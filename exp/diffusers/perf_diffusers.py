@@ -1,11 +1,13 @@
+import os
 import torch
-from diffusers import DiffusionPipeline, StableDiffusionXLPipeline
 import pandas as pd
 from itertools import product
 import argparse
-import sys
 import time
 import torchperf
+
+os.environ["HF_HUB_OFFLINE"] = "1"
+from diffusers import DiffusionPipeline, StableDiffusionXLPipeline
 
 
 def str2bool(v):
@@ -36,15 +38,18 @@ def profile(pipeline, n_batches: int, height, width):
 
 
 @torch.no_grad()
-def profile_unet(pipe, n_batches: int, height, width, prompt_hidden_size=77):
+def profile_unet(
+    is_sdxl: bool, pipe, n_batches: int, height, width, prompt_latent_length=77
+):
+    """set "TORCH_COMPILE_DEBUG=1 TORCH_COMPILE_DEBUG_DIR=/path/to/log" to see IR"""
     prompts = ["An image of a squirrel in Picasso style"] * n_batches
     latent_model_input = torch.randn(
         [2 * n_batches, 4, height // 8, width // 8], dtype=torch.float16, device="cuda"
     )
     t = 96
+    prompt_hidden_size = 2048 if is_sdxl else 768
     prompt_embeds = torch.randn(
-        # [2 * n_batches, prompt_hidden_size, 2048], dtype=torch.float16, device="cuda"
-        [2 * n_batches, prompt_hidden_size, 768],
+        [2 * n_batches, prompt_latent_length, prompt_hidden_size],
         dtype=torch.float16,
         device="cuda",
     )
@@ -57,32 +62,32 @@ def profile_unet(pipe, n_batches: int, height, width, prompt_hidden_size=77):
     }
     start = time.time()
     for i in range(1):
-        # noise_pred = pipe.unet(
-        #     latent_model_input,
-        #     t,
-        #     encoder_hidden_states=prompt_embeds,
-        #     cross_attention_kwargs=cross_attention_kwargs,
-        #     added_cond_kwargs=added_cond_kwargs,
-        #     return_dict=False,
-        # )[0]
-
-        explain(
-            pipe.unet,
+        noise_pred = pipe.unet(
             latent_model_input,
             t,
             encoder_hidden_states=prompt_embeds,
             cross_attention_kwargs=cross_attention_kwargs,
             added_cond_kwargs=added_cond_kwargs,
             return_dict=False,
-        )
+        )[0]
+
+        # torchperf.explain(
+        #     pipe.unet,
+        #     latent_model_input,
+        #     t,
+        #     encoder_hidden_states=prompt_embeds,
+        #     cross_attention_kwargs=cross_attention_kwargs,
+        #     added_cond_kwargs=added_cond_kwargs,
+        #     return_dict=False,
+        # )
         exit()
     end = time.time()
     return [end - start]
 
 
-def infer(data, sdxl: bool, run_compile: bool, batches: list[int], shapes):
+def infer(data, is_sdxl: bool, run_compile: bool, batches: list[int], shapes):
     row_prefix: list = []
-    if sdxl:
+    if is_sdxl:
         print("Using SDXL")
         row_prefix.append("SDXL")
         pipe = StableDiffusionXLPipeline.from_pretrained(
@@ -106,9 +111,10 @@ def infer(data, sdxl: bool, run_compile: bool, batches: list[int], shapes):
         print("Run torch compile")
         row_prefix.append(True)
         torch._dynamo.config.cache_size_limit = 102400
-        torch._dynamo.config.verbose = True
-        torch._dynamo.config.suppress_errors = True
-        pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=False)
+        # torch._dynamo.config.verbose = True
+        # torch._dynamo.config.suppress_errors = True
+        # pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=False)
+        pipe.unet = torch.compile(pipe.unet)
         # pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True, backend=torchperf.serialization_backend)
     else:
         print("Run torch eager")
@@ -120,9 +126,9 @@ def infer(data, sdxl: bool, run_compile: bool, batches: list[int], shapes):
             for repeat in range(4):
                 try:
                     times = profile(pipe, bs, h, w)
-                    # times = profile_unet(pipe, bs, h, w, hidden)
+                    # times = profile_unet(is_sdxl, pipe, bs, h, w, hidden)
                 except Exception as e:
-                    print(e)
+                    print("Catch execption:", e)
                     times = [pd.NA]
                     # times = [pd.NA]*4
                 row = row_prefix + [hidden, bs, h, w, repeat, *times]
@@ -136,8 +142,8 @@ def save_data(data, fn):
         data,
         columns=[
             "Model",
-            "prompt_hidden" "Compile",
-            "Hidden",
+            "Compile",
+            "Clip_Hidden",
             "Batch",
             "H",
             "W",
@@ -165,22 +171,22 @@ def analyze(fn: str):
     # df.to_pickle(fn+'_mean.pkl')
 
 
-args = parser.parse_args()
-assert args.model in ["sd15", "sdxl", "all"]
-data = []
-models = [args.model] if args.model != "all" else ["sd15", "sdxl"]
-compiles = [args.compile]
-batches = [
-    1,
-]
-shapes = [
-    [256, 256],
-]
+if __name__ == "__main__":
+    args = parser.parse_args()
+    assert args.model in ["sd15", "sdxl", "all"]
+    data = []
+    models = [args.model] if args.model != "all" else ["sd15", "sdxl"]
+    compiles = [args.compile]
+    batches = [1, 2, 4, 8, 16]
+    shapes = [
+        [256, 256],
+        [512, 512],
+    ]
 
-for model in models:
-    for use_compile in compiles:
-        infer(data, model == "sdxl", use_compile, batches, shapes)
-        print("===== print data =====")
-        print(data)
-save_data(data, args.output)
-# analyze(args.filename)
+    for model in models:
+        for use_compile in compiles:
+            infer(data, model == "sdxl", use_compile, batches, shapes)
+            print("===== print data =====")
+            print(data)
+    save_data(data, args.output)
+    # analyze(args.filename)
