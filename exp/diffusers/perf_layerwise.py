@@ -46,9 +46,15 @@ def tensors_to_shapes(tensors):
         raise ValueError(f"Unknown type {type(tensors)}")
 
 
-def shapes_to_tensors(shapes, old_batch, new_batch):
+def shapes_to_tensors(shapes, old_batch=None, new_batch=None):
     if isinstance(shapes, torch.Size):
-        assert shapes[0] == old_batch
+        if len(shapes) == 0:  # Timestamp
+            print(f"Find 0-dim tensor and replace with 1")
+            return torch.tensor(1)
+        if old_batch is not None:
+            assert shapes[0] == old_batch
+        if new_batch is None:
+            new_batch = list(shapes)[0]
         return torch.randn(
             [new_batch] + list(shapes)[1:], dtype=torch.float16, device="cuda"
         )
@@ -67,35 +73,84 @@ def shapes_to_tensors(shapes, old_batch, new_batch):
 
 
 def profile_layer_scalability(batches, name, model, sym_args, sym_kwargs):
-    model = torch.compile(model)
+    # model = torch.compile(model)
+
+    @torch.compile(dynamic=True)
+    def run_it(n_iter, args, kwargs):
+        out = []
+        for i in range(n_iter):
+            out.append(model(*args, **kwargs))
+        return out
+
     ret = []
-    # print(name)
+    print(f"{profile_layer_scalability.__name__=}")
     for batch in batches:
         args = shapes_to_tensors(sym_args, 2, 2 * batch)
         kwargs = shapes_to_tensors(sym_kwargs, 2, 2 * batch)
         # print(tensors_to_shapes(args), tensors_to_shapes(kwargs))
-        for i in range(2):
-            model(*args, **kwargs)
-        n_iter = 10
+        n_iter = 100
+        run_it(n_iter, args, kwargs)
         # print(name)
         # torch.cuda.profiler.start()
         torch.cuda.synchronize()
         start = time.time()
-        for i in range(n_iter):
-            model(*args, **kwargs)
+        run_it(n_iter, args, kwargs)
         torch.cuda.synchronize()
         end = time.time()
         ret.append((end - start) / n_iter)
     return ret
 
 
+# failed due to OOM
+def profile_layer_scalability_cuda_graph(batches, name, model, sym_args, sym_kwargs):
+    def run_it(n_iter, args, kwargs):
+        out = []
+        for i in range(n_iter):
+            out.append(model(*args, **kwargs))
+        return out
+
+    ret = []
+    print(f"{profile_layer_scalability.__name__=}")
+    for batch in batches:
+        args = shapes_to_tensors(sym_args, 2, 2 * batch)
+        kwargs = shapes_to_tensors(sym_kwargs, 2, 2 * batch)
+        n_iter = 100
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            model(*args, **kwargs)
+        # print(name)
+        # torch.cuda.profiler.start()
+        t = torchperf.cuda_timeit(lambda: g.replay(), compile=False)
+        ret.append(t)
+    return ret
+
+
 def export_layer_to_onnx(batches, name, model, sym_args, sym_kwargs):
     for batch in [1]:
+        print(sym_args, sym_kwargs)
         args = shapes_to_tensors(sym_args, 2, 2 * batch)
         kwargs = shapes_to_tensors(sym_kwargs, 2, 2 * batch)
         model(*args, **kwargs)
-        torch.onnx.export(model, (*args, kwargs), f"{name}.onnx")  # , verbose=True)
-        infer_onnx(f"{name}.onnx")
+        fn = f"{name}.onnx"
+        torch.onnx.export(model, (*args, kwargs), fn, verbose=True)
+        infer_onnx(fn)
+    exit()
+
+
+def export_layer_to_fx(batches, name, model: torch.nn.Module, sym_args, sym_kwargs):
+    model = model.eval()
+    for batch in [1]:
+        args = shapes_to_tensors(sym_args, 2, 2 * batch)
+        kwargs = shapes_to_tensors(sym_kwargs, 2, 2 * batch)
+
+        for k, v in kwargs.items():
+            if isinstance(v, float):
+                kwargs[k] = torch.tensor(v)
+
+        exported_program = torch.export.export(model, args, kwargs)
+        torch.export.save(exported_program, f"{name}.pt2")
+    exit()
 
 
 def profile_layerwise_problem_scalability(
@@ -148,6 +203,7 @@ def profile_layerwise_problem_scalability(
         handle.remove()
     # profile each layer
     for layer in input_data:
+        # layer_profile_data = export_layer_to_fx(batches, *layer)
         # layer_profile_data = export_layer_to_onnx(batches, *layer)
         layer_profile_data = profile_layer_scalability(batches, *layer)
         profile_data.append(
@@ -166,6 +222,7 @@ def get_layerwise(profile_data, is_sdxl: bool, shapes, batches):
             torch_dtype=torch.float16,
             variant="fp16",
             use_safetensors=True,
+            # low_cpu_mem_usage=False,
         )
     else:
         print("Using SD v1.5")
