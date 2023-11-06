@@ -1,4 +1,4 @@
-from nn import groupnorm
+from uniserve.layers import groupnorm
 import torch
 import torchperf
 
