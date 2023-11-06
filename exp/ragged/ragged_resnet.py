@@ -1,6 +1,6 @@
 import torch
 import os
-from perf_layerwise import shapes_to_tensors
+from torchperf.utils import shapes_to_tensors
 from torchperf import cuda_timeit
 from typing import Iterable, Optional
 from functools import partial
