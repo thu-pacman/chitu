@@ -55,6 +55,22 @@ Tensor ragged_nhwc_to_nchw(Tensor x, itype n, itype c,
     return torch::concat(tensors);
 }
 
+Tensor ragged_nchw_to_nhwc(Tensor x, itype n, itype c,
+                           std::vector<itype> HxWs) {
+    CHECK_CUDA(x);
+    TORCH_CHECK(x.dim() == 1);
+    itype start = 0;
+    std::vector<Tensor> tensors;
+    for (int i = 0; i < n; ++i) {
+        itype length = HxWs[i] * c;
+        tensors.emplace_back(
+            x.index({Slice(start, start + length)}).reshape({c, -1}).t());
+        start += length;
+    }
+    TORCH_CHECK(start == x.numel(), "Number of transposed elements mismatch");
+    return torch::concat(tensors); // [nhw, c]
+}
+
 Tensor ragged_nchw_unfold(Tensor x, itype n, itype c, std::vector<itype> hs,
                           std::vector<itype> ws, itype kh, itype kw, itype ph,
                           itype pw, itype dh, itype dw, itype sh, itype sw) {
@@ -96,6 +112,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Ragged NCHW LLTM forward (CUDA, Uniserve)")
         .def("ragged_nhwc_to_nchw", &ragged_nhwc_to_nchw,
              "ragged_nhwc_to_nchw (CUDA, Uniserve)")
+        .def("ragged_nchw_to_nhwc", &ragged_nchw_to_nhwc,
+             "ragged_nchw_to_nhwc (CUDA, Uniserve)")
         .def("ragged_nchw2nhwc_unfold_matmul", &ragged_nchw2nhwc_unfold_matmul,
              "ragged_nchw2nhwc_unfold_matmul (CUDA, Uniserve)");
 }
