@@ -55,9 +55,47 @@ Tensor ragged_nhwc_to_nchw(Tensor x, itype n, itype c,
     return torch::concat(tensors);
 }
 
+Tensor ragged_nchw_unfold(Tensor x, itype n, itype c, std::vector<itype> hs,
+                          std::vector<itype> ws, itype kh, itype kw, itype ph,
+                          itype pw, itype dh, itype dw, itype sh, itype sw) {
+    namespace F = torch::nn::functional;
+    itype start = 0;
+    x = x.flatten();
+    std::vector<Tensor> tensors;
+    auto opt = F::UnfoldFuncOptions({kh, kw})
+                   .padding({ph, pw})
+                   .stride({sh, sw})
+                   .dilation({dh, dw});
+    for (int i = 0; i < n; ++i) {
+        itype length = hs[i] * ws[i] * c;
+        tensors.emplace_back(F::unfold(x.index({Slice(start, start + length)})
+                                           .reshape({1, c, hs[i], ws[i]}),
+                                       opt)
+                                 .transpose_(1, 2)
+                                 .flatten(0, 1)); // [hw, crs]
+        start += length;
+    }
+    AT_ASSERTM(start == x.numel(), "Number of transposed elements mismatch");
+    return torch::concat(tensors);
+}
+
+Tensor ragged_nchw2nhwc_unfold_matmul(Tensor x, itype n, itype c,
+                                      std::vector<itype> hs,
+                                      std::vector<itype> ws, Tensor w, itype kh,
+                                      itype kw, itype ph, itype pw, itype dh,
+                                      itype dw, itype sh, itype sw) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(w);
+    auto unfolded =
+        ragged_nchw_unfold(x, n, c, hs, ws, kh, kw, ph, pw, dh, dw, sh, sw);
+    return torch::matmul(unfolded, w);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ragged_nchw_groupnorm_forward", &ragged_nchw_groupnorm_forward,
-          "Ragged NCHW LLTM forward (CUDA)")
+          "Ragged NCHW LLTM forward (CUDA, Uniserve)")
         .def("ragged_nhwc_to_nchw", &ragged_nhwc_to_nchw,
-             "ragged_nhwc_to_nchw");
+             "ragged_nhwc_to_nchw (CUDA, Uniserve)")
+        .def("ragged_nchw2nhwc_unfold_matmul", &ragged_nchw2nhwc_unfold_matmul,
+             "ragged_nchw2nhwc_unfold_matmul (CUDA, Uniserve)");
 }
