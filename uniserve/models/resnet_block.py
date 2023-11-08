@@ -55,6 +55,7 @@ class RaggedResnetBlock2D_nchw(nn.Module):
         hs: list[int],
         ws: list[int],
         HxWs: list[int],
+        HxWs_tensor: torch.Tensor,
         temb,
         scale: float = 1.0,
     ):
@@ -77,9 +78,10 @@ class RaggedResnetBlock2D_nchw(nn.Module):
         )
 
         temb = self.nonlinearity(temb)
-        temb = self.time_emb_proj(temb, scale)
-        temb = temb[0,].flatten()
-        x = x + temb
+        temb = self.time_emb_proj(temb, scale)  # [n, 1280]
+
+        # x = x + temb
+        x = torch.ops.uniserve.addB_jr_rr(x, n, HxWs_tensor, temb)
 
         x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, n, c, HxWs)  # [nchw]
 

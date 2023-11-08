@@ -8,7 +8,7 @@ setup(
             "uniserve_cuda",
             [
                 "operators.cpp",
-                # "lltm_cuda_kernel.cu",
+                "add_cuda_kernel.cu",
             ],
         ),
     ],

@@ -5,15 +5,16 @@
 // CUDA forward declarations
 using torch::Tensor;
 using namespace torch::indexing;
-// std::vector<torch::Tensor> lltm_cuda_forward(torch::Tensor input,
-//                                              torch::Tensor weights);
+torch::Tensor addB_jr_rr_cuda_forward_kernel(torch::Tensor A, int n,
+                                             torch::Tensor a_dim0s,
+                                             torch::Tensor B);
 
 // C++ interface
 
 #define CHECK_CUDA(x)                                                          \
-    AT_ASSERTM(x.type().is_cuda(), #x " must be a CUDA tensor")
+    TORCH_CHECK(x.type().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x)                                                    \
-    AT_ASSERTM(x.is_contiguous(), #x " must be contiguous")
+    TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x)                                                         \
     CHECK_CUDA(x);                                                             \
     CHECK_CONTIGUOUS(x)
@@ -107,6 +108,14 @@ Tensor ragged_nchw2nhwc_unfold_matmul(Tensor x, itype n, itype c,
     return torch::matmul(unfolded, w);
 }
 
+Tensor addB_jr_rr_cuda_forward(torch::Tensor A, int n, torch::Tensor a_dim0s,
+                               torch::Tensor B) {
+    CHECK_INPUT(A);
+    CHECK_INPUT(B);
+    CHECK_INPUT(a_dim0s);
+    return addB_jr_rr_cuda_forward_kernel(A, n, a_dim0s, B);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ragged_nchw_groupnorm_forward", &ragged_nchw_groupnorm_forward,
           "Ragged NCHW LLTM forward (CUDA, Uniserve)")
@@ -115,5 +124,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("ragged_nchw_to_nhwc", &ragged_nchw_to_nhwc,
              "ragged_nchw_to_nhwc (CUDA, Uniserve)")
         .def("ragged_nchw2nhwc_unfold_matmul", &ragged_nchw2nhwc_unfold_matmul,
-             "ragged_nchw2nhwc_unfold_matmul (CUDA, Uniserve)");
+             "ragged_nchw2nhwc_unfold_matmul (CUDA, Uniserve)")
+        .def("addB_jr_rr", &addB_jr_rr_cuda_forward,
+             "addB_jr_rr (CUDA, Uniserve)");
 }

@@ -45,12 +45,13 @@ def test_ResNet_uniform():
     hs = [h] * n
     ws = [w] * n
     HxWs = [h * w for h, w in zip(hs, ws)]
+    HxWs_tensor = torch.tensor(HxWs, dtype=torch.int64)
 
     x = torch.randn(n, c, h, w)
-    temb = torch.randn(1, 1280)
+    temb = torch.randn(n, 1280)
 
     y0 = m_orig(x, temb)
-    y1 = m_ragged(x.flatten(), n, c, hs, ws, HxWs, temb)
+    y1 = m_ragged(x.flatten(), n, c, hs, ws, HxWs, HxWs_tensor, temb)
 
     assert torchperf.allclose(y0.flatten(), y1.flatten())
 
@@ -59,22 +60,23 @@ def test_ResNet_uniform():
 def test_RaggedNhwcConv2d_ragged():
     n, c, hs, ws = 4, 320, [14, 14, 28, 28], [14, 28, 14, 28]
     HxWs = [h * w for h, w in zip(hs, ws)]
+    HxWs_tensor = torch.tensor(HxWs, dtype=torch.int64)
 
     m_orig = build_resnet()
     m_ragged = RaggedResnetBlock2D_nchw(m_orig)
-    temb = torch.randn(1, 1280)
+    temb = torch.randn(n, 1280)
 
     x0 = []
     y0 = []
-    for h, w in zip(hs, ws):
+    for i, (h, w) in enumerate(zip(hs, ws)):
         x = torch.randn(1, c, h, w)
-        y = m_orig(x, temb)  # [1, c, h, w]
+        y = m_orig(x, temb[[i],])  # [1, c, h, w]
         x0.append(x.flatten())
         y0.append(y.flatten())
     x0 = torch.concat(x0)
     y0 = torch.concat(y0)
 
-    y1 = m_ragged(x0.flatten(), n, c, hs, ws, HxWs, temb)
+    y1 = m_ragged(x0.flatten(), n, c, hs, ws, HxWs, HxWs_tensor, temb)
 
     assert torchperf.allclose(y0.flatten(), y1.flatten())
 
@@ -87,16 +89,16 @@ def test_RaggedNhwcConv2d_compile():
     # hs, ws = [56] * n, [56] * n
 
     HxWs = [h * w for h, w in zip(hs, ws)]
+    HxWs_tensor = torch.tensor(HxWs, dtype=torch.int64)
 
     m_orig = build_resnet()
     m_ragged = RaggedResnetBlock2D_nchw(m_orig)
-    temb = torch.randn(1, 1280)
+    temb = torch.randn(n, 1280)
 
-    x0 = []
-    y0 = []
-    for h, w in zip(hs, ws):
+    x0, y0 = [], []
+    for i, (h, w) in enumerate(zip(hs, ws)):
         x = torch.randn(1, c, h, w)
-        y = m_orig(x, temb)  # [1, c, h, w]
+        y = m_orig(x, temb[[i],])  # [1, c, h, w]
         x0.append(x)
         y0.append(y)
     x1 = torch.concat([x.flatten() for x in x0])
@@ -107,18 +109,18 @@ def test_RaggedNhwcConv2d_compile():
     m_ragged = torch.compile(m_ragged, dynamic=True, fullgraph=True)
     # torchperf.explain(m_ragged, x1, n, c, hs, ws, HxWs, temb)
 
-    y1 = m_ragged(x1, n, c, hs, ws, HxWs, temb)
+    y1 = m_ragged(x1, n, c, hs, ws, HxWs, HxWs_tensor, temb)
     assert torchperf.allclose(y0.flatten(), y1.flatten())
 
     def run_orig():
         y0 = []
-        for x in x0:
-            y0.append(m_orig(x, temb))
+        for i, x in enumerate(x0):
+            y0.append(m_orig(x, temb[[i]]))
         return y0
 
     t0 = torchperf.cuda_timeit_ms(run_orig, compile=False)
     t1 = torchperf.cuda_timeit_ms(
-        lambda: m_ragged(x1, n, c, hs, ws, HxWs, temb), compile=False
+        lambda: m_ragged(x1, n, c, hs, ws, HxWs, HxWs_tensor, temb), compile=False
     )
     print(f"{t0=} {t1=}")
 
