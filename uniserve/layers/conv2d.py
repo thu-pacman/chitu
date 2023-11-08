@@ -49,10 +49,11 @@ def ragged_nchw2nhwc_unfold_matmul_abstract(
 ):
     # TODO: deal with downscale and upscale
     assert kh == kw
-    assert ph == pw == (kh + 1) // 2
+    assert ph == pw == kh // 2
+    assert ph % 2 == 1
     assert dh == dw == 1
     assert sh == sw == 1
-    return input.new_empty(input.shape)
+    return input.new_empty(input.shape).reshape(-1, c)
 
 
 # Next, let’s add an implementation for the operator:

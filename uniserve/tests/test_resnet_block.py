@@ -1,7 +1,7 @@
 import torch
 import torchperf
-import uniserve
 from diffusers.models.resnet import ResnetBlock2D
+import uniserve
 from uniserve.models import RaggedResnetBlock2D_nchw
 
 dtype = torch.float16
@@ -55,25 +55,73 @@ def test_ResNet_uniform():
     assert torchperf.allclose(y0.flatten(), y1.flatten())
 
 
-# TODO
-# @torch.no_grad()
-# def test_RaggedNhwcConv2d_ragged():
-#     n, c, hs, ws = 4, 3, [14, 14, 28, 28], [14, 28, 14, 28]
-#     f, r, padding = 5, 3, 1
-#     layer_torch = LoRACompatibleConv(c, f, r, padding=padding)
+@torch.no_grad()
+def test_RaggedNhwcConv2d_ragged():
+    n, c, hs, ws = 4, 320, [14, 14, 28, 28], [14, 28, 14, 28]
+    HxWs = [h * w for h, w in zip(hs, ws)]
 
-#     y0 = []
-#     x0 = []
-#     for h, w in zip(hs, ws):
-#         x = torch.randn(1, c, h, w)
-#         y = layer_torch(x)  # [1, c, h, w]
-#         x0.append(x.flatten(2).transpose(1, 2).flatten(0, 1))
-#         y0.append(y.flatten(2).transpose(1, 2).flatten(0, 1))
-#     x0 = torch.concat(x0).contiguous()
-#     y0 = torch.concat(y0)
+    m_orig = build_resnet()
+    m_ragged = RaggedResnetBlock2D_nchw(m_orig)
+    temb = torch.randn(1, 1280)
 
-#     layer_us = uniserve.layers.RaggedNhwcConv2d(layer_torch)
-#     HxWs = [h * w for h, w in zip(hs, ws)]
-#     y1 = layer_us(x0, n, c, hs, ws, HxWs)
+    x0 = []
+    y0 = []
+    for h, w in zip(hs, ws):
+        x = torch.randn(1, c, h, w)
+        y = m_orig(x, temb)  # [1, c, h, w]
+        x0.append(x.flatten())
+        y0.append(y.flatten())
+    x0 = torch.concat(x0)
+    y0 = torch.concat(y0)
 
-#     assert torchperf.allclose(y0.flatten(), y1.flatten())
+    y1 = m_ragged(x0.flatten(), n, c, hs, ws, HxWs, temb)
+
+    assert torchperf.allclose(y0.flatten(), y1.flatten())
+
+
+@torch.no_grad()
+def test_RaggedNhwcConv2d_compile():
+    n, c, hs, ws = 4, 320, [14, 14, 28, 28], [14, 28, 14, 28]
+    # The following setting result into slight numerical errors
+    # n, c = 4, 320
+    # hs, ws = [56] * n, [56] * n
+
+    HxWs = [h * w for h, w in zip(hs, ws)]
+
+    m_orig = build_resnet()
+    m_ragged = RaggedResnetBlock2D_nchw(m_orig)
+    temb = torch.randn(1, 1280)
+
+    x0 = []
+    y0 = []
+    for h, w in zip(hs, ws):
+        x = torch.randn(1, c, h, w)
+        y = m_orig(x, temb)  # [1, c, h, w]
+        x0.append(x)
+        y0.append(y)
+    x1 = torch.concat([x.flatten() for x in x0])
+    y0 = torch.concat([y.flatten() for y in y0])
+
+    # Compile wrapper
+    m_orig = torch.compile(m_orig, dynamic=True, fullgraph=True)
+    m_ragged = torch.compile(m_ragged, dynamic=True, fullgraph=True)
+    # torchperf.explain(m_ragged, x1, n, c, hs, ws, HxWs, temb)
+
+    y1 = m_ragged(x1, n, c, hs, ws, HxWs, temb)
+    assert torchperf.allclose(y0.flatten(), y1.flatten())
+
+    def run_orig():
+        y0 = []
+        for x in x0:
+            y0.append(m_orig(x, temb))
+        return y0
+
+    t0 = torchperf.cuda_timeit_ms(run_orig, compile=False)
+    t1 = torchperf.cuda_timeit_ms(
+        lambda: m_ragged(x1, n, c, hs, ws, HxWs, temb), compile=False
+    )
+    print(f"{t0=} {t1=}")
+
+    # m_ragged(x1, n, c, hs, ws, HxWs, temb)
+    # torch.cuda.profiler.start()
+    # m_ragged(x1, n, c, hs, ws, HxWs, temb)
