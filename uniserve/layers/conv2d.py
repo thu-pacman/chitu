@@ -12,10 +12,8 @@ from diffusers.models.lora import LoRACompatibleConv
 @torch._custom_ops.custom_op("uniserve::ragged_nchw2nhwc_unfold_matmul")
 def ragged_nchw2nhwc_unfold_matmul(
     input: Tensor,
-    n: int,
     c: int,
-    hs: Sequence[int],
-    ws: Sequence[int],
+    idx_cpu: Tensor,
     weight: Tensor,
     kh: int,
     kw: int,
@@ -33,10 +31,8 @@ def ragged_nchw2nhwc_unfold_matmul(
 @torch._custom_ops.impl_abstract("uniserve::ragged_nchw2nhwc_unfold_matmul")
 def ragged_nchw2nhwc_unfold_matmul_abstract(
     input: Tensor,
-    n: int,
     c: int,
-    hs: Sequence[int],
-    ws: Sequence[int],
+    idx_cpu: Tensor,
     weight: Tensor,
     kh: int,
     kw: int,
@@ -61,10 +57,8 @@ def ragged_nchw2nhwc_unfold_matmul_abstract(
 @torch._custom_ops.impl("uniserve::ragged_nchw2nhwc_unfold_matmul")
 def ragged_nchw2nhwc_unfold_matmul_impl(
     input: Tensor,
-    n: int,
     c: int,
-    hs: Sequence[int],
-    ws: Sequence[int],
+    idx_cpu: Tensor,
     weight: Tensor,
     kh: int,
     kw: int,
@@ -75,8 +69,9 @@ def ragged_nchw2nhwc_unfold_matmul_impl(
     sh: int,
     sw: int,
 ):
+    assert idx_cpu.device.type == 'cpu'
     return uniserve_cuda.ragged_nchw2nhwc_unfold_matmul(
-        input, n, c, hs, ws, weight, kh, kw, ph, pw, dh, dw, sh, sw
+        input, c, idx_cpu, weight, kh, kw, ph, pw, dh, dw, sh, sw
     )
 
 
@@ -102,17 +97,15 @@ class RaggedNhwcConv2d(nn.Module):
         bias = conv.bias.flatten()  # [f]
         return nn.Parameter(kernel), nn.Parameter(bias)
 
-    def forward(self, x, n, c, hs: list[int], ws: list[int], HxWs: list[int]):
+    def forward(self, x, c, idx_cpu):
         """
         x: [nhw, c]
         output: [nhw, c]"""
-        x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, n, c, HxWs)
+        x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, c, idx_cpu)
         x = torch.ops.uniserve.ragged_nchw2nhwc_unfold_matmul(
             x,
-            n,
             c,
-            hs,
-            ws,
+            idx_cpu,
             self.weight,
             *self.shadow.kernel_size,
             *self.shadow.padding,

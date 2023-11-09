@@ -11,10 +11,9 @@ import uniserve_cuda
 # Registers the custom op
 @torch._custom_ops.custom_op("uniserve::ragged_nhwc_to_nchw")
 def ragged_nhwc_to_nchw(
-    input: Tensor,
-    n: int,
+    x: Tensor,
     c: int,
-    HxWs: Sequence[int],
+    idx_cpu: Tensor,
 ) -> Tensor:
     raise NotImplementedError()
 
@@ -22,33 +21,31 @@ def ragged_nhwc_to_nchw(
 # for compile
 @torch._custom_ops.impl_abstract("uniserve::ragged_nhwc_to_nchw")
 def ragged_nhwc_to_nchw_abstract(
-    input: Tensor,
-    n: int,
+    x: Tensor,
     c: int,
-    HxWs: Sequence[int],
+    idx_cpu: Tensor,
 ):
-    return input.new_empty(input.shape).flatten()
+    return x.new_empty(x.shape).flatten()
 
 
 # Next, let’s add an implementation for the operator:
 # Adds an implementation for the custom op
 @torch._custom_ops.impl("uniserve::ragged_nhwc_to_nchw")
 def ragged_nhwc_to_nchw_impl(
-    input: Tensor,
-    n: int,
+    x: Tensor,
     c: int,
-    HxWs: Sequence[int],
+    idx_cpu: Tensor,
 ):
-    return uniserve_cuda.ragged_nhwc_to_nchw(input, n, c, HxWs)
+    assert idx_cpu.device.type == 'cpu'
+    return uniserve_cuda.ragged_nhwc_to_nchw(x, c, idx_cpu)
 
 
 # Registers the custom op
 @torch._custom_ops.custom_op("uniserve::ragged_nchw_to_nhwc")
 def ragged_nchw_to_nhwc(
-    input: Tensor,
-    n: int,
+    x: Tensor,
     c: int,
-    HxWs: Sequence[int],
+    idx_cpu: Tensor,
 ) -> Tensor:
     raise NotImplementedError()
 
@@ -56,21 +53,20 @@ def ragged_nchw_to_nhwc(
 # for compile
 @torch._custom_ops.impl_abstract("uniserve::ragged_nchw_to_nhwc")
 def ragged_nchw_to_nhwc_abstract(
-    input: Tensor,
-    n: int,
+    x: Tensor,
     c: int,
-    HxWs: Sequence[int],
+    idx_cpu: Tensor,
 ):
-    return input.new_empty(input.shape).reshape(-1, c)
+    return x.new_empty(x.shape).reshape(-1, c)
 
 
 # Next, let’s add an implementation for the operator:
 # Adds an implementation for the custom op
 @torch._custom_ops.impl("uniserve::ragged_nchw_to_nhwc")
 def ragged_nchw_to_nhwc_impl(
-    input: Tensor,
-    n: int,
+    x: Tensor,
     c: int,
-    HxWs: Sequence[int],
+    idx_cpu: Tensor,
 ):
-    return uniserve_cuda.ragged_nchw_to_nhwc(input, n, c, HxWs)
+    assert idx_cpu.device.type == 'cpu'
+    return uniserve_cuda.ragged_nchw_to_nhwc(x, c, idx_cpu)

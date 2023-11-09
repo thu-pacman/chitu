@@ -12,8 +12,7 @@ import uniserve_cuda
 @torch._custom_ops.custom_op("uniserve::addB_jr_rr")
 def addB_jr_rr(
     A: Tensor,
-    n: int,
-    HxWs: Tensor,
+    idx_cuda: Tensor,
     B: Tensor,
 ) -> Tensor:
     raise NotImplementedError()
@@ -23,11 +22,9 @@ def addB_jr_rr(
 @torch._custom_ops.impl_abstract("uniserve::addB_jr_rr")
 def addB_jr_rr_abstract(
     A: Tensor,
-    n: int,
-    HxWs: Tensor,
+    idx_cuda: Tensor,
     B: Tensor,
 ):
-    assert HxWs.numel() == n
     assert A.shape[-1] == B.shape[-1]
     return A.new_empty(A.shape)
 
@@ -37,10 +34,9 @@ def addB_jr_rr_abstract(
 @torch._custom_ops.impl("uniserve::addB_jr_rr")
 def addB_jr_rr_impl(
     A: Tensor,
-    n: int,
-    HxWs: Tensor,
+    idx_cuda: Tensor,
     B: Tensor,
 ):
-    assert HxWs.numel() == n
+    assert idx_cuda.is_cuda
     assert A.shape[-1] == B.shape[-1]
-    return uniserve_cuda.addB_jr_rr(A, n, HxWs, B)
+    return uniserve_cuda.addB_jr_rr(A, idx_cuda[2], B)

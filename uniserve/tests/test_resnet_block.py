@@ -7,6 +7,7 @@ from uniserve.models import RaggedResnetBlock2D_nchw
 dtype = torch.float16
 torch.set_default_device("cuda")
 torch.set_default_dtype(dtype)
+torch.manual_seed(0)
 
 
 def build_resnet(
@@ -42,16 +43,13 @@ def test_ResNet_uniform():
     m_ragged = RaggedResnetBlock2D_nchw(m_orig)
 
     n, c, h, w = 2, 320, 32, 32
-    hs = [h] * n
-    ws = [w] * n
-    HxWs = [h * w for h, w in zip(hs, ws)]
-    HxWs_tensor = torch.tensor(HxWs, dtype=torch.int64)
+    idx_cuda, idx_cpu = uniserve.utils.create_index_from_regular(n, h, w)
 
     x = torch.randn(n, c, h, w)
     temb = torch.randn(n, 1280)
 
     y0 = m_orig(x, temb)
-    y1 = m_ragged(x.flatten(), n, c, hs, ws, HxWs, HxWs_tensor, temb)
+    y1 = m_ragged(x.flatten(), c, idx_cuda, idx_cpu, temb)
 
     assert torchperf.allclose(y0.flatten(), y1.flatten())
 
@@ -59,8 +57,7 @@ def test_ResNet_uniform():
 @torch.no_grad()
 def test_RaggedNhwcConv2d_ragged():
     n, c, hs, ws = 4, 320, [14, 14, 28, 28], [14, 28, 14, 28]
-    HxWs = [h * w for h, w in zip(hs, ws)]
-    HxWs_tensor = torch.tensor(HxWs, dtype=torch.int64)
+    idx_cuda, idx_cpu = uniserve.utils.create_index(hs, ws)
 
     m_orig = build_resnet()
     m_ragged = RaggedResnetBlock2D_nchw(m_orig)
@@ -76,7 +73,7 @@ def test_RaggedNhwcConv2d_ragged():
     x0 = torch.concat(x0)
     y0 = torch.concat(y0)
 
-    y1 = m_ragged(x0.flatten(), n, c, hs, ws, HxWs, HxWs_tensor, temb)
+    y1 = m_ragged(x0.flatten(), c, idx_cuda, idx_cpu, temb)
 
     assert torchperf.allclose(y0.flatten(), y1.flatten())
 
@@ -88,8 +85,7 @@ def test_RaggedNhwcConv2d_compile():
     # n, c = 4, 320
     # hs, ws = [56] * n, [56] * n
 
-    HxWs = [h * w for h, w in zip(hs, ws)]
-    HxWs_tensor = torch.tensor(HxWs, dtype=torch.int64)
+    idx_cuda, idx_cpu = uniserve.utils.create_index(hs, ws)
 
     m_orig = build_resnet()
     m_ragged = RaggedResnetBlock2D_nchw(m_orig)
@@ -104,6 +100,9 @@ def test_RaggedNhwcConv2d_compile():
     x1 = torch.concat([x.flatten() for x in x0])
     y0 = torch.concat([y.flatten() for y in y0])
 
+    y1 = m_ragged(x1, c, idx_cuda, idx_cpu, temb)
+    assert torchperf.allclose(y0.flatten(), y1.flatten())
+
     # Compile wrapper
     m_orig = torch.compile(m_orig, dynamic=True, fullgraph=True)
     m_ragged = torch.compile(m_ragged, dynamic=True, fullgraph=True)
@@ -112,9 +111,10 @@ def test_RaggedNhwcConv2d_compile():
     # Torch dynamo hint
     torch._dynamo.mark_dynamic(x1, 0)
     torch._dynamo.mark_dynamic(temb, 0)
-    torch._dynamo.mark_dynamic(HxWs_tensor, 0)
+    torch._dynamo.mark_dynamic(idx_cuda,1)
+    torch._dynamo.mark_dynamic(idx_cpu, 1)
 
-    y1 = m_ragged(x1, n, c, hs, ws, HxWs, HxWs_tensor, temb)
+    y1 = m_ragged(x1, c, idx_cuda, idx_cpu, temb)
     assert torchperf.allclose(y0.flatten(), y1.flatten())
 
     def run_orig():
@@ -123,9 +123,9 @@ def test_RaggedNhwcConv2d_compile():
             y0.append(m_orig(x, temb[[i]]))
         return y0
 
-    t0 = torchperf.cuda_timeit_ms(run_orig, compile=False)
+    t0 = torchperf.cuda_timeit_ms(run_orig)
     t1 = torchperf.cuda_timeit_ms(
-        lambda: m_ragged(x1, n, c, hs, ws, HxWs, HxWs_tensor, temb), compile=False
+        lambda: m_ragged(x1, c, idx_cuda, idx_cpu, temb)
     )
     print(f"{t0=} {t1=}")
 
@@ -135,8 +135,7 @@ def test_RaggedNhwcConv2d_compile():
 
     # Check recompilation
     n, c, hs, ws = 5, 320, [14, 14, 28, 28, 20], [14, 28, 14, 28, 20]
-    HxWs = [h * w for h, w in zip(hs, ws)]
-    HxWs_tensor = torch.tensor(HxWs, dtype=torch.int64)
+    idx_cuda, idx_cpu = uniserve.utils.create_index(hs, ws)
     x0, y0 = [], []
     for i, (h, w) in enumerate(zip(hs, ws)):
         x = torch.randn(1, c, h, w)
@@ -144,7 +143,7 @@ def test_RaggedNhwcConv2d_compile():
     x1 = torch.concat([x.flatten() for x in x0])
     temb = torch.randn(n, 1280)
     t2 = torchperf.cuda_timeit_ms(
-        lambda: m_ragged(x1, n, c, hs, ws, HxWs, HxWs_tensor, temb), 0, 1
+        lambda: m_ragged(x1, c, idx_cuda, idx_cpu, temb), 0, 1
     )
     print(f"{t2=}")
     assert t2 < 10, "An abnormal long execution time hints for recompilation"

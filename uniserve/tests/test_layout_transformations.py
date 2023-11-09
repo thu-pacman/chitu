@@ -20,6 +20,7 @@ def ragged_nhwc_to_nchw(x, n, c, HxWs):
 def test_ragged_nhwc_to_nchw():
     n, c, hs, ws = 2, 32, [14, 14], [14, 28]
     HxWs = [h * w for h, w in zip(hs, ws)]
+    idx_cuda, idx_cpu = uniserve.utils.create_index(hs, ws)
     y0 = []
     x0 = []
     for h, w in zip(hs, ws):
@@ -29,7 +30,7 @@ def test_ragged_nhwc_to_nchw():
 
     y0 = ragged_nhwc_to_nchw(x0, n, c, HxWs)
 
-    y1 = torch.ops.uniserve.ragged_nhwc_to_nchw(x0.flatten(), n, c, HxWs)
+    y1 = torch.ops.uniserve.ragged_nhwc_to_nchw(x0.flatten(), c, idx_cpu)
 
     assert torchperf.allclose(y0.flatten(), y1.flatten())
 
@@ -46,6 +47,7 @@ def ragged_nchw_to_nhwc(x, n, c, HxWs):
 def test_ragged_nchw_to_nhwc():
     n, c, hs, ws = 2, 32, [14, 14], [14, 28]
     HxWs = [h * w for h, w in zip(hs, ws)]
+    idx_cuda, idx_cpu = uniserve.utils.create_index(hs, ws)
     y0 = []
     x0 = []
     for h, w in zip(hs, ws):
@@ -55,6 +57,6 @@ def test_ragged_nchw_to_nhwc():
 
     y0 = ragged_nchw_to_nhwc(x0, n, c, HxWs)
 
-    y1 = torch.ops.uniserve.ragged_nchw_to_nhwc(x0.flatten(), n, c, HxWs)
+    y1 = torch.ops.uniserve.ragged_nchw_to_nhwc(x0.flatten(), c, idx_cpu)
 
     assert torchperf.allclose(y0.flatten(), y1.flatten())

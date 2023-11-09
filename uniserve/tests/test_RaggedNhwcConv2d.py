@@ -16,10 +16,8 @@ def test_RaggedNhwcConv2d_uniform():
     y0 = layer_torch(x)
 
     layer_us = uniserve.layers.RaggedNhwcConv2d(layer_torch)
-    hs = [h] * n
-    ws = [w] * n
-    HxWs = [h * w for h, w in zip(hs, ws)]
-    y1 = layer_us(x.flatten(2).transpose(1, 2).flatten(0, 1), n, c, hs, ws, HxWs)
+    idx_cuda, idx_cpu = uniserve.utils.create_index_from_regular(n, h, w)
+    y1 = layer_us(x.flatten(2).transpose(1, 2).flatten(0, 1), c, idx_cpu)
 
     assert torchperf.allclose(y0.flatten(2).transpose(1, 2).flatten(), y1.flatten())
 
@@ -41,7 +39,7 @@ def test_RaggedNhwcConv2d_ragged():
     y0 = torch.concat(y0)
 
     layer_us = uniserve.layers.RaggedNhwcConv2d(layer_torch)
-    HxWs = [h * w for h, w in zip(hs, ws)]
-    y1 = layer_us(x0, n, c, hs, ws, HxWs)
+    idx_cuda, idx_cpu = uniserve.utils.create_index(hs, ws)
+    y1 = layer_us(x0, c, idx_cpu)
 
     assert torchperf.allclose(y0.flatten(), y1.flatten())

@@ -12,9 +12,8 @@ import uniserve_cuda
 @torch._custom_ops.custom_op("uniserve::ragged_nchw_groupnorm")
 def ragged_nchw_groupnorm(
     input: Tensor,
-    n: int,
     c: int,
-    HxWs: Sequence[int],
+    idx_cpu: Tensor,
     num_groups: int,
     weight: Tensor,
     bias: Tensor,
@@ -27,9 +26,8 @@ def ragged_nchw_groupnorm(
 @torch._custom_ops.impl_abstract("uniserve::ragged_nchw_groupnorm")
 def ragged_nchw_groupnorm_abstract(
     input: Tensor,
-    n: int,
     c: int,
-    HxWs: Sequence[int],
+    idx_cpu: Tensor,
     num_groups: int,
     weight: Tensor,
     bias: Tensor,
@@ -43,16 +41,16 @@ def ragged_nchw_groupnorm_abstract(
 @torch._custom_ops.impl("uniserve::ragged_nchw_groupnorm")
 def ragged_nchw_groupnorm_impl(
     input: Tensor,
-    n: int,
     c: int,
-    HxWs: Sequence[int],
+    idx_cpu: Tensor,
     num_groups: int,
     weight: Tensor,
     bias: Tensor,
     eps: float,
 ):
+    assert idx_cpu.device.type == 'cpu'
     return uniserve_cuda.ragged_nchw_groupnorm_forward(
-        input, n, c, HxWs, num_groups, weight, bias, eps
+        input, c, idx_cpu, num_groups, weight, bias, eps
     )
 
 
@@ -64,7 +62,7 @@ class RaggedNchwGroupNorm(nn.Module):
         self.num_groups = shadow_norm.num_groups
         self.eps = shadow_norm.eps
 
-    def forward(self, input, n, c, HxWs):
+    def forward(self, input, c, idx_cpu):
         return torch.ops.uniserve.ragged_nchw_groupnorm(
-            input, n, c, HxWs, self.num_groups, self.weight, self.bias, self.eps
+            input, c, idx_cpu, self.num_groups, self.weight, self.bias, self.eps
         )

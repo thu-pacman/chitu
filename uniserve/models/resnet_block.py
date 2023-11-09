@@ -40,23 +40,20 @@ class RaggedResnetBlock2D_nchw(nn.Module):
         self.time_emb_proj = shadow.time_emb_proj
         self.output_scale_factor = shadow.output_scale_factor
 
-    def norm_act_conv_nchw2nhwc(self, x, n, c, hs, ws, HxWs, norm, nonlinearity, conv):
-        x = norm(x, n, c, HxWs)
-        x = torch.ops.uniserve.ragged_nchw_to_nhwc(x, n, c, HxWs)  # [nhw, c]
+    def norm_act_conv_nchw2nhwc(self, x, c, idx_cpu, norm, nonlinearity, conv):
+        x = norm(x, c, idx_cpu)
+        x = torch.ops.uniserve.ragged_nchw_to_nhwc(x, c, idx_cpu)  # [nhw, c]
         x = nonlinearity(x)
-        x = conv(x, n, c, hs, ws, HxWs)
+        x = conv(x, c, idx_cpu)
         return x
 
     def forward(
         self,
-        input_tensor,
-        n,
-        c,
-        hs: list[int],
-        ws: list[int],
-        HxWs: list[int],
-        HxWs_tensor: torch.Tensor,
-        temb,
+        input_tensor: torch.Tensor,
+        c: int,
+        idx_cuda: torch.Tensor,
+        idx_cpu: torch.Tensor,
+        temb: torch.Tensor,
         scale: float = 1.0,
     ):
         """
@@ -74,21 +71,21 @@ class RaggedResnetBlock2D_nchw(nn.Module):
 
         x = input_tensor  # [nchw]
         x = self.norm_act_conv_nchw2nhwc(
-            x, n, c, hs, ws, HxWs, self.norm1, self.nonlinearity, self.conv1
+            x, c, idx_cpu, self.norm1, self.nonlinearity, self.conv1
         )
 
         temb = self.nonlinearity(temb)
         temb = self.time_emb_proj(temb, scale)  # [n, 1280]
 
         # x = x + temb
-        x = torch.ops.uniserve.addB_jr_rr(x, n, HxWs_tensor, temb)
+        x = torch.ops.uniserve.addB_jr_rr(x, idx_cuda, temb)
 
-        x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, n, c, HxWs)  # [nchw]
+        x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, c, idx_cpu)  # [nchw]
 
         x = self.norm_act_conv_nchw2nhwc(
-            x, n, c, hs, ws, HxWs, self.norm2, self.nonlinearity, self.conv2
+            x, c, idx_cpu, self.norm2, self.nonlinearity, self.conv2
         )
-        x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, n, c, HxWs)  # [nchw]
+        x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, c, idx_cpu)  # [nchw]
 
         x = (input_tensor + x) / self.output_scale_factor
         return x

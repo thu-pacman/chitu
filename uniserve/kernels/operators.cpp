@@ -5,28 +5,34 @@
 // CUDA forward declarations
 using torch::Tensor;
 using namespace torch::indexing;
-torch::Tensor addB_jr_rr_cuda_forward_kernel(torch::Tensor A, int n,
-                                             torch::Tensor a_dim0s,
+torch::Tensor addB_jr_rr_cuda_forward_kernel(torch::Tensor A,
+                                             torch::Tensor idx_cuda,
                                              torch::Tensor B);
 
 // C++ interface
 
-#define CHECK_CUDA(x)                                                          \
-    TORCH_CHECK(x.type().is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CPU(x) TORCH_CHECK(x.is_cpu(), #x " must be a CPU tensor")
 #define CHECK_CONTIGUOUS(x)                                                    \
     TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x)                                                         \
     CHECK_CUDA(x);                                                             \
     CHECK_CONTIGUOUS(x)
+#define CHECK_INPUT_CPU(x)                                                     \
+    CHECK_CPU(x);                                                              \
+    CHECK_CONTIGUOUS(x)
 
 Tensor ragged_nchw_groupnorm_forward(
-    const at::Tensor &input, int64_t N, int64_t C, std::vector<int64_t> HxWs,
-    int64_t num_groups, const c10::optional<at::Tensor> &weight = {},
+    const at::Tensor &input, int64_t C, Tensor idx_cpu, int64_t num_groups,
+    const c10::optional<at::Tensor> &weight = {},
     const c10::optional<at::Tensor> &bias = {}, double eps = 1e-05) {
     CHECK_INPUT(input); // [nchw]
     itype start = 0;
     std::vector<Tensor> ys;
-    for (int i = 0; i < N; ++i) {
+    auto HxWs_tensor = idx_cpu.index({2});
+    auto HxWs = HxWs_tensor.accessor<itype, 1>();
+    const int n = HxWs.size(0);
+    for (int i = 0; i < n; ++i) {
         itype length = HxWs[i] * C;
         auto x = input.narrow(0, start, length).reshape({1, C, HxWs[i]});
         // TODO: provide output tensor to the following function
@@ -38,10 +44,13 @@ Tensor ragged_nchw_groupnorm_forward(
     return torch::concat(ys);
 }
 
-Tensor ragged_nhwc_to_nchw(Tensor x, itype n, itype c,
-                           std::vector<itype> HxWs) {
+Tensor ragged_nhwc_to_nchw(Tensor x, itype c, Tensor idx_cpu) {
     CHECK_INPUT(x);
     itype start = 0;
+    auto HxWs_tensor = idx_cpu.index({2});
+    auto HxWs = HxWs_tensor.accessor<itype, 1>();
+    const int n = HxWs.size(0);
+
     x = x.flatten();
     std::vector<Tensor> tensors;
     for (int i = 0; i < n; ++i) {
@@ -56,10 +65,14 @@ Tensor ragged_nhwc_to_nchw(Tensor x, itype n, itype c,
     return torch::concat(tensors);
 }
 
-Tensor ragged_nchw_to_nhwc(Tensor x, itype n, itype c,
-                           std::vector<itype> HxWs) {
-    CHECK_CUDA(x);
+Tensor ragged_nchw_to_nhwc(Tensor x, itype c, Tensor idx_cpu) {
+    CHECK_INPUT(x);
+    CHECK_INPUT_CPU(idx_cpu);
     TORCH_CHECK(x.dim() == 1);
+    auto HxWs_tensor = idx_cpu.index({2});
+    auto HxWs = HxWs_tensor.accessor<itype, 1>();
+    const int n = HxWs.size(0);
+
     itype start = 0;
     std::vector<Tensor> tensors;
     for (int i = 0; i < n; ++i) {
@@ -72,9 +85,9 @@ Tensor ragged_nchw_to_nhwc(Tensor x, itype n, itype c,
     return torch::concat(tensors); // [nhw, c]
 }
 
-Tensor ragged_nchw_unfold(Tensor x, itype n, itype c, std::vector<itype> hs,
-                          std::vector<itype> ws, itype kh, itype kw, itype ph,
-                          itype pw, itype dh, itype dw, itype sh, itype sw) {
+Tensor ragged_nchw_unfold(Tensor x, itype c, Tensor idx_cpu, itype kh, itype kw,
+                          itype ph, itype pw, itype dh, itype dw, itype sh,
+                          itype sw) {
     namespace F = torch::nn::functional;
     itype start = 0;
     x = x.flatten();
@@ -83,6 +96,12 @@ Tensor ragged_nchw_unfold(Tensor x, itype n, itype c, std::vector<itype> hs,
                    .padding({ph, pw})
                    .stride({sh, sw})
                    .dilation({dh, dw});
+    auto hs_tensor = idx_cpu.index({0});
+    auto hs = hs_tensor.accessor<itype, 1>();
+    auto ws_tensor = idx_cpu.index({1});
+    auto ws = ws_tensor.accessor<itype, 1>();
+    const int n = hs.size(0);
+
     for (int i = 0; i < n; ++i) {
         itype length = hs[i] * ws[i] * c;
         tensors.emplace_back(F::unfold(x.index({Slice(start, start + length)})
@@ -96,24 +115,24 @@ Tensor ragged_nchw_unfold(Tensor x, itype n, itype c, std::vector<itype> hs,
     return torch::concat(tensors);
 }
 
-Tensor ragged_nchw2nhwc_unfold_matmul(Tensor x, itype n, itype c,
-                                      std::vector<itype> hs,
-                                      std::vector<itype> ws, Tensor w, itype kh,
-                                      itype kw, itype ph, itype pw, itype dh,
-                                      itype dw, itype sh, itype sw) {
+Tensor ragged_nchw2nhwc_unfold_matmul(Tensor x, itype c, Tensor idx_cpu,
+                                      Tensor w, itype kh, itype kw, itype ph,
+                                      itype pw, itype dh, itype dw, itype sh,
+                                      itype sw) {
     CHECK_INPUT(x);
     CHECK_INPUT(w);
+    CHECK_INPUT_CPU(idx_cpu);
     auto unfolded =
-        ragged_nchw_unfold(x, n, c, hs, ws, kh, kw, ph, pw, dh, dw, sh, sw);
+        ragged_nchw_unfold(x, c, idx_cpu, kh, kw, ph, pw, dh, dw, sh, sw);
     return torch::matmul(unfolded, w);
 }
 
-Tensor addB_jr_rr_cuda_forward(torch::Tensor A, int n, torch::Tensor a_dim0s,
+Tensor addB_jr_rr_cuda_forward(torch::Tensor A, torch::Tensor idx_cuda,
                                torch::Tensor B) {
     CHECK_INPUT(A);
     CHECK_INPUT(B);
-    CHECK_INPUT(a_dim0s);
-    return addB_jr_rr_cuda_forward_kernel(A, n, a_dim0s, B);
+    CHECK_INPUT(idx_cuda);
+    return addB_jr_rr_cuda_forward_kernel(A, idx_cuda, B);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
