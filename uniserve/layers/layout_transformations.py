@@ -27,7 +27,7 @@ def ragged_nhwc_to_nchw_abstract(
     c: int,
     HxWs: Sequence[int],
 ):
-    return input.new_empty(input.shape)
+    return input.new_empty(input.shape).flatten()
 
 
 # Next, let’s add an implementation for the operator:
