@@ -109,6 +109,11 @@ def test_RaggedNhwcConv2d_compile():
     m_ragged = torch.compile(m_ragged, dynamic=True, fullgraph=True)
     # torchperf.explain(m_ragged, x1, n, c, hs, ws, HxWs, temb)
 
+    # Torch dynamo hint
+    torch._dynamo.mark_dynamic(x1, 0)
+    torch._dynamo.mark_dynamic(temb, 0)
+    torch._dynamo.mark_dynamic(HxWs_tensor, 0)
+
     y1 = m_ragged(x1, n, c, hs, ws, HxWs, HxWs_tensor, temb)
     assert torchperf.allclose(y0.flatten(), y1.flatten())
 
@@ -127,3 +132,19 @@ def test_RaggedNhwcConv2d_compile():
     # m_ragged(x1, n, c, hs, ws, HxWs, temb)
     # torch.cuda.profiler.start()
     # m_ragged(x1, n, c, hs, ws, HxWs, temb)
+
+    # Check recompilation
+    n, c, hs, ws = 5, 320, [14, 14, 28, 28, 20], [14, 28, 14, 28, 20]
+    HxWs = [h * w for h, w in zip(hs, ws)]
+    HxWs_tensor = torch.tensor(HxWs, dtype=torch.int64)
+    x0, y0 = [], []
+    for i, (h, w) in enumerate(zip(hs, ws)):
+        x = torch.randn(1, c, h, w)
+        x0.append(x)
+    x1 = torch.concat([x.flatten() for x in x0])
+    temb = torch.randn(n, 1280)
+    t2 = torchperf.cuda_timeit_ms(
+        lambda: m_ragged(x1, n, c, hs, ws, HxWs, HxWs_tensor, temb), 0, 1
+    )
+    print(f"{t2=}")
+    assert t2 < 10, "An abnormal long execution time hints for recompilation"
