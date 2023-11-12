@@ -69,7 +69,7 @@ def ragged_nchw2nhwc_unfold_matmul_impl(
     sh: int,
     sw: int,
 ):
-    assert idx_cpu.device.type == 'cpu'
+    assert idx_cpu.device.type == "cpu"
     return uniserve_cuda.ragged_nchw2nhwc_unfold_matmul(
         input, c, idx_cpu, weight, kh, kw, ph, pw, dh, dw, sh, sw
     )

@@ -111,7 +111,7 @@ def test_RaggedNhwcConv2d_compile():
     # Torch dynamo hint
     torch._dynamo.mark_dynamic(x1, 0)
     torch._dynamo.mark_dynamic(temb, 0)
-    torch._dynamo.mark_dynamic(idx_cuda,1)
+    torch._dynamo.mark_dynamic(idx_cuda, 1)
     torch._dynamo.mark_dynamic(idx_cpu, 1)
 
     y1 = m_ragged(x1, c, idx_cuda, idx_cpu, temb)
@@ -124,9 +124,7 @@ def test_RaggedNhwcConv2d_compile():
         return y0
 
     t0 = torchperf.cuda_timeit_ms(run_orig)
-    t1 = torchperf.cuda_timeit_ms(
-        lambda: m_ragged(x1, c, idx_cuda, idx_cpu, temb)
-    )
+    t1 = torchperf.cuda_timeit_ms(lambda: m_ragged(x1, c, idx_cuda, idx_cpu, temb))
     print(f"{t0=} {t1=}")
 
     # m_ragged(x1, n, c, hs, ws, HxWs, temb)

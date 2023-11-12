@@ -190,7 +190,7 @@ def profile_layerwise_problem_scalability(
     handles = []
     for name, layer in pipe.unet.named_modules():
         if layer.__class__.__name__ in modules_to_be_hooked:
-        # if name == "down_blocks.0.resnets.0":
+            # if name == "down_blocks.0.resnets.0":
             layer.profiling_name = name
             handle = layer.register_forward_pre_hook(hook_save_input, with_kwargs=True)
             handles.append(handle)

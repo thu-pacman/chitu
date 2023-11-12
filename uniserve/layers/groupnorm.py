@@ -48,7 +48,7 @@ def ragged_nchw_groupnorm_impl(
     bias: Tensor,
     eps: float,
 ):
-    assert idx_cpu.device.type == 'cpu'
+    assert idx_cpu.device.type == "cpu"
     return uniserve_cuda.ragged_nchw_groupnorm_forward(
         input, c, idx_cpu, num_groups, weight, bias, eps
     )

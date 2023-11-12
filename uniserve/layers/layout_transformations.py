@@ -36,7 +36,7 @@ def ragged_nhwc_to_nchw_impl(
     c: int,
     idx_cpu: Tensor,
 ):
-    assert idx_cpu.device.type == 'cpu'
+    assert idx_cpu.device.type == "cpu"
     return uniserve_cuda.ragged_nhwc_to_nchw(x, c, idx_cpu)
 
 
@@ -68,5 +68,5 @@ def ragged_nchw_to_nhwc_impl(
     c: int,
     idx_cpu: Tensor,
 ):
-    assert idx_cpu.device.type == 'cpu'
+    assert idx_cpu.device.type == "cpu"
     return uniserve_cuda.ragged_nchw_to_nhwc(x, c, idx_cpu)
