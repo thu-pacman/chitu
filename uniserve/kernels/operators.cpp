@@ -44,6 +44,41 @@ Tensor ragged_nchw_groupnorm_forward(
     return torch::concat(ys);
 }
 
+Tensor ragged_nseqf_attention_forward(const at::Tensor &input1,
+                                      const at::Tensor &input2,
+                                      const at::Tensor &input3, int64_t heads,
+                                      int64_t features, Tensor idx_cpu,
+                                      bool enco) {
+    CHECK_INPUT(input1);
+    CHECK_INPUT(input2);
+    CHECK_INPUT(input3);
+    itype start = 0, start2 = 0;
+    std::vector<Tensor> ys;
+    auto LSeq_tensor = idx_cpu.index({0});
+    auto LSeq = LSeq_tensor.accessor<itype, 1>();
+    const int n = LSeq.size(0);
+    for (int i = 0; i < n; i++) {
+        itype length = LSeq[i] * heads * features;
+        itype length2 = (enco ? 77 : LSeq[i]) * heads * features;
+        int64_t seq = enco ? 77 : LSeq[i];
+        auto q = input1.narrow(0, start, length)
+                     .reshape({LSeq[i], heads, features})
+                     .permute({1, 0, 2});
+        auto k = input2.narrow(0, start2, length2)
+                     .reshape({seq, heads, features})
+                     .permute({1, 0, 2});
+        auto v = input3.narrow(0, start2, length2)
+                     .reshape({seq, heads, features})
+                     .permute({1, 0, 2});
+        auto y =
+            torch::scaled_dot_product_attention(q, k, v).permute({1, 0, 2});
+        ys.emplace_back(y);
+        start += length;
+        start2 += length2;
+    }
+    return torch::concat(ys).flatten();
+}
+
 Tensor ragged_nhwc_to_nchw(Tensor x, itype c, Tensor idx_cpu) {
     CHECK_INPUT(x);
     itype start = 0;
@@ -138,6 +173,8 @@ Tensor addB_jr_rr_cuda_forward(torch::Tensor A, torch::Tensor idx_cuda,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ragged_nchw_groupnorm_forward", &ragged_nchw_groupnorm_forward,
           "Ragged NCHW LLTM forward (CUDA, Uniserve)")
+        .def("ragged_nseqf_attention_forward", &ragged_nseqf_attention_forward,
+             "ragged_nseqf_attention_forward (CUDA, Uniserve)")
         .def("ragged_nhwc_to_nchw", &ragged_nhwc_to_nchw,
              "ragged_nhwc_to_nchw (CUDA, Uniserve)")
         .def("ragged_nchw_to_nhwc", &ragged_nchw_to_nhwc,

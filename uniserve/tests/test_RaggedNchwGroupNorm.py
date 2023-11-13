@@ -15,7 +15,7 @@ def test_RaggedNchwGroupNorm_uniform():
     y0 = layer_torch(x)
 
     layer_us = groupnorm.RaggedNchwGroupNorm(layer_torch)
-    idx_cuda, idx_cpu = uniserve.utils.create_index_from_regular(n, h, w)
+    idx_cuda, idx_cpu = uniserve.utils.create_index_2d_from_regular(n, h, w)
     y1 = layer_us(x.flatten(), c, idx_cpu)
 
     assert torchperf.allclose(y0.flatten(), y1)
@@ -36,7 +36,7 @@ def test_RaggedNchwGroupNorm_ragged():
     y0 = torch.concat(y0)
 
     layer_us = groupnorm.RaggedNchwGroupNorm(layer_torch)
-    idx_cuda, idx_cpu = uniserve.utils.create_index(hs, ws)
+    idx_cuda, idx_cpu = uniserve.utils.create_index_2d(hs, ws)
     y1 = layer_us(x0.flatten(), c, idx_cpu)
 
     assert torchperf.allclose(y0.flatten(), y1)

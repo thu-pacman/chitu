@@ -1,7 +1,7 @@
 import torch
 
 
-def create_index(hs, ws):
+def create_index_2d(hs, ws):
     assert len(hs) == len(ws)
     HxWs = [h * w for h, w in zip(hs, ws)]
     idx_cuda = torch.tensor([hs, ws, HxWs], dtype=torch.int64)
@@ -9,10 +9,21 @@ def create_index(hs, ws):
     return idx_cuda, idx_cpu
 
 
-def create_index_from_regular(n, h, w):
+def create_index_1d(Lseq):
+    idx_cuda = torch.tensor([Lseq], dtype=torch.int64)
+    idx_cpu = idx_cuda.to("cpu")
+    return idx_cuda, idx_cpu
+
+
+def create_index_2d_from_regular(n, h, w):
     hs = [h] * n
     ws = [w] * n
-    return create_index(hs, ws)
+    return create_index_2d(hs, ws)
+
+
+def create_index_1d_from_regular(n, seq):
+    Lseq = [seq] * n
+    return create_index_1d(Lseq)
 
 
 # def replace_layer(module, name, old_layer, new_layer):

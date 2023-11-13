@@ -43,7 +43,7 @@ def test_ResNet_uniform():
     m_ragged = RaggedResnetBlock2D_nchw(m_orig)
 
     n, c, h, w = 2, 320, 32, 32
-    idx_cuda, idx_cpu = uniserve.utils.create_index_from_regular(n, h, w)
+    idx_cuda, idx_cpu = uniserve.utils.create_index_2d_from_regular(n, h, w)
 
     x = torch.randn(n, c, h, w)
     temb = torch.randn(n, 1280)
@@ -57,7 +57,7 @@ def test_ResNet_uniform():
 @torch.no_grad()
 def test_RaggedNhwcConv2d_ragged():
     n, c, hs, ws = 4, 320, [14, 14, 28, 28], [14, 28, 14, 28]
-    idx_cuda, idx_cpu = uniserve.utils.create_index(hs, ws)
+    idx_cuda, idx_cpu = uniserve.utils.create_index_2d(hs, ws)
 
     m_orig = build_resnet()
     m_ragged = RaggedResnetBlock2D_nchw(m_orig)
@@ -85,7 +85,7 @@ def test_RaggedNhwcConv2d_compile():
     # n, c = 4, 320
     # hs, ws = [56] * n, [56] * n
 
-    idx_cuda, idx_cpu = uniserve.utils.create_index(hs, ws)
+    idx_cuda, idx_cpu = uniserve.utils.create_index_2d(hs, ws)
 
     m_orig = build_resnet()
     m_ragged = RaggedResnetBlock2D_nchw(m_orig)
@@ -133,7 +133,7 @@ def test_RaggedNhwcConv2d_compile():
 
     # Check recompilation
     n, c, hs, ws = 5, 320, [14, 14, 28, 28, 20], [14, 28, 14, 28, 20]
-    idx_cuda, idx_cpu = uniserve.utils.create_index(hs, ws)
+    idx_cuda, idx_cpu = uniserve.utils.create_index_2d(hs, ws)
     x0, y0 = [], []
     for i, (h, w) in enumerate(zip(hs, ws)):
         x = torch.randn(1, c, h, w)

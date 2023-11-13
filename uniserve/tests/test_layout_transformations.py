@@ -20,7 +20,7 @@ def ragged_nhwc_to_nchw(x, n, c, HxWs):
 def test_ragged_nhwc_to_nchw():
     n, c, hs, ws = 2, 32, [14, 14], [14, 28]
     HxWs = [h * w for h, w in zip(hs, ws)]
-    idx_cuda, idx_cpu = uniserve.utils.create_index(hs, ws)
+    idx_cuda, idx_cpu = uniserve.utils.create_index_2d(hs, ws)
     y0 = []
     x0 = []
     for h, w in zip(hs, ws):
@@ -47,7 +47,7 @@ def ragged_nchw_to_nhwc(x, n, c, HxWs):
 def test_ragged_nchw_to_nhwc():
     n, c, hs, ws = 2, 32, [14, 14], [14, 28]
     HxWs = [h * w for h, w in zip(hs, ws)]
-    idx_cuda, idx_cpu = uniserve.utils.create_index(hs, ws)
+    idx_cuda, idx_cpu = uniserve.utils.create_index_2d(hs, ws)
     y0 = []
     x0 = []
     for h, w in zip(hs, ws):

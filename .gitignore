@@ -172,3 +172,5 @@ cython_debug/
 *.pt
 *.safetensors
 *.engine
+*.pth
+*.parquet

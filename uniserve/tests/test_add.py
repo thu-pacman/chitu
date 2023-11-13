@@ -22,7 +22,7 @@ def test_addB_jr_rr():
     x0 = torch.concat(x0).contiguous()
     y0 = torch.concat(y0)
 
-    idx_cuda, idx_cpu = uniserve.utils.create_index(hs, ws)
+    idx_cuda, idx_cpu = uniserve.utils.create_index_2d(hs, ws)
     y1 = torch.ops.uniserve.addB_jr_rr(x0, idx_cuda, addend)
 
     assert torchperf.allclose(y0.flatten(), y1.flatten())
