@@ -162,6 +162,9 @@ cython_debug/
 # VSCode
 .vscode/
 
+# PyTorch
+torch_compile_debug
+
 # Others
 *.txt
 *.sqlite

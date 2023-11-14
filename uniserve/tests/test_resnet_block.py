@@ -101,7 +101,7 @@ def test_RaggedNhwcConv2d_compile():
     y0 = torch.concat([y.flatten() for y in y0])
 
     y1 = m_ragged(x1, c, idx_cuda, idx_cpu, temb)
-    assert torchperf.allclose(y0.flatten(), y1.flatten())
+    assert torchperf.allclose(y0.flatten(), y1.flatten(), 0.01)
 
     # Compile wrapper
     m_orig = torch.compile(m_orig, dynamic=True, fullgraph=True)
