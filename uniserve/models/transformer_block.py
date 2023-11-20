@@ -11,7 +11,7 @@ import uniserve
 import uniserve.layers as unn
 
 
-class RaggedTransformerBlock_nchw(nn.Module):
+class RaggedTransformerBlock_nhwc(nn.Module):
     def __init__(self, shadow: BasicTransformerBlock):
         assert isinstance(shadow, BasicTransformerBlock)
         super().__init__()
@@ -26,44 +26,47 @@ class RaggedTransformerBlock_nchw(nn.Module):
         self.ff = shadow.ff
 
     def norm_attn_output_nseqf(
-        self, q, k, v, n, LSeq, features, heads, attn, enco=False
+        self, q, k, v, n, LSeq, heads_dim, heads_num, attn, enco=False
     ):
         Q = attn.to_q(q)
         K = attn.to_k(k)
         V = attn.to_v(v)
         out = self.scaled_dpa(
-            Q.flatten(), K.flatten(), V.flatten(), heads, features, LSeq, enco
+            Q.flatten(), K.flatten(), V.flatten(), heads_num, heads_dim, LSeq, enco
         )
-        out = out.reshape(-1, heads * features)
+        out = out.reshape(-1, heads_num * heads_dim)
         out = attn.to_out[0](out)
         return out
 
     def forward(
         self,
-        input_tensor: torch.Tensor,
+        hidden_states: torch.Tensor,
+        heads_num: int,
+        heads_dim: int,
         n: int,
         LSeq: torch.Tensor,
-        features,
-        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
     ):
         """_summary_
 
         Args:
-            input_tensor (_type_): 1D input tensor
+            hidden_states (_type_): 2D input tensor
             n (_type_): batch size
             seqs (list[int]): seq lenth per batch
-            features (_type_): actual transformer block seq length
-            hidden_states (_type_): sdxl hidden states
+            encoder_hidden_states (_type_): sdxl hidden states
         """
-        x = input_tensor.reshape(-1, features)
-        x_res = x
-        x = self.norm1(x)
-        x = self.norm_attn_output_nseqf(x, x, x, n, LSeq, 64, 20, self.attn1)
+        x_res = hidden_states
+        x = self.norm1(hidden_states)
+        x = self.norm_attn_output_nseqf(
+            x, x, x, n, LSeq, heads_dim, heads_num, self.attn1
+        )
         x += x_res
-        y = hidden_states.reshape(-1, 2048)
+        y = encoder_hidden_states.reshape(-1, 2048)
         x_res = x
         x = self.norm2(x)
-        x = self.norm_attn_output_nseqf(x, y, y, n, LSeq, 64, 20, self.attn2, True)
+        x = self.norm_attn_output_nseqf(
+            x, y, y, n, LSeq, heads_dim, heads_num, self.attn2, True
+        )
         x += x_res
         x_res = x
         x = self.norm3(x)

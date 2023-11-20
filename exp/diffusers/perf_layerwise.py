@@ -83,7 +83,7 @@ def profile_layer_scalability(batches, name, model, sym_args, sym_kwargs):
         return out
 
     ret = []
-    print(f"{profile_layer_scalability.__name__=}")
+    # print(f"{profile_layer_scalability.__name__=}")
     for batch in batches:
         args = shapes_to_tensors(sym_args, 2, 2 * batch)
         kwargs = shapes_to_tensors(sym_kwargs, 2, 2 * batch)
@@ -110,7 +110,7 @@ def profile_layer_scalability_cuda_graph(batches, name, model, sym_args, sym_kwa
         return out
 
     ret = []
-    print(f"{profile_layer_scalability.__name__=}")
+    # print(f"{profile_layer_scalability.__name__=}")
     for batch in batches:
         args = shapes_to_tensors(sym_args, 2, 2 * batch)
         kwargs = shapes_to_tensors(sym_kwargs, 2, 2 * batch)
@@ -128,7 +128,7 @@ def profile_layer_scalability_cuda_graph(batches, name, model, sym_args, sym_kwa
 
 def export_layer_to_onnx(batches, name, model, sym_args, sym_kwargs):
     for batch in [1]:
-        print(sym_args, sym_kwargs)
+        # print(sym_args, sym_kwargs)
         args = shapes_to_tensors(sym_args, 2, 2 * batch)
         kwargs = shapes_to_tensors(sym_kwargs, 2, 2 * batch)
         model(*args, **kwargs)
@@ -191,6 +191,7 @@ def profile_layerwise_problem_scalability(
     for name, layer in pipe.unet.named_modules():
         if layer.__class__.__name__ in modules_to_be_hooked:
             # if name == "down_blocks.0.resnets.0":
+            # print("!!!")
             layer.profiling_name = name
             handle = layer.register_forward_pre_hook(hook_save_input, with_kwargs=True)
             handles.append(handle)
@@ -204,12 +205,13 @@ def profile_layerwise_problem_scalability(
     # profile each layer
     for layer in input_data:
         # layer_profile_data = export_layer_to_fx(batches, *layer)
-        # layer_profile_data = export_layer_to_onnx(batches, *layer)
-        layer_profile_data = profile_layer_scalability(batches, *layer)
-        profile_data.append(
-            ["SDXL" if is_sdxl else "SD15", height, width, layer[0]]
-            + layer_profile_data
-        )
+        # print(layer)
+        layer_profile_data = export_layer_to_onnx(batches, *layer)
+        # layer_profile_data = profile_layer_scalability(batches, *layer)
+        # profile_data.append(
+        #     ["SDXL" if is_sdxl else "SD15", height, width, layer[0]]
+        #     + layer_profile_data
+        # )ex
 
 
 def get_layerwise(profile_data, is_sdxl: bool, shapes, batches):
@@ -238,13 +240,13 @@ def get_layerwise(profile_data, is_sdxl: bool, shapes, batches):
         profile_layerwise_problem_scalability(
             profile_data, is_sdxl, pipe, h, w, batches
         )
-        print(profile_data)
+        # print(profile_data)
 
 
 if __name__ == "__main__":
     profile_data = []
-    input_shapes = [[256, 256], [512, 512]]
-    batches = [1, 2, 4, 8, 16]
+    input_shapes = [[256, 256]]
+    batches = [1]
     for model in [True, False]:
         get_layerwise(profile_data, model, input_shapes, batches)
 

@@ -15,8 +15,8 @@ def ragged_nseqf_attention_forward(
     input1: Tensor,
     input2: Tensor,
     input3: Tensor,
-    heads: int,
-    features: int,
+    heads_num: int,
+    heads_dim: int,
     idx_cpu: Tensor,
     enco: bool,
 ) -> Tensor:
@@ -29,8 +29,8 @@ def ragged_nseqf_attention_forward_abstract(
     input1: Tensor,
     input2: Tensor,
     input3: Tensor,
-    heads: int,
-    features: int,
+    heads_num: int,
+    heads_dim: int,
     idx_cpu: Tensor,
     enco: bool,
 ):
@@ -46,14 +46,15 @@ def ragged_nseqf_attention_forward_impl(
     input1: Tensor,
     input2: Tensor,
     input3: Tensor,
-    heads: int,
-    features: int,
+    heads_num: int,
+    heads_dim: int,
     idx_cpu: Tensor,
     enco: bool,
 ):
     assert idx_cpu.device.type == "cpu"
+    # print(input1.shape, input2.shape, input3.shape, heads, features, idx_cpu, enco)
     return uniserve_cuda.ragged_nseqf_attention_forward(
-        input1, input2, input3, heads, features, idx_cpu, enco
+        input1, input2, input3, heads_num, heads_dim, idx_cpu, enco
     )
 
 
@@ -61,7 +62,9 @@ class RaggedNseqfAttentionForward(nn.Module):
     def __init__(self):
         super(RaggedNseqfAttentionForward, self).__init__()
 
-    def forward(self, input1, input2, input3, heads, features, idx_cpu, enco=False):
+    def forward(
+        self, input1, input2, input3, heads_num, heads_dim, idx_cpu, enco=False
+    ):
         return torch.ops.uniserve.ragged_nseqf_attention_forward(
-            input1, input2, input3, heads, features, idx_cpu, enco
+            input1, input2, input3, heads_num, heads_dim, idx_cpu, enco
         )
