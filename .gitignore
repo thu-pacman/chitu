@@ -177,3 +177,4 @@ torch_compile_debug
 *.engine
 *.pth
 *.parquet
+*.svg

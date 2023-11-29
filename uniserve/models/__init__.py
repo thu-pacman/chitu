@@ -1,3 +1,3 @@
-from .resnet_block import RaggedResnetBlock2D_nchw
+from .resnet_block import RaggedResnetBlock2D_nchw, RaggedResnetBlock2D_nhwc
 from .transformer_block import RaggedTransformerBlock_nhwc
 from .transformer_2d_model import RaggedTransformer2DModel_nchw

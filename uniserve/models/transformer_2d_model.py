@@ -62,9 +62,6 @@ class RaggedTransformer2DModel_nchw(nn.Module):
         for block in self.transformer_blocks:
             hidden_states = block(
                 hidden_states,
-                heads_num,
-                heads_dim,
-                -1,
                 idx_cpu[2].reshape(-1, idx_cpu[2].shape[0]),
                 encoder_hidden_states,
             )

@@ -1,3 +1,6 @@
 [submodule "exp/dataset/data_civitai/civitai_database"]
 	path = exp/dataset/data_civitai/civitai_database
 	url = git@github.com:zhengly123/civitai_database.git
+[submodule "third_party/torchperf"]
+	path = third_party/torchperf
+	url = git@github.com:zhengly123/torchperf.git

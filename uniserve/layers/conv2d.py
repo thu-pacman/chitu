@@ -76,13 +76,15 @@ def ragged_nchw2nhwc_unfold_matmul_impl(
 
 
 class RaggedNhwcConv2d(nn.Module):
-    def __init__(self, shadow_model: LoRACompatibleConv):
-        assert isinstance(shadow_model, LoRACompatibleConv)
+    def __init__(self, shadow_model: nn.Conv2d):
+        assert isinstance(shadow_model, nn.Conv2d)
         super().__init__()
         self.shadow = shadow_model
         weight, bias = self.weight_conv2gemm(shadow_model)
         self.weight = weight
         self.bias = bias
+        self.in_chalnels = shadow_model.in_channels
+        self.out_channels = shadow_model.out_channels
         # If we want to sperate matmul from the C kernel, shape inference
         # for im2col is requried.
         # self.mm = nn.Linear(*weight.shape)
@@ -91,16 +93,18 @@ class RaggedNhwcConv2d(nn.Module):
         # self.mm.weight = nn.Parameter(weight.T)
         # self.mm.bias = bias
 
-    def weight_conv2gemm(self, conv: LoRACompatibleConv):
+    def weight_conv2gemm(self, conv: nn.Conv2d):
         f = conv.weight.shape[0]
         kernel = conv.weight.reshape(f, -1).T.contiguous()  # [crs, f]
         bias = conv.bias.flatten()  # [f]
         return nn.Parameter(kernel), nn.Parameter(bias)
 
+    # TODO: remove c and infer it from x.shape
     def forward(self, x, c, idx_cpu):
         """
         x: [nhw, c]
         output: [nhw, c]"""
+        assert c == self.shadow.in_channels
         x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, c, idx_cpu)
         x = torch.ops.uniserve.ragged_nchw2nhwc_unfold_matmul(
             x,

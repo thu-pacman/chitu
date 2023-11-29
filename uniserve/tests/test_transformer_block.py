@@ -52,7 +52,7 @@ def test_Transformer_uniform():
     y0 = m_orig(x, encoder_hidden_states=encoder_hidden_states)
 
     x = x.reshape(-1, hidden_dim)
-    y1 = m_ragged(x, heads_num, heads_dim, n, idx_cpu, encoder_hidden_states)
+    y1 = m_ragged(x, idx_cpu, encoder_hidden_states)
 
     assert torchperf.allclose(y0.flatten(), y1.flatten(), 0.01)
 
@@ -78,7 +78,7 @@ def test_Transformer_ragged():
     x0 = torch.concat(x0)
     y0 = torch.concat(y0)
     x0 = x0.reshape(-1, hidden_dim)
-    y1 = m_ragged(x0, heads_num, heads_dim, n, idx_cpu, encoder_hidden_states)
+    y1 = m_ragged(x0, idx_cpu, encoder_hidden_states)
 
     assert torchperf.allclose(y0.flatten(), y1.flatten(), 0.01)
 
@@ -105,7 +105,7 @@ def test_Transformer_compile():
     y0 = torch.concat([y.flatten() for y in y0])
 
     x1 = x1.reshape(-1, hidden_dim)
-    y1 = m_ragged(x1, heads_num, heads_dim, n, idx_cpu, encoder_hidden_states)
+    y1 = m_ragged(x1, idx_cpu, encoder_hidden_states)
     assert torchperf.allclose(y0.flatten(), y1.flatten(), 0.01)
 
     # compile wrapper
@@ -118,7 +118,7 @@ def test_Transformer_compile():
     torch._dynamo.mark_dynamic(idx_cuda, 1)
     torch._dynamo.mark_dynamic(idx_cpu, 1)
 
-    y1 = m_ragged(x1, heads_num, heads_dim, n, idx_cpu, encoder_hidden_states)
+    y1 = m_ragged(x1, idx_cpu, encoder_hidden_states)
     assert torchperf.allclose(y0.flatten(), y1.flatten(), 0.01)
 
     def run_orig():
@@ -133,9 +133,7 @@ def test_Transformer_compile():
         return y0
 
     t0 = torchperf.cuda_timeit_ms(run_orig)
-    t1 = torchperf.cuda_timeit_ms(
-        lambda: m_ragged(x1, heads_num, heads_dim, n, idx_cpu, encoder_hidden_states)
-    )
+    t1 = torchperf.cuda_timeit_ms(lambda: m_ragged(x1, idx_cpu, encoder_hidden_states))
     print(f"{t0=} {t1=}")
 
     # Check recompilation
@@ -153,8 +151,6 @@ def test_Transformer_compile():
     x1 = x1.reshape(-1, hidden_dim)
     encoder_hidden_states = torch.randn(n, 77, 2048)
     # m_ragged(x1, n, idx_cpu, features, encoder_hidden_states)
-    t2 = torchperf.cuda_timeit_ms(
-        lambda: m_ragged(x1, heads_num, heads_dim, n, idx_cpu, encoder_hidden_states)
-    )
+    t2 = torchperf.cuda_timeit_ms(lambda: m_ragged(x1, idx_cpu, encoder_hidden_states))
     print(f"{t2=}")
     assert t2 < 10, "An abnormal long execution time hints for recompilation"

@@ -51,13 +51,13 @@ torch::Tensor addB_jr_rr_cuda_forward_kernel(torch::Tensor A,
     auto output = torch::zeros_like(A);
     const int block_size = 32 * 8;
     const dim3 grid((A.numel() + block_size - 1) / block_size);
-    // AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-    AT_DISPATCH_HALF(A.type(), "add_r_b_cuda_forward", ([&] {
-                         add_r_b_kernel<scalar_t><<<grid, block_size>>>(
-                             A.data_ptr<scalar_t>(), n,
-                             idx_cuda.data_ptr<itype>(), A.numel(), A.size(-1),
-                             B.data_ptr<scalar_t>(),
-                             output.data_ptr<scalar_t>());
-                     }));
+    // AT_DISPATCH_HALF(
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        A.type(), "add_r_b_cuda_forward", ([&] {
+            add_r_b_kernel<scalar_t><<<grid, block_size>>>(
+                A.data_ptr<scalar_t>(), n, idx_cuda.data_ptr<itype>(),
+                A.numel(), A.size(-1), B.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>());
+        }));
     return output;
 }

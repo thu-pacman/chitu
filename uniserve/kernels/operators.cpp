@@ -170,6 +170,39 @@ Tensor addB_jr_rr_cuda_forward(torch::Tensor A, torch::Tensor idx_cuda,
     return addB_jr_rr_cuda_forward_kernel(A, idx_cuda, B);
 }
 
+Tensor ragged_nchw_interpolate(const at::Tensor &x, itype c, Tensor idx_cpu,
+                               double scale_factor, std::string mode) {
+    // {'scale_factor': 2.0, 'mode': 'nearest'}
+    namespace F = torch::nn::functional;
+    CHECK_INPUT(x);
+    CHECK_INPUT_CPU(idx_cpu);
+    itype start = 0;
+    std::vector<Tensor> tensors;
+
+    auto hs_tensor = idx_cpu.index({0});
+    auto hs = hs_tensor.accessor<itype, 1>();
+    auto ws_tensor = idx_cpu.index({1});
+    auto ws = ws_tensor.accessor<itype, 1>();
+    const int n = hs.size(0);
+
+    for (int i = 0; i < n; ++i) {
+        itype length = hs[i] * ws[i] * c;
+        auto opt = F::InterpolateFuncOptions().scale_factor(
+            std::vector{scale_factor, scale_factor});
+        tensors.emplace_back(
+            F::interpolate(x.index({Slice(start, start + length)})
+                               .reshape({1, c, hs[i], ws[i]}),
+                           opt)
+                .flatten()); // [chw]
+        start += length;
+    }
+    AT_ASSERTM(start == x.numel(),
+               "Number of transposed elements mismatch: traversed " +
+                   std::to_string(start) + " but the tensor has " +
+                   std::to_string(x.numel()) + " elements");
+    return torch::concat(tensors);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ragged_nchw_groupnorm_forward", &ragged_nchw_groupnorm_forward,
           "Ragged NCHW LLTM forward (CUDA, Uniserve)")
@@ -182,5 +215,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("ragged_nchw2nhwc_unfold_matmul", &ragged_nchw2nhwc_unfold_matmul,
              "ragged_nchw2nhwc_unfold_matmul (CUDA, Uniserve)")
         .def("addB_jr_rr", &addB_jr_rr_cuda_forward,
-             "addB_jr_rr (CUDA, Uniserve)");
+             "addB_jr_rr (CUDA, Uniserve)")
+        .def("ragged_nchw_interpolate", &ragged_nchw_interpolate,
+             "ragged_nchw_interpolate (CUDA, Uniserve)");
 }
