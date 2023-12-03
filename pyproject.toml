@@ -1,0 +1,13 @@
+[project]
+name = "uniserve"
+version = "0.0.1"
+dependencies = []
+
+[tool.setuptools]
+packages = ["uniserve"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: slow tests (deselect with '-m \"not slow\"')",
+    "serial",
+]
