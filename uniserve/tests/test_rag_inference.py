@@ -4,8 +4,14 @@
 import os
 
 os.environ["HF_HUB_OFFLINE"] = "1"
+# os.environ["TORCHDYNAMO_REPORT_GUARD_FAILURES"] = "1"
+# os.environ[
+#     "TORCH_LOGS"
+# ] = "guards,+dynamo,+torch.fx.experimental.symbolic_shapes,dynamic"
 
 import pytest
+import datetime
+import numpy as np
 import torch
 import torch.fx
 from torch.fx.node import Node
@@ -61,7 +67,20 @@ def recursive_apply(cur, fn):
             recursive_apply(v, fn)
 
 
-def mark_dynamic_dims(args, kwargs, ragged_dims: list[list[int]]):
+def recursive_tensor_map(cur, fn):
+    if torch.is_tensor(cur):
+        return fn(cur)
+    elif isinstance(cur, dict):
+        return {k: recursive_tensor_map(v, fn) for k, v in cur.items()}
+    elif isinstance(cur, tuple):
+        return tuple(recursive_tensor_map(v, fn) for v in cur)
+    elif isinstance(cur, list):
+        return [recursive_tensor_map(v, fn) for v in cur]
+    else:
+        return cur
+
+
+def mark_dynamic_dims(args, kwargs={}, ragged_dims: list[list[int]] = []):
     assert isinstance(ragged_dims, (list, tuple))
     # mark dynamic dimensions
     for i, d in ragged_dims:
@@ -277,6 +296,7 @@ def build_unet_input(b=2, h=32, w=32):
     )
 
 
+@pytest.mark.slow()
 def test_rag_inference_unet():
     model = build_unet()
     args, kwargs = build_unet_input()
@@ -293,383 +313,6 @@ def test_rag_inference_unet():
     assert rshape.rag_division_ratio == 1
 
 
-# def get_unet_gm(
-#     model,
-#     args,
-#     kwargs,
-#     ragged_dims: dict[torch.Tensor, list[int]],
-#     dynamic=None,
-#     dynamic_batch=False,
-#     save_svg=False,
-# ):
-#     assert isinstance(ragged_dims, dict)
-#     assert False, "TODO: fix ragged dims"
-#     # mark dynamic dimensions
-#     for i, d in ragged_dims:
-#         torch._dynamo.mark_dynamic(args[i], d)
-
-#     if dynamic_batch:
-
-#         def mark_batch_as_dynamic(arg):
-#             if len(arg.shape) >= 1:
-#                 torch._dynamo.mark_dynamic(arg, 0)
-
-#         for arg in args:
-#             mark_batch_as_dynamic(arg)
-#         recursive_apply(kwargs, mark_batch_as_dynamic)
-
-#     gm = torchperf.torch_dynamo.get_dynamo_graph_modules(
-#         model, args, kwargs, True, dynamic
-#     )[0]
-#     gm.graph.print_tabular()
-#     if save_svg:
-#         torchperf.torch_dynamo.draw_simple_graph(gm, "unet_bhw_dynamic.svg")
-#     return gm
-
-
-# %%
-# model = build_unet()
-# %%
-# model = build_unet()
-# args, kwargs = build_unet_input(h=32)
-# %%
-# rag_dims = [[0, 2], [0, 3]]
-
-# torch._dynamo.allow_in_graph(
-#     (BasicTransformerBlock, ResnetBlock2D, LoRACompatibleConv, LoRACompatibleLinear)
-# )
-# # gm = run_rag_inference(model, args, kwargs, rag_dims)
-# gm_orig = get_unet_gm(model, args, kwargs, rag_dims)
-# %%
-# mark_dynamic_dims(args, kwargs, [[0, 2], [0, 3]])
-# model_inductor = torch.compile(model, dynamic=True)
-# %%
-# for height in [32, 48]:
-#     print(f'=== current height {height}')
-#     args, kwargs = build_unet_input(h=height, w=64)
-#     torchperf.cuda_timeit_ms(
-#         lambda :model_inductor(*args, **kwargs), 0, 5
-#     )
-# exit()
-# output_shape = [2, 4, RaggedDim(), RaggedDim()]
-# rshape = get_output_ragged_shape(gm)
-# assert rshape.shape == output_shape
-# assert rshape.rag_division_ratio == 1
-
-# %% ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-#    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-#### ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-# model = build_unet()
-# args, kwargs = build_unet_input()
-
-# # %% get the graph module with rag inference
-# gm = None
-
-
-# def test_rag_inference_unet_body(model, args, kwargs):
-#     global gm
-#     ragged_dims = [[0, 2], [0, 3]]
-
-#     torch._dynamo.allow_in_graph(
-#         (BasicTransformerBlock, ResnetBlock2D, LoRACompatibleConv, LoRACompatibleLinear)
-#     )
-
-#     model.run_head = uniserve.models.unet_2d_condition.run_head
-#     emb = model.run_head(model, *args, **kwargs)
-#     model.run_body = uniserve.models.unet_2d_condition.run_body
-#     fn = lambda *args, **kwargs: model.run_body(model, *args, **kwargs, emb=emb)
-#     # gm = run_rag_inference(
-#     #     fn, args, kwargs, ragged_dims, dynamic=True, dynamic_batch=False, save_svg=True
-#     # )
-#     gm = get_unet_gm(
-#         fn, args, kwargs, ragged_dims, dynamic=True, dynamic_batch=False, save_svg=True
-#     )
-#     regular_and_rag_shape_inference(gm, args, kwargs, ragged_dims)
-#     output_shape = [2, 4, RaggedDim(), RaggedDim()]
-#     rshape = get_output_ragged_shape(gm)
-#     assert rshape.shape == output_shape
-#     assert rshape.rag_division_ratio == 1
-#     return gm
-
-
-# # %%
-# def get_unet_body(model, args, kwargs):
-#     global gm
-#     ragged_dims = [[0, 2], [0, 3]]
-
-#     torch._dynamo.allow_in_graph(
-#         (BasicTransformerBlock, ResnetBlock2D, LoRACompatibleConv, LoRACompatibleLinear)
-#     )
-
-#     model.run_head = uniserve.models.unet_2d_condition.run_head
-#     emb = model.run_head(model, *args, **kwargs)
-#     model.run_body = uniserve.models.unet_2d_condition.run_body
-#     fn = lambda *args, **kwargs: model.run_body(model, *args, **kwargs, emb=emb)
-#     fn(*args, **kwargs)
-#     # gm = run_rag_inference(
-#     #     fn, args, kwargs, ragged_dims, dynamic=True, dynamic_batch=False, save_svg=True
-#     # )
-#     gm = get_unet_gm(
-#         fn, args, kwargs, ragged_dims, dynamic=True, dynamic_batch=False, save_svg=True
-#     )
-#     return gm
-
-
-# # %%
-# tensors_to_shapes(args), tensors_to_shapes(kwargs)
-
-
-# # %%
-# gm = get_unet_body(model, args, kwargs)
-# gm: torch.fx.GraphModule
-# # %%
-# gm.graph.print_tabular()
-
-# # %%
-# gm(*args, **kwargs)
-
-# # %%
-# gm.forward
-
-# # %%
-# ragged_dims = [[0, 2], [0, 3]]
-# regular_and_rag_shape_inference(gm, args, kwargs, ragged_dims)
-# output_shape = [2, 4, RaggedDim(), RaggedDim()]
-# rshape = get_output_ragged_shape(gm)
-
-# # %%
-# torchperf.torch_dynamo.draw_simple_graph(gm, "test_unet.svg")
-
-# # %%
-# transformed_gm: torch.nn.Module = RagTransformer(gm).transform()
-# # transformed.print_readable()
-# transformed_gm.graph.print_tabular()
-# torchperf.torch_dynamo.draw_simple_graph(transformed_gm, "transformed_unet.svg")
-# # %%
-
-
-# def run_and_compare(model, transformed, c, hs, ws):
-#     args, kwargs = build_unet_input(b=1)
-#     idx2d_cuda, idx2d_cpu = create_index_2d(hs, ws)
-#     idx1d_cuda, idx1d_cpu = idx2d_cuda[2:], idx2d_cpu[2:]
-
-#     x0 = []
-#     y0 = []
-#     for i, (h, w) in enumerate(zip(hs, ws)):
-#         x = torch.randn(1, c, h, w)
-#         y = model(x, *args[1:], **kwargs)  # [1, c, h, w]
-#         x0.append(x.flatten())
-#         if isinstance(y, (tuple, list)):
-#             assert len(y) == 1
-#             y0.append(y[0].flatten())
-#         else:
-#             y0.append(y.flatten())
-#     x0 = torch.concat(x0)
-#     y0 = torch.concat(y0)
-
-#     def flatten_nested_tensors(cur):
-#         def recursive_flatten(cur, result):
-#             if torch.is_tensor(cur):
-#                 result.append(cur)
-#             elif isinstance(cur, dict):
-#                 for k, v in cur.items():
-#                     recursive_flatten(v, result)
-#             elif isinstance(cur, (list, tuple)):
-#                 for v in cur:
-#                     recursive_flatten(v, result)
-
-#         ret = []
-#         recursive_flatten(cur, ret)
-#         return ret
-
-#     tensor_args = [x0.flatten(), *args[1:], *flatten_nested_tensors(kwargs)]
-#     assert len(tensor_args) == 5, tensor_args
-#     y1 = transformed(  # idx1d_cuda, idx1d_cpu, idx2d_cuda, idx2d_cpu, s0, s1, l_x_
-#         idx1d_cuda, idx1d_cpu, idx2d_cuda, idx2d_cpu, None, None, *tensor_args
-#     )
-#     assert torchperf.allclose(y0, y1)
-
-
-# run_and_compare(model, transformed_gm, 4, [32], [32])
-# run_and_compare(model, transformed_gm, 4, [32, 32], [32, 32])
-# run_and_compare(model, transformed_gm, 4, [32, 32, 32], [32, 32, 16])
-
-# # %%
-
-
-# def get_unet_gm_batch_size(b):
-#     args, kwargs = build_unet_input(b=b)
-#     rag_dims = [[0, 2], [0, 3]]
-#     # rag_dims = [[0,0], [0, 2], [0, 3], [2,0], [3,0], [4,0]]
-
-#     torch._dynamo.allow_in_graph(
-#         (BasicTransformerBlock, ResnetBlock2D, LoRACompatibleConv, LoRACompatibleLinear)
-#     )
-
-#     gm = run_rag_inference(model, args, kwargs, rag_dims, dynamic=True)
-#     return gm
-
-
-# # gm_unet_bs1:torch.fx.GraphModule = get_unet_gm_batch_size(4)
-# # gm_unet_bs1:torch.fx.GraphModule = get_unet_gm_batch_size(5)
-# gm_unet_bs1: torch.fx.GraphModule = get_unet_gm_batch_size(6)
-
-# # %%
-# # =================================================================================================
-# # =================================================================================================
-# # =================================================================================================
-# # %%
-# model = build_unet()
-# args, kwargs = build_unet_input()
-# # %%
-# ragged_dims = {args[0]: [2, 3]}
-# ragged_dims[args[0]]
-
-
-# # %%
-
-# torch._dynamo.allow_in_graph(
-#     (BasicTransformerBlock, ResnetBlock2D, LoRACompatibleConv, LoRACompatibleLinear)
-# )
-# gm, fx_args = get_fx_graph_and_inputs_with_dynamo(model, args, kwargs, [[0, 2], [0, 3]])
-# gm, fx_args
-
-# # %%
-# regular_and_rag_shape_inference_with_fx_inputs(gm, fx_args, ragged_dims)
-# rshape = get_output_ragged_shape(gm)
-
-
-# # %% ===========================================================================================
-# def build_unet_body(model, args, kwargs):
-#     model.run_head = uniserve.models.unet_2d_condition.run_head
-#     emb = model.run_head(model, *args, **kwargs)
-#     model.run_body = uniserve.models.unet_2d_condition.run_body
-#     fn = lambda *args, **kwargs: model.run_body(model, *args, **kwargs, emb=emb)
-#     return fn
-
-
-# unet_body = build_unet_body(model, args, kwargs)
-
-# # %%
-# torch._dynamo.allow_in_graph(
-#     (BasicTransformerBlock, ResnetBlock2D, LoRACompatibleConv, LoRACompatibleLinear)
-# )
-# gm, fx_args = get_fx_graph_and_inputs_with_dynamo(
-#     unet_body, args, kwargs, [[0, 2], [0, 3]]
-# )
-# gm, fx_args
-
-# # %%
-# regular_and_rag_shape_inference_with_fx_inputs(gm, fx_args, ragged_dims)
-# rshape = get_output_ragged_shape(gm)
-# assert rshape.shape == [2, 4, RaggedDim(), RaggedDim()]
-# assert rshape.rag_division_ratio == 1
-
-# # %%
-# rshape
-# torchperf.torch_dynamo.draw_simple_graph(gm, "unet_body.svg")
-
-# # %%
-# # @torch.no_grad()
-# # def test_rag_transformation_unet_body():
-# transformed_gm: torch.nn.Module = RagTransformer(gm).transform()
-# transformed_gm.print_readable()
-# transformed_gm.graph.print_tabular()
-
-# # %%
-# torchperf.torch_dynamo.draw_simple_graph(transformed_gm, "unet_body_transformed.svg")
-
-
-# # %% Shape propogation for transformed graph
-# @torch.no_grad()
-# def run_transformed_shape_inference():
-#     idx2d_cuda, idx2d_cpu = create_index_2d([8], [8])
-#     idx1d_cuda, idx1d_cpu = idx2d_cuda[2:], idx2d_cpu[2:]
-#     emb = model.run_head(model, *args, **kwargs)
-#     x0 = torch.randn(1, 4, 8, 8)
-#     fx_inputs = [
-#         idx1d_cuda,
-#         idx1d_cpu,
-#         idx2d_cuda,
-#         idx2d_cpu,
-#         None,
-#         None,
-#         x0.flatten(),
-#         kwargs["encoder_hidden_states"],
-#         emb,
-#     ]
-#     ragged_dims = {x0: [2, 3]}
-#     regular_and_rag_shape_inference_with_fx_inputs(
-#         transformed_gm, fx_inputs, ragged_dims
-#     )
-
-
-# run_transformed_shape_inference()
-
-# # %% Get placeholders
-# [n.target for n in transformed_gm.graph.nodes if n.op == "placeholder"]
-
-# # %%
-# tensors_to_shapes(args), tensors_to_shapes(kwargs)
-
-# # %%
-# args, kwargs = build_unet_input(b=1)
-
-
-# # %% Test equivalence
-# @torch.no_grad()
-# def run_and_compare(model: torch.nn.Module, gm: torch.fx.GraphModule, c, hs, ws):
-#     torch.set_default_dtype(torch.float32)
-#     model = model.eval().float()
-#     gm = gm.eval().float()
-#     args, kwargs = build_unet_input(b=1)
-#     idx2d_cuda, idx2d_cpu = create_index_2d(hs, ws)
-#     idx1d_cuda, idx1d_cpu = idx2d_cuda[2:], idx2d_cpu[2:]
-#     emb = model.run_head(model, *args, **kwargs)
-
-#     x0 = []
-#     y0 = []
-#     for i, (h, w) in enumerate(zip(hs, ws)):
-#         x = torch.randn(1, c, h, w)
-#         print(args[1:])
-#         y = model.run_body(model, x, *args[1:], **kwargs, emb=emb)[0]  # [1, c, h, w]
-#         x0.append(x.flatten())
-#         y0.append(y.flatten())
-#     x0 = torch.concat(x0)
-#     y0 = torch.concat(y0)
-
-#     y1 = transformed_gm(  # idx1d_cuda, idx1d_cpu, idx2d_cuda, idx2d_cpu, s0, s1, l_x_
-#         idx1d_cuda,
-#         idx1d_cpu,
-#         idx2d_cuda,
-#         idx2d_cpu,
-#         None,
-#         None,
-#         x0.flatten(),
-#         kwargs["encoder_hidden_states"],
-#         emb,
-#     )[0]
-#     print(y0)
-#     print(y1)
-#     # assert torchperf.allclose(y0, y1, .1, .1)
-#     assert torchperf.allclose(y0, y1)
-
-
-# run_and_compare(model, transformed_gm, 4, [8], [8])
-# run_and_compare(model, transformed_gm, 4, [8, 8], [8, 8])
-# run_and_compare(model, transformed_gm, 4, [8, 16, 8], [8, 16, 16])
-
-# # %%
-# # transformed_gm.to_folder('unet_body_transformed', 'unet_body_transformed')
-# gm.to_folder("unet_body_orig", "unet_body_orig")
-
-# # %%
-# from importlib import reload
-# import uniserve_cuda
-
-# uniserve_cuda = reload(uniserve_cuda)
-
-
 # %%
 def build_unet_body(model, args, kwargs):
     model.run_head = uniserve.models.unet_2d_condition.run_head
@@ -681,10 +324,16 @@ def build_unet_body(model, args, kwargs):
 
 # %% Test equivalence
 @torch.no_grad()
-def run_and_compare(model: torch.nn.Module, gm: torch.fx.GraphModule, c, hs, ws):
-    torch.set_default_dtype(torch.float32)
-    model = model.eval().float()
-    gm = gm.eval().float()
+def run_and_compare(
+    model: torch.nn.Module, gm: torch.fx.GraphModule, c, hs, ws, dtype=torch.float16
+):
+    saved_dtype = torch.get_default_dtype()
+    if dtype == torch.float32:
+        torch.set_default_dtype(torch.float32)
+        model = model.eval().float()
+        gm = gm.eval().float()
+    else:
+        torch.set_default_dtype(torch.float16)
     args, kwargs = build_unet_input(b=1)
     idx2d_cuda, idx2d_cpu = create_index_2d(hs, ws)
     idx1d_cuda, idx1d_cpu = idx2d_cuda[2:], idx2d_cpu[2:]
@@ -714,70 +363,252 @@ def run_and_compare(model: torch.nn.Module, gm: torch.fx.GraphModule, c, hs, ws)
     )[0]
     print(y0)
     print(y1)
-    # assert torchperf.allclose(y0, y1, .1, .1)
+    torch.set_default_dtype(saved_dtype)
     assert torchperf.allclose(y0, y1)
 
 
-@pytest.mark.skip(reason="Not implemented yet")
-def test_ragged_unet_body():
-    model = build_unet()
-    args, kwargs = build_unet_input()
-    ragged_dims = {args[0]: [2, 3]}
-    torch._dynamo.allow_in_graph(
-        (BasicTransformerBlock, ResnetBlock2D, LoRACompatibleConv, LoRACompatibleLinear)
+# %%
+@torch.no_grad()
+def run_transformed_shape_inference(model, transformed_gm, args, kwargs):
+    idx2d_cuda, idx2d_cpu = create_index_2d([8], [8])
+    idx1d_cuda, idx1d_cpu = idx2d_cuda[2:], idx2d_cpu[2:]
+    emb = model.run_head(model, *args, **kwargs)
+    x0 = torch.randn(1, 4, 8, 8)
+    fx_inputs = [
+        idx1d_cuda,
+        idx1d_cpu,
+        idx2d_cuda,
+        idx2d_cpu,
+        None,
+        None,
+        x0.flatten(),
+        kwargs["encoder_hidden_states"],
+        emb,
+    ]
+    ragged_dims = {x0: [2, 3]}
+    regular_and_rag_shape_inference_with_fx_inputs(
+        transformed_gm, fx_inputs, ragged_dims
     )
-    unet_body = build_unet_body(model, args, kwargs)
-    gm, fx_args = get_fx_graph_and_inputs_with_dynamo(
-        unet_body, args, kwargs, [[0, 2], [0, 3]]
-    )
-    regular_and_rag_shape_inference_with_fx_inputs(gm, fx_args, ragged_dims)
-    rshape = get_output_ragged_shape(gm)
-    assert rshape.shape == [2, 4, RaggedDim(), RaggedDim()]
-    assert rshape.rag_division_ratio == 1
-    # torchperf.torch_dynamo.draw_simple_graph(gm, "unet_body.svg")
 
-    # %%
-    transformed_gm: torch.nn.Module = RagTransformer(gm).transform()
-    transformed_gm.print_readable()
-    transformed_gm.graph.print_tabular()
-    # torchperf.torch_dynamo.draw_simple_graph(transformed_gm, "unet_body_transformed.svg")
 
-    @torch.no_grad()
-    def run_transformed_shape_inference():
-        idx2d_cuda, idx2d_cpu = create_index_2d([8], [8])
-        idx1d_cuda, idx1d_cpu = idx2d_cuda[2:], idx2d_cpu[2:]
-        emb = model.run_head(model, *args, **kwargs)
-        x0 = torch.randn(1, 4, 8, 8)
-        fx_inputs = [
+# %% Get intermediate results
+@torch.no_grad()
+def run_and_get_intemediate_results(
+    full_model,
+    gm: torch.fx.GraphModule,
+    transformed_gm: torch.fx.GraphModule,
+    c,
+    hs,
+    ws,
+    dtype=torch.float16,
+) -> tuple[dict[torch.fx.Node, torch.Tensor]]:
+    """The returned envs from debugger are only valid for batch size 2"""
+    saved_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    if dtype == torch.float32:
+        gm = gm.eval().float()
+        transformed_gm = transformed_gm.eval().float()
+        full_model = full_model.eval().float()
+    args, kwargs = build_unet_input(b=len(hs))
+    idx2d_cuda, idx2d_cpu = create_index_2d(hs, ws)
+    idx1d_cuda, idx1d_cpu = idx2d_cuda[2:], idx2d_cpu[2:]
+    emb = full_model.run_head(full_model, *args, **kwargs)
+
+    x0 = []
+    y0 = []
+    debugger0 = uniserve.transform.debugger.Debugger(gm)
+    assert len(hs) % 2 == 0  # TODO: support batch size 1
+    for i in range(0, len(hs), 2):
+        assert hs[i] == hs[i + 1]
+        assert ws[i] == ws[i + 1]
+        h, w = hs[i], ws[i]
+        x = torch.randn(2, c, h, w)
+        inputs = (
+            None,
+            None,
+            x,
+            kwargs["encoder_hidden_states"][i : i + 2],
+            emb[i : i + 2],
+        )
+        y = debugger0.run(*inputs)[0]
+        x0.append(x.flatten())
+        y0.append(y.flatten())
+    x0 = torch.concat(x0)
+    y0 = torch.concat(y0)
+
+    debugger1 = uniserve.transform.debugger.Debugger(transformed_gm)
+    y1 = debugger1.run(  # idx1d_cuda, idx1d_cpu, idx2d_cuda, idx2d_cpu, s0, s1, l_x_
+        idx1d_cuda,
+        idx1d_cpu,
+        idx2d_cuda,
+        idx2d_cpu,
+        None,
+        None,
+        x0.flatten(),
+        kwargs["encoder_hidden_states"],
+        emb,
+    )[0]
+    torch.set_default_dtype(saved_dtype)
+    transformed_gm = transformed_gm.eval().half()
+    full_model = full_model.eval().half()
+    assert torchperf.allclose(y0, y1, 1e-2, 1e-2, etol=0.01)
+    return (debugger0.env, debugger1.env)
+
+
+def nchw2nhwc(t: torch.Tensor):
+    return t.permute([0, 2, 3, 1])
+
+
+def compare_intermediate_results(env0, env1):
+    """Compare intermediate results from two environments. Make sure they run with the same inputs."""
+    ret = True
+    for n0 in env0:
+        print(n0.name)
+        t0: torch.Tensor = env0[n0]
+        for n1 in env1.keys():
+            if n1.name == "u_" + n0.name or n1.name == n0.name:
+                t1 = env1[n1]
+                break
+        else:
+            # assert False
+            print("Not found", n1.name)
+            continue
+        if torch.is_tensor(t0) and n0.op != "placeholder":
+            if t0.dim() == 4:
+                t0 = nchw2nhwc(t0).flatten(0, 2)
+            else:
+                t0 = t0.flatten(0, 1)
+            # assert torchperf.allclose(t0, t1)
+            ret &= torchperf.allclose(t0, t1)
+    return ret
+
+
+def get_compiled_unet_body(gm_body, *, dynamic):
+    def run_body(
+        idx1d_cuda, idx1d_cpu, idx2d_cuda, idx2d_cpu, x, encoder_hidden_states, emb
+    ):
+        return gm_body(
             idx1d_cuda,
             idx1d_cpu,
             idx2d_cuda,
             idx2d_cpu,
             None,
             None,
-            x0.flatten(),
-            kwargs["encoder_hidden_states"],
+            x,
+            encoder_hidden_states,
             emb,
-        ]
-        ragged_dims = {x0: [2, 3]}
-        regular_and_rag_shape_inference_with_fx_inputs(
-            transformed_gm, fx_inputs, ragged_dims
         )
 
-    run_transformed_shape_inference()
-    args, kwargs = build_unet_input(b=1)
-
-    run_and_compare(model, transformed_gm, 4, [8], [8])
-    run_and_compare(model, transformed_gm, 4, [8, 8], [8, 8])
-    run_and_compare(model, transformed_gm, 4, [8, 16, 8], [8, 16, 16])
-
-    # %%
-    # transformed_gm.to_folder('unet_body_transformed', 'unet_body_transformed')
-    # gm.to_folder("unet_body_orig", "unet_body_orig")
+    run_body = torch.compile(run_body, fullgraph=True, dynamic=dynamic)
+    return run_body
 
 
-# if __name__ == "__main__":
-# test_rag_inference_naive_model()
-# test_rag_inference_naive_model_reshape()
-# test_rag_inference_unet()
-# test_rag_transformation_naive_model()
+def get_unet_groundtruth(
+    model, x: torch.Tensor, timestamp: int, kwargs, hs, ws, *, input_layout="nchw"
+):
+    c = 4
+    assert len(hs) == len(ws)
+    n = len(hs)
+    ys = []
+    start = 0
+    x = x.flatten()
+    # Execute one-by-one
+    for i, (h, w) in enumerate(zip(hs, ws)):
+        kwargs_i = recursive_tensor_map(
+            kwargs,
+            lambda x: x[i : i + 1] if len(x.shape) > 0 and x.shape[0] == n else x,
+        )
+        x_size = c * h * w
+        ys.append(
+            model(
+                x[start : start + x_size].reshape(1, c, h, w),  # latent image
+                timestamp,  # Timestamp
+                **kwargs_i,
+            )[0]
+        )
+        start += x_size
+    return torch.concat([y.flatten() for y in ys])
+
+
+@torch.no_grad()
+def evaluate_inductor_unet_body(full_model, run_body, hs, ws, *, dynamic):
+    args, kwargs = build_unet_input(b=len(hs))
+    idx2d_cuda, idx2d_cpu = create_index_2d(hs, ws)
+    idx1d_cuda, idx1d_cpu = idx2d_cuda[2:], idx2d_cpu[2:]
+    emb = full_model.run_head(full_model, *args, **kwargs)
+    x = torch.randn([4 * sum([h * w for h, w in zip(hs, ws)])])
+
+    if dynamic:
+        for t in (idx1d_cuda, idx1d_cpu, idx2d_cuda, idx2d_cpu):
+            torch._dynamo.mark_dynamic(t, 1)
+        for t in (x, kwargs["encoder_hidden_states"], emb):
+            torch._dynamo.mark_dynamic(t, 0)
+
+    f = lambda: run_body(
+        idx1d_cuda,
+        idx1d_cpu,
+        idx2d_cuda,
+        idx2d_cpu,
+        x,
+        kwargs["encoder_hidden_states"],
+        emb,
+    )
+    t_compilation = torchperf.cuda_timeit_ms(f, warmup=0, iters=1)
+    t = torchperf.cuda_timeit_ms(f)
+    print(f"Time {t:.2f} ms. Compilation {t_compilation/1000:.2f} s")
+    # Correctness
+    y = f()
+    y_ans = get_unet_groundtruth(full_model, x, args[1], kwargs, hs, ws)
+    torchperf.allclose(y[0], y_ans, 0.01, 0.01, etol=0.01)
+
+
+@pytest.mark.slow()
+def test_ragged_unet_body():
+    model = build_unet()
+    args, kwargs = build_unet_input()
+    get_unet_groundtruth(model, *args, kwargs, [32, 32], [32, 32])
+    ragged_dims = {args[0]: [2, 3]}
+    torch._dynamo.allow_in_graph(
+        (BasicTransformerBlock, ResnetBlock2D, LoRACompatibleConv, LoRACompatibleLinear)
+    )
+    unet_body = build_unet_body(model, args, kwargs)
+
+    gm, fx_args = get_fx_graph_and_inputs_with_dynamo(
+        unet_body, args, kwargs, ragged_dims
+    )
+
+    regular_and_rag_shape_inference_with_fx_inputs(gm, fx_args, ragged_dims)
+    rshape = get_output_ragged_shape(gm)
+    assert rshape.shape == [2, 4, RaggedDim(), RaggedDim()]
+    assert rshape.rag_division_ratio == 1
+
+    transformed_gm: torch.nn.Module = RagTransformer(gm).transform()
+    # transformed_gm.print_readable()
+    # transformed_gm.graph.print_tabular()
+    # torchperf.torch_dynamo.draw_simple_graph(transformed_gm, "unet_body_transformed.svg")
+    # transformed_gm.to_folder("unet_body_transformed", "unet_body_transformed")
+
+    env0, env1 = run_and_get_intemediate_results(
+        model, gm, transformed_gm, 4, [8, 8, 16, 16], [8, 8, 16, 16], torch.float16
+    )
+    # compare_intermediate_results(env0, env1) # Only for bs = 2 since no dynamic shape
+
+    compiled_unet_body = get_compiled_unet_body(transformed_gm, dynamic=False)
+
+    torch._dynamo.config.cache_size_limit = 102400
+    evaluate_inductor_unet_body(
+        model, compiled_unet_body, [32, 32, 64, 64], [32, 32, 64, 64], dynamic=False
+    )
+
+
+# # %% Reload custom OPs
+# import importlib
+# torch._custom_ops._destroy('uniserve::ragged_nchw2nhwc_unfold_matmul')
+# importlib.reload(uniserve.layers.conv2d)
+
+if __name__ == "__main__":
+    #     test_rag_inference_naive_model()
+    #     test_rag_inference_naive_model_reshape()
+    #     test_rag_inference_unet()
+    #     test_rag_transformation_naive_model()
+    test_ragged_unet_body()

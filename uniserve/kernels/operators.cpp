@@ -203,9 +203,35 @@ Tensor ragged_nchw_interpolate(const at::Tensor &x, itype c, Tensor idx_cpu,
     return torch::concat(tensors);
 }
 
+Tensor ragged_nhwc_groupnorm_forward(
+    const at::Tensor &input, Tensor idx_cpu, int64_t num_groups,
+    const c10::optional<at::Tensor> &weight = {},
+    const c10::optional<at::Tensor> &bias = {}, double eps = 1e-05) {
+    CHECK_INPUT(input); // [nchw]
+    itype start = 0;
+    std::vector<Tensor> ys;
+    const itype C = input.size(1);
+    auto HxWs_tensor = idx_cpu.index({2});
+    auto HxWs = HxWs_tensor.accessor<itype, 1>();
+    const int n = HxWs.size(0);
+    auto input_nchw = ragged_nhwc_to_nchw(input, C, idx_cpu);
+    for (int i = 0; i < n; ++i) {
+        itype length = HxWs[i] * C;
+        auto x = input_nchw.narrow(0, start, length).reshape({1, C, HxWs[i]});
+        // TODO: provide output tensor to the following function
+        auto y = torch::group_norm(x, num_groups, weight, bias, eps).flatten();
+        ys.emplace_back(y);
+        start += length;
+    }
+    auto y = torch::concat(ys);
+    return ragged_nchw_to_nhwc(y, C, idx_cpu);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ragged_nchw_groupnorm_forward", &ragged_nchw_groupnorm_forward,
-          "Ragged NCHW LLTM forward (CUDA, Uniserve)")
+          "Ragged NCHW groupnorm forward (CUDA, Uniserve)")
+        .def("ragged_nhwc_groupnorm_forward", &ragged_nhwc_groupnorm_forward,
+             "Ragged NHWC groupnorm forward (CUDA, Uniserve)")
         .def("ragged_nseqf_attention_forward", &ragged_nseqf_attention_forward,
              "ragged_nseqf_attention_forward (CUDA, Uniserve)")
         .def("ragged_nhwc_to_nchw", &ragged_nhwc_to_nchw,

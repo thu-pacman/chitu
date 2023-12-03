@@ -36,14 +36,15 @@ class RaggedResnetBlock2D_nchw(nn.Module):
         self.norm2 = unn.RaggedNchwGroupNorm(shadow.norm2)
         self.conv1 = unn.RaggedNhwcConv2d(shadow.conv1)
         self.conv2 = unn.RaggedNhwcConv2d(shadow.conv2)
+        if shadow.conv_shortcut is not None:
+            self.conv_shortcut = unn.RaggedNhwcConv2d(shadow.conv_shortcut)
+        else:
+            self.conv_shortcut = None
         self.nonlinearity = shadow.nonlinearity
         self.time_emb_proj = shadow.time_emb_proj
         self.output_scale_factor = shadow.output_scale_factor
-        self.conv_shortcut = shadow.conv_shortcut
         self.in_channels = shadow.in_channels
         self.out_channels = shadow.out_channels
-        if shadow.conv_shortcut is not None:
-            self.conv_shortcut = unn.RaggedNhwcConv2d(shadow.conv_shortcut)
 
     def norm_act_conv_nchw2nhwc(self, x, c, idx_cpu, norm, nonlinearity, conv):
         x = norm(x, c, idx_cpu)

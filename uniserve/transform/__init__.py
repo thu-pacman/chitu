@@ -4,3 +4,5 @@ from .rag import (
     RagTransformer,
     fx_shape_inference,
 )
+
+from .debugger import Debugger

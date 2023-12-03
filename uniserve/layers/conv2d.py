@@ -46,10 +46,21 @@ def ragged_nchw2nhwc_unfold_matmul_abstract(
     # TODO: deal with downscale and upscale
     assert kh == kw
     assert ph == pw == kh // 2
-    assert ph % 2 == 1
     assert dh == dw == 1
-    assert sh == sw == 1
-    return input.new_empty(input.shape).reshape(-1, c)
+    assert sh == sw
+    assert input.dim() == 1
+    assert weight.dim() == 2
+    output_size = [input.reshape(-1, c).shape[0], weight.shape[1]]
+    if sh != 1:
+        # Unsupported data-dependent control flow
+        # for v in idx_cpu[0]:
+        #     assert v % 2 == 0
+        # for v in idx_cpu[1]:
+        #     assert v % 2 == 0
+        divisor = sh * sw
+        assert output_size[0] % divisor == 0
+        output_size[0] //= divisor
+    return input.new_empty(output_size)
 
 
 # Next, let’s add an implementation for the operator:

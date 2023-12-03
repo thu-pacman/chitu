@@ -356,30 +356,37 @@ class RagTransformer(torch.fx.Transformer):
     def __init__(self, module):
         super().__init__(module)
         # initialize index proxies
-        self.idx1d_cuda = Proxy(
-            self.new_graph.placeholder(
-                "idx1d_cuda", default_value=inspect.Signature.empty
-            ),
-            self.tracer,
-        )
-        self.idx1d_cpu = Proxy(
-            self.new_graph.placeholder(
-                "idx1d_cpu", default_value=inspect.Signature.empty
-            ),
-            self.tracer,
-        )
-        self.idx2d_cuda = Proxy(
-            self.new_graph.placeholder(
-                "idx2d_cuda", default_value=inspect.Signature.empty
-            ),
-            self.tracer,
-        )
-        self.idx2d_cpu = Proxy(
-            self.new_graph.placeholder(
-                "idx2d_cpu", default_value=inspect.Signature.empty
-            ),
-            self.tracer,
-        )
+        self.indices = {}  # (name, divisor) : proxy
+        for dims in [1, 2]:
+            for device in ["cuda", "cpu"]:
+                name = f"idx{dims}d_{device}"
+                self.indices[(name, 1)] = Proxy(
+                    self.new_graph.placeholder(
+                        name, default_value=inspect.Signature.empty
+                    ),
+                    self.tracer,
+                )
+
+    def divide_index2d(self, idx, ratio, device=None):
+        return idx // self.index_2d_divisor(ratio, device=device)
+
+    def index_2d_divisor(self, v, device=None):
+        return torch.tensor([[v], [v], [v**2]], dtype=torch.int64, device=device)
+
+    def get_index(self, dims: int, divisor: int, device: str):
+        assert isinstance(dims, int)
+        assert isinstance(divisor, int)
+        assert isinstance(device, str)
+        name = f"idx{dims}d_{device}"
+        key = (name, divisor)
+        if key not in self.indices:
+            if dims == 2:
+                self.indices[key] = self.divide_index2d(
+                    self.indices[(name, 1)], divisor, device
+                )
+            else:
+                self.indices[key] = self.indices[(name, 1)] // divisor
+        return self.indices[key]
 
     def run_node(self, n: Node) -> torch.fx.Proxy:
         with self._set_current_node(n):
@@ -406,9 +413,7 @@ class RagTransformer(torch.fx.Transformer):
         shape = get_info(n)
         if len(shape) == 4:
             assert shape.get_ragged_dims() == [2, 3]
-            idx2d_cpu = self.divide_index2d(
-                self.idx2d_cpu, shape.rag_division_ratio, "cpu"
-            )
+            idx2d_cpu = self.get_index(2, shape.rag_division_ratio, "cpu")
             t = torch.ops.uniserve.ragged_nchw_to_nhwc(t, shape[1], idx2d_cpu)
         return t
 
@@ -420,12 +425,8 @@ class RagTransformer(torch.fx.Transformer):
             in_shape = get_info(n.args[0])
             out_shape = get_info(n)
             x = args[0]
-            in_index = self.divide_index2d(
-                self.idx2d_cpu, in_shape.rag_division_ratio, "cpu"
-            )
-            out_index = self.divide_index2d(
-                self.idx2d_cpu, out_shape.rag_division_ratio, "cpu"
-            )
+            in_index = self.get_index(2, in_shape.rag_division_ratio, "cpu")
+            out_index = self.get_index(2, out_shape.rag_division_ratio, "cpu")
             x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, in_shape[1], in_index)
             x = torch.ops.uniserve.ragged_nchw_interpolate(
                 x, in_shape[1], in_index, **kwargs
@@ -443,9 +444,6 @@ class RagTransformer(torch.fx.Transformer):
     def add_module(self, old_target, new_mod):
         self.tracer.root.add_module("u_" + old_target, new_mod)
 
-    def divide_index2d(self, idx, ratio, device=None):
-        return idx // self.index_2d_divisor(ratio, device=device)
-
     def call_module(self, n: Node, target, args, kwargs):
         assert isinstance(target, str)
         submod = self.fetch_attr(target)
@@ -458,9 +456,7 @@ class RagTransformer(torch.fx.Transformer):
             return new_mod(
                 args[0],
                 in_channels,
-                self.divide_index2d(
-                    self.idx2d_cpu, get_info(n.args[0]).rag_division_ratio, "cpu"
-                ),
+                self.get_index(2, get_info(n.args[0]).rag_division_ratio, "cpu"),
             )
         elif isinstance(submod, ResnetBlock2D):
             # new_mod = umodel.RaggedResnetBlock2D_nchw(submod)
@@ -475,27 +471,35 @@ class RagTransformer(torch.fx.Transformer):
                 (
                     args[0],
                     in_channels,
-                    self.divide_index2d(
-                        self.idx2d_cuda, get_info(n.args[0]).rag_division_ratio, "cuda"
-                    ),
-                    self.divide_index2d(
-                        self.idx2d_cpu, get_info(n.args[0]).rag_division_ratio, "cpu"
-                    ),
+                    self.get_index(2, get_info(n.args[0]).rag_division_ratio, "cuda"),
+                    self.get_index(2, get_info(n.args[0]).rag_division_ratio, "cpu"),
                     args[1],
                 ),
                 kwargs,
             )
         elif isinstance(submod, BasicTransformerBlock):
-            new_mod = umodel.RaggedTransformerBlock_nchw(submod)
+            new_mod = umodel.RaggedTransformerBlock_nhwc(submod)
             self.add_module(target, new_mod)
-
             assert len(args) == 1
             return self.tracer.call_module(
                 new_mod,
                 new_mod.forward,
                 (
                     args[0],
-                    self.idx1d_cpu // get_info(n.args[0]).rag_division_ratio,
+                    self.get_index(1, get_info(n.args[0]).rag_division_ratio, "cpu"),
+                ),
+                kwargs,
+            )
+        elif isinstance(submod, torch.nn.modules.normalization.GroupNorm):
+            new_mod = unn.RaggedNhwcGroupNorm(submod)
+            self.add_module(target, new_mod)
+            assert len(args) == 1 and len(kwargs) == 0
+            return self.tracer.call_module(
+                new_mod,
+                new_mod.forward,
+                (
+                    *args,
+                    self.get_index(2, get_info(n.args[0]).rag_division_ratio, "cpu"),
                 ),
                 kwargs,
             )
@@ -518,13 +522,8 @@ class RagTransformer(torch.fx.Transformer):
                     torch.ops.uniserve.ragged_nhwc_to_nchw(
                         args[0][0],
                         rshape[1],
-                        self.divide_index2d(
-                            self.idx2d_cpu, rshape.rag_division_ratio, device="cpu"
-                        ),
+                        self.get_index(2, rshape.rag_division_ratio, "cpu"),
                     ),
                 ),
             )
         return super().output(target, args, kwargs)
-
-    def index_2d_divisor(self, v, device=None):
-        return torch.tensor([[v], [v], [v**2]], dtype=torch.int64, device=device)

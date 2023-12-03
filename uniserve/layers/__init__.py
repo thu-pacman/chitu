@@ -1,4 +1,4 @@
-from .groupnorm import RaggedNchwGroupNorm
+from .groupnorm import RaggedNchwGroupNorm, RaggedNhwcGroupNorm
 from .conv2d import RaggedNhwcConv2d
 from .attention import RaggedNseqfAttentionForward
 from . import layout_transformations as _layout_transformations
