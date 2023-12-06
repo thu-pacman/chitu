@@ -448,6 +448,8 @@ class RagTransformer(torch.fx.Transformer):
         assert isinstance(target, str)
         submod = self.fetch_attr(target)
         # assumption: current datalayout is [nhw, c] or [nSeq, c]
+        divisor_in = get_info(n.args[0]).rag_division_ratio
+        divisor_out = get_info(n).rag_division_ratio
         if isinstance(submod, torch.nn.Conv2d):
             in_channels = get_info(n.args[0])[1]
             new_mod = unn.RaggedNhwcConv2d(submod)
@@ -455,27 +457,29 @@ class RagTransformer(torch.fx.Transformer):
             self.tracer.root.add_module("u_" + target, new_mod)
             return new_mod(
                 args[0],
-                in_channels,
-                self.get_index(2, get_info(n.args[0]).rag_division_ratio, "cpu"),
+                self.get_index(2, divisor_in, "cuda"),
+                self.get_index(2, divisor_in, "cpu"),
+                self.get_index(2, divisor_out, "cuda"),
+                self.get_index(2, divisor_out, "cpu"),
             )
         elif isinstance(submod, ResnetBlock2D):
-            # new_mod = umodel.RaggedResnetBlock2D_nchw(submod)
             new_mod = umodel.RaggedResnetBlock2D_nhwc(submod)
             self.add_module(target, new_mod)
 
             assert len(args) == 2
-            in_channels = get_info(n.args[0])[1]
+            assert (
+                divisor_in == divisor_out
+            ), "TODO: support ResNet with down/up sampling"
             return self.tracer.call_module(
                 new_mod,
                 new_mod.forward,
                 (
                     args[0],
-                    in_channels,
-                    self.get_index(2, get_info(n.args[0]).rag_division_ratio, "cuda"),
-                    self.get_index(2, get_info(n.args[0]).rag_division_ratio, "cpu"),
-                    args[1],
+                    self.get_index(2, divisor_in, "cuda"),
+                    self.get_index(2, divisor_in, "cpu"),
+                    args[1],  # temb
                 ),
-                kwargs,
+                kwargs,  # {'scale':}
             )
         elif isinstance(submod, BasicTransformerBlock):
             new_mod = umodel.RaggedTransformerBlock_nhwc(submod)

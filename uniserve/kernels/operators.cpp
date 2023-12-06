@@ -3,11 +3,18 @@
 #include <vector>
 
 // CUDA forward declarations
+using at::IntArrayRef;
 using torch::Tensor;
 using namespace torch::indexing;
 torch::Tensor addB_jr_rr_cuda_forward_kernel(torch::Tensor A,
                                              torch::Tensor idx_cuda,
                                              torch::Tensor B);
+
+Tensor ragged_nhwc_im2col(const Tensor &input, const Tensor &idx_cuda,
+                          const Tensor &idx_cpu, const Tensor &idx_out_cuda,
+                          const Tensor &idx_out_cpu, IntArrayRef kernel_size,
+                          IntArrayRef dilation, IntArrayRef padding,
+                          IntArrayRef stride);
 
 // C++ interface
 
@@ -227,6 +234,19 @@ Tensor ragged_nhwc_groupnorm_forward(
     return ragged_nchw_to_nhwc(y, C, idx_cpu);
 }
 
+Tensor ragged_nhwc_im2col_cuda_forward(
+    const Tensor &input, const Tensor &idx_cuda, const Tensor &idx_cpu,
+    const Tensor &idx_out_cuda, const Tensor &idx_out_cpu,
+    IntArrayRef kernel_size, IntArrayRef padding, IntArrayRef dilation,
+    IntArrayRef stride) {
+    CHECK_INPUT(input);
+    CHECK_INPUT(idx_cuda);
+    CHECK_INPUT(idx_out_cuda);
+    return ragged_nhwc_im2col(input, idx_cuda, idx_cpu, idx_out_cuda,
+                              idx_out_cpu, kernel_size, dilation, padding,
+                              stride);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ragged_nchw_groupnorm_forward", &ragged_nchw_groupnorm_forward,
           "Ragged NCHW groupnorm forward (CUDA, Uniserve)")
@@ -242,6 +262,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              "ragged_nchw2nhwc_unfold_matmul (CUDA, Uniserve)")
         .def("addB_jr_rr", &addB_jr_rr_cuda_forward,
              "addB_jr_rr (CUDA, Uniserve)")
+        .def("ragged_nhwc_im2col", &ragged_nhwc_im2col_cuda_forward,
+             "ragged_nhwc_im2col (CUDA, Uniserve)")
         .def("ragged_nchw_interpolate", &ragged_nchw_interpolate,
              "ragged_nchw_interpolate (CUDA, Uniserve)");
 }

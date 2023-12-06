@@ -37,8 +37,11 @@ def build_resnet(
     return model
 
 
+# Only RaggedResnetBlock2D_nchw is test since it is a wrapper of the nhwc one.
+
+
 @torch.no_grad()
-def test_ResNet_uniform():
+def test_RaggedResnetBlock2D_nchw_uniform():
     m_orig = build_resnet()
     m_ragged = RaggedResnetBlock2D_nchw(m_orig)
 
@@ -55,7 +58,7 @@ def test_ResNet_uniform():
 
 
 @torch.no_grad()
-def test_RaggedNhwcConv2d_ragged():
+def test_RaggedResnetBlock2D_nchw():
     n, c, hs, ws = 4, 320, [14, 14, 28, 28], [14, 28, 14, 28]
     idx_cuda, idx_cpu = uniserve.utils.create_index_2d(hs, ws)
 
@@ -79,7 +82,7 @@ def test_RaggedNhwcConv2d_ragged():
 
 
 @torch.no_grad()
-def test_RaggedNhwcConv2d_compile():
+def test_RaggedResnetBlock2D_nchw_compile():
     n, c, hs, ws = 4, 320, [14, 14, 28, 28], [14, 28, 14, 28]
     # The following setting result into slight numerical errors
     # n, c = 4, 320

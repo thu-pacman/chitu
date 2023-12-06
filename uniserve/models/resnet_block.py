@@ -21,7 +21,7 @@ import uniserve.layers as unn
 # import torch.ops.uniserve as uop
 
 
-class RaggedResnetBlock2D_nchw(nn.Module):
+class RaggedResnetBlock2D_nhwc(nn.Module):
     def __init__(self, shadow: ResnetBlock2D):
         assert isinstance(shadow, ResnetBlock2D)
         super().__init__()
@@ -46,90 +46,68 @@ class RaggedResnetBlock2D_nchw(nn.Module):
         self.in_channels = shadow.in_channels
         self.out_channels = shadow.out_channels
 
-    def norm_act_conv_nchw2nhwc(self, x, c, idx_cpu, norm, nonlinearity, conv):
+    def norm_act_conv(self, x, idx_cuda, idx_cpu, norm, nonlinearity, conv):
+        c = x.shape[1]
+        # TODO: ragged nhwc group norm
+        x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, c, idx_cpu)  # [nchw]
         x = norm(x, c, idx_cpu)
         x = torch.ops.uniserve.ragged_nchw_to_nhwc(x, c, idx_cpu)  # [nhw, c]
         x = nonlinearity(x)
-        x = conv(x, c, idx_cpu)
+        x = conv(x, idx_cuda, idx_cpu, idx_cuda, idx_cpu)
         return x
 
+    # TODO: currently we assume the input and output shapes are the same
     def forward(
         self,
         input_tensor: torch.Tensor,
-        c: int,
         idx_cuda: torch.Tensor,
         idx_cpu: torch.Tensor,
         temb: torch.Tensor,
         scale: float = 1.0,
     ):
         """
-        Return a 1D nchw tensor
+        Return a 2D nhwc tensor
         """
 
-        # n, c, h, w = input_tensor.shape
-        # length = []
-        # pos = [0]
-        # for h, w in zip(hs, ws):
-        #     cnt = c * h * w
-        #     length.append(cnt)
-        #     pos.append(pos[-1] + cnt)
-        # pos.pop()
+        x = input_tensor  # [nhwc]
 
-        x = input_tensor  # [nchw]
-        c0 = c
-
-        x = self.norm_act_conv_nchw2nhwc(
-            x, c, idx_cpu, self.norm1, self.nonlinearity, self.conv1
+        x = self.norm_act_conv(
+            x, idx_cuda, idx_cpu, self.norm1, self.nonlinearity, self.conv1
         )
-        c = self.conv1.out_channels
 
         temb = self.nonlinearity(temb)
         temb = self.time_emb_proj(temb, scale)  # [n, 1280]
 
-        # x = x + temb
         x = torch.ops.uniserve.addB_jr_rr(x, idx_cuda, temb)
-
-        x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, c, idx_cpu)  # [nchw]
-
-        x = self.norm_act_conv_nchw2nhwc(
-            x, c, idx_cpu, self.norm2, self.nonlinearity, self.conv2
+        x = self.norm_act_conv(
+            x, idx_cuda, idx_cpu, self.norm2, self.nonlinearity, self.conv2
         )
 
-        # TOOD: to be optimized
         if self.conv_shortcut is not None:
-            # nchw -> nhwc -> nchw
-            input_tensor = torch.ops.uniserve.ragged_nchw_to_nhwc(
-                input_tensor, c0, idx_cpu
+            input_tensor = self.conv_shortcut(
+                input_tensor, idx_cuda, idx_cpu, idx_cuda, idx_cpu
             )
-            input_tensor = self.conv_shortcut(input_tensor, c0, idx_cpu)
-            input_tensor = torch.ops.uniserve.ragged_nhwc_to_nchw(
-                input_tensor, c, idx_cpu
-            )
-
-        x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, c, idx_cpu)  # [nchw]
 
         x = (input_tensor + x) / self.output_scale_factor
 
         return x
 
 
-class RaggedResnetBlock2D_nhwc(RaggedResnetBlock2D_nchw):
+class RaggedResnetBlock2D_nchw(RaggedResnetBlock2D_nhwc):
     def __init__(self, shadow: ResnetBlock2D):
         super().__init__(shadow)
         self.shadow = shadow
 
     def forward(
         self,
-        input_tensor: torch.Tensor,
+        x: torch.Tensor,
         c: int,
         idx_cuda: torch.Tensor,
         idx_cpu: torch.Tensor,
         temb: torch.Tensor,
         scale: float = 1.0,
     ):
-        x = input_tensor
-        # TOOD: to be optimized
-        x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, c, idx_cpu)
-        x = super().forward(x, c, idx_cuda, idx_cpu, temb, scale)
-        x = torch.ops.uniserve.ragged_nchw_to_nhwc(x, self.shadow.out_channels, idx_cpu)
+        x = torch.ops.uniserve.ragged_nchw_to_nhwc(x, c, idx_cpu)
+        x = super().forward(x, idx_cuda, idx_cpu, temb, scale)
+        x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, self.shadow.out_channels, idx_cpu)
         return x

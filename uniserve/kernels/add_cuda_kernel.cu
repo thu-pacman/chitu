@@ -1,11 +1,10 @@
+#include "common.h"
+#include <ATen/cuda/CUDAContext.h>
 #include <cstdio>
-#include <iostream>
-#include <torch/extension.h>
-
 #include <cuda.h>
 #include <cuda_runtime.h>
-
-#include "common.h"
+#include <iostream>
+#include <torch/extension.h>
 #include <vector>
 
 #define AT_DISPATCH_CASE_HALF(...)                                             \
@@ -13,6 +12,8 @@
 
 #define AT_DISPATCH_HALF(TYPE, NAME, ...)                                      \
     AT_DISPATCH_SWITCH(TYPE, NAME, AT_DISPATCH_CASE_HALF(__VA_ARGS__))
+
+using namespace at;
 
 namespace {
 
@@ -54,10 +55,11 @@ torch::Tensor addB_jr_rr_cuda_forward_kernel(torch::Tensor A,
     // AT_DISPATCH_HALF(
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(
         A.type(), "add_r_b_cuda_forward", ([&] {
-            add_r_b_kernel<scalar_t><<<grid, block_size>>>(
-                A.data_ptr<scalar_t>(), n, idx_cuda.data_ptr<itype>(),
-                A.numel(), A.size(-1), B.data_ptr<scalar_t>(),
-                output.data_ptr<scalar_t>());
+            add_r_b_kernel<scalar_t>
+                <<<grid, block_size, 0, at::cuda::getCurrentCUDAStream()>>>(
+                    A.data_ptr<scalar_t>(), n, idx_cuda.data_ptr<itype>(),
+                    A.numel(), A.size(-1), B.data_ptr<scalar_t>(),
+                    output.data_ptr<scalar_t>());
         }));
     return output;
 }

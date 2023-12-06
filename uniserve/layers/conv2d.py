@@ -106,27 +106,31 @@ class RaggedNhwcConv2d(nn.Module):
 
     def weight_conv2gemm(self, conv: nn.Conv2d):
         f = conv.weight.shape[0]
-        kernel = conv.weight.reshape(f, -1).T.contiguous()  # [crs, f]
-        bias = conv.bias.flatten()  # [f]
+        kernel = (
+            conv.weight.permute([2, 3, 1, 0]).flatten(0, 2).contiguous()
+        )  # [f,c,r,s] -> [rsc, f]
+        bias = conv.bias  # [f]
+        assert kernel.shape == (
+            conv.in_channels * conv.kernel_size[0] * conv.kernel_size[1],
+            conv.out_channels,
+        )
         return nn.Parameter(kernel), nn.Parameter(bias)
 
-    # TODO: remove c and infer it from x.shape
-    def forward(self, x, c, idx_cpu):
+    def forward(self, x, idx_cuda, idx_cpu, idx_out_cuda, idx_out_cpu):
         """
         x: [nhw, c]
         output: [nhw, c]"""
-        assert c == self.shadow.in_channels
-        x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, c, idx_cpu)
-        x = torch.ops.uniserve.ragged_nchw2nhwc_unfold_matmul(
+        x = torch.ops.uniserve.ragged_nhwc_im2col(
             x,
-            c,
+            idx_cuda,
             idx_cpu,
-            self.weight,
-            *self.shadow.kernel_size,
-            *self.shadow.padding,
-            *self.shadow.dilation,
-            *self.shadow.stride
-        )
+            idx_out_cuda,
+            idx_out_cpu,
+            self.shadow.kernel_size,
+            self.shadow.padding,
+            self.shadow.dilation,
+            self.shadow.stride,
+        )  # [nhw, rsc]
+        x = torch.matmul(x, self.weight)  # [nhw, f]
         x = x + self.bias
-        # x = self.mm(x)  # [nhw, c]
         return x
