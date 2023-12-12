@@ -9,7 +9,8 @@ torch.set_default_dtype(torch.float16)
 @torch.no_grad()
 def test_ragged_nhwc_im2col():
     # n, hs, ws, c = 2, [14, 14], [14, 28], 32
-    hs, ws, c = [32, 64, 64, 64], [32, 64, 64, 64], 32
+    # hs, ws, c = [32, 64, 64, 64], [32, 64, 64, 64], 320
+    hs, ws, c = [32, 32], [32, 32], 320
     # n, hs, ws, c = 1, [5], [5], 2
     idx_cuda, idx_cpu = uniserve.utils.create_index_2d(hs, ws)
     r, s = 3, 3

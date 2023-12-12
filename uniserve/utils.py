@@ -4,7 +4,7 @@ import torch
 def create_index_2d(hs, ws):
     assert len(hs) == len(ws)
     HxWs = [h * w for h, w in zip(hs, ws)]
-    idx_cuda = torch.tensor([hs, ws, HxWs], dtype=torch.int64)
+    idx_cuda = torch.tensor([hs, ws, HxWs], device="cuda", dtype=torch.int64)
     idx_cpu = idx_cuda.to("cpu")
     return idx_cuda, idx_cpu
 

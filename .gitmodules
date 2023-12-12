@@ -4,3 +4,6 @@
 [submodule "third_party/torchperf"]
 	path = third_party/torchperf
 	url = git@github.com:zhengly123/torchperf.git
+[submodule "third_party/uniserve-stable-fast"]
+	path = third_party/uniserve-stable-fast
+	url = git@github.com:zhengly123/uniserve-stable-fast.git

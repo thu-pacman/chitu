@@ -23,13 +23,13 @@ using itype = int64_t;
 template <typename dt>
 C10_LAUNCH_BOUNDS_1(1024)
 __global__ void ragged_nhwc_im2col_kernel(
-    const int64_t n, const dt *data_im, const int64_t batch_size,
+    const int64_t n, const dt *x_ptr, const int64_t batch_size,
     const int64_t channels, const int64_t *heights, const int64_t *widths,
     const int64_t kernel_height, const int64_t kernel_width,
     const int64_t pad_height, const int64_t pad_width,
     const int64_t stride_height, const int64_t stride_width,
     const int64_t dilation_height, const int64_t dilation_width,
-    const int64_t *heights_col, const int64_t *widths_col, dt *data_col) {
+    const int64_t *heights_col, const int64_t *widths_col, dt *y_ptr) {
     CUDA_KERNEL_LOOP(global_index, n) {
         int64_t index = global_index;
         int64_t batch = 0, in_offset = 0, out_offset = 0;
@@ -57,22 +57,22 @@ __global__ void ragged_nhwc_im2col_kernel(
         int64_t h_in = h_out * stride_height - pad_height;
         int64_t w_in = w_out * stride_width - pad_width;
 
-        dt *col = data_col // [nhwrsc]
-                           // previous batch offset
+        dt *col = y_ptr // [nhwrsc]
+                        // previous batch offset
                   + out_offset * kernel_height * kernel_width
                   // h,w offset in the current batch
                   + (h_out * width_col + w_out) * kernel_height * kernel_width *
                         channels
                   // channel offset
                   + channel_out;
-        const dt *im = data_im // [nhwc]
+        const dt *im = x_ptr // [nhwc]
                        + in_offset
                        // h,w offset in the current batch
                        + (h_in * width + w_in) * channels + channel_in;
 
         // printf("%lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n", index,
         //        in_offset, out_offset, channel_in, h_out, w_out, h_in, w_in,
-        //        col - data_col, data_im - im);
+        //        col - y_ptr, x_ptr - im);
         for (int64_t i = 0; i < kernel_height; ++i) {
             for (int64_t j = 0; j < kernel_width; ++j) {
                 int64_t h = h_in + i * dilation_height;
@@ -82,8 +82,8 @@ __global__ void ragged_nhwc_im2col_kernel(
                                  j * dilation_width) *
                                 channels]
                            : static_cast<dt>(0);
-                // printf("== %lld %lld %lld\n", index, col - data_col,
-                //        data_im - im);
+                // printf("== %lld %lld %lld\n", index, col - y_ptr,
+                //        x_ptr - im);
                 col += channels; // Step in for next (h,w)
             }
         }

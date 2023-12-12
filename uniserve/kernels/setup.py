@@ -14,6 +14,7 @@ else:  # Release
         "nvcc": [
             "-g",
             "--use_fast_math",
+            "-lineinfo",
         ],
         "cxx": ["-g"],
     }

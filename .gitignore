@@ -178,3 +178,5 @@ torch_compile_debug
 *.pth
 *.parquet
 *.svg
+*.png
+*.csv
