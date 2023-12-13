@@ -15,6 +15,8 @@ from diffusers.models.transformer_2d import (
     BasicTransformerBlock,
 )
 
+from typing import Union
+
 
 @dataclasses.dataclass
 class RaggedDim:
@@ -27,9 +29,9 @@ class RaggedDim:
 
 @dataclasses.dataclass
 class RaggedShape:
-    shape: tuple[int | RaggedDim]
+    shape: tuple[Union[int, RaggedDim]]
     is_shape: bool = False
-    rag_division_ratio: int | None = None
+    rag_division_ratio: Union[int, None] = None
 
     def dim(self):
         return len(self.shape)
@@ -101,7 +103,7 @@ class RagProp(torch.fx.Interpreter):
     def __init__(self, gm):
         super().__init__(gm)
 
-    def propagate(self, shapes: list[list[int | RaggedDim | None]]):
+    def propagate(self, shapes: list[list[Union[int, RaggedDim, None]]]):
         return super().run(*shapes)
 
     def init_input_ragged_shape(
@@ -291,7 +293,9 @@ def fx_shape_inference(gm, fx_input: list[torch.Tensor]):
     return gm
 
 
-def rag_inference(gm: torch.fx.GraphModule, shapes: list[list[int | RaggedDim | None]]):
+def rag_inference(
+    gm: torch.fx.GraphModule, shapes: list[list[Union[int, RaggedDim, None]]]
+):
     return RagProp(gm).propagate(shapes)
 
 
@@ -366,6 +370,12 @@ class RagTransformer(torch.fx.Transformer):
                     ),
                     self.tracer,
                 )
+        # cumulative index for FA2
+        name = f"cum_idx1d_cuda"
+        self.indices[(name, 1)] = Proxy(
+            self.new_graph.placeholder(name, default_value=inspect.Signature.empty),
+            self.tracer,
+        )
 
     def divide_index2d(self, idx, ratio, device=None):
         return idx // self.index_2d_divisor(ratio, device=device)
@@ -373,11 +383,13 @@ class RagTransformer(torch.fx.Transformer):
     def index_2d_divisor(self, v, device=None):
         return torch.tensor([[v], [v], [v**2]], dtype=torch.int64, device=device)
 
-    def get_index(self, dims: int, divisor: int, device: str):
+    def get_index(self, dims: int, divisor: int, device: str, cumulative=False):
         assert isinstance(dims, int)
         assert isinstance(divisor, int)
         assert isinstance(device, str)
         name = f"idx{dims}d_{device}"
+        if cumulative:
+            name = "cum_" + name
         key = (name, divisor)
         if key not in self.indices:
             if dims == 2:
@@ -490,6 +502,12 @@ class RagTransformer(torch.fx.Transformer):
                 new_mod.forward,
                 (
                     args[0],
+                    self.get_index(
+                        1,
+                        get_info(n.args[0]).rag_division_ratio,
+                        "cuda",
+                        cumulative=True,
+                    ),
                     self.get_index(1, get_info(n.args[0]).rag_division_ratio, "cpu"),
                 ),
                 kwargs,

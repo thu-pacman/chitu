@@ -262,7 +262,7 @@ def test_rag_transformation_naive_model():
         y0 = torch.concat(y0)
 
         y1 = transformed(  # idx1d_cuda, idx1d_cpu, idx2d_cuda, idx2d_cpu, s0, s1, l_x_
-            idx1d_cuda, idx1d_cpu, idx2d_cuda, idx2d_cpu, None, None, x0.flatten()
+            idx1d_cuda, idx1d_cpu, idx2d_cuda, idx2d_cpu, None, None, None, x0.flatten()
         )[0]
         assert torchperf.allclose(y0, y1)
 
@@ -412,6 +412,7 @@ def run_and_get_intemediate_results(
     args, kwargs = build_unet_input(b=len(hs))
     idx2d_cuda, idx2d_cpu = create_index_2d(hs, ws)
     idx1d_cuda, idx1d_cpu = idx2d_cuda[2:], idx2d_cpu[2:]
+    cum_idx1d_cuda = uniserve.utils.create_cum_index_1d([h * w for h, w in zip(hs, ws)])
     emb = full_model.run_head(full_model, *args, **kwargs)
 
     x0 = []
@@ -442,6 +443,7 @@ def run_and_get_intemediate_results(
         idx1d_cpu,
         idx2d_cuda,
         idx2d_cpu,
+        cum_idx1d_cuda,
         None,
         None,
         x0.flatten(),
@@ -485,13 +487,21 @@ def compare_intermediate_results(env0, env1):
 
 def get_compiled_unet_body(gm_body, *, dynamic):
     def run_body(
-        idx1d_cuda, idx1d_cpu, idx2d_cuda, idx2d_cpu, x, encoder_hidden_states, emb
+        idx1d_cuda,
+        idx1d_cpu,
+        idx2d_cuda,
+        idx2d_cpu,
+        cum_idx1d_cuda,
+        x,
+        encoder_hidden_states,
+        emb,
     ):
         return gm_body(
             idx1d_cuda,
             idx1d_cpu,
             idx2d_cuda,
             idx2d_cpu,
+            cum_idx1d_cuda,
             None,
             None,
             x,
@@ -531,10 +541,11 @@ def get_unet_groundtruth(
 
 
 @torch.no_grad()
-def evaluate_inductor_unet_body(full_model, run_body, hs, ws, *, dynamic):
+def evaluate_inductor_unet_body(full_model, compiled_run_body, hs, ws, *, dynamic):
     args, kwargs = build_unet_input(b=len(hs))
     idx2d_cuda, idx2d_cpu = create_index_2d(hs, ws)
     idx1d_cuda, idx1d_cpu = idx2d_cuda[2:], idx2d_cpu[2:]
+    cum_idx1d_cuda = uniserve.utils.create_cum_index_1d([h * w for h, w in zip(hs, ws)])
     emb = full_model.run_head(full_model, *args, **kwargs)
     x = torch.randn([4 * sum([h * w for h, w in zip(hs, ws)])])
 
@@ -544,11 +555,12 @@ def evaluate_inductor_unet_body(full_model, run_body, hs, ws, *, dynamic):
         for t in (x, kwargs["encoder_hidden_states"], emb):
             torch._dynamo.mark_dynamic(t, 0)
 
-    f = lambda: run_body(
+    f = lambda: compiled_run_body(
         idx1d_cuda,
         idx1d_cpu,
         idx2d_cuda,
         idx2d_cpu,
+        cum_idx1d_cuda,
         x,
         kwargs["encoder_hidden_states"],
         emb,
@@ -563,7 +575,7 @@ def evaluate_inductor_unet_body(full_model, run_body, hs, ws, *, dynamic):
 
 
 @pytest.mark.slow()
-def test_ragged_unet_body():
+def test_ragged_unet_body(save_model=False):
     model = build_unet()
     args, kwargs = build_unet_input()
     get_unet_groundtruth(model, *args, kwargs, [32, 32], [32, 32])
@@ -586,13 +598,17 @@ def test_ragged_unet_body():
     # transformed_gm.print_readable()
     # transformed_gm.graph.print_tabular()
     # torchperf.torch_dynamo.draw_simple_graph(transformed_gm, "unet_body_transformed.svg")
-    # transformed_gm.to_folder("unet_body_transformed", "unet_body_transformed")
+    if save_model:
+        transformed_gm.to_folder("unet_body_transformed", "unet_body_transformed")
+        return
 
     env0, env1 = run_and_get_intemediate_results(
         model, gm, transformed_gm, 4, [8, 8, 16, 16], [8, 8, 16, 16], torch.float16
     )
     # compare_intermediate_results(env0, env1) # Only for bs = 2 since no dynamic shape
 
+    # Dynamo are not supported now
+    return None
     compiled_unet_body = get_compiled_unet_body(transformed_gm, dynamic=False)
 
     torch._dynamo.config.cache_size_limit = 102400
@@ -611,4 +627,4 @@ if __name__ == "__main__":
     #     test_rag_inference_naive_model_reshape()
     #     test_rag_inference_unet()
     #     test_rag_transformation_naive_model()
-    test_ragged_unet_body()
+    test_ragged_unet_body(save_model=True)

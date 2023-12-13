@@ -42,37 +42,39 @@ class RaggedTransformer2DModel_nchw(nn.Module):
         heads_dim: int,
         c: int,
         idx_cuda: torch.Tensor,
-        idx_cpu: torch.Tensor,
+        idx2d_cpu: torch.Tensor,
+        cum_idx1d_cuda,
         encoder_hidden_states: torch.Tensor,
     ):
         residual = hidden_states
 
-        hidden_states = self.norm(hidden_states, c, idx_cpu)
+        hidden_states = self.norm(hidden_states, c, idx2d_cpu)
 
         hidden_states = torch.ops.uniserve.ragged_nchw_to_nhwc(
-            hidden_states, c, idx_cpu
+            hidden_states, c, idx2d_cpu
         )
         if self.use_linear_projection:
             hidden_states = self.proj_in(hidden_states)
         else:
-            hidden_states = self.proj_in(hidden_states, c, idx_cpu)
+            hidden_states = self.proj_in(hidden_states, c, idx2d_cpu)
 
         hidden_states = hidden_states.reshape(-1, c)
 
         for block in self.transformer_blocks:
             hidden_states = block(
                 hidden_states,
-                idx_cpu[2].reshape(-1, idx_cpu[2].shape[0]),
+                cum_idx1d_cuda,
+                idx2d_cpu[2].reshape(-1, idx2d_cpu[2].shape[0]),
                 encoder_hidden_states,
             )
 
         if self.use_linear_projection:
             hidden_states = self.proj_out(hidden_states)
         else:
-            hidden_states = self.proj_out(hidden_states, c, idx_cpu)
+            hidden_states = self.proj_out(hidden_states, c, idx2d_cpu)
 
         hidden_states = torch.ops.uniserve.ragged_nhwc_to_nchw(
-            hidden_states, c, idx_cpu
+            hidden_states, c, idx2d_cpu
         )
 
         output = hidden_states + residual

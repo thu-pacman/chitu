@@ -10,9 +10,17 @@ def create_index_2d(hs, ws):
 
 
 def create_index_1d(Lseq):
-    idx_cuda = torch.tensor([Lseq], dtype=torch.int64)
+    idx_cuda = torch.tensor([Lseq], device="cuda", dtype=torch.int64)
     idx_cpu = idx_cuda.to("cpu")
     return idx_cuda, idx_cpu
+
+
+def create_cum_index_1d(Lseq):
+    idx = [0]
+    for v in Lseq:
+        idx += [idx[-1] + int(v)]
+    idx_cuda = torch.tensor(idx, device="cuda", dtype=torch.int32)
+    return idx_cuda
 
 
 def create_index_2d_from_regular(n, h, w):

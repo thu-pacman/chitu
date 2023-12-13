@@ -6,10 +6,141 @@ from diffusers.models.transformer_2d import (
     Transformer2DModel,
     BasicTransformerBlock,
 )
-
+from diffusers.models.attention_processor import (
+    Attention,
+)
+from flash_attn import (
+    flash_attn_varlen_kvpacked_func,
+    flash_attn_varlen_qkvpacked_func,
+    flash_attn_varlen_func,
+)
 import uniserve
 import uniserve.layers as unn
 from typing import Optional, Dict, Any
+
+
+class BatchedLinear_nhwc(nn.Module):
+    def __init__(self, batches, in_features, out_features):
+        super().__init__()
+        self.batches = batches
+        self.in_features = in_features
+        self.out_feature = out_features
+        self.weight = nn.Parameter(torch.zeros(batches, in_features, out_features))
+        self.bias = nn.Parameter(torch.zeros(batches, out_features))
+
+    def forward(self, input_tensor):
+        assert self.batches == input_tensor.shape[0]
+        output = torch.bmm(input_tensor, self.weight)
+        return output + self.bias.unsqueeze(1)
+
+    # # Example
+    # self.to_kv = BatchedLinear_nhwc(
+    #     2, shadow.to_k.in_features, shadow.to_k.out_features
+    # )
+    # data1 = shadow.to_k.weight.data
+    # data2 = shadow.to_v.weight.data
+    # self.to_kv.weight.data = torch.stack([data1.t(), data2.t()], dim=0)
+    # if shadow.to_k.bias is not None:
+    #     assert shadow.to_v.bias is not None
+    #     bias1 = shadow.to_k.bias.data
+    #     bias2 = shadow.to_v.bias.data
+    #     self.to_kv.bias.data = torch.stack([bias1, bias2], dim=0)
+
+
+class RaggedAttentionblock_nhwc(nn.Module):
+    def __init__(self, shadow: Attention, enco=False):
+        super().__init__()
+        self.inner_dim = shadow.inner_dim
+        self.cross_attention_dim = shadow.cross_attention_dim
+        self.dropout = shadow.dropout
+        self.enco = enco
+        self.to_out = shadow.to_out[0]
+        self.heads = shadow.heads
+
+        has_bias = shadow.to_q.bias is not None
+        assert has_bias == (shadow.to_k.bias is not None)
+        assert has_bias == (shadow.to_v.bias is not None)
+        if enco:  # cross-attention
+            self.to_q = shadow.to_q
+            self.to_kv = torch.nn.Linear(
+                shadow.to_q.in_features, 2 * shadow.to_q.out_features, bias=has_bias
+            )
+            self.to_kv.weight.data = torch.concat(
+                [shadow.to_k.weight.data, shadow.to_v.weight.data], dim=0
+            )
+            if has_bias:
+                self.to_kv.bias.data = torch.concat(
+                    [shadow.to_k.bias.data, shadow.to_v.bias.data], dim=0
+                )
+        else:
+            self.to_qkv = torch.nn.Linear(
+                shadow.to_q.in_features, 3 * shadow.to_q.out_features, bias=has_bias
+            )
+            self.to_qkv.weight.data = torch.concat(
+                [
+                    shadow.to_q.weight.data,
+                    shadow.to_k.weight.data,
+                    shadow.to_v.weight.data,
+                ],
+                dim=0,
+            )
+            if has_bias:
+                self.to_qkv.bias.data = torch.concat(
+                    [
+                        shadow.to_q.bias.data,
+                        shadow.to_k.bias.data,
+                        shadow.to_v.bias.data,
+                    ],
+                    dim=0,
+                )
+
+    def forward(
+        self,
+        q,
+        k,
+        v,
+        cu_seqlens,
+        max_len,
+    ):
+        nheads = self.heads
+        head_dims = self.inner_dim // nheads  # hidden size per head
+        if self.enco:  # cross attention
+            assert k is v
+            Q = self.to_q(q).reshape(-1, nheads, head_dims)
+            # KV = self.to_kv(torch.stack([k, v], dim=0)).reshape(
+            #     2, -1, nheads, head_dims
+            # )
+            KV = self.to_kv(k).reshape(-1, 2, nheads, head_dims)
+            batches = cu_seqlens.shape[0]
+            out = torch.ops.uniserve.flashattn_varlen_fwd(
+                Q,
+                KV[:, 0],
+                KV[:, 1],
+                cu_seqlens,
+                torch.tensor(
+                    range(0, batches * 77, 77), dtype=torch.int32, device="cuda"
+                ),
+                max_len,
+                77,
+            )
+        else:  # self attention
+            assert q is k and k is v
+            QKV = self.to_qkv(q).reshape(-1, 3, nheads, head_dims)
+            # QKV: [seq, 3, #heads, head_dim]
+            out = torch.ops.uniserve.flashattn_varlen_fwd(
+                QKV[:, 0],
+                QKV[:, 1],
+                QKV[:, 2],
+                cu_seqlens,
+                cu_seqlens,
+                max_len,
+                max_len,
+            )
+
+        out = out.reshape(-1, self.inner_dim)
+
+        out = self.to_out(out)
+        return out
 
 
 class RaggedTransformerBlock_nhwc(nn.Module):
@@ -21,37 +152,19 @@ class RaggedTransformerBlock_nhwc(nn.Module):
         self.norm1 = shadow.norm1
         self.norm2 = shadow.norm2
         self.norm3 = shadow.norm3
-        self.attn1 = shadow.attn1
-        self.attn2 = shadow.attn2
-        self.scaled_dpa = unn.RaggedNseqfAttentionForward()
+        ## No LoRA version
+        self.attn1 = RaggedAttentionblock_nhwc(shadow.attn1)
+        self.attn2 = RaggedAttentionblock_nhwc(shadow.attn2, True)
+        # self.scaled_dpa = unn.RaggedNseqfAttentionForward()
         self.ff = shadow.ff
         assert self.attn1.inner_dim % self.attn1.heads == 0
         assert self.attn2.inner_dim % self.attn2.heads == 0
 
-    def norm_attn_output_nseqf(self, q, k, v, LSeq, attn, enco=False):
-        Q = attn.to_q(q)
-        K = attn.to_k(k)
-        V = attn.to_v(v)
-        heads = attn.heads
-        features = attn.inner_dim // attn.heads  # TODO -> hidden_per_dead
-        out = self.scaled_dpa(
-            Q.flatten(),
-            K.flatten(),
-            V.flatten(),
-            heads,
-            features,
-            LSeq,
-            enco,
-        )
-        out = out.reshape(-1, attn.inner_dim)
-        out = attn.to_out[0](out)
-        return out
-
     def forward(
         self,
         input_tensor: torch.Tensor,
-        # n: int,  # TODO remove this parameter
-        LSeq: torch.Tensor,
+        cum_index_cuda: torch.Tensor,
+        idx1d_cpu: torch.Tensor,  # to calculate the max length for FA2
         encoder_hidden_states: torch.Tensor,
         attention_mask: Optional[torch.FloatTensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
@@ -72,19 +185,34 @@ class RaggedTransformerBlock_nhwc(nn.Module):
         assert timestep is None
         assert cross_attention_kwargs is None
         assert class_labels is None
+        max_length = int(torch.max(idx1d_cpu))
+        hidden_states = input_tensor
+        ## attention 1
+        residual_states = hidden_states
+        hidden_states = self.norm1(hidden_states)
+        hidden_states = self.attn1(
+            hidden_states, hidden_states, hidden_states, cum_index_cuda, max_length
+        )
+        hidden_states += residual_states
 
-        x = input_tensor
-        x_res = x
-        x = self.norm1(x)
-        x = self.norm_attn_output_nseqf(x, x, x, LSeq, self.attn1)
-        x += x_res
-        y = encoder_hidden_states.reshape(-1, 2048)
-        x_res = x
-        x = self.norm2(x)
-        x = self.norm_attn_output_nseqf(x, y, y, LSeq, self.attn2, True)
-        x += x_res
-        x_res = x
-        x = self.norm3(x)
-        x = self.ff(x, scale=1.0)
-        x += x_res
-        return x
+        ## attention 2
+        residual_states = hidden_states
+        encoder_hidden_states = encoder_hidden_states.reshape(-1, 2048)
+        hidden_states = self.norm2(hidden_states)
+
+        hidden_states = self.attn2(
+            hidden_states,
+            encoder_hidden_states,
+            encoder_hidden_states,
+            cum_index_cuda,
+            max_length,
+        )
+        hidden_states += residual_states
+
+        ## feedforward
+        residual_states = hidden_states
+        hidden_states = self.norm3(hidden_states)
+        hidden_states = self.ff(hidden_states, scale=1.0)
+        hidden_states += residual_states
+
+        return hidden_states
