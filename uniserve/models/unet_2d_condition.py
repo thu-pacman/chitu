@@ -52,6 +52,7 @@ from diffusers.models.unet_2d_condition import (
     UNet2DConditionModel,
     UNet2DConditionOutput,
 )
+from torchperf.utils import shapes_to_tensors, tensors_to_shapes
 
 
 def run_head(
@@ -401,3 +402,54 @@ def run_body(
         return (sample,)
 
     return UNet2DConditionOutput(sample=sample)
+
+
+def build_unet_input(b=2, h=32, w=32, *, name: str):
+    if name == "sdxl":
+        return shapes_to_tensors(
+            (torch.Size([b, 4, h, w]), torch.Size([]))
+        ), shapes_to_tensors(
+            {
+                "encoder_hidden_states": torch.Size([b, 77, 2048]),
+                "cross_attention_kwargs": None,
+                "added_cond_kwargs": {
+                    "text_embeds": torch.Size([b, 1280]),
+                    "time_ids": torch.Size([b, 6]),
+                },
+                "return_dict": False,
+            }
+        )
+    elif name == "sd15":
+        return shapes_to_tensors(
+            (torch.Size([b, 4, h, w]), torch.Size([]))
+        ), shapes_to_tensors(
+            {
+                "encoder_hidden_states": torch.Size([b, 77, 768]),
+                "cross_attention_kwargs": None,
+                "added_cond_kwargs": None,
+                "return_dict": False,
+            }
+        )
+    else:
+        raise RuntimeError("Unknown model name {name}")
+
+
+def build_unet(name: str, dtype=torch.float16):
+    with torch.device("cpu"):
+        if name == "sdxl":
+            model = UNet2DConditionModel.from_pretrained(
+                "stabilityai/stable-diffusion-xl-base-1.0",
+                subfolder="unet",
+                variant="fp16",
+            )
+        elif name == "sd15":
+            model = UNet2DConditionModel.from_pretrained(
+                "runwayml/stable-diffusion-v1-5",
+                torch_dtype=torch.float16,
+                subfolder="unet",
+                variant="fp16",
+            )
+        else:
+            raise RuntimeError(f"Unknown model name {name}")
+    model = model.eval().cuda().type(dtype)
+    return model

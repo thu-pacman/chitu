@@ -37,6 +37,7 @@ from uniserve.utils import (
     create_index_1d_from_regular,
     create_index_2d_from_regular,
 )
+from uniserve.models.unet_2d_condition import build_unet, build_unet_input
 import types
 
 
@@ -271,35 +272,10 @@ def test_rag_transformation_naive_model():
     run_and_compare(7, [8, 16, 8], [8, 16, 16])
 
 
-def build_unet():
-    with torch.device("cpu"):
-        model = UNet2DConditionModel.from_pretrained(
-            "stabilityai/stable-diffusion-xl-base-1.0", subfolder="unet", variant="fp16"
-        )
-    model = model.eval().cuda().type(dtype)
-    return model
-
-
-def build_unet_input(b=2, h=32, w=32):
-    return shapes_to_tensors(
-        (torch.Size([b, 4, h, w]), torch.Size([]))
-    ), shapes_to_tensors(
-        {
-            "encoder_hidden_states": torch.Size([b, 77, 2048]),
-            "cross_attention_kwargs": None,
-            "added_cond_kwargs": {
-                "text_embeds": torch.Size([b, 1280]),
-                "time_ids": torch.Size([b, 6]),
-            },
-            "return_dict": False,
-        }
-    )
-
-
 @pytest.mark.slow()
 def test_rag_inference_unet():
-    model = build_unet()
-    args, kwargs = build_unet_input()
+    model = build_unet("sdxl")
+    args, kwargs = build_unet_input(name="sdxl")
     rag_dims = {args[0]: [2, 3]}
 
     torch._dynamo.allow_in_graph(
@@ -334,7 +310,7 @@ def run_and_compare(
         gm = gm.eval().float()
     else:
         torch.set_default_dtype(torch.float16)
-    args, kwargs = build_unet_input(b=1)
+    args, kwargs = build_unet_input(b=1, name="sdxl")
     idx2d_cuda, idx2d_cpu = create_index_2d(hs, ws)
     idx1d_cuda, idx1d_cpu = idx2d_cuda[2:], idx2d_cpu[2:]
     emb = model.run_head(model, *args, **kwargs)
@@ -400,6 +376,7 @@ def run_and_get_intemediate_results(
     c,
     hs,
     ws,
+    model_name,
     dtype=torch.float16,
 ) -> tuple[dict[torch.fx.Node, torch.Tensor]]:
     """The returned envs from debugger are only valid for batch size 2"""
@@ -409,7 +386,7 @@ def run_and_get_intemediate_results(
         gm = gm.eval().float()
         transformed_gm = transformed_gm.eval().float()
         full_model = full_model.eval().float()
-    args, kwargs = build_unet_input(b=len(hs))
+    args, kwargs = build_unet_input(b=len(hs), name=model_name)
     idx2d_cuda, idx2d_cpu = create_index_2d(hs, ws)
     idx1d_cuda, idx1d_cpu = idx2d_cuda[2:], idx2d_cpu[2:]
     cum_idx1d_cuda = uniserve.utils.create_cum_index_1d([h * w for h, w in zip(hs, ws)])
@@ -542,7 +519,7 @@ def get_unet_groundtruth(
 
 @torch.no_grad()
 def evaluate_inductor_unet_body(full_model, compiled_run_body, hs, ws, *, dynamic):
-    args, kwargs = build_unet_input(b=len(hs))
+    args, kwargs = build_unet_input(b=len(hs), name="sdxl")
     idx2d_cuda, idx2d_cpu = create_index_2d(hs, ws)
     idx1d_cuda, idx1d_cpu = idx2d_cuda[2:], idx2d_cpu[2:]
     cum_idx1d_cuda = uniserve.utils.create_cum_index_1d([h * w for h, w in zip(hs, ws)])
@@ -575,10 +552,9 @@ def evaluate_inductor_unet_body(full_model, compiled_run_body, hs, ws, *, dynami
 
 
 @pytest.mark.slow()
-def test_ragged_unet_body(save_model=False):
-    model = build_unet()
-    args, kwargs = build_unet_input()
-    get_unet_groundtruth(model, *args, kwargs, [32, 32], [32, 32])
+def test_ragged_unet_body(save_model=False, model_name="sdxl"):
+    model = build_unet(model_name)
+    args, kwargs = build_unet_input(name=model_name)
     ragged_dims = {args[0]: [2, 3]}
     torch._dynamo.allow_in_graph(
         (BasicTransformerBlock, ResnetBlock2D, LoRACompatibleConv, LoRACompatibleLinear)
@@ -597,13 +573,17 @@ def test_ragged_unet_body(save_model=False):
     transformed_gm: torch.nn.Module = RagTransformer(gm).transform()
     # transformed_gm.print_readable()
     # transformed_gm.graph.print_tabular()
-    # torchperf.torch_dynamo.draw_simple_graph(transformed_gm, "unet_body_transformed.svg")
+    # torchperf.torch_dynamo.draw_simple_graph(
+    #     transformed_gm, f"{name}_unet_body_transformed.svg"
+    # )
     if save_model:
-        transformed_gm.to_folder("unet_body_transformed", "unet_body_transformed")
+        folder = f"{model_name}_unet_body_transformed"
+        print(f"== Save model to {folder}")
+        transformed_gm.to_folder(folder, folder)
         return
 
     env0, env1 = run_and_get_intemediate_results(
-        model, gm, transformed_gm, 4, [8, 8, 16, 16], [8, 8, 16, 16], torch.float16
+        model, gm, transformed_gm, 4, [8, 8, 16, 16], [8, 8, 16, 16], model_name
     )
     # compare_intermediate_results(env0, env1) # Only for bs = 2 since no dynamic shape
 
@@ -627,4 +607,4 @@ if __name__ == "__main__":
     #     test_rag_inference_naive_model_reshape()
     #     test_rag_inference_unet()
     #     test_rag_transformation_naive_model()
-    test_ragged_unet_body(save_model=True)
+    test_ragged_unet_body(save_model=True, model_name="sdxl")

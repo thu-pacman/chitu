@@ -63,7 +63,7 @@ class RaggedAttentionblock_nhwc(nn.Module):
         if enco:  # cross-attention
             self.to_q = shadow.to_q
             self.to_kv = torch.nn.Linear(
-                shadow.to_q.in_features, 2 * shadow.to_q.out_features, bias=has_bias
+                shadow.to_k.in_features, 2 * shadow.to_k.out_features, bias=has_bias
             )
             self.to_kv.weight.data = torch.concat(
                 [shadow.to_k.weight.data, shadow.to_v.weight.data], dim=0
@@ -185,7 +185,9 @@ class RaggedTransformerBlock_nhwc(nn.Module):
         assert timestep is None
         assert cross_attention_kwargs is None
         assert class_labels is None
+        # This operation is not allowed by dynamo
         max_length = int(torch.max(idx1d_cpu))
+
         hidden_states = input_tensor
         ## attention 1
         residual_states = hidden_states
@@ -197,7 +199,8 @@ class RaggedTransformerBlock_nhwc(nn.Module):
 
         ## attention 2
         residual_states = hidden_states
-        encoder_hidden_states = encoder_hidden_states.reshape(-1, 2048)
+        # [n, 77, dim(2048/768)] -> [n*77, dim]
+        encoder_hidden_states = encoder_hidden_states.flatten(0, -2)
         hidden_states = self.norm2(hidden_states)
 
         hidden_states = self.attn2(
