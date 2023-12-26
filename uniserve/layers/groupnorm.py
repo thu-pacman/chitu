@@ -75,6 +75,7 @@ try:
     @torch._custom_ops.custom_op("uniserve::ragged_nhwc_groupnorm")
     def ragged_nhwc_groupnorm(
         input: Tensor,
+        idx1d_cum_cuda: Tensor,
         idx_cpu: Tensor,
         num_groups: int,
         weight: Tensor,
@@ -87,6 +88,7 @@ try:
     @torch._custom_ops.impl_abstract("uniserve::ragged_nhwc_groupnorm")
     def ragged_nhwc_groupnorm_abstract(
         input: Tensor,
+        idx1d_cum_cuda: Tensor,
         idx_cpu: Tensor,
         num_groups: int,
         weight: Tensor,
@@ -101,15 +103,17 @@ try:
     @torch._custom_ops.impl("uniserve::ragged_nhwc_groupnorm")
     def ragged_nhwc_groupnorm_impl(
         input: Tensor,
+        idx1d_cum_cuda: Tensor,
         idx_cpu: Tensor,
         num_groups: int,
         weight: Tensor,
         bias: Tensor,
         eps: float,
     ):
+        assert idx_cuda.device.type == "cuda"
         assert idx_cpu.device.type == "cpu"
         return uniserve_cuda.ragged_nhwc_groupnorm_forward(
-            input, idx_cpu, num_groups, weight, bias, eps
+            input, idx1d_cum_cuda, idx_cpu, num_groups, weight, bias, eps
         )
 
 except RuntimeError as e:
@@ -124,7 +128,13 @@ class RaggedNhwcGroupNorm(nn.Module):
         self.num_groups = shadow_norm.num_groups
         self.eps = shadow_norm.eps
 
-    def forward(self, input, idx_cpu):
+    def forward(self, input, idx1d_cum_cuda, idx_cpu):
         return torch.ops.uniserve.ragged_nhwc_groupnorm(
-            input, idx_cpu, self.num_groups, self.weight, self.bias, self.eps
+            input,
+            idx1d_cum_cuda,
+            idx_cpu,
+            self.num_groups,
+            self.weight,
+            self.bias,
+            self.eps,
         )

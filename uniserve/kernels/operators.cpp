@@ -211,7 +211,7 @@ Tensor ragged_nchw_interpolate(const at::Tensor &x, itype c, Tensor idx_cpu,
 }
 
 Tensor ragged_nhwc_groupnorm_forward(
-    const at::Tensor &input, Tensor idx_cpu, int64_t num_groups,
+    const Tensor &input, const Tensor &idx_cuda, const Tensor &idx_cpu, int64_t num_groups,
     const c10::optional<at::Tensor> &weight = {},
     const c10::optional<at::Tensor> &bias = {}, double eps = 1e-05) {
     CHECK_INPUT(input); // [nchw]

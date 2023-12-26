@@ -32,8 +32,8 @@ class RaggedResnetBlock2D_nhwc(nn.Module):
         assert not shadow.skip_time_act
 
         self.shadow = shadow
-        self.norm1 = unn.RaggedNchwGroupNorm(shadow.norm1)
-        self.norm2 = unn.RaggedNchwGroupNorm(shadow.norm2)
+        self.norm1 = unn.RaggedNhwcGroupNorm(shadow.norm1)
+        self.norm2 = unn.RaggedNhwcGroupNorm(shadow.norm2)
         self.conv1 = unn.RaggedNhwcConv2d(shadow.conv1)
         self.conv2 = unn.RaggedNhwcConv2d(shadow.conv2)
         if shadow.conv_shortcut is not None:
@@ -46,12 +46,14 @@ class RaggedResnetBlock2D_nhwc(nn.Module):
         self.in_channels = shadow.in_channels
         self.out_channels = shadow.out_channels
 
-    def norm_act_conv(self, x, idx_cuda, idx_cpu, norm, nonlinearity, conv):
-        c = x.shape[1]
+    def norm_act_conv(
+        self, x, idx_cuda_cum, idx_cuda, idx_cpu, norm, nonlinearity, conv
+    ):
+        # c = x.shape[1]
         # TODO: ragged nhwc group norm
-        x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, c, idx_cpu)  # [nchw]
-        x = norm(x, c, idx_cpu)
-        x = torch.ops.uniserve.ragged_nchw_to_nhwc(x, c, idx_cpu)  # [nhw, c]
+        # x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, c, idx_cpu)  # [nchw]
+        x = norm(x, idx_cuda_cum, idx_cpu)
+        # x = torch.ops.uniserve.ragged_nchw_to_nhwc(x, c, idx_cpu)  # [nhw, c]
         x = nonlinearity(x)
         x = conv(x, idx_cuda, idx_cpu, idx_cuda, idx_cpu)
         return x
@@ -60,6 +62,7 @@ class RaggedResnetBlock2D_nhwc(nn.Module):
     def forward(
         self,
         input_tensor: torch.Tensor,
+        idx_cuda_cum: torch.Tensor,
         idx_cuda: torch.Tensor,
         idx_cpu: torch.Tensor,
         temb: torch.Tensor,
@@ -72,7 +75,13 @@ class RaggedResnetBlock2D_nhwc(nn.Module):
         x = input_tensor  # [nhwc]
 
         x = self.norm_act_conv(
-            x, idx_cuda, idx_cpu, self.norm1, self.nonlinearity, self.conv1
+            x,
+            idx_cuda_cum,
+            idx_cuda,
+            idx_cpu,
+            self.norm1,
+            self.nonlinearity,
+            self.conv1,
         )
 
         temb = self.nonlinearity(temb)
@@ -80,7 +89,13 @@ class RaggedResnetBlock2D_nhwc(nn.Module):
 
         x = torch.ops.uniserve.addB_jr_rr(x, idx_cuda, temb)
         x = self.norm_act_conv(
-            x, idx_cuda, idx_cpu, self.norm2, self.nonlinearity, self.conv2
+            x,
+            idx_cuda_cum,
+            idx_cuda,
+            idx_cpu,
+            self.norm2,
+            self.nonlinearity,
+            self.conv2,
         )
 
         if self.conv_shortcut is not None:

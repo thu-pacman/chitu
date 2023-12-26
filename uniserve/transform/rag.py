@@ -487,6 +487,7 @@ class RagTransformer(torch.fx.Transformer):
                 new_mod.forward,
                 (
                     args[0],
+                    self.get_index(1, divisor_in**2, "cuda", True),
                     self.get_index(2, divisor_in, "cuda"),
                     self.get_index(2, divisor_in, "cpu"),
                     args[1],  # temb
@@ -521,6 +522,9 @@ class RagTransformer(torch.fx.Transformer):
                 new_mod.forward,
                 (
                     *args,
+                    self.get_index(
+                        1, get_info(n.args[0]).rag_division_ratio ** 2, "cuda", True
+                    ),
                     self.get_index(2, get_info(n.args[0]).rag_division_ratio, "cpu"),
                 ),
                 kwargs,
