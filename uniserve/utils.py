@@ -1,4 +1,7 @@
 import torch
+import PIL
+import datetime
+from typing import Sequence
 
 
 def create_index_2d(hs, ws):
@@ -56,3 +59,25 @@ def replace_layer(module, name, old_layer, new_layer):
 
 
 # replace_layer(model, "model")
+
+
+def save_image(
+    image: PIL.Image.Image | Sequence[PIL.Image.Image],
+    prefix_name: str = "image",
+    verbose=True,
+):
+    if isinstance(image, PIL.Image.Image):
+        fn = f'output/{prefix_name}_{datetime.datetime.now().strftime("%m%d-%H%M%S")}.jpg'
+        image.save(fn)
+        if verbose:
+            print(f"Save image to {fn}")
+    else:
+        for i, img in enumerate(image):
+            fn = f'output/{prefix_name}_{datetime.datetime.now().strftime("%m%d-%H%M%S")}_{i}.jpg'
+            img.save(fn)
+        if verbose:
+            print(f"Save {len(image)} images to {fn}")
+
+
+def get_deterministic_generator() -> torch.Generator:
+    return torch.Generator(device="cuda").manual_seed(12345)

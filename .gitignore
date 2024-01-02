@@ -180,3 +180,5 @@ torch_compile_debug
 *.svg
 *.png
 *.csv
+*.json
+*.jpg
