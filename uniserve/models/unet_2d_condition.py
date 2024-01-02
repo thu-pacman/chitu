@@ -405,7 +405,7 @@ def run_body(
 
 
 def build_unet_input(b=2, h=32, w=32, *, name: str):
-    if name == "sdxl":
+    if name in ["sdxl", "sdxl-turbo"]:
         return shapes_to_tensors(
             (torch.Size([b, 4, h, w]), torch.Size([]))
         ), shapes_to_tensors(
@@ -431,7 +431,7 @@ def build_unet_input(b=2, h=32, w=32, *, name: str):
             }
         )
     else:
-        raise RuntimeError("Unknown model name {name}")
+        raise RuntimeError(f"Unknown model name {name}")
 
 
 def build_unet(name: str, dtype=torch.float16):

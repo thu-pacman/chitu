@@ -110,7 +110,6 @@ try:
         bias: Tensor,
         eps: float,
     ):
-        assert idx_cuda.device.type == "cuda"
         assert idx_cpu.device.type == "cpu"
         return uniserve_cuda.ragged_nhwc_groupnorm_forward(
             input, idx1d_cum_cuda, idx_cpu, num_groups, weight, bias, eps

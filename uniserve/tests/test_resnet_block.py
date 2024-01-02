@@ -47,12 +47,13 @@ def test_RaggedResnetBlock2D_nchw_uniform():
 
     n, c, h, w = 2, 320, 32, 32
     idx_cuda, idx_cpu = uniserve.utils.create_index_2d_from_regular(n, h, w)
+    idx_cum_cuda = uniserve.utils.create_cum_index_1d([h * w] * n)
 
     x = torch.randn(n, c, h, w)
     temb = torch.randn(n, 1280)
 
     y0 = m_orig(x, temb)
-    y1 = m_ragged(x.flatten(), c, idx_cuda, idx_cpu, temb)
+    y1 = m_ragged(x.flatten(), c, idx_cum_cuda, idx_cuda, idx_cpu, temb)
 
     assert torchperf.allclose(y0.flatten(), y1.flatten())
 
@@ -61,6 +62,7 @@ def test_RaggedResnetBlock2D_nchw_uniform():
 def test_RaggedResnetBlock2D_nchw():
     n, c, hs, ws = 4, 320, [14, 14, 28, 28], [14, 28, 14, 28]
     idx_cuda, idx_cpu = uniserve.utils.create_index_2d(hs, ws)
+    idx_cum_cuda = uniserve.utils.create_cum_index_1d([h * w for h, w in zip(hs, ws)])
 
     m_orig = build_resnet()
     m_ragged = RaggedResnetBlock2D_nchw(m_orig)
@@ -76,7 +78,7 @@ def test_RaggedResnetBlock2D_nchw():
     x0 = torch.concat(x0)
     y0 = torch.concat(y0)
 
-    y1 = m_ragged(x0.flatten(), c, idx_cuda, idx_cpu, temb)
+    y1 = m_ragged(x0.flatten(), c, idx_cum_cuda, idx_cuda, idx_cpu, temb)
 
     assert torchperf.allclose(y0.flatten(), y1.flatten())
 
@@ -84,6 +86,7 @@ def test_RaggedResnetBlock2D_nchw():
 @torch.no_grad()
 def test_RaggedResnetBlock2D_nchw_compile():
     n, c, hs, ws = 4, 320, [14, 14, 28, 28], [14, 28, 14, 28]
+    idx_cum_cuda = uniserve.utils.create_cum_index_1d([h * w for h, w in zip(hs, ws)])
     # The following setting result into slight numerical errors
     # n, c = 4, 320
     # hs, ws = [56] * n, [56] * n
@@ -103,7 +106,7 @@ def test_RaggedResnetBlock2D_nchw_compile():
     x1 = torch.concat([x.flatten() for x in x0])
     y0 = torch.concat([y.flatten() for y in y0])
 
-    y1 = m_ragged(x1, c, idx_cuda, idx_cpu, temb)
+    y1 = m_ragged(x1, c, idx_cum_cuda, idx_cuda, idx_cpu, temb)
     assert torchperf.allclose(y0.flatten(), y1.flatten(), 0.01)
 
     # Compile wrapper
@@ -117,7 +120,7 @@ def test_RaggedResnetBlock2D_nchw_compile():
     torch._dynamo.mark_dynamic(idx_cuda, 1)
     torch._dynamo.mark_dynamic(idx_cpu, 1)
 
-    y1 = m_ragged(x1, c, idx_cuda, idx_cpu, temb)
+    y1 = m_ragged(x1, c, idx_cum_cuda, idx_cuda, idx_cpu, temb)
     assert torchperf.allclose(y0.flatten(), y1.flatten())
 
     def run_orig():
@@ -127,7 +130,9 @@ def test_RaggedResnetBlock2D_nchw_compile():
         return y0
 
     t0 = torchperf.cuda_timeit_ms(run_orig)
-    t1 = torchperf.cuda_timeit_ms(lambda: m_ragged(x1, c, idx_cuda, idx_cpu, temb))
+    t1 = torchperf.cuda_timeit_ms(
+        lambda: m_ragged(x1, c, idx_cum_cuda, idx_cuda, idx_cpu, temb)
+    )
     print(f"{t0=} {t1=}")
 
     # m_ragged(x1, n, c, hs, ws, HxWs, temb)
@@ -144,7 +149,7 @@ def test_RaggedResnetBlock2D_nchw_compile():
     x1 = torch.concat([x.flatten() for x in x0])
     temb = torch.randn(n, 1280)
     t2 = torchperf.cuda_timeit_ms(
-        lambda: m_ragged(x1, c, idx_cuda, idx_cpu, temb), 0, 1
+        lambda: m_ragged(x1, c, idx_cum_cuda, idx_cuda, idx_cpu, temb), 0, 1
     )
     print(f"{t2=}")
     assert t2 < 10, "An abnormal long execution time hints for recompilation"

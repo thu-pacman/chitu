@@ -117,12 +117,13 @@ class RaggedResnetBlock2D_nchw(RaggedResnetBlock2D_nhwc):
         self,
         x: torch.Tensor,
         c: int,
+        idx_cuda_cum: torch.Tensor,
         idx_cuda: torch.Tensor,
         idx_cpu: torch.Tensor,
         temb: torch.Tensor,
         scale: float = 1.0,
     ):
         x = torch.ops.uniserve.ragged_nchw_to_nhwc(x, c, idx_cpu)
-        x = super().forward(x, idx_cuda, idx_cpu, temb, scale)
+        x = super().forward(x, idx_cuda_cum, idx_cuda, idx_cpu, temb, scale)
         x = torch.ops.uniserve.ragged_nhwc_to_nchw(x, self.shadow.out_channels, idx_cpu)
         return x
