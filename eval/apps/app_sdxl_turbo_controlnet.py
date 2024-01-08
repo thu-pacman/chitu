@@ -1,4 +1,6 @@
 import os
+
+os.environ["HF_HUB_OFFLINE"] = "1"
 import torch
 from itertools import product
 import time
@@ -9,7 +11,6 @@ from PIL import Image
 import datetime
 import types
 
-os.environ["HF_HUB_OFFLINE"] = "1"
 from diffusers import (
     DiffusionPipeline,
     StableDiffusionXLPipeline,
@@ -25,8 +26,9 @@ from sdxl_control.uniserve_pipeline_controlnet_sd_xl import (
 )
 from utils.stable_fast_tools import get_default_sfast_config
 from sfast.compilers.diffusion_pipeline_compiler import (
-    compile,
-    compile_unet,
+    compile as sfast_compile,
+    compile_unet as sfast_compile_unet,
+    compile_vae as sfast_compile_vae,
 )
 
 
@@ -46,35 +48,37 @@ def profile_controlnet(
     input_image,
     save_image=False,
 ):
-    prompts = ["An image of a squirrel in Picasso style"] * n_batches
+    prompts = ["An image of a squirrel in Picasso style"]
     image_resize = cv2.resize(
         input_image, (height, width), interpolation=cv2.INTER_AREA
     )
     canny_image = Image.fromarray(image_resize)
     images = [canny_image] * n_batches
+    generator = torch.Generator(device="cuda").manual_seed(12345)
 
-    # start = time.time()
-    result = pipeline(
-        prompt=prompts,
-        controlnet_conditioning_scale=0.5,
-        image=images,
-        num_inference_steps=1,
-    )
-    ret_time = torchperf.cuda_timeit_ms(
-        lambda: pipeline(
-            prompt=prompts,
-            controlnet_conditioning_scale=0.5,
-            image=images,
-            num_inference_steps=1,
-        ),
-        5,
-        10,
-    )
+    def f():
+        ret = []
+        for image in images:
+            ret.append(
+                pipeline(
+                    prompt=prompts,
+                    guidance_scale=0,  # disable classifier_free_guidance
+                    controlnet_conditioning_scale=0.5,
+                    image=image,
+                    num_inference_steps=1,
+                    generator=generator,
+                ).images[0]
+            )
+        return ret
 
-    # end = time.time()
+    result = f()
+    ret_time = torchperf.cuda_timeit_ms(f, 3, 8)
+    # torchperf.torch_profile_it(
+    #     "sfast_controlNet_bs4", f(), sort_keys=["cpu_time_total", "cuda_time_total"]
+    # )
     if save_image:
         fn = f"output/out_{datetime.datetime.now().strftime('%m%d-%H%M%S')}.png"
-        result.images[0].save(fn)
+        result[0].save(fn)
         print(f"Save image to {fn}")
     return ret_time
 
@@ -121,8 +125,8 @@ def cached_controlnet(
     )
 
     (
-        latents,
-        sample,
+        latents,  # noise
+        sample,  # UNet output
         unet_down_block_res_samples,
         emb,
         prompt_embeds,
@@ -150,12 +154,16 @@ def cached_controlnet(
     )
 
     result = f2()
-    ret_time = torchperf.cuda_timeit_ms(f2, 3, 5)
-    torchperf.torch_profile_it("output", f2)
+    ret_time = torchperf.cuda_timeit_ms(f2, 3, 8)
+    # torchperf.torch_profile_it("output_f1", f1)
+    # torchperf.torch_profile_it(
+    #     "output_f2", f2, sort_keys=["cpu_time_total", "cuda_time_total"]
+    # )
     if save_image:
-        fn = f"output/out_{datetime.datetime.now().strftime('%m%d-%H%M%S')}.png"
-        result.images[0].save(fn)
-        print(f"Save image to {fn}")
+        for i, image in enumerate(result.images):
+            fn = f"output/out_{datetime.datetime.now().strftime('%m%d-%H%M%S')}_{i}.png"
+            image.save(fn)
+            print(f"Save image to {fn}")
     return ret_time
 
 
@@ -187,20 +195,18 @@ def infer(
     return tot_time
 
 
-def run(mode: str, model_name: str) -> float:
-    batches = [1]
-    shapes = [[512, 512]]
+def run(mode: str, model_name: str, shapes, batches) -> float:
     image = load_image(
         # "/home/zly/Works/uniserving/exp/diffusers/weights/EasternGraySquirrel_GAm.jpg"
         "/home/zly/Works/uniserving/exp/diffusers/weights/eastern-gray-squirrel-closeup.jpg"
     )
     lora_path = [
-        None,
+        # None,
         # "/home/wcz112/UNISERVING/LoRAs/Harrlogos_v2.0.safetensors", #sdxl lora
         # "/home/wcz112/UNISERVING/LoRAs/WowifierXL-V2.safetensors", #sdxl lora
-        # "/home/zly/Works/uniserving/exp/diffusers/weights/62833.add_detail.safetensors",
         # "/home/wcz112/UNISERVING/LoRAs/add_detail.safetensors",
         # "/home/wcz112/UNISERVING/LoRAs/edgGreekDollLikenessv1.safetensors",
+        "/home/zly/Works/uniserving/exp/weight/lora-sdxl_turbo-the_Vidiot_Teletext_Style.safetensors",
     ]
     image = np.array(image)
     image = cv2.Canny(image, 100, 200)
@@ -217,14 +223,19 @@ def run(mode: str, model_name: str) -> float:
             torch_dtype=torch.float16,
             variant="fp16",
         )
+        vae = AutoencoderKL.from_pretrained(
+            "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16
+        )
         pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
             # "stabilityai/stable-diffusion-xl-base-1.0",
             "stabilityai/sdxl-turbo",
             torch_dtype=torch.float16,
+            vae=vae,
             controlnet=controlnet,
             variant="fp16",
             use_safetensors=True,
         )
+        pipe.vae.config.force_upcast = False  # Use fp16 VAE
     elif model_name == "sd15":
         print("Using SD v1.5")
         url = "https://huggingface.co/lllyasviel/ControlNet-v1-1/blob/main/control_v11p_sd15_canny.pth"
@@ -242,18 +253,6 @@ def run(mode: str, model_name: str) -> float:
     pipe.safety_checker = None
     if mode == "debug":
         print("Run torch eager")
-        infer(
-            pipe,
-            image,
-            batches,
-            shapes,
-            use_cache=False,
-            lora_path=lora_path,
-        )
-    elif mode == "torch":
-        print("Run torch compile")
-        # torch._dynamo.config.cache_size_limit = 102400
-        # pipe.unet = torch.compile(pipe.unet, dynamic=False)
         ret_time = infer(
             pipe,
             image,
@@ -262,23 +261,32 @@ def run(mode: str, model_name: str) -> float:
             use_cache=False,
             lora_path=lora_path,
         )
-    elif mode == "torch_compile":
-        print("Run torch compile")
-        torch._dynamo.config.cache_size_limit = 102400
-        pipe.unet = torch.compile(pipe.unet, dynamic=False)
-        ret_time = infer(
-            pipe,
-            image,
-            batches,
-            shapes,
-            use_cache=False,
-            lora_path=lora_path,
-        )
+    # elif mode == "torch":
+    #     print("Run torch compile")
+    #     # torch._dynamo.config.cache_size_limit = 102400
+    #     # pipe.unet = torch.compile(pipe.unet, dynamic=False)
+    #     ret_time = infer(
+    #         pipe,
+    #         image,
+    #         batches,
+    #         shapes,
+    #         use_cache=False,
+    #         lora_path=lora_path,
+    #     )
+    # elif mode == "torch_compile":
+    #     print("Run torch compile")
+    #     torch._dynamo.config.cache_size_limit = 102400
+    #     pipe.unet = torch.compile(pipe.unet, dynamic=False)
+    #     ret_time = infer(
+    #         pipe,
+    #         image,
+    #         batches,
+    #         shapes,
+    #         use_cache=False,
+    #         lora_path=lora_path,
+    #     )
     elif mode == "sfast":
-        print("Run torch compile")
-        # torch._dynamo.config.cache_size_limit = 102400
-        # pipe.unet = torch.compile(pipe.unet, dynamic=False)
-        # pipe.unet = compile_unet(pipe.unet, sfast_config) useless compile waiting to be fixed
+        sfast_compile(pipe, sfast_config)
         ret_time = infer(
             pipe,
             image,
@@ -288,11 +296,9 @@ def run(mode: str, model_name: str) -> float:
             lora_path=lora_path,
         )
     elif mode == "ours":
-        print("Run torch compile")
-        # torch._dynamo.config.cache_size_limit = 102400
-        # pipe.unet = torch.compile(pipe.unet, dynamic=False)
-
-        # pipe = compile(pipe, sfast_config) useless compile waiting to be fixed.
+        # pipe.unet = sfast_compile_unet(pipe.unet)
+        pipe.controlnet = sfast_compile_unet(pipe.controlnet, sfast_config)
+        pipe.vae = sfast_compile_vae(pipe.vae, sfast_config)
         ret_time = infer(
             pipe,
             image,
@@ -303,12 +309,18 @@ def run(mode: str, model_name: str) -> float:
         )
     else:
         raise RuntimeError()
-    print(ret_time)
     return ret_time
 
 
 if __name__ == "__main__":
-    for mode in ["debug", "torch", "sfast", "ours"]:
-        # for mode in ["ours"]:
-        t = run(mode, "sdxl")
-        print(f"== {mode} {t:.2f}")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # for mode in ["debug", "torch", "sfast", "ours"]:
+    # for mode in ["ours"]:
+    # for mode in ["sfast"]:
+    for mode in ["sfast", "ours"]:
+        # for shapes in [[[256, 256]], [[512, 512]], [[1024, 1024]]]:
+        for shapes in [[[512, 512]]]:
+            for batches in [[1], [16]]:
+                t = run(mode, "sdxl", shapes=shapes, batches=batches)
+                print(f"== {mode} {t:.2f} {shapes} {batches}")

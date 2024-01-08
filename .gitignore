@@ -182,3 +182,7 @@ torch_compile_debug
 *.csv
 *.json
 *.jpg
+*.gif
+*.mp4
+*.pdf
+

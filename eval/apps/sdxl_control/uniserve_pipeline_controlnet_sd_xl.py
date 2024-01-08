@@ -46,6 +46,7 @@ if is_invisible_watermark_available():
 
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 from .uniserve_unet_2d_condition import UniserveSdxlControlUNet2DConditionModel
+import torchperf
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -403,7 +404,8 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
         # 6. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
         latents = self.prepare_latents(
-            batch_size * num_images_per_prompt,
+            # batch_size * num_images_per_prompt,
+            1,
             num_channels_latents,
             height,
             width,
@@ -412,6 +414,7 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
             generator,
             latents,
         )
+        latents = latents.broadcast_to([batch_size * num_images_per_prompt, -1, -1, -1])
 
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -725,17 +728,31 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
                     controlnet_cond_scale = controlnet_cond_scale[0]
                 cond_scale = controlnet_cond_scale * controlnet_keep[i]
 
+            # with torch.profiler.record_function("ControlNet"):
+            # down_block_res_samples, mid_block_res_sample = self.controlnet(
+            #     control_model_input,
+            #     t,
+            #     encoder_hidden_states=controlnet_prompt_embeds,
+            #     controlnet_cond=image,
+            #     conditioning_scale=cond_scale,
+            #     guess_mode=False,  # guess_mode,
+            #     added_cond_kwargs=controlnet_added_cond_kwargs,
+            #     return_dict=False,
+            # )
             down_block_res_samples, mid_block_res_sample = self.controlnet(
-                control_model_input,
+                control_model_input[:1,],
                 t,
-                encoder_hidden_states=controlnet_prompt_embeds,
-                controlnet_cond=image,
+                encoder_hidden_states=controlnet_prompt_embeds[:1,],
+                controlnet_cond=image[:1,],
                 conditioning_scale=cond_scale,
                 guess_mode=False,  # guess_mode,
-                added_cond_kwargs=controlnet_added_cond_kwargs,
+                added_cond_kwargs={
+                    "text_embeds": controlnet_added_cond_kwargs["text_embeds"][:1],
+                    "time_ids": controlnet_added_cond_kwargs["time_ids"][:1],
+                },
                 return_dict=False,
             )
-            # print(f"{down_block_res_samples=}", f"{mid_block_res_sample=}")
+
             # print(
             #     *[
             #         f"{k}={v}"
@@ -752,16 +769,24 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
             #     sep="\n",
             # )
 
-            noise_pred = self.unet.forward_2(
-                sample=sample,
-                encoder_hidden_states=prompt_embeds,
-                cross_attention_kwargs=cross_attention_kwargs,
-                down_block_additional_residuals=down_block_res_samples,
-                mid_block_additional_residual=mid_block_res_sample,
-                return_dict=False,
-                emb=emb,
-                down_block_res_samples=unet_down_block_res_samples,
-            )[0]
+            # with torch.profiler.record_function("UNet Forward2"):
+            n_batches = len(control_model_input)
+            noise_pred = []
+            for i in range(n_batches):
+                noise_pred_i = self.unet.forward_2(
+                    sample=sample[i : i + 1],
+                    encoder_hidden_states=prompt_embeds[i : i + 1],
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    down_block_additional_residuals=down_block_res_samples,
+                    mid_block_additional_residual=mid_block_res_sample,
+                    return_dict=False,
+                    emb=emb[i : i + 1],
+                    down_block_res_samples=[
+                        t[i : i + 1] for t in unet_down_block_res_samples
+                    ],
+                )[0]
+                noise_pred.append(noise_pred_i)
+            noise_pred = torch.concat(noise_pred, dim=0)
 
             # perform guidance
             if self.do_classifier_free_guidance:
@@ -782,6 +807,7 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
             #     if callback is not None and i % callback_steps == 0:
             #         callback(i, t, latents)
 
+        # with torch.profiler.record_function("mY Postprocessing"):
         # manually for max memory savings
         if self.vae.dtype == torch.float16 and self.vae.config.force_upcast:
             self.upcast_vae()
