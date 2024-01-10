@@ -8,12 +8,23 @@ from PIL import Image
 from svd_temporal_controlnet.pipeline.pipeline_stable_video_diffusion_controlnet import (
     StableVideoDiffusionPipelineControlNet,
 )
+from svd_temporal_controlnet.pipeline.uniserve_pipeline_stable_video_diffusion_controlnet import (
+    UniserveStableVideoDiffusionPipelineControlNet,
+)
+import random
 from svd_temporal_controlnet.models.controlnet_sdv import ControlNetSDVModel
 from svd_temporal_controlnet.models.unet_spatio_temporal_condition_controlnet import (
     UNetSpatioTemporalConditionControlNetModel,
 )
 import cv2
 import re
+import torchperf
+from utils.stable_fast_tools import get_default_sfast_config
+from sfast.compilers.diffusion_pipeline_compiler import (
+    compile as sfast_compile,
+    compile_unet as sfast_compile_unet,
+    compile_vae as sfast_compile_vae,
+)
 
 
 def save_gifs_side_by_side(
@@ -60,6 +71,7 @@ def save_gifs_side_by_side(
                     combined_frame = get_concat_h(combined_frame, gif.copy())
             frames.append(combined_frame)
 
+        print(f"Save final gif in {output_path}")
         frames[0].save(
             output_path,
             save_all=True,
@@ -317,8 +329,106 @@ def convert_list_bgra_to_rgba(image_list):
     return rgba_images
 
 
-# Main script
+def svd_perf(pipe, start_end_lists, opt=False, *, n_steps=25, n_frames=14):
+    print(start_end_lists)
+    ret = []
+    for start_end_list in start_end_lists:
+        if opt:
+            pipe.clear_cache()
+        for item in start_end_list:
+            if opt == False:
+                ret.append(
+                    pipe(
+                        validation_image,
+                        validation_control_images[:n_frames],
+                        decode_chunk_size=8,
+                        num_videos_per_prompt=1,
+                        num_frames=n_frames,
+                        motion_bucket_id=100,
+                        controlnet_cond_scale=1.0,
+                        num_inference_steps=n_steps,
+                    )
+                )
+            else:
+                ret.append(
+                    pipe(
+                        validation_image,
+                        validation_control_images[:n_frames],
+                        start_end_point=item,  # Specify start and end
+                        decode_chunk_size=8,
+                        num_videos_per_prompt=1,
+                        num_frames=n_frames,
+                        motion_bucket_id=100,
+                        controlnet_cond_scale=1.0,
+                        num_inference_steps=n_steps,
+                    )
+                )
+    return ret
+
+
+def get_pipeline(cached: bool, compile=False):
+    # Load and set up the pipeline
+    controlnet = controlnet = ControlNetSDVModel.from_pretrained(
+        "CiaraRowles/temporal-controlnet-depth-svd-v1",
+        subfolder="controlnet",
+        torch_dtype=torch.float16,
+    )
+    unet = UNetSpatioTemporalConditionControlNetModel.from_pretrained(
+        args["pretrained_model_name_or_path"],
+        subfolder="unet",
+        torch_dtype=torch.float16,
+    )
+    if cached:
+        pipeline = UniserveStableVideoDiffusionPipelineControlNet.from_pretrained(
+            args["pretrained_model_name_or_path"], controlnet=controlnet, unet=unet
+        )
+    else:
+        pipeline = StableVideoDiffusionPipelineControlNet.from_pretrained(
+            args["pretrained_model_name_or_path"], controlnet=controlnet, unet=unet
+        )
+    for param in pipeline.vae.parameters():
+        param.required_grad = False
+    # pipeline.enable_model_cpu_offload()
+    pipeline.to(dtype=torch.float16, device="cuda")
+    if compile:
+        config = get_default_sfast_config()
+        config.enable_cuda_graph = False
+        pipeline = sfast_compile(pipeline, config)
+    return pipeline
+
+
+def run_pipeline(n_steps, cached: bool, save_gif: bool = False):
+    pipeline = get_pipeline(cached=cached, compile=True)
+    ff1 = lambda: svd_perf(pipeline, start_end_points, opt=cached, n_steps=n_steps)
+    # Warmup
+    svd_perf(pipeline, [[[0, n_steps]]], opt=cached, n_steps=n_steps)
+    # Evaluate
+    t1 = torchperf.cuda_timeit_ms(ff1, 0, 1)
+    print(f"==== {cached=} {t1:.2f} ms =========")
+
+    if save_gif:
+        ret = ff1()
+        for video_frames in ret:
+            val_save_dir = os.path.join(args["output_dir"], "validation_images")
+            os.makedirs(val_save_dir, exist_ok=True)
+            save_gifs_side_by_side(
+                video_frames.frames,
+                validation_images,
+                validation_control_images,
+                val_save_dir,
+            )
+
+    # t1 = torchperf.cuda_timeit_ms(f1,1,2)
+    # val_save_dir = os.path.join(args["output_dir"], "validation_images_shuffle")
+    # os.makedirs(val_save_dir, exist_ok=True)
+    # save_gifs_side_by_side(
+    #     video_frames_opt, validation_images, validation_control_images, val_save_dir
+    # )
+
+
 if __name__ == "__main__":
+    cached = False  # False is baseline, True is optimized
+    torch.set_grad_enabled(False)
     args = {
         "pretrained_model_name_or_path": "stabilityai/stable-video-diffusion-img2vid",
         "validation_image_folder": "./svd_temporal_controlnet/validation_demo/rgb",
@@ -338,39 +448,48 @@ if __name__ == "__main__":
     )
     validation_image = Image.open(args["validation_image"]).convert("RGB")
 
-    # Load and set up the pipeline
-    controlnet = controlnet = ControlNetSDVModel.from_pretrained(
-        "CiaraRowles/temporal-controlnet-depth-svd-v1",
-        subfolder="controlnet",
-        torch_dtype=torch.float16,
-    )
-    unet = UNetSpatioTemporalConditionControlNetModel.from_pretrained(
-        args["pretrained_model_name_or_path"],
-        subfolder="unet",
-        torch_dtype=torch.float16,
-    )
-    pipeline = StableVideoDiffusionPipelineControlNet.from_pretrained(
-        args["pretrained_model_name_or_path"], controlnet=controlnet, unet=unet
-    )
-    pipeline.enable_model_cpu_offload()
-    pipeline.to(dtype=torch.float16)
-    # Additional pipeline configurations can be added here
-    # pipeline.enable_xformers_memory_efficient_attention()
-    # Create output directory if it doesn't exist
-    val_save_dir = os.path.join(args["output_dir"], "validation_images")
-    os.makedirs(val_save_dir, exist_ok=True)
+    # Create request trace
+    random.seed(888)
+    num_requests_pack = 1
+    requests_pack_size = 16
+    n_steps = 25
+    start_end_points = [
+        [
+            sorted((random.randint(0, n_steps), random.randint(0, n_steps)))
+            for _ in range(requests_pack_size)
+        ]
+        for i in range(num_requests_pack)
+    ]
+    # start_end_points = [[[0, 25]]]
+
+    run_pipeline(n_steps=n_steps, cached=cached, save_gif=False)
 
     # Inference and saving loop
-
-    video_frames = pipeline(
-        validation_image,
-        validation_control_images[:14],
-        decode_chunk_size=8,
-        num_frames=14,
-        motion_bucket_id=100,
-        controlnet_cond_scale=1.0,
-    ).frames
-
-    save_gifs_side_by_side(
-        video_frames, validation_images, validation_control_images, val_save_dir
-    )
+    # f0 = lambda: pipeline(
+    #     validation_image,
+    #     validation_control_images[:2],
+    #     decode_chunk_size=8,
+    #     num_videos_per_prompt=2,
+    #     num_frames=2,
+    #     motion_bucket_id=100,
+    #     controlnet_cond_scale=1.0,
+    # )
+    # video_frames = f0().frames
+    # t0 = torchperf.cuda_timeit_ms(f0,1,1)
+    # save_gifs_side_by_side(
+    #     video_frames, validation_images, validation_control_images, val_save_dir
+    # )
+    if False:  # Generate with the original pipeline
+        ff0 = lambda: svd_perf(pipeline, start_end_points)
+        video_frames = ff0()
+        val_save_dir = os.path.join(args["output_dir"], "validation_images")
+        os.makedirs(val_save_dir, exist_ok=True)
+        save_gifs_side_by_side(
+            video_frames[0].frames,
+            validation_images,
+            validation_control_images,
+            val_save_dir,
+        )
+        t0 = torchperf.cuda_timeit_ms(ff0, 0, 1)
+        print(f"====orignal time{t0:.2f}===========")
+        exit()

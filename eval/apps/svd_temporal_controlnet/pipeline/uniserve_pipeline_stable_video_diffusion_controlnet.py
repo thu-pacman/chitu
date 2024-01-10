@@ -20,7 +20,7 @@ import numpy as np
 import PIL.Image
 import torch
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
-from models.controlnet_sdv import ControlNetSDVModel
+from ..models.controlnet_sdv import ControlNetSDVModel
 
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models import (
@@ -30,13 +30,14 @@ from diffusers.models import (
 from diffusers.utils import BaseOutput, logging
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from models.unet_spatio_temporal_condition_controlnet import (
+from ..models.unet_spatio_temporal_condition_controlnet import (
     UNetSpatioTemporalConditionControlNetModel,
 )
-from utils.scheduling_euler_discrete_karras_fix import EulerDiscreteScheduler
+from ..utils.scheduling_euler_discrete_karras_fix import EulerDiscreteScheduler
 
 # from diffusers.pipelines.utils import PIL_INTERPOLATION, BaseOutput, logging
 
+torch.set_default_dtype(torch.float16)
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -104,7 +105,7 @@ class StableVideoDiffusionPipelineOutput(BaseOutput):
     frames: Union[List[PIL.Image.Image], np.ndarray]
 
 
-class StableVideoDiffusionPipelineControlNet(DiffusionPipeline):
+class UniserveStableVideoDiffusionPipelineControlNet(DiffusionPipeline):
     r"""
     Pipeline to generate video from an input image using Stable Video Diffusion.
 
@@ -146,7 +147,7 @@ class StableVideoDiffusionPipelineControlNet(DiffusionPipeline):
             scheduler=scheduler,
             feature_extractor=feature_extractor,
         )
-
+        self.dict = {}
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
@@ -286,6 +287,9 @@ class StableVideoDiffusionPipelineControlNet(DiffusionPipeline):
                 f"`height` and `width` have to be divisible by 8 but are {height} and {width}."
             )
 
+    def clear_cache(self):
+        self.dict = {}
+
     def prepare_latents(
         self,
         batch_size,
@@ -351,6 +355,8 @@ class StableVideoDiffusionPipelineControlNet(DiffusionPipeline):
         fps: int = 7,
         motion_bucket_id: int = 127,
         noise_aug_strength: int = 0.02,
+        start_end_point: Optional[Union[int, int]] = None,
+        hash_key: int = 0,
         decode_chunk_size: Optional[int] = None,
         num_videos_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -501,7 +507,7 @@ class StableVideoDiffusionPipelineControlNet(DiffusionPipeline):
         # image_latents [batch, channels, height, width] ->[batch, num_frames, channels, height, width]
         image_latents = image_latents.unsqueeze(1).repeat(1, num_frames, 1, 1, 1)
         # image_latents = torch.cat([image_latents] * 2) if do_classifier_free_guidance else image_latents
-
+        # print(image_latents.shape, latents.shape)
         # 5. Get Added Time IDs
         added_time_ids = self._get_add_time_ids(
             fps,
@@ -565,8 +571,25 @@ class StableVideoDiffusionPipelineControlNet(DiffusionPipeline):
         # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
+        start_end_point = (
+            (0, num_inference_steps) if start_end_point == None else start_end_point
+        )
+        # controlnet_cond_partial = torch.zeros(2, 1, 3, 576, 1024).to(device="cuda")
+        if self.dict.get(hash_key) is None:
+            self.dict[hash_key] = {}
+        # print(self.guidance_scale)
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                # print(t)
+                if i < start_end_point[0]:
+                    if self.dict[hash_key].get(i) is not None:
+                        latents, noise_pred = self.dict[hash_key][i]
+                        latents = self.scheduler.step(
+                            noise_pred, t, latents
+                        ).prev_sample
+                        # print("cache read")
+                        progress_bar.update()
+                        continue
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = (
                     torch.cat([latents] * 2) if do_classifier_free_guidance else latents
@@ -574,24 +597,41 @@ class StableVideoDiffusionPipelineControlNet(DiffusionPipeline):
                 latent_model_input = self.scheduler.scale_model_input(
                     latent_model_input, t
                 )
-
                 # Concatenate image_latents over channels dimention
 
                 latent_model_input = torch.cat(
                     [latent_model_input, image_latents], dim=2
                 )
-                down_block_res_samples, mid_block_res_sample = self.controlnet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=image_embeddings,
-                    controlnet_cond=controlnet_condition,
-                    added_time_ids=added_time_ids,
-                    conditioning_scale=controlnet_cond_scale,
-                    guess_mode=False,
-                    return_dict=False,
-                )
-
-                # predict the noise residual
+                if i < start_end_point[0] or i > start_end_point[1]:
+                    down_block_res_samples = [
+                        torch.zeros(num_frames * 2, 320, 72, 128).to(device="cuda"),
+                        torch.zeros(num_frames * 2, 320, 72, 128).to(device="cuda"),
+                        torch.zeros(num_frames * 2, 320, 72, 128).to(device="cuda"),
+                        torch.zeros(num_frames * 2, 320, 36, 64).to(device="cuda"),
+                        torch.zeros(num_frames * 2, 640, 36, 64).to(device="cuda"),
+                        torch.zeros(num_frames * 2, 640, 36, 64).to(device="cuda"),
+                        torch.zeros(num_frames * 2, 640, 18, 32).to(device="cuda"),
+                        torch.zeros(num_frames * 2, 1280, 18, 32).to(device="cuda"),
+                        torch.zeros(num_frames * 2, 1280, 18, 32).to(device="cuda"),
+                        torch.zeros(num_frames * 2, 1280, 9, 16).to(device="cuda"),
+                        torch.zeros(num_frames * 2, 1280, 9, 16).to(device="cuda"),
+                        torch.zeros(num_frames * 2, 1280, 9, 16).to(device="cuda"),
+                    ]
+                    mid_block_res_sample = torch.zeros(num_frames * 2, 1280, 9, 16).to(
+                        device="cuda"
+                    )
+                # if controlnet_cond_partial != None:
+                else:
+                    down_block_res_samples, mid_block_res_sample = self.controlnet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=image_embeddings,
+                        controlnet_cond=controlnet_condition,
+                        added_time_ids=added_time_ids,
+                        conditioning_scale=controlnet_cond_scale,
+                        guess_mode=False,
+                        return_dict=False,
+                    )
                 noise_pred = self.unet(
                     latent_model_input,
                     t,
@@ -605,10 +645,12 @@ class StableVideoDiffusionPipelineControlNet(DiffusionPipeline):
                 # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + self.guidance_scale * (
-                        noise_pred_cond - noise_pred_uncond
-                    )
-
+                    noise_pred = noise_pred_uncond + self.guidance_scale[
+                        :, : noise_pred_cond.shape[1], :, :, :
+                    ] * (noise_pred_cond - noise_pred_uncond)
+                if i < start_end_point[0]:
+                    self.dict[hash_key][i] = (latents, noise_pred)
+                    # print("cache write.")
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents).prev_sample
 
