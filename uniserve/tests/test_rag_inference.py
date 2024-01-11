@@ -390,6 +390,7 @@ def run_and_get_intemediate_results(
     idx2d_cuda, idx2d_cpu = create_index_2d(hs, ws)
     idx1d_cuda, idx1d_cpu = idx2d_cuda[2:], idx2d_cpu[2:]
     cum_idx1d_cuda = uniserve.utils.create_cum_index_1d([h * w for h, w in zip(hs, ws)])
+    prompt_cum_idx1d_cuda = uniserve.utils.create_cum_index_1d([77] * len(hs))
     emb = full_model.run_head(full_model, *args, **kwargs)
 
     x0 = []
@@ -421,6 +422,7 @@ def run_and_get_intemediate_results(
         idx2d_cuda,
         idx2d_cpu,
         cum_idx1d_cuda,
+        prompt_cum_idx1d_cuda,
         None,
         None,
         x0.flatten(),

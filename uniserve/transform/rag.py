@@ -376,6 +376,11 @@ class RagTransformer(torch.fx.Transformer):
             self.new_graph.placeholder(name, default_value=inspect.Signature.empty),
             self.tracer,
         )
+        name = f"prompt_cum_idx1d_cuda"
+        self.indices[(name, 1)] = Proxy(
+            self.new_graph.placeholder(name, default_value=inspect.Signature.empty),
+            self.tracer,
+        )
 
     def divide_index2d(self, idx, ratio, device=None):
         return idx // self.index_2d_divisor(ratio, device=device)
@@ -392,12 +397,13 @@ class RagTransformer(torch.fx.Transformer):
             name = "cum_" + name
         key = (name, divisor)
         if key not in self.indices:
-            if dims == 2:
-                self.indices[key] = self.divide_index2d(
-                    self.indices[(name, 1)], divisor, device
-                )
-            else:
-                self.indices[key] = self.indices[(name, 1)] // divisor
+            if divisor > 1:  # create new index by division
+                if dims == 2:
+                    self.indices[key] = self.divide_index2d(
+                        self.indices[(name, 1)], divisor, device
+                    )
+                else:
+                    self.indices[key] = self.indices[(name, 1)] // divisor
         return self.indices[key]
 
     def run_node(self, n: Node) -> torch.fx.Proxy:
@@ -495,7 +501,9 @@ class RagTransformer(torch.fx.Transformer):
                 kwargs,  # {'scale':}
             )
         elif isinstance(submod, BasicTransformerBlock):
-            new_mod = umodel.RaggedTransformerBlock_nhwc(submod)
+            new_mod = umodel.RaggedTransformerBlock_nhwc(
+                submod, get_info(n.args[0]).rag_division_ratio
+            )
             self.add_module(target, new_mod)
             assert len(args) == 1
             return self.tracer.call_module(
@@ -503,12 +511,13 @@ class RagTransformer(torch.fx.Transformer):
                 new_mod.forward,
                 (
                     args[0],
-                    self.get_index(
+                    self.get_index(  # sequence cum index cuda
                         1,
                         get_info(n.args[0]).rag_division_ratio,
                         "cuda",
                         cumulative=True,
                     ),
+                    self.indices[("prompt_cum_idx1d_cuda", 1)],  # prompt cum index cuda
                     self.get_index(1, get_info(n.args[0]).rag_division_ratio, "cpu"),
                 ),
                 kwargs,

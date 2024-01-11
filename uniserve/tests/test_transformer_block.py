@@ -49,6 +49,7 @@ def test_Transformer_uniform():
 
     idx1d_cuda, idx1d_cpu = uniserve.utils.create_index_1d([seq] * n)
     cum_idx_cuda = uniserve.utils.create_cum_index_1d([seq] * n)
+    prompt_cum_seqlens_cuda = uniserve.utils.create_cum_index_1d([77] * n)
 
     x = torch.randn(n, seq, hidden_dim)
 
@@ -56,7 +57,9 @@ def test_Transformer_uniform():
     y0 = m_orig(x, encoder_hidden_states=encoder_hidden_states)
 
     x = x.reshape(-1, hidden_dim)
-    y1 = m_ragged(x, cum_idx_cuda, idx1d_cpu, encoder_hidden_states)
+    y1 = m_ragged(
+        x, cum_idx_cuda, prompt_cum_seqlens_cuda, idx1d_cpu, encoder_hidden_states
+    )
 
     assert torchperf.allclose(y0.flatten(), y1.flatten(), 0.01, 0.01)
 
@@ -67,6 +70,7 @@ def test_Transformer_ragged():
     hidden_dim = heads_dim * heads_num
     idx1d_cuda, idx1d_cpu = uniserve.utils.create_index_1d(Lseq)
     cum_idx_cuda = uniserve.utils.create_cum_index_1d(Lseq)
+    prompt_cum_seqlens_cuda = uniserve.utils.create_cum_index_1d([77] * n)
 
     for bias in [True, False]:
         m_orig = build_transformer(bias)
@@ -84,7 +88,9 @@ def test_Transformer_ragged():
         x0 = torch.concat(x0)
         y0 = torch.concat(y0)
         x0 = x0.reshape(-1, hidden_dim)
-        y1 = m_ragged(x0, cum_idx_cuda, idx1d_cpu, encoder_hidden_states)
+        y1 = m_ragged(
+            x0, cum_idx_cuda, prompt_cum_seqlens_cuda, idx1d_cpu, encoder_hidden_states
+        )
 
         assert torchperf.allclose(y0.flatten(), y1.flatten(), 0.01)
 

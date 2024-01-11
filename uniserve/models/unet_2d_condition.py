@@ -89,22 +89,23 @@ def run_head(
     # this helps to broadcast it as a bias over attention scores, which will be in one of the following shapes:
     #   [batch,  heads, query_tokens, key_tokens] (e.g. torch sdp attn)
     #   [batch * heads, query_tokens, key_tokens] (e.g. xformers or classic attn)
-    if attention_mask is not None:
-        # assume that mask is expressed as:
-        #   (1 = keep,      0 = discard)
-        # convert mask into a bias that can be added to attention scores:
-        #       (keep = +0,     discard = -10000.0)
-        attention_mask = (1 - attention_mask.to(sample.dtype)) * -10000.0
-        attention_mask = attention_mask.unsqueeze(1)
+    # if attention_mask is not None:
+    #     # assume that mask is expressed as:
+    #     #   (1 = keep,      0 = discard)
+    #     # convert mask into a bias that can be added to attention scores:
+    #     #       (keep = +0,     discard = -10000.0)
+    #     attention_mask = (1 - attention_mask.to(sample.dtype)) * -10000.0
+    #     attention_mask = attention_mask.unsqueeze(1)
 
-    # convert encoder_attention_mask to a bias the same way we do for attention_mask
-    if encoder_attention_mask is not None:
-        encoder_attention_mask = (
-            1 - encoder_attention_mask.to(sample.dtype)
-        ) * -10000.0
-        encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
+    # # convert encoder_attention_mask to a bias the same way we do for attention_mask
+    # if encoder_attention_mask is not None:
+    #     encoder_attention_mask = (
+    #         1 - encoder_attention_mask.to(sample.dtype)
+    #     ) * -10000.0
+    #     encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
 
     # 0. center input if necessary
+    # print(sample.shape)
     if self.config.center_input_sample:
         sample = 2 * sample - 1.0
 

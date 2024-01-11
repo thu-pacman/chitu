@@ -99,7 +99,8 @@ class RaggedAttentionblock_nhwc(nn.Module):
         q,
         k,
         v,
-        cu_seqlens,
+        cum_seqlens_cuda,
+        prompt_cum_seqlens_cuda,
         max_len,
     ):
         nheads = self.heads
@@ -111,15 +112,16 @@ class RaggedAttentionblock_nhwc(nn.Module):
             #     2, -1, nheads, head_dims
             # )
             KV = self.to_kv(k).reshape(-1, 2, nheads, head_dims)
-            batches = cu_seqlens.shape[0]
+            batches = cum_seqlens_cuda.shape[0]
             out = torch.ops.uniserve.flashattn_varlen_fwd(
                 Q,
                 KV[:, 0],
                 KV[:, 1],
-                cu_seqlens,
-                torch.tensor(
-                    range(0, batches * 77, 77), dtype=torch.int32, device="cuda"
-                ),
+                cum_seqlens_cuda,
+                # torch.tensor(
+                #     range(0, batches * 77, 77), dtype=torch.int32, device="cuda"
+                # ),
+                prompt_cum_seqlens_cuda,
                 max_len,
                 77,
             )
@@ -131,8 +133,8 @@ class RaggedAttentionblock_nhwc(nn.Module):
                 QKV[:, 0],
                 QKV[:, 1],
                 QKV[:, 2],
-                cu_seqlens,
-                cu_seqlens,
+                cum_seqlens_cuda,
+                cum_seqlens_cuda,
                 max_len,
                 max_len,
             )
@@ -144,11 +146,12 @@ class RaggedAttentionblock_nhwc(nn.Module):
 
 
 class RaggedTransformerBlock_nhwc(nn.Module):
-    def __init__(self, shadow: BasicTransformerBlock):
+    def __init__(self, shadow: BasicTransformerBlock, shape_divisor: int = 1):
         assert isinstance(shadow, BasicTransformerBlock)
         super().__init__()
 
         self.shadow = shadow
+        self.shape_divisor = shape_divisor
         self.norm1 = shadow.norm1
         self.norm2 = shadow.norm2
         self.norm3 = shadow.norm3
@@ -164,6 +167,7 @@ class RaggedTransformerBlock_nhwc(nn.Module):
         self,
         input_tensor: torch.Tensor,
         cum_index_cuda: torch.Tensor,
+        prompt_cum_seqlens_cuda: torch.Tensor,
         idx1d_cpu: torch.Tensor,  # to calculate the max length for FA2
         encoder_hidden_states: torch.Tensor,
         attention_mask: Optional[torch.FloatTensor] = None,
@@ -186,14 +190,20 @@ class RaggedTransformerBlock_nhwc(nn.Module):
         assert cross_attention_kwargs is None
         assert class_labels is None
         # This operation is not allowed by dynamo
-        max_length = int(torch.max(idx1d_cpu))
+        # max_length = int(torch.max(idx1d_cpu))
+        max_length = 128 * 128 // self.shape_divisor
 
         hidden_states = input_tensor
         ## attention 1
         residual_states = hidden_states
         hidden_states = self.norm1(hidden_states)
         hidden_states = self.attn1(
-            hidden_states, hidden_states, hidden_states, cum_index_cuda, max_length
+            hidden_states,
+            hidden_states,
+            hidden_states,
+            cum_index_cuda,
+            prompt_cum_seqlens_cuda,
+            max_length,
         )
         hidden_states += residual_states
 
@@ -208,6 +218,7 @@ class RaggedTransformerBlock_nhwc(nn.Module):
             encoder_hidden_states,
             encoder_hidden_states,
             cum_index_cuda,
+            prompt_cum_seqlens_cuda,
             max_length,
         )
         hidden_states += residual_states
