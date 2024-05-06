@@ -7,7 +7,14 @@ import time
 import torchperf
 
 os.environ["HF_HUB_OFFLINE"] = "1"
-from diffusers import DiffusionPipeline, StableDiffusionXLPipeline
+from diffusers import (
+    DiffusionPipeline,
+    StableDiffusionXLPipeline,
+    PixArtAlphaPipeline,
+    VQDiffusionPipeline,
+    AutoPipelineForText2Image,
+    StableVideoDiffusionPipeline,
+)
 
 
 def str2bool(v):
@@ -85,27 +92,68 @@ def profile_unet(
     return [end - start]
 
 
-def infer(data, is_sdxl: bool, run_compile: bool, batches: list[int], shapes):
-    row_prefix: list = []
-    if is_sdxl:
+def load_model(name: str):
+    name = name.lower()
+    if name == "sdxl":
         print("Using SDXL")
-        row_prefix.append("SDXL")
         pipe = StableDiffusionXLPipeline.from_pretrained(
             "stabilityai/stable-diffusion-xl-base-1.0",
             torch_dtype=torch.float16,
             variant="fp16",
             use_safetensors=True,
         )
-    else:
+    elif name == "sdxl-turbo":
+        print("Using SDXL-turbo")
+        pipe = AutoPipelineForText2Image.from_pretrained(
+            "stabilityai/sdxl-turbo",
+            torch_dtype=torch.float16,
+            variant="fp16",
+            use_safetensors=True,
+        )
+        print(pipe.__class__.__name__)
+        # pipe = StableDiffusionXLPipeline.from_pretrained(
+        #     "stabilityai/sdxl-turbo",
+        #     torch_dtype=torch.float16,
+        #     variant="fp16",
+        #     use_safetensors=True,
+        # )
+    elif name == "sd15":
         print("Using SD v1.5")
-        row_prefix.append("SD15")
         pipe = DiffusionPipeline.from_pretrained(
             "runwayml/stable-diffusion-v1-5",
             torch_dtype=torch.float16,
             variant="fp16",
         )
+    elif name == "vqd":
+        print("Using VQDiffusion")
+        pipe = VQDiffusionPipeline.from_pretrained(
+            "microsoft/vq-diffusion-ithq", torch_dtype=torch.float16, varint="fp16"
+        )
+        pipe = pipe.to("cuda")
+    elif name == "pixart":
+        print("Using PixArt 1024")
+        pipe = PixArtAlphaPipeline.from_pretrained(
+            "PixArt-alpha/PixArt-XL-2-1024-MS", torch_dtype=torch.float16, varint="fp16"
+        )
+    elif name == "svd":
+        print("Using SVD")
+        pipe = StableVideoDiffusionPipeline.from_pretrained(
+            "stabilityai/stable-video-diffusion-img2vid-xt",
+            torch_dtype=torch.float16,
+            variant="fp16",
+        )
+    else:
+        raise RuntimeError(f"Unknown model {name}")
+
     print(f"{pipe.__class__.__name__=}")
+    pipe.safety_checker = None
     pipe.to("cuda")
+    return pipe
+
+
+def infer(data, name: str, run_compile: bool, batches: list[int], shapes):
+    row_prefix: list = []
+    pipe = load_model(name)
 
     if run_compile:
         print("Run torch compile")
@@ -173,9 +221,8 @@ def analyze(fn: str):
 
 if __name__ == "__main__":
     args = parser.parse_args()
-    assert args.model in ["sd15", "sdxl", "all"]
     data = []
-    models = [args.model] if args.model != "all" else ["sd15", "sdxl"]
+    models = [args.model] # if args.model != "all" else ["sd15", "sdxl"]
     compiles = [args.compile]
     batches = [1, 2, 4, 8, 16]
     shapes = [
@@ -190,3 +237,6 @@ if __name__ == "__main__":
             print(data)
     save_data(data, args.output)
     # analyze(args.filename)
+    # n_param = torchperf.utils.count_parameters(pipe.text_encoder)
+    # size_mb = torchperf.utils.count_model_size_in_mb(pipe.unet)
+    # print(f'{n_param=} {size_mb=}')

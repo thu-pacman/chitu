@@ -6,7 +6,8 @@ from itertools import product
 import torchperf
 import PIL
 import PIL.Image
-import uniserve.utils
+
+# import uniserve.utils
 from diffusers import (
     DiffusionPipeline,
     StableDiffusionXLPipeline,
@@ -29,17 +30,24 @@ def infer_standard(
     save_image: bool = False,
 ):
     prompts = ["An image of a squirrel in Picasso style"] * batch_size
-    generator = uniserve.utils.get_deterministic_generator()
+    # generator = uniserve.utils.get_deterministic_generator()
+    generator = None
     image = base(
         prompt=prompts,
         output_type="latent",
         generator=generator,  # , num_inference_steps=50
+        height=height,
+        width=width,
     ).images[0]
     image: PIL.Image.Image = refiner(
-        prompt=prompts, image=image[None, :], generator=generator
+        prompt=prompts,
+        image=image[None, :],
+        generator=generator,
+        height=height,
+        width=width,
     ).images[0]
-    if save_image:
-        uniserve.utils.save_image(image, "sdxl_refiner")
+    # if save_image:
+    #     uniserve.utils.save_image(image, "sdxl_refiner")
 
 
 def infer_opt(
@@ -52,18 +60,25 @@ def infer_opt(
     save_image: bool = False,
 ):
     prompts_base = ["An image of a squirrel in Picasso style"]
-    generator = uniserve.utils.get_deterministic_generator()
-    image = base(prompt=prompts_base, output_type="latent", generator=generator).images[
-        0
-    ]
+    # generator = uniserve.utils.get_deterministic_generator()
+    generator = None
+    image = base(
+        prompt=prompts_base,
+        output_type="latent",
+        generator=generator,
+        height=height,
+        width=width,
+    ).images[0]
     prompts_refiner = ["An image of a squirrel in Picasso style"] * batch_size
     images: PIL.Image.Image = refiner(
         prompt=prompts_refiner,
         image=image[None, :],
         generator=generator,
+        height=height,
+        width=width,
     ).images
-    if save_image:
-        uniserve.utils.save_image(images, "sdxl_refiner")
+    # if save_image:
+    #     uniserve.utils.save_image(images, "sdxl_refiner")
 
 
 def load_pipeline():
@@ -86,7 +101,7 @@ def load_pipeline():
 
 def run(mode: str) -> float:
     batch_size = 4
-    height, width = [512, 512]
+    height, width = [1024, 1024]
     base, refiner = load_pipeline()
 
     sfast_config = get_default_sfast_config()
@@ -100,6 +115,37 @@ def run(mode: str) -> float:
             lambda: infer_standard(base, refiner, batch_size, height, width), 1, 3
         )
     elif mode == "torch_compile":
+        base.text_encoder = torch.compile(base.text_encoder)
+        base.unet = torch.compile(base.unet)
+        refiner.text_encoder = torch.compile(refiner.text_encoder)
+        refiner.unet = torch.compile(refiner.unet)
+        refiner.vae.decode = torch.compile(refiner.vae.decode)
+        ret_time = torchperf.cuda_timeit_ms(
+            lambda: infer_standard(base, refiner, batch_size, height, width), 1, 3
+        )
+    elif mode == "trt":
+        print("Run tensorrt compile")
+        import torch_tensorrt
+
+        torch._dynamo.config.cache_size_limit = 102400
+        base.unet = torch.compile(
+            base.unet,
+            backend="torch_tensorrt",
+            dynamic=False,
+            options={"truncate_long_and_double": True, "precision": torch.half},
+        )
+        refiner.unet = torch.compile(
+            refiner.unet,
+            backend="torch_tensorrt",
+            dynamic=False,
+            options={"truncate_long_and_double": True, "precision": torch.half},
+        )
+        refiner.vae.decode = torch.compile(
+            refiner.vae.decode,
+            backend="torch_tensorrt",
+            dynamic=False,
+            options={"truncate_long_and_double": True, "precision": torch.half},
+        )
         ret_time = torchperf.cuda_timeit_ms(
             lambda: infer_standard(base, refiner, batch_size, height, width), 1, 3
         )
@@ -125,6 +171,9 @@ def run(mode: str) -> float:
 
 
 if __name__ == "__main__":
-    for mode in ["torch", "sfast", "ours"]:
+    # for mode in ["torch", "sfast", "ours"]:
+    # for mode in ["trt"]:
+    # for mode in ["torch"]:
+    for mode in ["sfast"]:
         t = run(mode)
         print(f"== {mode} {t:.2f}")

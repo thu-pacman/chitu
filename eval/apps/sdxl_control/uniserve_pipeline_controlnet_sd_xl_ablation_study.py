@@ -739,7 +739,7 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
             #     added_cond_kwargs=controlnet_added_cond_kwargs,
             #     return_dict=False,
             # )
-            if True: # ours
+            if True:  # ours
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     control_model_input[:1,],
                     t,
@@ -753,7 +753,7 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
                     },
                     return_dict=False,
                 )
-            else: # ControlNet x batch size
+            else:  # Ablation -redundancy elimination: ControlNet x batch size
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     control_model_input,
                     t,
@@ -787,7 +787,7 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
             #     sep="\n",
             # )
 
-            if True: # ours
+            if True:  # ours
                 n_batches = len(control_model_input)
                 noise_pred = []
                 for i in range(n_batches):
@@ -809,15 +809,37 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
                     )[0]
                     noise_pred.append(noise_pred_i)
                 noise_pred = torch.concat(noise_pred, dim=0)
-            else:
+            elif True:  # Deal with full ControlNet output
+                n_batches = len(control_model_input)
+                noise_pred = []
+                for i in range(n_batches):
+                    noise_pred_i = self.unet.forward(
+                        sample=sample[i : i + 1],
+                        encoder_hidden_states=prompt_embeds[i : i + 1],
+                        cross_attention_kwargs=cross_attention_kwargs,
+                        # down_block_additional_residuals=down_block_res_samples,
+                        # mid_block_additional_residual=mid_block_res_sample,
+                        down_block_additional_residuals=[
+                            v[i : i + 1] for v in down_block_res_samples
+                        ],
+                        mid_block_additional_residual=mid_block_res_sample[i : i + 1],
+                        return_dict=False,
+                        emb=emb[i : i + 1],
+                        down_block_res_samples=[
+                            t[i : i + 1] for t in unet_down_block_res_samples
+                        ],
+                    )[0]
+                    noise_pred.append(noise_pred_i)
+                noise_pred = torch.concat(noise_pred, dim=0)
+            else:  # Full UNet
                 n_batches = len(control_model_input)
                 noise_pred = []
                 # predict the noise residual
                 for i in range(n_batches):
                     noise_pred_i = self.unet(
-                        latent_model_input[i:i+1],
+                        latent_model_input[i : i + 1],
                         t,
-                        encoder_hidden_states=prompt_embeds[i:i+1],
+                        encoder_hidden_states=prompt_embeds[i : i + 1],
                         timestep_cond=None,
                         cross_attention_kwargs=self.cross_attention_kwargs,
                         # down_block_additional_residuals=down_block_res_samples,
@@ -826,7 +848,9 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
                             v[i : i + 1] for v in down_block_res_samples
                         ],
                         mid_block_additional_residual=mid_block_res_sample[i : i + 1],
-                        added_cond_kwargs={k:v[i:i+1] for k, v in added_cond_kwargs.items()},
+                        added_cond_kwargs={
+                            k: v[i : i + 1] for k, v in added_cond_kwargs.items()
+                        },
                         return_dict=False,
                     )[0]
                     # print(f'{noise_pred_i.shape=}')
@@ -872,9 +896,41 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
                     next(iter(self.vae.post_quant_conv.parameters())).dtype
                 )
 
-            image = self.vae.decode(
-                latents / self.vae.config.scaling_factor, return_dict=False
-            )[0]
+            if False: # Ours: batched VAE
+                image = self.vae.decode(
+                    latents / self.vae.config.scaling_factor, return_dict=False
+                )[0]
+            else: # ablation -Hetero: no batched VAE
+                images = []
+                for i in range(len(latents)):
+                    image = self.vae.decode(
+                        latents[i : i + 1] / self.vae.config.scaling_factor,
+                        return_dict=False,
+                    )[0]
+                    images.append(image)
+                image = torch.concat(images)
+
+            # cast back to fp16 if needed
+            if needs_upcasting:
+                self.vae.to(dtype=torch.float16)
+        else:
+            image = latents
+
+        if not output_type == "latent":
+            # apply watermark if available
+            if self.watermark is not None:
+                image = self.watermark.apply_watermark(image)
+
+            image = self.image_processor.postprocess(image, output_type=output_type)
+
+        # Offload all models
+        self.maybe_free_model_hooks()
+
+        if not return_dict:
+            return (image,)
+
+        return StableDiffusionXLPipelineOutput(images=image)
+
     @torch.no_grad()
     def call_seperate_unet(
         self,
@@ -1048,19 +1104,6 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
 
         callback = kwargs.pop("callback", None)
         callback_steps = kwargs.pop("callback_steps", None)
-
-        if callback is not None:
-            deprecate(
-                "callback",
-                "1.0.0",
-                "Passing `callback` as an input argument to `__call__` is deprecated, consider using `callback_on_step_end`",
-            )
-        if callback_steps is not None:
-            deprecate(
-                "callback_steps",
-                "1.0.0",
-                "Passing `callback_steps` as an input argument to `__call__` is deprecated, consider using `callback_on_step_end`",
-            )
 
         controlnet = self.controlnet._orig_mod if is_compiled_module(self.controlnet) else self.controlnet
 
@@ -1269,7 +1312,7 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         is_unet_compiled = is_compiled_module(self.unet)
         is_controlnet_compiled = is_compiled_module(self.controlnet)
-        is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1")
+        is_torch_higher_equal_2_1 = True
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # Relevant thread:
@@ -1326,18 +1369,47 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
                 if ip_adapter_image is not None:
                     added_cond_kwargs["image_embeds"] = image_embeds
 
+                n_batches = len(control_model_input)
+                noise_pred = []
                 # predict the noise residual
-                noise_pred = self.unet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep_cond=timestep_cond,
-                    cross_attention_kwargs=self.cross_attention_kwargs,
-                    down_block_additional_residuals=down_block_res_samples,
-                    mid_block_additional_residual=mid_block_res_sample,
-                    added_cond_kwargs=added_cond_kwargs,
-                    return_dict=False,
-                )[0]
+                for i in range(n_batches):
+                    # noise_pred_i = self.unet(
+                    #     latent_model_input[i : i + 1],
+                    #     t,
+                    #     encoder_hidden_states=prompt_embeds[i : i + 1],
+                    #     timestep_cond=None,
+                    #     cross_attention_kwargs=self.cross_attention_kwargs,
+                    #     # down_block_additional_residuals=down_block_res_samples,
+                    #     # mid_block_additional_residual=mid_block_res_sample,
+                    #     down_block_additional_residuals=[
+                    #         v[i : i + 1] for v in down_block_res_samples
+                    #     ],
+                    #     mid_block_additional_residual=mid_block_res_sample[i : i + 1],
+                    #     added_cond_kwargs={
+                    #         k: v[i : i + 1] for k, v in added_cond_kwargs.items()
+                    #     },
+                    #     return_dict=False,
+                    # )[0]
+                    # predict the noise residual
+                    noise_pred_i = self.unet(
+                        latent_model_input[i : i + 1],
+                        t,
+                        encoder_hidden_states=prompt_embeds[i : i + 1],
+                        timestep_cond=timestep_cond,
+                        cross_attention_kwargs=self.cross_attention_kwargs,
+                        down_block_additional_residuals=[
+                            v[i : i + 1] for v in down_block_res_samples
+                        ],
+                        mid_block_additional_residual=mid_block_res_sample[i : i + 1],
+                        added_cond_kwargs={
+                            k: v[i : i + 1] for k, v in added_cond_kwargs.items()
+                        },
+                        return_dict=False,
+                    )[0]
+                    # print(f'{noise_pred_i.shape=}')
+                    noise_pred.append(noise_pred_i)
+                noise_pred = torch.concat(noise_pred, dim=0)
+
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
