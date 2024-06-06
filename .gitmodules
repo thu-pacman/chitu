@@ -1,0 +1,10 @@
+[submodule "src/third_party/pybind11"]
+	path = src/third_party/pybind11
+	url = git@github.com:pybind/pybind11.git
+
+[submodule "src/third_party/spdlog"]
+	path = src/third_party/spdlog
+	url = git@github.com:gabime/spdlog.git
+[submodule "src/third_party/googletest"]
+	path = src/third_party/googletest
+	url = git@github.com:google/googletest.git
