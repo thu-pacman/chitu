@@ -7,6 +7,8 @@ import uvicorn
 import time, torch
 from cinfer import Dialog, Llama
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+import asyncio
+
 
 from cinfer.global_vars import set_global_variables, get_timers
 
@@ -27,7 +29,7 @@ task_semaphore = Semaphore(0)  # Semaphore initialized with a count of 0
 class Task:
     def __init__(self, message):
         self.message = message
-        self.completed = Event()
+        self.completed = asyncio.Event()
         self.response = None
 
 
@@ -36,59 +38,39 @@ async def create_completion(request: Request):
     print(request)
     params = await request.json()
     messages = params["messages"]
-    print(messages)
-    print(type(messages))
-    print(type(messages[0]))
-    task_queue.put(messages)  # Add task to the queue
+    t = Task(messages)
+    task_queue.put(t)  # Add task to the queue
     task_semaphore.release()  # Release the semaphore to signal the worker
-    return {"message": "Task added successfully"}
-    # if len(messages) == 0:
-    #     return JSONResponse(content={"message": "No message"})
-    # if isinstance(messages[0], dict):
-    #     messages = [messages]
-    # results = Backend.model.chat_completion(messages)
-    # outputs = []
-    # for result in results:
-    #     outputs.append(result["generation"]["content"])
-    # # print(params.messages, params.stream)
-    # return JSONResponse(content=outputs)
-
-    # generator = await openai_serving_completion.create_completion(request, raw_request)
-    # if isinstance(generator, ErrorResponse):
-    #     return JSONResponse(content=generator.model_dump(), status_code=generator.code)
-    # if request.stream:
-    #     return StreamingResponse(content=generator, media_type="text/event-stream")
-    # else:
-    #     return JSONResponse(content=generator.model_dump())
+    await t.completed.wait()  # Wait until the task is completed
+    return {"message": f"{t.response}"}
 
 
-def process_queue():
+async def process_queue():
     while True:
-        task_semaphore.acquire()  # Wait until a task is available
+        await asyncio.get_event_loop().run_in_executor(None, task_semaphore.acquire)
         if not task_queue.empty():
             qsize = task_queue.qsize()
             reqs = []
+            tasks = []
             for i in range(qsize):
-                reqs.append(task_queue.get())
-                # task_queue.pop()
-            print("in model", reqs)
+                tasks.append(task_queue.get())
+                reqs.append(tasks[i].message)
             results = Backend.model.chat_completion(reqs)
-            print(results)
+            for i in range(qsize):
+                tasks[i].response = results[i]["generation"]["content"]
+                tasks[i].completed.set()
 
 
-worker_thread = Thread(target=process_queue, daemon=True)
+# worker_thread = Thread(target=process_queue, daemon=True)
+# worker_thread.start()
+def start_worker():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(process_queue())
+
+
+worker_thread = Thread(target=start_worker, daemon=True)
 worker_thread.start()
-
-# @app.post("/chat")
-# async def completion(request: Request):
-#     params = await request.json()
-#     prompt = params["input"]
-#     try:
-#         output = infer(prompt, model, tokenizer, device)
-#         print(output)
-#         return {"output": output}
-#     except Exception as e:
-#         return {"output": str(e)}
 
 
 def main(
