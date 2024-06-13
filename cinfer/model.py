@@ -33,6 +33,8 @@ class ModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 2048
 
+    self_manage_cache: bool = False
+
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -128,22 +130,23 @@ class Attention(nn.Module):
             init_method=lambda x: x,
         )
 
-        self.cache_k = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            )
-        ).cuda()
-        self.cache_v = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            )
-        ).cuda()
+        if not args.self_manage_cache:
+            self.cache_k = torch.zeros(
+                (
+                    args.max_batch_size,
+                    args.max_seq_len,
+                    self.n_local_kv_heads,
+                    self.head_dim,
+                )
+            ).cuda()
+            self.cache_v = torch.zeros(
+                (
+                    args.max_batch_size,
+                    args.max_seq_len,
+                    self.n_local_kv_heads,
+                    self.head_dim,
+                )
+            ).cuda()
 
     def forward(
         self,
@@ -151,6 +154,7 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
