@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from .global_vars import set_global_variables, get_timers
+from .cache_manager import KVCache
 
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
@@ -12,10 +13,19 @@ from fairscale.nn.model_parallel.layers import (
     VocabParallelEmbedding,
 )
 from torch import nn
+import numpy as np
 
 # import tkops
 # from vllm import _custom_ops as vllm_ops
 import cinfer_backend
+import flash_attn
+
+
+class VarLens:
+    def __init__(self, tokens, device) -> None:
+        self.lens = torch.tensor([len(t) for t in tokens], device=device)
+        self.max_len = int(torch.max(self.lens))
+        self.total_len = int(torch.sum(self.lens))
 
 
 @dataclass
@@ -33,7 +43,7 @@ class ModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 2048
 
-    self_manage_cache: bool = False
+    torch_cache: bool = False
 
 
 class RMSNorm(torch.nn.Module):
@@ -129,8 +139,8 @@ class Attention(nn.Module):
             input_is_parallel=True,
             init_method=lambda x: x,
         )
-
-        if not args.self_manage_cache:
+        self.torch_cache = args.torch_cache
+        if not args.torch_cache:
             self.cache_k = torch.zeros(
                 (
                     args.max_batch_size,
@@ -148,13 +158,12 @@ class Attention(nn.Module):
                 )
             ).cuda()
 
-    def forward(
+    def forward_with_torch_cache(
         self,
         x: torch.Tensor,
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -195,9 +204,37 @@ class Attention(nn.Module):
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
+    def forward_with_input_cache(
+        self,
+        x: torch.Tensor,
+        varlens,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        cache: Optional[KVCache] = None,
+    ):
+        bs_seq, _ = x.shape
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)  # TODO
+        if cache is None:
+            cache = KVCache()
+            cache.init(xk, xv)
+        else:
+            cache.extend(xk, xv)
 
-# class GEMV(torch.autograd.Function):
-#     @staticmethod
+        output = flash_attn.flash_attn_varlen_func(
+            xq, xk, xv, varlens.lens, varlens.lens, varlens.max_len, varlens.max_len
+        ).view(bs_seq, -1)
+        return self.wo(output)
+
+    def forward(self, x, start_pos, freqs_cis, mask, varlens):
+        if self.torch_cache:
+            return self.forward_with_torch_cache(x, start_pos, freqs_cis, mask)
+        else:
+            assert start_pos == 0
+            return self.forward_with_input_cache(x, varlens, start_pos, freqs_cis, mask)
+
+
 def GEMV(x, w):
     # w = w.transpose(1, 0).contiguous()
     output = torch.zeros(x.shape[:-1] + w.shape[-1:], device=x.device, dtype=x.dtype)
@@ -229,42 +266,36 @@ class FeedForward(nn.Module):
         self.w3 = ColumnParallelLinear(
             dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
-        self.wt1 = None
-        self.wt2 = None
-        self.wt3 = None
-
-    def forward2(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        # self.wt1 = None
+        # self.wt2 = None
+        # self.wt3 = None
 
     def forward(self, x):
-        if x.shape[0] != 1 or (len(x.shape) == 3 and x.shape[1] != 1):
-            return self.w2(F.silu(self.w1(x)) * self.w3(x))
-        else:
-            return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
-            # return torch.mm(
-            #     (F.silu(GEMV(x, self.wt1)) * GEMV(x, self.wt3)).reshape(
-            #         -1, self.w2.weight.data.shape[1]
-            #     ),
-            #     self.wt2,
-            # )
+        # return torch.mm(
+        #     (F.silu(GEMV(x, self.wt1)) * GEMV(x, self.wt3)).reshape(
+        #         -1, self.w2.weight.data.shape[1]
+        #     ),
+        #     self.wt2,
+        # )
 
-            # return GEMV(
-            #     F.silu(GEMV(x, self.wt1)) * GEMV(x, self.wt3),
-            #     self.wt2,
-            # )
+        # return GEMV(
+        #     F.silu(GEMV(x, self.wt1)) * GEMV(x, self.wt3),
+        #     self.wt2,
+        # )
 
-            # return torch.mm(
-            #     F.silu(
-            #         torch.mm(x.reshape(-1, x.shape[-1]), self.wt1.t())
-            #         * torch.mm(x.reshape(-1, x.shape[-1]), self.wt3.t())
-            #     ).reshape(-1, self.w2.weight.data.shape[1]),
-            #     self.wt2.t(),
-            # )
+        # return torch.mm(
+        #     F.silu(
+        #         torch.mm(x.reshape(-1, x.shape[-1]), self.wt1.t())
+        #         * torch.mm(x.reshape(-1, x.shape[-1]), self.wt3.t())
+        #     ).reshape(-1, self.w2.weight.data.shape[1]),
+        #     self.wt2.t(),
+        # )
 
-            # return tkops.gemv(
-            #     F.silu(tkops.gemv(x, self.wt1) * tkops.gemv(x, self.wt3)), self.wt2
-            # )
+        # return tkops.gemv(
+        #     F.silu(tkops.gemv(x, self.wt1) * tkops.gemv(x, self.wt3)), self.wt2
+        # )
 
 
 class TransformerBlock(nn.Module):
@@ -291,8 +322,11 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        varlens,
     ):
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+        h = x + self.attention(
+            self.attention_norm(x), start_pos, freqs_cis, mask, varlens
+        )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -346,6 +380,18 @@ class Transformer(nn.Module):
 
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
+        h = self.norm(h)
+        output = self.output(h).float()
+        return output
+
+    @torch.inference_mode()
+    def prefill(self, tokens: torch.Tensor):
+        varlens = VarLens(tokens)
+        tokens = np.concatenate(tokens).tolist()
+        mask = None
+        freqs_cis = None
+        for layer in self.layers:
+            h = layer(h, 0, freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h).float()
         return output

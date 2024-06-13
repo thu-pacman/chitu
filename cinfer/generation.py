@@ -129,7 +129,6 @@ class Llama:
     def prefill(
         self,
         dialogs: List[Dialog],
-        max_gen_len: int,
     ):
         params = self.model.params
         bsz = len(dialogs)
@@ -137,28 +136,9 @@ class Llama:
         prompt_tokens = [
             self.formatter.encode_dialog_prompt(dialog) for dialog in dialogs
         ]
-        lens = [len(t) for t in prompt_tokens]
-        packed_prompt_tokens = []
-        for t in prompt_tokens:
-            packed_prompt_tokens.extend(t)
-        logits = self.model.forward(packed_prompt_tokens, prev_pos)
 
-        min_prompt_len = min(len(t) for t in prompt_tokens)
-        max_prompt_len = max(len(t) for t in prompt_tokens)
-        assert max_prompt_len <= params.max_seq_len
-        total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
-
-        pad_id = self.tokenizer.pad_id
-        # prepare input tokens of shape [bsz, total_len]
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
-        for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
-
-        prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device="cuda")
-        input_text_mask = tokens != pad_id
-        if min_prompt_len == total_len:
-            logits = self.model.forward(tokens, prev_pos)
+        logits = self.model.prefill(prompt_tokens)
+        return logits
 
     @torch.inference_mode()
     def generate(
