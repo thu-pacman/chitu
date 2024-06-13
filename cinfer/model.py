@@ -23,7 +23,9 @@ import flash_attn
 
 class VarLens:
     def __init__(self, tokens, device) -> None:
-        self.lens = torch.tensor([len(t) for t in tokens], device=device)
+        self.lens = torch.tensor(
+            [len(t) for t in tokens], device=device, dtype=torch.int32
+        )
         self.max_len = int(torch.max(self.lens))
         self.total_len = int(torch.sum(self.lens))
 
@@ -71,8 +73,20 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
     assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    if ndim == 4:
+        assert freqs_cis.shape == (
+            x.shape[1],
+            x.shape[-1],
+        ), f"{freqs_cis.shape} {x.shape}"
+        shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    elif ndim == 3:
+        assert freqs_cis.shape == (
+            x.shape[0],
+            x.shape[-1],
+        ), f"{freqs_cis.shape} {x.shape}"
+        shape = [d if i == 0 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    else:
+        assert False
     return freqs_cis.view(*shape)
 
 
@@ -84,8 +98,8 @@ def apply_rotary_emb(
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(xq.dim() - 1)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(xk.dim() - 1)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -215,6 +229,9 @@ class Attention(nn.Module):
     ):
         bs_seq, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq = xq.view(bs_seq, self.n_local_heads, self.head_dim)
+        xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)  # TODO
         if cache is None:
             cache = KVCache()
@@ -386,12 +403,15 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def prefill(self, tokens: torch.Tensor):
-        varlens = VarLens(tokens)
-        tokens = np.concatenate(tokens).tolist()
+        varlens = VarLens(tokens, "cuda")
+        tokens = torch.from_numpy(np.concatenate(tokens)).to("cuda")
         mask = None
-        freqs_cis = None
+        # freqs_cis = None
+        freqs_cis = self.freqs_cis[: varlens.total_len]
+        freqs_cis = freqs_cis.to("cuda")
+        h = self.tok_embeddings(tokens)
         for layer in self.layers:
-            h = layer(h, 0, freqs_cis, mask)
+            h = layer(h, 0, freqs_cis, mask, varlens)
         h = self.norm(h)
         output = self.output(h).float()
         return output

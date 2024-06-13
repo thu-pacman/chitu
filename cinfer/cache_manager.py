@@ -27,8 +27,8 @@ class KVCache:
 
     def check_shape(self, cache):
         # (bsz * seqlen, self.n_local_heads, self.head_dim)
-        assert len(cache.shape) == 3
-        assert cache.device == torch.device("cuda")
+        assert len(cache.shape) == 3, cache.shape
+        assert cache.device != torch.device("cpu")
 
     def check_shapes(self, cache_k, cache_v):
         self.check_shape(cache_k)

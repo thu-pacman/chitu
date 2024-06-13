@@ -66,33 +66,35 @@ def main(
         # ],
     ]
 
-    def add_to_logging(name):
-        if name in timers.timers:
-            timers_to_log.append(name)
-
     for i in range(3):
         generator.prefill(dialogs)
-        # results = generator.chat_completion(
-        #     dialogs,
-        #     max_gen_len=max_gen_len,
-        #     temperature=temperature,
-        #     top_p=top_p,
-        # )
-        timers = get_timers()
-        timers_to_log = []
 
-        add_to_logging("attn")
-        add_to_logging("feed")
-        print(timers_to_log)
-        timers.log(timers_to_log)
+    # def add_to_logging(name):
+    #     if name in timers.timers:
+    #         timers_to_log.append(name)
 
-        for dialog, result in zip(dialogs, results):
-            for msg in dialog:
-                print(f"{msg['role'].capitalize()}: {msg['content']}\n")
-            print(
-                f"> {result['generation']['role'].capitalize()}: {result['generation']['content']}"
-            )
-            print("\n==================================\n")
+    # for i in range(3):
+    #     results = generator.chat_completion(
+    #         dialogs,
+    #         max_gen_len=max_gen_len,
+    #         temperature=temperature,
+    #         top_p=top_p,
+    #     )
+    #     timers = get_timers()
+    #     timers_to_log = []
+
+    #     add_to_logging("attn")
+    #     add_to_logging("feed")
+    #     print(timers_to_log)
+    #     timers.log(timers_to_log)
+
+    #     for dialog, result in zip(dialogs, results):
+    #         for msg in dialog:
+    #             print(f"{msg['role'].capitalize()}: {msg['content']}\n")
+    #         print(
+    #             f"> {result['generation']['role'].capitalize()}: {result['generation']['content']}"
+    #         )
+    #         print("\n==================================\n")
 
 
 if __name__ == "__main__":
