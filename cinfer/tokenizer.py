@@ -209,7 +209,6 @@ class ChatFormat:
         return tokens
 
     def encode_message(self, message: Message) -> List[int]:
-        print(message)
         tokens = self.encode_header(message)
         tokens.extend(
             self.tokenizer.encode(message["content"].strip(), bos=False, eos=False)
@@ -219,7 +218,6 @@ class ChatFormat:
 
     def encode_dialog_prompt(self, dialog: Dialog) -> List[int]:
         tokens = []
-        print(dialog)
         tokens.append(self.tokenizer.special_tokens["<|begin_of_text|>"])
         for message in dialog:
             tokens.extend(self.encode_message(message))

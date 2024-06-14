@@ -8,6 +8,8 @@ from torch.profiler import profile, record_function, ProfilerActivity
 
 from cinfer.global_vars import set_global_variables, get_timers
 
+import timeit
+
 set_global_variables()
 
 
@@ -66,8 +68,14 @@ def main(
         # ],
     ]
 
-    for i in range(3):
-        generator.prefill(dialogs)
+    t = timeit.timeit(lambda: generator.prefill(dialogs), number=3) / 3
+    print(t)
+
+    t = timeit.timeit(lambda: generator.prefill(dialogs), number=3) / 3
+    print(t)
+
+    t = timeit.timeit(lambda: generator.prefill(dialogs), number=3) / 3
+    print(t)
 
     # def add_to_logging(name):
     #     if name in timers.timers:

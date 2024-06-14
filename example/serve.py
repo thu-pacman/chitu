@@ -8,6 +8,7 @@ import time, torch
 from cinfer import Dialog, Llama
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 import asyncio
+import json
 
 
 from cinfer.global_vars import set_global_variables, get_timers
@@ -27,18 +28,22 @@ task_semaphore = Semaphore(0)  # Semaphore initialized with a count of 0
 
 
 class Task:
-    def __init__(self, message):
+    def __init__(self, message, task_id):
         self.message = message
+        self.task_id = task_id
         self.completed = asyncio.Event()
         self.response = None
 
 
 @app.post("/v1/completions")
 async def create_completion(request: Request):
-    print(request)
     params = await request.json()
-    messages = params["messages"]
-    t = Task(messages)
+    # get request ID
+    request_id = request.headers.get("X-Request-ID")
+    if not request_id:
+        request_id = str(uuid.uuid4())
+    message = params["messages"]
+    t = Task(message, request_id)
     task_queue.put(t)  # Add task to the queue
     task_semaphore.release()  # Release the semaphore to signal the worker
     await t.completed.wait()  # Wait until the task is completed
