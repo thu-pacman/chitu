@@ -242,7 +242,7 @@ class Attention(nn.Module):
         output = flash_attn.flash_attn_varlen_func(
             xq, xk, xv, varlens.lens, varlens.lens, varlens.max_len, varlens.max_len
         ).view(bs_seq, -1)
-        return self.wo(output)
+        return self.wo(output), cache
 
     def forward(self, x, start_pos, freqs_cis, mask, varlens):
         if self.torch_cache:
@@ -341,11 +341,12 @@ class TransformerBlock(nn.Module):
         mask: Optional[torch.Tensor],
         varlens,
     ):
-        h = x + self.attention(
+        h, cache = self.attention(
             self.attention_norm(x), start_pos, freqs_cis, mask, varlens
         )
+        h += x
         out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+        return out, cache
 
 
 class Transformer(nn.Module):
@@ -402,7 +403,7 @@ class Transformer(nn.Module):
         return output
 
     @torch.inference_mode()
-    def prefill(self, tokens: torch.Tensor):
+    def prefill(self, tokens: list[int]):
         varlens = VarLens(tokens, "cuda")
         tokens = torch.from_numpy(np.concatenate(tokens)).to("cuda")
         mask = None
@@ -410,8 +411,10 @@ class Transformer(nn.Module):
         freqs_cis = self.freqs_cis[: varlens.total_len]
         freqs_cis = freqs_cis.to("cuda")
         h = self.tok_embeddings(tokens)
+        output_cache = []
         for layer in self.layers:
-            h = layer(h, 0, freqs_cis, mask, varlens)
+            h, cache = layer(h, 0, freqs_cis, mask, varlens)
+            output_cache.append(cache)
         h = self.norm(h)
         output = self.output(h).float()
-        return output
+        return output, output_cache
