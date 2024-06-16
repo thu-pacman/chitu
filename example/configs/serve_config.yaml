@@ -1,0 +1,13 @@
+serve:
+  host: 0.0.0.0
+  port: 21002
+model:
+  ckpt_dir: /home/hkz/Meta-Llama-3-8B-Instruct
+  tokenizer_path: /home/hkz/Meta-Llama-3-8B-Instruct/tokenizer.model
+  temperature: 0.6
+  top_p: 0.9
+  do_load: False # debug purpose
+executor:
+  name: exec
+scheduler:
+  type: fifo

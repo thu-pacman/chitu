@@ -15,10 +15,75 @@ from fairscale.nn.model_parallel.layers import (
 from torch import nn
 import numpy as np
 
-# import tkops
 # from vllm import _custom_ops as vllm_ops
 import cinfer_backend
 import flash_attn
+
+from fairscale.nn.model_parallel.initialize import (
+    get_model_parallel_rank,
+    initialize_model_parallel,
+    model_parallel_is_initialized,
+)
+from .tokenizer import Tokenizer
+from pathlib import Path
+import os, sys, json, time
+
+
+class Backend:
+    model = None
+    tokenizer = None
+    executor = None
+    scheduler = None
+
+    @staticmethod
+    def build(args):
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group("nccl")
+        if not model_parallel_is_initialized():
+            if model_parallel_size is None:
+                model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
+            initialize_model_parallel(model_parallel_size)
+
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+
+        torch.manual_seed(args.seed)
+
+        if local_rank > 0:
+            sys.stdout = open(os.devnull, "w")
+
+        with open(Path(args.ckpt_dir) / "params.json", "r") as f:
+            params = json.loads(f.read())
+
+        model_args: ModelArgs = ModelArgs(
+            **params,
+        )
+        tokenizer = Tokenizer(model_path=args.tokenizer_path)
+        assert model_args.vocab_size == tokenizer.n_words
+        model = Transformer(model_args)
+        if torch.cuda.is_bf16_supported():
+            torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
+        else:
+            torch.set_default_tensor_type(torch.cuda.HalfTensor)
+        model = model.to(torch.bfloat16)
+
+        if args.model.do_load:
+            start_time = time.time()
+            checkpoints = sorted(Path(args.ckpt_dir).glob("*.pth"))
+            assert len(checkpoints) > 0, f"no checkpoint files found in {args.ckpt_dir}"
+            assert model_parallel_size == len(
+                checkpoints
+            ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
+            ckpt_path = checkpoints[get_model_parallel_rank()]
+            checkpoint = torch.load(ckpt_path, map_location="cpu")
+            model.load_state_dict(checkpoint, strict=False)
+            print(f"Loaded in {time.time() - start_time:.2f} seconds")
+        else:
+            print(torch.cuda.memory_allocated(), local_rank)
+            model = model.to(local_rank)
+
+        Backend.model = model
+        Backend.tokenizer = tokenizer
 
 
 class VarLens:

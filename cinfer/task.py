@@ -1,15 +1,15 @@
 import torch
 from enum import Enum
-from queue import Queue
+import asyncio
+from .model import Backend
 
-# class TaskID():
-#     def __init__(self, req_id):
-#         self.task_id = 0
-#         self.req_id = 0
 
-#     def get_id(self):
-#         self.id += 1
-#         return self.id
+class UserRequest:
+    def __init__(self, message, request_id):
+        self.message = message
+        self.request_id = request_id
+        self.completed = asyncio.Event()
+        self.response = None
 
 
 class TaskPool:
@@ -20,12 +20,16 @@ class TaskPool:
         if task.task_id in TaskPool.pool:
             return False  # Task already exists, failed to add
         TaskPool.pool[task.task_id] = task
-        id_list.append(task.task_id)
+        TaskPool.id_list.append(task.task_id)
         return True
 
     def remove(task_id):
+        assert task_id in TaskPool.pool, "Task not found in pool"
+        if isinstance(TaskPool.pool[task_id], DecodeTask):
+            TaskPool.pool[task_id].req.response = TaskPool.pool[task_id].response
+            TaskPool.pool[task_id].req.completed.set()
         ret = TaskPool.pool.pop(task_id)
-        id_list.remove(task_id)
+        TaskPool.id_list.remove(task_id)
         if ret is None:
             return False  # Task not found, failed to remove
         return True
@@ -38,24 +42,39 @@ class TaskType(Enum):
 
 
 class Task:
-    def __init__(self, task_id):
+    def __init__(self, task_id, req):
+        self.task_id = task_id
+        self.req = req
         TaskPool.add(self)
 
 
 class PrefillTask(Task):
-    def __init__(self, task_id, tokens):
-        super().__init__(task_id)
-        self.tokens = tokens
-        self.task_id = task_id
+    def __init__(self, task_id: str, req: UserRequest, message: str):
+        super().__init__(task_id, req)
+        self.message = message
+        self.tokens = Backend.tokenizer.encode(message)
         self.task_type = TaskType.Prefill
+
+    def need_remove(self):
+        return True
 
 
 class DecodeTask(Task):
-    def __init__(self, task_id, kvcache, response=[]):
-        super().__init__(task_id)
+    def __init__(self, task_id: str, req: UserRequest, kvcache):
+        super().__init__(task_id, req)
         self.kvcache = kvcache
-        self.response = response
         self.task_type = TaskType.Decode
+        self.response = []
+
+    def update_cache(self, new_kvcache):
+        self.kvcache.update(new_kvcache)
+
+    def update_response(self, logit):
+        next_token = torch.argmax(logit[-1], dim=-1)
+        self.response.append(next_token)
+
+    def need_remove(self):
+        return torch.isin(self.response[-1], Backend.tokenizer.stop_tokens)
 
 
 class PackedTasks:

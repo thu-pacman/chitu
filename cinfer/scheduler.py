@@ -1,23 +1,14 @@
-import torch
 from .task import TaskPool
 
 
-def simulation_driver():
-    sched = TaskSchedulerFCFS()
-    sched.meta["max_task_batchsize"] = 4
-    uid = "u"
-    for i in range(10):
-        rid = f"r0{i}"
-        prompt = "This is a test prompt"
-        sched.append_user_request(UserPromptRequest(uid, rid, prompt, 128))
-    tids_to_run = []
-    while ScheduleHelper.global_timer_counter < 1000:
-        tids_to_run = sched.schedule(tids_to_run)
-        # execute
-        ScheduleHelper.timer_tick()
-
-
 class Scheduler:
+    @staticmethod
+    def build(args):
+        if args.type.lower() == "fifo":
+            return FifoScheduler(args.num_tasks)
+        else:
+            raise NotImplementedError(f"Scheduler {args.type} not implemented")
+
     def __init__(self):
         self.ret_task_ids = []
 
@@ -25,8 +16,16 @@ class Scheduler:
         assert len(self.ret_task_ids) == 0
         return self.ret_task_ids
 
-    def update(self, tids_to_run):
-        pass
+    def update(self, new_tasks):
+        for task in self.ret_task_ids:
+            if task.need_remove():
+                assert TaskPool.remove(task.task_id), "Task not found in pool"
+        for task in new_tasks:
+            assert TaskPool.add(task)
+        self.ret_task_ids = []  # reset scheduled tasks
+
+    def is_done(self):
+        return len(TaskPool.pool) == 0
 
 
 class FifoScheduler(Scheduler):
@@ -39,9 +38,3 @@ class FifoScheduler(Scheduler):
         super().schedule()
         self.ret_task_ids = TaskPool.id_list[: self.num_tasks]
         return self.ret_task_ids
-
-    def update(self, new_tasks):
-        for task in self.ret_task_ids:
-            assert TaskPool.remove(task), "Task not found in pool"
-        for task in new_tasks:
-            assert TaskPool.add(task)
