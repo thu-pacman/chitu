@@ -6,10 +6,25 @@ from .model import Backend
 class Executor:
     @staticmethod
     def build(args):
-        return Executor(args)
+        if args.type.lower() == "debug":
+            return DebugExecutor(args)
+        else:
+            return NormalExecutor(args)
 
     def __init__(self, args):
         pass
+
+    def step(
+        self,
+        tasks: PackedTasks,
+    ):
+        pass
+
+
+class NormalExecutor(Executor):
+
+    def __init__(self, args):
+        super().__init__(args)
 
     def _prefill2decode(self, task_id):
         return task_id.replace("prefill_", "decode_")
@@ -45,3 +60,16 @@ class Executor:
             return self.decode_step(tasks), None  # no new tasks
         else:
             raise NotImplementedError  # Hybrid task not implemented
+
+
+# TODO: impl for Executor
+class DebugExecutor(Executor):
+
+    def __init__(self, args):
+        super().__init__(args)
+
+    def step(
+        self,
+        tasks: PackedTasks,
+    ):
+        raise NotImplementedError

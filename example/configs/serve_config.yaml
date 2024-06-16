@@ -8,6 +8,6 @@ model:
   top_p: 0.9
   do_load: False # debug purpose
 executor:
-  name: exec
+  type: normal
 scheduler:
   type: fifo

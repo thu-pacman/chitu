@@ -47,6 +47,9 @@ class Task:
         self.req = req
         TaskPool.add(self)
 
+    def need_remove(self):
+        raise NotImplementedError
+
 
 class PrefillTask(Task):
     def __init__(self, task_id: str, req: UserRequest, message: str):
@@ -66,7 +69,7 @@ class DecodeTask(Task):
         self.task_type = TaskType.Decode
         self.response = []
 
-    def update_cache(self, new_kvcache):
+    def update_cache(self, new_kvcache):  # TODO: impl for KVCache
         self.kvcache.update(new_kvcache)
 
     def update_response(self, logit):
@@ -104,7 +107,7 @@ class PackedTasks:
                 tokens.append(task.tokens)
         self.tokens = tokens
 
-    def pack_kvcache(self):
+    def pack_kvcache(self):  # TODO: impl for KVCache
         kvcaches = []
         for task in self.tasks:
             if task.task_type == TaskType.Decode:

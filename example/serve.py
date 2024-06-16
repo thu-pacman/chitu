@@ -11,7 +11,7 @@ from threading import Semaphore, Thread
 from cinfer.global_vars import set_global_variables
 from cinfer.model import Backend
 from cinfer.task import UserRequest, TaskPool, PrefillTask
-from cinfer.loop import cinfer_init, cinfer_run
+from cinfer.cinfer_main import cinfer_init, cinfer_run
 
 
 app = FastAPI()
@@ -34,6 +34,9 @@ async def create_completion(request: Request):
     task_semaphore.release()  # Release the semaphore to signal the worker
     await req.completed.wait()  # Wait until the task is completed
     return {"message": f"{req.response}"}
+
+
+# TODO: impl for server (streaming response)
 
 
 async def process_queue():
