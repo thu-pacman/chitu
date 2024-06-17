@@ -24,7 +24,7 @@ from fairscale.nn.model_parallel.initialize import (
     initialize_model_parallel,
     model_parallel_is_initialized,
 )
-from .tokenizer import Tokenizer
+from .tokenizer import Tokenizer, ChatFormat
 from pathlib import Path
 import os, sys, json, time
 
@@ -32,16 +32,14 @@ import os, sys, json, time
 class Backend:
     model = None
     tokenizer = None
-    executor = None
-    scheduler = None
+    formatter = None
 
     @staticmethod
     def build(args):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group("nccl")
         if not model_parallel_is_initialized():
-            if model_parallel_size is None:
-                model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
+            model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
             initialize_model_parallel(model_parallel_size)
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -65,9 +63,10 @@ class Backend:
             torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
         else:
             torch.set_default_tensor_type(torch.cuda.HalfTensor)
+        print(torch.cuda.memory_allocated(), local_rank)
         model = model.to(torch.bfloat16)
 
-        if args.model.do_load:
+        if args.do_load:
             start_time = time.time()
             checkpoints = sorted(Path(args.ckpt_dir).glob("*.pth"))
             assert len(checkpoints) > 0, f"no checkpoint files found in {args.ckpt_dir}"
@@ -84,6 +83,7 @@ class Backend:
 
         Backend.model = model
         Backend.tokenizer = tokenizer
+        Backend.formatter = ChatFormat(tokenizer)
 
 
 class VarLens:
@@ -219,7 +219,7 @@ class Attention(nn.Module):
             init_method=lambda x: x,
         )
         self.torch_cache = args.torch_cache
-        if not args.torch_cache:
+        if args.torch_cache:
             self.cache_k = torch.zeros(
                 (
                     args.max_batch_size,

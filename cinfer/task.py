@@ -55,7 +55,11 @@ class PrefillTask(Task):
     def __init__(self, task_id: str, req: UserRequest, message: str):
         super().__init__(task_id, req)
         self.message = message
-        self.tokens = Backend.tokenizer.encode(message)
+        print(f"Prefill task: {message}")
+        if isinstance(message, str):
+            self.tokens = Backend.tokenizer.encode(message, bos=True, eos=False)
+        else:
+            self.tokens = Backend.formatter.encode_dialog_prompt(message)
         self.task_type = TaskType.Prefill
 
     def need_remove(self):

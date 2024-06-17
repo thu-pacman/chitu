@@ -13,5 +13,5 @@ def cinfer_init(args):
 
 def cinfer_run():
     task_ids = Backend.scheduler.schedule()
-    logits, new_tasks = Backend.executor.step(PackedTasks(task_ids))
-    Backend.scheduler.update(new_tasks)
+    logits = Backend.executor.step(PackedTasks(task_ids))
+    Backend.scheduler.update()

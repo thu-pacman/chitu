@@ -5,7 +5,7 @@ class Scheduler:
     @staticmethod
     def build(args):
         if args.type.lower() == "fifo":
-            return FifoScheduler(args.num_tasks)
+            return FifoScheduler(args.fifo.num_tasks)
         else:
             raise NotImplementedError(f"Scheduler {args.type} not implemented")
 
@@ -16,12 +16,10 @@ class Scheduler:
         assert len(self.ret_task_ids) == 0
         return self.ret_task_ids
 
-    def update(self, new_tasks):
-        for task in self.ret_task_ids:
-            if task.need_remove():
-                assert TaskPool.remove(task.task_id), "Task not found in pool"
-        for task in new_tasks:
-            assert TaskPool.add(task)
+    def update(self):
+        for task_id in self.ret_task_ids:
+            if TaskPool.pool[task_id].need_remove():
+                assert TaskPool.remove(task_id), "Task not found in pool"
         self.ret_task_ids = []  # reset scheduled tasks
 
     def is_done(self):

@@ -60,7 +60,7 @@ worker_thread = Thread(target=start_worker, daemon=True)
 worker_thread.start()
 
 
-@hydra.main(version_base=None, config_path="./configs", config_name="config")
+@hydra.main(version_base=None, config_path="./configs", config_name="serve_config")
 def main(args: DictConfig):
     set_global_variables()
     Backend.build(args.model)

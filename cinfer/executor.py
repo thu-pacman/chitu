@@ -33,15 +33,15 @@ class NormalExecutor(Executor):
         logits, output_cache = Backend.model.prefill(tasks.tokens)
         # after prefill, new decode tasks are created
         new_tasks = []
-        for it, cache in enumerate(output_cache):
+        for it in range(tasks.num_tasks):
             new_tasks.append(
                 DecodeTask(
                     self._prefill2decode(tasks.task_ids[it]),
                     tasks.tasks[it].req,
-                    cache,
+                    output_cache[it],
                 )
             )
-        return logits, new_tasks
+        return logits
 
     def decode_step(self, tasks: PackedTasks):
         logits, output_cache = Backend.model.decode(tasks.kvcaches)
@@ -57,7 +57,7 @@ class NormalExecutor(Executor):
         if tasks.task_type == TaskType.Prefill:
             return self.prefill_step(tasks)
         elif tasks.task_type == TaskType.Decode:
-            return self.decode_step(tasks), None  # no new tasks
+            return self.decode_step(tasks)
         else:
             raise NotImplementedError  # Hybrid task not implemented
 

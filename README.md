@@ -16,7 +16,7 @@ bash script/run.sh
 # to start serve at localhost:21002
 torchrun --nproc_per_node 1 example/serve.py
 # to test the server with prompt
-curl localhost:21002/v1/completions   -H "Content-Type: application/json"   -H "Authorization: Bearer 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"   -d '{
+curl localhost:21002/v1/completions   -H "Content-Type: application/json"  -d '{
     "messages": [
       {
         "role": "system",

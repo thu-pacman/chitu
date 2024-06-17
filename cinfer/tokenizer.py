@@ -123,7 +123,7 @@ class Tokenizer:
         - Setting `allowed_special` to "all" will treat all text corresponding
           to special tokens to be encoded as special tokens.
         """
-        assert type(s) is str
+        assert type(s) is str, type(s)
 
         # The tiktoken tokenizer can handle <=400k chars without
         # pyo3_runtime.PanicException.
