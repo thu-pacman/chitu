@@ -3,8 +3,9 @@
 ## Setup
 
 ```bash
-# Run on aliyun and A10
-source env/aliyun.env
+# Run on aliyun and A10*4
+source /home/spack/spack/share/spack/setup-env.sh
+spack load cuda
 TORCH_CUDA_ARCH_LIST=8.6 python setup.py build -j4 develop
 ```
 
@@ -15,6 +16,7 @@ TORCH_CUDA_ARCH_LIST=8.6 python setup.py build -j4 develop
 # other parameters are in example/configs/serve_config.yaml
 # log is stored in outputs
 torchrun --nproc_per_node 1 test/single_req_test.py request.max_new_tokens=64
+# to avoid GPU conflict, add `grun` before command
 ```
 
 
