@@ -29,6 +29,10 @@ from pathlib import Path
 import os, sys, json, time
 
 
+from logging import getLogger
+
+logger = getLogger(__name__)
+
 class Backend:
     model = None
     tokenizer = None
@@ -63,7 +67,6 @@ class Backend:
             torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
         else:
             torch.set_default_tensor_type(torch.cuda.HalfTensor)
-        print(torch.cuda.memory_allocated(), local_rank)
         model = model.to(torch.bfloat16)
 
         if args.do_load:
@@ -76,12 +79,14 @@ class Backend:
             ckpt_path = checkpoints[get_model_parallel_rank()]
             checkpoint = torch.load(ckpt_path, map_location="cpu")
             model.load_state_dict(checkpoint, strict=False)
-            print(f"Loaded in {time.time() - start_time:.2f} seconds")
+            logger.info(f"Loaded in {time.time() - start_time:.2f} seconds")
         else:
-            print(torch.cuda.memory_allocated(), local_rank)
             model = model.to(local_rank)
 
         Backend.model = model
+        tokenizer.stop_tokens = torch.tensor(
+            list(tokenizer.stop_tokens), device=local_rank
+        )
         Backend.tokenizer = tokenizer
         Backend.formatter = ChatFormat(tokenizer)
 

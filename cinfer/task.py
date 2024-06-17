@@ -3,12 +3,17 @@ from enum import Enum
 import asyncio
 from .model import Backend
 
+from logging import getLogger
+
+logger = getLogger(__name__)
+
 
 class UserRequest:
-    def __init__(self, message, request_id):
+    def __init__(self, message, request_id, max_new_tokens=128):
         self.message = message
         self.request_id = request_id
         self.completed = asyncio.Event()
+        self.max_new_tokens = max_new_tokens
         self.response = None
 
 
@@ -26,7 +31,9 @@ class TaskPool:
     def remove(task_id):
         assert task_id in TaskPool.pool, "Task not found in pool"
         if isinstance(TaskPool.pool[task_id], DecodeTask):
-            TaskPool.pool[task_id].req.response = TaskPool.pool[task_id].response
+            TaskPool.pool[task_id].req.response = [
+                Backend.tokenizer.decode([x]) for x in TaskPool.pool[task_id].response
+            ]
             TaskPool.pool[task_id].req.completed.set()
         ret = TaskPool.pool.pop(task_id)
         TaskPool.id_list.remove(task_id)
@@ -55,7 +62,7 @@ class PrefillTask(Task):
     def __init__(self, task_id: str, req: UserRequest, message: str):
         super().__init__(task_id, req)
         self.message = message
-        print(f"Prefill task: {message}")
+        logger.info(f"Prefill task: {message}")
         if isinstance(message, str):
             self.tokens = Backend.tokenizer.encode(message, bos=True, eos=False)
         else:
@@ -74,14 +81,18 @@ class DecodeTask(Task):
         self.response = []
 
     def update_cache(self, new_kvcache):  # TODO: impl for KVCache
-        self.kvcache.update(new_kvcache)
+        # self.kvcache.update(new_kvcache)
+        pass
 
     def update_response(self, logit):
-        next_token = torch.argmax(logit[-1], dim=-1)
+        next_token = torch.argmax(logit, dim=-1)
         self.response.append(next_token)
 
     def need_remove(self):
-        return torch.isin(self.response[-1], Backend.tokenizer.stop_tokens)
+        return (
+            torch.isin(self.response[-1], Backend.tokenizer.stop_tokens)
+            or len(self.response) >= self.req.max_new_tokens
+        )
 
 
 class PackedTasks:

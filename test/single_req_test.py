@@ -6,23 +6,41 @@ from faker import Faker
 import hydra
 from omegaconf import DictConfig
 
+from logging import getLogger
+
+logger = getLogger(__name__)
+
+
+def gen_reqs(num_reqs, prompt_len):
+    fake = Faker()
+    reqs = []
+    for i in range(num_reqs):
+        msg = ""
+        for j in range(prompt_len):
+            msg += fake.word() + " "
+        req = UserRequest(f"{msg}", f"request_{i}")
+        reqs.append(req)
+    return reqs
+
 
 @hydra.main(
     version_base=None, config_path="../example/configs", config_name="serve_config"
 )
 def main(args: DictConfig):
+
     set_global_variables()
     Backend.build(args.model)
     cinfer_init(args)
-    fake = Faker()
-    for i in range(5):
-        msg = ""
-        for j in range(10):
-            msg += fake.sentence()
-        req = UserRequest(f"{msg}", f"request_{i}")
+
+    reqs = gen_reqs(num_reqs=5, prompt_len=100)
+    for req in reqs:
         TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
+
     while len(TaskPool.pool) > 0:
         cinfer_run()
+
+    for req in reqs:
+        logger.info(f"Response: {req.response}")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 import torch
 from .task import PackedTasks, TaskType, DecodeTask
-from .model import Backend
+from .model import Backend, VarLens
 
 
 class Executor:
@@ -20,14 +20,14 @@ class Executor:
     ):
         pass
 
+    def _prefill2decode(self, task_id):
+        return task_id.replace("prefill_", "decode_")
+
 
 class NormalExecutor(Executor):
 
     def __init__(self, args):
         super().__init__(args)
-
-    def _prefill2decode(self, task_id):
-        return task_id.replace("prefill_", "decode_")
 
     def prefill_step(self, tasks: PackedTasks):
         logits, output_cache = Backend.model.prefill(tasks.tokens)
@@ -68,8 +68,57 @@ class DebugExecutor(Executor):
     def __init__(self, args):
         super().__init__(args)
 
+    def prefill_step(self, tasks: PackedTasks):
+        varlens = VarLens(tasks.tokens, "cuda")
+        total_len = varlens.total_len
+        logits = torch.randn(total_len, Backend.model.vocab_size, device="cuda")
+        output_cache = [
+            torch.randn(
+                [
+                    total_len,
+                    Backend.model.layers[0].attention.n_kv_heads,
+                    Backend.model.layers[0].attention.head_dim,
+                ],
+                device="cuda",
+            )
+            for _ in range(len(Backend.model.layers))
+        ]
+        new_tasks = []
+        for it in range(tasks.num_tasks):
+            new_tasks.append(
+                DecodeTask(
+                    self._prefill2decode(tasks.task_ids[it]),
+                    tasks.tasks[it].req,
+                    output_cache[it],
+                )
+            )
+        return logits
+
+    def decode_step(self, tasks: PackedTasks):
+        logits = torch.randn([tasks.num_tasks, Backend.model.vocab_size], device="cuda")
+        output_cache = [
+            torch.randn(
+                [
+                    tasks.num_tasks,
+                    Backend.model.layers[0].attention.n_kv_heads,
+                    Backend.model.layers[0].attention.head_dim,
+                ],
+                device="cuda",
+            )
+            for _ in range(len(Backend.model.layers))
+        ]
+        for it, task in enumerate(tasks.tasks):
+            task.update_cache(output_cache[it])
+            task.update_response(logits[it])
+        return logits
+
     def step(
         self,
         tasks: PackedTasks,
     ):
-        raise NotImplementedError
+        if tasks.task_type == TaskType.Prefill:
+            return self.prefill_step(tasks)
+        elif tasks.task_type == TaskType.Decode:
+            return self.decode_step(tasks)
+        else:
+            raise NotImplementedError  # Hybrid task not implemented

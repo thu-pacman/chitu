@@ -8,9 +8,11 @@ model:
   top_p: 0.9
   do_load: False # debug purpose
   seed: 0
+request:
+  max_new_tokens: 128
 executor:
-  type: normal
+  type: debug
 scheduler:
   type: fifo
   fifo:
-    num_tasks: 4
+    num_tasks: 1
