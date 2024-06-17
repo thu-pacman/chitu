@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from .global_vars import set_global_variables, get_timers
+from .cache_manager import KVCache
 
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
@@ -12,10 +13,91 @@ from fairscale.nn.model_parallel.layers import (
     VocabParallelEmbedding,
 )
 from torch import nn
+import numpy as np
 
-# import tkops
 # from vllm import _custom_ops as vllm_ops
 import cinfer_backend
+import flash_attn
+
+from fairscale.nn.model_parallel.initialize import (
+    get_model_parallel_rank,
+    initialize_model_parallel,
+    model_parallel_is_initialized,
+)
+from .tokenizer import Tokenizer, ChatFormat
+from pathlib import Path
+import os, sys, json, time
+
+
+from logging import getLogger
+
+logger = getLogger(__name__)
+
+class Backend:
+    model = None
+    tokenizer = None
+    formatter = None
+
+    @staticmethod
+    def build(args):
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group("nccl")
+        if not model_parallel_is_initialized():
+            model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
+            initialize_model_parallel(model_parallel_size)
+
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+
+        torch.manual_seed(args.seed)
+
+        if local_rank > 0:
+            sys.stdout = open(os.devnull, "w")
+
+        with open(Path(args.ckpt_dir) / "params.json", "r") as f:
+            params = json.loads(f.read())
+
+        model_args: ModelArgs = ModelArgs(
+            **params,
+        )
+        tokenizer = Tokenizer(model_path=args.tokenizer_path)
+        assert model_args.vocab_size == tokenizer.n_words
+        model = Transformer(model_args)
+        if torch.cuda.is_bf16_supported():
+            torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
+        else:
+            torch.set_default_tensor_type(torch.cuda.HalfTensor)
+        model = model.to(torch.bfloat16)
+
+        if args.do_load:
+            start_time = time.time()
+            checkpoints = sorted(Path(args.ckpt_dir).glob("*.pth"))
+            assert len(checkpoints) > 0, f"no checkpoint files found in {args.ckpt_dir}"
+            assert model_parallel_size == len(
+                checkpoints
+            ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
+            ckpt_path = checkpoints[get_model_parallel_rank()]
+            checkpoint = torch.load(ckpt_path, map_location="cpu")
+            model.load_state_dict(checkpoint, strict=False)
+            logger.info(f"Loaded in {time.time() - start_time:.2f} seconds")
+        else:
+            model = model.to(local_rank)
+
+        Backend.model = model
+        tokenizer.stop_tokens = torch.tensor(
+            list(tokenizer.stop_tokens), device=local_rank
+        )
+        Backend.tokenizer = tokenizer
+        Backend.formatter = ChatFormat(tokenizer)
+
+
+class VarLens:
+    def __init__(self, tokens, device) -> None:
+        self.lens = torch.tensor(
+            [len(t) for t in tokens], device=device, dtype=torch.int32
+        )
+        self.max_len = int(torch.max(self.lens))
+        self.total_len = int(torch.sum(self.lens))
 
 
 @dataclass
@@ -32,6 +114,8 @@ class ModelArgs:
 
     max_batch_size: int = 32
     max_seq_len: int = 2048
+
+    torch_cache: bool = False
 
 
 class RMSNorm(torch.nn.Module):
@@ -59,8 +143,20 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
     assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    if ndim == 4:
+        assert freqs_cis.shape == (
+            x.shape[1],
+            x.shape[-1],
+        ), f"{freqs_cis.shape} {x.shape}"
+        shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    elif ndim == 3:
+        assert freqs_cis.shape == (
+            x.shape[0],
+            x.shape[-1],
+        ), f"{freqs_cis.shape} {x.shape}"
+        shape = [d if i == 0 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    else:
+        assert False
     return freqs_cis.view(*shape)
 
 
@@ -72,8 +168,8 @@ def apply_rotary_emb(
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(xq.dim() - 1)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(xk.dim() - 1)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -127,25 +223,26 @@ class Attention(nn.Module):
             input_is_parallel=True,
             init_method=lambda x: x,
         )
+        self.torch_cache = args.torch_cache
+        if args.torch_cache:
+            self.cache_k = torch.zeros(
+                (
+                    args.max_batch_size,
+                    args.max_seq_len,
+                    self.n_local_kv_heads,
+                    self.head_dim,
+                )
+            ).cuda()
+            self.cache_v = torch.zeros(
+                (
+                    args.max_batch_size,
+                    args.max_seq_len,
+                    self.n_local_kv_heads,
+                    self.head_dim,
+                )
+            ).cuda()
 
-        self.cache_k = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            )
-        ).cuda()
-        self.cache_v = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            )
-        ).cuda()
-
-    def forward(
+    def forward_with_torch_cache(
         self,
         x: torch.Tensor,
         start_pos: int,
@@ -191,9 +288,40 @@ class Attention(nn.Module):
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
+    def forward_with_input_cache(
+        self,
+        x: torch.Tensor,
+        varlens,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        cache: Optional[KVCache] = None,
+    ):
+        bs_seq, _ = x.shape
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq = xq.view(bs_seq, self.n_local_heads, self.head_dim)
+        xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)  # TODO
+        if cache is None:
+            cache = KVCache()
+            cache.init(xk, xv)
+        else:
+            cache.extend(xk, xv)
 
-# class GEMV(torch.autograd.Function):
-#     @staticmethod
+        output = flash_attn.flash_attn_varlen_func(
+            xq, xk, xv, varlens.lens, varlens.lens, varlens.max_len, varlens.max_len
+        ).view(bs_seq, -1)
+        return self.wo(output), cache
+
+    def forward(self, x, start_pos, freqs_cis, mask, varlens):
+        if self.torch_cache:
+            return self.forward_with_torch_cache(x, start_pos, freqs_cis, mask)
+        else:
+            assert start_pos == 0
+            return self.forward_with_input_cache(x, varlens, start_pos, freqs_cis, mask)
+
+
 def GEMV(x, w):
     # w = w.transpose(1, 0).contiguous()
     output = torch.zeros(x.shape[:-1] + w.shape[-1:], device=x.device, dtype=x.dtype)
@@ -225,42 +353,36 @@ class FeedForward(nn.Module):
         self.w3 = ColumnParallelLinear(
             dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
-        self.wt1 = None
-        self.wt2 = None
-        self.wt3 = None
-
-    def forward2(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        # self.wt1 = None
+        # self.wt2 = None
+        # self.wt3 = None
 
     def forward(self, x):
-        if x.shape[0] != 1 or (len(x.shape) == 3 and x.shape[1] != 1):
-            return self.w2(F.silu(self.w1(x)) * self.w3(x))
-        else:
-            return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
-            # return torch.mm(
-            #     (F.silu(GEMV(x, self.wt1)) * GEMV(x, self.wt3)).reshape(
-            #         -1, self.w2.weight.data.shape[1]
-            #     ),
-            #     self.wt2,
-            # )
+        # return torch.mm(
+        #     (F.silu(GEMV(x, self.wt1)) * GEMV(x, self.wt3)).reshape(
+        #         -1, self.w2.weight.data.shape[1]
+        #     ),
+        #     self.wt2,
+        # )
 
-            # return GEMV(
-            #     F.silu(GEMV(x, self.wt1)) * GEMV(x, self.wt3),
-            #     self.wt2,
-            # )
+        # return GEMV(
+        #     F.silu(GEMV(x, self.wt1)) * GEMV(x, self.wt3),
+        #     self.wt2,
+        # )
 
-            # return torch.mm(
-            #     F.silu(
-            #         torch.mm(x.reshape(-1, x.shape[-1]), self.wt1.t())
-            #         * torch.mm(x.reshape(-1, x.shape[-1]), self.wt3.t())
-            #     ).reshape(-1, self.w2.weight.data.shape[1]),
-            #     self.wt2.t(),
-            # )
+        # return torch.mm(
+        #     F.silu(
+        #         torch.mm(x.reshape(-1, x.shape[-1]), self.wt1.t())
+        #         * torch.mm(x.reshape(-1, x.shape[-1]), self.wt3.t())
+        #     ).reshape(-1, self.w2.weight.data.shape[1]),
+        #     self.wt2.t(),
+        # )
 
-            # return tkops.gemv(
-            #     F.silu(tkops.gemv(x, self.wt1) * tkops.gemv(x, self.wt3)), self.wt2
-            # )
+        # return tkops.gemv(
+        #     F.silu(tkops.gemv(x, self.wt1) * tkops.gemv(x, self.wt3)), self.wt2
+        # )
 
 
 class TransformerBlock(nn.Module):
@@ -287,10 +409,14 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        varlens,
     ):
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+        h, cache = self.attention(
+            self.attention_norm(x), start_pos, freqs_cis, mask, varlens
+        )
+        h += x
         out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+        return out, cache
 
 
 class Transformer(nn.Module):
@@ -345,3 +471,20 @@ class Transformer(nn.Module):
         h = self.norm(h)
         output = self.output(h).float()
         return output
+
+    @torch.inference_mode()
+    def prefill(self, tokens: list[int]):
+        varlens = VarLens(tokens, "cuda")
+        tokens = torch.from_numpy(np.concatenate(tokens)).to("cuda")
+        mask = None
+        # freqs_cis = None
+        freqs_cis = self.freqs_cis[: varlens.total_len]
+        freqs_cis = freqs_cis.to("cuda")
+        h = self.tok_embeddings(tokens)
+        output_cache = []
+        for layer in self.layers:
+            h, cache = layer(h, 0, freqs_cis, mask, varlens)
+            output_cache.append(cache)
+        h = self.norm(h)
+        output = self.output(h).float()
+        return output, output_cache

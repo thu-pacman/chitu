@@ -123,7 +123,7 @@ class Tokenizer:
         - Setting `allowed_special` to "all" will treat all text corresponding
           to special tokens to be encoded as special tokens.
         """
-        assert type(s) is str
+        assert type(s) is str, type(s)
 
         # The tiktoken tokenizer can handle <=400k chars without
         # pyo3_runtime.PanicException.
@@ -209,7 +209,6 @@ class ChatFormat:
         return tokens
 
     def encode_message(self, message: Message) -> List[int]:
-        print(message)
         tokens = self.encode_header(message)
         tokens.extend(
             self.tokenizer.encode(message["content"].strip(), bos=False, eos=False)
@@ -219,7 +218,6 @@ class ChatFormat:
 
     def encode_dialog_prompt(self, dialog: Dialog) -> List[int]:
         tokens = []
-        print(dialog)
         tokens.append(self.tokenizer.special_tokens["<|begin_of_text|>"])
         for message in dialog:
             tokens.extend(self.encode_message(message))

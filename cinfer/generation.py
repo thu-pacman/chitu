@@ -126,6 +126,21 @@ class Llama:
         return time.time()
 
     @torch.inference_mode()
+    def prefill(
+        self,
+        dialogs: List[Dialog],
+    ):
+        params = self.model.params
+        bsz = len(dialogs)
+        assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
+        prompt_tokens = [
+            self.formatter.encode_dialog_prompt(dialog) for dialog in dialogs
+        ]
+
+        logits = self.model.prefill(prompt_tokens)
+        return logits
+
+    @torch.inference_mode()
     def generate(
         self,
         prompt_tokens: List[List[int]],
