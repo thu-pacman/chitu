@@ -20,6 +20,12 @@ class Executor:
     ):
         pass
 
+    '''
+    current scheduler implementation depends on this assumption:
+    a decode task object is the same with its corresponding prefill task object,
+    and keeps all its member fields, except for the prefix of its task_id.
+    keep this assumption to make scheduler works as expected
+    '''
     def _prefill2decode(self, task_id):
         return task_id.replace("prefill_", "decode_")
 
