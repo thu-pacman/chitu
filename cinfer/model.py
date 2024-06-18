@@ -28,10 +28,14 @@ from .tokenizer import Tokenizer, ChatFormat
 from pathlib import Path
 import os, sys, json, time
 
+from xformers.ops import fmha
+
 
 from logging import getLogger
 
+
 logger = getLogger(__name__)
+
 
 class Backend:
     model = None
@@ -314,7 +318,34 @@ class Attention(nn.Module):
         ).view(bs_seq, -1)
         return self.wo(output), cache
 
-    def forward(self, x, start_pos, freqs_cis, mask, varlens):
+    def decode_forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        cache,
+    ):
+        bsz, seqlen, _ = x.shape
+        assert seqlen == 1, "decode_forward only supports single token decoding"
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        assert cache is not None
+        cache.extend(xk, xv)
+
+        cache_k = cache.k.to(xq)
+        cache_v = cache.v.to(xq)
+
+        output = fmha.memory_efficient_attention_forward(xq, cache_k, cache_v)
+
+        return self.wo(output)
+
+    def forward(self, x, start_pos, freqs_cis, mask, varlens, cache):
         if self.torch_cache:
             return self.forward_with_torch_cache(x, start_pos, freqs_cis, mask)
         else:
@@ -353,36 +384,9 @@ class FeedForward(nn.Module):
         self.w3 = ColumnParallelLinear(
             dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
-        # self.wt1 = None
-        # self.wt2 = None
-        # self.wt3 = None
 
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
-
-        # return torch.mm(
-        #     (F.silu(GEMV(x, self.wt1)) * GEMV(x, self.wt3)).reshape(
-        #         -1, self.w2.weight.data.shape[1]
-        #     ),
-        #     self.wt2,
-        # )
-
-        # return GEMV(
-        #     F.silu(GEMV(x, self.wt1)) * GEMV(x, self.wt3),
-        #     self.wt2,
-        # )
-
-        # return torch.mm(
-        #     F.silu(
-        #         torch.mm(x.reshape(-1, x.shape[-1]), self.wt1.t())
-        #         * torch.mm(x.reshape(-1, x.shape[-1]), self.wt3.t())
-        #     ).reshape(-1, self.w2.weight.data.shape[1]),
-        #     self.wt2.t(),
-        # )
-
-        # return tkops.gemv(
-        #     F.silu(tkops.gemv(x, self.wt1) * tkops.gemv(x, self.wt3)), self.wt2
-        # )
 
 
 class TransformerBlock(nn.Module):
@@ -409,7 +413,7 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        varlens,
+        varlens=None,
     ):
         h, cache = self.attention(
             self.attention_norm(x), start_pos, freqs_cis, mask, varlens
@@ -479,6 +483,25 @@ class Transformer(nn.Module):
         mask = None
         # freqs_cis = None
         freqs_cis = self.freqs_cis[: varlens.total_len]
+        freqs_cis = freqs_cis.to("cuda")
+        h = self.tok_embeddings(tokens)
+        output_cache = []
+        for layer in self.layers:
+            h, cache = layer(h, 0, freqs_cis, mask, varlens)
+            output_cache.append(cache)
+        h = self.norm(h)
+        output = self.output(h).float()
+        return output, output_cache
+
+    @torch.inference_mode()
+    def decode(
+        self, tokens, kvcaches: list[int], start_pos
+    ):  # TODO: different start pos for reqs
+        tokens = torch.from_numpy(np.concatenate(tokens)).to("cuda")
+        batch_size = tokens.shape[0]
+        mask = None
+        # freqs_cis = None
+        freqs_cis = self.freqs_cis[start_pos : start_pos + 1]
         freqs_cis = freqs_cis.to("cuda")
         h = self.tok_embeddings(tokens)
         output_cache = []
