@@ -2,7 +2,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from .global_vars import set_global_variables, get_timers
-from .cache_manager import KVCache
+from .cache_manager import KVCache, KVCacheManager
 
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
@@ -93,6 +93,7 @@ class Backend:
         )
         Backend.tokenizer = tokenizer
         Backend.formatter = ChatFormat(tokenizer)
+        Backend.cache_manager = KVCacheManager()
 
 
 class VarLens:
@@ -100,6 +101,7 @@ class VarLens:
         self.lens = torch.tensor(
             [len(t) for t in tokens], device=device, dtype=torch.int32
         )
+        self.cpu_lens = [len(t) for t in tokens]
         self.max_len = int(torch.max(self.lens))
         self.total_len = int(torch.sum(self.lens))
 
@@ -299,7 +301,6 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        cache: Optional[KVCache] = None,
     ):
         bs_seq, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -307,12 +308,7 @@ class Attention(nn.Module):
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)  # TODO
-        if cache is None:
-            cache = KVCache()
-            cache.init(xk, xv)
-        else:
-            cache.extend(xk, xv)
-
+        Backend.cache_manager.tmp_storage(xk, xv)
         output = flash_attn.flash_attn_varlen_func(
             xq, xk, xv, varlens.lens, varlens.lens, varlens.max_len, varlens.max_len
         ).view(bs_seq, -1)
@@ -321,10 +317,7 @@ class Attention(nn.Module):
     def decode_forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
         freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
-        cache,
     ):
         bsz, seqlen, _ = x.shape
         assert seqlen == 1, "decode_forward only supports single token decoding"
@@ -335,22 +328,34 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-        assert cache is not None
-        cache.extend(xk, xv)
 
-        cache_k = cache.k.to(xq)
-        cache_v = cache.v.to(xq)
+        Backend.cache_manager.tmp_store(xk, xv)
 
-        output = fmha.memory_efficient_attention_forward(xq, cache_k, cache_v)
+        xk, xv = Backend.cache_manager.use_prepare_cache()
+
+        if self.n_local_heads != self.n_local_kv_heads:
+            group_size = self.n_local_heads // self.n_local_kv_heads
+            assert group_size > 1
+            xq = xq.view(bsz, seqlen, self.n_local_kv_heads, group_size, self.head_dim)
+            xk = xk.view(bsz, seqlen, self.n_local_kv_heads, 1, self.head_dim).expand(
+                bsz, seqlen, self.n_local_kv_heads, group_size, self.head_dim
+            )
+            xv = xv.view(bsz, seqlen, self.n_local_kv_heads, 1, self.head_dim).expand(
+                bsz, seqlen, self.n_local_kv_heads, group_size, self.head_dim
+            )
+
+        output = fmha.memory_efficient_attention_forward(xq, xk, xv)
 
         return self.wo(output)
 
-    def forward(self, x, start_pos, freqs_cis, mask, varlens, cache):
+    def forward(self, x, start_pos, freqs_cis, mask, varlens=None):
         if self.torch_cache:
             return self.forward_with_torch_cache(x, start_pos, freqs_cis, mask)
-        else:
+        elif cache is None:
             assert start_pos == 0
             return self.forward_with_input_cache(x, varlens, start_pos, freqs_cis, mask)
+        else:
+            return self.decode_forward(x, freqs_cis)
 
 
 def GEMV(x, w):
@@ -414,13 +419,14 @@ class TransformerBlock(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
         varlens=None,
+        cache=None,
     ):
-        h, cache = self.attention(
-            self.attention_norm(x), start_pos, freqs_cis, mask, varlens
+        h, new_cache = self.attention(
+            self.attention_norm(x), start_pos, freqs_cis, mask, varlens, cache
         )
         h += x
         out = h + self.feed_forward(self.ffn_norm(h))
-        return out, cache
+        return out, new_cache
 
 
 class Transformer(nn.Module):

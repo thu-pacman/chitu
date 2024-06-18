@@ -88,6 +88,27 @@ def prepare_data_gqa(
     return xq, key, value
 
 
+def prepare_noncontinuous_data(
+    batch=1, seq=10, seq_k=1000, n_local_kv_heads=32, head_dim=128
+):
+    xq = torch.randn(
+        [batch, seq, n_local_kv_heads, head_dim],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    key = torch.randn(
+        [batch, seq_k, n_local_kv_heads, head_dim],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    value = torch.randn(
+        [batch, seq_k, n_local_kv_heads, head_dim],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    return xq, key, value
+
+
 if __name__ == "__main__":
     # xq, key, value = prepare_data()
     xq, key, value = prepare_data_gqa()
