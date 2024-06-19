@@ -5,23 +5,22 @@ class Scheduler:
     @staticmethod
     def build(args):
         if args.type.lower() == "fifo" or args.type.lower() == "fcfs":
-            return FcfsScheduler(args.fcfs.num_tasks)
+            return FcfsScheduler(args.fcfs.num_tasks, args.fcfs.enable_hybrid)
         if args.type.lower() == "prefill_first":
-            return PrefillFirstScheduler(args.prefill_first.num_tasks)
+            return PrefillFirstScheduler(args.prefill_first.num_tasks, args.prefill_first.enable_hybrid)
         if args.type.lower() == "stride":
-            return StrideScheduler(args.stride.num_tasks)
+            return StrideScheduler(args.stride.num_tasks, args.stride.enable_hybrid)
         if args.type.lower() == "deadline":
-            return DdlScheduler(args.deadline.num_tasks)
+            return DdlScheduler(args.deadline.num_tasks, args.deadline.enable_hybrid)
         if args.type.lower() == "prefix_align":
-            return PrefixAlignScheduler(args.prefix_align.num_tasks)
+            return PrefixAlignScheduler(args.prefix_align.num_tasks, args.prefix_align.enable_hybrid)
         if args.type.lower() == "balance":
-            return BalanceScheduler(args.balance.num_tasks)
+            return BalanceScheduler(args.balance.num_tasks, args.balance.enable_hybrid)
         else:
             raise NotImplementedError(f"Scheduler {args.type} not implemented")
 
-    def __init__(self, enable_hybrid: bool=False):
+    def __init__(self):
         self.ret_task_ids = []
-        self.enable_hybrid = enable_hybrid
 
     def schedule(self) -> list[str]:
         assert len(self.ret_task_ids) == 0
@@ -43,10 +42,11 @@ class FcfsScheduler(Scheduler):
     first come, first service
     note that no arrival_time record, implicitly ordered by TaskPool.add -> list.append
     '''
-    def __init__(self, num_tasks):
+    def __init__(self, num_tasks: int, enable_hybrid: bool):
         super().__init__()
         assert num_tasks > 0, "num_tasks must be greater than 0"
         self.num_tasks = num_tasks
+        self.enable_hybrid = enable_hybrid
 
     def schedule(self) -> list[str]:
         super().schedule()
@@ -63,10 +63,11 @@ class PrefillFirstScheduler(Scheduler):
     always select prefill tasks, in a fifo manner, if any.
     decode tasks will be selected only if no prefill task
     '''
-    def __init__(self, num_tasks):
+    def __init__(self, num_tasks: int, enable_hybrid: bool):
         super().__init__()
         assert num_tasks > 0, "num_tasks must be greater than 0"
         self.num_tasks = num_tasks
+        self.enable_hybrid = enable_hybrid
 
     def schedule(self) -> list[str]:
         super().schedule()
@@ -86,10 +87,11 @@ class StrideScheduler(Scheduler):
     S += P * elapsed_time
     select the tasks with top scores and reset their scores back to 0.
     '''
-    def __init__(self, num_tasks):
+    def __init__(self, num_tasks: int, enable_hybrid: bool):
         super().__init__()
         assert num_tasks > 0, "num_tasks must be greater than 0"
-        self.num_tasks = num_tasks 
+        self.num_tasks = num_tasks
+        self.enable_hybrid = enable_hybrid
     
     def schedule(self) -> list[str]:
         super().schedule()
@@ -117,10 +119,11 @@ class DdlScheduler(Scheduler):
     select the tasks with nearest DDL.
     alpha and beta are arbitary value, defaults to 1ms.
     '''
-    def __init__(self, num_tasks):
+    def __init__(self, num_tasks: int, enable_hybrid: bool):
         super().__init__()
         assert num_tasks > 0, "num_tasks must be greater than 0"
-        self.num_tasks = num_tasks 
+        self.num_tasks = num_tasks
+        self.enable_hybrid = enable_hybrid 
     
     def schedule(self) -> list[str]:
         super().schedule()
@@ -140,10 +143,11 @@ class PrefixAlignScheduler(Scheduler):
     at scheduling point, try to select as many tasks with close prefix_length as possible.
     E.g., 4 tasks with prefix_length 100 and 2 tasks with prefix_length 300, select the former 4 tasks.
     '''
-    def __init__(self, num_tasks):
+    def __init__(self, num_tasks: int, enable_hybrid: bool):
         super().__init__()
         assert num_tasks > 0, "num_tasks must be greater than 0"
-        self.num_tasks = num_tasks 
+        self.num_tasks = num_tasks
+        self.enable_hybrid = enable_hybrid
     
     def schedule(self) -> list[str]:
         super().schedule()
@@ -164,10 +168,11 @@ class BalanceScheduler(Scheduler):
     however, searching for the optimal solution is expensive,
     so a somehow heuristic algorithm will be applied.
     '''
-    def __init__(self, num_tasks):
+    def __init__(self, num_tasks: int, enable_hybrid: bool):
         super().__init__()
         assert num_tasks > 0, "num_tasks must be greater than 0"
-        self.num_tasks = num_tasks 
+        self.num_tasks = num_tasks
+        self.enable_hybrid = enable_hybrid
     
     def schedule(self) -> list[str]:
         super().schedule()
