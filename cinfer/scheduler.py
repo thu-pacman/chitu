@@ -4,14 +4,14 @@ from .task import TaskPool, TaskType
 class Scheduler:
     @staticmethod
     def build(args):
-        if args.type.lower() == "fifo":
-            return FifoScheduler(args.fifo.num_tasks)
+        if args.type.lower() == "fifo" or args.type.lower() == "fcfs":
+            return FcfsScheduler(args.fcfs.num_tasks)
         if args.type.lower() == "prefill_first":
             return PrefillFirstScheduler(args.prefill_first.num_tasks)
         if args.type.lower() == "stride":
             return StrideScheduler(args.stride.num_tasks)
         if args.type.lower() == "deadline":
-            return DDLScheduler(args.deadline.num_tasks)
+            return DdlScheduler(args.deadline.num_tasks)
         if args.type.lower() == "prefix_align":
             return PrefixAlignScheduler(args.prefix_align.num_tasks)
         if args.type.lower() == "balance":
@@ -38,7 +38,7 @@ class Scheduler:
 
 
 
-class FifoScheduler(Scheduler):
+class FcfsScheduler(Scheduler):
     '''
     first come, first service
     note that no arrival_time record, implicitly ordered by TaskPool.add -> list.append
@@ -110,7 +110,7 @@ class StrideScheduler(Scheduler):
             TaskPool.pool[task_id].sched_score = 0
         return self.ret_task_ids
 
-class DDLScheduler(Scheduler):
+class DdlScheduler(Scheduler):
     '''
     each task has a deadline time DDL
     DDL = request_arrival_time + prefix_length*alpha + max_output_tokens*beta
