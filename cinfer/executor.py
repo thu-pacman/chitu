@@ -1,6 +1,9 @@
 import torch
 from .task import PackedTasks, TaskType, DecodeTask
 from .model import Backend, VarLens
+from logging import getLogger
+
+logger = getLogger(__name__)
 
 
 class Executor:
@@ -30,7 +33,9 @@ class NormalExecutor(Executor):
         super().__init__(args)
 
     def prefill_step(self, tasks: PackedTasks):
-        logits, output_cache = Backend.model.prefill(tasks.tokens)
+        logger.info(f"Prefill step: {tasks.task_ids}")
+        varlens = VarLens(tasks.tokens, "cuda")
+        logits = Backend.model.prefill(tasks.tokens)
         # after prefill, new decode tasks are created
         new_tasks = []
         for it in range(tasks.num_tasks):
@@ -38,16 +43,21 @@ class NormalExecutor(Executor):
                 DecodeTask(
                     self._prefill2decode(tasks.task_ids[it]),
                     tasks.tasks[it].req,
-                    output_cache[it],
                 )
             )
+        varlens = VarLens(tasks.tokens, "cuda")
+        Backend.cache_manager.finalize_prefill(tasks.req_ids, varlens)
         return logits
 
     def decode_step(self, tasks: PackedTasks):
-        logits, output_cache = Backend.model.decode(tasks.kvcaches)
+        logger.info(f"Decode step: {tasks.task_ids}")
+        logits = Backend.model.decode(
+            torch.randint(0, 100, (tasks.num_tasks, 1), device="cuda"), 1
+        )
         for it, task in enumerate(tasks.tasks):
-            task.update_cache(output_cache[it])
+            # task.update_cache(output_cache[it])
             task.update_response(logits[it])
+        Backend.cache_manager.finalize_decode(tasks.req_ids)
         return logits
 
     def step(
@@ -70,6 +80,7 @@ class DebugExecutor(Executor):
 
     def prefill_step(self, tasks: PackedTasks):
         varlens = VarLens(tasks.tokens, "cuda")
+        tasks.varlens = varlens
         total_len = varlens.total_len
         logits = torch.randn(total_len, Backend.model.vocab_size, device="cuda")
         output_cache = [

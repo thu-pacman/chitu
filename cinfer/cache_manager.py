@@ -4,21 +4,89 @@ import torch
 class KVCacheManager:
     def __init__(self, num_layers):
         self.cache = {}
-        self.prepared = False
         self.prepared_cache = []
         self.num_layers = num_layers
         self.tmp_storage = []
 
+    # return [layer, num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
     def prepare(self, req_ids):
-        self.prepared = True
         self.layer_id = 0
+        max_seq = 0
+        seq_lens = []
+        for req_id in req_ids:
+            seq_len = self.cache[req_id][self.layer_id][0].shape[0]
+            seq_lens.append(seq_len)
+        self.seq_lens = seq_lens
+        max_seq = max(seq_lens)
+        n_local_kv_heads = self.cache[req_ids[0]][0][0].shape[-2]
+        head_dim = self.cache[req_ids[0]][0][0].shape[-1]
+        prepared_cache = torch.zeros(
+            [
+                self.num_layers,  # layers
+                2,
+                len(req_ids),  # batch_size
+                max_seq + 1,  # seq_len
+                n_local_kv_heads,  # n_local_kv_heads
+                head_dim,  # head_dim
+            ]
+        )
+        # hkz-comment: Very similar to matrix transpose;
         for layer_id in range(self.num_layers):
-            self.prepared_cache.append([])
-            for req_id in req_ids:
-                self.prepared_cache[layer_id].append(
-                    [self.cache[req_id][layer_id][0], self.cache[req_id][layer_id][1]]
-                )
-                # TODO: Pad
+            for it, req_id in enumerate(req_ids):
+                prepared_cache[layer_id][0][it][: seq_lens[it]] = self.cache[req_id][
+                    layer_id
+                ][0]
+                prepared_cache[layer_id][1][it][: seq_lens[it]] = self.cache[req_id][
+                    layer_id
+                ][1]
+        self.prepared_cache = prepared_cache
+
+    # return for every req [layer, seq, n_local_kv_heads, head_dim] * 2 (for k and v)
+    def finalize_prefill(self, req_ids, varlen):
+        assert len(self.tmp_storage) == self.num_layers
+        assert len(varlen.cpu_lens) == len(req_ids)
+        assert sum(varlen.cpu_lens) == self.tmp_storage[0][0].shape[0]
+        for req_id in req_ids:
+            self.cache[req_id] = [None] * self.num_layers
+        for layer_id in range(self.num_layers):
+            start = 0
+            for it, req_id in enumerate(req_ids):
+                end = start + varlen.cpu_lens[it]
+                self.cache[req_id][layer_id] = [
+                    self.tmp_storage[layer_id][0][
+                        start:end
+                    ],  # [seq, n_local_kv_heads, head_dim]
+                    self.tmp_storage[layer_id][1][
+                        start:end
+                    ],  # [seq, n_local_kv_heads, head_dim]
+                ]
+                start = end
+        self.tmp_storage = []
+
+    # return for every req [layer, seq + 1, n_local_kv_heads, head_dim] * 2 (for k and v)
+    def finalize_decode(self, req_ids):
+        assert len(self.prepared_cache) > 0
+        for it, req_id in enumerate(req_ids):
+            self.cache[req_id] = [None] * self.num_layers
+        for layer_id in range(self.num_layers):
+            for it, req_id in enumerate(req_ids):
+                self.cache[req_id][layer_id] = [
+                    self.prepared_cache[layer_id][0][it][
+                        : self.seq_lens[it] + 1
+                    ],  # [seq + 1, n_local_kv_heads, head_dim]
+                    self.prepared_cache[layer_id][1][it][
+                        : self.seq_lens[it] + 1
+                    ],  # [seq + 1, n_local_kv_heads, head_dim]
+                ]
+        self.prepared_cache = []
+
+    # def update_cache(self, layer_id, req_id, it):
+    #     self.cache[req_id][layer_id][0] = torch.cat(
+    #         [self.cache[req_id][layer_id][0], self.tmp_storage[layer_id][0][it]], dim=0
+    #     )
+    #     self.cache[req_id][layer_id][1] = torch.cat(
+    #         [self.cache[req_id][layer_id][1], self.tmp_storage[layer_id][1][it]], dim=0
+    #     )
 
     def get(self, key):
         return self.cache.get(key, None)
@@ -36,42 +104,15 @@ class KVCacheManager:
     def tmp_store(self, cache_k, cache_v):
         self.tmp_storage.append([cache_k, cache_v])
 
-    def use_prepare_cache(self):
-        return (
-            self.prepared_cache[self.layer_id][0],
-            self.prepared_cache[self.layer_id][1],
-        )
-
-    def finalize_prefill(self, req_ids, varlen):
-        assert len(self.tmp_storage) == self.num_layers
-        assert len(varlen) == self.num_layers
-        assert sum(varlen.cpu_lens) == self.tmp_storage[0][0].shape[0]
-        for req_id in req_ids:
-            self.cache[req_id] = [None] * self.num_layers
-        for layer_id in range(self.num_layers):
-            start = 0
-            for req_id in req_ids:
-                end = start + varlen.cpu_lens[layer_id]
-                self.cache[req_id][layer_id] = [
-                    self.tmp_storage[layer_id][0][start:end],
-                    self.tmp_storage[layer_id][1][start:end],
-                ]
-                start = end
-
-    def update_cache(self, layer_id, req_id, it):
-        self.cache[req_id][layer_id][0] = torch.cat(
-            [self.cache[req_id][layer_id][0], self.tmp_storage[layer_id][0][it]], dim=0
-        )
-        self.cache[req_id][layer_id][1] = torch.cat(
-            [self.cache[req_id][layer_id][1], self.tmp_storage[layer_id][1][it]], dim=0
-        )
-
-    def finalize_decode(self, req_ids):
-        assert len(self.tmp_storage) == self.num_layers
+    # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
+    def update_prepare_cache(self, xk, xv):
         assert len(self.prepared_cache) > 0
-        for layer_id in range(self.num_layers):
-            for it, req_id in enumerate(req_ids):
-                self.update_cache(layer_id, req_id, it)
+        output = self.prepared_cache[self.layer_id]
+        self.layer_id += 1
+        for it in range(xk.shape[0]):
+            output[0][it][self.seq_lens[it]] = xk[it]
+            output[1][it][self.seq_lens[it]] = xv[it]
+        return output
 
 
 class KVCache:

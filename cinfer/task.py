@@ -74,15 +74,18 @@ class PrefillTask(Task):
 
 
 class DecodeTask(Task):
-    def __init__(self, task_id: str, req: UserRequest, kvcache):
+    def __init__(
+        self,
+        task_id: str,
+        req: UserRequest,
+    ):
         super().__init__(task_id, req)
-        self.kvcache = kvcache
         self.task_type = TaskType.Decode
         self.response = []
 
-    def update_cache(self, new_kvcache):  # TODO: impl for KVCache
-        # self.kvcache.update(new_kvcache)
-        pass
+    # def update_cache(self, new_kvcache):  # TODO: impl for KVCache
+    #     # self.kvcache.update(new_kvcache)
+    #     pass
 
     def update_response(self, logit):
         next_token = torch.argmax(logit, dim=-1)
@@ -102,9 +105,11 @@ class PackedTasks:
         assert self.num_tasks > 0, "No tasks provided"
         self.tasks = []
         task_types = []
+        self.req_ids = []
         for tid in self.task_ids:
             self.tasks.append(TaskPool.pool[tid])
             task_types.append(TaskPool.pool[tid].task_type)
+            self.req_ids.append(TaskPool.pool[tid].req.request_id)
         if TaskType.Prefill in task_types and TaskType.Decode in task_types:
             self.task_type = TaskType.Hybrid
             raise NotImplementedError("Hybrid task not implemented")
@@ -113,7 +118,8 @@ class PackedTasks:
             if self.task_type == TaskType.Prefill:
                 self.pack_tokens()
             else:
-                self.pack_kvcache()
+                # self.pack_kvcache()
+                Backend.cache_manager.prepare(self.req_ids)
 
     def pack_tokens(self):
         tokens = []
@@ -122,9 +128,9 @@ class PackedTasks:
                 tokens.append(task.tokens)
         self.tokens = tokens
 
-    def pack_kvcache(self):  # TODO: impl for KVCache
-        kvcaches = []
-        for task in self.tasks:
-            if task.task_type == TaskType.Decode:
-                kvcaches.append(task.kvcache)
-        self.kvcaches = kvcaches
+    # def pack_kvcache(self):  # TODO: impl for KVCache
+    #     kvcaches = []
+    #     for task in self.tasks:
+    #         if task.task_type == TaskType.Decode:
+    #             kvcaches.append(task.kvcache)
+    #     self.kvcaches = kvcaches

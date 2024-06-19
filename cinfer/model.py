@@ -93,13 +93,19 @@ class Backend:
         )
         Backend.tokenizer = tokenizer
         Backend.formatter = ChatFormat(tokenizer)
-        Backend.cache_manager = KVCacheManager()
+        Backend.cache_manager = KVCacheManager(model_args.n_layers)
 
 
 class VarLens:
     def __init__(self, tokens, device) -> None:
         self.lens = torch.tensor(
             [len(t) for t in tokens], device=device, dtype=torch.int32
+        )
+        self.prefix_lens = [0]
+        for t in tokens:
+            self.prefix_lens.append(self.prefix_lens[-1] + len(t))
+        self.prefix_lens = torch.tensor(
+            self.prefix_lens, device=device, dtype=torch.int32
         )
         self.cpu_lens = [len(t) for t in tokens]
         self.max_len = int(torch.max(self.lens))
@@ -308,11 +314,17 @@ class Attention(nn.Module):
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)  # TODO
-        Backend.cache_manager.tmp_storage(xk, xv)
+        Backend.cache_manager.tmp_store(xk, xv)
         output = flash_attn.flash_attn_varlen_func(
-            xq, xk, xv, varlens.lens, varlens.lens, varlens.max_len, varlens.max_len
+            xq,
+            xk,
+            xv,
+            varlens.prefix_lens,
+            varlens.prefix_lens,
+            varlens.max_len,
+            varlens.max_len,
         ).view(bs_seq, -1)
-        return self.wo(output), cache
+        return self.wo(output)
 
     def decode_forward(
         self,
@@ -329,30 +341,32 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        Backend.cache_manager.tmp_store(xk, xv)
-
-        xk, xv = Backend.cache_manager.use_prepare_cache()
+        cache = Backend.cache_manager.update_prepare_cache(xk, xv)
+        cache_k = cache[0]
+        cache_v = cache[1]
+        max_seq_len = cache.shape[2]
 
         if self.n_local_heads != self.n_local_kv_heads:
             group_size = self.n_local_heads // self.n_local_kv_heads
             assert group_size > 1
             xq = xq.view(bsz, seqlen, self.n_local_kv_heads, group_size, self.head_dim)
-            xk = xk.view(bsz, seqlen, self.n_local_kv_heads, 1, self.head_dim).expand(
-                bsz, seqlen, self.n_local_kv_heads, group_size, self.head_dim
-            )
-            xv = xv.view(bsz, seqlen, self.n_local_kv_heads, 1, self.head_dim).expand(
-                bsz, seqlen, self.n_local_kv_heads, group_size, self.head_dim
-            )
+            cache_k = cache_k.view(
+                bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
+            ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
+            cache_v = cache_v.view(
+                bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
+            ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
 
-        output = fmha.memory_efficient_attention_forward(xq, xk, xv)
+        output = fmha.memory_efficient_attention_forward(xq, cache_k, cache_v).view(
+            bsz, seqlen, -1
+        )
 
         return self.wo(output)
 
     def forward(self, x, start_pos, freqs_cis, mask, varlens=None):
         if self.torch_cache:
             return self.forward_with_torch_cache(x, start_pos, freqs_cis, mask)
-        elif cache is None:
-            assert start_pos == 0
+        elif start_pos == 0:
             return self.forward_with_input_cache(x, varlens, start_pos, freqs_cis, mask)
         else:
             return self.decode_forward(x, freqs_cis)
@@ -419,14 +433,11 @@ class TransformerBlock(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
         varlens=None,
-        cache=None,
     ):
-        h, new_cache = self.attention(
-            self.attention_norm(x), start_pos, freqs_cis, mask, varlens, cache
-        )
+        h = self.attention(self.attention_norm(x), start_pos, freqs_cis, mask, varlens)
         h += x
         out = h + self.feed_forward(self.ffn_norm(h))
-        return out, new_cache
+        return out
 
 
 class Transformer(nn.Module):
@@ -491,29 +502,23 @@ class Transformer(nn.Module):
         freqs_cis = self.freqs_cis[: varlens.total_len]
         freqs_cis = freqs_cis.to("cuda")
         h = self.tok_embeddings(tokens)
-        output_cache = []
         for layer in self.layers:
-            h, cache = layer(h, 0, freqs_cis, mask, varlens)
-            output_cache.append(cache)
+            h = layer(h, 0, freqs_cis, mask, varlens)
         h = self.norm(h)
         output = self.output(h).float()
-        return output, output_cache
+        return output
 
     @torch.inference_mode()
-    def decode(
-        self, tokens, kvcaches: list[int], start_pos
-    ):  # TODO: different start pos for reqs
-        tokens = torch.from_numpy(np.concatenate(tokens)).to("cuda")
+    def decode(self, tokens, start_pos=0):  # TODO: different start pos for reqs
+        # tokens = torch.from_numpy(np.concatenate(tokens)).to("cuda")
         batch_size = tokens.shape[0]
         mask = None
         # freqs_cis = None
         freqs_cis = self.freqs_cis[start_pos : start_pos + 1]
         freqs_cis = freqs_cis.to("cuda")
         h = self.tok_embeddings(tokens)
-        output_cache = []
         for layer in self.layers:
-            h, cache = layer(h, 0, freqs_cis, mask, varlens)
-            output_cache.append(cache)
+            h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h).float()
-        return output, output_cache
+        return output

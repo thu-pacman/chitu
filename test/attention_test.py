@@ -2,6 +2,7 @@ from xformers.ops import fmha
 import torch
 import torch.nn.functional as F
 import timeit
+import flash_attn
 
 
 @torch.inference_mode()
@@ -125,3 +126,11 @@ if __name__ == "__main__":
         "ground_truth",
         timeit.timeit(lambda: ground_truth_attention(xq, key, value), number=100) / 100,
     )
+
+    xq, key, value = prepare_data(seq=32, seq_k=32)
+    # xq, key, value = prepare_data_gqa(seq=32, seq_k=32)
+    varlen = torch.tensor([0, 32], dtype=torch.int32, device="cuda")
+    xq = xq.squeeze()
+    key = key.squeeze()
+    value = value.squeeze()
+    output = flash_attn.flash_attn_varlen_func(xq, key, value, varlen, varlen, 32, 32)
