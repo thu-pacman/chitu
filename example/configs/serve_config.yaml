@@ -13,6 +13,22 @@ request:
 executor:
   type: debug
 scheduler:
-  type: fifo
-  fifo:
-    num_tasks: 1
+  type: deadline
+  fcfs:
+    num_tasks: 2
+    enable_hybrid: False
+  prefill_first:
+    num_tasks: 2
+    enable_hybrid: False
+  stride:
+    num_tasks: 2
+    enable_hybrid: False
+  deadline:
+    num_tasks: 2
+    enable_hybrid: False
+  prefix_align:
+    num_tasks: 2
+    enable_hybrid: False
+  balance:
+    num_tasks: 2
+    enable_hybrid: False

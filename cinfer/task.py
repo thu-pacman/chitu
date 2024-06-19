@@ -1,6 +1,7 @@
 import torch
 from enum import Enum
 import asyncio
+import time
 from .model import Backend
 
 from logging import getLogger
@@ -41,7 +42,6 @@ class TaskPool:
             return False  # Task not found, failed to remove
         return True
 
-
 class TaskType(Enum):
     Prefill = 1
     Decode = 2
@@ -49,9 +49,15 @@ class TaskType(Enum):
 
 
 class Task:
-    def __init__(self, task_id, req):
+    def __init__(self, task_id, req, priority=1):
         self.task_id = task_id
         self.req = req
+        self.arrv_ts = time.perf_counter_ns()
+        self.sched_ts = self.arrv_ts 
+        self.priority = priority
+        self.sched_score = 0
+        self.prefix_length = -1
+        self.max_output_tokens = -1
         TaskPool.add(self)
 
     def need_remove(self):
@@ -59,8 +65,8 @@ class Task:
 
 
 class PrefillTask(Task):
-    def __init__(self, task_id: str, req: UserRequest, message: str):
-        super().__init__(task_id, req)
+    def __init__(self, task_id: str, req: UserRequest, message: str, priority: int=1):
+        super().__init__(task_id, req, priority)
         self.message = message
         logger.info(f"Prefill task: {message}")
         if isinstance(message, str):
@@ -68,14 +74,21 @@ class PrefillTask(Task):
         else:
             self.tokens = Backend.formatter.encode_dialog_prompt(message)
         self.task_type = TaskType.Prefill
+        self.prefix_length = len(self.tokens)
+        self.max_output_tokens = 1024 # TODO: replace hardcode by parameter
+        self.sched_ddl = time.perf_counter_ns() + self.prefix_length*1000*1000 + self.max_output_tokens*1000*1000
 
     def need_remove(self):
         return True
 
 
 class DecodeTask(Task):
-    def __init__(self, task_id: str, req: UserRequest, kvcache):
-        super().__init__(task_id, req)
+    def __init__(self, task_id: str, req: UserRequest, prefill_task: PrefillTask, kvcache, priority: int=1):
+        super().__init__(task_id, req, priority)
+        self.prefill = prefill_task
+        self.prefix_length = self.prefill.prefix_length
+        self.max_output_tokens = self.prefill.max_output_tokens
+        self.sched_ddl = self.prefill.sched_ddl
         self.kvcache = kvcache
         self.task_type = TaskType.Decode
         self.response = []
@@ -84,9 +97,11 @@ class DecodeTask(Task):
         # self.kvcache.update(new_kvcache)
         pass
 
-    def update_response(self, logit):
+    def update_response(self, logit): # TODO: modify if generate more than one token at a time
         next_token = torch.argmax(logit, dim=-1)
         self.response.append(next_token)
+        self.prefix_length += 1 
+        self.max_output_tokens -= 1
 
     def need_remove(self):
         return (

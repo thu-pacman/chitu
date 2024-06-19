@@ -38,6 +38,7 @@ class NormalExecutor(Executor):
                 DecodeTask(
                     self._prefill2decode(tasks.task_ids[it]),
                     tasks.tasks[it].req,
+                    tasks.tasks[it],
                     output_cache[it],
                 )
             )
@@ -89,6 +90,7 @@ class DebugExecutor(Executor):
                 DecodeTask(
                     self._prefill2decode(tasks.task_ids[it]),
                     tasks.tasks[it].req,
+                    tasks.tasks[it],
                     output_cache[it],
                 )
             )
