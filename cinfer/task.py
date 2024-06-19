@@ -3,6 +3,7 @@ from enum import Enum
 import asyncio
 import time
 from .model import Backend
+from .async_response import AsyncDataStream, AsyncResponse
 
 from logging import getLogger
 
@@ -10,12 +11,13 @@ logger = getLogger(__name__)
 
 
 class UserRequest:
-    def __init__(self, message, request_id, max_new_tokens=128):
+    def __init__(self, message, request_id, max_new_tokens=50, async_stream=None):
         self.message = message
         self.request_id = request_id
         self.completed = asyncio.Event()
         self.max_new_tokens = max_new_tokens
-        self.response = None
+        self.response = []
+        self.async_stream = async_stream
 
 
 class TaskPool:
@@ -35,6 +37,8 @@ class TaskPool:
             TaskPool.pool[task_id].req.response = [
                 Backend.tokenizer.decode([x]) for x in TaskPool.pool[task_id].response
             ]
+            if TaskPool.pool[task_id].req.async_stream:
+                TaskPool.pool[task_id].req.async_stream.send_stop_signal()
             TaskPool.pool[task_id].req.completed.set()
         ret = TaskPool.pool.pop(task_id)
         TaskPool.id_list.remove(task_id)
@@ -58,7 +62,6 @@ class Task:
         self.sched_score = 0
         self.prefix_length = -1
         self.max_output_tokens = -1
-        TaskPool.add(self)
 
     def need_remove(self):
         raise NotImplementedError
@@ -77,6 +80,7 @@ class PrefillTask(Task):
         self.prefix_length = len(self.tokens)
         self.max_output_tokens = 1024 # TODO: replace hardcode by parameter
         self.sched_ddl = time.perf_counter_ns() + self.prefix_length*1000*1000 + self.max_output_tokens*1000*1000
+        TaskPool.add(self)
 
     def need_remove(self):
         return True
@@ -92,6 +96,7 @@ class DecodeTask(Task):
         self.kvcache = kvcache
         self.task_type = TaskType.Decode
         self.response = []
+        TaskPool.add(self)
 
     def update_cache(self, new_kvcache):  # TODO: impl for KVCache
         # self.kvcache.update(new_kvcache)
@@ -102,6 +107,8 @@ class DecodeTask(Task):
         self.response.append(next_token)
         self.prefix_length += 1 
         self.max_output_tokens -= 1
+        if self.req.async_stream:
+            self.req.async_stream.add_data(Backend.tokenizer.decode([next_token]))
 
     def need_remove(self):
         return (
@@ -119,6 +126,8 @@ class PackedTasks:
         task_types = []
         for tid in self.task_ids:
             self.tasks.append(TaskPool.pool[tid])
+            print(TaskPool.pool[tid], type(TaskPool.pool[tid]))
+            print(TaskPool.pool[tid].task_type)
             task_types.append(TaskPool.pool[tid].task_type)
         if TaskType.Prefill in task_types and TaskType.Decode in task_types:
             self.task_type = TaskType.Hybrid
