@@ -83,8 +83,12 @@ class PrefillTask(Task):
 
 
 class DecodeTask(Task):
-    def __init__(self, task_id: str, req: UserRequest, kvcache, priority: int=1):
+    def __init__(self, task_id: str, req: UserRequest, prefill_task: PrefillTask, kvcache, priority: int=1):
         super().__init__(task_id, req, priority)
+        self.prefill = prefill_task
+        self.prefix_length = self.prefill.prefix_length
+        self.max_output_tokens = self.prefill.max_output_tokens
+        self.sched_ddl = self.prefill.sched_ddl
         self.kvcache = kvcache
         self.task_type = TaskType.Decode
         self.response = []

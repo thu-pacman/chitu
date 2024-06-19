@@ -59,7 +59,7 @@ class FcfsScheduler(Scheduler):
         else:
             filter_task_type = TaskPool.pool[TaskPool.id_list[0]].task_type if len(TaskPool.id_list) > 0 else TaskType.Prefill 
             filtered_task_ids = filter(lambda x: TaskPool.pool[x].task_type == filter_task_type, TaskPool.id_list)
-            self.ret_task_ids = filtered_task_ids[: self.num_tasks]
+            self.ret_task_ids = list(filtered_task_ids)[: self.num_tasks]
         logger.info(f"Selected task_ids: {self.ret_task_ids}")
         return self.ret_task_ids
 
@@ -78,11 +78,11 @@ class PrefillFirstScheduler(Scheduler):
         super().schedule()
         prefill_task_ids = filter(lambda x: TaskPool.pool[x].task_type == TaskType.Prefill, TaskPool.id_list)
         # select at most num_tasks prefill tasks
-        self.ret_task_ids = prefill_task_ids[: self.num_tasks]
+        self.ret_task_ids = list(prefill_task_ids)[: self.num_tasks]
         # if no prefill tasks or enable hybrid, select decode tasks if there is room left
         if len(self.ret_task_ids) == 0 or (self.enable_hybrid and len(self.ret_task_ids) < self.num_tasks):
             decode_task_ids = filter(lambda x: TaskPool.pool[x].task_type == TaskType.Decode, TaskPool.id_list)
-            self.ret_task_ids.extend(decode_task_ids[: self.num_tasks - len(self.ret_task_ids)])
+            self.ret_task_ids.extend(list(decode_task_ids)[: self.num_tasks - len(self.ret_task_ids)])
         logger.info(f"Selected task_ids: {self.ret_task_ids}")
         return self.ret_task_ids
         
@@ -112,7 +112,7 @@ class StrideScheduler(Scheduler):
         else:            
             filter_task_type = TaskPool.pool[TaskPool.id_list[0]].task_type if len(TaskPool.id_list) > 0 else TaskType.Prefill 
             filtered_task_ids = filter(lambda x: TaskPool.pool[x].task_type == filter_task_type, TaskPool.id_list)
-            self.ret_task_ids = sorted(filtered_task_ids, key=lambda x: TaskPool.pool[x].sched_score, reverse=True)[: self.num_tasks]
+            self.ret_task_ids = sorted(list(filtered_task_ids), key=lambda x: TaskPool.pool[x].sched_score, reverse=True)[: self.num_tasks]
         # reset sched_score of selected tasks
         for task_id in self.ret_task_ids:
             TaskPool.pool[task_id].sched_score = 0
@@ -140,7 +140,7 @@ class DdlScheduler(Scheduler):
         else:
             filter_task_type = TaskPool.pool[TaskPool.id_list[0]].task_type if len(TaskPool.id_list) > 0 else TaskType.Prefill 
             filtered_task_ids = filter(lambda x: TaskPool.pool[x].task_type == filter_task_type, TaskPool.id_list)
-            self.ret_task_ids = sorted(filtered_task_ids, key=lambda x: TaskPool.pool[x].sched_ddl)[: self.num_tasks]
+            self.ret_task_ids = sorted(list(filtered_task_ids), key=lambda x: TaskPool.pool[x].sched_ddl)[: self.num_tasks]
         logger.info(f"Selected task_ids: {self.ret_task_ids}")
         return self.ret_task_ids
     
@@ -165,7 +165,7 @@ class PrefixAlignScheduler(Scheduler):
         else:
             filter_task_type = TaskPool.pool[TaskPool.id_list[0]].task_type if len(TaskPool.id_list) > 0 else TaskType.Prefill 
             filtered_task_ids = filter(lambda x: TaskPool.pool[x].task_type == filter_task_type, TaskPool.id_list)
-            self.ret_task_ids = sorted(filtered_task_ids, key=lambda x: TaskPool.pool[x].prefix_length)[: self.num_tasks]
+            self.ret_task_ids = sorted(list(filtered_task_ids), key=lambda x: TaskPool.pool[x].prefix_length)[: self.num_tasks]
         logger.info(f"Selected task_ids: {self.ret_task_ids}")
         return self.ret_task_ids
 
@@ -185,8 +185,8 @@ class BalanceScheduler(Scheduler):
     
     def schedule(self) -> list[str]:
         super().schedule()
-        prefill_task_ids = filter(lambda x: TaskPool.pool[x].task_type == TaskType.Prefill, TaskPool.id_list)
-        decode_task_ids = filter(lambda x: TaskPool.pool[x].task_type == TaskType.Decode, TaskPool.id_list)
+        prefill_task_ids = list(filter(lambda x: TaskPool.pool[x].task_type == TaskType.Prefill, TaskPool.id_list))
+        decode_task_ids = list(filter(lambda x: TaskPool.pool[x].task_type == TaskType.Decode, TaskPool.id_list))
         if self.enable_hybrid: # TODO: currently half and half
             prefill_count = self.num_tasks//2 if len(decode_task_ids) >= self.num_tasks//2 else self.num_tasks - len(decode_task_ids)
             decode_count = self.num_tasks - prefill_count
