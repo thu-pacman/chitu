@@ -1,6 +1,10 @@
 import time
 from .task import TaskPool, TaskType
 
+from logging import getLogger
+
+logger = getLogger(__name__)
+
 class Scheduler:
     @staticmethod
     def build(args):
@@ -56,6 +60,7 @@ class FcfsScheduler(Scheduler):
             filter_task_type = TaskPool.pool[TaskPool.id_list[0]].task_type if len(TaskPool.id_list) > 0 else TaskType.Prefill 
             filtered_task_ids = filter(lambda x: TaskPool.pool[x].task_type == filter_task_type, TaskPool.id_list)
             self.ret_task_ids = filtered_task_ids[: self.num_tasks]
+        logger.info(f"Selected task_ids: {self.ret_task_ids}")
         return self.ret_task_ids
 
 class PrefillFirstScheduler(Scheduler):
@@ -78,6 +83,7 @@ class PrefillFirstScheduler(Scheduler):
         if len(self.ret_task_ids) == 0 or (self.enable_hybrid and len(self.ret_task_ids) < self.num_tasks):
             decode_task_ids = filter(lambda x: TaskPool.pool[x].task_type == TaskType.Decode, TaskPool.id_list)
             self.ret_task_ids.extend(decode_task_ids[: self.num_tasks - len(self.ret_task_ids)])
+        logger.info(f"Selected task_ids: {self.ret_task_ids}")
         return self.ret_task_ids
         
 class StrideScheduler(Scheduler):
@@ -110,6 +116,7 @@ class StrideScheduler(Scheduler):
         # reset sched_score of selected tasks
         for task_id in self.ret_task_ids:
             TaskPool.pool[task_id].sched_score = 0
+        logger.info(f"Selected task_ids: {self.ret_task_ids}")
         return self.ret_task_ids
 
 class DdlScheduler(Scheduler):
@@ -134,6 +141,7 @@ class DdlScheduler(Scheduler):
             filter_task_type = TaskPool.pool[TaskPool.id_list[0]].task_type if len(TaskPool.id_list) > 0 else TaskType.Prefill 
             filtered_task_ids = filter(lambda x: TaskPool.pool[x].task_type == filter_task_type, TaskPool.id_list)
             self.ret_task_ids = sorted(filtered_task_ids, key=lambda x: TaskPool.pool[x].sched_ddl)[: self.num_tasks]
+        logger.info(f"Selected task_ids: {self.ret_task_ids}")
         return self.ret_task_ids
     
 class PrefixAlignScheduler(Scheduler):
@@ -158,6 +166,7 @@ class PrefixAlignScheduler(Scheduler):
             filter_task_type = TaskPool.pool[TaskPool.id_list[0]].task_type if len(TaskPool.id_list) > 0 else TaskType.Prefill 
             filtered_task_ids = filter(lambda x: TaskPool.pool[x].task_type == filter_task_type, TaskPool.id_list)
             self.ret_task_ids = sorted(filtered_task_ids, key=lambda x: TaskPool.pool[x].prefix_length)[: self.num_tasks]
+        logger.info(f"Selected task_ids: {self.ret_task_ids}")
         return self.ret_task_ids
 
 class BalanceScheduler(Scheduler):
@@ -185,4 +194,5 @@ class BalanceScheduler(Scheduler):
             self.ret_task_ids.extend(decode_task_ids[: decode_count])
         else: # fall back to prefill_first
             self.ret_task_ids = prefill_task_ids[: self.num_tasks] if len(prefill_task_ids) > 0 else decode_task_ids[: self.num_tasks]
+        logger.info(f"Selected task_ids: {self.ret_task_ids}")
         return self.ret_task_ids
