@@ -1,7 +1,7 @@
 from cinfer.task import UserRequest, TaskPool, PrefillTask
 from cinfer.model import Backend
 from cinfer.cinfer_main import cinfer_init, cinfer_run
-from cinfer.global_vars import set_global_variables
+from cinfer.global_vars import set_global_variables, get_timers
 from faker import Faker
 import hydra
 from omegaconf import DictConfig
@@ -41,6 +41,17 @@ def main(args: DictConfig):
 
     for req in reqs:
         logger.info(f"Response: {req.response}")
+
+    timers = get_timers()
+    timers.log(
+        [
+            "cache_prepare",
+            "cache_finalize_prefill",
+            "cache_finalize_decode",
+            "prefill",
+            "decode",
+        ]
+    )
 
 
 if __name__ == "__main__":

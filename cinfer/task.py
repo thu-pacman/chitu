@@ -42,6 +42,7 @@ class TaskPool:
             return False  # Task not found, failed to remove
         return True
 
+
 class TaskType(Enum):
     Prefill = 1
     Decode = 2
@@ -53,7 +54,7 @@ class Task:
         self.task_id = task_id
         self.req = req
         self.arrv_ts = time.perf_counter_ns()
-        self.sched_ts = self.arrv_ts 
+        self.sched_ts = self.arrv_ts
         self.priority = priority
         self.sched_score = 0
         self.prefix_length = -1
@@ -65,7 +66,7 @@ class Task:
 
 
 class PrefillTask(Task):
-    def __init__(self, task_id: str, req: UserRequest, message: str, priority: int=1):
+    def __init__(self, task_id: str, req: UserRequest, message: str, priority: int = 1):
         super().__init__(task_id, req, priority)
         self.message = message
         logger.info(f"Prefill task: {message}")
@@ -75,32 +76,43 @@ class PrefillTask(Task):
             self.tokens = Backend.formatter.encode_dialog_prompt(message)
         self.task_type = TaskType.Prefill
         self.prefix_length = len(self.tokens)
-        self.max_output_tokens = 1024 # TODO: replace hardcode by parameter
-        self.sched_ddl = time.perf_counter_ns() + self.prefix_length*1000*1000 + self.max_output_tokens*1000*1000
+        self.max_output_tokens = 1024  # TODO: replace hardcode by parameter
+        self.sched_ddl = (
+            time.perf_counter_ns()
+            + self.prefix_length * 1000 * 1000
+            + self.max_output_tokens * 1000 * 1000
+        )
 
     def need_remove(self):
         return True
 
 
 class DecodeTask(Task):
-    def __init__(self, task_id: str, req: UserRequest, prefill_task: PrefillTask, kvcache, priority: int=1):
+    def __init__(
+        self,
+        task_id: str,
+        req: UserRequest,
+        prefill_task: PrefillTask,
+        priority: int = 1,
+    ):
         super().__init__(task_id, req, priority)
         self.prefill = prefill_task
         self.prefix_length = self.prefill.prefix_length
         self.max_output_tokens = self.prefill.max_output_tokens
         self.sched_ddl = self.prefill.sched_ddl
-        self.kvcache = kvcache
         self.task_type = TaskType.Decode
         self.response = []
 
-    def update_cache(self, new_kvcache):  # TODO: impl for KVCache
-        # self.kvcache.update(new_kvcache)
-        pass
+    # def update_cache(self, new_kvcache):  # TODO: impl for KVCache
+    #     # self.kvcache.update(new_kvcache)
+    #     pass
 
-    def update_response(self, logit): # TODO: modify if generate more than one token at a time
+    def update_response(
+        self, logit
+    ):  # TODO: modify if generate more than one token at a time
         next_token = torch.argmax(logit, dim=-1)
         self.response.append(next_token)
-        self.prefix_length += 1 
+        self.prefix_length += 1
         self.max_output_tokens -= 1
 
     def need_remove(self):
@@ -117,9 +129,11 @@ class PackedTasks:
         assert self.num_tasks > 0, "No tasks provided"
         self.tasks = []
         task_types = []
+        self.req_ids = []
         for tid in self.task_ids:
             self.tasks.append(TaskPool.pool[tid])
             task_types.append(TaskPool.pool[tid].task_type)
+            self.req_ids.append(TaskPool.pool[tid].req.request_id)
         if TaskType.Prefill in task_types and TaskType.Decode in task_types:
             self.task_type = TaskType.Hybrid
             raise NotImplementedError("Hybrid task not implemented")
@@ -127,8 +141,6 @@ class PackedTasks:
             self.task_type = task_types[0]
             if self.task_type == TaskType.Prefill:
                 self.pack_tokens()
-            else:
-                self.pack_kvcache()
 
     def pack_tokens(self):
         tokens = []
@@ -137,9 +149,9 @@ class PackedTasks:
                 tokens.append(task.tokens)
         self.tokens = tokens
 
-    def pack_kvcache(self):  # TODO: impl for KVCache
-        kvcaches = []
-        for task in self.tasks:
-            if task.task_type == TaskType.Decode:
-                kvcaches.append(task.kvcache)
-        self.kvcaches = kvcaches
+    # def pack_kvcache(self):  # TODO: impl for KVCache
+    #     kvcaches = []
+    #     for task in self.tasks:
+    #         if task.task_type == TaskType.Decode:
+    #             kvcaches.append(task.kvcache)
+    #     self.kvcaches = kvcaches
