@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request
+from fastapi.responses import Response, StreamingResponse
 import uvicorn
 import asyncio
 import hydra
@@ -12,6 +13,7 @@ from cinfer.global_vars import set_global_variables
 from cinfer.model import Backend
 from cinfer.task import UserRequest, TaskPool, PrefillTask
 from cinfer.cinfer_main import cinfer_init, cinfer_run
+from cinfer.async_response import AsyncResponse, AsyncDataStream
 
 
 app = FastAPI()
@@ -36,18 +38,31 @@ async def create_completion(request: Request):
     return {"message": f"{req.response}"}
 
 
-# TODO: impl for server (streaming response)
+@app.post("/v1/chat/completions")
+async def create_chat_completion(request: Request):
+    params = await request.json()
+    # get request ID
+    req_id = request.headers.get("X-Request-ID")
+    if not req_id:
+        req_id = str(uuid.uuid4())
+    message = params.pop("message")  # will not raise KeyError
+    response = AsyncResponse(req_id)
+    req = UserRequest(message, req_id, async_stream=response.async_stream)
+    TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
+    generator = response.get_generator()
+    return StreamingResponse(generator, media_type="text/event-stream")
 
 
 async def process_queue():
     while True:
-        await asyncio.get_event_loop().run_in_executor(None, task_semaphore.acquire)
+        # await asyncio.get_event_loop().run_in_executor(None, task_semaphore.acquire)
         if not request_queue.empty():
             qsize = request_queue.qsize()
             for i in range(qsize):
                 req = request_queue.get()
                 TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
-        cinfer_run()
+        if len(TaskPool.pool) > 0:
+            cinfer_run()
 
 
 def start_worker():
