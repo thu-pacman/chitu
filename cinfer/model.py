@@ -93,7 +93,18 @@ class Backend:
         )
         Backend.tokenizer = tokenizer
         Backend.formatter = ChatFormat(tokenizer)
-        Backend.cache_manager = KVCacheManager(model_args.n_layers)
+
+        model_parallel_size = fs_init.get_model_parallel_world_size()
+        n_kv_heads = (
+            model_args.n_heads
+            if model_args.n_kv_heads is None
+            else model_args.n_kv_heads
+        )
+        n_local_kv_heads = n_kv_heads // model_parallel_size
+        head_dim = model_args.dim // model_args.n_heads
+        Backend.cache_manager = KVCacheManager(
+            model_args.n_layers, n_local_kv_heads, head_dim
+        )
 
 
 class VarLens:

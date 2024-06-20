@@ -47,6 +47,7 @@ class NormalExecutor(Executor):
                 DecodeTask(
                     self._prefill2decode(tasks.task_ids[it]),
                     tasks.tasks[it].req,
+                    tasks.tasks[it],
                 )
             )
         varlens = VarLens(tasks.tokens, "cuda")
@@ -62,7 +63,6 @@ class NormalExecutor(Executor):
         )
         self.timers("decode").stop()
         for it, task in enumerate(tasks.tasks):
-            # task.update_cache(output_cache[it])
             task.update_response(logits[it])
         Backend.cache_manager.finalize_decode(tasks.req_ids)
         return logits
@@ -86,48 +86,52 @@ class DebugExecutor(Executor):
         super().__init__(args)
 
     def prefill_step(self, tasks: PackedTasks):
+        self.timers("prefill").start()
         varlens = VarLens(tasks.tokens, "cuda")
         tasks.varlens = varlens
         total_len = varlens.total_len
         logits = torch.randn(total_len, Backend.model.vocab_size, device="cuda")
-        output_cache = [
-            torch.randn(
+        for _ in range(Backend.cache_manager.num_layers):
+            xk = torch.randn(
                 [
                     total_len,
-                    Backend.model.layers[0].attention.n_kv_heads,
-                    Backend.model.layers[0].attention.head_dim,
+                    Backend.cache_manager.n_local_kv_heads,
+                    Backend.cache_manager.head_dim,
                 ],
                 device="cuda",
+                dtype=torch.bfloat16,
             )
-            for _ in range(len(Backend.model.layers))
-        ]
+            xv = torch.randn(
+                [
+                    total_len,
+                    Backend.cache_manager.n_local_kv_heads,
+                    Backend.cache_manager.head_dim,
+                ],
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            Backend.cache_manager.tmp_store(xk, xv)
+        self.timers("prefill").stop()
+        Backend.cache_manager.finalize_prefill(tasks.req_ids, varlens)
         new_tasks = []
         for it in range(tasks.num_tasks):
             new_tasks.append(
                 DecodeTask(
                     self._prefill2decode(tasks.task_ids[it]),
                     tasks.tasks[it].req,
-                    output_cache[it],
+                    tasks.tasks[it],
                 )
             )
         return logits
 
     def decode_step(self, tasks: PackedTasks):
+        Backend.cache_manager.prepare(tasks.req_ids)
+        self.timers("decode").start()
         logits = torch.randn([tasks.num_tasks, Backend.model.vocab_size], device="cuda")
-        output_cache = [
-            torch.randn(
-                [
-                    tasks.num_tasks,
-                    Backend.model.layers[0].attention.n_kv_heads,
-                    Backend.model.layers[0].attention.head_dim,
-                ],
-                device="cuda",
-            )
-            for _ in range(len(Backend.model.layers))
-        ]
         for it, task in enumerate(tasks.tasks):
-            task.update_cache(output_cache[it])
             task.update_response(logits[it])
+        self.timers("decode").stop()
+        Backend.cache_manager.finalize_decode(tasks.req_ids)
         return logits
 
     def step(

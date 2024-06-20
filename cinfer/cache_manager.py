@@ -3,10 +3,12 @@ from .global_vars import get_timers
 
 
 class KVCacheManager:
-    def __init__(self, num_layers):
+    def __init__(self, num_layers, n_local_kv_heads, head_dim):
         self.cache = {}
         self.prepared_cache = []
         self.num_layers = num_layers
+        self.n_local_kv_heads = n_local_kv_heads
+        self.head_dim = head_dim
         self.tmp_storage = []
         self.timers = get_timers()
 
@@ -48,7 +50,9 @@ class KVCacheManager:
     # return for every req [layer, seq, n_local_kv_heads, head_dim] * 2 (for k and v)
     def finalize_prefill(self, req_ids, varlen):
         self.timers("cache_finalize_prefill").start()
-        assert len(self.tmp_storage) == self.num_layers
+        assert (
+            len(self.tmp_storage) == self.num_layers
+        ), f"{len(self.tmp_storage)} {self.num_layers}"
         assert len(varlen.cpu_lens) == len(req_ids)
         assert sum(varlen.cpu_lens) == self.tmp_storage[0][0].shape[0]
         for req_id in req_ids:
