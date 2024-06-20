@@ -1,4 +1,5 @@
 import torch
+from .global_vars import get_timers
 
 
 class KVCacheManager:
@@ -7,9 +8,11 @@ class KVCacheManager:
         self.prepared_cache = []
         self.num_layers = num_layers
         self.tmp_storage = []
+        self.timers = get_timers()
 
     # return [layer, num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
     def prepare(self, req_ids):
+        self.timers("cache_prepare").start()
         self.layer_id = 0
         max_seq = 0
         seq_lens = []
@@ -40,9 +43,11 @@ class KVCacheManager:
                     layer_id
                 ][1]
         self.prepared_cache = prepared_cache
+        self.timers("cache_prepare").stop()
 
     # return for every req [layer, seq, n_local_kv_heads, head_dim] * 2 (for k and v)
     def finalize_prefill(self, req_ids, varlen):
+        self.timers("cache_finalize_prefill").start()
         assert len(self.tmp_storage) == self.num_layers
         assert len(varlen.cpu_lens) == len(req_ids)
         assert sum(varlen.cpu_lens) == self.tmp_storage[0][0].shape[0]
@@ -62,9 +67,11 @@ class KVCacheManager:
                 ]
                 start = end
         self.tmp_storage = []
+        self.timers("cache_finalize_prefill").stop()
 
     # return for every req [layer, seq + 1, n_local_kv_heads, head_dim] * 2 (for k and v)
     def finalize_decode(self, req_ids):
+        self.timers("cache_finalize_decode").start()
         assert len(self.prepared_cache) > 0
         for it, req_id in enumerate(req_ids):
             self.cache[req_id] = [None] * self.num_layers
@@ -79,14 +86,7 @@ class KVCacheManager:
                     ],  # [seq + 1, n_local_kv_heads, head_dim]
                 ]
         self.prepared_cache = []
-
-    # def update_cache(self, layer_id, req_id, it):
-    #     self.cache[req_id][layer_id][0] = torch.cat(
-    #         [self.cache[req_id][layer_id][0], self.tmp_storage[layer_id][0][it]], dim=0
-    #     )
-    #     self.cache[req_id][layer_id][1] = torch.cat(
-    #         [self.cache[req_id][layer_id][1], self.tmp_storage[layer_id][1][it]], dim=0
-    #     )
+        self.timers("cache_finalize_decode").stop()
 
     def get(self, key):
         return self.cache.get(key, None)

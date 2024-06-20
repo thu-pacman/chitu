@@ -117,9 +117,6 @@ class PackedTasks:
             self.task_type = task_types[0]
             if self.task_type == TaskType.Prefill:
                 self.pack_tokens()
-            else:
-                # self.pack_kvcache()
-                Backend.cache_manager.prepare(self.req_ids)
 
     def pack_tokens(self):
         tokens = []

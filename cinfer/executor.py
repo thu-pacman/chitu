@@ -2,6 +2,7 @@ import torch
 from .task import PackedTasks, TaskType, DecodeTask
 from .model import Backend, VarLens
 from logging import getLogger
+from .global_vars import get_timers
 
 logger = getLogger(__name__)
 
@@ -15,6 +16,7 @@ class Executor:
             return NormalExecutor(args)
 
     def __init__(self, args):
+        self.timers = get_timers()
         pass
 
     def step(
@@ -35,7 +37,9 @@ class NormalExecutor(Executor):
     def prefill_step(self, tasks: PackedTasks):
         logger.info(f"Prefill step: {tasks.task_ids}")
         varlens = VarLens(tasks.tokens, "cuda")
+        self.timers("prefill").start()
         logits = Backend.model.prefill(tasks.tokens)
+        self.timers("prefill").stop()
         # after prefill, new decode tasks are created
         new_tasks = []
         for it in range(tasks.num_tasks):
@@ -50,10 +54,13 @@ class NormalExecutor(Executor):
         return logits
 
     def decode_step(self, tasks: PackedTasks):
+        Backend.cache_manager.prepare(tasks.req_ids)
         logger.info(f"Decode step: {tasks.task_ids}")
+        self.timers("decode").start()
         logits = Backend.model.decode(
             torch.randint(0, 100, (tasks.num_tasks, 1), device="cuda"), 1
         )
+        self.timers("decode").stop()
         for it, task in enumerate(tasks.tasks):
             # task.update_cache(output_cache[it])
             task.update_response(logits[it])
