@@ -81,10 +81,10 @@ class Backend:
                 checkpoints
             ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
             ckpt_path = checkpoints[get_model_parallel_rank()]
-            logger.info(f"Loading checkpoint from {ckpt_path}")
+            logger.warning(f"Loading checkpoint from {ckpt_path}")
             checkpoint = torch.load(ckpt_path, map_location="cpu")
             model.load_state_dict(checkpoint, strict=False)
-            logger.info(f"Loaded in {time.time() - start_time:.2f} seconds")
+            logger.warning(f"Loaded in {time.time() - start_time:.2f} seconds")
         model = model.to(local_rank)
 
         Backend.model = model
@@ -324,14 +324,7 @@ class Attention(nn.Module):
         xq = xq.view(bs_seq, self.n_local_heads, self.head_dim)
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim)
-        # logger.info(f"before rotary emb: {xq}")
-        # logger.info(f"before rotary emb: {xk}")
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)  # TODO
-        # logger.info(f"after rotary emb: {xq}")
-        # logger.info(f"after rotary emb: {xk}")
-        # print(f"after rotary emb: {torch.sum(xq)}")
-        # print(f"after rotary emb: {torch.sum(xk)}")
-        # exit()
         Backend.cache_manager.tmp_store(xk, xv)
         output = flash_attn.flash_attn_varlen_func(
             xq,
@@ -544,35 +537,18 @@ class Transformer(nn.Module):
         tokens = torch.from_numpy(np.concatenate(tokens)).to("cuda")
         mask = None
         freqs_cis = self.prepare_freqs_cis_prefill(varlens)
-        # print(self.freqs_cis.dtype, freqs_cis.dtype)
         h = self.tok_embeddings(tokens)
-        # assert torch.allclose(h[: h.shape[0] // 2], h[h.shape[0] // 2 :])
-        # logger.info(f"Prefill hidden and freqs: {h}  {freqs_cis} {freqs_cis.shape}")
-        # logger.info(f"prefill tokens: {tokens}")
-        # exit()
-        cnt = 0
         for layer in self.layers:
             h = layer(h, 0, freqs_cis, mask, varlens)
-            # print(cnt)
-            # assert torch.allclose(h[: h.shape[0] // 2], h[h.shape[0] // 2 :])
-            cnt += 1
-            # if cnt == 5:
-            #     exit()
         h = self.norm(h)
-        # print("h", h)
         output = self.output(h).float()
-        # print("output", output)
         return output
 
     @torch.inference_mode()
-    def decode(self, tokens, seq_lens):  # TODO: different start pos for reqs
-        batch_size = tokens.shape[0]
+    def decode(self, tokens, seq_lens):
         mask = None
         # generate different freqs_cis for each request, [num_req, other_freq_dim]
         freqs_cis = self.prepare_freqs_cis_decode(seq_lens)
-        # print(self.freqs_cis.dtype, freqs_cis.dtype)
-        # exit()
-        # logger.info(f"decode tokens: {tokens}")
         h = self.tok_embeddings(tokens)
         for layer in self.layers:
             h = layer(h, 1, freqs_cis, mask)

@@ -72,7 +72,7 @@ class PrefillTask(Task):
     def __init__(self, task_id: str, req: UserRequest, message: str, priority: int = 1):
         super().__init__(task_id, req, priority)
         self.message = message
-        # logger.info(f"Prefill task: {message}")
+        logger.info(f"Prefill task: {message}")
         if isinstance(message, str):
             self.tokens = Backend.tokenizer.encode(message, bos=True, eos=False)
         else:
@@ -88,12 +88,8 @@ class PrefillTask(Task):
 
     def update_response(self, logit):
         self.next_token = torch.argmax(logit, dim=-1).item()
-        # logger.info(
-        #     f"prefill logit {logit.shape} {self.next_token} {Backend.tokenizer.decode([self.next_token])} {self.req.request_id}"
-        # )
-
-        # exit()
-        # self.response.append(next_token)
+        if self.req.async_stream:
+            self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
 
     def need_remove(self):
         return True
@@ -126,16 +122,14 @@ class DecodeTask(Task):
         self, logit
     ):  # TODO: modify if generate more than one token at a time
         self.next_token = torch.argmax(logit, dim=-1).item()
-        # logger.info(
-        #     f"decode logit {logit.shape} {self.next_token} {Backend.tokenizer.decode([self.next_token])} {self.req.request_id}"
-        # )
         self.response.append(self.next_token)
         self.prefix_length += 1
         self.max_output_tokens -= 1
         if self.req.async_stream:
-            self.req.async_stream.add_data(Backend.tokenizer.decode([next_token]))
+            self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
 
     def need_remove(self):
+        # return len(self.response) >= self.req.max_new_tokens
         return (
             torch.isin(self.response[-1], Backend.tokenizer.stop_tokens)
             or len(self.response) >= self.req.max_new_tokens
@@ -152,8 +146,6 @@ class PackedTasks:
         self.req_ids = []
         for tid in self.task_ids:
             self.tasks.append(TaskPool.pool[tid])
-            print(TaskPool.pool[tid], type(TaskPool.pool[tid]))
-            print(TaskPool.pool[tid].task_type)
             task_types.append(TaskPool.pool[tid].task_type)
             self.req_ids.append(TaskPool.pool[tid].req.request_id)
         if TaskType.Prefill in task_types and TaskType.Decode in task_types:

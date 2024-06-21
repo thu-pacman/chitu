@@ -35,12 +35,10 @@ class NormalExecutor(Executor):
         super().__init__(args)
 
     def prefill_step(self, tasks: PackedTasks):
-        # logger.info(f"Prefill step: {tasks.task_ids}")
+        logger.info(f"Prefill step: {tasks.task_ids}")
         varlens = VarLens(tasks.tokens, "cuda")
         self.timers("prefill").start()
         logits = Backend.model.prefill(tasks.tokens)
-        print(logits.shape)
-        # logger.info(f"prefill {logits}")
         self.timers("prefill").stop()
         # after prefill, new decode tasks are created
         new_tasks = []
@@ -76,17 +74,11 @@ class NormalExecutor(Executor):
         new_tokens = torch.tensor(
             new_tokens, device="cuda", dtype=torch.long
         ).unsqueeze(1)
-        # new_tokens = torch.tensor(
-        #     [Backend.tokenizer.pad_id] * tasks.num_tasks,
-        #     device="cuda",
-        #     dtype=torch.long,
-        # ).unsqueeze(1)
         logits = Backend.model.decode(new_tokens, seq_lens)
         self.timers("decode").stop()
         for it, task in enumerate(tasks.tasks):
             task.update_response(logits[it])
         Backend.cache_manager.finalize_decode(tasks.req_ids)
-        # exit()
         return logits
 
     def step(
@@ -101,7 +93,6 @@ class NormalExecutor(Executor):
             raise NotImplementedError  # Hybrid task not implemented
 
 
-# TODO: impl for Executor
 class DebugExecutor(Executor):
 
     def __init__(self, args):

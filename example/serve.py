@@ -15,6 +15,8 @@ from cinfer.task import UserRequest, TaskPool, PrefillTask
 from cinfer.cinfer_main import cinfer_init, cinfer_run
 from cinfer.async_response import AsyncResponse, AsyncDataStream
 
+import logging
+
 
 app = FastAPI()
 
@@ -45,7 +47,7 @@ async def create_chat_completion(request: Request):
     req_id = request.headers.get("X-Request-ID")
     if not req_id:
         req_id = str(uuid.uuid4())
-    message = params.pop("message")  # will not raise KeyError
+    message = params.pop("messages")  # will not raise KeyError
     response = AsyncResponse(req_id)
     req = UserRequest(message, req_id, async_stream=response.async_stream)
     TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
@@ -84,4 +86,6 @@ def main(args: DictConfig):
 
 
 if __name__ == "__main__":
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.WARNING)
     main()
