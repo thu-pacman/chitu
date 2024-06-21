@@ -35,16 +35,19 @@ class NormalExecutor(Executor):
         super().__init__(args)
 
     def prefill_step(self, tasks: PackedTasks):
-        logger.info(f"Prefill step: {tasks.task_ids}")
+        # logger.info(f"Prefill step: {tasks.task_ids}")
         varlens = VarLens(tasks.tokens, "cuda")
         self.timers("prefill").start()
         logits = Backend.model.prefill(tasks.tokens)
+        print(logits.shape)
         # logger.info(f"prefill {logits}")
         self.timers("prefill").stop()
         # after prefill, new decode tasks are created
         new_tasks = []
+        start = 0
         for it in range(tasks.num_tasks):
-            tasks.tasks[it].update_response(logits[it])
+            start += varlens.cpu_lens[it]
+            tasks.tasks[it].update_response(logits[start - 1])
             new_tasks.append(
                 DecodeTask(
                     self._prefill2decode(tasks.task_ids[it]),
@@ -59,7 +62,7 @@ class NormalExecutor(Executor):
 
     def decode_step(self, tasks: PackedTasks):
         Backend.cache_manager.prepare(tasks.req_ids)
-        logger.info(f"Decode step: {tasks.task_ids}")
+        # logger.info(f"Decode step: {tasks.task_ids}")
         self.timers("decode").start()
         seq_lens = []
         for req_id in tasks.req_ids:
@@ -83,6 +86,7 @@ class NormalExecutor(Executor):
         for it, task in enumerate(tasks.tasks):
             task.update_response(logits[it])
         Backend.cache_manager.finalize_decode(tasks.req_ids)
+        # exit()
         return logits
 
     def step(

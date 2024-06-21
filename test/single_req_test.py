@@ -10,18 +10,22 @@ from logging import getLogger
 
 logger = getLogger(__name__)
 
-msg = [
-    {"role": "user", "content": "I am going to Paris, what should I see?"},
-    {
-        "role": "assistant",
-        "content": """\
+msgs = [
+    [{"role": "user", "content": "what is the recipe of mayonnaise?"}],
+    # [{"role": "user", "content": "what is the recipe of mayonnaise?"}],
+    [
+        {"role": "user", "content": "I am going to Paris, what should I see?"},
+        {
+            "role": "assistant",
+            "content": """\
         Paris, the capital of France, is known for its stunning architecture, art museums, historical landmarks, and romantic atmosphere. Here are some of the top attractions to see in Paris:
         1. The Eiffel Tower: The iconic Eiffel Tower is one of the most recognizable landmarks in the world and offers breathtaking views of the city.
         2. The Louvre Museum: The Louvre is one of the world's largest and most famous museums, housing an impressive collection of art and artifacts, including the Mona Lisa.
         3. Notre-Dame Cathedral: This beautiful cathedral is one of the most famous landmarks in Paris and is known for its Gothic architecture and stunning stained glass windows.
         These are just a few of the many attractions that Paris has to offer. With so much to see and do, it's no wonder that Paris is one of the most popular tourist destinations in the world.""",
-    },
-    {"role": "user", "content": "What is so great about #1?"},
+        },
+        {"role": "user", "content": "What is so great about #1?"},
+    ],
 ]
 # msg = "what is the recipe of mayonnaise?"
 
@@ -33,7 +37,7 @@ def gen_reqs(num_reqs, prompt_len, max_new_tokens):
         # msg = ""
         # for j in range(prompt_len):
         #     msg += fake.word() + " "
-        req = UserRequest(msg, f"request_{i}", max_new_tokens=max_new_tokens)
+        req = UserRequest(msgs[i], f"request_{i}", max_new_tokens=max_new_tokens)
         reqs.append(req)
     return reqs
 
@@ -48,7 +52,7 @@ def main(args: DictConfig):
     cinfer_init(args)
 
     reqs = gen_reqs(
-        num_reqs=1, prompt_len=100, max_new_tokens=args.request.max_new_tokens
+        num_reqs=2, prompt_len=100, max_new_tokens=args.request.max_new_tokens
     )
     for req in reqs:
         TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))

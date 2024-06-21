@@ -69,7 +69,7 @@ class PrefillTask(Task):
     def __init__(self, task_id: str, req: UserRequest, message: str, priority: int = 1):
         super().__init__(task_id, req, priority)
         self.message = message
-        logger.info(f"Prefill task: {message}")
+        # logger.info(f"Prefill task: {message}")
         if isinstance(message, str):
             self.tokens = Backend.tokenizer.encode(message, bos=True, eos=False)
         else:
@@ -85,9 +85,9 @@ class PrefillTask(Task):
 
     def update_response(self, logit):
         self.next_token = torch.argmax(logit, dim=-1).item()
-        logger.info(
-            f"prefill logit {logit.shape} {self.next_token} {Backend.tokenizer.decode([self.next_token])}"
-        )
+        # logger.info(
+        #     f"prefill logit {logit.shape} {self.next_token} {Backend.tokenizer.decode([self.next_token])} {self.req.request_id}"
+        # )
 
         # exit()
         # self.response.append(next_token)
@@ -122,7 +122,9 @@ class DecodeTask(Task):
         self, logit
     ):  # TODO: modify if generate more than one token at a time
         self.next_token = torch.argmax(logit, dim=-1).item()
-        logger.info(f"decode logit {logit.shape} {self.next_token}")
+        # logger.info(
+        #     f"decode logit {logit.shape} {self.next_token} {Backend.tokenizer.decode([self.next_token])} {self.req.request_id}"
+        # )
         self.response.append(self.next_token)
         self.prefix_length += 1
         self.max_output_tokens -= 1
