@@ -58,8 +58,14 @@ class NormalExecutor(Executor):
         Backend.cache_manager.prepare(tasks.req_ids)
         logger.info(f"Decode step: {tasks.task_ids}")
         self.timers("decode").start()
+        seq_lens = []
+        for req_id in tasks.req_ids:
+            seq_len = Backend.cache_manager.cache[req_id][
+                Backend.cache_manager.layer_id
+            ][0].shape[0]
+            seq_lens.append(seq_len)
         logits = Backend.model.decode(
-            torch.randint(0, 100, (tasks.num_tasks, 1), device="cuda"), 1
+            torch.randint(0, 100, (tasks.num_tasks, 1), device="cuda"), seq_lens
         )
         self.timers("decode").stop()
         for it, task in enumerate(tasks.tasks):
