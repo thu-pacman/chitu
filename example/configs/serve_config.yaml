@@ -13,7 +13,7 @@ request:
 executor:
   type: debug
 scheduler:
-  type: deadline
+  type: fcfs
   fcfs:
     num_tasks: 2
     enable_hybrid: False

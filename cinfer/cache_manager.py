@@ -138,14 +138,12 @@ class KVCache:
     def init(self, cache_k, cache_v):
         assert not self.inited
         # self.check_shapes(cache_k, cache_v)
-        print("cache init:", cache_k.shape)
 
         self.cache_k = cache_k
         self.cache_v = cache_v
         self.inited = True
 
     def extend(self, new_cache_k, new_cache_v):
-        print("cache extend:", new_cache_k.shape)
         assert self.inited
         self.cache_k = torch.cat([self.cache_k, new_cache_k], dim=0)
         self.cache_v = torch.cat([self.cache_v, new_cache_v], dim=0)

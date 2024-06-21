@@ -42,12 +42,16 @@ class NormalExecutor(Executor):
         self.timers("prefill").stop()
         # after prefill, new decode tasks are created
         new_tasks = []
+        start = 0
         for it in range(tasks.num_tasks):
+            start += varlens.cpu_lens[it]
+            tasks.tasks[it].update_response(logits[start - 1])
             new_tasks.append(
                 DecodeTask(
                     self._prefill2decode(tasks.task_ids[it]),
                     tasks.tasks[it].req,
                     tasks.tasks[it],
+                    tasks.tasks[it].next_token,
                 )
             )
         varlens = VarLens(tasks.tokens, "cuda")
@@ -56,11 +60,21 @@ class NormalExecutor(Executor):
 
     def decode_step(self, tasks: PackedTasks):
         Backend.cache_manager.prepare(tasks.req_ids)
-        logger.info(f"Decode step: {tasks.task_ids}")
+        # logger.info(f"Decode step: {tasks.task_ids}")
         self.timers("decode").start()
-        logits = Backend.model.decode(
-            torch.randint(0, 100, (tasks.num_tasks, 1), device="cuda"), 1
-        )
+        seq_lens = []
+        for req_id in tasks.req_ids:
+            seq_len = Backend.cache_manager.cache[req_id][
+                Backend.cache_manager.layer_id
+            ][0].shape[0]
+            seq_lens.append(seq_len)
+        new_tokens = []
+        for task in tasks.tasks:
+            new_tokens.append(task.next_token)
+        new_tokens = torch.tensor(
+            new_tokens, device="cuda", dtype=torch.long
+        ).unsqueeze(1)
+        logits = Backend.model.decode(new_tokens, seq_lens)
         self.timers("decode").stop()
         for it, task in enumerate(tasks.tasks):
             task.update_response(logits[it])
@@ -79,7 +93,6 @@ class NormalExecutor(Executor):
             raise NotImplementedError  # Hybrid task not implemented
 
 
-# TODO: impl for Executor
 class DebugExecutor(Executor):
 
     def __init__(self, args):

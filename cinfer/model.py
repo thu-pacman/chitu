@@ -81,11 +81,11 @@ class Backend:
                 checkpoints
             ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
             ckpt_path = checkpoints[get_model_parallel_rank()]
+            logger.warning(f"Loading checkpoint from {ckpt_path}")
             checkpoint = torch.load(ckpt_path, map_location="cpu")
             model.load_state_dict(checkpoint, strict=False)
-            logger.info(f"Loaded in {time.time() - start_time:.2f} seconds")
-        else:
-            model = model.to(local_rank)
+            logger.warning(f"Loaded in {time.time() - start_time:.2f} seconds")
+        model = model.to(local_rank)
 
         Backend.model = model
         tokenizer.stop_tokens = torch.tensor(
@@ -311,7 +311,7 @@ class Attention(nn.Module):
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
-    def forward_with_input_cache(
+    def prefill_forward(
         self,
         x: torch.Tensor,
         varlens,
@@ -334,6 +334,7 @@ class Attention(nn.Module):
             varlens.prefix_lens,
             varlens.max_len,
             varlens.max_len,
+            causal=True,
         ).view(bs_seq, -1)
         return self.wo(output)
 
@@ -346,11 +347,15 @@ class Attention(nn.Module):
         assert seqlen == 1, "decode_forward only supports single token decoding"
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
+        xq = xq.view(-1, self.n_local_heads, self.head_dim)
+        xk = xk.view(-1, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(-1, self.n_local_kv_heads, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
         cache = Backend.cache_manager.update_prepare_cache(xk, xv)
         cache_k = cache[0]
@@ -378,7 +383,7 @@ class Attention(nn.Module):
         if self.torch_cache:
             return self.forward_with_torch_cache(x, start_pos, freqs_cis, mask)
         elif start_pos == 0:
-            return self.forward_with_input_cache(x, varlens, start_pos, freqs_cis, mask)
+            return self.prefill_forward(x, varlens, start_pos, freqs_cis, mask)
         else:
             return self.decode_forward(x, freqs_cis)
 
@@ -475,7 +480,7 @@ class Transformer(nn.Module):
             params.dim // params.n_heads,
             params.max_seq_len * 2,
             params.rope_theta,
-        )
+        ).cuda()
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
@@ -504,14 +509,34 @@ class Transformer(nn.Module):
         output = self.output(h).float()
         return output
 
+    def prepare_freqs_cis_prefill(self, varlens):
+        prepared_freqs_cis = torch.empty(
+            [varlens.total_len, self.freqs_cis.shape[1]],
+            device="cuda",
+            dtype=torch.complex64,
+        )
+        start = 0
+        for length in varlens.cpu_lens:
+            prepared_freqs_cis[start : start + length] = self.freqs_cis[:length]
+            start += length
+        return prepared_freqs_cis
+
+    def prepare_freqs_cis_decode(self, seq_lens):
+        prepared_freqs_cis = torch.empty(
+            [len(seq_lens), self.freqs_cis.shape[1]],
+            device="cuda",
+            dtype=torch.complex64,
+        )
+        for i, seq_len in enumerate(seq_lens):
+            prepared_freqs_cis[i] = self.freqs_cis[seq_len]
+        return prepared_freqs_cis
+
     @torch.inference_mode()
     def prefill(self, tokens: list[int]):
         varlens = VarLens(tokens, "cuda")
         tokens = torch.from_numpy(np.concatenate(tokens)).to("cuda")
         mask = None
-        # freqs_cis = None
-        freqs_cis = self.freqs_cis[: varlens.total_len]
-        freqs_cis = freqs_cis.to("cuda")
+        freqs_cis = self.prepare_freqs_cis_prefill(varlens)
         h = self.tok_embeddings(tokens)
         for layer in self.layers:
             h = layer(h, 0, freqs_cis, mask, varlens)
@@ -520,16 +545,13 @@ class Transformer(nn.Module):
         return output
 
     @torch.inference_mode()
-    def decode(self, tokens, start_pos=0):  # TODO: different start pos for reqs
-        # tokens = torch.from_numpy(np.concatenate(tokens)).to("cuda")
-        batch_size = tokens.shape[0]
+    def decode(self, tokens, seq_lens):
         mask = None
-        # freqs_cis = None
-        freqs_cis = self.freqs_cis[start_pos : start_pos + 1]
-        freqs_cis = freqs_cis.to("cuda")
+        # generate different freqs_cis for each request, [num_req, other_freq_dim]
+        freqs_cis = self.prepare_freqs_cis_decode(seq_lens)
         h = self.tok_embeddings(tokens)
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(h, 1, freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h).float()
         return output
