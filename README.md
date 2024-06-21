@@ -37,4 +37,11 @@ curl localhost:21002/v1/completions   -H "Content-Type: application/json"  -d '{
       }
     ]
   }'
+
+
+# test chat_completion request
+# 1. start serve at localhost:21002
+grun torchrun --nproc_per_node 1 example/serve.py
+# 2. send stream type request
+python test/chat_completions_req.py
 ```
