@@ -39,15 +39,18 @@ class NormalExecutor(Executor):
         varlens = VarLens(tasks.tokens, "cuda")
         self.timers("prefill").start()
         logits = Backend.model.prefill(tasks.tokens)
+        # logger.info(f"prefill {logits}")
         self.timers("prefill").stop()
         # after prefill, new decode tasks are created
         new_tasks = []
         for it in range(tasks.num_tasks):
+            tasks.tasks[it].update_response(logits[it])
             new_tasks.append(
                 DecodeTask(
                     self._prefill2decode(tasks.task_ids[it]),
                     tasks.tasks[it].req,
                     tasks.tasks[it],
+                    tasks.tasks[it].next_token,
                 )
             )
         varlens = VarLens(tasks.tokens, "cuda")
@@ -64,9 +67,18 @@ class NormalExecutor(Executor):
                 Backend.cache_manager.layer_id
             ][0].shape[0]
             seq_lens.append(seq_len)
-        logits = Backend.model.decode(
-            torch.randint(0, 100, (tasks.num_tasks, 1), device="cuda"), seq_lens
-        )
+        new_tokens = []
+        for task in tasks.tasks:
+            new_tokens.append(task.next_token)
+        new_tokens = torch.tensor(
+            new_tokens, device="cuda", dtype=torch.long
+        ).unsqueeze(1)
+        # new_tokens = torch.tensor(
+        #     [Backend.tokenizer.pad_id] * tasks.num_tasks,
+        #     device="cuda",
+        #     dtype=torch.long,
+        # ).unsqueeze(1)
+        logits = Backend.model.decode(new_tokens, seq_lens)
         self.timers("decode").stop()
         for it, task in enumerate(tasks.tasks):
             task.update_response(logits[it])

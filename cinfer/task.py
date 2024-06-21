@@ -32,9 +32,9 @@ class TaskPool:
     def remove(task_id):
         assert task_id in TaskPool.pool, "Task not found in pool"
         if isinstance(TaskPool.pool[task_id], DecodeTask):
-            TaskPool.pool[task_id].req.response = [
-                Backend.tokenizer.decode([x]) for x in TaskPool.pool[task_id].response
-            ]
+            TaskPool.pool[task_id].req.response = Backend.tokenizer.decode(
+                TaskPool.pool[task_id].response
+            )
             TaskPool.pool[task_id].req.completed.set()
         ret = TaskPool.pool.pop(task_id)
         TaskPool.id_list.remove(task_id)
@@ -83,6 +83,15 @@ class PrefillTask(Task):
             + self.max_output_tokens * 1000 * 1000
         )
 
+    def update_response(self, logit):
+        self.next_token = torch.argmax(logit, dim=-1).item()
+        logger.info(
+            f"prefill logit {logit.shape} {self.next_token} {Backend.tokenizer.decode([self.next_token])}"
+        )
+
+        # exit()
+        # self.response.append(next_token)
+
     def need_remove(self):
         return True
 
@@ -93,6 +102,7 @@ class DecodeTask(Task):
         task_id: str,
         req: UserRequest,
         prefill_task: PrefillTask,
+        next_token,
         priority: int = 1,
     ):
         super().__init__(task_id, req, priority)
@@ -101,7 +111,8 @@ class DecodeTask(Task):
         self.max_output_tokens = self.prefill.max_output_tokens
         self.sched_ddl = self.prefill.sched_ddl
         self.task_type = TaskType.Decode
-        self.response = []
+        self.response = [next_token]
+        self.next_token = next_token
 
     # def update_cache(self, new_kvcache):  # TODO: impl for KVCache
     #     # self.kvcache.update(new_kvcache)
@@ -110,8 +121,9 @@ class DecodeTask(Task):
     def update_response(
         self, logit
     ):  # TODO: modify if generate more than one token at a time
-        next_token = torch.argmax(logit, dim=-1)
-        self.response.append(next_token)
+        self.next_token = torch.argmax(logit, dim=-1).item()
+        logger.info(f"decode logit {logit.shape} {self.next_token}")
+        self.response.append(self.next_token)
         self.prefix_length += 1
         self.max_output_tokens -= 1
 
