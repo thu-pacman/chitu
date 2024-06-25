@@ -11,13 +11,12 @@ logger = getLogger(__name__)
 
 
 class UserRequest:
-    def __init__(self, message, request_id, max_new_tokens=50, async_stream=None):
+    def __init__(self, message, request_id, max_new_tokens=50):
         self.message = message
         self.request_id = request_id
         self.completed = asyncio.Event()
         self.max_new_tokens = max_new_tokens
-        self.response = []
-        self.async_stream = async_stream
+        self.async_stream = AsyncDataStream()
 
 
 class TaskPool:
@@ -34,11 +33,7 @@ class TaskPool:
     def remove(task_id):
         assert task_id in TaskPool.pool, "Task not found in pool"
         if isinstance(TaskPool.pool[task_id], DecodeTask):
-            TaskPool.pool[task_id].req.response = Backend.tokenizer.decode(
-                TaskPool.pool[task_id].response
-            )
-            if TaskPool.pool[task_id].req.async_stream:
-                TaskPool.pool[task_id].req.async_stream.send_stop_signal()
+            TaskPool.pool[task_id].req.async_stream.send_stop_signal()
             TaskPool.pool[task_id].req.completed.set()
         ret = TaskPool.pool.pop(task_id)
         TaskPool.id_list.remove(task_id)
@@ -88,8 +83,7 @@ class PrefillTask(Task):
 
     def update_response(self, logit):
         self.next_token = torch.argmax(logit, dim=-1).item()
-        if self.req.async_stream:
-            self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
+        self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
 
         # logger.warning(f"prefill token {(Backend.tokenizer.decode([self.next_token]))}")
 
@@ -123,8 +117,7 @@ class DecodeTask(Task):
         self.response.append(self.next_token)
         self.prefix_length += 1
         self.max_output_tokens -= 1
-        if self.req.async_stream:
-            self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
+        self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
         # logger.warning(f"decode token {(Backend.tokenizer.decode([self.next_token]))}")
 
     def need_remove(self):
