@@ -11,13 +11,13 @@ logger = getLogger(__name__)
 
 
 class UserRequest:
-    def __init__(self, message, request_id, max_new_tokens=50, async_stream=None):
+    def __init__(self, message, request_id, max_new_tokens=50):
         self.message = message
         self.request_id = request_id
         self.completed = asyncio.Event()
         self.max_new_tokens = max_new_tokens
         self.response = []
-        self.async_stream = async_stream
+        self.async_stream = AsyncDataStream()
 
 
 class TaskPool:

@@ -1,9 +1,10 @@
 import asyncio
 import threading
+import json
 from pydantic import BaseModel
 
 
-class ResponseDataChunk(BaseModel):
+class ChatCompletionResponse(BaseModel):
     id: str
     choices: list
 
@@ -43,17 +44,33 @@ class AsyncDataStream:
 
 
 class AsyncResponse:
-    def __init__(self, id: str):
-        self.id = id
-        self.async_stream = AsyncDataStream()
+    def __init__(self, req):
+        self.id = req.request_id
+        self.async_stream = req.async_stream
 
-    async def generate_response(self):
+    def stream_generator(self):
+        async def stream_response():
+            async for data in self.async_stream:
+                chunk = ChatCompletionResponse(
+                    id=self.id, choices=[{"index": 0, "delta": {"content": f"{data}"}}]
+                )
+                data = chunk.model_dump_json()
+                yield f"data: {data}\n\n"
+            # TODO add "usage": {"prompt_tokens":,"total_tokens":,"completion_tokens:"}
+            yield "data: [DONE]\n\n"
+
+        return stream_response()
+
+    async def full_generator(self):
+        text = ""
         async for data in self.async_stream:
-            chunk = ResponseDataChunk(
-                id=self.id, choices=[{"index": 0, "delta": {"content": f"{data}"}}]
-            )
-            data = chunk.model_dump_json()
-            yield f"data: {data}\n\n"
+            text += data
 
-    def get_generator(self):
-        return self.generate_response()
+        # TODO add "usage": {"prompt_tokens":,"total_tokens":,"completion_tokens:"}
+        full_response = ChatCompletionResponse(
+            id=self.id,
+            choices=[
+                {"index": 0, "message": {"role": "assistant", "content": f"{text}"}}
+            ],
+        )
+        return full_response

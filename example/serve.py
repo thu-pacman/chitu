@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, JSONResponse
 import uvicorn
 import asyncio
 import hydra
@@ -48,11 +48,17 @@ async def create_chat_completion(request: Request):
     if not req_id:
         req_id = str(uuid.uuid4())
     message = params.pop("messages")  # will not raise KeyError
-    response = AsyncResponse(req_id)
-    req = UserRequest(message, req_id, async_stream=response.async_stream)
+    stream = params.pop("stream", False)
+    req = UserRequest(message, req_id)
+    response = AsyncResponse(req)
     TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
-    generator = response.get_generator()
-    return StreamingResponse(generator, media_type="text/event-stream")
+    if stream:
+        return StreamingResponse(
+            response.stream_generator(), media_type="text/event-stream"
+        )
+    else:
+        full_response = await response.full_generator()
+        return JSONResponse(full_response.model_dump())
 
 
 async def process_queue():
