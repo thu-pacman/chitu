@@ -114,10 +114,6 @@ class DecodeTask(Task):
         self.next_token = next_token
         TaskPool.add(self)
 
-    # def update_cache(self, new_kvcache):  # TODO: impl for KVCache
-    #     # self.kvcache.update(new_kvcache)
-    #     pass
-
     def update_response(
         self, logit
     ):  # TODO: modify if generate more than one token at a time
@@ -129,11 +125,12 @@ class DecodeTask(Task):
             self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
 
     def need_remove(self):
-        # return len(self.response) >= self.req.max_new_tokens
-        return (
-            torch.isin(self.response[-1], Backend.tokenizer.stop_tokens)
-            or len(self.response) >= self.req.max_new_tokens
-        )
+        if Backend.args.stop_with_eos:
+            return (
+                torch.isin(self.response[-1], Backend.tokenizer.stop_tokens)
+                or len(self.response) >= self.req.max_new_tokens
+            )
+        return len(self.response) >= self.req.max_new_tokens
 
 
 class PackedTasks:

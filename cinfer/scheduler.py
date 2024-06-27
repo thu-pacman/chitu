@@ -38,6 +38,7 @@ class Scheduler:
     def update(self):
         for task_id in self.ret_task_ids:
             if TaskPool.pool[task_id].need_remove():
+                logger.warning(f"Task {task_id} is done")
                 assert TaskPool.remove(task_id), "Task not found in pool"
         self.ret_task_ids = []  # reset scheduled tasks
 
@@ -74,7 +75,7 @@ class FcfsScheduler(Scheduler):
             self.ret_task_ids = list(filtered_task_ids)[: self.num_tasks]
         if filter_task_type == TaskType.Prefill:
             self.ret_task_ids = self.ret_task_ids[:1]
-        logger.info(f"Selected task_ids: {self.ret_task_ids}")
+        # logger.info(f"Selected task_ids: {self.ret_task_ids}")
         return self.ret_task_ids
 
 
@@ -108,7 +109,7 @@ class PrefillFirstScheduler(Scheduler):
             self.ret_task_ids.extend(
                 list(decode_task_ids)[: self.num_tasks - len(self.ret_task_ids)]
             )
-        logger.info(f"Selected task_ids: {self.ret_task_ids}")
+        # logger.info(f"Selected task_ids: {self.ret_task_ids}")
         return self.ret_task_ids
 
 
@@ -158,7 +159,7 @@ class StrideScheduler(Scheduler):
         # reset sched_score of selected tasks
         for task_id in self.ret_task_ids:
             TaskPool.pool[task_id].sched_score = 0
-        logger.info(f"Selected task_ids: {self.ret_task_ids}")
+        # logger.info(f"Selected task_ids: {self.ret_task_ids}")
         return self.ret_task_ids
 
 
@@ -196,7 +197,7 @@ class DdlScheduler(Scheduler):
             self.ret_task_ids = sorted(
                 list(filtered_task_ids), key=lambda x: TaskPool.pool[x].sched_ddl
             )[: self.num_tasks]
-        logger.info(f"Selected task_ids: {self.ret_task_ids}")
+        # logger.info(f"Selected task_ids: {self.ret_task_ids}")
         return self.ret_task_ids
 
 
@@ -234,7 +235,7 @@ class PrefixAlignScheduler(Scheduler):
             self.ret_task_ids = sorted(
                 list(filtered_task_ids), key=lambda x: TaskPool.pool[x].prefix_length
             )[: self.num_tasks]
-        logger.info(f"Selected task_ids: {self.ret_task_ids}")
+        # logger.info(f"Selected task_ids: {self.ret_task_ids}")
         return self.ret_task_ids
 
 
@@ -282,5 +283,5 @@ class BalanceScheduler(Scheduler):
                 if len(prefill_task_ids) > 0
                 else decode_task_ids[: self.num_tasks]
             )
-        logger.info(f"Selected task_ids: {self.ret_task_ids}")
+        # logger.info(f"Selected task_ids: {self.ret_task_ids}")
         return self.ret_task_ids

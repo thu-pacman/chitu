@@ -7,6 +7,9 @@ __global__ void matvec_bfloat16(const __nv_bfloat16 *__restrict__ matrix,
 
     int output_id = blockIdx.x * blockDim.x + threadIdx.x;
     __nv_bfloat16 sum = __float2bfloat16(0.0f);
+    #ifdef AVOID_ZERO
+    const __nv_bfloat16 zero = __float2bfloat16(0.0f);
+    #endif
 
     int i = blockIdx.y;
     {
@@ -16,6 +19,9 @@ __global__ void matvec_bfloat16(const __nv_bfloat16 *__restrict__ matrix,
         if (output_id < num_output) {
 #pragma unroll
             for (int j = 0; j < BLOCK_SIZE; ++j) {
+                #ifdef AVOID_ZERO
+                if (shared_vector[j] == zero) continue;
+                #endif
                 int input_id = base + j;
                 sum = __hadd(sum, __hmul((__ldg(&matrix[num_output * input_id + output_id])),
                                          shared_vector[j]));

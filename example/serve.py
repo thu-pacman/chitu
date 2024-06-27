@@ -16,6 +16,10 @@ from cinfer.cinfer_main import cinfer_init, cinfer_run
 from cinfer.async_response import AsyncResponse, AsyncDataStream
 
 import logging
+from logging import getLogger
+
+
+logger = getLogger(__name__)
 
 
 app = FastAPI()
@@ -25,7 +29,7 @@ request_queue = Queue()
 task_semaphore = Semaphore(0)
 
 
-@app.post("/v1/completions")
+@app.post("/v1/chat/completions")
 async def create_completion(request: Request):
     params = await request.json()
     # get request ID
@@ -33,14 +37,19 @@ async def create_completion(request: Request):
     if not request_id:
         request_id = str(uuid.uuid4())
     message = params["messages"]
-    req = UserRequest(message, request_id)
+    try:
+        max_new_tokens = params["max_new_tokens"]
+    except KeyError:
+        max_new_tokens = 512
+    req = UserRequest(message, request_id, max_new_tokens=max_new_tokens)
     request_queue.put(req)  # Add task to the queue
     task_semaphore.release()  # Release the semaphore to signal the worker
     await req.completed.wait()  # Wait until the task is completed
+    logger.warning(f"Response: {req.response}")
     return {"message": f"{req.response}"}
 
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/completions")
 async def create_chat_completion(request: Request):
     params = await request.json()
     # get request ID
@@ -49,7 +58,16 @@ async def create_chat_completion(request: Request):
         req_id = str(uuid.uuid4())
     message = params.pop("messages")  # will not raise KeyError
     response = AsyncResponse(req_id)
-    req = UserRequest(message, req_id, async_stream=response.async_stream)
+    try:
+        max_new_tokens = params["max_new_tokens"]
+    except KeyError:
+        max_new_tokens = 512
+    req = UserRequest(
+        message,
+        req_id,
+        async_stream=response.async_stream,
+        max_new_tokens=max_new_tokens,
+    )
     TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
     generator = response.get_generator()
     return StreamingResponse(generator, media_type="text/event-stream")

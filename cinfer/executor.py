@@ -35,7 +35,7 @@ class NormalExecutor(Executor):
         super().__init__(args)
 
     def prefill_step(self, tasks: PackedTasks):
-        logger.info(f"Prefill step: {tasks.task_ids}")
+        # logger.warning(f"Prefill step: {tasks.task_ids}")
         varlens = VarLens(tasks.tokens, "cuda")
         self.timers("prefill").start()
         logits = Backend.model.prefill(tasks.tokens)
@@ -64,9 +64,7 @@ class NormalExecutor(Executor):
         self.timers("decode").start()
         seq_lens = []
         for req_id in tasks.req_ids:
-            seq_len = Backend.cache_manager.cache[req_id][
-                Backend.cache_manager.layer_id
-            ][0].shape[0]
+            seq_len = Backend.cache_manager.cache[req_id][0][0].shape[0]
             seq_lens.append(seq_len)
         new_tokens = []
         for task in tasks.tasks:
@@ -74,7 +72,9 @@ class NormalExecutor(Executor):
         new_tokens = torch.tensor(
             new_tokens, device="cuda", dtype=torch.long
         ).unsqueeze(1)
+        self.timers("decode-model").start()
         logits = Backend.model.decode(new_tokens, seq_lens)
+        self.timers("decode-model").stop()
         self.timers("decode").stop()
         for it, task in enumerate(tasks.tasks):
             task.update_response(logits[it])
