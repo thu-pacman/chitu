@@ -2,7 +2,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from .global_vars import set_global_variables, get_timers
-from .cache_manager import KVCacheManager
+from .cache_manager import KVCacheManager, KVCacheManagerSkewAware
 
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
@@ -103,9 +103,18 @@ class Backend:
         )
         n_local_kv_heads = n_kv_heads // model_parallel_size
         head_dim = model_args.dim // model_args.n_heads
-        Backend.cache_manager = KVCacheManager(
-            model_args.n_layers, n_local_kv_heads, head_dim
-        )
+
+        if args.cache_type == "normal":
+            Backend.cache_manager = KVCacheManager(
+                model_args.n_layers, n_local_kv_heads, head_dim
+            )
+        else:
+            Backend.cache_manager = KVCacheManagerSkewAware(
+                model_args.n_layers,
+                n_local_kv_heads,
+                head_dim,
+                max_seq_length=model_args.max_seq_len,
+            )
         Backend.args = args
 
 

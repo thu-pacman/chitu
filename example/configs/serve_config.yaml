@@ -9,6 +9,7 @@ model:
   do_load: True # debug purpose
   seed: 0
   stop_with_eos: True
+  cache_type: normal
 request:
   max_new_tokens: 128
 executor:

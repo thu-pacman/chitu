@@ -91,6 +91,8 @@ class PrefillTask(Task):
         if self.req.async_stream:
             self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
 
+        # logger.warning(f"prefill token {(Backend.tokenizer.decode([self.next_token]))}")
+
     def need_remove(self):
         return True
 
@@ -123,6 +125,7 @@ class DecodeTask(Task):
         self.max_output_tokens -= 1
         if self.req.async_stream:
             self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
+        # logger.warning(f"decode token {(Backend.tokenizer.decode([self.next_token]))}")
 
     def need_remove(self):
         if Backend.args.stop_with_eos:

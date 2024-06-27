@@ -64,7 +64,7 @@ class NormalExecutor(Executor):
         self.timers("decode").start()
         seq_lens = []
         for req_id in tasks.req_ids:
-            seq_len = Backend.cache_manager.cache[req_id][0][0].shape[0]
+            seq_len = Backend.cache_manager.lengths[req_id]
             seq_lens.append(seq_len)
         new_tokens = []
         for task in tasks.tasks:
