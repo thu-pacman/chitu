@@ -355,6 +355,7 @@ class FeedForward(nn.Module):
         )
 
     def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
         # if x.dim() != 3:
         #     return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
