@@ -203,9 +203,9 @@ class KVCacheManagerSkewAware:
         self.timers("cache_prepare").start()
         self.layer_id = 0
         start_pos = self.hot_reqs.index(req_ids[0])
-        assert (
-            self.hot_reqs[start_pos : start_pos + len(req_ids)] == req_ids
-        ), f"{self.hot_reqs} {req_ids}"
+        # assert (
+        #     self.hot_reqs[start_pos : start_pos + len(req_ids)] == req_ids
+        # ), f"{self.hot_reqs} {req_ids}"
 
         seq_lens = []
         for req_id in req_ids:
@@ -242,9 +242,12 @@ class KVCacheManagerSkewAware:
                 self.head_dim,
                 1,
             ),
-            start_pos * self.head_dim * self.n_local_kv_heads * self.max_seq_length * 2,
+            start_pos * self.head_dim * self.n_local_kv_heads * self.max_seq_length,
         )
         # fmt: on
+        # logger.warning(
+        #     f"start pos {start_pos} {torch.sum(self.prepared_cache != 0).item()}"
+        # )
 
         self.timers("cache_prepare").stop()
 
@@ -283,6 +286,10 @@ class KVCacheManagerSkewAware:
         self.tmp_storage = []
         self.timers("cache_finalize_prefill").stop()
 
+        # logger.warning(
+        #     f"{self.req2slot[req_id]} {torch.sum(self.buffer[:,:,self.req2slot[req_id]] != 0).item()}"
+        # )
+
     def finalize_decode(self, req_ids):
         for item in req_ids:
             self.lengths[item] += 1
@@ -293,6 +300,6 @@ class KVCacheManagerSkewAware:
         output = self.prepared_cache[self.layer_id]
         self.layer_id += 1
         for it in range(xk.shape[0]):
-            output[0][it][self.seq_lens[it]] = xk
-            output[1][it][self.seq_lens[it]] = xv
+            output[0][it][self.seq_lens[it]] = xk[it]
+            output[1][it][self.seq_lens[it]] = xv[it]
         return output

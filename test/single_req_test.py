@@ -14,7 +14,7 @@ logger = getLogger(__name__)
 msgs = [
     [{"role": "user", "content": "what is the recipe of Kung Pao chicken?"}],
     # [{"role": "user", "content": "what is the recipe of Kung Pao chicken?"}],
-    # [{"role": "user", "content": "what is the recipe of mayonnaise?"}],
+    [{"role": "user", "content": "what is the recipe of mayonnaise?"}],
     [
         {"role": "user", "content": "I am going to Paris, what should I see?"},
         {
@@ -35,11 +35,25 @@ def gen_reqs(num_reqs, prompt_len, max_new_tokens):
     fake = Faker()
     reqs = []
     for i in range(num_reqs):
+        msg = ""
+        for j in range(prompt_len):
+            msg += fake.word() + " "
+        req = UserRequest(msg, f"request_{i}", max_new_tokens=max_new_tokens)
+        reqs.append(req)
+    return reqs
+
+
+def gen_reqs_real(num_reqs, prompt_len, max_new_tokens):
+    fake = Faker()
+    reqs = []
+    for i in range(num_reqs):
         # msg = ""
         # for j in range(prompt_len):
         #     msg += fake.word() + " "
         # req = UserRequest(msg, f"request_{i}", max_new_tokens=max_new_tokens)
-        req = UserRequest(msgs[i], f"request_{i}", max_new_tokens=max_new_tokens)
+        req = UserRequest(
+            msgs[i % len(msgs)], f"request_{i}", max_new_tokens=max_new_tokens
+        )
         reqs.append(req)
     return reqs
 
@@ -57,8 +71,12 @@ def main(args: DictConfig):
     Backend.build(args.model)
     cinfer_init(args)
 
+    # reqs = gen_reqs_real(
+    #     num_reqs=16, prompt_len=512, max_new_tokens=args.request.max_new_tokens
+    # )
+
     reqs = gen_reqs(
-        num_reqs=1, prompt_len=512, max_new_tokens=args.request.max_new_tokens
+        num_reqs=16, prompt_len=512, max_new_tokens=args.request.max_new_tokens
     )
     for req in reqs:
         TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))

@@ -28,6 +28,8 @@ app = FastAPI()
 request_queue = Queue()
 task_semaphore = Semaphore(0)
 
+global_args = None
+
 
 @app.post("/v1/chat/completions")
 async def create_completion(request: Request):
@@ -40,7 +42,7 @@ async def create_completion(request: Request):
     try:
         max_new_tokens = params["max_new_tokens"]
     except KeyError:
-        max_new_tokens = 512
+        max_new_tokens = global_args.request.max_new_tokens
     req = UserRequest(message, request_id, max_new_tokens=max_new_tokens)
     request_queue.put(req)  # Add task to the queue
     task_semaphore.release()  # Release the semaphore to signal the worker
@@ -61,7 +63,7 @@ async def create_chat_completion(request: Request):
     try:
         max_new_tokens = params["max_new_tokens"]
     except KeyError:
-        max_new_tokens = 512
+        max_new_tokens = global_args.request.max_new_tokens
     req = UserRequest(
         message,
         req_id,
@@ -97,7 +99,9 @@ worker_thread.start()
 
 @hydra.main(version_base=None, config_path="./configs", config_name="serve_config")
 def main(args: DictConfig):
+    global global_args
     set_global_variables()
+    global_args = args
     Backend.build(args.model)
     cinfer_init(args)
     uvicorn.run(app, host=args.serve.host, port=args.serve.port, log_level="info")

@@ -113,9 +113,10 @@ class Backend:
                 model_args.n_layers,
                 n_local_kv_heads,
                 head_dim,
-                max_seq_length=model_args.max_seq_len,
+                max_seq_length=1024,
             )
         Backend.args = args
+        logger.warning(f"Backend initialized with {torch.cuda.memory_allocated()}")
 
 
 class VarLens:
