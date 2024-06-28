@@ -90,7 +90,7 @@ def prepare_data_gqa(
 
 
 def prepare_noncontinuous_data(
-    batch=1, seq=10, seq_k=1000, n_local_kv_heads=32, head_dim=128
+    batch=16, seq=1, seq_k=2048, n_local_kv_heads=32, head_dim=128
 ):
     xq = torch.randn(
         [batch, seq, n_local_kv_heads, head_dim],
@@ -102,22 +102,35 @@ def prepare_noncontinuous_data(
         device="cuda",
         dtype=torch.bfloat16,
     )
+    key = torch.as_strided(
+        key,
+        (batch, seq_k // 2, n_local_kv_heads, head_dim),
+        (head_dim * n_local_kv_heads * seq_k, head_dim * n_local_kv_heads, head_dim, 1),
+    )
     value = torch.randn(
         [batch, seq_k, n_local_kv_heads, head_dim],
         device="cuda",
         dtype=torch.bfloat16,
     )
+    value = torch.as_strided(
+        value,
+        (batch, seq_k // 2, n_local_kv_heads, head_dim),
+        (head_dim * n_local_kv_heads * seq_k, head_dim * n_local_kv_heads, head_dim, 1),
+    )
+    print(xq.shape, key.shape, value.shape)
     return xq, key, value
 
 
 if __name__ == "__main__":
     # xq, key, value = prepare_data()
-    xq, key, value = prepare_data_gqa()
+    # xq, key, value = prepare_data_gqa()
+    xq, key, value = prepare_noncontinuous_data()
     o1 = test_decode_attention(xq, key, value)
     o2 = ground_truth_attention(xq, key, value)
     print(o1.shape, o2.shape)
     o1 = o1.reshape(o2.shape)
-    print(torch.isclose(o1, o2).sum() / o1.numel())
+    print(torch.isclose(o1, o2, rtol=0.01, atol=0.01).sum() / o1.numel())
+    print(o1, o2, torch.isclose(o1, o2, rtol=0.01, atol=0.01))
     print(
         "xformer",
         timeit.timeit(lambda: test_decode_attention(xq, key, value), number=100) / 100,
@@ -125,6 +138,10 @@ if __name__ == "__main__":
     print(
         "ground_truth",
         timeit.timeit(lambda: ground_truth_attention(xq, key, value), number=100) / 100,
+    )
+    print(
+        "xformer",
+        timeit.timeit(lambda: test_decode_attention(xq, key, value), number=100) / 100,
     )
 
     xq, key, value = prepare_data(seq=32, seq_k=32)

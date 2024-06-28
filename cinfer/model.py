@@ -2,7 +2,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from .global_vars import set_global_variables, get_timers
-from .cache_manager import KVCache, KVCacheManager
+from .cache_manager import KVCacheManager, KVCacheManagerSkewAware
 
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
@@ -41,6 +41,7 @@ class Backend:
     model = None
     tokenizer = None
     formatter = None
+    args = None
 
     @staticmethod
     def build(args):
@@ -102,9 +103,20 @@ class Backend:
         )
         n_local_kv_heads = n_kv_heads // model_parallel_size
         head_dim = model_args.dim // model_args.n_heads
-        Backend.cache_manager = KVCacheManager(
-            model_args.n_layers, n_local_kv_heads, head_dim
-        )
+
+        if args.cache_type == "normal":
+            Backend.cache_manager = KVCacheManager(
+                model_args.n_layers, n_local_kv_heads, head_dim
+            )
+        else:
+            Backend.cache_manager = KVCacheManagerSkewAware(
+                model_args.n_layers,
+                n_local_kv_heads,
+                head_dim,
+                max_seq_length=1024,
+            )
+        Backend.args = args
+        logger.warning(f"Backend initialized with {torch.cuda.memory_allocated()}")
 
 
 class VarLens:
@@ -137,8 +149,6 @@ class ModelArgs:
 
     max_batch_size: int = 32
     max_seq_len: int = 2048
-
-    torch_cache: bool = False
 
 
 class RMSNorm(torch.nn.Module):
@@ -246,70 +256,6 @@ class Attention(nn.Module):
             input_is_parallel=True,
             init_method=lambda x: x,
         )
-        self.torch_cache = args.torch_cache
-        if args.torch_cache:
-            self.cache_k = torch.zeros(
-                (
-                    args.max_batch_size,
-                    args.max_seq_len,
-                    self.n_local_kv_heads,
-                    self.head_dim,
-                )
-            ).cuda()
-            self.cache_v = torch.zeros(
-                (
-                    args.max_batch_size,
-                    args.max_seq_len,
-                    self.n_local_kv_heads,
-                    self.head_dim,
-                )
-            ).cuda()
-
-    def forward_with_torch_cache(
-        self,
-        x: torch.Tensor,
-        start_pos: int,
-        freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
-    ):
-        bsz, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
-
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
-
-        # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(
-            keys, self.n_rep
-        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        values = repeat_kv(
-            values, self.n_rep
-        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(
-            1, 2
-        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        return self.wo(output)
 
     def prefill_forward(
         self,
@@ -380,9 +326,7 @@ class Attention(nn.Module):
         return self.wo(output)
 
     def forward(self, x, start_pos, freqs_cis, mask, varlens=None):
-        if self.torch_cache:
-            return self.forward_with_torch_cache(x, start_pos, freqs_cis, mask)
-        elif start_pos == 0:
+        if start_pos == 0:
             return self.prefill_forward(x, varlens, start_pos, freqs_cis, mask)
         else:
             return self.decode_forward(x, freqs_cis)
@@ -422,6 +366,37 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        # if x.dim() != 3:
+        #     return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+        # def prune_zeros(x):
+        #     if x.dim() == 3:
+        #         abs_x = torch.abs(x)
+        #         med_value, med_indices = torch.median(abs_x, dim=-1)
+        #         # logger.warning(f"med {med_value} mean {torch.mean(abs_x)}")
+        #         x[abs_x < med_value.item()] = 0
+        #     return x
+
+        # # import datetime
+        # # import os, time
+
+        # # current_time = datetime.datetime.now()
+        # # p = current_time.strftime("dumps/%Y-%m-%d_%H-%M-%S")
+        # # p = p + f"_{time.time()}"
+        # # os.makedirs(p, exist_ok=False)
+
+        # # x = prune_zeros(x)
+        # o0 = self.w1(x)
+        # o1 = F.silu(o0)
+        # o2 = self.w3(x)
+        # o3 = o1 * o2
+        # o3 = prune_zeros(o3)
+        # # torch.save(x, p + "/x.pth")
+        # # torch.save(o3, p + "/o3.pth")
+        # # torch.save(self.w1.weight.data, p + "/w1.pth")
+        # # torch.save(self.w3.weight.data, p + "/w3.pth")
+        # # torch.save(self.w2.weight.data, p + "/w2.pth")
+        # return self.w2(o3)
 
 
 class TransformerBlock(nn.Module):
@@ -535,23 +510,21 @@ class Transformer(nn.Module):
     def prefill(self, tokens: list[int]):
         varlens = VarLens(tokens, "cuda")
         tokens = torch.from_numpy(np.concatenate(tokens)).to("cuda")
-        mask = None
         freqs_cis = self.prepare_freqs_cis_prefill(varlens)
         h = self.tok_embeddings(tokens)
-        for layer in self.layers:
-            h = layer(h, 0, freqs_cis, mask, varlens)
+        for it, layer in enumerate(self.layers):
+            h = layer(h, 0, freqs_cis, None, varlens)
         h = self.norm(h)
         output = self.output(h).float()
         return output
 
     @torch.inference_mode()
     def decode(self, tokens, seq_lens):
-        mask = None
         # generate different freqs_cis for each request, [num_req, other_freq_dim]
         freqs_cis = self.prepare_freqs_cis_decode(seq_lens)
         h = self.tok_embeddings(tokens)
-        for layer in self.layers:
-            h = layer(h, 1, freqs_cis, mask)
+        for it, layer in enumerate(self.layers):
+            h = layer(h, 1, freqs_cis, None)
         h = self.norm(h)
         output = self.output(h).float()
         return output

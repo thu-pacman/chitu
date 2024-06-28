@@ -25,7 +25,7 @@ torchrun --nproc_per_node 1 test/single_req_test.py request.max_new_tokens=64
 # to start serve at localhost:21002
 torchrun --nproc_per_node 1 example/serve.py
 # to test the server with prompt
-curl localhost:21002/v1/completions   -H "Content-Type: application/json"  -d '{
+curl localhost:21002/v1/chat/completions   -H "Content-Type: application/json"  -d '{
     "messages": [
       {
         "role": "system",
@@ -39,9 +39,10 @@ curl localhost:21002/v1/completions   -H "Content-Type: application/json"  -d '{
   }'
 
 
-# test chat_completion request
-# 1. start serve at localhost:21002
-grun torchrun --nproc_per_node 1 example/serve.py
+# test stream response
+# 1. start serve at localhost:2512, avoid port conflict.
+grun torchrun --nproc_per_node 1 --master_port=12512 example/serve.py serve.port=2512 executor.type=normal scheduler.type=prefill_first scheduler.prefill_first.num_tasks=1 model.cache_type=skew
 # 2. send stream type request
+# "python test/chat_completions_req.py" for stream response, "python test/chat_completions_req.py 1" for non-stream
 python test/chat_completions_req.py
 ```

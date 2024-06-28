@@ -6,16 +6,18 @@ model:
   tokenizer_path: /home/hkz/Meta-Llama-3-8B-Instruct/tokenizer.model
   temperature: 0.6
   top_p: 0.9
-  do_load: False # debug purpose
+  do_load: True # debug purpose
   seed: 0
+  stop_with_eos: True
+  cache_type: normal
 request:
   max_new_tokens: 128
 executor:
-  type: debug
+  type: normal
 scheduler:
   type: fcfs
   fcfs:
-    num_tasks: 2
+    num_tasks: 16
     enable_hybrid: False
   prefill_first:
     num_tasks: 2
