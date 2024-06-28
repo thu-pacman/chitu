@@ -33,6 +33,7 @@ class TaskPool:
 
     def remove(task_id):
         assert task_id in TaskPool.pool, "Task not found in pool"
+        # logger.warning(f"finish {task_id} cuda memory {torch.cuda.memory_allocated()}")
         if isinstance(TaskPool.pool[task_id], DecodeTask):
             TaskPool.pool[task_id].req.response = Backend.tokenizer.decode(
                 TaskPool.pool[task_id].response
@@ -40,6 +41,9 @@ class TaskPool:
             if TaskPool.pool[task_id].req.async_stream:
                 TaskPool.pool[task_id].req.async_stream.send_stop_signal()
             TaskPool.pool[task_id].req.completed.set()
+            Backend.cache_manager.finalize_cache_all_decode(
+                TaskPool.pool[task_id].req.request_id
+            )
         ret = TaskPool.pool.pop(task_id)
         TaskPool.id_list.remove(task_id)
         if ret is None:

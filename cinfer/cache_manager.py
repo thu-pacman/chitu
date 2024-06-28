@@ -18,8 +18,41 @@ class KVCacheManager:
         self.lengths = {}
         self.timers = get_timers()
 
+    # Prefill:
+    def finalize_cache_bylayer_prefill(self, cache_k, cache_v, req_ids, varlen):
+        self.tmp_storage.append([cache_k, cache_v])
+
+    # Prefill:
+    # return for every req [layer, seq, n_local_kv_heads, head_dim] * 2 (for k and v)
+    def finalize_cache_all_prefill(self, req_ids, varlen):
+        self.timers("cache_finalize_cache_all_prefill").start()
+        assert (
+            len(self.tmp_storage) == self.num_layers
+        ), f"{len(self.tmp_storage)} {self.num_layers}"
+        assert len(varlen.cpu_lens) == len(req_ids)
+        assert sum(varlen.cpu_lens) == self.tmp_storage[0][0].shape[0]
+        for it, req_id in enumerate(req_ids):
+            self.lengths[req_id] = varlen.cpu_lens[it]
+            self.cache[req_id] = [None] * self.num_layers
+        for layer_id in range(self.num_layers):
+            start = 0
+            for it, req_id in enumerate(req_ids):
+                end = start + varlen.cpu_lens[it]
+                self.cache[req_id][layer_id] = [
+                    self.tmp_storage[layer_id][0][
+                        start:end
+                    ],  # [seq, n_local_kv_heads, head_dim]
+                    self.tmp_storage[layer_id][1][
+                        start:end
+                    ],  # [seq, n_local_kv_heads, head_dim]
+                ]
+                start = end
+        self.tmp_storage = []
+        self.timers("cache_finalize_cache_all_prefill").stop()
+
+    # Decode:
     # return [layer, num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
-    def prepare(self, req_ids):
+    def prepare_cache_decode(self, req_ids):
         self.timers("cache_prepare").start()
         self.layer_id = 0
         max_seq = 0
@@ -57,36 +90,21 @@ class KVCacheManager:
         self.prepared_cache = prepared_cache
         self.timers("cache_prepare").stop()
 
-    # return for every req [layer, seq, n_local_kv_heads, head_dim] * 2 (for k and v)
-    def finalize_prefill(self, req_ids, varlen):
-        self.timers("cache_finalize_prefill").start()
-        assert (
-            len(self.tmp_storage) == self.num_layers
-        ), f"{len(self.tmp_storage)} {self.num_layers}"
-        assert len(varlen.cpu_lens) == len(req_ids)
-        assert sum(varlen.cpu_lens) == self.tmp_storage[0][0].shape[0]
-        for it, req_id in enumerate(req_ids):
-            self.lengths[req_id] = varlen.cpu_lens[it]
-            self.cache[req_id] = [None] * self.num_layers
-        for layer_id in range(self.num_layers):
-            start = 0
-            for it, req_id in enumerate(req_ids):
-                end = start + varlen.cpu_lens[it]
-                self.cache[req_id][layer_id] = [
-                    self.tmp_storage[layer_id][0][
-                        start:end
-                    ],  # [seq, n_local_kv_heads, head_dim]
-                    self.tmp_storage[layer_id][1][
-                        start:end
-                    ],  # [seq, n_local_kv_heads, head_dim]
-                ]
-                start = end
-        self.tmp_storage = []
-        self.timers("cache_finalize_prefill").stop()
+    # Decode:
+    # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
+    def update_cache_decode(self, xk, xv):
+        assert len(self.prepared_cache) > 0
+        output = self.prepared_cache[self.layer_id]
+        self.layer_id += 1
+        for it in range(xk.shape[0]):
+            output[0][it][self.seq_lens[it]] = xk[it]
+            output[1][it][self.seq_lens[it]] = xv[it]
+        return output
 
+    # Decode:
     # return for every req [layer, seq + 1, n_local_kv_heads, head_dim] * 2 (for k and v)
-    def finalize_decode(self, req_ids):
-        self.timers("cache_finalize_decode").start()
+    def finalize_cache_single_decode(self, req_ids):
+        self.timers("cache_finalize_cache_single_decode").start()
         assert len(self.prepared_cache) > 0
         for it, req_id in enumerate(req_ids):
             self.cache[req_id] = [None] * self.num_layers
@@ -102,33 +120,11 @@ class KVCacheManager:
                     ],  # [seq + 1, n_local_kv_heads, head_dim]
                 ]
         self.prepared_cache = []
-        self.timers("cache_finalize_decode").stop()
+        self.timers("cache_finalize_cache_single_decode").stop()
 
-    def get(self, key):
-        return self.cache.get(key, None)
-
-    def set(self, key, value):
-        self.cache[key] = value
-
-    def delete(self, key):
-        if key in self.cache:
-            del self.cache[key]
-
-    def clear(self):
-        self.cache.clear()
-
-    def tmp_store(self, cache_k, cache_v):
-        self.tmp_storage.append([cache_k, cache_v])
-
-    # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
-    def update_prepare_cache(self, xk, xv):
-        assert len(self.prepared_cache) > 0
-        output = self.prepared_cache[self.layer_id]
-        self.layer_id += 1
-        for it in range(xk.shape[0]):
-            output[0][it][self.seq_lens[it]] = xk[it]
-            output[1][it][self.seq_lens[it]] = xv[it]
-        return output
+    # Decode:
+    def finalize_cache_all_decode(self, req_id):
+        pass
 
 
 class KVCache:
@@ -195,14 +191,48 @@ class KVCacheManagerSkewAware:
         self.timers = get_timers()
         self.prepared_reqs = []
         self.rounded_max_seq = -1
+        self.layer_id = 0
 
-    def tmp_store(self, cache_k, cache_v):
-        self.tmp_storage.append([cache_k, cache_v])
+    # Prefill:
+    # return for every req [layer, seq, n_local_kv_heads, head_dim] * 2 (for k and v)
+    def finalize_cache_bylayer_prefill(self, cache_k, cache_v, req_ids, varlen):
+        self.timers("cache_finalize_cache_all_prefill").start()
+        if self.layer_id == 0:
+            for it, req_id in enumerate(req_ids):
+                self.lengths[req_id] = varlen.cpu_lens[it]
+                for i in range(self.num_hot_req):
+                    if self.slot_availability[i]:
+                        self.req2slot[req_id] = i
+                        self.slot_availability[i] = False
+                        self.hot_reqs[i] = req_id
+                        break
+                assert (
+                    req_id in self.req2slot
+                ), f"Cannot allocate slot: {req_id} {self.req2slot}"
 
-    def prepare(self, req_ids):
+        start = 0
+        for it, req_id in enumerate(req_ids):
+            end = start + varlen.cpu_lens[it]
+            self.buffer[self.layer_id][0][self.req2slot[req_id]][
+                : varlen.cpu_lens[it]
+            ] = cache_k[start:end]
+            self.buffer[self.layer_id][1][self.req2slot[req_id]][
+                : varlen.cpu_lens[it]
+            ] = cache_v[start:end]
+            start = end
+        self.timers("cache_finalize_cache_all_prefill").stop()
+        self.layer_id += 1
+
+    # Prefill:
+    def finalize_cache_all_prefill(self, req_ids, varlen):
+        self.layer_id = 0
+
+    # Decode:
+    def prepare_cache_decode(self, req_ids):
         self.timers("cache_prepare").start()
         self.layer_id = 0
         start_pos = self.hot_reqs.index(req_ids[0])
+        assert start_pos + len(req_ids) <= self.num_hot_req
         # assert (
         #     self.hot_reqs[start_pos : start_pos + len(req_ids)] == req_ids
         # ), f"{self.hot_reqs} {req_ids}"
@@ -245,61 +275,30 @@ class KVCacheManagerSkewAware:
             start_pos * self.head_dim * self.n_local_kv_heads * self.max_seq_length,
         )
         # fmt: on
-        # logger.warning(
-        #     f"start pos {start_pos} {torch.sum(self.prepared_cache != 0).item()}"
-        # )
-
         self.timers("cache_prepare").stop()
 
-    # return for every req [layer, seq, n_local_kv_heads, head_dim] * 2 (for k and v)
-    def finalize_prefill(self, req_ids, varlen):
-        self.timers("cache_finalize_prefill").start()
-        assert (
-            len(self.tmp_storage) == self.num_layers
-        ), f"{len(self.tmp_storage)} {self.num_layers}"
-        assert len(varlen.cpu_lens) == len(req_ids)
-        assert sum(varlen.cpu_lens) == self.tmp_storage[0][0].shape[0]
-
-        for it, req_id in enumerate(req_ids):
-            self.lengths[req_id] = varlen.cpu_lens[it]
-            for i in range(self.num_hot_req):
-                if self.slot_availability[i]:
-                    self.req2slot[req_id] = i
-                    self.slot_availability[i] = False
-                    self.hot_reqs[i] = req_id
-                    break
-            assert (
-                req_id in self.req2slot
-            ), f"Cannot allocate slot: {req_id} {self.req2slot}"
-
-        for layer_id in range(self.num_layers):
-            start = 0
-            for it, req_id in enumerate(req_ids):
-                end = start + varlen.cpu_lens[it]
-                self.buffer[layer_id][0][self.req2slot[req_id]][
-                    : varlen.cpu_lens[it]
-                ] = self.tmp_storage[layer_id][0][start:end]
-                self.buffer[layer_id][1][self.req2slot[req_id]][
-                    : varlen.cpu_lens[it]
-                ] = self.tmp_storage[layer_id][1][start:end]
-                start = end
-        self.tmp_storage = []
-        self.timers("cache_finalize_prefill").stop()
-
-        # logger.warning(
-        #     f"{self.req2slot[req_id]} {torch.sum(self.buffer[:,:,self.req2slot[req_id]] != 0).item()}"
-        # )
-
-    def finalize_decode(self, req_ids):
-        for item in req_ids:
-            self.lengths[item] += 1
-        return
-
+    # Decode:
     # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
-    def update_prepare_cache(self, xk, xv):
+    def update_cache_decode(self, xk, xv):
         output = self.prepared_cache[self.layer_id]
         self.layer_id += 1
         for it in range(xk.shape[0]):
             output[0][it][self.seq_lens[it]] = xk[it]
             output[1][it][self.seq_lens[it]] = xv[it]
         return output
+
+    # Decode:
+    def finalize_cache_single_decode(self, req_ids):
+        for item in req_ids:
+            self.lengths[item] += 1
+        self.layer_id = 0
+
+    # Decode:
+    def finalize_cache_all_decode(self, req_id):
+        slot_id = self.hot_reqs.index(req_id)
+        if slot_id == -1:  # not in the hot slot
+            return
+        self.hot_reqs[slot_id] = -1
+        self.slot_availability[slot_id] = True
+        self.req2slot.pop(req_id)
+        self.lengths.pop(req_id)

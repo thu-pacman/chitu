@@ -42,6 +42,8 @@ class Backend:
     tokenizer = None
     formatter = None
     args = None
+    curr_varlens = None
+    curr_req_ids = None
 
     @staticmethod
     def build(args):
@@ -126,11 +128,11 @@ class VarLens:
         self.lens = torch.tensor(
             [len(t) for t in tokens], device=device, dtype=torch.int32
         )
-        self.prefix_lens = [0]
+        self.cpu_prefix_lens = [0]
         for t in tokens:
-            self.prefix_lens.append(self.prefix_lens[-1] + len(t))
+            self.cpu_prefix_lens.append(self.cpu_prefix_lens[-1] + len(t))
         self.prefix_lens = torch.tensor(
-            self.prefix_lens, device=device, dtype=torch.int32
+            self.cpu_prefix_lens, device=device, dtype=torch.int32
         )
         self.cpu_lens = [len(t) for t in tokens]
         self.max_len = int(torch.max(self.lens))
@@ -273,7 +275,12 @@ class Attention(nn.Module):
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)  # TODO
-        Backend.cache_manager.tmp_store(xk, xv)
+        Backend.cache_manager.finalize_cache_bylayer_prefill(
+            xk,
+            xv,
+            Backend.curr_req_ids,
+            Backend.curr_varlens,
+        )
         output = flash_attn.flash_attn_varlen_func(
             xq,
             xk,
@@ -347,7 +354,7 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        cache = Backend.cache_manager.update_prepare_cache(xk, xv)
+        cache = Backend.cache_manager.update_cache_decode(xk, xv)
         cache_k = cache[0]
         cache_v = cache[1]
         max_seq_len = cache.shape[2]
@@ -565,8 +572,11 @@ class Transformer(nn.Module):
         for it, layer in enumerate(self.layers):
             h = layer(h, 0, freqs_cis, None, varlens)
         h = self.norm(h)
-        output = self.output(h).float()
-        return output
+        h = self.output(h)
+        tmp = varlens.cpu_prefix_lens[1:]
+        h = h[[item - 1 for item in tmp]]
+        h = h.float()
+        return h
 
     @torch.inference_mode()
     def decode(self, tokens, seq_lens):
