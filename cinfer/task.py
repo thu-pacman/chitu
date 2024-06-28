@@ -125,6 +125,7 @@ class DecodeTask(Task):
         self.max_output_tokens -= 1
         if self.req.async_stream:
             self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
+            # self.req.async_stream.add_data("a")
         # logger.warning(f"decode token {(Backend.tokenizer.decode([self.next_token]))}")
 
     def need_remove(self):

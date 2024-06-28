@@ -65,6 +65,7 @@ class Backend:
         model_args: ModelArgs = ModelArgs(
             **params,
         )
+        model_args.max_seq_len = args.max_length
         tokenizer = Tokenizer(model_path=args.tokenizer_path)
         assert model_args.vocab_size == tokenizer.n_words
         model = Transformer(model_args)
@@ -114,6 +115,7 @@ class Backend:
                 n_local_kv_heads,
                 head_dim,
                 max_seq_length=1024,
+                num_hot_req=args.cache_max_reqs,
             )
         Backend.args = args
         logger.warning(f"Backend initialized with {torch.cuda.memory_allocated()}")
@@ -284,6 +286,48 @@ class Attention(nn.Module):
         ).view(bs_seq, -1)
         return self.wo(output)
 
+    @torch.inference_mode()
+    def ground_truth_attention(self, query, key, value):
+        # print(query.shape, key.shape)
+        n_local_kv_heads = key.shape[-2]
+        n_local_q_heads = query.shape[-2]
+        heads_per_group = n_local_q_heads // n_local_kv_heads
+        query = query.view(
+            query.shape[0],
+            query.shape[1],
+            n_local_kv_heads,
+            heads_per_group,
+            query.shape[-1],
+        )
+        key = key.view(key.shape[0], key.shape[1], n_local_kv_heads, 1, key.shape[-1])
+        value = value.view(
+            value.shape[0], value.shape[1], n_local_kv_heads, 1, value.shape[-1]
+        )
+        if key.shape[-2] < query.shape[-2] and key.shape[-2] == 1:
+            new_shape = []
+            for i in range(len(key.shape)):
+                if i == len(key.shape) - 2:
+                    new_shape.append(query.shape[-2])
+                else:
+                    new_shape.append(key.shape[i])
+            key = key.expand(new_shape)
+            value = value.expand(new_shape)
+            query = query.view(query.shape[0], query.shape[1], -1, query.shape[-1])
+            key = key.reshape(key.shape[0], key.shape[1], -1, key.shape[-1])
+            value = value.reshape(value.shape[0], value.shape[1], -1, value.shape[-1])
+
+        scale = 1.0 / query.shape[-1] ** 0.5
+        query = query * scale
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        # print(query.shape, key.transpose(-2, -1).shape)
+        attn = query @ key.transpose(-2, -1)
+        attn = attn.softmax(-1)
+        # attn = F.dropout(attn, p)
+        attn = attn @ value
+        return attn.transpose(1, 2)
+
     def decode_forward(
         self,
         x: torch.Tensor,
@@ -308,6 +352,9 @@ class Attention(nn.Module):
         cache_v = cache[1]
         max_seq_len = cache.shape[2]
 
+        # output = self.ground_truth_attention(xq, cache_k, cache_v).contiguous()
+        # output = output.view(bsz, seqlen, -1)
+
         if self.n_local_heads != self.n_local_kv_heads:
             group_size = self.n_local_heads // self.n_local_kv_heads
             assert group_size > 1
@@ -318,10 +365,13 @@ class Attention(nn.Module):
             cache_v = cache_v.view(
                 bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
             ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
-
         output = fmha.memory_efficient_attention_forward(xq, cache_k, cache_v).view(
             bsz, seqlen, -1
         )
+
+        # output = torch.randn(
+        #     [bsz, seqlen, self.n_local_heads * self.head_dim], device=x.device
+        # )
 
         return self.wo(output)
 
