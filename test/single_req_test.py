@@ -87,7 +87,7 @@ def main(args: DictConfig):
     timers("overall").stop()
 
     for req in reqs:
-        logger.warning(f"Response: {req.response}")
+        logger.warning(f"Response: {req.async_stream.data}")
 
     timers.log()
 
