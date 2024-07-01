@@ -9,7 +9,9 @@ model:
   do_load: True # debug purpose
   seed: 0
   stop_with_eos: True
+  max_length: 1024 # length of prefill + decode
   cache_type: normal
+  cache_max_reqs: 16
 request:
   max_new_tokens: 128
 executor:

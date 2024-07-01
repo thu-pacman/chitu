@@ -38,6 +38,8 @@ class NormalExecutor(Executor):
         # logger.warning(f"Prefill step: {tasks.task_ids}")
         varlens = VarLens(tasks.tokens, "cuda")
         self.timers("prefill").start()
+        Backend.curr_varlens = varlens
+        Backend.curr_req_ids = tasks.req_ids
         logits = Backend.model.prefill(tasks.tokens)
         self.timers("prefill").stop()
         # after prefill, new decode tasks are created
@@ -45,7 +47,7 @@ class NormalExecutor(Executor):
         start = 0
         for it in range(tasks.num_tasks):
             start += varlens.cpu_lens[it]
-            tasks.tasks[it].update_response(logits[start - 1])
+            tasks.tasks[it].update_response(logits[it])
             new_tasks.append(
                 DecodeTask(
                     self._prefill2decode(tasks.task_ids[it]),
@@ -55,11 +57,11 @@ class NormalExecutor(Executor):
                 )
             )
         varlens = VarLens(tasks.tokens, "cuda")
-        Backend.cache_manager.finalize_prefill(tasks.req_ids, varlens)
+        Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
         return logits
 
     def decode_step(self, tasks: PackedTasks):
-        Backend.cache_manager.prepare(tasks.req_ids)
+        Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
         # logger.info(f"Decode step: {tasks.task_ids}")
         self.timers("decode").start()
         seq_lens = []
@@ -78,7 +80,7 @@ class NormalExecutor(Executor):
         self.timers("decode").stop()
         for it, task in enumerate(tasks.tasks):
             task.update_response(logits[it])
-        Backend.cache_manager.finalize_decode(tasks.req_ids)
+        Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return logits
 
     def step(
@@ -123,9 +125,8 @@ class DebugExecutor(Executor):
                 device="cuda",
                 dtype=torch.bfloat16,
             )
-            Backend.cache_manager.tmp_store(xk, xv)
         self.timers("prefill").stop()
-        Backend.cache_manager.finalize_prefill(tasks.req_ids, varlens)
+        Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
         new_tasks = []
         for it in range(tasks.num_tasks):
             new_tasks.append(
@@ -138,13 +139,13 @@ class DebugExecutor(Executor):
         return logits
 
     def decode_step(self, tasks: PackedTasks):
-        Backend.cache_manager.prepare(tasks.req_ids)
+        Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
         self.timers("decode").start()
         logits = torch.randn([tasks.num_tasks, Backend.model.vocab_size], device="cuda")
         for it, task in enumerate(tasks.tasks):
             task.update_response(logits[it])
         self.timers("decode").stop()
-        Backend.cache_manager.finalize_decode(tasks.req_ids)
+        Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return logits
 
     def step(
