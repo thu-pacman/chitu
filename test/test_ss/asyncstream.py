@@ -1,6 +1,7 @@
 import asyncio
 import threading
 
+
 # The given class
 class AsyncStreamResponse:
     def __init__(self):
@@ -35,6 +36,7 @@ class AsyncStreamResponse:
             self.data_event.clear()
             await self.data_event.wait()
 
+
 # Function to test the class
 async def test_async_stream_response():
     stream = AsyncStreamResponse()
@@ -50,6 +52,7 @@ async def test_async_stream_response():
             print(data)
 
     await asyncio.gather(add_data_to_stream(), read_data_from_stream())
+
 
 # Run the test function
 asyncio.run(test_async_stream_response())
