@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, JSONResponse
 import uvicorn
 import asyncio
 import hydra
@@ -21,68 +21,34 @@ from logging import getLogger
 
 logger = getLogger(__name__)
 
-
 app = FastAPI()
-
-
-request_queue = Queue()
-task_semaphore = Semaphore(0)
 
 global_args = None
 
 
 @app.post("/v1/chat/completions")
-async def create_completion(request: Request):
-    params = await request.json()
-    # get request ID
-    request_id = request.headers.get("X-Request-ID")
-    if not request_id:
-        request_id = str(uuid.uuid4())
-    message = params["messages"]
-    try:
-        max_new_tokens = params["max_new_tokens"]
-    except KeyError:
-        max_new_tokens = global_args.request.max_new_tokens
-    req = UserRequest(message, request_id, max_new_tokens=max_new_tokens)
-    request_queue.put(req)  # Add task to the queue
-    task_semaphore.release()  # Release the semaphore to signal the worker
-    await req.completed.wait()  # Wait until the task is completed
-    logger.warning(f"Response: {req.response}")
-    return {"message": f"{req.response}"}
-
-
-@app.post("/v1/completions")
 async def create_chat_completion(request: Request):
     params = await request.json()
-    # get request ID
     req_id = request.headers.get("X-Request-ID")
     if not req_id:
         req_id = str(uuid.uuid4())
-    message = params.pop("messages")  # will not raise KeyError
-    response = AsyncResponse(req_id)
-    try:
-        max_new_tokens = params["max_new_tokens"]
-    except KeyError:
-        max_new_tokens = global_args.request.max_new_tokens
-    req = UserRequest(
-        message,
-        req_id,
-        async_stream=response.async_stream,
-        max_new_tokens=max_new_tokens,
-    )
+    stream = params.pop("stream", False)
+    message = params.pop("messages")
+    max_new_tokens = params.pop("max_tokens", global_args.request.max_new_tokens)
+    req = UserRequest(message, req_id, max_new_tokens=max_new_tokens)
+    response = AsyncResponse(req)
     TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
-    generator = response.get_generator()
-    return StreamingResponse(generator, media_type="text/event-stream")
+    if stream:
+        return StreamingResponse(
+            response.stream_generator(), media_type="text/event-stream"
+        )
+    else:
+        full_response = await response.full_generator()
+        return JSONResponse(full_response.model_dump())
 
 
 async def process_queue():
     while True:
-        # await asyncio.get_event_loop().run_in_executor(None, task_semaphore.acquire)
-        if not request_queue.empty():
-            qsize = request_queue.qsize()
-            for i in range(qsize):
-                req = request_queue.get()
-                TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
         if len(TaskPool.pool) > 0:
             cinfer_run()
 
