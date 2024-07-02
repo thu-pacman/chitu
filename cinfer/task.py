@@ -17,6 +17,11 @@ class UserRequest:
         self.completed = asyncio.Event()
         self.max_new_tokens = max_new_tokens
         self.async_stream = AsyncDataStream()
+        self.output = ""
+
+    def add_data(self, data):
+        self.async_stream.add_data(data)
+        self.output += data
 
 
 class TaskPool:
@@ -87,7 +92,8 @@ class PrefillTask(Task):
 
     def update_response(self, logit):
         self.next_token = torch.argmax(logit, dim=-1).item()
-        self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
+        # self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
+        self.req.add_data(Backend.tokenizer.decode([self.next_token]))
 
         # logger.warning(f"prefill token {(Backend.tokenizer.decode([self.next_token]))}")
 
@@ -121,7 +127,8 @@ class DecodeTask(Task):
         self.response.append(self.next_token)
         self.prefix_length += 1
         self.max_output_tokens -= 1
-        self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
+        self.req.add_data(Backend.tokenizer.decode([self.next_token]))
+        # self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
         # logger.warning(f"decode token {(Backend.tokenizer.decode([self.next_token]))}")
 
     def need_remove(self):

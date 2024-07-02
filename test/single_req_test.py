@@ -44,7 +44,6 @@ def gen_reqs(num_reqs, prompt_len, max_new_tokens):
 
 
 def gen_reqs_real(num_reqs, prompt_len, max_new_tokens):
-    fake = Faker()
     reqs = []
     for i in range(num_reqs):
         # msg = ""
@@ -87,7 +86,7 @@ def main(args: DictConfig):
     timers("overall").stop()
 
     for req in reqs:
-        logger.warning(f"Response: {req.response}")
+        logger.warning(f"Response: {req.output}")
 
     timers.log()
 
