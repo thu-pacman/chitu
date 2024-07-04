@@ -140,25 +140,76 @@ class DecodeTask(Task):
         return len(self.response) >= self.req.max_new_tokens
 
 
+# +:prefill, -:decode
+def req_encode(req_id: str):
+    parts = req_id.split("_", 1)
+    if parts[0] == "prefill":
+        return int(parts[1], 16)
+    else:
+        return -int(parts[1], 16)
+
+
+def req_decode(id_num: int):
+    if id_num > 0:
+        return "prefill_" + hex(id_num)[2:]
+    else:
+        return "decode_" + hex(-id_num)[2:]
+
+
 class PackedTasks:
-    def __init__(self, task_ids):
-        self.task_ids = task_ids
-        self.num_tasks = len(task_ids)
-        assert self.num_tasks > 0, "No tasks provided"
+    max_num_tasks = -1
+
+    def __init__(self, task_ids, rank=0, task_tensor=None):
         self.tasks = []
         task_types = []
         self.req_ids = []
-        for tid in self.task_ids:
-            self.tasks.append(TaskPool.pool[tid])
-            task_types.append(TaskPool.pool[tid].task_type)
-            self.req_ids.append(TaskPool.pool[tid].req.request_id)
-        if TaskType.Prefill in task_types and TaskType.Decode in task_types:
-            self.task_type = TaskType.Hybrid
-            raise NotImplementedError("Hybrid task not implemented")
+        if task_tensor is None:
+            self.task_ids = task_ids
+            self.num_tasks = len(task_ids)
+            assert self.num_tasks > 0, "No tasks provided"
+            for tid in self.task_ids:
+                self.tasks.append(TaskPool.pool[tid])
+                task_types.append(TaskPool.pool[tid].task_type)
+                self.req_ids.append(TaskPool.pool[tid].req.request_id)
+            if TaskType.Prefill in task_types and TaskType.Decode in task_types:
+                self.task_type = TaskType.Hybrid
+                raise NotImplementedError("Hybrid task not implemented")
+            else:
+                self.task_type = task_types[0]
+                if self.task_type == TaskType.Prefill:
+                    self.pack_tokens()
+            # generate encoded task tensor
+            encoded = [0] * (PackedTasks.max_num_tasks * 2)
+            for i, tid in enumerate(self.task_ids):
+                encoded[i] = req_encode(tid)
+                encoded[PackedTasks.max_num_tasks + i] = len(self.tasks[i].tokens)
+            # length_sum = sum([len(task.tokens) for task in self.tasks])
+            # encoded[PackedTasks.max_num_tasks] = length_sum
+            self.task_tensor = torch.tensor(
+                encoded,
+                dtype=torch.int64,
+                device=rank,
+            )
         else:
-            self.task_type = task_types[0]
-            if self.task_type == TaskType.Prefill:
-                self.pack_tokens()
+            task_tensor_cpu = task_tensor.cpu()
+            decoded = []
+            lens = []
+            for it, task_id in enumerate(task_tensor_cpu):
+                if task_id == 0:
+                    break
+                decoded.append(req_decode(task_id))
+                lens.append(int(task_tensor_cpu[PackedTasks.max_num_tasks + it]))
+            self.task_ids = decoded
+            self.num_tasks = len(self.task_ids)
+            assert self.num_tasks > 0, "No tasks provided"
+            self.req_ids = [item.split("_", 1)[0] for item in self.task_ids]
+            self.task_type = (
+                TaskType.Prefill
+                if self.task_ids[0].startswith("prefill")
+                else TaskType.Decode
+            )
+            self.task_tensor = task_tensor
+            self.tokens = [([0] * lens[it]) for it in range(len(lens))]
 
     def pack_tokens(self):
         tokens = []

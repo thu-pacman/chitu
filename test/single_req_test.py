@@ -5,6 +5,7 @@ from cinfer.global_vars import set_global_variables, get_timers
 from faker import Faker
 import hydra
 from omegaconf import DictConfig
+import torch
 
 from logging import getLogger
 import logging
@@ -43,6 +44,15 @@ def gen_reqs(num_reqs, prompt_len, max_new_tokens):
     return reqs
 
 
+import random
+
+
+def gen_req_id(len=8):
+    random_number = random.getrandbits(len * 4)
+    hex_string = f"{random_number:0{len}x}"
+    return hex_string
+
+
 def gen_reqs_real(num_reqs, prompt_len, max_new_tokens):
     reqs = []
     for i in range(num_reqs):
@@ -51,7 +61,7 @@ def gen_reqs_real(num_reqs, prompt_len, max_new_tokens):
         #     msg += fake.word() + " "
         # req = UserRequest(msg, f"request_{i}", max_new_tokens=max_new_tokens)
         req = UserRequest(
-            msgs[i % len(msgs)], f"request_{i}", max_new_tokens=max_new_tokens
+            msgs[i % len(msgs)], f"{gen_req_id()}", max_new_tokens=max_new_tokens
         )
         reqs.append(req)
     return reqs
@@ -69,19 +79,21 @@ def main(args: DictConfig):
 
     Backend.build(args.model)
     cinfer_init(args)
+    logger.warning("Backend built")
 
-    # reqs = gen_reqs_real(
+    # reqs = gen_reqs(
     #     num_reqs=16, prompt_len=512, max_new_tokens=args.request.max_new_tokens
     # )
-
-    reqs = gen_reqs(
-        num_reqs=16, prompt_len=512, max_new_tokens=args.request.max_new_tokens
-    )
-    for req in reqs:
-        TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
-
+    rank = torch.distributed.get_rank()
+    if rank == 0:
+        reqs = gen_reqs_real(
+            num_reqs=16, prompt_len=512, max_new_tokens=args.request.max_new_tokens
+        )
+        for req in reqs:
+            TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
+    logger.warning("start running")
     timers("overall").start()
-    while len(TaskPool.pool) > 0:
+    while len(TaskPool.pool) > 0 or rank != 0:
         cinfer_run()
     timers("overall").stop()
 

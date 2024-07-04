@@ -8,7 +8,7 @@ logger = getLogger(__name__)
 
 
 class KVCacheManager:
-    def __init__(self, num_layers, n_local_kv_heads, head_dim):
+    def __init__(self, num_layers, n_local_kv_heads, head_dim, device="cuda"):
         self.cache = {}
         self.prepared_cache = []
         self.num_layers = num_layers
@@ -17,6 +17,7 @@ class KVCacheManager:
         self.tmp_storage = []
         self.lengths = {}
         self.timers = get_timers()
+        self.device = torch.device(device)
 
     # Prefill:
     def finalize_cache_bylayer_prefill(self, cache_k, cache_v, req_ids, varlen):
@@ -76,7 +77,7 @@ class KVCacheManager:
                 head_dim,  # head_dim
             ],
             dtype=torch.bfloat16,
-            device="cuda",
+            device=self.device,
         )
         # hkz-comment: Very similar to matrix transpose;
         for layer_id in range(self.num_layers):
@@ -165,6 +166,7 @@ class KVCacheManagerSkewAware:
         head_dim,
         num_hot_req=16,
         max_seq_length=2048,
+        device="cuda",
     ):
         self.num_layers = num_layers
         self.n_local_kv_heads = n_local_kv_heads
@@ -176,6 +178,7 @@ class KVCacheManagerSkewAware:
         self.lengths = {}
         self.max_seq_length = max_seq_length
         self.tmp_storage = []
+        self.device = torch.device(device)
         self.buffer = torch.zeros(
             [
                 self.num_layers,
@@ -185,7 +188,7 @@ class KVCacheManagerSkewAware:
                 self.n_local_kv_heads,
                 self.head_dim,
             ],
-            device="cuda",
+            device=self.device,
             dtype=torch.bfloat16,
         )
         self.timers = get_timers()
@@ -198,6 +201,7 @@ class KVCacheManagerSkewAware:
     def finalize_cache_bylayer_prefill(self, cache_k, cache_v, req_ids, varlen):
         self.timers("cache_finalize_cache_all_prefill").start()
         if self.layer_id == 0:
+            # logger.warning(req_ids)
             for it, req_id in enumerate(req_ids):
                 self.lengths[req_id] = varlen.cpu_lens[it]
                 for i in range(self.num_hot_req):

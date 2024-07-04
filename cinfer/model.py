@@ -1,6 +1,8 @@
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
+
+import torch.distributed
 from .global_vars import set_global_variables, get_timers
 from .cache_manager import KVCacheManager, KVCacheManagerSkewAware
 
@@ -44,14 +46,16 @@ class Backend:
     args = None
     curr_varlens = None
     curr_req_ids = None
+    obj_group = None
 
     @staticmethod
     def build(args):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group("nccl")
         if not model_parallel_is_initialized():
-            model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
+            model_parallel_size = 1  # int(os.environ.get("WORLD_SIZE", 1))
             initialize_model_parallel(model_parallel_size)
+        Backend.obj_group = torch.distributed.new_group(backend="gloo")
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
@@ -70,7 +74,7 @@ class Backend:
         model_args.max_seq_len = args.max_length
         tokenizer = Tokenizer(model_path=args.tokenizer_path)
         assert model_args.vocab_size == tokenizer.n_words
-        model = Transformer(model_args)
+        model = PipeTransformer(model_args)
         if torch.cuda.is_bf16_supported():
             torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
         else:
@@ -81,10 +85,11 @@ class Backend:
             start_time = time.time()
             checkpoints = sorted(Path(args.ckpt_dir).glob("*.pth"))
             assert len(checkpoints) > 0, f"no checkpoint files found in {args.ckpt_dir}"
-            assert model_parallel_size == len(
-                checkpoints
-            ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
-            ckpt_path = checkpoints[get_model_parallel_rank()]
+            # assert model_parallel_size == len(
+            #     checkpoints
+            # ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
+            # ckpt_path = checkpoints[get_model_parallel_rank()]
+            ckpt_path = checkpoints[0]
             logger.warning(f"Loading checkpoint from {ckpt_path}")
             checkpoint = torch.load(ckpt_path, map_location="cpu")
             model.load_state_dict(checkpoint, strict=False)
@@ -541,10 +546,10 @@ class Transformer(nn.Module):
         output = self.output(h).float()
         return output
 
-    def prepare_freqs_cis_prefill(self, varlens):
+    def prepare_freqs_cis_prefill(self, varlens, device):
         prepared_freqs_cis = torch.empty(
             [varlens.total_len, self.freqs_cis.shape[1]],
-            device="cuda",
+            device=device,
             dtype=torch.complex64,
         )
         start = 0
@@ -553,10 +558,10 @@ class Transformer(nn.Module):
             start += length
         return prepared_freqs_cis
 
-    def prepare_freqs_cis_decode(self, seq_lens):
+    def prepare_freqs_cis_decode(self, seq_lens, device):
         prepared_freqs_cis = torch.empty(
             [len(seq_lens), self.freqs_cis.shape[1]],
-            device="cuda",
+            device=device,
             dtype=torch.complex64,
         )
         for i, seq_len in enumerate(seq_lens):
@@ -564,10 +569,10 @@ class Transformer(nn.Module):
         return prepared_freqs_cis
 
     @torch.inference_mode()
-    def prefill(self, tokens: list[int]):
-        varlens = VarLens(tokens, "cuda")
-        tokens = torch.from_numpy(np.concatenate(tokens)).to("cuda")
-        freqs_cis = self.prepare_freqs_cis_prefill(varlens)
+    def prefill(self, tokens: list[int], device="cuda"):
+        varlens = VarLens(tokens, device)
+        tokens = torch.from_numpy(np.concatenate(tokens)).to(device)
+        freqs_cis = self.prepare_freqs_cis_prefill(varlens, device)
         h = self.tok_embeddings(tokens)
         for it, layer in enumerate(self.layers):
             h = layer(h, 0, freqs_cis, None, varlens)
@@ -581,7 +586,102 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def decode(self, tokens, seq_lens):
         # generate different freqs_cis for each request, [num_req, other_freq_dim]
-        freqs_cis = self.prepare_freqs_cis_decode(seq_lens)
+        freqs_cis = self.prepare_freqs_cis_decode(seq_lens, tokens.device)
+        h = self.tok_embeddings(tokens)
+        for it, layer in enumerate(self.layers):
+            h = layer(h, 1, freqs_cis, None)
+        h = self.norm(h)
+        output = self.output(h).float()
+        return output
+
+
+class PipeTransformer(nn.Module):
+    def __init__(self, params: ModelArgs):
+        super().__init__()
+        self.rank = torch.distributed.get_rank()
+        self.world_size = torch.distributed.get_world_size()
+        self.varlens = None
+        self.params = params
+        self.vocab_size = params.vocab_size
+        self.n_layers = params.n_layers
+
+        if self.rank == 0:
+            self.tok_embeddings = VocabParallelEmbedding(
+                params.vocab_size, params.dim, init_method=lambda x: x
+            )
+
+        self.num_local_layers = params.n_layers // self.world_size
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(self.num_local_layers):
+            self.layers.append(TransformerBlock(layer_id, params))
+
+        if self.rank == self.world_size - 1:
+            self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+            self.output = ColumnParallelLinear(
+                params.dim, params.vocab_size, bias=False, init_method=lambda x: x
+            )
+
+        self.freqs_cis = precompute_freqs_cis(
+            params.dim // params.n_heads,
+            params.max_seq_len * 2,
+            params.rope_theta,
+        ).cuda(self.rank)
+
+    def prepare_freqs_cis_prefill(self, varlens, device):
+        prepared_freqs_cis = torch.empty(
+            [varlens.total_len, self.freqs_cis.shape[1]],
+            device=device,
+            dtype=torch.complex64,
+        )
+        start = 0
+        for length in varlens.cpu_lens:
+            prepared_freqs_cis[start : start + length] = self.freqs_cis[:length]
+            start += length
+        return prepared_freqs_cis
+
+    def prepare_freqs_cis_decode(self, seq_lens, device):
+        prepared_freqs_cis = torch.empty(
+            [len(seq_lens), self.freqs_cis.shape[1]],
+            device=device,
+            dtype=torch.complex64,
+        )
+        for i, seq_len in enumerate(seq_lens):
+            prepared_freqs_cis[i] = self.freqs_cis[seq_len]
+        return prepared_freqs_cis
+
+    @torch.inference_mode()
+    def prefill(self, tokens, h, device="cuda"):
+        logger.warning(f"num layer {len(self.layers)}")
+        varlens = VarLens(tokens, device)
+        freqs_cis = self.prepare_freqs_cis_prefill(varlens, device)
+
+        # start of model
+        if self.rank == 0:
+            tokens = torch.from_numpy(np.concatenate(tokens)).to(device)
+            logger.warning(
+                f"1 num layer {len(self.layers)} {self.rank} {self.tok_embeddings.weight.device} {tokens.device} {tokens.shape}"
+            )
+            h = self.tok_embeddings(tokens)
+        logger.warning(f"1.5 num layer {len(self.layers)} {self.rank}")
+        # layers
+        logger.warning(f"2 num layer {len(self.layers)} {h.shape}")
+        for it, layer in enumerate(self.layers):
+            h = layer(h, 0, freqs_cis, None, varlens)
+        # end of model
+        logger.warning(f"3 num layer {len(self.layers)}")
+        if self.rank == self.world_size - 1:
+            h = self.norm(h)
+            h = self.output(h)
+            tmp = varlens.cpu_prefix_lens[1:]
+            h = h[[item - 1 for item in tmp]]
+            h = h.float()
+        logger.warning(f"4 num layer {len(self.layers)}")
+        return h
+
+    @torch.inference_mode()
+    def decode(self, tokens, seq_lens):
+        # generate different freqs_cis for each request, [num_req, other_freq_dim]
+        freqs_cis = self.prepare_freqs_cis_decode(seq_lens, tokens.device)
         h = self.tok_embeddings(tokens)
         for it, layer in enumerate(self.layers):
             h = layer(h, 1, freqs_cis, None)
