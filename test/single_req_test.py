@@ -6,6 +6,7 @@ from faker import Faker
 import hydra
 from omegaconf import DictConfig
 import torch
+import time
 
 from logging import getLogger
 import logging
@@ -93,8 +94,10 @@ def main(args: DictConfig):
             TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
     logger.warning("start running")
     timers("overall").start()
-    while len(TaskPool.pool) > 0 or rank != 0:
+    # while len(TaskPool.pool) > 0 or rank != 0:
+    while True:
         cinfer_run()
+        time.sleep(1)
     timers("overall").stop()
 
     for req in reqs:

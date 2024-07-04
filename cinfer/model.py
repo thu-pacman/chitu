@@ -39,6 +39,13 @@ from logging import getLogger
 logger = getLogger(__name__)
 
 
+class OngoingRequests:
+    def __init__(self, reqs, handle, logits):
+        self.reqs = reqs
+        self.handle = handle
+        self.logits = logits
+
+
 class Backend:
     model = None
     tokenizer = None
@@ -46,7 +53,24 @@ class Backend:
     args = None
     curr_varlens = None
     curr_req_ids = None
-    obj_group = None
+    ongoing_reqs = []
+    logit_group = None
+
+    @staticmethod
+    def update_ongoing_reqs():
+        to_remove = []
+        for ogr in Backend.ongoing_reqs:
+            if ogr.handle.is_completed():
+                logits = ogr.logits
+                for i, req in enumerate(ogr.reqs):
+                    req.add_data(
+                        Backend.tokenizer.decode(
+                            [torch.argmax(logits[i], dim=-1).item()]
+                        )
+                    )
+                to_remove.append(ogr)
+        for tr in to_remove:
+            Backend.ongoing_reqs.remove(tr)
 
     @staticmethod
     def build(args):
@@ -55,7 +79,7 @@ class Backend:
         if not model_parallel_is_initialized():
             model_parallel_size = 1  # int(os.environ.get("WORLD_SIZE", 1))
             initialize_model_parallel(model_parallel_size)
-        Backend.obj_group = torch.distributed.new_group(backend="gloo")
+        Backend.logit_group = torch.distributed.new_group(backend="nccl")
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)

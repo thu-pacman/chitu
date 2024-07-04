@@ -1,7 +1,7 @@
 import torch
 import torch.distributed
 from .task import PackedTasks, TaskType, DecodeTask
-from .model import Backend, VarLens
+from .model import Backend, VarLens, OngoingRequests
 from logging import getLogger
 from .global_vars import get_timers
 
@@ -113,22 +113,24 @@ class PipeExecutor(NormalExecutor):
         Backend.curr_req_ids = tasks.req_ids
         logger.warning(f"2 {self.rank} Prefill step: {tasks.task_ids}")
         logits = Backend.model.prefill(tasks.tokens, h, self.rank)
-        logger.warning(f"{self.rank} finish Prefill step: {tasks.task_ids}")
+        logger.warning(f"rank {self.rank} finish Prefill step: {tasks.task_ids}")
         self.timers("prefill").stop()
         # after prefill, new decode tasks are created
+        if self.rank == self.world_size - 1:
+            torch.distributed.send(logits, dst=0, group=Backend.logit_group)
         new_tasks = []
-        for it in range(tasks.num_tasks):
-            if self.rank == self.world_size - 1:
-                logger.warning(f"rank {self.rank} update response {tasks.task_ids}")
-                # tasks.tasks[it].update_response(logits[it])
-            # new_tasks.append(
-            #     DecodeTask(
-            #         self._prefill2decode(tasks.task_ids[it]),
-            #         tasks.tasks[it].req,
-            #         tasks.tasks[it],
-            #         next_token=None,
-            #     )
-            # )
+        # for it in range(tasks.num_tasks):
+        #     if self.rank == self.world_size - 1:
+        #         logger.warning(f"rank {self.rank} update response {tasks.task_ids}")
+        #         tasks.tasks[it].update_response(logits[it])
+        #     new_tasks.append(
+        #         DecodeTask(
+        #             self._prefill2decode(tasks.task_ids[it]),
+        #             tasks.tasks[it].req,
+        #             tasks.tasks[it],
+        #             next_token=None,
+        #         )
+        #     )
         Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
         return logits
 
@@ -192,5 +194,17 @@ class PipeExecutor(NormalExecutor):
             logger.warning(f"rank {self.rank} sending {tasks.task_ids}")
             torch.distributed.isend(tensor=task_tensor, dst=self.rank + 1)
             torch.distributed.isend(tensor=h, dst=self.rank + 1)
-        else:
-            return h
+        # else:
+        #     return h
+
+        if self.rank == 0:
+            logits = torch.empty(
+                [tasks.num_tasks, Backend.model.vocab_size],
+                device=self.rank,
+                dtype=torch.bfloat16,
+            )
+            logger.warning(f"rank {self.rank} receiving logits {logits.shape}")
+            handle = torch.distributed.irecv(
+                logits, src=self.world_size - 1, group=Backend.logit_group
+            )
+            Backend.ongoing_reqs.append(OngoingRequests(tasks.reqs, handle, logits))

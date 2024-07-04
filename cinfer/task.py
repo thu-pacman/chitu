@@ -22,6 +22,7 @@ class UserRequest:
     def add_data(self, data):
         self.async_stream.add_data(data)
         self.output += data
+        logger.warning(f"add data {data}")
 
 
 class TaskPool:
@@ -95,7 +96,7 @@ class PrefillTask(Task):
         # self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
         self.req.add_data(Backend.tokenizer.decode([self.next_token]))
 
-        # logger.warning(f"prefill token {(Backend.tokenizer.decode([self.next_token]))}")
+        logger.warning(f"prefill token {(Backend.tokenizer.decode([self.next_token]))}")
 
     def need_remove(self):
         return True
@@ -190,6 +191,9 @@ class PackedTasks:
                 dtype=torch.int64,
                 device=rank,
             )
+            self.reqs = []
+            for task in self.tasks:
+                self.reqs.append(task.req)
         else:
             task_tensor_cpu = task_tensor.cpu()
             decoded = []

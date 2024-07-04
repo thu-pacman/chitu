@@ -19,9 +19,13 @@ def cinfer_run():
     rank = torch.distributed.get_rank()
     if rank == 0:
         task_ids = Backend.scheduler.schedule()
+        if len(task_ids) == 0:
+            Backend.update_ongoing_reqs()
+            return
         tasks = PackedTasks(task_ids, rank)
     else:
         tasks = None
     logits = Backend.executor.step(tasks)
     if rank == 0:
+        Backend.update_ongoing_reqs()
         Backend.scheduler.update()
