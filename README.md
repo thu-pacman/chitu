@@ -6,6 +6,9 @@
 # Run on aliyun and A10*4
 source /home/spack/spack/share/spack/setup-env.sh
 spack load cuda
+pip install -U xformers --index-url https://download.pytorch.org/whl/cu121 # install xformer
+pip install -r requirements.txt # install other python dependencies
+pip install flash-attn # may meet network problem, if so, try `https_proxy=http://127.0.0.1:7891 pip install flash-attn`
 TORCH_CUDA_ARCH_LIST=8.6 python setup.py build -j4 develop
 ```
 
