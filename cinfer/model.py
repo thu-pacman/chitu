@@ -55,23 +55,6 @@ class Backend:
     curr_varlens = None
     curr_req_ids = None
     ongoing_reqs = []
-    logit_group = None
-
-    # @staticmethod
-    # def update_ongoing_reqs():
-    #     to_remove = []
-    #     for ogr in Backend.ongoing_reqs:
-    #         if ogr.handle.is_completed():
-    #             logits = ogr.logits
-    #             for i, req in enumerate(ogr.reqs):
-    #                 req.add_data(
-    #                     Backend.tokenizer.decode(
-    #                         [torch.argmax(logits[i], dim=-1).item()]
-    #                     )
-    #                 )
-    #             to_remove.append(ogr)
-    #     for tr in to_remove:
-    #         Backend.ongoing_reqs.remove(tr)
 
     @staticmethod
     def build(args):
@@ -80,7 +63,6 @@ class Backend:
         if not model_parallel_is_initialized():
             model_parallel_size = 1  # int(os.environ.get("WORLD_SIZE", 1))
             initialize_model_parallel(model_parallel_size)
-        Backend.logit_group = torch.distributed.new_group(backend="nccl")
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)

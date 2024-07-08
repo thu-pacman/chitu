@@ -20,21 +20,10 @@ def cinfer_init(args):
 
 
 def update_ongoing_reqs():
-    logger.warning(
-        f"rank {torch.distributed.get_rank()} update_ongoing_reqs: {len(Backend.ongoing_reqs)} "
-    )
     to_remove = []
     unwait_task_ids = []
     for ogr in Backend.ongoing_reqs:
         if ogr.handle.is_completed():
-            logger.warning(
-                f"rank {torch.distributed.get_rank()} {ogr.logits.shape} logit completed"
-            )
-            # logits = ogr.logits
-            # for i, req in enumerate(ogr.reqs):
-            #     req.add_data(
-            #         Backend.tokenizer.decode([torch.argmax(logits[i], dim=-1).item()])
-            #     )
             for task in ogr.tasks:
                 task.unwait()
                 unwait_task_ids.append(task.task_id)

@@ -107,34 +107,17 @@ class PipeExecutor(NormalExecutor):
 
     def prefill_step(self, tasks: PackedTasks, h=None):
         self.timers("prefill").start()
-        logger.warning(f"1 {self.rank} Prefill step: {tasks.task_ids}")
         varlens = VarLens(tasks.tokens, self.rank)
         Backend.curr_varlens = varlens
         Backend.curr_req_ids = tasks.req_ids
-        logger.warning(f"2 {self.rank} Prefill step: {tasks.task_ids}")
         logits = Backend.model.prefill(tasks.tokens, h, self.rank)
-        logger.warning(f"rank {self.rank} finish Prefill step: {tasks.task_ids}")
         self.timers("prefill").stop()
         # send logits to rank 0 to get response words
         if self.rank == self.world_size - 1:
             torch.cuda.synchronize(self.rank)
-            import time
-
-            time.sleep(10)
-            logger.warning(
-                f"rank {self.rank} sending {logits.shape} to rank 0 (prefill)"
-            )
             torch.distributed.isend(
                 logits,
                 dst=0,
-                # group=Backend.logit_group,
-            )
-            logger.warning(
-                f"rank {self.rank} sended {logits.shape} to rank 0 (prefill)"
-            )
-            torch.cuda.synchronize(self.rank)
-            logger.warning(
-                f"rank {self.rank} sended {logits.shape} to rank 0 (prefill) success"
             )
         Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
         # after prefill, new decode tasks are created
@@ -180,12 +163,8 @@ class PipeExecutor(NormalExecutor):
         # for it, task in enumerate(tasks.tasks):
         #     task.update_response(logits[it])
         if self.rank == self.world_size - 1:
-            logger.warning(
-                f"rank {self.rank} sending {logits.shape} to rank 0 (decode)"
-            )
             logits = logits.view(logits.shape[0], -1)
             torch.distributed.send(logits, dst=0)
-            logger.warning(f"rank {self.rank} sended {logits.shape} to rank 0 (decode)")
         Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return logits
 
@@ -198,18 +177,13 @@ class PipeExecutor(NormalExecutor):
                 PackedTasks.max_num_tasks * 2, dtype=torch.int64, device=self.rank
             )
             torch.cuda.synchronize(self.rank)
-            logger.warning(f"rank {self.rank} receiving task {task_tensor}")
             torch.distributed.recv(tensor=task_tensor, src=self.rank - 1)
-            logger.warning(f"rank {self.rank} received task 1")
-            torch.cuda.synchronize(self.rank)
-            logger.warning(f"rank {self.rank} received task 1.5")
             # generate packed tasks according to task_ids and prefix_lens
             tasks = PackedTasks(
                 None,
                 self.rank,
                 task_tensor,
             )
-            logger.warning(f"rank {self.rank} received task 2")
             if tasks.task_type == TaskType.Prefill:
                 h = torch.empty(
                     [
@@ -225,10 +199,7 @@ class PipeExecutor(NormalExecutor):
                     device=self.rank,
                     dtype=torch.bfloat16,
                 )
-            logger.warning(f"rank {self.rank} received task 3")
-            logger.warning(f"rank {self.rank} receiving {h.shape}")
             torch.distributed.recv(tensor=h, src=self.rank - 1)
-            logger.warning(f"rank {self.rank} received {h.shape}")
         else:
             task_tensor = tasks.task_tensor
             h = None
@@ -242,9 +213,6 @@ class PipeExecutor(NormalExecutor):
             raise NotImplementedError  # Hybrid task not implemented
 
         if self.rank < self.world_size - 1:
-            logger.warning(
-                f"rank {self.rank} sending {tasks.task_ids} {h.shape} {task_tensor}"
-            )
             torch.distributed.isend(tensor=task_tensor, dst=self.rank + 1)
             torch.distributed.isend(tensor=h, dst=self.rank + 1)
         # else:
@@ -256,10 +224,7 @@ class PipeExecutor(NormalExecutor):
                 device=self.rank,
                 dtype=torch.float,
             )
-            logger.warning(f"rank {self.rank} receiving logits {logits.shape}")
-            handle = torch.distributed.irecv(
-                logits, src=self.world_size - 1  # , group=Backend.logit_group
-            )
+            handle = torch.distributed.irecv(logits, src=self.world_size - 1)
             Backend.ongoing_reqs.append(
                 OngoingRequests(tasks.reqs, tasks.tasks + new_tasks, handle, logits)
             )
