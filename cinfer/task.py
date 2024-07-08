@@ -22,7 +22,7 @@ class UserRequest:
     def add_data(self, data):
         self.async_stream.add_data(data)
         self.output += data
-        logger.warning(f"add data {data}")
+        # logger.warning(f"add data {data}")
 
 
 class TaskPool:
@@ -68,9 +68,28 @@ class Task:
         self.sched_score = 0
         self.prefix_length = -1
         self.max_output_tokens = -1
+        self.waiting = False
+        self.handle = None
+        self.wait_logit = None
 
     def need_remove(self):
         raise NotImplementedError
+
+    def update_response(self, logit):
+        raise NotImplementedError
+
+    def wait(self, handle, logit):
+        self.waiting = True
+        self.handle = handle
+        self.wait_logit = logit
+
+    def unwait(self):
+        # logger.warning(f"unwait {self.task_id}")
+        self.waiting = False
+        self.handle = None
+        if self.wait_logit is not None:
+            self.update_response(self.wait_logit)
+        self.wait_logit = None
 
 
 class PrefillTask(Task):
@@ -90,16 +109,18 @@ class PrefillTask(Task):
             + self.prefix_length * 1000 * 1000
             + self.max_output_tokens * 1000 * 1000
         )
+        self.linked_task = None
 
     def update_response(self, logit):
         self.next_token = torch.argmax(logit, dim=-1).item()
         # self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
         self.req.add_data(Backend.tokenizer.decode([self.next_token]))
-
-        logger.warning(f"prefill token {(Backend.tokenizer.decode([self.next_token]))}")
+        if self.linked_task is not None:
+            self.linked_task.next_token = self.next_token
+        # logger.warning(f"prefill token {(Backend.tokenizer.decode([self.next_token]))}")
 
     def need_remove(self):
-        return True
+        return not self.waiting
 
 
 class DecodeTask(Task):
@@ -110,6 +131,7 @@ class DecodeTask(Task):
         prefill_task: PrefillTask,
         next_token,
         priority: int = 1,
+        waiting: bool = False,
     ):
         super().__init__(task_id, req, priority)
         self.prefill = prefill_task
@@ -117,14 +139,19 @@ class DecodeTask(Task):
         self.max_output_tokens = self.prefill.max_output_tokens
         self.sched_ddl = self.prefill.sched_ddl
         self.task_type = TaskType.Decode
-        self.response = [next_token]
+        if next_token is not None:
+            self.response = [next_token]
+        else:
+            self.response = []
         self.next_token = next_token
+        self.waiting = waiting
         TaskPool.add(self)
 
     def update_response(
         self, logit
     ):  # TODO: modify if generate more than one token at a time
         self.next_token = torch.argmax(logit, dim=-1).item()
+        assert self.next_token is not None
         self.response.append(self.next_token)
         self.prefix_length += 1
         self.max_output_tokens -= 1
@@ -135,10 +162,13 @@ class DecodeTask(Task):
     def need_remove(self):
         if Backend.args.stop_with_eos:
             return (
-                torch.isin(self.response[-1], Backend.tokenizer.stop_tokens)
-                or len(self.response) >= self.req.max_new_tokens
-            )
-        return len(self.response) >= self.req.max_new_tokens
+                len(self.response) > 0
+                and (
+                    torch.isin(self.response[-1], Backend.tokenizer.stop_tokens)
+                    or len(self.response) >= self.req.max_new_tokens
+                )
+            ) and not self.waiting
+        return len(self.response) >= self.req.max_new_tokens and not self.waiting
 
 
 # +:prefill, -:decode
@@ -183,7 +213,8 @@ class PackedTasks:
             encoded = [0] * (PackedTasks.max_num_tasks * 2)
             for i, tid in enumerate(self.task_ids):
                 encoded[i] = req_encode(tid)
-                encoded[PackedTasks.max_num_tasks + i] = len(self.tasks[i].tokens)
+                if self.task_type == TaskType.Prefill:
+                    encoded[PackedTasks.max_num_tasks + i] = len(self.tasks[i].tokens)
             # length_sum = sum([len(task.tokens) for task in self.tasks])
             # encoded[PackedTasks.max_num_tasks] = length_sum
             self.task_tensor = torch.tensor(
@@ -194,26 +225,46 @@ class PackedTasks:
             self.reqs = []
             for task in self.tasks:
                 self.reqs.append(task.req)
+            logger.warning(
+                f"rank {torch.distributed.get_rank()} packing tasks {self.task_type}"
+            )
         else:
+            logger.warning(
+                f"rank {torch.distributed.get_rank()} gen tasks {task_tensor.shape}"
+            )
+            torch.cuda.synchronize(torch.distributed.get_rank())
+            logger.warning(
+                f"rank {torch.distributed.get_rank()} gen tasks {task_tensor.shape}"
+            )
+            logger.warning(
+                f"rank {torch.distributed.get_rank()} gen tasks {task_tensor}"
+            )
             task_tensor_cpu = task_tensor.cpu()
             decoded = []
             lens = []
+            logger.warning(f"length of task tensor {task_tensor_cpu.shape}")
             for it, task_id in enumerate(task_tensor_cpu):
                 if task_id == 0:
                     break
                 decoded.append(req_decode(task_id))
-                lens.append(int(task_tensor_cpu[PackedTasks.max_num_tasks + it]))
+                if task_id > 0:  # prefill
+                    lens.append(int(task_tensor_cpu[PackedTasks.max_num_tasks + it]))
             self.task_ids = decoded
             self.num_tasks = len(self.task_ids)
             assert self.num_tasks > 0, "No tasks provided"
-            self.req_ids = [item.split("_", 1)[0] for item in self.task_ids]
+            tmp = self.task_ids[0].split("_", 1)
+            logger.warning(f"packing task reqs {self.task_ids} {tmp}")
+            self.req_ids = [item.split("_", 1)[1] for item in self.task_ids]
+            logger.warning(f"packing task reqs {self.req_ids}")
             self.task_type = (
                 TaskType.Prefill
                 if self.task_ids[0].startswith("prefill")
                 else TaskType.Decode
             )
+            logger.warning(f"generating tasks {self.task_type}")
             self.task_tensor = task_tensor
-            self.tokens = [([0] * lens[it]) for it in range(len(lens))]
+            if self.task_type == TaskType.Prefill:
+                self.tokens = [([0] * lens[it]) for it in range(len(lens))]
 
     def pack_tokens(self):
         tokens = []

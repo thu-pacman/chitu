@@ -35,10 +35,13 @@ class Scheduler:
         assert len(self.ret_task_ids) == 0
         return self.ret_task_ids
 
-    def update(self):
+    def update(self, unwait_task_ids=[]):
         for task_id in self.ret_task_ids:
             if TaskPool.pool[task_id].need_remove():
                 logger.warning(f"Task {task_id} is done")
+                assert TaskPool.remove(task_id), "Task not found in pool"
+        for task_id in unwait_task_ids:
+            if task_id in TaskPool.id_list and TaskPool.pool[task_id].need_remove():
                 assert TaskPool.remove(task_id), "Task not found in pool"
         self.ret_task_ids = []  # reset scheduled tasks
 
@@ -94,7 +97,9 @@ class PrefillFirstScheduler(Scheduler):
     def schedule(self) -> list[str]:
         super().schedule()
         prefill_task_ids = filter(
-            lambda x: TaskPool.pool[x].task_type == TaskType.Prefill, TaskPool.id_list
+            lambda x: TaskPool.pool[x].task_type == TaskType.Prefill
+            and not TaskPool.pool[x].waiting,
+            TaskPool.id_list,
         )
         # select at most num_tasks prefill tasks
         self.ret_task_ids = list(prefill_task_ids)[: self.num_tasks]
@@ -103,7 +108,8 @@ class PrefillFirstScheduler(Scheduler):
             self.enable_hybrid and len(self.ret_task_ids) < self.num_tasks
         ):
             decode_task_ids = filter(
-                lambda x: TaskPool.pool[x].task_type == TaskType.Decode,
+                lambda x: TaskPool.pool[x].task_type == TaskType.Decode
+                and not TaskPool.pool[x].waiting,
                 TaskPool.id_list,
             )
             self.ret_task_ids.extend(

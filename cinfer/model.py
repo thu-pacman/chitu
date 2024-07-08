@@ -40,8 +40,9 @@ logger = getLogger(__name__)
 
 
 class OngoingRequests:
-    def __init__(self, reqs, handle, logits):
+    def __init__(self, reqs, tasks, handle, logits):
         self.reqs = reqs
+        self.tasks = tasks
         self.handle = handle
         self.logits = logits
 
@@ -56,21 +57,21 @@ class Backend:
     ongoing_reqs = []
     logit_group = None
 
-    @staticmethod
-    def update_ongoing_reqs():
-        to_remove = []
-        for ogr in Backend.ongoing_reqs:
-            if ogr.handle.is_completed():
-                logits = ogr.logits
-                for i, req in enumerate(ogr.reqs):
-                    req.add_data(
-                        Backend.tokenizer.decode(
-                            [torch.argmax(logits[i], dim=-1).item()]
-                        )
-                    )
-                to_remove.append(ogr)
-        for tr in to_remove:
-            Backend.ongoing_reqs.remove(tr)
+    # @staticmethod
+    # def update_ongoing_reqs():
+    #     to_remove = []
+    #     for ogr in Backend.ongoing_reqs:
+    #         if ogr.handle.is_completed():
+    #             logits = ogr.logits
+    #             for i, req in enumerate(ogr.reqs):
+    #                 req.add_data(
+    #                     Backend.tokenizer.decode(
+    #                         [torch.argmax(logits[i], dim=-1).item()]
+    #                     )
+    #                 )
+    #             to_remove.append(ogr)
+    #     for tr in to_remove:
+    #         Backend.ongoing_reqs.remove(tr)
 
     @staticmethod
     def build(args):
@@ -688,7 +689,7 @@ class PipeTransformer(nn.Module):
             h = self.tok_embeddings(tokens)
         logger.warning(f"1.5 num layer {len(self.layers)} {self.rank}")
         # layers
-        logger.warning(f"2 num layer {len(self.layers)} {h.shape}")
+        logger.warning(f"2 num layer {self.rank} {len(self.layers)} {h.shape}")
         for it, layer in enumerate(self.layers):
             h = layer(h, 0, freqs_cis, None, varlens)
         # end of model
@@ -703,12 +704,14 @@ class PipeTransformer(nn.Module):
         return h
 
     @torch.inference_mode()
-    def decode(self, tokens, seq_lens):
+    def decode(self, tokens, h, seq_lens, device="cuda"):
         # generate different freqs_cis for each request, [num_req, other_freq_dim]
-        freqs_cis = self.prepare_freqs_cis_decode(seq_lens, tokens.device)
-        h = self.tok_embeddings(tokens)
+        freqs_cis = self.prepare_freqs_cis_decode(seq_lens, device)
+        if self.rank == 0:
+            h = self.tok_embeddings(tokens)
         for it, layer in enumerate(self.layers):
             h = layer(h, 1, freqs_cis, None)
-        h = self.norm(h)
-        output = self.output(h).float()
-        return output
+        if self.rank == self.world_size - 1:
+            h = self.norm(h)
+            h = self.output(h).float()
+        return h
