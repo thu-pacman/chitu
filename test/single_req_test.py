@@ -82,19 +82,22 @@ def main(args: DictConfig):
     #     num_reqs=16, prompt_len=512, max_new_tokens=args.request.max_new_tokens
     # )
     rank = torch.distributed.get_rank()
-    if rank == 0:
-        reqs = gen_reqs_real(num_reqs=16, max_new_tokens=args.request.max_new_tokens)
+    for i in range(2):
+        if rank == 0:
+            reqs = gen_reqs_real(
+                num_reqs=16, max_new_tokens=args.request.max_new_tokens
+            )
+            for req in reqs:
+                TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
+        timers("overall").start()
+        while len(TaskPool.pool) > 0 or rank != 0:
+            cinfer_run()
+        timers("overall").stop()
+
         for req in reqs:
-            TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
-    timers("overall").start()
-    while len(TaskPool.pool) > 0 or rank != 0:
-        cinfer_run()
-    timers("overall").stop()
+            logger.warning(f"Response in rank {rank}: {req.output}")
 
-    for req in reqs:
-        logger.warning(f"Response in rank {rank}: {req.output}")
-
-    timers.log()
+        timers.log()
 
 
 if __name__ == "__main__":

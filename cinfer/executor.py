@@ -1,6 +1,13 @@
 import torch
 import torch.distributed
-from .task import PackedTasks, TaskType, DecodeTask, TaskPool
+from .task import (
+    PackedTasks,
+    TaskType,
+    DecodeTask,
+    TaskPool,
+    req_decode,
+    taskid2reqid,
+)
 from .model import Backend, VarLens, OngoingRequests
 from logging import getLogger
 from .global_vars import get_timers
@@ -30,6 +37,22 @@ class Executor:
 
     def _prefill2decode(self, task_id):
         return task_id.replace("prefill_", "decode_")
+
+    def _prepare_seq_lens_for_decode(self, tasks):
+        seq_lens = []
+        for req_id in tasks.req_ids:
+            seq_len = Backend.cache_manager.lengths[req_id]
+            seq_lens.append(seq_len)
+        return seq_lens
+
+    def _prepare_new_tokens_for_decode(self, tasks):
+        new_tokens = []
+        for task in tasks.tasks:
+            new_tokens.append(task.next_token)
+        new_tokens = torch.tensor(
+            new_tokens, device="cuda", dtype=torch.long
+        ).unsqueeze(1)
+        return new_tokens
 
 
 class NormalExecutor(Executor):
@@ -67,16 +90,8 @@ class NormalExecutor(Executor):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
         # logger.info(f"Decode step: {tasks.task_ids}")
         self.timers("decode").start()
-        seq_lens = []
-        for req_id in tasks.req_ids:
-            seq_len = Backend.cache_manager.lengths[req_id]
-            seq_lens.append(seq_len)
-        new_tokens = []
-        for task in tasks.tasks:
-            new_tokens.append(task.next_token)
-        new_tokens = torch.tensor(
-            new_tokens, device="cuda", dtype=torch.long
-        ).unsqueeze(1)
+        new_tokens = self._prepare_new_tokens_for_decode(tasks)
+        seq_lens = self._prepare_seq_lens_for_decode(tasks)
         self.timers("decode-model").start()
         logits = Backend.model.decode(new_tokens, seq_lens)
         self.timers("decode-model").stop()
@@ -110,7 +125,7 @@ class PipeExecutor(NormalExecutor):
         varlens = VarLens(tasks.tokens, self.rank)
         Backend.curr_varlens = varlens
         Backend.curr_req_ids = tasks.req_ids
-        logits = Backend.model.prefill(tasks.tokens, h, self.rank)
+        logits = Backend.model.prefill(tasks.tokens if self.rank == 0 else h, self.rank)
         self.timers("prefill").stop()
         # send logits to rank 0 to get response words
         if self.rank == self.world_size - 1:
@@ -139,25 +154,12 @@ class PipeExecutor(NormalExecutor):
         return logits, new_tasks
 
     def decode_step(self, tasks: PackedTasks, h=None):
-        logger.warning(f"decode reqs {tasks.req_ids}")
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
-        # logger.info(f"Decode step: {tasks.task_ids}")
         self.timers("decode").start()
-        seq_lens = []
-        for req_id in tasks.req_ids:
-            seq_len = Backend.cache_manager.lengths[req_id]
-            seq_lens.append(seq_len)
-        if self.rank == 0:
-            new_tokens = []
-            for task in tasks.tasks:
-                new_tokens.append(task.next_token)
-            new_tokens = torch.tensor(
-                new_tokens, device="cuda", dtype=torch.long
-            ).unsqueeze(1)
-        else:
-            new_tokens = None
+        seq_lens = self._prepare_seq_lens_for_decode(tasks)
+        tokens = self._prepare_new_tokens_for_decode(tasks) if self.rank == 0 else h
         self.timers("decode-model").start()
-        logits = Backend.model.decode(new_tokens, h, seq_lens, self.rank)
+        logits = Backend.model.decode(tokens, seq_lens, self.rank)
         self.timers("decode-model").stop()
         self.timers("decode").stop()
         # Send logits to rank 0 to get response words
@@ -182,6 +184,11 @@ class PipeExecutor(NormalExecutor):
             PackedTasks.max_num_tasks * 2, dtype=torch.int64, device=self.rank
         )
         torch.distributed.recv(tensor=task_tensor, src=self.rank - 1)
+        if PackedTasks.is_ended_tasks(task_tensor):
+            logger.warning("removing kvcache")
+            if self.rank < self.world_size - 1:
+                torch.distributed.isend(task_tensor, dst=self.rank + 1)
+            return task_tensor.cpu(), None, None
         # generate packed tasks according to task_tensor
         tasks = PackedTasks(None, self.rank, task_tensor)
         if tasks.task_type == TaskType.Prefill:
@@ -229,6 +236,16 @@ class PipeExecutor(NormalExecutor):
             if self.rank > 0
             else (tasks.task_tensor, None, tasks)
         )
+        # get remove-kvcache signal
+        if tasks is None:
+            logger.warning("removing kvcache")
+            for i in range(PackedTasks.max_num_tasks):
+                if task_tensor[i] == 0:
+                    break
+                Backend.cache_manager.finalize_cache_all_decode(
+                    taskid2reqid(req_decode(task_tensor[i]))
+                )
+            return
         # Run tasks
         h, new_decode_tasks = self._run_tasks(tasks, h)
         # Rank < world_size - 1 send task tensor and h to Rank + 1

@@ -36,14 +36,19 @@ class Scheduler:
         return self.ret_task_ids
 
     def update(self, unwait_task_ids=[]):
-        for task_id in self.ret_task_ids:
+        removed_task_ids = []
+        task_ids = self.ret_task_ids + unwait_task_ids
+        for task_id in task_ids:
             if TaskPool.pool[task_id].need_remove():
                 logger.warning(f"Task {task_id} is done")
+                if TaskPool.pool[task_id].task_type == TaskType.Decode:
+                    removed_task_ids.append(task_id)
                 assert TaskPool.remove(task_id), "Task not found in pool"
-        for task_id in unwait_task_ids:
-            if task_id in TaskPool.id_list and TaskPool.pool[task_id].need_remove():
-                assert TaskPool.remove(task_id), "Task not found in pool"
+        # for task_id in unwait_task_ids:
+        #     if task_id in TaskPool.id_list and TaskPool.pool[task_id].need_remove():
+        #         assert TaskPool.remove(task_id), "Task not found in pool"
         self.ret_task_ids = []  # reset scheduled tasks
+        return removed_task_ids
 
     def is_done(self):
         return len(TaskPool.pool) == 0

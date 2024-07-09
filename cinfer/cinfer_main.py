@@ -1,7 +1,7 @@
 import torch.distributed
 from .executor import Executor
 from .scheduler import Scheduler
-from .task import PackedTasks
+from .task import PackedTasks, req_encode
 from .model import Backend
 import torch
 from logging import getLogger
@@ -17,6 +17,21 @@ def cinfer_init(args):
     executor = Executor.build(args.executor)
     Backend.executor = executor
     PackedTasks.max_num_tasks = 32
+
+
+def remove_task_other_device(remove_task_ids):
+    if len(remove_task_ids) == 0:
+        return
+    encoded = [0] * (PackedTasks.max_num_tasks * 2)
+    encoded[PackedTasks.max_num_tasks] = -1  # Flag to indicate ending these tasks
+    for it, tid in enumerate(remove_task_ids):
+        encoded[it] = req_encode(tid)
+    task_tensor = torch.tensor(
+        encoded,
+        dtype=torch.int64,
+        device=0,
+    )
+    torch.distributed.isend(tensor=task_tensor, dst=1)
 
 
 def update_ongoing_reqs():
@@ -35,7 +50,15 @@ def update_ongoing_reqs():
 
 def update_ongoing_tasks():
     unwait_task_ids = update_ongoing_reqs()
-    Backend.scheduler.update(unwait_task_ids)
+    return unwait_task_ids
+
+
+def cinfer_update(ws):
+    removed_decode_task_ids = Backend.scheduler.update(
+        update_ongoing_tasks() if ws > 1 else []
+    )
+    # logger.warning(f"Removed decode tasks: {removed_decode_task_ids}")
+    remove_task_other_device(removed_decode_task_ids)
 
 
 def cinfer_run():
@@ -43,14 +66,12 @@ def cinfer_run():
     world_size = torch.distributed.get_world_size()
     if rank == 0:
         task_ids = Backend.scheduler.schedule()
-        if len(task_ids) == 0:
-            update_ongoing_tasks()
+        if len(task_ids) == 0:  # no tasks to do, but some tasks are waiting
+            cinfer_update(world_size)
             return
         tasks = PackedTasks(task_ids, rank)
     else:
         tasks = None
     Backend.executor.step(tasks)
-    if world_size > 1 and rank == 0:
-        update_ongoing_tasks()
-    elif rank == 0:
-        Backend.scheduler.update(task_ids)
+    if rank == 0:
+        cinfer_update(world_size)

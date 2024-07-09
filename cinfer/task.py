@@ -171,9 +171,13 @@ class DecodeTask(Task):
         return len(self.response) >= self.req.max_new_tokens and not self.waiting
 
 
+def taskid2reqid(task_id):
+    return task_id.split("_", 1)[1]
+
+
 # +:prefill, -:decode
-def req_encode(req_id: str):
-    parts = req_id.split("_", 1)
+def req_encode(task_id: str):
+    parts = task_id.split("_", 1)
     if parts[0] == "prefill":
         return int(parts[1], 16)
     else:
@@ -189,6 +193,9 @@ def req_decode(id_num: int):
 
 class PackedTasks:
     max_num_tasks = -1
+
+    def is_ended_tasks(task_tensor):
+        return task_tensor[PackedTasks.max_num_tasks] == -1
 
     def __init__(self, task_ids, rank=0, task_tensor=None):
         self.tasks = []

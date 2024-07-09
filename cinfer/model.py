@@ -657,14 +657,16 @@ class PipeTransformer(nn.Module):
         return prepared_freqs_cis
 
     @torch.inference_mode()
-    def prefill(self, tokens, h, device="cuda"):
-        varlens = VarLens(tokens, device)
+    def prefill(self, tokens, device="cuda"):
+        varlens = Backend.curr_varlens
         freqs_cis = self.prepare_freqs_cis_prefill(varlens, device)
 
         # start of model
         if self.rank == 0:
             tokens = torch.from_numpy(np.concatenate(tokens)).to(device)
             h = self.tok_embeddings(tokens)
+        else:
+            h = tokens
         # layers
         for it, layer in enumerate(self.layers):
             h = layer(h, 0, freqs_cis, None, varlens)
@@ -678,11 +680,13 @@ class PipeTransformer(nn.Module):
         return h
 
     @torch.inference_mode()
-    def decode(self, tokens, h, seq_lens, device="cuda"):
+    def decode(self, tokens, seq_lens, device="cuda"):
         # generate different freqs_cis for each request, [num_req, other_freq_dim]
         freqs_cis = self.prepare_freqs_cis_decode(seq_lens, device)
         if self.rank == 0:
             h = self.tok_embeddings(tokens)
+        else:
+            h = tokens
         for it, layer in enumerate(self.layers):
             h = layer(h, 1, freqs_cis, None)
         if self.rank == self.world_size - 1:
