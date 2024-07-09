@@ -33,6 +33,12 @@ msgs = [
 ]
 
 
+def gen_req_id(len=8):
+    random_number = random.getrandbits(len * 4)
+    hex_string = f"{random_number:0{len}x}"
+    return hex_string
+
+
 def gen_reqs(num_reqs, prompt_len, max_new_tokens):
     fake = Faker()
     reqs = []
@@ -40,7 +46,7 @@ def gen_reqs(num_reqs, prompt_len, max_new_tokens):
         msg = ""
         for j in range(prompt_len):
             msg += fake.word() + " "
-        req = UserRequest(msg, f"request_{i}", max_new_tokens=max_new_tokens)
+        req = UserRequest(msg, f"{gen_req_id()}", max_new_tokens=max_new_tokens)
         reqs.append(req)
     return reqs
 
@@ -48,19 +54,9 @@ def gen_reqs(num_reqs, prompt_len, max_new_tokens):
 import random
 
 
-def gen_req_id(len=8):
-    random_number = random.getrandbits(len * 4)
-    hex_string = f"{random_number:0{len}x}"
-    return hex_string
-
-
-def gen_reqs_real(num_reqs, prompt_len, max_new_tokens):
+def gen_reqs_real(num_reqs, max_new_tokens):
     reqs = []
     for i in range(num_reqs):
-        # msg = ""
-        # for j in range(prompt_len):
-        #     msg += fake.word() + " "
-        # req = UserRequest(msg, f"request_{i}", max_new_tokens=max_new_tokens)
         req = UserRequest(
             msgs[i % len(msgs)], f"{gen_req_id()}", max_new_tokens=max_new_tokens
         )
@@ -87,21 +83,16 @@ def main(args: DictConfig):
     # )
     rank = torch.distributed.get_rank()
     if rank == 0:
-        reqs = gen_reqs_real(
-            num_reqs=16, prompt_len=512, max_new_tokens=args.request.max_new_tokens
-        )
+        reqs = gen_reqs_real(num_reqs=16, max_new_tokens=args.request.max_new_tokens)
         for req in reqs:
             TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
-    logger.warning("start running")
     timers("overall").start()
-    # while len(TaskPool.pool) > 0 or rank != 0:
-    while True:
+    while len(TaskPool.pool) > 0 or rank != 0:
         cinfer_run()
-        time.sleep(1)
     timers("overall").stop()
 
     for req in reqs:
-        logger.warning(f"Response: {req.output}")
+        logger.warning(f"Response in rank {rank}: {req.output}")
 
     timers.log()
 

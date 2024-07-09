@@ -160,73 +160,80 @@ class PipeExecutor(NormalExecutor):
         logits = Backend.model.decode(new_tokens, h, seq_lens, self.rank)
         self.timers("decode-model").stop()
         self.timers("decode").stop()
-        # for it, task in enumerate(tasks.tasks):
-        #     task.update_response(logits[it])
+        # Send logits to rank 0 to get response words
         if self.rank == self.world_size - 1:
             logits = logits.view(logits.shape[0], -1)
-            torch.distributed.send(logits, dst=0)
+            torch.distributed.isend(logits, dst=0)
         Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return logits
+
+    def _run_tasks(self, tasks, h):
+        if tasks.task_type == TaskType.Prefill:
+            h, new_decode_tasks = self.prefill_step(tasks, h)
+        elif tasks.task_type == TaskType.Decode:
+            h = self.decode_step(tasks, h)
+            new_decode_tasks = []
+        else:
+            raise NotImplementedError  # Hybrid task not implemented
+        return h, new_decode_tasks
+
+    def _recv_task_tensor_and_h(self):
+        task_tensor = torch.empty(
+            PackedTasks.max_num_tasks * 2, dtype=torch.int64, device=self.rank
+        )
+        torch.distributed.recv(tensor=task_tensor, src=self.rank - 1)
+        # generate packed tasks according to task_tensor
+        tasks = PackedTasks(None, self.rank, task_tensor)
+        if tasks.task_type == TaskType.Prefill:
+            h = torch.empty(
+                [
+                    sum([len(token) for token in tasks.tokens]),
+                    Backend.model.params.dim,
+                ],
+                device=self.rank,
+                dtype=torch.bfloat16,
+            )
+        else:
+            h = torch.empty(
+                [tasks.num_tasks, 1, Backend.model.params.dim],
+                device=self.rank,
+                dtype=torch.bfloat16,
+            )
+        torch.distributed.recv(tensor=h, src=self.rank - 1)
+        return task_tensor, h, tasks
+
+    def _send_task_tensor_and_h(self, task_tensor, h):
+        torch.distributed.isend(tensor=task_tensor, dst=self.rank + 1)
+        torch.distributed.isend(tensor=h, dst=self.rank + 1)
+
+    def _recv_logits(self, tasks, new_decode_tasks):
+        logits = torch.empty(
+            [tasks.num_tasks, Backend.model.vocab_size],
+            device=self.rank,
+            dtype=torch.float,
+        )
+        handle = torch.distributed.irecv(logits, src=self.world_size - 1)
+        Backend.ongoing_reqs.append(
+            OngoingRequests(tasks.reqs, tasks.tasks + new_decode_tasks, handle, logits)
+        )
+        for it, task in enumerate(tasks.tasks):
+            task.wait(handle, logits[it])
 
     def step(
         self,
         tasks: PackedTasks = None,
     ):
-        if self.rank > 0:
-            task_tensor = torch.empty(
-                PackedTasks.max_num_tasks * 2, dtype=torch.int64, device=self.rank
-            )
-            torch.cuda.synchronize(self.rank)
-            torch.distributed.recv(tensor=task_tensor, src=self.rank - 1)
-            # generate packed tasks according to task_ids and prefix_lens
-            tasks = PackedTasks(
-                None,
-                self.rank,
-                task_tensor,
-            )
-            if tasks.task_type == TaskType.Prefill:
-                h = torch.empty(
-                    [
-                        sum([len(token) for token in tasks.tokens]),
-                        Backend.model.params.dim,
-                    ],
-                    device=self.rank,
-                    dtype=torch.bfloat16,
-                )
-            else:
-                h = torch.empty(
-                    [tasks.num_tasks, 1, Backend.model.params.dim],
-                    device=self.rank,
-                    dtype=torch.bfloat16,
-                )
-            torch.distributed.recv(tensor=h, src=self.rank - 1)
-        else:
-            task_tensor = tasks.task_tensor
-            h = None
-
-        if tasks.task_type == TaskType.Prefill:
-            h, new_tasks = self.prefill_step(tasks, h)
-        elif tasks.task_type == TaskType.Decode:
-            h = self.decode_step(tasks, h)
-            new_tasks = []
-        else:
-            raise NotImplementedError  # Hybrid task not implemented
-
+        # Rank >= 1 recv task tensor and h from Rank - 1
+        task_tensor, h, tasks = (
+            self._recv_task_tensor_and_h()
+            if self.rank > 0
+            else (tasks.task_tensor, None, tasks)
+        )
+        # Run tasks
+        h, new_decode_tasks = self._run_tasks(tasks, h)
+        # Rank < world_size - 1 send task tensor and h to Rank + 1
         if self.rank < self.world_size - 1:
-            torch.distributed.isend(tensor=task_tensor, dst=self.rank + 1)
-            torch.distributed.isend(tensor=h, dst=self.rank + 1)
-        # else:
-        #     return h
-
+            self._send_task_tensor_and_h(task_tensor, h)
+        # Rank 0 recv final logits from Rank world_size - 1
         if self.rank == 0:
-            logits = torch.empty(
-                [tasks.num_tasks, Backend.model.vocab_size],
-                device=self.rank,
-                dtype=torch.float,
-            )
-            handle = torch.distributed.irecv(logits, src=self.world_size - 1)
-            Backend.ongoing_reqs.append(
-                OngoingRequests(tasks.reqs, tasks.tasks + new_tasks, handle, logits)
-            )
-            for it, task in enumerate(tasks.tasks):
-                task.wait(handle, logits[it])
+            self._recv_logits(tasks, new_decode_tasks)

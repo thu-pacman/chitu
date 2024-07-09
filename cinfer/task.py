@@ -215,8 +215,6 @@ class PackedTasks:
                 encoded[i] = req_encode(tid)
                 if self.task_type == TaskType.Prefill:
                     encoded[PackedTasks.max_num_tasks + i] = len(self.tasks[i].tokens)
-            # length_sum = sum([len(task.tokens) for task in self.tasks])
-            # encoded[PackedTasks.max_num_tasks] = length_sum
             self.task_tensor = torch.tensor(
                 encoded,
                 dtype=torch.int64,
@@ -225,24 +223,10 @@ class PackedTasks:
             self.reqs = []
             for task in self.tasks:
                 self.reqs.append(task.req)
-            logger.warning(
-                f"rank {torch.distributed.get_rank()} packing tasks {self.task_type}"
-            )
         else:
-            logger.warning(
-                f"rank {torch.distributed.get_rank()} gen tasks {task_tensor.shape}"
-            )
-            torch.cuda.synchronize(torch.distributed.get_rank())
-            logger.warning(
-                f"rank {torch.distributed.get_rank()} gen tasks {task_tensor.shape}"
-            )
-            logger.warning(
-                f"rank {torch.distributed.get_rank()} gen tasks {task_tensor}"
-            )
             task_tensor_cpu = task_tensor.cpu()
             decoded = []
             lens = []
-            logger.warning(f"length of task tensor {task_tensor_cpu.shape}")
             for it, task_id in enumerate(task_tensor_cpu):
                 if task_id == 0:
                     break
@@ -252,16 +236,13 @@ class PackedTasks:
             self.task_ids = decoded
             self.num_tasks = len(self.task_ids)
             assert self.num_tasks > 0, "No tasks provided"
-            tmp = self.task_ids[0].split("_", 1)
-            logger.warning(f"packing task reqs {self.task_ids} {tmp}")
             self.req_ids = [item.split("_", 1)[1] for item in self.task_ids]
-            logger.warning(f"packing task reqs {self.req_ids}")
+            # TODO: need to change task type classification when adding hybrid task
             self.task_type = (
                 TaskType.Prefill
                 if self.task_ids[0].startswith("prefill")
                 else TaskType.Decode
             )
-            logger.warning(f"generating tasks {self.task_type}")
             self.task_tensor = task_tensor
             if self.task_type == TaskType.Prefill:
                 self.tokens = [([0] * lens[it]) for it in range(len(lens))]
@@ -272,10 +253,3 @@ class PackedTasks:
             if task.task_type == TaskType.Prefill:
                 tokens.append(task.tokens)
         self.tokens = tokens
-
-    # def pack_kvcache(self):  # TODO: impl for KVCache
-    #     kvcaches = []
-    #     for task in self.tasks:
-    #         if task.task_type == TaskType.Decode:
-    #             kvcaches.append(task.kvcache)
-    #     self.kvcaches = kvcaches

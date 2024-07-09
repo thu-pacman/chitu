@@ -658,31 +658,23 @@ class PipeTransformer(nn.Module):
 
     @torch.inference_mode()
     def prefill(self, tokens, h, device="cuda"):
-        logger.warning(f"num layer {len(self.layers)}")
         varlens = VarLens(tokens, device)
         freqs_cis = self.prepare_freqs_cis_prefill(varlens, device)
 
         # start of model
         if self.rank == 0:
             tokens = torch.from_numpy(np.concatenate(tokens)).to(device)
-            logger.warning(
-                f"1 num layer {len(self.layers)} {self.rank} {self.tok_embeddings.weight.device} {tokens.device} {tokens.shape}"
-            )
             h = self.tok_embeddings(tokens)
-        logger.warning(f"1.5 num layer {len(self.layers)} {self.rank}")
         # layers
-        logger.warning(f"2 num layer {self.rank} {len(self.layers)} {h.shape}")
         for it, layer in enumerate(self.layers):
             h = layer(h, 0, freqs_cis, None, varlens)
         # end of model
-        logger.warning(f"3 num layer {len(self.layers)}")
         if self.rank == self.world_size - 1:
             h = self.norm(h)
             h = self.output(h)
             tmp = varlens.cpu_prefix_lens[1:]
             h = h[[item - 1 for item in tmp]]
             h = h.float()
-        logger.warning(f"4 num layer {len(self.layers)}")
         return h
 
     @torch.inference_mode()
