@@ -65,6 +65,7 @@ class Backend:
             initialize_model_parallel(model_parallel_size)
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
         torch.cuda.set_device(local_rank)
 
         torch.manual_seed(args.seed)
@@ -99,7 +100,12 @@ class Backend:
             ckpt_path = checkpoints[0]
             logger.warning(f"Loading checkpoint from {ckpt_path}")
             checkpoint = torch.load(ckpt_path, map_location="cpu")
-            model.load_state_dict(checkpoint, strict=False)
+            from .utils import load
+
+            if world_size > 1:
+                load(checkpoint, model, model_args.n_layers, local_rank, world_size)
+            else:
+                model.load_state_dict(checkpoint, strict=False)
             logger.warning(f"Loaded in {time.time() - start_time:.2f} seconds")
         model = model.to(local_rank)
 

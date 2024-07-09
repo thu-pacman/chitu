@@ -185,7 +185,6 @@ class PipeExecutor(NormalExecutor):
         )
         torch.distributed.recv(tensor=task_tensor, src=self.rank - 1)
         if PackedTasks.is_ended_tasks(task_tensor):
-            logger.warning("removing kvcache")
             if self.rank < self.world_size - 1:
                 torch.distributed.isend(task_tensor, dst=self.rank + 1)
             return task_tensor.cpu(), None, None
@@ -238,7 +237,6 @@ class PipeExecutor(NormalExecutor):
         )
         # get remove-kvcache signal
         if tasks is None:
-            logger.warning("removing kvcache")
             for i in range(PackedTasks.max_num_tasks):
                 if task_tensor[i] == 0:
                     break
