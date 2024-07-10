@@ -4,7 +4,6 @@ from .task import (
     PackedTasks,
     TaskType,
     DecodeTask,
-    TaskPool,
     req_decode,
     taskid2reqid,
 )

@@ -53,12 +53,12 @@ def update_ongoing_tasks():
     return unwait_task_ids
 
 
-def cinfer_update(ws):
+def cinfer_update(world_size):
     removed_decode_task_ids = Backend.scheduler.update(
-        update_ongoing_tasks() if ws > 1 else []
+        update_ongoing_tasks() if world_size > 1 else []
     )
-    # logger.warning(f"Removed decode tasks: {removed_decode_task_ids}")
-    remove_task_other_device(removed_decode_task_ids)
+    if world_size > 1:
+        remove_task_other_device(removed_decode_task_ids)
 
 
 def cinfer_run():
