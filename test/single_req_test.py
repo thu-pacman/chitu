@@ -5,6 +5,8 @@ from cinfer.global_vars import set_global_variables, get_timers
 from faker import Faker
 import hydra
 from omegaconf import DictConfig
+import torch
+import time
 
 from logging import getLogger
 import logging
@@ -31,6 +33,12 @@ msgs = [
 ]
 
 
+def gen_req_id(len=8):
+    random_number = random.getrandbits(len * 4)
+    hex_string = f"{random_number:0{len}x}"
+    return hex_string
+
+
 def gen_reqs(num_reqs, prompt_len, max_new_tokens):
     fake = Faker()
     reqs = []
@@ -38,21 +46,19 @@ def gen_reqs(num_reqs, prompt_len, max_new_tokens):
         msg = ""
         for j in range(prompt_len):
             msg += fake.word() + " "
-        req = UserRequest(msg, f"request_{i}", max_new_tokens=max_new_tokens)
+        req = UserRequest(msg, f"{gen_req_id()}", max_new_tokens=max_new_tokens)
         reqs.append(req)
     return reqs
 
 
-def gen_reqs_real(num_reqs, prompt_len, max_new_tokens):
-    fake = Faker()
+import random
+
+
+def gen_reqs_real(num_reqs, max_new_tokens):
     reqs = []
     for i in range(num_reqs):
-        # msg = ""
-        # for j in range(prompt_len):
-        #     msg += fake.word() + " "
-        # req = UserRequest(msg, f"request_{i}", max_new_tokens=max_new_tokens)
         req = UserRequest(
-            msgs[i % len(msgs)], f"request_{i}", max_new_tokens=max_new_tokens
+            msgs[i % len(msgs)], f"{gen_req_id()}", max_new_tokens=max_new_tokens
         )
         reqs.append(req)
     return reqs
@@ -70,26 +76,28 @@ def main(args: DictConfig):
 
     Backend.build(args.model)
     cinfer_init(args)
+    logger.warning("Backend built")
 
-    # reqs = gen_reqs_real(
+    # reqs = gen_reqs(
     #     num_reqs=16, prompt_len=512, max_new_tokens=args.request.max_new_tokens
     # )
+    rank = torch.distributed.get_rank()
+    for i in range(2):
+        if rank == 0:
+            reqs = gen_reqs_real(
+                num_reqs=16, max_new_tokens=args.request.max_new_tokens
+            )
+            for req in reqs:
+                TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
+        timers("overall").start()
+        while len(TaskPool.pool) > 0 or rank != 0:
+            cinfer_run()
+        timers("overall").stop()
 
-    reqs = gen_reqs(
-        num_reqs=16, prompt_len=512, max_new_tokens=args.request.max_new_tokens
-    )
-    for req in reqs:
-        TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
+        for req in reqs:
+            logger.warning(f"Response in rank {rank}: {req.output}")
 
-    timers("overall").start()
-    while len(TaskPool.pool) > 0:
-        cinfer_run()
-    timers("overall").stop()
-
-    for req in reqs:
-        logger.warning(f"Response: {req.async_stream.data}")
-
-    timers.log()
+        timers.log()
 
 
 if __name__ == "__main__":

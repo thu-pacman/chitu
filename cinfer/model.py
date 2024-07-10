@@ -1,6 +1,8 @@
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
+
+import torch.distributed
 from .global_vars import set_global_variables, get_timers
 from .cache_manager import KVCacheManager, KVCacheManagerSkewAware
 
@@ -37,6 +39,14 @@ from logging import getLogger
 logger = getLogger(__name__)
 
 
+class OngoingRequests:
+    def __init__(self, reqs, tasks, handle, logits):
+        self.reqs = reqs
+        self.tasks = tasks
+        self.handle = handle
+        self.logits = logits
+
+
 class Backend:
     model = None
     tokenizer = None
@@ -44,16 +54,18 @@ class Backend:
     args = None
     curr_varlens = None
     curr_req_ids = None
+    ongoing_reqs = []
 
     @staticmethod
     def build(args):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group("nccl")
         if not model_parallel_is_initialized():
-            model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
+            model_parallel_size = 1  # int(os.environ.get("WORLD_SIZE", 1))
             initialize_model_parallel(model_parallel_size)
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
         torch.cuda.set_device(local_rank)
 
         torch.manual_seed(args.seed)
@@ -67,10 +79,10 @@ class Backend:
         model_args: ModelArgs = ModelArgs(
             **params,
         )
-        model_args.max_seq_len = args.max_length
+        model_args.max_seq_len = args.max_seq_len
         tokenizer = Tokenizer(model_path=args.tokenizer_path)
         assert model_args.vocab_size == tokenizer.n_words
-        model = Transformer(model_args)
+        model = PipeTransformer(model_args)
         if torch.cuda.is_bf16_supported():
             torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
         else:
@@ -81,13 +93,19 @@ class Backend:
             start_time = time.time()
             checkpoints = sorted(Path(args.ckpt_dir).glob("*.pth"))
             assert len(checkpoints) > 0, f"no checkpoint files found in {args.ckpt_dir}"
-            assert model_parallel_size == len(
-                checkpoints
-            ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
-            ckpt_path = checkpoints[get_model_parallel_rank()]
+            # assert model_parallel_size == len(
+            #     checkpoints
+            # ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
+            # ckpt_path = checkpoints[get_model_parallel_rank()]
+            ckpt_path = checkpoints[0]
             logger.warning(f"Loading checkpoint from {ckpt_path}")
             checkpoint = torch.load(ckpt_path, map_location="cpu")
-            model.load_state_dict(checkpoint, strict=False)
+            from .utils import load
+
+            if world_size > 1:
+                load(checkpoint, model, model_args.n_layers, local_rank, world_size)
+            else:
+                model.load_state_dict(checkpoint, strict=False)
             logger.warning(f"Loaded in {time.time() - start_time:.2f} seconds")
         model = model.to(local_rank)
 
@@ -116,8 +134,8 @@ class Backend:
                 model_args.n_layers,
                 n_local_kv_heads,
                 head_dim,
-                max_seq_length=1024,
-                num_hot_req=args.cache_max_reqs,
+                max_seq_len=args.max_seq_len,
+                num_hot_req=args.max_reqs,
             )
         Backend.args = args
         logger.warning(f"Backend initialized with {torch.cuda.memory_allocated()}")
@@ -359,9 +377,6 @@ class Attention(nn.Module):
         cache_v = cache[1]
         max_seq_len = cache.shape[2]
 
-        # output = self.ground_truth_attention(xq, cache_k, cache_v).contiguous()
-        # output = output.view(bsz, seqlen, -1)
-
         if self.n_local_heads != self.n_local_kv_heads:
             group_size = self.n_local_heads // self.n_local_kv_heads
             assert group_size > 1
@@ -375,11 +390,6 @@ class Attention(nn.Module):
         output = fmha.memory_efficient_attention_forward(xq, cache_k, cache_v).view(
             bsz, seqlen, -1
         )
-
-        # output = torch.randn(
-        #     [bsz, seqlen, self.n_local_heads * self.head_dim], device=x.device
-        # )
-
         return self.wo(output)
 
     def forward(self, x, start_pos, freqs_cis, mask, varlens=None):
@@ -541,10 +551,10 @@ class Transformer(nn.Module):
         output = self.output(h).float()
         return output
 
-    def prepare_freqs_cis_prefill(self, varlens):
+    def prepare_freqs_cis_prefill(self, varlens, device):
         prepared_freqs_cis = torch.empty(
             [varlens.total_len, self.freqs_cis.shape[1]],
-            device="cuda",
+            device=device,
             dtype=torch.complex64,
         )
         start = 0
@@ -553,10 +563,10 @@ class Transformer(nn.Module):
             start += length
         return prepared_freqs_cis
 
-    def prepare_freqs_cis_decode(self, seq_lens):
+    def prepare_freqs_cis_decode(self, seq_lens, device):
         prepared_freqs_cis = torch.empty(
             [len(seq_lens), self.freqs_cis.shape[1]],
-            device="cuda",
+            device=device,
             dtype=torch.complex64,
         )
         for i, seq_len in enumerate(seq_lens):
@@ -564,10 +574,10 @@ class Transformer(nn.Module):
         return prepared_freqs_cis
 
     @torch.inference_mode()
-    def prefill(self, tokens: list[int]):
-        varlens = VarLens(tokens, "cuda")
-        tokens = torch.from_numpy(np.concatenate(tokens)).to("cuda")
-        freqs_cis = self.prepare_freqs_cis_prefill(varlens)
+    def prefill(self, tokens: list[int], device="cuda"):
+        varlens = VarLens(tokens, device)
+        tokens = torch.from_numpy(np.concatenate(tokens)).to(device)
+        freqs_cis = self.prepare_freqs_cis_prefill(varlens, device)
         h = self.tok_embeddings(tokens)
         for it, layer in enumerate(self.layers):
             h = layer(h, 0, freqs_cis, None, varlens)
@@ -581,10 +591,103 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def decode(self, tokens, seq_lens):
         # generate different freqs_cis for each request, [num_req, other_freq_dim]
-        freqs_cis = self.prepare_freqs_cis_decode(seq_lens)
+        freqs_cis = self.prepare_freqs_cis_decode(seq_lens, tokens.device)
         h = self.tok_embeddings(tokens)
         for it, layer in enumerate(self.layers):
             h = layer(h, 1, freqs_cis, None)
         h = self.norm(h)
         output = self.output(h).float()
         return output
+
+
+class PipeTransformer(nn.Module):
+    def __init__(self, params: ModelArgs):
+        super().__init__()
+        self.rank = torch.distributed.get_rank()
+        self.world_size = torch.distributed.get_world_size()
+        self.varlens = None
+        self.params = params
+        self.vocab_size = params.vocab_size
+        self.n_layers = params.n_layers
+
+        if self.rank == 0:
+            self.tok_embeddings = VocabParallelEmbedding(
+                params.vocab_size, params.dim, init_method=lambda x: x
+            )
+
+        self.num_local_layers = params.n_layers // self.world_size
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(self.num_local_layers):
+            self.layers.append(TransformerBlock(layer_id, params))
+
+        if self.rank == self.world_size - 1:
+            self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+            self.output = ColumnParallelLinear(
+                params.dim, params.vocab_size, bias=False, init_method=lambda x: x
+            )
+
+        self.freqs_cis = precompute_freqs_cis(
+            params.dim // params.n_heads,
+            params.max_seq_len * 2,
+            params.rope_theta,
+        ).cuda(self.rank)
+
+    def prepare_freqs_cis_prefill(self, varlens, device):
+        prepared_freqs_cis = torch.empty(
+            [varlens.total_len, self.freqs_cis.shape[1]],
+            device=device,
+            dtype=torch.complex64,
+        )
+        start = 0
+        for length in varlens.cpu_lens:
+            prepared_freqs_cis[start : start + length] = self.freqs_cis[:length]
+            start += length
+        return prepared_freqs_cis
+
+    def prepare_freqs_cis_decode(self, seq_lens, device):
+        prepared_freqs_cis = torch.empty(
+            [len(seq_lens), self.freqs_cis.shape[1]],
+            device=device,
+            dtype=torch.complex64,
+        )
+        for i, seq_len in enumerate(seq_lens):
+            prepared_freqs_cis[i] = self.freqs_cis[seq_len]
+        return prepared_freqs_cis
+
+    @torch.inference_mode()
+    def prefill(self, tokens, device="cuda"):
+        varlens = Backend.curr_varlens
+        freqs_cis = self.prepare_freqs_cis_prefill(varlens, device)
+
+        # start of model
+        if self.rank == 0:
+            tokens = torch.from_numpy(np.concatenate(tokens)).to(device)
+            h = self.tok_embeddings(tokens)
+        else:
+            h = tokens
+        # layers
+        for it, layer in enumerate(self.layers):
+            h = layer(h, 0, freqs_cis, None, varlens)
+        # end of model
+        if self.rank == self.world_size - 1:
+            h = self.norm(h)
+            h = self.output(h)
+            tmp = varlens.cpu_prefix_lens[1:]
+            h = h[[item - 1 for item in tmp]]
+            h = h.float()
+        return h
+
+    @torch.inference_mode()
+    def decode(self, tokens, seq_lens, device="cuda"):
+        # generate different freqs_cis for each request, [num_req, other_freq_dim]
+        freqs_cis = self.prepare_freqs_cis_decode(seq_lens, device)
+        if self.rank == 0:
+            h = self.tok_embeddings(tokens)
+        else:
+            h = tokens
+        for it, layer in enumerate(self.layers):
+            h = layer(h, 1, freqs_cis, None)
+        if self.rank == self.world_size - 1:
+            h = self.norm(h)
+            h = self.output(h).float()
+        return h

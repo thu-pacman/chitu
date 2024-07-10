@@ -165,11 +165,12 @@ class Timers:
             string += " | {}: {:.2f} {} {:.2f}".format(
                 name, elapsed_time, cnt, elapsed_time / cnt
             )
-        if torch.distributed.is_initialized():
-            if torch.distributed.get_rank() == (torch.distributed.get_world_size() - 1):
-                print(string, flush=True)
-        else:
-            print(string, flush=True)
+        print(string, flush=True)
+        # if torch.distributed.is_initialized():
+        #     if torch.distributed.get_rank() == (torch.distributed.get_world_size() - 1):
+        #         print(string, flush=True)
+        # else:
+        #     print(string, flush=True)
 
 
 class GlobalMemoryBuffer:
