@@ -8,3 +8,6 @@ hydra-core
 fastapi
 uvicorn
 ninja
+packaging
+wheel
+cmake

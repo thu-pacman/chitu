@@ -1,0 +1,29 @@
+stages:
+    - format
+    - run
+
+variables:
+    VENV: "/home/ss/cinfer_env"
+
+before_script:
+    - source $VENV/bin/activate
+
+format_check:
+    stage: format
+    only:
+        - merge_requests
+    tags:
+        - chitu830-dev
+    script:
+        - black --check .
+
+run_check:
+    stage: run
+    only:
+        - merge_requests
+    tags:
+        - chitu830-dev
+    needs:
+        - format_check
+    script:
+        - grun torchrun --nproc_per_node 1 test/single_req_test.py request.max_new_tokens=64
