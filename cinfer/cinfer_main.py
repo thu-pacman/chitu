@@ -10,8 +10,8 @@ logger = getLogger(__name__)
 
 
 def cinfer_init(args):
-    rank = torch.distributed.get_rank()
     Backend.build(args)
+    rank = torch.distributed.get_rank()
     if rank == 0:
         scheduler = Scheduler.build(args.scheduler)
         Backend.scheduler = scheduler

@@ -160,7 +160,7 @@ class DecodeTask(Task):
         # logger.warning(f"decode token {(Backend.tokenizer.decode([self.next_token]))}")
 
     def need_remove(self):
-        if Backend.args.stop_with_eos:
+        if Backend.args.infer.stop_with_eos:
             return (
                 len(self.response) > 0
                 and (

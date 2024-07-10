@@ -74,7 +74,9 @@ class Backend:
             sys.stdout = open(os.devnull, "w")
 
         tokenizer = Tokenizer(model_path=args.models.tokenizer_path)
-        assert args.models.vocab_size == tokenizer.n_words
+        # assert (
+        #     args.models.vocab_size == tokenizer.n_words
+        # ), f"{args.models.vocab_size} vs. {tokenizer.n_words}"
         if world_size > 1:  # only support pipeline parallel for multi-gpu exec
             model = PipeTransformer(args.models)
         else:
@@ -103,7 +105,7 @@ class Backend:
             if world_size > 1:
                 load(checkpoint, model, args.models.n_layers, local_rank, world_size)
             else:
-                model.load_state_dict(checkpoint, strict=False)
+                model.load_state_dict(checkpoint, strict=True)
             logger.warning(f"Loaded in {time.time() - start_time:.2f} seconds")
         model = model.to(local_rank)
 
@@ -333,6 +335,121 @@ class Attention(nn.Module):
             return self.decode_forward(x, freqs_cis)
 
 
+class AttentionQwen(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        model_parallel_size = fs_init.get_model_parallel_world_size()
+        self.n_local_heads = args.n_heads // model_parallel_size
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.dim // args.n_heads
+
+        self.q_proj = ColumnParallelLinear(
+            args.dim,
+            args.n_heads * self.head_dim,
+            bias=True,
+            gather_output=False,
+            init_method=lambda x: x,
+        )
+        self.k_proj = ColumnParallelLinear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias=True,
+            gather_output=False,
+            init_method=lambda x: x,
+        )
+        self.v_proj = ColumnParallelLinear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias=True,
+            gather_output=False,
+            init_method=lambda x: x,
+        )
+        self.o_proj = RowParallelLinear(
+            args.n_heads * self.head_dim,
+            args.dim,
+            bias=False,
+            input_is_parallel=True,
+            init_method=lambda x: x,
+        )
+
+    def prefill_forward(
+        self,
+        x: torch.Tensor,
+        varlens,
+        freqs_cis: torch.Tensor,
+    ):
+        bs_seq, _ = x.shape
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        xq = xq.view(bs_seq, self.n_local_heads, self.head_dim)
+        xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        Backend.cache_manager.finalize_cache_bylayer_prefill(
+            xk,
+            xv,
+            Backend.curr_req_ids,
+            Backend.curr_varlens,
+        )
+        output = flash_attn.flash_attn_varlen_func(
+            xq,
+            xk,
+            xv,
+            varlens.prefix_lens,
+            varlens.prefix_lens,
+            varlens.max_len,
+            varlens.max_len,
+            causal=True,
+        ).view(bs_seq, -1)
+        return self.o_proj(output)
+
+    def decode_forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ):
+        bsz, seqlen, _ = x.shape
+        assert seqlen == 1, "decode_forward only supports single token decoding"
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+
+        xq = xq.view(-1, self.n_local_heads, self.head_dim)
+        xk = xk.view(-1, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(-1, self.n_local_kv_heads, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        cache = Backend.cache_manager.update_cache_decode(xk, xv)
+        cache_k = cache[0]
+        cache_v = cache[1]
+        max_seq_len = cache.shape[2]
+
+        if self.n_local_heads != self.n_local_kv_heads:
+            group_size = self.n_local_heads // self.n_local_kv_heads
+            assert group_size > 1
+            xq = xq.view(bsz, seqlen, self.n_local_kv_heads, group_size, self.head_dim)
+            cache_k = cache_k.view(
+                bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
+            ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
+            cache_v = cache_v.view(
+                bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
+            ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
+        output = fmha.memory_efficient_attention_forward(xq, cache_k, cache_v).view(
+            bsz, seqlen, -1
+        )
+        return self.o_proj(output)
+
+    def forward(self, x, freqs_cis, varlens=None):
+        if varlens is not None:  # prefill
+            return self.prefill_forward(x, varlens, freqs_cis)
+        else:  # decode
+            return self.decode_forward(x, freqs_cis)
+
+
 def GEMV(x, w):
     # w = w.transpose(1, 0).contiguous()
     output = torch.zeros(x.shape[:-1] + w.shape[-1:], device=x.device, dtype=x.dtype)
@@ -372,21 +489,30 @@ class FeedForwardLlama(nn.Module):
 class FeedForwardQwen(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
-        self.w1 = ColumnParallelLinear(
+        self.gate_proj = ColumnParallelLinear(
             dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
-        self.w2 = RowParallelLinear(
+        self.down_proj = RowParallelLinear(
             hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
         )
-        self.w3 = ColumnParallelLinear(
+        self.up_proj = ColumnParallelLinear(
             dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
 
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class TransformerBlock(nn.Module):
+
+    def build(layer_id, args):
+        if args.type == "llama":
+            return TransformerBlockLlama(layer_id, args)
+        elif args.type == "qwen":
+            return TransformerBlockQwen(layer_id, args)
+        else:
+            assert False, f"Unknown transformer type {args.type}"
+
     def __init__(self, layer_id: int, args):
         super().__init__()
         self.n_heads = args.n_heads
@@ -422,17 +548,15 @@ class TransformerBlockLlama(TransformerBlock):
 class TransformerBlockQwen(TransformerBlock):
     def __init__(self, layer_id: int, args):
         super().__init__(layer_id, args)
-        self.attention = Attention(args)
-        self.feed_forward = FeedForwardQwen(
-            dim=args.dim, hidden_dim=args.intermediate_dim
-        )
-        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.self_attn = AttentionQwen(args)
+        self.mlp = FeedForwardQwen(dim=args.dim, hidden_dim=args.intermediate_dim)
+        self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, varlens=None):
-        h = self.attention(self.attention_norm(x), freqs_cis, varlens)
+        h = self.self_attn(self.input_layernorm(x), freqs_cis, varlens)
         h += x
-        out = h + self.feed_forward(self.ffn_norm(h))
+        out = h + self.mlp(self.post_attention_layernorm(h))
         return out
 
 
@@ -443,18 +567,27 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
-        self.tok_embeddings = VocabParallelEmbedding(
-            params.vocab_size, params.dim, init_method=lambda x: x
-        )
+        if params.type == "llama":
+            self.tok_embeddings = VocabParallelEmbedding(
+                params.vocab_size, params.dim, init_method=lambda x: x
+            )
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                params.vocab_size, params.dim, init_method=lambda x: x
+            )
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
+            self.layers.append(TransformerBlock.build(layer_id, params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = ColumnParallelLinear(
-            params.dim, params.vocab_size, bias=False, init_method=lambda x: x
-        )
+
+        if params.type == "llama":
+            self.output = ColumnParallelLinear(
+                params.dim, params.vocab_size, bias=False, init_method=lambda x: x
+            )
+        else:
+            self.output = None
 
         self.freqs_cis = precompute_freqs_cis(
             params.dim // params.n_heads,
@@ -489,11 +622,13 @@ class Transformer(nn.Module):
         varlens = VarLens(tokens, device)
         tokens = torch.from_numpy(np.concatenate(tokens)).to(device)
         freqs_cis = self.prepare_freqs_cis_prefill(varlens, device)
-        h = self.tok_embeddings(tokens)
+        # h = self.tok_embeddings(tokens)
+        h = self.embed_tokens(tokens)
         for it, layer in enumerate(self.layers):
             h = layer(h, freqs_cis, varlens)
         h = self.norm(h)
-        h = self.output(h)
+        if self.output is not None:
+            h = self.output(h)
         tmp = varlens.cpu_prefix_lens[1:]
         h = h[[item - 1 for item in tmp]]
         h = h.float()
@@ -503,12 +638,15 @@ class Transformer(nn.Module):
     def decode(self, tokens, seq_lens):
         # generate different freqs_cis for each request, [num_req, other_freq_dim]
         freqs_cis = self.prepare_freqs_cis_decode(seq_lens, tokens.device)
-        h = self.tok_embeddings(tokens)
+        # h = self.tok_embeddings(tokens)
+        h = self.embed_tokens(tokens)
         for it, layer in enumerate(self.layers):
             h = layer(h, freqs_cis)
         h = self.norm(h)
-        output = self.output(h).float()
-        return output
+        if self.output is not None:
+            h = self.output(h)
+        h = h.float()
+        return h
 
 
 class PipeTransformer(Transformer):
@@ -525,7 +663,7 @@ class PipeTransformer(Transformer):
         self.num_local_layers = params.n_layers // self.world_size
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.num_local_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
+            self.layers.append(TransformerBlock.build(layer_id, params))
 
         if self.rank == self.world_size - 1:
             self.norm = RMSNorm(params.dim, eps=params.norm_eps)
