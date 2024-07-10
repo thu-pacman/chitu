@@ -79,7 +79,7 @@ class Backend:
         model_args: ModelArgs = ModelArgs(
             **params,
         )
-        model_args.max_seq_len = args.max_length
+        model_args.max_seq_len = args.max_seq_len
         tokenizer = Tokenizer(model_path=args.tokenizer_path)
         assert model_args.vocab_size == tokenizer.n_words
         model = PipeTransformer(model_args)
@@ -134,8 +134,8 @@ class Backend:
                 model_args.n_layers,
                 n_local_kv_heads,
                 head_dim,
-                max_seq_length=1024,
-                num_hot_req=args.cache_max_reqs,
+                max_seq_len=args.max_seq_len,
+                num_hot_req=args.max_reqs,
             )
         Backend.args = args
         logger.warning(f"Backend initialized with {torch.cuda.memory_allocated()}")
@@ -377,9 +377,6 @@ class Attention(nn.Module):
         cache_v = cache[1]
         max_seq_len = cache.shape[2]
 
-        # output = self.ground_truth_attention(xq, cache_k, cache_v).contiguous()
-        # output = output.view(bsz, seqlen, -1)
-
         if self.n_local_heads != self.n_local_kv_heads:
             group_size = self.n_local_heads // self.n_local_kv_heads
             assert group_size > 1
@@ -393,11 +390,6 @@ class Attention(nn.Module):
         output = fmha.memory_efficient_attention_forward(xq, cache_k, cache_v).view(
             bsz, seqlen, -1
         )
-
-        # output = torch.randn(
-        #     [bsz, seqlen, self.n_local_heads * self.head_dim], device=x.device
-        # )
-
         return self.wo(output)
 
     def forward(self, x, start_pos, freqs_cis, mask, varlens=None):

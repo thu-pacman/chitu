@@ -165,7 +165,7 @@ class KVCacheManagerSkewAware:
         n_local_kv_heads,
         head_dim,
         num_hot_req=16,
-        max_seq_length=2048,
+        max_seq_len=2048,
         device="cuda",
     ):
         self.num_layers = num_layers
@@ -176,7 +176,7 @@ class KVCacheManagerSkewAware:
         self.hot_reqs = [-1] * num_hot_req
         self.req2slot = {}
         self.lengths = {}
-        self.max_seq_length = max_seq_length
+        self.max_seq_len = max_seq_len
         self.tmp_storage = []
         self.device = torch.device(device)
         self.buffer = torch.zeros(
@@ -184,7 +184,7 @@ class KVCacheManagerSkewAware:
                 self.num_layers,
                 2,
                 self.num_hot_req,
-                self.max_seq_length,
+                self.max_seq_len,
                 self.n_local_kv_heads,
                 self.head_dim,
             ],
@@ -251,6 +251,7 @@ class KVCacheManagerSkewAware:
         limit = 16
         rounded_max_seq = (max_seq + 1 + limit - 1) // limit * limit
         if self.rounded_max_seq >= rounded_max_seq and self.prepared_reqs == req_ids:
+            # prepared cache is long enough
             self.timers("cache_prepare").stop()
             return
 
@@ -269,14 +270,14 @@ class KVCacheManagerSkewAware:
                 self.head_dim, # 1
             ),
             (
-                self.head_dim * self.n_local_kv_heads * self.max_seq_length * self.num_hot_req * 2,
-                self.head_dim * self.n_local_kv_heads * self.max_seq_length * self.num_hot_req,
-                self.head_dim * self.n_local_kv_heads * self.max_seq_length,
+                self.head_dim * self.n_local_kv_heads * self.max_seq_len * self.num_hot_req * 2,
+                self.head_dim * self.n_local_kv_heads * self.max_seq_len * self.num_hot_req,
+                self.head_dim * self.n_local_kv_heads * self.max_seq_len,
                 self.head_dim * self.n_local_kv_heads,
                 self.head_dim,
                 1,
             ),
-            start_pos * self.head_dim * self.n_local_kv_heads * self.max_seq_length,
+            start_pos * self.head_dim * self.n_local_kv_heads * self.max_seq_len,
         )
         # fmt: on
         self.timers("cache_prepare").stop()

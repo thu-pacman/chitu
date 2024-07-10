@@ -122,7 +122,7 @@ def prepare_noncontinuous_data(
         device="cuda",
         dtype=torch.bfloat16,
     )
-    max_seq_length = seq_k
+    max_seq_len = seq_k
     num_hot_req = batch_used
     prepared_cache = torch.as_strided(
         buffer,
@@ -135,9 +135,9 @@ def prepare_noncontinuous_data(
             head_dim,  # 1
         ),
         (
-            head_dim * n_local_kv_heads * max_seq_length * num_hot_req * 2,
-            head_dim * n_local_kv_heads * max_seq_length * num_hot_req,
-            head_dim * n_local_kv_heads * max_seq_length,
+            head_dim * n_local_kv_heads * max_seq_len * num_hot_req * 2,
+            head_dim * n_local_kv_heads * max_seq_len * num_hot_req,
+            head_dim * n_local_kv_heads * max_seq_len,
             head_dim * n_local_kv_heads,
             head_dim,
             1,

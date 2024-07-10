@@ -16,7 +16,7 @@ def cinfer_init(args):
         Backend.scheduler = scheduler
     executor = Executor.build(args.executor)
     Backend.executor = executor
-    PackedTasks.max_num_tasks = 32
+    PackedTasks.max_num_tasks = args.model.max_reqs
 
 
 def remove_task_other_device(remove_task_ids):
