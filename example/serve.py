@@ -68,7 +68,6 @@ def main(args: DictConfig):
     global global_args
     set_global_variables()
     global_args = args
-    Backend.build(args.model)
     cinfer_init(args)
     uvicorn.run(app, host=args.serve.host, port=args.serve.port, log_level="info")
 

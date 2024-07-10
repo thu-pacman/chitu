@@ -74,7 +74,6 @@ def main(args: DictConfig):
     set_global_variables()
     timers = get_timers()
 
-    Backend.build(args.model)
     cinfer_init(args)
     logger.warning("Backend built")
 

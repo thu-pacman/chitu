@@ -11,12 +11,13 @@ logger = getLogger(__name__)
 
 def cinfer_init(args):
     rank = torch.distributed.get_rank()
+    Backend.build(args)
     if rank == 0:
         scheduler = Scheduler.build(args.scheduler)
         Backend.scheduler = scheduler
     executor = Executor.build(args.executor)
     Backend.executor = executor
-    PackedTasks.max_num_tasks = args.model.max_reqs
+    PackedTasks.max_num_tasks = args.infer.max_reqs
 
 
 def remove_task_other_device(remove_task_ids):
