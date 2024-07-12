@@ -93,7 +93,7 @@ class Task:
 
 
 class PrefillTask(Task):
-    def __init__(self, task_id: str, req: UserRequest, message: str, priority: int = 1):
+    def __init__(self, task_id: str, req: UserRequest, message, priority: int = 1):
         super().__init__(task_id, req, priority)
         self.message = message
         logger.info(f"Prefill task: {message}")

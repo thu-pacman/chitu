@@ -14,6 +14,12 @@ import logging
 logger = getLogger(__name__)
 
 msgs = [
+    [
+        {
+            "role": "user",
+            "content": "宫保鸡丁怎么做?",
+        }
+    ],
     [{"role": "user", "content": "what is the recipe of Kung Pao chicken?"}],
     # [{"role": "user", "content": "what is the recipe of Kung Pao chicken?"}],
     [{"role": "user", "content": "what is the recipe of mayonnaise?"}],
@@ -77,15 +83,13 @@ def main(args: DictConfig):
     cinfer_init(args)
     logger.warning("Backend built")
 
-    # reqs = gen_reqs(
-    #     num_reqs=16, prompt_len=512, max_new_tokens=args.request.max_new_tokens
-    # )
     rank = torch.distributed.get_rank()
     for i in range(2):
         if rank == 0:
-            reqs = gen_reqs_real(
-                num_reqs=16, max_new_tokens=args.request.max_new_tokens
-            )
+            # reqs = gen_reqs(
+            #     num_reqs=1, prompt_len=512, max_new_tokens=args.request.max_new_tokens
+            # )
+            reqs = gen_reqs_real(num_reqs=1, max_new_tokens=args.request.max_new_tokens)
             for req in reqs:
                 TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
         timers("overall").start()

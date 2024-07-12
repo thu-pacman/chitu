@@ -26,7 +26,7 @@ from fairscale.nn.model_parallel.initialize import (
     initialize_model_parallel,
     model_parallel_is_initialized,
 )
-from .tokenizer import Tokenizer, ChatFormat
+from .tokenizer import Tokenizer, ChatFormat, TokenizerHF, ChatFormatHF
 from pathlib import Path
 import os, sys, json, time
 
@@ -73,14 +73,14 @@ class Backend:
         if local_rank > 0:
             sys.stdout = open(os.devnull, "w")
 
-        tokenizer = Tokenizer(model_path=args.models.tokenizer_path)
+        if args.models.type == "qwen":
+            tokenizer = TokenizerHF(path=args.models.tokenizer_path)
+        else:
+            tokenizer = Tokenizer(model_path=args.models.tokenizer_path)
         # assert (
         #     args.models.vocab_size == tokenizer.n_words
         # ), f"{args.models.vocab_size} vs. {tokenizer.n_words}"
-        if world_size > 1:  # only support pipeline parallel for multi-gpu exec
-            model = PipeTransformer(args.models)
-        else:
-            model = Transformer(args.models)
+        model = Transformer.build(args.models)
         if torch.cuda.is_bf16_supported():
             torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
         else:
@@ -89,7 +89,7 @@ class Backend:
 
         if args.infer.do_load:
             start_time = time.time()
-            checkpoints = sorted(Path(args.models.ckpt_dir).glob("*.pth"))
+            checkpoints = sorted(Path(args.models.ckpt_dir).glob("model1.pth"))
             assert (
                 len(checkpoints) > 0
             ), f"no checkpoint files found in {args.models.ckpt_dir}"
@@ -100,6 +100,7 @@ class Backend:
             ckpt_path = checkpoints[0]
             logger.warning(f"Loading checkpoint from {ckpt_path}")
             checkpoint = torch.load(ckpt_path, map_location="cpu")
+            logger.warning(checkpoint.keys())
             from .utils import load
 
             if world_size > 1:
@@ -111,10 +112,18 @@ class Backend:
 
         Backend.model = model
         tokenizer.stop_tokens = torch.tensor(
-            list(tokenizer.stop_tokens), device=local_rank
+            list(
+                [tokenizer.stop_tokens]
+                if isinstance(tokenizer.stop_tokens, int)
+                else tokenizer.stop_tokens
+            ),
+            device=local_rank,
         )
         Backend.tokenizer = tokenizer
-        Backend.formatter = ChatFormat(tokenizer)
+        if args.models.type == "qwen":
+            Backend.formatter = ChatFormatHF(tokenizer)
+        else:
+            Backend.formatter = ChatFormat(tokenizer)
 
         model_parallel_size = 1  # fs_init.get_model_parallel_world_size()
         n_kv_heads = args.models.n_kv_heads
@@ -208,56 +217,15 @@ def apply_rotary_emb(
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
-    bs, slen, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-    )
-
-
 class Attention(nn.Module):
-    def __init__(self, args):
+    def __init__(self):
         super().__init__()
-        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        model_parallel_size = fs_init.get_model_parallel_world_size()
-        self.n_local_heads = args.n_heads // model_parallel_size
-        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = args.dim // args.n_heads
 
-        self.wq = ColumnParallelLinear(
-            args.dim,
-            args.n_heads * self.head_dim,
-            bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
-        )
-        self.wk = ColumnParallelLinear(
-            args.dim,
-            self.n_kv_heads * self.head_dim,
-            bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
-        )
-        self.wv = ColumnParallelLinear(
-            args.dim,
-            self.n_kv_heads * self.head_dim,
-            bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
-        )
-        self.wo = RowParallelLinear(
-            args.n_heads * self.head_dim,
-            args.dim,
-            bias=False,
-            input_is_parallel=True,
-            init_method=lambda x: x,
-        )
+    def _run_linear(self, x):
+        raise NotImplementedError
+
+    def _run_output_linear(self, x):
+        raise NotImplementedError
 
     def prefill_forward(
         self,
@@ -266,7 +234,7 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor,
     ):
         bs_seq, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq, xk, xv = self._run_linear(x)
         xq = xq.view(bs_seq, self.n_local_heads, self.head_dim)
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim)
@@ -287,7 +255,7 @@ class Attention(nn.Module):
             varlens.max_len,
             causal=True,
         ).view(bs_seq, -1)
-        return self.wo(output)
+        return self._run_output_linear(output)
 
     def decode_forward(
         self,
@@ -296,7 +264,7 @@ class Attention(nn.Module):
     ):
         bsz, seqlen, _ = x.shape
         assert seqlen == 1, "decode_forward only supports single token decoding"
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq, xk, xv = self._run_linear(x)
 
         xq = xq.view(-1, self.n_local_heads, self.head_dim)
         xk = xk.view(-1, self.n_local_kv_heads, self.head_dim)
@@ -326,7 +294,7 @@ class Attention(nn.Module):
         output = fmha.memory_efficient_attention_forward(xq, cache_k, cache_v).view(
             bsz, seqlen, -1
         )
-        return self.wo(output)
+        return self._run_output_linear(output)
 
     def forward(self, x, freqs_cis, varlens=None):
         if varlens is not None:  # prefill
@@ -335,7 +303,187 @@ class Attention(nn.Module):
             return self.decode_forward(x, freqs_cis)
 
 
-class AttentionQwen(nn.Module):
+def GEMV(x, w):
+    # w = w.transpose(1, 0).contiguous()
+    output = torch.zeros(x.shape[:-1] + w.shape[-1:], device=x.device, dtype=x.dtype)
+    cinfer_backend.gemv(x, w, output)
+    return output
+
+
+class FeedForward(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class TransformerBlock(nn.Module):
+
+    def __init__(self, layer_id: int, args):
+        super().__init__()
+        self.n_heads = args.n_heads
+        self.dim = args.dim
+        self.head_dim = args.dim // args.n_heads
+        self.layer_id = layer_id
+        self.timers = get_timers()
+
+    def forward(self):
+        raise NotImplementedError
+
+
+class Transformer(nn.Module):
+    @staticmethod
+    def build(args):
+        if args.type == "qwen":
+            return TransformerQwen(args)
+        elif args.type == "llama":
+            return TransformerLlama(args)
+        else:
+            assert False, f"Unknown model type {args.models.type}"
+
+    def __init__(self, params):
+        super().__init__()
+        self.rank = torch.distributed.get_rank()
+        self.world_size = torch.distributed.get_world_size()
+        self.device = torch.device(self.rank)
+
+        self.pipeline_exec = self.world_size > 1
+
+        self.params = params
+        self.vocab_size = params.vocab_size
+        self.n_layers = params.n_layers
+
+        if self.pipeline_exec:
+            self.n_layers = self.n_layers // self.world_size
+
+        if not self.pipeline_exec or self.rank == 0:
+            self._init_pre_layers()
+        self._init_layers()
+        if not self.pipeline_exec or self.rank == self.world_size - 1:
+            self._init_post_layers()
+
+        self.freqs_cis = precompute_freqs_cis(
+            params.dim // params.n_heads,
+            params.max_seq_len * 2,
+            params.rope_theta,
+        ).cuda()
+
+    def _init_pre_layers(self):
+        raise NotImplementedError
+
+    def _init_layers(self):
+        raise NotImplementedError
+
+    def _init_post_layers(self):
+        raise NotImplementedError
+
+    def _pre_layers(self, h):
+        raise NotImplementedError
+
+    def _post_layers(self, h):
+        raise NotImplementedError
+
+    def prepare_freqs_cis_prefill(self, varlens, device):
+        prepared_freqs_cis = torch.empty(
+            [varlens.total_len, self.freqs_cis.shape[1]],
+            device=device,
+            dtype=torch.complex64,
+        )
+        start = 0
+        for length in varlens.cpu_lens:
+            prepared_freqs_cis[start : start + length] = self.freqs_cis[:length]
+            start += length
+        return prepared_freqs_cis
+
+    def prepare_freqs_cis_decode(self, seq_lens, device):
+        prepared_freqs_cis = torch.empty(
+            [len(seq_lens), self.freqs_cis.shape[1]],
+            device=device,
+            dtype=torch.complex64,
+        )
+        for i, seq_len in enumerate(seq_lens):
+            prepared_freqs_cis[i] = self.freqs_cis[seq_len]
+        return prepared_freqs_cis
+
+    @torch.inference_mode()
+    def prefill_single_device(self, tokens: list[int]):
+        varlens = VarLens(tokens, self.device)
+        tokens = torch.from_numpy(np.concatenate(tokens)).to(self.device)
+        freqs_cis = self.prepare_freqs_cis_prefill(varlens, self.device)
+        h = self._pre_layers(tokens)
+        for it, layer in enumerate(self.layers):
+            h = layer(h, freqs_cis, varlens)
+        h = self._post_layers(h)
+        tmp = varlens.cpu_prefix_lens[1:]
+        h = h[[item - 1 for item in tmp]]
+        h = h.float()
+        return h
+
+    @torch.inference_mode()
+    def decode_single_device(self, tokens, seq_lens):
+        # generate different freqs_cis for each request, [num_req, other_freq_dim]
+        freqs_cis = self.prepare_freqs_cis_decode(seq_lens, self.device)
+        h = self._pre_layers(tokens)
+        for it, layer in enumerate(self.layers):
+            h = layer(h, freqs_cis)
+        h = self._post_layers(h)
+        h = h.float()
+        return h
+
+    @torch.inference_mode()
+    def prefill_pipeline(self, tokens):
+        varlens = Backend.curr_varlens
+        freqs_cis = self.prepare_freqs_cis_prefill(varlens, self.device)
+
+        # start of model
+        if self.rank == 0:
+            tokens = torch.from_numpy(np.concatenate(tokens)).to(self.device)
+            h = self._pre_layers(tokens)
+        else:
+            h = tokens
+        # layers
+        for it, layer in enumerate(self.layers):
+            h = layer(h, 0, freqs_cis, None, varlens)
+        # end of model
+        if self.rank == self.world_size - 1:
+            h = self._post_layers(h)
+            tmp = varlens.cpu_prefix_lens[1:]
+            h = h[[item - 1 for item in tmp]]
+            h = h.float()
+        return h
+
+    @torch.inference_mode()
+    def decode_pipeline(self, tokens, seq_lens):
+        # generate different freqs_cis for each request, [num_req, other_freq_dim]
+        freqs_cis = self.prepare_freqs_cis_decode(seq_lens, self.device)
+        if self.rank == 0:
+            h = self.tok_embeddings(tokens)
+        else:
+            h = tokens
+        for it, layer in enumerate(self.layers):
+            h = layer(h, 1, freqs_cis, None)
+        if self.rank == self.world_size - 1:
+            h = self._post_layers(h)
+            h = h.float()
+        return h
+
+    @torch.inference_mode()
+    def prefill(self, tokens):
+        if self.pipeline_exec:
+            return self.prefill_pipeline(tokens)
+        else:
+            return self.prefill_single_device(tokens)
+
+    @torch.inference_mode()
+    def decode(self, tokens, seq_lens):
+        if self.pipeline_exec:
+            return self.decode_pipeline(tokens, seq_lens)
+        else:
+            return self.decode_single_device(tokens, seq_lens)
+
+
+class AttentionQwen(Attention):
     def __init__(self, args):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
@@ -374,87 +522,147 @@ class AttentionQwen(nn.Module):
             init_method=lambda x: x,
         )
 
-    def prefill_forward(
-        self,
-        x: torch.Tensor,
-        varlens,
-        freqs_cis: torch.Tensor,
-    ):
-        bs_seq, _ = x.shape
-        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        xq = xq.view(bs_seq, self.n_local_heads, self.head_dim)
-        xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim)
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-        Backend.cache_manager.finalize_cache_bylayer_prefill(
-            xk,
-            xv,
-            Backend.curr_req_ids,
-            Backend.curr_varlens,
+    def _run_linear(self, x):
+        return self.q_proj(x), self.k_proj(x), self.v_proj(x)
+
+    def _run_output_linear(self, x):
+        return self.o_proj(x)
+
+
+class FeedForwardQwen(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int):
+        super().__init__()
+        self.gate_proj = ColumnParallelLinear(
+            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
-        output = flash_attn.flash_attn_varlen_func(
-            xq,
-            xk,
-            xv,
-            varlens.prefix_lens,
-            varlens.prefix_lens,
-            varlens.max_len,
-            varlens.max_len,
-            causal=True,
-        ).view(bs_seq, -1)
-        return self.o_proj(output)
-
-    def decode_forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-    ):
-        bsz, seqlen, _ = x.shape
-        assert seqlen == 1, "decode_forward only supports single token decoding"
-        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-
-        xq = xq.view(-1, self.n_local_heads, self.head_dim)
-        xk = xk.view(-1, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(-1, self.n_local_kv_heads, self.head_dim)
-
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-
-        cache = Backend.cache_manager.update_cache_decode(xk, xv)
-        cache_k = cache[0]
-        cache_v = cache[1]
-        max_seq_len = cache.shape[2]
-
-        if self.n_local_heads != self.n_local_kv_heads:
-            group_size = self.n_local_heads // self.n_local_kv_heads
-            assert group_size > 1
-            xq = xq.view(bsz, seqlen, self.n_local_kv_heads, group_size, self.head_dim)
-            cache_k = cache_k.view(
-                bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
-            ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
-            cache_v = cache_v.view(
-                bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
-            ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
-        output = fmha.memory_efficient_attention_forward(xq, cache_k, cache_v).view(
-            bsz, seqlen, -1
+        self.down_proj = RowParallelLinear(
+            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
         )
-        return self.o_proj(output)
+        self.up_proj = ColumnParallelLinear(
+            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+        )
 
-    def forward(self, x, freqs_cis, varlens=None):
-        if varlens is not None:  # prefill
-            return self.prefill_forward(x, varlens, freqs_cis)
-        else:  # decode
-            return self.decode_forward(x, freqs_cis)
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-def GEMV(x, w):
-    # w = w.transpose(1, 0).contiguous()
-    output = torch.zeros(x.shape[:-1] + w.shape[-1:], device=x.device, dtype=x.dtype)
-    cinfer_backend.gemv(x, w, output)
-    return output
+class TransformerBlockQwen(TransformerBlock):
+    def __init__(self, layer_id: int, args):
+        super().__init__(layer_id, args)
+        self.self_attn = AttentionQwen(args)
+        self.mlp = FeedForwardQwen(dim=args.dim, hidden_dim=args.intermediate_dim)
+        self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
+
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, varlens=None):
+        h = self.self_attn(self.input_layernorm(x), freqs_cis, varlens)
+        h += x
+        out = h + self.mlp(self.post_attention_layernorm(h))
+        return out
+
+
+class TransformerQwen(Transformer):
+    def __init__(self, params):
+        super().__init__(params)
+
+    def _init_pre_layers(self):
+        self.embed_tokens = VocabParallelEmbedding(
+            self.params.vocab_size, self.params.dim, init_method=lambda x: x
+        )
+
+    def _init_layers(self):
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(self.params.n_layers):
+            self.layers.append(TransformerBlockQwen(layer_id, self.params))
+
+    def _init_post_layers(self):
+        self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps)
+        self.lm_head = ColumnParallelLinear(
+            self.params.dim, self.params.vocab_size, bias=False, init_method=lambda x: x
+        )
+
+    def _pre_layers(self, h):
+        return self.embed_tokens(h)
+
+    def _post_layers(self, h):
+        h = self.norm(h)
+        h = self.lm_head(h)
+        return h
+
+
+class AttentionLlama(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        model_parallel_size = fs_init.get_model_parallel_world_size()
+        self.n_local_heads = args.n_heads // model_parallel_size
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.dim // args.n_heads
+
+        self.wq = ColumnParallelLinear(
+            args.dim,
+            args.n_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
+        )
+        self.wk = ColumnParallelLinear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
+        )
+        self.wv = ColumnParallelLinear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
+        )
+        self.wo = RowParallelLinear(
+            args.n_heads * self.head_dim,
+            args.dim,
+            bias=False,
+            input_is_parallel=True,
+            init_method=lambda x: x,
+        )
+
+    def _run_linear(self, x):
+        return self.wq(x), self.wk(x), self.wv(x)
+
+    def _run_output_linear(self, x):
+        return self.wo(x)
+
+
+class TransformerLlama(Transformer):
+    def __init__(self, params):
+        super().__init__(params)
+
+    def _init_pre_layers(self):
+        self.tok_embeddings = VocabParallelEmbedding(
+            self.params.vocab_size, self.params.dim, init_method=lambda x: x
+        )
+
+    def _init_layers(self):
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(self.params.n_layers):
+            self.layers.append(TransformerBlockLlama(layer_id, self.params))
+
+    def _init_post_layers(self):
+        self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps)
+        self.output = ColumnParallelLinear(
+            self.params.dim, self.params.vocab_size, bias=False, init_method=lambda x: x
+        )
+
+    def _pre_layers(self, h):
+        return self.tok_embeddings(h)
+
+    def _post_layers(self, h):
+        h = self.norm(h)
+        h = self.output(h)
+        return h
 
 
 class FeedForwardLlama(nn.Module):
@@ -486,49 +694,10 @@ class FeedForwardLlama(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
-class FeedForwardQwen(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int):
-        super().__init__()
-        self.gate_proj = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
-        )
-        self.down_proj = RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
-        )
-        self.up_proj = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
-        )
-
-    def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
-class TransformerBlock(nn.Module):
-
-    def build(layer_id, args):
-        if args.type == "llama":
-            return TransformerBlockLlama(layer_id, args)
-        elif args.type == "qwen":
-            return TransformerBlockQwen(layer_id, args)
-        else:
-            assert False, f"Unknown transformer type {args.type}"
-
-    def __init__(self, layer_id: int, args):
-        super().__init__()
-        self.n_heads = args.n_heads
-        self.dim = args.dim
-        self.head_dim = args.dim // args.n_heads
-        self.layer_id = layer_id
-        self.timers = get_timers()
-
-    def forward(self):
-        raise NotImplementedError
-
-
 class TransformerBlockLlama(TransformerBlock):
     def __init__(self, layer_id: int, args):
         super().__init__(layer_id, args)
-        self.attention = Attention(args)
+        self.attention = AttentionLlama(args)
         self.feed_forward = FeedForwardLlama(
             dim=args.dim,
             hidden_dim=4 * args.dim,
@@ -543,174 +712,3 @@ class TransformerBlockLlama(TransformerBlock):
         h += x
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
-
-
-class TransformerBlockQwen(TransformerBlock):
-    def __init__(self, layer_id: int, args):
-        super().__init__(layer_id, args)
-        self.self_attn = AttentionQwen(args)
-        self.mlp = FeedForwardQwen(dim=args.dim, hidden_dim=args.intermediate_dim)
-        self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
-
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, varlens=None):
-        h = self.self_attn(self.input_layernorm(x), freqs_cis, varlens)
-        h += x
-        out = h + self.mlp(self.post_attention_layernorm(h))
-        return out
-
-
-class Transformer(nn.Module):
-    def __init__(self, params):
-        super().__init__()
-        self.params = params
-        self.vocab_size = params.vocab_size
-        self.n_layers = params.n_layers
-
-        if params.type == "llama":
-            self.tok_embeddings = VocabParallelEmbedding(
-                params.vocab_size, params.dim, init_method=lambda x: x
-            )
-        else:
-            self.embed_tokens = VocabParallelEmbedding(
-                params.vocab_size, params.dim, init_method=lambda x: x
-            )
-
-        self.layers = torch.nn.ModuleList()
-        for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock.build(layer_id, params))
-
-        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-
-        if params.type == "llama":
-            self.output = ColumnParallelLinear(
-                params.dim, params.vocab_size, bias=False, init_method=lambda x: x
-            )
-        else:
-            self.output = None
-
-        self.freqs_cis = precompute_freqs_cis(
-            params.dim // params.n_heads,
-            params.max_seq_len * 2,
-            params.rope_theta,
-        ).cuda()
-
-    def prepare_freqs_cis_prefill(self, varlens, device):
-        prepared_freqs_cis = torch.empty(
-            [varlens.total_len, self.freqs_cis.shape[1]],
-            device=device,
-            dtype=torch.complex64,
-        )
-        start = 0
-        for length in varlens.cpu_lens:
-            prepared_freqs_cis[start : start + length] = self.freqs_cis[:length]
-            start += length
-        return prepared_freqs_cis
-
-    def prepare_freqs_cis_decode(self, seq_lens, device):
-        prepared_freqs_cis = torch.empty(
-            [len(seq_lens), self.freqs_cis.shape[1]],
-            device=device,
-            dtype=torch.complex64,
-        )
-        for i, seq_len in enumerate(seq_lens):
-            prepared_freqs_cis[i] = self.freqs_cis[seq_len]
-        return prepared_freqs_cis
-
-    @torch.inference_mode()
-    def prefill(self, tokens: list[int], device="cuda"):
-        varlens = VarLens(tokens, device)
-        tokens = torch.from_numpy(np.concatenate(tokens)).to(device)
-        freqs_cis = self.prepare_freqs_cis_prefill(varlens, device)
-        # h = self.tok_embeddings(tokens)
-        h = self.embed_tokens(tokens)
-        for it, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis, varlens)
-        h = self.norm(h)
-        if self.output is not None:
-            h = self.output(h)
-        tmp = varlens.cpu_prefix_lens[1:]
-        h = h[[item - 1 for item in tmp]]
-        h = h.float()
-        return h
-
-    @torch.inference_mode()
-    def decode(self, tokens, seq_lens):
-        # generate different freqs_cis for each request, [num_req, other_freq_dim]
-        freqs_cis = self.prepare_freqs_cis_decode(seq_lens, tokens.device)
-        # h = self.tok_embeddings(tokens)
-        h = self.embed_tokens(tokens)
-        for it, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis)
-        h = self.norm(h)
-        if self.output is not None:
-            h = self.output(h)
-        h = h.float()
-        return h
-
-
-class PipeTransformer(Transformer):
-    def __init__(self, params):
-        super().__init__(params)
-        self.rank = torch.distributed.get_rank()
-        self.world_size = torch.distributed.get_world_size()
-
-        if self.rank == 0:
-            self.tok_embeddings = VocabParallelEmbedding(
-                params.vocab_size, params.dim, init_method=lambda x: x
-            )
-
-        self.num_local_layers = params.n_layers // self.world_size
-        self.layers = torch.nn.ModuleList()
-        for layer_id in range(self.num_local_layers):
-            self.layers.append(TransformerBlock.build(layer_id, params))
-
-        if self.rank == self.world_size - 1:
-            self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-            self.output = ColumnParallelLinear(
-                params.dim, params.vocab_size, bias=False, init_method=lambda x: x
-            )
-
-        self.freqs_cis = precompute_freqs_cis(
-            params.dim // params.n_heads,
-            params.max_seq_len * 2,
-            params.rope_theta,
-        ).cuda(self.rank)
-
-    @torch.inference_mode()
-    def prefill(self, tokens, device="cuda"):
-        varlens = Backend.curr_varlens
-        freqs_cis = self.prepare_freqs_cis_prefill(varlens, device)
-
-        # start of model
-        if self.rank == 0:
-            tokens = torch.from_numpy(np.concatenate(tokens)).to(device)
-            h = self.tok_embeddings(tokens)
-        else:
-            h = tokens
-        # layers
-        for it, layer in enumerate(self.layers):
-            h = layer(h, 0, freqs_cis, None, varlens)
-        # end of model
-        if self.rank == self.world_size - 1:
-            h = self.norm(h)
-            h = self.output(h)
-            tmp = varlens.cpu_prefix_lens[1:]
-            h = h[[item - 1 for item in tmp]]
-            h = h.float()
-        return h
-
-    @torch.inference_mode()
-    def decode(self, tokens, seq_lens, device="cuda"):
-        # generate different freqs_cis for each request, [num_req, other_freq_dim]
-        freqs_cis = self.prepare_freqs_cis_decode(seq_lens, device)
-        if self.rank == 0:
-            h = self.tok_embeddings(tokens)
-        else:
-            h = tokens
-        for it, layer in enumerate(self.layers):
-            h = layer(h, 1, freqs_cis, None)
-        if self.rank == self.world_size - 1:
-            h = self.norm(h)
-            h = self.output(h).float()
-        return h
