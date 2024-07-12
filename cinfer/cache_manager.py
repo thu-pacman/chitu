@@ -307,3 +307,36 @@ class KVCacheManagerSkewAware:
         self.slot_availability[slot_id] = True
         self.req2slot.pop(req_id)
         self.lengths.pop(req_id)
+
+
+class KVCacheManagerNop:
+    def __init__(
+        self,
+    ):
+        pass
+
+    # Prefill:
+    # return for every req [layer, seq, n_local_kv_heads, head_dim] * 2 (for k and v)
+    def finalize_cache_bylayer_prefill(self, cache_k, cache_v, req_ids, varlen):
+        pass
+
+    # Prefill:
+    def finalize_cache_all_prefill(self, req_ids, varlen):
+        pass
+
+    # Decode:
+    def prepare_cache_decode(self, req_ids):
+        pass
+
+    # Decode:
+    # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
+    def update_cache_decode(self, xk, xv):
+        pass
+
+    # Decode:
+    def finalize_cache_single_decode(self, req_ids):
+        pass
+
+    # Decode:
+    def finalize_cache_all_decode(self, req_id):
+        pass

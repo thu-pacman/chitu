@@ -1,5 +1,5 @@
 defaults:
-  - models: qwen2-7b
+  - models: qwen2-70b
   # - models: llama3-8b
 serve:
   host: 0.0.0.0
@@ -11,7 +11,7 @@ infer:
   stop_with_eos: True
   max_seq_len: 1024 # length of prefill + decode
   cache_type: normal
-  max_reqs: 16
+  max_reqs: 1
 request:
   max_new_tokens: 128
 executor:

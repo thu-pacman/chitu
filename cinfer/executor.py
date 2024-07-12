@@ -39,6 +39,8 @@ class Executor:
 
     def _prepare_seq_lens_for_decode(self, tasks):
         seq_lens = []
+        # for task in tasks.tasks:
+        #     seq_lens.append(task.prefix_length)
         for req_id in tasks.req_ids:
             seq_len = Backend.cache_manager.lengths[req_id]
             seq_lens.append(seq_len)

@@ -12,7 +12,7 @@ logger = getLogger(__name__)
 def cinfer_init(args):
     Backend.build(args)
     rank = torch.distributed.get_rank()
-    if rank == 0:
+    if args.infer.parallel_type != "pipe" or rank == 0:
         scheduler = Scheduler.build(args.scheduler)
         Backend.scheduler = scheduler
     executor = Executor.build(args.executor)
@@ -65,8 +65,9 @@ def cinfer_update(world_size):
 def cinfer_run():
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
-    if rank == 0:
+    if Backend.parallel_type != "pipe" or rank == 0:
         task_ids = Backend.scheduler.schedule()
+        logger.warning(f"Processing {task_ids}")
         if len(task_ids) == 0:  # no tasks to do, but some tasks are waiting
             cinfer_update(world_size)
             return
@@ -74,5 +75,7 @@ def cinfer_run():
     else:
         tasks = None
     Backend.executor.step(tasks)
-    if rank == 0:
+    if Backend.parallel_type == "pipe" and rank == 0:
         cinfer_update(world_size)
+    elif Backend.parallel_type != "pipe":
+        Backend.scheduler.update()
