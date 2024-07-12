@@ -148,7 +148,14 @@ class Backend:
                 model.n_layers, n_local_kv_heads, head_dim
             )
         elif args.infer.cache_type == "nop":
-            Backend.cache_manager = KVCacheManagerNop()
+            Backend.cache_manager = KVCacheManagerNop(
+                model.n_layers,
+                n_local_kv_heads,
+                head_dim,
+                max_seq_len=args.infer.max_seq_len,
+                num_hot_req=args.infer.max_reqs,
+                device=local_rank
+            )
         else:
             Backend.cache_manager = KVCacheManagerSkewAware(
                 model.n_layers,
@@ -156,9 +163,10 @@ class Backend:
                 head_dim,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=args.infer.max_reqs,
+                device=local_rank
             )
         Backend.args = args
-        logger.warning(f"Backend initialized with {torch.cuda.memory_allocated()}")
+        logger.warning(f"rank {local_rank} Backend initialized with {torch.cuda.memory_allocated()}")
 
 
 class VarLens:
@@ -364,8 +372,10 @@ class Transformer(nn.Module):
         self.world_size = torch.distributed.get_world_size()
         self.device = torch.device(self.rank)
 
-        self.pipeline_exec = True # self.world_size > 1
-        self.tensor_exec = False
+        # self.pipeline_exec = True # self.world_size > 1
+        # self.tensor_exec = False
+        self.pipeline_exec = False
+        self.tensor_exec = True
 
         self.params = params
         self.vocab_size = params.vocab_size

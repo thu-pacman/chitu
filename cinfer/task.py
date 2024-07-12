@@ -234,7 +234,9 @@ class PackedTasks:
             task_tensor_cpu = task_tensor.cpu()
             decoded = []
             lens = []
-            for it, task_id in enumerate(task_tensor_cpu):
+            # for it, task_id in enumerate(task_tensor_cpu):
+            for it in range(PackedTasks.max_num_tasks):
+                task_id = task_tensor_cpu[it]
                 if task_id == 0:
                     break
                 decoded.append(req_decode(task_id))

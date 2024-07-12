@@ -67,10 +67,11 @@ def cinfer_run():
     world_size = torch.distributed.get_world_size()
     if Backend.parallel_type != "pipe" or rank == 0:
         task_ids = Backend.scheduler.schedule()
-        logger.warning(f"Processing {task_ids}")
         if len(task_ids) == 0:  # no tasks to do, but some tasks are waiting
             cinfer_update(world_size)
             return
+        if rank == 0:
+            logger.warning(f"Processing {task_ids}")
         tasks = PackedTasks(task_ids, rank)
     else:
         tasks = None

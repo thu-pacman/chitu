@@ -285,8 +285,13 @@ class KVCacheManagerSkewAware:
     # Decode:
     # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
     def update_cache_decode(self, xk, xv):
+        self.timers("cache_update").start()
         output = self.prepared_cache[self.layer_id]
+        # output[0,:,self.seq_lens[0]] = xk
+        # output[1,:,self.seq_lens[0]] = xv
         self.layer_id += 1
+        self.timers("cache_update").stop()
+        return output
         for it in range(xk.shape[0]):
             output[0][it][self.seq_lens[it]] = xk[it]
             output[1][it][self.seq_lens[it]] = xv[it]
@@ -312,7 +317,36 @@ class KVCacheManagerSkewAware:
 class KVCacheManagerNop:
     def __init__(
         self,
+        num_layers,
+        n_local_kv_heads,
+        head_dim,
+        num_hot_req=16,
+        max_seq_len=2048,
+        device="cuda",
     ):
+        self.num_layers = num_layers
+        self.n_local_kv_heads = n_local_kv_heads
+        self.head_dim = head_dim
+        self.num_hot_req = num_hot_req
+        self.slot_availability = [True] * num_hot_req
+        self.hot_reqs = [-1] * num_hot_req
+        self.req2slot = {}
+        self.lengths = {}
+        self.max_seq_len = max_seq_len
+        self.tmp_storage = []
+        self.device = torch.device(device)
+        self.buffer = torch.zeros(
+            [
+                self.num_layers,
+                2,
+                self.num_hot_req,
+                self.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            ],
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
         pass
 
     # Prefill:

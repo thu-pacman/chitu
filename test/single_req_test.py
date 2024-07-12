@@ -80,10 +80,13 @@ def run_pipe(args, timers):
             # reqs = gen_reqs_real(num_reqs=1, max_new_tokens=args.request.max_new_tokens)
             for req in reqs:
                 TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
+        t_start = time.time()
         timers("overall").start()
         while len(TaskPool.pool) > 0 or rank != 0:
             cinfer_run()
         timers("overall").stop()
+        t_end = time.time()
+        logger.warning(f"Time cost {t_end - t_start}")
 
         for req in reqs:
             logger.warning(f"Response in rank {rank}: {req.output}")

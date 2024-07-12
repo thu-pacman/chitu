@@ -9,7 +9,7 @@ infer:
   do_load: True # set it to False for debug purpose
   seed: 0
   stop_with_eos: True
-  max_seq_len: 1024 # length of prefill + decode
+  max_seq_len: 640 # length of prefill + decode
   cache_type: normal
   max_reqs: 1
 request:
