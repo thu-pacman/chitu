@@ -124,7 +124,7 @@ class PipeExecutor(NormalExecutor):
         varlens = VarLens(tasks.tokens, self.rank)
         Backend.curr_varlens = varlens
         Backend.curr_req_ids = tasks.req_ids
-        logits = Backend.model.prefill(tasks.tokens if self.rank == 0 else h, self.rank)
+        logits = Backend.model.prefill(tasks.tokens if self.rank == 0 else h)
         self.timers("prefill").stop()
         # send logits to rank 0 to get response words
         if self.rank == self.world_size - 1:
@@ -158,7 +158,7 @@ class PipeExecutor(NormalExecutor):
         seq_lens = self._prepare_seq_lens_for_decode(tasks)
         tokens = self._prepare_new_tokens_for_decode(tasks) if self.rank == 0 else h
         self.timers("decode-model").start()
-        logits = Backend.model.decode(tokens, seq_lens, self.rank)
+        logits = Backend.model.decode(tokens, seq_lens)
         self.timers("decode-model").stop()
         self.timers("decode").stop()
         # Send logits to rank 0 to get response words

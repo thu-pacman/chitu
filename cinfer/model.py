@@ -104,7 +104,14 @@ class Backend:
             from .utils import load
 
             if world_size > 1:
-                load(checkpoint, model, args.models.n_layers, local_rank, world_size)
+                load(
+                    checkpoint,
+                    model,
+                    args.models.n_layers,
+                    local_rank,
+                    world_size,
+                    args.models.type,
+                )
             else:
                 model.load_state_dict(checkpoint, strict=True)
             logger.warning(f"Loaded in {time.time() - start_time:.2f} seconds")
@@ -444,7 +451,7 @@ class Transformer(nn.Module):
             h = tokens
         # layers
         for it, layer in enumerate(self.layers):
-            h = layer(h, 0, freqs_cis, None, varlens)
+            h = layer(h, freqs_cis, varlens)
         # end of model
         if self.rank == self.world_size - 1:
             h = self._post_layers(h)
@@ -458,11 +465,11 @@ class Transformer(nn.Module):
         # generate different freqs_cis for each request, [num_req, other_freq_dim]
         freqs_cis = self.prepare_freqs_cis_decode(seq_lens, self.device)
         if self.rank == 0:
-            h = self.tok_embeddings(tokens)
+            h = self._pre_layers(tokens)
         else:
             h = tokens
         for it, layer in enumerate(self.layers):
-            h = layer(h, 1, freqs_cis, None)
+            h = layer(h, freqs_cis)
         if self.rank == self.world_size - 1:
             h = self._post_layers(h)
             h = h.float()
@@ -572,7 +579,7 @@ class TransformerQwen(Transformer):
 
     def _init_layers(self):
         self.layers = torch.nn.ModuleList()
-        for layer_id in range(self.params.n_layers):
+        for layer_id in range(self.n_layers):
             self.layers.append(TransformerBlockQwen(layer_id, self.params))
 
     def _init_post_layers(self):
@@ -647,7 +654,7 @@ class TransformerLlama(Transformer):
 
     def _init_layers(self):
         self.layers = torch.nn.ModuleList()
-        for layer_id in range(self.params.n_layers):
+        for layer_id in range(self.n_layers):
             self.layers.append(TransformerBlockLlama(layer_id, self.params))
 
     def _init_post_layers(self):
