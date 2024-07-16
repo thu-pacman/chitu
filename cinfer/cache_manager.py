@@ -5,6 +5,124 @@ from logging import getLogger
 
 
 logger = getLogger(__name__)
+_BLOCK_SIZE = 512 # _BLOCK_SIZE must be a multiple of 256 for FlashAttention
+_MAX_SEQ_LEN = 2048
+_MAX_NUM_BLOCKS_PER_LAYER = (_MAX_SEQ_LEN // _BLOCK_SIZE) * 16 # TODO: make  this dynamic
+
+class PagedKVCacheManager:
+    def __init__(self, num_layers, n_local_kv_heads, head_dim, block_size=_BLOCK_SIZE, max_seq_len=_MAX_SEQ_LEN, num_blocks_per_layer = _MAX_NUM_BLOCKS_PER_LAYER, device="cuda"):
+        print("Init PagedKVCacheManager")
+        
+        self.num_layers = num_layers
+        self.n_local_kv_heads = n_local_kv_heads
+        self.head_dim = head_dim
+        assert block_size % 256 == 0
+        self.block_size = block_size
+        self.max_seq_len = max_seq_len
+        self.num_blocks = num_blocks_per_layer * num_layers
+        self.device = torch.device(device)
+        
+        self.seq_lens = {}
+        self.timers = get_timers()
+        self.block_table = {} #(seq_id, layer_id, block_idx)
+        # TODO: For better performance, use list instead of set for free_blocks
+        self.free_blocks = set(range(self.num_blocks))
+        self.paged_k_cache = torch.zeros(self.num_blocks, block_size, n_local_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+        self.paged_v_cache = torch.zeros(self.num_blocks, block_size, n_local_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+
+        # seq_lens = (tokens != -1).sum(1)
+        # for i, t in enumerate(seq_lens.tolist()):
+        #     num_blocks_to_reserve = math.ceil(t / block_size)
+        #     num_filled_positions = t % block_size
+        #     for b in range(num_blocks_to_reserve):
+        #         index = self.get_free_block()
+        #         if b == num_blocks_to_reserve-1:
+        #             self.block_table[i].append((index, num_filled_positions))
+        #         else:
+        #             self.block_table[i].append((index, block_size))
+
+
+    # Init block table and kv cache with kv generated during prefill
+    def finalize_cache_bylayer_prefill(self, xk, xv, req_ids, varlen, layer_id):
+        for idx, req_id in enumerate(req_ids):
+            if (layer_id == 0):
+                self.seq_lens[req_id] = varlen.cpu_lens[idx]
+                # logger.warning(f"Prefill: seq_lens[{req_id}] = {self.seq_lens[req_id]}")
+            num_blocks_prepared = (varlen.cpu_lens[idx] + self.block_size - 1) // self.block_size
+            block_ids = []
+            start_pos = varlen.cpu_prefix_lens[idx]
+            end_pos = varlen.cpu_prefix_lens[idx + 1]
+            for chunck_id in range(num_blocks_prepared):
+                block_idx = self.get_free_block()
+                block_ids.append(block_idx)
+                if chunck_id != num_blocks_prepared - 1:
+                    self.paged_k_cache[block_idx] = xk[start_pos : (start_pos + self.block_size)].clone()
+                    self.paged_v_cache[block_idx] = xv[start_pos : (start_pos + self.block_size)].clone()
+                    start_pos += self.block_size
+                else:
+                    tmp_len = end_pos - start_pos
+                    self.paged_k_cache[block_idx][:tmp_len] = xk[start_pos : end_pos].clone()
+                    self.paged_v_cache[block_idx][:tmp_len] = xv[start_pos : end_pos].clone()
+            if req_id in self.block_table:
+                assert len(self.block_table[req_id]) == layer_id
+            else:
+                self.block_table[req_id] = []
+            self.block_table[req_id].append(block_ids.copy())
+            # logger.warning(f"block table[{req_id}][{layer_id}] = {block_ids}")
+
+    def finalize_cache_all_prefill(self, req_ids, varlen):
+        pass
+
+    def prepare_cache_decode(self, req_ids):
+        pass
+
+    def get_free_block(self):
+        # TODO: When run out of free blocks, use scheduling and preemption in paper instead of exception
+        if len(self.free_blocks) == 0:
+            raise Exception('No more free blocks.')
+        idx = list(self.free_blocks)[0]
+        self.free_blocks.remove(idx)
+        return idx
+
+    def get_gpu_block_table(self, req_ids, layer_id):
+        max_block_num =max(len(self.block_table[req_id][layer_id]) for req_id in req_ids)
+        gpu_block_table = [[0] * max_block_num for _ in range(len(req_ids))]
+        for idx, req_id in enumerate(req_ids):
+            block_ids = self.block_table[req_id][layer_id]
+            gpu_block_table[idx][:len(block_ids)] = block_ids
+        # logger.warning(gpu_block_table)
+        return torch.tensor(gpu_block_table, dtype=torch.int32, device=self.device)
+    
+    def get_gpu_seq_lens(self, req_ids):
+        # logger.warning(f"get_gpu_seq_lens : {[self.seq_lens[req_id] for req_id in req_ids]}")
+        return torch.tensor([self.seq_lens[req_id] for req_id in req_ids], dtype=torch.int32, device=self.device)
+
+    def get_paged_kv_cache(self):
+        return self.paged_k_cache, self.paged_v_cache
+
+    def free_req_cache_blocks(self, req_id):
+        for layer_blocks in self.block_table[req_id]:
+            for block in layer_blocks:
+                self.free_blocks.add(block)
+        del self.block_table[req_id]
+            
+
+    # Prepare enough block table for next decoding. When decoding, flash attention will fill new kv into paged kv cache (inplace).
+    def prepare_block_table_for_decode(self, req_ids, layer_id):
+        for req_id in req_ids:
+            if self.seq_lens[req_id] % self.block_size == 0:
+                self.block_table[req_id][layer_id].append(self.get_free_block())
+
+    def finalize_cache_single_decode(self, req_ids):
+        for req_id in req_ids:
+            self.seq_lens[req_id] = self.seq_lens[req_id] + 1
+
+    def finalize_cache_all_decode(self, req_id):
+        assert req_id in self.seq_lens
+        assert req_id in self.block_table
+        del self.seq_lens[req_id]
+        self.free_req_cache_blocks(req_id)
+        
 
 
 class KVCacheManager:

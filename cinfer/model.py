@@ -4,7 +4,8 @@ from typing import Optional, Tuple
 
 import torch.distributed
 from .global_vars import set_global_variables, get_timers
-from .cache_manager import KVCacheManager, KVCacheManagerSkewAware
+# from .cache_manager import KVCacheManager, KVCacheManagerSkewAware
+from .cache_manager import PagedKVCacheManager
 
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
@@ -125,18 +126,24 @@ class Backend:
         n_local_kv_heads = n_kv_heads // model_parallel_size
         head_dim = model_args.dim // model_args.n_heads
 
-        if args.cache_type == "normal":
-            Backend.cache_manager = KVCacheManager(
-                model_args.n_layers, n_local_kv_heads, head_dim
-            )
-        else:
-            Backend.cache_manager = KVCacheManagerSkewAware(
-                model_args.n_layers,
-                n_local_kv_heads,
-                head_dim,
-                max_seq_len=args.max_seq_len,
-                num_hot_req=args.max_reqs,
-            )
+        # if args.cache_type == "normal":
+        #     Backend.cache_manager = KVCacheManager(
+        #         model_args.n_layers, n_local_kv_heads, head_dim
+        #     )
+        # else:
+        #     Backend.cache_manager = KVCacheManagerSkewAware(
+        #         model_args.n_layers,
+        #         n_local_kv_heads,
+        #         head_dim,
+        #         max_seq_len=args.max_seq_len,
+        #         num_hot_req=args.max_reqs,
+        #     )
+        Backend.cache_manager = PagedKVCacheManager(
+            model_args.n_layers,
+            n_local_kv_heads, 
+            head_dim, 
+            max_seq_len=args.max_seq_len
+        )
         Backend.args = args
         logger.warning(f"Backend initialized with {torch.cuda.memory_allocated()}")
 
@@ -286,6 +293,7 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        layer_id: int,
     ):
         bs_seq, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -298,6 +306,7 @@ class Attention(nn.Module):
             xv,
             Backend.curr_req_ids,
             Backend.curr_varlens,
+            layer_id,
         )
         output = flash_attn.flash_attn_varlen_func(
             xq,
@@ -357,6 +366,7 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
+        layer_id: int
     ):
         bsz, seqlen, _ = x.shape
         assert seqlen == 1, "decode_forward only supports single token decoding"
@@ -372,31 +382,42 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        cache = Backend.cache_manager.update_cache_decode(xk, xv)
-        cache_k = cache[0]
-        cache_v = cache[1]
-        max_seq_len = cache.shape[2]
+        Backend.cache_manager.prepare_block_table_for_decode(Backend.curr_req_ids, layer_id)
+        # logger.warning(f"req_ids : {Backend.curr_req_ids}")
+        block_table = Backend.cache_manager.get_gpu_block_table(Backend.curr_req_ids, layer_id)
+        cache_seqlens = Backend.cache_manager.get_gpu_seq_lens(Backend.curr_req_ids)
+        paged_k_cache, paged_v_cache = Backend.cache_manager.get_paged_kv_cache()
+        # logger.warning(f"xq.shape = {xq.shape}   xk.shape = {xk.shape}")
+        # logger.warning(block_table.shape)
+        # logger.warning(cache_seqlens.shape)
 
-        if self.n_local_heads != self.n_local_kv_heads:
-            group_size = self.n_local_heads // self.n_local_kv_heads
-            assert group_size > 1
-            xq = xq.view(bsz, seqlen, self.n_local_kv_heads, group_size, self.head_dim)
-            cache_k = cache_k.view(
-                bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
-            ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
-            cache_v = cache_v.view(
-                bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
-            ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
-        output = fmha.memory_efficient_attention_forward(xq, cache_k, cache_v).view(
-            bsz, seqlen, -1
-        )
+        output = flash_attn.flash_attn_with_kvcache(xq, paged_k_cache, paged_v_cache, xk, xv, cache_seqlens=cache_seqlens, block_table=block_table).view(bsz, seqlen, -1)
+
+        # cache = Backend.cache_manager.update_cache_decode(xk, xv)
+        # cache_k = cache[0]
+        # cache_v = cache[1]
+        # max_seq_len = cache.shape[2]
+
+        # if self.n_local_heads != self.n_local_kv_heads:
+        #     group_size = self.n_local_heads // self.n_local_kv_heads
+        #     assert group_size > 1
+        #     xq = xq.view(bsz, seqlen, self.n_local_kv_heads, group_size, self.head_dim)
+        #     cache_k = cache_k.view(
+        #         bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
+        #     ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
+        #     cache_v = cache_v.view(
+        #         bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
+        #     ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
+        # output = fmha.memory_efficient_attention_forward(xq, cache_k, cache_v).view(
+        #     bsz, seqlen, -1
+        # )
         return self.wo(output)
 
-    def forward(self, x, start_pos, freqs_cis, mask, varlens=None):
+    def forward(self, x, start_pos, freqs_cis, mask, layer_id, varlens=None):
         if start_pos == 0:
-            return self.prefill_forward(x, varlens, start_pos, freqs_cis, mask)
+            return self.prefill_forward(x, varlens, start_pos, freqs_cis, mask, layer_id)
         else:
-            return self.decode_forward(x, freqs_cis)
+            return self.decode_forward(x, freqs_cis, layer_id)
 
 
 def GEMV(x, w):
@@ -492,7 +513,7 @@ class TransformerBlock(nn.Module):
         mask: Optional[torch.Tensor],
         varlens=None,
     ):
-        h = self.attention(self.attention_norm(x), start_pos, freqs_cis, mask, varlens)
+        h = self.attention(self.attention_norm(x), start_pos, freqs_cis, mask, self.layer_id, varlens)
         h += x
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
