@@ -70,6 +70,7 @@ class Tokenizer:
             f"<|reserved_special_token_{i}|>"
             for i in range(5, self.num_reserved_special_tokens - 5)
         ]
+        self.tokens_cache = []
         self.special_tokens = {
             token: num_base_tokens + i for i, token in enumerate(special_tokens)
         }
@@ -168,7 +169,15 @@ class Tokenizer:
             str: The decoded string.
         """
         # Typecast is safe here. Tiktoken doesn't do anything list-related with the sequence.
-        return self.model.decode(cast(List[int], t))
+        if len(t) == 1 and t[0] in self.stop_tokens:
+            return ""
+        self.tokens_cache = self.tokens_cache + t
+        c = self.model.decode(cast(List[int], self.tokens_cache))
+        if "\uFFFD" in c:
+            return ""
+        else:
+            self.tokens_cache.clear()
+            return c
 
     @staticmethod
     def _split_whitespaces_or_nonwhitespaces(
@@ -229,6 +238,7 @@ class ChatFormat:
 
 class TokenizerHF:
     def __init__(self, path: str):
+        self.tokens_cache = []
         self.model = AutoTokenizer.from_pretrained(path)
         # self.model = AutoTokenizer.from_pretrained("Qwen/Qwen2-7B-Instruct")
         # Qwen2 don't set bos but have <|im_start|>
@@ -250,8 +260,14 @@ class TokenizerHF:
             t.append(self.eos_id)
         return t
 
-    def decode(self, t: Sequence[int]) -> str:
-        return self.model.decode(t, skip_special_tokens=True)
+    def decode(self, t: Sequence[int], skip_special_tokens=True) -> str:
+        self.tokens_cache = self.tokens_cache + t
+        c = self.model.decode(self.tokens_cache, skip_special_tokens=True)
+        if "\uFFFD" in c:
+            return ""
+        else:
+            self.tokens_cache.clear()
+            return c
 
 
 class ChatFormatHF:
@@ -260,25 +276,21 @@ class ChatFormatHF:
 
     def encode_header(self, message: Message) -> List[int]:  # ???
         tokens = []
-        tokens.append(self.tokenizer.bos_id)
-        tokens.extend(self.tokenizer.encode(message["role"], bos=False, eos=False))
-        tokens.append(self.tokenizer.eos_id)
-        tokens.extend(self.tokenizer.encode("\n\n", bos=False, eos=False))
+        tokens.extend(self.tokenizer.encode(message["role"], bos=True, eos=False))
+        tokens.extend(self.tokenizer.encode("\n", bos=False, eos=False))
         return tokens
 
     def encode_message(self, message: Message) -> List[int]:
         tokens = self.encode_header(message)
         tokens.extend(
-            self.tokenizer.encode(message["content"].strip(), bos=False, eos=False)
+            self.tokenizer.encode(message["content"].strip(), bos=False, eos=True)
         )
-        tokens.append(self.tokenizer.eos_id)
+        tokens.extend(self.tokenizer.encode("\n", bos=False, eos=False))
         return tokens
 
     def encode_dialog_prompt(self, dialog: Dialog) -> List[int]:
         tokens = []
-        tokens.append(self.tokenizer.bos_id)
         for message in dialog:
             tokens.extend(self.encode_message(message))
-        # Add the start of an assistant message for the model to complete.
-        tokens.extend(self.encode_header({"role": "assistant", "content": ""}))  # ???
+        tokens.extend(self.encode_header({"role": "assistant", "content": ""}))
         return tokens

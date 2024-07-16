@@ -56,11 +56,12 @@ class TaskPool:
         return True
 
     def display():
-        os.system("clear")
-        output_str = ""
+        return
+        num = len(TaskPool.total_reqs)
+        sys.stdout.write("\033[F" * num)
         for req in TaskPool.total_reqs:
-            output_str += f">>> {req.request_id}: {req.message} {req.output}<<<\n"
-        print(output_str)
+            sys.stdout.write(f">>> {req.request_id}: {req.message} {req.output}<<<\n")
+        sys.stdout.flush()
 
 
 class TaskType(Enum):
@@ -124,11 +125,9 @@ class PrefillTask(Task):
 
     def update_response(self, logit):
         self.next_token = torch.argmax(logit, dim=-1).item()
-        # self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
         self.req.add_data(Backend.tokenizer.decode([self.next_token]))
         if self.linked_task is not None:
             self.linked_task.next_token = self.next_token
-        # logger.warning(f"prefill token {(Backend.tokenizer.decode([self.next_token]))}")
 
     def need_remove(self):
         return not self.waiting
