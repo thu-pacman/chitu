@@ -84,9 +84,7 @@ def main(args: DictConfig):
     rank = torch.distributed.get_rank()
     for i in range(2):
         if rank == 0:
-            reqs = gen_reqs_real(
-                num_reqs=1, max_new_tokens=args.request.max_new_tokens
-            )
+            reqs = gen_reqs_real(num_reqs=1, max_new_tokens=args.request.max_new_tokens)
             for req in reqs:
                 TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
         timers("overall").start()

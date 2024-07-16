@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 
 import torch.distributed
 from .global_vars import set_global_variables, get_timers
+
 # from .cache_manager import KVCacheManager, KVCacheManagerSkewAware
 from .cache_manager import PagedKVCacheManager
 
@@ -140,9 +141,9 @@ class Backend:
         #     )
         Backend.cache_manager = PagedKVCacheManager(
             model_args.n_layers,
-            n_local_kv_heads, 
-            head_dim, 
-            max_seq_len=args.max_seq_len
+            n_local_kv_heads,
+            head_dim,
+            max_seq_len=args.max_seq_len,
         )
         Backend.args = args
         logger.warning(f"Backend initialized with {torch.cuda.memory_allocated()}")
@@ -362,12 +363,7 @@ class Attention(nn.Module):
         attn = attn @ value
         return attn.transpose(1, 2)
 
-    def decode_forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        layer_id: int
-    ):
+    def decode_forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, layer_id: int):
         bsz, seqlen, _ = x.shape
         assert seqlen == 1, "decode_forward only supports single token decoding"
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -382,16 +378,28 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        Backend.cache_manager.prepare_block_table_for_decode(Backend.curr_req_ids, layer_id)
+        Backend.cache_manager.prepare_block_table_for_decode(
+            Backend.curr_req_ids, layer_id
+        )
         # logger.warning(f"req_ids : {Backend.curr_req_ids}")
-        block_table = Backend.cache_manager.get_gpu_block_table(Backend.curr_req_ids, layer_id)
+        block_table = Backend.cache_manager.get_gpu_block_table(
+            Backend.curr_req_ids, layer_id
+        )
         cache_seqlens = Backend.cache_manager.get_gpu_seq_lens(Backend.curr_req_ids)
         paged_k_cache, paged_v_cache = Backend.cache_manager.get_paged_kv_cache()
         # logger.warning(f"xq.shape = {xq.shape}   xk.shape = {xk.shape}")
         # logger.warning(block_table.shape)
         # logger.warning(cache_seqlens.shape)
 
-        output = flash_attn.flash_attn_with_kvcache(xq, paged_k_cache, paged_v_cache, xk, xv, cache_seqlens=cache_seqlens, block_table=block_table).view(bsz, seqlen, -1)
+        output = flash_attn.flash_attn_with_kvcache(
+            xq,
+            paged_k_cache,
+            paged_v_cache,
+            xk,
+            xv,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+        ).view(bsz, seqlen, -1)
 
         # cache = Backend.cache_manager.update_cache_decode(xk, xv)
         # cache_k = cache[0]
@@ -415,7 +423,9 @@ class Attention(nn.Module):
 
     def forward(self, x, start_pos, freqs_cis, mask, layer_id, varlens=None):
         if start_pos == 0:
-            return self.prefill_forward(x, varlens, start_pos, freqs_cis, mask, layer_id)
+            return self.prefill_forward(
+                x, varlens, start_pos, freqs_cis, mask, layer_id
+            )
         else:
             return self.decode_forward(x, freqs_cis, layer_id)
 
@@ -513,7 +523,9 @@ class TransformerBlock(nn.Module):
         mask: Optional[torch.Tensor],
         varlens=None,
     ):
-        h = self.attention(self.attention_norm(x), start_pos, freqs_cis, mask, self.layer_id, varlens)
+        h = self.attention(
+            self.attention_norm(x), start_pos, freqs_cis, mask, self.layer_id, varlens
+        )
         h += x
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
