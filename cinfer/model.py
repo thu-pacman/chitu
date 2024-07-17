@@ -4,7 +4,8 @@ from typing import Optional, Tuple
 
 import torch.distributed
 from .global_vars import set_global_variables, get_timers
-from .cache_manager import KVCacheManager, KVCacheManagerSkewAware
+
+from .cache_manager import KVCacheManager, KVCacheManagerSkewAware, PagedKVCacheManager
 
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
@@ -55,6 +56,7 @@ class Backend:
     curr_varlens = None
     curr_req_ids = None
     ongoing_reqs = []
+    cache_type = ""
 
     @staticmethod
     def build(args):
@@ -77,10 +79,32 @@ class Backend:
             tokenizer = TokenizerHF(path=args.models.tokenizer_path)
         else:
             tokenizer = Tokenizer(model_path=args.models.tokenizer_path)
-        # assert (
-        #     args.models.vocab_size == tokenizer.n_words
-        # ), f"{args.models.vocab_size} vs. {tokenizer.n_words}"
-        model = Transformer.build(args.models)
+        assert (
+            args.models.vocab_size == tokenizer.n_words
+        ), f"{args.models.vocab_size} vs. {tokenizer.n_words}"
+
+        if args.infer.cache_type == "normal":
+            Backend.cache_manager = KVCacheManager(
+                args.models.n_layers, n_local_kv_heads, head_dim
+            )
+        elif args.infer.cache_type == "skew":
+            Backend.cache_manager = KVCacheManagerSkewAware(
+                args.models.n_layers,
+                n_local_kv_heads,
+                head_dim,
+                max_seq_len=args.infer.max_seq_len,
+                num_hot_req=args.infer.max_reqs,
+            )
+        elif args.infer.cache_type == "paged":
+            Backend.cache_manager = PagedKVCacheManager(
+                args.models.n_layers,
+                n_local_kv_heads,
+                head_dim,
+                max_seq_len=args.max_seq_len,
+            )
+        Backend.cache_type = args.infer.cache_type
+
+        model = Transformer.build(args.models, Backend.cache_manager)
         if torch.cuda.is_bf16_supported():
             torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
         else:
@@ -89,14 +113,10 @@ class Backend:
 
         if args.infer.do_load:
             start_time = time.time()
-            checkpoints = sorted(Path(args.models.ckpt_dir).glob("model1.pth"))
+            checkpoints = sorted(Path(args.models.ckpt_dir).glob("*.pth"))
             assert (
                 len(checkpoints) > 0
             ), f"no checkpoint files found in {args.models.ckpt_dir}"
-            # assert model_parallel_size == len(
-            #     checkpoints
-            # ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
-            # ckpt_path = checkpoints[get_model_parallel_rank()]
             ckpt_path = checkpoints[0]
             logger.warning(f"Loading checkpoint from {ckpt_path}")
             checkpoint = torch.load(ckpt_path, map_location="cpu")
@@ -137,18 +157,6 @@ class Backend:
         n_local_kv_heads = n_kv_heads // model_parallel_size
         head_dim = args.models.dim // args.models.n_heads
 
-        if args.infer.cache_type == "normal":
-            Backend.cache_manager = KVCacheManager(
-                args.models.n_layers, n_local_kv_heads, head_dim
-            )
-        else:
-            Backend.cache_manager = KVCacheManagerSkewAware(
-                args.models.n_layers,
-                n_local_kv_heads,
-                head_dim,
-                max_seq_len=args.infer.max_seq_len,
-                num_hot_req=args.infer.max_reqs,
-            )
         Backend.args = args
         logger.warning(f"Backend initialized with {torch.cuda.memory_allocated()}")
 
@@ -225,8 +233,10 @@ def apply_rotary_emb(
 
 
 class Attention(nn.Module):
-    def __init__(self):
+    def __init__(self, layer_id, cache):
         super().__init__()
+        self.layer_id = layer_id
+        self.cache = cache
 
     def _run_linear(self, x):
         raise NotImplementedError
@@ -237,8 +247,8 @@ class Attention(nn.Module):
     def prefill_forward(
         self,
         x: torch.Tensor,
-        varlens,
         freqs_cis: torch.Tensor,
+        varlens,
     ):
         bs_seq, _ = x.shape
         xq, xk, xv = self._run_linear(x)
@@ -246,11 +256,8 @@ class Attention(nn.Module):
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-        Backend.cache_manager.finalize_cache_bylayer_prefill(
-            xk,
-            xv,
-            Backend.curr_req_ids,
-            Backend.curr_varlens,
+        self.cache.finalize_cache_bylayer_prefill(
+            xk, xv, Backend.curr_req_ids, Backend.curr_varlens, self.layer_id
         )
         output = flash_attn.flash_attn_varlen_func(
             xq,
@@ -264,11 +271,7 @@ class Attention(nn.Module):
         ).view(bs_seq, -1)
         return self._run_output_linear(output)
 
-    def decode_forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-    ):
+    def decode_forward(self, x: torch.Tensor, freqs_cis: torch.Tensor):
         bsz, seqlen, _ = x.shape
         assert seqlen == 1, "decode_forward only supports single token decoding"
         xq, xk, xv = self._run_linear(x)
@@ -283,7 +286,7 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        cache = Backend.cache_manager.update_cache_decode(xk, xv)
+        cache = self.cache.update_cache_decode(xk, xv, self.layer_id)
         cache_k = cache[0]
         cache_v = cache[1]
         max_seq_len = cache.shape[2]
@@ -303,9 +306,41 @@ class Attention(nn.Module):
         )
         return self._run_output_linear(output)
 
+    def decode_forward_paged(self, x: torch.Tensor, freqs_cis: torch.Tensor):
+        bsz, seqlen, _ = x.shape
+        assert seqlen == 1, "decode_forward only supports single token decoding"
+        xq, xk, xv = self._run_linear(x)
+
+        xq = xq.view(-1, self.n_local_heads, self.head_dim)
+        xk = xk.view(-1, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(-1, self.n_local_kv_heads, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        self.cache.prepare_block_table_for_decode(Backend.curr_req_ids, self.layer_id)
+        block_table = self.cache.get_gpu_block_table(
+            Backend.curr_req_ids, self.layer_id
+        )
+        cache_seqlens = self.cache.get_gpu_seq_lens(Backend.curr_req_ids)
+        paged_k_cache, paged_v_cache = self.cache.get_paged_kv_cache()
+        output = flash_attn.flash_attn_with_kvcache(
+            xq,
+            paged_k_cache,
+            paged_v_cache,
+            xk,
+            xv,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+        ).view(bsz, seqlen, -1)
+        return self._run_output_linear(output)
+
     def forward(self, x, freqs_cis, varlens=None):
         if varlens is not None:  # prefill
-            return self.prefill_forward(x, varlens, freqs_cis)
+            return self.prefill_forward(x, freqs_cis, varlens)
         else:  # decode
             return self.decode_forward(x, freqs_cis)
 
@@ -341,15 +376,15 @@ class TransformerBlock(nn.Module):
 
 class Transformer(nn.Module):
     @staticmethod
-    def build(args):
+    def build(args, cache):
         if args.type == "qwen":
-            return TransformerQwen(args)
+            return TransformerQwen(args, cache)
         elif args.type == "llama":
-            return TransformerLlama(args)
+            return TransformerLlama(args, cache)
         else:
             assert False, f"Unknown model type {args.models.type}"
 
-    def __init__(self, params):
+    def __init__(self, params, cache):
         super().__init__()
         self.rank = torch.distributed.get_rank()
         self.world_size = torch.distributed.get_world_size()
@@ -366,7 +401,7 @@ class Transformer(nn.Module):
 
         if not self.pipeline_exec or self.rank == 0:
             self._init_pre_layers()
-        self._init_layers()
+        self._init_layers(cache)
         if not self.pipeline_exec or self.rank == self.world_size - 1:
             self._init_post_layers()
 
@@ -379,7 +414,7 @@ class Transformer(nn.Module):
     def _init_pre_layers(self):
         raise NotImplementedError
 
-    def _init_layers(self):
+    def _init_layers(self, cache):
         raise NotImplementedError
 
     def _init_post_layers(self):
@@ -491,8 +526,8 @@ class Transformer(nn.Module):
 
 
 class AttentionQwen(Attention):
-    def __init__(self, args):
-        super().__init__()
+    def __init__(self, args, layer_id, cache):
+        super().__init__(layer_id, cache)
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         model_parallel_size = fs_init.get_model_parallel_world_size()
         self.n_local_heads = args.n_heads // model_parallel_size
@@ -554,9 +589,9 @@ class FeedForwardQwen(nn.Module):
 
 
 class TransformerBlockQwen(TransformerBlock):
-    def __init__(self, layer_id: int, args):
+    def __init__(self, layer_id: int, args, cache):
         super().__init__(layer_id, args)
-        self.self_attn = AttentionQwen(args)
+        self.self_attn = AttentionQwen(args, layer_id, cache)
         self.mlp = FeedForwardQwen(dim=args.dim, hidden_dim=args.intermediate_dim)
         self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
         self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -577,10 +612,10 @@ class TransformerQwen(Transformer):
             self.params.vocab_size, self.params.dim, init_method=lambda x: x
         )
 
-    def _init_layers(self):
+    def _init_layers(self, cache):
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.n_layers):
-            self.layers.append(TransformerBlockQwen(layer_id, self.params))
+            self.layers.append(TransformerBlockQwen(layer_id, self.params, cache))
 
     def _init_post_layers(self):
         self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps)
@@ -598,8 +633,8 @@ class TransformerQwen(Transformer):
 
 
 class AttentionLlama(nn.Module):
-    def __init__(self, args):
-        super().__init__()
+    def __init__(self, args, layer_id, cache):
+        super().__init__(layer_id, cache)
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         model_parallel_size = fs_init.get_model_parallel_world_size()
         self.n_local_heads = args.n_heads // model_parallel_size
@@ -652,10 +687,10 @@ class TransformerLlama(Transformer):
             self.params.vocab_size, self.params.dim, init_method=lambda x: x
         )
 
-    def _init_layers(self):
+    def _init_layers(self, cache):
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.n_layers):
-            self.layers.append(TransformerBlockLlama(layer_id, self.params))
+            self.layers.append(TransformerBlockLlama(layer_id, self.params, cache))
 
     def _init_post_layers(self):
         self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps)
@@ -702,9 +737,9 @@ class FeedForwardLlama(nn.Module):
 
 
 class TransformerBlockLlama(TransformerBlock):
-    def __init__(self, layer_id: int, args):
+    def __init__(self, layer_id: int, args, cache):
         super().__init__(layer_id, args)
-        self.attention = AttentionLlama(args)
+        self.attention = AttentionLlama(args, layer_id, cache)
         self.feed_forward = FeedForwardLlama(
             dim=args.dim,
             hidden_dim=4 * args.dim,
