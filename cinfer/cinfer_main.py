@@ -1,7 +1,7 @@
 import torch.distributed
 from .executor import Executor
 from .scheduler import Scheduler
-from .task import PackedTasks, req_encode
+from .task import PackedTasks, req_encode, TaskPool
 from .model import Backend
 import torch
 from logging import getLogger
@@ -76,3 +76,4 @@ def cinfer_run():
     Backend.executor.step(tasks)
     if rank == 0:
         cinfer_update(world_size)
+        TaskPool.display()

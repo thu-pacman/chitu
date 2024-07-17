@@ -4,6 +4,7 @@ import asyncio
 import time
 from .model import Backend
 from .async_response import AsyncDataStream, AsyncResponse
+import os
 
 from logging import getLogger
 
@@ -28,12 +29,15 @@ class UserRequest:
 class TaskPool:
     pool = {}
     id_list = []
+    total_reqs = []
 
     def add(task):
         if task.task_id in TaskPool.pool:
             return False  # Task already exists, failed to add
         TaskPool.pool[task.task_id] = task
         TaskPool.id_list.append(task.task_id)
+        if task.req not in TaskPool.total_reqs:
+            TaskPool.total_reqs.append(task.req)
         return True
 
     def remove(task_id):
@@ -50,6 +54,13 @@ class TaskPool:
         if ret is None:
             return False  # Task not found, failed to remove
         return True
+
+    def display():
+        os.system("clear")
+        output_str = ""
+        for req in TaskPool.total_reqs:
+            output_str += f">>>\n{req.request_id}: {req.message} {req.output}<<<\n"
+        print(output_str)
 
 
 class TaskType(Enum):
