@@ -4,8 +4,14 @@ from typing import Optional, Tuple
 
 import torch.distributed
 from .global_vars import set_global_variables, get_timers
+from .utils import load_pipe
 
-from .cache_manager import KVCacheManager, KVCacheManagerSkewAware, PagedKVCacheManager
+from .cache_manager import (
+    KVCacheManager,
+    KVCacheManagerSkewAware,
+    PagedKVCacheManager,
+    KVCacheManagerNop,
+)
 
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
@@ -19,11 +25,10 @@ from torch import nn
 import numpy as np
 
 # from vllm import _custom_ops as vllm_ops
-import cinfer_backend
+# import cinfer_backend
 import flash_attn
 
 from fairscale.nn.model_parallel.initialize import (
-    get_model_parallel_rank,
     initialize_model_parallel,
     model_parallel_is_initialized,
 )
@@ -57,14 +62,30 @@ class Backend:
     curr_req_ids = None
     ongoing_reqs = []
     cache_type = ""
+    parallel_type = ""
+
+    @staticmethod
+    def build_model(args, cache, *extra_args, **extra_kwargs):
+        if args.type == "qwen":
+            return TransformerQwen(args, cache, *extra_args, **extra_kwargs)
+        elif args.type == "llama":
+            return TransformerLlama(args, cache, *extra_args, **extra_kwargs)
+        else:
+            assert False, f"Unknown model type {args.models.type}"
 
     @staticmethod
     def build(args):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group("nccl")
         if not model_parallel_is_initialized():
-            model_parallel_size = 1  # int(os.environ.get("WORLD_SIZE", 1))
+            if args.infer.parallel_type == "tensor":
+                model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
+                pipeline_parallel_size = 1
+            else:
+                model_parallel_size = 1
+                pipeline_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
             initialize_model_parallel(model_parallel_size)
+        Backend.parallel_type = args.infer.parallel_type
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -75,6 +96,7 @@ class Backend:
         if local_rank > 0:
             sys.stdout = open(os.devnull, "w")
 
+        # Init tokenizer
         if args.models.type == "qwen":
             tokenizer = TokenizerHF(path=args.models.tokenizer_path)
         else:
@@ -82,62 +104,6 @@ class Backend:
         assert (
             args.models.vocab_size == tokenizer.n_words
         ), f"{args.models.vocab_size} vs. {tokenizer.n_words}"
-
-        if args.infer.cache_type == "normal":
-            Backend.cache_manager = KVCacheManager(
-                args.models.n_layers, n_local_kv_heads, head_dim
-            )
-        elif args.infer.cache_type == "skew":
-            Backend.cache_manager = KVCacheManagerSkewAware(
-                args.models.n_layers,
-                n_local_kv_heads,
-                head_dim,
-                max_seq_len=args.infer.max_seq_len,
-                num_hot_req=args.infer.max_reqs,
-            )
-        elif args.infer.cache_type == "paged":
-            Backend.cache_manager = PagedKVCacheManager(
-                args.models.n_layers,
-                n_local_kv_heads,
-                head_dim,
-                max_seq_len=args.max_seq_len,
-            )
-        Backend.cache_type = args.infer.cache_type
-
-        model = Transformer.build(args.models, Backend.cache_manager)
-        if torch.cuda.is_bf16_supported():
-            torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
-        else:
-            torch.set_default_tensor_type(torch.cuda.HalfTensor)
-        model = model.to(torch.bfloat16)
-
-        if args.infer.do_load:
-            start_time = time.time()
-            checkpoints = sorted(Path(args.models.ckpt_dir).glob("*.pth"))
-            assert (
-                len(checkpoints) > 0
-            ), f"no checkpoint files found in {args.models.ckpt_dir}"
-            ckpt_path = checkpoints[0]
-            logger.warning(f"Loading checkpoint from {ckpt_path}")
-            checkpoint = torch.load(ckpt_path, map_location="cpu")
-            logger.warning(checkpoint.keys())
-            from .utils import load
-
-            if world_size > 1:
-                load(
-                    checkpoint,
-                    model,
-                    args.models.n_layers,
-                    local_rank,
-                    world_size,
-                    args.models.type,
-                )
-            else:
-                model.load_state_dict(checkpoint, strict=True)
-            logger.warning(f"Loaded in {time.time() - start_time:.2f} seconds")
-        model = model.to(local_rank)
-
-        Backend.model = model
         tokenizer.stop_tokens = torch.tensor(
             list(
                 [tokenizer.stop_tokens]
@@ -152,13 +118,93 @@ class Backend:
         else:
             Backend.formatter = ChatFormat(tokenizer)
 
-        model_parallel_size = 1  # fs_init.get_model_parallel_world_size()
+        # Init cache
+        local_n_layers = args.models.n_layers // pipeline_parallel_size
+        assert (
+            args.models.n_layers % pipeline_parallel_size == 0
+        ), f"n_layers {args.models.n_layers} not divisible by pipeline_parallel_size {pipeline_parallel_size}"
+        model_parallel_size = fs_init.get_model_parallel_world_size()
         n_kv_heads = args.models.n_kv_heads
         n_local_kv_heads = n_kv_heads // model_parallel_size
+        logger.warning(f"n local kv heads {n_local_kv_heads}")
         head_dim = args.models.dim // args.models.n_heads
+        if args.infer.cache_type == "normal":
+            Backend.cache_manager = KVCacheManager(
+                local_n_layers, n_local_kv_heads, head_dim
+            )
+        elif args.infer.cache_type == "nop":
+            Backend.cache_manager = KVCacheManagerNop(
+                local_n_layers,
+                n_local_kv_heads,
+                head_dim,
+                max_seq_len=args.infer.max_seq_len,
+                num_hot_req=args.infer.max_reqs,
+                device=local_rank,
+            )
+        elif args.infer.cache_type == "paged":
+            Backend.cache_manager = PagedKVCacheManager(
+                local_n_layers,
+                n_local_kv_heads,
+                head_dim,
+                max_seq_len=args.max_seq_len,
+            )
+        elif args.infer.cache_type == "skew":
+            Backend.cache_manager = KVCacheManagerSkewAware(
+                local_n_layers,
+                n_local_kv_heads,
+                head_dim,
+                max_seq_len=args.infer.max_seq_len,
+                num_hot_req=args.infer.max_reqs,
+                device=local_rank,
+            )
+        else:
+            assert False, f"Unknown cache type {args.infer.cache_type}"
+        Backend.cache_type = args.infer.cache_type
+
+        # Init model
+        model = Backend.build_model(
+            args.models,
+            Backend.cache_manager,
+            pipeline_parallel_size,
+            model_parallel_size,
+        )
+        if torch.cuda.is_bf16_supported():
+            torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
+        else:
+            torch.set_default_tensor_type(torch.cuda.HalfTensor)
+        model = model.to(torch.bfloat16)
+
+        # Init model parameters
+        if args.infer.do_load:
+            start_time = time.time()
+            checkpoints = sorted(Path(args.models.ckpt_dir).glob("*.pth"))
+            assert (
+                len(checkpoints) > 0
+            ), f"no checkpoint files found in {args.models.ckpt_dir}"
+            ckpt_path = checkpoints[0]
+            logger.warning(f"Loading checkpoint from {ckpt_path}")
+            checkpoint = torch.load(ckpt_path, map_location="cpu")
+            logger.warning(checkpoint.keys())
+
+            if pipeline_parallel_size > 1:
+                load_pipe(
+                    checkpoint,
+                    model,
+                    args.models.n_layers,
+                    local_rank,
+                    world_size,
+                    args.models.type,
+                )
+            else:
+                model.load_state_dict(checkpoint, strict=True)
+            logger.warning(f"Loaded in {time.time() - start_time:.2f} seconds")
+        model = model.to(local_rank)
+        Backend.model = model
 
         Backend.args = args
-        logger.warning(f"Backend initialized with {torch.cuda.memory_allocated()}")
+        logger.warning(
+            f"rank {local_rank} Backend initialized with CUDA mem at {torch.cuda.memory_allocated()}"
+        )
 
 
 class VarLens:
@@ -304,6 +350,7 @@ class Attention(nn.Module):
         output = fmha.memory_efficient_attention_forward(xq, cache_k, cache_v).view(
             bsz, seqlen, -1
         )
+        output = xq.view(bsz, seqlen, -1)
         return self._run_output_linear(output)
 
     def decode_forward_paged(self, x: torch.Tensor, freqs_cis: torch.Tensor):
@@ -375,22 +422,14 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    @staticmethod
-    def build(args, cache):
-        if args.type == "qwen":
-            return TransformerQwen(args, cache)
-        elif args.type == "llama":
-            return TransformerLlama(args, cache)
-        else:
-            assert False, f"Unknown model type {args.models.type}"
-
-    def __init__(self, params, cache):
+    def __init__(self, params, cache, pipeline_parallel_size, model_parallel_size):
         super().__init__()
         self.rank = torch.distributed.get_rank()
         self.world_size = torch.distributed.get_world_size()
         self.device = torch.device(self.rank)
 
-        self.pipeline_exec = self.world_size > 1
+        self.pipeline_exec = pipeline_parallel_size > 1
+        self.tensor_exec = model_parallel_size > 1
 
         self.params = params
         self.vocab_size = params.vocab_size
@@ -537,21 +576,21 @@ class AttentionQwen(Attention):
 
         self.q_proj = ColumnParallelLinear(
             args.dim,
-            args.n_heads * self.head_dim,
+            self.n_local_heads * self.head_dim,
             bias=True,
             gather_output=False,
             init_method=lambda x: x,
         )
         self.k_proj = ColumnParallelLinear(
             args.dim,
-            self.n_kv_heads * self.head_dim,
+            self.n_local_kv_heads * self.head_dim,
             bias=True,
             gather_output=False,
             init_method=lambda x: x,
         )
         self.v_proj = ColumnParallelLinear(
             args.dim,
-            self.n_kv_heads * self.head_dim,
+            self.n_local_kv_heads * self.head_dim,
             bias=True,
             gather_output=False,
             init_method=lambda x: x,
@@ -597,6 +636,7 @@ class TransformerBlockQwen(TransformerBlock):
         self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, varlens=None):
+        # h = self.input_layernorm(x)
         h = self.self_attn(self.input_layernorm(x), freqs_cis, varlens)
         h += x
         out = h + self.mlp(self.post_attention_layernorm(h))
@@ -632,7 +672,7 @@ class TransformerQwen(Transformer):
         return h
 
 
-class AttentionLlama(nn.Module):
+class AttentionLlama(Attention):
     def __init__(self, args, layer_id, cache):
         super().__init__(layer_id, cache)
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads

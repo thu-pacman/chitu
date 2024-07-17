@@ -177,7 +177,9 @@ class KVCacheManager:
         self.device = torch.device(device)
 
     # Prefill:
-    def finalize_cache_bylayer_prefill(self, cache_k, cache_v, req_ids, varlen, layer_id):
+    def finalize_cache_bylayer_prefill(
+        self, cache_k, cache_v, req_ids, varlen, layer_id
+    ):
         self.tmp_storage.append([cache_k, cache_v])
 
     # Prefill:
@@ -213,8 +215,6 @@ class KVCacheManager:
     def prepare_cache_decode(self, req_ids):
         self.timers("cache_prepare").start()
         max_seq = 0
-        seq_lens = []
-
         seq_lens = []
         for req_id in req_ids:
             seq_len = self.lengths[req_id]
@@ -330,7 +330,7 @@ class KVCacheManagerSkewAware:
         self.slot_availability = [True] * num_hot_req
         self.hot_reqs = [-1] * num_hot_req
         self.req2slot = {}
-        self.lengths = {}
+        self.seq_lens = {}
         self.max_seq_len = max_seq_len
         self.tmp_storage = []
         self.device = torch.device(device)
@@ -352,12 +352,14 @@ class KVCacheManagerSkewAware:
 
     # Prefill:
     # return for every req [layer, seq, n_local_kv_heads, head_dim] * 2 (for k and v)
-    def finalize_cache_bylayer_prefill(self, cache_k, cache_v, req_ids, varlen, layer_id):
+    def finalize_cache_bylayer_prefill(
+        self, cache_k, cache_v, req_ids, varlen, layer_id
+    ):
         self.timers("cache_finalize_cache_all_prefill").start()
         if layer_id == 0:
             # logger.warning(req_ids)
             for it, req_id in enumerate(req_ids):
-                self.lengths[req_id] = varlen.cpu_lens[it]
+                self.seq_lens[req_id] = varlen.cpu_lens[it]
                 for i in range(self.num_hot_req):
                     if self.slot_availability[i]:
                         self.req2slot[req_id] = i
@@ -371,12 +373,12 @@ class KVCacheManagerSkewAware:
         start = 0
         for it, req_id in enumerate(req_ids):
             end = start + varlen.cpu_lens[it]
-            self.buffer[layer_id][0][self.req2slot[req_id]][
-                : varlen.cpu_lens[it]
-            ] = cache_k[start:end]
-            self.buffer[layer_id][1][self.req2slot[req_id]][
-                : varlen.cpu_lens[it]
-            ] = cache_v[start:end]
+            self.buffer[layer_id][0][self.req2slot[req_id]][: varlen.cpu_lens[it]] = (
+                cache_k[start:end]
+            )
+            self.buffer[layer_id][1][self.req2slot[req_id]][: varlen.cpu_lens[it]] = (
+                cache_v[start:end]
+            )
             start = end
         self.timers("cache_finalize_cache_all_prefill").stop()
 
@@ -395,9 +397,8 @@ class KVCacheManagerSkewAware:
 
         seq_lens = []
         for req_id in req_ids:
-            seq_len = self.lengths[req_id]
+            seq_len = self.seq_lens[req_id]
             seq_lens.append(seq_len)
-        self.seq_lens = seq_lens
         max_seq = max(seq_lens)
 
         limit = 16
@@ -436,8 +437,14 @@ class KVCacheManagerSkewAware:
 
     # Decode:
     # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
-    def update_cache_decode(self, xk, xv, layer_id):
-        output = self.prepared_cache[layer_id]
+    def update_cache_decode(self, xk, xv):
+        self.timers("cache_update").start()
+        output = self.prepared_cache[self.layer_id]
+        # output[0,:,self.seq_lens[0]] = xk
+        # output[1,:,self.seq_lens[0]] = xv
+        self.layer_id += 1
+        self.timers("cache_update").stop()
+        return output
         for it in range(xk.shape[0]):
             output[0][it][self.seq_lens[it]] = xk[it]
             output[1][it][self.seq_lens[it]] = xv[it]
@@ -457,3 +464,65 @@ class KVCacheManagerSkewAware:
         self.slot_availability[slot_id] = True
         self.req2slot.pop(req_id)
         self.lengths.pop(req_id)
+
+
+class KVCacheManagerNop:
+    def __init__(
+        self,
+        num_layers,
+        n_local_kv_heads,
+        head_dim,
+        num_hot_req=16,
+        max_seq_len=2048,
+        device="cuda",
+    ):
+        self.num_layers = num_layers
+        self.n_local_kv_heads = n_local_kv_heads
+        self.head_dim = head_dim
+        self.num_hot_req = num_hot_req
+        self.slot_availability = [True] * num_hot_req
+        self.hot_reqs = [-1] * num_hot_req
+        self.req2slot = {}
+        self.lengths = {}
+        self.max_seq_len = max_seq_len
+        self.tmp_storage = []
+        self.device = torch.device(device)
+        self.buffer = torch.zeros(
+            [
+                self.num_layers,
+                2,
+                self.num_hot_req,
+                self.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            ],
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        pass
+
+    # Prefill:
+    # return for every req [layer, seq, n_local_kv_heads, head_dim] * 2 (for k and v)
+    def finalize_cache_bylayer_prefill(self, cache_k, cache_v, req_ids, varlen):
+        pass
+
+    # Prefill:
+    def finalize_cache_all_prefill(self, req_ids, varlen):
+        pass
+
+    # Decode:
+    def prepare_cache_decode(self, req_ids):
+        pass
+
+    # Decode:
+    # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
+    def update_cache_decode(self, xk, xv):
+        pass
+
+    # Decode:
+    def finalize_cache_single_decode(self, req_ids):
+        pass
+
+    # Decode:
+    def finalize_cache_all_decode(self, req_id):
+        pass

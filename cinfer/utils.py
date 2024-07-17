@@ -5,7 +5,7 @@ from logging import getLogger
 logger = getLogger(__name__)
 
 
-def load(checkpoint, model, num_layers, rank, world_size, type):
+def load_pipe(checkpoint, model, num_layers, rank, world_size, type):
     keys = checkpoint.keys()
     logger.warning(f"Loading checkpoint {keys}")
     partial_checkpoint = {}

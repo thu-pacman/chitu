@@ -70,6 +70,57 @@ def gen_reqs_real(num_reqs, max_new_tokens):
     return reqs
 
 
+def run_pipe(args, timers):
+    rank = torch.distributed.get_rank()
+    for i in range(2):
+        if rank == 0:
+            reqs = gen_reqs(
+                num_reqs=args.infer.max_reqs,
+                prompt_len=512,
+                max_new_tokens=args.request.max_new_tokens,
+            )
+            # reqs = gen_reqs_real(num_reqs=1, max_new_tokens=args.request.max_new_tokens)
+            for req in reqs:
+                TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
+        t_start = time.time()
+        timers("overall").start()
+        while len(TaskPool.pool) > 0 or rank != 0:
+            cinfer_run()
+        timers("overall").stop()
+        t_end = time.time()
+        logger.warning(f"Time cost {t_end - t_start}")
+
+        for req in reqs:
+            logger.warning(f"Response in rank {rank}: {req.output}")
+
+        timers.log()
+
+
+def run_normal(args, timers):
+    rank = torch.distributed.get_rank()
+    for i in range(2):
+        reqs = gen_reqs(
+            num_reqs=args.infer.max_reqs,
+            prompt_len=512,
+            max_new_tokens=args.request.max_new_tokens,
+        )
+        # reqs = gen_reqs_real(num_reqs=1, max_new_tokens=args.request.max_new_tokens)
+        for req in reqs:
+            TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
+        t_start = time.time()
+        timers("overall").start()
+        while len(TaskPool.pool) > 0:
+            cinfer_run()
+        timers("overall").stop()
+        t_end = time.time()
+        logger.warning(f"Time cost {t_end - t_start}")
+
+        for req in reqs:
+            logger.warning(f"Response in rank {rank}: {req.output}")
+
+        timers.log()
+
+
 @hydra.main(
     version_base=None, config_path="../example/configs", config_name="serve_config"
 )
@@ -81,28 +132,11 @@ def main(args: DictConfig):
     timers = get_timers()
 
     cinfer_init(args)
-    logger.warning("Backend built")
-
-    rank = torch.distributed.get_rank()
-    for i in range(2):
-        if rank == 0:
-            # reqs = gen_reqs(
-            #     num_reqs=args.infer.max_reqs, prompt_len=512, max_new_tokens=args.request.max_new_tokens
-            # )
-            reqs = gen_reqs_real(
-                num_reqs=args.infer.max_reqs, max_new_tokens=args.request.max_new_tokens
-            )
-            for req in reqs:
-                TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
-        timers("overall").start()
-        while len(TaskPool.pool) > 0 or rank != 0:
-            cinfer_run()
-        timers("overall").stop()
-
-        for req in reqs:
-            logger.warning(f"Response in rank {rank}: {req.output}")
-
-        timers.log()
+    logger.warning(f"finish init")
+    if args.infer.parallel_type == "pipe":
+        run_pipe(args, timers)
+    else:
+        run_normal(args, timers)
 
 
 if __name__ == "__main__":
