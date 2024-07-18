@@ -2,7 +2,7 @@ import torch.distributed
 from .executor import Executor
 from .scheduler import Scheduler
 from .task import PackedTasks, req_encode, TaskPool
-from .model import Backend
+from .backend import Backend
 import torch
 from logging import getLogger
 

@@ -69,6 +69,7 @@ class PagedKVCacheManager:
 
     # Init block table and kv cache with kv generated during prefill
     def finalize_cache_bylayer_prefill(self, xk, xv, req_ids, varlen, layer_id):
+        self.timers("cache_finalize_cache_all_prefill").start()
         for idx, req_id in enumerate(req_ids):
             if layer_id == 0:
                 self.seq_lens[req_id] = varlen.cpu_lens[idx]
@@ -104,8 +105,11 @@ class PagedKVCacheManager:
                 self.block_table[req_id] = []
             self.block_table[req_id].append(block_ids.copy())
             # logger.warning(f"block table[{req_id}][{layer_id}] = {block_ids}")
+        self.timers("cache_finalize_cache_all_prefill").stop()
 
     def finalize_cache_all_prefill(self, req_ids, varlen):
+        self.curr_varlens = None
+        self.curr_req_ids = None
         pass
 
     def prepare_cache_decode(self, req_ids):
@@ -113,13 +117,16 @@ class PagedKVCacheManager:
 
     def get_free_block(self):
         # TODO: When run out of free blocks, use scheduling and preemption in paper instead of exception
+        self.timers("get_free_block").start()
         if len(self.free_blocks) == 0:
             raise Exception("No more free blocks.")
         idx = list(self.free_blocks)[0]
         self.free_blocks.remove(idx)
+        self.timers("get_free_block").stop()
         return idx
 
     def get_gpu_block_table(self, req_ids, layer_id):
+        self.timers("get_gpu_block_table").start()
         max_block_num = max(
             len(self.block_table[req_id][layer_id]) for req_id in req_ids
         )
@@ -128,7 +135,9 @@ class PagedKVCacheManager:
             block_ids = self.block_table[req_id][layer_id]
             gpu_block_table[idx][: len(block_ids)] = block_ids
         # logger.warning(gpu_block_table)
-        return torch.tensor(gpu_block_table, dtype=torch.int32, device=self.device)
+        output = torch.tensor(gpu_block_table, dtype=torch.int32, device=self.device)
+        self.timers("get_gpu_block_table").stop()
+        return output
 
     def get_gpu_seq_lens(self, req_ids):
         # logger.warning(f"get_gpu_seq_lens : {[self.seq_lens[req_id] for req_id in req_ids]}")
@@ -142,26 +151,36 @@ class PagedKVCacheManager:
         return self.paged_k_cache, self.paged_v_cache
 
     def free_req_cache_blocks(self, req_id):
+        self.timers("free_req_cache_blocks").start()
         for layer_blocks in self.block_table[req_id]:
             for block in layer_blocks:
                 self.free_blocks.add(block)
         del self.block_table[req_id]
+        self.timers("free_req_cache_blocks").stop()
 
     # Prepare enough block table for next decoding. When decoding, flash attention will fill new kv into paged kv cache (inplace).
     def prepare_block_table_for_decode(self, req_ids, layer_id):
+        self.timers("prepare_block_table_for_decode").start()
         for req_id in req_ids:
             if self.seq_lens[req_id] % self.block_size == 0:
                 self.block_table[req_id][layer_id].append(self.get_free_block())
+        self.timers("prepare_block_table_for_decode").stop()
 
     def finalize_cache_single_decode(self, req_ids):
         for req_id in req_ids:
             self.seq_lens[req_id] = self.seq_lens[req_id] + 1
+        self.curr_varlens = None
+        self.curr_req_ids = None
 
     def finalize_cache_all_decode(self, req_id):
+        self.timers("finalize_cache_all_decode").start()
         assert req_id in self.seq_lens
         assert req_id in self.block_table
         del self.seq_lens[req_id]
         self.free_req_cache_blocks(req_id)
+        self.curr_varlens = None
+        self.curr_req_ids = None
+        self.timers("finalize_cache_all_decode").stop()
 
 
 class KVCacheManager:
@@ -172,7 +191,7 @@ class KVCacheManager:
         self.n_local_kv_heads = n_local_kv_heads
         self.head_dim = head_dim
         self.tmp_storage = []
-        self.lengths = {}
+        self.seq_lens = {}
         self.timers = get_timers()
         self.device = torch.device(device)
 
@@ -192,7 +211,7 @@ class KVCacheManager:
         assert len(varlen.cpu_lens) == len(req_ids)
         assert sum(varlen.cpu_lens) == self.tmp_storage[0][0].shape[0]
         for it, req_id in enumerate(req_ids):
-            self.lengths[req_id] = varlen.cpu_lens[it]
+            self.seq_lens[req_id] = varlen.cpu_lens[it]
             self.cache[req_id] = [None] * self.num_layers
         for layer_id in range(self.num_layers):
             start = 0
@@ -208,6 +227,8 @@ class KVCacheManager:
                 ]
                 start = end
         self.tmp_storage = []
+        self.curr_varlens = None
+        self.curr_req_ids = None
         self.timers("cache_finalize_cache_all_prefill").stop()
 
     # Decode:
@@ -217,9 +238,9 @@ class KVCacheManager:
         max_seq = 0
         seq_lens = []
         for req_id in req_ids:
-            seq_len = self.lengths[req_id]
+            seq_len = self.seq_lens[req_id]
             seq_lens.append(seq_len)
-        self.seq_lens = seq_lens
+        self.curr_seq_lens = seq_lens
         max_seq = max(seq_lens)
         n_local_kv_heads = self.cache[req_ids[0]][0][0].shape[-2]
         head_dim = self.cache[req_ids[0]][0][0].shape[-1]
@@ -253,8 +274,8 @@ class KVCacheManager:
         assert len(self.prepared_cache) > 0
         output = self.prepared_cache[layer_id]
         for it in range(xk.shape[0]):
-            output[0][it][self.seq_lens[it]] = xk[it]
-            output[1][it][self.seq_lens[it]] = xv[it]
+            output[0][it][self.curr_seq_lens[it]] = xk[it]
+            output[1][it][self.curr_seq_lens[it]] = xv[it]
         return output
 
     # Decode:
@@ -264,22 +285,26 @@ class KVCacheManager:
         assert len(self.prepared_cache) > 0
         for it, req_id in enumerate(req_ids):
             self.cache[req_id] = [None] * self.num_layers
-            self.lengths[req_id] += 1
+            self.seq_lens[req_id] += 1
         for layer_id in range(self.num_layers):
             for it, req_id in enumerate(req_ids):
                 self.cache[req_id][layer_id] = [
                     self.prepared_cache[layer_id][0][it][
-                        : self.seq_lens[it] + 1
+                        : self.curr_seq_lens[it] + 1
                     ],  # [seq + 1, n_local_kv_heads, head_dim]
                     self.prepared_cache[layer_id][1][it][
-                        : self.seq_lens[it] + 1
+                        : self.curr_seq_lens[it] + 1
                     ],  # [seq + 1, n_local_kv_heads, head_dim]
                 ]
         self.prepared_cache = []
         self.timers("cache_finalize_cache_single_decode").stop()
+        self.curr_varlens = None
+        self.curr_req_ids = None
 
     # Decode:
     def finalize_cache_all_decode(self, req_id):
+        self.curr_varlens = None
+        self.curr_req_ids = None
         pass
 
 
@@ -400,6 +425,7 @@ class KVCacheManagerSkewAware:
             seq_len = self.seq_lens[req_id]
             seq_lens.append(seq_len)
         max_seq = max(seq_lens)
+        self.curr_seq_lens = seq_lens
 
         limit = 16
         rounded_max_seq = (max_seq + 1 + limit - 1) // limit * limit
@@ -437,23 +463,22 @@ class KVCacheManagerSkewAware:
 
     # Decode:
     # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
-    def update_cache_decode(self, xk, xv):
-        self.timers("cache_update").start()
-        output = self.prepared_cache[self.layer_id]
-        # output[0,:,self.seq_lens[0]] = xk
-        # output[1,:,self.seq_lens[0]] = xv
-        self.layer_id += 1
-        self.timers("cache_update").stop()
-        return output
+    def update_cache_decode(self, xk, xv, layer_id):
+        # self.timers("cache_update").start()
+        output = self.prepared_cache[layer_id]
+        # self.timers("cache_update").stop()
+        # return output
         for it in range(xk.shape[0]):
-            output[0][it][self.seq_lens[it]] = xk[it]
-            output[1][it][self.seq_lens[it]] = xv[it]
+            output[0][it][self.curr_seq_lens[it]] = xk[it]
+            output[1][it][self.curr_seq_lens[it]] = xv[it]
         return output
 
     # Decode:
     def finalize_cache_single_decode(self, req_ids):
         for item in req_ids:
-            self.lengths[item] += 1
+            self.seq_lens[item] += 1
+        self.curr_varlens = None
+        self.curr_req_ids = None
 
     # Decode:
     def finalize_cache_all_decode(self, req_id):
@@ -463,7 +488,6 @@ class KVCacheManagerSkewAware:
         self.hot_reqs[slot_id] = -1
         self.slot_availability[slot_id] = True
         self.req2slot.pop(req_id)
-        self.lengths.pop(req_id)
 
 
 class KVCacheManagerNop:
@@ -483,7 +507,6 @@ class KVCacheManagerNop:
         self.slot_availability = [True] * num_hot_req
         self.hot_reqs = [-1] * num_hot_req
         self.req2slot = {}
-        self.lengths = {}
         self.max_seq_len = max_seq_len
         self.tmp_storage = []
         self.device = torch.device(device)
@@ -521,7 +544,8 @@ class KVCacheManagerNop:
 
     # Decode:
     def finalize_cache_single_decode(self, req_ids):
-        pass
+        self.curr_varlens = None
+        self.curr_req_ids = None
 
     # Decode:
     def finalize_cache_all_decode(self, req_id):

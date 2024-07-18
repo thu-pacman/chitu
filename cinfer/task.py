@@ -2,7 +2,7 @@ import torch
 from enum import Enum
 import asyncio
 import time
-from .model import Backend
+from .backend import Backend
 from .async_response import AsyncDataStream, AsyncResponse
 import os
 

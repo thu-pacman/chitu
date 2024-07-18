@@ -10,7 +10,8 @@ from threading import Semaphore, Thread
 
 
 from cinfer.global_vars import set_global_variables
-from cinfer.model import Backend
+
+# from cinfer.backend import Backend
 from cinfer.task import UserRequest, TaskPool, PrefillTask
 from cinfer.cinfer_main import cinfer_init, cinfer_run
 from cinfer.async_response import AsyncResponse, AsyncDataStream

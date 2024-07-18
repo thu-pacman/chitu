@@ -1,5 +1,6 @@
 from cinfer.task import UserRequest, TaskPool, PrefillTask
-from cinfer.model import Backend
+
+# from cinfer.backend import Backend
 from cinfer.cinfer_main import cinfer_init, cinfer_run
 from cinfer.global_vars import set_global_variables, get_timers
 from faker import Faker
@@ -99,12 +100,14 @@ def run_pipe(args, timers):
 def run_normal(args, timers):
     rank = torch.distributed.get_rank()
     for i in range(2):
-        reqs = gen_reqs(
-            num_reqs=args.infer.max_reqs,
-            prompt_len=512,
-            max_new_tokens=args.request.max_new_tokens,
+        # reqs = gen_reqs(
+        #     num_reqs=args.infer.max_reqs,
+        #     prompt_len=512,
+        #     max_new_tokens=args.request.max_new_tokens,
+        # )
+        reqs = gen_reqs_real(
+            num_reqs=args.infer.max_reqs, max_new_tokens=args.request.max_new_tokens
         )
-        # reqs = gen_reqs_real(num_reqs=1, max_new_tokens=args.request.max_new_tokens)
         for req in reqs:
             TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
         t_start = time.time()

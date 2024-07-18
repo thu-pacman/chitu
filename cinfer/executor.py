@@ -7,11 +7,20 @@ from .task import (
     req_decode,
     taskid2reqid,
 )
-from .model import Backend, VarLens, OngoingRequests
+from .backend import Backend
+from .utils import VarLens
 from logging import getLogger
 from .global_vars import get_timers
 
 logger = getLogger(__name__)
+
+
+class OngoingRequests:
+    def __init__(self, reqs, tasks, handle, logits):
+        self.reqs = reqs
+        self.tasks = tasks
+        self.handle = handle
+        self.logits = logits
 
 
 class Executor:
@@ -63,8 +72,8 @@ class NormalExecutor(Executor):
         # logger.warning(f"Prefill step: {tasks.task_ids}")
         varlens = VarLens(tasks.tokens, "cuda")
         self.timers("prefill").start()
-        Backend.curr_varlens = varlens
-        Backend.curr_req_ids = tasks.req_ids
+        Backend.cache_manager.curr_varlens = varlens
+        Backend.cache_manager.curr_req_ids = tasks.req_ids
         logits = Backend.model.prefill(tasks.tokens)
         self.timers("prefill").stop()
         # after prefill, new decode tasks are created
@@ -87,6 +96,7 @@ class NormalExecutor(Executor):
 
     def decode_step(self, tasks: PackedTasks):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
+        Backend.cache_manager.curr_req_ids = tasks.req_ids
         # logger.info(f"Decode step: {tasks.task_ids}")
         self.timers("decode").start()
         new_tokens = self._prepare_new_tokens_for_decode(tasks)
@@ -122,8 +132,8 @@ class PipeExecutor(NormalExecutor):
     def prefill_step(self, tasks: PackedTasks, h=None):
         self.timers("prefill").start()
         varlens = VarLens(tasks.tokens, self.rank)
-        Backend.curr_varlens = varlens
-        Backend.curr_req_ids = tasks.req_ids
+        Backend.cache_manager.curr_varlens = varlens
+        Backend.cache_manager.curr_req_ids = tasks.req_ids
         logits = Backend.model.prefill(tasks.tokens if self.rank == 0 else h)
         self.timers("prefill").stop()
         # send logits to rank 0 to get response words

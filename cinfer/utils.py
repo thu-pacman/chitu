@@ -32,3 +32,19 @@ def load_pipe(checkpoint, model, num_layers, rank, world_size, type):
             partial_checkpoint["lm_head.weight"] = checkpoint["lm_head.weight"]
         partial_checkpoint["norm.weight"] = checkpoint["norm.weight"]
     model.load_state_dict(partial_checkpoint)
+
+
+class VarLens:
+    def __init__(self, tokens, device) -> None:
+        self.lens = torch.tensor(
+            [len(t) for t in tokens], device=device, dtype=torch.int32
+        )
+        self.cpu_prefix_lens = [0]
+        for t in tokens:
+            self.cpu_prefix_lens.append(self.cpu_prefix_lens[-1] + len(t))
+        self.prefix_lens = torch.tensor(
+            self.cpu_prefix_lens, device=device, dtype=torch.int32
+        )
+        self.cpu_lens = [len(t) for t in tokens]
+        self.max_len = int(torch.max(self.lens))
+        self.total_len = int(torch.sum(self.lens))
