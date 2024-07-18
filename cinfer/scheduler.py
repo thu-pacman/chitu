@@ -1,4 +1,5 @@
 import time
+import torch
 from .task import TaskPool, TaskType
 
 from logging import getLogger
@@ -38,12 +39,20 @@ class Scheduler:
     def update(self, unwait_task_ids=[]):
         removed_task_ids = []
         task_ids = self.ret_task_ids + unwait_task_ids
-        for task_id in task_ids:
-            if TaskPool.pool[task_id].need_remove():
-                logger.warning(f"Task {task_id} is done")
-                if TaskPool.pool[task_id].task_type == TaskType.Decode:
-                    removed_task_ids.append(task_id)
-                assert TaskPool.remove(task_id), "Task not found in pool"
+        task_ids = list(set(task_ids))
+        # logger.warning(f"rank {torch.distributed.get_rank()} {task_ids}")
+        try:
+            for task_id in task_ids:
+                if TaskPool.pool[task_id].need_remove():
+                    # logger.warning(f"Task {task_id} is done")
+                    if TaskPool.pool[task_id].task_type == TaskType.Decode:
+                        removed_task_ids.append(task_id)
+                    assert TaskPool.remove(task_id), "Task not found in pool"
+        except:
+            logger.warning(
+                f"rank {torch.distributed.get_rank()} {TaskPool.pool.keys()}"
+            )
+            assert False
         # for task_id in unwait_task_ids:
         #     if task_id in TaskPool.id_list and TaskPool.pool[task_id].need_remove():
         #         assert TaskPool.remove(task_id), "Task not found in pool"
@@ -121,8 +130,12 @@ class PrefillFirstScheduler(Scheduler):
                 list(decode_task_ids)[: self.num_tasks - len(self.ret_task_ids)]
             )
         # logger.info(f"Selected task_ids: {self.ret_task_ids}")
-        # if TaskPool.pool[self.ret_task_ids[0]].task_type == TaskType.Prefill:
-        #     self.ret_task_ids = self.ret_task_ids[:1]
+
+        if (
+            len(self.ret_task_ids) > 0
+            and TaskPool.pool[self.ret_task_ids[0]].task_type == TaskType.Prefill
+        ):
+            self.ret_task_ids = self.ret_task_ids[:1]
         return self.ret_task_ids
 
 

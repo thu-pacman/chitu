@@ -10,7 +10,8 @@ from threading import Semaphore, Thread
 
 
 from cinfer.global_vars import set_global_variables
-from cinfer.model import Backend
+
+# from cinfer.backend import Backend
 from cinfer.task import UserRequest, TaskPool, PrefillTask
 from cinfer.cinfer_main import cinfer_init, cinfer_run
 from cinfer.async_response import AsyncResponse, AsyncDataStream
@@ -68,7 +69,6 @@ def main(args: DictConfig):
     global global_args
     set_global_variables()
     global_args = args
-    Backend.build(args.model)
     cinfer_init(args)
     uvicorn.run(app, host=args.serve.host, port=args.serve.port, log_level="info")
 

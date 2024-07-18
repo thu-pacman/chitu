@@ -1,21 +1,19 @@
+defaults:
+  # - models: qwen2-70b
+  - models: llama3-8b
 serve:
   host: 0.0.0.0
   port: 21002
-model:
-  ckpt_dir: /home/hkz/Meta-Llama-3-8B-Instruct
-  tokenizer_path: /home/hkz/Meta-Llama-3-8B-Instruct/tokenizer.model
-  temperature: 0.6
-  top_p: 0.9
-  do_load: True # debug purpose
+infer:
+  parallel_type: normal
+  do_load: True # set it to False for debug purpose
   seed: 0
   stop_with_eos: True
-  max_seq_len: 1024 # length of prefill + decode
-  cache_type: normal
-  max_reqs: 16
+  max_seq_len: 640 # length of prefill + decode
+  cache_type: paged
+  max_reqs: 1
 request:
   max_new_tokens: 128
-executor:
-  type: normal
 scheduler:
   type: fcfs
   fcfs:

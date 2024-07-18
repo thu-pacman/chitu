@@ -2,8 +2,9 @@ import torch
 from enum import Enum
 import asyncio
 import time
-from .model import Backend
+from .backend import Backend
 from .async_response import AsyncDataStream, AsyncResponse
+import os
 
 from logging import getLogger
 
@@ -28,12 +29,15 @@ class UserRequest:
 class TaskPool:
     pool = {}
     id_list = []
+    total_reqs = []
 
     def add(task):
         if task.task_id in TaskPool.pool:
             return False  # Task already exists, failed to add
         TaskPool.pool[task.task_id] = task
         TaskPool.id_list.append(task.task_id)
+        if task.req not in TaskPool.total_reqs:
+            TaskPool.total_reqs.append(task.req)
         return True
 
     def remove(task_id):
@@ -50,6 +54,13 @@ class TaskPool:
         if ret is None:
             return False  # Task not found, failed to remove
         return True
+
+    def display():
+        os.system("clear")
+        output_str = ""
+        for req in TaskPool.total_reqs:
+            output_str += f">>>\n{req.request_id}: {req.message} {req.output}<<<\n"
+        print(output_str)
 
 
 class TaskType(Enum):
@@ -93,7 +104,7 @@ class Task:
 
 
 class PrefillTask(Task):
-    def __init__(self, task_id: str, req: UserRequest, message: str, priority: int = 1):
+    def __init__(self, task_id: str, req: UserRequest, message, priority: int = 1):
         super().__init__(task_id, req, priority)
         self.message = message
         logger.info(f"Prefill task: {message}")
@@ -160,7 +171,7 @@ class DecodeTask(Task):
         # logger.warning(f"decode token {(Backend.tokenizer.decode([self.next_token]))}")
 
     def need_remove(self):
-        if Backend.args.stop_with_eos:
+        if Backend.args.infer.stop_with_eos:
             return (
                 len(self.response) > 0
                 and (
@@ -234,7 +245,9 @@ class PackedTasks:
             task_tensor_cpu = task_tensor.cpu()
             decoded = []
             lens = []
-            for it, task_id in enumerate(task_tensor_cpu):
+            # for it, task_id in enumerate(task_tensor_cpu):
+            for it in range(PackedTasks.max_num_tasks):
+                task_id = task_tensor_cpu[it]
                 if task_id == 0:
                     break
                 decoded.append(req_decode(task_id))
