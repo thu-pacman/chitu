@@ -26,9 +26,7 @@ class OngoingRequests:
 class Executor:
     @staticmethod
     def build(args):
-        if args.type.lower() == "debug":
-            assert False, "Debug mode disabled"
-        elif args.type.lower() == "pipe":
+        if args.infer.parallel_type == "pipe":
             return PipeExecutor(args)
         else:
             return NormalExecutor(args)
@@ -164,6 +162,7 @@ class PipeExecutor(NormalExecutor):
 
     def decode_step(self, tasks: PackedTasks, h=None):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
+        Backend.cache_manager.curr_req_ids = tasks.req_ids
         self.timers("decode").start()
         seq_lens = self._prepare_seq_lens_for_decode(tasks)
         tokens = self._prepare_new_tokens_for_decode(tasks) if self.rank == 0 else h

@@ -10,12 +10,10 @@ infer:
   seed: 0
   stop_with_eos: True
   max_seq_len: 640 # length of prefill + decode
-  cache_type: normal
+  cache_type: paged
   max_reqs: 1
 request:
   max_new_tokens: 128
-executor:
-  type: normal
 scheduler:
   type: fcfs
   fcfs:

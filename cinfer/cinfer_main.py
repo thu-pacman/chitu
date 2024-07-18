@@ -15,7 +15,7 @@ def cinfer_init(args):
     if args.infer.parallel_type != "pipe" or rank == 0:
         scheduler = Scheduler.build(args.scheduler)
         Backend.scheduler = scheduler
-    executor = Executor.build(args.executor)
+    executor = Executor.build(args)
     Backend.executor = executor
     PackedTasks.max_num_tasks = args.infer.max_reqs
 

@@ -24,20 +24,14 @@ def load_tensor_parallel(checkpoint, model, num_layers, rank, world_size, type):
     else:
         assert False, f"Unknown model type {type}"
     partial_checkpoint = {}
-    # 遍历模型参数并进行切分
     for name, param in checkpoint.items():
-        # 检查参数是否至少有一维
         if any(s in name for s in cpl_str):
-            print(f"{name}, handle cpl")
             chunks = torch.chunk(param, world_size, dim=0)
             partial_checkpoint[name] = chunks[rank]
         elif any(s in name for s in rpl_str):
             chunks = torch.chunk(param, world_size, dim=1)
-            print(f"{param.shape}, {chunks[0].shape}, {chunks[1].shape}")
             partial_checkpoint[name] = chunks[rank]
         else:
-            print(f"{name}, handle nothing")
-            # 如果参数是标量或空张量，直接复制到两个部分中
             partial_checkpoint[name] = param
     model.load_state_dict(partial_checkpoint)
 
