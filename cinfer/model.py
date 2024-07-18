@@ -193,9 +193,6 @@ class Attention(nn.Module):
         )
         cache_seqlens = self.cache.get_gpu_seq_lens(self.cache.curr_req_ids)
         paged_k_cache, paged_v_cache = self.cache.get_paged_kv_cache()
-        logger.warning(
-            f"block table shape {block_table.shape} {self.cache.curr_req_ids}"
-        )
         output = flash_attn.flash_attn_with_kvcache(
             xq,
             paged_k_cache,

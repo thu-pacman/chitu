@@ -15,7 +15,7 @@ from .cache_manager import (
 )
 from .model_llama import TransformerLlama
 from .model_qwen import TransformerQwen
-from .utils import load_pipe
+from .utils import load_pipe, load_tensor_parallel
 import fairscale.nn.model_parallel.initialize as fs_init
 
 from logging import getLogger
@@ -158,6 +158,15 @@ class Backend:
 
             if pipeline_parallel_size > 1:
                 load_pipe(
+                    checkpoint,
+                    model,
+                    args.models.n_layers,
+                    local_rank,
+                    world_size,
+                    args.models.type,
+                )
+            elif model_parallel_size > 1:
+                load_tensor_parallel(
                     checkpoint,
                     model,
                     args.models.n_layers,
