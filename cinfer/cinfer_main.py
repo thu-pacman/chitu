@@ -72,8 +72,8 @@ def cinfer_run():
         if len(task_ids) == 0:  # no tasks to do, but some tasks are waiting
             cinfer_update(rank, world_size)
             return
-        if rank == 0:
-            logger.warning(f"Processing {task_ids}")
+        # if rank == 0:
+        #     logger.warning(f"Processing {task_ids}")
         tasks = PackedTasks(task_ids, rank)
     else:
         tasks = None

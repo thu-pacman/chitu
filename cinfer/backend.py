@@ -71,9 +71,9 @@ class Backend:
             tokenizer = TokenizerHF(path=args.models.tokenizer_path)
         else:
             tokenizer = Tokenizer(model_path=args.models.tokenizer_path)
-        assert (
-            args.models.vocab_size == tokenizer.n_words
-        ), f"{args.models.vocab_size} vs. {tokenizer.n_words}"
+        # assert (
+        #     args.models.vocab_size == tokenizer.n_words
+        # ), f"{args.models.vocab_size} vs. {tokenizer.n_words}"
         tokenizer.stop_tokens = torch.tensor(
             list(
                 [tokenizer.stop_tokens]

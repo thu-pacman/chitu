@@ -10,6 +10,10 @@ from fairscale.nn.model_parallel.layers import (
     VocabParallelEmbedding,
 )
 
+from logging import getLogger
+
+logger = getLogger(__name__)
+
 
 class AttentionQwen(Attention):
     def __init__(self, args, layer_id, cache):
@@ -20,24 +24,23 @@ class AttentionQwen(Attention):
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
-
         self.q_proj = ColumnParallelLinear(
             args.dim,
-            self.n_local_heads * self.head_dim,
+            args.n_heads * self.head_dim,
             bias=True,
             gather_output=False,
             init_method=lambda x: x,
         )
         self.k_proj = ColumnParallelLinear(
             args.dim,
-            self.n_local_kv_heads * self.head_dim,
+            self.n_kv_heads * self.head_dim,
             bias=True,
             gather_output=False,
             init_method=lambda x: x,
         )
         self.v_proj = ColumnParallelLinear(
             args.dim,
-            self.n_local_kv_heads * self.head_dim,
+            self.n_kv_heads * self.head_dim,
             bias=True,
             gather_output=False,
             init_method=lambda x: x,

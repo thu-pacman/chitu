@@ -19,6 +19,14 @@ TORCH_CUDA_ARCH_LIST=8.6 python setup.py build -j4 develop
 # other parameters are in example/configs/serve_config.yaml
 # log is stored in outputs
 torchrun --nproc_per_node 1 test/single_req_test.py request.max_new_tokens=64
+
+# tensor parallel
+torchrun --nproc_per_node 2 test/single_req_test.py request.max_new_tokens=64 infer.parallel_type=tensor
+
+# pipeline parallel
+torchrun --nproc_per_node 2 test/single_req_test.py request.max_new_tokens=64 infer.parallel_type=pipe
+
+### NOTICE:
 # to avoid GPU conflict, add `grun` before command
 ```
 
