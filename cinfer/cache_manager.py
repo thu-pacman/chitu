@@ -113,6 +113,12 @@ class PagedKVCacheManager:
         pass
 
     def prepare_cache_decode(self, req_ids):
+        seq_lens = []
+        for req_id in req_ids:
+            seq_len = self.seq_lens[req_id]
+            seq_lens.append(seq_len)
+        max_seq = max(seq_lens)
+        self.curr_seq_lens = seq_lens
         pass
 
     def get_free_block(self):
