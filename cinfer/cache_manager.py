@@ -3,6 +3,8 @@ from .global_vars import get_timers
 
 from logging import getLogger
 
+from .ops import move_data
+
 
 logger = getLogger(__name__)
 _BLOCK_SIZE = 512  # _BLOCK_SIZE must be a multiple of 256 for FlashAttention
@@ -432,6 +434,9 @@ class KVCacheManagerSkewAware:
             seq_lens.append(seq_len)
         max_seq = max(seq_lens)
         self.curr_seq_lens = seq_lens
+        self.curr_seq_lens_gpu = torch.tensor(
+            seq_lens, dtype=torch.int32, device=self.device
+        )
 
         limit = 16
         rounded_max_seq = (max_seq + 1 + limit - 1) // limit * limit
@@ -474,9 +479,12 @@ class KVCacheManagerSkewAware:
         output = self.prepared_cache[layer_id]
         # self.timers("cache_update").stop()
         # return output
-        for it in range(xk.shape[0]):
-            output[0][it][self.curr_seq_lens[it]] = xk[it]
-            output[1][it][self.curr_seq_lens[it]] = xv[it]
+        # for it in range(xk.shape[0]):
+        #     output[0][it][self.curr_seq_lens[it]] = xk[it]
+        #     output[1][it][self.curr_seq_lens[it]] = xv[it]
+        # if layer_id == 0:
+        #     logger.warning(f"Update: {self.curr_seq_lens[0]} {xk.shape}")
+        move_data(output, xk, xv, self.curr_seq_lens_gpu, self.max_seq_len)
         return output
 
     # Decode:

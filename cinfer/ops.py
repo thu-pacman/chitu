@@ -49,3 +49,59 @@ def torch_attention(query, key, value):
     # attn = F.dropout(attn, p)
     attn = attn @ value
     return attn.transpose(1, 2)
+
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def move_data_kernel(
+    xk_ptr,
+    xv_ptr,
+    output_ptr,
+    seq_lens_ptr,
+    BATCH_SIZE: tl.constexpr,
+    NUM_HEAD: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    TOTAL_SEQ: tl.constexpr,
+):
+    batch_id = tl.program_id(axis=0)
+    head_id = tl.program_id(axis=1)
+    dim_id = tl.arange(0, HEAD_DIM)
+
+    xk_offset = batch_id * NUM_HEAD * HEAD_DIM + head_id * HEAD_DIM + dim_id
+    xv_offset = xk_offset
+    seq_len_offset = batch_id
+
+    xk_data = tl.load(xk_ptr + xk_offset)
+    xv_data = tl.load(xv_ptr + xv_offset)
+    seq_len = tl.load(seq_lens_ptr + seq_len_offset)
+
+    out_offset_k = (
+        batch_id * TOTAL_SEQ * NUM_HEAD * HEAD_DIM
+        + seq_len * NUM_HEAD * HEAD_DIM
+        + head_id * HEAD_DIM
+        + dim_id
+    )
+    out_offset_v = (BATCH_SIZE * TOTAL_SEQ * NUM_HEAD * HEAD_DIM) + out_offset_k
+
+    tl.store(output_ptr + out_offset_k, xk_data)
+    tl.store(output_ptr + out_offset_v, xv_data)
+
+
+def move_data(buffer, xk, xv, curr_seq_lens, total_seq):
+    batch_size = xk.shape[0]
+    num_head = xk.shape[-2]
+    head_dim = xk.shape[-1]
+    grid = (batch_size, num_head)
+    move_data_kernel[grid](
+        xk_ptr=xk,
+        xv_ptr=xv,
+        output_ptr=buffer,
+        seq_lens_ptr=curr_seq_lens,
+        BATCH_SIZE=batch_size,
+        NUM_HEAD=num_head,
+        HEAD_DIM=head_dim,
+        TOTAL_SEQ=total_seq,
+    )
