@@ -13,6 +13,8 @@ import flash_attn
 from xformers.ops import fmha
 from logging import getLogger
 
+from .ops import apply_rotary_pos_emb_triton
+
 logger = getLogger(__name__)
 
 
@@ -77,14 +79,13 @@ class AttentionQwen(Attention):
         xq = xq.view(bs_seq, self.n_local_heads, self.head_dim)
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim)
-        # xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         cos, sin = self.rotary_emb(xv, seq_len=bs_seq)
-        torch.cuda.synchronize()
-        xq, xk = apply_rotary_pos_emb(
+        # torch.cuda.synchronize()
+        xq, xk = apply_rotary_pos_emb_torch(
             xq, xk, cos, sin, position_ids=torch.arange(bs_seq, device=x.device)
         )
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         self.cache.finalize_cache_bylayer_prefill(
             xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
         )
@@ -109,18 +110,18 @@ class AttentionQwen(Attention):
         xk = xk.view(-1, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(-1, self.n_local_kv_heads, self.head_dim)
 
-        # xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-        torch.cuda.synchronize()
-        cos, sin = self.rotary_emb(xv, seq_len=max(self.cache.curr_seq_lens))
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
+        cos, sin = self.rotary_emb(xv, seq_len=max(self.cache.curr_seq_lens) + 1)
+        # torch.cuda.synchronize()
         xq, xk = apply_rotary_pos_emb(
             xq,
             xk,
             cos,
             sin,
-            position_ids=torch.tensor(self.cache.curr_seq_lens, device=x.device),
+            position_ids=self.cache.curr_seq_lens_gpu,
         )
-        torch.cuda.synchronize()
+        # logger.warning(f"cos shape {cos.shape} {self.cache.curr_seq_lens} {cos.dtype}")
+        # torch.cuda.synchronize()
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
@@ -144,7 +145,6 @@ class AttentionQwen(Attention):
         output = fmha.memory_efficient_attention_forward(xq, cache_k, cache_v).view(
             bsz, seqlen, -1
         )
-        output = xq.view(bsz, seqlen, -1)
         return self._run_output_linear(output)
 
     def decode_forward_paged(self, x: torch.Tensor, freqs_cis: torch.Tensor):
@@ -165,7 +165,7 @@ class AttentionQwen(Attention):
             xk,
             cos,
             sin,
-            position_ids=torch.tensor(self.cache.curr_seq_lens, device=x.device),
+            position_ids=self.cache.curr_seq_lens_gpu,
         )
         torch.cuda.synchronize()
 
@@ -301,38 +301,39 @@ class Qwen2RotaryEmbedding(nn.Module):
         )
 
 
-# Copied from transformers.models.llama.modeling_llama.rotate_half
 def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
-# Copied from transformers.models.mixtral.modeling_mixtral.apply_rotary_pos_emb
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
+def apply_rotary_pos_emb_torch(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     cos = cos[position_ids].unsqueeze(unsqueeze_dim)
     sin = sin[position_ids].unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+    # cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+    # sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    # q_embed = (q * cos) + (rotate_half(q) * sin)
+    # k_embed = (k * cos) + (rotate_half(k) * sin)
+
+    # cossin = torch.stack((cos, sin)).contiguous()
+    # torch.cuda.synchronize()
+    # ops.rotary_embedding(
+    #     positions=position_ids,
+    #     query=q,
+    #     key=k,
+    #     head_size=q.shape[-1],
+    #     cos_sin_cache=cossin,
+    #     is_neox=False,
+    # )
+    q_embed = apply_rotary_pos_emb_triton(q, cos, sin, position_ids)
+    k_embed = apply_rotary_pos_emb_triton(k, cos, sin, position_ids)
+    # torch.cuda.synchronize()
+
+    return q_embed, k_embed
+    # return q, k

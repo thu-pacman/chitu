@@ -121,6 +121,9 @@ class PagedKVCacheManager:
             seq_lens.append(seq_len)
         max_seq = max(seq_lens)
         self.curr_seq_lens = seq_lens
+        self.curr_seq_lens_gpu = torch.tensor(
+            seq_lens, dtype=torch.int32, device=self.device
+        )
         pass
 
     def get_free_block(self):
@@ -249,6 +252,9 @@ class KVCacheManager:
             seq_len = self.seq_lens[req_id]
             seq_lens.append(seq_len)
         self.curr_seq_lens = seq_lens
+        self.curr_seq_lens_gpu = torch.tensor(
+            seq_lens, dtype=torch.int32, device=self.device
+        )
         max_seq = max(seq_lens)
         n_local_kv_heads = self.cache[req_ids[0]][0][0].shape[-2]
         head_dim = self.cache[req_ids[0]][0][0].shape[-1]
