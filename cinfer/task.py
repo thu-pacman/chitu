@@ -22,7 +22,7 @@ class UserRequest:
 
     def add_data(self, data):
         self.async_stream.add_data(data)
-        self.output += data
+        self.output += data.strip("\n")
         # logger.warning(f"add data {data}")
 
 
@@ -59,7 +59,7 @@ class TaskPool:
         os.system("clear")
         output_str = ""
         for req in TaskPool.total_reqs:
-            output_str += f">>>\n{req.request_id}: {req.message} {req.output}<<<\n"
+            output_str += f">>> {req.request_id}: {req.message} {req.output}<<<\n"
         print(output_str)
 
 

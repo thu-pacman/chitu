@@ -358,7 +358,7 @@ class KVCacheManagerSkewAware:
         num_layers,
         n_local_kv_heads,
         head_dim,
-        num_hot_req=16,
+        num_hot_req,
         max_seq_len=2048,
         device="cuda",
     ):
@@ -508,7 +508,7 @@ class KVCacheManagerSkewAware:
         self.hot_reqs[slot_id] = -1
         self.slot_availability[slot_id] = True
         self.req2slot.pop(req_id)
-        self.buffer[slot_id].zero_()
+        self.buffer[:, :, slot_id, :, :, :].zero_()
 
 
 class KVCacheManagerNop:

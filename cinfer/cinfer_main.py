@@ -81,4 +81,6 @@ def cinfer_run():
     if Backend.parallel_type == "pipe" and rank == 0:
         cinfer_update(rank, world_size)
     elif Backend.parallel_type != "pipe":
+        if rank == 0:
+            TaskPool.display()
         Backend.scheduler.update()

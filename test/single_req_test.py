@@ -22,27 +22,30 @@ msgs = [
         }
     ],
     [{"role": "user", "content": "what is the recipe of Kung Pao chicken?"}],
-    # [{"role": "user", "content": "what is the recipe of Kung Pao chicken?"}],
+    [{"role": "user", "content": "怎么写程序?"}],
+    [{"role": "user", "content": "飞机在对流层还是平流层飞?"}],
+    [{"role": "user", "content": "怎么避免加班?"}],
     [{"role": "user", "content": "what is the recipe of mayonnaise?"}],
-    [
-        {"role": "user", "content": "I am going to Paris, what should I see?"},
-        {
-            "role": "assistant",
-            "content": """\
-        Paris, the capital of France, is known for its stunning architecture, art museums, historical landmarks, and romantic atmosphere. Here are some of the top attractions to see in Paris:
-        1. The Eiffel Tower: The iconic Eiffel Tower is one of the most recognizable landmarks in the world and offers breathtaking views of the city.
-        2. The Louvre Museum: The Louvre is one of the world's largest and most famous museums, housing an impressive collection of art and artifacts, including the Mona Lisa.
-        3. Notre-Dame Cathedral: This beautiful cathedral is one of the most famous landmarks in Paris and is known for its Gothic architecture and stunning stained glass windows.
-        These are just a few of the many attractions that Paris has to offer. With so much to see and do, it's no wonder that Paris is one of the most popular tourist destinations in the world.""",
-        },
-        {"role": "user", "content": "What is so great about #1?"},
-    ],
+    # [
+    #     {"role": "user", "content": "I am going to Paris, what should I see?"},
+    #     {
+    #         "role": "assistant",
+    #         "content": """\
+    #     Paris, the capital of France, is known for its stunning architecture, art museums, historical landmarks, and romantic atmosphere. Here are some of the top attractions to see in Paris:
+    #     1. The Eiffel Tower: The iconic Eiffel Tower is one of the most recognizable landmarks in the world and offers breathtaking views of the city.
+    #     2. The Louvre Museum: The Louvre is one of the world's largest and most famous museums, housing an impressive collection of art and artifacts, including the Mona Lisa.
+    #     3. Notre-Dame Cathedral: This beautiful cathedral is one of the most famous landmarks in Paris and is known for its Gothic architecture and stunning stained glass windows.
+    #     These are just a few of the many attractions that Paris has to offer. With so much to see and do, it's no wonder that Paris is one of the most popular tourist destinations in the world.""",
+    #     },
+    #     {"role": "user", "content": "What is so great about #1?"},
+    # ],
 ]
 
 
 def gen_req_id(len=8):
     random_number = random.getrandbits(len * 4)
     hex_string = f"{random_number:0{len}x}"
+    # logger.warning(f"generating req {hex_string}")
     return hex_string
 
 
@@ -101,7 +104,7 @@ def run_pipe(args, timers):
 
 def run_normal(args, timers):
     rank = torch.distributed.get_rank()
-    for i in range(2):
+    for i in range(3):
         # reqs = gen_reqs(
         #     num_reqs=args.infer.max_reqs,
         #     prompt_len=512,
