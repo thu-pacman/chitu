@@ -1,5 +1,6 @@
 import torch
 from logging import getLogger
+import numpy as np
 
 
 logger = getLogger(__name__)
@@ -79,3 +80,6 @@ class VarLens:
         self.cpu_lens = [len(t) for t in tokens]
         self.max_len = int(torch.max(self.lens))
         self.total_len = int(torch.sum(self.lens))
+        self.position_ids = torch.from_numpy(
+            np.concatenate([np.arange(l) for l in self.cpu_lens])
+        ).to(device)

@@ -131,11 +131,11 @@ class PrefillFirstScheduler(Scheduler):
             )
         # logger.info(f"Selected task_ids: {self.ret_task_ids}")
 
-        if (
-            len(self.ret_task_ids) > 0
-            and TaskPool.pool[self.ret_task_ids[0]].task_type == TaskType.Prefill
-        ):
-            self.ret_task_ids = self.ret_task_ids[:1]
+        # if (
+        #     len(self.ret_task_ids) > 0
+        #     and TaskPool.pool[self.ret_task_ids[0]].task_type == TaskType.Prefill
+        # ):
+        #     self.ret_task_ids = self.ret_task_ids[:1]
         return self.ret_task_ids
 
 

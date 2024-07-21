@@ -83,7 +83,11 @@ class AttentionQwen(Attention):
         cos, sin = self.rotary_emb(xv, seq_len=bs_seq)
         # torch.cuda.synchronize()
         xq, xk = apply_rotary_pos_emb_torch(
-            xq, xk, cos, sin, position_ids=torch.arange(bs_seq, device=x.device)
+            xq,
+            xk,
+            cos,
+            sin,
+            position_ids=self.cache.curr_varlens.position_ids,
         )
         # torch.cuda.synchronize()
         self.cache.finalize_cache_bylayer_prefill(
@@ -156,10 +160,7 @@ class AttentionQwen(Attention):
         xk = xk.view(-1, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(-1, self.n_local_kv_heads, self.head_dim)
 
-        # xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-        torch.cuda.synchronize()
         cos, sin = self.rotary_emb(xv, seq_len=max(self.cache.curr_seq_lens) + 1)
-        # logger.warning(f"cos shape {cos.shape} {self.cache.curr_seq_lens}")
         xq, xk = apply_rotary_pos_emb(
             xq,
             xk,
@@ -167,7 +168,6 @@ class AttentionQwen(Attention):
             sin,
             position_ids=self.cache.curr_seq_lens_gpu,
         )
-        torch.cuda.synchronize()
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
