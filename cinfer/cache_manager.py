@@ -508,6 +508,7 @@ class KVCacheManagerSkewAware:
         self.hot_reqs[slot_id] = -1
         self.slot_availability[slot_id] = True
         self.req2slot.pop(req_id)
+        self.buffer[slot_id].zero_()
 
 
 class KVCacheManagerNop:
