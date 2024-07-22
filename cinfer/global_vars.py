@@ -14,12 +14,18 @@ _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 _GLOBAL_SIGNAL_HANDLER = None
 _GLOBAL_MEMORY_BUFFER = None
+_GLOBAL_HALF = None
 
 
 def get_timers():
     """Return timers."""
     _ensure_var_is_initialized(_GLOBAL_TIMERS, "timers")
     return _GLOBAL_TIMERS
+
+def get_dtype():
+    _ensure_var_is_initialized(_GLOBAL_TIMERS, "use_half")
+    return _GLOBAL_HALF
+
 
 
 def get_global_memory_buffer():
@@ -32,6 +38,7 @@ def set_global_variables(
 ):
     _set_timers()
     # _set_global_memory_buffer()
+    _set_dtype()
 
 
 def _set_tensorboard_writer(args):
@@ -65,6 +72,10 @@ def _set_timers():
     global _GLOBAL_TIMERS
     _ensure_var_is_not_initialized(_GLOBAL_TIMERS, "timers")
     _GLOBAL_TIMERS = Timers()
+
+def _set_dtype():
+    global _GLOBAL_HALF
+    _GLOBAL_HALF = True
 
 
 def _set_global_memory_buffer():

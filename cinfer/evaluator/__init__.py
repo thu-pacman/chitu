@@ -1,1 +1,1 @@
-from evaluator.evaluator import lmeval, ppleval
+from cinfer.evaluator.evaluator import lmeval, ppleval

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch.distributed
-from .global_vars import set_global_variables, get_timers
+from .global_vars import set_global_variables, get_timers, get_dtype
 from .cache_manager import KVCacheManager, KVCacheManagerSkewAware
 
 import fairscale.nn.model_parallel.initialize as fs_init
@@ -18,7 +18,7 @@ from torch import nn
 import numpy as np
 
 # from vllm import _custom_ops as vllm_ops
-import cinfer_backend
+#import cinfer_backend
 import flash_attn
 
 from fairscale.nn.model_parallel.initialize import (
@@ -34,6 +34,10 @@ from xformers.ops import fmha
 
 
 from logging import getLogger
+
+from cinfer.quantize import quant
+
+
 
 
 logger = getLogger(__name__)
@@ -83,11 +87,19 @@ class Backend:
         tokenizer = Tokenizer(model_path=args.tokenizer_path)
         assert model_args.vocab_size == tokenizer.n_words
         model = PipeTransformer(model_args)
-        if torch.cuda.is_bf16_supported():
+        use_half = get_dtype()
+        if torch.cuda.is_bf16_supported() and (not use_half):
             torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
         else:
             torch.set_default_tensor_type(torch.cuda.HalfTensor)
-        model = model.to(torch.bfloat16)
+
+
+        
+        if use_half:
+            model = model.to(torch.float16)
+        else:
+            model = model.to(torch.bfloat16)
+
 
         if args.do_load:
             start_time = time.time()
@@ -107,6 +119,14 @@ class Backend:
             else:
                 model.load_state_dict(checkpoint, strict=False)
             logger.warning(f"Loaded in {time.time() - start_time:.2f} seconds")
+
+        
+        qmethod = 'awq'
+        if qmethod == 'awq':
+            model = model.to(torch.float16)
+            #print("quantizing LLAMA3 awq")
+            model = quant(model, qmethod)
+        
         model = model.to(local_rank)
 
         Backend.model = model
@@ -286,6 +306,7 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        cache=True,
     ):
         bs_seq, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -293,12 +314,13 @@ class Attention(nn.Module):
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)  # TODO
-        Backend.cache_manager.finalize_cache_bylayer_prefill(
-            xk,
-            xv,
-            Backend.curr_req_ids,
-            Backend.curr_varlens,
-        )
+        if cache:
+            Backend.cache_manager.finalize_cache_bylayer_prefill(
+                xk,
+                xv,
+                Backend.curr_req_ids,
+                Backend.curr_varlens,
+            )
         output = flash_attn.flash_attn_varlen_func(
             xq,
             xk,
@@ -392,19 +414,19 @@ class Attention(nn.Module):
         )
         return self.wo(output)
 
-    def forward(self, x, start_pos, freqs_cis, mask, varlens=None):
+    def forward(self, x, start_pos, freqs_cis, mask, varlens=None, cache=True):
         if start_pos == 0:
-            return self.prefill_forward(x, varlens, start_pos, freqs_cis, mask)
+            return self.prefill_forward(x, varlens, start_pos, freqs_cis, mask, cache)
         else:
             return self.decode_forward(x, freqs_cis)
 
-
+'''
 def GEMV(x, w):
     # w = w.transpose(1, 0).contiguous()
     output = torch.zeros(x.shape[:-1] + w.shape[-1:], device=x.device, dtype=x.dtype)
     cinfer_backend.gemv(x, w, output)
     return output
-
+'''
 
 class FeedForward(nn.Module):
     def __init__(
@@ -491,8 +513,9 @@ class TransformerBlock(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
         varlens=None,
+        cache=True,
     ):
-        h = self.attention(self.attention_norm(x), start_pos, freqs_cis, mask, varlens)
+        h = self.attention(self.attention_norm(x), start_pos, freqs_cis, mask, varlens, cache=cache)
         h += x
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
@@ -691,3 +714,4 @@ class PipeTransformer(nn.Module):
             h = self.norm(h)
             h = self.output(h).float()
         return h
+    

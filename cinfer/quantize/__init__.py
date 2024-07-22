@@ -1,1 +1,1 @@
-from quantize.quantizer import quant
+from cinfer.quantize.quantizer import quant

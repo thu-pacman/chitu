@@ -1,5 +1,5 @@
 import torch
-from .global_vars import get_timers
+from .global_vars import get_timers, get_dtype
 
 from logging import getLogger
 
@@ -54,6 +54,7 @@ class KVCacheManager:
     # Decode:
     # return [layer, num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
     def prepare_cache_decode(self, req_ids):
+        global _GLOBAL_HALF
         self.timers("cache_prepare").start()
         self.layer_id = 0
         max_seq = 0
@@ -67,6 +68,7 @@ class KVCacheManager:
         max_seq = max(seq_lens)
         n_local_kv_heads = self.cache[req_ids[0]][0][0].shape[-2]
         head_dim = self.cache[req_ids[0]][0][0].shape[-1]
+        use_half = get_dtype()
         prepared_cache = torch.zeros(
             [
                 self.num_layers,  # layers
@@ -76,9 +78,10 @@ class KVCacheManager:
                 n_local_kv_heads,  # n_local_kv_heads
                 head_dim,  # head_dim
             ],
-            dtype=torch.bfloat16,
+            dtype=torch.float16 if use_half else torch.bfloat16,
             device=self.device,
         )
+
         # hkz-comment: Very similar to matrix transpose;
         for layer_id in range(self.num_layers):
             for it, req_id in enumerate(req_ids):
@@ -189,7 +192,7 @@ class KVCacheManagerSkewAware:
                 self.head_dim,
             ],
             device=self.device,
-            dtype=torch.bfloat16,
+            dtype=torch.float16 if _GLOBAL_HALF else torch.bfloat16,
         )
         self.timers = get_timers()
         self.prepared_reqs = []

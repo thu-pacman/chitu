@@ -9,7 +9,7 @@ from .task import (
 )
 from .model import Backend, VarLens, OngoingRequests
 from logging import getLogger
-from .global_vars import get_timers
+from .global_vars import get_timers, get_dtype
 
 logger = getLogger(__name__)
 
@@ -189,6 +189,7 @@ class PipeExecutor(NormalExecutor):
             return task_tensor.cpu(), None, None
         # generate packed tasks according to task_tensor
         tasks = PackedTasks(None, self.rank, task_tensor)
+        use_half = get_dtype()
         if tasks.task_type == TaskType.Prefill:
             h = torch.empty(
                 [
@@ -196,13 +197,13 @@ class PipeExecutor(NormalExecutor):
                     Backend.model.params.dim,
                 ],
                 device=self.rank,
-                dtype=torch.bfloat16,
+                dtype=torch.float16 if use_half else torch.bfloat16
             )
         else:
             h = torch.empty(
                 [tasks.num_tasks, 1, Backend.model.params.dim],
                 device=self.rank,
-                dtype=torch.bfloat16,
+                dtype=torch.float16 if use_half else torch.bfloat16
             )
         torch.distributed.recv(tensor=h, src=self.rank - 1)
         return task_tensor, h, tasks
