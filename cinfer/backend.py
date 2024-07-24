@@ -3,9 +3,11 @@ from fairscale.nn.model_parallel.initialize import (
     model_parallel_is_initialized,
 )
 import torch
+import gc
 from .tokenizer import Tokenizer, ChatFormat, TokenizerHF, ChatFormatHF
 from pathlib import Path
 import os, sys, json, time
+from transformers import AutoModelForCausalLM
 
 from .cache_manager import (
     KVCacheManager,
@@ -47,14 +49,15 @@ class Backend:
     def build(args):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group("nccl")
+        if args.infer.parallel_type == "tensor":
+            model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
+            pipeline_parallel_size = 1
+        else:
+            model_parallel_size = 1
+            pipeline_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
         if not model_parallel_is_initialized():
-            if args.infer.parallel_type == "tensor":
-                model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
-                pipeline_parallel_size = 1
-            else:
-                model_parallel_size = 1
-                pipeline_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
             initialize_model_parallel(model_parallel_size)
+
         Backend.parallel_type = args.infer.parallel_type
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -71,9 +74,9 @@ class Backend:
             tokenizer = TokenizerHF(path=args.models.tokenizer_path)
         else:
             tokenizer = Tokenizer(model_path=args.models.tokenizer_path)
-        assert (
-            args.models.vocab_size == tokenizer.n_words
-        ), f"{args.models.vocab_size} vs. {tokenizer.n_words}"
+            assert (
+                args.models.vocab_size == tokenizer.n_words
+            ), f"{args.models.vocab_size} vs. {tokenizer.n_words}"
         tokenizer.stop_tokens = torch.tensor(
             list(
                 [tokenizer.stop_tokens]
@@ -147,15 +150,26 @@ class Backend:
         # Init model parameters
         if args.infer.do_load:
             start_time = time.time()
-            checkpoints = sorted(Path(args.models.ckpt_dir).glob("*.pth"))
-            assert (
-                len(checkpoints) > 0
-            ), f"no checkpoint files found in {args.models.ckpt_dir}"
-            ckpt_path = checkpoints[0]
-            logger.warning(f"Loading checkpoint from {ckpt_path}")
-            checkpoint = torch.load(ckpt_path, map_location="cpu")
-            # logger.warning(checkpoint.keys())
+            if args.models.type == "llama":
+                checkpoints = sorted(Path(args.models.ckpt_dir).glob("*.pth"))
+                assert (
+                    len(checkpoints) > 0
+                ), f"no checkpoint files found in {args.models.ckpt_dir}"
+                ckpt_path = checkpoints[0]
+                # logger.warning(f"Loading checkpoint from {ckpt_path}")
+                checkpoint = torch.load(ckpt_path, map_location="cpu")
+            elif args.models.type == "qwen":
+                params = AutoModelForCausalLM.from_pretrained(
+                    args.models.ckpt_dir, torch_dtype="auto", device_map="cpu"
+                ).state_dict()
 
+                def transform_key(key):
+                    if key.startswith("model."):
+                        return key[len("model.") :]
+                    return key
+
+                checkpoint = dict((transform_key(k), v) for k, v in params.items())
+            # logger.warning(checkpoint.keys())
             if pipeline_parallel_size > 1:
                 load_pipe(
                     checkpoint,
@@ -184,3 +198,10 @@ class Backend:
         logger.warning(
             f"rank {local_rank} Backend initialized with CUDA mem at {torch.cuda.memory_allocated()}"
         )
+
+    @staticmethod
+    def stop():
+        setattr(Backend, "model", None)
+        setattr(Backend, "cache_manager", None)
+        gc.collect()
+        torch.cuda.empty_cache()

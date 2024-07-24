@@ -41,18 +41,15 @@ class Scheduler:
         task_ids = self.ret_task_ids + unwait_task_ids
         task_ids = list(set(task_ids))
         # logger.warning(f"rank {torch.distributed.get_rank()} {task_ids}")
-        try:
-            for task_id in task_ids:
-                if TaskPool.pool[task_id].need_remove():
-                    # logger.warning(f"Task {task_id} is done")
-                    if TaskPool.pool[task_id].task_type == TaskType.Decode:
-                        removed_task_ids.append(task_id)
-                    assert TaskPool.remove(task_id), "Task not found in pool"
-        except:
-            logger.warning(
-                f"rank {torch.distributed.get_rank()} {TaskPool.pool.keys()}"
-            )
-            assert False
+        for task_id in task_ids:
+            if TaskPool.pool[task_id].need_remove():
+                # logger.warning(f"Task {task_id} is done")
+                if TaskPool.pool[task_id].task_type == TaskType.Decode:
+                    removed_task_ids.append(task_id)
+                assert TaskPool.remove(
+                    task_id
+                ), f"Task {task_id} not found in pool {TaskPool.pool.keys()}"
+            # assert False
         # for task_id in unwait_task_ids:
         #     if task_id in TaskPool.id_list and TaskPool.pool[task_id].need_remove():
         #         assert TaskPool.remove(task_id), "Task not found in pool"
@@ -131,11 +128,11 @@ class PrefillFirstScheduler(Scheduler):
             )
         # logger.info(f"Selected task_ids: {self.ret_task_ids}")
 
-        if (
-            len(self.ret_task_ids) > 0
-            and TaskPool.pool[self.ret_task_ids[0]].task_type == TaskType.Prefill
-        ):
-            self.ret_task_ids = self.ret_task_ids[:1]
+        # if (
+        #     len(self.ret_task_ids) > 0
+        #     and TaskPool.pool[self.ret_task_ids[0]].task_type == TaskType.Prefill
+        # ):
+        #     self.ret_task_ids = self.ret_task_ids[:1]
         return self.ret_task_ids
 
 

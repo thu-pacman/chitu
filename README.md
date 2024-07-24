@@ -5,7 +5,7 @@
 ```bash
 # Run on aliyun and A10*4
 source /home/spack/spack/share/spack/setup-env.sh
-spack load cuda
+spack load cuda@12.4
 pip install -U xformers --index-url https://download.pytorch.org/whl/cu121 # install xformer
 pip install -r requirements.txt # install other python dependencies
 pip install flash-attn # may meet network problem, if so, try `https_proxy=http://127.0.0.1:7891 pip install flash-attn`
@@ -19,6 +19,14 @@ TORCH_CUDA_ARCH_LIST=8.6 python setup.py build -j4 develop
 # other parameters are in example/configs/serve_config.yaml
 # log is stored in outputs
 torchrun --nproc_per_node 1 test/single_req_test.py request.max_new_tokens=64
+
+# tensor parallel
+torchrun --nproc_per_node 2 test/single_req_test.py request.max_new_tokens=64 infer.parallel_type=tensor
+
+# pipeline parallel
+torchrun --nproc_per_node 2 test/single_req_test.py request.max_new_tokens=64 infer.parallel_type=pipe
+
+### NOTICE:
 # to avoid GPU conflict, add `grun` before command
 ```
 
@@ -44,7 +52,7 @@ curl localhost:21002/v1/chat/completions   -H "Content-Type: application/json"  
 
 # test stream response
 # 1. start serve at localhost:2512, avoid port conflict.
-grun torchrun --nproc_per_node 1 --master_port=12512 example/serve.py serve.port=2512 executor.type=normal scheduler.type=prefill_first scheduler.prefill_first.num_tasks=1 model.cache_type=skew
+grun torchrun --nproc_per_node 1 --master_port=12513 example/serve.py serve.port=2512
 # 2. send stream type request
 # "python test/chat_completions_req.py" for stream response, "python test/chat_completions_req.py 1" for non-stream
 python test/chat_completions_req.py

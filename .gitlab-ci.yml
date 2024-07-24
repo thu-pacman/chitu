@@ -3,7 +3,7 @@ stages:
     - run
 
 variables:
-    VENV: "/home/ss/cinfer_env"
+    VENV: "/home/hkz2/.venv/cinfer"
 
 before_script:
     - source $VENV/bin/activate
@@ -15,7 +15,7 @@ format_check:
     tags:
         - chitu830-dev
     script:
-        - black --check .
+        - black --exclude src/third_party/ --check .
 
 run_check:
     stage: run
@@ -26,4 +26,8 @@ run_check:
     needs:
         - format_check
     script:
-        - grun torchrun --nproc_per_node 1 test/single_req_test.py request.max_new_tokens=64
+        - if [ -d "/home/hkz2/cinfer/src/third_party" ]; then cp -r /home/hkz2/cinfer/src/third_party/* ./src/third_party/; fi
+        - source /home/spack/spack/share/spack/setup-env.sh
+        - spack load cuda@12.4.0
+        - TORCH_CUDA_ARCH_LIST=8.6 python setup.py build -j4 develop
+        - grun torchrun --nproc_per_node 1 --master_port=22512 test/single_req_test.py request.max_new_tokens=64
