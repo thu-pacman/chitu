@@ -2,23 +2,39 @@ import asyncio
 import threading
 import json
 from pydantic import BaseModel
+from typing import List, Optional
+from cinfer.backend import Backend
+from logging import getLogger
+
+logger = getLogger(__name__)
 
 
 class ChatCompletionResponse(BaseModel):
     id: str
     choices: list
+    usage: Optional[dict] = None
 
 
 class AsyncDataStream:
     def __init__(self):
-        self.data = []
+        self.tokenizer = Backend.tokenizer
+        self.seqs: List[str] = []
+        self.tokens_len: int = 0
+        self.cache_tokens: List[int] = []
         self.stop_signal = False
         self.lock = threading.Lock()
         self.data_event = asyncio.Event()
 
-    def add_data(self, value):
+    def add_data(self, value: int):
         with self.lock:
-            self.data.append(value)
+            self.tokens_len += 1
+            self.cache_tokens.append(value)
+            c = self.tokenizer.decode(self.cache_tokens)
+            if "\uFFFD" in c:
+                return
+            else:
+                self.cache_tokens.clear()
+            self.seqs.append(c)
         self.data_event.set()
 
     def send_stop_signal(self):
@@ -33,10 +49,10 @@ class AsyncDataStream:
     async def __anext__(self):
         while True:
             with self.lock:
-                if self.stop_signal and self.index >= len(self.data):
+                if self.stop_signal and self.index >= len(self.seqs):
                     raise StopAsyncIteration
-                if self.index < len(self.data):
-                    result = self.data[self.index]
+                if self.index < len(self.seqs):
+                    result = self.seqs[self.index]
                     self.index += 1
                     return result
             self.data_event.clear()
@@ -45,18 +61,33 @@ class AsyncDataStream:
 
 class AsyncResponse:
     def __init__(self, req):
+        self.req = req
         self.id = req.request_id
         self.async_stream = req.async_stream
 
     def stream_generator(self):
         async def stream_response():
             async for data in self.async_stream:
-                chunk = ChatCompletionResponse(
-                    id=self.id, choices=[{"index": 0, "delta": {"content": f"{data}"}}]
-                )
-                data = chunk.model_dump_json()
-                yield f"data: {data}\n\n"
-            # TODO add "usage": {"prompt_tokens":,"total_tokens":,"completion_tokens:"}
+                if data:
+                    chunk = ChatCompletionResponse(
+                        id=self.id,
+                        choices=[{"index": 0, "delta": {"content": f"{data}"}}],
+                    )
+                    data = chunk.model_dump_json(exclude_none=True)
+                    yield f"data: {data}\n\n"
+
+            chunk = ChatCompletionResponse(
+                id=self.id,
+                choices=[{"index": 0, "delta": {"content": ""}}],
+                usage={
+                    "prompt_tokens": f"{self.req.prompt_len}",
+                    "completion_tokens": f"{self.async_stream.tokens_len}",
+                    "total_tokens": f"{self.async_stream.tokens_len + self.req.prompt_len}",
+                },
+            )
+            data = chunk.model_dump_json(exclude_none=True)
+            yield f"data: {data}\n\n"
+            logger.info(f"Task_{self.id}, {self.async_stream.seqs} [DONE]")
             yield "data: [DONE]\n\n"
 
         return stream_response()
@@ -72,5 +103,10 @@ class AsyncResponse:
             choices=[
                 {"index": 0, "message": {"role": "assistant", "content": f"{text}"}}
             ],
+            usage={
+                "prompt_tokens": f"{self.req.prompt_len}",
+                "completion_tokens": f"{self.async_stream.tokens_len}",
+                "total_tokens": f"{self.async_stream.tokens_len + self.req.prompt_len}",
+            },
         )
         return full_response

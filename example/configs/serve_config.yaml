@@ -10,18 +10,18 @@ infer:
   do_load: True # set it to False for debug purpose
   seed: 0
   stop_with_eos: True
-  max_seq_len: 640 # length of prefill + decode
+  max_seq_len: 1024 # length of prefill + decode
   cache_type: paged
-  max_reqs: 1
+  max_reqs: 2
 request:
   max_new_tokens: 128
 scheduler:
-  type: fcfs
+  type: prefill_first
   fcfs:
     num_tasks: 16
     enable_hybrid: False
   prefill_first:
-    num_tasks: 2
+    num_tasks: 8
     enable_hybrid: False
   stride:
     num_tasks: 2

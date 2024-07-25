@@ -171,13 +171,7 @@ class Tokenizer:
         # Typecast is safe here. Tiktoken doesn't do anything list-related with the sequence.
         if len(t) == 1 and t[0] in self.stop_tokens:
             return ""
-        self.tokens_cache = self.tokens_cache + t
-        c = self.model.decode(cast(List[int], self.tokens_cache))
-        if "\uFFFD" in c:
-            return ""
-        else:
-            self.tokens_cache.clear()
-            return c
+        return self.model.decode(cast(List[int], t))
 
     @staticmethod
     def _split_whitespaces_or_nonwhitespaces(
@@ -261,13 +255,7 @@ class TokenizerHF:
         return t
 
     def decode(self, t: Sequence[int], skip_special_tokens=True) -> str:
-        self.tokens_cache = self.tokens_cache + t
-        c = self.model.decode(self.tokens_cache, skip_special_tokens=True)
-        if "\uFFFD" in c:
-            return ""
-        else:
-            self.tokens_cache.clear()
-            return c
+        return self.model.decode(t, skip_special_tokens=True)
 
 
 class ChatFormatHF:
