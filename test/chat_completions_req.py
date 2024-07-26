@@ -1,15 +1,33 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 import requests, json, sys, time, random
 
-url = "http://127.0.0.1:2512/v1/chat/completions"  # cinfer
+random.seed(2512)
+
+url = "http://127.0.0.1:25121/v1/chat/completions"  # cinfer
 
 headers = {"Content-Type": "application/json"}
+
+
+def gen_req_id(len=8):
+    random_number = random.getrandbits(len * 4)
+    hex_string = f"{random_number:0{len}x}"
+    return hex_string
+
 
 msgs = [
     [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "你是谁"},
     ],
-    # 1
+    [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "宫保鸡丁怎么做"},
+    ],
+    [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "show some Emoji"},
+    ],
+    # 3
     [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "北京可以参观哪里"},
@@ -23,7 +41,7 @@ msgs = [
         },
         {"role": "user", "content": "第3个地方好在哪"},
     ],
-    # 2
+    # 4
     [
         {"role": "user", "content": "I am going to Paris, what should I see?"},
         {
@@ -39,57 +57,65 @@ msgs = [
         },
         {"role": "user", "content": "What is so great about #1?"},
     ],
-    # 3
-    [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "show some Emoji"},
-    ],
-    [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "宫保鸡丁怎么做"},
-    ],
 ]
 
 stream = False
-index = 0
+
+req_nums = 1
 
 if len(sys.argv) > 1:
     stream = True
-    index = int(sys.argv[1]) % len(msgs)
+    # index = int(sys.argv[1]) % len(msgs)
+    req_nums = int(sys.argv[1])
 
-body = {
-    "model": "xx",
-    "messages": msgs[index],
-    "max_tokens": 300,
-    "stream": stream,
-}
 
-generated_text = ""
-start_time = time.monotonic()
-with requests.post(url, json=body, stream=True) as response:
-    if response.status_code == 200:
-        tokens = 0
-        for chunk in response.iter_lines():
-            if not chunk:
-                continue
-            print(chunk)
-            if stream:
-                stem = "data: "
-                chunk = chunk[len(stem) :]
-                if chunk == b"[DONE]":
+def send_request(index: int):
+    body = {
+        "model": "/home/ss/models/Qwen2-7B-Instruct",
+        "messages": msgs[index % len(msgs)],
+        "max_tokens": 200,
+        "stream": stream,
+    }
+
+    generated_text = ""
+    start_time = time.monotonic()
+    with requests.post(url, json=body, stream=True) as response:
+        if response.status_code == 200:
+            tokens = 0
+            for chunk in response.iter_lines():
+                if not chunk:
                     continue
-                data = json.loads(chunk)
-                delta = data["choices"][0]["delta"]
-                if delta.get("content", None):
-                    tokens += 1
-                    generated_text += delta["content"]
+                # print(f"{index}: {chunk}")
+                if stream:
+                    stem = "data: "
+                    chunk = chunk[len(stem) :]
+                    if chunk == b"[DONE]":
+                        continue
+                    data = json.loads(chunk)
+                    delta = data["choices"][0]["delta"]
+                    if delta.get("content", None):
+                        tokens += 1
+                        generated_text += delta["content"]
 
-        end_time = time.monotonic()
-        duration = end_time - start_time
-        print(generated_text)
-        if stream:
-            print(
-                f"duration:{duration:.4f}, Tokens:{tokens},TPS:{tokens / duration:.4f}"
-            )
-    else:
-        print(f"Request failed with status code: {response.status_code}")
+            end_time = time.monotonic()
+            duration = end_time - start_time
+            # if stream:
+            #     print(
+            #         f"duration:{duration:.4f}, Tokens:{tokens},TPS:{tokens / duration:.4f}"
+            #     )
+            return (index, start_time, end_time, duration, generated_text)
+        else:
+            print(f"Request failed with status code: {response.status_code}")
+
+
+with ThreadPoolExecutor(max_workers=req_nums) as executor:
+    futures = []
+    for i in range(req_nums):
+        futures.append(executor.submit(send_request, i))
+        time.sleep(0.5)
+    for future in as_completed(futures):
+        result = future.result()
+        text = result[4][:35].replace("\n", "")
+        print(
+            f"Index:{result[0]:2d}, start:{result[1]:.4f}, end:{result[2]:.4f}, duration:{result[3]:.4f}, text:'{text}'"
+        )

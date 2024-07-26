@@ -8,7 +8,7 @@ from omegaconf import DictConfig
 import uuid
 from queue import Queue
 from threading import Semaphore, Thread
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Any, Optional
 import random
 
@@ -43,7 +43,7 @@ class Message(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    conversation_id: Any = gen_req_id()
+    conversation_id: str = Field(default_factory=gen_req_id)
     messages: List[Message]
     max_tokens: int = 128
     stream: bool = False
@@ -56,8 +56,6 @@ async def create_chat_completion(request: ChatRequest):
         return {"message": "Service is not started"}
     params = request.dict()
     req_id = params.pop("conversation_id")
-    if not req_id:
-        req_id = gen_req_id()
     stream = params.pop("stream", False)
     message = params.pop("messages")
     max_new_tokens = params.pop("max_tokens", global_args.request.max_new_tokens)
@@ -73,7 +71,7 @@ async def create_chat_completion(request: ChatRequest):
         return JSONResponse(full_response.model_dump())
 
 
-@app.post("/v1/init")
+@app.post("/init")
 async def init_cinfer_service():
     global global_args
     global server_status
@@ -84,7 +82,7 @@ async def init_cinfer_service():
     return {"message": "Service initial done."}
 
 
-@app.post("/v1/stop")
+@app.post("/stop")
 async def stop_cinfer_service():
     global server_status
     if server_status:
@@ -95,10 +93,25 @@ async def stop_cinfer_service():
         return {"message": "Service has not been initialized."}
 
 
-@app.post("/v1/status")
+@app.post("/status")
 async def get_cinfer_status():
     global server_status
     return {"message": f"{server_status}"}
+
+
+@app.post("/load_status")
+async def get_cinfer_load_status():
+    pass
+
+
+@app.post("/ping")
+async def get_cinfer_status():
+    return {"message": "Connection succeeded"}
+
+
+@app.post("/health")
+async def health():
+    pass  # TODO Check the inference service
 
 
 async def process_queue():

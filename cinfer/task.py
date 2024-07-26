@@ -14,6 +14,7 @@ logger = getLogger(__name__)
 class UserRequest:
     def __init__(self, message, request_id, max_new_tokens=50):
         self.message = message
+        self.prompt_len = 0
         self.request_id = request_id
         self.completed = asyncio.Event()
         self.max_new_tokens = max_new_tokens
@@ -22,7 +23,7 @@ class UserRequest:
 
     def add_data(self, data):
         self.async_stream.add_data(data)
-        self.output += data.strip("\n")
+        # self.output += data.strip("\n")
         # logger.warning(f"add data {data}")
 
 
@@ -44,6 +45,9 @@ class TaskPool:
         assert task_id in TaskPool.pool, "Task not found in pool"
         # logger.warning(f"finish {task_id} cuda memory {torch.cuda.memory_allocated()}")
         if isinstance(TaskPool.pool[task_id], DecodeTask):
+            TaskPool.pool[task_id].req.output = "".join(
+                TaskPool.pool[task_id].req.async_stream.seqs
+            ).replace("\n", "")
             TaskPool.pool[task_id].req.async_stream.send_stop_signal()
             TaskPool.pool[task_id].req.completed.set()
             Backend.cache_manager.finalize_cache_all_decode(
@@ -115,6 +119,7 @@ class PrefillTask(Task):
             self.tokens = Backend.formatter.encode_dialog_prompt(message)
         self.task_type = TaskType.Prefill
         self.prefix_length = len(self.tokens)
+        self.req.prompt_len = len(self.tokens)
         self.max_output_tokens = 1024  # TODO: replace hardcode by parameter
         self.sched_ddl = (
             time.perf_counter_ns()
@@ -125,7 +130,7 @@ class PrefillTask(Task):
 
     def update_response(self, logit):
         self.next_token = torch.argmax(logit, dim=-1).item()
-        self.req.add_data(Backend.tokenizer.decode([self.next_token]))
+        self.req.add_data(self.next_token)
         if self.linked_task is not None:
             self.linked_task.next_token = self.next_token
 
@@ -165,8 +170,7 @@ class DecodeTask(Task):
         self.response.append(self.next_token)
         self.prefix_length += 1
         self.max_output_tokens -= 1
-        self.req.add_data(Backend.tokenizer.decode([self.next_token]))
-        # self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
+        self.req.add_data(self.next_token)
         # logger.warning(f"decode token {(Backend.tokenizer.decode([self.next_token]))}")
 
     def need_remove(self):
