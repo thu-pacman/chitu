@@ -26,15 +26,19 @@ add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=0) # necessary if using googletes
 
 # set(CMAKE_CXX_STANDARD 14)
 
+set(Python_FIND_STRATEGY "LOCATION") # Find the first Python in the path (which is the Python we load),
+                                     # instead of finding Python of the most latest version
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
+
 # find torch path
 execute_process(
-        COMMAND python3 -c "import torch; import os; print(os.path.dirname(torch.__file__), end='')"
+        COMMAND "${Python_EXECUTABLE}" -c "import torch; import os; print(os.path.dirname(torch.__file__), end='')"
         OUTPUT_VARIABLE TorchPath
 )
 list(APPEND CMAKE_PREFIX_PATH ${TorchPath})
 
 execute_process(
-        COMMAND python3 -c "import torch; print(torch.__version__, end='')"
+        COMMAND "${Python_EXECUTABLE}" -c "import torch; print(torch.__version__, end='')"
         OUTPUT_VARIABLE TorchVersion
 )
 message(STATUS "Torch Version: ${TorchVersion}")
@@ -82,8 +86,7 @@ add_library(${PROJECT_NAME} SHARED ${project_SOURCES} ${project_HEADERS})
 
 find_package(Torch REQUIRED)
 find_package(CUDA REQUIRED)
-find_package(PythonLibs REQUIRED)
-include_directories(${PYTHON_INCLUDE_DIRS})
+include_directories(${Python_INCLUDE_DIRS})
 
 message(STATUS "torch library: ${TORCH_LIBRARY}")
 target_link_libraries(${PROJECT_NAME} spdlog::spdlog)
@@ -111,7 +114,6 @@ pybind11_add_module(cinfer_backend ${project_BINDINGS})
 find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib")
 message(STATUS "TORCH_PYTHON_LIBRARY: ${TORCH_PYTHON_LIBRARY}")
 message(STATUS "PYTHON_LIBRARIES: ${PYTHON_LIBRARIES}")
-target_link_libraries(cinfer_backend PRIVATE pybind11::embed)
 target_link_libraries(cinfer_backend PRIVATE ${PROJECT_NAME} ${TORCH_PYTHON_LIBRARY})
 target_link_libraries(cinfer_backend PRIVATE ${PYTHON_LIBRARIES})
 target_include_directories(cinfer_backend PRIVATE ${project_INCLUDE_DIR})
