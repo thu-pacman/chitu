@@ -301,7 +301,7 @@ class Transformer(nn.Module):
         return prepared_freqs_cis
 
     @torch.inference_mode()
-    def prefill_single_device(self, tokens: list[int]):
+    def prefill_single_device(self, tokens):
         varlens = VarLens(tokens, self.device)
         tokens = torch.from_numpy(np.concatenate(tokens)).to(self.device)
         freqs_cis = self.prepare_freqs_cis_prefill(varlens, self.device)

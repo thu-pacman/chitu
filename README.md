@@ -9,8 +9,12 @@ spack load cuda@12.4
 pip install -U xformers --index-url https://download.pytorch.org/whl/cu121 # install xformer
 pip install -r requirements.txt # install other python dependencies
 pip install flash-attn # may meet network problem, if so, try `https_proxy=http://127.0.0.1:7891 pip install flash-attn`
-TORCH_CUDA_ARCH_LIST=8.6 python setup.py build -j4 develop
+TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 pip install -e . # Editable install
+# or otherwise, do a non-editable Cython-compiled install:
+# TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 CINFER_WITH_CYTHON=1 pip install .
 ```
+
+NOTE: You won't get the "editable" feature if you set both `-e` and `CINFER_WITH_CYTHON=1`. If you have accidentally done this and want to switch back, you will need to do `rm cinfer/*.so`.
 
 ## Internal Test
 
