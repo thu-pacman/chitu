@@ -12,3 +12,4 @@ ninja
 packaging
 wheel
 cmake
+cython
