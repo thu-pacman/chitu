@@ -59,7 +59,7 @@ def quantize_llmint8(model):
     print(model)
     return model
 
-def quantize_awq(model):
+def quantize_awq(model, name="qwen"):
     q_config = {
         "zero_point": True,
         "q_group_size": 128
@@ -70,8 +70,11 @@ def quantize_awq(model):
     )
     #print(model.device)
 
-    sd = torch.load("/home/tanyijun/cinfer/quant_cache/Llama3-8B-4bit.pth", map_location="cpu")
-    model.load_state_dict(sd)
+    if name == "llama":
+        sd = torch.load("/home/tanyijun/cinfer/quant_cache/Llama3-8B-4bit.pth", map_location="cpu")
+        model.load_state_dict(sd)
+    elif name == "qwen":
+        0
 
     
     class FP16Trans(torch.nn.Module):
@@ -82,18 +85,22 @@ def quantize_awq(model):
         def forward(self, x):
             return self.tok_embeddings(x).to(torch.float16)
         
-
-    model.tok_embeddings = FP16Trans(model.tok_embeddings)
+    if name == "llama":
+        model.tok_embeddings = FP16Trans(model.tok_embeddings)
+    elif name == "qwen":
+        model.embed_tokens = FP16Trans(model.embed_tokens)
 
     print(model)
 
     return model
 
-def quant(model, method=None):
+def quant(model, method=None, name="qwen"):
+
+
 
     if method == "llmint8":
-        return quantize_llmint8(model)
+        return quantize_llmint8(model, name)
     elif method == "awq":
-        return quantize_awq(model)
+        return quantize_awq(model, name)
         
     return model

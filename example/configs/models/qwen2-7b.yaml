@@ -1,0 +1,13 @@
+name: qwen2-7b
+type: qwen
+ckpt_dir: /home/ss/models/Qwen2-7B-Instruct
+tokenizer_path: /home/ss/models/Qwen2-7B-Instruct # TODO
+dim: 3584
+n_layers: 28
+n_heads: 28
+n_kv_heads: 4
+vocab_size: 152064
+intermediate_dim: 18944
+norm_eps: 1e-06
+rope_theta: 1000000.0
+max_seq_len: 1024 # length of prefill + decode

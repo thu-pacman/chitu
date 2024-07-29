@@ -3,14 +3,19 @@ from fastapi.responses import Response, StreamingResponse, JSONResponse
 import uvicorn
 import asyncio
 import hydra
+import torch
 from omegaconf import DictConfig
 import uuid
 from queue import Queue
 from threading import Semaphore, Thread
+from pydantic import BaseModel, Field
+from typing import List, Any, Optional
+import random
 
 
 from cinfer.global_vars import set_global_variables
-from cinfer.model import Backend
+
+from cinfer.backend import Backend
 from cinfer.task import UserRequest, TaskPool, PrefillTask
 from cinfer.cinfer_main import cinfer_init, cinfer_run
 from cinfer.async_response import AsyncResponse, AsyncDataStream
@@ -18,20 +23,39 @@ from cinfer.async_response import AsyncResponse, AsyncDataStream
 import logging
 from logging import getLogger
 
-
 logger = getLogger(__name__)
 
 app = FastAPI()
 
 global_args = None
+server_status = False
+
+
+def gen_req_id(len=8):
+    random_number = random.getrandbits(len * 4)
+    hex_string = f"{random_number:0{len}x}"
+    return hex_string
+
+
+class Message(BaseModel):
+    role: str = "user"
+    content: str = "hello, who are you"
+
+
+class ChatRequest(BaseModel):
+    conversation_id: str = Field(default_factory=gen_req_id)
+    messages: List[Message]
+    max_tokens: int = 128
+    stream: bool = False
 
 
 @app.post("/v1/chat/completions")
-async def create_chat_completion(request: Request):
-    params = await request.json()
-    req_id = request.headers.get("X-Request-ID")
-    if not req_id:
-        req_id = str(uuid.uuid4())
+async def create_chat_completion(request: ChatRequest):
+    global server_status
+    if not server_status:
+        return {"message": "Service is not started"}
+    params = request.dict()
+    req_id = params.pop("conversation_id")
     stream = params.pop("stream", False)
     message = params.pop("messages")
     max_new_tokens = params.pop("max_tokens", global_args.request.max_new_tokens)
@@ -45,6 +69,49 @@ async def create_chat_completion(request: Request):
     else:
         full_response = await response.full_generator()
         return JSONResponse(full_response.model_dump())
+
+
+@app.post("/init")
+async def init_cinfer_service():
+    global global_args
+    global server_status
+    if server_status:
+        return {"message": "Service has been started."}
+    cinfer_init(global_args)
+    server_status = True
+    return {"message": "Service initial done."}
+
+
+@app.post("/stop")
+async def stop_cinfer_service():
+    global server_status
+    if server_status:
+        Backend.stop()
+        server_status = False
+        return {"message": "Service has been terminated."}
+    else:
+        return {"message": "Service has not been initialized."}
+
+
+@app.post("/status")
+async def get_cinfer_status():
+    global server_status
+    return {"message": f"{server_status}"}
+
+
+@app.post("/load_status")
+async def get_cinfer_load_status():
+    pass
+
+
+@app.post("/ping")
+async def get_cinfer_status():
+    return {"message": "Connection succeeded"}
+
+
+@app.post("/health")
+async def health():
+    pass  # TODO Check the inference service
 
 
 async def process_queue():
@@ -66,11 +133,14 @@ worker_thread.start()
 @hydra.main(version_base=None, config_path="./configs", config_name="serve_config")
 def main(args: DictConfig):
     global global_args
+    global server_status
     set_global_variables()
     global_args = args
-    Backend.build(args.model)
     cinfer_init(args)
-    uvicorn.run(app, host=args.serve.host, port=args.serve.port, log_level="info")
+    server_status = True
+    rank = torch.distributed.get_rank()
+    if rank == 0:
+        uvicorn.run(app, host=args.serve.host, port=args.serve.port, log_level="info")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,10 @@
 import time
+import torch
 from .task import TaskPool, TaskType
 
 from logging import getLogger
+
+from typing import List  # Please keep Python 3.8 compatible
 
 logger = getLogger(__name__)
 
@@ -31,19 +34,24 @@ class Scheduler:
     def __init__(self):
         self.ret_task_ids = []
 
-    def schedule(self) -> list[str]:
+    def schedule(self) -> List[str]:
         assert len(self.ret_task_ids) == 0
         return self.ret_task_ids
 
     def update(self, unwait_task_ids=[]):
         removed_task_ids = []
         task_ids = self.ret_task_ids + unwait_task_ids
+        task_ids = list(set(task_ids))
+        # logger.warning(f"rank {torch.distributed.get_rank()} {task_ids}")
         for task_id in task_ids:
             if TaskPool.pool[task_id].need_remove():
-                logger.warning(f"Task {task_id} is done")
+                # logger.warning(f"Task {task_id} is done")
                 if TaskPool.pool[task_id].task_type == TaskType.Decode:
                     removed_task_ids.append(task_id)
-                assert TaskPool.remove(task_id), "Task not found in pool"
+                assert TaskPool.remove(
+                    task_id
+                ), f"Task {task_id} not found in pool {TaskPool.pool.keys()}"
+            # assert False
         # for task_id in unwait_task_ids:
         #     if task_id in TaskPool.id_list and TaskPool.pool[task_id].need_remove():
         #         assert TaskPool.remove(task_id), "Task not found in pool"
@@ -66,7 +74,7 @@ class FcfsScheduler(Scheduler):
         self.num_tasks = num_tasks
         self.enable_hybrid = enable_hybrid
 
-    def schedule(self) -> list[str]:
+    def schedule(self) -> List[str]:
         super().schedule()
         if self.enable_hybrid:
             self.ret_task_ids = TaskPool.id_list[: self.num_tasks]
@@ -99,7 +107,7 @@ class PrefillFirstScheduler(Scheduler):
         self.num_tasks = num_tasks
         self.enable_hybrid = enable_hybrid
 
-    def schedule(self) -> list[str]:
+    def schedule(self) -> List[str]:
         super().schedule()
         prefill_task_ids = filter(
             lambda x: TaskPool.pool[x].task_type == TaskType.Prefill
@@ -121,7 +129,11 @@ class PrefillFirstScheduler(Scheduler):
                 list(decode_task_ids)[: self.num_tasks - len(self.ret_task_ids)]
             )
         # logger.info(f"Selected task_ids: {self.ret_task_ids}")
-        # if TaskPool.pool[self.ret_task_ids[0]].task_type == TaskType.Prefill:
+
+        # if (
+        #     len(self.ret_task_ids) > 0
+        #     and TaskPool.pool[self.ret_task_ids[0]].task_type == TaskType.Prefill
+        # ):
         #     self.ret_task_ids = self.ret_task_ids[:1]
         return self.ret_task_ids
 
@@ -140,7 +152,7 @@ class StrideScheduler(Scheduler):
         self.num_tasks = num_tasks
         self.enable_hybrid = enable_hybrid
 
-    def schedule(self) -> list[str]:
+    def schedule(self) -> List[str]:
         super().schedule()
         # update sched_score
         for task_id in TaskPool.id_list:
@@ -190,7 +202,7 @@ class DdlScheduler(Scheduler):
         self.num_tasks = num_tasks
         self.enable_hybrid = enable_hybrid
 
-    def schedule(self) -> list[str]:
+    def schedule(self) -> List[str]:
         super().schedule()
         # sort by ddl and select top tasks
         if self.enable_hybrid:
@@ -228,7 +240,7 @@ class PrefixAlignScheduler(Scheduler):
         self.num_tasks = num_tasks
         self.enable_hybrid = enable_hybrid
 
-    def schedule(self) -> list[str]:
+    def schedule(self) -> List[str]:
         super().schedule()
         # TODO: no definition on 'close prefix length', sort by prefix length and select the longest
         if self.enable_hybrid:
@@ -267,7 +279,7 @@ class BalanceScheduler(Scheduler):
         self.num_tasks = num_tasks
         self.enable_hybrid = enable_hybrid
 
-    def schedule(self) -> list[str]:
+    def schedule(self) -> List[str]:
         super().schedule()
         prefill_task_ids = list(
             filter(

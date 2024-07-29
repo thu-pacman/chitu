@@ -2,8 +2,9 @@ import torch
 from enum import Enum
 import asyncio
 import time
-from .model import Backend
+from .backend import Backend
 from .async_response import AsyncDataStream, AsyncResponse
+import os
 
 from logging import getLogger
 
@@ -13,6 +14,7 @@ logger = getLogger(__name__)
 class UserRequest:
     def __init__(self, message, request_id, max_new_tokens=50):
         self.message = message
+        self.prompt_len = 0
         self.request_id = request_id
         self.completed = asyncio.Event()
         self.max_new_tokens = max_new_tokens
@@ -21,25 +23,31 @@ class UserRequest:
 
     def add_data(self, data):
         self.async_stream.add_data(data)
-        self.output += data
+        # self.output += data.strip("\n")
         # logger.warning(f"add data {data}")
 
 
 class TaskPool:
     pool = {}
     id_list = []
+    total_reqs = []
 
     def add(task):
         if task.task_id in TaskPool.pool:
             return False  # Task already exists, failed to add
         TaskPool.pool[task.task_id] = task
         TaskPool.id_list.append(task.task_id)
+        if task.req not in TaskPool.total_reqs:
+            TaskPool.total_reqs.append(task.req)
         return True
 
     def remove(task_id):
         assert task_id in TaskPool.pool, "Task not found in pool"
         # logger.warning(f"finish {task_id} cuda memory {torch.cuda.memory_allocated()}")
         if isinstance(TaskPool.pool[task_id], DecodeTask):
+            TaskPool.pool[task_id].req.output = "".join(
+                TaskPool.pool[task_id].req.async_stream.seqs
+            ).replace("\n", "")
             TaskPool.pool[task_id].req.async_stream.send_stop_signal()
             TaskPool.pool[task_id].req.completed.set()
             Backend.cache_manager.finalize_cache_all_decode(
@@ -50,6 +58,14 @@ class TaskPool:
         if ret is None:
             return False  # Task not found, failed to remove
         return True
+
+    def display():
+        return
+        num = len(TaskPool.total_reqs)
+        sys.stdout.write("\033[F" * num)
+        for req in TaskPool.total_reqs:
+            sys.stdout.write(f">>> {req.request_id}: {req.message} {req.output}<<<\n")
+        sys.stdout.flush()
 
 
 class TaskType(Enum):
@@ -93,7 +109,7 @@ class Task:
 
 
 class PrefillTask(Task):
-    def __init__(self, task_id: str, req: UserRequest, message: str, priority: int = 1):
+    def __init__(self, task_id: str, req: UserRequest, message, priority: int = 1):
         super().__init__(task_id, req, priority)
         self.message = message
         logger.info(f"Prefill task: {message}")
@@ -103,6 +119,7 @@ class PrefillTask(Task):
             self.tokens = Backend.formatter.encode_dialog_prompt(message)
         self.task_type = TaskType.Prefill
         self.prefix_length = len(self.tokens)
+        self.req.prompt_len = len(self.tokens)
         self.max_output_tokens = 1024  # TODO: replace hardcode by parameter
         self.sched_ddl = (
             time.perf_counter_ns()
@@ -113,11 +130,9 @@ class PrefillTask(Task):
 
     def update_response(self, logit):
         self.next_token = torch.argmax(logit, dim=-1).item()
-        # self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
-        self.req.add_data(Backend.tokenizer.decode([self.next_token]))
+        self.req.add_data(self.next_token)
         if self.linked_task is not None:
             self.linked_task.next_token = self.next_token
-        # logger.warning(f"prefill token {(Backend.tokenizer.decode([self.next_token]))}")
 
     def need_remove(self):
         return not self.waiting
@@ -155,12 +170,11 @@ class DecodeTask(Task):
         self.response.append(self.next_token)
         self.prefix_length += 1
         self.max_output_tokens -= 1
-        self.req.add_data(Backend.tokenizer.decode([self.next_token]))
-        # self.req.async_stream.add_data(Backend.tokenizer.decode([self.next_token]))
+        self.req.add_data(self.next_token)
         # logger.warning(f"decode token {(Backend.tokenizer.decode([self.next_token]))}")
 
     def need_remove(self):
-        if Backend.args.stop_with_eos:
+        if Backend.args.infer.stop_with_eos:
             return (
                 len(self.response) > 0
                 and (
@@ -234,7 +248,9 @@ class PackedTasks:
             task_tensor_cpu = task_tensor.cpu()
             decoded = []
             lens = []
-            for it, task_id in enumerate(task_tensor_cpu):
+            # for it, task_id in enumerate(task_tensor_cpu):
+            for it in range(PackedTasks.max_num_tasks):
+                task_id = task_tensor_cpu[it]
                 if task_id == 0:
                     break
                 decoded.append(req_decode(task_id))

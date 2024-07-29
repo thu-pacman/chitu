@@ -27,7 +27,6 @@ def get_dtype():
     return _GLOBAL_HALF
 
 
-
 def get_global_memory_buffer():
     _ensure_var_is_initialized(_GLOBAL_MEMORY_BUFFER, "global memory buffer")
     return _GLOBAL_MEMORY_BUFFER
@@ -106,6 +105,7 @@ class _Timer:
         self.cnt = 0
 
     def start(self):
+        # return
         """Start the timer."""
         assert not self.started_, "timer has already been started"
         torch.cuda.synchronize()
@@ -113,6 +113,7 @@ class _Timer:
         self.started_ = True
 
     def stop(self):
+        # return
         """Stop the timer."""
         assert self.started_, "timer is not started"
         torch.cuda.synchronize()
@@ -172,6 +173,8 @@ class Timers:
         string = "time (ms)"
         for name in names:
             cnt = self.timers[name].cnt
+            if cnt == 0:
+                continue
             elapsed_time = self.timers[name].elapsed(reset=reset) * 1000.0 / normalizer
             string += " | {}: {:.2f} {} {:.2f}".format(
                 name, elapsed_time, cnt, elapsed_time / cnt

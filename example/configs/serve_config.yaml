@@ -1,28 +1,27 @@
+defaults:
+  # - models: qwen2-70b
+  - models: qwen2-7b
+  # - models: llama3-8b
 serve:
   host: 0.0.0.0
   port: 21002
-model:
-  ckpt_dir: /home/hkz/Meta-Llama-3-8B-Instruct
-  tokenizer_path: /home/hkz/Meta-Llama-3-8B-Instruct/tokenizer.model
-  temperature: 0.6
-  top_p: 0.9
-  do_load: True # debug purpose
+infer:
+  parallel_type: normal
+  do_load: True # set it to False for debug purpose
   seed: 0
   stop_with_eos: True
   max_seq_len: 1024 # length of prefill + decode
-  cache_type: normal
-  max_reqs: 16
+  cache_type: paged
+  max_reqs: 2
 request:
   max_new_tokens: 128
-executor:
-  type: normal
 scheduler:
-  type: fcfs
+  type: prefill_first
   fcfs:
     num_tasks: 16
     enable_hybrid: False
   prefill_first:
-    num_tasks: 2
+    num_tasks: 8
     enable_hybrid: False
   stride:
     num_tasks: 2
@@ -36,3 +35,5 @@ scheduler:
   balance:
     num_tasks: 2
     enable_hybrid: False
+quant: awq
+quant_ckpt_dir: /home/tanyijun/test_quantize/quant_cache/Qwen2-7B-4bit.pth

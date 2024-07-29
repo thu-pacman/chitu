@@ -16,6 +16,7 @@ from typing import (
 
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
+from transformers import AutoTokenizer
 
 
 logger = getLogger(__name__)
@@ -69,6 +70,7 @@ class Tokenizer:
             f"<|reserved_special_token_{i}|>"
             for i in range(5, self.num_reserved_special_tokens - 5)
         ]
+        self.tokens_cache = []
         self.special_tokens = {
             token: num_base_tokens + i for i, token in enumerate(special_tokens)
         }
@@ -167,6 +169,8 @@ class Tokenizer:
             str: The decoded string.
         """
         # Typecast is safe here. Tiktoken doesn't do anything list-related with the sequence.
+        if len(t) == 1 and t[0] in self.stop_tokens:
+            return ""
         return self.model.decode(cast(List[int], t))
 
     @staticmethod
@@ -222,5 +226,59 @@ class ChatFormat:
         for message in dialog:
             tokens.extend(self.encode_message(message))
         # Add the start of an assistant message for the model to complete.
+        tokens.extend(self.encode_header({"role": "assistant", "content": ""}))
+        return tokens
+
+
+class TokenizerHF:
+    def __init__(self, path: str):
+        self.tokens_cache = []
+        self.model = AutoTokenizer.from_pretrained(path)
+        # self.model = AutoTokenizer.from_pretrained("Qwen/Qwen2-7B-Instruct")
+        # Qwen2 don't set bos but have <|im_start|>
+        # all special tokens: <|endoftext|> <|im_start|> <|im_end|>
+        if "qwen2" in path.lower():
+            self.bos_id = self.model.convert_tokens_to_ids("<|im_start|>")
+        else:
+            self.bos_id = self.model.bos_token_id
+        self.eos_id = self.model.eos_token_id
+        self.pad_id = self.model.pad_token_id
+        self.stop_tokens = self.model.eos_token_id
+        self.n_words = self.model.vocab_size
+
+    def encode(self, s: str, bos: bool, eos: bool) -> List[int]:
+        t = self.model.encode(s, add_special_tokens=False)
+        if bos:
+            t.insert(0, self.bos_id)
+        if eos:
+            t.append(self.eos_id)
+        return t
+
+    def decode(self, t: Sequence[int], skip_special_tokens=True) -> str:
+        return self.model.decode(t, skip_special_tokens=True)
+
+
+class ChatFormatHF:
+    def __init__(self, tokenizer: TokenizerHF):
+        self.tokenizer = tokenizer
+
+    def encode_header(self, message: Message) -> List[int]:  # ???
+        tokens = []
+        tokens.extend(self.tokenizer.encode(message["role"], bos=True, eos=False))
+        tokens.extend(self.tokenizer.encode("\n", bos=False, eos=False))
+        return tokens
+
+    def encode_message(self, message: Message) -> List[int]:
+        tokens = self.encode_header(message)
+        tokens.extend(
+            self.tokenizer.encode(message["content"].strip(), bos=False, eos=True)
+        )
+        tokens.extend(self.tokenizer.encode("\n", bos=False, eos=False))
+        return tokens
+
+    def encode_dialog_prompt(self, dialog: Dialog) -> List[int]:
+        tokens = []
+        for message in dialog:
+            tokens.extend(self.encode_message(message))
         tokens.extend(self.encode_header({"role": "assistant", "content": ""}))
         return tokens

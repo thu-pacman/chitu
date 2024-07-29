@@ -7,19 +7,26 @@ from .task import (
     req_decode,
     taskid2reqid,
 )
-from .model import Backend, VarLens, OngoingRequests
+from .backend import Backend
+from .utils import VarLens
 from logging import getLogger
 from .global_vars import get_timers, get_dtype
 
 logger = getLogger(__name__)
 
 
+class OngoingRequests:
+    def __init__(self, reqs, tasks, handle, logits):
+        self.reqs = reqs
+        self.tasks = tasks
+        self.handle = handle
+        self.logits = logits
+
+
 class Executor:
     @staticmethod
     def build(args):
-        if args.type.lower() == "debug":
-            assert False, "Debug mode disabled"
-        elif args.type.lower() == "pipe":
+        if args.infer.parallel_type == "pipe":
             return PipeExecutor(args)
         else:
             return NormalExecutor(args)
@@ -40,7 +47,7 @@ class Executor:
     def _prepare_seq_lens_for_decode(self, tasks):
         seq_lens = []
         for req_id in tasks.req_ids:
-            seq_len = Backend.cache_manager.lengths[req_id]
+            seq_len = Backend.cache_manager.seq_lens[req_id]
             seq_lens.append(seq_len)
         return seq_lens
 
@@ -63,8 +70,8 @@ class NormalExecutor(Executor):
         # logger.warning(f"Prefill step: {tasks.task_ids}")
         varlens = VarLens(tasks.tokens, "cuda")
         self.timers("prefill").start()
-        Backend.curr_varlens = varlens
-        Backend.curr_req_ids = tasks.req_ids
+        Backend.cache_manager.curr_varlens = varlens
+        Backend.cache_manager.curr_req_ids = tasks.req_ids
         logits = Backend.model.prefill(tasks.tokens)
         self.timers("prefill").stop()
         # after prefill, new decode tasks are created
@@ -87,6 +94,7 @@ class NormalExecutor(Executor):
 
     def decode_step(self, tasks: PackedTasks):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
+        Backend.cache_manager.curr_req_ids = tasks.req_ids
         # logger.info(f"Decode step: {tasks.task_ids}")
         self.timers("decode").start()
         new_tokens = self._prepare_new_tokens_for_decode(tasks)
@@ -122,9 +130,9 @@ class PipeExecutor(NormalExecutor):
     def prefill_step(self, tasks: PackedTasks, h=None):
         self.timers("prefill").start()
         varlens = VarLens(tasks.tokens, self.rank)
-        Backend.curr_varlens = varlens
-        Backend.curr_req_ids = tasks.req_ids
-        logits = Backend.model.prefill(tasks.tokens if self.rank == 0 else h, self.rank)
+        Backend.cache_manager.curr_varlens = varlens
+        Backend.cache_manager.curr_req_ids = tasks.req_ids
+        logits = Backend.model.prefill(tasks.tokens if self.rank == 0 else h)
         self.timers("prefill").stop()
         # send logits to rank 0 to get response words
         if self.rank == self.world_size - 1:
@@ -154,11 +162,12 @@ class PipeExecutor(NormalExecutor):
 
     def decode_step(self, tasks: PackedTasks, h=None):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
+        Backend.cache_manager.curr_req_ids = tasks.req_ids
         self.timers("decode").start()
         seq_lens = self._prepare_seq_lens_for_decode(tasks)
         tokens = self._prepare_new_tokens_for_decode(tasks) if self.rank == 0 else h
         self.timers("decode-model").start()
-        logits = Backend.model.decode(tokens, seq_lens, self.rank)
+        logits = Backend.model.decode(tokens, seq_lens)
         self.timers("decode-model").stop()
         self.timers("decode").stop()
         # Send logits to rank 0 to get response words
@@ -197,13 +206,13 @@ class PipeExecutor(NormalExecutor):
                     Backend.model.params.dim,
                 ],
                 device=self.rank,
-                dtype=torch.float16 if use_half else torch.bfloat16
+                dtype=torch.float16 if use_half else torch.bfloat16,
             )
         else:
             h = torch.empty(
                 [tasks.num_tasks, 1, Backend.model.params.dim],
                 device=self.rank,
-                dtype=torch.float16 if use_half else torch.bfloat16
+                dtype=torch.float16 if use_half else torch.bfloat16,
             )
         torch.distributed.recv(tensor=h, src=self.rank - 1)
         return task_tensor, h, tasks

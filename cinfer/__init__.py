@@ -1,4 +1,1 @@
-#from .ops import GEMV
-
-
-import cinfer.model
+# from .ops import GEMV
