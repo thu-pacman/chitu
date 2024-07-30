@@ -276,6 +276,7 @@ class Transformer(nn.Module):
         raise NotImplementedError
 
     def _post_layers(self, h):
+        """NOTE: _post_layers is assumed to be a token-wise computation"""
         raise NotImplementedError
 
     def prepare_freqs_cis_prefill(self, varlens, device):
@@ -308,9 +309,9 @@ class Transformer(nn.Module):
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):
             h = layer(h, freqs_cis, varlens)
-        h = self._post_layers(h)
         tmp = varlens.cpu_prefix_lens[1:]
         h = h[[item - 1 for item in tmp]]
+        h = self._post_layers(h)  # Exec post layers AFTER cutting the last token off
         h = h.float()
         return h
 
@@ -341,9 +342,11 @@ class Transformer(nn.Module):
             h = layer(h, freqs_cis, varlens)
         # end of model
         if self.rank == self.world_size - 1:
-            h = self._post_layers(h)
             tmp = varlens.cpu_prefix_lens[1:]
             h = h[[item - 1 for item in tmp]]
+            h = self._post_layers(
+                h
+            )  # Exec post layers AFTER cutting the last token off
             h = h.float()
         return h
 

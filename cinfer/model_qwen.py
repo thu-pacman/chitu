@@ -250,6 +250,7 @@ class TransformerQwen(Transformer):
         return self.embed_tokens(h)
 
     def _post_layers(self, h):
+        """NOTE: _post_layers is assumed to be a token-wise computation"""
         h = self.norm(h)
         h = self.lm_head(h)
         return h

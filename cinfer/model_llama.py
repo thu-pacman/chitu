@@ -81,6 +81,7 @@ class TransformerLlama(Transformer):
         return self.tok_embeddings(h)
 
     def _post_layers(self, h):
+        """NOTE: _post_layers is assumed to be a token-wise computation"""
         h = self.norm(h)
         h = self.output(h)
         return h
