@@ -246,7 +246,24 @@ class WQLinear(nn.Module):
         # out_shape = x.shape[:-1] + (self.out_features,)
         # inputs = x.reshape(-1, x.shape[-1])
         inputs = x
-        if inputs.numel() / inputs.shape[-1] < 8:
+        #if inputs.numel() / inputs.shape[-1] < 8:
+        #print("qbug : ", inputs.shape, inputs.numel())
+        #batch_size, n_tokens, _ = inputs.shape
+        
+        #print(self.qweight.shape)
+        #print(self.scales.shape)
+        #print(self.scaled_zeros.shape)
+        #print(self.out_features)
+        #print(self.in_features)
+        '''
+        qbug :  torch.Size([6, 1, 3584]) 21504
+        torch.Size([128, 3584])
+        torch.Size([32, 512])
+        torch.Size([32, 512])
+        512
+        3584
+        '''
+        if inputs.shape[0] < 5:
             out = awq_inference_engine.gemv_forward_cuda_new(
                 inputs,
                 self.qweight,

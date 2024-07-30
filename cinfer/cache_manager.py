@@ -5,13 +5,22 @@ from logging import getLogger
 
 from .ops import move_data
 
+import os
+try:
+    os.environ['PAGED_SIZE']
+    paged_size = int(os.environ['PAGED_SIZE'])
+except KeyError:
+    paged_size = 16
+print("PAGED_SIZE : ", paged_size)
+
+
 
 logger = getLogger(__name__)
 _BLOCK_SIZE = 512  # _BLOCK_SIZE must be a multiple of 256 for FlashAttention
 _MAX_SEQ_LEN = 2048
 _MAX_NUM_BLOCKS_PER_LAYER = (
     _MAX_SEQ_LEN // _BLOCK_SIZE
-) * 16  # TODO: make  this dynamic
+) * paged_size  # TODO: make  this dynamic
 
 
 class PagedKVCacheManager:

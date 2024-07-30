@@ -35,5 +35,6 @@ scheduler:
   balance:
     num_tasks: 2
     enable_hybrid: False
-quant: None
-dtype: bfloat16
+quant: awq
+quant_ckpt_dir: /home/tanyijun/test_quantize/quant_cache/Qwen2-7B-4bit.pth
+dtype: float16

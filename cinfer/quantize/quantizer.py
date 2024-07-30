@@ -7,6 +7,13 @@ from cinfer.model import *
 
 from cinfer.tokenizer import Tokenizer, ChatFormat
 import cinfer.awq as awq
+
+from fairscale.nn.model_parallel.layers import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    VocabParallelEmbedding,
+)
+
 #import cinfer.evaluator as eval
 
 __all__ = ["quant"]
@@ -21,12 +28,12 @@ def replace_with_bnb(model, current_key_name=None):
             
         current_key_name.append(name)
         current_key_name_str = ".".join(current_key_name)
-        print(current_key_name_str)
+        #print(current_key_name_str)
         #if current_key_name_str == "model.model":
         #    continue
         #if (name == "model"):
         #    continue
-        if isinstance(module, torch.nn.Linear):
+        if isinstance(module, (torch.nn.Linear, ColumnParallelLinear, RowParallelLinear)):
             bnb_module = bnb.nn.Linear8bitLt(
                 module.in_features,
                 module.out_features,
@@ -99,7 +106,7 @@ def quant(model, method=None, name="qwen"):
 
 
     if method == "llmint8":
-        return quantize_llmint8(model, name)
+        return quantize_llmint8(model)
     elif method == "awq":
         return quantize_awq(model, name)
         

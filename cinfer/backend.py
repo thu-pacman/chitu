@@ -150,12 +150,13 @@ class Backend:
         else:
             torch.set_default_tensor_type(torch.cuda.HalfTensor)
         
-        if args.quant == "None":
+        if (args.quant == "None"):
             model = model.to(torch.bfloat16)
             torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
-        if args.quant == "awq":
+        if (args.quant == "awq") or (args.quant == "llmint8"):
             torch.set_default_tensor_type(torch.cuda.HalfTensor)
             model = model.to(torch.float16)
+        if (args.quant == "awq"):
             quant(model, method="awq", name="qwen")
         print(model)
 
@@ -215,6 +216,9 @@ class Backend:
             else:
                 model.load_state_dict(checkpoint, strict=True)
             logger.warning(f"Loaded in {time.time() - start_time:.2f} seconds")
+
+        if args.quant == "llmint8":
+            quant(model, "llmint8", "qwen")
         model = model.to(local_rank)
         Backend.model = model
 

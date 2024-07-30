@@ -35,5 +35,5 @@ scheduler:
   balance:
     num_tasks: 2
     enable_hybrid: False
-quant: None
-dtype: bfloat16
+quant: llmint8
+dtype: float16
