@@ -3,7 +3,7 @@ import requests, json, sys, time, random
 
 random.seed(2512)
 
-url = "http://127.0.0.1:25121/v1/chat/completions"  # cinfer
+url = "http://127.0.0.1:2512/v1/chat/completions"  # cinfer
 
 headers = {"Content-Type": "application/json"}
 
@@ -62,6 +62,11 @@ msgs = [
 stream = False
 
 req_nums = 1
+msg_id = None
+
+if len(sys.argv) > 2:
+    msg_id = int(sys.argv[2])
+
 
 if len(sys.argv) > 1:
     stream = True
@@ -72,8 +77,8 @@ if len(sys.argv) > 1:
 def send_request(index: int):
     body = {
         "model": "/home/ss/models/Qwen2-7B-Instruct",
-        "messages": msgs[index % len(msgs)],
-        "max_tokens": 200,
+        "messages": msgs[index % len(msgs) if msg_id is None else msg_id],
+        "max_tokens": 512,
         "stream": stream,
     }
 
@@ -99,11 +104,9 @@ def send_request(index: int):
 
             end_time = time.monotonic()
             duration = end_time - start_time
-            # if stream:
-            #     print(
-            #         f"duration:{duration:.4f}, Tokens:{tokens},TPS:{tokens / duration:.4f}"
-            #     )
-            return (index, start_time, end_time, duration, generated_text)
+            tps = tokens / duration
+            # print(generated_text)
+            return (index, start_time, end_time, duration, generated_text, tps)
         else:
             print(f"Request failed with status code: {response.status_code}")
 
@@ -117,5 +120,5 @@ with ThreadPoolExecutor(max_workers=req_nums) as executor:
         result = future.result()
         text = result[4][:35].replace("\n", "")
         print(
-            f"Index:{result[0]:2d}, start:{result[1]:.4f}, end:{result[2]:.4f}, duration:{result[3]:.4f}, text:'{text}'"
+            f"Index:{result[0]:2d}, start:{result[1]:.4f}, duration:{result[3]:.4f}, tps:{result[5]:.4f}, text:'{text}'"
         )

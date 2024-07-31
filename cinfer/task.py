@@ -45,9 +45,9 @@ class TaskPool:
         assert task_id in TaskPool.pool, "Task not found in pool"
         # logger.warning(f"finish {task_id} cuda memory {torch.cuda.memory_allocated()}")
         if isinstance(TaskPool.pool[task_id], DecodeTask):
-            TaskPool.pool[task_id].req.output = "".join(
-                TaskPool.pool[task_id].req.async_stream.seqs
-            ).replace("\n", "")
+            TaskPool.pool[task_id].req.output = repr(
+                "".join(TaskPool.pool[task_id].req.async_stream.seqs)
+            )
             TaskPool.pool[task_id].req.async_stream.send_stop_signal()
             TaskPool.pool[task_id].req.completed.set()
             Backend.cache_manager.finalize_cache_all_decode(
@@ -109,17 +109,34 @@ class Task:
 
 
 class PrefillTask(Task):
-    def __init__(self, task_id: str, req: UserRequest, message, priority: int = 1):
+    def __init__(
+        self,
+        task_id: str,
+        req: UserRequest,
+        message,
+        priority: int = 1,
+        max_seq_len: int = 1024,
+    ):
         super().__init__(task_id, req, priority)
         self.message = message
-        logger.info(f"Prefill task: {message}")
         if isinstance(message, str):
             self.tokens = Backend.tokenizer.encode(message, bos=True, eos=False)
         else:
             self.tokens = Backend.formatter.encode_dialog_prompt(message)
         self.task_type = TaskType.Prefill
-        self.prefix_length = len(self.tokens)
         self.req.prompt_len = len(self.tokens)
+        self.prefix_length = self.req.prompt_len
+        logger.info(
+            f"Prefill_{req.request_id}: {message}, seq_len: {self.req.prompt_len}, max_seq_len: {max_seq_len}\n"
+        )
+        if self.req.prompt_len >= max_seq_len:
+            logger.warning(
+                f"prompt length({self.prefix_length}) is greater than max_seq_len({max_seq_len})"
+            )
+            raise ValueError("length error")
+        self.req.max_new_tokens = min(
+            self.req.max_new_tokens, max_seq_len - self.req.prompt_len
+        )
         self.max_output_tokens = 1024  # TODO: replace hardcode by parameter
         self.sched_ddl = (
             time.perf_counter_ns()
