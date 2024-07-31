@@ -12,6 +12,7 @@ infer:
   stop_with_eos: True
   max_seq_len: 1024 # length of prefill + decode
   cache_type: paged
+  attn_type: flash # flash or ref
   max_reqs: 2
 request:
   max_new_tokens: 128

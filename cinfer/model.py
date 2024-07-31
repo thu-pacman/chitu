@@ -21,7 +21,6 @@ import numpy as np
 
 # from vllm import _custom_ops as vllm_ops
 # import cinfer_backend
-import flash_attn
 
 from fairscale.nn.model_parallel.initialize import (
     initialize_model_parallel,
@@ -93,10 +92,11 @@ def apply_rotary_emb(
 
 
 class Attention(nn.Module):
-    def __init__(self, layer_id, cache):
+    def __init__(self, layer_id, cache, attn_backend):
         super().__init__()
         self.layer_id = layer_id
         self.cache = cache
+        self.attn_backend = attn_backend
 
     def _run_linear(self, x):
         raise NotImplementedError
@@ -119,7 +119,7 @@ class Attention(nn.Module):
         self.cache.finalize_cache_bylayer_prefill(
             xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
         )
-        output = flash_attn.flash_attn_varlen_func(
+        output = self.attn_backend.attn_varlen_func(
             xq,
             xk,
             xv,
@@ -150,7 +150,7 @@ class Attention(nn.Module):
         cache_k = cache[0]
         cache_v = cache[1]
         cache_seqlens = self.cache.get_gpu_seq_lens()
-        output = flash_attn.flash_attn_with_kvcache(
+        output = self.attn_backend.attn_with_kvcache(
             xq,
             cache_k,
             cache_v,
@@ -183,7 +183,7 @@ class Attention(nn.Module):
         )
         cache_seqlens = self.cache.get_gpu_seq_lens()
         paged_k_cache, paged_v_cache = self.cache.get_paged_kv_cache()
-        output = flash_attn.flash_attn_with_kvcache(
+        output = self.attn_backend.attn_with_kvcache(
             xq,
             paged_k_cache,
             paged_v_cache,
@@ -212,7 +212,7 @@ class Attention(nn.Module):
 
 class TransformerBlock(nn.Module):
 
-    def __init__(self, layer_id: int, args):
+    def __init__(self, layer_id: int, args, cache, attn_backend):
         super().__init__()
         self.n_heads = args.n_heads
         self.dim = args.dim
@@ -225,9 +225,12 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, params, cache, pipeline_parallel_size, model_parallel_size):
+    def __init__(
+        self, params, cache, pipeline_parallel_size, model_parallel_size, attn_backend
+    ):
         super().__init__()
         self.cache = cache
+        self.attn_backend = attn_backend
         self.rank = torch.distributed.get_rank()
         self.world_size = torch.distributed.get_world_size()
         self.device = torch.device(self.rank)
@@ -244,7 +247,7 @@ class Transformer(nn.Module):
 
         if not self.pipeline_exec or self.rank == 0:
             self._init_pre_layers()
-        self._init_layers(cache)
+        self._init_layers(cache, attn_backend)
         if not self.pipeline_exec or self.rank == self.world_size - 1:
             self._init_post_layers()
 
@@ -257,7 +260,7 @@ class Transformer(nn.Module):
     def _init_pre_layers(self):
         raise NotImplementedError
 
-    def _init_layers(self, cache):
+    def _init_layers(self, cache, attn_backend):
         raise NotImplementedError
 
     def _init_post_layers(self):
