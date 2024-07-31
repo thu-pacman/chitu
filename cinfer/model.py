@@ -31,9 +31,6 @@ from .tokenizer import Tokenizer, ChatFormat, TokenizerHF, ChatFormatHF
 from pathlib import Path
 import os, sys, json, time
 
-from xformers.ops import fmha
-
-
 from logging import getLogger
 
 
@@ -149,24 +146,18 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        cache = self.cache.update_cache_decode(xk, xv, self.layer_id)
+        cache = self.cache.get_cache_decode(self.layer_id)
         cache_k = cache[0]
         cache_v = cache[1]
-        max_seq_len = cache.shape[2]
-
-        if self.n_local_heads != self.n_local_kv_heads:
-            group_size = self.n_local_heads // self.n_local_kv_heads
-            assert group_size > 1
-            xq = xq.view(bsz, seqlen, self.n_local_kv_heads, group_size, self.head_dim)
-            cache_k = cache_k.view(
-                bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
-            ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
-            cache_v = cache_v.view(
-                bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
-            ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
-        output = fmha.memory_efficient_attention_forward(xq, cache_k, cache_v).view(
-            bsz, seqlen, -1
-        )
+        cache_seqlens = self.cache.get_gpu_seq_lens()
+        output = flash_attn.flash_attn_with_kvcache(
+            xq,
+            cache_k,
+            cache_v,
+            xk,
+            xv,
+            cache_seqlens=cache_seqlens,
+        ).view(bsz, seqlen, -1)
         return self._run_output_linear(output)
 
     def decode_forward_paged(self, x: torch.Tensor, freqs_cis: torch.Tensor):
@@ -190,7 +181,7 @@ class Attention(nn.Module):
         block_table = self.cache.get_gpu_block_table(
             self.cache.curr_req_ids, self.layer_id
         )
-        cache_seqlens = self.cache.get_gpu_seq_lens(self.cache.curr_req_ids)
+        cache_seqlens = self.cache.get_gpu_seq_lens()
         paged_k_cache, paged_v_cache = self.cache.get_paged_kv_cache()
         output = flash_attn.flash_attn_with_kvcache(
             xq,
