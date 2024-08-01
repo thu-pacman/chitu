@@ -54,53 +54,11 @@ def replace_with_bnb(model, current_key_name=None):
         current_key_name.pop(-1)
     return model, has_been_replaced
 
-def replace_with_gptq(model, current_key_name=None):
-     
-    has_been_replaced = False
-    for name, module in model.named_children():
-        #print(name)
-        if current_key_name is None:
-            current_key_name = []
-            
-        current_key_name.append(name)
-        current_key_name_str = ".".join(current_key_name)
-        #print(name)
-        if name != "lm_head":
-            if isinstance(module, (torch.nn.Linear, ColumnParallelLinear, RowParallelLinear)):
-                from auto_gptq.nn_modules.qlinear.qlinear_tritonv2 import QuantLinear
-                qptq_linear = QuantLinear(
-                    8,
-                    128,
-                    module.in_features,
-                    module.out_features,
-                    module.bias is not None,
-                    trainable=False,
-                    weight_dtype=module.weight.dtype,
-                )
-                qptq_linear.requires_grad_(False)
-                setattr(model, name, qptq_linear)
-                has_been_replaced = True
-            if len(list(module.children())) > 0:
-                _, _has_been_replaced = replace_with_gptq(module, current_key_name)
-                has_been_replaced = has_been_replaced | _has_been_replaced
-        
-        current_key_name.pop(-1)
-    return model, has_been_replaced
-
 
 
 
 def quantize_llmint8(model):
     model, has_been_replaced = replace_with_bnb(model)
-
-    if not has_been_replaced:
-        print("no linear modules were found.")
-
-    print(model)
-    return model
-
-def quantize_gptq(model):
-    model, has_been_replaced = replace_with_gptq(model)
 
     if not has_been_replaced:
         print("no linear modules were found.")
@@ -151,7 +109,5 @@ def quant(model, method=None, name="qwen"):
         return quantize_llmint8(model)
     elif method == "awq":
         return quantize_awq(model, name)
-    elif method == "gptq":
-        return quantize_gptq(model)
         
     return model

@@ -176,6 +176,7 @@ print("0 GPU memory used : ", torch.cuda.memory_allocated())
 #model, tokenizer = quant_with_awq_results()
 model, tokenizer = load_quant_model(True)
 
+import cinfer.evaluator as eval
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
 print("1 GPU memory used : ", torch.cuda.memory_allocated(local_rank))
 model = model.to(local_rank)

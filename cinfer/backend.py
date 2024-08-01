@@ -153,12 +153,14 @@ class Backend:
         if (args.quant == "None"):
             model = model.to(torch.bfloat16)
             torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
-        if (args.quant == "awq") or (args.quant == "llmint8"):
+        if (args.quant == "awq") or (args.quant == "llmint8") or (args.quant == "gptq"):
             torch.set_default_tensor_type(torch.cuda.HalfTensor)
             model = model.to(torch.float16)
         if (args.quant == "awq"):
             quant(model, method="awq", name="qwen")
-        print(model)
+        elif (args.quant == "gptq"):
+            quant(model, method="gptq", name="qwen")
+        #print(model)
 
         # Init model parameters
         if args.infer.do_load:
@@ -183,6 +185,18 @@ class Backend:
                             s = s.replace(p[0], p[1], 1)
                         return s
                     checkpoint = dict((rep(k), v) for k, v in params.items())
+                elif args.quant == "gptq":
+                    params = AutoModelForCausalLM.from_pretrained(
+                        args.quant_ckpt_dir, torch_dtype="auto", device_map="cpu"
+                    ).state_dict()
+
+                    def transform_key(key):
+                        if key.startswith("model."):
+                            return key[len("model.") :]
+                        return key
+
+                    checkpoint = dict((transform_key(k), v) for k, v in params.items())
+                    #print(checkpoint.keys())
                 else:
                     params = AutoModelForCausalLM.from_pretrained(
                         args.models.ckpt_dir, torch_dtype="auto", device_map="cpu"
@@ -220,6 +234,7 @@ class Backend:
         if args.quant == "llmint8":
             quant(model, "llmint8", "qwen")
         model = model.to(local_rank)
+        print(model)
         Backend.model = model
 
         Backend.args = args
