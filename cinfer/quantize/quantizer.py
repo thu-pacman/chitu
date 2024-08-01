@@ -153,5 +153,6 @@ def quant(model, method=None, name="qwen"):
         return quantize_awq(model, name)
     elif method == "gptq":
         return quantize_gptq(model)
-        
+    elif method == "w8a16":
+        return quantize_a8a16(model)        
     return model
