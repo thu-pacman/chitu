@@ -141,7 +141,7 @@ def main(args: DictConfig):
 
     cinfer_init(args)
     logger.warning(f"finish init")
-    if args.infer.parallel_type == "pipe":
+    if args.infer.parallel_type == "pipe" or args.infer.parallel_type == "tensor":
         run_pipe(args, timers)
     else:
         run_normal(args, timers)

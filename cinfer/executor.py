@@ -1,5 +1,6 @@
 import torch
 import torch.distributed
+import numpy as np
 from .task import (
     PackedTasks,
     TaskType,
@@ -28,6 +29,8 @@ class Executor:
     def build(args):
         if args.infer.parallel_type == "pipe":
             return PipeExecutor(args)
+        elif args.infer.parallel_type == "tensor":
+            return TensorExecutor(args)
         else:
             return NormalExecutor(args)
 
@@ -260,3 +263,92 @@ class PipeExecutor(NormalExecutor):
         # Rank 0 recv final logits from Rank world_size - 1
         if self.rank == 0:
             self._recv_logits(tasks, new_decode_tasks)
+
+
+class TensorExecutor(NormalExecutor):
+    def __init__(self, args):
+        super().__init__(args)
+        self.rank = torch.distributed.get_rank()
+        self.world_size = torch.distributed.get_world_size()
+
+    def prefill_step(self, tasks, tokens):
+        varlens = VarLens(tasks.tokens, self.rank)
+        self.timers("prefill").start()
+        Backend.cache_manager.curr_varlens = varlens
+        Backend.cache_manager.curr_req_ids = tasks.req_ids
+        logits = Backend.model.prefill(tokens, varlens=varlens)
+        self.timers("prefill").stop()
+        if self.rank == 0:
+            new_tasks = []
+            start = 0
+            for it in range(tasks.num_tasks):
+                start += varlens.cpu_lens[it]
+                tasks.tasks[it].update_response(logits[it])
+                new_tasks.append(
+                    DecodeTask(
+                        self._prefill2decode(tasks.task_ids[it]),
+                        tasks.tasks[it].req,
+                        tasks.tasks[it],
+                        tasks.tasks[it].next_token,
+                    )
+                )
+        Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
+        return logits
+
+    def decode_step(self, tasks, tokens):
+        Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
+        Backend.cache_manager.curr_req_ids = tasks.req_ids
+        # logger.info(f"Decode step: {tasks.task_ids}")
+        self.timers("decode").start()
+        seq_lens = self._prepare_seq_lens_for_decode(tasks)
+        self.timers("decode-model").start()
+        logits = Backend.model.decode(tokens, seq_lens)
+        self.timers("decode-model").stop()
+        self.timers("decode").stop()
+        if self.rank == 0:
+            for it, task in enumerate(tasks.tasks):
+                task.update_response(logits[it])
+        Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
+        return logits
+
+
+    def step(self, tasks: PackedTasks = None):
+        task_tensor = (
+            tasks.task_tensor
+            if self.rank == 0
+            else torch.empty(
+                PackedTasks.max_num_tasks * 2, dtype=torch.int64, device=self.rank
+            )
+        )
+        torch.distributed.broadcast(tensor=task_tensor, src=0)
+
+        if self.rank != 0:
+            tasks = PackedTasks(None, self.rank, task_tensor)
+
+        if tasks.task_type == TaskType.Prefill:
+            if self.rank == 0:
+                tokens = torch.from_numpy(np.concatenate(tasks.tokens)).to(self.rank)
+            else:
+                tokens = torch.empty(
+                    [sum(len(seq) for seq in tasks.tokens)],
+                    dtype=torch.int64,
+                    device=self.rank,
+                )
+            torch.distributed.broadcast(tensor=tokens, src=0)
+            return self.prefill_step(tasks, tokens)
+        elif tasks.task_type == TaskType.Decode:
+            if self.rank == 0:
+                new_tokens = []
+                for task in tasks.tasks:
+                    new_tokens.append(task.next_token)
+                new_tokens = torch.tensor(
+                    new_tokens, dtype=torch.int64, device=self.rank
+                ).unsqueeze(1)
+            else:
+                new_tokens = torch.empty(
+                    [tasks.num_tasks, 1], dtype=torch.int64, device=self.rank
+                )
+            torch.distributed.broadcast(tensor=new_tokens, src=0)
+            return self.decode_step(tasks, new_tokens)
+        else:
+            raise NotImplementedError  # Hybrid task not implemented

@@ -57,7 +57,5 @@ curl localhost:21002/v1/chat/completions   -H "Content-Type: application/json"  
 # test stream response
 # 1. start serve at localhost:2512, avoid port conflict.
 grun torchrun --nproc_per_node 1 --master_port=12513 example/serve.py serve.port=2512
-# 2. send stream type request
-# "python test/chat_completions_req.py" for stream response, "python test/chat_completions_req.py 1" for non-stream
 python test/chat_completions_req.py
 ```
