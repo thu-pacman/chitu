@@ -13,3 +13,4 @@ packaging
 wheel
 cmake
 cython
+tqdm

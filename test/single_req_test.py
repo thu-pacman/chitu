@@ -133,7 +133,7 @@ def run_normal(args, timers):
 
 
 @hydra.main(
-    version_base=None, config_path="../example/configs", config_name="serve_config"
+    version_base=None, config_path="../example/configs", config_name="serve_config_w8a16"
 )
 def main(args: DictConfig):
     root_logger = logging.getLogger()

@@ -1,0 +1,40 @@
+defaults:
+  # - models: qwen2-70b
+  - models: qwen2-7b
+  # - models: llama3-8b
+serve:
+  host: 0.0.0.0
+  port: 21002
+infer:
+  parallel_type: normal
+  do_load: True # set it to False for debug purpose
+  seed: 0
+  stop_with_eos: True
+  max_seq_len: 4096 # length of prefill + decode
+  cache_type: paged
+  max_reqs: 64
+request:
+  max_new_tokens: 128
+scheduler:
+  type: prefill_first
+  fcfs:
+    num_tasks: 16
+    enable_hybrid: False
+  prefill_first:
+    num_tasks: 64
+    enable_hybrid: False
+  stride:
+    num_tasks: 2
+    enable_hybrid: False
+  deadline:
+    num_tasks: 2
+    enable_hybrid: False
+  prefix_align:
+    num_tasks: 2
+    enable_hybrid: False
+  balance:
+    num_tasks: 2
+    enable_hybrid: False
+quant: w8a16
+quant_ckpt_dir: /home/cyd/models/Qwen2-7B-Instruct-w8a16
+dtype: int8

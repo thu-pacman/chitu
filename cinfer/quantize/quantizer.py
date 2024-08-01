@@ -6,7 +6,7 @@ import bitsandbytes as bnb
 from cinfer.model import *
 
 from cinfer.tokenizer import Tokenizer, ChatFormat
-import cinfer.awq as awq
+#import cinfer.awq as awq
 
 from fairscale.nn.model_parallel.layers import (
     ColumnParallelLinear,
@@ -89,6 +89,35 @@ def replace_with_gptq(model, current_key_name=None):
 
 
 
+def replace_with_w8a16(model, current_key_name=None):
+     
+    has_been_replaced = False
+    for name, module in model.named_children():
+        #print(name)
+        if current_key_name is None:
+            current_key_name = []
+            
+        current_key_name.append(name)
+        current_key_name_str = ".".join(current_key_name)
+        #print(name)
+        if name != "lm_head":
+            if isinstance(module, (torch.nn.Linear, ColumnParallelLinear, RowParallelLinear)):
+                from cinfer.quantize.w8a16 import WeightOnlyLinear
+                w8a16_linear = WeightOnlyLinear(
+                    module.in_features,
+                    module.out_features,
+                    module.bias is not None
+                )
+                w8a16_linear.requires_grad_(False)
+                setattr(model, name, w8a16_linear)
+                has_been_replaced = True
+            if len(list(module.children())) > 0:
+                _, _has_been_replaced = replace_with_w8a16(module, current_key_name)
+                has_been_replaced = has_been_replaced | _has_been_replaced
+        
+        current_key_name.pop(-1)
+    return model, has_been_replaced
+
 
 def quantize_llmint8(model):
     model, has_been_replaced = replace_with_bnb(model)
@@ -143,6 +172,15 @@ def quantize_awq(model, name="qwen"):
 
     return model
 
+def quantize_w8a16(model):
+    model, has_been_replaced = replace_with_w8a16(model)
+
+    if not has_been_replaced:
+        raise NotImplementedError("error load model")
+
+    print(model)
+    return model
+
 def quant(model, method=None, name="qwen"):
 
 
@@ -154,5 +192,5 @@ def quant(model, method=None, name="qwen"):
     elif method == "gptq":
         return quantize_gptq(model)
     elif method == "w8a16":
-        return quantize_a8a16(model)        
+        return quantize_w8a16(model)        
     return model
