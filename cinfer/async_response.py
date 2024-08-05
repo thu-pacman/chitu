@@ -87,7 +87,9 @@ class AsyncResponse:
             )
             data = chunk.model_dump_json(exclude_none=True)
             yield f"data: {data}\n\n"
-            logger.info(f"Task_{self.id}, {self.async_stream.seqs} [DONE]")
+            logger.info(
+                f"Completed_{self.id}: {self.req.output}, token_len: {self.async_stream.tokens_len}\n"
+            )
             yield "data: [DONE]\n\n"
 
         return stream_response()
