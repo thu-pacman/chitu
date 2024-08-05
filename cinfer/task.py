@@ -20,6 +20,7 @@ class UserRequest:
         self.max_new_tokens = max_new_tokens
         self.async_stream = AsyncDataStream()
         self.output = ""
+        self.finish_reason = None
 
     def add_data(self, data):
         self.async_stream.add_data(data)
@@ -127,7 +128,7 @@ class PrefillTask(Task):
         self.req.prompt_len = len(self.tokens)
         self.prefix_length = self.req.prompt_len
         logger.info(
-            f"Prefill_{req.request_id}: {message}, seq_len: {self.req.prompt_len}, max_seq_len: {max_seq_len}\n"
+            f"Prefill_{req.request_id}: {message}, seq_len: {self.req.prompt_len}, max_seq_len: {max_seq_len}, max_new_tokens:[{self.req.max_new_tokens}] ==> [{min(self.req.max_new_tokens, max_seq_len - self.req.prompt_len)}]\n"
         )
         if self.req.prompt_len >= max_seq_len:
             logger.warning(
@@ -192,14 +193,16 @@ class DecodeTask(Task):
 
     def need_remove(self):
         if Backend.args.infer.stop_with_eos:
-            return (
+            if (
                 len(self.response) > 0
-                and (
-                    torch.isin(self.response[-1], Backend.tokenizer.stop_tokens)
-                    or len(self.response) >= self.req.max_new_tokens
-                )
-            ) and not self.waiting
-        return len(self.response) >= self.req.max_new_tokens and not self.waiting
+                and torch.isin(self.response[-1], Backend.tokenizer.stop_tokens)
+            ) and not self.waiting:
+                self.req.finish_reason = "stop"
+                return True
+        if len(self.response) >= self.req.max_new_tokens and not self.waiting:
+            self.req.finish_reason = "length"
+            return True
+        return False
 
 
 def taskid2reqid(task_id):
