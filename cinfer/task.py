@@ -2,6 +2,7 @@ import torch
 from enum import Enum
 import asyncio
 import time
+import threading
 from .backend import Backend
 from .async_response import AsyncDataStream, AsyncResponse
 import os
@@ -9,6 +10,31 @@ import os
 from logging import getLogger
 
 logger = getLogger(__name__)
+
+
+class TaskLoad:
+    _load_score = 0
+    _lock = threading.Lock()
+
+    @classmethod
+    def get_load(cls):
+        with cls._lock:
+            return cls._load_score
+
+    @classmethod
+    def increase(cls, score: int):
+        with cls._lock:
+            cls._load_score += score
+
+    @classmethod
+    def reduce(cls, score: int):
+        with cls._lock:
+            cls._load_score -= score
+
+    @classmethod
+    def clear(cls):
+        with cls._lock:
+            cls._load_score = 0
 
 
 class UserRequest:
@@ -51,11 +77,14 @@ class TaskPool:
             )
             TaskPool.pool[task_id].req.async_stream.send_stop_signal()
             TaskPool.pool[task_id].req.completed.set()
+            TaskLoad.reduce(TaskPool.pool[task_id].prefix_length)
             Backend.cache_manager.finalize_cache_all_decode(
                 TaskPool.pool[task_id].req.request_id
             )
         ret = TaskPool.pool.pop(task_id)
         TaskPool.id_list.remove(task_id)
+        if len(TaskPool.pool) == 0:
+            TaskLoad.clear()
         if ret is None:
             return False  # Task not found, failed to remove
         return True
@@ -135,6 +164,7 @@ class PrefillTask(Task):
                 f"prompt length({self.prefix_length}) is greater than max_seq_len({max_seq_len})"
             )
             raise ValueError("length error")
+        TaskLoad.increase(self.req.prompt_len)
         self.req.max_new_tokens = min(
             self.req.max_new_tokens, max_seq_len - self.req.prompt_len
         )
@@ -189,6 +219,7 @@ class DecodeTask(Task):
         self.prefix_length += 1
         self.max_output_tokens -= 1
         self.req.add_data(self.next_token)
+        TaskLoad.increase(1)
         # logger.warning(f"decode token {(Backend.tokenizer.decode([self.next_token]))}")
 
     def need_remove(self):
