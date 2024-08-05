@@ -16,7 +16,7 @@ import random
 from cinfer.global_vars import set_global_variables
 
 from cinfer.backend import Backend
-from cinfer.task import UserRequest, TaskPool, PrefillTask
+from cinfer.task import UserRequest, TaskPool, PrefillTask, TaskLoad
 from cinfer.cinfer_main import cinfer_init, cinfer_run
 from cinfer.async_response import AsyncResponse, AsyncDataStream
 
@@ -114,7 +114,7 @@ async def get_cinfer_status():
 
 @app.post("/load_status")
 async def get_cinfer_load_status():
-    pass
+    return {"message": f"{TaskLoad.get_load()}"}
 
 
 @app.post("/ping")
@@ -129,7 +129,7 @@ async def health():
 
 class IgnoreSpecificPathFilter(logging.Filter):
     def filter(self, record):
-        if "POST /ping" in record.getMessage():
+        if "/ping" in record.getMessage() or "/load_status" in record.getMessage():
             return False
         return True
 
