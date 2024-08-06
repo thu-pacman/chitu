@@ -57,15 +57,15 @@ class UserRequest:
 class TaskPool:
     pool = {}
     id_list = []
-    total_reqs = []
+    # total_reqs = []
 
     def add(task):
         if task.task_id in TaskPool.pool:
             return False  # Task already exists, failed to add
         TaskPool.pool[task.task_id] = task
         TaskPool.id_list.append(task.task_id)
-        if task.req not in TaskPool.total_reqs:
-            TaskPool.total_reqs.append(task.req)
+        # if task.req not in TaskPool.total_reqs:
+        #     TaskPool.total_reqs.append(task.req)
         return True
 
     def remove(task_id):
@@ -157,7 +157,7 @@ class PrefillTask(Task):
         self.req.prompt_len = len(self.tokens)
         self.prefix_length = self.req.prompt_len
         logger.info(
-            f"Prefill_{req.request_id}: {message}, seq_len: {self.req.prompt_len}, max_seq_len: {max_seq_len}, max_new_tokens:[{self.req.max_new_tokens}] ==> [{min(self.req.max_new_tokens, max_seq_len - self.req.prompt_len)}]\n"
+            f"Prefill_{req.request_id}: {message}\nseq_len: {self.req.prompt_len}, max_seq_len: {max_seq_len}, max_new_tokens:[{self.req.max_new_tokens}] ==> [{min(self.req.max_new_tokens, max_seq_len - self.req.prompt_len)}]\n"
         )
         if self.req.prompt_len >= max_seq_len:
             logger.warning(

@@ -10,7 +10,7 @@ infer:
   do_load: True # set it to False for debug purpose
   seed: 0
   stop_with_eos: True
-  max_seq_len: 4096 # length of prefill + decode
+  max_seq_len: 10240 # length of prefill + decode
   cache_type: paged
   attn_type: flash # flash or ref
   max_reqs: 8

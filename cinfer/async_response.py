@@ -111,7 +111,6 @@ class AsyncResponse:
         async for data in self.async_stream:
             text += data
 
-        # TODO add "usage": {"prompt_tokens":,"total_tokens":,"completion_tokens:"}
         full_response = ChatCompletionResponse(
             id=self.id,
             choices=[
@@ -122,5 +121,8 @@ class AsyncResponse:
                 "completion_tokens": f"{self.async_stream.tokens_len}",
                 "total_tokens": f"{self.async_stream.tokens_len + self.req.prompt_len}",
             },
+        )
+        logger.info(
+            f"Completed_{self.id}: {self.req.output}, token_len: {self.async_stream.tokens_len}\n"
         )
         return full_response

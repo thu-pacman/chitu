@@ -54,11 +54,10 @@ class AttentionQwen(Attention):
             input_is_parallel=True,
             init_method=lambda x: x,
         )
-
         self.rotary_emb = Qwen2RotaryEmbedding(
             self.head_dim,
-            max_position_embeddings=2048,
-            base=10000.0,
+            max_position_embeddings=args.max_position_embeddings,
+            base=args.rope_theta,
         )
 
     def _run_linear(self, x):
