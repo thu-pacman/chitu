@@ -11,7 +11,7 @@ infer:
   seed: 0
   stop_with_eos: True
   max_seq_len: 10240 # length of prefill + decode
-  cache_type: paged
+  cache_type: skew
   attn_type: flash # flash or ref
   max_reqs: 8
 request:

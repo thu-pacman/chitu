@@ -54,6 +54,10 @@ async def create_chat_completion(request: ChatRequest):
     global server_status
     if not server_status:
         return {"message": "Service is not started"}
+    if global_args.infer.cache_type == "skew" and len(TaskLoad.user_req) >= global_args.infer.max_reqs:
+        raise HTTPException(
+            status_code=403, detail="exceeding server processing capacity"
+        )
     params = request.dict()
     # req_id = params.pop("conversation_id")
     req_id = gen_req_id()

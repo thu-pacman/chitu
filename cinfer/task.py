@@ -6,6 +6,7 @@ import threading
 from .backend import Backend
 from .async_response import AsyncDataStream, AsyncResponse
 import os
+import weakref
 
 from logging import getLogger
 
@@ -15,6 +16,7 @@ logger = getLogger(__name__)
 class TaskLoad:
     _load_score = 0
     _lock = threading.Lock()
+    user_req = weakref.WeakSet()
 
     @classmethod
     def get_load(cls):
@@ -47,6 +49,7 @@ class UserRequest:
         self.async_stream = AsyncDataStream()
         self.output = ""
         self.finish_reason = None
+        TaskLoad.user_req.add(self)
 
     def add_data(self, data):
         self.async_stream.add_data(data)
@@ -81,6 +84,24 @@ class TaskPool:
             Backend.cache_manager.finalize_cache_all_decode(
                 TaskPool.pool[task_id].req.request_id
             )
+            if Backend.args.infer.cache_type == "skew":
+                # adjust decode_task order to adapt skew kv-cache
+                remove_index = TaskPool.id_list.index(task_id)
+                for decode_id in reversed(TaskPool.id_list):
+                    if (
+                        TaskPool.pool[decode_id].task_type == TaskType.Decode
+                        and decode_id != task_id
+                    ):
+                        decode_index = TaskPool.id_list.index(decode_id)
+                        (
+                            TaskPool.id_list[remove_index],
+                            TaskPool.id_list[decode_index],
+                        ) = (
+                            TaskPool.id_list[decode_index],
+                            TaskPool.id_list[remove_index],
+                        )
+                        break
+
         ret = TaskPool.pool.pop(task_id)
         TaskPool.id_list.remove(task_id)
         if len(TaskPool.pool) == 0:
