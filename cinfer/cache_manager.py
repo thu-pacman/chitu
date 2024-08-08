@@ -9,9 +9,6 @@ from .ops import move_data
 logger = getLogger(__name__)
 _BLOCK_SIZE = 512  # _BLOCK_SIZE must be a multiple of 256 for FlashAttention
 _MAX_SEQ_LEN = 2048
-_MAX_NUM_BLOCKS_PER_LAYER = (
-    _MAX_SEQ_LEN // _BLOCK_SIZE
-) * 16  # TODO: make  this dynamic
 
 
 class PagedKVCacheManager:
@@ -20,12 +17,14 @@ class PagedKVCacheManager:
         num_layers,
         n_local_kv_heads,
         head_dim,
+        num_hot_req=16,
         block_size=_BLOCK_SIZE,
         max_seq_len=_MAX_SEQ_LEN,
-        num_blocks_per_layer=_MAX_NUM_BLOCKS_PER_LAYER,
         device="cuda",
     ):
         print("Init PagedKVCacheManager")
+
+        num_blocks_per_layer = (_MAX_SEQ_LEN // _BLOCK_SIZE) * num_hot_req
 
         self.num_layers = num_layers
         self.n_local_kv_heads = n_local_kv_heads
