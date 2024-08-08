@@ -2,6 +2,7 @@ import torch
 from enum import Enum
 import asyncio
 import time
+import threading
 from .backend import Backend
 from .async_response import AsyncDataStream, AsyncResponse
 import os
@@ -9,6 +10,31 @@ import os
 from logging import getLogger
 
 logger = getLogger(__name__)
+
+
+class TaskLoad:
+    _load_score = 0
+    _lock = threading.Lock()
+
+    @classmethod
+    def get_load(cls):
+        with cls._lock:
+            return cls._load_score
+
+    @classmethod
+    def increase(cls, score: int):
+        with cls._lock:
+            cls._load_score += score
+
+    @classmethod
+    def reduce(cls, score: int):
+        with cls._lock:
+            cls._load_score -= score
+
+    @classmethod
+    def clear(cls):
+        with cls._lock:
+            cls._load_score = 0
 
 
 class UserRequest:
@@ -20,6 +46,7 @@ class UserRequest:
         self.max_new_tokens = max_new_tokens
         self.async_stream = AsyncDataStream()
         self.output = ""
+        self.finish_reason = None
 
     def add_data(self, data):
         self.async_stream.add_data(data)
@@ -45,16 +72,19 @@ class TaskPool:
         assert task_id in TaskPool.pool, "Task not found in pool"
         # logger.warning(f"finish {task_id} cuda memory {torch.cuda.memory_allocated()}")
         if isinstance(TaskPool.pool[task_id], DecodeTask):
-            TaskPool.pool[task_id].req.output = "".join(
-                TaskPool.pool[task_id].req.async_stream.seqs
-            ).replace("\n", "")
+            TaskPool.pool[task_id].req.output = repr(
+                "".join(TaskPool.pool[task_id].req.async_stream.seqs)
+            )
             TaskPool.pool[task_id].req.async_stream.send_stop_signal()
             TaskPool.pool[task_id].req.completed.set()
+            TaskLoad.reduce(TaskPool.pool[task_id].prefix_length)
             Backend.cache_manager.finalize_cache_all_decode(
                 TaskPool.pool[task_id].req.request_id
             )
         ret = TaskPool.pool.pop(task_id)
         TaskPool.id_list.remove(task_id)
+        if len(TaskPool.pool) == 0:
+            TaskLoad.clear()
         if ret is None:
             return False  # Task not found, failed to remove
         return True
@@ -109,17 +139,35 @@ class Task:
 
 
 class PrefillTask(Task):
-    def __init__(self, task_id: str, req: UserRequest, message, priority: int = 1):
+    def __init__(
+        self,
+        task_id: str,
+        req: UserRequest,
+        message,
+        priority: int = 1,
+        max_seq_len: int = 1024,
+    ):
         super().__init__(task_id, req, priority)
         self.message = message
-        logger.info(f"Prefill task: {message}")
         if isinstance(message, str):
             self.tokens = Backend.tokenizer.encode(message, bos=True, eos=False)
         else:
             self.tokens = Backend.formatter.encode_dialog_prompt(message)
         self.task_type = TaskType.Prefill
-        self.prefix_length = len(self.tokens)
         self.req.prompt_len = len(self.tokens)
+        self.prefix_length = self.req.prompt_len
+        logger.info(
+            f"Prefill_{req.request_id}: {message}, seq_len: {self.req.prompt_len}, max_seq_len: {max_seq_len}, max_new_tokens:[{self.req.max_new_tokens}] ==> [{min(self.req.max_new_tokens, max_seq_len - self.req.prompt_len)}]\n"
+        )
+        if self.req.prompt_len >= max_seq_len:
+            logger.warning(
+                f"prompt length({self.prefix_length}) is greater than max_seq_len({max_seq_len})"
+            )
+            raise ValueError("length error")
+        TaskLoad.increase(self.req.prompt_len)
+        self.req.max_new_tokens = min(
+            self.req.max_new_tokens, max_seq_len - self.req.prompt_len
+        )
         self.max_output_tokens = 1024  # TODO: replace hardcode by parameter
         self.sched_ddl = (
             time.perf_counter_ns()
@@ -171,18 +219,21 @@ class DecodeTask(Task):
         self.prefix_length += 1
         self.max_output_tokens -= 1
         self.req.add_data(self.next_token)
+        TaskLoad.increase(1)
         # logger.warning(f"decode token {(Backend.tokenizer.decode([self.next_token]))}")
 
     def need_remove(self):
         if Backend.args.infer.stop_with_eos:
-            return (
+            if (
                 len(self.response) > 0
-                and (
-                    torch.isin(self.response[-1], Backend.tokenizer.stop_tokens)
-                    or len(self.response) >= self.req.max_new_tokens
-                )
-            ) and not self.waiting
-        return len(self.response) >= self.req.max_new_tokens and not self.waiting
+                and torch.isin(self.response[-1], Backend.tokenizer.stop_tokens)
+            ) and not self.waiting:
+                self.req.finish_reason = "stop"
+                return True
+        if len(self.response) >= self.req.max_new_tokens and not self.waiting:
+            self.req.finish_reason = "length"
+            return True
+        return False
 
 
 def taskid2reqid(task_id):

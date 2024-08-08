@@ -15,16 +15,13 @@ from .cache_manager import (
     PagedKVCacheManager,
     KVCacheManagerNop,
 )
+from .attn_backend import FlashAttnBackend, RefAttnBackend
 from .model_llama import TransformerLlama
 from .model_qwen import TransformerQwen
 from .utils import load_pipe, load_tensor_parallel
 import fairscale.nn.model_parallel.initialize as fs_init
 
 from logging import getLogger
-
-
-from cinfer.quantize import quant
-
 
 logger = getLogger(__name__)
 
@@ -137,6 +134,12 @@ class Backend:
         else:
             assert False, f"Unknown cache type {args.infer.cache_type}"
         Backend.cache_type = args.infer.cache_type
+        if args.infer.attn_type == "flash":
+            attn_backend = FlashAttnBackend()
+        elif args.infer.attn_type == "ref":
+            attn_backend = RefAttnBackend()
+        else:
+            assert False, f"Unknown attn type {args.infer.attn_type}"
 
         # Init model
         model = Backend.build_model(
@@ -144,6 +147,7 @@ class Backend:
             Backend.cache_manager,
             pipeline_parallel_size,
             model_parallel_size,
+            attn_backend,
         )
         if torch.cuda.is_bf16_supported():
             torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)

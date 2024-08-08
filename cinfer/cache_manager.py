@@ -160,13 +160,8 @@ class PagedKVCacheManager:
         self.timers("get_gpu_block_table").stop()
         return output
 
-    def get_gpu_seq_lens(self, req_ids):
-        # logger.warning(f"get_gpu_seq_lens : {[self.seq_lens[req_id] for req_id in req_ids]}")
-        return torch.tensor(
-            [self.seq_lens[req_id] for req_id in req_ids],
-            dtype=torch.int32,
-            device=self.device,
-        )
+    def get_gpu_seq_lens(self):
+        return self.curr_seq_lens_gpu
 
     def get_paged_kv_cache(self):
         return self.paged_k_cache, self.paged_v_cache
@@ -302,6 +297,16 @@ class KVCacheManager:
             output[0][it][self.curr_seq_lens[it]] = xk[it]
             output[1][it][self.curr_seq_lens[it]] = xv[it]
         return output
+
+    # Decode:
+    # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
+    def get_cache_decode(self, layer_id):
+        return self.prepared_cache[layer_id]
+
+    # Decode:
+    # return [# of current req_ids]
+    def get_gpu_seq_lens(self):
+        return self.curr_seq_lens_gpu
 
     # Decode:
     # return for every req [layer, seq + 1, n_local_kv_heads, head_dim] * 2 (for k and v)
@@ -506,6 +511,16 @@ class KVCacheManagerSkewAware:
         return output
 
     # Decode:
+    # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
+    def get_cache_decode(self, layer_id):
+        return self.prepared_cache[layer_id]
+
+    # Decode:
+    # return [# of current req_ids]
+    def get_gpu_seq_lens(self):
+        return self.curr_seq_lens_gpu
+
+    # Decode:
     def finalize_cache_single_decode(self, req_ids):
         for item in req_ids:
             self.seq_lens[item] += 1
@@ -574,6 +589,16 @@ class KVCacheManagerNop:
     # Decode:
     # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
     def update_cache_decode(self, xk, xv):
+        pass
+
+    # Decode:
+    # return [# of current req_ids]
+    def get_gpu_seq_lens(self):
+        pass
+
+    # Decode:
+    # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
+    def get_cache_decode(self, layer_id):
         pass
 
     # Decode:

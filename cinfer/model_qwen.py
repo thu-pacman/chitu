@@ -10,7 +10,6 @@ from fairscale.nn.model_parallel.layers import (
     VocabParallelEmbedding,
 )
 import flash_attn
-from xformers.ops import fmha
 from logging import getLogger
 
 from .ops import apply_rotary_pos_emb_triton
@@ -19,8 +18,8 @@ logger = getLogger(__name__)
 
 
 class AttentionQwen(Attention):
-    def __init__(self, args, layer_id, cache):
-        super().__init__(layer_id, cache)
+    def __init__(self, args, layer_id, cache, attn_backend):
+        super().__init__(layer_id, cache, attn_backend)
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         model_parallel_size = fs_init.get_model_parallel_world_size()
         self.n_local_heads = args.n_heads // model_parallel_size
@@ -93,7 +92,7 @@ class AttentionQwen(Attention):
         self.cache.finalize_cache_bylayer_prefill(
             xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
         )
-        output = flash_attn.flash_attn_varlen_func(
+        output = self.attn_backend.attn_varlen_func(
             xq,
             xk,
             xv,
@@ -122,7 +121,7 @@ class AttentionQwen(Attention):
             xk,
             cos,
             sin,
-            position_ids=self.cache.curr_seq_lens_gpu,
+            position_ids=self.cache.get_gpu_seq_lens(),
         )
         # logger.warning(f"cos shape {cos.shape} {self.cache.curr_seq_lens} {cos.dtype}")
         # torch.cuda.synchronize()
@@ -131,24 +130,18 @@ class AttentionQwen(Attention):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        cache = self.cache.update_cache_decode(xk, xv, self.layer_id)
+        cache = self.cache.get_cache_decode(self.layer_id)
         cache_k = cache[0]
         cache_v = cache[1]
-        max_seq_len = cache.shape[2]
-
-        if self.n_local_heads != self.n_local_kv_heads:
-            group_size = self.n_local_heads // self.n_local_kv_heads
-            assert group_size > 1
-            xq = xq.view(bsz, seqlen, self.n_local_kv_heads, group_size, self.head_dim)
-            cache_k = cache_k.view(
-                bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
-            ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
-            cache_v = cache_v.view(
-                bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
-            ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
-        output = fmha.memory_efficient_attention_forward(xq, cache_k, cache_v).view(
-            bsz, seqlen, -1
-        )
+        cache_seqlens = self.cache.get_gpu_seq_lens()
+        output = self.attn_backend.attn_with_kvcache(
+            xq,
+            cache_k,
+            cache_v,
+            xk,
+            xv,
+            cache_seqlens=cache_seqlens,
+        ).view(bsz, seqlen, -1)
         return self._run_output_linear(output)
 
     def decode_forward_paged(self, x: torch.Tensor, freqs_cis: torch.Tensor):
@@ -166,7 +159,7 @@ class AttentionQwen(Attention):
             xk,
             cos,
             sin,
-            position_ids=self.cache.curr_seq_lens_gpu,
+            position_ids=self.cache.get_gpu_seq_lens(),
         )
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
@@ -179,9 +172,9 @@ class AttentionQwen(Attention):
         block_table = self.cache.get_gpu_block_table(
             self.cache.curr_req_ids, self.layer_id
         )
-        cache_seqlens = self.cache.get_gpu_seq_lens(self.cache.curr_req_ids)
+        cache_seqlens = self.cache.get_gpu_seq_lens()
         paged_k_cache, paged_v_cache = self.cache.get_paged_kv_cache()
-        output = flash_attn.flash_attn_with_kvcache(
+        output = self.attn_backend.attn_with_kvcache(
             xq,
             paged_k_cache,
             paged_v_cache,
@@ -211,9 +204,9 @@ class FeedForwardQwen(nn.Module):
 
 
 class TransformerBlockQwen(TransformerBlock):
-    def __init__(self, layer_id: int, args, cache):
-        super().__init__(layer_id, args)
-        self.self_attn = AttentionQwen(args, layer_id, cache)
+    def __init__(self, layer_id: int, args, cache, attn_backend):
+        super().__init__(layer_id, args, cache, attn_backend)
+        self.self_attn = AttentionQwen(args, layer_id, cache, attn_backend)
         self.mlp = FeedForwardQwen(dim=args.dim, hidden_dim=args.intermediate_dim)
         self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
         self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -227,18 +220,24 @@ class TransformerBlockQwen(TransformerBlock):
 
 
 class TransformerQwen(Transformer):
-    def __init__(self, params, cache, pipeline_parallel_size, model_parallel_size):
-        super().__init__(params, cache, pipeline_parallel_size, model_parallel_size)
+    def __init__(
+        self, params, cache, pipeline_parallel_size, model_parallel_size, attn_backend
+    ):
+        super().__init__(
+            params, cache, pipeline_parallel_size, model_parallel_size, attn_backend
+        )
 
     def _init_pre_layers(self):
         self.embed_tokens = VocabParallelEmbedding(
             self.params.vocab_size, self.params.dim, init_method=lambda x: x
         )
 
-    def _init_layers(self, cache):
+    def _init_layers(self, cache, attn_backend):
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.n_layers):
-            self.layers.append(TransformerBlockQwen(layer_id, self.params, cache))
+            self.layers.append(
+                TransformerBlockQwen(layer_id, self.params, cache, attn_backend)
+            )
 
     def _init_post_layers(self):
         self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps)
@@ -250,6 +249,7 @@ class TransformerQwen(Transformer):
         return self.embed_tokens(h)
 
     def _post_layers(self, h):
+        """NOTE: _post_layers is assumed to be a token-wise computation"""
         h = self.norm(h)
         h = self.lm_head(h)
         return h

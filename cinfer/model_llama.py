@@ -12,8 +12,8 @@ from fairscale.nn.model_parallel.layers import (
 
 
 class AttentionLlama(Attention):
-    def __init__(self, args, layer_id, cache):
-        super().__init__(layer_id, cache)
+    def __init__(self, args, layer_id, cache, attn_backend):
+        super().__init__(layer_id, cache, attn_backend)
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         model_parallel_size = fs_init.get_model_parallel_world_size()
         self.n_local_heads = args.n_heads // model_parallel_size
@@ -58,18 +58,24 @@ class AttentionLlama(Attention):
 
 
 class TransformerLlama(Transformer):
-    def __init__(self, params, cache, pipeline_parallel_size, model_parallel_size):
-        super().__init__(params, cache, pipeline_parallel_size, model_parallel_size)
+    def __init__(
+        self, params, cache, pipeline_parallel_size, model_parallel_size, attn_backend
+    ):
+        super().__init__(
+            params, cache, pipeline_parallel_size, model_parallel_size, attn_backend
+        )
 
     def _init_pre_layers(self):
         self.tok_embeddings = VocabParallelEmbedding(
             self.params.vocab_size, self.params.dim, init_method=lambda x: x
         )
 
-    def _init_layers(self, cache):
+    def _init_layers(self, cache, attn_backend):
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.n_layers):
-            self.layers.append(TransformerBlockLlama(layer_id, self.params, cache))
+            self.layers.append(
+                TransformerBlockLlama(layer_id, self.params, cache, attn_backend)
+            )
 
     def _init_post_layers(self):
         self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps)
@@ -81,6 +87,7 @@ class TransformerLlama(Transformer):
         return self.tok_embeddings(h)
 
     def _post_layers(self, h):
+        """NOTE: _post_layers is assumed to be a token-wise computation"""
         h = self.norm(h)
         h = self.output(h)
         return h
@@ -116,9 +123,9 @@ class FeedForwardLlama(nn.Module):
 
 
 class TransformerBlockLlama(TransformerBlock):
-    def __init__(self, layer_id: int, args, cache):
-        super().__init__(layer_id, args)
-        self.attention = AttentionLlama(args, layer_id, cache)
+    def __init__(self, layer_id: int, args, cache, attn_backend):
+        super().__init__(layer_id, args, cache, attn_backend)
+        self.attention = AttentionLlama(args, layer_id, cache, attn_backend)
         self.feed_forward = FeedForwardLlama(
             dim=args.dim,
             hidden_dim=4 * args.dim,

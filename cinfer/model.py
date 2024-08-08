@@ -21,7 +21,6 @@ import numpy as np
 
 # from vllm import _custom_ops as vllm_ops
 # import cinfer_backend
-import flash_attn
 
 from fairscale.nn.model_parallel.initialize import (
     initialize_model_parallel,
@@ -30,9 +29,6 @@ from fairscale.nn.model_parallel.initialize import (
 from .tokenizer import Tokenizer, ChatFormat, TokenizerHF, ChatFormatHF
 from pathlib import Path
 import os, sys, json, time
-
-from xformers.ops import fmha
-
 
 from logging import getLogger
 
@@ -96,10 +92,11 @@ def apply_rotary_emb(
 
 
 class Attention(nn.Module):
-    def __init__(self, layer_id, cache):
+    def __init__(self, layer_id, cache, attn_backend):
         super().__init__()
         self.layer_id = layer_id
         self.cache = cache
+        self.attn_backend = attn_backend
 
     def _run_linear(self, x):
         raise NotImplementedError
@@ -122,7 +119,7 @@ class Attention(nn.Module):
         self.cache.finalize_cache_bylayer_prefill(
             xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
         )
-        output = flash_attn.flash_attn_varlen_func(
+        output = self.attn_backend.attn_varlen_func(
             xq,
             xk,
             xv,
@@ -149,24 +146,18 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        cache = self.cache.update_cache_decode(xk, xv, self.layer_id)
+        cache = self.cache.get_cache_decode(self.layer_id)
         cache_k = cache[0]
         cache_v = cache[1]
-        max_seq_len = cache.shape[2]
-
-        if self.n_local_heads != self.n_local_kv_heads:
-            group_size = self.n_local_heads // self.n_local_kv_heads
-            assert group_size > 1
-            xq = xq.view(bsz, seqlen, self.n_local_kv_heads, group_size, self.head_dim)
-            cache_k = cache_k.view(
-                bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
-            ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
-            cache_v = cache_v.view(
-                bsz, max_seq_len, self.n_local_kv_heads, 1, self.head_dim
-            ).expand(bsz, max_seq_len, self.n_local_kv_heads, group_size, self.head_dim)
-        output = fmha.memory_efficient_attention_forward(xq, cache_k, cache_v).view(
-            bsz, seqlen, -1
-        )
+        cache_seqlens = self.cache.get_gpu_seq_lens()
+        output = self.attn_backend.attn_with_kvcache(
+            xq,
+            cache_k,
+            cache_v,
+            xk,
+            xv,
+            cache_seqlens=cache_seqlens,
+        ).view(bsz, seqlen, -1)
         return self._run_output_linear(output)
 
     def decode_forward_paged(self, x: torch.Tensor, freqs_cis: torch.Tensor):
@@ -190,9 +181,9 @@ class Attention(nn.Module):
         block_table = self.cache.get_gpu_block_table(
             self.cache.curr_req_ids, self.layer_id
         )
-        cache_seqlens = self.cache.get_gpu_seq_lens(self.cache.curr_req_ids)
+        cache_seqlens = self.cache.get_gpu_seq_lens()
         paged_k_cache, paged_v_cache = self.cache.get_paged_kv_cache()
-        output = flash_attn.flash_attn_with_kvcache(
+        output = self.attn_backend.attn_with_kvcache(
             xq,
             paged_k_cache,
             paged_v_cache,
@@ -221,7 +212,7 @@ class Attention(nn.Module):
 
 class TransformerBlock(nn.Module):
 
-    def __init__(self, layer_id: int, args):
+    def __init__(self, layer_id: int, args, cache, attn_backend):
         super().__init__()
         self.n_heads = args.n_heads
         self.dim = args.dim
@@ -234,9 +225,12 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, params, cache, pipeline_parallel_size, model_parallel_size):
+    def __init__(
+        self, params, cache, pipeline_parallel_size, model_parallel_size, attn_backend
+    ):
         super().__init__()
         self.cache = cache
+        self.attn_backend = attn_backend
         self.rank = torch.distributed.get_rank()
         self.world_size = torch.distributed.get_world_size()
         self.device = torch.device(self.rank)
@@ -253,7 +247,7 @@ class Transformer(nn.Module):
 
         if not self.pipeline_exec or self.rank == 0:
             self._init_pre_layers()
-        self._init_layers(cache)
+        self._init_layers(cache, attn_backend)
         if not self.pipeline_exec or self.rank == self.world_size - 1:
             self._init_post_layers()
 
@@ -266,7 +260,7 @@ class Transformer(nn.Module):
     def _init_pre_layers(self):
         raise NotImplementedError
 
-    def _init_layers(self, cache):
+    def _init_layers(self, cache, attn_backend):
         raise NotImplementedError
 
     def _init_post_layers(self):
@@ -276,6 +270,7 @@ class Transformer(nn.Module):
         raise NotImplementedError
 
     def _post_layers(self, h):
+        """NOTE: _post_layers is assumed to be a token-wise computation"""
         raise NotImplementedError
 
     def prepare_freqs_cis_prefill(self, varlens, device):
@@ -308,9 +303,9 @@ class Transformer(nn.Module):
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):
             h = layer(h, freqs_cis, varlens)
-        h = self._post_layers(h)
         tmp = varlens.cpu_prefix_lens[1:]
         h = h[[item - 1 for item in tmp]]
+        h = self._post_layers(h)  # Exec post layers AFTER cutting the last token off
         h = h.float()
         return h
 
@@ -341,9 +336,11 @@ class Transformer(nn.Module):
             h = layer(h, freqs_cis, varlens)
         # end of model
         if self.rank == self.world_size - 1:
-            h = self._post_layers(h)
             tmp = varlens.cpu_prefix_lens[1:]
             h = h[[item - 1 for item in tmp]]
+            h = self._post_layers(
+                h
+            )  # Exec post layers AFTER cutting the last token off
             h = h.float()
         return h
 

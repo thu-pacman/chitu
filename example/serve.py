@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response, StreamingResponse, JSONResponse
 import uvicorn
 import asyncio
@@ -16,7 +16,7 @@ import random
 from cinfer.global_vars import set_global_variables
 
 from cinfer.backend import Backend
-from cinfer.task import UserRequest, TaskPool, PrefillTask
+from cinfer.task import UserRequest, TaskPool, PrefillTask, TaskLoad
 from cinfer.cinfer_main import cinfer_init, cinfer_run
 from cinfer.async_response import AsyncResponse, AsyncDataStream
 
@@ -55,13 +55,26 @@ async def create_chat_completion(request: ChatRequest):
     if not server_status:
         return {"message": "Service is not started"}
     params = request.dict()
-    req_id = params.pop("conversation_id")
+    # req_id = params.pop("conversation_id")
+    req_id = gen_req_id()
     stream = params.pop("stream", False)
     message = params.pop("messages")
     max_new_tokens = params.pop("max_tokens", global_args.request.max_new_tokens)
-    req = UserRequest(message, req_id, max_new_tokens=max_new_tokens)
-    response = AsyncResponse(req)
-    TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
+    try:
+        req = UserRequest(message, req_id, max_new_tokens=max_new_tokens)
+        response = AsyncResponse(req)
+        task = PrefillTask(
+            f"prefill_{req.request_id}",
+            req,
+            req.message,
+            max_seq_len=global_args.infer.max_seq_len,
+        )
+        TaskPool.add(task)
+    except ValueError:
+        del req, response
+        raise HTTPException(
+            status_code=400, detail="prompt length is greater than max_seqs_len"
+        )
     if stream:
         return StreamingResponse(
             response.stream_generator(), media_type="text/event-stream"
@@ -101,7 +114,7 @@ async def get_cinfer_status():
 
 @app.post("/load_status")
 async def get_cinfer_load_status():
-    pass
+    return {"message": f"{TaskLoad.get_load()}"}
 
 
 @app.post("/ping")
@@ -112,6 +125,17 @@ async def get_cinfer_status():
 @app.post("/health")
 async def health():
     pass  # TODO Check the inference service
+
+
+class IgnoreSpecificPathFilter(logging.Filter):
+    def filter(self, record):
+        if "/ping" in record.getMessage() or "/load_status" in record.getMessage():
+            return False
+        return True
+
+
+api_logger = getLogger("uvicorn.access")
+api_logger.addFilter(IgnoreSpecificPathFilter())
 
 
 async def process_queue():

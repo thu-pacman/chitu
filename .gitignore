@@ -151,6 +151,9 @@ dmypy.json
 # pytype static type analyzer
 .pytype/
 
+# Cython-generated files
+cinfer/*.c
+
 # Cython debug symbols
 cython_debug/
 
@@ -164,3 +167,6 @@ cython_debug/
 outputs/*
 test/outputs/*
 dumps/*
+
+# Vim
+.*.swp

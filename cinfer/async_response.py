@@ -71,14 +71,26 @@ class AsyncResponse:
                 if data:
                     chunk = ChatCompletionResponse(
                         id=self.id,
-                        choices=[{"index": 0, "delta": {"content": f"{data}"}}],
+                        choices=[
+                            {
+                                "index": 0,
+                                "delta": {"content": f"{data}"},
+                                "finish_reason": None,
+                            }
+                        ],
                     )
                     data = chunk.model_dump_json(exclude_none=True)
                     yield f"data: {data}\n\n"
 
             chunk = ChatCompletionResponse(
                 id=self.id,
-                choices=[{"index": 0, "delta": {"content": ""}}],
+                choices=[
+                    {
+                        "index": 0,
+                        "delta": {"content": ""},
+                        "finish_reason": self.req.finish_reason,
+                    }
+                ],
                 usage={
                     "prompt_tokens": f"{self.req.prompt_len}",
                     "completion_tokens": f"{self.async_stream.tokens_len}",
@@ -87,7 +99,9 @@ class AsyncResponse:
             )
             data = chunk.model_dump_json(exclude_none=True)
             yield f"data: {data}\n\n"
-            logger.info(f"Task_{self.id}, {self.async_stream.seqs} [DONE]")
+            logger.info(
+                f"Completed_{self.id}: {self.req.output}, token_len: {self.async_stream.tokens_len}\n"
+            )
             yield "data: [DONE]\n\n"
 
         return stream_response()
