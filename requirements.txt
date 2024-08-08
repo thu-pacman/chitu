@@ -14,3 +14,5 @@ wheel
 cmake
 cython
 tqdm
+eetq
+bitsandbytes

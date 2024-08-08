@@ -11,6 +11,18 @@ pip install -r requirements.txt # install other python dependencies
 pip install flash-attn # may meet network problem, if so, try `https_proxy=http://127.0.0.1:7891 pip install flash-attn`
 TORCH_CUDA_ARCH_LIST=8.6 python setup.py build -j4 develop
 ```
+## Setup Quantization Kernels
+```bash
+# awq
+git clone https://github.com/mit-han-lab/llm-awq.git
+cd llm-awq/awq/kernels
+python setup.py install
+# gptq
+git clone https://github.com/PanQiWei/AutoGPTQ.git && cd AutoGPTQ
+pip install -vvv --no-build-isolation .  #neet to build from source
+# eetq
+# bnb
+```
 
 ## Internal Test
 
