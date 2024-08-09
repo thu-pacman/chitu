@@ -1,7 +1,8 @@
-#import cinfer.evaluator as eval
+# import cinfer.evaluator as eval
 import torch
 import os
-os.environ['PAGED_SIZE']="0"
+
+os.environ["PAGED_SIZE"] = "0"
 from cinfer.backend import Backend
 from cinfer.global_vars import *
 from cinfer.tokenizer import Tokenizer, ChatFormat, TokenizerHF, ChatFormatHF
@@ -38,7 +39,10 @@ def prefill_forward(
         causal=True,
     ).view(bs_seq, -1)
     return self._run_output_linear(output)
+
+
 Attention.prefill_forward = prefill_forward
+
 
 def prefill_forward_qwen(
     self,
@@ -72,9 +76,11 @@ def prefill_forward_qwen(
         causal=True,
     ).view(bs_seq, -1)
     return self._run_output_linear(output)
+
+
 AttentionQwen.prefill_forward = prefill_forward_qwen
 
-'''
+"""
 @torch.inference_mode()
 def test_output(self, tokens, device="cuda"):
     varlens = Backend.curr_varlens
@@ -94,7 +100,9 @@ def test_output(self, tokens, device="cuda"):
         h = self.norm(h)
         h = self.output(h)
     return h
-'''
+"""
+
+
 @torch.inference_mode()
 def prefill_single_device(self, tokens):
     varlens = VarLens(tokens, self.device)
@@ -103,32 +111,35 @@ def prefill_single_device(self, tokens):
     h = self._pre_layers(tokens)
     for it, layer in enumerate(self.layers):
         h = layer(h, freqs_cis, varlens)
-    #print(h.shape)
-    #h = h[[item - 1 for item in tmp]]
-    #print(h.shape)
+    # print(h.shape)
+    # h = h[[item - 1 for item in tmp]]
+    # print(h.shape)
     h = self._post_layers(h)  # Exec post layers AFTER cutting the last token off
-    #print(h.shape)
-    
-    #print("1 GPU memory used : ", torch.cuda.memory_allocated(0))
-    #print(h.shape)
+    # print(h.shape)
+
+    # print("1 GPU memory used : ", torch.cuda.memory_allocated(0))
+    # print(h.shape)
     return h
+
+
 Transformer.prefill_single_device = prefill_single_device
 
 
-
 import tqdm
+
+
 class Evaluator:
     def __init__(self, dataset, tokenizer, device, n_samples=40):
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.device = device
 
-        #self.dataset = tokenizer(
+        # self.dataset = tokenizer(
         #    "\n\n".join(dataset["text"]), return_tensors="pt"
-        #).input_ids.to(device)
+        # ).input_ids.to(device)
         self.dataset = tokenizer.encode(
             "\n\n".join(dataset["text"]), bos=False, eos=False
-        ) 
+        )
 
         self.n_samples = n_samples
 
@@ -137,26 +148,26 @@ class Evaluator:
         model.eval()
         nlls = []
         for i in tqdm.tqdm(range(self.n_samples), desc="Evaluating..."):
-            #batch = self.dataset[:, (i * 2048) : ((i + 1) * 2048)].to(model.device)
+            # batch = self.dataset[:, (i * 2048) : ((i + 1) * 2048)].to(model.device)
             batch = [self.dataset[(i * 2048) : ((i + 1) * 2048)]]
             with torch.no_grad():
                 Backend.curr_varlens = VarLens(batch, device=self.device)
                 Backend.cache_manager.curr_varlens = VarLens(batch, device=self.device)
                 # lm_logits = model.decode(tokens=torch.tensor(batch, device=self.device), seq_lens=[0]*2048)
-                #print("0 GPU memory used : ", torch.cuda.memory_allocated(0))
+                # print("0 GPU memory used : ", torch.cuda.memory_allocated(0))
                 lm_logits = model.prefill_single_device(batch).unsqueeze(dim=0)
-                #lm_logits = model(batch).logits
-            #print(lm_logits.shape)
-            #print("2 GPU memory used : ", torch.cuda.memory_allocated(0))
+                # lm_logits = model(batch).logits
+            # print(lm_logits.shape)
+            # print("2 GPU memory used : ", torch.cuda.memory_allocated(0))
             shift_logits = lm_logits[:, :-1, :].contiguous().float()
-            #print("3 GPU memory used : ", torch.cuda.memory_allocated(0))
+            # print("3 GPU memory used : ", torch.cuda.memory_allocated(0))
             shift_labels = torch.tensor(
                 [self.dataset[(i * 2048) : ((i + 1) * 2048)]], device=self.device
             )[:, 1:]
-            #print("4 GPU memory used : ", torch.cuda.memory_allocated(0))
-            #print(shift_labels.shape)
+            # print("4 GPU memory used : ", torch.cuda.memory_allocated(0))
+            # print(shift_labels.shape)
             loss_fct = torch.nn.CrossEntropyLoss()
-            #print("5 GPU memory used : ", torch.cuda.memory_allocated(0))
+            # print("5 GPU memory used : ", torch.cuda.memory_allocated(0))
             loss = loss_fct(
                 shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
             )
@@ -171,14 +182,18 @@ class Evaluator:
             gc.collect()
             torch.cuda.empty_cache()
         return torch.exp(torch.stack(nlls).sum() / (self.n_samples * 2048))
-    
+
+
 import datasets
+
+
 def ppleval(model, tokenizer, n_samples=40):
     dataset = datasets.load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     evaluator = Evaluator(dataset, tokenizer, model.device, n_samples=n_samples)
-    #evaluator = Evaluator(dataset, tokenizer, model.device, n_samples=40)
+    # evaluator = Evaluator(dataset, tokenizer, model.device, n_samples=40)
     ppl = evaluator.evaluate(model)
     print(f"Perplexity: {ppl}")
+
 
 @hydra.main(config_path="example/configs/", config_name="serve_config_gptq")
 def load_model(args):
@@ -186,6 +201,7 @@ def load_model(args):
     Backend.build(args)
     print(Backend.tokenizer)
     print(Backend.model)
+
 
 if __name__ == "__main__":
     load_model()
@@ -195,7 +211,7 @@ if __name__ == "__main__":
     print(model, tokenizer)
 
     ppleval(model, tokenizer)
-'''   
+"""   
 with open("example/configs/serve_config.yaml", "r") as file:
     args = yaml.safe_load(file)
 print(args)
@@ -205,8 +221,8 @@ with open("example/configs/models/" + models_args + ".yaml", "r") as file:
 print(models_args)
 Backend.model
 Backend.tokenizer
-'''
-'''
+"""
+"""
 from cinfer.attn_backend import FlashAttnBackend, RefAttnBackend
 
 attn_backend = FlashAttnBackend()
@@ -219,7 +235,7 @@ model = Backend.build_model(
     1,
     attn_backend,
 )
-'''
+"""
 
 
 #
