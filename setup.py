@@ -169,6 +169,28 @@ if os.environ.get("CINFER_WITH_CYTHON", "0") != "0":
 setup(
     name="CInfer",
     version="0.0.1",
+    install_requires=[
+        # Don't put `torch` here because it requires downloading from a specific source
+        "transformers",
+        "flash-attn",
+        "fairscale",
+        "fire",
+        "tiktoken==0.4.0",
+        "blobfile",
+        "faker",
+        "hydra-core",
+        "fastapi",
+        "uvicorn",
+        # The following packages are actually build-time dependencies, but we can't use
+        # `build-system.requires` in `pyproject.toml` because `torch` has to be downloaded
+        # from a specific source, so we put them here.
+        "setuptools",
+        "wheel",
+        "packaging",
+        "ninja",
+        "cmake",
+        "cython",
+    ],
     packages=find_packages(),
     ext_modules=ext_modules,
     cmdclass={"build_ext": CMakeBuild, "build_py": my_build_py},
