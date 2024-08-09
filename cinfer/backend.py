@@ -267,7 +267,6 @@ class Backend:
         if args.quant == "llmint8":
             quant(model, "llmint8", "qwen")
         model = model.to(local_rank)
-        print(model)
         Backend.model = model
 
         Backend.args = args
