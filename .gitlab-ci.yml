@@ -26,7 +26,9 @@ run_check:
     needs:
         - format_check
     script:
-        - if [ -d "/home/hkz2/cinfer/src/third_party" ]; then cp -r /home/hkz2/cinfer/src/third_party/* ./src/third_party/; fi
+        - git submodule update --init --recursive
+        - git submodule foreach --recursive git clean -ffdx
+        - git submodule foreach --recursive git reset --hard
         - source /home/spack/spack/share/spack/setup-env.sh
         - spack load cuda@12.4.0
         - TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 CINFER_WITH_CYTHON=1 pip install .
