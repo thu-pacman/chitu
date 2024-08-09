@@ -164,6 +164,8 @@ if os.environ.get("CINFER_WITH_CYTHON", "0") != "0":
     ext_modules += cythonize(create_cython_extensions("cinfer"))
     my_build_py = SkipBuildPy
 
+setup_dir = os.path.dirname(os.path.abspath(__file__))
+
 # The information here can also be placed in setup.cfg - better separation of
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
@@ -181,6 +183,9 @@ setup(
         "hydra-core",
         "fastapi",
         "uvicorn",
+        "tqdm",
+        "bitsandbytes",
+        "EETQ @ file://localhost" + os.path.join(setup_dir, "third_party/EETQ"),
         # The following packages are actually build-time dependencies, but we can't use
         # `build-system.requires` in `pyproject.toml` because `torch` has to be downloaded
         # from a specific source, so we put them here.

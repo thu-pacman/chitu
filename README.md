@@ -7,11 +7,14 @@
 source /home/spack/spack/share/spack/setup-env.sh
 spack load cuda@12.4
 pip install -U torch --index-url https://download.pytorch.org/whl/cu121 # Install torch. You have to change `cu121` to your cuda version
-TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 pip install -e . # Editable install
+TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 MAX_JOBS=4 pip install -e . # Editable install
 # or otherwise, do a non-editable Cython-compiled install:
-# TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 CINFER_WITH_CYTHON=1 pip install .
-# If you are encountering network issues, you may try appending `-i https://pypi.tuna.tsinghua.edu.cn/simple` to your `pip` commands.
+# TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 MAX_JOBS=4 CINFER_WITH_CYTHON=1 pip install .
 ```
+
+Note:
+- If you are encountering network issues, you may try appending `-i https://pypi.tuna.tsinghua.edu.cn/simple` to your `pip` commands.
+- `CINFER_SETUP_JOBS` is used to control number of jobs to compile this repo, while `MAX_JOBS` is used to control number of jobs to compile EETQ, which is a dependency of this repo.
 
 ## Setup Quantization Kernels
 ```bash

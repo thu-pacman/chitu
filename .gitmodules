@@ -7,3 +7,6 @@
 [submodule "src/third_party/googletest"]
 	path = src/third_party/googletest
 	url = git@git.qcjzai.cn:github-mirror/googletest.git
+[submodule "third_party/EETQ"]
+	path = third_party/EETQ
+	url = git@git.qcjzai.cn:github-mirror/EETQ.git
