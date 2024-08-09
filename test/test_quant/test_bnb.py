@@ -11,13 +11,13 @@ if __name__ == "__main__":
     enc = AutoTokenizer.from_pretrained(model_path)
     model = AutoModelForCausalLM.from_pretrained(model_path)
 
-    #print(model)
-    
+    # print(model)
+
     from quantize import quant
 
     qconfig = {}
-    qconfig['method'] = 'llmint8'
-    qconfig['bits'] = 8
+    qconfig["method"] = "llmint8"
+    qconfig["bits"] = 8
     quant(model, qconfig)
 
     print(model)
@@ -26,7 +26,11 @@ if __name__ == "__main__":
 
     enc.pad_token = enc.eos_token
 
-    model_inputs = enc(["A list of colors: red, blue", "The capital of Spanish is"], return_tensors="pt", padding=True).to(model.device)
+    model_inputs = enc(
+        ["A list of colors: red, blue", "The capital of Spanish is"],
+        return_tensors="pt",
+        padding=True,
+    ).to(model.device)
     generate_ids = model.generate(**model_inputs)
     results = enc.batch_decode(generate_ids, skip_special_tokens=True)
 

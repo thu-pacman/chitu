@@ -11,9 +11,12 @@ import torch.nn as nn
 import tqdm
 import datasets
 
+from cinfer.model import Transformer
+
+
 def lmeval(model, tasks=["wikitext"]):
-    #os.environ['http_proxy'] = "socks5h://localhost:1086" 
-    #os.environ['https_proxy'] = "socks5h://localhost:1086" 
+    # os.environ['http_proxy'] = "socks5h://localhost:1086"
+    # os.environ['https_proxy'] = "socks5h://localhost:1086"
     model = HFLM(pretrained=model)
     results = evaluator.simple_evaluate(
         model,
@@ -21,10 +24,9 @@ def lmeval(model, tasks=["wikitext"]):
         batch_size=16,
         num_fewshot=0,
         log_samples=True,
-        device="cuda"
+        device="cuda",
     )
 
-    
     def handle_non_serializable(o):
         if isinstance(o, np.int64) or isinstance(o, np.int32):
             return int(o)
@@ -32,7 +34,6 @@ def lmeval(model, tasks=["wikitext"]):
             return list(o)
         else:
             return str(o)
-
 
     dumped = json.dumps(
         results, indent=2, default=handle_non_serializable, ensure_ascii=False
@@ -45,6 +46,8 @@ def lmeval(model, tasks=["wikitext"]):
 META_LLAMA_FLAG = True
 
 from cinfer.model import Backend, VarLens
+
+
 class Evaluator:
     def __init__(self, dataset, tokenizer, device, n_samples=40):
         self.dataset = dataset
@@ -52,9 +55,9 @@ class Evaluator:
         self.device = device
 
         if META_LLAMA_FLAG:
-            #self.dataset = torch.tensor(tokenizer.encode(
+            # self.dataset = torch.tensor(tokenizer.encode(
             #    "\n\n".join(dataset["text"]), bos=True, eos=True
-            #), device="cuda").reshape(1, -1)
+            # ), device="cuda").reshape(1, -1)
             self.dataset = tokenizer.encode(
                 "\n\n".join(dataset["text"]), bos=False, eos=False
             )
@@ -62,7 +65,6 @@ class Evaluator:
             self.dataset = tokenizer(
                 "\n\n".join(dataset["text"]), return_tensors="pt"
             ).input_ids.to(device)
-            
 
         self.n_samples = n_samples
 
@@ -80,7 +82,7 @@ class Evaluator:
             else:
                 h = tokens
             # layers
-            #print("evaluation GPU memory used : ", torch.cuda.memory_allocated())  
+            # print("evaluation GPU memory used : ", torch.cuda.memory_allocated())
             for it, layer in enumerate(self.layers):
                 h = layer(h, 0, freqs_cis, None, varlens, cache=False)
             # end of model
@@ -89,28 +91,29 @@ class Evaluator:
                 h = self.output(h)
             return h
 
-        model.test_output = test_output
+        Transformer.test_output = test_output
 
-        
         model.eval()
         nlls = []
-        for i in tqdm.tqdm(range(self.n_samples), desc="Evaluating..."):    
+        for i in tqdm.tqdm(range(self.n_samples), desc="Evaluating..."):
             if META_LLAMA_FLAG:
-                #batch = [ba[(i * 2048) : ((i + 1) * 2048)] for ba in self.dataset]
+                # batch = [ba[(i * 2048) : ((i + 1) * 2048)] for ba in self.dataset]
                 batch = [self.dataset[(i * 2048) : ((i + 1) * 2048)]]
             else:
                 batch = self.dataset[:, (i * 2048) : ((i + 1) * 2048)].to(self.device)
 
-            with torch.no_grad():             
+            with torch.no_grad():
                 if META_LLAMA_FLAG:
                     Backend.curr_varlens = VarLens(batch, device=self.device)
-                    #lm_logits = model.decode(tokens=torch.tensor(batch, device=self.device), seq_lens=[0]*2048)
+                    # lm_logits = model.decode(tokens=torch.tensor(batch, device=self.device), seq_lens=[0]*2048)
                     lm_logits = model.test_output(batch).unsqueeze(dim=0)
                 else:
                     lm_logits = model(batch).logits
-            shift_logits = lm_logits[:, :-1, :].contiguous().float()       
+            shift_logits = lm_logits[:, :-1, :].contiguous().float()
             if META_LLAMA_FLAG:
-                shift_labels = torch.tensor([self.dataset[(i * 2048) : ((i + 1) * 2048)]], device=self.device)[:, 1:]
+                shift_labels = torch.tensor(
+                    [self.dataset[(i * 2048) : ((i + 1) * 2048)]], device=self.device
+                )[:, 1:]
             else:
                 shift_labels = self.dataset[:, (i * 2048) : ((i + 1) * 2048)][:, 1:]
             loss_fct = nn.CrossEntropyLoss()
@@ -125,15 +128,16 @@ class Evaluator:
             del shift_logits
             del shift_labels
             import gc
+
             gc.collect()
             torch.cuda.empty_cache()
 
         return torch.exp(torch.stack(nlls).sum() / (self.n_samples * 2048))
-    
+
 
 def ppleval(model, tokenizer, device="cuda", n_samples=40):
     dataset = datasets.load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     evaluator = Evaluator(dataset, tokenizer, device, n_samples=n_samples)
-    #evaluator = Evaluator(dataset, tokenizer, model.device, n_samples=40)
+    # evaluator = Evaluator(dataset, tokenizer, model.device, n_samples=40)
     ppl = evaluator.evaluate(model)
     print(f"Perplexity: {ppl}")

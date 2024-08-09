@@ -22,6 +22,7 @@ def get_timers():
     _ensure_var_is_initialized(_GLOBAL_TIMERS, "timers")
     return _GLOBAL_TIMERS
 
+
 def get_dtype():
     _ensure_var_is_initialized(_GLOBAL_TIMERS, "use_half")
     return _GLOBAL_HALF
@@ -37,7 +38,7 @@ def set_global_variables(
 ):
     _set_timers()
     # _set_global_memory_buffer()
-    _set_dtype(extra_args_provider.dtype=='float16')
+    _set_dtype(extra_args_provider.dtype == "float16")
 
 
 def _set_tensorboard_writer(args):
@@ -72,13 +73,13 @@ def _set_timers():
     _ensure_var_is_not_initialized(_GLOBAL_TIMERS, "timers")
     _GLOBAL_TIMERS = Timers()
 
+
 def _set_dtype(use_fp16=True):
     global _GLOBAL_HALF
     if use_fp16:
         _GLOBAL_HALF = True
     else:
         _GLOBAL_HALF = False
-
 
 
 def _set_global_memory_buffer():

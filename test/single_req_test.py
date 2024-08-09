@@ -157,7 +157,8 @@ def run_normal(args, timers):
         # )
         reqs = gen_reqs_real(
             # num_reqs=args.infer.max_reqs, max_new_tokens=args.request.max_new_tokens
-            num_reqs=6, max_new_tokens=args.request.max_new_tokens
+            num_reqs=6,
+            max_new_tokens=args.request.max_new_tokens,
         )
         for req in reqs:
             TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
@@ -178,7 +179,9 @@ def run_normal(args, timers):
 
 
 @hydra.main(
-    version_base=None, config_path="../example/configs", config_name="serve_config_w8a16"
+    version_base=None,
+    config_path="../example/configs",
+    config_name="serve_config_w8a16",
 )
 def main(args: DictConfig):
     root_logger = logging.getLogger()

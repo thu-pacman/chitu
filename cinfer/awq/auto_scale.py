@@ -5,13 +5,19 @@ import torch.nn as nn
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaRMSNorm
 from transformers.activations import GELUActivation
 
-from cinfer.awq.qmodule import ScaledActivation, get_op_by_name, get_op_name, set_op_by_name, append_str_prefix, pseudo_quantize_tensor
+from cinfer.awq.qmodule import (
+    ScaledActivation,
+    get_op_by_name,
+    get_op_name,
+    set_op_by_name,
+    append_str_prefix,
+    pseudo_quantize_tensor,
+)
 from fairscale.nn.model_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
 )
-
 
 
 __all__ = ["auto_scale_block", "apply_scale"]
@@ -79,7 +85,7 @@ def scale_fc_fc(fc1, fc2, scales):
 def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat):
 
     if w_bit is not None:
-        
+
         def w_quantize_func(p):
             return pseudo_quantize_tensor(
                 p,
@@ -125,7 +131,6 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat):
             if isinstance(out, tuple):
                 out = out[0]
 
-
             loss = (
                 (org_out - out).float().pow(2).mean().item()
             )  # float prevents overflow
@@ -138,7 +143,7 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat):
             block.load_state_dict(org_sd)
         if best_ratio == -1:
             raise Exception
-        #print("best_ratio : ", best_ratio)
+        # print("best_ratio : ", best_ratio)
         best_scales = best_scales.view(-1)
 
         assert torch.isnan(best_scales).sum() == 0, best_scales
@@ -149,7 +154,7 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat):
         if module2inspect is None:
             assert len(layers) == 1
             module2inspect = layers[0]
-        
+
         scales = _search_module_scale(module2inspect, layers, inp, kwargs)
         scales = scales.detach().cpu()
         # prev_op_name, [layer_name], scale
@@ -160,7 +165,6 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat):
         )
 
     scales_list = []  # return the searched scales
-
 
     if isinstance(module, LlamaDecoderLayer):
         # attention input
@@ -205,7 +209,6 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat):
             )
         )
 
-    
     else:
         raise NotImplementedError(f"{type(module)} not supported yet!")
 
@@ -223,9 +226,10 @@ def apply_scale(module, scales_list, input_feat_dict=None):
         scales.cuda()
 
         from cinfer.model import RMSNorm
+
         if isinstance(prev_op, (nn.Linear, ColumnParallelLinear)):
             assert len(layers) == 1
-            #print(prev_op_name, layer_names)
+            # print(prev_op_name, layer_names)
             scale_fc_fc(prev_op, layers[0], scales)
         elif isinstance(prev_op, (nn.LayerNorm, LlamaRMSNorm, RMSNorm)):
             scale_ln_fcs(prev_op, layers, scales)

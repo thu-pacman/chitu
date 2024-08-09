@@ -73,7 +73,7 @@ def auto_clip_layer(
         best_max_val = org_max_val.clone()
         min_errs = torch.ones_like(org_max_val) * 1e9
         input_feat = input_feat.to(w.device)
-        #print("input_feat * w : ", input_feat.shape, w.shape)
+        # print("input_feat * w : ", input_feat.shape, w.shape)
         org_out = (input_feat * w).sum(dim=-1)  # co, n_token, n_group
 
         for i_s in range(int(max_shrink * n_grid)):
@@ -128,7 +128,7 @@ def apply_clip(module, clip_list):
             if name == op_name:
                 return m
         raise ValueError(f"Cannot find op {op_name} in module {module}")
-    
+
     for name, max_val in clip_list:
         layer = get_op_by_name(module, name)
         layer.cuda()

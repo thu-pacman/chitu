@@ -1,4 +1,3 @@
-
 import torch
 
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -11,8 +10,6 @@ import numpy as np
 import torch.nn as nn
 import tqdm
 import datasets
-
-
 
 
 class Evaluator:
@@ -58,4 +55,3 @@ if __name__ == "__main__":
 
     lmeval(model)
     ppleval(model, enc)
-

@@ -19,6 +19,7 @@ from .attn_backend import FlashAttnBackend, RefAttnBackend
 from .model_llama import TransformerLlama
 from .model_qwen import TransformerQwen
 from .utils import load_pipe, load_tensor_parallel
+from .quantize import *
 import fairscale.nn.model_parallel.initialize as fs_init
 
 from logging import getLogger
@@ -153,20 +154,25 @@ class Backend:
             torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
         else:
             torch.set_default_tensor_type(torch.cuda.HalfTensor)
-        
-        if (args.quant == "None"):
+
+        if args.quant == "None":
             model = model.to(torch.bfloat16)
             torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
-        if (args.quant == "awq") or (args.quant == "llmint8") or (args.quant == "gptq") or (args.quant == "w8a16"):
+        if (
+            (args.quant == "awq")
+            or (args.quant == "llmint8")
+            or (args.quant == "gptq")
+            or (args.quant == "w8a16")
+        ):
             torch.set_default_tensor_type(torch.cuda.HalfTensor)
             model = model.to(torch.float16)
-        if (args.quant == "awq"):
+        if args.quant == "awq":
             quant(model, method="awq", name="qwen")
-        elif (args.quant == "gptq"):
+        elif args.quant == "gptq":
             quant(model, method="gptq", name="qwen")
-        elif (args.quant == "w8a16"):
+        elif args.quant == "w8a16":
             quant(model, method="w8a16", name="qwen")
-        #print(model)
+        # print(model)
 
         # Init model parameters
         if args.infer.do_load:
@@ -182,14 +188,16 @@ class Backend:
             elif args.models.type == "qwen":
                 if args.quant == "awq":
                     params = torch.load(args.quant_ckpt_dir, map_location="cpu")
-                    replace_list= [("model.", ""),
-                                   ("embed_tokens.weight", "embed_tokens.tok_embeddings.weight") 
-                            ]
+                    replace_list = [
+                        ("model.", ""),
+                        ("embed_tokens.weight", "embed_tokens.tok_embeddings.weight"),
+                    ]
 
                     def rep(s):
                         for p in replace_list:
                             s = s.replace(p[0], p[1], 1)
                         return s
+
                     checkpoint = dict((rep(k), v) for k, v in params.items())
                 elif args.quant == "gptq":
                     params = AutoModelForCausalLM.from_pretrained(
@@ -203,18 +211,24 @@ class Backend:
 
                     checkpoint = dict((transform_key(k), v) for k, v in params.items())
                 elif args.quant == "w8a16":
-                    params = torch.load(args.quant_ckpt_dir +"/pytorch_model.bin", map_location="cpu")
-                    replace_list= [("model.", ""),
-                                   ("embed_tokens.weight", "embed_tokens.tok_embeddings.weight") 
-                            ]
-                    replace_list = [("model.", ""),]
+                    params = torch.load(
+                        args.quant_ckpt_dir + "/pytorch_model.bin", map_location="cpu"
+                    )
+                    replace_list = [
+                        ("model.", ""),
+                        ("embed_tokens.weight", "embed_tokens.tok_embeddings.weight"),
+                    ]
+                    replace_list = [
+                        ("model.", ""),
+                    ]
 
                     def rep(s):
                         for p in replace_list:
                             s = s.replace(p[0], p[1], 1)
                         return s
+
                     checkpoint = dict((rep(k), v) for k, v in params.items())
-                    #print(checkpoint.keys())
+                    # print(checkpoint.keys())
                 else:
                     params = AutoModelForCausalLM.from_pretrained(
                         args.models.ckpt_dir, torch_dtype="auto", device_map="cpu"

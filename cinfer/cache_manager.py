@@ -6,13 +6,13 @@ from logging import getLogger
 from .ops import move_data
 
 import os
+
 try:
-    os.environ['PAGED_SIZE']
-    paged_size = int(os.environ['PAGED_SIZE'])
+    os.environ["PAGED_SIZE"]
+    paged_size = int(os.environ["PAGED_SIZE"])
 except KeyError:
     paged_size = 16
 print("PAGED_SIZE : ", paged_size)
-
 
 
 logger = getLogger(__name__)

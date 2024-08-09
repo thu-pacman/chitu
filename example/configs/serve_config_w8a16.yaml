@@ -13,6 +13,7 @@ infer:
   max_seq_len: 4096 # length of prefill + decode
   cache_type: paged
   max_reqs: 64
+  attn_type: flash # flash or ref
 request:
   max_new_tokens: 128
 scheduler:

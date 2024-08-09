@@ -10,6 +10,7 @@ from fairscale.nn.model_parallel.layers import (
     VocabParallelEmbedding,
 )
 
+
 def get_op_by_name(module, op_name):
     # get the op by its name relative to the module
     for name, m in module.named_modules():
@@ -49,6 +50,7 @@ def append_str_prefix(x, prefix):
         return [append_str_prefix(y, prefix) for y in x]
     else:
         return x
+
 
 def make_divisible(c, divisor):
     return (c + divisor - 1) // divisor
@@ -246,23 +248,23 @@ class WQLinear(nn.Module):
         # out_shape = x.shape[:-1] + (self.out_features,)
         # inputs = x.reshape(-1, x.shape[-1])
         inputs = x
-        #if inputs.numel() / inputs.shape[-1] < 8:
-        #print("qbug : ", inputs.shape, inputs.numel())
-        #batch_size, n_tokens, _ = inputs.shape
-        
-        #print(self.qweight.shape)
-        #print(self.scales.shape)
-        #print(self.scaled_zeros.shape)
-        #print(self.out_features)
-        #print(self.in_features)
-        '''
+        # if inputs.numel() / inputs.shape[-1] < 8:
+        # print("qbug : ", inputs.shape, inputs.numel())
+        # batch_size, n_tokens, _ = inputs.shape
+
+        # print(self.qweight.shape)
+        # print(self.scales.shape)
+        # print(self.scaled_zeros.shape)
+        # print(self.out_features)
+        # print(self.in_features)
+        """
         qbug :  torch.Size([6, 1, 3584]) 21504
         torch.Size([128, 3584])
         torch.Size([32, 512])
         torch.Size([32, 512])
         512
         3584
-        '''
+        """
         if inputs.shape[0] < 5:
             out = awq_inference_engine.gemv_forward_cuda_new(
                 inputs,
@@ -330,19 +332,25 @@ def pseudo_quantize_tensor(
 
 
 def is_linear(module):
-    return isinstance(module, (torch.nn.Linear, ColumnParallelLinear, RowParallelLinear))
+    return isinstance(
+        module, (torch.nn.Linear, ColumnParallelLinear, RowParallelLinear)
+    )
+
 
 @torch.no_grad()
 def real_quantize_model_weight(model, w_bit, q_config, init_only=False):
     from .qmodule import WQLinear
+
     layers = model.layers
     for i in tqdm.tqdm(
         range(len(layers)),
         desc="real weight quantization..." + ("(init only)" if init_only else ""),
     ):
         layer = layers[i]
-        named_linears = named_linears = {name: m for name, m in layer.named_modules() if is_linear(m)}
-        #scale_activations(layer) 
+        named_linears = named_linears = {
+            name: m for name, m in layer.named_modules() if is_linear(m)
+        }
+        # scale_activations(layer)
 
         for name, module in named_linears.items():
             if init_only:
