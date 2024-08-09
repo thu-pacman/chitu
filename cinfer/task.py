@@ -3,10 +3,13 @@ from enum import Enum
 import asyncio
 import time
 import threading
+from datetime import datetime
 from .backend import Backend
 from .async_response import AsyncDataStream, AsyncResponse
+from pathlib import Path
 import os
 import weakref
+import json
 
 from logging import getLogger
 
@@ -49,12 +52,39 @@ class UserRequest:
         self.async_stream = AsyncDataStream()
         self.output = ""
         self.finish_reason = None
+        self.timestamp: str = datetime.now().strftime("%H:%M:%S:%f")
+        self.start_time: int = time.monotonic()
+        self.prefill_end_time: int = 0
+        self.completion_time: int = 0
         TaskLoad.user_req.add(self)
 
     def add_data(self, data):
         self.async_stream.add_data(data)
         # self.output += data.strip("\n")
         # logger.warning(f"add data {data}")
+
+    def save_trace_to_json(self):
+        prefill_duration = self.prefill_end_time - self.start_time
+        all_duration = self.completion_time - self.start_time
+        decode_tps = self.async_stream.tokens_len / (
+            self.completion_time - self.prefill_end_time
+        )
+        tps = self.async_stream.tokens_len / all_duration
+
+        path = Path.cwd() / f"log/trace_{datetime.now().strftime('%Y_%m_%d')}.jsonl"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        trace_data = {
+            "id": self.request_id,
+            "timestamp": self.timestamp,
+            "input_length": self.prompt_len,
+            "output_length": self.async_stream.tokens_len,
+            "prefill_duration": round(prefill_duration, 6),
+            "all_duration": round(all_duration, 6),
+            "tps": round(tps, 6),
+        }
+        trace_str = json.dumps(trace_data)
+        with open(path, "a") as file:
+            file.write(trace_str + "\n")
 
 
 class TaskPool:
@@ -80,6 +110,8 @@ class TaskPool:
             )
             TaskPool.pool[task_id].req.async_stream.send_stop_signal()
             TaskPool.pool[task_id].req.completed.set()
+            TaskPool.pool[task_id].req.completion_time = time.monotonic()
+            TaskPool.pool[task_id].req.save_trace_to_json()
             TaskLoad.reduce(TaskPool.pool[task_id].prefix_length)
             Backend.cache_manager.finalize_cache_all_decode(
                 TaskPool.pool[task_id].req.request_id
@@ -229,6 +261,7 @@ class DecodeTask(Task):
             self.response = []
         self.next_token = next_token
         self.waiting = waiting
+        self.req.prefill_end_time = time.monotonic()
         TaskPool.add(self)
 
     def update_response(
