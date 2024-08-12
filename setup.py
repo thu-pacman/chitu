@@ -186,6 +186,10 @@ setup(
         "tqdm",
         "bitsandbytes",
         "EETQ @ file://localhost" + os.path.join(setup_dir, "third_party/EETQ"),
+        "awq_inference_engine @ file://localhost"
+        + os.path.join(setup_dir, "third_party/llm-awq/awq/kernels"),
+        "auto_gptq @ file://localhost"
+        + os.path.join(setup_dir, "third_party/AutoGPTQ"),
         # The following packages are actually build-time dependencies, but we can't use
         # `build-system.requires` in `pyproject.toml` because `torch` has to be downloaded
         # from a specific source, so we put them here.
