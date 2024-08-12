@@ -38,7 +38,8 @@ def set_global_variables(
 ):
     _set_timers()
     # _set_global_memory_buffer()
-    _set_dtype(extra_args_provider.dtype == "float16")
+    if extra_args_provider is not None:
+        _set_dtype(extra_args_provider.dtype == "float16")
 
 
 def _set_tensorboard_writer(args):

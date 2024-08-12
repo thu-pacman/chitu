@@ -37,5 +37,5 @@ scheduler:
     num_tasks: 2
     enable_hybrid: False
 quant: w8a16
-quant_ckpt_dir: /home/cyd/models/Qwen2-7B-Instruct-w8a16
+quant_ckpt_dir: /home/cyd/models/Qwen2-7B-Instruct-w8a16-without_merged
 dtype: float16

@@ -104,14 +104,16 @@ def run_pipe(args, timers):
 
 def run_normal(args, timers):
     rank = torch.distributed.get_rank()
-    for i in range(3):
+    for i in range(1):
         # reqs = gen_reqs(
         #     num_reqs=args.infer.max_reqs,
         #     prompt_len=512,
         #     max_new_tokens=args.request.max_new_tokens,
         # )
         reqs = gen_reqs_real(
-            num_reqs=args.infer.max_reqs, max_new_tokens=args.request.max_new_tokens
+            # num_reqs=args.infer.max_reqs, max_new_tokens=args.request.max_new_tokens
+            num_reqs=6,
+            max_new_tokens=args.request.max_new_tokens,
         )
         for req in reqs:
             TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
@@ -119,6 +121,8 @@ def run_normal(args, timers):
         timers("overall").start()
         while len(TaskPool.pool) > 0:
             cinfer_run()
+
+        print("GPU memory used : ", torch.cuda.memory_allocated())
         timers("overall").stop()
         t_end = time.time()
         logger.warning(f"Time cost {t_end - t_start}")
@@ -130,13 +134,15 @@ def run_normal(args, timers):
 
 
 @hydra.main(
-    version_base=None, config_path="../example/configs", config_name="serve_config"
+    version_base=None,
+    config_path="../example/configs",
+    config_name="serve_config_w8a16",
 )
 def main(args: DictConfig):
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.WARNING)
-
-    set_global_variables()
+    print(args)
+    set_global_variables(args)
     timers = get_timers()
 
     cinfer_init(args)
