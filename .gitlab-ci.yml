@@ -31,5 +31,5 @@ run_check:
         - git submodule foreach --recursive git reset --hard
         - source /home/spack/spack/share/spack/setup-env.sh
         - spack load cuda@12.4.0
-        - TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 MAX_JOBS=4 CINFER_WITH_CYTHON=1 pip install --no-build-isolation .
+        - TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 MAX_JOBS=4 CINFER_WITH_CYTHON=1 pip install --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple .
         - grun torchrun --nproc_per_node 1 --master_port=22512 test/single_req_test.py request.max_new_tokens=64

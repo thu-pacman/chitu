@@ -195,7 +195,7 @@ def ppleval(model, tokenizer, n_samples=40):
     print(f"Perplexity: {ppl}")
 
 
-@hydra.main(config_path="example/configs/", config_name="serve_config_gptq")
+@hydra.main(config_path="../example/configs/", config_name="serve_config")
 def load_model(args):
     set_global_variables(args)
     Backend.build(args)
