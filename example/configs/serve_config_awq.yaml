@@ -12,8 +12,8 @@ infer:
   stop_with_eos: True
   max_seq_len: 4096 # length of prefill + decode
   cache_type: paged
+  max_reqs: 64
   attn_type: flash # flash or ref
-  max_reqs: 8
 request:
   max_new_tokens: 128
 scheduler:
@@ -22,7 +22,7 @@ scheduler:
     num_tasks: 16
     enable_hybrid: False
   prefill_first:
-    num_tasks: 8
+    num_tasks: 64
     enable_hybrid: False
   stride:
     num_tasks: 2
@@ -36,5 +36,6 @@ scheduler:
   balance:
     num_tasks: 2
     enable_hybrid: False
-quant: None
-dtype: bfloat16
+quant: awq
+quant_ckpt_dir: /home/tanyijun/test_quantize/quant_cache/Qwen2-7B-4bit.pth
+dtype: float16

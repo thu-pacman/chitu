@@ -154,7 +154,27 @@ class Backend:
             torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
         else:
             torch.set_default_tensor_type(torch.cuda.HalfTensor)
-        model = model.to(torch.bfloat16)
+
+        if args.quant == "None":
+            model = model.to(torch.bfloat16)
+            torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
+        if (
+            (args.quant == "awq")
+            or (args.quant == "llmint8")
+            or (args.quant == "gptq")
+            or (args.quant == "w8a16")
+        ):
+            from .quantize import quant
+
+            torch.set_default_tensor_type(torch.cuda.HalfTensor)
+            model = model.to(torch.float16)
+        if args.quant == "awq":
+            quant(model, method="awq", name="qwen")
+        elif args.quant == "gptq":
+            quant(model, method="gptq", name="qwen")
+        elif args.quant == "w8a16":
+            quant(model, method="w8a16", name="qwen")
+        # print(model)
 
         # Init model parameters
         if args.infer.do_load:
@@ -168,16 +188,60 @@ class Backend:
                 # logger.warning(f"Loading checkpoint from {ckpt_path}")
                 checkpoint = torch.load(ckpt_path, map_location="cpu")
             elif args.models.type == "qwen":
-                params = AutoModelForCausalLM.from_pretrained(
-                    args.models.ckpt_dir, torch_dtype="auto", device_map="cpu"
-                ).state_dict()
+                if args.quant == "awq":
+                    params = torch.load(args.quant_ckpt_dir, map_location="cpu")
+                    replace_list = [
+                        ("model.", ""),
+                        ("embed_tokens.weight", "embed_tokens.tok_embeddings.weight"),
+                    ]
 
-                def transform_key(key):
-                    if key.startswith("model."):
-                        return key[len("model.") :]
-                    return key
+                    def rep(s):
+                        for p in replace_list:
+                            s = s.replace(p[0], p[1], 1)
+                        return s
 
-                checkpoint = dict((transform_key(k), v) for k, v in params.items())
+                    checkpoint = dict((rep(k), v) for k, v in params.items())
+                elif args.quant == "gptq":
+                    params = AutoModelForCausalLM.from_pretrained(
+                        args.quant_ckpt_dir, torch_dtype="auto", device_map="cpu"
+                    ).state_dict()
+
+                    def transform_key(key):
+                        if key.startswith("model."):
+                            return key[len("model.") :]
+                        return key
+
+                    checkpoint = dict((transform_key(k), v) for k, v in params.items())
+                elif args.quant == "w8a16":
+                    params = torch.load(
+                        args.quant_ckpt_dir + "/pytorch_model.bin", map_location="cpu"
+                    )
+                    replace_list = [
+                        ("model.", ""),
+                        ("embed_tokens.weight", "embed_tokens.tok_embeddings.weight"),
+                    ]
+                    replace_list = [
+                        ("model.", ""),
+                    ]
+
+                    def rep(s):
+                        for p in replace_list:
+                            s = s.replace(p[0], p[1], 1)
+                        return s
+
+                    checkpoint = dict((rep(k), v) for k, v in params.items())
+                    # print(checkpoint.keys())
+                else:
+                    params = AutoModelForCausalLM.from_pretrained(
+                        args.models.ckpt_dir, torch_dtype="auto", device_map="cpu"
+                    ).state_dict()
+
+                    def transform_key(key):
+                        if key.startswith("model."):
+                            return key[len("model.") :]
+                        return key
+
+                    checkpoint = dict((transform_key(k), v) for k, v in params.items())
             # logger.warning(checkpoint.keys())
             if pipeline_parallel_size > 1:
                 load_pipe(
@@ -200,6 +264,9 @@ class Backend:
             else:
                 model.load_state_dict(checkpoint, strict=True)
             logger.warning(f"Loaded in {time.time() - start_time:.2f} seconds")
+
+        if args.quant == "llmint8":
+            quant(model, "llmint8", "qwen")
         model = model.to(local_rank)
         Backend.model = model
 
