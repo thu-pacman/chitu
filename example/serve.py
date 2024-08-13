@@ -29,6 +29,7 @@ app = FastAPI()
 
 global_args = None
 server_status = False
+rank = 0
 
 
 def gen_req_id(len=8):
@@ -151,7 +152,7 @@ api_logger.addFilter(IgnoreSpecificPathFilter())
 
 async def process_queue():
     while True:
-        if len(TaskPool.pool) > 0:
+        if len(TaskPool.pool) > 0 or rank != 0:
             cinfer_run()
 
 
@@ -159,10 +160,6 @@ def start_worker():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(process_queue())
-
-
-worker_thread = Thread(target=start_worker, daemon=True)
-worker_thread.start()
 
 
 @hydra.main(version_base=None, config_path="./configs", config_name="serve_config")
@@ -174,6 +171,8 @@ def main(args: DictConfig):
     cinfer_init(args)
     server_status = True
     rank = torch.distributed.get_rank()
+    worker_thread = Thread(target=start_worker, daemon=True)
+    worker_thread.start()
     if rank == 0:
         uvicorn.run(app, host=args.serve.host, port=args.serve.port, log_level="info")
 
