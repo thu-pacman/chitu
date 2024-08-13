@@ -19,7 +19,6 @@ from .attn_backend import FlashAttnBackend, RefAttnBackend
 from .model_llama import TransformerLlama
 from .model_qwen import TransformerQwen
 from .utils import load_pipe, load_tensor_parallel
-from .quantize import *
 import fairscale.nn.model_parallel.initialize as fs_init
 
 from logging import getLogger
@@ -165,6 +164,8 @@ class Backend:
             or (args.quant == "gptq")
             or (args.quant == "w8a16")
         ):
+            from .quantize import quant
+
             torch.set_default_tensor_type(torch.cuda.HalfTensor)
             model = model.to(torch.float16)
         if args.quant == "awq":

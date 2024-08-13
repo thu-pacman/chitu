@@ -184,22 +184,18 @@ setup(
         "fastapi",
         "uvicorn",
         "tqdm",
-        "bitsandbytes",
-        "EETQ @ file://localhost" + os.path.join(setup_dir, "third_party/EETQ"),
-        "awq_inference_engine @ file://localhost"
-        + os.path.join(setup_dir, "third_party/llm-awq/awq/kernels"),
-        "auto_gptq @ file://localhost"
-        + os.path.join(setup_dir, "third_party/AutoGPTQ"),
-        # The following packages are actually build-time dependencies, but we can't use
-        # `build-system.requires` in `pyproject.toml` because `torch` has to be downloaded
-        # from a specific source, so we put them here.
-        "setuptools",
-        "wheel",
-        "packaging",
-        "ninja",
-        "cmake",
-        "cython",
+        "accelerate",
     ],
+    extras_require={
+        "quant": [
+            "bitsandbytes",
+            "EETQ @ file://localhost" + os.path.join(setup_dir, "third_party/EETQ"),
+            "awq_inference_engine @ file://localhost"
+            + os.path.join(setup_dir, "third_party/llm-awq/awq/kernels"),
+            "auto_gptq @ file://localhost"
+            + os.path.join(setup_dir, "third_party/AutoGPTQ"),
+        ],
+    },
     packages=find_packages(),
     ext_modules=ext_modules,
     cmdclass={"build_ext": CMakeBuild, "build_py": my_build_py},
