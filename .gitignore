@@ -169,6 +169,7 @@ cython_debug/
 outputs/*
 test/outputs/*
 dumps/*
+log/*
 
 # Vim
 .*.swp
