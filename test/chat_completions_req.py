@@ -3,7 +3,7 @@ import requests, json, sys, time, random
 
 random.seed(2512)
 
-url = "http://127.0.0.1:2512/v1/chat/completions"  # cinfer
+random.seed(2512)
 
 headers = {"Content-Type": "application/json"}
 

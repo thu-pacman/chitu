@@ -5,10 +5,12 @@ __pycache__/
 
 # C extensions
 *.so
+*.c
 
 # Distribution / packaging
 .Python
 build/
+quant_cache/
 develop-eggs/
 dist/
 downloads/
@@ -167,6 +169,7 @@ cython_debug/
 outputs/*
 test/outputs/*
 dumps/*
+log/*
 
 # Vim
 .*.swp

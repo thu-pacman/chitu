@@ -1,10 +1,18 @@
 [submodule "src/third_party/pybind11"]
 	path = src/third_party/pybind11
-	url = git@github.com:pybind/pybind11.git
-
+	url = git@git.qcjzai.cn:github-mirror/pybind11.git
 [submodule "src/third_party/spdlog"]
 	path = src/third_party/spdlog
-	url = git@github.com:gabime/spdlog.git
+	url = git@git.qcjzai.cn:github-mirror/spdlog.git
 [submodule "src/third_party/googletest"]
 	path = src/third_party/googletest
-	url = git@github.com:google/googletest.git
+	url = git@git.qcjzai.cn:github-mirror/googletest.git
+[submodule "third_party/EETQ"]
+	path = third_party/EETQ
+	url = git@git.qcjzai.cn:github-mirror/EETQ.git
+[submodule "third_party/llm-awq"]
+	path = third_party/llm-awq
+	url = git@git.qcjzai.cn:github-mirror/llm-awq.git
+[submodule "third_party/AutoGPTQ"]
+	path = third_party/AutoGPTQ
+	url = git@git.qcjzai.cn:github-mirror/AutoGPTQ.git

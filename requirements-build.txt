@@ -1,0 +1,6 @@
+setuptools
+wheel
+cmake
+ninja
+cython
+packaging

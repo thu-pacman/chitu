@@ -1,5 +1,5 @@
 import torch
-from .global_vars import get_timers
+from .global_vars import get_timers, get_dtype
 
 from logging import getLogger
 
@@ -9,9 +9,6 @@ from .ops import move_data
 logger = getLogger(__name__)
 _BLOCK_SIZE = 512  # _BLOCK_SIZE must be a multiple of 256 for FlashAttention
 _MAX_SEQ_LEN = 2048
-_MAX_NUM_BLOCKS_PER_LAYER = (
-    _MAX_SEQ_LEN // _BLOCK_SIZE
-) * 16  # TODO: make  this dynamic
 
 
 class PagedKVCacheManager:
@@ -20,12 +17,14 @@ class PagedKVCacheManager:
         num_layers,
         n_local_kv_heads,
         head_dim,
+        num_hot_req=16,
         block_size=_BLOCK_SIZE,
         max_seq_len=_MAX_SEQ_LEN,
-        num_blocks_per_layer=_MAX_NUM_BLOCKS_PER_LAYER,
         device="cuda",
     ):
         print("Init PagedKVCacheManager")
+
+        num_blocks_per_layer = (_MAX_SEQ_LEN // _BLOCK_SIZE) * num_hot_req
 
         self.num_layers = num_layers
         self.n_local_kv_heads = n_local_kv_heads
@@ -41,13 +40,14 @@ class PagedKVCacheManager:
         self.block_table = {}  # (seq_id, layer_id, block_idx)
         # TODO: For better performance, use list instead of set for free_blocks
         self.free_blocks = set(range(self.num_blocks))
+        use_half = get_dtype()
         self.paged_k_cache = torch.zeros(
             self.num_blocks,
             block_size,
             n_local_kv_heads,
             head_dim,
             device=device,
-            dtype=torch.bfloat16,
+            dtype=torch.float16 if use_half else torch.bfloat16,
         )
         self.paged_v_cache = torch.zeros(
             self.num_blocks,
@@ -55,7 +55,7 @@ class PagedKVCacheManager:
             n_local_kv_heads,
             head_dim,
             device=device,
-            dtype=torch.bfloat16,
+            dtype=torch.float16 if use_half else torch.bfloat16,
         )
 
         # seq_lens = (tokens != -1).sum(1)
@@ -253,6 +253,7 @@ class KVCacheManager:
         max_seq = max(seq_lens)
         n_local_kv_heads = self.cache[req_ids[0]][0][0].shape[-2]
         head_dim = self.cache[req_ids[0]][0][0].shape[-1]
+        use_half = get_dtype()
         prepared_cache = torch.zeros(
             [
                 self.num_layers,  # layers
@@ -262,7 +263,7 @@ class KVCacheManager:
                 n_local_kv_heads,  # n_local_kv_heads
                 head_dim,  # head_dim
             ],
-            dtype=torch.bfloat16,
+            dtype=torch.float16 if use_half else torch.bfloat16,
             device=self.device,
         )
         # hkz-comment: Very similar to matrix transpose;
@@ -378,6 +379,7 @@ class KVCacheManagerSkewAware:
         self.max_seq_len = max_seq_len
         self.tmp_storage = []
         self.device = torch.device(device)
+        use_half = get_dtype()
         self.buffer = torch.zeros(
             [
                 self.num_layers,
@@ -388,7 +390,7 @@ class KVCacheManagerSkewAware:
                 self.head_dim,
             ],
             device=self.device,
-            dtype=torch.bfloat16,
+            dtype=torch.float16 if use_half else torch.bfloat16,
         )
         self.timers = get_timers()
         self.prepared_reqs = []
@@ -520,10 +522,38 @@ class KVCacheManagerSkewAware:
         slot_id = self.hot_reqs.index(req_id)
         if slot_id == -1:  # not in the hot slot
             return
-        self.hot_reqs[slot_id] = -1
-        self.slot_availability[slot_id] = True
-        self.req2slot.pop(req_id)
-        self.buffer[:, :, slot_id, :, :, :].zero_()
+
+        slot_last_id = next(
+            (
+                i
+                for i in range(slot_id + 1, self.num_hot_req)
+                if (
+                    not self.slot_availability[i]
+                    and (i + 1 >= self.num_hot_req or self.slot_availability[i + 1])
+                )
+            ),
+            None,
+        )
+        if slot_last_id is not None:
+            self.buffer[:, :, slot_id, :, :, :] = self.buffer[
+                :, :, slot_last_id, :, :, :
+            ]
+            req_key = next(
+                (k for k, v in self.req2slot.items() if v == slot_last_id), None
+            )
+            if req_key is not None:
+                self.req2slot[req_key] = slot_id
+                self.hot_reqs[slot_id] = req_key
+            self.hot_reqs[slot_last_id] = -1
+            self.slot_availability[slot_last_id] = True
+            if req_id in self.req2slot:
+                self.req2slot.pop(req_id)
+            self.buffer[:, :, slot_last_id, :, :, :].zero_()
+        else:
+            self.hot_reqs[slot_id] = -1
+            self.slot_availability[slot_id] = True
+            self.req2slot.pop(req_id)
+            self.buffer[:, :, slot_id, :, :, :].zero_()
 
 
 class KVCacheManagerNop:
@@ -546,6 +576,7 @@ class KVCacheManagerNop:
         self.max_seq_len = max_seq_len
         self.tmp_storage = []
         self.device = torch.device(device)
+        use_half = get_dtype()
         self.buffer = torch.zeros(
             [
                 self.num_layers,
@@ -556,7 +587,7 @@ class KVCacheManagerNop:
                 self.head_dim,
             ],
             device=self.device,
-            dtype=torch.bfloat16,
+            dtype=torch.float16 if use_half else torch.bfloat16,
         )
         pass
 

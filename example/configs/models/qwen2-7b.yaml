@@ -10,4 +10,5 @@ vocab_size: 152064
 intermediate_dim: 18944
 norm_eps: 1e-06
 rope_theta: 1000000.0
+max_position_embeddings: 32768
 max_seq_len: 10240 # length of prefill + decode

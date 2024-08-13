@@ -6,15 +6,20 @@
 # Run on aliyun and A10*4
 source /home/spack/spack/share/spack/setup-env.sh
 spack load cuda@12.4
-pip install -U torch --index-url https://download.pytorch.org/whl/cu121 # install torch
-pip install -r requirements.txt # install other python dependencies
-pip install flash-attn # may meet network problem, if so, try `https_proxy=http://127.0.0.1:7891 pip install flash-attn`
-TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 pip install -e . # Editable install
+pip install -r requirements-build.txt
+pip install -U torch --index-url https://download.pytorch.org/whl/cu121 # Install torch. You have to change `cu121` to your cuda version
+# Editable install
+TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation -e .
+# or quant supports editable install
+TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation -e .[quant]
 # or otherwise, do a non-editable Cython-compiled install:
-# TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 CINFER_WITH_CYTHON=1 pip install .
+TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 MAX_JOBS=4 CINFER_WITH_CYTHON=1 pip install --no-build-isolation .
 ```
 
-NOTE: You won't get the "editable" feature if you set both `-e` and `CINFER_WITH_CYTHON=1`. If you have accidentally done this and want to switch back, you will need to do `rm cinfer/*.so`.
+Note:
+- If you are encountering network issues, you may try appending `-i https://pypi.tuna.tsinghua.edu.cn/simple` to your `pip` commands.
+- `CINFER_SETUP_JOBS` is used to control number of jobs to compile this repo, while `MAX_JOBS` is used to control number of jobs to compile EETQ, which is a dependency of this repo.
+- You won't get the "editable" feature if you set both `-e` and `CINFER_WITH_CYTHON=1`. If you have accidentally done this and want to switch back, you will need to do `rm cinfer/*.so`.
 
 ## Internal Test
 

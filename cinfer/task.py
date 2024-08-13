@@ -2,13 +2,44 @@ import torch
 from enum import Enum
 import asyncio
 import time
+import threading
+from datetime import datetime
 from .backend import Backend
 from .async_response import AsyncDataStream, AsyncResponse
+from pathlib import Path
 import os
+import weakref
+import json
 
 from logging import getLogger
 
 logger = getLogger(__name__)
+
+
+class TaskLoad:
+    _load_score = 0
+    _lock = threading.Lock()
+    user_req = weakref.WeakSet()
+
+    @classmethod
+    def get_load(cls):
+        with cls._lock:
+            return cls._load_score
+
+    @classmethod
+    def increase(cls, score: int):
+        with cls._lock:
+            cls._load_score += score
+
+    @classmethod
+    def reduce(cls, score: int):
+        with cls._lock:
+            cls._load_score -= score
+
+    @classmethod
+    def clear(cls):
+        with cls._lock:
+            cls._load_score = 0
 
 
 class UserRequest:
@@ -20,25 +51,54 @@ class UserRequest:
         self.max_new_tokens = max_new_tokens
         self.async_stream = AsyncDataStream()
         self.output = ""
+        self.finish_reason = None
+        self.timestamp: str = datetime.now().strftime("%H:%M:%S:%f")
+        self.start_time: int = time.monotonic()
+        self.prefill_end_time: int = 0
+        self.completion_time: int = 0
+        TaskLoad.user_req.add(self)
 
     def add_data(self, data):
         self.async_stream.add_data(data)
         # self.output += data.strip("\n")
         # logger.warning(f"add data {data}")
 
+    def save_trace_to_json(self):
+        prefill_duration = self.prefill_end_time - self.start_time
+        all_duration = self.completion_time - self.start_time
+        decode_tps = self.async_stream.tokens_len / (
+            self.completion_time - self.prefill_end_time
+        )
+        tps = self.async_stream.tokens_len / all_duration
+
+        path = Path.cwd() / f"log/trace_{datetime.now().strftime('%Y_%m_%d')}.jsonl"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        trace_data = {
+            "id": self.request_id,
+            "timestamp": self.timestamp,
+            "input_length": self.prompt_len,
+            "output_length": self.async_stream.tokens_len,
+            "prefill_duration": round(prefill_duration, 6),
+            "all_duration": round(all_duration, 6),
+            "tps": round(tps, 6),
+        }
+        trace_str = json.dumps(trace_data)
+        with open(path, "a") as file:
+            file.write(trace_str + "\n")
+
 
 class TaskPool:
     pool = {}
     id_list = []
-    total_reqs = []
+    # total_reqs = []
 
     def add(task):
         if task.task_id in TaskPool.pool:
             return False  # Task already exists, failed to add
         TaskPool.pool[task.task_id] = task
         TaskPool.id_list.append(task.task_id)
-        if task.req not in TaskPool.total_reqs:
-            TaskPool.total_reqs.append(task.req)
+        # if task.req not in TaskPool.total_reqs:
+        #     TaskPool.total_reqs.append(task.req)
         return True
 
     def remove(task_id):
@@ -50,11 +110,34 @@ class TaskPool:
             )
             TaskPool.pool[task_id].req.async_stream.send_stop_signal()
             TaskPool.pool[task_id].req.completed.set()
+            TaskPool.pool[task_id].req.completion_time = time.monotonic()
+            TaskPool.pool[task_id].req.save_trace_to_json()
+            TaskLoad.reduce(TaskPool.pool[task_id].prefix_length)
             Backend.cache_manager.finalize_cache_all_decode(
                 TaskPool.pool[task_id].req.request_id
             )
+            if Backend.args.infer.cache_type == "skew":
+                # adjust decode_task order to adapt skew kv-cache
+                remove_index = TaskPool.id_list.index(task_id)
+                for decode_id in reversed(TaskPool.id_list):
+                    if (
+                        TaskPool.pool[decode_id].task_type == TaskType.Decode
+                        and decode_id != task_id
+                    ):
+                        decode_index = TaskPool.id_list.index(decode_id)
+                        (
+                            TaskPool.id_list[remove_index],
+                            TaskPool.id_list[decode_index],
+                        ) = (
+                            TaskPool.id_list[decode_index],
+                            TaskPool.id_list[remove_index],
+                        )
+                        break
+
         ret = TaskPool.pool.pop(task_id)
         TaskPool.id_list.remove(task_id)
+        if len(TaskPool.pool) == 0:
+            TaskLoad.clear()
         if ret is None:
             return False  # Task not found, failed to remove
         return True
@@ -127,13 +210,14 @@ class PrefillTask(Task):
         self.req.prompt_len = len(self.tokens)
         self.prefix_length = self.req.prompt_len
         logger.info(
-            f"Prefill_{req.request_id}: {message}, seq_len: {self.req.prompt_len}, max_seq_len: {max_seq_len}\n"
+            f"Prefill_{req.request_id}: {message}\nseq_len: {self.req.prompt_len}, max_seq_len: {max_seq_len}, max_new_tokens:[{self.req.max_new_tokens}] ==> [{min(self.req.max_new_tokens, max_seq_len - self.req.prompt_len)}]\n"
         )
         if self.req.prompt_len >= max_seq_len:
             logger.warning(
                 f"prompt length({self.prefix_length}) is greater than max_seq_len({max_seq_len})"
             )
             raise ValueError("length error")
+        TaskLoad.increase(self.req.prompt_len)
         self.req.max_new_tokens = min(
             self.req.max_new_tokens, max_seq_len - self.req.prompt_len
         )
@@ -177,6 +261,7 @@ class DecodeTask(Task):
             self.response = []
         self.next_token = next_token
         self.waiting = waiting
+        self.req.prefill_end_time = time.monotonic()
         TaskPool.add(self)
 
     def update_response(
@@ -188,18 +273,21 @@ class DecodeTask(Task):
         self.prefix_length += 1
         self.max_output_tokens -= 1
         self.req.add_data(self.next_token)
+        TaskLoad.increase(1)
         # logger.warning(f"decode token {(Backend.tokenizer.decode([self.next_token]))}")
 
     def need_remove(self):
         if Backend.args.infer.stop_with_eos:
-            return (
+            if (
                 len(self.response) > 0
-                and (
-                    torch.isin(self.response[-1], Backend.tokenizer.stop_tokens)
-                    or len(self.response) >= self.req.max_new_tokens
-                )
-            ) and not self.waiting
-        return len(self.response) >= self.req.max_new_tokens and not self.waiting
+                and torch.isin(self.response[-1], Backend.tokenizer.stop_tokens)
+            ) and not self.waiting:
+                self.req.finish_reason = "stop"
+                return True
+        if len(self.response) >= self.req.max_new_tokens and not self.waiting:
+            self.req.finish_reason = "length"
+            return True
+        return False
 
 
 def taskid2reqid(task_id):

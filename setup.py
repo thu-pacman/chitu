@@ -164,11 +164,38 @@ if os.environ.get("CINFER_WITH_CYTHON", "0") != "0":
     ext_modules += cythonize(create_cython_extensions("cinfer"))
     my_build_py = SkipBuildPy
 
+setup_dir = os.path.dirname(os.path.abspath(__file__))
+
 # The information here can also be placed in setup.cfg - better separation of
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="CInfer",
     version="0.0.1",
+    install_requires=[
+        # Don't put `torch` here because it requires downloading from a specific source
+        "transformers",
+        "flash-attn",
+        "fairscale",
+        "fire",
+        "tiktoken==0.4.0",
+        "blobfile",
+        "faker",
+        "hydra-core",
+        "fastapi",
+        "uvicorn",
+        "tqdm",
+        "accelerate",
+    ],
+    extras_require={
+        "quant": [
+            "bitsandbytes",
+            "EETQ @ file://localhost" + os.path.join(setup_dir, "third_party/EETQ"),
+            "awq_inference_engine @ file://localhost"
+            + os.path.join(setup_dir, "third_party/llm-awq/awq/kernels"),
+            "auto_gptq @ file://localhost"
+            + os.path.join(setup_dir, "third_party/AutoGPTQ"),
+        ],
+    },
     packages=find_packages(),
     ext_modules=ext_modules,
     cmdclass={"build_ext": CMakeBuild, "build_py": my_build_py},

@@ -16,7 +16,7 @@ import random
 from cinfer.global_vars import set_global_variables
 
 from cinfer.backend import Backend
-from cinfer.task import UserRequest, TaskPool, PrefillTask
+from cinfer.task import UserRequest, TaskPool, PrefillTask, TaskLoad
 from cinfer.cinfer_main import cinfer_init, cinfer_run
 from cinfer.async_response import AsyncResponse, AsyncDataStream
 
@@ -54,6 +54,13 @@ async def create_chat_completion(request: ChatRequest):
     global server_status
     if not server_status:
         return {"message": "Service is not started"}
+    if (
+        global_args.infer.cache_type == "skew"
+        and len(TaskLoad.user_req) >= global_args.infer.max_reqs
+    ):
+        raise HTTPException(
+            status_code=403, detail="exceeding server processing capacity"
+        )
     params = request.dict()
     # req_id = params.pop("conversation_id")
     req_id = gen_req_id()
@@ -114,7 +121,11 @@ async def get_cinfer_status():
 
 @app.post("/load_status")
 async def get_cinfer_load_status():
-    pass
+    return {
+        "load_score": f"{TaskLoad.get_load()}",
+        "handle_reqs": f"{len(TaskLoad.user_req)}",
+        "max_reqs": f"{global_args.infer.max_reqs}",
+    }
 
 
 @app.post("/ping")
@@ -129,7 +140,7 @@ async def health():
 
 class IgnoreSpecificPathFilter(logging.Filter):
     def filter(self, record):
-        if "POST /ping" in record.getMessage():
+        if "/ping" in record.getMessage() or "/load_status" in record.getMessage():
             return False
         return True
 
