@@ -301,9 +301,7 @@ class Transformer(nn.Module):
             tokens, list
         ):  # else use tensor variable passed by TensorExecutor
             varlens = VarLens(tokens, self.device)
-            tokens = torch.from_numpy(np.concatenate(tokens)).to(
-                self.device
-            )
+            tokens = torch.from_numpy(np.concatenate(tokens)).to(self.device)
         freqs_cis = self.prepare_freqs_cis_prefill(varlens, self.device)
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):

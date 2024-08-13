@@ -312,7 +312,6 @@ class TensorExecutor(NormalExecutor):
         Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return logits
 
-
     def step(self, tasks: PackedTasks = None):
         task_tensor = (
             tasks.task_tensor
