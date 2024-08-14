@@ -164,6 +164,7 @@ def start_worker():
 
 @hydra.main(version_base=None, config_path="./configs", config_name="serve_config")
 def main(args: DictConfig):
+    global rank
     global global_args
     global server_status
     set_global_variables()
