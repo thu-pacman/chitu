@@ -1,4 +1,4 @@
-import cinfer_backend, torch
+import torch
 from .triton_kernels import *
 
 
