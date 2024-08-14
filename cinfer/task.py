@@ -82,6 +82,7 @@ class UserRequest:
             "all_duration": round(all_duration, 6),
             "tps": round(tps, 6),
         }
+        logger.info(trace_data)
         trace_str = json.dumps(trace_data)
         with open(path, "a") as file:
             file.write(trace_str + "\n")

@@ -296,9 +296,12 @@ class Transformer(nn.Module):
         return prepared_freqs_cis
 
     @torch.inference_mode()
-    def prefill_single_device(self, tokens):
-        varlens = VarLens(tokens, self.device)
-        tokens = torch.from_numpy(np.concatenate(tokens)).to(self.device)
+    def prefill_single_device(self, tokens, varlens=None):
+        if isinstance(
+            tokens, list
+        ):  # else use tensor variable passed by TensorExecutor
+            varlens = VarLens(tokens, self.device)
+            tokens = torch.from_numpy(np.concatenate(tokens)).to(self.device)
         freqs_cis = self.prepare_freqs_cis_prefill(varlens, self.device)
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):
@@ -360,9 +363,11 @@ class Transformer(nn.Module):
         return h
 
     @torch.inference_mode()
-    def prefill(self, tokens):
+    def prefill(self, tokens, varlens=None):
         if self.pipeline_exec:
             return self.prefill_pipeline(tokens)
+        elif self.tensor_exec:
+            return self.prefill_single_device(tokens, varlens)
         else:
             return self.prefill_single_device(tokens)
 
