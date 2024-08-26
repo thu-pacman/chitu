@@ -105,7 +105,6 @@ class AsyncResponse:
             logger.info(
                 f"Completed_{self.id}: {self.req.output}, token_len: {self.async_stream.tokens_len}\n"
             )
-            self.req.save_trace_to_json()
             yield "data: [DONE]\n\n"
 
         return stream_response()
