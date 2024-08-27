@@ -14,8 +14,21 @@ RUN apt update -y \
 
 WORKDIR /workspace
 
-COPY requirements.txt requirements.txt
-RUN echo "$(readlink -f requirements.txt)"
-RUN pip install -U torch --index-url https://download.pytorch.org/whl/cu121
-RUN pip install packaging
-RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+COPY requirements-build.txt requirements-build.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -U torch==2.1 --index-url https://download.pytorch.org/whl/cu121
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple flash-attn
+
+FROM base as build
+
+WORKDIR /workspace/cinfer
+
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    TORCH_CUDA_ARCH_LIST=8.6 CINFER_WITH_CYTHON=1 pip install --no-build-isolation .[quant]
+
+RUN rm -rf *
+COPY example/ .
