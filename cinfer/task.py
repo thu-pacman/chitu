@@ -6,7 +6,9 @@ import threading
 from datetime import datetime
 from .backend import Backend
 from .async_response import AsyncDataStream, AsyncResponse
+from .utils import sample_top_p
 from pathlib import Path
+from dataclasses import dataclass
 import os
 import weakref
 import json
@@ -42,8 +44,23 @@ class TaskLoad:
             cls._load_score = 0
 
 
+@dataclass
+class SampleParams:
+    temperature: float
+    top_p: float
+    frequency_penalty: float
+
+
 class UserRequest:
-    def __init__(self, message, request_id, max_new_tokens=50):
+    def __init__(
+        self,
+        message,
+        request_id,
+        max_new_tokens=50,
+        temperature=1,
+        top_p=0.9,
+        frequency_penalty=0,
+    ):
         self.message = message
         self.prompt_len = 0
         self.request_id = request_id
@@ -56,6 +73,9 @@ class UserRequest:
         self.start_time: int = time.monotonic()
         self.prefill_end_time: int = 0
         self.completion_time: int = 0
+        self.params = SampleParams(
+            temperature=temperature, top_p=top_p, frequency_penalty=frequency_penalty
+        )
         TaskLoad.user_req.add(self)
 
     def add_data(self, data):
@@ -159,12 +179,13 @@ class TaskType(Enum):
 
 
 class Task:
-    def __init__(self, task_id, req, priority=1):
+    def __init__(self, task_id, req, params, priority=1):
         self.task_id = task_id
         self.req = req
         self.arrv_ts = time.perf_counter_ns()
         self.sched_ts = self.arrv_ts
         self.priority = priority
+        self.params = params
         self.sched_score = 0
         self.prefix_length = -1
         self.max_output_tokens = -1
@@ -201,7 +222,7 @@ class PrefillTask(Task):
         priority: int = 1,
         max_seq_len: int = 1024,
     ):
-        super().__init__(task_id, req, priority)
+        super().__init__(task_id, req, req.params, priority)
         self.message = message
         if isinstance(message, str):
             self.tokens = Backend.tokenizer.encode(message, bos=True, eos=False)
@@ -231,7 +252,11 @@ class PrefillTask(Task):
         self.linked_task = None
 
     def update_response(self, logit):
-        self.next_token = torch.argmax(logit, dim=-1).item()
+        if self.params.temperature > 0:
+            probs = torch.softmax(logit / self.params.temperature, dim=-1)
+            self.next_token = sample_top_p(probs, self.params.top_p)
+        else:
+            self.next_token = torch.argmax(logit, dim=-1).item()
         self.req.add_data(self.next_token)
         if self.linked_task is not None:
             self.linked_task.next_token = self.next_token
@@ -250,7 +275,7 @@ class DecodeTask(Task):
         priority: int = 1,
         waiting: bool = False,
     ):
-        super().__init__(task_id, req, priority)
+        super().__init__(task_id, req, req.params, priority)
         self.prefill = prefill_task
         self.prefix_length = self.prefill.prefix_length
         self.max_output_tokens = self.prefill.max_output_tokens
@@ -268,7 +293,11 @@ class DecodeTask(Task):
     def update_response(
         self, logit
     ):  # TODO: modify if generate more than one token at a time
-        self.next_token = torch.argmax(logit, dim=-1).item()
+        if self.params.temperature > 0:
+            probs = torch.softmax(logit / self.params.temperature, dim=-1)
+            self.next_token = sample_top_p(probs, self.params.top_p)
+        else:
+            self.next_token = torch.argmax(logit, dim=-1).item()
         assert self.next_token is not None
         self.response.append(self.next_token)
         self.prefix_length += 1

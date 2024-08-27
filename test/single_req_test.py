@@ -68,7 +68,10 @@ def gen_reqs_real(num_reqs, max_new_tokens):
     reqs = []
     for i in range(num_reqs):
         req = UserRequest(
-            msgs[i % len(msgs)], f"{gen_req_id()}", max_new_tokens=max_new_tokens
+            msgs[i % len(msgs)],
+            f"{gen_req_id()}",
+            max_new_tokens=max_new_tokens,
+            temperature=1,
         )
         reqs.append(req)
     return reqs
