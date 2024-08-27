@@ -7,6 +7,7 @@ from datetime import datetime
 from .backend import Backend
 from .async_response import AsyncDataStream, AsyncResponse
 from .utils import sample_top_p
+from .backend import Backend
 from pathlib import Path
 from dataclasses import dataclass
 import os
@@ -57,9 +58,9 @@ class UserRequest:
         message,
         request_id,
         max_new_tokens=50,
-        temperature=1,
+        temperature=0.8,
         top_p=0.9,
-        frequency_penalty=0,
+        frequency_penalty=0.1,
     ):
         self.message = message
         self.prompt_len = 0
@@ -281,8 +282,10 @@ class DecodeTask(Task):
         self.max_output_tokens = self.prefill.max_output_tokens
         self.sched_ddl = self.prefill.sched_ddl
         self.task_type = TaskType.Decode
+        self.frequency_tensor = torch.zeros(Backend.args.models.vocab_size)
         if next_token is not None:
             self.response = [next_token]
+            self.frequency_tensor[next_token] += 1
         else:
             self.response = []
         self.next_token = next_token
@@ -293,12 +296,18 @@ class DecodeTask(Task):
     def update_response(
         self, logit
     ):  # TODO: modify if generate more than one token at a time
+        logit = logit - self.params.frequency_penalty * self.frequency_tensor
         if self.params.temperature > 0:
             probs = torch.softmax(logit / self.params.temperature, dim=-1)
             self.next_token = sample_top_p(probs, self.params.top_p)
         else:
             self.next_token = torch.argmax(logit, dim=-1).item()
         assert self.next_token is not None
+        self.frequency_tensor[self.next_token] += 1
+        # print log
+        a = torch.argmax(self.frequency_tensor, dim=-1).item()
+        print(f"-- token:{self.next_token}, max:{a}, num:{self.frequency_tensor[a]}")
+        # END
         self.response.append(self.next_token)
         self.prefix_length += 1
         self.max_output_tokens -= 1

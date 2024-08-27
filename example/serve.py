@@ -48,9 +48,9 @@ class ChatRequest(BaseModel):
     messages: List[Message]
     max_tokens: int = 128
     stream: bool = False
-    temperature: float = 1  # [0, 2]
+    temperature: float = 0.8  # [0, 2]
     top_p: float = 0.9  # (0,1]
-    frequency_penalty: float = 0
+    frequency_penalty: float = 0.1  # [-2, 2]
 
 
 @app.post("/v1/chat/completions")
