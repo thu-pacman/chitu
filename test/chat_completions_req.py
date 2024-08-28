@@ -3,7 +3,7 @@ import requests, json, sys, time, random
 
 random.seed(2512)
 
-random.seed(2512)
+url = "http://127.0.0.1:2512/v1/chat/completions"  # cinfer
 
 headers = {"Content-Type": "application/json"}
 
@@ -78,8 +78,9 @@ def send_request(index: int):
     body = {
         "model": "/home/ss/models/Qwen2-7B-Instruct",
         "messages": msgs[index % len(msgs) if msg_id is None else msg_id],
-        "max_tokens": 512,
+        "max_tokens": 100,
         "stream": stream,
+        "temperature": 1,
     }
 
     generated_text = ""

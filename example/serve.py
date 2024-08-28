@@ -48,6 +48,9 @@ class ChatRequest(BaseModel):
     messages: List[Message]
     max_tokens: int = 128
     stream: bool = False
+    temperature: float = 0.8  # [0, 2]
+    top_p: float = 0.9  # (0,1]
+    frequency_penalty: float = 0.1  # [-2, 2]
 
 
 @app.post("/v1/chat/completions")
@@ -68,8 +71,18 @@ async def create_chat_completion(request: ChatRequest):
     stream = params.pop("stream", False)
     message = params.pop("messages")
     max_new_tokens = params.pop("max_tokens", global_args.request.max_new_tokens)
+    temp = params.pop("temperature")
+    top_p = params.pop("top_p")
+    freq_pen = params.pop("frequency_penalty")
     try:
-        req = UserRequest(message, req_id, max_new_tokens=max_new_tokens)
+        req = UserRequest(
+            message,
+            req_id,
+            max_new_tokens=max_new_tokens,
+            temperature=temp,
+            top_p=top_p,
+            frequency_penalty=freq_pen,
+        )
         response = AsyncResponse(req)
         task = PrefillTask(
             f"prefill_{req.request_id}",

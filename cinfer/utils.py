@@ -66,6 +66,17 @@ def load_pipe(checkpoint, model, num_layers, rank, world_size, type):
     model.load_state_dict(partial_checkpoint)
 
 
+def sample_top_p(logit, top_p):
+    probs_sort, probs_idx = torch.sort(logit, dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    mask = probs_sum - probs_sort > top_p
+    probs_sort[mask] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    token_tensor = torch.multinomial(probs_sort, num_samples=1)
+    next_token = torch.gather(probs_idx, -1, token_tensor).item()
+    return next_token
+
+
 class VarLens:
     def __init__(self, tokens, device) -> None:
         self.lens = torch.tensor(
