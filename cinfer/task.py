@@ -304,10 +304,6 @@ class DecodeTask(Task):
             self.next_token = torch.argmax(logit, dim=-1).item()
         assert self.next_token is not None
         self.frequency_tensor[self.next_token] += 1
-        # print log
-        a = torch.argmax(self.frequency_tensor, dim=-1).item()
-        print(f"-- token:{self.next_token}, max:{a}, num:{self.frequency_tensor[a]}")
-        # END
         self.response.append(self.next_token)
         self.prefix_length += 1
         self.max_output_tokens -= 1
