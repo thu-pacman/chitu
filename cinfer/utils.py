@@ -13,9 +13,10 @@ def load_tensor_parallel(checkpoint, model, num_layers, rank, world_size, type):
         rpl_str = ["wo", "w2"]
     elif type == "qwen":
         cpl_str = [
-            "q_proj",
-            "k_proj",
-            "v_proj",
+            "qkv_proj",  # new after fusion
+            "q_proj",  # unused after fusion, for compatibility
+            "k_proj",  # unused after fusion, for compatibility
+            "v_proj",  # unused after fusion, for compatibility
             "gate_proj",
             "up_proj",
             "lm_head",

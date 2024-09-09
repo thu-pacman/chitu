@@ -26,23 +26,16 @@ class AttentionQwen(Attention):
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
-        self.q_proj = ColumnParallelLinear(
+
+        # Do a parallel + fused linear projection. Goals:
+        # - Parallelization should be among the kv_heads dim, so there is no communication.
+        # - Outputs from q_proj, k_proj, v_proj should be contiguous in memory.
+        #
+        # Therefore, the projected shape should be [model_parallel_size, self.n_rep + 2, self.n_local_kv_heads, self.head_dim]
+
+        self.qkv_proj = ColumnParallelLinear(
             args.dim,
-            args.n_heads * self.head_dim,
-            bias=True,
-            gather_output=False,
-            init_method=lambda x: x,
-        )
-        self.k_proj = ColumnParallelLinear(
-            args.dim,
-            self.n_kv_heads * self.head_dim,
-            bias=True,
-            gather_output=False,
-            init_method=lambda x: x,
-        )
-        self.v_proj = ColumnParallelLinear(
-            args.dim,
-            self.n_kv_heads * self.head_dim,
+            (args.n_heads + 2 * self.n_kv_heads) * self.head_dim,
             bias=True,
             gather_output=False,
             init_method=lambda x: x,
@@ -61,7 +54,16 @@ class AttentionQwen(Attention):
         )
 
     def _run_linear(self, x):
-        return self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split(
+            [
+                self.n_local_heads * self.head_dim,
+                self.n_local_kv_heads * self.head_dim,
+                self.n_local_kv_heads * self.head_dim,
+            ],
+            dim=-1,
+        )
+        return q, k, v
 
     def _run_output_linear(self, x):
         return self.o_proj(x)
