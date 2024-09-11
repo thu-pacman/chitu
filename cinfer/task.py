@@ -282,10 +282,8 @@ class DecodeTask(Task):
         self.max_output_tokens = self.prefill.max_output_tokens
         self.sched_ddl = self.prefill.sched_ddl
         self.task_type = TaskType.Decode
-        self.frequency_tensor = torch.zeros(Backend.args.models.vocab_size)
         if next_token is not None:
             self.response = [next_token]
-            self.frequency_tensor[next_token] += 1
         else:
             self.response = []
         self.next_token = next_token
@@ -296,14 +294,20 @@ class DecodeTask(Task):
     def update_response(
         self, logit
     ):  # TODO: modify if generate more than one token at a time
-        logit = logit - self.params.frequency_penalty * self.frequency_tensor
+        logit.index_add_(
+            -1,
+            torch.tensor(self.response),
+            -self.params.frequency_penalty
+            * torch.ones(
+                (1, len(self.response)), dtype=logit.dtype, device=logit.device
+            ),
+        )
         if self.params.temperature > 0:
             probs = torch.softmax(logit / self.params.temperature, dim=-1)
             self.next_token = sample_top_p(probs, self.params.top_p)
         else:
             self.next_token = torch.argmax(logit, dim=-1).item()
         assert self.next_token is not None
-        self.frequency_tensor[self.next_token] += 1
         self.response.append(self.next_token)
         self.prefix_length += 1
         self.max_output_tokens -= 1
