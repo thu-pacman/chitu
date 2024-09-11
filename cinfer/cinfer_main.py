@@ -64,6 +64,7 @@ def cinfer_update(rank, world_size):
         remove_task_other_device(removed_decode_task_ids)
 
 
+@torch.inference_mode()
 def cinfer_run():
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
