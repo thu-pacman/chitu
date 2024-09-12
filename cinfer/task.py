@@ -294,14 +294,19 @@ class DecodeTask(Task):
     def update_response(
         self, logit
     ):  # TODO: modify if generate more than one token at a time
-        logit.index_add_(
-            -1,
-            torch.tensor(self.response),
-            -self.params.frequency_penalty
-            * torch.ones(
-                (1, len(self.response)), dtype=logit.dtype, device=logit.device
-            ),
-        )
+        if logit.ndim == 1:
+            logit = logit.view(1, -1)
+        if len(self.response) > 0:
+            # FIXME: It shall not reach here with empty response, but it actually happens when pipeline-parallelized.
+            # Empty response shall go to PrefillTask's update_response
+            logit.index_add_(
+                -1,
+                torch.tensor(self.response),
+                -self.params.frequency_penalty
+                * torch.ones(
+                    (1, len(self.response)), dtype=logit.dtype, device=logit.device
+                ),
+            )
         if self.params.temperature > 0:
             probs = torch.softmax(logit / self.params.temperature, dim=-1)
             self.next_token = sample_top_p(probs, self.params.top_p)
