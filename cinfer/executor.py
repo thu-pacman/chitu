@@ -1,6 +1,8 @@
 import torch
 import torch.distributed
 import numpy as np
+from typing import Optional
+
 from .task import (
     PackedTasks,
     TaskType,
@@ -14,6 +16,11 @@ from logging import getLogger
 from .global_vars import get_timers, get_dtype
 
 logger = getLogger(__name__)
+
+# Although tags are not fully supported in the NCCL backend, they are helpful to understand the code
+TASK_TENSOR_TAG = 1
+HIDDEN_TENSOR_TAG = 2
+LOGIT_TAG = 3
 
 
 class OngoingRequests:
@@ -130,80 +137,15 @@ class PipeExecutor(NormalExecutor):
         self.rank = torch.distributed.get_rank()
         self.world_size = torch.distributed.get_world_size()
 
-    def prefill_step(self, tasks: PackedTasks, h=None):
-        self.timers("prefill").start()
+    def prefill_step(self, tasks: PackedTasks):
         varlens = VarLens(tasks.tokens, self.rank)
         Backend.cache_manager.curr_varlens = varlens
         Backend.cache_manager.curr_req_ids = tasks.req_ids
-        logits = Backend.model.prefill(tasks.tokens if self.rank == 0 else h)
-        self.timers("prefill").stop()
-        # send logits to rank 0 to get response words
-        if self.rank == self.world_size - 1:
-            torch.cuda.synchronize(self.rank)
-            torch.distributed.isend(
-                logits,
-                dst=0,
-            )
-        Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
-        # after prefill, new decode tasks are created
         if self.rank == 0:
-            new_tasks = []
-            for it in range(tasks.num_tasks):
-                new_tasks.append(
-                    DecodeTask(
-                        self._prefill2decode(tasks.task_ids[it]),
-                        tasks.tasks[it].req,
-                        tasks.tasks[it],
-                        next_token=None,
-                        waiting=True,
-                    )
-                )
-                tasks.tasks[it].linked_task = new_tasks[-1]
+            inp = tasks.tokens
         else:
-            new_tasks = None
-        return logits, new_tasks
-
-    def decode_step(self, tasks: PackedTasks, h=None):
-        Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
-        Backend.cache_manager.curr_req_ids = tasks.req_ids
-        self.timers("decode").start()
-        seq_lens = self._prepare_seq_lens_for_decode(tasks)
-        tokens = self._prepare_new_tokens_for_decode(tasks) if self.rank == 0 else h
-        self.timers("decode-model").start()
-        logits = Backend.model.decode(tokens, seq_lens)
-        self.timers("decode-model").stop()
-        self.timers("decode").stop()
-        # Send logits to rank 0 to get response words
-        if self.rank == self.world_size - 1:
-            logits = logits.view(logits.shape[0], -1)
-            torch.distributed.isend(logits, dst=0)
-        Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
-        return logits
-
-    def _run_tasks(self, tasks, h):
-        if tasks.task_type == TaskType.Prefill:
-            h, new_decode_tasks = self.prefill_step(tasks, h)
-        elif tasks.task_type == TaskType.Decode:
-            h = self.decode_step(tasks, h)
-            new_decode_tasks = []
-        else:
-            raise NotImplementedError  # Hybrid task not implemented
-        return h, new_decode_tasks
-
-    def _recv_task_tensor_and_h(self):
-        task_tensor = torch.empty(
-            PackedTasks.max_num_tasks * 2, dtype=torch.int64, device=self.rank
-        )
-        torch.distributed.recv(tensor=task_tensor, src=self.rank - 1)
-        if PackedTasks.is_ended_tasks(task_tensor):
-            if self.rank < self.world_size - 1:
-                torch.distributed.isend(task_tensor, dst=self.rank + 1)
-            return task_tensor.cpu(), None, None
-        # generate packed tasks according to task_tensor
-        tasks = PackedTasks(None, self.rank, task_tensor)
-        use_half = get_dtype()
-        if tasks.task_type == TaskType.Prefill:
-            h = torch.empty(
+            use_half = get_dtype()
+            inp = torch.empty(
                 [
                     sum([len(token) for token in tasks.tokens]),
                     Backend.model.params.dim,
@@ -211,18 +153,76 @@ class PipeExecutor(NormalExecutor):
                 device=self.rank,
                 dtype=torch.float16 if use_half else torch.bfloat16,
             )
+            torch.distributed.recv(tensor=inp, src=self.rank - 1, tag=HIDDEN_TENSOR_TAG)
+        self.timers("prefill").start()
+        out = Backend.model.prefill(inp)
+        self.timers("prefill").stop()
+        if self.rank < self.world_size - 1:
+            torch.distributed.isend(
+                tensor=out, dst=self.rank + 1, tag=HIDDEN_TENSOR_TAG
+            )
         else:
-            h = torch.empty(
+            # send logits to rank 0 to get response words
+            torch.cuda.synchronize(self.rank)
+            torch.distributed.isend(
+                out,
+                dst=0,
+                tag=LOGIT_TAG,
+            )
+        Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
+        return out
+
+    def decode_step(self, tasks: PackedTasks):
+        Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
+        Backend.cache_manager.curr_req_ids = tasks.req_ids
+        if self.rank == 0:
+            inp = self._prepare_new_tokens_for_decode(tasks)
+        else:
+            use_half = get_dtype()
+            inp = torch.empty(
                 [tasks.num_tasks, 1, Backend.model.params.dim],
                 device=self.rank,
                 dtype=torch.float16 if use_half else torch.bfloat16,
             )
-        torch.distributed.recv(tensor=h, src=self.rank - 1)
-        return task_tensor, h, tasks
+            torch.distributed.recv(tensor=inp, src=self.rank - 1, tag=HIDDEN_TENSOR_TAG)
+        self.timers("decode").start()
+        seq_lens = self._prepare_seq_lens_for_decode(tasks)
+        self.timers("decode-model").start()
+        out = Backend.model.decode(inp, seq_lens)
+        self.timers("decode-model").stop()
+        self.timers("decode").stop()
+        if self.rank < self.world_size - 1:
+            torch.distributed.isend(
+                tensor=out, dst=self.rank + 1, tag=HIDDEN_TENSOR_TAG
+            )
+        else:
+            # Send logits to rank 0 to get response words
+            out = out.view(out.shape[0], -1)
+            torch.distributed.isend(out, dst=0, tag=LOGIT_TAG)
+        Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
+        return out
 
-    def _send_task_tensor_and_h(self, task_tensor, h):
-        torch.distributed.isend(tensor=task_tensor, dst=self.rank + 1)
-        torch.distributed.isend(tensor=h, dst=self.rank + 1)
+    def _recv_task_tensor(self):
+        task_tensor = torch.empty(
+            PackedTasks.max_num_tasks * 2, dtype=torch.int64, device=self.rank
+        )
+        torch.distributed.recv(
+            tensor=task_tensor, src=self.rank - 1, tag=TASK_TENSOR_TAG
+        )
+        if PackedTasks.is_ended_tasks(task_tensor):
+            if self.rank < self.world_size - 1:
+                torch.distributed.isend(
+                    task_tensor, dst=self.rank + 1, tag=TASK_TENSOR_TAG
+                )
+            return task_tensor.cpu(), None
+        # generate packed tasks according to task_tensor
+        tasks = PackedTasks(None, self.rank, task_tensor)
+        return task_tensor, tasks
+
+    def _send_task_tensor(self, task_tensor):
+        torch.distributed.isend(
+            tensor=task_tensor, dst=self.rank + 1, tag=TASK_TENSOR_TAG
+        )
 
     def _recv_logits(self, tasks, new_decode_tasks):
         logits = torch.empty(
@@ -230,24 +230,19 @@ class PipeExecutor(NormalExecutor):
             device=self.rank,
             dtype=torch.float,
         )
-        handle = torch.distributed.irecv(logits, src=self.world_size - 1)
+        handle = torch.distributed.irecv(logits, src=self.world_size - 1, tag=LOGIT_TAG)
         Backend.ongoing_reqs.append(
             OngoingRequests(tasks.reqs, tasks.tasks + new_decode_tasks, handle, logits)
         )
         for it, task in enumerate(tasks.tasks):
             task.wait(handle, logits[it])
 
-    def step(
-        self,
-        tasks: PackedTasks = None,
-    ):
-        # Rank >= 1 recv task tensor and h from Rank - 1
-        task_tensor, h, tasks = (
-            self._recv_task_tensor_and_h()
-            if self.rank > 0
-            else (tasks.task_tensor, None, tasks)
+    def _propagate_tasks(self, tasks: Optional[PackedTasks]):
+        # Rank >= 1 recv task tensor from Rank - 1
+        task_tensor, tasks = (
+            self._recv_task_tensor() if self.rank > 0 else (tasks.task_tensor, tasks)
         )
-        # get remove-kvcache signal
+        # Get remove-kvcache signal
         if tasks is None:
             for i in range(PackedTasks.max_num_tasks):
                 if task_tensor[i] == 0:
@@ -255,14 +250,37 @@ class PipeExecutor(NormalExecutor):
                 Backend.cache_manager.finalize_cache_all_decode(
                     taskid2reqid(req_decode(task_tensor[i]))
                 )
+            return None
+        # Rank < world_size - 1 send task tensor to Rank + 1
+        if self.rank < self.world_size - 1:
+            self._send_task_tensor(task_tensor)
+        return tasks
+
+    def step(
+        self,
+        tasks: Optional[PackedTasks] = None,
+    ):
+        # Get tasks from the last rank and send them to the next rank
+        tasks = self._propagate_tasks(tasks)
+        if tasks is None:
             return
         # Run tasks
-        h, new_decode_tasks = self._run_tasks(tasks, h)
-        # Rank < world_size - 1 send task tensor and h to Rank + 1
-        if self.rank < self.world_size - 1:
-            self._send_task_tensor_and_h(task_tensor, h)
+        super().step(tasks)
         # Rank 0 recv final logits from Rank world_size - 1
         if self.rank == 0:
+            new_decode_tasks = []
+            if tasks.task_type == TaskType.Prefill:
+                # After prefill, new decode tasks are created
+                for it in range(tasks.num_tasks):
+                    new_task = DecodeTask(
+                        self._prefill2decode(tasks.task_ids[it]),
+                        tasks.tasks[it].req,
+                        tasks.tasks[it],
+                        next_token=None,
+                        waiting=True,
+                    )
+                    new_decode_tasks.append(new_task)
+                    tasks.tasks[it].linked_task = new_task
             self._recv_logits(tasks, new_decode_tasks)
 
 
