@@ -71,7 +71,7 @@ def cinfer_run():
     if rank == 0:
         task_ids = Backend.scheduler.schedule()
         if len(task_ids) == 0:  # no tasks to do, but some tasks are waiting
-            cinfer_update(rank, world_size)
+            cinfer_update(task_ids, rank, world_size)
             return
         # if rank == 0:
         #     logger.warning(f"Processing {task_ids}")
