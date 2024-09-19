@@ -4,9 +4,13 @@ stages:
     - check
 
 variables:
-    VENV: "/home/hkz2/.venv/cinfer"
+    VENV: "/home/gitlab-runner/venv-cinfer-ci"
 
 before_script:
+    - |
+      if [ ! -d "$VENV" ]; then
+        python3 -m venv "$VENV"
+      fi
     - source $VENV/bin/activate
 
 format_check:
@@ -14,8 +18,9 @@ format_check:
     only:
         - merge_requests
     tags:
-        - chitu830-dev
+        - maas-runner
     script:
+        - pip install black -i https://pypi.tuna.tsinghua.edu.cn/simple
         - black --exclude src/third_party/ --exclude third_party/ --check .
 
 env_build:
@@ -23,7 +28,7 @@ env_build:
     only:
         - merge_requests
     tags:
-        - chitu830-dev
+        - maas-runner
     needs:
         - format_check
     script:
@@ -32,6 +37,7 @@ env_build:
         - git submodule foreach --recursive git reset --hard
         - source /home/spack/spack/share/spack/setup-env.sh
         - spack load cuda@12.4.0
+        - pip install -r requirements-build.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
         - TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 MAX_JOBS=4 CINFER_WITH_CYTHON=1 pip install --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple .[quant]
 
 
@@ -40,11 +46,11 @@ paged_check:
     only:
         - merge_requests
     tags:
-        - chitu830-dev
+        - maas-runner
     needs:
         - env_build
     script:
-        - grun torchrun --nproc_per_node 1 --master_port=22514 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged
+        - srun --gres=gpu:1 -p debug --pty torchrun --nproc_per_node 1 --master_port=22514 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged
 
 
 skew_check:
@@ -52,8 +58,8 @@ skew_check:
     only:
         - merge_requests
     tags:
-        - chitu830-dev
+        - maas-runner
     needs:
         - env_build
     script:
-        - grun torchrun --nproc_per_node 1 --master_port=22515 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=skew
+        - srun --gres=gpu:1 -p debug --pty torchrun --nproc_per_node 1 --master_port=22515 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=skew

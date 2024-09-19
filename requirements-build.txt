@@ -4,7 +4,7 @@ cmake
 ninja
 protobuf
 sentencepiece
-numpy==1.26
+numpy<2.0.0
 cython
 packaging
 accelerate

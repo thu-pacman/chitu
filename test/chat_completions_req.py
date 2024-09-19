@@ -76,7 +76,7 @@ if len(sys.argv) > 1:
 
 def send_request(index: int):
     body = {
-        "model": "/home/ss/models/Qwen2-7B-Instruct",
+        "model": "/home/share/models/Qwen2-7B-Instruct",
         "messages": msgs[index % len(msgs) if msg_id is None else msg_id],
         "max_tokens": 100,
         "stream": stream,
