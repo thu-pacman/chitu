@@ -1,7 +1,7 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
-# tokenizer = AutoTokenizer.from_pretrained("/home/ss/models/Qwen2-7B-Instruct")
+# tokenizer = AutoTokenizer.from_pretrained("/home/share/models/Qwen2-7B-Instruct")
 # model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-7B-Instruct")
 # tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-7B-Instruct")
 # print(tokenizer.vocab_size)
@@ -34,7 +34,7 @@ model = AutoModelForCausalLM.from_pretrained(
 tokenizer2 = AutoTokenizer.from_pretrained(model_name)
 from cinfer.tokenizer import TokenizerHF, ChatFormatHF
 
-tokenizer = TokenizerHF("/home/ss/models/Qwen2-7B-Instruct")
+tokenizer = TokenizerHF("/home/share/models/Qwen2-7B-Instruct")
 formatter = ChatFormatHF(tokenizer)
 
 # Encode input text

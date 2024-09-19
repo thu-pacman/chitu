@@ -6,7 +6,7 @@ sys.path.append("/home/cyd/cinfer/cinfer/quantize")
 from mixquant import AutoForCausalLM
 from transformers import AutoTokenizer
 
-# model path  /home/ss/models/Qwen2-7B-Instruct
+# model path  /home/share/models/Qwen2-7B-Instruct
 # model path  /home/cyd/models/Qwen2-7B-Instruct-w8a16
 import argparse
 
@@ -14,7 +14,7 @@ parser = argparse.ArgumentParser(description="Calculate Perplexity for a model."
 parser.add_argument(
     "--model_path",
     type=str,
-    default="/home/ss/models/Qwen2-7B-Instruct",
+    default="/home/share/models/Qwen2-7B-Instruct",
     help="Model path",
 )
 parser.add_argument(
