@@ -31,16 +31,12 @@ class Scheduler:
         else:
             raise NotImplementedError(f"Scheduler {args.type} not implemented")
 
-    def __init__(self):
-        self.ret_task_ids = []
-
     def schedule(self) -> List[str]:
-        assert len(self.ret_task_ids) == 0
-        return self.ret_task_ids
+        raise NotImplementedError()
 
-    def update(self, unwait_task_ids=[]):
+    def update(self, cur_task_ids, unwait_task_ids=[]):
         removed_task_ids = []
-        task_ids = self.ret_task_ids + unwait_task_ids
+        task_ids = cur_task_ids + unwait_task_ids
         task_ids = list(set(task_ids))
         # logger.warning(f"rank {torch.distributed.get_rank()} {task_ids}")
         for task_id in task_ids:
@@ -55,7 +51,6 @@ class Scheduler:
         # for task_id in unwait_task_ids:
         #     if task_id in TaskPool.id_list and TaskPool.pool[task_id].need_remove():
         #         assert TaskPool.remove(task_id), "Task not found in pool"
-        self.ret_task_ids = []  # reset scheduled tasks
         return removed_task_ids
 
     def is_done(self):
@@ -75,9 +70,8 @@ class FcfsScheduler(Scheduler):
         self.enable_hybrid = enable_hybrid
 
     def schedule(self) -> List[str]:
-        super().schedule()
         if self.enable_hybrid:
-            self.ret_task_ids = TaskPool.id_list[: self.num_tasks]
+            ret_task_ids = TaskPool.id_list[: self.num_tasks]
         else:
             filter_task_type = (
                 TaskPool.pool[TaskPool.id_list[0]].task_type
@@ -88,11 +82,11 @@ class FcfsScheduler(Scheduler):
                 lambda x: TaskPool.pool[x].task_type == filter_task_type,
                 TaskPool.id_list,
             )
-            self.ret_task_ids = list(filtered_task_ids)[: self.num_tasks]
+            ret_task_ids = list(filtered_task_ids)[: self.num_tasks]
         if filter_task_type == TaskType.Prefill:
-            self.ret_task_ids = self.ret_task_ids[:1]
+            ret_task_ids = ret_task_ids[:1]
         # logger.info(f"Selected task_ids: {self.ret_task_ids}")
-        return self.ret_task_ids
+        return ret_task_ids
 
 
 class PrefillFirstScheduler(Scheduler):
@@ -108,34 +102,33 @@ class PrefillFirstScheduler(Scheduler):
         self.enable_hybrid = enable_hybrid
 
     def schedule(self) -> List[str]:
-        super().schedule()
         prefill_task_ids = filter(
             lambda x: TaskPool.pool[x].task_type == TaskType.Prefill
             and not TaskPool.pool[x].waiting,
             TaskPool.id_list,
         )
         # select at most num_tasks prefill tasks
-        self.ret_task_ids = list(prefill_task_ids)[: self.num_tasks]
+        ret_task_ids = list(prefill_task_ids)[: self.num_tasks]
         # if no prefill tasks or enable hybrid, select decode tasks if there is room left
-        if len(self.ret_task_ids) == 0 or (
-            self.enable_hybrid and len(self.ret_task_ids) < self.num_tasks
+        if len(ret_task_ids) == 0 or (
+            self.enable_hybrid and len(ret_task_ids) < self.num_tasks
         ):
             decode_task_ids = filter(
                 lambda x: TaskPool.pool[x].task_type == TaskType.Decode
                 and not TaskPool.pool[x].waiting,
                 TaskPool.id_list,
             )
-            self.ret_task_ids.extend(
-                list(decode_task_ids)[: self.num_tasks - len(self.ret_task_ids)]
+            ret_task_ids.extend(
+                list(decode_task_ids)[: self.num_tasks - len(ret_task_ids)]
             )
-        # logger.info(f"Selected task_ids: {self.ret_task_ids}")
+        # logger.info(f"Selected task_ids: {ret_task_ids}")
 
         # if (
-        #     len(self.ret_task_ids) > 0
-        #     and TaskPool.pool[self.ret_task_ids[0]].task_type == TaskType.Prefill
+        #     len(ret_task_ids) > 0
+        #     and TaskPool.pool[ret_task_ids[0]].task_type == TaskType.Prefill
         # ):
-        #     self.ret_task_ids = self.ret_task_ids[:1]
-        return self.ret_task_ids
+        #     ret_task_ids = ret_task_ids[:1]
+        return ret_task_ids
 
 
 class StrideScheduler(Scheduler):
@@ -153,7 +146,6 @@ class StrideScheduler(Scheduler):
         self.enable_hybrid = enable_hybrid
 
     def schedule(self) -> List[str]:
-        super().schedule()
         # update sched_score
         for task_id in TaskPool.id_list:
             task = TaskPool.pool[task_id]
@@ -161,7 +153,7 @@ class StrideScheduler(Scheduler):
             task.sched_ts = time.perf_counter_ns()
         # sort by sched_score and select top tasks
         if self.enable_hybrid:
-            self.ret_task_ids = sorted(
+            ret_task_ids = sorted(
                 TaskPool.id_list,
                 key=lambda x: TaskPool.pool[x].sched_score,
                 reverse=True,
@@ -176,16 +168,16 @@ class StrideScheduler(Scheduler):
                 lambda x: TaskPool.pool[x].task_type == filter_task_type,
                 TaskPool.id_list,
             )
-            self.ret_task_ids = sorted(
+            ret_task_ids = sorted(
                 list(filtered_task_ids),
                 key=lambda x: TaskPool.pool[x].sched_score,
                 reverse=True,
             )[: self.num_tasks]
         # reset sched_score of selected tasks
-        for task_id in self.ret_task_ids:
+        for task_id in ret_task_ids:
             TaskPool.pool[task_id].sched_score = 0
-        # logger.info(f"Selected task_ids: {self.ret_task_ids}")
-        return self.ret_task_ids
+        # logger.info(f"Selected task_ids: {ret_task_ids}")
+        return ret_task_ids
 
 
 class DdlScheduler(Scheduler):
@@ -203,10 +195,9 @@ class DdlScheduler(Scheduler):
         self.enable_hybrid = enable_hybrid
 
     def schedule(self) -> List[str]:
-        super().schedule()
         # sort by ddl and select top tasks
         if self.enable_hybrid:
-            self.ret_task_ids = sorted(
+            ret_task_ids = sorted(
                 TaskPool.id_list, key=lambda x: TaskPool.pool[x].sched_ddl
             )[: self.num_tasks]
         else:
@@ -219,11 +210,11 @@ class DdlScheduler(Scheduler):
                 lambda x: TaskPool.pool[x].task_type == filter_task_type,
                 TaskPool.id_list,
             )
-            self.ret_task_ids = sorted(
+            ret_task_ids = sorted(
                 list(filtered_task_ids), key=lambda x: TaskPool.pool[x].sched_ddl
             )[: self.num_tasks]
-        # logger.info(f"Selected task_ids: {self.ret_task_ids}")
-        return self.ret_task_ids
+        # logger.info(f"Selected task_ids: {ret_task_ids}")
+        return ret_task_ids
 
 
 class PrefixAlignScheduler(Scheduler):
@@ -244,7 +235,7 @@ class PrefixAlignScheduler(Scheduler):
         super().schedule()
         # TODO: no definition on 'close prefix length', sort by prefix length and select the longest
         if self.enable_hybrid:
-            self.ret_task_ids = sorted(
+            ret_task_ids = sorted(
                 TaskPool.id_list, key=lambda x: TaskPool.pool[x].prefix_length
             )[: self.num_tasks]
         else:
@@ -257,11 +248,11 @@ class PrefixAlignScheduler(Scheduler):
                 lambda x: TaskPool.pool[x].task_type == filter_task_type,
                 TaskPool.id_list,
             )
-            self.ret_task_ids = sorted(
+            ret_task_ids = sorted(
                 list(filtered_task_ids), key=lambda x: TaskPool.pool[x].prefix_length
             )[: self.num_tasks]
-        # logger.info(f"Selected task_ids: {self.ret_task_ids}")
-        return self.ret_task_ids
+        # logger.info(f"Selected task_ids: {ret_task_ids}")
+        return ret_task_ids
 
 
 class BalanceScheduler(Scheduler):
@@ -300,13 +291,13 @@ class BalanceScheduler(Scheduler):
                 else self.num_tasks - len(decode_task_ids)
             )
             decode_count = self.num_tasks - prefill_count
-            self.ret_task_ids = prefill_task_ids[:prefill_count]
-            self.ret_task_ids.extend(decode_task_ids[:decode_count])
+            ret_task_ids = prefill_task_ids[:prefill_count]
+            ret_task_ids.extend(decode_task_ids[:decode_count])
         else:  # fall back to prefill_first
-            self.ret_task_ids = (
+            ret_task_ids = (
                 prefill_task_ids[: self.num_tasks]
                 if len(prefill_task_ids) > 0
                 else decode_task_ids[: self.num_tasks]
             )
-        # logger.info(f"Selected task_ids: {self.ret_task_ids}")
-        return self.ret_task_ids
+        # logger.info(f"Selected task_ids: {ret_task_ids}")
+        return ret_task_ids

@@ -54,11 +54,11 @@ def update_ongoing_tasks():
     return unwait_task_ids
 
 
-def cinfer_update(rank, world_size):
+def cinfer_update(task_ids, rank, world_size):
     if rank == 0:
         TaskPool.display()
     removed_decode_task_ids = Backend.scheduler.update(
-        update_ongoing_tasks() if world_size > 1 else []
+        task_ids, update_ongoing_tasks() if world_size > 1 else []
     )
     if world_size > 1:
         remove_task_other_device(removed_decode_task_ids)
@@ -80,7 +80,7 @@ def cinfer_run():
         tasks = None
     Backend.executor.step(tasks)
     if Backend.parallel_type == "pipe" and rank == 0:
-        cinfer_update(rank, world_size)
+        cinfer_update(task_ids, rank, world_size)
     elif rank == 0:
         TaskPool.display()
-        Backend.scheduler.update()
+        Backend.scheduler.update(task_ids)
