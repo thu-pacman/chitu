@@ -242,6 +242,65 @@ class Backend:
                         return key
 
                     checkpoint = dict((transform_key(k), v) for k, v in params.items())
+
+                # Fuse q_proj, k_proj, v_proj into qkv_proj
+                new_checkpoint = {}
+                for k in checkpoint.keys():
+                    if k.endswith("q_proj.weight"):
+                        prefix = k[: -len("q_proj.weight")]
+                        assert prefix + "k_proj.weight" in checkpoint
+                        assert prefix + "v_proj.weight" in checkpoint
+                        q_weight = checkpoint[prefix + "q_proj.weight"]
+                        k_weight = checkpoint[prefix + "k_proj.weight"]
+                        v_weight = checkpoint[prefix + "v_proj.weight"]
+
+                        # The fused projected shape should be concatenated after the model parallel dimension.
+                        # See model_qwen.py for details.
+
+                        # q_weight, k_weight, v_weight are from ColumnParallelLinear, so their shape[0] are
+                        # output_size
+                        assert q_weight.shape[0] % model_parallel_size == 0
+                        assert k_weight.shape[0] % model_parallel_size == 0
+                        assert v_weight.shape[0] % model_parallel_size == 0
+                        q_weight = q_weight.reshape(
+                            model_parallel_size, -1, q_weight.shape[-1]
+                        )
+                        k_weight = k_weight.reshape(
+                            model_parallel_size, -1, k_weight.shape[-1]
+                        )
+                        v_weight = v_weight.reshape(
+                            model_parallel_size, -1, v_weight.shape[-1]
+                        )
+                        qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=1)
+                        qkv_weight = qkv_weight.reshape(-1, qkv_weight.shape[-1])
+                        new_checkpoint[prefix + "qkv_proj.weight"] = qkv_weight
+                    elif k.endswith("k_proj.weight") or k.endswith("v_proj.weight"):
+                        continue
+                    elif k.endswith("q_proj.bias"):
+                        prefix = k[: -len("q_proj.bias")]
+                        assert prefix + "k_proj.bias" in checkpoint
+                        assert prefix + "v_proj.bias" in checkpoint
+                        q_bias = checkpoint[prefix + "q_proj.bias"]
+                        k_bias = checkpoint[prefix + "k_proj.bias"]
+                        v_bias = checkpoint[prefix + "v_proj.bias"]
+
+                        # The fused projected shape should be concatenated after the model parallel dimension.
+                        # See model_qwen.py for details.
+                        assert q_bias.shape[0] % model_parallel_size == 0
+                        assert k_bias.shape[0] % model_parallel_size == 0
+                        assert v_bias.shape[0] % model_parallel_size == 0
+                        q_bias = q_bias.reshape(model_parallel_size, -1)
+                        k_bias = k_bias.reshape(model_parallel_size, -1)
+                        v_bias = v_bias.reshape(model_parallel_size, -1)
+                        qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=1)
+                        qkv_bias = qkv_bias.reshape(-1)
+                        new_checkpoint[prefix + "qkv_proj.bias"] = qkv_bias
+                    elif k.endswith("k_proj.bias") or k.endswith("v_proj.bias"):
+                        continue
+                    else:
+                        new_checkpoint[k] = checkpoint[k]
+                checkpoint = new_checkpoint
+
             # logger.warning(checkpoint.keys())
             if pipeline_parallel_size > 1:
                 load_pipe(
