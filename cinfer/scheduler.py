@@ -232,7 +232,6 @@ class PrefixAlignScheduler(Scheduler):
         self.enable_hybrid = enable_hybrid
 
     def schedule(self) -> List[str]:
-        super().schedule()
         # TODO: no definition on 'close prefix length', sort by prefix length and select the longest
         if self.enable_hybrid:
             ret_task_ids = sorted(
@@ -271,7 +270,6 @@ class BalanceScheduler(Scheduler):
         self.enable_hybrid = enable_hybrid
 
     def schedule(self) -> List[str]:
-        super().schedule()
         prefill_task_ids = list(
             filter(
                 lambda x: TaskPool.pool[x].task_type == TaskType.Prefill,
