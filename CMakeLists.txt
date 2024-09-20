@@ -117,3 +117,9 @@ message(STATUS "PYTHON_LIBRARIES: ${PYTHON_LIBRARIES}")
 target_link_libraries(cinfer_backend PRIVATE ${PROJECT_NAME} ${TORCH_PYTHON_LIBRARY})
 target_link_libraries(cinfer_backend PRIVATE ${PYTHON_LIBRARIES})
 target_include_directories(cinfer_backend PRIVATE ${project_INCLUDE_DIR})
+
+# Add a relative RPATH reflecting the same directory of cinfer_backend,
+# so we can find the ${PROJECT_NAME} library.
+# NOTE 1: $ORIGIN is a variable of LD, not CMake.
+# NOTE 2: We don't perform install, so we are setting BUILD_RPATH instead of INSTALL_RPATH.
+set_target_properties(cinfer_backend PROPERTIES BUILD_RPATH "$ORIGIN")
