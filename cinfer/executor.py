@@ -1,9 +1,12 @@
 import torch
 import torch.distributed
 import numpy as np
-from typing import Optional
+from typing import Optional, Sequence
+from dataclasses import dataclass
 
 from .task import (
+    Task,
+    UserRequest,
     PackedTasks,
     TaskType,
     DecodeTask,
@@ -11,7 +14,7 @@ from .task import (
     taskid2reqid,
 )
 from .backend import Backend
-from .utils import VarLens
+from .utils import VarLens, sample_top_p
 from logging import getLogger
 from .global_vars import get_timers, get_dtype
 
@@ -23,12 +26,13 @@ HIDDEN_TENSOR_TAG = 2
 LOGIT_TAG = 3
 
 
+@dataclass
 class OngoingRequests:
-    def __init__(self, reqs, tasks, handle, logits):
-        self.reqs = reqs
-        self.tasks = tasks
-        self.handle = handle
-        self.logits = logits
+    reqs: Sequence[UserRequest]
+    waiting_tasks: Sequence[Task]
+    new_decode_tasks: Sequence[DecodeTask]
+    handle: torch.distributed.distributed_c10d.Work
+    logits: torch.Tensor
 
 
 class Executor:
@@ -76,6 +80,49 @@ class NormalExecutor(Executor):
     def __init__(self, args):
         super().__init__(args)
 
+    def update_response(self, tasks: Sequence[Task], logits: torch.Tensor):
+        logits = logits.view(-1, logits.shape[-1])
+        assert len(tasks) == logits.shape[0]
+        for it, task in enumerate(tasks):
+            if (
+                task.req.params.frequency_penalty > 0
+                and isinstance(task, DecodeTask)
+                and len(task.response) > 0
+            ):
+                logits[it].index_add_(
+                    -1,
+                    torch.tensor(task.response, dtype=torch.long, device=logits.device),
+                    -task.req.params.frequency_penalty
+                    * torch.ones(
+                        (len(task.response),),
+                        dtype=logits.dtype,
+                        device=logits.device,
+                    ),
+                )
+        temperatures = torch.tensor(
+            [task.req.params.temperature for task in tasks], device=logits.device
+        )
+        top_ps = torch.tensor(
+            [task.req.params.top_p for task in tasks], device=logits.device
+        )
+        if torch.all(temperatures > 0):
+            probs = torch.softmax(logits / temperatures.view(-1, 1), dim=-1)
+            tokens = sample_top_p(probs, top_ps.view(-1, 1))
+        elif torch.all(temperatures == 0):
+            tokens = torch.argmax(logits, dim=-1)
+        else:
+            tokens = torch.empty(
+                (logits.shape[0],), dtype=torch.long, device=logits.device
+            )
+            for i in range(len(tasks)):
+                if temperatures[i] == 0:
+                    tokens[i] = torch.argmax(logits[i])
+                else:
+                    probs = torch.softmax(logits[i] / temperatures[i], dim=-1)
+                    tokens[i] = sample_top_p(probs, top_ps[i])
+        for it, task in enumerate(tasks):
+            task.update_response(tokens[it].item())
+
     def prefill_step(self, tasks: PackedTasks):
         # logger.warning(f"Prefill step: {tasks.task_ids}")
         varlens = VarLens(tasks.tokens, "cuda")
@@ -84,12 +131,12 @@ class NormalExecutor(Executor):
         Backend.cache_manager.curr_req_ids = tasks.req_ids
         logits = Backend.model.prefill(tasks.tokens)
         self.timers("prefill").stop()
+        self.update_response(tasks.tasks, logits)
         # after prefill, new decode tasks are created
         new_tasks = []
         start = 0
         for it in range(tasks.num_tasks):
             start += varlens.cpu_lens[it]
-            tasks.tasks[it].update_response(logits[it])
             new_tasks.append(
                 DecodeTask(
                     self._prefill2decode(tasks.task_ids[it]),
@@ -113,8 +160,7 @@ class NormalExecutor(Executor):
         logits = Backend.model.decode(new_tokens, seq_lens)
         self.timers("decode-model").stop()
         self.timers("decode").stop()
-        for it, task in enumerate(tasks.tasks):
-            task.update_response(logits[it])
+        self.update_response(tasks.tasks, logits)
         Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return logits
 
@@ -232,10 +278,10 @@ class PipeExecutor(NormalExecutor):
         )
         handle = torch.distributed.irecv(logits, src=self.world_size - 1, tag=LOGIT_TAG)
         Backend.ongoing_reqs.append(
-            OngoingRequests(tasks.reqs, tasks.tasks + new_decode_tasks, handle, logits)
+            OngoingRequests(tasks.reqs, tasks.tasks, new_decode_tasks, handle, logits)
         )
         for it, task in enumerate(tasks.tasks):
-            task.wait(handle, logits[it])
+            task.wait(handle)
 
     def _propagate_tasks(self, tasks: Optional[PackedTasks]):
         # Rank >= 1 recv task tensor from Rank - 1
@@ -298,11 +344,11 @@ class TensorExecutor(NormalExecutor):
         logits = Backend.model.prefill(tokens, varlens=varlens)
         self.timers("prefill").stop()
         if self.rank == 0:
+            self.update_response(tasks.tasks, logits)
             new_tasks = []
             start = 0
             for it in range(tasks.num_tasks):
                 start += varlens.cpu_lens[it]
-                tasks.tasks[it].update_response(logits[it])
                 new_tasks.append(
                     DecodeTask(
                         self._prefill2decode(tasks.task_ids[it]),
@@ -325,8 +371,7 @@ class TensorExecutor(NormalExecutor):
         self.timers("decode-model").stop()
         self.timers("decode").stop()
         if self.rank == 0:
-            for it, task in enumerate(tasks.tasks):
-                task.update_response(logits[it])
+            self.update_response(tasks.tasks, logits)
         Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return logits
 

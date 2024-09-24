@@ -6,7 +6,6 @@ import threading
 from datetime import datetime
 from .backend import Backend
 from .async_response import AsyncDataStream, AsyncResponse
-from .utils import sample_top_p
 from .backend import Backend
 from pathlib import Path
 from dataclasses import dataclass
@@ -190,27 +189,30 @@ class Task:
         self.sched_score = 0
         self.prefix_length = -1
         self.max_output_tokens = -1
+
+        # Waiting means either of:
+        # 1) waiting logits to return from another node, or
+        # 2) waiting for a prefill task to end to begin a decode task
         self.waiting = False
+
+        # The Case 1 waiting task's communication handle
         self.handle = None
-        self.wait_logit = None
 
     def need_remove(self):
         raise NotImplementedError
 
-    def update_response(self, logit):
+    def update_response(self, tokens):
         raise NotImplementedError
 
-    def wait(self, handle, logit):
+    def wait(self, handle):
         self.waiting = True
         self.handle = handle
-        self.wait_logit = logit
 
     def unwait(self):
         # logger.warning(f"unwait {self.task_id}")
+        assert self.waiting
         self.waiting = False
         self.handle = None
-        if self.wait_logit is not None:
-            self.update_response(self.wait_logit)
         self.wait_logit = None
 
 
@@ -252,12 +254,8 @@ class PrefillTask(Task):
         )
         self.linked_task = None
 
-    def update_response(self, logit):
-        if self.params.temperature > 0:
-            probs = torch.softmax(logit / self.params.temperature, dim=-1)
-            self.next_token = sample_top_p(probs, self.params.top_p)
-        else:
-            self.next_token = torch.argmax(logit, dim=-1).item()
+    def update_response(self, token: int):
+        self.next_token = token
         self.req.add_data(self.next_token)
         if self.linked_task is not None:
             self.linked_task.next_token = self.next_token
@@ -292,26 +290,9 @@ class DecodeTask(Task):
         TaskPool.add(self)
 
     def update_response(
-        self, logit
+        self, token: int
     ):  # TODO: modify if generate more than one token at a time
-        if logit.ndim == 1:
-            logit = logit.view(1, -1)
-        if len(self.response) > 0:
-            # FIXME: It shall not reach here with empty response, but it actually happens when pipeline-parallelized.
-            # Empty response shall go to PrefillTask's update_response
-            logit.index_add_(
-                -1,
-                torch.tensor(self.response),
-                -self.params.frequency_penalty
-                * torch.ones(
-                    (1, len(self.response)), dtype=logit.dtype, device=logit.device
-                ),
-            )
-        if self.params.temperature > 0:
-            probs = torch.softmax(logit / self.params.temperature, dim=-1)
-            self.next_token = sample_top_p(probs, self.params.top_p)
-        else:
-            self.next_token = torch.argmax(logit, dim=-1).item()
+        self.next_token = token
         assert self.next_token is not None
         self.response.append(self.next_token)
         self.prefix_length += 1
