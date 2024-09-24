@@ -74,7 +74,7 @@ def sample_top_p(logit, top_p):
     probs_sort[mask] = 0.0
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
     token_tensor = torch.multinomial(probs_sort, num_samples=1)
-    next_token = torch.gather(probs_idx, -1, token_tensor).item()
+    next_token = torch.gather(probs_idx, -1, token_tensor)
     return next_token
 
 

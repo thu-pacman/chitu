@@ -35,32 +35,36 @@ def remove_task_other_device(remove_task_ids):
     torch.distributed.isend(tensor=task_tensor, dst=1)
 
 
-def update_ongoing_reqs():
+def update_ongoing_tasks():
     to_remove = []
-    unwait_task_ids = []
+    unwait_tasks = []
+    logits_list = []
     for ogr in Backend.ongoing_reqs:
         if ogr.handle.is_completed():
             to_remove.append(ogr)
-            for task in ogr.tasks:
+            logits_list.append(ogr.logits.view(-1, ogr.logits.shape[-1]))
+            for task in ogr.waiting_tasks:
                 task.unwait()
-                unwait_task_ids.append(task.task_id)
+                unwait_tasks.append(task)
+            for task in ogr.new_decode_tasks:
+                task.unwait()
     for tr in to_remove:
         Backend.ongoing_reqs.remove(tr)
-    return unwait_task_ids
-
-
-def update_ongoing_tasks():
-    unwait_task_ids = update_ongoing_reqs()
-    return unwait_task_ids
+    logits_tensor = torch.cat(logits_list) if len(logits_list) > 0 else None
+    return unwait_tasks, logits_tensor
 
 
 def cinfer_update(task_ids, rank, world_size):
     if rank == 0:
         TaskPool.display()
-    removed_decode_task_ids = Backend.scheduler.update(
-        task_ids, update_ongoing_tasks() if world_size > 1 else []
-    )
-    if world_size > 1:
+    if world_size == 1:
+        Backend.scheduler.update(task_ids)
+    else:
+        unwait_tasks, logits = update_ongoing_tasks()
+        if logits is not None:
+            Backend.executor.update_response(unwait_tasks, logits)
+        unwait_task_ids = [t.task_id for t in unwait_tasks]
+        removed_decode_task_ids = Backend.scheduler.update(task_ids, unwait_task_ids)
         remove_task_other_device(removed_decode_task_ids)
 
 
