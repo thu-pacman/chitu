@@ -1,4 +1,4 @@
-from cinfer.task import UserRequest, TaskPool, PrefillTask
+from cinfer.task import UserRequest, TaskPool, Task
 
 # from cinfer.backend import Backend
 from cinfer.cinfer_main import cinfer_init, cinfer_run
@@ -87,7 +87,7 @@ def run_pipe(args, timers):
                 num_reqs=args.infer.max_reqs, max_new_tokens=args.request.max_new_tokens
             )
             for req in reqs:
-                TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
+                TaskPool.add(Task(f"{req.request_id}", req, req.message))
         t_start = time.time()
         timers("overall").start()
         while len(TaskPool.pool) > 0 or rank != 0:
@@ -116,7 +116,7 @@ def run_normal(args, timers):
             max_new_tokens=args.request.max_new_tokens,
         )
         for req in reqs:
-            TaskPool.add(PrefillTask(f"prefill_{req.request_id}", req, req.message))
+            TaskPool.add(Task(f"{req.request_id}", req, req.message))
         t_start = time.time()
         timers("overall").start()
         while len(TaskPool.pool) > 0:

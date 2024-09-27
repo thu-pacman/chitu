@@ -1,7 +1,7 @@
 import torch.distributed
 from .executor import Executor
 from .scheduler import Scheduler
-from .task import PackedTasks, req_encode, TaskPool
+from .task import PackedTasks, req_encode, TaskPool, TaskType
 from .backend import Backend
 import torch
 from logging import getLogger
@@ -26,7 +26,9 @@ def remove_task_other_device(remove_task_ids):
     encoded = [0] * (PackedTasks.max_num_tasks * 2)
     encoded[PackedTasks.max_num_tasks] = -1  # Flag to indicate ending these tasks
     for it, tid in enumerate(remove_task_ids):
-        encoded[it] = req_encode(tid)
+        encoded[it] = req_encode(
+            TaskType.Decode, tid  # Since we are removing, any task type is fine
+        )
     task_tensor = torch.tensor(
         encoded,
         dtype=torch.int64,
@@ -46,8 +48,6 @@ def update_ongoing_tasks():
             for task in ogr.waiting_tasks:
                 task.unwait()
                 unwait_tasks.append(task)
-            for task in ogr.new_decode_tasks:
-                task.unwait()
     for tr in to_remove:
         Backend.ongoing_reqs.remove(tr)
     logits_tensor = torch.cat(logits_list) if len(logits_list) > 0 else None
