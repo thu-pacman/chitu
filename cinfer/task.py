@@ -125,7 +125,7 @@ class TaskPool:
     def remove(task_id):
         assert task_id in TaskPool.pool, "Task not found in pool"
         # logger.warning(f"finish {task_id} cuda memory {torch.cuda.memory_allocated()}")
-        if isinstance(TaskPool.pool[task_id], DecodeTask):
+        if TaskPool.pool[task_id].task_type == TaskType.Decode:
             TaskPool.pool[task_id].req.output = repr(
                 "".join(TaskPool.pool[task_id].req.async_stream.seqs)
             )
@@ -179,44 +179,6 @@ class TaskType(Enum):
 
 
 class Task:
-    def __init__(self, task_id, req, params, priority=1):
-        self.task_id = task_id
-        self.req = req
-        self.arrv_ts = time.perf_counter_ns()
-        self.sched_ts = self.arrv_ts
-        self.priority = priority
-        self.params = params
-        self.sched_score = 0
-        self.prefix_length = -1
-        self.max_output_tokens = -1
-
-        # Waiting means either of:
-        # 1) waiting logits to return from another node, or
-        # 2) waiting for a prefill task to end to begin a decode task
-        self.waiting = False
-
-        # The Case 1 waiting task's communication handle
-        self.handle = None
-
-    def need_remove(self):
-        raise NotImplementedError
-
-    def update_response(self, tokens):
-        raise NotImplementedError
-
-    def wait(self, handle):
-        self.waiting = True
-        self.handle = handle
-
-    def unwait(self):
-        # logger.warning(f"unwait {self.task_id}")
-        assert self.waiting
-        self.waiting = False
-        self.handle = None
-        self.wait_logit = None
-
-
-class PrefillTask(Task):
     def __init__(
         self,
         task_id: str,
@@ -225,13 +187,30 @@ class PrefillTask(Task):
         priority: int = 1,
         max_seq_len: int = 1024,
     ):
-        super().__init__(task_id, req, req.params, priority)
-        self.message = message
+        self.task_id = task_id
+        self.req = req
+        self.response = []
+        self.arrv_ts = time.perf_counter_ns()
+        self.sched_ts = self.arrv_ts
+        self.priority = priority
+        self.sched_score = 0
+        self.prefix_length = -1
+        self.max_output_tokens = -1
+
+        # Waiting is only meaningful in pipeline parallelism. It means either of:
+        # 1) waiting logits to return from another node, or
+        # 2) waiting for a prefill task to end to begin a decode task
+        # Data parallelism and tensor parallelism do not need this, because they only call scheduler after finishing a task
+        self.waiting = False
+
+        # The Case 1 waiting task's communication handle
+        self.handle = None
+
         if isinstance(message, str):
             self.tokens = Backend.tokenizer.encode(message, bos=True, eos=False)
         else:
             self.tokens = Backend.formatter.encode_dialog_prompt(message)
-        self.task_type = TaskType.Prefill
+        self.task_type = TaskType.Prefill  # New Task object is always a prefill task
         self.req.prompt_len = len(self.tokens)
         self.prefix_length = self.req.prompt_len
         logger.info(
@@ -254,53 +233,6 @@ class PrefillTask(Task):
         )
         self.linked_task = None
 
-    def update_response(self, token: int):
-        self.next_token = token
-        self.req.add_data(self.next_token)
-        if self.linked_task is not None:
-            self.linked_task.next_token = self.next_token
-
-    def need_remove(self):
-        return not self.waiting
-
-
-class DecodeTask(Task):
-    def __init__(
-        self,
-        task_id: str,
-        req: UserRequest,
-        prefill_task: PrefillTask,
-        next_token,
-        priority: int = 1,
-        waiting: bool = False,
-    ):
-        super().__init__(task_id, req, req.params, priority)
-        self.prefill = prefill_task
-        self.prefix_length = self.prefill.prefix_length
-        self.max_output_tokens = self.prefill.max_output_tokens
-        self.sched_ddl = self.prefill.sched_ddl
-        self.task_type = TaskType.Decode
-        if next_token is not None:
-            self.response = [next_token]
-        else:
-            self.response = []
-        self.next_token = next_token
-        self.waiting = waiting
-        self.req.prefill_end_time = time.monotonic()
-        TaskPool.add(self)
-
-    def update_response(
-        self, token: int
-    ):  # TODO: modify if generate more than one token at a time
-        self.next_token = token
-        assert self.next_token is not None
-        self.response.append(self.next_token)
-        self.prefix_length += 1
-        self.max_output_tokens -= 1
-        self.req.add_data(self.next_token)
-        TaskLoad.increase(1)
-        # logger.warning(f"decode token {(Backend.tokenizer.decode([self.next_token]))}")
-
     def need_remove(self):
         if Backend.args.infer.stop_with_eos:
             if (
@@ -314,25 +246,49 @@ class DecodeTask(Task):
             return True
         return False
 
+    def update_response(self, token: int):
+        # TODO: modify if generate more than one token at a time
+        assert token is not None
+        self.next_token = token
+        self.response.append(self.next_token)
+        self.prefix_length += 1
+        self.max_output_tokens -= 1
+        self.req.add_data(self.next_token)
+        TaskLoad.increase(1)
+
+    def wait(self, handle):
+        self.waiting = True
+        self.handle = handle
+
+    def unwait(self):
+        # logger.warning(f"unwait {self.task_id}")
+        assert self.waiting
+        self.waiting = False
+        self.handle = None
+        self.wait_logit = None
+
+    def start_decoding(self):
+        self.task_type = TaskType.Decode
+        self.req.prefill_end_time = time.monotonic()
+
 
 def taskid2reqid(task_id):
-    return task_id.split("_", 1)[1]
+    return task_id
 
 
 # +:prefill, -:decode
-def req_encode(task_id: str):
-    parts = task_id.split("_", 1)
-    if parts[0] == "prefill":
-        return int(parts[1], 16)
+def req_encode(task_type: TaskType, task_id: str):
+    if task_type == TaskType.Prefill:
+        return int(task_id, 16)
     else:
-        return -int(parts[1], 16)
+        return -int(task_id, 16)
 
 
 def req_decode(id_num: int):
     if id_num > 0:
-        return "prefill_" + hex(id_num)[2:]
+        return hex(id_num)[2:], TaskType.Prefill
     else:
-        return "decode_" + hex(-id_num)[2:]
+        return hex(-id_num)[2:], TaskType.Decode
 
 
 class PackedTasks:
@@ -363,7 +319,7 @@ class PackedTasks:
             # generate encoded task tensor
             encoded = [0] * (PackedTasks.max_num_tasks * 2)
             for i, tid in enumerate(self.task_ids):
-                encoded[i] = req_encode(tid)
+                encoded[i] = req_encode(self.tasks[i].task_type, tid)
                 if self.task_type == TaskType.Prefill:
                     encoded[PackedTasks.max_num_tasks + i] = len(self.tasks[i].tokens)
             self.task_tensor = torch.tensor(
@@ -376,26 +332,25 @@ class PackedTasks:
                 self.reqs.append(task.req)
         else:
             task_tensor_cpu = task_tensor.cpu()
-            decoded = []
+            decoded_ids = []
+            decoded_types = []
             lens = []
             # for it, task_id in enumerate(task_tensor_cpu):
             for it in range(PackedTasks.max_num_tasks):
                 task_id = task_tensor_cpu[it]
                 if task_id == 0:
                     break
-                decoded.append(req_decode(task_id))
+                decoded_id, decoded_type = req_decode(task_id)
+                decoded_ids.append(decoded_id)
+                decoded_types.append(decoded_type)
                 if task_id > 0:  # prefill
                     lens.append(int(task_tensor_cpu[PackedTasks.max_num_tasks + it]))
-            self.task_ids = decoded
+            self.task_ids = decoded_ids
             self.num_tasks = len(self.task_ids)
             assert self.num_tasks > 0, "No tasks provided"
-            self.req_ids = [item.split("_", 1)[1] for item in self.task_ids]
+            self.req_ids = self.task_ids
             # TODO: need to change task type classification when adding hybrid task
-            self.task_type = (
-                TaskType.Prefill
-                if self.task_ids[0].startswith("prefill")
-                else TaskType.Decode
-            )
+            self.task_type = decoded_types[0]
             self.task_tensor = task_tensor
             if self.task_type == TaskType.Prefill:
                 self.tokens = [([0] * lens[it]) for it in range(len(lens))]

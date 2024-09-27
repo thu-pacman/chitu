@@ -16,7 +16,7 @@ import random
 from cinfer.global_vars import set_global_variables
 
 from cinfer.backend import Backend
-from cinfer.task import UserRequest, TaskPool, PrefillTask, TaskLoad
+from cinfer.task import UserRequest, TaskPool, Task, TaskLoad
 from cinfer.cinfer_main import cinfer_init, cinfer_run
 from cinfer.async_response import AsyncResponse, AsyncDataStream
 
@@ -84,8 +84,8 @@ async def create_chat_completion(request: ChatRequest):
             frequency_penalty=freq_pen,
         )
         response = AsyncResponse(req)
-        task = PrefillTask(
-            f"prefill_{req.request_id}",
+        task = Task(
+            f"{req.request_id}",
             req,
             req.message,
             max_seq_len=global_args.infer.max_seq_len,

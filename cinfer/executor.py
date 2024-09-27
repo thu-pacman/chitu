@@ -9,7 +9,6 @@ from .task import (
     UserRequest,
     PackedTasks,
     TaskType,
-    DecodeTask,
     req_decode,
     taskid2reqid,
 )
@@ -30,7 +29,6 @@ LOGIT_TAG = 3
 class OngoingRequests:
     reqs: Sequence[UserRequest]
     waiting_tasks: Sequence[Task]
-    new_decode_tasks: Sequence[DecodeTask]
     handle: torch.distributed.distributed_c10d.Work
     logits: torch.Tensor
 
@@ -54,9 +52,6 @@ class Executor:
         tasks: PackedTasks,
     ):
         pass
-
-    def _prefill2decode(self, task_id):
-        return task_id.replace("prefill_", "decode_")
 
     def _prepare_seq_lens_for_decode(self, tasks):
         seq_lens = []
@@ -86,7 +81,7 @@ class NormalExecutor(Executor):
         for it, task in enumerate(tasks):
             if (
                 task.req.params.frequency_penalty > 0
-                and isinstance(task, DecodeTask)
+                and task.task_type == TaskType.Decode
                 and len(task.response) > 0
             ):
                 logits[it].index_add_(
@@ -132,19 +127,8 @@ class NormalExecutor(Executor):
         logits = Backend.model.prefill(tasks.tokens)
         self.timers("prefill").stop()
         self.update_response(tasks.tasks, logits)
-        # after prefill, new decode tasks are created
-        new_tasks = []
-        start = 0
         for it in range(tasks.num_tasks):
-            start += varlens.cpu_lens[it]
-            new_tasks.append(
-                DecodeTask(
-                    self._prefill2decode(tasks.task_ids[it]),
-                    tasks.tasks[it].req,
-                    tasks.tasks[it],
-                    tasks.tasks[it].next_token,
-                )
-            )
+            tasks.tasks[it].start_decoding()
         varlens = VarLens(tasks.tokens, "cuda")
         Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
         return logits
@@ -270,7 +254,7 @@ class PipeExecutor(NormalExecutor):
             tensor=task_tensor, dst=self.rank + 1, tag=TASK_TENSOR_TAG
         )
 
-    def _recv_logits(self, tasks, new_decode_tasks):
+    def _recv_logits(self, tasks):
         logits = torch.empty(
             [tasks.num_tasks, Backend.model.vocab_size],
             device=self.rank,
@@ -278,7 +262,7 @@ class PipeExecutor(NormalExecutor):
         )
         handle = torch.distributed.irecv(logits, src=self.world_size - 1, tag=LOGIT_TAG)
         Backend.ongoing_reqs.append(
-            OngoingRequests(tasks.reqs, tasks.tasks, new_decode_tasks, handle, logits)
+            OngoingRequests(tasks.reqs, tasks.tasks, handle, logits)
         )
         for it, task in enumerate(tasks.tasks):
             task.wait(handle)
@@ -293,8 +277,9 @@ class PipeExecutor(NormalExecutor):
             for i in range(PackedTasks.max_num_tasks):
                 if task_tensor[i] == 0:
                     break
+                decoded_id, _ = req_decode(task_tensor[i])
                 Backend.cache_manager.finalize_cache_all_decode(
-                    taskid2reqid(req_decode(task_tensor[i]))
+                    taskid2reqid(decoded_id)
                 )
             return None
         # Rank < world_size - 1 send task tensor to Rank + 1
@@ -314,20 +299,12 @@ class PipeExecutor(NormalExecutor):
         super().step(tasks)
         # Rank 0 recv final logits from Rank world_size - 1
         if self.rank == 0:
-            new_decode_tasks = []
             if tasks.task_type == TaskType.Prefill:
                 # After prefill, new decode tasks are created
                 for it in range(tasks.num_tasks):
-                    new_task = DecodeTask(
-                        self._prefill2decode(tasks.task_ids[it]),
-                        tasks.tasks[it].req,
-                        tasks.tasks[it],
-                        next_token=None,
-                        waiting=True,
-                    )
-                    new_decode_tasks.append(new_task)
-                    tasks.tasks[it].linked_task = new_task
-            self._recv_logits(tasks, new_decode_tasks)
+                    tasks.tasks[it].start_decoding()
+                    tasks.tasks[it].wait(None)
+            self._recv_logits(tasks)
 
 
 class TensorExecutor(NormalExecutor):
@@ -345,18 +322,8 @@ class TensorExecutor(NormalExecutor):
         self.timers("prefill").stop()
         if self.rank == 0:
             self.update_response(tasks.tasks, logits)
-            new_tasks = []
-            start = 0
             for it in range(tasks.num_tasks):
-                start += varlens.cpu_lens[it]
-                new_tasks.append(
-                    DecodeTask(
-                        self._prefill2decode(tasks.task_ids[it]),
-                        tasks.tasks[it].req,
-                        tasks.tasks[it],
-                        tasks.tasks[it].next_token,
-                    )
-                )
+                tasks.tasks[it].start_decoding()
         Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
         return logits
 
