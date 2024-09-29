@@ -245,6 +245,14 @@ class PipeExecutor(NormalExecutor):
                     task_tensor, dst=self.rank + 1, tag=TASK_TENSOR_TAG
                 )
             return task_tensor.cpu(), None
+        if task_tensor[PackedTasks.max_num_tasks] == -2:
+            Backend.keep_workers_running = False
+            if self.rank < self.world_size - 1:
+                torch.distributed.isend(
+                    task_tensor, dst=self.rank + 1, tag=TASK_TENSOR_TAG
+                )
+            return task_tensor.cpu(), None
+
         # generate packed tasks according to task_tensor
         tasks = PackedTasks(None, self.rank, task_tensor)
         return task_tensor, tasks
@@ -353,6 +361,9 @@ class TensorExecutor(NormalExecutor):
         torch.distributed.broadcast(tensor=task_tensor, src=0)
 
         if self.rank != 0:
+            if task_tensor[PackedTasks.max_num_tasks] == -2:
+                Backend.keep_workers_running = False
+                return
             tasks = PackedTasks(None, self.rank, task_tensor)
 
         if tasks.task_type == TaskType.Prefill:

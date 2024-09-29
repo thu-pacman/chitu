@@ -18,7 +18,7 @@ format_check:
     only:
         - merge_requests
     tags:
-        - maas-runner
+        - maas-runner-a2
     script:
         - pip install black -i https://pypi.tuna.tsinghua.edu.cn/simple
         - black --exclude src/third_party/ --exclude third_party/ --check .
@@ -28,7 +28,7 @@ env_build:
     only:
         - merge_requests
     tags:
-        - maas-runner
+        - maas-runner-a2
     needs:
         - format_check
     script:
@@ -46,7 +46,7 @@ paged_check:
     only:
         - merge_requests
     tags:
-        - maas-runner
+        - maas-runner-a2
     needs:
         - env_build
     script:
@@ -58,7 +58,7 @@ skew_check:
     only:
         - merge_requests
     tags:
-        - maas-runner
+        - maas-runner-a2
     needs:
         - env_build
     script:
