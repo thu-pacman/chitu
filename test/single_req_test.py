@@ -1,6 +1,6 @@
 from cinfer.task import UserRequest, TaskPool, Task
 
-# from cinfer.backend import Backend
+from cinfer.backend import Backend
 from cinfer.cinfer_main import cinfer_init, cinfer_run
 from cinfer.global_vars import set_global_variables, get_timers
 from faker import Faker
@@ -77,7 +77,7 @@ def gen_reqs_real(num_reqs, max_new_tokens):
     return reqs
 
 
-def run_pipe(args, timers):
+def run_pipe_or_tensor_parallelism(args, timers):
     rank = torch.distributed.get_rank()
     for i in range(2):
         if rank == 0:
@@ -93,16 +93,28 @@ def run_pipe(args, timers):
                 TaskPool.add(Task(f"{req.request_id}", req, req.message))
         t_start = time.time()
         timers("overall").start()
-        while len(TaskPool.pool) > 0 or rank != 0:
+        while len(TaskPool.pool) > 0 or (rank != 0 and Backend.keep_workers_running):
             cinfer_run()
         timers("overall").stop()
         t_end = time.time()
         logger.warning(f"Time cost {t_end - t_start}")
 
-        for req in reqs:
-            logger.warning(f"Response in rank {rank}: {req.output}")
+        if rank == 0:
+            for req in reqs:
+                logger.warning(f"Response in rank {rank}: {req.output}")
 
         timers.log()
+
+    # send stop signal
+    if rank == 0:
+        max_num = Backend.args.infer.max_reqs
+        encoded = [0] * max_num * 2
+        encoded[max_num] = -2
+        task_tensor = torch.tensor(encoded, dtype=torch.int64, device=0)
+        if args.infer.parallel_type == "pipe":
+            torch.distributed.isend(tensor=task_tensor, dst=1)
+        else:
+            torch.distributed.broadcast(tensor=task_tensor, src=0)
 
 
 def run_normal(args, timers):
@@ -145,7 +157,7 @@ def main(args: DictConfig):
     cinfer_init(args)
     logger.warning(f"finish init")
     if args.infer.parallel_type == "pipe" or args.infer.parallel_type == "tensor":
-        run_pipe(args, timers)
+        run_pipe_or_tensor_parallelism(args, timers)
     else:
         run_normal(args, timers)
 

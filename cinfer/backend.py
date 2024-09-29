@@ -36,6 +36,7 @@ class Backend:
     ongoing_reqs = []
     cache_type = ""
     parallel_type = ""
+    keep_workers_running = True
 
     @staticmethod
     def build_model(args, cache, *extra_args, **extra_kwargs):
