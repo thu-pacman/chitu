@@ -2,7 +2,7 @@ import torch.distributed
 from .executor import Executor
 from .scheduler import Scheduler
 from .task import PackedTasks, req_encode, TaskPool, TaskType
-from .backend import Backend
+from .backend import Backend, BackendState
 import torch
 from logging import getLogger
 
@@ -88,3 +88,13 @@ def cinfer_run():
     elif rank == 0:
         TaskPool.display()
         Backend.scheduler.update(task_ids)
+
+
+def cinfer_terminate():
+    if torch.distributed.get_rank() == 0:
+        Backend.state = BackendState.Terminating
+        Backend.executor.step(None)
+
+
+def cinfer_is_terminated():
+    return Backend.state == BackendState.Terminated

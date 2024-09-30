@@ -12,7 +12,7 @@ from .task import (
     req_decode,
     taskid2reqid,
 )
-from .backend import Backend
+from .backend import Backend, BackendState
 from .utils import VarLens, sample_top_p
 from logging import getLogger
 from .global_vars import get_timers, get_dtype
@@ -118,6 +118,10 @@ class NormalExecutor(Executor):
         for it, task in enumerate(tasks):
             task.update_response(tokens[it].item())
 
+    def propagate_tasks(self, tasks: Optional[PackedTasks]):
+        """Make every ranks know the task metadata"""
+        return tasks  # Need to do nothing if not parallelized
+
     def prefill_step(self, tasks: PackedTasks):
         # logger.warning(f"Prefill step: {tasks.task_ids}")
         varlens = VarLens(tasks.tokens, "cuda")
@@ -152,6 +156,9 @@ class NormalExecutor(Executor):
         self,
         tasks: PackedTasks,
     ):
+        tasks = self.propagate_tasks(tasks)
+        if tasks is None:
+            return
         if tasks.task_type == TaskType.Prefill:
             return self.prefill_step(tasks)
         elif tasks.task_type == TaskType.Decode:
@@ -246,11 +253,7 @@ class PipeExecutor(NormalExecutor):
                 )
             return task_tensor.cpu(), None
         if task_tensor[PackedTasks.max_num_tasks] == -2:
-            Backend.keep_workers_running = False
-            if self.rank < self.world_size - 1:
-                torch.distributed.isend(
-                    task_tensor, dst=self.rank + 1, tag=TASK_TENSOR_TAG
-                )
+            Backend.state = BackendState.Terminating
             return task_tensor.cpu(), None
 
         # generate packed tasks according to task_tensor
@@ -275,11 +278,25 @@ class PipeExecutor(NormalExecutor):
         for it, task in enumerate(tasks.tasks):
             task.wait(handle)
 
-    def _propagate_tasks(self, tasks: Optional[PackedTasks]):
+    def propagate_tasks(self, tasks: Optional[PackedTasks]):
         # Rank >= 1 recv task tensor from Rank - 1
-        task_tensor, tasks = (
-            self._recv_task_tensor() if self.rank > 0 else (tasks.task_tensor, tasks)
-        )
+        if Backend.state == BackendState.Running:
+            task_tensor, tasks = (
+                self._recv_task_tensor()
+                if self.rank > 0
+                else (tasks.task_tensor, tasks)
+            )
+        if Backend.state == BackendState.Terminating:
+            if self.rank < self.world_size - 1:
+                max_num = Backend.args.infer.max_reqs
+                encoded = [0] * max_num * 2
+                encoded[max_num] = -2
+                task_tensor = torch.tensor(encoded, dtype=torch.int64, device=0)
+                torch.distributed.isend(tensor=task_tensor, dst=self.rank + 1)
+            Backend.state = BackendState.Terminated
+        if Backend.state == BackendState.Terminated:
+            return None
+
         # Get remove-kvcache signal
         if tasks is None:
             for i in range(PackedTasks.max_num_tasks):
@@ -290,21 +307,21 @@ class PipeExecutor(NormalExecutor):
                     taskid2reqid(decoded_id)
                 )
             return None
+
         # Rank < world_size - 1 send task tensor to Rank + 1
         if self.rank < self.world_size - 1:
             self._send_task_tensor(task_tensor)
+
         return tasks
 
     def step(
         self,
         tasks: Optional[PackedTasks] = None,
     ):
-        # Get tasks from the last rank and send them to the next rank
-        tasks = self._propagate_tasks(tasks)
-        if tasks is None:
-            return
         # Run tasks
         super().step(tasks)
+        if Backend.state == BackendState.Terminated:
+            return
         # Rank 0 recv final logits from Rank world_size - 1
         if self.rank == 0:
             if tasks.task_type == TaskType.Prefill:
@@ -321,7 +338,45 @@ class TensorExecutor(NormalExecutor):
         self.rank = torch.distributed.get_rank()
         self.world_size = torch.distributed.get_world_size()
 
-    def prefill_step(self, tasks, tokens):
+    def propagate_tasks(self, tasks: Optional[PackedTasks]):
+        """Broadcast task metadata from rank 0 to all other ranks"""
+        if Backend.state == BackendState.Running:
+            task_tensor = (
+                tasks.task_tensor
+                if self.rank == 0
+                else torch.empty(
+                    PackedTasks.max_num_tasks * 2, dtype=torch.int64, device=self.rank
+                )
+            )
+        else:
+            assert Backend.state == BackendState.Terminating
+            max_num = Backend.args.infer.max_reqs
+            encoded = [0] * max_num * 2
+            encoded[max_num] = -2
+            task_tensor = torch.tensor(encoded, dtype=torch.int64, device=0)
+            Backend.state = BackendState.Terminated
+        torch.distributed.broadcast(tensor=task_tensor, src=0)
+
+        if self.rank != 0 and task_tensor[PackedTasks.max_num_tasks] == -2:
+            Backend.state = BackendState.Terminated
+        if Backend.state == BackendState.Terminated:
+            return None
+        if self.rank != 0:
+            tasks = PackedTasks(None, self.rank, task_tensor)
+
+        return tasks
+
+    def prefill_step(self, tasks):
+        if self.rank == 0:
+            tokens = torch.from_numpy(np.concatenate(tasks.tokens)).to(self.rank)
+        else:
+            tokens = torch.empty(
+                [sum(len(seq) for seq in tasks.tokens)],
+                dtype=torch.int64,
+                device=self.rank,
+            )
+        torch.distributed.broadcast(tensor=tokens, src=0)
+
         varlens = VarLens(tasks.tokens, self.rank)
         self.timers("prefill").start()
         Backend.cache_manager.curr_varlens = varlens
@@ -335,7 +390,20 @@ class TensorExecutor(NormalExecutor):
         Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
         return logits
 
-    def decode_step(self, tasks, tokens):
+    def decode_step(self, tasks):
+        if self.rank == 0:
+            tokens = []
+            for task in tasks.tasks:
+                tokens.append(task.next_token)
+            tokens = torch.tensor(
+                tokens, dtype=torch.int64, device=self.rank
+            ).unsqueeze(1)
+        else:
+            tokens = torch.empty(
+                [tasks.num_tasks, 1], dtype=torch.int64, device=self.rank
+            )
+        torch.distributed.broadcast(tensor=tokens, src=0)
+
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
         Backend.cache_manager.curr_req_ids = tasks.req_ids
         # logger.info(f"Decode step: {tasks.task_ids}")
@@ -349,47 +417,3 @@ class TensorExecutor(NormalExecutor):
             self.update_response(tasks.tasks, logits)
         Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return logits
-
-    def step(self, tasks: PackedTasks = None):
-        task_tensor = (
-            tasks.task_tensor
-            if self.rank == 0
-            else torch.empty(
-                PackedTasks.max_num_tasks * 2, dtype=torch.int64, device=self.rank
-            )
-        )
-        torch.distributed.broadcast(tensor=task_tensor, src=0)
-
-        if self.rank != 0:
-            if task_tensor[PackedTasks.max_num_tasks] == -2:
-                Backend.keep_workers_running = False
-                return
-            tasks = PackedTasks(None, self.rank, task_tensor)
-
-        if tasks.task_type == TaskType.Prefill:
-            if self.rank == 0:
-                tokens = torch.from_numpy(np.concatenate(tasks.tokens)).to(self.rank)
-            else:
-                tokens = torch.empty(
-                    [sum(len(seq) for seq in tasks.tokens)],
-                    dtype=torch.int64,
-                    device=self.rank,
-                )
-            torch.distributed.broadcast(tensor=tokens, src=0)
-            return self.prefill_step(tasks, tokens)
-        elif tasks.task_type == TaskType.Decode:
-            if self.rank == 0:
-                new_tokens = []
-                for task in tasks.tasks:
-                    new_tokens.append(task.next_token)
-                new_tokens = torch.tensor(
-                    new_tokens, dtype=torch.int64, device=self.rank
-                ).unsqueeze(1)
-            else:
-                new_tokens = torch.empty(
-                    [tasks.num_tasks, 1], dtype=torch.int64, device=self.rank
-                )
-            torch.distributed.broadcast(tensor=new_tokens, src=0)
-            return self.decode_step(tasks, new_tokens)
-        else:
-            raise NotImplementedError  # Hybrid task not implemented
