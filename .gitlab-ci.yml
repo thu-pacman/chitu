@@ -50,7 +50,7 @@ paged_check:
     needs:
         - env_build
     script:
-      - srun --gres=gpu:def:1 -p debug --pty torchrun --nproc_per_node 1 --master_port=22514 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged
+      - srun --gres=gpu:def:1 --mem=10G -p debug --pty torchrun --nproc_per_node 1 --master_port=22514 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged
 
 
 skew_check:
@@ -62,4 +62,4 @@ skew_check:
     needs:
         - env_build
     script:
-      - srun --gres=gpu:def:1 -p debug --pty torchrun --nproc_per_node 1 --master_port=22515 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=skew
+      - srun --gres=gpu:def:1 --mem=10G -p debug --pty torchrun --nproc_per_node 1 --master_port=22515 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=skew

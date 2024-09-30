@@ -194,7 +194,6 @@ class Task:
         self.sched_ts = self.arrv_ts
         self.priority = priority
         self.sched_score = 0
-        self.prefix_length = -1
         self.max_output_tokens = -1
 
         # Waiting is only meaningful in pipeline parallelism. It means either of:
@@ -231,7 +230,6 @@ class Task:
             + self.prefix_length * 1000 * 1000
             + self.max_output_tokens * 1000 * 1000
         )
-        self.linked_task = None
 
     def need_remove(self):
         if Backend.args.infer.stop_with_eos:

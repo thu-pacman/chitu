@@ -4,6 +4,7 @@ from fairscale.nn.model_parallel.initialize import (
 )
 import torch
 import gc
+from enum import Enum
 from .tokenizer import Tokenizer, ChatFormat, TokenizerHF, ChatFormatHF
 from pathlib import Path
 import os, sys, json, time
@@ -26,6 +27,12 @@ from logging import getLogger
 logger = getLogger(__name__)
 
 
+class BackendState(Enum):
+    Running = 1
+    Terminating = 2  # All tasks done, but rank 0 should tell others to terminate
+    Terminated = 3
+
+
 class Backend:
     model = None
     tokenizer = None
@@ -36,7 +43,7 @@ class Backend:
     ongoing_reqs = []
     cache_type = ""
     parallel_type = ""
-    keep_workers_running = True
+    state = BackendState.Running
 
     @staticmethod
     def build_model(args, cache, *extra_args, **extra_kwargs):
