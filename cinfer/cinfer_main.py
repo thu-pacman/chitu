@@ -1,7 +1,14 @@
 import torch.distributed
 from .executor import Executor
 from .scheduler import Scheduler
-from .task import PackedTasks, req_encode, TaskPool, TaskType
+from .task import (
+    SerializedPackedTasksPayloadType,
+    PackedTasksBase,
+    PackedTasks,
+    req_encode,
+    TaskPool,
+    TaskType,
+)
 from .backend import Backend, BackendState
 import torch
 from logging import getLogger
@@ -17,23 +24,16 @@ def cinfer_init(args):
         Backend.scheduler = scheduler
     executor = Executor.build(args)
     Backend.executor = executor
-    PackedTasks.max_num_tasks = args.infer.max_reqs
+    PackedTasks.configure(max_num_tasks=args.infer.max_reqs)
 
 
 def remove_task_other_device(remove_task_ids):
     if len(remove_task_ids) == 0:
         return
-    encoded = [0] * (PackedTasks.max_num_tasks * 2)
-    encoded[PackedTasks.max_num_tasks] = -1  # Flag to indicate ending these tasks
-    for it, tid in enumerate(remove_task_ids):
-        encoded[it] = req_encode(
-            TaskType.Decode, tid  # Since we are removing, any task type is fine
-        )
-    task_tensor = torch.tensor(
-        encoded,
-        dtype=torch.int64,
-        device=0,
-    )
+    # Since we are removing, any task type is fine
+    task_tensor = PackedTasksBase(
+        len(remove_task_ids), remove_task_ids, remove_task_ids, TaskType.Decode
+    ).serialize(payload_type=SerializedPackedTasksPayloadType.EndTask, device=0)
     torch.distributed.isend(tensor=task_tensor, dst=1)
 
 

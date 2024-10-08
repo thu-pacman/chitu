@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from .task import (
     Task,
     UserRequest,
+    SerializedPackedTasksPayloadType,
+    PackedTasksBase,
     PackedTasks,
     TaskType,
     req_decode,
@@ -49,7 +51,7 @@ class Executor:
 
     def step(
         self,
-        tasks: PackedTasks,
+        tasks: PackedTasksBase,
     ):
         pass
 
@@ -118,11 +120,11 @@ class NormalExecutor(Executor):
         for it, task in enumerate(tasks):
             task.update_response(tokens[it].item())
 
-    def propagate_tasks(self, tasks: Optional[PackedTasks]):
+    def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
         """Make every ranks know the task metadata"""
         return tasks  # Need to do nothing if not parallelized
 
-    def prefill_step(self, tasks: PackedTasks):
+    def prefill_step(self, tasks: PackedTasksBase):
         # logger.warning(f"Prefill step: {tasks.task_ids}")
         varlens = VarLens(tasks.tokens, "cuda")
         self.timers("prefill").start()
@@ -137,7 +139,7 @@ class NormalExecutor(Executor):
         Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
         return logits
 
-    def decode_step(self, tasks: PackedTasks):
+    def decode_step(self, tasks: PackedTasksBase):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
         Backend.cache_manager.curr_req_ids = tasks.req_ids
         # logger.info(f"Decode step: {tasks.task_ids}")
@@ -154,7 +156,7 @@ class NormalExecutor(Executor):
 
     def step(
         self,
-        tasks: PackedTasks,
+        tasks: PackedTasksBase,
     ):
         tasks = self.propagate_tasks(tasks)
         if tasks is None:
@@ -174,7 +176,7 @@ class PipeExecutor(NormalExecutor):
         self.rank = torch.distributed.get_rank()
         self.world_size = torch.distributed.get_world_size()
 
-    def prefill_step(self, tasks: PackedTasks):
+    def prefill_step(self, tasks: PackedTasksBase):
         varlens = VarLens(tasks.tokens, self.rank)
         Backend.cache_manager.curr_varlens = varlens
         Backend.cache_manager.curr_req_ids = tasks.req_ids
@@ -209,7 +211,7 @@ class PipeExecutor(NormalExecutor):
         Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
         return out
 
-    def decode_step(self, tasks: PackedTasks):
+    def decode_step(self, tasks: PackedTasksBase):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
         Backend.cache_manager.curr_req_ids = tasks.req_ids
         if self.rank == 0:
@@ -239,32 +241,6 @@ class PipeExecutor(NormalExecutor):
         Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return out
 
-    def _recv_task_tensor(self):
-        task_tensor = torch.empty(
-            PackedTasks.max_num_tasks * 2, dtype=torch.int64, device=self.rank
-        )
-        torch.distributed.recv(
-            tensor=task_tensor, src=self.rank - 1, tag=TASK_TENSOR_TAG
-        )
-        if PackedTasks.is_ended_tasks(task_tensor):
-            if self.rank < self.world_size - 1:
-                torch.distributed.isend(
-                    task_tensor, dst=self.rank + 1, tag=TASK_TENSOR_TAG
-                )
-            return task_tensor.cpu(), None
-        if task_tensor[PackedTasks.max_num_tasks] == -2:
-            Backend.state = BackendState.Terminating
-            return task_tensor.cpu(), None
-
-        # generate packed tasks according to task_tensor
-        tasks = PackedTasks(None, self.rank, task_tensor)
-        return task_tensor, tasks
-
-    def _send_task_tensor(self, task_tensor):
-        torch.distributed.isend(
-            tensor=task_tensor, dst=self.rank + 1, tag=TASK_TENSOR_TAG
-        )
-
     def _recv_logits(self, tasks):
         logits = torch.empty(
             [tasks.num_tasks, Backend.model.vocab_size],
@@ -278,45 +254,50 @@ class PipeExecutor(NormalExecutor):
         for it, task in enumerate(tasks.tasks):
             task.wait(handle)
 
-    def propagate_tasks(self, tasks: Optional[PackedTasks]):
-        # Rank >= 1 recv task tensor from Rank - 1
-        if Backend.state == BackendState.Running:
-            task_tensor, tasks = (
-                self._recv_task_tensor()
-                if self.rank > 0
-                else (tasks.task_tensor, tasks)
+    def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
+        remove_kvcache = False
+
+        # Rank 0 initialzie from the argument. Rank >= 1 recv task tensor from Rank - 1
+        if self.rank == 0:
+            if Backend.state == BackendState.Running:
+                task_tensor = tasks.serialize(device=self.rank)
+            else:
+                assert Backend.state == BackendState.Terminating
+                task_tensor = PackedTasksBase.serialize_special(
+                    SerializedPackedTasksPayloadType.TerminateBackend, device=self.rank
+                )
+        else:
+            task_tensor = PackedTasksBase.empty_serialization(device=self.rank)
+            torch.distributed.recv(
+                tensor=task_tensor, src=self.rank - 1, tag=TASK_TENSOR_TAG
             )
+            task_tensor_type, tasks = PackedTasksBase.deserialize(task_tensor)
+            if task_tensor_type == SerializedPackedTasksPayloadType.TerminateBackend:
+                Backend.state = BackendState.Terminating
+            if task_tensor_type == SerializedPackedTasksPayloadType.EndTask:
+                remove_kvcache = True
+
+        # Rank < world_size - 1 send task tensor to Rank + 1
+        if self.rank < self.world_size - 1:
+            torch.distributed.isend(
+                tensor=task_tensor, dst=self.rank + 1, tag=TASK_TENSOR_TAG
+            )
+
         if Backend.state == BackendState.Terminating:
-            if self.rank < self.world_size - 1:
-                max_num = Backend.args.infer.max_reqs
-                encoded = [0] * max_num * 2
-                encoded[max_num] = -2
-                task_tensor = torch.tensor(encoded, dtype=torch.int64, device=0)
-                torch.distributed.isend(tensor=task_tensor, dst=self.rank + 1)
             Backend.state = BackendState.Terminated
         if Backend.state == BackendState.Terminated:
             return None
 
-        # Get remove-kvcache signal
-        if tasks is None:
-            for i in range(PackedTasks.max_num_tasks):
-                if task_tensor[i] == 0:
-                    break
-                decoded_id, _ = req_decode(task_tensor[i])
-                Backend.cache_manager.finalize_cache_all_decode(
-                    taskid2reqid(decoded_id)
-                )
+        if remove_kvcache:
+            for rid in tasks.req_ids:
+                Backend.cache_manager.finalize_cache_all_decode(rid)
             return None
-
-        # Rank < world_size - 1 send task tensor to Rank + 1
-        if self.rank < self.world_size - 1:
-            self._send_task_tensor(task_tensor)
 
         return tasks
 
     def step(
         self,
-        tasks: Optional[PackedTasks] = None,
+        tasks: Optional[PackedTasksBase] = None,
     ):
         # Run tasks
         super().step(tasks)
@@ -338,32 +319,32 @@ class TensorExecutor(NormalExecutor):
         self.rank = torch.distributed.get_rank()
         self.world_size = torch.distributed.get_world_size()
 
-    def propagate_tasks(self, tasks: Optional[PackedTasks]):
+    def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
         """Broadcast task metadata from rank 0 to all other ranks"""
         if Backend.state == BackendState.Running:
             task_tensor = (
-                tasks.task_tensor
+                tasks.serialize(device=self.rank)
                 if self.rank == 0
-                else torch.empty(
-                    PackedTasks.max_num_tasks * 2, dtype=torch.int64, device=self.rank
-                )
+                else PackedTasksBase.empty_serialization(device=self.rank)
             )
         else:
             assert Backend.state == BackendState.Terminating
-            max_num = Backend.args.infer.max_reqs
-            encoded = [0] * max_num * 2
-            encoded[max_num] = -2
-            task_tensor = torch.tensor(encoded, dtype=torch.int64, device=0)
+            task_tensor = PackedTasksBase.serialize_special(
+                SerializedPackedTasksPayloadType.TerminateBackend, device=self.rank
+            )
             Backend.state = BackendState.Terminated
         torch.distributed.broadcast(tensor=task_tensor, src=0)
 
-        if self.rank != 0 and task_tensor[PackedTasks.max_num_tasks] == -2:
+        if self.rank != 0:
+            task_tensor_type, tasks = PackedTasksBase.deserialize(task_tensor)
+
+        if (
+            self.rank != 0
+            and task_tensor_type == SerializedPackedTasksPayloadType.TerminateBackend
+        ):
             Backend.state = BackendState.Terminated
         if Backend.state == BackendState.Terminated:
             return None
-        if self.rank != 0:
-            tasks = PackedTasks(None, self.rank, task_tensor)
-
         return tasks
 
     def prefill_step(self, tasks):
