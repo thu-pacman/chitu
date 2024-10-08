@@ -9,6 +9,7 @@ from .async_response import AsyncDataStream, AsyncResponse
 from .backend import Backend
 from pathlib import Path
 from dataclasses import dataclass
+from typing import List, Optional, ClassVar
 import os
 import weakref
 import json
@@ -289,69 +290,135 @@ def req_decode(id_num: int):
         return hex(-id_num)[2:], TaskType.Decode
 
 
-class PackedTasks:
-    max_num_tasks = -1
+class SerializedPackedTasksPayloadType(Enum):
+    Normal = 1
+    TerminateBackend = 2
+    EndTask = 3
 
-    def is_ended_tasks(task_tensor):
-        return task_tensor[PackedTasks.max_num_tasks] == -1
 
-    def __init__(self, task_ids, rank=0, task_tensor=None):
+@dataclass
+class PackedTasksBase:
+    """
+    Serializable part of PackedTasks
+
+    Serialization format:
+
+    ```
+    | payload type | task_id * max_num_tasks | lens * max_num_tasks |
+    ```
+    """
+
+    # Class variables (please mark them with ClassVar)
+    configured: ClassVar[bool] = False
+    max_num_tasks: ClassVar[Optional[int]] = None
+
+    # Object fields
+    num_tasks: int
+    task_ids: List[int]
+    req_ids: List[int]
+    task_type: TaskType
+    tokens: Optional[List[List[int]]] = None
+
+    @classmethod
+    def configure(cls, max_num_tasks: int):
+        assert not PackedTasksBase.configured, "PackedTasksBase cannot be reconfigured"
+        PackedTasksBase.configured = True
+        PackedTasksBase.max_num_tasks = max_num_tasks
+
+    @classmethod
+    def deserialize(cls, task_tensor):
+        assert (
+            cls.configured
+        ), "PackedTasksBase must be configured before deserialization"
+
+        task_types = []
+        req_ids = []
+        task_tensor_cpu = task_tensor.cpu()
+        payload_type = SerializedPackedTasksPayloadType(task_tensor_cpu[0].item())
+
+        decoded_ids = []
+        decoded_types = []
+        lens = []
+        for it in range(cls.max_num_tasks):
+            task_id = task_tensor_cpu[1 + it]
+            if task_id == 0:
+                break
+            decoded_id, decoded_type = req_decode(task_id)
+            decoded_ids.append(decoded_id)
+            decoded_types.append(decoded_type)
+            if decoded_type == TaskType.Prefill:
+                lens.append(int(task_tensor_cpu[1 + cls.max_num_tasks + it]))
+        task_ids = decoded_ids
+        req_ids = task_ids
+        num_tasks = len(task_ids)
+        task_type = None
+        tokens = None
+        if num_tasks > 0:
+            # TODO: need to change task type classification when adding hybrid task
+            task_type = decoded_types[0]
+            if task_type == TaskType.Prefill:
+                tokens = [([0] * lens[it]) for it in range(len(lens))]
+        return payload_type, cls(num_tasks, task_ids, req_ids, task_type, tokens)
+
+    def serialize(self, device, payload_type=SerializedPackedTasksPayloadType.Normal):
+        assert (
+            PackedTasksBase.configured
+        ), "PackedTasksBase must be configured before serialization"
+
+        ret = PackedTasksBase.empty_serialization(device=device)
+        ret[0] = payload_type.value
+        for i, tid in enumerate(self.task_ids):
+            assert self.task_type != TaskType.Hybrid
+            ret[1 + i] = req_encode(self.task_type, tid)
+            if self.task_type == TaskType.Prefill:
+                ret[1 + PackedTasksBase.max_num_tasks + i] = len(self.tasks[i].tokens)
+        return ret
+
+    @classmethod
+    def serialize_special(cls, payload_type: SerializedPackedTasksPayloadType, device):
+        assert (
+            cls.configured
+        ), "PackedTasksBase must be configured before serialize_special"
+
+        ret = cls.empty_serialization(device=device)
+        ret[0] = payload_type.value
+        return ret
+
+    @classmethod
+    def empty_serialization(cls, device):
+        assert (
+            cls.configured
+        ), "PackedTasksBase must be configured before empty_serialization"
+
+        # TODO: We should use torch.empty instead, but we now assume there is a `0`
+        # indicating the end of tasks
+        return torch.zeros(
+            (1 + cls.max_num_tasks * 2,), dtype=torch.int64, device=device
+        )
+
+
+class PackedTasks(PackedTasksBase):
+    def __init__(self, task_ids, rank=0):
         self.tasks = []
         task_types = []
         self.req_ids = []
-        if task_tensor is None:
-            self.task_ids = task_ids
-            self.num_tasks = len(task_ids)
-            assert self.num_tasks > 0, "No tasks provided"
-            for tid in self.task_ids:
-                self.tasks.append(TaskPool.pool[tid])
-                task_types.append(TaskPool.pool[tid].task_type)
-                self.req_ids.append(TaskPool.pool[tid].req.request_id)
-            if TaskType.Prefill in task_types and TaskType.Decode in task_types:
-                self.task_type = TaskType.Hybrid
-                raise NotImplementedError("Hybrid task not implemented")
-            else:
-                self.task_type = task_types[0]
-                if self.task_type == TaskType.Prefill:
-                    self.pack_tokens()
-            # generate encoded task tensor
-            encoded = [0] * (PackedTasks.max_num_tasks * 2)
-            for i, tid in enumerate(self.task_ids):
-                encoded[i] = req_encode(self.tasks[i].task_type, tid)
-                if self.task_type == TaskType.Prefill:
-                    encoded[PackedTasks.max_num_tasks + i] = len(self.tasks[i].tokens)
-            self.task_tensor = torch.tensor(
-                encoded,
-                dtype=torch.int64,
-                device=rank,
-            )
-            self.reqs = []
-            for task in self.tasks:
-                self.reqs.append(task.req)
+        self.task_ids = task_ids
+        self.num_tasks = len(task_ids)
+        assert self.num_tasks > 0, "No tasks provided"
+        for tid in self.task_ids:
+            self.tasks.append(TaskPool.pool[tid])
+            task_types.append(TaskPool.pool[tid].task_type)
+            self.req_ids.append(TaskPool.pool[tid].req.request_id)
+        if TaskType.Prefill in task_types and TaskType.Decode in task_types:
+            self.task_type = TaskType.Hybrid
+            raise NotImplementedError("Hybrid task not implemented")
         else:
-            task_tensor_cpu = task_tensor.cpu()
-            decoded_ids = []
-            decoded_types = []
-            lens = []
-            # for it, task_id in enumerate(task_tensor_cpu):
-            for it in range(PackedTasks.max_num_tasks):
-                task_id = task_tensor_cpu[it]
-                if task_id == 0:
-                    break
-                decoded_id, decoded_type = req_decode(task_id)
-                decoded_ids.append(decoded_id)
-                decoded_types.append(decoded_type)
-                if task_id > 0:  # prefill
-                    lens.append(int(task_tensor_cpu[PackedTasks.max_num_tasks + it]))
-            self.task_ids = decoded_ids
-            self.num_tasks = len(self.task_ids)
-            assert self.num_tasks > 0, "No tasks provided"
-            self.req_ids = self.task_ids
-            # TODO: need to change task type classification when adding hybrid task
-            self.task_type = decoded_types[0]
-            self.task_tensor = task_tensor
+            self.task_type = task_types[0]
             if self.task_type == TaskType.Prefill:
-                self.tokens = [([0] * lens[it]) for it in range(len(lens))]
+                self.pack_tokens()
+        self.reqs = []
+        for task in self.tasks:
+            self.reqs.append(task.req)
 
     def pack_tokens(self):
         tokens = []
