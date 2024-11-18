@@ -15,7 +15,7 @@ from .task import (
     taskid2reqid,
 )
 from .backend import Backend, BackendState
-from .utils import VarLens, sample_top_p
+from .utils import VarLens, top_k_top_p_min_p_sampling_from_probs_torch
 from logging import getLogger
 from .global_vars import get_timers, get_dtype
 
@@ -78,7 +78,9 @@ class NormalExecutor(Executor):
         super().__init__(args)
 
     def update_response(self, tasks: Sequence[Task], logits: torch.Tensor):
-        logits = logits.view(-1, logits.shape[-1])
+        logits = logits.view(-1, logits.shape[-1]).to(
+            torch.float
+        )  # use float32 to calculate temperature and sample
         assert len(tasks) == logits.shape[0]
         for it, task in enumerate(tasks):
             if (
@@ -97,14 +99,25 @@ class NormalExecutor(Executor):
                     ),
                 )
         temperatures = torch.tensor(
-            [task.req.params.temperature for task in tasks], device=logits.device
+            [task.req.params.temperature for task in tasks],
+            device=logits.device,
+            dtype=torch.float,
         )
         top_ps = torch.tensor(
-            [task.req.params.top_p for task in tasks], device=logits.device
+            [task.req.params.top_p for task in tasks],
+            device=logits.device,
+            dtype=torch.float,
+        )
+        top_ks = torch.tensor(
+            [task.req.params.top_k for task in tasks],
+            device=logits.device,
+            dtype=torch.float,
         )
         if torch.all(temperatures > 0):
             probs = torch.softmax(logits / temperatures.view(-1, 1), dim=-1)
-            tokens = sample_top_p(probs, top_ps.view(-1, 1))
+            tokens = top_k_top_p_min_p_sampling_from_probs_torch(
+                probs, top_ks, top_ps
+            ).cpu()
         elif torch.all(temperatures == 0):
             tokens = torch.argmax(logits, dim=-1)
         else:
@@ -113,10 +126,14 @@ class NormalExecutor(Executor):
             )
             for i in range(len(tasks)):
                 if temperatures[i] == 0:
-                    tokens[i] = torch.argmax(logits[i])
+                    tokens[i] = torch.argmax(logits[i]).cpu()
                 else:
-                    probs = torch.softmax(logits[i] / temperatures[i], dim=-1)
-                    tokens[i] = sample_top_p(probs, top_ps[i])
+                    probs = torch.softmax(
+                        logits[i].unsqueeze(0) / temperatures[i], dim=-1
+                    )
+                    tokens[i] = top_k_top_p_min_p_sampling_from_probs_torch(
+                        probs, top_ks, top_ps
+                    ).cpu()
         for it, task in enumerate(tasks):
             task.update_response(tokens[it].item())
 

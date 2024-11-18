@@ -49,7 +49,8 @@ class ChatRequest(BaseModel):
     max_tokens: int = 128
     stream: bool = False
     temperature: float = 0.8  # [0, 2]
-    top_p: float = 0.9  # (0,1]
+    top_p: float = 0.9  # [0,1]
+    top_k: int = 50  # -1 or positive integer TODO process -1
     frequency_penalty: float = 0.1  # [-2, 2]
 
 
@@ -73,6 +74,7 @@ async def create_chat_completion(request: ChatRequest):
     max_new_tokens = params.pop("max_tokens", global_args.request.max_new_tokens)
     temp = params.pop("temperature")
     top_p = params.pop("top_p")
+    top_k = params.pop("top_k")
     freq_pen = params.pop("frequency_penalty")
     try:
         req = UserRequest(
@@ -81,6 +83,7 @@ async def create_chat_completion(request: ChatRequest):
             max_new_tokens=max_new_tokens,
             temperature=temp,
             top_p=top_p,
+            top_k=top_k,
             frequency_penalty=freq_pen,
         )
         response = AsyncResponse(req)
@@ -180,7 +183,7 @@ def main(args: DictConfig):
     global rank
     global global_args
     global server_status
-    set_global_variables()
+    set_global_variables(args)
     global_args = args
     cinfer_init(args)
     server_status = True

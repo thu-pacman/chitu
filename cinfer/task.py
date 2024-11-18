@@ -49,6 +49,7 @@ class TaskLoad:
 class SampleParams:
     temperature: float
     top_p: float
+    top_k: int
     frequency_penalty: float
 
 
@@ -60,6 +61,7 @@ class UserRequest:
         max_new_tokens=50,
         temperature=0.8,
         top_p=0.9,
+        top_k=50,
         frequency_penalty=0.1,
     ):
         self.message = message
@@ -75,7 +77,10 @@ class UserRequest:
         self.prefill_end_time: int = 0
         self.completion_time: int = 0
         self.params = SampleParams(
-            temperature=temperature, top_p=top_p, frequency_penalty=frequency_penalty
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            frequency_penalty=frequency_penalty,
         )
         TaskLoad.user_req.add(self)
 
