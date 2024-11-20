@@ -24,7 +24,7 @@ class PagedKVCacheManager:
     ):
         print("Init PagedKVCacheManager")
 
-        num_blocks_per_layer = (_MAX_SEQ_LEN // _BLOCK_SIZE) * num_hot_req
+        num_blocks_per_layer = (max_seq_len // _BLOCK_SIZE) * num_hot_req
 
         self.num_layers = num_layers
         self.n_local_kv_heads = n_local_kv_heads

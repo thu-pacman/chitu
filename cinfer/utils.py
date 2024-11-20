@@ -67,15 +67,26 @@ def load_pipe(checkpoint, model, num_layers, rank, world_size, type):
     model.load_state_dict(partial_checkpoint)
 
 
-def sample_top_p(logit, top_p):
-    probs_sort, probs_idx = torch.sort(logit, dim=-1, descending=True)
+def top_k_top_p_min_p_sampling_from_probs_torch(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor = None,  # TODO support min_ps
+):
+    """A top-k, top-p and min-p sampling implementation with native pytorch operations."""
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
-    mask = probs_sum - probs_sort > top_p
-    probs_sort[mask] = 0.0
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-    token_tensor = torch.multinomial(probs_sort, num_samples=1)
-    next_token = torch.gather(probs_idx, -1, token_tensor)
-    return next_token
+    # min_p_thresholds = probs_sort[:, 0] * min_ps
+    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+    probs_sort[
+        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
+        >= top_ks.view(-1, 1)
+    ] = 0.0
+    # probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+    probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
+    sampled_index = torch.multinomial(probs_sort, num_samples=1)
+    batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
+    return batch_next_token_ids
 
 
 class VarLens:

@@ -15,7 +15,7 @@ from .task import (
     taskid2reqid,
 )
 from .backend import Backend, BackendState
-from .utils import VarLens, sample_top_p
+from .utils import VarLens, top_k_top_p_min_p_sampling_from_probs_torch
 from logging import getLogger
 from .global_vars import get_timers, get_dtype
 
@@ -102,9 +102,12 @@ class NormalExecutor(Executor):
         top_ps = torch.tensor(
             [task.req.params.top_p for task in tasks], device=logits.device
         )
+        top_ks = torch.tensor(
+            [task.req.params.top_k for task in tasks], device=logits.device
+        )
         if torch.all(temperatures > 0):
             probs = torch.softmax(logits / temperatures.view(-1, 1), dim=-1)
-            tokens = sample_top_p(probs, top_ps.view(-1, 1))
+            tokens = top_k_top_p_min_p_sampling_from_probs_torch(probs, top_ks, top_ps)
         elif torch.all(temperatures == 0):
             tokens = torch.argmax(logits, dim=-1)
         else:
@@ -115,8 +118,13 @@ class NormalExecutor(Executor):
                 if temperatures[i] == 0:
                     tokens[i] = torch.argmax(logits[i])
                 else:
-                    probs = torch.softmax(logits[i] / temperatures[i], dim=-1)
-                    tokens[i] = sample_top_p(probs, top_ps[i])
+                    probs = torch.softmax(
+                        logits[i].unsqueeze(0) / temperatures[i], dim=-1
+                    )
+                    tokens[i] = top_k_top_p_min_p_sampling_from_probs_torch(
+                        probs, top_ks, top_ps
+                    )
+        tokens = tokens.cpu()
         for it, task in enumerate(tasks):
             task.update_response(tokens[it].item())
 
