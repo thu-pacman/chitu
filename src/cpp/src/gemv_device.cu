@@ -1,3 +1,5 @@
+#ifdef CINFER_CUDA_GEMV
+
 #include "gemv_device.h"
 
 __global__ void matvec_bfloat16(const __nv_bfloat16 *__restrict__ matrix,
@@ -32,3 +34,5 @@ __global__ void matvec_bfloat16(const __nv_bfloat16 *__restrict__ matrix,
         atomicAdd(result + output_id, sum);
     }
 }
+
+#endif // CINFER_CUDA_GEMV

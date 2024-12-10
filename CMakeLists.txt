@@ -1,4 +1,11 @@
 cmake_minimum_required(VERSION 3.12.2)
+
+option(CINFER_CUDA_GEMV "Enable cinfer's CUDA gemv kernel" OFF)
+
+if (CINFER_CUDA_GEMV)
+    add_definitions("CINFER_CUDA_GEMV")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -6,20 +13,23 @@ cmake_policy(SET CMP0048 NEW)
 project(cinfer-cpp LANGUAGES CXX)
 
 
-if(${CMAKE_VERSION} VERSION_LESS_EQUAL "3.13.4")
-  cuda_select_nvcc_arch_flags(ARCH_FLAGS "Auto") # optional argument for arch to add
-  message("ARCH_FLAGS = ${ARCH_FLAGS}")
-  set(CMAKE_CUDA_ARCHITECTURES ${ARCH_FLAGS})
-else()
-  include(FindCUDA/select_compute_arch)
-  CUDA_DETECT_INSTALLED_GPUS(INSTALLED_GPU_CCS_1)
-  string(STRIP "${INSTALLED_GPU_CCS_1}" INSTALLED_GPU_CCS_2)
-  string(REPLACE " " ";" INSTALLED_GPU_CCS_3 "${INSTALLED_GPU_CCS_2}")
-  string(REPLACE "." "" CUDA_ARCH_LIST "${INSTALLED_GPU_CCS_3}")
-  SET(CUDA_ARCH_LIST 86)
-  message("ARCH_FLAGS = ${CUDA_ARCH_LIST}")
-  SET(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH_LIST})
-  # set_property(GLOBAL PROPERTY CUDA_ARCHITECTURES "${CUDA_ARCH_LIST}")
+if (CINFER_CUDA_GEMV)
+    if(${CMAKE_VERSION} VERSION_LESS_EQUAL "3.13.4")
+      cuda_select_nvcc_arch_flags(ARCH_FLAGS "Auto") # optional argument for arch to add
+      message("ARCH_FLAGS = ${ARCH_FLAGS}")
+      set(CMAKE_CUDA_ARCHITECTURES ${ARCH_FLAGS})
+    else()
+      include(FindCUDA/select_compute_arch)
+      CUDA_DETECT_INSTALLED_GPUS(INSTALLED_GPU_CCS_1)
+      string(STRIP "${INSTALLED_GPU_CCS_1}" INSTALLED_GPU_CCS_2)
+      string(REPLACE " " ";" INSTALLED_GPU_CCS_3 "${INSTALLED_GPU_CCS_2}")
+      string(REPLACE "." "" CUDA_ARCH_LIST "${INSTALLED_GPU_CCS_3}")
+      SET(CUDA_ARCH_LIST 86)
+      message("ARCH_FLAGS = ${CUDA_ARCH_LIST}")
+      SET(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH_LIST})
+    endif()
+
+    set(CMAKE_CUDA_FLAGS " -fPIC -g -O3  --use_fast_math ")
 endif()
 
 add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=0) # necessary if using googletest and torch
@@ -29,6 +39,7 @@ add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=0) # necessary if using googletes
 set(Python_FIND_STRATEGY "LOCATION") # Find the first Python in the path (which is the Python we load),
                                      # instead of finding Python of the most latest version
 find_package(Python COMPONENTS Interpreter Development REQUIRED)
+include_directories(${Python_INCLUDE_DIRS})
 
 # find torch path
 execute_process(
@@ -59,10 +70,6 @@ message(STATUS "working dir: ${project_WORKING_DIR}")
 add_definitions(-DCInfer_DL_BASE_DIRECTORY="${CMAKE_CURRENT_LIST_DIR}")
 add_definitions(-DCInfer_DL_TEST_DIRECTORY="${project_TEST_DIR}")
 
-# set(CMAKE_CXX_FLAGS "-fopenmp -Wall ")
-# set(CMAKE_CUDA_FLAGS " -fPIC -fopenmp -g -O3  --use_fast_math -Wall ")
-set(CMAKE_CUDA_FLAGS " -fPIC -g -O3  --use_fast_math ")
-
 if (EXISTS ${project_INCLUDE_DIR})
     file(GLOB_RECURSE project_HEADERS ${project_HEADERS} ${project_INCLUDE_DIR}/*.h)
 endif ()
@@ -84,9 +91,10 @@ link_directories(${project_THIRD_PARTY_DIR}/yaml)
 
 add_library(${PROJECT_NAME} SHARED ${project_SOURCES} ${project_HEADERS})
 
-find_package(Torch REQUIRED)
-find_package(CUDA REQUIRED)
-include_directories(${Python_INCLUDE_DIRS})
+if (CINFER_CUDA_GEMV)
+    find_package(Torch REQUIRED)
+    find_package(CUDA REQUIRED)
+endif()
 
 message(STATUS "torch library: ${TORCH_LIBRARY}")
 target_link_libraries(${PROJECT_NAME} spdlog::spdlog)

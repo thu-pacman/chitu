@@ -1,3 +1,5 @@
+#ifdef CINFER_CUDA_GEMV
+
 #include "gemv_device.h"
 #include "gemv_host.h"
 #include <c10/cuda/CUDAStream.h>
@@ -18,3 +20,5 @@ void gemv(Tensor x, Tensor w, Tensor out) {
         (__nv_bfloat16 *)(x.data_ptr<at::BFloat16>()),
         (__nv_bfloat16 *)(out.data_ptr<at::BFloat16>()), num_output, num_input);
 }
+
+#endif // CINFER_CUDA_GEMV
