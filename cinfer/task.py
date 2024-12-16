@@ -4,17 +4,19 @@ import asyncio
 import time
 import threading
 from datetime import datetime
-from .backend import Backend
-from .async_response import AsyncDataStream, AsyncResponse
-from .backend import Backend
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional, ClassVar
 import os
 import weakref
 import json
-
 from logging import getLogger
+
+from .backend import Backend
+from .async_response import AsyncDataStream, AsyncResponse
+from .backend import Backend
+from .device_list import DeviceList
+
 
 logger = getLogger(__name__)
 
@@ -195,7 +197,7 @@ class Task:
     ):
         self.task_id = task_id
         self.req = req
-        self.response = []
+        self.response = DeviceList([], dtype=torch.long, device="cuda")
         self.arrv_ts = time.perf_counter_ns()
         self.sched_ts = self.arrv_ts
         self.priority = priority
