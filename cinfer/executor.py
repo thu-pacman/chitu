@@ -88,7 +88,7 @@ class NormalExecutor(Executor):
             ):
                 logits[it].index_add_(
                     -1,
-                    torch.tensor(task.response, dtype=torch.long, device=logits.device),
+                    task.response.to_tensor(),
                     -task.req.params.frequency_penalty
                     * torch.ones(
                         (len(task.response),),
