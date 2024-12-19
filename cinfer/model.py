@@ -175,9 +175,6 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        self.cache.prepare_block_table_for_decode(
-            self.cache.curr_req_ids, self.layer_id
-        )
         block_table = self.cache.get_gpu_block_table(
             self.cache.curr_req_ids, self.layer_id
         )

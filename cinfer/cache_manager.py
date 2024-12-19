@@ -34,6 +34,7 @@ class PagedKVCacheManager:
         self.max_seq_len = max_seq_len
         self.num_blocks = num_blocks_per_layer * num_layers
         self.device = torch.device(device)
+        self.gpu_block_table = None
 
         self.seq_lens = {}
         self.timers = get_timers()
@@ -57,17 +58,6 @@ class PagedKVCacheManager:
             device=device,
             dtype=torch.float16 if use_half else torch.bfloat16,
         )
-
-        # seq_lens = (tokens != -1).sum(1)
-        # for i, t in enumerate(seq_lens.tolist()):
-        #     num_blocks_to_reserve = math.ceil(t / block_size)
-        #     num_filled_positions = t % block_size
-        #     for b in range(num_blocks_to_reserve):
-        #         index = self.get_free_block()
-        #         if b == num_blocks_to_reserve-1:
-        #             self.block_table[i].append((index, num_filled_positions))
-        #         else:
-        #             self.block_table[i].append((index, block_size))
 
     # Init block table and kv cache with kv generated during prefill
     def finalize_cache_bylayer_prefill(self, xk, xv, req_ids, varlen, layer_id):
@@ -136,19 +126,8 @@ class PagedKVCacheManager:
         self.timers("get_free_block").stop()
         return idx
 
-    def get_gpu_block_table(self, req_ids, layer_id):
-        self.timers("get_gpu_block_table").start()
-        max_block_num = max(
-            len(self.block_table[req_id][layer_id]) for req_id in req_ids
-        )
-        gpu_block_table = [[0] * max_block_num for _ in range(len(req_ids))]
-        for idx, req_id in enumerate(req_ids):
-            block_ids = self.block_table[req_id][layer_id]
-            gpu_block_table[idx][: len(block_ids)] = block_ids
-        # logger.warning(gpu_block_table)
-        output = torch.tensor(gpu_block_table, dtype=torch.int32, device=self.device)
-        self.timers("get_gpu_block_table").stop()
-        return output
+    def get_gpu_block_table(self, layer_id):
+        return self.gpu_block_table[layer_id]
 
     def get_gpu_seq_lens(self):
         return self.curr_seq_lens_gpu
@@ -165,12 +144,24 @@ class PagedKVCacheManager:
         self.timers("free_req_cache_blocks").stop()
 
     # Prepare enough block table for next decoding. When decoding, flash attention will fill new kv into paged kv cache (inplace).
-    def prepare_block_table_for_decode(self, req_ids, layer_id):
-        self.timers("prepare_block_table_for_decode").start()
+    def prepare_block_table_for_decode(self, req_ids):
         for req_id in req_ids:
             if self.seq_lens[req_id] % self.block_size == 0:
-                self.block_table[req_id][layer_id].append(self.get_free_block())
-        self.timers("prepare_block_table_for_decode").stop()
+                for layer_id in range(self.num_layers):
+                    self.block_table[req_id][layer_id].append(self.get_free_block())
+
+        max_block_num = max(len(self.block_table[req_id][0]) for req_id in req_ids)
+        gpu_block_table = [
+            [[0] * max_block_num for _ in range(len(req_ids))]
+            for _ in range(self.num_layers)
+        ]
+        for layer_id in range(self.num_layers):
+            for idx, req_id in enumerate(req_ids):
+                block_ids = self.block_table[req_id][layer_id]
+                gpu_block_table[layer_id][idx][: len(block_ids)] = block_ids
+        self.gpu_block_table = torch.tensor(
+            gpu_block_table, dtype=torch.int32, device=self.device
+        )
 
     def finalize_cache_single_decode(self, req_ids):
         for req_id in req_ids:
