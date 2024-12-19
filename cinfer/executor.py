@@ -30,8 +30,7 @@ LOGIT_TAG = 3
 
 @dataclass
 class OngoingRequests:
-    reqs: Sequence[UserRequest]
-    waiting_tasks: Sequence[Task]
+    waiting_task: PackedTasks
     handle: torch.distributed.distributed_c10d.Work
     logits: torch.Tensor
 
@@ -240,9 +239,7 @@ class PipeExecutor(NormalExecutor):
             dtype=torch.float,
         )
         handle = torch.distributed.irecv(logits, src=self.world_size - 1, tag=LOGIT_TAG)
-        Backend.ongoing_reqs.append(
-            OngoingRequests(tasks.reqs, tasks.tasks, handle, logits)
-        )
+        Backend.ongoing_reqs.append(OngoingRequests(tasks, handle, logits))
         for it, task in enumerate(tasks.tasks):
             task.wait(handle)
 
