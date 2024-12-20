@@ -54,6 +54,11 @@ class SampleParams:
     top_k: int
     frequency_penalty: float
 
+    def __post_init__(self):
+        if self.temperature == 0:
+            self.temperature = 1
+            self.top_k = 1
+
 
 class UserRequest:
     def __init__(
@@ -252,11 +257,11 @@ class Task:
             return True
         return False
 
-    def update_response(self, token: int):
+    def update_response(self, token: int, token_gpu):
         # TODO: modify if generate more than one token at a time
         assert token is not None
+        self.response.append(token_gpu)
         self.next_token = token
-        self.response.append(self.next_token)
         self.prefix_length += 1
         self.max_output_tokens -= 1
         self.req.add_data(self.next_token)
@@ -426,6 +431,16 @@ class PackedTasks(PackedTasksBase):
         self.reqs = []
         for task in self.tasks:
             self.reqs.append(task.req)
+        self.is_all_greedy = all(task.req.params.top_k <= 1 for task in self.tasks)
+        self.temperatures = torch.tensor(
+            [task.req.params.temperature for task in self.tasks]
+        ).to(device=rank, non_blocking=True)
+        self.top_ps = torch.tensor([task.req.params.top_p for task in self.tasks]).to(
+            device=rank, non_blocking=True
+        )
+        self.top_ks = torch.tensor([task.req.params.top_k for task in self.tasks]).to(
+            device=rank, non_blocking=True
+        )
 
     def pack_tokens(self):
         tokens = []

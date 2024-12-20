@@ -16,8 +16,9 @@ from .task import (
 )
 from .backend import Backend, BackendState
 from .utils import VarLens, top_k_top_p_min_p_sampling_from_probs_torch
-from logging import getLogger
+from .cache_manager import PagedKVCacheManager
 from .global_vars import get_timers, get_dtype
+from logging import getLogger
 
 logger = getLogger(__name__)
 
@@ -29,8 +30,7 @@ LOGIT_TAG = 3
 
 @dataclass
 class OngoingRequests:
-    reqs: Sequence[UserRequest]
-    waiting_tasks: Sequence[Task]
+    waiting_task: PackedTasks
     handle: torch.distributed.distributed_c10d.Work
     logits: torch.Tensor
 
@@ -77,10 +77,10 @@ class NormalExecutor(Executor):
     def __init__(self, args):
         super().__init__(args)
 
-    def update_response(self, tasks: Sequence[Task], logits: torch.Tensor):
+    def update_response(self, tasks: PackedTasks, logits: torch.Tensor):
         logits = logits.view(-1, logits.shape[-1])
-        assert len(tasks) == logits.shape[0]
-        for it, task in enumerate(tasks):
+        assert len(tasks.tasks) == logits.shape[0]
+        for it, task in enumerate(tasks.tasks):
             if (
                 task.req.params.frequency_penalty > 0
                 and task.task_type == TaskType.Decode
@@ -96,37 +96,16 @@ class NormalExecutor(Executor):
                         device=logits.device,
                     ),
                 )
-        temperatures = torch.tensor(
-            [task.req.params.temperature for task in tasks], device=logits.device
-        )
-        top_ps = torch.tensor(
-            [task.req.params.top_p for task in tasks], device=logits.device
-        )
-        top_ks = torch.tensor(
-            [task.req.params.top_k for task in tasks], device=logits.device
-        )
-        if torch.all(temperatures > 0):
-            probs = torch.softmax(logits / temperatures.view(-1, 1), dim=-1)
-            tokens = top_k_top_p_min_p_sampling_from_probs_torch(probs, top_ks, top_ps)
-        elif torch.all(temperatures == 0):
+        if tasks.is_all_greedy:
             tokens = torch.argmax(logits, dim=-1)
         else:
-            tokens = torch.empty(
-                (logits.shape[0],), dtype=torch.long, device=logits.device
+            probs = torch.softmax(logits / tasks.temperatures.view(-1, 1), dim=-1)
+            tokens = top_k_top_p_min_p_sampling_from_probs_torch(
+                probs, tasks.top_ks, tasks.top_ps
             )
-            for i in range(len(tasks)):
-                if temperatures[i] == 0:
-                    tokens[i] = torch.argmax(logits[i])
-                else:
-                    probs = torch.softmax(
-                        logits[i].unsqueeze(0) / temperatures[i], dim=-1
-                    )
-                    tokens[i] = top_k_top_p_min_p_sampling_from_probs_torch(
-                        probs, top_ks, top_ps
-                    )
-        tokens = tokens.cpu()
-        for it, task in enumerate(tasks):
-            task.update_response(tokens[it].item())
+        tokens_cpu = tokens.cpu()
+        for it, task in enumerate(tasks.tasks):
+            task.update_response(tokens_cpu[it].item(), tokens[it])
 
     def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
         """Make every ranks know the task metadata"""
@@ -140,7 +119,7 @@ class NormalExecutor(Executor):
         Backend.cache_manager.curr_req_ids = tasks.req_ids
         logits = Backend.model.prefill(tasks.tokens)
         self.timers("prefill").stop()
-        self.update_response(tasks.tasks, logits)
+        self.update_response(tasks, logits)
         for it in range(tasks.num_tasks):
             tasks.tasks[it].start_decoding()
         varlens = VarLens(tasks.tokens, "cuda")
@@ -150,6 +129,8 @@ class NormalExecutor(Executor):
     def decode_step(self, tasks: PackedTasksBase):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
         Backend.cache_manager.curr_req_ids = tasks.req_ids
+        if isinstance(Backend.cache_manager, PagedKVCacheManager):
+            Backend.cache_manager.prepare_block_table_for_decode(tasks.req_ids)
         # logger.info(f"Decode step: {tasks.task_ids}")
         self.timers("decode").start()
         new_tokens = self._prepare_new_tokens_for_decode(tasks)
@@ -158,7 +139,7 @@ class NormalExecutor(Executor):
         logits = Backend.model.decode(new_tokens, seq_lens)
         self.timers("decode-model").stop()
         self.timers("decode").stop()
-        self.update_response(tasks.tasks, logits)
+        self.update_response(tasks, logits)
         Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return logits
 
@@ -222,6 +203,8 @@ class PipeExecutor(NormalExecutor):
     def decode_step(self, tasks: PackedTasksBase):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
         Backend.cache_manager.curr_req_ids = tasks.req_ids
+        if isinstance(Backend.cache_manager, PagedKVCacheManager):
+            Backend.cache_manager.prepare_block_table_for_decode(tasks.req_ids)
         if self.rank == 0:
             inp = self._prepare_new_tokens_for_decode(tasks)
         else:
@@ -256,9 +239,7 @@ class PipeExecutor(NormalExecutor):
             dtype=torch.float,
         )
         handle = torch.distributed.irecv(logits, src=self.world_size - 1, tag=LOGIT_TAG)
-        Backend.ongoing_reqs.append(
-            OngoingRequests(tasks.reqs, tasks.tasks, handle, logits)
-        )
+        Backend.ongoing_reqs.append(OngoingRequests(tasks, handle, logits))
         for it, task in enumerate(tasks.tasks):
             task.wait(handle)
 
@@ -373,7 +354,7 @@ class TensorExecutor(NormalExecutor):
         logits = Backend.model.prefill(tokens, varlens=varlens)
         self.timers("prefill").stop()
         if self.rank == 0:
-            self.update_response(tasks.tasks, logits)
+            self.update_response(tasks, logits)
             for it in range(tasks.num_tasks):
                 tasks.tasks[it].start_decoding()
         Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
@@ -395,6 +376,8 @@ class TensorExecutor(NormalExecutor):
 
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
         Backend.cache_manager.curr_req_ids = tasks.req_ids
+        if isinstance(Backend.cache_manager, PagedKVCacheManager):
+            Backend.cache_manager.prepare_block_table_for_decode(tasks.req_ids)
         # logger.info(f"Decode step: {tasks.task_ids}")
         self.timers("decode").start()
         seq_lens = self._prepare_seq_lens_for_decode(tasks)
@@ -403,6 +386,6 @@ class TensorExecutor(NormalExecutor):
         self.timers("decode-model").stop()
         self.timers("decode").stop()
         if self.rank == 0:
-            self.update_response(tasks.tasks, logits)
+            self.update_response(tasks, logits)
         Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return logits

@@ -44,14 +44,13 @@ def update_ongoing_tasks():
     for ogr in Backend.ongoing_reqs:
         if ogr.handle.is_completed():
             to_remove.append(ogr)
+            unwait_tasks.append(ogr.waiting_task)
             logits_list.append(ogr.logits.view(-1, ogr.logits.shape[-1]))
-            for task in ogr.waiting_tasks:
+            for task in ogr.waiting_task.tasks:
                 task.unwait()
-                unwait_tasks.append(task)
     for tr in to_remove:
         Backend.ongoing_reqs.remove(tr)
-    logits_tensor = torch.cat(logits_list) if len(logits_list) > 0 else None
-    return unwait_tasks, logits_tensor
+    return unwait_tasks, logits_list
 
 
 def cinfer_update(task_ids, rank, world_size):
@@ -61,9 +60,9 @@ def cinfer_update(task_ids, rank, world_size):
         Backend.scheduler.update(task_ids)
     else:
         unwait_tasks, logits = update_ongoing_tasks()
-        if logits is not None:
-            Backend.executor.update_response(unwait_tasks, logits)
-        unwait_task_ids = [t.task_id for t in unwait_tasks]
+        for idx, task in enumerate(unwait_tasks):
+            Backend.executor.update_response(task, logits[idx])
+        unwait_task_ids = [t.task_id for task in unwait_tasks for t in task.tasks]
         removed_decode_task_ids = Backend.scheduler.update(task_ids, unwait_task_ids)
         remove_task_other_device(removed_decode_task_ids)
 
