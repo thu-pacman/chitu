@@ -24,7 +24,7 @@ def get_timers():
 
 
 def get_dtype():
-    _ensure_var_is_initialized(_GLOBAL_TIMERS, "use_half")
+    _ensure_var_is_initialized(_GLOBAL_HALF, "use_half")
     return _GLOBAL_HALF
 
 

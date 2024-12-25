@@ -148,7 +148,7 @@ def main(args: DictConfig):
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.WARNING)
 
-    set_global_variables()
+    set_global_variables(args)
     timers = get_timers()
 
     cinfer_init(args)

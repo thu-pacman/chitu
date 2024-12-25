@@ -5,6 +5,7 @@ stages:
 
 variables:
     VENV: "/home/gitlab-runner/venv-cinfer-ci"
+    GIT_SUBMODULE_STRATEGY: recursive
 
 before_script:
     - |
@@ -18,7 +19,7 @@ format_check:
     only:
         - merge_requests
     tags:
-        - maas-runner-a2
+        - dev
     script:
         - pip install black -i https://pypi.tuna.tsinghua.edu.cn/simple
         - black --exclude src/third_party/ --exclude third_party/ --check .
@@ -28,15 +29,13 @@ env_build_nvidia:
     only:
         - merge_requests
     tags:
-        - maas-runner-a2
+        - dev
     needs:
         - format_check
     script:
-        - git submodule update --init --recursive
-        - git submodule foreach --recursive git clean -ffdx
-        - git submodule foreach --recursive git reset --hard
-        - source /home/spack/spack/share/spack/setup-env.sh
-        - spack load cuda@12.4.0
+        - export CUDA_HOME=/usr/local/cuda-12.4
+        - export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+        - export PATH=$CUDA_HOME/bin:$PATH
         - pip install -r requirements-build.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
         - TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 MAX_JOBS=4 CINFER_WITH_CYTHON=1 pip install --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple .[quant]
 
@@ -50,9 +49,6 @@ env_build_muxi:
     needs:
         - format_check
     script:
-        - git submodule update --init --recursive
-        - git submodule foreach --recursive git clean -ffdx
-        - git submodule foreach --recursive git reset --hard
         - export PATH=/opt/maca/mxgpu_llvm/bin:/opt/maca/bin:$PATH
         - export MACA_PATH=/opt/maca
         - export LD_LIBRARY_PATH=/opt/maca/lib:/opt/maca/mxgpu_llvm/lib:$LD_LIBRARY_PATH
@@ -66,7 +62,7 @@ paged_check_nvidia:
     only:
         - merge_requests
     tags:
-        - maas-runner-a2
+        - dev
     needs:
         - env_build_nvidia
     script:
@@ -93,7 +89,7 @@ skew_check_nvidia:
     only:
         - merge_requests
     tags:
-        - maas-runner-a2
+        - dev
     needs:
         - env_build_nvidia
     script:
