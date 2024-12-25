@@ -158,14 +158,15 @@ class Backend:
             model_parallel_size,
             attn_backend,
         )
-        if torch.cuda.is_bf16_supported():
-            torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
-        else:
-            torch.set_default_tensor_type(torch.cuda.HalfTensor)
-
         if args.quant == "None":
-            model = model.to(torch.bfloat16)
-            torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
+            if args.dtype == "float16":
+                model = model.to(torch.float16)
+                torch.set_default_tensor_type(torch.cuda.HalfTensor)
+            elif args.dtype == "bfloat16":
+                model = model.to(torch.bfloat16)
+                torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
+            else:
+                raise NotImplementedError(f"Unsupported dtype {args.dtype}")
         if (
             (args.quant == "awq")
             or (args.quant == "llmint8")
