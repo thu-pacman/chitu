@@ -109,3 +109,27 @@ skew_check_muxi:
       - export MACA_PATH=/opt/maca
       - export LD_LIBRARY_PATH=/opt/maca/lib:/opt/maca/mxgpu_llvm/lib:$LD_LIBRARY_PATH
       - torchrun --nproc_per_node 1 --master_port=22515 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=skew
+
+
+tp_paged_check_nvidia:
+    stage: check
+    only:
+        - merge_requests
+    tags:
+        - dev
+    needs:
+        - env_build_nvidia
+    script:
+      - srun --gres=gpu:def:2 --mem=10G -p debug --pty torchrun --nproc_per_node 2 --master_port=22516 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.parallel_type=tensor
+
+
+pp_paged_check_nvidia:
+    stage: check
+    only:
+        - merge_requests
+    tags:
+        - dev
+    needs:
+        - env_build_nvidia
+    script:
+      - srun --gres=gpu:def:2 --mem=10G -p debug --pty torchrun --nproc_per_node 2 --master_port=22517 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.parallel_type=pipe

@@ -310,6 +310,53 @@ class Backend:
                         new_checkpoint[k] = checkpoint[k]
                 checkpoint = new_checkpoint
 
+                # Fuse gate_proj and up_proj into gate_up_proj
+                new_checkpoint = {}
+                for k in checkpoint.keys():
+                    if k.endswith("gate_proj.weight"):
+                        prefix = k[: -len("gate_proj.weight")]
+                        assert prefix + "up_proj.weight" in checkpoint
+                        gate_weight = checkpoint[prefix + "gate_proj.weight"]
+                        up_weight = checkpoint[prefix + "up_proj.weight"]
+
+                        # The fused projected shape should be concatenated after the model parallel dimension.
+                        # See model_qwen.py for details.
+                        assert gate_weight.shape[0] % model_parallel_size == 0
+                        assert up_weight.shape[0] % model_parallel_size == 0
+                        gate_weight = gate_weight.reshape(
+                            model_parallel_size, -1, gate_weight.shape[-1]
+                        )
+                        up_weight = up_weight.reshape(
+                            model_parallel_size, -1, up_weight.shape[-1]
+                        )
+                        gate_up_weight = torch.cat([gate_weight, up_weight], dim=1)
+                        gate_up_weight = gate_up_weight.reshape(
+                            -1, gate_up_weight.shape[-1]
+                        )
+                        new_checkpoint[prefix + "gate_up_proj.weight"] = gate_up_weight
+                    elif k.endswith("up_proj.weight"):
+                        continue
+                    elif k.endswith("gate_proj.bias"):
+                        prefix = k[: -len("gate_proj.bias")]
+                        assert prefix + "up_proj.bias" in checkpoint
+                        gate_bias = checkpoint[prefix + "gate_proj.bias"]
+                        up_bias = checkpoint[prefix + "up_proj.bias"]
+
+                        # The fused projected shape should be concatenated after the model parallel dimension.
+                        # See model_qwen.py for details.
+                        assert gate_bias.shape[0] % model_parallel_size == 0
+                        assert up_bias.shape[0] % model_parallel_size == 0
+                        gate_bias = gate_bias.reshape(model_parallel_size, -1)
+                        up_bias = up_bias.reshape(model_parallel_size, -1)
+                        gate_up_bias = torch.cat([gate_bias, up_bias], dim=1)
+                        gate_up_bias = gate_up_bias.reshape(-1)
+                        new_checkpoint[prefix + "gate_up_proj.bias"] = gate_up_bias
+                    elif k.endswith("up_proj.bias"):
+                        continue
+                    else:
+                        new_checkpoint[k] = checkpoint[k]
+                checkpoint = new_checkpoint
+
             # logger.warning(checkpoint.keys())
             if pipeline_parallel_size > 1:
                 load_pipe(

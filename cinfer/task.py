@@ -352,7 +352,7 @@ class PackedTasksBase:
         decoded_types = []
         lens = []
         for it in range(cls.max_num_tasks):
-            task_id = task_tensor_cpu[1 + it]
+            task_id = task_tensor_cpu[1 + it].item()
             if task_id == 0:
                 break
             decoded_id, decoded_type = req_decode(task_id)

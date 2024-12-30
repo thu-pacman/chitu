@@ -185,18 +185,26 @@ class AttentionQwen(Attention):
 class FeedForwardQwen(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
-        self.gate_proj = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+
+        # Do a parallel + fused linear projection, while ensuring outputs from gate_proj and up_proj are contiguous in memory.
+        # Therefore, the projected shape is [model_parallel_size, 2 * hidden_dim]
+
+        self.gate_up_proj = ColumnParallelLinear(
+            dim,
+            hidden_dim * 2,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
         )
         self.down_proj = RowParallelLinear(
             hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
         )
-        self.up_proj = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
-        )
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate_up_out = self.gate_up_proj(x)
+        gate_out = gate_up_out[..., : gate_up_out.shape[-1] // 2]
+        up_out = gate_up_out[..., gate_up_out.shape[-1] // 2 :]
+        return self.down_proj(F.silu(gate_out) * up_out)
 
 
 class TransformerBlockQwen(TransformerBlock):
