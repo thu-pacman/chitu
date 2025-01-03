@@ -220,6 +220,10 @@ class Task:
 
         if isinstance(message, str):
             self.tokens = Backend.tokenizer.encode(message, bos=True, eos=False)
+        elif hasattr(Backend.tokenizer.model, "apply_chat_template"):
+            self.tokens = Backend.tokenizer.model.apply_chat_template(
+                message, add_generation_prompt=True
+            )
         else:
             self.tokens = Backend.formatter.encode_dialog_prompt(message)
         self.task_type = TaskType.Prefill  # New Task object is always a prefill task

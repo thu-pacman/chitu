@@ -7,7 +7,7 @@ from cinfer.backend import Backend
 from cinfer.global_vars import *
 from cinfer.tokenizer import Tokenizer, ChatFormat, TokenizerHF, ChatFormatHF
 from cinfer.model import Attention, Transformer, apply_rotary_emb
-from cinfer.model_qwen import AttentionQwen, apply_rotary_pos_emb_torch
+from cinfer.model_hf_llama import AttentionHFLlama, apply_rotary_pos_emb_torch
 from cinfer.utils import VarLens
 import yaml
 import flash_attn
@@ -78,7 +78,7 @@ def prefill_forward_qwen(
     return self._run_output_linear(output)
 
 
-AttentionQwen.prefill_forward = prefill_forward_qwen
+AttentionHFLlama.prefill_forward = prefill_forward_qwen
 
 """
 @torch.inference_mode()

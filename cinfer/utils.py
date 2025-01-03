@@ -11,7 +11,7 @@ def load_tensor_parallel(checkpoint, model, num_layers, rank, world_size, type):
     if type == "llama":
         cpl_str = ["wq", "wk", "wv", "w1", "w3", "output", "embed"]
         rpl_str = ["wo", "w2"]
-    elif type == "qwen":
+    elif type == "hf-llama":
         cpl_str = [
             "qkv_proj",  # new after fusion
             "q_proj",  # unused after fusion, for compatibility
@@ -47,7 +47,7 @@ def load_pipe(checkpoint, model, num_layers, rank, world_size, type):
             partial_checkpoint["tok_embeddings.weight"] = checkpoint[
                 "tok_embeddings.weight"
             ]
-        elif type == "qwen":
+        elif type == "hf-llama":
             partial_checkpoint["embed_tokens.weight"] = checkpoint[
                 "embed_tokens.weight"
             ]
@@ -61,7 +61,7 @@ def load_pipe(checkpoint, model, num_layers, rank, world_size, type):
     if rank == world_size - 1:
         if type == "llama":
             partial_checkpoint["output.weight"] = checkpoint["output.weight"]
-        elif type == "qwen":
+        elif type == "hf-llama":
             partial_checkpoint["lm_head.weight"] = checkpoint["lm_head.weight"]
         partial_checkpoint["norm.weight"] = checkpoint["norm.weight"]
     model.load_state_dict(partial_checkpoint)
@@ -106,3 +106,32 @@ class VarLens:
         self.position_ids = torch.from_numpy(
             np.concatenate([np.arange(l) for l in self.cpu_lens])
         ).to(device)
+
+
+def merge_column_parallel_weights(weights, model_parallel_size):
+    """
+    For example, fuse WQ, WK, WV into one tensor.
+
+    - Column parallel means the fairsacale-style ColumnPararllelLinear layer. The merged
+    dimension is actually the FIRST dimension instead of the last.
+    - The fused projected shape should be concatenated after the model parallel dimension.
+    See model_hf_llama.py for details.
+    """
+
+    new_weights = []
+    for weight in weights:
+        assert weight.shape[0] % model_parallel_size == 0
+        new_weights.append(weight.reshape(model_parallel_size, -1, weight.shape[-1]))
+    ret_weight = torch.cat(new_weights, dim=1)
+    ret_weight = ret_weight.reshape(-1, ret_weight.shape[-1])
+    return ret_weight
+
+
+def merge_column_parallel_biases(biases, model_parallel_size):
+    new_biases = []
+    for bias in biases:
+        assert bias.shape[0] % model_parallel_size == 0
+        new_biases.append(bias.reshape(model_parallel_size, -1))
+    ret_bias = torch.cat(new_biases, dim=1)
+    ret_bias = ret_bias.reshape(-1)
+    return ret_bias
