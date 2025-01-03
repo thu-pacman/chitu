@@ -18,8 +18,13 @@ from .cache_manager import (
 )
 from .attn_backend import FlashAttnBackend, RefAttnBackend
 from .model_llama import TransformerLlama
-from .model_qwen import TransformerQwen
-from .utils import load_pipe, load_tensor_parallel
+from .model_hf_llama import TransformerHFLlama
+from .utils import (
+    load_pipe,
+    load_tensor_parallel,
+    merge_column_parallel_weights,
+    merge_column_parallel_biases,
+)
 import fairscale.nn.model_parallel.initialize as fs_init
 
 from logging import getLogger
@@ -47,8 +52,10 @@ class Backend:
 
     @staticmethod
     def build_model(args, cache, *extra_args, **extra_kwargs):
-        if args.type == "qwen":
-            return TransformerQwen(args, cache, *extra_args, **extra_kwargs)
+        if args.type == "hf-llama":
+            if args.name.startswith("glm4"):
+                extra_kwargs["rotary_type"] = "glm4"
+            return TransformerHFLlama(args, cache, *extra_args, **extra_kwargs)
         elif args.type == "llama":
             return TransformerLlama(args, cache, *extra_args, **extra_kwargs)
         else:
@@ -78,9 +85,15 @@ class Backend:
         if local_rank > 0:
             sys.stdout = open(os.devnull, "w")
 
+        trust_remote_code = False
+        if args.models.name.startswith("glm4"):
+            trust_remote_code = True  # Blame the glm4 folks for this
+
         # Init tokenizer
-        if args.models.type == "qwen":
-            tokenizer = TokenizerHF(path=args.models.tokenizer_path)
+        if args.models.type == "hf-llama":
+            tokenizer = TokenizerHF(
+                path=args.models.tokenizer_path, trust_remote_code=trust_remote_code
+            )
         else:
             tokenizer = Tokenizer(model_path=args.models.tokenizer_path)
             assert (
@@ -95,7 +108,7 @@ class Backend:
             device=local_rank,
         )
         Backend.tokenizer = tokenizer
-        if args.models.type == "qwen":
+        if args.models.type == "hf-llama":
             Backend.formatter = ChatFormatHF(tokenizer)
         else:
             Backend.formatter = ChatFormat(tokenizer)
@@ -178,11 +191,11 @@ class Backend:
             torch.set_default_tensor_type(torch.cuda.HalfTensor)
             model = model.to(torch.float16)
         if args.quant == "awq":
-            quant(model, method="awq", name="qwen")
+            quant(model, method="awq", name="hf-llama")
         elif args.quant == "gptq":
-            quant(model, method="gptq", name="qwen")
+            quant(model, method="gptq", name="hf-llama")
         elif args.quant == "w8a16":
-            quant(model, method="w8a16", name="qwen")
+            quant(model, method="w8a16", name="hf-llama")
         # print(model)
 
         # Init model parameters
@@ -196,7 +209,7 @@ class Backend:
                 ckpt_path = checkpoints[0]
                 # logger.warning(f"Loading checkpoint from {ckpt_path}")
                 checkpoint = torch.load(ckpt_path, map_location="cpu")
-            elif args.models.type == "qwen":
+            elif args.models.type == "hf-llama":
                 if args.quant == "awq":
                     params = torch.load(args.quant_ckpt_dir, map_location="cpu")
                     replace_list = [
@@ -212,7 +225,10 @@ class Backend:
                     checkpoint = dict((rep(k), v) for k, v in params.items())
                 elif args.quant == "gptq":
                     params = AutoModelForCausalLM.from_pretrained(
-                        args.quant_ckpt_dir, torch_dtype="auto", device_map="cpu"
+                        args.quant_ckpt_dir,
+                        torch_dtype="auto",
+                        device_map="cpu",
+                        trust_remote_code=trust_remote_code,
                     ).state_dict()
 
                     def transform_key(key):
@@ -242,7 +258,10 @@ class Backend:
                     # print(checkpoint.keys())
                 else:
                     params = AutoModelForCausalLM.from_pretrained(
-                        args.models.ckpt_dir, torch_dtype="auto", device_map="cpu"
+                        args.models.ckpt_dir,
+                        torch_dtype="auto",
+                        device_map="cpu",
+                        trust_remote_code=trust_remote_code,
                     ).state_dict()
 
                     def transform_key(key):
@@ -252,59 +271,105 @@ class Backend:
 
                     checkpoint = dict((transform_key(k), v) for k, v in params.items())
 
+                if args.models.name.startswith("glm4"):
+                    # glm4 has non-standard key names because they use "custom code" in model files instead of
+                    # using code in transformers' repo.
+
+                    def map_glm4_key(k):
+                        k = k.replace(
+                            "transformer.embedding.word_embeddings.", "embed_tokens."
+                        )
+                        k = k.replace("transformer.encoder.layers.", "layers.")
+                        k = k.replace(".self_attention.", ".self_attn.")
+                        k = k.replace(".query_key_value.", ".qkv_proj.")
+                        k = k.replace(".dense.", ".o_proj.")
+                        k = k.replace(".dense_h_to_4h.", ".gate_up_proj.")
+                        k = k.replace(".dense_4h_to_h.", ".down_proj.")
+                        k = k.replace("transformer.encoder.final_layernorm.", "norm.")
+                        k = k.replace("transformer.output_layer.", "lm_head.")
+                        return k
+
+                    del checkpoint["transformer.rotary_pos_emb.inv_freq"]
+                    checkpoint = {map_glm4_key(k): v for k, v in checkpoint.items()}
+
                 # Fuse q_proj, k_proj, v_proj into qkv_proj
                 new_checkpoint = {}
                 for k in checkpoint.keys():
-                    if k.endswith("q_proj.weight"):
+                    if k.endswith(".qkv_proj.weight"):
+                        # Already fused, but need to transpose for model parallel
+                        qkv_weight = checkpoint[k]
+                        if model_parallel_size > 1:
+                            n_heads = args.models.n_heads
+                            n_kv_heads = (
+                                args.models.n_heads
+                                if args.models.n_kv_heads is None
+                                else args.models.n_kv_heads
+                            )
+                            head_dim = args.models.dim // n_heads
+                            q_weight, k_weight, v_weight = qkv_weight.split(
+                                [
+                                    n_heads * head_dim,
+                                    n_kv_heads * head_dim,
+                                    n_kv_heads * head_dim,
+                                ],
+                                dim=0,
+                            )
+                            qkv_weight = merge_column_parallel_weights(
+                                [q_weight, k_weight, v_weight], model_parallel_size
+                            )
+                        new_checkpoint[k] = qkv_weight
+                    elif k.endswith(".q_proj.weight"):
                         prefix = k[: -len("q_proj.weight")]
                         assert prefix + "k_proj.weight" in checkpoint
                         assert prefix + "v_proj.weight" in checkpoint
+                        assert prefix + "qkv_proj.weight" not in checkpoint
                         q_weight = checkpoint[prefix + "q_proj.weight"]
                         k_weight = checkpoint[prefix + "k_proj.weight"]
                         v_weight = checkpoint[prefix + "v_proj.weight"]
-
-                        # The fused projected shape should be concatenated after the model parallel dimension.
-                        # See model_qwen.py for details.
-
-                        # q_weight, k_weight, v_weight are from ColumnParallelLinear, so their shape[0] are
-                        # output_size
-                        assert q_weight.shape[0] % model_parallel_size == 0
-                        assert k_weight.shape[0] % model_parallel_size == 0
-                        assert v_weight.shape[0] % model_parallel_size == 0
-                        q_weight = q_weight.reshape(
-                            model_parallel_size, -1, q_weight.shape[-1]
+                        new_checkpoint[prefix + "qkv_proj.weight"] = (
+                            merge_column_parallel_weights(
+                                [q_weight, k_weight, v_weight], model_parallel_size
+                            )
                         )
-                        k_weight = k_weight.reshape(
-                            model_parallel_size, -1, k_weight.shape[-1]
-                        )
-                        v_weight = v_weight.reshape(
-                            model_parallel_size, -1, v_weight.shape[-1]
-                        )
-                        qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=1)
-                        qkv_weight = qkv_weight.reshape(-1, qkv_weight.shape[-1])
-                        new_checkpoint[prefix + "qkv_proj.weight"] = qkv_weight
-                    elif k.endswith("k_proj.weight") or k.endswith("v_proj.weight"):
+                    elif k.endswith(".k_proj.weight") or k.endswith(".v_proj.weight"):
                         continue
-                    elif k.endswith("q_proj.bias"):
+                    elif k.endswith(".qkv_proj.bias"):
+                        # Already fused, but need to transpose for model parallel
+                        qkv_bias = checkpoint[k]
+                        if model_parallel_size > 1:
+                            n_heads = args.models.n_heads
+                            n_kv_heads = (
+                                args.models.n_heads
+                                if args.models.n_kv_heads is None
+                                else args.models.n_kv_heads
+                            )
+                            head_dim = args.models.dim // n_heads
+                            q_bias, k_bias, v_bias = qkv_bias.split(
+                                [
+                                    n_heads * head_dim,
+                                    n_kv_heads * head_dim,
+                                    n_kv_heads * head_dim,
+                                ],
+                                dim=0,
+                            )
+                            qkv_bias = merge_column_parallel_biases(
+                                [q_bias, k_bias, v_bias], model_parallel_size
+                            )
+                        new_checkpoint[k] = qkv_bias
+                    elif k.endswith(".q_proj.bias"):
                         prefix = k[: -len("q_proj.bias")]
                         assert prefix + "k_proj.bias" in checkpoint
                         assert prefix + "v_proj.bias" in checkpoint
+                        assert prefix + "qkv_proj.bias" not in checkpoint
                         q_bias = checkpoint[prefix + "q_proj.bias"]
                         k_bias = checkpoint[prefix + "k_proj.bias"]
                         v_bias = checkpoint[prefix + "v_proj.bias"]
-
-                        # The fused projected shape should be concatenated after the model parallel dimension.
-                        # See model_qwen.py for details.
-                        assert q_bias.shape[0] % model_parallel_size == 0
-                        assert k_bias.shape[0] % model_parallel_size == 0
-                        assert v_bias.shape[0] % model_parallel_size == 0
-                        q_bias = q_bias.reshape(model_parallel_size, -1)
-                        k_bias = k_bias.reshape(model_parallel_size, -1)
-                        v_bias = v_bias.reshape(model_parallel_size, -1)
-                        qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=1)
-                        qkv_bias = qkv_bias.reshape(-1)
-                        new_checkpoint[prefix + "qkv_proj.bias"] = qkv_bias
-                    elif k.endswith("k_proj.bias") or k.endswith("v_proj.bias"):
+                        new_checkpoint[prefix + "qkv_proj.bias"] = (
+                            merge_column_parallel_biases(
+                                [q_bias, k_bias, v_bias], model_parallel_size
+                            )
+                        )
+                    elif k.endswith(".k_proj.bias") or k.endswith(".v_proj.bias"):
                         continue
                     else:
                         new_checkpoint[k] = checkpoint[k]
@@ -313,14 +378,26 @@ class Backend:
                 # Fuse gate_proj and up_proj into gate_up_proj
                 new_checkpoint = {}
                 for k in checkpoint.keys():
-                    if k.endswith("gate_proj.weight"):
+                    if k.endswith(".gate_up_proj.weight"):
+                        # Already fused, but need to transpose for model parallel
+                        gate_up_weight = checkpoint[k]
+                        if model_parallel_size > 1:
+                            gate_weight, up_weight = torch.chunk(
+                                gate_up_weight, 2, dim=0
+                            )
+                            gate_up_weight = merge_column_parallel_weights(
+                                [gate_weight, up_weight], model_parallel_size
+                            )
+                        new_checkpoint[k] = gate_up_weight
+                    elif k.endswith(".gate_proj.weight"):
                         prefix = k[: -len("gate_proj.weight")]
                         assert prefix + "up_proj.weight" in checkpoint
+                        assert prefix + "gate_up_proj.weight" not in checkpoint
                         gate_weight = checkpoint[prefix + "gate_proj.weight"]
                         up_weight = checkpoint[prefix + "up_proj.weight"]
 
                         # The fused projected shape should be concatenated after the model parallel dimension.
-                        # See model_qwen.py for details.
+                        # See model_hf_llama.py for details.
                         assert gate_weight.shape[0] % model_parallel_size == 0
                         assert up_weight.shape[0] % model_parallel_size == 0
                         gate_weight = gate_weight.reshape(
@@ -334,16 +411,26 @@ class Backend:
                             -1, gate_up_weight.shape[-1]
                         )
                         new_checkpoint[prefix + "gate_up_proj.weight"] = gate_up_weight
-                    elif k.endswith("up_proj.weight"):
+                    elif k.endswith(".up_proj.weight"):
                         continue
-                    elif k.endswith("gate_proj.bias"):
+                    elif k.endswith(".gate_up_proj.bias"):
+                        # Already fused, but need to transpose for model parallel
+                        gate_up_bias = checkpoint[k]
+                        if model_parallel_size > 1:
+                            gate_bias, up_bias = torch.chunk(gate_up_bias, 2, dim=0)
+                            gate_up_bias = merge_column_parallel_biases(
+                                [gate_bias, up_bias], model_parallel_size
+                            )
+                        new_checkpoint[k] = gate_up_bias
+                    elif k.endswith(".gate_proj.bias"):
                         prefix = k[: -len("gate_proj.bias")]
                         assert prefix + "up_proj.bias" in checkpoint
+                        assert prefix + "gate_up_proj.bias" not in checkpoint
                         gate_bias = checkpoint[prefix + "gate_proj.bias"]
                         up_bias = checkpoint[prefix + "up_proj.bias"]
 
                         # The fused projected shape should be concatenated after the model parallel dimension.
-                        # See model_qwen.py for details.
+                        # See model_hf_llama.py for details.
                         assert gate_bias.shape[0] % model_parallel_size == 0
                         assert up_bias.shape[0] % model_parallel_size == 0
                         gate_bias = gate_bias.reshape(model_parallel_size, -1)
@@ -351,7 +438,7 @@ class Backend:
                         gate_up_bias = torch.cat([gate_bias, up_bias], dim=1)
                         gate_up_bias = gate_up_bias.reshape(-1)
                         new_checkpoint[prefix + "gate_up_proj.bias"] = gate_up_bias
-                    elif k.endswith("up_proj.bias"):
+                    elif k.endswith(".up_proj.bias"):
                         continue
                     else:
                         new_checkpoint[k] = checkpoint[k]
@@ -381,7 +468,7 @@ class Backend:
             logger.warning(f"Loaded in {time.time() - start_time:.2f} seconds")
 
         if args.quant == "llmint8":
-            quant(model, "llmint8", "qwen")
+            quant(model, "llmint8", "hf-llama")
         model = model.to(local_rank)
         Backend.model = model
 

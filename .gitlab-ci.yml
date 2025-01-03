@@ -66,7 +66,7 @@ paged_check_nvidia:
     needs:
         - env_build_nvidia
     script:
-      - srun --gres=gpu:def:1 --mem=10G -p debug --pty torchrun --nproc_per_node 1 --master_port=22514 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged
+      - grun torchrun --nproc_per_node 1 --master_port=22514 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged
 
 
 paged_check_muxi:
@@ -93,7 +93,7 @@ skew_check_nvidia:
     needs:
         - env_build_nvidia
     script:
-      - srun --gres=gpu:def:1 --mem=10G -p debug --pty torchrun --nproc_per_node 1 --master_port=22515 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=skew
+      - grun torchrun --nproc_per_node 1 --master_port=22515 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=skew
 
 
 skew_check_muxi:
@@ -120,7 +120,7 @@ tp_paged_check_nvidia:
     needs:
         - env_build_nvidia
     script:
-      - srun --gres=gpu:def:2 --mem=10G -p debug --pty torchrun --nproc_per_node 2 --master_port=22516 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.parallel_type=tensor
+      - grun 2 torchrun --nproc_per_node 2 --master_port=22516 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.parallel_type=tensor
 
 
 pp_paged_check_nvidia:
@@ -132,4 +132,28 @@ pp_paged_check_nvidia:
     needs:
         - env_build_nvidia
     script:
-      - srun --gres=gpu:def:2 --mem=10G -p debug --pty torchrun --nproc_per_node 2 --master_port=22517 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.parallel_type=pipe
+      - grun 2 torchrun --nproc_per_node 2 --master_port=22517 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.parallel_type=pipe
+
+
+glm4_9b_nvidia:
+    stage: check
+    only:
+        - merge_requests
+    tags:
+        - dev
+    needs:
+        - env_build_nvidia
+    script:
+      - grun torchrun --nproc_per_node 1 --master_port=22518 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged models=glm4-9b
+
+
+llama3_8b_nvidia:
+    stage: check
+    only:
+        - merge_requests
+    tags:
+        - dev
+    needs:
+        - env_build_nvidia
+    script:
+      - grun torchrun --nproc_per_node 1 --master_port=22519 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged models=llama3-8b infer.max_seq_len=2048

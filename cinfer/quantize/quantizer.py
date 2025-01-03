@@ -147,7 +147,7 @@ def quantize_gptq(model):
     return model
 
 
-def quantize_awq(model, name="qwen"):
+def quantize_awq(model, name="hf-llama"):
     q_config = {"zero_point": True, "q_group_size": 128}
 
     awq.real_quantize_model_weight(model, w_bit=4, q_config=q_config, init_only=True)
@@ -158,7 +158,7 @@ def quantize_awq(model, name="qwen"):
             "/home/tanyijun/cinfer/quant_cache/Llama3-8B-4bit.pth", map_location="cpu"
         )
         model.load_state_dict(sd)
-    elif name == "qwen":
+    elif name == "hf-llama":
         0
 
     class FP16Trans(torch.nn.Module):
@@ -171,7 +171,7 @@ def quantize_awq(model, name="qwen"):
 
     if name == "llama":
         model.tok_embeddings = FP16Trans(model.tok_embeddings)
-    elif name == "qwen":
+    elif name == "hf-llama":
         model.embed_tokens = FP16Trans(model.embed_tokens)
 
     print(model)
@@ -189,7 +189,7 @@ def quantize_w8a16(model):
     return model
 
 
-def quant(model, method=None, name="qwen"):
+def quant(model, method=None, name="hf-llama"):
 
     if method == "llmint8":
         return quantize_llmint8(model)

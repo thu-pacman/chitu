@@ -17,9 +17,11 @@ from .ops import apply_rotary_pos_emb_triton
 logger = getLogger(__name__)
 
 
-class AttentionQwen(Attention):
-    def __init__(self, args, layer_id, cache, attn_backend):
+class AttentionHFLlama(Attention):
+    def __init__(self, args, layer_id, cache, attn_backend, rotary_type="default"):
         super().__init__(layer_id, cache, attn_backend)
+        self.rotary_type = rotary_type
+
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         model_parallel_size = fs_init.get_model_parallel_world_size()
         self.n_local_heads = args.n_heads // model_parallel_size
@@ -47,8 +49,8 @@ class AttentionQwen(Attention):
             input_is_parallel=True,
             init_method=lambda x: x,
         )
-        self.rotary_emb = Qwen2RotaryEmbedding(
-            self.head_dim,
+        self.rotary_emb = RotaryEmbeddingHFLlama(
+            self.head_dim // 2 if rotary_type == "glm4" else self.head_dim,
             max_position_embeddings=args.max_position_embeddings,
             base=args.rope_theta,
         )
@@ -82,12 +84,13 @@ class AttentionQwen(Attention):
         # torch.cuda.synchronize()
         cos, sin = self.rotary_emb(xv, seq_len=bs_seq)
         # torch.cuda.synchronize()
-        xq, xk = apply_rotary_pos_emb_torch(
+        xq, xk = apply_rotary_pos_emb(
             xq,
             xk,
             cos,
             sin,
             position_ids=self.cache.curr_varlens.position_ids,
+            rotary_type=self.rotary_type,
         )
         # torch.cuda.synchronize()
         self.cache.finalize_cache_bylayer_prefill(
@@ -123,6 +126,7 @@ class AttentionQwen(Attention):
             cos,
             sin,
             position_ids=self.cache.get_gpu_seq_lens(),
+            rotary_type=self.rotary_type,
         )
         # logger.warning(f"cos shape {cos.shape} {self.cache.curr_seq_lens} {cos.dtype}")
         # torch.cuda.synchronize()
@@ -161,6 +165,7 @@ class AttentionQwen(Attention):
             cos,
             sin,
             position_ids=self.cache.get_gpu_seq_lens(),
+            rotary_type=self.rotary_type,
         )
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
@@ -182,7 +187,7 @@ class AttentionQwen(Attention):
         return self._run_output_linear(output)
 
 
-class FeedForwardQwen(nn.Module):
+class FeedForwardHFLlama(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
 
@@ -207,26 +212,34 @@ class FeedForwardQwen(nn.Module):
         return self.down_proj(F.silu(gate_out) * up_out)
 
 
-class TransformerBlockQwen(TransformerBlock):
-    def __init__(self, layer_id: int, args, cache, attn_backend):
+class TransformerBlockHFLlama(TransformerBlock):
+    def __init__(self, layer_id: int, args, cache, attn_backend, rotary_type="default"):
         super().__init__(layer_id, args, cache, attn_backend)
-        self.self_attn = AttentionQwen(args, layer_id, cache, attn_backend)
-        self.mlp = FeedForwardQwen(dim=args.dim, hidden_dim=args.intermediate_dim)
+        self.self_attn = AttentionHFLlama(
+            args, layer_id, cache, attn_backend, rotary_type=rotary_type
+        )
+        self.mlp = FeedForwardHFLlama(dim=args.dim, hidden_dim=args.intermediate_dim)
         self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
         self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, varlens=None):
-        # h = self.input_layernorm(x)
         h = self.self_attn(self.input_layernorm(x), freqs_cis, varlens)
         h += x
         out = h + self.mlp(self.post_attention_layernorm(h))
         return out
 
 
-class TransformerQwen(Transformer):
+class TransformerHFLlama(Transformer):
     def __init__(
-        self, params, cache, pipeline_parallel_size, model_parallel_size, attn_backend
+        self,
+        params,
+        cache,
+        pipeline_parallel_size,
+        model_parallel_size,
+        attn_backend,
+        rotary_type="default",
     ):
+        self.rotary_type = rotary_type
         super().__init__(
             params, cache, pipeline_parallel_size, model_parallel_size, attn_backend
         )
@@ -240,7 +253,13 @@ class TransformerQwen(Transformer):
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.n_layers):
             self.layers.append(
-                TransformerBlockQwen(layer_id, self.params, cache, attn_backend)
+                TransformerBlockHFLlama(
+                    layer_id,
+                    self.params,
+                    cache,
+                    attn_backend,
+                    rotary_type=self.rotary_type,
+                )
             )
 
     def _init_post_layers(self):
@@ -259,7 +278,7 @@ class TransformerQwen(Transformer):
         return h
 
 
-class Qwen2RotaryEmbedding(nn.Module):
+class RotaryEmbeddingHFLlama(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
 
@@ -311,33 +330,73 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb_torch(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+def apply_rotary_pos_emb_torch(
+    q, k, cos, sin, position_ids, unsqueeze_dim=1, rotary_type="default"
+):
+    if rotary_type == "default":
+        cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+        sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
+
+    elif rotary_type == "glm4":
+        # TODO: Now we transpose q and k, do the rotary, and transpose back.
+        # Maybe we can transpose cos and sin just once instead of transposing q and k.
+        q, q_pass = q[..., :64], q[..., 64:]
+        k, k_pass = k[..., :64], k[..., 64:]
+        q = (
+            q.reshape(q.shape[0], q.shape[1], q.shape[2] // 2, 2)
+            .permute(0, 1, 3, 2)
+            .reshape(q.shape[0], q.shape[1], q.shape[2])
+        )
+        k = (
+            k.reshape(k.shape[0], k.shape[1], k.shape[2] // 2, 2)
+            .permute(0, 1, 3, 2)
+            .reshape(k.shape[0], k.shape[1], k.shape[2])
+        )
+        cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+        sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        q_embed = (
+            q_embed.reshape(
+                q_embed.shape[0], q_embed.shape[1], 2, q_embed.shape[2] // 2
+            )
+            .permute(0, 1, 3, 2)
+            .reshape(q_embed.shape[0], q_embed.shape[1], q_embed.shape[2])
+        )
+        k_embed = (
+            k_embed.reshape(
+                k_embed.shape[0], k_embed.shape[1], 2, k_embed.shape[2] // 2
+            )
+            .permute(0, 1, 3, 2)
+            .reshape(k_embed.shape[0], k_embed.shape[1], k_embed.shape[2])
+        )
+        return torch.cat([q_embed, q_pass], dim=-1), torch.cat(
+            [k_embed, k_pass], dim=-1
+        )
+
+    else:
+        raise ValueError(f"Unknown rotary type: {rotary_type}")
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    # cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    # sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-    # q_embed = (q * cos) + (rotate_half(q) * sin)
-    # k_embed = (k * cos) + (rotate_half(k) * sin)
-
-    # cossin = torch.stack((cos, sin)).contiguous()
-    # torch.cuda.synchronize()
-    # ops.rotary_embedding(
-    #     positions=position_ids,
-    #     query=q,
-    #     key=k,
-    #     head_size=q.shape[-1],
-    #     cos_sin_cache=cossin,
-    #     is_neox=False,
-    # )
-    q_embed = apply_rotary_pos_emb_triton(q, cos, sin, position_ids)
-    k_embed = apply_rotary_pos_emb_triton(k, cos, sin, position_ids)
-    # torch.cuda.synchronize()
-
-    return q_embed, k_embed
-    # return q, k
+def apply_rotary_pos_emb(
+    q, k, cos, sin, position_ids, unsqueeze_dim=1, rotary_type="default"
+):
+    if rotary_type == "default":
+        # NOTE: Performance of triton rotary kernel is untested for large batch sizes.
+        # If it's slow on prefill, just switch to torch implementation on the else case.
+        q_embed = apply_rotary_pos_emb_triton(q, cos, sin, position_ids)
+        k_embed = apply_rotary_pos_emb_triton(k, cos, sin, position_ids)
+        return q_embed, k_embed
+    else:
+        return apply_rotary_pos_emb_torch(
+            q,
+            k,
+            cos,
+            sin,
+            position_ids,
+            unsqueeze_dim=unsqueeze_dim,
+            rotary_type=rotary_type,
+        )

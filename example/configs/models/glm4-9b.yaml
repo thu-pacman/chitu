@@ -1,0 +1,14 @@
+name: glm4-9b
+type: hf-llama
+ckpt_dir: /home/share/models/glm-4-9b-chat
+tokenizer_path: /home/share/models/glm-4-9b-chat # TODO
+dim: 4096
+n_layers: 40
+n_heads: 32
+n_kv_heads: 2
+vocab_size: 151552
+intermediate_dim: 13696
+norm_eps: 1.5625e-07
+rope_theta: 5000000.0
+max_position_embeddings: 32768
+max_seq_len: 10240 # length of prefill + decode

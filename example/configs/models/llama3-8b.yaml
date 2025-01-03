@@ -1,7 +1,7 @@
 name: llama3-8b
 type: llama
-ckpt_dir: /home/hkz/Meta-Llama-3-8B-Instruct
-tokenizer_path: /home/hkz/Meta-Llama-3-8B-Instruct/tokenizer.model
+ckpt_dir: /home/share/models/Meta-Llama-3-8B-Instruct
+tokenizer_path: /home/share/models/Meta-Llama-3-8B-Instruct/tokenizer.model
 dim: 4096
 n_layers: 32
 n_heads: 32

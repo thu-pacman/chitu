@@ -177,7 +177,7 @@ setup(
         "flash-attn",
         "fairscale",
         "fire",
-        "tiktoken==0.4.0",
+        "tiktoken>=0.7.0",  # Required by glm4
         "blobfile",
         "faker",
         "hydra-core",

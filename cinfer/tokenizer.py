@@ -231,9 +231,11 @@ class ChatFormat:
 
 
 class TokenizerHF:
-    def __init__(self, path: str):
+    def __init__(self, path: str, trust_remote_code: bool = False):
         self.tokens_cache = []
-        self.model = AutoTokenizer.from_pretrained(path)
+        self.model = AutoTokenizer.from_pretrained(
+            path, trust_remote_code=trust_remote_code
+        )
         # self.model = AutoTokenizer.from_pretrained("Qwen/Qwen2-7B-Instruct")
         # Qwen2 don't set bos but have <|im_start|>
         # all special tokens: <|endoftext|> <|im_start|> <|im_end|>
@@ -248,9 +250,9 @@ class TokenizerHF:
 
     def encode(self, s: str, bos: bool, eos: bool) -> List[int]:
         t = self.model.encode(s, add_special_tokens=False)
-        if bos:
+        if bos and self.bos_id is not None:
             t.insert(0, self.bos_id)
-        if eos:
+        if eos and self.eos_id is not None:
             t.append(self.eos_id)
         return t
 
