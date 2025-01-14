@@ -35,17 +35,20 @@ class AttentionHFLlama(Attention):
         #
         # Therefore, the projected shape should be [model_parallel_size, self.n_rep + 2, self.n_local_kv_heads, self.head_dim]
 
+        qkv_has_bias = args.qkv_has_bias if hasattr(args, "qkv_has_bias") else True
+        o_has_bias = args.o_has_bias if hasattr(args, "o_has_bias") else False
+
         self.qkv_proj = ColumnParallelLinear(
             args.dim,
             (args.n_heads + 2 * self.n_kv_heads) * self.head_dim,
-            bias=True,
+            bias=qkv_has_bias,
             gather_output=False,
             init_method=lambda x: x,
         )
         self.o_proj = RowParallelLinear(
             args.n_heads * self.head_dim,
             args.dim,
-            bias=False,
+            bias=o_has_bias,
             input_is_parallel=True,
             init_method=lambda x: x,
         )
@@ -213,12 +216,20 @@ class FeedForwardHFLlama(nn.Module):
 
 
 class TransformerBlockHFLlama(TransformerBlock):
-    def __init__(self, layer_id: int, args, cache, attn_backend, rotary_type="default"):
+    def __init__(
+        self,
+        layer_id: int,
+        args,
+        cache,
+        attn_backend,
+        rotary_type="default",
+        mlp_type=FeedForwardHFLlama,
+    ):
         super().__init__(layer_id, args, cache, attn_backend)
         self.self_attn = AttentionHFLlama(
             args, layer_id, cache, attn_backend, rotary_type=rotary_type
         )
-        self.mlp = FeedForwardHFLlama(dim=args.dim, hidden_dim=args.intermediate_dim)
+        self.mlp = mlp_type(dim=args.dim, hidden_dim=args.intermediate_dim)
         self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
         self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
 
@@ -238,8 +249,10 @@ class TransformerHFLlama(Transformer):
         model_parallel_size,
         attn_backend,
         rotary_type="default",
+        layer_type=TransformerBlockHFLlama,
     ):
         self.rotary_type = rotary_type
+        self.layer_type = layer_type
         super().__init__(
             params, cache, pipeline_parallel_size, model_parallel_size, attn_backend
         )
@@ -253,7 +266,7 @@ class TransformerHFLlama(Transformer):
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.n_layers):
             self.layers.append(
-                TransformerBlockHFLlama(
+                self.layer_type(
                     layer_id,
                     self.params,
                     cache,

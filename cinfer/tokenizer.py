@@ -44,13 +44,19 @@ class Tokenizer:
 
     pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"  # noqa: E501
 
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, force_full_seq_decode: bool = False):
         """
         Initializes the Tokenizer with a Tiktoken model.
 
         Args:
             model_path (str): The path to the Tiktoken model file.
+            force_full_seq_decode (bool): If true, every time a new token is generated,
+                the output string will be re-decoded from all the generated tokens. If
+                there are `n` tokens, it will take `O(n^2)` time to decode them all. This
+                is requried by some models.
         """
+        self.force_full_seq_decode = force_full_seq_decode
+
         assert os.path.isfile(model_path), model_path
 
         mergeable_ranks = load_tiktoken_bpe(model_path)
@@ -231,7 +237,13 @@ class ChatFormat:
 
 
 class TokenizerHF:
-    def __init__(self, path: str, trust_remote_code: bool = False):
+    def __init__(
+        self,
+        path: str,
+        trust_remote_code: bool = False,
+        force_full_seq_decode: bool = False,
+    ):
+        self.force_full_seq_decode = force_full_seq_decode
         self.tokens_cache = []
         self.model = AutoTokenizer.from_pretrained(
             path, trust_remote_code=trust_remote_code

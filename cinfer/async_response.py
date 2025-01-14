@@ -22,6 +22,7 @@ class AsyncDataStream:
         self.tokenizer = Backend.tokenizer
         self.seqs: List[str] = []
         self.tokens_len: int = 0
+        self.chars_len: int = 0
         self.cache_tokens: List[int] = []
         self.stop_signal = False
         self.lock = threading.Lock()
@@ -31,12 +32,16 @@ class AsyncDataStream:
         with self.lock:
             self.tokens_len += 1
             self.cache_tokens.append(value)
-            c = self.tokenizer.decode(self.cache_tokens)
-            if "\uFFFD" in c:
+            s = self.tokenizer.decode(self.cache_tokens)
+            if "\uFFFD" in s:
                 return
-            else:
+            if not self.tokenizer.force_full_seq_decode:
                 self.cache_tokens.clear()
-            self.seqs.append(c)
+                self.seqs.append(s)
+                self.chars_len += len(s)
+            else:
+                self.seqs.append(s[self.chars_len :])
+                self.chars_len = len(s)
         self.data_event.set()
 
     def send_stop_signal(self):
