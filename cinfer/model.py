@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 
 import torch.distributed
 from .global_vars import set_global_variables, get_timers
-from .utils import load_pipe, VarLens
+from .utils import load_pipe, VarLens, compute_layer_dist_in_pipe
 from .cache_manager import PagedKVCacheManager
 
 
@@ -238,7 +238,9 @@ class Transformer(nn.Module):
         self.n_layers = params.n_layers
 
         if self.pipeline_exec:
-            self.n_layers = self.n_layers // self.world_size
+            self.n_layers = compute_layer_dist_in_pipe(
+                self.n_layers, pipeline_parallel_size
+            )[self.rank]
 
         if not self.pipeline_exec or self.rank == 0:
             self._init_pre_layers()

@@ -157,3 +157,15 @@ llama3_8b_nvidia:
         - env_build_nvidia
     script:
       - grun torchrun --nproc_per_node 1 --master_port=22519 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged models=llama3-8b infer.max_seq_len=2048
+
+
+mixtral_8x7b_nvidia:
+    stage: check
+    only:
+        - merge_requests
+    tags:
+        - dev
+    needs:
+        - env_build_nvidia
+    script:
+        - grun 5 torchrun --nproc_per_node 5 --master_port=22520 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.parallel_type=pipe models=mixtral-8x7b

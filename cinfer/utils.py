@@ -1,3 +1,4 @@
+import itertools
 import torch
 from logging import getLogger
 import numpy as np
@@ -6,36 +7,59 @@ import numpy as np
 logger = getLogger(__name__)
 
 
+def is_layer(layer_name, full_name):
+    return (
+        f".{layer_name}." in full_name
+        or full_name.startswith(layer_name + ".")
+        or full_name.endswith("." + layer_name)
+    )
+
+
 def load_tensor_parallel(checkpoint, model, num_layers, rank, world_size, type):
     keys = checkpoint.keys()
     if type == "llama":
         cpl_str = ["wq", "wk", "wv", "w1", "w3", "output", "embed"]
         rpl_str = ["wo", "w2"]
-    elif type == "hf-llama":
+    elif type == "hf-llama" or type == "hf-mixtral":
         cpl_str = [
             "qkv_proj",  # new after fusion
             "q_proj",  # unused after fusion, for compatibility
             "k_proj",  # unused after fusion, for compatibility
             "v_proj",  # unused after fusion, for compatibility
-            "gate_proj",
-            "up_proj",
+            "gate_up_proj",  # new after fusion
+            "gate_proj",  # unused after fusion, for compatibility
+            "up_proj",  # unused after fusion, for compatibility
             "lm_head",
-            "embed",
+            "embed_tokens",
         ]
         rpl_str = ["down_proj", "o_proj"]
+        if type == "hf-mixtral":
+            rpl_str.append("gate")  # MoE gate
     else:
         assert False, f"Unknown model type {type}"
     partial_checkpoint = {}
     for name, param in checkpoint.items():
-        if any(s in name for s in cpl_str):
+        if any(is_layer(s, name) for s in cpl_str):
             chunks = torch.chunk(param, world_size, dim=0)
             partial_checkpoint[name] = chunks[rank]
-        elif any(s in name for s in rpl_str):
+        elif any(is_layer(s, name) for s in rpl_str):
             chunks = torch.chunk(param, world_size, dim=1)
             partial_checkpoint[name] = chunks[rank]
         else:
             partial_checkpoint[name] = param
     model.load_state_dict(partial_checkpoint)
+
+
+def compute_layer_dist_in_pipe(num_layers, world_size):
+    num_layers_of_each_rank = [
+        num_layers // world_size + (1 if i < num_layers % world_size else 0)
+        for i in range(world_size)
+    ]
+    # If non-divisible, make the fisrst and the last rank to have fewer layers, because they have pre-layers and post-layers
+    if world_size > 2 and num_layers_of_each_rank[0] > num_layers_of_each_rank[-2]:
+        num_layers_of_each_rank[0] -= 1
+        num_layers_of_each_rank[-2] += 1
+    return num_layers_of_each_rank
 
 
 def load_pipe(checkpoint, model, num_layers, rank, world_size, type):
@@ -47,21 +71,29 @@ def load_pipe(checkpoint, model, num_layers, rank, world_size, type):
             partial_checkpoint["tok_embeddings.weight"] = checkpoint[
                 "tok_embeddings.weight"
             ]
-        elif type == "hf-llama":
+        elif type == "hf-llama" or type == "hf-mixtral":
             partial_checkpoint["embed_tokens.weight"] = checkpoint[
                 "embed_tokens.weight"
             ]
-    base = num_layers // world_size * rank
-    for i in range(base, num_layers // world_size * (rank + 1)):
+
+    num_layers_of_each_rank = compute_layer_dist_in_pipe(num_layers, world_size)
+    first_layer_id_of_each_rank = list(
+        itertools.accumulate([0] + num_layers_of_each_rank)
+    )
+
+    for i in range(
+        first_layer_id_of_each_rank[rank], first_layer_id_of_each_rank[rank + 1]
+    ):
         for key in keys:
             if f"layers.{i}." in key:
-                partial_checkpoint[key.replace(str(i), str(i - base), 1)] = checkpoint[
-                    key
-                ]
+                local_i = i - first_layer_id_of_each_rank[rank]
+                partial_checkpoint[
+                    key.replace(f"layers.{i}.", f"layers.{local_i}.", 1)
+                ] = checkpoint[key]
     if rank == world_size - 1:
         if type == "llama":
             partial_checkpoint["output.weight"] = checkpoint["output.weight"]
-        elif type == "hf-llama":
+        elif type == "hf-llama" or type == "hf-mixtral":
             partial_checkpoint["lm_head.weight"] = checkpoint["lm_head.weight"]
         partial_checkpoint["norm.weight"] = checkpoint["norm.weight"]
     model.load_state_dict(partial_checkpoint)

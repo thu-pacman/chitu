@@ -19,7 +19,9 @@ from .cache_manager import (
 from .attn_backend import FlashAttnBackend, RefAttnBackend
 from .model_llama import TransformerLlama
 from .model_hf_llama import TransformerHFLlama
+from .model_hf_mixtral import TransformerHFMixtral
 from .utils import (
+    compute_layer_dist_in_pipe,
     load_pipe,
     load_tensor_parallel,
     merge_column_parallel_weights,
@@ -56,6 +58,8 @@ class Backend:
             if args.name.startswith("glm4"):
                 extra_kwargs["rotary_type"] = "glm4"
             return TransformerHFLlama(args, cache, *extra_args, **extra_kwargs)
+        elif args.type == "hf-mixtral":
+            return TransformerHFMixtral(args, cache, *extra_args, **extra_kwargs)
         elif args.type == "llama":
             return TransformerLlama(args, cache, *extra_args, **extra_kwargs)
         else:
@@ -90,12 +94,22 @@ class Backend:
             trust_remote_code = True  # Blame the glm4 folks for this
 
         # Init tokenizer
-        if args.models.type == "hf-llama":
+        force_full_seq_decode = (
+            args.models.tokenizer_force_full_seq_decode
+            if hasattr(args.models, "tokenizer_force_full_seq_decode")
+            else False
+        )
+        if args.models.type == "hf-llama" or args.models.type == "hf-mixtral":
             tokenizer = TokenizerHF(
-                path=args.models.tokenizer_path, trust_remote_code=trust_remote_code
+                path=args.models.tokenizer_path,
+                trust_remote_code=trust_remote_code,
+                force_full_seq_decode=force_full_seq_decode,
             )
         else:
-            tokenizer = Tokenizer(model_path=args.models.tokenizer_path)
+            tokenizer = Tokenizer(
+                model_path=args.models.tokenizer_path,
+                force_full_seq_decode=force_full_seq_decode,
+            )
             assert (
                 args.models.vocab_size == tokenizer.n_words
             ), f"{args.models.vocab_size} vs. {tokenizer.n_words}"
@@ -108,16 +122,19 @@ class Backend:
             device=local_rank,
         )
         Backend.tokenizer = tokenizer
-        if args.models.type == "hf-llama":
+        if args.models.type == "hf-llama" or args.models.type == "hf-mixtral":
             Backend.formatter = ChatFormatHF(tokenizer)
         else:
             Backend.formatter = ChatFormat(tokenizer)
 
         # Init cache
-        local_n_layers = args.models.n_layers // pipeline_parallel_size
-        assert (
-            args.models.n_layers % pipeline_parallel_size == 0
-        ), f"n_layers {args.models.n_layers} not divisible by pipeline_parallel_size {pipeline_parallel_size}"
+        local_n_layers = (
+            compute_layer_dist_in_pipe(args.models.n_layers, pipeline_parallel_size)[
+                local_rank
+            ]
+            if args.infer.parallel_type == "pipe"
+            else args.models.n_layers
+        )
         model_parallel_size = fs_init.get_model_parallel_world_size()
         n_kv_heads = args.models.n_kv_heads
         n_local_kv_heads = n_kv_heads // model_parallel_size
@@ -209,7 +226,7 @@ class Backend:
                 ckpt_path = checkpoints[0]
                 # logger.warning(f"Loading checkpoint from {ckpt_path}")
                 checkpoint = torch.load(ckpt_path, map_location="cpu")
-            elif args.models.type == "hf-llama":
+            elif args.models.type == "hf-llama" or args.models.type == "hf-mixtral":
                 if args.quant == "awq":
                     params = torch.load(args.quant_ckpt_dir, map_location="cpu")
                     replace_list = [
@@ -291,6 +308,17 @@ class Backend:
 
                     del checkpoint["transformer.rotary_pos_emb.inv_freq"]
                     checkpoint = {map_glm4_key(k): v for k, v in checkpoint.items()}
+
+                if args.models.name.startswith("mixtral"):
+
+                    def map_mixtral_key(k):
+                        k = k.replace(".block_sparse_moe.", ".mlp.")
+                        k = k.replace(".w1.", ".gate_proj.")
+                        k = k.replace(".w3.", ".up_proj.")
+                        k = k.replace(".w2.", ".down_proj.")
+                        return k
+
+                    checkpoint = {map_mixtral_key(k): v for k, v in checkpoint.items()}
 
                 # Fuse q_proj, k_proj, v_proj into qkv_proj
                 new_checkpoint = {}
