@@ -188,6 +188,7 @@ setup(
     ],
     extras_require={
         "quant": [
+            "optimum",
             "bitsandbytes",
             "EETQ @ file://localhost" + os.path.join(setup_dir, "third_party/EETQ"),
             "awq_inference_engine @ file://localhost"

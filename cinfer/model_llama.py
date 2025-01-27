@@ -59,11 +59,19 @@ class AttentionLlama(Attention):
 
 class TransformerLlama(Transformer):
     def __init__(
-        self, params, cache, pipeline_parallel_size, model_parallel_size, attn_backend
+        self,
+        params,
+        cache,
+        pipeline_parallel_size,
+        model_parallel_size,
+        attn_backend,
+        merge_qkv_gate_up=False,
     ):
         super().__init__(
             params, cache, pipeline_parallel_size, model_parallel_size, attn_backend
         )
+        if merge_qkv_gate_up:
+            raise NotImplementedError("merge_qkv_gate_up is not supported in llama")
 
     def _init_pre_layers(self):
         self.tok_embeddings = VocabParallelEmbedding(
