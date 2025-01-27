@@ -12,6 +12,7 @@ import hydra
 from omegaconf import DictConfig
 import torch
 import time
+import os
 
 from logging import getLogger
 import logging
@@ -131,6 +132,8 @@ def run_normal(args, timers):
         timers("overall").start()
         while len(TaskPool.pool) > 0:
             cinfer_run()
+
+        print("GPU memory used : ", torch.cuda.memory_allocated())
         timers("overall").stop()
         t_end = time.time()
         logger.warning(f"Time cost {t_end - t_start}")
@@ -142,12 +145,14 @@ def run_normal(args, timers):
 
 
 @hydra.main(
-    version_base=None, config_path="../example/configs", config_name="serve_config"
+    version_base=None,
+    config_path="../example/configs",
+    config_name=os.getenv("CONFIG_NAME", "serve_config"),
 )
 def main(args: DictConfig):
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.WARNING)
-
+    print(args)
     set_global_variables(args)
     timers = get_timers()
 

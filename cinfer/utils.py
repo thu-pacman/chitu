@@ -22,13 +22,13 @@ def load_tensor_parallel(checkpoint, model, num_layers, rank, world_size, type):
         rpl_str = ["wo", "w2"]
     elif type == "hf-llama" or type == "hf-mixtral":
         cpl_str = [
-            "qkv_proj",  # new after fusion
-            "q_proj",  # unused after fusion, for compatibility
-            "k_proj",  # unused after fusion, for compatibility
-            "v_proj",  # unused after fusion, for compatibility
-            "gate_up_proj",  # new after fusion
-            "gate_proj",  # unused after fusion, for compatibility
-            "up_proj",  # unused after fusion, for compatibility
+            "qkv_proj",  # new after merge_qkv
+            "q_proj",  # for compatibility if not using merge_qkv
+            "k_proj",  # for compatibility if not using merge_qkv
+            "v_proj",  # for compatibility if not using merge_qkv
+            "gate_up_proj",  # new after merge_gate_up
+            "gate_proj",  # for compatibility if not using merge_gate_up
+            "up_proj",  # for compatibility if not using merge_gate_up
             "lm_head",
             "embed_tokens",
         ]
@@ -142,7 +142,9 @@ class VarLens:
 
 def merge_column_parallel_weights(weights, model_parallel_size):
     """
-    For example, fuse WQ, WK, WV into one tensor.
+    For example, fuse weight_Q, weight_K, weight_V into one tensor.
+
+    This function can handle any (output_hidden, input_hidden) shaped tensor.
 
     - Column parallel means the fairsacale-style ColumnPararllelLinear layer. The merged
     dimension is actually the FIRST dimension instead of the last.
@@ -160,6 +162,11 @@ def merge_column_parallel_weights(weights, model_parallel_size):
 
 
 def merge_column_parallel_biases(biases, model_parallel_size):
+    """
+    For example, fuse bias_Q, bias_K, bias_V into one tensor.
+
+    This function can handle any (output_hidden,) shaped tensor.
+    """
     new_biases = []
     for bias in biases:
         assert bias.shape[0] % model_parallel_size == 0

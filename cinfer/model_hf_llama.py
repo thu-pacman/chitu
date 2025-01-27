@@ -18,9 +18,12 @@ logger = getLogger(__name__)
 
 
 class AttentionHFLlama(Attention):
-    def __init__(self, args, layer_id, cache, attn_backend, rotary_type="default"):
+    def __init__(
+        self, args, layer_id, cache, attn_backend, rotary_type="default", merge_qkv=True
+    ):
         super().__init__(layer_id, cache, attn_backend)
         self.rotary_type = rotary_type
+        self.merge_qkv = merge_qkv
 
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         model_parallel_size = fs_init.get_model_parallel_world_size()
@@ -38,13 +41,36 @@ class AttentionHFLlama(Attention):
         qkv_has_bias = args.qkv_has_bias if hasattr(args, "qkv_has_bias") else True
         o_has_bias = args.o_has_bias if hasattr(args, "o_has_bias") else False
 
-        self.qkv_proj = ColumnParallelLinear(
-            args.dim,
-            (args.n_heads + 2 * self.n_kv_heads) * self.head_dim,
-            bias=qkv_has_bias,
-            gather_output=False,
-            init_method=lambda x: x,
-        )
+        if merge_qkv:
+            self.qkv_proj = ColumnParallelLinear(
+                args.dim,
+                (args.n_heads + 2 * self.n_kv_heads) * self.head_dim,
+                bias=qkv_has_bias,
+                gather_output=False,
+                init_method=lambda x: x,
+            )
+        else:
+            self.q_proj = ColumnParallelLinear(
+                args.dim,
+                args.n_heads * self.head_dim,
+                bias=qkv_has_bias,
+                gather_output=False,
+                init_method=lambda x: x,
+            )
+            self.k_proj = ColumnParallelLinear(
+                args.dim,
+                self.n_kv_heads * self.head_dim,
+                bias=qkv_has_bias,
+                gather_output=False,
+                init_method=lambda x: x,
+            )
+            self.v_proj = ColumnParallelLinear(
+                args.dim,
+                self.n_kv_heads * self.head_dim,
+                bias=qkv_has_bias,
+                gather_output=False,
+                init_method=lambda x: x,
+            )
         self.o_proj = RowParallelLinear(
             args.n_heads * self.head_dim,
             args.dim,
@@ -59,15 +85,20 @@ class AttentionHFLlama(Attention):
         )
 
     def _run_linear(self, x):
-        qkv = self.qkv_proj(x)
-        q, k, v = qkv.split(
-            [
-                self.n_local_heads * self.head_dim,
-                self.n_local_kv_heads * self.head_dim,
-                self.n_local_kv_heads * self.head_dim,
-            ],
-            dim=-1,
-        )
+        if self.merge_qkv:
+            qkv = self.qkv_proj(x)
+            q, k, v = qkv.split(
+                [
+                    self.n_local_heads * self.head_dim,
+                    self.n_local_kv_heads * self.head_dim,
+                    self.n_local_kv_heads * self.head_dim,
+                ],
+                dim=-1,
+            )
+        else:
+            q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = self.v_proj(x)
         return q, k, v
 
     def _run_output_linear(self, x):
@@ -191,27 +222,48 @@ class AttentionHFLlama(Attention):
 
 
 class FeedForwardHFLlama(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int):
+    def __init__(self, dim: int, hidden_dim: int, merge_gate_up: bool = True):
         super().__init__()
+        self.merge_gate_up = merge_gate_up
 
         # Do a parallel + fused linear projection, while ensuring outputs from gate_proj and up_proj are contiguous in memory.
         # Therefore, the projected shape is [model_parallel_size, 2 * hidden_dim]
 
-        self.gate_up_proj = ColumnParallelLinear(
-            dim,
-            hidden_dim * 2,
-            bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
-        )
+        if merge_gate_up:
+            self.gate_up_proj = ColumnParallelLinear(
+                dim,
+                hidden_dim * 2,
+                bias=False,
+                gather_output=False,
+                init_method=lambda x: x,
+            )
+        else:
+            self.gate_proj = ColumnParallelLinear(
+                dim,
+                hidden_dim,
+                bias=False,
+                gather_output=False,
+                init_method=lambda x: x,
+            )
+            self.up_proj = ColumnParallelLinear(
+                dim,
+                hidden_dim,
+                bias=False,
+                gather_output=False,
+                init_method=lambda x: x,
+            )
         self.down_proj = RowParallelLinear(
             hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
         )
 
     def forward(self, x):
-        gate_up_out = self.gate_up_proj(x)
-        gate_out = gate_up_out[..., : gate_up_out.shape[-1] // 2]
-        up_out = gate_up_out[..., gate_up_out.shape[-1] // 2 :]
+        if self.merge_gate_up:
+            gate_up_out = self.gate_up_proj(x)
+            gate_out = gate_up_out[..., : gate_up_out.shape[-1] // 2]
+            up_out = gate_up_out[..., gate_up_out.shape[-1] // 2 :]
+        else:
+            gate_out = self.gate_proj(x)
+            up_out = self.up_proj(x)
         return self.down_proj(F.silu(gate_out) * up_out)
 
 
@@ -224,12 +276,22 @@ class TransformerBlockHFLlama(TransformerBlock):
         attn_backend,
         rotary_type="default",
         mlp_type=FeedForwardHFLlama,
+        merge_qkv_gate_up=True,
     ):
         super().__init__(layer_id, args, cache, attn_backend)
         self.self_attn = AttentionHFLlama(
-            args, layer_id, cache, attn_backend, rotary_type=rotary_type
+            args,
+            layer_id,
+            cache,
+            attn_backend,
+            rotary_type=rotary_type,
+            merge_qkv=merge_qkv_gate_up,
         )
-        self.mlp = mlp_type(dim=args.dim, hidden_dim=args.intermediate_dim)
+        self.mlp = mlp_type(
+            dim=args.dim,
+            hidden_dim=args.intermediate_dim,
+            merge_gate_up=merge_qkv_gate_up,
+        )
         self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
         self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
 
@@ -250,9 +312,11 @@ class TransformerHFLlama(Transformer):
         attn_backend,
         rotary_type="default",
         layer_type=TransformerBlockHFLlama,
+        merge_qkv_gate_up=True,
     ):
         self.rotary_type = rotary_type
         self.layer_type = layer_type
+        self.merge_qkv_gate_up = merge_qkv_gate_up
         super().__init__(
             params, cache, pipeline_parallel_size, model_parallel_size, attn_backend
         )
@@ -272,6 +336,7 @@ class TransformerHFLlama(Transformer):
                     cache,
                     attn_backend,
                     rotary_type=self.rotary_type,
+                    merge_qkv_gate_up=self.merge_qkv_gate_up,
                 )
             )
 

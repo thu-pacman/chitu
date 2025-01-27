@@ -76,7 +76,7 @@ def replace_with_gptq(model, current_key_name=None):
             ):
                 from auto_gptq.nn_modules.qlinear.qlinear_tritonv2 import QuantLinear
 
-                qptq_linear = QuantLinear(
+                gptq_linear = QuantLinear(
                     8,
                     128,
                     module.in_features,
@@ -85,8 +85,8 @@ def replace_with_gptq(model, current_key_name=None):
                     trainable=False,
                     weight_dtype=module.weight.dtype,
                 )
-                qptq_linear.requires_grad_(False)
-                setattr(model, name, qptq_linear)
+                gptq_linear.requires_grad_(False)
+                setattr(model, name, gptq_linear)
                 has_been_replaced = True
             if len(list(module.children())) > 0:
                 _, _has_been_replaced = replace_with_gptq(module, current_key_name)

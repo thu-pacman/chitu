@@ -181,12 +181,21 @@ class Backend:
             assert False, f"Unknown attn type {args.infer.attn_type}"
 
         # Init model
+        merge_qkv_gate_up = True
+        if args.models.type == "llama":
+            merge_qkv_gate_up = False  # Not yet supported
+        if args.quant != "None":
+            # Merge weights for quantized models is non-trivial, because we can
+            # only merge weights but NOT the scales on input dimensions, and this
+            # will break the assumption of the fused quantized kernels.
+            merge_qkv_gate_up = False
         model = Backend.build_model(
             args.models,
             Backend.cache_manager,
             pipeline_parallel_size,
             model_parallel_size,
             attn_backend,
+            merge_qkv_gate_up=merge_qkv_gate_up,
         )
         if args.quant == "None":
             if args.dtype == "float16":
@@ -320,157 +329,162 @@ class Backend:
 
                     checkpoint = {map_mixtral_key(k): v for k, v in checkpoint.items()}
 
-                # Fuse q_proj, k_proj, v_proj into qkv_proj
-                new_checkpoint = {}
-                for k in checkpoint.keys():
-                    if k.endswith(".qkv_proj.weight"):
-                        # Already fused, but need to transpose for model parallel
-                        qkv_weight = checkpoint[k]
-                        if model_parallel_size > 1:
-                            n_heads = args.models.n_heads
-                            n_kv_heads = (
-                                args.models.n_heads
-                                if args.models.n_kv_heads is None
-                                else args.models.n_kv_heads
+                if merge_qkv_gate_up:
+                    # Fuse q_proj, k_proj, v_proj into qkv_proj
+                    new_checkpoint = {}
+                    for k in checkpoint.keys():
+                        if k.endswith(".qkv_proj.weight"):
+                            # Already fused, but need to transpose for model parallel
+                            qkv_weight = checkpoint[k]
+                            if model_parallel_size > 1:
+                                n_heads = args.models.n_heads
+                                n_kv_heads = (
+                                    args.models.n_heads
+                                    if args.models.n_kv_heads is None
+                                    else args.models.n_kv_heads
+                                )
+                                head_dim = args.models.dim // n_heads
+                                q_weight, k_weight, v_weight = qkv_weight.split(
+                                    [
+                                        n_heads * head_dim,
+                                        n_kv_heads * head_dim,
+                                        n_kv_heads * head_dim,
+                                    ],
+                                    dim=0,
+                                )
+                                qkv_weight = merge_column_parallel_weights(
+                                    [q_weight, k_weight, v_weight], model_parallel_size
+                                )
+                            new_checkpoint[k] = qkv_weight
+                        elif k.endswith(".q_proj.weight"):
+                            prefix = k[: -len("q_proj.weight")]
+                            assert prefix + "k_proj.weight" in checkpoint
+                            assert prefix + "v_proj.weight" in checkpoint
+                            assert prefix + "qkv_proj.weight" not in checkpoint
+                            q_weight = checkpoint[prefix + "q_proj.weight"]
+                            k_weight = checkpoint[prefix + "k_proj.weight"]
+                            v_weight = checkpoint[prefix + "v_proj.weight"]
+                            new_checkpoint[prefix + "qkv_proj.weight"] = (
+                                merge_column_parallel_weights(
+                                    [q_weight, k_weight, v_weight], model_parallel_size
+                                )
                             )
-                            head_dim = args.models.dim // n_heads
-                            q_weight, k_weight, v_weight = qkv_weight.split(
-                                [
-                                    n_heads * head_dim,
-                                    n_kv_heads * head_dim,
-                                    n_kv_heads * head_dim,
-                                ],
-                                dim=0,
+                        elif k.endswith(".k_proj.weight") or k.endswith(
+                            ".v_proj.weight"
+                        ):
+                            continue
+                        elif k.endswith(".qkv_proj.bias"):
+                            # Already fused, but need to transpose for model parallel
+                            qkv_bias = checkpoint[k]
+                            if model_parallel_size > 1:
+                                n_heads = args.models.n_heads
+                                n_kv_heads = (
+                                    args.models.n_heads
+                                    if args.models.n_kv_heads is None
+                                    else args.models.n_kv_heads
+                                )
+                                head_dim = args.models.dim // n_heads
+                                q_bias, k_bias, v_bias = qkv_bias.split(
+                                    [
+                                        n_heads * head_dim,
+                                        n_kv_heads * head_dim,
+                                        n_kv_heads * head_dim,
+                                    ],
+                                    dim=0,
+                                )
+                                qkv_bias = merge_column_parallel_biases(
+                                    [q_bias, k_bias, v_bias], model_parallel_size
+                                )
+                            new_checkpoint[k] = qkv_bias
+                        elif k.endswith(".q_proj.bias"):
+                            prefix = k[: -len("q_proj.bias")]
+                            assert prefix + "k_proj.bias" in checkpoint
+                            assert prefix + "v_proj.bias" in checkpoint
+                            assert prefix + "qkv_proj.bias" not in checkpoint
+                            q_bias = checkpoint[prefix + "q_proj.bias"]
+                            k_bias = checkpoint[prefix + "k_proj.bias"]
+                            v_bias = checkpoint[prefix + "v_proj.bias"]
+                            new_checkpoint[prefix + "qkv_proj.bias"] = (
+                                merge_column_parallel_biases(
+                                    [q_bias, k_bias, v_bias], model_parallel_size
+                                )
                             )
-                            qkv_weight = merge_column_parallel_weights(
-                                [q_weight, k_weight, v_weight], model_parallel_size
-                            )
-                        new_checkpoint[k] = qkv_weight
-                    elif k.endswith(".q_proj.weight"):
-                        prefix = k[: -len("q_proj.weight")]
-                        assert prefix + "k_proj.weight" in checkpoint
-                        assert prefix + "v_proj.weight" in checkpoint
-                        assert prefix + "qkv_proj.weight" not in checkpoint
-                        q_weight = checkpoint[prefix + "q_proj.weight"]
-                        k_weight = checkpoint[prefix + "k_proj.weight"]
-                        v_weight = checkpoint[prefix + "v_proj.weight"]
-                        new_checkpoint[prefix + "qkv_proj.weight"] = (
-                            merge_column_parallel_weights(
-                                [q_weight, k_weight, v_weight], model_parallel_size
-                            )
-                        )
-                    elif k.endswith(".k_proj.weight") or k.endswith(".v_proj.weight"):
-                        continue
-                    elif k.endswith(".qkv_proj.bias"):
-                        # Already fused, but need to transpose for model parallel
-                        qkv_bias = checkpoint[k]
-                        if model_parallel_size > 1:
-                            n_heads = args.models.n_heads
-                            n_kv_heads = (
-                                args.models.n_heads
-                                if args.models.n_kv_heads is None
-                                else args.models.n_kv_heads
-                            )
-                            head_dim = args.models.dim // n_heads
-                            q_bias, k_bias, v_bias = qkv_bias.split(
-                                [
-                                    n_heads * head_dim,
-                                    n_kv_heads * head_dim,
-                                    n_kv_heads * head_dim,
-                                ],
-                                dim=0,
-                            )
-                            qkv_bias = merge_column_parallel_biases(
-                                [q_bias, k_bias, v_bias], model_parallel_size
-                            )
-                        new_checkpoint[k] = qkv_bias
-                    elif k.endswith(".q_proj.bias"):
-                        prefix = k[: -len("q_proj.bias")]
-                        assert prefix + "k_proj.bias" in checkpoint
-                        assert prefix + "v_proj.bias" in checkpoint
-                        assert prefix + "qkv_proj.bias" not in checkpoint
-                        q_bias = checkpoint[prefix + "q_proj.bias"]
-                        k_bias = checkpoint[prefix + "k_proj.bias"]
-                        v_bias = checkpoint[prefix + "v_proj.bias"]
-                        new_checkpoint[prefix + "qkv_proj.bias"] = (
-                            merge_column_parallel_biases(
-                                [q_bias, k_bias, v_bias], model_parallel_size
-                            )
-                        )
-                    elif k.endswith(".k_proj.bias") or k.endswith(".v_proj.bias"):
-                        continue
-                    else:
-                        new_checkpoint[k] = checkpoint[k]
-                checkpoint = new_checkpoint
+                        elif k.endswith(".k_proj.bias") or k.endswith(".v_proj.bias"):
+                            continue
+                        else:
+                            new_checkpoint[k] = checkpoint[k]
+                    checkpoint = new_checkpoint
 
-                # Fuse gate_proj and up_proj into gate_up_proj
-                new_checkpoint = {}
-                for k in checkpoint.keys():
-                    if k.endswith(".gate_up_proj.weight"):
-                        # Already fused, but need to transpose for model parallel
-                        gate_up_weight = checkpoint[k]
-                        if model_parallel_size > 1:
-                            gate_weight, up_weight = torch.chunk(
-                                gate_up_weight, 2, dim=0
-                            )
-                            gate_up_weight = merge_column_parallel_weights(
-                                [gate_weight, up_weight], model_parallel_size
-                            )
-                        new_checkpoint[k] = gate_up_weight
-                    elif k.endswith(".gate_proj.weight"):
-                        prefix = k[: -len("gate_proj.weight")]
-                        assert prefix + "up_proj.weight" in checkpoint
-                        assert prefix + "gate_up_proj.weight" not in checkpoint
-                        gate_weight = checkpoint[prefix + "gate_proj.weight"]
-                        up_weight = checkpoint[prefix + "up_proj.weight"]
+                    # Fuse gate_proj and up_proj into gate_up_proj
+                    new_checkpoint = {}
+                    for k in checkpoint.keys():
+                        if k.endswith(".gate_up_proj.weight"):
+                            # Already fused, but need to transpose for model parallel
+                            gate_up_weight = checkpoint[k]
+                            if model_parallel_size > 1:
+                                gate_weight, up_weight = torch.chunk(
+                                    gate_up_weight, 2, dim=0
+                                )
+                                gate_up_weight = merge_column_parallel_weights(
+                                    [gate_weight, up_weight], model_parallel_size
+                                )
+                            new_checkpoint[k] = gate_up_weight
+                        elif k.endswith(".gate_proj.weight"):
+                            prefix = k[: -len("gate_proj.weight")]
+                            assert prefix + "up_proj.weight" in checkpoint
+                            assert prefix + "gate_up_proj.weight" not in checkpoint
+                            gate_weight = checkpoint[prefix + "gate_proj.weight"]
+                            up_weight = checkpoint[prefix + "up_proj.weight"]
 
-                        # The fused projected shape should be concatenated after the model parallel dimension.
-                        # See model_hf_llama.py for details.
-                        assert gate_weight.shape[0] % model_parallel_size == 0
-                        assert up_weight.shape[0] % model_parallel_size == 0
-                        gate_weight = gate_weight.reshape(
-                            model_parallel_size, -1, gate_weight.shape[-1]
-                        )
-                        up_weight = up_weight.reshape(
-                            model_parallel_size, -1, up_weight.shape[-1]
-                        )
-                        gate_up_weight = torch.cat([gate_weight, up_weight], dim=1)
-                        gate_up_weight = gate_up_weight.reshape(
-                            -1, gate_up_weight.shape[-1]
-                        )
-                        new_checkpoint[prefix + "gate_up_proj.weight"] = gate_up_weight
-                    elif k.endswith(".up_proj.weight"):
-                        continue
-                    elif k.endswith(".gate_up_proj.bias"):
-                        # Already fused, but need to transpose for model parallel
-                        gate_up_bias = checkpoint[k]
-                        if model_parallel_size > 1:
-                            gate_bias, up_bias = torch.chunk(gate_up_bias, 2, dim=0)
-                            gate_up_bias = merge_column_parallel_biases(
-                                [gate_bias, up_bias], model_parallel_size
+                            # The fused projected shape should be concatenated after the model parallel dimension.
+                            # See model_hf_llama.py for details.
+                            assert gate_weight.shape[0] % model_parallel_size == 0
+                            assert up_weight.shape[0] % model_parallel_size == 0
+                            gate_weight = gate_weight.reshape(
+                                model_parallel_size, -1, gate_weight.shape[-1]
                             )
-                        new_checkpoint[k] = gate_up_bias
-                    elif k.endswith(".gate_proj.bias"):
-                        prefix = k[: -len("gate_proj.bias")]
-                        assert prefix + "up_proj.bias" in checkpoint
-                        assert prefix + "gate_up_proj.bias" not in checkpoint
-                        gate_bias = checkpoint[prefix + "gate_proj.bias"]
-                        up_bias = checkpoint[prefix + "up_proj.bias"]
+                            up_weight = up_weight.reshape(
+                                model_parallel_size, -1, up_weight.shape[-1]
+                            )
+                            gate_up_weight = torch.cat([gate_weight, up_weight], dim=1)
+                            gate_up_weight = gate_up_weight.reshape(
+                                -1, gate_up_weight.shape[-1]
+                            )
+                            new_checkpoint[prefix + "gate_up_proj.weight"] = (
+                                gate_up_weight
+                            )
+                        elif k.endswith(".up_proj.weight"):
+                            continue
+                        elif k.endswith(".gate_up_proj.bias"):
+                            # Already fused, but need to transpose for model parallel
+                            gate_up_bias = checkpoint[k]
+                            if model_parallel_size > 1:
+                                gate_bias, up_bias = torch.chunk(gate_up_bias, 2, dim=0)
+                                gate_up_bias = merge_column_parallel_biases(
+                                    [gate_bias, up_bias], model_parallel_size
+                                )
+                            new_checkpoint[k] = gate_up_bias
+                        elif k.endswith(".gate_proj.bias"):
+                            prefix = k[: -len("gate_proj.bias")]
+                            assert prefix + "up_proj.bias" in checkpoint
+                            assert prefix + "gate_up_proj.bias" not in checkpoint
+                            gate_bias = checkpoint[prefix + "gate_proj.bias"]
+                            up_bias = checkpoint[prefix + "up_proj.bias"]
 
-                        # The fused projected shape should be concatenated after the model parallel dimension.
-                        # See model_hf_llama.py for details.
-                        assert gate_bias.shape[0] % model_parallel_size == 0
-                        assert up_bias.shape[0] % model_parallel_size == 0
-                        gate_bias = gate_bias.reshape(model_parallel_size, -1)
-                        up_bias = up_bias.reshape(model_parallel_size, -1)
-                        gate_up_bias = torch.cat([gate_bias, up_bias], dim=1)
-                        gate_up_bias = gate_up_bias.reshape(-1)
-                        new_checkpoint[prefix + "gate_up_proj.bias"] = gate_up_bias
-                    elif k.endswith(".up_proj.bias"):
-                        continue
-                    else:
-                        new_checkpoint[k] = checkpoint[k]
-                checkpoint = new_checkpoint
+                            # The fused projected shape should be concatenated after the model parallel dimension.
+                            # See model_hf_llama.py for details.
+                            assert gate_bias.shape[0] % model_parallel_size == 0
+                            assert up_bias.shape[0] % model_parallel_size == 0
+                            gate_bias = gate_bias.reshape(model_parallel_size, -1)
+                            up_bias = up_bias.reshape(model_parallel_size, -1)
+                            gate_up_bias = torch.cat([gate_bias, up_bias], dim=1)
+                            gate_up_bias = gate_up_bias.reshape(-1)
+                            new_checkpoint[prefix + "gate_up_proj.bias"] = gate_up_bias
+                        elif k.endswith(".up_proj.bias"):
+                            continue
+                        else:
+                            new_checkpoint[k] = checkpoint[k]
+                    checkpoint = new_checkpoint
 
             # logger.warning(checkpoint.keys())
             if pipeline_parallel_size > 1:

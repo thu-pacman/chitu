@@ -10,9 +10,9 @@ infer:
   do_load: True # set it to False for debug purpose
   seed: 0
   stop_with_eos: True
-  max_seq_len: 4096 # length of prefill + decode
+  max_seq_len: 10240 # length of prefill + decode
   cache_type: paged
-  max_reqs: 64
+  max_reqs: 8
   attn_type: flash # flash or ref
 request:
   max_new_tokens: 128
@@ -22,7 +22,7 @@ scheduler:
     num_tasks: 16
     enable_hybrid: False
   prefill_first:
-    num_tasks: 64
+    num_tasks: 8
     enable_hybrid: False
   stride:
     num_tasks: 2
@@ -37,5 +37,5 @@ scheduler:
     num_tasks: 2
     enable_hybrid: False
 quant: gptq
-quant_ckpt_dir: /home/tanyijun/models/qwen/Qwen2-7B-Instruct-GPTQ-Int8
+quant_ckpt_dir: /home/share/models/Qwen2-7B-Instruct-GPTQ-Int8
 dtype: float16

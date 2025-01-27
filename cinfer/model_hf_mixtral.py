@@ -13,12 +13,19 @@ from .model_hf_llama import (
 
 
 class FeedForwardExpertHFMixtral(FeedForwardHFLlama):
-    def __init__(self, dim: int, hidden_dim: int):
-        super().__init__(dim, hidden_dim)
+    def __init__(self, dim: int, hidden_dim: int, merge_gate_up: bool = True):
+        super().__init__(dim, hidden_dim, merge_gate_up=merge_gate_up)
 
 
 class SparseMoeBlockHFMixtral(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, num_experts: int, top_k: int):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        num_experts: int,
+        top_k: int,
+        merge_gate_up: bool = True,
+    ):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
@@ -33,7 +40,10 @@ class SparseMoeBlockHFMixtral(nn.Module):
         )
 
         self.experts = nn.ModuleList(
-            [FeedForwardExpertHFMixtral(dim, hidden_dim) for _ in range(num_experts)]
+            [
+                FeedForwardExpertHFMixtral(dim, hidden_dim, merge_gate_up=merge_gate_up)
+                for _ in range(num_experts)
+            ]
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -93,6 +103,7 @@ class TransformerBlockHFMixtral(TransformerBlockHFLlama):
         attn_backend,
         rotary_type="default",
         mlp_type=SparseMoeBlockHFMixtral,
+        merge_qkv_gate_up=True,
     ):
         super().__init__(
             layer_id,
@@ -105,6 +116,7 @@ class TransformerBlockHFMixtral(TransformerBlockHFLlama):
                 num_experts=args.num_local_experts,
                 top_k=args.num_experts_per_tok,
             ),
+            merge_qkv_gate_up=merge_qkv_gate_up,
         )
 
 
@@ -118,6 +130,7 @@ class TransformerHFMixtral(TransformerHFLlama):
         attn_backend,
         rotary_type="default",
         layer_type=TransformerBlockHFMixtral,
+        merge_qkv_gate_up=True,
     ):
         super().__init__(
             params,
@@ -127,4 +140,5 @@ class TransformerHFMixtral(TransformerHFLlama):
             attn_backend,
             rotary_type=rotary_type,
             layer_type=layer_type,
+            merge_qkv_gate_up=merge_qkv_gate_up,
         )

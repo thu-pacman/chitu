@@ -81,7 +81,7 @@ paged_check_muxi:
       - export PATH=/opt/maca/mxgpu_llvm/bin:/opt/maca/bin:$PATH
       - export MACA_PATH=/opt/maca
       - export LD_LIBRARY_PATH=/opt/maca/lib:/opt/maca/mxgpu_llvm/lib:$LD_LIBRARY_PATH
-      - torchrun --nproc_per_node 1 --master_port=22514 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged
+      - grun torchrun --nproc_per_node 1 --master_port=22514 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged
 
 
 skew_check_nvidia:
@@ -108,7 +108,7 @@ skew_check_muxi:
       - export PATH=/opt/maca/mxgpu_llvm/bin:/opt/maca/bin:$PATH
       - export MACA_PATH=/opt/maca
       - export LD_LIBRARY_PATH=/opt/maca/lib:/opt/maca/mxgpu_llvm/lib:$LD_LIBRARY_PATH
-      - torchrun --nproc_per_node 1 --master_port=22515 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=skew
+      - grun torchrun --nproc_per_node 1 --master_port=22515 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=skew
 
 
 tp_paged_check_nvidia:
@@ -169,3 +169,15 @@ mixtral_8x7b_nvidia:
         - env_build_nvidia
     script:
         - grun 5 torchrun --nproc_per_node 5 --master_port=22520 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.parallel_type=pipe models=mixtral-8x7b
+
+
+gptq_nvidia:
+    stage: check
+    only:
+        - merge_requests
+    tags:
+        - dev
+    needs:
+        - env_build_nvidia
+    script:
+      - CONFIG_NAME=serve_config_gptq grun torchrun --nproc_per_node 1 --master_port=22521 test/single_req_test.py request.max_new_tokens=64
