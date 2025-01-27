@@ -13,6 +13,7 @@ from omegaconf import DictConfig
 import torch
 import time
 import os
+import random
 
 from logging import getLogger
 import logging
@@ -54,19 +55,21 @@ def gen_req_id(len=8):
     return hex_string
 
 
-def gen_reqs(num_reqs, prompt_len, max_new_tokens):
-    fake = Faker()
+def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens):
+    from cinfer.backend import Backend
+
+    def generate_prompt(token_length, tkn):
+        while True:
+            tokens = [random.randint(100, 1000) for _ in range(token_length)]
+            if len(tkn.encode(tkn.decode(tokens))) == token_length:
+                return tkn.decode(tokens)
+
     reqs = []
     for i in range(num_reqs):
-        msg = ""
-        for j in range(prompt_len):
-            msg += fake.word() + " "
+        msg = generate_prompt(prompt_len - 1, Backend.tokenizer)
         req = UserRequest(msg, f"{gen_req_id()}", max_new_tokens=max_new_tokens)
         reqs.append(req)
     return reqs
-
-
-import random
 
 
 def gen_reqs_real(num_reqs, max_new_tokens):
@@ -82,16 +85,21 @@ def gen_reqs_real(num_reqs, max_new_tokens):
     return reqs
 
 
+def gen_reqs(num_reqs, max_new_tokens):
+    global local_args
+    if local_args.request.prompt_tokens_len > 0:
+        return gen_reqs_fake(
+            num_reqs, local_args.request.prompt_tokens_len, max_new_tokens
+        )
+    else:
+        return gen_reqs_real(num_reqs, max_new_tokens)
+
+
 def run_pipe_or_tensor_parallelism(args, timers):
     rank = torch.distributed.get_rank()
     for i in range(2):
         if rank == 0:
-            # reqs = gen_reqs(
-            #     num_reqs=args.infer.max_reqs,
-            #     prompt_len=512,
-            #     max_new_tokens=args.request.max_new_tokens,
-            # )
-            reqs = gen_reqs_real(
+            reqs = gen_reqs(
                 num_reqs=args.infer.max_reqs, max_new_tokens=args.request.max_new_tokens
             )
             for req in reqs:
@@ -118,12 +126,7 @@ def run_pipe_or_tensor_parallelism(args, timers):
 def run_normal(args, timers):
     rank = torch.distributed.get_rank()
     for i in range(3):
-        # reqs = gen_reqs(
-        #     num_reqs=args.infer.max_reqs,
-        #     prompt_len=512,
-        #     max_new_tokens=args.request.max_new_tokens,
-        # )
-        reqs = gen_reqs_real(
+        reqs = gen_reqs(
             num_reqs=args.infer.max_reqs, max_new_tokens=args.request.max_new_tokens
         )
         for req in reqs:
@@ -150,6 +153,8 @@ def run_normal(args, timers):
     config_name=os.getenv("CONFIG_NAME", "serve_config"),
 )
 def main(args: DictConfig):
+    global local_args
+    local_args = args
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.WARNING)
     print(args)

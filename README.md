@@ -37,6 +37,9 @@ torchrun --nproc_per_node 2 test/single_req_test.py request.max_new_tokens=64 in
 
 ### NOTICE:
 # to avoid GPU conflict, add `grun` before command
+
+# Set prompt length and max new tokens for testing performance
+torchrun --nproc_per_node 1 test/single_req_test.py request.prompt_tokens_len=128 request.max_new_tokens=64 infer.stop_with_eos=False
 ```
 
 

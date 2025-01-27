@@ -15,6 +15,7 @@ infer:
   attn_type: flash # flash or ref
   max_reqs: 8
 request:
+  prompt_tokens_len: -1 # use for perf test in single_req_test.py, -1 means use real requests.
   max_new_tokens: 128
 scheduler:
   type: prefill_first
