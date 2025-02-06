@@ -19,10 +19,18 @@ logger = getLogger(__name__)
 
 class AttentionHFLlama(Attention):
     def __init__(
-        self, args, layer_id, cache, attn_backend, rotary_type="default", merge_qkv=True
+        self,
+        args,
+        layer_id,
+        cache,
+        attn_backend,
+        rotary_type="default",
+        op_impl: str = "torch",
+        merge_qkv: bool = True,
     ):
         super().__init__(layer_id, cache, attn_backend)
         self.rotary_type = rotary_type
+        self.op_impl = op_impl
         self.merge_qkv = merge_qkv
 
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
@@ -41,6 +49,7 @@ class AttentionHFLlama(Attention):
         qkv_has_bias = args.qkv_has_bias if hasattr(args, "qkv_has_bias") else True
         o_has_bias = args.o_has_bias if hasattr(args, "o_has_bias") else False
 
+        qkv_proj_linear = o_proj_linear = get_linear_layout_contig_x_contig_y(op_impl)
         if merge_qkv:
             self.qkv_proj = ColumnParallelLinear(
                 args.dim,
@@ -48,6 +57,7 @@ class AttentionHFLlama(Attention):
                 bias=qkv_has_bias,
                 gather_output=False,
                 init_method=lambda x: x,
+                linear_op=qkv_proj_linear,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -56,6 +66,7 @@ class AttentionHFLlama(Attention):
                 bias=qkv_has_bias,
                 gather_output=False,
                 init_method=lambda x: x,
+                linear_op=qkv_proj_linear,
             )
             self.k_proj = ColumnParallelLinear(
                 args.dim,
@@ -63,6 +74,7 @@ class AttentionHFLlama(Attention):
                 bias=qkv_has_bias,
                 gather_output=False,
                 init_method=lambda x: x,
+                linear_op=qkv_proj_linear,
             )
             self.v_proj = ColumnParallelLinear(
                 args.dim,
@@ -70,6 +82,7 @@ class AttentionHFLlama(Attention):
                 bias=qkv_has_bias,
                 gather_output=False,
                 init_method=lambda x: x,
+                linear_op=qkv_proj_linear,
             )
         self.o_proj = RowParallelLinear(
             args.n_heads * self.head_dim,
@@ -77,6 +90,7 @@ class AttentionHFLlama(Attention):
             bias=o_has_bias,
             input_is_parallel=True,
             init_method=lambda x: x,
+            linear_op=o_proj_linear,
         )
         self.rotary_emb = RotaryEmbeddingHFLlama(
             self.head_dim // 2 if rotary_type == "glm4" else self.head_dim,
@@ -85,8 +99,19 @@ class AttentionHFLlama(Attention):
         )
 
     def _run_linear(self, x):
+        if self.op_impl == "muxi_custom_kernel":
+            x_shape = x.shape
+            x = x.reshape(-1, x.shape[-1])
+            n = x.shape[0]
+            if n > 1:
+                x_paded = torch.zeros(((n + 15) & ~15, x.shape[1]), device=x.device)
+                x_paded[: x.shape[0], :] = x
+                x = x_paded
         if self.merge_qkv:
             qkv = self.qkv_proj(x)
+            if self.op_impl == "muxi_custom_kernel":
+                qkv = qkv[:n, :]
+                qkv = qkv.reshape(x_shape[:-1] + (qkv.shape[-1],))
             q, k, v = qkv.split(
                 [
                     self.n_local_heads * self.head_dim,
@@ -99,10 +124,29 @@ class AttentionHFLlama(Attention):
             q = self.q_proj(x)
             k = self.k_proj(x)
             v = self.v_proj(x)
+            if self.op_impl == "muxi_custom_kernel":
+                q = q[:n, :]
+                k = k[:n, :]
+                v = v[:n, :]
+                q = q.reshape(x_shape[:-1] + (q.shape[-1],))
+                k = k.reshape(x_shape[:-1] + (k.shape[-1],))
+                v = v.reshape(x_shape[:-1] + (v.shape[-1],))
         return q, k, v
 
     def _run_output_linear(self, x):
-        return self.o_proj(x)
+        if self.op_impl == "muxi_custom_kernel":
+            x_shape = x.shape
+            x = x.reshape(-1, x.shape[-1])
+            n = x.shape[0]
+            if n > 1:
+                x_paded = torch.zeros(((n + 15) & ~15, x.shape[1]), device=x.device)
+                x_paded[: x.shape[0], :] = x
+                x = x_paded
+        y = self.o_proj(x)
+        if self.op_impl == "muxi_custom_kernel":
+            y = y[:n, :]
+            y = y.reshape(x_shape[:-1] + (y.shape[-1],))
+        return y
 
     def prefill_forward(
         self,
@@ -222,13 +266,18 @@ class AttentionHFLlama(Attention):
 
 
 class FeedForwardHFLlama(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, merge_gate_up: bool = True):
+    def __init__(
+        self, dim: int, hidden_dim: int, op_impl: str, merge_gate_up: bool = True
+    ):
         super().__init__()
+        self.op_impl = op_impl
         self.merge_gate_up = merge_gate_up
 
         # Do a parallel + fused linear projection, while ensuring outputs from gate_proj and up_proj are contiguous in memory.
         # Therefore, the projected shape is [model_parallel_size, 2 * hidden_dim]
 
+        gate_up_proj_linear = get_linear_layout_contig_x_native_y(op_impl)
+        down_proj_linear = get_linear_layout_native_x_contig_y(op_impl)
         if merge_gate_up:
             self.gate_up_proj = ColumnParallelLinear(
                 dim,
@@ -236,6 +285,7 @@ class FeedForwardHFLlama(nn.Module):
                 bias=False,
                 gather_output=False,
                 init_method=lambda x: x,
+                linear_op=gate_up_proj_linear,
             )
         else:
             self.gate_proj = ColumnParallelLinear(
@@ -244,6 +294,7 @@ class FeedForwardHFLlama(nn.Module):
                 bias=False,
                 gather_output=False,
                 init_method=lambda x: x,
+                linear_op=gate_up_proj_linear,
             )
             self.up_proj = ColumnParallelLinear(
                 dim,
@@ -251,20 +302,42 @@ class FeedForwardHFLlama(nn.Module):
                 bias=False,
                 gather_output=False,
                 init_method=lambda x: x,
+                linear_op=gate_up_proj_linear,
             )
         self.down_proj = RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
+            hidden_dim,
+            dim,
+            bias=False,
+            input_is_parallel=True,
+            init_method=lambda x: x,
+            linear_op=down_proj_linear,
         )
 
     def forward(self, x):
+        if self.op_impl == "muxi_custom_kernel":
+            x_shape = x.shape
+            x = x.reshape(-1, x_shape[-1])
+            n = x.shape[0]
+            if n > 1:
+                x_paded = torch.zeros(((n + 15) & ~15, x.shape[1]), device=x.device)
+                x_paded[: x.shape[0], :] = x
+                x = x_paded
         if self.merge_gate_up:
             gate_up_out = self.gate_up_proj(x)
-            gate_out = gate_up_out[..., : gate_up_out.shape[-1] // 2]
-            up_out = gate_up_out[..., gate_up_out.shape[-1] // 2 :]
+            if self.op_impl == "muxi_custom_kernel":
+                gate_out = gate_up_out[: gate_up_out.shape[0] // 2]
+                up_out = gate_up_out[gate_up_out.shape[0] // 2 :]
+            else:
+                gate_out = gate_up_out[..., : gate_up_out.shape[-1] // 2]
+                up_out = gate_up_out[..., gate_up_out.shape[-1] // 2 :]
         else:
             gate_out = self.gate_proj(x)
             up_out = self.up_proj(x)
-        return self.down_proj(F.silu(gate_out) * up_out)
+        y = self.down_proj(F.silu(gate_out) * up_out)
+        if self.op_impl == "muxi_custom_kernel":
+            y = y[:n, :]
+            y = y.reshape(x_shape[:-1] + (y.shape[-1],))
+        return y
 
 
 class TransformerBlockHFLlama(TransformerBlock):
@@ -274,22 +347,25 @@ class TransformerBlockHFLlama(TransformerBlock):
         args,
         cache,
         attn_backend,
+        op_impl,
         rotary_type="default",
         mlp_type=FeedForwardHFLlama,
         merge_qkv_gate_up=True,
     ):
-        super().__init__(layer_id, args, cache, attn_backend)
+        super().__init__(layer_id, args, cache, attn_backend, op_impl)
         self.self_attn = AttentionHFLlama(
             args,
             layer_id,
             cache,
             attn_backend,
             rotary_type=rotary_type,
+            op_impl=op_impl,
             merge_qkv=merge_qkv_gate_up,
         )
         self.mlp = mlp_type(
             dim=args.dim,
             hidden_dim=args.intermediate_dim,
+            op_impl=op_impl,
             merge_gate_up=merge_qkv_gate_up,
         )
         self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -310,6 +386,7 @@ class TransformerHFLlama(Transformer):
         pipeline_parallel_size,
         model_parallel_size,
         attn_backend,
+        op_impl,
         rotary_type="default",
         layer_type=TransformerBlockHFLlama,
         merge_qkv_gate_up=True,
@@ -318,7 +395,12 @@ class TransformerHFLlama(Transformer):
         self.layer_type = layer_type
         self.merge_qkv_gate_up = merge_qkv_gate_up
         super().__init__(
-            params, cache, pipeline_parallel_size, model_parallel_size, attn_backend
+            params,
+            cache,
+            pipeline_parallel_size,
+            model_parallel_size,
+            attn_backend,
+            op_impl,
         )
 
     def _init_pre_layers(self):
@@ -326,7 +408,7 @@ class TransformerHFLlama(Transformer):
             self.params.vocab_size, self.params.dim, init_method=lambda x: x
         )
 
-    def _init_layers(self, cache, attn_backend):
+    def _init_layers(self, cache, attn_backend, op_impl):
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.n_layers):
             self.layers.append(
@@ -334,7 +416,8 @@ class TransformerHFLlama(Transformer):
                     layer_id,
                     self.params,
                     cache,
-                    attn_backend,
+                    attn_backend=attn_backend,
+                    op_impl=op_impl,
                     rotary_type=self.rotary_type,
                     merge_qkv_gate_up=self.merge_qkv_gate_up,
                 )
@@ -478,3 +561,108 @@ def apply_rotary_pos_emb(
             unsqueeze_dim=unsqueeze_dim,
             rotary_type=rotary_type,
         )
+
+
+def get_linear_layout_contig_x_native_y(op_impl: str):
+    if op_impl == "torch":
+        return torch.nn.functional.linear
+    elif op_impl == "muxi_custom_kernel":
+        import muxi_layout_kernels
+
+        def linear_layout_contig_x_native_y(x, w, b=None):
+            assert x.ndim == 2
+            x_is_vector = x.shape[0] == 1
+            if not x_is_vector:
+                x_transposed = muxi_layout_kernels.layoutB(x)
+            # w has already been transposed, but reshaped back for compatibility. We only need to "view" it again.
+            w_transposed = w.view(w.shape[0] // 16, w.shape[1] // 8, 16, 8)
+            if x_is_vector:
+                y = muxi_layout_kernels.gemv_layoutA(w_transposed, x)
+                # TODO: support bias
+                if b is not None:
+                    y += b
+                # View as 5D to be compatible with "native layout" but make n's tile to be 1.
+                y = y.view(y.shape[1] // 32, 1, 4, 1, 8)
+            elif x_transposed.shape[1] * 16 > 256:
+                y = muxi_layout_kernels.muxi_hgemm_layout(w_transposed, x_transposed)
+                # TODO: support bias
+                if b is not None:
+                    y += b
+                y = muxi_layout_kernels.layoutB(y)
+            else:
+                y = muxi_layout_kernels.gemm_layoutABC(
+                    w_transposed, x_transposed, bias=b
+                )
+            return y
+
+        return linear_layout_contig_x_native_y
+    else:
+        raise NotImplementedError()
+
+
+def get_linear_layout_native_x_contig_y(op_impl: str):
+    if op_impl == "torch":
+        return torch.nn.functional.linear
+    elif op_impl == "muxi_custom_kernel":
+        import muxi_layout_kernels
+
+        def linear_layout_native_x_contig_y(x_transposed, w, b=None):
+            assert x_transposed.ndim == 5
+            x_is_vector = x_transposed.shape[1] == 1 and x_transposed.shape[3] == 1
+            # w has already been transposed, but reshaped back for compatibility. We only need to "view" it again.
+            w_transposed = w.view(w.shape[0] // 16, w.shape[1] // 8, 16, 8)
+            if x_is_vector:
+                y = muxi_layout_kernels.gemv_layoutA(
+                    w_transposed, x_transposed.view(1, -1)
+                )
+                # TODO: support bias
+                if b is not None:
+                    y += b
+            elif x_transposed.shape[1] * 16 > 256:
+                y = muxi_layout_kernels.muxi_hgemm_layout(w_transposed, x_transposed)
+                # TODO: support bias
+                if b is not None:
+                    y += b
+            else:
+                y = muxi_layout_kernels.gemm_layoutAB_ContinuousC(
+                    w_transposed, x_transposed, bias=b
+                )
+            return y
+
+        return linear_layout_native_x_contig_y
+    else:
+        raise NotImplementedError()
+
+
+def get_linear_layout_contig_x_contig_y(op_impl: str):
+    if op_impl == "torch":
+        return torch.nn.functional.linear
+    elif op_impl == "muxi_custom_kernel":
+        import muxi_layout_kernels
+
+        def linear_layout_native_x_contig_y(x, w, b=None):
+            assert x.ndim == 2
+            x_is_vector = x.shape[0] == 1
+            if not x_is_vector:
+                x_transposed = muxi_layout_kernels.layoutB(x)
+            # w has already been transposed, but reshaped back for compatibility. We only need to "view" it again.
+            w_transposed = w.view(w.shape[0] // 16, w.shape[1] // 8, 16, 8)
+            if x_is_vector:
+                y = muxi_layout_kernels.gemv_layoutA(w_transposed, x)
+                # TODO: support bias
+                if b is not None:
+                    y += b
+            elif x_transposed.shape[1] * 16 > 256:
+                y = muxi_layout_kernels.muxi_hgemm_layout(w_transposed, x_transposed)
+                # TODO: support bias
+                if b is not None:
+                    y += b
+            else:
+                y = muxi_layout_kernels.gemm_layoutAB_ContinuousC(
+                    w_transposed, x_transposed, bias=b
+                )
+            return y
+
+        return linear_layout_native_x_contig_y
+    else:
+        raise NotImplementedError()

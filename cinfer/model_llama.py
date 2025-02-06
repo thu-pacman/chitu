@@ -65,11 +65,18 @@ class TransformerLlama(Transformer):
         pipeline_parallel_size,
         model_parallel_size,
         attn_backend,
+        op_impl,
         merge_qkv_gate_up=False,
     ):
         super().__init__(
-            params, cache, pipeline_parallel_size, model_parallel_size, attn_backend
+            params,
+            cache,
+            pipeline_parallel_size,
+            model_parallel_size,
+            attn_backend,
+            op_impl,
         )
+        self.op_impl = op_impl
         if merge_qkv_gate_up:
             raise NotImplementedError("merge_qkv_gate_up is not supported in llama")
 
@@ -78,11 +85,13 @@ class TransformerLlama(Transformer):
             self.params.vocab_size, self.params.dim, init_method=lambda x: x
         )
 
-    def _init_layers(self, cache, attn_backend):
+    def _init_layers(self, cache, attn_backend, op_impl):
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.n_layers):
             self.layers.append(
-                TransformerBlockLlama(layer_id, self.params, cache, attn_backend)
+                TransformerBlockLlama(
+                    layer_id, self.params, cache, attn_backend, self.op_impl
+                )
             )
 
     def _init_post_layers(self):
@@ -131,8 +140,8 @@ class FeedForwardLlama(nn.Module):
 
 
 class TransformerBlockLlama(TransformerBlock):
-    def __init__(self, layer_id: int, args, cache, attn_backend):
-        super().__init__(layer_id, args, cache, attn_backend)
+    def __init__(self, layer_id: int, args, cache, attn_backend, op_impl):
+        super().__init__(layer_id, args, cache, attn_backend, op_impl)
         self.attention = AttentionLlama(args, layer_id, cache, attn_backend)
         self.feed_forward = FeedForwardLlama(
             dim=args.dim,

@@ -194,7 +194,8 @@ class Backend:
             Backend.cache_manager,
             pipeline_parallel_size,
             model_parallel_size,
-            attn_backend,
+            attn_backend=attn_backend,
+            op_impl=args.infer.op_impl,
             merge_qkv_gate_up=merge_qkv_gate_up,
         )
         if args.quant == "None":
@@ -484,6 +485,65 @@ class Backend:
                             continue
                         else:
                             new_checkpoint[k] = checkpoint[k]
+                    checkpoint = new_checkpoint
+
+                if args.infer.op_impl == "muxi_custom_kernel":
+                    # Pre-transposition on weights
+                    new_checkpoint = {}
+                    for key in checkpoint.keys():
+                        if key.endswith(".o_proj.weight") or key.endswith(
+                            ".down_proj.weight"
+                        ):
+                            # Row parallel
+                            m, k = checkpoint[key].shape
+                            assert m % (model_parallel_size * 64) == 0
+                            assert k % 128 == 0
+                            new_checkpoint[key] = (
+                                checkpoint[key]
+                                .reshape(
+                                    model_parallel_size,
+                                    m // model_parallel_size // 16,
+                                    16,
+                                    k // 8,
+                                    8,
+                                )
+                                .permute(0, 1, 3, 2, 4)
+                                .contiguous()
+                                .reshape(m, k)  # Reshape back to for compatibility
+                            )
+                        elif (
+                            key.endswith(".qkv_proj.weight")
+                            or key.endswith(".q_proj.weight")
+                            or key.endswith(".k_proj.weight")
+                            or key.endswith(".v_proj.weight")
+                            or key.endswith(".gate_up_proj.weight")
+                            or key.endswith(".gate_proj.weight")
+                            or key.endswith(".up_proj.weight")
+                        ):
+                            # Column parallel
+                            m, k = checkpoint[key].shape
+                            assert m % 64 == 0
+                            assert k % (model_parallel_size * 128) == 0
+                            new_checkpoint[key] = (
+                                checkpoint[key]
+                                .reshape(
+                                    m // 16,
+                                    16,
+                                    model_parallel_size,
+                                    k // model_parallel_size // 8,
+                                    8,
+                                )
+                                .permute(2, 0, 3, 1, 4)
+                                .contiguous()
+                                .reshape(
+                                    model_parallel_size, m, k // model_parallel_size
+                                )
+                                .permute(1, 0, 2)
+                                .contiguous()
+                                .reshape(m, k)  # Reshape back to for compatibility
+                            )
+                        else:
+                            new_checkpoint[key] = checkpoint[key]
                     checkpoint = new_checkpoint
 
             # logger.warning(checkpoint.keys())

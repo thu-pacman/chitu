@@ -175,7 +175,8 @@ setup(
         # Don't put `torch` here because it requires downloading from a specific source
         "transformers",
         "flash-attn",
-        "fairscale",
+        "fairscale @ file://localhost"
+        + os.path.join(setup_dir, "third_party/fairscale"),
         "fire",
         "tiktoken>=0.7.0",  # Required by glm4
         "blobfile",
@@ -195,6 +196,10 @@ setup(
             + os.path.join(setup_dir, "third_party/llm-awq/awq/kernels"),
             "auto_gptq @ file://localhost"
             + os.path.join(setup_dir, "third_party/AutoGPTQ"),
+        ],
+        "muxi_layout_kernels": [
+            "muxi_layout_kernels @ file://localhost"
+            + os.path.join(setup_dir, "third_party/muxi_layout_kernels"),
         ],
     },
     packages=find_packages(),
