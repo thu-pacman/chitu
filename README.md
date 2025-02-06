@@ -1,6 +1,6 @@
 # CInfer
 
-## Setup
+## Setup for Development
 
 ```bash
 # Run on aliyun and A10*4
@@ -20,6 +20,20 @@ Note:
 - If you are encountering network issues, you may try appending `-i https://pypi.tuna.tsinghua.edu.cn/simple` to your `pip` commands.
 - `CINFER_SETUP_JOBS` is used to control number of jobs to compile this repo, while `MAX_JOBS` is used to control number of jobs to compile EETQ, which is a dependency of this repo.
 - You won't get the "editable" feature if you set both `-e` and `CINFER_WITH_CYTHON=1`. If you have accidentally done this and want to switch back, you will need to do `rm cinfer/*.so`.
+
+## Build for Distribution
+
+First follow "Setup for Development" to install to your local environment, including your optional choices of `[quant]`, etc. Then run the following to build wheel files:
+
+```bash
+./script/build_for_dist.sh
+```
+
+This will create a `dist/` directory containing the wheel files. Copy them to your desired location and install them with `pip install <wheel_file>`.
+
+Optionally, you can also copy `test/` and `example/` directories to your desired location to run them.
+
+DO NOT COPY SOURCE FILES OUT OF CONTROLLED DEVELOPMENT ENVIRONMENT WITHOUT PERMISSION FROM YOUR SUPERVISOR.
 
 ## Internal Test
 
