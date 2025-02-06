@@ -14,6 +14,10 @@ before_script:
       fi
     - source $VENV/bin/activate
 
+
+############################################################################################################
+# Format
+
 format_check:
     stage: format
     only:
@@ -23,6 +27,10 @@ format_check:
     script:
         - pip install black -i https://pypi.tuna.tsinghua.edu.cn/simple
         - black --exclude src/third_party/ --exclude third_party/ --check .
+
+
+############################################################################################################
+# Build
 
 env_build_nvidia:
     stage: env
@@ -60,6 +68,9 @@ env_build_muxi:
         - pip install -U -r requirements-build.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
         - CINFER_SETUP_JOBS=4 MAX_JOBS=4 CINFER_WITH_CYTHON=1 pip install -U --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple .[muxi_layout_kernels]
 
+
+############################################################################################################
+# KV cache
 
 paged_check_nvidia:
     stage: check
@@ -115,6 +126,9 @@ skew_check_muxi:
       - grun torchrun --nproc_per_node 1 --master_port=22515 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=skew
 
 
+############################################################################################################
+# Parallelism
+
 tp_paged_check_nvidia:
     stage: check
     only:
@@ -139,6 +153,21 @@ pp_paged_check_nvidia:
       - grun 2 torchrun --nproc_per_node 2 --master_port=22517 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.parallel_type=pipe
 
 
+############################################################################################################
+# Other models
+
+deepseek_r1_distill_qwen_14b_nvidia:
+    stage: check
+    only:
+        - merge_requests
+    tags:
+        - dev
+    needs:
+        - env_build_nvidia
+    script:
+      - grun 2 torchrun --nproc_per_node 2 --master_port=22518 test/single_req_test.py infer.cache_type=paged models=deepseek-r1-distill-qwen-14b infer.parallel_type=tensor infer.max_reqs=1 request.max_new_tokens=4096
+
+
 glm4_9b_nvidia:
     stage: check
     only:
@@ -148,7 +177,7 @@ glm4_9b_nvidia:
     needs:
         - env_build_nvidia
     script:
-      - grun torchrun --nproc_per_node 1 --master_port=22518 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged models=glm4-9b
+      - grun torchrun --nproc_per_node 1 --master_port=22519 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged models=glm4-9b
 
 
 llama3_8b_nvidia:
@@ -160,7 +189,7 @@ llama3_8b_nvidia:
     needs:
         - env_build_nvidia
     script:
-      - grun torchrun --nproc_per_node 1 --master_port=22519 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged models=llama3-8b infer.max_seq_len=2048
+      - grun torchrun --nproc_per_node 1 --master_port=22520 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged models=llama3-8b infer.max_seq_len=2048
 
 
 mixtral_8x7b_nvidia:
@@ -172,8 +201,11 @@ mixtral_8x7b_nvidia:
     needs:
         - env_build_nvidia
     script:
-        - grun 5 torchrun --nproc_per_node 5 --master_port=22520 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.parallel_type=pipe models=mixtral-8x7b
+        - grun 5 torchrun --nproc_per_node 5 --master_port=22521 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.parallel_type=pipe models=mixtral-8x7b
 
+
+############################################################################################################
+# Optimizations
 
 gptq_nvidia:
     stage: check
@@ -184,7 +216,7 @@ gptq_nvidia:
     needs:
         - env_build_nvidia
     script:
-      - CONFIG_NAME=serve_config_gptq grun torchrun --nproc_per_node 1 --master_port=22521 test/single_req_test.py request.max_new_tokens=64
+      - CONFIG_NAME=serve_config_gptq grun torchrun --nproc_per_node 1 --master_port=22522 test/single_req_test.py request.max_new_tokens=64
 
 
 native_layout_muxi:
