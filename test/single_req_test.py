@@ -61,7 +61,10 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens):
     def generate_prompt(token_length, tkn):
         while True:
             tokens = [random.randint(100, 1000) for _ in range(token_length)]
-            if len(tkn.encode(tkn.decode(tokens))) == token_length:
+            if (
+                len(tkn.encode(tkn.decode(tokens), bos=False, eos=False))
+                == token_length
+            ):
                 return tkn.decode(tokens)
 
     reqs = []

@@ -13,8 +13,10 @@ from .model_hf_llama import (
 
 
 class FeedForwardExpertHFMixtral(FeedForwardHFLlama):
-    def __init__(self, dim: int, hidden_dim: int, merge_gate_up: bool = True):
-        super().__init__(dim, hidden_dim, merge_gate_up=merge_gate_up)
+    def __init__(
+        self, dim: int, hidden_dim: int, op_impl: str, merge_gate_up: bool = True
+    ):
+        super().__init__(dim, hidden_dim, op_impl=op_impl, merge_gate_up=merge_gate_up)
 
 
 class SparseMoeBlockHFMixtral(nn.Module):
@@ -24,6 +26,7 @@ class SparseMoeBlockHFMixtral(nn.Module):
         hidden_dim: int,
         num_experts: int,
         top_k: int,
+        op_impl: str,
         merge_gate_up: bool = True,
     ):
         super().__init__()
@@ -41,7 +44,9 @@ class SparseMoeBlockHFMixtral(nn.Module):
 
         self.experts = nn.ModuleList(
             [
-                FeedForwardExpertHFMixtral(dim, hidden_dim, merge_gate_up=merge_gate_up)
+                FeedForwardExpertHFMixtral(
+                    dim, hidden_dim, op_impl=op_impl, merge_gate_up=merge_gate_up
+                )
                 for _ in range(num_experts)
             ]
         )
@@ -101,6 +106,7 @@ class TransformerBlockHFMixtral(TransformerBlockHFLlama):
         args,
         cache,
         attn_backend,
+        op_impl="torch",
         rotary_type="default",
         mlp_type=SparseMoeBlockHFMixtral,
         merge_qkv_gate_up=True,
@@ -109,7 +115,8 @@ class TransformerBlockHFMixtral(TransformerBlockHFLlama):
             layer_id,
             args,
             cache,
-            attn_backend,
+            attn_backend=attn_backend,
+            op_impl=op_impl,
             rotary_type=rotary_type,
             mlp_type=functools.partial(
                 mlp_type,
@@ -131,6 +138,7 @@ class TransformerHFMixtral(TransformerHFLlama):
         rotary_type="default",
         layer_type=TransformerBlockHFMixtral,
         merge_qkv_gate_up=True,
+        op_impl="torch",
     ):
         super().__init__(
             params,
@@ -141,4 +149,5 @@ class TransformerHFMixtral(TransformerHFLlama):
             rotary_type=rotary_type,
             layer_type=layer_type,
             merge_qkv_gate_up=merge_qkv_gate_up,
+            op_impl=op_impl,
         )

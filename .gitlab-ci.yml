@@ -36,8 +36,10 @@ env_build_nvidia:
         - export CUDA_HOME=/usr/local/cuda-12.4
         - export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
         - export PATH=$CUDA_HOME/bin:$PATH
-        - pip install -r requirements-build.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-        - TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 MAX_JOBS=4 CINFER_WITH_CYTHON=1 pip install --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple .[quant]
+        # Old pip won't reinstall local dependencies, so we need to upgrade it first.
+        - pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
+        - pip install -U -r requirements-build.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+        - TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 MAX_JOBS=4 CINFER_WITH_CYTHON=1 pip install -U --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple .[quant]
 
 
 env_build_muxi:
@@ -52,9 +54,11 @@ env_build_muxi:
         - export PATH=/opt/maca/mxgpu_llvm/bin:/opt/maca/bin:$PATH
         - export MACA_PATH=/opt/maca
         - export LD_LIBRARY_PATH=/opt/maca/lib:/opt/maca/mxgpu_llvm/lib:$LD_LIBRARY_PATH
+        # Old pip won't reinstall local dependencies, so we need to upgrade it first.
+        - pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
         - pip install -U /home/share/software/maca-pytorch2.1-py38-2.25.2.8-x86_64/2.25.2.8/wheel/*.whl -i https://pypi.tuna.tsinghua.edu.cn/simple
-        - pip install -r requirements-build.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-        - CINFER_SETUP_JOBS=4 MAX_JOBS=4 CINFER_WITH_CYTHON=1 pip install --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple .
+        - pip install -U -r requirements-build.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+        - CINFER_SETUP_JOBS=4 MAX_JOBS=4 CINFER_WITH_CYTHON=1 pip install -U --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple .[muxi_layout_kernels]
 
 
 paged_check_nvidia:
@@ -181,3 +185,18 @@ gptq_nvidia:
         - env_build_nvidia
     script:
       - CONFIG_NAME=serve_config_gptq grun torchrun --nproc_per_node 1 --master_port=22521 test/single_req_test.py request.max_new_tokens=64
+
+
+native_layout_muxi:
+    stage: check
+    only:
+        - merge_requests
+    tags:
+        - muxi
+    needs:
+        - env_build_muxi
+    script:
+      - export PATH=/opt/maca/mxgpu_llvm/bin:/opt/maca/bin:$PATH
+      - export MACA_PATH=/opt/maca
+      - export LD_LIBRARY_PATH=/opt/maca/lib:/opt/maca/mxgpu_llvm/lib:$LD_LIBRARY_PATH
+      - grun torchrun --nproc_per_node 1 --master_port=22516 test/single_req_test.py request.max_new_tokens=64 infer.op_impl=muxi_custom_kernel
