@@ -1,4 +1,3 @@
-import itertools
 import torch
 from logging import getLogger
 import numpy as np
@@ -15,41 +14,6 @@ def is_layer(layer_name, full_name):
     )
 
 
-def load_tensor_parallel(checkpoint, model, num_layers, rank, world_size, type):
-    keys = checkpoint.keys()
-    if type == "llama":
-        cpl_str = ["wq", "wk", "wv", "w1", "w3", "output", "embed"]
-        rpl_str = ["wo", "w2"]
-    elif type == "hf-llama" or type == "hf-mixtral":
-        cpl_str = [
-            "qkv_proj",  # new after merge_qkv
-            "q_proj",  # for compatibility if not using merge_qkv
-            "k_proj",  # for compatibility if not using merge_qkv
-            "v_proj",  # for compatibility if not using merge_qkv
-            "gate_up_proj",  # new after merge_gate_up
-            "gate_proj",  # for compatibility if not using merge_gate_up
-            "up_proj",  # for compatibility if not using merge_gate_up
-            "lm_head",
-            "embed_tokens",
-        ]
-        rpl_str = ["down_proj", "o_proj"]
-        if type == "hf-mixtral":
-            rpl_str.append("gate")  # MoE gate
-    else:
-        assert False, f"Unknown model type {type}"
-    partial_checkpoint = {}
-    for name, param in checkpoint.items():
-        if any(is_layer(s, name) for s in cpl_str):
-            chunks = torch.chunk(param, world_size, dim=0)
-            partial_checkpoint[name] = chunks[rank]
-        elif any(is_layer(s, name) for s in rpl_str):
-            chunks = torch.chunk(param, world_size, dim=1)
-            partial_checkpoint[name] = chunks[rank]
-        else:
-            partial_checkpoint[name] = param
-    model.load_state_dict(partial_checkpoint)
-
-
 def compute_layer_dist_in_pipe(num_layers, world_size):
     num_layers_of_each_rank = [
         num_layers // world_size + (1 if i < num_layers % world_size else 0)
@@ -60,43 +24,6 @@ def compute_layer_dist_in_pipe(num_layers, world_size):
         num_layers_of_each_rank[0] -= 1
         num_layers_of_each_rank[-2] += 1
     return num_layers_of_each_rank
-
-
-def load_pipe(checkpoint, model, num_layers, rank, world_size, type):
-    keys = checkpoint.keys()
-    # logger.warning(f"Loading checkpoint {keys}")
-    partial_checkpoint = {}
-    if rank == 0:
-        if type == "llama":
-            partial_checkpoint["tok_embeddings.weight"] = checkpoint[
-                "tok_embeddings.weight"
-            ]
-        elif type == "hf-llama" or type == "hf-mixtral":
-            partial_checkpoint["embed_tokens.weight"] = checkpoint[
-                "embed_tokens.weight"
-            ]
-
-    num_layers_of_each_rank = compute_layer_dist_in_pipe(num_layers, world_size)
-    first_layer_id_of_each_rank = list(
-        itertools.accumulate([0] + num_layers_of_each_rank)
-    )
-
-    for i in range(
-        first_layer_id_of_each_rank[rank], first_layer_id_of_each_rank[rank + 1]
-    ):
-        for key in keys:
-            if f"layers.{i}." in key:
-                local_i = i - first_layer_id_of_each_rank[rank]
-                partial_checkpoint[
-                    key.replace(f"layers.{i}.", f"layers.{local_i}.", 1)
-                ] = checkpoint[key]
-    if rank == world_size - 1:
-        if type == "llama":
-            partial_checkpoint["output.weight"] = checkpoint["output.weight"]
-        elif type == "hf-llama" or type == "hf-mixtral":
-            partial_checkpoint["lm_head.weight"] = checkpoint["lm_head.weight"]
-        partial_checkpoint["norm.weight"] = checkpoint["norm.weight"]
-    model.load_state_dict(partial_checkpoint)
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(
