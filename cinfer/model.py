@@ -1,10 +1,15 @@
 import math
+import itertools
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Mapping, List, Any
 
 import torch.distributed
 from .global_vars import set_global_variables, get_timers
-from .utils import load_pipe, VarLens, compute_layer_dist_in_pipe
+from .utils import (
+    VarLens,
+    compute_layer_dist_in_pipe,
+    is_layer,
+)
 from .cache_manager import PagedKVCacheManager
 
 
@@ -237,12 +242,15 @@ class Transformer(nn.Module):
         self.world_size = torch.distributed.get_world_size()
         self.device = torch.device(self.rank)
 
+        self.pipeline_parallel_size = pipeline_parallel_size
+        self.model_parallel_size = model_parallel_size
         self.pipeline_exec = pipeline_parallel_size > 1
         self.tensor_exec = model_parallel_size > 1
 
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
+        self.global_n_layers = params.n_layers
 
         if self.pipeline_exec:
             self.n_layers = compute_layer_dist_in_pipe(
@@ -260,6 +268,96 @@ class Transformer(nn.Module):
             params.max_seq_len * 2,
             params.rope_theta,
         ).cuda()
+
+    def _get_tensor_column_parallel_layer_names(self) -> List[str]:
+        raise NotImplementedError
+
+    def _get_tensor_row_parallel_layer_names(self) -> List[str]:
+        raise NotImplementedError
+
+    def _get_pre_layer_prefixes(self) -> List[str]:
+        raise NotImplementedError
+
+    def _get_post_layer_prefixes(self) -> List[str]:
+        raise NotImplementedError
+
+    def _get_layer_i_prefixes(self, i: int) -> List[str]:
+        raise NotImplementedError
+
+    def _chunk_checkpoint_for_pipeline_parallel(
+        self,
+        checkpoint,
+        num_layers: int,
+        rank: int,
+        world_size: int,
+    ):
+        keys = checkpoint.keys()
+        # logger.warning(f"Loading checkpoint {keys}")
+        partial_checkpoint = {}
+
+        num_layers_of_each_rank = compute_layer_dist_in_pipe(num_layers, world_size)
+        first_layer_id_of_each_rank = list(
+            itertools.accumulate([0] + num_layers_of_each_rank)
+        )
+
+        for i in range(
+            first_layer_id_of_each_rank[rank], first_layer_id_of_each_rank[rank + 1]
+        ):
+            for key in keys:
+                if i == 0:
+                    for prefix in self._get_pre_layer_prefixes():
+                        if key.startswith(prefix):
+                            partial_checkpoint[key] = checkpoint[key]
+                for prefix in self._get_layer_i_prefixes(i):
+                    if key.startswith(prefix):
+                        local_i = i - first_layer_id_of_each_rank[rank]
+                        partial_checkpoint[
+                            key.replace(f"layers.{i}.", f"layers.{local_i}.", 1)
+                        ] = checkpoint[key]
+                if i == num_layers - 1:
+                    for prefix in self._get_post_layer_prefixes():
+                        if key.startswith(prefix):
+                            partial_checkpoint[key] = checkpoint[key]
+        return partial_checkpoint
+
+    def _chunk_checkpoint_for_tensor_parallel(
+        self,
+        checkpoint,
+        rank: int,
+        world_size: int,
+    ):
+        keys = checkpoint.keys()
+        partial_checkpoint = {}
+
+        cpl_names = self._get_tensor_column_parallel_layer_names()
+        rpl_names = self._get_tensor_row_parallel_layer_names()
+
+        for name, param in checkpoint.items():
+            if any(is_layer(s, name) for s in cpl_names):
+                chunks = torch.chunk(param, world_size, dim=0)
+                partial_checkpoint[name] = chunks[rank]
+            elif any(is_layer(s, name) for s in rpl_names):
+                chunks = torch.chunk(param, world_size, dim=1)
+                partial_checkpoint[name] = chunks[rank]
+            else:
+                partial_checkpoint[name] = param
+        return partial_checkpoint
+
+    def load_state_dict(self, state_dict: Mapping[str, Any], *args, **kwargs):
+        if self.pipeline_exec and not self.tensor_exec:
+            state_dict = self._chunk_checkpoint_for_pipeline_parallel(
+                state_dict, self.global_n_layers, self.rank, self.world_size
+            )
+        elif self.tensor_exec and not self.pipeline_exec:
+            state_dict = self._chunk_checkpoint_for_tensor_parallel(
+                state_dict, self.rank, self.world_size
+            )
+        elif not self.pipeline_exec and not self.tensor_exec:
+            pass
+        else:
+            raise NotImplementedError  # TODO: Hybrid parallelism
+
+        super().load_state_dict(state_dict, *args, **kwargs)
 
     def _init_pre_layers(self):
         raise NotImplementedError

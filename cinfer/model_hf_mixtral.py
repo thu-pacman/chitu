@@ -1,4 +1,5 @@
 import functools
+from typing import List, Mapping, Any
 
 import torch
 from torch import nn
@@ -151,3 +152,19 @@ class TransformerHFMixtral(TransformerHFLlama):
             merge_qkv_gate_up=merge_qkv_gate_up,
             op_impl=op_impl,
         )
+
+    def _get_tensor_row_parallel_layer_names(self) -> List[str]:
+        return super()._get_tensor_row_parallel_layer_names() + [
+            "gate",  # MoE gate
+        ]
+
+    def load_state_dict(self, state_dict: Mapping[str, Any], *args, **kwargs):
+        def map_mixtral_key(k):
+            k = k.replace(".block_sparse_moe.", ".mlp.")
+            k = k.replace(".w1.", ".gate_proj.")
+            k = k.replace(".w3.", ".up_proj.")
+            k = k.replace(".w2.", ".down_proj.")
+            return k
+
+        state_dict = {map_mixtral_key(k): v for k, v in state_dict.items()}
+        super().load_state_dict(state_dict, *args, **kwargs)

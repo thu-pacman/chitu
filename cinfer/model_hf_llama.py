@@ -1,6 +1,6 @@
 from .model import Attention, Transformer, TransformerBlock, RMSNorm
 from torch import nn
-from typing import Optional
+from typing import Optional, List, Mapping, Any
 import torch
 import torch.nn.functional as F
 import fairscale.nn.model_parallel.initialize as fs_init
@@ -13,6 +13,16 @@ import flash_attn
 from logging import getLogger
 
 from .ops import apply_rotary_pos_emb_triton
+from .utils import (
+    merge_column_parallel_weights,
+    merge_column_parallel_biases,
+)
+from .muxi_utils import (
+    preprocess_weights_for_native_layout,
+    linear_layout_contig_x_native_y,
+    linear_layout_native_x_contig_y,
+    linear_layout_contig_x_contig_y,
+)
 
 logger = getLogger(__name__)
 
@@ -403,6 +413,221 @@ class TransformerHFLlama(Transformer):
             op_impl,
         )
 
+    def _get_tensor_column_parallel_layer_names(self) -> List[str]:
+        return [
+            "qkv_proj",  # new after merge_qkv
+            "q_proj",  # for compatibility if not using merge_qkv
+            "k_proj",  # for compatibility if not using merge_qkv
+            "v_proj",  # for compatibility if not using merge_qkv
+            "gate_up_proj",  # new after merge_gate_up
+            "gate_proj",  # for compatibility if not using merge_gate_up
+            "up_proj",  # for compatibility if not using merge_gate_up
+            "lm_head",
+            "embed_tokens",
+        ]
+
+    def _get_tensor_row_parallel_layer_names(self) -> List[str]:
+        return ["down_proj", "o_proj"]
+
+    def _get_pre_layer_prefixes(self) -> List[str]:
+        return ["embed_tokens."]
+
+    def _get_post_layer_prefixes(self) -> List[str]:
+        return ["lm_head.", "norm."]
+
+    def _get_layer_i_prefixes(self, i: int) -> List[str]:
+        return [f"layers.{i}."]
+
+    def _process_state_dict_for_merging_qkv(
+        self, checkpoint: Mapping[str, Any], model_parallel_size: int
+    ):
+        new_checkpoint = {}
+        for k in checkpoint.keys():
+            if k.endswith(".qkv_proj.weight"):
+                # Already fused, but need to transpose for model parallel
+                qkv_weight = checkpoint[k]
+                if model_parallel_size > 1:
+                    n_heads = self.params.n_heads
+                    n_kv_heads = (
+                        self.params.n_heads
+                        if self.params.n_kv_heads is None
+                        else self.params.n_kv_heads
+                    )
+                    head_dim = self.params.dim // n_heads
+                    q_weight, k_weight, v_weight = qkv_weight.split(
+                        [
+                            n_heads * head_dim,
+                            n_kv_heads * head_dim,
+                            n_kv_heads * head_dim,
+                        ],
+                        dim=0,
+                    )
+                    qkv_weight = merge_column_parallel_weights(
+                        [q_weight, k_weight, v_weight], model_parallel_size
+                    )
+                new_checkpoint[k] = qkv_weight
+            elif k.endswith(".q_proj.weight"):
+                prefix = k[: -len("q_proj.weight")]
+                assert prefix + "k_proj.weight" in checkpoint
+                assert prefix + "v_proj.weight" in checkpoint
+                assert prefix + "qkv_proj.weight" not in checkpoint
+                q_weight = checkpoint[prefix + "q_proj.weight"]
+                k_weight = checkpoint[prefix + "k_proj.weight"]
+                v_weight = checkpoint[prefix + "v_proj.weight"]
+                new_checkpoint[prefix + "qkv_proj.weight"] = (
+                    merge_column_parallel_weights(
+                        [q_weight, k_weight, v_weight], model_parallel_size
+                    )
+                )
+            elif k.endswith(".k_proj.weight") or k.endswith(".v_proj.weight"):
+                continue
+            elif k.endswith(".qkv_proj.bias"):
+                # Already fused, but need to transpose for model parallel
+                qkv_bias = checkpoint[k]
+                if model_parallel_size > 1:
+                    n_heads = self.params.n_heads
+                    n_kv_heads = (
+                        self.params.n_heads
+                        if self.params.n_kv_heads is None
+                        else self.params.n_kv_heads
+                    )
+                    head_dim = self.params.dim // n_heads
+                    q_bias, k_bias, v_bias = qkv_bias.split(
+                        [
+                            n_heads * head_dim,
+                            n_kv_heads * head_dim,
+                            n_kv_heads * head_dim,
+                        ],
+                        dim=0,
+                    )
+                    qkv_bias = merge_column_parallel_biases(
+                        [q_bias, k_bias, v_bias], model_parallel_size
+                    )
+                new_checkpoint[k] = qkv_bias
+            elif k.endswith(".q_proj.bias"):
+                prefix = k[: -len("q_proj.bias")]
+                assert prefix + "k_proj.bias" in checkpoint
+                assert prefix + "v_proj.bias" in checkpoint
+                assert prefix + "qkv_proj.bias" not in checkpoint
+                q_bias = checkpoint[prefix + "q_proj.bias"]
+                k_bias = checkpoint[prefix + "k_proj.bias"]
+                v_bias = checkpoint[prefix + "v_proj.bias"]
+                new_checkpoint[prefix + "qkv_proj.bias"] = merge_column_parallel_biases(
+                    [q_bias, k_bias, v_bias], model_parallel_size
+                )
+            elif k.endswith(".k_proj.bias") or k.endswith(".v_proj.bias"):
+                continue
+            else:
+                new_checkpoint[k] = checkpoint[k]
+        return new_checkpoint
+
+    def _process_state_dict_for_merging_gate_up(
+        self, checkpoint: Mapping[str, Any], model_parallel_size: int
+    ):
+        new_checkpoint = {}
+        for k in checkpoint.keys():
+            if k.endswith(".gate_up_proj.weight"):
+                # Already fused, but need to transpose for model parallel
+                gate_up_weight = checkpoint[k]
+                if model_parallel_size > 1:
+                    gate_weight, up_weight = torch.chunk(gate_up_weight, 2, dim=0)
+                    gate_up_weight = merge_column_parallel_weights(
+                        [gate_weight, up_weight], model_parallel_size
+                    )
+                new_checkpoint[k] = gate_up_weight
+            elif k.endswith(".gate_proj.weight"):
+                prefix = k[: -len("gate_proj.weight")]
+                assert prefix + "up_proj.weight" in checkpoint
+                assert prefix + "gate_up_proj.weight" not in checkpoint
+                gate_weight = checkpoint[prefix + "gate_proj.weight"]
+                up_weight = checkpoint[prefix + "up_proj.weight"]
+
+                # The fused projected shape should be concatenated after the model parallel dimension.
+                # See model_hf_llama.py for details.
+                assert gate_weight.shape[0] % model_parallel_size == 0
+                assert up_weight.shape[0] % model_parallel_size == 0
+                gate_weight = gate_weight.reshape(
+                    model_parallel_size, -1, gate_weight.shape[-1]
+                )
+                up_weight = up_weight.reshape(
+                    model_parallel_size, -1, up_weight.shape[-1]
+                )
+                gate_up_weight = torch.cat([gate_weight, up_weight], dim=1)
+                gate_up_weight = gate_up_weight.reshape(-1, gate_up_weight.shape[-1])
+                new_checkpoint[prefix + "gate_up_proj.weight"] = gate_up_weight
+            elif k.endswith(".up_proj.weight"):
+                continue
+            elif k.endswith(".gate_up_proj.bias"):
+                # Already fused, but need to transpose for model parallel
+                gate_up_bias = checkpoint[k]
+                if model_parallel_size > 1:
+                    gate_bias, up_bias = torch.chunk(gate_up_bias, 2, dim=0)
+                    gate_up_bias = merge_column_parallel_biases(
+                        [gate_bias, up_bias], model_parallel_size
+                    )
+                new_checkpoint[k] = gate_up_bias
+            elif k.endswith(".gate_proj.bias"):
+                prefix = k[: -len("gate_proj.bias")]
+                assert prefix + "up_proj.bias" in checkpoint
+                assert prefix + "gate_up_proj.bias" not in checkpoint
+                gate_bias = checkpoint[prefix + "gate_proj.bias"]
+                up_bias = checkpoint[prefix + "up_proj.bias"]
+
+                # The fused projected shape should be concatenated after the model parallel dimension.
+                # See model_hf_llama.py for details.
+                assert gate_bias.shape[0] % model_parallel_size == 0
+                assert up_bias.shape[0] % model_parallel_size == 0
+                gate_bias = gate_bias.reshape(model_parallel_size, -1)
+                up_bias = up_bias.reshape(model_parallel_size, -1)
+                gate_up_bias = torch.cat([gate_bias, up_bias], dim=1)
+                gate_up_bias = gate_up_bias.reshape(-1)
+                new_checkpoint[prefix + "gate_up_proj.bias"] = gate_up_bias
+            elif k.endswith(".up_proj.bias"):
+                continue
+            else:
+                new_checkpoint[k] = checkpoint[k]
+        return new_checkpoint
+
+    def load_state_dict(self, state_dict: Mapping[str, Any], *args, **kwargs):
+        if self.params.name.startswith("glm4"):
+            # glm4 has non-standard key names because they use "custom code" in model files instead of
+            # using code in transformers' repo.
+
+            def map_glm4_key(k):
+                k = k.replace("transformer.embedding.word_embeddings.", "embed_tokens.")
+                k = k.replace("transformer.encoder.layers.", "layers.")
+                k = k.replace(".self_attention.", ".self_attn.")
+                k = k.replace(".query_key_value.", ".qkv_proj.")
+                k = k.replace(".dense.", ".o_proj.")
+                k = k.replace(".dense_h_to_4h.", ".gate_up_proj.")
+                k = k.replace(".dense_4h_to_h.", ".down_proj.")
+                k = k.replace("transformer.encoder.final_layernorm.", "norm.")
+                k = k.replace("transformer.output_layer.", "lm_head.")
+                return k
+
+            del state_dict["transformer.rotary_pos_emb.inv_freq"]
+            state_dict = {map_glm4_key(k): v for k, v in state_dict.items()}
+
+        if self.merge_qkv_gate_up:
+            state_dict = self._process_state_dict_for_merging_qkv(
+                state_dict, self.model_parallel_size
+            )
+            state_dict = self._process_state_dict_for_merging_gate_up(
+                state_dict, self.model_parallel_size
+            )
+
+        if self.op_impl == "muxi_custom_kernel":
+            rpl_names = self._get_tensor_row_parallel_layer_names()
+            cpl_names = self._get_tensor_column_parallel_layer_names()
+            if "gate" in rpl_names:
+                # MoE gate from Mixtral. We have not implement muxi kernel for this yet.
+                rpl_names.remove("gate")
+            state_dict = preprocess_weights_for_native_layout(
+                state_dict, self.model_parallel_size, rpl_names, cpl_names
+            )
+
+        super().load_state_dict(state_dict, *args, **kwargs)
+
     def _init_pre_layers(self):
         self.embed_tokens = VocabParallelEmbedding(
             self.params.vocab_size, self.params.dim, init_method=lambda x: x
@@ -567,34 +792,6 @@ def get_linear_layout_contig_x_native_y(op_impl: str):
     if op_impl == "torch":
         return torch.nn.functional.linear
     elif op_impl == "muxi_custom_kernel":
-        import muxi_layout_kernels
-
-        def linear_layout_contig_x_native_y(x, w, b=None):
-            assert x.ndim == 2
-            x_is_vector = x.shape[0] == 1
-            if not x_is_vector:
-                x_transposed = muxi_layout_kernels.layoutB(x)
-            # w has already been transposed, but reshaped back for compatibility. We only need to "view" it again.
-            w_transposed = w.view(w.shape[0] // 16, w.shape[1] // 8, 16, 8)
-            if x_is_vector:
-                y = muxi_layout_kernels.gemv_layoutA(w_transposed, x)
-                # TODO: support bias
-                if b is not None:
-                    y += b
-                # View as 5D to be compatible with "native layout" but make n's tile to be 1.
-                y = y.view(y.shape[1] // 32, 1, 4, 1, 8)
-            elif x_transposed.shape[1] * 16 > 256:
-                y = muxi_layout_kernels.muxi_hgemm_layout(w_transposed, x_transposed)
-                # TODO: support bias
-                if b is not None:
-                    y += b
-                y = muxi_layout_kernels.layoutB(y)
-            else:
-                y = muxi_layout_kernels.gemm_layoutABC(
-                    w_transposed, x_transposed, bias=b
-                )
-            return y
-
         return linear_layout_contig_x_native_y
     else:
         raise NotImplementedError()
@@ -604,31 +801,6 @@ def get_linear_layout_native_x_contig_y(op_impl: str):
     if op_impl == "torch":
         return torch.nn.functional.linear
     elif op_impl == "muxi_custom_kernel":
-        import muxi_layout_kernels
-
-        def linear_layout_native_x_contig_y(x_transposed, w, b=None):
-            assert x_transposed.ndim == 5
-            x_is_vector = x_transposed.shape[1] == 1 and x_transposed.shape[3] == 1
-            # w has already been transposed, but reshaped back for compatibility. We only need to "view" it again.
-            w_transposed = w.view(w.shape[0] // 16, w.shape[1] // 8, 16, 8)
-            if x_is_vector:
-                y = muxi_layout_kernels.gemv_layoutA(
-                    w_transposed, x_transposed.view(1, -1)
-                )
-                # TODO: support bias
-                if b is not None:
-                    y += b
-            elif x_transposed.shape[1] * 16 > 256:
-                y = muxi_layout_kernels.muxi_hgemm_layout(w_transposed, x_transposed)
-                # TODO: support bias
-                if b is not None:
-                    y += b
-            else:
-                y = muxi_layout_kernels.gemm_layoutAB_ContinuousC(
-                    w_transposed, x_transposed, bias=b
-                )
-            return y
-
         return linear_layout_native_x_contig_y
     else:
         raise NotImplementedError()
@@ -638,31 +810,6 @@ def get_linear_layout_contig_x_contig_y(op_impl: str):
     if op_impl == "torch":
         return torch.nn.functional.linear
     elif op_impl == "muxi_custom_kernel":
-        import muxi_layout_kernels
-
-        def linear_layout_native_x_contig_y(x, w, b=None):
-            assert x.ndim == 2
-            x_is_vector = x.shape[0] == 1
-            if not x_is_vector:
-                x_transposed = muxi_layout_kernels.layoutB(x)
-            # w has already been transposed, but reshaped back for compatibility. We only need to "view" it again.
-            w_transposed = w.view(w.shape[0] // 16, w.shape[1] // 8, 16, 8)
-            if x_is_vector:
-                y = muxi_layout_kernels.gemv_layoutA(w_transposed, x)
-                # TODO: support bias
-                if b is not None:
-                    y += b
-            elif x_transposed.shape[1] * 16 > 256:
-                y = muxi_layout_kernels.muxi_hgemm_layout(w_transposed, x_transposed)
-                # TODO: support bias
-                if b is not None:
-                    y += b
-            else:
-                y = muxi_layout_kernels.gemm_layoutAB_ContinuousC(
-                    w_transposed, x_transposed, bias=b
-                )
-            return y
-
-        return linear_layout_native_x_contig_y
+        return linear_layout_contig_x_contig_y
     else:
         raise NotImplementedError()
