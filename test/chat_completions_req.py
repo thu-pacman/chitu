@@ -3,7 +3,7 @@ import requests, json, sys, time, random
 
 random.seed(2512)
 
-url = "http://127.0.0.1:2512/v1/chat/completions"  # cinfer
+url = "http://127.0.0.1:7000/v1/chat/completions"  # cinfer
 
 headers = {"Content-Type": "application/json"}
 
@@ -78,12 +78,13 @@ def send_request(index: int):
     body = {
         "model": "/home/share/models/Qwen2-7B-Instruct",
         "messages": msgs[index % len(msgs) if msg_id is None else msg_id],
-        "max_tokens": 100,
+        "max_tokens": 1024,
         "stream": stream,
         "temperature": 1,
     }
 
     generated_text = ""
+    reasoning_text = ""
     start_time = time.monotonic()
     with requests.post(url, json=body, stream=True) as response:
         if response.status_code == 200:
@@ -102,12 +103,23 @@ def send_request(index: int):
                     if delta.get("content", None):
                         tokens += 1
                         generated_text += delta["content"]
+                    if delta.get("reasoning_content", None):
+                        tokens += 1
+                        reasoning_text += delta["reasoning_content"]
 
             end_time = time.monotonic()
             duration = end_time - start_time
             tps = tokens / duration
             # print(generated_text)
-            return (index, start_time, end_time, duration, generated_text, tps)
+            return (
+                index,
+                start_time,
+                end_time,
+                duration,
+                generated_text,
+                tps,
+                reasoning_text,
+            )
         else:
             print(f"Request failed with status code: {response.status_code}")
 
@@ -119,7 +131,8 @@ with ThreadPoolExecutor(max_workers=req_nums) as executor:
         time.sleep(0.5)
     for future in as_completed(futures):
         result = future.result()
-        text = result[4][:35].replace("\n", "")
+        text = result[4].replace("\n", "")
+        reasoning_text = result[6].replace("\n", "")
         print(
-            f"Index:{result[0]:2d}, start:{result[1]:.4f}, duration:{result[3]:.4f}, tps:{result[5]:.4f}, text:'{text}'"
+            f"Index:{result[0]:2d}, start:{result[1]:.4f}, duration:{result[3]:.4f}, tps:{result[5]:.4f}\nreasoning_content:'{reasoning_text}'\ncontent:'{text}'"
         )

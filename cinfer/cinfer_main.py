@@ -34,7 +34,10 @@ def remove_task_other_device(remove_task_ids):
     task_tensor = PackedTasksBase(
         len(remove_task_ids), remove_task_ids, remove_task_ids, TaskType.Decode
     ).serialize(payload_type=SerializedPackedTasksPayloadType.EndTask, device=0)
-    torch.distributed.isend(tensor=task_tensor, dst=1)
+    if Backend.parallel_type == "pipe":
+        torch.distributed.isend(tensor=task_tensor, dst=1)
+    elif Backend.parallel_type == "tensor":
+        torch.distributed.broadcast(tensor=task_tensor, src=0)
 
 
 def update_ongoing_tasks():
@@ -86,7 +89,9 @@ def cinfer_run():
         cinfer_update(task_ids, rank, world_size)
     elif rank == 0:
         TaskPool.display()
-        Backend.scheduler.update(task_ids)
+        removed_decode_task_ids = Backend.scheduler.update(task_ids)
+        if world_size != 1:
+            remove_task_other_device(removed_decode_task_ids)
 
 
 def cinfer_terminate():
