@@ -310,6 +310,7 @@ class TensorExecutor(NormalExecutor):
 
     def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
         """Broadcast task metadata from rank 0 to all other ranks"""
+        remove_kvcache = False
         if Backend.state == BackendState.Running:
             task_tensor = (
                 tasks.serialize(device=self.rank)
@@ -327,13 +328,19 @@ class TensorExecutor(NormalExecutor):
         if self.rank != 0:
             task_tensor_type, tasks = PackedTasksBase.deserialize(task_tensor)
 
-        if (
-            self.rank != 0
-            and task_tensor_type == SerializedPackedTasksPayloadType.TerminateBackend
-        ):
-            Backend.state = BackendState.Terminated
+        if self.rank != 0:
+            if task_tensor_type == SerializedPackedTasksPayloadType.TerminateBackend:
+                Backend.state = BackendState.Terminated
+            if task_tensor_type == SerializedPackedTasksPayloadType.EndTask:
+                remove_kvcache = True
         if Backend.state == BackendState.Terminated:
             return None
+
+        if remove_kvcache:
+            for rid in tasks.req_ids:
+                Backend.cache_manager.finalize_cache_all_decode(rid)
+            return None
+
         return tasks
 
     def prefill_step(self, tasks):

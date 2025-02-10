@@ -178,20 +178,27 @@ def start_worker():
     loop.run_until_complete(process_queue())
 
 
+def start_unicorn(args):
+    uvicorn.run(app, host=args.serve.host, port=args.serve.port, log_level="info")
+
+
 @hydra.main(version_base=None, config_path="./configs", config_name="serve_config")
 def main(args: DictConfig):
     global rank
     global global_args
     global server_status
-    set_global_variables(args)
     global_args = args
+    set_global_variables(args)
     cinfer_init(args)
     server_status = True
     rank = torch.distributed.get_rank()
-    worker_thread = Thread(target=start_worker, daemon=True)
-    worker_thread.start()
     if rank == 0:
-        uvicorn.run(app, host=args.serve.host, port=args.serve.port, log_level="info")
+        uvicorn_thread = Thread(target=start_unicorn, args=(args,))
+        uvicorn_thread.start()
+    server_status = True
+    start_worker()
+    if rank == 0:
+        uvicorn_thread.join()
 
 
 if __name__ == "__main__":

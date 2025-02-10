@@ -154,6 +154,7 @@ class Backend:
                 head_dim,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=args.infer.max_reqs,
+                device=local_rank,
             )
         elif args.infer.cache_type == "skew":
             Backend.cache_manager = KVCacheManagerSkewAware(
