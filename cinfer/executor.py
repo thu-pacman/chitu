@@ -168,6 +168,7 @@ class PipeExecutor(NormalExecutor):
         self.world_size = torch.distributed.get_world_size()
 
     def prefill_step(self, tasks: PackedTasksBase):
+        print(f"!!! {self.rank}: prefill step (A)")
         varlens = VarLens(tasks.tokens, device=self.local_rank)
         Backend.cache_manager.curr_varlens = varlens
         Backend.cache_manager.curr_req_ids = tasks.req_ids
@@ -184,9 +185,13 @@ class PipeExecutor(NormalExecutor):
                 dtype=torch.float16 if use_half else torch.bfloat16,
             )
             torch.distributed.recv(tensor=inp, src=self.rank - 1, tag=HIDDEN_TENSOR_TAG)
+        print(f"!!! {self.rank}: prefill step (B)")
         self.timers("prefill").start()
         out = Backend.model.prefill(inp)
         self.timers("prefill").stop()
+        print(
+            f"!!! {self.rank}: prefill step (C), out.shape={out.shape} out.dtype={out.dtype}"
+        )
         if self.rank < self.world_size - 1:
             torch.distributed.isend(
                 tensor=out, dst=self.rank + 1, tag=HIDDEN_TENSOR_TAG
@@ -199,10 +204,12 @@ class PipeExecutor(NormalExecutor):
                 dst=0,
                 tag=LOGIT_TAG,
             )
+        print(f"!!! {self.rank}: prefill step (D)")
         Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
         return out
 
     def decode_step(self, tasks: PackedTasksBase):
+        print(f"!!! {self.rank}: decode step")
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
         Backend.cache_manager.curr_req_ids = tasks.req_ids
         if isinstance(Backend.cache_manager, PagedKVCacheManager):

@@ -14,7 +14,6 @@ from .utils import (
 from .cache_manager import PagedKVCacheManager
 
 
-import fairscale.nn.model_parallel.initialize as fs_init
 import torch
 import torch.nn.functional as F
 from fairscale.nn.model_parallel.layers import (
