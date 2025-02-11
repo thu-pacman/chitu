@@ -50,7 +50,12 @@ torchrun --nproc_per_node 2 test/single_req_test.py request.max_new_tokens=64 in
 torchrun --nproc_per_node 2 test/single_req_test.py request.max_new_tokens=64 infer.parallel_type=pipe
 
 ### NOTICE:
-# to avoid GPU conflict, add `grun` before command
+# On servers with `grun`, add `grun` before command to avoid GPU conflict.
+
+# Run on a multi-node cluster with Slurm:
+# ./script/srun_multi_node.sh <num_nodes> <num_gpus_per_node> [your command after torchrun]...
+# For example:
+./script/srun_multi_node.sh 2 2 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.parallel_type=tensor
 
 # Set prompt length and max new tokens for testing performance
 torchrun --nproc_per_node 1 test/single_req_test.py request.prompt_tokens_len=128 request.max_new_tokens=64 infer.stop_with_eos=False

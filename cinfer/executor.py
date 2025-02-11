@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.distributed
 import numpy as np
@@ -163,10 +164,11 @@ class PipeExecutor(NormalExecutor):
     def __init__(self, args):
         super().__init__(args)
         self.rank = torch.distributed.get_rank()
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = torch.distributed.get_world_size()
 
     def prefill_step(self, tasks: PackedTasksBase):
-        varlens = VarLens(tasks.tokens, self.rank)
+        varlens = VarLens(tasks.tokens, device=self.local_rank)
         Backend.cache_manager.curr_varlens = varlens
         Backend.cache_manager.curr_req_ids = tasks.req_ids
         if self.rank == 0:
@@ -178,7 +180,7 @@ class PipeExecutor(NormalExecutor):
                     sum([len(token) for token in tasks.tokens]),
                     Backend.model.params.dim,
                 ],
-                device=self.rank,
+                device=self.local_rank,
                 dtype=torch.float16 if use_half else torch.bfloat16,
             )
             torch.distributed.recv(tensor=inp, src=self.rank - 1, tag=HIDDEN_TENSOR_TAG)
@@ -191,7 +193,7 @@ class PipeExecutor(NormalExecutor):
             )
         else:
             # send logits to rank 0 to get response words
-            torch.cuda.synchronize(self.rank)
+            torch.cuda.synchronize(self.local_rank)
             torch.distributed.isend(
                 out,
                 dst=0,
@@ -211,7 +213,7 @@ class PipeExecutor(NormalExecutor):
             use_half = get_dtype()
             inp = torch.empty(
                 [tasks.num_tasks, 1, Backend.model.params.dim],
-                device=self.rank,
+                device=self.local_rank,
                 dtype=torch.float16 if use_half else torch.bfloat16,
             )
             torch.distributed.recv(tensor=inp, src=self.rank - 1, tag=HIDDEN_TENSOR_TAG)
@@ -235,7 +237,7 @@ class PipeExecutor(NormalExecutor):
     def _recv_logits(self, tasks):
         logits = torch.empty(
             [tasks.num_tasks, Backend.model.vocab_size],
-            device=self.rank,
+            device=self.local_rank,
             dtype=torch.float,
         )
         handle = torch.distributed.irecv(logits, src=self.world_size - 1, tag=LOGIT_TAG)
@@ -249,14 +251,15 @@ class PipeExecutor(NormalExecutor):
         # Rank 0 initialzie from the argument. Rank >= 1 recv task tensor from Rank - 1
         if self.rank == 0:
             if Backend.state == BackendState.Running:
-                task_tensor = tasks.serialize(device=self.rank)
+                task_tensor = tasks.serialize(device=self.local_rank)
             else:
                 assert Backend.state == BackendState.Terminating
                 task_tensor = PackedTasksBase.serialize_special(
-                    SerializedPackedTasksPayloadType.TerminateBackend, device=self.rank
+                    SerializedPackedTasksPayloadType.TerminateBackend,
+                    device=self.local_rank,
                 )
         else:
-            task_tensor = PackedTasksBase.empty_serialization(device=self.rank)
+            task_tensor = PackedTasksBase.empty_serialization(device=self.local_rank)
             torch.distributed.recv(
                 tensor=task_tensor, src=self.rank - 1, tag=TASK_TENSOR_TAG
             )
@@ -306,6 +309,7 @@ class TensorExecutor(NormalExecutor):
     def __init__(self, args):
         super().__init__(args)
         self.rank = torch.distributed.get_rank()
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = torch.distributed.get_world_size()
 
     def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
@@ -313,14 +317,15 @@ class TensorExecutor(NormalExecutor):
         remove_kvcache = False
         if Backend.state == BackendState.Running:
             task_tensor = (
-                tasks.serialize(device=self.rank)
+                tasks.serialize(device=self.local_rank)
                 if self.rank == 0
-                else PackedTasksBase.empty_serialization(device=self.rank)
+                else PackedTasksBase.empty_serialization(device=self.local_rank)
             )
         else:
             assert Backend.state == BackendState.Terminating
             task_tensor = PackedTasksBase.serialize_special(
-                SerializedPackedTasksPayloadType.TerminateBackend, device=self.rank
+                SerializedPackedTasksPayloadType.TerminateBackend,
+                device=self.local_rank,
             )
             Backend.state = BackendState.Terminated
         torch.distributed.broadcast(tensor=task_tensor, src=0)
@@ -350,11 +355,11 @@ class TensorExecutor(NormalExecutor):
             tokens = torch.empty(
                 [sum(len(seq) for seq in tasks.tokens)],
                 dtype=torch.int64,
-                device=self.rank,
+                device=self.local_rank,
             )
         torch.distributed.broadcast(tensor=tokens, src=0)
 
-        varlens = VarLens(tasks.tokens, self.rank)
+        varlens = VarLens(tasks.tokens, device=self.local_rank)
         self.timers("prefill").start()
         Backend.cache_manager.curr_varlens = varlens
         Backend.cache_manager.curr_req_ids = tasks.req_ids
@@ -373,11 +378,11 @@ class TensorExecutor(NormalExecutor):
             for task in tasks.tasks:
                 tokens.append(task.next_token)
             tokens = torch.tensor(
-                tokens, dtype=torch.int64, device=self.rank
+                tokens, dtype=torch.int64, device=self.local_rank
             ).unsqueeze(1)
         else:
             tokens = torch.empty(
-                [tasks.num_tasks, 1], dtype=torch.int64, device=self.rank
+                [tasks.num_tasks, 1], dtype=torch.int64, device=self.local_rank
             )
         torch.distributed.broadcast(tensor=tokens, src=0)
 
