@@ -635,7 +635,7 @@ class TransformerHFLlama(Transformer):
 
     def _init_layers(self, cache, attn_backend, op_impl):
         self.layers = torch.nn.ModuleList()
-        for layer_id in range(self.n_layers):
+        for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
             self.layers.append(
                 self.layer_type(
                     layer_id,

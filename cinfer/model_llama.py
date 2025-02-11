@@ -102,7 +102,7 @@ class TransformerLlama(Transformer):
 
     def _init_layers(self, cache, attn_backend, op_impl):
         self.layers = torch.nn.ModuleList()
-        for layer_id in range(self.n_layers):
+        for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
             self.layers.append(
                 TransformerBlockLlama(
                     layer_id, self.params, cache, attn_backend, self.op_impl
