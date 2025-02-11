@@ -1,3 +1,4 @@
+import os
 import math
 import itertools
 from dataclasses import dataclass
@@ -239,8 +240,9 @@ class Transformer(nn.Module):
         self.attn_backend = attn_backend
         self.op_impl = op_impl
         self.rank = torch.distributed.get_rank()
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = torch.distributed.get_world_size()
-        self.device = torch.device(self.rank)
+        self.device = torch.device(self.local_rank)
 
         self.pipeline_parallel_size = pipeline_parallel_size
         self.model_parallel_size = model_parallel_size

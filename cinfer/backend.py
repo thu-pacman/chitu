@@ -82,7 +82,7 @@ class Backend:
 
         torch.manual_seed(args.infer.seed)
 
-        if local_rank > 0:
+        if global_rank > 0:
             sys.stdout = open(os.devnull, "w")
 
         trust_remote_code = False
