@@ -14,7 +14,8 @@ _MAX_SEQ_LEN = 2048
 class PagedKVCacheManager:
     def __init__(
         self,
-        num_layers,
+        begin_layer_id,
+        end_layer_id,
         n_local_kv_heads,
         head_dim,
         num_hot_req=16,
@@ -26,19 +27,21 @@ class PagedKVCacheManager:
 
         num_blocks_per_layer = (max_seq_len // _BLOCK_SIZE) * num_hot_req
 
-        self.num_layers = num_layers
+        self.begin_layer_id = begin_layer_id
+        self.end_layer_id = end_layer_id
+        self.num_layers = end_layer_id - begin_layer_id
         self.n_local_kv_heads = n_local_kv_heads
         self.head_dim = head_dim
         assert block_size % 256 == 0
         self.block_size = block_size
         self.max_seq_len = max_seq_len
-        self.num_blocks = num_blocks_per_layer * num_layers
+        self.num_blocks = num_blocks_per_layer * self.num_layers
         self.device = torch.device(device)
         self.gpu_block_table = None
 
         self.seq_lens = {}
         self.timers = get_timers()
-        self.block_table = {}  # (seq_id, layer_id, block_idx)
+        self.block_table = {}  # (seq_id, layer_id - begin_layer_id, block_idx)
         # TODO: For better performance, use list instead of set for free_blocks
         self.free_blocks = set(range(self.num_blocks))
         use_half = get_dtype()
@@ -63,7 +66,7 @@ class PagedKVCacheManager:
     def finalize_cache_bylayer_prefill(self, xk, xv, req_ids, varlen, layer_id):
         self.timers("cache_finalize_cache_all_prefill").start()
         for idx, req_id in enumerate(req_ids):
-            if layer_id == 0:
+            if layer_id == self.begin_layer_id:
                 self.seq_lens[req_id] = varlen.cpu_lens[idx]
                 # logger.warning(f"Prefill: seq_lens[{req_id}] = {self.seq_lens[req_id]}")
             num_blocks_prepared = (
@@ -92,11 +95,10 @@ class PagedKVCacheManager:
                         start_pos:end_pos
                     ].clone()
             if req_id in self.block_table:
-                assert len(self.block_table[req_id]) == layer_id
+                assert len(self.block_table[req_id]) == layer_id - self.begin_layer_id
             else:
                 self.block_table[req_id] = []
             self.block_table[req_id].append(block_ids.copy())
-            # logger.warning(f"block table[{req_id}][{layer_id}] = {block_ids}")
         self.timers("cache_finalize_cache_all_prefill").stop()
 
     def finalize_cache_all_prefill(self, req_ids, varlen):
@@ -127,7 +129,7 @@ class PagedKVCacheManager:
         return idx
 
     def get_gpu_block_table(self, layer_id):
-        return self.gpu_block_table[layer_id]
+        return self.gpu_block_table[layer_id - self.begin_layer_id]
 
     def get_gpu_seq_lens(self):
         return self.curr_seq_lens_gpu
@@ -147,18 +149,20 @@ class PagedKVCacheManager:
     def prepare_block_table_for_decode(self, req_ids):
         for req_id in req_ids:
             if self.seq_lens[req_id] % self.block_size == 0:
-                for layer_id in range(self.num_layers):
-                    self.block_table[req_id][layer_id].append(self.get_free_block())
+                for local_layer_id in range(self.num_layers):
+                    self.block_table[req_id][local_layer_id].append(
+                        self.get_free_block()
+                    )
 
         max_block_num = max(len(self.block_table[req_id][0]) for req_id in req_ids)
         gpu_block_table = [
             [[0] * max_block_num for _ in range(len(req_ids))]
             for _ in range(self.num_layers)
         ]
-        for layer_id in range(self.num_layers):
+        for local_layer_id in range(self.num_layers):
             for idx, req_id in enumerate(req_ids):
-                block_ids = self.block_table[req_id][layer_id]
-                gpu_block_table[layer_id][idx][: len(block_ids)] = block_ids
+                block_ids = self.block_table[req_id][local_layer_id]
+                gpu_block_table[local_layer_id][idx][: len(block_ids)] = block_ids
         self.gpu_block_table = torch.tensor(
             gpu_block_table, dtype=torch.int32, device=self.device
         )
@@ -181,10 +185,14 @@ class PagedKVCacheManager:
 
 
 class KVCacheManager:
-    def __init__(self, num_layers, n_local_kv_heads, head_dim, device="cuda"):
+    def __init__(
+        self, begin_layer_id, end_layer_id, n_local_kv_heads, head_dim, device="cuda"
+    ):
         self.cache = {}
         self.prepared_cache = []
-        self.num_layers = num_layers
+        self.begin_layer_id = begin_layer_id
+        self.end_layer_id = end_layer_id
+        self.num_layers = end_layer_id - begin_layer_id
         self.n_local_kv_heads = n_local_kv_heads
         self.head_dim = head_dim
         self.tmp_storage = []
@@ -210,15 +218,15 @@ class KVCacheManager:
         for it, req_id in enumerate(req_ids):
             self.seq_lens[req_id] = varlen.cpu_lens[it]
             self.cache[req_id] = [None] * self.num_layers
-        for layer_id in range(self.num_layers):
+        for local_layer_id in range(self.num_layers):
             start = 0
             for it, req_id in enumerate(req_ids):
                 end = start + varlen.cpu_lens[it]
-                self.cache[req_id][layer_id] = [
-                    self.tmp_storage[layer_id][0][
+                self.cache[req_id][local_layer_id] = [
+                    self.tmp_storage[local_layer_id][0][
                         start:end
                     ],  # [seq, n_local_kv_heads, head_dim]
-                    self.tmp_storage[layer_id][1][
+                    self.tmp_storage[local_layer_id][1][
                         start:end
                     ],  # [seq, n_local_kv_heads, head_dim]
                 ]
@@ -258,14 +266,14 @@ class KVCacheManager:
             device=self.device,
         )
         # hkz-comment: Very similar to matrix transpose;
-        for layer_id in range(self.num_layers):
+        for local_layer_id in range(self.num_layers):
             for it, req_id in enumerate(req_ids):
-                prepared_cache[layer_id][0][it][: seq_lens[it]] = self.cache[req_id][
-                    layer_id
-                ][0]
-                prepared_cache[layer_id][1][it][: seq_lens[it]] = self.cache[req_id][
-                    layer_id
-                ][1]
+                prepared_cache[local_layer_id][0][it][: seq_lens[it]] = self.cache[
+                    req_id
+                ][local_layer_id][0]
+                prepared_cache[local_layer_id][1][it][: seq_lens[it]] = self.cache[
+                    req_id
+                ][local_layer_id][1]
         self.prepared_cache = prepared_cache
         self.timers("cache_prepare").stop()
 
@@ -273,7 +281,7 @@ class KVCacheManager:
     # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
     def update_cache_decode(self, xk, xv, layer_id):
         assert len(self.prepared_cache) > 0
-        output = self.prepared_cache[layer_id]
+        output = self.prepared_cache[layer_id - self.begin_layer_id]
         for it in range(xk.shape[0]):
             output[0][it][self.curr_seq_lens[it]] = xk[it]
             output[1][it][self.curr_seq_lens[it]] = xv[it]
@@ -282,7 +290,7 @@ class KVCacheManager:
     # Decode:
     # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
     def get_cache_decode(self, layer_id):
-        return self.prepared_cache[layer_id]
+        return self.prepared_cache[layer_id - self.begin_layer_id]
 
     # Decode:
     # return [# of current req_ids]
@@ -297,13 +305,13 @@ class KVCacheManager:
         for it, req_id in enumerate(req_ids):
             self.cache[req_id] = [None] * self.num_layers
             self.seq_lens[req_id] += 1
-        for layer_id in range(self.num_layers):
+        for local_layer_id in range(self.num_layers):
             for it, req_id in enumerate(req_ids):
-                self.cache[req_id][layer_id] = [
-                    self.prepared_cache[layer_id][0][it][
+                self.cache[req_id][local_layer_id] = [
+                    self.prepared_cache[local_layer_id][0][it][
                         : self.curr_seq_lens[it] + 1
                     ],  # [seq + 1, n_local_kv_heads, head_dim]
-                    self.prepared_cache[layer_id][1][it][
+                    self.prepared_cache[local_layer_id][1][it][
                         : self.curr_seq_lens[it] + 1
                     ],  # [seq + 1, n_local_kv_heads, head_dim]
                 ]
@@ -352,14 +360,17 @@ class KVCache:
 class KVCacheManagerSkewAware:
     def __init__(
         self,
-        num_layers,
+        begin_layer_id,
+        end_layer_id,
         n_local_kv_heads,
         head_dim,
         num_hot_req,
         max_seq_len=2048,
         device="cuda",
     ):
-        self.num_layers = num_layers
+        self.begin_layer_id = begin_layer_id
+        self.end_layer_id = end_layer_id
+        self.num_layers = end_layer_id - begin_layer_id
         self.n_local_kv_heads = n_local_kv_heads
         self.head_dim = head_dim
         self.num_hot_req = num_hot_req
@@ -393,7 +404,7 @@ class KVCacheManagerSkewAware:
         self, cache_k, cache_v, req_ids, varlen, layer_id
     ):
         self.timers("cache_finalize_cache_all_prefill").start()
-        if layer_id == 0:
+        if layer_id == self.begin_layer_id:
             # logger.warning(req_ids)
             for it, req_id in enumerate(req_ids):
                 self.seq_lens[req_id] = varlen.cpu_lens[it]
@@ -410,12 +421,12 @@ class KVCacheManagerSkewAware:
         start = 0
         for it, req_id in enumerate(req_ids):
             end = start + varlen.cpu_lens[it]
-            self.buffer[layer_id][0][self.req2slot[req_id]][: varlen.cpu_lens[it]] = (
-                cache_k[start:end]
-            )
-            self.buffer[layer_id][1][self.req2slot[req_id]][: varlen.cpu_lens[it]] = (
-                cache_v[start:end]
-            )
+            self.buffer[layer_id - self.begin_layer_id][0][self.req2slot[req_id]][
+                : varlen.cpu_lens[it]
+            ] = cache_k[start:end]
+            self.buffer[layer_id - self.begin_layer_id][1][self.req2slot[req_id]][
+                : varlen.cpu_lens[it]
+            ] = cache_v[start:end]
             start = end
         self.timers("cache_finalize_cache_all_prefill").stop()
 
@@ -479,22 +490,14 @@ class KVCacheManagerSkewAware:
     # Decode:
     # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
     def update_cache_decode(self, xk, xv, layer_id):
-        # self.timers("cache_update").start()
-        output = self.prepared_cache[layer_id]
-        # self.timers("cache_update").stop()
-        # return output
-        # for it in range(xk.shape[0]):
-        #     output[0][it][self.curr_seq_lens[it]] = xk[it]
-        #     output[1][it][self.curr_seq_lens[it]] = xv[it]
-        # if layer_id == 0:
-        #     logger.warning(f"Update: {self.curr_seq_lens[0]} {xk.shape}")
+        output = self.prepared_cache[layer_id - self.begin_layer_id]
         move_data(output, xk, xv, self.curr_seq_lens_gpu, self.max_seq_len)
         return output
 
     # Decode:
     # return [num_req, 2, max_seqlen + 1, n_local_kv_heads, head_dim]
     def get_cache_decode(self, layer_id):
-        return self.prepared_cache[layer_id]
+        return self.prepared_cache[layer_id - self.begin_layer_id]
 
     # Decode:
     # return [# of current req_ids]
@@ -550,14 +553,17 @@ class KVCacheManagerSkewAware:
 class KVCacheManagerNop:
     def __init__(
         self,
-        num_layers,
+        begin_layer_id,
+        end_layer_id,
         n_local_kv_heads,
         head_dim,
         num_hot_req=16,
         max_seq_len=2048,
         device="cuda",
     ):
-        self.num_layers = num_layers
+        self.begin_layer_id = begin_layer_id
+        self.end_layer_id = end_layer_id
+        self.num_layers = end_layer_id - begin_layer_id
         self.n_local_kv_heads = n_local_kv_heads
         self.head_dim = head_dim
         self.num_hot_req = num_hot_req

@@ -249,13 +249,20 @@ class Transformer(nn.Module):
 
         self.params = params
         self.vocab_size = params.vocab_size
-        self.n_layers = params.n_layers
         self.global_n_layers = params.n_layers
 
         if self.pipeline_exec:
-            self.n_layers = compute_layer_dist_in_pipe(
-                self.n_layers, pipeline_parallel_size
-            )[self.rank]
+            num_layers_of_each_rank = compute_layer_dist_in_pipe(
+                self.global_n_layers, self.world_size
+            )
+            first_layer_id_of_each_rank = list(
+                itertools.accumulate([0] + num_layers_of_each_rank)
+            )
+            self.local_begin_layer_id = first_layer_id_of_each_rank[self.rank]
+            self.local_end_layer_id = first_layer_id_of_each_rank[self.rank + 1]
+        else:
+            self.local_begin_layer_id = 0
+            self.local_end_layer_id = self.global_n_layers
 
         if not self.pipeline_exec or self.rank == 0:
             self._init_pre_layers()

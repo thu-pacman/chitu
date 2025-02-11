@@ -4,6 +4,7 @@ from fairscale.nn.model_parallel.initialize import (
 )
 import torch
 import gc
+import itertools
 from enum import Enum
 from .tokenizer import Tokenizer, ChatFormat, TokenizerHF, ChatFormatHF
 from pathlib import Path
@@ -75,7 +76,8 @@ class Backend:
         Backend.parallel_type = args.infer.parallel_type
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        global_rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
         torch.cuda.set_device(local_rank)
 
         torch.manual_seed(args.infer.seed)
@@ -122,13 +124,18 @@ class Backend:
             Backend.formatter = ChatFormat(tokenizer)
 
         # Init cache
-        local_n_layers = (
-            compute_layer_dist_in_pipe(args.models.n_layers, pipeline_parallel_size)[
-                local_rank
-            ]
-            if args.infer.parallel_type == "pipe"
-            else args.models.n_layers
-        )
+        if args.infer.parallel_type == "pipe":
+            num_layers_of_each_rank = compute_layer_dist_in_pipe(
+                args.models.n_layers, pipeline_parallel_size
+            )
+            first_layer_id_of_each_rank = list(
+                itertools.accumulate([0] + num_layers_of_each_rank)
+            )
+            local_begin_layer_id = first_layer_id_of_each_rank[global_rank]
+            local_end_layer_id = first_layer_id_of_each_rank[global_rank + 1]
+        else:
+            local_begin_layer_id = 0
+            local_end_layer_id = args.models.n_layers
         model_parallel_size = fs_init.get_model_parallel_world_size()
         n_kv_heads = args.models.n_kv_heads
         n_local_kv_heads = n_kv_heads // model_parallel_size
@@ -136,11 +143,12 @@ class Backend:
         head_dim = args.models.dim // args.models.n_heads
         if args.infer.cache_type == "normal":
             Backend.cache_manager = KVCacheManager(
-                local_n_layers, n_local_kv_heads, head_dim
+                local_begin_layer_id, local_end_layer_id, n_local_kv_heads, head_dim
             )
         elif args.infer.cache_type == "nop":
             Backend.cache_manager = KVCacheManagerNop(
-                local_n_layers,
+                local_begin_layer_id,
+                local_end_layer_id,
                 n_local_kv_heads,
                 head_dim,
                 max_seq_len=args.infer.max_seq_len,
@@ -149,7 +157,8 @@ class Backend:
             )
         elif args.infer.cache_type == "paged":
             Backend.cache_manager = PagedKVCacheManager(
-                local_n_layers,
+                local_begin_layer_id,
+                local_end_layer_id,
                 n_local_kv_heads,
                 head_dim,
                 max_seq_len=args.infer.max_seq_len,
@@ -158,7 +167,8 @@ class Backend:
             )
         elif args.infer.cache_type == "skew":
             Backend.cache_manager = KVCacheManagerSkewAware(
-                local_n_layers,
+                local_begin_layer_id,
+                local_end_layer_id,
                 n_local_kv_heads,
                 head_dim,
                 max_seq_len=args.infer.max_seq_len,
