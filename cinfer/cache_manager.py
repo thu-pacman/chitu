@@ -48,16 +48,18 @@ class PagedKVCacheManager:
         self.paged_k_cache = torch.zeros(
             self.num_blocks,
             block_size,
-            n_local_kv_heads,
-            head_dim,
+            # n_local_kv_heads, FIXME
+            # head_dim, FIXME
+            512,
             device=device,
             dtype=torch.float16 if use_half else torch.bfloat16,
         )
         self.paged_v_cache = torch.zeros(
             self.num_blocks,
             block_size,
-            n_local_kv_heads,
-            head_dim,
+            # n_local_kv_heads, FIXME
+            # head_dim, FIXME
+            64,
             device=device,
             dtype=torch.float16 if use_half else torch.bfloat16,
         )

@@ -356,6 +356,16 @@ class AttentionDeepSeekV3(Attention):
         )
         self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
         self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+
+        if varlens is not None:  # Prefill:
+            self.cache.finalize_cache_bylayer_prefill(
+                self.kv_cache[:bsz, start_pos:end_pos],
+                self.pe_cache[:bsz, start_pos:end_pos],
+                self.cache.curr_req_ids,
+                self.cache.curr_varlens,
+                self.layer_id,
+            )
+
         scores = (
             torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos])
             + torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])

@@ -11,7 +11,6 @@ from .utils import (
     compute_layer_dist_in_pipe,
     is_layer,
 )
-from .cache_manager import PagedKVCacheManager
 
 
 import torch

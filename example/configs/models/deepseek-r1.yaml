@@ -1,7 +1,7 @@
 name: deepseek-r1
 type: deepseek-v3
-ckpt_dir: /data1/DeepSeek-R1.local
-tokenizer_path: /data1/DeepSeek-R1.local # TODO
+ckpt_dir: /data/DeepSeek-R1/
+tokenizer_path: /data/DeepSeek-R1/ # TODO
 vocab_size: 129280
 dim: 7168
 inter_dim: 18432
