@@ -151,47 +151,53 @@ class Backend:
             local_begin_layer_id = 0
             local_end_layer_id = args.models.n_layers
         model_parallel_size = fs_init.get_model_parallel_world_size()
-        n_kv_heads = (
-            args.models.n_kv_heads
-            if hasattr(args.models, "n_kv_heads")
-            else args.models.n_heads
-        )
-        n_local_kv_heads = n_kv_heads // model_parallel_size
-        logger.warning(f"n local kv heads {n_local_kv_heads}")
-        head_dim = args.models.dim // args.models.n_heads
+        kv_cache_kvargs = {}
+        if args.models.type == "deepseek-v3":
+            kv_cache_kvargs["k_shape_per_sample"] = (512,)
+            kv_cache_kvargs["v_shape_per_sample"] = (64,)
+            # FIXME: Read from args. Consider model_parallel_size
+        else:
+            n_kv_heads = (
+                args.models.n_kv_heads
+                if hasattr(args.models, "n_kv_heads")
+                else args.models.n_heads
+            )
+            n_local_kv_heads = n_kv_heads // model_parallel_size
+            head_dim = args.models.dim // args.models.n_heads
+            kv_cache_kvargs["n_local_kv_heads"] = n_local_kv_heads
+            kv_cache_kvargs["head_dim"] = head_dim
         if args.infer.cache_type == "normal":
             Backend.cache_manager = KVCacheManager(
-                local_begin_layer_id, local_end_layer_id, n_local_kv_heads, head_dim
+                local_begin_layer_id,
+                local_end_layer_id,
+                **kv_cache_kvargs,
             )
         elif args.infer.cache_type == "nop":
             Backend.cache_manager = KVCacheManagerNop(
                 local_begin_layer_id,
                 local_end_layer_id,
-                n_local_kv_heads,
-                head_dim,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=args.infer.max_reqs,
                 device=local_rank,
+                **kv_cache_kvargs,
             )
         elif args.infer.cache_type == "paged":
             Backend.cache_manager = PagedKVCacheManager(
                 local_begin_layer_id,
                 local_end_layer_id,
-                n_local_kv_heads,
-                head_dim,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=args.infer.max_reqs,
                 device=local_rank,
+                **kv_cache_kvargs,
             )
         elif args.infer.cache_type == "skew":
             Backend.cache_manager = KVCacheManagerSkewAware(
                 local_begin_layer_id,
                 local_end_layer_id,
-                n_local_kv_heads,
-                head_dim,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=args.infer.max_reqs,
                 device=local_rank,
+                **kv_cache_kvargs,
             )
         else:
             assert False, f"Unknown cache type {args.infer.cache_type}"
