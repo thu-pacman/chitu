@@ -143,14 +143,17 @@ class Backend:
         head_dim = args.models.dim // args.models.n_heads
         if args.infer.cache_type == "normal":
             Backend.cache_manager = KVCacheManager(
-                local_begin_layer_id, local_end_layer_id, n_local_kv_heads, head_dim
+                local_begin_layer_id,
+                local_end_layer_id,
+                n_local_kv_heads=n_local_kv_heads,
+                head_dim=head_dim,
             )
         elif args.infer.cache_type == "nop":
             Backend.cache_manager = KVCacheManagerNop(
                 local_begin_layer_id,
                 local_end_layer_id,
-                n_local_kv_heads,
-                head_dim,
+                n_local_kv_heads=n_local_kv_heads,
+                head_dim=head_dim,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=args.infer.max_reqs,
                 device=local_rank,
@@ -159,8 +162,8 @@ class Backend:
             Backend.cache_manager = PagedKVCacheManager(
                 local_begin_layer_id,
                 local_end_layer_id,
-                n_local_kv_heads,
-                head_dim,
+                n_local_kv_heads=n_local_kv_heads,
+                head_dim=head_dim,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=args.infer.max_reqs,
                 device=local_rank,
@@ -169,8 +172,8 @@ class Backend:
             Backend.cache_manager = KVCacheManagerSkewAware(
                 local_begin_layer_id,
                 local_end_layer_id,
-                n_local_kv_heads,
-                head_dim,
+                n_local_kv_heads=n_local_kv_heads,
+                head_dim=head_dim,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=args.infer.max_reqs,
                 device=local_rank,
