@@ -153,9 +153,10 @@ class Backend:
         model_parallel_size = fs_init.get_model_parallel_world_size()
         kv_cache_kvargs = {}
         if args.models.type == "deepseek-v3":
-            kv_cache_kvargs["k_shape_per_sample"] = (512,)
-            kv_cache_kvargs["v_shape_per_sample"] = (64,)
-            # FIXME: Read from args. Consider model_parallel_size
+            kv_cache_kvargs["k_shape_per_sample"] = (args.models.kv_lora_rank,)
+            kv_cache_kvargs["v_shape_per_sample"] = (args.models.qk_rope_head_dim,)
+            # Unable to distribute DeepSeek-v3's KV cache via TP. So these shapes have
+            # nothing to do with model_parallel_size
         else:
             n_kv_heads = (
                 args.models.n_kv_heads
