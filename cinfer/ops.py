@@ -9,23 +9,6 @@ def GEMV(x, w):
     return output
 
 
-def move_data(buffer, xk, xv, curr_seq_lens, total_seq):
-    batch_size = xk.shape[0]
-    num_head = xk.shape[-2]
-    head_dim = xk.shape[-1]
-    grid = (batch_size, num_head)
-    move_data_kernel[grid](
-        xk_ptr=xk,
-        xv_ptr=xv,
-        output_ptr=buffer,
-        seq_lens_ptr=curr_seq_lens,
-        BATCH_SIZE=batch_size,
-        NUM_HEAD=num_head,
-        HEAD_DIM=head_dim,
-        TOTAL_SEQ=total_seq,
-    )
-
-
 def apply_rotary_pos_emb_triton(q, cos, sin, pos, block_size=128):
     # Get tensor shapes
     batch_size, n_local_heads, head_dim = q.shape

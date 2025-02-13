@@ -4,41 +4,6 @@ import triton.language as tl
 import torch
 
 
-@triton.jit
-def move_data_kernel(
-    xk_ptr,
-    xv_ptr,
-    output_ptr,
-    seq_lens_ptr,
-    BATCH_SIZE: tl.constexpr,
-    NUM_HEAD: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    TOTAL_SEQ: tl.constexpr,
-):
-    batch_id = tl.program_id(axis=0)
-    head_id = tl.program_id(axis=1)
-    dim_id = tl.arange(0, HEAD_DIM)
-
-    xk_offset = batch_id * NUM_HEAD * HEAD_DIM + head_id * HEAD_DIM + dim_id
-    xv_offset = xk_offset
-    seq_len_offset = batch_id
-
-    xk_data = tl.load(xk_ptr + xk_offset)
-    xv_data = tl.load(xv_ptr + xv_offset)
-    seq_len = tl.load(seq_lens_ptr + seq_len_offset)
-
-    out_offset_k = (
-        batch_id * TOTAL_SEQ * NUM_HEAD * HEAD_DIM
-        + seq_len * NUM_HEAD * HEAD_DIM
-        + head_id * HEAD_DIM
-        + dim_id
-    )
-    out_offset_v = (BATCH_SIZE * TOTAL_SEQ * NUM_HEAD * HEAD_DIM) + out_offset_k
-
-    tl.store(output_ptr + out_offset_k, xk_data)
-    tl.store(output_ptr + out_offset_v, xv_data)
-
-
 # Define constants
 BATCH_SIZE = 64
 NUM_HEAD = 1
