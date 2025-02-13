@@ -1,6 +1,6 @@
 #!/bin/bash
 
-if [[ $# < 2 ]]; then
+if [[ $# -lt 2 ]]; then
     echo "Usage: $0 <num_nodes> <num_gpus_per_node> [your command after torchrun]..."
     exit 1
 fi

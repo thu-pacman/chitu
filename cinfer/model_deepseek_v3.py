@@ -256,40 +256,8 @@ class AttentionDeepSeekV3(Attention):
             mscale = 0.1 * mscale * math.log(args.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        varlens=None,
-    ):
-        """
-        Forward pass for the Multi-Headed Attention Layer (MLA).
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
-            start_pos (int): Starting position in the sequence for caching.
-            freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
-
-        Returns:
-            torch.Tensor: Output tensor with the same shape as the input.
-        """
-
-        if varlens is not None:  # Prefill:
-            start_pos = 0
-            bsz = len(varlens.cpu_lens)
-            x = x.view(bsz, -1, x.shape[-1])
-        else:  # Decode
-            cache_seqlens = self.cache.get_gpu_seq_lens()
-            assert torch.all(cache_seqlens[0] == cache_seqlens)
-            start_pos = cache_seqlens[0]
-
+    def _run_linear(self, x, freqs_cis):
         bsz, seqlen, _ = x.size()
-
-        mask = None
-        if seqlen > 1:
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=x.device).triu_(1)
-
-        end_pos = start_pos + seqlen
         if self.q_lora_rank == 0:
             q = self.wq(x)
         else:
@@ -313,39 +281,81 @@ class AttentionDeepSeekV3(Attention):
         q_nope = torch.einsum(
             "bshd,hdc->bshc", q_nope, wkv_b[:, : self.qk_nope_head_dim]
         )
+        return q_nope, q_pe, kv, k_pe, wkv_b
 
-        if varlens is None:  # Decode:
-            kv_cache, pe_cache = self.cache.get_cache_decode(self.layer_id)
-        else:
-            kv_cache = torch.zeros(bsz, end_pos, self.kv_lora_rank).cuda()
-            pe_cache = torch.zeros(bsz, end_pos, self.qk_rope_head_dim).cuda()
+    def prefill_forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        varlens,
+    ):
+        start_pos = 0
+        bsz = len(varlens.cpu_lens)
+        x = x.view(bsz, -1, x.shape[-1])
+        bsz, seqlen, _ = x.size()
+        end_pos = start_pos + seqlen
+        q_nope, q_pe, kv, k_pe, wkv_b = self._run_linear(x, freqs_cis)
 
-        kv_cache[:, start_pos:end_pos] = self.kv_norm(kv, compute_dtype=kv.dtype)
-        pe_cache[:, start_pos:end_pos] = k_pe.squeeze(2)
+        kv_cache = self.kv_norm(kv, compute_dtype=kv.dtype)
+        pe_cache = k_pe.squeeze(2)
+        self.cache.finalize_cache_bylayer_prefill(
+            kv_cache[:, start_pos:end_pos],
+            pe_cache[:, start_pos:end_pos],
+            self.cache.curr_req_ids,
+            self.cache.curr_varlens,
+            self.layer_id,
+        )
+        q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
+        kv_pe_cache = torch.cat([kv_cache[:, :end_pos], pe_cache[:, :end_pos]], dim=-1)
+        x = self.attn_backend.attn_varlen_func(
+            q_nope_pe.view(-1, q_nope_pe.shape[-2], q_nope_pe.shape[-1]),
+            kv_pe_cache.view(-1, 1, kv_pe_cache.shape[-1]),
+            kv_cache[:, :end_pos].view(-1, 1, kv_cache.shape[-1]),
+            varlens.prefix_lens,
+            varlens.prefix_lens,
+            varlens.max_len,
+            varlens.max_len,
+            causal=True,
+        )
 
-        if varlens is not None:  # Prefill:
-            self.cache.finalize_cache_bylayer_prefill(
-                kv_cache[:, start_pos:end_pos],
-                pe_cache[:, start_pos:end_pos],
-                self.cache.curr_req_ids,
-                self.cache.curr_varlens,
-                self.layer_id,
-            )
+        x = x.view(bsz, seqlen, x.shape[-2], x.shape[-1])
+        x = self._run_output_linear(x, wkv_b)
+        return x.view(bsz * seqlen, -1)
 
-        scores = (
-            torch.einsum("bshc,btc->bsht", q_nope, kv_cache[:, :end_pos])
-            + torch.einsum("bshr,btr->bsht", q_pe, pe_cache[:, :end_pos])
-        ) * self.softmax_scale
-        if mask is not None:
-            scores += mask.unsqueeze(1)
-        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
-        x = torch.einsum("bsht,btc->bshc", scores, kv_cache[:, :end_pos])
+    def decode_forward(self, x: torch.Tensor, freqs_cis: torch.Tensor):
+        cache_seqlens = self.cache.get_gpu_seq_lens()
+        assert torch.all(cache_seqlens[0] == cache_seqlens)
+        start_pos = cache_seqlens[0]
+        bsz, seqlen, _ = x.size()
+        end_pos = start_pos + seqlen
+
+        q_nope, q_pe, kv, k_pe, wkv_b = self._run_linear(x, freqs_cis)
+
+        kv_cache, pe_cache = self.cache.get_cache_decode(self.layer_id)
+        this_kv = self.kv_norm(kv, compute_dtype=kv.dtype)
+        this_pe = k_pe.squeeze(2)
+        q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
+        kv_pe_cache = torch.cat([kv_cache, pe_cache], dim=-1)
+        this_kv_pe = torch.cat([this_kv, this_pe], dim=-1)
+        x = self.attn_backend.attn_with_kvcache(
+            q_nope_pe,
+            kv_pe_cache.view(kv_pe_cache.shape[0], kv_pe_cache.shape[1], 1, -1),
+            kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], 1, -1),
+            this_kv_pe.view(this_kv_pe.shape[0], this_kv_pe.shape[1], 1, -1),
+            this_kv.view(this_kv.shape[0], this_kv.shape[1], 1, -1),
+            cache_seqlens=cache_seqlens,
+        )
+        pe_cache[:, start_pos] = kv_pe_cache[:, start_pos, self.kv_lora_rank :]
+
+        x = self._run_output_linear(x, wkv_b)
+        return x
+
+    def decode_forward_paged(self, x: torch.Tensor, freqs_cis: torch.Tensor):
+        assert False  # TODO
+
+    def _run_output_linear(self, x, wkv_b):
         x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim :])
         x = self.wo(x.flatten(2))
-
-        if varlens is not None:  # Prefill:
-            x = x.view(bsz * seqlen, -1)
-
         return x
 
 
