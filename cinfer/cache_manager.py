@@ -549,8 +549,8 @@ class KVCacheManagerSkewAware:
             None,
         )
         if slot_last_id is not None:
-            self.k_buffer[:, slot_id, :, :, :] = self.k_buffer[:, slot_last_id, :, :, :]
-            self.v_buffer[:, slot_id, :, :, :] = self.v_buffer[:, slot_last_id, :, :, :]
+            self.k_buffer[:, slot_id] = self.k_buffer[:, slot_last_id]
+            self.v_buffer[:, slot_id] = self.v_buffer[:, slot_last_id]
             req_key = next(
                 (k for k, v in self.req2slot.items() if v == slot_last_id), None
             )
@@ -561,14 +561,14 @@ class KVCacheManagerSkewAware:
             self.slot_availability[slot_last_id] = True
             if req_id in self.req2slot:
                 self.req2slot.pop(req_id)
-            self.k_buffer[:, slot_last_id, :, :, :].zero_()
-            self.v_buffer[:, slot_last_id, :, :, :].zero_()
+            self.k_buffer[:, slot_last_id].zero_()
+            self.v_buffer[:, slot_last_id].zero_()
         else:
             self.hot_reqs[slot_id] = -1
             self.slot_availability[slot_id] = True
             self.req2slot.pop(req_id)
-            self.k_buffer[:, slot_id, :, :, :].zero_()
-            self.v_buffer[:, slot_id, :, :, :].zero_()
+            self.k_buffer[:, slot_id].zero_()
+            self.v_buffer[:, slot_id].zero_()
 
 
 class KVCacheManagerNop:

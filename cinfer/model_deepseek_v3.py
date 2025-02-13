@@ -285,19 +285,6 @@ class AttentionDeepSeekV3(Attention):
             mscale = 0.1 * mscale * math.log(args.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
-        # TODO: Use our own KV cache
-        max_batch_size: int = 1
-        self.register_buffer(
-            "kv_cache",
-            torch.zeros(max_batch_size, args.max_seq_len, self.kv_lora_rank),
-            persistent=False,
-        )
-        self.register_buffer(
-            "pe_cache",
-            torch.zeros(max_batch_size, args.max_seq_len, self.qk_rope_head_dim),
-            persistent=False,
-        )
-
     def forward(
         self,
         x: torch.Tensor,
@@ -354,26 +341,33 @@ class AttentionDeepSeekV3(Attention):
         q_nope = torch.einsum(
             "bshd,hdc->bshc", q_nope, wkv_b[:, : self.qk_nope_head_dim]
         )
-        self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
-        self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+
+        if varlens is None:  # Decode:
+            kv_cache, pe_cache = self.cache.get_cache_decode(self.layer_id)
+        else:
+            kv_cache = torch.zeros(bsz, end_pos, self.kv_lora_rank).cuda()
+            pe_cache = torch.zeros(bsz, end_pos, self.qk_rope_head_dim).cuda()
+
+        kv_cache[:, start_pos:end_pos] = self.kv_norm(kv)
+        pe_cache[:, start_pos:end_pos] = k_pe.squeeze(2)
 
         if varlens is not None:  # Prefill:
             self.cache.finalize_cache_bylayer_prefill(
-                self.kv_cache[:bsz, start_pos:end_pos],
-                self.pe_cache[:bsz, start_pos:end_pos],
+                kv_cache[:, start_pos:end_pos],
+                pe_cache[:, start_pos:end_pos],
                 self.cache.curr_req_ids,
                 self.cache.curr_varlens,
                 self.layer_id,
             )
 
         scores = (
-            torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos])
-            + torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])
+            torch.einsum("bshc,btc->bsht", q_nope, kv_cache[:, :end_pos])
+            + torch.einsum("bshr,btr->bsht", q_pe, pe_cache[:, :end_pos])
         ) * self.softmax_scale
         if mask is not None:
             scores += mask.unsqueeze(1)
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
-        x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
+        x = torch.einsum("bsht,btc->bshc", scores, kv_cache[:, :end_pos])
         x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim :])
         x = self.wo(x.flatten(2))
 
