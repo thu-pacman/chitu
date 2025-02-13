@@ -40,18 +40,51 @@ from logging import getLogger
 logger = getLogger(__name__)
 
 
-class RMSNorm(torch.nn.Module):
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization (RMSNorm).
+
+    Args:
+        dim (int): Dimension of the input tensor.
+        eps (float): Epsilon value for numerical stability. Defaults to 1e-6.
+    """
+
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
+        self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+    def _naive_norm(self, x, compute_dtype):
+        dtype = x.dtype
+        x = x.to(compute_dtype)
+        y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return y.to(dtype) * self.weight
 
-    def forward(self, x):
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+    def forward(self, x: torch.Tensor, compute_dtype=None):
+        """
+        Forward pass for RMSNorm.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            compute_dtype (torch.dtype, optional): The dtype to use for computation. Defaults to the
+                dtype of the input tensor.
+
+        Returns:
+            torch.Tensor: Normalized tensor with the same shape as input.
+        """
+        # NOTE: Although F.rms_norm uses different dtypes inside itself, and some models directly
+        # pass float16 tensors to it, our CI shows it does not work for some models, especially GPTQ
+        # quantized models. Maybe we should make the dtype optional.
+        if compute_dtype is None:
+            compute_dtype = torch.float32
+        if hasattr(F, "rms_norm"):
+            dtype = x.dtype
+            return F.rms_norm(
+                x.to(compute_dtype), (self.dim,), self.weight, self.eps
+            ).to(dtype)
+        else:  # Old PyTorch versions
+            return self._naive_norm(x, compute_dtype=compute_dtype)
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
