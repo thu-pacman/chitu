@@ -222,35 +222,6 @@ class RowParallelLinearDeepSeekV3(LinearDeepSeekV3):
         return y
 
 
-# TODO: Delete this. This should be the same with our own RMSNorm
-class RMSNormDeepSeekV3(nn.Module):
-    """
-    Root Mean Square Layer Normalization (RMSNorm).
-
-    Args:
-        dim (int): Dimension of the input tensor.
-        eps (float): Epsilon value for numerical stability. Defaults to 1e-6.
-    """
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor):
-        """
-        Forward pass for RMSNorm.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Normalized tensor with the same shape as input.
-        """
-        return F.rms_norm(x, (self.dim,), self.weight, self.eps)
-
-
 class AttentionDeepSeekV3(Attention):
     def __init__(self, args, layer_id, cache, attn_backend):
         super().__init__(layer_id, cache, attn_backend)
@@ -266,14 +237,14 @@ class AttentionDeepSeekV3(Attention):
         self.v_head_dim = args.v_head_dim
 
         self.wq_a = LinearDeepSeekV3(self.dim, self.q_lora_rank)
-        self.q_norm = RMSNormDeepSeekV3(self.q_lora_rank)
+        self.q_norm = RMSNorm(self.q_lora_rank)
         self.wq_b = ColumnParallelLinearDeepSeekV3(
             self.q_lora_rank, self.n_heads * self.qk_head_dim
         )
         self.wkv_a = LinearDeepSeekV3(
             self.dim, self.kv_lora_rank + self.qk_rope_head_dim
         )
-        self.kv_norm = RMSNormDeepSeekV3(self.kv_lora_rank)
+        self.kv_norm = RMSNorm(self.kv_lora_rank)
         self.wkv_b = ColumnParallelLinearDeepSeekV3(
             self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim)
         )
@@ -322,7 +293,8 @@ class AttentionDeepSeekV3(Attention):
         if self.q_lora_rank == 0:
             q = self.wq(x)
         else:
-            q = self.wq_b(self.q_norm(self.wq_a(x)))
+            q_a = self.wq_a(x)
+            q = self.wq_b(self.q_norm(q_a, compute_dtype=q_a.dtype))
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -348,7 +320,7 @@ class AttentionDeepSeekV3(Attention):
             kv_cache = torch.zeros(bsz, end_pos, self.kv_lora_rank).cuda()
             pe_cache = torch.zeros(bsz, end_pos, self.qk_rope_head_dim).cuda()
 
-        kv_cache[:, start_pos:end_pos] = self.kv_norm(kv)
+        kv_cache[:, start_pos:end_pos] = self.kv_norm(kv, compute_dtype=kv.dtype)
         pe_cache[:, start_pos:end_pos] = k_pe.squeeze(2)
 
         if varlens is not None:  # Prefill:
@@ -610,8 +582,8 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         self.ffn_norm = RMSNorm(args.dim)
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, varlens=None):
-        x = x + self.attn(self.attn_norm(x), freqs_cis, varlens)
-        x = x + self.ffn(self.ffn_norm(x))
+        x = x + self.attn(self.attn_norm(x, compute_dtype=x.dtype), freqs_cis, varlens)
+        x = x + self.ffn(self.ffn_norm(x, compute_dtype=x.dtype))
         return x
 
 
@@ -673,7 +645,7 @@ class TransformerDeepSeekV3(Transformer):
             )
 
     def _init_post_layers(self):
-        self.norm = RMSNormDeepSeekV3(self.params.dim)
+        self.norm = RMSNorm(self.params.dim)
         self.head = ColumnParallelLinearDeepSeekV3(
             self.params.dim, self.params.vocab_size, dtype=torch.get_default_dtype()
         )
@@ -683,7 +655,7 @@ class TransformerDeepSeekV3(Transformer):
 
     def _post_layers(self, h):
         """NOTE: _post_layers is assumed to be a token-wise computation"""
-        h = self.norm(h)
+        h = self.norm(h, compute_dtype=h.dtype)
         h = self.head(h)
         return h
 
