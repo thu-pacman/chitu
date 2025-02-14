@@ -6,11 +6,7 @@ from typing import Optional, Tuple, Mapping, List, Any
 
 import torch.distributed
 from .global_vars import set_global_variables, get_timers
-from .utils import (
-    VarLens,
-    compute_layer_dist_in_pipe,
-    is_layer,
-)
+from .utils import VarLens, compute_layer_dist_in_pipe, is_layer
 from .cache_manager import PagedKVCacheManager
 
 
@@ -24,6 +20,7 @@ from fairscale.nn.model_parallel.layers import (
 )
 from torch import nn
 import numpy as np
+
 
 # from vllm import _custom_ops as vllm_ops
 # import cinfer_backend
@@ -282,27 +279,36 @@ class Transformer(nn.Module):
         self.pipeline_exec = pipeline_parallel_size > 1
         self.tensor_exec = model_parallel_size > 1
 
+        self.tp_size = model_parallel_size
+        self.pp_size = pipeline_parallel_size
+        self.pp_stage = self.rank // self.model_parallel_size
+        self.pp_main_rank = (self.rank // model_parallel_size) * model_parallel_size
+        self.pp_end_stage = (self.world_size - 1) // model_parallel_size
+        from .backend import Backend
+
+        self.tp_group = Backend.tp_group
+
         self.params = params
         self.vocab_size = params.vocab_size
         self.global_n_layers = params.n_layers
 
         if self.pipeline_exec:
             num_layers_of_each_rank = compute_layer_dist_in_pipe(
-                self.global_n_layers, self.world_size
+                self.global_n_layers, self.pipeline_parallel_size
             )
             first_layer_id_of_each_rank = list(
                 itertools.accumulate([0] + num_layers_of_each_rank)
             )
-            self.local_begin_layer_id = first_layer_id_of_each_rank[self.rank]
-            self.local_end_layer_id = first_layer_id_of_each_rank[self.rank + 1]
+            self.local_begin_layer_id = first_layer_id_of_each_rank[self.pp_stage]
+            self.local_end_layer_id = first_layer_id_of_each_rank[self.pp_stage + 1]
         else:
             self.local_begin_layer_id = 0
             self.local_end_layer_id = self.global_n_layers
 
-        if not self.pipeline_exec or self.rank == 0:
+        if not self.pipeline_exec or self.pp_stage == 0:
             self._init_pre_layers()
         self._init_layers(cache, attn_backend=attn_backend, op_impl=op_impl)
-        if not self.pipeline_exec or self.rank == self.world_size - 1:
+        if not self.pipeline_exec or self.pp_stage == self.pipeline_parallel_size - 1:
             self._init_post_layers()
 
         self.freqs_cis = precompute_freqs_cis(
@@ -386,19 +392,14 @@ class Transformer(nn.Module):
         return partial_checkpoint
 
     def load_state_dict(self, state_dict: Mapping[str, Any], *args, **kwargs):
-        if self.pipeline_exec and not self.tensor_exec:
+        if self.pipeline_exec:
             state_dict = self._chunk_checkpoint_for_pipeline_parallel(
-                state_dict, self.global_n_layers, self.rank, self.world_size
+                state_dict, self.global_n_layers, self.pp_stage, self.pp_size
             )
-        elif self.tensor_exec and not self.pipeline_exec:
+        if self.tensor_exec:
             state_dict = self._chunk_checkpoint_for_tensor_parallel(
-                state_dict, self.rank, self.world_size
+                state_dict, self.rank % self.tp_size, self.tp_size
             )
-        elif not self.pipeline_exec and not self.tensor_exec:
-            pass
-        else:
-            raise NotImplementedError  # TODO: Hybrid parallelism
-
         super().load_state_dict(state_dict, *args, **kwargs)
 
     def _init_pre_layers(self):
@@ -469,12 +470,14 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def prefill_pipeline(self, tokens):
+
         varlens = self.cache.curr_varlens
         freqs_cis = self.prepare_freqs_cis_prefill(varlens, self.device)
 
         # start of model
-        if self.rank == 0:
-            tokens = torch.from_numpy(np.concatenate(tokens)).to(self.device)
+        # if self.rank == 0:
+        if self.pp_stage == 0:
+            # tokens = torch.from_numpy(np.concatenate(tokens)).to(self.device)
             h = self._pre_layers(tokens)
         else:
             h = tokens
@@ -482,28 +485,34 @@ class Transformer(nn.Module):
         for it, layer in enumerate(self.layers):
             h = layer(h, freqs_cis, varlens)
         # end of model
-        if self.rank == self.world_size - 1:
+        # if self.rank == self.world_size - 1:
+        if self.pp_stage == self.pp_end_stage:
             tmp = varlens.cpu_prefix_lens[1:]
             h = h[[item - 1 for item in tmp]]
             h = self._post_layers(
                 h
             )  # Exec post layers AFTER cutting the last token off
+
             h = h.float()
+
         return h
 
     @torch.inference_mode()
     def decode_pipeline(self, tokens, seq_lens):
         # generate different freqs_cis for each request, [num_req, other_freq_dim]
         freqs_cis = self.prepare_freqs_cis_decode(seq_lens, self.device)
-        if self.rank == 0:
+        # if self.rank == 0:
+        if self.pp_stage == 0:
             h = self._pre_layers(tokens)
         else:
             h = tokens
         for it, layer in enumerate(self.layers):
             h = layer(h, freqs_cis)
-        if self.rank == self.world_size - 1:
+        # if self.rank == self.world_size - 1:
+        if self.pp_stage == self.pp_end_stage:
             h = self._post_layers(h)
             h = h.float()
+
         return h
 
     @torch.inference_mode()

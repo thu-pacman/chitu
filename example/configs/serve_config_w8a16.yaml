@@ -6,7 +6,8 @@ serve:
   host: 0.0.0.0
   port: 21002
 infer:
-  parallel_type: normal
+  tp_size: 1
+  pp_size: 1
   do_load: True # set it to False for debug purpose
   seed: 0
   stop_with_eos: True

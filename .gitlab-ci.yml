@@ -138,7 +138,7 @@ tp_paged_check_nvidia:
     needs:
         - env_build_nvidia
     script:
-      - grun 2 torchrun --nproc_per_node 2 --master_port=22516 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.parallel_type=tensor
+      - grun 2 torchrun --nproc_per_node 2 --master_port=22516 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
 
 
 pp_paged_check_nvidia:
@@ -150,7 +150,19 @@ pp_paged_check_nvidia:
     needs:
         - env_build_nvidia
     script:
-      - grun 2 torchrun --nproc_per_node 2 --master_port=22517 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.parallel_type=pipe
+      - grun 2 torchrun --nproc_per_node 2 --master_port=22517 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.pp_size=2
+
+
+tp_pp_paged_check_nvidia:
+    stage: check
+    only:
+        - merge_requests
+    tags:
+        - dev
+    needs:
+        - env_build_nvidia
+    script:
+      - grun 4 torchrun --nproc_per_node 4 --master_port=22518 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2 infer.pp_size=2
 
 
 ############################################################################################################
@@ -165,7 +177,7 @@ deepseek_r1_distill_qwen_14b_nvidia:
     needs:
         - env_build_nvidia
     script:
-      - grun 2 torchrun --nproc_per_node 2 --master_port=22518 test/single_req_test.py infer.cache_type=paged models=deepseek-r1-distill-qwen-14b infer.parallel_type=tensor infer.max_reqs=1 request.max_new_tokens=4096
+      - grun 2 torchrun --nproc_per_node 2 --master_port=22519 test/single_req_test.py infer.cache_type=paged models=deepseek-r1-distill-qwen-14b infer.tp_size=2 infer.max_reqs=1 request.max_new_tokens=4096
 
 
 glm4_9b_nvidia:
@@ -177,7 +189,7 @@ glm4_9b_nvidia:
     needs:
         - env_build_nvidia
     script:
-      - grun torchrun --nproc_per_node 1 --master_port=22519 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged models=glm4-9b
+      - grun torchrun --nproc_per_node 1 --master_port=22520 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged models=glm4-9b
 
 
 llama3_8b_nvidia:
@@ -189,7 +201,7 @@ llama3_8b_nvidia:
     needs:
         - env_build_nvidia
     script:
-      - grun torchrun --nproc_per_node 1 --master_port=22520 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged models=llama3-8b infer.max_seq_len=2048
+      - grun torchrun --nproc_per_node 1 --master_port=22521 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged models=llama3-8b infer.max_seq_len=2048
 
 
 mixtral_8x7b_nvidia:
@@ -201,7 +213,7 @@ mixtral_8x7b_nvidia:
     needs:
         - env_build_nvidia
     script:
-        - grun 5 torchrun --nproc_per_node 5 --master_port=22521 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.parallel_type=pipe models=mixtral-8x7b
+        - grun 5 torchrun --nproc_per_node 5 --master_port=22522 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.pp_size=5 models=mixtral-8x7b
 
 
 ############################################################################################################
@@ -216,7 +228,7 @@ gptq_nvidia:
     needs:
         - env_build_nvidia
     script:
-      - CONFIG_NAME=serve_config_gptq grun torchrun --nproc_per_node 1 --master_port=22522 test/single_req_test.py request.max_new_tokens=64
+      - CONFIG_NAME=serve_config_gptq grun torchrun --nproc_per_node 1 --master_port=22523 test/single_req_test.py request.max_new_tokens=64
 
 
 native_layout_muxi:

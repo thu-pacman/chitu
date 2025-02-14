@@ -28,15 +28,20 @@ def cinfer_init(args):
 
 
 def remove_task_other_device(remove_task_ids):
+    # TODO handle in executor?
     if len(remove_task_ids) == 0:
         return
     # Since we are removing, any task type is fine
     task_tensor = PackedTasksBase(
         len(remove_task_ids), remove_task_ids, remove_task_ids, TaskType.Decode
     ).serialize(payload_type=SerializedPackedTasksPayloadType.EndTask, device=0)
-    if Backend.parallel_type == "pipe":
-        torch.distributed.isend(tensor=task_tensor, dst=1)
-    elif Backend.parallel_type == "tensor":
+    if Backend.args.infer.pp_size > 1:
+        torch.distributed.isend(tensor=task_tensor, dst=Backend.args.infer.tp_size)
+        if Backend.args.infer.tp_size > 1:
+            torch.distributed.broadcast(
+                tensor=task_tensor, src=Backend.pp_main_rank, group=Backend.tp_group
+            )
+    elif Backend.args.infer.tp_size > 1:
         torch.distributed.broadcast(tensor=task_tensor, src=0)
 
 
@@ -85,7 +90,8 @@ def cinfer_run():
     else:
         tasks = None
     Backend.executor.step(tasks)
-    if Backend.parallel_type == "pipe" and rank == 0:
+
+    if Backend.args.infer.pp_size > 1 and rank == 0:
         cinfer_update(task_ids, rank, world_size)
     elif rank == 0:
         TaskPool.display()

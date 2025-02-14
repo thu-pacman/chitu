@@ -44,10 +44,13 @@ DO NOT COPY SOURCE FILES OUT OF CONTROLLED DEVELOPMENT ENVIRONMENT WITHOUT PERMI
 torchrun --nproc_per_node 1 test/single_req_test.py request.max_new_tokens=64
 
 # tensor parallel
-torchrun --nproc_per_node 2 test/single_req_test.py request.max_new_tokens=64 infer.parallel_type=tensor
+torchrun --nproc_per_node 2 test/single_req_test.py request.max_new_tokens=64 infer.tp_size=2
 
 # pipeline parallel
-torchrun --nproc_per_node 2 test/single_req_test.py request.max_new_tokens=64 infer.parallel_type=pipe
+torchrun --nproc_per_node 2 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2
+
+# hybrid parallel
+torchrun --nproc_per_node 4 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=2
 
 ### NOTICE:
 # On servers with `grun`, add `grun` before command to avoid GPU conflict.
