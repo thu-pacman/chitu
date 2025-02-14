@@ -26,6 +26,20 @@ def compute_layer_dist_in_pipe(num_layers, world_size):
     return num_layers_of_each_rank
 
 
+def generate_rank_list(tp_size: int, pp_size: int):
+    ranks = []
+    rank = 0
+
+    for pp in range(pp_size):
+        pp_ranks = []
+        for tp in range(tp_size):
+            pp_ranks.append(rank)
+            rank += 1
+        ranks.append(pp_ranks)
+
+    return ranks
+
+
 def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -101,3 +115,8 @@ def merge_column_parallel_biases(biases, model_parallel_size):
     ret_bias = torch.cat(new_biases, dim=1)
     ret_bias = ret_bias.reshape(-1)
     return ret_bias
+
+
+def print_d(*args, **kargs):
+    # return
+    print(f">>> rank{torch.distributed.get_rank()}:", *args, **kargs)

@@ -423,7 +423,7 @@ class TransformerHFLlama(Transformer):
             "gate_proj",  # for compatibility if not using merge_gate_up
             "up_proj",  # for compatibility if not using merge_gate_up
             "lm_head",
-            "embed_tokens",
+            # "embed_tokens",
         ]
 
     def _get_tensor_row_parallel_layer_names(self) -> List[str]:
@@ -629,8 +629,11 @@ class TransformerHFLlama(Transformer):
         super().load_state_dict(state_dict, *args, **kwargs)
 
     def _init_pre_layers(self):
-        self.embed_tokens = VocabParallelEmbedding(
-            self.params.vocab_size, self.params.dim, init_method=lambda x: x
+        # self.embed_tokens = VocabParallelEmbedding(
+        #     self.params.vocab_size, self.params.dim, init_method=lambda x: x
+        # )
+        self.embed_tokens = nn.Embedding(
+            num_embeddings=self.params.vocab_size, embedding_dim=self.params.dim
         )
 
     def _init_layers(self, cache, attn_backend, op_impl):
