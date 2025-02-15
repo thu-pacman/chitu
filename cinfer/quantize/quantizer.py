@@ -3,17 +3,10 @@ import torch
 import bitsandbytes as bnb
 
 
-from cinfer.model import *
-
-from cinfer.tokenizer import Tokenizer, ChatFormat
-
-import cinfer.awq as awq
-
-from fairscale.nn.model_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    VocabParallelEmbedding,
-)
+from ..model import *
+from ..tokenizer import Tokenizer, ChatFormat
+from .. import awq
+from ..tensor_parallel import ColumnParallelLinear, RowParallelLinear
 
 # import cinfer.evaluator as eval
 

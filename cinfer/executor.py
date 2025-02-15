@@ -19,6 +19,7 @@ from .backend import Backend, BackendState
 from .utils import VarLens, top_k_top_p_min_p_sampling_from_probs_torch
 from .cache_manager import PagedKVCacheManager
 from .global_vars import get_timers, get_dtype
+from .tensor_parallel import get_tp_group
 from logging import getLogger
 
 logger = getLogger(__name__)
@@ -80,7 +81,9 @@ class NormalExecutor(Executor):
 
     def update_response(self, tasks: PackedTasks, logits: torch.Tensor):
         logits = logits.view(-1, logits.shape[-1])
-        assert len(tasks.tasks) == logits.shape[0]
+        assert (
+            len(tasks.tasks) == logits.shape[0]
+        ), f"logtis has shape {logits.shape}, but there are {len(tasks.tasks)} tasks"
         for it, task in enumerate(tasks.tasks):
             if (
                 task.req.params.frequency_penalty > 0
@@ -172,7 +175,7 @@ class PipeTensorExecutor(NormalExecutor):
         self.pp_main_rank = Backend.pp_main_rank
         self.pp_end_stage = Backend.pp_end_stage
         self.last_pp_main_rank = self.pp_end_stage * self.tp_size
-        self.tp_group = Backend.tp_group
+        self.tp_group = get_tp_group()
 
     def prefill_step(self, tasks: PackedTasksBase):
         varlens = VarLens(tasks.tokens, device=self.local_rank)
@@ -217,13 +220,15 @@ class PipeTensorExecutor(NormalExecutor):
         self.timers("prefill").stop()
         if self.rank == self.pp_main_rank and self.pp_stage != self.pp_end_stage:
             torch.distributed.isend(
-                tensor=out, dst=self.rank + self.tp_size, tag=HIDDEN_TENSOR_TAG
+                tensor=out.contiguous(),  # contiguous() is necessary for NCCL
+                dst=self.rank + self.tp_size,
+                tag=HIDDEN_TENSOR_TAG,
             )
         elif self.rank == self.pp_main_rank and self.pp_stage == self.pp_end_stage:
             # send logits to rank 0 to get response words
             torch.cuda.synchronize(self.local_rank)
             torch.distributed.isend(
-                out,
+                tensor=out.contiguous(),  # contiguous() is necessary for NCCL
                 dst=0,
                 tag=LOGIT_TAG,
             )
@@ -269,12 +274,18 @@ class PipeTensorExecutor(NormalExecutor):
         self.timers("decode").stop()
         if self.rank == self.pp_main_rank and self.pp_stage != self.pp_end_stage:
             torch.distributed.isend(
-                tensor=out, dst=self.rank + self.tp_size, tag=HIDDEN_TENSOR_TAG
+                tensor=out.contiguous(),  # contiguous() is necessary for NCCL
+                dst=self.rank + self.tp_size,
+                tag=HIDDEN_TENSOR_TAG,
             )
         elif self.rank == self.pp_main_rank and self.pp_stage == self.pp_end_stage:
             # Send logits to rank 0 to get response words
             out = out.view(out.shape[0], -1)
-            torch.distributed.isend(out, dst=0, tag=LOGIT_TAG)
+            torch.distributed.isend(
+                out.contiguous(),  # contiguous() is necessary for NCCL
+                dst=0,
+                tag=LOGIT_TAG,
+            )
         Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return out
 

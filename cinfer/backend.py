@@ -1,7 +1,3 @@
-from fairscale.nn.model_parallel.initialize import (
-    initialize_model_parallel,
-    model_parallel_is_initialized,
-)
 import torch
 import gc
 import itertools
@@ -17,12 +13,12 @@ from .cache_manager import (
     PagedKVCacheManager,
     KVCacheManagerNop,
 )
+from .tensor_parallel import init_tp, get_tp_size
 from .attn_backend import FlashAttnBackend, RefAttnBackend
 from .model_llama import TransformerLlama
 from .model_hf_llama import TransformerHFLlama
 from .model_hf_mixtral import TransformerHFMixtral
-from .utils import compute_layer_dist_in_pipe, generate_rank_list
-import fairscale.nn.model_parallel.initialize as fs_init
+from .utils import compute_layer_dist_in_pipe
 
 from logging import getLogger
 
@@ -45,7 +41,6 @@ class Backend:
     ongoing_reqs = []
     cache_type = ""
     state = BackendState.Running
-    tp_group = None
     pp_stage = None
     pp_end_stage = None
     pp_main_rank = None
@@ -78,12 +73,7 @@ class Backend:
         ), "World size not match"
         torch.cuda.set_device(local_rank)
 
-        rank_list = generate_rank_list(model_parallel_size, pipeline_parallel_size)
-        for ranks in rank_list:
-            pg = torch.distributed.new_group(ranks)
-            if global_rank in ranks:
-
-                Backend.tp_group = pg
+        init_tp(model_parallel_size, pipeline_parallel_size)
 
         Backend.pp_stage = global_rank // model_parallel_size
         Backend.pp_end_stage = (world_size - 1) // model_parallel_size
@@ -91,8 +81,6 @@ class Backend:
             global_rank // model_parallel_size
         ) * model_parallel_size
 
-        if not model_parallel_is_initialized():
-            initialize_model_parallel(model_parallel_size)
         torch.manual_seed(args.infer.seed)
 
         if global_rank > 0:
@@ -149,7 +137,6 @@ class Backend:
         else:
             local_begin_layer_id = 0
             local_end_layer_id = args.models.n_layers
-        model_parallel_size = fs_init.get_model_parallel_world_size()
 
         n_kv_heads = args.models.n_kv_heads
         n_local_kv_heads = n_kv_heads // model_parallel_size
