@@ -175,8 +175,6 @@ setup(
         # Don't put `torch` here because it requires downloading from a specific source
         "transformers",
         "flash-attn",
-        "fairscale @ file://localhost"
-        + os.path.join(setup_dir, "third_party/fairscale"),
         "fire",
         "tiktoken>=0.7.0",  # Required by glm4
         "blobfile",

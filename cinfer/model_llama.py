@@ -1,10 +1,11 @@
-from .model import Attention, Transformer, TransformerBlock, RMSNorm
 from torch import nn
 from typing import Optional, List
 import torch
 import torch.nn.functional as F
-import fairscale.nn.model_parallel.initialize as fs_init
-from fairscale.nn.model_parallel.layers import (
+
+from .model import Attention, Transformer, TransformerBlock, RMSNorm
+from .tensor_parallel import (
+    get_tp_size,
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
@@ -15,7 +16,7 @@ class AttentionLlama(Attention):
     def __init__(self, args, layer_id, cache, attn_backend):
         super().__init__(layer_id, cache, attn_backend)
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        model_parallel_size = fs_init.get_model_parallel_world_size()
+        model_parallel_size = get_tp_size()
         self.n_local_heads = args.n_heads // model_parallel_size
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
@@ -24,30 +25,26 @@ class AttentionLlama(Attention):
         self.wq = ColumnParallelLinear(
             args.dim,
             args.n_heads * self.head_dim,
-            bias=False,
+            has_bias=False,
             gather_output=False,
-            init_method=lambda x: x,
         )
         self.wk = ColumnParallelLinear(
             args.dim,
             self.n_kv_heads * self.head_dim,
-            bias=False,
+            has_bias=False,
             gather_output=False,
-            init_method=lambda x: x,
         )
         self.wv = ColumnParallelLinear(
             args.dim,
             self.n_kv_heads * self.head_dim,
-            bias=False,
+            has_bias=False,
             gather_output=False,
-            init_method=lambda x: x,
         )
         self.wo = RowParallelLinear(
             args.n_heads * self.head_dim,
             args.dim,
-            bias=False,
+            has_bias=False,
             input_is_parallel=True,
-            init_method=lambda x: x,
         )
 
     def _run_linear(self, x):
@@ -97,7 +94,7 @@ class TransformerLlama(Transformer):
 
     def _init_pre_layers(self):
         self.tok_embeddings = VocabParallelEmbedding(
-            self.params.vocab_size, self.params.dim, init_method=lambda x: x
+            self.params.vocab_size, self.params.dim
         )
 
     def _init_layers(self, cache, attn_backend, op_impl):
@@ -112,7 +109,7 @@ class TransformerLlama(Transformer):
     def _init_post_layers(self):
         self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps)
         self.output = ColumnParallelLinear(
-            self.params.dim, self.params.vocab_size, bias=False, init_method=lambda x: x
+            self.params.dim, self.params.vocab_size, has_bias=False
         )
 
     def _pre_layers(self, h):
@@ -141,13 +138,13 @@ class FeedForwardLlama(nn.Module):
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
         self.w1 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+            dim, hidden_dim, has_bias=False, gather_output=False
         )
         self.w2 = RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
+            hidden_dim, dim, has_bias=False, input_is_parallel=True
         )
         self.w3 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+            dim, hidden_dim, has_bias=False, gather_output=False
         )
 
     def forward(self, x):

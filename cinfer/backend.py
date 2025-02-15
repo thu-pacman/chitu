@@ -1,7 +1,3 @@
-from fairscale.nn.model_parallel.initialize import (
-    initialize_model_parallel,
-    model_parallel_is_initialized,
-)
 import torch
 import gc
 import itertools
@@ -20,13 +16,13 @@ from .cache_manager import (
     PagedKVCacheManager,
     KVCacheManagerNop,
 )
+from .tensor_parallel import init_tp, get_tp_size
 from .attn_backend import FlashAttnBackend, RefAttnBackend
 from .model_llama import TransformerLlama
 from .model_deepseek_v3 import TransformerDeepSeekV3
 from .model_hf_llama import TransformerHFLlama
 from .model_hf_mixtral import TransformerHFMixtral
 from .utils import compute_layer_dist_in_pipe
-import fairscale.nn.model_parallel.initialize as fs_init
 
 from logging import getLogger
 
@@ -48,8 +44,10 @@ class Backend:
     curr_req_ids = None
     ongoing_reqs = []
     cache_type = ""
-    parallel_type = ""
     state = BackendState.Running
+    pp_stage = None
+    pp_end_stage = None
+    pp_main_rank = None
 
     @staticmethod
     def build_model(args, cache, *extra_args, **extra_kwargs):
@@ -70,21 +68,24 @@ class Backend:
     def build(args):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group("nccl")
-        if args.infer.parallel_type == "tensor":
-            model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
-            pipeline_parallel_size = 1
-        else:
-            model_parallel_size = 1
-            pipeline_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
-        if not model_parallel_is_initialized():
-            initialize_model_parallel(model_parallel_size)
-
-        Backend.parallel_type = args.infer.parallel_type
+        model_parallel_size = args.infer.tp_size
+        pipeline_parallel_size = args.infer.pp_size
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         global_rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
+        assert (
+            world_size == model_parallel_size * pipeline_parallel_size
+        ), "World size not match"
         torch.cuda.set_device(local_rank)
+
+        init_tp(model_parallel_size, pipeline_parallel_size)
+
+        Backend.pp_stage = global_rank // model_parallel_size
+        Backend.pp_end_stage = (world_size - 1) // model_parallel_size
+        Backend.pp_main_rank = (
+            global_rank // model_parallel_size
+        ) * model_parallel_size
 
         torch.manual_seed(args.infer.seed)
 
@@ -138,19 +139,18 @@ class Backend:
             Backend.formatter = ChatFormat(tokenizer)
 
         # Init cache
-        if args.infer.parallel_type == "pipe":
+        if pipeline_parallel_size > 1:
             num_layers_of_each_rank = compute_layer_dist_in_pipe(
                 args.models.n_layers, pipeline_parallel_size
             )
             first_layer_id_of_each_rank = list(
                 itertools.accumulate([0] + num_layers_of_each_rank)
             )
-            local_begin_layer_id = first_layer_id_of_each_rank[global_rank]
-            local_end_layer_id = first_layer_id_of_each_rank[global_rank + 1]
+            local_begin_layer_id = first_layer_id_of_each_rank[Backend.pp_stage]
+            local_end_layer_id = first_layer_id_of_each_rank[Backend.pp_stage + 1]
         else:
             local_begin_layer_id = 0
             local_end_layer_id = args.models.n_layers
-        model_parallel_size = fs_init.get_model_parallel_world_size()
         kv_cache_kvargs = {}
         if args.models.type == "deepseek-v3":
             kv_cache_kvargs["k_shape_per_sample"] = (args.models.kv_lora_rank,)

@@ -101,3 +101,8 @@ def merge_column_parallel_biases(biases, model_parallel_size):
     ret_bias = torch.cat(new_biases, dim=1)
     ret_bias = ret_bias.reshape(-1)
     return ret_bias
+
+
+def print_d(*args, **kargs):
+    # return
+    print(f">>> rank{torch.distributed.get_rank()}:", *args, **kargs)

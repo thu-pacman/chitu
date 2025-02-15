@@ -19,6 +19,7 @@ from .backend import Backend, BackendState
 from .utils import VarLens, top_k_top_p_min_p_sampling_from_probs_torch
 from .cache_manager import PagedKVCacheManager
 from .global_vars import get_timers, get_dtype
+from .tensor_parallel import get_tp_group
 from logging import getLogger
 
 logger = getLogger(__name__)
@@ -39,9 +40,9 @@ class OngoingRequests:
 class Executor:
     @staticmethod
     def build(args):
-        if args.infer.parallel_type == "pipe":
-            return PipeExecutor(args)
-        elif args.infer.parallel_type == "tensor":
+        if args.infer.pp_size > 1:
+            return PipeTensorExecutor(args)
+        elif args.infer.tp_size > 1:
             return TensorExecutor(args)
         else:
             return NormalExecutor(args)
@@ -80,7 +81,9 @@ class NormalExecutor(Executor):
 
     def update_response(self, tasks: PackedTasks, logits: torch.Tensor):
         logits = logits.view(-1, logits.shape[-1])
-        assert len(tasks.tasks) == logits.shape[0]
+        assert (
+            len(tasks.tasks) == logits.shape[0]
+        ), f"logtis has shape {logits.shape}, but there are {len(tasks.tasks)} tasks"
         for it, task in enumerate(tasks.tasks):
             if (
                 task.req.params.frequency_penalty > 0
@@ -159,48 +162,74 @@ class NormalExecutor(Executor):
             raise NotImplementedError  # Hybrid task not implemented
 
 
-class PipeExecutor(NormalExecutor):
+class PipeTensorExecutor(NormalExecutor):
 
     def __init__(self, args):
         super().__init__(args)
         self.rank = torch.distributed.get_rank()
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = torch.distributed.get_world_size()
+        self.tp_size = args.infer.tp_size
+        self.pp_size = args.infer.pp_size
+        self.pp_stage = Backend.pp_stage
+        self.pp_main_rank = Backend.pp_main_rank
+        self.pp_end_stage = Backend.pp_end_stage
+        self.last_pp_main_rank = self.pp_end_stage * self.tp_size
+        self.tp_group = get_tp_group()
 
     def prefill_step(self, tasks: PackedTasksBase):
         print(f"!!! {self.rank}: prefill step (A)")
         varlens = VarLens(tasks.tokens, device=self.local_rank)
         Backend.cache_manager.curr_varlens = varlens
         Backend.cache_manager.curr_req_ids = tasks.req_ids
+
         if self.rank == 0:
-            inp = tasks.tokens
+            inp = torch.from_numpy(np.concatenate(tasks.tokens)).to(self.local_rank)
+            if self.tp_size > 1:
+                torch.distributed.broadcast(
+                    tensor=inp, src=self.pp_main_rank, group=self.tp_group
+                )  # TODO main rank 处理统一放后面
         else:
             use_half = get_dtype()
-            inp = torch.empty(
-                [
-                    sum([len(token) for token in tasks.tokens]),
-                    Backend.model.params.dim,
-                ],
-                device=self.local_rank,
-                dtype=torch.float16 if use_half else torch.bfloat16,
-            )
-            torch.distributed.recv(tensor=inp, src=self.rank - 1, tag=HIDDEN_TENSOR_TAG)
-        print(f"!!! {self.rank}: prefill step (B)")
+            if self.pp_stage == 0:
+                inp = torch.empty(
+                    [sum(len(seq) for seq in tasks.tokens)],
+                    dtype=torch.int64,
+                    device=self.local_rank,
+                )
+            else:
+                inp = torch.empty(
+                    [
+                        sum([len(token) for token in tasks.tokens]),
+                        Backend.model.params.dim,
+                    ],
+                    device=self.local_rank,
+                    dtype=torch.float16 if use_half else torch.bfloat16,
+                )
+            if self.rank == self.pp_main_rank:
+                torch.distributed.recv(
+                    tensor=inp, src=self.rank - self.tp_size, tag=HIDDEN_TENSOR_TAG
+                )
+            if self.tp_size > 1:
+                torch.distributed.broadcast(
+                    tensor=inp, src=self.pp_main_rank, group=self.tp_group
+                )
         self.timers("prefill").start()
+
         out = Backend.model.prefill(inp)
+
         self.timers("prefill").stop()
-        print(
-            f"!!! {self.rank}: prefill step (C), out.shape={out.shape} out.dtype={out.dtype}"
-        )
-        if self.rank < self.world_size - 1:
+        if self.rank == self.pp_main_rank and self.pp_stage != self.pp_end_stage:
             torch.distributed.isend(
-                tensor=out, dst=self.rank + 1, tag=HIDDEN_TENSOR_TAG
+                tensor=out.contiguous(),  # contiguous() is necessary for NCCL
+                dst=self.rank + self.tp_size,
+                tag=HIDDEN_TENSOR_TAG,
             )
-        else:
+        elif self.rank == self.pp_main_rank and self.pp_stage == self.pp_end_stage:
             # send logits to rank 0 to get response words
             torch.cuda.synchronize(self.local_rank)
             torch.distributed.isend(
-                out,
+                tensor=out.contiguous(),  # contiguous() is necessary for NCCL
                 dst=0,
                 tag=LOGIT_TAG,
             )
@@ -215,29 +244,51 @@ class PipeExecutor(NormalExecutor):
         if isinstance(Backend.cache_manager, PagedKVCacheManager):
             Backend.cache_manager.prepare_block_table_for_decode(tasks.req_ids)
         if self.rank == 0:
-            inp = self._prepare_new_tokens_for_decode(tasks)
+            inp = self._prepare_new_tokens_for_decode(tasks)  # tensor
+            if self.tp_size > 1:
+                torch.distributed.broadcast(
+                    tensor=inp, src=self.pp_main_rank, group=self.tp_group
+                )
         else:
             use_half = get_dtype()
-            inp = torch.empty(
-                [tasks.num_tasks, 1, Backend.model.params.dim],
-                device=self.local_rank,
-                dtype=torch.float16 if use_half else torch.bfloat16,
-            )
-            torch.distributed.recv(tensor=inp, src=self.rank - 1, tag=HIDDEN_TENSOR_TAG)
+            if self.pp_stage == 0:
+                inp = torch.empty(
+                    [tasks.num_tasks, 1], dtype=torch.int64, device=self.local_rank
+                )
+            else:
+                inp = torch.empty(
+                    [tasks.num_tasks, 1, Backend.model.params.dim],
+                    device=self.local_rank,
+                    dtype=torch.float16 if use_half else torch.bfloat16,
+                )
+            if self.rank == self.pp_main_rank:
+                torch.distributed.recv(
+                    tensor=inp, src=self.rank - self.tp_size, tag=HIDDEN_TENSOR_TAG
+                )
+            if self.tp_size > 1:
+                torch.distributed.broadcast(
+                    tensor=inp, src=self.pp_main_rank, group=self.tp_group
+                )
         self.timers("decode").start()
         seq_lens = self._prepare_seq_lens_for_decode(tasks)
         self.timers("decode-model").start()
         out = Backend.model.decode(inp, seq_lens)
         self.timers("decode-model").stop()
         self.timers("decode").stop()
-        if self.rank < self.world_size - 1:
+        if self.rank == self.pp_main_rank and self.pp_stage != self.pp_end_stage:
             torch.distributed.isend(
-                tensor=out, dst=self.rank + 1, tag=HIDDEN_TENSOR_TAG
+                tensor=out.contiguous(),  # contiguous() is necessary for NCCL
+                dst=self.rank + self.tp_size,
+                tag=HIDDEN_TENSOR_TAG,
             )
-        else:
+        elif self.rank == self.pp_main_rank and self.pp_stage == self.pp_end_stage:
             # Send logits to rank 0 to get response words
             out = out.view(out.shape[0], -1)
-            torch.distributed.isend(out, dst=0, tag=LOGIT_TAG)
+            torch.distributed.isend(
+                out.contiguous(),  # contiguous() is necessary for NCCL
+                dst=0,
+                tag=LOGIT_TAG,
+            )
         Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return out
 
@@ -247,7 +298,9 @@ class PipeExecutor(NormalExecutor):
             device=self.local_rank,
             dtype=torch.float,
         )
-        handle = torch.distributed.irecv(logits, src=self.world_size - 1, tag=LOGIT_TAG)
+        handle = torch.distributed.irecv(
+            logits, src=self.last_pp_main_rank, tag=LOGIT_TAG
+        )
         Backend.ongoing_reqs.append(OngoingRequests(tasks, handle, logits))
         for it, task in enumerate(tasks.tasks):
             task.wait(handle)
@@ -265,21 +318,32 @@ class PipeExecutor(NormalExecutor):
                     SerializedPackedTasksPayloadType.TerminateBackend,
                     device=self.local_rank,
                 )
+            if self.tp_size > 1:
+                torch.distributed.broadcast(
+                    tensor=task_tensor, src=self.pp_main_rank, group=self.tp_group
+                )
+
         else:
             task_tensor = PackedTasksBase.empty_serialization(device=self.local_rank)
-            torch.distributed.recv(
-                tensor=task_tensor, src=self.rank - 1, tag=TASK_TENSOR_TAG
-            )
+            if self.rank == self.pp_main_rank:
+                torch.distributed.recv(
+                    tensor=task_tensor,
+                    src=self.rank - self.tp_size,
+                    tag=TASK_TENSOR_TAG,
+                )
+            if self.tp_size > 1:
+                torch.distributed.broadcast(
+                    tensor=task_tensor, src=self.pp_main_rank, group=self.tp_group
+                )
             task_tensor_type, tasks = PackedTasksBase.deserialize(task_tensor)
             if task_tensor_type == SerializedPackedTasksPayloadType.TerminateBackend:
                 Backend.state = BackendState.Terminating
             if task_tensor_type == SerializedPackedTasksPayloadType.EndTask:
                 remove_kvcache = True
 
-        # Rank < world_size - 1 send task tensor to Rank + 1
-        if self.rank < self.world_size - 1:
+        if self.rank == self.pp_main_rank and self.pp_stage != self.pp_end_stage:
             torch.distributed.isend(
-                tensor=task_tensor, dst=self.rank + 1, tag=TASK_TENSOR_TAG
+                tensor=task_tensor, dst=self.rank + self.tp_size, tag=TASK_TENSOR_TAG
             )
 
         if Backend.state == BackendState.Terminating:
@@ -300,6 +364,7 @@ class PipeExecutor(NormalExecutor):
     ):
         # Run tasks
         super().step(tasks)
+
         if Backend.state == BackendState.Terminated:
             return
         # Rank 0 recv final logits from Rank world_size - 1
@@ -387,6 +452,8 @@ class TensorExecutor(NormalExecutor):
             tokens = torch.tensor(
                 tokens, dtype=torch.int64, device=self.local_rank
             ).unsqueeze(1)
+            # TODO
+            # inp = self._prepare_new_tokens_for_decode(tasks)
         else:
             tokens = torch.empty(
                 [tasks.num_tasks, 1], dtype=torch.int64, device=self.local_rank

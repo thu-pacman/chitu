@@ -3,12 +3,6 @@ from torch import nn
 from typing import Optional, List, Mapping, Any
 import torch
 import torch.nn.functional as F
-import fairscale.nn.model_parallel.initialize as fs_init
-from fairscale.nn.model_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    VocabParallelEmbedding,
-)
 import flash_attn
 from logging import getLogger
 
@@ -16,6 +10,12 @@ from .ops import apply_rotary_pos_emb_triton
 from .utils import (
     merge_column_parallel_weights,
     merge_column_parallel_biases,
+)
+from .tensor_parallel import (
+    get_tp_size,
+    ColumnParallelLinear,
+    RowParallelLinear,
+    VocabParallelEmbedding,
 )
 from .muxi_utils import (
     preprocess_weights_for_native_layout,
@@ -44,7 +44,7 @@ class AttentionHFLlama(Attention):
         self.merge_qkv = merge_qkv
 
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        model_parallel_size = fs_init.get_model_parallel_world_size()
+        model_parallel_size = get_tp_size()
         self.n_local_heads = args.n_heads // model_parallel_size
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
@@ -64,42 +64,37 @@ class AttentionHFLlama(Attention):
             self.qkv_proj = ColumnParallelLinear(
                 args.dim,
                 (args.n_heads + 2 * self.n_kv_heads) * self.head_dim,
-                bias=qkv_has_bias,
+                has_bias=qkv_has_bias,
                 gather_output=False,
-                init_method=lambda x: x,
                 linear_op=qkv_proj_linear,
             )
         else:
             self.q_proj = ColumnParallelLinear(
                 args.dim,
                 args.n_heads * self.head_dim,
-                bias=qkv_has_bias,
+                has_bias=qkv_has_bias,
                 gather_output=False,
-                init_method=lambda x: x,
                 linear_op=qkv_proj_linear,
             )
             self.k_proj = ColumnParallelLinear(
                 args.dim,
                 self.n_kv_heads * self.head_dim,
-                bias=qkv_has_bias,
+                has_bias=qkv_has_bias,
                 gather_output=False,
-                init_method=lambda x: x,
                 linear_op=qkv_proj_linear,
             )
             self.v_proj = ColumnParallelLinear(
                 args.dim,
                 self.n_kv_heads * self.head_dim,
-                bias=qkv_has_bias,
+                has_bias=qkv_has_bias,
                 gather_output=False,
-                init_method=lambda x: x,
                 linear_op=qkv_proj_linear,
             )
         self.o_proj = RowParallelLinear(
             args.n_heads * self.head_dim,
             args.dim,
-            bias=o_has_bias,
+            has_bias=o_has_bias,
             input_is_parallel=True,
-            init_method=lambda x: x,
             linear_op=o_proj_linear,
         )
         self.rotary_emb = RotaryEmbeddingHFLlama(
@@ -292,34 +287,30 @@ class FeedForwardHFLlama(nn.Module):
             self.gate_up_proj = ColumnParallelLinear(
                 dim,
                 hidden_dim * 2,
-                bias=False,
+                has_bias=False,
                 gather_output=False,
-                init_method=lambda x: x,
                 linear_op=gate_up_proj_linear,
             )
         else:
             self.gate_proj = ColumnParallelLinear(
                 dim,
                 hidden_dim,
-                bias=False,
+                has_bias=False,
                 gather_output=False,
-                init_method=lambda x: x,
                 linear_op=gate_up_proj_linear,
             )
             self.up_proj = ColumnParallelLinear(
                 dim,
                 hidden_dim,
-                bias=False,
+                has_bias=False,
                 gather_output=False,
-                init_method=lambda x: x,
                 linear_op=gate_up_proj_linear,
             )
         self.down_proj = RowParallelLinear(
             hidden_dim,
             dim,
-            bias=False,
+            has_bias=False,
             input_is_parallel=True,
-            init_method=lambda x: x,
             linear_op=down_proj_linear,
         )
 
@@ -630,7 +621,7 @@ class TransformerHFLlama(Transformer):
 
     def _init_pre_layers(self):
         self.embed_tokens = VocabParallelEmbedding(
-            self.params.vocab_size, self.params.dim, init_method=lambda x: x
+            num_embeddings=self.params.vocab_size, embedding_dim=self.params.dim
         )
 
     def _init_layers(self, cache, attn_backend, op_impl):
@@ -651,7 +642,7 @@ class TransformerHFLlama(Transformer):
     def _init_post_layers(self):
         self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps)
         self.lm_head = ColumnParallelLinear(
-            self.params.dim, self.params.vocab_size, bias=False, init_method=lambda x: x
+            self.params.dim, self.params.vocab_size, has_bias=False
         )
 
     def _pre_layers(self, h):

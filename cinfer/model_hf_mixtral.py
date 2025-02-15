@@ -4,8 +4,7 @@ from typing import List, Mapping, Any
 import torch
 from torch import nn
 
-from fairscale.nn.model_parallel.layers import ColumnParallelLinear, RowParallelLinear
-
+from .tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from .model_hf_llama import (
     FeedForwardHFLlama,
     TransformerBlockHFLlama,
@@ -36,11 +35,7 @@ class SparseMoeBlockHFMixtral(nn.Module):
 
         # num_experts is very low, so don't use ColumnParallelLinear
         self.gate = RowParallelLinear(
-            dim,
-            num_experts,
-            bias=False,
-            input_is_parallel=False,
-            init_method=lambda x: x,
+            dim, num_experts, has_bias=False, input_is_parallel=False
         )
 
         self.experts = nn.ModuleList(
