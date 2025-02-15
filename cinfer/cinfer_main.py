@@ -10,6 +10,7 @@ from .task import (
     TaskType,
 )
 from .backend import Backend, BackendState
+from .tensor_parallel import get_tp_group
 import torch
 from logging import getLogger
 
@@ -39,7 +40,7 @@ def remove_task_other_device(remove_task_ids):
         torch.distributed.isend(tensor=task_tensor, dst=Backend.args.infer.tp_size)
         if Backend.args.infer.tp_size > 1:
             torch.distributed.broadcast(
-                tensor=task_tensor, src=Backend.pp_main_rank, group=Backend.tp_group
+                tensor=task_tensor, src=Backend.pp_main_rank, group=get_tp_group()
             )
     elif Backend.args.infer.tp_size > 1:
         torch.distributed.broadcast(tensor=task_tensor, src=0)

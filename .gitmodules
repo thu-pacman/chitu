@@ -19,6 +19,3 @@
 [submodule "third_party/muxi_layout_kernels"]
     path = third_party/muxi_layout_kernels
     url = https://git.qcjzai.cn/baichenhan/layoutabc_gemm_torch.git
-[submodule "third_party/fairscale"]
-    path = third_party/fairscale
-    url = https://git.qcjzai.cn/tangshizhi/fairscale.git

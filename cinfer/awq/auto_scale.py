@@ -5,7 +5,7 @@ import torch.nn as nn
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaRMSNorm
 from transformers.activations import GELUActivation
 
-from cinfer.awq.qmodule import (
+from .qmodule import (
     ScaledActivation,
     get_op_by_name,
     get_op_name,
@@ -13,11 +13,7 @@ from cinfer.awq.qmodule import (
     append_str_prefix,
     pseudo_quantize_tensor,
 )
-from fairscale.nn.model_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    VocabParallelEmbedding,
-)
+from ..tensor_parallel import ColumnParallelLinear, RowParallelLinear
 
 
 __all__ = ["auto_scale_block", "apply_scale"]

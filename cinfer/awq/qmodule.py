@@ -4,11 +4,8 @@ import torch.nn as nn
 import awq_inference_engine  # with CUDA kernels
 import tqdm
 import gc
-from fairscale.nn.model_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    VocabParallelEmbedding,
-)
+
+from ..tensor_parallel import ColumnParallelLinear, RowParallelLinear
 
 
 def get_op_by_name(module, op_name):

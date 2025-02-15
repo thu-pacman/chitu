@@ -4,31 +4,22 @@ import itertools
 from dataclasses import dataclass
 from typing import Optional, Tuple, Mapping, List, Any
 
+import torch
 import torch.distributed
+import torch.nn.functional as F
+from torch import nn
+
+import numpy as np
+
 from .global_vars import set_global_variables, get_timers
 from .utils import VarLens, compute_layer_dist_in_pipe, is_layer
 from .cache_manager import PagedKVCacheManager
-
-
-import fairscale.nn.model_parallel.initialize as fs_init
-import torch
-import torch.nn.functional as F
-from fairscale.nn.model_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    VocabParallelEmbedding,
-)
-from torch import nn
-import numpy as np
+from .tensor_parallel import get_tp_group
 
 
 # from vllm import _custom_ops as vllm_ops
 # import cinfer_backend
 
-from fairscale.nn.model_parallel.initialize import (
-    initialize_model_parallel,
-    model_parallel_is_initialized,
-)
 from .tokenizer import Tokenizer, ChatFormat, TokenizerHF, ChatFormatHF
 from pathlib import Path
 import os, sys, json, time
@@ -284,9 +275,7 @@ class Transformer(nn.Module):
         self.pp_stage = self.rank // self.model_parallel_size
         self.pp_main_rank = (self.rank // model_parallel_size) * model_parallel_size
         self.pp_end_stage = (self.world_size - 1) // model_parallel_size
-        from .backend import Backend
-
-        self.tp_group = Backend.tp_group
+        self.tp_group = get_tp_group()
 
         self.params = params
         self.vocab_size = params.vocab_size
@@ -382,11 +371,25 @@ class Transformer(nn.Module):
 
         for name, param in checkpoint.items():
             if any(is_layer(s, name) for s in cpl_names):
-                chunks = torch.chunk(param, world_size, dim=0)
-                partial_checkpoint[name] = chunks[rank]
+                if name.endswith("weight"):
+                    chunks = torch.chunk(param, world_size, dim=0)
+                    partial_checkpoint[name] = chunks[rank]
+                elif name.endswith("bias"):
+                    chunks = torch.chunk(param, world_size, dim=-1)
+                    partial_checkpoint[name] = chunks[rank]
+                else:
+                    assert False, f"Illegal parallel tensor {name}"
             elif any(is_layer(s, name) for s in rpl_names):
-                chunks = torch.chunk(param, world_size, dim=1)
-                partial_checkpoint[name] = chunks[rank]
+                if name.endswith("weight"):
+                    chunks = torch.chunk(param, world_size, dim=1)
+                    partial_checkpoint[name] = chunks[rank]
+                elif name.endswith("bias"):
+                    # Rank 0 needs a full bias and only rank 0 needs it
+                    rank = torch.distributed.get_rank(group=get_tp_group())
+                    if rank == 0:
+                        partial_checkpoint[name] = param
+                else:
+                    assert False, f"Illegal parallel tensor {name}"
             else:
                 partial_checkpoint[name] = param
         return partial_checkpoint
