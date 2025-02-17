@@ -18,7 +18,7 @@ from .task import (
 from .backend import Backend, BackendState
 from .utils import VarLens, top_k_top_p_min_p_sampling_from_probs_torch
 from .cache_manager import PagedKVCacheManager
-from .global_vars import get_timers, get_dtype
+from .global_vars import get_timers
 from .tensor_parallel import get_tp_group
 from logging import getLogger
 
@@ -189,7 +189,6 @@ class PipeTensorExecutor(NormalExecutor):
                     tensor=inp, src=self.pp_main_rank, group=self.tp_group
                 )  # TODO main rank 处理统一放后面
         else:
-            use_half = get_dtype()
             if self.pp_stage == 0:
                 inp = torch.empty(
                     [sum(len(seq) for seq in tasks.tokens)],
@@ -203,7 +202,6 @@ class PipeTensorExecutor(NormalExecutor):
                         Backend.model.params.dim,
                     ],
                     device=self.local_rank,
-                    dtype=torch.float16 if use_half else torch.bfloat16,
                 )
             if self.rank == self.pp_main_rank:
                 torch.distributed.recv(
@@ -247,7 +245,6 @@ class PipeTensorExecutor(NormalExecutor):
                     tensor=inp, src=self.pp_main_rank, group=self.tp_group
                 )
         else:
-            use_half = get_dtype()
             if self.pp_stage == 0:
                 inp = torch.empty(
                     [tasks.num_tasks, 1], dtype=torch.int64, device=self.local_rank
@@ -256,7 +253,6 @@ class PipeTensorExecutor(NormalExecutor):
                 inp = torch.empty(
                     [tasks.num_tasks, 1, Backend.model.params.dim],
                     device=self.local_rank,
-                    dtype=torch.float16 if use_half else torch.bfloat16,
                 )
             if self.rank == self.pp_main_rank:
                 torch.distributed.recv(

@@ -90,6 +90,14 @@ class Backend:
         if args.models.name.startswith("glm4"):
             trust_remote_code = True  # Blame the glm4 folks for this
 
+        # Set default_dtype. This should come before any tensor computation
+        if args.dtype == "float16":
+            torch.set_default_dtype(torch.float16)
+        elif args.dtype == "bfloat16":
+            torch.set_default_dtype(torch.bfloat16)
+        else:
+            raise NotImplementedError(f"Unsupported dtype {args.dtype}")
+
         # Init tokenizer
         force_full_seq_decode = (
             args.models.tokenizer_force_full_seq_decode
@@ -206,15 +214,6 @@ class Backend:
             op_impl=args.infer.op_impl,
             merge_qkv_gate_up=merge_qkv_gate_up,
         )
-        if args.quant == "None":
-            if args.dtype == "float16":
-                model = model.to(torch.float16)
-                torch.set_default_tensor_type(torch.cuda.HalfTensor)
-            elif args.dtype == "bfloat16":
-                model = model.to(torch.bfloat16)
-                torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
-            else:
-                raise NotImplementedError(f"Unsupported dtype {args.dtype}")
         if (
             (args.quant == "awq")
             or (args.quant == "llmint8")
@@ -306,7 +305,9 @@ class Backend:
 
                     checkpoint = dict((transform_key(k), v) for k, v in params.items())
 
-            model.load_state_dict(checkpoint, strict=True)
+            model.load_state_dict(
+                checkpoint, strict=True, assign=args.keep_dtype_in_checkpoint
+            )
             logger.warning(f"Loaded in {time.time() - start_time:.2f} seconds")
 
         if args.quant == "llmint8":

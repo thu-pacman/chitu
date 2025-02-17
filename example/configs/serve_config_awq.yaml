@@ -41,4 +41,5 @@ scheduler:
     enable_hybrid: False
 quant: awq
 quant_ckpt_dir: /home/tanyijun/test_quantize/quant_cache/Qwen2-7B-4bit.pth
-dtype: float16
+dtype: float16 # default_dtype of torch
+keep_dtype_in_checkpoint: True
