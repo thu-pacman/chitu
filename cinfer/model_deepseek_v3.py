@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Mapping, Any
 import math
 
 import torch
@@ -10,9 +10,15 @@ import triton
 import triton.language as tl
 from triton import Config
 
-import fairscale.nn.model_parallel.initialize as fs_init
-
 from .model import Attention, Transformer, TransformerBlock, RMSNorm
+from .tensor_parallel import (
+    get_tp_group,
+    get_tp_size,
+    get_tp_rank,
+    ColumnParallelLinear,
+    RowParallelLinear,
+    VocabParallelEmbedding,
+)
 
 
 class ParallelEmbeddingDeepSeekV3(nn.Module):
@@ -26,14 +32,14 @@ class ParallelEmbeddingDeepSeekV3(nn.Module):
 
     def __init__(self, vocab_size: int, dim: int):
         super().__init__()
-        self.model_parallel_size = fs_init.get_model_parallel_world_size()
+        self.model_parallel_size = get_tp_size()
         self.vocab_size = vocab_size
         self.dim = dim
         assert (
             vocab_size % self.model_parallel_size == 0
         ), f"Vocabulary size must be divisible by world size (world_size={self.model_parallel_size})"
         self.part_vocab_size = vocab_size // self.model_parallel_size
-        self.vocab_start_idx = dist.get_rank() * self.part_vocab_size
+        self.vocab_start_idx = get_tp_rank() * self.part_vocab_size
         self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
 
@@ -57,7 +63,7 @@ class ParallelEmbeddingDeepSeekV3(nn.Module):
         y = F.embedding(x, self.weight)
         if self.model_parallel_size > 1:
             y[mask] = 0
-            dist.all_reduce(y)
+            dist.all_reduce(y, group=get_tp_group())
         return y
 
 
@@ -162,7 +168,7 @@ class ColumnParallelLinearDeepSeekV3(LinearDeepSeekV3):
     def __init__(
         self, in_features: int, out_features: int, bias: bool = False, dtype=None
     ):
-        self.model_parallel_size = fs_init.get_model_parallel_world_size()
+        self.model_parallel_size = get_tp_size()
         assert (
             out_features % self.model_parallel_size == 0
         ), f"Output features must be divisible by world size (world_size={self.model_parallel_size})"
@@ -197,7 +203,7 @@ class RowParallelLinearDeepSeekV3(LinearDeepSeekV3):
     def __init__(
         self, in_features: int, out_features: int, bias: bool = False, dtype=None
     ):
-        self.model_parallel_size = fs_init.get_model_parallel_world_size()
+        self.model_parallel_size = get_tp_size()
         assert (
             in_features % self.model_parallel_size == 0
         ), f"Input features must be divisible by world size (world_size={self.model_parallel_size})"
@@ -216,7 +222,7 @@ class RowParallelLinearDeepSeekV3(LinearDeepSeekV3):
         """
         y = linear_deepseek_v3(x, self.weight)
         if self.model_parallel_size > 1:
-            dist.all_reduce(y)
+            dist.all_reduce(y, group=get_tp_group())
         if self.bias is not None:
             y += self.bias
         return y
@@ -225,7 +231,7 @@ class RowParallelLinearDeepSeekV3(LinearDeepSeekV3):
 class AttentionDeepSeekV3(Attention):
     def __init__(self, args, layer_id, cache, attn_backend):
         super().__init__(layer_id, cache, attn_backend)
-        model_parallel_size = fs_init.get_model_parallel_world_size()
+        model_parallel_size = get_tp_size()
         self.dim = args.dim
         self.n_heads = args.n_heads
         self.n_local_heads = args.n_heads // model_parallel_size
@@ -485,9 +491,9 @@ class ExpertDeepSeekV3(nn.Module):
             inter_dim (int): Hidden layer dimensionality.
         """
         super().__init__()
-        self.w1 = LinearDeepSeekV3(dim, inter_dim)
-        self.w2 = LinearDeepSeekV3(inter_dim, dim)
-        self.w3 = LinearDeepSeekV3(dim, inter_dim)
+        self.w1 = ColumnParallelLinearDeepSeekV3(dim, inter_dim)
+        self.w2 = RowParallelLinearDeepSeekV3(inter_dim, dim)
+        self.w3 = ColumnParallelLinearDeepSeekV3(dim, inter_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -626,10 +632,10 @@ class TransformerDeepSeekV3(Transformer):
         self.freqs_cis = precompute_freqs_cis_deepseek_v3(params)
 
     def _get_tensor_column_parallel_layer_names(self) -> List[str]:
-        assert False  # TODO: Implement this
+        return ["embed", "wq_b", "wkv_b", "w1", "w3", "head"]
 
     def _get_tensor_row_parallel_layer_names(self) -> List[str]:
-        assert False  # TODO: Implement this
+        return ["wo", "w2"]
 
     def _get_pre_layer_prefixes(self) -> List[str]:
         return ["embed."]
@@ -639,6 +645,10 @@ class TransformerDeepSeekV3(Transformer):
 
     def _get_layer_i_prefixes(self, i: int) -> List[str]:
         return [f"layers.{i}."]
+
+    def load_state_dict(self, state_dict: Mapping[str, Any], strict=True, assign=False):
+        assign = False  # This must always be False for now (FIXME)
+        super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def _init_pre_layers(self):
         self.embed = ParallelEmbeddingDeepSeekV3(

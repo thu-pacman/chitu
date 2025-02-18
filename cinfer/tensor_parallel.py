@@ -2,6 +2,7 @@ __all__ = [
     "init_tp",
     "get_tp_group",
     "get_tp_size",
+    "get_tp_rank",
     "ColumnParallelLinear",
     "RowParallelLinear",
     "VocabParallelEmbedding",
@@ -32,6 +33,10 @@ def get_tp_group():
 
 def get_tp_size():
     return tp_comm_group.size() if tp_comm_group is not None else 1
+
+
+def get_tp_rank():
+    return torch.distributed.get_rank(group=get_tp_group())
 
 
 class ColumnParallelLinear(torch.nn.Module):
@@ -122,7 +127,7 @@ class RowParallelLinear(torch.nn.Module):
 
         self.tp_group = get_tp_group()
         self.tp_size = get_tp_size()
-        self.rank = torch.distributed.get_rank(group=self.tp_group)
+        self.rank = get_tp_rank()
 
         # These attributes are unused, but keep them compatible with nn.Linear
         self.in_features = in_features
@@ -173,7 +178,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.tp_group = get_tp_group()
         self.tp_size = get_tp_size()
-        self.rank = torch.distributed.get_rank(group=self.tp_group)
+        self.rank = get_tp_rank()
 
         assert (
             num_embeddings % self.tp_size == 0

@@ -100,6 +100,10 @@ class NormalExecutor(Executor):
                         device=logits.device,
                     ),
                 )
+        print(f"!!! {torch.distributed.get_rank()}: update_response (B)")
+        print(
+            f"!!! {torch.distributed.get_rank()}: is_all_greedy: {tasks.is_all_greedy}"
+        )
         if tasks.is_all_greedy:
             tokens = torch.argmax(logits, dim=-1)
         else:
@@ -107,6 +111,7 @@ class NormalExecutor(Executor):
             tokens = top_k_top_p_min_p_sampling_from_probs_torch(
                 probs, tasks.top_ks, tasks.top_ps
             )
+        print(f"!!! {torch.distributed.get_rank()}: update_response (C)")
         tokens_cpu = tokens.cpu()
         for it, task in enumerate(tasks.tasks):
             task.update_response(tokens_cpu[it].item(), tokens[it])
@@ -151,7 +156,9 @@ class NormalExecutor(Executor):
         self,
         tasks: PackedTasksBase,
     ):
+        print(f"!!! {torch.distributed.get_rank()}: step (A)")
         tasks = self.propagate_tasks(tasks)
+        print(f"!!! {torch.distributed.get_rank()}: step (B)")
         if tasks is None:
             return
         if tasks.task_type == TaskType.Prefill:
@@ -168,7 +175,6 @@ class PipeTensorExecutor(NormalExecutor):
         super().__init__(args)
         self.rank = torch.distributed.get_rank()
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        self.world_size = torch.distributed.get_world_size()
         self.tp_size = args.infer.tp_size
         self.pp_size = args.infer.pp_size
         self.pp_stage = Backend.pp_stage
@@ -231,8 +237,8 @@ class PipeTensorExecutor(NormalExecutor):
                 dst=0,
                 tag=LOGIT_TAG,
             )
-        print(f"!!! {self.rank}: prefill step (D)")
         Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
+        print(f"!!! {self.rank}: prefill step (B)")
         return out
 
     def decode_step(self, tasks: PackedTasksBase):
@@ -304,7 +310,7 @@ class PipeTensorExecutor(NormalExecutor):
     def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
         remove_kvcache = False
 
-        # Rank 0 initialzie from the argument. Rank >= 1 recv task tensor from Rank - 1
+        # PP stage 0 initialzie from the argument. PP stage >= 1 recv task tensor from stage - 1
         if self.rank == 0:
             if Backend.state == BackendState.Running:
                 task_tensor = tasks.serialize(device=self.local_rank)
@@ -363,7 +369,7 @@ class PipeTensorExecutor(NormalExecutor):
 
         if Backend.state == BackendState.Terminated:
             return
-        # Rank 0 recv final logits from Rank world_size - 1
+        # Rank 0 recv final logits from last PP stage
         if self.rank == 0:
             if tasks.task_type == TaskType.Prefill:
                 # After prefill, new decode tasks are created
@@ -378,7 +384,6 @@ class TensorExecutor(NormalExecutor):
         super().__init__(args)
         self.rank = torch.distributed.get_rank()
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        self.world_size = torch.distributed.get_world_size()
 
     def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
         """Broadcast task metadata from rank 0 to all other ranks"""
