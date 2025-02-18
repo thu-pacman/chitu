@@ -21,54 +21,11 @@ from .tensor_parallel import (
 )
 
 
-class ParallelEmbeddingDeepSeekV3(nn.Module):
-    """
-    Embedding layer with parallelism support across distributed processes.
-
-    Args:
-        vocab_size (int): Vocabulary size.
-        dim (int): Embedding dimension.
-    """
-
-    def __init__(self, vocab_size: int, dim: int):
-        super().__init__()
-        self.model_parallel_size = get_tp_size()
-        self.vocab_size = vocab_size
-        self.dim = dim
-        assert (
-            vocab_size % self.model_parallel_size == 0
-        ), f"Vocabulary size must be divisible by world size (world_size={self.model_parallel_size})"
-        self.part_vocab_size = vocab_size // self.model_parallel_size
-        self.vocab_start_idx = get_tp_rank() * self.part_vocab_size
-        self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
-        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for parallel embedding layer.
-
-        Args:
-            x (torch.Tensor): Input tensor containing token indices.
-
-        Returns:
-            torch.Tensor: Embedded representations.
-
-        Raises:
-            ValueError: If `world_size` is not defined.
-        """
-        if self.model_parallel_size > 1:
-            mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
-            x = x - self.vocab_start_idx
-            x[mask] = 0
-        y = F.embedding(x, self.weight)
-        if self.model_parallel_size > 1:
-            y[mask] = 0
-            dist.all_reduce(y, group=get_tp_group())
-        return y
-
-
 def linear_deepseek_v3(
-    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Applies a linear transformation to the incoming data: y = xA^T + b.
@@ -95,8 +52,9 @@ def linear_deepseek_v3(
         return F.linear(x, weight, bias)
     else:
         block_size = 128
-        x, scale = act_quant(x, block_size)
-        y = fp8_gemm(x, scale, weight, weight.scale)
+        x, act_scale = act_quant(x, block_size)
+        assert weight_scale is not None
+        y = fp8_gemm(x, act_scale, weight, weight_scale)
         if bias is not None:
             y += bias
         return y
@@ -113,7 +71,6 @@ class LinearDeepSeekV3(nn.Module):
         dtype (optional): Data type for the layer. Defaults to `torch.bfloat16`.
     """
 
-    # dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
     dtype = torch.float8_e4m3fn
 
     def __init__(
@@ -131,7 +88,7 @@ class LinearDeepSeekV3(nn.Module):
             block_size = 128
             scale_out_features = (out_features + block_size - 1) // block_size
             scale_in_features = (in_features + block_size - 1) // block_size
-            self.weight.scale = self.scale = nn.Parameter(
+            self.scale = nn.Parameter(
                 torch.empty(scale_out_features, scale_in_features, dtype=torch.float32)
             )
         else:
@@ -151,7 +108,7 @@ class LinearDeepSeekV3(nn.Module):
         Returns:
             torch.Tensor: Transformed tensor after linear computation.
         """
-        return linear_deepseek_v3(x, self.weight, self.bias)
+        return linear_deepseek_v3(x, self.weight, self.scale, self.bias)
 
 
 class ColumnParallelLinearDeepSeekV3(LinearDeepSeekV3):
@@ -185,7 +142,7 @@ class ColumnParallelLinearDeepSeekV3(LinearDeepSeekV3):
         Returns:
             torch.Tensor: Transformed tensor with column-parallel computation.
         """
-        y = linear_deepseek_v3(x, self.weight, self.bias)
+        y = linear_deepseek_v3(x, self.weight, self.scale, self.bias)
         return y
 
 
@@ -220,7 +177,7 @@ class RowParallelLinearDeepSeekV3(LinearDeepSeekV3):
         Returns:
             torch.Tensor: Transformed tensor with row-parallel computation.
         """
-        y = linear_deepseek_v3(x, self.weight)
+        y = linear_deepseek_v3(x, self.weight, self.scale)
         if self.model_parallel_size > 1:
             dist.all_reduce(y, group=get_tp_group())
         if self.bias is not None:
@@ -447,7 +404,7 @@ class GateDeepSeekV3(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
-        scores = linear_deepseek_v3(x, self.weight)
+        scores = F.linear(x, self.weight)
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1, dtype=torch.float32)
         else:
@@ -580,8 +537,6 @@ class MoEDeepSeekV3(nn.Module):
             idx, top = torch.where(indices == i)
             y[idx] += expert(x[idx]) * weights[idx, top, None]
         z = self.shared_experts(x)
-        # if co_moe.world_size > 1:
-        #    dist.all_reduce(y, group=co_moe.group)
         return (y + z).view(shape)
 
 
@@ -646,14 +601,8 @@ class TransformerDeepSeekV3(Transformer):
     def _get_layer_i_prefixes(self, i: int) -> List[str]:
         return [f"layers.{i}."]
 
-    def load_state_dict(self, state_dict: Mapping[str, Any], strict=True, assign=False):
-        assign = False  # This must always be False for now (FIXME)
-        super().load_state_dict(state_dict, strict=strict, assign=assign)
-
     def _init_pre_layers(self):
-        self.embed = ParallelEmbeddingDeepSeekV3(
-            self.params.vocab_size, self.params.dim
-        )
+        self.embed = VocabParallelEmbedding(self.params.vocab_size, self.params.dim)
 
     def _init_layers(self, cache, attn_backend, op_impl):
         self.layers = torch.nn.ModuleList()
@@ -666,8 +615,12 @@ class TransformerDeepSeekV3(Transformer):
 
     def _init_post_layers(self):
         self.norm = RMSNorm(self.params.dim)
-        self.head = ColumnParallelLinearDeepSeekV3(
-            self.params.dim, self.params.vocab_size, dtype=torch.get_default_dtype()
+        self.head = ColumnParallelLinear(
+            self.params.dim,
+            self.params.vocab_size,
+            has_bias=False,
+            dtype=torch.get_default_dtype(),
+            gather_output=True,
         )
 
     def _pre_layers(self, h):
