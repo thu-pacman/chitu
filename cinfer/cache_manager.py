@@ -1,5 +1,5 @@
 import torch
-from .global_vars import get_timers, get_dtype
+from .global_vars import get_timers
 
 from logging import getLogger
 
@@ -55,16 +55,13 @@ class PagedKVCacheManager:
         self.block_table = {}  # (seq_id, layer_id - begin_layer_id, block_idx)
         # TODO: For better performance, use list instead of set for free_blocks
         self.free_blocks = set(range(self.num_blocks))
-        use_half = get_dtype()
         self.paged_k_cache = torch.zeros(
             (self.num_blocks, block_size) + self.k_shape_per_sample,
             device=device,
-            dtype=torch.float16 if use_half else torch.bfloat16,
         )
         self.paged_v_cache = torch.zeros(
             (self.num_blocks, block_size) + self.v_shape_per_sample,
             device=device,
-            dtype=torch.float16 if use_half else torch.bfloat16,
         )
 
     # Init block table and kv cache with kv generated during prefill
@@ -257,7 +254,6 @@ class KVCacheManager:
         max_seq = max(seq_lens)
         n_local_kv_heads = self.cache[req_ids[0]][0][0].shape[-2]
         head_dim = self.cache[req_ids[0]][0][0].shape[-1]
-        use_half = get_dtype()
         prepared_cache = torch.zeros(
             [
                 self.num_layers,  # layers
@@ -267,7 +263,6 @@ class KVCacheManager:
                 n_local_kv_heads,  # n_local_kv_heads
                 head_dim,  # head_dim
             ],
-            dtype=torch.float16 if use_half else torch.bfloat16,
             device=self.device,
         )
         # hkz-comment: Very similar to matrix transpose;
@@ -391,7 +386,6 @@ class KVCacheManagerSkewAware:
         self.max_seq_len = max_seq_len
         self.tmp_storage = []
         self.device = torch.device(device)
-        use_half = get_dtype()
         self.k_buffer = torch.zeros(
             (
                 self.num_layers,
@@ -400,7 +394,6 @@ class KVCacheManagerSkewAware:
             )
             + self.k_shape_per_sample,
             device=self.device,
-            dtype=torch.float16 if use_half else torch.bfloat16,
         )
         self.v_buffer = torch.zeros(
             (
@@ -410,7 +403,6 @@ class KVCacheManagerSkewAware:
             )
             + self.v_shape_per_sample,
             device=self.device,
-            dtype=torch.float16 if use_half else torch.bfloat16,
         )
         self.timers = get_timers()
         self.prepared_reqs = []
@@ -594,7 +586,6 @@ class KVCacheManagerNop:
         self.max_seq_len = max_seq_len
         self.tmp_storage = []
         self.device = torch.device(device)
-        use_half = get_dtype()
         self.buffer = torch.zeros(
             [
                 self.num_layers,
@@ -605,7 +596,6 @@ class KVCacheManagerNop:
                 self.head_dim,
             ],
             device=self.device,
-            dtype=torch.float16 if use_half else torch.bfloat16,
         )
         pass
 

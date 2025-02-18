@@ -40,4 +40,5 @@ scheduler:
     num_tasks: 2
     enable_hybrid: False
 quant: llmint8
-dtype: float16
+dtype: float16 # default_dtype of torch
+keep_dtype_in_checkpoint: True
