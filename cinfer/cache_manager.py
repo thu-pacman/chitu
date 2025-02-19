@@ -475,10 +475,11 @@ class KVCacheManagerSkewAware:
 
         k_prepared_cache_shape = list(self.k_buffer.shape)
         k_prepared_cache_stride = list(self.k_buffer.stride())
-        k_prepared_cache_shape[1] = len(req_ids)
         k_prepared_cache_stride[0] = (
             k_prepared_cache_shape[1] * k_prepared_cache_stride[1]
         )
+        k_prepared_cache_shape[1] = len(req_ids)
+        k_prepared_cache_shape[2] = rounded_max_seq
         k_prepared_cache_offset = start_pos * k_prepared_cache_stride[1]
         self.k_prepared_cache = torch.as_strided(
             self.k_buffer,
@@ -489,10 +490,11 @@ class KVCacheManagerSkewAware:
 
         v_prepared_cache_shape = list(self.v_buffer.shape)
         v_prepared_cache_stride = list(self.v_buffer.stride())
-        v_prepared_cache_shape[1] = len(req_ids)
         v_prepared_cache_stride[0] = (
             v_prepared_cache_shape[1] * v_prepared_cache_stride[1]
         )
+        v_prepared_cache_shape[1] = len(req_ids)
+        v_prepared_cache_shape[2] = rounded_max_seq
         v_prepared_cache_offset = start_pos * v_prepared_cache_stride[1]
         self.v_prepared_cache = torch.as_strided(
             self.v_buffer,
