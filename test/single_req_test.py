@@ -103,7 +103,8 @@ def run_pipe_or_tensor_parallelism(args, timers):
     for i in range(2):
         if rank == 0:
             reqs = gen_reqs(
-                num_reqs=args.infer.max_reqs, max_new_tokens=args.request.max_new_tokens
+                num_reqs=args.infer.max_reqs - i,
+                max_new_tokens=args.request.max_new_tokens,
             )
             for req in reqs:
                 TaskPool.add(Task(f"{req.request_id}", req, req.message))
@@ -130,7 +131,7 @@ def run_normal(args, timers):
     rank = torch.distributed.get_rank()
     for i in range(3):
         reqs = gen_reqs(
-            num_reqs=args.infer.max_reqs, max_new_tokens=args.request.max_new_tokens
+            num_reqs=args.infer.max_reqs - i, max_new_tokens=args.request.max_new_tokens
         )
         for req in reqs:
             TaskPool.add(Task(f"{req.request_id}", req, req.message))
