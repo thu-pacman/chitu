@@ -62,39 +62,30 @@ def linear_deepseek_v3(
 
 class LinearDeepSeekV3(nn.Module):
     """
-    Custom linear layer with support for quantized weights and optional bias.
-
-    Args:
-        in_features (int): Number of input features.
-        out_features (int): Number of output features.
-        bias (bool): Whether to include a bias term. Defaults to False.
-        dtype (optional): Data type for the layer. Defaults to `torch.bfloat16`.
+    FP8 linear layer
     """
 
-    dtype = torch.float8_e4m3fn
-
     def __init__(
-        self, in_features: int, out_features: int, bias: bool = False, dtype=None
+        self,
+        in_features: int,
+        out_features: int,
+        has_bias: bool = False,
+        bias_dtype=None,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.weight = nn.Parameter(
-            torch.empty(
-                out_features, in_features, dtype=dtype or LinearDeepSeekV3.dtype
-            )
+            torch.empty(out_features, in_features, dtype=torch.float8_e4m3fn)
         )
-        if self.weight.element_size() == 1:
-            block_size = 128
-            scale_out_features = (out_features + block_size - 1) // block_size
-            scale_in_features = (in_features + block_size - 1) // block_size
-            self.scale = nn.Parameter(
-                torch.empty(scale_out_features, scale_in_features, dtype=torch.float32)
-            )
-        else:
-            self.register_parameter("scale", None)
-        if bias:
-            self.bias = nn.Parameter(torch.empty(out_features))
+        block_size = 128
+        scale_out_features = (out_features + block_size - 1) // block_size
+        scale_in_features = (in_features + block_size - 1) // block_size
+        self.scale = nn.Parameter(
+            torch.empty(scale_out_features, scale_in_features, dtype=torch.float32)
+        )
+        if has_bias:
+            self.bias = nn.Parameter(torch.empty(out_features, dtype=bias_dtype))
         else:
             self.register_parameter("bias", None)
 
@@ -111,78 +102,68 @@ class LinearDeepSeekV3(nn.Module):
         return linear_deepseek_v3(x, self.weight, self.scale, self.bias)
 
 
-class ColumnParallelLinearDeepSeekV3(LinearDeepSeekV3):
+class ColumnParallelLinearDeepSeekV3(ColumnParallelLinear):
     """
-    Linear layer with column parallelism, splitting output features across distributed processes.
-
-    Args:
-        in_features (int): Number of input features.
-        out_features (int): Total number of output features.
-        bias (bool): Whether to include a bias term. Defaults to False.
-        dtype (optional): Data type for the layer. Defaults to `torch.bfloat16`.
+    FP8 column parallel linear layer
     """
 
     def __init__(
-        self, in_features: int, out_features: int, bias: bool = False, dtype=None
+        self,
+        in_features: int,
+        out_features: int,
+        has_bias: bool = False,
+        bias_dtype=None,
+        gather_output: bool = True,
     ):
-        self.model_parallel_size = get_tp_size()
-        assert (
-            out_features % self.model_parallel_size == 0
-        ), f"Output features must be divisible by world size (world_size={self.model_parallel_size})"
-        self.part_out_features = out_features // self.model_parallel_size
-        super().__init__(in_features, self.part_out_features, bias, dtype)
+        super().__init__(
+            in_features,
+            out_features,
+            has_bias=has_bias,
+            dtype=torch.float8_e4m3fn,
+            bias_dtype=bias_dtype,
+            linear_op=lambda x, w, b: linear_deepseek_v3(x, w, self.scale, b),
+            gather_output=gather_output,
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for column parallel linear layer.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Transformed tensor with column-parallel computation.
-        """
-        y = linear_deepseek_v3(x, self.weight, self.scale, self.bias)
-        return y
+        local_out_features, local_in_features = self.weight.shape
+        block_size = 128
+        scale_out_features = (local_out_features + block_size - 1) // block_size
+        scale_in_features = (local_in_features + block_size - 1) // block_size
+        self.scale = nn.Parameter(
+            torch.empty(scale_out_features, scale_in_features, dtype=torch.float32)
+        )
 
 
-class RowParallelLinearDeepSeekV3(LinearDeepSeekV3):
+class RowParallelLinearDeepSeekV3(RowParallelLinear):
     """
-    Linear layer with row parallelism, splitting input features across distributed processes.
-
-    Args:
-        in_features (int): Total number of input features.
-        out_features (int): Number of output features.
-        bias (bool): Whether to include a bias term. Defaults to False.
-        dtype (optional): Data type for the layer. Defaults to `torch.bfloat16`.
+    FP8 row parallel linear layer
     """
 
     def __init__(
-        self, in_features: int, out_features: int, bias: bool = False, dtype=None
+        self,
+        in_features: int,
+        out_features: int,
+        has_bias: bool = False,
+        bias_dtype=None,
+        input_is_parallel: bool = False,
     ):
-        self.model_parallel_size = get_tp_size()
-        assert (
-            in_features % self.model_parallel_size == 0
-        ), f"Input features must be divisible by world size (world_size={self.model_parallel_size})"
-        self.part_in_features = in_features // self.model_parallel_size
-        super().__init__(self.part_in_features, out_features, bias, dtype)
+        super().__init__(
+            in_features,
+            out_features,
+            has_bias=has_bias,
+            dtype=torch.float8_e4m3fn,
+            bias_dtype=bias_dtype,
+            linear_op=lambda x, w, b: linear_deepseek_v3(x, w, self.scale, b),
+            input_is_parallel=input_is_parallel,
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for row parallel linear layer.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Transformed tensor with row-parallel computation.
-        """
-        y = linear_deepseek_v3(x, self.weight, self.scale)
-        if self.model_parallel_size > 1:
-            dist.all_reduce(y, group=get_tp_group())
-        if self.bias is not None:
-            y += self.bias
-        return y
+        local_out_features, local_in_features = self.weight.shape
+        block_size = 128
+        scale_out_features = (local_out_features + block_size - 1) // block_size
+        scale_in_features = (local_in_features + block_size - 1) // block_size
+        self.scale = nn.Parameter(
+            torch.empty(scale_out_features, scale_in_features, dtype=torch.float32)
+        )
 
 
 class AttentionDeepSeekV3(Attention):
@@ -199,19 +180,30 @@ class AttentionDeepSeekV3(Attention):
         self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
         self.v_head_dim = args.v_head_dim
 
-        self.wq_a = LinearDeepSeekV3(self.dim, self.q_lora_rank)
+        self.wq_a = LinearDeepSeekV3(self.dim, self.q_lora_rank, has_bias=False)
         self.q_norm = RMSNorm(self.q_lora_rank)
         self.wq_b = ColumnParallelLinearDeepSeekV3(
-            self.q_lora_rank, self.n_heads * self.qk_head_dim
+            self.q_lora_rank,
+            self.n_heads * self.qk_head_dim,
+            has_bias=False,
+            gather_output=False,
         )
         self.wkv_a = LinearDeepSeekV3(
-            self.dim, self.kv_lora_rank + self.qk_rope_head_dim
+            self.dim, self.kv_lora_rank + self.qk_rope_head_dim, has_bias=False
         )
         self.kv_norm = RMSNorm(self.kv_lora_rank)
         self.wkv_b = ColumnParallelLinearDeepSeekV3(
-            self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim)
+            self.kv_lora_rank,
+            self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            has_bias=False,
+            gather_output=False,
         )
-        self.wo = RowParallelLinearDeepSeekV3(self.n_heads * self.v_head_dim, self.dim)
+        self.wo = RowParallelLinearDeepSeekV3(
+            self.n_heads * self.v_head_dim,
+            self.dim,
+            has_bias=False,
+            input_is_parallel=True,
+        )
         self.softmax_scale = self.qk_head_dim**-0.5
         original_seq_len: int = 4096
         if args.max_seq_len > original_seq_len:
@@ -341,9 +333,15 @@ class MLPDeepSeekV3(nn.Module):
             inter_dim (int): Hidden layer dimensionality.
         """
         super().__init__()
-        self.w1 = ColumnParallelLinearDeepSeekV3(dim, inter_dim)
-        self.w2 = RowParallelLinearDeepSeekV3(inter_dim, dim)
-        self.w3 = ColumnParallelLinearDeepSeekV3(dim, inter_dim)
+        self.w1 = ColumnParallelLinearDeepSeekV3(
+            dim, inter_dim, has_bias=False, gather_output=False
+        )
+        self.w2 = RowParallelLinearDeepSeekV3(
+            inter_dim, dim, has_bias=False, input_is_parallel=True
+        )
+        self.w3 = ColumnParallelLinearDeepSeekV3(
+            dim, inter_dim, has_bias=False, gather_output=False
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -448,9 +446,15 @@ class ExpertDeepSeekV3(nn.Module):
             inter_dim (int): Hidden layer dimensionality.
         """
         super().__init__()
-        self.w1 = ColumnParallelLinearDeepSeekV3(dim, inter_dim)
-        self.w2 = RowParallelLinearDeepSeekV3(inter_dim, dim)
-        self.w3 = ColumnParallelLinearDeepSeekV3(dim, inter_dim)
+        self.w1 = ColumnParallelLinearDeepSeekV3(
+            dim, inter_dim, has_bias=False, gather_output=False
+        )
+        self.w2 = RowParallelLinearDeepSeekV3(
+            inter_dim, dim, has_bias=False, input_is_parallel=True
+        )
+        self.w3 = ColumnParallelLinearDeepSeekV3(
+            dim, inter_dim, has_bias=False, gather_output=False
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

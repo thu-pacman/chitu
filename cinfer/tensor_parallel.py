@@ -47,6 +47,7 @@ class ColumnParallelLinear(torch.nn.Module):
         has_bias: bool = True,
         gather_output: bool = True,
         dtype=None,
+        bias_dtype=None,
         linear_op=torch.nn.functional.linear,
     ):
         """
@@ -58,6 +59,7 @@ class ColumnParallelLinear(torch.nn.Module):
             has_bias: If set to True, the layer will have a bias.
             gather_output: If set to True, an all-gather operation is performed on the output tensor.
             dtype: The desired data type of the parameters.
+            bias_dtype: The desired data type of the bias. Defaults to `dtype`.
             linear_op: The linear operation to use. Defaults to `torch.nn.functional.linear`.
         """
 
@@ -82,7 +84,7 @@ class ColumnParallelLinear(torch.nn.Module):
         )
         if has_bias:
             self.bias = torch.nn.Parameter(
-                torch.empty(out_features // self.tp_size, dtype=dtype)
+                torch.empty(out_features // self.tp_size, dtype=bias_dtype or dtype)
             )
         else:
             self.bias = None
@@ -109,6 +111,7 @@ class RowParallelLinear(torch.nn.Module):
         has_bias: bool = True,
         input_is_parallel: bool = False,
         dtype=None,
+        bias_dtype=None,
         linear_op=torch.nn.functional.linear,
     ):
         """
@@ -120,6 +123,7 @@ class RowParallelLinear(torch.nn.Module):
             has_bias: If set to True, the layer will have a bias.
             input_is_parallel: If set to True, the input tensor is already parallelized.
             dtype: The desired data type of the parameters.
+            bias_dtype: The desired data type of the bias. Defaults to `dtype`.
             linear_op: The linear operation to use. Defaults to `torch.nn.functional.linear`.
         """
 
@@ -144,7 +148,9 @@ class RowParallelLinear(torch.nn.Module):
             torch.empty(out_features, in_features // self.tp_size, dtype=dtype)
         )
         if has_bias:
-            self.bias = torch.nn.Parameter(torch.empty(out_features, dtype=dtype))
+            self.bias = torch.nn.Parameter(
+                torch.empty(out_features, dtype=bias_dtype or dtype)
+            )
         else:
             self.bias = None
 
