@@ -391,6 +391,7 @@ class TransformerHFLlama(Transformer):
         rotary_type="default",
         layer_type=TransformerBlockHFLlama,
         merge_qkv_gate_up=True,
+        **kvargs,
     ):
         self.rotary_type = rotary_type
         self.layer_type = layer_type
@@ -402,6 +403,7 @@ class TransformerHFLlama(Transformer):
             model_parallel_size,
             attn_backend,
             op_impl,
+            **kvargs,
         )
 
     def _get_tensor_column_parallel_layer_names(self) -> List[str]:

@@ -164,8 +164,10 @@ class RowParallelLinearDeepSeekV3(RowParallelLinear):
 
 
 class AttentionDeepSeekV3(Attention):
-    def __init__(self, args, layer_id, cache, attn_backend):
+    def __init__(self, args, layer_id, cache, attn_backend, mla_absorb):
         super().__init__(layer_id, cache, attn_backend)
+        self.mla_absorb = mla_absorb
+
         model_parallel_size = get_tp_size()
         self.dim = args.dim
         self.n_heads = args.n_heads
@@ -223,19 +225,35 @@ class AttentionDeepSeekV3(Attention):
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_pe = apply_rotary_emb_deepseek_v3(k_pe.unsqueeze(2), freqs_cis)
-        block_size = 128
-        wkv_b = (
-            self.wkv_b.weight
-            if self.wkv_b.scale is None
-            else weight_dequant_deepseek_v3(
-                self.wkv_b.weight, self.wkv_b.scale, block_size
+        if self.mla_absorb == "none":
+            q = torch.cat([q_nope, q_pe], dim=-1)
+            kv = self.wkv_b(self.kv_norm(kv))
+            kv = kv.view(
+                bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim
             )
-        )
-        wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
-        q_nope = torch.einsum(
-            "bshd,hdc->bshc", q_nope, wkv_b[:, : self.qk_nope_head_dim]
-        )
-        return q_nope, q_pe, kv, k_pe, wkv_b
+            k_nope, v = torch.split(
+                kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+            )
+            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+            return q, k, v
+        elif self.mla_absorb == "absorb-without-precomp":
+            block_size = 128
+            wkv_b = (
+                self.wkv_b.weight
+                if self.wkv_b.scale is None
+                else weight_dequant_deepseek_v3(
+                    self.wkv_b.weight, self.wkv_b.scale, block_size
+                )
+            )
+            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
+            q_nope = torch.einsum(
+                "bshd,hdc->bshc", q_nope, wkv_b[:, : self.qk_nope_head_dim]
+            )
+            return q_nope, q_pe, kv, k_pe, wkv_b
+        else:
+            raise NotImplementedError(
+                f"MLA absorb mode {self.mla_absorb} not supported"
+            )
 
     def prefill_forward(
         self,
@@ -248,32 +266,59 @@ class AttentionDeepSeekV3(Attention):
         x = x.view(bsz, -1, x.shape[-1])
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
-        q_nope, q_pe, kv, k_pe, wkv_b = self._run_linear(x, freqs_cis)
 
-        kv_cache = self.kv_norm(kv, compute_dtype=kv.dtype)
-        pe_cache = k_pe.squeeze(2)
-        self.cache.finalize_cache_bylayer_prefill(
-            kv_cache[:, start_pos:end_pos],
-            pe_cache[:, start_pos:end_pos],
-            self.cache.curr_req_ids,
-            self.cache.curr_varlens,
-            self.layer_id,
-        )
-        q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
-        kv_pe_cache = torch.cat([kv_cache[:, :end_pos], pe_cache[:, :end_pos]], dim=-1)
-        x = self.attn_backend.attn_varlen_func(
-            q_nope_pe.view(-1, q_nope_pe.shape[-2], q_nope_pe.shape[-1]),
-            kv_pe_cache.view(-1, 1, kv_pe_cache.shape[-1]),
-            kv_cache[:, :end_pos].view(-1, 1, kv_cache.shape[-1]),
-            varlens.prefix_lens,
-            varlens.prefix_lens,
-            varlens.max_len,
-            varlens.max_len,
-            causal=True,
-        )
+        if self.mla_absorb == "none":
+            q, k, v = self._run_linear(x, freqs_cis)
+            self.cache.finalize_cache_bylayer_prefill(
+                k, v, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
+            )
+            x = self.attn_backend.attn_varlen_func(
+                q.view(bsz * seqlen, q.shape[-2], q.shape[-1]),
+                k.view(bsz * seqlen, k.shape[-2], k.shape[-1]),
+                v.view(bsz * seqlen, v.shape[-2], v.shape[-1]),
+                varlens.prefix_lens,
+                varlens.prefix_lens,
+                varlens.max_len,
+                varlens.max_len,
+                causal=True,
+            ).view(bsz, seqlen, -1)
 
-        x = x.view(bsz, seqlen, x.shape[-2], x.shape[-1])
-        x = self._run_output_linear(x, wkv_b)
+        elif self.mla_absorb == "absorb-without-precomp":
+            q_nope, q_pe, kv, k_pe, wkv_b = self._run_linear(x, freqs_cis)
+
+            kv_cache = self.kv_norm(kv, compute_dtype=kv.dtype)
+            pe_cache = k_pe.squeeze(2)
+            self.cache.finalize_cache_bylayer_prefill(
+                kv_cache[:, start_pos:end_pos],
+                pe_cache[:, start_pos:end_pos],
+                self.cache.curr_req_ids,
+                self.cache.curr_varlens,
+                self.layer_id,
+            )
+            q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
+            kv_pe_cache = torch.cat(
+                [kv_cache[:, :end_pos], pe_cache[:, :end_pos]], dim=-1
+            )
+            x = self.attn_backend.attn_varlen_func(
+                q_nope_pe.view(-1, q_nope_pe.shape[-2], q_nope_pe.shape[-1]),
+                kv_pe_cache.view(-1, 1, kv_pe_cache.shape[-1]),
+                kv_cache[:, :end_pos].view(-1, 1, kv_cache.shape[-1]),
+                varlens.prefix_lens,
+                varlens.prefix_lens,
+                varlens.max_len,
+                varlens.max_len,
+                causal=True,
+            )
+
+            x = x.view(bsz, seqlen, x.shape[-2], x.shape[-1])
+            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim :])
+
+        else:
+            raise NotImplementedError(
+                f"MLA absorb mode {self.mla_absorb} not supported"
+            )
+
+        x = self._run_output_linear(x)
         return x.view(bsz * seqlen, -1)
 
     def decode_forward(self, x: torch.Tensor, freqs_cis: torch.Tensor):
@@ -283,32 +328,58 @@ class AttentionDeepSeekV3(Attention):
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
 
-        q_nope, q_pe, kv, k_pe, wkv_b = self._run_linear(x, freqs_cis)
+        if self.mla_absorb == "none":
+            q, k, v = self._run_linear(x, freqs_cis)
+            q = q.view(bsz, seqlen, self.n_local_heads, -1)
+            k = k.view(bsz, seqlen, self.n_local_heads, -1)
+            v = v.view(bsz, seqlen, self.n_local_heads, -1)
 
-        kv_cache, pe_cache = self.cache.get_cache_decode(self.layer_id)
-        this_kv = self.kv_norm(kv, compute_dtype=kv.dtype)
-        this_pe = k_pe.squeeze(2)
-        q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
-        kv_pe_cache = torch.cat([kv_cache, pe_cache], dim=-1)
-        this_kv_pe = torch.cat([this_kv, this_pe], dim=-1)
-        x = self.attn_backend.attn_with_kvcache(
-            q_nope_pe,
-            kv_pe_cache.view(kv_pe_cache.shape[0], kv_pe_cache.shape[1], 1, -1),
-            kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], 1, -1),
-            this_kv_pe.view(this_kv_pe.shape[0], this_kv_pe.shape[1], 1, -1),
-            this_kv.view(this_kv.shape[0], this_kv.shape[1], 1, -1),
-            cache_seqlens=cache_seqlens,
-        )
-        pe_cache[:, start_pos] = kv_pe_cache[:, start_pos, self.kv_lora_rank :]
+            cache = self.cache.get_cache_decode(self.layer_id)
+            cache_k = cache[0]
+            cache_v = cache[1]
+            cache_seqlens = self.cache.get_gpu_seq_lens()
+            x = self.attn_backend.attn_with_kvcache(
+                q,
+                cache_k,
+                cache_v,
+                k,
+                v,
+                cache_seqlens=cache_seqlens,
+            ).view(bsz, seqlen, -1)
 
-        x = self._run_output_linear(x, wkv_b)
+        elif self.mla_absorb == "absorb-without-precomp":
+            q_nope, q_pe, kv, k_pe, wkv_b = self._run_linear(x, freqs_cis)
+
+            kv_cache, pe_cache = self.cache.get_cache_decode(self.layer_id)
+            this_kv = self.kv_norm(kv, compute_dtype=kv.dtype)
+            this_pe = k_pe.squeeze(2)
+            q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
+            kv_pe_cache = torch.cat([kv_cache, pe_cache], dim=-1)
+            this_kv_pe = torch.cat([this_kv, this_pe], dim=-1)
+            x = self.attn_backend.attn_with_kvcache(
+                q_nope_pe,
+                kv_pe_cache.view(kv_pe_cache.shape[0], kv_pe_cache.shape[1], 1, -1),
+                kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], 1, -1),
+                this_kv_pe.view(this_kv_pe.shape[0], this_kv_pe.shape[1], 1, -1),
+                this_kv.view(this_kv.shape[0], this_kv.shape[1], 1, -1),
+                cache_seqlens=cache_seqlens,
+            )
+            pe_cache[:, start_pos] = kv_pe_cache[:, start_pos, self.kv_lora_rank :]
+
+            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim :])
+
+        else:
+            raise NotImplementedError(
+                f"MLA absorb mode {self.mla_absorb} not supported"
+            )
+
+        x = self._run_output_linear(x)
         return x
 
     def decode_forward_paged(self, x: torch.Tensor, freqs_cis: torch.Tensor):
         assert False  # TODO
 
-    def _run_output_linear(self, x, wkv_b):
-        x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim :])
+    def _run_output_linear(self, x):
         x = self.wo(x.flatten(2))
         return x
 
@@ -544,9 +615,11 @@ class MoEDeepSeekV3(nn.Module):
 
 
 class TransformerBlockDeepSeekV3(TransformerBlock):
-    def __init__(self, layer_id: int, args, cache, attn_backend, op_impl):
+    def __init__(self, layer_id: int, args, cache, attn_backend, op_impl, mla_absorb):
         super().__init__(layer_id, args, cache, attn_backend, op_impl)
-        self.attn = AttentionDeepSeekV3(args, layer_id, cache, attn_backend)
+        self.attn = AttentionDeepSeekV3(
+            args, layer_id, cache, attn_backend, mla_absorb=mla_absorb
+        )
         self.ffn = (
             MLPDeepSeekV3(args.dim, args.inter_dim)
             if layer_id < args.n_dense_layers
@@ -570,9 +643,11 @@ class TransformerDeepSeekV3(Transformer):
         model_parallel_size,
         attn_backend,
         op_impl,
+        mla_absorb,
         merge_qkv_gate_up=False,
     ):
         torch.set_default_dtype(torch.bfloat16)
+        self.mla_absorb = mla_absorb
         super().__init__(
             params,
             cache,
@@ -580,6 +655,7 @@ class TransformerDeepSeekV3(Transformer):
             model_parallel_size,
             attn_backend,
             op_impl,
+            mla_absorb=mla_absorb,
         )
         if op_impl != "torch":
             raise NotImplementedError("Only op_impl=torch is supported in DeepSeek V3")
@@ -612,7 +688,12 @@ class TransformerDeepSeekV3(Transformer):
         for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
             self.layers.append(
                 TransformerBlockDeepSeekV3(
-                    layer_id, self.params, cache, attn_backend, self.op_impl
+                    layer_id,
+                    self.params,
+                    cache,
+                    attn_backend,
+                    self.op_impl,
+                    mla_absorb=self.mla_absorb,
                 )
             )
 

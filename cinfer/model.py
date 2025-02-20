@@ -255,6 +255,7 @@ class Transformer(nn.Module):
         model_parallel_size,
         attn_backend,
         op_impl,
+        **kvargs,
     ):
         super().__init__()
         self.cache = cache

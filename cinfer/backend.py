@@ -161,10 +161,24 @@ class Backend:
             local_end_layer_id = args.models.n_layers
         kv_cache_kvargs = {}
         if args.models.type == "deepseek-v3":
-            kv_cache_kvargs["k_shape_per_sample"] = (args.models.kv_lora_rank,)
-            kv_cache_kvargs["v_shape_per_sample"] = (args.models.qk_rope_head_dim,)
-            # Unable to distribute DeepSeek-v3's KV cache via TP. So these shapes have
-            # nothing to do with model_parallel_size
+            if (
+                args.infer.mla_absorb == "absorb"
+                or args.infer.mla_absorb == "absorb-without-precomp"
+            ):
+                kv_cache_kvargs["k_shape_per_sample"] = (args.models.kv_lora_rank,)
+                kv_cache_kvargs["v_shape_per_sample"] = (args.models.qk_rope_head_dim,)
+                # Unable to distribute DeepSeek-v3's KV cache via TP. So these shapes have
+                # nothing to do with model_parallel_size
+            elif args.infer.mla_absorb == "none":
+                n_local_heads = args.models.n_heads // model_parallel_size
+                k_head_dim = args.models.qk_nope_head_dim + args.models.qk_rope_head_dim
+                v_head_dim = args.models.v_head_dim
+                kv_cache_kvargs["k_shape_per_sample"] = (n_local_heads, k_head_dim)
+                kv_cache_kvargs["v_shape_per_sample"] = (n_local_heads, v_head_dim)
+            else:
+                raise NotImplementedError(
+                    f"Unsupported mla_absorb {args.infer.mla_absorb}"
+                )
         else:
             n_kv_heads = (
                 args.models.n_kv_heads
@@ -235,6 +249,7 @@ class Backend:
             attn_backend=attn_backend,
             op_impl=args.infer.op_impl,
             merge_qkv_gate_up=merge_qkv_gate_up,
+            mla_absorb=args.infer.mla_absorb,
         )
         if (
             (args.quant == "awq")
