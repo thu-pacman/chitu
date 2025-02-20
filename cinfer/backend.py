@@ -18,10 +18,10 @@ from .cache_manager import (
 )
 from .tensor_parallel import init_tp, get_tp_size
 from .attn_backend import FlashAttnBackend, RefAttnBackend
-from .model_llama import TransformerLlama
-from .model_deepseek_v3 import TransformerDeepSeekV3
-from .model_hf_llama import TransformerHFLlama
-from .model_hf_mixtral import TransformerHFMixtral
+from .models.model_llama import TransformerLlama
+from .models.model_deepseek_v3 import TransformerDeepSeekV3
+from .models.model_hf_llama import TransformerHFLlama
+from .models.model_hf_mixtral import TransformerHFMixtral
 from .utils import compute_layer_dist_in_pipe
 
 from logging import getLogger
