@@ -3,7 +3,7 @@ import torch
 import bitsandbytes as bnb
 
 
-from ..model import *
+from ..models.model import *
 from ..tokenizer import Tokenizer, ChatFormat
 from .. import awq
 from ..tensor_parallel import ColumnParallelLinear, RowParallelLinear

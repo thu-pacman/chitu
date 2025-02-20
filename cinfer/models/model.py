@@ -11,16 +11,13 @@ from torch import nn
 
 import numpy as np
 
-from .global_vars import set_global_variables, get_timers
-from .utils import VarLens, compute_layer_dist_in_pipe, is_layer
-from .cache_manager import PagedKVCacheManager
-from .tensor_parallel import get_tp_group, get_tp_rank
+from ..global_vars import set_global_variables, get_timers
+from ..utils import VarLens, compute_layer_dist_in_pipe, is_layer
+from ..cache_manager import PagedKVCacheManager
+from ..tensor_parallel import get_tp_group, get_tp_rank
 
 
-# from vllm import _custom_ops as vllm_ops
-# import cinfer_backend
-
-from .tokenizer import Tokenizer, ChatFormat, TokenizerHF, ChatFormatHF
+from ..tokenizer import Tokenizer, ChatFormat, TokenizerHF, ChatFormatHF
 from pathlib import Path
 import os, sys, json, time
 

@@ -6,18 +6,18 @@ import torch.nn.functional as F
 import flash_attn
 from logging import getLogger
 
-from .ops import apply_rotary_pos_emb_triton
-from .utils import (
+from ..ops import apply_rotary_pos_emb_triton
+from ..utils import (
     merge_column_parallel_weights,
     merge_column_parallel_biases,
 )
-from .tensor_parallel import (
+from ..tensor_parallel import (
     get_tp_size,
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
 )
-from .muxi_utils import (
+from ..muxi_utils import (
     preprocess_weights_for_native_layout,
     linear_layout_contig_x_native_y,
     linear_layout_native_x_contig_y,
