@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from .model import Attention, Transformer, TransformerBlock, RMSNorm
-from .tensor_parallel import (
+from ..tensor_parallel import (
     get_tp_group,
     get_tp_size,
     get_tp_rank,
@@ -15,7 +15,11 @@ from .tensor_parallel import (
     RowParallelLinear,
     VocabParallelEmbedding,
 )
-from .ops import act_quant_deepseek_v3, weight_dequant_deepseek_v3, fp8_gemm_deepseek_v3
+from ..ops import (
+    act_quant_deepseek_v3,
+    weight_dequant_deepseek_v3,
+    fp8_gemm_deepseek_v3,
+)
 
 
 def linear_deepseek_v3(

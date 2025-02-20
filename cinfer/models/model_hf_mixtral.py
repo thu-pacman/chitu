@@ -4,7 +4,7 @@ from typing import List, Mapping, Any
 import torch
 from torch import nn
 
-from .tensor_parallel import ColumnParallelLinear, RowParallelLinear
+from ..tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from .model_hf_llama import (
     FeedForwardHFLlama,
     TransformerBlockHFLlama,

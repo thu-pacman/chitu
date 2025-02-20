@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from .model import Attention, Transformer, TransformerBlock, RMSNorm
-from .tensor_parallel import (
+from ..tensor_parallel import (
     get_tp_size,
     ColumnParallelLinear,
     RowParallelLinear,
