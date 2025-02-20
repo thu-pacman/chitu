@@ -100,10 +100,6 @@ class NormalExecutor(Executor):
                         device=logits.device,
                     ),
                 )
-        print(f"!!! {torch.distributed.get_rank()}: update_response (B)")
-        print(
-            f"!!! {torch.distributed.get_rank()}: is_all_greedy: {tasks.is_all_greedy}"
-        )
         if tasks.is_all_greedy:
             tokens = torch.argmax(logits, dim=-1)
         else:
@@ -111,7 +107,6 @@ class NormalExecutor(Executor):
             tokens = top_k_top_p_min_p_sampling_from_probs_torch(
                 probs, tasks.top_ks, tasks.top_ps
             )
-        print(f"!!! {torch.distributed.get_rank()}: update_response (C)")
         tokens_cpu = tokens.cpu()
         for it, task in enumerate(tasks.tasks):
             task.update_response(tokens_cpu[it].item(), tokens[it])
@@ -156,9 +151,7 @@ class NormalExecutor(Executor):
         self,
         tasks: PackedTasksBase,
     ):
-        print(f"!!! {torch.distributed.get_rank()}: step (A)")
         tasks = self.propagate_tasks(tasks)
-        print(f"!!! {torch.distributed.get_rank()}: step (B)")
         if tasks is None:
             return
         if tasks.task_type == TaskType.Prefill:
@@ -184,7 +177,6 @@ class PipeTensorExecutor(NormalExecutor):
         self.tp_group = get_tp_group()
 
     def prefill_step(self, tasks: PackedTasksBase):
-        print(f"!!! {self.rank}: prefill step (A)")
         varlens = VarLens(tasks.tokens, device=self.local_rank)
         Backend.cache_manager.curr_varlens = varlens
         Backend.cache_manager.curr_req_ids = tasks.req_ids
@@ -238,11 +230,9 @@ class PipeTensorExecutor(NormalExecutor):
                 tag=LOGIT_TAG,
             )
         Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
-        print(f"!!! {self.rank}: prefill step (B)")
         return out
 
     def decode_step(self, tasks: PackedTasksBase):
-        print(f"!!! {self.rank}: decode step")
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
         Backend.cache_manager.curr_req_ids = tasks.req_ids
         if isinstance(Backend.cache_manager, PagedKVCacheManager):
