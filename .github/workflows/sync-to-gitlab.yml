@@ -22,3 +22,4 @@ jobs:
       - name: Push PR branch to GitLab
         run: |
           git push gitlab ${{ github.event.pull_request.head.ref }}:github_${{ github.event.pull_request.head.ref }}  # 推送 PR 分支
+          echo "Sync Success!"
