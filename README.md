@@ -1,4 +1,6 @@
-# CInfer
+# 赤兔（Chitu）
+
+A.k.a. CInfer
 
 ## Setup for Development
 
