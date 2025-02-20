@@ -135,6 +135,7 @@ class TransformerHFMixtral(TransformerHFLlama):
         layer_type=TransformerBlockHFMixtral,
         merge_qkv_gate_up=True,
         op_impl="torch",
+        **kvargs,
     ):
         super().__init__(
             params,
@@ -146,6 +147,7 @@ class TransformerHFMixtral(TransformerHFLlama):
             layer_type=layer_type,
             merge_qkv_gate_up=merge_qkv_gate_up,
             op_impl=op_impl,
+            **kvargs,
         )
 
     def _get_tensor_row_parallel_layer_names(self) -> List[str]:

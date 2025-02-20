@@ -1,11 +1,14 @@
 import torch
 import gc
 import itertools
+from tqdm import tqdm, trange
+from glob import glob
 from enum import Enum
 from .tokenizer import Tokenizer, ChatFormat, TokenizerHF, ChatFormatHF
 from pathlib import Path
 import os, sys, json, time
 from transformers import AutoModelForCausalLM
+from safetensors.torch import safe_open
 
 from .cache_manager import (
     KVCacheManager,
@@ -16,6 +19,7 @@ from .cache_manager import (
 from .tensor_parallel import init_tp, get_tp_size
 from .attn_backend import FlashAttnBackend, RefAttnBackend
 from .model_llama import TransformerLlama
+from .model_deepseek_v3 import TransformerDeepSeekV3
 from .model_hf_llama import TransformerHFLlama
 from .model_hf_mixtral import TransformerHFMixtral
 from .utils import compute_layer_dist_in_pipe
@@ -55,6 +59,8 @@ class Backend:
             return TransformerHFMixtral(args, cache, *extra_args, **extra_kwargs)
         elif args.type == "llama":
             return TransformerLlama(args, cache, *extra_args, **extra_kwargs)
+        elif args.type == "deepseek-v3":
+            return TransformerDeepSeekV3(args, cache, *extra_args, **extra_kwargs)
         else:
             assert False, f"Unknown model type {args.models.type}"
 
@@ -104,7 +110,11 @@ class Backend:
             if hasattr(args.models, "tokenizer_force_full_seq_decode")
             else False
         )
-        if args.models.type == "hf-llama" or args.models.type == "hf-mixtral":
+        if (
+            args.models.type == "hf-llama"
+            or args.models.type == "hf-mixtral"
+            or args.models.type == "deepseek-v3"
+        ):
             tokenizer = TokenizerHF(
                 path=args.models.tokenizer_path,
                 trust_remote_code=trust_remote_code,
@@ -127,7 +137,11 @@ class Backend:
             device=local_rank,
         )
         Backend.tokenizer = tokenizer
-        if args.models.type == "hf-llama" or args.models.type == "hf-mixtral":
+        if (
+            args.models.type == "hf-llama"
+            or args.models.type == "hf-mixtral"
+            or args.models.type == "deepseek-v3"
+        ):
             Backend.formatter = ChatFormatHF(tokenizer)
         else:
             Backend.formatter = ChatFormat(tokenizer)
@@ -145,46 +159,68 @@ class Backend:
         else:
             local_begin_layer_id = 0
             local_end_layer_id = args.models.n_layers
-
-        n_kv_heads = args.models.n_kv_heads
-        n_local_kv_heads = n_kv_heads // model_parallel_size
-        head_dim = args.models.dim // args.models.n_heads
+        kv_cache_kvargs = {}
+        if args.models.type == "deepseek-v3":
+            if (
+                args.infer.mla_absorb == "absorb"
+                or args.infer.mla_absorb == "absorb-without-precomp"
+            ):
+                kv_cache_kvargs["k_shape_per_sample"] = (args.models.kv_lora_rank,)
+                kv_cache_kvargs["v_shape_per_sample"] = (args.models.qk_rope_head_dim,)
+                # Unable to distribute DeepSeek-v3's KV cache via TP. So these shapes have
+                # nothing to do with model_parallel_size
+            elif args.infer.mla_absorb == "none":
+                n_local_heads = args.models.n_heads // model_parallel_size
+                k_head_dim = args.models.qk_nope_head_dim + args.models.qk_rope_head_dim
+                v_head_dim = args.models.v_head_dim
+                kv_cache_kvargs["k_shape_per_sample"] = (n_local_heads, k_head_dim)
+                kv_cache_kvargs["v_shape_per_sample"] = (n_local_heads, v_head_dim)
+            else:
+                raise NotImplementedError(
+                    f"Unsupported mla_absorb {args.infer.mla_absorb}"
+                )
+        else:
+            n_kv_heads = (
+                args.models.n_kv_heads
+                if hasattr(args.models, "n_kv_heads")
+                else args.models.n_heads
+            )
+            n_local_kv_heads = n_kv_heads // model_parallel_size
+            head_dim = args.models.dim // args.models.n_heads
+            kv_cache_kvargs["n_local_kv_heads"] = n_local_kv_heads
+            kv_cache_kvargs["head_dim"] = head_dim
         if args.infer.cache_type == "normal":
             Backend.cache_manager = KVCacheManager(
                 local_begin_layer_id,
                 local_end_layer_id,
-                n_local_kv_heads=n_local_kv_heads,
-                head_dim=head_dim,
+                **kv_cache_kvargs,
             )
         elif args.infer.cache_type == "nop":
             Backend.cache_manager = KVCacheManagerNop(
                 local_begin_layer_id,
                 local_end_layer_id,
-                n_local_kv_heads=n_local_kv_heads,
-                head_dim=head_dim,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=args.infer.max_reqs,
                 device=local_rank,
+                **kv_cache_kvargs,
             )
         elif args.infer.cache_type == "paged":
             Backend.cache_manager = PagedKVCacheManager(
                 local_begin_layer_id,
                 local_end_layer_id,
-                n_local_kv_heads=n_local_kv_heads,
-                head_dim=head_dim,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=args.infer.max_reqs,
                 device=local_rank,
+                **kv_cache_kvargs,
             )
         elif args.infer.cache_type == "skew":
             Backend.cache_manager = KVCacheManagerSkewAware(
                 local_begin_layer_id,
                 local_end_layer_id,
-                n_local_kv_heads=n_local_kv_heads,
-                head_dim=head_dim,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=args.infer.max_reqs,
                 device=local_rank,
+                **kv_cache_kvargs,
             )
         else:
             assert False, f"Unknown cache type {args.infer.cache_type}"
@@ -198,7 +234,7 @@ class Backend:
 
         # Init model
         merge_qkv_gate_up = True
-        if args.models.type == "llama":
+        if args.models.type == "llama" or args.models.type == "deepseek-v3":
             merge_qkv_gate_up = False  # Not yet supported
         if args.quant != "None":
             # Merge weights for quantized models is non-trivial, because we can
@@ -213,6 +249,7 @@ class Backend:
             attn_backend=attn_backend,
             op_impl=args.infer.op_impl,
             merge_qkv_gate_up=merge_qkv_gate_up,
+            mla_absorb=args.infer.mla_absorb,
         )
         if (
             (args.quant == "awq")
@@ -304,6 +341,10 @@ class Backend:
                         return key
 
                     checkpoint = dict((transform_key(k), v) for k, v in params.items())
+            elif args.models.type == "deepseek-v3":
+                checkpoint = load_state_dict_deepseek_v3(args.models.ckpt_dir)
+            else:
+                raise NotImplementedError(f"Unsupported model type {args.models.type}")
 
             model.load_state_dict(
                 checkpoint, strict=True, assign=args.keep_dtype_in_checkpoint
@@ -326,3 +367,48 @@ class Backend:
         setattr(Backend, "cache_manager", None)
         gc.collect()
         torch.cuda.empty_cache()
+
+
+def load_state_dict_deepseek_v3(hf_ckpt_path):
+    torch.set_num_threads(8)
+    state_dict = {}
+
+    for file_path in tqdm(glob(os.path.join(hf_ckpt_path, "*.safetensors"))):
+        with safe_open(file_path, framework="pt", device="cpu") as f:
+            for name in f.keys():
+                if "model.layers.61" in name:
+                    continue
+                param: torch.Tensor = f.get_tensor(name)
+                if name.startswith("model."):
+                    name = name[len("model.") :]
+                name = name.replace("self_attn", "attn")
+                name = name.replace("mlp", "ffn")
+                name = name.replace("weight_scale_inv", "scale")
+                name = name.replace("e_score_correction_bias", "bias")
+                key = name.split(".")[-2]
+                mapping = {
+                    "embed_tokens": ("embed", 0),
+                    "input_layernorm": ("attn_norm", None),
+                    "post_attention_layernorm": ("ffn_norm", None),
+                    "q_proj": ("wq", 0),
+                    "q_a_proj": ("wq_a", None),
+                    "q_a_layernorm": ("q_norm", None),
+                    "q_b_proj": ("wq_b", 0),
+                    "kv_a_proj_with_mqa": ("wkv_a", None),
+                    "kv_a_layernorm": ("kv_norm", None),
+                    "kv_b_proj": ("wkv_b", 0),
+                    "o_proj": ("wo", 1),
+                    "gate": ("gate", None),
+                    "gate_proj": ("w1", 0),
+                    "down_proj": ("w2", 1),
+                    "up_proj": ("w3", 0),
+                    "norm": ("norm", None),
+                    "lm_head": ("head", 0),
+                    "scale": ("scale", None),
+                }
+                assert key in mapping, f"Key {key} not found in mapping"
+                new_key, dim = mapping[key]
+                name = name.replace(key, new_key)
+                state_dict[name] = param
+
+    return state_dict

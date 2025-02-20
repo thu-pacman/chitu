@@ -64,6 +64,7 @@ class TransformerLlama(Transformer):
         attn_backend,
         op_impl,
         merge_qkv_gate_up=False,
+        **kvargs,
     ):
         super().__init__(
             params,
@@ -72,6 +73,7 @@ class TransformerLlama(Transformer):
             model_parallel_size,
             attn_backend,
             op_impl,
+            **kvargs,
         )
         self.op_impl = op_impl
         if merge_qkv_gate_up:

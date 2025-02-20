@@ -168,7 +168,6 @@ class PipeTensorExecutor(NormalExecutor):
         super().__init__(args)
         self.rank = torch.distributed.get_rank()
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        self.world_size = torch.distributed.get_world_size()
         self.tp_size = args.infer.tp_size
         self.pp_size = args.infer.pp_size
         self.pp_stage = Backend.pp_stage
@@ -301,7 +300,7 @@ class PipeTensorExecutor(NormalExecutor):
     def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
         remove_kvcache = False
 
-        # Rank 0 initialzie from the argument. Rank >= 1 recv task tensor from Rank - 1
+        # PP stage 0 initialzie from the argument. PP stage >= 1 recv task tensor from stage - 1
         if self.rank == 0:
             if Backend.state == BackendState.Running:
                 task_tensor = tasks.serialize(device=self.local_rank)
@@ -360,7 +359,7 @@ class PipeTensorExecutor(NormalExecutor):
 
         if Backend.state == BackendState.Terminated:
             return
-        # Rank 0 recv final logits from Rank world_size - 1
+        # Rank 0 recv final logits from last PP stage
         if self.rank == 0:
             if tasks.task_type == TaskType.Prefill:
                 # After prefill, new decode tasks are created
@@ -375,7 +374,6 @@ class TensorExecutor(NormalExecutor):
         super().__init__(args)
         self.rank = torch.distributed.get_rank()
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        self.world_size = torch.distributed.get_world_size()
 
     def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
         """Broadcast task metadata from rank 0 to all other ranks"""

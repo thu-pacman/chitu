@@ -15,6 +15,7 @@ infer:
   cache_type: skew
   attn_type: flash # flash or ref
   op_impl: torch # torch or muxi_custom_kernel
+  mla_absorb: "none" # none, absorb-without-precomp, absorb
   max_reqs: 8
 request:
   prompt_tokens_len: -1 # use for perf test in single_req_test.py, -1 means use real requests.

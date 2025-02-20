@@ -16,6 +16,7 @@ infer:
   max_reqs: 64
   attn_type: flash # flash or ref
   op_impl: torch # torch or muxi_custom_kernel
+  mla_absorb: "none" # none, absorb-without-precomp, absorb
 request:
   prompt_tokens_len: -1 # use for perf test in single_req_test.py, -1 means use real requests.
   max_new_tokens: 128
