@@ -35,8 +35,6 @@ This will create a `dist/` directory containing the wheel files. Copy them to yo
 
 Optionally, you can also copy `test/` and `example/` directories to your desired location to run them.
 
-DO NOT COPY SOURCE FILES OUT OF CONTROLLED DEVELOPMENT ENVIRONMENT WITHOUT PERMISSION FROM YOUR SUPERVISOR.
-
 ## Internal Test
 
 ```bash
