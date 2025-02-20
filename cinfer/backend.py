@@ -89,8 +89,8 @@ class Backend:
 
         torch.manual_seed(args.infer.seed)
 
-        # if global_rank > 0:
-        #    sys.stdout = open(os.devnull, "w")
+        if global_rank > 0:
+            sys.stdout = open(os.devnull, "w")
 
         trust_remote_code = False
         if args.models.name.startswith("glm4"):
