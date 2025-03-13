@@ -17,7 +17,7 @@ Chitu is a high-performance inference framework for large language models. Chitu
 - **Availability**: Chitu is ready and already deployed for real-world production.
 
 
-Welcome to join the [Wechat group](docs/assets/wechat_group.jpg) Wechat group and stay tuned!
+Welcome to join the [WeChat group](docs/assets/wechat_group.jpg) and stay tuned!
 
 
 ## Benchmarks
@@ -26,7 +26,7 @@ We evaluate on NVIDIA A800 40GB and H20 96GB GPUs, comparing with vLLM as baseli
 
 
 ### Online throughput: DeepSeek-R1-671B on A800(40GB)
-<video src="docs/assets/chitu_performance.mp4" autoplay loop muted controls>
+<video src="https://github.com/user-attachments/assets/41495ac8-123d-4402-a6a8-0e0294b2edf4" autoplay loop muted controls>
 </video>
 
 #### N nodes * 8 * A800(40GB)
