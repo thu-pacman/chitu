@@ -1,0 +1,15 @@
+name: DeepSeek-R1-Distill-Qwen-14B
+type: hf-llama
+source: "https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-14B" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+dim: 5120
+n_layers: 48
+n_heads: 40
+n_kv_heads: 8
+vocab_size: 152064
+intermediate_dim: 13824
+norm_eps: 1e-05
+rope_theta: 1000000.0
+rs_token_id: 151648
+re_token_id: 151649

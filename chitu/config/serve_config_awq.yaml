@@ -1,0 +1,46 @@
+defaults:
+  - models: Qwen2-7B-Instruct
+serve:
+  host: 0.0.0.0
+  port: 21002
+infer:
+  tp_size: 1
+  pp_size: 1
+  do_load: True # set it to False for debug purpose
+  seed: 0
+  stop_with_eos: True
+  max_seq_len: 4096 # length of prefill + decode
+  cache_type: paged
+  max_reqs: 64
+  attn_type: flash_attn # flash_attn, flash_mla, flash_infer, triton or ref
+  op_impl: torch # torch or muxi_custom_kernel
+  mla_absorb: "none" # none, absorb-without-precomp, absorb
+  soft_fp8: False
+request:
+  prompt_tokens_len: -1 # use for perf test in single_req_test.py, -1 means use real requests.
+  max_new_tokens: 128
+scheduler:
+  type: prefill_first
+  fcfs:
+    num_tasks: 16
+    enable_hybrid: False
+  prefill_first:
+    num_tasks: 64
+    enable_hybrid: False
+  stride:
+    num_tasks: 2
+    enable_hybrid: False
+  deadline:
+    num_tasks: 2
+    enable_hybrid: False
+  prefix_align:
+    num_tasks: 2
+    enable_hybrid: False
+  balance:
+    num_tasks: 2
+    enable_hybrid: False
+quant: awq
+quant_ckpt_dir: /home/tanyijun/test_quantize/quant_cache/Qwen2-7B-4bit.pth
+dtype: float16 # default_dtype of torch
+keep_dtype_in_checkpoint: True
+skip_preprocess: False
