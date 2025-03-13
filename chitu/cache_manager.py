@@ -29,7 +29,8 @@ class PagedKVCacheManager:
         You can optionally set `k_shae_per_sample` and `v_shape_per_sample`, or `n_local_kv_heads` and `head_dim`.
         """
 
-        self.num_blocks = (max_seq_len // block_size) * num_hot_req
+        self.max_blocks_per_req = max_seq_len // block_size + 1
+        self.num_blocks = self.max_blocks_per_req * num_hot_req
 
         self.begin_layer_id = begin_layer_id
         self.end_layer_id = end_layer_id
@@ -54,6 +55,17 @@ class PagedKVCacheManager:
         self.seq_lens = {}
         self.timers = get_timers()
         self.block_table = {}  # (seq_id, block_idx)
+        self.curr_seq_lens_gpu_excl_this_decode = torch.zeros(
+            num_hot_req, dtype=torch.int32, device=self.device
+        )
+        self.curr_seq_lens_gpu_incl_this_decode = torch.zeros(
+            num_hot_req, dtype=torch.int32, device=self.device
+        )
+        self.gpu_block_table_buffer = torch.zeros(
+            (num_hot_req, self.max_blocks_per_req),
+            dtype=torch.int32,
+            device=self.device,
+        )
         # TODO: For better performance, use list instead of set for free_blocks
         self.free_blocks = set(range(self.num_blocks))
         if self.kv_shape_per_sample is not None:
@@ -140,12 +152,10 @@ class PagedKVCacheManager:
             seq_lens.append(seq_len)
         max_seq = max(seq_lens)
         self.curr_seq_lens = seq_lens
-        self.curr_seq_lens_gpu_excl_this_decode = torch.tensor(
-            seq_lens, dtype=torch.int32, device=self.device
-        )
-        self.curr_seq_lens_gpu_incl_this_decode = (
-            self.curr_seq_lens_gpu_excl_this_decode + 1
-        )
+        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
+        self.curr_seq_lens_gpu_excl_this_decode[: len(seq_lens)].copy_(seq_lens_tensor)
+        self.curr_seq_lens_gpu_incl_this_decode[: len(seq_lens)].copy_(seq_lens_tensor)
+        self.curr_seq_lens_gpu_incl_this_decode[: len(seq_lens)].add_(1)
 
     def get_free_block(self):
         # TODO: When run out of free blocks, use scheduling and preemption in paper instead of exception
@@ -161,10 +171,10 @@ class PagedKVCacheManager:
         return self.gpu_block_table
 
     def get_gpu_seq_lens_excl_this_decode(self):
-        return self.curr_seq_lens_gpu_excl_this_decode
+        return self.curr_seq_lens_gpu_excl_this_decode[: len(self.curr_seq_lens)]
 
     def get_gpu_seq_lens_incl_this_decode(self):
-        return self.curr_seq_lens_gpu_incl_this_decode
+        return self.curr_seq_lens_gpu_incl_this_decode[: len(self.curr_seq_lens)]
 
     def get_paged_kv_cache(self, layer_id):
         if self.kv_shape_per_sample is not None:
@@ -188,14 +198,15 @@ class PagedKVCacheManager:
             if self.seq_lens[req_id] % self.block_size == 0:
                 self.block_table[req_id].append(self.get_free_block())
 
-        max_block_num = max(len(self.block_table[req_id]) for req_id in req_ids)
-        gpu_block_table = [[0] * max_block_num for _ in range(len(req_ids))]
+        self.gpu_block_table_buffer[: len(req_ids)].zero_()
+
         for idx, req_id in enumerate(req_ids):
             block_ids = self.block_table[req_id]
-            gpu_block_table[idx][: len(block_ids)] = block_ids
-        self.gpu_block_table = torch.tensor(
-            gpu_block_table, dtype=torch.int32, device=self.device
-        )
+            self.gpu_block_table_buffer[idx, : len(block_ids)].copy_(
+                torch.tensor(block_ids, dtype=torch.int32, device=self.device)
+            )
+
+        self.gpu_block_table = self.gpu_block_table_buffer[: len(req_ids)]
 
     def finalize_cache_single_decode(self, req_ids):
         for req_id in req_ids:

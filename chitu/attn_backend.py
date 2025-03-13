@@ -520,11 +520,18 @@ class FlashMLABackend(RefAttnBackend):
         block_size,
         softmax_scale=None,
     ):
-        self.metadata, self.num_splits = flash_mla.get_mla_metadata(
+        metadata, num_splits = flash_mla.get_mla_metadata(
             cache_seqlens_incl_this_decode,
             self.mtp_size * self.local_n_heads // self.kv_heads,
             self.kv_heads,
         )
+        if self.metadata is None or self.num_splits is None:
+            self.metadata = metadata.clone()
+            self.num_splits = num_splits.clone()
+
+        splits_len = num_splits.shape[0]
+        self.metadata.copy_(metadata)
+        self.num_splits[:splits_len].copy_(num_splits)
 
     def mla_attn_with_kvcache(
         self,
@@ -588,19 +595,47 @@ class FlashInferBackend(RefAttnBackend):
         softmax_scale=None,
     ):
         batch_size = cache_seqlens_incl_this_decode.shape[0]
-
-        # FlashInfer accepts block tables for Q and KV in CSR format.
-        # - For Q, it is trivial because the length for each sample is 1.
-        # - For KV, we need to convert `block_table` to CSR format.
-        q_indptr = torch.arange(0, batch_size + 1).cuda().int()
-        kv_indptr_list = []
-        kv_indices_list = []
+        max_blocks_per_seq = block_table.shape[1]
+        if not hasattr(self, "q_indptr") or self.q_indptr.shape[0] != batch_size + 1:
+            self.q_indptr = torch.zeros(
+                batch_size + 1, dtype=torch.int32, device="cuda"
+            )
+        torch.arange(0, batch_size + 1, out=self.q_indptr)
+        if not hasattr(self, "kv_indptr") or self.kv_indptr.shape[0] != batch_size + 1:
+            self.kv_indptr = torch.zeros(
+                batch_size + 1, dtype=torch.int32, device="cuda"
+            )
+        max_indices = batch_size * max_blocks_per_seq
+        if (
+            not hasattr(self, "kv_indices_buffer")
+            or self.kv_indices_buffer.shape[0] < max_indices
+        ):
+            self.kv_indices_buffer = torch.zeros(
+                max_indices, dtype=torch.int32, device="cuda"
+            )
+        self.kv_indptr.zero_()
+        valid_blocks = torch.zeros(
+            (batch_size, max_blocks_per_seq), dtype=torch.bool, device="cuda"
+        )
         for i in range(batch_size):
-            kv_indptr_list.append(len(kv_indices_list))
-            kv_indices_list.append(block_table[i, : cache_seqlens_incl_this_decode[i]])
-        kv_indptr_list.append(len(kv_indices_list))
-        kv_indptr = torch.tensor(kv_indptr_list).cuda().int()
-        kv_indices = torch.cat(kv_indices_list).cuda().int()
+            valid_range = (
+                torch.arange(max_blocks_per_seq, device="cuda")
+                < cache_seqlens_incl_this_decode[i]
+            )
+            valid_blocks[i] = valid_range
+        blocks_per_seq = valid_blocks.sum(dim=1)
+        torch.cumsum(blocks_per_seq, dim=0, out=self.kv_indptr[1:])
+        total_valid_blocks = blocks_per_seq.sum().item()
+        idx = 0
+        for i in range(batch_size):
+            num_blocks = blocks_per_seq[i].item()
+            if num_blocks > 0:
+                # 使用连续内存操作
+                self.kv_indices_buffer[idx : idx + num_blocks].copy_(
+                    block_table[i, :num_blocks]
+                )
+                idx += num_blocks
+        kv_indices = self.kv_indices_buffer[:total_valid_blocks]
 
         if softmax_scale is None:
             softmax_scale = (
@@ -608,8 +643,8 @@ class FlashInferBackend(RefAttnBackend):
             )
 
         self.mla_wrapper.plan(
-            q_indptr,
-            kv_indptr,
+            self.q_indptr,
+            self.kv_indptr,
             kv_indices,
             cache_seqlens_incl_this_decode,
             num_heads=self.local_n_heads,

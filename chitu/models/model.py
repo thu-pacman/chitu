@@ -13,7 +13,7 @@ from torch import nn
 
 import numpy as np
 
-from ..global_vars import set_global_variables, get_timers
+from ..global_vars import set_global_variables, get_timers, get_global_args
 from ..utils import VarLens, compute_layer_dist_in_pipe, is_layer
 from ..muxi_utils import has_tbsgemm, tbsgemm
 from ..cache_manager import PagedKVCacheManager
@@ -427,8 +427,25 @@ class Transformer(nn.Module):
         return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
 
     def prepare_freqs_cis_decode(self, seq_lens):
+        bs = len(seq_lens)
         curr_freqs_cis = self.freqs_cis[self.cache.get_gpu_seq_lens_excl_this_decode()]
-        return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
+        if not hasattr(self, "cis_cos_buffer") or not hasattr(self, "cis_sin_buffer"):
+            max_reqs = get_global_args().infer.max_reqs
+            self.cis_cos_buffer = torch.zeros(
+                (max_reqs, curr_freqs_cis.real.shape[-1]),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.cis_sin_buffer = torch.zeros(
+                (max_reqs, curr_freqs_cis.imag.shape[-1]),
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+        self.cis_cos_buffer[:bs].copy_(curr_freqs_cis.real.contiguous())
+        self.cis_sin_buffer[:bs].copy_(curr_freqs_cis.imag.contiguous())
+
+        return self.cis_cos_buffer[:bs], self.cis_sin_buffer[:bs]
 
     @torch.inference_mode()
     def prefill_single_device(self, tokens, varlens=None):
@@ -448,9 +465,7 @@ class Transformer(nn.Module):
         return h
 
     @torch.inference_mode()
-    def decode_single_device(self, tokens, seq_lens):
-        # generate different freqs_cis for each request, [num_req, other_freq_dim]
-        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_decode(seq_lens)
+    def decode_single_device(self, tokens, freqs_cis_cos, freqs_cis_sin):
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):
             h = layer(h, freqs_cis_cos, freqs_cis_sin)
@@ -485,9 +500,7 @@ class Transformer(nn.Module):
         return h
 
     @torch.inference_mode()
-    def decode_pipeline(self, tokens, seq_lens):
-        # generate different freqs_cis for each request, [num_req, other_freq_dim]
-        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_decode(seq_lens)
+    def decode_pipeline(self, tokens, freqs_cis_cos, freqs_cis_sin):
         if self.pp_stage == 0:
             h = self._pre_layers(tokens)
         else:
@@ -509,14 +522,6 @@ class Transformer(nn.Module):
         else:
             return self.prefill_single_device(tokens)
 
-    @torch.inference_mode()
-    def decode(self, tokens, seq_lens):
-        self.prepare_decoding_attn()
-        if self.pipeline_exec:
-            return self.decode_pipeline(tokens, seq_lens)
-        else:
-            return self.decode_single_device(tokens, seq_lens)
-
     def prepare_decoding_attn(self):
         cache_seqlens_excl_this_decode = self.cache.get_gpu_seq_lens_excl_this_decode()
         cache_seqlens_incl_this_decode = self.cache.get_gpu_seq_lens_incl_this_decode()
@@ -528,3 +533,90 @@ class Transformer(nn.Module):
             block_table,
             block_size,
         )
+
+    @torch.inference_mode()
+    def decode(self, tokens, seq_lens):
+        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_decode(seq_lens)
+        self.prepare_decoding_attn()
+
+        batch_size = len(seq_lens)
+        use_cuda_graph = get_global_args().infer.use_cuda_graph and (
+            get_global_args().infer.attn_type == "flash_infer"
+            or get_global_args().infer.attn_type == "flash_mla"
+        )
+        if use_cuda_graph and batch_size <= get_global_args().infer.max_reqs:
+            if not hasattr(self, "cuda_graphs"):
+                self.cuda_graphs = {}
+                self.static_tokens_dict = {}
+                self.static_output_dict = {}
+                self.cuda_graph_pool = None
+
+            if batch_size not in self.cuda_graphs:
+                self.static_tokens_dict[batch_size] = tokens.clone()
+
+                if self.pipeline_exec:
+                    sample_output = self.decode_pipeline(
+                        self.static_tokens_dict[batch_size],
+                        freqs_cis_cos,
+                        freqs_cis_sin,
+                    )
+                else:
+                    sample_output = self.decode_single_device(
+                        self.static_tokens_dict[batch_size],
+                        freqs_cis_cos,
+                        freqs_cis_sin,
+                    )
+
+                self.static_output_dict[batch_size] = torch.zeros_like(sample_output)
+
+                self.cuda_graphs[batch_size] = torch.cuda.CUDAGraph()
+
+                if self.cuda_graph_pool is not None:
+                    with torch.cuda.graph(
+                        self.cuda_graphs[batch_size], pool=self.cuda_graph_pool
+                    ):
+                        if self.pipeline_exec:
+                            self.static_output_dict[batch_size].copy_(
+                                self.decode_pipeline(
+                                    self.static_tokens_dict[batch_size],
+                                    freqs_cis_cos,
+                                    freqs_cis_sin,
+                                )
+                            )
+                        else:
+                            self.static_output_dict[batch_size].copy_(
+                                self.decode_single_device(
+                                    self.static_tokens_dict[batch_size],
+                                    freqs_cis_cos,
+                                    freqs_cis_sin,
+                                )
+                            )
+                else:
+                    with torch.cuda.graph(self.cuda_graphs[batch_size]):
+                        if self.pipeline_exec:
+                            self.static_output_dict[batch_size].copy_(
+                                self.decode_pipeline(
+                                    self.static_tokens_dict[batch_size],
+                                    freqs_cis_cos,
+                                    freqs_cis_sin,
+                                )
+                            )
+                        else:
+                            self.static_output_dict[batch_size].copy_(
+                                self.decode_single_device(
+                                    self.static_tokens_dict[batch_size],
+                                    freqs_cis_cos,
+                                    freqs_cis_sin,
+                                )
+                            )
+                    if self.cuda_graph_pool is None:
+                        self.cuda_graph_pool = self.cuda_graphs[batch_size].pool()
+
+            self.static_tokens_dict[batch_size].copy_(tokens)
+            self.cuda_graphs[batch_size].replay()
+            return self.static_output_dict[batch_size]
+        else:
+            if self.pipeline_exec:
+                return self.decode_pipeline(tokens, freqs_cis_cos, freqs_cis_sin)
+            else:
+                return self.decode_single_device(tokens, freqs_cis_cos, freqs_cis_sin)

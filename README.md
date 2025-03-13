@@ -49,38 +49,38 @@ First follow "Setup for Development" to install to your local environment, inclu
 
 This will create a `dist/` directory containing the wheel files. Copy them to your desired location and install them with `pip install <wheel_file>`. If you have to use custom dependencies (e.g. `torch`) of your platform, append `--no-deps` to the `pip install` command.
 
-Optionally, you can also copy `test/` and `example/` directories to your desired location to run them.
+Optionally, you can also copy `test/` directories to your desired location to run them.
 
 ## Internal Test
 
 **Single GPU:**
 
-The following command run with settings in `example/configs/serve_config.yaml`. You may override them with command line arguments. You may also override the entire config file with environment variable `CONFIG_NAME=<your_config_file.yaml>`.
+The following command run with settings in `chitu/config/serve_config.yaml`. You may override them with command line arguments. You may also override the entire config file with environment variable `CONFIG_NAME=<your_config_file.yaml>`.
 
 The log is stored in `outputs/`.
 
 Example:
 
 ```bash
-torchrun --nproc_per_node 1 test/single_req_test.py request.max_new_tokens=64
+torchrun --nproc_per_node 1 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64
 ```
 
 **Tensor Parallelism (TP):**
 
 ```bash
-torchrun --nproc_per_node 2 test/single_req_test.py request.max_new_tokens=64 infer.tp_size=2
+torchrun --nproc_per_node 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.tp_size=2
 ```
 
 **Pipeline Parallelism (PP):**
 
 ```bash
-torchrun --nproc_per_node 2 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2
+torchrun --nproc_per_node 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.pp_size=2
 ```
 
 **Hybrid TP-PP Parallelism:**
 
 ```bash
-torchrun --nproc_per_node 4 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=2
+torchrun --nproc_per_node 4 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=2
 ```
 
 **Multi-Node Parallelism with Slurm:**
@@ -94,7 +94,7 @@ You can use the following script:
 Example:
 
 ```bash
-./script/srun_multi_node.sh 2 2 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
+./script/srun_multi_node.sh 2 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
 ```
 
 **Multi-Node Parallelism with Direct SSH Connectin:**
@@ -108,7 +108,7 @@ Please first make sure you can connect to each host via SSH without a password. 
 Example:
 
 ```bash
-./script/ssh_multi_node.sh "host1,host2" 2 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
+./script/ssh_multi_node.sh "host1,host2" 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
 ```
 
 **Multi-Node Parallelism with Direct SSH Connectin and a Docker Container:**
@@ -122,7 +122,7 @@ Please first make sure you can connect to each host via SSH without a password, 
 Example:
 
 ```bash
-./script/ssh_docker_multi_node.sh my_container /workspace "host1,host2" 2 test/single_req_test.py request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
+./script/ssh_docker_multi_node.sh my_container /workspace "host1,host2" 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
 ```
 
 **Fixing Input and Output Lengths for Performance Testing:**
@@ -131,6 +131,8 @@ You can set the input and output lengths, and disable early stopping, with the f
 
 ```bash
 torchrun --nproc_per_node 1 test/single_req_test.py \
+    models=<model-name> \
+    models.ckpt_dir=<path/to/checkpoint> \
     request.prompt_tokens_len=128 \
     request.max_new_tokens=64 \
     infer.max_seq_len=192 \
@@ -162,15 +164,15 @@ Next, override the model path in your normal run:
 Example usage for TP partitioning:
 
 ```bash
-PREPROCESS_AND_SAVE_DIR=<target_directory> torchrun <torchrun_arguments> script/preprocess_and_save.py infer.tp_size=2
+PREPROCESS_AND_SAVE_DIR=<target_directory> torchrun <torchrun_arguments> script/preprocess_and_save.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> infer.tp_size=2
 torchrun <torchrun_arguments> test/single_req_test.py infer.tp_size=2 models.ckpt_dir=<target_directory> models.tokenizer_path=<target_directory> skip_preprocess=True
 ```
 
 Example usage for quantization (currently different from the general usage):
 
 ```bash
-PREPROCESS_AND_SAVE_DIR=<target_directory> [CONFIG_NAME=<config_file>] torchrun <torchrun_arguments> script/preprocess_and_save.py quant_on_load=True
-[CONFIG_NAME=<config_file>] torchrun <torchrun_arguments> test/single_req_test.py quant_ckpt_dir=<target_directory>
+PREPROCESS_AND_SAVE_DIR=<target_directory> [CONFIG_NAME=<config_file>] torchrun <torchrun_arguments> script/preprocess_and_save.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> quant_on_load=True
+[CONFIG_NAME=<config_file>] torchrun <torchrun_arguments> test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> quant_ckpt_dir=<target_directory>
 ```
 
 **Example script for DeepSeek R1:**
@@ -184,7 +186,7 @@ bash ./script/run_deepseek_mla.sh
 Start a service at a given port (by default 0.0.0.0:21002):
 
 ```bash
-torchrun --nproc_per_node 1 example/serve.py serve.host=<host> serve.port=<port>
+torchrun --nproc_per_node 1 -m chitu models=<model-name> models.ckpt_dir=<path/to/checkpoint> serve.host=<host> serve.port=<port>
 ```
 You can test it with a single request:
 
