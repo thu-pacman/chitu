@@ -41,11 +41,6 @@ We evaluate on NVIDIA A800 40GB and H20 96GB GPUs, comparing with vLLM as baseli
 - Even in Eager mode, Chitu (8.5 tokens/s) outperforms vLLM (6.85 tokens/s)
 Chitu maintains good performance with FP8 quantization while reducing memory usage
 
-|Batchsize|1|4|8|16|32|
-|:---|:---|:---|:---|:---|:---|
-|3node|22.7|70.13|108.93|159.01|214.48|
-|6node|27.94|78.83|129.78|181.36|244.06|
-
 ### Online throughput: DeepSeek-R1-671B on H20(96GB)
 
 #### 16*H20(96GB)
@@ -59,7 +54,7 @@ Chitu maintains good performance with FP8 quantization while reducing memory usa
 - For single request scenarios (bs=1), Chitu slightly outperforms vLLM (22.1 vs 21.16 tokens/s)
 - At medium batch size (bs=16), both systems show comparable performance (~200 tokens/s)
 - For large batch processing (bs=256):
-vLLM achieves higher throughput Chitu, we are optimizing in subsequent versions.
+vLLM achieves higher throughput Chitu, we are optimizing in subsequent versions
 
 
 ## Getting started
