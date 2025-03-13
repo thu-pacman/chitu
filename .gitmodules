@@ -10,18 +10,9 @@
 [submodule "third_party/AutoGPTQ"]
     path = third_party/AutoGPTQ
     url = https://github.com/AutoGPTQ/AutoGPTQ.git
-[submodule "third_party/muxi_layout_kernels"]
-    path = third_party/muxi_layout_kernels
-    url = https://git.qcjzai.cn/baichenhan/layoutabc_gemm_torch.git
-[submodule "third_party/nv_w8a8_kernels"]
-    path = third_party/nv_w8a8_kernels
-    url = https://git.qcjzai.cn/tanyijun/nv_w8a8_kernels.git
 [submodule "third_party/cutlass"]
 	path = third_party/cutlass
 	url = https://github.com/NVIDIA/cutlass.git
-[submodule "third_party/muxi_w8a8_kernels"]
-	path = third_party/muxi_w8a8_kernels
-	url = https://git.qcjzai.cn/tanyijun/muxi_w8a8_kernels.git
 [submodule "third_party/FlashMLA"]
 	path = third_party/FlashMLA
 	url = https://github.com/deepseek-ai/FlashMLA.git

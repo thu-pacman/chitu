@@ -1,221 +1,170 @@
-# 赤兔（Chitu）
+# Chitu
 
-A.k.a. CInfer
+English | [中文](docs/zh/README_zh.md)
 
-## Setup for Development
+Chitu is a high-performance inference framework for large language models, focusing on efficiency, flexibility, and availability.
+
+## News
+
+[2025/03/14] Initial release of Chitu, support DeepSeek-R1 671B.
+
+## Introduction
+
+Chitu is a high-performance inference framework for large language models. Chitu supports various mainstream large language models, including DeepSeek, LLaMA series, Mixtral, and more. We focus on the following goals:
+
+- **Efficiency**: We continue to develop and integrate latest optimizations for large language models, including GPU kernels, parallel strategies, quantizations and more.
+- **Flexibility**: We not only focus on the polular NVIDIA GPUs, but pay special attention to all kinds of hardware environments, including legacy GPUs, non-NVIDIA GPUs and CPUs. We aim to provide a versatile framework to encounter the diverse deploying requirements.
+- **Availability**: Chitu is ready and already deployed for real-world production.
+
+
+Welcome to join the [Wechat group](docs/assets/wechat_group.jpg) Wechat group and stay tuned!
+
+
+## Benchmarks
+
+We evaluate on NVIDIA A800 40GB and H20 96GB GPUs, comparing with vLLM as baselines.
+
+
+### Online throughput: DeepSeek-R1-671B on A800(40GB)
+<video src="docs/assets/chitu_performance.mp4" autoplay loop muted controls>
+</video>
+
+#### N nodes * 8 * A800(40GB)
+|Hardware|6 nodes||3 nodes|
+|:---|:---|:---|:---|
+|Serving system and data format|vllm 0.7.3, BF16|chitu 0.1.0, BF16|Chitu 0.1.0, FP8|
+|With cuda graph|OOM*|29.8 token/s|22.7 token/s|
+|Eager (no cuda graph)|6.85 token/s|8.5 token/s|7.0 token/s|
+
+- In 6-node configuration, vLLM encounters Out of Memory (OOM) when using CUDA Graph, we are figuring this out.
+- Chitu achieves 22.7 tokens/s with CUDA Graph on 3 nodes, showing significant improvement over Eager mode
+- Even in Eager mode, Chitu (8.5 tokens/s) outperforms vLLM (6.85 tokens/s)
+Chitu maintains good performance with FP8 quantization while reducing memory usage
+
+|Batchsize|1|4|8|16|32|
+|:---|:---|:---|:---|:---|:---|
+|3node|22.7|70.13|108.93|159.01|214.48|
+|6node|27.94|78.83|129.78|181.36|244.06|
+
+### Online throughput: DeepSeek-R1-671B on H20(96GB)
+
+#### 16*H20(96GB)
+
+|Serving system and data format|vllm 0.7.2, FP8|chitu 0.1.0, FP8|
+|:---|:---|:---|
+|bs=1, output token/s|21.16|22.1|
+|bs=16, output token/s|205.09|202.1|
+|bs=256, output token/s|1148.67|780.3|
+
+- For single request scenarios (bs=1), Chitu slightly outperforms vLLM (22.1 vs 21.16 tokens/s)
+- At medium batch size (bs=16), both systems show comparable performance (~200 tokens/s)
+- For large batch processing (bs=256):
+vLLM achieves higher throughput Chitu, we are optimizing in subsequent versions.
+
+
+## Getting started
+
+Install Chitu either from source.
+
+### Install from Source
 
 ```bash
+git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
+
 pip install -r requirements-build.txt
-pip install -U torch --index-url https://download.pytorch.org/whl/cu124 # Install torch. Change `cu124` to your cuda version.
-TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation . # Install this repo. Change `8.6` to your desired CUDA arch list.
+pip install -U torch --index-url https://download.pytorch.org/whl/cu124  # Change according to your CUDA version
+TORCH_CUDA_ARCH_LIST=8.6 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation .
 ```
 
-Append `-e` to `pip install` for editable install. Example:
+
+## Quick Start
+
+### Single GPU Inference
 
 ```bash
-TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation -e .
+torchrun --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 models=DeepSeek-R1 models.ckpt_dir=/data/DeepSeek-R1 infer.pp_size=1 infer.tp_size=8
 ```
 
-Append `[optional-dependency-name]` after `.` for optional dependencies. Example:
+### Hybrid Parallelism (TP+PP)
 
 ```bash
-TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation ".[quant]"
+torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=8 models=DeepSeek-R1 models.ckpt_dir=/data/DeepSeek-R1
 ```
 
-Currently supported optional dependencies are:
-- `quant`: Quantization.
-- `flash_attn`: Support `infer.attn_type=flash_attn`.
-- `flash_mla`: Support `infer.attn_type=flash_mla`.
-- `muxi_layout_kernels`.
-- `muxi_w8a8_kernels`.
-
-Set `CINFER_WITH_CYTHON=1` to compile Python sources with Cython. Example:
+### Start a Service
 
 ```bash
-TORCH_CUDA_ARCH_LIST=8.6 CINFER_SETUP_JOBS=4 MAX_JOBS=4 CINFER_WITH_CYTHON=1 pip install --no-build-isolation .
-```
+# Start service at localhost:21002
+export WORLD_SIZE=8
+torchrun --nnodes 1 \
+    --nproc_per_node 8 \
+    --master_port=22525 \
+    example/serve.py \
+    serve.port=21002 \
+    infer.stop_with_eos=False \
+    infer.cache_type=paged \
+    infer.pp_size=1 \
+    infer.tp_size=8 \
+    models=DeepSeek-R1 \
+    models.ckpt_dir=/data/DeepSeek-R1 \
+    infer.attn_type=flash_infer \
+    keep_dtype_in_checkpoint=True \
+    infer.mla_absorb=absorb-without-precomp \
+    infer.soft_fp8=True \
+    infer.do_load=True \
+    infer.max_reqs=1 \
+    scheduler.prefill_first.num_tasks=100 \
+    infer.max_seq_len=4096 \
+    request.max_new_tokens=100 \
+    infer.use_cuda_graph=True
 
-Note:
-- `CINFER_SETUP_JOBS` is used to control number of jobs to compile this repo, while `MAX_JOBS` is used to control number of jobs to compile EETQ, which is a dependency of this repo.
-- You won't get the "editable" feature if you set both `-e` and `CINFER_WITH_CYTHON=1`. If you have accidentally done this and want to switch back, you will need to do `rm chitu/*.so`.
-
-## Build for Distribution
-
-First follow "Setup for Development" to install to your local environment, including your optional choices of `[quant]`, etc. Then run the following to build wheel files:
-
-```bash
-./script/build_for_dist.sh
-```
-
-This will create a `dist/` directory containing the wheel files. Copy them to your desired location and install them with `pip install <wheel_file>`. If you have to use custom dependencies (e.g. `torch`) of your platform, append `--no-deps` to the `pip install` command.
-
-Optionally, you can also copy `test/` directories to your desired location to run them.
-
-## Internal Test
-
-**Single GPU:**
-
-The following command run with settings in `chitu/config/serve_config.yaml`. You may override them with command line arguments. You may also override the entire config file with environment variable `CONFIG_NAME=<your_config_file.yaml>`.
-
-The log is stored in `outputs/`.
-
-Example:
-
-```bash
-torchrun --nproc_per_node 1 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64
-```
-
-**Tensor Parallelism (TP):**
-
-```bash
-torchrun --nproc_per_node 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.tp_size=2
-```
-
-**Pipeline Parallelism (PP):**
-
-```bash
-torchrun --nproc_per_node 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.pp_size=2
-```
-
-**Hybrid TP-PP Parallelism:**
-
-```bash
-torchrun --nproc_per_node 4 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=2
-```
-
-**Multi-Node Parallelism with Slurm:**
-
-You can use the following script:
-
-```bash
-./script/srun_multi_node.sh <num_nodes> <num_gpus_per_node> [your command after torchrun]...
-```
-
-Example:
-
-```bash
-./script/srun_multi_node.sh 2 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
-```
-
-**Multi-Node Parallelism with Direct SSH Connectin:**
-
-Please first make sure you can connect to each host via SSH without a password. Then you can use the following script:
-
-```bash
-./script/ssh_multi_node.sh <comma-separated-hosts> <num_gpus_per_node> [your command after torchrun]...
-```
-
-Example:
-
-```bash
-./script/ssh_multi_node.sh "host1,host2" 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
-```
-
-**Multi-Node Parallelism with Direct SSH Connectin and a Docker Container:**
-
-Please first make sure you can connect to each host via SSH without a password, and please also start a docker container on each node with the same container name. Then you can use the following script:
-
-```bash
-./script/ssh_docker_multi_node.sh <docker-container-name> <pwd-in-container> <comma-separated-hosts> <num_gpus_per_node> [your command after torchrun]...
-```
-
-Example:
-
-```bash
-./script/ssh_docker_multi_node.sh my_container /workspace "host1,host2" 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
-```
-
-**Fixing Input and Output Lengths for Performance Testing:**
-
-You can set the input and output lengths, and disable early stopping, with the following command:
-
-```bash
-torchrun --nproc_per_node 1 test/single_req_test.py \
-    models=<model-name> \
-    models.ckpt_dir=<path/to/checkpoint> \
-    request.prompt_tokens_len=128 \
-    request.max_new_tokens=64 \
-    infer.max_seq_len=192 \
-    infer.max_reqs=8 \
-    infer.stop_with_eos=False
-```
-
-**Preprocess a model's state dict with a given config and save it to a new checkpoint, and skip preprocessing in the future:**
-
-`script/preprocess_and_save.py` can be used for:
-- Quantize from a full model and save it to a new checkpoint.
-- Partition a model for TP or PP and save it to a new checkpoint.
-- Merge Q/K/V or gate/up matrices and save it to a new checkpoint.
-
-Usage:
-
-First, run this script to preprocess and save the model:
-
-```bash
-PREPROCESS_AND_SAVE_DIR=<target_directory> [CONFIG_NAME=<config_file>] torchrun <torchrun_arguments> script/preprocess_and_save.py [your_additional_overrides_to_config]
-```
-
-Next, override the model path in your normal run:
-
-```bash
-<your normal command> models.ckpt_dir=<target_directory> models.tokenizer_path=<target_directory> skip_preprocess=True
-```
-
-Example usage for TP partitioning:
-
-```bash
-PREPROCESS_AND_SAVE_DIR=<target_directory> torchrun <torchrun_arguments> script/preprocess_and_save.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> infer.tp_size=2
-torchrun <torchrun_arguments> test/single_req_test.py infer.tp_size=2 models.ckpt_dir=<target_directory> models.tokenizer_path=<target_directory> skip_preprocess=True
-```
-
-Example usage for quantization (currently different from the general usage):
-
-```bash
-PREPROCESS_AND_SAVE_DIR=<target_directory> [CONFIG_NAME=<config_file>] torchrun <torchrun_arguments> script/preprocess_and_save.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> quant_on_load=True
-[CONFIG_NAME=<config_file>] torchrun <torchrun_arguments> test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> quant_ckpt_dir=<target_directory>
-```
-
-**Example script for DeepSeek R1:**
-
-```bash
-bash ./script/run_deepseek_mla.sh
-```
-
-## Start a Service
-
-Start a service at a given port (by default 0.0.0.0:21002):
-
-```bash
-torchrun --nproc_per_node 1 -m chitu models=<model-name> models.ckpt_dir=<path/to/checkpoint> serve.host=<host> serve.port=<port>
-```
-You can test it with a single request:
-
-```bash
-curl localhost:21002/v1/chat/completions   -H "Content-Type: application/json"  -d '{
+# Test the service
+curl localhost:21002/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
     "messages": [
       {
         "role": "system",
-        "content": "You are a poetic assistant, skilled in explaining complex programming concepts with creative flair."
+        "content": "You are a helpful assistant."
       },
       {
         "role": "user",
-        "content": "Compose a poem that explains the concept of recursion in programming."
+        "content": "What is machine learning?"
       }
     ]
   }'
 ```
 
-## Performance Benchmarking
-
-The framework provides a comprehensive benchmarking tool to measure inference performance, including latency, throughput, and TPS (Tokens Per Second).
-
-First start the service like above, then you can use the following command to benchmark the service:
+### Benchmarking
 
 ```bash
+# Comprehensive performance testing with benchmark_serving tool
 python benchmarks/benchmark_serving.py \
     --model "deepseek-r1" \
     --iterations 10 \
     --seq-len 10 \
     --warmup 3 \
-    --base-url http://localhost:8000
+    --base-url http://localhost:21002
 ```
+
+## FAQ (Frequently Asked Questions)
+
+[English](docs/en/FAQ.md) | [中文](docs/zh/FAQ.md)
+
+## Contributing
+
+We welcome contributions! Please see our [Contributing Guide](docs/CONTRIBUTING.md) for details.
+
+## License
+
+The Chitu Project is under the Apache License v2.0. - see the [LICENSE](LICENSE) file for details.
+
+
+## Acknowledgment
+
+We learned a lot from the following projects when building Chitu:
+- [vLLM](https://github.com/vllm-project/vllm)
+- [SGLang](https://github.com/sgl-project/sglang)
+- [DeepSeek](https://github.com/deepseek-ai)
+
+Special thanks to our partners (Partners listed in no particular order): 中国电信、华为、沐曦、燧原、 etc.
