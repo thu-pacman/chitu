@@ -1,0 +1,25 @@
+name: Sync PR to GitLab
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          fetch-depth: 0  # 获取完整 Git 历史
+          ref: ${{ github.event.pull_request.head.ref }}  # PR 分支
+          
+      - name: Add GitLab remote
+        run: |
+          git remote add gitlab https://${{ vars.GITLAB_USER_NAME }}:${{ secrets.GITLAB_TOKEN }}@${{ vars.GITLAB_DOMAIN }}${{ vars.GITLAB_PATH }}
+
+      - name: Push PR branch to GitLab
+        run: |
+          git push gitlab ${{ github.event.pull_request.head.ref }}:github_${{ github.event.pull_request.head.ref }}  # 推送 PR 分支
+          echo "Sync Success!"

@@ -1,0 +1,13 @@
+name: Qwen2-7B-Instruct
+type: hf-llama
+source: "https://huggingface.co/Qwen/Qwen2-7B-Instruct" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+dim: 3584
+n_layers: 28
+n_heads: 28
+n_kv_heads: 4
+vocab_size: 152064
+intermediate_dim: 18944
+norm_eps: 1e-06
+rope_theta: 1000000.0

@@ -1,0 +1,13 @@
+name: glm-4-9b-chat
+type: hf-llama
+source: "https://huggingface.co/THUDM/glm-4-9b-chat" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+dim: 4096
+n_layers: 40
+n_heads: 32
+n_kv_heads: 2
+vocab_size: 151552
+intermediate_dim: 13696
+norm_eps: 1.5625e-07
+rope_theta: 5000000.0

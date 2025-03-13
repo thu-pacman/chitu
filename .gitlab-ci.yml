@@ -1,0 +1,12 @@
+stages:
+  - sync
+
+sync-to-github:
+  stage: sync
+  tags:
+    - ${SYNC_TAGS}
+  script:
+    - sh -c "${SYNC_GITHUB_SHELL}"
+  only:
+    - public-main
+  when: on_success
