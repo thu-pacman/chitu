@@ -11,18 +11,16 @@ from threading import Semaphore, Thread
 from pydantic import BaseModel, Field
 from typing import List, Any, Optional
 import random
-
-
-from chitu.global_vars import set_global_variables
-
-from chitu.backend import Backend
-from chitu.task import UserRequest, TaskPool, Task, TaskLoad
-from chitu.chitu_main import chitu_init, chitu_run
-from chitu.async_response import AsyncResponse, AsyncDataStream
-from chitu.utils import get_config_dir_path
-
 import logging
 from logging import getLogger
+
+from .global_vars import set_global_variables
+from .backend import Backend
+from .task import UserRequest, TaskPool, Task, TaskLoad
+from .chitu_main import chitu_init, chitu_run
+from .async_response import AsyncResponse, AsyncDataStream
+from .utils import get_config_dir_path
+
 
 logger = getLogger(__name__)
 
@@ -68,7 +66,6 @@ async def create_chat_completion(request: ChatRequest):
             status_code=403, detail="exceeding server processing capacity"
         )
     params = request.dict()
-    # req_id = params.pop("conversation_id")
     req_id = gen_req_id()
     stream = params.pop("stream", False)
     message = params.pop("messages")
