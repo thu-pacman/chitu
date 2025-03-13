@@ -51,7 +51,7 @@ class ChatRequest(BaseModel):
     stream: bool = False
     temperature: float = 0.8  # [0, 2]
     top_p: float = 0.9  # [0,1]
-    top_k: int = 50  # -1 or positive integer TODO process -1
+    top_k: int = 50  # -1 or positive integer
     frequency_penalty: float = 0.1  # [-2, 2]
 
 
@@ -183,6 +183,38 @@ def start_unicorn(args):
     uvicorn.run(app, host=args.serve.host, port=args.serve.port, log_level="info")
 
 
+def warmup_engine():
+    logger.warning("Starting inference system warmup...")
+
+    global global_args
+    num_warmup_reqs = global_args.infer.max_reqs
+    warmup_msg = [{"role": "user", "content": "Hi"}]
+
+    for i in range(num_warmup_reqs):
+        req = UserRequest(
+            warmup_msg,
+            f"{gen_req_id()}",
+            max_new_tokens=10,
+            temperature=0.7,
+            top_k=1,
+        )
+
+        task = Task(
+            f"{req.request_id}",
+            req,
+            req.message,
+            max_seq_len=global_args.infer.max_seq_len,
+        )
+        TaskPool.add(task)
+
+    logger.warning(f"Added {num_warmup_reqs} warmup requests to TaskPool")
+
+    while len(TaskPool.pool) > 0:
+        chitu_run()
+
+    logger.warning("Inference system warmup completed")
+
+
 @hydra.main(
     version_base=None, config_path=get_config_dir_path(), config_name="serve_config"
 )
@@ -192,9 +224,10 @@ def main(args: DictConfig):
     global server_status
     global_args = args
     chitu_init(args, logging_level=logging.WARNING)
-    server_status = True
+    torch.distributed.barrier()
     rank = torch.distributed.get_rank()
     if rank == 0:
+        warmup_engine()
         uvicorn_thread = Thread(target=start_unicorn, args=(args,))
         uvicorn_thread.start()
     server_status = True

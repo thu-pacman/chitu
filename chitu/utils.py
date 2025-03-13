@@ -2,6 +2,7 @@ from typing import Tuple, Any
 
 import torch
 from logging import getLogger
+from .global_vars import get_global_args
 import numpy as np
 
 
@@ -32,14 +33,22 @@ def is_layer(layer_name, full_name):
 
 
 def compute_layer_dist_in_pipe(num_layers, world_size):
-    num_layers_of_each_rank = [
-        num_layers // world_size + (1 if i < num_layers % world_size else 0)
-        for i in range(world_size)
-    ]
-    # If non-divisible, make the fisrst and the last rank to have fewer layers, because they have pre-layers and post-layers
-    if world_size > 2 and num_layers_of_each_rank[0] > num_layers_of_each_rank[-2]:
-        num_layers_of_each_rank[0] -= 1
-        num_layers_of_each_rank[-2] += 1
+    args = get_global_args()
+    if args.infer.pp_layer_partition is not None:
+        assert (
+            len(args.infer.pp_layer_partition) == world_size
+            and sum(args.infer.pp_layer_partition) == args.models.n_layers
+        ), f"pp_layer_partition must be a list of length {world_size} and sum up to {args.models.n_layers}"
+        num_layers_of_each_rank = args.infer.pp_layer_partition
+    else:
+        num_layers_of_each_rank = [
+            num_layers // world_size + (1 if i < num_layers % world_size else 0)
+            for i in range(world_size)
+        ]
+        # If non-divisible, make the fisrst and the last rank to have fewer layers, because they have pre-layers and post-layers
+        if world_size > 2 and num_layers_of_each_rank[0] > num_layers_of_each_rank[-2]:
+            num_layers_of_each_rank[0] -= 1
+            num_layers_of_each_rank[-2] += 1
     return num_layers_of_each_rank
 
 
