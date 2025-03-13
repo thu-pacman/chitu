@@ -27,7 +27,7 @@ Chitu (赤兔) 定位于「生产级大模型推理引擎」，并且充分考�
 我们在 NVIDIA A800 40GB 和 H20 96GB GPU 上进行评测，并与 vLLM 作为基准进行比较。
 
 ### 在线吞吐量：DeepSeek-R1-671B 在 A800(40GB) 上的表现
-<video src="../../docs/assets/chitu_performance.mp4" autoplay loop muted controls>
+<video src="https://github.com/user-attachments/assets/41495ac8-123d-4402-a6a8-0e0294b2edf4" autoplay loop muted controls>
 </video>
 
 
