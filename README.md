@@ -169,10 +169,14 @@ We welcome contributions! Please see our [Contributing Guide](docs/CONTRIBUTING.
 
 The Chitu Project is under the Apache License v2.0. - see the [LICENSE](LICENSE) file for details.
 
+This repository also contains third_party submodules under other open source
+licenses. You can find these submodules under third_party/ directory, which
+contains their own license files.
+
 
 ## Acknowledgment
 
-We learned a lot from the following projects when building Chitu:
+We learned a lot from the following projects and adapted some functions when building Chitu:
 - [vLLM](https://github.com/vllm-project/vllm)
 - [SGLang](https://github.com/sgl-project/sglang)
 - [DeepSeek](https://github.com/deepseek-ai)
