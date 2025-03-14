@@ -109,7 +109,7 @@ export WORLD_SIZE=8
 torchrun --nnodes 1 \
     --nproc_per_node 8 \
     --master_port=22525 \
-    example/serve.py \
+    chitu/serve.py \
     serve.port=21002 \
     infer.stop_with_eos=False \
     infer.cache_type=paged \
