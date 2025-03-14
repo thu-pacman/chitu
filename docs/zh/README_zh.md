@@ -1,7 +1,7 @@
 
 # Chitu（赤兔）
 
-[English](../../README.md) | 中文
+[English](/README.md) | 中文
 
 
 Chitu (赤兔) 是一个专注于效率、灵活性和可用性的高性能大语言模型推理框架。
@@ -159,11 +159,11 @@ python benchmarks/benchmark_serving.py \
 
 ### 完整文档
 
-更多细节请参阅[此文档](docs/Development.md)。
+更多细节请参阅[此文档](/docs/Development.md)。
 
 ## 常见问题
 
-[English](../en/FAQ.md) | [中文](FAQ.md)
+[English](/docs/en/FAQ.md) | [中文](/docs/zh/FAQ.md)
 
 
 ## 贡献指南
