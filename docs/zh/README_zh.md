@@ -22,28 +22,45 @@ Chitu (赤兔) 定位于「生产级大模型推理引擎」，并且充分考�
 
 欢迎加入我们的[推理引擎交流群](../../docs/assets/wechat_group.jpg)，并保持关注！
 
-## 性能基准
+## 性能数据
 
-我们在 NVIDIA A800 40GB 和 H20 96GB GPU 上进行评测，并与 vLLM 作为基准进行比较。
+我们在 NVIDIA A800 40GB 和 H20 96GB GPU 上进行评测，并与 vLLM 进行比较。
 
-### 在线吞吐量：DeepSeek-R1-671B 在 A800(40GB) 上的表现
-<video src="https://github.com/user-attachments/assets/41495ac8-123d-4402-a6a8-0e0294b2edf4" autoplay loop muted controls>
-</video>
+### 在 A800(40GB) 集群上部署 DeepSeek-R1-671B
 
+#### 多机环境下 Chitu 与 vLLM 的对比
 
-#### 多机8卡A800环境
-|硬件环境|6 节点||3 节点|
+|硬件环境|6 节点|6 节点|3 节点|
 |:---|:---|:---|:---|
 |框架+精度|vllm 0.7.3, BF16|chitu 0.1.0, BF16|Chitu 0.1.0, FP8|
-|使用 cuda graph|*OOM*|29.8 token/s|22.7 token/s|
-|Eager 模式(no cuda graph)|6.85 token/s|8.5 token/s|7.0 token/s|
+|使用 cuda graph|*OOM*|29.8 output token/s|22.7 output token/s|
+|不使用 cuda graph|6.85 output token/s|8.5 output token/s|7.0 output token/s|
 
-- 在6节点配置下使用 CUDA Graph 时出现内存溢出（OOM），我们正在排查此问题
-- 赤兔在两种配置下均可稳定运行，输出速度还提升了3.15倍
+- 表格中数据均为单请求场景（bs=1）的输出速度
+- 对 Chitu 而言，使用3个节点运行FP8模型，其输出速度与使用6个节点运行BF16模型的速度是可比的
+- 对于单个请求的回答输出速度，是否使用 cuda graph 对性能有显著的影响，赤兔引擎使用 cuda graph 后性能有明显提升
+- 在我们的测试过程中，尝试在6节点配置下使用 cuda graph 运行 vLLM 时遇到了内存溢出错误（OOM），我们正在排查此问题
 
-### 在线吞吐量: DeepSeek-R1-671B 在 H20(96G) 上的表现
+<video src="https://github.com/user-attachments/assets/41495ac8-123d-4402-a6a8-0e0294b2edf4" autoplay loop muted controls>
+</video>
+*此视频录制时间较早，性能数据与发布版本有少许差别*
 
-#### 双机8卡H20环境
+#### 使用Chitu运行BF16和FP8模型的进一步对比
+
+|batchsize|6 节点, BF16 |3 节点, FP8|
+|:---|:---|:---|
+|1| 29.8 token/s| 22.7 token/s| 
+|4| 78.8 token/s| 70.1 token/s| 
+|8| 129.8 token/s| 108.9 token/s| 
+|16| 181.4 token/s| 159.0 token/s| 
+|32| 244.1 token/s| 214.5 token/s| 
+
+- 从不同batchsize的测试数据来看，同样基于Chitu引擎，使用3节点运行FP8模型的输出速度约为使用6节点运行BF16模型的75%\~90%，即单位算力的产出获得了1.5x\~1.8x的提升
+- 我们认为这是由于解码Decoding过程主要依赖于访存带宽，使用一半的GPU去访问一半的数据（FP8的权重大小是BF16的一半）不会消耗更长的时间，GPU计算能力缩减只带来较小的影响
+
+### 在 H20(96G) 集群上部署 DeepSeek-R1-671B 
+
+#### 双机8卡H20环境的运行数据
 
 |硬件环境|vllm 0.7.2, FP8|chitu 0.1.0, FP8|
 |:---|:---|:---|
@@ -51,10 +68,10 @@ Chitu (赤兔) 定位于「生产级大模型推理引擎」，并且充分考�
 |bs=16, output token/s|205.09|202.1|
 |bs=256, output token/s|1148.67|780.3|
 
-- 在单请求场景下 (bs=1)，Chitu 性能略优于 vLLM（22.1 vs 21.16 tokens/s）
-- 在中等批量大小下 (bs=16)，两个系统展现出相当的性能表现（约 200 tokens/s）
+- 在单请求场景下 (bs=1)，Chitu 性能略优于 vLLM
+- 在中等批量大小下 (bs=16)，两个系统展现出相当的性能表现
 - 在大批量处理场景下 (bs=256)：
-  vLLM 达到了更高的吞吐量，我们将在后续版本中针对大批量请求对 Chitu 进行优化。
+  vLLM 达到了更高的吞吐量，我们将在 Chitu 的后续版本中对大批量处理场景进行优化。
 
 
 ## 开始使用
