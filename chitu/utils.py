@@ -1,3 +1,10 @@
+"""
+This file has adaption of open-source code from the following sources:
+- The sampling implementation is originally from SGLang
+  (https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/sampler.py),
+  licensed under Apache 2.0.
+"""
+
 from typing import Tuple, Any
 
 import torch
