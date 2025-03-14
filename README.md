@@ -74,7 +74,7 @@ vLLM achieves higher throughput, and we will optimize for large batch size in su
 
 ## Getting started
 
-Install Chitu either from source.
+You can install Chitu from source.
 
 ### Install from Source
 
@@ -156,6 +156,10 @@ python benchmarks/benchmark_serving.py \
     --warmup 3 \
     --base-url http://localhost:21002
 ```
+
+### Full Documentation
+
+Please refer to [here](docs/Development.md) for more details.
 
 ## FAQ (Frequently Asked Questions)
 

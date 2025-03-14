@@ -157,6 +157,10 @@ python benchmarks/benchmark_serving.py \
     --base-url http://localhost:21002
 ```
 
+### 完整文档
+
+更多细节请参阅[此文档](docs/Development.md)。
+
 ## 常见问题
 
 [English](../en/FAQ.md) | [中文](FAQ.md)
