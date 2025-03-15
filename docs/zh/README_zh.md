@@ -1,7 +1,7 @@
 
 # Chitu（赤兔）
 
-[English](../../README.md) | 中文
+[English](/README.md) | 中文
 
 
 Chitu (赤兔) 是一个专注于效率、灵活性和可用性的高性能大语言模型推理框架。
@@ -159,20 +159,20 @@ python benchmarks/benchmark_serving.py \
 
 ### 完整文档
 
-更多细节请参阅[此文档](docs/Development.md)。
+更多细节请参阅[此文档](/docs/Development.md)。
 
 ## 常见问题
 
-[English](../en/FAQ.md) | [中文](FAQ.md)
+[English](/docs/en/FAQ.md) | [中文](/docs/zh/FAQ.md)
 
 
 ## 贡献指南
 
-我们欢迎各种形式的贡献！详情请参阅我们的[贡献指南](../../CONTRIBUTING.md)。
+我们欢迎各种形式的贡献！详情请参阅我们的[贡献指南](/docs/CONTRIBUTING.md)。
 
 ## 许可证
 
-Chitu 项目采用 Apache License v2.0 许可证 - 详见 [LICENSE](../../LICENSE) 文件。
+Chitu 项目采用 Apache License v2.0 许可证 - 详见 [LICENSE](/LICENSE) 文件。
 
 本代码仓库还包含遵循其他开源许可证的第三方子模块。你可以在 “third_party/” 目录下找到这些子模块，该目录中包含了它们各自的许可证文件。
 
