@@ -1,26 +1,27 @@
 import os
+from dataclasses import dataclass
+from logging import getLogger
+from typing import Optional, Sequence
+
+import numpy as np
 import torch
 import torch.distributed
-import numpy as np
-from typing import Optional, Sequence
-from dataclasses import dataclass
 
-from .task import (
-    Task,
-    UserRequest,
-    SerializedPackedTasksPayloadType,
-    PackedTasksBase,
+from chitu.backend import Backend, BackendState
+from chitu.cache_manager import PagedKVCacheManager
+from chitu.global_vars import get_timers
+from chitu.task import (
     PackedTasks,
+    PackedTasksBase,
+    SerializedPackedTasksPayloadType,
+    Task,
     TaskType,
+    UserRequest,
     req_decode,
     taskid2reqid,
 )
-from .backend import Backend, BackendState
-from .utils import VarLens, top_k_top_p_min_p_sampling_from_probs_torch
-from .cache_manager import PagedKVCacheManager
-from .global_vars import get_timers
-from .tensor_parallel import get_tp_group
-from logging import getLogger
+from chitu.tensor_parallel import get_tp_group
+from chitu.utils import VarLens, top_k_top_p_min_p_sampling_from_probs_torch
 
 logger = getLogger(__name__)
 

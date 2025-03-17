@@ -9,12 +9,13 @@ __all__ = ["AttnBackend", "FlashAttnBackend", "RefAttnBackend"]
 import abc
 import math
 from typing import Optional, Union
-import torch
-from .global_vars import get_global_args
-from .utils import try_import_opt_dep
-from .ops import append_to_paged_kv_cache
-from .triton_decode_attention import mla_decode
 
+import torch
+
+from chitu.global_vars import get_global_args
+from chitu.ops import append_to_paged_kv_cache
+from chitu.triton_decode_attention import mla_decode
+from chitu.utils import try_import_opt_dep
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")

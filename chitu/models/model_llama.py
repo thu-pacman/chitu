@@ -1,16 +1,17 @@
-from torch import nn
-from typing import Optional, List
+from typing import List, Optional
+
 import torch
 import torch.nn.functional as F
+from torch import nn
 
-from .model import Attention, Transformer, TransformerBlock, RMSNorm
-from ..tensor_parallel import (
-    get_tp_size,
+from chitu.attn_backend import AttnBackend
+from chitu.models.model import Attention, RMSNorm, Transformer, TransformerBlock
+from chitu.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
+    get_tp_size,
 )
-from ..attn_backend import AttnBackend
 
 
 class AttentionLlama(Attention):

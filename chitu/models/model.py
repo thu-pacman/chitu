@@ -1,27 +1,25 @@
-import os
-import math
 import itertools
-from pathlib import Path
-from logging import getLogger
+import math
+import os
 from dataclasses import dataclass
-from typing import Optional, Tuple, Mapping, List, Any
+from logging import getLogger
+from pathlib import Path
+from typing import Any, List, Mapping, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.distributed
 import torch.nn.functional as F
 from torch import nn
 
-import numpy as np
-
-from ..global_vars import set_global_variables, get_timers, get_global_args
-from ..utils import VarLens, compute_layer_dist_in_pipe, is_layer
-from ..muxi_utils import has_tbsgemm, tbsgemm
-from ..cache_manager import PagedKVCacheManager
-from ..tensor_parallel import get_tp_group, get_tp_rank
-from ..tokenizer import Tokenizer, ChatFormat, TokenizerHF, ChatFormatHF
-from ..ops import apply_rotary_pos_emb
-from ..attn_backend import AttnBackend
-
+from chitu.attn_backend import AttnBackend
+from chitu.cache_manager import PagedKVCacheManager
+from chitu.global_vars import get_global_args, get_timers, set_global_variables
+from chitu.muxi_utils import has_tbsgemm, tbsgemm
+from chitu.ops import apply_rotary_pos_emb
+from chitu.tensor_parallel import get_tp_group, get_tp_rank
+from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
+from chitu.utils import VarLens, compute_layer_dist_in_pipe, is_layer
 
 logger = getLogger(__name__)
 

@@ -1,17 +1,16 @@
-import torch
-import torch.nn as nn
-
-import w8a8gemm
-import w8a8gemv
-import torch
-from torch import nn
 from functools import partial
 
-from ..tensor_parallel import (
-    get_tp_size,
+import torch
+import torch.nn as nn
+import w8a8gemm
+import w8a8gemv
+from torch import nn
+
+from chitu.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
+    get_tp_size,
 )
 
 

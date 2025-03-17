@@ -1,37 +1,40 @@
-import torch
 import gc
 import itertools
-from tqdm import tqdm, trange
-from glob import glob
+import json
+import os
+import sys
+import time
 from enum import Enum
-from .tokenizer import Tokenizer, ChatFormat, TokenizerHF, ChatFormatHF
-from pathlib import Path
-import os, sys, json, time
-from transformers import AutoModelForCausalLM
-from safetensors.torch import safe_open
+from glob import glob
 from logging import getLogger
+from pathlib import Path
 
-from .cache_manager import (
-    KVCacheManager,
-    KVCacheManagerSkewAware,
-    PagedKVCacheManager,
-    KVCacheManagerNop,
-)
-from .tensor_parallel import init_tp, get_tp_size
-from .attn_backend import (
+import torch
+from safetensors.torch import safe_open
+from tqdm import tqdm, trange
+from transformers import AutoModelForCausalLM
+
+from chitu.attn_backend import (
     FlashAttnBackend,
-    RefAttnBackend,
-    FlashMLABackend,
     FlashInferBackend,
+    FlashMLABackend,
+    RefAttnBackend,
     TritonAttnBackend,
 )
-from .models.model_llama import TransformerLlama
-from .models.model_deepseek_v3 import TransformerDeepSeekV3
-from .models.model_hf_llama import TransformerHFLlama
-from .models.model_hf_mixtral import TransformerHFMixtral
-from .quantize import quant
-from .utils import compute_layer_dist_in_pipe
-
+from chitu.cache_manager import (
+    KVCacheManager,
+    KVCacheManagerNop,
+    KVCacheManagerSkewAware,
+    PagedKVCacheManager,
+)
+from chitu.models.model_deepseek_v3 import TransformerDeepSeekV3
+from chitu.models.model_hf_llama import TransformerHFLlama
+from chitu.models.model_hf_mixtral import TransformerHFMixtral
+from chitu.models.model_llama import TransformerLlama
+from chitu.quantize import quant
+from chitu.tensor_parallel import get_tp_size, init_tp
+from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
+from chitu.utils import compute_layer_dist_in_pipe
 
 logger = getLogger(__name__)
 

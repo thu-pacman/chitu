@@ -1,10 +1,10 @@
-from typing import Tuple
 import struct
+from typing import Tuple
 
 import torch
 import triton
 
-from .triton_kernels import *
+from chitu.triton_kernels import *
 
 
 def auto_retry_triton_compilation(fn):
@@ -23,7 +23,8 @@ def auto_retry_triton_compilation(fn):
     # from `~/.triton/cache` to a local directory, or we can make use of `torch.distributed`
     # to synchronize the compilation.
 
-    import time, random
+    import random
+    import time
 
     def wrapped(*args, **kwargs):
         i = 0

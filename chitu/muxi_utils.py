@@ -1,6 +1,6 @@
 from typing import List
 
-from .utils import try_import_opt_dep
+from chitu.utils import try_import_opt_dep
 
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"

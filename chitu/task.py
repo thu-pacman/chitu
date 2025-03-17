@@ -1,23 +1,22 @@
-import torch
-from enum import Enum
 import asyncio
-import time
-import threading
-from datetime import datetime
-from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Optional, ClassVar
-import os
-import weakref
 import json
+import os
+import threading
+import time
+import weakref
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
 from logging import getLogger
+from pathlib import Path
+from typing import ClassVar, List, Optional
 
-from .backend import Backend
-from .async_response import AsyncDataStream, AsyncResponse
-from .backend import Backend
-from .device_list import DeviceList
-from .global_vars import get_slot_handle
+import torch
 
+from chitu.async_response import AsyncDataStream, AsyncResponse
+from chitu.backend import Backend
+from chitu.device_list import DeviceList
+from chitu.global_vars import get_slot_handle
 
 logger = getLogger(__name__)
 

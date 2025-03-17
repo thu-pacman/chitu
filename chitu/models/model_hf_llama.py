@@ -1,25 +1,25 @@
-from .model import Attention, Transformer, TransformerBlock, RMSNorm
-from torch import nn
-from typing import Optional, List, Mapping, Any
+from logging import getLogger
+from typing import Any, List, Mapping, Optional
+
 import torch
 import torch.nn.functional as F
-from logging import getLogger
+from torch import nn
 
-from ..ops import apply_rotary_pos_emb
-from ..attn_backend import AttnBackend
-from ..tensor_parallel import (
-    get_tp_size,
+from chitu.attn_backend import AttnBackend
+from chitu.models.model import Attention, RMSNorm, Transformer, TransformerBlock
+from chitu.muxi_utils import (
+    linear_layout_contig_x_contig_y,
+    linear_layout_contig_x_native_y,
+    linear_layout_native_x_contig_y,
+    preprocess_weights_for_native_layout,
+)
+from chitu.ops import apply_rotary_pos_emb
+from chitu.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
+    get_tp_size,
 )
-from ..muxi_utils import (
-    preprocess_weights_for_native_layout,
-    linear_layout_contig_x_native_y,
-    linear_layout_native_x_contig_y,
-    linear_layout_contig_x_contig_y,
-)
-
 
 logger = getLogger(__name__)
 

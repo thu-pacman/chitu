@@ -1,8 +1,8 @@
-import torch
-from .global_vars import get_timers, get_slot_handle
-
 from logging import getLogger
 
+import torch
+
+from chitu.global_vars import get_slot_handle, get_timers
 
 logger = getLogger(__name__)
 _BLOCK_SIZE = 512  # _BLOCK_SIZE must be a multiple of 256 for FlashAttention

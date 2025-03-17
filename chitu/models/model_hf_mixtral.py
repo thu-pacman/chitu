@@ -1,16 +1,16 @@
 import functools
-from typing import List, Mapping, Any
+from typing import Any, List, Mapping
 
 import torch
 from torch import nn
 
-from ..tensor_parallel import ColumnParallelLinear, RowParallelLinear
-from .model_hf_llama import (
+from chitu.attn_backend import AttnBackend
+from chitu.models.model_hf_llama import (
     FeedForwardHFLlama,
     TransformerBlockHFLlama,
     TransformerHFLlama,
 )
-from ..attn_backend import AttnBackend
+from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 
 
 class FeedForwardExpertHFMixtral(FeedForwardHFLlama):

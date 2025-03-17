@@ -1,15 +1,13 @@
+from functools import partial
 from typing import Tuple
 
 import torch
 import torch.nn as nn
-
-import torch
 from torch import nn
-from functools import partial
 
-from ..tensor_parallel import ColumnParallelLinear, RowParallelLinear
-from ..muxi_utils import tbsgemm
-from ..global_vars import get_timers
+from chitu.global_vars import get_timers
+from chitu.muxi_utils import tbsgemm
+from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 
 
 class NormAndQuant(torch.nn.Module):
