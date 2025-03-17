@@ -1,21 +1,22 @@
-import torch
-import torch.distributed
 import logging
 from logging import getLogger
 
-from .executor import Executor
-from .scheduler import Scheduler
-from .task import (
-    SerializedPackedTasksPayloadType,
-    PackedTasksBase,
+import torch
+import torch.distributed
+
+from chitu.backend import Backend, BackendState
+from chitu.executor import Executor
+from chitu.global_vars import set_global_variables
+from chitu.scheduler import Scheduler
+from chitu.task import (
     PackedTasks,
-    req_encode,
+    PackedTasksBase,
+    SerializedPackedTasksPayloadType,
     TaskPool,
     TaskType,
+    req_encode,
 )
-from .backend import Backend, BackendState
-from .tensor_parallel import get_tp_group
-from .global_vars import set_global_variables
+from chitu.tensor_parallel import get_tp_group
 
 logger = getLogger(__name__)
 

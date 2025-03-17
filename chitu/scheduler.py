@@ -1,11 +1,11 @@
 import time
-import torch
-from .task import TaskPool, TaskType
-
 from logging import getLogger
-
 from typing import List  # Please keep Python 3.8 compatible
-from .global_vars import get_global_args, get_slot_handle
+
+import torch
+
+from chitu.global_vars import get_global_args, get_slot_handle
+from chitu.task import TaskPool, TaskType
 
 logger = getLogger(__name__)
 

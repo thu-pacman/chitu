@@ -1,9 +1,10 @@
-import torch
 from logging import getLogger
 
-from ..models.model import *
-from ..tokenizer import Tokenizer, ChatFormat
-from ..tensor_parallel import ColumnParallelLinear, RowParallelLinear
+import torch
+
+from chitu.models.model import *
+from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear
+from chitu.tokenizer import ChatFormat, Tokenizer
 
 logger = getLogger(__name__)
 
@@ -98,7 +99,7 @@ def replace_with_w8a16(model, current_key_name=None):
             if isinstance(
                 module, (torch.nn.Linear, ColumnParallelLinear, RowParallelLinear)
             ):
-                from .w8a16 import WeightOnlyLinear
+                from chitu.quantize.w8a16 import WeightOnlyLinear
 
                 w8a16_linear = WeightOnlyLinear(
                     module.in_features, module.out_features, module.bias is not None
@@ -127,7 +128,7 @@ def replace_with_simple_w8a8(model, current_key_name=None, quant_on_load=False):
             if isinstance(
                 module, (torch.nn.Linear, ColumnParallelLinear, RowParallelLinear)
             ):
-                from .w8a8 import W8A8Linear
+                from chitu.quantize.w8a8 import W8A8Linear
 
                 w8a8_linear = W8A8Linear.from_float(
                     module, model_arch_only=not quant_on_load
@@ -155,8 +156,8 @@ def replace_with_simple_w8a8_muxi(model, current_key_name=None, quant_on_load=Fa
         current_key_name.append(name)
         current_key_name_str = ".".join(current_key_name)
         if name != "lm_head":
-            from .muxi_w8a8 import W8A8Linear, NormAndQuant
-            from ..models.model import RMSNorm
+            from chitu.models.model import RMSNorm
+            from chitu.quantize.muxi_w8a8 import NormAndQuant, W8A8Linear
 
             if isinstance(
                 module, (torch.nn.Linear, ColumnParallelLinear, RowParallelLinear)
@@ -210,7 +211,7 @@ def quantize_gptq(model):
 def quantize_awq(model, name="hf-llama"):
     q_config = {"zero_point": True, "q_group_size": 128}
 
-    from .. import awq
+    from chitu import awq
 
     awq.real_quantize_model_weight(model, w_bit=4, q_config=q_config, init_only=True)
 

@@ -1,1 +1,1 @@
-from .quantizer import quant
+from chitu.quantize.quantizer import quant

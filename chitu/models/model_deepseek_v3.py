@@ -1,42 +1,41 @@
-from typing import List, Optional, Tuple, Mapping, Any
-from typing_extensions import override
 import math
 from logging import getLogger
+from typing import Any, List, Mapping, Optional, Tuple
 
 import torch
-from torch import nn
-import torch.nn.functional as F
 import torch.distributed as dist
+import torch.nn.functional as F
+from torch import nn
+from typing_extensions import override
 
-from .model import Attention, Transformer, TransformerBlock, RMSNorm
-from ..global_vars import get_global_args
-from ..tensor_parallel import (
-    get_tp_group,
-    get_tp_size,
-    get_tp_rank,
+from chitu.attn_backend import AttnBackend
+from chitu.cache_manager import PagedKVCacheManager
+from chitu.device_type import get_device_name, is_muxi, is_nvidia
+from chitu.global_vars import get_global_args
+from chitu.models.model import Attention, RMSNorm, Transformer, TransformerBlock
+from chitu.ops import (
+    act_quant_deepseek_v3,
+    apply_rotary_pos_emb,
+    fp8_gemm_deepseek_v3,
+    soft_fp8_gemm_deepseek_v3,
+    weight_dequant_deepseek_v3,
+    weight_dequant_soft_fp8_deepseek_v3,
+)
+from chitu.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
+    get_tp_group,
+    get_tp_rank,
+    get_tp_size,
 )
-from ..ops import (
-    apply_rotary_pos_emb,
-    act_quant_deepseek_v3,
-    weight_dequant_deepseek_v3,
-    weight_dequant_soft_fp8_deepseek_v3,
-    fp8_gemm_deepseek_v3,
-    soft_fp8_gemm_deepseek_v3,
-)
-from ..attn_backend import AttnBackend
-from ..cache_manager import PagedKVCacheManager
-from ..utils import try_import_opt_dep
-from ..device_type import is_nvidia, is_muxi, get_device_name
-
+from chitu.utils import try_import_opt_dep
 
 logger = getLogger(__name__)
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
 if has_triton:
-    from ..fused_moe import fused_experts
+    from chitu.fused_moe import fused_experts
 
 
 def parse_dtype(name: str) -> torch.dtype:

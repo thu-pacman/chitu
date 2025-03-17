@@ -18,7 +18,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 import chitu_backend
-from .device_type import is_muxi, is_nvidia, get_device_name
+from chitu.device_type import is_muxi, is_nvidia, get_device_name
 
 
 class SiluAndMul(nn.Module):

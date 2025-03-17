@@ -1,13 +1,14 @@
 import asyncio
-import threading
 import json
+import threading
 import time
 from datetime import datetime
-from pydantic import BaseModel
-from typing import List, Optional
 from logging import getLogger
+from typing import List, Optional
 
-from .backend import Backend
+from pydantic import BaseModel
+
+from chitu.backend import Backend
 
 logger = getLogger(__name__)
 

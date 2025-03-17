@@ -1,26 +1,26 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import Response, StreamingResponse, JSONResponse
-import uvicorn
 import asyncio
-import hydra
-import torch
-from omegaconf import DictConfig
+import logging
+import random
 import uuid
+from logging import getLogger
 from queue import Queue
 from threading import Semaphore, Thread
+from typing import Any, List, Optional
+
+import hydra
+import torch
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from omegaconf import DictConfig
 from pydantic import BaseModel, Field
-from typing import List, Any, Optional
-import random
-import logging
-from logging import getLogger
 
-from .global_vars import set_global_variables
-from .backend import Backend
-from .task import UserRequest, TaskPool, Task, TaskLoad
-from .chitu_main import chitu_init, chitu_run
-from .async_response import AsyncResponse, AsyncDataStream
-from .utils import get_config_dir_path
-
+from chitu.async_response import AsyncDataStream, AsyncResponse
+from chitu.backend import Backend
+from chitu.chitu_main import chitu_init, chitu_run
+from chitu.global_vars import set_global_variables
+from chitu.task import Task, TaskLoad, TaskPool, UserRequest
+from chitu.utils import get_config_dir_path
 
 logger = getLogger(__name__)
 

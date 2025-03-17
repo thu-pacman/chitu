@@ -5,13 +5,13 @@ This file has adaption of open-source code from the following sources:
   licensed under Apache 2.0.
 """
 
-from typing import Tuple, Any
-
-import torch
 from logging import getLogger
-from .global_vars import get_global_args
-import numpy as np
+from typing import Any, Tuple
 
+import numpy as np
+import torch
+
+from chitu.global_vars import get_global_args
 
 logger = getLogger(__name__)
 
