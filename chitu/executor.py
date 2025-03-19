@@ -110,7 +110,7 @@ class NormalExecutor(Executor):
             )
         tokens_cpu = tokens.cpu()
         for it, task in enumerate(tasks.tasks):
-            task.update_response(tokens_cpu[it].item(), tokens[it])
+            task.update_response(tokens_cpu[it].item(), tokens[it], logits[it])
 
     def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
         """Make every ranks know the task metadata"""
