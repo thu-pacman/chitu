@@ -1,6 +1,6 @@
 # Chitu
 
-English | [中文](docs/zh/README_zh.md)
+English | [中文](/docs/zh/README_zh.md)
 
 Chitu is a high-performance inference framework for large language models, focusing on efficiency, flexibility, and availability.
 
@@ -159,11 +159,11 @@ python benchmarks/benchmark_serving.py \
 
 ### Full Documentation
 
-Please refer to [here](docs/Development.md) for more details.
+Please refer to [here](/docs/Development.md) for more details.
 
 ## FAQ (Frequently Asked Questions)
 
-[English](docs/en/FAQ.md) | [中文](docs/zh/FAQ.md)
+[English](/docs/en/FAQ.md) | [中文](/docs/zh/FAQ.md)
 
 ## Contributing
 
