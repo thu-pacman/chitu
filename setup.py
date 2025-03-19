@@ -24,6 +24,7 @@ ext_modules = [
             "./csrc/binding.cpp",
             "./csrc/moe_align_kernel.cu",
             "./csrc/fused_shared_experts_kernel.cu",
+            "./csrc/group_topk.cu",
         ],
         extra_compile_args={
             "cxx": ["-std=c++17"],
