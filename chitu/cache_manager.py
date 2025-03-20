@@ -2,7 +2,8 @@ from logging import getLogger
 
 import torch
 
-from chitu.global_vars import get_slot_handle, get_timers
+from chitu.global_vars import get_slot_handle, get_timers, get_global_args
+from chitu.static_tensor import StaticTensor
 
 logger = getLogger(__name__)
 _BLOCK_SIZE = 512  # _BLOCK_SIZE must be a multiple of 256 for FlashAttention
@@ -50,21 +51,18 @@ class PagedKVCacheManager:
         self.block_size = block_size
         self.max_seq_len = max_seq_len
         self.device = torch.device(device)
-        self.gpu_block_table = None
 
         self.seq_lens = {}
         self.timers = get_timers()
         self.block_table = {}  # (seq_id, block_idx)
-        self.curr_seq_lens_gpu_excl_this_decode = torch.zeros(
-            num_hot_req, dtype=torch.int32, device=self.device
+        self.curr_seq_lens_gpu_excl_this_decode = StaticTensor(
+            max_nelem=num_hot_req, dtype=torch.int32, device=self.device
         )
-        self.curr_seq_lens_gpu_incl_this_decode = torch.zeros(
-            num_hot_req, dtype=torch.int32, device=self.device
+        self.curr_seq_lens_gpu_incl_this_decode = StaticTensor(
+            max_nelem=num_hot_req, dtype=torch.int32, device=self.device
         )
-        self.gpu_block_table_buffer = torch.zeros(
-            (num_hot_req, self.max_blocks_per_req),
-            dtype=torch.int32,
-            device=self.device,
+        self.gpu_block_table = StaticTensor(
+            max_nelem=self.num_blocks, dtype=torch.int32, device=self.device
         )
         # TODO: For better performance, use list instead of set for free_blocks
         self.free_blocks = set(range(self.num_blocks))
@@ -88,6 +86,9 @@ class PagedKVCacheManager:
 
     def get_block_size(self):
         return self.block_size
+
+    def get_num_blocks(self):
+        return self.num_blocks
 
     # Init block table and kv cache with kv generated during prefill
     def finalize_cache_bylayer_prefill(self, xk, xv, req_ids, varlen, layer_id):
@@ -152,10 +153,12 @@ class PagedKVCacheManager:
             seq_lens.append(seq_len)
         max_seq = max(seq_lens)
         self.curr_seq_lens = seq_lens
-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
-        self.curr_seq_lens_gpu_excl_this_decode[: len(seq_lens)].copy_(seq_lens_tensor)
-        self.curr_seq_lens_gpu_incl_this_decode[: len(seq_lens)].copy_(seq_lens_tensor)
-        self.curr_seq_lens_gpu_incl_this_decode[: len(seq_lens)].add_(1)
+        self.curr_seq_lens_gpu_excl_this_decode.set(
+            torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
+        )
+        self.curr_seq_lens_gpu_incl_this_decode.set(
+            self.curr_seq_lens_gpu_excl_this_decode.get() + 1
+        )
 
     def get_free_block(self):
         # TODO: When run out of free blocks, use scheduling and preemption in paper instead of exception
@@ -168,13 +171,13 @@ class PagedKVCacheManager:
         return idx
 
     def get_gpu_block_table(self):
-        return self.gpu_block_table
+        return self.gpu_block_table.get()
 
     def get_gpu_seq_lens_excl_this_decode(self):
-        return self.curr_seq_lens_gpu_excl_this_decode[: len(self.curr_seq_lens)]
+        return self.curr_seq_lens_gpu_excl_this_decode.get()
 
     def get_gpu_seq_lens_incl_this_decode(self):
-        return self.curr_seq_lens_gpu_incl_this_decode[: len(self.curr_seq_lens)]
+        return self.curr_seq_lens_gpu_incl_this_decode.get()
 
     def get_paged_kv_cache(self, layer_id):
         if self.kv_shape_per_sample is not None:
@@ -198,15 +201,18 @@ class PagedKVCacheManager:
             if self.seq_lens[req_id] % self.block_size == 0:
                 self.block_table[req_id].append(self.get_free_block())
 
-        self.gpu_block_table_buffer[: len(req_ids)].zero_()
-
+        if get_global_args().infer.use_cuda_graph:
+            max_block_num = self.max_blocks_per_req
+        else:
+            max_block_num = max(len(self.block_table[req_id]) for req_id in req_ids)
+        self.gpu_block_table.set(
+            torch.zeros((len(req_ids), max_block_num), dtype=torch.int32, device="cuda")
+        )
         for idx, req_id in enumerate(req_ids):
             block_ids = self.block_table[req_id]
-            self.gpu_block_table_buffer[idx, : len(block_ids)].copy_(
-                torch.tensor(block_ids, dtype=torch.int32, device=self.device)
+            self.gpu_block_table.get()[idx, : len(block_ids)] = torch.tensor(
+                block_ids, dtype=torch.int32
             )
-
-        self.gpu_block_table = self.gpu_block_table_buffer[: len(req_ids)]
 
     def finalize_cache_single_decode(self, req_ids):
         for req_id in req_ids:

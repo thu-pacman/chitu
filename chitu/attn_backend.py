@@ -16,6 +16,7 @@ from chitu.global_vars import get_global_args
 from chitu.ops import append_to_paged_kv_cache
 from chitu.triton_decode_attention import mla_decode
 from chitu.utils import try_import_opt_dep
+from chitu.static_tensor import StaticTensor
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
@@ -521,18 +522,22 @@ class FlashMLABackend(RefAttnBackend):
         block_size,
         softmax_scale=None,
     ):
+        max_batch_size = get_global_args().infer.max_reqs
         metadata, num_splits = flash_mla.get_mla_metadata(
             cache_seqlens_incl_this_decode,
             self.mtp_size * self.local_n_heads // self.kv_heads,
             self.kv_heads,
         )
-        if self.metadata is None or self.num_splits is None:
-            self.metadata = metadata.clone()
-            self.num_splits = num_splits.clone()
-
-        splits_len = num_splits.shape[0]
-        self.metadata.copy_(metadata)
-        self.num_splits[:splits_len].copy_(num_splits)
+        if self.metadata is None:
+            self.metadata = StaticTensor(metadata)  # `metadata` has a fixed shape
+        else:
+            self.metadata.set(metadata)
+        if self.num_splits is None:
+            self.num_splits = StaticTensor(
+                num_splits, max_nelem=max_batch_size + 1
+            )  # `num_splits`'s shape is always (batch_size + 1,)
+        else:
+            self.num_splits.set(num_splits)
 
     def mla_attn_with_kvcache(
         self,
@@ -565,8 +570,8 @@ class FlashMLABackend(RefAttnBackend):
             block_table,
             cache_seqlens_incl_this_decode,
             512,  # dv
-            self.metadata,
-            self.num_splits,
+            self.metadata.get(),
+            self.num_splits.get(),
             causal=causal,
             softmax_scale=softmax_scale,
         )
@@ -574,18 +579,44 @@ class FlashMLABackend(RefAttnBackend):
 
 
 class FlashInferBackend(RefAttnBackend):
-    def __init__(self):
+    def __init__(self, tot_num_blocks):
         super().__init__()
 
-        self.mla_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-            torch.empty(128 * 1024 * 1024, dtype=torch.int8).cuda(), backend="auto"
+        args = get_global_args()
+
+        # FlashInfer accepts block tables for Q and KV in CSR format.
+        # - For Q, it is trivial because the length for each sample is 1.
+        # - For KV, we need to convert `block_table` to CSR format.
+        # These buffers must be allocated when initializing
+        # `flashinfer.mla.BatchMLAPagedAttentionWrapper` when cuda graph is enabled
+        max_batch_size = get_global_args().infer.max_reqs
+        self.q_indptr = StaticTensor(
+            torch.empty(max_batch_size + 1, dtype=torch.int32, device="cuda")
+        )
+        self.kv_indptr = StaticTensor(
+            torch.empty(max_batch_size + 1, dtype=torch.int32, device="cuda")
+        )
+        self.kv_indices = StaticTensor(
+            torch.empty(tot_num_blocks, dtype=torch.int32, device="cuda")
+        )
+        self.seqlens = StaticTensor(
+            torch.empty(max_batch_size, dtype=torch.int32, device="cuda")
         )
 
-        self.args = get_global_args()
-        self.local_n_heads = self.args.models.n_heads // self.args.infer.tp_size
-        self.kv_lora_rank = self.args.models.kv_lora_rank
-        self.qk_rope_head_dim = self.args.models.qk_rope_head_dim
-        self.qk_nope_head_dim = self.args.models.qk_nope_head_dim
+        self.mla_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+            torch.empty(128 * 1024 * 1024, dtype=torch.int8).cuda(),
+            use_cuda_graph=args.infer.use_cuda_graph,
+            qo_indptr=self.q_indptr.get(),
+            kv_indptr=self.kv_indptr.get(),
+            kv_indices=self.kv_indices.get(),
+            kv_len_arr=self.seqlens.get(),
+            backend="auto",
+        )
+
+        self.local_n_heads = args.models.n_heads // args.infer.tp_size
+        self.kv_lora_rank = args.models.kv_lora_rank
+        self.qk_rope_head_dim = args.models.qk_rope_head_dim
+        self.qk_nope_head_dim = args.models.qk_nope_head_dim
 
     def prepare_metadata_for_decode(
         self,
@@ -596,63 +627,35 @@ class FlashInferBackend(RefAttnBackend):
         softmax_scale=None,
     ):
         batch_size = cache_seqlens_incl_this_decode.shape[0]
-        max_blocks_per_seq = block_table.shape[1]
-        if not hasattr(self, "q_indptr") or self.q_indptr.shape[0] != batch_size + 1:
-            self.q_indptr = torch.zeros(
-                batch_size + 1, dtype=torch.int32, device="cuda"
-            )
-        torch.arange(0, batch_size + 1, out=self.q_indptr)
-        if not hasattr(self, "kv_indptr") or self.kv_indptr.shape[0] != batch_size + 1:
-            self.kv_indptr = torch.zeros(
-                batch_size + 1, dtype=torch.int32, device="cuda"
-            )
-        max_indices = batch_size * max_blocks_per_seq
-        if (
-            not hasattr(self, "kv_indices_buffer")
-            or self.kv_indices_buffer.shape[0] < max_indices
-        ):
-            self.kv_indices_buffer = torch.zeros(
-                max_indices, dtype=torch.int32, device="cuda"
-            )
-        self.kv_indptr.zero_()
-        valid_blocks = torch.zeros(
-            (batch_size, max_blocks_per_seq), dtype=torch.bool, device="cuda"
-        )
+        self.q_indptr.set(torch.arange(0, batch_size + 1).cuda().to(torch.int32))
+        kv_indptr_list = []
+        kv_indices_list = []
+        tot_len = 0
         for i in range(batch_size):
-            valid_range = (
-                torch.arange(max_blocks_per_seq, device="cuda")
-                < cache_seqlens_incl_this_decode[i]
-            )
-            valid_blocks[i] = valid_range
-        blocks_per_seq = valid_blocks.sum(dim=1)
-        torch.cumsum(blocks_per_seq, dim=0, out=self.kv_indptr[1:])
-        total_valid_blocks = blocks_per_seq.sum().item()
-        idx = 0
-        for i in range(batch_size):
-            num_blocks = blocks_per_seq[i].item()
-            if num_blocks > 0:
-                # 使用连续内存操作
-                self.kv_indices_buffer[idx : idx + num_blocks].copy_(
-                    block_table[i, :num_blocks]
-                )
-                idx += num_blocks
-        kv_indices = self.kv_indices_buffer[:total_valid_blocks]
+            kv_indptr_list.append(tot_len)
+            cur_len = (cache_seqlens_incl_this_decode[i] - 1) // block_size + 1
+            kv_indices_list.append(block_table[i, :cur_len])
+            tot_len += cur_len
+        kv_indptr_list.append(tot_len)
+        self.kv_indptr.set(torch.tensor(kv_indptr_list).cuda().to(torch.int32))
+        self.kv_indices.set(torch.cat(kv_indices_list).cuda().to(torch.int32))
+        self.seqlens.set(cache_seqlens_incl_this_decode)
 
         if softmax_scale is None:
-            softmax_scale = (
-                1.0 / ((self.qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5),
+            softmax_scale = 1.0 / (
+                (self.qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5
             )
 
         self.mla_wrapper.plan(
-            self.q_indptr,
-            self.kv_indptr,
-            kv_indices,
-            cache_seqlens_incl_this_decode,
+            self.q_indptr.get(),
+            self.kv_indptr.get(),
+            self.kv_indices.get(),
+            self.seqlens.get(),
             num_heads=self.local_n_heads,
             head_dim_ckv=self.kv_lora_rank,
             head_dim_kpe=self.qk_rope_head_dim,
             page_size=block_size,
-            causal=False,
+            causal=True,
             sm_scale=softmax_scale,
             q_data_type=torch.get_default_dtype(),
             kv_data_type=torch.get_default_dtype(),

@@ -682,7 +682,7 @@ class TransformerHFLlama(Transformer):
             self.rotary_emb.sin_cached[self.cache.curr_varlens.position_ids],
         )
 
-    def prepare_freqs_cis_decode(self, seq_lens):
+    def prepare_freqs_cis_decode(self):
         return (
             self.rotary_emb.cos_cached[self.cache.get_gpu_seq_lens_excl_this_decode()],
             self.rotary_emb.sin_cached[self.cache.get_gpu_seq_lens_excl_this_decode()],

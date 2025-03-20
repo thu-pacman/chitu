@@ -264,7 +264,8 @@ class Backend:
         elif args.infer.attn_type == "flash_mla":
             attn_backend = FlashMLABackend()
         elif args.infer.attn_type == "flash_infer":
-            attn_backend = FlashInferBackend()
+            assert isinstance(Backend.cache_manager, PagedKVCacheManager)
+            attn_backend = FlashInferBackend(Backend.cache_manager.get_num_blocks())
         elif args.infer.attn_type == "triton":
             attn_backend = TritonAttnBackend()
         elif args.infer.attn_type == "ref":
