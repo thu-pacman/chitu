@@ -78,6 +78,11 @@ class UserRequest:
         self.max_new_tokens = max_new_tokens
         self.async_stream = AsyncDataStream()
         self.output = ""
+        self._test_flag = False
+        self._test_logits = []
+        self._test_tokens = []
+        self._test_standard_tokens = None
+        self._test_standard_it = 0
         self.finish_reason = None
         self.timestamp: str = datetime.now().strftime("%H:%M:%S:%f")
         self.start_time: int = time.monotonic()
@@ -94,6 +99,16 @@ class UserRequest:
     def add_data(self, data):
         self.async_stream.add_data(data)
         logger.debug(f"add data: {data}")
+
+    def _test_add_logit(self, logit):
+        logit = logit.tolist()
+        # logit = logit[0: 9]
+        self._test_logits.append(logit)
+        # logger.warning(f"add logit {logit}")
+
+    def _test_add_token(self, token):
+        self._test_tokens.append(token)
+        # logger.warning(f"add token {token}")
 
     def save_trace_to_json(self):
         prefill_duration = self.prefill_end_time - self.start_time
@@ -269,10 +284,19 @@ class Task:
             return True
         return False
 
-    def update_response(self, token: int, token_gpu):
+    def update_response(self, token: int, token_gpu, logit):
         # TODO: modify if generate more than one token at a time
         assert token is not None
         self.response.append(token_gpu)
+        if self.req._test_flag:
+            self.req._test_add_logit(logit)
+            self.req._test_add_token(token)
+        if not self.req._test_standard_tokens == None:
+            # print(token, "--->", self.req.standard_tokens[self.req.standard_it], "[ ", self.req.standard_it, " ]")
+            token = self.req._test_standard_tokens[self.req._test_standard_it]
+            self.req._test_standard_it = self.req._test_standard_it + 1
+            if self.req._test_standard_it >= len(self.req._test_standard_tokens):
+                self.req.max_new_tokens = -1
         self.next_token = token
         self.prefix_length += 1
         self.max_output_tokens -= 1

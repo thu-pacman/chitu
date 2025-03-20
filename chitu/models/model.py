@@ -20,6 +20,8 @@ from chitu.ops import apply_rotary_pos_emb
 from chitu.tensor_parallel import get_tp_group, get_tp_rank
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
 from chitu.utils import VarLens, compute_layer_dist_in_pipe, is_layer
+from chitu.cuda_graph import make_dispatched_graphed_callables
+from chitu.device_type import is_muxi, get_device_name
 
 logger = getLogger(__name__)
 
@@ -424,26 +426,9 @@ class Transformer(nn.Module):
         curr_freqs_cis = self.freqs_cis[self.cache.curr_varlens.position_ids]
         return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
 
-    def prepare_freqs_cis_decode(self, seq_lens):
-        bs = len(seq_lens)
+    def prepare_freqs_cis_decode(self):
         curr_freqs_cis = self.freqs_cis[self.cache.get_gpu_seq_lens_excl_this_decode()]
-        if not hasattr(self, "cis_cos_buffer") or not hasattr(self, "cis_sin_buffer"):
-            max_reqs = get_global_args().infer.max_reqs
-            self.cis_cos_buffer = torch.zeros(
-                (max_reqs, curr_freqs_cis.real.shape[-1]),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            self.cis_sin_buffer = torch.zeros(
-                (max_reqs, curr_freqs_cis.imag.shape[-1]),
-                dtype=torch.float32,
-                device=self.device,
-            )
-
-        self.cis_cos_buffer[:bs].copy_(curr_freqs_cis.real.contiguous())
-        self.cis_sin_buffer[:bs].copy_(curr_freqs_cis.imag.contiguous())
-
-        return self.cis_cos_buffer[:bs], self.cis_sin_buffer[:bs]
+        return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
 
     @torch.inference_mode()
     def prefill_single_device(self, tokens, varlens=None):
@@ -534,87 +519,36 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def decode(self, tokens, seq_lens):
-        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_decode(seq_lens)
         self.prepare_decoding_attn()
 
         batch_size = len(seq_lens)
-        use_cuda_graph = get_global_args().infer.use_cuda_graph and (
-            get_global_args().infer.attn_type == "flash_infer"
-            or get_global_args().infer.attn_type == "flash_mla"
+        max_batch_size = get_global_args().infer.max_reqs
+
+        use_cuda_graph = get_global_args().infer.use_cuda_graph
+
+        if use_cuda_graph:
+            if get_global_args().infer.cache_type == "skew":
+                raise NotImplementedError(
+                    'CUDA graph is currently not supported for infer.cache_type="skew"'
+                )
+            if is_muxi():
+                raise NotImplementedError(
+                    f"CUDA graph is currently not supported for {get_device_name()}"
+                )
+
+        @make_dispatched_graphed_callables(
+            sample_args=(tokens,),
+            sample_kwargs={},
+            args_max_nelem=(tokens.numel() // batch_size * max_batch_size,),
+            kwargs_max_nelem={},
+            output_max_nelem_callback=lambda n: n // batch_size * max_batch_size,
+            enable=use_cuda_graph,
         )
-        if use_cuda_graph and batch_size <= get_global_args().infer.max_reqs:
-            if not hasattr(self, "cuda_graphs"):
-                self.cuda_graphs = {}
-                self.static_tokens_dict = {}
-                self.static_output_dict = {}
-                self.cuda_graph_pool = None
-
-            if batch_size not in self.cuda_graphs:
-                self.static_tokens_dict[batch_size] = tokens.clone()
-
-                if self.pipeline_exec:
-                    sample_output = self.decode_pipeline(
-                        self.static_tokens_dict[batch_size],
-                        freqs_cis_cos,
-                        freqs_cis_sin,
-                    )
-                else:
-                    sample_output = self.decode_single_device(
-                        self.static_tokens_dict[batch_size],
-                        freqs_cis_cos,
-                        freqs_cis_sin,
-                    )
-
-                self.static_output_dict[batch_size] = torch.zeros_like(sample_output)
-
-                self.cuda_graphs[batch_size] = torch.cuda.CUDAGraph()
-
-                if self.cuda_graph_pool is not None:
-                    with torch.cuda.graph(
-                        self.cuda_graphs[batch_size], pool=self.cuda_graph_pool
-                    ):
-                        if self.pipeline_exec:
-                            self.static_output_dict[batch_size].copy_(
-                                self.decode_pipeline(
-                                    self.static_tokens_dict[batch_size],
-                                    freqs_cis_cos,
-                                    freqs_cis_sin,
-                                )
-                            )
-                        else:
-                            self.static_output_dict[batch_size].copy_(
-                                self.decode_single_device(
-                                    self.static_tokens_dict[batch_size],
-                                    freqs_cis_cos,
-                                    freqs_cis_sin,
-                                )
-                            )
-                else:
-                    with torch.cuda.graph(self.cuda_graphs[batch_size]):
-                        if self.pipeline_exec:
-                            self.static_output_dict[batch_size].copy_(
-                                self.decode_pipeline(
-                                    self.static_tokens_dict[batch_size],
-                                    freqs_cis_cos,
-                                    freqs_cis_sin,
-                                )
-                            )
-                        else:
-                            self.static_output_dict[batch_size].copy_(
-                                self.decode_single_device(
-                                    self.static_tokens_dict[batch_size],
-                                    freqs_cis_cos,
-                                    freqs_cis_sin,
-                                )
-                            )
-                    if self.cuda_graph_pool is None:
-                        self.cuda_graph_pool = self.cuda_graphs[batch_size].pool()
-
-            self.static_tokens_dict[batch_size].copy_(tokens)
-            self.cuda_graphs[batch_size].replay()
-            return self.static_output_dict[batch_size]
-        else:
+        def do_decode(tokens):
+            freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_decode()
             if self.pipeline_exec:
                 return self.decode_pipeline(tokens, freqs_cis_cos, freqs_cis_sin)
             else:
                 return self.decode_single_device(tokens, freqs_cis_cos, freqs_cis_sin)
+
+        return do_decode(batch_size, tokens)
