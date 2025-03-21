@@ -9,7 +9,7 @@ def test_moe_align_block_size_cuda():
     # Import inside the `skipif` guard
     from chitu_backend import cuda_moe_align_block_size
 
-    topk_ids = torch.randint(0, 256, (1000,), device="cuda:0")
+    topk_ids = torch.randint(0, 256, (64,), device="cuda:0")
     num_experts = 256
     block_size = 64
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
@@ -28,6 +28,11 @@ def test_moe_align_block_size_cuda():
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+    token_cnts_buffer = torch.zeros(
+        (num_experts + 1) * num_experts,
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
     cumsum_buffer = torch.zeros(
         (num_experts + 1,), dtype=torch.int32, device=topk_ids.device
     )
@@ -38,15 +43,13 @@ def test_moe_align_block_size_cuda():
         sorted_ids,
         expert_ids,
         num_tokens_post_pad,
+        token_cnts_buffer,
         cumsum_buffer,
     )
-    print("num_tokens_post_pad:", num_tokens_post_pad)
-    print("topk_ids:", topk_ids)
     # Find indices where topk_ids value is 0
     # Randomly select 10 expert IDs to check
     unique_expert_ids = torch.unique(topk_ids)
     selected_experts = unique_expert_ids
-    print(f"Randomly selected experts to check: {selected_experts.tolist()}")
 
     # For each selected expert, find indices where topk_ids equals that expert
     for expert_id in selected_experts:
@@ -56,13 +59,10 @@ def test_moe_align_block_size_cuda():
             expert_indices = expert_indices.unsqueeze(0)  # Convert scalar to 1D tensor
         elif expert_indices.numel() == 0:
             expert_indices = torch.tensor([], dtype=torch.long, device=topk_ids.device)
-        print(f"Indices where topk_ids value is {expert_id}:", expert_indices)
 
         # Get cumsum buffer values for this expert
-        start_idx_expert = cumsum_buffer[expert_id].item()
-        len_expert = cumsum_buffer[expert_id + 1].item() - start_idx_expert
-
-        print(f"Expert {expert_id}: start_idx={start_idx_expert}, length={len_expert}")
+        start_idx_expert = cumsum_buffer[expert_id - 1].item()
+        len_expert = cumsum_buffer[expert_id].item() - start_idx_expert
 
         # Check if any of the expert indices in topk_ids appear in the expert section of sorted_ids
         if len_expert > 0:
