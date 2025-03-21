@@ -10,7 +10,7 @@ Chitu (赤兔) 是一个专注于效率、灵活性和可用性的高性能大�
 
 [敬请期待] 提供 FP8 转 FP16 算子以支持更多型号 GPU。 
 
-[2025/03/21] 补充了部分 BF16 模型（QwQ-32B）使用 FP8/INT8/INT4 量化的精度对比数据，其中 QwQ-32B FP8 量化模型开源至 [Huggingface](https://huggingface.co/qingcheng-ai/QWQ-32B-FP8)。
+[2025/03/21] 更好地支持了 QwQ-32B，下文补充了 QwQ-32B 使用 BF16/FP8/INT8/INT4 的精度对比数据，其中 QwQ-32B FP8 量化模型开源至 [Huggingface](https://huggingface.co/qingcheng-ai/QWQ-32B-FP8)。
 
 [2025/03/14] 清华团队开源大模型推理引擎“赤兔Chitu”，支持 DeepSeek-R1 671B，提供 FP8 在线转 BF16 的高效算子实现。
 

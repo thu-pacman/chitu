@@ -6,9 +6,9 @@ Chitu is a high-performance inference framework for large language models, focus
 
 ## News
 
-[Stay tuned] Provide FP8 to FP16 operators to support more GPUs.
+[Coming soon!] Provide FP8 to FP16 operators to support more GPUs.
 
-[2025/03/21] Added accuracy comparison results using QwQ-32B BF16/FP8/INT8/INT4. QwQ-32B FP8 model is available on [Huggingface](https://huggingface.co/qingcheng-ai/QWQ-32B-FP8).
+[2025/03/21] Better support for QwQ-32B. Added accuracy comparison results using QwQ-32B BF16/FP8/INT8/INT4. QwQ-32B FP8 model is available on [Huggingface](https://huggingface.co/qingcheng-ai/QWQ-32B-FP8).
 
 [2025/03/14] Initial release of Chitu, supports DeepSeek-R1 671B, and provides efficient operators with online FP8 to BF16 conversion.
 
