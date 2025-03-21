@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 from typing_extensions import override
 
+import chitu_backend
 from chitu.attn_backend import AttnBackend
 from chitu.cache_manager import PagedKVCacheManager
 from chitu.device_type import get_device_name, is_muxi, is_nvidia
@@ -917,6 +918,20 @@ class MoEDeepSeekV3(nn.Module):
             input_is_parallel=True,
         )
 
+    def get_expert_weights_for_fp8_w8a8(self, expert_num):
+        w1w3_weight = self.w1w3.weight[:expert_num]
+        w1w3_scale = self.w1w3.scale[:expert_num]
+        w2_weight = self.w2.weight[:expert_num]
+        w2_scale = self.w2.scale[:expert_num]
+        return w1w3_weight, w1w3_scale, w2_weight, w2_scale
+
+    def get_expert_weights_for_non_fp8(self, expert_num):
+        w1w3_weight = self.w1w3.weight[:expert_num]
+        w1w3_scale = None
+        w2_weight = self.w2.weight[:expert_num]
+        w2_scale = None
+        return w1w3_weight, w1w3_scale, w2_weight, w2_scale
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for the MoE module.
@@ -927,86 +942,141 @@ class MoEDeepSeekV3(nn.Module):
         Returns:
             torch.Tensor: Output tensor after expert routing and computation.
         """
+
+        shared_experts = 0
+        if get_global_args().infer.fuse_shared_experts:
+            shared_experts = self.n_shared_experts
+
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x)
 
         if has_triton and not is_muxi():
-            w1w3_out = linear_deepseek_v3(
-                x,
-                self.w1w3.weight[-1],
-                self.w1w3.scale[-1] if self.w1w3.scale is not None else None,
-                self.w1w3.bias[-1] if self.w1w3.bias is not None else None,
-            )
-            w1_out, w3_out = torch.split(w1w3_out, w1w3_out.shape[-1] // 2, dim=-1)
-            act = F.silu(w1_out) * w3_out
-            y = linear_deepseek_v3(
-                act,
-                self.w2.weight[-1],
-                self.w2.scale[-1] if self.w2.scale is not None else None,
-                self.w2.bias[-1] if self.w2.bias is not None else None,
-            )
 
             if self.w1w3.scale is None and self.w2.scale is None:
-                w1w3_weight = self.w1w3.weight[: self.n_routed_experts]
-                w1w3_scale = None
-                w2_weight = self.w2.weight[: self.n_routed_experts]
-                w2_scale = None
+                w1w3_weight, w1w3_scale, w2_weight, w2_scale = (
+                    self.get_expert_weights_for_non_fp8(
+                        self.n_routed_experts + shared_experts
+                    )
+                )
                 use_fp8_w8a8 = False
                 fused_soft_fp8 = False
             else:
                 assert self.w1w3.scale is not None
                 assert self.w2.scale is not None
                 if not get_global_args().infer.soft_fp8:
-                    w1w3_weight = self.w1w3.weight[: self.n_routed_experts]
-                    w1w3_scale = self.w1w3.scale[: self.n_routed_experts]
-                    w2_weight = self.w2.weight[: self.n_routed_experts]
-                    w2_scale = self.w2.scale[: self.n_routed_experts]
+                    w1w3_weight, w1w3_scale, w2_weight, w2_scale = (
+                        self.get_expert_weights_for_fp8_w8a8(
+                            self.n_routed_experts + shared_experts
+                        )
+                    )
                     use_fp8_w8a8 = True
                     fused_soft_fp8 = False
                 elif is_nvidia():
-                    w1w3_weight = self.w1w3.weight[: self.n_routed_experts]
-                    w1w3_scale = self.w1w3.scale[: self.n_routed_experts]
-                    w2_weight = self.w2.weight[: self.n_routed_experts]
-                    w2_scale = self.w2.scale[: self.n_routed_experts]
+                    w1w3_weight, w1w3_scale, w2_weight, w2_scale = (
+                        self.get_expert_weights_for_fp8_w8a8(
+                            self.n_routed_experts + shared_experts
+                        )
+                    )
                     use_fp8_w8a8 = True
                     fused_soft_fp8 = True
+
                 else:
                     logger.warning(
                         f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
                     )
                     block_size = 128
                     w1w3_weight = weight_dequant_soft_fp8_deepseek_v3(
-                        self.w1w3.weight[: self.n_routed_experts],
-                        self.w1w3.scale[: self.n_routed_experts],
+                        self.w1w3.weight[
+                            : self.n_routed_experts + self.n_shared_experts
+                        ],
+                        self.w1w3.scale[
+                            : self.n_routed_experts + self.n_shared_experts
+                        ],
                         block_size,
                     )
                     w1w3_scale = None
                     w2_weight = weight_dequant_soft_fp8_deepseek_v3(
-                        self.w2.weight[: self.n_routed_experts],
-                        self.w2.scale[: self.n_routed_experts],
+                        self.w2.weight[: self.n_routed_experts + self.n_shared_experts],
+                        self.w2.scale[: self.n_routed_experts + self.n_shared_experts],
                         block_size,
                     )
                     w2_scale = None
                     use_fp8_w8a8 = False
                     fused_soft_fp8 = False
 
-            y1 = fused_experts(
-                x,
-                w1w3_weight,
-                w2_weight,
-                topk_weights=weights,
-                topk_ids=indices,
-                use_fp8_w8a8=use_fp8_w8a8,
-                inplace=True,
-                global_num_experts=self.n_routed_experts,
-                expert_map=None,  # use when ep > 1
-                w1_scale=w1w3_scale,
-                w2_scale=w2_scale,
-                block_shape=[128, 128],
-                soft_fp8=fused_soft_fp8,
-            )
-            y += y1
+            if not get_global_args().infer.fuse_shared_experts:
+                w1w3_out = linear_deepseek_v3(
+                    x,
+                    self.w1w3.weight[-1],
+                    self.w1w3.scale[-1] if self.w1w3.scale is not None else None,
+                    self.w1w3.bias[-1] if self.w1w3.bias is not None else None,
+                )
+                w1_out, w3_out = torch.split(w1w3_out, w1w3_out.shape[-1] // 2, dim=-1)
+                act = F.silu(w1_out) * w3_out
+                y1 = linear_deepseek_v3(
+                    act,
+                    self.w2.weight[-1],
+                    self.w2.scale[-1] if self.w2.scale is not None else None,
+                    self.w2.bias[-1] if self.w2.bias is not None else None,
+                )
+
+                y = fused_experts(
+                    x,
+                    w1w3_weight,
+                    w2_weight,
+                    topk_weights=weights,
+                    topk_ids=indices,
+                    use_fp8_w8a8=use_fp8_w8a8,
+                    inplace=True,
+                    global_num_experts=self.n_routed_experts,
+                    expert_map=None,  # use when ep > 1
+                    w1_scale=w1w3_scale,
+                    w2_scale=w2_scale,
+                    block_shape=[128, 128],
+                    soft_fp8=fused_soft_fp8,
+                )
+
+                y += y1
+            else:
+                indice_shape = indices.shape
+                new_indices = torch.zeros(
+                    (indice_shape[0], indice_shape[1] + 1),
+                    dtype=indices.dtype,
+                    device=indices.device,
+                )
+
+                new_weights = torch.zeros(
+                    (weights.shape[0], weights.shape[1] + 1),
+                    dtype=weights.dtype,
+                    device=weights.device,
+                )
+
+                chitu_backend.cuda_add_shared_experts(
+                    new_weights,
+                    new_indices,
+                    weights,
+                    indices,
+                    self.n_routed_experts,
+                    self.n_shared_experts,
+                )
+                del weights, indices
+                y = fused_experts(
+                    x,
+                    w1w3_weight,
+                    w2_weight,
+                    topk_weights=new_weights,
+                    topk_ids=new_indices,
+                    use_fp8_w8a8=use_fp8_w8a8,
+                    inplace=True,
+                    global_num_experts=self.n_routed_experts + self.n_shared_experts,
+                    expert_map=None,  # use when ep > 1
+                    w1_scale=w1w3_scale,
+                    w2_scale=w2_scale,
+                    block_shape=[128, 128],
+                    soft_fp8=fused_soft_fp8,
+                )
+
             torch.distributed.all_reduce(y, group=get_tp_group())
         else:
             y = torch.zeros_like(x)

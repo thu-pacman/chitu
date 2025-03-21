@@ -9,6 +9,7 @@ namespace chitu {
 
 void init_compute(py::module &m) {
     m.def("cuda_moe_align_block_size", &moe_align_block_size, "");
+    m.def("cuda_add_shared_experts", &add_shared_experts, "");
 }
 
 } // namespace chitu

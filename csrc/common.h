@@ -40,6 +40,25 @@ using Index = int64_t;
         }                                                                      \
     } while (0)
 
+#define DISPATCH_CASE_INTEGRAL_TYPES(...)                                      \
+    AT_DISPATCH_CASE(at::ScalarType::Byte, __VA_ARGS__)                        \
+    AT_DISPATCH_CASE(at::ScalarType::Char, __VA_ARGS__)                        \
+    AT_DISPATCH_CASE(at::ScalarType::Short, __VA_ARGS__)                       \
+    AT_DISPATCH_CASE(at::ScalarType::Int, __VA_ARGS__)                         \
+    AT_DISPATCH_CASE(at::ScalarType::Long, __VA_ARGS__)
+
+#define DISPATCH_CASE_FLOAT_TYPES(...)                                         \
+    AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__)                       \
+    AT_DISPATCH_CASE(at::ScalarType::Double, __VA_ARGS__)                      \
+    AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__)                        \
+    AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
+
+#define DISPATCH_FLOAT_TYPES(TYPE, NAME, ...)                                  \
+    AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_FLOAT_TYPES(__VA_ARGS__))
+
+#define DISPATCH_INTEGRAL_TYPES(TYPE, NAME, ...)                               \
+    AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
+
 const torch::TensorOptions int64_option =
     torch::TensorOptions().dtype(torch::kInt64).requires_grad(false);
 

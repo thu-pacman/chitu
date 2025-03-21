@@ -501,6 +501,11 @@ def moe_align_block_size_cuda(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+    token_cnts_buffer = torch.zeros(
+        (num_experts + 1) * num_experts,
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
     cumsum_buffer = torch.zeros(
         (num_experts + 1,), dtype=torch.int32, device=topk_ids.device
     )
@@ -511,6 +516,7 @@ def moe_align_block_size_cuda(
         sorted_ids,
         expert_ids,
         num_tokens_post_pad,
+        token_cnts_buffer,
         cumsum_buffer,
     )
     if expert_map is not None:
