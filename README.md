@@ -8,7 +8,7 @@ Chitu is a high-performance inference framework for large language models, focus
 
 [Coming soon!] Provide FP8 to FP16 operators to support more GPUs.
 
-[2025/03/21] Better support for QwQ-32B. Added accuracy comparison results using QwQ-32B BF16/FP8/INT8/INT4. QwQ-32B FP8 model is available on [Huggingface](https://huggingface.co/qingcheng-ai/QWQ-32B-FP8).
+[2025/03/21] Better support for QwQ-32B. QwQ-32B FP8 model will be available on [Huggingface](https://huggingface.co/qingcheng-ai/QWQ-32B-FP8).
 
 [2025/03/14] Initial release of Chitu, supports DeepSeek-R1 671B, and provides efficient operators with online FP8 to BF16 conversion.
 
@@ -26,21 +26,6 @@ Welcome to add [Chitu Assistant](../../docs/assets/wechat_assistant.jpg) as a fr
 
 ## Evaluation
 *Here we list Chitu's key results only. More comprehensive comparison and discussion will be given in our tech report.*
-
-### Aaccuracy test on QwQ-32B
-
-The officially released QwQ-32B uses parameters in BF16 format.
-We use the Q8_0 and AWQ quantized versions provided by the community, as well as our own [FP8 quantized version](https://huggingface.co/qingcheng-ai/QWQ-32B-FP8) to test the accuracy, along with the official version.
-The test results in the following table are based on the MMLU benchmark.
-In order to speed up the test, we prevent the model from generating too long thought chains, so the score may be different from that with unlimited thought chain.
-In our experiment, **the accuracy of the FP8 quantized version is almost the same as the BF16 version, and it can be used for faster inference.**
-
-| Data Format | MMLU Score |
-|:---|:---|
-| BF16 Official | 61.2 |
-| FP8 Quantized | 61.2 |
-| Q8_0 (INT8) | 59.1 |
-| AWQ (INT4) | 53.4 |
 
 ### Deploy DeepSeek-R1-671B on A800(40GB) cluster
 
