@@ -6,7 +6,11 @@ Chitu is a high-performance inference framework for large language models, focus
 
 ## News
 
-[2025/03/14] Initial release of Chitu, support DeepSeek-R1 671B.
+[Coming soon!] Provide FP8 to FP16 operators to support more GPUs.
+
+[2025/03/21] Better support for QwQ-32B. QwQ-32B FP8 model will be available on [Huggingface](https://huggingface.co/qingcheng-ai/QWQ-32B-FP8).
+
+[2025/03/14] Initial release of Chitu, supports DeepSeek-R1 671B, and provides efficient operators with online FP8 to BF16 conversion.
 
 ## Introduction
 
@@ -17,41 +21,33 @@ Chitu is a high-performance inference framework for large language models. Chitu
 - **Availability**: Chitu is ready and already deployed for real-world production.
 
 
-Welcome to join the [WeChat group](docs/assets/wechat_group.jpg) and stay tuned!
+Welcome to add [Chitu Assistant](../../docs/assets/wechat_assistant.jpg) as a friend on WeChat, join our communication group, and stay tuned!
 
 
-## Performance Evaluation
-
-We perform benchmarks on NVIDIA A800 40GB and H20 96GB GPUs and compare with vLLM.
+## Evaluation
+*Here we list Chitu's key results only. More comprehensive comparison and discussion will be given in our tech report.*
 
 ### Deploy DeepSeek-R1-671B on A800(40GB) cluster
 
-#### Comparison between Chitu and vLLM with multiple nodes
-
-|Hardware environment|6 nodes|6 nodes|3 nodes|
-|:---|:---|:---|:---|
-|Framework+precision|vllm 0.7.3, BF16|chitu 0.1.0, BF16|Chitu 0.1.0, FP8|
-|Use cuda graph|*OOM*|29.8 output token/s|22.7 output token/s|
-|Do not use cuda graph|6.85 output token/s|8.5 output token/s|7.0 output token/s|
+|Configuration |6 nodes|3 nodes|
+|:---|:---|:---|
+|Framework+precision|chitu 0.1.0, BF16|Chitu 0.1.0, FP8|
+|Use cuda graph|29.8 output token/s|22.7 output token/s|
+|Do not use cuda graph|8.5 output token/s|7.0 output token/s|
 
 - Data in the table are all output throughput of single request (bs=1)
 - For Chitu For example, the output speed of the FP8 model running with 3 nodes is comparable to the speed of the BF16 model running with 6 nodes
 - Whether to use cuda graph has a significant impact on performance. The performance of the Chitu has been significantly improved after using cuda graph
-- During our evaluation, we encountered an out of memory error (OOM) when trying to run vLLM with cuda graph under a 6-node configuration. We are still solving this issue
-
-<video src="https://github.com/user-attachments/assets/41495ac8-123d-4402-a6a8-0e0294b2edf4" autoplay loop muted controls>
-</video>
-*This video was recorded earlier, and the performance data is slightly different from the released version*
 
 #### Comparison of BF16 and FP8 models running with Chitu
 
-|batchsize|6 nodes, BF16 |3 nodes, FP8|
+|Batchsize|6 nodes, BF16 |3 nodes, FP8|
 |:---|:---|:---|
-|1| 29.8 token/s| 22.7 token/s|
-|4| 78.8 token/s| 70.1 token/s|
-|8| 129.8 token/s| 108.9 token/s|
-|16| 181.4 token/s| 159.0 token/s|
-|32| 244.1 token/s| 214.5 token/s|
+|1| 29.8 token/s| 22.7 token/s| 
+|4| 78.8 token/s| 70.1 token/s| 
+|8| 129.8 token/s| 108.9 token/s| 
+|16| 181.4 token/s| 159.0 token/s| 
+|32| 244.1 token/s| 214.5 token/s| 
 
 - From the test data of different batch sizes, based on the Chitu engine, the output speed of the FP8 model running on 3 nodes is about 75%\~90% of that of the BF16 model running on 6 nodes, that is, the output per unit computing power has been improved by 1.5x\~1.8x
 - We believe that this is because the decoding process mainly depends on memory bandwidth. Using half of the GPU to access half of the data (the weight size of FP8 is half of that of BF16) will not take longer, and the reduction in GPU computing power will only have a small impact
@@ -60,16 +56,11 @@ We perform benchmarks on NVIDIA A800 40GB and H20 96GB GPUs and compare with vLL
 
 #### Running on 2 nodes each with 8*H20 
 
-|Hardware environment|vllm 0.7.2, FP8|chitu 0.1.0, FP8|
-|:---|:---|:---|
-|bs=1, output token/s|21.16|22.1|
-|bs=16, output token/s|205.09|202.1|
-|bs=256, output token/s|1148.67|780.3|
-
-- With single request (bs=1), Chitu performs slightly better than vLLM
-- At medium batch size (bs=16), both systems show comparable performance
-- At large batch size (bs=256):
-vLLM achieves higher throughput, and we will optimize for large batch size in subsequent versions of Chitu.
+| Output token/s|chitu 0.1.0, FP8|
+|:---|:---|
+|bs=1|22.1|
+|bs=16|202.1|
+|bs=256|780.3|
 
 
 ## Getting started
