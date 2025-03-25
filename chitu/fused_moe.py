@@ -232,48 +232,17 @@ def fused_moe_kernel(
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
 
                 if soft_fp8:
-                    b_unpacked_int32 = tl.inline_asm_elementwise(
-                        asm="""
-                        {
-                            .reg .b8 tmp<4>;
-                            mov.b32 {tmp0, tmp1, tmp2, tmp3}, $4;
-                            cvt.u32.u8 $0, tmp0;
-                            cvt.u32.u8 $1, tmp1;
-                            cvt.u32.u8 $2, tmp2;
-                            cvt.u32.u8 $3, tmp3;
-                        }
-                        """,
-                        constraints=(
-                            "=r,=r,=r,=r,"  # Ouputs: $0, $1, $2, $3
-                            "r"  # Input: $5
-                        ),
-                        args=[b],
-                        dtype=(tl.int32),
-                        is_pure=True,
-                        pack=4,
+                    b_uint32 = b.to(tl.uint8, bitcast=True).to(tl.uint32)
+                    b_unscaled_fp32 = (
+                        ((b_uint32 & 0x80) << 24) | ((b_uint32 & 0x7F) << 20)
+                    ).to(tl.float32, bitcast=True)
+                    b_coeff = tl.cast(0x7B800000, tl.uint32).to(
+                        tl.float32, bitcast=True
                     )
-
-                    b_unpacked_bits_fp32 = ((b_unpacked_int32 & 0x80) << 24) | (
-                        (b_unpacked_int32 & 0x7F) << 20
-                    )
-                    b_new_scale = tl.inline_asm_elementwise(
-                        asm="""
-                        {
-                            mul.f32 $0, $1, 0f7B800000;
-                        }
-                        """,
-                        constraints=("=f," "f"),
-                        args=[b_scale],
-                        dtype=(tl.float32),
-                        is_pure=True,
-                        pack=1,
-                    )
-                    unpacked_f32 = b_unpacked_bits_fp32.to(
-                        dtype=tl.float32, bitcast=True
-                    )
-                    b_new_value = unpacked_f32 * b_new_scale
-                    b_new_value = b_new_value.to(dtype=tl.bfloat16)
-                    accumulator += tl.dot(a, b_new_value)
+                    b_new_scale = b_scale * b_coeff
+                    b_scaled_fp32 = b_unscaled_fp32 * b_new_scale
+                    b_scaled_fp32 = b_scaled_fp32.to(dtype=tl.bfloat16)
+                    accumulator += tl.dot(a, b_scaled_fp32)
                 else:
                     a_scale = tl.load(
                         a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
