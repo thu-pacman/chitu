@@ -31,9 +31,21 @@ def init_logger(logging_level=logging.INFO):
             record.msg = f"[Rank {torch.distributed.get_rank()}] {record.msg}"
         return True
 
-    handler = logging.StreamHandler()
-    handler.addFilter(add_rank_to_msg)
-    base_logger.addHandler(handler)
+    def add_filter_to_all_parent_handlers(cur_logger):
+        for handler in cur_logger.handlers:
+            handler.addFilter(add_rank_to_msg)
+        if cur_logger.parent:
+            add_filter_to_all_parent_handlers(cur_logger.parent)
+
+    # If there is no handlers, create a new handler to hold the filter. If not (very likely
+    # because we launch from Hydra, and Hydra setup the root logger), a new handler will only
+    # duplicate the logs. In this case, we should add the filter to all the existing handlers.
+    if base_logger.hasHandlers():  # Including handlers from the parents
+        add_filter_to_all_parent_handlers(base_logger)
+    else:
+        handler = logging.StreamHandler()
+        handler.addFilter(add_rank_to_msg)
+        base_logger.addHandler(handler)
 
 
 def chitu_init(args, logging_level=logging.INFO):
