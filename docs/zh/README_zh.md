@@ -158,6 +158,12 @@ python benchmarks/benchmark_serving.py \
 
 我们欢迎各种形式的贡献！详情请参阅我们的[贡献指南](/docs/CONTRIBUTING.md)。
 
+## 讨论
+
+如有任何问题或疑虑，欢迎提交issue。我们也设有一个活跃的微信群，方便进行更详细的讨论。二维码如下：
+
+<img src="../WeChatGroup.png" width="30%">
+
 ## 许可证
 
 Chitu 项目采用 Apache License v2.0 许可证 - 详见 [LICENSE](/LICENSE) 文件。
