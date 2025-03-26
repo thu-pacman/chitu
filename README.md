@@ -162,7 +162,7 @@ We welcome contributions! Please see our [Contributing Guide](docs/CONTRIBUTING.
 
 ## Discussion
 For any questions or concerns, you're welcome to create an issue. We also have an active WeChat group available for more detailed discussions.
-QR Code: ![image](https://github.com/sth1997/chitu/blob/public-main/docs/WeChatGroup.png)
+QR Code: <img src="docs/WeChatGroup.png" width="30%">
 
 ## License
 
