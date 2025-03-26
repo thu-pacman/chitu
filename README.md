@@ -160,6 +160,10 @@ Please refer to [here](/docs/Development.md) for more details.
 
 We welcome contributions! Please see our [Contributing Guide](docs/CONTRIBUTING.md) for details.
 
+## Discussion
+For any questions or concerns, you're welcome to create an issue. We also have an active WeChat group available for more detailed discussions.
+QR Code: ![image](https://github.com/sth1997/chitu/blob/public-main/docs/WeChatGroup.png)
+
 ## License
 
 The Chitu Project is under the Apache License v2.0. - see the [LICENSE](LICENSE) file for details.
