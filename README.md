@@ -162,7 +162,9 @@ We welcome contributions! Please see our [Contributing Guide](docs/CONTRIBUTING.
 
 ## Discussion
 For any questions or concerns, you're welcome to create an issue. We also have an active WeChat group available for more detailed discussions.
-QR Code: <img src="docs/WeChatGroup.png" width="30%">
+QR Code: 
+
+<img src="docs/WeChatGroup.png" width="30%">
 
 ## License
 
