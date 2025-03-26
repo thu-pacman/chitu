@@ -21,9 +21,6 @@ Chitu is a high-performance inference framework for large language models. Chitu
 - **Availability**: Chitu is ready and already deployed for real-world production.
 
 
-Welcome to add [Chitu Assistant](../../docs/assets/wechat_assistant.jpg) as a friend on WeChat, join our communication group, and stay tuned!
-
-
 ## Evaluation
 *Here we list Chitu's key results only. More comprehensive comparison and discussion will be given in our tech report.*
 
@@ -159,6 +156,12 @@ Please refer to [here](/docs/Development.md) for more details.
 ## Contributing
 
 We welcome contributions! Please see our [Contributing Guide](docs/CONTRIBUTING.md) for details.
+
+## Discussion
+For any questions or concerns, you're welcome to create an issue. We also have an active WeChat group available for more detailed discussions.
+QR Code: 
+
+<img src="docs/WeChatGroup.png" width="30%">
 
 ## License
 
