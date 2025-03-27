@@ -1,10 +1,12 @@
 import torch
 import pytest
 
-from chitu.device_type import is_nvidia
+from chitu.device_type import is_nvidia, is_muxi
 
 
-@pytest.mark.skipif(not is_nvidia(), reason="Only NVIDIA GPUs are supported")
+@pytest.mark.skipif(
+    not is_nvidia() and not is_muxi(), reason="Only NVIDIA and Muxi GPUs are supported"
+)
 def test_moe_align_block_size_cuda():
     # Import inside the `skipif` guard
     from chitu_backend import cuda_moe_align_block_size

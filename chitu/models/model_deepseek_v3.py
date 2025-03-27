@@ -82,7 +82,7 @@ def linear_deepseek_v3(
     if weight.element_size() > 1:
         return F.linear(x, weight, bias)
     elif get_global_args().infer.soft_fp8:
-        if is_nvidia():
+        if is_nvidia() or is_muxi():
             y = soft_fp8_gemm_deepseek_v3(x, weight, weight_scale)
             if bias is not None:
                 y += bias
@@ -951,7 +951,7 @@ class MoEDeepSeekV3(nn.Module):
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x)
 
-        if has_triton and not is_muxi():
+        if has_triton:
 
             if self.w1w3.scale is None and self.w2.scale is None:
                 w1w3_weight, w1w3_scale, w2_weight, w2_scale = (
@@ -972,7 +972,7 @@ class MoEDeepSeekV3(nn.Module):
                     )
                     use_fp8_w8a8 = True
                     fused_soft_fp8 = False
-                elif is_nvidia():
+                elif is_nvidia() or is_muxi():
                     w1w3_weight, w1w3_scale, w2_weight, w2_scale = (
                         self.get_expert_weights_for_fp8_w8a8(
                             self.n_routed_experts + shared_experts
