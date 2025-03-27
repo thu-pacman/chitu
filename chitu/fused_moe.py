@@ -9,6 +9,7 @@ This file has adaption of open-source code from the following sources:
 import functools
 import json
 import os
+import struct
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -106,6 +107,7 @@ def fused_moe_kernel(
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     soft_fp8: tl.constexpr,
+    fp8_to_fp32_scale: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -236,10 +238,7 @@ def fused_moe_kernel(
                     b_unscaled_fp32 = (
                         ((b_uint32 & 0x80) << 24) | ((b_uint32 & 0x7F) << 20)
                     ).to(tl.float32, bitcast=True)
-                    b_coeff = tl.cast(0x7B800000, tl.uint32).to(
-                        tl.float32, bitcast=True
-                    )
-                    b_new_scale = b_scale * b_coeff
+                    b_new_scale = b_scale * fp8_to_fp32_scale
                     b_scaled_fp32 = b_unscaled_fp32 * b_new_scale
                     b_scaled_fp32 = b_scaled_fp32.to(dtype=tl.bfloat16)
                     accumulator += tl.dot(a, b_scaled_fp32)
@@ -577,7 +576,7 @@ def moe_align_block_size(
     num_experts: int,
     expert_map: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if is_nvidia():
+    if is_nvidia() or is_muxi():
         return moe_align_block_size_cuda(topk_ids, block_size, num_experts, expert_map)
     else:
         return moe_align_block_size_native(
@@ -816,6 +815,11 @@ def invoke_fused_moe_kernel(
         assert A_scale is None
         assert B_scale is None
 
+    # Some of our platforms only has Triton with low versions, where these is no `tl.cast`
+    # which is used for initializing a constant with a given type. Therefore, we need to
+    # pass `fp8_to_fp32_scale` as a constant from outside.
+    fp8_to_fp32_scale = struct.unpack(">f", bytes.fromhex("7b800000"))[0]
+
     EM = sorted_token_ids.shape[0]
     if A.shape[0] < config["BLOCK_SIZE_M"]:
         # optimize for small batch_size.
@@ -862,6 +866,7 @@ def invoke_fused_moe_kernel(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         soft_fp8=soft_fp8,
+        fp8_to_fp32_scale=fp8_to_fp32_scale,
         **config,
     )
 

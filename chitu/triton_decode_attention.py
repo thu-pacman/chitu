@@ -9,10 +9,11 @@ import triton.language as tl
 
 _mla_attn_kernel_configs = [
     triton.Config(
-        {},
+        {"BLOCK_N": block_n},
         num_stages=num_stages,
         num_warps=4,
     )
+    for block_n in [32, 64]
     for num_stages in [1, 2]
 ]
 
@@ -147,7 +148,6 @@ def _mla_attn(
     head_dim_kpe = q_pe.shape[-1]
 
     BLOCK_H = 16
-    BLOCK_N = 64
     grid = (
         batch_size,
         triton.cdiv(head_num, BLOCK_H),
@@ -174,7 +174,6 @@ def _mla_attn(
         attn_logits.stride(1),
         attn_logits.stride(2),
         BLOCK_H=BLOCK_H,
-        BLOCK_N=BLOCK_N,
         NUM_KV_SPLITS=num_kv_splits,
         PAGE_SIZE=page_size,
         HEAD_DIM_CKV=head_dim_ckv,

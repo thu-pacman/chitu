@@ -431,6 +431,9 @@ def weight_dequant_soft_fp8_deepseek_v3(
     )
     bit_reordered_x = bit_reordered_x.view(dtype=torch.float32)
 
+    # Some of our platforms only has Triton with low versions, where these is no `tl.cast`
+    # which is used for initializing a constant with a given type. Therefore, we need to
+    # pass `fp8_to_fp32_scale` as a constant from outside.
     fp8_to_fp32_scale = struct.unpack(">f", bytes.fromhex("7b800000"))[0]
     y = torch.empty_like(x, dtype=torch.get_default_dtype())
     grid = lambda meta: (
@@ -503,10 +506,25 @@ def soft_fp8_gemm_deepseek_v3(a: torch.Tensor, b: torch.Tensor, b_s: torch.Tenso
     M = a.numel() // K
     N = b.size(0)
     c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+
+    # Some of our platforms only has Triton with low versions, where these is no `tl.cast`
+    # which is used for initializing a constant with a given type. Therefore, we need to
+    # pass `fp8_to_fp32_scale` as a constant from outside.
+    fp8_to_fp32_scale = struct.unpack(">f", bytes.fromhex("7b800000"))[0]
+
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
     soft_fp8_gemm_deepseek_v3_kernel[grid](
-        a, b.view(dtype=torch.uint8), c, b_s, M, N, K, group_n=128, group_k=128
+        a,
+        b.view(dtype=torch.uint8),
+        c,
+        b_s,
+        M,
+        N,
+        K,
+        group_n=128,
+        group_k=128,
+        fp8_to_fp32_scale=fp8_to_fp32_scale,
     )
     return c
