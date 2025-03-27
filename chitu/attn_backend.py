@@ -633,7 +633,7 @@ class FlashInferBackend(RefAttnBackend):
         tot_len = 0
         for i in range(batch_size):
             kv_indptr_list.append(tot_len)
-            cur_len = (cache_seqlens_incl_this_decode[i] - 1) // block_size + 1
+            cur_len = (cache_seqlens_incl_this_decode[i].item() - 1) // block_size + 1
             kv_indices_list.append(block_table[i, :cur_len])
             tot_len += cur_len
         kv_indptr_list.append(tot_len)
