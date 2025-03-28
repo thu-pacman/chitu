@@ -646,6 +646,14 @@ class FlashInferBackend(RefAttnBackend):
                 (self.qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5
             )
 
+        # Currently `self.mla_wrapper` holds fixed reserved buffers for CUDA graph, whose
+        # sizes cannot be changed for different batch size. We have to forcely override
+        # their shapes here.
+        self.mla_wrapper._qo_indptr_buf = self.q_indptr.get()
+        self.mla_wrapper._kv_indptr_buf = self.kv_indptr.get()
+        self.mla_wrapper._kv_indices_buf = self.kv_indices.get()
+        self.mla_wrapper._kv_len_arr_buf = self.seqlens.get()
+
         self.mla_wrapper.plan(
             self.q_indptr.get(),
             self.kv_indptr.get(),

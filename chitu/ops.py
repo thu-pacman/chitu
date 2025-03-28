@@ -3,6 +3,7 @@ from typing import Tuple
 
 import torch
 import triton
+import triton.language as tl
 
 from chitu.triton_kernels import *
 
@@ -488,7 +489,11 @@ def fp8_gemm_deepseek_v3(
 
 
 @auto_retry_triton_compilation
-def soft_fp8_gemm_deepseek_v3(a: torch.Tensor, b: torch.Tensor, b_s: torch.Tensor):
+def soft_fp8_gemm_deepseek_v3(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+):
     """
     Perform a matrix multiplication with FP8 dynamically casted to BF16.
 
@@ -511,7 +516,14 @@ def soft_fp8_gemm_deepseek_v3(a: torch.Tensor, b: torch.Tensor, b_s: torch.Tenso
     # which is used for initializing a constant with a given type. Therefore, we need to
     # pass `fp8_to_fp32_scale` as a constant from outside.
     fp8_to_fp32_scale = struct.unpack(">f", bytes.fromhex("7b800000"))[0]
-
+    if torch.get_default_dtype() == torch.bfloat16:
+        compute_dtype = tl.bfloat16
+    elif torch.get_default_dtype() == torch.float16:
+        compute_dtype = tl.float16
+    elif torch.get_default_dtype() == torch.float32:
+        compute_dtype = tl.float32
+    else:
+        raise ValueError(f"Unsupported compute_type: {torch.get_default_dtype()}")
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
@@ -526,5 +538,6 @@ def soft_fp8_gemm_deepseek_v3(a: torch.Tensor, b: torch.Tensor, b_s: torch.Tenso
         group_n=128,
         group_k=128,
         fp8_to_fp32_scale=fp8_to_fp32_scale,
+        compute_dtype=compute_dtype,
     )
     return c

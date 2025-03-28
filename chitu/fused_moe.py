@@ -240,7 +240,7 @@ def fused_moe_kernel(
                     ).to(tl.float32, bitcast=True)
                     b_new_scale = b_scale * fp8_to_fp32_scale
                     b_scaled_fp32 = b_unscaled_fp32 * b_new_scale
-                    b_scaled_fp32 = b_scaled_fp32.to(dtype=tl.bfloat16)
+                    b_scaled_fp32 = b_scaled_fp32.to(dtype=compute_type)
                     accumulator += tl.dot(a, b_scaled_fp32)
                 else:
                     a_scale = tl.load(

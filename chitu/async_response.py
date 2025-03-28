@@ -39,7 +39,7 @@ class AsyncDataStream:
             self.tokens_len += 1
             self.cache_tokens.append(value)
             s = self.tokenizer.decode(self.cache_tokens)
-            if "\uFFFD" in s:
+            if "\ufffd" in s:
                 return
             if not self.tokenizer.force_full_seq_decode:
                 self.cache_tokens.clear()

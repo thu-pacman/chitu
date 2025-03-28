@@ -427,7 +427,7 @@ class AttentionDeepSeekV3(Attention):
                 self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.bfloat16,
+                bias_dtype=torch.get_default_dtype(),
             )
         else:
             self.wq_a = LinearDeepSeekV3(
@@ -435,14 +435,14 @@ class AttentionDeepSeekV3(Attention):
                 self.q_lora_rank,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.bfloat16,
+                bias_dtype=torch.get_default_dtype(),
             )
             self.wkv_a = LinearDeepSeekV3(
                 self.dim,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.bfloat16,
+                bias_dtype=torch.get_default_dtype(),
             )
         self.q_norm = RMSNorm(self.q_lora_rank)
         self.wq_b = ColumnParallelLinearDeepSeekV3(
@@ -450,7 +450,7 @@ class AttentionDeepSeekV3(Attention):
             self.n_heads * self.qk_head_dim,
             has_bias=False,
             dtype=parse_dtype(args.main_weight_dtype),
-            bias_dtype=torch.bfloat16,
+            bias_dtype=torch.get_default_dtype(),
             gather_output=False,
         )
         self.kv_norm = RMSNorm(self.kv_lora_rank)
@@ -459,7 +459,7 @@ class AttentionDeepSeekV3(Attention):
             self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
             has_bias=False,
             dtype=parse_dtype(args.main_weight_dtype),
-            bias_dtype=torch.bfloat16,
+            bias_dtype=torch.get_default_dtype(),
             gather_output=False,
         )
         self.wo = RowParallelLinearDeepSeekV3(
@@ -467,7 +467,7 @@ class AttentionDeepSeekV3(Attention):
             self.dim,
             has_bias=False,
             dtype=parse_dtype(args.main_weight_dtype),
-            bias_dtype=torch.bfloat16,
+            bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
         )
         self.softmax_scale = compute_softmax_scale_deepseek_v3(args)
@@ -723,7 +723,7 @@ class MLPDeepSeekV3(nn.Module):
                 args.inter_dim * 2,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.bfloat16,
+                bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
             )
         else:
@@ -732,7 +732,7 @@ class MLPDeepSeekV3(nn.Module):
                 args.inter_dim,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.bfloat16,
+                bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
             )
             self.w3 = ColumnParallelLinearDeepSeekV3(
@@ -740,7 +740,7 @@ class MLPDeepSeekV3(nn.Module):
                 args.inter_dim,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.bfloat16,
+                bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
             )
         self.w2 = RowParallelLinearDeepSeekV3(
@@ -748,7 +748,7 @@ class MLPDeepSeekV3(nn.Module):
             args.dim,
             has_bias=False,
             dtype=parse_dtype(args.main_weight_dtype),
-            bias_dtype=torch.bfloat16,
+            bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
         )
 
@@ -886,7 +886,7 @@ class MoEDeepSeekV3(nn.Module):
                 args.moe_inter_dim * 2,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.bfloat16,
+                bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
             )
         else:
@@ -896,7 +896,7 @@ class MoEDeepSeekV3(nn.Module):
                 args.moe_inter_dim,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.bfloat16,
+                bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
             )
             self.w3 = GroupColumnParallelLinearDeepSeekV3(
@@ -905,7 +905,7 @@ class MoEDeepSeekV3(nn.Module):
                 args.moe_inter_dim,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.bfloat16,
+                bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
             )
         self.w2 = GroupRowParallelLinearDeepSeekV3(
@@ -914,7 +914,7 @@ class MoEDeepSeekV3(nn.Module):
             args.dim,
             has_bias=False,
             dtype=parse_dtype(args.main_weight_dtype),
-            bias_dtype=torch.bfloat16,
+            bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
         )
 
@@ -1197,7 +1197,6 @@ class TransformerDeepSeekV3(Transformer):
         mla_absorb: str,
         merge_qkv_gate_up=True,
     ):
-        torch.set_default_dtype(torch.bfloat16)
         self.mla_absorb = mla_absorb
         self.merge_qkv_gate_up = merge_qkv_gate_up
         super().__init__(

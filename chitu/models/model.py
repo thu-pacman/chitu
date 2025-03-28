@@ -531,10 +531,6 @@ class Transformer(nn.Module):
                 raise NotImplementedError(
                     'CUDA graph is currently not supported for infer.cache_type="skew"'
                 )
-            if is_muxi():
-                raise NotImplementedError(
-                    f"CUDA graph is currently not supported for {get_device_name()}"
-                )
 
         @make_dispatched_graphed_callables(
             sample_args=(tokens,),

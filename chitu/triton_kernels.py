@@ -402,6 +402,7 @@ def soft_fp8_gemm_deepseek_v3_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     fp8_to_fp32_scale: tl.constexpr,
+    compute_dtype: tl.constexpr,
 ):
     """
     Perform a matrix multiplication with FP8 dynamically casted to BF16.
@@ -457,18 +458,13 @@ def soft_fp8_gemm_deepseek_v3_kernel(
         )
         b_new_scale = b_s * fp8_to_fp32_scale
         b_scaled_fp32 = b_unscaled_fp32 * b_new_scale
-        b_scaled_fp32 = b_scaled_fp32.to(dtype=tl.bfloat16)
+        b_scaled_fp32 = b_scaled_fp32.to(dtype=compute_dtype)
         accumulator += tl.dot(a, b_scaled_fp32)
 
         a_ptrs += BLOCK_SIZE_K
         b_ptrs += BLOCK_SIZE_K
 
-    if C.dtype.element_ty == tl.bfloat16:
-        c = accumulator.to(tl.bfloat16)
-    elif C.dtype.element_ty == tl.float16:
-        c = accumulator.to(tl.float16)
-    else:
-        c = accumulator.to(tl.float32)
+    c = accumulator.to(compute_dtype)
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
