@@ -603,15 +603,20 @@ class FlashInferBackend(RefAttnBackend):
             torch.empty(max_batch_size, dtype=torch.int32, device="cuda")
         )
 
-        self.workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8).cuda()
-
-        self.mla_wrapper = None
+        self.mla_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+            torch.empty(128 * 1024 * 1024, dtype=torch.int8).cuda(),
+            use_cuda_graph=args.infer.use_cuda_graph,
+            qo_indptr=self.q_indptr.get(),
+            kv_indptr=self.kv_indptr.get(),
+            kv_indices=self.kv_indices.get(),
+            kv_len_arr=self.seqlens.get(),
+            backend="auto",
+        )
 
         self.local_n_heads = args.models.n_heads // args.infer.tp_size
         self.kv_lora_rank = args.models.kv_lora_rank
         self.qk_rope_head_dim = args.models.qk_rope_head_dim
         self.qk_nope_head_dim = args.models.qk_nope_head_dim
-        self.use_cuda_graph = args.infer.use_cuda_graph
 
     def prepare_metadata_for_decode(
         self,
@@ -641,19 +646,13 @@ class FlashInferBackend(RefAttnBackend):
                 (self.qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5
             )
 
-        # Currently `self.mla_wrapper` should be initialized here instead of in `__init__`,
-        # because it only accepts fixed reserved buffers (like `qo_indptr`) for CUDA graph,
-        # whose sizes cannot be changed for different batch size. This is acceptable because
-        # currently (flashinfer 0.2.3) only do minimal jobs when initializing the wrapper.
-        self.mla_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-            self.workspace,
-            use_cuda_graph=self.use_cuda_graph,
-            qo_indptr=self.q_indptr.get(),
-            kv_indptr=self.kv_indptr.get(),
-            kv_indices=self.kv_indices.get(),
-            kv_len_arr=self.seqlens.get(),
-            backend="auto",
-        )
+        # Currently `self.mla_wrapper` holds fixed reserved buffers for CUDA graph, whose
+        # sizes cannot be changed for different batch size. We have to forcely override
+        # their shapes here.
+        self.mla_wrapper._qo_indptr_buf = self.q_indptr.get()
+        self.mla_wrapper._kv_indptr_buf = self.kv_indptr.get()
+        self.mla_wrapper._kv_indices_buf = self.kv_indices.get()
+        self.mla_wrapper._kv_len_arr_buf = self.seqlens.get()
 
         self.mla_wrapper.plan(
             self.q_indptr.get(),
