@@ -83,7 +83,7 @@ if os.environ.get("CINFER_WITH_CYTHON", "0") != "0":
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="chitu",
-    version="0.1.0",
+    version="0.1.1",
     install_requires=[
         # Don't put `torch` here because it requires downloading from a specific source
         "transformers",
