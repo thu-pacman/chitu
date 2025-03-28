@@ -578,3 +578,44 @@ def silu_and_mul(x, imply="triton"):
         return invoke_silu_and_mul(x)
     else:
         return silu_and_mul_torch(x)
+
+
+def calculate_settings(n):
+    # reference: https://github.com/unslothai/unsloth/blob/fd753fed99ed5f10ef8a9b7139588d9de9ddecfb/unsloth/kernels/utils.py#L43
+
+    MAX_FUSED_SIZE = 65536
+    BLOCK_SIZE = triton.next_power_of_2(n)
+    if BLOCK_SIZE > MAX_FUSED_SIZE:
+        raise RuntimeError(
+            f"Cannot launch Triton kernel since n = {n} exceeds "
+            f"the recommended Triton blocksize = {MAX_FUSED_SIZE}."
+        )
+
+    num_warps = 4
+    if BLOCK_SIZE >= 32768:
+        num_warps = 32
+    elif BLOCK_SIZE >= 8192:
+        num_warps = 16
+    elif BLOCK_SIZE >= 2048:
+        num_warps = 8
+    return BLOCK_SIZE, num_warps
+
+
+def rms_norm(X: torch.Tensor, W: torch.Tensor, dim, eps):
+    num_x = X.numel()
+    num_rows = num_x // dim
+    assert W.is_contiguous()
+    BLOCK_SIZE, num_warps = calculate_settings(dim)
+    Y = torch.empty_like(X, dtype=X.dtype, device=X.device)
+    rms_norm_kernel[num_rows,](
+        Y,
+        Y.stride(-2),
+        X,
+        X.stride(-2),
+        W,
+        dim,
+        eps,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=num_warps,
+    )
+    return Y
