@@ -603,20 +603,15 @@ class FlashInferBackend(RefAttnBackend):
             torch.empty(max_batch_size, dtype=torch.int32, device="cuda")
         )
 
-        self.mla_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-            torch.empty(128 * 1024 * 1024, dtype=torch.int8).cuda(),
-            use_cuda_graph=args.infer.use_cuda_graph,
-            qo_indptr=self.q_indptr.get(),
-            kv_indptr=self.kv_indptr.get(),
-            kv_indices=self.kv_indices.get(),
-            kv_len_arr=self.seqlens.get(),
-            backend="auto",
-        )
+        self.workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8).cuda()
+
+        self.mla_wrapper = None
 
         self.local_n_heads = args.models.n_heads // args.infer.tp_size
         self.kv_lora_rank = args.models.kv_lora_rank
         self.qk_rope_head_dim = args.models.qk_rope_head_dim
         self.qk_nope_head_dim = args.models.qk_nope_head_dim
+        self.use_cuda_graph = args.infer.use_cuda_graph
 
     def prepare_metadata_for_decode(
         self,
@@ -645,6 +640,20 @@ class FlashInferBackend(RefAttnBackend):
             softmax_scale = 1.0 / (
                 (self.qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5
             )
+
+        # Currently `self.mla_wrapper` should be initialized here instead of in `__init__`,
+        # because it only accepts fixed reserved buffers (like `qo_indptr`) for CUDA graph,
+        # whose sizes cannot be changed for different batch size. This is acceptable because
+        # currently (flashinfer 0.2.3) only do minimal jobs when initializing the wrapper.
+        self.mla_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+            self.workspace,
+            use_cuda_graph=self.use_cuda_graph,
+            qo_indptr=self.q_indptr.get(),
+            kv_indptr=self.kv_indptr.get(),
+            kv_indices=self.kv_indices.get(),
+            kv_len_arr=self.seqlens.get(),
+            backend="auto",
+        )
 
         self.mla_wrapper.plan(
             self.q_indptr.get(),
