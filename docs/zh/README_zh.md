@@ -8,7 +8,7 @@ Chitu (赤兔) 是一个专注于效率、灵活性和可用性的高性能大�
 
 ## 最新动态
 
-[敬请期待] 提供 FP8 转 FP16 算子以支持更多型号 GPU。 
+[2025/03/28] 提供 FP8 转 FP16 算子以支持更多型号 GPU。 
 
 [2025/03/21] 更好地支持了 QwQ-32B，其中 QwQ-32B FP8 量化模型将开源至 [Huggingface](https://huggingface.co/qingcheng-ai/QWQ-32B-FP8)。
 

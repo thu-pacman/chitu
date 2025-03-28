@@ -6,7 +6,7 @@ Chitu is a high-performance inference framework for large language models, focus
 
 ## News
 
-[Coming soon!] Provide FP8 to FP16 operators to support more GPUs.
+[2025/03/28] Provide FP8 to FP16 operators to support more GPUs.
 
 [2025/03/21] Better support for QwQ-32B. QwQ-32B FP8 model will be available on [Huggingface](https://huggingface.co/qingcheng-ai/QWQ-32B-FP8).
 
