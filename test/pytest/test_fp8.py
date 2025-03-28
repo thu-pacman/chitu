@@ -1,6 +1,6 @@
 import torch
 import pytest
-
+import triton.language as tl
 from chitu.ops import (
     act_quant_deepseek_v3,
     fp8_gemm_deepseek_v3,
@@ -28,15 +28,16 @@ def init_b_and_b_s(dim, block_size):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
-def test_dequanted_gemm_is_close_to_fp8_gemm():
-    torch.set_default_dtype(torch.bfloat16)
+def test_dequanted_gemm_is_close_to_fp8_gemm(dtype: torch.dtype):
+    torch.set_default_dtype(dtype)
     dim = 256
     block_size = 128
-    a = torch.randn(dim, dim, dtype=torch.bfloat16, device="cuda")
+    a = torch.randn(dim, dim, dtype=dtype, device="cuda")
     b, b_s = init_b_and_b_s(dim, block_size)
 
     a_fp8, a_s = act_quant_deepseek_v3(a, block_size)
@@ -52,12 +53,13 @@ def test_dequanted_gemm_is_close_to_fp8_gemm():
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
-def test_soft_fp8_dequant_is_close_to_dequant():
-    torch.set_default_dtype(torch.bfloat16)
+def test_soft_fp8_dequant_is_close_to_dequant(dtype: torch.dtype):
+    torch.set_default_dtype(dtype)
     dim = 256
     block_size = 128
     b, b_s = init_b_and_b_s(dim, block_size)
@@ -68,15 +70,16 @@ def test_soft_fp8_dequant_is_close_to_dequant():
     assert torch.allclose(dequant_b, soft_dequant_b, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
-def test_soft_fp8_gemm_is_close_to_dequanted_gemm():
-    torch.set_default_dtype(torch.bfloat16)
+def test_soft_fp8_gemm_is_close_to_dequanted_gemm(dtype: torch.dtype):
+    torch.set_default_dtype(dtype)
     dim = 256
     block_size = 128
-    a = torch.randn(dim, dim, dtype=torch.bfloat16, device="cuda")
+    a = torch.randn(dim, dim, dtype=dtype, device="cuda")
     b, b_s = init_b_and_b_s(dim, block_size)
 
     dequant_b = weight_dequant_soft_fp8_deepseek_v3(b, b_s)
