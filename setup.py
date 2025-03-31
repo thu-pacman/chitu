@@ -75,7 +75,7 @@ class SkipBuildPy(build_py):
 
 
 my_build_py = build_py
-if os.environ.get("CINFER_WITH_CYTHON", "0") != "0":
+if os.environ.get("CHITU_WITH_CYTHON", "0") != "0":
     ext_modules += cythonize(create_cython_extensions("chitu"))
     my_build_py = SkipBuildPy
 
@@ -86,7 +86,7 @@ setup(
     version="0.1.1",
     install_requires=[
         # Don't put `torch` here because it requires downloading from a specific source
-        "transformers",
+        "transformers<4.47",  # Required by auto_gptq
         "fire",
         "tiktoken>=0.7.0",  # Required by glm4
         "blobfile",
