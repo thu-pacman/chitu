@@ -1,10 +1,16 @@
-FROM pytorch/pytorch:2.5.0-cuda12.4-cudnn9-devel AS base
+FROM mxc500-torch2.1-py310:mc2.29.0.7-ubuntu22.04-amd64 AS base
 
-ARG torch_cuda_arch_list='7.0 7.5 8.0 8.6 8.9 9.0+PTX'
-ARG optional_deps='flash_attn,flash_mla,flashinfer'
+ARG optional_deps=''
 ARG build_jobs=''
 ARG enable_editable_install='false'
 ARG enable_cython='true'
+
+# The base image uses Conda as the Python environment. We need to activate it
+# For `docker build` stage, the most straightforward way is to use `bash --login -c` as the shell
+SHELL ["/bin/bash", "--login", "-c"]
+# For `docker run` stage, we need an entrypoint
+RUN echo "source /etc/profile; \"\$@\"" > /entrypoint.sh
+ENTRYPOINT ["/bin/bash", "/entrypoint.sh"]
 
 RUN if [ "${enable_editable_install}" != "true" ] && [ "${enable_editable_install}" != "false" ]; then \
     echo "ARG enable_editable_install must either be 'true' or 'false'"; \
@@ -19,12 +25,6 @@ RUN if [ "{enable_cython}" == "true" ] && [ "${enable_editable_install}" == "tru
     exit 1; \
 fi
 
-ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
-
-RUN apt update -y \
-    && apt install -y git \
-    && apt install -y gcc-10 g++-10
-
 WORKDIR /workspace/chitu
 COPY . .
 
@@ -32,15 +32,20 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt
+
+# The actual installing procedure requries a GPU device, which is not available in the `docker build` stage.
+# We echo the commands to `install.sh`, and users shoud run it via `docker run` after the image is built.
+# Then, the final image can be committed to a new image.
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ -n "${build_jobs}" ]; then \
-        export MAX_JOBS=${build_jobs}; \
+        echo "export MAX_JOBS=${build_jobs}" >> install.sh; \
     fi; \
     if [ "${enable_cython}" == "true" ]; then \
-        export CHITU_WITH_CYTHON=1; \
+        echo "export CHITU_WITH_CYTHON=1" >> install.sh; \
     fi; \
     if [ "${enable_editable_install}" == "true" ]; then \
-        pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e .[${optional_deps}]; \
+        echo "pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e .[${optional_deps}]" >> install.sh; \
     else \
-        pip install -i https://pypi.tuna.tsinghua.edu.cn/simple .[${optional_deps}]; \
-    fi
+        echo "pip install -i https://pypi.tuna.tsinghua.edu.cn/simple .[${optional_deps}]" >> install.sh; \
+    fi; \
+    chmod +x install.sh
