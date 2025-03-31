@@ -8,6 +8,7 @@ __all__ = [
     "weight_dequant_soft_fp8_deepseek_v3_kernel_step_2",
     "fp8_gemm_deepseek_v3_kernel",
     "soft_fp8_gemm_deepseek_v3_kernel",
+    "moe_sum_kernel",
 ]
 
 import triton
@@ -471,3 +472,64 @@ def soft_fp8_gemm_deepseek_v3_kernel(
     c_ptrs = C + N * offs_cm[:, None] + offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
+
+
+@triton.jit
+def moe_sum_kernel(
+    # Pointers to matrices
+    input_ptr,
+    output_ptr,
+    # Matrix dimensions
+    M,
+    topK,
+    N,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    """
+    Kernel for summing a 3D tensor along dimension 1 (topK).
+    Input shape: (M, topK, N)
+    Output shape: (M, N)
+    """
+    # Program ID
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    # Block start indices
+    m_start = pid_m * BLOCK_SIZE_M
+    n_start = pid_n * BLOCK_SIZE_N
+
+    # Create offsets for m and n dimensions
+    offs_m = m_start + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = n_start + tl.arange(0, BLOCK_SIZE_N)
+
+    # Create a mask to handle the case where the block extends beyond the matrix
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+
+    # Initialize the output sum to zero
+    output_sum = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Loop over the topK dimension
+    for k in range(topK):
+        # Compute the input offset for the current slice
+        # input[m, k, n] is at input_ptr + m * (topK * N) + k * N + n
+        input_offset = offs_m[:, None] * (topK * N) + k * N + offs_n[None, :]
+
+        # Load the input values for the current slice
+        x = tl.load(
+            input_ptr + input_offset, mask=m_mask[:, None] & n_mask[None, :], other=0.0
+        )
+
+        # Add to the running sum
+        output_sum += x
+
+    # Compute the output offset
+    # output[m, n] is at output_ptr + m * N + n
+    output_offset = offs_m[:, None] * N + offs_n[None, :]
+
+    # Store the final sum to the output tensor
+    tl.store(
+        output_ptr + output_offset, output_sum, mask=m_mask[:, None] & n_mask[None, :]
+    )

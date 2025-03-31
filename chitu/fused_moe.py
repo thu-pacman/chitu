@@ -21,23 +21,46 @@ import triton.language as tl
 import chitu_backend
 from chitu.device_type import is_muxi, is_nvidia, get_device_name
 
+from chitu.triton_kernels import moe_sum_kernel
 
-class SiluAndMul(nn.Module):
-    """An activation function for SwiGLU.
 
-    The function computes x -> silu(x[:d]) * x[d:] where d = x.shape[-1] // 2.
+def silu_and_mul_torch(x: torch.Tensor):
+    d = x.shape[-1] // 2
+    return F.silu(x[..., :d]) * x[..., d:]
 
-    Shapes:
-        x: (num_tokens, 2 * d) or (batch_size, seq_len, 2 * d)
-        return: (num_tokens, d) or (batch_size, seq_len, d)
+
+def silu_and_mul(x: torch.Tensor):
+    return silu_and_mul_torch(x)
+
+
+def moe_sum(input_tensor, output_tensor, config: Dict[str, Any]):
     """
+    Sum the input tensor along dimension 1 (topK).
+    Input shape: (M, topK, N)
+    Output shape: (M, N)
 
-    def __init__(self):
-        super().__init__()
+    Args:
+        input_tensor: Input tensor of shape (M, topK, N)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        return F.silu(x[..., :d]) * x[..., d:]
+    Returns:
+        Output tensor of shape (M, N)
+    """
+    M, topK, N = input_tensor.shape
+
+    # Determine grid and block sizes
+    grid = lambda meta: (
+        triton.cdiv(M, meta["BLOCK_SIZE_M"]),
+        triton.cdiv(N, meta["BLOCK_SIZE_N"]),
+    )
+    moe_sum_kernel[grid](
+        input_tensor,
+        output_tensor,
+        M,
+        topK,
+        N,
+        BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
+        BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
+    )
 
 
 @triton.jit
@@ -1249,7 +1272,7 @@ def fused_experts_impl(
         )
 
         if activation == "silu":
-            intermediate_cache2 = SiluAndMul()(intermediate_cache1.view(-1, N))
+            intermediate_cache2 = silu_and_mul(intermediate_cache1.view(-1, N))
         else:
             raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
@@ -1276,12 +1299,10 @@ def fused_experts_impl(
             soft_fp8=soft_fp8,
         )
 
-        def moe_sum(input: torch.Tensor, output: torch.Tensor):
-            output.copy_(input.sum(dim=1))
-
         moe_sum(
             intermediate_cache3.view(*intermediate_cache3.shape),
             out_hidden_states[begin_chunk_idx:end_chunk_idx],
+            config,
         )
 
     return out_hidden_states
