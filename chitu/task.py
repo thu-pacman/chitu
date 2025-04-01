@@ -45,6 +45,7 @@ class TaskLoad:
     def clear(cls):
         with cls._lock:
             cls._load_score = 0
+            cls.user_req.clear()
 
 
 @dataclass
@@ -222,6 +223,7 @@ class Task:
         message,
         priority: int = 1,
         max_seq_len: int = 1024,
+        stop_with_eos: bool = True,
     ):
         self.task_id = task_id
         self.req = req
@@ -231,6 +233,7 @@ class Task:
         self.priority = priority
         self.sched_score = 0
         self.max_output_tokens = -1
+        self.stop_with_eos = stop_with_eos
 
         # Waiting is only meaningful in pipeline parallelism. It means either of:
         # 1) waiting logits to return from another node, or
@@ -272,7 +275,7 @@ class Task:
         )
 
     def need_remove(self):
-        if Backend.args.infer.stop_with_eos:
+        if self.stop_with_eos:
             if (
                 len(self.response) > 0
                 and torch.isin(self.response[-1], Backend.tokenizer.stop_tokens)

@@ -115,7 +115,9 @@ def run_pipe_or_tensor_parallelism(args, timers):
                 max_new_tokens=args.request.max_new_tokens,
             )
             for req in reqs:
-                TaskPool.add(Task(f"{req.request_id}", req, req.message))
+                TaskPool.add(
+                    Task(f"{req.request_id}", req, req.message, stop_with_eos=False)
+                )
         t_start = time.time()
         timers("overall").start()
         while not chitu_is_terminated():
@@ -142,7 +144,9 @@ def run_normal(args, timers):
             num_reqs=args.infer.max_reqs, max_new_tokens=args.request.max_new_tokens
         )
         for req in reqs:
-            TaskPool.add(Task(f"{req.request_id}", req, req.message))
+            TaskPool.add(
+                Task(f"{req.request_id}", req, req.message, stop_with_eos=False)
+            )
         t_start = time.time()
         timers("overall").start()
         while len(TaskPool.pool) > 0:

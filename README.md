@@ -99,7 +99,6 @@ torchrun --nnodes 1 \
     --master_port=22525 \
     -m chitu \
     serve.port=21002 \
-    infer.stop_with_eos=False \
     infer.cache_type=paged \
     infer.pp_size=1 \
     infer.tp_size=8 \
