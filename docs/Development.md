@@ -123,7 +123,7 @@ Example:
 
 **Fixing Input and Output Lengths for Performance Testing:**
 
-You can set the input and output lengths, and disable early stopping, with the following command:
+You can set the input lengths and output lengths, with the following command:
 
 ```bash
 torchrun --nproc_per_node 1 test/single_req_test.py \
@@ -133,7 +133,6 @@ torchrun --nproc_per_node 1 test/single_req_test.py \
     request.max_new_tokens=64 \
     infer.max_seq_len=192 \
     infer.max_reqs=8 \
-    infer.stop_with_eos=False
 ```
 
 **Preprocess a model's state dict with a given config and save it to a new checkpoint, and skip preprocessing in the future:**

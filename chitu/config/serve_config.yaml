@@ -8,7 +8,6 @@ infer:
   pp_size: 1
   do_load: True # set it to False for debug purpose
   seed: 0
-  stop_with_eos: True
   max_seq_len: 10240 # length of prefill + decode
   cache_type: skew
   attn_type: flash_attn # flash_attn, flash_mla, flash_infer, triton or ref

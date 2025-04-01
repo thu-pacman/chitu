@@ -59,7 +59,7 @@ class BenchmarkServing:
         print(f"  Warmup Iterations: {config.warmup_iterations}")
         print(f"  Base URL: {base_url}")
 
-    def _run_inference(self):
+    def _run_inference(self, min_batch_size: int = 1):
         """Run a single inference pass with proper measurement."""
         # Create a request based on configuration
         messages = self._get_test_messages()
@@ -73,6 +73,8 @@ class BenchmarkServing:
             "temperature": 1.0,
             "top_p": 0.9,
             "top_k": 50,
+            "min_batch_size": min_batch_size,
+            "stop_with_eos": False,
         }
 
         # Send request and measure time
@@ -169,10 +171,46 @@ class BenchmarkServing:
         else:
             return test_messages[2]
 
-    # TODO: Implement batch benchmark
     def run_batch_benchmark(self) -> List[BenchmarkResult]:
         """Run benchmark with concurrent requests to simulate batch processing."""
-        return []
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        print(
+            f"Running batch benchmark with {self.config.batch_size} concurrent requests..."
+        )
+
+        results = []
+
+        with ThreadPoolExecutor(max_workers=self.config.batch_size) as executor:
+            # Submit all requests concurrently
+            futures = []
+            for _ in range(self.config.batch_size):
+                futures.append(
+                    executor.submit(
+                        self._run_inference, min_batch_size=self.config.batch_size
+                    )
+                )
+
+            # Collect results as they complete
+            for future in as_completed(futures):
+                latency, tps = future.result()
+                result = BenchmarkResult(
+                    latency_ms=latency,
+                    tps=tps,
+                    throughput=(1000 / latency),  # req/s
+                    config=self.config,
+                )
+                results.append(result)
+
+                # Print progress
+                print(
+                    f"Batch request completed: "
+                    f"TPS={result.tps:.2f} tok/s, "
+                    f"Latency={result.latency_ms:.2f}ms, "
+                    f"Throughput={result.throughput:.2f} req/s"
+                )
+
+        return results
 
     def run(self) -> BenchmarkResult:
         """Run the benchmark and return aggregated results."""

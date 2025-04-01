@@ -28,6 +28,7 @@ app = FastAPI()
 
 global_args = None
 server_status = False
+min_batch_size = 1
 rank = 0
 
 
@@ -51,16 +52,19 @@ class ChatRequest(BaseModel):
     top_p: float = 0.9  # [0,1]
     top_k: int = 50  # -1 or positive integer
     frequency_penalty: float = 0.1  # [-2, 2]
+    min_batch_size: int = 1
+    stop_with_eos: bool = True
 
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatRequest):
     global server_status
+    global min_batch_size
     if not server_status:
         return {"message": "Service is not started"}
     if (
         global_args.infer.cache_type == "skew"
-        and len(TaskLoad.user_req) >= global_args.infer.max_reqs
+        and len(TaskPool.pool) >= global_args.infer.max_reqs
     ):
         raise HTTPException(
             status_code=403, detail="exceeding server processing capacity"
@@ -74,6 +78,8 @@ async def create_chat_completion(request: ChatRequest):
     top_p = params.pop("top_p")
     top_k = params.pop("top_k")
     freq_pen = params.pop("frequency_penalty")
+    min_batch_size = params.pop("min_batch_size")
+    stop_with_eos = params.pop("stop_with_eos")
     try:
         req = UserRequest(
             message,
@@ -90,6 +96,7 @@ async def create_chat_completion(request: ChatRequest):
             req,
             req.message,
             max_seq_len=global_args.infer.max_seq_len,
+            stop_with_eos=stop_with_eos,
         )
         TaskPool.add(task)
     except ValueError:
@@ -165,8 +172,10 @@ api_logger.addFilter(IgnoreSpecificPathFilter())
 
 
 async def process_queue():
+    global min_batch_size
     while True:
-        if len(TaskPool.pool) > 0 or rank != 0:
+        if (len(TaskPool.pool) >= min_batch_size) or rank != 0:
+            min_batch_size = 1
             chitu_run()
 
 

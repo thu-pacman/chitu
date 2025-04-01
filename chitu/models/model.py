@@ -279,6 +279,8 @@ class Transformer(nn.Module):
 
         self.precompute_freqs_cis(max_position_embeddings, self.device)
 
+        self.do_decode_callable = None
+
     def _get_tensor_column_parallel_layer_names(self) -> List[str]:
         raise NotImplementedError
 
@@ -532,19 +534,23 @@ class Transformer(nn.Module):
                     'CUDA graph is currently not supported for infer.cache_type="skew"'
                 )
 
-        @make_dispatched_graphed_callables(
-            sample_args=(tokens,),
-            sample_kwargs={},
-            args_max_nelem=(tokens.numel() // batch_size * max_batch_size,),
-            kwargs_max_nelem={},
-            output_max_nelem_callback=lambda n: n // batch_size * max_batch_size,
-            enable=use_cuda_graph,
-        )
-        def do_decode(tokens):
-            freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_decode()
-            if self.pipeline_exec:
-                return self.decode_pipeline(tokens, freqs_cis_cos, freqs_cis_sin)
-            else:
-                return self.decode_single_device(tokens, freqs_cis_cos, freqs_cis_sin)
+        if self.do_decode_callable is None:
 
-        return do_decode(batch_size, tokens)
+            @make_dispatched_graphed_callables(
+                args_max_nelem=(tokens.numel() // batch_size * max_batch_size,),
+                kwargs_max_nelem={},
+                output_max_nelem_callback=lambda bs, n: n // bs * max_batch_size,
+                enable=use_cuda_graph,
+            )
+            def do_decode(tokens):
+                freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_decode()
+                if self.pipeline_exec:
+                    return self.decode_pipeline(tokens, freqs_cis_cos, freqs_cis_sin)
+                else:
+                    return self.decode_single_device(
+                        tokens, freqs_cis_cos, freqs_cis_sin
+                    )
+
+            self.do_decode_callable = do_decode
+
+        return self.do_decode_callable(batch_size, tokens)

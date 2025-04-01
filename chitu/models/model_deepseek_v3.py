@@ -21,6 +21,7 @@ from chitu.ops import (
     soft_fp8_gemm_deepseek_v3,
     weight_dequant_deepseek_v3,
     weight_dequant_soft_fp8_deepseek_v3,
+    silu_and_mul,
 )
 from chitu.tensor_parallel import (
     ColumnParallelLinear,
@@ -764,11 +765,11 @@ class MLPDeepSeekV3(nn.Module):
         """
         if self.merge_gate_up:
             w1w3_out = self.w1w3(x)
-            w1_out, w3_out = torch.split(w1w3_out, w1w3_out.shape[-1] // 2, dim=-1)
+            return self.w2(silu_and_mul(w1w3_out))
         else:
             w1_out = self.w1(x)
             w3_out = self.w3(x)
-        return self.w2(F.silu(w1_out) * w3_out)
+            return self.w2(F.silu(w1_out) * w3_out)
 
 
 class GateDeepSeekV3(nn.Module):
@@ -1012,8 +1013,7 @@ class MoEDeepSeekV3(nn.Module):
                     self.w1w3.scale[-1] if self.w1w3.scale is not None else None,
                     self.w1w3.bias[-1] if self.w1w3.bias is not None else None,
                 )
-                w1_out, w3_out = torch.split(w1w3_out, w1w3_out.shape[-1] // 2, dim=-1)
-                act = F.silu(w1_out) * w3_out
+                act = silu_and_mul(w1w3_out)
                 y1 = linear_deepseek_v3(
                     act,
                     self.w2.weight[-1],
@@ -1095,24 +1095,18 @@ class MoEDeepSeekV3(nn.Module):
 
             if self.merge_gate_up:
                 w1w3_outs = self.w1w3(xs)
-                w1_outs, w3_outs = zip(
-                    *[
-                        (
-                            torch.split(w1w3_out, w1w3_out.shape[-1] // 2, dim=-1)
-                            if w1w3_out is not None
-                            else (None, None)
-                        )
-                        for w1w3_out in w1w3_outs
-                    ]
-                )
+                act = [
+                    (silu_and_mul(w1w3_out) if w1w3_out is not None else None)
+                    for w1w3_out in w1w3_outs
+                ]
             else:
                 w1_outs = self.w1(xs)
                 w3_outs = self.w3(xs)
 
-            act = [
-                F.silu(w1_out) * w3_out if w1_out is not None else None
-                for w1_out, w3_out in zip(w1_outs, w3_outs)
-            ]
+                act = [
+                    F.silu(w1_out) * w3_out if w1_out is not None else None
+                    for w1_out, w3_out in zip(w1_outs, w3_outs)
+                ]
 
             w2_outs = self.w2(act)
 

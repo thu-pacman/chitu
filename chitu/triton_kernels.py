@@ -9,6 +9,7 @@ __all__ = [
     "fp8_gemm_deepseek_v3_kernel",
     "soft_fp8_gemm_deepseek_v3_kernel",
     "moe_sum_kernel",
+    "silu_and_mul_kernel",
 ]
 
 import triton
@@ -533,3 +534,21 @@ def moe_sum_kernel(
     tl.store(
         output_ptr + output_offset, output_sum, mask=m_mask[:, None] & n_mask[None, :]
     )
+
+
+@triton.jit
+def silu_and_mul_kernel(
+    output_ptr, x_ptr, output_row_stride, x_row_stride, BLOCK_SIZE: tl.constexpr
+):
+    row_idx = tl.program_id(0)
+    row_start_ptr = x_ptr + row_idx * x_row_stride
+    d = x_row_stride // 2
+    offsets = tl.arange(0, BLOCK_SIZE)
+    part1 = tl.load(row_start_ptr + offsets, mask=(offsets < d), other=0)
+    part2 = tl.load(row_start_ptr + d + offsets, mask=(offsets < d), other=0)
+    part1_fp32 = part1.to(tl.float32)
+    silu_part1_fp32 = part1_fp32 / (1 + tl.exp(-1 * part1_fp32))
+    silu_part1 = silu_part1_fp32.to(part1.dtype)
+    result = silu_part1 * part2
+    output = output_ptr + row_idx * output_row_stride + offsets
+    tl.store(output, result, mask=(offsets < d))
