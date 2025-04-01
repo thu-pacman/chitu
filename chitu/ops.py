@@ -2,6 +2,8 @@ import struct
 from typing import Tuple
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -541,3 +543,38 @@ def soft_fp8_gemm_deepseek_v3(
         compute_dtype=compute_dtype,
     )
     return c
+
+
+def silu_and_mul_torch(x: torch.Tensor):
+    d = x.shape[-1] // 2
+    return F.silu(x[..., :d]) * x[..., d:]
+
+
+@auto_retry_triton_compilation
+def invoke_silu_and_mul(x):
+    n_rows = x.nelement() // x.shape[-1]
+    n_cols = x.shape[-1]
+    BLOCK_SIZE = triton.next_power_of_2(n_cols)
+    output_shape = x.shape[:-1] + (n_cols // 2,)
+    output = torch.empty(output_shape, device=x.device, dtype=x.dtype)
+    num_warps = 4
+    if BLOCK_SIZE >= 2048:
+        num_warps = 8
+    if BLOCK_SIZE >= 4096:
+        num_warps = 16
+    silu_and_mul_kernel[(n_rows,)](
+        output,
+        x,
+        output.shape[-1],
+        x.shape[-1],
+        num_warps=num_warps,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return output
+
+
+def silu_and_mul(x, imply="triton"):
+    if imply == "triton":
+        return invoke_silu_and_mul(x)
+    else:
+        return silu_and_mul_torch(x)

@@ -22,15 +22,7 @@ import chitu_backend
 from chitu.device_type import is_muxi, is_nvidia, get_device_name
 
 from chitu.triton_kernels import moe_sum_kernel
-
-
-def silu_and_mul_torch(x: torch.Tensor):
-    d = x.shape[-1] // 2
-    return F.silu(x[..., :d]) * x[..., d:]
-
-
-def silu_and_mul(x: torch.Tensor):
-    return silu_and_mul_torch(x)
+from chitu.ops import silu_and_mul
 
 
 def moe_sum(input_tensor, output_tensor, config: Dict[str, Any]):
