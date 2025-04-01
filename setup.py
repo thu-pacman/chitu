@@ -5,9 +5,13 @@ import sys
 from setuptools import Extension, setup, find_packages
 from setuptools.command.build_ext import build_ext
 from setuptools.command.build_py import build_py
+import packaging.version
 from Cython.Build import cythonize
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
+assert packaging.version.parse(setuptools.__version__) >= packaging.version.parse(
+    "62.3.0"
+), "setuptools>=62.3.0 is required for `**` wildcard in package_data."
 
 setup_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -31,9 +35,11 @@ ext_modules = [
 
 
 cython_unsafe_files = [
-    "triton_kernels.py",
-    "fused_moe.py",
-    "triton_decode_attention.py",
+    "triton_kernels.py",  # Triton kernels inside
+    "fused_moe.py",  # Triton kernels inside
+    "triton_decode_attention.py",  # Triton kernels inside
+    "__main__.py",  # Triton kernels inside
+    "serve.py",  # Reason unkown. Test not passed for Cython. (FIXME)
 ]
 
 

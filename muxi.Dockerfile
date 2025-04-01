@@ -34,18 +34,4 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt
 
 # The actual installing procedure requries a GPU device, which is not available in the `docker build` stage.
-# We echo the commands to `install.sh`, and users shoud run it via `docker run` after the image is built.
-# Then, the final image can be committed to a new image.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ -n "${build_jobs}" ]; then \
-        echo "export MAX_JOBS=${build_jobs}" >> install.sh; \
-    fi; \
-    if [ "${enable_cython}" == "true" ]; then \
-        echo "export CHITU_WITH_CYTHON=1" >> install.sh; \
-    fi; \
-    if [ "${enable_editable_install}" == "true" ]; then \
-        echo "pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e .[${optional_deps}]" >> install.sh; \
-    else \
-        echo "pip install -i https://pypi.tuna.tsinghua.edu.cn/simple .[${optional_deps}]" >> install.sh; \
-    fi; \
-    chmod +x install.sh
+# We delay it to an additional `docker run` stage which runs `script/install.sh`.
