@@ -33,14 +33,4 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ -n "${build_jobs}" ]; then \
-        export MAX_JOBS=${build_jobs}; \
-    fi; \
-    if [ "${enable_cython}" == "true" ]; then \
-        export CHITU_WITH_CYTHON=1; \
-    fi; \
-    if [ "${enable_editable_install}" == "true" ]; then \
-        pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e .[${optional_deps}]; \
-    else \
-        pip install -i https://pypi.tuna.tsinghua.edu.cn/simple .[${optional_deps}]; \
-    fi
+    bash script/install.sh "${optional_deps}" "${build_jobs}" "${enable_editable_install}" "${enable_cython}"

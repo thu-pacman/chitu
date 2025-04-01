@@ -21,6 +21,7 @@ TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=4 pip install --no-build-isolation ".[quant]"
 Currently supported optional dependencies are:
 - `quant`: Quantization.
 - `flash_attn`: Support `infer.attn_type=flash_attn`.
+- `flashinfer`: Support `infer.attn_type=flash_infer`.
 - `flash_mla`: Support `infer.attn_type=flash_mla`.
 - `muxi_layout_kernels` (Currently not publicly available. Please contact Qingcheng.AI).
 - `muxi_w8a8_kernels` (Currently not publicly available. Please contact Qingcheng.AI).
