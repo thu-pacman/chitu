@@ -5,9 +5,13 @@ import sys
 from setuptools import Extension, setup, find_packages
 from setuptools.command.build_ext import build_ext
 from setuptools.command.build_py import build_py
+import packaging.version
 from Cython.Build import cythonize
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
+assert packaging.version.parse(setuptools.__version__) >= packaging.version.parse(
+    "62.3.0"
+), "setuptools>=62.3.0 is required for `**` wildcard in package_data."
 
 setup_dir = os.path.dirname(os.path.abspath(__file__))
 
