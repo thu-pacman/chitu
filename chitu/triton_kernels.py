@@ -10,6 +10,7 @@ __all__ = [
     "soft_fp8_gemm_deepseek_v3_kernel",
     "moe_sum_kernel",
     "silu_and_mul_kernel",
+    "rms_norm_kernel",
 ]
 
 import triton
@@ -552,3 +553,37 @@ def silu_and_mul_kernel(
     result = silu_part1 * part2
     output = output_ptr + row_idx * output_row_stride + offsets
     tl.store(output, result, mask=(offsets < d))
+
+
+@triton.jit
+def rms_norm_kernel(
+    Y,
+    Y_row_stride,
+    X,
+    X_row_stride,
+    W,
+    n_cols: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fast RMS Layernorm kernel
+    Inspiration from a Triton tutorial:
+    https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html
+    """
+    row_idx = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+
+    Y += row_idx * Y_row_stride
+    X += row_idx * X_row_stride
+
+    X_row = tl.load(X + col_offsets, mask=mask, other=0)
+    W_row = tl.load(W + col_offsets, mask=mask, other=0)  # .to(tl.float32)
+
+    row_var = tl.sum(X_row * X_row, axis=0) / n_cols
+    inv_var = tl.math.rsqrt(row_var + eps)
+    normed = X_row * inv_var
+    normed = normed.to(W_row.dtype)  # Exact copy from HF
+    output = normed * W_row
+    tl.store(Y + col_offsets, output, mask=mask)

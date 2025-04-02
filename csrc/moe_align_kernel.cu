@@ -42,11 +42,12 @@ __global__ void moe_align_block_size_kernel(
     int32_t padded_num_experts, int32_t experts_per_warp, int32_t block_size,
     size_t numel, int32_t *__restrict__ cumsum) {
     extern __shared__ int32_t shared_counts[];
-
-    const int warp_id = threadIdx.x / WARP_SIZE;
+    __shared__ int32_t shared_data[2048];
+    int tid = threadIdx.x;
+    const int warp_id = tid / WARP_SIZE;
     const int my_expert_start = warp_id * experts_per_warp;
 
-    for (int i = 0; i < experts_per_warp; ++i) {
+    for (int i = tid % WARP_SIZE; i < experts_per_warp; i += WARP_SIZE) {
         if (my_expert_start + i < padded_num_experts) {
             shared_counts[warp_id * experts_per_warp + i] = 0;
         }
@@ -54,11 +55,7 @@ __global__ void moe_align_block_size_kernel(
 
     __syncthreads();
 
-    const size_t tokens_per_thread = ceil_div(numel, blockDim.x);
-    const size_t start_idx = threadIdx.x * tokens_per_thread;
-
-    for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread;
-         ++i) {
+    for (int i = tid; i < numel; i += blockDim.x) {
         int expert_id = topk_ids[i];
         int warp_idx = expert_id / experts_per_warp;
         int expert_offset = expert_id % experts_per_warp;
@@ -68,27 +65,40 @@ __global__ void moe_align_block_size_kernel(
 
     __syncthreads();
 
-    if (threadIdx.x == 0) {
-        cumsum[0] = 0;
-        for (int i = 1; i <= num_experts; ++i) {
-            int expert_count = 0;
-            int warp_idx = (i - 1) / experts_per_warp;
-            int expert_offset = (i - 1) % experts_per_warp;
-            expert_count =
-                shared_counts[warp_idx * experts_per_warp + expert_offset];
-
-            cumsum[i] =
-                cumsum[i - 1] + ceil_div(expert_count, block_size) * block_size;
-        }
-        *total_tokens_post_pad = cumsum[num_experts];
+    if (tid == 0) {
+        shared_data[tid] = 0;
+    } else {
+        int warp_idx = (tid - 1) / experts_per_warp;
+        int expert_offset = (tid - 1) % experts_per_warp;
+        int expert_count = shared_counts[warp_idx * experts_per_warp + expert_offset];
+        shared_data[tid] = (tid <= num_experts) ? ceil_div(expert_count, block_size) : 0;
     }
-
     __syncthreads();
 
-    if (threadIdx.x < num_experts) {
-        for (int i = cumsum[threadIdx.x]; i < cumsum[threadIdx.x + 1];
-             i += block_size) {
-            expert_ids[i / block_size] = threadIdx.x;
+    for(int stride = 1; stride < blockDim.x; stride *= 2) {
+        int index = (tid + 1) * stride * 2 - 1;
+        if(index < 2 * blockDim.x && index - stride >= 0) {
+            shared_data[index] += shared_data[index - stride];
+        }
+        __syncthreads();
+    }
+
+    for(int stride = blockDim.x/2; stride >= 1; stride /= 2) {
+        int index = (tid + 1) * stride * 2 - 1;
+        if(index + stride < 2 * blockDim.x) {
+            shared_data[index + stride] += shared_data[index];
+        }
+        __syncthreads();
+    }
+
+    if (tid <= num_experts){
+        cumsum[tid] = shared_data[tid] * block_size;
+        if (tid == num_experts) {
+            *total_tokens_post_pad = shared_data[tid] * block_size;
+        } else {
+            for (int i = shared_data[tid]; i < shared_data[tid + 1]; i++) {
+                expert_ids[i] = tid;
+            }
         }
     }
 }
