@@ -60,21 +60,22 @@ Chitu (赤兔) 定位于「生产级大模型推理引擎」，并且充分考�
 |bs=16|202.1|
 |bs=256|780.3|
 
-## 开始使用
+## 快速入门
 
-通过源码安装 Chitu。
+以下是简单的安装使用说明，适用于在单机环境上快速验证。
+如果需要在更复杂的环境上运行，或需要获得更高的运行性能，请参阅[此文档](/docs/zh/DEVELOPMENT_zh.md)。
 
 ### 从源码安装
 
+注意下面示例命令中的部分参数需要根据实际环境进行调整（见注释）。
 ```bash
-git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
-
+# 如果下载很慢，试试在命令最后加上 “-i https://pypi.tuna.tsinghua.edu.cn/simple”
 pip install -r requirements-build.txt
-pip install -U torch --index-url https://download.pytorch.org/whl/cu124  # 根据您的 CUDA 版本调整
-TORCH_CUDA_ARCH_LIST=8.6 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation .
+# 安装 torch，需要将 cu124 替换为实际的 cuda 版本号
+pip install -U torch --index-url https://download.pytorch.org/whl/cu124 
+# TORCH_CUDA_ARCH_LIST 的值可通过 python -c "import torch; print(torch.cuda.get_device_capability())" 查看
+TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=4 pip install --no-build-isolation . 
 ```
-
-## 快速入门
 
 ### 单 GPU 推理
 
@@ -141,10 +142,6 @@ python benchmarks/benchmark_serving.py \
     --warmup 3 \
     --base-url http://localhost:21002
 ```
-
-### 完整文档
-
-更多细节请参阅[此文档](/docs/Development.md)。
 
 ## 常见问题
 

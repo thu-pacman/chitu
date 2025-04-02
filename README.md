@@ -62,7 +62,7 @@ Chitu is a high-performance inference framework for large language models. Chitu
 
 ## Getting started
 
-You can install Chitu from source.
+For professional users and developers, please read [the full installation guide](/docs/en/DEVELOPMENT.md) for more details.
 
 ### Install from Source
 
@@ -71,11 +71,8 @@ git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
 
 pip install -r requirements-build.txt
 pip install -U torch --index-url https://download.pytorch.org/whl/cu124  # Change according to your CUDA version
-TORCH_CUDA_ARCH_LIST=8.6 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation .
+TORCH_CUDA_ARCH_LIST=8.6 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation . # Change `8.6` to your desired CUDA arch list.
 ```
-
-
-## Quick Start
 
 ### Single GPU Inference
 
@@ -144,9 +141,6 @@ python benchmarks/benchmark_serving.py \
     --base-url http://localhost:21002
 ```
 
-### Full Documentation
-
-Please refer to [here](/docs/Development.md) for more details.
 
 ## FAQ (Frequently Asked Questions)
 
