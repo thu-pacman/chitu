@@ -1,4 +1,5 @@
-## Setup for Development
+# Developer Guide
+## Installation
 
 ```bash
 pip install -r requirements-build.txt
@@ -15,16 +16,13 @@ TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=4 pip install --no-build-isolation -e .
 Append `[optional-dependency-name]` after `.` for optional dependencies. Example:
 
 ```bash
-TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=4 pip install --no-build-isolation ".[quant]"
+TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=4 pip install --no-build-isolation ".[flash_mla]"
 ```
 
 Currently supported optional dependencies are:
-- `quant`: Quantization.
 - `flash_attn`: Support `infer.attn_type=flash_attn`.
 - `flashinfer`: Support `infer.attn_type=flash_infer`.
 - `flash_mla`: Support `infer.attn_type=flash_mla`.
-- `muxi_layout_kernels` (Currently not publicly available. Please contact Qingcheng.AI).
-- `muxi_w8a8_kernels` (Currently not publicly available. Please contact Qingcheng.AI).
 
 Set `CHITU_WITH_CYTHON=1` to compile Python sources with Cython. Example:
 
@@ -123,7 +121,7 @@ Example:
 
 **Fixing Input and Output Lengths for Performance Testing:**
 
-You can set the input lengths and output lengths, with the following command:
+You can set the input and output lengths, with the following command:
 
 ```bash
 torchrun --nproc_per_node 1 test/single_req_test.py \
@@ -132,7 +130,7 @@ torchrun --nproc_per_node 1 test/single_req_test.py \
     request.prompt_tokens_len=128 \
     request.max_new_tokens=64 \
     infer.max_seq_len=192 \
-    infer.max_reqs=8 \
+    infer.max_reqs=8
 ```
 
 **Preprocess a model's state dict with a given config and save it to a new checkpoint, and skip preprocessing in the future:**
