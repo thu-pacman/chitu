@@ -186,7 +186,7 @@ def apply_rotary_pos_emb_triton(q, k, cos, sin, rotary_type="hf-llama", block_si
         k_shape = k.shape
 
         if q.dim() == 4:
-            q = q.view(-1, q.shape[-2], q, shape[-1])
+            q = q.view(-1, q.shape[-2], q.shape[-1])
         elif q.dim() == 3:
             pass
         elif q.dim() == 2:
@@ -573,8 +573,8 @@ def invoke_silu_and_mul(x):
     return output
 
 
-def silu_and_mul(x, imply="triton"):
-    if imply == "triton":
+def silu_and_mul(x, impl="triton"):
+    if impl == "triton":
         return invoke_silu_and_mul(x)
     else:
         return silu_and_mul_torch(x)
