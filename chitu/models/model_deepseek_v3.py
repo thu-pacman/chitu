@@ -14,7 +14,7 @@ import chitu_backend
 from chitu.layers.gate import fused_sigmoid_gate
 from chitu.attn_backend import AttnBackend
 from chitu.cache_manager import PagedKVCacheManager
-from chitu.device_type import get_device_name, is_muxi, is_nvidia
+from chitu.device_type import get_device_name, is_muxi, is_nvidia, has_native_fp8
 from chitu.global_vars import get_global_args
 from chitu.models.model import Attention, RMSNorm, Transformer, TransformerBlock
 from chitu.ops import (
@@ -1470,9 +1470,18 @@ class TransformerDeepSeekV3(Transformer):
                         for i in range(self.params.n_routed_experts):
                             parts.append(checkpoint[prefix + f"experts.{i}.{w}.{part}"])
                         parts.append(checkpoint[prefix + f"shared_experts.{w}.{part}"])
-                        new_checkpoint[prefix + f"{w}.{part}"] = torch.stack(
-                            parts, dim=0
-                        )
+                        if (
+                            len(parts) > 0
+                            and parts[0].element_size() == 1
+                            and not has_native_fp8()
+                        ):
+                            new_checkpoint[prefix + f"{w}.{part}"] = torch.stack(
+                                [p.view(torch.uint8) for p in parts], dim=0
+                            ).view(parts[0].dtype)
+                        else:
+                            new_checkpoint[prefix + f"{w}.{part}"] = torch.stack(
+                                parts, dim=0
+                            )
                         replaced = True
                         break
                 if replaced:
@@ -1619,9 +1628,14 @@ class TransformerDeepSeekV3(Transformer):
                 assert prefix + "wkv_a.weight" in checkpoint
                 q_weight = checkpoint[prefix + "wq_a.weight"]
                 kv_weight = checkpoint[prefix + "wkv_a.weight"]
-                new_checkpoint[prefix + "wqkv_a.weight"] = torch.cat(
-                    [q_weight, kv_weight], dim=0
-                )
+                if q_weight.element_size() == 1 and not has_native_fp8():
+                    new_checkpoint[prefix + "wqkv_a.weight"] = torch.cat(
+                        [q_weight.view(torch.uint8), kv_weight.view(torch.uint8)], dim=0
+                    ).view(q_weight.dtype)
+                else:
+                    new_checkpoint[prefix + "wqkv_a.weight"] = torch.cat(
+                        [q_weight, kv_weight], dim=0
+                    )
             elif k.endswith(".wkv_a.weight"):
                 continue
             elif k.endswith(".wq_a.scale"):
@@ -1629,9 +1643,14 @@ class TransformerDeepSeekV3(Transformer):
                 assert prefix + "wkv_a.scale" in checkpoint
                 q_scale = checkpoint[prefix + "wq_a.scale"]
                 kv_scale = checkpoint[prefix + "wkv_a.scale"]
-                new_checkpoint[prefix + "wqkv_a.scale"] = torch.cat(
-                    [q_scale, kv_scale], dim=0
-                )
+                if q_scale.element_size() == 1 and not has_native_fp8():
+                    new_checkpoint[prefix + "wqkv_a.scale"] = torch.cat(
+                        [q_scale.view(torch.uint8), kv_scale.view(torch.uint8)], dim=0
+                    ).view(q_scale.dtype)
+                else:
+                    new_checkpoint[prefix + "wqkv_a.scale"] = torch.cat(
+                        [q_scale, kv_scale], dim=0
+                    )
             elif k.endswith(".wkv_a.scale"):
                 continue
             elif k.endswith(".wq_a.bias"):
@@ -1639,9 +1658,14 @@ class TransformerDeepSeekV3(Transformer):
                 assert prefix + "wkv_a.bias" in checkpoint
                 q_bias = checkpoint[prefix + "wq_a.bias"]
                 kv_bias = checkpoint[prefix + "wkv_a.bias"]
-                new_checkpoint[prefix + "wqkv_a.bias"] = torch.cat(
-                    [q_bias, kv_bias], dim=0
-                )
+                if q_bias.element_size() == 1 and not has_native_fp8():
+                    new_checkpoint[prefix + "wqkv_a.bias"] = torch.cat(
+                        [q_bias.view(torch.uint8), kv_bias.view(torch.uint8)], dim=0
+                    ).view(q_bias.dtype)
+                else:
+                    new_checkpoint[prefix + "wqkv_a.bias"] = torch.cat(
+                        [q_bias, kv_bias], dim=0
+                    )
             elif k.endswith(".wkv_a.bias"):
                 continue
             else:
@@ -1657,9 +1681,15 @@ class TransformerDeepSeekV3(Transformer):
                 assert prefix + "w1w3.weight" not in checkpoint
                 gate_weight = checkpoint[prefix + "w1.weight"]
                 up_weight = checkpoint[prefix + "w3.weight"]
-                new_checkpoint[prefix + "w1w3.weight"] = torch.cat(
-                    [gate_weight, up_weight], dim=0
-                )
+                if gate_weight.element_size() == 1 and not has_native_fp8():
+                    new_checkpoint[prefix + "w1w3.weight"] = torch.cat(
+                        [gate_weight.view(torch.uint8), up_weight.view(torch.uint8)],
+                        dim=0,
+                    ).view(gate_weight.dtype)
+                else:
+                    new_checkpoint[prefix + "w1w3.weight"] = torch.cat(
+                        [gate_weight, up_weight], dim=0
+                    )
             elif k.endswith(".w3.weight"):
                 continue
             elif k.endswith(".w1.scale"):
@@ -1668,9 +1698,15 @@ class TransformerDeepSeekV3(Transformer):
                 assert prefix + "w1w3.scale" not in checkpoint
                 gate_scale = checkpoint[prefix + "w1.scale"]
                 up_scale = checkpoint[prefix + "w3.scale"]
-                new_checkpoint[prefix + "w1w3.scale"] = torch.cat(
-                    [gate_scale, up_scale], dim=0
-                )
+                if gate_scale.element_size() == 1 and not has_native_fp8():
+                    new_checkpoint[prefix + "w1w3.scale"] = torch.cat(
+                        [gate_scale.view(torch.uint8), up_scale.view(torch.uint8)],
+                        dim=0,
+                    ).view(gate_scale.dtype)
+                else:
+                    new_checkpoint[prefix + "w1w3.scale"] = torch.cat(
+                        [gate_scale, up_scale], dim=0
+                    )
             elif k.endswith(".w3.scale"):
                 continue
             elif k.endswith(".w1.bias"):
@@ -1679,9 +1715,14 @@ class TransformerDeepSeekV3(Transformer):
                 assert prefix + "w1w3.bias" not in checkpoint
                 gate_bias = checkpoint[prefix + "w1.bias"]
                 up_bias = checkpoint[prefix + "w3.bias"]
-                new_checkpoint[prefix + "w1w3.bias"] = torch.cat(
-                    [gate_bias, up_bias], dim=0
-                )
+                if gate_bias.element_size() == 1 and not has_native_fp8():
+                    new_checkpoint[prefix + "w1w3.bias"] = torch.cat(
+                        [gate_bias.view(torch.uint8), up_bias.view(torch.uint8)], dim=0
+                    ).view(gate_bias.dtype)
+                else:
+                    new_checkpoint[prefix + "w1w3.bias"] = torch.cat(
+                        [gate_bias, up_bias], dim=0
+                    )
             elif k.endswith(".w3.bias"):
                 continue
             else:

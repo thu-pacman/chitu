@@ -477,7 +477,15 @@ def weight_dequant_soft_fp8_deepseek_v3(
         assert False, "Weight tensor must have 2 or 3 dimensions"
 
     x = x.view(dtype=torch.uint8)
-    bit_reordered_x = torch.empty_like(x, dtype=torch.uint32)
+    if hasattr(torch, "uint32"):
+        bit_reordered_x = torch.empty_like(x, dtype=torch.uint32)
+    elif hasattr(torch, "int32"):
+        bit_reordered_x = torch.empty_like(x, dtype=torch.int32)
+    else:
+        raise ValueError(
+            "The current PyTorch environment supports neither the uint32 type nor the int32 type."
+        )
+
     grid = lambda meta: (triton.cdiv(B * M * N, meta["BLOCK_SIZE"]),)
     weight_dequant_soft_fp8_deepseek_v3_kernel_step_1[grid](
         x, bit_reordered_x, B * M * N, BLOCK_SIZE=block_size
