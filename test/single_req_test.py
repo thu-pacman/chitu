@@ -116,7 +116,7 @@ def run_pipe_or_tensor_parallelism(args, timers):
             )
             for req in reqs:
                 TaskPool.add(
-                    Task(f"{req.request_id}", req, req.message, stop_with_eos=False)
+                    Task(f"{req.request_id}", req, req.message, stop_with_eos=True)
                 )
         t_start = time.time()
         timers("overall").start()
@@ -145,7 +145,7 @@ def run_normal(args, timers):
         )
         for req in reqs:
             TaskPool.add(
-                Task(f"{req.request_id}", req, req.message, stop_with_eos=False)
+                Task(f"{req.request_id}", req, req.message, stop_with_eos=True)
             )
         t_start = time.time()
         timers("overall").start()

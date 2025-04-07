@@ -831,7 +831,7 @@ class GateDeepSeekV3(nn.Module):
             (sample_num, self.topk), dtype=torch.int64, device=scores.device
         )
         weights = torch.empty(
-            (sample_num, self.topk), dtype=torch.float32, device=scores.device
+            (sample_num, self.topk), dtype=x.dtype, device=scores.device
         )
         chitu_backend.cuda_group_topk_gather_weights(
             scores,

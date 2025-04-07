@@ -8,16 +8,19 @@
 
 namespace chitu {
 
-template <int TPB, size_t NUM_GROUPS, size_t TOPK_GROUPS, size_t TOPK>
-__launch_bounds__(TPB) __global__ void group_topk_kernel_gather_weights(
-    const float *__restrict__ input_after_act,
-    const torch::BFloat16 *__restrict__ original_scores, float route_scale,
-    float *weights, int64_t *indices, const size_t group_dim) {
-    using cub_kvp = cub::KeyValuePair<int64_t, float>;
+template <int TPB, size_t NUM_GROUPS, size_t TOPK_GROUPS, size_t TOPK,
+          typename T>
+__launch_bounds__(TPB) __global__
+    void group_topk_kernel_gather_weights(const T *__restrict__ input_after_act,
+                                          const T *__restrict__ original_scores,
+                                          float route_scale, T *weights,
+                                          int64_t *indices,
+                                          const size_t group_dim) {
+    using cub_kvp = cub::KeyValuePair<int64_t, T>;
     cub_kvp thread_kvp;
     cub::ArgMax arg_max;
     size_t cur_token_idx = blockIdx.x;
-    float group_top2_sum[NUM_GROUPS];
+    T group_top2_sum[NUM_GROUPS];
     int64_t topk_group_indices[TOPK_GROUPS];
     int64_t topk_indices[TOPK];
     // 计算group_top2_sum
@@ -87,7 +90,7 @@ __launch_bounds__(TPB) __global__ void group_topk_kernel_gather_weights(
             }
         }
         topk_indices[topK_idx] = thread_kvp.key;
-        float weight = original_scores[cur_token_start + thread_kvp.key];
+        auto &&weight = original_scores[cur_token_start + thread_kvp.key];
         weights[cur_token_idx * TOPK + topK_idx] = weight;
         weights_sum += weight;
         indices[cur_token_idx * TOPK + topK_idx] = thread_kvp.key;
@@ -98,6 +101,7 @@ __launch_bounds__(TPB) __global__ void group_topk_kernel_gather_weights(
     }
 }
 
+template <typename T>
 void groupTopKLauncher(torch::Tensor &input_after_act,
                        torch::Tensor &original_scores, float route_scale,
                        torch::Tensor &weights, torch::Tensor &indices,
@@ -107,21 +111,31 @@ void groupTopKLauncher(torch::Tensor &input_after_act,
     const int group_dim = input_after_act.size(-1);
     const int num_tokens = input_after_act.size(0);
     const int num_blocks = num_tokens;
-    group_topk_kernel_gather_weights<TPB, 8, 4, 8>
+    group_topk_kernel_gather_weights<TPB, 8, 4, 8, T>
         <<<num_blocks, TPB, 0, stream>>>(
-            input_after_act.data_ptr<float>(),
-            original_scores.data_ptr<torch::BFloat16>(), route_scale,
-            weights.data_ptr<float>(), indices.data_ptr<int64_t>(), group_dim);
+            input_after_act.data_ptr<T>(), original_scores.data_ptr<T>(),
+            route_scale, weights.data_ptr<T>(), indices.data_ptr<int64_t>(),
+            group_dim);
 }
 
 void groupTopKIndices(torch::Tensor &input_after_act,
                       torch::Tensor &original_scores, float route_scale,
                       torch::Tensor &weights, torch::Tensor &indices,
                       const int num_groups) {
+    ASSERTWITH(input_after_act.scalar_type() == original_scores.scalar_type(),
+               "`groupTopKIndices` requires all floating point tensors to have "
+               "the same dtype");
+    ASSERTWITH(input_after_act.scalar_type() == weights.scalar_type(),
+               "`groupTopKIndices` requires all floating point tensors to have "
+               "the same dtype");
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input_after_act));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    groupTopKLauncher(input_after_act, original_scores, route_scale, weights,
-                      indices, num_groups, stream);
+    DISPATCH_FLOAT_TYPES(
+        input_after_act.scalar_type(), "groupTopKIndices", [&] {
+            groupTopKLauncher<scalar_t>(input_after_act, original_scores,
+                                        route_scale, weights, indices,
+                                        num_groups, stream);
+        });
 }
 
 } // namespace chitu
