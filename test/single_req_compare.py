@@ -295,3 +295,11 @@ def main(args: DictConfig):
 
 if __name__ == "__main__":
     main()
+
+    # Sometimes torch.distributed will hang during destruction if CUDA graph is enabled.
+    # As a workaround, we `exec` a dummy process to kill the current process, without
+    # returning an error.
+    logger.info("Waiting for all ranks to finish...")
+    torch.distributed.barrier()
+    # Don't exec bash because it loads startup scripts
+    os.execl("/usr/bin/echo", "Exiting")  # os.execl rejects "", so print something
