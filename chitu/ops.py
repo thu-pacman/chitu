@@ -591,17 +591,11 @@ def invoke_silu_and_mul(x):
     BLOCK_SIZE, _ = calculate_settings(n_cols // 2)
     output_shape = x.shape[:-1] + (n_cols // 2,)
     output = torch.empty(output_shape, device=x.device, dtype=x.dtype)
-    num_warps = 4
-    if BLOCK_SIZE >= 2048:
-        num_warps = 8
-    if BLOCK_SIZE >= 4096:
-        num_warps = 16
     silu_and_mul_kernel[(n_rows,)](
         output,
         x,
         output.shape[-1],
         x.shape[-1],
-        num_warps=num_warps,
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return output
@@ -650,6 +644,5 @@ def rms_norm(X: torch.Tensor, W: torch.Tensor, dim, eps):
         dim,
         eps,
         BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
     )
     return Y

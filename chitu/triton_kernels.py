@@ -16,6 +16,7 @@ __all__ = [
 import triton
 import triton.language as tl
 from triton import Config
+from chitu.device_type import is_muxi
 
 
 @triton.jit
@@ -537,6 +538,16 @@ def moe_sum_kernel(
     )
 
 
+configs = [
+    triton.Config(
+        {},
+        num_warps=num_warps,
+    )
+    for num_warps in ([4, 8] if is_muxi() else [4, 8, 16])
+]
+
+
+@triton.autotune(configs=configs, key=["output_row_stride", "x_row_stride"])
 @triton.jit
 def silu_and_mul_kernel(
     output_ptr, x_ptr, output_row_stride, x_row_stride, BLOCK_SIZE: tl.constexpr
@@ -555,6 +566,7 @@ def silu_and_mul_kernel(
     tl.store(output, result, mask=(offsets < d))
 
 
+@triton.autotune(configs=configs, key=["Y_row_stride", "X_row_stride"])
 @triton.jit
 def rms_norm_kernel(
     Y,
