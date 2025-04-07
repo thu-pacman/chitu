@@ -32,12 +32,18 @@ from chitu.tensor_parallel import (
     get_tp_size,
 )
 from chitu.utils import try_import_opt_dep
+from functools import partial
+
 
 logger = getLogger(__name__)
+
+RMSNorm_impl = partial(RMSNorm, impl="torch")
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
 if has_triton:
     from chitu.fused_moe import fused_experts
+
+    RMSNorm_impl = partial(RMSNorm, impl="triton")
 
 
 def parse_dtype(name: str) -> torch.dtype:
@@ -445,7 +451,7 @@ class AttentionDeepSeekV3(Attention):
                 dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
             )
-        self.q_norm = RMSNorm(self.q_lora_rank, impl="triton")
+        self.q_norm = RMSNorm_impl(self.q_lora_rank)
         self.wq_b = ColumnParallelLinearDeepSeekV3(
             self.q_lora_rank,
             self.n_heads * self.qk_head_dim,
@@ -454,7 +460,7 @@ class AttentionDeepSeekV3(Attention):
             bias_dtype=torch.get_default_dtype(),
             gather_output=False,
         )
-        self.kv_norm = RMSNorm(self.kv_lora_rank, impl="triton")
+        self.kv_norm = RMSNorm_impl(self.kv_lora_rank)
         self.wkv_b = ColumnParallelLinearDeepSeekV3(
             self.kv_lora_rank,
             self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -808,6 +814,35 @@ class GateDeepSeekV3(nn.Module):
             else None
         )
 
+    def is_sigmoid_bias_group_topK(self):
+        return (
+            self.score_func == "sigmoid" and self.bias is not None and self.n_groups > 1
+        )
+
+    def sigmoid_bias_group_topk_forward(self, x):
+        sample_num = x.size(0)
+        scores = F.linear(x, self.weight)
+        scores = scores.sigmoid()
+        original_scores = scores
+        # if self.bias is not None:
+        scores = scores + self.bias
+        scores = scores.view(sample_num, self.n_groups, -1)
+        kernel_indices = torch.empty(
+            (sample_num, self.topk), dtype=torch.int64, device=scores.device
+        )
+        weights = torch.empty(
+            (sample_num, self.topk), dtype=torch.float32, device=scores.device
+        )
+        chitu_backend.cuda_group_topk_gather_weights(
+            scores,
+            original_scores,
+            self.route_scale,
+            weights,
+            kernel_indices,
+            self.n_groups,
+        )
+        return weights, kernel_indices
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for the gating mechanism.
@@ -818,29 +853,33 @@ class GateDeepSeekV3(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
-        scores = F.linear(x, self.weight)
-        if self.score_func == "softmax":
-            scores = scores.softmax(dim=-1, dtype=torch.float32)
+        is_prefill = x.shape[0] > 1
+        if self.is_sigmoid_bias_group_topK() and is_prefill and is_nvidia():
+            return self.sigmoid_bias_group_topk_forward(x)
         else:
-            scores = scores.sigmoid()
-        original_scores = scores
-        if self.bias is not None:
-            scores = scores + self.bias
-        if self.n_groups > 1:
-            scores = scores.view(x.size(0), self.n_groups, -1)
-            if self.bias is None:
-                group_scores = scores.amax(dim=-1)
+            scores = F.linear(x, self.weight)
+            if self.score_func == "softmax":
+                scores = scores.softmax(dim=-1, dtype=torch.float32)
             else:
-                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
-            mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
-            scores = (scores * mask.unsqueeze(-1)).flatten(1)
-        indices = torch.topk(scores, self.topk, dim=-1)[1]
-        weights = original_scores.gather(1, indices)
-        if self.score_func == "sigmoid":
-            weights /= weights.sum(dim=-1, keepdim=True)
-        weights *= self.route_scale
-        return weights.type_as(x), indices
+                scores = scores.sigmoid()
+            original_scores = scores
+            if self.bias is not None:
+                scores = scores + self.bias
+            if self.n_groups > 1:
+                scores = scores.view(x.size(0), self.n_groups, -1)
+                if self.bias is None:
+                    group_scores = scores.amax(dim=-1)
+                else:
+                    group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+                indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+                mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
+                scores = (scores * mask.unsqueeze(-1)).flatten(1)
+            indices = torch.topk(scores, self.topk, dim=-1)[1]
+            weights = original_scores.gather(1, indices)
+            if self.score_func == "sigmoid":
+                weights /= weights.sum(dim=-1, keepdim=True)
+            weights *= self.route_scale
+            return weights.type_as(x), indices
 
 
 class MoEDeepSeekV3(nn.Module):
@@ -950,6 +989,7 @@ class MoEDeepSeekV3(nn.Module):
 
         shape = x.size()
         x = x.view(-1, self.dim)
+
         weights, indices = self.gate(x)
 
         if has_triton:
@@ -1039,14 +1079,15 @@ class MoEDeepSeekV3(nn.Module):
 
                 y += y1
             else:
+
                 indice_shape = indices.shape
-                new_indices = torch.zeros(
+                new_indices = torch.empty(
                     (indice_shape[0], indice_shape[1] + 1),
                     dtype=indices.dtype,
                     device=indices.device,
                 )
 
-                new_weights = torch.zeros(
+                new_weights = torch.empty(
                     (weights.shape[0], weights.shape[1] + 1),
                     dtype=weights.dtype,
                     device=weights.device,
@@ -1157,8 +1198,8 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                 merge_gate_up=merge_qkv_gate_up,
             )
         )
-        self.attn_norm = RMSNorm(args.dim, impl="triton")
-        self.ffn_norm = RMSNorm(args.dim, impl="triton")
+        self.attn_norm = RMSNorm_impl(args.dim)
+        self.ffn_norm = RMSNorm_impl(args.dim)
 
     def forward(
         self,
@@ -1167,6 +1208,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         freqs_cis_sin: torch.Tensor,
         varlens=None,
     ):
+
         x = x + self.attn(
             self.attn_norm(x, compute_dtype=x.dtype),
             freqs_cis_cos,
@@ -1371,7 +1413,7 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def _init_post_layers(self):
-        self.norm = RMSNorm(self.params.dim, impl="triton")
+        self.norm = RMSNorm_impl(self.params.dim)
         self.head = ColumnParallelLinear(
             self.params.dim,
             self.params.vocab_size,
