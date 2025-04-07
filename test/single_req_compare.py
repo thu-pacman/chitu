@@ -39,7 +39,7 @@ def load_result(filename="data.json"):
         return []
 
 
-def check_result(result_0_lst, result_1_lst, name_0, name_1, tol=[-1, -1]):
+def check_result(result_0_lst, result_1_lst, name_0, name_1, err=[-1, -1]):
     for result_it in range(min(len(result_0_lst), len(result_1_lst))):
         result_0 = result_0_lst[result_it]
         result_1 = result_1_lst[result_it]
@@ -51,23 +51,23 @@ def check_result(result_0_lst, result_1_lst, name_0, name_1, tol=[-1, -1]):
             logit1 = result_1["logits"][logit_it]
             for it in range(min(len(logit0), len(logit1))):
                 if logit1[it] == 0.0:
-                    tol[0] = max(tol[0], abs(logit0[it] - logit1[it]))
+                    err[0] = max(err[0], abs(logit0[it] - logit1[it]))
                 else:
                     if 0.2 < max(
                         0.0, abs(logit0[it] - logit1[it]) - 5e-2 * abs(logit1[it])
                     ):
                         print(logit0[it], " vs ", logit1[it])
-                    # tol[1] = max(
-                    #    tol[1],
+                    # err[1] = max(
+                    #    err[1],
                     #    max(0.0, abs(logit0[it] - logit1[it]) - 0.5) / abs(logit1[it]),
                     # )
-                    tol[0] = max(
-                        tol[0],
+                    err[0] = max(
+                        err[0],
                         max(0.0, abs(logit0[it] - logit1[it]) - 5e-2 * abs(logit1[it])),
                     )
             assert np.allclose(
                 logit0, logit1, atol=0.5, rtol=5e-2
-            ), f"logits difference in result {result_it}:: logit {logit_it}; atol:{tol[0]}, rtol:{tol[1]}"
+            ), f"logits difference in result {result_it}:: logit {logit_it}; aerr:{err[0]}, rerr:{err[1]}"
 
 
 # -----------utils part end--------------
@@ -124,10 +124,7 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens):
     def generate_prompt(token_length, tkn):
         while True:
             tokens = [random.randint(100, 1000) for _ in range(token_length)]
-            if (
-                len(tkn.encode(tkn.decode(tokens), bos=False, eos=False))
-                == token_length
-            ):
+            if len(tkn.encode(tkn.decode(tokens), bos=False, eos=True)) == token_length:
                 return tkn.decode(tokens)
 
     reqs = []
@@ -283,11 +280,26 @@ def main(args: DictConfig):
         now_result = run_normal(args, timers, history_result)
 
     if rank == 0:
-        tol = [0, 0]
-        check_result(now_result, history_result, "now", "history", tol)
-        print("!!!!!!!!!atol_max: ", tol[0])
-        print("!!!!!!!!!rtol_max: ", tol[1])
+        if history_result is not None:
+            err = [0, 0]
+            check_result(now_result, history_result, "now", "history", err)
+            print("!!!!!!!!!aerr_max: ", err[0])
+            print("!!!!!!!!!rerr_max: ", err[1])
+        else:
+            logger.warning(
+                "No history result to compare. This is OK for a newly added test case. "
+                "Merge this commit to `regression_test_reference` branch to update the "
+                "reference result."
+            )
 
 
 if __name__ == "__main__":
     main()
+
+    # Sometimes torch.distributed will hang during destruction if CUDA graph is enabled.
+    # As a workaround, we `exec` a dummy process to kill the current process, without
+    # returning an error.
+    logger.info("Waiting for all ranks to finish...")
+    torch.distributed.barrier()
+    # Don't exec bash because it loads startup scripts
+    os.execl("/usr/bin/echo", "Exiting")  # os.execl rejects "", so print something

@@ -6,7 +6,7 @@ We welcome contributions to the Chitu project! This document provides guidelines
 
 ## Code Style
 
-- Use `black` to format your Python code
+- Use `black` to format your Python code, and `clang-format` to format your C++/CUDA code.
 - Use descriptive variable names
 - Add docstrings for all public functions and classes
 - Keep functions focused and single-purpose

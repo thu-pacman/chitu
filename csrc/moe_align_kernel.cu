@@ -70,28 +70,30 @@ __global__ void moe_align_block_size_kernel(
     } else {
         int warp_idx = (tid - 1) / experts_per_warp;
         int expert_offset = (tid - 1) % experts_per_warp;
-        int expert_count = shared_counts[warp_idx * experts_per_warp + expert_offset];
-        shared_data[tid] = (tid <= num_experts) ? ceil_div(expert_count, block_size) : 0;
+        int expert_count =
+            shared_counts[warp_idx * experts_per_warp + expert_offset];
+        shared_data[tid] =
+            (tid <= num_experts) ? ceil_div(expert_count, block_size) : 0;
     }
     __syncthreads();
 
-    for(int stride = 1; stride < blockDim.x; stride *= 2) {
+    for (int stride = 1; stride < blockDim.x; stride *= 2) {
         int index = (tid + 1) * stride * 2 - 1;
-        if(index < 2 * blockDim.x && index - stride >= 0) {
+        if (index < 2 * blockDim.x && index - stride >= 0) {
             shared_data[index] += shared_data[index - stride];
         }
         __syncthreads();
     }
 
-    for(int stride = blockDim.x/2; stride >= 1; stride /= 2) {
+    for (int stride = blockDim.x / 2; stride >= 1; stride /= 2) {
         int index = (tid + 1) * stride * 2 - 1;
-        if(index + stride < 2 * blockDim.x) {
+        if (index + stride < 2 * blockDim.x) {
             shared_data[index + stride] += shared_data[index];
         }
         __syncthreads();
     }
 
-    if (tid <= num_experts){
+    if (tid <= num_experts) {
         cumsum[tid] = shared_data[tid] * block_size;
         if (tid == num_experts) {
             *total_tokens_post_pad = shared_data[tid] * block_size;

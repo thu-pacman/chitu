@@ -116,7 +116,7 @@ def run_pipe_or_tensor_parallelism(args, timers):
             )
             for req in reqs:
                 TaskPool.add(
-                    Task(f"{req.request_id}", req, req.message, stop_with_eos=False)
+                    Task(f"{req.request_id}", req, req.message, stop_with_eos=True)
                 )
         t_start = time.time()
         timers("overall").start()
@@ -145,7 +145,7 @@ def run_normal(args, timers):
         )
         for req in reqs:
             TaskPool.add(
-                Task(f"{req.request_id}", req, req.message, stop_with_eos=False)
+                Task(f"{req.request_id}", req, req.message, stop_with_eos=True)
             )
         t_start = time.time()
         timers("overall").start()
@@ -185,3 +185,11 @@ def main(args: DictConfig):
 
 if __name__ == "__main__":
     main()
+
+    # Sometimes torch.distributed will hang during destruction if CUDA graph is enabled.
+    # As a workaround, we `exec` a dummy process to kill the current process, without
+    # returning an error.
+    logger.info("Waiting for all ranks to finish...")
+    torch.distributed.barrier()
+    # Don't exec bash because it loads startup scripts
+    os.execl("/usr/bin/echo", "Exiting")  # os.execl rejects "", so print something
