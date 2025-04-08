@@ -5,6 +5,7 @@ ARG optional_deps='flash_attn,flash_mla,flashinfer'
 ARG build_jobs=''
 ARG enable_editable_install='false'
 ARG enable_cython='true'
+ARG enable_test='false'
 
 RUN if [ "${enable_editable_install}" != "true" ] && [ "${enable_editable_install}" != "false" ]; then \
     echo "ARG enable_editable_install must either be 'true' or 'false'"; \
@@ -14,16 +15,29 @@ RUN if [ "${enable_cython}" != "true" ] && [ "${enable_cython}" != "false" ]; th
     echo "ARG enable_cython must either be 'true' or 'false'"; \
     exit 1; \
 fi
-RUN if [ "{enable_cython}" == "true" ] && [ "${enable_editable_install}" == "true" ]; then \
+RUN if [ "{enable_cython}" = "true" ] && [ "${enable_editable_install}" = "true" ]; then \
     echo "Cython is not supported when installing in editable mode"; \
     exit 1; \
 fi
+RUN if [ "${enable_test}" != "true" ] && [ "${enable_test}" != "false" ]; then \
+    echo "ARG enable_test must either be 'true' or 'false'"; \
+    exit 1; \
+fi
+
+# Required for non-interactive apt install
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
 
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 
 RUN apt update -y \
     && apt install -y git \
     && apt install -y gcc-10 g++-10
+
+RUN if [ "${enable_test}" = "true" ]; then \
+    apt install -y expect; \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest; \
+fi
 
 WORKDIR /workspace/chitu
 COPY . .
