@@ -52,7 +52,7 @@ Chitu (赤兔) 定位于「生产级大模型推理引擎」，并且充分考�
 - 从不同batchsize的测试数据来看，同样基于Chitu引擎，使用3节点运行FP8模型的输出速度约为使用6节点运行BF16模型的75%\~90%，即单位算力的产出获得了1.5x\~1.8x的提升
 - 我们认为这是由于解码Decoding过程主要依赖于访存带宽，使用一半的GPU去访问一半的数据（FP8的权重大小是BF16的一半）不会消耗更长的时间，GPU计算能力缩减只带来较小的影响
 
-### 在 H20(96G) 集群（两机*八卡）上部署 DeepSeek-R1-671B 
+### 在 H20(96G) 集群（两机×八卡）上部署 DeepSeek-R1-671B
 
 | 输出速率 token/s|chitu 0.1.0, FP8|
 |:---|:---|
@@ -75,6 +75,12 @@ pip install -r requirements-build.txt
 pip install -U torch --index-url https://download.pytorch.org/whl/cu124 
 # TORCH_CUDA_ARCH_LIST 的值可通过 python -c "import torch; print(torch.cuda.get_device_capability())" 查看
 TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=4 pip install --no-build-isolation . 
+```
+
+### 查看支持的模型
+
+```bash
+python3 script/print_supported_models.py
 ```
 
 ### 单 GPU 推理
@@ -162,7 +168,7 @@ python benchmarks/benchmark_serving.py \
 
 Chitu 项目采用 Apache License v2.0 许可证 - 详见 [LICENSE](/LICENSE) 文件。
 
-本代码仓库还包含遵循其他开源许可证的第三方子模块。你可以在 “third_party/” 目录下找到这些子模块，该目录中包含了它们各自的许可证文件。
+本代码仓库还包含遵循其他开源许可证的第三方子模块。你可以在 `third_party/` 目录下找到这些子模块，该目录中包含了它们各自的许可证文件。
 
 ## 致谢
 
