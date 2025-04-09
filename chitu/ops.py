@@ -8,6 +8,8 @@ import triton
 import triton.language as tl
 
 from chitu.triton_kernels import *
+from chitu.device_type import is_hopper
+from chitu.utils import try_import_opt_dep
 
 
 def auto_retry_triton_compilation(fn):
@@ -484,9 +486,15 @@ def fp8_gemm_deepseek_v3(
         triton.cdiv(M, META["BLOCK_SIZE_M"]),
         triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    fp8_gemm_deepseek_v3_kernel[grid](
-        a, b, c, a_s, b_s, M, N, K, group_n=128, group_k=128
-    )
+    has_deep_gemm = False
+    if torch.get_default_dtype() == torch.bfloat16 and is_hopper() is True:
+        deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
+    if has_deep_gemm:
+        deep_gemm.gemm_fp8_fp8_bf16_nt((a, a_s), (b, b_s), c)
+    else:
+        fp8_gemm_deepseek_v3_kernel[grid](
+            a, b, c, a_s, b_s, M, N, K, group_n=128, group_k=128
+        )
     return c
 
 
@@ -554,7 +562,7 @@ def silu_and_mul_torch(x: torch.Tensor):
 def invoke_silu_and_mul(x):
     n_rows = x.nelement() // x.shape[-1]
     n_cols = x.shape[-1]
-    BLOCK_SIZE = triton.next_power_of_2(n_cols)
+    BLOCK_SIZE, _ = calculate_settings(n_cols // 2)
     output_shape = x.shape[:-1] + (n_cols // 2,)
     output = torch.empty(output_shape, device=x.device, dtype=x.dtype)
     num_warps = 4

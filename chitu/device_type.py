@@ -22,3 +22,9 @@ def is_muxi():
 
 def has_native_fp8():
     return is_nvidia() and torch.cuda.get_device_capability() >= (8, 9)
+
+
+def is_hopper():
+    HOPPER_DEVICE_PATTERNS = ["H20", "H100"]
+    device_name = get_device_name()
+    return any(pattern in device_name for pattern in HOPPER_DEVICE_PATTERNS)

@@ -140,6 +140,10 @@ setup(
             "flash_mla @ file://localhost"
             + os.path.join(setup_dir, "third_party/FlashMLA"),
         ],
+        "deep_gemm": [
+            "deep_gemm @ file://localhost"
+            + os.path.join(setup_dir, "third_party/DeepGEMM"),
+        ],
     },
     packages=find_packages(),
     ext_modules=ext_modules,
