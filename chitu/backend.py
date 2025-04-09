@@ -1,3 +1,4 @@
+from typing import Callable
 import gc
 import itertools
 import json
@@ -321,7 +322,11 @@ class Backend:
                 ), f"no checkpoint files found in {args.models.ckpt_dir}"
                 ckpt_path = checkpoints[0]
                 checkpoint = torch.load(ckpt_path, map_location="cpu")
-            elif args.models.type == "hf-llama" or args.models.type == "hf-mixtral":
+            elif (
+                args.models.type == "hf-llama"
+                or args.models.type == "hf-mixtral"
+                or args.models.type == "deepseek-v3"
+            ):
                 if args.quant == "awq":
                     params = torch.load(args.quant_ckpt_dir, map_location="cpu")
                     replace_list = [
@@ -372,8 +377,13 @@ class Backend:
                         model_path = args.models.ckpt_dir
                     else:
                         model_path = args.quant_ckpt_dir
+                    filter_key = None
+                    if args.models.type == "deepseek-v3":
+                        filter_key = lambda key: "model.layers.61" not in key
                     params = load_state_dict(
-                        model_path, skip_preprocess=args.skip_preprocess
+                        model_path,
+                        skip_preprocess=args.skip_preprocess,
+                        filter_key=filter_key,
                     )
 
                     def transform_key(key):
@@ -382,10 +392,6 @@ class Backend:
                         return key
 
                     checkpoint = dict((transform_key(k), v) for k, v in params.items())
-            elif args.models.type == "deepseek-v3":
-                checkpoint = load_state_dict_deepseek_v3(
-                    args.models.ckpt_dir, skip_preprocess=args.skip_preprocess
-                )
             else:
                 raise NotImplementedError(f"Unsupported model type {args.models.type}")
 
@@ -416,7 +422,9 @@ class Backend:
         torch.cuda.empty_cache()
 
 
-def load_state_dict(hf_ckpt_path, skip_preprocess=False):
+def load_state_dict(
+    hf_ckpt_path, *, skip_preprocess=False, filter_key: Callable[[str], bool] = None
+):
     if not skip_preprocess:
         path = os.path.join(hf_ckpt_path, "*.safetensors")
     else:
@@ -427,59 +435,7 @@ def load_state_dict(hf_ckpt_path, skip_preprocess=False):
     for file_path in tqdm(glob(path)):
         with safe_open(file_path, framework="pt", device="cpu") as f:
             for name in f.keys():
-                param: torch.Tensor = f.get_tensor(name)
-                state_dict[name] = param
-    return state_dict
-
-
-def load_state_dict_deepseek_v3(hf_ckpt_path, skip_preprocess=False):
-    torch.set_num_threads(8)
-
-    if not skip_preprocess:
-        path = os.path.join(hf_ckpt_path, "*.safetensors")
-    else:
-        rank = torch.distributed.get_rank()
-        path = os.path.join(hf_ckpt_path, f"model.rank{rank}.safetensors")
-
-    state_dict = {}
-
-    for file_path in tqdm(glob(path)):
-        with safe_open(file_path, framework="pt", device="cpu") as f:
-            for name in f.keys():
-                if "model.layers.61" in name:
-                    continue
-                param: torch.Tensor = f.get_tensor(name)
-                if not skip_preprocess:
-                    if name.startswith("model."):
-                        name = name[len("model.") :]
-                    name = name.replace("self_attn", "attn")
-                    name = name.replace("mlp", "ffn")
-                    name = name.replace("weight_scale_inv", "scale")
-                    name = name.replace("e_score_correction_bias", "bias")
-                    key = name.split(".")[-2]
-                    mapping = {
-                        "embed_tokens": ("embed", 0),
-                        "input_layernorm": ("attn_norm", None),
-                        "post_attention_layernorm": ("ffn_norm", None),
-                        "q_proj": ("wq", 0),
-                        "q_a_proj": ("wq_a", None),
-                        "q_a_layernorm": ("q_norm", None),
-                        "q_b_proj": ("wq_b", 0),
-                        "kv_a_proj_with_mqa": ("wkv_a", None),
-                        "kv_a_layernorm": ("kv_norm", None),
-                        "kv_b_proj": ("wkv_b", 0),
-                        "o_proj": ("wo", 1),
-                        "gate": ("gate", None),
-                        "gate_proj": ("w1", 0),
-                        "down_proj": ("w2", 1),
-                        "up_proj": ("w3", 0),
-                        "norm": ("norm", None),
-                        "lm_head": ("head", 0),
-                        "scale": ("scale", None),
-                    }
-                    assert key in mapping, f"Key {key} not found in mapping"
-                    new_key, dim = mapping[key]
-                    name = name.replace(key, new_key)
-                state_dict[name] = param
-
+                if filter_key is None or filter_key(name):
+                    param: torch.Tensor = f.get_tensor(name)
+                    state_dict[name] = param
     return state_dict

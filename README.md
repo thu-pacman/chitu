@@ -51,7 +51,7 @@ Chitu is a high-performance inference framework for large language models. Chitu
 
 ### Deploy DeepSeek-R1-671B on the H20 (96G) cluster
 
-#### Running on 2 nodes each with 8*H20 
+#### Running on 2 nodes each with 8×H20
 
 | Output token/s|chitu 0.1.0, FP8|
 |:---|:---|
@@ -72,6 +72,12 @@ git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
 pip install -r requirements-build.txt
 pip install -U torch --index-url https://download.pytorch.org/whl/cu124  # Change according to your CUDA version
 TORCH_CUDA_ARCH_LIST=8.6 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation . # Change `8.6` to your desired CUDA arch list.
+```
+
+### List Supported Models
+
+```bash
+python3 script/print_supported_models.py
 ```
 
 ### Single GPU Inference
@@ -160,8 +166,8 @@ QR Code:
 
 The Chitu Project is under the Apache License v2.0. - see the [LICENSE](LICENSE) file for details.
 
-This repository also contains third_party submodules under other open source
-licenses. You can find these submodules under third_party/ directory, which
+This repository also contains third party submodules under other open source
+licenses. You can find these submodules under `third_party/` directory, which
 contains their own license files.
 
 
@@ -172,4 +178,4 @@ We learned a lot from the following projects and adapted some functions when bui
 - [SGLang](https://github.com/sgl-project/sglang)
 - [DeepSeek](https://github.com/deepseek-ai)
 
-Special thanks to our partners (Partners listed in no particular order): 中国电信、华为、沐曦、燧原、 etc.
+Special thanks to our partners (Partners listed in no particular order): 中国电信、华为、沐曦、燧原, etc.

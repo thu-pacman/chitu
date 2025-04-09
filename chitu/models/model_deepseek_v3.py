@@ -1372,6 +1372,54 @@ class TransformerDeepSeekV3(Transformer):
         return new_checkpoint
 
     @override
+    def load_state_dict_parallel(
+        self,
+        state_dict: Mapping[str, Any],
+        skip_preprocess: bool = False,
+        *args,
+        **kwargs,
+    ):
+        if not skip_preprocess:
+
+            new_state_dict = {}
+            for k in state_dict.keys():
+                name = k
+                name = name.replace("self_attn", "attn")
+                name = name.replace("mlp", "ffn")
+                name = name.replace("weight_scale_inv", "scale")
+                name = name.replace("e_score_correction_bias", "bias")
+                key = name.split(".")[-2]
+                mapping = {
+                    "embed_tokens": ("embed", 0),
+                    "input_layernorm": ("attn_norm", None),
+                    "post_attention_layernorm": ("ffn_norm", None),
+                    "q_proj": ("wq", 0),
+                    "q_a_proj": ("wq_a", None),
+                    "q_a_layernorm": ("q_norm", None),
+                    "q_b_proj": ("wq_b", 0),
+                    "kv_a_proj_with_mqa": ("wkv_a", None),
+                    "kv_a_layernorm": ("kv_norm", None),
+                    "kv_b_proj": ("wkv_b", 0),
+                    "o_proj": ("wo", 1),
+                    "gate": ("gate", None),
+                    "gate_proj": ("w1", 0),
+                    "down_proj": ("w2", 1),
+                    "up_proj": ("w3", 0),
+                    "norm": ("norm", None),
+                    "lm_head": ("head", 0),
+                    "scale": ("scale", None),
+                }
+                assert key in mapping, f"Key {key} not found in mapping"
+                new_key, dim = mapping[key]
+                name = name.replace(key, new_key)
+                new_state_dict[name] = state_dict[k]
+            state_dict = new_state_dict
+
+        super().load_state_dict_parallel(
+            state_dict, skip_preprocess=skip_preprocess, *args, **kwargs
+        )
+
+    @override
     def load_state_dict(
         self,
         state_dict: Mapping[str, Any],

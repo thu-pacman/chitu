@@ -20,7 +20,7 @@ RUN if [ "${enable_cython}" != "true" ] && [ "${enable_cython}" != "false" ]; th
     echo "ARG enable_cython must either be 'true' or 'false'"; \
     exit 1; \
 fi
-RUN if [ "{enable_cython}" == "true" ] && [ "${enable_editable_install}" == "true" ]; then \
+RUN if [ "{enable_cython}" = "true" ] && [ "${enable_editable_install}" = "true" ]; then \
     echo "Cython is not supported when installing in editable mode"; \
     exit 1; \
 fi
