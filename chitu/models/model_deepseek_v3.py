@@ -9,6 +9,7 @@ from torch import nn
 from typing_extensions import override
 
 import chitu_backend
+from chitu.layers.gate import fused_sigmoid_gate
 from chitu.attn_backend import AttnBackend
 from chitu.cache_manager import PagedKVCacheManager
 from chitu.device_type import get_device_name, is_muxi, is_nvidia
@@ -32,6 +33,7 @@ from chitu.tensor_parallel import (
     get_tp_rank,
     get_tp_size,
 )
+
 from chitu.utils import try_import_opt_dep
 from functools import partial
 
@@ -838,34 +840,8 @@ class GateDeepSeekV3(nn.Module):
             else None
         )
 
-    def is_sigmoid_bias_group_topK(self):
-        return (
-            self.score_func == "sigmoid" and self.bias is not None and self.n_groups > 1
-        )
-
-    def sigmoid_bias_group_topk_forward(self, x):
-        sample_num = x.size(0)
-        scores = F.linear(x, self.weight)
-        scores = scores.sigmoid()
-        original_scores = scores
-        # if self.bias is not None:
-        scores = scores + self.bias
-        scores = scores.view(sample_num, self.n_groups, -1)
-        kernel_indices = torch.empty(
-            (sample_num, self.topk), dtype=torch.int64, device=scores.device
-        )
-        weights = torch.empty(
-            (sample_num, self.topk), dtype=x.dtype, device=scores.device
-        )
-        chitu_backend.cuda_group_topk_gather_weights(
-            scores,
-            original_scores,
-            self.route_scale,
-            weights,
-            kernel_indices,
-            self.n_groups,
-        )
-        return weights, kernel_indices
+    def is_fused_sigmoid_gate(self):
+        return self.score_func == "sigmoid" and self.n_groups > 1
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -877,11 +853,12 @@ class GateDeepSeekV3(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
-        is_prefill = x.shape[0] > 1
-        if self.is_sigmoid_bias_group_topK() and is_prefill and is_nvidia():
-            return self.sigmoid_bias_group_topk_forward(x)
+        scores = F.linear(x, self.weight)
+        if self.is_fused_sigmoid_gate() and is_nvidia():
+            indices, weights = fused_sigmoid_gate(
+                scores, self.topk, self.n_groups, self.topk_groups, self.bias
+            )
         else:
-            scores = F.linear(x, self.weight)
             if self.score_func == "softmax":
                 scores = scores.softmax(dim=-1, dtype=torch.float32)
             else:
@@ -900,10 +877,11 @@ class GateDeepSeekV3(nn.Module):
                 scores = (scores * mask.unsqueeze(-1)).flatten(1)
             indices = torch.topk(scores, self.topk, dim=-1)[1]
             weights = original_scores.gather(1, indices)
-            if self.score_func == "sigmoid":
-                weights /= weights.sum(dim=-1, keepdim=True)
-            weights *= self.route_scale
-            return weights.type_as(x), indices
+
+        if self.score_func == "sigmoid":
+            weights /= weights.sum(dim=-1, keepdim=True)
+        weights *= self.route_scale
+        return weights.type_as(x), indices.to(torch.int32)
 
 
 class MoEDeepSeekV3(nn.Module):

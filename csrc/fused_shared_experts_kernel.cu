@@ -10,8 +10,8 @@ namespace chitu {
 
 template <typename floatT>
 __global__ void addSharedExpertsKernel(floatT *topk_weights_new,
-                                       long *topk_indices_new,
-                                       floatT *topk_weights, long *topk_indices,
+                                       int *topk_indices_new,
+                                       floatT *topk_weights, int *topk_indices,
                                        const int num_routed_experts,
                                        const int num_shared_experts,
                                        const int topk, const int num_token) {
@@ -51,10 +51,9 @@ void addSharedExpertsLauncher(torch::Tensor &topk_weights_new,
         topk_weights.scalar_type(), "addSharedExpertsKernel", [&] {
             addSharedExpertsKernel<<<gridNum, BLOCK_SIZE, 0, stream>>>(
                 topk_weights_new.data_ptr<scalar_t>(),
-                topk_indices_new.data_ptr<long>(),
-                topk_weights.data_ptr<scalar_t>(),
-                topk_indices.data_ptr<long>(), num_routed_experts,
-                num_shared_experts, topk, num_tokens);
+                topk_indices_new.data_ptr<int>(),
+                topk_weights.data_ptr<scalar_t>(), topk_indices.data_ptr<int>(),
+                num_routed_experts, num_shared_experts, topk, num_tokens);
         });
 }
 
