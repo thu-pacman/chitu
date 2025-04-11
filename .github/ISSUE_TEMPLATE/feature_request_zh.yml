@@ -1,0 +1,43 @@
+name: 功能需求
+description: 提交您希望赤兔增加的新功能
+title: "[Bug]: 您的标题"
+labels: ["feature request"]
+assignees:
+  - 
+body:
+  - type: markdown
+    attributes:
+      value: |
+        在提交问题以前，请确认该问题在没有在[issues](https://github.com/thu-pacman/chitu/issues)中被提出过。感谢您的贡献！
+  - type: input
+    id: contact
+    attributes:
+      label: 您的联系方式
+      description: 若我们需要确认更多的信息，如何联系您？
+      placeholder: eg.email@example.com
+    validations:
+      required: false
+  - type: textarea
+    id: feature-description
+    attributes:
+      label: 功能描述，动机以及背景
+      description: 清楚准确的您需求的功能，您为什么需要这项功能，以及该功能与哪一方面的问题有关。
+      placeholder: Tell us what you see!
+      value: "此处输入功能描述"
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 类似产品
+      description: 若有其他产品有类似功能，请提供相关信息。
+      placeholder: your environment!
+      value: "若有，请输入"
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: 提交前请确认
+      description: 提交报告以前，请搜索[issues](https://github.com/thu-pacman/chitu/issues)，确认该问题未提出过。
+      options:
+        - label: 确认
+          required: true

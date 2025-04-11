@@ -1,0 +1,61 @@
+name: 漏洞报告
+description: 漏洞报告模版.
+title: "[Bug]: 您的标题"
+labels: ["bug"]
+assignees:
+  - 
+body:
+  - type: markdown
+    attributes:
+      value: |
+        在提交问题以前，请确认该问题在没有在[issues](https://github.com/thu-pacman/chitu/issues)中被提出过。感谢您的贡献！
+  - type: input
+    id: contact
+    attributes:
+      label: 您的联系方式
+      description: 若我们需要确认更多的信息，如何联系您？
+      placeholder: eg.email@example.com
+    validations:
+      required: false
+  - type: textarea
+    id: what-happend
+    attributes:
+      label: 漏洞描述
+      description: 清楚准确的描述漏洞信息，如何复现以及您期望的效果。
+      placeholder: Tell us what you see!
+      value: "漏洞信息，如何复现以及期望效果"
+    validations:
+      required: true
+  - type: textarea
+    id: enviroment
+    attributes:
+      label: 运行环境
+      description: 系统运行环境：conda环境，pip环境，显卡和驱动信息。
+      placeholder: your environment!
+      value: "此处输入系统运行的conda环境，pip环境，显卡和驱动信息"
+  - type: dropdown
+    id: version
+    attributes:
+      label: 版本信息
+      description: 您运行的版本是?
+      options:
+        - 0.1.2 (Default)
+        - 0.1.1
+        - 0.1.0
+      default: 0
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 系统日志
+      description: 请在此处粘贴系统运行时的日志。
+      render: shell
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: 提交前请确认
+      description: 提交报告以前，请搜索[issues](https://github.com/thu-pacman/chitu/issues)，确认该问题未提出过。
+      options:
+        - label: 确认
+          required: true
