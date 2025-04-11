@@ -655,7 +655,10 @@ class TransformerHFLlama(Transformer):
     def _init_post_layers(self):
         self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps)
         self.lm_head = ColumnParallelLinear(
-            self.params.dim, self.params.vocab_size, has_bias=False
+            self.params.dim,
+            self.params.vocab_size,
+            has_bias=False,
+            disable_quantization=True,
         )
 
     def _pre_layers(self, h):

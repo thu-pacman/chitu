@@ -9,6 +9,8 @@ __all__ = [
 ]
 
 import torch
+from typing import Optional, Dict, Any
+from chitu.global_vars import get_global_args
 
 tp_comm_group = None
 
@@ -49,6 +51,7 @@ class ColumnParallelLinear(torch.nn.Module):
         dtype=None,
         bias_dtype=None,
         linear_op=torch.nn.functional.linear,
+        disable_quantization=False,
     ):
         """
         Ouput-dimension-parallelized linaer layer
@@ -61,6 +64,7 @@ class ColumnParallelLinear(torch.nn.Module):
             dtype: The desired data type of the parameters.
             bias_dtype: The desired data type of the bias. Defaults to `dtype`.
             linear_op: The linear operation to use. Defaults to `torch.nn.functional.linear`.
+            disable_quantization: disable quantization operation
         """
 
         super().__init__()
@@ -78,19 +82,59 @@ class ColumnParallelLinear(torch.nn.Module):
 
         self.gather_output = gather_output
         self.linear_op = linear_op
+        self.local_out_features = out_features // self.tp_size
 
-        self.weight = torch.nn.Parameter(
-            torch.empty(out_features // self.tp_size, in_features, dtype=dtype)
-        )
-        if has_bias:
-            self.bias = torch.nn.Parameter(
-                torch.empty(out_features // self.tp_size, dtype=bias_dtype or dtype)
+        args = get_global_args()
+        quant_method = None if disable_quantization else args.quant
+        self.is_quantized = quant_method is not None and quant_method != "gguf"
+        if self.is_quantized:
+            from chitu.quantization import QuantizationRegistry
+
+            self.quant_linear_class = QuantizationRegistry.get_quantized_linear_class(
+                quant_method
+            )
+            assert (
+                self.quant_linear_class != None
+            ), f"quant method {quant_method} not support"
+
+            # Create quantized inner module
+            self.quant_linear_class.create_from_linear_spec(
+                self,
+                in_features=in_features,
+                out_features=self.local_out_features,
+                bias=has_bias,
+                weight_dtype=dtype,
             )
         else:
-            self.bias = None
+            self.weight = torch.nn.Parameter(
+                torch.empty(self.local_out_features, in_features, dtype=dtype)
+            )
+            if has_bias:
+                self.bias = torch.nn.Parameter(
+                    torch.empty(self.local_out_features, dtype=bias_dtype or dtype)
+                )
+            else:
+                self.bias = None
+
+    def _apply(self, fn):
+        if self.is_quantized:
+
+            def callback(t):
+                return self.quant_linear_class._apply_callback(self, fn, t)
+
+            super()._apply(callback)
+        else:
+            super()._apply(fn)
+        return self
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.linear_op(x, self.weight, self.bias)
+        # Apply linear transformation
+        if self.is_quantized:
+            y = self.quant_linear_class.forward(self, x)
+        else:
+            # Use standard parameters
+            y = self.linear_op(x, self.weight, self.bias)
+
         if self.gather_output and self.tp_size > 1:
             y_transposed = y.permute(-1, *range(y.dim() - 1)).contiguous()
             shape = list(y_transposed.shape)
@@ -144,28 +188,76 @@ class RowParallelLinear(torch.nn.Module):
         self.input_is_parallel = input_is_parallel
         self.linear_op = linear_op
 
-        self.weight = torch.nn.Parameter(
-            torch.empty(out_features, in_features // self.tp_size, dtype=dtype)
-        )
-        if has_bias:
-            self.bias = torch.nn.Parameter(
-                torch.empty(out_features, dtype=bias_dtype or dtype)
+        # Adjusted dimensions for tensor parallelism
+        self.local_in_features = in_features // self.tp_size
+
+        # Handle quantization
+        args = get_global_args()
+        quant_method = args.quant
+        self.is_quantized = quant_method is not None and quant_method != "gguf"
+
+        if self.is_quantized:
+            # Import here to avoid circular imports
+            from chitu.quantization import QuantizationRegistry
+
+            self.quant_linear_class = QuantizationRegistry.get_quantized_linear_class(
+                quant_method
+            )
+            assert (
+                self.quant_linear_class != None
+            ), f"quant method {quant_method} not support"
+
+            # Create quantized inner module
+            self.quant_linear_class.create_from_linear_spec(
+                self,
+                in_features=self.local_in_features,
+                out_features=out_features,
+                bias=has_bias,
+                weight_dtype=dtype,
             )
         else:
-            self.bias = None
+            self.weight = torch.nn.Parameter(
+                torch.empty(out_features, self.local_in_features, dtype=dtype)
+            )
+            if has_bias:
+                self.bias = torch.nn.Parameter(
+                    torch.empty(out_features, dtype=bias_dtype or dtype)
+                )
+            else:
+                self.bias = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _apply(self, fn):
+        if self.is_quantized:
+
+            def callback(t):
+                return self.quant_linear_class._apply_callback(self, fn, t)
+
+            super()._apply(callback)
+        else:
+            super()._apply(fn)
+        return self
+
+    def forward(self, x: torch.Tensor, dst=-1) -> torch.Tensor:
         if not self.input_is_parallel and self.tp_size > 1:
             shape = list(x.shape)
             this_rank_dim = shape[-1] // self.tp_size
             shape[-1] = self.tp_size
             shape.append(this_rank_dim)
             x = x.view(shape).select(-2, self.rank)
-        if self.tp_size > 1:
-            y = self.linear_op(x, self.weight, self.bias if self.rank == 0 else None)
-            torch.distributed.all_reduce(y, group=self.tp_group)
+
+        self.bias = self.bias if (self.rank == 0 or self.tp_size == 1) else None
+
+        if self.is_quantized:
+            y = self.quant_linear_class.forward(self, x)
         else:
             y = self.linear_op(x, self.weight, self.bias)
+
+        if self.tp_size > 1:
+            if dst == -1:
+                torch.distributed.all_reduce(y, group=self.tp_group)
+            else:
+                torch.distributed.reduce(y, dst=dst, op=torch.distributed.ReduceOp.SUM)
+
         return y
 
 
