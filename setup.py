@@ -110,15 +110,13 @@ setup(
         "quant": [
             "optimum",
             "bitsandbytes",
-            "EETQ @ file://localhost" + os.path.join(setup_dir, "third_party/EETQ"),
-            "awq_inference_engine @ file://localhost"
-            + os.path.join(setup_dir, "third_party/llm-awq/awq/kernels"),
-            "auto_gptq @ file://localhost"
-            + os.path.join(setup_dir, "third_party/AutoGPTQ"),
+            "auto_gptq",
             "w8a8gemm @ file://localhost"
             + os.path.join(setup_dir, "third_party/nv_w8a8_kernels/w8a8gemm"),
             "w8a8gemv @ file://localhost"
             + os.path.join(setup_dir, "third_party/nv_w8a8_kernels/w8a8gemv"),
+            "autoawq-kernels==0.0.8",
+            "autoawq[kernels]",
         ],
         "muxi_layout_kernels": [
             "muxi_layout_kernels @ file://localhost"
