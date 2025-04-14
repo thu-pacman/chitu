@@ -250,9 +250,7 @@ class Backend:
                 **kv_cache_kvargs,
             )
         elif args.infer.cache_type == "paged":
-            block_size = (
-                64 if args.infer.mla_absorb == "absorb-without-precomp" else 256
-            )
+            block_size = 64 if args.infer.mla_absorb != "none" else 256
             return PagedKVCacheManager(
                 local_begin_layer_id,
                 local_end_layer_id,
