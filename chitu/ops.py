@@ -458,6 +458,32 @@ def weight_dequant_soft_fp8_deepseek_v3(
     return y
 
 
+def weight_quant_deepseek_v3(
+    w: torch.Tensor, block_size: int = 128
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    row, col = w.shape
+    assert row % block_size == 0
+    assert col % block_size == 0
+    w_block_at_last = (
+        w.view(row // block_size, block_size, col // block_size, block_size)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(-1, block_size * block_size)
+    ).to(torch.float32)
+    s = torch.amax(torch.abs(w_block_at_last), dim=-1, keepdim=True)
+    w_block_at_last = (w_block_at_last / s).to(torch.float8_e4m3fn)
+    w = (
+        w_block_at_last.view(
+            row // block_size, col // block_size, block_size, block_size
+        )
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(row, col)
+    )
+    s = s.view(row // block_size, col // block_size)
+    return w, s
+
+
 @auto_retry_triton_compilation
 def fp8_gemm_deepseek_v3(
     a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor, b_s: torch.Tensor
