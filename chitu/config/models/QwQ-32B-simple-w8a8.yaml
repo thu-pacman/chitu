@@ -1,0 +1,13 @@
+# QwQ-32B-simple-w8a8 is a quantization of QwQ-32B
+defaults:
+  - QwQ-32B
+  - _self_ # Config in this file overrides configs in defaults
+
+# Access info
+name: QwQ-32B-simple-w8a8
+source: "(This is an interal quantized model, only for testing purpose)" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+
+# Overrides
+quant: simple_w8a8

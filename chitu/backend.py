@@ -393,7 +393,7 @@ class Backend:
         if args.models.type == "llama":
             merge_qkv_gate_up = False  # Not yet supported
 
-        if args.quant is not None:
+        if hasattr(args.models, "quant") and args.models.quant is not None:
             # Merge weights for offline-scaled quantized models is non-trivial, because we can
             # only merge weights but NOT the scales on input dimensions, and this will break the
             # assumption of the fused quantized kernels. So we only merge weights for supported
@@ -413,7 +413,7 @@ class Backend:
         )
 
         # Handle model precision
-        if args.quant in [
+        if hasattr(args.models, "quant") and args.models.quant in [
             "awq",
             "llmint8",
             "gptq",
@@ -475,7 +475,7 @@ class Backend:
         """
         trust_remote_code = args.models.name.startswith("glm-4")
 
-        if args.quant == "awq":
+        if hasattr(args.models, "quant") and args.models.quant == "awq":
             params = torch.load(args.models.ckpt_dir, map_location="cpu")
             replace_list = [
                 ("model.", ""),
@@ -488,7 +488,7 @@ class Backend:
                 return s
 
             checkpoint = dict((rep(k), v) for k, v in params.items())
-        elif args.quant == "gptq":
+        elif hasattr(args.models, "quant") and args.models.quant == "gptq":
             params = AutoModelForCausalLM.from_pretrained(
                 args.models.ckpt_dir,
                 torch_dtype="auto",
@@ -502,7 +502,7 @@ class Backend:
                 return key
 
             checkpoint = dict((transform_key(k), v) for k, v in params.items())
-        elif args.quant == "w8a16":
+        elif hasattr(args.models, "quant") and args.models.quant == "w8a16":
             params = torch.load(
                 args.models.ckpt_dir + "/pytorch_model.bin", map_location="cpu"
             )
