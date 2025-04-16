@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 import aiohttp
 import asyncio
 
+import pkg_resources
+
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
 
@@ -273,7 +275,7 @@ class BenchmarkServing:
                         "model_name": r.config.model_name,
                         "batch_size": r.config.batch_size,
                         "sequence_length": r.config.sequence_length,
-                        "device": r.config.device,
+                        # "device": r.config.device,
                     },
                 }
             )
@@ -544,6 +546,15 @@ def process_one_metric(
         result[f"p{p_word}_{metric_attribute_name}_ms"] = value
 
 
+def save_dict_result(result: dict, output_dir: str):
+    """Save dict benchmark results to JSON file."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    output_file = os.path.join(output_dir, "benchmark_results.json")
+    with open(output_file, "w") as f:
+        json.dump(result, f, indent=2)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run Chitu performance benchmarks")
     parser.add_argument("--model", required=True, help="Model name")
@@ -622,7 +633,19 @@ def main():
             )
         )
 
+        codebase = {
+            "name": "chitu",
+            "version": pkg_resources.get_distribution("chitu").version,
+        }
+
+        model = {"name": config.model_name}
+
         result = {
+            "env": [
+                torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())
+            ],
+            "codebase": codebase,
+            "model": model,
             "duration": total_time,
             "completed": metrics.completed,
             "total_input_tokens": metrics.total_input,
@@ -675,7 +698,11 @@ def main():
 
         print("=" * 50)
 
-    # return result
+        if args.output_dir:
+            save_dict_result(result, args.output_dir)
+            print(
+                f"\nDetailed results saved to {args.output_dir}/benchmark_results.json"
+            )
 
 
 if __name__ == "__main__":

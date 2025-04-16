@@ -17,9 +17,9 @@ void add_shared_experts(torch::Tensor &topk_weights_new,
                         torch::Tensor &topk_indices, int64_t num_routed_experts,
                         int64_t num_shared_experts);
 
-void groupTopKIndices(torch::Tensor &input_after_act,
-                      torch::Tensor &original_scores, float route_scale,
-                      torch::Tensor &weights, torch::Tensor &indices,
-                      const int num_groups);
+void route_gate(torch::Tensor &linear_output, int score_fun, int batchSize,
+                int n_groups, int topK_groups, torch::Tensor &expertsIds,
+                torch::Tensor &selectedExpertsWeights, int topK,
+                c10::optional<torch::Tensor> bias = c10::nullopt);
 
 } // namespace chitu

@@ -85,7 +85,11 @@ class ColumnParallelLinear(torch.nn.Module):
         self.local_out_features = out_features // self.tp_size
 
         args = get_global_args()
-        quant_method = None if disable_quantization else args.quant
+        quant_method = (
+            None
+            if disable_quantization or not hasattr(args.models, "quant")
+            else args.models.quant
+        )
         self.is_quantized = quant_method is not None and quant_method != "gguf"
         if self.is_quantized:
             from chitu.quantization import QuantizationRegistry
@@ -193,7 +197,7 @@ class RowParallelLinear(torch.nn.Module):
 
         # Handle quantization
         args = get_global_args()
-        quant_method = args.quant
+        quant_method = args.models.quant if hasattr(args.models, "quant") else None
         self.is_quantized = quant_method is not None and quant_method != "gguf"
 
         if self.is_quantized:
