@@ -1,0 +1,10 @@
+# DeepSeek-R1-Distill-Llama-70B is a finetune of Llama-3.3-70B-Instruct
+defaults:
+  - Llama-3.3-70B-Instruct
+  - _self_ # Config in this file overrides configs in defaults
+
+# Access info
+name: DeepSeek-R1-Distill-Llama-70B
+source: "https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-70B" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.

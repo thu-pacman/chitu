@@ -22,7 +22,7 @@ import chitu_backend
 from chitu.device_type import is_muxi, is_nvidia, get_device_name
 
 from chitu.triton_kernels import moe_sum_kernel
-from chitu.ops import silu_and_mul
+from chitu.ops import silu_and_mul, to_triton_dtype
 
 
 def moe_sum(input_tensor, output_tensor, config: Dict[str, Any]):
@@ -1196,14 +1196,7 @@ def fused_experts_impl(
         dtype=hidden_states.dtype,
     )
 
-    if hidden_states.dtype == torch.bfloat16:
-        compute_type = tl.bfloat16
-    elif hidden_states.dtype == torch.float16:
-        compute_type = tl.float16
-    elif hidden_states.dtype == torch.float32:
-        compute_type = tl.float32
-    else:
-        raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
+    compute_type = to_triton_dtype(hidden_states.dtype)
 
     if inplace:
         out_hidden_states = hidden_states
