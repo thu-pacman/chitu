@@ -22,6 +22,7 @@ from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
 from chitu.utils import VarLens, compute_layer_dist_in_pipe, is_layer
 from chitu.cuda_graph import make_dispatched_graphed_callables
 from chitu.device_type import is_muxi, get_device_name
+from chitu.utils import try_import_opt_dep
 
 logger = getLogger(__name__)
 
@@ -35,14 +36,26 @@ class RMSNorm(nn.Module):
         eps (float): Epsilon value for numerical stability. Defaults to 1e-6.
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6, impl: str = "torch"):
+    def __init__(self, dim: int, eps: float = 1e-6, impl: str = "auto"):
         super().__init__()
+
+        if impl == "auto":
+            triton, has_triton = try_import_opt_dep("triton", "triton")
+            if has_tbsgemm and get_global_args().dtype == "float16" and eps == 1e-6:
+                impl = "muxi_w8a8_kernels"
+            elif has_triton:
+                impl = "triton"
+            elif hasattr(F, "rms_norm"):
+                impl = "torch"
+            else:
+                impl = "ref"
+
         self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
         self.impl = impl
 
-    def _naive_norm(self, x, compute_dtype):
+    def _ref_norm(self, x, compute_dtype):
         dtype = x.dtype
         x = x.to(compute_dtype)
         y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -64,24 +77,24 @@ class RMSNorm(nn.Module):
         # pass float16 tensors to it, our CI shows it does not work for some models, especially GPTQ
         # quantized models. Maybe we should make the dtype optional.
 
-        if has_tbsgemm and x.dtype == torch.float16:
-            output = tbsgemm.norm(x, self.weight)
-            return output
+        if compute_dtype is None:
+            compute_dtype = torch.float32
+
+        if self.impl == "triton":
+            return rms_norm(x, self.weight, self.eps, compute_dtype=compute_dtype)
+        elif self.impl == "muxi_w8a8_kernels":
+            assert self.eps == 1e-6
+            assert x.dtype == torch.float16
+            return tbsgemm.norm(x, self.weight)
+        elif self.impl == "torch":
+            dtype = x.dtype
+            return F.rms_norm(
+                x.to(compute_dtype), (self.dim,), self.weight, self.eps
+            ).to(dtype)
+        elif self.impl == "ref":
+            return self._ref_norm(x, compute_dtype)
         else:
-            if compute_dtype is None:
-                compute_dtype = torch.float32
-            if self.impl == "triton":
-                return rms_norm(x.to(compute_dtype), self.weight, self.dim, self.eps)
-            elif self.impl == "torch":
-                if hasattr(F, "rms_norm"):
-                    dtype = x.dtype
-                    return F.rms_norm(
-                        x.to(compute_dtype), (self.dim,), self.weight, self.eps
-                    ).to(dtype)
-                else:
-                    return self._naive_norm(x, compute_dtype)
-            else:
-                raise ValueError(f"Invalid implementation: {self.impl}")
+            raise ValueError(f"Invalid RMSNorm implementation: {self.impl}")
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device=None):

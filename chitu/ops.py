@@ -12,6 +12,17 @@ from chitu.device_type import is_hopper
 from chitu.utils import try_import_opt_dep
 
 
+def to_triton_dtype(dtype: torch.dtype):
+    if dtype == torch.float16:
+        return tl.float16
+    elif dtype == torch.bfloat16:
+        return tl.bfloat16
+    elif dtype == torch.float32:
+        return tl.float32
+    else:
+        raise NotImplementedError(f"Unsupported dtype: {dtype}")
+
+
 def auto_retry_triton_compilation(fn):
     """
     Avoid file confict introduced by Triton compiler.
@@ -55,19 +66,20 @@ def auto_retry_triton_compilation(fn):
 
 @auto_retry_triton_compilation
 def append_to_paged_kv_cache(
-    kv_cache,  # (num_pages, page_size, other dims...)
+    kv_cache,  # (num_pages, page_size, other contiguous dims...)
     page_table,  # (batch_size, num_pages_per_sample)
-    this_kv,  # (batch_size, other dims...)
+    this_kv,  # (batch_size, other contiguous dims...)
     old_seq_lens,  # (batch_size,)
 ):
     """
     for i in range(cache_seqlens.shape[0]):
-        kv_cache[block_table[i][cache_seqlens[i] // 64]][cache_seqlens[i] % 64] = kv[i]
+        kv_cache[block_table[i][cache_seqlens[i] // page_size]][cache_seqlens[i] % page_size] = kv[i]
     """
 
-    assert kv_cache.is_contiguous()
+    kv_cache = kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], -1)
+    this_kv = this_kv.view(this_kv.shape[0], -1)
+
     assert page_table.is_contiguous()
-    assert this_kv.is_contiguous()
     assert old_seq_lens.is_contiguous()
 
     page_size = kv_cache.shape[1]
@@ -93,6 +105,9 @@ def append_to_paged_kv_cache(
         BATCH_SIZE=batch_size,
         NUM_PAGES_PER_SAMPLE=num_pages_per_sample,
         TOT_LEN_OF_OTHER_DIMS=tot_len_of_other_dims,
+        KV_CACHE_STRIDE0=kv_cache.stride(0),
+        KV_CACHE_STRIDE1=kv_cache.stride(1),
+        THIS_KV_STRIDE0=this_kv.stride(0),
         BLOCK_SIZE=block_size,
     )
 
@@ -127,17 +142,24 @@ def reshape_rotary_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
 
 
 @auto_retry_triton_compilation
-def apply_rotary_pos_emb_triton(q, k, cos, sin, rotary_type="hf-llama", block_size=128):
+def apply_rotary_pos_emb_triton(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rotary_type: str = "hf-llama",
+    block_size=128,
+):
+    # Prepare output tensor
+    q_out = torch.empty_like(q)
+    k_out = torch.empty_like(k)
+
     if rotary_type == "hf-llama":
         # "hf-llama" has an [real, real, ..., real, imag, imag, ..., imag] layout.
 
         # Get tensor shapes
         q_batch_size, q_n_local_heads, q_head_dim = q.shape
         k_batch_size, k_n_local_heads, k_head_dim = k.shape
-
-        # Prepare output tensor
-        q_output = torch.empty_like(q)
-        k_output = torch.empty_like(k)
 
         # Define grid size
         q_grid = (q_batch_size * q_n_local_heads, q_head_dim // block_size)
@@ -148,38 +170,38 @@ def apply_rotary_pos_emb_triton(q, k, cos, sin, rotary_type="hf-llama", block_si
         assert k.is_contiguous()
         assert cos.is_contiguous()
         assert sin.is_contiguous()
-        assert q_output.is_contiguous()
-        assert k_output.is_contiguous()
+        assert q_out.is_contiguous()
+        assert k_out.is_contiguous()
         rotary_embedding_kernel_hf_llama[q_grid](
             q,
             cos,
             sin,
-            q_output,
+            q_out,
             q_n_local_heads,
             q.stride(0),
             q.stride(1),
             cos.stride(0),
             sin.stride(0),
-            q_output.stride(0),
-            q_output.stride(1),
+            q_out.stride(0),
+            q_out.stride(1),
             BLOCK_SIZE=block_size,
         )
         rotary_embedding_kernel_hf_llama[k_grid](
             k,
             cos,
             sin,
-            k_output,
+            k_out,
             k_n_local_heads,
             k.stride(0),
             k.stride(1),
             cos.stride(0),
             sin.stride(0),
-            k_output.stride(0),
-            k_output.stride(1),
+            k_out.stride(0),
+            k_out.stride(1),
             BLOCK_SIZE=block_size,
         )
 
-        return q_output, k_output
+        return q_out, k_out
 
     elif rotary_type == "llama":
         # "llama" has an [real, imag, real, imag, ..., real, imag] layout.
@@ -188,19 +210,23 @@ def apply_rotary_pos_emb_triton(q, k, cos, sin, rotary_type="hf-llama", block_si
         k_shape = k.shape
 
         if q.dim() == 4:
-            q = q.view(-1, q.shape[-2], q.shape[-1])
+            q = q.view(-1, q_shape[-2], q_shape[-1])
+            q_out = q_out.view(-1, q_shape[-2], q_shape[-1])
         elif q.dim() == 3:
             pass
         elif q.dim() == 2:
-            q = q.view(-1, 1, q.shape[-1])
+            q = q.view(-1, 1, q_shape[-1])
+            q_out = q_out.view(-1, 1, q_shape[-1])
         else:
             assert False
         if k.dim() == 4:
-            k = k.view(-1, k.shape[-2], k.shape[-1])
+            k = k.view(-1, k_shape[-2], k_shape[-1])
+            k_out = k_out.view(-1, k_shape[-2], k_shape[-1])
         elif k.dim() == 3:
             pass
         elif k.dim() == 2:
-            k = k.view(-1, 1, k.shape[-1])
+            k = k.view(-1, 1, k_shape[-1])
+            k_out = k_out.view(-1, 1, k_shape[-1])
         else:
             assert False
         assert q.shape[-1] == k.shape[-1]
@@ -210,10 +236,6 @@ def apply_rotary_pos_emb_triton(q, k, cos, sin, rotary_type="hf-llama", block_si
         bs, head_num_q, rotary_dim = q.shape
         bs, head_num_k, rotary_dim = k.shape
 
-        # Prepare output tensor
-        out_q = torch.empty_like(q)
-        out_k = torch.empty_like(k)
-
         # Launch kernel
         BLOCK_H = min(
             triton.cdiv(triton.next_power_of_2(bs), 128), max(head_num_q, head_num_k)
@@ -222,31 +244,37 @@ def apply_rotary_pos_emb_triton(q, k, cos, sin, rotary_type="hf-llama", block_si
         rotary_embedding_kernel_llama[grid](
             q,
             k,
-            out_q,
-            out_k,
+            q_out,
+            k_out,
             cos,
             sin,
             q.stride(0),
             q.stride(1),
             k.stride(0),
             k.stride(1),
-            out_q.stride(0),
-            out_q.stride(1),
-            out_k.stride(0),
-            out_k.stride(1),
+            q_out.stride(0),
+            q_out.stride(1),
+            k_out.stride(0),
+            k_out.stride(1),
             head_num_q,
             head_num_k,
             rotary_dim,
             BLOCK_H,
         )
 
-        return out_q.view(q_shape), out_k.view(k_shape)
+        return q_out.view(q_shape), k_out.view(k_shape)
 
     else:
         raise ValueError(f"Unknown rotary type: {rotary_type}")
 
 
-def apply_rotary_pos_emb_torch(q, k, cos, sin, rotary_type="hf-llama"):
+def apply_rotary_pos_emb_torch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rotary_type: str = "hf-llama",
+):
     if rotary_type == "hf-llama":
         # "hf-llama" has an [real, real, ..., real, imag, imag, ..., imag] layout.
         cos = torch.cat([cos, cos], dim=-1)
@@ -314,22 +342,42 @@ def apply_rotary_pos_emb_torch(q, k, cos, sin, rotary_type="hf-llama"):
         raise ValueError(f"Unknown rotary type: {rotary_type}")
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, rotary_type="hf-llama"):
-    if rotary_type == "hf-llama" or (
-        rotary_type == "llama" and hasattr(triton.language, "interleave")
-    ):
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rotary_type: str = "hf-llama",
+    impl: str = "auto",
+):
+    """
+    Rotary positional embedding
+
+    Args:
+        q: Query input
+        k: Key input
+        cos: Precomputed cosine
+        sin: Precomputed sine
+        rotary_type: Variant of rotary positional embedding
+    """
+
+    if impl == "auto":
+        if rotary_type == "hf-llama" or (
+            rotary_type == "llama" and hasattr(triton.language, "interleave")
+        ):
+            impl = "triton"
+        else:
+            impl = "torch"
+
+    if impl == "triton":
         # NOTE: some platform such as muxi now doesn't support triton.language.interleave, so we need check attr
         # NOTE: Performance of triton rotary kernel is untested for large batch sizes.
         # If it's slow on prefill, just switch to torch implementation on the else case.
         return apply_rotary_pos_emb_triton(q, k, cos, sin, rotary_type=rotary_type)
+    elif impl == "torch":
+        return apply_rotary_pos_emb_torch(q, k, cos, sin, rotary_type=rotary_type)
     else:
-        return apply_rotary_pos_emb_torch(
-            q,
-            k,
-            cos,
-            sin,
-            rotary_type=rotary_type,
-        )
+        raise NotImplementedError(f"Unsupported rotary implementation: {impl}")
 
 
 @auto_retry_triton_compilation
@@ -629,20 +677,30 @@ def calculate_settings(n):
     return BLOCK_SIZE, num_warps
 
 
-def rms_norm(X: torch.Tensor, W: torch.Tensor, dim, eps):
-    num_x = X.numel()
-    num_rows = num_x // dim
+def rms_norm(X: torch.Tensor, W: torch.Tensor, eps, compute_dtype):
+    out = torch.empty_like(X)
+
+    X_shape = X.shape
+    num_cols = X.shape[-1]
+    num_rows = X.numel() // num_cols
+
+    # Assume the row dimensions are contiguous, but it can be non-contiguous between
+    # each row
+    X = X.view(num_rows, num_cols)
+    out = out.view(num_rows, num_cols)
+
     assert W.is_contiguous()
-    BLOCK_SIZE, num_warps = calculate_settings(dim)
-    Y = torch.empty_like(X, dtype=X.dtype, device=X.device)
+
+    BLOCK_SIZE, num_warps = calculate_settings(num_cols)
     rms_norm_kernel[num_rows,](
-        Y,
-        Y.stride(-2),
+        out,
+        out.stride(-2),
         X,
         X.stride(-2),
         W,
-        dim,
+        num_cols,
         eps,
+        compute_dtype=to_triton_dtype(compute_dtype),
         BLOCK_SIZE=BLOCK_SIZE,
     )
-    return Y
+    return out.view(X_shape)

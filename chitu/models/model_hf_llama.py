@@ -21,8 +21,26 @@ from chitu.tensor_parallel import (
     VocabParallelEmbedding,
     get_tp_size,
 )
+from chitu.global_vars import get_global_args
 
 logger = getLogger(__name__)
+
+
+def get_rms_norm_impl():
+    impl = "auto"
+
+    # These models are extremely sensitive to the implementation of RMSNorm. We always use "ref" as
+    # a stable implementation. Feel free to remove this if you have find some other ways to make the
+    # model stable.
+    args = get_global_args()
+    if args.models.name == "Mixtral-8x7B-Instruct-v0.1":
+        impl = "ref"
+    if hasattr(args.models, "quant") and args.models.quant == "simple_w8a8":
+        impl = "ref"
+    if hasattr(args.models, "quant") and args.models.quant == "simple_w8a8_muxi":
+        impl = "ref"
+
+    return impl
 
 
 class AttentionHFLlama(Attention):
@@ -353,8 +371,12 @@ class TransformerBlockHFLlama(TransformerBlock):
             op_impl=op_impl,
             merge_gate_up=merge_qkv_gate_up,
         )
-        self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.input_layernorm = RMSNorm(
+            args.dim, eps=args.norm_eps, impl=get_rms_norm_impl()
+        )
+        self.post_attention_layernorm = RMSNorm(
+            args.dim, eps=args.norm_eps, impl=get_rms_norm_impl()
+        )
 
     def forward(
         self,
@@ -654,7 +676,9 @@ class TransformerHFLlama(Transformer):
             )
 
     def _init_post_layers(self):
-        self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps)
+        self.norm = RMSNorm(
+            self.params.dim, eps=self.params.norm_eps, impl=get_rms_norm_impl()
+        )
         self.lm_head = ColumnParallelLinear(
             self.params.dim,
             self.params.vocab_size,

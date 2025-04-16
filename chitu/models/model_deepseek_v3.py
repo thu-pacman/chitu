@@ -33,20 +33,14 @@ from chitu.tensor_parallel import (
     get_tp_rank,
     get_tp_size,
 )
-
 from chitu.utils import try_import_opt_dep
-from functools import partial
 
 
 logger = getLogger(__name__)
 
-RMSNorm_impl = partial(RMSNorm, impl="torch")
-
 triton, has_triton = try_import_opt_dep("triton", "triton")
 if has_triton:
     from chitu.fused_moe import fused_experts
-
-    RMSNorm_impl = partial(RMSNorm, impl="triton")
 
 
 def parse_dtype(name: str) -> torch.dtype:
@@ -454,7 +448,7 @@ class AttentionDeepSeekV3(Attention):
                 dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
             )
-        self.q_norm = RMSNorm_impl(self.q_lora_rank)
+        self.q_norm = RMSNorm(self.q_lora_rank)
         self.wq_b = ColumnParallelLinearDeepSeekV3(
             self.q_lora_rank,
             (
@@ -467,7 +461,7 @@ class AttentionDeepSeekV3(Attention):
             bias_dtype=torch.get_default_dtype(),
             gather_output=False,
         )
-        self.kv_norm = RMSNorm_impl(self.kv_lora_rank)
+        self.kv_norm = RMSNorm(self.kv_lora_rank)
         if self.mla_absorb != "absorb":
             self.wkv_b = ColumnParallelLinearDeepSeekV3(
                 self.kv_lora_rank,
@@ -1200,8 +1194,8 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                 merge_gate_up=merge_qkv_gate_up,
             )
         )
-        self.attn_norm = RMSNorm_impl(args.dim)
-        self.ffn_norm = RMSNorm_impl(args.dim)
+        self.attn_norm = RMSNorm(args.dim)
+        self.ffn_norm = RMSNorm(args.dim)
 
     def forward(
         self,
@@ -1593,7 +1587,7 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def _init_post_layers(self):
-        self.norm = RMSNorm_impl(self.params.dim)
+        self.norm = RMSNorm(self.params.dim)
         self.head = ColumnParallelLinear(
             self.params.dim,
             self.params.vocab_size,

@@ -29,6 +29,9 @@ def append_to_paged_kv_cache_kernel(
     BATCH_SIZE: tl.constexpr,
     NUM_PAGES_PER_SAMPLE: tl.constexpr,
     TOT_LEN_OF_OTHER_DIMS: tl.constexpr,
+    KV_CACHE_STRIDE0: tl.constexpr,
+    KV_CACHE_STRIDE1: tl.constexpr,
+    THIS_KV_STRIDE0: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,  # GPU block size, not page size
 ):
     batch_id = tl.program_id(axis=0)
@@ -39,14 +42,13 @@ def append_to_paged_kv_cache_kernel(
 
     seqlen = tl.load(old_seq_lens_ptr + batch_id)
 
-    page_table_offset = batch_id * NUM_PAGES_PER_SAMPLE + seqlen // 64
+    page_table_offset = batch_id * NUM_PAGES_PER_SAMPLE + seqlen // PAGE_SIZE
     page_id = tl.load(page_table_ptr + page_table_offset)
 
     kv_cache_offset = (
-        page_id * PAGE_SIZE + seqlen % 64
-    ) * TOT_LEN_OF_OTHER_DIMS + dim_id
-
-    this_kv_offset = batch_id * TOT_LEN_OF_OTHER_DIMS + dim_id
+        page_id * KV_CACHE_STRIDE0 + (seqlen % PAGE_SIZE) * KV_CACHE_STRIDE1 + dim_id
+    )
+    this_kv_offset = batch_id * THIS_KV_STRIDE0 + dim_id
 
     this_kv_data = tl.load(this_kv_ptr + this_kv_offset, mask=dim_mask)
     tl.store(kv_cache_ptr + kv_cache_offset, this_kv_data, mask=dim_mask)
@@ -566,16 +568,17 @@ def silu_and_mul_kernel(
     tl.store(output, result, mask=(offsets < d))
 
 
-@triton.autotune(configs=configs, key=["Y_row_stride", "X_row_stride"])
+@triton.autotune(configs=configs, key=["Y_row_stride", "X_row_stride", "compute_dtype"])
 @triton.jit
 def rms_norm_kernel(
     Y,
-    Y_row_stride,
+    Y_row_stride: tl.constexpr,
     X,
-    X_row_stride,
+    X_row_stride: tl.constexpr,
     W,
     n_cols: tl.constexpr,
     eps: tl.constexpr,
+    compute_dtype: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
@@ -590,12 +593,12 @@ def rms_norm_kernel(
     Y += row_idx * Y_row_stride
     X += row_idx * X_row_stride
 
-    X_row = tl.load(X + col_offsets, mask=mask, other=0)
-    W_row = tl.load(W + col_offsets, mask=mask, other=0)  # .to(tl.float32)
+    X_row = tl.load(X + col_offsets, mask=mask, other=0).to(compute_dtype)
+    W_row = tl.load(W + col_offsets, mask=mask, other=0)
 
     row_var = tl.sum(X_row * X_row, axis=0) / n_cols
     inv_var = tl.math.rsqrt(row_var + eps)
     normed = X_row * inv_var
-    normed = normed.to(W_row.dtype)  # Exact copy from HF
+    normed = normed.to(W_row.dtype)  # Be consistent with impl="ref"
     output = normed * W_row
     tl.store(Y + col_offsets, output, mask=mask)
