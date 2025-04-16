@@ -362,28 +362,48 @@ class Transformer(nn.Module):
         cpl_names = self._get_tensor_column_parallel_layer_names()
         rpl_names = self._get_tensor_row_parallel_layer_names()
 
+        quant = self.params.quant if hasattr(self.params, "quant") else None
+
         for name, param in checkpoint.items():
             if any(is_layer(s, name) for s in cpl_names):
-                if name.endswith("weight") or (
-                    self.params.type == "deepseek-v3" and name.endswith("scale")
+                if (
+                    name.endswith(".weight")
+                    or (self.params.type == "deepseek-v3" and name.endswith(".scale"))
+                    or (quant == "blockfp8" and name.endswith(".scale"))
                 ):
                     chunks = torch.chunk(param, world_size, dim=0)
                     partial_checkpoint[name] = chunks[rank]
-                elif name.endswith("bias"):
+                elif name.endswith(".bias"):
                     chunks = torch.chunk(param, world_size, dim=-1)
+                    partial_checkpoint[name] = chunks[rank]
+                elif quant == "autoawq" and (
+                    name.endswith(".qweight")
+                    or name.endswith(".qzeros")
+                    or name.endswith(".scales")
+                ):
+                    chunks = torch.chunk(param, world_size, dim=1)
                     partial_checkpoint[name] = chunks[rank]
                 else:
                     assert False, f"Illegal parallel tensor {name}"
             elif any(is_layer(s, name) for s in rpl_names):
-                if name.endswith("weight") or (
-                    self.params.type == "deepseek-v3" and name.endswith("scale")
+                if (
+                    name.endswith(".weight")
+                    or (self.params.type == "deepseek-v3" and name.endswith("scale"))
+                    or (quant == "blockfp8" and name.endswith("scale"))
                 ):
                     chunks = torch.chunk(param, world_size, dim=1)
                     partial_checkpoint[name] = chunks[rank]
-                elif name.endswith("bias"):
+                elif name.endswith(".bias"):
                     # Rank 0 needs a full bias and only rank 0 needs it
                     if get_tp_rank() == 0:
                         partial_checkpoint[name] = param
+                elif quant == "autoawq" and (
+                    name.endswith(".qweight")
+                    or name.endswith(".qzeros")
+                    or name.endswith(".scales")
+                ):
+                    chunks = torch.chunk(param, world_size, dim=0)
+                    partial_checkpoint[name] = chunks[rank]
                 else:
                     assert False, f"Illegal parallel tensor {name}"
             else:
