@@ -1,0 +1,20 @@
+name: Llama-3.3-70B-Instruct
+type: hf-llama
+source: "https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+qkv_has_bias: false
+dim: 8192
+n_layers: 80
+n_heads: 64
+n_kv_heads: 8
+vocab_size: 128256
+intermediate_dim: 28672
+norm_eps: 1e-05
+rope_scaling:
+  factor: 8.0
+  high_freq_factor: 4.0
+  low_freq_factor: 1.0
+  original_max_position_embeddings: 8192
+  rope_type: llama3
+rope_theta: 500000.0

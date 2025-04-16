@@ -1,5 +1,6 @@
 from logging import getLogger
 from typing import Any, List, Mapping, Optional
+import math
 
 import torch
 import torch.nn.functional as F
@@ -676,6 +677,11 @@ class TransformerHFLlama(Transformer):
             head_dim // 2 if self.rotary_type == "glm4" else head_dim,
             max_position_embeddings=max_position_embeddings,
             base=float(self.params.rope_theta),
+            rope_scaling=(
+                self.params.rope_scaling
+                if hasattr(self.params, "rope_scaling")
+                else None
+            ),
             device=device,
         )
 
@@ -694,7 +700,12 @@ class TransformerHFLlama(Transformer):
 
 class RotaryEmbeddingHFLlama(nn.Module):
     def __init__(
-        self, dim: int, max_position_embeddings: int, base: float, device=None
+        self,
+        dim: int,
+        max_position_embeddings: int,
+        base: float,
+        rope_scaling=None,
+        device=None,
     ):
         super().__init__()
 
@@ -708,6 +719,46 @@ class RotaryEmbeddingHFLlama(nn.Module):
                 / self.dim
             )
         )
+
+        if rope_scaling is not None:
+            if rope_scaling.rope_type == "llama3":
+                # Based on https://github.com/huggingface/transformers/blob/3165eb7c2808832d0de86c8f508d9da6b2124044/src/transformers/modeling_rope_utils.py#L385
+                # licensed under Apache-2.0
+
+                factor = rope_scaling.factor  # `8` in the original implementation
+                low_freq_factor = (
+                    rope_scaling.low_freq_factor
+                )  # `1` in the original implementation
+                high_freq_factor = (
+                    rope_scaling.high_freq_factor
+                )  # `4` in the original implementation
+                old_context_len = (
+                    rope_scaling.original_max_position_embeddings
+                )  # `8192` in the original implementation
+
+                low_freq_wavelen = old_context_len / low_freq_factor
+                high_freq_wavelen = old_context_len / high_freq_factor
+
+                wavelen = 2 * math.pi / inv_freq
+                # wavelen < high_freq_wavelen: do nothing
+                # wavelen > low_freq_wavelen: divide by factor
+                inv_freq_llama = torch.where(
+                    wavelen > low_freq_wavelen, inv_freq / factor, inv_freq
+                )
+                # otherwise: interpolate between the two, using a smooth factor
+                smooth_factor = (old_context_len / wavelen - low_freq_factor) / (
+                    high_freq_factor - low_freq_factor
+                )
+                smoothed_inv_freq = (
+                    1 - smooth_factor
+                ) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
+                is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(
+                    wavelen > low_freq_wavelen
+                )
+                inv_freq = torch.where(
+                    is_medium_freq, smoothed_inv_freq, inv_freq_llama
+                )
+
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         t = torch.arange(
