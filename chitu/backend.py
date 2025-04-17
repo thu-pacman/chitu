@@ -392,8 +392,13 @@ class Backend:
         merge_qkv_gate_up = True
         if args.models.type == "llama":
             merge_qkv_gate_up = False  # Not yet supported
+        if args.models.name == "QwQ-32B-FP8":
+            merge_qkv_gate_up = False  # FIXME
 
-        if hasattr(args.models, "quant") and args.models.quant is not None:
+        if hasattr(args.models, "quant") and args.models.quant not in [
+            None,
+            "blockfp8",
+        ]:
             # Merge weights for offline-scaled quantized models is non-trivial, because we can
             # only merge weights but NOT the scales on input dimensions, and this will break the
             # assumption of the fused quantized kernels. So we only merge weights for supported

@@ -1,4 +1,5 @@
 import math
+import functools
 from logging import getLogger
 from typing import Any, List, Mapping, Optional, Tuple
 
@@ -16,10 +17,7 @@ from chitu.device_type import get_device_name, is_muxi, is_nvidia
 from chitu.global_vars import get_global_args
 from chitu.models.model import Attention, RMSNorm, Transformer, TransformerBlock
 from chitu.ops import (
-    act_quant_deepseek_v3,
     apply_rotary_pos_emb,
-    fp8_gemm_deepseek_v3,
-    soft_fp8_gemm_deepseek_v3,
     weight_dequant_deepseek_v3,
     weight_dequant_soft_fp8_deepseek_v3,
     weight_quant_deepseek_v3,
@@ -29,14 +27,13 @@ from chitu.tensor_parallel import (
     LocalLinear,
     ColumnParallelLinear,
     RowParallelLinear,
-    ColumnParallelLinearMixIn,
-    RowParallelLinearMixIn,
     VocabParallelEmbedding,
     get_tp_group,
     get_tp_rank,
     get_tp_size,
 )
 from chitu.utils import try_import_opt_dep
+from chitu.quantization import linear_block_fp8, Blockfp8Linear
 
 
 logger = getLogger(__name__)
@@ -63,173 +60,28 @@ def linear_deepseek_v3(
     weight_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """
-    Applies a linear transformation to the incoming data: y = xA^T + b.
-    This function supports specialized implementations based on quantization
-    and tensor formats.
-
-    Args:
-        x (torch.Tensor): The input tensor.
-        weight (torch.Tensor): The weight tensor. It may be quantized and
-            requires dequantization for certain cases.
-        bias (Optional[torch.Tensor]): The bias tensor to be added. Default is None.
-
-    Returns:
-        torch.Tensor: The result of the linear transformation, which may involve
-        quantization-aware computations depending on the input parameters.
-
-    Notes:
-        - If `weight` is quantized (e.g., `element_size() > 1`), a dequantized version
-          is used for computation.
-        - If `gemm_impl == "bf16"`, dequantization and a `bf16` GEMM operation are applied.
-        - For other cases, the function applies quantization to `x` and uses `fp8_gemm_deepseek_v3` for computation.
-    """
-
     block_size = 128
     if weight.element_size() > 1:
         return F.linear(x, weight, bias)
-    elif get_global_args().infer.soft_fp8:
-        if is_nvidia() or is_muxi():
-            y = soft_fp8_gemm_deepseek_v3(x, weight, weight_scale)
-            if bias is not None:
-                y += bias
-            return y
-        else:
-            logger.warning(
-                f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
-            )
-            weight_dequanted = weight_dequant_soft_fp8_deepseek_v3(
-                weight, weight_scale, block_size
-            )
-            return F.linear(x, weight_dequanted, bias)
     else:
-        x_shape = x.shape
-        x = x.view(-1, x_shape[-1])
-        x, act_scale = act_quant_deepseek_v3(x, block_size)
-        assert weight_scale is not None
-        y = fp8_gemm_deepseek_v3(x, act_scale, weight, weight_scale)
-        if bias is not None:
-            y += bias
-        return y.view(x_shape[:-1] + y.shape[-1:])
-
-
-class LinearDeepSeekV3(nn.Module):
-    """
-    FP8 linear layer
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        has_bias: bool = False,
-        dtype=torch.float8_e4m3fn,
-        bias_dtype=None,
-    ):
-        super().__init__()
-        dtype = dtype or torch.get_default_dtype()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
-        block_size = 128
-        scale_out_features = (out_features + block_size - 1) // block_size
-        scale_in_features = (in_features + block_size - 1) // block_size
-        if dtype.itemsize == 1:
-            self.scale = nn.Parameter(
-                torch.empty(scale_out_features, scale_in_features, dtype=torch.float32)
-            )
-        else:
-            self.register_parameter("scale", None)
-        if has_bias:
-            self.bias = nn.Parameter(torch.empty(out_features, dtype=bias_dtype))
-        else:
-            self.register_parameter("bias", None)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the custom linear layer.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Transformed tensor after linear computation.
-        """
-        return linear_deepseek_v3(x, self.weight, self.scale, self.bias)
-
-
-class ColumnParallelLinearDeepSeekV3(ColumnParallelLinearMixIn, LocalLinear):
-    """
-    FP8 column parallel linear layer
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        has_bias: bool = False,
-        dtype=torch.float8_e4m3fn,
-        bias_dtype=None,
-        gather_output: bool = True,
-    ):
-        super().__init__(
-            in_features,
-            out_features,
-            has_bias=has_bias,
-            dtype=dtype,
-            bias_dtype=bias_dtype,
-            linear_op=lambda x, w, b: linear_deepseek_v3(x, w, self.scale, b),
-            gather_output=gather_output,
+        return linear_block_fp8(
+            x=x,
+            weight=weight,
+            weight_scale=weight_scale,
+            bias=bias,
+            block_size=block_size,
         )
 
-        dtype = dtype or torch.get_default_dtype()
-        if dtype.itemsize == 1:
-            local_out_features, local_in_features = self.weight.shape
-            block_size = 128
-            scale_out_features = (local_out_features + block_size - 1) // block_size
-            scale_in_features = (local_in_features + block_size - 1) // block_size
-            self.scale = nn.Parameter(
-                torch.empty(scale_out_features, scale_in_features, dtype=torch.float32)
-            )
-        else:
-            self.scale = None
 
-
-class RowParallelLinearDeepSeekV3(RowParallelLinearMixIn, LocalLinear):
-    """
-    FP8 row parallel linear layer
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        has_bias: bool = False,
-        dtype=torch.float8_e4m3fn,
-        bias_dtype=None,
-        input_is_parallel: bool = False,
-    ):
-        super().__init__(
-            in_features,
-            out_features,
-            has_bias=has_bias,
-            dtype=dtype,
-            bias_dtype=bias_dtype,
-            linear_op=lambda x, w, b: linear_deepseek_v3(x, w, self.scale, b),
-            input_is_parallel=input_is_parallel,
-        )
-
-        dtype = dtype or torch.get_default_dtype()
-        if dtype.itemsize == 1:
-            local_out_features, local_in_features = self.weight.shape
-            block_size = 128
-            scale_out_features = (local_out_features + block_size - 1) // block_size
-            scale_in_features = (local_in_features + block_size - 1) // block_size
-            self.scale = nn.Parameter(
-                torch.empty(scale_out_features, scale_in_features, dtype=torch.float32)
-            )
-        else:
-            self.scale = None
+def getLinearDeepSeekV3():
+    args = get_global_args()
+    quant_method = args.models.quant if hasattr(args.models, "quant") else None
+    if quant_method is None:
+        return LocalLinear
+    elif quant_method == "blockfp8":
+        return Blockfp8Linear
+    else:
+        raise NotImplementedError(f"{quant_method} is not supported for DeepSeek V3.")
 
 
 class GroupColumnParallelLinearDeepSeekV3(torch.nn.Module):
@@ -429,7 +281,7 @@ class AttentionDeepSeekV3(Attention):
             # fp8 gemm can handle weights not divisible by block_size, but it does not hold
             # after merging for the output dimension, except for the last weight.
             assert self.q_lora_rank % block_size == 0
-            self.wqkv_a = LinearDeepSeekV3(
+            self.wqkv_a = getLinearDeepSeekV3()(
                 self.dim,
                 self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
                 has_bias=False,
@@ -437,14 +289,14 @@ class AttentionDeepSeekV3(Attention):
                 bias_dtype=torch.get_default_dtype(),
             )
         else:
-            self.wq_a = LinearDeepSeekV3(
+            self.wq_a = getLinearDeepSeekV3()(
                 self.dim,
                 self.q_lora_rank,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
             )
-            self.wkv_a = LinearDeepSeekV3(
+            self.wkv_a = getLinearDeepSeekV3()(
                 self.dim,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 has_bias=False,
@@ -452,7 +304,7 @@ class AttentionDeepSeekV3(Attention):
                 bias_dtype=torch.get_default_dtype(),
             )
         self.q_norm = RMSNorm(self.q_lora_rank)
-        self.wq_b = ColumnParallelLinearDeepSeekV3(
+        self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             (
                 self.n_heads * self.qk_head_dim
@@ -463,18 +315,20 @@ class AttentionDeepSeekV3(Attention):
             dtype=parse_dtype(args.main_weight_dtype),
             bias_dtype=torch.get_default_dtype(),
             gather_output=False,
+            base_linear_class=getLinearDeepSeekV3(),
         )
         self.kv_norm = RMSNorm(self.kv_lora_rank)
         if self.mla_absorb != "absorb":
-            self.wkv_b = ColumnParallelLinearDeepSeekV3(
+            self.wkv_b = ColumnParallelLinear(
                 self.kv_lora_rank,
                 self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
+                base_linear_class=getLinearDeepSeekV3(),
             )
-        self.wo = RowParallelLinearDeepSeekV3(
+        self.wo = RowParallelLinear(
             (
                 self.n_heads * self.v_head_dim
                 if self.mla_absorb != "absorb"
@@ -485,6 +339,7 @@ class AttentionDeepSeekV3(Attention):
             dtype=parse_dtype(args.main_weight_dtype),
             bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
+            base_linear_class=getLinearDeepSeekV3(),
         )
         self.softmax_scale = compute_softmax_scale_deepseek_v3(args)
 
@@ -543,7 +398,7 @@ class AttentionDeepSeekV3(Attention):
             )
             wkv_b = (
                 self.wkv_b.weight
-                if self.wkv_b.scale is None
+                if not isinstance(self.wkv_b, Blockfp8Linear)
                 else weight_dequant_fn(self.wkv_b.weight, self.wkv_b.scale, block_size)
             )
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
@@ -748,38 +603,42 @@ class MLPDeepSeekV3(nn.Module):
         self.merge_gate_up = merge_gate_up
 
         if merge_gate_up:
-            self.w1w3 = ColumnParallelLinearDeepSeekV3(
+            self.w1w3 = ColumnParallelLinear(
                 args.dim,
                 args.inter_dim * 2,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
+                base_linear_class=getLinearDeepSeekV3(),
             )
         else:
-            self.w1 = ColumnParallelLinearDeepSeekV3(
+            self.w1 = ColumnParallelLinear(
                 args.dim,
                 args.inter_dim,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
+                base_linear_class=getLinearDeepSeekV3(),
             )
-            self.w3 = ColumnParallelLinearDeepSeekV3(
+            self.w3 = ColumnParallelLinear(
                 args.dim,
                 args.inter_dim,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
+                base_linear_class=getLinearDeepSeekV3(),
             )
-        self.w2 = RowParallelLinearDeepSeekV3(
+        self.w2 = RowParallelLinear(
             args.inter_dim,
             args.dim,
             has_bias=False,
             dtype=parse_dtype(args.main_weight_dtype),
             bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
+            base_linear_class=getLinearDeepSeekV3(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -832,7 +691,7 @@ class GateDeepSeekV3(nn.Module):
         self.route_scale = args.route_scale
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
         self.bias = (
-            nn.Parameter(torch.empty(args.n_routed_experts))
+            nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32))
             if self.dim == 7168
             else None
         )
@@ -1597,6 +1456,7 @@ class TransformerDeepSeekV3(Transformer):
             has_bias=False,
             dtype=torch.get_default_dtype(),
             gather_output=True,
+            disable_quantization=True,
         )
 
     @override

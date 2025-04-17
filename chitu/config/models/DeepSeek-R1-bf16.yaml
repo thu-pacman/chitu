@@ -1,4 +1,4 @@
-# DeepSeek-R1-bf16 is a data-type variant of DeepSeek-R1
+# DeepSeek-R1-bf16 is a de-quantization of DeepSeek-R1
 defaults:
   - DeepSeek-R1
   - _self_ # Config in this file overrides configs in defaults
@@ -11,3 +11,4 @@ tokenizer_path: null # By default the same as ckpt_dir, or you can override it w
 
 # Overrides
 main_weight_dtype: bfloat16
+quant: null

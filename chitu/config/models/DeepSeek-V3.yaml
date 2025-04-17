@@ -27,3 +27,4 @@ rope_factor: 40
 rs_token_id: 151648
 re_token_id: 151649
 main_weight_dtype: float8_e4m3fn
+quant: blockfp8

@@ -101,12 +101,20 @@ def ColumnParallelLinear(
     dtype=None,
     bias_dtype=None,
     linear_op=torch.nn.functional.linear,
+    *,
+    base_linear_class: Optional[type] = None,
     disable_quantization: bool = False,
 ):
     """
     Factory function for the ColumnParallelLinear class family.
 
-    See ColumnParallelLinearMixIn for details.
+    Most arguments are forwarded to ColumnParallelLinearMixIn, See ColumnParallelLinearMixIn for
+    details.
+
+    Additional arguments:
+        base_linear_class: The base linear class to use. Defaults to be determined by the global
+            quantization method.
+        disable_quantization: Disable quantization operation. Defaults to False.
     """
 
     args = get_global_args()
@@ -116,14 +124,19 @@ def ColumnParallelLinear(
         else args.models.quant
     )
     is_quantized = quant_method is not None and quant_method != "gguf"
-    if is_quantized:
-        from chitu.quantization import QuantizationRegistry
 
-        base_linear_class = QuantizationRegistry.get_quantized_linear_class(
-            quant_method
-        )
-    else:
-        base_linear_class = LocalLinear
+    if base_linear_class is None:
+        if is_quantized:
+            from chitu.quantization import QuantizationRegistry
+
+            base_linear_class = QuantizationRegistry.get_quantized_linear_class(
+                quant_method
+            )
+        else:
+            base_linear_class = LocalLinear
+
+    if dtype is None and is_quantized and quant_method == "blockfp8":
+        dtype = torch.float8_e4m3fn
 
     class ColumnParallelLinearImpl(ColumnParallelLinearMixIn, base_linear_class):
         # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
@@ -131,8 +144,7 @@ def ColumnParallelLinear(
         # further base class of the original base class.
         # See https://docs.python.org/3/tutorial/classes.html#multiple-inheritance
 
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
+        pass
 
     return ColumnParallelLinearImpl(
         in_features=in_features,
@@ -142,7 +154,6 @@ def ColumnParallelLinear(
         dtype=dtype,
         bias_dtype=bias_dtype,
         linear_op=linear_op,
-        disable_quantization=disable_quantization,
     )
 
 
@@ -154,12 +165,19 @@ def RowParallelLinear(
     dtype=None,
     bias_dtype=None,
     linear_op=torch.nn.functional.linear,
+    *,
+    base_linear_class: Optional[type] = None,
     disable_quantization: bool = False,
 ):
     """
     Factory function for the RowParallelLinear class family.
 
-    See RowParallelLinearMixIn for details.
+    Most arguments are forwarded to RowParallelLinearMixIn, See RowParallelLinearMixIn for details.
+
+    Additional arguments:
+        base_linear_class: The base linear class to use. Defaults to be determined by the global
+            quantization method.
+        disable_quantization: Disable quantization operation. Defaults to False.
     """
 
     args = get_global_args()
@@ -169,14 +187,19 @@ def RowParallelLinear(
         else args.models.quant
     )
     is_quantized = quant_method is not None and quant_method != "gguf"
-    if is_quantized:
-        from chitu.quantization import QuantizationRegistry
 
-        base_linear_class = QuantizationRegistry.get_quantized_linear_class(
-            quant_method
-        )
-    else:
-        base_linear_class = LocalLinear
+    if base_linear_class is None:
+        if is_quantized:
+            from chitu.quantization import QuantizationRegistry
+
+            base_linear_class = QuantizationRegistry.get_quantized_linear_class(
+                quant_method
+            )
+        else:
+            base_linear_class = LocalLinear
+
+    if dtype is None and is_quantized and quant_method == "blockfp8":
+        dtype = torch.float8_e4m3fn
 
     class RowParallelLinearImpl(RowParallelLinearMixIn, base_linear_class):
         # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
@@ -184,8 +207,7 @@ def RowParallelLinear(
         # further base class of the original base class.
         # See https://docs.python.org/3/tutorial/classes.html#multiple-inheritance
 
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
+        pass
 
     return RowParallelLinearImpl(
         in_features=in_features,
@@ -195,7 +217,6 @@ def RowParallelLinear(
         dtype=dtype,
         bias_dtype=bias_dtype,
         linear_op=linear_op,
-        disable_quantization=disable_quantization,
     )
 
 
@@ -209,7 +230,6 @@ class ColumnParallelLinearMixIn:
         dtype=None,
         bias_dtype=None,
         linear_op=torch.nn.functional.linear,
-        disable_quantization: bool = False,
     ):
         """
         Ouput-dimension-parallelized linaer layer
@@ -222,7 +242,6 @@ class ColumnParallelLinearMixIn:
             dtype: The desired data type of the parameters.
             bias_dtype: The desired data type of the bias. Defaults to `dtype`.
             linear_op: The linear operation to use. Defaults to `torch.nn.functional.linear`.
-            disable_quantization: disable quantization operation
         """
 
         tp_group = get_tp_group()
@@ -274,7 +293,6 @@ class RowParallelLinearMixIn:
         dtype=None,
         bias_dtype=None,
         linear_op=torch.nn.functional.linear,
-        disable_quantization: bool = False,
     ):
         """
         Input-dimension-parallelized linear layer
@@ -287,7 +305,6 @@ class RowParallelLinearMixIn:
             dtype: The desired data type of the parameters.
             bias_dtype: The desired data type of the bias. Defaults to `dtype`.
             linear_op: The linear operation to use. Defaults to `torch.nn.functional.linear`.
-            disable_quantization: disable quantization operation
         """
 
         tp_group = get_tp_group()
