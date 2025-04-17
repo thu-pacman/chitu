@@ -26,8 +26,11 @@ from chitu.ops import (
     silu_and_mul,
 )
 from chitu.tensor_parallel import (
+    LocalLinear,
     ColumnParallelLinear,
     RowParallelLinear,
+    ColumnParallelLinearMixIn,
+    RowParallelLinearMixIn,
     VocabParallelEmbedding,
     get_tp_group,
     get_tp_rank,
@@ -155,7 +158,7 @@ class LinearDeepSeekV3(nn.Module):
         return linear_deepseek_v3(x, self.weight, self.scale, self.bias)
 
 
-class ColumnParallelLinearDeepSeekV3(ColumnParallelLinear):
+class ColumnParallelLinearDeepSeekV3(ColumnParallelLinearMixIn, LocalLinear):
     """
     FP8 column parallel linear layer
     """
@@ -192,7 +195,7 @@ class ColumnParallelLinearDeepSeekV3(ColumnParallelLinear):
             self.scale = None
 
 
-class RowParallelLinearDeepSeekV3(RowParallelLinear):
+class RowParallelLinearDeepSeekV3(RowParallelLinearMixIn, LocalLinear):
     """
     FP8 row parallel linear layer
     """

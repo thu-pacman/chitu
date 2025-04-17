@@ -422,7 +422,6 @@ class Backend:
             "simple_w8a8_muxi",
         ]:
             torch.set_default_tensor_type(torch.cuda.HalfTensor)
-            model = model.to(torch.float16)
 
         return model
 
