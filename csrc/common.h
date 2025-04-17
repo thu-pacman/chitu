@@ -56,28 +56,30 @@ template <> struct map_to_cuda_type<at::BFloat16> {
     using type = nv_bfloat16;
 };
 
-template <typename scalar_t> __device__ inline scalar_t to_scalar(float x);
-
-template <> __device__ inline float to_scalar<float>(float x) { return x; }
-
-template <> __device__ inline __half to_scalar<__half>(float x) {
-    return __float2half(x);
+template <typename dst_type, typename from_type>
+__device__ inline dst_type to_scalar(from_type x) {
+    if constexpr (std::is_same_v<from_type, dst_type>) {
+        return x;
+    } else if constexpr (std::is_same_v<from_type, float> &&
+                         std::is_same_v<dst_type, __half>) {
+        return __float2half(x);
+    } else if constexpr (std::is_same_v<from_type, float> &&
+                         std::is_same_v<dst_type, nv_bfloat16>) {
+        return __float2bfloat16(x);
+    } else if constexpr (std::is_same_v<from_type, __half> &&
+                         std::is_same_v<dst_type, float>) {
+        return __half2float(x);
+    } else if constexpr (std::is_same_v<from_type, nv_bfloat16> &&
+                         std::is_same_v<dst_type, float>) {
+        return __bfloat162float(x);
+    } else {
+        // For other conversions, go through float as an intermediate step
+        return to_scalar<float, dst_type>(to_scalar<from_type, float>(x));
+    }
 }
 
-template <> __device__ inline nv_bfloat16 to_scalar<nv_bfloat16>(float x) {
-    return __float2bfloat16(x);
-}
-
-template <typename scalar_t> __device__ inline float to_float(scalar_t x);
-
-template <> __device__ inline float to_float<float>(float x) { return x; }
-
-template <> __device__ inline float to_float<__half>(const __half x) {
-    return __half2float(x);
-}
-
-template <> __device__ inline float to_float<nv_bfloat16>(const nv_bfloat16 x) {
-    return __bfloat162float(x);
+template <typename T> __device__ inline float to_float(T x) {
+    return to_scalar<float, T>(x);
 }
 
 template <typename T> __device__ inline bool gt(const T a, const T b) {
