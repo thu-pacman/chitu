@@ -1,53 +1,29 @@
 import torch
 import logging
 from typing import Dict, Tuple, Optional, Type
-from abc import ABC, abstractmethod
+
+from chitu.utils import try_import_opt_dep
+from chitu.ops import (
+    fp8_gemm_deepseek_v3,
+    soft_fp8_gemm_deepseek_v3,
+    weight_dequant_soft_fp8_deepseek_v3,
+    act_quant_deepseek_v3,
+)
+from chitu.global_vars import get_global_args
+from chitu.device_type import get_device_name, is_muxi, is_nvidia, has_native_fp8
+
 
 logger = logging.getLogger(__name__)
 
 
-class QuantizedLinearBase(ABC):
+class QuantizedLinearBase(torch.nn.Module):
     """
-    Abstract base class for all quantized linear layers.
+    Base class for all quantized linear layers.
 
     Defines the interface that all quantized linear implementations must follow.
     """
 
-    @abstractmethod
-    def create_from_linear_spec(
-        self, in_features: int, out_features: int, bias: bool = True, **kwargs
-    ) -> torch.nn.Module:
-        """
-        Create a quantized linear module from specifications.
-
-        Arguments:
-            in_features: Number of input features
-            out_features: Number of output features
-            bias: Whether to include a bias term
-            **kwargs: Additional implementation-specific parameters
-        """
-        pass
-
-    @abstractmethod
-    def forward(self, x: torch.Tensor) -> torch.nn.Module:
-        """
-        Rewrite forward.
-
-        Arguments:
-            x: input tensor
-        """
-        pass
-
-    @staticmethod
-    def _apply_callback(self, fn, t):
-        """
-        It will be passed to'apply for operations such as. .to() .cuda()
-
-        Arguments:
-            fn: original function callback
-            t: input tensor
-        """
-        return fn(t)
+    pass
 
 
 class LLMInt8Linear(QuantizedLinearBase):
@@ -55,16 +31,18 @@ class LLMInt8Linear(QuantizedLinearBase):
     8-bit linear layer implementation using bitsandbytes.
     """
 
-    @staticmethod
-    def create_from_linear_spec(
-        self, in_features: int, out_features: int, bias: bool = True, **kwargs
+    def __init__(
+        self, in_features: int, out_features: int, has_bias: bool = True, **kwargs
     ) -> torch.nn.Module:
+
+        super().__init__()
+
         import bitsandbytes as bnb
 
         bnb_module = bnb.nn.Linear8bitLt(
             in_features,
             out_features,
-            bias=bias,
+            bias=has_bias,
             has_fp16_weights=kwargs.get("has_fp16_weights", False),
             threshold=kwargs.get("threshold", 6.0),
         )
@@ -76,8 +54,7 @@ class LLMInt8Linear(QuantizedLinearBase):
         self.state = bnb_module.state
         self.init_8bit_state = bnb_module.init_8bit_state
 
-    @staticmethod
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         import bitsandbytes as bnb
 
         self.state.is_training = False
@@ -101,10 +78,11 @@ class AutoAWQLinear(QuantizedLinearBase):
     Auto awq 8-bit linear layer.
     """
 
-    @staticmethod
-    def create_from_linear_spec(
-        self, in_features: int, out_features: int, bias: bool = True, **kwargs
+    def __init__(
+        self, in_features: int, out_features: int, has_bias: bool = True, **kwargs
     ):
+        super().__init__()
+
         from awq.modules.linear import WQLinear_GEMM
 
         wqlinear = WQLinear_GEMM(
@@ -112,7 +90,7 @@ class AutoAWQLinear(QuantizedLinearBase):
             group_size=128,
             in_features=in_features,
             out_features=out_features,
-            bias=bias,
+            bias=has_bias,
             dev=None,
         )
 
@@ -126,8 +104,7 @@ class AutoAWQLinear(QuantizedLinearBase):
         self.bias = wqlinear.bias
         self.out_features = wqlinear.out_features
 
-    @staticmethod
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         from awq.modules.linear.gemm import WQLinearMMFunction
 
         out_shape = x.shape[:-1] + (self.out_features,)
@@ -170,10 +147,12 @@ class W8A8Linear(QuantizedLinearBase):
         aa = act.div(scales).round_()
         return aa.to(torch.int8).view(-1, act_shape[-1]), scales.view(-1)
 
-    @staticmethod
-    def create_from_linear_spec(
-        self, in_features: int, out_features: int, bias: bool = True, **kwargs
+    def __init__(
+        self, in_features: int, out_features: int, has_bias: bool = True, **kwargs
     ) -> torch.nn.Module:
+
+        super().__init__()
+
         self.in_features = in_features
         self.out_features = out_features
         self.register_buffer(
@@ -193,7 +172,7 @@ class W8A8Linear(QuantizedLinearBase):
                 requires_grad=False,
             ),
         )
-        if bias:
+        if has_bias:
             self.register_buffer(
                 "bias",
                 torch.zeros(
@@ -203,16 +182,10 @@ class W8A8Linear(QuantizedLinearBase):
         else:
             self.register_buffer("bias", None)
 
-    @staticmethod
-    def _apply_callback(self, fn, t):
-        if t is self.weight or t is self.scale_channel:
-            return t.to(device=fn(t).device) if t.device != fn(t).device else t
-        return fn(t)
-
-    @staticmethod
     @torch.no_grad()
-    def forward(self, x: torch.Tensor):
-        import w8a8gemm, w8a8gemv
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w8a8gemm, _ = try_import_opt_dep("w8a8gemm", "quant")
+        w8a8gemv, _ = try_import_opt_dep("w8a8gemv", "quant")
 
         if x.dim() == 2:
             q_x, act_scale = W8A8Linear.quant_act(x)
@@ -245,10 +218,12 @@ class W8A8MuxiLinear(QuantizedLinearBase):
     Muxi 8-bit weight and activation quantized linear layer.
     """
 
-    @staticmethod
-    def create_from_linear_spec(
-        self, in_features: int, out_features: int, bias: bool = True, **kwargs
+    def __init__(
+        self, in_features: int, out_features: int, has_bias: bool = True, **kwargs
     ) -> torch.nn.Module:
+
+        super().__init__()
+
         self.in_features = in_features
         self.out_features = out_features
         self.register_buffer(
@@ -268,7 +243,7 @@ class W8A8MuxiLinear(QuantizedLinearBase):
                 requires_grad=False,
             ),
         )
-        if bias:
+        if has_bias:
             self.register_buffer(
                 "bias",
                 torch.zeros(
@@ -278,15 +253,8 @@ class W8A8MuxiLinear(QuantizedLinearBase):
         else:
             self.register_buffer("bias", None)
 
-    @staticmethod
-    def _apply_callback(self, fn, t):
-        if t is self.weight or t is self.scale_channel:
-            return t.to(device=fn(t).device) if t.device != fn(t).device else t
-        return fn(t)
-
-    @staticmethod
     @torch.no_grad()
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         from chitu.muxi_utils import tbsgemm
 
         if isinstance(x, Tuple):
@@ -328,71 +296,119 @@ class W8A8MuxiLinear(QuantizedLinearBase):
             return out
 
 
+def linear_block_fp8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    block_size: Optional[int] = 128,
+) -> torch.Tensor:
+    """
+    Applies a linear transformation to the incoming data: y = xA^T + b.
+    This function supports specialized implementations based on quantization
+    and tensor formats.
+
+    Args:
+        x (torch.Tensor): The input tensor.
+        weight (torch.Tensor): The weight tensor. It may be quantized and
+            requires dequantization for certain cases.
+        bias (Optional[torch.Tensor]): The bias tensor to be added. Default is None.
+
+    Returns:
+        torch.Tensor: The result of the linear transformation, which may involve
+        quantization-aware computations depending on the input parameters.
+    """
+
+    assert weight.element_size() == 1
+
+    if get_global_args().infer.soft_fp8:
+        if is_nvidia() or is_muxi():
+            y = soft_fp8_gemm_deepseek_v3(x, weight, weight_scale)
+            if bias is not None:
+                y += bias
+            return y
+        else:
+            logger.warning(
+                f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
+            )
+            weight_dequanted = weight_dequant_soft_fp8_deepseek_v3(
+                weight, weight_scale, block_size
+            )
+            return torch.nn.functional.linear(x, weight_dequanted, bias)
+    else:
+        x_dtype = x.dtype
+        x_shape = x.shape
+        x = x.view(-1, x_shape[-1])
+        x, act_scale = act_quant_deepseek_v3(x, block_size)
+        assert weight_scale is not None
+        y = fp8_gemm_deepseek_v3(x, act_scale, weight, weight_scale)
+        if bias is not None:
+            y += bias
+        return y.view(x_shape[:-1] + y.shape[-1:]).to(x_dtype)
+
+
 class Blockfp8Linear(QuantizedLinearBase):
     """
     block 8-bit weight and activation quantized linear layer.
     """
 
-    @staticmethod
-    def create_from_linear_spec(
+    def __init__(
         self,
         in_features: int,
         out_features: int,
-        bias: bool = True,
-        device=None,
+        has_bias: bool = False,
+        dtype=torch.float8_e4m3fn,
+        bias_dtype=None,
         block_size=128,
         **kwargs,
-    ) -> torch.nn.Module:
+    ):
+        super().__init__()
+
+        dtype = dtype or torch.get_default_dtype()
+        assert dtype.itemsize == 1
 
         self.in_features = in_features
         self.out_features = out_features
         self.block_size = block_size
 
-        self.register_buffer(
+        self.register_parameter(
             "weight",
-            torch.empty(
-                (out_features, in_features),
-                dtype=torch.float8_e4m3fn,
-                requires_grad=False,
-                device=device,
-            ),
-        )
-        self.register_buffer(
-            "scale",
-            torch.empty(
-                (out_features // block_size, in_features // block_size),
-                dtype=torch.float32,
-                requires_grad=False,
-                device=device,
+            torch.nn.Parameter(
+                torch.empty(
+                    (out_features, in_features), dtype=dtype, requires_grad=False
+                )
             ),
         )
 
-        if bias:
-            self.register_buffer(
-                "bias",
+        scale_out_features = (out_features + block_size - 1) // block_size
+        scale_in_features = (in_features + block_size - 1) // block_size
+        self.register_parameter(
+            "scale",
+            torch.nn.Parameter(
                 torch.empty(
-                    (out_features),
-                    dtype=torch.float16,
+                    scale_out_features,
+                    scale_in_features,
+                    dtype=torch.float32,
                     requires_grad=False,
-                    device=device,
+                )
+            ),
+        )
+
+        if has_bias:
+            self.register_parameter(
+                "bias",
+                torch.nn.Parameter(
+                    torch.empty(out_features, dtype=bias_dtype, requires_grad=False)
                 ),
             )
         else:
-            self.bias = None
-
-    @staticmethod
-    def _apply_callback(self, fn, t):
-        if t is self.weight or t is self.scale:
-            return t.to(device=fn(t).device) if t.device != fn(t).device else t
-        return fn(t)
+            self.register_parameter("bias", None)
 
     @torch.no_grad()
-    @staticmethod
-    def forward(self, x):
-        from chitu.models.model_deepseek_v3 import linear_deepseek_v3
-
-        out = linear_deepseek_v3(x, self.weight, self.scale, self.bias).to(x.dtype)
-        return out
+    def forward(self, x) -> torch.Tensor:
+        return linear_block_fp8(
+            x, self.weight, self.scale, self.bias, block_size=self.block_size
+        )
 
 
 class QuantizationRegistry:

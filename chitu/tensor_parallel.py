@@ -38,10 +38,189 @@ def get_tp_size():
 
 
 def get_tp_rank():
-    return torch.distributed.get_rank(group=get_tp_group())
+    return (
+        torch.distributed.get_rank(
+            group=get_tp_group()  # Don't pass None. None means world group
+        )
+        if tp_comm_group is not None
+        else 0
+    )
 
 
-class ColumnParallelLinear(torch.nn.Module):
+class LocalLinear(torch.nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        has_bias: bool = True,
+        dtype=None,
+        bias_dtype=None,
+        linear_op=torch.nn.functional.linear,
+    ):
+        """
+        Linear layer running on a single device.
+
+        Additional parameters are supported based on `torch.nn.Linear`.
+
+        Args:
+            in_features: size of each input sample
+            out_features: size of each output sample
+            has_bias: If set to True, the layer will have a bias.
+            dtype: The desired data type of the parameters.
+            bias_dtype: The desired data type of the bias. Defaults to `dtype`.
+            linear_op: The linear operation to use. Defaults to `torch.nn.functional.linear`.
+        """
+
+        super().__init__()
+
+        # These attributes are unused, but keep them compatible with nn.Linear
+        self.in_features = in_features
+        self.out_features = out_features
+
+        self.linear_op = linear_op
+
+        self.weight = torch.nn.Parameter(
+            torch.empty(self.out_features, in_features, dtype=dtype)
+        )
+        if has_bias:
+            self.bias = torch.nn.Parameter(
+                torch.empty(self.out_features, dtype=bias_dtype or dtype)
+            )
+        else:
+            self.bias = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear_op(x, self.weight, self.bias)
+
+
+def ColumnParallelLinear(
+    in_features: int,
+    out_features: int,
+    has_bias: bool = True,
+    gather_output: bool = True,
+    dtype=None,
+    bias_dtype=None,
+    linear_op=torch.nn.functional.linear,
+    *,
+    base_linear_class: Optional[type] = None,
+    disable_quantization: bool = False,
+):
+    """
+    Factory function for the ColumnParallelLinear class family.
+
+    Most arguments are forwarded to ColumnParallelLinearMixIn, See ColumnParallelLinearMixIn for
+    details.
+
+    Additional arguments:
+        base_linear_class: The base linear class to use. Defaults to be determined by the global
+            quantization method.
+        disable_quantization: Disable quantization operation. Defaults to False.
+    """
+
+    args = get_global_args()
+    quant_method = (
+        None
+        if disable_quantization or not hasattr(args.models, "quant")
+        else args.models.quant
+    )
+    is_quantized = quant_method is not None and quant_method != "gguf"
+
+    if base_linear_class is None:
+        if is_quantized:
+            from chitu.quantization import QuantizationRegistry
+
+            base_linear_class = QuantizationRegistry.get_quantized_linear_class(
+                quant_method
+            )
+        else:
+            base_linear_class = LocalLinear
+
+    if dtype is None and is_quantized and quant_method == "blockfp8":
+        dtype = torch.float8_e4m3fn
+
+    class ColumnParallelLinearImpl(ColumnParallelLinearMixIn, base_linear_class):
+        # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
+        # of the final class, so we can append a class to the base class, to make it act like a
+        # further base class of the original base class.
+        # See https://docs.python.org/3/tutorial/classes.html#multiple-inheritance
+
+        pass
+
+    return ColumnParallelLinearImpl(
+        in_features=in_features,
+        out_features=out_features,
+        has_bias=has_bias,
+        gather_output=gather_output,
+        dtype=dtype,
+        bias_dtype=bias_dtype,
+        linear_op=linear_op,
+    )
+
+
+def RowParallelLinear(
+    in_features: int,
+    out_features: int,
+    has_bias: bool = True,
+    input_is_parallel: bool = False,
+    dtype=None,
+    bias_dtype=None,
+    linear_op=torch.nn.functional.linear,
+    *,
+    base_linear_class: Optional[type] = None,
+    disable_quantization: bool = False,
+):
+    """
+    Factory function for the RowParallelLinear class family.
+
+    Most arguments are forwarded to RowParallelLinearMixIn, See RowParallelLinearMixIn for details.
+
+    Additional arguments:
+        base_linear_class: The base linear class to use. Defaults to be determined by the global
+            quantization method.
+        disable_quantization: Disable quantization operation. Defaults to False.
+    """
+
+    args = get_global_args()
+    quant_method = (
+        None
+        if disable_quantization or not hasattr(args.models, "quant")
+        else args.models.quant
+    )
+    is_quantized = quant_method is not None and quant_method != "gguf"
+
+    if base_linear_class is None:
+        if is_quantized:
+            from chitu.quantization import QuantizationRegistry
+
+            base_linear_class = QuantizationRegistry.get_quantized_linear_class(
+                quant_method
+            )
+        else:
+            base_linear_class = LocalLinear
+
+    if dtype is None and is_quantized and quant_method == "blockfp8":
+        dtype = torch.float8_e4m3fn
+
+    class RowParallelLinearImpl(RowParallelLinearMixIn, base_linear_class):
+        # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
+        # of the final class, so we can append a class to the base class, to make it act like a
+        # further base class of the original base class.
+        # See https://docs.python.org/3/tutorial/classes.html#multiple-inheritance
+
+        pass
+
+    return RowParallelLinearImpl(
+        in_features=in_features,
+        out_features=out_features,
+        has_bias=has_bias,
+        input_is_parallel=input_is_parallel,
+        dtype=dtype,
+        bias_dtype=bias_dtype,
+        linear_op=linear_op,
+    )
+
+
+class ColumnParallelLinearMixIn:
     def __init__(
         self,
         in_features: int,
@@ -51,7 +230,6 @@ class ColumnParallelLinear(torch.nn.Module):
         dtype=None,
         bias_dtype=None,
         linear_op=torch.nn.functional.linear,
-        disable_quantization=False,
     ):
         """
         Ouput-dimension-parallelized linaer layer
@@ -64,81 +242,35 @@ class ColumnParallelLinear(torch.nn.Module):
             dtype: The desired data type of the parameters.
             bias_dtype: The desired data type of the bias. Defaults to `dtype`.
             linear_op: The linear operation to use. Defaults to `torch.nn.functional.linear`.
-            disable_quantization: disable quantization operation
         """
 
-        super().__init__()
+        tp_group = get_tp_group()
+        tp_size = get_tp_size()
 
-        self.tp_group = get_tp_group()
-        self.tp_size = get_tp_size()
+        assert out_features % tp_size == 0, "out_features must be divisible by tp_size"
+        local_out_features = out_features // tp_size
+
+        super().__init__(
+            in_features=in_features,
+            out_features=local_out_features,
+            has_bias=has_bias,
+            dtype=dtype,
+            bias_dtype=bias_dtype,
+            linear_op=linear_op,
+        )
+
+        self.gather_output = gather_output
+        self.linear_op = linear_op
+        self.local_out_features = local_out_features
+        self.tp_group = tp_group
+        self.tp_size = tp_size
 
         # These attributes are unused, but keep them compatible with nn.Linear
         self.in_features = in_features
         self.out_features = out_features
 
-        assert (
-            out_features % self.tp_size == 0
-        ), "out_features must be divisible by tp_size"
-
-        self.gather_output = gather_output
-        self.linear_op = linear_op
-        self.local_out_features = out_features // self.tp_size
-
-        args = get_global_args()
-        quant_method = (
-            None
-            if disable_quantization or not hasattr(args.models, "quant")
-            else args.models.quant
-        )
-        self.is_quantized = quant_method is not None and quant_method != "gguf"
-        if self.is_quantized:
-            from chitu.quantization import QuantizationRegistry
-
-            self.quant_linear_class = QuantizationRegistry.get_quantized_linear_class(
-                quant_method
-            )
-            assert (
-                self.quant_linear_class != None
-            ), f"quant method {quant_method} not support"
-
-            # Create quantized inner module
-            self.quant_linear_class.create_from_linear_spec(
-                self,
-                in_features=in_features,
-                out_features=self.local_out_features,
-                bias=has_bias,
-                weight_dtype=dtype,
-            )
-        else:
-            self.weight = torch.nn.Parameter(
-                torch.empty(self.local_out_features, in_features, dtype=dtype)
-            )
-            if has_bias:
-                self.bias = torch.nn.Parameter(
-                    torch.empty(self.local_out_features, dtype=bias_dtype or dtype)
-                )
-            else:
-                self.bias = None
-
-    def _apply(self, fn):
-        if self.is_quantized:
-
-            def callback(t):
-                return self.quant_linear_class._apply_callback(self, fn, t)
-
-            super()._apply(callback)
-        else:
-            super()._apply(fn)
-        return self
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Apply linear transformation
-        if self.is_quantized:
-            y = self.quant_linear_class.forward(self, x)
-        else:
-            # Use standard parameters
-            y = self.linear_op(x, self.weight, self.bias)
-
+        y = super().forward(x)
         if self.gather_output and self.tp_size > 1:
             y_transposed = y.permute(-1, *range(y.dim() - 1)).contiguous()
             shape = list(y_transposed.shape)
@@ -151,7 +283,7 @@ class ColumnParallelLinear(torch.nn.Module):
         return y
 
 
-class RowParallelLinear(torch.nn.Module):
+class RowParallelLinearMixIn:
     def __init__(
         self,
         in_features: int,
@@ -175,71 +307,32 @@ class RowParallelLinear(torch.nn.Module):
             linear_op: The linear operation to use. Defaults to `torch.nn.functional.linear`.
         """
 
-        super().__init__()
+        tp_group = get_tp_group()
+        tp_size = get_tp_size()
+        rank = get_tp_rank()
 
-        self.tp_group = get_tp_group()
-        self.tp_size = get_tp_size()
-        self.rank = get_tp_rank()
+        assert in_features % tp_size == 0, "in_features must be divisible by tp_size"
+        local_in_features = in_features // tp_size
+
+        super().__init__(
+            in_features=local_in_features,
+            out_features=out_features,
+            has_bias=has_bias if rank == 0 else False,
+            dtype=dtype,
+            bias_dtype=bias_dtype,
+            linear_op=linear_op,
+        )
+
+        self.input_is_parallel = input_is_parallel
+        self.linear_op = linear_op
+        self.local_in_features = local_in_features
+        self.tp_group = tp_group
+        self.tp_size = tp_size
+        self.rank = rank
 
         # These attributes are unused, but keep them compatible with nn.Linear
         self.in_features = in_features
         self.out_features = out_features
-
-        assert (
-            in_features % self.tp_size == 0
-        ), "in_features must be divisible by tp_size"
-
-        self.input_is_parallel = input_is_parallel
-        self.linear_op = linear_op
-
-        # Adjusted dimensions for tensor parallelism
-        self.local_in_features = in_features // self.tp_size
-
-        # Handle quantization
-        args = get_global_args()
-        quant_method = args.models.quant if hasattr(args.models, "quant") else None
-        self.is_quantized = quant_method is not None and quant_method != "gguf"
-
-        if self.is_quantized:
-            # Import here to avoid circular imports
-            from chitu.quantization import QuantizationRegistry
-
-            self.quant_linear_class = QuantizationRegistry.get_quantized_linear_class(
-                quant_method
-            )
-            assert (
-                self.quant_linear_class != None
-            ), f"quant method {quant_method} not support"
-
-            # Create quantized inner module
-            self.quant_linear_class.create_from_linear_spec(
-                self,
-                in_features=self.local_in_features,
-                out_features=out_features,
-                bias=has_bias,
-                weight_dtype=dtype,
-            )
-        else:
-            self.weight = torch.nn.Parameter(
-                torch.empty(out_features, self.local_in_features, dtype=dtype)
-            )
-            if has_bias:
-                self.bias = torch.nn.Parameter(
-                    torch.empty(out_features, dtype=bias_dtype or dtype)
-                )
-            else:
-                self.bias = None
-
-    def _apply(self, fn):
-        if self.is_quantized:
-
-            def callback(t):
-                return self.quant_linear_class._apply_callback(self, fn, t)
-
-            super()._apply(callback)
-        else:
-            super()._apply(fn)
-        return self
 
     def forward(self, x: torch.Tensor, dst=-1) -> torch.Tensor:
         if not self.input_is_parallel and self.tp_size > 1:
@@ -249,12 +342,7 @@ class RowParallelLinear(torch.nn.Module):
             shape.append(this_rank_dim)
             x = x.view(shape).select(-2, self.rank)
 
-        self.bias = self.bias if (self.rank == 0 or self.tp_size == 1) else None
-
-        if self.is_quantized:
-            y = self.quant_linear_class.forward(self, x)
-        else:
-            y = self.linear_op(x, self.weight, self.bias)
+        y = super().forward(x)
 
         if self.tp_size > 1:
             if dst == -1:

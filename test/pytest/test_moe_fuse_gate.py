@@ -27,19 +27,24 @@ def reference_top_impl(
 
 @pytest.mark.parametrize(
     "seq_length",
-    [1, 8, 9, 64, 256, 1024],
+    [1, 16, 128, 256, 512, 1024],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 @pytest.mark.parametrize("params", [(256, 8, 4, 8)])
 @pytest.mark.parametrize("has_bias", [True, False])
-def test_moe_fused_gate_sigmoid(seq_length, dtype, params, has_bias):
+@pytest.mark.parametrize("bias_is_float32", [True, False])
+def test_moe_fused_gate_sigmoid(seq_length, dtype, params, has_bias, bias_is_float32):
     num_experts, num_expert_group, topk_group, topk = params
 
     torch.manual_seed(seq_length)
     device = torch.device("cuda")
     scores = torch.rand((seq_length, num_experts)).to(dtype).to(device)
     if has_bias:
-        bias = torch.rand(num_experts).to(dtype).to(device)
+        bias = (
+            torch.rand(num_experts)
+            .to(torch.float32 if bias_is_float32 else dtype)
+            .to(device)
+        )
     else:
         bias = None
 
