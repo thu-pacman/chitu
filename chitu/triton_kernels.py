@@ -11,6 +11,7 @@ __all__ = [
     "moe_sum_kernel",
     "silu_and_mul_kernel",
     "rms_norm_kernel",
+    "grouped_matmul_kernel",
 ]
 
 import triton
@@ -602,3 +603,111 @@ def rms_norm_kernel(
     normed = normed.to(W_row.dtype)  # Be consistent with impl="ref"
     output = normed * W_row
     tl.store(Y + col_offsets, output, mask=mask)
+
+
+@triton.autotune(configs=fp8_gemm_deepseek_v3_configs, key=["N", "K"])
+@triton.jit
+def grouped_matmul_kernel(
+    group_a_ptrs,
+    group_b_ptrs,
+    group_b_s_ptrs,
+    group_c_ptrs,
+    M,
+    K,
+    N,
+    stride_a_group,
+    stride_a_m,
+    stride_b_group,
+    stride_b_1,
+    stride_c_group,
+    stride_c_m,
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    need_trans_B: tl.constexpr,
+):
+    """
+    Performs group matrix multiplication operation on matrices.
+
+    Args:
+        group_a_ptrs (tl.pointer): Pointer to the lhs.
+        group_b_ptrs (tl.pointer): Pointer to the rhs.
+        group_b_s_ptrs (tl.pointer): Pointer to the scaling factors of rhs.
+        group_c_ptrs (tl.pointer): output buffer for dequantized group matrix multiplication.
+        need_trans_B (tl.constexpr): Ture when B is [K, N], False when B is [N, K]
+    Returns:
+        None
+    """
+    pid_g = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+    pid_n = tl.program_id(axis=2)
+    m = tl.cdiv(M, BLOCK_SIZE_M)
+    n = tl.cdiv(N, BLOCK_SIZE_N)
+    k = tl.cdiv(K, BLOCK_SIZE_K)
+    scale_k = tl.cdiv(K, group_k)
+    scale_n = tl.cdiv(N, group_n)
+    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = (
+        group_a_ptrs
+        + pid_g * stride_a_group
+        + offs_m[:, None] * stride_a_m
+        + offs_k[None, :]
+    )
+    if need_trans_B:
+        b_ptrs = (
+            group_b_ptrs
+            + pid_g * stride_b_group
+            + offs_k[None, :] * stride_b_1
+            + offs_n[:, None]
+        )
+    else:
+        b_ptrs = (
+            group_b_ptrs
+            + pid_g * stride_b_group
+            + offs_n[None, :] * stride_b_1
+            + offs_k[:, None]
+        )
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for i in range(k):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K, other=0.0)
+        if need_trans_B:
+            b = tl.load(
+                b_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K, other=0.0
+            ).to(a.dtype)
+            b_s = tl.load(
+                group_b_s_ptrs
+                + pid_g * scale_k * scale_n
+                + pid_n * BLOCK_SIZE_N // group_n
+                + i * BLOCK_SIZE_K // group_k * scale_n
+            )
+            b = b.trans(1, 0)
+            b_ptrs += BLOCK_SIZE_K * stride_b_1
+        else:
+            b = tl.load(
+                b_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=0.0
+            ).to(a.dtype)
+            b_s = tl.load(
+                group_b_s_ptrs
+                + pid_g * scale_k * scale_n
+                + pid_n * BLOCK_SIZE_N // group_n * scale_k
+                + i * BLOCK_SIZE_K // group_k
+            )
+            b_ptrs += BLOCK_SIZE_K
+        accumulator += tl.dot(a, b) * b_s
+        a_ptrs += BLOCK_SIZE_K
+    c = accumulator.to(group_c_ptrs.dtype.element_ty)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = (
+        group_c_ptrs
+        + pid_g * stride_c_group
+        + offs_m[:, None] * stride_c_m
+        + offs_n[None, :]
+    )
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c, mask=mask)

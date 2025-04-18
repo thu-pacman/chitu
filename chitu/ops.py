@@ -10,6 +10,7 @@ import triton.language as tl
 from chitu.triton_kernels import *
 from chitu.device_type import is_hopper
 from chitu.utils import try_import_opt_dep
+from chitu.global_vars import get_global_args
 
 
 def to_triton_dtype(dtype: torch.dtype):
@@ -712,3 +713,150 @@ def rms_norm(X: torch.Tensor, W: torch.Tensor, eps, compute_dtype):
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return out.view(X_shape)
+
+
+@auto_retry_triton_compilation
+def quant_einsum_shd_hdc_shc(
+    group_A, group_B, group_b_s, group_n=128, group_k=128, impl="auto"
+):
+    assert group_A.dim() == 3
+    assert group_B.dim() == 3
+    assert group_A.shape[1] == group_B.shape[0]
+    assert group_A.shape[2] == group_B.shape[1]
+
+    if impl == "auto":
+        if group_b_s is not None and not get_global_args().infer.soft_fp8:
+            impl = "triton"
+        else:
+            impl = "torch"
+
+    if impl == "torch":
+        if group_b_s is not None:
+            weight_dequant_fn = (
+                weight_dequant_soft_fp8_deepseek_v3
+                if get_global_args().infer.soft_fp8
+                else weight_dequant_deepseek_v3
+            )
+            group_B = weight_dequant_fn(group_B, group_b_s, block_size=128)
+        return torch.einsum("shd,hdc->shc", group_A, group_B)
+
+    elif impl == "triton":
+        assert group_B.shape[1] == group_b_s.shape[1] * group_k
+        assert group_B.shape[2] == group_b_s.shape[2] * group_n
+        s, h, d, c = (
+            group_A.shape[0],
+            group_A.shape[1],
+            group_A.shape[2],
+            group_B.shape[2],
+        )
+        group_size = h
+        M = s
+        K = d
+        N = c
+        stride_A_group, stride_A_m = group_A.stride()[1], group_A.stride()[0]
+        stride_B_group, stride_B_1 = group_B.stride()[0], group_B.stride()[1]
+        stride_C_group, stride_C_m = c, h * c
+        group_C = torch.empty((s, h, c), dtype=group_A.dtype, device=group_A.device)
+
+        grid = lambda META: (
+            group_size,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]),
+            triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
+        grouped_matmul_kernel[grid](
+            group_A,
+            group_B,
+            group_b_s,
+            group_C,
+            M,
+            K,
+            N,
+            stride_A_group,
+            stride_A_m,
+            stride_B_group,
+            stride_B_1,
+            stride_C_group,
+            stride_C_m,
+            group_n,
+            group_k,
+            need_trans_B=True,
+        )
+
+        return group_C
+
+    else:
+        raise RuntimeError(f"Unsupported impl: {impl}")
+
+
+@auto_retry_triton_compilation
+def quant_einsum_shc_hdc_shd(
+    group_A, group_B, group_b_s, group_n=128, group_k=128, impl="auto"
+):
+    assert group_A.dim() == 3
+    assert group_B.dim() == 3
+    assert group_A.shape[1] == group_B.shape[0]
+    assert group_A.shape[2] == group_B.shape[2]
+
+    if impl == "auto":
+        if group_b_s is not None and not get_global_args().infer.soft_fp8:
+            impl = "triton"
+        else:
+            impl = "torch"
+
+    if impl == "torch":
+        if group_b_s is not None:
+            weight_dequant_fn = (
+                weight_dequant_soft_fp8_deepseek_v3
+                if get_global_args().infer.soft_fp8
+                else weight_dequant_deepseek_v3
+            )
+            group_B = weight_dequant_fn(group_B, group_b_s, block_size=128)
+        return torch.einsum("shc,hdc->shd", group_A, group_B)
+
+    elif impl == "triton":
+        assert group_B.shape[1] == group_b_s.shape[1] * group_k
+        assert group_B.shape[2] == group_b_s.shape[2] * group_n
+        s, h, c, d = (
+            group_A.shape[0],
+            group_A.shape[1],
+            group_A.shape[2],
+            group_B.shape[1],
+        )
+        group_size = h
+        M = s
+        K = c
+        N = d
+        stride_A_group, stride_A_m = group_A.stride()[1], group_A.stride()[0]
+        stride_B_group, stride_B_1 = group_B.stride()[0], group_B.stride()[1]
+        stride_C_group, stride_C_m = d, h * d
+        group_C = torch.empty((s, h, d), dtype=group_A.dtype, device=group_A.device)
+
+        grid = lambda META: (
+            group_size,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]),
+            triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
+
+        grouped_matmul_kernel[grid](
+            group_A,
+            group_B,
+            group_b_s,
+            group_C,
+            M,
+            K,
+            N,
+            stride_A_group,
+            stride_A_m,
+            stride_B_group,
+            stride_B_1,
+            stride_C_group,
+            stride_C_m,
+            group_n,
+            group_k,
+            need_trans_B=False,
+        )
+
+        return group_C
+
+    else:
+        raise RuntimeError(f"Unsupported impl: {impl}")

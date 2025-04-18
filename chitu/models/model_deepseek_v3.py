@@ -14,7 +14,12 @@ import chitu_backend
 from chitu.layers.gate import fused_sigmoid_gate
 from chitu.attn_backend import AttnBackend
 from chitu.cache_manager import PagedKVCacheManager
-from chitu.device_type import get_device_name, is_muxi, is_nvidia, has_native_fp8
+from chitu.device_type import (
+    get_device_name,
+    is_muxi,
+    is_nvidia,
+    has_native_fp8,
+)
 from chitu.global_vars import get_global_args
 from chitu.models.model import Attention, RMSNorm, Transformer, TransformerBlock
 from chitu.ops import (
@@ -23,6 +28,8 @@ from chitu.ops import (
     weight_dequant_soft_fp8_deepseek_v3,
     weight_quant_deepseek_v3,
     silu_and_mul,
+    quant_einsum_shd_hdc_shc,
+    quant_einsum_shc_hdc_shd,
 )
 from chitu.tensor_parallel import (
     LocalLinear,
@@ -84,6 +91,123 @@ def getLinearDeepSeekV3():
         return Blockfp8Linear
     else:
         raise NotImplementedError(f"{quant_method} is not supported for DeepSeek V3.")
+
+
+class ParallelAbsorbGemm1(torch.nn.Module):
+    def __init__(
+        self,
+        global_n_heads: int,
+        in_features_per_head: int,
+        out_features_per_head: int,
+        dtype=None,
+        block_size: int = 128,
+    ):
+        """
+        The first GeMM in "absorb-without-precomp" mode, embaarrassingly parallel among heads.
+
+        It compues `einsum("shd,hdc->shc", x, weight)` where `weight` may be block-fp8 quantized.
+        """
+
+        super().__init__()
+
+        if dtype is None:
+            dtype = torch.get_default_dtype()
+
+        tp_size = get_tp_size()
+        assert global_n_heads % tp_size == 0
+        local_n_heads = global_n_heads // tp_size
+
+        self.weight = torch.nn.Parameter(
+            torch.empty(
+                local_n_heads, in_features_per_head, out_features_per_head, dtype=dtype
+            )
+        )
+
+        if dtype.itemsize == 1:
+            assert out_features_per_head % block_size == 0
+            assert in_features_per_head % block_size == 0
+            self.scale = torch.nn.Parameter(
+                torch.empty(
+                    local_n_heads,
+                    in_features_per_head // block_size,
+                    out_features_per_head // block_size,
+                    dtype=torch.float32,
+                )
+            )
+        else:
+            self.register_parameter("scale", None)
+
+        self.local_n_heads = local_n_heads
+        self.in_features_per_head = in_features_per_head
+        self.out_features_per_head = out_features_per_head
+        self.block_size = block_size
+
+    def forward(self, q_nope: torch.Tensor) -> torch.Tensor:
+        return quant_einsum_shd_hdc_shc(q_nope, self.weight, self.scale)
+
+
+class ParallelAbsorbGemm2(torch.nn.Module):
+    def __init__(
+        self,
+        global_n_heads: int,
+        in_features_per_head: int,
+        out_features_per_head: int,
+        dtype=None,
+        block_size: int = 128,
+    ):
+        """
+        The second GeMM in "absorb-without-precomp" mode, embaarrassingly parallel among heads.
+
+        It compues `einsum("shc,hdc->shd", x, weight)` where `weight` may be block-fp8 quantized.
+        """
+
+        super().__init__()
+
+        if dtype is None:
+            dtype = torch.get_default_dtype()
+
+        tp_size = get_tp_size()
+        assert global_n_heads % tp_size == 0
+        local_n_heads = global_n_heads // tp_size
+
+        self.weight = torch.nn.Parameter(
+            torch.empty(
+                local_n_heads, out_features_per_head, in_features_per_head, dtype=dtype
+            )
+        )
+
+        if dtype.itemsize == 1:
+            assert out_features_per_head % block_size == 0
+            assert in_features_per_head % block_size == 0
+            self.scale = torch.nn.Parameter(
+                torch.empty(
+                    local_n_heads,
+                    out_features_per_head // block_size,
+                    in_features_per_head // block_size,
+                    dtype=torch.float32,
+                )
+            )
+        else:
+            self.register_parameter("scale", None)
+
+        self.local_n_heads = local_n_heads
+        self.in_features_per_head = in_features_per_head
+        self.out_features_per_head = out_features_per_head
+        self.block_size = block_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 3:
+            seq, n_head, n_hidden = x.shape
+            bs = None
+        else:
+            bs, seq, n_head, n_hidden = x.shape
+            x = x.view(bs * seq, n_head, n_hidden)
+
+        y = quant_einsum_shc_hdc_shd(x, self.weight, self.scale)
+
+        if bs is not None:
+            y = y.view(bs, seq, y.shape[-2], y.shape[-1])
+        return y
 
 
 class GroupColumnParallelLinearDeepSeekV3(torch.nn.Module):
@@ -320,7 +444,8 @@ class AttentionDeepSeekV3(Attention):
             base_linear_class=getLinearDeepSeekV3(),
         )
         self.kv_norm = RMSNorm(self.kv_lora_rank)
-        if self.mla_absorb != "absorb":
+
+        if self.mla_absorb == "none":
             self.wkv_b = ColumnParallelLinear(
                 self.kv_lora_rank,
                 self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -330,6 +455,22 @@ class AttentionDeepSeekV3(Attention):
                 gather_output=False,
                 base_linear_class=getLinearDeepSeekV3(),
             )
+        elif self.mla_absorb == "absorb-without-precomp":
+            self.wkv_b_absorb_1 = ParallelAbsorbGemm1(
+                self.n_heads,
+                self.qk_nope_head_dim,
+                self.kv_lora_rank,
+                dtype=parse_dtype(args.main_weight_dtype),
+                block_size=block_size,
+            )
+            self.wkv_b_absorb_2 = ParallelAbsorbGemm2(
+                self.n_heads,
+                self.kv_lora_rank,
+                self.v_head_dim,
+                dtype=parse_dtype(args.main_weight_dtype),
+                block_size=block_size,
+            )
+
         self.wo = RowParallelLinear(
             (
                 self.n_heads * self.v_head_dim
@@ -392,24 +533,10 @@ class AttentionDeepSeekV3(Attention):
             )
             return q, k, v
         elif self.mla_absorb == "absorb-without-precomp":
-            block_size = 128
-            weight_dequant_fn = (
-                weight_dequant_soft_fp8_deepseek_v3
-                if get_global_args().infer.soft_fp8
-                else weight_dequant_deepseek_v3
-            )
-            wkv_b = (
-                self.wkv_b.weight
-                if not isinstance(self.wkv_b, Blockfp8Linear)
-                else weight_dequant_fn(self.wkv_b.weight, self.wkv_b.scale, block_size)
-            )
-            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
-            q_nope = torch.einsum(
-                "shd,hdc->shc", q_nope, wkv_b[:, : self.qk_nope_head_dim]
-            )
-            return q_nope, q_pe, kv, k_pe, wkv_b
+            q_nope = self.wkv_b_absorb_1(q_nope)
+            return q_nope, q_pe, kv, k_pe
         elif self.mla_absorb == "absorb":
-            return q_nope, q_pe, kv, k_pe, None
+            return q_nope, q_pe, kv, k_pe
         else:
             raise NotImplementedError(
                 f"MLA absorb mode {self.mla_absorb} not supported"
@@ -442,9 +569,7 @@ class AttentionDeepSeekV3(Attention):
             )
 
         elif self.mla_absorb == "absorb-without-precomp" or self.mla_absorb == "absorb":
-            q_nope, q_pe, kv, k_pe, wkv_b = self._run_linear(
-                x, freqs_cis_cos, freqs_cis_sin
-            )
+            q_nope, q_pe, kv, k_pe = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
 
             kv_cache = self.kv_norm(kv, compute_dtype=kv.dtype)
             pe_cache = k_pe
@@ -480,7 +605,7 @@ class AttentionDeepSeekV3(Attention):
 
             x = x.view(bs_seq, x.shape[-2], x.shape[-1])
             if self.mla_absorb == "absorb-without-precomp":
-                x = torch.einsum("shc,hdc->shd", x, wkv_b[:, -self.v_head_dim :])
+                x = self.wkv_b_absorb_2(x)
 
         else:
             raise NotImplementedError(
@@ -518,7 +643,7 @@ class AttentionDeepSeekV3(Attention):
             ).view(bsz, seqlen, 1, -1)
 
         elif self.mla_absorb == "absorb-without-precomp" or self.mla_absorb == "absorb":
-            q_nope, q_pe, kv, k_pe, wkv_b = self._run_linear(
+            q_nope, q_pe, kv, k_pe = self._run_linear(
                 x.view(bsz * seqlen, -1), freqs_cis_cos, freqs_cis_sin
             )
 
@@ -541,7 +666,7 @@ class AttentionDeepSeekV3(Attention):
                 pe_cache[:, start_pos] = kv_pe_cache[:, start_pos, self.kv_lora_rank :]
 
             if self.mla_absorb == "absorb-without-precomp":
-                x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim :])
+                x = self.wkv_b_absorb_2(x)
 
         else:
             raise NotImplementedError(
@@ -561,7 +686,7 @@ class AttentionDeepSeekV3(Attention):
         cache_seqlens_excl_this_decode = self.cache.get_gpu_seq_lens_excl_this_decode()
         cache_seqlens_incl_this_decode = self.cache.get_gpu_seq_lens_incl_this_decode()
         bsz, seqlen, _ = x.size()
-        q_nope, q_pe, kv, k_pe, wkv_b = self._run_linear(
+        q_nope, q_pe, kv, k_pe = self._run_linear(
             x.view(bsz * seqlen, -1), freqs_cis_cos, freqs_cis_sin
         )
 
@@ -581,7 +706,7 @@ class AttentionDeepSeekV3(Attention):
             softmax_scale=self.softmax_scale,
         )
         if self.mla_absorb == "absorb-without-precomp":
-            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim :])
+            x = self.wkv_b_absorb_2(x)
         x = self._run_output_linear(x)
         return x
 
@@ -1493,6 +1618,49 @@ class TransformerDeepSeekV3(Transformer):
             new_checkpoint[k] = checkpoint[k]
         return new_checkpoint
 
+    def _process_state_dict_for_absorption_without_precomputation(
+        self, checkpoint: Mapping[str, Any]
+    ):
+        model_parallel_size = get_tp_size()
+        n_local_heads = self.params.n_heads // model_parallel_size
+        block_size = 128
+
+        new_checkpoint = {}
+        for k in checkpoint.keys():
+            if k.endswith(".wkv_b.weight"):
+                prefix = k[: -len("wkv_b.weight")]
+                wkv_b_weight = checkpoint[prefix + "wkv_b.weight"]
+                wkv_b_weight = wkv_b_weight.view(
+                    n_local_heads, -1, wkv_b_weight.shape[-1]
+                )
+                wkv_b_scale = checkpoint[prefix + "wkv_b.scale"]
+                wkv_b_scale = wkv_b_scale.view(n_local_heads, -1, wkv_b_scale.shape[-1])
+                wkv_b_absorb_1_weight = wkv_b_weight[:, : self.params.qk_nope_head_dim]
+                wkv_b_absorb_1_scale = wkv_b_scale[
+                    :, : self.params.qk_nope_head_dim // block_size
+                ]
+                wkv_b_absorb_2_weight = wkv_b_weight[:, self.params.qk_nope_head_dim :]
+                wkv_b_absorb_2_scale = wkv_b_scale[
+                    :, self.params.qk_nope_head_dim // block_size :
+                ]
+                new_checkpoint[prefix + "wkv_b_absorb_1.weight"] = wkv_b_absorb_1_weight
+                new_checkpoint[prefix + "wkv_b_absorb_1.scale"] = wkv_b_absorb_1_scale
+                new_checkpoint[prefix + "wkv_b_absorb_2.weight"] = wkv_b_absorb_2_weight
+                new_checkpoint[prefix + "wkv_b_absorb_2.scale"] = wkv_b_absorb_2_scale
+
+            elif k.endswith(".wkv_b.scale"):
+                continue
+
+            elif k.endswith(".wkv_b.bias"):
+                raise NotImplementedError(
+                    "infer.mla_absorb=absorb-without-precomp is not implemented for wkv_b with a bias"
+                )
+
+            else:
+                new_checkpoint[k] = checkpoint[k]
+
+        return new_checkpoint
+
     def _process_state_dict_for_absorption(self, checkpoint: Mapping[str, Any]):
         model_parallel_size = get_tp_size()
         n_local_heads = self.params.n_heads // model_parallel_size
@@ -1789,6 +1957,12 @@ class TransformerDeepSeekV3(Transformer):
 
             if self.mla_absorb == "absorb":
                 state_dict = self._process_state_dict_for_absorption(state_dict)
+            elif self.mla_absorb == "absorb-without-precomp":
+                state_dict = (
+                    self._process_state_dict_for_absorption_without_precomputation(
+                        state_dict
+                    )
+                )
 
             if self.merge_qkv_gate_up:
                 state_dict = self._process_state_dict_for_merging_qkv(state_dict)
