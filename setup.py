@@ -19,6 +19,7 @@ assert packaging.version.parse(setuptools.__version__) >= packaging.version.pars
     "62.3.0"
 ), "setuptools>=62.3.0 is required for `**` wildcard in package_data."
 
+
 setup_dir = os.path.dirname(os.path.abspath(__file__))
 
 ext_modules = [
@@ -37,9 +38,24 @@ ext_modules = [
             "nvcc": ["-std=c++17"],
         },
         include_dirs=[os.path.join(setup_dir, "third_party/spdlog/include")],
-    )
+    ),
+    CUDAExtension(
+        name="KTransformersOps",
+        sources=[
+            "csrc/custom_gguf/dequant.cu",
+            "csrc/custom_gguf/binding.cpp",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": [
+                "-O3",
+                "--use_fast_math",
+                "-Xcompiler",
+                "-fPIC",
+            ],
+        },
+    ),
 ]
-
 
 cython_unsafe_files = [
     "triton_kernels.py",  # Triton kernels inside
@@ -147,6 +163,9 @@ setup(
         "deep_gemm": [
             "deep_gemm @ file://localhost"
             + os.path.join(setup_dir, "third_party/DeepGEMM"),
+        ],
+        "cpu": [
+            "cpumoe @ file://localhost" + os.path.join(setup_dir, "csrc/cpumoe"),
         ],
     },
     packages=find_packages(),

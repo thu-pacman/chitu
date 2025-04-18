@@ -120,12 +120,15 @@ def run_pipe_or_tensor_parallelism(args, timers):
                 )
         t_start = time.time()
         timers("overall").start()
+        tokens = 0
         while not chitu_is_terminated():
+            tokens += 1
             chitu_run()
             if rank == 0 and len(TaskPool.pool) == 0:
                 break  # Rank 0 can temperarily leave to do other things
         timers("overall").stop()
         t_end = time.time()
+        logger.info(f"Tokens generate : {tokens}")
         logger.info(f"Time cost {t_end - t_start}")
 
         if rank == 0:
@@ -149,12 +152,15 @@ def run_normal(args, timers):
             )
         t_start = time.time()
         timers("overall").start()
+        tokens = 0
         while len(TaskPool.pool) > 0:
+            tokens += 1
             chitu_run()
 
         print("GPU memory used : ", torch.cuda.memory_allocated())
         timers("overall").stop()
         t_end = time.time()
+        logger.info(f"Tokens generate : {tokens}")
         logger.info(f"Time cost {t_end - t_start}")
 
         for req in reqs:

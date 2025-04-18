@@ -276,7 +276,6 @@ class Transformer(nn.Module):
         self.params = params
         self.vocab_size = params.vocab_size
         self.global_n_layers = params.n_layers
-
         if self.pipeline_exec:
             num_layers_of_each_rank = compute_layer_dist_in_pipe(
                 self.global_n_layers, self.pipeline_parallel_size

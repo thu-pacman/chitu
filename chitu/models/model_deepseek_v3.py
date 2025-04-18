@@ -5,6 +5,7 @@ from typing import Any, List, Mapping, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import torch.distributed
 import torch.nn.functional as F
 from torch import nn
 from typing_extensions import override
@@ -35,6 +36,7 @@ from chitu.tensor_parallel import (
 from chitu.utils import try_import_opt_dep
 from chitu.quantization import linear_block_fp8, Blockfp8Linear
 
+import ctypes
 
 logger = getLogger(__name__)
 
@@ -1023,6 +1025,305 @@ class MoEDeepSeekV3(nn.Module):
         return y.view(shape)
 
 
+class MoEDeepSeekV3CPU(nn.Module):
+    """
+    Mixture-of-Experts (MoE) module.
+
+    Attributes:
+        dim (int): Dimensionality of input features.
+        n_routed_experts (int): Total number of experts in the model.
+        n_local_experts (int): Number of experts handled locally in distributed systems.
+        n_activated_experts (int): Number of experts activated for each input.
+        gate (nn.Module): Gating mechanism to route inputs to experts.
+        experts (nn.ModuleList): List of expert modules.
+        shared_experts (nn.Module): Shared experts applied to all inputs.
+    """
+
+    def __init__(self, args, ggml_type, merge_gate_up: bool):
+        """
+        Initializes the MoE module.
+
+        Args:
+            args (ModelArgs): Model arguments containing MoE parameters.
+        """
+        super().__init__()
+        self.merge_gate_up = merge_gate_up
+        self.dim = args.dim
+        self.tp_group = get_tp_group()
+        self.tp_size = get_tp_size()
+        self.rank = get_tp_rank()
+
+        moe_world_size = 1
+        self.max_batch_size = get_global_args().infer.max_reqs
+        assert (
+            args.n_routed_experts % moe_world_size == 0
+        ), f"Number of experts must be divisible by world size (world_size={moe_world_size})"
+        self.n_shared_experts = args.n_shared_experts
+        self.n_routed_experts = args.n_routed_experts
+        self.n_local_experts = args.n_routed_experts // moe_world_size
+        self.n_activated_experts = args.n_activated_experts
+        self.gate = GateDeepSeekV3(args)
+        if merge_gate_up:
+            self.w1w3 = ColumnParallelLinear(
+                args.dim,
+                args.moe_inter_dim * 2,
+                has_bias=False,
+                dtype=parse_dtype(args.main_weight_dtype),
+                bias_dtype=torch.bfloat16,
+                gather_output=False,
+            )
+        else:
+            self.w1 = ColumnParallelLinear(
+                args.dim,
+                args.moe_inter_dim,
+                has_bias=False,
+                dtype=parse_dtype(args.main_weight_dtype),
+                bias_dtype=torch.bfloat16,
+                gather_output=False,
+                base_linear_class=getLinearDeepSeekV3(),
+            )
+            self.w3 = ColumnParallelLinear(
+                args.dim,
+                args.moe_inter_dim,
+                has_bias=False,
+                dtype=parse_dtype(args.main_weight_dtype),
+                bias_dtype=torch.bfloat16,
+                gather_output=False,
+                base_linear_class=getLinearDeepSeekV3(),
+            )
+        self.w2 = RowParallelLinear(
+            args.moe_inter_dim,
+            args.dim,
+            has_bias=False,
+            dtype=parse_dtype(args.main_weight_dtype),
+            bias_dtype=torch.bfloat16,
+            input_is_parallel=True,
+            base_linear_class=getLinearDeepSeekV3(),
+        )
+
+        if self.rank == 0:
+
+            self.register_buffer(
+                "gate_proj",
+                torch.empty(
+                    int(256 * 2048 * 7168 / 256 * 144),
+                    dtype=torch.uint8,
+                    device="cpu",
+                    requires_grad=False,
+                ),
+            )
+            self.register_buffer(
+                "up_proj",
+                torch.empty(
+                    int(256 * 2048 * 7168 / 256 * 144),
+                    dtype=torch.uint8,
+                    device="cpu",
+                    requires_grad=False,
+                ),
+            )
+            if ggml_type == 12:
+                self.register_buffer(
+                    "down_proj",
+                    torch.empty(
+                        int(256 * 2048 * 7168 / 256 * 144),
+                        dtype=torch.uint8,
+                        device="cpu",
+                        requires_grad=False,
+                    ),
+                )
+            elif ggml_type == 14:
+                self.register_buffer(
+                    "down_proj",
+                    torch.empty(
+                        int(256 * 2048 * 7168 / 256 * 210),
+                        dtype=torch.uint8,
+                        device="cpu",
+                        requires_grad=False,
+                    ),
+                )
+            else:
+                raise ValueError("ggml quantization type unimplemented !")
+
+            self.register_buffer(
+                "gate_type",
+                torch.empty(
+                    1,
+                    dtype=torch.int,
+                    device="cpu",
+                    requires_grad=False,
+                ),
+            )
+            self.register_buffer(
+                "up_type",
+                torch.empty(
+                    1,
+                    dtype=torch.int,
+                    device="cpu",
+                    requires_grad=False,
+                ),
+            )
+            self.register_buffer(
+                "down_type",
+                torch.empty(
+                    1,
+                    dtype=torch.int,
+                    device="cpu",
+                    requires_grad=False,
+                ),
+            )
+
+        self.stride = 64
+        self.moe = None
+
+    def to(self, *args, **kwargs):
+        self.gate.to(*args, **kwargs)
+        if self.merge_gate_up:
+            self.w1w3.to(*args, **kwargs)
+        else:
+            self.w1.to(*args, **kwargs)
+            self.w3.to(*args, **kwargs)
+        self.w2.to(*args, **kwargs)
+        return self
+
+    def init_weights(self):
+        if self.rank == 0:
+            gate_ptr = ctypes.addressof(
+                ctypes.cast(
+                    self.gate_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+                ).contents
+            )
+            up_ptr = ctypes.addressof(
+                ctypes.cast(
+                    self.up_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+                ).contents
+            )
+            down_ptr = ctypes.addressof(
+                ctypes.cast(
+                    self.down_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+                ).contents
+            )
+
+            import cpumoe
+
+            moe_config = cpumoe.moe.MOEConfig(
+                256,
+                8,
+                7168,
+                2048,
+                self.stride,
+                10,
+                1024,
+                gate_ptr,
+                up_ptr,
+                down_ptr,
+                self.gate_type.item(),
+                self.up_type.item(),
+                self.down_type.item(),
+                30,
+                0,
+            )
+
+            self.moe = cpumoe.moe.MOE(moe_config)
+
+            # warm up
+            self.moe.warm_up()
+            self.input_tensor_cpu = torch.empty(
+                (self.max_batch_size, 1, 7168),
+                device="cpu",
+                pin_memory=True,
+                dtype=torch.bfloat16,
+            )
+            self.weights_cpu = torch.empty(
+                (self.max_batch_size, 8),
+                device="cpu",
+                pin_memory=True,
+                dtype=torch.float32,
+            )
+            self.indices_cpu = torch.empty(
+                (self.max_batch_size, 8),
+                device="cpu",
+                pin_memory=True,
+                dtype=torch.int64,
+            )
+            self.output_cpu = torch.empty(
+                (self.max_batch_size, 1, 7168),
+                device="cpu",
+                pin_memory=True,
+                dtype=torch.bfloat16,
+            )
+            self.output_gpu = torch.empty(
+                (self.max_batch_size, 1, 7168), device=self.rank, dtype=torch.bfloat16
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the MoE module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after expert routing and computation.
+        """
+        shape = x.size()
+
+        if self.rank == 0:
+            x_flat = x.view(-1, self.dim)
+            weights, indices = self.gate(x_flat)
+            indices = indices.contiguous().to(torch.int64)
+            weights = weights.contiguous().to(torch.float32)
+            if x.shape[1] > 1:
+                input_tensor = x.contiguous().cpu()
+                indices = indices.cpu()
+                weights = weights.cpu()
+                output = torch.empty_like(input_tensor).contiguous().pin_memory()
+                self.moe.forward(
+                    indices.size(0),
+                    indices.size(1),
+                    indices.data_ptr(),
+                    weights.data_ptr(),
+                    input_tensor.data_ptr(),
+                    output.data_ptr(),
+                )
+            else:
+                self.input_tensor_cpu.copy_(x, non_blocking=True)
+                self.indices_cpu.copy_(indices, non_blocking=True)
+                self.weights_cpu.copy_(weights, non_blocking=True)
+                self.moe.forward_with_cuda_stream(
+                    self.max_batch_size,
+                    8,
+                    self.indices_cpu.data_ptr(),
+                    self.weights_cpu.data_ptr(),
+                    self.input_tensor_cpu.data_ptr(),
+                    self.output_cpu.data_ptr(),
+                    torch.cuda.current_stream().cuda_stream,
+                )
+
+        if self.merge_gate_up:
+            w1w3_out = self.w1w3(x)
+            w1_out, w3_out = torch.split(w1w3_out, w1w3_out.shape[-1] // 2, dim=-1)
+        else:
+            w1_out = self.w1(x)
+            w3_out = self.w3(x)
+        y = self.w2(F.silu(w1_out) * w3_out)
+
+        if self.rank == 0:
+            if x.shape[1] > 1:
+                self.moe.sync()
+                output = output.to(x.device, non_blocking=True).view(shape)
+                y += output
+            else:
+                self.moe.sync_with_cuda_stream(torch.cuda.current_stream().cuda_stream)
+                self.output_gpu.copy_(self.output_cpu, non_blocking=True)
+                y += self.output_gpu
+            y_scatter = [y] * self.tp_size
+        else:
+            y_scatter = None
+
+        torch.distributed.scatter(y, y_scatter, src=0)
+        return y.view(shape)
+
+
 class TransformerBlockDeepSeekV3(TransformerBlock):
     def __init__(
         self,
@@ -1033,10 +1334,13 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         op_impl,
         mla_absorb,
         merge_qkv_gate_up,
+        cpu_infer=False,
+        ggml_type=0,
     ):
         super().__init__(
             layer_id, args, cache, attn_backend=attn_backend, op_impl=op_impl
         )
+        self.layer_id = layer_id
         self.attn = AttentionDeepSeekV3(
             args,
             layer_id,
@@ -1051,13 +1355,28 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                 merge_gate_up=merge_qkv_gate_up,
             )
             if layer_id < args.n_dense_layers
-            else MoEDeepSeekV3(
-                args,
-                merge_gate_up=merge_qkv_gate_up,
+            else (
+                MoEDeepSeekV3(
+                    args,
+                    merge_gate_up=merge_qkv_gate_up,
+                )
+                if not cpu_infer
+                else MoEDeepSeekV3CPU(
+                    args,
+                    ggml_type=ggml_type,
+                    merge_gate_up=merge_qkv_gate_up,
+                )
             )
         )
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
+
+    def to(self, *args, **kwargs):
+        self.attn.to(*args, **kwargs)
+        self.ffn.to(*args, **kwargs)
+        self.attn_norm.to(*args, **kwargs)
+        self.ffn_norm.to(*args, **kwargs)
+        return self
 
     def forward(
         self,
@@ -1066,7 +1385,6 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         freqs_cis_sin: torch.Tensor,
         varlens=None,
     ):
-
         x = x + self.attn(
             self.attn_norm(x, compute_dtype=x.dtype),
             freqs_cis_cos,
@@ -1083,6 +1401,9 @@ class TransformerDeepSeekV3(Transformer):
         params,
         cache,
         *,
+        cpu_infer: bool,
+        cpu_layers: List,
+        ggml_type: List,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
         model_parallel_size: int,
@@ -1093,6 +1414,9 @@ class TransformerDeepSeekV3(Transformer):
     ):
         self.mla_absorb = mla_absorb
         self.merge_qkv_gate_up = merge_qkv_gate_up
+        self.cpu_layers = cpu_layers
+        self.ggml_type = ggml_type
+        self.cpu_infer = cpu_infer
         super().__init__(
             params,
             cache,
@@ -1105,6 +1429,14 @@ class TransformerDeepSeekV3(Transformer):
         )
         if op_impl != "torch":
             raise NotImplementedError("Only op_impl=torch is supported in DeepSeek V3")
+
+    def to(self, *args, **kwargs):
+        self.embed.to(*args, **kwargs)
+        self.norm.to(*args, **kwargs)
+        self.head.to(*args, **kwargs)
+        for l in self.layers:
+            l.to(*args, **kwargs)
+        return self
 
     @override
     def _get_tensor_column_parallel_layer_names(self) -> List[str]:
@@ -1361,11 +1693,11 @@ class TransformerDeepSeekV3(Transformer):
         self,
         state_dict: Mapping[str, Any],
         skip_preprocess: bool = False,
+        replace=True,
         *args,
         **kwargs,
     ):
-        if not skip_preprocess:
-
+        if skip_preprocess and replace:
             new_state_dict = {}
             for k in state_dict.keys():
                 name = k
@@ -1434,18 +1766,43 @@ class TransformerDeepSeekV3(Transformer):
     @override
     def _init_layers(self, cache, attn_backend, op_impl):
         self.layers = torch.nn.ModuleList()
+        import logging
+        from logging import getLogger
+
+        logger = getLogger(__name__)
+        import resource
+
+        memory_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
-            self.layers.append(
-                TransformerBlockDeepSeekV3(
-                    layer_id,
-                    self.params,
-                    cache,
-                    attn_backend,
-                    self.op_impl,
-                    mla_absorb=self.mla_absorb,
-                    merge_qkv_gate_up=self.merge_qkv_gate_up,
-                )
+            logger.info(
+                f"initing layer : {layer_id}  cpu memory usage: {memory_usage / 1024**2} GB  gpu memory usage : RANK : {torch.cuda.current_device()} {torch.cuda.memory_allocated()/(1024**3)} GB"
             )
+            if layer_id in self.cpu_layers:
+                self.layers.append(
+                    TransformerBlockDeepSeekV3(
+                        layer_id,
+                        self.params,
+                        cache,
+                        attn_backend,
+                        self.op_impl,
+                        mla_absorb=self.mla_absorb,
+                        merge_qkv_gate_up=self.merge_qkv_gate_up,
+                        cpu_infer=self.cpu_infer,
+                        ggml_type=self.ggml_type[layer_id],
+                    )
+                )
+            else:
+                self.layers.append(
+                    TransformerBlockDeepSeekV3(
+                        layer_id,
+                        self.params,
+                        cache,
+                        attn_backend,
+                        self.op_impl,
+                        mla_absorb=self.mla_absorb,
+                        merge_qkv_gate_up=self.merge_qkv_gate_up,
+                    )
+                )
 
     @override
     def _init_post_layers(self):
