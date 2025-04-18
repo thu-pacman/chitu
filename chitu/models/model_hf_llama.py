@@ -9,9 +9,9 @@ from torch import nn
 from chitu.attn_backend import AttnBackend
 from chitu.models.model import Attention, RMSNorm, Transformer, TransformerBlock
 from chitu.muxi_utils import (
-    linear_layout_contig_x_contig_y,
-    linear_layout_contig_x_native_y,
-    linear_layout_native_x_contig_y,
+    LinearLayoutContigXContigY,
+    LinearLayoutContigXNativeY,
+    LinearLayoutNativeXContigY,
     preprocess_weights_for_native_layout,
 )
 from chitu.ops import apply_rotary_pos_emb
@@ -82,7 +82,7 @@ class AttentionHFLlama(Attention):
                 (args.n_heads + 2 * self.n_kv_heads) * self.head_dim,
                 has_bias=qkv_has_bias,
                 gather_output=False,
-                linear_op=qkv_proj_linear,
+                base_linear_class=qkv_proj_linear,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -90,28 +90,28 @@ class AttentionHFLlama(Attention):
                 args.n_heads * self.head_dim,
                 has_bias=qkv_has_bias,
                 gather_output=False,
-                linear_op=qkv_proj_linear,
+                base_linear_class=qkv_proj_linear,
             )
             self.k_proj = ColumnParallelLinear(
                 args.dim,
                 self.n_kv_heads * self.head_dim,
                 has_bias=qkv_has_bias,
                 gather_output=False,
-                linear_op=qkv_proj_linear,
+                base_linear_class=qkv_proj_linear,
             )
             self.v_proj = ColumnParallelLinear(
                 args.dim,
                 self.n_kv_heads * self.head_dim,
                 has_bias=qkv_has_bias,
                 gather_output=False,
-                linear_op=qkv_proj_linear,
+                base_linear_class=qkv_proj_linear,
             )
         self.o_proj = RowParallelLinear(
             args.n_heads * self.head_dim,
             args.dim,
             has_bias=o_has_bias,
             input_is_parallel=True,
-            linear_op=o_proj_linear,
+            base_linear_class=o_proj_linear,
         )
 
     def _run_linear(self, x):
@@ -290,7 +290,7 @@ class FeedForwardHFLlama(nn.Module):
                 hidden_dim * 2,
                 has_bias=False,
                 gather_output=False,
-                linear_op=gate_up_proj_linear,
+                base_linear_class=gate_up_proj_linear,
             )
         else:
             self.gate_proj = ColumnParallelLinear(
@@ -298,21 +298,21 @@ class FeedForwardHFLlama(nn.Module):
                 hidden_dim,
                 has_bias=False,
                 gather_output=False,
-                linear_op=gate_up_proj_linear,
+                base_linear_class=gate_up_proj_linear,
             )
             self.up_proj = ColumnParallelLinear(
                 dim,
                 hidden_dim,
                 has_bias=False,
                 gather_output=False,
-                linear_op=gate_up_proj_linear,
+                base_linear_class=gate_up_proj_linear,
             )
         self.down_proj = RowParallelLinear(
             hidden_dim,
             dim,
             has_bias=False,
             input_is_parallel=True,
-            linear_op=down_proj_linear,
+            base_linear_class=down_proj_linear,
         )
 
     def forward(self, x):
@@ -797,33 +797,21 @@ class RotaryEmbeddingHFLlama(nn.Module):
 
 
 def get_linear_layout_contig_x_native_y(op_impl: str):
-    if op_impl == "torch":
-        return torch.nn.functional.linear
-    elif op_impl == "muxi_custom_kernel":
-        return linear_layout_contig_x_native_y
-    elif op_impl == "muxi_w8a8_kernel":
-        return torch.nn.functional.linear
+    if op_impl == "muxi_custom_kernel":
+        return LinearLayoutContigXNativeY
     else:
-        raise NotImplementedError()
+        return None  # Let QuantizationRegistry pick it
 
 
 def get_linear_layout_native_x_contig_y(op_impl: str):
-    if op_impl == "torch":
-        return torch.nn.functional.linear
-    elif op_impl == "muxi_custom_kernel":
-        return linear_layout_native_x_contig_y
-    elif op_impl == "muxi_w8a8_kernel":
-        return torch.nn.functional.linear
+    if op_impl == "muxi_custom_kernel":
+        return LinearLayoutNativeXContigY
     else:
-        raise NotImplementedError()
+        return None  # Let QuantizationRegistry pick it
 
 
 def get_linear_layout_contig_x_contig_y(op_impl: str):
-    if op_impl == "torch":
-        return torch.nn.functional.linear
-    elif op_impl == "muxi_custom_kernel":
-        return linear_layout_contig_x_contig_y
-    elif op_impl == "muxi_w8a8_kernel":
-        return torch.nn.functional.linear
+    if op_impl == "muxi_custom_kernel":
+        return LinearLayoutContigXContigY
     else:
-        raise NotImplementedError()
+        return None  # Let QuantizationRegistry pick it

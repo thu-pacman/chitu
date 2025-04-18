@@ -1,6 +1,8 @@
 from typing import List
+import torch
 
 from chitu.utils import try_import_opt_dep
+from chitu.tensor_parallel import LocalLinear
 
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
@@ -105,3 +107,18 @@ def linear_layout_contig_x_contig_y(x, w, b=None):
             w_transposed, x_transposed, bias=b
         )
     return y
+
+
+class LinearLayoutContigXNativeY(LocalLinear):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return linear_layout_contig_x_native_y(x, self.weight, self.bias)
+
+
+class LinearLayoutNativeXContigY(LocalLinear):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return linear_layout_native_x_contig_y(x, self.weight, self.bias)
+
+
+class LinearLayoutContigXContigY(LocalLinear):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return linear_layout_contig_x_contig_y(x, self.weight, self.bias)

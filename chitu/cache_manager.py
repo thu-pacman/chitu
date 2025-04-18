@@ -206,7 +206,9 @@ class PagedKVCacheManager:
         else:
             max_block_num = max(len(self.block_table[req_id]) for req_id in req_ids)
         self.gpu_block_table.set(
-            torch.zeros((len(req_ids), max_block_num), dtype=torch.int32, device="cuda")
+            torch.zeros(
+                (len(req_ids), max_block_num), dtype=torch.int32, device=self.device
+            )
         )
         for idx, req_id in enumerate(req_ids):
             block_ids = self.block_table[req_id]
