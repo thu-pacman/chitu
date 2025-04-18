@@ -360,7 +360,6 @@ class Blockfp8Linear(QuantizedLinearBase):
         dtype=torch.float8_e4m3fn,
         bias_dtype=None,
         block_size=128,
-        **kwargs,
     ):
         super().__init__()
 

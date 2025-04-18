@@ -55,7 +55,6 @@ class LocalLinear(torch.nn.Module):
         has_bias: bool = True,
         dtype=None,
         bias_dtype=None,
-        linear_op=torch.nn.functional.linear,
     ):
         """
         Linear layer running on a single device.
@@ -68,7 +67,6 @@ class LocalLinear(torch.nn.Module):
             has_bias: If set to True, the layer will have a bias.
             dtype: The desired data type of the parameters.
             bias_dtype: The desired data type of the bias. Defaults to `dtype`.
-            linear_op: The linear operation to use. Defaults to `torch.nn.functional.linear`.
         """
 
         super().__init__()
@@ -76,8 +74,6 @@ class LocalLinear(torch.nn.Module):
         # These attributes are unused, but keep them compatible with nn.Linear
         self.in_features = in_features
         self.out_features = out_features
-
-        self.linear_op = linear_op
 
         self.weight = torch.nn.Parameter(
             torch.empty(self.out_features, in_features, dtype=dtype)
@@ -90,7 +86,7 @@ class LocalLinear(torch.nn.Module):
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear_op(x, self.weight, self.bias)
+        return torch.nn.functional.linear(x, self.weight, self.bias)
 
 
 def ColumnParallelLinear(
@@ -100,7 +96,6 @@ def ColumnParallelLinear(
     gather_output: bool = True,
     dtype=None,
     bias_dtype=None,
-    linear_op=torch.nn.functional.linear,
     *,
     base_linear_class: Optional[type] = None,
     disable_quantization: bool = False,
@@ -153,7 +148,6 @@ def ColumnParallelLinear(
         gather_output=gather_output,
         dtype=dtype,
         bias_dtype=bias_dtype,
-        linear_op=linear_op,
     )
 
 
@@ -164,7 +158,6 @@ def RowParallelLinear(
     input_is_parallel: bool = False,
     dtype=None,
     bias_dtype=None,
-    linear_op=torch.nn.functional.linear,
     *,
     base_linear_class: Optional[type] = None,
     disable_quantization: bool = False,
@@ -216,7 +209,6 @@ def RowParallelLinear(
         input_is_parallel=input_is_parallel,
         dtype=dtype,
         bias_dtype=bias_dtype,
-        linear_op=linear_op,
     )
 
 
@@ -229,7 +221,6 @@ class ColumnParallelLinearMixIn:
         gather_output: bool = True,
         dtype=None,
         bias_dtype=None,
-        linear_op=torch.nn.functional.linear,
     ):
         """
         Ouput-dimension-parallelized linaer layer
@@ -241,7 +232,6 @@ class ColumnParallelLinearMixIn:
             gather_output: If set to True, an all-gather operation is performed on the output tensor.
             dtype: The desired data type of the parameters.
             bias_dtype: The desired data type of the bias. Defaults to `dtype`.
-            linear_op: The linear operation to use. Defaults to `torch.nn.functional.linear`.
         """
 
         tp_group = get_tp_group()
@@ -256,11 +246,9 @@ class ColumnParallelLinearMixIn:
             has_bias=has_bias,
             dtype=dtype,
             bias_dtype=bias_dtype,
-            linear_op=linear_op,
         )
 
         self.gather_output = gather_output
-        self.linear_op = linear_op
         self.local_out_features = local_out_features
         self.tp_group = tp_group
         self.tp_size = tp_size
@@ -292,7 +280,6 @@ class RowParallelLinearMixIn:
         input_is_parallel: bool = False,
         dtype=None,
         bias_dtype=None,
-        linear_op=torch.nn.functional.linear,
     ):
         """
         Input-dimension-parallelized linear layer
@@ -304,7 +291,6 @@ class RowParallelLinearMixIn:
             input_is_parallel: If set to True, the input tensor is already parallelized.
             dtype: The desired data type of the parameters.
             bias_dtype: The desired data type of the bias. Defaults to `dtype`.
-            linear_op: The linear operation to use. Defaults to `torch.nn.functional.linear`.
         """
 
         tp_group = get_tp_group()
@@ -320,11 +306,9 @@ class RowParallelLinearMixIn:
             has_bias=has_bias if rank == 0 else False,
             dtype=dtype,
             bias_dtype=bias_dtype,
-            linear_op=linear_op,
         )
 
         self.input_is_parallel = input_is_parallel
-        self.linear_op = linear_op
         self.local_in_features = local_in_features
         self.tp_group = tp_group
         self.tp_size = tp_size
