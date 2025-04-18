@@ -1,12 +1,18 @@
 import os
-import subprocess
-import sys
 
+import setuptools
 from setuptools import Extension, setup, find_packages
-from setuptools.command.build_ext import build_ext
 from setuptools.command.build_py import build_py
 import packaging.version
 from Cython.Build import cythonize
+
+try:
+    import torch
+except ImportError:
+    raise RuntimeError(
+        "torch is required to build chitu. Please install torch (with the correct CUDA version) before installing chitu.\n"
+        "For example: pip install torch --index-url https://download.pytorch.org/whl/cu124"
+    )
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 assert packaging.version.parse(setuptools.__version__) >= packaging.version.parse(
