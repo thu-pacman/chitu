@@ -1504,9 +1504,12 @@ class TransformerDeepSeekV3(Transformer):
             raise NotImplementedError("Only op_impl=torch is supported in DeepSeek V3")
 
     def to(self, *args, **kwargs):
-        self.embed.to(*args, **kwargs)
-        self.norm.to(*args, **kwargs)
-        self.head.to(*args, **kwargs)
+        if hasattr(self, "embed"):
+            self.embed.to(*args, **kwargs)
+        if hasattr(self, "norm"):
+            self.norm.to(*args, **kwargs)
+        if hasattr(self, "head"):
+            self.head.to(*args, **kwargs)
         for l in self.layers:
             l.to(*args, **kwargs)
         return self
