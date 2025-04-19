@@ -10,6 +10,7 @@ import triton.language as tl
 from chitu.triton_kernels import *
 from chitu.device_type import is_hopper
 from chitu.utils import try_import_opt_dep
+from chitu.global_vars import get_global_args
 
 
 def to_triton_dtype(dtype: torch.dtype):
@@ -477,7 +478,15 @@ def weight_dequant_soft_fp8_deepseek_v3(
         assert False, "Weight tensor must have 2 or 3 dimensions"
 
     x = x.view(dtype=torch.uint8)
-    bit_reordered_x = torch.empty_like(x, dtype=torch.uint32)
+    if hasattr(torch, "uint32"):
+        bit_reordered_x = torch.empty_like(x, dtype=torch.uint32)
+    elif hasattr(torch, "int32"):
+        bit_reordered_x = torch.empty_like(x, dtype=torch.int32)
+    else:
+        raise ValueError(
+            "The current PyTorch environment supports neither the uint32 type nor the int32 type."
+        )
+
     grid = lambda meta: (triton.cdiv(B * M * N, meta["BLOCK_SIZE"]),)
     weight_dequant_soft_fp8_deepseek_v3_kernel_step_1[grid](
         x, bit_reordered_x, B * M * N, BLOCK_SIZE=block_size
@@ -704,3 +713,89 @@ def rms_norm(X: torch.Tensor, W: torch.Tensor, eps, compute_dtype):
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return out.view(X_shape)
+
+
+@auto_retry_triton_compilation
+def quant_einsum_shc_hdc_shd(
+    group_A: torch.Tensor,
+    group_B: torch.Tensor,
+    group_b_s: torch.Tensor,
+    *,
+    group_n: int = 128,
+    group_k: int = 128,
+    soft_fp8: bool = False,
+    impl: str = "auto",
+):
+    assert group_A.dim() == 3
+    assert group_B.dim() == 3
+    assert group_A.shape[1] == group_B.shape[0]
+    assert group_A.shape[2] == group_B.shape[2]
+
+    if impl == "auto":
+        if group_b_s is not None:
+            impl = "triton"
+        else:
+            impl = "torch"
+
+    if impl == "torch":
+        if group_b_s is not None:
+            weight_dequant_fn = (
+                weight_dequant_soft_fp8_deepseek_v3
+                if soft_fp8
+                else weight_dequant_deepseek_v3
+            )
+            group_B = weight_dequant_fn(group_B, group_b_s, block_size=128)
+        return torch.einsum("shc,hdc->shd", group_A, group_B)
+
+    elif impl == "triton":
+        assert group_B.shape[1] == group_b_s.shape[1] * group_k
+        assert group_B.shape[2] == group_b_s.shape[2] * group_n
+        s, h, c, d = (
+            group_A.shape[0],
+            group_A.shape[1],
+            group_A.shape[2],
+            group_B.shape[1],
+        )
+        group_size = h
+        M = s
+        K = c
+        N = d
+        stride_A_group, stride_A_m = group_A.stride()[1], group_A.stride()[0]
+        stride_B_group, stride_B_1 = group_B.stride()[0], group_B.stride()[1]
+        stride_C_group, stride_C_m = d, h * d
+        group_C = torch.empty((s, h, d), dtype=group_A.dtype, device=group_A.device)
+
+        if soft_fp8:
+            fp8_to_fp32_scale = struct.unpack(">f", bytes.fromhex("7b800000"))[0]
+        else:
+            fp8_to_fp32_scale = None
+
+        grid = lambda META: (
+            group_size,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]),
+            triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
+
+        grouped_matmul_kernel[grid](
+            group_A,
+            group_B,
+            group_b_s,
+            group_C,
+            M,
+            K,
+            N,
+            stride_A_group,
+            stride_A_m,
+            stride_B_group,
+            stride_B_1,
+            stride_C_group,
+            stride_C_m,
+            group_n,
+            group_k,
+            fp8_to_fp32_scale=fp8_to_fp32_scale,
+        )
+
+        return group_C
+
+    else:
+        raise RuntimeError(f"Unsupported impl: {impl}")

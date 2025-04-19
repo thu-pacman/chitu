@@ -39,22 +39,6 @@ ext_modules = [
         },
         include_dirs=[os.path.join(setup_dir, "third_party/spdlog/include")],
     ),
-    CUDAExtension(
-        name="KTransformersOps",
-        sources=[
-            "csrc/custom_gguf/dequant.cu",
-            "csrc/custom_gguf/binding.cpp",
-        ],
-        extra_compile_args={
-            "cxx": ["-O3"],
-            "nvcc": [
-                "-O3",
-                "--use_fast_math",
-                "-Xcompiler",
-                "-fPIC",
-            ],
-        },
-    ),
 ]
 
 cython_unsafe_files = [
