@@ -15,7 +15,7 @@
 #include <torch/torch.h>
 // namespace py = pybind11;
 
-PYBIND11_MODULE(KTransformersOps, m) {
+PYBIND11_MODULE(ktdequant, m) {
 
     m.def(
         "dequantize_q8_0",

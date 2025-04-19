@@ -24,7 +24,6 @@ from typing import Sequence
 import os
 from enum import IntEnum
 import torch
-import KTransformersOps
 import ctypes
 import math
 
@@ -654,11 +653,13 @@ def dequantize_q2_k_gpu(
     data = np.frombuffer(data, dtype=data.dtype)
     device_ = torch.device(device)
     # TODO: this and from_numpy in other functions will cause a warning saying that numpy is not writable,
-    # the best way to fix this is transfer ptr to KTransformersOps instead of Tensor.
+    # the best way to fix this is transfer ptr to ktdequant instead of Tensor.
     c_pointer = ctypes.addressof(
         ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents
     )
-    return KTransformersOps.dequantize_q2_k(
+    import ktdequant
+
+    return ktdequant.dequantize_q2_k(
         c_pointer, data.size, block_size, ele_per_blk, device_, target_dtype
     )
 
@@ -725,11 +726,13 @@ def dequantize_q3_k_gpu(
     data = np.frombuffer(data, dtype=data.dtype)
     device_ = torch.device(device)
     # TODO: this and from_numpy in other functions will cause a warning saying that numpy is not writable,
-    # the best way to fix this is transfer ptr to KTransformersOps instead of Tensor.
+    # the best way to fix this is transfer ptr to ktdequant instead of Tensor.
     c_pointer = ctypes.addressof(
         ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents
     )
-    return KTransformersOps.dequantize_q3_k(
+    import ktdequant
+
+    return ktdequant.dequantize_q3_k(
         c_pointer, data.size, block_size, ele_per_blk, device_, target_dtype
     )
 
@@ -771,11 +774,13 @@ def dequantize_q4_k_gpu(
     data = np.frombuffer(data, dtype=data.dtype)
     device_ = torch.device(device)
     # TODO: this and from_numpy in other functions will cause a warning saying that numpy is not writable,
-    # the best way to fix this is transfer ptr to KTransformersOps instead of Tensor.
+    # the best way to fix this is transfer ptr to ktdequant instead of Tensor.
     c_pointer = ctypes.addressof(
         ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents
     )
-    return KTransformersOps.dequantize_q4_k(
+    import ktdequant
+
+    return ktdequant.dequantize_q4_k(
         c_pointer, data.size, block_size, ele_per_blk, device_, target_dtype
     )
 
@@ -850,11 +855,13 @@ def dequantize_q5_k_gpu(
     data = np.frombuffer(data, dtype=data.dtype)
     device_ = torch.device(device)
     # TODO: this and from_numpy in other functions will cause a warning saying that numpy is not writable,
-    # the best way to fix this is transfer ptr to KTransformersOps instead of Tensor.
+    # the best way to fix this is transfer ptr to ktdequant instead of Tensor.
     c_pointer = ctypes.addressof(
         ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents
     )
-    return KTransformersOps.dequantize_q5_k(
+    import ktdequant
+
+    return ktdequant.dequantize_q5_k(
         c_pointer, data.size, block_size, ele_per_blk, device_, target_dtype
     )
 
@@ -925,7 +932,9 @@ def dequantize_q6_k_gpu(
     c_pointer = ctypes.addressof(
         ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents
     )
-    return KTransformersOps.dequantize_q6_k(
+    import ktdequant
+
+    return ktdequant.dequantize_q6_k(
         c_pointer, data.size, block_size, ele_per_blk, device_, target_dtype
     )
 
@@ -988,7 +997,9 @@ def dequantize_iq4_xs_gpu(
     c_pointer = ctypes.addressof(
         ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents
     )
-    return KTransformersOps.dequantize_iq4_xs(
+    import ktdequant
+
+    return ktdequant.dequantize_iq4_xs(
         c_pointer, data.size, block_size, ele_per_blk, device_, target_dtype
     )
 
@@ -1086,7 +1097,9 @@ def dequantize_q8_0_gpu(
     c_pointer = ctypes.addressof(
         ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents
     )
-    return KTransformersOps.dequantize_q8_0(
+    import ktdequant
+
+    return ktdequant.dequantize_q8_0(
         c_pointer, data.size, block_size, ele_per_blk, device_, target_dtype
     )
 

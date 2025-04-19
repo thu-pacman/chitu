@@ -77,5 +77,22 @@ setup(
             ],
             extra_compile_args=["-O3", "-march=native"],
         ),
+        CUDAExtension(
+            name="ktdequant",
+            sources=[
+                "custom_gguf/dequant.cu",
+                "custom_gguf/binding.cpp",
+            ],
+            include_dirs=["custom_gguf/"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": [
+                    "-O3",
+                    "--use_fast_math",
+                    "-Xcompiler",
+                    "-fPIC",
+                ],
+            },
+        ),
     ],
 )
