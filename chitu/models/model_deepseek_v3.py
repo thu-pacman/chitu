@@ -28,7 +28,6 @@ from chitu.ops import (
     weight_dequant_soft_fp8_deepseek_v3,
     weight_quant_deepseek_v3,
     silu_and_mul,
-    quant_einsum_shd_hdc_shc,
     quant_einsum_shc_hdc_shd,
 )
 from chitu.tensor_parallel import (
@@ -93,7 +92,7 @@ def getLinearDeepSeekV3():
         raise NotImplementedError(f"{quant_method} is not supported for DeepSeek V3.")
 
 
-class ParallelAbsorbGemm1(torch.nn.Module):
+class ParallelAbsorbGemm(torch.nn.Module):
     def __init__(
         self,
         global_n_heads: int,
@@ -103,62 +102,9 @@ class ParallelAbsorbGemm1(torch.nn.Module):
         block_size: int = 128,
     ):
         """
-        The first GeMM in "absorb-without-precomp" mode, embaarrassingly parallel among heads.
+        The two group GeMMs in "absorb-without-precomp" mode, embaarrassingly parallel among heads.
 
-        It compues `einsum("shd,hdc->shc", x, weight)` where `weight` may be block-fp8 quantized.
-        """
-
-        super().__init__()
-
-        if dtype is None:
-            dtype = torch.get_default_dtype()
-
-        tp_size = get_tp_size()
-        assert global_n_heads % tp_size == 0
-        local_n_heads = global_n_heads // tp_size
-
-        self.weight = torch.nn.Parameter(
-            torch.empty(
-                local_n_heads, in_features_per_head, out_features_per_head, dtype=dtype
-            )
-        )
-
-        if dtype.itemsize == 1:
-            assert out_features_per_head % block_size == 0
-            assert in_features_per_head % block_size == 0
-            self.scale = torch.nn.Parameter(
-                torch.empty(
-                    local_n_heads,
-                    in_features_per_head // block_size,
-                    out_features_per_head // block_size,
-                    dtype=torch.float32,
-                )
-            )
-        else:
-            self.register_parameter("scale", None)
-
-        self.local_n_heads = local_n_heads
-        self.in_features_per_head = in_features_per_head
-        self.out_features_per_head = out_features_per_head
-        self.block_size = block_size
-
-    def forward(self, q_nope: torch.Tensor) -> torch.Tensor:
-        return quant_einsum_shd_hdc_shc(q_nope, self.weight, self.scale)
-
-
-class ParallelAbsorbGemm2(torch.nn.Module):
-    def __init__(
-        self,
-        global_n_heads: int,
-        in_features_per_head: int,
-        out_features_per_head: int,
-        dtype=None,
-        block_size: int = 128,
-    ):
-        """
-        The second GeMM in "absorb-without-precomp" mode, embaarrassingly parallel among heads.
-
-        It compues `einsum("shc,hdc->shd", x, weight)` where `weight` may be block-fp8 quantized.
+        It computes `einsum("shc,hdc->shd", x, weight)` where `weight` may be block-fp8 quantized.
         """
 
         super().__init__()
@@ -203,7 +149,9 @@ class ParallelAbsorbGemm2(torch.nn.Module):
             bs, seq, n_head, n_hidden = x.shape
             x = x.view(bs * seq, n_head, n_hidden)
 
-        y = quant_einsum_shc_hdc_shd(x, self.weight, self.scale)
+        y = quant_einsum_shc_hdc_shd(
+            x, self.weight, self.scale, soft_fp8=get_global_args().infer.soft_fp8
+        )
 
         if bs is not None:
             y = y.view(bs, seq, y.shape[-2], y.shape[-1])
@@ -456,14 +404,14 @@ class AttentionDeepSeekV3(Attention):
                 base_linear_class=getLinearDeepSeekV3(),
             )
         elif self.mla_absorb == "absorb-without-precomp":
-            self.wkv_b_absorb_1 = ParallelAbsorbGemm1(
+            self.wkv_b_absorb_1 = ParallelAbsorbGemm(
                 self.n_heads,
                 self.qk_nope_head_dim,
                 self.kv_lora_rank,
                 dtype=parse_dtype(args.main_weight_dtype),
                 block_size=block_size,
             )
-            self.wkv_b_absorb_2 = ParallelAbsorbGemm2(
+            self.wkv_b_absorb_2 = ParallelAbsorbGemm(
                 self.n_heads,
                 self.kv_lora_rank,
                 self.v_head_dim,
@@ -1643,8 +1591,12 @@ class TransformerDeepSeekV3(Transformer):
                 wkv_b_absorb_2_scale = wkv_b_scale[
                     :, self.params.qk_nope_head_dim // block_size :
                 ]
-                new_checkpoint[prefix + "wkv_b_absorb_1.weight"] = wkv_b_absorb_1_weight
-                new_checkpoint[prefix + "wkv_b_absorb_1.scale"] = wkv_b_absorb_1_scale
+                new_checkpoint[prefix + "wkv_b_absorb_1.weight"] = (
+                    wkv_b_absorb_1_weight.permute(0, 2, 1)
+                )
+                new_checkpoint[prefix + "wkv_b_absorb_1.scale"] = (
+                    wkv_b_absorb_1_scale.permute(0, 2, 1)
+                )
                 new_checkpoint[prefix + "wkv_b_absorb_2.weight"] = wkv_b_absorb_2_weight
                 new_checkpoint[prefix + "wkv_b_absorb_2.scale"] = wkv_b_absorb_2_scale
 
@@ -1989,7 +1941,7 @@ class TransformerDeepSeekV3(Transformer):
 
         memory_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
-            logger.info(
+            logger.debug(
                 f"initing layer : {layer_id}  cpu memory usage: {memory_usage / 1024**2} GB  gpu memory usage : RANK : {torch.cuda.current_device()} {torch.cuda.memory_allocated()/(1024**3)} GB"
             )
             if layer_id in self.cpu_layers:
