@@ -1584,24 +1584,33 @@ class TransformerDeepSeekV3(Transformer):
                 wkv_b_weight = wkv_b_weight.view(
                     n_local_heads, -1, wkv_b_weight.shape[-1]
                 )
-                wkv_b_scale = checkpoint[prefix + "wkv_b.scale"]
-                wkv_b_scale = wkv_b_scale.view(n_local_heads, -1, wkv_b_scale.shape[-1])
                 wkv_b_absorb_1_weight = wkv_b_weight[:, : self.params.qk_nope_head_dim]
-                wkv_b_absorb_1_scale = wkv_b_scale[
-                    :, : self.params.qk_nope_head_dim // block_size
-                ]
                 wkv_b_absorb_2_weight = wkv_b_weight[:, self.params.qk_nope_head_dim :]
-                wkv_b_absorb_2_scale = wkv_b_scale[
-                    :, self.params.qk_nope_head_dim // block_size :
-                ]
                 new_checkpoint[prefix + "wkv_b_absorb_1.weight"] = (
                     wkv_b_absorb_1_weight.permute(0, 2, 1)
                 )
-                new_checkpoint[prefix + "wkv_b_absorb_1.scale"] = (
-                    wkv_b_absorb_1_scale.permute(0, 2, 1)
-                )
                 new_checkpoint[prefix + "wkv_b_absorb_2.weight"] = wkv_b_absorb_2_weight
-                new_checkpoint[prefix + "wkv_b_absorb_2.scale"] = wkv_b_absorb_2_scale
+
+                is_fp8 = wkv_b_weight.element_size() == 1
+                if is_fp8:
+                    wkv_b_scale = checkpoint[prefix + "wkv_b.scale"]
+                    wkv_b_scale = wkv_b_scale.view(
+                        n_local_heads, -1, wkv_b_scale.shape[-1]
+                    )
+                    wkv_b_absorb_1_scale = wkv_b_scale[
+                        :, : self.params.qk_nope_head_dim // block_size
+                    ]
+                    wkv_b_absorb_2_scale = wkv_b_scale[
+                        :, self.params.qk_nope_head_dim // block_size :
+                    ]
+                    new_checkpoint[prefix + "wkv_b_absorb_1.scale"] = (
+                        wkv_b_absorb_1_scale.permute(0, 2, 1)
+                    )
+                    new_checkpoint[prefix + "wkv_b_absorb_2.scale"] = (
+                        wkv_b_absorb_2_scale
+                    )
+                else:
+                    assert prefix + "wkv_b.scale" not in checkpoint
 
             elif k.endswith(".wkv_b.scale"):
                 continue
