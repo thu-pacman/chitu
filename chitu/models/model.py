@@ -601,12 +601,6 @@ class Transformer(nn.Module):
 
         use_cuda_graph = get_global_args().infer.use_cuda_graph
 
-        if use_cuda_graph:
-            if get_global_args().infer.cache_type == "skew":
-                raise NotImplementedError(
-                    'CUDA graph is currently not supported for infer.cache_type="skew"'
-                )
-
         if self.do_decode_callable is None:
 
             @make_dispatched_graphed_callables(

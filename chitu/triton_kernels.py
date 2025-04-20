@@ -1,5 +1,6 @@
 __all__ = [
     "append_to_paged_kv_cache_kernel",
+    "append_to_non_paged_kv_cache_kernel",
     "rotary_embedding_kernel_hf_llama",
     "rotary_embedding_kernel_llama",
     "act_quant_deepseek_v3_kernel",
@@ -51,6 +52,33 @@ def append_to_paged_kv_cache_kernel(
     kv_cache_offset = (
         page_id * KV_CACHE_STRIDE0 + (seqlen % PAGE_SIZE) * KV_CACHE_STRIDE1 + dim_id
     )
+    this_kv_offset = batch_id * THIS_KV_STRIDE0 + dim_id
+
+    this_kv_data = tl.load(this_kv_ptr + this_kv_offset, mask=dim_mask)
+    tl.store(kv_cache_ptr + kv_cache_offset, this_kv_data, mask=dim_mask)
+
+
+@triton.jit
+def append_to_non_paged_kv_cache_kernel(
+    kv_cache_ptr,  # (num_pages, page_size, other dims...)
+    this_kv_ptr,  # (batch_size, other dims...)
+    old_seq_lens_ptr,  # (batch_size,)
+    BATCH_SIZE: tl.constexpr,
+    TOT_LEN_OF_OTHER_DIMS: tl.constexpr,
+    KV_CACHE_STRIDE0: tl.constexpr,
+    KV_CACHE_STRIDE1: tl.constexpr,
+    THIS_KV_STRIDE0: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,  # GPU block size, not page size
+):
+    batch_id = tl.program_id(axis=0)
+    dim_id_0 = tl.program_id(axis=1)
+    dim_id_1 = tl.arange(0, BLOCK_SIZE)
+    dim_id = dim_id_0 * BLOCK_SIZE + dim_id_1
+    dim_mask = dim_id < TOT_LEN_OF_OTHER_DIMS
+
+    seqlen = tl.load(old_seq_lens_ptr + batch_id)
+
+    kv_cache_offset = batch_id * KV_CACHE_STRIDE0 + seqlen * KV_CACHE_STRIDE1 + dim_id
     this_kv_offset = batch_id * THIS_KV_STRIDE0 + dim_id
 
     this_kv_data = tl.load(this_kv_ptr + this_kv_offset, mask=dim_mask)

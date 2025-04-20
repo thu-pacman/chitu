@@ -13,8 +13,8 @@ from typing import Optional, Union
 import torch
 
 from chitu.global_vars import get_global_args
-from chitu.ops import append_to_paged_kv_cache
-from chitu.triton_decode_attention import mla_decode
+from chitu.ops import append_to_paged_kv_cache, append_to_non_paged_kv_cache
+from chitu.triton_decode_attention import mla_decode, mla_decode_non_paged
 from chitu.utils import try_import_opt_dep
 from chitu.static_tensor import StaticTensor
 
@@ -790,9 +790,12 @@ class TritonAttnBackend(RefAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
     ):
-        append_to_paged_kv_cache(
-            kv_cache, block_table, kv, cache_seqlens_excl_this_decode
-        )
+        if block_table is None:
+            append_to_non_paged_kv_cache(kv_cache, kv, cache_seqlens_excl_this_decode)
+        else:
+            append_to_paged_kv_cache(
+                kv_cache, block_table, kv, cache_seqlens_excl_this_decode
+            )
 
         B = q_nope.shape[0]
 
@@ -829,18 +832,31 @@ class TritonAttnBackend(RefAttnBackend):
                 1.0 / ((self.qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5),
             )
 
-        mla_decode(
-            q_nope,
-            q_pe,
-            kv_c_cache,
-            k_pe_cache,
-            o,
-            block_table,
-            cache_seqlens_incl_this_decode,
-            attn_logits,
-            num_kv_splits,
-            softmax_scale,
-            PAGE_SIZE,
-        )
+        if block_table is None:
+            mla_decode_non_paged(
+                q_nope,
+                q_pe,
+                kv_c_cache,
+                k_pe_cache,
+                o,
+                cache_seqlens_incl_this_decode,
+                attn_logits,
+                num_kv_splits,
+                softmax_scale,
+            )
+        else:
+            mla_decode(
+                q_nope,
+                q_pe,
+                kv_c_cache,
+                k_pe_cache,
+                o,
+                block_table,
+                cache_seqlens_incl_this_decode,
+                attn_logits,
+                num_kv_splits,
+                softmax_scale,
+                PAGE_SIZE,
+            )
 
         return o.view(B, 1, self.local_n_heads, -1)

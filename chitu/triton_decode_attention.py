@@ -181,6 +181,165 @@ def _mla_attn(
     )
 
 
+@triton.autotune(configs=_mla_attn_kernel_configs, key=[])
+@triton.jit
+def _mla_attn_non_paged_kernel(
+    Q_nope,
+    Q_pe,
+    Kv_c_cache,
+    K_pe_cache,
+    B_seq_len,
+    O,
+    sm_scale,
+    stride_q_nope_bs,
+    stride_q_nope_h,
+    stride_q_pe_bs,
+    stride_q_pe_h,
+    stride_kv_c_bs,
+    stride_k_pe_bs,
+    stride_kv_c_s,
+    stride_k_pe_s,
+    stride_o_b,
+    stride_o_h,
+    stride_o_s,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    HEAD_DIM_CKV: tl.constexpr,
+    HEAD_DIM_KPE: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+    split_kv_id = tl.program_id(2)
+
+    cur_batch_seq_len = tl.load(B_seq_len + cur_batch)
+
+    offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
+    cur_head = cur_head_id * BLOCK_H + tl.arange(0, BLOCK_H)
+    offs_q_nope = (
+        cur_batch * stride_q_nope_bs
+        + cur_head[:, None] * stride_q_nope_h
+        + offs_d_ckv[None, :]
+    )
+    q_nope = tl.load(Q_nope + offs_q_nope)
+
+    offs_d_kpe = tl.arange(0, HEAD_DIM_KPE)
+    offs_q_pe = (
+        cur_batch * stride_q_pe_bs
+        + cur_head[:, None] * stride_q_pe_h
+        + offs_d_kpe[None, :]
+    )
+    q_pe = tl.load(Q_pe + offs_q_pe)
+
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, HEAD_DIM_CKV], dtype=tl.float32)
+
+    kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+    if split_kv_end > split_kv_start:
+        for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            offs_k_c = (
+                cur_batch * stride_kv_c_bs
+                + offs_n[None, :] * stride_kv_c_s
+                + offs_d_ckv[:, None]
+            )
+            k_c = tl.load(
+                Kv_c_cache + offs_k_c, mask=offs_n[None, :] < split_kv_end, other=0.0
+            )
+
+            qk = tl.dot(q_nope, k_c.to(q_nope.dtype))
+
+            offs_k_pe = (
+                cur_batch * stride_k_pe_bs
+                + offs_n[None, :] * stride_k_pe_s
+                + offs_d_kpe[:, None]
+            )
+            k_pe = tl.load(
+                K_pe_cache + offs_k_pe, mask=offs_n[None, :] < split_kv_end, other=0.0
+            )
+
+            qk += tl.dot(q_pe, k_pe.to(q_pe.dtype))
+            qk *= sm_scale
+
+            qk = tl.where(offs_n[None, :] < split_kv_end, qk, float("-inf"))
+
+            v_c = tl.trans(k_c)
+
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max[:, None])
+            acc *= re_scale[:, None]
+            acc += tl.dot(p.to(v_c.dtype), v_c)
+
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
+        offs_o = (
+            cur_batch * stride_o_b
+            + cur_head[:, None] * stride_o_h
+            + split_kv_id * stride_o_s
+            + offs_d_ckv[None, :]
+        )
+        tl.store(O + offs_o, acc / e_sum[:, None])
+        offs_o_1 = (
+            cur_batch * stride_o_b
+            + cur_head * stride_o_h
+            + split_kv_id * stride_o_s
+            + HEAD_DIM_CKV
+        )
+        tl.store(O + offs_o_1, e_max + tl.log(e_sum))
+
+
+def _mla_attn_non_paged(
+    q_nope,
+    q_pe,
+    kv_c_cache,
+    k_pe_cache,
+    attn_logits,
+    b_seq_len,
+    num_kv_splits,
+    sm_scale,
+):
+    batch_size, head_num = q_nope.shape[0], q_nope.shape[1]
+    head_dim_ckv = q_nope.shape[-1]
+    head_dim_kpe = q_pe.shape[-1]
+
+    BLOCK_H = 16
+    grid = (
+        batch_size,
+        triton.cdiv(head_num, BLOCK_H),
+        num_kv_splits,
+    )
+
+    _mla_attn_non_paged_kernel[grid](
+        q_nope,
+        q_pe,
+        kv_c_cache,
+        k_pe_cache,
+        b_seq_len,
+        attn_logits,
+        sm_scale,
+        q_nope.stride(0),
+        q_nope.stride(1),
+        q_pe.stride(0),
+        q_pe.stride(1),
+        kv_c_cache.stride(0),
+        k_pe_cache.stride(0),
+        kv_c_cache.stride(1),
+        k_pe_cache.stride(1),
+        attn_logits.stride(0),
+        attn_logits.stride(1),
+        attn_logits.stride(2),
+        BLOCK_H=BLOCK_H,
+        NUM_KV_SPLITS=num_kv_splits,
+        HEAD_DIM_CKV=head_dim_ckv,
+        HEAD_DIM_KPE=head_dim_kpe,
+    )
+
+
 @triton.jit
 def _mla_softmax_reducev_kernel(
     Logits,
@@ -280,6 +439,36 @@ def mla_decode(
         num_kv_splits,
         sm_scale,
         page_size,
+    )
+    _mla_softmax_reducev(
+        attn_logits,
+        o,
+        b_seq_len,
+        num_kv_splits,
+    )
+
+
+def mla_decode_non_paged(
+    q_nope,
+    q_pe,
+    kv_c_cache,
+    k_pe_cache,
+    o,
+    b_seq_len,
+    attn_logits,
+    num_kv_splits,
+    sm_scale,
+):
+    assert num_kv_splits == attn_logits.shape[2]
+    _mla_attn_non_paged(
+        q_nope,
+        q_pe,
+        kv_c_cache,
+        k_pe_cache,
+        attn_logits,
+        b_seq_len,
+        num_kv_splits,
+        sm_scale,
     )
     _mla_softmax_reducev(
         attn_logits,

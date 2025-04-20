@@ -75,7 +75,7 @@ def append_to_paged_kv_cache(
 ):
     """
     for i in range(cache_seqlens.shape[0]):
-        kv_cache[block_table[i][cache_seqlens[i] // page_size]][cache_seqlens[i] % page_size] = kv[i]
+        kv_cache[block_table[i, cache_seqlens[i] // page_size], cache_seqlens[i] % page_size] = kv[i]
     """
 
     kv_cache = kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], -1)
@@ -106,6 +106,47 @@ def append_to_paged_kv_cache(
         PAGE_SIZE=page_size,
         BATCH_SIZE=batch_size,
         NUM_PAGES_PER_SAMPLE=num_pages_per_sample,
+        TOT_LEN_OF_OTHER_DIMS=tot_len_of_other_dims,
+        KV_CACHE_STRIDE0=kv_cache.stride(0),
+        KV_CACHE_STRIDE1=kv_cache.stride(1),
+        THIS_KV_STRIDE0=this_kv.stride(0),
+        BLOCK_SIZE=block_size,
+    )
+
+
+@auto_retry_triton_compilation
+def append_to_non_paged_kv_cache(
+    kv_cache,  # (batch_size, seq_len, other contiguous dims...)
+    this_kv,  # (batch_size, other contiguous dims...)
+    old_seq_lens,  # (batch_size,)
+):
+    """
+    for i in range(cache_seqlens.shape[0]):
+        kv_cache[i, cache_seqlens[i]] = kv[i]
+    """
+
+    kv_cache = kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], -1)
+    this_kv = this_kv.view(this_kv.shape[0], -1)
+
+    assert old_seq_lens.is_contiguous()
+
+    batch_size = kv_cache.shape[0]
+    assert this_kv.shape[0] == batch_size
+    assert old_seq_lens.shape[0] == batch_size
+
+    tot_len_of_other_dims = this_kv.numel() // batch_size
+    assert (
+        kv_cache.numel() // (kv_cache.shape[0] * kv_cache.shape[1])
+        == tot_len_of_other_dims
+    )
+
+    block_size = 512  # GPU block size
+    grid = (batch_size, triton.cdiv(tot_len_of_other_dims, block_size))
+    append_to_non_paged_kv_cache_kernel[grid](
+        kv_cache_ptr=kv_cache,
+        this_kv_ptr=this_kv,
+        old_seq_lens_ptr=old_seq_lens,
+        BATCH_SIZE=batch_size,
         TOT_LEN_OF_OTHER_DIMS=tot_len_of_other_dims,
         KV_CACHE_STRIDE0=kv_cache.stride(0),
         KV_CACHE_STRIDE1=kv_cache.stride(1),

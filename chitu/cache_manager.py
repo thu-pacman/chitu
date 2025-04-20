@@ -491,6 +491,13 @@ class KVCacheManagerSkewAware:
         else:
             self.v_buffer = None
 
+        self.curr_seq_lens_gpu_excl_this_decode = StaticTensor(
+            max_nelem=num_hot_req, dtype=torch.int32, device=self.device
+        )
+        self.curr_seq_lens_gpu_incl_this_decode = StaticTensor(
+            max_nelem=num_hot_req, dtype=torch.int32, device=self.device
+        )
+
         self.timers = get_timers()
         self.prepared_reqs = []
         self.rounded_max_seq = -1
@@ -552,11 +559,11 @@ class KVCacheManagerSkewAware:
             seq_lens.append(seq_len)
         max_seq = max(seq_lens)
         self.curr_seq_lens = seq_lens
-        self.curr_seq_lens_gpu_excl_this_decode = torch.tensor(
-            seq_lens, dtype=torch.int32, device=self.device
+        self.curr_seq_lens_gpu_excl_this_decode.set(
+            torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
         )
-        self.curr_seq_lens_gpu_incl_this_decode = (
-            self.curr_seq_lens_gpu_excl_this_decode + 1
+        self.curr_seq_lens_gpu_incl_this_decode.set(
+            self.curr_seq_lens_gpu_excl_this_decode.get() + 1
         )
 
         limit = 16
@@ -631,12 +638,12 @@ class KVCacheManagerSkewAware:
     # Decode:
     # return [# of current req_ids]
     def get_gpu_seq_lens_excl_this_decode(self):
-        return self.curr_seq_lens_gpu_excl_this_decode
+        return self.curr_seq_lens_gpu_excl_this_decode.get()
 
     # Decode:
     # return [# of current req_ids]
     def get_gpu_seq_lens_incl_this_decode(self):
-        return self.curr_seq_lens_gpu_incl_this_decode
+        return self.curr_seq_lens_gpu_incl_this_decode.get()
 
     # Decode:
     def finalize_cache_single_decode(self, req_ids):
