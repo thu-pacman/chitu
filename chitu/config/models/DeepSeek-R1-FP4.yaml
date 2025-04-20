@@ -1,0 +1,14 @@
+# DeepSeek-R1-bf16 is a data-type variant of DeepSeek-R1
+defaults:
+  - DeepSeek-R1
+  - _self_ # Config in this file overrides configs in defaults
+
+# Access info
+name: DeepSeek-R1-bf16
+source: "https://huggingface.co/opensourcerelease/DeepSeek-R1-bf16" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+
+# Overrides
+main_weight_dtype: float4_e2m1
+quant: blockfp4

@@ -1,5 +1,5 @@
 import struct
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -543,7 +543,11 @@ def weight_quant_deepseek_v3(
 
 @auto_retry_triton_compilation
 def fp8_gemm_deepseek_v3(
-    a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor, b_s: torch.Tensor
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    b_s_2: Optional[torch.Tensor] = None,
 ):
     """
     Perform a matrix multiplication using FP8 precision.
@@ -572,12 +576,16 @@ def fp8_gemm_deepseek_v3(
     has_deep_gemm = False
     if torch.get_default_dtype() == torch.bfloat16 and is_hopper() is True:
         deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
-    if has_deep_gemm:
+    if has_deep_gemm and b.dtype is not torch.uint8:
         deep_gemm.gemm_fp8_fp8_bf16_nt((a, a_s), (b, b_s), c)
     else:
-        fp8_gemm_deepseek_v3_kernel[grid](
-            a, b, c, a_s, b_s, M, N, K, group_n=128, group_k=128
-        )
+        if b.dtype is torch.uint8:
+            assert b_s_2 is not None, "Fp4 quant gemm must hava scale2"
+            assert b_s_2.is_contiguous(), "Fp4 scale2 must be contiguous"
+        else:
+            fp8_gemm_deepseek_v3_kernel[grid](
+                a, b, c, a_s, b_s, M, N, K, group_n=128, group_k=128
+            )
     return c
 
 
@@ -586,6 +594,7 @@ def soft_fp8_gemm_deepseek_v3(
     a: torch.Tensor,
     b: torch.Tensor,
     b_s: torch.Tensor,
+    b_s_2: Optional[torch.Tensor] = None,
 ):
     """
     Perform a matrix multiplication with FP8 dynamically casted to BF16.
@@ -620,18 +629,123 @@ def soft_fp8_gemm_deepseek_v3(
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    soft_fp8_gemm_deepseek_v3_kernel[grid](
+    if b.dtype == torch.uint8:
+        assert b_s_2 is not None, "Scaling_2 factor tensor must exist"
+        assert b_s_2.is_contiguous(), "Scaling_2 factor tensor must be contiguous"
+
+    else:
+        soft_fp8_gemm_deepseek_v3_kernel[grid](
+            a,
+            b.view(dtype=torch.uint8),
+            c,
+            b_s,
+            M,
+            N,
+            K,
+            group_n=128,
+            group_k=128,
+            fp8_to_fp32_scale=fp8_to_fp32_scale,
+            compute_dtype=compute_dtype,
+        )
+    return c
+
+
+@auto_retry_triton_compilation
+def soft_fp4_raise_to_fp8_gemm_deepseek_v3(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    b_s_2: Optional[torch.Tensor] = None,
+):
+    """
+    Perform a matrix multiplication with FP8 dynamically casted to BF16.
+
+    Args:
+        a (torch.Tensor): The first input matrix, must be contiguous.
+        a_s (torch.Tensor): The scaling factor of first input matrix, must be contiguous.
+        b (torch.Tensor): The second input matrix, must be contiguous.
+        b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
+        b_s_2 (torch.Tensor): The scaling factor for b_s, must be contiguous.
+
+    Returns:
+        torch.Tensor: The result of the matrix multiplication.
+    """
+    assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
+    assert a_s.is_contiguous(), "Scaling factor of A must be contiguous"
+    assert b_s.is_contiguous(), "Scaling factor tensor must be contiguous"
+    K = a.size(-1)
+    M = a.numel() // K
+    N = b.size(0)
+    c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]),
+        triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    assert b_s_2 is not None, "Scaling_2 factor tensor must exist"
+    assert b_s_2.is_contiguous(), "Scaling_2 factor tensor must be contiguous"
+
+    soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel[grid](
+        a,
+        b,
+        c,
+        a_s,
+        b_s,
+        b_s_2,
+        M,
+        N,
+        K,
+        group_k=128,
+        stride_b_s=16,
+        is_w1w3=(b_s_2.numel() == 2),
+    )
+    return c
+
+
+@auto_retry_triton_compilation
+def soft_fp4_raise_to_bf16_gemm_deepseek_v3(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    b_s_2: Optional[torch.Tensor] = None,
+):
+    """
+    Perform a matrix multiplication with FP8 dynamically casted to BF16.
+
+    Args:
+        a (torch.Tensor): The first input matrix, must be contiguous.
+        b (torch.Tensor): The second input matrix, must be contiguous.
+        b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
+        b_s_2 (torch.Tensor): The scaling factor for b_s, must be contiguous.
+
+    Returns:
+        torch.Tensor: The result of the matrix multiplication.
+    """
+    assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
+    assert b_s.is_contiguous(), "Scaling factor tensor must be contiguous"
+    K = a.size(-1)
+    M = a.numel() // K
+    N = b.size(0)
+    c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    assert b_s_2 is not None, "Scaling_2 factor tensor must exist"
+    assert b_s_2.is_contiguous(), "Scaling_2 factor tensor must be contiguous"
+
+    soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel[grid](
         a,
         b.view(dtype=torch.uint8),
         c,
         b_s,
+        b_s_2,
         M,
         N,
         K,
-        group_n=128,
-        group_k=128,
-        fp8_to_fp32_scale=fp8_to_fp32_scale,
-        compute_dtype=compute_dtype,
+        stride_b_s=16,
+        is_w1w3=(b_s_2.numel() == 2),
     )
     return c
 

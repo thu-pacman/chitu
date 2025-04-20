@@ -401,6 +401,7 @@ class Backend:
         if hasattr(args.models, "quant") and args.models.quant not in [
             None,
             "blockfp8",
+            "blockfp4",
         ]:
             # Merge weights for offline-scaled quantized models is non-trivial, because we can
             # only merge weights but NOT the scales on input dimensions, and this will break the
@@ -778,6 +779,7 @@ def load_state_dict_deepseek_v3(hf_ckpt_path, skip_preprocess=False):
                     name = name.replace("self_attn", "attn")
                     name = name.replace("mlp", "ffn")
                     name = name.replace("weight_scale_inv", "scale")
+                    name = name.replace("weight_scale", "scale")
                     name = name.replace("e_score_correction_bias", "bias")
                     key = name.split(".")[-2]
                     mapping = {

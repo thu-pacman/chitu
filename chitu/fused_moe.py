@@ -76,6 +76,237 @@ def write_zeros_to_output(
 
 
 @triton.jit
+def fused_moe_kernel_soft_fp4(
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    b_scale2_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Matrix dimensions
+    N,
+    K,
+    EM,
+    num_valid_tokens,
+    # The stride variables represent how much to increase the ptr by when
+    # moving by 1 element in a particular dimension. E.g. `stride_am` is
+    # how much to increase `a_ptr` by to get the element one row down
+    # (A has M rows).
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_asm,
+    stride_ask,
+    stride_bse,
+    stride_bsk,
+    stride_bsn,
+    stride_b_s: tl.constexpr,
+    # Block size for block-wise quantization
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    soft_fp8: tl.constexpr,
+    is_w1w3: tl.constexpr,
+):
+    """
+    Implements the fused computation for a Mixture of Experts (MOE) using
+    token and expert matrices.
+
+    Key Parameters:
+    - A: The input tensor representing tokens with shape (*, K), where '*' can
+        be any shape representing batches and K is the feature dimension of
+        each token.
+    - B: The stacked MOE weight tensor with shape (E, N, K), where E is
+        the number of experts, K is the input feature dimension, and N is
+        the output feature dimension.
+    - C: The output cache tensor with shape (M, topk, N), where M is the
+        total number of tokens post padding, topk is the number of times
+        each token is repeated, and N is the output feature dimension.
+    - sorted_token_ids: A tensor containing the sorted indices of tokens,
+        repeated topk times and arranged by the expert index they are
+        assigned to.
+    - expert_ids: A tensor containing the indices of the expert for each
+        block. It determines which expert matrix from B should be used for
+        each block in A.
+    This kernel performs the multiplication of a token by its corresponding
+    expert matrix as determined by `expert_ids`. The sorting of
+    `sorted_token_ids` by expert index and padding ensures divisibility by
+    BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
+    multiplication across different blocks processed by the same expert.
+    """
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # ----------------------------------------------------------
+    # Create pointers for the first blocks of A and B.
+    # We will advance this pointer as we move in the K direction
+    # and accumulate
+    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if off_experts == -1:
+        # -----------------------------------------------------------
+        # Write back zeros to the output when the expert is not
+        # in the current expert parallel rank.
+        write_zeros_to_output(
+            c_ptr,
+            stride_cm,
+            stride_cn,
+            pid_n,
+            N,
+            offs_token,
+            token_mask,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            compute_type,
+        )
+        return
+
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K // 2)
+    num_b_s_in_block = BLOCK_SIZE_K // stride_b_s
+    a_ptrs = a_ptr + (
+        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+    )
+
+    b_ptrs = (
+        b_ptr
+        + off_experts * stride_be
+        + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    )
+    if group_k > 0 and group_n > 0:
+        if not soft_fp8:
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+        b_scale_ptrs = (
+            b_scale_ptr
+            + off_experts * stride_bse
+            + offs_bn[None, :] * stride_bsn
+            + offs_k[:, None] // stride_b_s
+        )
+        if is_w1w3:
+            if pid_n * BLOCK_SIZE_N >= N // 2:
+                b_scale2 = tl.load(b_scale2_ptr + off_experts * 2 + 1)
+            else:
+                b_scale2 = tl.load(b_scale2_ptr + off_experts * 2 + 0)
+
+        else:
+            b_scale2 = tl.load(b_scale2_ptr + off_experts)
+
+    fp4_to_fp8_scale = 64.0
+
+    # -----------------------------------------------------------
+    # Iterate to compute a block of the C matrix.
+    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
+    # of fp32 values for higher accuracy.
+    # `accumulator` will be converted back to fp16 after the loop.
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # Load the next block of A and B, generate a mask by checking the
+        # K dimension.
+        a_1 = tl.load(
+            a_ptrs,
+            mask=token_mask[:, None]
+            & (offs_k[None, :] < K - k * BLOCK_SIZE_K - BLOCK_SIZE_K // 2),
+            other=0.0,
+        )
+        a_2 = tl.load(
+            a_ptrs + BLOCK_SIZE_K // 2,
+            mask=token_mask[:, None]
+            & (offs_k[None, :] < K - k * BLOCK_SIZE_K - BLOCK_SIZE_K // 2),
+            other=0.0,
+        )
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        # We accumulate along the K dimension.
+        if group_k > 0 and group_n > 0:
+            k_start = k * BLOCK_SIZE_K
+            offs_ks = k_start // group_k
+            b_scale_1 = tl.load(b_scale_ptrs)
+            b_scale_2 = tl.load(b_scale_ptrs + num_b_s_in_block // 2)
+            if soft_fp8:
+                fp8_weight_1 = ((b & 0x08) << 4) | ((b & 0x07) << 2)
+                fp8_weight_1 = (
+                    fp8_weight_1.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+                    * b_scale_1
+                )
+                accumulator += tl.dot(a_1, fp8_weight_1)
+                fp8_weight_2 = (b & 0x80) | ((b & 0x70) >> 2)
+                fp8_weight_2 = (
+                    fp8_weight_2.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+                    * b_scale_2
+                )
+                accumulator += tl.dot(a_2, fp8_weight_2)
+            else:
+                a_scale = tl.load(
+                    a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+                )
+                tmp_accumulator = tl.zeros(
+                    (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32
+                )
+                fp8_weight_1 = ((b & 0x08) << 4) | ((b & 0x07) << 2)
+                fp8_weight_1 = (
+                    fp8_weight_1.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+                    * b_scale_1
+                )
+                tmp_accumulator += tl.dot(a_1, fp8_weight_1.to(tl.float8e4nv))
+                fp8_weight_2 = (b & 0x80) | ((b & 0x70) >> 2)
+                fp8_weight_2 = (
+                    fp8_weight_2.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+                    * b_scale_2
+                )
+                tmp_accumulator += tl.dot(a_2, fp8_weight_2.to(tl.float8e4nv))
+                accumulator += tmp_accumulator * a_scale[:, None]
+        # Advance the ptrs to the next K block.
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk // 2
+        b_scale_ptrs += num_b_s_in_block
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        accumulator = accumulator * moe_weight[:, None]
+    accumulator = accumulator * fp4_to_fp8_scale * b_scale2
+    accumulator = accumulator.to(compute_type)
+    # -----------------------------------------------------------
+    # Write back the block of the output
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+@triton.jit
 def fused_moe_kernel(
     # Pointers to matrices
     a_ptr,
@@ -788,6 +1019,7 @@ def invoke_fused_moe_kernel(
     C: torch.Tensor,
     A_scale: Optional[torch.Tensor],
     B_scale: Optional[torch.Tensor],
+    B_scale2: Optional[torch.Tensor],
     B_zp: Optional[torch.Tensor],
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -799,10 +1031,12 @@ def invoke_fused_moe_kernel(
     config: Dict[str, Any],
     compute_type: tl.dtype,
     use_fp8_w8a8: bool,  # NOTE only support fp8_w8a8
+    use_fp4_w4a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
     block_shape: Optional[List[int]] = None,
     soft_fp8: bool = False,
+    is_w1w3: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -826,6 +1060,17 @@ def invoke_fused_moe_kernel(
     elif use_int8_w8a16 or use_int4_w4a16:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
+    elif use_fp4_w4a8:
+        assert B_scale is not None
+        assert B_scale2 is not None
+        assert len(block_shape) == 2
+        if not soft_fp8:
+            block_n, block_k = block_shape[0], block_shape[1]
+            A, A_scale = per_token_group_quant_fp8(A, block_k)
+        else:
+            A_scale = None
+        block_n, block_k = block_shape[0], block_shape[1]
+        # A, A_scale = per_token_group_quant_fp8(A, block_k)
     else:
         assert A_scale is None
         assert B_scale is None
@@ -846,44 +1091,82 @@ def invoke_fused_moe_kernel(
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
-
-    fused_moe_kernel[grid](
-        A,
-        B,
-        C,
-        A_scale,
-        B_scale,
-        topk_weights,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        B.shape[1],
-        A.shape[1],
-        EM,
-        topk_ids.numel(),
-        A.stride(0),
-        A.stride(1),
-        B.stride(0),
-        B.stride(2),
-        B.stride(1),
-        C.stride(1),
-        C.stride(2),
-        A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
-        A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
-        B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
-        B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
-        B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
-        0 if block_shape is None else block_shape[0],
-        0 if block_shape is None else block_shape[1],
-        MUL_ROUTED_WEIGHT=mul_routed_weight,
-        top_k=top_k,
-        compute_type=compute_type,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
-        soft_fp8=soft_fp8,
-        fp8_to_fp32_scale=fp8_to_fp32_scale,
-        **config,
-    )
+    if use_fp4_w4a8:
+        fused_moe_kernel_soft_fp4[grid](
+            A,
+            B,
+            C,
+            A_scale,
+            B_scale,
+            B_scale2,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            B.shape[1],
+            A.shape[1],
+            EM,
+            topk_ids.numel(),
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            C.stride(1),
+            C.stride(2),
+            A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
+            A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
+            B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
+            B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
+            B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+            16,
+            0 if block_shape is None else block_shape[0],
+            0 if block_shape is None else block_shape[1],
+            MUL_ROUTED_WEIGHT=mul_routed_weight,
+            top_k=top_k,
+            compute_type=compute_type,
+            soft_fp8=soft_fp8,
+            is_w1w3=is_w1w3,
+            **config,
+        )
+    else:
+        fused_moe_kernel[grid](
+            A,
+            B,
+            C,
+            A_scale,
+            B_scale,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            B.shape[1],
+            A.shape[1],
+            EM,
+            topk_ids.numel(),
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            C.stride(1),
+            C.stride(2),
+            A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
+            A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
+            B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
+            B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
+            B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+            0 if block_shape is None else block_shape[0],
+            0 if block_shape is None else block_shape[1],
+            MUL_ROUTED_WEIGHT=mul_routed_weight,
+            top_k=top_k,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            soft_fp8=soft_fp8,
+            fp8_to_fp32_scale=fp8_to_fp32_scale,
+            **config,
+        )
 
 
 def get_default_config(
@@ -896,7 +1179,7 @@ def get_default_config(
     is_marlin: bool,
     block_shape: Optional[List[int]] = None,
 ) -> Dict[str, int]:
-    if dtype == "fp8_w8a8" and block_shape is not None:
+    if (dtype == "fp8_w8a8" or dtype == "fp4_w4a8") and block_shape is not None:
         # Block-wise quant: BLOCK_SIZE_N must be divisible by block_shape[0]
         # BLOCK_SIZE_K must be divisible by block_shape[1]
         config = {
@@ -948,6 +1231,7 @@ def get_config_dtype_str(
     use_int4_w4a16: Optional[bool] = False,
     use_int8_w8a16: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
+    use_fp4_w4a8: Optional[bool] = False,
 ):
     if use_fp8_w8a8:
         return "fp8_w8a8"
@@ -955,6 +1239,8 @@ def get_config_dtype_str(
         return "int8_w8a16"
     elif use_int4_w4a16:
         return "int4_w8a16"
+    elif use_fp4_w4a8:
+        return "fp4_w4a8"
     elif dtype == torch.float:
         # avoiding cases where kernel fails when float32 MoE
         # use fp16/bfloat16 configs
@@ -970,12 +1256,15 @@ def inplace_fused_experts(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
+    use_fp4_w4a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     global_num_experts: int = -1,
     expert_map: Optional[torch.Tensor] = None,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
+    w1_scale2: Optional[torch.Tensor] = None,
+    w2_scale2: Optional[torch.Tensor] = None,
     w1_zp: Optional[torch.Tensor] = None,
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
@@ -992,12 +1281,15 @@ def inplace_fused_experts(
         True,
         activation,
         use_fp8_w8a8,
+        use_fp4_w4a8,
         use_int8_w8a16,
         use_int4_w4a16,
         global_num_experts,
         expert_map,
         w1_scale,
         w2_scale,
+        w1_scale2,
+        w2_scale2,
         w1_zp,
         w2_zp,
         a1_scale,
@@ -1017,6 +1309,7 @@ def outplace_fused_experts(
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_fp4_w4a8: bool = False,
     global_num_experts: int = -1,
     expert_map: Optional[torch.Tensor] = None,
     w1_scale: Optional[torch.Tensor] = None,
@@ -1037,6 +1330,7 @@ def outplace_fused_experts(
         False,
         activation,
         use_fp8_w8a8,
+        use_fp4_w4a8,
         use_int8_w8a16,
         use_int4_w4a16,
         global_num_experts,
@@ -1061,12 +1355,15 @@ def fused_experts(
     inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
+    use_fp4_w4a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     global_num_experts: int = -1,
     expert_map: Optional[torch.Tensor] = None,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
+    w1w3_scale_2: Optional[torch.Tensor] = None,
+    w2_scale_2: Optional[torch.Tensor] = None,
     w1_zp: Optional[torch.Tensor] = None,
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
@@ -1084,12 +1381,15 @@ def fused_experts(
             topk_ids,
             activation,
             use_fp8_w8a8,
+            use_fp4_w4a8,
             use_int8_w8a16,
             use_int4_w4a16,
             global_num_experts,
             expert_map,
             w1_scale,
             w2_scale,
+            w1w3_scale_2,
+            w2_scale_2,
             w1_zp,
             w2_zp,
             a1_scale,
@@ -1131,12 +1431,15 @@ def fused_experts_impl(
     inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
+    use_fp4_w4a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     global_num_experts: int = -1,
     expert_map: Optional[torch.Tensor] = None,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
+    w1_scale2: Optional[torch.Tensor] = None,
+    w2_scale2: Optional[torch.Tensor] = None,
     w1_zp: Optional[torch.Tensor] = None,
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
@@ -1146,6 +1449,8 @@ def fused_experts_impl(
 ):
     # Check constraints.
     if use_int4_w4a16:
+        assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
+    elif use_fp4_w4a8:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
         assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
@@ -1170,6 +1475,7 @@ def fused_experts_impl(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_fp4_w4a8=use_fp4_w4a8,
         dtype=hidden_states.dtype,
     )
 
@@ -1239,6 +1545,7 @@ def fused_experts_impl(
             intermediate_cache1,
             a1_scale,
             w1_scale,
+            w1_scale2,
             w1_zp,
             curr_topk_weights,
             curr_topk_ids,
@@ -1250,10 +1557,12 @@ def fused_experts_impl(
             config,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
+            use_fp4_w4a8=use_fp4_w4a8,
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
             block_shape=block_shape,
             soft_fp8=soft_fp8,
+            is_w1w3=True,
         )
 
         if activation == "silu":
@@ -1267,6 +1576,7 @@ def fused_experts_impl(
             intermediate_cache3,
             a2_scale,
             w2_scale,
+            w2_scale2,
             w2_zp,
             curr_topk_weights,
             curr_topk_ids,
@@ -1278,6 +1588,7 @@ def fused_experts_impl(
             config,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
+            use_fp4_w4a8=use_fp4_w4a8,
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
             block_shape=block_shape,

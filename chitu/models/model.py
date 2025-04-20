@@ -250,12 +250,14 @@ class Transformer(nn.Module):
         model_parallel_size: int,
         attn_backend: AttnBackend,
         op_impl: str,
+        is_fp4=False,
         **kvargs,
     ):
         super().__init__()
         self.cache = cache
         self.attn_backend = attn_backend
         self.op_impl = op_impl
+        self.is_fp4 = is_fp4
         self.rank = torch.distributed.get_rank()
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = torch.distributed.get_world_size()
@@ -365,10 +367,13 @@ class Transformer(nn.Module):
 
         for name, param in checkpoint.items():
             if any(is_layer(s, name) for s in cpl_names):
-                if (
+                if name.endswith("input_scale") or (name.endswith("scale_2")):
+                    partial_checkpoint[name] = param
+                elif (
                     name.endswith(".weight")
                     or (self.params.type == "deepseek-v3" and name.endswith(".scale"))
                     or (quant == "blockfp8" and name.endswith(".scale"))
+                    or (quant == "blockfp4" and name.endswith(".weight_scale"))
                 ):
                     chunks = torch.chunk(param, world_size, dim=0)
                     partial_checkpoint[name] = chunks[rank]
@@ -385,10 +390,13 @@ class Transformer(nn.Module):
                 else:
                     assert False, f"Illegal parallel tensor {name}"
             elif any(is_layer(s, name) for s in rpl_names):
-                if (
+                if name.endswith("input_scale") or (name.endswith("scale_2")):
+                    partial_checkpoint[name] = param
+                elif (
                     name.endswith(".weight")
                     or (self.params.type == "deepseek-v3" and name.endswith("scale"))
-                    or (quant == "blockfp8" and name.endswith("scale"))
+                    or (quant == "blockfp8" and name.endswith(".scale"))
+                    or (quant == "blockfp4" and name.endswith(".weight_scale"))
                 ):
                     chunks = torch.chunk(param, world_size, dim=1)
                     partial_checkpoint[name] = chunks[rank]
