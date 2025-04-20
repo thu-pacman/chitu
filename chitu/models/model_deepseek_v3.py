@@ -630,22 +630,13 @@ class AttentionDeepSeekV3(Attention):
             # In-place update to `kv_cache`, which is part of `kv`
             self.kv_norm(kv_cache, compute_dtype=kv.dtype, out=kv_cache)
 
-            if isinstance(self.cache, PagedKVCacheManager):
-                self.cache.finalize_cache_bylayer_prefill(
-                    kv,
-                    None,
-                    self.cache.curr_req_ids,
-                    self.cache.curr_varlens,
-                    self.layer_id,
-                )
-            else:
-                self.cache.finalize_cache_bylayer_prefill(
-                    kv_cache,
-                    pe_cache,
-                    self.cache.curr_req_ids,
-                    self.cache.curr_varlens,
-                    self.layer_id,
-                )
+            self.cache.finalize_cache_bylayer_prefill(
+                kv,
+                None,
+                self.cache.curr_req_ids,
+                self.cache.curr_varlens,
+                self.layer_id,
+            )
             q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
             x = self.attn_backend.attn_varlen_func(
                 q_nope_pe.view(-1, q_nope_pe.shape[-2], q_nope_pe.shape[-1]),
@@ -675,6 +666,7 @@ class AttentionDeepSeekV3(Attention):
         self, x: torch.Tensor, freqs_cis_cos: torch.Tensor, freqs_cis_sin: torch.Tensor
     ):
         cache_seqlens_excl_this_decode = self.cache.get_gpu_seq_lens_excl_this_decode()
+        cache_seqlens_incl_this_decode = self.cache.get_gpu_seq_lens_incl_this_decode()
         bsz, seqlen, _ = x.size()
 
         if self.mla_absorb == "none":
@@ -703,25 +695,22 @@ class AttentionDeepSeekV3(Attention):
                 x.view(bsz * seqlen, -1), freqs_cis_cos, freqs_cis_sin
             )
 
-            kv_cache, pe_cache = self.cache.get_cache_decode(self.layer_id)
-            q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
-            kv_pe_cache = torch.cat([kv_cache, pe_cache], dim=-1)
+            kv_cache, _ = self.cache.get_cache_decode(self.layer_id)
             this_kv = kv[..., : self.kv_lora_rank]
 
             # In-place update to `this_kv`, which is part of `kv`
             self.kv_norm(this_kv, compute_dtype=kv.dtype, out=this_kv)
 
-            x = self.attn_backend.attn_with_kvcache(
-                q_nope_pe.view(bsz, seqlen, q_nope_pe.shape[-2], q_nope_pe.shape[-1]),
-                kv_pe_cache.view(kv_pe_cache.shape[0], kv_pe_cache.shape[1], 1, -1),
-                kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], 1, -1),
+            x = self.attn_backend.mla_attn_with_kvcache(
+                q_nope,
+                q_pe,
+                kv_cache,
                 kv.view(bsz, seqlen, 1, -1),
-                this_kv.view(bsz, seqlen, 1, -1),
-                cache_seqlens=cache_seqlens_excl_this_decode,
+                cache_seqlens_excl_this_decode=cache_seqlens_excl_this_decode,
+                cache_seqlens_incl_this_decode=cache_seqlens_incl_this_decode,
+                block_table=None,
                 softmax_scale=self.softmax_scale,
             )
-            for start_pos in cache_seqlens_excl_this_decode:
-                pe_cache[:, start_pos] = kv_pe_cache[:, start_pos, self.kv_lora_rank :]
 
             if self.mla_absorb == "absorb-without-precomp":
                 x = self.wkv_b_absorb_2(x)
@@ -749,7 +738,7 @@ class AttentionDeepSeekV3(Attention):
         )
 
         block_table = self.cache.get_gpu_block_table()
-        paged_kv_cache = self.cache.get_paged_kv_cache(self.layer_id)
+        paged_kv_cache, _ = self.cache.get_paged_kv_cache(self.layer_id)
         this_kv = kv[..., : self.kv_lora_rank]
 
         # In-place update to `this_kv`, which is part of `kv`

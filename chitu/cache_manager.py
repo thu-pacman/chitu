@@ -27,7 +27,12 @@ class PagedKVCacheManager:
         head_dim=None,
     ):
         """
-        You can optionally set `k_shae_per_sample` and `v_shape_per_sample`, or `n_local_kv_heads` and `head_dim`.
+        Paged KV cache manager
+
+        Note for KV cache shapes:
+        - You can either set `k_shae_per_sample` and `v_shape_per_sample`, or `n_local_kv_heads` and `head_dim`.
+        - Otherwise, you can set `kv_shape_per_sample`, which means a holistic shape for both K and V, which
+          internally uses only K and disables V.
         """
 
         self.max_blocks_per_req = max_seq_len // block_size + 1
@@ -36,17 +41,22 @@ class PagedKVCacheManager:
         self.begin_layer_id = begin_layer_id
         self.end_layer_id = end_layer_id
         self.num_layers = end_layer_id - begin_layer_id
-        self.k_shape_per_sample = (
-            k_shape_per_sample
-            if k_shape_per_sample is not None
-            else (n_local_kv_heads, head_dim)
-        )
-        self.v_shape_per_sample = (
-            v_shape_per_sample
-            if v_shape_per_sample is not None
-            else (n_local_kv_heads, head_dim)
-        )
-        self.kv_shape_per_sample = kv_shape_per_sample
+
+        if kv_shape_per_sample is None:
+            self.k_shape_per_sample = (
+                k_shape_per_sample
+                if k_shape_per_sample is not None
+                else (n_local_kv_heads, head_dim)
+            )
+            self.v_shape_per_sample = (
+                v_shape_per_sample
+                if v_shape_per_sample is not None
+                else (n_local_kv_heads, head_dim)
+            )
+        else:
+            self.k_shape_per_sample = kv_shape_per_sample
+            self.v_shape_per_sample = None
+
         # assert block_size % 256 == 0
         self.block_size = block_size
         self.max_seq_len = max_seq_len
@@ -66,23 +76,23 @@ class PagedKVCacheManager:
         )
         # TODO: For better performance, use list instead of set for free_blocks
         self.free_blocks = set(range(self.num_blocks))
-        if self.kv_shape_per_sample is not None:
-            self.paged_kv_cache = torch.zeros(
-                (self.num_layers, self.num_blocks, block_size)
-                + self.kv_shape_per_sample,
-                device=device,
-            )
-        else:
+
+        if self.k_shape_per_sample is not None:
             self.paged_k_cache = torch.zeros(
                 (self.num_layers, self.num_blocks, block_size)
                 + self.k_shape_per_sample,
                 device=device,
             )
+        else:
+            self.paged_k_cache = None
+        if self.v_shape_per_sample is not None:
             self.paged_v_cache = torch.zeros(
                 (self.num_layers, self.num_blocks, block_size)
                 + self.v_shape_per_sample,
                 device=device,
             )
+        else:
+            self.paged_v_cache = None
 
     def get_block_size(self):
         return self.block_size
@@ -112,31 +122,23 @@ class PagedKVCacheManager:
             end_pos = varlen.cpu_prefix_lens[idx + 1]
             for chunck_id in range(num_blocks_prepared):
                 block_idx = block_ids[chunck_id]
-                if self.kv_shape_per_sample is not None:
-                    if chunck_id != num_blocks_prepared - 1:
-                        self.paged_kv_cache[layer_id - self.begin_layer_id][
-                            block_idx
-                        ] = xk[start_pos : (start_pos + self.block_size)].clone()
-                        start_pos += self.block_size
-                    else:
-                        tmp_len = end_pos - start_pos
-                        self.paged_kv_cache[layer_id - self.begin_layer_id][block_idx][
-                            :tmp_len
-                        ] = xk[start_pos:end_pos].clone()
-                else:
-                    if chunck_id != num_blocks_prepared - 1:
+                if chunck_id != num_blocks_prepared - 1:
+                    if self.paged_k_cache is not None:
                         self.paged_k_cache[layer_id - self.begin_layer_id][
                             block_idx
                         ] = xk[start_pos : (start_pos + self.block_size)].clone()
+                    if self.paged_v_cache is not None:
                         self.paged_v_cache[layer_id - self.begin_layer_id][
                             block_idx
                         ] = xv[start_pos : (start_pos + self.block_size)].clone()
-                        start_pos += self.block_size
-                    else:
-                        tmp_len = end_pos - start_pos
+                    start_pos += self.block_size
+                else:
+                    tmp_len = end_pos - start_pos
+                    if self.paged_k_cache is not None:
                         self.paged_k_cache[layer_id - self.begin_layer_id][block_idx][
                             :tmp_len
                         ] = xk[start_pos:end_pos].clone()
+                    if self.paged_v_cache is not None:
                         self.paged_v_cache[layer_id - self.begin_layer_id][block_idx][
                             :tmp_len
                         ] = xv[start_pos:end_pos].clone()
@@ -180,13 +182,17 @@ class PagedKVCacheManager:
         return self.curr_seq_lens_gpu_incl_this_decode.get()
 
     def get_paged_kv_cache(self, layer_id):
-        if self.kv_shape_per_sample is not None:
-            return self.paged_kv_cache[layer_id - self.begin_layer_id]
-        else:
-            return (
-                self.paged_k_cache[layer_id - self.begin_layer_id],
-                self.paged_v_cache[layer_id - self.begin_layer_id],
-            )
+        ret_k = (
+            self.paged_k_cache[layer_id - self.begin_layer_id]
+            if self.paged_k_cache is not None
+            else None
+        )
+        ret_v = (
+            self.paged_v_cache[layer_id - self.begin_layer_id]
+            if self.paged_v_cache is not None
+            else None
+        )
+        return ret_k, ret_v
 
     def free_req_cache_blocks(self, req_id):
         self.timers("free_req_cache_blocks").start()
@@ -419,26 +425,38 @@ class KVCacheManagerSkewAware:
         *,
         k_shape_per_sample=None,
         v_shape_per_sample=None,
+        kv_shape_per_sample=None,
         n_local_kv_heads=None,
         head_dim=None,
     ):
         """
-        You can optionally set `k_shae_per_sample` and `v_shape_per_sample`, or `n_local_kv_heads` and `head_dim`.
+        Non-paged KV cache manager
+
+        Note for KV cache shapes:
+        - You can either set `k_shae_per_sample` and `v_shape_per_sample`, or `n_local_kv_heads` and `head_dim`.
+        - Otherwise, you can set `kv_shape_per_sample`, which means a holistic shape for both K and V, which
+          internally uses only K and disables V.
         """
 
         self.begin_layer_id = begin_layer_id
         self.end_layer_id = end_layer_id
         self.num_layers = end_layer_id - begin_layer_id
-        self.k_shape_per_sample = (
-            k_shape_per_sample
-            if k_shape_per_sample is not None
-            else (n_local_kv_heads, head_dim)
-        )
-        self.v_shape_per_sample = (
-            v_shape_per_sample
-            if v_shape_per_sample is not None
-            else (n_local_kv_heads, head_dim)
-        )
+
+        if kv_shape_per_sample is None:
+            self.k_shape_per_sample = (
+                k_shape_per_sample
+                if k_shape_per_sample is not None
+                else (n_local_kv_heads, head_dim)
+            )
+            self.v_shape_per_sample = (
+                v_shape_per_sample
+                if v_shape_per_sample is not None
+                else (n_local_kv_heads, head_dim)
+            )
+        else:
+            self.k_shape_per_sample = kv_shape_per_sample
+            self.v_shape_per_sample = None
+
         self.num_hot_req = num_hot_req
         self.slot_availability = [True] * num_hot_req
         self.hot_reqs = [-1] * num_hot_req
@@ -447,24 +465,32 @@ class KVCacheManagerSkewAware:
         self.max_seq_len = max_seq_len
         self.tmp_storage = []
         self.device = torch.device(device)
-        self.k_buffer = torch.zeros(
-            (
-                self.num_layers,
-                self.num_hot_req,
-                self.max_seq_len,
+
+        if self.k_shape_per_sample is not None:
+            self.k_buffer = torch.zeros(
+                (
+                    self.num_layers,
+                    self.num_hot_req,
+                    self.max_seq_len,
+                )
+                + self.k_shape_per_sample,
+                device=self.device,
             )
-            + self.k_shape_per_sample,
-            device=self.device,
-        )
-        self.v_buffer = torch.zeros(
-            (
-                self.num_layers,
-                self.num_hot_req,
-                self.max_seq_len,
+        else:
+            self.k_buffer = None
+        if self.v_shape_per_sample is not None:
+            self.v_buffer = torch.zeros(
+                (
+                    self.num_layers,
+                    self.num_hot_req,
+                    self.max_seq_len,
+                )
+                + self.v_shape_per_sample,
+                device=self.device,
             )
-            + self.v_shape_per_sample,
-            device=self.device,
-        )
+        else:
+            self.v_buffer = None
+
         self.timers = get_timers()
         self.prepared_reqs = []
         self.rounded_max_seq = -1
@@ -496,12 +522,14 @@ class KVCacheManagerSkewAware:
         start = 0
         for it, req_id in enumerate(req_ids):
             end = start + varlen.cpu_lens[it]
-            self.k_buffer[layer_id - self.begin_layer_id][self.req2slot[req_id]][
-                : varlen.cpu_lens[it]
-            ] = cache_k[start:end]
-            self.v_buffer[layer_id - self.begin_layer_id][self.req2slot[req_id]][
-                : varlen.cpu_lens[it]
-            ] = cache_v[start:end]
+            if self.k_buffer is not None:
+                self.k_buffer[layer_id - self.begin_layer_id][self.req2slot[req_id]][
+                    : varlen.cpu_lens[it]
+                ] = cache_k[start:end]
+            if self.v_buffer is not None:
+                self.v_buffer[layer_id - self.begin_layer_id][self.req2slot[req_id]][
+                    : varlen.cpu_lens[it]
+                ] = cache_v[start:end]
             start = end
         self.timers("cache_finalize_cache_all_prefill").stop()
 
@@ -541,45 +569,58 @@ class KVCacheManagerSkewAware:
         self.rounded_max_seq = rounded_max_seq
         self.prepared_reqs = req_ids
 
-        k_prepared_cache_shape = list(self.k_buffer.shape)
-        k_prepared_cache_stride = list(self.k_buffer.stride())
-        k_prepared_cache_stride[0] = (
-            k_prepared_cache_shape[1] * k_prepared_cache_stride[1]
-        )
-        k_prepared_cache_shape[1] = len(req_ids)
-        k_prepared_cache_shape[2] = rounded_max_seq
-        k_prepared_cache_offset = start_pos * k_prepared_cache_stride[1]
-        self.k_prepared_cache = torch.as_strided(
-            self.k_buffer,
-            k_prepared_cache_shape,
-            k_prepared_cache_stride,
-            k_prepared_cache_offset,
-        )
+        if self.k_buffer is not None:
+            k_prepared_cache_shape = list(self.k_buffer.shape)
+            k_prepared_cache_stride = list(self.k_buffer.stride())
+            k_prepared_cache_stride[0] = (
+                k_prepared_cache_shape[1] * k_prepared_cache_stride[1]
+            )
+            k_prepared_cache_shape[1] = len(req_ids)
+            k_prepared_cache_shape[2] = rounded_max_seq
+            k_prepared_cache_offset = start_pos * k_prepared_cache_stride[1]
+            self.k_prepared_cache = torch.as_strided(
+                self.k_buffer,
+                k_prepared_cache_shape,
+                k_prepared_cache_stride,
+                k_prepared_cache_offset,
+            )
+        else:
+            self.k_prepared_cache = None
 
-        v_prepared_cache_shape = list(self.v_buffer.shape)
-        v_prepared_cache_stride = list(self.v_buffer.stride())
-        v_prepared_cache_stride[0] = (
-            v_prepared_cache_shape[1] * v_prepared_cache_stride[1]
-        )
-        v_prepared_cache_shape[1] = len(req_ids)
-        v_prepared_cache_shape[2] = rounded_max_seq
-        v_prepared_cache_offset = start_pos * v_prepared_cache_stride[1]
-        self.v_prepared_cache = torch.as_strided(
-            self.v_buffer,
-            v_prepared_cache_shape,
-            v_prepared_cache_stride,
-            v_prepared_cache_offset,
-        )
+        if self.v_buffer is not None:
+            v_prepared_cache_shape = list(self.v_buffer.shape)
+            v_prepared_cache_stride = list(self.v_buffer.stride())
+            v_prepared_cache_stride[0] = (
+                v_prepared_cache_shape[1] * v_prepared_cache_stride[1]
+            )
+            v_prepared_cache_shape[1] = len(req_ids)
+            v_prepared_cache_shape[2] = rounded_max_seq
+            v_prepared_cache_offset = start_pos * v_prepared_cache_stride[1]
+            self.v_prepared_cache = torch.as_strided(
+                self.v_buffer,
+                v_prepared_cache_shape,
+                v_prepared_cache_stride,
+                v_prepared_cache_offset,
+            )
+        else:
+            self.v_prepared_cache = None
 
         self.timers("cache_prepare").stop()
 
     # Decode:
     # return [2, num_req, max_seqlen + 1, n_local_kv_heads, head_dim]
     def get_cache_decode(self, layer_id):
-        return (
-            self.k_prepared_cache[layer_id - self.begin_layer_id],
-            self.v_prepared_cache[layer_id - self.begin_layer_id],
+        ret_k = (
+            self.k_prepared_cache[layer_id - self.begin_layer_id]
+            if self.k_prepared_cache is not None
+            else None
         )
+        ret_v = (
+            self.v_prepared_cache[layer_id - self.begin_layer_id]
+            if self.v_prepared_cache is not None
+            else None
+        )
+        return ret_k, ret_v
 
     def get_gpu_block_table(self):
         return None
@@ -638,8 +679,10 @@ class KVCacheManagerSkewAware:
             )
 
         if slot_last_id is not None:
-            self.k_buffer[:, slot_id] = self.k_buffer[:, slot_last_id]
-            self.v_buffer[:, slot_id] = self.v_buffer[:, slot_last_id]
+            if self.k_buffer is not None:
+                self.k_buffer[:, slot_id] = self.k_buffer[:, slot_last_id]
+            if self.v_buffer is not None:
+                self.v_buffer[:, slot_id] = self.v_buffer[:, slot_last_id]
             req_key = next(
                 (k for k, v in self.req2slot.items() if v == slot_last_id), None
             )
@@ -650,14 +693,18 @@ class KVCacheManagerSkewAware:
             self.slot_availability[slot_last_id] = True
             if req_id in self.req2slot:
                 self.req2slot.pop(req_id)
-            self.k_buffer[:, slot_last_id].zero_()
-            self.v_buffer[:, slot_last_id].zero_()
+            if self.k_buffer is not None:
+                self.k_buffer[:, slot_last_id].zero_()
+            if self.v_buffer is not None:
+                self.v_buffer[:, slot_last_id].zero_()
         else:
             self.hot_reqs[slot_id] = -1
             self.slot_availability[slot_id] = True
             self.req2slot.pop(req_id)
-            self.k_buffer[:, slot_id].zero_()
-            self.v_buffer[:, slot_id].zero_()
+            if self.k_buffer is not None:
+                self.k_buffer[:, slot_id].zero_()
+            if self.v_buffer is not None:
+                self.v_buffer[:, slot_id].zero_()
 
 
 class KVCacheManagerNop:

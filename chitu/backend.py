@@ -292,15 +292,9 @@ class Backend:
 
         if args.models.type == "deepseek-v3":
             if args.infer.mla_absorb in ["absorb", "absorb-without-precomp"]:
-                if args.infer.cache_type == "paged":
-                    kv_cache_kvargs["kv_shape_per_sample"] = (
-                        args.models.kv_lora_rank + args.models.qk_rope_head_dim,
-                    )
-                else:
-                    kv_cache_kvargs["k_shape_per_sample"] = (args.models.kv_lora_rank,)
-                    kv_cache_kvargs["v_shape_per_sample"] = (
-                        args.models.qk_rope_head_dim,
-                    )
+                kv_cache_kvargs["kv_shape_per_sample"] = (
+                    args.models.kv_lora_rank + args.models.qk_rope_head_dim,
+                )
             elif args.infer.mla_absorb == "none":
                 n_local_heads = args.models.n_heads // model_parallel_size
                 k_head_dim = args.models.qk_nope_head_dim + args.models.qk_rope_head_dim
