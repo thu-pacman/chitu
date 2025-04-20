@@ -543,6 +543,7 @@ class AttentionDeepSeekV3(Attention):
             kv = self.wkv_a(x)
         q = self.wq_b(self.q_norm(q_a, compute_dtype=q_a.dtype))
         q = q.view(bs_seq, self.n_local_heads, -1)
+
         q_nope, q_pe = torch.split(
             q,
             [
@@ -551,13 +552,23 @@ class AttentionDeepSeekV3(Attention):
             ],
             dim=-1,
         )
-        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        q_pe, k_pe = apply_rotary_pos_emb(
-            q_pe, k_pe, freqs_cis_cos, freqs_cis_sin, rotary_type="llama"
+        kv_lora, k_pe = torch.split(
+            kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
+
+        # In-place update to `q_pe` and `k_pe`, which are part of `q` and `kv`, respectively
+        apply_rotary_pos_emb(
+            q_pe,
+            k_pe,
+            freqs_cis_cos,
+            freqs_cis_sin,
+            q_out=q_pe,
+            k_out=k_pe,
+            rotary_type="llama",
+        )
+
         if self.mla_absorb == "none":
-            q = torch.cat([q_nope, q_pe], dim=-1)
-            kv = self.wkv_b(self.kv_norm(kv))
+            kv = self.wkv_b(self.kv_norm(kv_lora))
             kv = kv.view(
                 bs_seq, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim
             )
@@ -576,9 +587,9 @@ class AttentionDeepSeekV3(Attention):
             return q, k, v
         elif self.mla_absorb == "absorb-without-precomp":
             q_nope = self.wkv_b_absorb_1(q_nope)
-            return q_nope, q_pe, kv, k_pe
+            return q_nope, q_pe, kv
         elif self.mla_absorb == "absorb":
-            return q_nope, q_pe, kv, k_pe
+            return q_nope, q_pe, kv
         else:
             raise NotImplementedError(
                 f"MLA absorb mode {self.mla_absorb} not supported"
@@ -611,14 +622,17 @@ class AttentionDeepSeekV3(Attention):
             )
 
         elif self.mla_absorb == "absorb-without-precomp" or self.mla_absorb == "absorb":
-            q_nope, q_pe, kv, k_pe = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
+            q_nope, q_pe, kv = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
 
-            kv_cache = self.kv_norm(kv, compute_dtype=kv.dtype)
-            pe_cache = k_pe
-            kv_pe_cache = torch.cat([kv_cache, pe_cache], dim=-1)
+            kv_cache = kv[:, : self.kv_lora_rank]
+            pe_cache = kv[:, -self.qk_rope_head_dim :]
+
+            # In-place update to `kv_cache`, which is part of `kv`
+            self.kv_norm(kv_cache, compute_dtype=kv.dtype, out=kv_cache)
+
             if isinstance(self.cache, PagedKVCacheManager):
                 self.cache.finalize_cache_bylayer_prefill(
-                    kv_pe_cache,
+                    kv,
                     None,
                     self.cache.curr_req_ids,
                     self.cache.curr_varlens,
@@ -635,7 +649,7 @@ class AttentionDeepSeekV3(Attention):
             q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
             x = self.attn_backend.attn_varlen_func(
                 q_nope_pe.view(-1, q_nope_pe.shape[-2], q_nope_pe.shape[-1]),
-                kv_pe_cache.view(-1, 1, kv_pe_cache.shape[-1]),
+                kv.view(-1, 1, kv.shape[-1]),
                 kv_cache.view(-1, 1, kv_cache.shape[-1]),
                 varlens.prefix_lens,
                 varlens.prefix_lens,
@@ -685,21 +699,23 @@ class AttentionDeepSeekV3(Attention):
             ).view(bsz, seqlen, 1, -1)
 
         elif self.mla_absorb == "absorb-without-precomp" or self.mla_absorb == "absorb":
-            q_nope, q_pe, kv, k_pe = self._run_linear(
+            q_nope, q_pe, kv = self._run_linear(
                 x.view(bsz * seqlen, -1), freqs_cis_cos, freqs_cis_sin
             )
 
             kv_cache, pe_cache = self.cache.get_cache_decode(self.layer_id)
-            this_kv = self.kv_norm(kv, compute_dtype=kv.dtype)
-            this_pe = k_pe
             q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
             kv_pe_cache = torch.cat([kv_cache, pe_cache], dim=-1)
-            this_kv_pe = torch.cat([this_kv, this_pe], dim=-1)
+            this_kv = kv[..., : self.kv_lora_rank]
+
+            # In-place update to `this_kv`, which is part of `kv`
+            self.kv_norm(this_kv, compute_dtype=kv.dtype, out=this_kv)
+
             x = self.attn_backend.attn_with_kvcache(
                 q_nope_pe.view(bsz, seqlen, q_nope_pe.shape[-2], q_nope_pe.shape[-1]),
                 kv_pe_cache.view(kv_pe_cache.shape[0], kv_pe_cache.shape[1], 1, -1),
                 kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], 1, -1),
-                this_kv_pe.view(bsz, seqlen, 1, -1),
+                kv.view(bsz, seqlen, 1, -1),
                 this_kv.view(bsz, seqlen, 1, -1),
                 cache_seqlens=cache_seqlens_excl_this_decode,
                 softmax_scale=self.softmax_scale,
@@ -728,20 +744,22 @@ class AttentionDeepSeekV3(Attention):
         cache_seqlens_excl_this_decode = self.cache.get_gpu_seq_lens_excl_this_decode()
         cache_seqlens_incl_this_decode = self.cache.get_gpu_seq_lens_incl_this_decode()
         bsz, seqlen, _ = x.size()
-        q_nope, q_pe, kv, k_pe = self._run_linear(
+        q_nope, q_pe, kv = self._run_linear(
             x.view(bsz * seqlen, -1), freqs_cis_cos, freqs_cis_sin
         )
 
         block_table = self.cache.get_gpu_block_table()
         paged_kv_cache = self.cache.get_paged_kv_cache(self.layer_id)
-        this_kv = self.kv_norm(kv, compute_dtype=kv.dtype)
-        this_pe = k_pe
-        this_kv_pe = torch.cat([this_kv, this_pe], dim=-1)
+        this_kv = kv[..., : self.kv_lora_rank]
+
+        # In-place update to `this_kv`, which is part of `kv`
+        self.kv_norm(this_kv, compute_dtype=kv.dtype, out=this_kv)
+
         x = self.attn_backend.mla_attn_with_kvcache(
             q_nope,
             q_pe,
             paged_kv_cache,
-            this_kv_pe.view(bsz, seqlen, 1, -1),
+            kv.view(bsz, seqlen, 1, -1),
             cache_seqlens_excl_this_decode=cache_seqlens_excl_this_decode,
             cache_seqlens_incl_this_decode=cache_seqlens_incl_this_decode,
             block_table=block_table,

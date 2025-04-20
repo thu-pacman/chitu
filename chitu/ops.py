@@ -11,6 +11,7 @@ from chitu.triton_kernels import *
 from chitu.device_type import is_hopper
 from chitu.utils import try_import_opt_dep
 from chitu.global_vars import get_global_args
+import chitu_backend
 
 
 def to_triton_dtype(dtype: torch.dtype):
@@ -150,7 +151,7 @@ def apply_rotary_pos_emb_triton(
     sin: torch.Tensor,
     rotary_type: str = "hf-llama",
     block_size=128,
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     # Prepare output tensor
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
@@ -230,12 +231,16 @@ def apply_rotary_pos_emb_triton(
             k_out = k_out.view(-1, 1, k_shape[-1])
         else:
             assert False
+
         assert q.shape[-1] == k.shape[-1]
         assert q.shape[0] == k.shape[0]
         assert q.shape[-1] // 2 == cos.shape[-1]
         assert q.shape[-1] // 2 == sin.shape[-1]
         bs, head_num_q, rotary_dim = q.shape
         bs, head_num_k, rotary_dim = k.shape
+
+        assert cos.is_contiguous()
+        assert sin.is_contiguous()
 
         # Launch kernel
         BLOCK_H = min(
@@ -266,7 +271,60 @@ def apply_rotary_pos_emb_triton(
         return q_out.view(q_shape), k_out.view(k_shape)
 
     else:
-        raise ValueError(f"Unknown rotary type: {rotary_type}")
+        raise NotImplementedError(
+            f"Unsupported rotary type: {rotary_type} for Triton implementation"
+        )
+
+
+def apply_rotary_pos_emb_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_out: Optional[torch.Tensor] = None,
+    k_out: Optional[torch.Tensor] = None,
+    rotary_type: str = "hf-llama",
+    impl: str = "auto",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if rotary_type == "llama":
+        q_shape = q.shape
+        k_shape = k.shape
+
+        if q.dim() == 4:
+            q = q.view(-1, q_shape[-2], q_shape[-1])
+            if q_out is not None:
+                q_out = q_out.view(-1, q_shape[-2], q_shape[-1])
+        elif q.dim() == 3:
+            pass
+        elif q.dim() == 2:
+            q = q.view(-1, 1, q_shape[-1])
+            if q_out is not None:
+                q_out = q_out.view(-1, 1, q_shape[-1])
+        else:
+            assert False
+        if k.dim() == 4:
+            k = k.view(-1, k_shape[-2], k_shape[-1])
+            if k_out is not None:
+                k_out = k_out.view(-1, k_shape[-2], k_shape[-1])
+        elif k.dim() == 3:
+            pass
+        elif k.dim() == 2:
+            k = k.view(-1, 1, k_shape[-1])
+            if k_out is not None:
+                k_out = k_out.view(-1, 1, k_shape[-1])
+        else:
+            assert False
+
+        q_out, k_out = chitu_backend.cuda_rotary_pos_emb_llama(
+            q, k, cos, sin, q_out=q_out, k_out=k_out
+        )
+
+        return q_out.view(q_shape), k_out.view(k_shape)
+
+    else:
+        raise NotImplementedError(
+            f"Unsupported rotary type: {rotary_type} for CUDA implementation"
+        )
 
 
 def apply_rotary_pos_emb_torch(
@@ -274,8 +332,10 @@ def apply_rotary_pos_emb_torch(
     k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    q_out: Optional[torch.Tensor] = None,
+    k_out: Optional[torch.Tensor] = None,
     rotary_type: str = "hf-llama",
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     if rotary_type == "hf-llama":
         # "hf-llama" has an [real, real, ..., real, imag, imag, ..., imag] layout.
         cos = torch.cat([cos, cos], dim=-1)
@@ -286,7 +346,7 @@ def apply_rotary_pos_emb_torch(
         sin_k = reshape_rotary_for_broadcast(sin, k)
         q_embed = (q * cos_q) + (rotate_half(q) * sin_q)
         k_embed = (k * cos_k) + (rotate_half(k) * sin_k)
-        return q_embed.to(q.dtype), k_embed.to(k.dtype)
+        q_embed, k_embed = q_embed.to(q.dtype), k_embed.to(k.dtype)
 
     elif rotary_type == "llama":
         # "llama" has an [real, imag, real, imag, ..., real, imag] layout.
@@ -298,7 +358,7 @@ def apply_rotary_pos_emb_torch(
         sin_k = reshape_rotary_for_broadcast(sin, k)
         q_embed = (q * cos_q) + (rotate_pairwise(q) * sin_q)
         k_embed = (k * cos_k) + (rotate_pairwise(k) * sin_k)
-        return q_embed.to(q.dtype), k_embed.to(k.dtype)
+        q_embed, k_embed = q_embed.to(q.dtype), k_embed.to(k.dtype)
 
     elif rotary_type == "glm4":
         # TODO: Now we transpose q and k, do the rotary, and transpose back.
@@ -335,12 +395,22 @@ def apply_rotary_pos_emb_torch(
             .permute(0, 1, 3, 2)
             .reshape(k_embed.shape[0], k_embed.shape[1], k_embed.shape[2])
         )
-        return torch.cat([q_embed, q_pass], dim=-1), torch.cat(
+        q_embed, k_embed = torch.cat([q_embed, q_pass], dim=-1), torch.cat(
             [k_embed, k_pass], dim=-1
         )
 
     else:
         raise ValueError(f"Unknown rotary type: {rotary_type}")
+
+    if q_out is not None:
+        q_out.copy_(q_embed)
+    else:
+        q_out = q_embed
+    if k_out is not None:
+        k_out.copy_(k_embed)
+    else:
+        k_out = k_embed
+    return q_out, k_out
 
 
 def apply_rotary_pos_emb(
@@ -348,9 +418,11 @@ def apply_rotary_pos_emb(
     k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    q_out: Optional[torch.Tensor] = None,
+    k_out: Optional[torch.Tensor] = None,
     rotary_type: str = "hf-llama",
     impl: str = "auto",
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Rotary positional embedding
 
@@ -359,14 +431,23 @@ def apply_rotary_pos_emb(
         k: Key input
         cos: Precomputed cosine
         sin: Precomputed sine
+        q_out: If set, the query output will be written to this tensor
+        k_out: If set, the key output will be written to this tensor
         rotary_type: Variant of rotary positional embedding
     """
 
     if impl == "auto":
-        if rotary_type == "hf-llama" or (
-            rotary_type == "llama" and hasattr(triton.language, "interleave")
+        if (
+            q_out is None
+            and k_out is None
+            and (
+                rotary_type == "hf-llama"
+                or (rotary_type == "llama" and hasattr(triton.language, "interleave"))
+            )
         ):
             impl = "triton"
+        elif rotary_type == "llama":
+            impl = "cuda"
         else:
             impl = "torch"
 
@@ -374,9 +455,17 @@ def apply_rotary_pos_emb(
         # NOTE: some platform such as muxi now doesn't support triton.language.interleave, so we need check attr
         # NOTE: Performance of triton rotary kernel is untested for large batch sizes.
         # If it's slow on prefill, just switch to torch implementation on the else case.
+        assert q_out is None  # Triton does not support in-place operation
+        assert k_out is None
         return apply_rotary_pos_emb_triton(q, k, cos, sin, rotary_type=rotary_type)
+    elif impl == "cuda":
+        return apply_rotary_pos_emb_cuda(
+            q, k, cos, sin, q_out=q_out, k_out=k_out, rotary_type=rotary_type
+        )
     elif impl == "torch":
-        return apply_rotary_pos_emb_torch(q, k, cos, sin, rotary_type=rotary_type)
+        return apply_rotary_pos_emb_torch(
+            q, k, cos, sin, q_out=q_out, k_out=k_out, rotary_type=rotary_type
+        )
     else:
         raise NotImplementedError(f"Unsupported rotary implementation: {impl}")
 

@@ -17,7 +17,9 @@
 
 namespace chitu {
 
+// FIXME: set it as a template parameter according to the device
 #define WARP_SIZE 32
+
 template <typename scalar_t>
 __global__ void
 count_and_sort_expert_tokens_kernel(const scalar_t *__restrict__ topk_ids,

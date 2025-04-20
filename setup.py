@@ -32,6 +32,8 @@ ext_modules = [
             "./csrc/moe_align_kernel.cu",
             "./csrc/fused_shared_experts_kernel.cu",
             "./csrc/group_topk.cu",
+            "./csrc/rotary_pos_emb_llama.cu",
+            "./csrc/rms_norm.cu",
             "./csrc/weight_layout_change.cu",
         ],
         extra_compile_args={

@@ -12,7 +12,9 @@
 
 namespace chitu {
 
+// FIXME: set it as a template parameter according to the device
 #define WARP_SIZE 32
+#define WARP_SHFL_MASK 0xffffffff
 
 template <typename T,
           /// Number of elements in the array
@@ -145,11 +147,11 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
         }
 
         for (int mask = (experts_per_group / VPT) / 2; mask > 0; mask >>= 1) {
-            BIAS_T tmp = __shfl_xor_sync(0xFFFFFFFFFFFFFFFF,
-                                         max_score_in_experts_group_tmp, mask,
-                                         THREADS_PER_ROW);
-            int tmp_id = __shfl_xor_sync(0xFFFFFFFFFFFFFFFF, max_id, mask,
-                                         THREADS_PER_ROW);
+            BIAS_T tmp =
+                __shfl_xor_sync(WARP_SHFL_MASK, max_score_in_experts_group_tmp,
+                                mask, THREADS_PER_ROW);
+            int tmp_id =
+                __shfl_xor_sync(WARP_SHFL_MASK, max_id, mask, THREADS_PER_ROW);
             if (gt(tmp, max_score_in_experts_group_tmp) ||
                 (eq(tmp, max_score_in_experts_group_tmp) && tmp_id < max_id)) {
                 max_score_in_experts_group_tmp = tmp;
@@ -171,11 +173,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     BIAS_T max_tmp = max_score_in_experts_group;
     for (int i = 0; i < topK_groups; i++) {
         for (int mask = THREADS_PER_ROW / 2; mask > 0; mask >>= 1) {
-            BIAS_T tmp = __shfl_xor_sync(0xFFFFFFFFFFFFFFFF, max_tmp, mask,
-                                         THREADS_PER_ROW);
-            int tmp_expert_id =
-                __shfl_xor_sync(0xFFFFFFFFFFFFFFFF, max_experts_group_id, mask,
-                                THREADS_PER_ROW);
+            BIAS_T tmp =
+                __shfl_xor_sync(WARP_SHFL_MASK, max_tmp, mask, THREADS_PER_ROW);
+            int tmp_expert_id = __shfl_xor_sync(
+                WARP_SHFL_MASK, max_experts_group_id, mask, THREADS_PER_ROW);
             if (gt(tmp, max_tmp) ||
                 (eq(tmp, max_tmp) && tmp_expert_id < max_experts_group_id)) {
                 max_tmp = tmp;
@@ -238,12 +239,12 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 // Second, use butterfly to find the global max
 #pragma unroll
         for (int mask = THREADS_PER_ROW / 2; mask > 0; mask >>= 1) {
-            BIAS_T other_max_val = __shfl_xor_sync(0xFFFFFFFFFFFFFFFF, max_val,
-                                                   mask, THREADS_PER_ROW);
-            int other_expert_id = __shfl_xor_sync(0xFFFFFFFFFFFFFFFF, expert_id,
+            BIAS_T other_max_val =
+                __shfl_xor_sync(WARP_SHFL_MASK, max_val, mask, THREADS_PER_ROW);
+            int other_expert_id = __shfl_xor_sync(WARP_SHFL_MASK, expert_id,
                                                   mask, THREADS_PER_ROW);
             T other_max_val_no_bias = __shfl_xor_sync(
-                0xFFFFFFFFFFFFFFFF, max_val_no_bias, mask, THREADS_PER_ROW);
+                WARP_SHFL_MASK, max_val_no_bias, mask, THREADS_PER_ROW);
 
             // keep the lower expert_id "win"
             if (gt(other_max_val, max_val) ||
@@ -340,7 +341,7 @@ void fused_gate_dispatcher(const T *input, const int score_fun,
         assert(false && "Unsupported topK value, just 8 are supported now.");
         break;
     }
-} // namespace fused_softmax_topk
+}
 
 #define LAUNCH_GATE(NUM_EXPERTS)                                               \
     fused_gate_dispatcher<T, BIAS_T, NUM_EXPERTS>(                             \
