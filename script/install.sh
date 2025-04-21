@@ -33,10 +33,10 @@ if [ "${enable_editable_install}" == "true" ]; then
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e .${OPTIONAL_DEPS_SPECIFIER}
 else
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple .${OPTIONAL_DEPS_SPECIFIER}
-fi
 
-# Remove the source code. We only need to run the installed package. Keep testings and scripts.
-#
-# NOTE: A better practice is to use a multi-stage build. But currently `muxi.Dockerfile`
-# requires an additional `docker run` stage to build. We will consider this in the future.
-rm -rf ./chitu
+    # Remove the source code. We only need to run the installed package. Keep testings and scripts.
+    #
+    # NOTE: A better practice is to use a multi-stage build. But currently `muxi.Dockerfile`
+    # requires an additional `docker run` stage to build. We will consider this in the future.
+    rm -rf ./chitu
+fi
