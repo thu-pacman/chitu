@@ -183,7 +183,11 @@ class ParallelAbsorbGemm(torch.nn.Module):
 
         y = quant_einsum_shc_hdc_shd(
             x,
-            self.weight,
+            (
+                self.weight
+                if self.weight.element_size() > 1 or has_native_fp8()
+                else self.weight.view(torch.uint8)
+            ),
             self.scale,
             soft_fp8=(get_global_args().infer.raise_lower_bit_float_to == "bfloat16"),
         )
