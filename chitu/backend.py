@@ -292,15 +292,9 @@ class Backend:
 
         if args.models.type == "deepseek-v3":
             if args.infer.mla_absorb in ["absorb", "absorb-without-precomp"]:
-                if args.infer.cache_type == "paged":
-                    kv_cache_kvargs["kv_shape_per_sample"] = (
-                        args.models.kv_lora_rank + args.models.qk_rope_head_dim,
-                    )
-                else:
-                    kv_cache_kvargs["k_shape_per_sample"] = (args.models.kv_lora_rank,)
-                    kv_cache_kvargs["v_shape_per_sample"] = (
-                        args.models.qk_rope_head_dim,
-                    )
+                kv_cache_kvargs["kv_shape_per_sample"] = (
+                    args.models.kv_lora_rank + args.models.qk_rope_head_dim,
+                )
             elif args.infer.mla_absorb == "none":
                 n_local_heads = args.models.n_heads // model_parallel_size
                 k_head_dim = args.models.qk_nope_head_dim + args.models.qk_rope_head_dim
@@ -401,6 +395,7 @@ class Backend:
         if hasattr(args.models, "quant") and args.models.quant not in [
             None,
             "blockfp8",
+            "blockfp4",
         ]:
             # Merge weights for offline-scaled quantized models is non-trivial, because we can
             # only merge weights but NOT the scales on input dimensions, and this will break the
@@ -778,6 +773,7 @@ def load_state_dict_deepseek_v3(hf_ckpt_path, skip_preprocess=False):
                     name = name.replace("self_attn", "attn")
                     name = name.replace("mlp", "ffn")
                     name = name.replace("weight_scale_inv", "scale")
+                    name = name.replace("weight_scale", "scale")
                     name = name.replace("e_score_correction_bias", "bias")
                     key = name.split(".")[-2]
                     mapping = {

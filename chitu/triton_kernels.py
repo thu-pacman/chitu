@@ -1,5 +1,6 @@
 __all__ = [
     "append_to_paged_kv_cache_kernel",
+    "append_to_non_paged_kv_cache_kernel",
     "rotary_embedding_kernel_hf_llama",
     "rotary_embedding_kernel_llama",
     "act_quant_deepseek_v3_kernel",
@@ -8,16 +9,35 @@ __all__ = [
     "weight_dequant_soft_fp8_deepseek_v3_kernel_step_2",
     "fp8_gemm_deepseek_v3_kernel",
     "soft_fp8_gemm_deepseek_v3_kernel",
+    "soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel",
+    "soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel",
     "moe_sum_kernel",
     "silu_and_mul_kernel",
     "rms_norm_kernel",
     "grouped_matmul_kernel",
 ]
 
+import functools
+from logging import getLogger
+
 import triton
 import triton.language as tl
 from triton import Config
+
 from chitu.device_type import is_muxi
+
+logger = getLogger(__name__)
+
+
+def auto_tuning_logger(args, **kwargs):
+    # NOTE: there are more info in `args`, but normally we don't print it,
+    # because there are large tensors inside, which is a run time performance
+    # overhead to print them. You can temporarily print them if you want to
+    # debug.
+    logger.debug(
+        f"Tuning fp8_gemm_deepseek_v3_configs. Trying: "
+        + ", ".join([f"{key}={kwargs[key]}" for key in kwargs])
+    )
 
 
 @triton.jit
@@ -49,6 +69,33 @@ def append_to_paged_kv_cache_kernel(
     kv_cache_offset = (
         page_id * KV_CACHE_STRIDE0 + (seqlen % PAGE_SIZE) * KV_CACHE_STRIDE1 + dim_id
     )
+    this_kv_offset = batch_id * THIS_KV_STRIDE0 + dim_id
+
+    this_kv_data = tl.load(this_kv_ptr + this_kv_offset, mask=dim_mask)
+    tl.store(kv_cache_ptr + kv_cache_offset, this_kv_data, mask=dim_mask)
+
+
+@triton.jit
+def append_to_non_paged_kv_cache_kernel(
+    kv_cache_ptr,  # (num_pages, page_size, other dims...)
+    this_kv_ptr,  # (batch_size, other dims...)
+    old_seq_lens_ptr,  # (batch_size,)
+    BATCH_SIZE: tl.constexpr,
+    TOT_LEN_OF_OTHER_DIMS: tl.constexpr,
+    KV_CACHE_STRIDE0: tl.constexpr,
+    KV_CACHE_STRIDE1: tl.constexpr,
+    THIS_KV_STRIDE0: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,  # GPU block size, not page size
+):
+    batch_id = tl.program_id(axis=0)
+    dim_id_0 = tl.program_id(axis=1)
+    dim_id_1 = tl.arange(0, BLOCK_SIZE)
+    dim_id = dim_id_0 * BLOCK_SIZE + dim_id_1
+    dim_mask = dim_id < TOT_LEN_OF_OTHER_DIMS
+
+    seqlen = tl.load(old_seq_lens_ptr + batch_id)
+
+    kv_cache_offset = batch_id * KV_CACHE_STRIDE0 + seqlen * KV_CACHE_STRIDE1 + dim_id
     this_kv_offset = batch_id * THIS_KV_STRIDE0 + dim_id
 
     this_kv_data = tl.load(this_kv_ptr + this_kv_offset, mask=dim_mask)
@@ -299,6 +346,12 @@ fp8_gemm_deepseek_v3_configs = [
         {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": 128},
         num_stages=num_stages,
         num_warps=8,
+        pre_hook=functools.partial(
+            auto_tuning_logger,
+            block_m=block_m,
+            block_n=block_n,
+            num_stages=num_stages,
+        ),
     )
     for block_m in [16, 32, 64]
     for block_n in [32, 64, 128]
@@ -364,6 +417,104 @@ def fp8_gemm_deepseek_v3_kernel(
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K
         b_ptrs += BLOCK_SIZE_K
+    c = accumulator.to(c_ptr.dtype.element_ty)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c, mask=mask)
+
+
+@triton.autotune(configs=fp8_gemm_deepseek_v3_configs, key=["N", "K"])
+@triton.jit
+def soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_s_ptr,
+    b_s_ptr,
+    b_s_2_ptr,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    group_k: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    stride_b_s: tl.constexpr,
+    is_w1w3: tl.constexpr,
+):
+    """
+    Performs a matrix multiplication operation on FP8 matrices with scaling factors.
+
+    Args:
+        a_ptr (tl.tensor): Pointer to the first input matrix A.
+        b_ptr (tl.tensor): Pointer to the second input matrix B.
+        c_ptr (tl.tensor): Pointer to the output matrix C.
+        a_s_ptr (tl.tensor): Pointer to the scaling factors for matrix A.
+        b_s_ptr (tl.tensor): Pointer to the scaling factors for matrix B.
+        M (int): Number of rows in matrix A and C.
+        N (tl.constexpr): Number of columns in matrix B and C.
+        K (tl.constexpr): Number of columns in matrix A and rows in matrix B.
+        group_n (tl.constexpr): Quantization group size for the N dimension.
+        group_k (tl.constexpr): Quantization group size for the K dimension.
+        BLOCK_SIZE_M (tl.constexpr): Block size for the M dimension.
+        BLOCK_SIZE_N (tl.constexpr): Block size for the N dimension.
+        BLOCK_SIZE_K (tl.constexpr): Block size for the K dimension.
+
+    Returns:
+        None
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    k = tl.cdiv(K, BLOCK_SIZE_K)
+    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K // 2)
+    num_b_s_in_block = tl.cdiv(BLOCK_SIZE_K, stride_b_s)
+    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+    b_ptrs = b_ptr + offs_n[None, :] * K // 2 + offs_k[:, None]
+    a_s_ptrs = a_s_ptr + offs_m * k
+    b_s_ptrs = b_s_ptr + (offs_n[None, :] * K + offs_k[:, None]) // stride_b_s
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    if is_w1w3:
+        if pid_n * BLOCK_SIZE_N >= N // 2:
+            scale_2 = tl.load(b_s_2_ptr + 1)
+        else:
+            scale_2 = tl.load(b_s_2_ptr)
+    else:
+        scale_2 = tl.load(b_s_2_ptr)
+    fp4_to_fp8_scale = 64.0
+    for i in range(k):
+        b = tl.load(
+            b_ptrs,
+            mask=offs_k[:, None] < (K - i * BLOCK_SIZE_K - BLOCK_SIZE_K // 2),
+            other=0.0,
+        )
+        a_s = tl.load(a_s_ptrs + i * BLOCK_SIZE_K // group_k)
+        b_s_1 = tl.load(b_s_ptrs)
+        b_s_2 = tl.load(b_s_ptrs + num_b_s_in_block // 2)
+        fp8_weight_1 = ((b & 0x08) << 4) | ((b & 0x07) << 2)
+        fp8_weight_2 = (b & 0x80) | ((b & 0x70) >> 2)
+        a_1 = tl.load(
+            a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K - BLOCK_SIZE_K // 2
+        )
+        a_2 = tl.load(
+            a_ptrs + BLOCK_SIZE_K // 2,
+            mask=offs_k[None, :] < K - i * BLOCK_SIZE_K - BLOCK_SIZE_K // 2,
+        )
+        fp8_weight_1 = (
+            fp8_weight_1.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16) * b_s_1
+        )
+        accumulator += tl.dot(a_1, fp8_weight_1.to(tl.float8e4nv)) * a_s[:, None]
+        fp8_weight_2 = (
+            fp8_weight_2.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16) * b_s_2
+        )
+        accumulator += tl.dot(a_2, fp8_weight_2.to(tl.float8e4nv)) * a_s[:, None]
+        a_ptrs += BLOCK_SIZE_K
+        b_ptrs += BLOCK_SIZE_K // 2
+        b_s_ptrs += num_b_s_in_block
+    accumulator = accumulator * fp4_to_fp8_scale * scale_2
     c = accumulator.to(c_ptr.dtype.element_ty)
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -478,6 +629,105 @@ def soft_fp8_gemm_deepseek_v3_kernel(
     c_ptrs = C + N * offs_cm[:, None] + offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
+
+
+@triton.autotune(configs=soft_fp8_gemm_deepseek_v3_configs, key=["N", "K"])
+@triton.jit
+def soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    b_s_ptr,
+    b_s_2_ptr,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_b_s: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    is_w1w3: tl.constexpr,
+):
+    """
+    Performs a matrix multiplication operation on FP8 matrices with scaling factors.
+
+    Args:
+        a_ptr (tl.tensor): Pointer to the first input matrix A.
+        b_ptr (tl.tensor): Pointer to the second input matrix B.
+        c_ptr (tl.tensor): Pointer to the output matrix C.
+        a_s_ptr (tl.tensor): Pointer to the scaling factors for matrix A.
+        b_s_ptr (tl.tensor): Pointer to the scaling factors for matrix B.
+        M (int): Number of rows in matrix A and C.
+        N (tl.constexpr): Number of columns in matrix B and C.
+        K (tl.constexpr): Number of columns in matrix A and rows in matrix B.
+        group_n (tl.constexpr): Quantization group size for the N dimension.
+        group_k (tl.constexpr): Quantization group size for the K dimension.
+        BLOCK_SIZE_M (tl.constexpr): Block size for the M dimension.
+        BLOCK_SIZE_N (tl.constexpr): Block size for the N dimension.
+        BLOCK_SIZE_K (tl.constexpr): Block size for the K dimension.
+
+    Returns:
+        None
+    """
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    k = tl.cdiv(K, BLOCK_SIZE_K)
+    num_b_s_in_block = tl.cdiv(BLOCK_SIZE_K, stride_b_s)
+    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K // 2)
+    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+    b_ptrs = b_ptr + offs_n[None, :] * K // 2 + offs_k[:, None]
+    b_s_ptrs = b_s_ptr + (offs_n[None, :] * K + offs_k[:, None]) // stride_b_s
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    if is_w1w3:
+        if pid_n * BLOCK_SIZE_N >= N // 2:
+            scale_2 = tl.load(b_s_2_ptr + 1)
+        else:
+            scale_2 = tl.load(b_s_2_ptr)
+    else:
+        scale_2 = tl.load(b_s_2_ptr)
+    fp4_to_fp8_scale = 64.0
+    for i in range(k):
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < (K - i * BLOCK_SIZE_K), other=0.0)
+        b_s_1 = tl.load(b_s_ptrs)
+        b_s_2 = tl.load(b_s_ptrs + num_b_s_in_block // 2)
+        fp8_weight_1 = ((b & 0x08) << 4) | ((b & 0x07) << 2)
+        fp8_weight_2 = (b & 0x80) | ((b & 0x70) >> 2)
+        a_1 = tl.load(
+            a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K - BLOCK_SIZE_K // 2
+        )
+        a_2 = tl.load(
+            a_ptrs + BLOCK_SIZE_K // 2,
+            mask=offs_k[None, :] < K - i * BLOCK_SIZE_K - BLOCK_SIZE_K // 2,
+        )
+        fp8_weight_1 = (
+            fp8_weight_1.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16) * b_s_1
+        )
+        accumulator += tl.dot(a_1, fp8_weight_1)
+        fp8_weight_2 = (
+            fp8_weight_2.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16) * b_s_2
+        )
+        accumulator += tl.dot(a_2, fp8_weight_2)
+        a_ptrs += BLOCK_SIZE_K
+        b_ptrs += BLOCK_SIZE_K // 2
+        b_s_ptrs += num_b_s_in_block
+    accumulator = accumulator * scale_2 * fp4_to_fp8_scale
+    c = accumulator.to(c_ptr.dtype.element_ty)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c, mask=mask)
 
 
 @triton.jit
@@ -605,9 +855,37 @@ def rms_norm_kernel(
     tl.store(Y + col_offsets, output, mask=mask)
 
 
-@triton.autotune(
-    configs=fp8_gemm_deepseek_v3_configs, key=["N", "K", "fp8_to_fp32_scale"]
-)
+def grouped_matmul_config_filter(*, block_m, block_n, num_stages):
+    # Work around some bugs that not only make a config invalid, and even crashes the program
+    if is_muxi():
+        if num_stages > 1:
+            # Reproduce the bug on image mxc500-torch2.1-py310:mc2.29.0.7-ubuntu22.04-amd64 on host mx-oam-181
+            return False
+    return True
+
+
+grouped_matmul_configs = [
+    Config(
+        {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": 128},
+        num_stages=num_stages,
+        num_warps=8,
+        pre_hook=functools.partial(
+            auto_tuning_logger,
+            block_m=block_m,
+            block_n=block_n,
+            num_stages=num_stages,
+        ),
+    )
+    for block_m in [16, 32, 64]
+    for block_n in [32, 64, 128]
+    for num_stages in [1, 3, 5]
+    if grouped_matmul_config_filter(
+        block_m=block_m, block_n=block_n, num_stages=num_stages
+    )
+]
+
+
+@triton.autotune(configs=grouped_matmul_configs, key=["N", "K", "fp8_to_fp32_scale"])
 @triton.jit
 def grouped_matmul_kernel(
     # Pointers:

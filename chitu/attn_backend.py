@@ -13,8 +13,8 @@ from typing import Optional, Union
 import torch
 
 from chitu.global_vars import get_global_args
-from chitu.ops import append_to_paged_kv_cache
-from chitu.triton_decode_attention import mla_decode
+from chitu.ops import append_to_paged_kv_cache, append_to_non_paged_kv_cache
+from chitu.triton_decode_attention import mla_decode, mla_decode_non_paged
 from chitu.utils import try_import_opt_dep
 from chitu.static_tensor import StaticTensor
 
@@ -31,6 +31,7 @@ class AttnBackend(abc.ABC):
     def prepare_metadata_for_decode(self, *args, **kwargs):
         pass
 
+    @abc.abstractmethod
     def attn_varlen_func(
         self,
         q,
@@ -91,6 +92,7 @@ class AttnBackend(abc.ABC):
         """
         raise NotImplementedError()
 
+    @abc.abstractmethod
     def attn_with_kvcache(
         self,
         q,
@@ -164,6 +166,64 @@ class AttnBackend(abc.ABC):
             out: (batch_size, seqlen, nheads, headdim).
         """
         raise NotImplementedError()
+
+    def mla_attn_with_kvcache(
+        self,
+        q_nope,
+        q_pe,
+        kv_cache,
+        kv,
+        cache_seqlens_excl_this_decode: Union[(int, torch.Tensor)],
+        cache_seqlens_incl_this_decode: Union[(int, torch.Tensor)],
+        block_table: torch.Tensor,
+        causal=True,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
+    ):
+        # If not overridden, fall back to a multi-query attention
+
+        args = get_global_args()
+
+        q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
+        q_nope_pe = q_nope_pe.view(
+            q_nope_pe.shape[-3],  # batch
+            1,  # seqlen
+            q_nope_pe.shape[-2],  # head
+            q_nope_pe.shape[-1],  # hidden
+        )
+
+        kv_cache = kv_cache.view(
+            kv_cache.shape[0],
+            kv_cache.shape[1],
+            1,  # head
+            kv_cache.shape[-1],  # hidden
+        )
+        assert (
+            kv_cache.shape[-1]
+            == args.models.kv_lora_rank + args.models.qk_rope_head_dim
+        )
+        kv_cache_lora = kv_cache[..., : args.models.kv_lora_rank]
+
+        kv = kv.view(
+            kv.shape[0],
+            kv.shape[1],
+            1,  # head
+            kv.shape[-1],  # hidden
+        )
+        assert kv.shape[-1] == args.models.kv_lora_rank + args.models.qk_rope_head_dim
+        kv_lora = kv[..., : args.models.kv_lora_rank]
+
+        return self.attn_with_kvcache(
+            q_nope_pe,
+            kv_cache,
+            kv_cache_lora,
+            kv,
+            kv_lora,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens_excl_this_decode,
+            softmax_scale=softmax_scale,
+        )
 
 
 class FlashAttnBackend(AttnBackend):
@@ -730,9 +790,12 @@ class TritonAttnBackend(RefAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
     ):
-        append_to_paged_kv_cache(
-            kv_cache, block_table, kv, cache_seqlens_excl_this_decode
-        )
+        if block_table is None:
+            append_to_non_paged_kv_cache(kv_cache, kv, cache_seqlens_excl_this_decode)
+        else:
+            append_to_paged_kv_cache(
+                kv_cache, block_table, kv, cache_seqlens_excl_this_decode
+            )
 
         B = q_nope.shape[0]
 
@@ -769,18 +832,31 @@ class TritonAttnBackend(RefAttnBackend):
                 1.0 / ((self.qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5),
             )
 
-        mla_decode(
-            q_nope,
-            q_pe,
-            kv_c_cache,
-            k_pe_cache,
-            o,
-            block_table,
-            cache_seqlens_incl_this_decode,
-            attn_logits,
-            num_kv_splits,
-            softmax_scale,
-            PAGE_SIZE,
-        )
+        if block_table is None:
+            mla_decode_non_paged(
+                q_nope,
+                q_pe,
+                kv_c_cache,
+                k_pe_cache,
+                o,
+                cache_seqlens_incl_this_decode,
+                attn_logits,
+                num_kv_splits,
+                softmax_scale,
+            )
+        else:
+            mla_decode(
+                q_nope,
+                q_pe,
+                kv_c_cache,
+                k_pe_cache,
+                o,
+                block_table,
+                cache_seqlens_incl_this_decode,
+                attn_logits,
+                num_kv_splits,
+                softmax_scale,
+                PAGE_SIZE,
+            )
 
         return o.view(B, 1, self.local_n_heads, -1)

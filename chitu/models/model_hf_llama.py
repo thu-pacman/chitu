@@ -371,12 +371,8 @@ class TransformerBlockHFLlama(TransformerBlock):
             op_impl=op_impl,
             merge_gate_up=merge_qkv_gate_up,
         )
-        self.input_layernorm = RMSNorm(
-            args.dim, eps=args.norm_eps, impl=get_rms_norm_impl()
-        )
-        self.post_attention_layernorm = RMSNorm(
-            args.dim, eps=args.norm_eps, impl=get_rms_norm_impl()
-        )
+        self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
 
     def forward(
         self,
@@ -386,10 +382,13 @@ class TransformerBlockHFLlama(TransformerBlock):
         varlens=None,
     ):
         h = self.self_attn(
-            self.input_layernorm(x), freqs_cis_cos, freqs_cis_sin, varlens
+            self.input_layernorm(x, impl=get_rms_norm_impl()),
+            freqs_cis_cos,
+            freqs_cis_sin,
+            varlens,
         )
         h += x
-        out = h + self.mlp(self.post_attention_layernorm(h))
+        out = h + self.mlp(self.post_attention_layernorm(h, impl=get_rms_norm_impl()))
         return out
 
 
@@ -676,9 +675,7 @@ class TransformerHFLlama(Transformer):
             )
 
     def _init_post_layers(self):
-        self.norm = RMSNorm(
-            self.params.dim, eps=self.params.norm_eps, impl=get_rms_norm_impl()
-        )
+        self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps)
         self.lm_head = ColumnParallelLinear(
             self.params.dim,
             self.params.vocab_size,
@@ -691,7 +688,7 @@ class TransformerHFLlama(Transformer):
 
     def _post_layers(self, h):
         """NOTE: _post_layers is assumed to be a token-wise computation"""
-        h = self.norm(h)
+        h = self.norm(h, impl=get_rms_norm_impl())
         h = self.lm_head(h)
         return h
 

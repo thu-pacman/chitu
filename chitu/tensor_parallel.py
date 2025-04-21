@@ -76,11 +76,13 @@ class LocalLinear(torch.nn.Module):
         self.out_features = out_features
 
         self.weight = torch.nn.Parameter(
-            torch.empty(self.out_features, in_features, dtype=dtype)
+            torch.empty(self.out_features, in_features, dtype=dtype),
+            requires_grad=False,
         )
         if has_bias:
             self.bias = torch.nn.Parameter(
-                torch.empty(self.out_features, dtype=bias_dtype or dtype)
+                torch.empty(self.out_features, dtype=bias_dtype or dtype),
+                requires_grad=False,
             )
         else:
             self.bias = None
@@ -361,7 +363,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.vocab_end_idx = self.vocab_start_idx + (num_embeddings // self.tp_size)
 
         self.weight = torch.nn.Parameter(
-            torch.empty(num_embeddings // self.tp_size, embedding_dim, dtype=dtype)
+            torch.empty(num_embeddings // self.tp_size, embedding_dim, dtype=dtype),
+            requires_grad=False,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

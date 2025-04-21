@@ -6,6 +6,8 @@ from chitu.utils import try_import_opt_dep
 from chitu.ops import (
     fp8_gemm_deepseek_v3,
     soft_fp8_gemm_deepseek_v3,
+    soft_fp4_raise_to_fp8_gemm_deepseek_v3,
+    soft_fp4_raise_to_bf16_gemm_deepseek_v3,
     weight_dequant_soft_fp8_deepseek_v3,
     act_quant_deepseek_v3,
 )
@@ -321,7 +323,7 @@ def linear_block_fp8(
 
     assert weight.element_size() == 1
 
-    if get_global_args().infer.soft_fp8:
+    if get_global_args().infer.raise_lower_bit_float_to == "bfloat16":
         if is_nvidia() or is_muxi():
             y = soft_fp8_gemm_deepseek_v3(x, weight, weight_scale)
             if bias is not None:
@@ -342,6 +344,62 @@ def linear_block_fp8(
         x, act_scale = act_quant_deepseek_v3(x, block_size)
         assert weight_scale is not None
         y = fp8_gemm_deepseek_v3(x, act_scale, weight, weight_scale)
+        if bias is not None:
+            y += bias
+        return y.view(x_shape[:-1] + y.shape[-1:]).to(x_dtype)
+
+
+def linear_block_fp4(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: Optional[torch.Tensor] = None,
+    weight_scale_2: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    block_size: Optional[int] = 128,
+) -> torch.Tensor:
+    """
+    Applies a linear transformation to the incoming data: y = xA^T + b.
+    This function supports specialized implementations based on quantization
+    and tensor formats.
+
+    Args:
+        x (torch.Tensor): The input tensor.
+        weight (torch.Tensor): The weight tensor. It may be quantized and
+            requires dequantization for certain cases.
+        bias (Optional[torch.Tensor]): The bias tensor to be added. Default is None.
+
+    Returns:
+        torch.Tensor: The result of the linear transformation, which may involve
+        quantization-aware computations depending on the input parameters.
+    """
+
+    assert weight.element_size() == 1
+
+    if get_global_args().infer.raise_lower_bit_float_to == "bfloat16":
+        if is_nvidia() or is_muxi():
+            y = soft_fp4_raise_to_bf16_gemm_deepseek_v3(
+                x, weight, weight_scale, weight_scale_2
+            )
+            if bias is not None:
+                y += bias
+            return y
+        else:
+            logger.warning(
+                f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
+            )
+            weight_dequanted = weight_dequant_soft_fp8_deepseek_v3(
+                weight, weight_scale, block_size
+            )
+            return torch.nn.functional.linear(x, weight_dequanted, bias)
+    else:
+        x_dtype = x.dtype
+        x_shape = x.shape
+        x = x.view(-1, x_shape[-1])
+        x, act_scale = act_quant_deepseek_v3(x, block_size)
+        assert weight_scale is not None
+        y = soft_fp4_raise_to_fp8_gemm_deepseek_v3(
+            x, act_scale, weight, weight_scale, weight_scale_2
+        )
         if bias is not None:
             y += bias
         return y.view(x_shape[:-1] + y.shape[-1:]).to(x_dtype)
@@ -410,6 +468,95 @@ class Blockfp8Linear(QuantizedLinearBase):
         )
 
 
+class Blockfp4Linear(QuantizedLinearBase):
+    """
+    block 8-bit weight and activation quantized linear layer.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        has_bias: bool = False,
+        dtype=torch.uint8,
+        bias_dtype=None,
+        block_size=8,
+        scale_2_dim=1,
+        **kwargs,
+    ):
+        super().__init__()
+
+        dtype = dtype or torch.get_default_dtype()
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.block_size = block_size
+
+        self.register_parameter(
+            "weight",
+            torch.nn.Parameter(
+                torch.empty((out_features, in_features), dtype=dtype),
+                requires_grad=False,
+            ),
+        )
+
+        scale_out_features = out_features
+        scale_in_features = (in_features + block_size - 1) // block_size
+        self.register_parameter(
+            "scale",
+            torch.nn.Parameter(
+                torch.empty(
+                    scale_out_features,
+                    scale_in_features,
+                    dtype=torch.float8_e4m3fn,
+                ),
+                requires_grad=False,
+            ),
+        )
+
+        if has_bias:
+            self.register_parameter(
+                "bias",
+                torch.nn.Parameter(
+                    torch.empty(out_features, dtype=bias_dtype),
+                    requires_grad=False,
+                ),
+            )
+        else:
+            self.register_parameter("bias", None)
+
+    def register_scale_2_param(
+        self,
+        scale_2_size: int = 1,
+    ):
+        self.register_parameter(
+            "input_scale",
+            torch.nn.Parameter(
+                torch.empty(
+                    scale_2_size,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            ),
+        )
+        self.register_parameter(
+            "scale_2",
+            torch.nn.Parameter(
+                torch.empty(
+                    scale_2_size,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            ),
+        )
+
+    @torch.no_grad()
+    def forward(self, x) -> torch.Tensor:
+        return linear_block_fp4(
+            x, self.weight, self.scale, self.scale_2, self.bias, block_size=128
+        )
+
+
 class QuantizationRegistry:
     """
     Registry of available quantization methods and their implementations.
@@ -421,6 +568,7 @@ class QuantizationRegistry:
         "simple_w8a8": W8A8Linear,
         "simple_w8a8_muxi": W8A8MuxiLinear,
         "blockfp8": Blockfp8Linear,
+        "blockfp4": Blockfp4Linear,
     }
 
     @classmethod

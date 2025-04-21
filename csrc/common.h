@@ -48,7 +48,7 @@ template <typename T> struct map_to_cuda_type {
 // float16: map at::Half -> __half
 
 template <> struct map_to_cuda_type<at::Half> {
-    using type = half;
+    using type = __half;
 };
 
 // bfloat16: map at::BFloat16 -> nv_bfloat16
