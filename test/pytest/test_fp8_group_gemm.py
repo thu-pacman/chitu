@@ -24,23 +24,31 @@ def check_close(x, y):
     return diff < 0.001
 
 
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("n_heads,in_feats,out_feats", [(16, 128, 512), (16, 512, 128)])
 @pytest.mark.parametrize("compute_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("soft_fp8", [False, True])
-def test_quant_einsum_shc_hdc_shd(compute_dtype, soft_fp8):
+def test_quant_einsum_shc_hdc_shd(
+    n_heads, batch_size, in_feats, out_feats, compute_dtype, soft_fp8
+):
     torch.set_default_dtype(compute_dtype)
     if not soft_fp8 and (
         not is_nvidia() or not torch.cuda.get_device_capability() >= (9, 0)
     ):
         pytest.skip("This test requires NVIDIA GPU with compute capability >= 9.0")
 
-    q_nope = torch.randn((22, 16, 128), dtype=compute_dtype, device="cuda")
+    q_nope = torch.randn(
+        (batch_size, n_heads, in_feats), dtype=compute_dtype, device="cuda"
+    )
     weight = (
-        torch.randn((16, 512, 128), dtype=compute_dtype)
+        torch.randn((n_heads, out_feats, in_feats), dtype=compute_dtype)
         .to(torch.float8_e4m3fn)
         .cuda()
         .view(torch.uint8)
     )
-    scale = torch.randn((16, 4, 1), dtype=torch.float32, device="cuda")
+    scale = torch.randn(
+        (n_heads, out_feats // 128, in_feats // 128), dtype=torch.float32, device="cuda"
+    )
     torch_out = quant_einsum_shc_hdc_shd(
         q_nope, weight, scale, soft_fp8=soft_fp8, impl="torch"
     )

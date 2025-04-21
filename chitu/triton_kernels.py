@@ -17,10 +17,27 @@ __all__ = [
     "grouped_matmul_kernel",
 ]
 
+import functools
+from logging import getLogger
+
 import triton
 import triton.language as tl
 from triton import Config
+
 from chitu.device_type import is_muxi
+
+logger = getLogger(__name__)
+
+
+def auto_tuning_logger(args, **kwargs):
+    # NOTE: there are more info in `args`, but normally we don't print it,
+    # because there are large tensors inside, which is a run time performance
+    # overhead to print them. You can temporarily print them if you want to
+    # debug.
+    logger.debug(
+        f"Tuning fp8_gemm_deepseek_v3_configs. Trying: "
+        + ", ".join([f"{key}={kwargs[key]}" for key in kwargs])
+    )
 
 
 @triton.jit
@@ -329,6 +346,12 @@ fp8_gemm_deepseek_v3_configs = [
         {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": 128},
         num_stages=num_stages,
         num_warps=8,
+        pre_hook=functools.partial(
+            auto_tuning_logger,
+            block_m=block_m,
+            block_n=block_n,
+            num_stages=num_stages,
+        ),
     )
     for block_m in [16, 32, 64]
     for block_n in [32, 64, 128]
@@ -832,9 +855,37 @@ def rms_norm_kernel(
     tl.store(Y + col_offsets, output, mask=mask)
 
 
-@triton.autotune(
-    configs=fp8_gemm_deepseek_v3_configs, key=["N", "K", "fp8_to_fp32_scale"]
-)
+def grouped_matmul_config_filter(*, block_m, block_n, num_stages):
+    # Work around some bugs that not only make a config invalid, and even crashes the program
+    if is_muxi():
+        if num_stages > 1:
+            # Reproduce the bug on image mxc500-torch2.1-py310:mc2.29.0.7-ubuntu22.04-amd64 on host mx-oam-181
+            return False
+    return True
+
+
+grouped_matmul_configs = [
+    Config(
+        {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": 128},
+        num_stages=num_stages,
+        num_warps=8,
+        pre_hook=functools.partial(
+            auto_tuning_logger,
+            block_m=block_m,
+            block_n=block_n,
+            num_stages=num_stages,
+        ),
+    )
+    for block_m in [16, 32, 64]
+    for block_n in [32, 64, 128]
+    for num_stages in [1, 3, 5]
+    if grouped_matmul_config_filter(
+        block_m=block_m, block_n=block_n, num_stages=num_stages
+    )
+]
+
+
+@triton.autotune(configs=grouped_matmul_configs, key=["N", "K", "fp8_to_fp32_scale"])
 @triton.jit
 def grouped_matmul_kernel(
     # Pointers:
