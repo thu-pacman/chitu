@@ -112,7 +112,7 @@ torchrun --nnodes 1 \
     models.ckpt_dir=/data/DeepSeek-R1 \
     keep_dtype_in_checkpoint=True \
     infer.mla_absorb=absorb-without-precomp \
-    infer.soft_fp8=True \
+    infer.raise_lower_bit_float_to=bfloat16 \
     infer.do_load=True \
     infer.max_reqs=1 \
     scheduler.prefill_first.num_tasks=100 \
@@ -151,7 +151,7 @@ python benchmarks/benchmark_serving.py \
 
 ## 常见问题
 
-[English](/docs/en/FAQ.md) | [中文](/docs/zh/FAQ.md)
+[English](/docs/en/FAQ.md) | [中文](/docs/zh/FAQ_zh.md)
 
 
 ## 贡献指南

@@ -50,6 +50,14 @@ def init_logger(logging_level=logging.INFO):
 
 def chitu_init(args, logging_level=logging.INFO):
     init_logger(logging_level)
+
+    # Deal with legacy arguments
+    if hasattr(args.infer, "soft_fp8") and args.infer.soft_fp8:
+        logger.warning(
+            "Argument `infer.soft_fp8=True` is deprecated. Use `infer.raise_lower_bit_float_to=bfloat16` instead."
+        )
+        args.infer.raise_lower_bit_float_to = "bfloat16"
+
     set_global_variables(args)
     Backend.build(args)
     rank = torch.distributed.get_rank()

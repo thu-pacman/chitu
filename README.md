@@ -110,7 +110,7 @@ torchrun --nnodes 1 \
     infer.attn_type=flash_infer \
     keep_dtype_in_checkpoint=True \
     infer.mla_absorb=absorb-without-precomp \
-    infer.soft_fp8=True \
+    infer.raise_lower_bit_float_to=bfloat16 \
     infer.do_load=True \
     infer.max_reqs=1 \
     scheduler.prefill_first.num_tasks=100 \
