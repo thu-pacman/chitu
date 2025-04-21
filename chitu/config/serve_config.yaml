@@ -14,6 +14,7 @@ infer:
   op_impl: torch # torch or muxi_custom_kernel
   mla_absorb: "none" # none, absorb-without-precomp, absorb
   raise_lower_bit_float_to: float8_e4m3fn # choose one hardware-support dtype to compute lower-bit float 
+  soft_fp8: false # Legacy parameter. To be removed in the future.
   fuse_shared_experts: False # whether to fuse shared experts
   max_reqs: 8
   pp_layer_partition: null # The number of layers for each pipeline stage, e.g., [10, 12, 12, 10].
