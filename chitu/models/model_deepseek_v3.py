@@ -1786,7 +1786,7 @@ class TransformerDeepSeekV3(Transformer):
                 wkv_b_absorb_1_weight = wkv_b_weight[:, : self.params.qk_nope_head_dim]
                 wkv_b_absorb_2_weight = wkv_b_weight[:, self.params.qk_nope_head_dim :]
                 new_checkpoint[prefix + "wkv_b_absorb_1.weight"] = (
-                    wkv_b_absorb_1_weight.permute(0, 2, 1)
+                    wkv_b_absorb_1_weight.permute(0, 2, 1).contiguous()
                 )
                 new_checkpoint[prefix + "wkv_b_absorb_2.weight"] = wkv_b_absorb_2_weight
 
@@ -1803,7 +1803,7 @@ class TransformerDeepSeekV3(Transformer):
                         :, self.params.qk_nope_head_dim // block_size :
                     ]
                     new_checkpoint[prefix + "wkv_b_absorb_1.scale"] = (
-                        wkv_b_absorb_1_scale.permute(0, 2, 1)
+                        wkv_b_absorb_1_scale.permute(0, 2, 1).contiguous()
                     )
                     new_checkpoint[prefix + "wkv_b_absorb_2.scale"] = (
                         wkv_b_absorb_2_scale
