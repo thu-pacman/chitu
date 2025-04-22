@@ -20,7 +20,7 @@ import warnings
 import numpy as np
 import re
 import numpy.typing as npt
-from typing import Sequence
+from typing import Sequence, Tuple, Dict
 import os
 from enum import IntEnum
 import torch
@@ -61,7 +61,7 @@ class GGMLQuantizationType(IntEnum):
 
 
 QK_K = 256
-GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
+GGML_QUANT_SIZES: Dict[GGMLQuantizationType, Tuple[int, int]] = {
     GGMLQuantizationType.F32: (1, 4),
     GGMLQuantizationType.F16: (1, 2),
     GGMLQuantizationType.Q4_0: (32, 2 + 16),

@@ -54,14 +54,14 @@ class CustomBuildExtension(BuildExtension):
 
 llama_cpp_files = glob.glob("../../third_party/llamafile/*.cpp")
 setup(
-    name="cpumoe",
+    name="cpuinfer",
     version="0.0.0",
     install_requires=["cpufeature"],
     cmdclass={"build_ext": CustomBuildExtension},
     ext_modules=[
         CMakeExtension("llama.cpp", "../../third_party/llama.cpp"),
         CUDAExtension(
-            name="cpumoe",
+            name="cpuinfer",
             sources=[
                 "ext_bindings.cpp",
                 "moe.cpp",
@@ -75,7 +75,7 @@ setup(
             library_dirs=[
                 os.path.join(setup_dir, "../../third_party/llama.cpp/build"),
             ],
-            extra_compile_args=["-O3", "-march=native"],
+            extra_compile_args=["-O3", "-march=native", "-DUSE_CUDA"],
         ),
         CUDAExtension(
             name="ktdequant",

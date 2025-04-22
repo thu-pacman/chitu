@@ -6,6 +6,8 @@ Chitu is a high-performance inference framework for large language models, focus
 
 ## News
 
+[2025/04/18] Added support for CPU+GPU hybrid inference.
+
 [2025/03/28] Provide FP8 to FP16 operators to support more GPUs.
 
 [2025/03/21] Better support for QwQ-32B. QwQ-32B FP8 model will be available on [Huggingface](https://huggingface.co/qingcheng-ai/QWQ-32B-FP8).
@@ -58,6 +60,47 @@ Chitu is a high-performance inference framework for large language models. Chitu
 |bs=1|22.1|
 |bs=16|202.1|
 |bs=256|780.3|
+
+### CPU+GPU Hybrid Inference
+
+First, pull the latest code and install with:
+
+```bash
+TORCH_CUDA_ARCH_LIST=9.0 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation ".[cpu,flash_mla]"
+```
+
+
+```bash
+torchrun --nproc_per_node 1 \
+    --master_port=22525 \
+    test/single_req_test.py \
+    models=DeepSeek-R1-Q4_K_M \
+    models.ckpt_dir=/data/nfs/DeepSeek-R1-Q4_K_M/ \
+    models.tokenizer_path=/data/nfs/DeepSeek-R1-bf16 \
+    infer.use_cuda_graph=True \
+    quant=gguf \
+    +cpu_layer_num=58 \
+    infer.tp_size=1 \
+    infer.pp_size=1 \
+    infer.cache_type=paged \
+    infer.attn_type=flash_mla \
+    infer.mla_absorb=absorb-without-precomp \
+    infer.max_reqs=1 \
+    infer.max_seq_len=256 \
+    request.max_new_tokens=100
+
+# CPU execution is accelerated with cpumoe
+```
+
+#### Performance Data for Hybrid Inference
+
+| MoE layers on GPU | GPUs | token/s (bs=1) | token/s (bs=16) | 
+|:---------------|:------|:---------------|:----------------|
+| 0    | 1    | 10.61          | 28.16            |
+| 24    | 2    | 14.04           | 42.57        |
+
+
+- 适合需要降低成本或GPU显存受限的场景
 
 
 ## Getting started
@@ -177,5 +220,9 @@ We learned a lot from the following projects and adapted some functions when bui
 - [vLLM](https://github.com/vllm-project/vllm)
 - [SGLang](https://github.com/sgl-project/sglang)
 - [DeepSeek](https://github.com/deepseek-ai)
+- [KTransformers](https://github.com/kvcache-ai/ktransformers)
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)
+- [FlashAttention](https://github.com/Dao-AILab/flash-attention)
+- [FlashInfer](https://github.com/flashinfer-ai/flashinfer)
 
 Special thanks to our partners (Partners listed in no particular order): 中国电信、华为、沐曦、燧原, etc.

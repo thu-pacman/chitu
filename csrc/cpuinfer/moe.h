@@ -17,13 +17,12 @@
 #include <vector>
 
 #include "conversion.h"
+#include "cpuinfer.h"
 #include "llama.cpp/ggml-impl.h"
 #include "llama.cpp/ggml-quants.h"
 #include "llama.cpp/ggml.h"
 #include "llamafile/sgemm.h"
 #include "shared_mem_buffer.h"
-#include "threadpool.h"
-
 struct MOEConfig {
     int expert_num;
     int routed_expert_num;
@@ -39,7 +38,6 @@ struct MOEConfig {
     ggml_type up_type;
     ggml_type down_type;
     ggml_type hidden_type;
-    int max_thread_num;
 
     MOEConfig() {}
 
@@ -47,34 +45,28 @@ struct MOEConfig {
               int intermediate_size, int stride, int group_min_len,
               int group_max_len, void *gate_proj, void *up_proj,
               void *down_proj, ggml_type gate_type, ggml_type up_type,
-              ggml_type down_type, ggml_type hidden_type, int max_thread_num)
+              ggml_type down_type, ggml_type hidden_type)
         : expert_num(expert_num), routed_expert_num(routed_expert_num),
           hidden_size(hidden_size), intermediate_size(intermediate_size),
           stride(stride), group_min_len(group_min_len),
           group_max_len(group_max_len), gate_proj(gate_proj), up_proj(up_proj),
           down_proj(down_proj), gate_type(gate_type), up_type(up_type),
-          down_type(down_type), hidden_type(hidden_type),
-          max_thread_num(max_thread_num) {}
+          down_type(down_type), hidden_type(hidden_type) {}
 };
 
 class MOE {
   public:
     MOE(MOEConfig);
     ~MOE();
-    void warm_up();
+    void warm_up(CPUInfer *CPUInfer);
     void forward_one(int k, const uint64_t *expert_ids, const float *weights,
-                     const void *input, void *output);
+                     const void *input, void *output, CPUInfer *CPUInfer);
     void forward_many(int qlen, int k, const uint64_t *expert_ids,
-                      const float *weights, const void *input, void *output);
+                      const float *weights, const void *input, void *output,
+                      CPUInfer *CPUInfer);
     void forward(int qlen, int k, const uint64_t *expert_ids,
-                 const float *weights, const void *input, void *output);
-    void forward_async(int qlen, int k, const uint64_t *expert_ids,
-                       const float *weights, const void *input, void *output);
-    void sync();
-    void forward_with_cuda_stream(int qlen, int k, const uint64_t *expert_ids,
-                                  const float *weights, const void *input,
-                                  void *output, intptr_t user_cuda_stream);
-    void sync_with_cuda_stream(intptr_t user_cuda_stream);
+                 const float *weights, const void *input, void *output,
+                 CPUInfer *CPUInfer);
 
   private:
     MOEConfig config_;
@@ -169,8 +161,6 @@ class MOE {
     std::vector<float *> m_local_intermediate_fp32_ptr_; // [expert_num]
     std::vector<uint8_t *> m_local_down_input_ptr_;      // [expert_num]
     std::vector<float *> m_local_down_output_ptr_;       // [expert_num]
-    ParallelExecutor *main_executor;
-    ParallelExecutor *worker_executor;
 };
 
 #endif

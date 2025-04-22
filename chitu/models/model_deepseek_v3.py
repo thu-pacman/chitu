@@ -113,6 +113,8 @@ def getLinearDeepSeekV3(
     quant_method = args.models.quant if hasattr(args.models, "quant") else None
     if quant_method is None:
         return LocalLinear
+    elif quant_method == "gguf":
+        return Blockfp8Linear
     elif quant_method == "blockfp8":
         return Blockfp8Linear
     elif quant_method == "blockfp4":
@@ -1295,7 +1297,7 @@ class MoEDeepSeekV3CPU(nn.Module):
         shared_experts (nn.Module): Shared experts applied to all inputs.
     """
 
-    def __init__(self, args, ggml_type, merge_gate_up: bool):
+    def __init__(self, args, cpu_infer, ggml_type, merge_gate_up: bool):
         """
         Initializes the MoE module.
 
@@ -1429,6 +1431,7 @@ class MoEDeepSeekV3CPU(nn.Module):
             )
 
         self.stride = 64
+        self.cpu_infer = cpu_infer
         self.moe = None
 
     def to(self, *args, **kwargs):
@@ -1459,9 +1462,9 @@ class MoEDeepSeekV3CPU(nn.Module):
                 ).contents
             )
 
-            import cpumoe
+            import cpuinfer
 
-            moe_config = cpumoe.moe.MOEConfig(
+            moe_config = cpuinfer.moe.MOEConfig(
                 256,
                 8,
                 7168,
@@ -1476,13 +1479,14 @@ class MoEDeepSeekV3CPU(nn.Module):
                 self.up_type.item(),
                 self.down_type.item(),
                 30,
-                0,
             )
 
-            self.moe = cpumoe.moe.MOE(moe_config)
+            self.moe = cpuinfer.moe.MOE(moe_config)
 
             # warm up
-            self.moe.warm_up()
+            self.cpu_infer.submit(self.moe.warm_up())
+            self.cpu_infer.sync()
+
             self.input_tensor_cpu = torch.empty(
                 (self.max_batch_size, 1, 7168),
                 device="cpu",
@@ -1533,26 +1537,30 @@ class MoEDeepSeekV3CPU(nn.Module):
                 indices = indices.cpu()
                 weights = weights.cpu()
                 output = torch.empty_like(input_tensor).contiguous().pin_memory()
-                self.moe.forward(
-                    indices.size(0),
-                    indices.size(1),
-                    indices.data_ptr(),
-                    weights.data_ptr(),
-                    input_tensor.data_ptr(),
-                    output.data_ptr(),
+                self.cpu_infer.submit(
+                    self.moe.forward(
+                        indices.size(0),
+                        indices.size(1),
+                        indices.data_ptr(),
+                        weights.data_ptr(),
+                        input_tensor.data_ptr(),
+                        output.data_ptr(),
+                    )
                 )
             else:
                 self.input_tensor_cpu.copy_(x, non_blocking=True)
                 self.indices_cpu.copy_(indices, non_blocking=True)
                 self.weights_cpu.copy_(weights, non_blocking=True)
-                self.moe.forward_with_cuda_stream(
-                    self.max_batch_size,
-                    8,
-                    self.indices_cpu.data_ptr(),
-                    self.weights_cpu.data_ptr(),
-                    self.input_tensor_cpu.data_ptr(),
-                    self.output_cpu.data_ptr(),
+                self.cpu_infer.submit_with_cuda_stream(
                     torch.cuda.current_stream().cuda_stream,
+                    self.moe.forward(
+                        self.max_batch_size,
+                        8,
+                        self.indices_cpu.data_ptr(),
+                        self.weights_cpu.data_ptr(),
+                        self.input_tensor_cpu.data_ptr(),
+                        self.output_cpu.data_ptr(),
+                    ),
                 )
 
         if self.merge_gate_up:
@@ -1565,11 +1573,13 @@ class MoEDeepSeekV3CPU(nn.Module):
 
         if self.rank == 0:
             if x.shape[1] > 1:
-                self.moe.sync()
+                self.cpu_infer.sync()
                 output = output.to(x.device, non_blocking=True).view(shape)
                 y += output
             else:
-                self.moe.sync_with_cuda_stream(torch.cuda.current_stream().cuda_stream)
+                self.cpu_infer.sync_with_cuda_stream(
+                    torch.cuda.current_stream().cuda_stream
+                )
                 self.output_gpu.copy_(self.output_cpu, non_blocking=True)
                 y += self.output_gpu
             y_scatter = [y] * self.tp_size
@@ -1623,6 +1633,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                 if not cpu_infer
                 else MoEDeepSeekV3CPU(
                     args,
+                    cpu_infer=cpu_infer,
                     ggml_type=ggml_type,
                     merge_gate_up=merge_qkv_gate_up,
                 )
@@ -1661,7 +1672,7 @@ class TransformerDeepSeekV3(Transformer):
         params,
         cache,
         *,
-        cpu_infer: bool,
+        cpu_infer,
         cpu_layers: List,
         ggml_type: List,
         max_position_embeddings: int,
@@ -1775,7 +1786,7 @@ class TransformerDeepSeekV3(Transformer):
                 wkv_b_absorb_1_weight = wkv_b_weight[:, : self.params.qk_nope_head_dim]
                 wkv_b_absorb_2_weight = wkv_b_weight[:, self.params.qk_nope_head_dim :]
                 new_checkpoint[prefix + "wkv_b_absorb_1.weight"] = (
-                    wkv_b_absorb_1_weight.permute(0, 2, 1)
+                    wkv_b_absorb_1_weight.permute(0, 2, 1).contiguous()
                 )
                 new_checkpoint[prefix + "wkv_b_absorb_2.weight"] = wkv_b_absorb_2_weight
 
@@ -1792,7 +1803,7 @@ class TransformerDeepSeekV3(Transformer):
                         :, self.params.qk_nope_head_dim // block_size :
                     ]
                     new_checkpoint[prefix + "wkv_b_absorb_1.scale"] = (
-                        wkv_b_absorb_1_scale.permute(0, 2, 1)
+                        wkv_b_absorb_1_scale.permute(0, 2, 1).contiguous()
                     )
                     new_checkpoint[prefix + "wkv_b_absorb_2.scale"] = (
                         wkv_b_absorb_2_scale

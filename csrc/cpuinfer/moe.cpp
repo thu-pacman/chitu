@@ -16,18 +16,10 @@
 #include <numaif.h>
 #endif
 
-#include <cuda_runtime.h>
-
+thread_local int CPUInfer::worker_id_ = 0;
 #ifdef USE_NUMA
-thread_local int ParallelExecutor::numa_node = -1;
+thread_local int CPUInfer::numa_node_ = -1;
 #endif
-thread_local int ParallelExecutor::thread_local_id = -1;
-
-void __attribute__((constructor)) initialize_ggml_table() {
-    for (int i = 0; i < (1 << 16); ++i) {
-        ggml_table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(i);
-    }
-}
 
 MOE::MOE(MOEConfig config) {
     config_ = config;
@@ -203,15 +195,10 @@ MOE::MOE(MOEConfig config) {
     m_local_intermediate_fp32_ptr_.resize(config_.expert_num);
     m_local_down_input_ptr_.resize(config_.expert_num);
     m_local_down_output_ptr_.resize(config_.expert_num);
-
-    main_executor = new ParallelExecutor(1);
-    worker_executor = new ParallelExecutor(config_.max_thread_num);
 }
 
 MOE::~MOE() {
     shared_mem_buffer.dealloc(this);
-    delete main_executor;
-    delete worker_executor;
 
 #ifdef USE_NUMA
     int numa_nodes = numa_num_configured_nodes();
@@ -232,7 +219,7 @@ MOE::~MOE() {
 #endif
 }
 
-void MOE::warm_up() {
+void MOE::warm_up(CPUInfer *cpuinfer) {
     std::vector<float> input_fp32(config_.hidden_size);
     std::vector<uint8_t> input(config_.hidden_size *
                                ggml_type_size(config_.hidden_type) /
@@ -248,14 +235,15 @@ void MOE::warm_up() {
     for (int i = 0; i < config_.expert_num; i++) {
         uint64_t expert_ids = i;
         float weights = 0;
-        forward_one(1, &expert_ids, &weights, input.data(), output.data());
+        forward_one(1, &expert_ids, &weights, input.data(), output.data(),
+                    cpuinfer);
     }
 }
 
 static float act_fn(float x) { return x / (1.0f + expf(-x)); }
 
 void MOE::forward_one(int k, const uint64_t *expert_ids, const float *weights,
-                      const void *input, void *output) {
+                      const void *input, void *output, CPUInfer *cpuinfer) {
     const void *gate_input_ptr;
     const void *up_input_ptr;
     if (config_.hidden_type ==
@@ -294,20 +282,23 @@ void MOE::forward_one(int k, const uint64_t *expert_ids, const float *weights,
         }
     }
     int nth = config_.intermediate_size / config_.stride;
-
-    worker_executor->do_work_stealing_job(nth * k, [&](int task_id) {
+    cpuinfer->parallel_for(nth * k, [&](int task_id) {
         int expert_idx = task_id / nth;
         uint64_t expert_id = expert_ids[expert_idx];
         int ith = task_id % nth;
 
 #ifdef USE_NUMA
         void *gate_proj_ptr =
-            (uint8_t *)gate_proj_numa_[Backend::numa_node] +
+            (uint8_t *)gate_proj_numa_[cpuinfer::numa_node] +
             (expert_id * config_.intermediate_size + ith * config_.stride) *
                 config_.hidden_size * ggml_type_size(config_.gate_type) /
                 ggml_blck_size(config_.gate_type);
 #else
-        void* gate_proj_ptr = (uint8_t*)gate_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
+            void *gate_proj_ptr =
+                (uint8_t *)gate_proj_ +
+                (expert_id * config_.intermediate_size + ith * config_.stride) *
+                    config_.hidden_size * ggml_type_size(config_.gate_type) /
+                    ggml_blck_size(config_.gate_type);
 #endif
 
         float *gate_output_ptr =
@@ -326,12 +317,16 @@ void MOE::forward_one(int k, const uint64_t *expert_ids, const float *weights,
 
 #ifdef USE_NUMA
         void *up_proj_ptr =
-            (uint8_t *)up_proj_numa_[Backend::numa_node] +
+            (uint8_t *)up_proj_numa_[cpuinfer::numa_node] +
             (expert_id * config_.intermediate_size + ith * config_.stride) *
                 config_.hidden_size * ggml_type_size(config_.up_type) /
                 ggml_blck_size(config_.up_type);
 #else
-        void* up_proj_ptr = (uint8_t*)up_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
+            void *up_proj_ptr =
+                (uint8_t *)up_proj_ +
+                (expert_id * config_.intermediate_size + ith * config_.stride) *
+                    config_.hidden_size * ggml_type_size(config_.up_type) /
+                    ggml_blck_size(config_.up_type);
 #endif
 
         float *up_output_ptr = s_up_output_[expert_idx] + ith * config_.stride;
@@ -370,8 +365,6 @@ void MOE::forward_one(int k, const uint64_t *expert_ids, const float *weights,
                 ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
         }
     });
-    worker_executor->wait();
-
     if (config_.stride %
             ggml_blck_size(ggml_internal_get_type_traits(config_.down_type)
                                .vec_dot_type) !=
@@ -384,7 +377,7 @@ void MOE::forward_one(int k, const uint64_t *expert_ids, const float *weights,
         }
     }
     nth = config_.hidden_size / config_.stride;
-    worker_executor->do_work_stealing_job(nth, [&](int task_id) {
+    cpuinfer->parallel_for(nth, [&](int task_id) {
         int ith = task_id;
         for (int i = ith * config_.stride; i < (ith + 1) * config_.stride;
              i++) {
@@ -395,13 +388,18 @@ void MOE::forward_one(int k, const uint64_t *expert_ids, const float *weights,
 
 #ifdef USE_NUMA
             void *down_proj_ptr =
-                (uint8_t *)down_proj_numa_[Backend::numa_node] +
+                (uint8_t *)down_proj_numa_[cpuinfer::numa_node] +
                 (expert_id * config_.hidden_size + ith * config_.stride) *
                     config_.intermediate_size *
                     ggml_type_size(config_.down_type) /
                     ggml_blck_size(config_.down_type);
 #else
-            void* down_proj_ptr = (uint8_t*)down_proj_ + (expert_id * config_.hidden_size + ith * config_.stride) * config_.intermediate_size * ggml_type_size(config_.down_type) / ggml_blck_size(config_.down_type);
+                void *down_proj_ptr =
+                    (uint8_t *)down_proj_ +
+                    (expert_id * config_.hidden_size + ith * config_.stride) *
+                        config_.intermediate_size *
+                        ggml_type_size(config_.down_type) /
+                        ggml_blck_size(config_.down_type);
 #endif
 
             float *down_output_ptr =
@@ -433,7 +431,6 @@ void MOE::forward_one(int k, const uint64_t *expert_ids, const float *weights,
                        config_.hidden_type);
         }
     });
-    worker_executor->wait();
     if (config_.stride % ggml_blck_size(config_.hidden_type) != 0) {
         from_float(s_output_fp32_, output, config_.hidden_size,
                    config_.hidden_type);
@@ -441,7 +438,8 @@ void MOE::forward_one(int k, const uint64_t *expert_ids, const float *weights,
 }
 
 void MOE::forward_many(int qlen, int k, const uint64_t *expert_ids,
-                       const float *weights, const void *input, void *output) {
+                       const float *weights, const void *input, void *output,
+                       CPUInfer *cpuinfer) {
     for (int i = 0; i < config_.expert_num; i++) {
         m_local_num_[i] = 0;
     }
@@ -483,7 +481,7 @@ void MOE::forward_many(int qlen, int k, const uint64_t *expert_ids,
             m_local_down_output_ + offset * config_.hidden_size;
         offset += m_local_num_[i];
     }
-    worker_executor->do_work_stealing_job(qlen, [&](int i) {
+    cpuinfer->parallel_for(qlen, [&](int i) {
         const void *gate_input_ptr;
         const void *up_input_ptr;
         if (config_.hidden_type ==
@@ -573,133 +571,139 @@ void MOE::forward_many(int qlen, int k, const uint64_t *expert_ids,
                                .vec_dot_type));
         }
     });
-    worker_executor->wait();
     int stride = QK_K;
     int nth = config_.intermediate_size / stride;
-    worker_executor->do_work_stealing_job(
-        nth * config_.expert_num, [&](int task_id) {
-            uint64_t expert_idx = task_id / nth;
-            int ith = task_id % nth;
-            void *gate_input_ptr = m_local_gate_input_ptr_[expert_idx];
+    cpuinfer->parallel_for(nth * config_.expert_num, [&](int task_id) {
+        uint64_t expert_idx = task_id / nth;
+        int ith = task_id % nth;
+        void *gate_input_ptr = m_local_gate_input_ptr_[expert_idx];
 
 #ifdef USE_NUMA
+        void *gate_proj_ptr =
+            (uint8_t *)gate_proj_numa_[cpuinfer::numa_node] +
+            (expert_idx * config_.intermediate_size + ith * stride) *
+                config_.hidden_size * ggml_type_size(config_.gate_type) /
+                ggml_blck_size(config_.gate_type);
+#else
             void *gate_proj_ptr =
-                (uint8_t *)gate_proj_numa_[ParallelExecutor::numa_node] +
+                (uint8_t *)gate_proj_ +
                 (expert_idx * config_.intermediate_size + ith * stride) *
                     config_.hidden_size * ggml_type_size(config_.gate_type) /
                     ggml_blck_size(config_.gate_type);
-#else
-        void* gate_proj_ptr = (uint8_t*)gate_proj_ + (expert_idx * config_.intermediate_size + ith * stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
 #endif
 
-            float *gate_output_ptr =
-                m_local_gate_output_ptr_[expert_idx] + ith * stride;
-            llamafile_sgemm(
-                stride, m_local_num_[expert_idx],
-                config_.hidden_size / ggml_blck_size(config_.gate_type),
-                gate_proj_ptr,
-                config_.hidden_size / ggml_blck_size(config_.gate_type),
-                gate_input_ptr,
-                config_.hidden_size / ggml_blck_size(config_.gate_type),
-                gate_output_ptr, config_.intermediate_size, 0, 1,
-                GGML_TASK_TYPE_COMPUTE, config_.gate_type,
-                ggml_internal_get_type_traits(config_.gate_type).vec_dot_type,
-                GGML_TYPE_F32, GGML_PREC_DEFAULT);
-            void *up_input_ptr = m_local_up_input_ptr_[expert_idx];
+        float *gate_output_ptr =
+            m_local_gate_output_ptr_[expert_idx] + ith * stride;
+        llamafile_sgemm(
+            stride, m_local_num_[expert_idx],
+            config_.hidden_size / ggml_blck_size(config_.gate_type),
+            gate_proj_ptr,
+            config_.hidden_size / ggml_blck_size(config_.gate_type),
+            gate_input_ptr,
+            config_.hidden_size / ggml_blck_size(config_.gate_type),
+            gate_output_ptr, config_.intermediate_size, 0, 1,
+            GGML_TASK_TYPE_COMPUTE, config_.gate_type,
+            ggml_internal_get_type_traits(config_.gate_type).vec_dot_type,
+            GGML_TYPE_F32, GGML_PREC_DEFAULT);
+        void *up_input_ptr = m_local_up_input_ptr_[expert_idx];
 
 #ifdef USE_NUMA
+        void *up_proj_ptr =
+            (uint8_t *)up_proj_numa_[cpuinfer::numa_node] +
+            (expert_idx * config_.intermediate_size + ith * stride) *
+                config_.hidden_size * ggml_type_size(config_.up_type) /
+                ggml_blck_size(config_.up_type);
+#else
             void *up_proj_ptr =
-                (uint8_t *)up_proj_numa_[ParallelExecutor::numa_node] +
+                (uint8_t *)up_proj_ +
                 (expert_idx * config_.intermediate_size + ith * stride) *
                     config_.hidden_size * ggml_type_size(config_.up_type) /
                     ggml_blck_size(config_.up_type);
-#else
-        void* up_proj_ptr = (uint8_t*)up_proj_ + (expert_idx * config_.intermediate_size + ith * stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
 #endif
 
-            float *up_output_ptr =
-                m_local_up_output_ptr_[expert_idx] + ith * stride;
-            llamafile_sgemm(
-                stride, m_local_num_[expert_idx],
-                config_.hidden_size / ggml_blck_size(config_.up_type),
-                up_proj_ptr,
-                config_.hidden_size / ggml_blck_size(config_.up_type),
-                up_input_ptr,
-                config_.hidden_size / ggml_blck_size(config_.up_type),
-                up_output_ptr, config_.intermediate_size, 0, 1,
-                GGML_TASK_TYPE_COMPUTE, config_.up_type,
-                ggml_internal_get_type_traits(config_.up_type).vec_dot_type,
-                GGML_TYPE_F32, GGML_PREC_DEFAULT);
-            for (int i = 0; i < m_local_num_[expert_idx]; i++) {
-                for (int j = ith * stride; j < (ith + 1) * stride; j++) {
-                    m_local_intermediate_fp32_ptr_
-                        [expert_idx][i * config_.intermediate_size + j] =
-                            act_fn(m_local_gate_output_ptr_
-                                       [expert_idx]
-                                       [i * config_.intermediate_size + j]) *
-                            m_local_up_output_ptr_
-                                [expert_idx][i * config_.intermediate_size + j];
-                }
-                float *intermediate_fp32_ptr =
-                    m_local_intermediate_fp32_ptr_[expert_idx] +
-                    i * config_.intermediate_size + ith * stride;
-                void *down_input_ptr =
-                    m_local_down_input_ptr_[expert_idx] +
-                    i * config_.intermediate_size *
-                        ggml_type_size(
-                            ggml_internal_get_type_traits(config_.down_type)
-                                .vec_dot_type) /
-                        ggml_blck_size(
-                            ggml_internal_get_type_traits(config_.down_type)
-                                .vec_dot_type) +
-                    ith * stride *
-                        ggml_type_size(
-                            ggml_internal_get_type_traits(config_.down_type)
-                                .vec_dot_type) /
-                        ggml_blck_size(
-                            ggml_internal_get_type_traits(config_.down_type)
-                                .vec_dot_type);
-                from_float(intermediate_fp32_ptr, down_input_ptr, stride,
-                           ggml_internal_get_type_traits(config_.down_type)
-                               .vec_dot_type);
+        float *up_output_ptr =
+            m_local_up_output_ptr_[expert_idx] + ith * stride;
+        llamafile_sgemm(
+            stride, m_local_num_[expert_idx],
+            config_.hidden_size / ggml_blck_size(config_.up_type), up_proj_ptr,
+            config_.hidden_size / ggml_blck_size(config_.up_type), up_input_ptr,
+            config_.hidden_size / ggml_blck_size(config_.up_type),
+            up_output_ptr, config_.intermediate_size, 0, 1,
+            GGML_TASK_TYPE_COMPUTE, config_.up_type,
+            ggml_internal_get_type_traits(config_.up_type).vec_dot_type,
+            GGML_TYPE_F32, GGML_PREC_DEFAULT);
+        for (int i = 0; i < m_local_num_[expert_idx]; i++) {
+            for (int j = ith * stride; j < (ith + 1) * stride; j++) {
+                m_local_intermediate_fp32_ptr_
+                    [expert_idx][i * config_.intermediate_size + j] =
+                        act_fn(m_local_gate_output_ptr_
+                                   [expert_idx]
+                                   [i * config_.intermediate_size + j]) *
+                        m_local_up_output_ptr_[expert_idx]
+                                              [i * config_.intermediate_size +
+                                               j];
             }
-        });
-    worker_executor->wait();
+            float *intermediate_fp32_ptr =
+                m_local_intermediate_fp32_ptr_[expert_idx] +
+                i * config_.intermediate_size + ith * stride;
+            void *down_input_ptr =
+                m_local_down_input_ptr_[expert_idx] +
+                i * config_.intermediate_size *
+                    ggml_type_size(
+                        ggml_internal_get_type_traits(config_.down_type)
+                            .vec_dot_type) /
+                    ggml_blck_size(
+                        ggml_internal_get_type_traits(config_.down_type)
+                            .vec_dot_type) +
+                ith * stride *
+                    ggml_type_size(
+                        ggml_internal_get_type_traits(config_.down_type)
+                            .vec_dot_type) /
+                    ggml_blck_size(
+                        ggml_internal_get_type_traits(config_.down_type)
+                            .vec_dot_type);
+            from_float(
+                intermediate_fp32_ptr, down_input_ptr, stride,
+                ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
+        }
+    });
     stride = QK_K;
     nth = config_.hidden_size / stride;
-    worker_executor->do_work_stealing_job(
-        nth * config_.expert_num, [&](int task_id) {
-            uint64_t expert_idx = task_id / nth;
-            int ith = task_id % nth;
-            void *down_input_ptr = m_local_down_input_ptr_[expert_idx];
+    cpuinfer->parallel_for(nth * config_.expert_num, [&](int task_id) {
+        uint64_t expert_idx = task_id / nth;
+        int ith = task_id % nth;
+        void *down_input_ptr = m_local_down_input_ptr_[expert_idx];
 
 #ifdef USE_NUMA
+        void *down_proj_ptr =
+            (uint8_t *)down_proj_numa_[cpuinfer::numa_node] +
+            (expert_idx * config_.hidden_size + ith * stride) *
+                config_.intermediate_size * ggml_type_size(config_.down_type) /
+                ggml_blck_size(config_.down_type);
+#else
             void *down_proj_ptr =
-                (uint8_t *)down_proj_numa_[ParallelExecutor::numa_node] +
+                (uint8_t *)down_proj_ +
                 (expert_idx * config_.hidden_size + ith * stride) *
                     config_.intermediate_size *
                     ggml_type_size(config_.down_type) /
                     ggml_blck_size(config_.down_type);
-#else
-        void* down_proj_ptr = (uint8_t*)down_proj_ + (expert_idx * config_.hidden_size + ith * stride) * config_.intermediate_size * ggml_type_size(config_.down_type) / ggml_blck_size(config_.down_type);
 #endif
 
-            float *down_output_ptr =
-                m_local_down_output_ptr_[expert_idx] + ith * stride;
-            llamafile_sgemm(
-                stride, m_local_num_[expert_idx],
-                config_.intermediate_size / ggml_blck_size(config_.down_type),
-                down_proj_ptr,
-                config_.intermediate_size / ggml_blck_size(config_.down_type),
-                down_input_ptr,
-                config_.intermediate_size / ggml_blck_size(config_.down_type),
-                down_output_ptr, config_.hidden_size, 0, 1,
-                GGML_TASK_TYPE_COMPUTE, config_.down_type,
-                ggml_internal_get_type_traits(config_.down_type).vec_dot_type,
-                GGML_TYPE_F32, GGML_PREC_DEFAULT);
-        });
-    worker_executor->wait();
-    worker_executor->do_work_stealing_job(qlen, [&](int i) {
+        float *down_output_ptr =
+            m_local_down_output_ptr_[expert_idx] + ith * stride;
+        llamafile_sgemm(
+            stride, m_local_num_[expert_idx],
+            config_.intermediate_size / ggml_blck_size(config_.down_type),
+            down_proj_ptr,
+            config_.intermediate_size / ggml_blck_size(config_.down_type),
+            down_input_ptr,
+            config_.intermediate_size / ggml_blck_size(config_.down_type),
+            down_output_ptr, config_.hidden_size, 0, 1, GGML_TASK_TYPE_COMPUTE,
+            config_.down_type,
+            ggml_internal_get_type_traits(config_.down_type).vec_dot_type,
+            GGML_TYPE_F32, GGML_PREC_DEFAULT);
+    });
+    cpuinfer->parallel_for(qlen, [&](int i) {
         for (int e = 0; e < config_.hidden_size; e++) {
             m_output_fp32_[i][e] = 0;
         }
@@ -719,11 +723,11 @@ void MOE::forward_many(int qlen, int k, const uint64_t *expert_ids,
                                            ggml_blck_size(config_.hidden_type),
                    config_.hidden_size, config_.hidden_type);
     });
-    worker_executor->wait();
 }
 
 void MOE::forward(int qlen, int k, const uint64_t *expert_ids,
-                  const float *weights, const void *input, void *output) {
+                  const float *weights, const void *input, void *output,
+                  CPUInfer *cpuinfer) {
     if (qlen < config_.group_min_len) {
         for (int i = 0; i < qlen; i++) {
             forward_one(
@@ -733,12 +737,13 @@ void MOE::forward(int qlen, int k, const uint64_t *expert_ids,
                                        ggml_blck_size(config_.hidden_type),
                 (uint8_t *)output + i * config_.hidden_size *
                                         ggml_type_size(config_.hidden_type) /
-                                        ggml_blck_size(config_.hidden_type));
+                                        ggml_blck_size(config_.hidden_type),
+                cpuinfer);
         }
         return;
     }
     int forward_len = std::min(config_.group_max_len, qlen);
-    forward_many(forward_len, k, expert_ids, weights, input, output);
+    forward_many(forward_len, k, expert_ids, weights, input, output, cpuinfer);
     forward(qlen - forward_len, k, expert_ids + forward_len * k,
             weights + forward_len * k,
             (uint8_t *)input + forward_len * config_.hidden_size *
@@ -746,53 +751,6 @@ void MOE::forward(int qlen, int k, const uint64_t *expert_ids,
                                    ggml_blck_size(config_.hidden_type),
             (uint8_t *)output + forward_len * config_.hidden_size *
                                     ggml_type_size(config_.hidden_type) /
-                                    ggml_blck_size(config_.hidden_type));
-}
-
-void MOE::forward_async(int qlen, int k, const uint64_t *expert_ids,
-                        const float *weights, const void *input, void *output) {
-    main_executor->do_work_stealing_job(1, [=](int i) {
-        forward(qlen, k, expert_ids, weights, input, output);
-    });
-}
-
-void MOE::sync() { main_executor->wait(); }
-
-struct Args {
-    MOE *moe;
-    int qlen;
-    int k;
-    const uint64_t *expert_ids;
-    const float *weights;
-    const void *input;
-    void *output;
-};
-
-void MOE::forward_with_cuda_stream(int qlen, int k, const uint64_t *expert_ids,
-                                   const float *weights, const void *input,
-                                   void *output, intptr_t user_cuda_stream) {
-    auto lambda = [](void *args) {
-        Args *args_ = (Args *)args;
-        MOE *moe = args_->moe;
-        int qlen = args_->qlen;
-        int k = args_->k;
-        const uint64_t *expert_ids = args_->expert_ids;
-        const float *weights = args_->weights;
-        const void *input = args_->input;
-        void *output = args_->output;
-
-        std::invoke(&MOE::forward_async, moe, qlen, k, expert_ids, weights, input, output);
-    };
-
-    Args *args = new Args{this, qlen, k, expert_ids, weights, input, output};
-
-    cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, lambda, args);
-}
-
-void MOE::sync_with_cuda_stream(intptr_t user_cuda_stream) {
-    auto sync_fn = [](void *arg) {
-        MOE *moe_instance = static_cast<MOE *>(arg);
-        moe_instance->sync();
-    };
-    cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, sync_fn, this);
+                                    ggml_blck_size(config_.hidden_type),
+            cpuinfer);
 }

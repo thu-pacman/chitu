@@ -1007,6 +1007,7 @@ def quant_einsum_shc_hdc_shd(
         stride_A_group, stride_A_m = group_A.stride()[1], group_A.stride()[0]
         stride_B_group, stride_B_1 = group_B.stride()[0], group_B.stride()[1]
         stride_C_group, stride_C_m = d, h * d
+        assert group_b_s.is_contiguous()
         group_C = torch.empty((s, h, d), dtype=group_A.dtype, device=group_A.device)
 
         if soft_fp8:

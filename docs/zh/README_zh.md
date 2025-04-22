@@ -1,4 +1,3 @@
-
 # Chitu（赤兔）
 
 [English](/README.md) | 中文
@@ -7,6 +6,8 @@
 Chitu (赤兔) 是一个专注于效率、灵活性和可用性的高性能大语言模型推理框架。
 
 ## 最新动态
+
+[2025/04/18] 新增CPU+GPU异构混合推理支持，实现算力资源的灵活调度。
 
 [2025/03/28] 提供 FP8 转 FP16 算子以支持更多型号 GPU。 
 
@@ -59,6 +60,49 @@ Chitu (赤兔) 定位于「生产级大模型推理引擎」，并且充分考�
 |bs=1|22.1|
 |bs=16|202.1|
 |bs=256|780.3|
+
+### CPU+GPU异构混合推理
+
+赤兔支持CPU和GPU混合部署模型，可以根据实际硬件资源和性能需求灵活配置。以下是一个简单的示例：
+
+首先拉取最新代码，进行安装，以 H20 机器为例
+
+```bash
+TORCH_CUDA_ARCH_LIST=9.0 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation ".[cpu,flash_mla]"
+```
+
+```bash
+torchrun --nproc_per_node 1 \
+    --master_port=22525 \
+    test/single_req_test.py \
+    models=DeepSeek-R1-Q4_K_M \
+    models.ckpt_dir=/data/nfs/DeepSeek-R1-Q4_K_M/ \
+    models.tokenizer_path=/data/nfs/DeepSeek-R1-bf16 \
+    infer.use_cuda_graph=True \
+    quant=gguf \
+    +cpu_layer_num=58 \
+    infer.tp_size=1 \
+    infer.pp_size=1 \
+    infer.cache_type=paged \
+    infer.attn_type=flash_mla \
+    infer.mla_absorb=absorb-without-precomp \
+    infer.max_reqs=1 \
+    infer.max_seq_len=256 \
+    request.max_new_tokens=100
+
+# CPU部分会自动启用cpumoe加速
+```
+
+#### 异构混合推理性能数据
+
+
+| MoE 层部署在GPU数量       | GPU数 | token/s (bs=1) | token/s (bs=16) | 
+|:---------------|:------|:---------------|:----------------|
+| 0    | 1    | 10.61          | 28.16            |
+| 24    | 2    | 14.04           | 42.57        |
+
+
+- 适合需要降低成本或GPU显存受限的场景
 
 ## 快速入门
 
@@ -176,5 +220,9 @@ Chitu 项目采用 Apache License v2.0 许可证 - 详见 [LICENSE](/LICENSE) �
 - [vLLM](https://github.com/vllm-project/vllm)
 - [SGLang](https://github.com/sgl-project/sglang)
 - [DeepSeek](https://github.com/deepseek-ai)
+- [KTransformers](https://github.com/kvcache-ai/ktransformers)
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)
+- [FlashAttention](https://github.com/Dao-AILab/flash-attention)
+- [FlashInfer](https://github.com/flashinfer-ai/flashinfer)
 
 我们也感谢来自各方的帮助：中国电信、华为、沐曦、燧原等。

@@ -13,6 +13,7 @@ from chitu.muxi_utils import (
     LinearLayoutContigXNativeY,
     LinearLayoutNativeXContigY,
     preprocess_weights_for_native_layout,
+    get_muxi_padded_input,
 )
 from chitu.ops import apply_rotary_pos_emb
 from chitu.tensor_parallel import (
@@ -119,10 +120,7 @@ class AttentionHFLlama(Attention):
             x_shape = x.shape
             x = x.reshape(-1, x.shape[-1])
             n = x.shape[0]
-            if n > 1:
-                x_paded = torch.zeros(((n + 15) & ~15, x.shape[1]), device=x.device)
-                x_paded[: x.shape[0], :] = x
-                x = x_paded
+            x = get_muxi_padded_input(x)
         if self.merge_qkv:
             qkv = self.qkv_proj(x)
             if self.op_impl == "muxi_custom_kernel":
@@ -154,10 +152,7 @@ class AttentionHFLlama(Attention):
             x_shape = x.shape
             x = x.reshape(-1, x.shape[-1])
             n = x.shape[0]
-            if n > 1:
-                x_paded = torch.zeros(((n + 15) & ~15, x.shape[1]), device=x.device)
-                x_paded[: x.shape[0], :] = x
-                x = x_paded
+            x = get_muxi_padded_input(x)
         y = self.o_proj(x)
         if self.op_impl == "muxi_custom_kernel":
             y = y[:n, :]
@@ -320,10 +315,7 @@ class FeedForwardHFLlama(nn.Module):
             x_shape = x.shape
             x = x.reshape(-1, x_shape[-1])
             n = x.shape[0]
-            if n > 1:
-                x_paded = torch.zeros(((n + 15) & ~15, x.shape[1]), device=x.device)
-                x_paded[: x.shape[0], :] = x
-                x = x_paded
+            x = get_muxi_padded_input(x)
         if self.merge_gate_up:
             gate_up_out = self.gate_up_proj(x)
             if self.op_impl == "muxi_custom_kernel":
