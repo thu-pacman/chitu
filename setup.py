@@ -152,7 +152,7 @@ setup(
             + os.path.join(setup_dir, "third_party/DeepGEMM"),
         ],
         "cpu": [
-            "cpumoe @ file://localhost" + os.path.join(setup_dir, "csrc/cpumoe"),
+            "cpuinfer @ file://localhost" + os.path.join(setup_dir, "csrc/cpuinfer"),
         ],
     },
     packages=find_packages(),

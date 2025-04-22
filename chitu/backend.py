@@ -404,8 +404,13 @@ class Backend:
             merge_qkv_gate_up = False
 
         if args.models.type == "deepseek-v3" and args.quant == "gguf":
-            Backend.cpu_infer = True
-            Backend.cpu_layers = list(range(61))
+            import cpuinfer
+
+            cpu_layer_num = (
+                args.cpu_layer_num if hasattr(args.models, "cpu_layer_num") else 58
+            )
+            Backend.cpu_infer = cpuinfer.CPUInfer(args.models.cpu_num_thread)
+            Backend.cpu_layers = list(range(61 - cpu_layer_num, 61))
             Backend.ggml_type = [
                 0,
                 0,
@@ -470,7 +475,7 @@ class Backend:
                 14,
             ]
         else:
-            Backend.cpu_infer = False
+            Backend.cpu_infer = None
             Backend.cpu_layers = []
             Backend.ggml_type = []
         model = Backend.build_model(
@@ -533,7 +538,7 @@ class Backend:
             logger.info(f"loading gguf file : {args.models.ckpt_dir}")
             ds_gguf_loader = GGUFLoader(args.models.ckpt_dir)
             load_gguf_deepseek_v3_gguf(
-                model, ds_gguf_loader, Backend.cpu_layers, 4, args
+                model, ds_gguf_loader, Backend.cpu_layers, 10, args
             )
         else:
             model.load_state_dict_parallel(
@@ -720,7 +725,6 @@ def load_gguf_deepseek_v3_gguf(
 
     for layer_id in range(3, 61, layer_load_per_iter):
         end_layer = min(61, layer_id + layer_load_per_iter)
-        logger.debug(f"loading layer : from {layer_id} to {end_layer}")
         checkpoint = load_state_dict_deepseek_v3_gguf_moe_layer(
             ds_gguf_loader,
             cpu_layers,
@@ -1134,13 +1138,43 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                         torch.bfloat16,
                         global_rank,
                         world_size,
-                    )
-                    gathered_experts = [
-                        torch.zeros_like(expert_tensor, device=device)
-                        for _ in range(world_size)
-                    ]
-                    dist.all_gather(gathered_experts, expert_tensor)
-                    gathered_experts = torch.concat(gathered_experts, dim=0).cpu()
+                    ).cpu()
+
+                    if (
+                        main_weight_dtype == "float8_e4m3fn"
+                        and not safetensor_name.endswith("norm.weight")
+                    ):
+                        experts_weight, experts_scale = quant_fp8(
+                            expert_tensor,
+                            block_size=128,
+                        )
+                        experts_weight = experts_weight.cuda()
+                        experts_scale = experts_scale.cuda()
+                        gathered_weight = [
+                            torch.zeros_like(experts_weight, device=device)
+                            for _ in range(world_size)
+                        ]
+                        gathered_scale = [
+                            torch.zeros_like(experts_scale, device=device)
+                            for _ in range(world_size)
+                        ]
+                        dist.all_gather(gathered_weight, experts_weight)
+                        dist.all_gather(gathered_scale, experts_scale)
+                        gathered_experts_weight = torch.concat(
+                            gathered_weight, dim=0
+                        ).cpu()
+                        gathered_experts_scale = torch.concat(
+                            gathered_scale, dim=0
+                        ).cpu()
+                        torch.cuda.empty_cache()
+                    else:
+                        gathered_experts = [
+                            torch.zeros_like(expert_tensor, device=device)
+                            for _ in range(world_size)
+                        ]
+                        dist.all_gather(gathered_experts, expert_tensor)
+                        gathered_experts = torch.concat(gathered_experts, dim=0).cpu()
+
                     safetensor_name = "layers." + str(layer_id) + k
                     for expert_id in range(256):
                         safetensor_name = (
@@ -1150,7 +1184,25 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                             + str(expert_id)
                             + k
                         )
-                        state_dict[safetensor_name] = gathered_experts[expert_id]
+                        if (
+                            main_weight_dtype == "float8_e4m3fn"
+                            and not safetensor_name.endswith("norm.weight")
+                        ):
+
+                            safetensor_scale = safetensor_name[:-6] + "scale"
+                            state_dict[safetensor_name] = gathered_experts_weight[
+                                expert_id
+                            ].cpu()
+                            state_dict[safetensor_scale] = gathered_experts_scale[
+                                expert_id
+                            ].cpu()
+
+                        else:
+                            state_dict[safetensor_name] = (
+                                ds_gguf_loader.load_gguf_tensor(
+                                    gguf_name, device, torch.bfloat16
+                                ).cpu()
+                            )
 
             else:
                 for k in translation_experts.keys():
@@ -1167,8 +1219,22 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                             + str(expert_id)
                             + k
                         )
-                        state_dict[safetensor_name] = expert_tensor[expert_id]
+                        # state_dict[safetensor_name] = expert_tensor[expert_id]
                         # check_equal(state_dict, tensor_dict_st, safetensor_name)
+                        if (
+                            main_weight_dtype == "float8_e4m3fn"
+                            and not safetensor_name.endswith("norm.weight")
+                        ):
+                            safetensor_scale = safetensor_name[:-6] + "scale"
+                            weight, scale = quant_fp8(
+                                expert_tensor[expert_id],
+                                block_size=128,
+                            )
+                            state_dict[safetensor_name] = weight.cpu()
+                            state_dict[safetensor_scale] = scale.cpu()
+
+                        else:
+                            state_dict[safetensor_name] = expert_tensor[expert_id].cpu()
 
         else:
             if local_rank == 0:
