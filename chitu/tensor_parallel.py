@@ -100,7 +100,6 @@ def ColumnParallelLinear(
     bias_dtype=None,
     *,
     base_linear_class: Optional[type] = None,
-    disable_quantization: bool = False,
 ):
     """
     Factory function for the ColumnParallelLinear class family.
@@ -111,29 +110,14 @@ def ColumnParallelLinear(
     Additional arguments:
         base_linear_class: The base linear class to use. Defaults to be determined by the global
             quantization method.
-        disable_quantization: Disable quantization operation. Defaults to False.
     """
 
-    args = get_global_args()
-    quant_method = (
-        None
-        if disable_quantization or not hasattr(args.models, "quant")
-        else args.models.quant
-    )
-    is_quantized = quant_method is not None and quant_method != "gguf"
-
     if base_linear_class is None:
-        if is_quantized:
-            from chitu.quantization import QuantizationRegistry
+        from chitu.quantization import QuantizationRegistry
 
-            base_linear_class = QuantizationRegistry.get_quantized_linear_class(
-                quant_method
-            )
-        else:
-            base_linear_class = LocalLinear
-
-    if dtype is None and is_quantized and quant_method == "blockfp8":
-        dtype = torch.float8_e4m3fn
+        base_linear_class = (
+            QuantizationRegistry.get_quantized_linear_class_from_global_args()
+        )
 
     class ColumnParallelLinearImpl(ColumnParallelLinearMixIn, base_linear_class):
         # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
@@ -162,7 +146,6 @@ def RowParallelLinear(
     bias_dtype=None,
     *,
     base_linear_class: Optional[type] = None,
-    disable_quantization: bool = False,
 ):
     """
     Factory function for the RowParallelLinear class family.
@@ -172,29 +155,14 @@ def RowParallelLinear(
     Additional arguments:
         base_linear_class: The base linear class to use. Defaults to be determined by the global
             quantization method.
-        disable_quantization: Disable quantization operation. Defaults to False.
     """
 
-    args = get_global_args()
-    quant_method = (
-        None
-        if disable_quantization or not hasattr(args.models, "quant")
-        else args.models.quant
-    )
-    is_quantized = quant_method is not None and quant_method != "gguf"
-
     if base_linear_class is None:
-        if is_quantized:
-            from chitu.quantization import QuantizationRegistry
+        from chitu.quantization import QuantizationRegistry
 
-            base_linear_class = QuantizationRegistry.get_quantized_linear_class(
-                quant_method
-            )
-        else:
-            base_linear_class = LocalLinear
-
-    if dtype is None and is_quantized and quant_method == "blockfp8":
-        dtype = torch.float8_e4m3fn
+        base_linear_class = (
+            QuantizationRegistry.get_quantized_linear_class_from_global_args()
+        )
 
     class RowParallelLinearImpl(RowParallelLinearMixIn, base_linear_class):
         # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph

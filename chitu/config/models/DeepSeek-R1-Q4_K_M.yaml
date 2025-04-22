@@ -10,5 +10,5 @@ ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<pat
 tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
 
 # Overrides
-quant: gguf
+quant: gguf-blockfp8
 cpu_num_thread: 64
