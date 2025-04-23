@@ -10,7 +10,7 @@ expect -timeout -1 "Uvicorn running on"
 
 # Test the server
 system echo "Starting test..."
-system python benchmarks/benchmark_serving.py --model "qwen2-7b" --iterations 10 --seq-len 10 --warmup 3 --base-url http://127.0.0.1:21100 || exit 1
+system python benchmarks/benchmark_serving.py --model "qwen2-7b" --iterations 10 --warmup 3 --input-len 10 --output-len 10 --base-url http://127.0.0.1:21100 || exit 1
 
 # Clean up
 system echo "Testing done. You may see some killing messages following, which is expected."
