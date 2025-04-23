@@ -17,6 +17,7 @@ from chitu.ops import append_to_paged_kv_cache, append_to_non_paged_kv_cache
 from chitu.triton_decode_attention import mla_decode, mla_decode_non_paged
 from chitu.utils import try_import_opt_dep
 from chitu.static_tensor import StaticTensor
+from chitu.triton_flash_attention import context_attention_fwd
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
@@ -775,6 +776,40 @@ class TritonAttnBackend(RefAttnBackend):
         softmax_scale=None,
     ):
         self.block_size = block_size
+
+    def attn_varlen_func(
+        self,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p=0,
+        causal=False,
+        window_size=(-1, -1),
+        softcap=0,
+        softmax_scale=None,
+    ):
+        assert torch.equal(cu_seqlens_q, cu_seqlens_k)
+        seq_len = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        B = q.shape[0]
+        output = torch.empty(
+            B, self.local_n_heads, self.kv_lora_rank, dtype=q.dtype, device=q.device
+        )
+        context_attention_fwd(
+            q,
+            k,
+            v,
+            output,
+            cu_seqlens_q,
+            seq_len,
+            max_seqlen_q,
+            softmax_scale,
+            causal,
+        )
+        return output
 
     def mla_attn_with_kvcache(
         self,

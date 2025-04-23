@@ -48,6 +48,7 @@ cython_unsafe_files = [
     "triton_kernels.py",  # Triton kernels inside
     "fused_moe.py",  # Triton kernels inside
     "triton_decode_attention.py",  # Triton kernels inside
+    "triton_flash_attention.py",  # Triton kernels inside
     "__main__.py",  # Triton kernels inside
     "serve.py",  # Reason unkown. Test not passed for Cython. (FIXME)
 ]
