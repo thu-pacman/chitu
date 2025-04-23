@@ -980,7 +980,6 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
         memory_used()
     device = f"cuda:{local_rank}"
     state_dict = {}
-    ds_gguf_loader = GGUFLoader("/data/nfs/DeepSeek-R1-Q4_K_M")
     translation_attn = {
         ".attn_norm.weight": ".attn_norm.weight",
         ".attn.kv_norm.weight": ".attn_kv_a_norm.weight",
