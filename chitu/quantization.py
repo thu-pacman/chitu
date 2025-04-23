@@ -1,7 +1,8 @@
 import torch
 import logging
-from typing import Dict, Tuple, Optional, Type
+from typing import Dict, Tuple, Optional, Type, Set
 
+from chitu.tensor_parallel import LocalLinear
 from chitu.utils import try_import_opt_dep
 from chitu.ops import (
     fp8_gemm_deepseek_v3,
@@ -421,7 +422,7 @@ class Blockfp8Linear(QuantizedLinearBase):
     ):
         super().__init__()
 
-        dtype = dtype or torch.get_default_dtype()
+        dtype = dtype or torch.float8_e4m3fn
         assert dtype.itemsize == 1
 
         self.in_features = in_features
@@ -563,35 +564,52 @@ class QuantizationRegistry:
     """
 
     _registry: Dict[str, Type[QuantizedLinearBase]] = {
+        None: LocalLinear,
         "llmint8": LLMInt8Linear,
         "autoawq": AutoAWQLinear,
         "simple_w8a8": W8A8Linear,
         "simple_w8a8_muxi": W8A8MuxiLinear,
         "blockfp8": Blockfp8Linear,
         "blockfp4": Blockfp4Linear,
+        "gguf": LocalLinear,
+        "gguf-blockfp8": Blockfp8Linear,
     }
 
     @classmethod
     def get_quantized_linear_class(
-        cls, method: Optional[str]
+        cls, method: Optional[str], *, disabled_methods: Optional[Set[str]] = None
     ) -> Optional[Type[QuantizedLinearBase]]:
         """
         Get the quantized linear implementation for the specified method.
 
         Arguments:
             method: Quantization method name, or None for no quantization
+            disabled_methods: Set of disabled methods. If `method` is in this set,
+                this function will return unquantized LocalLinear. This is useful
+                for partial quantization of selected layers.
 
         Returns:
             The quantized linear class, or None if method is None or not found
         """
-        if method is None:
-            return None
+
+        if disabled_methods is not None and method in disabled_methods:
+            method = None
 
         impl = cls._registry.get(method)
         if impl is None:
             logger.warning(f"Unknown quantization method: {method}")
 
         return impl
+
+    @classmethod
+    def get_quantized_linear_class_from_global_args(
+        cls, *, disabled_methods: Optional[Set[str]] = None
+    ) -> Optional[Type[QuantizedLinearBase]]:
+        args = get_global_args()
+        quant_method = None if not hasattr(args.models, "quant") else args.models.quant
+        return cls.get_quantized_linear_class(
+            quant_method, disabled_methods=disabled_methods
+        )
 
     @classmethod
     def register_method(

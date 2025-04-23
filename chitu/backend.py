@@ -403,7 +403,10 @@ class Backend:
             # quantization methods.
             merge_qkv_gate_up = False
 
-        if args.models.type == "deepseek-v3" and args.quant == "gguf":
+        if args.models.type == "deepseek-v3" and args.quant in [
+            "gguf",
+            "gguf-blockfp8",
+        ]:
             import cpuinfer
 
             cpu_layer_num = (
@@ -534,7 +537,10 @@ class Backend:
         else:
             raise NotImplementedError(f"Unsupported model type {args.models.type}")
 
-        if args.models.type == "deepseek-v3" and args.quant == "gguf":
+        if args.models.type == "deepseek-v3" and args.quant in [
+            "gguf",
+            "gguf-blockfp8",
+        ]:
             logger.info(f"loading gguf file : {args.models.ckpt_dir}")
             ds_gguf_loader = GGUFLoader(args.models.ckpt_dir)
             load_gguf_deepseek_v3_gguf(
@@ -615,7 +621,7 @@ class Backend:
                 return s
 
             checkpoint = dict((rep(k), v) for k, v in params.items())
-        elif args.quant == "gguf":
+        elif args.quant in ["gguf", "gguf-blockfp8"]:
             llama_gguf_loader = llama_gguf_loader = GGUFLoader(args.models.ckpt_dir)
             checkpoint = load_state_dict_llama_gguf_mlp_layers(
                 llama_gguf_loader, len(model.layers)
@@ -974,7 +980,6 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
         memory_used()
     device = f"cuda:{local_rank}"
     state_dict = {}
-    ds_gguf_loader = GGUFLoader("/data/nfs/DeepSeek-R1-Q4_K_M")
     translation_attn = {
         ".attn_norm.weight": ".attn_norm.weight",
         ".attn.kv_norm.weight": ".attn_kv_a_norm.weight",

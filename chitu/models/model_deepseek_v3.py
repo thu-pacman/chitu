@@ -43,8 +43,7 @@ from chitu.utils import try_import_opt_dep
 from chitu.quantization import (
     linear_block_fp8,
     linear_block_fp4,
-    Blockfp8Linear,
-    Blockfp4Linear,
+    QuantizationRegistry,
 )
 
 import ctypes
@@ -104,26 +103,6 @@ def linear_deepseek_v3(
                 bias=bias,
                 block_size=block_size,
             )
-
-
-def getLinearDeepSeekV3(
-    is_quant_layer: bool = True,
-):
-    args = get_global_args()
-    quant_method = args.models.quant if hasattr(args.models, "quant") else None
-    if quant_method is None:
-        return LocalLinear
-    elif quant_method == "gguf":
-        return Blockfp8Linear
-    elif quant_method == "blockfp8":
-        return Blockfp8Linear
-    elif quant_method == "blockfp4":
-        if is_quant_layer:
-            return Blockfp4Linear
-        else:
-            return LocalLinear
-    else:
-        raise NotImplementedError(f"{quant_method} is not supported for DeepSeek V3.")
 
 
 class ParallelAbsorbGemm(torch.nn.Module):
@@ -452,27 +431,39 @@ class AttentionDeepSeekV3(Attention):
             # fp8 gemm can handle weights not divisible by block_size, but it does not hold
             # after merging for the output dimension, except for the last weight.
             assert self.q_lora_rank % block_size == 0
-            self.wqkv_a = getLinearDeepSeekV3(False)(
-                self.dim,
-                self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
-                has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.get_default_dtype(),
+            self.wqkv_a = (
+                QuantizationRegistry.get_quantized_linear_class_from_global_args(
+                    disabled_methods={"blockfp4"}
+                )(
+                    self.dim,
+                    self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+                    has_bias=False,
+                    dtype=parse_dtype(args.main_weight_dtype),
+                    bias_dtype=torch.get_default_dtype(),
+                )
             )
         else:
-            self.wq_a = getLinearDeepSeekV3(False)(
-                self.dim,
-                self.q_lora_rank,
-                has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.get_default_dtype(),
+            self.wq_a = (
+                QuantizationRegistry.get_quantized_linear_class_from_global_args(
+                    disabled_methods={"blockfp4"}
+                )(
+                    self.dim,
+                    self.q_lora_rank,
+                    has_bias=False,
+                    dtype=parse_dtype(args.main_weight_dtype),
+                    bias_dtype=torch.get_default_dtype(),
+                )
             )
-            self.wkv_a = getLinearDeepSeekV3(False)(
-                self.dim,
-                self.kv_lora_rank + self.qk_rope_head_dim,
-                has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.get_default_dtype(),
+            self.wkv_a = (
+                QuantizationRegistry.get_quantized_linear_class_from_global_args(
+                    disabled_methods={"blockfp4"}
+                )(
+                    self.dim,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    has_bias=False,
+                    dtype=parse_dtype(args.main_weight_dtype),
+                    bias_dtype=torch.get_default_dtype(),
+                )
             )
         self.q_norm = RMSNorm(self.q_lora_rank)
         self.wq_b = ColumnParallelLinear(
@@ -486,8 +477,9 @@ class AttentionDeepSeekV3(Attention):
             dtype=parse_dtype(args.main_weight_dtype),
             bias_dtype=torch.get_default_dtype(),
             gather_output=False,
-            base_linear_class=getLinearDeepSeekV3(False),
-            disable_quantization=is_fp4,
+            base_linear_class=QuantizationRegistry.get_quantized_linear_class_from_global_args(
+                disabled_methods={"blockfp4"}
+            ),
         )
         self.kv_norm = RMSNorm(self.kv_lora_rank)
 
@@ -499,8 +491,9 @@ class AttentionDeepSeekV3(Attention):
                 dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
-                base_linear_class=getLinearDeepSeekV3(False),
-                disable_quantization=is_fp4,
+                base_linear_class=QuantizationRegistry.get_quantized_linear_class_from_global_args(
+                    disabled_methods={"blockfp4"}
+                ),
             )
         elif self.mla_absorb == "absorb-without-precomp":
             self.wkv_b_absorb_1 = ParallelAbsorbGemm(
@@ -529,8 +522,9 @@ class AttentionDeepSeekV3(Attention):
             dtype=parse_dtype(args.main_weight_dtype),
             bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
-            base_linear_class=getLinearDeepSeekV3(False),
-            disable_quantization=is_fp4,
+            base_linear_class=QuantizationRegistry.get_quantized_linear_class_from_global_args(
+                disabled_methods={"blockfp4"}
+            ),
         )
         self.softmax_scale = compute_softmax_scale_deepseek_v3(args)
 
@@ -794,7 +788,6 @@ class MLPDeepSeekV3(nn.Module):
                 ),  # In fp4 quantization, dtype of MLP is float4_e2m1
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
-                base_linear_class=getLinearDeepSeekV3(),
             )
             if is_fp4:
                 self.w1w3.register_scale_2_param(
@@ -808,7 +801,6 @@ class MLPDeepSeekV3(nn.Module):
                 dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
-                base_linear_class=getLinearDeepSeekV3(),
             )
             self.w3 = ColumnParallelLinear(
                 args.dim // 2 if is_fp4 else args.dim,
@@ -817,7 +809,6 @@ class MLPDeepSeekV3(nn.Module):
                 dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
-                base_linear_class=getLinearDeepSeekV3(),
             )
             if is_fp4:
                 self.w1.register_scale_2_param()
@@ -829,7 +820,6 @@ class MLPDeepSeekV3(nn.Module):
             dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
             bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
-            base_linear_class=getLinearDeepSeekV3(),
         )
         if is_fp4:
             self.w2.register_scale_2_param()
@@ -1338,7 +1328,6 @@ class MoEDeepSeekV3CPU(nn.Module):
                 dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.bfloat16,
                 gather_output=False,
-                base_linear_class=getLinearDeepSeekV3(),
             )
             self.w3 = ColumnParallelLinear(
                 args.dim,
@@ -1347,7 +1336,6 @@ class MoEDeepSeekV3CPU(nn.Module):
                 dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.bfloat16,
                 gather_output=False,
-                base_linear_class=getLinearDeepSeekV3(),
             )
         self.w2 = RowParallelLinear(
             args.moe_inter_dim,
@@ -1356,7 +1344,6 @@ class MoEDeepSeekV3CPU(nn.Module):
             dtype=parse_dtype(args.main_weight_dtype),
             bias_dtype=torch.bfloat16,
             input_is_parallel=True,
-            base_linear_class=getLinearDeepSeekV3(),
         )
 
         if self.rank == 0:
@@ -2244,7 +2231,7 @@ class TransformerDeepSeekV3(Transformer):
             has_bias=False,
             dtype=torch.get_default_dtype(),
             gather_output=True,
-            disable_quantization=True,
+            base_linear_class=LocalLinear,
         )
 
     @override

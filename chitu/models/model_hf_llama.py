@@ -17,6 +17,7 @@ from chitu.muxi_utils import (
 )
 from chitu.ops import apply_rotary_pos_emb
 from chitu.tensor_parallel import (
+    LocalLinear,
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
@@ -672,7 +673,7 @@ class TransformerHFLlama(Transformer):
             self.params.dim,
             self.params.vocab_size,
             has_bias=False,
-            disable_quantization=True,
+            base_linear_class=LocalLinear,
         )
 
     def _pre_layers(self, h):

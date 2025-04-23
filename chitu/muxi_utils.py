@@ -13,15 +13,19 @@ tbsgemm, has_tbsgemm = try_import_opt_dep("tbsgemm", "muxi_w8a8_kernels")
 def preprocess_weights_for_native_layout(
     checkpoint, rpl_names: List[str], cpl_names: List[str]
 ):
+    # NOTE: Currently we skip all the weights that is not part of a layer (which means
+    # they are either pre-layers or post-layers). This is only for convenience. They
+    # can be supported by native layout in the future.
+
     def is_rpl_weight(key):
         for name in rpl_names:
-            if key.endswith(f".{name}.weight"):
+            if key.endswith(f".{name}.weight"):  # Not including pre-layer or post-layer
                 return True
         return False
 
     def is_cpl_weight(key):
         for name in cpl_names:
-            if key.endswith(f".{name}.weight"):
+            if key.endswith(f".{name}.weight"):  # Not including pre-layer or post-layer
                 return True
         return False
 
