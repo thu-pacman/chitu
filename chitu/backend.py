@@ -593,6 +593,18 @@ class Backend:
                 return s
 
             checkpoint = dict((rep(k), v) for k, v in params.items())
+        if args.quant == "gptqmodel":
+            params = load_state_dict(args.models.ckpt_dir)
+            replace_list = [
+                ("model.", ""),
+            ]
+
+            def rep(s):
+                for p in replace_list:
+                    s = s.replace(p[0], p[1], 1)
+                return s
+
+            checkpoint = dict((rep(k), v) for k, v in params.items())
         elif args.quant == "gptq":
             params = AutoModelForCausalLM.from_pretrained(
                 args.models.ckpt_dir,
