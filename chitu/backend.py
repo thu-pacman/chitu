@@ -389,8 +389,6 @@ class Backend:
         merge_qkv_gate_up = True
         if args.models.type == "llama":
             merge_qkv_gate_up = False  # Not yet supported
-        if args.models.name == "QwQ-32B-FP8":
-            merge_qkv_gate_up = False  # FIXME
 
         if hasattr(args.models, "quant") and args.models.quant not in [
             None,

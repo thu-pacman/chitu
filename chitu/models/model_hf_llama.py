@@ -320,7 +320,11 @@ class FeedForwardHFLlama(nn.Module):
             x = get_muxi_padded_input(x)
         if self.merge_gate_up:
             gate_up_out = self.gate_up_proj(x)
-            if self.op_impl == "muxi_custom_kernel":
+            args = get_global_args()
+            quant_method = (
+                None if not hasattr(args.models, "quant") else args.models.quant
+            )  # FIXME: All quant methods should be supported
+            if self.op_impl == "muxi_custom_kernel" and quant_method is None:
                 gate_out = gate_up_out[: gate_up_out.shape[0] // 2]
                 up_out = gate_up_out[gate_up_out.shape[0] // 2 :]
             else:
@@ -535,6 +539,19 @@ class TransformerHFLlama(Transformer):
                 )
             elif k.endswith(".k_proj.weight") or k.endswith(".v_proj.weight"):
                 continue
+            elif k.endswith(".q_proj.scale"):
+                prefix = k[: -len("q_proj.scale")]
+                assert prefix + "k_proj.scale" in checkpoint
+                assert prefix + "v_proj.scale" in checkpoint
+                assert prefix + "qkv_proj.scale" not in checkpoint
+                q_scale = checkpoint[prefix + "q_proj.scale"]
+                k_scale = checkpoint[prefix + "k_proj.scale"]
+                v_scale = checkpoint[prefix + "v_proj.scale"]
+                new_checkpoint[prefix + "qkv_proj.scale"] = torch.cat(
+                    [q_scale, k_scale, v_scale], dim=0
+                )
+            elif k.endswith(".k_proj.scale") or k.endswith(".v_proj.scale"):
+                continue
             elif k.endswith(".q_proj.bias"):
                 prefix = k[: -len("q_proj.bias")]
                 assert prefix + "k_proj.bias" in checkpoint
@@ -565,6 +582,17 @@ class TransformerHFLlama(Transformer):
                     [gate_weight, up_weight], dim=0
                 )
             elif k.endswith(".up_proj.weight"):
+                continue
+            elif k.endswith(".gate_proj.scale"):
+                prefix = k[: -len("gate_proj.scale")]
+                assert prefix + "up_proj.scale" in checkpoint
+                assert prefix + "gate_up_proj.scale" not in checkpoint
+                gate_scale = checkpoint[prefix + "gate_proj.scale"]
+                up_scale = checkpoint[prefix + "up_proj.scale"]
+                new_checkpoint[prefix + "gate_up_proj.scale"] = torch.cat(
+                    [gate_scale, up_scale], dim=0
+                )
+            elif k.endswith(".up_proj.scale"):
                 continue
             elif k.endswith(".gate_proj.bias"):
                 prefix = k[: -len("gate_proj.bias")]
