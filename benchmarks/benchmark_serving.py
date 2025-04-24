@@ -285,10 +285,14 @@ class BenchmarkServing:
         # Measure
         outputs: list[RequestFuncOutput] = []
 
+        start_time = time.perf_counter()
+
         for _ in range(self.config.num_iterations):
             outputs.extend(asyncio.run(self.run_async()))
 
-        return outputs
+        total_time = time.perf_counter() - start_time
+
+        return outputs, total_time
 
 
 def calculate_metrics(
@@ -446,11 +450,8 @@ def main():
 
     # Run benchmark
     print("\nStarting benchmark...")
-    start_time = time.perf_counter()
 
-    outputs = runner.benchmark()
-
-    total_time = time.perf_counter() - start_time
+    outputs, total_time = runner.benchmark()
 
     metrics, actual_output_lens = calculate_metrics(
         outputs=outputs,
