@@ -677,7 +677,6 @@ def fp8_gemm_deepseek_v3(
     a_s: torch.Tensor,
     b: torch.Tensor,
     b_s: torch.Tensor,
-    b_s_2: Optional[torch.Tensor] = None,
 ):
     """
     Perform a matrix multiplication using FP8 precision.
@@ -709,13 +708,9 @@ def fp8_gemm_deepseek_v3(
     if has_deep_gemm and b.dtype is not torch.uint8:
         deep_gemm.gemm_fp8_fp8_bf16_nt((a, a_s), (b, b_s), c)
     else:
-        if b.dtype is torch.uint8:
-            assert b_s_2 is not None, "Fp4 quant gemm must hava scale2"
-            assert b_s_2.is_contiguous(), "Fp4 scale2 must be contiguous"
-        else:
-            fp8_gemm_deepseek_v3_kernel[grid](
-                a, b, c, a_s, b_s, M, N, K, group_n=128, group_k=128
-            )
+        fp8_gemm_deepseek_v3_kernel[grid](
+            a, b, c, a_s, b_s, M, N, K, group_n=128, group_k=128
+        )
     return c
 
 
@@ -724,7 +719,6 @@ def soft_fp8_gemm_deepseek_v3(
     a: torch.Tensor,
     b: torch.Tensor,
     b_s: torch.Tensor,
-    b_s_2: Optional[torch.Tensor] = None,
 ):
     """
     Perform a matrix multiplication with FP8 dynamically casted to BF16.
@@ -759,24 +753,19 @@ def soft_fp8_gemm_deepseek_v3(
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    if b.dtype == torch.uint8:
-        assert b_s_2 is not None, "Scaling_2 factor tensor must exist"
-        assert b_s_2.is_contiguous(), "Scaling_2 factor tensor must be contiguous"
-
-    else:
-        soft_fp8_gemm_deepseek_v3_kernel[grid](
-            a,
-            b.view(dtype=torch.uint8),
-            c,
-            b_s,
-            M,
-            N,
-            K,
-            group_n=128,
-            group_k=128,
-            fp8_to_fp32_scale=fp8_to_fp32_scale,
-            compute_dtype=compute_dtype,
-        )
+    soft_fp8_gemm_deepseek_v3_kernel[grid](
+        a,
+        b.view(dtype=torch.uint8),
+        c,
+        b_s,
+        M,
+        N,
+        K,
+        group_n=128,
+        group_k=128,
+        fp8_to_fp32_scale=fp8_to_fp32_scale,
+        compute_dtype=compute_dtype,
+    )
     return c
 
 

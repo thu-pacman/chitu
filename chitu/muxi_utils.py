@@ -3,6 +3,7 @@ import torch
 
 from chitu.utils import try_import_opt_dep
 from chitu.tensor_parallel import LocalLinear
+from chitu.quantization import Blockfp8Linear
 
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
@@ -129,6 +130,45 @@ def linear_layout_contig_x_contig_y(x, w, b=None):
     return y
 
 
+def blockfp8_linear_layout_contig_x_contig_y(x, w, b=None, weight_scale=None):
+    assert x.ndim == 2
+    bs = x.shape[0]
+    x_is_vector = bs == 1
+    w_transposed = w.view(w.shape[0] // 16, w.shape[1] // 8, 16, 8)
+
+    assert weight_scale is not None
+
+    if x_is_vector:
+        y = muxi_layout_kernels.gemv_layoutA(
+            w_transposed, x, scale_matrix=weight_scale, bias=b
+        )
+    else:
+        assert bs % 16 == 0
+        if bs < 128:
+            y = muxi_layout_kernels.gemm_layoutA_linear(
+                w_transposed, x, scale_matrix=weight_scale, bias=b
+            )
+        else:
+            m, k = w.shape
+            n, k = x.shape
+            y = muxi_layout_kernels.gemm_layoutA_soft_fp8_wapper(
+                w_transposed,
+                weight_scale,
+                x,
+                m,
+                n,
+                k,
+                alpha=1,
+                beta=0,
+                kernelParam1=128,
+                kernelParam2=128,
+                kernelParam3=128,
+                kernelId=2,
+                bias=b,
+            )
+    return y
+
+
 def get_muxi_padded_input(x, dtype=None, bound=16, can_be_single_batch=True):
     assert x.ndim == 2
     bs, seq_len = x.shape
@@ -155,3 +195,10 @@ class LinearLayoutNativeXContigY(LocalLinear):
 class LinearLayoutContigXContigY(LocalLinear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return linear_layout_contig_x_contig_y(x, self.weight, self.bias)
+
+
+class Blockfp8LinearLayoutContigXContigY(Blockfp8Linear):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return blockfp8_linear_layout_contig_x_contig_y(
+            x, self.weight, self.bias, self.scale
+        )

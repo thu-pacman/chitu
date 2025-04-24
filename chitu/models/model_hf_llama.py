@@ -1,5 +1,5 @@
 from logging import getLogger
-from typing import Any, List, Mapping, Optional
+from typing import Any, List, Mapping
 import math
 
 import torch
@@ -12,6 +12,7 @@ from chitu.muxi_utils import (
     LinearLayoutContigXContigY,
     LinearLayoutContigXNativeY,
     LinearLayoutNativeXContigY,
+    Blockfp8LinearLayoutContigXContigY,
     preprocess_weights_for_native_layout,
     get_muxi_padded_input,
 )
@@ -788,20 +789,52 @@ class RotaryEmbeddingHFLlama(nn.Module):
 
 def get_linear_layout_contig_x_native_y(op_impl: str):
     if op_impl == "muxi_custom_kernel":
-        return LinearLayoutContigXNativeY
+        args = get_global_args()
+        quant_method = None if not hasattr(args.models, "quant") else args.models.quant
+        if quant_method is None:
+            return LinearLayoutContigXNativeY
+        elif quant_method == "blockfp8":
+            # Blockfp8LinearLayoutContigXNativeY is not implemented. Fall back.
+            return Blockfp8LinearLayoutContigXContigY
+        else:
+            raise NotImplementedError(
+                f'Quantization method {quant_method} is not implemented for "muxi_custom_kernel"'
+            )
+
     else:
         return None  # Let QuantizationRegistry pick it
 
 
 def get_linear_layout_native_x_contig_y(op_impl: str):
     if op_impl == "muxi_custom_kernel":
-        return LinearLayoutNativeXContigY
+        args = get_global_args()
+        quant_method = None if not hasattr(args.models, "quant") else args.models.quant
+        if quant_method is None:
+            return LinearLayoutNativeXContigY
+        elif quant_method == "blockfp8":
+            # Blockfp8LinearLayoutNativeXContigY is not implemented. Fall back.
+            return Blockfp8LinearLayoutContigXContigY
+        else:
+            raise NotImplementedError(
+                f'Quantization method {quant_method} is not implemented for "muxi_custom_kernel"'
+            )
+
     else:
         return None  # Let QuantizationRegistry pick it
 
 
 def get_linear_layout_contig_x_contig_y(op_impl: str):
     if op_impl == "muxi_custom_kernel":
-        return LinearLayoutContigXContigY
+        args = get_global_args()
+        quant_method = None if not hasattr(args.models, "quant") else args.models.quant
+        if quant_method is None:
+            return LinearLayoutContigXContigY
+        elif quant_method == "blockfp8":
+            return Blockfp8LinearLayoutContigXContigY
+        else:
+            raise NotImplementedError(
+                f'Quantization method {quant_method} is not implemented for "muxi_custom_kernel"'
+            )
+
     else:
         return None  # Let QuantizationRegistry pick it

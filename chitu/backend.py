@@ -34,7 +34,7 @@ from chitu.models.model_hf_mixtral import TransformerHFMixtral
 from chitu.models.model_llama import TransformerLlama
 from chitu.tensor_parallel import get_tp_size, init_tp
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
-from chitu.utils import compute_layer_dist_in_pipe
+from chitu.utils import compute_layer_dist_in_pipe, parse_dtype
 
 import gc
 import sys
@@ -537,6 +537,16 @@ class Backend:
         else:
             raise NotImplementedError(f"Unsupported model type {args.models.type}")
 
+        # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
+        # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
+        if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
+            if (
+                hasattr(args.models, "quant") and args.models.quant == "blockfp8"
+            ):  # FIXME: Also blockfp4
+                for k in checkpoint.keys():
+                    if checkpoint[k].element_size() == 1:
+                        checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
+
         if args.models.type == "deepseek-v3" and args.quant in [
             "gguf",
             "gguf-blockfp8",
@@ -582,6 +592,18 @@ class Backend:
 
             checkpoint = dict((rep(k), v) for k, v in params.items())
         if args.quant == "autoawq":
+            params = load_state_dict(args.models.ckpt_dir)
+            replace_list = [
+                ("model.", ""),
+            ]
+
+            def rep(s):
+                for p in replace_list:
+                    s = s.replace(p[0], p[1], 1)
+                return s
+
+            checkpoint = dict((rep(k), v) for k, v in params.items())
+        if args.quant == "gptqmodel":
             params = load_state_dict(args.models.ckpt_dir)
             replace_list = [
                 ("model.", ""),

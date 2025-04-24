@@ -18,7 +18,6 @@ from chitu.device_type import (
     get_device_name,
     is_muxi,
     is_nvidia,
-    has_native_fp8,
 )
 from chitu.global_vars import get_global_args
 from chitu.models.model import Attention, RMSNorm, Transformer, TransformerBlock
@@ -39,7 +38,7 @@ from chitu.tensor_parallel import (
     get_tp_rank,
     get_tp_size,
 )
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_opt_dep, parse_dtype
 from chitu.quantization import (
     linear_block_fp8,
     linear_block_fp4,
@@ -53,25 +52,6 @@ logger = getLogger(__name__)
 triton, has_triton = try_import_opt_dep("triton", "triton")
 if has_triton:
     from chitu.fused_moe import fused_experts
-
-
-def parse_dtype(
-    name: str,
-    is_quant_layer: Optional[bool] = False,
-) -> torch.dtype:
-    if name == "float16":
-        return torch.float16
-    elif name == "bfloat16":
-        return torch.bfloat16
-    elif name == "float8_e4m3fn":
-        return torch.float8_e4m3fn
-    elif name == "float4_e2m1":
-        if is_quant_layer:
-            return torch.uint8
-        else:
-            return torch.bfloat16
-    else:
-        assert False
 
 
 def linear_deepseek_v3(
@@ -125,6 +105,15 @@ class ParallelAbsorbGemm(torch.nn.Module):
         if dtype is None:
             dtype = torch.get_default_dtype()
 
+        # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
+        # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
+        args = get_global_args()
+        if (
+            dtype.itemsize == 1
+            and parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1
+        ):
+            dtype = torch.uint8
+
         tp_size = get_tp_size()
         assert global_n_heads % tp_size == 0
         local_n_heads = global_n_heads // tp_size
@@ -132,7 +121,8 @@ class ParallelAbsorbGemm(torch.nn.Module):
         self.weight = torch.nn.Parameter(
             torch.empty(
                 local_n_heads, out_features_per_head, in_features_per_head, dtype=dtype
-            )
+            ),
+            requires_grad=False,
         )
 
         if dtype.itemsize == 1:
@@ -144,7 +134,8 @@ class ParallelAbsorbGemm(torch.nn.Module):
                     out_features_per_head // block_size,
                     in_features_per_head // block_size,
                     dtype=torch.float32,
-                )
+                ),
+                requires_grad=False,
             )
         else:
             self.register_parameter("scale", None)
@@ -164,11 +155,7 @@ class ParallelAbsorbGemm(torch.nn.Module):
 
         y = quant_einsum_shc_hdc_shd(
             x,
-            (
-                self.weight
-                if self.weight.element_size() > 1 or has_native_fp8()
-                else self.weight.view(torch.uint8)
-            ),
+            self.weight,
             self.scale,
             soft_fp8=(get_global_args().infer.raise_lower_bit_float_to == "bfloat16"),
         )
@@ -194,6 +181,15 @@ class GroupColumnParallelLinearDeepSeekV3(torch.nn.Module):
         super().__init__()
 
         dtype = dtype or torch.get_default_dtype()
+
+        # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
+        # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
+        args = get_global_args()
+        if (
+            dtype.itemsize == 1
+            and parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1
+        ):
+            dtype = torch.uint8
 
         self.tp_group = get_tp_group()
         self.tp_size = get_tp_size()
@@ -298,6 +294,15 @@ class GroupRowParallelLinearDeepSeekV3(torch.nn.Module):
         super().__init__()
 
         dtype = dtype or torch.get_default_dtype()
+
+        # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
+        # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
+        args = get_global_args()
+        if (
+            dtype.itemsize == 1
+            and parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1
+        ):
+            dtype = torch.uint8
 
         self.tp_group = get_tp_group()
         self.tp_size = get_tp_size()
@@ -1732,18 +1737,9 @@ class TransformerDeepSeekV3(Transformer):
                         for i in range(self.params.n_routed_experts):
                             parts.append(checkpoint[prefix + f"experts.{i}.{w}.{part}"])
                         parts.append(checkpoint[prefix + f"shared_experts.{w}.{part}"])
-                        if (
-                            len(parts) > 0
-                            and parts[0].element_size() == 1
-                            and not has_native_fp8()
-                        ):
-                            new_checkpoint[prefix + f"{w}.{part}"] = torch.stack(
-                                [p.view(torch.uint8) for p in parts], dim=0
-                            ).view(parts[0].dtype)
-                        else:
-                            new_checkpoint[prefix + f"{w}.{part}"] = torch.stack(
-                                parts, dim=0
-                            )
+                        new_checkpoint[prefix + f"{w}.{part}"] = torch.stack(
+                            parts, dim=0
+                        )
                         replaced = True
                         break
                 if replaced:
@@ -1878,9 +1874,17 @@ class TransformerDeepSeekV3(Transformer):
                     -1, self.params.q_lora_rank
                 )
                 if is_fp8:
+                    # FIXME: Support soft fp8 in weight_quant_deepseek_v3
                     new_wq_b, new_wq_b_scale = weight_quant_deepseek_v3(
                         new_wq_b, block_size
                     )
+                    if (
+                        parse_dtype(
+                            get_global_args().infer.raise_lower_bit_float_to
+                        ).itemsize
+                        > 1
+                    ):
+                        new_wq_b = new_wq_b.view(dtype=torch.uint8)
                     new_checkpoint[prefix + "wq_b.weight"] = new_wq_b
                     new_checkpoint[prefix + "wq_b.scale"] = new_wq_b_scale
                 else:
@@ -1908,7 +1912,15 @@ class TransformerDeepSeekV3(Transformer):
                 wkv_b_for_wo = torch.block_diag(*wkv_b_for_wo)
                 new_wo = wo_weight @ wkv_b_for_wo
                 if is_fp8:
+                    # FIXME: Support soft fp8 in weight_quant_deepseek_v3
                     new_wo, new_wo_scale = weight_quant_deepseek_v3(new_wo, block_size)
+                    if (
+                        parse_dtype(
+                            get_global_args().infer.raise_lower_bit_float_to
+                        ).itemsize
+                        > 1
+                    ):
+                        new_wo = new_wo.view(dtype=torch.uint8)
                     new_checkpoint[prefix + "wo.weight"] = new_wo
                     new_checkpoint[prefix + "wo.scale"] = new_wo_scale
                 else:
@@ -1946,14 +1958,9 @@ class TransformerDeepSeekV3(Transformer):
                 assert prefix + "wkv_a.weight" in checkpoint
                 q_weight = checkpoint[prefix + "wq_a.weight"]
                 kv_weight = checkpoint[prefix + "wkv_a.weight"]
-                if q_weight.element_size() == 1 and not has_native_fp8():
-                    new_checkpoint[prefix + "wqkv_a.weight"] = torch.cat(
-                        [q_weight.view(torch.uint8), kv_weight.view(torch.uint8)], dim=0
-                    ).view(q_weight.dtype)
-                else:
-                    new_checkpoint[prefix + "wqkv_a.weight"] = torch.cat(
-                        [q_weight, kv_weight], dim=0
-                    )
+                new_checkpoint[prefix + "wqkv_a.weight"] = torch.cat(
+                    [q_weight, kv_weight], dim=0
+                )
             elif k.endswith(".wkv_a.weight"):
                 continue
             elif k.endswith(".wq_a.scale"):
@@ -1961,14 +1968,9 @@ class TransformerDeepSeekV3(Transformer):
                 assert prefix + "wkv_a.scale" in checkpoint
                 q_scale = checkpoint[prefix + "wq_a.scale"]
                 kv_scale = checkpoint[prefix + "wkv_a.scale"]
-                if q_scale.element_size() == 1 and not has_native_fp8():
-                    new_checkpoint[prefix + "wqkv_a.scale"] = torch.cat(
-                        [q_scale.view(torch.uint8), kv_scale.view(torch.uint8)], dim=0
-                    ).view(q_scale.dtype)
-                else:
-                    new_checkpoint[prefix + "wqkv_a.scale"] = torch.cat(
-                        [q_scale, kv_scale], dim=0
-                    )
+                new_checkpoint[prefix + "wqkv_a.scale"] = torch.cat(
+                    [q_scale, kv_scale], dim=0
+                )
             elif k.endswith(".wkv_a.scale"):
                 continue
             elif k.endswith(".wq_a.bias"):
@@ -1976,14 +1978,9 @@ class TransformerDeepSeekV3(Transformer):
                 assert prefix + "wkv_a.bias" in checkpoint
                 q_bias = checkpoint[prefix + "wq_a.bias"]
                 kv_bias = checkpoint[prefix + "wkv_a.bias"]
-                if q_bias.element_size() == 1 and not has_native_fp8():
-                    new_checkpoint[prefix + "wqkv_a.bias"] = torch.cat(
-                        [q_bias.view(torch.uint8), kv_bias.view(torch.uint8)], dim=0
-                    ).view(q_bias.dtype)
-                else:
-                    new_checkpoint[prefix + "wqkv_a.bias"] = torch.cat(
-                        [q_bias, kv_bias], dim=0
-                    )
+                new_checkpoint[prefix + "wqkv_a.bias"] = torch.cat(
+                    [q_bias, kv_bias], dim=0
+                )
             elif k.endswith(".wkv_a.bias"):
                 continue
             else:
@@ -1999,15 +1996,9 @@ class TransformerDeepSeekV3(Transformer):
                 assert prefix + "w1w3.weight" not in checkpoint
                 gate_weight = checkpoint[prefix + "w1.weight"]
                 up_weight = checkpoint[prefix + "w3.weight"]
-                if gate_weight.element_size() == 1 and not has_native_fp8():
-                    new_checkpoint[prefix + "w1w3.weight"] = torch.cat(
-                        [gate_weight.view(torch.uint8), up_weight.view(torch.uint8)],
-                        dim=0,
-                    ).view(gate_weight.dtype)
-                else:
-                    new_checkpoint[prefix + "w1w3.weight"] = torch.cat(
-                        [gate_weight, up_weight], dim=0
-                    )
+                new_checkpoint[prefix + "w1w3.weight"] = torch.cat(
+                    [gate_weight, up_weight], dim=0
+                )
             elif k.endswith(".w3.weight"):
                 continue
             elif k.endswith(".w1.scale"):
@@ -2016,15 +2007,9 @@ class TransformerDeepSeekV3(Transformer):
                 assert prefix + "w1w3.scale" not in checkpoint
                 gate_scale = checkpoint[prefix + "w1.scale"]
                 up_scale = checkpoint[prefix + "w3.scale"]
-                if gate_scale.element_size() == 1 and not has_native_fp8():
-                    new_checkpoint[prefix + "w1w3.scale"] = torch.cat(
-                        [gate_scale.view(torch.uint8), up_scale.view(torch.uint8)],
-                        dim=0,
-                    ).view(gate_scale.dtype)
-                else:
-                    new_checkpoint[prefix + "w1w3.scale"] = torch.cat(
-                        [gate_scale, up_scale], dim=0
-                    )
+                new_checkpoint[prefix + "w1w3.scale"] = torch.cat(
+                    [gate_scale, up_scale], dim=0
+                )
             elif k.endswith(".w3.scale"):
                 continue
             elif k.endswith(".w1.scale_2"):
@@ -2033,15 +2018,9 @@ class TransformerDeepSeekV3(Transformer):
                 assert prefix + "w1w3.scale_2" not in checkpoint
                 gate_scale = checkpoint[prefix + "w1.scale_2"]
                 up_scale = checkpoint[prefix + "w3.scale_2"]
-                if gate_scale.element_size() == 1 and not has_native_fp8():
-                    new_checkpoint[prefix + "w1w3.scale_2"] = torch.cat(
-                        [gate_scale, up_scale],
-                        dim=0,
-                    ).view(gate_scale.dtype)
-                else:
-                    new_checkpoint[prefix + "w1w3.scale_2"] = torch.cat(
-                        [gate_scale, up_scale], dim=0
-                    )
+                new_checkpoint[prefix + "w1w3.scale_2"] = torch.cat(
+                    [gate_scale, up_scale], dim=0
+                )
             elif k.endswith(".w3.scale_2"):
                 continue
             elif k.endswith(".w1.input_scale"):
@@ -2050,15 +2029,9 @@ class TransformerDeepSeekV3(Transformer):
                 assert prefix + "w1w3.input_scale" not in checkpoint
                 gate_scale = checkpoint[prefix + "w1.input_scale"]
                 up_scale = checkpoint[prefix + "w3.input_scale"]
-                if gate_scale.element_size() == 1 and not has_native_fp8():
-                    new_checkpoint[prefix + "w1w3.input_scale"] = torch.cat(
-                        [gate_scale, up_scale],
-                        dim=0,
-                    ).view(gate_scale.dtype)
-                else:
-                    new_checkpoint[prefix + "w1w3.input_scale"] = torch.cat(
-                        [gate_scale, up_scale], dim=0
-                    )
+                new_checkpoint[prefix + "w1w3.input_scale"] = torch.cat(
+                    [gate_scale, up_scale], dim=0
+                )
             elif k.endswith(".w3.input_scale"):
                 continue
             elif k.endswith(".w1.bias"):
@@ -2067,14 +2040,9 @@ class TransformerDeepSeekV3(Transformer):
                 assert prefix + "w1w3.bias" not in checkpoint
                 gate_bias = checkpoint[prefix + "w1.bias"]
                 up_bias = checkpoint[prefix + "w3.bias"]
-                if gate_bias.element_size() == 1 and not has_native_fp8():
-                    new_checkpoint[prefix + "w1w3.bias"] = torch.cat(
-                        [gate_bias.view(torch.uint8), up_bias.view(torch.uint8)], dim=0
-                    ).view(gate_bias.dtype)
-                else:
-                    new_checkpoint[prefix + "w1w3.bias"] = torch.cat(
-                        [gate_bias, up_bias], dim=0
-                    )
+                new_checkpoint[prefix + "w1w3.bias"] = torch.cat(
+                    [gate_bias, up_bias], dim=0
+                )
             elif k.endswith(".w3.bias"):
                 continue
             else:

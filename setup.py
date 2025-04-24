@@ -103,7 +103,7 @@ setup(
     version="0.2.2",
     install_requires=[
         # Don't put `torch` here because it requires downloading from a specific source
-        "transformers<4.47",  # Required by auto_gptq
+        "transformers",
         "fire",
         "tiktoken>=0.7.0",  # Required by glm4
         "blobfile",
@@ -120,13 +120,14 @@ setup(
         "quant": [
             "optimum",
             "bitsandbytes",
-            "auto_gptq",
             "w8a8gemm @ file://localhost"
             + os.path.join(setup_dir, "third_party/nv_w8a8_kernels/w8a8gemm"),
             "w8a8gemv @ file://localhost"
             + os.path.join(setup_dir, "third_party/nv_w8a8_kernels/w8a8gemv"),
             "autoawq-kernels==0.0.8",
             "autoawq[kernels]",
+            "gptqmodel>=2.2.0",
+            "tokenizers>=0.20.3",
         ],
         "muxi_layout_kernels": [
             "muxi_layout_kernels @ file://localhost"

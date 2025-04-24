@@ -29,6 +29,10 @@ class AttnBackend(abc.ABC):
     Interface class for all attention implementations
     """
 
+    def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
+        super().__init__()
+        self.qk_nope_head_dim = qk_nope_head_dim
+
     def prepare_metadata_for_decode(self, *args, **kwargs):
         pass
 
@@ -184,36 +188,39 @@ class AttnBackend(abc.ABC):
     ):
         # If not overridden, fall back to a multi-query attention
 
-        args = get_global_args()
+        bs, local_n_heads, kv_lora_rank = q_nope.shape
+        assert q_pe.shape[0] == bs
+        assert q_pe.shape[1] == local_n_heads
+        _, _, qk_rope_head_dim = q_pe.shape
 
         q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
         q_nope_pe = q_nope_pe.view(
-            q_nope_pe.shape[-3],  # batch
+            bs,
             1,  # seqlen
-            q_nope_pe.shape[-2],  # head
-            q_nope_pe.shape[-1],  # hidden
+            local_n_heads,
+            kv_lora_rank + qk_rope_head_dim,  # hidden
         )
 
         kv_cache = kv_cache.view(
             kv_cache.shape[0],
             kv_cache.shape[1],
             1,  # head
-            kv_cache.shape[-1],  # hidden
+            kv_lora_rank + qk_rope_head_dim,  # hidden
         )
-        assert (
-            kv_cache.shape[-1]
-            == args.models.kv_lora_rank + args.models.qk_rope_head_dim
-        )
-        kv_cache_lora = kv_cache[..., : args.models.kv_lora_rank]
+        assert kv_cache.shape[-1] == kv_lora_rank + qk_rope_head_dim
+        kv_cache_lora = kv_cache[..., :kv_lora_rank]
 
         kv = kv.view(
             kv.shape[0],
             kv.shape[1],
             1,  # head
-            kv.shape[-1],  # hidden
+            kv_lora_rank + qk_rope_head_dim,  # hidden
         )
-        assert kv.shape[-1] == args.models.kv_lora_rank + args.models.qk_rope_head_dim
-        kv_lora = kv[..., : args.models.kv_lora_rank]
+        kv_lora = kv[..., :kv_lora_rank]
+
+        if softmax_scale is None:
+            assert self.qk_nope_head_dim is not None
+            softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
 
         return self.attn_with_kvcache(
             q_nope_pe,
@@ -229,8 +236,8 @@ class AttnBackend(abc.ABC):
 
 class FlashAttnBackend(AttnBackend):
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
+        super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
     def attn_varlen_func(
         self,
@@ -308,8 +315,8 @@ class FlashAttnBackend(AttnBackend):
 
 class RefAttnBackend(AttnBackend):
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
+        super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
         import einops as _einops
 
@@ -533,11 +540,54 @@ class RefAttnBackend(AttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
     ):
-        assert block_table is None, "block_table is not supported in RefAttnBackend"
         if cache_seqlens is int or cache_seqlens.ndim == 0:
             cache_seqlens = torch.full(
                 (q.shape[0],), cache_seqlens, dtype=torch.long, device=q.device
             )
+
+        if block_table is not None:
+            k_cache_paged = k_cache
+            v_cache_paged = v_cache
+            if k is None and q is None:
+                max_seqlen = torch.amax(cache_seqlens)
+            elif k is not None and q is not None:
+                max_seqlen = torch.amax(cache_seqlens + 1)
+            else:
+                assert False
+            k_cache = torch.zeros(
+                cache_seqlens.shape[0],
+                max_seqlen,
+                *k_cache_paged.shape[2:],
+                device=k_cache_paged.device,
+                dtype=k_cache_paged.dtype,
+            )
+            v_cache = torch.zeros(
+                cache_seqlens.shape[0],
+                max_seqlen,
+                *v_cache_paged.shape[2:],
+                device=v_cache_paged.device,
+                dtype=v_cache_paged.dtype,
+            )
+            page_size = k_cache_paged.shape[1]
+            for i in range(cache_seqlens.shape[0]):
+                for j in range(0, cache_seqlens[i], page_size):
+                    len_in_this_page = min(page_size, cache_seqlens[i] - j)
+                    k_cache[i, j : j + len_in_this_page] = k_cache_paged[
+                        block_table[i, j // page_size], :len_in_this_page
+                    ]
+                    v_cache[i, j : j + len_in_this_page] = v_cache_paged[
+                        block_table[i, j // page_size], :len_in_this_page
+                    ]
+                if k is not None and q is not None:
+                    k_cache_paged[
+                        block_table[i, cache_seqlens[i] // page_size],
+                        cache_seqlens[i] % page_size,
+                    ] = k[i]
+                    v_cache_paged[
+                        block_table[i, cache_seqlens[i] // page_size],
+                        cache_seqlens[i] % page_size,
+                    ] = v[i]
+
         arange = self._einops.rearrange(
             torch.arange(k_cache.shape[1], device=k_cache.device), "s -> 1 s"
         )
@@ -549,6 +599,9 @@ class RefAttnBackend(AttnBackend):
             for i in range(cache_seqlens.shape[0]):
                 k_cache[i][cache_seqlens[i]] = k[i]
                 v_cache[i][cache_seqlens[i]] = v[i]
+        else:
+            assert False
+
         output, _ = self._attention(
             q,
             k_cache,
@@ -565,8 +618,8 @@ class RefAttnBackend(AttnBackend):
 
 
 class FlashMLABackend(RefAttnBackend):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
+        super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
         self.args = get_global_args()
         self.mtp_size = 1
@@ -640,8 +693,8 @@ class FlashMLABackend(RefAttnBackend):
 
 
 class FlashInferBackend(RefAttnBackend):
-    def __init__(self, tot_num_blocks):
-        super().__init__()
+    def __init__(self, tot_num_blocks, *, qk_nope_head_dim: Optional[int] = None):
+        super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
         args = get_global_args()
 
@@ -758,14 +811,8 @@ class FlashInferBackend(RefAttnBackend):
 
 
 class TritonAttnBackend(RefAttnBackend):
-    def __init__(self):
-        super().__init__()
-
-        self.args = get_global_args()
-        self.local_n_heads = self.args.models.n_heads // self.args.infer.tp_size
-        self.kv_lora_rank = self.args.models.kv_lora_rank
-        self.qk_rope_head_dim = self.args.models.qk_rope_head_dim
-        self.qk_nope_head_dim = self.args.models.qk_nope_head_dim
+    def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
+        super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
     def prepare_metadata_for_decode(
         self,
@@ -794,9 +841,10 @@ class TritonAttnBackend(RefAttnBackend):
     ):
         assert torch.equal(cu_seqlens_q, cu_seqlens_k)
         seq_len = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-        B = q.shape[0]
+        B, local_n_heads, _ = q.shape
+        _, _, v_n_hidden = v.shape
         output = torch.empty(
-            B, self.local_n_heads, self.kv_lora_rank, dtype=q.dtype, device=q.device
+            B, local_n_heads, v_n_hidden, dtype=q.dtype, device=q.device
         )
         context_attention_fwd(
             q,
@@ -825,6 +873,11 @@ class TritonAttnBackend(RefAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
     ):
+        B, local_n_heads, kv_lora_rank = q_nope.shape
+        assert q_pe.shape[0] == B
+        assert q_pe.shape[1] == local_n_heads
+        _, _, qk_rope_head_dim = q_pe.shape
+
         if block_table is None:
             append_to_non_paged_kv_cache(kv_cache, kv, cache_seqlens_excl_this_decode)
         else:
@@ -832,12 +885,10 @@ class TritonAttnBackend(RefAttnBackend):
                 kv_cache, block_table, kv, cache_seqlens_excl_this_decode
             )
 
-        B = q_nope.shape[0]
-
         o = torch.zeros(
             B,
-            self.local_n_heads,
-            self.kv_lora_rank,
+            local_n_heads,
+            kv_lora_rank,
             dtype=q_nope.dtype,
             device=q_nope.device,
         )
@@ -847,9 +898,9 @@ class TritonAttnBackend(RefAttnBackend):
         attn_logits = torch.empty(
             (
                 B,
-                self.local_n_heads,
+                local_n_heads,
                 num_kv_splits,
-                self.kv_lora_rank + 1,
+                kv_lora_rank + 1,
             ),
             dtype=torch.float32,
             device=q_nope.device,
@@ -857,15 +908,14 @@ class TritonAttnBackend(RefAttnBackend):
 
         assert kv_cache.ndim == 3  # (num_blocks, block_size, dim)
         kv_c_and_k_pe_cache = kv_cache
-        kv_c_cache = kv_c_and_k_pe_cache[..., : self.kv_lora_rank]
-        k_pe_cache = kv_c_and_k_pe_cache[..., self.kv_lora_rank :]
+        kv_c_cache = kv_c_and_k_pe_cache[..., :kv_lora_rank]
+        k_pe_cache = kv_c_and_k_pe_cache[..., kv_lora_rank:]
 
         PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
 
         if softmax_scale is None:
-            softmax_scale = (
-                1.0 / ((self.qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5),
-            )
+            assert self.qk_nope_head_dim is not None
+            softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
 
         if block_table is None:
             mla_decode_non_paged(
@@ -894,4 +944,4 @@ class TritonAttnBackend(RefAttnBackend):
                 PAGE_SIZE,
             )
 
-        return o.view(B, 1, self.local_n_heads, -1)
+        return o.view(B, 1, local_n_heads, -1)
