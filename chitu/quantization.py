@@ -3,7 +3,7 @@ import logging
 from typing import Dict, Tuple, Optional, Type, Set, List
 
 from chitu.tensor_parallel import LocalLinear
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_opt_dep, parse_dtype
 from chitu.ops import (
     fp8_gemm_deepseek_v3,
     soft_fp8_gemm_deepseek_v3,
@@ -13,7 +13,7 @@ from chitu.ops import (
     act_quant_deepseek_v3,
 )
 from chitu.global_vars import get_global_args
-from chitu.device_type import get_device_name, is_muxi, is_nvidia, has_native_fp8
+from chitu.device_type import get_device_name, is_muxi, is_nvidia
 
 
 logger = logging.getLogger(__name__)
@@ -684,6 +684,13 @@ class Blockfp8Linear(QuantizedLinearBase):
         super().__init__()
 
         dtype = dtype or torch.float8_e4m3fn
+
+        # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
+        # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
+        args = get_global_args()
+        if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
+            dtype = torch.uint8
+
         assert dtype.itemsize == 1
 
         self.in_features = in_features
@@ -693,9 +700,8 @@ class Blockfp8Linear(QuantizedLinearBase):
         self.register_parameter(
             "weight",
             torch.nn.Parameter(
-                torch.empty(
-                    (out_features, in_features), dtype=dtype, requires_grad=False
-                )
+                torch.empty((out_features, in_features), dtype=dtype),
+                requires_grad=False,
             ),
         )
 
@@ -708,8 +714,8 @@ class Blockfp8Linear(QuantizedLinearBase):
                     scale_out_features,
                     scale_in_features,
                     dtype=torch.float32,
-                    requires_grad=False,
-                )
+                ),
+                requires_grad=False,
             ),
         )
 
@@ -717,7 +723,7 @@ class Blockfp8Linear(QuantizedLinearBase):
             self.register_parameter(
                 "bias",
                 torch.nn.Parameter(
-                    torch.empty(out_features, dtype=bias_dtype, requires_grad=False)
+                    torch.empty(out_features, dtype=bias_dtype), requires_grad=False
                 ),
             )
         else:

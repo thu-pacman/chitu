@@ -6,7 +6,7 @@ This file has adaption of open-source code from the following sources:
 """
 
 from logging import getLogger
-from typing import Any, Tuple
+from typing import Any, Tuple, Optional
 
 import numpy as np
 import torch
@@ -105,3 +105,22 @@ def get_config_dir_path():
     import pkg_resources
 
     return pkg_resources.resource_filename("chitu", "config")
+
+
+def parse_dtype(
+    name: str,
+    is_quant_layer: Optional[bool] = False,
+) -> torch.dtype:
+    if name == "float16":
+        return torch.float16
+    elif name == "bfloat16":
+        return torch.bfloat16
+    elif name == "float8_e4m3fn":
+        return torch.float8_e4m3fn
+    elif name == "float4_e2m1":
+        if is_quant_layer:
+            return torch.uint8
+        else:
+            return torch.bfloat16
+    else:
+        assert False
