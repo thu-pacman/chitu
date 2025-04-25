@@ -66,6 +66,8 @@ class UserRequest:
         self,
         message,
         request_id,
+        logprobs=False,
+        top_logprobs=None,
         max_new_tokens=50,
         temperature=0.8,
         top_p=0.9,
@@ -76,6 +78,8 @@ class UserRequest:
         self.prompt_len = 0
         self.request_id = request_id
         self.completed = asyncio.Event()
+        self.logprobs = logprobs
+        self.top_logprobs = 0 if logprobs and not top_logprobs else top_logprobs
         self.max_new_tokens = max_new_tokens
         self.async_stream = AsyncDataStream()
         self.output = ""
@@ -97,8 +101,8 @@ class UserRequest:
         )
         TaskLoad.user_req.add(self)
 
-    def add_data(self, data):
-        self.async_stream.add_data(data)
+    def add_data(self, data, top_logprobs=None, top_token_idx=None):
+        self.async_stream.add_data(data, top_logprobs, top_token_idx)
         logger.debug(f"add data: {data}")
 
     def _test_add_logit(self, logit):
@@ -303,7 +307,14 @@ class Task:
         self.next_token = token
         self.prefix_length += 1
         self.max_output_tokens -= 1
-        self.req.add_data(self.next_token)
+        if self.req.logprobs:
+            logprobs_raw = torch.log(torch.softmax(logit, dim=-1))
+            logprobs_raw, token_idx = logprobs_raw.sort(descending=True)
+            logprobs_raw = logprobs_raw[: max(1, self.req.top_logprobs)].tolist()
+            token_idx = token_idx[: max(1, self.req.top_logprobs)].tolist()
+            self.req.add_data(self.next_token, logprobs_raw, token_idx)
+        else:
+            self.req.add_data(self.next_token)
         TaskLoad.increase(1)
 
     def wait(self, handle):

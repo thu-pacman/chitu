@@ -46,6 +46,8 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     conversation_id: str = Field(default_factory=gen_req_id)
     messages: List[Message]
+    logprobs: bool = False
+    top_logprobs: Optional[int] = None
     max_tokens: int = 128
     stream: bool = False
     temperature: float = 0.8  # [0, 2]
@@ -73,6 +75,8 @@ async def create_chat_completion(request: ChatRequest):
     req_id = gen_req_id()
     stream = params.pop("stream", False)
     message = params.pop("messages")
+    logprobs = params.pop("logprobs")
+    top_logprobs = params.pop("top_logprobs")
     max_new_tokens = params.pop("max_tokens", global_args.request.max_new_tokens)
     temp = params.pop("temperature")
     top_p = params.pop("top_p")
@@ -84,6 +88,8 @@ async def create_chat_completion(request: ChatRequest):
         req = UserRequest(
             message,
             req_id,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
             max_new_tokens=max_new_tokens,
             temperature=temp,
             top_p=top_p,
