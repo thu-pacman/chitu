@@ -1,7 +1,7 @@
 import math
 import functools
 from logging import getLogger
-from typing import Any, List, Mapping, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -38,6 +38,18 @@ from chitu.tensor_parallel import (
     get_tp_rank,
     get_tp_size,
 )
+
+from chitu.muxi_utils import (
+    LinearLayoutContigXContigY,
+    Blockfp8LinearLayoutContigXContigY,
+    linear_layout_contig_x_contig_y,
+    blockfp8_linear_layout_contig_x_contig_y,
+    preprocess_weights_for_native_layout,
+    get_muxi_padded_input,
+    grouped_topk,
+    muxi_fused_experts,
+)
+
 from chitu.utils import try_import_opt_dep, parse_dtype
 from chitu.quantization import (
     linear_block_fp8,
@@ -60,11 +72,13 @@ def linear_deepseek_v3(
     weight_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     weight_scale_2: Optional[torch.Tensor] = None,
+    *,
+    linear_op=torch.nn.functional.linear,
     input_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     block_size = 128
     if weight.element_size() > 1:
-        return F.linear(x, weight, bias)
+        return linear_op(x, weight, bias)
     else:
         if weight_scale_2 is not None:
             return linear_block_fp4(
@@ -82,6 +96,10 @@ def linear_deepseek_v3(
                 weight_scale=weight_scale,
                 bias=bias,
                 block_size=block_size,
+                # this is for custom kernel
+                linear_op=(
+                    None if linear_op == torch.nn.functional.linear else linear_op
+                ),
             )
 
 
@@ -411,11 +429,13 @@ class AttentionDeepSeekV3(Attention):
         layer_id,
         cache,
         attn_backend,
+        op_impl: str,
         mla_absorb,
         merge_qkv,
         is_fp4,
     ):
         super().__init__(layer_id, cache, attn_backend)
+        self.op_impl = op_impl
         self.mla_absorb = mla_absorb
         self.merge_qkv = merge_qkv
 
@@ -482,8 +502,8 @@ class AttentionDeepSeekV3(Attention):
             dtype=parse_dtype(args.main_weight_dtype),
             bias_dtype=torch.get_default_dtype(),
             gather_output=False,
-            base_linear_class=QuantizationRegistry.get_quantized_linear_class_from_global_args(
-                disabled_methods={"blockfp4"}
+            base_linear_class=get_linear_layout_contig_x_contig_y(
+                op_impl, disabled_methods={"blockfp4"}
             ),
         )
         self.kv_norm = RMSNorm(self.kv_lora_rank)
@@ -496,8 +516,8 @@ class AttentionDeepSeekV3(Attention):
                 dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
-                base_linear_class=QuantizationRegistry.get_quantized_linear_class_from_global_args(
-                    disabled_methods={"blockfp4"}
+                base_linear_class=get_linear_layout_contig_x_contig_y(
+                    op_impl, disabled_methods={"blockfp4"}
                 ),
             )
         elif self.mla_absorb == "absorb-without-precomp":
@@ -527,8 +547,8 @@ class AttentionDeepSeekV3(Attention):
             dtype=parse_dtype(args.main_weight_dtype),
             bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
-            base_linear_class=QuantizationRegistry.get_quantized_linear_class_from_global_args(
-                disabled_methods={"blockfp4"}
+            base_linear_class=get_linear_layout_contig_x_contig_y(
+                op_impl, disabled_methods={"blockfp4"}
             ),
         )
         self.softmax_scale = compute_softmax_scale_deepseek_v3(args)
@@ -546,7 +566,14 @@ class AttentionDeepSeekV3(Attention):
         else:
             q_a = self.wq_a(x)
             kv = self.wkv_a(x)
-        q = self.wq_b(self.q_norm(q_a, compute_dtype=q_a.dtype))
+        if self.op_impl == "muxi_custom_kernel":
+            q = self.wq_b(
+                get_muxi_padded_input(self.q_norm(q_a, compute_dtype=q_a.dtype))
+            )
+            q = q[:bs_seq]
+        else:
+            q = self.wq_b(self.q_norm(q_a, compute_dtype=q_a.dtype))
+
         q = q.view(bs_seq, self.n_local_heads, -1)
 
         q_nope, q_pe = torch.split(
@@ -573,7 +600,12 @@ class AttentionDeepSeekV3(Attention):
         )
 
         if self.mla_absorb == "none":
-            kv = self.wkv_b(self.kv_norm(kv_lora))
+            if self.op_impl == "muxi_custom_kernel":
+                kv = self.wkv_b(get_muxi_padded_input(self.kv_norm(kv_lora)))
+                kv = kv[:bs_seq]
+            else:
+                kv = self.wkv_b(self.kv_norm(kv_lora))
+
             kv = kv.view(
                 bs_seq, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim
             )
@@ -765,8 +797,19 @@ class AttentionDeepSeekV3(Attention):
         return x
 
     def _run_output_linear(self, x):
-        x = self.wo(x.flatten(-2))
-        return x
+        x = x.flatten(-2)
+        if self.op_impl == "muxi_custom_kernel":
+            x_shape = x.shape
+            x = x.reshape(-1, x_shape[-1])
+            bs_seq, _ = x.size()
+            x = get_muxi_padded_input(x)
+            y = self.wo(x)
+            y = y[:bs_seq]
+            y = y.reshape(x_shape[:-1] + (y.shape[-1],))
+            return y
+        else:
+            x = self.wo(x)
+            return x
 
 
 class MLPDeepSeekV3(nn.Module):
@@ -779,9 +822,10 @@ class MLPDeepSeekV3(nn.Module):
         w3 (nn.Module): Additional linear layer for feature transformation.
     """
 
-    def __init__(self, args, merge_gate_up: bool, is_fp4: bool = False):
+    def __init__(self, args, merge_gate_up: bool, op_impl: str, is_fp4: bool = False):
         super().__init__()
         self.merge_gate_up = merge_gate_up
+        self.op_impl = op_impl
 
         if merge_gate_up:
             self.w1w3 = ColumnParallelLinear(
@@ -793,6 +837,7 @@ class MLPDeepSeekV3(nn.Module):
                 ),  # In fp4 quantization, dtype of MLP is float4_e2m1
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
+                base_linear_class=get_linear_layout_contig_x_contig_y(op_impl),
             )
             if is_fp4:
                 self.w1w3.register_scale_2_param(
@@ -806,6 +851,7 @@ class MLPDeepSeekV3(nn.Module):
                 dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
+                base_linear_class=get_linear_layout_contig_x_contig_y(op_impl),
             )
             self.w3 = ColumnParallelLinear(
                 args.dim // 2 if is_fp4 else args.dim,
@@ -814,6 +860,7 @@ class MLPDeepSeekV3(nn.Module):
                 dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
+                base_linear_class=get_linear_layout_contig_x_contig_y(op_impl),
             )
             if is_fp4:
                 self.w1.register_scale_2_param()
@@ -825,6 +872,7 @@ class MLPDeepSeekV3(nn.Module):
             dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
             bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
+            base_linear_class=get_linear_layout_contig_x_contig_y(op_impl),
         )
         if is_fp4:
             self.w2.register_scale_2_param()
@@ -839,6 +887,17 @@ class MLPDeepSeekV3(nn.Module):
         Returns:
             torch.Tensor: Output tensor after MLP computation.
         """
+        if self.op_impl == "muxi_custom_kernel":
+            x_shape = x.shape
+            x = x.view(-1, x_shape[-1])
+            bs_seq, _ = x.size()
+            x = get_muxi_padded_input(x)
+            w2_out = self._compute_w2(x)[:bs_seq]
+            return w2_out.reshape(x_shape[:-1] + (w2_out.shape[-1],))
+        else:
+            return self._compute_w2(x)
+
+    def _compute_w2(self, x: torch.Tensor) -> torch.Tensor:
         if self.merge_gate_up:
             w1w3_out = self.w1w3(x)
             return self.w2(silu_and_mul(w1w3_out))
@@ -863,7 +922,7 @@ class GateDeepSeekV3(nn.Module):
         bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
     """
 
-    def __init__(self, args):
+    def __init__(self, args, op_impl: str = "torch"):
         """
         Initializes the Gate module.
 
@@ -871,6 +930,7 @@ class GateDeepSeekV3(nn.Module):
             args (ModelArgs): Model arguments containing gating parameters.
         """
         super().__init__()
+        self.op_impl = op_impl
         self.dim = args.dim
         self.topk = args.n_activated_experts
         self.n_groups = args.n_expert_groups
@@ -899,34 +959,50 @@ class GateDeepSeekV3(nn.Module):
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
         scores = F.linear(x, self.weight)
-        if self.is_fused_sigmoid_gate() and is_nvidia():
-            indices, weights = fused_sigmoid_gate(
-                scores, self.topk, self.n_groups, self.topk_groups, self.bias
+        if self.op_impl == "muxi_custom_kernel":
+            weights, indices = grouped_topk(
+                x,
+                scores,
+                self.topk,
+                renormalize=self.score_func == "sigmoid",
+                num_expert_group=self.n_groups,
+                topk_group=self.topk_groups,
+                scoring_func=self.score_func,
+                e_score_correction_bias=(
+                    None if self.bias is None else self.bias.type_as(scores)
+                ),
             )
+            weights *= self.route_scale
+            return weights, indices
         else:
-            if self.score_func == "softmax":
-                scores = scores.softmax(dim=-1, dtype=torch.float32)
+            if self.is_fused_sigmoid_gate() and (is_nvidia() or is_muxi()):
+                indices, weights = fused_sigmoid_gate(
+                    scores, self.topk, self.n_groups, self.topk_groups, self.bias
+                )
             else:
-                scores = scores.sigmoid()
-            original_scores = scores
-            if self.bias is not None:
-                scores = scores + self.bias
-            if self.n_groups > 1:
-                scores = scores.view(x.size(0), self.n_groups, -1)
-                if self.bias is None:
-                    group_scores = scores.amax(dim=-1)
+                if self.score_func == "softmax":
+                    scores = scores.softmax(dim=-1, dtype=torch.float32)
                 else:
-                    group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-                indices = group_scores.topk(self.topk_groups, dim=-1)[1]
-                mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
-                scores = (scores * mask.unsqueeze(-1)).flatten(1)
-            indices = torch.topk(scores, self.topk, dim=-1)[1]
-            weights = original_scores.gather(1, indices)
+                    scores = scores.sigmoid()
+                original_scores = scores
+                if self.bias is not None:
+                    scores = scores + self.bias
+                if self.n_groups > 1:
+                    scores = scores.view(x.size(0), self.n_groups, -1)
+                    if self.bias is None:
+                        group_scores = scores.amax(dim=-1)
+                    else:
+                        group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+                    indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+                    mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
+                    scores = (scores * mask.unsqueeze(-1)).flatten(1)
+                indices = torch.topk(scores, self.topk, dim=-1)[1]
+                weights = original_scores.gather(1, indices)
 
-        if self.score_func == "sigmoid":
-            weights /= weights.sum(dim=-1, keepdim=True)
-        weights *= self.route_scale
-        return weights.type_as(x), indices.to(torch.int32)
+            if self.score_func == "sigmoid":
+                weights /= weights.sum(dim=-1, keepdim=True)
+            weights *= self.route_scale
+            return weights.type_as(x), indices.to(torch.int32)
 
 
 class MoEDeepSeekV3(nn.Module):
@@ -943,7 +1019,7 @@ class MoEDeepSeekV3(nn.Module):
         shared_experts (nn.Module): Shared experts applied to all inputs.
     """
 
-    def __init__(self, args, merge_gate_up: bool, is_fp4: bool = False):
+    def __init__(self, args, merge_gate_up: bool, op_impl: str, is_fp4: bool = False):
         """
         Initializes the MoE module.
 
@@ -951,6 +1027,7 @@ class MoEDeepSeekV3(nn.Module):
             args (ModelArgs): Model arguments containing MoE parameters.
         """
         super().__init__()
+        self.op_impl = op_impl
         self.merge_gate_up = merge_gate_up
         self.dim = args.dim
         self.is_fp4 = is_fp4
@@ -966,7 +1043,8 @@ class MoEDeepSeekV3(nn.Module):
         self.n_activated_experts = args.n_activated_experts
         self.experts_start_idx = moe_rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.gate = GateDeepSeekV3(args)
+        self.gate = GateDeepSeekV3(args, op_impl)
+
         if merge_gate_up:
             self.w1w3 = GroupColumnParallelLinearDeepSeekV3(
                 self.experts_end_idx - self.experts_start_idx + self.n_shared_experts,
@@ -1050,8 +1128,9 @@ class MoEDeepSeekV3(nn.Module):
 
         weights, indices = self.gate(x)
 
-        if has_triton:
-
+        if self.op_impl == "muxi_custom_kernel":
+            y = self._compute_muxi_fused_experts(x, weights, indices)
+        elif has_triton:
             if self.w1w3.scale is None and self.w2.scale is None:
                 w1w3_weight, w1w3_scale, w2_weight, w2_scale = (
                     self.get_expert_weights_for_non_fp8(
@@ -1276,6 +1355,87 @@ class MoEDeepSeekV3(nn.Module):
             ):
                 y += w2_outs[i]
         return y.view(shape)
+
+    def _compute_muxi_fused_experts(self, x, weights, indices):
+        w1_linear = w3_linear = w2_linear = (
+            blockfp8_linear_layout_contig_x_contig_y
+            if hasattr(get_global_args().models, "quant")
+            else linear_layout_contig_x_contig_y
+        )
+        batch, _ = x.shape
+        newx = get_muxi_padded_input(x)
+
+        new_w1w3 = None
+        w1_out = None
+        w3_out = None
+        act = None
+        new_w2 = self.w2.weight[: -self.n_shared_experts]
+
+        if self.merge_gate_up:
+            w1w3_out = linear_deepseek_v3(
+                newx,
+                self.w1w3.weight[-1],
+                self.w1w3.scale[-1] if self.w1w3.scale is not None else None,
+                self.w1w3.bias[-1] if self.w1w3.bias is not None else None,
+                linear_op=w1_linear,
+            )
+            act = silu_and_mul(w1w3_out)
+            new_w1w3 = self.w1w3.weight[: -self.n_shared_experts]
+        else:
+            w1_out = linear_deepseek_v3(
+                newx,
+                self.w1.weight[-1],
+                self.w1.scale[-1] if self.w1.scale is not None else None,
+                self.w1.bias[-1] if self.w1.bias is not None else None,
+                linear_op=w1_linear,
+            )
+            w3_out = linear_deepseek_v3(
+                newx,
+                self.w3.weight[-1],
+                self.w3.scale[-1] if self.w3.scale is not None else None,
+                self.w3.bias[-1] if self.w3.bias is not None else None,
+                linear_op=w3_linear,
+            )
+            new_w1w3 = torch.cat(
+                (
+                    self.w1.weight[: -self.n_shared_experts],
+                    self.w3.weight[: -self.n_shared_experts],
+                ),
+                dim=1,
+            )
+            act = F.silu(w1_out) * w3_out
+
+        y = linear_deepseek_v3(
+            act,
+            self.w2.weight[-1],
+            self.w2.scale[-1] if self.w2.scale is not None else None,
+            self.w2.bias[-1] if self.w2.bias is not None else None,
+            linear_op=w2_linear,
+        )
+        y = y[:batch]
+        y1 = muxi_fused_experts(
+            hidden_states=x,
+            w1=new_w1w3,
+            w2=new_w2,
+            topk_weights=weights,
+            topk_ids=indices,
+            inplace=True,
+            w1_scale=(
+                self.w1w3.scale[: -self.n_shared_experts]
+                if self.w1w3.scale is not None
+                else None
+            ),
+            w2_scale=(
+                self.w2.scale[: -self.n_shared_experts]
+                if self.w2.scale is not None
+                else None
+            ),
+            block_shape=[128, 128],
+            soft_fp8=True if self.w1w3.scale is not None else False,
+        )
+        y += y1
+        torch.distributed.all_reduce(y, group=get_tp_group())
+        return y
 
 
 class MoEDeepSeekV3CPU(nn.Module):
@@ -1605,6 +1765,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             layer_id,
             cache,
             attn_backend,
+            op_impl=op_impl,
             mla_absorb=mla_absorb,
             merge_qkv=merge_qkv_gate_up,
             is_fp4=is_fp4,
@@ -1613,6 +1774,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             MLPDeepSeekV3(
                 args,
                 merge_gate_up=merge_qkv_gate_up,
+                op_impl=op_impl,
                 is_fp4=is_fp4,
             )
             if layer_id < args.n_dense_layers
@@ -1620,6 +1782,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                 MoEDeepSeekV3(
                     args,
                     merge_gate_up=merge_qkv_gate_up,
+                    op_impl=op_impl,
                     is_fp4=is_fp4,
                 )
                 if not cpu_infer
@@ -1691,8 +1854,6 @@ class TransformerDeepSeekV3(Transformer):
             mla_absorb=mla_absorb,
             is_fp4=(get_global_args().models.main_weight_dtype == "float4_e2m1"),
         )
-        if op_impl != "torch":
-            raise NotImplementedError("Only op_impl=torch is supported in DeepSeek V3")
 
     def to(self, *args, **kwargs):
         if hasattr(self, "embed"):
@@ -1707,7 +1868,7 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def _get_tensor_column_parallel_layer_names(self) -> List[str]:
-        return ["embed", "wq_b", "wkv_b", "w1", "w3", "head"]
+        return ["embed", "wq_b", "wkv_b", "w1", "w3", "w1w3", "head"]
 
     @override
     def _get_tensor_row_parallel_layer_names(self) -> List[str]:
@@ -2140,6 +2301,17 @@ class TransformerDeepSeekV3(Transformer):
                 state_dict = self._process_state_dict_for_merging_gate_up(state_dict)
 
             state_dict = self._process_state_dict_for_merging_experts(state_dict)
+
+        if self.op_impl == "muxi_custom_kernel":
+            rpl_names = self._get_tensor_row_parallel_layer_names()
+            cpl_names = self._get_tensor_column_parallel_layer_names()
+            cpl_names = [name for name in cpl_names if name not in {"embed", "head"}]
+            if self.mla_absorb == "absorb-without-precomp":
+                cpl_names.remove("wkv_b")
+            state_dict = preprocess_weights_for_native_layout(
+                state_dict, rpl_names, cpl_names
+            )
+
         super().load_state_dict(
             state_dict, skip_preprocess=skip_preprocess, *args, **kwargs
         )
@@ -2327,3 +2499,24 @@ def compute_softmax_scale_deepseek_v3(args):
     mscale: float = 1.0
     mscale = 0.1 * mscale * math.log(args.rope_factor) + 1.0
     return (qk_head_dim**-0.5) * mscale * mscale
+
+
+def get_linear_layout_contig_x_contig_y(
+    op_impl: str, disabled_methods: Optional[Set[str]] = None
+):
+    if op_impl == "muxi_custom_kernel":
+        args = get_global_args()
+        quant_method = None if not hasattr(args.models, "quant") else args.models.quant
+        if quant_method is None:
+            return LinearLayoutContigXContigY
+        elif quant_method == "blockfp8":
+            return Blockfp8LinearLayoutContigXContigY
+        else:
+            raise NotImplementedError(
+                f'Quantization method {quant_method} is not implemented for "muxi_custom_kernel"'
+            )
+
+    else:
+        return QuantizationRegistry.get_quantized_linear_class_from_global_args(
+            disabled_methods=disabled_methods
+        )

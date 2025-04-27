@@ -566,6 +566,7 @@ def linear_block_fp8(
     weight_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     block_size: Optional[int] = 128,
+    linear_op=None,
 ) -> torch.Tensor:
     """
     Applies a linear transformation to the incoming data: y = xA^T + b.
@@ -587,7 +588,10 @@ def linear_block_fp8(
 
     if get_global_args().infer.raise_lower_bit_float_to == "bfloat16":
         if is_nvidia() or is_muxi():
-            y = soft_fp8_gemm_deepseek_v3(x, weight, weight_scale)
+            if linear_op is not None:
+                y = linear_op(x, weight, weight_scale=weight_scale, b=bias)
+            else:
+                y = soft_fp8_gemm_deepseek_v3(x, weight, weight_scale)
             if bias is not None:
                 y += bias
             return y
