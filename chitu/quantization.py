@@ -592,8 +592,8 @@ def linear_block_fp8(
                 y = linear_op(x, weight, weight_scale=weight_scale, b=bias)
             else:
                 y = soft_fp8_gemm_deepseek_v3(x, weight, weight_scale)
-            if bias is not None:
-                y += bias
+                if bias is not None:
+                    y += bias
             return y
         else:
             logger.warning(

@@ -584,13 +584,7 @@ class AttentionDeepSeekV3(Attention):
         else:
             q_a = self.wq_a(x)
             kv = self.wkv_a(x)
-        if self.op_impl == "muxi_custom_kernel":
-            q = self.wq_b(
-                get_muxi_padded_input(self.q_norm(q_a, compute_dtype=q_a.dtype))
-            )
-            q = q[:bs_seq]
-        else:
-            q = self.wq_b(self.q_norm(q_a, compute_dtype=q_a.dtype))
+        q = self.wq_b(self.q_norm(q_a, compute_dtype=q_a.dtype))
 
         q = q.view(bs_seq, self.n_local_heads, -1)
 
@@ -618,11 +612,7 @@ class AttentionDeepSeekV3(Attention):
         )
 
         if self.mla_absorb == "none":
-            if self.op_impl == "muxi_custom_kernel":
-                kv = self.wkv_b(get_muxi_padded_input(self.kv_norm(kv_lora)))
-                kv = kv[:bs_seq]
-            else:
-                kv = self.wkv_b(self.kv_norm(kv_lora))
+            kv = self.wkv_b(self.kv_norm(kv_lora))
 
             kv = kv.view(
                 bs_seq, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim
@@ -815,19 +805,7 @@ class AttentionDeepSeekV3(Attention):
         return x
 
     def _run_output_linear(self, x):
-        x = x.flatten(-2)
-        if self.op_impl == "muxi_custom_kernel":
-            x_shape = x.shape
-            x = x.reshape(-1, x_shape[-1])
-            bs_seq, _ = x.size()
-            x = get_muxi_padded_input(x)
-            y = self.wo(x)
-            y = y[:bs_seq]
-            y = y.reshape(x_shape[:-1] + (y.shape[-1],))
-            return y
-        else:
-            x = self.wo(x)
-            return x
+        return self.wo(x.flatten(-2))
 
 
 class MLPDeepSeekV3(nn.Module):
@@ -905,17 +883,6 @@ class MLPDeepSeekV3(nn.Module):
         Returns:
             torch.Tensor: Output tensor after MLP computation.
         """
-        if self.op_impl == "muxi_custom_kernel":
-            x_shape = x.shape
-            x = x.view(-1, x_shape[-1])
-            bs_seq, _ = x.size()
-            x = get_muxi_padded_input(x)
-            w2_out = self._compute_w2(x)[:bs_seq]
-            return w2_out.reshape(x_shape[:-1] + (w2_out.shape[-1],))
-        else:
-            return self._compute_w2(x)
-
-    def _compute_w2(self, x: torch.Tensor) -> torch.Tensor:
         if self.merge_gate_up:
             w1w3_out = self.w1w3(x)
             return self.w2(silu_and_mul(w1w3_out))

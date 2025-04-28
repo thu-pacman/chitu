@@ -870,28 +870,57 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3(
 
 
 def silu_and_mul_torch(x: torch.Tensor):
-    d = x.shape[-1] // 2
-    return F.silu(x[..., :d]) * x[..., d:]
+    import chitu.muxi_utils as muxi_utils
+
+    if isinstance(x, torch.Tensor):
+        d = x.shape[-1] // 2
+        return F.silu(x[..., :d]) * x[..., d:]
+
+    elif isinstance(x, muxi_utils.NativeLayoutActivation):
+        d = x.buffer.shape[0] // 2
+        return muxi_utils.NativeLayoutActivation(
+            x.batch_size, x.batch_shape, F.silu(x.buffer[:d]) * x.buffer[d:]
+        )
+
+    else:
+        raise ValueError(
+            f"Unsupported input type: {type(x)}. Expected torch.Tensor or muxi_utils.NativeLayoutActivation."
+        )
 
 
 @auto_retry_triton_compilation
 def invoke_silu_and_mul(x):
+    assert isinstance(x, torch.Tensor)
+
     n_rows = x.nelement() // x.shape[-1]
     n_cols = x.shape[-1]
-    BLOCK_SIZE, _ = calculate_settings(n_cols // 2)
+    assert n_cols % 2 == 0
+
     output_shape = x.shape[:-1] + (n_cols // 2,)
     output = torch.empty(output_shape, device=x.device, dtype=x.dtype)
+
+    assert x.is_contiguous()
+    assert output.is_contiguous()
+
+    BLOCK_SIZE, _ = calculate_settings(n_cols // 2)
     silu_and_mul_kernel[(n_rows,)](
         output,
         x,
-        output.shape[-1],
-        x.shape[-1],
+        n_cols // 2,
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return output
 
 
-def silu_and_mul(x, impl="triton"):
+def silu_and_mul(x, impl="auto"):
+    import chitu.muxi_utils as muxi_utils
+
+    if impl == "auto":
+        if isinstance(x, muxi_utils.NativeLayoutActivation):
+            impl = "torch"
+        else:
+            impl = "triton"
+
     if impl == "triton":
         return invoke_silu_and_mul(x)
     else:

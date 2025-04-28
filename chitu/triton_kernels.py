@@ -815,23 +815,22 @@ configs = [
 ]
 
 
-@triton.autotune(configs=configs, key=["output_row_stride", "x_row_stride"])
+@triton.autotune(configs=configs, key=["output_n_cols"])
 @triton.jit
-def silu_and_mul_kernel(
-    output_ptr, x_ptr, output_row_stride, x_row_stride, BLOCK_SIZE: tl.constexpr
-):
+def silu_and_mul_kernel(output_ptr, x_ptr, output_n_cols, BLOCK_SIZE: tl.constexpr):
     row_idx = tl.program_id(0)
-    row_start_ptr = x_ptr + row_idx * x_row_stride
-    d = x_row_stride // 2
+    row_start_ptr = x_ptr + row_idx * output_n_cols * 2
     offsets = tl.arange(0, BLOCK_SIZE)
-    part1 = tl.load(row_start_ptr + offsets, mask=(offsets < d), other=0)
-    part2 = tl.load(row_start_ptr + d + offsets, mask=(offsets < d), other=0)
+    part1 = tl.load(row_start_ptr + offsets, mask=(offsets < output_n_cols), other=0)
+    part2 = tl.load(
+        row_start_ptr + output_n_cols + offsets, mask=(offsets < output_n_cols), other=0
+    )
     part1_fp32 = part1.to(tl.float32)
     silu_part1_fp32 = part1_fp32 / (1 + tl.exp(-1 * part1_fp32))
     silu_part1 = silu_part1_fp32.to(part1.dtype)
     result = silu_part1 * part2
-    output = output_ptr + row_idx * output_row_stride + offsets
-    tl.store(output, result, mask=(offsets < d))
+    output = output_ptr + row_idx * output_n_cols + offsets
+    tl.store(output, result, mask=(offsets < output_n_cols))
 
 
 @triton.autotune(configs=configs, key=["Y_row_stride", "X_row_stride", "compute_dtype"])

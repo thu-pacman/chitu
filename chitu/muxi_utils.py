@@ -1,4 +1,5 @@
-from typing import List, Optional
+from typing import List, Optional, Union
+from dataclasses import dataclass
 from .utils import try_import_opt_dep
 import torch
 
@@ -371,23 +372,52 @@ def muxi_fused_experts(
     return y.view(shape)
 
 
+@dataclass
+class NativeLayoutActivation:
+    batch_size: int
+    batch_shape: Union[torch.Size, List[int]]
+    buffer: torch.Tensor
+
+
 class LinearLayoutContigXNativeY(LocalLinear):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return linear_layout_contig_x_native_y(x, self.weight, self.bias)
+    def forward(self, x: torch.Tensor) -> NativeLayoutActivation:
+        x_shape = x.shape
+        x = x.reshape(-1, x.shape[-1])
+        n = x.shape[0]
+        x = get_muxi_padded_input(x)
+        y = linear_layout_contig_x_native_y(x, self.weight, self.bias)
+        return NativeLayoutActivation(n, x_shape[:-1], y)
 
 
 class LinearLayoutNativeXContigY(LocalLinear):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return linear_layout_native_x_contig_y(x, self.weight, self.bias)
+    def forward(self, x: NativeLayoutActivation) -> torch.Tensor:
+        y = linear_layout_native_x_contig_y(x.buffer, self.weight, self.bias)
+        y = y[: x.batch_size, :]
+        y = y.reshape(x.batch_shape + (y.shape[-1],))
+        return y
 
 
 class LinearLayoutContigXContigY(LocalLinear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return linear_layout_contig_x_contig_y(x, self.weight, self.bias)
+        x_shape = x.shape
+        x = x.reshape(-1, x.shape[-1])
+        n = x.shape[0]
+        x = get_muxi_padded_input(x)
+        y = linear_layout_contig_x_contig_y(x, self.weight, self.bias)
+        y = y[:n, :]
+        y = y.reshape(x_shape[:-1] + (y.shape[-1],))
+        return y
 
 
 class Blockfp8LinearLayoutContigXContigY(Blockfp8Linear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return blockfp8_linear_layout_contig_x_contig_y(
+        x_shape = x.shape
+        x = x.reshape(-1, x.shape[-1])
+        n = x.shape[0]
+        x = get_muxi_padded_input(x)
+        y = blockfp8_linear_layout_contig_x_contig_y(
             x, self.weight, self.bias, self.scale
         )
+        y = y[:n, :]
+        y = y.reshape(x_shape[:-1] + (y.shape[-1],))
+        return y
