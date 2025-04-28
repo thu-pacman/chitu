@@ -137,10 +137,6 @@ setup(
             "tbsgemm @ file://localhost"
             + os.path.join(setup_dir, "third_party/muxi_w8a8_kernels/w8a8"),
         ],
-        "muxi_moe_fused": [
-            "muxi_moe_fused @ file://localhost"
-            + os.path.join(setup_dir, "third_party/muxi_fusedmoe_interface"),
-        ],
         "flash_attn": [
             "flash-attn",
             # Although `flash-attn` is available in PyPI, don't make it a required

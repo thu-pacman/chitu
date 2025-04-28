@@ -11,10 +11,6 @@ muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
 )
 tbsgemm, has_tbsgemm = try_import_opt_dep("tbsgemm", "muxi_w8a8_kernels")
 
-muxi_moe_fused, has_muxi_moe_fused = try_import_opt_dep(
-    "muxi_moe_fused", "muxi_moe_fused"
-)
-
 
 def preprocess_weights_for_native_layout(
     checkpoint, rpl_names: List[str], cpl_names: List[str]
@@ -249,7 +245,7 @@ def grouped_topk(
     else:
         raise ValueError("Unsupported scoring function")
 
-    muxi_moe_fused.fused_routing_gate(
+    muxi_layout_kernels.fused_routing_gate(
         gating_output,
         score_fun,
         B,
@@ -326,7 +322,7 @@ def muxi_fused_experts(
 
     if soft_fp8:
         assert w1_scale is not None and w2_scale is not None
-        muxi_moe_fused.fused_experts_compute(
+        muxi_layout_kernels.fused_experts_compute(
             w1,
             w2,
             hidden_states,
@@ -347,7 +343,7 @@ def muxi_fused_experts(
             soft_fp8,
         )
     else:
-        muxi_moe_fused.fused_experts_compute(
+        muxi_layout_kernels.fused_experts_compute(
             w1,
             w2,
             hidden_states,
