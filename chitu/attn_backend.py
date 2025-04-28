@@ -697,6 +697,11 @@ class FlashInferBackend(RefAttnBackend):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
         args = get_global_args()
+        self.is_mla = (
+            args.infer.mla_absorb == "absorb-without-precomp"
+            or args.infer.mla_absorb == "absorb"
+        )
+        self.is_paged = args.infer.cache_type == "paged"
 
         # FlashInfer accepts block tables for Q and KV in CSR format.
         # - For Q, it is trivial because the length for each sample is 1.
@@ -717,20 +722,47 @@ class FlashInferBackend(RefAttnBackend):
             torch.empty(max_batch_size, dtype=torch.int32, device="cuda")
         )
 
-        self.mla_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+        self.prefill_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
             torch.empty(128 * 1024 * 1024, dtype=torch.int8).cuda(),
+            "NHD",
             use_cuda_graph=args.infer.use_cuda_graph,
-            qo_indptr=self.q_indptr.get(),
-            kv_indptr=self.kv_indptr.get(),
-            kv_indices=self.kv_indices.get(),
-            kv_len_arr=self.seqlens.get(),
-            backend="auto",
+            qo_indptr_buf=self.q_indptr.get(),
+            kv_indptr_buf=self.kv_indptr.get(),
         )
+        if self.is_paged == True:
+            self.last_page_len = torch.empty(
+                max_batch_size, dtype=torch.int32, device="cuda"
+            )
+            self.record_pre_page_len = torch.empty(
+                max_batch_size, dtype=torch.int32, device="cuda"
+            )
+            self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                torch.empty(128 * 1024 * 1024, dtype=torch.int8).cuda(),
+                "NHD",
+                use_cuda_graph=args.infer.use_cuda_graph,
+                paged_kv_indptr_buffer=self.kv_indptr.get(),
+                paged_kv_indices_buffer=self.kv_indices.get(),
+                paged_kv_last_page_len_buffer=self.last_page_len,
+            )
 
         self.local_n_heads = args.models.n_heads // args.infer.tp_size
-        self.kv_lora_rank = args.models.kv_lora_rank
-        self.qk_rope_head_dim = args.models.qk_rope_head_dim
-        self.qk_nope_head_dim = args.models.qk_nope_head_dim
+        if self.is_mla:
+            self.kv_lora_rank = args.models.kv_lora_rank
+            self.qk_rope_head_dim = args.models.qk_rope_head_dim
+            self.qk_nope_head_dim = args.models.qk_nope_head_dim
+            self.mla_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+                torch.empty(128 * 1024 * 1024, dtype=torch.int8).cuda(),
+                use_cuda_graph=args.infer.use_cuda_graph,
+                qo_indptr=self.q_indptr.get(),
+                kv_indptr=self.kv_indptr.get(),
+                kv_indices=self.kv_indices.get(),
+                kv_len_arr=self.seqlens.get(),
+                backend="auto",
+            )
+        else:
+            self.kv_lora_rank = None
+            self.qk_rope_head_dim = None
+            self.local_n_kv_heads = args.models.n_kv_heads // args.infer.tp_size
 
     def prepare_metadata_for_decode(
         self,
@@ -756,32 +788,34 @@ class FlashInferBackend(RefAttnBackend):
         self.seqlens.set(cache_seqlens_incl_this_decode)
 
         if softmax_scale is None:
-            softmax_scale = 1.0 / (
-                (self.qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5
-            )
+            if self.qk_rope_head_dim is not None and self.qk_nope_head_dim is not None:
+                softmax_scale = 1.0 / (
+                    (self.qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5
+                )
 
         # Currently `self.mla_wrapper` holds fixed reserved buffers for CUDA graph, whose
         # sizes cannot be changed for different batch size. We have to forcely override
         # their shapes here.
-        self.mla_wrapper._qo_indptr_buf = self.q_indptr.get()
-        self.mla_wrapper._kv_indptr_buf = self.kv_indptr.get()
-        self.mla_wrapper._kv_indices_buf = self.kv_indices.get()
-        self.mla_wrapper._kv_len_arr_buf = self.seqlens.get()
+        if self.is_mla:
+            self.mla_wrapper._qo_indptr_buf = self.q_indptr.get()
+            self.mla_wrapper._kv_indptr_buf = self.kv_indptr.get()
+            self.mla_wrapper._kv_indices_buf = self.kv_indices.get()
+            self.mla_wrapper._kv_len_arr_buf = self.seqlens.get()
 
-        self.mla_wrapper.plan(
-            self.q_indptr.get(),
-            self.kv_indptr.get(),
-            self.kv_indices.get(),
-            self.seqlens.get(),
-            num_heads=self.local_n_heads,
-            head_dim_ckv=self.kv_lora_rank,
-            head_dim_kpe=self.qk_rope_head_dim,
-            page_size=block_size,
-            causal=True,
-            sm_scale=softmax_scale,
-            q_data_type=torch.get_default_dtype(),
-            kv_data_type=torch.get_default_dtype(),
-        )
+            self.mla_wrapper.plan(
+                self.q_indptr.get(),
+                self.kv_indptr.get(),
+                self.kv_indices.get(),
+                self.seqlens.get(),
+                num_heads=self.local_n_heads,
+                head_dim_ckv=self.kv_lora_rank,
+                head_dim_kpe=self.qk_rope_head_dim,
+                page_size=block_size,
+                causal=True,
+                sm_scale=softmax_scale,
+                q_data_type=torch.get_default_dtype(),
+                kv_data_type=torch.get_default_dtype(),
+            )
 
     def mla_attn_with_kvcache(
         self,
@@ -797,6 +831,10 @@ class FlashInferBackend(RefAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
     ):
+        B, local_n_heads, self.kv_lora_rank = q_nope.shape
+        assert q_pe.shape[0] == B
+        assert q_pe.shape[1] == local_n_heads
+        _, _, self.qk_rope_head_dim = q_pe.shape
         append_to_paged_kv_cache(
             kv_cache, block_table, kv, cache_seqlens_excl_this_decode
         )
@@ -808,6 +846,161 @@ class FlashInferBackend(RefAttnBackend):
             kv_cache[..., self.kv_lora_rank :],
             return_lse=False,
         ).view(cache_seqlens_excl_this_decode.shape[0], 1, self.local_n_heads, -1)
+
+    def attn_varlen_func(
+        self,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p=0.0,
+        causal=False,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
+    ):
+        head_dim_qk = q.shape[-1]
+        head_dim_vo = v.shape[-1]
+        # flashinfer prefill not support these cases
+        if head_dim_vo not in [64, 128, 256] or (
+            head_dim_qk != head_dim_vo
+            and not (head_dim_qk == 192 and head_dim_vo == 128)
+        ):
+            o = super().attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                causal,
+                window_size,
+                softcap,
+                softmax_scale,
+            )
+        else:
+            num_qo_heads = q.shape[-2]
+            num_kv_heads = k.shape[-2]
+            self.prefill_wrapper.plan(
+                cu_seqlens_q,
+                cu_seqlens_k,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim_qk=q.shape[-1],
+                head_dim_vo=v.shape[-1],
+                causal=causal,
+                q_data_type=q.dtype,
+                kv_data_type=k.dtype,
+                window_left=window_size[0],
+                logits_soft_cap=softcap,
+                sm_scale=softmax_scale,
+            )
+            o = self.prefill_wrapper.run(q, k, v)
+        return o
+
+    def attn_with_kvcache(
+        self,
+        q,
+        k_cache,
+        v_cache,
+        k=None,
+        v=None,
+        cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+        cache_leftpad: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
+        causal=False,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
+    ):
+        batch_size = q.shape[0]
+        block_size = k_cache.shape[1]
+        head_dim = q.shape[-1]
+        group_size = q.shape[-2] // k_cache.shape[-2]
+        if group_size not in [1, 2, 3, 4, 8]:
+            return super().attn_with_kvcache(
+                q,
+                k_cache,
+                v_cache,
+                k,
+                v,
+                cache_seqlens,
+                cache_leftpad,
+                block_table,
+                causal,
+                window_size,
+                softcap,
+                softmax_scale,
+            )
+        if block_table != None:
+            # append kv to cache
+            if k != None:
+                assert v != None
+                for i in range(batch_size):
+                    if isinstance(cache_seqlens, torch.Tensor):
+                        batch_seq_len = cache_seqlens[i]
+                    elif isinstance(cache_seqlens, int):
+                        batch_seq_len = cache_seqlens
+                    else:
+                        raise RuntimeError(
+                            f"Cache_seqlens type must be torch.Tensor or int: {type(cache_seqlens)}"
+                        )
+                    k_cache[
+                        block_table[i, batch_seq_len // block_size],
+                        batch_seq_len % block_size,
+                    ] = k[i]
+                    v_cache[
+                        block_table[i, batch_seq_len // block_size],
+                        batch_seq_len % block_size,
+                    ] = v[i]
+                    self.last_page_len[i] = batch_seq_len + 1
+
+            def is_new_seq_len():
+                for i in range(batch_size):
+                    if self.record_pre_page_len[i] != self.last_page_len[i]:
+                        return True
+                return False
+
+            if is_new_seq_len():
+                self.record_pre_page_len.copy_(self.last_page_len)
+                self.decode_wrapper.plan(
+                    self.kv_indptr.get(),
+                    self.kv_indices.get(),
+                    self.last_page_len,
+                    self.local_n_heads,
+                    self.local_n_kv_heads,
+                    head_dim,
+                    block_size,
+                    pos_encoding_mode="NONE",
+                    q_data_type=q.dtype,
+                    kv_data_type=k_cache.dtype,
+                    window_left=window_size[0],
+                    logits_soft_cap=softcap,
+                    sm_scale=softmax_scale,
+                )
+            o = self.decode_wrapper.run(
+                q.view(-1, q.shape[-2], q.shape[-1]), (k_cache, v_cache)
+            )
+        else:
+            o = torch.empty_like(q)
+            for i in range(batch_size):
+                k_cache[i, cache_seqlens[i]] = k[i]
+                v_cache[i, cache_seqlens[i]] = v[i]
+                o[i] = flashinfer.single_decode_with_kv_cache(
+                    q[i].squeeze(0),
+                    k_cache[i, : cache_seqlens[i] + 1],
+                    v_cache[i, : cache_seqlens[i] + 1],
+                    "NHD",
+                    window_left=window_size[0],
+                    logits_soft_cap=softcap,
+                    sm_scale=softmax_scale,
+                )
+        return o.view(q.shape)
 
 
 class TritonAttnBackend(RefAttnBackend):

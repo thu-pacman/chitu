@@ -79,9 +79,10 @@ def get_global_args():
     return _GLOBAL_ARGS
 
 
-def set_global_args(args):
+def set_global_args(args, need_ensure=True):
     global _GLOBAL_ARGS
-    _ensure_var_is_not_initialized(_GLOBAL_ARGS, "global args")
+    if need_ensure == True:
+        _ensure_var_is_not_initialized(_GLOBAL_ARGS, "global args")
     _GLOBAL_ARGS = args
 
 
