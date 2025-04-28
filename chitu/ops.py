@@ -856,7 +856,7 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3(
 
     soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel[grid](
         a,
-        b.view(dtype=torch.uint8),
+        b,
         c,
         b_s,
         b_s_2,

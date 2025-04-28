@@ -485,6 +485,8 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel(
     else:
         scale_2 = tl.load(b_s_2_ptr)
     fp4_to_fp8_scale = 64.0
+    fp8_to_bf16_scale = 0x7B800000
+    fp8_to_bf16_scale = fp8_to_bf16_scale.to(tl.float32, bitcast=True).to(tl.bfloat16)
     for i in range(k):
         b = tl.load(
             b_ptrs,
@@ -492,10 +494,14 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel(
             other=0.0,
         )
         a_s = tl.load(a_s_ptrs + i * BLOCK_SIZE_K // group_k)
-        b_s_1 = tl.load(b_s_ptrs)
-        b_s_2 = tl.load(b_s_ptrs + num_b_s_in_block // 2)
+        b_s_1 = tl.load(b_s_ptrs).to(tl.uint16)
+        b_s_2 = tl.load(b_s_ptrs + num_b_s_in_block // 2).to(tl.uint16)
         fp8_weight_1 = ((b & 0x08) << 4) | ((b & 0x07) << 2)
         fp8_weight_2 = (b & 0x80) | ((b & 0x70) >> 2)
+        bf16_s_1 = ((b_s_1 & 0x0080) << 8) | ((b_s_1 & 0x007F) << 4)
+        bf16_s_2 = ((b_s_2 & 0x0080) << 8) | ((b_s_2 & 0x007F) << 4)
+        b_s_1 = bf16_s_1.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
+        b_s_2 = bf16_s_2.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
         a_1 = tl.load(
             a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K - BLOCK_SIZE_K // 2
         )
@@ -689,6 +695,10 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel(
     b_ptrs = b_ptr + offs_n[None, :] * K // 2 + offs_k[:, None]
     b_s_ptrs = b_s_ptr + (offs_n[None, :] * K + offs_k[:, None]) // stride_b_s
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    fp4_to_bf16_scale = 0x7E800000
+    fp4_to_bf16_scale = fp4_to_bf16_scale.to(tl.float32, bitcast=True).to(tl.bfloat16)
+    fp8_to_bf16_scale = 0x7B800000
+    fp8_to_bf16_scale = fp8_to_bf16_scale.to(tl.float32, bitcast=True).to(tl.bfloat16)
     if is_w1w3:
         if pid_n * BLOCK_SIZE_N >= N // 2:
             scale_2 = tl.load(b_s_2_ptr + 1)
@@ -696,13 +706,18 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel(
             scale_2 = tl.load(b_s_2_ptr)
     else:
         scale_2 = tl.load(b_s_2_ptr)
-    fp4_to_fp8_scale = 64.0
     for i in range(k):
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < (K - i * BLOCK_SIZE_K), other=0.0)
-        b_s_1 = tl.load(b_s_ptrs)
-        b_s_2 = tl.load(b_s_ptrs + num_b_s_in_block // 2)
-        fp8_weight_1 = ((b & 0x08) << 4) | ((b & 0x07) << 2)
-        fp8_weight_2 = (b & 0x80) | ((b & 0x70) >> 2)
+        b = tl.load(
+            b_ptrs, mask=offs_k[:, None] < (K - i * BLOCK_SIZE_K), other=0.0
+        ).to(tl.uint16)
+        b_s_1 = tl.load(b_s_ptrs).to(tl.uint16)
+        b_s_2 = tl.load(b_s_ptrs + num_b_s_in_block // 2).to(tl.uint16)
+        bf16_weight_1 = ((b & 0x08) << 12) | ((b & 0x07) << 6)
+        bf16_weight_2 = ((b & 0x80) << 8) | ((b & 0x70) << 2)
+        bf16_s_1 = ((b_s_1 & 0x0080) << 8) | ((b_s_1 & 0x007F) << 4)
+        bf16_s_2 = ((b_s_2 & 0x0080) << 8) | ((b_s_2 & 0x007F) << 4)
+        b_s_1 = bf16_s_1.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
+        b_s_2 = bf16_s_2.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
         a_1 = tl.load(
             a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K - BLOCK_SIZE_K // 2
         )
@@ -710,18 +725,18 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel(
             a_ptrs + BLOCK_SIZE_K // 2,
             mask=offs_k[None, :] < K - i * BLOCK_SIZE_K - BLOCK_SIZE_K // 2,
         )
-        fp8_weight_1 = (
-            fp8_weight_1.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16) * b_s_1
+        bf16_weight_1 = (
+            bf16_weight_1.to(tl.bfloat16, bitcast=True) * fp4_to_bf16_scale * b_s_1
         )
-        accumulator += tl.dot(a_1, fp8_weight_1)
-        fp8_weight_2 = (
-            fp8_weight_2.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16) * b_s_2
+        accumulator += tl.dot(a_1, bf16_weight_1)
+        bf16_weight_2 = (
+            bf16_weight_2.to(tl.bfloat16, bitcast=True) * fp4_to_bf16_scale * b_s_2
         )
-        accumulator += tl.dot(a_2, fp8_weight_2)
+        accumulator += tl.dot(a_2, bf16_weight_2)
         a_ptrs += BLOCK_SIZE_K
         b_ptrs += BLOCK_SIZE_K // 2
         b_s_ptrs += num_b_s_in_block
-    accumulator = accumulator * scale_2 * fp4_to_fp8_scale
+    accumulator = accumulator * scale_2
     c = accumulator.to(c_ptr.dtype.element_ty)
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)

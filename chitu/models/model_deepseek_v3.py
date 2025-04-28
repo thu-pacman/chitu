@@ -240,6 +240,15 @@ class GroupColumnParallelLinearDeepSeekV3(torch.nn.Module):
                 scale_in_features = (
                     in_features + quant_scale_stride - 1
                 ) // quant_scale_stride
+                self.scale = nn.Parameter(
+                    torch.empty(
+                        group_size,
+                        scale_out_features,
+                        scale_in_features,
+                        dtype=torch.uint8,
+                    ),
+                    requires_grad=False,
+                )
                 self.input_scale = nn.Parameter(
                     torch.empty(
                         group_size,
@@ -259,15 +268,15 @@ class GroupColumnParallelLinearDeepSeekV3(torch.nn.Module):
             else:
                 scale_out_features = (local_out_features + block_size - 1) // block_size
                 scale_in_features = (in_features + block_size - 1) // block_size
-            self.scale = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    scale_out_features,
-                    scale_in_features,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
+                self.scale = nn.Parameter(
+                    torch.empty(
+                        group_size,
+                        scale_out_features,
+                        scale_in_features,
+                        dtype=torch.float32,
+                    ),
+                    requires_grad=False,
+                )
         else:
             self.scale = None
 
@@ -355,6 +364,15 @@ class GroupRowParallelLinearDeepSeekV3(torch.nn.Module):
                 scale_in_features = (
                     local_in_features + quant_scale_stride - 1
                 ) // quant_scale_stride
+                self.scale = nn.Parameter(
+                    torch.empty(
+                        group_size,
+                        scale_out_features,
+                        scale_in_features,
+                        dtype=torch.uint8,
+                    ),
+                    requires_grad=False,
+                )
                 self.input_scale = nn.Parameter(
                     torch.empty(
                         group_size,
@@ -374,15 +392,15 @@ class GroupRowParallelLinearDeepSeekV3(torch.nn.Module):
             else:
                 scale_out_features = (out_features + block_size - 1) // block_size
                 scale_in_features = (local_in_features + block_size - 1) // block_size
-            self.scale = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    scale_out_features,
-                    scale_in_features,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
+                self.scale = nn.Parameter(
+                    torch.empty(
+                        group_size,
+                        scale_out_features,
+                        scale_in_features,
+                        dtype=torch.float32,
+                    ),
+                    requires_grad=False,
+                )
         else:
             self.scale = None
 
@@ -2214,10 +2232,8 @@ class TransformerDeepSeekV3(Transformer):
         new_checkpoint = {}
         for k in checkpoint.keys():
             param = checkpoint[k]
-            if param.dtype == torch.uint8:
+            if param.dtype == torch.uint8 and "weight" in k:
                 param.data = chitu_backend.weight_layout_change(param.data.cuda()).cpu()
-            if param.dtype == torch.float8_e4m3fn:
-                param.data = param.data.to(torch.bfloat16)
             if "scale_2" in k or "input_scale" in k:
                 param.data = param.data.unsqueeze(0)
             new_checkpoint[k] = param
