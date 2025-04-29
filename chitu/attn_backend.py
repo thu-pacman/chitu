@@ -622,7 +622,174 @@ class RefAttnBackend(AttnBackend):
         return output
 
 
-class FlashMLABackend(RefAttnBackend):
+class TritonAttnBackend(RefAttnBackend):
+    def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
+        super().__init__(qk_nope_head_dim=qk_nope_head_dim)
+
+    def prepare_metadata_for_decode(
+        self,
+        cache_seqlens_excl_this_decode,
+        cache_seqlens_incl_this_decode,
+        block_table,
+        block_size,
+        softmax_scale=None,
+    ):
+        self.block_size = block_size
+
+    def attn_varlen_func(
+        self,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p=0,
+        causal=False,
+        window_size=(-1, -1),
+        softcap=0,
+        softmax_scale=None,
+    ):
+        assert torch.equal(cu_seqlens_q, cu_seqlens_k)
+        seq_len = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        B, local_n_heads, _ = q.shape
+        _, _, v_n_hidden = v.shape
+        output = torch.empty(
+            B, local_n_heads, v_n_hidden, dtype=q.dtype, device=q.device
+        )
+        context_attention_fwd(
+            q,
+            k,
+            v,
+            output,
+            cu_seqlens_q,
+            seq_len,
+            max_seqlen_q,
+            softmax_scale,
+            causal,
+        )
+        return output
+
+    def mla_attn_with_kvcache(
+        self,
+        q_nope,
+        q_pe,
+        kv_cache,
+        kv,
+        cache_seqlens_excl_this_decode: Union[(int, torch.Tensor)],
+        cache_seqlens_incl_this_decode: Union[(int, torch.Tensor)],
+        block_table: torch.Tensor,
+        causal=True,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
+    ):
+        B, local_n_heads, kv_lora_rank = q_nope.shape
+        assert q_pe.shape[0] == B
+        assert q_pe.shape[1] == local_n_heads
+        _, _, qk_rope_head_dim = q_pe.shape
+
+        if block_table is None:
+            append_to_non_paged_kv_cache(kv_cache, kv, cache_seqlens_excl_this_decode)
+        else:
+            append_to_paged_kv_cache(
+                kv_cache, block_table, kv, cache_seqlens_excl_this_decode
+            )
+
+        o = torch.zeros(
+            B,
+            local_n_heads,
+            kv_lora_rank,
+            dtype=q_nope.dtype,
+            device=q_nope.device,
+        )
+
+        num_kv_splits = None
+        if is_muxi():
+            if B > 32:
+                num_kv_splits = 3
+            elif B > 1:
+                num_kv_splits = 8
+            else:
+                num_kv_splits = 16
+        else:
+            num_kv_splits = 4
+
+        assert num_kv_splits is not None
+
+        attn_logits = torch.empty(
+            (
+                B,
+                local_n_heads,
+                num_kv_splits,
+                kv_lora_rank + 1,
+            ),
+            dtype=torch.float32,
+            device=q_nope.device,
+        )
+
+        assert kv_cache.ndim == 3  # (num_blocks, block_size, dim)
+
+        if is_muxi():
+            kv_c_and_k_pe_cache = kv_cache.unsqueeze(2)  # Add a head dim of 1
+        else:
+            kv_c_and_k_pe_cache = kv_cache
+            k_pe_cache = kv_c_and_k_pe_cache[..., kv_lora_rank:]
+
+        kv_c_cache = kv_c_and_k_pe_cache[..., :kv_lora_rank]
+        PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
+
+        if softmax_scale is None:
+            assert self.qk_nope_head_dim is not None
+            softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
+
+        if is_muxi():
+            q = torch.cat([q_nope, q_pe], dim=-1)
+            decode_attention_fwd(
+                q,
+                kv_c_and_k_pe_cache,
+                kv_c_cache,
+                o,
+                block_table,
+                cache_seqlens_incl_this_decode,
+                attn_logits,
+                num_kv_splits,
+                softmax_scale,
+                PAGE_SIZE,
+            )
+        else:
+            if block_table is None:
+                mla_decode_non_paged(
+                    q_nope,
+                    q_pe,
+                    kv_c_cache,
+                    k_pe_cache,
+                    o,
+                    cache_seqlens_incl_this_decode,
+                    attn_logits,
+                    num_kv_splits,
+                    softmax_scale,
+                )
+            else:
+                mla_decode(
+                    q_nope,
+                    q_pe,
+                    kv_c_cache,
+                    k_pe_cache,
+                    o,
+                    block_table,
+                    cache_seqlens_incl_this_decode,
+                    attn_logits,
+                    num_kv_splits,
+                    softmax_scale,
+                    PAGE_SIZE,
+                )
+
+        return o.view(B, 1, local_n_heads, -1)
+
+
+class FlashMLABackend(TritonAttnBackend):
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
@@ -697,7 +864,7 @@ class FlashMLABackend(RefAttnBackend):
         return output
 
 
-class FlashInferBackend(RefAttnBackend):
+class FlashInferBackend(TritonAttnBackend):
     def __init__(self, tot_num_blocks, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
@@ -1006,170 +1173,3 @@ class FlashInferBackend(RefAttnBackend):
                     sm_scale=softmax_scale,
                 )
         return o.view(q.shape)
-
-
-class TritonAttnBackend(RefAttnBackend):
-    def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
-        super().__init__(qk_nope_head_dim=qk_nope_head_dim)
-
-    def prepare_metadata_for_decode(
-        self,
-        cache_seqlens_excl_this_decode,
-        cache_seqlens_incl_this_decode,
-        block_table,
-        block_size,
-        softmax_scale=None,
-    ):
-        self.block_size = block_size
-
-    def attn_varlen_func(
-        self,
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        dropout_p=0,
-        causal=False,
-        window_size=(-1, -1),
-        softcap=0,
-        softmax_scale=None,
-    ):
-        assert torch.equal(cu_seqlens_q, cu_seqlens_k)
-        seq_len = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-        B, local_n_heads, _ = q.shape
-        _, _, v_n_hidden = v.shape
-        output = torch.empty(
-            B, local_n_heads, v_n_hidden, dtype=q.dtype, device=q.device
-        )
-        context_attention_fwd(
-            q,
-            k,
-            v,
-            output,
-            cu_seqlens_q,
-            seq_len,
-            max_seqlen_q,
-            softmax_scale,
-            causal,
-        )
-        return output
-
-    def mla_attn_with_kvcache(
-        self,
-        q_nope,
-        q_pe,
-        kv_cache,
-        kv,
-        cache_seqlens_excl_this_decode: Union[(int, torch.Tensor)],
-        cache_seqlens_incl_this_decode: Union[(int, torch.Tensor)],
-        block_table: torch.Tensor,
-        causal=True,
-        window_size=(-1, -1),  # -1 means infinite context window
-        softcap=0.0,  # 0.0 means deactivated
-        softmax_scale=None,
-    ):
-        B, local_n_heads, kv_lora_rank = q_nope.shape
-        assert q_pe.shape[0] == B
-        assert q_pe.shape[1] == local_n_heads
-        _, _, qk_rope_head_dim = q_pe.shape
-
-        if block_table is None:
-            append_to_non_paged_kv_cache(kv_cache, kv, cache_seqlens_excl_this_decode)
-        else:
-            append_to_paged_kv_cache(
-                kv_cache, block_table, kv, cache_seqlens_excl_this_decode
-            )
-
-        o = torch.zeros(
-            B,
-            local_n_heads,
-            kv_lora_rank,
-            dtype=q_nope.dtype,
-            device=q_nope.device,
-        )
-
-        num_kv_splits = None
-        if is_muxi():
-            if B > 32:
-                num_kv_splits = 3
-            elif B > 1:
-                num_kv_splits = 8
-            else:
-                num_kv_splits = 16
-        else:
-            num_kv_splits = 4
-
-        assert num_kv_splits is not None
-
-        attn_logits = torch.empty(
-            (
-                B,
-                local_n_heads,
-                num_kv_splits,
-                kv_lora_rank + 1,
-            ),
-            dtype=torch.float32,
-            device=q_nope.device,
-        )
-
-        assert kv_cache.ndim == 3  # (num_blocks, block_size, dim)
-
-        if is_muxi():
-            kv_c_and_k_pe_cache = kv_cache.unsqueeze(2)  # Add a head dim of 1
-        else:
-            kv_c_and_k_pe_cache = kv_cache
-            k_pe_cache = kv_c_and_k_pe_cache[..., kv_lora_rank:]
-
-        kv_c_cache = kv_c_and_k_pe_cache[..., :kv_lora_rank]
-        PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
-
-        if softmax_scale is None:
-            assert self.qk_nope_head_dim is not None
-            softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
-
-        if is_muxi():
-            q = torch.cat([q_nope, q_pe], dim=-1)
-            decode_attention_fwd(
-                q,
-                kv_c_and_k_pe_cache,
-                kv_c_cache,
-                o,
-                block_table,
-                cache_seqlens_incl_this_decode,
-                attn_logits,
-                num_kv_splits,
-                softmax_scale,
-                PAGE_SIZE,
-            )
-        else:
-            if block_table is None:
-                mla_decode_non_paged(
-                    q_nope,
-                    q_pe,
-                    kv_c_cache,
-                    k_pe_cache,
-                    o,
-                    cache_seqlens_incl_this_decode,
-                    attn_logits,
-                    num_kv_splits,
-                    softmax_scale,
-                )
-            else:
-                mla_decode(
-                    q_nope,
-                    q_pe,
-                    kv_c_cache,
-                    k_pe_cache,
-                    o,
-                    block_table,
-                    cache_seqlens_incl_this_decode,
-                    attn_logits,
-                    num_kv_splits,
-                    softmax_scale,
-                    PAGE_SIZE,
-                )
-
-        return o.view(B, 1, local_n_heads, -1)
