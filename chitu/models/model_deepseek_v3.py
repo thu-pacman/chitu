@@ -73,12 +73,11 @@ def linear_deepseek_v3(
     bias: Optional[torch.Tensor] = None,
     weight_scale_2: Optional[torch.Tensor] = None,
     *,
-    linear_op=torch.nn.functional.linear,
     input_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     block_size = 128
     if weight.element_size() > 1:
-        return linear_op(x, weight, bias)
+        return torch.nn.functional.linear(x, weight, bias)
     else:
         if weight_scale_2 is not None:
             return linear_block_fp4(
@@ -96,10 +95,6 @@ def linear_deepseek_v3(
                 weight_scale=weight_scale,
                 bias=bias,
                 block_size=block_size,
-                # this is for custom kernel
-                linear_op=(
-                    None if linear_op == torch.nn.functional.linear else linear_op
-                ),
             )
 
 
@@ -818,15 +813,31 @@ class MLPDeepSeekV3(nn.Module):
         w3 (nn.Module): Additional linear layer for feature transformation.
     """
 
-    def __init__(self, args, merge_gate_up: bool, op_impl: str, is_fp4: bool = False):
+    def __init__(
+        self,
+        args,
+        role: str,  # "standalone" or "shared_experts"
+        merge_gate_up: bool,
+        op_impl: str,
+        is_fp4: bool = False,
+    ):
         super().__init__()
         self.merge_gate_up = merge_gate_up
         self.op_impl = op_impl
 
+        if role == "standalone":
+            inter_dim = args.inter_dim
+        elif role == "shared_experts":
+            inter_dim = args.moe_inter_dim
+        else:
+            raise ValueError(
+                f"Invalid role: {role}. Expected 'standalone' or 'shared_experts'."
+            )
+
         if merge_gate_up:
             self.w1w3 = ColumnParallelLinear(
                 args.dim // 2 if is_fp4 else args.dim,
-                args.inter_dim * 2,
+                inter_dim * 2,
                 has_bias=False,
                 dtype=parse_dtype(
                     args.main_weight_dtype, is_quant_layer=True
@@ -842,7 +853,7 @@ class MLPDeepSeekV3(nn.Module):
         else:
             self.w1 = ColumnParallelLinear(
                 args.dim // 2 if is_fp4 else args.dim,
-                args.inter_dim,
+                inter_dim,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
                 bias_dtype=torch.get_default_dtype(),
@@ -851,7 +862,7 @@ class MLPDeepSeekV3(nn.Module):
             )
             self.w3 = ColumnParallelLinear(
                 args.dim // 2 if is_fp4 else args.dim,
-                args.inter_dim,
+                inter_dim,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
                 bias_dtype=torch.get_default_dtype(),
@@ -862,12 +873,13 @@ class MLPDeepSeekV3(nn.Module):
                 self.w1.register_scale_2_param()
                 self.w3.register_scale_2_param()
         self.w2 = RowParallelLinear(
-            args.inter_dim // 2 if is_fp4 else args.inter_dim,
+            inter_dim // 2 if is_fp4 else inter_dim,
             args.dim,
             has_bias=False,
             dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
             bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
+            reduce_output=(role == "standalone"),
             base_linear_class=get_linear_layout_contig_x_contig_y(op_impl),
         )
         if is_fp4:
@@ -1016,6 +1028,7 @@ class MoEDeepSeekV3(nn.Module):
         self.merge_gate_up = merge_gate_up
         self.dim = args.dim
         self.is_fp4 = is_fp4
+        self.fuse_shared_experts = get_global_args().infer.fuse_shared_experts
 
         moe_world_size = 1
         moe_rank = 0
@@ -1023,6 +1036,9 @@ class MoEDeepSeekV3(nn.Module):
             args.n_routed_experts % moe_world_size == 0
         ), f"Number of experts must be divisible by world size (world_size={moe_world_size})"
         self.n_shared_experts = args.n_shared_experts
+        self.n_fused_shared_experts = (
+            args.n_shared_experts if self.fuse_shared_experts else 0
+        )
         self.n_routed_experts = args.n_routed_experts
         self.n_local_experts = args.n_routed_experts // moe_world_size
         self.n_activated_experts = args.n_activated_experts
@@ -1030,9 +1046,12 @@ class MoEDeepSeekV3(nn.Module):
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = GateDeepSeekV3(args, op_impl)
 
+        # Routed experts + fused shared experts
         if merge_gate_up:
             self.w1w3 = GroupColumnParallelLinearDeepSeekV3(
-                self.experts_end_idx - self.experts_start_idx + self.n_shared_experts,
+                self.experts_end_idx
+                - self.experts_start_idx
+                + self.n_fused_shared_experts,
                 args.dim // 2 if is_fp4 else args.dim,
                 args.moe_inter_dim * 2,
                 has_bias=False,
@@ -1044,7 +1063,9 @@ class MoEDeepSeekV3(nn.Module):
             )
         else:
             self.w1 = GroupColumnParallelLinearDeepSeekV3(
-                self.experts_end_idx - self.experts_start_idx + self.n_shared_experts,
+                self.experts_end_idx
+                - self.experts_start_idx
+                + self.n_fused_shared_experts,
                 args.dim // 2 if is_fp4 else args.dim,
                 args.moe_inter_dim,
                 has_bias=False,
@@ -1054,7 +1075,9 @@ class MoEDeepSeekV3(nn.Module):
                 gather_output=False,
             )
             self.w3 = GroupColumnParallelLinearDeepSeekV3(
-                self.experts_end_idx - self.experts_start_idx + self.n_shared_experts,
+                self.experts_end_idx
+                - self.experts_start_idx
+                + self.n_fused_shared_experts,
                 args.dim // 2 if is_fp4 else args.dim,
                 args.moe_inter_dim,
                 has_bias=False,
@@ -1064,7 +1087,7 @@ class MoEDeepSeekV3(nn.Module):
                 gather_output=False,
             )
         self.w2 = GroupRowParallelLinearDeepSeekV3(
-            self.experts_end_idx - self.experts_start_idx + self.n_shared_experts,
+            self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts,
             args.moe_inter_dim // 2 if is_fp4 else args.moe_inter_dim,
             args.dim,
             has_bias=False,
@@ -1073,6 +1096,16 @@ class MoEDeepSeekV3(nn.Module):
             bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
         )
+
+        # Non-fused shared experts
+        if not self.fuse_shared_experts:
+            self.shared_experts = MLPDeepSeekV3(
+                args,
+                role="shared_experts",
+                merge_gate_up=merge_gate_up,
+                op_impl=op_impl,
+                is_fp4=is_fp4,
+            )
 
     def get_expert_weights_for_fp8_w8a8(self, expert_num):
         w1w3_weight = self.w1w3.weight[:expert_num]
@@ -1105,7 +1138,7 @@ class MoEDeepSeekV3(nn.Module):
         """
 
         shared_experts = 0
-        if get_global_args().infer.fuse_shared_experts:
+        if self.fuse_shared_experts:
             shared_experts = self.n_shared_experts
 
         shape = x.size()
@@ -1197,41 +1230,9 @@ class MoEDeepSeekV3(nn.Module):
                     use_fp8_w8a8 = False
                     fused_soft_fp8 = False
 
-            if not get_global_args().infer.fuse_shared_experts:
-                if use_fp4_w4a8:
-                    w1w3_out = linear_deepseek_v3(
-                        x,
-                        self.w1w3.weight[-1],
-                        self.w1w3.scale[-1] if self.w1w3.scale is not None else None,
-                        self.w1w3.bias[-1] if self.w1w3.bias is not None else None,
-                        (
-                            self.w1w3.scale_2[-1]
-                            if self.w1w3.scale_2 is not None
-                            else None
-                        ),
-                    )
-                    act = silu_and_mul(w1w3_out)
-                    y1 = linear_deepseek_v3(
-                        act,
-                        self.w2.weight[-1],
-                        self.w2.scale[-1] if self.w2.scale is not None else None,
-                        self.w2.bias[-1] if self.w2.bias is not None else None,
-                        self.w2.scale_2[-1] if self.w2.scale_2 is not None else None,
-                    )
-                else:
-                    w1w3_out = linear_deepseek_v3(
-                        x,
-                        self.w1w3.weight[-1],
-                        self.w1w3.scale[-1] if self.w1w3.scale is not None else None,
-                        self.w1w3.bias[-1] if self.w1w3.bias is not None else None,
-                    )
-                    act = silu_and_mul(w1w3_out)
-                    y1 = linear_deepseek_v3(
-                        act,
-                        self.w2.weight[-1],
-                        self.w2.scale[-1] if self.w2.scale is not None else None,
-                        self.w2.bias[-1] if self.w2.bias is not None else None,
-                    )
+            if not self.fuse_shared_experts:
+                y1 = self.shared_experts(x)
+
                 y = fused_experts(
                     x,
                     w1w3_weight,
@@ -1342,79 +1343,25 @@ class MoEDeepSeekV3(nn.Module):
         return y.view(shape)
 
     def _compute_muxi_fused_experts(self, x, weights, indices):
-        w1_linear = w3_linear = w2_linear = (
-            blockfp8_linear_layout_contig_x_contig_y
-            if hasattr(get_global_args().models, "quant")
-            else linear_layout_contig_x_contig_y
-        )
-        batch, _ = x.shape
-        newx = get_muxi_padded_input(x)
+        if self.fuse_shared_experts:
+            raise NotImplementedError(
+                "Fused shared experts is not supported for muxi_layout_kernels"
+            )
+        if not self.merge_gate_up:
+            raise NotImplementedError(
+                "muxi_layout_kernels for fused MoE requires merge_gate_up=True"
+            )
 
-        new_w1w3 = None
-        w1_out = None
-        w3_out = None
-        act = None
-        new_w2 = self.w2.weight[: -self.n_shared_experts]
-
-        if self.merge_gate_up:
-            w1w3_out = linear_deepseek_v3(
-                newx,
-                self.w1w3.weight[-1],
-                self.w1w3.scale[-1] if self.w1w3.scale is not None else None,
-                self.w1w3.bias[-1] if self.w1w3.bias is not None else None,
-                linear_op=w1_linear,
-            )
-            act = silu_and_mul(w1w3_out)
-            new_w1w3 = self.w1w3.weight[: -self.n_shared_experts]
-        else:
-            w1_out = linear_deepseek_v3(
-                newx,
-                self.w1.weight[-1],
-                self.w1.scale[-1] if self.w1.scale is not None else None,
-                self.w1.bias[-1] if self.w1.bias is not None else None,
-                linear_op=w1_linear,
-            )
-            w3_out = linear_deepseek_v3(
-                newx,
-                self.w3.weight[-1],
-                self.w3.scale[-1] if self.w3.scale is not None else None,
-                self.w3.bias[-1] if self.w3.bias is not None else None,
-                linear_op=w3_linear,
-            )
-            new_w1w3 = torch.cat(
-                (
-                    self.w1.weight[: -self.n_shared_experts],
-                    self.w3.weight[: -self.n_shared_experts],
-                ),
-                dim=1,
-            )
-            act = F.silu(w1_out) * w3_out
-
-        y = linear_deepseek_v3(
-            act,
-            self.w2.weight[-1],
-            self.w2.scale[-1] if self.w2.scale is not None else None,
-            self.w2.bias[-1] if self.w2.bias is not None else None,
-            linear_op=w2_linear,
-        )
-        y = y[:batch]
+        y = self.shared_experts(x)
         y1 = muxi_fused_experts(
             hidden_states=x,
-            w1=new_w1w3,
-            w2=new_w2,
+            w1=self.w1w3.weight,
+            w2=self.w2.weight,
             topk_weights=weights,
             topk_ids=indices,
             inplace=True,
-            w1_scale=(
-                self.w1w3.scale[: -self.n_shared_experts]
-                if self.w1w3.scale is not None
-                else None
-            ),
-            w2_scale=(
-                self.w2.scale[: -self.n_shared_experts]
-                if self.w2.scale is not None
-                else None
-            ),
+            w1_scale=self.w1w3.scale,
+            w2_scale=self.w2.scale,
             block_shape=[128, 128],
             soft_fp8=True if self.w1w3.scale is not None else False,
         )
@@ -1758,6 +1705,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         self.ffn = (
             MLPDeepSeekV3(
                 args,
+                role="standalone",
                 merge_gate_up=merge_qkv_gate_up,
                 op_impl=op_impl,
                 is_fp4=is_fp4,
@@ -1872,6 +1820,8 @@ class TransformerDeepSeekV3(Transformer):
         return [f"layers.{i}."]
 
     def _process_state_dict_for_merging_experts(self, checkpoint: Mapping[str, Any]):
+        fuse_shared_experts = get_global_args().infer.fuse_shared_experts
+
         new_checkpoint = {}
         for k in checkpoint.keys():
             replaced = False
@@ -1882,7 +1832,10 @@ class TransformerDeepSeekV3(Transformer):
                         parts = []
                         for i in range(self.params.n_routed_experts):
                             parts.append(checkpoint[prefix + f"experts.{i}.{w}.{part}"])
-                        parts.append(checkpoint[prefix + f"shared_experts.{w}.{part}"])
+                        if fuse_shared_experts:
+                            parts.append(
+                                checkpoint[prefix + f"shared_experts.{w}.{part}"]
+                            )
                         new_checkpoint[prefix + f"{w}.{part}"] = torch.stack(
                             parts, dim=0
                         )
@@ -1892,7 +1845,9 @@ class TransformerDeepSeekV3(Transformer):
                     break
             if replaced:
                 continue
-            if ".experts." in k or ".shared_experts." in k:
+            if ".experts." in k:
+                continue
+            if fuse_shared_experts and ".shared_experts." in k:
                 continue
             new_checkpoint[k] = checkpoint[k]
         return new_checkpoint
