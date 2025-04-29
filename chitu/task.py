@@ -294,16 +294,17 @@ class Task:
     def update_response(self, token: int, token_gpu, logit):
         # TODO: modify if generate more than one token at a time
         assert token is not None
-        self.response.append(token_gpu)
         if self.req._test_flag:
             self.req._test_add_logit(logit)
             self.req._test_add_token(token)
         if not self.req._test_standard_tokens == None:
             # print(token, "--->", self.req.standard_tokens[self.req.standard_it], "[ ", self.req.standard_it, " ]")
             token = self.req._test_standard_tokens[self.req._test_standard_it]
+            token_gpu = torch.tensor(token)
             self.req._test_standard_it = self.req._test_standard_it + 1
             if self.req._test_standard_it >= len(self.req._test_standard_tokens):
                 self.req.max_new_tokens = -1
+        self.response.append(token_gpu)
         self.next_token = token
         self.prefix_length += 1
         self.max_output_tokens -= 1
