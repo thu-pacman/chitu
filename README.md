@@ -1,144 +1,129 @@
-# Chitu
+# Chitu（赤兔）
 
-English | [中文](/docs/zh/README_zh.md)
+中文 | [English](/docs/en/README.md)
 
-Chitu is a high-performance inference framework for large language models, focusing on efficiency, flexibility, and availability.
+Chitu (赤兔) 是一个专注于效率、灵活性和可用性的高性能大语言模型推理框架。
 
-## News
+## 最新动态
 
-[2025/04/18] Added support for CPU+GPU hybrid inference.
+[2025/04/30] 发布 v0.3.0，新增 FP4 在线转 FP8、BF16 的高效算子实现，支持 DeepSeek-R1 671B 的 [FP4 量化版](https://huggingface.co/nvidia/DeepSeek-R1-FP4)。
 
-[2025/03/28] Provide FP8 to FP16 operators to support more GPUs.
+[2025/04/18] 发布 v0.2.2，新增 CPU+GPU 异构混合推理支持，新增多个算子的优化实现。
 
-[2025/03/21] Better support for QwQ-32B. QwQ-32B FP8 model will be available on [Huggingface](https://huggingface.co/qingcheng-ai/QWQ-32B-FP8).
+[2025/03/21] 更好地支持了 QwQ-32B，包括 [FP8 量化版](https://huggingface.co/qingcheng-ai/QWQ-32B-FP8)。
 
-[2025/03/14] Initial release of Chitu, supports DeepSeek-R1 671B, and provides efficient operators with online FP8 to BF16 conversion.
+[2025/03/14] 发布 v0.1.0，支持 DeepSeek-R1 671B，提供 FP8 在线转 BF16 的高效算子实现。
 
-## Introduction
+## 简介
 
-Chitu is a high-performance inference framework for large language models. Chitu supports various mainstream large language models, including DeepSeek, LLaMA series, Mixtral, and more. We focus on the following goals:
+Chitu (赤兔) 定位于「生产级大模型推理引擎」，充分考虑企业 AI 落地从小规模试验到大规模部署的渐进式需求，专注于提供以下重要特性：
 
-- **Efficiency**: We continue to develop and integrate latest optimizations for large language models, including GPU kernels, parallel strategies, quantizations and more.
-- **Flexibility**: We not only focus on the polular NVIDIA GPUs, but pay special attention to all kinds of hardware environments, including legacy GPUs, non-NVIDIA GPUs and CPUs. We aim to provide a versatile framework to encounter the diverse deploying requirements.
-- **Availability**: Chitu is ready and already deployed for real-world production.
+- **多元算力适配**：不仅支持 NVIDIA 最新旗舰到旧款的多系列产品，也为国产芯片提供优化支持。
+- **全场景可伸缩**：从纯 CPU 部署、单 GPU 部署到大规模集群部署，赤兔引擎提供可扩展的解决方案。
+- **长期稳定运行**：可应用于实际生产环境，稳定性足以承载并发业务流量。
 
+## 测试数据
 
-## Evaluation
-*Here we list Chitu's key results only. More comprehensive comparison and discussion will be given in our tech report.*
+### 在单机八卡 H20(96G) 服务器上部署 DeepSeek-R1-671B
 
-### Deploy DeepSeek-R1-671B on A800(40GB) cluster
+| 输出速率 token/s| chitu 0.3.0, 原版 FP8| chitu 0.3.0, FP4->FP8 | chitu 0.3.0, FP4->BF16 |
+|:---|:---|:---|:---|
+|bs=1| 24.30 | 20.70 | 19.78 |
+|bs=16| 203.71 | 89.56 | 110.68 |
+|bs=64| OOM | 237.20 | 232.14 |
+|bs=128| OOM | 360.80 | 351.73 |
+| **MMLU 得分** | 89.8 | 88.0 | 88.0 |
 
-|Configuration |6 nodes|3 nodes|
-|:---|:---|:---|
-|Framework+precision|chitu 0.1.0, BF16|Chitu 0.1.0, FP8|
-|Use cuda graph|29.8 output token/s|22.7 output token/s|
-|Do not use cuda graph|8.5 output token/s|7.0 output token/s|
+- 八卡机的显存总容量为768GB，而原版模型的权重需要接近700GB，因此可支持的并发数不大
+- FP4 量化版模型的权重仅需不到400GB的显存空间，因此可支持更大的并发数；也使得 GPU 配置为 8*64GB 的服务器可以轻松部署 671B 模型
+- 上表的性能测试使用的输入和输出长度均为 512 tokens
+- 在 MMLU 精度测试中，FP4 量化版得分 (88.0) 优于 INT8 量化版 (87.2) 和 INT4 量化版 (82.1) ，比原版降低约 2%
+- v0.3.0 版本中的 FP4->FP8/BF16 相关算子实现仍有性能提升空间，将在后续更新中进行优化
 
-- Data in the table are all output throughput of single request (bs=1)
-- For Chitu For example, the output speed of the FP8 model running with 3 nodes is comparable to the speed of the BF16 model running with 6 nodes
-- Whether to use cuda graph has a significant impact on performance. The performance of the Chitu has been significantly improved after using cuda graph
+### 在两机16卡 H20(96G) 服务器集群上部署 DeepSeek-R1-671B
 
-#### Comparison of BF16 and FP8 models running with Chitu
-
-|Batchsize|6 nodes, BF16 |3 nodes, FP8|
-|:---|:---|:---|
-|1| 29.8 token/s| 22.7 token/s| 
-|4| 78.8 token/s| 70.1 token/s| 
-|8| 129.8 token/s| 108.9 token/s| 
-|16| 181.4 token/s| 159.0 token/s| 
-|32| 244.1 token/s| 214.5 token/s| 
-
-- From the test data of different batch sizes, based on the Chitu engine, the output speed of the FP8 model running on 3 nodes is about 75%\~90% of that of the BF16 model running on 6 nodes, that is, the output per unit computing power has been improved by 1.5x\~1.8x
-- We believe that this is because the decoding process mainly depends on memory bandwidth. Using half of the GPU to access half of the data (the weight size of FP8 is half of that of BF16) will not take longer, and the reduction in GPU computing power will only have a small impact
-
-### Deploy DeepSeek-R1-671B on the H20 (96G) cluster
-
-#### Running on 2 nodes each with 8×H20
-
-| Output token/s|chitu 0.1.0, FP8|
+| 输出速率 token/s|chitu 0.1.0, 原版 FP8|
 |:---|:---|
 |bs=1|22.1|
 |bs=16|202.1|
 |bs=256|780.3|
 
-### CPU+GPU Hybrid Inference
+### 在 Xeon 8480P + H20(96G) 服务器上异构部署 DeepSeek-R1-671B (v0.2.2版本数据)
 
-First, pull the latest code and install with:
-
-```bash
-TORCH_CUDA_ARCH_LIST=9.0 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation ".[cpu,flash_mla]"
-```
-
-
-```bash
-torchrun --nproc_per_node 1 \
-    --master_port=22525 \
-    test/single_req_test.py \
-    models=DeepSeek-R1-Q4_K_M \
-    models.ckpt_dir=/data/nfs/DeepSeek-R1-Q4_K_M/ \
-    models.tokenizer_path=/data/nfs/DeepSeek-R1-bf16 \
-    infer.use_cuda_graph=True \
-    quant=gguf \
-    +cpu_layer_num=58 \
-    infer.tp_size=1 \
-    infer.pp_size=1 \
-    infer.cache_type=paged \
-    infer.attn_type=flash_mla \
-    infer.mla_absorb=absorb-without-precomp \
-    infer.max_reqs=1 \
-    infer.max_seq_len=256 \
-    request.max_new_tokens=100
-
-# CPU execution is accelerated with cpumoe
-```
-
-#### Performance Data for Hybrid Inference
-
-| MoE layers on GPU | GPUs | token/s (bs=1) | token/s (bs=16) | 
+| 完整放置于 GPU 的层数       | GPU 卡数 | output token/s (bs=1) | output token/s (bs=16) |
 |:---------------|:------|:---------------|:----------------|
 | 0    | 1    | 10.61          | 28.16            |
 | 24    | 2    | 14.04           | 42.57        |
 
+- 使用的模型是 DeepSeek-R1-671B 的 Q4 量化版本（INT4）
+- 性能瓶颈在 CPU 一侧，增加 GPU 数量后性能提升有限，建议采用更高端的 CPU 和主存
+- 适用于 GPU 显存受限且不需要高并发支持的场景
+- MMLU 测试得分约 83
 
-- 适合需要降低成本或GPU显存受限的场景
+### 在 A800(40GB) 集群上部署 DeepSeek-R1-671B
 
+|硬件环境|6 节点|3 节点|
+|:---|:---|:---|
+|框架+精度|chitu 0.1.0, BF16|Chitu 0.1.0, FP8|
+|使用 cuda graph|29.8 output token/s|22.7 output token/s|
+|不使用 cuda graph|8.5 output token/s|7.0 output token/s|
 
-## Getting started
+- 表格中数据均为单请求场景（bs=1）的输出速度
+- 对 Chitu 而言，使用3个节点运行FP8模型，其输出速度与使用6个节点运行BF16模型的速度是可比的
+- 对于单个请求的回答输出速度，是否使用 cuda graph 对性能有显著的影响，使用 cuda graph 后性能有明显提升
 
-For professional users and developers, please read [the full installation guide](/docs/en/DEVELOPMENT.md) for more details.
+|batchsize|6 节点, BF16 |3 节点, FP8|
+|:---|:---|:---|
+|1| 29.8 token/s| 22.7 token/s|
+|4| 78.8 token/s| 70.1 token/s|
+|8| 129.8 token/s| 108.9 token/s|
+|16| 181.4 token/s| 159.0 token/s|
+|32| 244.1 token/s| 214.5 token/s|
 
-### Install from Source
+- 从不同batchsize的测试数据来看，同样基于Chitu引擎，使用3节点运行FP8模型的输出速度约为使用6节点运行BF16模型的75%\~90%，即单位算力的产出获得了1.5x\~1.8x的提升
+- 这是由于解码Decoding过程主要依赖于访存带宽，使用一半的GPU去访问一半的数据（FP8的权重大小是BF16的一半）不会消耗更长的时间，GPU计算能力缩减只带来较小的影响
 
+## 快速入门
+
+以下是简单的安装使用说明，适用于在单机环境上快速验证。
+如果需要在更复杂的环境上运行，或需要获得更高的运行性能，请参阅[开发手册](/docs/zh/DEVELOPMENT.md)。
+
+### 从源码安装
+
+注意下面示例命令中的部分参数需要根据实际环境进行调整（见注释）。
 ```bash
+# 下载源码，注意使用 --recursive 选项获取第三方依赖
 git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
-
+# 如果下载很慢，试试在命令最后加上 “-i https://pypi.tuna.tsinghua.edu.cn/simple”
 pip install -r requirements-build.txt
-pip install -U torch --index-url https://download.pytorch.org/whl/cu124  # Change according to your CUDA version
-TORCH_CUDA_ARCH_LIST=8.6 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation . # Change `8.6` to your desired CUDA arch list.
+# 安装 torch，需要将 cu124 替换为实际的 cuda 版本号
+pip install -U torch --index-url https://download.pytorch.org/whl/cu124 
+# TORCH_CUDA_ARCH_LIST 的值可通过 python -c "import torch; print(torch.cuda.get_device_capability())" 查看
+TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation . 
 ```
 
-### List Supported Models
+### 查看支持的模型
 
 ```bash
 python3 script/print_supported_models.py
 ```
 
-### Single GPU Inference
+### 单 GPU 推理
 
 ```bash
 torchrun --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 models=DeepSeek-R1 models.ckpt_dir=/data/DeepSeek-R1 infer.pp_size=1 infer.tp_size=8
 ```
 
-### Hybrid Parallelism (TP+PP)
+### 混合并行 (TP+PP)
 
 ```bash
 torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=8 models=DeepSeek-R1 models.ckpt_dir=/data/DeepSeek-R1
 ```
 
-### Start a Service
+### 启动服务
 
 ```bash
-# Start service at localhost:21002
+# 在 localhost:21002 启动服务
 export WORLD_SIZE=8
 torchrun --nnodes 1 \
     --nproc_per_node 8 \
@@ -150,7 +135,6 @@ torchrun --nnodes 1 \
     infer.tp_size=8 \
     models=DeepSeek-R1 \
     models.ckpt_dir=/data/DeepSeek-R1 \
-    infer.attn_type=flash_infer \
     keep_dtype_in_checkpoint=True \
     infer.mla_absorb=absorb-without-precomp \
     infer.raise_lower_bit_float_to=bfloat16 \
@@ -161,7 +145,7 @@ torchrun --nnodes 1 \
     request.max_new_tokens=100 \
     infer.use_cuda_graph=True
 
-# Test the service
+# 测试服务
 curl localhost:21002/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -178,10 +162,10 @@ curl localhost:21002/v1/chat/completions \
   }'
 ```
 
-### Benchmarking
+### 性能测试
 
 ```bash
-# Comprehensive performance testing with benchmark_serving tool
+# 使用 benchmark_serving 工具进行全面性能测试
 python benchmarks/benchmark_serving.py \
     --model "deepseek-r1" \
     --iterations 10 \
@@ -190,39 +174,45 @@ python benchmarks/benchmark_serving.py \
     --base-url http://localhost:21002
 ```
 
+## 常见问题
 
-## FAQ (Frequently Asked Questions)
+[中文](/docs/zh/FAQ.md) | [English](/docs/en/FAQ.md)
 
-[English](/docs/en/FAQ.md) | [中文](/docs/zh/FAQ.md)
+## 贡献指南
 
-## Contributing
+我们欢迎各种形式的贡献！详情请参阅我们的[贡献指南](/docs/CONTRIBUTING.md)。
 
-We welcome contributions! Please see our [Contributing Guide](docs/CONTRIBUTING.md) for details.
+## 讨论
 
-## Discussion
-For any questions or concerns, you're welcome to create an issue. We also have an active WeChat group available for more detailed discussions.
-QR Code: 
+如有任何问题或疑虑，欢迎提交issue。我们也设有一个活跃的微信群，方便进行更详细的讨论。二维码如下：
 
-<img src="docs/WeChatGroup.png" width="30%">
+<img src="../WeChatGroup.png" width="30%">
 
-## License
+## 许可证
 
-The Chitu Project is under the Apache License v2.0. - see the [LICENSE](LICENSE) file for details.
+Chitu 项目采用 Apache License v2.0 许可证 - 详见 [LICENSE](/LICENSE) 文件。
 
-This repository also contains third party submodules under other open source
-licenses. You can find these submodules under `third_party/` directory, which
-contains their own license files.
+本代码仓库还包含遵循其他开源许可证的第三方子模块。你可以在 `third_party/` 目录下找到这些子模块，该目录中包含了它们各自的许可证文件。
 
+## 致谢
 
-## Acknowledgment
+在构建 Chitu 的过程中，我们从以下项目（按字母排序）中学到了很多，并复用了一些函数：
 
-We learned a lot from the following projects and adapted some functions when building Chitu:
-- [vLLM](https://github.com/vllm-project/vllm)
-- [SGLang](https://github.com/sgl-project/sglang)
 - [DeepSeek](https://github.com/deepseek-ai)
-- [KTransformers](https://github.com/kvcache-ai/ktransformers)
-- [llama.cpp](https://github.com/ggml-org/llama.cpp)
 - [FlashAttention](https://github.com/Dao-AILab/flash-attention)
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer)
+- [KTransformers](https://github.com/kvcache-ai/ktransformers)
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)
+- [SGLang](https://github.com/sgl-project/sglang)
+- [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)
+- [vLLM](https://github.com/vllm-project/vllm)
 
-Special thanks to our partners (Partners listed in no particular order): 中国电信、华为、沐曦、燧原, etc.
+我们也感谢来自各方的帮助：中国电信、华为、沐曦、燧原等。
+
+## 技术服务
+
+项目团队感谢广大用户及开源社区提出的宝贵意见和建议，并将持续改进赤兔推理引擎。
+
+然而，受制于团队成员的精力，无法保证及时解决所有用户在使用中遇到问题。
+
+如需专业技术服务，欢迎致信 solution@chitu.ai

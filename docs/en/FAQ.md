@@ -18,9 +18,8 @@ Chitu is more focused on aspects that existing open source projects do not take 
 We think it is a useful supplement to the open source ecosystem of large models.
 
 ### Q5: Which scenarios are suitable for Chitu and which are not
-As for the version v0.1.0, it is for users who have non-Hopper GPUs and want to run FP8 directly, such as users with A800 clusters.
-On the H20 platform, since the hardware already supports FP8 very well and there are already many excellent open source implementations, using Chitu will not immediately bring significant improvements.
-Of course, Chitu will continue to optimize its performance on platforms such as H20.
+As of chitu v0.3.0, Chitu is aimed at users who **do not** have the latest NVIDIA high-end GPU but want to run FP4 and FP8 models directly.
+Chitu can support online conversion of FP4 and FP8 data types on common GPU models such as A800 and H20.
 
-### Q6: Will Chitu support CPU serving or CPU+GPU serving?
-From the perspective of supporting the smooth expansion of serving system from small to large, YES. Please stay tuned.
+### Q6: Does Chitu support pure CPU inference or CPU+GPU inference?
+Starting from chitu v0.2.2, CPU+GPU heterogeneous inference is supported. Pure CPU inference support is in the plan.
