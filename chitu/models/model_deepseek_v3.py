@@ -217,7 +217,12 @@ class GroupColumnParallelLinearDeepSeekV3(torch.nn.Module):
         local_out_features = local_out_features = out_features // self.tp_size
 
         self.weight = torch.nn.Parameter(
-            torch.empty(group_size, local_out_features, in_features, dtype=dtype),
+            torch.empty(
+                group_size,
+                local_out_features,
+                in_features // 2 if is_fp4 else in_features,
+                dtype=dtype,
+            ),
             requires_grad=False,
         )
         if has_bias:
@@ -230,7 +235,7 @@ class GroupColumnParallelLinearDeepSeekV3(torch.nn.Module):
         if dtype.itemsize == 1:
             block_size = 128
             if is_fp4:
-                quant_scale_stride = 8
+                quant_scale_stride = 16
                 scale_out_features = local_out_features
                 scale_in_features = (
                     in_features + quant_scale_stride - 1
@@ -341,7 +346,12 @@ class GroupRowParallelLinearDeepSeekV3(torch.nn.Module):
         self.input_is_parallel = input_is_parallel
 
         self.weight = torch.nn.Parameter(
-            torch.empty(group_size, out_features, local_in_features, dtype=dtype),
+            torch.empty(
+                group_size,
+                out_features,
+                local_in_features // 2 if is_fp4 else local_in_features,
+                dtype=dtype,
+            ),
             requires_grad=False,
         )
         if has_bias:
@@ -354,7 +364,7 @@ class GroupRowParallelLinearDeepSeekV3(torch.nn.Module):
         if dtype.itemsize == 1:
             block_size = 128
             if is_fp4:
-                quant_scale_stride = 8
+                quant_scale_stride = 16
                 scale_out_features = out_features
                 scale_in_features = (
                     local_in_features + quant_scale_stride - 1
@@ -445,7 +455,6 @@ class AttentionDeepSeekV3(Attention):
         op_impl: str,
         mla_absorb,
         merge_qkv,
-        is_fp4,
     ):
         super().__init__(layer_id, cache, attn_backend)
         self.op_impl = op_impl
@@ -525,18 +534,27 @@ class AttentionDeepSeekV3(Attention):
                 ),
             )
         elif self.mla_absorb == "absorb-without-precomp":
+            quant_method = None if not hasattr(args, "quant") else args.quant
             self.wkv_b_absorb_1 = ParallelAbsorbGemm(
                 self.n_heads,
                 self.qk_nope_head_dim,
                 self.kv_lora_rank,
-                dtype=parse_dtype(args.main_weight_dtype),
+                dtype=(
+                    torch.bfloat16
+                    if quant_method == "blockfp4"
+                    else parse_dtype(args.main_weight_dtype)
+                ),
                 block_size=block_size,
             )
             self.wkv_b_absorb_2 = ParallelAbsorbGemm(
                 self.n_heads,
                 self.kv_lora_rank,
                 self.v_head_dim,
-                dtype=parse_dtype(args.main_weight_dtype),
+                dtype=(
+                    torch.bfloat16
+                    if quant_method == "blockfp4"
+                    else parse_dtype(args.main_weight_dtype)
+                ),
                 block_size=block_size,
             )
 
@@ -827,12 +845,10 @@ class MLPDeepSeekV3(nn.Module):
 
         if merge_gate_up:
             self.w1w3 = ColumnParallelLinear(
-                args.dim // 2 if is_fp4 else args.dim,
+                args.dim,
                 inter_dim * 2,
                 has_bias=False,
-                dtype=parse_dtype(
-                    args.main_weight_dtype, is_quant_layer=True
-                ),  # In fp4 quantization, dtype of MLP is float4_e2m1
+                dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_x_contig_y(op_impl),
@@ -843,19 +859,19 @@ class MLPDeepSeekV3(nn.Module):
                 )  # In merge gate up computation, scale_2 will also be cat into one Tensor
         else:
             self.w1 = ColumnParallelLinear(
-                args.dim // 2 if is_fp4 else args.dim,
+                args.dim,
                 inter_dim,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
+                dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_x_contig_y(op_impl),
             )
             self.w3 = ColumnParallelLinear(
-                args.dim // 2 if is_fp4 else args.dim,
+                args.dim,
                 inter_dim,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
+                dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_x_contig_y(op_impl),
@@ -864,10 +880,10 @@ class MLPDeepSeekV3(nn.Module):
                 self.w1.register_scale_2_param()
                 self.w3.register_scale_2_param()
         self.w2 = RowParallelLinear(
-            inter_dim // 2 if is_fp4 else inter_dim,
+            inter_dim,
             args.dim,
             has_bias=False,
-            dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
+            dtype=parse_dtype(args.main_weight_dtype),
             bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
             reduce_output=(role == "standalone"),
@@ -1043,10 +1059,10 @@ class MoEDeepSeekV3(nn.Module):
                 self.experts_end_idx
                 - self.experts_start_idx
                 + self.n_fused_shared_experts,
-                args.dim // 2 if is_fp4 else args.dim,
+                args.dim,
                 args.moe_inter_dim * 2,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
+                dtype=parse_dtype(args.main_weight_dtype),
                 is_fp4=is_fp4,
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
@@ -1057,10 +1073,10 @@ class MoEDeepSeekV3(nn.Module):
                 self.experts_end_idx
                 - self.experts_start_idx
                 + self.n_fused_shared_experts,
-                args.dim // 2 if is_fp4 else args.dim,
+                args.dim,
                 args.moe_inter_dim,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
+                dtype=parse_dtype(args.main_weight_dtype),
                 is_fp4=is_fp4,
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
@@ -1069,20 +1085,20 @@ class MoEDeepSeekV3(nn.Module):
                 self.experts_end_idx
                 - self.experts_start_idx
                 + self.n_fused_shared_experts,
-                args.dim // 2 if is_fp4 else args.dim,
+                args.dim,
                 args.moe_inter_dim,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
+                dtype=parse_dtype(args.main_weight_dtype),
                 is_fp4=is_fp4,
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
             )
         self.w2 = GroupRowParallelLinearDeepSeekV3(
             self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts,
-            args.moe_inter_dim // 2 if is_fp4 else args.moe_inter_dim,
+            args.moe_inter_dim,
             args.dim,
             has_bias=False,
-            dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
+            dtype=parse_dtype(args.main_weight_dtype),
             is_fp4=is_fp4,
             bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
@@ -1691,7 +1707,6 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             op_impl=op_impl,
             mla_absorb=mla_absorb,
             merge_qkv=merge_qkv_gate_up,
-            is_fp4=is_fp4,
         )
         self.ffn = (
             MLPDeepSeekV3(

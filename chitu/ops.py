@@ -1,4 +1,5 @@
 import struct
+import packaging
 from typing import Tuple, Optional
 
 import torch
@@ -782,6 +783,10 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3(
     Returns:
         torch.Tensor: The result of the matrix multiplication.
     """
+
+    if packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"):
+        raise ImportError("Triton version >= 3.2.0 is required for soft fp4")
+
     assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
     assert a_s.is_contiguous(), "Scaling factor of A must be contiguous"
     assert b_s.is_contiguous(), "Scaling factor tensor must be contiguous"
@@ -833,6 +838,10 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3(
     Returns:
         torch.Tensor: The result of the matrix multiplication.
     """
+
+    if packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"):
+        raise ImportError("Triton version >= 3.2.0 is required for soft fp4")
+
     assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
     assert b_s.is_contiguous(), "Scaling factor tensor must be contiguous"
     K = a.size(-1)

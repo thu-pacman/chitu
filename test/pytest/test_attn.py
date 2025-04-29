@@ -1,5 +1,6 @@
 import torch
 import pytest
+import packaging
 from omegaconf import OmegaConf
 import flashinfer
 
@@ -121,7 +122,10 @@ def test_triton_mla_attn(
     assert torch.allclose(y, y_ref, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.skipif(flashinfer.__version__ < "0.2.0", reason="flashinfer is too old")
+@pytest.mark.skipif(
+    packaging.version.parse(flashinfer.__version__) < packaging.version.parse("0.2.0"),
+    reason="flashinfer is too old",
+)
 @pytest.mark.parametrize("cu_seqlens_qk", [[0, 9, 22, 33]])
 @pytest.mark.parametrize("n_heads", [4])
 @pytest.mark.parametrize("n_kv_heads", [1])
@@ -185,7 +189,10 @@ def test_flashinfer_attn_varlen_func(cu_seqlens_qk, n_heads, n_kv_heads, head_di
     assert torch.allclose(flashinfer_out, ref_out, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.skipif(flashinfer.__version__ < "0.2.0", reason="flashinfer is too old")
+@pytest.mark.skipif(
+    packaging.version.parse(flashinfer.__version__) < packaging.version.parse("0.2.0"),
+    reason="flashinfer is too old",
+)
 @pytest.mark.parametrize("cache_seqlens", [[509, 19, 15, 22]])
 @pytest.mark.parametrize("n_heads", [4])
 @pytest.mark.parametrize("n_kv_heads", [1])

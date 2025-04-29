@@ -109,7 +109,6 @@ def get_config_dir_path():
 
 def parse_dtype(
     name: str,
-    is_quant_layer: Optional[bool] = False,
 ) -> torch.dtype:
     if name == "float16":
         return torch.float16
@@ -118,9 +117,6 @@ def parse_dtype(
     elif name == "float8_e4m3fn":
         return torch.float8_e4m3fn
     elif name == "float4_e2m1":
-        if is_quant_layer:
-            return torch.uint8
-        else:
-            return torch.bfloat16
+        return torch.uint8
     else:
         assert False

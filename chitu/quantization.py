@@ -877,7 +877,7 @@ class Blockfp4Linear(QuantizedLinearBase):
         has_bias: bool = False,
         dtype=torch.uint8,
         bias_dtype=None,
-        block_size=8,
+        block_size=16,
         scale_2_dim=1,
         **kwargs,
     ):
@@ -892,7 +892,13 @@ class Blockfp4Linear(QuantizedLinearBase):
         self.register_parameter(
             "weight",
             torch.nn.Parameter(
-                torch.empty((out_features, in_features), dtype=dtype),
+                torch.empty(
+                    (
+                        out_features,
+                        in_features // 2,  # Every 2 float4 is packed into 1 uint8
+                    ),
+                    dtype=dtype,
+                ),
                 requires_grad=False,
             ),
         )
