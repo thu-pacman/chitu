@@ -3,13 +3,15 @@
 
 从源码进行安装。注意下面示例命令中的部分参数需要根据实际环境进行调整（见注释）。
 ```bash
+# 下载源码，注意使用 --recursive 选项获取第三方依赖
+git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
 # 如果下载很慢，试试在命令最后加上 “-i https://pypi.tuna.tsinghua.edu.cn/simple”
 pip install -r requirements-build.txt
 # 安装 torch，需要将 cu124 替换为实际的 cuda 版本号
 pip install -U torch --index-url https://download.pytorch.org/whl/cu124 
 # TORCH_CUDA_ARCH_LIST 的值可通过 python -c "import torch; print(torch.cuda.get_device_capability())" 查看
 # ".[flashinfer,flash_mla]" 为可选安装项，如果都不需要，替换为 "." 即可，下文有更多说明
-TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=4 pip install --no-build-isolation ".[flashinfer,flash_mla]" 
+TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation ".[flashinfer,flash_mla]" 
 ```
 
 当前支持的可选安装项有:
@@ -21,13 +23,13 @@ TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=4 pip install --no-build-isolation ".[flashinf
 如果需要用于开发，建议加上 `-e` 选项启用 editable install，如
 
 ```bash
-TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=4 pip install --no-build-isolation -e .
+TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation -e .
 ```
 
 可以通过 `CHITU_WITH_CYTHON=1` 使用 Cython 对 Python 代码进行编译，如：
 
 ```bash
-TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=4 CHITU_WITH_CYTHON=1 pip install --no-build-isolation .
+TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 CHITU_WITH_CYTHON=1 pip install --no-build-isolation .
 ```
 
 注意：
@@ -44,7 +46,8 @@ TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=4 CHITU_WITH_CYTHON=1 pip install --no-build-i
 
 您也可以选择将 `test/` 目录复制到您想要的位置以运行它们。
 
-## 测试
+## 运行和测试
+=======
 
 默认的配置文件为 `chitu/config/serve_config.yaml` 。您可以使用命令行参数覆盖相关的参数设置，也可以使用环境变量 `CONFIG_NAME=<your_config_file.yaml>` 另行指定配置文件。
 需要提醒的是，`chitu/config/models/` 目录中的 yaml 文件并非完整的配置文件，切勿直接将 `CONFIG_NAME` 指向它们。
@@ -167,6 +170,40 @@ torchrun <torchrun_arguments> test/single_req_test.py infer.tp_size=2 models.ckp
 PREPROCESS_AND_SAVE_DIR=<target_directory> [CONFIG_NAME=<config_file>] torchrun <torchrun_arguments> script/preprocess_and_save.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> quant_on_load=True
 [CONFIG_NAME=<config_file>] torchrun <torchrun_arguments> test/single_req_test.py models=<模型名称> models.ckpt_dir=<路径/到/检查点> quant_ckpt_dir=<目标目录>
 ```
+
+
+**使用 CPU+GPU 异构混合推理**
+
+赤兔支持 CPU 和 GPU 异构混合推理，可以根据实际硬件资源和性能需求灵活配置。以下是一个简单的示例：
+
+首先拉取最新代码，进行安装，以 H20 机器为例
+
+```bash
+TORCH_CUDA_ARCH_LIST=9.0 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation ".[cpu,flash_mla]"
+```
+
+然后参考下面的启动脚本，其中`+cpu_layer_num=58`表示将其中58层的MoE部分放在CPU上进行运算，可根据GPU显存的容量适当设定层数。
+
+```bash
+torchrun --nproc_per_node 1 \
+    --master_port=22525 \
+    test/single_req_test.py \
+    models=DeepSeek-R1-Q4_K_M \
+    models.ckpt_dir=/data/nfs/DeepSeek-R1-Q4_K_M/ \
+    models.tokenizer_path=/data/nfs/DeepSeek-R1-bf16 \
+    infer.use_cuda_graph=True \
+    quant=gguf \
+    +cpu_layer_num=58\
+    infer.tp_size=1 \
+    infer.pp_size=1 \
+    infer.cache_type=paged \
+    infer.attn_type=flash_mla \
+    infer.mla_absorb=absorb-without-precomp \
+    infer.max_reqs=1 \
+    infer.max_seq_len=256 \
+    request.max_new_tokens=100
+```
+
 
 ## 部署推理服务
 

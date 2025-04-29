@@ -2,21 +2,22 @@
 ## Installation
 
 ```bash
+git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
 pip install -r requirements-build.txt
 pip install -U torch --index-url https://download.pytorch.org/whl/cu124 # Install torch. Change `cu124` to your cuda version.
-TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=4 pip install --no-build-isolation . # Install this repo. Change `8.6` to your desired CUDA arch list.
+TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation . # Install this repo. Change `8.6` to your desired CUDA arch list.
 ```
 
 Append `-e` to `pip install` for editable install. Example:
 
 ```bash
-TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=4 pip install --no-build-isolation -e .
+TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation -e .
 ```
 
 Append `[optional-dependency-name]` after `.` for optional dependencies. Example:
 
 ```bash
-TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=4 pip install --no-build-isolation ".[flash_mla]"
+TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation ".[flash_mla]"
 ```
 
 Currently supported optional dependencies are:
@@ -27,7 +28,7 @@ Currently supported optional dependencies are:
 Set `CHITU_WITH_CYTHON=1` to compile Python sources with Cython. Example:
 
 ```bash
-TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=4 CHITU_WITH_CYTHON=1 pip install --no-build-isolation .
+TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 CHITU_WITH_CYTHON=1 pip install --no-build-isolation .
 ```
 
 Note:
@@ -173,6 +174,39 @@ PREPROCESS_AND_SAVE_DIR=<target_directory> [CONFIG_NAME=<config_file>] torchrun 
 ```bash
 bash ./script/run_deepseek_mla.sh
 ```
+
+**CPU+GPU Hybrid Deployment**
+
+Chitu supports CPU and GPU heterogeneous hybrid deployment, which can be flexibly configured according to actual hardware resources and performance requirements. The following is a simple example:
+
+First pull the latest code and install it, taking the H20 machine as an example
+
+```bash
+TORCH_CUDA_ARCH_LIST=9.0 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation ".[cpu,flash_mla]"
+```
+
+Then refer to the startup script below, where `+cpu_layer_num=58` means that the MoE parts of 58 layers are placed on the CPU for calculation, and the number of layers can be appropriately set according to the capacity of the GPU video memory.
+
+```bash
+torchrun --nproc_per_node 1 \ 
+--master_port=22525 \ 
+test/single_req_test.py \ 
+models=DeepSeek-R1-Q4_K_M \ 
+models.ckpt_dir=/data/nfs/DeepSeek-R1-Q4_K_M/ \ 
+models.tokenizer_path=/data/nfs/DeepSeek-R1-bf16 \ 
+infer.use_cuda_graph=True \ 
+quant=gguf \ 
++cpu_layer_num=58\ 
+infer.tp_size=1 \ 
+infer.pp_size=1 \ 
+infer.cache_type=paged \ 
+infer.attn_type=flash_mla \ 
+infer.mla_absorb=absorb-without-precomp \ 
+infer.max_reqs=1 \ infer.max_seq_len=256 \ 
+request.max_new_tokens=100
+```
+
+
 
 ## Start a Service
 
