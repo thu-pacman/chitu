@@ -14,10 +14,15 @@ import torch
 
 from chitu.global_vars import get_global_args
 from chitu.ops import append_to_paged_kv_cache, append_to_non_paged_kv_cache
-from chitu.triton_decode_attention import mla_decode, mla_decode_non_paged
+from chitu.triton_decode_attention import (
+    mla_decode,
+    mla_decode_non_paged,
+    decode_attention_fwd,
+)
 from chitu.utils import try_import_opt_dep
 from chitu.static_tensor import StaticTensor
 from chitu.triton_flash_attention import context_attention_fwd
+from chitu.device_type import is_muxi
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
@@ -1086,7 +1091,18 @@ class TritonAttnBackend(RefAttnBackend):
             device=q_nope.device,
         )
 
-        num_kv_splits = 4
+        num_kv_splits = None
+        if is_muxi():
+            if B > 32:
+                num_kv_splits = 3
+            elif B > 1:
+                num_kv_splits = 8
+            else:
+                num_kv_splits = 16
+        else:
+            num_kv_splits = 4
+
+        assert num_kv_splits is not None
 
         attn_logits = torch.empty(
             (
@@ -1100,34 +1116,26 @@ class TritonAttnBackend(RefAttnBackend):
         )
 
         assert kv_cache.ndim == 3  # (num_blocks, block_size, dim)
-        kv_c_and_k_pe_cache = kv_cache
-        kv_c_cache = kv_c_and_k_pe_cache[..., :kv_lora_rank]
-        k_pe_cache = kv_c_and_k_pe_cache[..., kv_lora_rank:]
 
+        if is_muxi():
+            kv_c_and_k_pe_cache = kv_cache.unsqueeze(2)  # Add a head dim of 1
+        else:
+            kv_c_and_k_pe_cache = kv_cache
+            k_pe_cache = kv_c_and_k_pe_cache[..., kv_lora_rank:]
+
+        kv_c_cache = kv_c_and_k_pe_cache[..., :kv_lora_rank]
         PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
 
         if softmax_scale is None:
             assert self.qk_nope_head_dim is not None
             softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
 
-        if block_table is None:
-            mla_decode_non_paged(
-                q_nope,
-                q_pe,
+        if is_muxi():
+            q = torch.cat([q_nope, q_pe], dim=-1)
+            decode_attention_fwd(
+                q,
+                kv_c_and_k_pe_cache,
                 kv_c_cache,
-                k_pe_cache,
-                o,
-                cache_seqlens_incl_this_decode,
-                attn_logits,
-                num_kv_splits,
-                softmax_scale,
-            )
-        else:
-            mla_decode(
-                q_nope,
-                q_pe,
-                kv_c_cache,
-                k_pe_cache,
                 o,
                 block_table,
                 cache_seqlens_incl_this_decode,
@@ -1136,5 +1144,32 @@ class TritonAttnBackend(RefAttnBackend):
                 softmax_scale,
                 PAGE_SIZE,
             )
+        else:
+            if block_table is None:
+                mla_decode_non_paged(
+                    q_nope,
+                    q_pe,
+                    kv_c_cache,
+                    k_pe_cache,
+                    o,
+                    cache_seqlens_incl_this_decode,
+                    attn_logits,
+                    num_kv_splits,
+                    softmax_scale,
+                )
+            else:
+                mla_decode(
+                    q_nope,
+                    q_pe,
+                    kv_c_cache,
+                    k_pe_cache,
+                    o,
+                    block_table,
+                    cache_seqlens_incl_this_decode,
+                    attn_logits,
+                    num_kv_splits,
+                    softmax_scale,
+                    PAGE_SIZE,
+                )
 
         return o.view(B, 1, local_n_heads, -1)
