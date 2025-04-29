@@ -22,8 +22,8 @@ fi
 COMMAND=${@:4}
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-MASTER_PORT=$(($SLURM_JOB_ID+52000))
-RDVZ_PORT=$(($SLURM_JOB_ID+53000))
+MASTER_PORT=$((($SLURM_JOB_ID % 10000)+52000))
+RDVZ_PORT=$((($SLURM_JOB_ID % 10000) +53000))
 RDVZ_ID=chitu
 
 echo prepare torchrun on node $(hostname) 

@@ -738,7 +738,7 @@ class Blockfp8Linear(QuantizedLinearBase):
 
 class Blockfp4Linear(QuantizedLinearBase):
     """
-    block 8-bit weight and activation quantized linear layer.
+    block 4-bit weight and activation quantized linear layer.
     """
 
     def __init__(
@@ -776,7 +776,7 @@ class Blockfp4Linear(QuantizedLinearBase):
                 torch.empty(
                     scale_out_features,
                     scale_in_features,
-                    dtype=torch.float8_e4m3fn,
+                    dtype=torch.uint8,
                 ),
                 requires_grad=False,
             ),

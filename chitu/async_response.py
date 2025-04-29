@@ -31,14 +31,21 @@ class AsyncDataStream:
         self.data_event = asyncio.Event()
         self.is_reasoning = False
         self.reasoning_len = 0
+        self.top_logprobs_list = []
+        self.top_tokens_list = []
 
-    def add_data(self, value: int):
+    def add_data(self, value: int, top_logprobs=None, top_token_idx=None):
         with self.lock:
             if self.reasoning_handle(value):
                 return
             self.tokens_len += 1
             self.cache_tokens.append(value)
             s = self.tokenizer.decode(self.cache_tokens)
+            top_tokens = (
+                [self.tokenizer.decode(token_idx) for token_idx in top_token_idx]
+                if top_token_idx
+                else None
+            )
             if "\ufffd" in s:
                 return
             if not self.tokenizer.force_full_seq_decode:
@@ -48,6 +55,9 @@ class AsyncDataStream:
             else:
                 self.seqs.append(s[self.chars_len :])
                 self.chars_len = len(s)
+            if top_logprobs:
+                self.top_logprobs_list.append(top_logprobs)
+                self.top_tokens_list.append(top_tokens)
         self.data_event.set()
 
     def send_stop_signal(self):
@@ -82,8 +92,14 @@ class AsyncDataStream:
                     raise StopAsyncIteration
                 if self.index < len(self.seqs):
                     result = self.seqs[self.index]
+                    if self.index < len(self.top_logprobs_list):
+                        top_logprobs = self.top_logprobs_list[self.index]
+                        top_tokens = self.top_tokens_list[self.index]
+                    else:
+                        top_logprobs = None
+                        top_tokens = None
                     self.index += 1
-                    return result
+                    return result, top_logprobs, top_tokens
             self.data_event.clear()
             await self.data_event.wait()
 
@@ -96,19 +112,39 @@ class AsyncResponse:
 
     def stream_generator(self):
         async def stream_response():
-            async for data in self.async_stream:
+            async for data, top_logprobs, top_tokens in self.async_stream:
                 if data:
                     delta = {}
                     if self.async_stream.is_reasoning_content():
                         delta["reasoning_content"] = f"{data}"
                     else:
                         delta["content"] = f"{data}"
+                    if self.req.logprobs:
+                        logprobs = {"content": []}
+                        logprobs["content"].append(
+                            {
+                                "token": top_tokens[0],
+                                "logprob": top_logprobs[0],
+                                "top_logprobs": [],
+                            }
+                        )
+                        if self.req.top_logprobs > 0:
+                            for logprob, token in zip(top_logprobs, top_tokens):
+                                logprobs["content"][-1]["top_logprobs"].append(
+                                    {
+                                        "token": token,
+                                        "logprob": logprob,
+                                    }
+                                )
+                    else:
+                        logprobs = None
                     chunk = ChatCompletionResponse(
                         id=self.id,
                         choices=[
                             {
                                 "index": 0,
                                 "delta": delta,
+                                "logprobs": logprobs,
                                 "finish_reason": None,
                                 "time_stamp": datetime.now().strftime("%H:%M:%S:%f"),
                             }
@@ -143,8 +179,13 @@ class AsyncResponse:
 
     async def full_generator(self):
         text = []
-        async for data in self.async_stream:
+        top_logprobs_list = []
+        top_tokens_list = []
+        async for data, top_logprobs, top_tokens in self.async_stream:
             text.append(data)
+            if self.req.logprobs:
+                top_logprobs_list.append(top_logprobs)
+                top_tokens_list.append(top_tokens)
         r_len = self.async_stream.reasoning_len
         message = {}
         message["role"] = "assistant"
@@ -153,9 +194,30 @@ class AsyncResponse:
             message["reasoning_content"] = "".join(text[:r_len])
         message["content"] = "".join(text[r_len:])
 
+        if self.req.logprobs:
+            logprobs = {"content": []}
+            for top_logprobs, top_tokens in zip(top_logprobs_list, top_tokens_list):
+                logprobs["content"].append(
+                    {
+                        "token": top_tokens[0],
+                        "logprob": top_logprobs[0],
+                        "top_logprobs": [],
+                    }
+                )
+                if self.req.top_logprobs > 0:
+                    for logprob, token in zip(top_logprobs, top_tokens):
+                        logprobs["content"][-1]["top_logprobs"].append(
+                            {
+                                "token": token,
+                                "logprob": logprob,
+                            }
+                        )
+        else:
+            logprobs = None
+
         full_response = ChatCompletionResponse(
             id=self.id,
-            choices=[{"index": 0, "message": message}],
+            choices=[{"index": 0, "message": message, "logprobs": logprobs}],
             usage={
                 "prompt_tokens": f"{self.req.prompt_len}",
                 "completion_tokens": f"{self.async_stream.tokens_len}",

@@ -389,8 +389,6 @@ class Backend:
         merge_qkv_gate_up = True
         if args.models.type == "llama":
             merge_qkv_gate_up = False  # Not yet supported
-        if args.models.name == "QwQ-32B-FP8":
-            merge_qkv_gate_up = False  # FIXME
 
         if hasattr(args.models, "quant") and args.models.quant not in [
             None,
@@ -540,12 +538,14 @@ class Backend:
         # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
         # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
         if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
-            if (
-                hasattr(args.models, "quant") and args.models.quant == "blockfp8"
-            ):  # FIXME: Also blockfp4
+            if hasattr(args.models, "quant") and args.models.quant == "blockfp8":
                 for k in checkpoint.keys():
                     if checkpoint[k].element_size() == 1:
                         checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
+        if hasattr(args.models, "quant") and args.models.quant == "blockfp4":
+            for k in checkpoint.keys():
+                if checkpoint[k].element_size() == 1:
+                    checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
 
         if args.models.type == "deepseek-v3" and args.quant in [
             "gguf",

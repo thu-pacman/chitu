@@ -13,9 +13,6 @@ from chitu.global_vars import set_global_args
 from chitu.device_type import is_nvidia
 
 
-set_global_args(OmegaConf.create({"infer": {"soft_fp8": False}}))
-
-
 def check_close(x, y):
     x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
@@ -31,6 +28,7 @@ def check_close(x, y):
 def test_quant_einsum_shc_hdc_shd(
     n_heads, batch_size, in_feats, out_feats, compute_dtype, soft_fp8
 ):
+    set_global_args(OmegaConf.create({"infer": {"soft_fp8": False}}), need_ensure=False)
     torch.set_default_dtype(compute_dtype)
     if not soft_fp8 and (
         not is_nvidia() or not torch.cuda.get_device_capability() >= (9, 0)

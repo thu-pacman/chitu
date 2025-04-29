@@ -142,6 +142,7 @@ def RowParallelLinear(
     out_features: int,
     has_bias: bool = True,
     input_is_parallel: bool = False,
+    reduce_output: bool = True,
     dtype=None,
     bias_dtype=None,
     *,
@@ -177,6 +178,7 @@ def RowParallelLinear(
         out_features=out_features,
         has_bias=has_bias,
         input_is_parallel=input_is_parallel,
+        reduce_output=reduce_output,
         dtype=dtype,
         bias_dtype=bias_dtype,
     )
@@ -248,6 +250,7 @@ class RowParallelLinearMixIn:
         out_features: int,
         has_bias: bool = True,
         input_is_parallel: bool = False,
+        reduce_output: bool = True,
         dtype=None,
         bias_dtype=None,
     ):
@@ -259,6 +262,7 @@ class RowParallelLinearMixIn:
             out_features: size of each output sample
             has_bias: If set to True, the layer will have a bias.
             input_is_parallel: If set to True, the input tensor is already parallelized.
+            reduce_output: If set to True, an all-reduce operation is performed on the output tensor.
             dtype: The desired data type of the parameters.
             bias_dtype: The desired data type of the bias. Defaults to `dtype`.
         """
@@ -279,6 +283,7 @@ class RowParallelLinearMixIn:
         )
 
         self.input_is_parallel = input_is_parallel
+        self.reduce_output = reduce_output
         self.local_in_features = local_in_features
         self.tp_group = tp_group
         self.tp_size = tp_size
@@ -298,7 +303,7 @@ class RowParallelLinearMixIn:
 
         y = super().forward(x)
 
-        if self.tp_size > 1:
+        if self.reduce_output and self.tp_size > 1:
             if dst == -1:
                 torch.distributed.all_reduce(y, group=self.tp_group)
             else:

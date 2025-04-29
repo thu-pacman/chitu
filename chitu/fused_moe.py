@@ -225,7 +225,15 @@ def fused_moe_kernel_soft_fp4(
         else:
             b_scale2 = tl.load(b_scale2_ptr + off_experts)
 
-    fp4_to_fp8_scale = 64.0
+    fp8_to_bf16_scale = 0x7B800000
+    fp8_to_bf16_scale = fp8_to_bf16_scale.to(tl.float32, bitcast=True).to(tl.bfloat16)
+    if soft_fp8:
+        fp4_to_bf16_scale = 0x7E800000
+        fp4_to_bf16_scale = fp4_to_bf16_scale.to(tl.float32, bitcast=True).to(
+            tl.bfloat16
+        )
+    else:
+        fp4_to_fp8_scale = 64.0
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -253,21 +261,28 @@ def fused_moe_kernel_soft_fp4(
         if group_k > 0 and group_n > 0:
             k_start = k * BLOCK_SIZE_K
             offs_ks = k_start // group_k
-            b_scale_1 = tl.load(b_scale_ptrs)
-            b_scale_2 = tl.load(b_scale_ptrs + num_b_s_in_block // 2)
+            b_scale_1 = tl.load(b_scale_ptrs).to(tl.uint16)
+            b_scale_2 = tl.load(b_scale_ptrs + num_b_s_in_block // 2).to(tl.uint16)
+            bf16_s_1 = ((b_scale_1 & 0x0080) << 8) | ((b_scale_1 & 0x007F) << 4)
+            bf16_s_2 = ((b_scale_2 & 0x0080) << 8) | ((b_scale_2 & 0x007F) << 4)
+            b_scale_1 = bf16_s_1.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
+            b_scale_2 = bf16_s_2.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
             if soft_fp8:
-                fp8_weight_1 = ((b & 0x08) << 4) | ((b & 0x07) << 2)
-                fp8_weight_1 = (
-                    fp8_weight_1.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+                b = b.to(tl.uint16)
+                bf16_weight_1 = ((b & 0x08) << 12) | ((b & 0x07) << 6)
+                bf16_weight_1 = (
+                    bf16_weight_1.to(tl.bfloat16, bitcast=True)
                     * b_scale_1
+                    * fp4_to_bf16_scale
                 )
-                accumulator += tl.dot(a_1, fp8_weight_1)
-                fp8_weight_2 = (b & 0x80) | ((b & 0x70) >> 2)
-                fp8_weight_2 = (
-                    fp8_weight_2.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+                accumulator += tl.dot(a_1, bf16_weight_1)
+                bf16_weight_2 = ((b & 0x80) << 8) | ((b & 0x70) << 2)
+                bf16_weight_2 = (
+                    bf16_weight_2.to(tl.bfloat16, bitcast=True)
                     * b_scale_2
+                    * fp4_to_bf16_scale
                 )
-                accumulator += tl.dot(a_2, fp8_weight_2)
+                accumulator += tl.dot(a_2, bf16_weight_2)
             else:
                 a_scale = tl.load(
                     a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
@@ -296,7 +311,10 @@ def fused_moe_kernel_soft_fp4(
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
-    accumulator = accumulator * fp4_to_fp8_scale * b_scale2
+    if soft_fp8:
+        accumulator = accumulator * b_scale2
+    else:
+        accumulator = accumulator * fp4_to_fp8_scale * b_scale2
     accumulator = accumulator.to(compute_type)
     # -----------------------------------------------------------
     # Write back the block of the output

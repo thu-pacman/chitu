@@ -14,9 +14,8 @@ from chitu.muxi_utils import (
     LinearLayoutNativeXContigY,
     Blockfp8LinearLayoutContigXContigY,
     preprocess_weights_for_native_layout,
-    get_muxi_padded_input,
 )
-from chitu.ops import apply_rotary_pos_emb
+from chitu.ops import apply_rotary_pos_emb, silu_and_mul
 from chitu.tensor_parallel import (
     LocalLinear,
     ColumnParallelLinear,
@@ -35,6 +34,9 @@ def get_rms_norm_impl():
     # These models are extremely sensitive to the implementation of RMSNorm. We always use "ref" as
     # a stable implementation. Feel free to remove this if you have find some other ways to make the
     # model stable.
+    #
+    # FIXME: We have found some bugs on our regression test. If the sensitivity is a false positive,
+    # remove this.
     args = get_global_args()
     if args.models.name == "Mixtral-8x7B-Instruct-v0.1":
         impl = "ref"
@@ -118,16 +120,8 @@ class AttentionHFLlama(Attention):
         )
 
     def _run_linear(self, x):
-        if self.op_impl == "muxi_custom_kernel":
-            x_shape = x.shape
-            x = x.reshape(-1, x.shape[-1])
-            n = x.shape[0]
-            x = get_muxi_padded_input(x)
         if self.merge_qkv:
             qkv = self.qkv_proj(x)
-            if self.op_impl == "muxi_custom_kernel":
-                qkv = qkv[:n, :]
-                qkv = qkv.reshape(x_shape[:-1] + (qkv.shape[-1],))
             q, k, v = qkv.split(
                 [
                     self.n_local_heads * self.head_dim,
@@ -140,26 +134,10 @@ class AttentionHFLlama(Attention):
             q = self.q_proj(x)
             k = self.k_proj(x)
             v = self.v_proj(x)
-            if self.op_impl == "muxi_custom_kernel":
-                q = q[:n, :]
-                k = k[:n, :]
-                v = v[:n, :]
-                q = q.reshape(x_shape[:-1] + (q.shape[-1],))
-                k = k.reshape(x_shape[:-1] + (k.shape[-1],))
-                v = v.reshape(x_shape[:-1] + (v.shape[-1],))
         return q, k, v
 
     def _run_output_linear(self, x):
-        if self.op_impl == "muxi_custom_kernel":
-            x_shape = x.shape
-            x = x.reshape(-1, x.shape[-1])
-            n = x.shape[0]
-            x = get_muxi_padded_input(x)
-        y = self.o_proj(x)
-        if self.op_impl == "muxi_custom_kernel":
-            y = y[:n, :]
-            y = y.reshape(x_shape[:-1] + (y.shape[-1],))
-        return y
+        return self.o_proj(x)
 
     def prefill_forward(
         self,
@@ -313,28 +291,31 @@ class FeedForwardHFLlama(nn.Module):
         )
 
     def forward(self, x):
-        if self.op_impl == "muxi_custom_kernel":
-            x_shape = x.shape
-            x = x.reshape(-1, x_shape[-1])
-            n = x.shape[0]
-            x = get_muxi_padded_input(x)
         if self.merge_gate_up:
-            gate_up_out = self.gate_up_proj(x)
-            if self.op_impl == "muxi_custom_kernel":
-                gate_out = gate_up_out[: gate_up_out.shape[0] // 2]
-                up_out = gate_up_out[gate_up_out.shape[0] // 2 :]
+            # These models are extremely sensitive to the implementation of silu_and_mul. We always use
+            # "torch" as a stable implementation. Feel free to remove this if you have find some other
+            # ways to make the model stable.
+            #
+            # FIXME: We have found some bugs on our regression test. If the sensitivity is a false
+            # positive, remove this.
+            args = get_global_args()
+            if (
+                args.models.name == "Mixtral-8x7B-Instruct-v0.1"
+                or args.models.name == "DeepSeek-R1-Distill-Qwen-14B"
+            ):
+                silu_and_mul_impl = "torch"
             else:
-                gate_out = gate_up_out[..., : gate_up_out.shape[-1] // 2]
-                up_out = gate_up_out[..., gate_up_out.shape[-1] // 2 :]
+                silu_and_mul_impl = "auto"
+
+            gate_up_out = self.gate_up_proj(x)
+            silu_and_mul_out = silu_and_mul(gate_up_out, impl=silu_and_mul_impl)
+
         else:
             gate_out = self.gate_proj(x)
             up_out = self.up_proj(x)
+            silu_and_mul_out = F.silu(gate_out) * up_out
 
-        y = self.down_proj(F.silu(gate_out) * up_out)
-        if self.op_impl == "muxi_custom_kernel":
-            y = y[:n, :]
-            y = y.reshape(x_shape[:-1] + (y.shape[-1],))
-        return y
+        return self.down_proj(silu_and_mul_out)
 
 
 class TransformerBlockHFLlama(TransformerBlock):
@@ -535,6 +516,19 @@ class TransformerHFLlama(Transformer):
                 )
             elif k.endswith(".k_proj.weight") or k.endswith(".v_proj.weight"):
                 continue
+            elif k.endswith(".q_proj.scale"):
+                prefix = k[: -len("q_proj.scale")]
+                assert prefix + "k_proj.scale" in checkpoint
+                assert prefix + "v_proj.scale" in checkpoint
+                assert prefix + "qkv_proj.scale" not in checkpoint
+                q_scale = checkpoint[prefix + "q_proj.scale"]
+                k_scale = checkpoint[prefix + "k_proj.scale"]
+                v_scale = checkpoint[prefix + "v_proj.scale"]
+                new_checkpoint[prefix + "qkv_proj.scale"] = torch.cat(
+                    [q_scale, k_scale, v_scale], dim=0
+                )
+            elif k.endswith(".k_proj.scale") or k.endswith(".v_proj.scale"):
+                continue
             elif k.endswith(".q_proj.bias"):
                 prefix = k[: -len("q_proj.bias")]
                 assert prefix + "k_proj.bias" in checkpoint
@@ -565,6 +559,17 @@ class TransformerHFLlama(Transformer):
                     [gate_weight, up_weight], dim=0
                 )
             elif k.endswith(".up_proj.weight"):
+                continue
+            elif k.endswith(".gate_proj.scale"):
+                prefix = k[: -len("gate_proj.scale")]
+                assert prefix + "up_proj.scale" in checkpoint
+                assert prefix + "gate_up_proj.scale" not in checkpoint
+                gate_scale = checkpoint[prefix + "gate_proj.scale"]
+                up_scale = checkpoint[prefix + "up_proj.scale"]
+                new_checkpoint[prefix + "gate_up_proj.scale"] = torch.cat(
+                    [gate_scale, up_scale], dim=0
+                )
+            elif k.endswith(".up_proj.scale"):
                 continue
             elif k.endswith(".gate_proj.bias"):
                 prefix = k[: -len("gate_proj.bias")]
