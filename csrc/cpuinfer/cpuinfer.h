@@ -65,17 +65,6 @@ class CPUInfer {
 #endif
     static thread_local int worker_id_;
 
-    // Platform-specific operations
-    void bind_numa_node(int node) {
-#ifdef USE_NUMA
-        numa_node_ = node * numa_num_configured_nodes() / active_workers_;
-        numa_bitmask *mask = numa_bitmask_alloc(numa_num_configured_nodes());
-        numa_bitmask_setbit(mask, numa_node_);
-        numa_bind(mask);
-        numa_bitmask_free(mask);
-#endif
-    }
-
     void initialize_workers() {
         worker_pool_.reserve(workers_.size());
         for (size_t i = 1; i < workers_.size(); ++i) {
@@ -95,8 +84,6 @@ class CPUInfer {
 
     void worker_routine(int worker_id) {
         worker_id_ = worker_id;
-        bind_numa_node(worker_id);
-
         auto last_active = std::chrono::steady_clock::now();
         while (true) {
             switch (workers_[worker_id].state.load(std::memory_order_acquire)) {
@@ -120,32 +107,43 @@ class CPUInfer {
     }
 
     void process_tasks(int worker_id) {
+
+#ifdef USE_NUMA
+        if (numa_node == -1) {
+            numa_node = thread_id * numa_num_configured_nodes() / thread_num_;
+            struct bitmask *mask =
+                numa_bitmask_alloc(numa_num_configured_nodes());
+            numa_bitmask_setbit(mask, numa_node);
+            numa_bind(mask);
+        }
+#endif
         auto &ctx = workers_[worker_id];
 
-        while (execute_task(ctx)) {
+        while (true) {
+            int task_id =
+                ctx.task_counter.fetch_add(1, std::memory_order_acq_rel);
+            if (task_id >= ctx.task_end) {
+                break;
+            }
+            compute_callback_(task_id);
         }
-
-        for (size_t offset = 1; offset < workers_.size(); ++offset) {
-            int target = (worker_id + offset) % workers_.size();
-            if (workers_[target].state.load(std::memory_order_acquire) !=
-                WorkerState::Active)
+        for (int t_offset = 1; t_offset < workers_.size(); t_offset++) {
+            int t_i = (worker_id + t_offset) % workers_.size();
+            if (workers_[t_i].state.load(std::memory_order_acquire) !=
+                WorkerState::Active) {
                 continue;
-
-            while (execute_task(workers_[target])) {
+            }
+            while (true) {
+                int task_id = workers_[t_i].task_counter.fetch_add(
+                    1, std::memory_order_acq_rel);
+                if (task_id >= workers_[t_i].task_end) {
+                    break;
+                }
+                compute_callback_(task_id);
             }
         }
-
-        ctx.state.store(WorkerState::Idle, std::memory_order_release);
-    }
-
-    bool execute_task(WorkerContext &ctx) {
-        const int task_id =
-            ctx.task_counter.fetch_add(1, std::memory_order_acq_rel);
-        if (task_id >= ctx.task_end)
-            return false;
-
-        compute_callback_(task_id);
-        return true;
+        workers_[worker_id].state.store(WorkerState::Idle,
+                                        std::memory_order_release);
     }
 
   public:
@@ -180,13 +178,13 @@ class CPUInfer {
             std::lock_guard lock(queue_mutex_);
             task_queue_.emplace(std::bind(std::forward<Fn>(fn),
                                           std::forward<Args>(args)..., this));
-            sync_flag_.store(false, std::memory_order_release);
+            sync_flag_.store(false, std::memory_order_seq_cst);
         }
         queue_cv_.notify_one();
     }
 
     void sync() {
-        while (!sync_flag_.load(std::memory_order_acquire)) {
+        while (!sync_flag_.load(std::memory_order_seq_cst)) {
             std::this_thread::yield();
         }
     }
@@ -273,8 +271,9 @@ class CPUInfer {
 
             {
                 std::lock_guard lock(queue_mutex_);
-                sync_flag_.store(task_queue_.empty(),
-                                 std::memory_order_release);
+                if (task_queue_.empty()) {
+                    sync_flag_.store(true, std::memory_order_release);
+                }
             }
         }
     }

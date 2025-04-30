@@ -24,6 +24,9 @@ Currently supported optional dependencies are:
 - `flash_attn`: Support `infer.attn_type=flash_attn`.
 - `flashinfer`: Support `infer.attn_type=flash_infer`.
 - `flash_mla`: Support `infer.attn_type=flash_mla`.
+- `deep_gemm`: Support using DeepGEMM for fp8 inference.
+- `cpu`: Support hybrid CPU+GPU inference.
+- `muxi_layout_kernels`: Addtional kernels for running on MetaX GPUs with `infer.op_impl=muxi_custom_kernel`, optimized for small batches.
 
 Set `CHITU_WITH_CYTHON=1` to compile Python sources with Cython. Example:
 
@@ -192,8 +195,8 @@ torchrun --nproc_per_node 1 \
 --master_port=22525 \ 
 test/single_req_test.py \ 
 models=DeepSeek-R1-Q4_K_M \ 
-models.ckpt_dir=/data/nfs/DeepSeek-R1-Q4_K_M/ \ 
-models.tokenizer_path=/data/nfs/DeepSeek-R1-bf16 \ 
+models.ckpt_dir=<path/to/your/model> \
+models.tokenizer_path=<path/to/your/tokenizer> \
 infer.use_cuda_graph=True \ 
 quant=gguf \ 
 +cpu_layer_num=58\ 

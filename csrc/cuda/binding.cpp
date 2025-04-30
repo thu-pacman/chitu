@@ -1,9 +1,9 @@
 #include <pybind11/pybind11.h>
 
-#include "moe_kernel.h"
-#include "rms_norm.h"
-#include "rotary_pos_emb_llama.h"
-#include "weight_layout_change.h"
+#include "moe/moe_kernel.h"
+#include "norm/rms_norm.h"
+#include "rotary/rotary_pos_emb_llama.h"
+#include "weight_layout/weight_layout_change.h"
 
 namespace py = pybind11;
 using namespace pybind11::literals;

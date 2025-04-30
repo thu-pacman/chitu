@@ -33,6 +33,7 @@ class CustomBuildExtension(BuildExtension):
                         "BUILD_SHARED_LIBS=ON",
                         "-D",
                         "LLAMA_NATIVE=ON",
+                        "-DCMAKE_CXX_COMPILER=g++",
                     ],
                     cwd=ext.sourcedir,
                     check=True,
@@ -63,7 +64,7 @@ setup(
         CUDAExtension(
             name="cpuinfer",
             sources=[
-                "ext_bindings.cpp",
+                "bindings.cpp",
                 "moe.cpp",
                 "shared_mem_buffer.cpp",
             ]
@@ -80,10 +81,9 @@ setup(
         CUDAExtension(
             name="ktdequant",
             sources=[
-                "custom_gguf/dequant.cu",
-                "custom_gguf/binding.cpp",
+                os.path.join(setup_dir, "../cuda/dequant/dequant.cu"),
+                os.path.join(setup_dir, "../cuda/dequant/binding.cpp"),
             ],
-            include_dirs=["custom_gguf/"],
             extra_compile_args={
                 "cxx": ["-O3"],
                 "nvcc": [

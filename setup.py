@@ -28,19 +28,22 @@ ext_modules = [
     CUDAExtension(
         name="chitu_backend",
         sources=[
-            "./csrc/binding.cpp",
-            "./csrc/moe_align_kernel.cu",
-            "./csrc/fused_shared_experts_kernel.cu",
-            "./csrc/group_topk.cu",
-            "./csrc/rotary_pos_emb_llama.cu",
-            "./csrc/rms_norm.cu",
-            "./csrc/weight_layout_change.cu",
+            "./csrc/cuda/binding.cpp",
+            "./csrc/cuda/moe/moe_align_kernel.cu",
+            "./csrc/cuda/moe/fused_shared_experts_kernel.cu",
+            "./csrc/cuda/moe/group_topk.cu",
+            "./csrc/cuda/rotary/rotary_pos_emb_llama.cu",
+            "./csrc/cuda/norm/rms_norm.cu",
+            "./csrc/cuda/weight_layout/weight_layout_change.cu",
         ],
         extra_compile_args={
             "cxx": ["-std=c++17"],
             "nvcc": ["-std=c++17"],
         },
-        include_dirs=[os.path.join(setup_dir, "third_party/spdlog/include")],
+        include_dirs=[
+            os.path.join(setup_dir, "third_party/spdlog/include"),
+            os.path.join(setup_dir, "csrc/cuda/common"),
+        ],
     ),
 ]
 
