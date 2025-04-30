@@ -6,7 +6,7 @@ Chitu (赤兔) 是一个专注于效率、灵活性和可用性的高性能大�
 
 ## 最新动态
 
-[2025/04/30] 发布 v0.3.0，新增 FP4 在线转 FP8、BF16 的高效算子实现，支持 DeepSeek-R1 671B 的 [FP4 量化版](https://huggingface.co/nvidia/DeepSeek-R1-FP4)。
+[2025/04/29] 发布 v0.3.0，新增 FP4 在线转 FP8、BF16 的高效算子实现，支持 DeepSeek-R1 671B 的 [FP4 量化版](https://huggingface.co/nvidia/DeepSeek-R1-FP4)。
 
 [2025/04/18] 发布 v0.2.2，新增 CPU+GPU 异构混合推理支持，新增多个算子的优化实现。
 
@@ -48,7 +48,7 @@ Chitu (赤兔) 定位于「生产级大模型推理引擎」，充分考虑企�
 |bs=16|202.1|
 |bs=256|780.3|
 
-### 在 Xeon 8480P + H20(96G) 服务器上异构部署 DeepSeek-R1-671B (v0.2.2版本数据)
+### 在 Xeon 8480P + H20(96G) 服务器上异构部署 DeepSeek-R1-671B
 
 | 完整放置于 GPU 的层数       | GPU 卡数 | output token/s (bs=1) | output token/s (bs=16) |
 |:---------------|:------|:---------------|:----------------|
@@ -56,32 +56,37 @@ Chitu (赤兔) 定位于「生产级大模型推理引擎」，充分考虑企�
 | 24    | 2    | 14.04           | 42.57        |
 
 - 使用的模型是 DeepSeek-R1-671B 的 Q4 量化版本（INT4）
+- 测试数据基于 Chitu v0.2.2 版本
 - 性能瓶颈在 CPU 一侧，增加 GPU 数量后性能提升有限，建议采用更高端的 CPU 和主存
 - 适用于 GPU 显存受限且不需要高并发支持的场景
 - MMLU 测试得分约 83
 
 ### 在 A800(40GB) 集群上部署 DeepSeek-R1-671B
 
-|硬件环境|6 节点|3 节点|
+|Batchsize |6 节点, BF16 |3 节点, FP8|
 |:---|:---|:---|
-|框架+精度|chitu 0.1.0, BF16|Chitu 0.1.0, FP8|
-|使用 cuda graph|29.8 output token/s|22.7 output token/s|
-|不使用 cuda graph|8.5 output token/s|7.0 output token/s|
+|1| 29.8 | 22.7 |
+|4| 78.8 | 70.1 |
+|8| 129.8 | 108.9 |
+|16| 181.4 | 159.0 |
+|32| 244.1 | 214.5 |
 
-- 表格中数据均为单请求场景（bs=1）的输出速度
-- 对 Chitu 而言，使用3个节点运行FP8模型，其输出速度与使用6个节点运行BF16模型的速度是可比的
-- 对于单个请求的回答输出速度，是否使用 cuda graph 对性能有显著的影响，使用 cuda graph 后性能有明显提升
-
-|batchsize|6 节点, BF16 |3 节点, FP8|
-|:---|:---|:---|
-|1| 29.8 token/s| 22.7 token/s|
-|4| 78.8 token/s| 70.1 token/s|
-|8| 129.8 token/s| 108.9 token/s|
-|16| 181.4 token/s| 159.0 token/s|
-|32| 244.1 token/s| 214.5 token/s|
-
+- 表中数值为输出速率 output token/s
 - 从不同batchsize的测试数据来看，同样基于Chitu引擎，使用3节点运行FP8模型的输出速度约为使用6节点运行BF16模型的75%\~90%，即单位算力的产出获得了1.5x\~1.8x的提升
 - 这是由于解码Decoding过程主要依赖于访存带宽，使用一半的GPU去访问一半的数据（FP8的权重大小是BF16的一半）不会消耗更长的时间，GPU计算能力缩减只带来较小的影响
+
+### 在沐曦集群上部署 DeepSeek-R1-671B 和 DeepSeek-R1-Distill-Llama-70B
+
+|Batchsize| 两机, 671B, FP8| 单机, 70B, BF16 |
+|:---|:---|:---|
+|1| 20.31| 39.55 |
+|128| 195.89 | 812.17 |
+
+- 每台服务器配备了 8 张 C550 加速卡
+- 表中数值为输出速率 output token/s，输入输出长度均为 512 tokens
+- 在 bs=1 的场景下，两机运行 FP8 版本 671B 的输出速率与四机运行 BF16 版本相当
+- 在 bs=128 的场景下，两机运行 FP8 版本 671B 的输出速率约为四机运行 BF16 版本的一半
+- 对于 70B 模型，使用原本的 BF16 格式运行即可获得良好的性能
 
 ## 快速入门
 
@@ -186,7 +191,7 @@ python benchmarks/benchmark_serving.py \
 
 如有任何问题或疑虑，欢迎提交issue。我们也设有一个活跃的微信群，方便进行更详细的讨论。二维码如下：
 
-<img src="../WeChatGroup.png" width="30%">
+<img src="docs/WeChatGroup.png" width="30%">
 
 ## 许可证
 
