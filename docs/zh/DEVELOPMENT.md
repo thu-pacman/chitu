@@ -15,10 +15,13 @@ TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation ".[flashinf
 ```
 
 当前支持的可选安装项有:
-- `flash_attn`: 用于支持 `infer.attn_type=flash_attn`
+- `flash_attn`: 用于支持 `infer.attn_type=flash_attn`。
     > 直接安装 flash_attn 可能很慢，可以到 flash_attn 的 github 上下载相应的预编译包（一个 .whl 文件），然后通过 pip install 这个 .whl 文件。
-- `flashinfer`: 用于支持 `infer.attn_type=flash_infer`
-- `flash_mla`: 用于支持 `infer.attn_type=flash_mla`
+- `flashinfer`: 用于支持 `infer.attn_type=flash_infer`。
+- `flash_mla`: 用于支持 `infer.attn_type=flash_mla`。
+- `deep_gemm`: 用于支持使用 DeepGEMM 进行 fp8 推理。
+- `cpu`: 用于支持 CPU+GPU 混合推理。
+- `muxi_layout_kernels`: 用于支持在沐曦 GPU 上使用 `infer.op_impl=muxi_custom_kernel` 模式，在小 batch 场景性能更优。
 
 如果需要用于开发，建议加上 `-e` 选项启用 editable install，如
 
@@ -189,8 +192,8 @@ torchrun --nproc_per_node 1 \
     --master_port=22525 \
     test/single_req_test.py \
     models=DeepSeek-R1-Q4_K_M \
-    models.ckpt_dir=/data/nfs/DeepSeek-R1-Q4_K_M/ \
-    models.tokenizer_path=/data/nfs/DeepSeek-R1-bf16 \
+    models.ckpt_dir=<模型路径> \
+    models.tokenizer_path=<tokenizer路径> \
     infer.use_cuda_graph=True \
     quant=gguf \
     +cpu_layer_num=58\
