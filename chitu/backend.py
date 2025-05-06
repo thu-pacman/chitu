@@ -312,7 +312,11 @@ class Backend:
                 else args.models.n_heads
             )
             n_local_kv_heads = n_kv_heads // model_parallel_size
-            head_dim = args.models.dim // args.models.n_heads
+            head_dim = (
+                args.models.head_dim
+                if hasattr(args.models, "head_dim")
+                else args.models.dim // args.models.n_heads
+            )
             kv_cache_kvargs["n_local_kv_heads"] = n_local_kv_heads
             kv_cache_kvargs["head_dim"] = head_dim
 
@@ -399,6 +403,8 @@ class Backend:
             # only merge weights but NOT the scales on input dimensions, and this will break the
             # assumption of the fused quantized kernels. So we only merge weights for supported
             # quantization methods.
+            merge_qkv_gate_up = False
+        if args.models.name == "Qwen3-32B":
             merge_qkv_gate_up = False
 
         if args.models.type == "deepseek-v3" and args.quant in [

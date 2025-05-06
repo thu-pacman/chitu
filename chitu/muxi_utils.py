@@ -4,8 +4,7 @@ from .utils import try_import_opt_dep
 import torch
 
 from chitu.utils import try_import_opt_dep
-from chitu.tensor_parallel import LocalLinear
-from chitu.quantization import Blockfp8Linear
+from chitu.quantization import NormalLinear, Blockfp8Linear
 
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
@@ -379,7 +378,7 @@ class NativeLayoutActivation:
     buffer: torch.Tensor
 
 
-class LinearLayoutContigXNativeY(LocalLinear):
+class LinearLayoutContigXNativeY(NormalLinear):
     def forward(self, x: torch.Tensor) -> NativeLayoutActivation:
         x_shape = x.shape
         x = x.reshape(-1, x.shape[-1])
@@ -389,7 +388,7 @@ class LinearLayoutContigXNativeY(LocalLinear):
         return NativeLayoutActivation(n, x_shape[:-1], y)
 
 
-class LinearLayoutNativeXContigY(LocalLinear):
+class LinearLayoutNativeXContigY(NormalLinear):
     def forward(self, x: NativeLayoutActivation) -> torch.Tensor:
         y = linear_layout_native_x_contig_y(x.buffer, self.weight, self.bias)
         y = y[: x.batch_size, :]
@@ -397,7 +396,7 @@ class LinearLayoutNativeXContigY(LocalLinear):
         return y
 
 
-class LinearLayoutContigXContigY(LocalLinear):
+class LinearLayoutContigXContigY(NormalLinear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_shape = x.shape
         x = x.reshape(-1, x.shape[-1])

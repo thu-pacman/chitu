@@ -2,7 +2,6 @@ import torch
 import logging
 from typing import Dict, Tuple, Optional, Type, Set, List
 
-from chitu.tensor_parallel import LocalLinear
 from chitu.utils import try_import_opt_dep, parse_dtype
 from chitu.ops import (
     fp8_gemm_deepseek_v3,
@@ -27,6 +26,50 @@ class QuantizedLinearBase(torch.nn.Module):
     """
 
     pass
+
+
+class NormalLinear(QuantizedLinearBase):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        has_bias: bool = True,
+        dtype=None,
+        bias_dtype=None,
+    ):
+        """
+        Non-quantized linear layer.
+
+        Additional parameters are supported based on `torch.nn.Linear`.
+
+        Args:
+            in_features: size of each input sample
+            out_features: size of each output sample
+            has_bias: If set to True, the layer will have a bias.
+            dtype: The desired data type of the parameters.
+            bias_dtype: The desired data type of the bias. Defaults to `dtype`.
+        """
+
+        super().__init__()
+
+        # These attributes are unused, but keep them compatible with nn.Linear
+        self.in_features = in_features
+        self.out_features = out_features
+
+        self.weight = torch.nn.Parameter(
+            torch.empty(self.out_features, in_features, dtype=dtype),
+            requires_grad=False,
+        )
+        if has_bias:
+            self.bias = torch.nn.Parameter(
+                torch.empty(self.out_features, dtype=bias_dtype or dtype),
+                requires_grad=False,
+            )
+        else:
+            self.bias = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(x, self.weight, self.bias)
 
 
 class LLMInt8Linear(QuantizedLinearBase):
@@ -831,7 +874,7 @@ class QuantizationRegistry:
     """
 
     _registry: Dict[str, Type[QuantizedLinearBase]] = {
-        None: LocalLinear,
+        None: NormalLinear,
         "llmint8": LLMInt8Linear,
         "autoawq": AutoAWQLinear,
         "gptqmodel": GPTQLinear,
@@ -839,9 +882,21 @@ class QuantizationRegistry:
         "simple_w8a8_muxi": W8A8MuxiLinear,
         "blockfp8": Blockfp8Linear,
         "blockfp4": Blockfp4Linear,
-        "gguf": LocalLinear,
+        "gguf": NormalLinear,
         "gguf-blockfp8": Blockfp8Linear,
     }
+
+    @classmethod
+    def get_all_methods(cls) -> Set[str]:
+        """
+        Get all registered quantization methods.
+
+        Returns:
+            Set of quantization method names
+        """
+        ret = set(cls._registry.keys())
+        ret.remove(None)
+        return ret
 
     @classmethod
     def get_quantized_linear_class(
@@ -853,7 +908,7 @@ class QuantizationRegistry:
         Arguments:
             method: Quantization method name, or None for no quantization
             disabled_methods: Set of disabled methods. If `method` is in this set,
-                this function will return unquantized LocalLinear. This is useful
+                this function will return unquantized NormalLinear. This is useful
                 for partial quantization of selected layers.
 
         Returns:
@@ -865,7 +920,7 @@ class QuantizationRegistry:
 
         impl = cls._registry.get(method)
         if impl is None:
-            logger.warning(f"Unknown quantization method: {method}")
+            raise ValueError(f"Unknown quantization method: {method}")
 
         return impl
 

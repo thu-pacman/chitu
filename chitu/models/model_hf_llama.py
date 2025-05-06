@@ -17,13 +17,13 @@ from chitu.muxi_utils import (
 )
 from chitu.ops import apply_rotary_pos_emb, silu_and_mul
 from chitu.tensor_parallel import (
-    LocalLinear,
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
     get_tp_size,
 )
 from chitu.global_vars import get_global_args
+from chitu.quantization import QuantizationRegistry
 
 logger = getLogger(__name__)
 
@@ -69,7 +69,9 @@ class AttentionHFLlama(Attention):
         self.n_local_heads = args.n_heads // model_parallel_size
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = args.dim // args.n_heads
+        self.head_dim = (
+            args.head_dim if hasattr(args, "head_dim") else args.dim // args.n_heads
+        )
 
         # Do a parallel + fused linear projection. Goals:
         # - Parallelization should be among the kv_heads dim, so there is no communication.
@@ -119,6 +121,10 @@ class AttentionHFLlama(Attention):
             base_linear_class=o_proj_linear,
         )
 
+        if args.name == "Qwen3-32B":
+            self.q_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
+
     def _run_linear(self, x):
         if self.merge_qkv:
             qkv = self.qkv_proj(x)
@@ -148,10 +154,16 @@ class AttentionHFLlama(Attention):
     ):
         # 因为量化后x是个tuple，所以取shape的时候放linear后面
         xq, xk, xv = self._run_linear(x)
+
         bs_seq, _ = xq.shape
         xq = xq.view(bs_seq, self.n_local_heads, self.head_dim).contiguous()
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
+
+        if hasattr(self, "q_norm") and hasattr(self, "k_norm"):
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
+
         xq, xk = apply_rotary_pos_emb(
             xq,
             xk,
@@ -159,9 +171,11 @@ class AttentionHFLlama(Attention):
             freqs_cis_sin,
             rotary_type=self.rotary_type,
         )
+
         self.cache.finalize_cache_bylayer_prefill(
             xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
         )
+
         output = self.attn_backend.attn_varlen_func(
             xq,
             xk,
@@ -184,6 +198,11 @@ class AttentionHFLlama(Attention):
         xq = xq.view(-1, self.n_local_heads, self.head_dim).contiguous()
         xk = xk.view(-1, self.n_local_kv_heads, self.head_dim).contiguous()
         xv = xv.view(-1, self.n_local_kv_heads, self.head_dim).contiguous()
+
+        if hasattr(self, "q_norm") and hasattr(self, "k_norm"):
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
+
         xq, xk = apply_rotary_pos_emb(
             xq,
             xk,
@@ -195,10 +214,12 @@ class AttentionHFLlama(Attention):
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
         cache = self.cache.get_cache_decode(self.layer_id)
         cache_k = cache[0]
         cache_v = cache[1]
         cache_seqlens = self.cache.get_gpu_seq_lens_excl_this_decode()
+
         output = self.attn_backend.attn_with_kvcache(
             xq,
             cache_k,
@@ -207,6 +228,7 @@ class AttentionHFLlama(Attention):
             xv,
             cache_seqlens=cache_seqlens,
         ).view(bsz, seqlen, -1)
+
         return self._run_output_linear(output)
 
     def decode_forward_paged(
@@ -220,6 +242,11 @@ class AttentionHFLlama(Attention):
         xq = xq.view(-1, self.n_local_heads, self.head_dim).contiguous()
         xk = xk.view(-1, self.n_local_kv_heads, self.head_dim).contiguous()
         xv = xv.view(-1, self.n_local_kv_heads, self.head_dim).contiguous()
+
+        if hasattr(self, "q_norm") and hasattr(self, "k_norm"):
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
+
         xq, xk = apply_rotary_pos_emb(
             xq,
             xk,
@@ -364,6 +391,7 @@ class TransformerBlockHFLlama(TransformerBlock):
         )
         h += x
         out = h + self.mlp(self.post_attention_layernorm(h, impl=get_rms_norm_impl()))
+
         return out
 
 
@@ -679,7 +707,7 @@ class TransformerHFLlama(Transformer):
             self.params.dim,
             self.params.vocab_size,
             has_bias=False,
-            base_linear_class=LocalLinear,
+            disabled_methods=QuantizationRegistry.get_all_methods(),
         )
 
     def _pre_layers(self, h):
@@ -692,7 +720,11 @@ class TransformerHFLlama(Transformer):
         return h
 
     def precompute_freqs_cis(self, max_position_embeddings, device):
-        head_dim = self.params.dim // self.params.n_heads
+        head_dim = (
+            self.params.head_dim
+            if "head_dim" in self.params
+            else self.params.dim // self.params.n_heads
+        )
         self.rotary_emb = RotaryEmbeddingHFLlama(
             head_dim // 2 if self.rotary_type == "glm4" else head_dim,
             max_position_embeddings=max_position_embeddings,
