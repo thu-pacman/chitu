@@ -78,21 +78,5 @@ setup(
             ],
             extra_compile_args=["-O3", "-march=native", "-DUSE_CUDA"],
         ),
-        CUDAExtension(
-            name="ktdequant",
-            sources=[
-                os.path.join(setup_dir, "../cuda/dequant/dequant.cu"),
-                os.path.join(setup_dir, "../cuda/dequant/binding.cpp"),
-            ],
-            extra_compile_args={
-                "cxx": ["-O3"],
-                "nvcc": [
-                    "-O3",
-                    "--use_fast_math",
-                    "-Xcompiler",
-                    "-fPIC",
-                ],
-            },
-        ),
     ],
 )

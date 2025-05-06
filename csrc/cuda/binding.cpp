@@ -1,5 +1,10 @@
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <torch/extension.h>
+#include <torch/library.h>
+#include <torch/torch.h>
 
+#include "dequant/ops.h"
 #include "moe/moe_kernel.h"
 #include "norm/rms_norm.h"
 #include "rotary/rotary_pos_emb_llama.h"
@@ -22,9 +27,117 @@ void init_compute(py::module &m) {
     m.def("weight_layout_change", &weight_layout_change, "");
 }
 
+/**
+ * @Description  : The following code originates from KVCache.AI and
+ *                 was authored by zure-Tang and Boxin Zhang.
+ **/
+
+void init_dequant(py::module &m) {
+    auto ktdequant = m.def_submodule("ktdequant");
+
+    ktdequant.def(
+        "dequantize_q8_0",
+        [](const intptr_t data, int num_bytes, int blk_size,
+           const int ele_per_blk, torch::Device device,
+           py::object target_dtype) {
+            torch::Dtype dtype =
+                torch::python::detail::py_object_to_dtype(target_dtype);
+            return dequantize_q8_0((int8_t *)data, num_bytes, blk_size,
+                                   ele_per_blk, device, dtype);
+        },
+        "Function to dequantize q8_0 data.", py::arg("data"),
+        py::arg("num_bytes"), py::arg("blk_size"), py::arg("ele_per_blk"),
+        py::arg("device"), py::arg("target_dtype"));
+
+    ktdequant.def(
+        "dequantize_q6_k",
+        [](const intptr_t data, int num_bytes, int blk_size,
+           const int ele_per_blk, torch::Device device,
+           py::object target_dtype) {
+            torch::Dtype dtype =
+                torch::python::detail::py_object_to_dtype(target_dtype);
+            return dequantize_q6_k((int8_t *)data, num_bytes, blk_size,
+                                   ele_per_blk, device, dtype);
+        },
+        "Function to dequantize q6_k data.", py::arg("data"),
+        py::arg("num_bytes"), py::arg("blk_size"), py::arg("ele_per_blk"),
+        py::arg("device"), py::arg("target_dtype"));
+
+    ktdequant.def(
+        "dequantize_q5_k",
+        [](const intptr_t data, int num_bytes, int blk_size,
+           const int ele_per_blk, torch::Device device,
+           py::object target_dtype) {
+            torch::Dtype dtype =
+                torch::python::detail::py_object_to_dtype(target_dtype);
+            return dequantize_q5_k((int8_t *)data, num_bytes, blk_size,
+                                   ele_per_blk, device, dtype);
+        },
+        "Function to dequantize q5_k data.", py::arg("data"),
+        py::arg("num_bytes"), py::arg("blk_size"), py::arg("ele_per_blk"),
+        py::arg("device"), py::arg("target_dtype"));
+
+    ktdequant.def(
+        "dequantize_q4_k",
+        [](const intptr_t data, int num_bytes, int blk_size,
+           const int ele_per_blk, torch::Device device,
+           py::object target_dtype) {
+            torch::Dtype dtype =
+                torch::python::detail::py_object_to_dtype(target_dtype);
+            return dequantize_q4_k((int8_t *)data, num_bytes, blk_size,
+                                   ele_per_blk, device, dtype);
+        },
+        "Function to dequantize q4_k data.", py::arg("data"),
+        py::arg("num_bytes"), py::arg("blk_size"), py::arg("ele_per_blk"),
+        py::arg("device"), py::arg("target_dtype"));
+
+    ktdequant.def(
+        "dequantize_q3_k",
+        [](const intptr_t data, int num_bytes, int blk_size,
+           const int ele_per_blk, torch::Device device,
+           py::object target_dtype) {
+            torch::Dtype dtype =
+                torch::python::detail::py_object_to_dtype(target_dtype);
+            return dequantize_q3_k((int8_t *)data, num_bytes, blk_size,
+                                   ele_per_blk, device, dtype);
+        },
+        "Function to dequantize q3_k data.", py::arg("data"),
+        py::arg("num_bytes"), py::arg("blk_size"), py::arg("ele_per_blk"),
+        py::arg("device"), py::arg("target_dtype"));
+
+    ktdequant.def(
+        "dequantize_q2_k",
+        [](const intptr_t data, int num_bytes, int blk_size,
+           const int ele_per_blk, torch::Device device,
+           py::object target_dtype) {
+            torch::Dtype dtype =
+                torch::python::detail::py_object_to_dtype(target_dtype);
+            return dequantize_q2_k((int8_t *)data, num_bytes, blk_size,
+                                   ele_per_blk, device, dtype);
+        },
+        "Function to dequantize q2_k data.", py::arg("data"),
+        py::arg("num_bytes"), py::arg("blk_size"), py::arg("ele_per_blk"),
+        py::arg("device"), py::arg("target_dtype"));
+
+    ktdequant.def(
+        "dequantize_iq4_xs",
+        [](const intptr_t data, int num_bytes, int blk_size,
+           const int ele_per_blk, torch::Device device,
+           py::object target_dtype) {
+            torch::Dtype dtype =
+                torch::python::detail::py_object_to_dtype(target_dtype);
+            return dequantize_iq4_xs((int8_t *)data, num_bytes, blk_size,
+                                     ele_per_blk, device, dtype);
+        },
+        "Function to dequantize iq4_xs data.", py::arg("data"),
+        py::arg("num_bytes"), py::arg("blk_size"), py::arg("ele_per_blk"),
+        py::arg("device"), py::arg("target_dtype"));
+}
+
 } // namespace chitu
 
 PYBIND11_MODULE(chitu_backend, m) {
     m.doc() = "A Supa Fast inference engine";
     chitu::init_compute(m);
+    chitu::init_dequant(m);
 }

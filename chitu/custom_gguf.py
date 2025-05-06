@@ -657,7 +657,7 @@ def dequantize_q2_k_gpu(
     c_pointer = ctypes.addressof(
         ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents
     )
-    import ktdequant
+    from chitu_backend import ktdequant
 
     return ktdequant.dequantize_q2_k(
         c_pointer, data.size, block_size, ele_per_blk, device_, target_dtype
@@ -730,7 +730,7 @@ def dequantize_q3_k_gpu(
     c_pointer = ctypes.addressof(
         ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents
     )
-    import ktdequant
+    from chitu_backend import ktdequant
 
     return ktdequant.dequantize_q3_k(
         c_pointer, data.size, block_size, ele_per_blk, device_, target_dtype
@@ -778,7 +778,7 @@ def dequantize_q4_k_gpu(
     c_pointer = ctypes.addressof(
         ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents
     )
-    import ktdequant
+    from chitu_backend import ktdequant
 
     return ktdequant.dequantize_q4_k(
         c_pointer, data.size, block_size, ele_per_blk, device_, target_dtype
@@ -859,7 +859,7 @@ def dequantize_q5_k_gpu(
     c_pointer = ctypes.addressof(
         ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents
     )
-    import ktdequant
+    from chitu_backend import ktdequant
 
     return ktdequant.dequantize_q5_k(
         c_pointer, data.size, block_size, ele_per_blk, device_, target_dtype
@@ -932,7 +932,7 @@ def dequantize_q6_k_gpu(
     c_pointer = ctypes.addressof(
         ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents
     )
-    import ktdequant
+    from chitu_backend import ktdequant
 
     return ktdequant.dequantize_q6_k(
         c_pointer, data.size, block_size, ele_per_blk, device_, target_dtype
@@ -997,7 +997,7 @@ def dequantize_iq4_xs_gpu(
     c_pointer = ctypes.addressof(
         ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents
     )
-    import ktdequant
+    from chitu_backend import ktdequant
 
     return ktdequant.dequantize_iq4_xs(
         c_pointer, data.size, block_size, ele_per_blk, device_, target_dtype
@@ -1097,7 +1097,7 @@ def dequantize_q8_0_gpu(
     c_pointer = ctypes.addressof(
         ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents
     )
-    import ktdequant
+    from chitu_backend import ktdequant
 
     return ktdequant.dequantize_q8_0(
         c_pointer, data.size, block_size, ele_per_blk, device_, target_dtype

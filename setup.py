@@ -19,33 +19,16 @@ assert packaging.version.parse(setuptools.__version__) >= packaging.version.pars
     "62.3.0"
 ), "setuptools>=62.3.0 is required for `**` wildcard in package_data."
 
+import csrc.setup_build as operators
 
 setup_dir = os.path.dirname(os.path.abspath(__file__))
 
-ext_modules = [
-    # We use CUDAExtension instead of CMake for native sources, because many of the non-NVIDIA GPUs have
-    # their custom CUDAExtension, but not their custom CMake support.
-    CUDAExtension(
-        name="chitu_backend",
-        sources=[
-            "./csrc/cuda/binding.cpp",
-            "./csrc/cuda/moe/moe_align_kernel.cu",
-            "./csrc/cuda/moe/fused_shared_experts_kernel.cu",
-            "./csrc/cuda/moe/group_topk.cu",
-            "./csrc/cuda/rotary/rotary_pos_emb_llama.cu",
-            "./csrc/cuda/norm/rms_norm.cu",
-            "./csrc/cuda/weight_layout/weight_layout_change.cu",
-        ],
-        extra_compile_args={
-            "cxx": ["-std=c++17"],
-            "nvcc": ["-std=c++17"],
-        },
-        include_dirs=[
-            os.path.join(setup_dir, "third_party/spdlog/include"),
-            os.path.join(setup_dir, "csrc/cuda/common"),
-        ],
-    ),
-]
+
+# We use CUDAExtension instead of CMake for native sources, because many of the non-NVIDIA GPUs have
+# their custom CUDAExtension, but not their custom CMake support.
+
+ext_modules = operators.get_extensions()
+
 
 cython_unsafe_files = [
     "triton_kernels.py",  # Triton kernels inside
@@ -156,9 +139,7 @@ setup(
             "deep_gemm @ file://localhost"
             + os.path.join(setup_dir, "third_party/DeepGEMM"),
         ],
-        "cpu": [
-            "cpuinfer @ file://localhost" + os.path.join(setup_dir, "csrc/cpuinfer"),
-        ],
+        **operators.get_extras_require(),
     },
     packages=find_packages(),
     ext_modules=ext_modules,
