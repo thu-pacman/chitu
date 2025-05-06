@@ -9,8 +9,10 @@ __all__ = [
 ]
 
 import torch
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Set, Any
+
 from chitu.global_vars import get_global_args
+from chitu.quantization import QuantizationRegistry
 
 tp_comm_group = None
 
@@ -47,48 +49,76 @@ def get_tp_rank():
     )
 
 
-class LocalLinear(torch.nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        has_bias: bool = True,
-        dtype=None,
-        bias_dtype=None,
-    ):
-        """
-        Linear layer running on a single device.
-
-        Additional parameters are supported based on `torch.nn.Linear`.
-
-        Args:
-            in_features: size of each input sample
-            out_features: size of each output sample
-            has_bias: If set to True, the layer will have a bias.
-            dtype: The desired data type of the parameters.
-            bias_dtype: The desired data type of the bias. Defaults to `dtype`.
-        """
-
-        super().__init__()
-
-        # These attributes are unused, but keep them compatible with nn.Linear
-        self.in_features = in_features
-        self.out_features = out_features
-
-        self.weight = torch.nn.Parameter(
-            torch.empty(self.out_features, in_features, dtype=dtype),
-            requires_grad=False,
-        )
-        if has_bias:
-            self.bias = torch.nn.Parameter(
-                torch.empty(self.out_features, dtype=bias_dtype or dtype),
-                requires_grad=False,
+def get_local_linear_class(
+    base_linear_class: Optional[type] = None,
+    *,
+    disabled_methods: Optional[Set[str]] = None,
+):
+    if base_linear_class is None:
+        base_linear_class = (
+            QuantizationRegistry.get_quantized_linear_class_from_global_args(
+                disabled_methods=disabled_methods
             )
-        else:
-            self.bias = None
+        )
+    return base_linear_class
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.linear(x, self.weight, self.bias)
+
+def LocalLinear(
+    in_features: int,
+    out_features: int,
+    has_bias: bool = True,
+    dtype=None,
+    bias_dtype=None,
+    *,
+    base_linear_class: Optional[type] = None,
+    disabled_methods: Optional[Set[str]] = None,
+):
+    """
+    Factory function for Linear layers running on a single device.
+
+    Args:
+        in_features: size of each input sample
+        out_features: size of each output sample
+        has_bias: If set to True, the layer will have a bias.
+        dtype: The desired data type of the parameters.
+        bias_dtype: The desired data type of the bias. Defaults to `dtype`.
+        base_linear_class: The base linear class to use. Defaults to be determined by the global
+            quantization method.
+        disabled_methods: Set of disabled methods. If `base_linear_class` is `None`, don't use
+            the quantization method in this set. This is useful for for partial quantization of
+            selected layers.
+    """
+
+    return get_local_linear_class(base_linear_class, disabled_methods=disabled_methods)(
+        in_features=in_features,
+        out_features=out_features,
+        has_bias=has_bias,
+        dtype=dtype,
+        bias_dtype=bias_dtype,
+    )
+
+
+def get_column_parallel_linear_class(
+    base_linear_class: Optional[type] = None,
+    *,
+    disabled_methods: Optional[Set[str]] = None,
+):
+    if base_linear_class is None:
+        base_linear_class = (
+            QuantizationRegistry.get_quantized_linear_class_from_global_args(
+                disabled_methods=disabled_methods
+            )
+        )
+
+    class ColumnParallelLinearImpl(ColumnParallelLinearMixIn, base_linear_class):
+        # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
+        # of the final class, so we can append a class to the base class, to make it act like a
+        # further base class of the original base class.
+        # See https://docs.python.org/3/tutorial/classes.html#multiple-inheritance
+
+        pass
+
+    return ColumnParallelLinearImpl
 
 
 def ColumnParallelLinear(
@@ -100,6 +130,7 @@ def ColumnParallelLinear(
     bias_dtype=None,
     *,
     base_linear_class: Optional[type] = None,
+    disabled_methods: Optional[Set[str]] = None,
 ):
     """
     Factory function for the ColumnParallelLinear class family.
@@ -110,24 +141,14 @@ def ColumnParallelLinear(
     Additional arguments:
         base_linear_class: The base linear class to use. Defaults to be determined by the global
             quantization method.
+        disabled_methods: Set of disabled methods. If `base_linear_class` is `None`, don't use
+            the quantization method in this set. This is useful for for partial quantization of
+            selected layers.
     """
 
-    if base_linear_class is None:
-        from chitu.quantization import QuantizationRegistry
-
-        base_linear_class = (
-            QuantizationRegistry.get_quantized_linear_class_from_global_args()
-        )
-
-    class ColumnParallelLinearImpl(ColumnParallelLinearMixIn, base_linear_class):
-        # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
-        # of the final class, so we can append a class to the base class, to make it act like a
-        # further base class of the original base class.
-        # See https://docs.python.org/3/tutorial/classes.html#multiple-inheritance
-
-        pass
-
-    return ColumnParallelLinearImpl(
+    return get_column_parallel_linear_class(
+        base_linear_class, disabled_methods=disabled_methods
+    )(
         in_features=in_features,
         out_features=out_features,
         has_bias=has_bias,
@@ -135,6 +156,29 @@ def ColumnParallelLinear(
         dtype=dtype,
         bias_dtype=bias_dtype,
     )
+
+
+def get_row_parallel_linear_class(
+    base_linear_class: Optional[type] = None,
+    *,
+    disabled_methods: Optional[Set[str]] = None,
+):
+    if base_linear_class is None:
+        base_linear_class = (
+            QuantizationRegistry.get_quantized_linear_class_from_global_args(
+                disabled_methods=disabled_methods
+            )
+        )
+
+    class RowParallelLinearImpl(RowParallelLinearMixIn, base_linear_class):
+        # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
+        # of the final class, so we can append a class to the base class, to make it act like a
+        # further base class of the original base class.
+        # See https://docs.python.org/3/tutorial/classes.html#multiple-inheritance
+
+        pass
+
+    return RowParallelLinearImpl
 
 
 def RowParallelLinear(
@@ -147,6 +191,7 @@ def RowParallelLinear(
     bias_dtype=None,
     *,
     base_linear_class: Optional[type] = None,
+    disabled_methods: Optional[Set[str]] = None,
 ):
     """
     Factory function for the RowParallelLinear class family.
@@ -156,24 +201,14 @@ def RowParallelLinear(
     Additional arguments:
         base_linear_class: The base linear class to use. Defaults to be determined by the global
             quantization method.
+        disabled_methods: Set of disabled methods. If `base_linear_class` is `None`, don't use
+            the quantization method in this set. This is useful for for partial quantization of
+            selected layers.
     """
 
-    if base_linear_class is None:
-        from chitu.quantization import QuantizationRegistry
-
-        base_linear_class = (
-            QuantizationRegistry.get_quantized_linear_class_from_global_args()
-        )
-
-    class RowParallelLinearImpl(RowParallelLinearMixIn, base_linear_class):
-        # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
-        # of the final class, so we can append a class to the base class, to make it act like a
-        # further base class of the original base class.
-        # See https://docs.python.org/3/tutorial/classes.html#multiple-inheritance
-
-        pass
-
-    return RowParallelLinearImpl(
+    return get_row_parallel_linear_class(
+        base_linear_class, disabled_methods=disabled_methods
+    )(
         in_features=in_features,
         out_features=out_features,
         has_bias=has_bias,

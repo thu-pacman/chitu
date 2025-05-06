@@ -469,40 +469,31 @@ class AttentionDeepSeekV3(Attention):
             # fp8 gemm can handle weights not divisible by block_size, but it does not hold
             # after merging for the output dimension, except for the last weight.
             assert self.q_lora_rank % block_size == 0
-            self.wqkv_a = (
-                QuantizationRegistry.get_quantized_linear_class_from_global_args(
-                    disabled_methods={"blockfp4"}
-                )(
-                    self.dim,
-                    self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
-                    has_bias=False,
-                    dtype=parse_dtype(args.main_weight_dtype),
-                    bias_dtype=torch.get_default_dtype(),
-                )
-            )
+            self.wqkv_a = LocalLinear(
+                self.dim,
+                self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+                has_bias=False,
+                dtype=parse_dtype(args.main_weight_dtype),
+                bias_dtype=torch.get_default_dtype(),
+                disabled_methods={"blockfp4"},
+            )  # FIXME: Run this layer with muxi_layout_kernels
         else:
-            self.wq_a = (
-                QuantizationRegistry.get_quantized_linear_class_from_global_args(
-                    disabled_methods={"blockfp4"}
-                )(
-                    self.dim,
-                    self.q_lora_rank,
-                    has_bias=False,
-                    dtype=parse_dtype(args.main_weight_dtype),
-                    bias_dtype=torch.get_default_dtype(),
-                )
-            )
-            self.wkv_a = (
-                QuantizationRegistry.get_quantized_linear_class_from_global_args(
-                    disabled_methods={"blockfp4"}
-                )(
-                    self.dim,
-                    self.kv_lora_rank + self.qk_rope_head_dim,
-                    has_bias=False,
-                    dtype=parse_dtype(args.main_weight_dtype),
-                    bias_dtype=torch.get_default_dtype(),
-                )
-            )
+            self.wq_a = LocalLinear(
+                self.dim,
+                self.q_lora_rank,
+                has_bias=False,
+                dtype=parse_dtype(args.main_weight_dtype),
+                bias_dtype=torch.get_default_dtype(),
+                disabled_methods={"blockfp4"},
+            )  # FIXME: Run this layer with muxi_layout_kernels
+            self.wkv_a = LocalLinear(
+                self.dim,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                has_bias=False,
+                dtype=parse_dtype(args.main_weight_dtype),
+                bias_dtype=torch.get_default_dtype(),
+                disabled_methods={"blockfp4"},
+            )  # FIXME: Run this layer with muxi_layout_kernels
         self.q_norm = RMSNorm(self.q_lora_rank)
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
@@ -2309,7 +2300,7 @@ class TransformerDeepSeekV3(Transformer):
             has_bias=False,
             dtype=torch.get_default_dtype(),
             gather_output=True,
-            base_linear_class=LocalLinear,
+            disabled_methods=QuantizationRegistry.get_all_methods(),
         )
 
     @override

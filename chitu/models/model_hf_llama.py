@@ -17,13 +17,13 @@ from chitu.muxi_utils import (
 )
 from chitu.ops import apply_rotary_pos_emb, silu_and_mul
 from chitu.tensor_parallel import (
-    LocalLinear,
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
     get_tp_size,
 )
 from chitu.global_vars import get_global_args
+from chitu.quantization import QuantizationRegistry
 
 logger = getLogger(__name__)
 
@@ -707,7 +707,7 @@ class TransformerHFLlama(Transformer):
             self.params.dim,
             self.params.vocab_size,
             has_bias=False,
-            base_linear_class=LocalLinear,
+            disabled_methods=QuantizationRegistry.get_all_methods(),
         )
 
     def _pre_layers(self, h):
