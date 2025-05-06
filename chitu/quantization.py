@@ -1,4 +1,5 @@
 import torch
+import functools
 import logging
 from typing import Dict, Tuple, Optional, Type, Set, List
 
@@ -28,6 +29,83 @@ class QuantizedLinearBase(torch.nn.Module):
     pass
 
 
+class QuantizationRegistry:
+    """
+    Registry of available quantization methods and their implementations.
+    """
+
+    _registry: Dict[str, Type[QuantizedLinearBase]] = {}
+
+    @classmethod
+    def get_all_methods(cls) -> Set[str]:
+        """
+        Get all registered quantization methods.
+
+        Returns:
+            Set of quantization method names
+        """
+        ret = set(cls._registry.keys())
+        ret.remove(None)
+        return ret
+
+    @classmethod
+    def get_quantized_linear_class(
+        cls, method: Optional[str], *, disabled_methods: Optional[Set[str]] = None
+    ) -> Optional[Type[QuantizedLinearBase]]:
+        """
+        Get the quantized linear implementation for the specified method.
+
+        Arguments:
+            method: Quantization method name, or None for no quantization
+            disabled_methods: Set of disabled methods. If `method` is in this set,
+                this function will return unquantized NormalLinear. This is useful
+                for partial quantization of selected layers.
+
+        Returns:
+            The quantized linear class, or None if method is None or not found
+        """
+
+        if disabled_methods is not None and method in disabled_methods:
+            method = None
+
+        impl = cls._registry.get(method)
+        if impl is None:
+            raise ValueError(f"Unknown quantization method: {method}")
+
+        return impl
+
+    @classmethod
+    def get_quantized_linear_class_from_global_args(
+        cls, *, disabled_methods: Optional[Set[str]] = None
+    ) -> Optional[Type[QuantizedLinearBase]]:
+        args = get_global_args()
+        quant_method = None if not hasattr(args.models, "quant") else args.models.quant
+        return cls.get_quantized_linear_class(
+            quant_method, disabled_methods=disabled_methods
+        )
+
+    @classmethod
+    def register_method(
+        cls,
+        name: Optional[str],
+        implementation: Optional[Type[QuantizedLinearBase]] = None,
+    ) -> None:
+        """
+        Register a new quantization method.
+
+        Arguments:
+            name: Name of the quantization method. None for non-quantized layer.
+            implementation: Implementation class. If None, return a partial function as
+                a decorator.
+        """
+        if implementation is None:
+            return functools.partial(cls.register_method, name)
+        cls._registry[name] = implementation
+        return implementation
+
+
+@QuantizationRegistry.register_method("gguf")
+@QuantizationRegistry.register_method(None)
 class NormalLinear(QuantizedLinearBase):
     def __init__(
         self,
@@ -72,6 +150,7 @@ class NormalLinear(QuantizedLinearBase):
         return torch.nn.functional.linear(x, self.weight, self.bias)
 
 
+@QuantizationRegistry.register_method("llmint8")
 class LLMInt8Linear(QuantizedLinearBase):
     """
     8-bit linear layer implementation using bitsandbytes.
@@ -119,6 +198,7 @@ class LLMInt8Linear(QuantizedLinearBase):
         return out
 
 
+@QuantizationRegistry.register_method("autoawq")
 class AutoAWQLinear(QuantizedLinearBase):
     """
     Auto awq 4-bit linear layer.
@@ -297,6 +377,7 @@ def get_scale_perms():
     return scale_perm, scale_perm_single
 
 
+@QuantizationRegistry.register_method("gptqmodel")
 class GPTQLinear(QuantizedLinearBase):
     """
     gptqmodel marlin 8-bit linear layer.
@@ -438,6 +519,7 @@ class GPTQLinear(QuantizedLinearBase):
         return out
 
 
+@QuantizationRegistry.register_method("simple_w8a8")
 class W8A8Linear(QuantizedLinearBase):
     """
     8-bit weight and activation quantized linear layer.
@@ -520,6 +602,7 @@ class W8A8Linear(QuantizedLinearBase):
         return out
 
 
+@QuantizationRegistry.register_method("simple_w8a8_muxi")
 class W8A8MuxiLinear(QuantizedLinearBase):
     """
     Muxi 8-bit weight and activation quantized linear layer.
@@ -710,6 +793,8 @@ def linear_block_fp4(
         return y.view(x_shape[:-1] + y.shape[-1:]).to(x_dtype)
 
 
+@QuantizationRegistry.register_method("gguf-blockfp8")
+@QuantizationRegistry.register_method("blockfp8")
 class Blockfp8Linear(QuantizedLinearBase):
     """
     block 8-bit weight and activation quantized linear layer.
@@ -779,6 +864,7 @@ class Blockfp8Linear(QuantizedLinearBase):
         )
 
 
+@QuantizationRegistry.register_method("blockfp4")
 class Blockfp4Linear(QuantizedLinearBase):
     """
     block 4-bit weight and activation quantized linear layer.
@@ -866,83 +952,3 @@ class Blockfp4Linear(QuantizedLinearBase):
         return linear_block_fp4(
             x, self.weight, self.scale, self.scale_2, self.bias, block_size=128
         )
-
-
-class QuantizationRegistry:
-    """
-    Registry of available quantization methods and their implementations.
-    """
-
-    _registry: Dict[str, Type[QuantizedLinearBase]] = {
-        None: NormalLinear,
-        "llmint8": LLMInt8Linear,
-        "autoawq": AutoAWQLinear,
-        "gptqmodel": GPTQLinear,
-        "simple_w8a8": W8A8Linear,
-        "simple_w8a8_muxi": W8A8MuxiLinear,
-        "blockfp8": Blockfp8Linear,
-        "blockfp4": Blockfp4Linear,
-        "gguf": NormalLinear,
-        "gguf-blockfp8": Blockfp8Linear,
-    }
-
-    @classmethod
-    def get_all_methods(cls) -> Set[str]:
-        """
-        Get all registered quantization methods.
-
-        Returns:
-            Set of quantization method names
-        """
-        ret = set(cls._registry.keys())
-        ret.remove(None)
-        return ret
-
-    @classmethod
-    def get_quantized_linear_class(
-        cls, method: Optional[str], *, disabled_methods: Optional[Set[str]] = None
-    ) -> Optional[Type[QuantizedLinearBase]]:
-        """
-        Get the quantized linear implementation for the specified method.
-
-        Arguments:
-            method: Quantization method name, or None for no quantization
-            disabled_methods: Set of disabled methods. If `method` is in this set,
-                this function will return unquantized NormalLinear. This is useful
-                for partial quantization of selected layers.
-
-        Returns:
-            The quantized linear class, or None if method is None or not found
-        """
-
-        if disabled_methods is not None and method in disabled_methods:
-            method = None
-
-        impl = cls._registry.get(method)
-        if impl is None:
-            raise ValueError(f"Unknown quantization method: {method}")
-
-        return impl
-
-    @classmethod
-    def get_quantized_linear_class_from_global_args(
-        cls, *, disabled_methods: Optional[Set[str]] = None
-    ) -> Optional[Type[QuantizedLinearBase]]:
-        args = get_global_args()
-        quant_method = None if not hasattr(args.models, "quant") else args.models.quant
-        return cls.get_quantized_linear_class(
-            quant_method, disabled_methods=disabled_methods
-        )
-
-    @classmethod
-    def register_method(
-        cls, name: str, implementation: Type[QuantizedLinearBase]
-    ) -> None:
-        """
-        Register a new quantization method.
-
-        Arguments:
-            name: Name of the quantization method
-            implementation: Implementation class
-        """
-        cls._registry[name] = implementation
