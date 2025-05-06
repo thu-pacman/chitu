@@ -1,9 +1,9 @@
 import torch
 import functools
 import logging
-from typing import Dict, Tuple, Optional, Type, Set, List
+from typing import Dict, Mapping, Tuple, Optional, Type, Set, List, Any
 
-from chitu.utils import try_import_opt_dep, parse_dtype
+from chitu.utils import try_import_opt_dep, parse_dtype, ceil_div
 from chitu.ops import (
     fp8_gemm_deepseek_v3,
     soft_fp8_gemm_deepseek_v3,
@@ -50,7 +50,11 @@ class QuantizationRegistry:
 
     @classmethod
     def get_quantized_linear_class(
-        cls, method: Optional[str], *, disabled_methods: Optional[Set[str]] = None
+        cls,
+        method: Optional[str],
+        *,
+        disabled_methods: Optional[Set[str]] = None,
+        quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
     ) -> Optional[Type[QuantizedLinearBase]]:
         """
         Get the quantized linear implementation for the specified method.
@@ -60,6 +64,8 @@ class QuantizationRegistry:
             disabled_methods: Set of disabled methods. If `method` is in this set,
                 this function will return unquantized NormalLinear. This is useful
                 for partial quantization of selected layers.
+            quant_kwargs: Nested mapping for additional arguments for specific
+                quantization methods. E.g., `{"quant_method_x": {"arg1": value1, ...}}`
 
         Returns:
             The quantized linear class, or None if method is None or not found
@@ -70,18 +76,35 @@ class QuantizationRegistry:
 
         impl = cls._registry.get(method)
         if impl is None:
-            raise ValueError(f"Unknown quantization method: {method}")
+            raise ValueError(f"Unknown quantization method in `method`: {method}")
+
+        for key in quant_kwargs:
+            if key not in cls._registry:
+                raise ValueError(
+                    f"Unknown quantization method in `quant_kwargs`: {key}"
+                )
+
+        if method in quant_kwargs:
+
+            class QuantLinearImpl(impl):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **quant_kwargs[method], **kwargs)
+
+            impl = QuantLinearImpl
 
         return impl
 
     @classmethod
     def get_quantized_linear_class_from_global_args(
-        cls, *, disabled_methods: Optional[Set[str]] = None
+        cls,
+        *,
+        disabled_methods: Optional[Set[str]] = None,
+        quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
     ) -> Optional[Type[QuantizedLinearBase]]:
         args = get_global_args()
         quant_method = None if not hasattr(args.models, "quant") else args.models.quant
         return cls.get_quantized_linear_class(
-            quant_method, disabled_methods=disabled_methods
+            quant_method, disabled_methods=disabled_methods, quant_kwargs=quant_kwargs
         )
 
     @classmethod
@@ -740,10 +763,10 @@ def linear_block_fp8(
 def linear_block_fp4(
     x: torch.Tensor,
     weight: torch.Tensor,
-    weight_scale: Optional[torch.Tensor] = None,
-    weight_scale_2: Optional[torch.Tensor] = None,
+    weight_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    act_block_size: int,
     bias: Optional[torch.Tensor] = None,
-    block_size: Optional[int] = 128,
 ) -> torch.Tensor:
     """
     Applies a linear transformation to the incoming data: y = xA^T + b.
@@ -754,6 +777,9 @@ def linear_block_fp4(
         x (torch.Tensor): The input tensor.
         weight (torch.Tensor): The weight tensor. It may be quantized and
             requires dequantization for certain cases.
+        weight_scale (torch.Tensor): The first-level scale tensor.
+        weight_scale_2 (torch.Tensor): The second-level scale tensor.
+        act_block_size (int): The block size for activation quantization.
         bias (Optional[torch.Tensor]): The bias tensor to be added. Default is None.
 
     Returns:
@@ -772,21 +798,23 @@ def linear_block_fp4(
                 y += bias
             return y
         else:
-            logger.warning(
-                f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
+            raise NotImplementedError(
+                f"Soft-fp8 fused gemm not implemented for {get_device_name()}"
             )
-            weight_dequanted = weight_dequant_soft_fp8_deepseek_v3(
-                weight, weight_scale, block_size
-            )
-            return torch.nn.functional.linear(x, weight_dequanted, bias)
+            # FIXME: Use a dequant-then-compute approach
     else:
         x_dtype = x.dtype
         x_shape = x.shape
         x = x.view(-1, x_shape[-1])
-        x, act_scale = act_quant_deepseek_v3(x, block_size)
+        x, act_scale = act_quant_deepseek_v3(x, act_block_size)
         assert weight_scale is not None
         y = soft_fp4_raise_to_fp8_gemm_deepseek_v3(
-            x, act_scale, weight, weight_scale, weight_scale_2
+            x,
+            act_scale,
+            weight,
+            weight_scale,
+            weight_scale_2,
+            act_block_size=act_block_size,
         )
         if bias is not None:
             y += bias
@@ -868,6 +896,18 @@ class Blockfp8Linear(QuantizedLinearBase):
 class Blockfp4Linear(QuantizedLinearBase):
     """
     block 4-bit weight and activation quantized linear layer.
+
+    Args:
+        in_features: size of each input sample
+        out_features: size of each output sample
+        has_bias: If set to True, the layer will have a bias.
+        dtype: The desired data type of the parameters.
+        bias_dtype: The desired data type of the bias.
+        block_shape: The block shape (in, out) of first-level scaling. Defaults to
+            (16, 1).
+        block_shape_2: The block shape (in, out) of second-level scaling. Defaults
+            to the same shape as the full weight tensor.
+        act_block_size: The block size for activation quantization.
     """
 
     def __init__(
@@ -877,17 +917,19 @@ class Blockfp4Linear(QuantizedLinearBase):
         has_bias: bool = False,
         dtype=torch.uint8,
         bias_dtype=None,
-        block_size=16,
-        scale_2_dim=1,
-        **kwargs,
+        block_shape: Tuple[int, int] = (16, 1),
+        block_shape_2: Optional[Tuple[int, int]] = None,
+        act_block_size: int = 128,
     ):
         super().__init__()
 
         dtype = dtype or torch.get_default_dtype()
+        if block_shape_2 is None:
+            block_shape_2 = (in_features, out_features)
 
         self.in_features = in_features
         self.out_features = out_features
-        self.block_size = block_size
+        self.act_block_size = act_block_size
 
         self.register_parameter(
             "weight",
@@ -903,15 +945,40 @@ class Blockfp4Linear(QuantizedLinearBase):
             ),
         )
 
-        scale_out_features = out_features
-        scale_in_features = (in_features + block_size - 1) // block_size
+        block_in, block_out = block_shape
         self.register_parameter(
             "scale",
             torch.nn.Parameter(
                 torch.empty(
-                    scale_out_features,
-                    scale_in_features,
+                    ceil_div(out_features, block_out),
+                    ceil_div(in_features, block_in),
                     dtype=torch.uint8,
+                ),
+                requires_grad=False,
+            ),
+        )
+
+        block_2_in, block_2_out = block_shape_2
+        assert out_features % block_2_out == 0
+        assert in_features % block_2_in == 0
+        self.register_parameter(
+            "input_scale",
+            torch.nn.Parameter(
+                torch.empty(
+                    out_features // block_2_out,
+                    in_features // block_2_in,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            ),
+        )
+        self.register_parameter(
+            "scale_2",
+            torch.nn.Parameter(
+                torch.empty(
+                    out_features // block_2_out,
+                    in_features // block_2_in,
+                    dtype=torch.float32,
                 ),
                 requires_grad=False,
             ),
@@ -928,33 +995,13 @@ class Blockfp4Linear(QuantizedLinearBase):
         else:
             self.register_parameter("bias", None)
 
-    def register_scale_2_param(
-        self,
-        scale_2_size: int = 1,
-    ):
-        self.register_parameter(
-            "input_scale",
-            torch.nn.Parameter(
-                torch.empty(
-                    scale_2_size,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            ),
-        )
-        self.register_parameter(
-            "scale_2",
-            torch.nn.Parameter(
-                torch.empty(
-                    scale_2_size,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            ),
-        )
-
     @torch.no_grad()
     def forward(self, x) -> torch.Tensor:
         return linear_block_fp4(
-            x, self.weight, self.scale, self.scale_2, self.bias, block_size=128
+            x,
+            self.weight,
+            self.scale,
+            self.scale_2,
+            act_block_size=self.act_block_size,
+            bias=self.bias,
         )

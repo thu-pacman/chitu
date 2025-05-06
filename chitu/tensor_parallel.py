@@ -9,7 +9,7 @@ __all__ = [
 ]
 
 import torch
-from typing import Optional, Dict, Set, Any
+from typing import Optional, Mapping, Set, Any
 
 from chitu.global_vars import get_global_args
 from chitu.quantization import QuantizationRegistry
@@ -53,11 +53,12 @@ def get_local_linear_class(
     base_linear_class: Optional[type] = None,
     *,
     disabled_methods: Optional[Set[str]] = None,
+    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     if base_linear_class is None:
         base_linear_class = (
             QuantizationRegistry.get_quantized_linear_class_from_global_args(
-                disabled_methods=disabled_methods
+                disabled_methods=disabled_methods, quant_kwargs=quant_kwargs
             )
         )
     return base_linear_class
@@ -72,6 +73,7 @@ def LocalLinear(
     *,
     base_linear_class: Optional[type] = None,
     disabled_methods: Optional[Set[str]] = None,
+    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     """
     Factory function for Linear layers running on a single device.
@@ -87,9 +89,13 @@ def LocalLinear(
         disabled_methods: Set of disabled methods. If `base_linear_class` is `None`, don't use
             the quantization method in this set. This is useful for for partial quantization of
             selected layers.
+        quant_kwargs: Nested mapping for additional arguments for specific
+            quantization methods. E.g., `{"quant_method_x": {"arg1": value1, ...}}`
     """
 
-    return get_local_linear_class(base_linear_class, disabled_methods=disabled_methods)(
+    return get_local_linear_class(
+        base_linear_class, disabled_methods=disabled_methods, quant_kwargs=quant_kwargs
+    )(
         in_features=in_features,
         out_features=out_features,
         has_bias=has_bias,
@@ -102,11 +108,12 @@ def get_column_parallel_linear_class(
     base_linear_class: Optional[type] = None,
     *,
     disabled_methods: Optional[Set[str]] = None,
+    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     if base_linear_class is None:
         base_linear_class = (
             QuantizationRegistry.get_quantized_linear_class_from_global_args(
-                disabled_methods=disabled_methods
+                disabled_methods=disabled_methods, quant_kwargs=quant_kwargs
             )
         )
 
@@ -131,6 +138,7 @@ def ColumnParallelLinear(
     *,
     base_linear_class: Optional[type] = None,
     disabled_methods: Optional[Set[str]] = None,
+    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     """
     Factory function for the ColumnParallelLinear class family.
@@ -144,10 +152,12 @@ def ColumnParallelLinear(
         disabled_methods: Set of disabled methods. If `base_linear_class` is `None`, don't use
             the quantization method in this set. This is useful for for partial quantization of
             selected layers.
+        quant_kwargs: Nested mapping for additional arguments for specific
+            quantization methods. E.g., `{"quant_method_x": {"arg1": value1, ...}}`
     """
 
     return get_column_parallel_linear_class(
-        base_linear_class, disabled_methods=disabled_methods
+        base_linear_class, disabled_methods=disabled_methods, quant_kwargs=quant_kwargs
     )(
         in_features=in_features,
         out_features=out_features,
@@ -162,11 +172,12 @@ def get_row_parallel_linear_class(
     base_linear_class: Optional[type] = None,
     *,
     disabled_methods: Optional[Set[str]] = None,
+    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     if base_linear_class is None:
         base_linear_class = (
             QuantizationRegistry.get_quantized_linear_class_from_global_args(
-                disabled_methods=disabled_methods
+                disabled_methods=disabled_methods, quant_kwargs=quant_kwargs
             )
         )
 
@@ -192,6 +203,7 @@ def RowParallelLinear(
     *,
     base_linear_class: Optional[type] = None,
     disabled_methods: Optional[Set[str]] = None,
+    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     """
     Factory function for the RowParallelLinear class family.
@@ -204,10 +216,12 @@ def RowParallelLinear(
         disabled_methods: Set of disabled methods. If `base_linear_class` is `None`, don't use
             the quantization method in this set. This is useful for for partial quantization of
             selected layers.
+        quant_kwargs: Nested mapping for additional arguments for specific
+            quantization methods. E.g., `{"quant_method_x": {"arg1": value1, ...}}`
     """
 
     return get_row_parallel_linear_class(
-        base_linear_class, disabled_methods=disabled_methods
+        base_linear_class, disabled_methods=disabled_methods, quant_kwargs=quant_kwargs
     )(
         in_features=in_features,
         out_features=out_features,

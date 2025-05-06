@@ -18,11 +18,12 @@ import torch.nn.functional as F
 
 import triton
 import triton.language as tl
+
 import chitu_backend
 from chitu.device_type import is_muxi, is_nvidia, get_device_name
-
 from chitu.triton_kernels import moe_sum_kernel
 from chitu.ops import silu_and_mul, to_triton_dtype
+from chitu.utils import ceil_div
 
 
 def moe_sum(input_tensor, output_tensor, config: Dict[str, Any]):
@@ -537,10 +538,6 @@ def fused_moe_kernel(
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
-
-
-def ceil_div(a, b):
-    return (a + b - 1) // b
 
 
 @triton.jit

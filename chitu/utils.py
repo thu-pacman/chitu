@@ -120,3 +120,7 @@ def parse_dtype(
         return torch.uint8
     else:
         assert False
+
+
+def ceil_div(a, b):
+    return (a + b - 1) // b
