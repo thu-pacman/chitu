@@ -524,35 +524,6 @@ class Backend:
         """
         start_time = time.time()
 
-        if args.models.type == "llama":
-            checkpoints = sorted(Path(args.models.ckpt_dir).glob("*.pth"))
-            assert (
-                len(checkpoints) > 0
-            ), f"no checkpoint files found in {args.models.ckpt_dir}"
-            ckpt_path = checkpoints[0]
-            checkpoint = torch.load(ckpt_path, map_location="cpu")
-        elif args.models.type == "hf-llama" or args.models.type == "hf-mixtral":
-            checkpoint = Backend._load_hf_checkpoint(model, args)
-        elif args.models.type == "deepseek-v3":
-            if args.quant is None:
-                checkpoint = load_state_dict_deepseek_v3(
-                    args.models.ckpt_dir, skip_preprocess=args.skip_preprocess
-                )
-        else:
-            raise NotImplementedError(f"Unsupported model type {args.models.type}")
-
-        # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
-        # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
-        if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
-            if hasattr(args.models, "quant") and args.models.quant == "blockfp8":
-                for k in checkpoint.keys():
-                    if checkpoint[k].element_size() == 1:
-                        checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
-        if hasattr(args.models, "quant") and args.models.quant == "blockfp4":
-            for k in checkpoint.keys():
-                if checkpoint[k].element_size() == 1:
-                    checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
-
         if args.models.type == "deepseek-v3" and args.quant in [
             "gguf",
             "gguf-blockfp8",
@@ -562,7 +533,32 @@ class Backend:
             load_gguf_deepseek_v3_gguf(
                 model, ds_gguf_loader, Backend.cpu_layers, 10, args
             )
+
         else:
+            if args.models.type == "llama":
+                checkpoints = sorted(Path(args.models.ckpt_dir).glob("*.pth"))
+                assert (
+                    len(checkpoints) > 0
+                ), f"no checkpoint files found in {args.models.ckpt_dir}"
+                ckpt_path = checkpoints[0]
+                checkpoint = torch.load(ckpt_path, map_location="cpu")
+            elif args.models.type in {"hf-llama", "hf-mixtral", "deepseek-v3"}:
+                checkpoint = Backend._load_hf_checkpoint(model, args)
+            else:
+                raise NotImplementedError(f"Unsupported model type {args.models.type}")
+
+            # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
+            # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
+            if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
+                if hasattr(args.models, "quant") and args.models.quant == "blockfp8":
+                    for k in checkpoint.keys():
+                        if checkpoint[k].element_size() == 1:
+                            checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
+            if hasattr(args.models, "quant") and args.models.quant == "blockfp4":
+                for k in checkpoint.keys():
+                    if checkpoint[k].element_size() == 1:
+                        checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
+
             model.load_state_dict_parallel(
                 checkpoint,
                 strict=True,
@@ -656,7 +652,12 @@ class Backend:
             )
         else:
             model_path = args.models.ckpt_dir
-            params = load_state_dict(model_path, skip_preprocess=args.skip_preprocess)
+            filter_key = None
+            if args.models.type == "deepseek-v3":
+                filter_key = lambda key: "model.layers.61" not in key
+            params = load_state_dict(
+                model_path, skip_preprocess=args.skip_preprocess, filter_key=filter_key
+            )
 
             def transform_key(key):
                 if key.startswith("model."):
@@ -722,8 +723,9 @@ def load_state_dict(
     for file_path in tqdm(glob(path)):
         with safe_open(file_path, framework="pt", device="cpu") as f:
             for name in f.keys():
-                param: torch.Tensor = f.get_tensor(name)
-                state_dict[name] = param
+                if filter_key is None or filter_key(name):
+                    param: torch.Tensor = f.get_tensor(name)
+                    state_dict[name] = param
     return state_dict
 
 
@@ -785,72 +787,6 @@ def load_gguf_deepseek_v3_gguf(
         if layer_id in cpu_layers:
             if model.layers[layer_id].ffn.moe == None:
                 model.layers[layer_id].ffn.init_weights()
-
-
-def load_state_dict_deepseek_v3(hf_ckpt_path, skip_preprocess=False):
-    torch.set_num_threads(8)
-
-    if not skip_preprocess:
-        path = os.path.join(hf_ckpt_path, "*.safetensors")
-    else:
-        rank = torch.distributed.get_rank()
-        path = os.path.join(hf_ckpt_path, f"model.rank{rank}.safetensors")
-
-    state_dict = {}
-
-    for file_path in tqdm(glob(path)):
-        # memory_used()
-        with safe_open(file_path, framework="pt", device="cpu") as f:
-            for name in f.keys():
-                if "model.layers.61" in name:
-                    continue
-                param: torch.Tensor = f.get_tensor(name)
-                if not skip_preprocess:
-                    if name.startswith("model."):
-                        name = name[len("model.") :]
-                    name = name.replace("self_attn", "attn")
-                    name = name.replace("mlp", "ffn")
-                    name = name.replace("weight_scale_inv", "scale")
-                    name = name.replace("weight_scale", "scale")
-                    name = name.replace("e_score_correction_bias", "bias")
-                    key = name.split(".")[-2]
-                    mapping = {
-                        "embed_tokens": ("embed", 0),
-                        "input_layernorm": ("attn_norm", None),
-                        "post_attention_layernorm": ("ffn_norm", None),
-                        "q_proj": ("wq", 0),
-                        "q_a_proj": ("wq_a", None),
-                        "q_a_layernorm": ("q_norm", None),
-                        "q_b_proj": ("wq_b", 0),
-                        "kv_a_proj_with_mqa": ("wkv_a", None),
-                        "kv_a_layernorm": ("kv_norm", None),
-                        "kv_b_proj": ("wkv_b", 0),
-                        "o_proj": ("wo", 1),
-                        "gate": ("gate", None),
-                        "gate_proj": ("w1", 0),
-                        "down_proj": ("w2", 1),
-                        "up_proj": ("w3", 0),
-                        "norm": ("norm", None),
-                        "lm_head": ("head", 0),
-                        "scale": ("scale", None),
-                    }
-                    assert key in mapping, f"Key {key} not found in mapping"
-                    new_key, dim = mapping[key]
-                    name = name.replace(key, new_key)
-                state_dict[name] = param
-            # memory_used()
-
-    return state_dict
-
-
-def print_dict(d, name):
-    print(name, d[name].shape, d[name].dtype)
-
-
-def check_equal(d0, d1, name):
-    print_dict(d0, name)
-    print(d1[name])
-    assert d0[name].shape == d1[name][0] and d0[name].dtype == d1[name][1]
 
 
 def load_state_dict_llama_gguf_mlp_layers(llama_gguf_loader: GGUFLoader, layer_num=64):
@@ -1078,7 +1014,6 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                 state_dict[safetensor_name] = ds_gguf_loader.load_gguf_tensor(
                     gguf_name, device, torch.bfloat16
                 ).cpu()
-            # check_equal(state_dict, tensor_dict_st, safetensor_name)
 
         for k in translation_gate.keys():
             safetensor_name = "layers." + str(layer_id) + k
@@ -1091,7 +1026,6 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                 state_dict[safetensor_name] = ds_gguf_loader.load_gguf_tensor(
                     gguf_name, device, torch.bfloat16
                 ).cpu()
-            # check_equal(state_dict, tensor_dict_st, safetensor_name)
 
         if shared_cpu_offload and cpu_offload:
             gate_proj, gate_type = ds_gguf_loader.get_undequanted_tensor_and_ggml_type(
@@ -1129,7 +1063,6 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                     state_dict[safetensor_name] = ds_gguf_loader.load_gguf_tensor(
                         gguf_name, device, torch.bfloat16
                     ).cpu()
-                # check_equal(state_dict, tensor_dict_st, safetensor_name)
         else:
             for k in translation_shared_experts_cpu.keys():
                 safetensor_name = "layers." + str(layer_id) + k
@@ -1152,7 +1085,6 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                     state_dict[safetensor_name] = ds_gguf_loader.load_gguf_tensor(
                         gguf_name, device, torch.bfloat16
                     ).cpu()
-                # check_equal(state_dict, tensor_dict_st, safetensor_name)
 
         if not cpu_offload:
             if parallel_moe_load:
@@ -1252,8 +1184,6 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                             + str(expert_id)
                             + k
                         )
-                        # state_dict[safetensor_name] = expert_tensor[expert_id]
-                        # check_equal(state_dict, tensor_dict_st, safetensor_name)
                         if (
                             main_weight_dtype == "float8_e4m3fn"
                             and not safetensor_name.endswith("norm.weight")

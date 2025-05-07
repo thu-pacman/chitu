@@ -2158,41 +2158,41 @@ class TransformerDeepSeekV3(Transformer):
         *args,
         **kwargs,
     ):
-        if skip_preprocess and replace:
+        if not skip_preprocess and replace:
             new_state_dict = {}
             for k in state_dict.keys():
                 name = k
-                name = name.replace("self_attn", "attn")
-                name = name.replace("mlp", "ffn")
-                name = name.replace("weight_scale_inv", "scale")
-                name = name.replace("weight_scale", "scale")
-                name = name.replace("weight_scale_2", "scale_2")
-                name = name.replace("e_score_correction_bias", "bias")
+                name = name.replace(".self_attn.", ".attn.")
+                name = name.replace(".mlp.", ".ffn.")
+                name = name.replace(".weight_scale_inv", ".scale")
+                name = name.replace(".weight_scale", ".scale")
+                name = name.replace(".weight_scale_2", ".scale_2")
+                name = name.replace(".e_score_correction_bias", ".bias")
                 key = name.split(".")[-2]
                 mapping = {
-                    "embed_tokens": ("embed", 0),
-                    "input_layernorm": ("attn_norm", None),
-                    "post_attention_layernorm": ("ffn_norm", None),
-                    "q_proj": ("wq", 0),
-                    "q_a_proj": ("wq_a", None),
-                    "q_a_layernorm": ("q_norm", None),
-                    "q_b_proj": ("wq_b", 0),
-                    "kv_a_proj_with_mqa": ("wkv_a", None),
-                    "kv_a_layernorm": ("kv_norm", None),
-                    "kv_b_proj": ("wkv_b", 0),
-                    "o_proj": ("wo", 1),
-                    "gate": ("gate", None),
-                    "gate_proj": ("w1", 0),
-                    "down_proj": ("w2", 1),
-                    "up_proj": ("w3", 0),
-                    "norm": ("norm", None),
-                    "lm_head": ("head", 0),
-                    "scale": ("scale", None),
-                    "input_scale": ("input_scale", None),
-                    "scale_2": ("scale_2", None),
+                    "embed_tokens": "embed",
+                    "input_layernorm": "attn_norm",
+                    "post_attention_layernorm": "ffn_norm",
+                    "q_proj": "wq",
+                    "q_a_proj": "wq_a",
+                    "q_a_layernorm": "q_norm",
+                    "q_b_proj": "wq_b",
+                    "kv_a_proj_with_mqa": "wkv_a",
+                    "kv_a_layernorm": "kv_norm",
+                    "kv_b_proj": "wkv_b",
+                    "o_proj": "wo",
+                    "gate": "gate",
+                    "gate_proj": "w1",
+                    "down_proj": "w2",
+                    "up_proj": "w3",
+                    "norm": "norm",
+                    "lm_head": "head",
+                    "scale": "scale",
+                    "input_scale": "input_scale",
+                    "scale_2": "scale_2",
                 }
-                assert key in mapping, f"Key {key} not found in mapping"
-                new_key, dim = mapping[key]
+                assert key in mapping, f"Key {key} in {name} not found in mapping"
+                new_key = mapping[key]
                 name = name.replace(key, new_key)
                 new_state_dict[name] = state_dict[k]
             state_dict = new_state_dict
