@@ -1108,24 +1108,35 @@ class MoEDeepSeekV3(nn.Module):
                 op_impl=op_impl,
             )
 
-    def get_expert_weights_for_fp8_w8a8(self, expert_num):
-        w1w3_weight = self.w1w3.weight[:expert_num]
-        w1w3_scale = self.w1w3.scale[:expert_num]
-        w2_weight = self.w2.weight[:expert_num]
-        w2_scale = self.w2.scale[:expert_num]
+    def get_expert_weights_for_fp8_w8a8(self):
+        w1w3_weight = self.w1w3.weight
+        w1w3_scale = self.w1w3.scale
+        w2_weight = self.w2.weight
+        w2_scale = self.w2.scale
         return w1w3_weight, w1w3_scale, w2_weight, w2_scale
 
-    def get_expert_weights_for_non_fp8(self, expert_num):
-        w1w3_weight = self.w1w3.weight[:expert_num]
+    def get_expert_weights_for_non_fp8(self):
+        w1w3_weight = self.w1w3.weight
         w1w3_scale = None
-        w2_weight = self.w2.weight[:expert_num]
+        w2_weight = self.w2.weight
         w2_scale = None
         return w1w3_weight, w1w3_scale, w2_weight, w2_scale
 
-    def get_expert_weight_scale_2_for_fp4(self, expert_num):
-        w1w3_weight_scale2 = self.w1w3.scale_2[:expert_num]
-        w2_scale2 = self.w2.scale_2[:expert_num]
-        return w1w3_weight_scale2, w2_scale2
+    def get_expert_weights_for_fp4(self):
+        w1w3_weight = self.w1w3.weight
+        w1w3_weigth_scale = self.w1w3.scale
+        w1w3_weight_scale2 = self.w1w3.scale_2
+        w2_weight = self.w2.weight
+        w2_weight_scale = self.w2.scale
+        w2_weight_scale2 = self.w2.scale_2
+        return (
+            w1w3_weight,
+            w1w3_weigth_scale,
+            w1w3_weight_scale2,
+            w2_weight,
+            w2_weight_scale,
+            w2_weight_scale2,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -1138,10 +1149,6 @@ class MoEDeepSeekV3(nn.Module):
             torch.Tensor: Output tensor after expert routing and computation.
         """
 
-        shared_experts = 0
-        if self.fuse_shared_experts:
-            shared_experts = self.n_shared_experts
-
         shape = x.size()
         x = x.view(-1, self.dim)
 
@@ -1150,86 +1157,76 @@ class MoEDeepSeekV3(nn.Module):
         if self.op_impl == "muxi_custom_kernel":
             y = self._compute_muxi_fused_experts(x, weights, indices)
         elif has_triton:
-            if self.w1w3.scale is None and self.w2.scale is None:
+            args = get_global_args()
+            quant_method = (
+                None if not hasattr(args.models, "quant") else args.models.quant
+            )
+            if quant_method is None:
                 w1w3_weight, w1w3_scale, w2_weight, w2_scale = (
-                    self.get_expert_weights_for_non_fp8(
-                        self.n_routed_experts + shared_experts
-                    )
+                    self.get_expert_weights_for_non_fp8()
                 )
                 w1w3_scale_2, w2_scale_2 = None, None
                 use_fp4_w4a8 = False
                 use_fp8_w8a8 = False
                 fused_soft_fp8 = False
-            else:
-                assert self.w1w3.scale is not None
-                assert self.w2.scale is not None
-                if not get_global_args().infer.raise_lower_bit_float_to == "bfloat16":
-                    w1w3_weight, w1w3_scale, w2_weight, w2_scale = (
-                        self.get_expert_weights_for_fp8_w8a8(
-                            self.n_routed_experts + shared_experts
-                        )
-                    )
-                    if self.is_fp4:
-                        w1w3_scale_2, w2_scale_2 = (
-                            self.get_expert_weight_scale_2_for_fp4(
-                                expert_num=self.n_routed_experts + shared_experts
-                            )
-                        )
-                        use_fp4_w4a8 = True
-                        use_fp8_w8a8 = False
-                        fused_soft_fp8 = False
-                    else:
-                        w1w3_scale_2, w2_scale_2 = None, None
-                        use_fp4_w4a8 = False
-                        use_fp8_w8a8 = True
-                        fused_soft_fp8 = False
-                elif is_nvidia() or is_muxi():
-                    w1w3_weight, w1w3_scale, w2_weight, w2_scale = (
-                        self.get_expert_weights_for_fp8_w8a8(
-                            self.n_routed_experts + shared_experts
-                        )
-                    )
-                    if self.is_fp4:
-                        w1w3_scale_2, w2_scale_2 = (
-                            self.get_expert_weight_scale_2_for_fp4(
-                                expert_num=self.n_routed_experts + shared_experts
-                            )
-                        )
-                        use_fp4_w4a8 = True
-                        use_fp8_w8a8 = False
-                        fused_soft_fp8 = True
-                    else:
-                        w1w3_scale_2, w2_scale_2 = None, None
-                        use_fp4_w4a8 = False
-                        use_fp8_w8a8 = True
-                        fused_soft_fp8 = True
 
-                else:
-                    logger.warning(
-                        f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
-                    )
-                    block_size = 128
-                    w1w3_weight = weight_dequant_soft_fp8_deepseek_v3(
-                        self.w1w3.weight[
-                            : self.n_routed_experts + self.n_shared_experts
-                        ],
-                        self.w1w3.scale[
-                            : self.n_routed_experts + self.n_shared_experts
-                        ],
-                        block_size,
-                    )
-                    w1w3_scale = None
-                    w1w3_scale_2 = None
-                    w2_weight = weight_dequant_soft_fp8_deepseek_v3(
-                        self.w2.weight[: self.n_routed_experts + self.n_shared_experts],
-                        self.w2.scale[: self.n_routed_experts + self.n_shared_experts],
-                        block_size,
-                    )
-                    w2_scale = None
-                    w2_scale_2 = None
-                    use_fp4_w4a8 = False
-                    use_fp8_w8a8 = False
+            elif (
+                parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
+                == 1
+                or is_nvidia()
+                or is_muxi()
+            ):
+                if (
+                    parse_dtype(
+                        get_global_args().infer.raise_lower_bit_float_to
+                    ).itemsize
+                    == 1
+                ):
                     fused_soft_fp8 = False
+                else:
+                    fused_soft_fp8 = True
+
+                if self.is_fp4:
+                    (
+                        w1w3_weight,
+                        w1w3_scale,
+                        w1w3_scale_2,
+                        w2_weight,
+                        w2_scale,
+                        w2_scale_2,
+                    ) = self.get_expert_weights_for_fp4()
+                    use_fp4_w4a8 = True
+                    use_fp8_w8a8 = False
+                else:
+                    w1w3_weight, w1w3_scale, w2_weight, w2_scale = (
+                        self.get_expert_weights_for_fp8_w8a8()
+                    )
+                    w1w3_scale_2, w2_scale_2 = None, None
+                    use_fp4_w4a8 = False
+                    use_fp8_w8a8 = True
+
+            else:
+                logger.warning(
+                    f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
+                )
+                block_size = 128
+                w1w3_weight = weight_dequant_soft_fp8_deepseek_v3(
+                    self.w1w3.weight,
+                    self.w1w3.scale,
+                    block_size,
+                )
+                w1w3_scale = None
+                w1w3_scale_2 = None
+                w2_weight = weight_dequant_soft_fp8_deepseek_v3(
+                    self.w2.weight,
+                    self.w2.scale,
+                    block_size,
+                )
+                w2_scale = None
+                w2_scale_2 = None
+                use_fp4_w4a8 = False
+                use_fp8_w8a8 = False
+                fused_soft_fp8 = False
 
             if not self.fuse_shared_experts:
                 y1 = self.shared_experts(x)
@@ -1823,32 +1820,28 @@ class TransformerDeepSeekV3(Transformer):
 
         new_checkpoint = {}
         for k in checkpoint.keys():
-            replaced = False
-            for w in ["w1", "w2", "w3", "w1w3"]:
-                for part in ["weight", "scale", "bias", "input_scale", "scale_2"]:
-                    if k.endswith(f".experts.0.{w}.{part}"):
-                        prefix = k[: -len(f"experts.0.{w}.{part}")]
-                        parts = []
-                        for i in range(self.params.n_routed_experts):
-                            parts.append(checkpoint[prefix + f"experts.{i}.{w}.{part}"])
-                        if fuse_shared_experts:
-                            parts.append(
-                                checkpoint[prefix + f"shared_experts.{w}.{part}"]
-                            )
-                        new_checkpoint[prefix + f"{w}.{part}"] = torch.stack(
-                            parts, dim=0
-                        )
-                        replaced = True
-                        break
-                if replaced:
-                    break
-            if replaced:
+            if any(
+                k.endswith(f".experts.0.{w}.{part}")
+                for w in ["w1", "w2", "w3", "w1w3"]
+                for part in self._get_2d_out_x_in_tensor_names()
+                + self._get_2d_in_x_out_tensor_names()
+                + self._get_1d_in_tensor_names()
+                + self._get_1d_out_tensor_names()
+            ):
+                w, part = k.split(".")[-2:]
+                prefix = k[: -len(f"experts.0.{w}.{part}")]
+                parts = []
+                for i in range(self.params.n_routed_experts):
+                    parts.append(checkpoint[prefix + f"experts.{i}.{w}.{part}"])
+                if fuse_shared_experts:
+                    parts.append(checkpoint[prefix + f"shared_experts.{w}.{part}"])
+                new_checkpoint[prefix + f"{w}.{part}"] = torch.stack(parts, dim=0)
+            elif ".experts." in k:
                 continue
-            if ".experts." in k:
+            elif fuse_shared_experts and ".shared_experts." in k:
                 continue
-            if fuse_shared_experts and ".shared_experts." in k:
-                continue
-            new_checkpoint[k] = checkpoint[k]
+            else:
+                new_checkpoint[k] = checkpoint[k]
         return new_checkpoint
 
     def _process_state_dict_for_absorption_without_precomputation(
@@ -2053,36 +2046,47 @@ class TransformerDeepSeekV3(Transformer):
     def _process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
-            if k.endswith(".wq_a.weight"):
-                prefix = k[: -len("wq_a.weight")]
-                assert prefix + "wkv_a.weight" in checkpoint
-                q_weight = checkpoint[prefix + "wq_a.weight"]
-                kv_weight = checkpoint[prefix + "wkv_a.weight"]
-                new_checkpoint[prefix + "wqkv_a.weight"] = torch.cat(
+            # Cat dim 0
+            if any(
+                k.endswith(f".wq_a.{tensor_name}")
+                for tensor_name in self._get_2d_out_x_in_tensor_names()
+                + self._get_1d_out_tensor_names()
+            ):
+                tensor_name = k.split(".")[-1]
+                prefix = k[: -len(f".wq_a.{tensor_name}")]
+                assert f"{prefix}.wkv_a.{tensor_name}" in checkpoint
+                q_weight = checkpoint[f"{prefix}.wq_a.{tensor_name}"]
+                kv_weight = checkpoint[f"{prefix}.wkv_a.{tensor_name}"]
+                new_checkpoint[f"{prefix}.wqkv_a.{tensor_name}"] = torch.cat(
                     [q_weight, kv_weight], dim=0
                 )
-            elif k.endswith(".wkv_a.weight"):
+            elif any(
+                k.endswith(f".wkv_a.{tensor_name}")
+                for tensor_name in self._get_2d_out_x_in_tensor_names()
+                + self._get_1d_out_tensor_names()
+            ):
                 continue
-            elif k.endswith(".wq_a.scale"):
-                prefix = k[: -len("wq_a.scale")]
-                assert prefix + "wkv_a.scale" in checkpoint
-                q_scale = checkpoint[prefix + "wq_a.scale"]
-                kv_scale = checkpoint[prefix + "wkv_a.scale"]
-                new_checkpoint[prefix + "wqkv_a.scale"] = torch.cat(
-                    [q_scale, kv_scale], dim=0
+
+            # Cat dim 1
+            elif any(
+                k.endswith(f".wq_a.{tensor_name}")
+                for tensor_name in self._get_2d_in_x_out_tensor_names()
+            ):
+                tensor_name = k.split(".")[-1]
+                prefix = k[: -len(f".wq_a.{tensor_name}")]
+                assert f"{prefix}.wkv_a.{tensor_name}" in checkpoint
+                q_weight = checkpoint[f"{prefix}.wq_a.{tensor_name}"]
+                kv_weight = checkpoint[f"{prefix}.wkv_a.{tensor_name}"]
+                new_checkpoint[f"{prefix}.wqkv_a.{tensor_name}"] = torch.cat(
+                    [q_weight, kv_weight], dim=1
                 )
-            elif k.endswith(".wkv_a.scale"):
+            elif any(
+                k.endswith(f".wkv_a.{tensor_name}")
+                for tensor_name in self._get_2d_in_x_out_tensor_names()
+            ):
                 continue
-            elif k.endswith(".wq_a.bias"):
-                prefix = k[: -len("wq_a.bias")]
-                assert prefix + "wkv_a.bias" in checkpoint
-                q_bias = checkpoint[prefix + "wq_a.bias"]
-                kv_bias = checkpoint[prefix + "wkv_a.bias"]
-                new_checkpoint[prefix + "wqkv_a.bias"] = torch.cat(
-                    [q_bias, kv_bias], dim=0
-                )
-            elif k.endswith(".wkv_a.bias"):
-                continue
+
+            # Unchanged tensors
             else:
                 new_checkpoint[k] = checkpoint[k]
         return new_checkpoint
@@ -2090,61 +2094,49 @@ class TransformerDeepSeekV3(Transformer):
     def _process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
-            if k.endswith(".w1.weight"):
-                prefix = k[: -len("w1.weight")]
-                assert prefix + "w3.weight" in checkpoint
-                assert prefix + "w1w3.weight" not in checkpoint
-                gate_weight = checkpoint[prefix + "w1.weight"]
-                up_weight = checkpoint[prefix + "w3.weight"]
-                new_checkpoint[prefix + "w1w3.weight"] = torch.cat(
+            # Cat dim 0
+            if any(
+                k.endswith(f".w1.{tensor_name}")
+                for tensor_name in self._get_2d_out_x_in_tensor_names()
+                + self._get_1d_out_tensor_names()
+            ):
+                tensor_name = k.split(".")[-1]
+                prefix = k[: -len(f".w1.{tensor_name}")]
+                assert f"{prefix}.w3.{tensor_name}" in checkpoint
+                assert f"{prefix}.w1w3.{tensor_name}" not in checkpoint
+                gate_weight = checkpoint[f"{prefix}.w1.{tensor_name}"]
+                up_weight = checkpoint[f"{prefix}.w3.{tensor_name}"]
+                new_checkpoint[f"{prefix}.w1w3.{tensor_name}"] = torch.cat(
                     [gate_weight, up_weight], dim=0
                 )
-            elif k.endswith(".w3.weight"):
+            elif any(
+                k.endswith(f".w3.{tensor_name}")
+                for tensor_name in self._get_2d_out_x_in_tensor_names()
+                + self._get_1d_out_tensor_names()
+            ):
                 continue
-            elif k.endswith(".w1.scale"):
-                prefix = k[: -len("w1.scale")]
-                assert prefix + "w3.scale" in checkpoint
-                assert prefix + "w1w3.scale" not in checkpoint
-                gate_scale = checkpoint[prefix + "w1.scale"]
-                up_scale = checkpoint[prefix + "w3.scale"]
-                new_checkpoint[prefix + "w1w3.scale"] = torch.cat(
-                    [gate_scale, up_scale], dim=0
+
+            # Cat dim 1
+            elif any(
+                k.endswith(f".w1.{tensor_name}")
+                for tensor_name in self._get_2d_in_x_out_tensor_names()
+            ):
+                tensor_name = k.split(".")[-1]
+                prefix = k[: -len(f".w1.{tensor_name}")]
+                assert f"{prefix}.w3.{tensor_name}" in checkpoint
+                assert f"{prefix}.w1w3.{tensor_name}" not in checkpoint
+                gate_weight = checkpoint[f"{prefix}.w1.{tensor_name}"]
+                up_weight = checkpoint[f"{prefix}.w3.{tensor_name}"]
+                new_checkpoint[f"{prefix}.w1w3.{tensor_name}"] = torch.cat(
+                    [gate_weight, up_weight], dim=1
                 )
-            elif k.endswith(".w3.scale"):
+            elif any(
+                k.endswith(f".w3.{tensor_name}")
+                for tensor_name in self._get_2d_in_x_out_tensor_names()
+            ):
                 continue
-            elif k.endswith(".w1.scale_2"):
-                prefix = k[: -len("w1.scale_2")]
-                assert prefix + "w3.scale_2" in checkpoint
-                assert prefix + "w1w3.scale_2" not in checkpoint
-                gate_scale = checkpoint[prefix + "w1.scale_2"]
-                up_scale = checkpoint[prefix + "w3.scale_2"]
-                new_checkpoint[prefix + "w1w3.scale_2"] = torch.cat(
-                    [gate_scale, up_scale], dim=0
-                )
-            elif k.endswith(".w3.scale_2"):
-                continue
-            elif k.endswith(".w1.input_scale"):
-                prefix = k[: -len("w1.input_scale")]
-                assert prefix + "w3.input_scale" in checkpoint
-                assert prefix + "w1w3.input_scale" not in checkpoint
-                gate_scale = checkpoint[prefix + "w1.input_scale"]
-                up_scale = checkpoint[prefix + "w3.input_scale"]
-                new_checkpoint[prefix + "w1w3.input_scale"] = torch.cat(
-                    [gate_scale, up_scale], dim=0
-                )
-            elif k.endswith(".w3.input_scale"):
-                continue
-            elif k.endswith(".w1.bias"):
-                prefix = k[: -len("w1.bias")]
-                assert prefix + "w3.bias" in checkpoint
-                assert prefix + "w1w3.bias" not in checkpoint
-                gate_bias = checkpoint[prefix + "w1.bias"]
-                up_bias = checkpoint[prefix + "w3.bias"]
-                new_checkpoint[prefix + "w1w3.bias"] = torch.cat(
-                    [gate_bias, up_bias], dim=0
-                )
-            elif k.endswith(".w3.bias"):
-                continue
+
+            # Unchanged tensors
             else:
                 new_checkpoint[k] = checkpoint[k]
         return new_checkpoint

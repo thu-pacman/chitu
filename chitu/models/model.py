@@ -343,6 +343,40 @@ class Transformer(nn.Module):
     def _get_layer_i_prefixes(self, i: int) -> List[str]:
         raise NotImplementedError
 
+    def _get_2d_out_x_in_tensor_names(self) -> List[str]:
+        ret = ["weight"]
+        quant = self.params.quant if hasattr(self.params, "quant") else None
+        if quant == "blockfp8":
+            ret += ["scale"]
+        elif quant == "blockfp4":
+            ret += ["scale", "scale_2", "input_scale"]
+        return ret
+
+    def _get_2d_in_x_out_tensor_names(self) -> List[str]:
+        ret = []
+        quant = self.params.quant if hasattr(self.params, "quant") else None
+        if quant == "autoawq":
+            ret += ["qweight", "qzeros", "scales"]
+        elif quant == "gptqmodel":
+            ret += ["qweight", "qzeros", "scales"]
+        return ret
+
+    def _get_1d_in_tensor_names(self) -> List[str]:
+        ret = []
+        quant = self.params.quant if hasattr(self.params, "quant") else None
+        if quant == "gptqmodel":
+            ret += ["g_idx"]
+        return ret
+
+    def _get_1d_out_tensor_names(self) -> List[str]:
+        ret = ["bias"]
+        quant = self.params.quant if hasattr(self.params, "quant") else None
+        if quant == "simple_w8a8":
+            ret += ["scale_channel"]
+        if quant == "simple_w8a8_muxi":
+            ret += ["scale_channel"]
+        return ret
+
     def _chunk_checkpoint_for_pipeline_parallel(
         self,
         checkpoint,
@@ -394,54 +428,69 @@ class Transformer(nn.Module):
 
         for name, param in checkpoint.items():
             if any(is_layer(s, name) for s in cpl_names):
-                if name.endswith("input_scale") or (
-                    quant == "blockfp4" and name.endswith("scale_2")
+                if (
+                    name.split(".")[-1]
+                    in self._get_1d_in_tensor_names() + self._get_1d_out_tensor_names()
                 ):
-                    partial_checkpoint[name] = param
-                elif (
-                    name.endswith(".weight")
-                    or (quant == "blockfp8" and name.endswith(".scale"))
-                    or (quant == "blockfp4" and name.endswith(".scale"))
-                ):
-                    chunks = torch.chunk(param, world_size, dim=0)
-                    partial_checkpoint[name] = chunks[rank]
-                elif name.endswith(".bias"):
-                    chunks = torch.chunk(param, world_size, dim=-1)
-                    partial_checkpoint[name] = chunks[rank]
-                elif quant == "autoawq" and (
-                    name.endswith(".qweight")
-                    or name.endswith(".qzeros")
-                    or name.endswith(".scales")
-                ):
-                    chunks = torch.chunk(param, world_size, dim=1)
-                    partial_checkpoint[name] = chunks[rank]
-                else:
-                    assert False, f"Illegal parallel tensor {name}"
-            elif any(is_layer(s, name) for s in rpl_names):
-                if name.endswith("input_scale") or (
-                    quant == "blockfp4" and name.endswith("scale_2")
-                ):
-                    partial_checkpoint[name] = param
-                elif (
-                    name.endswith(".weight")
-                    or (quant == "blockfp8" and name.endswith(".scale"))
-                    or (quant == "blockfp4" and name.endswith(".scale"))
-                ):
-                    chunks = torch.chunk(param, world_size, dim=1)
-                    partial_checkpoint[name] = chunks[rank]
-                elif name.endswith(".bias"):
-                    # Rank 0 needs a full bias and only rank 0 needs it
-                    if get_tp_rank() == 0:
+                    assert param.dim() == 1
+                    if param.shape[0] == 1:  # Broadcast
                         partial_checkpoint[name] = param
-                elif quant == "autoawq" and (
-                    name.endswith(".qweight")
-                    or name.endswith(".qzeros")
-                    or name.endswith(".scales")
-                ):
-                    chunks = torch.chunk(param, world_size, dim=0)
-                    partial_checkpoint[name] = chunks[rank]
+                    else:
+                        assert param.shape[0] % world_size == 0
+                        chunks = torch.chunk(param, world_size, dim=0)
+                        partial_checkpoint[name] = chunks[rank]
+                elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names():
+                    assert param.dim() == 2
+                    if param.shape[0] == 1:  # Broadcast
+                        partial_checkpoint[name] = param
+                    else:
+                        assert param.shape[0] % world_size == 0
+                        chunks = torch.chunk(param, world_size, dim=0)
+                        partial_checkpoint[name] = chunks[rank]
+                elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names():
+                    assert param.dim() == 2
+                    if param.shape[1] == 1:  # Broadcast
+                        partial_checkpoint[name] = param
+                    else:
+                        assert param.shape[1] % world_size == 0
+                        chunks = torch.chunk(param, world_size, dim=1)
+                        partial_checkpoint[name] = chunks[rank]
                 else:
+                    # FIXME: Support quant=llmint8 for TP
                     assert False, f"Illegal parallel tensor {name}"
+
+            elif any(is_layer(s, name) for s in rpl_names):
+                if (
+                    name.split(".")[-1]
+                    in self._get_1d_in_tensor_names() + self._get_1d_out_tensor_names()
+                ):
+                    assert param.dim() == 1
+                    if param.shape[0] == 1:  # Broadcast
+                        partial_checkpoint[name] = param
+                    else:
+                        assert param.shape[0] % world_size == 0
+                        chunks = torch.chunk(param, world_size, dim=0)
+                        partial_checkpoint[name] = chunks[rank]
+                elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names():
+                    assert param.dim() == 2
+                    if param.shape[1] == 1:  # Broadcast
+                        partial_checkpoint[name] = param
+                    else:
+                        assert param.shape[1] % world_size == 0
+                        chunks = torch.chunk(param, world_size, dim=1)
+                        partial_checkpoint[name] = chunks[rank]
+                elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names():
+                    assert param.dim() == 2
+                    if param.shape[0] == 1:  # Broadcast
+                        partial_checkpoint[name] = param
+                    else:
+                        assert param.shape[0] % world_size == 0
+                        chunks = torch.chunk(param, world_size, dim=0)
+                        partial_checkpoint[name] = chunks[rank]
+                else:
+                    # FIXME: Support quant=llmint8 for TP
+                    assert False, f"Illegal parallel tensor {name}"
+
             else:
                 partial_checkpoint[name] = param
         return partial_checkpoint
@@ -451,7 +500,7 @@ class Transformer(nn.Module):
         if quant == "blockfp4":
             new_state_dict = {}
             for key, value in state_dict.items():
-                if key.endswith(".scale_2") or key.endswith("input_scale"):
+                if key.endswith(".scale_2") or key.endswith(".input_scale"):
                     new_state_dict[key] = value.view(1, 1)
                 else:
                     new_state_dict[key] = value
