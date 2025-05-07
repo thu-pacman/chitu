@@ -1,4 +1,5 @@
 import struct
+import packaging
 from typing import Tuple, Optional
 
 import torch
@@ -767,7 +768,8 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3(
     a_s: torch.Tensor,
     b: torch.Tensor,
     b_s: torch.Tensor,
-    b_s_2: Optional[torch.Tensor] = None,
+    b_s_2: torch.Tensor,
+    act_block_size: int,
 ):
     """
     Perform a matrix multiplication with FP8 dynamically casted to BF16.
@@ -778,13 +780,27 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3(
         b (torch.Tensor): The second input matrix, must be contiguous.
         b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
         b_s_2 (torch.Tensor): The scaling factor for b_s, must be contiguous.
+        act_block_size (int): The block size for activation quantization.
 
     Returns:
         torch.Tensor: The result of the matrix multiplication.
     """
+
+    if packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"):
+        raise ImportError("Triton version >= 3.2.0 is required for soft fp4")
+
     assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
     assert a_s.is_contiguous(), "Scaling factor of A must be contiguous"
     assert b_s.is_contiguous(), "Scaling factor tensor must be contiguous"
+    assert b_s_2.is_contiguous(), "Scaling_2 factor tensor must be contiguous"
+
+    assert b_s.dim() == 2
+    assert b_s.shape[0] == b.shape[0]
+    assert b_s.shape[1] == b.shape[1] * 2 // 16
+    assert b_s_2.dim() == 2
+    assert b_s_2.shape[0] == 1 or b_s_2.shape[0] == 2
+    assert b_s_2.shape[1] == 1
+
     K = a.size(-1)
     M = a.numel() // K
     N = b.size(0)
@@ -794,9 +810,6 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3(
         triton.cdiv(M, META["BLOCK_SIZE_M"]),
         triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    assert b_s_2 is not None, "Scaling_2 factor tensor must exist"
-    assert b_s_2.is_contiguous(), "Scaling_2 factor tensor must be contiguous"
-
     soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel[grid](
         a,
         b,
@@ -807,9 +820,9 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3(
         M,
         N,
         K,
-        group_k=128,
+        group_k=act_block_size,
         stride_b_s=16,
-        is_w1w3=(b_s_2.numel() == 2),
+        is_w1w3=(b_s_2.shape[0] == 2),
     )
     return c
 
@@ -819,7 +832,7 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3(
     a: torch.Tensor,
     b: torch.Tensor,
     b_s: torch.Tensor,
-    b_s_2: Optional[torch.Tensor] = None,
+    b_s_2: torch.Tensor,
 ):
     """
     Perform a matrix multiplication with FP8 dynamically casted to BF16.
@@ -833,8 +846,21 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3(
     Returns:
         torch.Tensor: The result of the matrix multiplication.
     """
+
+    if packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"):
+        raise ImportError("Triton version >= 3.2.0 is required for soft fp4")
+
     assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
     assert b_s.is_contiguous(), "Scaling factor tensor must be contiguous"
+    assert b_s_2.is_contiguous(), "Scaling_2 factor tensor must be contiguous"
+
+    assert b_s.dim() == 2
+    assert b_s.shape[0] == b.shape[0]
+    assert b_s.shape[1] == b.shape[1] * 2 // 16
+    assert b_s_2.dim() == 2
+    assert b_s_2.shape[0] == 1 or b_s_2.shape[0] == 2
+    assert b_s_2.shape[1] == 1
+
     K = a.size(-1)
     M = a.numel() // K
     N = b.size(0)
@@ -843,9 +869,6 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3(
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    assert b_s_2 is not None, "Scaling_2 factor tensor must exist"
-    assert b_s_2.is_contiguous(), "Scaling_2 factor tensor must be contiguous"
-
     soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel[grid](
         a,
         b,
@@ -856,7 +879,7 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3(
         N,
         K,
         stride_b_s=16,
-        is_w1w3=(b_s_2.numel() == 2),
+        is_w1w3=(b_s_2.shape[0] == 2),
     )
     return c
 

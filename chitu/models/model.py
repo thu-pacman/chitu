@@ -394,13 +394,14 @@ class Transformer(nn.Module):
 
         for name, param in checkpoint.items():
             if any(is_layer(s, name) for s in cpl_names):
-                if name.endswith("input_scale") or (name.endswith("scale_2")):
+                if name.endswith("input_scale") or (
+                    quant == "blockfp4" and name.endswith("scale_2")
+                ):
                     partial_checkpoint[name] = param
                 elif (
                     name.endswith(".weight")
-                    or (self.params.type == "deepseek-v3" and name.endswith(".scale"))
                     or (quant == "blockfp8" and name.endswith(".scale"))
-                    or (quant == "blockfp4" and name.endswith(".weight_scale"))
+                    or (quant == "blockfp4" and name.endswith(".scale"))
                 ):
                     chunks = torch.chunk(param, world_size, dim=0)
                     partial_checkpoint[name] = chunks[rank]
@@ -417,13 +418,14 @@ class Transformer(nn.Module):
                 else:
                     assert False, f"Illegal parallel tensor {name}"
             elif any(is_layer(s, name) for s in rpl_names):
-                if name.endswith("input_scale") or (name.endswith("scale_2")):
+                if name.endswith("input_scale") or (
+                    quant == "blockfp4" and name.endswith("scale_2")
+                ):
                     partial_checkpoint[name] = param
                 elif (
                     name.endswith(".weight")
-                    or (self.params.type == "deepseek-v3" and name.endswith("scale"))
                     or (quant == "blockfp8" and name.endswith(".scale"))
-                    or (quant == "blockfp4" and name.endswith(".weight_scale"))
+                    or (quant == "blockfp4" and name.endswith(".scale"))
                 ):
                     chunks = torch.chunk(param, world_size, dim=1)
                     partial_checkpoint[name] = chunks[rank]
@@ -444,6 +446,32 @@ class Transformer(nn.Module):
                 partial_checkpoint[name] = param
         return partial_checkpoint
 
+    def process_state_dict_for_blockfp4_before_chunk(self, state_dict):
+        quant = self.params.quant if hasattr(self.params, "quant") else None
+        if quant == "blockfp4":
+            new_state_dict = {}
+            for key, value in state_dict.items():
+                if key.endswith(".scale_2") or key.endswith("input_scale"):
+                    new_state_dict[key] = value.view(1, 1)
+                else:
+                    new_state_dict[key] = value
+            state_dict = new_state_dict
+        return state_dict
+
+    def process_state_dict_for_blockfp4_after_chunk(self, state_dict):
+        quant = self.params.quant if hasattr(self.params, "quant") else None
+        if quant == "blockfp4":
+            new_state_dict = {}
+            for k in state_dict.keys():
+                param = state_dict[k]
+                if param.dtype == torch.uint8 and "weight" in k:
+                    param.data = chitu_backend.weight_layout_change(
+                        param.data.cuda()
+                    ).cpu()
+                new_state_dict[k] = param
+            state_dict = new_state_dict
+        return state_dict
+
     def load_state_dict_parallel(
         self,
         state_dict: Mapping[str, Any],
@@ -452,6 +480,7 @@ class Transformer(nn.Module):
         **kwargs,
     ):
         if not skip_preprocess:
+            state_dict = self.process_state_dict_for_blockfp4_before_chunk(state_dict)
             if self.pipeline_exec:
                 state_dict = self._chunk_checkpoint_for_pipeline_parallel(
                     state_dict, self.global_n_layers, self.pp_stage, self.pp_size
@@ -471,6 +500,8 @@ class Transformer(nn.Module):
         *args,
         **kwargs,
     ):
+        if not skip_preprocess:
+            state_dict = self.process_state_dict_for_blockfp4_after_chunk(state_dict)
         super().load_state_dict(state_dict, *args, **kwargs)
 
     def _init_pre_layers(self):

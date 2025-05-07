@@ -49,8 +49,7 @@ from chitu.muxi_utils import (
     grouped_topk,
     muxi_fused_experts,
 )
-
-from chitu.utils import try_import_opt_dep, parse_dtype
+from chitu.utils import try_import_opt_dep, parse_dtype, ceil_div
 from chitu.quantization import (
     linear_block_fp8,
     linear_block_fp4,
@@ -217,7 +216,12 @@ class GroupColumnParallelLinearDeepSeekV3(torch.nn.Module):
         local_out_features = local_out_features = out_features // self.tp_size
 
         self.weight = torch.nn.Parameter(
-            torch.empty(group_size, local_out_features, in_features, dtype=dtype),
+            torch.empty(
+                group_size,
+                local_out_features,
+                in_features // 2 if is_fp4 else in_features,
+                dtype=dtype,
+            ),
             requires_grad=False,
         )
         if has_bias:
@@ -230,11 +234,9 @@ class GroupColumnParallelLinearDeepSeekV3(torch.nn.Module):
         if dtype.itemsize == 1:
             block_size = 128
             if is_fp4:
-                quant_scale_stride = 8
+                quant_scale_stride = 16
                 scale_out_features = local_out_features
-                scale_in_features = (
-                    in_features + quant_scale_stride - 1
-                ) // quant_scale_stride
+                scale_in_features = ceil_div(in_features, quant_scale_stride)
                 self.scale = nn.Parameter(
                     torch.empty(
                         group_size,
@@ -248,6 +250,7 @@ class GroupColumnParallelLinearDeepSeekV3(torch.nn.Module):
                     torch.empty(
                         group_size,
                         scale_2_dim,
+                        1,
                         dtype=torch.float32,
                     ),
                     requires_grad=False,
@@ -256,6 +259,7 @@ class GroupColumnParallelLinearDeepSeekV3(torch.nn.Module):
                     torch.empty(
                         group_size,
                         scale_2_dim,
+                        1,
                         dtype=torch.float32,
                     ),
                     requires_grad=False,
@@ -341,7 +345,12 @@ class GroupRowParallelLinearDeepSeekV3(torch.nn.Module):
         self.input_is_parallel = input_is_parallel
 
         self.weight = torch.nn.Parameter(
-            torch.empty(group_size, out_features, local_in_features, dtype=dtype),
+            torch.empty(
+                group_size,
+                out_features,
+                local_in_features // 2 if is_fp4 else local_in_features,
+                dtype=dtype,
+            ),
             requires_grad=False,
         )
         if has_bias:
@@ -354,11 +363,9 @@ class GroupRowParallelLinearDeepSeekV3(torch.nn.Module):
         if dtype.itemsize == 1:
             block_size = 128
             if is_fp4:
-                quant_scale_stride = 8
+                quant_scale_stride = 16
                 scale_out_features = out_features
-                scale_in_features = (
-                    local_in_features + quant_scale_stride - 1
-                ) // quant_scale_stride
+                scale_in_features = ceil_div(local_in_features, quant_scale_stride)
                 self.scale = nn.Parameter(
                     torch.empty(
                         group_size,
@@ -371,7 +378,8 @@ class GroupRowParallelLinearDeepSeekV3(torch.nn.Module):
                 self.input_scale = nn.Parameter(
                     torch.empty(
                         group_size,
-                        1,  # In FP4 quantized model, one Tensor has one scale_2
+                        1,
+                        1,
                         dtype=torch.float32,
                     ),
                     requires_grad=False,
@@ -379,6 +387,7 @@ class GroupRowParallelLinearDeepSeekV3(torch.nn.Module):
                 self.scale_2 = nn.Parameter(
                     torch.empty(
                         group_size,
+                        1,
                         1,
                         dtype=torch.float32,
                     ),
@@ -445,7 +454,6 @@ class AttentionDeepSeekV3(Attention):
         op_impl: str,
         mla_absorb,
         merge_qkv,
-        is_fp4,
     ):
         super().__init__(layer_id, cache, attn_backend)
         self.op_impl = op_impl
@@ -525,18 +533,27 @@ class AttentionDeepSeekV3(Attention):
                 ),
             )
         elif self.mla_absorb == "absorb-without-precomp":
+            quant_method = None if not hasattr(args, "quant") else args.quant
             self.wkv_b_absorb_1 = ParallelAbsorbGemm(
                 self.n_heads,
                 self.qk_nope_head_dim,
                 self.kv_lora_rank,
-                dtype=parse_dtype(args.main_weight_dtype),
+                dtype=(
+                    torch.bfloat16
+                    if quant_method == "blockfp4"
+                    else parse_dtype(args.main_weight_dtype)
+                ),
                 block_size=block_size,
             )
             self.wkv_b_absorb_2 = ParallelAbsorbGemm(
                 self.n_heads,
                 self.kv_lora_rank,
                 self.v_head_dim,
-                dtype=parse_dtype(args.main_weight_dtype),
+                dtype=(
+                    torch.bfloat16
+                    if quant_method == "blockfp4"
+                    else parse_dtype(args.main_weight_dtype)
+                ),
                 block_size=block_size,
             )
 
@@ -810,7 +827,6 @@ class MLPDeepSeekV3(nn.Module):
         role: str,  # "standalone" or "shared_experts"
         merge_gate_up: bool,
         op_impl: str,
-        is_fp4: bool = False,
     ):
         super().__init__()
         self.merge_gate_up = merge_gate_up
@@ -827,54 +843,50 @@ class MLPDeepSeekV3(nn.Module):
 
         if merge_gate_up:
             self.w1w3 = ColumnParallelLinear(
-                args.dim // 2 if is_fp4 else args.dim,
+                args.dim,
                 inter_dim * 2,
                 has_bias=False,
-                dtype=parse_dtype(
-                    args.main_weight_dtype, is_quant_layer=True
-                ),  # In fp4 quantization, dtype of MLP is float4_e2m1
+                dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
-                base_linear_class=get_linear_layout_contig_x_contig_y(op_impl),
+                base_linear_class=get_linear_layout_contig_x_contig_y(
+                    op_impl,
+                    quant_kwargs={
+                        "blockfp4": {
+                            "block_shape_2": (args.dim, inter_dim // get_tp_size())
+                        }
+                    },
+                ),
             )
-            if is_fp4:
-                self.w1w3.register_scale_2_param(
-                    2
-                )  # In merge gate up computation, scale_2 will also be cat into one Tensor
         else:
             self.w1 = ColumnParallelLinear(
-                args.dim // 2 if is_fp4 else args.dim,
+                args.dim,
                 inter_dim,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
+                dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_x_contig_y(op_impl),
             )
             self.w3 = ColumnParallelLinear(
-                args.dim // 2 if is_fp4 else args.dim,
+                args.dim,
                 inter_dim,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
+                dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_x_contig_y(op_impl),
             )
-            if is_fp4:
-                self.w1.register_scale_2_param()
-                self.w3.register_scale_2_param()
         self.w2 = RowParallelLinear(
-            inter_dim // 2 if is_fp4 else inter_dim,
+            inter_dim,
             args.dim,
             has_bias=False,
-            dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
+            dtype=parse_dtype(args.main_weight_dtype),
             bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
             reduce_output=(role == "standalone"),
             base_linear_class=get_linear_layout_contig_x_contig_y(op_impl),
         )
-        if is_fp4:
-            self.w2.register_scale_2_param()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -926,7 +938,6 @@ class GateDeepSeekV3(nn.Module):
         self.score_func = args.score_func
         self.route_scale = args.route_scale
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
-        self.is_fp4 = args.main_weight_dtype == "float4_e2m1"
         self.bias = (
             nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32))
             if self.dim == 7168
@@ -1043,10 +1054,10 @@ class MoEDeepSeekV3(nn.Module):
                 self.experts_end_idx
                 - self.experts_start_idx
                 + self.n_fused_shared_experts,
-                args.dim // 2 if is_fp4 else args.dim,
+                args.dim,
                 args.moe_inter_dim * 2,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
+                dtype=parse_dtype(args.main_weight_dtype),
                 is_fp4=is_fp4,
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
@@ -1057,10 +1068,10 @@ class MoEDeepSeekV3(nn.Module):
                 self.experts_end_idx
                 - self.experts_start_idx
                 + self.n_fused_shared_experts,
-                args.dim // 2 if is_fp4 else args.dim,
+                args.dim,
                 args.moe_inter_dim,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
+                dtype=parse_dtype(args.main_weight_dtype),
                 is_fp4=is_fp4,
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
@@ -1069,20 +1080,20 @@ class MoEDeepSeekV3(nn.Module):
                 self.experts_end_idx
                 - self.experts_start_idx
                 + self.n_fused_shared_experts,
-                args.dim // 2 if is_fp4 else args.dim,
+                args.dim,
                 args.moe_inter_dim,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
+                dtype=parse_dtype(args.main_weight_dtype),
                 is_fp4=is_fp4,
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
             )
         self.w2 = GroupRowParallelLinearDeepSeekV3(
             self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts,
-            args.moe_inter_dim // 2 if is_fp4 else args.moe_inter_dim,
+            args.moe_inter_dim,
             args.dim,
             has_bias=False,
-            dtype=parse_dtype(args.main_weight_dtype, is_quant_layer=True),
+            dtype=parse_dtype(args.main_weight_dtype),
             is_fp4=is_fp4,
             bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
@@ -1095,7 +1106,6 @@ class MoEDeepSeekV3(nn.Module):
                 role="shared_experts",
                 merge_gate_up=merge_gate_up,
                 op_impl=op_impl,
-                is_fp4=is_fp4,
             )
 
     def get_expert_weights_for_fp8_w8a8(self, expert_num):
@@ -1691,7 +1701,6 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             op_impl=op_impl,
             mla_absorb=mla_absorb,
             merge_qkv=merge_qkv_gate_up,
-            is_fp4=is_fp4,
         )
         self.ffn = (
             MLPDeepSeekV3(
@@ -1699,7 +1708,6 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                 role="standalone",
                 merge_gate_up=merge_qkv_gate_up,
                 op_impl=op_impl,
-                is_fp4=is_fp4,
             )
             if layer_id < args.n_dense_layers
             else (
@@ -2141,17 +2149,6 @@ class TransformerDeepSeekV3(Transformer):
                 new_checkpoint[k] = checkpoint[k]
         return new_checkpoint
 
-    def _process_state_dict_for_fp4_model(self, checkpoint: Mapping[str, Any]):
-        new_checkpoint = {}
-        for k in checkpoint.keys():
-            param = checkpoint[k]
-            if param.dtype == torch.uint8 and "weight" in k:
-                param.data = chitu_backend.weight_layout_change(param.data.cuda()).cpu()
-            if "scale_2" in k or "input_scale" in k:
-                param.data = param.data.unsqueeze(0)
-            new_checkpoint[k] = param
-        return new_checkpoint
-
     @override
     def load_state_dict_parallel(
         self,
@@ -2212,10 +2209,7 @@ class TransformerDeepSeekV3(Transformer):
         *args,
         **kwargs,
     ):
-        if self.is_fp4:
-            state_dict = self._process_state_dict_for_fp4_model(state_dict)
         if not skip_preprocess:
-
             if self.mla_absorb == "absorb":
                 state_dict = self._process_state_dict_for_absorption(state_dict)
             elif self.mla_absorb == "absorb-without-precomp":
@@ -2431,9 +2425,14 @@ def compute_softmax_scale_deepseek_v3(args):
 
 
 def get_linear_layout_contig_x_contig_y(
-    op_impl: str, disabled_methods: Optional[Set[str]] = None
+    op_impl: str,
+    disabled_methods: Optional[Set[str]] = None,
+    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     if op_impl == "muxi_custom_kernel":
+        assert (
+            len(quant_kwargs) == 0
+        ), "quant_kwargs is not supported for muxi_custom_kernel"
         args = get_global_args()
         quant_method = None if not hasattr(args.models, "quant") else args.models.quant
         if quant_method is None:
@@ -2447,5 +2446,5 @@ def get_linear_layout_contig_x_contig_y(
 
     else:
         return QuantizationRegistry.get_quantized_linear_class_from_global_args(
-            disabled_methods=disabled_methods
+            disabled_methods=disabled_methods, quant_kwargs=quant_kwargs
         )
