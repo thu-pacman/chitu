@@ -121,7 +121,7 @@ class AttentionHFLlama(Attention):
             base_linear_class=o_proj_linear,
         )
 
-        if args.name == "Qwen3-32B":
+        if args.name in {"Qwen3-32B", "Qwen3-30B-A3B"}:
             self.q_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
 
@@ -345,6 +345,91 @@ class FeedForwardHFLlama(nn.Module):
         return self.down_proj(silu_and_mul_out)
 
 
+class Qwen3MoeBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        op_impl: str,
+        merge_gate_up: bool,
+        layer_idx: int,
+    ):
+        super().__init__()
+        params = get_global_args().models
+        self.layer_idx = layer_idx
+        self.num_experts: int = (
+            params.num_experts if hasattr(params, "num_experts") else 128
+        )
+        self.top_k: int = (
+            params.num_experts_per_tok if hasattr(params, "num_experts_per_tok") else 8
+        )
+        self.norm_prob: bool = (
+            params.norm_topk_prob if hasattr(params, "norm_topk_prob") else False
+        )
+
+        self.gate = nn.Linear(dim, self.num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [
+                FeedForwardHFLlama(
+                    dim=dim,
+                    hidden_dim=hidden_dim,
+                    op_impl=op_impl,
+                    merge_gate_up=merge_gate_up,
+                )
+                for _ in range(self.num_experts)
+            ]
+        )
+
+    def forward(self, x):
+        bs_seq, dim = x.shape[:-1], x.shape[-1]
+        x = x.view(-1, dim)  # shape=(bsz*seq_len,dim)
+        router_scores = self.gate(x)  # shape=(bsz*seq_len,num_experts)
+        routing_weights = F.softmax(router_scores, dim=-1)
+        routing_weights, chosen_experts = torch.topk(
+            routing_weights, self.top_k, dim=-1
+        )  # (bsz*seq_len,topk)
+        if self.norm_prob:
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        if torch.isnan(routing_weights).any() or torch.isinf(routing_weights).any():
+            raise ValueError(
+                f"Layer {self.layer_idx}: Routing weights contain nan/inf!"
+            )
+
+        routing_weights, chosen_experts = (
+            routing_weights.flatten(),
+            chosen_experts.flatten(),
+        )  # shape=(bsz*seq_len*topk,)
+        sorted_experts, sorted_idx = torch.sort(chosen_experts)
+        sorted_weights = routing_weights[sorted_idx]
+        token_idx = (
+            torch.arange(x.shape[0], device=x.device)[:, None]
+            .expand(-1, self.top_k)
+            .flatten()
+        )
+        sorted_tokens_idx = token_idx[sorted_idx]
+
+        unique_experts, counts = torch.unique(sorted_experts, return_counts=True)
+        expert_start_idx = torch.cat(
+            [torch.tensor([0], device=counts.device), counts.cumsum(dim=-1)]
+        )
+
+        outputs = torch.zeros(x.shape, dtype=x.dtype, device=x.device)
+        for i in range(len(unique_experts)):
+            expert_idx = unique_experts[i]
+            start = expert_start_idx[i]
+            end = expert_start_idx[i + 1]
+            curr_tokens_idx = sorted_tokens_idx[start:end]  # shape=(end-start,)
+            curr_expert_weights = sorted_weights[start:end]  # shape=(end-start,)
+
+            ffn_inputs = x[curr_tokens_idx]  # shape=(end-start,dim)
+            expert_outputs = (
+                self.experts[expert_idx](ffn_inputs) * curr_expert_weights[:, None]
+            )
+            outputs.index_add_(0, curr_tokens_idx, expert_outputs)
+        outputs = outputs.reshape(*bs_seq, dim)
+        return outputs
+
+
 class TransformerBlockHFLlama(TransformerBlock):
     def __init__(
         self,
@@ -367,12 +452,22 @@ class TransformerBlockHFLlama(TransformerBlock):
             op_impl=op_impl,
             merge_qkv=merge_qkv_gate_up,
         )
-        self.mlp = mlp_type(
-            dim=args.dim,
-            hidden_dim=args.intermediate_dim,
-            op_impl=op_impl,
-            merge_gate_up=merge_qkv_gate_up,
-        )
+        if args.name == "Qwen3-30B-A3B":
+            mlp_type = Qwen3MoeBlock
+            self.mlp = mlp_type(
+                dim=args.dim,
+                hidden_dim=args.moe_intermediate_dim,
+                op_impl=op_impl,
+                merge_gate_up=merge_qkv_gate_up,
+                layer_idx=layer_id,
+            )
+        else:
+            self.mlp = mlp_type(
+                dim=args.dim,
+                hidden_dim=args.intermediate_dim,
+                op_impl=op_impl,
+                merge_gate_up=merge_qkv_gate_up,
+            )
         self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
         self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
 

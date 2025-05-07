@@ -404,7 +404,7 @@ class Backend:
             # assumption of the fused quantized kernels. So we only merge weights for supported
             # quantization methods.
             merge_qkv_gate_up = False
-        if args.models.name == "Qwen3-32B":
+        if args.models.name in {"Qwen3-32B", "Qwen3-30B-A3B"}:
             merge_qkv_gate_up = False
 
         if args.models.type == "deepseek-v3" and args.quant in [
@@ -698,7 +698,7 @@ class Backend:
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         logger.info(
-            f"rank {local_rank} Backend initialized with CUDA mem at {torch.cuda.memory_allocated()}"
+            f"rank {local_rank} Backend initialized with CUDA mem at {torch.cuda.memory_allocated()/1024**3:.2f} GB"
         )
         return Backend
 
