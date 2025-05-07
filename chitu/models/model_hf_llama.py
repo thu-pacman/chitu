@@ -121,7 +121,7 @@ class AttentionHFLlama(Attention):
             base_linear_class=o_proj_linear,
         )
 
-        if args.name in {"Qwen3-32B", "Qwen3-30B-A3B"}:
+        if args.name in {"Qwen3-32B", "Qwen3-30B-A3B", "Qwen3-235B-A22B"}:
             self.q_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
 
@@ -452,7 +452,7 @@ class TransformerBlockHFLlama(TransformerBlock):
             op_impl=op_impl,
             merge_qkv=merge_qkv_gate_up,
         )
-        if args.name == "Qwen3-30B-A3B":
+        if args.name in {"Qwen3-30B-A3B", "Qwen3-235B-A22B"}:
             mlp_type = Qwen3MoeBlock
             self.mlp = mlp_type(
                 dim=args.dim,
