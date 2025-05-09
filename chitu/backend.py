@@ -178,13 +178,10 @@ class Backend:
                 args.models.vocab_size == tokenizer.n_words
             ), f"{args.models.vocab_size} vs. {tokenizer.n_words}"
 
-        tokenizer.stop_tokens = torch.tensor(
-            list(
-                [tokenizer.stop_tokens]
-                if isinstance(tokenizer.stop_tokens, int)
-                else tokenizer.stop_tokens
-            ),
-            device=local_rank,
+        tokenizer.stop_tokens = set(
+            [tokenizer.stop_tokens]
+            if isinstance(tokenizer.stop_tokens, int)
+            else tokenizer.stop_tokens
         )
 
         return tokenizer
