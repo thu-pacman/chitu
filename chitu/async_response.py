@@ -33,6 +33,8 @@ class AsyncDataStream:
         self.reasoning_len = 0
         self.top_logprobs_list = []
         self.top_tokens_list = []
+        self.rs_token_id = Backend.args.models.get("rs_token_id", -1)
+        self.re_token_id = Backend.args.models.get("re_token_id", -1)
 
     def add_data(self, value: int, top_logprobs=None, top_token_idx=None):
         with self.lock:
@@ -66,14 +68,12 @@ class AsyncDataStream:
         self.data_event.set()
 
     def reasoning_handle(self, value: int):
-        rs_token_id = Backend.args.models.get("rs_token_id", -1)
-        re_token_id = Backend.args.models.get("re_token_id", -1)
-        if rs_token_id == -1 or re_token_id == -1:
+        if self.rs_token_id == -1 or self.re_token_id == -1:
             return False
-        if not self.is_reasoning and self.tokens_len == 0 and value == rs_token_id:
+        if not self.is_reasoning and self.tokens_len == 0 and value == self.rs_token_id:
             self.is_reasoning = True
             return True
-        if self.is_reasoning and value == re_token_id:
+        if self.is_reasoning and value == self.re_token_id:
             self.is_reasoning = False
             self.reasoning_len = len(self.seqs)
             return True
