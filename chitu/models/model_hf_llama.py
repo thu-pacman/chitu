@@ -121,7 +121,7 @@ class AttentionHFLlama(Attention):
             base_linear_class=o_proj_linear,
         )
 
-        if args.name in {"Qwen3-32B", "Qwen3-30B-A3B"}:
+        if args.name in {"Qwen3-32B", "Qwen3-30B-A3B", "Qwen3-235B-A22B"}:
             self.q_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
 
@@ -452,7 +452,7 @@ class TransformerBlockHFLlama(TransformerBlock):
             op_impl=op_impl,
             merge_qkv=merge_qkv_gate_up,
         )
-        if args.name == "Qwen3-30B-A3B":
+        if args.name in {"Qwen3-30B-A3B", "Qwen3-235B-A22B"}:
             mlp_type = Qwen3MoeBlock
             self.mlp = mlp_type(
                 dim=args.dim,
@@ -626,45 +626,62 @@ class TransformerHFLlama(Transformer):
     def _process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
-            if k.endswith(".q_proj.weight"):
-                prefix = k[: -len("q_proj.weight")]
-                assert prefix + "k_proj.weight" in checkpoint
-                assert prefix + "v_proj.weight" in checkpoint
-                assert prefix + "qkv_proj.weight" not in checkpoint
-                q_weight = checkpoint[prefix + "q_proj.weight"]
-                k_weight = checkpoint[prefix + "k_proj.weight"]
-                v_weight = checkpoint[prefix + "v_proj.weight"]
-                new_checkpoint[prefix + "qkv_proj.weight"] = torch.cat(
+            # Cat dim 0
+            if any(
+                k.endswith(f".q_proj.{tensor_name}")
+                for tensor_name in self._get_2d_out_x_in_tensor_names()
+                + self._get_1d_out_tensor_names()
+            ):
+                tensor_name = k.split(".")[-1]
+                prefix = k[: -len(f".q_proj.{tensor_name}")]
+                assert f"{prefix}.k_proj.{tensor_name}" in checkpoint
+                assert f"{prefix}.v_proj.{tensor_name}" in checkpoint
+                q_weight = checkpoint[f"{prefix}.q_proj.{tensor_name}"]
+                k_weight = checkpoint[f"{prefix}.k_proj.{tensor_name}"]
+                v_weight = checkpoint[f"{prefix}.v_proj.{tensor_name}"]
+                new_checkpoint[f"{prefix}.qkv_proj.{tensor_name}"] = torch.cat(
                     [q_weight, k_weight, v_weight], dim=0
                 )
-            elif k.endswith(".k_proj.weight") or k.endswith(".v_proj.weight"):
+            elif any(
+                k.endswith(f".k_proj.{tensor_name}")
+                for tensor_name in self._get_2d_out_x_in_tensor_names()
+                + self._get_1d_out_tensor_names()
+            ):
                 continue
-            elif k.endswith(".q_proj.scale"):
-                prefix = k[: -len("q_proj.scale")]
-                assert prefix + "k_proj.scale" in checkpoint
-                assert prefix + "v_proj.scale" in checkpoint
-                assert prefix + "qkv_proj.scale" not in checkpoint
-                q_scale = checkpoint[prefix + "q_proj.scale"]
-                k_scale = checkpoint[prefix + "k_proj.scale"]
-                v_scale = checkpoint[prefix + "v_proj.scale"]
-                new_checkpoint[prefix + "qkv_proj.scale"] = torch.cat(
-                    [q_scale, k_scale, v_scale], dim=0
+            elif any(
+                k.endswith(f".v_proj.{tensor_name}")
+                for tensor_name in self._get_2d_out_x_in_tensor_names()
+                + self._get_1d_out_tensor_names()
+            ):
+                continue
+
+            # Cat dim 1
+            elif any(
+                k.endswith(f".q_proj.{tensor_name}")
+                for tensor_name in self._get_2d_in_x_out_tensor_names()
+            ):
+                tensor_name = k.split(".")[-1]
+                prefix = k[: -len(f".q_proj.{tensor_name}")]
+                assert f"{prefix}.k_proj.{tensor_name}" in checkpoint
+                assert f"{prefix}.v_proj.{tensor_name}" in checkpoint
+                q_weight = checkpoint[f"{prefix}.q_proj.{tensor_name}"]
+                k_weight = checkpoint[f"{prefix}.k_proj.{tensor_name}"]
+                v_weight = checkpoint[f"{prefix}.v_proj.{tensor_name}"]
+                new_checkpoint[f"{prefix}.qkv_proj.{tensor_name}"] = torch.cat(
+                    [q_weight, k_weight, v_weight], dim=1
                 )
-            elif k.endswith(".k_proj.scale") or k.endswith(".v_proj.scale"):
+            elif any(
+                k.endswith(f".k_proj.{tensor_name}")
+                for tensor_name in self._get_2d_in_x_out_tensor_names()
+            ):
                 continue
-            elif k.endswith(".q_proj.bias"):
-                prefix = k[: -len("q_proj.bias")]
-                assert prefix + "k_proj.bias" in checkpoint
-                assert prefix + "v_proj.bias" in checkpoint
-                assert prefix + "qkv_proj.bias" not in checkpoint
-                q_bias = checkpoint[prefix + "q_proj.bias"]
-                k_bias = checkpoint[prefix + "k_proj.bias"]
-                v_bias = checkpoint[prefix + "v_proj.bias"]
-                new_checkpoint[prefix + "qkv_proj.bias"] = torch.cat(
-                    [q_bias, k_bias, v_bias], dim=0
-                )
-            elif k.endswith(".k_proj.bias") or k.endswith(".v_proj.bias"):
+            elif any(
+                k.endswith(f".v_proj.{tensor_name}")
+                for tensor_name in self._get_2d_in_x_out_tensor_names()
+            ):
                 continue
+
+            # Unchanged tensors
             else:
                 new_checkpoint[k] = checkpoint[k]
         return new_checkpoint
@@ -672,39 +689,49 @@ class TransformerHFLlama(Transformer):
     def _process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
-            if k.endswith(".gate_proj.weight"):
-                prefix = k[: -len("gate_proj.weight")]
-                assert prefix + "up_proj.weight" in checkpoint
-                assert prefix + "gate_up_proj.weight" not in checkpoint
-                gate_weight = checkpoint[prefix + "gate_proj.weight"]
-                up_weight = checkpoint[prefix + "up_proj.weight"]
-                new_checkpoint[prefix + "gate_up_proj.weight"] = torch.cat(
+            # Cat dim 0
+            if any(
+                k.endswith(f".gate_proj.{tensor_name}")
+                for tensor_name in self._get_2d_out_x_in_tensor_names()
+                + self._get_1d_out_tensor_names()
+            ):
+                tensor_name = k.split(".")[-1]
+                prefix = k[: -len(f".gate_proj.{tensor_name}")]
+                assert f"{prefix}.up_proj.{tensor_name}" in checkpoint
+                assert f"{prefix}.gate_up_proj.{tensor_name}" not in checkpoint
+                gate_weight = checkpoint[f"{prefix}.gate_proj.{tensor_name}"]
+                up_weight = checkpoint[f"{prefix}.up_proj.{tensor_name}"]
+                new_checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = torch.cat(
                     [gate_weight, up_weight], dim=0
                 )
-            elif k.endswith(".up_proj.weight"):
+            elif any(
+                k.endswith(f".up_proj.{tensor_name}")
+                for tensor_name in self._get_2d_out_x_in_tensor_names()
+                + self._get_1d_out_tensor_names()
+            ):
                 continue
-            elif k.endswith(".gate_proj.scale"):
-                prefix = k[: -len("gate_proj.scale")]
-                assert prefix + "up_proj.scale" in checkpoint
-                assert prefix + "gate_up_proj.scale" not in checkpoint
-                gate_scale = checkpoint[prefix + "gate_proj.scale"]
-                up_scale = checkpoint[prefix + "up_proj.scale"]
-                new_checkpoint[prefix + "gate_up_proj.scale"] = torch.cat(
-                    [gate_scale, up_scale], dim=0
+
+            # Cat dim 1
+            elif any(
+                k.endswith(f".gate_proj.{tensor_name}")
+                for tensor_name in self._get_2d_in_x_out_tensor_names()
+            ):
+                tensor_name = k.split(".")[-1]
+                prefix = k[: -len(f".gate_proj.{tensor_name}")]
+                assert f"{prefix}.up_proj.{tensor_name}" in checkpoint
+                assert f"{prefix}.gate_up_proj.{tensor_name}" not in checkpoint
+                gate_weight = checkpoint[f"{prefix}.gate_proj.{tensor_name}"]
+                up_weight = checkpoint[f"{prefix}.up_proj.{tensor_name}"]
+                new_checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = torch.cat(
+                    [gate_weight, up_weight], dim=1
                 )
-            elif k.endswith(".up_proj.scale"):
+            elif any(
+                k.endswith(f".up_proj.{tensor_name}")
+                for tensor_name in self._get_2d_in_x_out_tensor_names()
+            ):
                 continue
-            elif k.endswith(".gate_proj.bias"):
-                prefix = k[: -len("gate_proj.bias")]
-                assert prefix + "up_proj.bias" in checkpoint
-                assert prefix + "gate_up_proj.bias" not in checkpoint
-                gate_bias = checkpoint[prefix + "gate_proj.bias"]
-                up_bias = checkpoint[prefix + "up_proj.bias"]
-                new_checkpoint[prefix + "gate_up_proj.bias"] = torch.cat(
-                    [gate_bias, up_bias], dim=0
-                )
-            elif k.endswith(".up_proj.bias"):
-                continue
+
+            # Unchanged tensors
             else:
                 new_checkpoint[k] = checkpoint[k]
         return new_checkpoint

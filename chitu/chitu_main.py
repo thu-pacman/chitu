@@ -24,7 +24,7 @@ logger = getLogger(__name__)
 def init_logger(logging_level=logging.INFO):
     base_name = __name__.split(".")[0]
     base_logger = getLogger(base_name)
-    base_logger.setLevel(logging.INFO)
+    base_logger.setLevel(logging_level)
 
     def add_rank_to_msg(record):
         if torch.distributed.is_initialized():

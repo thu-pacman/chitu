@@ -178,13 +178,10 @@ class Backend:
                 args.models.vocab_size == tokenizer.n_words
             ), f"{args.models.vocab_size} vs. {tokenizer.n_words}"
 
-        tokenizer.stop_tokens = torch.tensor(
-            list(
-                [tokenizer.stop_tokens]
-                if isinstance(tokenizer.stop_tokens, int)
-                else tokenizer.stop_tokens
-            ),
-            device=local_rank,
+        tokenizer.stop_tokens = set(
+            [tokenizer.stop_tokens]
+            if isinstance(tokenizer.stop_tokens, int)
+            else tokenizer.stop_tokens
         )
 
         return tokenizer
@@ -404,7 +401,7 @@ class Backend:
             # assumption of the fused quantized kernels. So we only merge weights for supported
             # quantization methods.
             merge_qkv_gate_up = False
-        if args.models.name in {"Qwen3-32B", "Qwen3-30B-A3B"}:
+        if args.models.name in {"Qwen3-32B", "Qwen3-30B-A3B", "Qwen3-235B-A22B"}:
             merge_qkv_gate_up = False
 
         if args.models.type == "deepseek-v3" and args.quant in [

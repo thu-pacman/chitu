@@ -282,7 +282,7 @@ class Task:
         if self.stop_with_eos:
             if (
                 len(self.response) > 0
-                and torch.isin(self.response[-1], Backend.tokenizer.stop_tokens)
+                and self.response[-1].item() in Backend.tokenizer.stop_tokens
             ) and not self.waiting:
                 self.req.finish_reason = "stop"
                 return True
