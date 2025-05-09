@@ -102,5 +102,4 @@ def benchmark_quant_einsum_shc_hdc_shd(M, K, N, provider):
 
 
 if __name__ == "__main__":
-    test_quant_einsum_shc_hdc_shd()
     benchmark_quant_einsum_shc_hdc_shd.run(show_plots=False, print_data=True)

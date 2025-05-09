@@ -26,7 +26,7 @@ from chitu.ops import silu_and_mul, to_triton_dtype
 from chitu.utils import ceil_div
 
 
-def moe_sum(input_tensor, output_tensor, config: Dict[str, Any]):
+def moe_sum(input_tensor, output_tensor):
     """
     Sum the input tensor along dimension 1 (topK).
     Input shape: (M, topK, N)
@@ -40,19 +40,37 @@ def moe_sum(input_tensor, output_tensor, config: Dict[str, Any]):
     """
     M, topK, N = input_tensor.shape
 
+    def calculate_settings(n):
+        # reference: https://github.com/unslothai/unsloth/blob/fd753fed99ed5f10ef8a9b7139588d9de9ddecfb/unsloth/kernels/utils.py#L43
+
+        MAX_FUSED_SIZE = 65536
+        BLOCK_SIZE = triton.next_power_of_2(n)
+        if BLOCK_SIZE > MAX_FUSED_SIZE:
+            raise RuntimeError(
+                f"Cannot launch Triton kernel since n = {n} exceeds "
+                f"the recommended Triton blocksize = {MAX_FUSED_SIZE}."
+            )
+
+        num_warps = 4
+        if BLOCK_SIZE >= 32768:
+            num_warps = 32
+        elif BLOCK_SIZE >= 8192:
+            num_warps = 16
+        elif BLOCK_SIZE >= 1024:
+            num_warps = 8
+        return BLOCK_SIZE, num_warps
+
+    BLOCK_SIZE_N, num_warps = calculate_settings(N)
     # Determine grid and block sizes
-    grid = lambda meta: (
-        triton.cdiv(M, meta["BLOCK_SIZE_M"]),
-        triton.cdiv(N, meta["BLOCK_SIZE_N"]),
-    )
-    moe_sum_kernel[grid](
+
+    moe_sum_kernel[M,](
         input_tensor,
         output_tensor,
         M,
         topK,
         N,
-        BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
-        BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        num_warps=num_warps,
     )
 
 
@@ -1613,7 +1631,6 @@ def fused_experts_impl(
         moe_sum(
             intermediate_cache3.view(*intermediate_cache3.shape),
             out_hidden_states[begin_chunk_idx:end_chunk_idx],
-            config,
         )
 
     return out_hidden_states
