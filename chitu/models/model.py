@@ -346,7 +346,7 @@ class Transformer(nn.Module):
     def _get_2d_out_x_in_tensor_names(self) -> List[str]:
         ret = ["weight"]
         quant = self.params.quant if hasattr(self.params, "quant") else None
-        if quant == "blockfp8":
+        if quant == "blockfp8" or quant == "gguf-blockfp8":
             ret += ["scale"]
         elif quant == "blockfp4":
             ret += ["scale", "scale_2", "input_scale"]
@@ -432,7 +432,9 @@ class Transformer(nn.Module):
                     name.split(".")[-1]
                     in self._get_1d_in_tensor_names() + self._get_1d_out_tensor_names()
                 ):
-                    assert param.dim() == 1
+                    assert (
+                        param.dim() == 1
+                    ), f"{name} is expected to be 1D, but got {param.dim()}D"
                     if param.shape[0] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
@@ -440,7 +442,9 @@ class Transformer(nn.Module):
                         chunks = torch.chunk(param, world_size, dim=0)
                         partial_checkpoint[name] = chunks[rank]
                 elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names():
-                    assert param.dim() == 2
+                    assert (
+                        param.dim() == 2
+                    ), f"{name} is expected to be 2D, but got {param.dim()}D"
                     if param.shape[0] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
@@ -448,7 +452,9 @@ class Transformer(nn.Module):
                         chunks = torch.chunk(param, world_size, dim=0)
                         partial_checkpoint[name] = chunks[rank]
                 elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names():
-                    assert param.dim() == 2
+                    assert (
+                        param.dim() == 2
+                    ), f"{name} is expected to be 2D, but got {param.dim()}D"
                     if param.shape[1] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
@@ -464,7 +470,9 @@ class Transformer(nn.Module):
                     name.split(".")[-1]
                     in self._get_1d_in_tensor_names() + self._get_1d_out_tensor_names()
                 ):
-                    assert param.dim() == 1
+                    assert (
+                        param.dim() == 1
+                    ), f"{name} is expected to be 1D, but got {param.dim()}D"
                     if param.shape[0] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
@@ -472,7 +480,9 @@ class Transformer(nn.Module):
                         chunks = torch.chunk(param, world_size, dim=0)
                         partial_checkpoint[name] = chunks[rank]
                 elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names():
-                    assert param.dim() == 2
+                    assert (
+                        param.dim() == 2
+                    ), f"{name} is expected to be 2D, but got {param.dim()}D"
                     if param.shape[1] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
@@ -480,7 +490,9 @@ class Transformer(nn.Module):
                         chunks = torch.chunk(param, world_size, dim=1)
                         partial_checkpoint[name] = chunks[rank]
                 elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names():
-                    assert param.dim() == 2
+                    assert (
+                        param.dim() == 2
+                    ), f"{name} is expected to be 2D, but got {param.dim()}D"
                     if param.shape[0] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
