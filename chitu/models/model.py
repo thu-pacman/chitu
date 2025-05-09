@@ -349,7 +349,7 @@ class Transformer(nn.Module):
         if quant == "blockfp8" or quant == "gguf-blockfp8":
             ret += ["scale"]
         elif quant == "blockfp4":
-            ret += ["scale", "scale_2", "input_scale"]
+            ret += ["weight_scale", "weight_scale_2", "input_scale"]
         return ret
 
     def _get_2d_in_x_out_tensor_names(self) -> List[str]:
@@ -512,7 +512,7 @@ class Transformer(nn.Module):
         if quant == "blockfp4":
             new_state_dict = {}
             for key, value in state_dict.items():
-                if key.endswith(".scale_2") or key.endswith(".input_scale"):
+                if key.endswith(".weight_scale_2") or key.endswith(".input_scale"):
                     new_state_dict[key] = value.view(1, 1)
                 else:
                     new_state_dict[key] = value
@@ -525,7 +525,7 @@ class Transformer(nn.Module):
             new_state_dict = {}
             for k in state_dict.keys():
                 param = state_dict[k]
-                if param.dtype == torch.uint8 and "weight" in k:
+                if param.dtype == torch.uint8 and k.endswith(".weight"):
                     param.data = chitu_backend.weight_layout_change(
                         param.data.cuda()
                     ).cpu()

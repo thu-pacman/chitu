@@ -209,7 +209,7 @@ class GroupColumnParallelLinearDeepSeekV3(torch.nn.Module):
             quant_scale_stride = 16
             scale_out_features = local_out_features
             scale_in_features = ceil_div(in_features, quant_scale_stride)
-            self.scale = nn.Parameter(
+            self.weight_scale = nn.Parameter(
                 torch.empty(
                     group_size,
                     scale_out_features,
@@ -227,7 +227,7 @@ class GroupColumnParallelLinearDeepSeekV3(torch.nn.Module):
                 ),
                 requires_grad=False,
             )
-            self.scale_2 = nn.Parameter(
+            self.weight_scale_2 = nn.Parameter(
                 torch.empty(
                     group_size,
                     scale_2_dim,
@@ -267,8 +267,8 @@ class GroupColumnParallelLinearDeepSeekV3(torch.nn.Module):
                     y = linear_block_fp4(
                         x=x,
                         weight=self.weight[i],
-                        weight_scale=self.scale[i],
-                        weight_scale_2=self.scale_2[i],
+                        weight_scale=self.weight_scale[i],
+                        weight_scale_2=self.weight_scale_2[i],
                         bias=self.bias[i],
                         act_block_size=128,
                     )
@@ -366,7 +366,7 @@ class GroupRowParallelLinearDeepSeekV3(torch.nn.Module):
             quant_scale_stride = 16
             scale_out_features = out_features
             scale_in_features = ceil_div(local_in_features, quant_scale_stride)
-            self.scale = nn.Parameter(
+            self.weight_scale = nn.Parameter(
                 torch.empty(
                     group_size,
                     scale_out_features,
@@ -384,7 +384,7 @@ class GroupRowParallelLinearDeepSeekV3(torch.nn.Module):
                 ),
                 requires_grad=False,
             )
-            self.scale_2 = nn.Parameter(
+            self.weight_scale_2 = nn.Parameter(
                 torch.empty(
                     group_size,
                     1,
@@ -438,8 +438,8 @@ class GroupRowParallelLinearDeepSeekV3(torch.nn.Module):
                     y = linear_block_fp4(
                         x=x,
                         weight=self.weight[i],
-                        weight_scale=self.scale[i],
-                        weight_scale_2=self.scale_2[i],
+                        weight_scale=self.weight_scale[i],
+                        weight_scale_2=self.weight_scale_2[i],
                         bias=(
                             self.bias[i]
                             if self.rank == 0 and self.bias is not None
@@ -1145,11 +1145,11 @@ class MoEDeepSeekV3(nn.Module):
 
     def get_expert_weights_for_fp4(self):
         w1w3_weight = self.w1w3.weight
-        w1w3_weigth_scale = self.w1w3.scale
-        w1w3_weight_scale2 = self.w1w3.scale_2
+        w1w3_weigth_scale = self.w1w3.weight_scale
+        w1w3_weight_scale2 = self.w1w3.weight_scale_2
         w2_weight = self.w2.weight
-        w2_weight_scale = self.w2.scale
-        w2_weight_scale2 = self.w2.scale_2
+        w2_weight_scale = self.w2.weight_scale
+        w2_weight_scale2 = self.w2.weight_scale_2
         return (
             w1w3_weight,
             w1w3_weigth_scale,
@@ -2206,8 +2206,6 @@ class TransformerDeepSeekV3(Transformer):
                 name = name.replace(".self_attn.", ".attn.")
                 name = name.replace(".mlp.", ".ffn.")
                 name = name.replace(".weight_scale_inv", ".scale")
-                name = name.replace(".weight_scale", ".scale")
-                name = name.replace(".weight_scale_2", ".scale_2")
                 name = name.replace(".e_score_correction_bias", ".bias")
                 key = name.split(".")[-2]
                 mapping = {

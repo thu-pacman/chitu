@@ -391,11 +391,11 @@ class Backend:
         if args.models.type == "llama":
             merge_qkv_gate_up = False  # Not yet supported
 
-        if hasattr(args.models, "quant") and args.models.quant not in [
-            None,
-            "blockfp8",
-            "blockfp4",
-        ]:
+        quant = args.models.quant if hasattr(args.models, "quant") else None
+        allowed_quant_for_merge_qkv_gate_up = {None, "blockfp8"}
+        if args.models.type == "deepseek-v3":
+            allowed_quant_for_merge_qkv_gate_up.add("blockfp4")
+        if quant not in allowed_quant_for_merge_qkv_gate_up:
             # Merge weights for offline-scaled quantized models is non-trivial, because we can
             # only merge weights but NOT the scales on input dimensions, and this will break the
             # assumption of the fused quantized kernels. So we only merge weights for supported
@@ -652,6 +652,10 @@ class Backend:
             filter_key = None
             if args.models.type == "deepseek-v3":
                 filter_key = lambda key: "model.layers.61" not in key
+            elif args.models.name == "QwQ-32B-fp4":
+                filter_key = lambda key: not key.endswith(
+                    ".k_scale"
+                ) and not key.endswith(".v_scale")
             params = load_state_dict(
                 model_path, skip_preprocess=args.skip_preprocess, filter_key=filter_key
             )
