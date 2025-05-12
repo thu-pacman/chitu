@@ -10,6 +10,7 @@ from typing import Any, Tuple, Optional
 
 import numpy as np
 import torch
+import importlib
 
 from chitu.global_vars import get_global_args
 
@@ -18,7 +19,7 @@ logger = getLogger(__name__)
 
 def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> Tuple[Any, bool]:
     try:
-        return __import__(pkg_name), True
+        return importlib.import_module(pkg_name), True
     except ImportError:
 
         class ReportErrorWhenUsed:

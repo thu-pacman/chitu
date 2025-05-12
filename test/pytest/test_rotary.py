@@ -76,5 +76,54 @@ def test_apply_rotary_pos_emb_interleave_deepseek_in_place(
     assert torch.all(torch.isclose(out_k, out_k_torch, rtol=rtol, atol=atol))
 
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["batch_size"],
+        x_vals=[1, 16, 128, 256, 512, 1024],
+        line_arg="provider",
+        line_vals=["torch", "triton", "cuda"],
+        line_names=["Torch", "Triton", "Cuda"],
+        styles=[("blue", "-"), ("green", "-"), ("red", "-")],
+        ylabel="us",
+        plot_name="apply_rotary_pos_emb-performance",
+        args={"n_local_heads": 64, "head_dim": 256},
+    )
+)
+def benchmark(batch_size, n_local_heads, head_dim, provider, rotary_type="llama"):
+    torch.set_default_dtype(torch.float16)
+    q = torch.randn(batch_size, n_local_heads, head_dim, device="cuda")
+    k = torch.randn(batch_size, head_dim, device="cuda")
+
+    complex_freqs = torch.polar(
+        torch.ones(batch_size, head_dim // 2, device="cuda", dtype=torch.float32),
+        torch.rand(batch_size, head_dim // 2, device="cuda", dtype=torch.float32)
+        * 2
+        * math.pi,
+    )
+    cos = complex_freqs.real.contiguous()
+    sin = complex_freqs.imag.contiguous()
+
+    if provider == "torch":
+        ms = triton.testing.do_bench(
+            lambda: apply_rotary_pos_emb(
+                q, k, cos, sin, rotary_type=rotary_type, impl="torch"
+            )
+        )
+    elif provider == "triton":
+        ms = triton.testing.do_bench(
+            lambda: apply_rotary_pos_emb(
+                q, k, cos, sin, rotary_type=rotary_type, impl="triton"
+            )
+        )
+    elif provider == "cuda":
+        ms = triton.testing.do_bench(
+            lambda: apply_rotary_pos_emb(
+                q, k, cos, sin, rotary_type=rotary_type, impl="cuda"
+            )
+        )
+    return ms * 1000
+
+
 if __name__ == "__main__":
-    test_apply_rotary_pos_emb_triton_interleave_deepseek()
+
+    benchmark.run(show_plots=True, print_data=True)

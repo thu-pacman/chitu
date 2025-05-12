@@ -14,14 +14,8 @@ import torch
 
 from chitu.global_vars import get_global_args
 from chitu.ops import append_to_paged_kv_cache, append_to_non_paged_kv_cache
-from chitu.triton_decode_attention import (
-    mla_decode,
-    mla_decode_non_paged,
-    decode_attention_fwd,
-)
 from chitu.utils import try_import_opt_dep
 from chitu.static_tensor import StaticTensor
-from chitu.triton_flash_attention import context_attention_fwd
 from chitu.device_type import is_muxi
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
@@ -625,6 +619,23 @@ class RefAttnBackend(AttnBackend):
 class TritonAttnBackend(RefAttnBackend):
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
+        try:
+            from chitu.triton_flash_attention import context_attention_fwd
+            from chitu.triton_decode_attention import (
+                mla_decode,
+                mla_decode_non_paged,
+                decode_attention_fwd,
+            )
+
+            self.mla_decode = mla_decode
+            self.mla_decode_non_paged = mla_decode_non_paged
+            self.decode_attention_fwd = decode_attention_fwd
+            self.context_attention_fwd = context_attention_fwd
+        except ImportError:
+            self.mla_decode = None
+            self.mla_decode_non_paged = None
+            self.decode_attention_fwd = None
+            self.context_attention_fwd = None
 
     def prepare_metadata_for_decode(
         self,
@@ -658,7 +669,7 @@ class TritonAttnBackend(RefAttnBackend):
         output = torch.empty(
             B, local_n_heads, v_n_hidden, dtype=q.dtype, device=q.device
         )
-        context_attention_fwd(
+        self.context_attention_fwd(
             q,
             k,
             v,
@@ -746,7 +757,7 @@ class TritonAttnBackend(RefAttnBackend):
 
         if is_muxi():
             q = torch.cat([q_nope, q_pe], dim=-1)
-            decode_attention_fwd(
+            self.decode_attention_fwd(
                 q,
                 kv_c_and_k_pe_cache,
                 kv_c_cache,
@@ -760,7 +771,7 @@ class TritonAttnBackend(RefAttnBackend):
             )
         else:
             if block_table is None:
-                mla_decode_non_paged(
+                self.mla_decode_non_paged(
                     q_nope,
                     q_pe,
                     kv_c_cache,
@@ -772,7 +783,7 @@ class TritonAttnBackend(RefAttnBackend):
                     softmax_scale,
                 )
             else:
-                mla_decode(
+                self.mla_decode(
                     q_nope,
                     q_pe,
                     kv_c_cache,

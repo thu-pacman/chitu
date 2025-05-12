@@ -923,7 +923,7 @@ class Blockfp4Linear(QuantizedLinearBase):
     ):
         super().__init__()
 
-        dtype = dtype or torch.get_default_dtype()
+        dtype = dtype or torch.uint8
         if block_shape_2 is None:
             block_shape_2 = (in_features, out_features)
 
@@ -947,7 +947,7 @@ class Blockfp4Linear(QuantizedLinearBase):
 
         block_in, block_out = block_shape
         self.register_parameter(
-            "scale",
+            "weight_scale",
             torch.nn.Parameter(
                 torch.empty(
                     ceil_div(out_features, block_out),
@@ -973,7 +973,7 @@ class Blockfp4Linear(QuantizedLinearBase):
             ),
         )
         self.register_parameter(
-            "scale_2",
+            "weight_scale_2",
             torch.nn.Parameter(
                 torch.empty(
                     out_features // block_2_out,
@@ -1000,8 +1000,8 @@ class Blockfp4Linear(QuantizedLinearBase):
         return linear_block_fp4(
             x,
             self.weight,
-            self.scale,
-            self.scale_2,
+            self.weight_scale,
+            self.weight_scale_2,
             act_block_size=self.act_block_size,
             bias=self.bias,
         )

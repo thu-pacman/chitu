@@ -1,31 +1,48 @@
 import torch
 import pytest
-import packaging
+import packaging.version
 from omegaconf import OmegaConf
 import flashinfer
-
+from typing import List
 from chitu.triton_flash_attention import context_attention_fwd
 from chitu.attn_backend import RefAttnBackend, TritonAttnBackend, FlashInferBackend
 from chitu.global_vars import set_global_args
+import triton
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_triton_prefill_attn():
+@pytest.mark.parametrize("num_local_heads", [32])
+@pytest.mark.parametrize("qk_head_dim", [576])
+@pytest.mark.parametrize("v_head_dim", [512])
+@pytest.mark.parametrize("bs", [1, 9])
+def test_triton_prefill_attn(num_local_heads, qk_head_dim, v_head_dim, bs):
+
+    if isinstance(bs, int):
+        # If batch_size is provided directly, use it
+        seq_lens = [torch.randint(1, 128, (1,)).item() for _ in range(bs)]
+    else:
+        # If seq_lens is already provided as an argument, use that
+        seq_lens = bs
     # Set random seed for reproducibility
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
 
-    # Test parameters
-    seq_lens = [9]
     max_seq_len = max(seq_lens)
 
     # Create test tensors
-    q = torch.randn(sum(seq_lens), 16, 576, dtype=torch.bfloat16).to("cuda")
-    k = torch.randn(sum(seq_lens), 1, 576, dtype=torch.bfloat16).to("cuda")
-    v = torch.randn(sum(seq_lens), 1, 512, dtype=torch.bfloat16).to("cuda")
+    q = torch.randn(
+        sum(seq_lens), num_local_heads, qk_head_dim, dtype=torch.bfloat16
+    ).to("cuda")
+    k = torch.randn(sum(seq_lens), 1, qk_head_dim, dtype=torch.bfloat16).to("cuda")
+    v = torch.randn(sum(seq_lens), 1, v_head_dim, dtype=torch.bfloat16).to("cuda")
 
     # Create metadata tensors
-    b_start_loc = torch.tensor([0, seq_lens[0]], device="cuda")
+    # Create b_start_loc using prefix sum logic
+    # b_start_loc[i] represents the starting index of the i-th batch in the concatenated tensor
+    # The last element is the total length (sum of all sequence lengths)
+    b_start_loc = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device="cuda")
+    for i in range(len(seq_lens)):
+        b_start_loc[i + 1] = b_start_loc[i] + seq_lens[i]
     b_seq_len = torch.tensor(seq_lens, device="cuda")
 
     # Set attention parameters
@@ -33,11 +50,20 @@ def test_triton_prefill_attn():
     max_seqlen_k = max_seq_len
     softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
     is_causal = True
-
-    # Run triton implementation
-    o = torch.empty(sum(seq_lens), 16, 512, dtype=torch.float32).to("cuda")
-    context_attention_fwd(
-        q, k, v, o, b_start_loc, b_seq_len, max_seqlen_q, softmax_scale, is_causal
+    attn_backend = TritonAttnBackend(qk_nope_head_dim=qk_head_dim)
+    o = attn_backend.attn_varlen_func(
+        q,
+        k,
+        v,
+        b_start_loc,
+        b_start_loc,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p=0,
+        causal=is_causal,
+        window_size=(-1, -1),
+        softcap=0,
+        softmax_scale=softmax_scale,
     )
 
     # Run reference implementation
@@ -291,3 +317,209 @@ def test_flashinfer_attn_with_kvcache(
     )
 
     assert torch.allclose(flashinfer_out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["bs"],
+        x_vals=[1, 8, 16, 32],
+        line_arg="provider",
+        line_vals=["triton", "flashinfer"],
+        line_names=["Triton", "FlashInfer"],
+        styles=[("blue", "-"), ("green", "-")],
+        ylabel="us",
+        plot_name="attn-performance",
+        args={"num_local_heads": 32, "qk_head_dim": 576, "v_head_dim": 512},
+    )
+)
+def benchmark_attn_varlen_func(num_local_heads, qk_head_dim, v_head_dim, bs, provider):
+    # Create seq_lens list with length=batch_size and values in [0, 128)
+    if isinstance(bs, int):
+        # If batch_size is provided directly, use it
+        seq_lens = [torch.randint(1, 128, (1,)).item() for _ in range(bs)]
+    else:
+        # If seq_lens is already provided as an argument, use that
+        seq_lens = bs
+    max_seq_len = max(seq_lens)
+    q = torch.randn(
+        sum(seq_lens), num_local_heads, qk_head_dim, dtype=torch.bfloat16
+    ).to("cuda")
+    k = torch.randn(sum(seq_lens), 1, qk_head_dim, dtype=torch.bfloat16).to("cuda")
+    v = torch.randn(sum(seq_lens), 1, v_head_dim, dtype=torch.bfloat16).to("cuda")
+    b_start_loc = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device="cuda")
+    for i in range(len(seq_lens)):
+        b_start_loc[i + 1] = b_start_loc[i] + seq_lens[i]
+    b_seq_len = torch.tensor(seq_lens, device="cuda")
+    max_seqlen_q = max_seq_len
+    max_seqlen_k = max_seq_len
+    softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
+    is_causal = True
+    if provider == "triton":
+        attn_backend = TritonAttnBackend(qk_nope_head_dim=qk_head_dim)
+        ms = triton.testing.do_bench(
+            lambda: attn_backend.attn_varlen_func(
+                q,
+                k,
+                v,
+                b_start_loc,
+                b_start_loc,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p=0,
+                causal=is_causal,
+                window_size=(-1, -1),
+                softcap=0,
+                softmax_scale=softmax_scale,
+            )
+        )
+    elif provider == "flashinfer":
+        set_global_args(
+            OmegaConf.create(
+                {
+                    "infer": {
+                        "mla_absorb": None,
+                        "max_reqs": 4,
+                        "use_cuda_graph": False,
+                        "tp_size": 1,
+                        "cache_type": "paged",
+                    },
+                    "models": {"n_heads": 4, "n_kv_heads": 1},
+                }
+            ),
+            need_ensure=False,
+        )
+        flashinfer_backend = FlashInferBackend(tot_num_blocks=51, qk_nope_head_dim=None)
+        ms = triton.testing.do_bench(
+            lambda: flashinfer_backend.attn_varlen_func(
+                q,
+                k,
+                v,
+                b_start_loc,
+                b_start_loc,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p=0,
+                causal=is_causal,
+                window_size=(-1, -1),
+                softcap=0,
+                softmax_scale=softmax_scale,
+            )
+        )
+    else:
+        raise AssertionError("Provider must be triton or flashinfer")
+    return ms * 1000
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["bs"],
+        x_vals=[1, 16, 128],
+        line_arg="provider",
+        line_vals=["triton", "flashinfer"],
+        line_names=["Triton", "FlashInfer"],
+        styles=[("blue", "-"), ("green", "-")],
+        ylabel="us",
+        plot_name="attn-decode-performance",
+        args={
+            "cache_seqlens_excl_this_decode": 512,
+            "n_heads": 32,
+            "kv_lora_rank": 512,
+            "qk_rope_head_dim": 64,
+            "page_size": 256,
+        },
+    )
+)
+def benchmark_mla_attn_with_kvcache(
+    bs,
+    cache_seqlens_excl_this_decode,
+    n_heads,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    page_size,
+    provider,
+):
+    torch.set_default_dtype(torch.float16)
+    max_num_pages = bs * 16
+    q_nope = torch.randn(bs, n_heads, kv_lora_rank, device="cuda")
+    q_pe = torch.randn(bs, n_heads, qk_rope_head_dim, device="cuda")
+    kv_cache = torch.randn(
+        max_num_pages, page_size, kv_lora_rank + qk_rope_head_dim, device="cuda"
+    )
+    this_kv = torch.randn(bs, 1, 1, kv_lora_rank + qk_rope_head_dim, device="cuda")
+    cache_seqlens_excl_this_decode_tensor = (
+        torch.ones(bs, device="cuda", dtype=torch.int32)
+        * cache_seqlens_excl_this_decode
+    )
+
+    cache_seqlens_incl_this_decode_tensor = cache_seqlens_excl_this_decode_tensor + 1
+    page_cnt_per_sample = (cache_seqlens_excl_this_decode // page_size) + 1
+    page_table = torch.randperm(max_num_pages, device="cuda", dtype=torch.int32)[
+        : bs * page_cnt_per_sample
+    ].view(bs, page_cnt_per_sample)
+
+    attn = TritonAttnBackend(qk_nope_head_dim=128)
+    if provider == "triton":
+        ms = triton.testing.do_bench(
+            lambda: attn.mla_attn_with_kvcache(
+                q_nope,
+                q_pe,
+                kv_cache,
+                this_kv,
+                cache_seqlens_excl_this_decode_tensor,
+                cache_seqlens_incl_this_decode_tensor,
+                page_table,
+            )
+        )
+    elif provider == "flashinfer":
+        set_global_args(
+            OmegaConf.create(
+                {
+                    "infer": {
+                        "mla_absorb": "absorb-without-precomp",
+                        "max_reqs": bs,
+                        "use_cuda_graph": False,
+                        "tp_size": 1,
+                        "cache_type": "paged",
+                    },
+                    "models": {
+                        "n_heads": n_heads,
+                        "kv_lora_rank": kv_lora_rank,
+                        "qk_rope_head_dim": qk_rope_head_dim,
+                        "qk_nope_head_dim": 128,
+                    },
+                }
+            ),
+            need_ensure=False,
+        )
+        flashinfer_backend = FlashInferBackend(
+            tot_num_blocks=max_num_pages, qk_nope_head_dim=128
+        )
+        flashinfer_backend.prepare_metadata_for_decode(
+            cache_seqlens_excl_this_decode_tensor,
+            cache_seqlens_incl_this_decode_tensor,
+            page_table,
+            page_size,
+            None,
+        )
+        ms = triton.testing.do_bench(
+            lambda: flashinfer_backend.mla_attn_with_kvcache(
+                q_nope,
+                q_pe,
+                kv_cache,
+                this_kv,
+                cache_seqlens_excl_this_decode_tensor,
+                cache_seqlens_incl_this_decode_tensor,
+                page_table,
+            )
+        )
+    else:
+        raise AssertionError("Provider must be triton or flashinfer")
+    return ms * 1000
+
+
+if __name__ == "__main__":
+    benchmark_mla_attn_with_kvcache.run(show_plots=True, print_data=True)
+    # benchmark_attn_varlen_func.run(show_plots=True, print_data=True)
+    # benchmark_attn_varlen_func.run(bs=8, show_plots=True, print_data=True)
+    # benchmark_attn_varlen_func.run(bs=16, show_plots=True, print_data=True)
+    # benchmark_attn_varlen_func.run(bs=32, show_plots=True, print_data=True)

@@ -115,8 +115,11 @@ async def create_chat_completion(request: ChatRequest):
             response.stream_generator(), media_type="text/event-stream"
         )
     else:
-        full_response = await response.full_generator()
-        return JSONResponse(full_response.model_dump())
+        try:
+            full_response = await response.full_generator()
+            return JSONResponse(full_response.model_dump())
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/init")

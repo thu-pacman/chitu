@@ -2,6 +2,8 @@ import torch
 import chitu_backend
 import pytest
 from typing import List, Optional
+import triton
+import triton.language as tl
 from chitu.layers.gate import fused_sigmoid_gate
 
 
@@ -72,3 +74,59 @@ def test_moe_fused_gate_sigmoid(seq_length, dtype, params, has_bias, bias_is_flo
     assert torch.allclose(
         kernel_indices.sort()[0].to(torch.int64), indices.sort()[0].to(torch.int64)
     )
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["seq_length"],
+        x_vals=[1, 16, 128, 256, 512, 1024],
+        line_arg="provider",
+        line_vals=["torch", "triton"],
+        line_names=["Torch", "Triton"],
+        styles=[("blue", "-"), ("green", "-")],
+        ylabel="us",
+        plot_name="moe_fused_gate_sigmoid-performance",
+        args={
+            "dtype": torch.bfloat16,
+            "params": (256, 8, 4, 8),
+            "has_bias": True,
+            "bias_is_float32": True,
+        },
+    )
+)
+def benchmark(seq_length, dtype, params, has_bias, bias_is_float32, provider):
+    num_experts, num_expert_group, topk_group, topk = params
+
+    torch.manual_seed(seq_length)
+    device = torch.device("cuda")
+    scores = torch.rand((seq_length, num_experts)).to(dtype).to(device)
+    if has_bias:
+        bias = (
+            torch.rand(num_experts)
+            .to(torch.float32 if bias_is_float32 else dtype)
+            .to(device)
+        )
+    else:
+        bias = None
+
+    if provider == "torch":
+        ms = triton.testing.do_bench(
+            lambda: reference_top_impl(
+                scores, bias, seq_length, num_expert_group, topk_group, topk
+            )
+        )
+    if provider == "triton":
+        ms = triton.testing.do_bench(
+            lambda: fused_sigmoid_gate(
+                scores,
+                topk,
+                num_expert_group=num_expert_group,
+                topk_group=topk_group,
+                e_score_correction_bias=bias,
+            )
+        )
+    return ms * 1000
+
+
+if __name__ == "__main__":
+    benchmark.run(show_plots=True, print_data=True)
