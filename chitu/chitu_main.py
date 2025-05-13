@@ -58,6 +58,13 @@ def chitu_init(args, logging_level=logging.INFO):
         )
         args.infer.raise_lower_bit_float_to = "bfloat16"
 
+    if args.infer.attn_type == "npu":
+        try:
+            import torch_npu
+            from torch_npu.contrib import transfer_to_npu
+        except ImportError:
+            raise ImportError("torch_npu is not installed")
+
     set_global_variables(args)
     Backend.build(args)
     rank = torch.distributed.get_rank()

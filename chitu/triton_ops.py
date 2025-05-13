@@ -12,7 +12,6 @@ from chitu.triton_kernels import *
 from chitu.device_type import is_hopper
 from chitu.utils import try_import_opt_dep
 from chitu.global_vars import get_global_args
-import chitu_backend
 
 
 def to_triton_dtype(dtype: torch.dtype):

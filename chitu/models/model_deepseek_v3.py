@@ -10,7 +10,6 @@ import torch.nn.functional as F
 from torch import nn
 from typing_extensions import override
 
-import chitu_backend
 from chitu.layers.gate import fused_sigmoid_gate
 from chitu.attn_backend import AttnBackend
 from chitu.cache_manager import PagedKVCacheManager
@@ -61,6 +60,8 @@ import ctypes
 logger = getLogger(__name__)
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
+chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
+
 if has_triton:
     from chitu.fused_moe import fused_experts
 

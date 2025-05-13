@@ -27,7 +27,10 @@ setup_dir = os.path.dirname(os.path.abspath(__file__))
 # We use CUDAExtension instead of CMake for native sources, because many of the non-NVIDIA GPUs have
 # their custom CUDAExtension, but not their custom CMake support.
 
-ext_modules = operators.get_extensions()
+if os.environ.get("ASCEND_PLATFORM", "0") == "0":
+    ext_modules = operators.get_extensions()
+else:
+    ext_modules = []
 
 
 cython_unsafe_files = [

@@ -21,6 +21,7 @@ from chitu.attn_backend import (
     FlashMLABackend,
     RefAttnBackend,
     TritonAttnBackend,
+    NpuAttnBackend,
 )
 from chitu.cache_manager import (
     KVCacheManager,
@@ -251,6 +252,8 @@ class Backend:
             )
         elif args.infer.cache_type == "paged":
             block_size = 64 if args.infer.mla_absorb != "none" else 256
+            if args.infer.attn_type == "npu":
+                block_size = 128
             return PagedKVCacheManager(
                 local_begin_layer_id,
                 local_end_layer_id,
@@ -339,6 +342,8 @@ class Backend:
             return FlashInferBackend(Backend.cache_manager.get_num_blocks())
         elif args.infer.attn_type == "triton":
             return TritonAttnBackend()
+        elif args.infer.attn_type == "npu":
+            return NpuAttnBackend()
         elif args.infer.attn_type == "ref":
             return RefAttnBackend()
         else:
