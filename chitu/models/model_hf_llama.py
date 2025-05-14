@@ -121,7 +121,7 @@ class AttentionHFLlama(Attention):
             base_linear_class=o_proj_linear,
         )
 
-        if args.name in {"Qwen3-32B", "Qwen3-30B-A3B", "Qwen3-235B-A22B"}:
+        if "Qwen3" in args.name:
             self.q_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
 
@@ -744,6 +744,8 @@ class TransformerHFLlama(Transformer):
         **kwargs,
     ):
         if not skip_preprocess:
+            if getattr(self.params, "tie_word_embeddings", False):
+                state_dict["lm_head.weight"] = state_dict["embed_tokens.weight"]
 
             if self.params.name.startswith("glm-4"):
                 # glm4 has non-standard key names because they use "custom code" in model files instead of
