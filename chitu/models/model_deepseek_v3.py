@@ -511,7 +511,11 @@ class AttentionDeepSeekV3(Attention):
                 self.dim,
                 self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
+                dtype=(
+                    torch.bfloat16
+                    if args.quant == "blockfp4"
+                    else parse_dtype(args.main_weight_dtype)
+                ),
                 bias_dtype=torch.get_default_dtype(),
                 disabled_methods={"blockfp4"},
             )  # FIXME: Run this layer with muxi_layout_kernels
@@ -520,7 +524,11 @@ class AttentionDeepSeekV3(Attention):
                 self.dim,
                 self.q_lora_rank,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
+                dtype=(
+                    torch.bfloat16
+                    if args.quant == "blockfp4"
+                    else parse_dtype(args.main_weight_dtype)
+                ),
                 bias_dtype=torch.get_default_dtype(),
                 disabled_methods={"blockfp4"},
             )  # FIXME: Run this layer with muxi_layout_kernels
@@ -528,7 +536,11 @@ class AttentionDeepSeekV3(Attention):
                 self.dim,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
+                dtype=(
+                    torch.bfloat16
+                    if args.quant == "blockfp4"
+                    else parse_dtype(args.main_weight_dtype)
+                ),
                 bias_dtype=torch.get_default_dtype(),
                 disabled_methods={"blockfp4"},
             )  # FIXME: Run this layer with muxi_layout_kernels
@@ -541,7 +553,11 @@ class AttentionDeepSeekV3(Attention):
                 else self.n_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
             ),
             has_bias=False,
-            dtype=parse_dtype(args.main_weight_dtype),
+            dtype=(
+                torch.bfloat16
+                if args.quant == "blockfp4"
+                else parse_dtype(args.main_weight_dtype)
+            ),
             bias_dtype=torch.get_default_dtype(),
             gather_output=False,
             base_linear_class=get_linear_layout_contig_x_contig_y(
@@ -555,7 +571,11 @@ class AttentionDeepSeekV3(Attention):
                 self.kv_lora_rank,
                 self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
+                dtype=(
+                    torch.bfloat16
+                    if args.quant == "blockfp4"
+                    else parse_dtype(args.main_weight_dtype)
+                ),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_x_contig_y(
@@ -595,7 +615,11 @@ class AttentionDeepSeekV3(Attention):
             ),
             self.dim,
             has_bias=False,
-            dtype=parse_dtype(args.main_weight_dtype),
+            dtype=(
+                torch.bfloat16
+                if args.quant == "blockfp4"
+                else parse_dtype(args.main_weight_dtype)
+            ),
             bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
             base_linear_class=get_linear_layout_contig_x_contig_y(
