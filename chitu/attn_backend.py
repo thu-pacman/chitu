@@ -1339,10 +1339,17 @@ class NpuAttnBackend(RefAttnBackend):
         if not self.has_torch_npu:
             raise ImportError("torch_npu is not installed")
         self.local_n_heads = self.args.models.n_heads // self.args.infer.tp_size
-        self.local_n_kv_heads = self.args.models.n_kv_heads // self.args.infer.tp_size
+        if hasattr(self.args.models, "n_kv_heads"):
+            self.local_n_kv_heads = (
+                self.args.models.n_kv_heads // self.args.infer.tp_size
+            )
+        else:
+            self.local_n_kv_heads = self.local_n_heads
+        if hasattr(self.args.models, "v_head_dim"):
+            self.mla_v_head_dim = self.args.models.v_head_dim
         self.scale = float(
             1 / math.sqrt(self.args.models.dim // self.args.models.n_heads)
-        )
+        )  # [FIXME] can not be used in mla
         self.block_size = 128
 
     def prepare_metadata_for_prefill(self, varlens):
@@ -1392,6 +1399,22 @@ class NpuAttnBackend(RefAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
     ):
+        if self.args.infer.mla_absorb.lower() != "none":
+            return super().attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                causal,
+                window_size,
+                softcap,
+                softmax_scale,
+            )
+
         # q [tokens_num, head_num, head_dim]
         output = torch.empty_like(q)
         self.torch_npu._npu_flash_attention(
@@ -1483,3 +1506,52 @@ class NpuAttnBackend(RefAttnBackend):
         output = output.permute(0, 2, 1, 3)  # 等价于 "b h 1 d -> b 1 h d"
 
         return output
+
+    def mla_attn_with_kvcache(
+        self,
+        q_nope,
+        q_pe,
+        kv_cache,
+        kv,
+        cache_seqlens_excl_this_decode: Union[(int, torch.Tensor)],
+        cache_seqlens_incl_this_decode: Union[(int, torch.Tensor)],
+        block_table: torch.Tensor,
+        causal=True,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
+    ):
+        bsz = cache_seqlens_excl_this_decode.shape[0]
+        tp_size = self.args.infer.tp_size
+        query = torch.cat([q_nope, q_pe], dim=-1).view(bsz, q_nope.shape[-2], -1)
+
+        for i in range(bsz):
+            kv_cache[block_table[i][cache_seqlens_excl_this_decode[i] // 128]][
+                cache_seqlens_excl_this_decode[i] % 128
+            ] = kv[i]
+        # kv_cache[indices, positions] = kv.squeeze(1) if kv.ndim == 3 and kv.shape[1] == 1 else kv
+
+        # slots = attn_metadata.slot_mapping
+        # torch_npu._npu_reshape_and_cache_siso(key=k_cache,
+        #                                           key_cache=key_cache,
+        #                                           slot_indices=slots)
+        kv_cache = kv_cache.unsqueeze(2)
+        attn_output = torch.randn(
+            [bsz, self.mla_v_head_dim // tp_size, 512],
+            dtype=query.dtype,
+            device=query.device,
+        )
+        self.torch_npu._npu_paged_attention_mla(
+            query=query,
+            key_cache=kv_cache,
+            num_kv_heads=1,
+            num_heads=128 // tp_size,
+            scale_value=1.0 / math.sqrt(query.shape[-1]),
+            block_table=block_table,
+            context_lens=cache_seqlens_incl_this_decode.cpu(),
+            mla_vheadsize=512,
+            out=attn_output,
+        )
+        attn_output = attn_output.unsqueeze(1)
+
+        return attn_output

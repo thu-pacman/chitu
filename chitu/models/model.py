@@ -78,7 +78,7 @@ class RMSNorm(nn.Module):
 
         if impl == "auto":
             triton, has_triton = try_import_opt_dep("triton", "triton")
-            if out is not None:
+            if out is not None and has_chitu_backend:
                 impl = "cuda"
             elif (
                 has_tbsgemm

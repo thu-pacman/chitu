@@ -118,6 +118,11 @@ class Backend:
         torch.cuda.set_device(local_rank)
         init_tp(model_parallel_size, pipeline_parallel_size)
 
+        if args.infer.attn_type == "npu":
+            from chitu.tensor_parallel import init_pp_group_npu
+
+            init_pp_group_npu(model_parallel_size, pipeline_parallel_size)
+
         Backend.pp_stage = global_rank // model_parallel_size
         Backend.pp_end_stage = (world_size - 1) // model_parallel_size
         Backend.pp_main_rank = (

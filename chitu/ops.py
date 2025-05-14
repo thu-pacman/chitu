@@ -575,7 +575,7 @@ def apply_rotary_pos_emb(
             )
         ):
             impl = "triton"
-        elif rotary_type == "llama":
+        elif rotary_type == "llama" and has_chitu_backend:
             impl = "cuda"
         else:
             impl = "torch"

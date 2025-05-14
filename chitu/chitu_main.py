@@ -16,7 +16,7 @@ from chitu.task import (
     TaskType,
     req_encode,
 )
-from chitu.tensor_parallel import get_tp_group
+from chitu.tensor_parallel import get_tp_group, get_pp_group
 
 logger = getLogger(__name__)
 
@@ -85,7 +85,10 @@ def remove_task_other_device(remove_task_ids):
         len(remove_task_ids), remove_task_ids, remove_task_ids, TaskType.Decode
     ).serialize(payload_type=SerializedPackedTasksPayloadType.EndTask, device=0)
     if Backend.args.infer.pp_size > 1:
-        torch.distributed.isend(tensor=task_tensor, dst=Backend.args.infer.tp_size)
+        pg = get_pp_group(0, Backend.args.infer.tp_size)
+        torch.distributed.isend(
+            tensor=task_tensor, dst=Backend.args.infer.tp_size, group=pg
+        )
         if Backend.args.infer.tp_size > 1:
             torch.distributed.broadcast(
                 tensor=task_tensor, src=Backend.pp_main_rank, group=get_tp_group()
