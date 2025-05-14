@@ -23,6 +23,7 @@ from chitu.device_type import is_muxi
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
 flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
+triton, has_triton = try_import_opt_dep("triton", "triton")
 
 
 class AttnBackend(abc.ABC):
@@ -451,7 +452,7 @@ class RefAttnBackend(AttnBackend):
         # Otherwise we'll get NaN in dV
         if query_padding_mask is not None:
             attention = attention.masked_fill(
-                self._einops.rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0
+                self._einops.rearrange(~query_padding_mask, "b t -> b 1 t 1"), 0.0
             )
         dropout_scaling = 1.0 / (1 - dropout_p)
         if dropout_mask is not None:
@@ -461,7 +462,7 @@ class RefAttnBackend(AttnBackend):
         output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
         if query_padding_mask is not None:
             output.masked_fill_(
-                self._einops.rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0
+                self._einops.rearrange(~query_padding_mask, "b t -> b t 1 1"), 0.0
             )
         return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
@@ -630,17 +631,20 @@ class TritonAttnBackend(RefAttnBackend):
                 mla_decode,
                 mla_decode_non_paged,
                 decode_attention_fwd,
+                triton_skew_decode,
             )
 
             self.mla_decode = mla_decode
             self.mla_decode_non_paged = mla_decode_non_paged
             self.decode_attention_fwd = decode_attention_fwd
             self.context_attention_fwd = context_attention_fwd
+            self.triton_skew_decode = triton_skew_decode
         except ImportError:
             self.mla_decode = None
             self.mla_decode_non_paged = None
             self.decode_attention_fwd = None
             self.context_attention_fwd = None
+            self.triton_skew_decode = None
 
     def prepare_metadata_for_decode(
         self,
@@ -803,6 +807,140 @@ class TritonAttnBackend(RefAttnBackend):
                 )
 
         return o.view(B, 1, local_n_heads, -1)
+
+    def attn_with_kvcache(
+        self,
+        q,
+        k_cache,
+        v_cache,
+        k=None,
+        v=None,
+        cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+        cache_leftpad: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
+        causal=False,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
+    ):
+        if triton.__version__ < "3.2.0" and block_table is None:
+            # triton has bug, when version < 3.2.0, the "~" operator on bool vector will get wrong results, so fallback to ref_attn
+            return super().attn_with_kvcache(
+                q,
+                k_cache,
+                v_cache,
+                k,
+                v,
+                cache_seqlens,
+                cache_leftpad,
+                block_table,
+                causal,
+                window_size,
+                softcap,
+                softmax_scale,
+            )
+        if cache_seqlens is int or cache_seqlens.ndim == 0:
+            cache_seqlens = torch.full(
+                (q.shape[0],), cache_seqlens, dtype=torch.long, device=q.device
+            )
+        if k is None and q is None:
+            seqlens = cache_seqlens
+        elif k is not None and q is not None:
+            seqlens = cache_seqlens + 1
+            if block_table is not None:
+                page_size = k_cache.shape[1]
+                for i in range(cache_seqlens.shape[0]):
+                    k_cache[
+                        block_table[i, cache_seqlens[i] // page_size],
+                        cache_seqlens[i] % page_size,
+                    ] = k[i]
+                    v_cache[
+                        block_table[i, cache_seqlens[i] // page_size],
+                        cache_seqlens[i] % page_size,
+                    ] = v[i]
+            else:
+                for i in range(cache_seqlens.shape[0]):
+                    k_cache[i, cache_seqlens[i]] = k[i]
+                    v_cache[i, cache_seqlens[i]] = v[i]
+        else:
+            assert False
+
+        if block_table is not None:
+            PAGE_SIZE = k_cache.shape[1]
+            output = torch.zeros_like(q)
+            num_kv_splits = None
+            if is_muxi():
+                if q.shape[0] > 32:
+                    num_kv_splits = 3
+                elif q.shape[0] > 1:
+                    num_kv_splits = 8
+                else:
+                    num_kv_splits = 16
+            else:
+                num_kv_splits = 4
+
+            assert num_kv_splits is not None
+
+            attn_logits = torch.empty(
+                (
+                    q.shape[0],
+                    q.shape[-2],
+                    num_kv_splits,
+                    q.shape[-1] + 1,
+                ),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            if softmax_scale == None:
+                softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+            self.decode_attention_fwd(
+                q.view(-1, q.shape[-2], q.shape[-1]),
+                k_cache,
+                v_cache,
+                output.view(-1, output.shape[-2], output.shape[-1]),
+                block_table,
+                seqlens,
+                attn_logits,
+                num_kv_splits,
+                softmax_scale,
+                PAGE_SIZE,
+                logit_cap=softcap,
+            )
+        else:
+            arange = self._einops.rearrange(
+                torch.arange(k_cache.shape[1], device=k_cache.device), "s -> 1 s"
+            )
+            cache_seqlens_expanded = self._einops.rearrange(cache_seqlens, "b -> b 1")
+            if k is None and q is None:
+                key_padding_mask = arange < cache_seqlens_expanded
+            elif k is not None and q is not None:
+                key_padding_mask = arange < cache_seqlens_expanded + 1
+            else:
+                assert False
+            local_mask = None
+            if window_size[0] >= 0 or window_size[1] >= 0:
+                local_mask = self._construct_local_mask(
+                    1,
+                    torch.max(seqlens),
+                    window_size,
+                    None,
+                    key_padding_mask,
+                    q.device,
+                    key_leftpad=cache_leftpad,
+                )
+            output = self.triton_skew_decode(
+                q,
+                k_cache,
+                v_cache,
+                key_padding_mask=key_padding_mask,
+                window_size=window_size,
+                softcap=softcap,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                local_mask=local_mask,
+            )
+
+        return output
 
 
 class FlashMLABackend(TritonAttnBackend):
