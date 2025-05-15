@@ -1,0 +1,16 @@
+name: Qwen3-8B
+type: hf-llama
+source: "https://huggingface.co/Qwen/Qwen3-8B" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+dim: 1024
+n_layers: 28
+n_heads: 16
+n_kv_heads: 8
+vocab_size: 151936
+intermediate_dim: 3072
+norm_eps: 1e-06
+rope_theta: 1000000.0
+qkv_has_bias: False
+head_dim: 128
+tie_word_embeddings: True

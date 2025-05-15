@@ -5,6 +5,8 @@ This file has adaption of open-source code from the following sources:
   licensed under Apache 2.0.
 """
 
+import math
+import torch
 import triton
 import triton.language as tl
 
@@ -1131,3 +1133,258 @@ def mla_decode_non_paged(
         b_seq_len,
         num_kv_splits,
     )
+
+
+block_m_sizes = [32] if is_muxi() else [32, 64]
+triton_skew_decode_configs = [
+    triton.Config({"BLOCK_SIZE_M": BM, "BLOCK_SIZE_N": BN})
+    for BM in block_m_sizes
+    for BN in [32]
+]
+
+
+@triton.autotune(configs=triton_skew_decode_configs, key=["num_heads_q", "head_dim"])
+@triton.jit
+def triton_skew_decode_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    o_ptr,
+    softmax_scale,
+    softcap: tl.constexpr,
+    attn_bias,
+    dropout_p,
+    local_mask,
+    query_padding_mask,
+    key_padding_mask,
+    dropout_mask,
+    stride_q_b,
+    stride_q_t,
+    stride_q_h,
+    stride_q_d,  # q.shape=bthd
+    stride_k_b,
+    stride_k_s,
+    stride_k_h,
+    stride_k_d,  # k.shape=bshd
+    stride_v_b,
+    stride_v_s,
+    stride_v_h,
+    stride_v_d,  # v.shape=bshd
+    stride_o_b,
+    stride_o_t,
+    stride_o_h,
+    stride_o_d,  # o.shape=bthd
+    batch_size: tl.constexpr,
+    seq_len_q: tl.constexpr,
+    seq_len_kv: tl.constexpr,
+    num_heads_q: tl.constexpr,
+    head_dim: tl.constexpr,
+    group_size: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    pid_bh = tl.program_id(axis=0)
+    pid_t = tl.program_id(axis=1)
+
+    b = pid_bh // num_heads_q
+    h = pid_bh % num_heads_q
+
+    t_range = pid_t * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+
+    mask_t = t_range < seq_len_q
+
+    q_offsets = (
+        b * stride_q_b
+        + h * stride_q_h
+        + t_range[:, None] * stride_q_t
+        + tl.arange(0, head_dim)[None, :] * stride_q_d
+    )
+    q = tl.load(q_ptr + q_offsets, mask=mask_t[:, None], other=0.0)
+    acc = tl.zeros([BLOCK_SIZE_M, head_dim], dtype=tl.float32)
+    last_max = tl.zeros([BLOCK_SIZE_M], dtype=tl.float32) - float("inf")
+    last_sum = tl.zeros([BLOCK_SIZE_M], dtype=tl.float32)
+
+    if query_padding_mask is not None:
+        query_mask_offset = b * seq_len_q + t_range[:, None]
+        query_mask = tl.load(
+            query_padding_mask + query_mask_offset, mask=mask_t[:, None], other=0.0
+        )
+
+    for i in range(0, seq_len_kv, BLOCK_SIZE_N):
+        s_range = i + tl.arange(0, BLOCK_SIZE_N)
+        mask_s = s_range < seq_len_kv
+
+        k_offsets = (
+            b * stride_k_b
+            + h // group_size * stride_k_h
+            + s_range[:, None] * stride_k_s
+            + tl.arange(0, head_dim)[None, :] * stride_k_d
+        )
+        k = tl.load(k_ptr + k_offsets, mask=mask_s[:, None], other=0.0)
+        k = tl.trans(k)
+        block_scores = tl.dot(q, k)
+        block_scores = block_scores * softmax_scale
+
+        if softcap > 0:
+            block_scores = block_scores / softcap
+            block_scores_clamped = tl.minimum(tl.maximum(block_scores, -4.97), 4.97)
+            exp_block_scores = tl.exp(2 * block_scores_clamped)
+            tanh_val = (exp_block_scores - 1) / (exp_block_scores + 1)
+            block_scores = tanh_val * softcap
+
+        if key_padding_mask is not None:
+            key_mask = tl.load(
+                key_padding_mask + b * seq_len_kv + s_range, mask=mask_s, other=0
+            )
+            block_scores = tl.where(~key_mask[None, :], float("-inf"), block_scores)
+
+        if local_mask is not None:
+            mask = tl.load(local_mask + b * seq_len_kv + s_range, mask=mask_s, other=0)
+            block_scores = tl.where(mask[None, :], float("-inf"), block_scores)
+
+        if attn_bias is not None:
+            attn_bias_offsets = (
+                b * num_heads_q * seq_len_q * seq_len_kv
+                + h * seq_len_q * seq_len_kv
+                + t_range[:, None] * seq_len_kv
+                + s_range
+            )
+            attn_bias_mask = mask_t[:, None] & mask_s[None, :]
+            attn_bias_val = tl.load(
+                attn_bias + attn_bias_offsets, mask=attn_bias_mask, other=0.0
+            )
+            block_scores += attn_bias_val
+
+        new_max = tl.maximum(last_max, tl.max(block_scores, 1))
+        block_scores -= new_max[:, None]
+        p = tl.math.exp(block_scores)
+
+        if local_mask is not None:
+            full_local_mask_row_offset = b * seq_len_kv + tl.arange(0, seq_len_kv)
+            mask = tl.load(local_mask + full_local_mask_row_offset)
+            all_true = tl.min(mask) == 1
+            p = tl.where(all_true[None, :], 0.0, p)
+
+        new_sum = tl.sum(p, 1)
+        alpha = tl.math.exp(last_max - new_max)
+        last_sum = last_sum * alpha + new_sum
+        acc = acc * alpha[:, None]
+        if query_padding_mask is not None:
+            p = tl.where(~query_mask[None, :], 0.0, p)
+        dropout_scaling = 1.0 / (1 - dropout_p)
+        if dropout_mask is not None:  # assume shape is bhts
+            dropout_mask_offset = (
+                b * num_heads_q * seq_len_q * seq_len_kv
+                + h * seq_len_q * seq_len_kv
+                + t_range[:, None] * seq_len_kv
+                + s_range[None, :]
+            )
+            mask = tl.load(
+                dropout_mask + dropout_mask_offset,
+                mask=mask_t[None, :] & mask_s[:, None],
+                other=0,
+            )
+            p = tl.where(~mask[None, :], 0.0, p)
+        v_offsets = (
+            b * stride_v_b
+            + h // group_size * stride_v_h
+            + s_range[:, None] * stride_v_s
+            + tl.arange(0, head_dim)[None, :] * stride_v_d
+        )
+        v = tl.load(v_ptr + v_offsets, mask=mask_s[:, None], other=0.0)
+        v = v * dropout_scaling
+        p = p.to(q_ptr.type.element_ty)
+        v = v.to(q_ptr.type.element_ty)
+        acc_i = tl.dot(p, v)
+        if query_padding_mask is not None:
+            acc_i = tl.where(~query_mask[None, :], 0.0, acc_i)
+        acc = acc + acc_i
+        last_max = new_max
+    acc = acc / last_sum[:, None]
+
+    o_offsets = (
+        b * stride_o_b
+        + h * stride_o_h
+        + t_range[:, None] * stride_o_t
+        + tl.arange(0, head_dim)[None, :] * stride_o_d
+    )
+    tl.store(o_ptr + o_offsets, acc.to(o_ptr.type.element_ty), mask=mask_t[:, None])
+
+
+def triton_skew_decode(
+    q,
+    k,
+    v,
+    query_padding_mask=None,
+    key_padding_mask=None,
+    attn_bias=None,
+    dropout_p=0.0,
+    dropout_mask=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite window size
+    softcap=0.0,
+    upcast=False,
+    reorder_ops=False,
+    key_leftpad=None,
+    softmax_scale=None,
+    local_mask=None,
+):
+    if causal:
+        window_size = (window_size[0], 0)
+    if upcast:
+        q, k, v = q.float(), k.float(), v.float()
+    group_size = q.shape[2] // k.shape[2]
+    d = q.shape[-1]
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(d)
+    o = torch.empty_like(q)
+    if attn_bias is not None:
+        assert attn_bias.shape[-1] == k.shape[1] and attn_bias.shape[-2] == q.shape[1]
+        attn_bias = torch.broadcast_to(
+            attn_bias, (q.shape[0], q.shape[2], q.shape[1], k.shape[1])
+        )  # bhts
+        if attn_bias.is_contiguous() == False:
+            attn_bias = attn_bias.contiguous()
+    grid = lambda META: (
+        q.shape[0] * q.shape[2],
+        triton.cdiv(q.shape[1], META["BLOCK_SIZE_M"]),
+        1,
+    )
+    triton_skew_decode_kernel[grid](
+        q,
+        k,
+        v,
+        o,
+        softmax_scale,
+        softcap,
+        attn_bias,
+        dropout_p,
+        local_mask,
+        query_padding_mask,
+        key_padding_mask,
+        dropout_mask,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        o.stride(3),
+        q.shape[0],
+        q.shape[1],
+        k.shape[1],
+        q.shape[2],
+        q.shape[3],
+        group_size,
+    )
+
+    return o

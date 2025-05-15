@@ -15,6 +15,7 @@ from chitu.global_vars import get_global_args
 from chitu.quantization import QuantizationRegistry
 
 tp_comm_group = None
+pp_group = {}
 
 
 def generate_tp_rank_list(tp_size: int, pp_size: int):
@@ -29,6 +30,28 @@ def init_tp(tp_size: int, pp_size: int):
         group = torch.distributed.new_group(ranks)
         if global_rank in ranks:
             tp_comm_group = group
+
+
+def init_pp_group_npu(tp_size: int, pp_size: int):
+    assert len(pp_group) == 0
+    if pp_size < 2:
+        return
+
+    ranks = [i * tp_size for i in range(pp_size)]
+    for i in range(pp_size):
+        next_i = (i + 1) % pp_size
+        rank_pair = [ranks[i], ranks[next_i]]
+        pg = torch.distributed.new_group(rank_pair)
+        pp_group[(ranks[i], ranks[next_i])] = pg
+        pp_group[(ranks[next_i], ranks[i])] = pg
+
+
+def get_pp_group(rank1, rank2):
+    if len(pp_group) == 0:
+        return None
+    else:
+        key = (rank1, rank2)
+        return pp_group[key]
 
 
 def get_tp_group():

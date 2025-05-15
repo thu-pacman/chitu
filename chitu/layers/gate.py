@@ -1,5 +1,7 @@
 import torch
-import chitu_backend
+from chitu.utils import try_import_opt_dep
+
+chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
 
 
 def fused_sigmoid_gate(

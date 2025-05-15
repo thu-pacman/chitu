@@ -9,7 +9,8 @@ import torch.nn.functional as F
 from chitu.device_type import is_hopper
 from chitu.utils import try_import_opt_dep
 from chitu.global_vars import get_global_args
-import chitu_backend
+
+chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
 
 
 def rotate_half(x):
@@ -234,7 +235,7 @@ def append_to_paged_kv_cache_torch(
     for i in range(old_seq_lens.shape[0]):
         kv_cache[
             page_table[i, old_seq_lens[i] // page_size], old_seq_lens[i] % page_size
-        ] = this_kv[i]
+        ] = this_kv[i].clone()
 
 
 # TODO: need to be optimized
@@ -574,7 +575,7 @@ def apply_rotary_pos_emb(
             )
         ):
             impl = "triton"
-        elif rotary_type == "llama":
+        elif rotary_type == "llama" and has_chitu_backend:
             impl = "cuda"
         else:
             impl = "torch"

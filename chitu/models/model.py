@@ -23,7 +23,8 @@ from chitu.utils import VarLens, compute_layer_dist_in_pipe, is_layer
 from chitu.cuda_graph import make_dispatched_graphed_callables
 from chitu.device_type import is_muxi, get_device_name
 from chitu.utils import try_import_opt_dep
-import chitu_backend
+
+chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
 
 logger = getLogger(__name__)
 
@@ -77,7 +78,7 @@ class RMSNorm(nn.Module):
 
         if impl == "auto":
             triton, has_triton = try_import_opt_dep("triton", "triton")
-            if out is not None:
+            if out is not None and has_chitu_backend:
                 impl = "cuda"
             elif (
                 has_tbsgemm
@@ -665,6 +666,7 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def prefill(self, tokens, varlens=None):
+        self.attn_backend.prepare_metadata_for_prefill(self.cache.curr_varlens)
         if self.pipeline_exec:
             return self.prefill_pipeline(tokens)
         elif self.tensor_exec:

@@ -20,7 +20,7 @@ from chitu.task import (
     req_decode,
     taskid2reqid,
 )
-from chitu.tensor_parallel import get_tp_group
+from chitu.tensor_parallel import get_tp_group, get_pp_group
 from chitu.utils import VarLens, top_k_top_p_min_p_sampling_from_probs_torch
 
 logger = getLogger(__name__)
@@ -204,8 +204,12 @@ class PipeTensorExecutor(NormalExecutor):
                     device=self.local_rank,
                 )
             if self.rank == self.pp_main_rank:
+                pg = get_pp_group(self.rank, self.rank - self.tp_size)
                 torch.distributed.recv(
-                    tensor=inp, src=self.rank - self.tp_size, tag=HIDDEN_TENSOR_TAG
+                    tensor=inp,
+                    src=self.rank - self.tp_size,
+                    tag=HIDDEN_TENSOR_TAG,
+                    group=pg,
                 )
             if self.tp_size > 1:
                 torch.distributed.broadcast(
@@ -217,18 +221,22 @@ class PipeTensorExecutor(NormalExecutor):
 
         self.timers("prefill").stop()
         if self.rank == self.pp_main_rank and self.pp_stage != self.pp_end_stage:
+            pg = get_pp_group(self.rank, self.rank + self.tp_size)
             torch.distributed.isend(
                 tensor=out.contiguous(),  # contiguous() is necessary for NCCL
                 dst=self.rank + self.tp_size,
                 tag=HIDDEN_TENSOR_TAG,
+                group=pg,
             )
         elif self.rank == self.pp_main_rank and self.pp_stage == self.pp_end_stage:
             # send logits to rank 0 to get response words
             torch.cuda.synchronize(self.local_rank)
+            pg = get_pp_group(self.rank, 0)
             torch.distributed.isend(
                 tensor=out.contiguous(),  # contiguous() is necessary for NCCL
                 dst=0,
                 tag=LOGIT_TAG,
+                group=pg,
             )
         Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
         return out
@@ -255,8 +263,12 @@ class PipeTensorExecutor(NormalExecutor):
                     device=self.local_rank,
                 )
             if self.rank == self.pp_main_rank:
+                pg = get_pp_group(self.rank, self.rank - self.tp_size)
                 torch.distributed.recv(
-                    tensor=inp, src=self.rank - self.tp_size, tag=HIDDEN_TENSOR_TAG
+                    tensor=inp,
+                    src=self.rank - self.tp_size,
+                    tag=HIDDEN_TENSOR_TAG,
+                    group=pg,
                 )
             if self.tp_size > 1:
                 torch.distributed.broadcast(
@@ -269,18 +281,22 @@ class PipeTensorExecutor(NormalExecutor):
         self.timers("decode-model").stop()
         self.timers("decode").stop()
         if self.rank == self.pp_main_rank and self.pp_stage != self.pp_end_stage:
+            pg = get_pp_group(self.rank, self.rank + self.tp_size)
             torch.distributed.isend(
                 tensor=out.contiguous(),  # contiguous() is necessary for NCCL
                 dst=self.rank + self.tp_size,
                 tag=HIDDEN_TENSOR_TAG,
+                group=pg,
             )
         elif self.rank == self.pp_main_rank and self.pp_stage == self.pp_end_stage:
             # Send logits to rank 0 to get response words
             out = out.view(out.shape[0], -1)
+            pg = get_pp_group(self.rank, 0)
             torch.distributed.isend(
                 out.contiguous(),  # contiguous() is necessary for NCCL
                 dst=0,
                 tag=LOGIT_TAG,
+                group=pg,
             )
         Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return out
@@ -291,8 +307,9 @@ class PipeTensorExecutor(NormalExecutor):
             device=self.local_rank,
             dtype=torch.float,
         )
+        pg = get_pp_group(self.rank, self.last_pp_main_rank)
         handle = torch.distributed.irecv(
-            logits, src=self.last_pp_main_rank, tag=LOGIT_TAG
+            logits, src=self.last_pp_main_rank, tag=LOGIT_TAG, group=pg
         )
         Backend.ongoing_reqs.append(OngoingRequests(tasks, handle, logits))
         for it, task in enumerate(tasks.tasks):
@@ -319,10 +336,12 @@ class PipeTensorExecutor(NormalExecutor):
         else:
             task_tensor = PackedTasksBase.empty_serialization(device=self.local_rank)
             if self.rank == self.pp_main_rank:
+                pg = get_pp_group(self.rank, self.rank - self.tp_size)
                 torch.distributed.recv(
                     tensor=task_tensor,
                     src=self.rank - self.tp_size,
                     tag=TASK_TENSOR_TAG,
+                    group=pg,
                 )
             if self.tp_size > 1:
                 torch.distributed.broadcast(
@@ -335,8 +354,12 @@ class PipeTensorExecutor(NormalExecutor):
                 remove_kvcache = True
 
         if self.rank == self.pp_main_rank and self.pp_stage != self.pp_end_stage:
+            pg = get_pp_group(self.rank, self.rank + self.tp_size)
             torch.distributed.isend(
-                tensor=task_tensor, dst=self.rank + self.tp_size, tag=TASK_TENSOR_TAG
+                tensor=task_tensor,
+                dst=self.rank + self.tp_size,
+                tag=TASK_TENSOR_TAG,
+                group=pg,
             )
 
         if Backend.state == BackendState.Terminating:

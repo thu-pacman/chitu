@@ -4,13 +4,15 @@ This file has adaption of open-source code from the following sources:
 - The implementation of the reference backend (RefAttnBackend) is originally from flash_attn's test (https://github.com/Dao-AILab/flash-attention/blob/main/tests/test_flash_attn.py), licensed under BSD-3-Clause.
 """
 
-__all__ = ["AttnBackend", "FlashAttnBackend", "RefAttnBackend"]
+__all__ = ["AttnBackend", "FlashAttnBackend", "RefAttnBackend", "NpuAttnBackend"]
 
 import abc
 import math
 from typing import Optional, Union
 
 import torch
+from torch.nn.functional import scaled_dot_product_attention
+
 
 from chitu.global_vars import get_global_args
 from chitu.ops import append_to_paged_kv_cache, append_to_non_paged_kv_cache
@@ -21,6 +23,7 @@ from chitu.device_type import is_muxi
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
 flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
+triton, has_triton = try_import_opt_dep("triton", "triton")
 
 
 class AttnBackend(abc.ABC):
@@ -33,6 +36,9 @@ class AttnBackend(abc.ABC):
         self.qk_nope_head_dim = qk_nope_head_dim
 
     def prepare_metadata_for_decode(self, *args, **kwargs):
+        pass
+
+    def prepare_metadata_for_prefill(self, *args, **kwargs):
         pass
 
     @abc.abstractmethod
@@ -446,7 +452,7 @@ class RefAttnBackend(AttnBackend):
         # Otherwise we'll get NaN in dV
         if query_padding_mask is not None:
             attention = attention.masked_fill(
-                self._einops.rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0
+                self._einops.rearrange(~query_padding_mask, "b t -> b 1 t 1"), 0.0
             )
         dropout_scaling = 1.0 / (1 - dropout_p)
         if dropout_mask is not None:
@@ -456,7 +462,7 @@ class RefAttnBackend(AttnBackend):
         output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
         if query_padding_mask is not None:
             output.masked_fill_(
-                self._einops.rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0
+                self._einops.rearrange(~query_padding_mask, "b t -> b t 1 1"), 0.0
             )
         return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
@@ -625,17 +631,20 @@ class TritonAttnBackend(RefAttnBackend):
                 mla_decode,
                 mla_decode_non_paged,
                 decode_attention_fwd,
+                triton_skew_decode,
             )
 
             self.mla_decode = mla_decode
             self.mla_decode_non_paged = mla_decode_non_paged
             self.decode_attention_fwd = decode_attention_fwd
             self.context_attention_fwd = context_attention_fwd
+            self.triton_skew_decode = triton_skew_decode
         except ImportError:
             self.mla_decode = None
             self.mla_decode_non_paged = None
             self.decode_attention_fwd = None
             self.context_attention_fwd = None
+            self.triton_skew_decode = None
 
     def prepare_metadata_for_decode(
         self,
@@ -798,6 +807,140 @@ class TritonAttnBackend(RefAttnBackend):
                 )
 
         return o.view(B, 1, local_n_heads, -1)
+
+    def attn_with_kvcache(
+        self,
+        q,
+        k_cache,
+        v_cache,
+        k=None,
+        v=None,
+        cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+        cache_leftpad: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
+        causal=False,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
+    ):
+        if triton.__version__ < "3.2.0" and block_table is None:
+            # triton has bug, when version < 3.2.0, the "~" operator on bool vector will get wrong results, so fallback to ref_attn
+            return super().attn_with_kvcache(
+                q,
+                k_cache,
+                v_cache,
+                k,
+                v,
+                cache_seqlens,
+                cache_leftpad,
+                block_table,
+                causal,
+                window_size,
+                softcap,
+                softmax_scale,
+            )
+        if cache_seqlens is int or cache_seqlens.ndim == 0:
+            cache_seqlens = torch.full(
+                (q.shape[0],), cache_seqlens, dtype=torch.long, device=q.device
+            )
+        if k is None and q is None:
+            seqlens = cache_seqlens
+        elif k is not None and q is not None:
+            seqlens = cache_seqlens + 1
+            if block_table is not None:
+                page_size = k_cache.shape[1]
+                for i in range(cache_seqlens.shape[0]):
+                    k_cache[
+                        block_table[i, cache_seqlens[i] // page_size],
+                        cache_seqlens[i] % page_size,
+                    ] = k[i]
+                    v_cache[
+                        block_table[i, cache_seqlens[i] // page_size],
+                        cache_seqlens[i] % page_size,
+                    ] = v[i]
+            else:
+                for i in range(cache_seqlens.shape[0]):
+                    k_cache[i, cache_seqlens[i]] = k[i]
+                    v_cache[i, cache_seqlens[i]] = v[i]
+        else:
+            assert False
+
+        if block_table is not None:
+            PAGE_SIZE = k_cache.shape[1]
+            output = torch.zeros_like(q)
+            num_kv_splits = None
+            if is_muxi():
+                if q.shape[0] > 32:
+                    num_kv_splits = 3
+                elif q.shape[0] > 1:
+                    num_kv_splits = 8
+                else:
+                    num_kv_splits = 16
+            else:
+                num_kv_splits = 4
+
+            assert num_kv_splits is not None
+
+            attn_logits = torch.empty(
+                (
+                    q.shape[0],
+                    q.shape[-2],
+                    num_kv_splits,
+                    q.shape[-1] + 1,
+                ),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            if softmax_scale == None:
+                softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+            self.decode_attention_fwd(
+                q.view(-1, q.shape[-2], q.shape[-1]),
+                k_cache,
+                v_cache,
+                output.view(-1, output.shape[-2], output.shape[-1]),
+                block_table,
+                seqlens,
+                attn_logits,
+                num_kv_splits,
+                softmax_scale,
+                PAGE_SIZE,
+                logit_cap=softcap,
+            )
+        else:
+            arange = self._einops.rearrange(
+                torch.arange(k_cache.shape[1], device=k_cache.device), "s -> 1 s"
+            )
+            cache_seqlens_expanded = self._einops.rearrange(cache_seqlens, "b -> b 1")
+            if k is None and q is None:
+                key_padding_mask = arange < cache_seqlens_expanded
+            elif k is not None and q is not None:
+                key_padding_mask = arange < cache_seqlens_expanded + 1
+            else:
+                assert False
+            local_mask = None
+            if window_size[0] >= 0 or window_size[1] >= 0:
+                local_mask = self._construct_local_mask(
+                    1,
+                    torch.max(seqlens),
+                    window_size,
+                    None,
+                    key_padding_mask,
+                    q.device,
+                    key_leftpad=cache_leftpad,
+                )
+            output = self.triton_skew_decode(
+                q,
+                k_cache,
+                v_cache,
+                key_padding_mask=key_padding_mask,
+                window_size=window_size,
+                softcap=softcap,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                local_mask=local_mask,
+            )
+
+        return output
 
 
 class FlashMLABackend(TritonAttnBackend):
@@ -1184,3 +1327,231 @@ class FlashInferBackend(TritonAttnBackend):
                     sm_scale=softmax_scale,
                 )
         return o.view(q.shape)
+
+
+class NpuAttnBackend(RefAttnBackend):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.args = get_global_args()
+        self.torch_npu, self.has_torch_npu = try_import_opt_dep(
+            "torch_npu", "torch_npu"
+        )
+        if not self.has_torch_npu:
+            raise ImportError("torch_npu is not installed")
+        self.local_n_heads = self.args.models.n_heads // self.args.infer.tp_size
+        if hasattr(self.args.models, "n_kv_heads"):
+            self.local_n_kv_heads = (
+                self.args.models.n_kv_heads // self.args.infer.tp_size
+            )
+        else:
+            self.local_n_kv_heads = self.local_n_heads
+        if hasattr(self.args.models, "v_head_dim"):
+            self.mla_v_head_dim = self.args.models.v_head_dim
+        self.scale = float(
+            1 / math.sqrt(self.args.models.dim // self.args.models.n_heads)
+        )  # [FIXME] can not be used in mla
+        self.block_size = 128
+
+    def prepare_metadata_for_prefill(self, varlens):
+        def generate_attn_mask(max_seq_len: int, dtype=torch.bfloat16):
+            # Construct lower triangle matrix.
+            mask_flag = torch.tril(
+                torch.ones((max_seq_len, max_seq_len), dtype=torch.bool)
+            ).view(max_seq_len, max_seq_len)
+            # Create upper triangle matrix used to mark mask positions.
+            mask_flag = ~mask_flag
+            # Currently for fp16 dtype, the mask value should be set to -inf.
+            # TODO: Eliminate this part in the future.
+            if dtype == torch.float16:
+                mask_value = torch.finfo(torch.float32).min
+            else:
+                mask_value = 1
+            attn_mask = torch.masked_fill(
+                torch.zeros(size=(max_seq_len, max_seq_len)), mask_flag, mask_value
+            ).to(dtype)
+            return attn_mask
+
+        self.attn_mask = generate_attn_mask(varlens.max_len, torch.bfloat16).cuda()
+        self.seq_lens_tensor_cpu = varlens.seq_lens_tensor_cpu
+
+    def prepare_metadata_for_decode(
+        self,
+        cache_seqlens_excl_this_decode,
+        cache_seqlens_incl_this_decode,
+        block_table,
+        block_size,
+        softmax_scale=None,
+    ):
+        self.cache_seqlens_incl_this_decode_cpu = cache_seqlens_incl_this_decode.cpu()
+
+    def attn_varlen_func(
+        self,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p=0.0,
+        causal=False,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
+    ):
+        if self.args.infer.mla_absorb.lower() != "none":
+            return super().attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                causal,
+                window_size,
+                softcap,
+                softmax_scale,
+            )
+
+        # q [tokens_num, head_num, head_dim]
+        output = torch.empty_like(q)
+        self.torch_npu._npu_flash_attention(
+            query=q,
+            key=k,
+            value=v,
+            mask=self.attn_mask,
+            seq_len=self.seq_lens_tensor_cpu,
+            scale_value=self.scale,
+            num_heads=self.local_n_heads,
+            num_kv_heads=self.local_n_kv_heads,
+            out=output,
+        )
+        return output
+
+    def attn_with_kvcache(
+        self,
+        q,
+        k_cache,
+        v_cache,
+        k=None,
+        v=None,
+        cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+        cache_leftpad: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
+        causal=False,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
+    ):
+        if block_table is None:
+            return self.attn_with_skew_kvcache(
+                q, k_cache, v_cache, k, v, cache_seqlens=cache_seqlens
+            )
+        else:
+            q = q.squeeze(
+                1
+            )  # [batch_size, 1, head_num, head_dim] -> [tokens, head_num, head_dim]
+            output = torch.empty_like(q)
+
+            # update kv_cache
+            append_to_paged_kv_cache(k_cache, block_table, k, cache_seqlens)
+            append_to_paged_kv_cache(v_cache, block_table, v, cache_seqlens)
+
+            self.torch_npu._npu_paged_attention(
+                query=q,
+                key_cache=k_cache,
+                value_cache=v_cache,
+                num_kv_heads=self.local_n_kv_heads,
+                num_heads=self.local_n_heads,
+                scale_value=self.scale,
+                block_table=block_table,
+                context_lens=self.cache_seqlens_incl_this_decode_cpu,
+                out=output,
+            )
+            return output.unsqueeze(1)
+
+    def attn_with_skew_kvcache(
+        self,
+        q,
+        k_cache,
+        v_cache,
+        k=None,
+        v=None,
+        cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+        causal=False,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+    ):
+        arange = torch.arange(k_cache.shape[1], device=k_cache.device).unsqueeze(0)
+        cache_seqlens_expanded = cache_seqlens.unsqueeze(1)
+        if k is None and q is None:
+            key_padding_mask = arange < cache_seqlens_expanded
+        elif k is not None and q is not None:
+            key_padding_mask = arange < cache_seqlens_expanded + 1
+            for i in range(cache_seqlens.shape[0]):
+                k_cache[i][cache_seqlens[i]] = k[i].clone()
+                v_cache[i][cache_seqlens[i]] = v[i].clone()
+
+        q = q.permute(0, 2, 1, 3)  # 等价于 "b 1 h d -> b h 1 d"
+        k_cache = k_cache.permute(0, 2, 1, 3)  # 等价于 "b s h d -> b h s d"
+        v_cache = v_cache.permute(0, 2, 1, 3)  # 等价于 "b s h d -> b h s d"
+        key_padding_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+
+        output = scaled_dot_product_attention(
+            q, k_cache, v_cache, attn_mask=key_padding_mask, is_causal=causal
+        )
+
+        output = output.permute(0, 2, 1, 3)  # 等价于 "b h 1 d -> b 1 h d"
+
+        return output
+
+    def mla_attn_with_kvcache(
+        self,
+        q_nope,
+        q_pe,
+        kv_cache,
+        kv,
+        cache_seqlens_excl_this_decode: Union[(int, torch.Tensor)],
+        cache_seqlens_incl_this_decode: Union[(int, torch.Tensor)],
+        block_table: torch.Tensor,
+        causal=True,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
+    ):
+        bsz = cache_seqlens_excl_this_decode.shape[0]
+        tp_size = self.args.infer.tp_size
+        query = torch.cat([q_nope, q_pe], dim=-1).view(bsz, q_nope.shape[-2], -1)
+
+        for i in range(bsz):
+            kv_cache[block_table[i][cache_seqlens_excl_this_decode[i] // 128]][
+                cache_seqlens_excl_this_decode[i] % 128
+            ] = kv[i]
+        # kv_cache[indices, positions] = kv.squeeze(1) if kv.ndim == 3 and kv.shape[1] == 1 else kv
+
+        # slots = attn_metadata.slot_mapping
+        # torch_npu._npu_reshape_and_cache_siso(key=k_cache,
+        #                                           key_cache=key_cache,
+        #                                           slot_indices=slots)
+        kv_cache = kv_cache.unsqueeze(2)
+        attn_output = torch.randn(
+            [bsz, self.mla_v_head_dim // tp_size, 512],
+            dtype=query.dtype,
+            device=query.device,
+        )
+        self.torch_npu._npu_paged_attention_mla(
+            query=query,
+            key_cache=kv_cache,
+            num_kv_heads=1,
+            num_heads=128 // tp_size,
+            scale_value=1.0 / math.sqrt(query.shape[-1]),
+            block_table=block_table,
+            context_lens=cache_seqlens_incl_this_decode.cpu(),
+            mla_vheadsize=512,
+            out=attn_output,
+        )
+        attn_output = attn_output.unsqueeze(1)
+
+        return attn_output

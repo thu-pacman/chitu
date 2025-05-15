@@ -10,7 +10,6 @@ import torch.nn.functional as F
 from torch import nn
 from typing_extensions import override
 
-import chitu_backend
 from chitu.layers.gate import fused_sigmoid_gate
 from chitu.attn_backend import AttnBackend
 from chitu.cache_manager import PagedKVCacheManager
@@ -61,6 +60,12 @@ import ctypes
 logger = getLogger(__name__)
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
+chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
+torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
+
+if has_torch_npu:
+    from chitu.npu_utils import fused_experts_npu
+
 if has_triton:
     from chitu.fused_moe import fused_experts
 
@@ -506,7 +511,11 @@ class AttentionDeepSeekV3(Attention):
                 self.dim,
                 self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
+                dtype=(
+                    torch.bfloat16
+                    if args.quant == "blockfp4"
+                    else parse_dtype(args.main_weight_dtype)
+                ),
                 bias_dtype=torch.get_default_dtype(),
                 disabled_methods={"blockfp4"},
             )  # FIXME: Run this layer with muxi_layout_kernels
@@ -515,7 +524,11 @@ class AttentionDeepSeekV3(Attention):
                 self.dim,
                 self.q_lora_rank,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
+                dtype=(
+                    torch.bfloat16
+                    if args.quant == "blockfp4"
+                    else parse_dtype(args.main_weight_dtype)
+                ),
                 bias_dtype=torch.get_default_dtype(),
                 disabled_methods={"blockfp4"},
             )  # FIXME: Run this layer with muxi_layout_kernels
@@ -523,7 +536,11 @@ class AttentionDeepSeekV3(Attention):
                 self.dim,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
+                dtype=(
+                    torch.bfloat16
+                    if args.quant == "blockfp4"
+                    else parse_dtype(args.main_weight_dtype)
+                ),
                 bias_dtype=torch.get_default_dtype(),
                 disabled_methods={"blockfp4"},
             )  # FIXME: Run this layer with muxi_layout_kernels
@@ -536,7 +553,11 @@ class AttentionDeepSeekV3(Attention):
                 else self.n_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
             ),
             has_bias=False,
-            dtype=parse_dtype(args.main_weight_dtype),
+            dtype=(
+                torch.bfloat16
+                if args.quant == "blockfp4"
+                else parse_dtype(args.main_weight_dtype)
+            ),
             bias_dtype=torch.get_default_dtype(),
             gather_output=False,
             base_linear_class=get_linear_layout_contig_x_contig_y(
@@ -550,7 +571,11 @@ class AttentionDeepSeekV3(Attention):
                 self.kv_lora_rank,
                 self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
+                dtype=(
+                    torch.bfloat16
+                    if args.quant == "blockfp4"
+                    else parse_dtype(args.main_weight_dtype)
+                ),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_x_contig_y(
@@ -590,7 +615,11 @@ class AttentionDeepSeekV3(Attention):
             ),
             self.dim,
             has_bias=False,
-            dtype=parse_dtype(args.main_weight_dtype),
+            dtype=(
+                torch.bfloat16
+                if args.quant == "blockfp4"
+                else parse_dtype(args.main_weight_dtype)
+            ),
             bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
             base_linear_class=get_linear_layout_contig_x_contig_y(
@@ -1177,6 +1206,8 @@ class MoEDeepSeekV3(nn.Module):
 
         if self.op_impl == "muxi_custom_kernel":
             y = self._compute_muxi_fused_experts(x, weights, indices)
+        elif has_torch_npu:  # or use op_impl ?
+            y = self._compute_npu_fused_experts(x, weights, indices)
         elif has_triton:
             quant_method = None if not hasattr(self.args, "quant") else self.args.quant
             if quant_method is None:
@@ -1384,6 +1415,19 @@ class MoEDeepSeekV3(nn.Module):
             w2_scale=self.w2.scale,
             block_shape=[128, 128],
             soft_fp8=True if self.w1w3.scale is not None else False,
+        )
+        y += y1
+        torch.distributed.all_reduce(y, group=get_tp_group())
+        return y
+
+    def _compute_npu_fused_experts(self, x, weights, indices):
+        y = self.shared_experts(x)
+        y1 = fused_experts_npu(
+            hidden_states=x,
+            w1=self.w1w3.weight,
+            w2=self.w2.weight,
+            topk_weights=weights,
+            topk_ids=indices,
         )
         y += y1
         torch.distributed.all_reduce(y, group=get_tp_group())
@@ -2350,7 +2394,19 @@ class TransformerDeepSeekV3(Transformer):
     def precompute_freqs_cis(self, max_position_embeddings: int, device):
         self.freqs_cis = precompute_freqs_cis_deepseek_v3(
             self.params, max_position_embeddings
-        ).to(device)
+        )
+        self.freqs_cis_real = self.freqs_cis.real.contiguous().to(device)
+        self.freqs_cis_imag = self.freqs_cis.imag.contiguous().to(device)
+
+    @override
+    def prepare_freqs_cis_prefill(self, varlens):
+        index = self.cache.curr_varlens.position_ids
+        return self.freqs_cis_real[index], self.freqs_cis_imag[index]
+
+    @override
+    def prepare_freqs_cis_decode(self):
+        index = self.cache.get_gpu_seq_lens_excl_this_decode()
+        return self.freqs_cis_real[index], self.freqs_cis_imag[index]
 
     @override
     def prepare_decoding_attn(self):

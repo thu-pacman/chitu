@@ -84,8 +84,14 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
 
 class VarLens:
     def __init__(self, tokens, device) -> None:
-        self.lens = torch.tensor(
-            [len(t) for t in tokens], device=device, dtype=torch.int32
+        self.cpu_lens = [len(t) for t in tokens]
+        self.seq_lens_tensor_cpu = torch.tensor(
+            self.cpu_lens, device="cpu", dtype=torch.int32
+        )
+        self.lens = (
+            self.seq_lens_tensor_cpu.to(device)
+            if device != "cpu"
+            else self.seq_lens_tensor_cpu
         )
         self.cpu_prefix_lens = [0]
         for t in tokens:
@@ -93,7 +99,6 @@ class VarLens:
         self.prefix_lens = torch.tensor(
             self.cpu_prefix_lens, device=device, dtype=torch.int32
         )
-        self.cpu_lens = [len(t) for t in tokens]
         self.max_len = int(torch.max(self.lens))
         self.total_len = int(torch.sum(self.lens))
         self.position_ids = torch.from_numpy(

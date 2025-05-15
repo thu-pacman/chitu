@@ -21,6 +21,7 @@ from chitu.attn_backend import (
     FlashMLABackend,
     RefAttnBackend,
     TritonAttnBackend,
+    NpuAttnBackend,
 )
 from chitu.cache_manager import (
     KVCacheManager,
@@ -116,6 +117,11 @@ class Backend:
 
         torch.cuda.set_device(local_rank)
         init_tp(model_parallel_size, pipeline_parallel_size)
+
+        if args.infer.attn_type == "npu":
+            from chitu.tensor_parallel import init_pp_group_npu
+
+            init_pp_group_npu(model_parallel_size, pipeline_parallel_size)
 
         Backend.pp_stage = global_rank // model_parallel_size
         Backend.pp_end_stage = (world_size - 1) // model_parallel_size
@@ -251,6 +257,8 @@ class Backend:
             )
         elif args.infer.cache_type == "paged":
             block_size = 64 if args.infer.mla_absorb != "none" else 256
+            if args.infer.attn_type == "npu":
+                block_size = 128
             return PagedKVCacheManager(
                 local_begin_layer_id,
                 local_end_layer_id,
@@ -339,6 +347,8 @@ class Backend:
             return FlashInferBackend(Backend.cache_manager.get_num_blocks())
         elif args.infer.attn_type == "triton":
             return TritonAttnBackend()
+        elif args.infer.attn_type == "npu":
+            return NpuAttnBackend()
         elif args.infer.attn_type == "ref":
             return RefAttnBackend()
         else:

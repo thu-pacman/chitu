@@ -10,7 +10,7 @@ infer:
   seed: 0
   max_seq_len: 10240 # length of prefill + decode
   cache_type: skew
-  attn_type: flash_attn # flash_attn, flash_mla, flash_infer, triton or ref
+  attn_type: flash_attn # flash_attn, flash_mla, flash_infer, triton, npu or ref
   op_impl: torch # torch or muxi_custom_kernel
   mla_absorb: "none" # none, absorb-without-precomp, absorb
   raise_lower_bit_float_to: float8_e4m3fn # choose one hardware-support dtype to compute lower-bit float 
