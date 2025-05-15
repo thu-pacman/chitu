@@ -6,6 +6,8 @@ Chitu is a high-performance inference framework for large language models, focus
 
 ## News
 
+[2025/05/15] Released v0.3.2, added support for [Qwen3 models](https://huggingface.co/collections/Qwen/qwen3-67dd247413f0e2e4f653967f).
+
 [2025/04/29] Released v0.3.0, added support for online conversion of FP4 to FP8 and BF16, supported the [FP4 quantized version](https://huggingface.co/nvidia/DeepSeek-R1-FP4) of DeepSeek-R1 671B.
 
 [2025/04/18] Released v0.2.2, added support for CPU+GPU heterogeneous hybrid inference, and added optimized implementation of multiple operators.
