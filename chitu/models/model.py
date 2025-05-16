@@ -24,6 +24,7 @@ from chitu.cuda_graph import make_dispatched_graphed_callables
 from chitu.device_type import is_muxi, get_device_name
 from chitu.utils import try_import_opt_dep
 
+torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
 
 logger = getLogger(__name__)
@@ -88,6 +89,8 @@ class RMSNorm(nn.Module):
                 impl = "muxi_w8a8_kernels"
             elif has_triton:
                 impl = "triton"
+            elif has_torch_npu:
+                impl = "torch_npu"
             elif hasattr(F, "rms_norm"):
                 impl = "torch"
             else:
@@ -104,6 +107,16 @@ class RMSNorm(nn.Module):
             assert self.eps == 1e-6
             assert x.dtype == torch.float16
             return tbsgemm.norm(x, self.weight)
+        elif impl == "torch_npu":
+            dtype = x.dtype
+            tmp_out = torch_npu.npu_rms_norm(x, self.weight, epsilon=self.eps)[0].to(
+                dtype
+            )
+            if out is not None:
+                out.copy_(tmp_out)
+            else:
+                out = tmp_out
+            return out
         elif impl == "torch":
             dtype = x.dtype
             tmp_out = F.rms_norm(

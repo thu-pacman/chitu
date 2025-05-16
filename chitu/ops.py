@@ -11,6 +11,16 @@ from chitu.utils import try_import_opt_dep
 from chitu.global_vars import get_global_args
 
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
+torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
+
+try:
+    import triton
+    import triton.language as tl
+
+    has_triton = True
+    from chitu.triton_ops import *
+except ImportError:
+    has_triton = False
 
 
 def rotate_half(x):
@@ -179,6 +189,39 @@ def apply_rotary_pos_emb_torch(
     return q_out, k_out
 
 
+def apply_rotary_pos_emb_torch_npu(q, k, cos, sin, rotary_type="hf-llama"):
+    if rotary_type == "hf-llama":
+        if q.dim() == 3 and cos.dim() == 2 and sin.dim() == 2:
+            cos = torch.cat([cos, cos], dim=-1)
+            sin = torch.cat([sin, sin], dim=-1)
+            q_embed = torch_npu.npu_rotary_mul(
+                q.unsqueeze(0),
+                cos.unsqueeze(1).unsqueeze(0),
+                sin.unsqueeze(1).unsqueeze(0),
+            )[0]
+            k_embed = torch_npu.npu_rotary_mul(
+                k.unsqueeze(0),
+                cos.unsqueeze(1).unsqueeze(0),
+                sin.unsqueeze(1).unsqueeze(0),
+            )[0]
+        else:
+            raise ValueError(f"Unsupported shape: {q.shape}")
+        return q_embed.to(q.dtype), k_embed.to(k.dtype)
+    elif rotary_type == "llama":
+        # "llama" has an [real, imag, real, imag, ..., real, imag] layout.
+        cos = torch.stack([cos, cos], dim=-1).flatten(-2)
+        sin = torch.stack([sin, sin], dim=-1).flatten(-2)
+        cos_q = reshape_rotary_for_broadcast(cos, q)
+        sin_q = reshape_rotary_for_broadcast(sin, q)
+        cos_k = reshape_rotary_for_broadcast(cos, k)
+        sin_k = reshape_rotary_for_broadcast(sin, k)
+        q_embed = (q * cos_q) + (rotate_pairwise(q) * sin_q)
+        k_embed = (k * cos_k) + (rotate_pairwise(k) * sin_k)
+        return q_embed.to(q.dtype), k_embed.to(k.dtype)
+    else:
+        raise ValueError(f"Unknown rotary type: {rotary_type}")
+
+
 def weight_quant_deepseek_v3(
     w: torch.Tensor, block_size: int = 128
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -256,16 +299,6 @@ def rms_norm_torch(X: torch.Tensor, W: torch.Tensor, eps, compute_dtype):
     return output.to(compute_dtype)
 
 
-try:
-    import triton
-    import triton.language as tl
-
-    TRITON_AVAILABLE = True
-    from chitu.triton_ops import *
-except ImportError:
-    TRITON_AVAILABLE = False
-
-
 def quant_einsum_shc_hdc_shd(
     group_A: torch.Tensor,
     group_B: torch.Tensor,
@@ -282,7 +315,7 @@ def quant_einsum_shc_hdc_shd(
     assert group_A.shape[2] == group_B.shape[2]
 
     if impl == "auto":
-        if group_b_s is not None and TRITON_AVAILABLE:
+        if group_b_s is not None and has_triton:
             impl = "triton"
         else:
             impl = "torch"
@@ -321,7 +354,7 @@ def fp8_gemm_deepseek_v3(
     if impl == "auto":
         impl = "triton"
 
-    if impl == "triton" and TRITON_AVAILABLE:
+    if impl == "triton" and has_triton:
         return fp8_gemm_deepseek_v3_triton_default(a, a_s, b, b_s)
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
@@ -337,7 +370,7 @@ def append_to_paged_kv_cache(
     if impl == "auto":
         impl = "triton"
 
-    if impl == "triton" and TRITON_AVAILABLE:
+    if impl == "triton" and has_triton:
         return append_to_paged_kv_cache_triton(
             kv_cache, page_table, this_kv, old_seq_lens
         )
@@ -351,7 +384,7 @@ def rms_norm(X: torch.Tensor, W: torch.Tensor, eps, compute_dtype, impl: str = "
     if impl == "auto":
         impl = "triton"
 
-    if impl == "triton" and TRITON_AVAILABLE:
+    if impl == "triton" and has_triton:
         return rms_norm_triton(X, W, eps, compute_dtype)
     else:
         return rms_norm_torch(X, W, eps, compute_dtype)
@@ -366,7 +399,7 @@ def append_to_non_paged_kv_cache(
     if impl == "auto":
         impl = "triton"
 
-    if impl == "triton" and TRITON_AVAILABLE:
+    if impl == "triton" and has_triton:
         return append_to_non_paged_kv_cache_triton(kv_cache, this_kv, old_seq_lens)
     else:
         return append_to_non_paged_kv_cache_torch(kv_cache, this_kv, old_seq_lens)
@@ -393,7 +426,7 @@ def soft_fp8_gemm_deepseek_v3(
     if impl == "auto":
         impl = "triton"
 
-    if impl == "triton" and TRITON_AVAILABLE:
+    if impl == "triton" and has_triton:
         return soft_fp8_gemm_deepseek_v3_triton(a, b, b_s)
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
@@ -426,7 +459,7 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3(
     if impl == "auto":
         impl = "triton"
 
-    if impl == "triton" and TRITON_AVAILABLE:
+    if impl == "triton" and has_triton:
         return soft_fp4_raise_to_fp8_gemm_deepseek_v3_triton(
             a, a_s, b, b_s, b_s_2, act_block_size
         )
@@ -457,7 +490,7 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3(
     if impl == "auto":
         impl = "triton"
 
-    if impl == "triton" and TRITON_AVAILABLE:
+    if impl == "triton" and has_triton:
         return soft_fp4_raise_to_bf16_gemm_deepseek_v3_triton(a, b, b_s, b_s_2)
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
@@ -484,7 +517,7 @@ def weight_dequant_soft_fp8_deepseek_v3(
     if impl == "auto":
         impl = "triton"
 
-    if impl == "triton" and TRITON_AVAILABLE:
+    if impl == "triton" and has_triton:
         return weight_dequant_soft_fp8_deepseek_v3_triton(x, s, block_size)
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
@@ -509,7 +542,7 @@ def act_quant_deepseek_v3(
     if impl == "auto":
         impl = "triton"
 
-    if impl == "triton" and TRITON_AVAILABLE:
+    if impl == "triton" and has_triton:
         return act_quant_deepseek_v3_triton(x, block_size)
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
@@ -536,7 +569,7 @@ def weight_dequant_deepseek_v3(
     if impl == "auto":
         impl = "triton"
 
-    if impl == "triton" and TRITON_AVAILABLE:
+    if impl == "triton" and has_triton:
         return weight_dequant_deepseek_v3_triton(x, s, block_size)
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
@@ -573,14 +606,16 @@ def apply_rotary_pos_emb(
                 rotary_type == "hf-llama"
                 or (rotary_type == "llama" and hasattr(triton.language, "interleave"))
             )
-        ):
+        ) and has_triton:
             impl = "triton"
         elif rotary_type == "llama" and has_chitu_backend:
             impl = "cuda"
+        elif has_torch_npu:
+            impl = "torch_npu"
         else:
             impl = "torch"
 
-    if impl == "triton" and TRITON_AVAILABLE:
+    if impl == "triton" and has_triton:
         # NOTE: some platform such as muxi now doesn't support triton.language.interleave, so we need check attr
         # NOTE: Performance of triton rotary kernel is untested for large batch sizes.
         # If it's slow on prefill, just switch to torch implementation on the else case.
@@ -591,6 +626,8 @@ def apply_rotary_pos_emb(
         return apply_rotary_pos_emb_cuda(
             q, k, cos, sin, q_out=q_out, k_out=k_out, rotary_type=rotary_type
         )
+    elif impl == "torch_npu":
+        return apply_rotary_pos_emb_torch_npu(q, k, cos, sin, rotary_type=rotary_type)
     else:
         return apply_rotary_pos_emb_torch(
             q, k, cos, sin, q_out=q_out, k_out=k_out, rotary_type=rotary_type
@@ -606,7 +643,7 @@ def silu_and_mul(x, impl="auto"):
         else:
             impl = "triton"
 
-    if impl == "triton" and TRITON_AVAILABLE:
+    if impl == "triton" and has_triton:
         return invoke_silu_and_mul(x)
     else:
         return silu_and_mul_torch(x)
