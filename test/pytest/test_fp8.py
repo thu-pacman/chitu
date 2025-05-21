@@ -56,11 +56,22 @@ def test_dequanted_gemm_is_close_to_fp8_gemm(dtype: torch.dtype):
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["dim"],
-        x_vals=[128, 256, 512, 1024],
+        x_names=["bs", "dim"],
+        x_vals=[
+            (1, 1024),
+            (4, 1024),
+            (16, 1024),
+            (64, 1024),
+            (256, 1024),
+            (1, 4096),
+            (4, 4096),
+            (16, 4096),
+            (64, 4096),
+            (256, 4096),
+        ],
         line_arg="provider",
-        line_vals=["torch", "triton_fp8"],
-        line_names=["Torch", "Triton_FP8"],
+        line_vals=["torch_bf16", "triton_fp8"],
+        line_names=["Torch_BF16", "Triton_FP8"],
         styles=[("blue", "-"), ("green", "-")],
         ylabel="us",
         plot_name="fp8_gemm-performance",
@@ -70,19 +81,21 @@ def test_dequanted_gemm_is_close_to_fp8_gemm(dtype: torch.dtype):
         },
     )
 )
-def benchmark_fp8_gemm(dim, dtype, block_size, provider):
+def benchmark_fp8_gemm(bs, dim, dtype, block_size, provider):
     torch.manual_seed(42)
     torch.set_default_dtype(dtype)
     device = torch.device("cuda")
-    a = torch.randn(dim, dim, dtype=dtype, device=device)
+    a = torch.randn(bs, dim, dtype=dtype, device=device)
     b, b_s = init_b_and_b_s(dim, block_size)
 
-    if provider == "torch":
+    if provider == "torch_bf16":
         dequant_b = weight_dequant_deepseek_v3(b, b_s)
         ms = triton.testing.do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
-    if provider == "triton_fp8":
+    elif provider == "triton_fp8":
         a_fp8, a_s = act_quant_deepseek_v3(a, block_size)
         ms = triton.testing.do_bench(lambda: fp8_gemm_deepseek_v3(a_fp8, a_s, b, b_s))
+    else:
+        assert False, f"Unknown provider: {provider}"
     return ms * 1000
 
 
@@ -124,11 +137,22 @@ def test_soft_fp8_gemm_is_close_to_dequanted_gemm(dtype: torch.dtype):
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["dim"],
-        x_vals=[128, 256, 512, 1024],
+        x_names=["bs", "dim"],
+        x_vals=[
+            (1, 1024),
+            (4, 1024),
+            (16, 1024),
+            (64, 1024),
+            (256, 1024),
+            (1, 4096),
+            (4, 4096),
+            (16, 4096),
+            (64, 4096),
+            (256, 4096),
+        ],
         line_arg="provider",
-        line_vals=["torch", "triton_soft_fp8"],
-        line_names=["Torch", "Triton_Soft_FP8"],
+        line_vals=["torch_bf16", "triton_soft_fp8"],
+        line_names=["Torch_BF16", "Triton_Soft_FP8"],
         styles=[("blue", "-"), ("green", "-")],
         ylabel="us",
         plot_name="soft_fp8_gemm-performance",
@@ -138,18 +162,20 @@ def test_soft_fp8_gemm_is_close_to_dequanted_gemm(dtype: torch.dtype):
         },
     )
 )
-def benchmark_soft_fp8_gemm(dim, dtype, block_size, provider):
+def benchmark_soft_fp8_gemm(bs, dim, dtype, block_size, provider):
     torch.manual_seed(42)
     torch.set_default_dtype(dtype)
     device = torch.device("cuda")
-    a = torch.randn(dim, dim, dtype=dtype, device=device)
+    a = torch.randn(bs, dim, dtype=dtype, device=device)
     b, b_s = init_b_and_b_s(dim, block_size)
 
-    if provider == "torch":
+    if provider == "torch_bf16":
         dequant_b = weight_dequant_soft_fp8_deepseek_v3(b, b_s)
         ms = triton.testing.do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
-    if provider == "triton_soft_fp8":
+    elif provider == "triton_soft_fp8":
         ms = triton.testing.do_bench(lambda: soft_fp8_gemm_deepseek_v3(a, b, b_s))
+    else:
+        assert False, f"Unknown provider: {provider}"
     return ms * 1000
 
 
