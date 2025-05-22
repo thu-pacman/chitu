@@ -280,22 +280,30 @@ def fused_moe_kernel_soft_fp4(
         if group_k > 0 and group_n > 0:
             k_start = k * BLOCK_SIZE_K
             offs_ks = k_start // group_k
-            b_scale_1 = tl.load(b_scale_ptrs).to(tl.uint16)
-            b_scale_2 = tl.load(b_scale_ptrs + num_b_s_in_block // 2).to(tl.uint16)
-            bf16_s_1 = ((b_scale_1 & 0x0080) << 8) | ((b_scale_1 & 0x007F) << 4)
-            bf16_s_2 = ((b_scale_2 & 0x0080) << 8) | ((b_scale_2 & 0x007F) << 4)
-            b_scale_1 = bf16_s_1.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
-            b_scale_2 = bf16_s_2.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
             if soft_fp8:
-                b = b.to(tl.uint16)
-                bf16_weight_1 = ((b & 0x08) << 12) | ((b & 0x07) << 6)
+                b_scale_1 = tl.load(b_scale_ptrs)
+                b_scale_2 = tl.load(b_scale_ptrs + num_b_s_in_block // 2)
+                b_scale_1 = b_scale_1.to(tl.int8, bitcast=True).to(
+                    tl.int16
+                )  # Do signed cast to copy the sign bit
+                b_scale_2 = b_scale_2.to(tl.int8, bitcast=True).to(
+                    tl.int16
+                )  # Do signed cast to copy the sign bit
+                bf16_s_1 = (b_scale_1 << 4) & 0x87F0
+                bf16_s_2 = (b_scale_2 << 4) & 0x87F0
+                b_scale_1 = bf16_s_1.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
+                b_scale_2 = bf16_s_2.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
+                b = b.to(tl.int8, bitcast=True).to(
+                    tl.int16
+                )  # Do signed cast to copy the sign bit
+                bf16_weight_1 = (b << 12 >> 6) & 0x81C0
                 bf16_weight_1 = (
                     bf16_weight_1.to(tl.bfloat16, bitcast=True)
                     * b_scale_1
                     * fp4_to_bf16_scale
                 )
                 accumulator += tl.dot(a_1, bf16_weight_1)
-                bf16_weight_2 = ((b & 0x80) << 8) | ((b & 0x70) << 2)
+                bf16_weight_2 = (b << 2) & 0x81C0
                 bf16_weight_2 = (
                     bf16_weight_2.to(tl.bfloat16, bitcast=True)
                     * b_scale_2
@@ -303,19 +311,25 @@ def fused_moe_kernel_soft_fp4(
                 )
                 accumulator += tl.dot(a_2, bf16_weight_2)
             else:
+                b_scale_1 = tl.load(b_scale_ptrs).to(tl.float8e4nv, bitcast=True)
+                b_scale_2 = tl.load(b_scale_ptrs + num_b_s_in_block // 2).to(
+                    tl.float8e4nv, bitcast=True
+                )
+                b_scale_1 = b_scale_1.to(tl.bfloat16)
+                b_scale_2 = b_scale_2.to(tl.bfloat16)
                 a_scale = tl.load(
                     a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                 )
                 tmp_accumulator = tl.zeros(
                     (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32
                 )
-                fp8_weight_1 = ((b & 0x08) << 4) | ((b & 0x07) << 2)
+                fp8_weight_1 = (b.to(tl.int8, bitcast=True) << 4 >> 2) & 0x9C
                 fp8_weight_1 = (
                     fp8_weight_1.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
                     * b_scale_1
                 )
                 tmp_accumulator += tl.dot(a_1, fp8_weight_1.to(tl.float8e4nv))
-                fp8_weight_2 = (b & 0x80) | ((b & 0x70) >> 2)
+                fp8_weight_2 = (b.to(tl.int8, bitcast=True) >> 2) & 0x9C
                 fp8_weight_2 = (
                     fp8_weight_2.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
                     * b_scale_2
@@ -517,10 +531,11 @@ def fused_moe_kernel(
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
 
                 if soft_fp8:
-                    b_uint32 = b.to(tl.uint8, bitcast=True).to(tl.uint32)
-                    b_unscaled_fp32 = (
-                        ((b_uint32 & 0x80) << 24) | ((b_uint32 & 0x7F) << 20)
-                    ).to(tl.float32, bitcast=True)
+                    t = b.to(tl.int8, bitcast=True).to(
+                        tl.int32
+                    )  # Do signed cast to copy the sign bit
+                    t = (t << 20) & 0x87F00000
+                    b_unscaled_fp32 = t.to(tl.float32, bitcast=True)
                     b_new_scale = b_scale * fp8_to_fp32_scale
                     b_scaled_fp32 = b_unscaled_fp32 * b_new_scale
                     b_scaled_fp32 = b_scaled_fp32.to(dtype=compute_type)

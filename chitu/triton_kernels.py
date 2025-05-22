@@ -311,8 +311,10 @@ def weight_dequant_soft_fp8_deepseek_v3_kernel_step_1(
     pid = tl.program_id(axis=0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < N
-    x = tl.load(x_ptr + offs, mask=mask).to(tl.uint32)
-    y = ((x & 0x80) << 24) | ((x & 0x7F) << 20)
+    x = tl.load(x_ptr + offs, mask=mask)
+    x = x.to(tl.int8, bitcast=True).to(tl.int32)  # Do signed cast to copy the sign bit
+    x = (x << 20) & 0x87F00000
+    y = x.to(tl.uint32, bitcast=True)
     tl.store(y_ptr + offs, y, mask=mask)
 
 
@@ -485,8 +487,6 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel(
     else:
         scale_2 = tl.load(b_s_2_ptr)
     fp4_to_fp8_scale = 64.0
-    fp8_to_bf16_scale = 0x7B800000
-    fp8_to_bf16_scale = fp8_to_bf16_scale.to(tl.float32, bitcast=True).to(tl.bfloat16)
     for i in range(k):
         b = tl.load(
             b_ptrs,
@@ -494,14 +494,14 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel(
             other=0.0,
         )
         a_s = tl.load(a_s_ptrs + i * BLOCK_SIZE_K // group_k)
-        b_s_1 = tl.load(b_s_ptrs).to(tl.uint16)
-        b_s_2 = tl.load(b_s_ptrs + num_b_s_in_block // 2).to(tl.uint16)
-        fp8_weight_1 = ((b & 0x08) << 4) | ((b & 0x07) << 2)
-        fp8_weight_2 = (b & 0x80) | ((b & 0x70) >> 2)
-        bf16_s_1 = ((b_s_1 & 0x0080) << 8) | ((b_s_1 & 0x007F) << 4)
-        bf16_s_2 = ((b_s_2 & 0x0080) << 8) | ((b_s_2 & 0x007F) << 4)
-        b_s_1 = bf16_s_1.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
-        b_s_2 = bf16_s_2.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
+        b_s_1 = tl.load(b_s_ptrs).to(tl.float8e4nv, bitcast=True)
+        b_s_2 = tl.load(b_s_ptrs + num_b_s_in_block // 2).to(
+            tl.float8e4nv, bitcast=True
+        )
+        fp8_weight_1 = (b.to(tl.int8, bitcast=True) << 4 >> 2) & 0x9C
+        fp8_weight_2 = (b.to(tl.int8, bitcast=True) >> 2) & 0x9C
+        b_s_1 = b_s_1.to(tl.bfloat16)
+        b_s_2 = b_s_2.to(tl.bfloat16)
         a_1 = tl.load(
             a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K - BLOCK_SIZE_K // 2
         )
@@ -616,10 +616,11 @@ def soft_fp8_gemm_deepseek_v3_kernel(
         offs_ks = k_start // group_k
         b_s = tl.load(Bs_ptrs + offs_ks)
 
-        b_uint32 = b.to(tl.uint8, bitcast=True).to(tl.uint32)
-        b_unscaled_fp32 = (((b_uint32 & 0x80) << 24) | ((b_uint32 & 0x7F) << 20)).to(
-            tl.float32, bitcast=True
-        )
+        t = b.to(tl.int8, bitcast=True).to(
+            tl.int32
+        )  # Do signed cast to copy the sign bit
+        t = (t << 20) & 0x87F00000
+        b_unscaled_fp32 = t.to(tl.float32, bitcast=True)
         b_new_scale = b_s * fp8_to_fp32_scale
         b_scaled_fp32 = b_unscaled_fp32 * b_new_scale
         b_scaled_fp32 = b_scaled_fp32.to(dtype=compute_dtype)
@@ -707,15 +708,22 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel(
     else:
         scale_2 = tl.load(b_s_2_ptr)
     for i in range(k):
-        b = tl.load(
-            b_ptrs, mask=offs_k[:, None] < (K - i * BLOCK_SIZE_K), other=0.0
-        ).to(tl.uint16)
-        b_s_1 = tl.load(b_s_ptrs).to(tl.uint16)
-        b_s_2 = tl.load(b_s_ptrs + num_b_s_in_block // 2).to(tl.uint16)
-        bf16_weight_1 = ((b & 0x08) << 12) | ((b & 0x07) << 6)
-        bf16_weight_2 = ((b & 0x80) << 8) | ((b & 0x70) << 2)
-        bf16_s_1 = ((b_s_1 & 0x0080) << 8) | ((b_s_1 & 0x007F) << 4)
-        bf16_s_2 = ((b_s_2 & 0x0080) << 8) | ((b_s_2 & 0x007F) << 4)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < (K - i * BLOCK_SIZE_K), other=0.0)
+        b = b.to(tl.int8, bitcast=True).to(
+            tl.int16
+        )  # Do signed cast to copy the sign bit
+        b_s_1 = tl.load(b_s_ptrs)
+        b_s_2 = tl.load(b_s_ptrs + num_b_s_in_block // 2)
+        b_s_1 = b_s_1.to(tl.int8, bitcast=True).to(
+            tl.int16
+        )  # Do signed cast to copy the sign bit
+        b_s_2 = b_s_2.to(tl.int8, bitcast=True).to(
+            tl.int16
+        )  # Do signed cast to copy the sign bit
+        bf16_weight_1 = (b << 12 >> 6) & 0x81C0
+        bf16_weight_2 = (b << 2) & 0x81C0
+        bf16_s_1 = (b_s_1 << 4) & 0x87F0
+        bf16_s_2 = (b_s_2 << 4) & 0x87F0
         b_s_1 = bf16_s_1.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
         b_s_2 = bf16_s_2.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
         a_1 = tl.load(
@@ -961,10 +969,11 @@ def grouped_matmul_kernel(
         if fp8_to_fp32_scale is None:
             accumulator += tl.dot(a, b.to(a.dtype)) * b_s
         else:
-            b_uint32 = b.to(tl.uint8, bitcast=True).to(tl.uint32)
-            b_unscaled_fp32 = (
-                ((b_uint32 & 0x80) << 24) | ((b_uint32 & 0x7F) << 20)
-            ).to(tl.float32, bitcast=True)
+            t = b.to(tl.int8, bitcast=True).to(
+                tl.int32
+            )  # Do signed cast to copy the sign bit
+            t = (t << 20) & 0x87F00000
+            b_unscaled_fp32 = t.to(tl.float32, bitcast=True)
             b_new_scale = b_s * fp8_to_fp32_scale
             b_scaled_fp32 = b_unscaled_fp32 * b_new_scale
             b_scaled_fp32 = b_scaled_fp32.to(dtype=a.dtype)
