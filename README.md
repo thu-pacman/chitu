@@ -6,6 +6,8 @@ Chitu (赤兔) 是一个专注于效率、灵活性和可用性的高性能大�
 
 ## 最新动态
 
+[2025/5/22] 发布 v0.3.3，增加了对昇腾 NPU 的初步支持。
+
 [2025/05/15] 发布 v0.3.2，支持[Qwen3 系列模型](https://huggingface.co/collections/Qwen/qwen3-67dd247413f0e2e4f653967f)。
 
 [2025/04/29] 发布 v0.3.0，新增 FP4 在线转 FP8、BF16 的高效算子实现，支持 DeepSeek-R1 671B 的 [FP4 量化版](https://huggingface.co/nvidia/DeepSeek-R1-FP4)。
