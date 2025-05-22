@@ -6,6 +6,8 @@ Chitu is a high-performance inference framework for large language models, focus
 
 ## News
 
+[2025/05/22] Released v0.3.3, with initial support for Ascend NPU.
+
 [2025/05/15] Released v0.3.2, added support for [Qwen3 models](https://huggingface.co/collections/Qwen/qwen3-67dd247413f0e2e4f653967f).
 
 [2025/04/29] Released v0.3.0, added support for online conversion of FP4 to FP8 and BF16, supported the [FP4 quantized version](https://huggingface.co/nvidia/DeepSeek-R1-FP4) of DeepSeek-R1 671B.
@@ -102,6 +104,8 @@ git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
 pip install -r requirements-build.txt
 pip install -U torch --index-url https://download.pytorch.org/whl/cu124  # Change according to your CUDA version
 TORCH_CUDA_ARCH_LIST=9.0 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation . # Change `8.6` to your desired CUDA arch list.
+# For the Ascend platform, you need set up the CANN and torch_npu 2.5 environments, and set the environment variable ASCEND_PLATFORM=1 during installation.
+ASCEND_PLATFORM=1 MAX_JOBS=4 pip install --no-build-isolation .
 ```
 
 ### List Supported Models
@@ -125,6 +129,16 @@ torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_t
 ### Start a Service
 
 ```bash
+# Additional startup configuration for Ascend NPU
+# 1. Set the inference attention type to npu
+#   infer.attn_type=npu
+# 2. Configure environment variables for performance tuning
+#   export TASK_QUEUE_ENABLE=2        # Offload some operator adaptation tasks to the secondary pipeline to balance load and reduce dequeue wake-up latency
+#   export CPU_AFFINITY_CONF=2        # Bind tasks to CPUs within the same NUMA node to avoid cross-NUMA memory access and lower scheduling overhead
+#   export HCCL_OP_EXPANSION_MODE=AIV # Leverage the device’s AI Vector Core units to accelerate AllReduce operations
+# 3. For multi-node inference, specify the local ip
+#   export HCCL_IF_IP=$LOCAL_IP
+
 # Start service at localhost:21002
 export WORLD_SIZE=8
 torchrun --nnodes 1 \
