@@ -1,3 +1,5 @@
+<img src="docs/logo.png" width="20%">
+
 # Chitu（赤兔）
 
 中文 | [English](/docs/en/README.md)
