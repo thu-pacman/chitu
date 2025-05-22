@@ -1,3 +1,5 @@
+<img src="../logo.png" width="20%">
+
 # Chitu
 
 English | [中文](/README.md)
