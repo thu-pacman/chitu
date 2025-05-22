@@ -269,6 +269,7 @@ class Backend:
                 **kv_cache_kvargs,
             )
         elif args.infer.cache_type == "skew":
+            assert args.infer.attn_type != "npu", "Set paged cache for npu"
             return KVCacheManagerSkewAware(
                 local_begin_layer_id,
                 local_end_layer_id,

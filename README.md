@@ -98,6 +98,7 @@ Chitu (赤兔) 定位于「生产级大模型推理引擎」，充分考虑企�
 ### 从源码安装
 
 注意下面示例命令中的部分参数需要根据实际环境进行调整（见注释）。
+
 ```bash
 # 下载源码，注意使用 --recursive 选项获取第三方依赖
 git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
@@ -107,6 +108,8 @@ pip install -r requirements-build.txt
 pip install -U torch --index-url https://download.pytorch.org/whl/cu124 
 # TORCH_CUDA_ARCH_LIST 的值可通过 python -c "import torch; print(torch.cuda.get_device_capability())" 查看
 TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation . 
+# 华为昇腾平台需要先准备 CANN 和 torch_npu 2.5 环境，安装时设置变量 ASCEND_PLATFORM=1
+ASCEND_PLATFORM=1 MAX_JOBS=4 pip install --no-build-isolation . 
 ```
 
 ### 查看支持的模型
@@ -130,6 +133,14 @@ torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_t
 ### 启动服务
 
 ```bash
+# 华为昇腾平台启动额外设置
+# 1. 需要指定 infer.attn_type=npu
+# 2. 设置环境变量优化执行
+#   export TASK_QUEUE_ENABLE=2  # 将部分算子适配任务迁移至二级流水，使两级流水负载更均衡，并减少dequeue唤醒时间
+#   export CPU_AFFINITY_CONF=2  # 优化任务的执行效率，避免跨NUMA（非统一内存访问架构）节点的内存访问，减少任务调度开销
+#   export HCCL_OP_EXPANSION_MODE=AIV  # 利用Device的AI Vector Core计算单元来加速AllReduce
+# 3. 多机推理设置 export HCCL_IF_IP=$LOCAL_IP
+
 # 在 localhost:21002 启动服务
 export WORLD_SIZE=8
 torchrun --nnodes 1 \
