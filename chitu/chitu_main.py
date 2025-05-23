@@ -6,7 +6,7 @@ import torch.distributed
 
 from chitu.backend import Backend, BackendState
 from chitu.executor import Executor
-from chitu.global_vars import set_global_variables
+from chitu.global_vars import set_global_variables, set_quant_variables
 from chitu.scheduler import Scheduler
 from chitu.task import (
     PackedTasks,
@@ -65,7 +65,9 @@ def chitu_init(args, logging_level=logging.INFO):
         except ImportError:
             raise ImportError("torch_npu is not installed")
 
+    set_quant_variables(args)
     set_global_variables(args)
+
     Backend.build(args)
     rank = torch.distributed.get_rank()
     if rank == 0:

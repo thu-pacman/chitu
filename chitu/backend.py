@@ -402,7 +402,11 @@ class Backend:
         if args.models.type == "llama":
             merge_qkv_gate_up = False  # Not yet supported
 
-        quant = args.models.quant if hasattr(args.models, "quant") else None
+        quant = (
+            args.models.quant_config.type
+            if hasattr(args.models, "quant_config")
+            else None
+        )
         allowed_quant_for_merge_qkv_gate_up = {None, "blockfp8"}
         if args.models.type == "deepseek-v3":
             allowed_quant_for_merge_qkv_gate_up.add("blockfp4")
@@ -415,7 +419,7 @@ class Backend:
         if args.models.name in {"Qwen3-32B", "Qwen3-30B-A3B", "Qwen3-235B-A22B"}:
             merge_qkv_gate_up = False
 
-        if args.models.type == "deepseek-v3" and args.quant in [
+        if args.models.type == "deepseek-v3" and args.models.quant_config.type in [
             "gguf",
             "gguf-blockfp8",
         ]:
@@ -509,7 +513,7 @@ class Backend:
         )
 
         # Handle model precision
-        if hasattr(args.models, "quant") and args.models.quant in [
+        if hasattr(args.models, "quant_config") and args.models.quant_config.type in [
             "awq",
             "llmint8",
             "gptq",
@@ -532,7 +536,7 @@ class Backend:
         """
         start_time = time.time()
 
-        if args.models.type == "deepseek-v3" and args.quant in [
+        if args.models.type == "deepseek-v3" and args.models.quant_config.type in [
             "gguf",
             "gguf-blockfp8",
         ]:
@@ -558,15 +562,20 @@ class Backend:
             # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
             # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
             if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
-                if hasattr(args.models, "quant") and args.models.quant == "blockfp8":
+                if (
+                    hasattr(args.models, "quant_config")
+                    and args.models.quant_config.type == "blockfp8"
+                ):
                     for k in checkpoint.keys():
                         if checkpoint[k].element_size() == 1:
                             checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
-            if hasattr(args.models, "quant") and args.models.quant == "blockfp4":
+            if (
+                hasattr(args.models, "quant_config")
+                and args.models.quant_config.type == "blockfp4"
+            ):
                 for k in checkpoint.keys():
                     if checkpoint[k].element_size() == 1:
                         checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
-
             model.load_state_dict_parallel(
                 checkpoint,
                 strict=True,
@@ -586,99 +595,35 @@ class Backend:
         Returns:
             Loaded checkpoint dictionary
         """
-        trust_remote_code = args.models.name.startswith("glm-4")
+        quant_config = getattr(args.models, "quant_config", None)
+        quant_name = getattr(quant_config, "name", None)
+        ckpt_dir = args.models.ckpt_dir
 
-        if args.quant == "awq":
-            params = torch.load(args.models.ckpt_dir, map_location="cpu")
-            replace_list = [
-                ("model.", ""),
-                ("embed_tokens.weight", "embed_tokens.tok_embeddings.weight"),
-            ]
+        def remove_prefix(state_dict, prefix):
+            return {
+                k[len(prefix) :] if k.startswith(prefix) else k: v
+                for k, v in state_dict.items()
+            }
 
-            def rep(s):
-                for p in replace_list:
-                    s = s.replace(p[0], p[1], 1)
-                return s
+        def get_filter_key():
+            if getattr(args.models, "type", "") == "deepseek-v3":
+                return lambda k: "model.layers.61" not in k
+            if getattr(args.models, "name", "") == "QwQ-32B-fp4":
+                return lambda k: not (k.endswith(".k_scale") or k.endswith(".v_scale"))
+            return None
 
-            checkpoint = dict((rep(k), v) for k, v in params.items())
-        if args.quant == "autoawq":
-            params = load_state_dict(args.models.ckpt_dir)
-            replace_list = [
-                ("model.", ""),
-            ]
-
-            def rep(s):
-                for p in replace_list:
-                    s = s.replace(p[0], p[1], 1)
-                return s
-
-            checkpoint = dict((rep(k), v) for k, v in params.items())
-        if args.quant == "gptqmodel":
-            params = load_state_dict(args.models.ckpt_dir)
-            replace_list = [
-                ("model.", ""),
-            ]
-
-            def rep(s):
-                for p in replace_list:
-                    s = s.replace(p[0], p[1], 1)
-                return s
-
-            checkpoint = dict((rep(k), v) for k, v in params.items())
-        elif args.quant == "gptq":
-            params = AutoModelForCausalLM.from_pretrained(
-                args.models.ckpt_dir,
-                torch_dtype="auto",
-                device_map="cpu",
-                trust_remote_code=trust_remote_code,
-            ).state_dict()
-
-            def transform_key(key):
-                if key.startswith("model."):
-                    return key[len("model.") :]
-                return key
-
-            checkpoint = dict((transform_key(k), v) for k, v in params.items())
-        elif hasattr(args.models, "quant") and args.models.quant == "w8a16":
-            params = torch.load(
-                args.models.ckpt_dir + "/pytorch_model.bin", map_location="cpu"
-            )
-            replace_list = [
-                ("model.", ""),
-            ]
-
-            def rep(s):
-                for p in replace_list:
-                    s = s.replace(p[0], p[1], 1)
-                return s
-
-            checkpoint = dict((rep(k), v) for k, v in params.items())
-        elif args.quant in ["gguf", "gguf-blockfp8"]:
-            llama_gguf_loader = llama_gguf_loader = GGUFLoader(args.models.ckpt_dir)
-            checkpoint = load_state_dict_llama_gguf_mlp_layers(
-                llama_gguf_loader, len(model.layers)
-            )
+        if quant_name in ["autoawq", "gptqmodel", "awq"]:
+            params = load_state_dict(ckpt_dir)
+            return remove_prefix(params, "model.")
+        elif quant_name in ["gguf", "gguf-blockfp8"]:
+            loader = GGUFLoader(ckpt_dir)
+            return load_state_dict_llama_gguf_mlp_layers(loader, len(model.layers))
         else:
-            model_path = args.models.ckpt_dir
-            filter_key = None
-            if args.models.type == "deepseek-v3":
-                filter_key = lambda key: "model.layers.61" not in key
-            elif args.models.name == "QwQ-32B-fp4":
-                filter_key = lambda key: not key.endswith(
-                    ".k_scale"
-                ) and not key.endswith(".v_scale")
+            filter_key = get_filter_key()
             params = load_state_dict(
-                model_path, skip_preprocess=args.skip_preprocess, filter_key=filter_key
+                ckpt_dir, skip_preprocess=args.skip_preprocess, filter_key=filter_key
             )
-
-            def transform_key(key):
-                if key.startswith("model."):
-                    return key[len("model.") :]
-                return key
-
-            checkpoint = dict((transform_key(k), v) for k, v in params.items())
-
-        return checkpoint
+            return remove_prefix(params, "model.")
 
     @staticmethod
     def build(args):
@@ -797,8 +742,8 @@ def load_gguf_deepseek_v3_gguf(
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     for layer_id in range(3, 61):
         if layer_id in cpu_layers:
-            if model.layers[layer_id].ffn.moe == None:
-                model.layers[layer_id].ffn.init_weights()
+            if model.layers[layer_id].mlp.moe == None:
+                model.layers[layer_id].mlp.init_weights()
 
 
 def load_state_dict_llama_gguf_mlp_layers(llama_gguf_loader: GGUFLoader, layer_num=64):
@@ -871,10 +816,10 @@ def load_state_dict_deepseek_v3_gguf_mlp_layer(
     device = f"cuda:{local_rank}"
     state_dict = {}
 
-    state_dict["embed.weight"] = ds_gguf_loader.load_gguf_tensor(
+    state_dict["embed_tokens.weight"] = ds_gguf_loader.load_gguf_tensor(
         "token_embd.weight", device, torch.bfloat16
     ).cpu()
-    state_dict["head.weight"] = ds_gguf_loader.load_gguf_tensor(
+    state_dict["lm_head.weight"] = ds_gguf_loader.load_gguf_tensor(
         "output.weight", device, torch.bfloat16
     ).cpu()
     state_dict["norm.weight"] = ds_gguf_loader.load_gguf_tensor(
@@ -882,21 +827,21 @@ def load_state_dict_deepseek_v3_gguf_mlp_layer(
     ).cpu()
 
     translation_attn = {
-        ".attn_norm.weight": ".attn_norm.weight",
-        ".attn.kv_norm.weight": ".attn_kv_a_norm.weight",
-        ".attn.wkv_a.weight": ".attn_kv_a_mqa.weight",
-        ".attn.wkv_b.weight": ".attn_kv_b.weight",
-        ".attn.wo.weight": ".attn_output.weight",
-        ".attn.q_norm.weight": ".attn_q_a_norm.weight",
-        ".attn.wq_a.weight": ".attn_q_a.weight",
-        ".attn.wq_b.weight": ".attn_q_b.weight",
+        ".input_layernorm.weight": ".attn_norm.weight",
+        ".self_attn.kv_a_layernorm.weight": ".attn_kv_a_norm.weight",
+        ".self_attn.kv_a_proj_with_mqa.weight": ".attn_kv_a_mqa.weight",
+        ".self_attn.kv_b_proj.weight": ".attn_kv_b.weight",
+        ".self_attn.o_proj.weight": ".attn_output.weight",
+        ".self_attn.q_a_layernorm.weight": ".attn_q_a_norm.weight",
+        ".self_attn.q_a_proj.weight": ".attn_q_a.weight",
+        ".self_attn.q_b_proj.weight": ".attn_q_b.weight",
     }
 
     translation_mlp = {
-        ".ffn.w2.weight": ".ffn_down.weight",
-        ".ffn.w1.weight": ".ffn_gate.weight",
-        ".ffn.w3.weight": ".ffn_up.weight",
-        ".ffn_norm.weight": ".ffn_norm.weight",
+        ".mlp.down_proj.weight": ".ffn_down.weight",
+        ".mlp.gate_proj.weight": ".ffn_gate.weight",
+        ".mlp.up_proj.weight": ".ffn_up.weight",
+        ".post_attention_layernorm.weight": ".ffn_norm.weight",
     }
 
     for layer_id in range(3):
@@ -956,46 +901,40 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
         memory_used()
     device = f"cuda:{local_rank}"
     state_dict = {}
-    translation_attn = {
-        ".attn_norm.weight": ".attn_norm.weight",
-        ".attn.kv_norm.weight": ".attn_kv_a_norm.weight",
-        ".attn.wkv_a.weight": ".attn_kv_a_mqa.weight",
-        ".attn.wkv_b.weight": ".attn_kv_b.weight",
-        ".attn.wo.weight": ".attn_output.weight",
-        ".attn.q_norm.weight": ".attn_q_a_norm.weight",
-        ".attn.wq_a.weight": ".attn_q_a.weight",
-        ".attn.wq_b.weight": ".attn_q_b.weight",
-    }
 
-    translation_mlp = {
-        ".ffn.w2.weight": ".ffn_down.weight",
-        ".ffn.w1.weight": ".ffn_gate.weight",
-        ".ffn.w3.weight": ".ffn_up.weight",
-        ".ffn_norm.weight": ".ffn_norm.weight",
+    translation_attn = {
+        ".input_layernorm.weight": ".attn_norm.weight",
+        ".self_attn.kv_a_layernorm.weight": ".attn_kv_a_norm.weight",
+        ".self_attn.kv_a_proj_with_mqa.weight": ".attn_kv_a_mqa.weight",
+        ".self_attn.kv_b_proj.weight": ".attn_kv_b.weight",
+        ".self_attn.o_proj.weight": ".attn_output.weight",
+        ".self_attn.q_a_layernorm.weight": ".attn_q_a_norm.weight",
+        ".self_attn.q_a_proj.weight": ".attn_q_a.weight",
+        ".self_attn.q_b_proj.weight": ".attn_q_b.weight",
     }
 
     translation_gate = {
-        ".ffn.gate.bias": ".exp_probs_b.bias",
-        ".ffn.gate.weight": ".ffn_gate_inp.weight",
-        ".ffn_norm.weight": ".ffn_norm.weight",
+        ".mlp.gate.bias": ".exp_probs_b.bias",
+        ".mlp.gate.weight": ".ffn_gate_inp.weight",
+        ".post_attention_layernorm.weight": ".ffn_norm.weight",
     }
 
     translation_shared_experts = {
-        ".ffn.shared_experts.w2.weight": ".ffn_down_shexp.weight",
-        ".ffn.shared_experts.w1.weight": ".ffn_gate_shexp.weight",
-        ".ffn.shared_experts.w3.weight": ".ffn_up_shexp.weight",
+        ".mlp.shared_experts.down_proj.weight": ".ffn_down_shexp.weight",
+        ".mlp.shared_experts.gate_proj.weight": ".ffn_gate_shexp.weight",
+        ".mlp.shared_experts.up_proj.weight": ".ffn_up_shexp.weight",
     }
 
     translation_shared_experts_cpu = {
-        ".ffn.w2.weight": ".ffn_down_shexp.weight",
-        ".ffn.w1.weight": ".ffn_gate_shexp.weight",
-        ".ffn.w3.weight": ".ffn_up_shexp.weight",
+        ".mlp.down_proj.weight": ".ffn_down_shexp.weight",
+        ".mlp.gate_proj.weight": ".ffn_gate_shexp.weight",
+        ".mlp.up_proj.weight": ".ffn_up_shexp.weight",
     }
 
     translation_experts = {
-        ".w2.weight": ".ffn_down_exps.weight",
-        ".w1.weight": ".ffn_gate_exps.weight",
-        ".w3.weight": ".ffn_up_exps.weight",
+        ".down_proj.weight": ".ffn_down_exps.weight",
+        ".gate_proj.weight": ".ffn_gate_exps.weight",
+        ".up_proj.weight": ".ffn_up_exps.weight",
     }
 
     # cpu_layer = list(range(100))
@@ -1050,9 +989,9 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                 f"blk.{layer_id}.ffn_down_shexp.weight"
             )
 
-            state_dict["layers." + str(layer_id) + ".ffn.shared_gate_proj"] = gate_proj
-            state_dict["layers." + str(layer_id) + ".ffn.shared_up_proj"] = up_proj
-            state_dict["layers." + str(layer_id) + ".ffn.shared_down_proj"] = down_proj
+            state_dict["layers." + str(layer_id) + ".mlp.shared_gate_proj"] = gate_proj
+            state_dict["layers." + str(layer_id) + ".mlp.shared_up_proj"] = up_proj
+            state_dict["layers." + str(layer_id) + ".mlp.shared_down_proj"] = down_proj
         elif not cpu_offload:
             for k in translation_shared_experts.keys():
                 safetensor_name = "layers." + str(layer_id) + k
@@ -1157,7 +1096,7 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                         safetensor_name = (
                             "layers."
                             + str(layer_id)
-                            + ".ffn.experts."
+                            + ".mlp.experts."
                             + str(expert_id)
                             + k
                         )
@@ -1192,7 +1131,7 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                         safetensor_name = (
                             "layers."
                             + str(layer_id)
-                            + ".ffn.experts."
+                            + ".mlp.experts."
                             + str(expert_id)
                             + k
                         )
@@ -1227,16 +1166,20 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                     )
                 )
 
-                state_dict["layers." + str(layer_id) + ".ffn.gate_proj"] = gate_proj
-                state_dict["layers." + str(layer_id) + ".ffn.up_proj"] = up_proj
-                state_dict["layers." + str(layer_id) + ".ffn.down_proj"] = down_proj
-                state_dict["layers." + str(layer_id) + ".ffn.gate_type"] = torch.tensor(
+                state_dict["layers." + str(layer_id) + ".mlp.gguf_gate_proj"] = (
+                    gate_proj
+                )
+                state_dict["layers." + str(layer_id) + ".mlp.gguf_up_proj"] = up_proj
+                state_dict["layers." + str(layer_id) + ".mlp.gguf_down_proj"] = (
+                    down_proj
+                )
+                state_dict["layers." + str(layer_id) + ".mlp.gate_type"] = torch.tensor(
                     gate_type
                 ).view(1)
-                state_dict["layers." + str(layer_id) + ".ffn.up_type"] = torch.tensor(
+                state_dict["layers." + str(layer_id) + ".mlp.up_type"] = torch.tensor(
                     up_type
                 ).view(1)
-                state_dict["layers." + str(layer_id) + ".ffn.down_type"] = torch.tensor(
+                state_dict["layers." + str(layer_id) + ".mlp.down_type"] = torch.tensor(
                     down_type
                 ).view(1)
 

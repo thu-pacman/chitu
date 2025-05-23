@@ -1,0 +1,5 @@
+quant: 
+- model: '.'
+  rules:
+    - regex : 'layers\.'
+      type : gptqmodel

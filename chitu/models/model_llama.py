@@ -15,7 +15,7 @@ from chitu.tensor_parallel import (
 
 
 class AttentionLlama(Attention):
-    def __init__(self, args, layer_id, cache, attn_backend):
+    def __init__(self, args, layer_id, cache, attn_backend, checkpoint_prefix):
         super().__init__(layer_id, cache, attn_backend)
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         model_parallel_size = get_tp_size()
@@ -29,24 +29,28 @@ class AttentionLlama(Attention):
             args.n_heads * self.head_dim,
             has_bias=False,
             gather_output=False,
+            checkpoint_prefix=f"{checkpoint_prefix}.wq",
         )
         self.wk = ColumnParallelLinear(
             args.dim,
             self.n_kv_heads * self.head_dim,
             has_bias=False,
             gather_output=False,
+            checkpoint_prefix=f"{checkpoint_prefix}.wk",
         )
         self.wv = ColumnParallelLinear(
             args.dim,
             self.n_kv_heads * self.head_dim,
             has_bias=False,
             gather_output=False,
+            checkpoint_prefix=f"{checkpoint_prefix}.wv",
         )
         self.wo = RowParallelLinear(
             args.n_heads * self.head_dim,
             args.dim,
             has_bias=False,
             input_is_parallel=True,
+            checkpoint_prefix=f"{checkpoint_prefix}.wo",
         )
 
     def _run_linear(self, x):
@@ -109,14 +113,22 @@ class TransformerLlama(Transformer):
         for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
             self.layers.append(
                 TransformerBlockLlama(
-                    layer_id, self.params, cache, attn_backend, self.op_impl
+                    layer_id,
+                    self.params,
+                    cache,
+                    attn_backend,
+                    self.op_impl,
+                    checkpoint_prefix=f"layers.{layer_id}",
                 )
             )
 
     def _init_post_layers(self):
         self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps)
         self.output = ColumnParallelLinear(
-            self.params.dim, self.params.vocab_size, has_bias=False
+            self.params.dim,
+            self.params.vocab_size,
+            has_bias=False,
+            checkpoint_prefix=f"output",
         )
 
     def _pre_layers(self, h):
@@ -136,6 +148,7 @@ class FeedForwardLlama(nn.Module):
         hidden_dim: int,
         multiple_of: int,
         ffn_dim_multiplier: Optional[float],
+        checkpoint_prefix: str,
     ):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
@@ -145,13 +158,25 @@ class FeedForwardLlama(nn.Module):
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
         self.w1 = ColumnParallelLinear(
-            dim, hidden_dim, has_bias=False, gather_output=False
+            dim,
+            hidden_dim,
+            has_bias=False,
+            gather_output=False,
+            checkpoint_prefix=f"{checkpoint_prefix}.w1",
         )
         self.w2 = RowParallelLinear(
-            hidden_dim, dim, has_bias=False, input_is_parallel=True
+            hidden_dim,
+            dim,
+            has_bias=False,
+            input_is_parallel=True,
+            checkpoint_prefix=f"{checkpoint_prefix}.w2",
         )
         self.w3 = ColumnParallelLinear(
-            dim, hidden_dim, has_bias=False, gather_output=False
+            dim,
+            hidden_dim,
+            has_bias=False,
+            gather_output=False,
+            checkpoint_prefix=f"{checkpoint_prefix}.w3",
         )
 
     def forward(self, x):
@@ -159,14 +184,19 @@ class FeedForwardLlama(nn.Module):
 
 
 class TransformerBlockLlama(TransformerBlock):
-    def __init__(self, layer_id: int, args, cache, attn_backend, op_impl):
+    def __init__(
+        self, layer_id: int, args, cache, attn_backend, op_impl, checkpoint_prefix
+    ):
         super().__init__(layer_id, args, cache, attn_backend, op_impl)
-        self.attention = AttentionLlama(args, layer_id, cache, attn_backend)
+        self.attention = AttentionLlama(
+            args, layer_id, cache, attn_backend, f"{checkpoint_prefix}.attention"
+        )
         self.feed_forward = FeedForwardLlama(
             dim=args.dim,
             hidden_dim=4 * args.dim,
             multiple_of=args.multiple_of,
             ffn_dim_multiplier=args.ffn_dim_multiplier,
+            checkpoint_prefix=f"{checkpoint_prefix}.feed_forward",
         )
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)

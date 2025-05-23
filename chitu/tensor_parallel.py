@@ -75,13 +75,13 @@ def get_tp_rank():
 def get_local_linear_class(
     base_linear_class: Optional[type] = None,
     *,
-    disabled_methods: Optional[Set[str]] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+    checkpoint_prefix: str = "",
 ):
     if base_linear_class is None:
         base_linear_class = (
             QuantizationRegistry.get_quantized_linear_class_from_global_args(
-                disabled_methods=disabled_methods, quant_kwargs=quant_kwargs
+                quant_kwargs=quant_kwargs, checkpoint_prefix=checkpoint_prefix
             )
         )
     return base_linear_class
@@ -90,12 +90,12 @@ def get_local_linear_class(
 def LocalLinear(
     in_features: int,
     out_features: int,
+    checkpoint_prefix: str,
     has_bias: bool = True,
     dtype=None,
     bias_dtype=None,
     *,
     base_linear_class: Optional[type] = None,
-    disabled_methods: Optional[Set[str]] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     """
@@ -109,15 +109,14 @@ def LocalLinear(
         bias_dtype: The desired data type of the bias. Defaults to `dtype`.
         base_linear_class: The base linear class to use. Defaults to be determined by the global
             quantization method.
-        disabled_methods: Set of disabled methods. If `base_linear_class` is `None`, don't use
-            the quantization method in this set. This is useful for for partial quantization of
-            selected layers.
         quant_kwargs: Nested mapping for additional arguments for specific
             quantization methods. E.g., `{"quant_method_x": {"arg1": value1, ...}}`
     """
 
     return get_local_linear_class(
-        base_linear_class, disabled_methods=disabled_methods, quant_kwargs=quant_kwargs
+        base_linear_class,
+        quant_kwargs=quant_kwargs,
+        checkpoint_prefix=checkpoint_prefix,
     )(
         in_features=in_features,
         out_features=out_features,
@@ -130,13 +129,14 @@ def LocalLinear(
 def get_column_parallel_linear_class(
     base_linear_class: Optional[type] = None,
     *,
-    disabled_methods: Optional[Set[str]] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+    checkpoint_prefix="",
 ):
     if base_linear_class is None:
         base_linear_class = (
             QuantizationRegistry.get_quantized_linear_class_from_global_args(
-                disabled_methods=disabled_methods, quant_kwargs=quant_kwargs
+                quant_kwargs=quant_kwargs,
+                checkpoint_prefix=checkpoint_prefix,
             )
         )
 
@@ -154,13 +154,13 @@ def get_column_parallel_linear_class(
 def ColumnParallelLinear(
     in_features: int,
     out_features: int,
+    checkpoint_prefix: str,
     has_bias: bool = True,
     gather_output: bool = True,
     dtype=None,
     bias_dtype=None,
     *,
     base_linear_class: Optional[type] = None,
-    disabled_methods: Optional[Set[str]] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     """
@@ -172,15 +172,15 @@ def ColumnParallelLinear(
     Additional arguments:
         base_linear_class: The base linear class to use. Defaults to be determined by the global
             quantization method.
-        disabled_methods: Set of disabled methods. If `base_linear_class` is `None`, don't use
-            the quantization method in this set. This is useful for for partial quantization of
-            selected layers.
         quant_kwargs: Nested mapping for additional arguments for specific
             quantization methods. E.g., `{"quant_method_x": {"arg1": value1, ...}}`
+        checkpoint_prefix: Used to match whether quantization is required
     """
 
     return get_column_parallel_linear_class(
-        base_linear_class, disabled_methods=disabled_methods, quant_kwargs=quant_kwargs
+        base_linear_class,
+        quant_kwargs=quant_kwargs,
+        checkpoint_prefix=checkpoint_prefix,
     )(
         in_features=in_features,
         out_features=out_features,
@@ -194,13 +194,14 @@ def ColumnParallelLinear(
 def get_row_parallel_linear_class(
     base_linear_class: Optional[type] = None,
     *,
-    disabled_methods: Optional[Set[str]] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+    checkpoint_prefix="",
 ):
     if base_linear_class is None:
         base_linear_class = (
             QuantizationRegistry.get_quantized_linear_class_from_global_args(
-                disabled_methods=disabled_methods, quant_kwargs=quant_kwargs
+                quant_kwargs=quant_kwargs,
+                checkpoint_prefix=checkpoint_prefix,
             )
         )
 
@@ -218,6 +219,7 @@ def get_row_parallel_linear_class(
 def RowParallelLinear(
     in_features: int,
     out_features: int,
+    checkpoint_prefix: str,
     has_bias: bool = True,
     input_is_parallel: bool = False,
     reduce_output: bool = True,
@@ -225,7 +227,6 @@ def RowParallelLinear(
     bias_dtype=None,
     *,
     base_linear_class: Optional[type] = None,
-    disabled_methods: Optional[Set[str]] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     """
@@ -236,15 +237,15 @@ def RowParallelLinear(
     Additional arguments:
         base_linear_class: The base linear class to use. Defaults to be determined by the global
             quantization method.
-        disabled_methods: Set of disabled methods. If `base_linear_class` is `None`, don't use
-            the quantization method in this set. This is useful for for partial quantization of
-            selected layers.
         quant_kwargs: Nested mapping for additional arguments for specific
             quantization methods. E.g., `{"quant_method_x": {"arg1": value1, ...}}`
+        checkpoint_prefix: Used to match whether quantization is required
     """
 
     return get_row_parallel_linear_class(
-        base_linear_class, disabled_methods=disabled_methods, quant_kwargs=quant_kwargs
+        base_linear_class,
+        quant_kwargs=quant_kwargs,
+        checkpoint_prefix=checkpoint_prefix,
     )(
         in_features=in_features,
         out_features=out_features,

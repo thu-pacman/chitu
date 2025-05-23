@@ -40,9 +40,15 @@ def get_rms_norm_impl():
     args = get_global_args()
     if args.models.name == "Mixtral-8x7B-Instruct-v0.1":
         impl = "ref"
-    if hasattr(args.models, "quant") and args.models.quant == "simple_w8a8":
+    if (
+        hasattr(args.models, "quant_config")
+        and args.models.quant_config.type == "simple_w8a8"
+    ):
         impl = "ref"
-    if hasattr(args.models, "quant") and args.models.quant == "simple_w8a8_muxi":
+    if (
+        hasattr(args.models, "quant_config")
+        and args.models.quant_config.type == "simple_w8a8_muxi"
+    ):
         impl = "ref"
 
     return impl
@@ -58,6 +64,7 @@ class AttentionHFLlama(Attention):
         rotary_type="hf-llama",
         op_impl: str = "torch",
         merge_qkv: bool = True,
+        checkpoint_prefix="",
     ):
         super().__init__(layer_id, cache, attn_backend)
         self.rotary_type = rotary_type
@@ -90,6 +97,7 @@ class AttentionHFLlama(Attention):
                 has_bias=qkv_has_bias,
                 gather_output=False,
                 base_linear_class=qkv_proj_linear,
+                checkpoint_prefix=f"{checkpoint_prefix}.qkv_proj",
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -98,6 +106,7 @@ class AttentionHFLlama(Attention):
                 has_bias=qkv_has_bias,
                 gather_output=False,
                 base_linear_class=qkv_proj_linear,
+                checkpoint_prefix=f"{checkpoint_prefix}.q_proj",
             )
             self.k_proj = ColumnParallelLinear(
                 args.dim,
@@ -105,6 +114,7 @@ class AttentionHFLlama(Attention):
                 has_bias=qkv_has_bias,
                 gather_output=False,
                 base_linear_class=qkv_proj_linear,
+                checkpoint_prefix=f"{checkpoint_prefix}.k_proj",
             )
             self.v_proj = ColumnParallelLinear(
                 args.dim,
@@ -112,6 +122,7 @@ class AttentionHFLlama(Attention):
                 has_bias=qkv_has_bias,
                 gather_output=False,
                 base_linear_class=qkv_proj_linear,
+                checkpoint_prefix=f"{checkpoint_prefix}.v_proj",
             )
         self.o_proj = RowParallelLinear(
             args.n_heads * self.head_dim,
@@ -119,6 +130,7 @@ class AttentionHFLlama(Attention):
             has_bias=o_has_bias,
             input_is_parallel=True,
             base_linear_class=o_proj_linear,
+            checkpoint_prefix=f"{checkpoint_prefix}.o_proj",
         )
 
         if "Qwen3" in args.name:
@@ -275,7 +287,12 @@ class AttentionHFLlama(Attention):
 
 class FeedForwardHFLlama(nn.Module):
     def __init__(
-        self, dim: int, hidden_dim: int, op_impl: str, merge_gate_up: bool = True
+        self,
+        dim: int,
+        hidden_dim: int,
+        op_impl: str,
+        merge_gate_up: bool = True,
+        checkpoint_prefix="",
     ):
         super().__init__()
         self.op_impl = op_impl
@@ -293,6 +310,7 @@ class FeedForwardHFLlama(nn.Module):
                 has_bias=False,
                 gather_output=False,
                 base_linear_class=gate_up_proj_linear,
+                checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
             )
         else:
             self.gate_proj = ColumnParallelLinear(
@@ -301,6 +319,7 @@ class FeedForwardHFLlama(nn.Module):
                 has_bias=False,
                 gather_output=False,
                 base_linear_class=gate_up_proj_linear,
+                checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
             )
             self.up_proj = ColumnParallelLinear(
                 dim,
@@ -308,6 +327,7 @@ class FeedForwardHFLlama(nn.Module):
                 has_bias=False,
                 gather_output=False,
                 base_linear_class=gate_up_proj_linear,
+                checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
             )
         self.down_proj = RowParallelLinear(
             hidden_dim,
@@ -315,6 +335,7 @@ class FeedForwardHFLlama(nn.Module):
             has_bias=False,
             input_is_parallel=True,
             base_linear_class=down_proj_linear,
+            checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
         )
 
     def forward(self, x):
@@ -353,6 +374,7 @@ class Qwen3MoeBlock(nn.Module):
         op_impl: str,
         merge_gate_up: bool,
         layer_idx: int,
+        checkpoint_prefix="",
     ):
         super().__init__()
         params = get_global_args().models
@@ -375,8 +397,9 @@ class Qwen3MoeBlock(nn.Module):
                     hidden_dim=hidden_dim,
                     op_impl=op_impl,
                     merge_gate_up=merge_gate_up,
+                    checkpoint_prefix=f"{checkpoint_prefix}.experts.{expert_id}",
                 )
-                for _ in range(self.num_experts)
+                for expert_id in range(self.num_experts)
             ]
         )
 
@@ -441,6 +464,7 @@ class TransformerBlockHFLlama(TransformerBlock):
         rotary_type="hf-llama",
         mlp_type=FeedForwardHFLlama,
         merge_qkv_gate_up=True,
+        checkpoint_prefix="",
     ):
         super().__init__(layer_id, args, cache, attn_backend, op_impl)
         self.self_attn = AttentionHFLlama(
@@ -451,6 +475,7 @@ class TransformerBlockHFLlama(TransformerBlock):
             rotary_type=rotary_type,
             op_impl=op_impl,
             merge_qkv=merge_qkv_gate_up,
+            checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
         )
         if args.name in {"Qwen3-30B-A3B", "Qwen3-235B-A22B"}:
             mlp_type = Qwen3MoeBlock
@@ -460,6 +485,7 @@ class TransformerBlockHFLlama(TransformerBlock):
                 op_impl=op_impl,
                 merge_gate_up=merge_qkv_gate_up,
                 layer_idx=layer_id,
+                checkpoint_prefix=f"{checkpoint_prefix}.mlp",
             )
         else:
             self.mlp = mlp_type(
@@ -467,6 +493,7 @@ class TransformerBlockHFLlama(TransformerBlock):
                 hidden_dim=args.intermediate_dim,
                 op_impl=op_impl,
                 merge_gate_up=merge_qkv_gate_up,
+                checkpoint_prefix=f"{checkpoint_prefix}.mlp",
             )
         self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
         self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -822,6 +849,7 @@ class TransformerHFLlama(Transformer):
                     op_impl=op_impl,
                     rotary_type=self.rotary_type,
                     merge_qkv_gate_up=self.merge_qkv_gate_up,
+                    checkpoint_prefix=f"layers.{layer_id}",
                 )
             )
 
@@ -831,7 +859,7 @@ class TransformerHFLlama(Transformer):
             self.params.dim,
             self.params.vocab_size,
             has_bias=False,
-            disabled_methods=QuantizationRegistry.get_all_methods(),
+            checkpoint_prefix=f"lm_head",
         )
 
     def _pre_layers(self, h):
@@ -951,7 +979,11 @@ class RotaryEmbeddingHFLlama(nn.Module):
 def get_linear_layout_contig_x_native_y(op_impl: str):
     if op_impl == "muxi_custom_kernel":
         args = get_global_args()
-        quant_method = None if not hasattr(args.models, "quant") else args.models.quant
+        quant_method = (
+            None
+            if not hasattr(args.models, "quant_config")
+            else args.models.quant_config.type
+        )
         if quant_method is None:
             return LinearLayoutContigXNativeY
         elif quant_method == "blockfp8":
@@ -969,7 +1001,11 @@ def get_linear_layout_contig_x_native_y(op_impl: str):
 def get_linear_layout_native_x_contig_y(op_impl: str):
     if op_impl == "muxi_custom_kernel":
         args = get_global_args()
-        quant_method = None if not hasattr(args.models, "quant") else args.models.quant
+        quant_method = (
+            None
+            if not hasattr(args.models, "quant_config")
+            else args.models.quant_config.type
+        )
         if quant_method is None:
             return LinearLayoutNativeXContigY
         elif quant_method == "blockfp8":
@@ -987,7 +1023,11 @@ def get_linear_layout_native_x_contig_y(op_impl: str):
 def get_linear_layout_contig_x_contig_y(op_impl: str):
     if op_impl == "muxi_custom_kernel":
         args = get_global_args()
-        quant_method = None if not hasattr(args.models, "quant") else args.models.quant
+        quant_method = (
+            None
+            if not hasattr(args.models, "quant_config")
+            else args.models.quant_config.type
+        )
         if quant_method is None:
             return LinearLayoutContigXContigY
         elif quant_method == "blockfp8":

@@ -359,7 +359,11 @@ class Transformer(nn.Module):
 
     def _get_2d_out_x_in_tensor_names(self) -> List[str]:
         ret = ["weight"]
-        quant = self.params.quant if hasattr(self.params, "quant") else None
+        quant = (
+            self.params.quant_config.type
+            if hasattr(self.params, "quant_config")
+            else None
+        )
         if quant == "blockfp8" or quant == "gguf-blockfp8":
             ret += ["scale"]
         elif quant == "blockfp4":
@@ -368,7 +372,11 @@ class Transformer(nn.Module):
 
     def _get_2d_in_x_out_tensor_names(self) -> List[str]:
         ret = []
-        quant = self.params.quant if hasattr(self.params, "quant") else None
+        quant = (
+            self.params.quant_config.type
+            if hasattr(self.params, "quant_config")
+            else None
+        )
         if quant == "autoawq":
             ret += ["qweight", "qzeros", "scales"]
         elif quant == "gptqmodel":
@@ -377,14 +385,22 @@ class Transformer(nn.Module):
 
     def _get_1d_in_tensor_names(self) -> List[str]:
         ret = []
-        quant = self.params.quant if hasattr(self.params, "quant") else None
+        quant = (
+            self.params.quant_config.type
+            if hasattr(self.params, "quant_config")
+            else None
+        )
         if quant == "gptqmodel":
             ret += ["g_idx"]
         return ret
 
     def _get_1d_out_tensor_names(self) -> List[str]:
         ret = ["bias"]
-        quant = self.params.quant if hasattr(self.params, "quant") else None
+        quant = (
+            self.params.quant_config.type
+            if hasattr(self.params, "quant_config")
+            else None
+        )
         if quant == "simple_w8a8":
             ret += ["scale_channel"]
         if quant == "simple_w8a8_muxi":
@@ -438,7 +454,11 @@ class Transformer(nn.Module):
         cpl_names = self._get_tensor_column_parallel_layer_names()
         rpl_names = self._get_tensor_row_parallel_layer_names()
 
-        quant = self.params.quant if hasattr(self.params, "quant") else None
+        quant = (
+            self.params.quant_config.type
+            if hasattr(self.params, "quant_config")
+            else None
+        )
 
         for name, param in checkpoint.items():
             if any(is_layer(s, name) for s in cpl_names):
@@ -522,7 +542,11 @@ class Transformer(nn.Module):
         return partial_checkpoint
 
     def process_state_dict_for_blockfp4_before_chunk(self, state_dict):
-        quant = self.params.quant if hasattr(self.params, "quant") else None
+        quant = (
+            self.params.quant_config.type
+            if hasattr(self.params, "quant_config")
+            else None
+        )
         if quant == "blockfp4":
             new_state_dict = {}
             for key, value in state_dict.items():
@@ -534,7 +558,11 @@ class Transformer(nn.Module):
         return state_dict
 
     def process_state_dict_for_blockfp4_after_chunk(self, state_dict):
-        quant = self.params.quant if hasattr(self.params, "quant") else None
+        quant = (
+            self.params.quant_config.type
+            if hasattr(self.params, "quant_config")
+            else None
+        )
         if quant == "blockfp4":
             new_state_dict = {}
             for k in state_dict.keys():
