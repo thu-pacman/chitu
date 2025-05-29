@@ -278,7 +278,7 @@ class ColumnParallelLinearMixIn:
         bias_dtype=None,
     ):
         """
-        Ouput-dimension-parallelized linaer layer
+        Ouput-dimension-parallelized linear layer
 
         Args:
             in_features: size of each input sample

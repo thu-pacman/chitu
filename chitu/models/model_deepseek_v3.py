@@ -1,7 +1,7 @@
 import math
 import functools
 from logging import getLogger
-from typing import Any, List, Mapping, Optional, Set, Tuple
+from typing import Dict, Mapping, Tuple, Optional, Type, Set, List, Any
 
 import torch
 import torch.distributed as dist
@@ -19,7 +19,15 @@ from chitu.device_type import (
     is_nvidia,
 )
 from chitu.global_vars import get_global_args
-from chitu.models.model import Attention, RMSNorm, Transformer, TransformerBlock
+from chitu.models.model import (
+    Attention,
+    RMSNorm,
+    Transformer,
+    TransformerBlock,
+    MoeGate,
+    MoeBlock,
+    MoeBlockRegistry,
+)
 from chitu.ops import (
     apply_rotary_pos_emb,
     weight_dequant_deepseek_v3,
@@ -148,334 +156,6 @@ class ParallelAbsorbGemm(torch.nn.Module):
         if bs is not None:
             y = y.view(bs, seq, y.shape[-2], y.shape[-1])
         return y
-
-
-class GroupColumnParallelLinearDeepSeekV3(torch.nn.Module):
-    def __init__(
-        self,
-        group_size: int,
-        in_features: int,
-        out_features: int,
-        has_bias: bool = True,
-        gather_output: bool = True,
-        dtype=None,
-        bias_dtype=None,
-        scale_2_dim: int = 1,
-    ):
-        super().__init__()
-
-        dtype = dtype or torch.get_default_dtype()
-
-        # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
-        # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
-        args = get_global_args()
-        if (
-            dtype.itemsize == 1
-            and parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1
-        ):
-            dtype = torch.uint8
-
-        self.quant_method = (
-            None
-            if not hasattr(args.models, "quant_config")
-            else args.models.quant_config.type
-        )
-
-        self.tp_group = get_tp_group()
-        self.tp_size = get_tp_size()
-        self.group_size = group_size
-        self.in_features = in_features
-        self.out_features = out_features
-        self.gather_output = gather_output
-
-        assert (
-            out_features % self.tp_size == 0
-        ), "out_features must be divisible by tp_size"
-        local_out_features = local_out_features = out_features // self.tp_size
-
-        self.weight = torch.nn.Parameter(
-            torch.empty(
-                group_size,
-                local_out_features,
-                in_features // 2 if self.quant_method == "blockfp4" else in_features,
-                dtype=dtype,
-            ),
-            requires_grad=False,
-        )
-        if has_bias:
-            self.bias = torch.nn.Parameter(
-                torch.empty(group_size, local_out_features, dtype=bias_dtype or dtype),
-                requires_grad=False,
-            )
-        else:
-            self.bias = None
-
-        if self.quant_method is None:
-            self.scale = None
-        elif self.quant_method == "blockfp4":
-            quant_scale_stride = 16
-            scale_out_features = local_out_features
-            scale_in_features = ceil_div(in_features, quant_scale_stride)
-            self.weight_scale = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    scale_out_features,
-                    scale_in_features,
-                    dtype=torch.uint8,
-                ),
-                requires_grad=False,
-            )
-            self.input_scale = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    scale_2_dim,
-                    1,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-            self.weight_scale_2 = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    scale_2_dim,
-                    1,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-        elif self.quant_method == "blockfp8":
-            block_size = 128
-            scale_out_features = (local_out_features + block_size - 1) // block_size
-            scale_in_features = (in_features + block_size - 1) // block_size
-            self.scale = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    scale_out_features,
-                    scale_in_features,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-        else:
-            raise NotImplementedError(
-                f"Unsupported quantization method {self.quant_method}"
-            )
-
-    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
-        assert len(xs) == self.group_size
-        ys = []
-        for i in range(self.group_size):
-            y = None
-            if xs[i] is not None:
-                x = xs[i]
-                if self.quant_method is None:
-                    y = torch.nn.functional.linear(x, self.weight[i], self.bias[i])
-                elif self.quant_method == "blockfp4":
-                    y = linear_block_fp4(
-                        x=x,
-                        weight=self.weight[i],
-                        weight_scale=self.weight_scale[i],
-                        weight_scale_2=self.weight_scale_2[i],
-                        bias=self.bias[i],
-                        act_block_size=128,
-                    )
-                elif self.quant_method == "blockfp8":
-                    y = linear_block_fp8(
-                        x=x,
-                        weight=self.weight[i],
-                        weight_scale=self.scale[i],
-                        bias=self.bias[i],
-                        block_size=128,
-                    )
-                else:
-                    raise NotImplementedError(
-                        f"Unsupported quantization method {self.quant_method}"
-                    )
-                if self.gather_output and self.tp_size > 1:
-                    y_transposed = y.permute(-1, *range(y.dim() - 1)).contiguous()
-                    shape = list(y_transposed.shape)
-                    shape[0] *= self.tp_size
-                    y_gathered = y.new_empty(shape)
-                    torch.distributed.all_gather_into_tensor(
-                        y_gathered, y_transposed, group=self.tp_group
-                    )
-                    y = y_gathered.permute(*range(1, y.dim()), 0)
-            ys.append(y)
-        return ys
-
-
-class GroupRowParallelLinearDeepSeekV3(torch.nn.Module):
-    def __init__(
-        self,
-        group_size: int,
-        in_features: int,
-        out_features: int,
-        has_bias: bool = True,
-        input_is_parallel: bool = False,
-        dtype=None,
-        bias_dtype=None,
-    ):
-        super().__init__()
-
-        dtype = dtype or torch.get_default_dtype()
-
-        # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
-        # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
-        args = get_global_args()
-        if (
-            dtype.itemsize == 1
-            and parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1
-        ):
-            dtype = torch.uint8
-
-        self.quant_method = (
-            None
-            if not hasattr(args.models, "quant_config")
-            else args.models.quant_config.type
-        )
-
-        self.tp_group = get_tp_group()
-        self.tp_size = get_tp_size()
-        self.rank = get_tp_rank()
-        self.group_size = group_size
-        self.in_features = in_features
-        self.out_features = out_features
-
-        assert (
-            in_features % self.tp_size == 0
-        ), "in_features must be divisible by tp_size"
-        local_in_features = in_features // self.tp_size
-
-        self.input_is_parallel = input_is_parallel
-
-        self.weight = torch.nn.Parameter(
-            torch.empty(
-                group_size,
-                out_features,
-                (
-                    local_in_features // 2
-                    if self.quant_method == "blockfp4"
-                    else local_in_features
-                ),
-                dtype=dtype,
-            ),
-            requires_grad=False,
-        )
-        if has_bias:
-            self.bias = torch.nn.Parameter(
-                torch.empty(group_size, out_features, dtype=bias_dtype or dtype),
-                requires_grad=False,
-            )
-        else:
-            self.bias = None
-
-        if self.quant_method is None:
-            self.scale = None
-        elif self.quant_method == "blockfp4":
-            quant_scale_stride = 16
-            scale_out_features = out_features
-            scale_in_features = ceil_div(local_in_features, quant_scale_stride)
-            self.weight_scale = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    scale_out_features,
-                    scale_in_features,
-                    dtype=torch.uint8,
-                ),
-                requires_grad=False,
-            )
-            self.input_scale = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    1,
-                    1,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-            self.weight_scale_2 = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    1,
-                    1,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-        elif self.quant_method == "blockfp8":
-            block_size = 128
-            scale_out_features = (out_features + block_size - 1) // block_size
-            scale_in_features = (local_in_features + block_size - 1) // block_size
-            self.scale = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    scale_out_features,
-                    scale_in_features,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-        else:
-            raise NotImplementedError(
-                f"Unsupported quantization method {self.quant_method}"
-            )
-
-    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
-        assert len(xs) == self.group_size
-        ys = []
-        for i in range(self.group_size):
-            y = None
-            if xs[i] is not None:
-                x = xs[i]
-                if not self.input_is_parallel and self.tp_size > 1:
-                    shape = list(x.shape)
-                    this_rank_dim = shape[-1] // self.tp_size
-                    shape[-1] = self.tp_size
-                    shape.append(this_rank_dim)
-                    x = x.view(shape).select(-2, self.rank)
-                if self.quant_method is None:
-                    y = torch.nn.functional.linear(
-                        x,
-                        self.weight[i],
-                        (
-                            self.bias[i]
-                            if self.rank == 0 and self.bias is not None
-                            else None
-                        ),
-                    )
-                elif self.quant_method == "blockfp4":
-                    y = linear_block_fp4(
-                        x=x,
-                        weight=self.weight[i],
-                        weight_scale=self.weight_scale[i],
-                        weight_scale_2=self.weight_scale_2[i],
-                        bias=(
-                            self.bias[i]
-                            if self.rank == 0 and self.bias is not None
-                            else None
-                        ),
-                        act_block_size=128,
-                    )
-                elif self.quant_method == "blockfp8":
-                    y = linear_block_fp8(
-                        x=x,
-                        weight=self.weight[i],
-                        weight_scale=self.scale[i],
-                        bias=(
-                            self.bias[i]
-                            if self.rank == 0 and self.bias is not None
-                            else None
-                        ),
-                        block_size=128,
-                    )
-                else:
-                    raise NotImplementedError(
-                        f"Unsupported quantization method {self.quant_method}"
-                    )
-                if self.tp_size > 1:
-                    torch.distributed.all_reduce(y, group=self.tp_group)
-            ys.append(y)
-        return ys
 
 
 class AttentionDeepSeekV3(Attention):
@@ -989,7 +669,7 @@ class MLPDeepSeekV3(nn.Module):
             return self.down_proj(F.silu(gate_proj_out) * up_proj_out)
 
 
-class GateDeepSeekV3(nn.Module):
+class GateDeepSeekV3(MoeGate):
     """
     Gating mechanism for routing inputs in a mixture-of-experts (MoE) model.
 
@@ -1011,489 +691,90 @@ class GateDeepSeekV3(nn.Module):
         Args:
             args (ModelArgs): Model arguments containing gating parameters.
         """
-        super().__init__()
-        self.op_impl = op_impl
-        self.dim = args.dim
-        self.topk = args.n_activated_experts
-        self.n_groups = args.n_expert_groups
-        self.topk_groups = args.n_limited_groups
-        self.score_func = args.score_func
-        self.route_scale = args.route_scale
-        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
-        self.bias = (
-            nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32))
-            if self.dim == 7168
-            else None
+        super().__init__(
+            op_impl=op_impl,
+            dim=args.dim,
+            topk=args.n_activated_experts,
+            n_groups=args.n_expert_groups,
+            topk_groups=args.n_limited_groups,
+            score_func=args.score_func,
+            route_scale=args.route_scale,
+            n_experts=args.n_routed_experts,
+            bias=(
+                nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32))
+                if args.dim == 7168
+                else None
+            ),
+            norm_prob=False,
         )
 
-    def is_fused_sigmoid_gate(self):
-        return self.score_func == "sigmoid" and self.n_groups > 1
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass for the gating mechanism.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
-        """
-        scores = F.linear(x, self.weight)
-        if self.op_impl == "muxi_custom_kernel":
-            weights, indices = grouped_topk(
-                x,
-                scores,
-                self.topk,
-                renormalize=self.score_func == "sigmoid",
-                num_expert_group=self.n_groups,
-                topk_group=self.topk_groups,
-                scoring_func=self.score_func,
-                e_score_correction_bias=(
-                    None if self.bias is None else self.bias.type_as(scores)
-                ),
-            )
-            weights *= self.route_scale
-            return weights, indices
-        else:
-            if self.is_fused_sigmoid_gate() and (is_nvidia() or is_muxi()):
-                indices, weights = fused_sigmoid_gate(
-                    scores,
-                    self.topk,
-                    self.n_groups,
-                    self.topk_groups,
-                    self.bias,
-                )
-            else:
-                if self.score_func == "softmax":
-                    scores = scores.softmax(dim=-1, dtype=torch.float32)
-                else:
-                    scores = scores.sigmoid()
-                original_scores = scores
-                if self.bias is not None:
-                    scores = scores + self.bias
-                if self.n_groups > 1:
-                    scores = scores.view(x.size(0), self.n_groups, -1)
-                    if self.bias is None:
-                        group_scores = scores.amax(dim=-1)
-                    else:
-                        group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-                    indices = group_scores.topk(self.topk_groups, dim=-1)[1]
-                    mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
-                    scores = (scores * mask.unsqueeze(-1)).flatten(1)
-                indices = torch.topk(scores, self.topk, dim=-1)[1]
-                weights = original_scores.gather(1, indices)
-
-            if self.score_func == "sigmoid":
-                weights /= weights.sum(dim=-1, keepdim=True)
-            weights *= self.route_scale
-            return weights.type_as(x), indices.to(torch.int32)
-
-
-class MoEDeepSeekV3(nn.Module):
-    """
-    Mixture-of-Experts (MoE) module.
-
-    Attributes:
-        dim (int): Dimensionality of input features.
-        n_routed_experts (int): Total number of experts in the model.
-        n_local_experts (int): Number of experts handled locally in distributed systems.
-        n_activated_experts (int): Number of experts activated for each input.
-        gate (nn.Module): Gating mechanism to route inputs to experts.
-        experts (nn.ModuleList): List of expert modules.
-        shared_experts (nn.Module): Shared experts applied to all inputs.
-    """
-
-    def __init__(self, args, merge_gate_up: bool, op_impl: str, checkpoint_prefix: str):
-        """
-        Initializes the MoE module.
-
-        Args:
-            args (ModelArgs): Model arguments containing MoE parameters.
-        """
-        super().__init__()
-        self.args = args
-        self.op_impl = op_impl
-        self.merge_gate_up = merge_gate_up
-        self.dim = args.dim
-        self.fuse_shared_experts = get_global_args().infer.fuse_shared_experts
-
-        moe_world_size = 1
-        moe_rank = 0
-        assert (
-            args.n_routed_experts % moe_world_size == 0
-        ), f"Number of experts must be divisible by world size (world_size={moe_world_size})"
-        self.n_shared_experts = args.n_shared_experts
-        self.n_fused_shared_experts = (
-            args.n_shared_experts if self.fuse_shared_experts else 0
-        )
-        self.n_routed_experts = args.n_routed_experts
-        self.n_local_experts = args.n_routed_experts // moe_world_size
-        self.n_activated_experts = args.n_activated_experts
-        self.experts_start_idx = moe_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.gate = GateDeepSeekV3(args, op_impl)
-
-        # Routed experts + fused shared experts
-        if merge_gate_up:
-            self.gate_up_proj = GroupColumnParallelLinearDeepSeekV3(
-                self.experts_end_idx
-                - self.experts_start_idx
-                + self.n_fused_shared_experts,
-                args.dim,
-                args.moe_inter_dim * 2,
-                has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.get_default_dtype(),
-                gather_output=False,
-                scale_2_dim=2,
-            )
-        else:
-            self.gate_proj = GroupColumnParallelLinearDeepSeekV3(
-                self.experts_end_idx
-                - self.experts_start_idx
-                + self.n_fused_shared_experts,
-                args.dim,
-                args.moe_inter_dim,
-                has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.get_default_dtype(),
-                gather_output=False,
-            )
-            self.up_proj = GroupColumnParallelLinearDeepSeekV3(
-                self.experts_end_idx
-                - self.experts_start_idx
-                + self.n_fused_shared_experts,
-                args.dim,
-                args.moe_inter_dim,
-                has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.get_default_dtype(),
-                gather_output=False,
-            )
-        self.down_proj = GroupRowParallelLinearDeepSeekV3(
-            self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts,
-            args.moe_inter_dim,
-            args.dim,
-            has_bias=False,
-            dtype=parse_dtype(args.main_weight_dtype),
-            bias_dtype=torch.get_default_dtype(),
-            input_is_parallel=True,
-        )
-
+class MoeDeepSeekV3_params_resolver:
+    def __init__(
+        self,
+        args,
+        merge_gate_up: bool,
+        op_impl: str,
+        checkpoint_prefix: str,
+    ):
         # Non-fused shared experts
-        if not self.fuse_shared_experts:
-            self.shared_experts = MLPDeepSeekV3(
+        if not get_global_args().infer.fuse_shared_experts:
+            shared_experts = MLPDeepSeekV3(
                 args,
                 role="shared_experts",
                 merge_gate_up=merge_gate_up,
                 op_impl=op_impl,
                 checkpoint_prefix=checkpoint_prefix,
             )
-
-    def get_expert_weights_for_fp8_w8a8(self):
-        gate_up_proj_weight = self.gate_up_proj.weight
-        gate_up_proj_scale = self.gate_up_proj.scale
-        down_proj_weight = self.down_proj.weight
-        down_proj_scale = self.down_proj.scale
-        return (
-            gate_up_proj_weight,
-            gate_up_proj_scale,
-            down_proj_weight,
-            down_proj_scale,
-        )
-
-    def get_expert_weights_for_non_fp8(self):
-        gate_up_proj_weight = self.gate_up_proj.weight
-        gate_up_proj_scale = None
-        down_proj_weight = self.down_proj.weight
-        down_proj_scale = None
-        return (
-            gate_up_proj_weight,
-            gate_up_proj_scale,
-            down_proj_weight,
-            down_proj_scale,
-        )
-
-    def get_expert_weights_for_fp4(self):
-        gate_up_proj_weight = self.gate_up_proj.weight
-        gate_up_proj_weigth_scale = self.gate_up_proj.weight_scale
-        gate_up_proj_weight_scale2 = self.gate_up_proj.weight_scale_2
-        down_proj_weight = self.down_proj.weight
-        down_proj_weight_scale = self.down_proj.weight_scale
-        down_proj_weight_scale2 = self.down_proj.weight_scale_2
-        return (
-            gate_up_proj_weight,
-            gate_up_proj_weigth_scale,
-            gate_up_proj_weight_scale2,
-            down_proj_weight,
-            down_proj_weight_scale,
-            down_proj_weight_scale2,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the MoE module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
-        """
-
-        shape = x.size()
-        x = x.view(-1, self.dim)
-
-        weights, indices = self.gate(x)
-
-        if self.op_impl == "muxi_custom_kernel":
-            y = self._compute_muxi_fused_experts(x, weights, indices)
-        elif has_torch_npu:  # or use op_impl ?
-            y = self._compute_npu_fused_experts(x, weights, indices)
-        elif has_triton:
-            quant_method = (
-                None
-                if not hasattr(self.args, "quant_config")
-                else self.args.quant_config.type
-            )
-            if quant_method is None:
-                (
-                    gate_up_proj_weight,
-                    gate_up_proj_scale,
-                    down_proj_weight,
-                    down_proj_scale,
-                ) = self.get_expert_weights_for_non_fp8()
-                gate_up_proj_scale_2, down_proj_scale_2 = None, None
-                use_fp4_w4a8 = False
-                use_fp8_w8a8 = False
-                fused_soft_fp8 = False
-
-            elif (
-                parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
-                == 1
-                or is_nvidia()
-                or is_muxi()
-            ):
-                if (
-                    parse_dtype(
-                        get_global_args().infer.raise_lower_bit_float_to
-                    ).itemsize
-                    == 1
-                ):
-                    fused_soft_fp8 = False
-                else:
-                    fused_soft_fp8 = True
-
-                if quant_method == "blockfp4":
-                    (
-                        gate_up_proj_weight,
-                        gate_up_proj_scale,
-                        gate_up_proj_scale_2,
-                        down_proj_weight,
-                        down_proj_scale,
-                        down_proj_scale_2,
-                    ) = self.get_expert_weights_for_fp4()
-                    use_fp4_w4a8 = True
-                    use_fp8_w8a8 = False
-                elif quant_method == "blockfp8":
-                    (
-                        gate_up_proj_weight,
-                        gate_up_proj_scale,
-                        down_proj_weight,
-                        down_proj_scale,
-                    ) = self.get_expert_weights_for_fp8_w8a8()
-                    gate_up_proj_scale_2, down_proj_scale_2 = None, None
-                    use_fp4_w4a8 = False
-                    use_fp8_w8a8 = True
-                else:
-                    raise NotImplementedError(
-                        f"Unsupported quantization method {quant_method}"
-                    )
-
-            else:
-                logger.warning(
-                    f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
-                )
-                block_size = 128
-                gate_up_proj_weight = weight_dequant_soft_fp8_deepseek_v3(
-                    self.gate_up_proj.weight,
-                    self.gate_up_proj.scale,
-                    block_size,
-                )
-                gate_up_proj_scale = None
-                gate_up_proj_scale_2 = None
-                down_proj_weight = weight_dequant_soft_fp8_deepseek_v3(
-                    self.down_proj.weight,
-                    self.down_proj.scale,
-                    block_size,
-                )
-                down_proj_scale = None
-                down_proj_scale_2 = None
-                use_fp4_w4a8 = False
-                use_fp8_w8a8 = False
-                fused_soft_fp8 = False
-
-            if not self.fuse_shared_experts:
-                y1 = self.shared_experts(x)
-
-                y = fused_experts(
-                    x,
-                    gate_up_proj_weight,
-                    down_proj_weight,
-                    topk_weights=weights,
-                    topk_ids=indices,
-                    use_fp8_w8a8=use_fp8_w8a8,
-                    use_fp4_w4a8=use_fp4_w4a8,
-                    inplace=True,
-                    global_num_experts=self.n_routed_experts + self.n_shared_experts,
-                    expert_map=None,  # use when ep > 1
-                    w1_scale=gate_up_proj_scale,
-                    w2_scale=down_proj_scale,
-                    w1w3_scale_2=gate_up_proj_scale_2,
-                    w2_scale_2=down_proj_scale_2,
-                    block_shape=[128, 128],
-                    soft_fp8=fused_soft_fp8,
-                )
-
-                y += y1
-            else:
-
-                indice_shape = indices.shape
-                new_indices = torch.empty(
-                    (indice_shape[0], indice_shape[1] + 1),
-                    dtype=indices.dtype,
-                    device=indices.device,
-                )
-
-                new_weights = torch.empty(
-                    (weights.shape[0], weights.shape[1] + 1),
-                    dtype=weights.dtype,
-                    device=weights.device,
-                )
-
-                chitu_backend.cuda_add_shared_experts(
-                    new_weights,
-                    new_indices,
-                    weights,
-                    indices,
-                    self.n_routed_experts,
-                    self.n_shared_experts,
-                )
-                del weights, indices
-                y = fused_experts(
-                    x,
-                    gate_up_proj_weight,
-                    down_proj_weight,
-                    topk_weights=new_weights,
-                    topk_ids=new_indices,
-                    use_fp8_w8a8=use_fp8_w8a8,
-                    use_fp4_w4a8=use_fp4_w4a8,
-                    inplace=True,
-                    global_num_experts=self.n_routed_experts + self.n_shared_experts,
-                    expert_map=None,  # use when ep > 1
-                    w1_scale=gate_up_proj_scale,
-                    w2_scale=down_proj_scale,
-                    w1w3_scale_2=gate_up_proj_scale_2,
-                    w2_scale_2=down_proj_scale_2,
-                    block_shape=[128, 128],
-                    soft_fp8=fused_soft_fp8,
-                )
-
-            torch.distributed.all_reduce(y, group=get_tp_group())
         else:
-            y = torch.zeros_like(x)
-            counts = torch.bincount(
-                indices.flatten(), minlength=self.n_routed_experts
-            ).tolist()
-
-            xs = []
-            for i in range(self.experts_start_idx, self.experts_end_idx):
-                this_x = None
-                if counts[i]:
-                    idx, top = torch.where(indices == i)
-                    this_x = x[idx]
-                xs.append(this_x)
-            xs += [x] * self.n_shared_experts
-
-            if self.merge_gate_up:
-                gate_up_proj_outs = self.gate_up_proj(xs)
-                act = [
-                    (
-                        silu_and_mul(gate_up_proj_out)
-                        if gate_up_proj_out is not None
-                        else None
-                    )
-                    for gate_up_proj_out in gate_up_proj_outs
-                ]
-            else:
-                gate_proj_outs = self.gate_proj(xs)
-                up_proj_outs = self.up_proj(xs)
-
-                act = [
-                    (
-                        F.silu(gate_proj_out) * up_proj_out
-                        if gate_proj_out is not None
-                        else None
-                    )
-                    for gate_proj_out, up_proj_out in zip(gate_proj_outs, up_proj_outs)
-                ]
-
-            down_proj_outs = self.down_proj(act)
-
-            for i in range(self.experts_start_idx, self.experts_end_idx):
-                if counts[i]:
-                    idx, top = torch.where(indices == i)
-                    y[idx] += (
-                        down_proj_outs[i - self.experts_start_idx]
-                        * weights[idx, top, None]
-                    )
-            for i in range(
-                self.experts_end_idx - self.experts_start_idx,
-                self.experts_end_idx - self.experts_start_idx + self.n_shared_experts,
-            ):
-                y += down_proj_outs[i]
-        return y.view(shape)
-
-    def _compute_muxi_fused_experts(self, x, weights, indices):
-        if self.fuse_shared_experts:
-            raise NotImplementedError(
-                "Fused shared experts is not supported for muxi_layout_kernels"
-            )
-        if not self.merge_gate_up:
-            raise NotImplementedError(
-                "muxi_layout_kernels for fused MoE requires merge_gate_up=True"
-            )
-
-        y = self.shared_experts(x)
-        y1 = muxi_fused_experts(
-            hidden_states=x,
-            gate_proj=self.gate_up_proj.weight,
-            down_proj=self.down_proj.weight,
-            topk_weights=weights,
-            topk_ids=indices,
-            inplace=True,
-            gate_proj_scale=self.gate_up_proj.scale,
-            down_proj_scale=self.down_proj.scale,
-            block_shape=[128, 128],
-            soft_fp8=True if self.gate_up_proj.scale is not None else False,
+            shared_experts = None
+        super().__init__(
+            dim=args.dim,
+            moe_inter_dim=args.moe_inter_dim,
+            n_routed_experts=args.n_routed_experts,
+            n_shared_experts=args.n_shared_experts,
+            n_activated_experts=args.n_activated_experts,
+            moe_world_size=1,
+            moe_rank=0,
+            do_gather_output=False,
+            merge_gate_up=merge_gate_up,
+            dtype=args.main_weight_dtype,
+            op_impl=op_impl,
+            gate=GateDeepSeekV3(args, op_impl),
+            fuse_shared_experts=get_global_args().infer.fuse_shared_experts,
+            shared_experts=shared_experts,
+            checkpoint_prefix=checkpoint_prefix,
         )
-        y += y1
-        torch.distributed.all_reduce(y, group=get_tp_group())
-        return y
 
-    def _compute_npu_fused_experts(self, x, weights, indices):
-        y = self.shared_experts(x)
-        y1 = fused_experts_npu(
-            hidden_states=x,
-            w1=self.w1w3.weight,
-            w2=self.w2.weight,
-            topk_weights=weights,
-            topk_ids=indices,
+
+def MoEDeepSeekV3(
+    args,
+    merge_gate_up: bool,
+    op_impl: str,
+    checkpoint_prefix: str,
+    base_moe_class: Optional[type] = None,
+    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+):
+    if base_moe_class is None:
+        base_moe_class = MoeBlockRegistry.get_quantized_MoeBlock_class_from_global_args(
+            quant_kwargs=quant_kwargs,
+            checkpoint_prefix=f"{checkpoint_prefix}.moe",
         )
-        y += y1
-        torch.distributed.all_reduce(y, group=get_tp_group())
-        return y
+
+    class MoeBlockImpl(MoeDeepSeekV3_params_resolver, base_moe_class):
+        # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
+        # of the final class, so we can append a class to the base class, to make it act like a
+        # further base class of the original base class.
+        # See https://docs.python.org/3/tutorial/classes.html#multiple-inheritance
+
+        pass
+
+    return MoeBlockImpl(
+        args,
+        merge_gate_up=merge_gate_up,
+        op_impl=op_impl,
+        checkpoint_prefix=f"{checkpoint_prefix}.moe",
+    )
 
 
 class MoEDeepSeekV3CPU(nn.Module):
@@ -2374,6 +1655,12 @@ class TransformerDeepSeekV3(Transformer):
                 state_dict = self._process_state_dict_for_merging_gate_up(state_dict)
 
             state_dict = self._process_state_dict_for_merging_experts(state_dict)
+            if not self.cpu_infer:
+                state_dict = super().process_state_dict_for_renaming_linear_layer(
+                    state_dict,
+                    self.merge_qkv_gate_up,
+                    get_global_args().models.n_dense_layers,
+                )
 
         if self.op_impl == "muxi_custom_kernel":
             rpl_names = self._get_tensor_row_parallel_layer_names()
