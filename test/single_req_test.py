@@ -181,6 +181,7 @@ def main(args: DictConfig):
     logger.info(f"Run with args: {args}")
 
     chitu_init(args, logging_level=logging.INFO)
+    torch.distributed.barrier()
     timers = get_timers()
     logger.debug(f"finish init")
     if args.infer.pp_size > 1 or args.infer.tp_size > 1:

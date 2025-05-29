@@ -1,0 +1,8 @@
+type: blockfp4
+quant: 
+- model: "deepseek"
+  rules:
+    - regex : '\.mlp\.'
+- model: '.'
+  rules:
+    - regex : 'layers\.'

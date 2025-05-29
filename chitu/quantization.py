@@ -14,7 +14,7 @@ from chitu.ops import (
 )
 from chitu.global_vars import get_global_args
 from chitu.device_type import get_device_name, is_muxi, is_nvidia
-
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,6 @@ class QuantizationRegistry:
         cls,
         method: Optional[str],
         *,
-        disabled_methods: Optional[Set[str]] = None,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
     ) -> Optional[Type[QuantizedLinearBase]]:
         """
@@ -61,18 +60,11 @@ class QuantizationRegistry:
 
         Arguments:
             method: Quantization method name, or None for no quantization
-            disabled_methods: Set of disabled methods. If `method` is in this set,
-                this function will return unquantized NormalLinear. This is useful
-                for partial quantization of selected layers.
             quant_kwargs: Nested mapping for additional arguments for specific
                 quantization methods. E.g., `{"quant_method_x": {"arg1": value1, ...}}`
-
         Returns:
             The quantized linear class, or None if method is None or not found
         """
-
-        if disabled_methods is not None and method in disabled_methods:
-            method = None
 
         impl = cls._registry.get(method)
         if impl is None:
@@ -98,13 +90,34 @@ class QuantizationRegistry:
     def get_quantized_linear_class_from_global_args(
         cls,
         *,
-        disabled_methods: Optional[Set[str]] = None,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+        checkpoint_prefix="",
     ) -> Optional[Type[QuantizedLinearBase]]:
         args = get_global_args()
-        quant_method = None if not hasattr(args.models, "quant") else args.models.quant
+        quant_cfg = getattr(args.models, "quant_config", None)
+        if quant_cfg is None:
+            return cls.get_quantized_linear_class(None, quant_kwargs=quant_kwargs)
+
+        rules = getattr(quant_cfg, "rules", [])
+        for rule in rules:
+            pattern = rule.get("regex")
+            if not pattern or not re.search(pattern, checkpoint_prefix):
+                continue
+
+            method = getattr(rule, "type", None)
+            if not method:
+                method = quant_cfg.type
+            rule_kwargs = rule.get("kwargs", {})
+            method_kwargs = quant_kwargs.get(method, {})
+            merged_kwargs = {**rule_kwargs, **method_kwargs}
+            return cls.get_quantized_linear_class(
+                method,
+                quant_kwargs={method: merged_kwargs},
+            )
+
         return cls.get_quantized_linear_class(
-            quant_method, disabled_methods=disabled_methods, quant_kwargs=quant_kwargs
+            None,
+            quant_kwargs=quant_kwargs,
         )
 
     @classmethod
@@ -836,6 +849,7 @@ class Blockfp8Linear(QuantizedLinearBase):
         dtype=torch.float8_e4m3fn,
         bias_dtype=None,
         block_size=128,
+        **kwarg,
     ):
         super().__init__()
 

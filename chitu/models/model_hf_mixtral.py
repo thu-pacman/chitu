@@ -28,6 +28,7 @@ class SparseMoeBlockHFMixtral(nn.Module):
         num_experts: int,
         top_k: int,
         op_impl: str,
+        checkpoint_prefix: str,
         merge_gate_up: bool = True,
     ):
         super().__init__()
@@ -36,7 +37,11 @@ class SparseMoeBlockHFMixtral(nn.Module):
 
         # num_experts is very low, so don't use ColumnParallelLinear
         self.gate = RowParallelLinear(
-            dim, num_experts, has_bias=False, input_is_parallel=False
+            dim,
+            num_experts,
+            has_bias=False,
+            input_is_parallel=False,
+            checkpoint_prefix=f"{checkpoint_prefix}.gate",
         )
 
         self.experts = nn.ModuleList(
@@ -107,6 +112,7 @@ class TransformerBlockHFMixtral(TransformerBlockHFLlama):
         rotary_type="hf-llama",
         mlp_type=SparseMoeBlockHFMixtral,
         merge_qkv_gate_up=True,
+        checkpoint_prefix="",
     ):
         super().__init__(
             layer_id,
@@ -121,6 +127,7 @@ class TransformerBlockHFMixtral(TransformerBlockHFLlama):
                 top_k=args.num_experts_per_tok,
             ),
             merge_qkv_gate_up=merge_qkv_gate_up,
+            checkpoint_prefix=checkpoint_prefix,
         )
 
 

@@ -647,3 +647,29 @@ def silu_and_mul(x, impl="auto"):
         return invoke_silu_and_mul(x)
     else:
         return silu_and_mul_torch(x)
+
+
+def topk_softmax(scores, topk, renormalize, indices_type: Optional[torch.dtype] = None):
+    M, _ = scores.shape
+
+    topk_weights = torch.empty(M, topk, dtype=torch.float32, device=scores.device)
+    topk_ids = torch.empty(
+        M,
+        topk,
+        dtype=torch.int32 if indices_type is None else indices_type,
+        device=scores.device,
+    )
+    token_expert_indices = torch.empty(M, topk, dtype=torch.int32, device=scores.device)
+
+    scores_float = scores.float()  # TODO(woosuk): Optimize this.
+
+    chitu_backend.cuda_topk_softmax(
+        topk_weights,
+        topk_ids,
+        token_expert_indices,
+        scores_float,
+    )
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    return topk_weights, topk_ids, token_expert_indices

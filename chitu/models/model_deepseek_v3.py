@@ -1,7 +1,7 @@
 import math
 import functools
 from logging import getLogger
-from typing import Any, List, Mapping, Optional, Set, Tuple
+from typing import Dict, Mapping, Tuple, Optional, Type, Set, List, Any
 
 import torch
 import torch.distributed as dist
@@ -19,7 +19,15 @@ from chitu.device_type import (
     is_nvidia,
 )
 from chitu.global_vars import get_global_args
-from chitu.models.model import Attention, RMSNorm, Transformer, TransformerBlock
+from chitu.models.model import (
+    Attention,
+    RMSNorm,
+    Transformer,
+    TransformerBlock,
+    MoeGate,
+    MoeBlock,
+    MoeBlockRegistry,
+)
 from chitu.ops import (
     apply_rotary_pos_emb,
     weight_dequant_deepseek_v3,
@@ -150,330 +158,6 @@ class ParallelAbsorbGemm(torch.nn.Module):
         return y
 
 
-class GroupColumnParallelLinearDeepSeekV3(torch.nn.Module):
-    def __init__(
-        self,
-        group_size: int,
-        in_features: int,
-        out_features: int,
-        has_bias: bool = True,
-        gather_output: bool = True,
-        dtype=None,
-        bias_dtype=None,
-        scale_2_dim: int = 1,
-    ):
-        super().__init__()
-
-        dtype = dtype or torch.get_default_dtype()
-
-        # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
-        # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
-        args = get_global_args()
-        if (
-            dtype.itemsize == 1
-            and parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1
-        ):
-            dtype = torch.uint8
-
-        self.quant_method = (
-            None if not hasattr(args.models, "quant") else args.models.quant
-        )
-
-        self.tp_group = get_tp_group()
-        self.tp_size = get_tp_size()
-        self.group_size = group_size
-        self.in_features = in_features
-        self.out_features = out_features
-        self.gather_output = gather_output
-
-        assert (
-            out_features % self.tp_size == 0
-        ), "out_features must be divisible by tp_size"
-        local_out_features = local_out_features = out_features // self.tp_size
-
-        self.weight = torch.nn.Parameter(
-            torch.empty(
-                group_size,
-                local_out_features,
-                in_features // 2 if self.quant_method == "blockfp4" else in_features,
-                dtype=dtype,
-            ),
-            requires_grad=False,
-        )
-        if has_bias:
-            self.bias = torch.nn.Parameter(
-                torch.empty(group_size, local_out_features, dtype=bias_dtype or dtype),
-                requires_grad=False,
-            )
-        else:
-            self.bias = None
-
-        if self.quant_method is None:
-            self.scale = None
-        elif self.quant_method == "blockfp4":
-            quant_scale_stride = 16
-            scale_out_features = local_out_features
-            scale_in_features = ceil_div(in_features, quant_scale_stride)
-            self.weight_scale = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    scale_out_features,
-                    scale_in_features,
-                    dtype=torch.uint8,
-                ),
-                requires_grad=False,
-            )
-            self.input_scale = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    scale_2_dim,
-                    1,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-            self.weight_scale_2 = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    scale_2_dim,
-                    1,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-        elif self.quant_method == "blockfp8":
-            block_size = 128
-            scale_out_features = (local_out_features + block_size - 1) // block_size
-            scale_in_features = (in_features + block_size - 1) // block_size
-            self.scale = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    scale_out_features,
-                    scale_in_features,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-        else:
-            raise NotImplementedError(
-                f"Unsupported quantization method {self.quant_method}"
-            )
-
-    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
-        assert len(xs) == self.group_size
-        ys = []
-        for i in range(self.group_size):
-            y = None
-            if xs[i] is not None:
-                x = xs[i]
-                if self.quant_method is None:
-                    y = torch.nn.functional.linear(x, self.weight[i], self.bias[i])
-                elif self.quant_method == "blockfp4":
-                    y = linear_block_fp4(
-                        x=x,
-                        weight=self.weight[i],
-                        weight_scale=self.weight_scale[i],
-                        weight_scale_2=self.weight_scale_2[i],
-                        bias=self.bias[i],
-                        act_block_size=128,
-                    )
-                elif self.quant_method == "blockfp8":
-                    y = linear_block_fp8(
-                        x=x,
-                        weight=self.weight[i],
-                        weight_scale=self.scale[i],
-                        bias=self.bias[i],
-                        block_size=128,
-                    )
-                else:
-                    raise NotImplementedError(
-                        f"Unsupported quantization method {self.quant_method}"
-                    )
-                if self.gather_output and self.tp_size > 1:
-                    y_transposed = y.permute(-1, *range(y.dim() - 1)).contiguous()
-                    shape = list(y_transposed.shape)
-                    shape[0] *= self.tp_size
-                    y_gathered = y.new_empty(shape)
-                    torch.distributed.all_gather_into_tensor(
-                        y_gathered, y_transposed, group=self.tp_group
-                    )
-                    y = y_gathered.permute(*range(1, y.dim()), 0)
-            ys.append(y)
-        return ys
-
-
-class GroupRowParallelLinearDeepSeekV3(torch.nn.Module):
-    def __init__(
-        self,
-        group_size: int,
-        in_features: int,
-        out_features: int,
-        has_bias: bool = True,
-        input_is_parallel: bool = False,
-        dtype=None,
-        bias_dtype=None,
-    ):
-        super().__init__()
-
-        dtype = dtype or torch.get_default_dtype()
-
-        # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
-        # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
-        args = get_global_args()
-        if (
-            dtype.itemsize == 1
-            and parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1
-        ):
-            dtype = torch.uint8
-
-        self.quant_method = (
-            None if not hasattr(args.models, "quant") else args.models.quant
-        )
-
-        self.tp_group = get_tp_group()
-        self.tp_size = get_tp_size()
-        self.rank = get_tp_rank()
-        self.group_size = group_size
-        self.in_features = in_features
-        self.out_features = out_features
-
-        assert (
-            in_features % self.tp_size == 0
-        ), "in_features must be divisible by tp_size"
-        local_in_features = in_features // self.tp_size
-
-        self.input_is_parallel = input_is_parallel
-
-        self.weight = torch.nn.Parameter(
-            torch.empty(
-                group_size,
-                out_features,
-                (
-                    local_in_features // 2
-                    if self.quant_method == "blockfp4"
-                    else local_in_features
-                ),
-                dtype=dtype,
-            ),
-            requires_grad=False,
-        )
-        if has_bias:
-            self.bias = torch.nn.Parameter(
-                torch.empty(group_size, out_features, dtype=bias_dtype or dtype),
-                requires_grad=False,
-            )
-        else:
-            self.bias = None
-
-        if self.quant_method is None:
-            self.scale = None
-        elif self.quant_method == "blockfp4":
-            quant_scale_stride = 16
-            scale_out_features = out_features
-            scale_in_features = ceil_div(local_in_features, quant_scale_stride)
-            self.weight_scale = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    scale_out_features,
-                    scale_in_features,
-                    dtype=torch.uint8,
-                ),
-                requires_grad=False,
-            )
-            self.input_scale = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    1,
-                    1,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-            self.weight_scale_2 = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    1,
-                    1,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-        elif self.quant_method == "blockfp8":
-            block_size = 128
-            scale_out_features = (out_features + block_size - 1) // block_size
-            scale_in_features = (local_in_features + block_size - 1) // block_size
-            self.scale = nn.Parameter(
-                torch.empty(
-                    group_size,
-                    scale_out_features,
-                    scale_in_features,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-        else:
-            raise NotImplementedError(
-                f"Unsupported quantization method {self.quant_method}"
-            )
-
-    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
-        assert len(xs) == self.group_size
-        ys = []
-        for i in range(self.group_size):
-            y = None
-            if xs[i] is not None:
-                x = xs[i]
-                if not self.input_is_parallel and self.tp_size > 1:
-                    shape = list(x.shape)
-                    this_rank_dim = shape[-1] // self.tp_size
-                    shape[-1] = self.tp_size
-                    shape.append(this_rank_dim)
-                    x = x.view(shape).select(-2, self.rank)
-                if self.quant_method is None:
-                    y = torch.nn.functional.linear(
-                        x,
-                        self.weight[i],
-                        (
-                            self.bias[i]
-                            if self.rank == 0 and self.bias is not None
-                            else None
-                        ),
-                    )
-                elif self.quant_method == "blockfp4":
-                    y = linear_block_fp4(
-                        x=x,
-                        weight=self.weight[i],
-                        weight_scale=self.weight_scale[i],
-                        weight_scale_2=self.weight_scale_2[i],
-                        bias=(
-                            self.bias[i]
-                            if self.rank == 0 and self.bias is not None
-                            else None
-                        ),
-                        act_block_size=128,
-                    )
-                elif self.quant_method == "blockfp8":
-                    y = linear_block_fp8(
-                        x=x,
-                        weight=self.weight[i],
-                        weight_scale=self.scale[i],
-                        bias=(
-                            self.bias[i]
-                            if self.rank == 0 and self.bias is not None
-                            else None
-                        ),
-                        block_size=128,
-                    )
-                else:
-                    raise NotImplementedError(
-                        f"Unsupported quantization method {self.quant_method}"
-                    )
-                if self.tp_size > 1:
-                    torch.distributed.all_reduce(y, group=self.tp_group)
-            ys.append(y)
-        return ys
-
-
 class AttentionDeepSeekV3(Attention):
     def __init__(
         self,
@@ -484,6 +168,7 @@ class AttentionDeepSeekV3(Attention):
         op_impl: str,
         mla_absorb,
         merge_qkv,
+        checkpoint_prefix: str,
     ):
         super().__init__(layer_id, cache, attn_backend)
         self.op_impl = op_impl
@@ -513,39 +198,39 @@ class AttentionDeepSeekV3(Attention):
                 has_bias=False,
                 dtype=(
                     torch.bfloat16
-                    if args.quant == "blockfp4"
+                    if args.quant_config.type == "blockfp4"
                     else parse_dtype(args.main_weight_dtype)
                 ),
                 bias_dtype=torch.get_default_dtype(),
-                disabled_methods={"blockfp4"},
+                checkpoint_prefix=f"{checkpoint_prefix}.wqkv_a",
             )  # FIXME: Run this layer with muxi_layout_kernels
         else:
-            self.wq_a = LocalLinear(
+            self.q_a_proj = LocalLinear(
                 self.dim,
                 self.q_lora_rank,
                 has_bias=False,
                 dtype=(
                     torch.bfloat16
-                    if args.quant == "blockfp4"
+                    if args.quant_config.type == "blockfp4"
                     else parse_dtype(args.main_weight_dtype)
                 ),
                 bias_dtype=torch.get_default_dtype(),
-                disabled_methods={"blockfp4"},
+                checkpoint_prefix=f"{checkpoint_prefix}.q_a_proj",
             )  # FIXME: Run this layer with muxi_layout_kernels
-            self.wkv_a = LocalLinear(
+            self.kv_a_proj_with_mqa = LocalLinear(
                 self.dim,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 has_bias=False,
                 dtype=(
                     torch.bfloat16
-                    if args.quant == "blockfp4"
+                    if args.quant_config.type == "blockfp4"
                     else parse_dtype(args.main_weight_dtype)
                 ),
                 bias_dtype=torch.get_default_dtype(),
-                disabled_methods={"blockfp4"},
+                checkpoint_prefix=f"{checkpoint_prefix}.kv_a_proj_with_mqa",
             )  # FIXME: Run this layer with muxi_layout_kernels
-        self.q_norm = RMSNorm(self.q_lora_rank)
-        self.wq_b = ColumnParallelLinear(
+        self.q_a_layernorm = RMSNorm(self.q_lora_rank)
+        self.q_b_proj = ColumnParallelLinear(
             self.q_lora_rank,
             (
                 self.n_heads * self.qk_head_dim
@@ -555,36 +240,42 @@ class AttentionDeepSeekV3(Attention):
             has_bias=False,
             dtype=(
                 torch.bfloat16
-                if args.quant == "blockfp4"
+                if args.quant_config.type == "blockfp4"
                 else parse_dtype(args.main_weight_dtype)
             ),
             bias_dtype=torch.get_default_dtype(),
             gather_output=False,
             base_linear_class=get_linear_layout_contig_x_contig_y(
-                op_impl, disabled_methods={"blockfp4"}
+                op_impl,
+                checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
             ),
+            checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",
         )
-        self.kv_norm = RMSNorm(self.kv_lora_rank)
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank)
 
         if self.mla_absorb == "none":
-            self.wkv_b = ColumnParallelLinear(
+            self.kv_b_proj = ColumnParallelLinear(
                 self.kv_lora_rank,
                 self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
                 has_bias=False,
                 dtype=(
                     torch.bfloat16
-                    if args.quant == "blockfp4"
+                    if args.quant_config.type == "blockfp4"
                     else parse_dtype(args.main_weight_dtype)
                 ),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_x_contig_y(
-                    op_impl, disabled_methods={"blockfp4"}
+                    op_impl,
+                    checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
                 ),
+                checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
             )
         elif self.mla_absorb == "absorb-without-precomp":
-            quant_method = None if not hasattr(args, "quant") else args.quant
-            self.wkv_b_absorb_1 = ParallelAbsorbGemm(
+            quant_method = (
+                None if not hasattr(args, "quant_config") else args.quant_config.type
+            )
+            self.kv_b_proj_absorb_1 = ParallelAbsorbGemm(
                 self.n_heads,
                 self.qk_nope_head_dim,
                 self.kv_lora_rank,
@@ -595,7 +286,7 @@ class AttentionDeepSeekV3(Attention):
                 ),
                 block_size=block_size,
             )
-            self.wkv_b_absorb_2 = ParallelAbsorbGemm(
+            self.kv_b_proj_absorb_2 = ParallelAbsorbGemm(
                 self.n_heads,
                 self.kv_lora_rank,
                 self.v_head_dim,
@@ -607,7 +298,7 @@ class AttentionDeepSeekV3(Attention):
                 block_size=block_size,
             )
 
-        self.wo = RowParallelLinear(
+        self.o_proj = RowParallelLinear(
             (
                 self.n_heads * self.v_head_dim
                 if self.mla_absorb != "absorb"
@@ -617,14 +308,16 @@ class AttentionDeepSeekV3(Attention):
             has_bias=False,
             dtype=(
                 torch.bfloat16
-                if args.quant == "blockfp4"
+                if args.quant_config.type == "blockfp4"
                 else parse_dtype(args.main_weight_dtype)
             ),
             bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
             base_linear_class=get_linear_layout_contig_x_contig_y(
-                op_impl, disabled_methods={"blockfp4"}
+                op_impl,
+                checkpoint_prefix=f"{checkpoint_prefix}.o_proj",
             ),
+            checkpoint_prefix=f"{checkpoint_prefix}.o_proj",
         )
         self.softmax_scale = compute_softmax_scale_deepseek_v3(args)
 
@@ -639,9 +332,9 @@ class AttentionDeepSeekV3(Attention):
                 dim=-1,
             )
         else:
-            q_a = self.wq_a(x)
-            kv = self.wkv_a(x)
-        q = self.wq_b(self.q_norm(q_a, compute_dtype=q_a.dtype))
+            q_a = self.q_a_proj(x)
+            kv = self.kv_a_proj_with_mqa(x)
+        q = self.q_b_proj(self.q_a_layernorm(q_a, compute_dtype=q_a.dtype))
 
         q = q.view(bs_seq, self.n_local_heads, -1)
 
@@ -669,7 +362,7 @@ class AttentionDeepSeekV3(Attention):
         )
 
         if self.mla_absorb == "none":
-            kv = self.wkv_b(self.kv_norm(kv_lora))
+            kv = self.kv_b_proj(self.kv_a_layernorm(kv_lora))
 
             kv = kv.view(
                 bs_seq, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim
@@ -688,7 +381,7 @@ class AttentionDeepSeekV3(Attention):
             )
             return q, k, v
         elif self.mla_absorb == "absorb-without-precomp":
-            q_nope = self.wkv_b_absorb_1(q_nope)
+            q_nope = self.kv_b_proj_absorb_1(q_nope)
             return q_nope, q_pe, kv
         elif self.mla_absorb == "absorb":
             return q_nope, q_pe, kv
@@ -730,7 +423,7 @@ class AttentionDeepSeekV3(Attention):
             pe_cache = kv[:, -self.qk_rope_head_dim :]
 
             # In-place update to `kv_cache`, which is part of `kv`
-            self.kv_norm(kv_cache, compute_dtype=kv.dtype, out=kv_cache)
+            self.kv_a_layernorm(kv_cache, compute_dtype=kv.dtype, out=kv_cache)
 
             self.cache.finalize_cache_bylayer_prefill(
                 kv,
@@ -754,7 +447,7 @@ class AttentionDeepSeekV3(Attention):
 
             x = x.view(bs_seq, x.shape[-2], x.shape[-1])
             if self.mla_absorb == "absorb-without-precomp":
-                x = self.wkv_b_absorb_2(x)
+                x = self.kv_b_proj_absorb_2(x)
 
         else:
             raise NotImplementedError(
@@ -801,7 +494,7 @@ class AttentionDeepSeekV3(Attention):
             this_kv = kv[..., : self.kv_lora_rank]
 
             # In-place update to `this_kv`, which is part of `kv`
-            self.kv_norm(this_kv, compute_dtype=kv.dtype, out=this_kv)
+            self.kv_a_layernorm(this_kv, compute_dtype=kv.dtype, out=this_kv)
 
             x = self.attn_backend.mla_attn_with_kvcache(
                 q_nope,
@@ -815,7 +508,7 @@ class AttentionDeepSeekV3(Attention):
             )
 
             if self.mla_absorb == "absorb-without-precomp":
-                x = self.wkv_b_absorb_2(x)
+                x = self.kv_b_proj_absorb_2(x)
 
         else:
             raise NotImplementedError(
@@ -844,7 +537,7 @@ class AttentionDeepSeekV3(Attention):
         this_kv = kv[..., : self.kv_lora_rank]
 
         # In-place update to `this_kv`, which is part of `kv`
-        self.kv_norm(this_kv, compute_dtype=kv.dtype, out=this_kv)
+        self.kv_a_layernorm(this_kv, compute_dtype=kv.dtype, out=this_kv)
 
         x = self.attn_backend.mla_attn_with_kvcache(
             q_nope,
@@ -857,12 +550,12 @@ class AttentionDeepSeekV3(Attention):
             softmax_scale=self.softmax_scale,
         )
         if self.mla_absorb == "absorb-without-precomp":
-            x = self.wkv_b_absorb_2(x)
+            x = self.kv_b_proj_absorb_2(x)
         x = self._run_output_linear(x)
         return x
 
     def _run_output_linear(self, x):
-        return self.wo(x.flatten(-2))
+        return self.o_proj(x.flatten(-2))
 
 
 class MLPDeepSeekV3(nn.Module):
@@ -870,9 +563,9 @@ class MLPDeepSeekV3(nn.Module):
     Multi-Layer Perceptron (MLP) used as a feed-forward layer.
 
     Attributes:
-        w1 (nn.Module): Linear layer for input-to-hidden transformation.
-        w2 (nn.Module): Linear layer for hidden-to-output transformation.
-        w3 (nn.Module): Additional linear layer for feature transformation.
+        gate_proj (nn.Module): Linear layer for input-to-hidden transformation.
+        down_proj (nn.Module): Linear layer for hidden-to-output transformation.
+        up_proj (nn.Module): Additional linear layer for feature transformation.
     """
 
     def __init__(
@@ -881,6 +574,7 @@ class MLPDeepSeekV3(nn.Module):
         role: str,  # "standalone" or "shared_experts"
         merge_gate_up: bool,
         op_impl: str,
+        checkpoint_prefix: str,
     ):
         super().__init__()
         self.merge_gate_up = merge_gate_up
@@ -896,7 +590,7 @@ class MLPDeepSeekV3(nn.Module):
             )
 
         if merge_gate_up:
-            self.w1w3 = ColumnParallelLinear(
+            self.gate_up_proj = ColumnParallelLinear(
                 args.dim,
                 inter_dim * 2,
                 has_bias=False,
@@ -910,28 +604,38 @@ class MLPDeepSeekV3(nn.Module):
                             "block_shape_2": (args.dim, inter_dim // get_tp_size())
                         }
                     },
+                    checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
                 ),
+                checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
             )
         else:
-            self.w1 = ColumnParallelLinear(
+            self.gate_proj = ColumnParallelLinear(
                 args.dim,
                 inter_dim,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
-                base_linear_class=get_linear_layout_contig_x_contig_y(op_impl),
+                base_linear_class=get_linear_layout_contig_x_contig_y(
+                    op_impl,
+                    checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
+                ),
+                checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
             )
-            self.w3 = ColumnParallelLinear(
+            self.up_proj = ColumnParallelLinear(
                 args.dim,
                 inter_dim,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
-                base_linear_class=get_linear_layout_contig_x_contig_y(op_impl),
+                base_linear_class=get_linear_layout_contig_x_contig_y(
+                    op_impl,
+                    checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
+                ),
+                checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
             )
-        self.w2 = RowParallelLinear(
+        self.down_proj = RowParallelLinear(
             inter_dim,
             args.dim,
             has_bias=False,
@@ -939,7 +643,11 @@ class MLPDeepSeekV3(nn.Module):
             bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
             reduce_output=(role == "standalone"),
-            base_linear_class=get_linear_layout_contig_x_contig_y(op_impl),
+            base_linear_class=get_linear_layout_contig_x_contig_y(
+                op_impl,
+                checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
+            ),
+            checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -953,15 +661,15 @@ class MLPDeepSeekV3(nn.Module):
             torch.Tensor: Output tensor after MLP computation.
         """
         if self.merge_gate_up:
-            w1w3_out = self.w1w3(x)
-            return self.w2(silu_and_mul(w1w3_out))
+            gate_up_proj_out = self.gate_up_proj(x)
+            return self.down_proj(silu_and_mul(gate_up_proj_out))
         else:
-            w1_out = self.w1(x)
-            w3_out = self.w3(x)
-            return self.w2(F.silu(w1_out) * w3_out)
+            gate_proj_out = self.gate_proj(x)
+            up_proj_out = self.up_proj(x)
+            return self.down_proj(F.silu(gate_proj_out) * up_proj_out)
 
 
-class GateDeepSeekV3(nn.Module):
+class GateDeepSeekV3(MoeGate):
     """
     Gating mechanism for routing inputs in a mixture-of-experts (MoE) model.
 
@@ -983,455 +691,90 @@ class GateDeepSeekV3(nn.Module):
         Args:
             args (ModelArgs): Model arguments containing gating parameters.
         """
-        super().__init__()
-        self.op_impl = op_impl
-        self.dim = args.dim
-        self.topk = args.n_activated_experts
-        self.n_groups = args.n_expert_groups
-        self.topk_groups = args.n_limited_groups
-        self.score_func = args.score_func
-        self.route_scale = args.route_scale
-        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
-        self.bias = (
-            nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32))
-            if self.dim == 7168
-            else None
+        super().__init__(
+            op_impl=op_impl,
+            dim=args.dim,
+            topk=args.n_activated_experts,
+            n_groups=args.n_expert_groups,
+            topk_groups=args.n_limited_groups,
+            score_func=args.score_func,
+            route_scale=args.route_scale,
+            n_experts=args.n_routed_experts,
+            bias=(
+                nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32))
+                if args.dim == 7168
+                else None
+            ),
+            norm_prob=False,
         )
 
-    def is_fused_sigmoid_gate(self):
-        return self.score_func == "sigmoid" and self.n_groups > 1
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass for the gating mechanism.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
-        """
-        scores = F.linear(x, self.weight)
-        if self.op_impl == "muxi_custom_kernel":
-            weights, indices = grouped_topk(
-                x,
-                scores,
-                self.topk,
-                renormalize=self.score_func == "sigmoid",
-                num_expert_group=self.n_groups,
-                topk_group=self.topk_groups,
-                scoring_func=self.score_func,
-                e_score_correction_bias=(
-                    None if self.bias is None else self.bias.type_as(scores)
-                ),
-            )
-            weights *= self.route_scale
-            return weights, indices
-        else:
-            if self.is_fused_sigmoid_gate() and (is_nvidia() or is_muxi()):
-                indices, weights = fused_sigmoid_gate(
-                    scores, self.topk, self.n_groups, self.topk_groups, self.bias
-                )
-            else:
-                if self.score_func == "softmax":
-                    scores = scores.softmax(dim=-1, dtype=torch.float32)
-                else:
-                    scores = scores.sigmoid()
-                original_scores = scores
-                if self.bias is not None:
-                    scores = scores + self.bias
-                if self.n_groups > 1:
-                    scores = scores.view(x.size(0), self.n_groups, -1)
-                    if self.bias is None:
-                        group_scores = scores.amax(dim=-1)
-                    else:
-                        group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-                    indices = group_scores.topk(self.topk_groups, dim=-1)[1]
-                    mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
-                    scores = (scores * mask.unsqueeze(-1)).flatten(1)
-                indices = torch.topk(scores, self.topk, dim=-1)[1]
-                weights = original_scores.gather(1, indices)
-
-            if self.score_func == "sigmoid":
-                weights /= weights.sum(dim=-1, keepdim=True)
-            weights *= self.route_scale
-            return weights.type_as(x), indices.to(torch.int32)
-
-
-class MoEDeepSeekV3(nn.Module):
-    """
-    Mixture-of-Experts (MoE) module.
-
-    Attributes:
-        dim (int): Dimensionality of input features.
-        n_routed_experts (int): Total number of experts in the model.
-        n_local_experts (int): Number of experts handled locally in distributed systems.
-        n_activated_experts (int): Number of experts activated for each input.
-        gate (nn.Module): Gating mechanism to route inputs to experts.
-        experts (nn.ModuleList): List of expert modules.
-        shared_experts (nn.Module): Shared experts applied to all inputs.
-    """
-
-    def __init__(self, args, merge_gate_up: bool, op_impl: str):
-        """
-        Initializes the MoE module.
-
-        Args:
-            args (ModelArgs): Model arguments containing MoE parameters.
-        """
-        super().__init__()
-        self.args = args
-        self.op_impl = op_impl
-        self.merge_gate_up = merge_gate_up
-        self.dim = args.dim
-        self.fuse_shared_experts = get_global_args().infer.fuse_shared_experts
-
-        moe_world_size = 1
-        moe_rank = 0
-        assert (
-            args.n_routed_experts % moe_world_size == 0
-        ), f"Number of experts must be divisible by world size (world_size={moe_world_size})"
-        self.n_shared_experts = args.n_shared_experts
-        self.n_fused_shared_experts = (
-            args.n_shared_experts if self.fuse_shared_experts else 0
-        )
-        self.n_routed_experts = args.n_routed_experts
-        self.n_local_experts = args.n_routed_experts // moe_world_size
-        self.n_activated_experts = args.n_activated_experts
-        self.experts_start_idx = moe_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.gate = GateDeepSeekV3(args, op_impl)
-
-        # Routed experts + fused shared experts
-        if merge_gate_up:
-            self.w1w3 = GroupColumnParallelLinearDeepSeekV3(
-                self.experts_end_idx
-                - self.experts_start_idx
-                + self.n_fused_shared_experts,
-                args.dim,
-                args.moe_inter_dim * 2,
-                has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.get_default_dtype(),
-                gather_output=False,
-                scale_2_dim=2,
-            )
-        else:
-            self.w1 = GroupColumnParallelLinearDeepSeekV3(
-                self.experts_end_idx
-                - self.experts_start_idx
-                + self.n_fused_shared_experts,
-                args.dim,
-                args.moe_inter_dim,
-                has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.get_default_dtype(),
-                gather_output=False,
-            )
-            self.w3 = GroupColumnParallelLinearDeepSeekV3(
-                self.experts_end_idx
-                - self.experts_start_idx
-                + self.n_fused_shared_experts,
-                args.dim,
-                args.moe_inter_dim,
-                has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.get_default_dtype(),
-                gather_output=False,
-            )
-        self.w2 = GroupRowParallelLinearDeepSeekV3(
-            self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts,
-            args.moe_inter_dim,
-            args.dim,
-            has_bias=False,
-            dtype=parse_dtype(args.main_weight_dtype),
-            bias_dtype=torch.get_default_dtype(),
-            input_is_parallel=True,
-        )
-
+class MoeDeepSeekV3_params_resolver:
+    def __init__(
+        self,
+        args,
+        merge_gate_up: bool,
+        op_impl: str,
+        checkpoint_prefix: str,
+    ):
         # Non-fused shared experts
-        if not self.fuse_shared_experts:
-            self.shared_experts = MLPDeepSeekV3(
+        if not get_global_args().infer.fuse_shared_experts:
+            shared_experts = MLPDeepSeekV3(
                 args,
                 role="shared_experts",
                 merge_gate_up=merge_gate_up,
                 op_impl=op_impl,
+                checkpoint_prefix=checkpoint_prefix,
             )
-
-    def get_expert_weights_for_fp8_w8a8(self):
-        w1w3_weight = self.w1w3.weight
-        w1w3_scale = self.w1w3.scale
-        w2_weight = self.w2.weight
-        w2_scale = self.w2.scale
-        return w1w3_weight, w1w3_scale, w2_weight, w2_scale
-
-    def get_expert_weights_for_non_fp8(self):
-        w1w3_weight = self.w1w3.weight
-        w1w3_scale = None
-        w2_weight = self.w2.weight
-        w2_scale = None
-        return w1w3_weight, w1w3_scale, w2_weight, w2_scale
-
-    def get_expert_weights_for_fp4(self):
-        w1w3_weight = self.w1w3.weight
-        w1w3_weigth_scale = self.w1w3.weight_scale
-        w1w3_weight_scale2 = self.w1w3.weight_scale_2
-        w2_weight = self.w2.weight
-        w2_weight_scale = self.w2.weight_scale
-        w2_weight_scale2 = self.w2.weight_scale_2
-        return (
-            w1w3_weight,
-            w1w3_weigth_scale,
-            w1w3_weight_scale2,
-            w2_weight,
-            w2_weight_scale,
-            w2_weight_scale2,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the MoE module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
-        """
-
-        shape = x.size()
-        x = x.view(-1, self.dim)
-
-        weights, indices = self.gate(x)
-
-        if self.op_impl == "muxi_custom_kernel":
-            y = self._compute_muxi_fused_experts(x, weights, indices)
-        elif has_torch_npu:  # or use op_impl ?
-            y = self._compute_npu_fused_experts(x, weights, indices)
-        elif has_triton:
-            quant_method = None if not hasattr(self.args, "quant") else self.args.quant
-            if quant_method is None:
-                w1w3_weight, w1w3_scale, w2_weight, w2_scale = (
-                    self.get_expert_weights_for_non_fp8()
-                )
-                w1w3_scale_2, w2_scale_2 = None, None
-                use_fp4_w4a8 = False
-                use_fp8_w8a8 = False
-                fused_soft_fp8 = False
-
-            elif (
-                parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
-                == 1
-                or is_nvidia()
-                or is_muxi()
-            ):
-                if (
-                    parse_dtype(
-                        get_global_args().infer.raise_lower_bit_float_to
-                    ).itemsize
-                    == 1
-                ):
-                    fused_soft_fp8 = False
-                else:
-                    fused_soft_fp8 = True
-
-                if quant_method == "blockfp4":
-                    (
-                        w1w3_weight,
-                        w1w3_scale,
-                        w1w3_scale_2,
-                        w2_weight,
-                        w2_scale,
-                        w2_scale_2,
-                    ) = self.get_expert_weights_for_fp4()
-                    use_fp4_w4a8 = True
-                    use_fp8_w8a8 = False
-                elif quant_method == "blockfp8":
-                    w1w3_weight, w1w3_scale, w2_weight, w2_scale = (
-                        self.get_expert_weights_for_fp8_w8a8()
-                    )
-                    w1w3_scale_2, w2_scale_2 = None, None
-                    use_fp4_w4a8 = False
-                    use_fp8_w8a8 = True
-                else:
-                    raise NotImplementedError(
-                        f"Unsupported quantization method {quant_method}"
-                    )
-
-            else:
-                logger.warning(
-                    f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
-                )
-                block_size = 128
-                w1w3_weight = weight_dequant_soft_fp8_deepseek_v3(
-                    self.w1w3.weight,
-                    self.w1w3.scale,
-                    block_size,
-                )
-                w1w3_scale = None
-                w1w3_scale_2 = None
-                w2_weight = weight_dequant_soft_fp8_deepseek_v3(
-                    self.w2.weight,
-                    self.w2.scale,
-                    block_size,
-                )
-                w2_scale = None
-                w2_scale_2 = None
-                use_fp4_w4a8 = False
-                use_fp8_w8a8 = False
-                fused_soft_fp8 = False
-
-            if not self.fuse_shared_experts:
-                y1 = self.shared_experts(x)
-
-                y = fused_experts(
-                    x,
-                    w1w3_weight,
-                    w2_weight,
-                    topk_weights=weights,
-                    topk_ids=indices,
-                    use_fp8_w8a8=use_fp8_w8a8,
-                    use_fp4_w4a8=use_fp4_w4a8,
-                    inplace=True,
-                    global_num_experts=self.n_routed_experts + self.n_shared_experts,
-                    expert_map=None,  # use when ep > 1
-                    w1_scale=w1w3_scale,
-                    w2_scale=w2_scale,
-                    w1w3_scale_2=w1w3_scale_2,
-                    w2_scale_2=w2_scale_2,
-                    block_shape=[128, 128],
-                    soft_fp8=fused_soft_fp8,
-                )
-
-                y += y1
-            else:
-
-                indice_shape = indices.shape
-                new_indices = torch.empty(
-                    (indice_shape[0], indice_shape[1] + 1),
-                    dtype=indices.dtype,
-                    device=indices.device,
-                )
-
-                new_weights = torch.empty(
-                    (weights.shape[0], weights.shape[1] + 1),
-                    dtype=weights.dtype,
-                    device=weights.device,
-                )
-
-                chitu_backend.cuda_add_shared_experts(
-                    new_weights,
-                    new_indices,
-                    weights,
-                    indices,
-                    self.n_routed_experts,
-                    self.n_shared_experts,
-                )
-                del weights, indices
-                y = fused_experts(
-                    x,
-                    w1w3_weight,
-                    w2_weight,
-                    topk_weights=new_weights,
-                    topk_ids=new_indices,
-                    use_fp8_w8a8=use_fp8_w8a8,
-                    use_fp4_w4a8=use_fp4_w4a8,
-                    inplace=True,
-                    global_num_experts=self.n_routed_experts + self.n_shared_experts,
-                    expert_map=None,  # use when ep > 1
-                    w1_scale=w1w3_scale,
-                    w2_scale=w2_scale,
-                    w1w3_scale_2=w1w3_scale_2,
-                    w2_scale_2=w2_scale_2,
-                    block_shape=[128, 128],
-                    soft_fp8=fused_soft_fp8,
-                )
-
-            torch.distributed.all_reduce(y, group=get_tp_group())
         else:
-            y = torch.zeros_like(x)
-            counts = torch.bincount(
-                indices.flatten(), minlength=self.n_routed_experts
-            ).tolist()
-
-            xs = []
-            for i in range(self.experts_start_idx, self.experts_end_idx):
-                this_x = None
-                if counts[i]:
-                    idx, top = torch.where(indices == i)
-                    this_x = x[idx]
-                xs.append(this_x)
-            xs += [x] * self.n_shared_experts
-
-            if self.merge_gate_up:
-                w1w3_outs = self.w1w3(xs)
-                act = [
-                    (silu_and_mul(w1w3_out) if w1w3_out is not None else None)
-                    for w1w3_out in w1w3_outs
-                ]
-            else:
-                w1_outs = self.w1(xs)
-                w3_outs = self.w3(xs)
-
-                act = [
-                    F.silu(w1_out) * w3_out if w1_out is not None else None
-                    for w1_out, w3_out in zip(w1_outs, w3_outs)
-                ]
-
-            w2_outs = self.w2(act)
-
-            for i in range(self.experts_start_idx, self.experts_end_idx):
-                if counts[i]:
-                    idx, top = torch.where(indices == i)
-                    y[idx] += (
-                        w2_outs[i - self.experts_start_idx] * weights[idx, top, None]
-                    )
-            for i in range(
-                self.experts_end_idx - self.experts_start_idx,
-                self.experts_end_idx - self.experts_start_idx + self.n_shared_experts,
-            ):
-                y += w2_outs[i]
-        return y.view(shape)
-
-    def _compute_muxi_fused_experts(self, x, weights, indices):
-        if self.fuse_shared_experts:
-            raise NotImplementedError(
-                "Fused shared experts is not supported for muxi_layout_kernels"
-            )
-        if not self.merge_gate_up:
-            raise NotImplementedError(
-                "muxi_layout_kernels for fused MoE requires merge_gate_up=True"
-            )
-
-        y = self.shared_experts(x)
-        y1 = muxi_fused_experts(
-            hidden_states=x,
-            w1=self.w1w3.weight,
-            w2=self.w2.weight,
-            topk_weights=weights,
-            topk_ids=indices,
-            inplace=True,
-            w1_scale=self.w1w3.scale,
-            w2_scale=self.w2.scale,
-            block_shape=[128, 128],
-            soft_fp8=True if self.w1w3.scale is not None else False,
+            shared_experts = None
+        super().__init__(
+            dim=args.dim,
+            moe_inter_dim=args.moe_inter_dim,
+            n_routed_experts=args.n_routed_experts,
+            n_shared_experts=args.n_shared_experts,
+            n_activated_experts=args.n_activated_experts,
+            moe_world_size=1,
+            moe_rank=0,
+            do_gather_output=False,
+            merge_gate_up=merge_gate_up,
+            dtype=args.main_weight_dtype,
+            op_impl=op_impl,
+            gate=GateDeepSeekV3(args, op_impl),
+            fuse_shared_experts=get_global_args().infer.fuse_shared_experts,
+            shared_experts=shared_experts,
+            checkpoint_prefix=checkpoint_prefix,
         )
-        y += y1
-        torch.distributed.all_reduce(y, group=get_tp_group())
-        return y
 
-    def _compute_npu_fused_experts(self, x, weights, indices):
-        y = self.shared_experts(x)
-        y1 = fused_experts_npu(
-            hidden_states=x,
-            w1=self.w1w3.weight,
-            w2=self.w2.weight,
-            topk_weights=weights,
-            topk_ids=indices,
+
+def MoEDeepSeekV3(
+    args,
+    merge_gate_up: bool,
+    op_impl: str,
+    checkpoint_prefix: str,
+    base_moe_class: Optional[type] = None,
+    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+):
+    if base_moe_class is None:
+        base_moe_class = MoeBlockRegistry.get_quantized_MoeBlock_class_from_global_args(
+            quant_kwargs=quant_kwargs,
+            checkpoint_prefix=f"{checkpoint_prefix}.moe",
         )
-        y += y1
-        torch.distributed.all_reduce(y, group=get_tp_group())
-        return y
+
+    class MoeBlockImpl(MoeDeepSeekV3_params_resolver, base_moe_class):
+        # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
+        # of the final class, so we can append a class to the base class, to make it act like a
+        # further base class of the original base class.
+        # See https://docs.python.org/3/tutorial/classes.html#multiple-inheritance
+
+        pass
+
+    return MoeBlockImpl(
+        args,
+        merge_gate_up=merge_gate_up,
+        op_impl=op_impl,
+        checkpoint_prefix=f"{checkpoint_prefix}.moe",
+    )
 
 
 class MoEDeepSeekV3CPU(nn.Module):
@@ -1448,7 +791,9 @@ class MoEDeepSeekV3CPU(nn.Module):
         shared_experts (nn.Module): Shared experts applied to all inputs.
     """
 
-    def __init__(self, args, cpu_infer, ggml_type, merge_gate_up: bool):
+    def __init__(
+        self, args, cpu_infer, ggml_type, merge_gate_up: bool, checkpoint_prefix: str
+    ):
         """
         Initializes the MoE module.
 
@@ -1473,44 +818,48 @@ class MoEDeepSeekV3CPU(nn.Module):
         self.n_activated_experts = args.n_activated_experts
         self.gate = GateDeepSeekV3(args)
         if merge_gate_up:
-            self.w1w3 = ColumnParallelLinear(
+            self.gate_up_proj = ColumnParallelLinear(
                 args.dim,
                 args.moe_inter_dim * 2,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.bfloat16,
                 gather_output=False,
+                checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
             )
         else:
-            self.w1 = ColumnParallelLinear(
+            self.gate_proj = ColumnParallelLinear(
                 args.dim,
                 args.moe_inter_dim,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.bfloat16,
                 gather_output=False,
+                checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
             )
-            self.w3 = ColumnParallelLinear(
+            self.up_proj = ColumnParallelLinear(
                 args.dim,
                 args.moe_inter_dim,
                 has_bias=False,
                 dtype=parse_dtype(args.main_weight_dtype),
                 bias_dtype=torch.bfloat16,
                 gather_output=False,
+                checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
             )
-        self.w2 = RowParallelLinear(
+        self.down_proj = RowParallelLinear(
             args.moe_inter_dim,
             args.dim,
             has_bias=False,
             dtype=parse_dtype(args.main_weight_dtype),
             bias_dtype=torch.bfloat16,
             input_is_parallel=True,
+            checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
         )
 
         if self.rank == 0:
 
             self.register_buffer(
-                "gate_proj",
+                "gguf_gate_proj",
                 torch.empty(
                     int(256 * 2048 * 7168 / 256 * 144),
                     dtype=torch.uint8,
@@ -1519,7 +868,7 @@ class MoEDeepSeekV3CPU(nn.Module):
                 ),
             )
             self.register_buffer(
-                "up_proj",
+                "gguf_up_proj",
                 torch.empty(
                     int(256 * 2048 * 7168 / 256 * 144),
                     dtype=torch.uint8,
@@ -1529,7 +878,7 @@ class MoEDeepSeekV3CPU(nn.Module):
             )
             if ggml_type == 12:
                 self.register_buffer(
-                    "down_proj",
+                    "gguf_down_proj",
                     torch.empty(
                         int(256 * 2048 * 7168 / 256 * 144),
                         dtype=torch.uint8,
@@ -1539,7 +888,7 @@ class MoEDeepSeekV3CPU(nn.Module):
                 )
             elif ggml_type == 14:
                 self.register_buffer(
-                    "down_proj",
+                    "gguf_down_proj",
                     torch.empty(
                         int(256 * 2048 * 7168 / 256 * 210),
                         dtype=torch.uint8,
@@ -1585,28 +934,28 @@ class MoEDeepSeekV3CPU(nn.Module):
     def to(self, *args, **kwargs):
         self.gate.to(*args, **kwargs)
         if self.merge_gate_up:
-            self.w1w3.to(*args, **kwargs)
+            self.gate_up_proj.to(*args, **kwargs)
         else:
-            self.w1.to(*args, **kwargs)
-            self.w3.to(*args, **kwargs)
-        self.w2.to(*args, **kwargs)
+            self.gate_proj.to(*args, **kwargs)
+            self.up_proj.to(*args, **kwargs)
+        self.down_proj.to(*args, **kwargs)
         return self
 
     def init_weights(self):
         if self.rank == 0:
             gate_ptr = ctypes.addressof(
                 ctypes.cast(
-                    self.gate_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+                    self.gguf_gate_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
                 ).contents
             )
             up_ptr = ctypes.addressof(
                 ctypes.cast(
-                    self.up_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+                    self.gguf_up_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
                 ).contents
             )
             down_ptr = ctypes.addressof(
                 ctypes.cast(
-                    self.down_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+                    self.gguf_down_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
                 ).contents
             )
 
@@ -1712,12 +1061,14 @@ class MoEDeepSeekV3CPU(nn.Module):
                 )
 
         if self.merge_gate_up:
-            w1w3_out = self.w1w3(x)
-            w1_out, w3_out = torch.split(w1w3_out, w1w3_out.shape[-1] // 2, dim=-1)
+            gate_up_proj_out = self.gate_up_proj(x)
+            gate_proj_out, up_proj_out = torch.split(
+                gate_up_proj_out, gate_up_proj_out.shape[-1] // 2, dim=-1
+            )
         else:
-            w1_out = self.w1(x)
-            w3_out = self.w3(x)
-        y = self.w2(F.silu(w1_out) * w3_out)
+            gate_proj_out = self.gate_proj(x)
+            up_proj_out = self.up_proj(x)
+        y = self.down_proj(F.silu(gate_proj_out) * up_proj_out)
 
         if self.rank == 0:
             if x.shape[1] > 1:
@@ -1750,12 +1101,13 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         merge_qkv_gate_up,
         cpu_infer=False,
         ggml_type=0,
+        checkpoint_prefix="",
     ):
         super().__init__(
             layer_id, args, cache, attn_backend=attn_backend, op_impl=op_impl
         )
         self.layer_id = layer_id
-        self.attn = AttentionDeepSeekV3(
+        self.self_attn = AttentionDeepSeekV3(
             args,
             layer_id,
             cache,
@@ -1763,13 +1115,15 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             op_impl=op_impl,
             mla_absorb=mla_absorb,
             merge_qkv=merge_qkv_gate_up,
+            checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
         )
-        self.ffn = (
+        self.mlp = (
             MLPDeepSeekV3(
                 args,
                 role="standalone",
                 merge_gate_up=merge_qkv_gate_up,
                 op_impl=op_impl,
+                checkpoint_prefix=f"{checkpoint_prefix}.mlp",
             )
             if layer_id < args.n_dense_layers
             else (
@@ -1777,6 +1131,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                     args,
                     merge_gate_up=merge_qkv_gate_up,
                     op_impl=op_impl,
+                    checkpoint_prefix=f"{checkpoint_prefix}.mlp",
                 )
                 if not cpu_infer
                 else MoEDeepSeekV3CPU(
@@ -1784,17 +1139,18 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                     cpu_infer=cpu_infer,
                     ggml_type=ggml_type,
                     merge_gate_up=merge_qkv_gate_up,
+                    checkpoint_prefix=f"{checkpoint_prefix}.mlp",
                 )
             )
         )
-        self.attn_norm = RMSNorm(args.dim)
-        self.ffn_norm = RMSNorm(args.dim)
+        self.input_layernorm = RMSNorm(args.dim)
+        self.post_attention_layernorm = RMSNorm(args.dim)
 
     def to(self, *args, **kwargs):
-        self.attn.to(*args, **kwargs)
-        self.ffn.to(*args, **kwargs)
-        self.attn_norm.to(*args, **kwargs)
-        self.ffn_norm.to(*args, **kwargs)
+        self.self_attn.to(*args, **kwargs)
+        self.mlp.to(*args, **kwargs)
+        self.input_layernorm.to(*args, **kwargs)
+        self.post_attention_layernorm.to(*args, **kwargs)
         return self
 
     def forward(
@@ -1804,13 +1160,13 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         freqs_cis_sin: torch.Tensor,
         varlens=None,
     ):
-        x = x + self.attn(
-            self.attn_norm(x, compute_dtype=x.dtype),
+        x = x + self.self_attn(
+            self.input_layernorm(x, compute_dtype=x.dtype),
             freqs_cis_cos,
             freqs_cis_sin,
             varlens,
         )
-        x = x + self.ffn(self.ffn_norm(x, compute_dtype=x.dtype))
+        x = x + self.mlp(self.post_attention_layernorm(x, compute_dtype=x.dtype))
         return x
 
 
@@ -1848,31 +1204,39 @@ class TransformerDeepSeekV3(Transformer):
         )
 
     def to(self, *args, **kwargs):
-        if hasattr(self, "embed"):
-            self.embed.to(*args, **kwargs)
+        if hasattr(self, "embed_tokens"):
+            self.embed_tokens.to(*args, **kwargs)
         if hasattr(self, "norm"):
             self.norm.to(*args, **kwargs)
-        if hasattr(self, "head"):
-            self.head.to(*args, **kwargs)
+        if hasattr(self, "lm_head"):
+            self.lm_head.to(*args, **kwargs)
         for l in self.layers:
             l.to(*args, **kwargs)
         return self
 
     @override
     def _get_tensor_column_parallel_layer_names(self) -> List[str]:
-        return ["embed", "wq_b", "wkv_b", "w1", "w3", "w1w3", "head"]
+        return [
+            "embed_tokens",
+            "q_b_proj",
+            "kv_b_proj",
+            "gate_proj",
+            "up_proj",
+            "gate_up_proj",
+            "lm_head",
+        ]
 
     @override
     def _get_tensor_row_parallel_layer_names(self) -> List[str]:
-        return ["wo", "w2"]
+        return ["o_proj", "down_proj"]
 
     @override
     def _get_pre_layer_prefixes(self) -> List[str]:
-        return ["embed."]
+        return ["embed_tokens."]
 
     @override
     def _get_post_layer_prefixes(self) -> List[str]:
-        return ["head.", "norm."]
+        return ["lm_head.", "norm."]
 
     @override
     def _get_layer_i_prefixes(self, i: int) -> List[str]:
@@ -1885,7 +1249,7 @@ class TransformerDeepSeekV3(Transformer):
         for k in checkpoint.keys():
             if any(
                 k.endswith(f".experts.0.{w}.{part}")
-                for w in ["w1", "w2", "w3", "w1w3"]
+                for w in ["gate_proj", "down_proj", "up_proj", "gate_up_proj"]
                 for part in self._get_2d_out_x_in_tensor_names()
                 + self._get_2d_in_x_out_tensor_names()
                 + self._get_1d_in_tensor_names()
@@ -1917,33 +1281,33 @@ class TransformerDeepSeekV3(Transformer):
         new_checkpoint = {}
         for k in checkpoint.keys():
             if any(
-                k.endswith(f".wkv_b.{tensor_name}")
+                k.endswith(f".kv_b_proj.{tensor_name}")
                 for tensor_name in self._get_2d_out_x_in_tensor_names()
             ):
                 tensor_name = k.split(".")[-1]
-                prefix = k[: -len(f".wkv_b.{tensor_name}")]
-                wkv_b_weight = checkpoint[f"{prefix}.wkv_b.{tensor_name}"]
-                wkv_b_weight = wkv_b_weight.view(
-                    n_local_heads, -1, wkv_b_weight.shape[-1]
+                prefix = k[: -len(f".kv_b_proj.{tensor_name}")]
+                kv_b_proj_weight = checkpoint[f"{prefix}.kv_b_proj.{tensor_name}"]
+                kv_b_proj_weight = kv_b_proj_weight.view(
+                    n_local_heads, -1, kv_b_proj_weight.shape[-1]
                 )
                 absorbed_dim = self.params.qk_nope_head_dim + self.params.v_head_dim
-                assert absorbed_dim % wkv_b_weight.shape[1] == 0
-                ratio = absorbed_dim // wkv_b_weight.shape[1]
-                wkv_b_absorb_1_weight = wkv_b_weight[
+                assert absorbed_dim % kv_b_proj_weight.shape[1] == 0
+                ratio = absorbed_dim // kv_b_proj_weight.shape[1]
+                kv_b_proj_absorb_1_weight = kv_b_proj_weight[
                     :, : self.params.qk_nope_head_dim // ratio
                 ]
-                wkv_b_absorb_2_weight = wkv_b_weight[
+                kv_b_proj_absorb_2_weight = kv_b_proj_weight[
                     :, self.params.qk_nope_head_dim // ratio :
                 ]
-                new_checkpoint[f"{prefix}.wkv_b_absorb_1.{tensor_name}"] = (
-                    wkv_b_absorb_1_weight.permute(0, 2, 1).contiguous()
+                new_checkpoint[f"{prefix}.kv_b_proj_absorb_1.{tensor_name}"] = (
+                    kv_b_proj_absorb_1_weight.permute(0, 2, 1).contiguous()
                 )
-                new_checkpoint[f"{prefix}.wkv_b_absorb_2.{tensor_name}"] = (
-                    wkv_b_absorb_2_weight
+                new_checkpoint[f"{prefix}.kv_b_proj_absorb_2.{tensor_name}"] = (
+                    kv_b_proj_absorb_2_weight
                 )
 
             elif any(
-                k.endswith(f".wkv_b.{tensor_name}")
+                k.endswith(f".kv_b_proj.{tensor_name}")
                 for tensor_name in self._get_2d_in_x_out_tensor_names()
             ):
                 raise NotImplementedError(
@@ -1951,7 +1315,7 @@ class TransformerDeepSeekV3(Transformer):
                 )
 
             elif any(
-                k.endswith(f".wkv_b.{tensor_name}")
+                k.endswith(f".kv_b_proj.{tensor_name}")
                 for tensor_name in self._get_1d_in_tensor_names()
             ):
                 raise NotImplementedError(
@@ -1959,7 +1323,7 @@ class TransformerDeepSeekV3(Transformer):
                 )
 
             elif any(
-                k.endswith(f".wkv_b.{tensor_name}")
+                k.endswith(f".kv_b_proj.{tensor_name}")
                 for tensor_name in self._get_1d_out_tensor_names()
             ):
                 raise NotImplementedError(
@@ -1975,7 +1339,11 @@ class TransformerDeepSeekV3(Transformer):
         model_parallel_size = get_tp_size()
         n_local_heads = self.params.n_heads // model_parallel_size
 
-        quant = self.params.quant if hasattr(self.params, "quant") else None
+        quant = (
+            self.params.quant_config.type
+            if hasattr(self.params, "quant_config")
+            else None
+        )
 
         weight_dequant_fn = (
             weight_dequant_soft_fp8_deepseek_v3
@@ -1986,73 +1354,79 @@ class TransformerDeepSeekV3(Transformer):
 
         new_checkpoint = {}
         for k in checkpoint.keys():
-            if k.endswith(".wkv_b.weight"):
-                prefix = k[: -len("wkv_b.weight")]
-                assert prefix + "wkv_b.weight" in checkpoint
-                wkv_b_ckpt_weight = checkpoint[prefix + "wkv_b.weight"]
+            if k.endswith(".kv_b_proj.weight"):
+                prefix = k[: -len("kv_b_proj.weight")]
+                assert prefix + "kv_b_proj.weight" in checkpoint
+                kv_b_proj_ckpt_weight = checkpoint[prefix + "kv_b_proj.weight"]
                 if quant in [None, "gguf", "blockfp4"]:  # blockfp4 skips quantizing MLA
-                    wkv_b_weight = wkv_b_ckpt_weight
+                    kv_b_proj_weight = kv_b_proj_ckpt_weight
                 elif quant in ["blockfp8", "gguf-blockfp8"]:
-                    assert prefix + "wkv_b.scale" in checkpoint
-                    wkv_b_scale = checkpoint[prefix + "wkv_b.scale"]
+                    assert prefix + "kv_b_proj.scale" in checkpoint
+                    kv_b_proj_scale = checkpoint[prefix + "kv_b_proj.scale"]
                     # FIXME: Keep this on GPU
-                    wkv_b_weight = weight_dequant_fn(
-                        wkv_b_ckpt_weight.cuda(), wkv_b_scale.cuda(), block_size
+                    kv_b_proj_weight = weight_dequant_fn(
+                        kv_b_proj_ckpt_weight.cuda(), kv_b_proj_scale.cuda(), block_size
                     ).cpu()
                 else:
                     raise NotImplementedError(
                         f"infer.mla_absorb=absorb is not implemented for {quant} quantization"
                     )
-                wkv_b_weight = wkv_b_weight.view(
+                kv_b_proj_weight = kv_b_proj_weight.view(
                     n_local_heads,
                     self.params.qk_nope_head_dim + self.params.v_head_dim,
                     self.params.kv_lora_rank,
                 )
 
-                # Absorb into wq_b
-                wq_b_ckpt_weight = checkpoint[prefix + "wq_b.weight"]
+                # Absorb into q_b_proj
+                q_b_proj_ckpt_weight = checkpoint[prefix + "q_b_proj.weight"]
                 if quant in [None, "gguf", "blockfp4"]:  # blockfp4 skips quantizing MLA
-                    wq_b_weight = wq_b_ckpt_weight
+                    q_b_proj_weight = q_b_proj_ckpt_weight
                 elif quant in ["blockfp8", "gguf-blockfp8"]:
-                    assert prefix + "wq_b.scale" in checkpoint
-                    wq_b_scale = checkpoint[prefix + "wq_b.scale"]
+                    assert prefix + "q_b_proj.scale" in checkpoint
+                    q_b_proj_scale = checkpoint[prefix + "q_b_proj.scale"]
                     # FIXME: Keep this on GPU
-                    wq_b_weight = weight_dequant_fn(
-                        wq_b_ckpt_weight.cuda(), wq_b_scale.cuda(), block_size
+                    q_b_proj_weight = weight_dequant_fn(
+                        q_b_proj_ckpt_weight.cuda(), q_b_proj_scale.cuda(), block_size
                     ).cpu()
                 else:
                     raise NotImplementedError(
                         f"infer.mla_absorb=absorb is not implemented for {quant} quantization"
                     )
-                wq_b_weight_per_head = wq_b_weight.view(
+                q_b_proj_weight_per_head = q_b_proj_weight.view(
                     n_local_heads,
                     self.params.qk_nope_head_dim + self.params.qk_rope_head_dim,
                     self.params.q_lora_rank,
                 )
-                wq_b_nope = wq_b_weight_per_head[:, : self.params.qk_nope_head_dim]
-                wq_b_rope = wq_b_weight_per_head[:, self.params.qk_nope_head_dim :]
-                #   x @ wq_b_nope^T @ per_head(wkv_b[:, :qk_nope_head_dim, :])
-                # = x @ (per_head(wkv_b[:, :qk_nope_head_dim, :])^T @ wq_b_nope)^T
-                wkv_b_for_wq_b = wkv_b_weight[:, : self.params.qk_nope_head_dim]
-                assert wkv_b_for_wq_b.shape == (
+                q_b_proj_nope = q_b_proj_weight_per_head[
+                    :, : self.params.qk_nope_head_dim
+                ]
+                q_b_proj_rope = q_b_proj_weight_per_head[
+                    :, self.params.qk_nope_head_dim :
+                ]
+                #   x @ q_b_proj_nope^T @ per_head(kv_b_proj[:, :qk_nope_head_dim, :])
+                # = x @ (per_head(kv_b_proj[:, :qk_nope_head_dim, :])^T @ q_b_proj_nope)^T
+                kv_b_proj_for_q_b_proj = kv_b_proj_weight[
+                    :, : self.params.qk_nope_head_dim
+                ]
+                assert kv_b_proj_for_q_b_proj.shape == (
                     n_local_heads,
                     self.params.qk_nope_head_dim,
                     self.params.kv_lora_rank,
                 )
-                wkv_b_for_wq_b = torch.block_diag(*wkv_b_for_wq_b)
-                new_wq_b_nope = (
-                    wkv_b_for_wq_b.t()
-                    @ wq_b_nope.contiguous().view(-1, self.params.q_lora_rank)
+                kv_b_proj_for_q_b_proj = torch.block_diag(*kv_b_proj_for_q_b_proj)
+                new_q_b_proj_nope = (
+                    kv_b_proj_for_q_b_proj.t()
+                    @ q_b_proj_nope.contiguous().view(-1, self.params.q_lora_rank)
                 ).view(n_local_heads, self.params.kv_lora_rank, self.params.q_lora_rank)
-                new_wq_b = torch.cat([new_wq_b_nope, wq_b_rope], dim=1).view(
-                    -1, self.params.q_lora_rank
-                )
+                new_q_b_proj = torch.cat(
+                    [new_q_b_proj_nope, q_b_proj_rope], dim=1
+                ).view(-1, self.params.q_lora_rank)
                 if quant in [None, "gguf", "blockfp4"]:  # blockfp4 skips quantizing MLA
-                    new_checkpoint[prefix + "wq_b.weight"] = new_wq_b
+                    new_checkpoint[prefix + "q_b_proj.weight"] = new_q_b_proj
                 elif quant in ["blockfp8", "gguf-blockfp8"]:
                     # FIXME: Support soft fp8 in weight_quant_deepseek_v3
-                    new_wq_b, new_wq_b_scale = weight_quant_deepseek_v3(
-                        new_wq_b, block_size
+                    new_q_b_proj, new_q_b_proj_scale = weight_quant_deepseek_v3(
+                        new_q_b_proj, block_size
                     )
                     if (
                         parse_dtype(
@@ -2060,75 +1434,77 @@ class TransformerDeepSeekV3(Transformer):
                         ).itemsize
                         > 1
                     ):
-                        new_wq_b = new_wq_b.view(dtype=torch.uint8)
-                    new_checkpoint[prefix + "wq_b.weight"] = new_wq_b
-                    new_checkpoint[prefix + "wq_b.scale"] = new_wq_b_scale
+                        new_q_b_proj = new_q_b_proj.view(dtype=torch.uint8)
+                    new_checkpoint[prefix + "q_b_proj.weight"] = new_q_b_proj
+                    new_checkpoint[prefix + "q_b_proj.scale"] = new_q_b_proj_scale
                 else:
                     raise NotImplementedError(
                         f"infer.mla_absorb=absorb is not implemented for {quant} quantization"
                     )
 
-                # Absorb into wo
-                wo_ckpt_weight = checkpoint[prefix + "wo.weight"]
+                # Absorb into o_proj
+                o_proj_ckpt_weight = checkpoint[prefix + "o_proj.weight"]
                 if quant in [None, "gguf", "blockfp4"]:  # blockfp4 skips quantizing MLA
-                    wo_weight = wo_ckpt_weight
+                    o_proj_weight = o_proj_ckpt_weight
                 elif quant in ["blockfp8", "gguf-blockfp8"]:
-                    assert prefix + "wo.scale" in checkpoint
-                    wo_scale = checkpoint[prefix + "wo.scale"]
+                    assert prefix + "o_proj.scale" in checkpoint
+                    o_proj_scale = checkpoint[prefix + "o_proj.scale"]
                     # FIXME: Keep this on GPU
-                    wo_weight = weight_dequant_fn(
-                        wo_ckpt_weight.cuda(), wo_scale.cuda(), block_size
+                    o_proj_weight = weight_dequant_fn(
+                        o_proj_ckpt_weight.cuda(), o_proj_scale.cuda(), block_size
                     ).cpu()
                 else:
                     raise NotImplementedError(
                         f"infer.mla_absorb=absorb is not implemented for {quant} quantization"
                     )
-                #   x @ per_head(wkv_b_weight[:, -params.v_head_dim :, :]^T) @ wo_weight^T
-                # = x @ (wo_weight @ per_head(wkv_b_weight[:, -params.v_head_dim :, :]))^T
-                wkv_b_for_wo = wkv_b_weight[:, -self.params.v_head_dim :]
-                assert wkv_b_for_wo.shape == (
+                #   x @ per_head(kv_b_proj_weight[:, -params.v_head_dim :, :]^T) @ o_proj_weight^T
+                # = x @ (o_proj_weight @ per_head(kv_b_proj_weight[:, -params.v_head_dim :, :]))^T
+                kv_b_proj_for_o_proj = kv_b_proj_weight[:, -self.params.v_head_dim :]
+                assert kv_b_proj_for_o_proj.shape == (
                     n_local_heads,
                     self.params.v_head_dim,
                     self.params.kv_lora_rank,
                 )
-                wkv_b_for_wo = torch.block_diag(*wkv_b_for_wo)
-                new_wo = wo_weight @ wkv_b_for_wo
+                kv_b_proj_for_o_proj = torch.block_diag(*kv_b_proj_for_o_proj)
+                new_o_proj = o_proj_weight @ kv_b_proj_for_o_proj
                 if quant in [None, "gguf", "blockfp4"]:  # blockfp4 skips quantizing MLA
-                    new_checkpoint[prefix + "wo.weight"] = new_wo
+                    new_checkpoint[prefix + "o_proj.weight"] = new_o_proj
                 elif quant in ["blockfp8", "gguf-blockfp8"]:
                     # FIXME: Support soft fp8 in weight_quant_deepseek_v3
-                    new_wo, new_wo_scale = weight_quant_deepseek_v3(new_wo, block_size)
+                    new_o_proj, new_o_proj_scale = weight_quant_deepseek_v3(
+                        new_o_proj, block_size
+                    )
                     if (
                         parse_dtype(
                             get_global_args().infer.raise_lower_bit_float_to
                         ).itemsize
                         > 1
                     ):
-                        new_wo = new_wo.view(dtype=torch.uint8)
-                    new_checkpoint[prefix + "wo.weight"] = new_wo
-                    new_checkpoint[prefix + "wo.scale"] = new_wo_scale
+                        new_o_proj = new_o_proj.view(dtype=torch.uint8)
+                    new_checkpoint[prefix + "o_proj.weight"] = new_o_proj
+                    new_checkpoint[prefix + "o_proj.scale"] = new_o_proj_scale
                 else:
                     raise NotImplementedError(
                         f"infer.mla_absorb=absorb is not implemented for {quant} quantization"
                     )
 
-            elif k.endswith(".wkv_b.scale"):
+            elif k.endswith(".kv_b_proj.scale"):
                 continue
 
-            elif k.endswith(".wkv_b.bias"):
+            elif k.endswith(".kv_b_proj.bias"):
                 raise NotImplementedError(
-                    "infer.mla_absorb=absorb is not implemented for wkv_b with a bias"
+                    "infer.mla_absorb=absorb is not implemented for kv_b_proj with a bias"
                 )
 
-            elif k.endswith(".wo.weight") or k.endswith(".wo.scale"):
+            elif k.endswith(".o_proj.weight") or k.endswith(".o_proj.scale"):
                 continue
 
-            elif k.endswith(".wq_b.weight") or k.endswith(".wq_b.scale"):
+            elif k.endswith(".q_b_proj.weight") or k.endswith(".q_b_proj.scale"):
                 continue
 
-            elif k.endswith(".wq_b.bias"):
+            elif k.endswith(".q_b_proj.bias"):
                 raise NotImplementedError(
-                    "infer.mla_absorb=absorb is not implemented for wq_b with a bias"
+                    "infer.mla_absorb=absorb is not implemented for q_b_proj with a bias"
                 )
 
             else:
@@ -2141,20 +1517,20 @@ class TransformerDeepSeekV3(Transformer):
         for k in checkpoint.keys():
             # Cat dim 0
             if any(
-                k.endswith(f".wq_a.{tensor_name}")
+                k.endswith(f".q_a_proj.{tensor_name}")
                 for tensor_name in self._get_2d_out_x_in_tensor_names()
                 + self._get_1d_out_tensor_names()
             ):
                 tensor_name = k.split(".")[-1]
-                prefix = k[: -len(f".wq_a.{tensor_name}")]
-                assert f"{prefix}.wkv_a.{tensor_name}" in checkpoint
-                q_weight = checkpoint[f"{prefix}.wq_a.{tensor_name}"]
-                kv_weight = checkpoint[f"{prefix}.wkv_a.{tensor_name}"]
+                prefix = k[: -len(f".q_a_proj.{tensor_name}")]
+                assert f"{prefix}.kv_a_proj_with_mqa.{tensor_name}" in checkpoint
+                q_weight = checkpoint[f"{prefix}.q_a_proj.{tensor_name}"]
+                kv_weight = checkpoint[f"{prefix}.kv_a_proj_with_mqa.{tensor_name}"]
                 new_checkpoint[f"{prefix}.wqkv_a.{tensor_name}"] = torch.cat(
                     [q_weight, kv_weight], dim=0
                 )
             elif any(
-                k.endswith(f".wkv_a.{tensor_name}")
+                k.endswith(f".kv_a_proj_with_mqa.{tensor_name}")
                 for tensor_name in self._get_2d_out_x_in_tensor_names()
                 + self._get_1d_out_tensor_names()
             ):
@@ -2162,19 +1538,19 @@ class TransformerDeepSeekV3(Transformer):
 
             # Cat dim 1
             elif any(
-                k.endswith(f".wq_a.{tensor_name}")
+                k.endswith(f".q_a_proj.{tensor_name}")
                 for tensor_name in self._get_2d_in_x_out_tensor_names()
             ):
                 tensor_name = k.split(".")[-1]
-                prefix = k[: -len(f".wq_a.{tensor_name}")]
-                assert f"{prefix}.wkv_a.{tensor_name}" in checkpoint
-                q_weight = checkpoint[f"{prefix}.wq_a.{tensor_name}"]
-                kv_weight = checkpoint[f"{prefix}.wkv_a.{tensor_name}"]
+                prefix = k[: -len(f".q_a_proj.{tensor_name}")]
+                assert f"{prefix}.kv_a_proj_with_mqa.{tensor_name}" in checkpoint
+                q_weight = checkpoint[f"{prefix}.q_a_proj.{tensor_name}"]
+                kv_weight = checkpoint[f"{prefix}.kv_a_proj_with_mqa.{tensor_name}"]
                 new_checkpoint[f"{prefix}.wqkv_a.{tensor_name}"] = torch.cat(
                     [q_weight, kv_weight], dim=1
                 )
             elif any(
-                k.endswith(f".wkv_a.{tensor_name}")
+                k.endswith(f".kv_a_proj_with_mqa.{tensor_name}")
                 for tensor_name in self._get_2d_in_x_out_tensor_names()
             ):
                 continue
@@ -2189,21 +1565,21 @@ class TransformerDeepSeekV3(Transformer):
         for k in checkpoint.keys():
             # Cat dim 0
             if any(
-                k.endswith(f".w1.{tensor_name}")
+                k.endswith(f".gate_proj.{tensor_name}")
                 for tensor_name in self._get_2d_out_x_in_tensor_names()
                 + self._get_1d_out_tensor_names()
             ):
                 tensor_name = k.split(".")[-1]
-                prefix = k[: -len(f".w1.{tensor_name}")]
-                assert f"{prefix}.w3.{tensor_name}" in checkpoint
-                assert f"{prefix}.w1w3.{tensor_name}" not in checkpoint
-                gate_weight = checkpoint[f"{prefix}.w1.{tensor_name}"]
-                up_weight = checkpoint[f"{prefix}.w3.{tensor_name}"]
-                new_checkpoint[f"{prefix}.w1w3.{tensor_name}"] = torch.cat(
+                prefix = k[: -len(f".gate_proj.{tensor_name}")]
+                assert f"{prefix}.up_proj.{tensor_name}" in checkpoint
+                assert f"{prefix}.gate_up_proj.{tensor_name}" not in checkpoint
+                gate_weight = checkpoint[f"{prefix}.gate_proj.{tensor_name}"]
+                up_weight = checkpoint[f"{prefix}.up_proj.{tensor_name}"]
+                new_checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = torch.cat(
                     [gate_weight, up_weight], dim=0
                 )
             elif any(
-                k.endswith(f".w3.{tensor_name}")
+                k.endswith(f".up_proj.{tensor_name}")
                 for tensor_name in self._get_2d_out_x_in_tensor_names()
                 + self._get_1d_out_tensor_names()
             ):
@@ -2211,20 +1587,20 @@ class TransformerDeepSeekV3(Transformer):
 
             # Cat dim 1
             elif any(
-                k.endswith(f".w1.{tensor_name}")
+                k.endswith(f".gate_proj.{tensor_name}")
                 for tensor_name in self._get_2d_in_x_out_tensor_names()
             ):
                 tensor_name = k.split(".")[-1]
-                prefix = k[: -len(f".w1.{tensor_name}")]
-                assert f"{prefix}.w3.{tensor_name}" in checkpoint
-                assert f"{prefix}.w1w3.{tensor_name}" not in checkpoint
-                gate_weight = checkpoint[f"{prefix}.w1.{tensor_name}"]
-                up_weight = checkpoint[f"{prefix}.w3.{tensor_name}"]
-                new_checkpoint[f"{prefix}.w1w3.{tensor_name}"] = torch.cat(
+                prefix = k[: -len(f".gate_proj.{tensor_name}")]
+                assert f"{prefix}.up_proj.{tensor_name}" in checkpoint
+                assert f"{prefix}.gate_up_proj.{tensor_name}" not in checkpoint
+                gate_weight = checkpoint[f"{prefix}.gate_proj.{tensor_name}"]
+                up_weight = checkpoint[f"{prefix}.up_proj.{tensor_name}"]
+                new_checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = torch.cat(
                     [gate_weight, up_weight], dim=1
                 )
             elif any(
-                k.endswith(f".w3.{tensor_name}")
+                k.endswith(f".up_proj.{tensor_name}")
                 for tensor_name in self._get_2d_in_x_out_tensor_names()
             ):
                 continue
@@ -2247,36 +1623,8 @@ class TransformerDeepSeekV3(Transformer):
             new_state_dict = {}
             for k in state_dict.keys():
                 name = k
-                name = name.replace(".self_attn.", ".attn.")
-                name = name.replace(".mlp.", ".ffn.")
                 name = name.replace(".weight_scale_inv", ".scale")
                 name = name.replace(".e_score_correction_bias", ".bias")
-                key = name.split(".")[-2]
-                mapping = {
-                    "embed_tokens": "embed",
-                    "input_layernorm": "attn_norm",
-                    "post_attention_layernorm": "ffn_norm",
-                    "q_proj": "wq",
-                    "q_a_proj": "wq_a",
-                    "q_a_layernorm": "q_norm",
-                    "q_b_proj": "wq_b",
-                    "kv_a_proj_with_mqa": "wkv_a",
-                    "kv_a_layernorm": "kv_norm",
-                    "kv_b_proj": "wkv_b",
-                    "o_proj": "wo",
-                    "gate": "gate",
-                    "gate_proj": "w1",
-                    "down_proj": "w2",
-                    "up_proj": "w3",
-                    "norm": "norm",
-                    "lm_head": "head",
-                    "scale": "scale",
-                    "input_scale": "input_scale",
-                    "scale_2": "scale_2",
-                }
-                assert key in mapping, f"Key {key} in {name} not found in mapping"
-                new_key = mapping[key]
-                name = name.replace(key, new_key)
                 new_state_dict[name] = state_dict[k]
             state_dict = new_state_dict
 
@@ -2307,13 +1655,21 @@ class TransformerDeepSeekV3(Transformer):
                 state_dict = self._process_state_dict_for_merging_gate_up(state_dict)
 
             state_dict = self._process_state_dict_for_merging_experts(state_dict)
+            if not self.cpu_infer:
+                state_dict = super().process_state_dict_for_renaming_linear_layer(
+                    state_dict,
+                    self.merge_qkv_gate_up,
+                    get_global_args().models.n_dense_layers,
+                )
 
         if self.op_impl == "muxi_custom_kernel":
             rpl_names = self._get_tensor_row_parallel_layer_names()
             cpl_names = self._get_tensor_column_parallel_layer_names()
-            cpl_names = [name for name in cpl_names if name not in {"embed", "head"}]
+            cpl_names = [
+                name for name in cpl_names if name not in {"embed_tokens", "lm_head"}
+            ]
             if self.mla_absorb == "absorb-without-precomp":
-                cpl_names.remove("wkv_b")
+                cpl_names.remove("kv_b_proj")
             state_dict = preprocess_weights_for_native_layout(
                 state_dict, rpl_names, cpl_names
             )
@@ -2324,7 +1680,9 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def _init_pre_layers(self):
-        self.embed = VocabParallelEmbedding(self.params.vocab_size, self.params.dim)
+        self.embed_tokens = VocabParallelEmbedding(
+            self.params.vocab_size, self.params.dim
+        )
 
     @override
     def _init_layers(self, cache, attn_backend, op_impl):
@@ -2352,6 +1710,7 @@ class TransformerDeepSeekV3(Transformer):
                         merge_qkv_gate_up=self.merge_qkv_gate_up,
                         cpu_infer=self.cpu_infer,
                         ggml_type=self.ggml_type[layer_id],
+                        checkpoint_prefix=f"layers.{layer_id}",
                     )
                 )
             else:
@@ -2364,30 +1723,31 @@ class TransformerDeepSeekV3(Transformer):
                         self.op_impl,
                         mla_absorb=self.mla_absorb,
                         merge_qkv_gate_up=self.merge_qkv_gate_up,
+                        checkpoint_prefix=f"layers.{layer_id}",
                     )
                 )
 
     @override
     def _init_post_layers(self):
         self.norm = RMSNorm(self.params.dim)
-        self.head = ColumnParallelLinear(
+        self.lm_head = ColumnParallelLinear(
             self.params.dim,
             self.params.vocab_size,
             has_bias=False,
             dtype=torch.get_default_dtype(),
             gather_output=True,
-            disabled_methods=QuantizationRegistry.get_all_methods(),
+            checkpoint_prefix="lm_head",
         )
 
     @override
     def _pre_layers(self, h):
-        return self.embed(h)
+        return self.embed_tokens(h)
 
     @override
     def _post_layers(self, h):
         """NOTE: _post_layers is assumed to be a token-wise computation"""
         h = self.norm(h, compute_dtype=h.dtype)
-        h = self.head(h)
+        h = self.lm_head(h)
         return h
 
     @override
@@ -2520,7 +1880,7 @@ def compute_softmax_scale_deepseek_v3(args):
 
 def get_linear_layout_contig_x_contig_y(
     op_impl: str,
-    disabled_methods: Optional[Set[str]] = None,
+    checkpoint_prefix: str,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     if op_impl == "muxi_custom_kernel":
@@ -2528,7 +1888,11 @@ def get_linear_layout_contig_x_contig_y(
             len(quant_kwargs) == 0
         ), "quant_kwargs is not supported for muxi_custom_kernel"
         args = get_global_args()
-        quant_method = None if not hasattr(args.models, "quant") else args.models.quant
+        quant_method = (
+            None
+            if not hasattr(args.models, "quant_config")
+            else args.models.quant_config.type
+        )
         if quant_method is None:
             return LinearLayoutContigXContigY
         elif quant_method == "blockfp8":
@@ -2540,5 +1904,5 @@ def get_linear_layout_contig_x_contig_y(
 
     else:
         return QuantizationRegistry.get_quantized_linear_class_from_global_args(
-            disabled_methods=disabled_methods, quant_kwargs=quant_kwargs
+            quant_kwargs=quant_kwargs, checkpoint_prefix=checkpoint_prefix
         )

@@ -22,4 +22,8 @@ void route_gate(torch::Tensor &linear_output, int score_fun, int batchSize,
                 torch::Tensor &selectedExpertsWeights, int topK,
                 c10::optional<torch::Tensor> bias = c10::nullopt);
 
+void topk_softmax(torch::Tensor &topk_weights, torch::Tensor &topk_indices,
+                  torch::Tensor &token_expert_indices,
+                  torch::Tensor &gating_output);
+
 } // namespace chitu

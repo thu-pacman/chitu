@@ -1,0 +1,5 @@
+quant: 
+- model: '.'
+  rules:
+    - regex : 'layers\.'
+      type : simple_w8a8

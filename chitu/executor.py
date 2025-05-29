@@ -20,7 +20,7 @@ from chitu.task import (
     req_decode,
     taskid2reqid,
 )
-from chitu.tensor_parallel import get_tp_group, get_pp_group
+from chitu.tensor_parallel import get_tp_group, get_pp_group, get_cpu_tp_group
 from chitu.utils import VarLens, top_k_top_p_min_p_sampling_from_probs_torch
 
 logger = getLogger(__name__)
@@ -176,6 +176,7 @@ class PipeTensorExecutor(NormalExecutor):
         self.pp_end_stage = Backend.pp_end_stage
         self.last_pp_main_rank = self.pp_end_stage * self.tp_size
         self.tp_group = get_tp_group()
+        self.cpu_tp_group = get_cpu_tp_group()
 
     def prefill_step(self, tasks: PackedTasksBase):
         varlens = VarLens(tasks.tokens, device=self.local_rank)
@@ -321,32 +322,62 @@ class PipeTensorExecutor(NormalExecutor):
         # PP stage 0 initialzie from the argument. PP stage >= 1 recv task tensor from stage - 1
         if self.rank == 0:
             if Backend.state == BackendState.Running:
-                task_tensor = tasks.serialize(device=self.local_rank)
+                task_tensor = tasks.serialize(
+                    device="cpu" if Backend.use_gloo else self.local_rank
+                )
             else:
                 assert Backend.state == BackendState.Terminating
                 task_tensor = PackedTasksBase.serialize_special(
                     SerializedPackedTasksPayloadType.TerminateBackend,
-                    device=self.local_rank,
+                    device="cpu" if Backend.use_gloo else self.local_rank,
                 )
             if self.tp_size > 1:
-                torch.distributed.broadcast(
-                    tensor=task_tensor, src=self.pp_main_rank, group=self.tp_group
-                )
+                if not Backend.use_gloo:
+                    torch.distributed.broadcast(
+                        tensor=task_tensor, src=self.pp_main_rank, group=self.tp_group
+                    )
+                elif self.pp_size == 1:
+                    torch.distributed.broadcast(
+                        tensor=task_tensor,
+                        src=self.pp_main_rank,
+                        group=Backend.group_gloo,
+                    )
+                else:
+                    torch.distributed.broadcast(
+                        tensor=task_tensor,
+                        src=self.pp_main_rank,
+                        group=self.cpu_tp_group,
+                    )
 
         else:
-            task_tensor = PackedTasksBase.empty_serialization(device=self.local_rank)
+            task_tensor = PackedTasksBase.empty_serialization(
+                device="cpu" if Backend.use_gloo else self.local_rank
+            )
             if self.rank == self.pp_main_rank:
                 pg = get_pp_group(self.rank, self.rank - self.tp_size)
                 torch.distributed.recv(
                     tensor=task_tensor,
                     src=self.rank - self.tp_size,
                     tag=TASK_TENSOR_TAG,
-                    group=pg,
+                    group=Backend.group_gloo if Backend.use_gloo else pg,
                 )
             if self.tp_size > 1:
-                torch.distributed.broadcast(
-                    tensor=task_tensor, src=self.pp_main_rank, group=self.tp_group
-                )
+                if not Backend.use_gloo:
+                    torch.distributed.broadcast(
+                        tensor=task_tensor, src=self.pp_main_rank, group=self.tp_group
+                    )
+                elif self.pp_size == 1:
+                    torch.distributed.broadcast(
+                        tensor=task_tensor,
+                        src=self.pp_main_rank,
+                        group=Backend.group_gloo,
+                    )
+                else:
+                    torch.distributed.broadcast(
+                        tensor=task_tensor,
+                        src=self.pp_main_rank,
+                        group=self.cpu_tp_group,
+                    )
             task_tensor_type, tasks = PackedTasksBase.deserialize(task_tensor)
             if task_tensor_type == SerializedPackedTasksPayloadType.TerminateBackend:
                 Backend.state = BackendState.Terminating
@@ -359,7 +390,7 @@ class PipeTensorExecutor(NormalExecutor):
                 tensor=task_tensor,
                 dst=self.rank + self.tp_size,
                 tag=TASK_TENSOR_TAG,
-                group=pg,
+                group=Backend.group_gloo if Backend.use_gloo else pg,
             )
 
         if Backend.state == BackendState.Terminating:
@@ -404,18 +435,25 @@ class TensorExecutor(NormalExecutor):
         remove_kvcache = False
         if Backend.state == BackendState.Running:
             task_tensor = (
-                tasks.serialize(device=self.local_rank)
+                tasks.serialize(device="cpu" if Backend.use_gloo else self.local_rank)
                 if self.rank == 0
-                else PackedTasksBase.empty_serialization(device=self.local_rank)
+                else PackedTasksBase.empty_serialization(
+                    device="cpu" if Backend.use_gloo else self.local_rank
+                )
             )
         else:
             assert Backend.state == BackendState.Terminating
             task_tensor = PackedTasksBase.serialize_special(
                 SerializedPackedTasksPayloadType.TerminateBackend,
-                device=self.local_rank,
+                device="cpu" if Backend.use_gloo else self.local_rank,
             )
             Backend.state = BackendState.Terminated
-        torch.distributed.broadcast(tensor=task_tensor, src=0)
+        if Backend.use_gloo:
+            torch.distributed.broadcast(
+                tensor=task_tensor, src=0, group=Backend.group_gloo
+            )
+        else:
+            torch.distributed.broadcast(tensor=task_tensor, src=0)
 
         if self.rank != 0:
             task_tensor_type, tasks = PackedTasksBase.deserialize(task_tensor)

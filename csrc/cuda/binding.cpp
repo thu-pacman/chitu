@@ -25,6 +25,7 @@ void init_compute(py::module &m) {
     m.def("cuda_rms_norm", &rms_norm, "x"_a, "w"_a, "eps"_a,
           "out"_a = std::nullopt, "");
     m.def("weight_layout_change", &weight_layout_change, "");
+    m.def("cuda_topk_softmax", &topk_softmax, "");
 }
 
 /**

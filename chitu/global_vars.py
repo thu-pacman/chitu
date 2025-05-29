@@ -41,6 +41,44 @@ def set_global_variables(global_args=None):
         )
 
 
+def set_quant_variables(global_args=None):
+    if global_args is None:
+        return
+
+    models = global_args.get("models", {})
+    model_name = models.get("name")
+    assert isinstance(model_name, str)
+
+    model_name = model_name.lower()
+    if not hasattr(models, "quant_config"):
+        return
+
+    quant_config = {"rules": [], "type": models.quant_config.get("type", None)}
+    quant_list = models.quant_config.get("quant", [])
+
+    for config in quant_list:
+        pattern = config.get("model", "")
+        if pattern != "":
+            import re
+
+            if re.match(pattern, model_name):
+                rules = config.get("rules", [])
+                quant_config["rules"] = []
+                if rules and not quant_config["type"]:
+                    first_rule = rules[0]
+                    quant_config["type"] = first_rule.get("type")
+                for index, rule in enumerate(rules):
+                    rule_type = rule.get("type", None)
+                    if not rule_type:
+                        rule_type = quant_config["type"]
+                    quant_config["rules"].append(
+                        {"type": rule_type, "regex": rule.regex}
+                    )
+                models.quant_config = quant_config
+                return
+    models.quant_config = quant_config
+
+
 def _set_slot_handle(max_reqs, pp_size, cache_type):
     global _GLOBAL_SLOT_HANDLE
     _ensure_var_is_not_initialized(_GLOBAL_SLOT_HANDLE, "slot_handle")

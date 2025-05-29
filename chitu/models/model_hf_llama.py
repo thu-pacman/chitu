@@ -1,5 +1,5 @@
 from logging import getLogger
-from typing import Any, List, Mapping
+from typing import Dict, Mapping, Tuple, Optional, Type, Set, List, Any
 import math
 
 import torch
@@ -7,7 +7,15 @@ import torch.nn.functional as F
 from torch import nn
 
 from chitu.attn_backend import AttnBackend
-from chitu.models.model import Attention, RMSNorm, Transformer, TransformerBlock
+from chitu.models.model import (
+    Attention,
+    RMSNorm,
+    Transformer,
+    TransformerBlock,
+    MoeGate,
+    MoeBlock,
+    MoeBlockRegistry,
+)
 from chitu.muxi_utils import (
     LinearLayoutContigXContigY,
     LinearLayoutContigXNativeY,
@@ -21,6 +29,7 @@ from chitu.tensor_parallel import (
     RowParallelLinear,
     VocabParallelEmbedding,
     get_tp_size,
+    get_tp_rank,
 )
 from chitu.global_vars import get_global_args
 from chitu.quantization import QuantizationRegistry
@@ -40,9 +49,15 @@ def get_rms_norm_impl():
     args = get_global_args()
     if args.models.name == "Mixtral-8x7B-Instruct-v0.1":
         impl = "ref"
-    if hasattr(args.models, "quant") and args.models.quant == "simple_w8a8":
+    if (
+        hasattr(args.models, "quant_config")
+        and args.models.quant_config.type == "simple_w8a8"
+    ):
         impl = "ref"
-    if hasattr(args.models, "quant") and args.models.quant == "simple_w8a8_muxi":
+    if (
+        hasattr(args.models, "quant_config")
+        and args.models.quant_config.type == "simple_w8a8_muxi"
+    ):
         impl = "ref"
 
     return impl
@@ -58,6 +73,7 @@ class AttentionHFLlama(Attention):
         rotary_type="hf-llama",
         op_impl: str = "torch",
         merge_qkv: bool = True,
+        checkpoint_prefix="",
     ):
         super().__init__(layer_id, cache, attn_backend)
         self.rotary_type = rotary_type
@@ -90,6 +106,7 @@ class AttentionHFLlama(Attention):
                 has_bias=qkv_has_bias,
                 gather_output=False,
                 base_linear_class=qkv_proj_linear,
+                checkpoint_prefix=f"{checkpoint_prefix}.qkv_proj",
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -98,6 +115,7 @@ class AttentionHFLlama(Attention):
                 has_bias=qkv_has_bias,
                 gather_output=False,
                 base_linear_class=qkv_proj_linear,
+                checkpoint_prefix=f"{checkpoint_prefix}.q_proj",
             )
             self.k_proj = ColumnParallelLinear(
                 args.dim,
@@ -105,6 +123,7 @@ class AttentionHFLlama(Attention):
                 has_bias=qkv_has_bias,
                 gather_output=False,
                 base_linear_class=qkv_proj_linear,
+                checkpoint_prefix=f"{checkpoint_prefix}.k_proj",
             )
             self.v_proj = ColumnParallelLinear(
                 args.dim,
@@ -112,6 +131,7 @@ class AttentionHFLlama(Attention):
                 has_bias=qkv_has_bias,
                 gather_output=False,
                 base_linear_class=qkv_proj_linear,
+                checkpoint_prefix=f"{checkpoint_prefix}.v_proj",
             )
         self.o_proj = RowParallelLinear(
             args.n_heads * self.head_dim,
@@ -119,6 +139,7 @@ class AttentionHFLlama(Attention):
             has_bias=o_has_bias,
             input_is_parallel=True,
             base_linear_class=o_proj_linear,
+            checkpoint_prefix=f"{checkpoint_prefix}.o_proj",
         )
 
         if "Qwen3" in args.name:
@@ -275,7 +296,12 @@ class AttentionHFLlama(Attention):
 
 class FeedForwardHFLlama(nn.Module):
     def __init__(
-        self, dim: int, hidden_dim: int, op_impl: str, merge_gate_up: bool = True
+        self,
+        dim: int,
+        hidden_dim: int,
+        op_impl: str,
+        merge_gate_up: bool = True,
+        checkpoint_prefix="",
     ):
         super().__init__()
         self.op_impl = op_impl
@@ -293,6 +319,7 @@ class FeedForwardHFLlama(nn.Module):
                 has_bias=False,
                 gather_output=False,
                 base_linear_class=gate_up_proj_linear,
+                checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
             )
         else:
             self.gate_proj = ColumnParallelLinear(
@@ -301,6 +328,7 @@ class FeedForwardHFLlama(nn.Module):
                 has_bias=False,
                 gather_output=False,
                 base_linear_class=gate_up_proj_linear,
+                checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
             )
             self.up_proj = ColumnParallelLinear(
                 dim,
@@ -308,6 +336,7 @@ class FeedForwardHFLlama(nn.Module):
                 has_bias=False,
                 gather_output=False,
                 base_linear_class=gate_up_proj_linear,
+                checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
             )
         self.down_proj = RowParallelLinear(
             hidden_dim,
@@ -315,6 +344,7 @@ class FeedForwardHFLlama(nn.Module):
             has_bias=False,
             input_is_parallel=True,
             base_linear_class=down_proj_linear,
+            checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
         )
 
     def forward(self, x):
@@ -345,89 +375,95 @@ class FeedForwardHFLlama(nn.Module):
         return self.down_proj(silu_and_mul_out)
 
 
-class Qwen3MoeBlock(nn.Module):
+class Qwen3MoeGate(MoeGate):
     def __init__(
         self,
-        dim: int,
-        hidden_dim: int,
+        args,
+        op_impl: str,
+    ):
+        params = get_global_args().models
+        super().__init__(
+            op_impl,
+            args.dim,
+            topk=(
+                params.num_experts_per_tok
+                if hasattr(params, "num_experts_per_tok")
+                else 8
+            ),
+            n_groups=1,
+            topk_groups=1,
+            score_func="softmax",
+            route_scale=1,
+            n_experts=params.num_experts if hasattr(params, "num_experts") else 128,
+            bias=None,
+            norm_prob=(
+                params.norm_topk_prob if hasattr(params, "norm_topk_prob") else False
+            ),
+        )
+
+
+class Qwen3_params_resolver:
+    def __init__(
+        self,
+        args,
         op_impl: str,
         merge_gate_up: bool,
         layer_idx: int,
+        checkpoint_prefix: str,
     ):
-        super().__init__()
         params = get_global_args().models
+        super().__init__(
+            dim=args.dim,
+            moe_inter_dim=args.moe_intermediate_dim,
+            n_routed_experts=(
+                params.num_experts if hasattr(params, "num_experts") else 128
+            ),
+            n_shared_experts=0,
+            n_activated_experts=0,
+            moe_world_size=1,
+            moe_rank=0,
+            do_gather_output=False,
+            merge_gate_up=merge_gate_up,
+            op_impl=op_impl,
+            dtype=params.dtype if hasattr(params, "dtype") else "bfloat16",
+            gate=Qwen3MoeGate(args, op_impl),
+            fuse_shared_experts=False,
+            shared_experts=None,
+            checkpoint_prefix=checkpoint_prefix,
+        )
         self.layer_idx = layer_idx
-        self.num_experts: int = (
-            params.num_experts if hasattr(params, "num_experts") else 128
-        )
-        self.top_k: int = (
-            params.num_experts_per_tok if hasattr(params, "num_experts_per_tok") else 8
-        )
-        self.norm_prob: bool = (
-            params.norm_topk_prob if hasattr(params, "norm_topk_prob") else False
-        )
 
-        self.gate = nn.Linear(dim, self.num_experts, bias=False)
-        self.experts = nn.ModuleList(
-            [
-                FeedForwardHFLlama(
-                    dim=dim,
-                    hidden_dim=hidden_dim,
-                    op_impl=op_impl,
-                    merge_gate_up=merge_gate_up,
-                )
-                for _ in range(self.num_experts)
-            ]
+
+def Qwen3MoeBlock(
+    args,
+    merge_gate_up: bool,
+    op_impl: str,
+    layer_idx: int,
+    checkpoint_prefix: str,
+    base_moe_class: Optional[type] = None,
+    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+):
+    if base_moe_class is None:
+        base_moe_class = MoeBlockRegistry.get_quantized_MoeBlock_class_from_global_args(
+            quant_kwargs=quant_kwargs,
+            checkpoint_prefix=f"{checkpoint_prefix}.moe",
         )
 
-    def forward(self, x):
-        bs_seq, dim = x.shape[:-1], x.shape[-1]
-        x = x.view(-1, dim)  # shape=(bsz*seq_len,dim)
-        router_scores = self.gate(x)  # shape=(bsz*seq_len,num_experts)
-        routing_weights = F.softmax(router_scores, dim=-1)
-        routing_weights, chosen_experts = torch.topk(
-            routing_weights, self.top_k, dim=-1
-        )  # (bsz*seq_len,topk)
-        if self.norm_prob:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        if torch.isnan(routing_weights).any() or torch.isinf(routing_weights).any():
-            raise ValueError(
-                f"Layer {self.layer_idx}: Routing weights contain nan/inf!"
-            )
+    class MoeBlockImpl(Qwen3_params_resolver, base_moe_class):
+        # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
+        # of the final class, so we can append a class to the base class, to make it act like a
+        # further base class of the original base class.
+        # See https://docs.python.org/3/tutorial/classes.html#multiple-inheritance
 
-        routing_weights, chosen_experts = (
-            routing_weights.flatten(),
-            chosen_experts.flatten(),
-        )  # shape=(bsz*seq_len*topk,)
-        sorted_experts, sorted_idx = torch.sort(chosen_experts)
-        sorted_weights = routing_weights[sorted_idx]
-        token_idx = (
-            torch.arange(x.shape[0], device=x.device)[:, None]
-            .expand(-1, self.top_k)
-            .flatten()
-        )
-        sorted_tokens_idx = token_idx[sorted_idx]
+        pass
 
-        unique_experts, counts = torch.unique(sorted_experts, return_counts=True)
-        expert_start_idx = torch.cat(
-            [torch.tensor([0], device=counts.device), counts.cumsum(dim=-1)]
-        )
-
-        outputs = torch.zeros(x.shape, dtype=x.dtype, device=x.device)
-        for i in range(len(unique_experts)):
-            expert_idx = unique_experts[i]
-            start = expert_start_idx[i]
-            end = expert_start_idx[i + 1]
-            curr_tokens_idx = sorted_tokens_idx[start:end]  # shape=(end-start,)
-            curr_expert_weights = sorted_weights[start:end]  # shape=(end-start,)
-
-            ffn_inputs = x[curr_tokens_idx]  # shape=(end-start,dim)
-            expert_outputs = (
-                self.experts[expert_idx](ffn_inputs) * curr_expert_weights[:, None]
-            )
-            outputs.index_add_(0, curr_tokens_idx, expert_outputs)
-        outputs = outputs.reshape(*bs_seq, dim)
-        return outputs
+    return MoeBlockImpl(
+        args=args,
+        merge_gate_up=merge_gate_up,
+        op_impl=op_impl,
+        layer_idx=layer_idx,
+        checkpoint_prefix=f"{checkpoint_prefix}.moe",
+    )
 
 
 class TransformerBlockHFLlama(TransformerBlock):
@@ -441,6 +477,7 @@ class TransformerBlockHFLlama(TransformerBlock):
         rotary_type="hf-llama",
         mlp_type=FeedForwardHFLlama,
         merge_qkv_gate_up=True,
+        checkpoint_prefix="",
     ):
         super().__init__(layer_id, args, cache, attn_backend, op_impl)
         self.self_attn = AttentionHFLlama(
@@ -451,15 +488,16 @@ class TransformerBlockHFLlama(TransformerBlock):
             rotary_type=rotary_type,
             op_impl=op_impl,
             merge_qkv=merge_qkv_gate_up,
+            checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
         )
         if args.name in {"Qwen3-30B-A3B", "Qwen3-235B-A22B"}:
             mlp_type = Qwen3MoeBlock
             self.mlp = mlp_type(
-                dim=args.dim,
-                hidden_dim=args.moe_intermediate_dim,
+                args=args,
                 op_impl=op_impl,
                 merge_gate_up=merge_qkv_gate_up,
                 layer_idx=layer_id,
+                checkpoint_prefix=f"{checkpoint_prefix}.mlp",
             )
         else:
             self.mlp = mlp_type(
@@ -467,6 +505,7 @@ class TransformerBlockHFLlama(TransformerBlock):
                 hidden_dim=args.intermediate_dim,
                 op_impl=op_impl,
                 merge_gate_up=merge_qkv_gate_up,
+                checkpoint_prefix=f"{checkpoint_prefix}.mlp",
             )
         self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
         self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -778,6 +817,64 @@ class TransformerHFLlama(Transformer):
             state_dict, skip_preprocess=skip_preprocess, *args, **kwargs
         )
 
+    def _process_state_dict_for_merging_expert_weights(
+        self, checkpoint: Mapping[str, Any], merge_gate_up: bool
+    ):
+        """
+        重构专家权重结构的函数
+        参数格式示例：
+        输入键：'layers.3.mlp.experts.1.gate_proj.weight'
+        输出键：'layers.3.mlp.gate_proj.weight' (合并所有该层的专家权重)
+        """
+        from collections import defaultdict
+        import re
+
+        new_checkpoint = {}
+        if not merge_gate_up:
+            gate_proj_weights = defaultdict(lambda: defaultdict(list))
+            down_proj_weights = defaultdict(lambda: defaultdict(list))
+            up_proj_weights = defaultdict(lambda: defaultdict(list))
+            weight_lists = [gate_proj_weights, down_proj_weights, up_proj_weights]
+            pattern_lists = [
+                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_proj\.weight",
+                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\.weight",
+                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.up_proj\.weight",
+            ]
+            tensor_names = ["gate_proj", "down_proj", "up_proj"]
+        else:
+            gate_up_proj_weights = defaultdict(lambda: defaultdict(list))
+            down_proj_weights = defaultdict(lambda: defaultdict(list))
+            weight_lists = [gate_up_proj_weights, down_proj_weights]
+            pattern_lists = [
+                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_up_proj\.weight",
+                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\.weight",
+            ]
+            tensor_names = ["gate_up_proj", "down_proj"]
+
+        for key in checkpoint:
+            matched = False
+            for weight_list, pattern in zip(weight_lists, pattern_lists):
+                match = re.match(pattern, key)
+                if match:
+                    layer_idx, expert_idx = map(int, match.groups())
+                    weight_list[layer_idx][expert_idx] = checkpoint[key]
+                    matched = True
+                    break
+            if not matched:
+                new_checkpoint[key] = checkpoint[key]
+
+        for weight_list, tensor_name in zip(weight_lists, tensor_names):
+            for layer in weight_list:
+                experts_ordered = [
+                    weight_list[layer][e] for e in sorted(weight_list[layer])
+                ]
+                stacked_weights = torch.stack(experts_ordered, dim=0)
+
+                new_key = f"layers.{layer}.mlp.{tensor_name}.weight"
+                new_checkpoint[new_key] = stacked_weights
+
+        return new_checkpoint
+
     def load_state_dict(
         self,
         state_dict: Mapping[str, Any],
@@ -801,6 +898,18 @@ class TransformerHFLlama(Transformer):
                     state_dict, rpl_names, cpl_names
                 )
 
+            if get_global_args().models.name in [
+                "Qwen3-30B-A3B",
+                "Qwen3-235B-A22B",
+            ]:
+                # Qwen3 models have a special structure for experts, so we need to merge them.
+                state_dict = self._process_state_dict_for_merging_expert_weights(
+                    state_dict, self.merge_qkv_gate_up
+                )
+                state_dict = super().process_state_dict_for_renaming_linear_layer(
+                    state_dict, self.merge_qkv_gate_up, n_dense_layers=0
+                )
+
         super().load_state_dict(
             state_dict, skip_preprocess=skip_preprocess, *args, **kwargs
         )
@@ -822,6 +931,7 @@ class TransformerHFLlama(Transformer):
                     op_impl=op_impl,
                     rotary_type=self.rotary_type,
                     merge_qkv_gate_up=self.merge_qkv_gate_up,
+                    checkpoint_prefix=f"layers.{layer_id}",
                 )
             )
 
@@ -831,7 +941,7 @@ class TransformerHFLlama(Transformer):
             self.params.dim,
             self.params.vocab_size,
             has_bias=False,
-            disabled_methods=QuantizationRegistry.get_all_methods(),
+            checkpoint_prefix=f"lm_head",
         )
 
     def _pre_layers(self, h):
@@ -951,7 +1061,11 @@ class RotaryEmbeddingHFLlama(nn.Module):
 def get_linear_layout_contig_x_native_y(op_impl: str):
     if op_impl == "muxi_custom_kernel":
         args = get_global_args()
-        quant_method = None if not hasattr(args.models, "quant") else args.models.quant
+        quant_method = (
+            None
+            if not hasattr(args.models, "quant_config")
+            else args.models.quant_config.type
+        )
         if quant_method is None:
             return LinearLayoutContigXNativeY
         elif quant_method == "blockfp8":
@@ -969,7 +1083,11 @@ def get_linear_layout_contig_x_native_y(op_impl: str):
 def get_linear_layout_native_x_contig_y(op_impl: str):
     if op_impl == "muxi_custom_kernel":
         args = get_global_args()
-        quant_method = None if not hasattr(args.models, "quant") else args.models.quant
+        quant_method = (
+            None
+            if not hasattr(args.models, "quant_config")
+            else args.models.quant_config.type
+        )
         if quant_method is None:
             return LinearLayoutNativeXContigY
         elif quant_method == "blockfp8":
@@ -987,7 +1105,11 @@ def get_linear_layout_native_x_contig_y(op_impl: str):
 def get_linear_layout_contig_x_contig_y(op_impl: str):
     if op_impl == "muxi_custom_kernel":
         args = get_global_args()
-        quant_method = None if not hasattr(args.models, "quant") else args.models.quant
+        quant_method = (
+            None
+            if not hasattr(args.models, "quant_config")
+            else args.models.quant_config.type
+        )
         if quant_method is None:
             return LinearLayoutContigXContigY
         elif quant_method == "blockfp8":

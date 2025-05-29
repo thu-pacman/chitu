@@ -1,0 +1,7 @@
+quant: 
+- model: '.'
+  rules:
+    - regex : 'layers\.'
+      type : blockfp8
+      kwargs:
+        bits : 4
