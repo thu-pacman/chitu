@@ -71,7 +71,7 @@ def chitu_init(args, logging_level=logging.INFO):
     Backend.build(args)
     rank = torch.distributed.get_rank()
     if rank == 0:
-        scheduler = Scheduler.build(args.scheduler)
+        scheduler = Scheduler.build(args.scheduler, args.infer)
         Backend.scheduler = scheduler
     executor = Executor.build(args)
     Backend.executor = executor

@@ -12,7 +12,7 @@ logger = getLogger(__name__)
 
 class Scheduler:
     @staticmethod
-    def build(args):
+    def build(args, infer_args):
         if args.type.lower() == "fifo" or args.type.lower() == "fcfs":
             return FcfsScheduler(args.fcfs.num_tasks, args.fcfs.enable_hybrid)
         if args.type.lower() == "prefill_first":
@@ -23,7 +23,14 @@ class Scheduler:
                 )
             else:
                 return PrefillFirstScheduler(
-                    args.prefill_first.num_tasks, args.prefill_first.enable_hybrid
+                    args.prefill_first.num_tasks,
+                    args.prefill_first.enable_hybrid,
+                    infer_args.pp_size,
+                    infer_args.max_reqs,
+                    args.prefill_first.pp_config.prefill_num_tasks_divided_by_pp,
+                    args.prefill_first.pp_config.prefill_num_tasks,
+                    args.prefill_first.pp_config.enforce_decoder_num_tasks_max,
+                    args.prefill_first.pp_config.decoder_num_tasks,
                 )
         if args.type.lower() == "stride":
             return StrideScheduler(args.stride.num_tasks, args.stride.enable_hybrid)
@@ -100,18 +107,45 @@ class PrefillFirstScheduler(Scheduler):
     decode tasks will be selected only if no prefill task
     """
 
-    def __init__(self, num_tasks: int, enable_hybrid: bool):
+    def __init__(
+        self,
+        num_tasks: int,
+        enable_hybrid: bool,
+        pp_size: int,
+        max_reqs: int,
+        prefill_num_tasks_divided_by_pp: bool,
+        prefill_num_tasks: int,
+        enforce_decoder_num_tasks_max: bool,
+        decoder_num_tasks: int,
+    ):
         super().__init__()
         assert num_tasks > 0, "num_tasks must be greater than 0"
         self.num_tasks = num_tasks
         self.enable_hybrid = enable_hybrid
+        self.pp_size = pp_size
+        self.max_reqs = max_reqs
+        self.prefill_num_tasks_divided_by_pp = prefill_num_tasks_divided_by_pp
+        self.prefill_num_tasks = prefill_num_tasks
+        self.enforce_decoder_num_tasks_max = enforce_decoder_num_tasks_max
+        self.decoder_num_tasks = decoder_num_tasks
 
     def schedule(self) -> List[str]:
+        max_reqs_can_handle = min(self.max_reqs, len(TaskPool.id_list))
+
         prefill_task_ids = filter(
             lambda x: TaskPool.pool[x].task_type == TaskType.Prefill
             and not TaskPool.pool[x].waiting,
             TaskPool.id_list,
         )
+
+        if self.pp_size > 1:
+            if self.prefill_num_tasks_divided_by_pp:
+                self.num_tasks = (
+                    max_reqs_can_handle // self.pp_size or max_reqs_can_handle
+                )
+            else:
+                self.num_tasks = self.prefill_num_tasks
+
         # select at most num_tasks prefill tasks
         ret_task_ids = list(prefill_task_ids)[: self.num_tasks]
         # if no prefill tasks or enable hybrid, select decode tasks if there is room left
@@ -123,6 +157,17 @@ class PrefillFirstScheduler(Scheduler):
                 and not TaskPool.pool[x].waiting,
                 TaskPool.id_list,
             )
+
+            if self.pp_size > 1:
+                if self.enforce_decoder_num_tasks_max:
+                    self.num_tasks = max_reqs_can_handle
+                    if self.max_reqs >= len(TaskPool.id_list) and any(
+                        TaskPool.pool[task].waiting for task in TaskPool.id_list
+                    ):
+                        return ret_task_ids
+                else:
+                    self.num_tasks = self.decoder_num_tasks
+
             ret_task_ids.extend(
                 list(decode_task_ids)[: self.num_tasks - len(ret_task_ids)]
             )
