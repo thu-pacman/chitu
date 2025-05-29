@@ -74,6 +74,8 @@ class Backend:
     ongoing_reqs = []
     cache_type = ""
     state = BackendState.Running
+    use_gloo = True
+    group_gloo = None
     pp_stage = None
     pp_end_stage = None
     pp_main_rank = None
@@ -94,6 +96,7 @@ class Backend:
         else:
             assert False, f"Unknown model type {args.models.type}"
 
+    # FIXME: When cache type is "skew", gloo backend cannot be used.
     @staticmethod
     def _init_distributed(args):
         """
@@ -104,6 +107,10 @@ class Backend:
         """
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group("nccl")
+
+        Backend.use_gloo = not args.infer.cache_type == "skew"
+        if Backend.use_gloo:
+            Backend.group_gloo = torch.distributed.new_group(backend="gloo")
 
         model_parallel_size = args.infer.tp_size
         pipeline_parallel_size = args.infer.pp_size
@@ -116,7 +123,7 @@ class Backend:
         ), "World size not match"
 
         torch.cuda.set_device(local_rank)
-        init_tp(model_parallel_size, pipeline_parallel_size)
+        init_tp(model_parallel_size, pipeline_parallel_size, Backend.use_gloo)
 
         if args.infer.attn_type == "npu":
             from chitu.tensor_parallel import init_pp_group_npu

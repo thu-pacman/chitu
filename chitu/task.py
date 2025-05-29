@@ -396,21 +396,22 @@ class PackedTasksBase:
 
         task_types = []
         req_ids = []
-        task_tensor_cpu = task_tensor.cpu()
-        payload_type = SerializedPackedTasksPayloadType(task_tensor_cpu[0].item())
+        if not Backend.use_gloo:
+            task_tensor = task_tensor.cpu()
+        payload_type = SerializedPackedTasksPayloadType(task_tensor[0].item())
 
         decoded_ids = []
         decoded_types = []
         lens = []
         for it in range(cls.max_num_tasks):
-            task_id = task_tensor_cpu[1 + it].item()
+            task_id = task_tensor[1 + it].item()
             if task_id == 0:
                 break
             decoded_id, decoded_type = req_decode(task_id)
             decoded_ids.append(decoded_id)
             decoded_types.append(decoded_type)
             if decoded_type == TaskType.Prefill:
-                lens.append(int(task_tensor_cpu[1 + cls.max_num_tasks + it]))
+                lens.append(int(task_tensor[1 + cls.max_num_tasks + it]))
         task_ids = decoded_ids
         req_ids = task_ids
         num_tasks = len(task_ids)
@@ -424,7 +425,7 @@ class PackedTasksBase:
 
         slot_handle = get_slot_handle()
         if slot_handle:
-            slot_handle.set_slot_idx(task_tensor_cpu[-1].item())
+            slot_handle.set_slot_idx(task_tensor[-1].item())
 
         return payload_type, cls(num_tasks, task_ids, req_ids, task_type, tokens)
 

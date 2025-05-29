@@ -15,6 +15,7 @@ from chitu.global_vars import get_global_args
 from chitu.quantization import QuantizationRegistry
 
 tp_comm_group = None
+cpu_tp_comm_group = None
 pp_group = {}
 
 
@@ -22,14 +23,19 @@ def generate_tp_rank_list(tp_size: int, pp_size: int):
     return torch.arange(tp_size * pp_size).reshape(pp_size, tp_size).tolist()
 
 
-def init_tp(tp_size: int, pp_size: int):
+def init_tp(tp_size: int, pp_size: int, use_gloo: bool):
     global tp_comm_group
+    global cpu_tp_comm_group
     rank_list = generate_tp_rank_list(tp_size, pp_size)
     global_rank = torch.distributed.get_rank()
     for ranks in rank_list:
         group = torch.distributed.new_group(ranks)
+        cpu_group = (
+            torch.distributed.new_group(ranks, backend="gloo") if use_gloo else None
+        )
         if global_rank in ranks:
             tp_comm_group = group
+            cpu_tp_comm_group = cpu_group
 
 
 def init_pp_group_npu(tp_size: int, pp_size: int):
@@ -56,6 +62,10 @@ def get_pp_group(rank1, rank2):
 
 def get_tp_group():
     return tp_comm_group
+
+
+def get_cpu_tp_group():
+    return cpu_tp_comm_group
 
 
 def get_tp_size():
