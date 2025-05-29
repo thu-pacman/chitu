@@ -8,6 +8,8 @@ Chitu is a high-performance inference framework for large language models, focus
 
 ## News
 
+[2025/05/29] Release v0.3.4, with some performance optimizations.
+
 [2025/05/22] Released v0.3.3, with initial support for Ascend NPU.
 
 [2025/05/15] Released v0.3.2, added support for [Qwen3 models](https://huggingface.co/collections/Qwen/qwen3-67dd247413f0e2e4f653967f).
@@ -180,7 +182,43 @@ curl localhost:21002/v1/chat/completions \
     ]
   }'
 ```
+### Pipeline Configuration
 
+#### Micro Batch Size
+|Parameter|Default|Description|
+|:---|:---|:---|
+|prefill_num_tasks_divided_by_pp| True | When pp_size > 1, setting this to True means prefill_num_tasks = cur_req_size / pp_size |
+|prefill_num_tasks| 8 | Takes effect only when prefill_num_tasks_divided_by_pp is False. Specifies the max number of tasks in the prefill stage |
+|enforce_decoder_num_tasks_max| True | When pp_size > 1, setting this to True means decoder_num_tasks = cur_req_size / pp_size |
+|decoder_num_tasks| 8 | Takes effect only when enforce_decoder_num_tasks_max is False. Specifies the max number of concurrent tasks in the decoder stage |
+
+Usage Example
+```
+# Adjust micro batch size by configuring scheduler.prefill_first.pp_config
+
+torchrun --nnodes 1 \
+    --nproc_per_node 8 \
+    --master_port=22525 \
+    -m chitu \
+    serve.port=21002 \
+    infer.cache_type=paged \
+    infer.pp_size=2 \
+    infer.tp_size=4 \
+    models=DeepSeek-R1 \
+    models.ckpt_dir=/data/DeepSeek-R1 \
+    keep_dtype_in_checkpoint=True \
+    infer.mla_absorb=absorb-without-precomp \
+    infer.raise_lower_bit_float_to=bfloat16 \
+    infer.do_load=True \
+    infer.max_reqs=1 \
+    scheduler.prefill_first.pp_config.prefill_num_tasks_divided_by_pp=False \
+    scheduler.prefill_first.pp_config.prefill_num_tasks=8 \
+    scheduler.prefill_first.pp_config.enforce_decoder_num_tasks_max=True \
+    scheduler.prefill_first.pp_config.decoder_num_tasks=8 \
+    infer.max_seq_len=4096 \
+    request.max_new_tokens=100 \
+    infer.use_cuda_graph=True
+```
 ### Benchmarking
 
 ```bash

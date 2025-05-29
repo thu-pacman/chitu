@@ -30,6 +30,11 @@ scheduler:
   prefill_first:
     num_tasks: 8
     enable_hybrid: False
+    pp_config:
+      prefill_num_tasks_divided_by_pp: True
+      prefill_num_tasks: 8
+      enforce_decoder_num_tasks_max: True
+      decoder_num_tasks: 8
   stride:
     num_tasks: 2
     enable_hybrid: False
