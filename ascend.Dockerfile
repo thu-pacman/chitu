@@ -1,7 +1,8 @@
-FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel AS base
+# NOTE: CANN version is coupled with torch-npu version.
+# See https://github.com/Ascend/pytorch/tags for the mapping.
+FROM quay.io/ascend/cann:8.2.rc1.alpha002-910b-ubuntu22.04-py3.10 AS base
 
-ARG torch_cuda_arch_list='7.0 7.5 8.0 8.6 8.9 9.0+PTX'
-ARG optional_deps='flash_attn,flash_mla,flashinfer'
+ARG optional_deps=''
 ARG build_jobs=''
 ARG enable_editable_install='false'
 ARG enable_cython='true'
@@ -28,11 +29,6 @@ fi
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 
-ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
-
-RUN apt update -y && apt install -y git gcc-10 g++-10
-
-# NOTE: Always apt update before apt install to avoid out-dated docker cache
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
 
@@ -42,10 +38,24 @@ RUN if [ "${enable_test}" = "true" ]; then \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest; \
 fi
 
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$(lscpu | grep x86)" ]; then \
+        pip install -U torch==2.5.1+cpu -i https://download.pytorch.org/whl/cpu; \
+    else \
+        pip install -U torch==2.5.1 -i https://pypi.tuna.tsinghua.edu.cn/simple; \
+    fi
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install pyyaml setuptools -i https://pypi.tuna.tsinghua.edu.cn/simple
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install torch-npu==2.5.1 -i https://pypi.tuna.tsinghua.edu.cn/simple
+
 WORKDIR /workspace/chitu
 COPY . .
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt
-RUN --mount=type=cache,target=/root/.cache/pip \
-    bash script/install.sh "${optional_deps}" "${build_jobs}" "${enable_editable_install}" "${enable_cython}"
+
+ENV ASCEND_PLATFORM=1
+
+# The actual installing procedure requries a NPU device, which is not available in the `docker build` stage.
+# We delay it to an additional `docker run` stage which runs `script/install.sh`.

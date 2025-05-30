@@ -4,6 +4,7 @@ ARG optional_deps=''
 ARG build_jobs=''
 ARG enable_editable_install='false'
 ARG enable_cython='true'
+ARG enable_test='false'
 
 # The base image uses Conda as the Python environment. We need to activate it
 # For `docker build` stage, the most straightforward way is to use `bash --login -c` as the shell
@@ -24,12 +25,27 @@ RUN if [ "{enable_cython}" = "true" ] && [ "${enable_editable_install}" = "true"
     echo "Cython is not supported when installing in editable mode"; \
     exit 1; \
 fi
+RUN if [ "${enable_test}" != "true" ] && [ "${enable_test}" != "false" ]; then \
+    echo "ARG enable_test must either be 'true' or 'false'"; \
+    exit 1; \
+fi
+
+# Required for non-interactive apt install
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# NOTE: Always apt update before apt install to avoid out-dated docker cache
+RUN if [ "${enable_test}" = "true" ]; then \
+    apt update -y && apt install -y expect && \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest; \
+fi
 
 WORKDIR /workspace/chitu
 COPY . .
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt
 
