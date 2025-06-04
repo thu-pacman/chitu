@@ -386,13 +386,12 @@ class PipeTensorExecutor(NormalExecutor):
 
         if self.rank == self.pp_main_rank and self.pp_stage != self.pp_end_stage:
             pg = get_pp_group(self.rank, self.rank + self.tp_size)
-            torch.distributed.isend(
+            torch.distributed.send(
                 tensor=task_tensor,
                 dst=self.rank + self.tp_size,
                 tag=TASK_TENSOR_TAG,
                 group=Backend.group_gloo if Backend.use_gloo else pg,
             )
-
         if Backend.state == BackendState.Terminating:
             Backend.state = BackendState.Terminated
         if Backend.state == BackendState.Terminated:
