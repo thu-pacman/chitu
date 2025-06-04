@@ -1,12 +1,13 @@
-# Qwen3-32B-fp4 is a quantization of Qwen3-32B
 defaults:
-  - Qwen3-32B
-  - quant_config: blockfp4
+  - Qwen3-30B-A3B
+  - quant_config: mix-fp4-fp8
   - _self_ # Config in this file overrides configs in defaults
 
-# Access info
-name: Qwen3-32B-fp4
-source: "https://huggingface.co/qingcheng-ai/Qwen3-32B-fp4" # Just for displaying. No automatic download.
+
+name: Qwen3-30B-A3B-mix-fp4-fp8
+type: hf-llama
+source: "https://huggingface.co/Qwen/Qwen3-30B-A3B" # Just for displaying. No automatic download.
 ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
 tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+
 

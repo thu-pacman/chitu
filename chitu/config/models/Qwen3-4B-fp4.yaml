@@ -1,6 +1,7 @@
 # Qwen3-4B-fp4 is a quantization of Qwen3-4B
 defaults:
   - Qwen3-4B
+  - quant_config: blockfp4
   - _self_ # Config in this file overrides configs in defaults
 
 # Access info
@@ -9,5 +10,3 @@ source: "(This is an internal quantized model, only for testing purpose)" # Just
 ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
 tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
 
-# Overrides
-quant: blockfp4

@@ -6,8 +6,7 @@ import functools
 from dataclasses import dataclass
 from logging import getLogger
 from pathlib import Path
-from typing import Dict, Mapping, Tuple, Optional, Type, Set, List, Any
-
+from typing import Any, List, Mapping, Optional, Dict, Type, Set
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -374,50 +373,30 @@ class Transformer(nn.Module):
     def _get_layer_i_prefixes(self, i: int) -> List[str]:
         raise NotImplementedError
 
-    def _get_2d_out_x_in_tensor_names(self) -> List[str]:
+    def _get_2d_out_x_in_tensor_names(self, quant) -> List[str]:
         ret = ["weight"]
-        quant = (
-            self.params.quant_config.type
-            if hasattr(self.params, "quant_config")
-            else None
-        )
         if quant == "blockfp8" or quant == "gguf-blockfp8":
             ret += ["scale"]
         elif quant == "blockfp4":
             ret += ["weight_scale", "weight_scale_2", "input_scale"]
         return ret
 
-    def _get_2d_in_x_out_tensor_names(self) -> List[str]:
+    def _get_2d_in_x_out_tensor_names(self, quant) -> List[str]:
         ret = []
-        quant = (
-            self.params.quant_config.type
-            if hasattr(self.params, "quant_config")
-            else None
-        )
         if quant == "autoawq":
             ret += ["qweight", "qzeros", "scales"]
         elif quant == "gptqmodel":
             ret += ["qweight", "qzeros", "scales"]
         return ret
 
-    def _get_1d_in_tensor_names(self) -> List[str]:
+    def _get_1d_in_tensor_names(self, quant) -> List[str]:
         ret = []
-        quant = (
-            self.params.quant_config.type
-            if hasattr(self.params, "quant_config")
-            else None
-        )
         if quant == "gptqmodel":
             ret += ["g_idx"]
         return ret
 
-    def _get_1d_out_tensor_names(self) -> List[str]:
+    def _get_1d_out_tensor_names(self, quant) -> List[str]:
         ret = ["bias"]
-        quant = (
-            self.params.quant_config.type
-            if hasattr(self.params, "quant_config")
-            else None
-        )
         if quant == "simple_w8a8":
             ret += ["scale_channel"]
         if quant == "simple_w8a8_muxi":
@@ -471,18 +450,17 @@ class Transformer(nn.Module):
         cpl_names = self._get_tensor_column_parallel_layer_names()
         rpl_names = self._get_tensor_row_parallel_layer_names()
 
-        quant = (
-            self.params.quant_config.type
-            if hasattr(self.params, "quant_config")
-            else None
-        )
-
         for name, param in checkpoint.items():
+            quant = None
+            for rule in self.params.quant_config.rules:
+                pattern = rule.get("regex")
+                if pattern and re.search(pattern, name):
+                    quant = rule.type
+                    break
             if any(is_layer(s, name) for s in cpl_names):
-                if (
-                    name.split(".")[-1]
-                    in self._get_1d_in_tensor_names() + self._get_1d_out_tensor_names()
-                ):
+                if name.split(".")[-1] in self._get_1d_in_tensor_names(
+                    quant
+                ) + self._get_1d_out_tensor_names(quant):
                     assert (
                         param.dim() == 1
                     ), f"{name} is expected to be 1D, but got {param.dim()}D"
@@ -492,7 +470,7 @@ class Transformer(nn.Module):
                         assert param.shape[0] % world_size == 0
                         chunks = torch.chunk(param, world_size, dim=0)
                         partial_checkpoint[name] = chunks[rank]
-                elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names():
+                elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names(quant):
                     assert (
                         param.dim() == 2
                     ), f"{name} is expected to be 2D, but got {param.dim()}D"
@@ -502,7 +480,7 @@ class Transformer(nn.Module):
                         assert param.shape[0] % world_size == 0
                         chunks = torch.chunk(param, world_size, dim=0)
                         partial_checkpoint[name] = chunks[rank]
-                elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names():
+                elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names(quant):
                     assert (
                         param.dim() == 2
                     ), f"{name} is expected to be 2D, but got {param.dim()}D"
@@ -517,10 +495,9 @@ class Transformer(nn.Module):
                     assert False, f"Illegal parallel tensor {name}"
 
             elif any(is_layer(s, name) for s in rpl_names):
-                if (
-                    name.split(".")[-1]
-                    in self._get_1d_in_tensor_names() + self._get_1d_out_tensor_names()
-                ):
+                if name.split(".")[-1] in self._get_1d_in_tensor_names(
+                    quant
+                ) + self._get_1d_out_tensor_names(quant):
                     assert (
                         param.dim() == 1
                     ), f"{name} is expected to be 1D, but got {param.dim()}D"
@@ -530,7 +507,7 @@ class Transformer(nn.Module):
                         assert param.shape[0] % world_size == 0
                         chunks = torch.chunk(param, world_size, dim=0)
                         partial_checkpoint[name] = chunks[rank]
-                elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names():
+                elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names(quant):
                     assert (
                         param.dim() == 2
                     ), f"{name} is expected to be 2D, but got {param.dim()}D"
@@ -540,7 +517,7 @@ class Transformer(nn.Module):
                         assert param.shape[1] % world_size == 0
                         chunks = torch.chunk(param, world_size, dim=1)
                         partial_checkpoint[name] = chunks[rank]
-                elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names():
+                elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names(quant):
                     assert (
                         param.dim() == 2
                     ), f"{name} is expected to be 2D, but got {param.dim()}D"
@@ -602,7 +579,6 @@ class Transformer(nn.Module):
         输出键：'layers.3.mlp.gate_proj_weight'
         """
         from collections import defaultdict
-        import re
 
         new_checkpoint = {}
         if not merge_gate_up:
@@ -1476,6 +1452,8 @@ class MoE_blockfp4(MoeBlock):
             build_weight=False,
         )
 
+        self.linear_dtype = torch.uint8
+
         quant_scale_stride = 16
 
         gate_up_proj_in_features = dim
@@ -1670,8 +1648,7 @@ class MoE_blockfp4(MoeBlock):
             y = self._compute_muxi_fused_experts(x, weights, indices)
         elif has_torch_npu:  # or use op_impl ?
             y = self._compute_npu_fused_experts(x, weights, indices)
-        elif has_triton:
-            assert self.merge_gate_up
+        elif has_triton and self.merge_gate_up:
             if (
                 parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
                 == 1

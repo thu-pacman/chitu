@@ -1,6 +1,7 @@
 from logging import getLogger
 from typing import Dict, Mapping, Tuple, Optional, Type, Set, List, Any
 import math
+import re
 
 import torch
 import torch.nn.functional as F
@@ -490,7 +491,7 @@ class TransformerBlockHFLlama(TransformerBlock):
             merge_qkv=merge_qkv_gate_up,
             checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
         )
-        if args.name in {"Qwen3-30B-A3B", "Qwen3-235B-A22B"}:
+        if "Qwen3-30B-A3B" in args.name or "Qwen3-235B-A22B" in args.name:
             mlp_type = Qwen3MoeBlock
             self.mlp = mlp_type(
                 args=args,
@@ -665,11 +666,17 @@ class TransformerHFLlama(Transformer):
     def _process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
+            quant = None
+            for rule in self.params.quant_config.rules:
+                pattern = rule.get("regex")
+                if pattern and re.search(pattern, k):
+                    quant = rule.type
+                    break
             # Cat dim 0
             if any(
                 k.endswith(f".q_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names()
-                + self._get_1d_out_tensor_names()
+                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant)
             ):
                 tensor_name = k.split(".")[-1]
                 prefix = k[: -len(f".q_proj.{tensor_name}")]
@@ -683,21 +690,21 @@ class TransformerHFLlama(Transformer):
                 )
             elif any(
                 k.endswith(f".k_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names()
-                + self._get_1d_out_tensor_names()
+                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant)
             ):
                 continue
             elif any(
                 k.endswith(f".v_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names()
-                + self._get_1d_out_tensor_names()
+                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant)
             ):
                 continue
 
             # Cat dim 1
             elif any(
                 k.endswith(f".q_proj.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names()
+                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
             ):
                 tensor_name = k.split(".")[-1]
                 prefix = k[: -len(f".q_proj.{tensor_name}")]
@@ -711,12 +718,12 @@ class TransformerHFLlama(Transformer):
                 )
             elif any(
                 k.endswith(f".k_proj.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names()
+                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
             ):
                 continue
             elif any(
                 k.endswith(f".v_proj.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names()
+                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
             ):
                 continue
 
@@ -728,11 +735,17 @@ class TransformerHFLlama(Transformer):
     def _process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
+            quant = None
+            for rule in self.params.quant_config.rules:
+                pattern = rule.get("regex")
+                if pattern and re.search(pattern, k):
+                    quant = rule.type
+                    break
             # Cat dim 0
             if any(
                 k.endswith(f".gate_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names()
-                + self._get_1d_out_tensor_names()
+                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant)
             ):
                 tensor_name = k.split(".")[-1]
                 prefix = k[: -len(f".gate_proj.{tensor_name}")]
@@ -745,15 +758,15 @@ class TransformerHFLlama(Transformer):
                 )
             elif any(
                 k.endswith(f".up_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names()
-                + self._get_1d_out_tensor_names()
+                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant)
             ):
                 continue
 
             # Cat dim 1
             elif any(
                 k.endswith(f".gate_proj.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names()
+                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
             ):
                 tensor_name = k.split(".")[-1]
                 prefix = k[: -len(f".gate_proj.{tensor_name}")]
@@ -766,7 +779,7 @@ class TransformerHFLlama(Transformer):
                 )
             elif any(
                 k.endswith(f".up_proj.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names()
+                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
             ):
                 continue
 
@@ -817,61 +830,64 @@ class TransformerHFLlama(Transformer):
             state_dict, skip_preprocess=skip_preprocess, *args, **kwargs
         )
 
-    def _process_state_dict_for_merging_expert_weights(
-        self, checkpoint: Mapping[str, Any], merge_gate_up: bool
+    def _process_state_dict_for_merging_expert(
+        self, checkpoint: Mapping[str, Any], merge_gate_up: bool, key_name: str
     ):
         """
         重构专家权重结构的函数
         参数格式示例：
-        输入键：'layers.3.mlp.experts.1.gate_proj.weight'
-        输出键：'layers.3.mlp.gate_proj.weight' (合并所有该层的专家权重)
+        输入键：'layers.3.mlp.experts.1.gate_proj.key_name'
+        输出键：'layers.3.mlp.gate_proj.key_name' (合并所有该层的专家权重)
         """
         from collections import defaultdict
-        import re
 
         new_checkpoint = {}
         if not merge_gate_up:
-            gate_proj_weights = defaultdict(lambda: defaultdict(list))
-            down_proj_weights = defaultdict(lambda: defaultdict(list))
-            up_proj_weights = defaultdict(lambda: defaultdict(list))
-            weight_lists = [gate_proj_weights, down_proj_weights, up_proj_weights]
+            gate_proj_input_scale = defaultdict(lambda: defaultdict(list))
+            down_proj_input_scale = defaultdict(lambda: defaultdict(list))
+            up_proj_input_scale = defaultdict(lambda: defaultdict(list))
+            input_scale_lists = [
+                gate_proj_input_scale,
+                down_proj_input_scale,
+                up_proj_input_scale,
+            ]
             pattern_lists = [
-                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_proj\.weight",
-                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\.weight",
-                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.up_proj\.weight",
+                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_proj\." + f"{key_name}$",
+                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\." + f"{key_name}$",
+                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.up_proj\." + f"{key_name}$",
             ]
             tensor_names = ["gate_proj", "down_proj", "up_proj"]
         else:
-            gate_up_proj_weights = defaultdict(lambda: defaultdict(list))
-            down_proj_weights = defaultdict(lambda: defaultdict(list))
-            weight_lists = [gate_up_proj_weights, down_proj_weights]
+            gate_up_proj_input_scale = defaultdict(lambda: defaultdict(list))
+            down_proj_input_scale = defaultdict(lambda: defaultdict(list))
+            input_scale_lists = [gate_up_proj_input_scale, down_proj_input_scale]
             pattern_lists = [
-                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_up_proj\.weight",
-                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\.weight",
+                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_up_proj\." + f"{key_name}$",
+                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\." + f"{key_name}$",
             ]
             tensor_names = ["gate_up_proj", "down_proj"]
 
         for key in checkpoint:
             matched = False
-            for weight_list, pattern in zip(weight_lists, pattern_lists):
+            for input_scale_list, pattern in zip(input_scale_lists, pattern_lists):
                 match = re.match(pattern, key)
                 if match:
+
                     layer_idx, expert_idx = map(int, match.groups())
-                    weight_list[layer_idx][expert_idx] = checkpoint[key]
+                    input_scale_list[layer_idx][expert_idx] = checkpoint[key]
                     matched = True
                     break
             if not matched:
                 new_checkpoint[key] = checkpoint[key]
 
-        for weight_list, tensor_name in zip(weight_lists, tensor_names):
-            for layer in weight_list:
+        for input_scale_list, tensor_name in zip(input_scale_lists, tensor_names):
+            for layer in input_scale_list:
                 experts_ordered = [
-                    weight_list[layer][e] for e in sorted(weight_list[layer])
+                    input_scale_list[layer][e] for e in sorted(input_scale_list[layer])
                 ]
-                stacked_weights = torch.stack(experts_ordered, dim=0)
-
-                new_key = f"layers.{layer}.mlp.{tensor_name}.weight"
-                new_checkpoint[new_key] = stacked_weights
+                stacked_input_scale = torch.stack(experts_ordered, dim=0)
+                new_key = f"layers.{layer}.mlp.{tensor_name}.{key_name}"
+                new_checkpoint[new_key] = stacked_input_scale
 
         return new_checkpoint
 
@@ -898,14 +914,20 @@ class TransformerHFLlama(Transformer):
                     state_dict, rpl_names, cpl_names
                 )
 
-            if get_global_args().models.name in [
-                "Qwen3-30B-A3B",
-                "Qwen3-235B-A22B",
-            ]:
+            if (
+                "Qwen3-30B-A3B" in get_global_args().models.name
+                or "Qwen3-235B-A22B" in get_global_args().models.name
+            ):
                 # Qwen3 models have a special structure for experts, so we need to merge them.
-                state_dict = self._process_state_dict_for_merging_expert_weights(
-                    state_dict, self.merge_qkv_gate_up
-                )
+                for key_name in [
+                    "input_scale",
+                    "weight_scale",
+                    "weight_scale_2",
+                    "weight",
+                ]:
+                    state_dict = self._process_state_dict_for_merging_expert(
+                        state_dict, self.merge_qkv_gate_up, key_name
+                    )
                 state_dict = super().process_state_dict_for_renaming_linear_layer(
                     state_dict, self.merge_qkv_gate_up, n_dense_layers=0
                 )

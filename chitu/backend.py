@@ -408,20 +408,19 @@ class Backend:
         if args.models.type == "llama":
             merge_qkv_gate_up = False  # Not yet supported
 
-        quant = (
-            args.models.quant_config.type
-            if hasattr(args.models, "quant_config")
-            else None
-        )
         allowed_quant_for_merge_qkv_gate_up = {None, "blockfp8"}
         if args.models.type == "deepseek-v3":
             allowed_quant_for_merge_qkv_gate_up.add("blockfp4")
-        if quant not in allowed_quant_for_merge_qkv_gate_up:
-            # Merge weights for offline-scaled quantized models is non-trivial, because we can
-            # only merge weights but NOT the scales on input dimensions, and this will break the
-            # assumption of the fused quantized kernels. So we only merge weights for supported
-            # quantization methods.
-            merge_qkv_gate_up = False
+
+        if hasattr(args.models, "quant_config"):
+            for rule in args.models.quant_config.rules:
+                if rule.type not in allowed_quant_for_merge_qkv_gate_up:
+                    # Merge weights for offline-scaled quantized models is non-trivial, because we can
+                    # only merge weights but NOT the scales on input dimensions, and this will break the
+                    # assumption of the fused quantized kernels. So we only merge weights for supported
+                    # quantization methods.
+                    merge_qkv_gate_up = False
+                    break
 
         if args.models.type == "deepseek-v3" and args.models.quant_config.type in [
             "gguf",
@@ -516,17 +515,6 @@ class Backend:
             mla_absorb=args.infer.mla_absorb,
         )
 
-        # Handle model precision
-        if hasattr(args.models, "quant_config") and args.models.quant_config.type in [
-            "awq",
-            "llmint8",
-            "gptq",
-            "w8a16",
-            "simple_w8a8",
-            "simple_w8a8_muxi",
-        ]:
-            torch.set_default_tensor_type(torch.cuda.HalfTensor)
-
         return model
 
     @staticmethod
@@ -565,21 +553,19 @@ class Backend:
 
             # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
             # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
-            if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
-                if (
-                    hasattr(args.models, "quant_config")
-                    and args.models.quant_config.type == "blockfp8"
-                ):
+            for rule in args.models.quant_config.rules:
+                if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
+                    if rule.type == "blockfp8":
+                        for k in checkpoint.keys():
+                            if checkpoint[k].element_size() == 1:
+                                checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
+                        break
+                if rule.type == "blockfp4":
                     for k in checkpoint.keys():
                         if checkpoint[k].element_size() == 1:
                             checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
-            if (
-                hasattr(args.models, "quant_config")
-                and args.models.quant_config.type == "blockfp4"
-            ):
-                for k in checkpoint.keys():
-                    if checkpoint[k].element_size() == 1:
-                        checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
+                    break
+
             model.load_state_dict_parallel(
                 checkpoint,
                 strict=True,
