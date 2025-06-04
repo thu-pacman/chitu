@@ -108,7 +108,6 @@ class Backend:
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group("nccl")
 
-        Backend.use_gloo = not args.infer.cache_type == "skew"
         if Backend.use_gloo:
             Backend.group_gloo = torch.distributed.new_group(backend="gloo")
 

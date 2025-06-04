@@ -67,6 +67,8 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     min_ps: torch.Tensor = None,  # TODO support min_ps
 ):
     """A top-k, top-p and min-p sampling implementation with native pytorch operations."""
+    from chitu.ops import multinomial
+
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     # min_p_thresholds = probs_sort[:, 0] * min_ps
@@ -77,7 +79,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     ] = 0.0
     # probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
     probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
-    sampled_index = torch.multinomial(probs_sort, num_samples=1)
+    sampled_index = multinomial(probs_sort, num_samples=1, impl="sync-free")
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
     return batch_next_token_ids
 

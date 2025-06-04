@@ -1,6 +1,6 @@
 import struct
 import packaging
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 import torch
 import torch.nn as nn
@@ -673,3 +673,34 @@ def topk_softmax(scores, topk, renormalize, indices_type: Optional[torch.dtype] 
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights, topk_ids, token_expert_indices
+
+
+def multinomial(
+    probs: torch.Tensor,
+    num_samples: int,
+    seq_groups: Optional[List] = None,
+    impl: str = "torch",
+) -> torch.Tensor:
+    if impl == "torch":
+        return torch.multinomial(probs, num_samples)
+    elif impl == "sync-free":
+        # Adapted from
+        # https://github.com/vllm-project/vllm/blob/4577fc9abb064d74b2082ffc5005cbb82ca91766/vllm/model_executor/layers/sampler.py#L527
+        if num_samples > 1:
+            probs = probs.repeat_interleave(num_samples, dim=0)
+        q = torch.empty_like(probs)
+        if seq_groups is None:
+            q.exponential_()
+        else:
+            sample_idx = 0
+            for seq_group in seq_groups:
+                seq_ids = seq_group.seq_ids
+                stride = len(seq_ids) * num_samples
+                assert seq_group.generator is not None
+                q[sample_idx : sample_idx + stride].exponential_(
+                    generator=seq_group.generator
+                )
+                sample_idx += stride
+        return probs.div_(q).argmax(dim=1).view(-1, num_samples)
+    else:
+        raise NotImplementedError(f"unsupport impl: {impl}")
