@@ -1,7 +1,8 @@
 import math
 import functools
 from logging import getLogger
-from typing import Dict, Mapping, Tuple, Optional, Type, Set, List, Any
+from typing import Any, List, Mapping, Optional, Set, Tuple
+import re
 
 import torch
 import torch.distributed as dist
@@ -1247,13 +1248,19 @@ class TransformerDeepSeekV3(Transformer):
 
         new_checkpoint = {}
         for k in checkpoint.keys():
+            quant = None
+            for rule in self.params.quant_config.rules:
+                pattern = rule.get("regex")
+                if pattern and re.search(pattern, k):
+                    quant = rule.type
+                    break
             if any(
                 k.endswith(f".experts.0.{w}.{part}")
                 for w in ["gate_proj", "down_proj", "up_proj", "gate_up_proj"]
-                for part in self._get_2d_out_x_in_tensor_names()
-                + self._get_2d_in_x_out_tensor_names()
-                + self._get_1d_in_tensor_names()
-                + self._get_1d_out_tensor_names()
+                for part in self._get_2d_out_x_in_tensor_names(quant)
+                + self._get_2d_in_x_out_tensor_names(quant)
+                + self._get_1d_in_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant)
             ):
                 w, part = k.split(".")[-2:]
                 prefix = k[: -len(f"experts.0.{w}.{part}")]
@@ -1280,9 +1287,15 @@ class TransformerDeepSeekV3(Transformer):
 
         new_checkpoint = {}
         for k in checkpoint.keys():
+            quant = None
+            for rule in self.params.quant_config.rules:
+                pattern = rule.get("regex")
+                if pattern and re.search(pattern, k):
+                    quant = rule.type
+                    break
             if any(
                 k.endswith(f".kv_b_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names()
+                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
             ):
                 tensor_name = k.split(".")[-1]
                 prefix = k[: -len(f".kv_b_proj.{tensor_name}")]
@@ -1308,7 +1321,7 @@ class TransformerDeepSeekV3(Transformer):
 
             elif any(
                 k.endswith(f".kv_b_proj.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names()
+                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
             ):
                 raise NotImplementedError(
                     f"infer.mla_absorb=absorb-without-precomp is not implemented for 2D (in, out) tensor {tensor_name}"
@@ -1316,7 +1329,7 @@ class TransformerDeepSeekV3(Transformer):
 
             elif any(
                 k.endswith(f".kv_b_proj.{tensor_name}")
-                for tensor_name in self._get_1d_in_tensor_names()
+                for tensor_name in self._get_1d_in_tensor_names(quant)
             ):
                 raise NotImplementedError(
                     f"infer.mla_absorb=absorb-without-precomp is not implemented for 1D (in,) tensor {tensor_name}"
@@ -1324,7 +1337,7 @@ class TransformerDeepSeekV3(Transformer):
 
             elif any(
                 k.endswith(f".kv_b_proj.{tensor_name}")
-                for tensor_name in self._get_1d_out_tensor_names()
+                for tensor_name in self._get_1d_out_tensor_names(quant)
             ):
                 raise NotImplementedError(
                     f"infer.mla_absorb=absorb-without-precomp is not implemented for 1D (out,) tensor {tensor_name}"
@@ -1515,11 +1528,17 @@ class TransformerDeepSeekV3(Transformer):
     def _process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
+            quant = None
+            for rule in self.params.quant_config.rules:
+                pattern = rule.get("regex")
+                if pattern and re.search(pattern, k):
+                    quant = rule.type
+                    break
             # Cat dim 0
             if any(
                 k.endswith(f".q_a_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names()
-                + self._get_1d_out_tensor_names()
+                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant)
             ):
                 tensor_name = k.split(".")[-1]
                 prefix = k[: -len(f".q_a_proj.{tensor_name}")]
@@ -1531,15 +1550,15 @@ class TransformerDeepSeekV3(Transformer):
                 )
             elif any(
                 k.endswith(f".kv_a_proj_with_mqa.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names()
-                + self._get_1d_out_tensor_names()
+                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant)
             ):
                 continue
 
             # Cat dim 1
             elif any(
                 k.endswith(f".q_a_proj.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names()
+                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
             ):
                 tensor_name = k.split(".")[-1]
                 prefix = k[: -len(f".q_a_proj.{tensor_name}")]
@@ -1551,7 +1570,7 @@ class TransformerDeepSeekV3(Transformer):
                 )
             elif any(
                 k.endswith(f".kv_a_proj_with_mqa.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names()
+                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
             ):
                 continue
 
@@ -1563,11 +1582,17 @@ class TransformerDeepSeekV3(Transformer):
     def _process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
+            quant = None
+            for rule in self.params.quant_config.rules:
+                pattern = rule.get("regex")
+                if pattern and re.search(pattern, k):
+                    quant = rule.type
+                    break
             # Cat dim 0
             if any(
                 k.endswith(f".gate_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names()
-                + self._get_1d_out_tensor_names()
+                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant)
             ):
                 tensor_name = k.split(".")[-1]
                 prefix = k[: -len(f".gate_proj.{tensor_name}")]
@@ -1580,15 +1605,15 @@ class TransformerDeepSeekV3(Transformer):
                 )
             elif any(
                 k.endswith(f".up_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names()
-                + self._get_1d_out_tensor_names()
+                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant)
             ):
                 continue
 
             # Cat dim 1
             elif any(
                 k.endswith(f".gate_proj.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names()
+                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
             ):
                 tensor_name = k.split(".")[-1]
                 prefix = k[: -len(f".gate_proj.{tensor_name}")]
@@ -1601,7 +1626,7 @@ class TransformerDeepSeekV3(Transformer):
                 )
             elif any(
                 k.endswith(f".up_proj.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names()
+                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
             ):
                 continue
 

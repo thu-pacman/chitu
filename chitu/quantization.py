@@ -218,6 +218,9 @@ class LLMInt8Linear(QuantizedLinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         import bitsandbytes as bnb
 
+        if x.dtype != torch.float16:
+            x = x.to(torch.float16)
+
         self.state.is_training = False
         if self.weight.CB is not None:
             self.init_8bit_state()
@@ -244,7 +247,6 @@ class AutoAWQLinear(QuantizedLinearBase):
         self, in_features: int, out_features: int, has_bias: bool = True, **kwargs
     ):
         super().__init__()
-
         from awq.modules.linear import WQLinear_GEMM
 
         wqlinear = WQLinear_GEMM(
@@ -269,8 +271,10 @@ class AutoAWQLinear(QuantizedLinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from awq.modules.linear.gemm import WQLinearMMFunction
 
-        out_shape = x.shape[:-1] + (self.out_features,)
+        if x.dtype != torch.float16:
+            x = x.to(torch.float16)
 
+        out_shape = x.shape[:-1] + (self.out_features,)
         input_dtype = x.dtype
         if input_dtype != torch.float16:
             x = x.half()
@@ -524,6 +528,9 @@ class GPTQLinear(QuantizedLinearBase):
         replace_tensor(self, "scales", marlin_scales)
 
     def forward(self, x: torch.Tensor):
+        if x.dtype != torch.float16:
+            x = x.to(torch.float16)
+
         if not self.pinit:
             self.post_init()
             self.pinit = True
@@ -609,6 +616,9 @@ class W8A8Linear(QuantizedLinearBase):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype != torch.float16:
+            x = x.to(torch.float16)
+
         w8a8gemm, _ = try_import_opt_dep("w8a8gemm", "quant")
         w8a8gemv, _ = try_import_opt_dep("w8a8gemv", "quant")
 
@@ -682,6 +692,9 @@ class W8A8MuxiLinear(QuantizedLinearBase):
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from chitu.muxi_utils import tbsgemm
+
+        if x.dtype != torch.float16:
+            x = x.to(torch.float16)
 
         if isinstance(x, Tuple):
             q_x = x[0]

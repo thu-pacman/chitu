@@ -295,6 +295,10 @@ class ColumnParallelLinearMixIn:
         assert out_features % tp_size == 0, "out_features must be divisible by tp_size"
         local_out_features = out_features // tp_size
 
+        # These attributes are unused, but keep them compatible with nn.Linear
+        self.in_features = in_features
+        self.out_features = out_features
+
         super().__init__(
             in_features=in_features,
             out_features=local_out_features,
@@ -307,10 +311,6 @@ class ColumnParallelLinearMixIn:
         self.local_out_features = local_out_features
         self.tp_group = tp_group
         self.tp_size = tp_size
-
-        # These attributes are unused, but keep them compatible with nn.Linear
-        self.in_features = in_features
-        self.out_features = out_features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = super().forward(x)
@@ -357,6 +357,10 @@ class RowParallelLinearMixIn:
         assert in_features % tp_size == 0, "in_features must be divisible by tp_size"
         local_in_features = in_features // tp_size
 
+        # These attributes are unused, but keep them compatible with nn.Linear
+        self.in_features = in_features
+        self.out_features = out_features
+
         super().__init__(
             in_features=local_in_features,
             out_features=out_features,
@@ -371,10 +375,6 @@ class RowParallelLinearMixIn:
         self.tp_group = tp_group
         self.tp_size = tp_size
         self.rank = rank
-
-        # These attributes are unused, but keep them compatible with nn.Linear
-        self.in_features = in_features
-        self.out_features = out_features
 
     def forward(self, x: torch.Tensor, dst=-1) -> torch.Tensor:
         if not self.input_is_parallel and self.tp_size > 1:

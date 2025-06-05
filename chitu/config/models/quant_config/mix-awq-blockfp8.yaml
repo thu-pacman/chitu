@@ -1,0 +1,44 @@
+type: blockfp8
+quant:
+- model: '.'
+  rules:
+  - type : autoawq
+    regex : q_proj 
+    kwargs:
+      w_bit : 4
+      group_size : 128
+      zero_point : True
+  - type : autoawq
+    regex : k_proj 
+    kwargs:
+      w_bit : 4
+      group_size : 128
+      zero_point : True
+  - type : autoawq
+    regex : v_proj 
+    kwargs:
+      w_bit : 4
+      group_size : 128
+      zero_point : True
+  - type : autoawq
+    regex : o_proj 
+    kwargs:
+      w_bit : 4
+      group_size : 128
+      zero_point : True
+  - type : autoawq
+    regex : up_proj 
+    kwargs:
+      w_bit : 4
+      group_size : 128
+      zero_point : True
+  - type : autoawq
+    regex : gate_proj 
+    kwargs:
+      w_bit : 4
+      group_size : 128
+      zero_point : True
+  - type : blockfp8
+    regex : down_proj 
+    kwargs:
+      block_size : 128

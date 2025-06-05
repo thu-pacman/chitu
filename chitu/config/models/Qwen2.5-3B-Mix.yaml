@@ -1,0 +1,21 @@
+defaults:
+  - Qwen2.5-3B
+  - quant_config: mix-awq-blockfp8
+  - _self_ # Config in this file overrides configs in defaults
+
+
+name: Qwen2.5-3B-Mix
+type: hf-llama
+source: "(This is an internal quantized model, only for testing purpose)"
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+
+dim: 2048
+n_layers: 36
+n_heads: 16
+n_kv_heads: 2
+vocab_size: 151936
+intermediate_dim: 11008
+norm_eps: 1e-06
+rope_theta: 1000000.0
+tie_word_embeddings: True

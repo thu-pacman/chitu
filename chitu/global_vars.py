@@ -51,6 +51,11 @@ def set_quant_variables(global_args=None):
 
     model_name = model_name.lower()
     if not hasattr(models, "quant_config"):
+        from omegaconf import OmegaConf
+
+        OmegaConf.set_struct(models, False)
+        models["quant_config"] = {"rules": [], "type": None}
+        OmegaConf.set_struct(models, True)
         return
 
     quant_config = {"rules": [], "type": models.quant_config.get("type", None)}
