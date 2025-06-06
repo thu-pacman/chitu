@@ -62,6 +62,8 @@ def chitu_init(args, logging_level=logging.INFO):
         try:
             import torch_npu
             from torch_npu.contrib import transfer_to_npu
+
+            torch.cuda.CUDAGraph = torch.npu.NPUGraph
         except ImportError:
             raise ImportError("torch_npu is not installed")
 

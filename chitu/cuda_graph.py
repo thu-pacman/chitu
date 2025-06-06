@@ -1,8 +1,11 @@
 from typing import Callable, Sequence, Mapping, Any, Optional
+from dataclasses import dataclass
+from contextlib import nullcontext, contextmanager
 import functools
 import torch
 
 from chitu.static_tensor import StaticTensor
+from chitu.device_type import is_ascend
 
 
 def make_dispatched_graphed_callables(
@@ -11,6 +14,7 @@ def make_dispatched_graphed_callables(
     args_max_nelem: Sequence[int],
     kwargs_max_nelem: Mapping[str, int],
     output_max_nelem_callback: Callable[[int], int],
+    before_replay_callback: Optional[Callable[[Any], None]] = None,
     enable: bool = True,
 ) -> Callable:
     """
@@ -25,6 +29,9 @@ def make_dispatched_graphed_callables(
             in shared static tensors.
         output_max_nelem: A `(key, sample_nelem) -> max_nelem` callback to return the maximum number of
             elements in the output tensor, used to hold outputs in shared static tensors.
+        before_replay_callback: An optional `(graph) -> None` callback function to be called before each
+            graph replay. Note that this callback is not invoked before warming-up runs, or before graph
+            capturing.
         enable: If False, do nothing but only add the `key` argument.
 
     Returns:
@@ -37,6 +44,7 @@ def make_dispatched_graphed_callables(
             args_max_nelem=args_max_nelem,
             kwargs_max_nelem=kwargs_max_nelem,
             output_max_nelem_callback=output_max_nelem_callback,
+            before_replay_callback=before_replay_callback,
             enable=enable,
         )
 
@@ -98,15 +106,39 @@ def make_dispatched_graphed_callables(
 
                 # Capture the graph
                 graph_dict[key] = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph_dict[key], pool=cuda_graph_pool):
-                    output = f(
-                        *[static_tensor.get() for static_tensor in args_static_tensors],
-                        **{
-                            k: static_tensor.get()
-                            for k, static_tensor in kwargs_static_tensors.items()
-                        },
-                    )
-                    output_static_tensor.set(output)
+                if is_ascend():
+                    capturing_stream = torch.npu.Stream(device=sample_output.device)
+                    capturing_stream.wait_stream(torch.npu.current_stream())
+                    with torch.npu.stream(capturing_stream):
+                        with torch.cuda.graph(
+                            graph_dict[key],
+                            pool=cuda_graph_pool,
+                            auto_dispatch_capture=True,
+                        ):
+                            output = f(
+                                *[
+                                    static_tensor.get()
+                                    for static_tensor in args_static_tensors
+                                ],
+                                **{
+                                    k: static_tensor.get()
+                                    for k, static_tensor in kwargs_static_tensors.items()
+                                },
+                            )
+                            output_static_tensor.set(output)
+                else:
+                    with torch.cuda.graph(graph_dict[key], pool=cuda_graph_pool):
+                        output = f(
+                            *[
+                                static_tensor.get()
+                                for static_tensor in args_static_tensors
+                            ],
+                            **{
+                                k: static_tensor.get()
+                                for k, static_tensor in kwargs_static_tensors.items()
+                            },
+                        )
+                        output_static_tensor.set(output)
                 if cuda_graph_pool is None:
                     cuda_graph_pool = graph_dict[key].pool()
 
@@ -122,6 +154,8 @@ def make_dispatched_graphed_callables(
                         device=output_device_dict[key],
                     )
                 )
+                if before_replay_callback is not None:
+                    before_replay_callback(graph_dict[key])
                 graph_dict[key].replay()
 
             return output_static_tensor.get()

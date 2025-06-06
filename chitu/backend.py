@@ -265,6 +265,10 @@ class Backend:
             block_size = 64 if args.infer.mla_absorb != "none" else 256
             if args.infer.attn_type == "npu":
                 block_size = 128
+                if args.infer.use_cuda_graph:
+                    raise NotImplementedError(
+                        "Graph capturing is not yet implemented for args.infer.cache_type=paged on Ascend NPU"
+                    )
             return PagedKVCacheManager(
                 local_begin_layer_id,
                 local_end_layer_id,
@@ -275,7 +279,6 @@ class Backend:
                 **kv_cache_kvargs,
             )
         elif args.infer.cache_type == "skew":
-            assert args.infer.attn_type != "npu", "Set paged cache for npu"
             return KVCacheManagerSkewAware(
                 local_begin_layer_id,
                 local_end_layer_id,
@@ -301,6 +304,24 @@ class Backend:
         model_parallel_size = args.infer.tp_size
 
         kv_cache_kvargs = {}
+
+        # support NPU BSH layout
+        if args.infer.attn_type == "npu" and args.models.type != "deepseek-v3":
+            n_kv_heads = (
+                args.models.n_kv_heads
+                if hasattr(args.models, "n_kv_heads")
+                else args.models.n_heads
+            )
+            n_local_kv_heads = n_kv_heads // model_parallel_size
+            head_dim = (
+                args.models.head_dim
+                if hasattr(args.models, "head_dim")
+                else args.models.dim // args.models.n_heads
+            )
+            kv_cache_kvargs["k_shape_per_sample"] = (n_local_kv_heads * head_dim,)
+            kv_cache_kvargs["v_shape_per_sample"] = (n_local_kv_heads * head_dim,)
+
+            return kv_cache_kvargs
 
         if args.models.type == "deepseek-v3":
             if args.infer.mla_absorb in ["absorb", "absorb-without-precomp"]:

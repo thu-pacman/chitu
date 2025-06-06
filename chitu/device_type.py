@@ -20,6 +20,10 @@ def is_muxi():
     return any(pattern in device_name for pattern in MUXI_DEVICE_PATTERNS)
 
 
+def is_ascend():
+    return "Ascend" in get_device_name()
+
+
 def has_native_fp8():
     return is_nvidia() and torch.cuda.get_device_capability() >= (8, 9)
 

@@ -23,7 +23,7 @@ from chitu.tensor_parallel import get_tp_group, get_tp_rank, get_tp_size
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
 from chitu.utils import VarLens, compute_layer_dist_in_pipe, is_layer, ceil_div
 from chitu.cuda_graph import make_dispatched_graphed_callables
-from chitu.device_type import is_muxi, get_device_name, is_nvidia
+from chitu.device_type import is_muxi, get_device_name, is_nvidia, is_ascend
 from chitu.utils import try_import_opt_dep, parse_dtype
 from chitu.muxi_utils import grouped_topk, muxi_fused_experts
 from chitu.layers.gate import fused_sigmoid_gate
@@ -776,10 +776,19 @@ class Transformer(nn.Module):
 
         if self.do_decode_callable is None:
 
+            before_replay_callback = None
+            if is_ascend():
+                before_replay_callback = lambda graph: graph.update(
+                    cpu_update_input=[
+                        {"actual_seq_lengths_kv": self.attn_backend.seq_lens_incl_list}
+                    ]
+                )
+
             @make_dispatched_graphed_callables(
                 args_max_nelem=(tokens.numel() // batch_size * max_batch_size,),
                 kwargs_max_nelem={},
                 output_max_nelem_callback=lambda bs, n: n // bs * max_batch_size,
+                before_replay_callback=before_replay_callback,
                 enable=use_cuda_graph,
             )
             def do_decode(tokens):
