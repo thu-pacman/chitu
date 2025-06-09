@@ -103,6 +103,15 @@ class PagedKVCacheManager:
     # Init block table and kv cache with kv generated during prefill
     def finalize_cache_bylayer_prefill(self, xk, xv, req_ids, varlen, layer_id):
         self.timers("cache_finalize_cache_all_prefill").start()
+
+        if (
+            get_global_args().infer.attn_type == "npu"
+            and len(self.k_shape_per_sample) == 1
+        ):
+            # NPU BSH layout
+            xk = xk.view(xk.shape[0], -1).contiguous()
+            xv = xv.view(xv.shape[0], -1).contiguous()
+
         for idx, req_id in enumerate(req_ids):
             num_blocks_prepared = (
                 varlen.cpu_lens[idx] + self.block_size - 1
@@ -509,6 +518,14 @@ class KVCacheManagerSkewAware:
         self, cache_k, cache_v, req_ids, varlen, layer_id
     ):
         self.timers("cache_finalize_cache_all_prefill").start()
+        if (
+            get_global_args().infer.attn_type == "npu"
+            and len(self.k_shape_per_sample) == 1
+        ):
+            # NPU BSH layout
+            cache_k = cache_k.view(cache_k.shape[0], -1).contiguous()
+            cache_v = cache_v.view(cache_v.shape[0], -1).contiguous()
+
         if self.slot_handle:
             start_idx, _ = self.slot_handle.get_current_slot_start_end_idx()
         else:
@@ -547,11 +564,6 @@ class KVCacheManagerSkewAware:
     # Decode:
     def prepare_cache_decode(self, req_ids):
         self.timers("cache_prepare").start()
-        start_pos = self.hot_reqs.index(req_ids[0])
-        assert start_pos + len(req_ids) <= self.num_hot_req
-        # assert (
-        #     self.hot_reqs[start_pos : start_pos + len(req_ids)] == req_ids
-        # ), f"{self.hot_reqs} {req_ids}"
 
         seq_lens = []
         for req_id in req_ids:
@@ -566,51 +578,73 @@ class KVCacheManagerSkewAware:
             self.curr_seq_lens_gpu_excl_this_decode.get() + 1
         )
 
-        limit = 16
-        rounded_max_seq = (max_seq + 1 + limit - 1) // limit * limit
-        if self.rounded_max_seq >= rounded_max_seq and self.prepared_reqs == req_ids:
-            # prepared cache is long enough
-            self.timers("cache_prepare").stop()
-            return
+        args = get_global_args()
+        if args.infer.pp_size == 1:  # Non-PP
+            self.k_prepared_cache = (
+                None if self.k_buffer is None else self.k_buffer[:, : len(req_ids)]
+            )
+            self.v_prepared_cache = (
+                None if self.v_buffer is None else self.v_buffer[:, : len(req_ids)]
+            )
 
-        self.rounded_max_seq = rounded_max_seq
-        self.prepared_reqs = req_ids
+        else:  # PP
+            if args.infer.use_cuda_graph:
+                raise NotImplementedError(
+                    "Setting infer.cache_type=skew and infer.use_cuda_graph=True "
+                    "simultaneously is not supported when using pipeline parallelism"
+                )
 
-        if self.k_buffer is not None:
-            k_prepared_cache_shape = list(self.k_buffer.shape)
-            k_prepared_cache_stride = list(self.k_buffer.stride())
-            k_prepared_cache_stride[0] = (
-                k_prepared_cache_shape[1] * k_prepared_cache_stride[1]
-            )
-            k_prepared_cache_shape[1] = len(req_ids)
-            k_prepared_cache_shape[2] = rounded_max_seq
-            k_prepared_cache_offset = start_pos * k_prepared_cache_stride[1]
-            self.k_prepared_cache = torch.as_strided(
-                self.k_buffer,
-                k_prepared_cache_shape,
-                k_prepared_cache_stride,
-                k_prepared_cache_offset,
-            )
-        else:
-            self.k_prepared_cache = None
+            start_pos = self.hot_reqs.index(req_ids[0])
+            assert start_pos + len(req_ids) <= self.num_hot_req
 
-        if self.v_buffer is not None:
-            v_prepared_cache_shape = list(self.v_buffer.shape)
-            v_prepared_cache_stride = list(self.v_buffer.stride())
-            v_prepared_cache_stride[0] = (
-                v_prepared_cache_shape[1] * v_prepared_cache_stride[1]
-            )
-            v_prepared_cache_shape[1] = len(req_ids)
-            v_prepared_cache_shape[2] = rounded_max_seq
-            v_prepared_cache_offset = start_pos * v_prepared_cache_stride[1]
-            self.v_prepared_cache = torch.as_strided(
-                self.v_buffer,
-                v_prepared_cache_shape,
-                v_prepared_cache_stride,
-                v_prepared_cache_offset,
-            )
-        else:
-            self.v_prepared_cache = None
+            limit = 16
+            rounded_max_seq = (max_seq + 1 + limit - 1) // limit * limit
+            if (
+                self.rounded_max_seq >= rounded_max_seq
+                and self.prepared_reqs == req_ids
+            ):
+                # prepared cache is long enough
+                self.timers("cache_prepare").stop()
+                return
+
+            self.rounded_max_seq = rounded_max_seq
+            self.prepared_reqs = req_ids
+
+            if self.k_buffer is not None:
+                k_prepared_cache_shape = list(self.k_buffer.shape)
+                k_prepared_cache_stride = list(self.k_buffer.stride())
+                k_prepared_cache_stride[0] = (
+                    k_prepared_cache_shape[1] * k_prepared_cache_stride[1]
+                )
+                k_prepared_cache_shape[1] = len(req_ids)
+                k_prepared_cache_shape[2] = rounded_max_seq
+                k_prepared_cache_offset = start_pos * k_prepared_cache_stride[1]
+                self.k_prepared_cache = torch.as_strided(
+                    self.k_buffer,
+                    k_prepared_cache_shape,
+                    k_prepared_cache_stride,
+                    k_prepared_cache_offset,
+                )
+            else:
+                self.k_prepared_cache = None
+
+            if self.v_buffer is not None:
+                v_prepared_cache_shape = list(self.v_buffer.shape)
+                v_prepared_cache_stride = list(self.v_buffer.stride())
+                v_prepared_cache_stride[0] = (
+                    v_prepared_cache_shape[1] * v_prepared_cache_stride[1]
+                )
+                v_prepared_cache_shape[1] = len(req_ids)
+                v_prepared_cache_shape[2] = rounded_max_seq
+                v_prepared_cache_offset = start_pos * v_prepared_cache_stride[1]
+                self.v_prepared_cache = torch.as_strided(
+                    self.v_buffer,
+                    v_prepared_cache_shape,
+                    v_prepared_cache_stride,
+                    v_prepared_cache_offset,
+                )
+            else:
+                self.v_prepared_cache = None
 
         self.timers("cache_prepare").stop()
 

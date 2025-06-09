@@ -1382,7 +1382,8 @@ class NpuAttnBackend(RefAttnBackend):
         block_size,
         softmax_scale=None,
     ):
-        self.cache_seqlens_incl_this_decode_cpu = cache_seqlens_incl_this_decode.cpu()
+        self.seq_lens_incl_list = cache_seqlens_incl_this_decode.tolist()
+        self.seq_lens_excl_list = cache_seqlens_excl_this_decode.tolist()
 
     def attn_varlen_func(
         self,
@@ -1445,67 +1446,51 @@ class NpuAttnBackend(RefAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
     ):
-        if block_table is None:
-            return self.attn_with_skew_kvcache(
-                q, k_cache, v_cache, k, v, cache_seqlens=cache_seqlens
-            )
-        else:
-            q = q.squeeze(
-                1
-            )  # [batch_size, 1, head_num, head_dim] -> [tokens, head_num, head_dim]
-            output = torch.empty_like(q)
+        # [BSND] -> [BSH]
+        q = q.view(q.shape[0], q.shape[1], -1).contiguous()
+        k = k.view(k.shape[0], k.shape[1], -1).contiguous()
+        v = v.view(v.shape[0], v.shape[1], -1).contiguous()
 
+        if block_table is None:
+            # skew kvcache
+            self.torch_npu.scatter_update_(k_cache, cache_seqlens, k, 1)
+            self.torch_npu.scatter_update_(v_cache, cache_seqlens, v, 1)
+
+            output_ = torch.empty_like(q)
+            lse_ = torch.empty(1, dtype=q.dtype, device="npu")
+            self.torch_npu.npu_fused_infer_attention_score.out(
+                q,
+                k_cache,
+                v_cache,
+                input_layout="BSH",
+                actual_seq_lengths_kv=self.seq_lens_incl_list,  # List[int]
+                scale=self.scale,
+                num_heads=self.local_n_heads,
+                num_key_value_heads=self.local_n_kv_heads,
+                out=[output_, lse_],
+            )
+            return output_
+        else:
             # update kv_cache
             append_to_paged_kv_cache(k_cache, block_table, k, cache_seqlens)
             append_to_paged_kv_cache(v_cache, block_table, v, cache_seqlens)
 
-            self.torch_npu._npu_paged_attention(
-                query=q,
-                key_cache=k_cache,
-                value_cache=v_cache,
-                num_kv_heads=self.local_n_kv_heads,
-                num_heads=self.local_n_heads,
-                scale_value=self.scale,
+            output_ = torch.empty_like(q)
+            lse_ = torch.empty(1, dtype=q.dtype, device="npu")
+            self.torch_npu.npu_fused_infer_attention_score.out(
+                q,
+                k_cache,
+                v_cache,
+                input_layout="BSH",
+                block_size=128,
                 block_table=block_table,
-                context_lens=self.cache_seqlens_incl_this_decode_cpu,
-                out=output,
+                actual_seq_lengths_kv=self.seq_lens_incl_list,  # List[int]
+                scale=self.scale,
+                num_heads=self.local_n_heads,
+                num_key_value_heads=self.local_n_kv_heads,
+                out=[output_, lse_],
             )
-            return output.unsqueeze(1)
-
-    def attn_with_skew_kvcache(
-        self,
-        q,
-        k_cache,
-        v_cache,
-        k=None,
-        v=None,
-        cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
-        causal=False,
-        window_size=(-1, -1),  # -1 means infinite context window
-        softcap=0.0,  # 0.0 means deactivated
-    ):
-        arange = torch.arange(k_cache.shape[1], device=k_cache.device).unsqueeze(0)
-        cache_seqlens_expanded = cache_seqlens.unsqueeze(1)
-        if k is None and q is None:
-            key_padding_mask = arange < cache_seqlens_expanded
-        elif k is not None and q is not None:
-            key_padding_mask = arange < cache_seqlens_expanded + 1
-            for i in range(cache_seqlens.shape[0]):
-                k_cache[i][cache_seqlens[i]] = k[i].clone()
-                v_cache[i][cache_seqlens[i]] = v[i].clone()
-
-        q = q.permute(0, 2, 1, 3)  # 等价于 "b 1 h d -> b h 1 d"
-        k_cache = k_cache.permute(0, 2, 1, 3)  # 等价于 "b s h d -> b h s d"
-        v_cache = v_cache.permute(0, 2, 1, 3)  # 等价于 "b s h d -> b h s d"
-        key_padding_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-
-        output = scaled_dot_product_attention(
-            q, k_cache, v_cache, attn_mask=key_padding_mask, is_causal=causal
-        )
-
-        output = output.permute(0, 2, 1, 3)  # 等价于 "b h 1 d -> b 1 h d"
-
-        return output
+            return output_
 
     def mla_attn_with_kvcache(
         self,

@@ -170,7 +170,6 @@ class _Timer:
         self.cnt = 0
 
     def start(self):
-        # return
         """Start the timer."""
         assert not self.started_, "timer has already been started"
         torch.cuda.synchronize()
@@ -178,7 +177,6 @@ class _Timer:
         self.started_ = True
 
     def stop(self):
-        # return
         """Stop the timer."""
         assert self.started_, "timer is not started"
         torch.cuda.synchronize()

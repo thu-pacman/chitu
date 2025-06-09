@@ -10,9 +10,13 @@ __all__ = [
 
 import torch
 from typing import Optional, Mapping, Set, Any
+from logging import getLogger
 
 from chitu.global_vars import get_global_args
 from chitu.quantization import QuantizationRegistry
+from chitu.device_type import is_ascend
+
+logger = getLogger(__name__)
 
 tp_comm_group = None
 cpu_tp_comm_group = None
@@ -427,9 +431,17 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.tp_size > 1:
             mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
             x = x - self.vocab_start_idx
-            x[mask] = 0
+            if is_ascend():
+                # See https://www.hiascend.com/document/detail/zh/Pytorch/60RC3/ptmoddevg/trainingmigrguide/performance_tuning_0034.html
+                x *= ~mask
+            else:
+                x[mask] = 0
         y = torch.nn.functional.embedding(x, self.weight)
         if self.tp_size > 1:
-            y[mask] = 0
+            if is_ascend():
+                # See https://www.hiascend.com/document/detail/zh/Pytorch/60RC3/ptmoddevg/trainingmigrguide/performance_tuning_0034.html
+                y *= ~mask.unsqueeze(-1)
+            else:
+                y[mask] = 0
             torch.distributed.all_reduce(y, group=self.tp_group)
         return y
