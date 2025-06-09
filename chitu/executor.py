@@ -318,6 +318,7 @@ class PipeTensorExecutor(NormalExecutor):
 
     def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
         remove_kvcache = False
+        is_heartbeat = False
 
         # PP stage 0 initialzie from the argument. PP stage >= 1 recv task tensor from stage - 1
         if self.rank == 0:
@@ -379,6 +380,9 @@ class PipeTensorExecutor(NormalExecutor):
                         group=self.cpu_tp_group,
                     )
             task_tensor_type, tasks = PackedTasksBase.deserialize(task_tensor)
+            is_heartbeat = (
+                task_tensor_type == SerializedPackedTasksPayloadType.Heartbeat
+            )
             if task_tensor_type == SerializedPackedTasksPayloadType.TerminateBackend:
                 Backend.state = BackendState.Terminating
             if task_tensor_type == SerializedPackedTasksPayloadType.EndTask:
@@ -392,6 +396,8 @@ class PipeTensorExecutor(NormalExecutor):
                 tag=TASK_TENSOR_TAG,
                 group=Backend.group_gloo if Backend.use_gloo else pg,
             )
+        if is_heartbeat:
+            return None
         if Backend.state == BackendState.Terminating:
             Backend.state = BackendState.Terminated
         if Backend.state == BackendState.Terminated:
@@ -458,6 +464,8 @@ class TensorExecutor(NormalExecutor):
             task_tensor_type, tasks = PackedTasksBase.deserialize(task_tensor)
 
         if self.rank != 0:
+            if task_tensor_type == SerializedPackedTasksPayloadType.Heartbeat:
+                return None
             if task_tensor_type == SerializedPackedTasksPayloadType.TerminateBackend:
                 Backend.state = BackendState.Terminated
             if task_tensor_type == SerializedPackedTasksPayloadType.EndTask:
