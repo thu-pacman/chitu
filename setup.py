@@ -132,7 +132,7 @@ setup(
             # dependency, because its installation runs forever on some platforms.
         ],
         "flashinfer": [
-            "flashinfer-python",
+            "flashinfer-python<=0.2.5",  # Later versions require a too-new torch
         ],
         "flash_mla": [
             "flash_mla @ file://localhost"
