@@ -1,3 +1,4 @@
+import os
 import logging
 from logging import getLogger
 
@@ -16,6 +17,7 @@ from chitu.task import (
     TaskType,
 )
 from chitu.distributed_utils import propagate_tensor_to_all_devices
+from chitu.device_type import is_nvidia
 
 logger = getLogger(__name__)
 
@@ -48,6 +50,13 @@ def init_logger(logging_level=logging.INFO):
 
 
 def chitu_init(args, logging_level=logging.INFO):
+    if (
+        is_nvidia()
+        and torch.distributed.is_nccl_available()
+        and torch.cuda.nccl.version() <= (2, 21, 5)
+    ):
+        os.environ["NCCL_NVLS_NCHANNELS"] = "32"
+
     init_logger(logging_level)
 
     # Deal with legacy arguments
