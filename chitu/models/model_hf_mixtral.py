@@ -1,4 +1,5 @@
 import functools
+import re
 from typing import Any, List, Mapping
 
 import torch
@@ -15,9 +16,13 @@ from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 
 class FeedForwardExpertHFMixtral(FeedForwardHFLlama):
     def __init__(
-        self, dim: int, hidden_dim: int, op_impl: str, merge_gate_up: bool = True
+        self,
+        dim: int,
+        hidden_dim: int,
+        op_impl: str,
+        params,
     ):
-        super().__init__(dim, hidden_dim, op_impl=op_impl, merge_gate_up=merge_gate_up)
+        super().__init__(dim, hidden_dim, op_impl=op_impl, params=params)
 
 
 class SparseMoeBlockHFMixtral(nn.Module):
@@ -29,7 +34,7 @@ class SparseMoeBlockHFMixtral(nn.Module):
         top_k: int,
         op_impl: str,
         checkpoint_prefix: str,
-        merge_gate_up: bool = True,
+        params,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -47,7 +52,7 @@ class SparseMoeBlockHFMixtral(nn.Module):
         self.experts = nn.ModuleList(
             [
                 FeedForwardExpertHFMixtral(
-                    dim, hidden_dim, op_impl=op_impl, merge_gate_up=merge_gate_up
+                    dim, hidden_dim, op_impl=op_impl, params=params
                 )
                 for _ in range(num_experts)
             ]
@@ -111,7 +116,6 @@ class TransformerBlockHFMixtral(TransformerBlockHFLlama):
         op_impl="torch",
         rotary_type="hf-llama",
         mlp_type=SparseMoeBlockHFMixtral,
-        merge_qkv_gate_up=True,
         checkpoint_prefix="",
     ):
         super().__init__(
@@ -126,7 +130,6 @@ class TransformerBlockHFMixtral(TransformerBlockHFLlama):
                 num_experts=args.num_local_experts,
                 top_k=args.num_experts_per_tok,
             ),
-            merge_qkv_gate_up=merge_qkv_gate_up,
             checkpoint_prefix=checkpoint_prefix,
         )
 
@@ -143,7 +146,6 @@ class TransformerHFMixtral(TransformerHFLlama):
         attn_backend: AttnBackend,
         rotary_type: str = "hf-llama",
         layer_type: type = TransformerBlockHFMixtral,
-        merge_qkv_gate_up: bool = True,
         op_impl: str = "torch",
         **kvargs,
     ):
@@ -156,7 +158,6 @@ class TransformerHFMixtral(TransformerHFLlama):
             attn_backend=attn_backend,
             rotary_type=rotary_type,
             layer_type=layer_type,
-            merge_qkv_gate_up=merge_qkv_gate_up,
             op_impl=op_impl,
             **kvargs,
         )

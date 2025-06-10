@@ -35,6 +35,12 @@ class QuantizationRegistry:
     """
 
     _registry: Dict[str, Type[QuantizedLinearBase]] = {}
+    _allowed_quant_for_merge_qkv_gate_up: List = [
+        "blockfp8",
+        "autoawq",
+        "simple_w8a8",
+        None,
+    ]
 
     @classmethod
     def get_all_methods(cls) -> Set[str]:
@@ -986,8 +992,8 @@ class Blockfp4Linear(QuantizedLinearBase):
         )
 
         block_2_in, block_2_out = block_shape_2
-        assert out_features % block_2_out == 0
-        assert in_features % block_2_in == 0
+        assert out_features % block_2_out == 0, f"{out_features=}, {block_2_out=}"
+        assert in_features % block_2_in == 0, f"{in_features=}, {block_2_in=}"
         self.register_parameter(
             "input_scale",
             torch.nn.Parameter(

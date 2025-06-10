@@ -36,6 +36,8 @@ from chitu.models.model_llama import TransformerLlama
 from chitu.tensor_parallel import get_tp_size, init_tp
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
 from chitu.utils import compute_layer_dist_in_pipe, parse_dtype
+from chitu.global_vars import get_global_args
+from chitu.quantization import QuantizationRegistry
 
 import gc
 import sys
@@ -419,25 +421,8 @@ class Backend:
         """
         model_parallel_size = args.infer.tp_size
         pipeline_parallel_size = args.infer.pp_size
-
-        # Determine whether to merge QKV, gate, and up projections
-        merge_qkv_gate_up = True
-        if args.models.type == "llama":
-            merge_qkv_gate_up = False  # Not yet supported
-
-        allowed_quant_for_merge_qkv_gate_up = {None, "blockfp8"}
         if args.models.type == "deepseek-v3":
-            allowed_quant_for_merge_qkv_gate_up.add("blockfp4")
-
-        if hasattr(args.models, "quant_config"):
-            for rule in args.models.quant_config.rules:
-                if rule.type not in allowed_quant_for_merge_qkv_gate_up:
-                    # Merge weights for offline-scaled quantized models is non-trivial, because we can
-                    # only merge weights but NOT the scales on input dimensions, and this will break the
-                    # assumption of the fused quantized kernels. So we only merge weights for supported
-                    # quantization methods.
-                    merge_qkv_gate_up = False
-                    break
+            QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up.append("blockfp4")
 
         if args.models.type == "deepseek-v3" and args.models.quant_config.type in [
             "gguf",
@@ -528,7 +513,6 @@ class Backend:
             model_parallel_size=model_parallel_size,
             attn_backend=attn_backend,
             op_impl=args.infer.op_impl,
-            merge_qkv_gate_up=merge_qkv_gate_up,
             mla_absorb=args.infer.mla_absorb,
         )
 

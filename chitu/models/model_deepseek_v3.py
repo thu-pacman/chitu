@@ -168,13 +168,20 @@ class AttentionDeepSeekV3(Attention):
         attn_backend,
         op_impl: str,
         mla_absorb,
-        merge_qkv,
         checkpoint_prefix: str,
     ):
         super().__init__(layer_id, cache, attn_backend)
         self.op_impl = op_impl
         self.mla_absorb = mla_absorb
-        self.merge_qkv = merge_qkv
+        quant = None
+        for rule in args.quant_config.rules:
+            pattern = rule.get("regex")
+            if pattern and re.search(pattern, checkpoint_prefix):
+                quant = rule.type
+                break
+        self.merge_qkv = (
+            quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
+        )
 
         model_parallel_size = get_tp_size()
         self.dim = args.dim
@@ -189,7 +196,7 @@ class AttentionDeepSeekV3(Attention):
 
         block_size = 128
 
-        if merge_qkv:
+        if self.merge_qkv:
             # fp8 gemm can handle weights not divisible by block_size, but it does not hold
             # after merging for the output dimension, except for the last weight.
             assert self.q_lora_rank % block_size == 0
@@ -573,12 +580,25 @@ class MLPDeepSeekV3(nn.Module):
         self,
         args,
         role: str,  # "standalone" or "shared_experts"
-        merge_gate_up: bool,
         op_impl: str,
         checkpoint_prefix: str,
+        merge_gate_up=None,  # only work when role is "shared_experts"
     ):
         super().__init__()
-        self.merge_gate_up = merge_gate_up
+        if role == "shared_experts":
+            assert merge_gate_up is not None
+            self.merge_gate_up = merge_gate_up
+        else:
+            quant = None
+            for rule in args.quant_config.rules:
+                pattern = rule.get("regex")
+                if pattern and re.search(pattern, checkpoint_prefix):
+                    quant = rule.type
+                    break
+            if quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
+                self.merge_gate_up = True
+            else:
+                self.merge_gate_up = False
         self.op_impl = op_impl
 
         if role == "standalone":
@@ -590,7 +610,7 @@ class MLPDeepSeekV3(nn.Module):
                 f"Invalid role: {role}. Expected 'standalone' or 'shared_experts'."
             )
 
-        if merge_gate_up:
+        if self.merge_gate_up:
             self.gate_up_proj = ColumnParallelLinear(
                 args.dim,
                 inter_dim * 2,
@@ -738,28 +758,28 @@ class MoeDeepSeekV3_params_resolver:
             moe_world_size=1,
             moe_rank=0,
             do_gather_output=False,
-            merge_gate_up=merge_gate_up,
             dtype=args.main_weight_dtype,
             op_impl=op_impl,
             gate=GateDeepSeekV3(args, op_impl),
             fuse_shared_experts=get_global_args().infer.fuse_shared_experts,
             shared_experts=shared_experts,
             checkpoint_prefix=checkpoint_prefix,
+            merge_gate_up=merge_gate_up,
         )
 
 
 def MoEDeepSeekV3(
     args,
-    merge_gate_up: bool,
     op_impl: str,
     checkpoint_prefix: str,
     base_moe_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
+    checkpoint_prefix = checkpoint_prefix + ".moe"
     if base_moe_class is None:
         base_moe_class = MoeBlockRegistry.get_quantized_MoeBlock_class_from_global_args(
             quant_kwargs=quant_kwargs,
-            checkpoint_prefix=f"{checkpoint_prefix}.moe",
+            checkpoint_prefix=checkpoint_prefix,
         )
 
     class MoeBlockImpl(MoeDeepSeekV3_params_resolver, base_moe_class):
@@ -770,11 +790,19 @@ def MoEDeepSeekV3(
 
         pass
 
+    quant = None
+    for rule in args.quant_config.rules:
+        pattern = rule.get("regex")
+        if pattern and re.search(pattern, checkpoint_prefix):
+            quant = rule.type
+            break
+    merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
+
     return MoeBlockImpl(
         args,
         merge_gate_up=merge_gate_up,
         op_impl=op_impl,
-        checkpoint_prefix=f"{checkpoint_prefix}.moe",
+        checkpoint_prefix=checkpoint_prefix,
     )
 
 
@@ -793,7 +821,12 @@ class MoEDeepSeekV3CPU(nn.Module):
     """
 
     def __init__(
-        self, args, cpu_infer, ggml_type, merge_gate_up: bool, checkpoint_prefix: str
+        self,
+        args,
+        cpu_infer,
+        ggml_type,
+        checkpoint_prefix: str,
+        merge_qkv_gate_up: bool = False,
     ):
         """
         Initializes the MoE module.
@@ -802,7 +835,7 @@ class MoEDeepSeekV3CPU(nn.Module):
             args (ModelArgs): Model arguments containing MoE parameters.
         """
         super().__init__()
-        self.merge_gate_up = merge_gate_up
+        self.merge_qkv_gate_up = merge_qkv_gate_up
         self.dim = args.dim
         self.tp_group = get_tp_group()
         self.tp_size = get_tp_size()
@@ -818,7 +851,7 @@ class MoEDeepSeekV3CPU(nn.Module):
         self.n_local_experts = args.n_routed_experts // moe_world_size
         self.n_activated_experts = args.n_activated_experts
         self.gate = GateDeepSeekV3(args)
-        if merge_gate_up:
+        if self.merge_qkv_gate_up:
             self.gate_up_proj = ColumnParallelLinear(
                 args.dim,
                 args.moe_inter_dim * 2,
@@ -934,7 +967,7 @@ class MoEDeepSeekV3CPU(nn.Module):
 
     def to(self, *args, **kwargs):
         self.gate.to(*args, **kwargs)
-        if self.merge_gate_up:
+        if self.merge_qkv_gate_up:
             self.gate_up_proj.to(*args, **kwargs)
         else:
             self.gate_proj.to(*args, **kwargs)
@@ -1061,7 +1094,7 @@ class MoEDeepSeekV3CPU(nn.Module):
                     ),
                 )
 
-        if self.merge_gate_up:
+        if self.merge_qkv_gate_up:
             gate_up_proj_out = self.gate_up_proj(x)
             gate_proj_out, up_proj_out = torch.split(
                 gate_up_proj_out, gate_up_proj_out.shape[-1] // 2, dim=-1
@@ -1099,7 +1132,6 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         attn_backend,
         op_impl,
         mla_absorb,
-        merge_qkv_gate_up,
         cpu_infer=False,
         ggml_type=0,
         checkpoint_prefix="",
@@ -1115,14 +1147,12 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             attn_backend,
             op_impl=op_impl,
             mla_absorb=mla_absorb,
-            merge_qkv=merge_qkv_gate_up,
             checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
         )
         self.mlp = (
             MLPDeepSeekV3(
                 args,
                 role="standalone",
-                merge_gate_up=merge_qkv_gate_up,
                 op_impl=op_impl,
                 checkpoint_prefix=f"{checkpoint_prefix}.mlp",
             )
@@ -1130,7 +1160,6 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             else (
                 MoEDeepSeekV3(
                     args,
-                    merge_gate_up=merge_qkv_gate_up,
                     op_impl=op_impl,
                     checkpoint_prefix=f"{checkpoint_prefix}.mlp",
                 )
@@ -1139,7 +1168,6 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                     args,
                     cpu_infer=cpu_infer,
                     ggml_type=ggml_type,
-                    merge_gate_up=merge_qkv_gate_up,
                     checkpoint_prefix=f"{checkpoint_prefix}.mlp",
                 )
             )
@@ -1186,10 +1214,8 @@ class TransformerDeepSeekV3(Transformer):
         attn_backend: AttnBackend,
         op_impl: str,
         mla_absorb: str,
-        merge_qkv_gate_up=True,
     ):
         self.mla_absorb = mla_absorb
-        self.merge_qkv_gate_up = merge_qkv_gate_up
         self.cpu_layers = cpu_layers
         self.ggml_type = ggml_type
         self.cpu_infer = cpu_infer
@@ -1534,8 +1560,10 @@ class TransformerDeepSeekV3(Transformer):
                 if pattern and re.search(pattern, k):
                     quant = rule.type
                     break
+            if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
+                new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
-            if any(
+            elif any(
                 k.endswith(f".q_a_proj.{tensor_name}")
                 for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
                 + self._get_1d_out_tensor_names(quant)
@@ -1588,8 +1616,10 @@ class TransformerDeepSeekV3(Transformer):
                 if pattern and re.search(pattern, k):
                     quant = rule.type
                     break
+            if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
+                new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
-            if any(
+            elif any(
                 k.endswith(f".gate_proj.{tensor_name}")
                 for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
                 + self._get_1d_out_tensor_names(quant)
@@ -1675,15 +1705,13 @@ class TransformerDeepSeekV3(Transformer):
                     )
                 )
 
-            if self.merge_qkv_gate_up:
-                state_dict = self._process_state_dict_for_merging_qkv(state_dict)
-                state_dict = self._process_state_dict_for_merging_gate_up(state_dict)
+            state_dict = self._process_state_dict_for_merging_qkv(state_dict)
+            state_dict = self._process_state_dict_for_merging_gate_up(state_dict)
 
             state_dict = self._process_state_dict_for_merging_experts(state_dict)
             if not self.cpu_infer:
                 state_dict = super().process_state_dict_for_renaming_linear_layer(
                     state_dict,
-                    self.merge_qkv_gate_up,
                     get_global_args().models.n_dense_layers,
                 )
 
@@ -1732,7 +1760,6 @@ class TransformerDeepSeekV3(Transformer):
                         attn_backend,
                         self.op_impl,
                         mla_absorb=self.mla_absorb,
-                        merge_qkv_gate_up=self.merge_qkv_gate_up,
                         cpu_infer=self.cpu_infer,
                         ggml_type=self.ggml_type[layer_id],
                         checkpoint_prefix=f"layers.{layer_id}",
@@ -1747,7 +1774,6 @@ class TransformerDeepSeekV3(Transformer):
                         attn_backend,
                         self.op_impl,
                         mla_absorb=self.mla_absorb,
-                        merge_qkv_gate_up=self.merge_qkv_gate_up,
                         checkpoint_prefix=f"layers.{layer_id}",
                     )
                 )

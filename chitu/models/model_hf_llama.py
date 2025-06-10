@@ -73,13 +73,20 @@ class AttentionHFLlama(Attention):
         attn_backend,
         rotary_type="hf-llama",
         op_impl: str = "torch",
-        merge_qkv: bool = True,
         checkpoint_prefix="",
     ):
         super().__init__(layer_id, cache, attn_backend)
         self.rotary_type = rotary_type
         self.op_impl = op_impl
-        self.merge_qkv = merge_qkv
+        quant = None
+        for rule in args.quant_config.rules:
+            pattern = rule.get("regex")
+            if pattern and re.search(pattern, checkpoint_prefix):
+                quant = rule.type
+                break
+        self.merge_qkv = (
+            quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
+        )
 
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         model_parallel_size = get_tp_size()
@@ -100,7 +107,7 @@ class AttentionHFLlama(Attention):
         o_has_bias = args.o_has_bias if hasattr(args, "o_has_bias") else False
 
         qkv_proj_linear = o_proj_linear = get_linear_layout_contig_x_contig_y(op_impl)
-        if merge_qkv:
+        if self.merge_qkv:
             self.qkv_proj = ColumnParallelLinear(
                 args.dim,
                 (args.n_heads + 2 * self.n_kv_heads) * self.head_dim,
@@ -301,19 +308,27 @@ class FeedForwardHFLlama(nn.Module):
         dim: int,
         hidden_dim: int,
         op_impl: str,
-        merge_gate_up: bool = True,
         checkpoint_prefix="",
+        params=None,
     ):
         super().__init__()
         self.op_impl = op_impl
-        self.merge_gate_up = merge_gate_up
+        quant = None
+        for rule in params.quant_config.rules:
+            pattern = rule.get("regex")
+            if pattern and re.search(pattern, checkpoint_prefix):
+                quant = rule.type
+                break
+        self.merge_gate_up = (
+            quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
+        )
 
         # Do a parallel + fused linear projection, while ensuring outputs from gate_proj and up_proj are contiguous in memory.
         # Therefore, the projected shape is [model_parallel_size, 2 * hidden_dim]
 
         gate_up_proj_linear = get_linear_layout_contig_x_native_y(op_impl)
         down_proj_linear = get_linear_layout_native_x_contig_y(op_impl)
-        if merge_gate_up:
+        if self.merge_gate_up:
             self.gate_up_proj = ColumnParallelLinear(
                 dim,
                 hidden_dim * 2,
@@ -408,9 +423,9 @@ class Qwen3_params_resolver:
         self,
         args,
         op_impl: str,
-        merge_gate_up: bool,
         layer_idx: int,
         checkpoint_prefix: str,
+        merge_gate_up: bool,
     ):
         params = get_global_args().models
         super().__init__(
@@ -424,20 +439,19 @@ class Qwen3_params_resolver:
             moe_world_size=1,
             moe_rank=0,
             do_gather_output=False,
-            merge_gate_up=merge_gate_up,
             op_impl=op_impl,
             dtype=params.dtype if hasattr(params, "dtype") else "bfloat16",
             gate=Qwen3MoeGate(args, op_impl),
             fuse_shared_experts=False,
             shared_experts=None,
             checkpoint_prefix=checkpoint_prefix,
+            merge_gate_up=merge_gate_up,
         )
         self.layer_idx = layer_idx
 
 
 def Qwen3MoeBlock(
     args,
-    merge_gate_up: bool,
     op_impl: str,
     layer_idx: int,
     checkpoint_prefix: str,
@@ -458,12 +472,20 @@ def Qwen3MoeBlock(
 
         pass
 
+    quant = None
+    for rule in args.quant_config.rules:
+        pattern = rule.get("regex")
+        if pattern and re.search(pattern, checkpoint_prefix):
+            quant = rule.type
+            break
+    merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
+
     return MoeBlockImpl(
         args=args,
-        merge_gate_up=merge_gate_up,
         op_impl=op_impl,
         layer_idx=layer_idx,
         checkpoint_prefix=f"{checkpoint_prefix}.moe",
+        merge_gate_up=merge_gate_up,
     )
 
 
@@ -477,7 +499,6 @@ class TransformerBlockHFLlama(TransformerBlock):
         op_impl,
         rotary_type="hf-llama",
         mlp_type=FeedForwardHFLlama,
-        merge_qkv_gate_up=True,
         checkpoint_prefix="",
     ):
         super().__init__(layer_id, args, cache, attn_backend, op_impl)
@@ -488,7 +509,6 @@ class TransformerBlockHFLlama(TransformerBlock):
             attn_backend,
             rotary_type=rotary_type,
             op_impl=op_impl,
-            merge_qkv=merge_qkv_gate_up,
             checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
         )
         if "Qwen3-30B-A3B" in args.name or "Qwen3-235B-A22B" in args.name:
@@ -496,7 +516,6 @@ class TransformerBlockHFLlama(TransformerBlock):
             self.mlp = mlp_type(
                 args=args,
                 op_impl=op_impl,
-                merge_gate_up=merge_qkv_gate_up,
                 layer_idx=layer_id,
                 checkpoint_prefix=f"{checkpoint_prefix}.mlp",
             )
@@ -505,8 +524,8 @@ class TransformerBlockHFLlama(TransformerBlock):
                 dim=args.dim,
                 hidden_dim=args.intermediate_dim,
                 op_impl=op_impl,
-                merge_gate_up=merge_qkv_gate_up,
                 checkpoint_prefix=f"{checkpoint_prefix}.mlp",
+                params=args,
             )
         self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
         self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -543,12 +562,10 @@ class TransformerHFLlama(Transformer):
         op_impl: str,
         rotary_type: str = "hf-llama",
         layer_type: type = TransformerBlockHFLlama,
-        merge_qkv_gate_up=True,
         **kvargs,
     ):
         self.rotary_type = rotary_type
         self.layer_type = layer_type
-        self.merge_qkv_gate_up = merge_qkv_gate_up
         super().__init__(
             params,
             cache,
@@ -672,8 +689,10 @@ class TransformerHFLlama(Transformer):
                 if pattern and re.search(pattern, k):
                     quant = rule.type
                     break
+            if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
+                new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
-            if any(
+            elif any(
                 k.endswith(f".q_proj.{tensor_name}")
                 for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
                 + self._get_1d_out_tensor_names(quant)
@@ -741,8 +760,10 @@ class TransformerHFLlama(Transformer):
                 if pattern and re.search(pattern, k):
                     quant = rule.type
                     break
+            if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
+                new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
-            if any(
+            elif any(
                 k.endswith(f".gate_proj.{tensor_name}")
                 for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
                 + self._get_1d_out_tensor_names(quant)
@@ -831,7 +852,7 @@ class TransformerHFLlama(Transformer):
         )
 
     def _process_state_dict_for_merging_expert(
-        self, checkpoint: Mapping[str, Any], merge_gate_up: bool, key_name: str
+        self, checkpoint: Mapping[str, Any], key_name: str
     ):
         """
         重构专家权重结构的函数
@@ -842,30 +863,23 @@ class TransformerHFLlama(Transformer):
         from collections import defaultdict
 
         new_checkpoint = {}
-        if not merge_gate_up:
-            gate_proj_input_scale = defaultdict(lambda: defaultdict(list))
-            down_proj_input_scale = defaultdict(lambda: defaultdict(list))
-            up_proj_input_scale = defaultdict(lambda: defaultdict(list))
-            input_scale_lists = [
-                gate_proj_input_scale,
-                down_proj_input_scale,
-                up_proj_input_scale,
-            ]
-            pattern_lists = [
-                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_proj\." + f"{key_name}$",
-                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\." + f"{key_name}$",
-                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.up_proj\." + f"{key_name}$",
-            ]
-            tensor_names = ["gate_proj", "down_proj", "up_proj"]
-        else:
-            gate_up_proj_input_scale = defaultdict(lambda: defaultdict(list))
-            down_proj_input_scale = defaultdict(lambda: defaultdict(list))
-            input_scale_lists = [gate_up_proj_input_scale, down_proj_input_scale]
-            pattern_lists = [
-                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_up_proj\." + f"{key_name}$",
-                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\." + f"{key_name}$",
-            ]
-            tensor_names = ["gate_up_proj", "down_proj"]
+        gate_up_proj_input_scale = defaultdict(lambda: defaultdict(list))
+        gate_proj_input_scale = defaultdict(lambda: defaultdict(list))
+        down_proj_input_scale = defaultdict(lambda: defaultdict(list))
+        up_proj_input_scale = defaultdict(lambda: defaultdict(list))
+        input_scale_lists = [
+            gate_up_proj_input_scale,
+            gate_proj_input_scale,
+            down_proj_input_scale,
+            up_proj_input_scale,
+        ]
+        pattern_lists = [
+            r"layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_up_proj\." + f"{key_name}$",
+            r"layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_proj\." + f"{key_name}$",
+            r"layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\." + f"{key_name}$",
+            r"layers\.(\d+)\.mlp\.experts\.(\d+)\.up_proj\." + f"{key_name}$",
+        ]
+        tensor_names = ["gate_up_proj", "gate_proj", "down_proj", "up_proj"]
 
         for key in checkpoint:
             matched = False
@@ -900,9 +914,8 @@ class TransformerHFLlama(Transformer):
     ):
         if not skip_preprocess:
 
-            if self.merge_qkv_gate_up:
-                state_dict = self._process_state_dict_for_merging_qkv(state_dict)
-                state_dict = self._process_state_dict_for_merging_gate_up(state_dict)
+            state_dict = self._process_state_dict_for_merging_qkv(state_dict)
+            state_dict = self._process_state_dict_for_merging_gate_up(state_dict)
 
             if self.op_impl == "muxi_custom_kernel":
                 rpl_names = self._get_tensor_row_parallel_layer_names()
@@ -926,10 +939,10 @@ class TransformerHFLlama(Transformer):
                     "weight",
                 ]:
                     state_dict = self._process_state_dict_for_merging_expert(
-                        state_dict, self.merge_qkv_gate_up, key_name
+                        state_dict, key_name
                     )
                 state_dict = super().process_state_dict_for_renaming_linear_layer(
-                    state_dict, self.merge_qkv_gate_up, n_dense_layers=0
+                    state_dict, n_dense_layers=0
                 )
 
         super().load_state_dict(
@@ -952,7 +965,6 @@ class TransformerHFLlama(Transformer):
                     attn_backend=attn_backend,
                     op_impl=op_impl,
                     rotary_type=self.rotary_type,
-                    merge_qkv_gate_up=self.merge_qkv_gate_up,
                     checkpoint_prefix=f"layers.{layer_id}",
                 )
             )
