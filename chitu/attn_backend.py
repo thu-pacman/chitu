@@ -1351,6 +1351,9 @@ class NpuAttnBackend(RefAttnBackend):
             1 / math.sqrt(self.args.models.dim // self.args.models.n_heads)
         )  # [FIXME] can not be used in mla
         self.block_size = 128
+        self.slot_mapping = StaticTensor(
+            max_nelem=self.args.infer.max_reqs, dtype=torch.int32, device="cuda"
+        )
 
     def prepare_metadata_for_prefill(self, varlens):
         def generate_attn_mask(max_seq_len: int, dtype=torch.bfloat16):
@@ -1384,6 +1387,19 @@ class NpuAttnBackend(RefAttnBackend):
     ):
         self.seq_lens_incl_list = cache_seqlens_incl_this_decode.tolist()
         self.seq_lens_excl_list = cache_seqlens_excl_this_decode.tolist()
+        # paged kvcache
+        if block_table is not None:
+            self.block_table_list = block_table.tolist()
+            slot_list = []
+            for i in range(len(self.block_table_list)):
+                block_number = self.block_table_list[i][
+                    self.seq_lens_excl_list[i] // block_size
+                ]
+                block_offset = self.seq_lens_excl_list[i] % block_size
+                slot_list.append(block_number * block_size + block_offset)
+            self.slot_mapping.set(
+                torch.tensor(slot_list, dtype=torch.int32, device="cuda")
+            )
 
     def attn_varlen_func(
         self,
@@ -1472,8 +1488,14 @@ class NpuAttnBackend(RefAttnBackend):
             return output_
         else:
             # update kv_cache
-            append_to_paged_kv_cache(k_cache, block_table, k, cache_seqlens)
-            append_to_paged_kv_cache(v_cache, block_table, v, cache_seqlens)
+            k_cache_ = k_cache.view(k_cache.shape[0] * k_cache.shape[1], -1).unsqueeze(
+                1
+            )
+            v_cache_ = v_cache.view(v_cache.shape[0] * v_cache.shape[1], -1).unsqueeze(
+                1
+            )
+            k_cache_[self.slot_mapping.get()] = k
+            v_cache_[self.slot_mapping.get()] = v
 
             output_ = torch.empty_like(q)
             lse_ = torch.empty(1, dtype=q.dtype, device="npu")
