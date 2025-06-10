@@ -357,6 +357,14 @@ class Transformer(nn.Module):
         self.precompute_freqs_cis(max_position_embeddings, self.device)
 
         self.do_decode_callable = None
+        self.args = get_global_args()
+        self.max_batch_size = self.args.infer.max_reqs
+        self.model_type = self.args.models.type
+        self.use_cuda_graph = self.args.infer.use_cuda_graph
+        if self.use_cuda_graph and is_ascend() and self.model_type == "deepseek-v3":
+            raise NotImplementedError(
+                "Graph capturing is not yet implemented for deepseek models on Ascend NPU"
+            )
 
     def _get_tensor_column_parallel_layer_names(self) -> List[str]:
         raise NotImplementedError
@@ -770,9 +778,6 @@ class Transformer(nn.Module):
         self.prepare_decoding_attn()
 
         batch_size = len(seq_lens)
-        max_batch_size = get_global_args().infer.max_reqs
-
-        use_cuda_graph = get_global_args().infer.use_cuda_graph
 
         if self.do_decode_callable is None:
 
@@ -785,11 +790,11 @@ class Transformer(nn.Module):
                 )
 
             @make_dispatched_graphed_callables(
-                args_max_nelem=(tokens.numel() // batch_size * max_batch_size,),
+                args_max_nelem=(tokens.numel() // batch_size * self.max_batch_size,),
                 kwargs_max_nelem={},
-                output_max_nelem_callback=lambda bs, n: n // bs * max_batch_size,
+                output_max_nelem_callback=lambda bs, n: n // bs * self.max_batch_size,
                 before_replay_callback=before_replay_callback,
-                enable=use_cuda_graph,
+                enable=self.use_cuda_graph,
             )
             def do_decode(tokens):
                 freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_decode()

@@ -1,3 +1,4 @@
+import os
 import logging
 from logging import getLogger
 
@@ -5,7 +6,7 @@ import torch
 import torch.distributed
 
 from chitu.backend import Backend, BackendState
-from chitu.executor import Executor, TASK_TENSOR_TAG
+from chitu.executor import Executor
 from chitu.global_vars import set_global_variables, set_quant_variables
 from chitu.scheduler import Scheduler
 from chitu.task import (
@@ -14,9 +15,9 @@ from chitu.task import (
     SerializedPackedTasksPayloadType,
     TaskPool,
     TaskType,
-    req_encode,
 )
-from chitu.tensor_parallel import get_tp_group, get_pp_group, get_cpu_tp_group
+from chitu.distributed_utils import propagate_tensor_to_all_devices
+from chitu.device_type import is_nvidia
 
 logger = getLogger(__name__)
 
@@ -49,6 +50,13 @@ def init_logger(logging_level=logging.INFO):
 
 
 def chitu_init(args, logging_level=logging.INFO):
+    if (
+        is_nvidia()
+        and torch.distributed.is_nccl_available()
+        and torch.cuda.nccl.version() <= (2, 21, 5)
+    ):
+        os.environ["NCCL_NVLS_NCHANNELS"] = "32"
+
     init_logger(logging_level)
 
     # Deal with legacy arguments
@@ -91,42 +99,7 @@ def remove_task_other_device(remove_task_ids):
         payload_type=SerializedPackedTasksPayloadType.EndTask,
         device="cpu" if Backend.use_gloo else 0,
     )
-    if Backend.args.infer.pp_size > 1:
-        pg = get_pp_group(0, Backend.args.infer.tp_size)
-        torch.distributed.isend(
-            tensor=task_tensor,
-            dst=Backend.args.infer.tp_size,
-            tag=TASK_TENSOR_TAG,
-            group=Backend.group_gloo if Backend.use_gloo else pg,
-        )
-        if Backend.args.infer.tp_size > 1:
-            if not Backend.use_gloo:
-                torch.distributed.broadcast(
-                    tensor=task_tensor, src=Backend.pp_main_rank, group=get_tp_group()
-                )
-            elif Backend.args.infer.pp_size == 1:
-                torch.distributed.broadcast(
-                    tensor=task_tensor,
-                    src=Backend.pp_main_rank,
-                    group=Backend.group_gloo,
-                )
-            else:
-                torch.distributed.broadcast(
-                    tensor=task_tensor,
-                    src=Backend.pp_main_rank,
-                    group=get_cpu_tp_group(),
-                )
-    elif Backend.args.infer.tp_size > 1:
-        if not Backend.use_gloo:
-            torch.distributed.broadcast(tensor=task_tensor, src=0)
-        elif Backend.args.infer.pp_size == 1:
-            torch.distributed.broadcast(
-                tensor=task_tensor, src=0, group=Backend.group_gloo
-            )
-        else:
-            torch.distributed.broadcast(
-                tensor=task_tensor, src=0, group=get_cpu_tp_group()
-            )
+    propagate_tensor_to_all_devices(task_tensor)
 
 
 def update_ongoing_tasks():

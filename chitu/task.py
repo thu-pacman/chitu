@@ -357,6 +357,7 @@ class SerializedPackedTasksPayloadType(Enum):
     Normal = 1
     TerminateBackend = 2
     EndTask = 3
+    Heartbeat = 4
 
 
 @dataclass
@@ -399,6 +400,9 @@ class PackedTasksBase:
         if not Backend.use_gloo:
             task_tensor = task_tensor.cpu()
         payload_type = SerializedPackedTasksPayloadType(task_tensor[0].item())
+
+        if payload_type == SerializedPackedTasksPayloadType.Heartbeat:
+            return payload_type, None
 
         decoded_ids = []
         decoded_types = []

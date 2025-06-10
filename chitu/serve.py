@@ -1,26 +1,31 @@
 import asyncio
 import logging
 import random
-import uuid
 from logging import getLogger
-from queue import Queue
-from threading import Semaphore, Thread
-from typing import Any, List, Optional
+from threading import Thread
+from typing import List, Optional
 
 import hydra
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
 from omegaconf import DictConfig
 from pydantic import BaseModel, Field
 
-from chitu.async_response import AsyncDataStream, AsyncResponse
+from chitu.async_response import AsyncResponse
 from chitu.backend import Backend
 from chitu.chitu_main import chitu_init, chitu_run
-from chitu.global_vars import set_global_variables
-from chitu.task import Task, TaskLoad, TaskPool, UserRequest
+from chitu.task import (
+    PackedTasksBase,
+    SerializedPackedTasksPayloadType,
+    Task,
+    TaskLoad,
+    TaskPool,
+    UserRequest,
+)
 from chitu.utils import get_config_dir_path
+from chitu.distributed_utils import propagate_tensor_to_all_devices
 
 logger = getLogger(__name__)
 
@@ -181,11 +186,30 @@ api_logger.addFilter(IgnoreSpecificPathFilter())
 
 
 async def process_queue():
+    if rank == 0:
+        asyncio.create_task(heartbeat_timer(60))
     global min_batch_size
     while True:
         if (len(TaskPool.pool) >= min_batch_size) or rank != 0:
             min_batch_size = 1
             chitu_run()
+        else:
+            await asyncio.sleep(0.01)
+
+
+async def propagate_heartbeat():
+    """add heartbeat tasks"""
+    heartbeat_task_tensor = PackedTasksBase.serialize_special(
+        SerializedPackedTasksPayloadType.Heartbeat,
+        device="cpu" if Backend.use_gloo else 0,
+    )
+    propagate_tensor_to_all_devices(heartbeat_task_tensor)
+
+
+async def heartbeat_timer(interval=60):
+    while True:
+        await asyncio.sleep(interval)
+        await propagate_heartbeat()
 
 
 def start_worker():

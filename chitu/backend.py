@@ -265,10 +265,6 @@ class Backend:
             block_size = 64 if args.infer.mla_absorb != "none" else 256
             if args.infer.attn_type == "npu":
                 block_size = 128
-                if args.infer.use_cuda_graph:
-                    raise NotImplementedError(
-                        "Graph capturing is not yet implemented for args.infer.cache_type=paged on Ascend NPU"
-                    )
             return PagedKVCacheManager(
                 local_begin_layer_id,
                 local_end_layer_id,
