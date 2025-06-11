@@ -1,13 +1,11 @@
-/*
- * @Description  :
- * @Author       : Azure-Tang, Boxin Zhang
- * @Date         : 2024-07-25 13:38:30
- * @Version      : 0.2.2
- * Adapted from
- * https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.c
- * Copyright (c) 2023-2024 The ggml authors
- * Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
+/**
+ * This file has adaption of open-source code from the following sources:
+ * - https://github.com/kvcache-ai/ktransformers, licensed under Apache 2.0,
+ *   which is further adapted from
+ *   https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.c,
+ *   licensed under MIT.
  */
+
 #include <c10/cuda/CUDAGuard.h>
 #include <cstdint>
 #include <cuda_bf16.h>

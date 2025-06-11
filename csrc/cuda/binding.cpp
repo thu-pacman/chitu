@@ -29,9 +29,9 @@ void init_compute(py::module &m) {
 }
 
 /**
- * @Description  : The following code originates from KVCache.AI and
- *                 was authored by zure-Tang and Boxin Zhang.
- **/
+ * The following code originates from KVCache.AI and was authored by zure-Tang
+ * and Boxin Zhang, licensed under Apache 2.0.
+ */
 
 void init_dequant(py::module &m) {
     auto ktdequant = m.def_submodule("ktdequant");

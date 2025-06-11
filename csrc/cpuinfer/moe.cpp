@@ -1,12 +1,8 @@
 /**
- * @Description  :
- * @Author       : chenht2022
- * @Date         : 2024-07-22 02:03:22
- * @Version      : 1.0.0
- * @LastEditors  : kkk1nak0
- * @LastEditTime : 2024-08-15 07:43:41
- * @Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
- **/
+ * This file has adaption of open-source code from the following sources:
+ * - https://github.com/kvcache-ai/ktransformers, licensed under Apache 2.0.
+ */
+
 #include "moe.h"
 #include <cstdint>
 #include <iostream>

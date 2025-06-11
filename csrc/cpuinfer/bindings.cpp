@@ -1,13 +1,10 @@
 /**
- * @Description  :
- * @Author       : chenht2022, Jianwei Dong
- * @Date         : 2024-07-22 02:03:22
- * @Version      : 1.0.0
- * @LastEditors  : Jianwei Dong
- * @LastEditTime : 2024-08-26 22:47:06
- * @Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
- **/
+ * This file has adaption of open-source code from the following sources:
+ * - https://github.com/kvcache-ai/ktransformers, licensed under Apache 2.0.
+ */
+
 // Python bindings
+
 #include "cpuinfer.h"
 #include "llamafile/flags.h"
 #include "moe.h"

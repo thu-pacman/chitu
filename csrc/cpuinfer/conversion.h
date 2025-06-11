@@ -1,12 +1,8 @@
 /**
- * @Description  :
- * @Author       : chenht2022
- * @Date         : 2024-07-12 10:07:58
- * @Version      : 1.0.0
- * @LastEditors  : chenht2022
- * @LastEditTime : 2024-07-25 10:34:55
- * @Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
- **/
+ * This file has adaption of open-source code from the following sources:
+ * - https://github.com/kvcache-ai/ktransformers, licensed under Apache 2.0.
+ */
+
 #ifndef CPUINFER_CONVERSION_H
 #define CPUINFER_CONVERSION_H
 
