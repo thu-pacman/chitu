@@ -10,7 +10,7 @@ sync-to-github:
     - sh -c "${SYNC_GITHUB_SHELL}"
   only:
     - public-main
-  when: on_success
+  when: always
 
 sync-to-gitee:
   stage: sync-to-gitee
@@ -20,4 +20,4 @@ sync-to-gitee:
     - sh -c "${SYNC_GITEE_SHELL}"
   only:
     - public-main
-  when: on_success
+  when: always
