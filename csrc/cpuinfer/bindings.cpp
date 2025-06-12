@@ -72,7 +72,7 @@ class MOEBindings {
 
 PYBIND11_MODULE(cpuinfer, m) {
     py::class_<CPUInfer>(m, "CPUInfer")
-        .def(py::init<int>())
+        .def(py::init<const std::string &>())
         .def("submit", &CPUInfer::submit)
         .def("submit_with_cuda_stream", &CPUInfer::submit_with_cuda_stream)
         .def("sync", &CPUInfer::sync)

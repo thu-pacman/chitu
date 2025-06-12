@@ -64,6 +64,7 @@ setup(
         CUDAExtension(
             name="cpuinfer",
             sources=[
+                "affinity.cpp",
                 "bindings.cpp",
                 "moe.cpp",
                 "shared_mem_buffer.cpp",

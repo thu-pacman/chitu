@@ -7,66 +7,13 @@
 #include <cstdint>
 #include <iostream>
 
-#ifdef USE_NUMA
-#include <numa.h>
-#include <numaif.h>
-#endif
-
 thread_local int CPUInfer::worker_id_ = 0;
-#ifdef USE_NUMA
-thread_local int CPUInfer::numa_node_ = -1;
-#endif
 
 MOE::MOE(MOEConfig config) {
     config_ = config;
     gate_proj_ = config_.gate_proj;
     up_proj_ = config_.up_proj;
     down_proj_ = config_.down_proj;
-
-#ifdef USE_NUMA
-    int numa_nodes = numa_num_configured_nodes();
-    gate_proj_numa_.resize(numa_nodes);
-    up_proj_numa_.resize(numa_nodes);
-    down_proj_numa_.resize(numa_nodes);
-    size_t exp_inter_hidden_mul_ = (size_t)config.expert_num *
-                                   config.intermediate_size *
-                                   config.hidden_size;
-    for (int i = 0; i < numa_nodes; i++) {
-        gate_proj_numa_[i] = numa_alloc_onnode(
-            exp_inter_hidden_mul_ * ggml_type_size(config.gate_type) /
-                ggml_blck_size(config.gate_type),
-            i);
-        up_proj_numa_[i] = numa_alloc_onnode(
-            exp_inter_hidden_mul_ * ggml_type_size(config.up_type) /
-                ggml_blck_size(config.up_type),
-            i);
-        down_proj_numa_[i] = numa_alloc_onnode(
-            exp_inter_hidden_mul_ * ggml_type_size(config.down_type) /
-                ggml_blck_size(config.down_type),
-            i);
-        if (!gate_proj_numa_[i]) {
-            std::cout << "Memory allocation failed for gate_proj_numa_ on node "
-                      << i << std::endl;
-        }
-        if (!up_proj_numa_[i]) {
-            std::cout << "Memory allocation failed for up_proj_numa_ on node "
-                      << i << std::endl;
-        }
-        if (!down_proj_numa_[i]) {
-            std::cout << "Memory allocation failed for down_proj_numa_ on node "
-                      << i << std::endl;
-        }
-        memcpy(gate_proj_numa_[i], gate_proj_,
-               exp_inter_hidden_mul_ * ggml_type_size(config.gate_type) /
-                   ggml_blck_size(config.gate_type));
-        memcpy(up_proj_numa_[i], up_proj_,
-               exp_inter_hidden_mul_ * ggml_type_size(config.up_type) /
-                   ggml_blck_size(config.up_type));
-        memcpy(down_proj_numa_[i], down_proj_,
-               exp_inter_hidden_mul_ * ggml_type_size(config.down_type) /
-                   ggml_blck_size(config.down_type));
-    }
-#endif
 
     std::vector<std::pair<void **, uint64_t>> s_mem_requests;
     s_mem_requests.push_back(
@@ -193,27 +140,7 @@ MOE::MOE(MOEConfig config) {
     m_local_down_output_ptr_.resize(config_.expert_num);
 }
 
-MOE::~MOE() {
-    shared_mem_buffer.dealloc(this);
-
-#ifdef USE_NUMA
-    int numa_nodes = numa_num_configured_nodes();
-    for (int i = 0; i < numa_nodes; i++) {
-        numa_free(gate_proj_numa_[i],
-                  config_.expert_num * config_.intermediate_size *
-                      config_.hidden_size * ggml_type_size(config_.gate_type) /
-                      ggml_blck_size(config_.gate_type));
-        numa_free(up_proj_numa_[i],
-                  config_.expert_num * config_.intermediate_size *
-                      config_.hidden_size * ggml_type_size(config_.up_type) /
-                      ggml_blck_size(config_.up_type));
-        numa_free(down_proj_numa_[i], config_.expert_num * config_.hidden_size *
-                                          config_.intermediate_size *
-                                          ggml_type_size(config_.down_type) /
-                                          ggml_blck_size(config_.down_type));
-    }
-#endif
-}
+MOE::~MOE() { shared_mem_buffer.dealloc(this); }
 
 void MOE::warm_up(CPUInfer *cpuinfer) {
     std::vector<float> input_fp32(config_.hidden_size);
@@ -283,19 +210,11 @@ void MOE::forward_one(int k, const uint64_t *expert_ids, const float *weights,
         uint64_t expert_id = expert_ids[expert_idx];
         int ith = task_id % nth;
 
-#ifdef USE_NUMA
         void *gate_proj_ptr =
-            (uint8_t *)gate_proj_numa_[cpuinfer::numa_node] +
+            (uint8_t *)gate_proj_ +
             (expert_id * config_.intermediate_size + ith * config_.stride) *
                 config_.hidden_size * ggml_type_size(config_.gate_type) /
                 ggml_blck_size(config_.gate_type);
-#else
-            void *gate_proj_ptr =
-                (uint8_t *)gate_proj_ +
-                (expert_id * config_.intermediate_size + ith * config_.stride) *
-                    config_.hidden_size * ggml_type_size(config_.gate_type) /
-                    ggml_blck_size(config_.gate_type);
-#endif
 
         float *gate_output_ptr =
             s_gate_output_[expert_idx] + ith * config_.stride;
@@ -311,19 +230,11 @@ void MOE::forward_one(int k, const uint64_t *expert_ids, const float *weights,
             ggml_internal_get_type_traits(config_.gate_type).vec_dot_type,
             GGML_TYPE_F32, GGML_PREC_DEFAULT);
 
-#ifdef USE_NUMA
         void *up_proj_ptr =
-            (uint8_t *)up_proj_numa_[cpuinfer::numa_node] +
+            (uint8_t *)up_proj_ +
             (expert_id * config_.intermediate_size + ith * config_.stride) *
                 config_.hidden_size * ggml_type_size(config_.up_type) /
                 ggml_blck_size(config_.up_type);
-#else
-            void *up_proj_ptr =
-                (uint8_t *)up_proj_ +
-                (expert_id * config_.intermediate_size + ith * config_.stride) *
-                    config_.hidden_size * ggml_type_size(config_.up_type) /
-                    ggml_blck_size(config_.up_type);
-#endif
 
         float *up_output_ptr = s_up_output_[expert_idx] + ith * config_.stride;
         llamafile_sgemm(
@@ -382,21 +293,12 @@ void MOE::forward_one(int k, const uint64_t *expert_ids, const float *weights,
         for (int expert_idx = 0; expert_idx < k; expert_idx++) {
             uint64_t expert_id = expert_ids[expert_idx];
 
-#ifdef USE_NUMA
             void *down_proj_ptr =
-                (uint8_t *)down_proj_numa_[cpuinfer::numa_node] +
+                (uint8_t *)down_proj_ +
                 (expert_id * config_.hidden_size + ith * config_.stride) *
                     config_.intermediate_size *
                     ggml_type_size(config_.down_type) /
                     ggml_blck_size(config_.down_type);
-#else
-                void *down_proj_ptr =
-                    (uint8_t *)down_proj_ +
-                    (expert_id * config_.hidden_size + ith * config_.stride) *
-                        config_.intermediate_size *
-                        ggml_type_size(config_.down_type) /
-                        ggml_blck_size(config_.down_type);
-#endif
 
             float *down_output_ptr =
                 s_down_output_[expert_idx] + ith * config_.stride;
@@ -574,19 +476,11 @@ void MOE::forward_many(int qlen, int k, const uint64_t *expert_ids,
         int ith = task_id % nth;
         void *gate_input_ptr = m_local_gate_input_ptr_[expert_idx];
 
-#ifdef USE_NUMA
         void *gate_proj_ptr =
-            (uint8_t *)gate_proj_numa_[cpuinfer::numa_node] +
+            (uint8_t *)gate_proj_ +
             (expert_idx * config_.intermediate_size + ith * stride) *
                 config_.hidden_size * ggml_type_size(config_.gate_type) /
                 ggml_blck_size(config_.gate_type);
-#else
-            void *gate_proj_ptr =
-                (uint8_t *)gate_proj_ +
-                (expert_idx * config_.intermediate_size + ith * stride) *
-                    config_.hidden_size * ggml_type_size(config_.gate_type) /
-                    ggml_blck_size(config_.gate_type);
-#endif
 
         float *gate_output_ptr =
             m_local_gate_output_ptr_[expert_idx] + ith * stride;
@@ -603,19 +497,11 @@ void MOE::forward_many(int qlen, int k, const uint64_t *expert_ids,
             GGML_TYPE_F32, GGML_PREC_DEFAULT);
         void *up_input_ptr = m_local_up_input_ptr_[expert_idx];
 
-#ifdef USE_NUMA
         void *up_proj_ptr =
-            (uint8_t *)up_proj_numa_[cpuinfer::numa_node] +
+            (uint8_t *)up_proj_ +
             (expert_idx * config_.intermediate_size + ith * stride) *
                 config_.hidden_size * ggml_type_size(config_.up_type) /
                 ggml_blck_size(config_.up_type);
-#else
-            void *up_proj_ptr =
-                (uint8_t *)up_proj_ +
-                (expert_idx * config_.intermediate_size + ith * stride) *
-                    config_.hidden_size * ggml_type_size(config_.up_type) /
-                    ggml_blck_size(config_.up_type);
-#endif
 
         float *up_output_ptr =
             m_local_up_output_ptr_[expert_idx] + ith * stride;
@@ -670,20 +556,11 @@ void MOE::forward_many(int qlen, int k, const uint64_t *expert_ids,
         int ith = task_id % nth;
         void *down_input_ptr = m_local_down_input_ptr_[expert_idx];
 
-#ifdef USE_NUMA
         void *down_proj_ptr =
-            (uint8_t *)down_proj_numa_[cpuinfer::numa_node] +
+            (uint8_t *)down_proj_ +
             (expert_idx * config_.hidden_size + ith * stride) *
                 config_.intermediate_size * ggml_type_size(config_.down_type) /
                 ggml_blck_size(config_.down_type);
-#else
-            void *down_proj_ptr =
-                (uint8_t *)down_proj_ +
-                (expert_idx * config_.hidden_size + ith * stride) *
-                    config_.intermediate_size *
-                    ggml_type_size(config_.down_type) /
-                    ggml_blck_size(config_.down_type);
-#endif
 
         float *down_output_ptr =
             m_local_down_output_ptr_[expert_idx] + ith * stride;

@@ -10,15 +10,17 @@ infer:
   seed: 0
   max_seq_len: 10240 # length of prefill + decode
   cache_type: skew
-  attn_type: flash_attn # flash_attn, flash_mla, flash_infer, triton, npu or ref
-  op_impl: torch # torch or muxi_custom_kernel
-  mla_absorb: "none" # none, absorb-without-precomp, absorb
+  attn_type: flash_attn # one of: flash_attn, flash_mla, flash_infer, triton, npu, ref
+  op_impl: torch # one of: torch, muxi_custom_kernel
+  mla_absorb: "none" # one of: none, absorb-without-precomp, absorb
   raise_lower_bit_float_to: float8_e4m3fn # choose one hardware-support dtype to compute lower-bit float 
   soft_fp8: false # Legacy parameter. To be removed in the future.
   fuse_shared_experts: False # whether to fuse shared experts
   max_reqs: 8
   pp_layer_partition: null # The number of layers for each pipeline stage, e.g., [10, 12, 12, 10].
   use_cuda_graph: False
+  bind_process_to_cpu: auto # one of: auto, none, numa
+  bind_thread_to_cpu: physical_core # one of: physical_core, logical_core
 request:
   prompt_tokens_len: -1 # use for perf test in single_req_test.py, -1 means use real requests.
   max_new_tokens: 128
