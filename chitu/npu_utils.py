@@ -81,3 +81,56 @@ def fused_experts_npu(
     if len(ori_shape) == 3:
         hidden_states = hidden_states.view(ori_shape)
     return hidden_states
+
+
+def try_get_npu_profiler(
+    result_path: str = "./trace_result", wait: int = 0, warmup: int = 2
+):
+
+    import os
+    import time
+    from datetime import datetime
+    from contextlib import contextmanager
+
+    @contextmanager
+    def nullcontext(enter_result=None):
+        yield enter_result
+
+    try:
+        import torch_npu
+    except ImportError:
+        return nullcontext
+
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        export_type=torch_npu.profiler.ExportType.Text,
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+        msprof_tx=False,
+        aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+        l2_cache=False,
+        op_attr=False,
+        data_simplification=False,
+        record_op_args=False,
+        gc_detect_threshold=None,
+    )
+
+    os.makedirs(result_path, exist_ok=True)
+    time_str = datetime.now().strftime("%H_%M")
+    profiler = torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU,
+        ],
+        schedule=torch_npu.profiler.schedule(
+            wait=wait, warmup=warmup, active=1000, repeat=0
+        ),
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+            dir_name=result_path, worker_name=f"trace_{time_str}"
+        ),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_modules=False,
+        with_flops=False,
+        experimental_config=experimental_config,
+    )
+    return profiler
