@@ -8,6 +8,8 @@ Chitu is a high-performance inference framework for large language models, focus
 
 ## News
 
+[2025/06/12] Released v0.3.5, added support for Ascend NPU aclgraph to enhance higher performance, and fixed some known issues.
+
 [2025/05/29] Release v0.3.4, with some performance optimizations.
 
 [2025/05/22] Released v0.3.3, with initial support for Ascend NPU.
@@ -32,6 +34,18 @@ Chitu is a high-performance inference framework for large language models. Chitu
 
 
 ## Evaluation
+
+### Deploy Qwen3-32B on Ascend 910B Dual Cards (with aclgraph enabled via infer.use_cuda_graph=True)
+
+| Batchsize | chitu 0.3.5, Output TPS (tokens/s) |
+|:---|:---|
+|1| 20.40 |
+|4| 75.81 |
+|8| 141.30 |
+|16| 257.22 |
+|32| 444.38 |
+|64| 723.42 |
+
 ### Deploy DeepSeek-R1-671B on a single eight-card H20 (96G) server
 
 | Output token/s| chitu 0.3.0, original FP8| chitu 0.3.0, FP4->FP8 | chitu 0.3.0, FP4->BF16 |
@@ -109,6 +123,7 @@ pip install -r requirements-build.txt
 pip install -U torch --index-url https://download.pytorch.org/whl/cu124  # Change according to your CUDA version
 TORCH_CUDA_ARCH_LIST=9.0 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation . # Change `8.6` to your desired CUDA arch list.
 # For the Ascend platform, you need set up the CANN and torch_npu 2.5 environments, and set the environment variable ASCEND_PLATFORM=1 during installation.
+# Note: To enable aclgraph support, you need to install torch_npu via the whl in third_party/ascend, or directly use the official chitu docker image.
 ASCEND_PLATFORM=1 MAX_JOBS=4 pip install --no-build-isolation .
 ```
 
