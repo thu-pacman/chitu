@@ -20,6 +20,7 @@ TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation ".[flashinf
 - `flashinfer`: 用于支持 `infer.attn_type=flash_infer`。
 - `flash_mla`: 用于支持 `infer.attn_type=flash_mla`。
 - `deep_gemm`: 用于支持使用 DeepGEMM 进行 fp8 推理。
+- `quant`：推理量化模型所需的若干额外依赖。
 - `cpu`: 用于支持 CPU+GPU 混合推理。
 - `muxi_layout_kernels`: 用于支持在沐曦 GPU 上使用 `infer.op_impl=muxi_custom_kernel` 模式，在小 batch 场景性能更优。
 

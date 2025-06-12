@@ -25,6 +25,7 @@ Currently supported optional dependencies are:
 - `flashinfer`: Support `infer.attn_type=flash_infer`.
 - `flash_mla`: Support `infer.attn_type=flash_mla`.
 - `deep_gemm`: Support using DeepGEMM for fp8 inference.
+- `quant`: Additional dependencies for quantized inference.
 - `cpu`: Support hybrid CPU+GPU inference.
 - `muxi_layout_kernels`: Addtional kernels for running on MetaX GPUs with `infer.op_impl=muxi_custom_kernel`, optimized for small batches.
 
