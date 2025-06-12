@@ -8,6 +8,8 @@ Chitu (赤兔) 是一个专注于效率、灵活性和可用性的高性能大�
 
 ## 最新动态
 
+[2025/06/12] 发布 v0.3.5，增加了昇腾 NPU aclgraph 的支持以获更高性能，解决了一些已知问题。
+
 [2025/05/29] 发布 v0.3.4，一些性能优化。
 
 [2025/05/22] 发布 v0.3.3，增加了对昇腾 NPU 的初步支持。
@@ -31,6 +33,17 @@ Chitu (赤兔) 定位于「生产级大模型推理引擎」，充分考虑企�
 - **长期稳定运行**：可应用于实际生产环境，稳定性足以承载并发业务流量。
 
 ## 测试数据
+
+### 在昇腾 910B 两卡部署 Qwen3-32B (配置 infer.use_cuda_graph=True 开启 aclgraph)
+
+| Batchsize | chitu 0.3.5, 输出速率 token/s |
+|:---|:---|
+|1| 20.40 |
+|4| 75.81 |
+|8| 141.30 |
+|16| 257.22 |
+|32| 444.38 |
+|64| 723.42 |
 
 ### 在单机八卡 H20(96G) 服务器上部署 DeepSeek-R1-671B
 
@@ -115,6 +128,7 @@ pip install -U torch --index-url https://download.pytorch.org/whl/cu124
 # TORCH_CUDA_ARCH_LIST 的值可通过 python -c "import torch; print(torch.cuda.get_device_capability())" 查看
 TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation . 
 # 华为昇腾平台需要先准备 CANN 和 torch_npu 2.5 环境，安装时设置变量 ASCEND_PLATFORM=1
+# 注意：如果要开启 aclgraph 支持，需要通过 third_party/ascend 里的 whl 安装 torch_npu，或者直接使用chitu官方 docker 镜像
 ASCEND_PLATFORM=1 MAX_JOBS=4 pip install --no-build-isolation . 
 ```
 
