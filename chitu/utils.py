@@ -11,6 +11,7 @@ from typing import Any, Tuple, Optional
 import numpy as np
 import torch
 import importlib
+from chitu.device_type import is_ascend
 
 from chitu.global_vars import get_global_args
 
@@ -72,11 +73,15 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     # min_p_thresholds = probs_sort[:, 0] * min_ps
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-    probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
+
+    top_p_mask = (probs_sum - probs_sort) > top_ps.view(-1, 1)
+    top_k_mask = torch.arange(0, probs.shape[-1], device=probs.device).view(
+        1, -1
+    ) >= top_ks.view(-1, 1)
+    if is_ascend():
+        probs_sort *= ~(top_p_mask | top_k_mask)
+    else:
+        probs_sort[top_p_mask | top_k_mask] = 0.0
     # probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
     probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
     sampled_index = multinomial(probs_sort, num_samples=1, impl="sync-free")
