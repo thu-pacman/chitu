@@ -1,12 +1,8 @@
 /**
- * @Description  :
- * @Author       : chenht2022
- * @Date         : 2024-07-22 02:03:22
- * @Version      : 1.0.0
- * @LastEditors  : chenht2022
- * @LastEditTime : 2024-07-25 10:35:10
- * @Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
- **/
+ * This file has adaption of open-source code from the following sources:
+ * - https://github.com/kvcache-ai/ktransformers, licensed under Apache 2.0.
+ */
+
 #ifndef CPUINFER_OPERATOR_MOE_H
 #define CPUINFER_OPERATOR_MOE_H
 
@@ -76,18 +72,6 @@ class MOE {
                       // quantized)]
     void *down_proj_; // [expert_num * hidden_size * intermediate_size ( /32 if
                       // quantized)]
-
-#ifdef USE_NUMA
-    std::vector<void *>
-        gate_proj_numa_; // [numa_num, expert_num * intermediate_size *
-                         // hidden_size ( /32 if quantized)]
-    std::vector<void *>
-        up_proj_numa_; // [numa_num, expert_num * intermediate_size *
-                       // hidden_size ( /32 if quantized)]
-    std::vector<void *>
-        down_proj_numa_; // [numa_num, expert_num * hidden_size *
-                         // intermediate_size ( /32 if quantized)]
-#endif
 
     float *s_input_fp32_; // [hidden_size]
     uint8_t *

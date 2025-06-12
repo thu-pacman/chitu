@@ -1,12 +1,8 @@
 /**
- * @Description  :
- * @Author       : Azure-Tang
- * @Date         : 2024-07-22 09:27:55
- * @Version      : 1.0.0
- * @LastEditors  : kkk1nak0
- * @LastEditTime : 2024-08-12 03:48:46
- * @Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
- **/
+ * This file has adaption of open-source code from the following sources:
+ * - https://github.com/kvcache-ai/ktransformers, licensed under Apache 2.0.
+ */
+
 #pragma once
 
 #include <torch/extension.h>

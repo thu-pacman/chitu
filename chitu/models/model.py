@@ -577,33 +577,22 @@ class Transformer(nn.Module):
             state_dict = new_state_dict
         return state_dict
 
-    def process_state_dict_for_renaming_linear_layer(
-        self, checkpoint, merge_gate_up, n_dense_layers
-    ):
+    def process_state_dict_for_renaming_linear_layer(self, checkpoint, n_dense_layers):
         """
         重命名专家权重结构的函数以消除冗余的 gate,up,down 层
         参数格式示例：
         输入键：'layers.3.mlp.gate_proj.weight'
         输出键：'layers.3.mlp.gate_proj_weight'
         """
-        from collections import defaultdict
-
         new_checkpoint = {}
-        if not merge_gate_up:
+        for key in checkpoint:
             pattern_lists = [
+                r"layers\.(\d+)\.mlp\.gate_up_proj\.([^.]+)",
                 r"layers\.(\d+)\.mlp\.gate_proj\.([^.]+)",
                 r"layers\.(\d+)\.mlp\.down_proj\.([^.]+)",
                 r"layers\.(\d+)\.mlp\.up_proj\.([^.]+)",
             ]
-            tensor_names = ["gate_proj", "down_proj", "up_proj"]
-        else:
-            pattern_lists = [
-                r"layers\.(\d+)\.mlp\.gate_up_proj\.([^.]+)",
-                r"layers\.(\d+)\.mlp\.down_proj\.([^.]+)",
-            ]
-            tensor_names = ["gate_up_proj", "down_proj"]
-
-        for key in checkpoint:
+            tensor_names = ["gate_up_proj", "gate_proj", "down_proj", "up_proj"]
             matched = False
             for tensor_name, pattern in zip(tensor_names, pattern_lists):
                 match = re.fullmatch(pattern, key)
@@ -935,18 +924,17 @@ class MoeBlock(nn.Module):
         moe_world_size: int,
         moe_rank: int,
         do_gather_output: bool,
-        merge_gate_up: bool,
         dtype: str,
         op_impl: str,
         gate: MoeGate,
         fuse_shared_experts: bool,
         shared_experts: nn.Module,
         checkpoint_prefix: str,
+        merge_gate_up: bool,
         build_weight: bool = True,
     ):
         super().__init__()
         self.op_impl = op_impl
-        self.merge_gate_up = merge_gate_up
         self.gate = gate
         self.dim = dim
         self.fuse_shared_experts = fuse_shared_experts
@@ -984,6 +972,7 @@ class MoeBlock(nn.Module):
             )
             else parse_dtype(dtype)
         )
+        self.merge_gate_up = merge_gate_up
         if build_weight:
             if not self.merge_gate_up:
                 self.gate_proj_weight = nn.Parameter(
@@ -1433,13 +1422,13 @@ class MoE_blockfp4(MoeBlock):
         moe_world_size: int,
         moe_rank: int,
         do_gather_output: bool,
-        merge_gate_up: bool,
         dtype: torch.dtype,
         op_impl: str,
         gate: MoeGate,
         fuse_shared_experts: bool,
         shared_experts: nn.Module,
         checkpoint_prefix: str,
+        merge_gate_up: bool,
     ):
         """
         Initializes the MoE module.
@@ -1456,7 +1445,6 @@ class MoE_blockfp4(MoeBlock):
             moe_world_size,
             moe_rank,
             do_gather_output,
-            merge_gate_up,
             dtype,
             op_impl,
             gate,
@@ -1464,6 +1452,7 @@ class MoE_blockfp4(MoeBlock):
             shared_experts,
             checkpoint_prefix,
             build_weight=False,
+            merge_gate_up=merge_gate_up,
         )
 
         self.linear_dtype = torch.uint8
@@ -1472,7 +1461,7 @@ class MoE_blockfp4(MoeBlock):
 
         gate_up_proj_in_features = dim
 
-        if merge_gate_up:
+        if self.merge_gate_up:
             out_features = moe_inter_dim * 2
             assert (
                 out_features % self.tp_size == 0
@@ -1936,13 +1925,13 @@ class MoE_blockfp8(MoeBlock):
         moe_world_size: int,
         moe_rank: int,
         do_gather_output: bool,
-        merge_gate_up: bool,
         dtype: torch.dtype,
         op_impl: str,
         gate: MoeGate,
         fuse_shared_experts: bool,
         shared_experts: nn.Module,
         checkpoint_prefix: str,
+        merge_gate_up: bool,
     ):
         """
         Initializes the MoE module.
@@ -1959,18 +1948,19 @@ class MoE_blockfp8(MoeBlock):
             moe_world_size,
             moe_rank,
             do_gather_output,
-            merge_gate_up,
             dtype,
             op_impl,
             gate,
             fuse_shared_experts,
             shared_experts,
             checkpoint_prefix,
+            build_weight=True,
+            merge_gate_up=merge_gate_up,
         )
         gate_up_proj_in_features = dim
         block_size = 128
 
-        if merge_gate_up:
+        if self.merge_gate_up:
             out_features = moe_inter_dim * 2
             assert (
                 out_features % self.tp_size == 0

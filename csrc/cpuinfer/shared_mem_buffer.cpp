@@ -1,12 +1,8 @@
 /**
- * @Description  :
- * @Author       : chenht2022
- * @Date         : 2024-08-05 04:49:08
- * @Version      : 1.0.0
- * @LastEditors  : chenht2022
- * @LastEditTime : 2024-08-05 09:21:29
- * @Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
- **/
+ * This file has adaption of open-source code from the following sources:
+ * - https://github.com/kvcache-ai/ktransformers, licensed under Apache 2.0.
+ */
+
 #include "shared_mem_buffer.h"
 #include <cstdio>
 

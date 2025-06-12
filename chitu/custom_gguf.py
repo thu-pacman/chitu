@@ -1,20 +1,14 @@
-#!/usr/bin/env python
-# coding=utf-8
 """
-Description  :
-Author       : Azure-Tang, Boxin Zhang, chenht2022
-Date         : 2024-07-26 08:48:54
-Version      : 1.0.0
-LastEditors  : kkk1nak0
-LastEditTime : 2024-08-14 08:20:45
-Adapted from https://github.com/99991/pygguf/blob/main/gguf.py
-Copyright (c) 2023-2024 The ggml authors
-Copyright (c) 2024 Thomas Germer
-Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
+This file has adaption of open-source code from the following sources:
+- https://github.com/kvcache-ai/ktransformers, licensed under Apache 2.0,
+  which is further adapted from https://github.com/99991/pygguf/blob/main/gguf.py, licensed under MIT,
+  which is further adapted from https://github.com/ggml-org/llama.cpp, licsend under MIT,
+  which is further adapted from https://github.com/ggml-org/ggml, licensed under MIT.
 """
-# copied from llama.cpp/gguf-py/gguf/constants.py to satisfy dependence of gguf
-# GGUF specification
+
+# GGUF specification:
 # https://github.com/ggerganov/ggml/blob/master/docs/gguf.md
+
 import struct
 import warnings
 import numpy as np

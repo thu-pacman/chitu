@@ -7,8 +7,14 @@
 #include <functional>
 #include <mutex>
 #include <queue>
+#include <set>
+#include <stdexcept>
 #include <thread>
+#include <unordered_set>
 #include <vector>
+
+#include <immintrin.h> // for _mm_pause on x86
+#include <sched.h>
 
 #ifdef USE_CUDA
 #include "vendors/cuda.h"
@@ -16,12 +22,21 @@
 #include "vendors/musa.h"
 #endif
 
-#ifdef USE_NUMA
-#include <numa.h>
-#include <numaif.h>
-#endif
-
+#include "affinity.h"
 #include "llama.cpp/ggml-impl.h"
+
+inline bool parse_bind_physical_core(
+    const std::string
+        &thread_binding_policy /* one of: physical_core, logical_core */) {
+    if (thread_binding_policy == "physical_core") {
+        return true;
+    } else if (thread_binding_policy == "logical_core") {
+        return false;
+    } else {
+        throw std::invalid_argument("Invalid thread_binding_policy: " +
+                                    thread_binding_policy);
+    }
+}
 
 class CPUInfer {
   public:
@@ -49,6 +64,14 @@ class CPUInfer {
     std::vector<WorkerContext> workers_;
     std::vector<std::thread> worker_pool_;
 
+    // Physical core management
+    bool bind_to_physical_core_;
+    std::mutex bind_core_mutex_;
+    std::set<std::tuple<int /* physical package ID */, int /* die ID */,
+                        int /* core ID */>>
+        used_physical_cores_;
+    std::unordered_set<int> used_logical_cores_;
+
     // Task management
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
@@ -60,9 +83,6 @@ class CPUInfer {
     int active_workers_;
 
     // Thread-local storage
-#ifdef USE_NUMA
-    static thread_local int numa_node_;
-#endif
     static thread_local int worker_id_;
 
     void initialize_workers() {
@@ -84,6 +104,11 @@ class CPUInfer {
 
     void worker_routine(int worker_id) {
         worker_id_ = worker_id;
+        if (bind_to_physical_core_) {
+            bind_cur_thread_to_first_available_physical_core();
+        } else {
+            bind_cur_thread_to_first_available_logical_core();
+        }
         auto last_active = std::chrono::steady_clock::now();
         while (true) {
             switch (workers_[worker_id].state.load(std::memory_order_acquire)) {
@@ -100,6 +125,8 @@ class CPUInfer {
                 if (std::chrono::steady_clock::now() - last_active >
                     IDLE_THRESHOLD) {
                     std::this_thread::sleep_for(SLEEP_DURATION);
+                } else {
+                    _mm_pause();
                 }
                 break;
             }
@@ -107,16 +134,6 @@ class CPUInfer {
     }
 
     void process_tasks(int worker_id) {
-
-#ifdef USE_NUMA
-        if (numa_node == -1) {
-            numa_node = thread_id * numa_num_configured_nodes() / thread_num_;
-            struct bitmask *mask =
-                numa_bitmask_alloc(numa_num_configured_nodes());
-            numa_bitmask_setbit(mask, numa_node);
-            numa_bind(mask);
-        }
-#endif
         auto &ctx = workers_[worker_id];
 
         while (true) {
@@ -146,11 +163,101 @@ class CPUInfer {
                                         std::memory_order_release);
     }
 
-  public:
-    explicit CPUInfer(size_t num_workers)
-        : workers_(num_workers), active_workers_(num_workers), sync_flag_(true),
-          shutdown_flag_(false) {
+    int bind_cur_thread_to_first_available_physical_core() {
+        std::lock_guard lock(bind_core_mutex_);
 
+        // We can't assume all CPUs on the system are available for us. Query
+        // the availability first.
+        cpu_set_t old_mask;
+        if (sched_getaffinity(0, sizeof(cpu_set_t), &old_mask)) {
+            throw std::runtime_error("Failed to get current thread affinity");
+        }
+        for (int i = 0; i < CPU_SETSIZE; i++) {
+            if (CPU_ISSET(i, &old_mask)) {
+                // Find a physical core that is not already used
+                int physical_package_id =
+                    get_physical_cpu_id_from_logical_cpu_id("physical_package",
+                                                            i);
+                int die_id = get_physical_cpu_id_from_logical_cpu_id("die", i);
+                int core_id =
+                    get_physical_cpu_id_from_logical_cpu_id("core", i);
+                auto core_tuple =
+                    std::make_tuple(physical_package_id, die_id, core_id);
+                if (used_physical_cores_.find(core_tuple) ==
+                    used_physical_cores_.end()) {
+                    used_physical_cores_.insert(core_tuple);
+
+                    // Bind the current thread to this physical core
+                    cpu_set_t new_mask;
+                    CPU_ZERO(&new_mask);
+                    CPU_SET(i, &new_mask);
+                    if (sched_setaffinity(0, sizeof(cpu_set_t), &new_mask) !=
+                        0) {
+                        throw std::runtime_error(
+                            "Failed to bind thread to physical core " +
+                            std::to_string(i));
+                    }
+                    return i;
+                }
+            }
+        }
+
+        throw std::runtime_error(
+            "No available physical cores found for "
+            "binding the current thread. Please set the number of workers to "
+            "be no greater than the number of physical cores.");
+    }
+
+    int bind_cur_thread_to_first_available_logical_core() {
+        std::lock_guard lock(bind_core_mutex_);
+
+        // We can't assume all CPUs on the system are available for us. Query
+        // the availability first.
+        cpu_set_t old_mask;
+        if (sched_getaffinity(0, sizeof(cpu_set_t), &old_mask)) {
+            throw std::runtime_error("Failed to get current thread affinity");
+        }
+        for (int i = 0; i < CPU_SETSIZE; i++) {
+            if (CPU_ISSET(i, &old_mask)) {
+                if (used_logical_cores_.find(i) == used_logical_cores_.end()) {
+                    used_logical_cores_.insert(i);
+
+                    // Bind the current thread to this logical core
+                    cpu_set_t new_mask;
+                    CPU_ZERO(&new_mask);
+                    CPU_SET(i, &new_mask);
+                    if (sched_setaffinity(0, sizeof(cpu_set_t), &new_mask) !=
+                        0) {
+                        throw std::runtime_error(
+                            "Failed to bind thread to logical core " +
+                            std::to_string(i));
+                    }
+                    return i;
+                }
+            }
+        }
+
+        throw std::runtime_error(
+            "No available logical cores found for "
+            "binding the current thread. Please set the number of workers to "
+            "be no greater than the number of logical cores.");
+    }
+
+  public:
+    explicit CPUInfer(
+        const std::string
+            &thread_binding_policy /* one of: physical_core, logical_core */)
+        : CPUInfer(parse_bind_physical_core(thread_binding_policy)) {}
+
+    explicit CPUInfer(bool bind_to_physical_core)
+        : CPUInfer(bind_to_physical_core,
+                   bind_to_physical_core ? count_available_physical_cpus()
+                                         : count_available_logical_cpus()) {}
+
+    explicit CPUInfer(bool bind_to_physical_core, int num_workers)
+        : workers_(num_workers), bind_to_physical_core_(bind_to_physical_core),
+          active_workers_(num_workers), sync_flag_(true),
+          shutdown_flag_(false) {
         for (auto &ctx : workers_) {
             ctx.state.store(WorkerState::Idle, std::memory_order_relaxed);
         }
@@ -251,6 +358,11 @@ class CPUInfer {
 
   private:
     void dispatch_tasks() {
+        if (bind_to_physical_core_) {
+            bind_cur_thread_to_first_available_physical_core();
+        } else {
+            bind_cur_thread_to_first_available_logical_core();
+        }
         while (true) {
             std::function<void()> task;
             {

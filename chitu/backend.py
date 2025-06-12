@@ -9,10 +9,11 @@ from enum import Enum
 from glob import glob
 from logging import getLogger
 from pathlib import Path
+from tqdm import tqdm, trange
 
 import torch
+import torch.distributed as dist
 from safetensors.torch import safe_open
-from tqdm import tqdm, trange
 from transformers import AutoModelForCausalLM
 
 from chitu.attn_backend import (
@@ -35,12 +36,13 @@ from chitu.models.model_hf_mixtral import TransformerHFMixtral
 from chitu.models.model_llama import TransformerLlama
 from chitu.tensor_parallel import get_tp_size, init_tp
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
-from chitu.utils import compute_layer_dist_in_pipe, parse_dtype
-
-import gc
-import sys
+from chitu.utils import compute_layer_dist_in_pipe, parse_dtype, try_import_opt_dep
+from chitu.global_vars import get_global_args
+from chitu.quantization import QuantizationRegistry
 from chitu.custom_gguf import *
-import torch.distributed as dist
+
+numa, has_numa = try_import_opt_dep("numa", "cpu")
+cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
 
 logger = getLogger(__name__)
@@ -114,6 +116,7 @@ class Backend:
         model_parallel_size = args.infer.tp_size
         pipeline_parallel_size = args.infer.pp_size
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
         global_rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
 
@@ -121,7 +124,39 @@ class Backend:
             world_size == model_parallel_size * pipeline_parallel_size
         ), "World size not match"
 
+        # Bind process to GPU
         torch.cuda.set_device(local_rank)
+
+        # Bind process to CPU NUMA
+        if args.infer.bind_process_to_cpu == "auto":
+            if not has_cpuinfer and not has_numa:
+                args.infer.bind_process_to_cpu = "none"
+            elif not has_numa:
+                logger.warning(
+                    "'cpuinfer' is found but 'numa' is mising. Disabling NUMA binding. "
+                    "For better CPU inference performance, please refer to README.md and "
+                    "install the full '[cpu]' optional dependency."
+                )
+                args.infer.bind_process_to_cpu = "none"
+            elif not numa.available():
+                logger.warning(
+                    "NUMA is not support on this OS or hardware platform. Disabling NUMA binding."
+                )
+                args.infer.bind_process_to_cpu = "none"
+            elif numa.get_max_node() + 1 < local_world_size:
+                logger.info("Disable NUMA binding due to insufficient NUMA nodes.")
+                args.infer.bind_process_to_cpu = "none"
+            else:
+                args.infer.bind_process_to_cpu = "numa"
+        if args.infer.bind_process_to_cpu == "numa":
+            numa.bind({local_rank})
+        elif args.infer.bind_process_to_cpu == "none":
+            pass
+        else:
+            raise ValueError(
+                f"Unsupported infer.bind_process_to_cpu={args.infer.bind_process_to_cpu}"
+            )
+
         init_tp(model_parallel_size, pipeline_parallel_size, Backend.use_gloo)
 
         if args.infer.attn_type == "npu":
@@ -419,36 +454,17 @@ class Backend:
         """
         model_parallel_size = args.infer.tp_size
         pipeline_parallel_size = args.infer.pp_size
-
-        # Determine whether to merge QKV, gate, and up projections
-        merge_qkv_gate_up = True
-        if args.models.type == "llama":
-            merge_qkv_gate_up = False  # Not yet supported
-
-        allowed_quant_for_merge_qkv_gate_up = {None, "blockfp8"}
         if args.models.type == "deepseek-v3":
-            allowed_quant_for_merge_qkv_gate_up.add("blockfp4")
-
-        if hasattr(args.models, "quant_config"):
-            for rule in args.models.quant_config.rules:
-                if rule.type not in allowed_quant_for_merge_qkv_gate_up:
-                    # Merge weights for offline-scaled quantized models is non-trivial, because we can
-                    # only merge weights but NOT the scales on input dimensions, and this will break the
-                    # assumption of the fused quantized kernels. So we only merge weights for supported
-                    # quantization methods.
-                    merge_qkv_gate_up = False
-                    break
+            QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up.append("blockfp4")
 
         if args.models.type == "deepseek-v3" and args.models.quant_config.type in [
             "gguf",
             "gguf-blockfp8",
         ]:
-            import cpuinfer
-
             cpu_layer_num = (
                 args.cpu_layer_num if hasattr(args.models, "cpu_layer_num") else 58
             )
-            Backend.cpu_infer = cpuinfer.CPUInfer(args.models.cpu_num_thread)
+            Backend.cpu_infer = cpuinfer.CPUInfer(args.infer.bind_thread_to_cpu)
             Backend.cpu_layers = list(range(61 - cpu_layer_num, 61))
             Backend.ggml_type = [
                 0,
@@ -528,7 +544,6 @@ class Backend:
             model_parallel_size=model_parallel_size,
             attn_backend=attn_backend,
             op_impl=args.infer.op_impl,
-            merge_qkv_gate_up=merge_qkv_gate_up,
             mla_absorb=args.infer.mla_absorb,
         )
 
