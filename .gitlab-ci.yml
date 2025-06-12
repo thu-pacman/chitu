@@ -1,12 +1,23 @@
 stages:
-  - sync
+  - sync-to-github
+  - sync-to-gitee
 
 sync-to-github:
-  stage: sync
+  stage: sync-to-github
   tags:
     - ${SYNC_TAGS}
   script:
     - sh -c "${SYNC_GITHUB_SHELL}"
+  only:
+    - public-main
+  when: on_success
+
+sync-to-gitee:
+  stage: sync-to-gitee
+  tags:
+    - ${SYNC_TAGS}
+  script:
+    - sh -c "${SYNC_GITEE_SHELL}"
   only:
     - public-main
   when: on_success
