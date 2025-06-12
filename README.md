@@ -249,6 +249,52 @@ python benchmarks/benchmark_serving.py \
     --base-url http://localhost:21002
 ```
 
+## 使用容器
+
+### 昇腾
+
+```
+docker run \
+  --rm \
+  --device /dev/davinci0 \
+  --device /dev/davinci1 \
+  --device /dev/davinci2 \
+  --device /dev/davinci3 \
+  --device /dev/davinci4 \
+  --device /dev/davinci5 \
+  --device /dev/davinci6 \
+  --device /dev/davinci7 \
+  --device /dev/davinci_manager \
+  --device /dev/devmm_svm \
+  --device /dev/hisi_hdc \
+  -v /usr/local/dcmi:/usr/local/dcmi \
+  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+  -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+  -v /etc/ascend_install.info:/etc/ascend_install.info \
+  -v <your_model_path>:<container_model_path> \
+  <your_image_name> \
+  <your_command>
+```
+
+### 沐曦
+
+```
+docker run \
+  --rm \
+  --device=/dev/dri \
+  --device=/dev/mxcd \
+  --group-add video \
+  --privileged=true \
+  --security-opt seccomp=unconfined \
+  --security-opt apparmor=unconfined \
+  --shm-size=100gb \
+  --ulimit memlock=-1 \
+  -v <your_model_path>:<container_model_path> \
+  <your_image_name> \
+  <your_command>
+```
+
 ## 常见问题
 
 [中文](/docs/zh/FAQ.md) | [English](/docs/en/FAQ.md)
