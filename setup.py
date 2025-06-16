@@ -123,7 +123,7 @@ setup(
             + os.path.join(setup_dir, "third_party/muxi_w8a8_kernels/w8a8"),
         ],
         "flash_attn": [
-            "flash-attn",
+            "flash-attn<2.8.0",
             # Although `flash-attn` is available in PyPI, don't make it a required
             # dependency, because its installation runs forever on some platforms.
         ],
