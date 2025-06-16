@@ -923,7 +923,6 @@ class MoeBlock(nn.Module):
         n_activated_experts: int,
         moe_world_size: int,
         moe_rank: int,
-        do_gather_output: bool,
         dtype: str,
         op_impl: str,
         gate: MoeGate,
@@ -955,7 +954,6 @@ class MoeBlock(nn.Module):
         )
         self.tp_group = get_tp_group()
         self.tp_size = get_tp_size()
-        self.do_gather_output = do_gather_output
         self.checkpoint_prefix = checkpoint_prefix
         # Non-fused shared experts
         if not self.fuse_shared_experts:
@@ -1150,10 +1148,6 @@ class MoeBlock(nn.Module):
                     out = None
                     if xs[i] is not None:
                         out = F.linear(xs[i], self.gate_up_proj_weight[i], bias=None)
-                        if self.do_gather_output and self.tp_size > 1:
-                            out = self.gather_output(
-                                out, self.tp_size, tp_group=self.tp_group
-                            )
                     gate_up_proj_outs.append(out)
                 act = [
                     (
@@ -1174,13 +1168,6 @@ class MoeBlock(nn.Module):
                             xs[i], self.gate_proj_weight[i], bias=None
                         )
                         up_proj_out = F.linear(xs[i], self.up_proj_weight[i], bias=None)
-                        if self.do_gather_output and self.tp_size > 1:
-                            gate_proj_out = self.gather_output(
-                                gate_proj_out, self.tp_size, tp_group=self.tp_group
-                            )
-                            up_proj_out = self.gather_output(
-                                up_proj_out, self.tp_size, tp_group=self.tp_group
-                            )
                     gate_proj_outs.append(gate_proj_out)
                     up_proj_outs.append(up_proj_out)
 
@@ -1265,29 +1252,6 @@ class MoeBlock(nn.Module):
             y += y1
         torch.distributed.all_reduce(y, group=get_tp_group())
         return y
-
-    def gather_output(
-        x: torch.Tensor,
-        tp_size: int,
-        tp_group: Optional[torch.distributed.ProcessGroup],
-    ) -> torch.Tensor:
-        """
-        Gather output tensor across multiple devices.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            gather_output (bool): Flag to indicate if gathering is needed.
-            tp_group (Optional[torch.distributed.ProcessGroup]): Process group for gathering.
-
-        Returns:
-            torch.Tensor: Gathered output tensor.
-        """
-        x = x.permute(-1, *range(x.dim() - 1)).contiguous()
-        shape = list(x.shape)
-        shape[0] *= tp_size
-        x_gathered = x.new_empty(shape)
-        torch.distributed.all_gather_into_tensor(x_gathered, x, group=tp_group)
-        return x_gathered.permute(*range(1, x.dim()), 0)
 
 
 class MoeBlockRegistry:
@@ -1421,7 +1385,6 @@ class MoE_blockfp4(MoeBlock):
         n_activated_experts: int,
         moe_world_size: int,
         moe_rank: int,
-        do_gather_output: bool,
         dtype: torch.dtype,
         op_impl: str,
         gate: MoeGate,
@@ -1444,7 +1407,6 @@ class MoE_blockfp4(MoeBlock):
             n_activated_experts,
             moe_world_size,
             moe_rank,
-            do_gather_output,
             dtype,
             op_impl,
             gate,
@@ -1789,10 +1751,6 @@ class MoE_blockfp4(MoeBlock):
                             128,
                             None,
                         )
-                        if self.do_gather_output and self.tp_size > 1:
-                            out = self.gather_output(
-                                out, self.tp_size, tp_group=self.tp_group
-                            )
                     gate_up_proj_outs.append(out)
                 act = [
                     (
@@ -1826,13 +1784,6 @@ class MoE_blockfp4(MoeBlock):
                             128,
                             None,
                         )
-                        if self.do_gather_output and self.tp_size > 1:
-                            gate_proj_out = self.gather_output(
-                                gate_proj_out, self.tp_size, tp_group=self.tp_group
-                            )
-                            up_proj_out = self.gather_output(
-                                up_proj_out, self.tp_size, tp_group=self.tp_group
-                            )
                     gate_proj_outs.append(gate_proj_out)
                     up_proj_outs.append(up_proj_out)
 
@@ -1924,7 +1875,6 @@ class MoE_blockfp8(MoeBlock):
         n_activated_experts: int,
         moe_world_size: int,
         moe_rank: int,
-        do_gather_output: bool,
         dtype: torch.dtype,
         op_impl: str,
         gate: MoeGate,
@@ -1947,7 +1897,6 @@ class MoE_blockfp8(MoeBlock):
             n_activated_experts,
             moe_world_size,
             moe_rank,
-            do_gather_output,
             dtype,
             op_impl,
             gate,
@@ -2181,10 +2130,6 @@ class MoE_blockfp8(MoeBlock):
                             None,
                             128,
                         )
-                        if self.do_gather_output and self.tp_size > 1:
-                            out = self.gather_output(
-                                out, self.tp_size, tp_group=self.tp_group
-                            )
                     gate_up_proj_outs.append(out)
                 act = [
                     (
@@ -2216,13 +2161,6 @@ class MoE_blockfp8(MoeBlock):
                             None,
                             128,
                         )
-                        if self.do_gather_output and self.tp_size > 1:
-                            gate_proj_out = self.gather_output(
-                                gate_proj_out, self.tp_size, tp_group=self.tp_group
-                            )
-                            up_proj_out = self.gather_output(
-                                up_proj_out, self.tp_size, tp_group=self.tp_group
-                            )
                     gate_proj_outs.append(gate_proj_out)
                     up_proj_outs.append(up_proj_out)
 

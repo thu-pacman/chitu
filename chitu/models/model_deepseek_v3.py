@@ -758,7 +758,6 @@ class MoeDeepSeekV3_params_resolver:
             n_activated_experts=args.n_activated_experts,
             moe_world_size=1,
             moe_rank=0,
-            do_gather_output=False,
             dtype=args.main_weight_dtype,
             op_impl=op_impl,
             gate=GateDeepSeekV3(args, op_impl),

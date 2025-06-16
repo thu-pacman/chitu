@@ -438,7 +438,6 @@ class Qwen3_params_resolver:
             n_activated_experts=0,
             moe_world_size=1,
             moe_rank=0,
-            do_gather_output=False,
             op_impl=op_impl,
             dtype=params.dtype if hasattr(params, "dtype") else "bfloat16",
             gate=Qwen3MoeGate(args, op_impl),
