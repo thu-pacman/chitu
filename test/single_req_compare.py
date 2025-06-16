@@ -14,9 +14,10 @@ from chitu.chitu_main import (
     chitu_run,
     chitu_terminate,
     chitu_is_terminated,
+    warmup_engine,
 )
 from chitu.global_vars import get_timers
-from chitu.utils import get_config_dir_path
+from chitu.utils import get_config_dir_path, gen_req_id
 
 # -----------utils part begin--------------
 import json
@@ -109,13 +110,6 @@ def gen_debug_req_id(len=8):
     req_id = f"{counter:0{len}x}"
     counter += 1
     return req_id
-
-
-def gen_req_id(len=8):
-    random_number = random.getrandbits(len * 4)
-    hex_string = f"{random_number:0{len}x}"
-    # logger.warning(f"generating req {hex_string}")
-    return hex_string
 
 
 def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens):
@@ -263,10 +257,13 @@ def main(args: DictConfig):
 
     chitu_init(args, logging_level=logging.INFO)
     torch.distributed.barrier()
+
     timers = get_timers()
     logger.debug(f"finish init")
 
     rank = torch.distributed.get_rank()
+    if rank == 0:
+        warmup_engine(args)
 
     history_path = os.getenv("HISTORY_PATH", "./example/history/history.txt")
     history_result = None
