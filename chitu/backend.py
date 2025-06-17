@@ -86,7 +86,7 @@ class Backend:
     @staticmethod
     def build_model(args, cache, *extra_args, **extra_kwargs):
         if args.type == "hf-llama":
-            if args.name.startswith("glm-4"):
+            if args.name.startswith("glm"):
                 extra_kwargs["rotary_type"] = "glm4"
             return TransformerHFLlama(args, cache, *extra_args, **extra_kwargs)
         elif args.type == "hf-mixtral":
