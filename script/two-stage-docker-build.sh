@@ -26,9 +26,11 @@ image_name=$7
 image_version=$8
 docker_run_prefix="${@:9}"
 
+container_base_name=$(basename ${image_name})
+
 docker image rm ${image_name}:${image_version} || true
 docker image rm ${image_name}:${image_version}-stage0 || true
-docker rm ${image_name}-${image_version}-stage1 || true
+docker rm ${container_base_name}-${image_version}-stage1 || true
 docker build \
     -f "${dockerfile}" \
     --build-arg optional_deps="${optional_deps}" \
@@ -38,9 +40,9 @@ docker build \
     -t ${image_name}:${image_version}-stage0 \
     .
 ${docker_run_prefix} \
-    --name ${image_name}-${image_version}-stage1 \
+    --name ${container_base_name}-${image_version}-stage1 \
     ${image_name}:${image_version}-stage0 \
     bash ./script/install.sh "${optional_deps}" "${build_jobs}" "${enable_editable_install}" "${enable_cython}"
-docker commit ${image_name}-${image_version}-stage1 ${image_name}:${image_version}
-docker rm ${image_name}-${image_version}-stage1
+docker commit ${container_base_name}-${image_version}-stage1 ${image_name}:${image_version}
+docker rm ${container_base_name}-${image_version}-stage1
 docker image rm ${image_name}:${image_version}-stage0
