@@ -599,7 +599,7 @@ class Transformer(nn.Module):
                 if match:
                     layer_idx = int(match.group(1))
                     suffix = match.group(2)
-                    if layer_idx < n_dense_layers:
+                    if layer_idx < n_dense_layers and self.pp_stage == 0:
                         break
                     new_key = f"layers.{layer_idx}.mlp.{tensor_name}_{suffix}"
                     new_checkpoint[new_key] = checkpoint[key]
