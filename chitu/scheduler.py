@@ -4,7 +4,7 @@ from typing import List  # Please keep Python 3.8 compatible
 
 import torch
 
-from chitu.global_vars import get_global_args, get_slot_handle
+from chitu.global_vars import get_slot_handle
 from chitu.task import TaskPool, TaskType
 
 logger = getLogger(__name__)

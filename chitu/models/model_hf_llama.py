@@ -438,7 +438,6 @@ class Qwen3_params_resolver:
             n_activated_experts=0,
             moe_world_size=1,
             moe_rank=0,
-            do_gather_output=False,
             op_impl=op_impl,
             dtype=params.dtype if hasattr(params, "dtype") else "bfloat16",
             gate=Qwen3MoeGate(args, op_impl),
@@ -549,6 +548,64 @@ class TransformerBlockHFLlama(TransformerBlock):
         return out
 
 
+class TransformerBlockHFGlm4(TransformerBlock):
+    def __init__(
+        self,
+        layer_id: int,
+        args,
+        cache,
+        attn_backend,
+        op_impl,
+        rotary_type="glm4",
+        mlp_type=FeedForwardHFLlama,
+        checkpoint_prefix="",
+    ):
+        super().__init__(layer_id, args, cache, attn_backend, op_impl)
+        self.self_attn = AttentionHFLlama(
+            args,
+            layer_id,
+            cache,
+            attn_backend,
+            rotary_type=rotary_type,
+            op_impl=op_impl,
+            checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
+        )
+
+        self.mlp = mlp_type(
+            dim=args.dim,
+            hidden_dim=args.intermediate_dim,
+            op_impl=op_impl,
+            checkpoint_prefix=f"{checkpoint_prefix}.mlp",
+            params=args,
+        )
+        self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.post_self_attn_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.post_mlp_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis_cos: torch.Tensor,
+        freqs_cis_sin: torch.Tensor,
+        varlens=None,
+    ):
+        impl = get_rms_norm_impl()
+        h = self.self_attn(
+            self.input_layernorm(x, impl=impl),
+            freqs_cis_cos,
+            freqs_cis_sin,
+            varlens,
+        )
+        h = self.post_self_attn_layernorm(h, impl=impl)
+        h += x
+        out = h + self.post_mlp_layernorm(
+            self.mlp(self.post_attention_layernorm(h, impl=impl)), impl=impl
+        )
+
+        return out
+
+
 class TransformerHFLlama(Transformer):
     def __init__(
         self,
@@ -565,7 +622,10 @@ class TransformerHFLlama(Transformer):
         **kvargs,
     ):
         self.rotary_type = rotary_type
-        self.layer_type = layer_type
+        if params.name.startswith("glm") and params.name != "glm-4-9b-chat":
+            self.layer_type = TransformerBlockHFGlm4
+        else:
+            self.layer_type = layer_type
         super().__init__(
             params,
             cache,
@@ -751,6 +811,23 @@ class TransformerHFLlama(Transformer):
                 new_checkpoint[k] = checkpoint[k]
         return new_checkpoint
 
+    def _add_zero_bias_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
+        new_checkpoint = {}
+        for k in checkpoint.keys():
+            if k.endswith(".qkv_proj.bias"):
+                return checkpoint
+        for k in checkpoint.keys():
+            if k.endswith(".qkv_proj.weight"):
+                prefix = k[: -len("qkv_proj.weight")]
+                assert prefix + "qkv_proj.bias" not in checkpoint
+                weight = checkpoint[k]
+                qkv_bias = torch.zeros(
+                    weight.shape[0], dtype=weight.dtype, device=weight.device
+                )
+                new_checkpoint[prefix + "qkv_proj.bias"] = qkv_bias
+        new_checkpoint.update(checkpoint)
+        return new_checkpoint
+
     def _process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
@@ -820,11 +897,11 @@ class TransformerHFLlama(Transformer):
             if getattr(self.params, "tie_word_embeddings", False):
                 state_dict["lm_head.weight"] = state_dict["embed_tokens.weight"]
 
-            if self.params.name.startswith("glm-4"):
+            if self.params.name.startswith("glm"):
                 # glm4 has non-standard key names because they use "custom code" in model files instead of
                 # using code in transformers' repo.
 
-                def map_glm4_key(k):
+                def map_glm_key(k):
                     k = k.replace(
                         "transformer.embedding.word_embeddings.", "embed_tokens."
                     )
@@ -838,8 +915,9 @@ class TransformerHFLlama(Transformer):
                     k = k.replace("transformer.output_layer.", "lm_head.")
                     return k
 
-                del state_dict["transformer.rotary_pos_emb.inv_freq"]
-                state_dict = {map_glm4_key(k): v for k, v in state_dict.items()}
+                if self.params.name == "glm-4-9b-chat":
+                    del state_dict["transformer.rotary_pos_emb.inv_freq"]
+                state_dict = {map_glm_key(k): v for k, v in state_dict.items()}
 
             if self.model_parallel_size > 1:
                 # QKV and gate/up layers might already be merged in the checkpoint, but they should be split
@@ -916,6 +994,10 @@ class TransformerHFLlama(Transformer):
 
             state_dict = self._process_state_dict_for_merging_qkv(state_dict)
             state_dict = self._process_state_dict_for_merging_gate_up(state_dict)
+            if self.params.name.startswith("glm") and (
+                not self.params.name.startswith("glm-4-9b")
+            ):
+                state_dict = self._add_zero_bias_for_merging_qkv(state_dict)
 
             if self.op_impl == "muxi_custom_kernel":
                 rpl_names = self._get_tensor_row_parallel_layer_names()

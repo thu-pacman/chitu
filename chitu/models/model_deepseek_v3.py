@@ -3,6 +3,7 @@ import functools
 from logging import getLogger
 from typing import Any, List, Mapping, Optional, Set, Tuple
 import re
+import ctypes
 
 import torch
 import torch.distributed as dist
@@ -63,8 +64,8 @@ from chitu.quantization import (
     linear_block_fp4,
     QuantizationRegistry,
 )
+from chitu.static_tensor import StaticTensor
 
-import ctypes
 
 logger = getLogger(__name__)
 
@@ -757,7 +758,6 @@ class MoeDeepSeekV3_params_resolver:
             n_activated_experts=args.n_activated_experts,
             moe_world_size=1,
             moe_rank=0,
-            do_gather_output=False,
             dtype=args.main_weight_dtype,
             op_impl=op_impl,
             gate=GateDeepSeekV3(args, op_impl),
@@ -835,6 +835,7 @@ class MoEDeepSeekV3CPU(nn.Module):
             args (ModelArgs): Model arguments containing MoE parameters.
         """
         super().__init__()
+        self.args = args
         self.merge_qkv_gate_up = merge_qkv_gate_up
         self.dim = args.dim
         self.tp_group = get_tp_group()
@@ -996,10 +997,10 @@ class MoEDeepSeekV3CPU(nn.Module):
             import cpuinfer
 
             moe_config = cpuinfer.moe.MOEConfig(
-                256,
-                8,
-                7168,
-                2048,
+                self.args.n_routed_experts,
+                self.args.n_activated_experts,
+                self.args.dim,
+                self.args.moe_inter_dim,
                 self.stride,
                 10,
                 1024,
@@ -1018,32 +1019,34 @@ class MoEDeepSeekV3CPU(nn.Module):
             self.cpu_infer.submit(self.moe.warm_up())
             self.cpu_infer.sync()
 
-            self.input_tensor_cpu = torch.empty(
-                (self.max_batch_size, 1, 7168),
+            self.input_tensor_cpu = StaticTensor(
+                max_nelem=self.max_batch_size * self.args.dim,
                 device="cpu",
                 pin_memory=True,
                 dtype=torch.bfloat16,
             )
-            self.weights_cpu = torch.empty(
-                (self.max_batch_size, 8),
+            self.weights_cpu = StaticTensor(
+                max_nelem=self.max_batch_size * self.args.n_activated_experts,
                 device="cpu",
                 pin_memory=True,
                 dtype=torch.float32,
             )
-            self.indices_cpu = torch.empty(
-                (self.max_batch_size, 8),
+            self.indices_cpu = StaticTensor(
+                max_nelem=self.max_batch_size * self.args.n_activated_experts,
                 device="cpu",
                 pin_memory=True,
                 dtype=torch.int64,
             )
-            self.output_cpu = torch.empty(
-                (self.max_batch_size, 1, 7168),
+            self.output_cpu = StaticTensor(
+                max_nelem=self.max_batch_size * self.args.dim,
                 device="cpu",
                 pin_memory=True,
                 dtype=torch.bfloat16,
             )
-            self.output_gpu = torch.empty(
-                (self.max_batch_size, 1, 7168), device=self.rank, dtype=torch.bfloat16
+            self.output_gpu = StaticTensor(
+                max_nelem=self.max_batch_size * self.args.dim,
+                device="cuda",
+                dtype=torch.bfloat16,
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1079,18 +1082,23 @@ class MoEDeepSeekV3CPU(nn.Module):
                     )
                 )
             else:
-                self.input_tensor_cpu.copy_(x, non_blocking=True)
-                self.indices_cpu.copy_(indices, non_blocking=True)
-                self.weights_cpu.copy_(weights, non_blocking=True)
+                self.input_tensor_cpu.set_shape(x.shape)
+                self.indices_cpu.set_shape(indices.shape)
+                self.weights_cpu.set_shape(weights.shape)
+                self.output_cpu.set_shape(x.shape)
+                self.output_gpu.set_shape(x.shape)
+                self.input_tensor_cpu.get().copy_(x, non_blocking=True)
+                self.indices_cpu.get().copy_(indices, non_blocking=True)
+                self.weights_cpu.get().copy_(weights, non_blocking=True)
                 self.cpu_infer.submit_with_cuda_stream(
                     torch.cuda.current_stream().cuda_stream,
                     self.moe.forward(
-                        self.max_batch_size,
-                        8,
-                        self.indices_cpu.data_ptr(),
-                        self.weights_cpu.data_ptr(),
-                        self.input_tensor_cpu.data_ptr(),
-                        self.output_cpu.data_ptr(),
+                        indices.size(0),
+                        indices.size(1),
+                        self.indices_cpu.get().data_ptr(),
+                        self.weights_cpu.get().data_ptr(),
+                        self.input_tensor_cpu.get().data_ptr(),
+                        self.output_cpu.get().data_ptr(),
                     ),
                 )
 
@@ -1113,8 +1121,8 @@ class MoEDeepSeekV3CPU(nn.Module):
                 self.cpu_infer.sync_with_cuda_stream(
                     torch.cuda.current_stream().cuda_stream
                 )
-                self.output_gpu.copy_(self.output_cpu, non_blocking=True)
-                y += self.output_gpu
+                self.output_gpu.get().copy_(self.output_cpu.get(), non_blocking=True)
+                y += self.output_gpu.get()
             y_scatter = [y] * self.tp_size
         else:
             y_scatter = None

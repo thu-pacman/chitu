@@ -1,4 +1,6 @@
 from typing import Optional
+import functools
+
 import torch
 
 
@@ -21,6 +23,9 @@ class StaticTensor:
             initial tensor.
         device: The device of the tensor. Defaults to the device of the initial
             tensor.
+        pin_memory: Whether to pin the memory of the tensor. Defaults to the
+            pin memory status of the initial tensor, or False if no initial
+            tensor is provided.
     """
 
     def __init__(
@@ -30,6 +35,7 @@ class StaticTensor:
         max_nelem: Optional[int] = None,
         dtype: Optional[torch.device] = None,
         device: Optional[torch.device] = None,
+        pin_memory: Optional[bool] = None,
     ):
         if max_nelem is None:
             if tensor is None:
@@ -43,8 +49,15 @@ class StaticTensor:
             if tensor is None:
                 raise ValueError(f"device must be specified if tensor is None")
             device = tensor.device
+        if pin_memory is None:
+            if tensor is None:
+                pin_memory = False
+            else:
+                pin_memory = tensor.is_pinned()
 
-        self._buffer = torch.empty(max_nelem, dtype=dtype, device=device)
+        self._buffer = torch.empty(
+            max_nelem, dtype=dtype, device=device, pin_memory=pin_memory
+        )
         self._cur_nelem = 0
         self._cur_shape = (0,)
 
@@ -73,6 +86,13 @@ class StaticTensor:
         self._buffer[: tensor.numel()].copy_(tensor.flatten())
         self._cur_nelem = tensor.numel()
         self._cur_shape = tensor.shape
+
+    def set_shape(self, shape):
+        """
+        Reset the shape and discard the current tensor
+        """
+        self._cur_nelem = functools.reduce(lambda x, y: x * y, shape, 1)
+        self._cur_shape = shape
 
     def get(self) -> torch.Tensor:
         """
