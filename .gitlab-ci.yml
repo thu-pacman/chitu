@@ -1,6 +1,7 @@
 stages:
   - sync-to-github
   - sync-to-gitee
+  - build-and-push
 
 sync-to-github:
   stage: sync-to-github
@@ -21,3 +22,109 @@ sync-to-gitee:
   only:
     - public-main
   when: always
+
+.build-image-template: &build-platform-template
+  stage: build-and-push
+  only:
+    - public-main
+  before_script:
+    - echo "Building and pushing ${PLATFORM} platform image"
+    - echo "CLOUD_REGISTRY_PASSWORD:$CLOUD_REGISTRY_PASSWORD"
+    - echo "CLOUD_USERNAME:$CLOUD_USERNAME"
+    - echo "CLOUD_REGISTRY:$CLOUD_REGISTRY"
+    - echo "CI_COMMIT_TAG:$CI_COMMIT_TAG"
+    - echo "$CLOUD_REGISTRY_PASSWORD" | docker login -u "$CLOUD_USERNAME" --password-stdin "$CLOUD_REGISTRY"
+  script:
+    - eval "$BUILD_SCRIPT"
+    - echo "${PLATFORM} image built successfully:${CLOUD_REGISTRY}/public/chitu-${PLATFORM}:${CI_COMMIT_TAG}"
+
+    - echo "Pushing ${PLATFORM} image to cloud registry..."
+    - docker push ${CLOUD_REGISTRY}/public/chitu-${PLATFORM}:${CI_COMMIT_TAG}
+
+    - echo "${PLATFORM} image pushed successfully!"
+    - |
+      echo "Tagging and pushing as latest for stable release:${CI_COMMIT_TAG}"
+      docker tag ${CLOUD_REGISTRY}/public/chitu-${PLATFORM}:${CI_COMMIT_TAG} ${CLOUD_REGISTRY}/public/chitu-${PLATFORM}:latest
+      docker push ${CLOUD_REGISTRY}/public/chitu-${PLATFORM}:latest
+  after_script:
+    - docker logout $CLOUD_REGISTRY
+  when: manual
+
+# NVIDIA平台构建
+build-image-nvidia:
+  <<: *build-platform-template
+  tags:
+    - h20
+  variables:
+    PLATFORM: "nvidia"
+    BUILD_SCRIPT: |
+      docker build \
+        --build-arg torch_cuda_arch_list='9.0+PTX' \
+        --build-arg optional_deps='flash_attn,flashinfer,flash_mla,deep_gemm,quant,cpu' \
+        --build-arg enable_editable_install=false \
+        --build-arg enable_cython=true \
+        --build-arg enable_test=true \
+        -t ${CLOUD_REGISTRY}/public/chitu-${PLATFORM}:${CI_COMMIT_TAG} \
+        .
+
+# Muxi平台构建
+build-image-muxi:
+  <<: *build-platform-template
+  tags:
+    - muxi
+  variables:
+    PLATFORM: "muxi"
+    BUILD_SCRIPT: |
+      bash ./script/two-stage-docker-build.sh \
+        'muxi.Dockerfile' \
+        'muxi_layout_kernels' \
+        '' \
+        'false' \
+        'true' \
+        'true' \
+        ${CLOUD_REGISTRY}/public/chitu-${PLATFORM} \
+        "${CI_COMMIT_TAG}" \
+        docker run \
+          --device=/dev/dri \
+          --device=/dev/mxcd \
+          --group-add video \
+          --privileged=true \
+          --security-opt seccomp=unconfined \
+          --security-opt apparmor=unconfined \
+          --shm-size '100gb' \
+          --ulimit memlock=-1
+
+# Ascend平台构建
+build-image-ascend:
+  <<: *build-platform-template
+  tags:
+    - huawei-4-910B
+  variables:
+    PLATFORM: "ascend"
+    BUILD_SCRIPT: |
+      bash ./script/two-stage-docker-build.sh \
+        'ascend.Dockerfile' \
+        '' \
+        '' \
+        'false' \
+        'true' \
+        'true' \
+        ${CLOUD_REGISTRY}/public/chitu-${PLATFORM} \
+        "${CI_COMMIT_TAG}" \
+        grun 8 docker run \
+          --device /dev/davinci0 \
+          --device /dev/davinci1 \
+          --device /dev/davinci2 \
+          --device /dev/davinci3 \
+          --device /dev/davinci4 \
+          --device /dev/davinci5 \
+          --device /dev/davinci6 \
+          --device /dev/davinci7 \
+          --device /dev/davinci_manager \
+          --device /dev/devmm_svm \
+          --device /dev/hisi_hdc \
+          -v /usr/local/dcmi:/usr/local/dcmi \
+          -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+          -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+          -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+          -v /etc/ascend_install.info:/etc/ascend_install.info
