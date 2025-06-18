@@ -24,7 +24,7 @@ from chitu.task import (
     TaskPool,
     UserRequest,
 )
-from chitu.utils import get_config_dir_path, gen_req_id
+from chitu.utils import get_config_dir_path
 from chitu.distributed_utils import propagate_tensor_to_all_devices
 
 logger = getLogger(__name__)
@@ -35,6 +35,12 @@ global_args = None
 server_status = False
 min_batch_size = 1
 rank = 0
+
+
+def gen_req_id(len=8):
+    random_number = random.getrandbits(len * 4)
+    hex_string = f"{random_number:0{len}x}"
+    return hex_string
 
 
 class Message(BaseModel):
@@ -216,6 +222,38 @@ def start_unicorn(args):
     uvicorn.run(app, host=args.serve.host, port=args.serve.port, log_level="info")
 
 
+def warmup_engine():
+    logger.warning("Starting inference system warmup...")
+
+    global global_args
+    num_warmup_reqs = global_args.infer.max_reqs
+    warmup_msg = [{"role": "user", "content": "Hi"}]
+
+    for i in range(num_warmup_reqs):
+        req = UserRequest(
+            warmup_msg,
+            f"{gen_req_id()}",
+            max_new_tokens=10,
+            temperature=0.7,
+            top_k=1,
+        )
+
+        task = Task(
+            f"{req.request_id}",
+            req,
+            req.message,
+            max_seq_len=global_args.infer.max_seq_len,
+        )
+        TaskPool.add(task)
+
+    logger.warning(f"Added {num_warmup_reqs} warmup requests to TaskPool")
+
+    while len(TaskPool.pool) > 0:
+        chitu_run()
+
+    logger.warning("Inference system warmup completed")
+
+
 @hydra.main(
     version_base=None, config_path=get_config_dir_path(), config_name="serve_config"
 )
@@ -228,6 +266,7 @@ def main(args: DictConfig):
     torch.distributed.barrier()
     rank = torch.distributed.get_rank()
     if rank == 0:
+        warmup_engine()
         uvicorn_thread = Thread(target=start_unicorn, args=(args,))
         uvicorn_thread.start()
     server_status = True

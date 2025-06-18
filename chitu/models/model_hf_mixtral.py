@@ -17,24 +17,24 @@ from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 class FeedForwardExpertHFMixtral(FeedForwardHFLlama):
     def __init__(
         self,
+        params,
         dim: int,
         hidden_dim: int,
         op_impl: str,
-        params,
     ):
-        super().__init__(dim, hidden_dim, op_impl=op_impl, params=params)
+        super().__init__(params, dim, hidden_dim, op_impl=op_impl)
 
 
 class SparseMoeBlockHFMixtral(nn.Module):
     def __init__(
         self,
+        params,
         dim: int,
         hidden_dim: int,
         num_experts: int,
         top_k: int,
         op_impl: str,
         checkpoint_prefix: str,
-        params,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -51,9 +51,7 @@ class SparseMoeBlockHFMixtral(nn.Module):
 
         self.experts = nn.ModuleList(
             [
-                FeedForwardExpertHFMixtral(
-                    dim, hidden_dim, op_impl=op_impl, params=params
-                )
+                FeedForwardExpertHFMixtral(params, dim, hidden_dim, op_impl=op_impl)
                 for _ in range(num_experts)
             ]
         )

@@ -14,8 +14,8 @@ from chitu.models.model import (
     Transformer,
     TransformerBlock,
     MoeGate,
-    MoeBlock,
-    MoeBlockRegistry,
+    MoeExpertsRegistry,
+    ParallelMoeBlock,
 )
 from chitu.muxi_utils import (
     LinearLayoutContigXContigY,
@@ -33,7 +33,7 @@ from chitu.tensor_parallel import (
     get_tp_rank,
 )
 from chitu.global_vars import get_global_args
-from chitu.quantization import QuantizationRegistry
+from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
 
 logger = getLogger(__name__)
 
@@ -78,12 +78,9 @@ class AttentionHFLlama(Attention):
         super().__init__(layer_id, cache, attn_backend)
         self.rotary_type = rotary_type
         self.op_impl = op_impl
-        quant = None
-        for rule in args.quant_config.rules:
-            pattern = rule.get("regex")
-            if pattern and re.search(pattern, checkpoint_prefix):
-                quant = rule.type
-                break
+        quant = get_quant_from_checkpoint_prefix(
+            checkpoint_prefix, args.quant_config.rules
+        )
         self.merge_qkv = (
             quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
         )
@@ -305,20 +302,17 @@ class AttentionHFLlama(Attention):
 class FeedForwardHFLlama(nn.Module):
     def __init__(
         self,
+        params,
         dim: int,
         hidden_dim: int,
         op_impl: str,
         checkpoint_prefix="",
-        params=None,
     ):
         super().__init__()
         self.op_impl = op_impl
-        quant = None
-        for rule in params.quant_config.rules:
-            pattern = rule.get("regex")
-            if pattern and re.search(pattern, checkpoint_prefix):
-                quant = rule.type
-                break
+        quant = get_quant_from_checkpoint_prefix(
+            checkpoint_prefix, params.quant_config.rules
+        )
         self.merge_gate_up = (
             quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
         )
@@ -394,13 +388,12 @@ class FeedForwardHFLlama(nn.Module):
 class Qwen3MoeGate(MoeGate):
     def __init__(
         self,
-        args,
+        params,
         op_impl: str,
     ):
-        params = get_global_args().models
         super().__init__(
             op_impl,
-            args.dim,
+            params.dim,
             topk=(
                 params.num_experts_per_tok
                 if hasattr(params, "num_experts_per_tok")
@@ -418,7 +411,7 @@ class Qwen3MoeGate(MoeGate):
         )
 
 
-class Qwen3_params_resolver:
+class MoeExpertsQwen3MixIn:
     def __init__(
         self,
         args,
@@ -440,30 +433,30 @@ class Qwen3_params_resolver:
             moe_rank=0,
             op_impl=op_impl,
             dtype=params.dtype if hasattr(params, "dtype") else "bfloat16",
-            gate=Qwen3MoeGate(args, op_impl),
             fuse_shared_experts=False,
-            shared_experts=None,
             checkpoint_prefix=checkpoint_prefix,
             merge_gate_up=merge_gate_up,
         )
         self.layer_idx = layer_idx
 
 
-def Qwen3MoeBlock(
+def Qwen3MoeExperts(
     args,
     op_impl: str,
     layer_idx: int,
     checkpoint_prefix: str,
-    base_moe_class: Optional[type] = None,
+    base_moe_experts_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
-    if base_moe_class is None:
-        base_moe_class = MoeBlockRegistry.get_quantized_MoeBlock_class_from_global_args(
-            quant_kwargs=quant_kwargs,
-            checkpoint_prefix=f"{checkpoint_prefix}.moe",
+    if base_moe_experts_class is None:
+        base_moe_experts_class = (
+            MoeExpertsRegistry.get_quantized_MoeExperts_class_from_global_args(
+                quant_kwargs=quant_kwargs,
+                checkpoint_prefix=f"{checkpoint_prefix}.moe",
+            )
         )
 
-    class MoeBlockImpl(Qwen3_params_resolver, base_moe_class):
+    class MoeExpertsImpl(MoeExpertsQwen3MixIn, base_moe_experts_class):
         # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
         # of the final class, so we can append a class to the base class, to make it act like a
         # further base class of the original base class.
@@ -471,21 +464,40 @@ def Qwen3MoeBlock(
 
         pass
 
-    quant = None
-    for rule in args.quant_config.rules:
-        pattern = rule.get("regex")
-        if pattern and re.search(pattern, checkpoint_prefix):
-            quant = rule.type
-            break
+    quant = get_quant_from_checkpoint_prefix(checkpoint_prefix, args.quant_config.rules)
     merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
 
-    return MoeBlockImpl(
+    return MoeExpertsImpl(
         args=args,
         op_impl=op_impl,
         layer_idx=layer_idx,
         checkpoint_prefix=f"{checkpoint_prefix}.moe",
         merge_gate_up=merge_gate_up,
     )
+
+
+class ParallelMoeBlockQwen3(ParallelMoeBlock):
+    def __init__(
+        self,
+        args,
+        op_impl: str,
+        layer_idx: int,
+        checkpoint_prefix: str,
+        base_moe_experts_class: Optional[type] = None,
+        quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+    ):
+        super().__init__(
+            gate=Qwen3MoeGate(args, op_impl),
+            experts=Qwen3MoeExperts(
+                args,
+                op_impl,
+                layer_idx,
+                checkpoint_prefix,
+                base_moe_experts_class,
+                quant_kwargs,
+            ),
+            non_fused_shared_experts=None,
+        )
 
 
 class TransformerBlockHFLlama(TransformerBlock):
@@ -511,7 +523,7 @@ class TransformerBlockHFLlama(TransformerBlock):
             checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
         )
         if "Qwen3-30B-A3B" in args.name or "Qwen3-235B-A22B" in args.name:
-            mlp_type = Qwen3MoeBlock
+            mlp_type = ParallelMoeBlockQwen3
             self.mlp = mlp_type(
                 args=args,
                 op_impl=op_impl,
@@ -520,11 +532,11 @@ class TransformerBlockHFLlama(TransformerBlock):
             )
         else:
             self.mlp = mlp_type(
+                args,
                 dim=args.dim,
                 hidden_dim=args.intermediate_dim,
                 op_impl=op_impl,
                 checkpoint_prefix=f"{checkpoint_prefix}.mlp",
-                params=args,
             )
         self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
         self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -743,12 +755,7 @@ class TransformerHFLlama(Transformer):
     def _process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
-            quant = None
-            for rule in self.params.quant_config.rules:
-                pattern = rule.get("regex")
-                if pattern and re.search(pattern, k):
-                    quant = rule.type
-                    break
+            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
                 new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
@@ -831,12 +838,7 @@ class TransformerHFLlama(Transformer):
     def _process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
-            quant = None
-            for rule in self.params.quant_config.rules:
-                pattern = rule.get("regex")
-                if pattern and re.search(pattern, k):
-                    quant = rule.type
-                    break
+            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
                 new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
@@ -936,7 +938,7 @@ class TransformerHFLlama(Transformer):
         重构专家权重结构的函数
         参数格式示例：
         输入键：'layers.3.mlp.experts.1.gate_proj.key_name'
-        输出键：'layers.3.mlp.gate_proj.key_name' (合并所有该层的专家权重)
+        输出键：'layers.3.mlp.experts.gate_proj.key_name' (合并所有该层的专家权重)
         """
         from collections import defaultdict
 
@@ -978,7 +980,7 @@ class TransformerHFLlama(Transformer):
                     input_scale_list[layer][e] for e in sorted(input_scale_list[layer])
                 ]
                 stacked_input_scale = torch.stack(experts_ordered, dim=0)
-                new_key = f"layers.{layer}.mlp.{tensor_name}.{key_name}"
+                new_key = f"layers.{layer}.mlp.experts.{tensor_name}.{key_name}"
                 new_checkpoint[new_key] = stacked_input_scale
 
         return new_checkpoint

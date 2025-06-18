@@ -7,7 +7,6 @@ This file has adaption of open-source code from the following sources:
 
 from logging import getLogger
 from typing import Any, Tuple, Optional
-import random
 
 import numpy as np
 import torch
@@ -138,9 +137,3 @@ def parse_dtype(
 
 def ceil_div(a, b):
     return (a + b - 1) // b
-
-
-def gen_req_id(len=8):
-    random_number = random.getrandbits(len * 4)
-    hex_string = f"{random_number:0{len}x}"
-    return hex_string

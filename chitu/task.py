@@ -16,7 +16,7 @@ import torch
 from chitu.async_response import AsyncDataStream, AsyncResponse
 from chitu.backend import Backend
 from chitu.device_list import DeviceList
-from chitu.global_vars import get_slot_handle, get_global_args
+from chitu.global_vars import get_slot_handle
 
 logger = getLogger(__name__)
 
@@ -429,11 +429,7 @@ class PackedTasksBase:
 
         slot_handle = get_slot_handle()
         if slot_handle:
-            slot_handle.set_slot_idx(task_tensor[-2].item())
-
-        num_blocks = task_tensor[-1].item()
-        if not num_blocks == 0:
-            get_global_args().infer.num_blocks = num_blocks
+            slot_handle.set_slot_idx(task_tensor[-1].item())
 
         return payload_type, cls(num_tasks, task_ids, req_ids, task_type, tokens)
 
@@ -452,11 +448,7 @@ class PackedTasksBase:
 
         slot_handle = get_slot_handle()
         if slot_handle:
-            ret[-2] = slot_handle.get_slot_idx()
-
-        infer_args = get_global_args().infer
-        if infer_args.cache_type == "paged" and not infer_args.num_blocks == -1:
-            ret[-1] = infer_args.num_blocks
+            ret[-1] = slot_handle.get_slot_idx()
 
         return ret
 
@@ -479,7 +471,7 @@ class PackedTasksBase:
         # TODO: We should use torch.empty instead, but we now assume there is a `0`
         # indicating the end of tasks
         return torch.zeros(
-            (3 + cls.max_num_tasks * 2,), dtype=torch.int64, device=device
+            (2 + cls.max_num_tasks * 2,), dtype=torch.int64, device=device
         )
 
 

@@ -27,8 +27,8 @@ from chitu.models.model import (
     Transformer,
     TransformerBlock,
     MoeGate,
-    MoeBlock,
-    MoeBlockRegistry,
+    MoeExpertsRegistry,
+    ParallelMoeBlock,
 )
 from chitu.ops import (
     apply_rotary_pos_emb,
@@ -59,11 +59,7 @@ from chitu.muxi_utils import (
     muxi_fused_experts,
 )
 from chitu.utils import try_import_opt_dep, parse_dtype, ceil_div
-from chitu.quantization import (
-    linear_block_fp8,
-    linear_block_fp4,
-    QuantizationRegistry,
-)
+from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
 from chitu.static_tensor import StaticTensor
 
 
@@ -174,12 +170,9 @@ class AttentionDeepSeekV3(Attention):
         super().__init__(layer_id, cache, attn_backend)
         self.op_impl = op_impl
         self.mla_absorb = mla_absorb
-        quant = None
-        for rule in args.quant_config.rules:
-            pattern = rule.get("regex")
-            if pattern and re.search(pattern, checkpoint_prefix):
-                quant = rule.type
-                break
+        quant = get_quant_from_checkpoint_prefix(
+            checkpoint_prefix, args.quant_config.rules
+        )
         self.merge_qkv = (
             quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
         )
@@ -590,12 +583,9 @@ class MLPDeepSeekV3(nn.Module):
             assert merge_gate_up is not None
             self.merge_gate_up = merge_gate_up
         else:
-            quant = None
-            for rule in args.quant_config.rules:
-                pattern = rule.get("regex")
-                if pattern and re.search(pattern, checkpoint_prefix):
-                    quant = rule.type
-                    break
+            quant = get_quant_from_checkpoint_prefix(
+                checkpoint_prefix, args.quant_config.rules
+            )
             if quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
                 self.merge_gate_up = True
             else:
@@ -731,7 +721,7 @@ class GateDeepSeekV3(MoeGate):
         )
 
 
-class MoeDeepSeekV3_params_resolver:
+class MoeExpertsDeepSeekV3MixIn:
     def __init__(
         self,
         args,
@@ -739,17 +729,6 @@ class MoeDeepSeekV3_params_resolver:
         op_impl: str,
         checkpoint_prefix: str,
     ):
-        # Non-fused shared experts
-        if not get_global_args().infer.fuse_shared_experts:
-            shared_experts = MLPDeepSeekV3(
-                args,
-                role="shared_experts",
-                merge_gate_up=merge_gate_up,
-                op_impl=op_impl,
-                checkpoint_prefix=checkpoint_prefix,
-            )
-        else:
-            shared_experts = None
         super().__init__(
             dim=args.dim,
             moe_inter_dim=args.moe_inter_dim,
@@ -760,29 +739,29 @@ class MoeDeepSeekV3_params_resolver:
             moe_rank=0,
             dtype=args.main_weight_dtype,
             op_impl=op_impl,
-            gate=GateDeepSeekV3(args, op_impl),
             fuse_shared_experts=get_global_args().infer.fuse_shared_experts,
-            shared_experts=shared_experts,
             checkpoint_prefix=checkpoint_prefix,
             merge_gate_up=merge_gate_up,
         )
 
 
-def MoEDeepSeekV3(
+def MoeExpertsDeepSeekV3(
     args,
     op_impl: str,
     checkpoint_prefix: str,
-    base_moe_class: Optional[type] = None,
+    base_moe_experts_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     checkpoint_prefix = checkpoint_prefix + ".moe"
-    if base_moe_class is None:
-        base_moe_class = MoeBlockRegistry.get_quantized_MoeBlock_class_from_global_args(
-            quant_kwargs=quant_kwargs,
-            checkpoint_prefix=checkpoint_prefix,
+    if base_moe_experts_class is None:
+        base_moe_experts_class = (
+            MoeExpertsRegistry.get_quantized_MoeExperts_class_from_global_args(
+                quant_kwargs=quant_kwargs,
+                checkpoint_prefix=checkpoint_prefix,
+            )
         )
 
-    class MoeBlockImpl(MoeDeepSeekV3_params_resolver, base_moe_class):
+    class MoeExpertsImpl(MoeExpertsDeepSeekV3MixIn, base_moe_experts_class):
         # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
         # of the final class, so we can append a class to the base class, to make it act like a
         # further base class of the original base class.
@@ -790,20 +769,54 @@ def MoEDeepSeekV3(
 
         pass
 
-    quant = None
-    for rule in args.quant_config.rules:
-        pattern = rule.get("regex")
-        if pattern and re.search(pattern, checkpoint_prefix):
-            quant = rule.type
-            break
+    quant = get_quant_from_checkpoint_prefix(checkpoint_prefix, args.quant_config.rules)
     merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
 
-    return MoeBlockImpl(
+    return MoeExpertsImpl(
         args,
         merge_gate_up=merge_gate_up,
         op_impl=op_impl,
         checkpoint_prefix=checkpoint_prefix,
     )
+
+
+class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
+    def __init__(
+        self,
+        args,
+        op_impl: str,
+        checkpoint_prefix: str,
+        base_moe_experts_class: Optional[type] = None,
+        quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+    ):
+        if not get_global_args().infer.fuse_shared_experts:
+            quant = get_quant_from_checkpoint_prefix(
+                checkpoint_prefix, args.quant_config.rules
+            )
+            merge_gate_up = (
+                quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
+            )
+            non_fused_shared_experts = MLPDeepSeekV3(
+                args,
+                role="shared_experts",
+                merge_gate_up=merge_gate_up,
+                op_impl=op_impl,
+                checkpoint_prefix=checkpoint_prefix,
+            )
+        else:
+            non_fused_shared_experts = None
+
+        super().__init__(
+            gate=GateDeepSeekV3(args, op_impl=op_impl),
+            experts=MoeExpertsDeepSeekV3(
+                args,
+                op_impl=op_impl,
+                checkpoint_prefix=checkpoint_prefix,
+                base_moe_experts_class=base_moe_experts_class,
+                quant_kwargs=quant_kwargs,
+            ),
+            non_fused_shared_experts=non_fused_shared_experts,
+        )
 
 
 class MoEDeepSeekV3CPU(nn.Module):
@@ -1166,7 +1179,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             )
             if layer_id < args.n_dense_layers
             else (
-                MoEDeepSeekV3(
+                ParallelMoeBlockDeepSeekV3(
                     args,
                     op_impl=op_impl,
                     checkpoint_prefix=f"{checkpoint_prefix}.mlp",
@@ -1282,12 +1295,7 @@ class TransformerDeepSeekV3(Transformer):
 
         new_checkpoint = {}
         for k in checkpoint.keys():
-            quant = None
-            for rule in self.params.quant_config.rules:
-                pattern = rule.get("regex")
-                if pattern and re.search(pattern, k):
-                    quant = rule.type
-                    break
+            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if any(
                 k.endswith(f".experts.0.{w}.{part}")
                 for w in ["gate_proj", "down_proj", "up_proj", "gate_up_proj"]
@@ -1303,7 +1311,9 @@ class TransformerDeepSeekV3(Transformer):
                     parts.append(checkpoint[prefix + f"experts.{i}.{w}.{part}"])
                 if fuse_shared_experts:
                     parts.append(checkpoint[prefix + f"shared_experts.{w}.{part}"])
-                new_checkpoint[prefix + f"{w}.{part}"] = torch.stack(parts, dim=0)
+                new_checkpoint[prefix + f"experts.{w}.{part}"] = torch.stack(
+                    parts, dim=0
+                )
             elif ".experts." in k:
                 continue
             elif fuse_shared_experts and ".shared_experts." in k:
@@ -1321,12 +1331,7 @@ class TransformerDeepSeekV3(Transformer):
 
         new_checkpoint = {}
         for k in checkpoint.keys():
-            quant = None
-            for rule in self.params.quant_config.rules:
-                pattern = rule.get("regex")
-                if pattern and re.search(pattern, k):
-                    quant = rule.type
-                    break
+            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if any(
                 k.endswith(f".kv_b_proj.{tensor_name}")
                 for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
@@ -1562,12 +1567,7 @@ class TransformerDeepSeekV3(Transformer):
     def _process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
-            quant = None
-            for rule in self.params.quant_config.rules:
-                pattern = rule.get("regex")
-                if pattern and re.search(pattern, k):
-                    quant = rule.type
-                    break
+            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
                 new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
@@ -1618,12 +1618,7 @@ class TransformerDeepSeekV3(Transformer):
     def _process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
-            quant = None
-            for rule in self.params.quant_config.rules:
-                pattern = rule.get("regex")
-                if pattern and re.search(pattern, k):
-                    quant = rule.type
-                    break
+            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
                 new_checkpoint[k] = checkpoint[k]
             # Cat dim 0

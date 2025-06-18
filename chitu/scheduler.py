@@ -2,8 +2,6 @@ import time
 from logging import getLogger
 from typing import List  # Please keep Python 3.8 compatible
 
-import torch
-
 from chitu.global_vars import get_slot_handle
 from chitu.task import TaskPool, TaskType
 
@@ -13,37 +11,65 @@ logger = getLogger(__name__)
 class Scheduler:
     @staticmethod
     def build(args, infer_args):
-        if args.type.lower() == "fifo" or args.type.lower() == "fcfs":
-            return FcfsScheduler(args.fcfs.num_tasks, args.fcfs.enable_hybrid)
-        if args.type.lower() == "prefill_first":
-            slot_handle = get_slot_handle()
-            if slot_handle:
+        scheduler_type = args.type.lower()
+
+        def get_num_tasks(config):
+            return infer_args.max_reqs if config.num_tasks is None else config.num_tasks
+
+        schedulers = {
+            "fifo": lambda: FcfsScheduler(
+                get_num_tasks(args.fcfs), args.fcfs.enable_hybrid
+            ),
+            "fcfs": lambda: FcfsScheduler(
+                get_num_tasks(args.fcfs), args.fcfs.enable_hybrid
+            ),
+            "stride": lambda: StrideScheduler(
+                get_num_tasks(args.stride), args.stride.enable_hybrid
+            ),
+            "deadline": lambda: DdlScheduler(
+                get_num_tasks(args.deadline), args.deadline.enable_hybrid
+            ),
+            "prefix_align": lambda: PrefixAlignScheduler(
+                get_num_tasks(args.prefix_align), args.prefix_align.enable_hybrid
+            ),
+            "balance": lambda: BalanceScheduler(
+                get_num_tasks(args.balance), args.balance.enable_hybrid
+            ),
+        }
+
+        if scheduler_type in schedulers:
+            return schedulers[scheduler_type]()
+
+        if scheduler_type == "prefill_first":
+            num_tasks = get_num_tasks(args.prefill_first)
+            if get_slot_handle():
                 return SkewPipelineScheduler(
-                    args.prefill_first.num_tasks, args.prefill_first.enable_hybrid
+                    num_tasks, args.prefill_first.enable_hybrid
                 )
-            else:
-                return PrefillFirstScheduler(
-                    args.prefill_first.num_tasks,
-                    args.prefill_first.enable_hybrid,
-                    infer_args.pp_size,
-                    infer_args.max_reqs,
-                    args.prefill_first.pp_config.prefill_num_tasks_divided_by_pp,
-                    args.prefill_first.pp_config.prefill_num_tasks,
-                    args.prefill_first.pp_config.enforce_decoder_num_tasks_max,
-                    args.prefill_first.pp_config.decoder_num_tasks,
-                )
-        if args.type.lower() == "stride":
-            return StrideScheduler(args.stride.num_tasks, args.stride.enable_hybrid)
-        if args.type.lower() == "deadline":
-            return DdlScheduler(args.deadline.num_tasks, args.deadline.enable_hybrid)
-        if args.type.lower() == "prefix_align":
-            return PrefixAlignScheduler(
-                args.prefix_align.num_tasks, args.prefix_align.enable_hybrid
+
+            pp = args.prefill_first.pp_config
+            pp_config_prefill_num_tasks = (
+                infer_args.max_reqs
+                if pp.prefill_num_tasks is None
+                else pp.prefill_num_tasks
             )
-        if args.type.lower() == "balance":
-            return BalanceScheduler(args.balance.num_tasks, args.balance.enable_hybrid)
-        else:
-            raise NotImplementedError(f"Scheduler {args.type} not implemented")
+            pp_config_decoder_num_tasks = (
+                infer_args.max_reqs
+                if pp.decoder_num_tasks is None
+                else pp.decoder_num_tasks
+            )
+            return PrefillFirstScheduler(
+                num_tasks,
+                args.prefill_first.enable_hybrid,
+                infer_args.pp_size,
+                infer_args.max_reqs,
+                pp.prefill_num_tasks_divided_by_pp,
+                pp_config_prefill_num_tasks,
+                pp.enforce_decoder_num_tasks_max,
+                pp_config_decoder_num_tasks,
+            )
+
+        raise NotImplementedError(f"Scheduler {args.type} not implemented")
 
     def schedule(self) -> List[str]:
         raise NotImplementedError()
@@ -59,10 +85,6 @@ class Scheduler:
                 assert TaskPool.remove(
                     task_id
                 ), f"Task {task_id} not found in pool {TaskPool.pool.keys()}"
-            # assert False
-        # for task_id in unwait_task_ids:
-        #     if task_id in TaskPool.id_list and TaskPool.pool[task_id].need_remove():
-        #         assert TaskPool.remove(task_id), "Task not found in pool"
         return removed_task_ids
 
     def is_done(self):
@@ -95,9 +117,9 @@ class FcfsScheduler(Scheduler):
                 TaskPool.id_list,
             )
             ret_task_ids = list(filtered_task_ids)[: self.num_tasks]
-        if filter_task_type == TaskType.Prefill:
-            ret_task_ids = ret_task_ids[:1]
-        logger.debug(f"Selected task_ids: {self.ret_task_ids}")
+        # if filter_task_type == TaskType.Prefill:
+        #     ret_task_ids = ret_task_ids[:1]
+        logger.debug(f"Selected task_ids: {ret_task_ids}")
         return ret_task_ids
 
 
