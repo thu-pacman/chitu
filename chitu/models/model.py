@@ -1052,7 +1052,7 @@ class MoeExpertsBase(nn.Module):
                     use_fp8_w8a8=False,
                     use_fp4_w4a8=False,
                     inplace=True,
-                    global_num_experts=self.n_routed_experts + self.n_shared_experts,
+                    global_num_experts=self.n_routed_experts,
                     expert_map=None,  # use when ep > 1
                     w1_scale=None,
                     w2_scale=None,
@@ -1675,7 +1675,7 @@ class Blockfp4MoeExperts(MoeExpertsBase):
                     use_fp8_w8a8=False,
                     use_fp4_w4a8=True,
                     inplace=True,
-                    global_num_experts=self.n_routed_experts + self.n_shared_experts,
+                    global_num_experts=self.n_routed_experts,
                     expert_map=None,  # use when ep > 1
                     w1_scale=gate_up_proj_scale,
                     w2_scale=down_proj_scale,
@@ -2018,7 +2018,7 @@ class Blockfp8MoeExperts(MoeExpertsBase):
                     use_fp8_w8a8=True,
                     use_fp4_w4a8=False,
                     inplace=True,
-                    global_num_experts=self.n_routed_experts + self.n_shared_experts,
+                    global_num_experts=self.n_routed_experts,
                     expert_map=None,  # use when ep > 1
                     w1_scale=gate_up_proj_scale,
                     w2_scale=down_proj_scale,
