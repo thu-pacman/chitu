@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from chitu.async_response import AsyncResponse
 from chitu.backend import Backend
-from chitu.chitu_main import chitu_init, chitu_run
+from chitu.chitu_main import chitu_init, chitu_run, warmup_engine
 from chitu.task import (
     PackedTasksBase,
     SerializedPackedTasksPayloadType,
@@ -228,6 +228,7 @@ def main(args: DictConfig):
     torch.distributed.barrier()
     rank = torch.distributed.get_rank()
     if rank == 0:
+        warmup_engine(args)
         uvicorn_thread = Thread(target=start_unicorn, args=(args,))
         uvicorn_thread.start()
     server_status = True

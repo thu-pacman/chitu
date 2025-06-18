@@ -28,27 +28,27 @@ request:
 scheduler:
   type: prefill_first
   fcfs:
-    num_tasks: 16
+    num_tasks: null
     enable_hybrid: False
   prefill_first:
-    num_tasks: 8
+    num_tasks: null
     enable_hybrid: False
     pp_config:
       prefill_num_tasks_divided_by_pp: True
-      prefill_num_tasks: 8
+      prefill_num_tasks: null
       enforce_decoder_num_tasks_max: True
-      decoder_num_tasks: 8
+      decoder_num_tasks: null
   stride:
-    num_tasks: 2
+    num_tasks: null
     enable_hybrid: False
   deadline:
-    num_tasks: 2
+    num_tasks: null
     enable_hybrid: False
   prefix_align:
-    num_tasks: 2
+    num_tasks: null
     enable_hybrid: False
   balance:
-    num_tasks: 2
+    num_tasks: null
     enable_hybrid: False
 quant: null
 dtype: bfloat16 # default_dtype of torch
