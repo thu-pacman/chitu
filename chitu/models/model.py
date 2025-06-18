@@ -587,10 +587,10 @@ class Transformer(nn.Module):
         new_checkpoint = {}
         for key in checkpoint:
             pattern_lists = [
-                r"layers\.(\d+)\.mlp\.gate_up_proj\.([^.]+)",
-                r"layers\.(\d+)\.mlp\.gate_proj\.([^.]+)",
-                r"layers\.(\d+)\.mlp\.down_proj\.([^.]+)",
-                r"layers\.(\d+)\.mlp\.up_proj\.([^.]+)",
+                r"layers\.(\d+)\.mlp\.experts\.gate_up_proj\.([^.]+)",
+                r"layers\.(\d+)\.mlp\.experts\.gate_proj\.([^.]+)",
+                r"layers\.(\d+)\.mlp\.experts\.down_proj\.([^.]+)",
+                r"layers\.(\d+)\.mlp\.experts\.up_proj\.([^.]+)",
             ]
             tensor_names = ["gate_up_proj", "gate_proj", "down_proj", "up_proj"]
             matched = False
@@ -601,7 +601,7 @@ class Transformer(nn.Module):
                     suffix = match.group(2)
                     if layer_idx < n_dense_layers and self.pp_stage == 0:
                         break
-                    new_key = f"layers.{layer_idx}.mlp.{tensor_name}_{suffix}"
+                    new_key = f"layers.{layer_idx}.mlp.experts.{tensor_name}_{suffix}"
                     new_checkpoint[new_key] = checkpoint[key]
                     matched = True
                     break
@@ -864,7 +864,7 @@ class MoeGate(nn.Module):
                 scores, self.topk, self.n_groups, self.topk_groups, self.bias
             )
             weights /= weights.sum(dim=-1, keepdim=True)
-        elif self.score_func == "softmax" and (is_nvidia()):
+        elif self.score_func == "softmax" and is_nvidia():
             scores = F.linear(x, self.weight)
             weights, indices, expert_idx = topk_softmax(
                 scores, self.topk, self.norm_prob, torch.int32
@@ -900,21 +900,11 @@ class MoeGate(nn.Module):
         return weights.type_as(x), indices.to(torch.int32)
 
 
-class MoeBlock(nn.Module):
+class MoeExpertsBase(nn.Module):
     """
-    Basic Moe Block.
-    Example:
-    >>> class derivedMoe(MoeBlock):
-    >>>     super().__init__(
-                dim=1024,
-                hidden_dim=4096,
-                n_routed_experts=8,
-                n_shared_experts=2,
-                moe_world_size=4,
-                moe_rank=0,
-                merge_gate_up=True,
-                ...
-            )
+    MoE experts after the gate. This module runs locally on one device.
+
+    Inherit from this class for quantization.
     """
 
     def __init__(
@@ -928,16 +918,13 @@ class MoeBlock(nn.Module):
         moe_rank: int,
         dtype: str,
         op_impl: str,
-        gate: MoeGate,
         fuse_shared_experts: bool,
-        shared_experts: nn.Module,
         checkpoint_prefix: str,
         merge_gate_up: bool,
         build_weight: bool = True,
     ):
         super().__init__()
         self.op_impl = op_impl
-        self.gate = gate
         self.dim = dim
         self.fuse_shared_experts = fuse_shared_experts
         assert (
@@ -958,9 +945,6 @@ class MoeBlock(nn.Module):
         self.tp_group = get_tp_group()
         self.tp_size = get_tp_size()
         self.checkpoint_prefix = checkpoint_prefix
-        # Non-fused shared experts
-        if not self.fuse_shared_experts:
-            self.shared_experts = shared_experts
 
         self.linear_dtype = (
             torch.uint8
@@ -1006,21 +990,21 @@ class MoeBlock(nn.Module):
                 requires_grad=False,
             )
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor):
         """
         Forward pass for the MoE module.
 
         Args:
             x (torch.Tensor): Input tensor.
+            weights (torch.Tensor): Routing weights from the gate.
+            indices (torch.Tensor): Indices of the selected experts.
 
         Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
+            torch.Tensor: Output tensor.
         """
 
         shape = x.size()
         x = x.view(-1, self.dim)
-
-        weights, indices = self.gate(x)
 
         if self.op_impl == "muxi_custom_kernel":
             y = self._compute_muxi_fused_experts(x, weights, indices)
@@ -1080,9 +1064,6 @@ class MoeBlock(nn.Module):
                     soft_fp8=fused_soft_fp8,
                 )
 
-                if self.n_shared_experts > 0:
-                    y1 = self.shared_experts(x)
-                    y += y1
             else:
 
                 indice_shape = indices.shape
@@ -1126,8 +1107,6 @@ class MoeBlock(nn.Module):
                     soft_fp8=fused_soft_fp8,
                 )
 
-            if self.tp_size > 1:
-                torch.distributed.all_reduce(y, group=get_tp_group())
         else:
             y = torch.zeros_like(x)
             counts = torch.bincount(
@@ -1207,11 +1186,6 @@ class MoeBlock(nn.Module):
                     + self.n_fused_shared_experts,
                 ):
                     y += down_proj_outs[i]
-            else:
-                if self.n_shared_experts > 0:
-                    y += self.shared_experts(x)
-            if self.tp_size > 1:
-                dist.all_reduce(y, group=self.tp_group)
         return y.view(shape)
 
     def _compute_muxi_fused_experts(self, x, weights, indices):
@@ -1224,7 +1198,7 @@ class MoeBlock(nn.Module):
                 "muxi_layout_kernels for fused MoE requires merge_gate_up=True"
             )
 
-        y = muxi_fused_experts(
+        return muxi_fused_experts(
             hidden_states=x,
             w1=self.gate_up_proj_weight,
             w2=self.down_proj_weight,
@@ -1236,33 +1210,69 @@ class MoeBlock(nn.Module):
             block_shape=[128, 128],
             soft_fp8=False,
         )
-        if self.n_shared_experts > 0:
-            y1 = self.shared_experts(x)
-            y += y1
-        torch.distributed.all_reduce(y, group=get_tp_group())
-        return y
 
     def _compute_npu_fused_experts(self, x, weights, indices):
-        y = fused_experts_npu(
+        return fused_experts_npu(
             hidden_states=x,
             w1=self.gate_up_proj_weight,
             w2=self.down_proj_weight,
             topk_weights=weights,
             topk_ids=indices,
         )
-        if self.n_shared_experts > 0:
-            y1 = self.shared_experts(x)
-            y += y1
-        torch.distributed.all_reduce(y, group=get_tp_group())
+
+
+class ParallelMoeBlock(nn.Module):
+    """
+    Mixture-of-Experts (MoE) block.
+
+    An object of this class includes MoeGate, MoeExperts, and maybe shared experts in a separated object
+    (if fuse_shared_experts=False). This object maybe in parallel.
+
+    Args:
+        gate (MoeGate): The gating layer.
+        experts (MoeExpertsBase): The layer containing routed experts + fused shared experts
+        non_fused_shared_experts (Optional[nn.Module]): Optional layer for shared experts if not fused.
+    """
+
+    def __init__(
+        self,
+        gate: MoeGate,
+        experts: MoeExpertsBase,
+        non_fused_shared_experts: Optional[nn.Module] = None,
+    ):
+        super().__init__()
+        self.gate = gate
+        self.experts = experts
+        self.shared_experts = non_fused_shared_experts
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the MoE block.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after expert routing and computation.
+        """
+        weights, indices = self.gate(x.view(-1, x.shape[-1]))
+        if self.shared_experts is not None:
+            # Do this before `self.experts`, because `self.experts` may modify `x` in-place
+            shared_y = self.shared_experts(x)
+        y = self.experts(x, weights, indices)
+        if self.shared_experts is not None:
+            y += shared_y
+        if get_tp_size() > 1:
+            torch.distributed.all_reduce(y, group=get_tp_group())
         return y
 
 
-class MoeBlockRegistry:
+class MoeExpertsRegistry:
     """
-    Registry of available quantization methods and their implementations.
+    Registry of available quantization methods for MoeExperts
     """
 
-    _registry: Dict[str, Type[MoeBlock]] = {}
+    _registry: Dict[str, Type[MoeExpertsBase]] = {}
 
     @classmethod
     def get_all_methods(cls) -> Set[str]:
@@ -1277,12 +1287,12 @@ class MoeBlockRegistry:
         return ret
 
     @classmethod
-    def get_MoeBlock_class(
+    def get_MoeExperts_class(
         cls,
         method: Optional[str],
         *,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-    ) -> Optional[Type[MoeBlock]]:
+    ) -> Optional[Type[MoeExpertsBase]]:
         """
         Get the quantized moe implementation for the specified method.
 
@@ -1306,25 +1316,25 @@ class MoeBlockRegistry:
 
         if method in quant_kwargs:
 
-            class QuantMoeImpl(impl):
+            class QuantMoeExpertsImpl(impl):
                 def __init__(self, *args, **kwargs):
                     super().__init__(*args, **quant_kwargs[method], **kwargs)
 
-            impl = QuantMoeImpl
+            impl = QuantMoeExpertsImpl
 
         return impl
 
     @classmethod
-    def get_quantized_MoeBlock_class_from_global_args(
+    def get_quantized_MoeExperts_class_from_global_args(
         cls,
         *,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
         checkpoint_prefix="",
-    ) -> Optional[Type[MoeBlock]]:
+    ) -> Optional[Type[MoeExpertsBase]]:
         args = get_global_args()
         quant_cfg = getattr(args.models, "quant_config", None)
         if quant_cfg is None:
-            return cls.get_MoeBlock_class(None, quant_kwargs=quant_kwargs)
+            return cls.get_MoeExperts_class(None, quant_kwargs=quant_kwargs)
 
         rules = getattr(quant_cfg, "rules", [])
         for rule in rules:
@@ -1338,12 +1348,12 @@ class MoeBlockRegistry:
             rule_kwargs = rule.get("kwargs", {})
             method_kwargs = quant_kwargs.get(method, {})
             merged_kwargs = {**rule_kwargs, **method_kwargs}
-            return cls.get_MoeBlock_class(
+            return cls.get_MoeExperts_class(
                 method,
                 quant_kwargs={method: merged_kwargs},
             )
 
-        return cls.get_MoeBlock_class(
+        return cls.get_MoeExperts_class(
             None,
             quant_kwargs=quant_kwargs,
         )
@@ -1352,13 +1362,13 @@ class MoeBlockRegistry:
     def register_method(
         cls,
         name: Optional[str],
-        implementation: Optional[Type[MoeBlock]] = None,
+        implementation: Optional[Type[MoeExpertsBase]] = None,
     ) -> None:
         """
-        Register a new MoeBlock method.
+        Register a new MoeExperts method.
 
         Arguments:
-            name: Name of the MoeBlock method. None for non-quantized layer.
+            name: Name of the MoeExperts method. None for non-quantized layer.
             implementation: Implementation class. If None, return a partial function as
                 a decorator.
         """
@@ -1368,15 +1378,15 @@ class MoeBlockRegistry:
         return implementation
 
 
-@MoeBlockRegistry.register_method(None)
-class MoeBlock_without_quant(MoeBlock):
+@MoeExpertsRegistry.register_method(None)
+class NormalMoeExperts(MoeExpertsBase):
     pass
 
 
-@MoeBlockRegistry.register_method("blockfp4")
-class MoE_blockfp4(MoeBlock):
+@MoeExpertsRegistry.register_method("blockfp4")
+class Blockfp4MoeExperts(MoeExpertsBase):
     """
-    blockfp4 quantized Mixture-of-Experts (MoE) module.
+    blockfp4 quantized MoeExperts
     """
 
     def __init__(
@@ -1390,9 +1400,7 @@ class MoE_blockfp4(MoeBlock):
         moe_rank: int,
         dtype: torch.dtype,
         op_impl: str,
-        gate: MoeGate,
         fuse_shared_experts: bool,
-        shared_experts: nn.Module,
         checkpoint_prefix: str,
         merge_gate_up: bool,
     ):
@@ -1412,9 +1420,7 @@ class MoE_blockfp4(MoeBlock):
             moe_rank,
             dtype,
             op_impl,
-            gate,
             fuse_shared_experts,
-            shared_experts,
             checkpoint_prefix,
             build_weight=False,
             merge_gate_up=merge_gate_up,
@@ -1596,24 +1602,28 @@ class MoE_blockfp4(MoeBlock):
             requires_grad=False,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
         """
         Forward pass for the MoE module.
 
         Args:
             x (torch.Tensor): Input tensor.
+            weights (torch.Tensor): Routing weights from the gate.
+            indices (torch.Tensor): Indices of the selected experts.
 
         Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
+            torch.Tensor: Output tensor.
         """
 
         shape = x.size()
         x = x.view(-1, self.dim)
 
-        weights, indices = self.gate(x)
-
         if self.op_impl == "muxi_custom_kernel":
-            y = self._compute_muxi_fused_experts(x, weights, indices)
+            raise NotImplementedError(
+                "muxi_custom_kernel is not supported for blockfp4 MoeExperts"
+            )
         elif has_torch_npu:  # or use op_impl ?
             y = self._compute_npu_fused_experts(x, weights, indices)
         elif has_triton and self.merge_gate_up:
@@ -1657,7 +1667,6 @@ class MoE_blockfp4(MoeBlock):
                 fused_soft_fp8 = False
 
             if not self.fuse_shared_experts:
-                y1 = self.shared_experts(x)
 
                 y = fused_experts(
                     x,
@@ -1678,7 +1687,6 @@ class MoE_blockfp4(MoeBlock):
                     soft_fp8=fused_soft_fp8,
                 )
 
-                y += y1
             else:
 
                 indice_shape = indices.shape
@@ -1722,8 +1730,6 @@ class MoE_blockfp4(MoeBlock):
                     soft_fp8=fused_soft_fp8,
                 )
 
-            if self.tp_size > 1:
-                torch.distributed.all_reduce(y, group=get_tp_group())
         else:
             y = torch.zeros_like(x)
             counts = torch.bincount(
@@ -1828,45 +1834,13 @@ class MoE_blockfp4(MoeBlock):
                     + self.n_fused_shared_experts,
                 ):
                     y += down_proj_outs[i]
-            else:
-                for i in range(self.n_shared_experts):
-                    y += self.shared_experts(x)
-            if self.tp_size > 1:
-                dist.all_reduce(y, group=self.tp_group)
         return y.view(shape)
 
-    def _compute_muxi_fused_experts(self, x, weights, indices):
-        if self.fuse_shared_experts:
-            raise NotImplementedError(
-                "Fused shared experts is not supported for muxi_layout_kernels"
-            )
-        if not self.merge_gate_up:
-            raise NotImplementedError(
-                "muxi_layout_kernels for fused MoE requires merge_gate_up=True"
-            )
 
-        y = self.shared_experts(x)
-        y1 = muxi_fused_experts(
-            hidden_states=x,
-            w1=self.gate_up_proj_weight,
-            w2=self.down_proj_weight,
-            topk_weights=weights,
-            topk_ids=indices,
-            inplace=True,
-            w1_scale=self.gate_up_proj_weight_scale,
-            w2_scale=self.down_proj_weight_scale,
-            block_shape=[128, 128],
-            soft_fp8=True,
-        )
-        y += y1
-        torch.distributed.all_reduce(y, group=get_tp_group())
-        return y
-
-
-@MoeBlockRegistry.register_method("blockfp8")
-class MoE_blockfp8(MoeBlock):
+@MoeExpertsRegistry.register_method("blockfp8")
+class Blockfp8MoeExperts(MoeExpertsBase):
     """
-    blockfp8 quantized Mixture-of-Experts (MoE) module.
+    blockfp8 quantized MoeExperts
     """
 
     def __init__(
@@ -1880,9 +1854,7 @@ class MoE_blockfp8(MoeBlock):
         moe_rank: int,
         dtype: torch.dtype,
         op_impl: str,
-        gate: MoeGate,
         fuse_shared_experts: bool,
-        shared_experts: nn.Module,
         checkpoint_prefix: str,
         merge_gate_up: bool,
     ):
@@ -1902,9 +1874,7 @@ class MoE_blockfp8(MoeBlock):
             moe_rank,
             dtype,
             op_impl,
-            gate,
             fuse_shared_experts,
-            shared_experts,
             checkpoint_prefix,
             build_weight=True,
             merge_gate_up=merge_gate_up,
@@ -1980,21 +1950,23 @@ class MoE_blockfp8(MoeBlock):
             requires_grad=False,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
         """
         Forward pass for the MoE module.
 
         Args:
             x (torch.Tensor): Input tensor.
+            weights (torch.Tensor): Routing weights from the gate.
+            indices (torch.Tensor): Indices of the selected experts.
 
         Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
+            torch.Tensor: Output tensor.
         """
 
         shape = x.size()
         x = x.view(-1, self.dim)
-
-        weights, indices = self.gate(x)
 
         if self.op_impl == "muxi_custom_kernel":
             y = self._compute_muxi_fused_experts(x, weights, indices)
@@ -2038,7 +2010,6 @@ class MoE_blockfp8(MoeBlock):
                 fused_soft_fp8 = False
 
             if not self.fuse_shared_experts:
-                y1 = self.shared_experts(x)
 
                 y = fused_experts(
                     x,
@@ -2059,7 +2030,6 @@ class MoE_blockfp8(MoeBlock):
                     soft_fp8=fused_soft_fp8,
                 )
 
-                y += y1
             else:
 
                 indice_shape = indices.shape
@@ -2103,7 +2073,6 @@ class MoE_blockfp8(MoeBlock):
                     soft_fp8=fused_soft_fp8,
                 )
 
-            torch.distributed.all_reduce(y, group=get_tp_group())
         else:
             y = torch.zeros_like(x)
             counts = torch.bincount(
@@ -2204,11 +2173,6 @@ class MoE_blockfp8(MoeBlock):
                     + self.n_fused_shared_experts,
                 ):
                     y += down_proj_outs[i]
-            else:
-                for i in range(self.n_shared_experts):
-                    y += self.shared_experts(x)
-            if self.tp_size > 1:
-                dist.all_reduce(y, group=self.tp_group)
         return y.view(shape)
 
     def _compute_muxi_fused_experts(self, x, weights, indices):
@@ -2221,8 +2185,7 @@ class MoE_blockfp8(MoeBlock):
                 "muxi_layout_kernels for fused MoE requires merge_gate_up=True"
             )
 
-        y = self.shared_experts(x)
-        y1 = muxi_fused_experts(
+        return muxi_fused_experts(
             hidden_states=x,
             w1=self.gate_up_proj_weight,
             w2=self.down_proj_weight,
@@ -2234,6 +2197,3 @@ class MoE_blockfp8(MoeBlock):
             block_shape=[128, 128],
             soft_fp8=True,
         )
-        y += y1
-        torch.distributed.all_reduce(y, group=get_tp_group())
-        return y
