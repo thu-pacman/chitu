@@ -59,12 +59,7 @@ from chitu.muxi_utils import (
     muxi_fused_experts,
 )
 from chitu.utils import try_import_opt_dep, parse_dtype, ceil_div
-from chitu.quantization import (
-    linear_block_fp8,
-    linear_block_fp4,
-    QuantizationRegistry,
-    get_quant_from_checkpoint_prefix,
-)
+from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
 from chitu.static_tensor import StaticTensor
 
 

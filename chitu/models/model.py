@@ -27,10 +27,8 @@ from chitu.device_type import is_muxi, get_device_name, is_nvidia, is_ascend
 from chitu.utils import try_import_opt_dep, parse_dtype
 from chitu.muxi_utils import grouped_topk, muxi_fused_experts
 from chitu.layers.gate import fused_sigmoid_gate
-from chitu.quantization import (
-    linear_block_fp8,
-    linear_block_fp4,
-)
+from chitu.quantization.blockfp8 import linear_block_fp8
+from chitu.quantization.blockfp4 import linear_block_fp4
 
 torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
