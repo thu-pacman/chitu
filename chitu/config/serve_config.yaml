@@ -19,7 +19,6 @@ infer:
   max_reqs: 8
   pp_layer_partition: null # The number of layers for each pipeline stage, e.g., [10, 12, 12, 10].
   use_cuda_graph: False
-  num_blocks: -1 # a positive interger or -1 for auto num blocks calculation
   bind_process_to_cpu: auto # one of: auto, none, numa
   bind_thread_to_cpu: physical_core # one of: physical_core, logical_core
 request:

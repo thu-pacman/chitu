@@ -765,9 +765,6 @@ class Transformer(nn.Module):
         self.prepare_decoding_attn()
 
         batch_size = len(seq_lens)
-        infer_args = get_global_args().infer
-        if infer_args.cache_type == "paged":
-            self.use_cuda_graph = self.use_cuda_graph and (infer_args.num_blocks != -1)
 
         if self.do_decode_callable is None:
 
