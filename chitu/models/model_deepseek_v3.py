@@ -819,20 +819,51 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
         )
 
 
-class MoEDeepSeekV3CPU(nn.Module):
-    """
-    Mixture-of-Experts (MoE) module.
+class MoEDeepSeekV3CPU(ParallelMoeBlock):
+    def __init__(
+        self,
+        args,
+        cpu_infer,
+        ggml_type,
+        checkpoint_prefix: str,
+        merge_qkv_gate_up: bool = False,
+    ):
+        if not get_global_args().infer.fuse_shared_experts:
+            quant = get_quant_from_checkpoint_prefix(
+                checkpoint_prefix, args.quant_config.rules
+            )
+            merge_gate_up = (
+                quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
+            )
+            non_fused_shared_experts = MLPDeepSeekV3(
+                args,
+                role="shared_experts",
+                merge_gate_up=merge_gate_up,
+                op_impl=get_global_args().infer.op_impl,
+                checkpoint_prefix=checkpoint_prefix,
+            )
+        else:
+            non_fused_shared_experts = None
 
-    Attributes:
-        dim (int): Dimensionality of input features.
-        n_routed_experts (int): Total number of experts in the model.
-        n_local_experts (int): Number of experts handled locally in distributed systems.
-        n_activated_experts (int): Number of experts activated for each input.
-        gate (nn.Module): Gating mechanism to route inputs to experts.
-        experts (nn.ModuleList): List of expert modules.
-        shared_experts (nn.Module): Shared experts applied to all inputs.
-    """
+        super().__init__(
+            gate=GateDeepSeekV3(args),
+            experts=MoeExpertsDeepSeekV3CPU(
+                args,
+                cpu_infer=cpu_infer,
+                ggml_type=ggml_type,
+                checkpoint_prefix=checkpoint_prefix,
+                merge_qkv_gate_up=merge_qkv_gate_up,
+            ),
+            non_fused_shared_experts=non_fused_shared_experts,
+        )
 
+    def to(self, *args, **kwargs):
+        self.gate.to(*args, **kwargs)
+        if self.shared_experts is not None:
+            self.shared_experts.to(*args, **kwargs)
+
+
+class MoeExpertsDeepSeekV3CPU(nn.Module):
     def __init__(
         self,
         args,
@@ -851,8 +882,6 @@ class MoEDeepSeekV3CPU(nn.Module):
         self.args = args
         self.merge_qkv_gate_up = merge_qkv_gate_up
         self.dim = args.dim
-        self.tp_group = get_tp_group()
-        self.tp_size = get_tp_size()
         self.rank = get_tp_rank()
 
         moe_world_size = 1
@@ -864,45 +893,6 @@ class MoEDeepSeekV3CPU(nn.Module):
         self.n_routed_experts = args.n_routed_experts
         self.n_local_experts = args.n_routed_experts // moe_world_size
         self.n_activated_experts = args.n_activated_experts
-        self.gate = GateDeepSeekV3(args)
-        if self.merge_qkv_gate_up:
-            self.gate_up_proj = ColumnParallelLinear(
-                args.dim,
-                args.moe_inter_dim * 2,
-                has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.bfloat16,
-                gather_output=False,
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
-            )
-        else:
-            self.gate_proj = ColumnParallelLinear(
-                args.dim,
-                args.moe_inter_dim,
-                has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.bfloat16,
-                gather_output=False,
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
-            )
-            self.up_proj = ColumnParallelLinear(
-                args.dim,
-                args.moe_inter_dim,
-                has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.bfloat16,
-                gather_output=False,
-                checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
-            )
-        self.down_proj = RowParallelLinear(
-            args.moe_inter_dim,
-            args.dim,
-            has_bias=False,
-            dtype=parse_dtype(args.main_weight_dtype),
-            bias_dtype=torch.bfloat16,
-            input_is_parallel=True,
-            checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
-        )
 
         if self.rank == 0:
 
@@ -980,14 +970,7 @@ class MoEDeepSeekV3CPU(nn.Module):
         self.moe = None
 
     def to(self, *args, **kwargs):
-        self.gate.to(*args, **kwargs)
-        if self.merge_qkv_gate_up:
-            self.gate_up_proj.to(*args, **kwargs)
-        else:
-            self.gate_proj.to(*args, **kwargs)
-            self.up_proj.to(*args, **kwargs)
-        self.down_proj.to(*args, **kwargs)
-        return self
+        return self  # Do nothing
 
     def init_weights(self):
         if self.rank == 0:
@@ -1062,21 +1045,23 @@ class MoEDeepSeekV3CPU(nn.Module):
                 dtype=torch.bfloat16,
             )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
         """
         Forward pass for the MoE module.
 
         Args:
             x (torch.Tensor): Input tensor.
+            weights (torch.Tensor): Routing weights from the gate.
+            indices (torch.Tensor): Indices of the selected experts.
 
         Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
+            torch.Tensor: Output tensor.
         """
         shape = x.size()
 
         if self.rank == 0:
-            x_flat = x.view(-1, self.dim)
-            weights, indices = self.gate(x_flat)
             indices = indices.contiguous().to(torch.int64)
             weights = weights.contiguous().to(torch.float32)
             if x.shape[1] > 1:
@@ -1115,32 +1100,19 @@ class MoEDeepSeekV3CPU(nn.Module):
                     ),
                 )
 
-        if self.merge_qkv_gate_up:
-            gate_up_proj_out = self.gate_up_proj(x)
-            gate_proj_out, up_proj_out = torch.split(
-                gate_up_proj_out, gate_up_proj_out.shape[-1] // 2, dim=-1
-            )
-        else:
-            gate_proj_out = self.gate_proj(x)
-            up_proj_out = self.up_proj(x)
-        y = self.down_proj(F.silu(gate_proj_out) * up_proj_out)
-
         if self.rank == 0:
             if x.shape[1] > 1:
                 self.cpu_infer.sync()
-                output = output.to(x.device, non_blocking=True).view(shape)
-                y += output
+                y = output.to(x.device, non_blocking=True).view(shape)
             else:
                 self.cpu_infer.sync_with_cuda_stream(
                     torch.cuda.current_stream().cuda_stream
                 )
                 self.output_gpu.get().copy_(self.output_cpu.get(), non_blocking=True)
-                y += self.output_gpu.get()
-            y_scatter = [y] * self.tp_size
+                y = self.output_gpu.get()
         else:
-            y_scatter = None
+            y = torch.zeros_like(x)
 
-        torch.distributed.scatter(y, y_scatter, src=0)
         return y.view(shape)
 
 
@@ -1314,7 +1286,7 @@ class TransformerDeepSeekV3(Transformer):
                 new_checkpoint[prefix + f"experts.{w}.{part}"] = torch.stack(
                     parts, dim=0
                 )
-            elif ".experts." in k:
+            elif re.search(r"\.experts\.\d+", k):
                 continue
             elif fuse_shared_experts and ".shared_experts." in k:
                 continue

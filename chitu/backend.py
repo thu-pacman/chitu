@@ -765,8 +765,8 @@ def load_gguf_deepseek_v3_gguf(
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     for layer_id in range(3, 61):
         if layer_id in cpu_layers:
-            if model.layers[layer_id].mlp.moe == None:
-                model.layers[layer_id].mlp.init_weights()
+            if model.layers[layer_id].mlp.experts.moe == None:
+                model.layers[layer_id].mlp.experts.init_weights()
 
 
 def load_state_dict_llama_gguf_mlp_layers(llama_gguf_loader: GGUFLoader, layer_num=64):
@@ -948,12 +948,6 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
         ".mlp.shared_experts.up_proj.weight": ".ffn_up_shexp.weight",
     }
 
-    translation_shared_experts_cpu = {
-        ".mlp.down_proj.weight": ".ffn_down_shexp.weight",
-        ".mlp.gate_proj.weight": ".ffn_gate_shexp.weight",
-        ".mlp.up_proj.weight": ".ffn_up_shexp.weight",
-    }
-
     translation_experts = {
         ".down_proj.weight": ".ffn_down_exps.weight",
         ".gate_proj.weight": ".ffn_gate_exps.weight",
@@ -966,7 +960,6 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
 
     for layer_id in range(start_layer, end_layer):
         cpu_offload = layer_id in cpu_layers
-        shared_cpu_offload = False
         if local_rank == 0:
             logger.info(f"loading layer : {layer_id}")
             memory_used()
@@ -1001,21 +994,7 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                     gguf_name, device, torch.bfloat16
                 ).cpu()
 
-        if shared_cpu_offload and cpu_offload:
-            gate_proj, gate_type = ds_gguf_loader.get_undequanted_tensor_and_ggml_type(
-                f"blk.{layer_id}.ffn_gate_shexp.weight"
-            )
-            up_proj, up_type = ds_gguf_loader.get_undequanted_tensor_and_ggml_type(
-                f"blk.{layer_id}.ffn_up_shexp.weight"
-            )
-            down_proj, down_type = ds_gguf_loader.get_undequanted_tensor_and_ggml_type(
-                f"blk.{layer_id}.ffn_down_shexp.weight"
-            )
-
-            state_dict["layers." + str(layer_id) + ".mlp.shared_gate_proj"] = gate_proj
-            state_dict["layers." + str(layer_id) + ".mlp.shared_up_proj"] = up_proj
-            state_dict["layers." + str(layer_id) + ".mlp.shared_down_proj"] = down_proj
-        elif not cpu_offload:
+        if not cpu_offload:
             for k in translation_shared_experts.keys():
                 safetensor_name = "layers." + str(layer_id) + k
                 gguf_name = "blk." + str(layer_id) + translation_shared_experts[k]
@@ -1038,9 +1017,9 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                         gguf_name, device, torch.bfloat16
                     ).cpu()
         else:
-            for k in translation_shared_experts_cpu.keys():
+            for k in translation_shared_experts.keys():
                 safetensor_name = "layers." + str(layer_id) + k
-                gguf_name = "blk." + str(layer_id) + translation_shared_experts_cpu[k]
+                gguf_name = "blk." + str(layer_id) + translation_shared_experts[k]
                 if (
                     main_weight_dtype == "float8_e4m3fn"
                     and not safetensor_name.endswith("norm.weight")
@@ -1189,21 +1168,23 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                     )
                 )
 
-                state_dict["layers." + str(layer_id) + ".mlp.gguf_gate_proj"] = (
-                    gate_proj
+                state_dict[
+                    "layers." + str(layer_id) + ".mlp.experts.gguf_gate_proj"
+                ] = gate_proj
+                state_dict["layers." + str(layer_id) + ".mlp.experts.gguf_up_proj"] = (
+                    up_proj
                 )
-                state_dict["layers." + str(layer_id) + ".mlp.gguf_up_proj"] = up_proj
-                state_dict["layers." + str(layer_id) + ".mlp.gguf_down_proj"] = (
-                    down_proj
+                state_dict[
+                    "layers." + str(layer_id) + ".mlp.experts.gguf_down_proj"
+                ] = down_proj
+                state_dict["layers." + str(layer_id) + ".mlp.experts.gate_type"] = (
+                    torch.tensor(gate_type).view(1)
                 )
-                state_dict["layers." + str(layer_id) + ".mlp.gate_type"] = torch.tensor(
-                    gate_type
-                ).view(1)
-                state_dict["layers." + str(layer_id) + ".mlp.up_type"] = torch.tensor(
-                    up_type
-                ).view(1)
-                state_dict["layers." + str(layer_id) + ".mlp.down_type"] = torch.tensor(
-                    down_type
-                ).view(1)
+                state_dict["layers." + str(layer_id) + ".mlp.experts.up_type"] = (
+                    torch.tensor(up_type).view(1)
+                )
+                state_dict["layers." + str(layer_id) + ".mlp.experts.down_type"] = (
+                    torch.tensor(down_type).view(1)
+                )
 
     return state_dict
