@@ -1,16 +1,30 @@
 from typing import Optional, Tuple
+from logging import getLogger
 
 import torch
 
-from chitu.quantization.registry import QuantizedLinearBase, QuantizationRegistry
+from chitu.quantization.registry import (
+    QuantizedLinearBase,
+    QuantizedMoeExpertsBase,
+    QuantizationRegistry,
+)
 from chitu.ops import (
     soft_fp4_raise_to_fp8_gemm_deepseek_v3,
     soft_fp4_raise_to_bf16_gemm_deepseek_v3,
     act_quant_deepseek_v3,
 )
 from chitu.device_type import get_device_name, is_muxi, is_nvidia
-from chitu.utils import ceil_div
+from chitu.utils import ceil_div, try_import_opt_dep, parse_dtype
 from chitu.global_vars import get_global_args
+from chitu.ops import silu_and_mul
+
+chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
+triton, has_triton = try_import_opt_dep("triton", "triton")
+if has_triton:
+    from chitu.fused_moe import fused_experts
+
+
+logger = getLogger(__name__)
 
 
 def linear_block_fp4(
@@ -74,7 +88,7 @@ def linear_block_fp4(
         return y.view(x_shape[:-1] + y.shape[-1:]).to(x_dtype)
 
 
-@QuantizationRegistry.register_method("blockfp4")
+@QuantizationRegistry.register_linear("blockfp4")
 class Blockfp4Linear(QuantizedLinearBase):
     """
     block 4-bit weight and activation quantized linear layer.
@@ -187,3 +201,396 @@ class Blockfp4Linear(QuantizedLinearBase):
             act_block_size=self.act_block_size,
             bias=self.bias,
         )
+
+
+@QuantizationRegistry.register_moe_experts("blockfp4")
+class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
+    """
+    blockfp4 quantized MoeExperts
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        moe_inter_dim: int,
+        n_routed_experts: int,
+        n_shared_experts: int,
+        n_activated_experts: int,
+        moe_world_size: int,
+        moe_rank: int,
+        dtype: torch.dtype,
+        op_impl: str,
+        fuse_shared_experts: bool,
+        checkpoint_prefix: str,
+        merge_gate_up: bool,
+    ):
+        """
+        Initializes the MoE module.
+
+        Args:
+            args (ModelArgs): Model arguments containing MoE parameters.
+        """
+        super().__init__(
+            dim,
+            moe_inter_dim,
+            n_routed_experts,
+            n_shared_experts,
+            n_activated_experts,
+            moe_world_size,
+            moe_rank,
+            dtype,
+            op_impl,
+            fuse_shared_experts,
+            checkpoint_prefix,
+            build_weight=False,
+            merge_gate_up=merge_gate_up,
+        )
+
+        self.linear_dtype = torch.uint8
+
+        quant_scale_stride = 16
+
+        if self.merge_gate_up:
+            scale_in_features = ceil_div(dim, quant_scale_stride)
+            self.gate_up_proj_weight = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    moe_inter_dim * 2,
+                    dim // 2,
+                    dtype=self.linear_dtype,
+                ),
+                requires_grad=False,
+            )
+            self.gate_up_proj_weight_scale = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    moe_inter_dim * 2,
+                    scale_in_features,
+                    dtype=torch.uint8,
+                ),
+                requires_grad=False,
+            )
+            self.gate_up_proj_weight_scale_2 = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    2,
+                    1,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            self.gate_up_proj_input_scale = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    2,
+                    1,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+        else:
+            scale_in_features = ceil_div(dim, quant_scale_stride)
+            self.gate_proj_weight = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    moe_inter_dim,
+                    dim // 2,
+                    dtype=self.linear_dtype,
+                ),
+                requires_grad=False,
+            )
+            self.gate_proj_weight_scale = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    moe_inter_dim,
+                    scale_in_features,
+                    dtype=torch.uint8,
+                ),
+                requires_grad=False,
+            )
+            self.gate_proj_weight_scale_2 = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    1,
+                    1,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            self.gate_proj_input_scale = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    1,
+                    1,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            self.up_proj_weight = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    moe_inter_dim,
+                    dim // 2,
+                    dtype=self.linear_dtype,
+                ),
+                requires_grad=False,
+            )
+            self.up_proj_weight_scale = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    moe_inter_dim,
+                    scale_in_features,
+                    dtype=torch.uint8,
+                ),
+                requires_grad=False,
+            )
+            self.up_proj_weight_scale_2 = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    1,
+                    1,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            self.up_proj_input_scale = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    1,
+                    1,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+        down_proj_scale_in_features = ceil_div(moe_inter_dim, quant_scale_stride)
+        down_proj_scale_out_features = dim
+        self.down_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                dim,
+                moe_inter_dim // 2,
+                dtype=self.linear_dtype,
+            ),
+            requires_grad=False,
+        )
+        self.down_proj_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                down_proj_scale_out_features,
+                down_proj_scale_in_features,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        self.down_proj_weight_scale_2 = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                1,
+                1,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        self.down_proj_input_scale = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                1,
+                1,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Forward pass for the MoE module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            weights (torch.Tensor): Routing weights from the gate.
+            indices (torch.Tensor): Indices of the selected experts.
+
+        Returns:
+            torch.Tensor: Output tensor.
+        """
+
+        shape = x.size()
+        x = x.view(-1, self.dim)
+
+        if self.op_impl == "muxi_custom_kernel":
+            raise NotImplementedError(
+                "muxi_custom_kernel is not supported for blockfp4 MoeExperts"
+            )
+        elif has_triton and self.merge_gate_up:
+            raise_to_16 = (
+                parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
+                != 1
+            )
+
+            if not self.fuse_shared_experts:
+
+                y = fused_experts(
+                    x,
+                    self.gate_up_proj_weight,
+                    self.down_proj_weight,
+                    topk_weights=weights,
+                    topk_ids=indices,
+                    use_fp4_w4a8=True,
+                    inplace=True,
+                    global_num_experts=self.n_routed_experts,
+                    w1_scale=self.gate_up_proj_weight_scale,
+                    w2_scale=self.down_proj_weight_scale,
+                    w1w3_scale_2=self.gate_up_proj_weight_scale_2,
+                    w2_scale_2=self.down_proj_weight_scale_2,
+                    block_shape=[128, 128],
+                    soft_fp8=raise_to_16,
+                )
+
+            else:
+
+                indice_shape = indices.shape
+                new_indices = torch.empty(
+                    (indice_shape[0], indice_shape[1] + 1),
+                    dtype=indices.dtype,
+                    device=indices.device,
+                )
+
+                new_weights = torch.empty(
+                    (weights.shape[0], weights.shape[1] + 1),
+                    dtype=weights.dtype,
+                    device=weights.device,
+                )
+
+                chitu_backend.cuda_add_shared_experts(
+                    new_weights,
+                    new_indices,
+                    weights,
+                    indices,
+                    self.n_routed_experts,
+                    self.n_shared_experts,
+                )
+                del weights, indices
+                y = fused_experts(
+                    x,
+                    self.gate_up_proj_weight,
+                    self.down_proj_weight,
+                    topk_weights=new_weights,
+                    topk_ids=new_indices,
+                    use_fp4_w4a8=True,
+                    inplace=True,
+                    global_num_experts=self.n_routed_experts + self.n_shared_experts,
+                    w1_scale=self.gate_up_proj_weight_scale,
+                    w2_scale=self.down_proj_weight_scale,
+                    w1w3_scale_2=self.gate_up_proj_weight_scale_2,
+                    w2_scale_2=self.down_proj_weight_scale_2,
+                    block_shape=[128, 128],
+                    soft_fp8=raise_to_16,
+                )
+
+        else:
+            y = torch.zeros_like(x)
+            counts = torch.bincount(
+                indices.flatten(), minlength=self.n_routed_experts
+            ).tolist()
+
+            xs = []
+            for i in range(self.experts_start_idx, self.experts_end_idx):
+                this_x = None
+                if counts[i]:
+                    idx, top = torch.where(indices == i)
+                    this_x = x[idx]
+                xs.append(this_x)
+            if self.fuse_shared_experts:
+                xs += [x] * self.n_fused_shared_experts
+
+            if self.merge_gate_up:
+                assert len(xs) == self.group_size
+                gate_up_proj_outs = []
+                for i in range(self.group_size):
+                    out = None
+                    if xs[i] is not None:
+                        out = linear_block_fp4(
+                            xs[i],
+                            self.gate_up_proj_weight[i],
+                            self.gate_up_proj_weight_scale[i],
+                            self.gate_up_proj_weight_scale_2[i],
+                            128,
+                            None,
+                        )
+                    gate_up_proj_outs.append(out)
+                act = [
+                    (
+                        silu_and_mul(gate_up_proj_out)
+                        if gate_up_proj_out is not None
+                        else None
+                    )
+                    for gate_up_proj_out in gate_up_proj_outs
+                ]
+            else:
+                assert len(xs) == self.group_size
+                gate_proj_outs = []
+                up_proj_outs = []
+                for i in range(self.group_size):
+                    gate_proj_out = None
+                    up_proj_out = None
+                    if xs[i] is not None:
+                        gate_proj_out = linear_block_fp4(
+                            xs[i],
+                            self.gate_proj_weight[i],
+                            self.gate_proj_weight_scale[i],
+                            self.gate_proj_weight_scale_2[i],
+                            128,
+                            None,
+                        )
+                        up_proj_out = linear_block_fp4(
+                            xs[i],
+                            self.up_proj_weight[i],
+                            self.up_proj_weight_scale[i],
+                            self.up_proj_weight_scale_2[i],
+                            128,
+                            None,
+                        )
+                    gate_proj_outs.append(gate_proj_out)
+                    up_proj_outs.append(up_proj_out)
+
+                act = [
+                    (
+                        torch.nn.functional.silu(gate_proj_out) * up_proj_out
+                        if gate_proj_out is not None
+                        else None
+                    )
+                    for gate_proj_out, up_proj_out in zip(gate_proj_outs, up_proj_outs)
+                ]
+
+            down_proj_outs = []
+            for i in range(self.group_size):
+                down_proj_out = None
+                if act[i] is not None:
+                    down_proj_out = linear_block_fp4(
+                        act[i],
+                        self.down_proj_weight[i],
+                        self.down_proj_weight_scale[i],
+                        self.down_proj_weight_scale_2[i],
+                        128,
+                        None,
+                    )
+                down_proj_outs.append(down_proj_out)
+
+            for i in range(self.experts_start_idx, self.experts_end_idx):
+                if counts[i]:
+                    idx, top = torch.where(indices == i)
+                    y[idx] += (
+                        down_proj_outs[i - self.experts_start_idx]
+                        * weights[idx, top, None]
+                    )
+            if self.fuse_shared_experts:
+                for i in range(
+                    self.experts_end_idx - self.experts_start_idx,
+                    self.experts_end_idx
+                    - self.experts_start_idx
+                    + self.n_fused_shared_experts,
+                ):
+                    y += down_proj_outs[i]
+        return y.view(shape)

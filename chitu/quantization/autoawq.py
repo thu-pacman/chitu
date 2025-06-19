@@ -3,7 +3,7 @@ import torch
 from chitu.quantization.registry import QuantizedLinearBase, QuantizationRegistry
 
 
-@QuantizationRegistry.register_method("autoawq")
+@QuantizationRegistry.register_linear("autoawq")
 class AutoAWQLinear(QuantizedLinearBase):
     """
     Auto awq 4-bit linear layer.

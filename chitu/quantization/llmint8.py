@@ -6,7 +6,7 @@ from chitu.utils import try_import_opt_dep
 bnb, has_bnb = try_import_opt_dep("bitsandbytes", "quant")
 
 
-@QuantizationRegistry.register_method("llmint8")
+@QuantizationRegistry.register_linear("llmint8")
 class LLMInt8Linear(QuantizedLinearBase):
     """
     8-bit linear layer implementation using bitsandbytes.

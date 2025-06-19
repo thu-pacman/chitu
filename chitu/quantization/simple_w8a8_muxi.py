@@ -4,7 +4,7 @@ import torch
 from chitu.quantization.registry import QuantizedLinearBase, QuantizationRegistry
 
 
-@QuantizationRegistry.register_method("simple_w8a8_muxi")
+@QuantizationRegistry.register_linear("simple_w8a8_muxi")
 class W8A8MuxiLinear(QuantizedLinearBase):
     """
     Muxi 8-bit weight and activation quantized linear layer.

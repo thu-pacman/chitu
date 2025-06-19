@@ -14,7 +14,6 @@ from chitu.models.model import (
     Transformer,
     TransformerBlock,
     MoeGate,
-    MoeExpertsRegistry,
     ParallelMoeBlock,
 )
 from chitu.muxi_utils import (
@@ -420,19 +419,19 @@ class MoeExpertsQwen3MixIn:
         checkpoint_prefix: str,
         merge_gate_up: bool,
     ):
-        params = get_global_args().models
+        assert args.moe_intermediate_dim % get_tp_size() == 0
         super().__init__(
             dim=args.dim,
-            moe_inter_dim=args.moe_intermediate_dim,
+            moe_inter_dim=args.moe_intermediate_dim // get_tp_size(),
             n_routed_experts=(
-                params.num_experts if hasattr(params, "num_experts") else 128
+                args.num_experts if hasattr(args, "num_experts") else 128
             ),
             n_shared_experts=0,
             n_activated_experts=0,
             moe_world_size=1,
             moe_rank=0,
             op_impl=op_impl,
-            dtype=params.dtype if hasattr(params, "dtype") else "bfloat16",
+            dtype=args.dtype if hasattr(args, "dtype") else "bfloat16",
             fuse_shared_experts=False,
             checkpoint_prefix=checkpoint_prefix,
             merge_gate_up=merge_gate_up,
@@ -450,7 +449,7 @@ def Qwen3MoeExperts(
 ):
     if base_moe_experts_class is None:
         base_moe_experts_class = (
-            MoeExpertsRegistry.get_quantized_MoeExperts_class_from_global_args(
+            QuantizationRegistry.get_quantized_moe_experts_class_from_global_args(
                 quant_kwargs=quant_kwargs,
                 checkpoint_prefix=f"{checkpoint_prefix}.moe",
             )
