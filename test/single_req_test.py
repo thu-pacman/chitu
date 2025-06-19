@@ -14,9 +14,10 @@ from chitu.chitu_main import (
     chitu_run,
     chitu_terminate,
     chitu_is_terminated,
+    warmup_engine,
 )
 from chitu.global_vars import get_timers
-from chitu.utils import get_config_dir_path
+from chitu.utils import get_config_dir_path, gen_req_id
 
 logger = getLogger(__name__)
 
@@ -32,21 +33,7 @@ msgs = [
     [{"role": "user", "content": "飞机在对流层还是平流层飞?"}],
     [{"role": "user", "content": "怎么避免加班?"}],
     [{"role": "user", "content": "what is the recipe of mayonnaise?"}],
-    # [
-    #     {"role": "user", "content": "I am going to Paris, what should I see?"},
-    #     {
-    #         "role": "assistant",
-    #         "content": """\
-    #     Paris, the capital of France, is known for its stunning architecture, art museums, historical landmarks, and romantic atmosphere. Here are some of the top attractions to see in Paris:
-    #     1. The Eiffel Tower: The iconic Eiffel Tower is one of the most recognizable landmarks in the world and offers breathtaking views of the city.
-    #     2. The Louvre Museum: The Louvre is one of the world's largest and most famous museums, housing an impressive collection of art and artifacts, including the Mona Lisa.
-    #     3. Notre-Dame Cathedral: This beautiful cathedral is one of the most famous landmarks in Paris and is known for its Gothic architecture and stunning stained glass windows.
-    #     These are just a few of the many attractions that Paris has to offer. With so much to see and do, it's no wonder that Paris is one of the most popular tourist destinations in the world.""",
-    #     },
-    #     {"role": "user", "content": "What is so great about #1?"},
-    # ],
 ]
-
 counter = 1
 
 
@@ -55,12 +42,6 @@ def gen_debug_req_id(len=8):
     req_id = f"{counter:0{len}x}"
     counter += 1
     return req_id
-
-
-def gen_req_id(len=8):
-    random_number = random.getrandbits(len * 4)
-    hex_string = f"{random_number:0{len}x}"
-    return hex_string
 
 
 def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens):
@@ -108,7 +89,10 @@ def gen_reqs(num_reqs, max_new_tokens):
 
 def run_pipe_or_tensor_parallelism(args, timers):
     rank = torch.distributed.get_rank()
-    for i in range(2):
+    if rank == 0:
+        warmup_engine(args)
+
+    for i in range(3):
         if rank == 0:
             reqs = gen_reqs(
                 num_reqs=args.infer.max_reqs,
@@ -142,7 +126,10 @@ def run_pipe_or_tensor_parallelism(args, timers):
 
 def run_normal(args, timers):
     rank = torch.distributed.get_rank()
-    for i in range(3):
+    if rank == 0:
+        warmup_engine(args)
+
+    for i in range(2):
         reqs = gen_reqs(
             num_reqs=args.infer.max_reqs, max_new_tokens=args.request.max_new_tokens
         )
@@ -182,6 +169,7 @@ def main(args: DictConfig):
 
     chitu_init(args, logging_level=logging.INFO)
     torch.distributed.barrier()
+
     timers = get_timers()
     logger.debug(f"finish init")
     if args.infer.pp_size > 1 or args.infer.tp_size > 1:

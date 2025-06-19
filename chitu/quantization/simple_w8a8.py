@@ -8,7 +8,7 @@ w8a8gemm, _ = try_import_opt_dep("w8a8gemm", "quant")
 w8a8gemv, _ = try_import_opt_dep("w8a8gemv", "quant")
 
 
-@QuantizationRegistry.register_method("simple_w8a8")
+@QuantizationRegistry.register_linear("simple_w8a8")
 class W8A8Linear(QuantizedLinearBase):
     """
     8-bit weight and activation quantized linear layer.

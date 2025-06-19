@@ -3,7 +3,11 @@ from logging import getLogger
 
 import torch
 
-from chitu.quantization.registry import QuantizedLinearBase, QuantizationRegistry
+from chitu.quantization.registry import (
+    QuantizedLinearBase,
+    QuantizedMoeExpertsBase,
+    QuantizationRegistry,
+)
 from chitu.ops import (
     fp8_gemm_deepseek_v3,
     soft_fp8_gemm_deepseek_v3,
@@ -11,8 +15,14 @@ from chitu.ops import (
     act_quant_deepseek_v3,
 )
 from chitu.device_type import get_device_name, is_muxi, is_nvidia
-from chitu.utils import parse_dtype
+from chitu.utils import try_import_opt_dep, parse_dtype
 from chitu.global_vars import get_global_args
+from chitu.ops import silu_and_mul, weight_dequant_soft_fp8_deepseek_v3
+
+chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
+triton, has_triton = try_import_opt_dep("triton", "triton")
+if has_triton:
+    from chitu.fused_moe import fused_experts
 
 
 logger = getLogger(__name__)
@@ -69,8 +79,8 @@ def linear_block_fp8(
         return y.view(x_shape[:-1] + y.shape[-1:]).to(x_dtype)
 
 
-@QuantizationRegistry.register_method("gguf-blockfp8")
-@QuantizationRegistry.register_method("blockfp8")
+@QuantizationRegistry.register_linear("gguf-blockfp8")
+@QuantizationRegistry.register_linear("blockfp8")
 class Blockfp8Linear(QuantizedLinearBase):
     """
     block 8-bit weight and activation quantized linear layer.
@@ -138,4 +148,338 @@ class Blockfp8Linear(QuantizedLinearBase):
     def forward(self, x) -> torch.Tensor:
         return linear_block_fp8(
             x, self.weight, self.scale, self.bias, block_size=self.block_size
+        )
+
+
+@QuantizationRegistry.register_moe_experts("blockfp8")
+class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
+    """
+    blockfp8 quantized MoeExperts
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        moe_inter_dim: int,
+        n_routed_experts: int,
+        n_shared_experts: int,
+        n_activated_experts: int,
+        moe_world_size: int,
+        moe_rank: int,
+        dtype: torch.dtype,
+        op_impl: str,
+        fuse_shared_experts: bool,
+        checkpoint_prefix: str,
+        merge_gate_up: bool,
+    ):
+        """
+        Initializes the MoE module.
+
+        Args:
+            args (ModelArgs): Model arguments containing MoE parameters.
+        """
+        super().__init__(
+            dim,
+            moe_inter_dim,
+            n_routed_experts,
+            n_shared_experts,
+            n_activated_experts,
+            moe_world_size,
+            moe_rank,
+            dtype,
+            op_impl,
+            fuse_shared_experts,
+            checkpoint_prefix,
+            build_weight=True,
+            merge_gate_up=merge_gate_up,
+        )
+        gate_up_proj_in_features = dim
+        block_size = 128
+
+        if self.merge_gate_up:
+            scale_out_features = (moe_inter_dim * 2 + block_size - 1) // block_size
+            scale_in_features = (
+                gate_up_proj_in_features + block_size - 1
+            ) // block_size
+            self.gate_up_proj_scale = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    scale_out_features,
+                    scale_in_features,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+        else:
+            scale_out_features = (moe_inter_dim + block_size - 1) // block_size
+            scale_in_features = (
+                gate_up_proj_in_features + block_size - 1
+            ) // block_size
+            self.gate_proj_scale = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    scale_out_features,
+                    scale_in_features,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            self.up_proj_scale = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    scale_out_features,
+                    scale_in_features,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+        down_proj_scale_out_features = (dim + block_size - 1) // block_size
+        down_proj_scale_in_features = (moe_inter_dim + block_size - 1) // block_size
+        self.down_proj_scale = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                down_proj_scale_out_features,
+                down_proj_scale_in_features,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Forward pass for the MoE module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            weights (torch.Tensor): Routing weights from the gate.
+            indices (torch.Tensor): Indices of the selected experts.
+
+        Returns:
+            torch.Tensor: Output tensor.
+        """
+
+        shape = x.size()
+        x = x.view(-1, self.dim)
+
+        if self.op_impl == "muxi_custom_kernel":
+            y = self._compute_muxi_fused_experts(x, weights, indices)
+        elif has_triton:
+            assert self.merge_gate_up
+            if (
+                parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
+                == 1
+                or is_nvidia()
+                or is_muxi()
+            ):
+                fused_soft_fp8 = (
+                    parse_dtype(
+                        get_global_args().infer.raise_lower_bit_float_to
+                    ).itemsize
+                    != 1
+                )
+                gate_up_proj_weight = self.gate_up_proj_weight
+                gate_up_proj_scale = self.gate_up_proj_scale
+                down_proj_weight = self.down_proj_weight
+                down_proj_scale = self.down_proj_scale
+            else:
+                logger.warning(
+                    f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
+                )
+                block_size = 128
+                gate_up_proj_weight = weight_dequant_soft_fp8_deepseek_v3(
+                    self.gate_up_proj_weight,
+                    self.gate_up_proj_scale,
+                    block_size,
+                )
+                gate_up_proj_scale = None
+                down_proj_weight = weight_dequant_soft_fp8_deepseek_v3(
+                    self.down_proj_weight,
+                    self.down_proj_scale,
+                    block_size,
+                )
+                down_proj_scale = None
+                fused_soft_fp8 = False
+
+            if not self.fuse_shared_experts:
+                y = fused_experts(
+                    x,
+                    gate_up_proj_weight,
+                    down_proj_weight,
+                    topk_weights=weights,
+                    topk_ids=indices,
+                    use_fp8_w8a8=True,
+                    inplace=True,
+                    global_num_experts=self.n_routed_experts,
+                    w1_scale=gate_up_proj_scale,
+                    w2_scale=down_proj_scale,
+                    block_shape=[128, 128],
+                    soft_fp8=fused_soft_fp8,
+                )
+
+            else:
+
+                indice_shape = indices.shape
+                new_indices = torch.empty(
+                    (indice_shape[0], indice_shape[1] + 1),
+                    dtype=indices.dtype,
+                    device=indices.device,
+                )
+
+                new_weights = torch.empty(
+                    (weights.shape[0], weights.shape[1] + 1),
+                    dtype=weights.dtype,
+                    device=weights.device,
+                )
+
+                chitu_backend.cuda_add_shared_experts(
+                    new_weights,
+                    new_indices,
+                    weights,
+                    indices,
+                    self.n_routed_experts,
+                    self.n_shared_experts,
+                )
+                del weights, indices
+                y = fused_experts(
+                    x,
+                    gate_up_proj_weight,
+                    down_proj_weight,
+                    topk_weights=new_weights,
+                    topk_ids=new_indices,
+                    use_fp8_w8a8=True,
+                    inplace=True,
+                    global_num_experts=self.n_routed_experts + self.n_shared_experts,
+                    w1_scale=gate_up_proj_scale,
+                    w2_scale=down_proj_scale,
+                    block_shape=[128, 128],
+                    soft_fp8=fused_soft_fp8,
+                )
+
+        else:
+            y = torch.zeros_like(x)
+            counts = torch.bincount(
+                indices.flatten(), minlength=self.n_routed_experts
+            ).tolist()
+
+            xs = []
+            for i in range(self.experts_start_idx, self.experts_end_idx):
+                this_x = None
+                if counts[i]:
+                    idx, top = torch.where(indices == i)
+                    this_x = x[idx]
+                xs.append(this_x)
+            if self.fuse_shared_experts:
+                xs += [x] * self.n_fused_shared_experts
+
+            if self.merge_gate_up:
+                assert len(xs) == self.group_size
+                gate_up_proj_outs = []
+                for i in range(self.group_size):
+                    out = None
+                    if xs[i] is not None:
+                        out = linear_block_fp8(
+                            xs[i],
+                            self.gate_up_proj_weight[i],
+                            self.gate_up_proj_scale[i],
+                            None,
+                            128,
+                        )
+                    gate_up_proj_outs.append(out)
+                act = [
+                    (
+                        silu_and_mul(gate_up_proj_out)
+                        if gate_up_proj_out is not None
+                        else None
+                    )
+                    for gate_up_proj_out in gate_up_proj_outs
+                ]
+            else:
+                assert len(xs) == self.group_size
+                gate_proj_outs = []
+                up_proj_outs = []
+                for i in range(self.group_size):
+                    gate_proj_out = None
+                    up_proj_out = None
+                    if xs[i] is not None:
+                        gate_proj_out = linear_block_fp8(
+                            xs[i],
+                            self.gate_proj_weight[i],
+                            self.gate_proj_scale[i],
+                            None,
+                            128,
+                        )
+                        up_proj_out = linear_block_fp8(
+                            xs[i],
+                            self.up_proj_weight[i],
+                            self.up_proj_scale[i],
+                            None,
+                            128,
+                        )
+                    gate_proj_outs.append(gate_proj_out)
+                    up_proj_outs.append(up_proj_out)
+
+                act = [
+                    (
+                        torch.nn.functional.silu(gate_proj_out) * up_proj_out
+                        if gate_proj_out is not None
+                        else None
+                    )
+                    for gate_proj_out, up_proj_out in zip(gate_proj_outs, up_proj_outs)
+                ]
+
+            down_proj_outs = []
+            for i in range(self.group_size):
+                down_proj_out = None
+                if act[i] is not None:
+                    down_proj_out = linear_block_fp8(
+                        act[i],
+                        self.down_proj_weight[i],
+                        self.down_proj_scale[i],
+                        None,
+                        128,
+                    )
+                down_proj_outs.append(down_proj_out)
+
+            for i in range(self.experts_start_idx, self.experts_end_idx):
+                if counts[i]:
+                    idx, top = torch.where(indices == i)
+                    y[idx] += (
+                        down_proj_outs[i - self.experts_start_idx]
+                        * weights[idx, top, None]
+                    )
+            if self.fuse_shared_experts:
+                for i in range(
+                    self.experts_end_idx - self.experts_start_idx,
+                    self.experts_end_idx
+                    - self.experts_start_idx
+                    + self.n_fused_shared_experts,
+                ):
+                    y += down_proj_outs[i]
+        return y.view(shape)
+
+    def _compute_muxi_fused_experts(self, x, weights, indices):
+        from chitu.muxi_utils import muxi_fused_experts
+
+        if self.fuse_shared_experts:
+            raise NotImplementedError(
+                "Fused shared experts is not supported for muxi_layout_kernels"
+            )
+        if not self.merge_gate_up:
+            raise NotImplementedError(
+                "muxi_layout_kernels for fused MoE requires merge_gate_up=True"
+            )
+
+        return muxi_fused_experts(
+            hidden_states=x,
+            w1=self.gate_up_proj_weight,
+            w2=self.down_proj_weight,
+            topk_weights=weights,
+            topk_ids=indices,
+            inplace=True,
+            w1_scale=self.gate_up_proj_scale,
+            w2_scale=self.down_proj_scale,
+            block_shape=[128, 128],
+            soft_fp8=True,
         )

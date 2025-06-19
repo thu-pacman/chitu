@@ -129,7 +129,7 @@ def get_scale_perms():
     return scale_perm, scale_perm_single
 
 
-@QuantizationRegistry.register_method("gptqmodel")
+@QuantizationRegistry.register_linear("gptqmodel")
 class GPTQLinear(QuantizedLinearBase):
     """
     gptqmodel marlin 8-bit linear layer.

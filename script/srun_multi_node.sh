@@ -8,14 +8,19 @@ fi
 JOB_NAME=$USER-chitu
 NODES=$1
 NTASKS_PER_NODE=1
-CPUS_PER_TASK=32
-GPUS_PER_TASK=$2
+NUM_GPUS=$2
+CPUS_PER_GPU=24
+MEM_PER_GPU=242144
+
+# 计算总的CPU和内存
+NUM_CPUS=$((NUM_GPUS * ${CPUS_PER_GPU}))
+NUM_MEMS=$((NUM_GPUS * ${MEM_PER_GPU}))
 
 THIS_SCRIPT=$(realpath $0)
 
 if [[ "$3" != "--node" ]]; then
     COMMAND=${@:3}
-    PARAMS="--job-name $JOB_NAME --nodes $NODES --ntasks-per-node $NTASKS_PER_NODE --cpus-per-task $CPUS_PER_TASK --gpus-per-task $GPUS_PER_TASK"
+    PARAMS="--job-name $JOB_NAME --nodes $NODES --ntasks-per-node $NTASKS_PER_NODE --cpus-per-task $NUM_CPUS --mem $NUM_MEMS --gres=gpu:$NUM_GPUS"
     exec srun $PARAMS $THIS_SCRIPT $1 $2 --node $COMMAND
 fi
 

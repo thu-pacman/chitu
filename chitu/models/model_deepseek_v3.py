@@ -27,7 +27,6 @@ from chitu.models.model import (
     Transformer,
     TransformerBlock,
     MoeGate,
-    MoeExpertsRegistry,
     ParallelMoeBlock,
 )
 from chitu.ops import (
@@ -729,9 +728,10 @@ class MoeExpertsDeepSeekV3MixIn:
         op_impl: str,
         checkpoint_prefix: str,
     ):
+        assert args.moe_inter_dim % get_tp_size() == 0
         super().__init__(
             dim=args.dim,
-            moe_inter_dim=args.moe_inter_dim,
+            moe_inter_dim=args.moe_inter_dim // get_tp_size(),
             n_routed_experts=args.n_routed_experts,
             n_shared_experts=args.n_shared_experts,
             n_activated_experts=args.n_activated_experts,
@@ -755,7 +755,7 @@ def MoeExpertsDeepSeekV3(
     checkpoint_prefix = checkpoint_prefix + ".moe"
     if base_moe_experts_class is None:
         base_moe_experts_class = (
-            MoeExpertsRegistry.get_quantized_MoeExperts_class_from_global_args(
+            QuantizationRegistry.get_quantized_moe_experts_class_from_global_args(
                 quant_kwargs=quant_kwargs,
                 checkpoint_prefix=checkpoint_prefix,
             )

@@ -1,10 +1,14 @@
 import torch
 
-from chitu.quantization.registry import QuantizedLinearBase, QuantizationRegistry
+from chitu.quantization.registry import (
+    QuantizedLinearBase,
+    QuantizedMoeExpertsBase,
+    QuantizationRegistry,
+)
 
 
-@QuantizationRegistry.register_method("gguf")
-@QuantizationRegistry.register_method(None)
+@QuantizationRegistry.register_linear("gguf")
+@QuantizationRegistry.register_linear(None)
 class NormalLinear(QuantizedLinearBase):
     def __init__(
         self,
@@ -47,3 +51,8 @@ class NormalLinear(QuantizedLinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.linear(x, self.weight, self.bias)
+
+
+@QuantizationRegistry.register_moe_experts(None)
+class NormalMoeExperts(QuantizedMoeExpertsBase):
+    pass
