@@ -8,6 +8,8 @@ Chitu is a high-performance inference framework for large language models, focus
 
 ## News
 
+[2025/06/12] Released v0.3.6, added support for [GLM-4 models](https://huggingface.co/collections/THUDM/glm-4-0414-67f3cbcb34dd9d252707cb2e), and optimized startup configuration options.
+
 [2025/06/12] Released v0.3.5, added support for Ascend NPU aclgraph to enhance higher performance, and fixed some known issues.
 
 [2025/05/29] Release v0.3.4, with some performance optimizations.
