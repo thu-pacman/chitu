@@ -756,6 +756,17 @@ class Transformer(nn.Module):
         self.prepare_decoding_attn()
 
         batch_size = len(seq_lens)
+        infer_args = get_global_args().infer
+        current_cuda_graph_enabled = self.use_cuda_graph and (
+            infer_args.cache_type != "paged" or infer_args.num_blocks != -1
+        )
+
+        if (
+            hasattr(self, "_last_cuda_graph_enabled")
+            and self._last_cuda_graph_enabled != current_cuda_graph_enabled
+        ):
+            self.do_decode_callable = None
+        self._last_cuda_graph_enabled = current_cuda_graph_enabled
 
         if self.do_decode_callable is None:
 
@@ -772,7 +783,7 @@ class Transformer(nn.Module):
                 kwargs_max_nelem={},
                 output_max_nelem_callback=lambda bs, n: n // bs * self.max_batch_size,
                 before_replay_callback=before_replay_callback,
-                enable=self.use_cuda_graph,
+                enable=current_cuda_graph_enabled,
             )
             def do_decode(tokens):
                 freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_decode()

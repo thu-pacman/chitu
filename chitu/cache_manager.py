@@ -1,7 +1,8 @@
 from logging import getLogger
 
 import torch
-
+from typing import Dict, List
+from collections import deque
 from chitu.global_vars import get_slot_handle, get_timers, get_global_args
 from chitu.static_tensor import StaticTensor
 
@@ -17,6 +18,7 @@ class PagedKVCacheManager:
         end_layer_id,
         num_hot_req=16,
         block_size=_BLOCK_SIZE,
+        num_blocks: int = -1,
         max_seq_len=_MAX_SEQ_LEN,
         device="cuda",
         *,
@@ -36,8 +38,8 @@ class PagedKVCacheManager:
         """
 
         self.max_blocks_per_req = max_seq_len // block_size + 1
-        self.num_blocks = self.max_blocks_per_req * num_hot_req
-
+        self.max_num_blocks = self.max_blocks_per_req * num_hot_req
+        self.num_blocks = num_blocks if num_blocks != -1 else num_hot_req
         self.begin_layer_id = begin_layer_id
         self.end_layer_id = end_layer_id
         self.num_layers = end_layer_id - begin_layer_id
@@ -57,14 +59,13 @@ class PagedKVCacheManager:
             self.k_shape_per_sample = kv_shape_per_sample
             self.v_shape_per_sample = None
 
-        # assert block_size % 256 == 0
         self.block_size = block_size
         self.max_seq_len = max_seq_len
         self.device = torch.device(device)
 
         self.seq_lens = {}
         self.timers = get_timers()
-        self.block_table = {}  # (seq_id, block_idx)
+        self.block_table: Dict[int, List[int]] = {}  # (seq_id, block_idx)
         self.curr_seq_lens_gpu_excl_this_decode = StaticTensor(
             max_nelem=num_hot_req, dtype=torch.int32, device=self.device
         )
@@ -72,11 +73,9 @@ class PagedKVCacheManager:
             max_nelem=num_hot_req, dtype=torch.int32, device=self.device
         )
         self.gpu_block_table = StaticTensor(
-            max_nelem=self.num_blocks, dtype=torch.int32, device=self.device
+            max_nelem=self.max_num_blocks, dtype=torch.int32, device=self.device
         )
-        # TODO: For better performance, use list instead of set for free_blocks
-        self.free_blocks = set(range(self.num_blocks))
-
+        self.free_blocks = deque(range(self.num_blocks))
         if self.k_shape_per_sample is not None:
             self.paged_k_cache = torch.zeros(
                 (self.num_layers, self.num_blocks, block_size)
@@ -93,16 +92,41 @@ class PagedKVCacheManager:
             )
         else:
             self.paged_v_cache = None
+        self.reallocate_cache = False
 
     def get_block_size(self):
         return self.block_size
 
     def get_num_blocks(self):
-        return self.num_blocks
+        return self.max_num_blocks
 
     # Init block table and kv cache with kv generated during prefill
     def finalize_cache_bylayer_prefill(self, xk, xv, req_ids, varlen, layer_id):
         self.timers("cache_finalize_cache_all_prefill").start()
+
+        # reallocate cache blocks according to available memory
+        if not self.reallocate_cache:
+            infer_args = get_global_args().infer
+            if infer_args.num_blocks != -1 and infer_args.num_blocks != self.num_blocks:
+                self.num_blocks = min(infer_args.num_blocks, self.max_num_blocks)
+                self.free_blocks = deque(range(self.num_blocks))
+                if self.paged_k_cache is not None:
+                    del self.paged_k_cache
+                    torch.cuda.empty_cache()
+                    self.paged_k_cache = torch.zeros(
+                        (self.num_layers, self.num_blocks, self.block_size)
+                        + self.k_shape_per_sample,
+                        device=self.device,
+                    )
+                if self.paged_v_cache is not None:
+                    del self.paged_v_cache
+                    torch.cuda.empty_cache()
+                    self.paged_v_cache = torch.zeros(
+                        (self.num_layers, self.num_blocks, self.block_size)
+                        + self.v_shape_per_sample,
+                        device=self.device,
+                    )
+                self.reallocate_cache = True
 
         if (
             get_global_args().infer.attn_type == "npu"
@@ -162,7 +186,6 @@ class PagedKVCacheManager:
         for req_id in req_ids:
             seq_len = self.seq_lens[req_id]
             seq_lens.append(seq_len)
-        max_seq = max(seq_lens)
         self.curr_seq_lens = seq_lens
         self.curr_seq_lens_gpu_excl_this_decode.set(
             torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
@@ -175,9 +198,8 @@ class PagedKVCacheManager:
         # TODO: When run out of free blocks, use scheduling and preemption in paper instead of exception
         self.timers("get_free_block").start()
         if len(self.free_blocks) == 0:
-            raise Exception("No more free blocks.")
-        idx = list(self.free_blocks)[0]
-        self.free_blocks.remove(idx)
+            raise Exception(f"No more free blocks.")
+        idx = self.free_blocks.popleft()
         self.timers("get_free_block").stop()
         return idx
 
@@ -206,8 +228,9 @@ class PagedKVCacheManager:
     def free_req_cache_blocks(self, req_id):
         self.timers("free_req_cache_blocks").start()
         for block in self.block_table[req_id]:
-            self.free_blocks.add(block)
+            self.free_blocks.append(block)
         del self.block_table[req_id]
+        del self.seq_lens[req_id]
         self.timers("free_req_cache_blocks").stop()
 
     # Prepare enough block table for next decoding. When decoding, flash attention will fill new kv into paged kv cache (inplace).
@@ -241,7 +264,6 @@ class PagedKVCacheManager:
         self.timers("finalize_cache_all_decode").start()
         assert req_id in self.seq_lens
         assert req_id in self.block_table
-        del self.seq_lens[req_id]
         self.free_req_cache_blocks(req_id)
         self.curr_varlens = None
         self.curr_req_ids = None

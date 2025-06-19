@@ -306,6 +306,7 @@ class Backend:
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=args.infer.max_reqs,
                 block_size=block_size,
+                num_blocks=args.infer.num_blocks,
                 device=local_rank,
                 **kv_cache_kvargs,
             )
