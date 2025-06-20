@@ -147,39 +147,39 @@ class GPTQLinear(QuantizedLinearBase):
         self.in_features = in_features
         self.out_features = out_features
 
-        self.register_buffer(
-            "qweight",
+        self.qweight = torch.nn.Parameter(
             torch.empty(
                 self.in_features // self.pack_factor,
                 self.out_features,
                 dtype=torch.int32,
             ),
+            requires_grad=False,
         )
 
-        self.register_buffer(
-            "g_idx",
+        self.g_idx = torch.nn.Parameter(
             torch.empty(
                 self.in_features,
                 dtype=torch.int32,
             ),
+            requires_grad=False,
         )
 
-        self.register_buffer(
-            "scales",
+        self.scales = torch.nn.Parameter(
             torch.empty(
                 self.in_features // self.group_size,
                 self.out_features,
                 dtype=torch.float16,
             ),
+            requires_grad=False,
         )
 
-        self.register_buffer(
-            "qzeros",
+        self.qzeros = torch.nn.Parameter(
             torch.empty(
                 self.in_features // self.group_size,
                 self.out_features // self.pack_factor,
                 dtype=torch.int32,
             ),
+            requires_grad=False,
         )
 
         self.pinit = False
@@ -188,8 +188,9 @@ class GPTQLinear(QuantizedLinearBase):
         self.is_k_full = marlin_is_k_full(self.desc_act, is_row_parallel=False)
 
         if has_bias:
-            self.register_buffer(
-                "bias", torch.zeros((self.out_features), dtype=torch.float16)
+            self.bias = torch.nn.Parameter(
+                torch.zeros((self.out_features), dtype=torch.float16),
+                requires_grad=False,
             )
         else:
             self.bias = None

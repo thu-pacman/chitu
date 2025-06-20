@@ -34,6 +34,7 @@ from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
 from chitu.utils import compute_layer_dist_in_pipe, parse_dtype, try_import_opt_dep
 from chitu.quantization import QuantizationRegistry
 from chitu.custom_gguf import *
+from chitu.hybrid_device import CPUParameter
 from chitu.models.registry import ModelType, get_model_class
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
@@ -410,6 +411,21 @@ class Backend:
             raise ValueError(f"Unknown attn type {args.infer.attn_type}")
 
     @staticmethod
+    def _move_one_module_to_device(m: torch.nn.Module):
+        # NOTE: m._parameters contains parameters in this module (non-recursive),
+        # while m.parameters() returns all parameters in this module and its submodules
+        # (recursive).
+        for key in m._parameters:
+            param = m._parameters[key]
+            if param is not None:
+                if not isinstance(param, CPUParameter):
+                    param.data = param.data.cuda()
+        for key in m._buffers:
+            buffer = m._buffers[key]
+            if buffer is not None:
+                m._buffers[key] = buffer.cuda()
+
+    @staticmethod
     def _build_and_setup_model(args, attn_backend):
         """
         Build model architecture, load checkpoints, and apply quantization.
@@ -429,8 +445,8 @@ class Backend:
             Backend._load_checkpoint(model, args)
 
         # Move model to appropriate device
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        Backend.model = model.to(local_rank)
+        model.apply(Backend._move_one_module_to_device)
+        Backend.model = model
         Backend.args = args
 
         gc.collect()
@@ -729,7 +745,7 @@ def load_gguf_deepseek_v3_gguf(
         assign=args.keep_dtype_in_checkpoint,
         skip_preprocess=args.skip_preprocess,
     )
-    model = model.to(local_rank)
+    model.apply(Backend._move_one_module_to_device)
     del checkpoint0
     gc.collect()
     torch.cuda.empty_cache()
@@ -751,7 +767,6 @@ def load_gguf_deepseek_v3_gguf(
             assign=args.keep_dtype_in_checkpoint,
             skip_preprocess=args.skip_preprocess,
         )
-        # model = model.to(local_rank)
         del checkpoint
         gc.collect()
         torch.cuda.empty_cache()
@@ -1173,13 +1188,13 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                     "layers." + str(layer_id) + ".mlp.experts.gguf_down_proj"
                 ] = down_proj
                 state_dict["layers." + str(layer_id) + ".mlp.experts.gate_type"] = (
-                    torch.tensor(gate_type).view(1)
+                    torch.tensor(gate_type)
                 )
                 state_dict["layers." + str(layer_id) + ".mlp.experts.up_type"] = (
-                    torch.tensor(up_type).view(1)
+                    torch.tensor(up_type)
                 )
                 state_dict["layers." + str(layer_id) + ".mlp.experts.down_type"] = (
-                    torch.tensor(down_type).view(1)
+                    torch.tensor(down_type)
                 )
 
     return state_dict

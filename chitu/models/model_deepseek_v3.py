@@ -45,13 +45,15 @@ from chitu.tensor_parallel import (
     get_tp_rank,
     get_tp_size,
 )
+from chitu.hybrid_device import CPUParameter
 from chitu.utils import parse_dtype, try_import_opt_dep
-
-logger = getLogger(__name__)
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
 torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
+
+
+logger = getLogger(__name__)
 
 
 class ParallelAbsorbGemm(torch.nn.Module):
@@ -836,11 +838,6 @@ class MoEDeepSeekV3CPU(ParallelMoeBlock):
             non_fused_shared_experts=non_fused_shared_experts,
         )
 
-    def to(self, *args, **kwargs):
-        self.gate.to(*args, **kwargs)
-        if self.shared_experts is not None:
-            self.shared_experts.to(*args, **kwargs)
-
 
 class MoeExpertsDeepSeekV3CPU(nn.Module):
     def __init__(
@@ -875,81 +872,71 @@ class MoeExpertsDeepSeekV3CPU(nn.Module):
 
         if self.rank == 0:
 
-            self.register_buffer(
-                "gguf_gate_proj",
+            self.gguf_gate_proj = CPUParameter(
                 torch.empty(
                     int(256 * 2048 * 7168 / 256 * 144),
                     dtype=torch.uint8,
                     device="cpu",
-                    requires_grad=False,
                 ),
+                requires_grad=False,
             )
-            self.register_buffer(
-                "gguf_up_proj",
+            self.gguf_up_proj = CPUParameter(
                 torch.empty(
                     int(256 * 2048 * 7168 / 256 * 144),
                     dtype=torch.uint8,
                     device="cpu",
-                    requires_grad=False,
                 ),
+                requires_grad=False,
             )
             if ggml_type == 12:
-                self.register_buffer(
-                    "gguf_down_proj",
+                self.gguf_down_proj = CPUParameter(
                     torch.empty(
                         int(256 * 2048 * 7168 / 256 * 144),
                         dtype=torch.uint8,
                         device="cpu",
-                        requires_grad=False,
                     ),
+                    requires_grad=False,
                 )
             elif ggml_type == 14:
-                self.register_buffer(
-                    "gguf_down_proj",
+                self.gguf_down_proj = CPUParameter(
                     torch.empty(
                         int(256 * 2048 * 7168 / 256 * 210),
                         dtype=torch.uint8,
                         device="cpu",
-                        requires_grad=False,
                     ),
+                    requires_grad=False,
                 )
             else:
                 raise ValueError("ggml quantization type unimplemented !")
 
-            self.register_buffer(
-                "gate_type",
+            self.gate_type = CPUParameter(
                 torch.empty(
-                    1,
+                    (),
                     dtype=torch.int,
                     device="cpu",
-                    requires_grad=False,
                 ),
+                requires_grad=False,
             )
-            self.register_buffer(
-                "up_type",
+            self.up_type = CPUParameter(
                 torch.empty(
-                    1,
+                    (),
                     dtype=torch.int,
                     device="cpu",
-                    requires_grad=False,
                 ),
+                requires_grad=False,
             )
-            self.register_buffer(
-                "down_type",
+            self.down_type = CPUParameter(
                 torch.empty(
-                    1,
+                    (),
                     dtype=torch.int,
                     device="cpu",
-                    requires_grad=False,
                 ),
+                requires_grad=False,
             )
 
         self.stride = 64
         self.cpu_infer = cpu_infer
         self.moe = None
-
-    def to(self, *args, **kwargs):
-        return self  # Do nothing
 
     def init_weights(self):
         if self.rank == 0:
@@ -1147,13 +1134,6 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         self.input_layernorm = RMSNorm(args.dim)
         self.post_attention_layernorm = RMSNorm(args.dim)
 
-    def to(self, *args, **kwargs):
-        self.self_attn.to(*args, **kwargs)
-        self.mlp.to(*args, **kwargs)
-        self.input_layernorm.to(*args, **kwargs)
-        self.post_attention_layernorm.to(*args, **kwargs)
-        return self
-
     def forward(
         self,
         x: torch.Tensor,
@@ -1202,17 +1182,6 @@ class TransformerDeepSeekV3(Transformer):
             op_impl=op_impl,
             mla_absorb=mla_absorb,
         )
-
-    def to(self, *args, **kwargs):
-        if hasattr(self, "embed_tokens"):
-            self.embed_tokens.to(*args, **kwargs)
-        if hasattr(self, "norm"):
-            self.norm.to(*args, **kwargs)
-        if hasattr(self, "lm_head"):
-            self.lm_head.to(*args, **kwargs)
-        for l in self.layers:
-            l.to(*args, **kwargs)
-        return self
 
     @override
     def _get_tensor_column_parallel_layer_names(self) -> List[str]:
