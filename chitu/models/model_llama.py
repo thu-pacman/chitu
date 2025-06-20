@@ -6,6 +6,7 @@ from torch import nn
 
 from chitu.attn_backend import AttnBackend
 from chitu.models.model import Attention, RMSNorm, Transformer, TransformerBlock
+from chitu.models.registry import ModelType, register_model
 from chitu.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -60,6 +61,7 @@ class AttentionLlama(Attention):
         return self.wo(x)
 
 
+@register_model(ModelType.LLAMA)
 class TransformerLlama(Transformer):
     def __init__(
         self,

@@ -1,78 +1,59 @@
-import math
-import functools
-from logging import getLogger
-from typing import Any, List, Mapping, Optional, Set, Tuple
-import re
 import ctypes
+import math
+import re
+from logging import getLogger
+from typing import Any, List, Mapping, Optional
 
 import torch
-import torch.distributed as dist
 import torch.distributed
 import torch.nn.functional as F
 from torch import nn
 from typing_extensions import override
 
-from chitu.layers.gate import fused_sigmoid_gate
 from chitu.attn_backend import AttnBackend
-from chitu.cache_manager import PagedKVCacheManager
-from chitu.device_type import (
-    get_device_name,
-    is_muxi,
-    is_nvidia,
-)
 from chitu.global_vars import get_global_args
 from chitu.models.model import (
     Attention,
+    MoeGate,
+    ParallelMoeBlock,
     RMSNorm,
     Transformer,
     TransformerBlock,
-    MoeGate,
-    ParallelMoeBlock,
+)
+from chitu.models.registry import ModelType, register_model
+from chitu.muxi_utils import (
+    Blockfp8LinearLayoutContigXContigY,
+    LinearLayoutContigXContigY,
+    preprocess_weights_for_native_layout,
 )
 from chitu.ops import (
     apply_rotary_pos_emb,
+    quant_einsum_shc_hdc_shd,
+    silu_and_mul,
     weight_dequant_deepseek_v3,
     weight_dequant_soft_fp8_deepseek_v3,
     weight_quant_deepseek_v3,
-    silu_and_mul,
-    quant_einsum_shc_hdc_shd,
 )
+from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
+from chitu.static_tensor import StaticTensor
 from chitu.tensor_parallel import (
-    LocalLinear,
     ColumnParallelLinear,
+    LocalLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
     get_tp_group,
     get_tp_rank,
     get_tp_size,
 )
-
-from chitu.muxi_utils import (
-    LinearLayoutContigXContigY,
-    Blockfp8LinearLayoutContigXContigY,
-    linear_layout_contig_x_contig_y,
-    blockfp8_linear_layout_contig_x_contig_y,
-    preprocess_weights_for_native_layout,
-    get_muxi_padded_input,
-    grouped_topk,
-    muxi_fused_experts,
-)
-from chitu.utils import try_import_opt_dep, parse_dtype, ceil_div
-from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
-from chitu.static_tensor import StaticTensor
-
-
-logger = getLogger(__name__)
+from chitu.hybrid_device import CPUParameter
+from chitu.utils import parse_dtype, try_import_opt_dep
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
 torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
 
-if has_torch_npu:
-    from chitu.npu_utils import fused_experts_npu
 
-if has_triton:
-    from chitu.fused_moe import fused_experts
+logger = getLogger(__name__)
 
 
 class ParallelAbsorbGemm(torch.nn.Module):
@@ -819,20 +800,46 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
         )
 
 
-class MoEDeepSeekV3CPU(nn.Module):
-    """
-    Mixture-of-Experts (MoE) module.
+class MoEDeepSeekV3CPU(ParallelMoeBlock):
+    def __init__(
+        self,
+        args,
+        cpu_infer,
+        ggml_type,
+        checkpoint_prefix: str,
+        merge_qkv_gate_up: bool = False,
+    ):
+        if not get_global_args().infer.fuse_shared_experts:
+            quant = get_quant_from_checkpoint_prefix(
+                checkpoint_prefix, args.quant_config.rules
+            )
+            merge_gate_up = (
+                quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
+            )
+            non_fused_shared_experts = MLPDeepSeekV3(
+                args,
+                role="shared_experts",
+                merge_gate_up=merge_gate_up,
+                op_impl=get_global_args().infer.op_impl,
+                checkpoint_prefix=checkpoint_prefix,
+            )
+        else:
+            non_fused_shared_experts = None
 
-    Attributes:
-        dim (int): Dimensionality of input features.
-        n_routed_experts (int): Total number of experts in the model.
-        n_local_experts (int): Number of experts handled locally in distributed systems.
-        n_activated_experts (int): Number of experts activated for each input.
-        gate (nn.Module): Gating mechanism to route inputs to experts.
-        experts (nn.ModuleList): List of expert modules.
-        shared_experts (nn.Module): Shared experts applied to all inputs.
-    """
+        super().__init__(
+            gate=GateDeepSeekV3(args),
+            experts=MoeExpertsDeepSeekV3CPU(
+                args,
+                cpu_infer=cpu_infer,
+                ggml_type=ggml_type,
+                checkpoint_prefix=checkpoint_prefix,
+                merge_qkv_gate_up=merge_qkv_gate_up,
+            ),
+            non_fused_shared_experts=non_fused_shared_experts,
+        )
 
+
+class MoeExpertsDeepSeekV3CPU(nn.Module):
     def __init__(
         self,
         args,
@@ -851,8 +858,6 @@ class MoEDeepSeekV3CPU(nn.Module):
         self.args = args
         self.merge_qkv_gate_up = merge_qkv_gate_up
         self.dim = args.dim
-        self.tp_group = get_tp_group()
-        self.tp_size = get_tp_size()
         self.rank = get_tp_rank()
 
         moe_world_size = 1
@@ -864,130 +869,74 @@ class MoEDeepSeekV3CPU(nn.Module):
         self.n_routed_experts = args.n_routed_experts
         self.n_local_experts = args.n_routed_experts // moe_world_size
         self.n_activated_experts = args.n_activated_experts
-        self.gate = GateDeepSeekV3(args)
-        if self.merge_qkv_gate_up:
-            self.gate_up_proj = ColumnParallelLinear(
-                args.dim,
-                args.moe_inter_dim * 2,
-                has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.bfloat16,
-                gather_output=False,
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
-            )
-        else:
-            self.gate_proj = ColumnParallelLinear(
-                args.dim,
-                args.moe_inter_dim,
-                has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.bfloat16,
-                gather_output=False,
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
-            )
-            self.up_proj = ColumnParallelLinear(
-                args.dim,
-                args.moe_inter_dim,
-                has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.bfloat16,
-                gather_output=False,
-                checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
-            )
-        self.down_proj = RowParallelLinear(
-            args.moe_inter_dim,
-            args.dim,
-            has_bias=False,
-            dtype=parse_dtype(args.main_weight_dtype),
-            bias_dtype=torch.bfloat16,
-            input_is_parallel=True,
-            checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
-        )
 
         if self.rank == 0:
 
-            self.register_buffer(
-                "gguf_gate_proj",
+            self.gguf_gate_proj = CPUParameter(
                 torch.empty(
                     int(256 * 2048 * 7168 / 256 * 144),
                     dtype=torch.uint8,
                     device="cpu",
-                    requires_grad=False,
                 ),
+                requires_grad=False,
             )
-            self.register_buffer(
-                "gguf_up_proj",
+            self.gguf_up_proj = CPUParameter(
                 torch.empty(
                     int(256 * 2048 * 7168 / 256 * 144),
                     dtype=torch.uint8,
                     device="cpu",
-                    requires_grad=False,
                 ),
+                requires_grad=False,
             )
             if ggml_type == 12:
-                self.register_buffer(
-                    "gguf_down_proj",
+                self.gguf_down_proj = CPUParameter(
                     torch.empty(
                         int(256 * 2048 * 7168 / 256 * 144),
                         dtype=torch.uint8,
                         device="cpu",
-                        requires_grad=False,
                     ),
+                    requires_grad=False,
                 )
             elif ggml_type == 14:
-                self.register_buffer(
-                    "gguf_down_proj",
+                self.gguf_down_proj = CPUParameter(
                     torch.empty(
                         int(256 * 2048 * 7168 / 256 * 210),
                         dtype=torch.uint8,
                         device="cpu",
-                        requires_grad=False,
                     ),
+                    requires_grad=False,
                 )
             else:
                 raise ValueError("ggml quantization type unimplemented !")
 
-            self.register_buffer(
-                "gate_type",
+            self.gate_type = CPUParameter(
                 torch.empty(
-                    1,
+                    (),
                     dtype=torch.int,
                     device="cpu",
-                    requires_grad=False,
                 ),
+                requires_grad=False,
             )
-            self.register_buffer(
-                "up_type",
+            self.up_type = CPUParameter(
                 torch.empty(
-                    1,
+                    (),
                     dtype=torch.int,
                     device="cpu",
-                    requires_grad=False,
                 ),
+                requires_grad=False,
             )
-            self.register_buffer(
-                "down_type",
+            self.down_type = CPUParameter(
                 torch.empty(
-                    1,
+                    (),
                     dtype=torch.int,
                     device="cpu",
-                    requires_grad=False,
                 ),
+                requires_grad=False,
             )
 
         self.stride = 64
         self.cpu_infer = cpu_infer
         self.moe = None
-
-    def to(self, *args, **kwargs):
-        self.gate.to(*args, **kwargs)
-        if self.merge_qkv_gate_up:
-            self.gate_up_proj.to(*args, **kwargs)
-        else:
-            self.gate_proj.to(*args, **kwargs)
-            self.up_proj.to(*args, **kwargs)
-        self.down_proj.to(*args, **kwargs)
-        return self
 
     def init_weights(self):
         if self.rank == 0:
@@ -1062,21 +1011,23 @@ class MoEDeepSeekV3CPU(nn.Module):
                 dtype=torch.bfloat16,
             )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
         """
         Forward pass for the MoE module.
 
         Args:
             x (torch.Tensor): Input tensor.
+            weights (torch.Tensor): Routing weights from the gate.
+            indices (torch.Tensor): Indices of the selected experts.
 
         Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
+            torch.Tensor: Output tensor.
         """
         shape = x.size()
 
         if self.rank == 0:
-            x_flat = x.view(-1, self.dim)
-            weights, indices = self.gate(x_flat)
             indices = indices.contiguous().to(torch.int64)
             weights = weights.contiguous().to(torch.float32)
             if x.shape[1] > 1:
@@ -1115,32 +1066,19 @@ class MoEDeepSeekV3CPU(nn.Module):
                     ),
                 )
 
-        if self.merge_qkv_gate_up:
-            gate_up_proj_out = self.gate_up_proj(x)
-            gate_proj_out, up_proj_out = torch.split(
-                gate_up_proj_out, gate_up_proj_out.shape[-1] // 2, dim=-1
-            )
-        else:
-            gate_proj_out = self.gate_proj(x)
-            up_proj_out = self.up_proj(x)
-        y = self.down_proj(F.silu(gate_proj_out) * up_proj_out)
-
         if self.rank == 0:
             if x.shape[1] > 1:
                 self.cpu_infer.sync()
-                output = output.to(x.device, non_blocking=True).view(shape)
-                y += output
+                y = output.to(x.device, non_blocking=True).view(shape)
             else:
                 self.cpu_infer.sync_with_cuda_stream(
                     torch.cuda.current_stream().cuda_stream
                 )
                 self.output_gpu.get().copy_(self.output_cpu.get(), non_blocking=True)
-                y += self.output_gpu.get()
-            y_scatter = [y] * self.tp_size
+                y = self.output_gpu.get()
         else:
-            y_scatter = None
+            y = torch.zeros_like(x)
 
-        torch.distributed.scatter(y, y_scatter, src=0)
         return y.view(shape)
 
 
@@ -1196,13 +1134,6 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         self.input_layernorm = RMSNorm(args.dim)
         self.post_attention_layernorm = RMSNorm(args.dim)
 
-    def to(self, *args, **kwargs):
-        self.self_attn.to(*args, **kwargs)
-        self.mlp.to(*args, **kwargs)
-        self.input_layernorm.to(*args, **kwargs)
-        self.post_attention_layernorm.to(*args, **kwargs)
-        return self
-
     def forward(
         self,
         x: torch.Tensor,
@@ -1220,6 +1151,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         return x
 
 
+@register_model(ModelType.DEEPSEEK_V3)
 class TransformerDeepSeekV3(Transformer):
     def __init__(
         self,
@@ -1250,17 +1182,6 @@ class TransformerDeepSeekV3(Transformer):
             op_impl=op_impl,
             mla_absorb=mla_absorb,
         )
-
-    def to(self, *args, **kwargs):
-        if hasattr(self, "embed_tokens"):
-            self.embed_tokens.to(*args, **kwargs)
-        if hasattr(self, "norm"):
-            self.norm.to(*args, **kwargs)
-        if hasattr(self, "lm_head"):
-            self.lm_head.to(*args, **kwargs)
-        for l in self.layers:
-            l.to(*args, **kwargs)
-        return self
 
     @override
     def _get_tensor_column_parallel_layer_names(self) -> List[str]:
@@ -1314,7 +1235,7 @@ class TransformerDeepSeekV3(Transformer):
                 new_checkpoint[prefix + f"experts.{w}.{part}"] = torch.stack(
                     parts, dim=0
                 )
-            elif ".experts." in k:
+            elif re.search(r"\.experts\.\d+", k):
                 continue
             elif fuse_shared_experts and ".shared_experts." in k:
                 continue

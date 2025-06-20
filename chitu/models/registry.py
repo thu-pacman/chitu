@@ -1,0 +1,33 @@
+from typing import Union
+from enum import Enum
+
+_model_registry = {}
+
+
+class ModelType(str, Enum):
+    DEEPSEEK_V3 = "deepseek-v3"
+    HF_LLAMA = "hf-llama"
+    HF_MIXTRAL = "hf-mixtral"
+    LLAMA = "llama"
+
+
+def register_model(name: Union[str, ModelType]):
+    def decorator(cls):
+        name_str = str(name)
+        if name_str in _model_registry:
+            print(f"Warning: Model with name '{name_str}' is being re-registered.")
+        _model_registry[name_str] = cls
+        return cls
+
+    return decorator
+
+
+def get_model_class(name: Union[str, ModelType]):
+    name_str = str(name)
+    model_class = _model_registry.get(name_str)
+    if model_class is None:
+        raise ValueError(
+            f"No model registered with name '{name_str}'. "
+            f"Available models: {list(_model_registry.keys())}"
+        )
+    return model_class
