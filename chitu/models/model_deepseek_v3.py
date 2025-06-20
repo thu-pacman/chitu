@@ -1,78 +1,56 @@
-import math
-import functools
-from logging import getLogger
-from typing import Any, List, Mapping, Optional, Set, Tuple
-import re
 import ctypes
+import math
+from logging import getLogger
+from typing import Any, List, Mapping, Optional
 
 import torch
-import torch.distributed as dist
 import torch.distributed
 import torch.nn.functional as F
 from torch import nn
 from typing_extensions import override
 
-from chitu.layers.gate import fused_sigmoid_gate
 from chitu.attn_backend import AttnBackend
-from chitu.cache_manager import PagedKVCacheManager
-from chitu.device_type import (
-    get_device_name,
-    is_muxi,
-    is_nvidia,
-)
 from chitu.global_vars import get_global_args
 from chitu.models.model import (
     Attention,
+    MoeGate,
+    ParallelMoeBlock,
     RMSNorm,
     Transformer,
     TransformerBlock,
-    MoeGate,
-    ParallelMoeBlock,
+)
+from chitu.models.registry import ModelType, register_model
+from chitu.muxi_utils import (
+    Blockfp8LinearLayoutContigXContigY,
+    LinearLayoutContigXContigY,
+    preprocess_weights_for_native_layout,
 )
 from chitu.ops import (
     apply_rotary_pos_emb,
+    quant_einsum_shc_hdc_shd,
+    silu_and_mul,
     weight_dequant_deepseek_v3,
     weight_dequant_soft_fp8_deepseek_v3,
     weight_quant_deepseek_v3,
-    silu_and_mul,
-    quant_einsum_shc_hdc_shd,
 )
+from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
+from chitu.static_tensor import StaticTensor
 from chitu.tensor_parallel import (
-    LocalLinear,
     ColumnParallelLinear,
+    LocalLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
     get_tp_group,
     get_tp_rank,
     get_tp_size,
 )
-
-from chitu.muxi_utils import (
-    LinearLayoutContigXContigY,
-    Blockfp8LinearLayoutContigXContigY,
-    linear_layout_contig_x_contig_y,
-    blockfp8_linear_layout_contig_x_contig_y,
-    preprocess_weights_for_native_layout,
-    get_muxi_padded_input,
-    grouped_topk,
-    muxi_fused_experts,
-)
-from chitu.utils import try_import_opt_dep, parse_dtype, ceil_div
-from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
-from chitu.static_tensor import StaticTensor
-
+from chitu.utils import parse_dtype, try_import_opt_dep
 
 logger = getLogger(__name__)
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
 torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
-
-if has_torch_npu:
-    from chitu.npu_utils import fused_experts_npu
-
-if has_triton:
-    from chitu.fused_moe import fused_experts
 
 
 class ParallelAbsorbGemm(torch.nn.Module):
@@ -1192,6 +1170,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         return x
 
 
+@register_model(ModelType.DEEPSEEK_V3)
 class TransformerDeepSeekV3(Transformer):
     def __init__(
         self,

@@ -14,7 +14,6 @@ from tqdm import tqdm, trange
 import torch
 import torch.distributed as dist
 from safetensors.torch import safe_open
-from transformers import AutoModelForCausalLM
 
 from chitu.attn_backend import (
     FlashAttnBackend,
@@ -30,16 +29,12 @@ from chitu.cache_manager import (
     KVCacheManagerSkewAware,
     PagedKVCacheManager,
 )
-from chitu.models.model_deepseek_v3 import TransformerDeepSeekV3
-from chitu.models.model_hf_llama import TransformerHFLlama
-from chitu.models.model_hf_mixtral import TransformerHFMixtral
-from chitu.models.model_llama import TransformerLlama
-from chitu.tensor_parallel import get_tp_size, init_tp
+from chitu.tensor_parallel import init_tp
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
 from chitu.utils import compute_layer_dist_in_pipe, parse_dtype, try_import_opt_dep
-from chitu.global_vars import get_global_args
 from chitu.quantization import QuantizationRegistry
 from chitu.custom_gguf import *
+from chitu.models.registry import ModelType, get_model_class
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
@@ -85,18 +80,18 @@ class Backend:
 
     @staticmethod
     def build_model(args, cache, *extra_args, **extra_kwargs):
-        if args.type == "hf-llama":
-            if args.name.startswith("glm"):
-                extra_kwargs["rotary_type"] = "glm4"
-            return TransformerHFLlama(args, cache, *extra_args, **extra_kwargs)
-        elif args.type == "hf-mixtral":
-            return TransformerHFMixtral(args, cache, *extra_args, **extra_kwargs)
-        elif args.type == "llama":
-            return TransformerLlama(args, cache, *extra_args, **extra_kwargs)
-        elif args.type == "deepseek-v3":
-            return TransformerDeepSeekV3(args, cache, *extra_args, **extra_kwargs)
-        else:
-            assert False, f"Unknown model type {args.models.type}"
+        try:
+            model_type = ModelType(args.type)
+        except ValueError:
+            raise ValueError(
+                f"Model type '{args.type}' is not supported. "
+                f"Available types: {[t.value for t in ModelType]}"
+            )
+
+        model_cls = get_model_class(model_type)
+        if args.name.startswith("glm"):
+            extra_kwargs["rotary_type"] = "glm4"
+        return model_cls(args, cache, *extra_args, **extra_kwargs)
 
     # FIXME: When cache type is "skew", gloo backend cannot be used.
     @staticmethod

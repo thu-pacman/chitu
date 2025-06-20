@@ -1,32 +1,30 @@
 import itertools
-import math
 import os
 import re
-import functools
-from dataclasses import dataclass
 from logging import getLogger
-from pathlib import Path
-from typing import Any, List, Mapping, Optional, Dict, Type, Set
+from typing import Any, List, Mapping, Optional
+
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
 from chitu.attn_backend import AttnBackend
 from chitu.cache_manager import PagedKVCacheManager
-from chitu.global_vars import get_global_args, get_timers, set_global_variables
-from chitu.muxi_utils import has_tbsgemm, tbsgemm
-from chitu.ops import apply_rotary_pos_emb, rms_norm, topk_softmax
-from chitu.tensor_parallel import get_tp_group, get_tp_rank, get_tp_size
-from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
-from chitu.utils import VarLens, compute_layer_dist_in_pipe, is_layer, ceil_div
 from chitu.cuda_graph import make_dispatched_graphed_callables
-from chitu.device_type import is_muxi, get_device_name, is_nvidia, is_ascend
-from chitu.utils import try_import_opt_dep, parse_dtype
-from chitu.muxi_utils import grouped_topk
+from chitu.device_type import is_ascend, is_muxi, is_nvidia
+from chitu.global_vars import get_global_args, get_timers
 from chitu.layers.gate import fused_sigmoid_gate
-from chitu.quantization import QuantizationRegistry, QuantizedMoeExpertsBase
+from chitu.muxi_utils import has_tbsgemm, grouped_topk, tbsgemm
+from chitu.ops import apply_rotary_pos_emb, rms_norm, topk_softmax
+from chitu.tensor_parallel import get_tp_group, get_tp_size
+from chitu.utils import (
+    VarLens,
+    compute_layer_dist_in_pipe,
+    is_layer,
+    try_import_opt_dep,
+)
+from chitu.quantization import QuantizedMoeExpertsBase
 
 torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")

@@ -1,13 +1,14 @@
-from logging import getLogger
-from typing import Dict, Mapping, Tuple, Optional, Type, Set, List, Any
 import math
 import re
+from logging import getLogger
+from typing import Any, List, Mapping, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from chitu.attn_backend import AttnBackend
+from chitu.global_vars import get_global_args
 from chitu.models.model import (
     Attention,
     RMSNorm,
@@ -16,23 +17,22 @@ from chitu.models.model import (
     MoeGate,
     ParallelMoeBlock,
 )
+from chitu.models.registry import ModelType, register_model
 from chitu.muxi_utils import (
+    Blockfp8LinearLayoutContigXContigY,
     LinearLayoutContigXContigY,
     LinearLayoutContigXNativeY,
     LinearLayoutNativeXContigY,
-    Blockfp8LinearLayoutContigXContigY,
     preprocess_weights_for_native_layout,
 )
 from chitu.ops import apply_rotary_pos_emb, silu_and_mul
+from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
 from chitu.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
     get_tp_size,
-    get_tp_rank,
 )
-from chitu.global_vars import get_global_args
-from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
 
 logger = getLogger(__name__)
 
@@ -617,6 +617,7 @@ class TransformerBlockHFGlm4(TransformerBlock):
         return out
 
 
+@register_model(ModelType.HF_LLAMA)
 class TransformerHFLlama(Transformer):
     def __init__(
         self,

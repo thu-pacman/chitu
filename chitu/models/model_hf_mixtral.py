@@ -1,5 +1,4 @@
 import functools
-import re
 from typing import Any, List, Mapping
 
 import torch
@@ -11,7 +10,8 @@ from chitu.models.model_hf_llama import (
     TransformerBlockHFLlama,
     TransformerHFLlama,
 )
-from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear
+from chitu.models.registry import ModelType, register_model
+from chitu.tensor_parallel import RowParallelLinear
 
 
 class FeedForwardExpertHFMixtral(FeedForwardHFLlama):
@@ -132,6 +132,7 @@ class TransformerBlockHFMixtral(TransformerBlockHFLlama):
         )
 
 
+@register_model(ModelType.HF_MIXTRAL)
 class TransformerHFMixtral(TransformerHFLlama):
     def __init__(
         self,
