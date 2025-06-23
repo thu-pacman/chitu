@@ -410,39 +410,9 @@ class Qwen3MoeGate(MoeGate):
         )
 
 
-class MoeExpertsQwen3MixIn:
-    def __init__(
-        self,
-        args,
-        op_impl: str,
-        layer_idx: int,
-        checkpoint_prefix: str,
-        merge_gate_up: bool,
-    ):
-        assert args.moe_intermediate_dim % get_tp_size() == 0
-        super().__init__(
-            dim=args.dim,
-            moe_inter_dim=args.moe_intermediate_dim // get_tp_size(),
-            n_routed_experts=(
-                args.num_experts if hasattr(args, "num_experts") else 128
-            ),
-            n_shared_experts=0,
-            n_activated_experts=0,
-            moe_world_size=1,
-            moe_rank=0,
-            op_impl=op_impl,
-            dtype=args.dtype if hasattr(args, "dtype") else "bfloat16",
-            fuse_shared_experts=False,
-            checkpoint_prefix=checkpoint_prefix,
-            merge_gate_up=merge_gate_up,
-        )
-        self.layer_idx = layer_idx
-
-
 def Qwen3MoeExperts(
     args,
     op_impl: str,
-    layer_idx: int,
     checkpoint_prefix: str,
     base_moe_experts_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
@@ -455,21 +425,21 @@ def Qwen3MoeExperts(
             )
         )
 
-    class MoeExpertsImpl(MoeExpertsQwen3MixIn, base_moe_experts_class):
-        # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
-        # of the final class, so we can append a class to the base class, to make it act like a
-        # further base class of the original base class.
-        # See https://docs.python.org/3/tutorial/classes.html#multiple-inheritance
-
-        pass
-
     quant = get_quant_from_checkpoint_prefix(checkpoint_prefix, args.quant_config.rules)
     merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
 
-    return MoeExpertsImpl(
-        args=args,
+    assert args.moe_intermediate_dim % get_tp_size() == 0
+    return base_moe_experts_class(
+        dim=args.dim,
+        moe_inter_dim=args.moe_intermediate_dim // get_tp_size(),
+        n_routed_experts=(args.num_experts if hasattr(args, "num_experts") else 128),
+        n_shared_experts=0,
+        n_activated_experts=0,
+        moe_world_size=1,
+        moe_rank=0,
         op_impl=op_impl,
-        layer_idx=layer_idx,
+        dtype=args.dtype if hasattr(args, "dtype") else "bfloat16",
+        fuse_shared_experts=False,
         checkpoint_prefix=f"{checkpoint_prefix}.moe",
         merge_gate_up=merge_gate_up,
     )
@@ -480,7 +450,6 @@ class ParallelMoeBlockQwen3(ParallelMoeBlock):
         self,
         args,
         op_impl: str,
-        layer_idx: int,
         checkpoint_prefix: str,
         base_moe_experts_class: Optional[type] = None,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
@@ -490,7 +459,6 @@ class ParallelMoeBlockQwen3(ParallelMoeBlock):
             experts=Qwen3MoeExperts(
                 args,
                 op_impl,
-                layer_idx,
                 checkpoint_prefix,
                 base_moe_experts_class,
                 quant_kwargs,
@@ -526,7 +494,6 @@ class TransformerBlockHFLlama(TransformerBlock):
             self.mlp = mlp_type(
                 args=args,
                 op_impl=op_impl,
-                layer_idx=layer_id,
                 checkpoint_prefix=f"{checkpoint_prefix}.mlp",
             )
         else:
@@ -966,7 +933,6 @@ class TransformerHFLlama(Transformer):
             for input_scale_list, pattern in zip(input_scale_lists, pattern_lists):
                 match = re.match(pattern, key)
                 if match:
-
                     layer_idx, expert_idx = map(int, match.groups())
                     input_scale_list[layer_idx][expert_idx] = checkpoint[key]
                     matched = True

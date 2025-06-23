@@ -701,31 +701,6 @@ class GateDeepSeekV3(MoeGate):
         )
 
 
-class MoeExpertsDeepSeekV3MixIn:
-    def __init__(
-        self,
-        args,
-        merge_gate_up: bool,
-        op_impl: str,
-        checkpoint_prefix: str,
-    ):
-        assert args.moe_inter_dim % get_tp_size() == 0
-        super().__init__(
-            dim=args.dim,
-            moe_inter_dim=args.moe_inter_dim // get_tp_size(),
-            n_routed_experts=args.n_routed_experts,
-            n_shared_experts=args.n_shared_experts,
-            n_activated_experts=args.n_activated_experts,
-            moe_world_size=1,
-            moe_rank=0,
-            dtype=args.main_weight_dtype,
-            op_impl=op_impl,
-            fuse_shared_experts=get_global_args().infer.fuse_shared_experts,
-            checkpoint_prefix=checkpoint_prefix,
-            merge_gate_up=merge_gate_up,
-        )
-
-
 def MoeExpertsDeepSeekV3(
     args,
     op_impl: str,
@@ -742,22 +717,23 @@ def MoeExpertsDeepSeekV3(
             )
         )
 
-    class MoeExpertsImpl(MoeExpertsDeepSeekV3MixIn, base_moe_experts_class):
-        # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
-        # of the final class, so we can append a class to the base class, to make it act like a
-        # further base class of the original base class.
-        # See https://docs.python.org/3/tutorial/classes.html#multiple-inheritance
-
-        pass
-
     quant = get_quant_from_checkpoint_prefix(checkpoint_prefix, args.quant_config.rules)
     merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
 
-    return MoeExpertsImpl(
-        args,
-        merge_gate_up=merge_gate_up,
+    assert args.moe_inter_dim % get_tp_size() == 0
+    return base_moe_experts_class(
+        dim=args.dim,
+        moe_inter_dim=args.moe_inter_dim // get_tp_size(),
+        n_routed_experts=args.n_routed_experts,
+        n_shared_experts=args.n_shared_experts,
+        n_activated_experts=args.n_activated_experts,
+        moe_world_size=1,
+        moe_rank=0,
+        dtype=args.main_weight_dtype,
         op_impl=op_impl,
+        fuse_shared_experts=get_global_args().infer.fuse_shared_experts,
         checkpoint_prefix=checkpoint_prefix,
+        merge_gate_up=merge_gate_up,
     )
 
 
