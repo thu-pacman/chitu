@@ -1,7 +1,7 @@
 # DeepSeek-R1-Q4_K_M is a data-type variant of DeepSeek-R1
 defaults:
   - DeepSeek-V3
-  - quant_config: gguf-blockfp8
+  - quant_config: blockfp8_attn_Q4KM_ffn
   - _self_ # Config in this file overrides configs in defaults
 
 # Access info

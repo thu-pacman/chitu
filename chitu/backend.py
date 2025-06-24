@@ -31,8 +31,12 @@ from chitu.cache_manager import (
 )
 from chitu.tensor_parallel import init_tp
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
-from chitu.utils import compute_layer_dist_in_pipe, parse_dtype, try_import_opt_dep
-from chitu.quantization import QuantizationRegistry
+from chitu.utils import (
+    compute_layer_dist_in_pipe,
+    parse_dtype,
+    try_import_opt_dep,
+)
+from chitu.quantization import QuantizationRegistry, utils
 from chitu.custom_gguf import *
 from chitu.hybrid_device import CPUParameter
 from chitu.models.registry import ModelType, get_model_class
@@ -77,7 +81,6 @@ class Backend:
     pp_stage = None
     pp_end_stage = None
     pp_main_rank = None
-    cpu_infer = None
 
     @staticmethod
     def build_model(args, cache, *extra_args, **extra_kwargs):
@@ -469,88 +472,9 @@ class Backend:
         if args.models.type == "deepseek-v3":
             QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up.append("blockfp4")
 
-        if args.models.type == "deepseek-v3" and args.models.quant_config.type in [
-            "gguf",
-            "gguf-blockfp8",
-        ]:
-            cpu_layer_num = (
-                args.cpu_layer_num if hasattr(args.models, "cpu_layer_num") else 58
-            )
-            Backend.cpu_infer = cpuinfer.CPUInfer(args.infer.bind_thread_to_cpu)
-            Backend.cpu_layers = list(range(61 - cpu_layer_num, 61))
-            Backend.ggml_type = [
-                0,
-                0,
-                0,
-                14,
-                14,
-                14,
-                14,
-                12,
-                12,
-                14,
-                12,
-                12,
-                14,
-                12,
-                12,
-                14,
-                12,
-                12,
-                14,
-                12,
-                12,
-                14,
-                12,
-                12,
-                14,
-                12,
-                12,
-                14,
-                12,
-                12,
-                14,
-                12,
-                12,
-                14,
-                12,
-                12,
-                14,
-                12,
-                12,
-                14,
-                12,
-                12,
-                14,
-                12,
-                12,
-                14,
-                12,
-                12,
-                14,
-                12,
-                12,
-                14,
-                12,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-            ]
-        else:
-            Backend.cpu_infer = None
-            Backend.cpu_layers = []
-            Backend.ggml_type = []
         model = Backend.build_model(
             args.models,
             Backend.cache_manager,
-            cpu_infer=Backend.cpu_infer,
-            cpu_layers=Backend.cpu_layers,
-            ggml_type=Backend.ggml_type,
             max_position_embeddings=args.infer.max_seq_len,
             pipeline_parallel_size=pipeline_parallel_size,
             model_parallel_size=model_parallel_size,
@@ -574,13 +498,11 @@ class Backend:
 
         if args.models.type == "deepseek-v3" and args.models.quant_config.type in [
             "gguf",
-            "gguf-blockfp8",
+            "q4km",
         ]:
             logger.info(f"loading gguf file : {args.models.ckpt_dir}")
             ds_gguf_loader = GGUFLoader(args.models.ckpt_dir)
-            load_gguf_deepseek_v3_gguf(
-                model, ds_gguf_loader, Backend.cpu_layers, 10, args
-            )
+            load_gguf_deepseek_v3_gguf(model, ds_gguf_loader, 10, args)
 
         else:
             if args.models.type == "llama":
@@ -649,7 +571,7 @@ class Backend:
         if quant_name in ["autoawq", "gptqmodel", "awq"]:
             params = load_state_dict(ckpt_dir)
             return remove_prefix(params, "model.")
-        elif quant_name in ["gguf", "gguf-blockfp8"]:
+        elif quant_name in ["gguf", "q4km"]:
             loader = GGUFLoader(ckpt_dir)
             return load_state_dict_llama_gguf_mlp_layers(loader, len(model.layers))
         else:
@@ -731,7 +653,7 @@ def memory_used():
 
 
 def load_gguf_deepseek_v3_gguf(
-    model, ds_gguf_loader: GGUFLoader, cpu_layers, layer_load_per_iter=10, args=None
+    model, ds_gguf_loader: GGUFLoader, layer_load_per_iter=10, args=None
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     logger.debug(f"loading layer : from 0 to 3")
@@ -749,7 +671,9 @@ def load_gguf_deepseek_v3_gguf(
     del checkpoint0
     gc.collect()
     torch.cuda.empty_cache()
-
+    cpu_layers = utils.collect_layers_by_type(
+        ["q4km", "gguf"], args.models.quant_config.rules
+    )
     for layer_id in range(3, 61, layer_load_per_iter):
         end_layer = min(61, layer_id + layer_load_per_iter)
         checkpoint = load_state_dict_deepseek_v3_gguf_moe_layer(

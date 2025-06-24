@@ -370,7 +370,7 @@ class Transformer(nn.Module):
 
     def _get_2d_out_x_in_tensor_names(self, quant) -> List[str]:
         ret = ["weight"]
-        if quant == "blockfp8" or quant == "gguf-blockfp8":
+        if quant == "blockfp8" or quant == "q4km":
             ret += ["scale"]
         elif quant == "blockfp4":
             ret += ["weight_scale", "weight_scale_2", "input_scale"]
@@ -568,8 +568,8 @@ class Transformer(nn.Module):
         """
         重命名专家权重结构的函数以消除冗余的 gate,up,down 层
         参数格式示例：
-        输入键：'layers.3.mlp.gate_proj.weight'
-        输出键：'layers.3.mlp.gate_proj_weight'
+        输入键：'layers.3.mlp.experts.gate_proj.weight'
+        输出键：'layers.3.mlp.experts.gate_proj_weight'
         """
         new_checkpoint = {}
         for key in checkpoint:

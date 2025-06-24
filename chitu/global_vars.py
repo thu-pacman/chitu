@@ -5,6 +5,7 @@ from functools import reduce
 import operator
 import torch
 from logging import getLogger
+from omegaconf import OmegaConf
 
 logger = getLogger(__name__)
 
@@ -51,8 +52,6 @@ def set_quant_variables(global_args=None):
 
     model_name = model_name.lower()
     if not hasattr(models, "quant_config"):
-        from omegaconf import OmegaConf
-
         OmegaConf.set_struct(models, False)
         models["quant_config"] = {"rules": [], "type": None}
         OmegaConf.set_struct(models, True)
@@ -76,9 +75,10 @@ def set_quant_variables(global_args=None):
                     rule_type = rule.get("type", None)
                     if not rule_type:
                         rule_type = quant_config["type"]
-                    quant_config["rules"].append(
-                        {"type": rule_type, "regex": rule.regex}
-                    )
+                    OmegaConf.set_struct(rule, False)
+                    rule.type = rule_type
+                    OmegaConf.set_struct(rule, True)
+                    quant_config["rules"].append(rule)
                 models.quant_config = quant_config
                 return
     models.quant_config = quant_config

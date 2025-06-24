@@ -2,6 +2,7 @@ from typing import Optional
 from logging import getLogger
 
 import torch
+import torch.nn.functional as F
 
 from chitu.quantization.registry import (
     QuantizedLinearBase,
@@ -79,7 +80,6 @@ def linear_block_fp8(
         return y.view(x_shape[:-1] + y.shape[-1:]).to(x_dtype)
 
 
-@QuantizationRegistry.register_linear("gguf-blockfp8")
 @QuantizationRegistry.register_linear("blockfp8")
 class Blockfp8Linear(QuantizedLinearBase):
     """

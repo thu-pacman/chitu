@@ -1,5 +1,0 @@
-quant: 
-- model: '.'
-  rules:
-    - regex : 'layers\.'
-      type : gguf-blockfp8
