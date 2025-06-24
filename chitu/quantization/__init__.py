@@ -12,3 +12,4 @@ from chitu.quantization.simple_w8a8 import W8A8Linear
 from chitu.quantization.simple_w8a8_muxi import W8A8MuxiLinear
 from chitu.quantization.blockfp8 import Blockfp8Linear, Blockfp8MoeExperts
 from chitu.quantization.blockfp4 import Blockfp4Linear, Blockfp4MoeExperts
+from chitu.quantization.q4km import MoeExpertsDeepSeekV3CPU

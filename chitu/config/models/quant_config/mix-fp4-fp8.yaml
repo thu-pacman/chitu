@@ -3,13 +3,9 @@ quant:
   rules:
     - regex : '\.gate_proj$'
       type : blockfp4
-      kwargs:
-        block_size : 16 
     - regex : '\.gate$'
       type : blockfp8
       kwargs:
         block_size : 128
     - regex : '^layers\.'
       type : blockfp4
-      kwargs:
-        block_size : 16

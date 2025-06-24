@@ -1,11 +1,9 @@
-import ctypes
 import math
 import re
 from logging import getLogger
 from typing import Any, List, Mapping, Optional
 
 import torch
-import torch.distributed
 import torch.nn.functional as F
 from torch import nn
 from typing_extensions import override
@@ -35,17 +33,13 @@ from chitu.ops import (
     weight_quant_deepseek_v3,
 )
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
-from chitu.static_tensor import StaticTensor
 from chitu.tensor_parallel import (
     ColumnParallelLinear,
     LocalLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
-    get_tp_group,
-    get_tp_rank,
     get_tp_size,
 )
-from chitu.hybrid_device import CPUParameter
 from chitu.utils import parse_dtype, try_import_opt_dep
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
@@ -776,288 +770,6 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
         )
 
 
-class MoEDeepSeekV3CPU(ParallelMoeBlock):
-    def __init__(
-        self,
-        args,
-        cpu_infer,
-        ggml_type,
-        checkpoint_prefix: str,
-        merge_qkv_gate_up: bool = False,
-    ):
-        if not get_global_args().infer.fuse_shared_experts:
-            quant = get_quant_from_checkpoint_prefix(
-                checkpoint_prefix, args.quant_config.rules
-            )
-            merge_gate_up = (
-                quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
-            )
-            non_fused_shared_experts = MLPDeepSeekV3(
-                args,
-                role="shared_experts",
-                merge_gate_up=merge_gate_up,
-                op_impl=get_global_args().infer.op_impl,
-                checkpoint_prefix=checkpoint_prefix,
-            )
-        else:
-            non_fused_shared_experts = None
-
-        super().__init__(
-            gate=GateDeepSeekV3(args),
-            experts=MoeExpertsDeepSeekV3CPU(
-                args,
-                cpu_infer=cpu_infer,
-                ggml_type=ggml_type,
-                checkpoint_prefix=checkpoint_prefix,
-                merge_qkv_gate_up=merge_qkv_gate_up,
-            ),
-            non_fused_shared_experts=non_fused_shared_experts,
-        )
-
-
-class MoeExpertsDeepSeekV3CPU(nn.Module):
-    def __init__(
-        self,
-        args,
-        cpu_infer,
-        ggml_type,
-        checkpoint_prefix: str,
-        merge_qkv_gate_up: bool = False,
-    ):
-        """
-        Initializes the MoE module.
-
-        Args:
-            args (ModelArgs): Model arguments containing MoE parameters.
-        """
-        super().__init__()
-        self.args = args
-        self.merge_qkv_gate_up = merge_qkv_gate_up
-        self.dim = args.dim
-        self.rank = get_tp_rank()
-
-        moe_world_size = 1
-        self.max_batch_size = get_global_args().infer.max_reqs
-        assert (
-            args.n_routed_experts % moe_world_size == 0
-        ), f"Number of experts must be divisible by world size (world_size={moe_world_size})"
-        self.n_shared_experts = args.n_shared_experts
-        self.n_routed_experts = args.n_routed_experts
-        self.n_local_experts = args.n_routed_experts // moe_world_size
-        self.n_activated_experts = args.n_activated_experts
-
-        if self.rank == 0:
-
-            self.gguf_gate_proj = CPUParameter(
-                torch.empty(
-                    int(256 * 2048 * 7168 / 256 * 144),
-                    dtype=torch.uint8,
-                    device="cpu",
-                ),
-                requires_grad=False,
-            )
-            self.gguf_up_proj = CPUParameter(
-                torch.empty(
-                    int(256 * 2048 * 7168 / 256 * 144),
-                    dtype=torch.uint8,
-                    device="cpu",
-                ),
-                requires_grad=False,
-            )
-            if ggml_type == 12:
-                self.gguf_down_proj = CPUParameter(
-                    torch.empty(
-                        int(256 * 2048 * 7168 / 256 * 144),
-                        dtype=torch.uint8,
-                        device="cpu",
-                    ),
-                    requires_grad=False,
-                )
-            elif ggml_type == 14:
-                self.gguf_down_proj = CPUParameter(
-                    torch.empty(
-                        int(256 * 2048 * 7168 / 256 * 210),
-                        dtype=torch.uint8,
-                        device="cpu",
-                    ),
-                    requires_grad=False,
-                )
-            else:
-                raise ValueError("ggml quantization type unimplemented !")
-
-            self.gate_type = CPUParameter(
-                torch.empty(
-                    (),
-                    dtype=torch.int,
-                    device="cpu",
-                ),
-                requires_grad=False,
-            )
-            self.up_type = CPUParameter(
-                torch.empty(
-                    (),
-                    dtype=torch.int,
-                    device="cpu",
-                ),
-                requires_grad=False,
-            )
-            self.down_type = CPUParameter(
-                torch.empty(
-                    (),
-                    dtype=torch.int,
-                    device="cpu",
-                ),
-                requires_grad=False,
-            )
-
-        self.stride = 64
-        self.cpu_infer = cpu_infer
-        self.moe = None
-
-    def init_weights(self):
-        if self.rank == 0:
-            gate_ptr = ctypes.addressof(
-                ctypes.cast(
-                    self.gguf_gate_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
-                ).contents
-            )
-            up_ptr = ctypes.addressof(
-                ctypes.cast(
-                    self.gguf_up_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
-                ).contents
-            )
-            down_ptr = ctypes.addressof(
-                ctypes.cast(
-                    self.gguf_down_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
-                ).contents
-            )
-
-            import cpuinfer
-
-            moe_config = cpuinfer.moe.MOEConfig(
-                self.args.n_routed_experts,
-                self.args.n_activated_experts,
-                self.args.dim,
-                self.args.moe_inter_dim,
-                self.stride,
-                10,
-                1024,
-                gate_ptr,
-                up_ptr,
-                down_ptr,
-                self.gate_type.item(),
-                self.up_type.item(),
-                self.down_type.item(),
-                30,
-            )
-
-            self.moe = cpuinfer.moe.MOE(moe_config)
-
-            # warm up
-            self.cpu_infer.submit(self.moe.warm_up())
-            self.cpu_infer.sync()
-
-            self.input_tensor_cpu = StaticTensor(
-                max_nelem=self.max_batch_size * self.args.dim,
-                device="cpu",
-                pin_memory=True,
-                dtype=torch.bfloat16,
-            )
-            self.weights_cpu = StaticTensor(
-                max_nelem=self.max_batch_size * self.args.n_activated_experts,
-                device="cpu",
-                pin_memory=True,
-                dtype=torch.float32,
-            )
-            self.indices_cpu = StaticTensor(
-                max_nelem=self.max_batch_size * self.args.n_activated_experts,
-                device="cpu",
-                pin_memory=True,
-                dtype=torch.int64,
-            )
-            self.output_cpu = StaticTensor(
-                max_nelem=self.max_batch_size * self.args.dim,
-                device="cpu",
-                pin_memory=True,
-                dtype=torch.bfloat16,
-            )
-            self.output_gpu = StaticTensor(
-                max_nelem=self.max_batch_size * self.args.dim,
-                device="cuda",
-                dtype=torch.bfloat16,
-            )
-
-    def forward(
-        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Forward pass for the MoE module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            weights (torch.Tensor): Routing weights from the gate.
-            indices (torch.Tensor): Indices of the selected experts.
-
-        Returns:
-            torch.Tensor: Output tensor.
-        """
-        shape = x.size()
-
-        if self.rank == 0:
-            indices = indices.contiguous().to(torch.int64)
-            weights = weights.contiguous().to(torch.float32)
-            if x.shape[1] > 1:
-                input_tensor = x.contiguous().cpu()
-                indices = indices.cpu()
-                weights = weights.cpu()
-                output = torch.empty_like(input_tensor).contiguous().pin_memory()
-                self.cpu_infer.submit(
-                    self.moe.forward(
-                        indices.size(0),
-                        indices.size(1),
-                        indices.data_ptr(),
-                        weights.data_ptr(),
-                        input_tensor.data_ptr(),
-                        output.data_ptr(),
-                    )
-                )
-            else:
-                self.input_tensor_cpu.set_shape(x.shape)
-                self.indices_cpu.set_shape(indices.shape)
-                self.weights_cpu.set_shape(weights.shape)
-                self.output_cpu.set_shape(x.shape)
-                self.output_gpu.set_shape(x.shape)
-                self.input_tensor_cpu.get().copy_(x, non_blocking=True)
-                self.indices_cpu.get().copy_(indices, non_blocking=True)
-                self.weights_cpu.get().copy_(weights, non_blocking=True)
-                self.cpu_infer.submit_with_cuda_stream(
-                    torch.cuda.current_stream().cuda_stream,
-                    self.moe.forward(
-                        indices.size(0),
-                        indices.size(1),
-                        self.indices_cpu.get().data_ptr(),
-                        self.weights_cpu.get().data_ptr(),
-                        self.input_tensor_cpu.get().data_ptr(),
-                        self.output_cpu.get().data_ptr(),
-                    ),
-                )
-
-        if self.rank == 0:
-            if x.shape[1] > 1:
-                self.cpu_infer.sync()
-                y = output.to(x.device, non_blocking=True).view(shape)
-            else:
-                self.cpu_infer.sync_with_cuda_stream(
-                    torch.cuda.current_stream().cuda_stream
-                )
-                self.output_gpu.get().copy_(self.output_cpu.get(), non_blocking=True)
-                y = self.output_gpu.get()
-        else:
-            y = torch.zeros_like(x)
-
-        return y.view(shape)
-
-
 class TransformerBlockDeepSeekV3(TransformerBlock):
     def __init__(
         self,
@@ -1067,8 +779,6 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         attn_backend,
         op_impl,
         mla_absorb,
-        cpu_infer=False,
-        ggml_type=0,
         checkpoint_prefix="",
     ):
         super().__init__(
@@ -1096,13 +806,6 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                 ParallelMoeBlockDeepSeekV3(
                     args,
                     op_impl=op_impl,
-                    checkpoint_prefix=f"{checkpoint_prefix}.mlp",
-                )
-                if not cpu_infer
-                else MoEDeepSeekV3CPU(
-                    args,
-                    cpu_infer=cpu_infer,
-                    ggml_type=ggml_type,
                     checkpoint_prefix=f"{checkpoint_prefix}.mlp",
                 )
             )
@@ -1134,9 +837,6 @@ class TransformerDeepSeekV3(Transformer):
         params,
         cache,
         *,
-        cpu_infer,
-        cpu_layers: List,
-        ggml_type: List,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
         model_parallel_size: int,
@@ -1145,9 +845,6 @@ class TransformerDeepSeekV3(Transformer):
         mla_absorb: str,
     ):
         self.mla_absorb = mla_absorb
-        self.cpu_layers = cpu_layers
-        self.ggml_type = ggml_type
-        self.cpu_infer = cpu_infer
         super().__init__(
             params,
             cache,
@@ -1309,7 +1006,7 @@ class TransformerDeepSeekV3(Transformer):
                 kv_b_proj_ckpt_weight = checkpoint[prefix + "kv_b_proj.weight"]
                 if quant in [None, "gguf", "blockfp4"]:  # blockfp4 skips quantizing MLA
                     kv_b_proj_weight = kv_b_proj_ckpt_weight
-                elif quant in ["blockfp8", "gguf-blockfp8"]:
+                elif quant in ["blockfp8", "q4km"]:
                     assert prefix + "kv_b_proj.scale" in checkpoint
                     kv_b_proj_scale = checkpoint[prefix + "kv_b_proj.scale"]
                     # FIXME: Keep this on GPU
@@ -1330,7 +1027,7 @@ class TransformerDeepSeekV3(Transformer):
                 q_b_proj_ckpt_weight = checkpoint[prefix + "q_b_proj.weight"]
                 if quant in [None, "gguf", "blockfp4"]:  # blockfp4 skips quantizing MLA
                     q_b_proj_weight = q_b_proj_ckpt_weight
-                elif quant in ["blockfp8", "gguf-blockfp8"]:
+                elif quant in ["blockfp8", "q4km"]:
                     assert prefix + "q_b_proj.scale" in checkpoint
                     q_b_proj_scale = checkpoint[prefix + "q_b_proj.scale"]
                     # FIXME: Keep this on GPU
@@ -1372,7 +1069,7 @@ class TransformerDeepSeekV3(Transformer):
                 ).view(-1, self.params.q_lora_rank)
                 if quant in [None, "gguf", "blockfp4"]:  # blockfp4 skips quantizing MLA
                     new_checkpoint[prefix + "q_b_proj.weight"] = new_q_b_proj
-                elif quant in ["blockfp8", "gguf-blockfp8"]:
+                elif quant in ["blockfp8", "q4km"]:
                     # FIXME: Support soft fp8 in weight_quant_deepseek_v3
                     new_q_b_proj, new_q_b_proj_scale = weight_quant_deepseek_v3(
                         new_q_b_proj, block_size
@@ -1395,7 +1092,7 @@ class TransformerDeepSeekV3(Transformer):
                 o_proj_ckpt_weight = checkpoint[prefix + "o_proj.weight"]
                 if quant in [None, "gguf", "blockfp4"]:  # blockfp4 skips quantizing MLA
                     o_proj_weight = o_proj_ckpt_weight
-                elif quant in ["blockfp8", "gguf-blockfp8"]:
+                elif quant in ["blockfp8", "q4km"]:
                     assert prefix + "o_proj.scale" in checkpoint
                     o_proj_scale = checkpoint[prefix + "o_proj.scale"]
                     # FIXME: Keep this on GPU
@@ -1418,7 +1115,7 @@ class TransformerDeepSeekV3(Transformer):
                 new_o_proj = o_proj_weight @ kv_b_proj_for_o_proj
                 if quant in [None, "gguf", "blockfp4"]:  # blockfp4 skips quantizing MLA
                     new_checkpoint[prefix + "o_proj.weight"] = new_o_proj
-                elif quant in ["blockfp8", "gguf-blockfp8"]:
+                elif quant in ["blockfp8", "q4km"]:
                     # FIXME: Support soft fp8 in weight_quant_deepseek_v3
                     new_o_proj, new_o_proj_scale = weight_quant_deepseek_v3(
                         new_o_proj, block_size
@@ -1604,16 +1301,14 @@ class TransformerDeepSeekV3(Transformer):
                         state_dict
                     )
                 )
-
             state_dict = self._process_state_dict_for_merging_qkv(state_dict)
             state_dict = self._process_state_dict_for_merging_gate_up(state_dict)
 
             state_dict = self._process_state_dict_for_merging_experts(state_dict)
-            if not self.cpu_infer:
-                state_dict = super().process_state_dict_for_renaming_linear_layer(
-                    state_dict,
-                    get_global_args().models.n_dense_layers,
-                )
+            state_dict = super().process_state_dict_for_renaming_linear_layer(
+                state_dict,
+                get_global_args().models.n_dense_layers,
+            )
 
         if self.op_impl == "muxi_custom_kernel":
             rpl_names = self._get_tensor_row_parallel_layer_names()
@@ -1640,10 +1335,6 @@ class TransformerDeepSeekV3(Transformer):
     @override
     def _init_layers(self, cache, attn_backend, op_impl):
         self.layers = torch.nn.ModuleList()
-        import logging
-        from logging import getLogger
-
-        logger = getLogger(__name__)
         import resource
 
         memory_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -1651,32 +1342,17 @@ class TransformerDeepSeekV3(Transformer):
             logger.debug(
                 f"initing layer : {layer_id}  cpu memory usage: {memory_usage / 1024**2} GB  gpu memory usage : RANK : {torch.cuda.current_device()} {torch.cuda.memory_allocated()/(1024**3)} GB"
             )
-            if layer_id in self.cpu_layers:
-                self.layers.append(
-                    TransformerBlockDeepSeekV3(
-                        layer_id,
-                        self.params,
-                        cache,
-                        attn_backend,
-                        self.op_impl,
-                        mla_absorb=self.mla_absorb,
-                        cpu_infer=self.cpu_infer,
-                        ggml_type=self.ggml_type[layer_id],
-                        checkpoint_prefix=f"layers.{layer_id}",
-                    )
+            self.layers.append(
+                TransformerBlockDeepSeekV3(
+                    layer_id,
+                    self.params,
+                    cache,
+                    attn_backend,
+                    self.op_impl,
+                    mla_absorb=self.mla_absorb,
+                    checkpoint_prefix=f"layers.{layer_id}",
                 )
-            else:
-                self.layers.append(
-                    TransformerBlockDeepSeekV3(
-                        layer_id,
-                        self.params,
-                        cache,
-                        attn_backend,
-                        self.op_impl,
-                        mla_absorb=self.mla_absorb,
-                        checkpoint_prefix=f"layers.{layer_id}",
-                    )
-                )
+            )
 
     @override
     def _init_post_layers(self):

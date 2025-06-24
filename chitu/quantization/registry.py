@@ -443,6 +443,14 @@ class QuantizationRegistry:
             if not pattern or not re.search(pattern, checkpoint_prefix):
                 continue
 
+            layers = rule.get("layers")
+            if layers:
+                match = re.search(r"layers\.(\d+)\.", checkpoint_prefix)
+                if match:
+                    layer_id = int(match.group(1))
+                    if layer_id not in layers:
+                        continue
+
             method = getattr(rule, "type", None)
             if not method:
                 method = quant_cfg.type

@@ -1,0 +1,15 @@
+quant: 
+- model: 'deepseek'
+  rules:
+    - regex : 'layers\.(\d+)\.mlp\.moe'
+      type : q4km
+      layers: [3, 4, 5, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 53, 54, 55, 56, 57, 58, 59, 60]
+      kwargs:
+        ggml_type: q6k
+    - regex : 'layers\.(\d+)\.mlp\.moe'
+      type : q4km
+      layers: [7, 8, 10, 11, 13, 14, 16, 17, 19, 20, 22, 23, 25, 26, 28, 29, 31, 32, 34, 35, 37, 38, 40, 41, 43, 44, 46, 47, 49, 50, 52]
+      kwargs:
+        ggml_type: q4k
+    - regex : 'layers\.'
+      type : blockfp8
