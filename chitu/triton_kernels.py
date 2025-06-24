@@ -15,6 +15,7 @@ __all__ = [
     "silu_and_mul_kernel",
     "rms_norm_kernel",
     "grouped_matmul_kernel",
+    "apply_frequency_penalty_kernel",
 ]
 
 import functools
@@ -992,3 +993,33 @@ def grouped_matmul_kernel(
     )
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(c_ptrs, c, mask=mask)
+
+
+@triton.jit
+def apply_frequency_penalty_kernel(
+    logits_ptr,
+    logits_index_ptr,
+    response_ptr,
+    logits_row_stride: tl.constexpr,
+    logits_col_stride: tl.constexpr,
+    response_row_stride: tl.constexpr,
+    vocab_size: tl.constexpr,
+    response_len_list,
+    frequency_penalty_list,
+    batch_size: tl.constexpr,  # Number of elements in logits_index
+    num_threads: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    thread_id = tl.program_id(axis=1)
+
+    logits_row = tl.load(logits_index_ptr + pid)
+    row_start = logits_row * logits_row_stride
+    response_len = tl.load(response_len_list + pid)
+    frequency_penalty = tl.load(frequency_penalty_list + pid)
+
+    for token_pos in range(thread_id, response_len, num_threads):
+        token_id = tl.load(response_ptr + pid * response_row_stride + token_pos)
+        logits_pos = row_start + token_id * logits_col_stride
+        tl.atomic_add(
+            logits_ptr + logits_pos, -frequency_penalty, token_id < vocab_size
+        )

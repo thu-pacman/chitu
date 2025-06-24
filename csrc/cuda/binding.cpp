@@ -7,6 +7,7 @@
 #include "dequant/ops.h"
 #include "moe/moe_kernel.h"
 #include "norm/rms_norm.h"
+#include "frequency_penalty/frequency_penalty.h"
 #include "rotary/rotary_pos_emb_llama.h"
 #include "weight_layout/weight_layout_change.h"
 
@@ -26,6 +27,7 @@ void init_compute(py::module &m) {
           "out"_a = std::nullopt, "");
     m.def("weight_layout_change", &weight_layout_change, "");
     m.def("cuda_topk_softmax", &topk_softmax, "");
+    m.def("cuda_frequency_penalty", &applyFrequencyPenalty, "");
 }
 
 /**

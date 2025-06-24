@@ -9,7 +9,7 @@ import torch.distributed
 
 from chitu.backend import Backend, BackendState
 from chitu.cache_manager import PagedKVCacheManager
-from chitu.global_vars import get_timers
+from chitu.global_vars import get_timers, get_global_args
 from chitu.task import (
     PackedTasks,
     PackedTasksBase,
@@ -22,6 +22,8 @@ from chitu.task import (
 )
 from chitu.tensor_parallel import get_tp_group, get_pp_group, get_cpu_tp_group
 from chitu.utils import VarLens, top_k_top_p_min_p_sampling_from_probs_torch
+from chitu.ops import apply_frequency_penalty
+from chitu.device_list import DeviceList
 
 logger = getLogger(__name__)
 
@@ -85,22 +87,39 @@ class NormalExecutor(Executor):
         assert (
             len(tasks.tasks) == logits.shape[0]
         ), f"logtis has shape {logits.shape}, but there are {len(tasks.tasks)} tasks"
-        for it, task in enumerate(tasks.tasks):
-            if (
-                task.req.params.frequency_penalty > 0
-                and task.task_type == TaskType.Decode
-                and len(task.response) > 0
-            ):
-                logits[it].index_add_(
-                    -1,
-                    task.response.to_tensor(),
-                    -task.req.params.frequency_penalty
-                    * torch.ones(
-                        (len(task.response),),
-                        dtype=logits.dtype,
-                        device=logits.device,
-                    ),
+        # TODO(lijian): this is a temperary solution to get max bs
+        use_cumulative = get_global_args().infer.max_reqs > 64
+        if tasks.should_apply_frequency_penalty:
+            logits_index_list = []
+            response_list = []
+            response_len_list = []
+            if not use_cumulative:
+                for it, task in enumerate(tasks.tasks):
+                    if (
+                        task.req.params.frequency_penalty > 0
+                        and task.task_type == TaskType.Decode
+                        and len(task.response) > 0
+                    ):
+                        logits_index_list.append(it)
+                        response_list.append(task.response)
+                        response_len_list.append(len(task.response))
+                logits_index_list = DeviceList(
+                    logits_index_list, dtype=torch.int64, device=logits.device
                 )
+                response_len_list = DeviceList(
+                    response_len_list, dtype=torch.int64, device=logits.device
+                )
+                apply_frequency_penalty(
+                    logits,
+                    logits_index_list,
+                    response_list,
+                    response_len_list,
+                    tasks.frequency_penalties,
+                    impl="auto",
+                )
+            else:
+                assert tasks.cumulative_freq_penalties is not None
+                logits.sub_(tasks.cumulative_freq_penalties)
         if tasks.is_all_greedy:
             tokens = torch.argmax(logits, dim=-1)
         else:
@@ -108,6 +127,8 @@ class NormalExecutor(Executor):
             tokens = top_k_top_p_min_p_sampling_from_probs_torch(
                 probs, tasks.top_ks, tasks.top_ps
             )
+        if use_cumulative:
+            tasks.update_cumulative_freq_penalties(tokens)
         tokens_cpu = tokens.cpu()
         for it, task in enumerate(tasks.tasks):
             task.update_response(tokens_cpu[it].item(), tokens[it], logits[it])

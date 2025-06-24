@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from chitu.device_type import is_hopper
 from chitu.utils import try_import_opt_dep
 from chitu.global_vars import get_global_args
+from chitu.device_list import DeviceList
 
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
 torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
@@ -708,3 +709,70 @@ def multinomial(
         return probs.div_(q).argmax(dim=1).view(-1, num_samples)
     else:
         raise NotImplementedError(f"unsupport impl: {impl}")
+
+
+@torch.no_grad()
+def apply_frequency_penalty(
+    logits: torch.Tensor,
+    logits_index: DeviceList,
+    response_list: List[DeviceList],
+    response_len_list: DeviceList,
+    frequency_penalty: torch.tensor,
+    impl="auto",
+):
+    bs = len(logits_index)
+    if bs == 0:
+        return
+    assert (
+        len(response_list) == bs
+        and len(response_len_list) == bs
+        and frequency_penalty.shape[0] == bs
+    )
+    assert frequency_penalty.is_contiguous()
+    if impl == "auto":
+        # NOTE: This is a temporary solution based tests on h20.
+        if has_triton and bs > 8 and bs <= 16:
+            impl = "triton"
+        elif bs < 16:
+            impl = "torch"
+        else:
+            impl = "cuda"
+    if impl == "triton":
+        apply_frequency_penalty_triton(
+            logits,
+            logits_index.to_tensor(),
+            response_list,
+            response_len_list.to_tensor(),
+            frequency_penalty,
+        )
+    elif impl == "torch":
+        for i, idx in enumerate(logits_index):
+            logits[idx].index_add_(
+                -1,
+                response_list[i].to_tensor(),
+                -frequency_penalty[idx]
+                * torch.ones(
+                    (response_len_list[i],),
+                    dtype=logits.dtype,
+                    device=logits.device,
+                ),
+            )
+    elif impl == "cuda":
+        assert logits.dtype == torch.float
+        responses = [response.to_tensor().data_ptr() for response in response_list]
+        response_ptr_list = torch.tensor(
+            responses, dtype=torch.int64, device=logits.device
+        )
+        chitu_backend.cuda_frequency_penalty(
+            logits,
+            logits_index.to_tensor(),
+            response_ptr_list,
+            frequency_penalty,
+            response_len_list.to_tensor(),
+            bs,
+            logits.shape[-1],
+            logits.stride(0),
+            logits.stride(1),
+        )
+    else:
+        raise NotImplementedError(f"{impl=}")
