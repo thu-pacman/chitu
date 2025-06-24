@@ -21,7 +21,7 @@ class InferConfig:
     op_impl: str = MISSING
     mla_absorb: Optional[str] = MISSING
     raise_lower_bit_float_to: str = MISSING
-    soft_fp8: bool = MISSING
+    soft_fp8: bool = MISSING  # Legacy parameter. To be removed in the future.
     fuse_shared_experts: bool = MISSING
     max_reqs: int = MISSING
     pp_layer_partition: Optional[list] = MISSING
@@ -74,6 +74,7 @@ class ServeConfig:
     request: RequestConfig = field(default_factory=RequestConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     quant: Optional[str] = MISSING
-    dtype: str = MISSING
+    dtype: Optional[str] = MISSING  # Legacy parameter. To be removed in the future.
+    float_16bit_variant: str = MISSING
     keep_dtype_in_checkpoint: bool = MISSING
     skip_preprocess: bool = MISSING

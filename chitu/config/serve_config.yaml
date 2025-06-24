@@ -53,6 +53,7 @@ scheduler:
     num_tasks: null
     enable_hybrid: False
 quant: null
-dtype: bfloat16 # default_dtype of torch
+dtype: null # Legacy parameter. To be removed in the future.
+float_16bit_variant: bfloat16 # one of: bfloat16, float16. This sets the default_dtype of torch
 keep_dtype_in_checkpoint: False
 skip_preprocess: False

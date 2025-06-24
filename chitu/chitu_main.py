@@ -149,6 +149,11 @@ def chitu_init(args, logging_level=logging.INFO):
             "Argument `infer.soft_fp8=True` is deprecated. Use `infer.raise_lower_bit_float_to=bfloat16` instead."
         )
         args.infer.raise_lower_bit_float_to = "bfloat16"
+    if hasattr(args, "dtype") and args.dtype is not None:
+        logger.warning(
+            "Argument `dtype` is deprecated. Use `float_16bit_variant` instead."
+        )
+        args.float_16bit_variant = args.dtype
 
     if args.infer.attn_type == "npu":
         try:
