@@ -26,6 +26,7 @@ from chitu.task import (
 )
 from chitu.utils import get_config_dir_path, gen_req_id
 from chitu.distributed_utils import propagate_tensor_to_all_devices
+from chitu.schemas import ServeConfig
 
 logger = getLogger(__name__)
 
@@ -219,7 +220,7 @@ def start_unicorn(args):
 @hydra.main(
     version_base=None, config_path=get_config_dir_path(), config_name="serve_config"
 )
-def main(args: DictConfig):
+def main(args: ServeConfig):
     global rank
     global global_args
     global server_status
