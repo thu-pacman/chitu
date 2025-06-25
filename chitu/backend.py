@@ -180,12 +180,12 @@ class Backend:
         torch.manual_seed(args.infer.seed)
 
         # Set default_dtype
-        if args.dtype == "float16":
+        if args.float_16bit_variant == "float16":
             torch.set_default_dtype(torch.float16)
-        elif args.dtype == "bfloat16":
+        elif args.float_16bit_variant == "bfloat16":
             torch.set_default_dtype(torch.bfloat16)
         else:
-            raise NotImplementedError(f"Unsupported dtype {args.dtype}")
+            raise NotImplementedError(f"Unsupported float_16bit_variant {args.dtype}")
 
         # Check checkpoint exists
         check_checkpoint_path(args)

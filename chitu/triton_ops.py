@@ -1,6 +1,6 @@
 import struct
 import packaging
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 import torch
 import torch.nn as nn
@@ -12,6 +12,7 @@ from chitu.triton_kernels import *
 from chitu.device_type import is_hopper
 from chitu.utils import try_import_opt_dep
 from chitu.global_vars import get_global_args
+from chitu.device_list import DeviceList
 
 
 def to_triton_dtype(dtype: torch.dtype):
@@ -767,3 +768,52 @@ def quant_einsum_shc_hdc_shd_triton(
     )
 
     return group_C
+
+
+def apply_frequency_penalty_triton(
+    logits: torch.Tensor,
+    logits_index: torch.Tensor,
+    response_list: List[DeviceList],
+    response_len_list: torch.Tensor,
+    frequency_penalty: torch.Tensor,
+):
+    """
+    使用Triton实现的频率惩罚函数
+    参数:
+        logits: 形状为 [batch, vocab] 的logits张量
+        logits_index: 需要更新的行索引
+        response: 已生成的token序列
+        frequency_penalty: 频率惩罚系数
+    """
+    assert logits.is_contiguous()
+    assert logits_index.is_contiguous()
+    assert frequency_penalty.is_contiguous()
+    assert response_len_list.is_contiguous()
+    vocab_size = logits.size(-1)
+
+    grid = lambda meta: (meta["batch_size"], meta["num_threads"])
+    batch_size = logits_index.shape[0]
+
+    max_len = response_len_list[0]
+    for i in range(1, batch_size):
+        max_len = max(max_len, response_len_list[i])
+    response = torch.empty(
+        (batch_size, max_len),
+        dtype=response_list[0].to_tensor().dtype,
+        device=response_list[0].to_tensor().device,
+    )
+    for i in range(batch_size):
+        response[i, : response_len_list[i]] = response_list[i].to_tensor()
+    apply_frequency_penalty_kernel[grid](
+        logits_ptr=logits,
+        logits_index_ptr=logits_index,
+        response_ptr=response,
+        response_len_list=response_len_list,
+        frequency_penalty_list=frequency_penalty,
+        logits_row_stride=logits.stride(0),
+        logits_col_stride=logits.stride(1),
+        response_row_stride=response.stride(0),
+        vocab_size=vocab_size,
+        batch_size=batch_size,
+        num_threads=256,
+    )

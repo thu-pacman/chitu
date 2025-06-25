@@ -2,10 +2,10 @@ import os
 import hydra
 import safetensors.torch
 import torch.distributed
-from omegaconf import DictConfig
 
 from chitu.chitu_main import chitu_init
 from chitu.backend import Backend
+from chitu.schemas import ServeConfig
 from chitu.utils import get_config_dir_path
 
 
@@ -14,7 +14,7 @@ from chitu.utils import get_config_dir_path
     config_path=get_config_dir_path(),
     config_name=os.getenv("CONFIG_NAME", "serve_config"),
 )
-def main(args: DictConfig):
+def main(args: ServeConfig):
     target_dir = os.getenv("PREPROCESS_AND_SAVE_DIR")
     os.makedirs(target_dir, exist_ok=True)
 

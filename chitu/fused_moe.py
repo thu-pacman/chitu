@@ -19,11 +19,12 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-import chitu_backend
 from chitu.device_type import is_muxi, is_nvidia, get_device_name
 from chitu.triton_kernels import moe_sum_kernel
 from chitu.ops import silu_and_mul, to_triton_dtype
-from chitu.utils import ceil_div
+from chitu.utils import ceil_div, try_import_opt_dep
+
+chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
 
 
 def moe_sum(input_tensor, output_tensor):

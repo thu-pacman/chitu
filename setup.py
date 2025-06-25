@@ -27,10 +27,13 @@ setup_dir = os.path.dirname(os.path.abspath(__file__))
 # We use CUDAExtension instead of CMake for native sources, because many of the non-NVIDIA GPUs have
 # their custom CUDAExtension, but not their custom CMake support.
 
-if os.environ.get("ASCEND_PLATFORM", "0") == "0":
-    ext_modules = operators.get_extensions()
-else:
+if (
+    os.environ.get("CHITU_ASCEND_BUILD", "0") == "1"
+    or os.environ.get("CHITU_HYGON_BUILD", "0") == "1"
+):
     ext_modules = []
+else:
+    ext_modules = operators.get_extensions()
 
 
 cython_unsafe_files = [

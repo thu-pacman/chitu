@@ -36,6 +36,18 @@ Chitu (赤兔) 定位于「生产级大模型推理引擎」，充分考虑企�
 
 ## 测试数据
 
+### 在海光 BW200 四卡部署 Qwen3-32B, chitu 0.3.6
+
+| 输出速率 token/s | input 256, output 256 | input 1024, output 1024|
+|:---|:---|:---|
+|bs=1| 25.04 | 25.29 |
+|bs=2| 47.73 | 49.16 |
+|bs=4| 94.50 | 94.21 |
+|bs=8| 181.96 | 169.06 |
+|bs=16| 346.90 | 310.18 |
+|bs=32| 592.70 | 546.70 |
+|bs=64| 962.24 | 808.09 |
+
 ### 在昇腾 910B 两卡部署 Qwen3-32B (配置 infer.use_cuda_graph=True 开启 aclgraph)
 
 | Batchsize | chitu 0.3.5, 输出速率 token/s |
@@ -125,13 +137,15 @@ Chitu (赤兔) 定位于「生产级大模型推理引擎」，充分考虑企�
 git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
 # 如果下载很慢，试试在命令最后加上 “-i https://pypi.tuna.tsinghua.edu.cn/simple”
 pip install -r requirements-build.txt
-# 安装 torch，需要将 cu124 替换为实际的 cuda 版本号
+# 注意: 非英伟达平台请安装对应 torch，英伟达平台请对应修改自己的 cuda 版本
 pip install -U torch --index-url https://download.pytorch.org/whl/cu124 
 # TORCH_CUDA_ARCH_LIST 的值可通过 python -c "import torch; print(torch.cuda.get_device_capability())" 查看
-TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation . 
-# 华为昇腾平台需要先准备 CANN 和 torch_npu 2.5 环境，安装时设置变量 ASCEND_PLATFORM=1
+TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation .
+# 华为昇腾平台需要先准备 CANN 和 torch_npu 2.5 环境，安装时设置变量 CHITU_ASCEND_BUILD=1
 # 注意：如果要开启 aclgraph 支持，需要通过 third_party/ascend 里的 whl 安装 torch_npu，或者直接使用chitu官方 docker 镜像
-ASCEND_PLATFORM=1 MAX_JOBS=4 pip install --no-build-isolation . 
+CHITU_ASCEND_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
+# 海光平台需要先准备好 torch 环境，安装时设置环境变量 CHITU_HYGON_BUILD=1
+CHITU_HYGON_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
 ```
 
 ### 查看支持的模型
@@ -292,6 +306,28 @@ docker run \
   --security-opt apparmor=unconfined \
   --shm-size=100gb \
   --ulimit memlock=-1 \
+  -v <your_model_path>:<container_model_path> \
+  <your_image_name> \
+  <your_command>
+```
+
+### 海光
+
+```
+docker run -dit \
+  -u root \
+  --network=host \
+  --privileged \
+  --device=/dev/kfd \
+  --device=/dev/dri \
+  --ipc=host \
+  --shm-size=100G \
+  --group-add video \
+  --cap-add=SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  --ulimit stack=-1:-1 \
+  --ulimit memlock=-1:-1 \
+  -v /opt/hyhal:/opt/hyhal:ro \
   -v <your_model_path>:<container_model_path> \
   <your_image_name> \
   <your_command>

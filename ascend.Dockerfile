@@ -65,7 +65,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt
 
-ENV ASCEND_PLATFORM=1
+ENV CHITU_ASCEND_BUILD=1
 
 # The actual installing procedure requries a NPU device, which is not available in the `docker build` stage.
 # We delay it to an additional `docker run` stage which runs `script/install.sh`.

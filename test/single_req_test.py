@@ -17,6 +17,7 @@ from chitu.chitu_main import (
     warmup_engine,
 )
 from chitu.global_vars import get_timers
+from chitu.schemas import ServeConfig
 from chitu.utils import get_config_dir_path, gen_req_id
 
 logger = getLogger(__name__)
@@ -161,7 +162,7 @@ def run_normal(args, timers):
     config_path=os.getenv("CONFIG_PATH", get_config_dir_path()),
     config_name=os.getenv("CONFIG_NAME", "serve_config"),
 )
-def main(args: DictConfig):
+def main(args: ServeConfig):
     global local_args
     local_args = args
     logger.setLevel(logging.DEBUG)
