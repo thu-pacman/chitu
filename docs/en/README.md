@@ -37,6 +37,18 @@ Chitu is a high-performance inference framework for large language models. Chitu
 
 ## Evaluation
 
+### Deploy Qwen3-32B on Hygon BW200 4-cards, chitu 0.3.6
+
+| Output token/s | input 256, output 256 | input 1024, output 1024|
+|:---|:---|:---|
+|bs=1| 25.04 | 25.29 |
+|bs=2| 47.73 | 49.16 |
+|bs=4| 94.50 | 94.21 |
+|bs=8| 181.96 | 169.06 |
+|bs=16| 346.90 | 310.18 |
+|bs=32| 592.70 | 546.70 |
+|bs=64| 962.24 | 808.09 |
+
 ### Deploy Qwen3-32B on Ascend 910B Dual Cards (with aclgraph enabled via infer.use_cuda_graph=True)
 
 | Batchsize | chitu 0.3.5, Output TPS (tokens/s) |
@@ -122,11 +134,14 @@ For professional users and developers, please read [the full installation guide]
 git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
 
 pip install -r requirements-build.txt
+# Note: For non-NVIDIA platforms, please install the corresponding version of Torch. For NVIDIA platforms, please make sure to match the installation with your CUDA version.
 pip install -U torch --index-url https://download.pytorch.org/whl/cu124  # Change according to your CUDA version
 TORCH_CUDA_ARCH_LIST=9.0 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation . # Change `8.6` to your desired CUDA arch list.
-# For the Ascend platform, you need set up the CANN and torch_npu 2.5 environments, and set the environment variable ASCEND_PLATFORM=1 during installation.
+# For the Ascend platform, you need set up the CANN and torch_npu 2.5 environments, and set the environment variable CHITU_ASCEND_BUILD=1 during installation.
 # Note: To enable aclgraph support, you need to install torch_npu via the whl in third_party/ascend, or directly use the official chitu docker image.
-ASCEND_PLATFORM=1 MAX_JOBS=4 pip install --no-build-isolation .
+CHITU_ASCEND_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
+# For the Hygon platform, the corresponding torch environment needs to be prepared in advance, and set the environment variable CHITU_HYGON_BUILD=1 during installation.
+CHITU_HYGON_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
 ```
 
 ### List Supported Models
@@ -290,6 +305,28 @@ docker run \
   --security-opt apparmor=unconfined \
   --shm-size=100gb \
   --ulimit memlock=-1 \
+  -v <your_model_path>:<container_model_path> \
+  <your_image_name> \
+  <your_command>
+```
+
+### Hygon
+
+```
+docker run -dit \
+  -u root \
+  --network=host \
+  --privileged \
+  --device=/dev/kfd \
+  --device=/dev/dri \
+  --ipc=host \
+  --shm-size=100G \
+  --group-add video \
+  --cap-add=SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  --ulimit stack=-1:-1 \
+  --ulimit memlock=-1:-1 \
+  -v /opt/hyhal:/opt/hyhal:ro \
   -v <your_model_path>:<container_model_path> \
   <your_image_name> \
   <your_command>
