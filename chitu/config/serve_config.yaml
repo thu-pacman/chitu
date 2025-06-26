@@ -1,4 +1,6 @@
 defaults:
+  - hydra/callbacks: 
+    - serve_config_rules
   - models: Qwen2-7B-Instruct
   - serve_config_schema
   - _self_

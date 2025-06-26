@@ -1,0 +1,5 @@
+# @package _global_
+hydra:
+  callbacks:
+    serve_config_rules:
+      _target_: chitu.schemas.serve_config_rules.ServeConfigRules
