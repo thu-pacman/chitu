@@ -168,6 +168,11 @@ def chitu_init(args, logging_level=logging.INFO):
             torch.cuda.CUDAGraph = torch.npu.NPUGraph
         except ImportError:
             raise ImportError("torch_npu is not installed")
+        # Set environ for ascend
+        from chitu.utils import get_ascend_custom_opp_path
+
+        site_packages_path = get_ascend_custom_opp_path()
+        os.environ["ASCEND_CUSTOM_OPP_PATH"] = site_packages_path
 
     set_quant_variables(args)
     set_global_variables(args)

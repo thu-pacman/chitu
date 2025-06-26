@@ -121,7 +121,7 @@ class Backend:
 
         assert (
             world_size == model_parallel_size * pipeline_parallel_size
-        ), "World size not match"
+        ), f"World size not match: {world_size} != {model_parallel_size} * {pipeline_parallel_size}"
 
         # Bind process to GPU
         torch.cuda.set_device(local_rank)

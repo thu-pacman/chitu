@@ -200,7 +200,6 @@ class AttentionHFLlama(Attention):
         self.cache.finalize_cache_bylayer_prefill(
             xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
         )
-
         output = self.attn_backend.attn_varlen_func(
             xq,
             xk,
@@ -244,7 +243,6 @@ class AttentionHFLlama(Attention):
         cache_k = cache[0]
         cache_v = cache[1]
         cache_seqlens = self.cache.get_gpu_seq_lens_excl_this_decode()
-
         output = self.attn_backend.attn_with_kvcache(
             xq,
             cache_k,
@@ -339,6 +337,7 @@ class FeedForwardHFLlama(nn.Module):
                 base_linear_class=gate_up_proj_linear,
                 checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
             )
+
             self.up_proj = ColumnParallelLinear(
                 dim,
                 hidden_dim,
@@ -347,6 +346,7 @@ class FeedForwardHFLlama(nn.Module):
                 base_linear_class=gate_up_proj_linear,
                 checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
             )
+
         self.down_proj = RowParallelLinear(
             hidden_dim,
             dim,

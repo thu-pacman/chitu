@@ -733,7 +733,7 @@ def apply_frequency_penalty(
         # NOTE: This is a temporary solution based tests on h20.
         if has_triton and bs > 8 and bs <= 16:
             impl = "triton"
-        elif bs < 16:
+        elif bs < 16 or has_torch_npu:
             impl = "torch"
         else:
             impl = "cuda"

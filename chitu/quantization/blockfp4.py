@@ -22,9 +22,70 @@ chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_ba
 triton, has_triton = try_import_opt_dep("triton", "triton")
 if has_triton:
     from chitu.fused_moe import fused_experts
+torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
+if has_torch_npu:
+    from chitu.npu_utils import fused_experts_npu
+try:
+    import grouped_gemm
+except ImportError:
+    pass
 
 
 logger = getLogger(__name__)
+
+
+def linear_block_fp4_npu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    assert (
+        weight.shape[-2] % 2 == 0
+    ), f"Weight shape[-2] must be even, but got {weight.shape[-2]}"
+    assert (
+        weight.shape[-1] % 2 == 0
+    ), f"Weight shape[-1] must be even, but got {weight.shape[-1]}"
+    # 针对反量化矩阵乘算子做的 shape 适配
+    weight = weight.reshape(weight.shape[-1] * 2, weight.shape[-2] // 2)
+    weight = weight.unsqueeze(0)
+    weight_scale = weight_scale.unsqueeze(0)
+    scale = weight_scale.transpose(-2, -1)
+    if not scale.is_contiguous():
+        scale = scale.contiguous()
+    scale_off = torch.empty_like(scale)
+    output = torch.empty(
+        [x.shape[0], weight.shape[-1] * 2], dtype=x.dtype, device=x.device
+    )
+    # NOTE: 生成一个仅有一个元素的 Tensor，值为 N,并且需要保证 export tokens 是一个一维的 Tensor
+    expert_tokens = torch.full([1], x.shape[0], device=x.device, dtype=torch.int64)
+
+    if x.dim() == 3:
+        # 三维的 x 需要squeeze到二维,在NpuAttnBackend mla_attn_with_kvcache中 x 会被 unsqueeze 到三维
+        x = x.squeeze(1)
+        grouped_gemm.grouped_gemm(
+            x,
+            weight,
+            antiquantOffsetOptional=scale_off,
+            antiquantScaleOptional=scale,
+            groupListOptional=expert_tokens,
+            output=output,
+        )
+        output = output.unsqueeze(1)
+    else:
+        grouped_gemm.grouped_gemm(
+            x,
+            weight,
+            antiquantOffsetOptional=scale_off,
+            antiquantScaleOptional=scale,
+            groupListOptional=expert_tokens,
+            output=output,
+        )
+
+    if bias is not None:
+        output += bias
+    return output
 
 
 def linear_block_fp4(
@@ -64,6 +125,8 @@ def linear_block_fp4(
             if bias is not None:
                 y += bias
             return y
+        elif get_global_args().infer.npu_fusion_fp4:
+            return linear_block_fp4_npu(x, weight, weight_scale, weight_scale_2, bias)
         else:
             raise NotImplementedError(
                 f"Soft-fp8 fused gemm not implemented for {get_device_name()}"
@@ -142,13 +205,20 @@ class Blockfp4Linear(QuantizedLinearBase):
         )
 
         block_in, block_out = block_shape
+        if (
+            get_global_args().models.type == "hf-llama"
+            and get_global_args().infer.npu_fusion_fp4
+        ):
+            dtype = torch.bfloat16
+        else:
+            dtype = torch.uint8
         self.register_parameter(
             "weight_scale",
             torch.nn.Parameter(
                 torch.empty(
                     ceil_div(out_features, block_out),
                     ceil_div(in_features, block_in),
-                    dtype=torch.uint8,
+                    dtype=dtype,
                 ),
                 requires_grad=False,
             ),
@@ -401,6 +471,18 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
             requires_grad=False,
         )
 
+    def _compute_npu_fused_experts(self, x, weights, indices):
+        y = fused_experts_npu(
+            hidden_states=x,
+            w1=self.gate_up_proj_weight,
+            w2=self.down_proj_weight,
+            topk_weights=weights,
+            topk_ids=indices,
+            w1_scale=self.gate_up_proj_weight_scale,
+            w2_scale=self.down_proj_weight_scale,
+        )
+        return y
+
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
     ) -> torch.Tensor:
@@ -423,6 +505,8 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
             raise NotImplementedError(
                 "muxi_custom_kernel is not supported for blockfp4 MoeExperts"
             )
+        elif has_torch_npu:
+            y = self._compute_npu_fused_experts(x, weights, indices)
         elif has_triton and self.merge_gate_up:
             raise_to_16 = (
                 parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize

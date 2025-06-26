@@ -1400,6 +1400,7 @@ class NpuAttnBackend(RefAttnBackend):
             self.slot_mapping.set(
                 torch.tensor(slot_list, dtype=torch.int32, device="cuda")
             )
+        self.cache_seqlens_incl_this_decode_cpu = cache_seqlens_incl_this_decode.cpu()
 
     def attn_varlen_func(
         self,
@@ -1543,7 +1544,7 @@ class NpuAttnBackend(RefAttnBackend):
         #                                           key_cache=key_cache,
         #                                           slot_indices=slots)
         kv_cache = kv_cache.unsqueeze(2)
-        attn_output = torch.randn(
+        attn_output = torch.zeros(
             [bsz, self.mla_v_head_dim // tp_size, 512],
             dtype=query.dtype,
             device=query.device,
@@ -1555,7 +1556,7 @@ class NpuAttnBackend(RefAttnBackend):
             num_heads=128 // tp_size,
             scale_value=1.0 / math.sqrt(query.shape[-1]),
             block_table=block_table,
-            context_lens=cache_seqlens_incl_this_decode.cpu(),
+            context_lens=self.cache_seqlens_incl_this_decode_cpu,
             mla_vheadsize=512,
             out=attn_output,
         )

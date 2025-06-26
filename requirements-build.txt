@@ -4,3 +4,4 @@ cmake
 ninja
 cython
 packaging
+pybind11

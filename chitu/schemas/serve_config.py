@@ -26,6 +26,7 @@ class InferConfig:
     max_reqs: int = MISSING
     pp_layer_partition: Optional[list] = MISSING
     use_cuda_graph: bool = MISSING
+    npu_fusion_fp4: bool = MISSING
     num_blocks: int = MISSING
     bind_process_to_cpu: str = MISSING
     bind_thread_to_cpu: str = MISSING

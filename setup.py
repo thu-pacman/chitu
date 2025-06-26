@@ -141,6 +141,10 @@ setup(
             "deep_gemm @ file://localhost"
             + os.path.join(setup_dir, "third_party/DeepGEMM"),
         ],
+        "grouped_gemm": [
+            "grouped_gemm @ file://localhost"
+            + os.path.join(setup_dir, "csrc/ascendCppExtensions/grouped_gemm"),
+        ],
         **operators.get_extras_require(),
     },
     packages=find_packages(),
