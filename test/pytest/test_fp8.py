@@ -1,7 +1,7 @@
 import torch
 import pytest
 import triton
-import triton.language as tl
+
 from chitu.ops import (
     act_quant_deepseek_v3,
     fp8_gemm_deepseek_v3,
@@ -38,20 +38,28 @@ def test_dequanted_gemm_is_close_to_fp8_gemm(dtype: torch.dtype):
     torch.set_default_dtype(dtype)
     dim = 256
     block_size = 128
+    assert dim % block_size == 0, "dim must be divisible by block_size"
     a = torch.randn(dim, dim, dtype=dtype, device="cuda")
     b, b_s = init_b_and_b_s(dim, block_size)
 
     a_fp8, a_s = act_quant_deepseek_v3(a, block_size)
     std_y = fp8_gemm_deepseek_v3(a_fp8, a_s, b, b_s)
 
-    dequant_b = weight_dequant_deepseek_v3(b, b_s)
-    y = torch.nn.functional.linear(a, dequant_b)
-
-    # Assert no more than 10% of the elements are different more than 15%
-    assert (
-        len(torch.nonzero(~torch.isclose(std_y, y, atol=0.15, rtol=0.15))) / (dim * dim)
-        < 0.1
+    # Dequant from `a_fp8` and `a_s` instead of directly using `a` in dequanted implementation,
+    # so the numerical difference is controlled inside the kernels
+    dequant_a = (
+        (
+            a_fp8.to(a_s.dtype).view(dim, dim // block_size, block_size)
+            * a_s.view(dim, dim // block_size, 1)
+        )
+        .to(dtype)
+        .view(dim, dim)
     )
+
+    dequant_b = weight_dequant_deepseek_v3(b, b_s)
+    y = torch.nn.functional.linear(dequant_a, dequant_b)
+
+    assert torch.allclose(std_y, y, atol=0.15, rtol=0.15)
 
 
 @triton.testing.perf_report(

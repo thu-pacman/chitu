@@ -1,3 +1,7 @@
+defaults:
+  - quant_config: blockfp8
+  - _self_ # Config in this file overrides configs in defaults
+
 name: DeepSeek-V3
 type: deepseek-v3
 source: "https://huggingface.co/deepseek-ai/DeepSeek-V3" # Just for displaying. No automatic download.

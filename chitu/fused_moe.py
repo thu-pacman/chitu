@@ -254,6 +254,7 @@ def fused_moe_kernel_soft_fp4(
         )
     else:
         fp4_to_fp8_scale = 64.0
+        fp4_max = 6.0
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -327,15 +328,17 @@ def fused_moe_kernel_soft_fp4(
                 fp8_weight_1 = (b.to(tl.int8, bitcast=True) << 4 >> 2) & 0x9C
                 fp8_weight_1 = (
                     fp8_weight_1.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+                    * (fp4_to_fp8_scale / fp4_max)
                     * b_scale_1
-                )
-                tmp_accumulator += tl.dot(a_1, fp8_weight_1.to(tl.float8e4nv))
+                ).to(tl.float8e4nv)
+                tmp_accumulator += tl.dot(a_1, fp8_weight_1)
                 fp8_weight_2 = (b.to(tl.int8, bitcast=True) >> 2) & 0x9C
                 fp8_weight_2 = (
                     fp8_weight_2.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+                    * (fp4_to_fp8_scale / fp4_max)
                     * b_scale_2
-                )
-                tmp_accumulator += tl.dot(a_2, fp8_weight_2.to(tl.float8e4nv))
+                ).to(tl.float8e4nv)
+                tmp_accumulator += tl.dot(a_2, fp8_weight_2)
                 accumulator += tmp_accumulator * a_scale[:, None]
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -345,10 +348,9 @@ def fused_moe_kernel_soft_fp4(
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
-    if soft_fp8:
-        accumulator = accumulator * b_scale2
-    else:
-        accumulator = accumulator * fp4_to_fp8_scale * b_scale2
+    if not soft_fp8:
+        accumulator *= fp4_max
+    accumulator *= b_scale2
     accumulator = accumulator.to(compute_type)
     # -----------------------------------------------------------
     # Write back the block of the output

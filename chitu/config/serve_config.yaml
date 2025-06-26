@@ -24,6 +24,7 @@ infer:
   num_blocks: -1 # a positive interger or -1 for auto num blocks calculation
   bind_process_to_cpu: auto # one of: auto, none, numa
   bind_thread_to_cpu: physical_core # one of: physical_core, logical_core
+  gpu_memory_utilization: 0.98 # GPU memory utilization for each GPU, e.g., 0.98 means 98% of GPU memory will be used.
 request:
   prompt_tokens_len: -1 # use for perf test in single_req_test.py, -1 means use real requests.
   max_new_tokens: 128

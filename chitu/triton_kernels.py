@@ -488,6 +488,7 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel(
     else:
         scale_2 = tl.load(b_s_2_ptr)
     fp4_to_fp8_scale = 64.0
+    fp4_max = 6.0
     for i in range(k):
         b = tl.load(
             b_ptrs,
@@ -511,17 +512,21 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel(
             mask=offs_k[None, :] < K - i * BLOCK_SIZE_K - BLOCK_SIZE_K // 2,
         )
         fp8_weight_1 = (
-            fp8_weight_1.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16) * b_s_1
+            fp8_weight_1.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+            * (fp4_to_fp8_scale / fp4_max)
+            * b_s_1
         )
         accumulator += tl.dot(a_1, fp8_weight_1.to(tl.float8e4nv)) * a_s[:, None]
         fp8_weight_2 = (
-            fp8_weight_2.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16) * b_s_2
+            fp8_weight_2.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+            * (fp4_to_fp8_scale / fp4_max)
+            * b_s_2
         )
         accumulator += tl.dot(a_2, fp8_weight_2.to(tl.float8e4nv)) * a_s[:, None]
         a_ptrs += BLOCK_SIZE_K
         b_ptrs += BLOCK_SIZE_K // 2
         b_s_ptrs += num_b_s_in_block
-    accumulator = accumulator * fp4_to_fp8_scale * scale_2
+    accumulator = accumulator * fp4_max * scale_2
     c = accumulator.to(c_ptr.dtype.element_ty)
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
