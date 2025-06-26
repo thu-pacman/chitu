@@ -88,7 +88,8 @@ class NormalExecutor(Executor):
             len(tasks.tasks) == logits.shape[0]
         ), f"logtis has shape {logits.shape}, but there are {len(tasks.tasks)} tasks"
         # TODO(lijian): this is a temperary solution to get max bs
-        use_cumulative = get_global_args().infer.max_reqs > 64
+        # use_cumulative = get_global_args().infer.max_reqs > 64
+        use_cumulative = False
         if tasks.should_apply_frequency_penalty:
             logits_index_list = []
             response_list = []

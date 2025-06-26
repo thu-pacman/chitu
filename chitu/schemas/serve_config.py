@@ -27,7 +27,7 @@ class InferConfig:
     pp_layer_partition: Optional[list] = MISSING
     use_cuda_graph: bool = MISSING
     num_blocks: int = MISSING
-    bind_process_to_cpu: Optional[str] = MISSING
+    bind_process_to_cpu: str = MISSING
     bind_thread_to_cpu: str = MISSING
     gpu_memory_utilization: float = MISSING
 
