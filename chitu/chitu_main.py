@@ -67,7 +67,9 @@ def init_cache_static():
     torch.cuda.reset_peak_memory_stats(0)
 
 
-def get_additional_block_num(total_gpu_memory, cache_manager):
+def get_additional_block_num(
+    total_gpu_memory, cache_manager, gpu_memory_utilization=0.98
+):
     """Calculate additional block numbers based on available memory"""
 
     def tuple_product(t):
@@ -82,7 +84,7 @@ def get_additional_block_num(total_gpu_memory, cache_manager):
     non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
     if non_torch_allocations > 0:
         peak_memory += non_torch_allocations
-    additional_kv_cache_memory = total_gpu_memory * 0.98 - peak_memory
+    additional_kv_cache_memory = total_gpu_memory * gpu_memory_utilization - peak_memory
     block_mem = (
         2
         * cache_manager.block_size
@@ -125,8 +127,11 @@ def warmup_engine(args):
         chitu_run()
     if should_calculate_blocks(args):
         _, total_gpu_memory = torch.cuda.mem_get_info(0)
+        gpu_memory_utilization = args.infer.gpu_memory_utilization
         get_global_args().infer.num_blocks = (
-            get_additional_block_num(total_gpu_memory, Backend.cache_manager)
+            get_additional_block_num(
+                total_gpu_memory, Backend.cache_manager, gpu_memory_utilization
+            )
             + args.infer.max_reqs
         )
 
