@@ -51,7 +51,7 @@ def set_quant_variables(global_args=None):
     assert isinstance(model_name, str)
 
     model_name = model_name.lower()
-    if not hasattr(models, "quant_config"):
+    if models.get("quant_config", None) is None:
         OmegaConf.set_struct(models, False)
         models["quant_config"] = {"rules": [], "type": None}
         OmegaConf.set_struct(models, True)

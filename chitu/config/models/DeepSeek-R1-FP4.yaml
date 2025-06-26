@@ -1,7 +1,7 @@
 # DeepSeek-R1-FP4 is a data-type variant of DeepSeek-R1
 defaults:
   - DeepSeek-R1
-  - quant_config: blockfp4
+  - override quant_config: blockfp4
   - _self_ # Config in this file overrides configs in defaults
 
 # Access info

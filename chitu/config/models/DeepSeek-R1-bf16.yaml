@@ -11,3 +11,4 @@ tokenizer_path: null # By default the same as ckpt_dir, or you can override it w
 
 # Overrides
 main_weight_dtype: bfloat16
+quant_config: null
