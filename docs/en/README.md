@@ -8,21 +8,11 @@ Chitu is a high-performance inference framework for large language models, focus
 
 ## News
 
-[2025/06/12] Released v0.3.6, added support for [GLM-4 models](https://huggingface.co/collections/THUDM/glm-4-0414-67f3cbcb34dd9d252707cb2e), and optimized startup configuration options.
-
 [2025/06/12] Released v0.3.5, added support for Ascend NPU aclgraph to enhance higher performance, and fixed some known issues.
-
-[2025/05/29] Release v0.3.4, with some performance optimizations.
-
-[2025/05/22] Released v0.3.3, with initial support for Ascend NPU.
-
-[2025/05/15] Released v0.3.2, added support for [Qwen3 models](https://huggingface.co/collections/Qwen/qwen3-67dd247413f0e2e4f653967f).
 
 [2025/04/29] Released v0.3.0, added support for online conversion of FP4 to FP8 and BF16, supported the [FP4 quantized version](https://huggingface.co/nvidia/DeepSeek-R1-FP4) of DeepSeek-R1 671B.
 
 [2025/04/18] Released v0.2.2, added support for CPU+GPU heterogeneous hybrid inference, and added optimized implementation of multiple operators.
-
-[2025/03/21] Better support for QwQ-32B, including [FP8 quantized version](https://huggingface.co/qingcheng-ai/QWQ-32B-FP8).
 
 [2025/03/14] Released v0.1.0, supports DeepSeek-R1 671B, and provides efficient operator implementation for online conversion of FP8 to BF16.
 
@@ -37,7 +27,7 @@ Chitu is a high-performance inference framework for large language models. Chitu
 
 ## Evaluation
 
-### Deploy Qwen3-32B on Hygon BW200 4-cards, chitu 0.3.6
+### Deploy Qwen3-32B on Hygon DCU 4-cards
 
 | Output token/s | input 256, output 256 | input 1024, output 1024|
 |:---|:---|:---|
@@ -49,7 +39,7 @@ Chitu is a high-performance inference framework for large language models. Chitu
 |bs=32| 592.70 | 546.70 |
 |bs=64| 962.24 | 808.09 |
 
-### Deploy Qwen3-32B on Ascend 910B Dual Cards (with aclgraph enabled via infer.use_cuda_graph=True)
+### Deploy Qwen3-32B on Ascend 910B Dual Cards
 
 | Batchsize | chitu 0.3.5, Output TPS (tokens/s) |
 |:---|:---|
@@ -59,6 +49,19 @@ Chitu is a high-performance inference framework for large language models. Chitu
 |16| 257.22 |
 |32| 444.38 |
 |64| 723.42 |
+
+### Deploy DeepSeek-R1-671B and DeepSeek-R1-Distill-Llama-70B on MetaX cluster
+
+|Batchsize| 2 nodes, 671B, FP8| 1 node, 70B, BF16 |
+|:---|:---|:---|
+|1| 20.31| 39.55 |
+|128| 195.89 | 812.17 |
+
+- Each node is with eight GPUs
+- The values ​​in the table are output token/s, and the input and output lengths are both 512 tokens
+- In the scenario of bs=1, the output rate of two nodes running FP8 version 671B is equivalent to that of four nodes running BF16 version
+- In the scenario of bs=128, the output rate of two nodes running FP8 version 671B is about half of that of four nodes running BF16 version
+- 70B Model can be run in native BF16 format for good performance
 
 ### Deploy DeepSeek-R1-671B on a single eight-card H20 (96G) server
 
@@ -110,19 +113,6 @@ Chitu is a high-performance inference framework for large language models. Chitu
 - The values ​​in the table are output token/s
 - From the test data of different batch sizes, based on the Chitu engine, the output speed of the FP8 model running on 3 nodes is about 75%\~90% of that of the BF16 model running on 6 nodes, that is, the output per unit computing power has been improved by 1.5x\~1.8x
 - This is because the decoding process mainly depends on the memory access bandwidth. Using half of the GPU to access half of the data (the weight size of FP8 is half of that of BF16) will not take longer, and the reduction of GPU computing power will only bring a small impact
-
-### Deploy DeepSeek-R1-671B and DeepSeek-R1-Distill-Llama-70B on MetaX cluster
-
-|Batchsize| 2 nodes, 671B, FP8| 1 node, 70B, BF16 |
-|:---|:---|:---|
-|1| 20.31| 39.55 |
-|128| 195.89 | 812.17 |
-
-- Each node is with eight GPUs
-- The values ​​in the table are output token/s, and the input and output lengths are both 512 tokens
-- In the scenario of bs=1, the output rate of two nodes running FP8 version 671B is equivalent to that of four nodes running BF16 version
-- In the scenario of bs=128, the output rate of two nodes running FP8 version 671B is about half of that of four nodes running BF16 version
-- 70B Model can be run in native BF16 format for good performance
 
 ## Getting started
 
