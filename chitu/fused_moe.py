@@ -20,7 +20,13 @@ import triton
 import triton.language as tl
 
 from chitu.device_type import is_muxi, is_nvidia, get_device_name
-from chitu.triton_kernels import moe_sum_kernel
+from chitu.triton_kernels import (
+    moe_sum_kernel,
+    SIGNED_INT32_0x87F00000,
+    SIGNED_INT16_0x81C0,
+    SIGNED_INT16_0x87F0,
+    SIGNED_INT8_0x9C,
+)
 from chitu.ops import silu_and_mul, to_triton_dtype
 from chitu.utils import ceil_div, try_import_opt_dep
 
@@ -291,21 +297,21 @@ def fused_moe_kernel_soft_fp4(
                 b_scale_2 = b_scale_2.to(tl.int8, bitcast=True).to(
                     tl.int16
                 )  # Do signed cast to copy the sign bit
-                bf16_s_1 = (b_scale_1 << 4) & 0x87F0
-                bf16_s_2 = (b_scale_2 << 4) & 0x87F0
+                bf16_s_1 = (b_scale_1 << 4) & SIGNED_INT16_0x87F0
+                bf16_s_2 = (b_scale_2 << 4) & SIGNED_INT16_0x87F0
                 b_scale_1 = bf16_s_1.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
                 b_scale_2 = bf16_s_2.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
                 b = b.to(tl.int8, bitcast=True).to(
                     tl.int16
                 )  # Do signed cast to copy the sign bit
-                bf16_weight_1 = (b << 12 >> 6) & 0x81C0
+                bf16_weight_1 = (b << 12 >> 6) & SIGNED_INT16_0x81C0
                 bf16_weight_1 = (
                     bf16_weight_1.to(tl.bfloat16, bitcast=True)
                     * b_scale_1
                     * fp4_to_bf16_scale
                 )
                 accumulator += tl.dot(a_1, bf16_weight_1)
-                bf16_weight_2 = (b << 2) & 0x81C0
+                bf16_weight_2 = (b << 2) & SIGNED_INT16_0x81C0
                 bf16_weight_2 = (
                     bf16_weight_2.to(tl.bfloat16, bitcast=True)
                     * b_scale_2
@@ -325,14 +331,16 @@ def fused_moe_kernel_soft_fp4(
                 tmp_accumulator = tl.zeros(
                     (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32
                 )
-                fp8_weight_1 = (b.to(tl.int8, bitcast=True) << 4 >> 2) & 0x9C
+                fp8_weight_1 = (
+                    b.to(tl.int8, bitcast=True) << 4 >> 2
+                ) & SIGNED_INT8_0x9C
                 fp8_weight_1 = (
                     fp8_weight_1.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
                     * (fp4_to_fp8_scale / fp4_max)
                     * b_scale_1
                 ).to(tl.float8e4nv)
                 tmp_accumulator += tl.dot(a_1, fp8_weight_1)
-                fp8_weight_2 = (b.to(tl.int8, bitcast=True) >> 2) & 0x9C
+                fp8_weight_2 = (b.to(tl.int8, bitcast=True) >> 2) & SIGNED_INT8_0x9C
                 fp8_weight_2 = (
                     fp8_weight_2.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
                     * (fp4_to_fp8_scale / fp4_max)
@@ -537,7 +545,7 @@ def fused_moe_kernel(
                     t = b.to(tl.int8, bitcast=True).to(
                         tl.int32
                     )  # Do signed cast to copy the sign bit
-                    t = (t << 20) & 0x87F00000
+                    t = (t << 20) & SIGNED_INT32_0x87F00000
                     b_unscaled_fp32 = t.to(tl.float32, bitcast=True)
                     b_new_scale = b_scale * fp8_to_fp32_scale
                     b_scaled_fp32 = b_unscaled_fp32 * b_new_scale
