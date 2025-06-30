@@ -138,7 +138,9 @@ def warmup_engine(args):
     logger.warning("Inference system warmup completed")
 
 
-def chitu_init(args, logging_level=logging.INFO):
+def chitu_init(args, logging_level=None):
+    debug = os.getenv("CHITU_DEBUG", "0") == "1"
+
     if (
         is_nvidia()
         and torch.distributed.is_nccl_available()
@@ -146,6 +148,8 @@ def chitu_init(args, logging_level=logging.INFO):
     ):
         os.environ["NCCL_NVLS_NCHANNELS"] = "32"
 
+    if logging_level is None:
+        logging_level = logging.DEBUG if debug else logging.INFO
     init_logger(logging_level)
 
     # Deal with legacy arguments
@@ -175,7 +179,7 @@ def chitu_init(args, logging_level=logging.INFO):
         os.environ["ASCEND_CUSTOM_OPP_PATH"] = site_packages_path
 
     set_quant_variables(args)
-    set_global_variables(args)
+    set_global_variables(args, debug=debug)
 
     Backend.build(args)
     rank = torch.distributed.get_rank()
