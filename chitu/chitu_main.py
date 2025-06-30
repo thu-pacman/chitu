@@ -222,8 +222,6 @@ def update_ongoing_tasks():
 
 
 def chitu_update(task_ids, rank, world_size):
-    if rank == 0:
-        TaskPool.display()
     if world_size == 1:
         Backend.scheduler.update(task_ids)
     else:
@@ -254,7 +252,6 @@ def chitu_run():
     if Backend.args.infer.pp_size > 1 and rank == 0:
         chitu_update(task_ids, rank, world_size)
     elif rank == 0:
-        TaskPool.display()
         removed_decode_task_ids = Backend.scheduler.update(task_ids)
         if world_size != 1:
             remove_task_other_device(removed_decode_task_ids)

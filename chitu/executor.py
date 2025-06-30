@@ -1,7 +1,7 @@
 import os
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Optional, Sequence
+from typing import Optional
 
 import numpy as np
 import torch
@@ -14,11 +14,7 @@ from chitu.task import (
     PackedTasks,
     PackedTasksBase,
     SerializedPackedTasksPayloadType,
-    Task,
     TaskType,
-    UserRequest,
-    req_decode,
-    taskid2reqid,
 )
 from chitu.tensor_parallel import get_tp_group, get_pp_group, get_cpu_tp_group
 from chitu.utils import VarLens, top_k_top_p_min_p_sampling_from_probs_torch
@@ -82,14 +78,14 @@ class NormalExecutor(Executor):
     def __init__(self, args):
         super().__init__(args)
 
-    def update_response(self, tasks: PackedTasks, logits: torch.Tensor):
-        logits = logits.view(-1, logits.shape[-1])
-        assert (
-            len(tasks.tasks) == logits.shape[0]
-        ), f"logtis has shape {logits.shape}, but there are {len(tasks.tasks)} tasks"
-        # TODO(lijian): this is a temperary solution to get max bs
+    def sample(self, logits: torch.Tensor, tasks: PackedTasks):
+        # logits is [num_tasks, vocab_size]
+
+        # preprocess: apply frequency penalty
+        # TODO(lijian): this is a temporary solution to get max bs
         # use_cumulative = get_global_args().infer.max_reqs > 64
         use_cumulative = False
+
         if tasks.should_apply_frequency_penalty:
             logits_index_list = []
             response_list = []
@@ -121,6 +117,7 @@ class NormalExecutor(Executor):
             else:
                 assert tasks.cumulative_freq_penalties is not None
                 logits.sub_(tasks.cumulative_freq_penalties)
+
         if tasks.is_all_greedy:
             tokens = torch.argmax(logits, dim=-1)
         else:
@@ -128,11 +125,36 @@ class NormalExecutor(Executor):
             tokens = top_k_top_p_min_p_sampling_from_probs_torch(
                 probs, tasks.top_ks, tasks.top_ps
             )
+
         if use_cumulative:
             tasks.update_cumulative_freq_penalties(tokens)
+
+        return tokens
+
+    def update_response(self, tasks: PackedTasks, logits: torch.Tensor):
+        logits = logits.view(-1, logits.shape[-1])
+        assert (
+            len(tasks.tasks) == logits.shape[0]
+        ), f"logits has shape {logits.shape}, but there are {len(tasks.tasks)} tasks"
+
+        tokens = self.sample(logits, tasks)
         tokens_cpu = tokens.cpu()
-        for it, task in enumerate(tasks.tasks):
-            task.update_response(tokens_cpu[it].item(), tokens[it], logits[it])
+
+        if tasks.return_logprobs:
+            logprobs = torch.log_softmax(logits, dim=-1)
+            logprobs, token_idxs = logprobs.sort(dim=-1, descending=True)
+            logprobs_cpu = logprobs.cpu()
+            token_idxs_cpu = token_idxs.cpu()
+            for it, task in enumerate(tasks.tasks):
+                task.update_response(
+                    tokens_cpu[it].item(),
+                    tokens[it],
+                    logprobs_cpu[it],
+                    token_idxs_cpu[it],
+                )
+        else:
+            for it, task in enumerate(tasks.tasks):
+                task.update_response(tokens_cpu[it].item(), tokens[it])
 
     def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
         """Make every ranks know the task metadata"""
@@ -342,7 +364,7 @@ class PipeTensorExecutor(NormalExecutor):
         remove_kvcache = False
         is_heartbeat = False
 
-        # PP stage 0 initialzie from the argument. PP stage >= 1 recv task tensor from stage - 1
+        # PP stage 0 initialize from the argument. PP stage >= 1 recv task tensor from stage - 1
         if self.rank == 0:
             if Backend.state == BackendState.Running:
                 task_tensor = tasks.serialize(
