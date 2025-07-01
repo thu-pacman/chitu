@@ -160,8 +160,11 @@ class Task:
         self.sched_ts = self.arrv_ts
         self.priority = priority
         self.sched_score = 0
-        self.max_output_tokens = -1
         self.stop_with_eos = stop_with_eos
+
+        # response related
+        self.num_new_tokens: int = 0
+        self.next_token: int = -1  # Only effective when num_new_tokens > 0
 
         # Waiting is only meaningful in pipeline parallelism. It means either of:
         # 1) waiting logits to return from another node, or
@@ -203,14 +206,17 @@ class Task:
         )
 
     def need_remove(self):
-        if self.stop_with_eos:
-            if (
-                len(self.response) > 0
-                and self.response[-1].item() in Backend.tokenizer.stop_tokens
-            ) and not self.waiting:
-                self.req.finish_reason = "stop"
-                return True
-        if len(self.response) >= self.req.max_new_tokens and not self.waiting:
+        if self.waiting:
+            return False
+
+        if (
+            self.stop_with_eos
+            and self.num_new_tokens > 0
+            and self.next_token in Backend.tokenizer.stop_tokens
+        ):
+            self.req.finish_reason = "stop"
+            return True
+        if self.num_new_tokens >= self.req.max_new_tokens:
             self.req.finish_reason = "length"
             return True
         return False
@@ -225,9 +231,9 @@ class Task:
         # TODO: modify if generate more than one token at a time
         assert token is not None
         self.response.append(token_gpu)
+        self.num_new_tokens += 1
         self.next_token = token
         self.prefix_length += 1
-        self.max_output_tokens -= 1
         if self.req.logprobs:
             logprobs = logprobs[: max(1, self.req.top_logprobs)].tolist()
             token_idxs = token_idxs[: max(1, self.req.top_logprobs)].tolist()
