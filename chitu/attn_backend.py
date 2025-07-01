@@ -386,9 +386,9 @@ class RefAttnBackend(AttnBackend):
     ):
         """
         Arguments:
-            q: (batch_size, seqlen_q, nheads, head_dim)
-            k: (batch_size, seqlen_k, nheads_k, head_dim)
-            v: (batch_size, seqlen_k, nheads_k, head_dim)
+            q: (batch_size, seqlen_q, nheads, head_dim_qk)
+            k: (batch_size, seqlen_k, nheads_k, head_dim_qk)
+            v: (batch_size, seqlen_k, nheads_k, head_dim_v)
             query_padding_mask: (batch_size, seqlen_q)
             key_padding_mask: (batch_size, seqlen_k)
             attn_bias: broadcastable to (batch_size, nheads, seqlen_q, seqlen_k)
@@ -402,7 +402,7 @@ class RefAttnBackend(AttnBackend):
                 without changing the math. This is to estimate the numerical error from operation
                 reordering.
         Output:
-            output: (batch_size, seqlen_q, nheads, head_dim)
+            output: (batch_size, seqlen_q, nheads, head_dim_v)
             attention: (batch_size, nheads, seqlen_q, seqlen_k), softmax after dropout
         """
         if causal:
@@ -847,27 +847,26 @@ class TritonAttnBackend(RefAttnBackend):
             seqlens = cache_seqlens
         elif k is not None and q is not None:
             seqlens = cache_seqlens + 1
-            if block_table is not None:
-                page_size = k_cache.shape[1]
-                for i in range(cache_seqlens.shape[0]):
-                    k_cache[
-                        block_table[i, cache_seqlens[i] // page_size],
-                        cache_seqlens[i] % page_size,
-                    ] = k[i]
-                    v_cache[
-                        block_table[i, cache_seqlens[i] // page_size],
-                        cache_seqlens[i] % page_size,
-                    ] = v[i]
+            if block_table is None:
+                append_to_non_paged_kv_cache(k_cache, k.contiguous(), cache_seqlens)
+                append_to_non_paged_kv_cache(v_cache, v.contiguous(), cache_seqlens)
             else:
-                for i in range(cache_seqlens.shape[0]):
-                    k_cache[i, cache_seqlens[i]] = k[i]
-                    v_cache[i, cache_seqlens[i]] = v[i]
+                append_to_paged_kv_cache(
+                    k_cache, block_table, k.contiguous(), cache_seqlens
+                )
+                append_to_paged_kv_cache(
+                    v_cache, block_table, v.contiguous(), cache_seqlens
+                )
         else:
             assert False
 
         if block_table is not None:
             PAGE_SIZE = k_cache.shape[1]
-            output = torch.zeros_like(q)
+            output = torch.empty(
+                (q.shape[0], q.shape[1], q.shape[2], v_cache.shape[-1]),
+                dtype=q.dtype,
+                device=q.device,
+            )
             num_kv_splits = None
             if is_muxi():
                 if q.shape[0] > 32:
