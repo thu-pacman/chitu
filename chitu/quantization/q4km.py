@@ -1,9 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from chitu.quantization.registry import (
-    QuantizationRegistry,
-)
+from chitu.quantization.registry import QuantizationRegistry, QuantizedMoeExpertsBase
 from chitu.global_vars import get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.hybrid_device import CPUParameter
@@ -11,7 +9,7 @@ import ctypes
 
 
 @QuantizationRegistry.register_moe_experts("q4km")
-class MoeExpertsDeepSeekV3CPU(torch.nn.Module):
+class MoeExpertsDeepSeekV3CPU(QuantizedMoeExpertsBase):
     """
     Mixture-of-Experts (MoE) module.
 
@@ -29,6 +27,8 @@ class MoeExpertsDeepSeekV3CPU(torch.nn.Module):
 
     def __init__(
         self,
+        ############################################
+        # Common parameters for all quantizations
         dim: int,
         moe_inter_dim: int,
         n_routed_experts: int,
@@ -36,11 +36,13 @@ class MoeExpertsDeepSeekV3CPU(torch.nn.Module):
         n_activated_experts: int,
         moe_world_size: int,
         moe_rank: int,
-        dtype: torch.dtype,
         op_impl: str,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
+        *,
+        ############################################
+        # Parameters specific to this quantization
         ggml_type: str,
     ):
         """

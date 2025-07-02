@@ -136,7 +136,14 @@ class GPTQLinear(QuantizedLinearBase):
     """
 
     def __init__(
-        self, in_features: int, out_features: int, has_bias: bool = True, **kwargs
+        self,
+        ############################################
+        # Common parameters for all quantizations
+        in_features: int,
+        out_features: int,
+        has_bias: bool = True,
+        ############################################
+        # No parameters specific to this quantization
     ):
         super().__init__()
         self.pack_dtype_bits = 32
@@ -194,10 +201,6 @@ class GPTQLinear(QuantizedLinearBase):
             )
         else:
             self.bias = None
-
-        self.is_lm_head = False
-        if kwargs.get("name") is not None and kwargs.get("lm_head_name") is not None:
-            self.is_lm_head = kwargs["name"] == kwargs["lm_head_name"]
 
         self.fp32 = True
 

@@ -106,8 +106,6 @@ def LocalLinear(
     out_features: int,
     checkpoint_prefix: str,
     has_bias: bool = True,
-    dtype=None,
-    bias_dtype=None,
     *,
     base_linear_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
@@ -119,8 +117,6 @@ def LocalLinear(
         in_features: size of each input sample
         out_features: size of each output sample
         has_bias: If set to True, the layer will have a bias.
-        dtype: The desired data type of the parameters.
-        bias_dtype: The desired data type of the bias. Defaults to `dtype`.
         base_linear_class: The base linear class to use. Defaults to be determined by the global
             quantization method.
         quant_kwargs: Nested mapping for additional arguments for specific
@@ -135,8 +131,6 @@ def LocalLinear(
         in_features=in_features,
         out_features=out_features,
         has_bias=has_bias,
-        dtype=dtype,
-        bias_dtype=bias_dtype,
     )
 
 
@@ -171,8 +165,6 @@ def ColumnParallelLinear(
     checkpoint_prefix: str,
     has_bias: bool = True,
     gather_output: bool = True,
-    dtype=None,
-    bias_dtype=None,
     *,
     base_linear_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
@@ -200,8 +192,6 @@ def ColumnParallelLinear(
         out_features=out_features,
         has_bias=has_bias,
         gather_output=gather_output,
-        dtype=dtype,
-        bias_dtype=bias_dtype,
     )
 
 
@@ -237,8 +227,6 @@ def RowParallelLinear(
     has_bias: bool = True,
     input_is_parallel: bool = False,
     reduce_output: bool = True,
-    dtype=None,
-    bias_dtype=None,
     *,
     base_linear_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
@@ -266,8 +254,6 @@ def RowParallelLinear(
         has_bias=has_bias,
         input_is_parallel=input_is_parallel,
         reduce_output=reduce_output,
-        dtype=dtype,
-        bias_dtype=bias_dtype,
     )
 
 
@@ -278,8 +264,6 @@ class ColumnParallelLinearMixIn:
         out_features: int,
         has_bias: bool = True,
         gather_output: bool = True,
-        dtype=None,
-        bias_dtype=None,
     ):
         """
         Ouput-dimension-parallelized linear layer
@@ -289,8 +273,6 @@ class ColumnParallelLinearMixIn:
             out_features: size of each output sample
             has_bias: If set to True, the layer will have a bias.
             gather_output: If set to True, an all-gather operation is performed on the output tensor.
-            dtype: The desired data type of the parameters.
-            bias_dtype: The desired data type of the bias. Defaults to `dtype`.
         """
 
         tp_group = get_tp_group()
@@ -307,8 +289,6 @@ class ColumnParallelLinearMixIn:
             in_features=in_features,
             out_features=local_out_features,
             has_bias=has_bias,
-            dtype=dtype,
-            bias_dtype=bias_dtype,
         )
 
         self.gather_output = gather_output
@@ -338,8 +318,6 @@ class RowParallelLinearMixIn:
         has_bias: bool = True,
         input_is_parallel: bool = False,
         reduce_output: bool = True,
-        dtype=None,
-        bias_dtype=None,
     ):
         """
         Input-dimension-parallelized linear layer
@@ -350,8 +328,6 @@ class RowParallelLinearMixIn:
             has_bias: If set to True, the layer will have a bias.
             input_is_parallel: If set to True, the input tensor is already parallelized.
             reduce_output: If set to True, an all-reduce operation is performed on the output tensor.
-            dtype: The desired data type of the parameters.
-            bias_dtype: The desired data type of the bias. Defaults to `dtype`.
         """
 
         tp_group = get_tp_group()
@@ -369,8 +345,6 @@ class RowParallelLinearMixIn:
             in_features=local_in_features,
             out_features=out_features,
             has_bias=has_bias if rank == 0 else False,
-            dtype=dtype,
-            bias_dtype=bias_dtype,
         )
 
         self.input_is_parallel = input_is_parallel

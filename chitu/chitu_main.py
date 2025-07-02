@@ -138,7 +138,9 @@ def warmup_engine(args):
     logger.warning("Inference system warmup completed")
 
 
-def chitu_init(args, logging_level=logging.INFO):
+def chitu_init(args, logging_level=None):
+    debug = os.getenv("CHITU_DEBUG", "0") == "1"
+
     if (
         is_nvidia()
         and torch.distributed.is_nccl_available()
@@ -146,6 +148,8 @@ def chitu_init(args, logging_level=logging.INFO):
     ):
         os.environ["NCCL_NVLS_NCHANNELS"] = "32"
 
+    if logging_level is None:
+        logging_level = logging.DEBUG if debug else logging.INFO
     init_logger(logging_level)
 
     # Deal with legacy arguments
@@ -168,9 +172,14 @@ def chitu_init(args, logging_level=logging.INFO):
             torch.cuda.CUDAGraph = torch.npu.NPUGraph
         except ImportError:
             raise ImportError("torch_npu is not installed")
+        # Set environ for ascend
+        from chitu.utils import get_ascend_custom_opp_path
+
+        site_packages_path = get_ascend_custom_opp_path()
+        os.environ["ASCEND_CUSTOM_OPP_PATH"] = site_packages_path
 
     set_quant_variables(args)
-    set_global_variables(args)
+    set_global_variables(args, debug=debug)
 
     Backend.build(args)
     rank = torch.distributed.get_rank()
@@ -213,8 +222,6 @@ def update_ongoing_tasks():
 
 
 def chitu_update(task_ids, rank, world_size):
-    if rank == 0:
-        TaskPool.display()
     if world_size == 1:
         Backend.scheduler.update(task_ids)
     else:
@@ -245,7 +252,6 @@ def chitu_run():
     if Backend.args.infer.pp_size > 1 and rank == 0:
         chitu_update(task_ids, rank, world_size)
     elif rank == 0:
-        TaskPool.display()
         removed_decode_task_ids = Backend.scheduler.update(task_ids)
         if world_size != 1:
             remove_task_other_device(removed_decode_task_ids)

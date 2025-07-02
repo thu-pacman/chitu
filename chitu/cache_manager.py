@@ -131,10 +131,11 @@ class PagedKVCacheManager:
         if (
             get_global_args().infer.attn_type == "npu"
             and len(self.k_shape_per_sample) == 1
+            and get_global_args().models.type != "deepseek-v3"
         ):
             # NPU BSH layout
-            xk = xk.view(xk.shape[0], -1).contiguous()
-            xv = xv.view(xv.shape[0], -1).contiguous()
+            xk = xk.view(xk.shape[0], -1).contiguous() if xk is not None else None
+            xv = xv.view(xv.shape[0], -1).contiguous() if xv is not None else None
 
         for idx, req_id in enumerate(req_ids):
             num_blocks_prepared = (

@@ -1,12 +1,10 @@
 import hydra
-from omegaconf import DictConfig
 import torch
 import time
 import os
 import random
 import logging
 from logging import getLogger
-from faker import Faker
 
 from chitu.task import UserRequest, TaskPool, Task
 from chitu.chitu_main import (

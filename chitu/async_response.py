@@ -166,9 +166,10 @@ class AsyncResponse:
                         }
                     ],
                     usage={
-                        "prompt_tokens": f"{self.req.prompt_len}",
-                        "completion_tokens": f"{self.async_stream.tokens_len}",
-                        "total_tokens": f"{self.async_stream.tokens_len + self.req.prompt_len}",
+                        "prompt_tokens": self.req.prompt_len,
+                        "completion_tokens": self.async_stream.tokens_len,
+                        "total_tokens": self.async_stream.tokens_len
+                        + self.req.prompt_len,
                     },
                 )
                 data = chunk.model_dump_json(exclude_none=True)
@@ -226,9 +227,9 @@ class AsyncResponse:
             id=self.id,
             choices=[{"index": 0, "message": message, "logprobs": logprobs}],
             usage={
-                "prompt_tokens": f"{self.req.prompt_len}",
-                "completion_tokens": f"{self.async_stream.tokens_len}",
-                "total_tokens": f"{self.async_stream.tokens_len + self.req.prompt_len}",
+                "prompt_tokens": self.req.prompt_len,
+                "completion_tokens": self.async_stream.tokens_len,
+                "total_tokens": self.async_stream.tokens_len + self.req.prompt_len,
             },
         )
         logger.debug(

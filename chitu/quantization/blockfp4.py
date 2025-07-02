@@ -22,9 +22,67 @@ chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_ba
 triton, has_triton = try_import_opt_dep("triton", "triton")
 if has_triton:
     from chitu.fused_moe import fused_experts
+torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
+if has_torch_npu:
+    from chitu.npu_utils import fused_experts_npu
+grouped_gemm, _ = try_import_opt_dep("grouped_gemm", "ascend_kernels")
 
 
 logger = getLogger(__name__)
+
+
+def linear_block_fp4_npu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    assert (
+        weight.shape[-2] % 2 == 0
+    ), f"Weight shape[-2] must be even, but got {weight.shape[-2]}"
+    assert (
+        weight.shape[-1] % 2 == 0
+    ), f"Weight shape[-1] must be even, but got {weight.shape[-1]}"
+    # 针对反量化矩阵乘算子做的 shape 适配
+    weight = weight.reshape(weight.shape[-1] * 2, weight.shape[-2] // 2)
+    weight = weight.unsqueeze(0)
+    weight_scale = weight_scale.unsqueeze(0)
+    scale = weight_scale.transpose(-2, -1)
+    if not scale.is_contiguous():
+        scale = scale.contiguous()
+    scale_off = torch.empty_like(scale)
+    output = torch.empty(
+        [x.shape[0], weight.shape[-1] * 2], dtype=x.dtype, device=x.device
+    )
+    # NOTE: 生成一个仅有一个元素的 Tensor，值为 N,并且需要保证 export tokens 是一个一维的 Tensor
+    expert_tokens = torch.full([1], x.shape[0], device=x.device, dtype=torch.int64)
+
+    if x.dim() == 3:
+        # 三维的 x 需要squeeze到二维,在NpuAttnBackend mla_attn_with_kvcache中 x 会被 unsqueeze 到三维
+        x = x.squeeze(1)
+        grouped_gemm.grouped_gemm(
+            x,
+            weight,
+            antiquantOffsetOptional=scale_off,
+            antiquantScaleOptional=scale,
+            groupListOptional=expert_tokens,
+            output=output,
+        )
+        output = output.unsqueeze(1)
+    else:
+        grouped_gemm.grouped_gemm(
+            x,
+            weight,
+            antiquantOffsetOptional=scale_off,
+            antiquantScaleOptional=scale,
+            groupListOptional=expert_tokens,
+            output=output,
+        )
+
+    if bias is not None:
+        output += bias
+    return output
 
 
 def linear_block_fp4(
@@ -64,6 +122,8 @@ def linear_block_fp4(
             if bias is not None:
                 y += bias
             return y
+        elif get_global_args().infer.npu_fusion_fp4:
+            return linear_block_fp4_npu(x, weight, weight_scale, weight_scale_2, bias)
         else:
             raise NotImplementedError(
                 f"Soft-fp8 fused gemm not implemented for {get_device_name()}"
@@ -97,7 +157,6 @@ class Blockfp4Linear(QuantizedLinearBase):
         in_features: size of each input sample
         out_features: size of each output sample
         has_bias: If set to True, the layer will have a bias.
-        dtype: The desired data type of the parameters.
         bias_dtype: The desired data type of the bias.
         block_shape: The block shape (in, out) of first-level scaling. Defaults to
             (16, 1).
@@ -108,10 +167,14 @@ class Blockfp4Linear(QuantizedLinearBase):
 
     def __init__(
         self,
+        ############################################
+        # Common parameters for all quantizations
         in_features: int,
         out_features: int,
         has_bias: bool = False,
-        dtype=torch.uint8,
+        *,
+        ############################################
+        # Parameters specific to this quantization
         bias_dtype=None,
         block_shape: Tuple[int, int] = (16, 1),
         block_shape_2: Optional[Tuple[int, int]] = None,
@@ -119,7 +182,6 @@ class Blockfp4Linear(QuantizedLinearBase):
     ):
         super().__init__()
 
-        dtype = dtype or torch.uint8
         if block_shape_2 is None:
             block_shape_2 = (in_features, out_features)
 
@@ -135,20 +197,27 @@ class Blockfp4Linear(QuantizedLinearBase):
                         out_features,
                         in_features // 2,  # Every 2 float4 is packed into 1 uint8
                     ),
-                    dtype=dtype,
+                    dtype=torch.uint8,
                 ),
                 requires_grad=False,
             ),
         )
 
         block_in, block_out = block_shape
+        if (
+            get_global_args().models.type == "hf-llama"
+            and get_global_args().infer.npu_fusion_fp4
+        ):
+            dtype = torch.bfloat16
+        else:
+            dtype = torch.uint8
         self.register_parameter(
             "weight_scale",
             torch.nn.Parameter(
                 torch.empty(
                     ceil_div(out_features, block_out),
                     ceil_div(in_features, block_in),
-                    dtype=torch.uint8,
+                    dtype=dtype,
                 ),
                 requires_grad=False,
             ),
@@ -211,6 +280,8 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
 
     def __init__(
         self,
+        ############################################
+        # Common parameters for all quantizations
         dim: int,
         moe_inter_dim: int,
         n_routed_experts: int,
@@ -218,11 +289,12 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
         n_activated_experts: int,
         moe_world_size: int,
         moe_rank: int,
-        dtype: torch.dtype,
         op_impl: str,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
+        ############################################
+        # No parameters specific to this quantization
     ):
         """
         Initializes the MoE module.
@@ -230,23 +302,27 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
         Args:
             args (ModelArgs): Model arguments containing MoE parameters.
         """
-        super().__init__(
-            dim,
-            moe_inter_dim,
-            n_routed_experts,
-            n_shared_experts,
-            n_activated_experts,
-            moe_world_size,
-            moe_rank,
-            dtype,
-            op_impl,
-            fuse_shared_experts,
-            checkpoint_prefix,
-            build_weight=False,
-            merge_gate_up=merge_gate_up,
-        )
+        super().__init__()
 
-        self.linear_dtype = torch.uint8
+        self.op_impl = op_impl
+        self.dim = dim
+        self.fuse_shared_experts = fuse_shared_experts
+        assert (
+            n_routed_experts % moe_world_size == 0
+        ), f"Number of experts must be divisible by world size (world_size={moe_world_size})"
+        self.n_shared_experts = n_shared_experts
+        self.n_fused_shared_experts = (
+            n_shared_experts if self.fuse_shared_experts else 0
+        )
+        self.n_routed_experts = n_routed_experts
+        self.n_local_experts = n_routed_experts // moe_world_size
+        self.experts_start_idx = moe_rank * self.n_local_experts
+        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        self.group_size = (
+            self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts
+        )
+        self.checkpoint_prefix = checkpoint_prefix
+        self.merge_gate_up = merge_gate_up
 
         quant_scale_stride = 16
 
@@ -257,7 +333,7 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
                     self.group_size,
                     moe_inter_dim * 2,
                     dim // 2,
-                    dtype=self.linear_dtype,
+                    dtype=torch.uint8,
                 ),
                 requires_grad=False,
             )
@@ -295,7 +371,7 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
                     self.group_size,
                     moe_inter_dim,
                     dim // 2,
-                    dtype=self.linear_dtype,
+                    dtype=torch.uint8,
                 ),
                 requires_grad=False,
             )
@@ -331,7 +407,7 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
                     self.group_size,
                     moe_inter_dim,
                     dim // 2,
-                    dtype=self.linear_dtype,
+                    dtype=torch.uint8,
                 ),
                 requires_grad=False,
             )
@@ -369,7 +445,7 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
                 self.group_size,
                 dim,
                 moe_inter_dim // 2,
-                dtype=self.linear_dtype,
+                dtype=torch.uint8,
             ),
             requires_grad=False,
         )
@@ -401,6 +477,18 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
             requires_grad=False,
         )
 
+    def _compute_npu_fused_experts(self, x, weights, indices):
+        y = fused_experts_npu(
+            hidden_states=x,
+            w1=self.gate_up_proj_weight,
+            w2=self.down_proj_weight,
+            topk_weights=weights,
+            topk_ids=indices,
+            w1_scale=self.gate_up_proj_weight_scale,
+            w2_scale=self.down_proj_weight_scale,
+        )
+        return y
+
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
     ) -> torch.Tensor:
@@ -423,6 +511,8 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
             raise NotImplementedError(
                 "muxi_custom_kernel is not supported for blockfp4 MoeExperts"
             )
+        elif has_torch_npu:
+            y = self._compute_npu_fused_experts(x, weights, indices)
         elif has_triton and self.merge_gate_up:
             raise_to_16 = (
                 parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize

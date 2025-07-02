@@ -48,7 +48,7 @@ class ChatRequest(BaseModel):
     messages: List[Message]
     logprobs: bool = False
     top_logprobs: Optional[int] = None
-    max_tokens: int = 128
+    max_tokens: Optional[int] = None
     stream: bool = False
     temperature: float = 0.8  # [0, 2]
     top_p: float = 0.9  # [0,1]

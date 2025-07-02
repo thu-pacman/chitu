@@ -5,9 +5,13 @@ This file has adaption of open-source code from the following sources:
   licensed under Apache 2.0.
 """
 
-from logging import getLogger
-from typing import Any, Tuple, Optional
+import functools
+import logging
+from logging import WARNING, INFO, getLogger
+import os
+from pathlib import Path
 import random
+from typing import Any, List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -20,6 +24,23 @@ logger = getLogger(__name__)
 
 
 def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> Tuple[Any, bool]:
+    """
+    Import an optional dependency.
+
+    The package name and optional dependency name should be consistent with the listing
+    in `setup.py`. For example, you can list a Python package `my_quant_wxax` in the
+    `quant` extra of `setup.py`, then you can use this function like `try_import_opt_dep('my_quant_wxax', 'quant')`,
+    and the user may install the optional dependency like `pip install chitu[quant]`.
+
+    Args:
+        pkg_name (str): The name of the Python package to import.
+        opt_dep_name (str): The name of the optional dependency category in `setup.py`.
+
+    Returns:
+        [0]: The imported module if successful, or a dummy object that raises an ImportError.
+        [1]: A boolean indicating whether the import was successful.
+    """
+
     try:
         return importlib.import_module(pkg_name), True
     except ImportError:
@@ -121,6 +142,13 @@ def get_config_dir_path():
     return pkg_resources.resource_filename("chitu", "config")
 
 
+def get_ascend_custom_opp_path():
+    import site
+
+    site_packages_path = os.path.join(site.getsitepackages()[0], "vendors", "customize")
+    return site_packages_path
+
+
 def parse_dtype(
     name: str,
 ) -> torch.dtype:
@@ -140,7 +168,231 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
+class DataSaver:
+    """数据保存装饰器类"""
+
+    def __init__(
+        self,
+        max_files: int = 5,
+        save_prob: float = 0.1,
+        save_dir: str = "test_data",
+        save_tensors: List[str] = None,
+        save_attrs: List[str] = None,
+        save_locals: List[str] = None,
+        save_return: bool = True,
+    ):
+        self.max_files = max_files
+        self.save_prob = save_prob
+        self.save_dir = Path(save_dir + "/")
+        self.saved_files: List[str] = []  # 存储所有保存的文件名
+        self.replaceable_files: List[str] = []  # 存储可替换的文件名
+        self.call_count = 0
+        self.random = random.Random(42)  # 使用固定种子确保可重复性
+        self.save_tensors = save_tensors or []  # 指定要保存的张量名称列表
+        self.save_attrs = save_attrs or []  # 指定要保存的类成员变量名称列表
+        self.save_locals = save_locals or []  # 指定要保存的局部变量名称列表
+        self.save_return = save_return  # 是否默认保存函数返回值
+
+        # 获取当前机器编号和卡号
+        self.machine_id = int(os.environ.get("RANK", 0)) // 8  # 假设每台机器8张卡
+        self.card_id = int(os.environ.get("RANK", 0)) % 8
+
+        # 创建保存目录
+        self.save_dir.mkdir(exist_ok=True)
+
+    def __call__(self, func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # 获取函数的参数名和值
+            import inspect
+
+            sig = inspect.signature(func)
+            bound_args = sig.bind(*args, **kwargs)
+            bound_args.apply_defaults()
+
+            # 获取参数名和值的映射
+            param_dict = bound_args.arguments
+            param_names = list(param_dict.keys())
+            args_names = list(param_dict.values())
+
+            # 在函数执行前收集要保存的输入数据
+            input_data = {}
+
+            # 保存指定的输入张量
+            for i, name in enumerate(param_names):
+                if name in self.save_tensors and i < len(args_names):
+                    # 对于需要保存的张量，创建副本
+                    logger.info(f"clone input param: {name}, its val: {args_names[i]}")
+                    if isinstance(args_names[i], torch.Tensor):
+                        input_data[name] = args_names[i].clone()
+                    else:
+                        input_data[name] = args_names[i]
+
+            # 保存指定的关键字参数张量
+            for name in self.save_tensors:
+                if name in kwargs:
+                    # logger.info(f"clone input kwarg: {name}, its val:{kwargs[name]}")
+                    if isinstance(kwargs[name], torch.Tensor):
+                        input_data[name] = kwargs[name].clone()
+                    else:
+                        input_data[name] = kwargs[name]
+
+            # 保存指定的类成员变量
+            for name in self.save_attrs:
+                # logger.info(f"clone input attr: {name}, its val:{getattr(args[0], name)}")
+                if hasattr(args[0], name):  # args[0] 是 self
+                    attr = getattr(args[0], name)
+                    if isinstance(attr, torch.Tensor):
+                        input_data[name] = attr.clone()
+                    else:
+                        input_data[name] = attr
+
+            # 执行原始函数
+            try:
+                # 适配多个返回值的情况
+                if isinstance(func(*args, **kwargs), tuple):
+                    result = func(*args, **kwargs)
+                else:
+                    result = (func(*args, **kwargs),)
+            except Exception as e:
+                logger.error(f"保存数据失败: {e}, 只保存输入文件")
+                save_data = input_data.copy()
+                torch.save(
+                    save_data,
+                    self.save_dir
+                    / f"{func.__name__}_m{self.machine_id}_c{self.card_id}_exec_error.pt",
+                )
+                raise e
+
+            # 决定是否保存数据
+            self.call_count += 1
+            if (
+                len(self.saved_files) < self.max_files
+                or self.random.random() < self.save_prob
+            ):
+                # 合并输入数据和输出数据
+                save_data = input_data.copy()
+
+                # 默认保存函数返回结果
+                if self.save_return:
+                    # logger.info(f"clone return result: {result}, its val:{result}")
+                    save_data["func_return"] = result
+
+                # 获取 layer_index 和 decode_step
+                layer_index = (
+                    args[0].layer_id if args and hasattr(args[0], "layer_id") else 0
+                )
+                decode_step = 0
+                if args and hasattr(args[0], "cache"):
+                    cache_manager = args[0].cache
+                    if (
+                        hasattr(cache_manager, "curr_req_ids")
+                        and cache_manager.curr_req_ids
+                    ):
+                        req_id = cache_manager.curr_req_ids[0]
+                        decode_step = cache_manager.seq_lens.get(req_id, 0)
+
+                # 获取模型名称和数据类型
+                try:
+                    args = get_global_args()
+                    model_name = args.models.type
+                    model_path = args.models.ckpt_dir
+                except:
+                    model_name = "unknown"
+                    model_path = "unknown"
+                model_dtype = (
+                    "fp4" if get_global_args().infer.npu_fusion_fp4 else "bf16"
+                )
+                # 添加推理步骤信息
+                # print(f"args_names: {args_names}")
+                save_data["inference_info"] = {
+                    "machine_id": self.machine_id,
+                    "card_id": self.card_id,
+                    "call_count": self.call_count,
+                    "function_name": func.__name__,
+                    "batch_size": (
+                        args_names[0].shape[0]
+                        if isinstance(args_names[0], torch.Tensor)
+                        else None
+                    ),
+                    "decode_step": decode_step,
+                    "layer_index": layer_index,
+                    "model_name": model_name,
+                    "model_dtype": model_dtype,
+                    "model_path": model_path,
+                }
+
+                # 生成文件名
+                filename = f"{func.__name__}_{model_name}_{model_dtype}_m{self.machine_id}_c{self.card_id}_l{layer_index}_d{decode_step}_{self.call_count}.pt"
+
+                if self.call_count == 1:
+                    # 第一次调用，永久保存
+                    logger.info(f"首次调用，永久保存数据到 {self.save_dir}/{filename}")
+                    torch.save(save_data, self.save_dir / filename)
+                    self.saved_files.append(filename)
+                elif (
+                    len(self.replaceable_files) < self.max_files - 1
+                ):  # 减1是因为要保留第一次的文件
+                    # 如果还没达到最大可替换文件数量，直接保存
+                    logger.info(f"保存数据到 {self.save_dir}/{filename}")
+                    torch.save(save_data, self.save_dir / filename)
+                    self.saved_files.append(filename)
+                    self.replaceable_files.append(filename)
+                else:
+                    # 如果已经达到最大可替换文件数量，随机替换一个可替换的文件
+                    replace_idx = self.random.randint(
+                        0, len(self.replaceable_files) - 1
+                    )
+                    old_filename = self.replaceable_files[replace_idx]
+                    # 删除旧文件
+                    (self.save_dir / old_filename).unlink(missing_ok=True)
+                    # 保存新文件
+                    torch.save(save_data, self.save_dir / filename)
+                    self.saved_files[self.saved_files.index(old_filename)] = filename
+                    self.replaceable_files[replace_idx] = filename
+                    logger.info(
+                        f"替换文件 {self.save_dir}/{old_filename} 为 {self.save_dir}/{filename}"
+                    )
+
+            return result
+
+        return wrapper
+
+
 def gen_req_id(len=8):
     random_number = random.getrandbits(len * 4)
     hex_string = f"{random_number:0{len}x}"
     return hex_string
+
+
+def log_with_rank(msg, rank=0, prefix="", level=WARNING, logger=logger):
+    """
+    根据指定的 rank 输出日志，默认只输出 rank 0 的日志
+
+    Args:
+        msg: 日志消息
+        rank: 指定要输出日志的 rank，默认为 0
+        prefix: 日志前缀
+        level: 日志级别，默认为 logging.INFO
+        logger: logger 实例，默认为当前模块的 logger
+    """
+    import torch.distributed as dist
+
+    current_rank = dist.get_rank() if dist.is_initialized() else 0
+
+    if current_rank == rank:
+        if prefix:
+            msg = f"[Rank {current_rank}] {prefix}{msg}"
+        else:
+            msg = f"[Rank {current_rank}] {msg}"
+
+        if level == INFO:
+            logger.info(msg)
+        elif level == logging.WARNING:
+            logger.warning(msg)
+        elif level == logging.ERROR:
+            logger.error(msg)
+        elif level == logging.DEBUG:
+            logger.debug(msg)
+        else:
+            logger.log(level, msg)

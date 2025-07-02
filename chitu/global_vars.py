@@ -19,6 +19,7 @@ _GLOBAL_TIMERS = None
 _GLOBAL_SIGNAL_HANDLER = None
 _GLOBAL_MEMORY_BUFFER = None
 _GLOBAL_SLOT_HANDLE = None
+_GLOBAL_DEBUG: bool = False
 
 
 def get_global_memory_buffer():
@@ -31,7 +32,8 @@ def get_slot_handle():
     return _GLOBAL_SLOT_HANDLE
 
 
-def set_global_variables(global_args=None):
+def set_global_variables(global_args=None, debug=False):
+    _set_debug(debug)
     set_global_args(global_args)
     _set_timers()
     if global_args is not None:
@@ -82,6 +84,15 @@ def set_quant_variables(global_args=None):
                 models.quant_config = quant_config
                 return
     models.quant_config = quant_config
+
+
+def _set_debug(debug: bool):
+    global _GLOBAL_DEBUG
+    _GLOBAL_DEBUG = debug
+
+
+def get_debug():
+    return _GLOBAL_DEBUG
 
 
 def _set_slot_handle(max_reqs, pp_size, cache_type):
@@ -171,6 +182,8 @@ class _Timer:
 
     def start(self):
         """Start the timer."""
+        if not get_debug():
+            return
         assert not self.started_, "timer has already been started"
         torch.cuda.synchronize()
         self.start_time = time.time()
@@ -178,6 +191,8 @@ class _Timer:
 
     def stop(self):
         """Stop the timer."""
+        if not get_debug():
+            return
         assert self.started_, "timer is not started"
         torch.cuda.synchronize()
         self.elapsed_ += time.time() - self.start_time

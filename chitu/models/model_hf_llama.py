@@ -200,7 +200,6 @@ class AttentionHFLlama(Attention):
         self.cache.finalize_cache_bylayer_prefill(
             xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
         )
-
         output = self.attn_backend.attn_varlen_func(
             xq,
             xk,
@@ -244,7 +243,6 @@ class AttentionHFLlama(Attention):
         cache_k = cache[0]
         cache_v = cache[1]
         cache_seqlens = self.cache.get_gpu_seq_lens_excl_this_decode()
-
         output = self.attn_backend.attn_with_kvcache(
             xq,
             cache_k,
@@ -339,6 +337,7 @@ class FeedForwardHFLlama(nn.Module):
                 base_linear_class=gate_up_proj_linear,
                 checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
             )
+
             self.up_proj = ColumnParallelLinear(
                 dim,
                 hidden_dim,
@@ -347,6 +346,7 @@ class FeedForwardHFLlama(nn.Module):
                 base_linear_class=gate_up_proj_linear,
                 checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
             )
+
         self.down_proj = RowParallelLinear(
             hidden_dim,
             dim,
@@ -438,7 +438,6 @@ def Qwen3MoeExperts(
         moe_world_size=1,
         moe_rank=0,
         op_impl=op_impl,
-        dtype=args.dtype if hasattr(args, "dtype") else "bfloat16",
         fuse_shared_experts=False,
         checkpoint_prefix=f"{checkpoint_prefix}.moe",
         merge_gate_up=merge_gate_up,
@@ -785,23 +784,6 @@ class TransformerHFLlama(Transformer):
                 new_checkpoint[k] = checkpoint[k]
         return new_checkpoint
 
-    def _add_zero_bias_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
-        new_checkpoint = {}
-        for k in checkpoint.keys():
-            if k.endswith(".qkv_proj.bias"):
-                return checkpoint
-        for k in checkpoint.keys():
-            if k.endswith(".qkv_proj.weight"):
-                prefix = k[: -len("qkv_proj.weight")]
-                assert prefix + "qkv_proj.bias" not in checkpoint
-                weight = checkpoint[k]
-                qkv_bias = torch.zeros(
-                    weight.shape[0], dtype=weight.dtype, device=weight.device
-                )
-                new_checkpoint[prefix + "qkv_proj.bias"] = qkv_bias
-        new_checkpoint.update(checkpoint)
-        return new_checkpoint
-
     def _process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
@@ -962,10 +944,6 @@ class TransformerHFLlama(Transformer):
 
             state_dict = self._process_state_dict_for_merging_qkv(state_dict)
             state_dict = self._process_state_dict_for_merging_gate_up(state_dict)
-            if self.params.name.startswith("glm") and (
-                not self.params.name.startswith("glm-4-9b")
-            ):
-                state_dict = self._add_zero_bias_for_merging_qkv(state_dict)
 
             if self.op_impl == "muxi_custom_kernel":
                 rpl_names = self._get_tensor_row_parallel_layer_names()

@@ -1,4 +1,4 @@
-import packaging
+import packaging.version
 import torch
 import pytest
 import triton
@@ -146,7 +146,7 @@ def test_fp4_raise_to_bf16_gemm_is_close_to_dequanted_gemm():
         line_names=["Torch_BF16", "Triton_FP4_raise_to_BF16"],
         styles=[("blue", "-"), ("green", "-")],
         ylabel="us",
-        plot_name="fp8_gemm-performance",
+        plot_name="fp4_raise_to_bf16_gemm-performance",
         args={
             "default_dtype": torch.bfloat16,
             "block_size": 16,
@@ -238,7 +238,7 @@ def test_fp4_raise_to_fp8_gemm_is_close_to_dequanted_gemm():
         line_names=["Torch_BF16", "Triton_FP4_raise_to_FP8"],
         styles=[("blue", "-"), ("green", "-")],
         ylabel="us",
-        plot_name="fp8_gemm-performance",
+        plot_name="fp4_raise_to_fp8_gemm-performance",
         args={
             "default_dtype": torch.bfloat16,
             "block_size": 16,

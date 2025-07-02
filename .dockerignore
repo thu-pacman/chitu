@@ -91,6 +91,7 @@
 **/test/outputs/*
 **/dumps/*
 **/log/*
+!third_party/ascend-kernel/grouped_gemm/op_host/inc/log/*
 
 # Vim
 **/.*.swp

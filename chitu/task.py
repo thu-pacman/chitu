@@ -9,11 +9,11 @@ from datetime import datetime
 from enum import Enum
 from logging import getLogger
 from pathlib import Path
-from typing import ClassVar, List, Optional
+from typing import ClassVar, Dict, List, Optional
 
 import torch
 
-from chitu.async_response import AsyncDataStream, AsyncResponse
+from chitu.async_response import AsyncDataStream
 from chitu.backend import Backend
 from chitu.device_list import DeviceList
 from chitu.global_vars import get_slot_handle, get_global_args
@@ -118,9 +118,6 @@ class UserRequest:
     def save_trace_to_json(self):
         prefill_duration = self.prefill_end_time - self.start_time
         all_duration = self.completion_time - self.start_time
-        decode_tps = self.async_stream.tokens_len / (
-            self.completion_time - self.prefill_end_time
-        )
         tps = self.async_stream.tokens_len / all_duration
 
         path = Path.cwd() / f"log/trace_{datetime.now().strftime('%Y_%m_%d')}.jsonl"
@@ -138,79 +135,6 @@ class UserRequest:
         trace_str = json.dumps(trace_data)
         with open(path, "a") as file:
             file.write(trace_str + "\n")
-
-
-class TaskPool:
-    pool = {}
-    id_list = []
-    # total_reqs = []
-
-    def add(task):
-        if task.task_id in TaskPool.pool:
-            return False  # Task already exists, failed to add
-        TaskPool.pool[task.task_id] = task
-        TaskPool.id_list.append(task.task_id)
-        # if task.req not in TaskPool.total_reqs:
-        #     TaskPool.total_reqs.append(task.req)
-        return True
-
-    def remove(task_id):
-        assert task_id in TaskPool.pool, "Task not found in pool"
-        logger.debug(f"finish {task_id}. cuda memory: {torch.cuda.memory_allocated()}")
-        if TaskPool.pool[task_id].task_type == TaskType.Decode:
-            TaskPool.pool[task_id].req.output = repr(
-                "".join(TaskPool.pool[task_id].req.async_stream.seqs)
-            )
-            TaskPool.pool[task_id].req.async_stream.send_stop_signal()
-            TaskPool.pool[task_id].req.completed.set()
-            TaskPool.pool[task_id].req.completion_time = time.monotonic()
-            TaskPool.pool[task_id].req.save_trace_to_json()
-            TaskLoad.reduce(TaskPool.pool[task_id].prefix_length)
-            Backend.cache_manager.finalize_cache_all_decode(
-                TaskPool.pool[task_id].req.request_id
-            )
-            if Backend.args.infer.cache_type == "skew":
-                if Backend.args.infer.pp_size > 1:
-                    scheduler = Backend.scheduler
-                    for lst in scheduler.decode_slots:
-                        if task_id in lst:
-                            index = lst.index(task_id)
-                            lst[index] = lst[-1]
-                            lst.pop()
-                            break
-                else:
-                    # adjust decode_task order to adapt skew kv-cache
-                    remove_index = TaskPool.id_list.index(task_id)
-                    for decode_id in reversed(TaskPool.id_list):
-                        if (
-                            TaskPool.pool[decode_id].task_type == TaskType.Decode
-                            and decode_id != task_id
-                        ):
-                            decode_index = TaskPool.id_list.index(decode_id)
-                            (
-                                TaskPool.id_list[remove_index],
-                                TaskPool.id_list[decode_index],
-                            ) = (
-                                TaskPool.id_list[decode_index],
-                                TaskPool.id_list[remove_index],
-                            )
-                            break
-
-        ret = TaskPool.pool.pop(task_id)
-        TaskPool.id_list.remove(task_id)
-        if len(TaskPool.pool) == 0:
-            TaskLoad.clear()
-        if ret is None:
-            return False  # Task not found, failed to remove
-        return True
-
-    def display():
-        return
-        num = len(TaskPool.total_reqs)
-        sys.stdout.write("\033[F" * num)
-        for req in TaskPool.total_reqs:
-            sys.stdout.write(f">>> {req.request_id}: {req.message} {req.output}<<<\n")
-        sys.stdout.flush()
 
 
 class TaskType(Enum):
@@ -236,8 +160,11 @@ class Task:
         self.sched_ts = self.arrv_ts
         self.priority = priority
         self.sched_score = 0
-        self.max_output_tokens = -1
         self.stop_with_eos = stop_with_eos
+
+        # response related
+        self.num_new_tokens: int = 0
+        self.next_token: int = -1  # Only effective when num_new_tokens > 0
 
         # Waiting is only meaningful in pipeline parallelism. It means either of:
         # 1) waiting logits to return from another node, or
@@ -279,41 +206,36 @@ class Task:
         )
 
     def need_remove(self):
-        if self.stop_with_eos:
-            if (
-                len(self.response) > 0
-                and self.response[-1].item() in Backend.tokenizer.stop_tokens
-            ) and not self.waiting:
-                self.req.finish_reason = "stop"
-                return True
-        if len(self.response) >= self.req.max_new_tokens and not self.waiting:
+        if self.waiting:
+            return False
+
+        if (
+            self.stop_with_eos
+            and self.num_new_tokens > 0
+            and self.next_token in Backend.tokenizer.stop_tokens
+        ):
+            self.req.finish_reason = "stop"
+            return True
+        if self.num_new_tokens >= self.req.max_new_tokens:
             self.req.finish_reason = "length"
             return True
         return False
 
-    def update_response(self, token: int, token_gpu, logit):
+    def update_response(
+        self,
+        token: int,
+        logprobs: Optional[torch.Tensor] = None,
+        token_idxs: Optional[torch.Tensor] = None,
+    ):
         # TODO: modify if generate more than one token at a time
         assert token is not None
-        if self.req._test_flag:
-            self.req._test_add_logit(logit)
-            self.req._test_add_token(token)
-        if not self.req._test_standard_tokens == None:
-            # print(token, "--->", self.req.standard_tokens[self.req.standard_it], "[ ", self.req.standard_it, " ]")
-            token = self.req._test_standard_tokens[self.req._test_standard_it]
-            token_gpu = torch.tensor(token)
-            self.req._test_standard_it = self.req._test_standard_it + 1
-            if self.req._test_standard_it >= len(self.req._test_standard_tokens):
-                self.req.max_new_tokens = -1
-        self.response.append(token_gpu)
+        self.num_new_tokens += 1
         self.next_token = token
         self.prefix_length += 1
-        self.max_output_tokens -= 1
         if self.req.logprobs:
-            logprobs_raw = torch.log(torch.softmax(logit, dim=-1))
-            logprobs_raw, token_idx = logprobs_raw.sort(descending=True)
-            logprobs_raw = logprobs_raw[: max(1, self.req.top_logprobs)].tolist()
-            token_idx = token_idx[: max(1, self.req.top_logprobs)].tolist()
-            self.req.add_data(self.next_token, logprobs_raw, token_idx)
+            logprobs = logprobs[: max(1, self.req.top_logprobs)].tolist()
+            token_idxs = token_idxs[: max(1, self.req.top_logprobs)].tolist()
+            self.req.add_data(self.next_token, logprobs, token_idxs)
         else:
             self.req.add_data(self.next_token)
         TaskLoad.increase(1)
@@ -360,6 +282,70 @@ class SerializedPackedTasksPayloadType(Enum):
     Heartbeat = 4
 
 
+class TaskPool:
+    pool: Dict[str, Task] = {}
+    id_list: List[str] = []
+
+    @classmethod
+    def add(cls, task: Task):
+        if task.task_id in cls.pool:
+            return False  # Task already exists, failed to add
+        cls.pool[task.task_id] = task
+        cls.id_list.append(task.task_id)
+        return True
+
+    @classmethod
+    def remove(cls, task_id: str):
+        assert task_id in cls.pool, "Task not found in pool"
+        logger.debug(f"finish {task_id}. cuda memory: {torch.cuda.memory_allocated()}")
+        if cls.pool[task_id].task_type == TaskType.Decode:
+            cls.pool[task_id].req.output = repr(
+                "".join(cls.pool[task_id].req.async_stream.seqs)
+            )
+            cls.pool[task_id].req.async_stream.send_stop_signal()
+            cls.pool[task_id].req.completed.set()
+            cls.pool[task_id].req.completion_time = time.monotonic()
+            cls.pool[task_id].req.save_trace_to_json()
+            TaskLoad.reduce(cls.pool[task_id].prefix_length)
+            Backend.cache_manager.finalize_cache_all_decode(
+                cls.pool[task_id].req.request_id
+            )
+            if Backend.args.infer.cache_type == "skew":
+                if Backend.args.infer.pp_size > 1:
+                    scheduler = Backend.scheduler
+                    for lst in scheduler.decode_slots:
+                        if task_id in lst:
+                            index = lst.index(task_id)
+                            lst[index] = lst[-1]
+                            lst.pop()
+                            break
+                else:
+                    # adjust decode_task order to adapt skew kv-cache
+                    remove_index = cls.id_list.index(task_id)
+                    for decode_id in reversed(cls.id_list):
+                        if (
+                            cls.pool[decode_id].task_type == TaskType.Decode
+                            and decode_id != task_id
+                        ):
+                            decode_index = cls.id_list.index(decode_id)
+                            (
+                                cls.id_list[remove_index],
+                                cls.id_list[decode_index],
+                            ) = (
+                                cls.id_list[decode_index],
+                                cls.id_list[remove_index],
+                            )
+                            break
+
+        ret = cls.pool.pop(task_id)
+        cls.id_list.remove(task_id)
+        if len(cls.pool) == 0:
+            TaskLoad.clear()
+        if ret is None:
+            return False  # Task not found, failed to remove
+        return True
+
+
 @dataclass
 class PackedTasksBase:
     """
@@ -378,8 +364,8 @@ class PackedTasksBase:
 
     # Object fields
     num_tasks: int
-    task_ids: List[int]
-    req_ids: List[int]
+    task_ids: List[str]
+    req_ids: List[str]
     task_type: TaskType
     tokens: Optional[List[List[int]]] = None
 
@@ -484,27 +470,23 @@ class PackedTasksBase:
 
 
 class PackedTasks(PackedTasksBase):
-    def __init__(self, task_ids, rank=0):
-        self.tasks = []
-        task_types = []
-        self.req_ids = []
+    def __init__(self, task_ids: List[str], rank=0):
         self.task_ids = task_ids
         self.num_tasks = len(task_ids)
         assert self.num_tasks > 0, "No tasks provided"
-        for tid in self.task_ids:
-            self.tasks.append(TaskPool.pool[tid])
-            task_types.append(TaskPool.pool[tid].task_type)
-            self.req_ids.append(TaskPool.pool[tid].req.request_id)
-        if TaskType.Prefill in task_types and TaskType.Decode in task_types:
+        self.tasks: List[Task] = [TaskPool.pool[tid] for tid in task_ids]
+
+        self.req_ids = [task.req.request_id for task in self.tasks]
+        self.reqs = [task.req for task in self.tasks]
+
+        self.task_type = self.tasks[0].task_type
+        if not all(task.task_type == self.task_type for task in self.tasks):
             self.task_type = TaskType.Hybrid
             raise NotImplementedError("Hybrid task not implemented")
-        else:
-            self.task_type = task_types[0]
-            if self.task_type == TaskType.Prefill:
-                self.pack_tokens()
-        self.reqs = []
-        for task in self.tasks:
-            self.reqs.append(task.req)
+
+        if self.task_type == TaskType.Prefill:
+            self.pack_tokens()
+
         self.is_all_greedy = all(task.req.params.top_k <= 1 for task in self.tasks)
         self.temperatures = torch.tensor(
             [task.req.params.temperature for task in self.tasks]
@@ -524,6 +506,23 @@ class PackedTasks(PackedTasksBase):
         )
         self.cumulative_freq_penalties = torch.zeros(
             (self.num_tasks, Backend.model.vocab_size), dtype=torch.float32, device=rank
+        )
+
+        # logprobs
+        self.return_logprobs = any(task.req.logprobs for task in self.tasks)
+
+        self.response_len = torch.tensor(
+            [len(task.response) for task in self.tasks], dtype=torch.int, device=rank
+        )
+        self.response_capacity = torch.tensor(
+            [len(task.response._data) for task in self.tasks],
+            dtype=torch.int,
+            device=rank,
+        )
+        self.response_ptr = torch.tensor(
+            [task.response._data.data_ptr() for task in self.tasks],
+            dtype=torch.long,
+            device=rank,
         )
 
     def pack_tokens(self):

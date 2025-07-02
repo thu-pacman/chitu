@@ -30,6 +30,18 @@ from chitu.device_type import is_muxi
 logger = getLogger(__name__)
 
 
+# Triton does not support explicitly typed immediate values. Instead, it looks for
+# the narrowest type that can hold the value (see https://triton-lang.org/main/python-api/triton-semantics.html).
+# This means that if you use a hex value for a nagative signed integer, it will be
+# interpreted as a wider unsigned integer. Starting from triton 3.3.1, this results
+# in an error when you combine this integer with a signed variable in an operator,
+# for example `x & 0x80000000`. Therefore, we need to define these constants here.
+SIGNED_INT32_0x87F00000 = tl.constexpr(0x87F00000 - 0x100000000)
+SIGNED_INT16_0x81C0 = tl.constexpr(0x81C0 - 0x10000)
+SIGNED_INT16_0x87F0 = tl.constexpr(0x87F0 - 0x10000)
+SIGNED_INT8_0x9C = tl.constexpr(0x9C - 0x100)
+
+
 def auto_tuning_logger(args, **kwargs):
     # NOTE: there are more info in `args`, but normally we don't print it,
     # because there are large tensors inside, which is a run time performance
@@ -314,7 +326,7 @@ def weight_dequant_soft_fp8_deepseek_v3_kernel_step_1(
     mask = offs < N
     x = tl.load(x_ptr + offs, mask=mask)
     x = x.to(tl.int8, bitcast=True).to(tl.int32)  # Do signed cast to copy the sign bit
-    x = (x << 20) & 0x87F00000
+    x = (x << 20) & SIGNED_INT32_0x87F00000
     y = x.to(tl.uint32, bitcast=True)
     tl.store(y_ptr + offs, y, mask=mask)
 
@@ -500,8 +512,8 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel(
         b_s_2 = tl.load(b_s_ptrs + num_b_s_in_block // 2).to(
             tl.float8e4nv, bitcast=True
         )
-        fp8_weight_1 = (b.to(tl.int8, bitcast=True) << 4 >> 2) & 0x9C
-        fp8_weight_2 = (b.to(tl.int8, bitcast=True) >> 2) & 0x9C
+        fp8_weight_1 = (b.to(tl.int8, bitcast=True) << 4 >> 2) & SIGNED_INT8_0x9C
+        fp8_weight_2 = (b.to(tl.int8, bitcast=True) >> 2) & SIGNED_INT8_0x9C
         b_s_1 = b_s_1.to(tl.bfloat16)
         b_s_2 = b_s_2.to(tl.bfloat16)
         a_1 = tl.load(
@@ -625,7 +637,7 @@ def soft_fp8_gemm_deepseek_v3_kernel(
         t = b.to(tl.int8, bitcast=True).to(
             tl.int32
         )  # Do signed cast to copy the sign bit
-        t = (t << 20) & 0x87F00000
+        t = (t << 20) & SIGNED_INT32_0x87F00000
         b_unscaled_fp32 = t.to(tl.float32, bitcast=True)
         b_new_scale = b_s * fp8_to_fp32_scale
         b_scaled_fp32 = b_unscaled_fp32 * b_new_scale
@@ -726,10 +738,10 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel(
         b_s_2 = b_s_2.to(tl.int8, bitcast=True).to(
             tl.int16
         )  # Do signed cast to copy the sign bit
-        bf16_weight_1 = (b << 12 >> 6) & 0x81C0
-        bf16_weight_2 = (b << 2) & 0x81C0
-        bf16_s_1 = (b_s_1 << 4) & 0x87F0
-        bf16_s_2 = (b_s_2 << 4) & 0x87F0
+        bf16_weight_1 = (b << 12 >> 6) & SIGNED_INT16_0x81C0
+        bf16_weight_2 = (b << 2) & SIGNED_INT16_0x81C0
+        bf16_s_1 = (b_s_1 << 4) & SIGNED_INT16_0x87F0
+        bf16_s_2 = (b_s_2 << 4) & SIGNED_INT16_0x87F0
         b_s_1 = bf16_s_1.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
         b_s_2 = bf16_s_2.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
         a_1 = tl.load(
@@ -978,7 +990,7 @@ def grouped_matmul_kernel(
             t = b.to(tl.int8, bitcast=True).to(
                 tl.int32
             )  # Do signed cast to copy the sign bit
-            t = (t << 20) & 0x87F00000
+            t = (t << 20) & SIGNED_INT32_0x87F00000
             b_unscaled_fp32 = t.to(tl.float32, bitcast=True)
             b_new_scale = b_s * fp8_to_fp32_scale
             b_scaled_fp32 = b_unscaled_fp32 * b_new_scale

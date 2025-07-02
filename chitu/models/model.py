@@ -112,6 +112,8 @@ class RMSNorm(nn.Module):
             return tbsgemm.norm(x, self.weight)
         elif impl == "torch_npu":
             dtype = x.dtype
+            if self.weight.dtype != dtype:
+                self.weight.data = self.weight.data.to(dtype)
             tmp_out = torch_npu.npu_rms_norm(x, self.weight, epsilon=self.eps)[0].to(
                 dtype
             )
@@ -546,6 +548,92 @@ class Transformer(nn.Module):
             state_dict = new_state_dict
         return state_dict
 
+    def anti_quant_fp8(self, scale1, scale2):
+        """
+        Pytorch native 反量化函数，用于将FP8 scale1 转换为BF16
+
+        Args:
+            scale1: 输入的FP8 scale1
+            scale2: 输入的FP32 scale2
+
+        """
+        shape_w = scale1.shape
+        shape_nw = list(shape_w)
+        new_weight = torch.empty(shape_nw, dtype=torch.bfloat16, device="npu")
+        scale_fp8_to_32 = torch.tensor(0x7B80, dtype=torch.uint16)
+        scale1 = scale1.to(torch.int16)
+        new_weight = ((scale1 & 0x0080) << 8) | ((scale1 & 0x007F) << 4)
+        new_weight = new_weight.view(torch.bfloat16) * scale_fp8_to_32.view(
+            torch.bfloat16
+        )
+        new_weight = new_weight.to(torch.float32)
+        if scale2.shape[-2] == 1:
+            new_weight *= scale2
+        else:
+            new_weight[..., : shape_nw[-2] // 2, :] *= scale2[..., 0, :].unsqueeze(-1)
+            new_weight[..., shape_nw[-2] // 2 :, :] *= scale2[..., 1, :].unsqueeze(-1)
+        return new_weight.to(torch.bfloat16)
+
+    # 针对npu反量化+矩阵乘融合算子设计
+    def repack_weight(self, weight):
+        tmp_weight = weight.to(torch.int16)
+        tmp_weight = ((tmp_weight & 0x00F0) << 4) | (tmp_weight & 0x000F)
+        shape = list(tmp_weight.shape)
+        shape[-2] = shape[-1] // 2
+        shape[-1] = shape[-2] * 2
+        new_weight = torch.empty(shape, dtype=torch.uint8, device="npu")
+        new_weight = tmp_weight.view(torch.uint8)
+        new_weight = new_weight.transpose(-2, -1).contiguous()
+        new_weight = new_weight.view(torch.int16)
+        new_weight = ((new_weight & 0x0F00) >> 4) | (new_weight & 0x000F)
+        weight = new_weight.to(torch.uint8).unsqueeze(0)
+
+        weight_shape = weight.shape
+        assert weight_shape[-2] % 64 == 0
+        assert weight_shape[-1] % 128 == 0
+        tmp_weight = weight.reshape(
+            weight_shape[-3] * weight_shape[-2] // 64,
+            4,
+            2,
+            8,
+            weight_shape[-1] // 128,
+            8,
+            4,
+            4,
+        )
+        new_weight = tmp_weight.permute(0, 2, 1, 5, 4, 6, 3, 7).contiguous()
+        return new_weight.reshape(weight_shape)
+
+    def _process_weight_for_npu_fusion(self, param):
+        """处理NPU fusion mode下的权重数据
+
+        Args:
+            param: 权重参数
+
+        Returns:
+            repack后的权重参数
+        """
+        weight_shape = param.data.shape
+        param.data = self.repack_weight(param.data.to(device="npu")).cpu()
+        param.data = param.data.reshape(weight_shape)
+        return param
+
+    def _process_weight_scale_for_npu_fusion(self, param, scale_2):
+        """处理NPU fusion mode下的权重scale数据
+
+        Args:
+            param: scale参数
+            scale_2: 第二级scale参数
+
+        Returns:
+            处理后的scale参数
+        """
+        param.data = self.anti_quant_fp8(
+            param.data.to(device="npu"), scale_2.data.to(device="npu")
+        ).cpu()
+        param.data = param.data.transpose(-2, -1).contiguous().transpose(-2, -1)
+        return param
+
     def process_state_dict_for_blockfp4_after_chunk(self, state_dict):
         quant = (
             self.params.quant_config.type
@@ -557,9 +645,21 @@ class Transformer(nn.Module):
             for k in state_dict.keys():
                 param = state_dict[k]
                 if param.dtype == torch.uint8 and k.endswith("weight"):
-                    param.data = chitu_backend.weight_layout_change(
-                        param.data.cuda()
-                    ).cpu()
+                    # NPU fusion mode preprocess
+                    if get_global_args().infer.npu_fusion_fp4:
+                        param = self._process_weight_for_npu_fusion(param)
+                    # NV preprocess
+                    else:
+                        param.data = chitu_backend.weight_layout_change(
+                            param.data.cuda()
+                        ).cpu()
+                # 处理scale参数
+                if get_global_args().infer.npu_fusion_fp4 and k.endswith(
+                    "weight_scale"
+                ):
+                    scale_name = k + "_2"
+                    scale_2 = state_dict[scale_name]
+                    param = self._process_weight_scale_for_npu_fusion(param, scale_2)
                 new_state_dict[k] = param
             state_dict = new_state_dict
         return state_dict

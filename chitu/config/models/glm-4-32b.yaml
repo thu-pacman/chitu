@@ -11,4 +11,4 @@ vocab_size: 151552
 intermediate_dim: 23040
 norm_eps: 1e-05
 rope_theta: 10000.0
-
+qkv_has_bias: False

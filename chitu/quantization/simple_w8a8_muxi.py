@@ -11,7 +11,14 @@ class W8A8MuxiLinear(QuantizedLinearBase):
     """
 
     def __init__(
-        self, in_features: int, out_features: int, has_bias: bool = True, **kwargs
+        self,
+        ############################################
+        # Common parameters for all quantizations
+        in_features: int,
+        out_features: int,
+        has_bias: bool = True,
+        ############################################
+        # No parameters specific to this quantization
     ) -> torch.nn.Module:
 
         super().__init__()

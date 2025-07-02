@@ -1,8 +1,47 @@
+import logging
+from typing import Optional, List
+
 import torch
 import torch_npu
 from torch_npu.contrib import transfer_to_npu
 
-from typing import Optional, List
+from chitu.global_vars import get_global_args
+from chitu.utils import log_with_rank, try_import_opt_dep
+
+grouped_gemm, _ = try_import_opt_dep("grouped_gemm", "ascend_kernels")
+
+
+logger = logging.getLogger(__name__)
+
+
+def fused_group_matmul(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    expert_tokens: torch.Tensor,
+):
+    # 加载的权重未做预处理的时候是在 K 方向连续，预处理后是在N 方向连续，然后做了一次 reshape
+    # 所以这次 reshape 是为了还原模型加载的权重
+    weight = weight.reshape(
+        weight.shape[0], weight.shape[-1] * 2, weight.shape[-2] // 2
+    )
+    scale = scale.transpose(-2, -1).contiguous()
+
+    scale_off = torch.empty_like(scale)
+
+    output = torch.zeros(
+        [x.shape[0], weight.shape[-1] * 2], dtype=x.dtype, device=x.device
+    )
+
+    grouped_gemm.grouped_gemm(
+        x,
+        weight,
+        antiquantOffsetOptional=scale_off,
+        antiquantScaleOptional=scale,
+        groupListOptional=expert_tokens,
+        output=output,
+    )
+    return output
 
 
 def fused_experts_npu(
@@ -12,10 +51,13 @@ def fused_experts_npu(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     top_k: int = 8,
+    w1_scale=None,
+    w2_scale=None,
     **kwargs,
 ):
     # Check constraints.
-    assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
+    if not get_global_args().infer.npu_fusion_fp4:
+        assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -42,31 +84,47 @@ def fused_experts_npu(
     expert_tokens = torch_npu.npu_moe_compute_expert_tokens(expanded_expert_idx, E)
     expert_tokens = expert_tokens.to(torch.int64)
 
-    w1 = w1.transpose(1, 2)
-    gate_up_out_list = torch_npu.npu_grouped_matmul(
-        x=[expanded_x],
-        weight=[w1],
-        split_item=2,
-        group_list_type=0,
-        group_type=0,
-        group_list=expert_tokens,
-    )
+    if get_global_args().infer.npu_fusion_fp4:
+        gate_up_out = fused_group_matmul(
+            x=expanded_x,
+            weight=w1,
+            scale=w1_scale,
+            expert_tokens=expert_tokens,
+        )
+    else:
+        w1 = w1.transpose(1, 2)
+        gate_up_out_list = torch_npu.npu_grouped_matmul(
+            x=[expanded_x],
+            weight=[w1],
+            split_item=2,
+            group_list_type=0,
+            group_type=0,
+            group_list=expert_tokens,
+        )
+        # TODO: Remove this in the future.
+        gate_up_out = torch.cat(gate_up_out_list, dim=0)
 
-    # TODO: Remove this in the future.
-    gate_up_out = torch.cat(gate_up_out_list, dim=0)
     gate_up_out = torch_npu.npu_swiglu(gate_up_out)
 
-    w2 = w2.transpose(1, 2)
-    down_out_list = torch_npu.npu_grouped_matmul(
-        x=[gate_up_out],
-        weight=[w2],
-        split_item=2,
-        group_list_type=0,
-        group_type=0,
-        group_list=expert_tokens,
-    )
+    if get_global_args().infer.npu_fusion_fp4:
+        down_out_list = fused_group_matmul(
+            x=gate_up_out,
+            weight=w2,
+            scale=w2_scale,
+            expert_tokens=expert_tokens,
+        )
+    else:
+        w2 = w2.transpose(1, 2)
+        down_out_list = torch_npu.npu_grouped_matmul(
+            x=[gate_up_out],
+            weight=[w2],
+            split_item=2,
+            group_list_type=0,
+            group_type=0,
+            group_list=expert_tokens,
+        )
+        down_out_list = torch.cat(down_out_list, dim=0)
 
-    down_out_list = torch.cat(down_out_list, dim=0)
     # TODO: Reorder device memory 2 times here, replace the current
     # implementation here when suitable operators become available.
     hidden_states = torch_npu.npu_moe_finalize_routing(
