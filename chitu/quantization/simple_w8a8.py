@@ -26,7 +26,14 @@ class W8A8Linear(QuantizedLinearBase):
         return aa.to(torch.int8).view(-1, act_shape[-1]), scales.view(-1)
 
     def __init__(
-        self, in_features: int, out_features: int, has_bias: bool = True, **kwargs
+        self,
+        ############################################
+        # Common parameters for all quantizations
+        in_features: int,
+        out_features: int,
+        has_bias: bool = True,
+        ############################################
+        # No parameters specific to this quantization
     ) -> torch.nn.Module:
 
         super().__init__()

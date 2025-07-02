@@ -160,7 +160,6 @@ class Blockfp4Linear(QuantizedLinearBase):
         in_features: size of each input sample
         out_features: size of each output sample
         has_bias: If set to True, the layer will have a bias.
-        dtype: The desired data type of the parameters.
         bias_dtype: The desired data type of the bias.
         block_shape: The block shape (in, out) of first-level scaling. Defaults to
             (16, 1).
@@ -171,10 +170,14 @@ class Blockfp4Linear(QuantizedLinearBase):
 
     def __init__(
         self,
+        ############################################
+        # Common parameters for all quantizations
         in_features: int,
         out_features: int,
         has_bias: bool = False,
-        dtype=torch.uint8,
+        *,
+        ############################################
+        # Parameters specific to this quantization
         bias_dtype=None,
         block_shape: Tuple[int, int] = (16, 1),
         block_shape_2: Optional[Tuple[int, int]] = None,
@@ -182,7 +185,6 @@ class Blockfp4Linear(QuantizedLinearBase):
     ):
         super().__init__()
 
-        dtype = dtype or torch.uint8
         if block_shape_2 is None:
             block_shape_2 = (in_features, out_features)
 
@@ -198,7 +200,7 @@ class Blockfp4Linear(QuantizedLinearBase):
                         out_features,
                         in_features // 2,  # Every 2 float4 is packed into 1 uint8
                     ),
-                    dtype=dtype,
+                    dtype=torch.uint8,
                 ),
                 requires_grad=False,
             ),
@@ -281,6 +283,8 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
 
     def __init__(
         self,
+        ############################################
+        # Common parameters for all quantizations
         dim: int,
         moe_inter_dim: int,
         n_routed_experts: int,
@@ -288,11 +292,12 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
         n_activated_experts: int,
         moe_world_size: int,
         moe_rank: int,
-        dtype: torch.dtype,
         op_impl: str,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
+        ############################################
+        # No parameters specific to this quantization
     ):
         """
         Initializes the MoE module.
@@ -300,23 +305,27 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
         Args:
             args (ModelArgs): Model arguments containing MoE parameters.
         """
-        super().__init__(
-            dim,
-            moe_inter_dim,
-            n_routed_experts,
-            n_shared_experts,
-            n_activated_experts,
-            moe_world_size,
-            moe_rank,
-            dtype,
-            op_impl,
-            fuse_shared_experts,
-            checkpoint_prefix,
-            build_weight=False,
-            merge_gate_up=merge_gate_up,
-        )
+        super().__init__()
 
-        self.linear_dtype = torch.uint8
+        self.op_impl = op_impl
+        self.dim = dim
+        self.fuse_shared_experts = fuse_shared_experts
+        assert (
+            n_routed_experts % moe_world_size == 0
+        ), f"Number of experts must be divisible by world size (world_size={moe_world_size})"
+        self.n_shared_experts = n_shared_experts
+        self.n_fused_shared_experts = (
+            n_shared_experts if self.fuse_shared_experts else 0
+        )
+        self.n_routed_experts = n_routed_experts
+        self.n_local_experts = n_routed_experts // moe_world_size
+        self.experts_start_idx = moe_rank * self.n_local_experts
+        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        self.group_size = (
+            self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts
+        )
+        self.checkpoint_prefix = checkpoint_prefix
+        self.merge_gate_up = merge_gate_up
 
         quant_scale_stride = 16
 
@@ -327,7 +336,7 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
                     self.group_size,
                     moe_inter_dim * 2,
                     dim // 2,
-                    dtype=self.linear_dtype,
+                    dtype=torch.uint8,
                 ),
                 requires_grad=False,
             )
@@ -365,7 +374,7 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
                     self.group_size,
                     moe_inter_dim,
                     dim // 2,
-                    dtype=self.linear_dtype,
+                    dtype=torch.uint8,
                 ),
                 requires_grad=False,
             )
@@ -401,7 +410,7 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
                     self.group_size,
                     moe_inter_dim,
                     dim // 2,
-                    dtype=self.linear_dtype,
+                    dtype=torch.uint8,
                 ),
                 requires_grad=False,
             )
@@ -439,7 +448,7 @@ class Blockfp4MoeExperts(QuantizedMoeExpertsBase):
                 self.group_size,
                 dim,
                 moe_inter_dim // 2,
-                dtype=self.linear_dtype,
+                dtype=torch.uint8,
             ),
             requires_grad=False,
         )

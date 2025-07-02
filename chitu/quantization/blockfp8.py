@@ -88,24 +88,26 @@ class Blockfp8Linear(QuantizedLinearBase):
 
     def __init__(
         self,
+        ############################################
+        # Common parameters for all quantizations
         in_features: int,
         out_features: int,
         has_bias: bool = False,
-        dtype=torch.float8_e4m3fn,
+        *,
+        ############################################
+        # Parameters specific to this quantization
         bias_dtype=None,
         block_size=128,
-        **kwarg,
     ):
         super().__init__()
-
-        dtype = dtype or torch.float8_e4m3fn
 
         # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
         # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
         args = get_global_args()
         if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
             dtype = torch.uint8
-
+        else:
+            dtype = torch.float8_e4m3fn
         assert dtype.itemsize == 1
 
         self.in_features = in_features
@@ -159,6 +161,8 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
 
     def __init__(
         self,
+        ############################################
+        # Common parameters for all quantizations
         dim: int,
         moe_inter_dim: int,
         n_routed_experts: int,
@@ -166,11 +170,12 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         n_activated_experts: int,
         moe_world_size: int,
         moe_rank: int,
-        dtype: torch.dtype,
         op_impl: str,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
+        ############################################
+        # No parameters specific to this quantization
     ):
         """
         Initializes the MoE module.
@@ -178,25 +183,48 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         Args:
             args (ModelArgs): Model arguments containing MoE parameters.
         """
-        super().__init__(
-            dim,
-            moe_inter_dim,
-            n_routed_experts,
-            n_shared_experts,
-            n_activated_experts,
-            moe_world_size,
-            moe_rank,
-            dtype,
-            op_impl,
-            fuse_shared_experts,
-            checkpoint_prefix,
-            build_weight=True,
-            merge_gate_up=merge_gate_up,
+        super().__init__()
+
+        self.op_impl = op_impl
+        self.dim = dim
+        self.fuse_shared_experts = fuse_shared_experts
+        assert (
+            n_routed_experts % moe_world_size == 0
+        ), f"Number of experts must be divisible by world size (world_size={moe_world_size})"
+        self.n_shared_experts = n_shared_experts
+        self.n_fused_shared_experts = (
+            n_shared_experts if self.fuse_shared_experts else 0
         )
+        self.n_routed_experts = n_routed_experts
+        self.n_local_experts = n_routed_experts // moe_world_size
+        self.experts_start_idx = moe_rank * self.n_local_experts
+        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        self.group_size = (
+            self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts
+        )
+        self.checkpoint_prefix = checkpoint_prefix
+        self.merge_gate_up = merge_gate_up
+
+        # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
+        # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
+        args = get_global_args()
+        if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
+            dtype = torch.uint8
+        else:
+            dtype = torch.float8_e4m3fn
+        assert dtype.itemsize == 1
+
         gate_up_proj_in_features = dim
         block_size = 128
 
         if self.merge_gate_up:
+            self.gate_up_proj_weight = torch.nn.Parameter(
+                torch.empty(
+                    (self.group_size, moe_inter_dim * 2, self.dim),
+                    dtype=dtype,
+                ),
+                requires_grad=False,
+            )
             scale_out_features = (moe_inter_dim * 2 + block_size - 1) // block_size
             scale_in_features = (
                 gate_up_proj_in_features + block_size - 1
@@ -211,6 +239,20 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                 requires_grad=False,
             )
         else:
+            self.gate_proj_weight = torch.nn.Parameter(
+                torch.empty(
+                    (self.group_size, moe_inter_dim, self.dim),
+                    dtype=dtype,
+                ),
+                requires_grad=False,
+            )
+            self.up_proj_weight = torch.nn.Parameter(
+                torch.empty(
+                    (self.group_size, moe_inter_dim, self.dim),
+                    dtype=dtype,
+                ),
+                requires_grad=False,
+            )
             scale_out_features = (moe_inter_dim + block_size - 1) // block_size
             scale_in_features = (
                 gate_up_proj_in_features + block_size - 1
@@ -233,6 +275,13 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                 ),
                 requires_grad=False,
             )
+        self.down_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, self.dim, moe_inter_dim),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
         down_proj_scale_out_features = (dim + block_size - 1) // block_size
         down_proj_scale_in_features = (moe_inter_dim + block_size - 1) // block_size
         self.down_proj_scale = torch.nn.Parameter(

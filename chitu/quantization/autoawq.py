@@ -10,7 +10,14 @@ class AutoAWQLinear(QuantizedLinearBase):
     """
 
     def __init__(
-        self, in_features: int, out_features: int, has_bias: bool = True, **kwargs
+        self,
+        ############################################
+        # Common parameters for all quantizations
+        in_features: int,
+        out_features: int,
+        has_bias: bool = True,
+        ############################################
+        # No parameters specific to this quantization
     ):
         super().__init__()
         from awq.modules.linear import WQLinear_GEMM

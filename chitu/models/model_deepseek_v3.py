@@ -172,12 +172,6 @@ class AttentionDeepSeekV3(Attention):
                 self.dim,
                 self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
                 has_bias=False,
-                dtype=(
-                    torch.bfloat16
-                    if args.quant_config.type == "blockfp4"
-                    else parse_dtype(args.main_weight_dtype)
-                ),
-                bias_dtype=torch.get_default_dtype(),
                 checkpoint_prefix=f"{checkpoint_prefix}.wqkv_a",
             )  # FIXME: Run this layer with muxi_layout_kernels
         else:
@@ -185,24 +179,12 @@ class AttentionDeepSeekV3(Attention):
                 self.dim,
                 self.q_lora_rank,
                 has_bias=False,
-                dtype=(
-                    torch.bfloat16
-                    if args.quant_config.type == "blockfp4"
-                    else parse_dtype(args.main_weight_dtype)
-                ),
-                bias_dtype=torch.get_default_dtype(),
                 checkpoint_prefix=f"{checkpoint_prefix}.q_a_proj",
             )  # FIXME: Run this layer with muxi_layout_kernels
             self.kv_a_proj_with_mqa = LocalLinear(
                 self.dim,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 has_bias=False,
-                dtype=(
-                    torch.bfloat16
-                    if args.quant_config.type == "blockfp4"
-                    else parse_dtype(args.main_weight_dtype)
-                ),
-                bias_dtype=torch.get_default_dtype(),
                 checkpoint_prefix=f"{checkpoint_prefix}.kv_a_proj_with_mqa",
             )  # FIXME: Run this layer with muxi_layout_kernels
         self.q_a_layernorm = RMSNorm(self.q_lora_rank)
@@ -214,12 +196,6 @@ class AttentionDeepSeekV3(Attention):
                 else self.n_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
             ),
             has_bias=False,
-            dtype=(
-                torch.bfloat16
-                if args.quant_config.type == "blockfp4"
-                else parse_dtype(args.main_weight_dtype)
-            ),
-            bias_dtype=torch.get_default_dtype(),
             gather_output=False,
             base_linear_class=get_linear_layout_contig_x_contig_y(
                 op_impl,
@@ -234,12 +210,6 @@ class AttentionDeepSeekV3(Attention):
                 self.kv_lora_rank,
                 self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
                 has_bias=False,
-                dtype=(
-                    torch.bfloat16
-                    if args.quant_config.type == "blockfp4"
-                    else parse_dtype(args.main_weight_dtype)
-                ),
-                bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_x_contig_y(
                     op_impl,
@@ -282,12 +252,6 @@ class AttentionDeepSeekV3(Attention):
             ),
             self.dim,
             has_bias=False,
-            dtype=(
-                torch.bfloat16
-                if args.quant_config.type == "blockfp4"
-                else parse_dtype(args.main_weight_dtype)
-            ),
-            bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
             base_linear_class=get_linear_layout_contig_x_contig_y(
                 op_impl,
@@ -605,8 +569,6 @@ class MLPDeepSeekV3(nn.Module):
                 args.dim,
                 inter_dim * 2,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_x_contig_y(
                     op_impl,
@@ -624,8 +586,6 @@ class MLPDeepSeekV3(nn.Module):
                 args.dim,
                 inter_dim,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_x_contig_y(
                     op_impl,
@@ -637,8 +597,6 @@ class MLPDeepSeekV3(nn.Module):
                 args.dim,
                 inter_dim,
                 has_bias=False,
-                dtype=parse_dtype(args.main_weight_dtype),
-                bias_dtype=torch.get_default_dtype(),
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_x_contig_y(
                     op_impl,
@@ -650,8 +608,6 @@ class MLPDeepSeekV3(nn.Module):
             inter_dim,
             args.dim,
             has_bias=False,
-            dtype=parse_dtype(args.main_weight_dtype),
-            bias_dtype=torch.get_default_dtype(),
             input_is_parallel=True,
             reduce_output=(role == "standalone"),
             base_linear_class=get_linear_layout_contig_x_contig_y(
@@ -748,7 +704,6 @@ def MoeExpertsDeepSeekV3(
         n_activated_experts=args.n_activated_experts,
         moe_world_size=1,
         moe_rank=0,
-        dtype=args.main_weight_dtype,
         op_impl=op_impl,
         fuse_shared_experts=get_global_args().infer.fuse_shared_experts,
         checkpoint_prefix=checkpoint_prefix,
@@ -1386,7 +1341,6 @@ class TransformerDeepSeekV3(Transformer):
             self.params.dim,
             self.params.vocab_size,
             has_bias=False,
-            dtype=torch.get_default_dtype(),
             gather_output=True,
             checkpoint_prefix="lm_head",
         )
