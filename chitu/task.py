@@ -224,13 +224,11 @@ class Task:
     def update_response(
         self,
         token: int,
-        token_gpu,
         logprobs: Optional[torch.Tensor] = None,
         token_idxs: Optional[torch.Tensor] = None,
     ):
         # TODO: modify if generate more than one token at a time
         assert token is not None
-        self.response.append(token_gpu)
         self.num_new_tokens += 1
         self.next_token = token
         self.prefix_length += 1
@@ -512,6 +510,20 @@ class PackedTasks(PackedTasksBase):
 
         # logprobs
         self.return_logprobs = any(task.req.logprobs for task in self.tasks)
+
+        self.response_len = torch.tensor(
+            [len(task.response) for task in self.tasks], dtype=torch.int, device=rank
+        )
+        self.response_capacity = torch.tensor(
+            [len(task.response._data) for task in self.tasks],
+            dtype=torch.int,
+            device=rank,
+        )
+        self.response_ptr = torch.tensor(
+            [task.response._data.data_ptr() for task in self.tasks],
+            dtype=torch.long,
+            device=rank,
+        )
 
     def pack_tokens(self):
         tokens = []

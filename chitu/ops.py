@@ -776,3 +776,63 @@ def apply_frequency_penalty(
         )
     else:
         raise NotImplementedError(f"{impl=}")
+
+
+@torch.no_grad()
+def response_append_cuda(
+    response_list,
+    tokens_list,
+    response_len,
+    response_capacity,
+    task_num,
+):
+    assert response_list.dtype == torch.long, f"{response_list.dtype=}"
+    assert tokens_list.dtype == torch.long, f"{tokens_list.dtype=}"
+    assert response_len.dtype == torch.int, f"{response_len.dtype=}"
+    assert response_capacity.dtype == torch.int, f"{response_capacity.dtype=}"
+    need_expand = response_len == response_capacity
+    new_response_list = torch.empty_like(response_list)
+    return_response_list = []
+    expand_cpu = need_expand.cpu()
+
+    for i in range(task_num):
+        if expand_cpu[i]:
+            new_len = max(2 * response_capacity[i], 32)
+            new_response = torch.empty(
+                new_len, dtype=torch.long, device=response_list.device
+            )
+            new_response_list[i] = new_response.data_ptr()
+            response_capacity[i] = new_len
+            return_response_list.append((i, new_response))
+
+    chitu_backend.cuda_response_append(
+        response_list, new_response_list, tokens_list, response_len, need_expand
+    )
+    return return_response_list
+
+
+def response_append(tasks, tokens, impl="auto"):
+    if impl == "auto":
+        if tasks.num_tasks > 8:
+            impl = "cuda"
+        else:
+            impl = "torch"
+    if impl == "torch":
+        for it, task in enumerate(tasks.tasks):
+            task.response.append(tokens[it])
+    elif impl == "cuda":
+        new_response = response_append_cuda(
+            tasks.response_ptr,
+            tokens,
+            tasks.response_len,
+            tasks.response_capacity,
+            task_num=tasks.num_tasks,
+        )
+        for idx, response in new_response:
+            tasks.tasks[idx].response._data = response
+            tasks.response_ptr[idx] = response.data_ptr()
+        for task in tasks.tasks:
+            task.response._len += 1
+        tasks.response_len += 1
+    else:
+        raise NotImplementedError(f"{impl=}")

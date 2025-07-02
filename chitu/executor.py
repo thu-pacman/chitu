@@ -18,7 +18,7 @@ from chitu.task import (
 )
 from chitu.tensor_parallel import get_tp_group, get_pp_group, get_cpu_tp_group
 from chitu.utils import VarLens, top_k_top_p_min_p_sampling_from_probs_torch
-from chitu.ops import apply_frequency_penalty
+from chitu.ops import apply_frequency_penalty, response_append
 from chitu.device_list import DeviceList
 
 logger = getLogger(__name__)
@@ -148,13 +148,13 @@ class NormalExecutor(Executor):
             for it, task in enumerate(tasks.tasks):
                 task.update_response(
                     tokens_cpu[it].item(),
-                    tokens[it],
                     logprobs_cpu[it],
                     token_idxs_cpu[it],
                 )
         else:
             for it, task in enumerate(tasks.tasks):
-                task.update_response(tokens_cpu[it].item(), tokens[it])
+                task.update_response(tokens_cpu[it].item())
+        response_append(tasks, tokens, impl="auto")
 
     def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
         """Make every ranks know the task metadata"""
