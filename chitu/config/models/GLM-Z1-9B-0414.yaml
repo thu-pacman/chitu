@@ -1,5 +1,5 @@
 name: glm-z1-9b
-type: hf-llama
+type: hf-glm-z1
 source: "https://modelscope.cn/models/ZhipuAI/GLM-Z1-9B-0414" # Just for displaying. No automatic download.
 ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
 tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.

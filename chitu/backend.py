@@ -209,7 +209,7 @@ class Backend:
             else False
         )
 
-        if args.models.type in ["hf-llama", "hf-mixtral", "deepseek-v3"]:
+        if args.models.type in ["hf-llama", "hf-glm-z1", "hf-mixtral", "deepseek-v3"]:
             tokenizer = TokenizerHF(
                 path=args.models.tokenizer_path,
                 trust_remote_code=trust_remote_code,
@@ -512,7 +512,12 @@ class Backend:
                 ), f"no checkpoint files found in {args.models.ckpt_dir}"
                 ckpt_path = checkpoints[0]
                 checkpoint = torch.load(ckpt_path, map_location="cpu")
-            elif args.models.type in {"hf-llama", "hf-mixtral", "deepseek-v3"}:
+            elif args.models.type in {
+                "hf-llama",
+                "hf-glm-z1",
+                "hf-mixtral",
+                "deepseek-v3",
+            }:
                 checkpoint = Backend._load_hf_checkpoint(model, args)
             else:
                 raise NotImplementedError(f"Unsupported model type {args.models.type}")

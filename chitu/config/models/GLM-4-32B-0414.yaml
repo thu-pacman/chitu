@@ -1,6 +1,9 @@
-name: glm-z1-32b
-type: hf-llama
-source: "https://modelscope.cn/models/ZhipuAI/GLM-Z1-32B-0414/" # Just for displaying. No automatic download.
+# NOTE: The model architecture of GLM-4-*B series and GLM-4-*B-0414 series is different.
+# This file is for the new GLM-4-*B-0414 series.
+
+name: glm-4-32b
+type: hf-glm-z1
+source: "https://modelscope.cn/models/ZhipuAI/GLM-4-32B-0414" # Just for displaying. No automatic download.
 ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
 tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
 dim: 6144
