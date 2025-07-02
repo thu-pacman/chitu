@@ -25,10 +25,7 @@ if has_triton:
 torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
 if has_torch_npu:
     from chitu.npu_utils import fused_experts_npu
-try:
-    import grouped_gemm
-except ImportError:
-    pass
+grouped_gemm, _ = try_import_opt_dep("grouped_gemm", "ascend_kernels")
 
 
 logger = getLogger(__name__)

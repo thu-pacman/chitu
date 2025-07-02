@@ -1,18 +1,15 @@
+import logging
+from typing import Optional, List
+
 import torch
 import torch_npu
 from torch_npu.contrib import transfer_to_npu
 
-from typing import Optional, List
-
 from chitu.global_vars import get_global_args
-from chitu.utils import log_with_rank
+from chitu.utils import log_with_rank, try_import_opt_dep
 
-try:
-    import grouped_gemm
-except ImportError:
-    pass
+grouped_gemm, _ = try_import_opt_dep("grouped_gemm", "ascend_kernels")
 
-import logging
 
 logger = logging.getLogger(__name__)
 

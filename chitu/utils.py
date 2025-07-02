@@ -24,6 +24,23 @@ logger = getLogger(__name__)
 
 
 def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> Tuple[Any, bool]:
+    """
+    Import an optional dependency.
+
+    The package name and optional dependency name should be consistent with the listing
+    in `setup.py`. For example, you can list a Python package `my_quant_wxax` in the
+    `quant` extra of `setup.py`, then you can use this function like `try_import_opt_dep('my_quant_wxax', 'quant')`,
+    and the user may install the optional dependency like `pip install chitu[quant]`.
+
+    Args:
+        pkg_name (str): The name of the Python package to import.
+        opt_dep_name (str): The name of the optional dependency category in `setup.py`.
+
+    Returns:
+        [0]: The imported module if successful, or a dummy object that raises an ImportError.
+        [1]: A boolean indicating whether the import was successful.
+    """
+
     try:
         return importlib.import_module(pkg_name), True
     except ImportError:

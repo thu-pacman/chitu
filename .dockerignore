@@ -91,7 +91,7 @@
 **/test/outputs/*
 **/dumps/*
 **/log/*
-!csrc/ascendCppExtensions/grouped_gemm/op_host/inc/log/*
+!third_party/ascend-kernel/grouped_gemm/op_host/inc/log/*
 
 # Vim
 **/.*.swp

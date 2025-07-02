@@ -117,6 +117,8 @@ setup(
             "gptqmodel>=2.2.0",
             "tokenizers>=0.20.3",
         ],
+        ##########################################################################
+        # Our own kernels for various architectures
         "muxi_layout_kernels": [
             "muxi_layout_kernels @ file://localhost"
             + os.path.join(setup_dir, "third_party/muxi_layout_kernels"),
@@ -125,6 +127,12 @@ setup(
             "tbsgemm @ file://localhost"
             + os.path.join(setup_dir, "third_party/muxi_w8a8_kernels/w8a8"),
         ],
+        "ascend_kernels": [
+            "grouped_gemm @ file://localhost"
+            + os.path.join(setup_dir, "third_party/ascend-kernel/grouped_gemm"),
+        ],
+        ##########################################################################
+        # Really third-party kernels
         "flash_attn": [
             "flash-attn<2.8.0",
             # Although `flash-attn` is available in PyPI, don't make it a required
@@ -140,10 +148,6 @@ setup(
         "deep_gemm": [
             "deep_gemm @ file://localhost"
             + os.path.join(setup_dir, "third_party/DeepGEMM"),
-        ],
-        "grouped_gemm": [
-            "grouped_gemm @ file://localhost"
-            + os.path.join(setup_dir, "csrc/ascendCppExtensions/grouped_gemm"),
         ],
         **operators.get_extras_require(),
     },

@@ -586,7 +586,23 @@ class Transformer(nn.Module):
         new_weight = new_weight.transpose(-2, -1).contiguous()
         new_weight = new_weight.view(torch.int16)
         new_weight = ((new_weight & 0x0F00) >> 4) | (new_weight & 0x000F)
-        return new_weight.to(torch.uint8)
+        weight = new_weight.to(torch.uint8).unsqueeze(0)
+
+        weight_shape = weight.shape
+        assert weight_shape[-2] % 64 == 0
+        assert weight_shape[-1] % 128 == 0
+        tmp_weight = weight.reshape(
+            weight_shape[-3] * weight_shape[-2] // 64,
+            4,
+            2,
+            8,
+            weight_shape[-1] // 128,
+            8,
+            4,
+            4,
+        )
+        new_weight = tmp_weight.permute(0, 2, 1, 5, 4, 6, 3, 7).contiguous()
+        return new_weight.reshape(weight_shape)
 
     def _process_weight_for_npu_fusion(self, param):
         """处理NPU fusion mode下的权重数据
