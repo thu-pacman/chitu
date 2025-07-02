@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from chitu.quantization.registry import (
     QuantizedLinearBase,
     QuantizedMoeExpertsBase,
+    QuantizedAbsorbGemmBase,
     QuantizationRegistry,
 )
 from chitu.ops import (
@@ -14,6 +15,7 @@ from chitu.ops import (
     soft_fp8_gemm_deepseek_v3,
     weight_dequant_soft_fp8_deepseek_v3,
     act_quant_deepseek_v3,
+    quant_einsum_shc_hdc_shd,
 )
 from chitu.device_type import get_device_name, is_muxi, is_nvidia
 from chitu.utils import try_import_opt_dep, parse_dtype
@@ -532,3 +534,72 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
             block_shape=[128, 128],
             soft_fp8=True,
         )
+
+
+@QuantizationRegistry.register_absorb_gemm("blockfp8")
+class NormalAbsorbGemm(QuantizedAbsorbGemmBase):
+    def __init__(
+        self,
+        ############################################
+        # Common parameters for all quantizations
+        n_heads: int,
+        in_features_per_head: int,
+        out_features_per_head: int,
+        *,
+        ############################################
+        # Parameters specific to this quantization
+        block_size: int = 128,
+    ):
+        super().__init__()
+
+        # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
+        # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
+        args = get_global_args()
+        if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
+            dtype = torch.uint8
+        else:
+            dtype = torch.float8_e4m3fn
+
+        self.weight = torch.nn.Parameter(
+            torch.empty(
+                n_heads, out_features_per_head, in_features_per_head, dtype=dtype
+            ),
+            requires_grad=False,
+        )
+
+        assert out_features_per_head % block_size == 0
+        assert in_features_per_head % block_size == 0
+        self.scale = torch.nn.Parameter(
+            torch.empty(
+                n_heads,
+                out_features_per_head // block_size,
+                in_features_per_head // block_size,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+
+        self.n_heads = n_heads
+        self.in_features_per_head = in_features_per_head
+        self.out_features_per_head = out_features_per_head
+        self.block_size = block_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 3:
+            seq, n_head, n_hidden = x.shape
+            bs = None
+        else:
+            bs, seq, n_head, n_hidden = x.shape
+            x = x.view(bs * seq, n_head, n_hidden)
+
+        y = quant_einsum_shc_hdc_shd(
+            x,
+            self.weight,
+            self.scale,
+            block_size=self.block_size,
+            soft_fp8=(get_global_args().infer.raise_lower_bit_float_to == "bfloat16"),
+        )
+
+        if bs is not None:
+            y = y.view(bs, seq, y.shape[-2], y.shape[-1])
+        return y

@@ -305,6 +305,7 @@ def quant_einsum_shc_hdc_shd(
     group_B: torch.Tensor,
     group_b_s: torch.Tensor,
     *,
+    block_size: int = 128,
     group_n: int = 128,
     group_k: int = 128,
     soft_fp8: bool = False,
@@ -316,23 +317,21 @@ def quant_einsum_shc_hdc_shd(
     assert group_A.shape[2] == group_B.shape[2]
 
     if impl == "auto":
-        if group_b_s is not None and has_triton:
+        if has_triton:
             impl = "triton"
         else:
             impl = "torch"
 
-    if (
-        impl == "torch"
-    ):  # TODO: torch implementation for these two functions need to be added
-        if group_b_s is not None:
-            weight_dequant_fn = (
-                weight_dequant_soft_fp8_deepseek_v3
-                if soft_fp8
-                else weight_dequant_deepseek_v3
-            )
-            group_B = weight_dequant_fn(group_B, group_b_s, block_size=128)
+    if impl == "torch":
+        weight_dequant_fn = (
+            weight_dequant_soft_fp8_deepseek_v3
+            if soft_fp8
+            else weight_dequant_deepseek_v3
+        )
+        group_B = weight_dequant_fn(group_B, group_b_s, block_size=block_size)
         return torch.einsum("shc,hdc->shd", group_A, group_B)
     elif impl == "triton":
+        assert block_size == 128
         return quant_einsum_shc_hdc_shd_triton(
             group_A,
             group_B,
