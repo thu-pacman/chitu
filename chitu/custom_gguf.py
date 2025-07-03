@@ -342,73 +342,6 @@ class GGUFLoader:
 
         return values
 
-    # def load_gguf_tensor_dist(data, shape, ggml_type, "cuda", torch.bfloat16, 0, 2)->torch.Tensor:
-
-    def load_gguf_tensor_dist(
-        self,
-        data,
-        shape,
-        ggml_type,
-        device: str = "cpu",
-        target_dtype=None,
-        rank=0,
-        world_size=1,
-    ) -> torch.Tensor:
-        if target_dtype == None:
-            target_dtype = torch.get_default_dtype()
-
-        if ggml_type not in GGML_NAMES:
-            raise NotImplementedError(f"ggml_type {ggml_type} not implemented")
-
-        ggml_name = GGML_NAMES[ggml_type]
-
-        block_size = GGML_BLOCK_SIZES[ggml_name]
-        elements_per_block = GGML_ELEMENTS_PER_BLOCK[ggml_name]
-        num_elements = int(np.prod(shape))
-        num_blocks = num_elements // elements_per_block
-        load_blocks = num_blocks // world_size
-        blocks_per_iter = 16384
-        blocks_iter = (load_blocks + blocks_per_iter - 1) // blocks_per_iter
-
-        if load_blocks > blocks_per_iter:  # dequant large tensor
-            values = torch.empty(
-                (load_blocks, elements_per_block), dtype=target_dtype, device=device
-            )
-            for i in range(blocks_iter):
-                blocks_begin = i * blocks_per_iter
-                blocks_end = min(blocks_begin + blocks_per_iter, load_blocks)
-
-                load_begin = blocks_begin + rank * blocks_iter
-                load_end = blocks_end + rank * blocks_iter
-                if "cuda" in device.lower():
-                    cur_values = GGML_DEQUANTIZE_GPU[ggml_name](
-                        data[load_begin * block_size : load_end * block_size],
-                        device,
-                        target_dtype,
-                    )
-                else:
-                    cur_values = GGML_DEQUANTIZE[ggml_name](
-                        data[load_begin * block_size : load_end * block_size]
-                    )
-                    cur_values = torch.from_numpy(cur_values.copy())
-
-                cur_values = cur_values.view(-1, elements_per_block)
-                if ggml_name == "BF16":
-                    cur_values = cur_values.view(torch.bfloat16)
-                values[blocks_begin:blocks_end] = cur_values
-        else:
-            if "cuda" in device.lower():
-                values = GGML_DEQUANTIZE_GPU[ggml_name](data, device)
-            else:
-                values = GGML_DEQUANTIZE[ggml_name](data)
-                values = torch.from_numpy(values)
-            values = values.to(target_dtype)
-        if ggml_name == "BF16":
-            values = values.view(torch.bfloat16)
-
-        values = values.view(shape[::-1])
-        return values
-
     def load_gguf_tensor(
         self, name: str, device: str = "cpu", target_dtype=None
     ) -> torch.Tensor:
@@ -921,7 +854,6 @@ def dequantize_q6_k_gpu(
     block_size = GGML_BLOCK_SIZES["Q6_K"]
     ele_per_blk = GGML_ELEMENTS_PER_BLOCK["Q6_K"]
     device_ = torch.device(device)
-    num_blocks = len(data) // block_size
     data = np.frombuffer(data, dtype=data.dtype)
     c_pointer = ctypes.addressof(
         ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents
@@ -986,7 +918,6 @@ def dequantize_iq4_xs_gpu(
     block_size = GGML_BLOCK_SIZES["IQ4_XS"]
     ele_per_blk = GGML_ELEMENTS_PER_BLOCK["IQ4_XS"]
     device_ = torch.device(device)
-    num_blocks = len(data) // block_size
     data = np.frombuffer(data, dtype=data.dtype)
     c_pointer = ctypes.addressof(
         ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents

@@ -381,7 +381,6 @@ class PackedTasksBase:
             cls.configured
         ), "PackedTasksBase must be configured before deserialization"
 
-        task_types = []
         req_ids = []
         if not Backend.use_gloo:
             task_tensor = task_tensor.cpu()

@@ -296,7 +296,6 @@ class AttentionDeepSeekV3(Attention):
             q_nope, q_pe, kv = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
 
             kv_cache = kv[:, : self.kv_lora_rank]
-            pe_cache = kv[:, -self.qk_rope_head_dim :]
 
             # In-place update to `kv_cache`, which is part of `kv`
             self.kv_a_layernorm(kv_cache, compute_dtype=kv.dtype, out=kv_cache)

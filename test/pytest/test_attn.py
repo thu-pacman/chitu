@@ -43,7 +43,6 @@ def test_triton_prefill_attn(num_local_heads, qk_head_dim, v_head_dim, bs):
     b_start_loc = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device="cuda")
     for i in range(len(seq_lens)):
         b_start_loc[i + 1] = b_start_loc[i] + seq_lens[i]
-    b_seq_len = torch.tensor(seq_lens, device="cuda")
 
     # Set attention parameters
     max_seqlen_q = max_seq_len
@@ -450,7 +449,6 @@ def benchmark_attn_varlen_func(num_local_heads, qk_head_dim, v_head_dim, bs, pro
     b_start_loc = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device="cuda")
     for i in range(len(seq_lens)):
         b_start_loc[i + 1] = b_start_loc[i] + seq_lens[i]
-    b_seq_len = torch.tensor(seq_lens, device="cuda")
     max_seqlen_q = max_seq_len
     max_seqlen_k = max_seq_len
     softmax_scale = 1.0 / (q.shape[-1] ** 0.5)

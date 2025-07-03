@@ -201,7 +201,6 @@ class Backend:
         Returns:
             Initialized tokenizer
         """
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
         trust_remote_code = args.models.name.startswith("glm-4")
         force_full_seq_decode = (
             args.models.tokenizer_force_full_seq_decode
@@ -701,7 +700,6 @@ def load_gguf_deepseek_v3_gguf(
         torch.cuda.empty_cache()
 
     logger.info("initing cpu tensors!")
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     for layer_id in range(3, 61):
         if layer_id in cpu_layers:
             if model.layers[layer_id].mlp.experts.moe == None:

@@ -1128,8 +1128,6 @@ def invoke_fused_moe_kernel(
             A, A_scale = per_token_group_quant_fp8(A, block_k)
         else:
             A_scale = None
-        block_n, block_k = block_shape[0], block_shape[1]
-        # A, A_scale = per_token_group_quant_fp8(A, block_k)
     else:
         assert A_scale is None
         assert B_scale is None
@@ -1585,9 +1583,6 @@ def fused_experts_impl(
             # so the cache size and config are already set correctly and
             # do not need to be adjusted.
             intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
-            intermediate_cache2 = intermediate_cache2[
-                : tokens_in_chunk * topk_ids.shape[1]
-            ]
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
             config = get_config_func(tokens_in_chunk)
 
