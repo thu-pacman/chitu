@@ -30,6 +30,11 @@ from chitu.ops import (
     weight_dequant_deepseek_v3,
     weight_dequant_soft_fp8_deepseek_v3,
     weight_quant_deepseek_v3,
+    unpack_weight_bytes,
+    decode_e2m1_from_nibbles,
+    fp4_fake_quant,
+    pack_weight_nibbles,
+    to_e2m1_nibbles,
 )
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
 from chitu.tensor_parallel import (
@@ -91,9 +96,7 @@ class AttentionDeepSeekV3(Attention):
         quant = get_quant_from_checkpoint_prefix(
             checkpoint_prefix, args.quant_config.rules
         )
-        self.merge_qkv = (
-            quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
-        )
+        self.merge_qkv = quant in QuantizationRegistry._allowed_quant_for_merge_qkv
 
         model_parallel_size = get_tp_size()
         self.dim = args.dim
@@ -106,7 +109,7 @@ class AttentionDeepSeekV3(Attention):
         self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
         self.v_head_dim = args.v_head_dim
 
-        block_size = 128
+        block_size = 16 if quant == "blockfp4" else 128
 
         if self.merge_qkv:
             # fp8 gemm can handle weights not divisible by block_size, but it does not hold
@@ -143,7 +146,7 @@ class AttentionDeepSeekV3(Attention):
             gather_output=False,
             base_linear_class=get_linear_layout_contig_x_contig_y(
                 op_impl,
-                checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
+                checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",
             ),
             checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",
         )
@@ -162,9 +165,6 @@ class AttentionDeepSeekV3(Attention):
                 checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
             )
         elif self.mla_absorb == "absorb-without-precomp":
-            quant_method = (
-                None if not hasattr(args, "quant_config") else args.quant_config.type
-            )
             self.kv_b_proj_absorb_1 = ParallelAbsorbGemm(
                 self.n_heads,
                 self.qk_nope_head_dim,
@@ -484,7 +484,7 @@ class MLPDeepSeekV3(nn.Module):
             quant = get_quant_from_checkpoint_prefix(
                 checkpoint_prefix, args.quant_config.rules
             )
-            if quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
+            if quant in QuantizationRegistry._allowed_quant_for_merge_gate_up:
                 self.merge_gate_up = True
             else:
                 self.merge_gate_up = False
@@ -628,7 +628,7 @@ def MoeExpertsDeepSeekV3(
         )
 
     quant = get_quant_from_checkpoint_prefix(checkpoint_prefix, args.quant_config.rules)
-    merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
+    merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
 
     assert args.moe_inter_dim % get_tp_size() == 0
     return base_moe_experts_class(
@@ -660,14 +660,14 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
                 checkpoint_prefix, args.quant_config.rules
             )
             merge_gate_up = (
-                quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
+                quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
             )
             non_fused_shared_experts = MLPDeepSeekV3(
                 args,
                 role="shared_experts",
                 merge_gate_up=merge_gate_up,
                 op_impl=op_impl,
-                checkpoint_prefix=checkpoint_prefix,
+                checkpoint_prefix=f"{checkpoint_prefix}.shared_experts",
             )
         else:
             non_fused_shared_experts = None
@@ -836,8 +836,6 @@ class TransformerDeepSeekV3(Transformer):
     ):
         model_parallel_size = get_tp_size()
         n_local_heads = self.params.n_heads // model_parallel_size
-        block_size = 128
-
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -847,26 +845,35 @@ class TransformerDeepSeekV3(Transformer):
             ):
                 tensor_name = k.split(".")[-1]
                 prefix = k[: -len(f".kv_b_proj.{tensor_name}")]
-                kv_b_proj_weight = checkpoint[f"{prefix}.kv_b_proj.{tensor_name}"]
-                kv_b_proj_weight = kv_b_proj_weight.view(
-                    n_local_heads, -1, kv_b_proj_weight.shape[-1]
-                )
-                absorbed_dim = self.params.qk_nope_head_dim + self.params.v_head_dim
-                assert absorbed_dim % kv_b_proj_weight.shape[1] == 0
-                ratio = absorbed_dim // kv_b_proj_weight.shape[1]
-                kv_b_proj_absorb_1_weight = kv_b_proj_weight[
-                    :, : self.params.qk_nope_head_dim // ratio
-                ]
-                kv_b_proj_absorb_2_weight = kv_b_proj_weight[
-                    :, self.params.qk_nope_head_dim // ratio :
-                ]
-                new_checkpoint[f"{prefix}.kv_b_proj_absorb_1.{tensor_name}"] = (
-                    kv_b_proj_absorb_1_weight.permute(0, 2, 1).contiguous()
-                )
-                new_checkpoint[f"{prefix}.kv_b_proj_absorb_2.{tensor_name}"] = (
-                    kv_b_proj_absorb_2_weight
-                )
-
+                if k.endswith(f".kv_b_proj.input_scale") or k.endswith(
+                    f".kv_b_proj.weight_scale_2"
+                ):
+                    new_checkpoint[f"{prefix}.kv_b_proj_absorb_1.{tensor_name}"] = (
+                        checkpoint[k].view(1, 1)
+                    )
+                    new_checkpoint[f"{prefix}.kv_b_proj_absorb_2.{tensor_name}"] = (
+                        checkpoint[k].view(1, 1)
+                    )
+                else:
+                    kv_b_proj_weight = checkpoint[f"{prefix}.kv_b_proj.{tensor_name}"]
+                    kv_b_proj_weight = kv_b_proj_weight.view(
+                        n_local_heads, -1, kv_b_proj_weight.shape[-1]
+                    )
+                    absorbed_dim = self.params.qk_nope_head_dim + self.params.v_head_dim
+                    assert absorbed_dim % kv_b_proj_weight.shape[1] == 0
+                    ratio = absorbed_dim // kv_b_proj_weight.shape[1]
+                    kv_b_proj_absorb_1_weight = kv_b_proj_weight[
+                        :, : self.params.qk_nope_head_dim // ratio
+                    ]
+                    kv_b_proj_absorb_2_weight = kv_b_proj_weight[
+                        :, self.params.qk_nope_head_dim // ratio :
+                    ]
+                    new_checkpoint[f"{prefix}.kv_b_proj_absorb_1.{tensor_name}"] = (
+                        kv_b_proj_absorb_1_weight.permute(0, 2, 1).contiguous()
+                    )
+                    new_checkpoint[f"{prefix}.kv_b_proj_absorb_2.{tensor_name}"] = (
+                        kv_b_proj_absorb_2_weight
+                    )
             elif any(
                 k.endswith(f".kv_b_proj.{tensor_name}")
                 for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
@@ -900,26 +907,22 @@ class TransformerDeepSeekV3(Transformer):
         model_parallel_size = get_tp_size()
         n_local_heads = self.params.n_heads // model_parallel_size
 
-        quant = (
-            self.params.quant_config.type
-            if hasattr(self.params, "quant_config")
-            else None
-        )
-
         weight_dequant_fn = (
             weight_dequant_soft_fp8_deepseek_v3
             if get_global_args().infer.raise_lower_bit_float_to == "bfloat16"
             else weight_dequant_deepseek_v3
         )
-        block_size = 128
 
         new_checkpoint = {}
         for k in checkpoint.keys():
+            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            block_size = 16 if quant in ["blockfp4"] else 128
+
             if k.endswith(".kv_b_proj.weight"):
                 prefix = k[: -len("kv_b_proj.weight")]
                 assert prefix + "kv_b_proj.weight" in checkpoint
                 kv_b_proj_ckpt_weight = checkpoint[prefix + "kv_b_proj.weight"]
-                if quant in [None, "gguf", "blockfp4"]:  # blockfp4 skips quantizing MLA
+                if quant in [None, "gguf"]:  # blockfp4 skips quantizing MLA
                     kv_b_proj_weight = kv_b_proj_ckpt_weight
                 elif quant in ["blockfp8", "q4km"]:
                     assert prefix + "kv_b_proj.scale" in checkpoint
@@ -928,19 +931,48 @@ class TransformerDeepSeekV3(Transformer):
                     kv_b_proj_weight = weight_dequant_fn(
                         kv_b_proj_ckpt_weight.cuda(), kv_b_proj_scale.cuda(), block_size
                     ).cpu()
+                elif quant in ["blockfp4"]:
+                    assert prefix + "kv_b_proj.weight_scale" in checkpoint
+                    assert prefix + "kv_b_proj.weight_scale_2" in checkpoint
+                    up_kv_b_proj_weight = decode_e2m1_from_nibbles(
+                        unpack_weight_bytes(kv_b_proj_ckpt_weight.cuda())
+                    ).reshape(*kv_b_proj_ckpt_weight.shape[:-1], -1, block_size)
+                    kv_b_proj_weight = (
+                        (
+                            up_kv_b_proj_weight
+                            * checkpoint[prefix + "kv_b_proj.weight_scale"]
+                            .view(torch.float8_e4m3fn)
+                            .unsqueeze(-1)
+                            .to(
+                                dtype=up_kv_b_proj_weight.dtype,
+                                device=up_kv_b_proj_weight.device,
+                            )
+                            * checkpoint[prefix + "kv_b_proj.weight_scale_2"].to(
+                                device=up_kv_b_proj_weight.device
+                            )
+                        )
+                        .reshape(
+                            kv_b_proj_ckpt_weight.shape[0],
+                            kv_b_proj_ckpt_weight.shape[1] * 2,
+                        )
+                        .to(dtype=torch.bfloat16, device="cpu")
+                    )
                 else:
                     raise NotImplementedError(
                         f"infer.mla_absorb=absorb is not implemented for {quant} quantization"
                     )
+                # kv_lora_rank = self.params.kv_lora_rank // 2 if quant == "blockfp4" else self.params.kv_lora_rank
+                kv_lora_rank = self.params.kv_lora_rank
+
                 kv_b_proj_weight = kv_b_proj_weight.view(
                     n_local_heads,
                     self.params.qk_nope_head_dim + self.params.v_head_dim,
-                    self.params.kv_lora_rank,
+                    kv_lora_rank,
                 )
 
                 # Absorb into q_b_proj
                 q_b_proj_ckpt_weight = checkpoint[prefix + "q_b_proj.weight"]
-                if quant in [None, "gguf", "blockfp4"]:  # blockfp4 skips quantizing MLA
+                if quant in [None, "gguf"]:  # blockfp4 skips quantizing MLA
                     q_b_proj_weight = q_b_proj_ckpt_weight
                 elif quant in ["blockfp8", "q4km"]:
                     assert prefix + "q_b_proj.scale" in checkpoint
@@ -949,14 +981,41 @@ class TransformerDeepSeekV3(Transformer):
                     q_b_proj_weight = weight_dequant_fn(
                         q_b_proj_ckpt_weight.cuda(), q_b_proj_scale.cuda(), block_size
                     ).cpu()
+                elif quant in ["blockfp4"]:
+                    assert prefix + "q_b_proj.weight_scale" in checkpoint
+                    assert prefix + "q_b_proj.weight_scale_2" in checkpoint
+                    up_q_b_proj_weight = decode_e2m1_from_nibbles(
+                        unpack_weight_bytes(q_b_proj_ckpt_weight.cuda())
+                    ).reshape(*q_b_proj_ckpt_weight.shape[:-1], -1, block_size)
+                    q_b_proj_weight = (
+                        (
+                            up_q_b_proj_weight
+                            * checkpoint[prefix + "q_b_proj.weight_scale"]
+                            .view(torch.float8_e4m3fn)
+                            .unsqueeze(-1)
+                            .to(
+                                dtype=up_q_b_proj_weight.dtype,
+                                device=up_q_b_proj_weight.device,
+                            )
+                            * checkpoint[prefix + "q_b_proj.weight_scale_2"].to(
+                                device=up_q_b_proj_weight.device
+                            )
+                        )
+                        .reshape(
+                            q_b_proj_ckpt_weight.shape[0],
+                            q_b_proj_ckpt_weight.shape[1] * 2,
+                        )
+                        .to(dtype=torch.bfloat16, device="cpu")
+                    )
                 else:
                     raise NotImplementedError(
                         f"infer.mla_absorb=absorb is not implemented for {quant} quantization"
                     )
+                q_lora_rank = self.params.q_lora_rank
                 q_b_proj_weight_per_head = q_b_proj_weight.view(
                     n_local_heads,
                     self.params.qk_nope_head_dim + self.params.qk_rope_head_dim,
-                    self.params.q_lora_rank,
+                    q_lora_rank,
                 )
                 q_b_proj_nope = q_b_proj_weight_per_head[
                     :, : self.params.qk_nope_head_dim
@@ -972,18 +1031,35 @@ class TransformerDeepSeekV3(Transformer):
                 assert kv_b_proj_for_q_b_proj.shape == (
                     n_local_heads,
                     self.params.qk_nope_head_dim,
-                    self.params.kv_lora_rank,
+                    kv_lora_rank,
                 )
                 kv_b_proj_for_q_b_proj = torch.block_diag(*kv_b_proj_for_q_b_proj)
                 new_q_b_proj_nope = (
                     kv_b_proj_for_q_b_proj.t()
-                    @ q_b_proj_nope.contiguous().view(-1, self.params.q_lora_rank)
-                ).view(n_local_heads, self.params.kv_lora_rank, self.params.q_lora_rank)
+                    @ q_b_proj_nope.contiguous().view(-1, q_lora_rank)
+                ).view(n_local_heads, kv_lora_rank, q_lora_rank)
                 new_q_b_proj = torch.cat(
                     [new_q_b_proj_nope, q_b_proj_rope], dim=1
-                ).view(-1, self.params.q_lora_rank)
-                if quant in [None, "gguf", "blockfp4"]:  # blockfp4 skips quantizing MLA
+                ).view(-1, q_lora_rank)
+                if quant in [None, "gguf"]:  # blockfp4 skips quantizing MLA
                     new_checkpoint[prefix + "q_b_proj.weight"] = new_q_b_proj
+                elif quant in ["blockfp4"]:
+                    new_q_b_proj, new_q_b_proj_scale, new_q_b_proj_scale_2 = (
+                        fp4_fake_quant(
+                            new_q_b_proj,
+                            block_scale=None,
+                            global_scale=None,
+                            quant=True,
+                        )
+                    )
+                    new_q_b_proj = pack_weight_nibbles(to_e2m1_nibbles(new_q_b_proj))
+                    new_checkpoint[prefix + "q_b_proj.weight"] = new_q_b_proj
+                    new_checkpoint[prefix + "q_b_proj.weight_scale"] = (
+                        new_q_b_proj_scale.view(torch.uint8)
+                    )
+                    new_checkpoint[prefix + "q_b_proj.weight_scale_2"] = (
+                        new_q_b_proj_scale_2.view(1, 1)
+                    )
                 elif quant in ["blockfp8", "q4km"]:
                     # FIXME: Support soft fp8 in weight_quant_deepseek_v3
                     new_q_b_proj, new_q_b_proj_scale = weight_quant_deepseek_v3(
@@ -1005,7 +1081,7 @@ class TransformerDeepSeekV3(Transformer):
 
                 # Absorb into o_proj
                 o_proj_ckpt_weight = checkpoint[prefix + "o_proj.weight"]
-                if quant in [None, "gguf", "blockfp4"]:  # blockfp4 skips quantizing MLA
+                if quant in [None, "gguf"]:  # blockfp4 skips quantizing MLA
                     o_proj_weight = o_proj_ckpt_weight
                 elif quant in ["blockfp8", "q4km"]:
                     assert prefix + "o_proj.scale" in checkpoint
@@ -1014,6 +1090,31 @@ class TransformerDeepSeekV3(Transformer):
                     o_proj_weight = weight_dequant_fn(
                         o_proj_ckpt_weight.cuda(), o_proj_scale.cuda(), block_size
                     ).cpu()
+                elif quant in ["blockfp4"]:
+                    assert prefix + "o_proj.weight_scale" in checkpoint
+                    assert prefix + "o_proj.weight_scale_2" in checkpoint
+                    up_o_proj_weight = decode_e2m1_from_nibbles(
+                        unpack_weight_bytes(o_proj_ckpt_weight.cuda())
+                    ).reshape(*o_proj_ckpt_weight.shape[:-1], -1, block_size)
+                    o_proj_weight = (
+                        (
+                            up_o_proj_weight
+                            * checkpoint[prefix + "o_proj.weight_scale"]
+                            .view(torch.float8_e4m3fn)
+                            .unsqueeze(-1)
+                            .to(
+                                dtype=up_o_proj_weight.dtype,
+                                device=up_o_proj_weight.device,
+                            )
+                            * checkpoint[prefix + "o_proj.weight_scale_2"].to(
+                                device=up_o_proj_weight.device
+                            )
+                        )
+                        .reshape(
+                            o_proj_ckpt_weight.shape[0], o_proj_ckpt_weight.shape[1] * 2
+                        )
+                        .to(dtype=torch.bfloat16, device="cpu")
+                    )
                 else:
                     raise NotImplementedError(
                         f"infer.mla_absorb=absorb is not implemented for {quant} quantization"
@@ -1024,11 +1125,11 @@ class TransformerDeepSeekV3(Transformer):
                 assert kv_b_proj_for_o_proj.shape == (
                     n_local_heads,
                     self.params.v_head_dim,
-                    self.params.kv_lora_rank,
+                    kv_lora_rank,
                 )
                 kv_b_proj_for_o_proj = torch.block_diag(*kv_b_proj_for_o_proj)
                 new_o_proj = o_proj_weight @ kv_b_proj_for_o_proj
-                if quant in [None, "gguf", "blockfp4"]:  # blockfp4 skips quantizing MLA
+                if quant in [None, "gguf"]:  # blockfp4 skips quantizing MLA
                     new_checkpoint[prefix + "o_proj.weight"] = new_o_proj
                 elif quant in ["blockfp8", "q4km"]:
                     # FIXME: Support soft fp8 in weight_quant_deepseek_v3
@@ -1044,12 +1145,29 @@ class TransformerDeepSeekV3(Transformer):
                         new_o_proj = new_o_proj.view(dtype=torch.uint8)
                     new_checkpoint[prefix + "o_proj.weight"] = new_o_proj
                     new_checkpoint[prefix + "o_proj.scale"] = new_o_proj_scale
+                elif quant in ["blockfp4"]:
+                    new_o_proj, new_o_proj_scale, new_o_proj_scale_2 = fp4_fake_quant(
+                        new_o_proj, block_scale=None, global_scale=None, quant=True
+                    )
+                    new_o_proj = pack_weight_nibbles(to_e2m1_nibbles(new_o_proj))
+                    new_checkpoint[prefix + "o_proj.weight"] = new_o_proj
+                    new_checkpoint[prefix + "o_proj.weight_scale"] = (
+                        new_o_proj_scale.view(torch.uint8)
+                    )
+                    new_checkpoint[prefix + "o_proj.weight_scale_2"] = (
+                        new_o_proj_scale_2.view(1, 1)
+                    )
                 else:
                     raise NotImplementedError(
                         f"infer.mla_absorb=absorb is not implemented for {quant} quantization"
                     )
 
-            elif k.endswith(".kv_b_proj.scale"):
+            elif (
+                k.endswith(".kv_b_proj.scale")
+                or k.endswith(".kv_b_proj.weight_scale")
+                or k.endswith(".kv_b_proj.weight_scale_2")
+                or k.endswith(".kv_b_proj.input_scale")
+            ):
                 continue
 
             elif k.endswith(".kv_b_proj.bias"):
@@ -1057,10 +1175,20 @@ class TransformerDeepSeekV3(Transformer):
                     "infer.mla_absorb=absorb is not implemented for kv_b_proj with a bias"
                 )
 
-            elif k.endswith(".o_proj.weight") or k.endswith(".o_proj.scale"):
+            elif (
+                k.endswith(".o_proj.weight")
+                or k.endswith(".o_proj.scale")
+                or k.endswith(".o_proj.weight_scale")
+                or k.endswith(".o_proj.weight_scale_2")
+            ):
                 continue
 
-            elif k.endswith(".q_b_proj.weight") or k.endswith(".q_b_proj.scale"):
+            elif (
+                k.endswith(".q_b_proj.weight")
+                or k.endswith(".q_b_proj.scale")
+                or k.endswith(".q_b_proj.weight_scale")
+                or k.endswith(".q_b_proj.weight_scale_2")
+            ):
                 continue
 
             elif k.endswith(".q_b_proj.bias"):
@@ -1077,7 +1205,7 @@ class TransformerDeepSeekV3(Transformer):
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-            if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
+            if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv:
                 new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
             elif any(
@@ -1128,7 +1256,7 @@ class TransformerDeepSeekV3(Transformer):
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-            if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
+            if quant not in QuantizationRegistry._allowed_quant_for_merge_gate_up:
                 new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
             elif any(

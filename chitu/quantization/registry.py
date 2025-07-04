@@ -54,7 +54,13 @@ class QuantizationRegistry:
     _moe_experts_registry: Dict[str, Type[QuantizedMoeExpertsBase]] = {}
     _absorb_gemm_registry: Dict[str, Type[QuantizedAbsorbGemmBase]] = {}
 
-    _allowed_quant_for_merge_qkv_gate_up: List = [
+    _allowed_quant_for_merge_gate_up: List = [
+        "blockfp8",
+        "autoawq",
+        "simple_w8a8",
+        None,
+    ]
+    _allowed_quant_for_merge_qkv: List = [
         "blockfp8",
         "autoawq",
         "simple_w8a8",

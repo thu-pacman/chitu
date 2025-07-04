@@ -80,9 +80,7 @@ class AttentionHFLlama(Attention):
         quant = get_quant_from_checkpoint_prefix(
             checkpoint_prefix, args.quant_config.rules
         )
-        self.merge_qkv = (
-            quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
-        )
+        self.merge_qkv = quant in QuantizationRegistry._allowed_quant_for_merge_qkv
 
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         model_parallel_size = get_tp_size()
@@ -311,7 +309,7 @@ class FeedForwardHFLlama(nn.Module):
             checkpoint_prefix, params.quant_config.rules
         )
         self.merge_gate_up = (
-            quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
+            quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
         )
 
         # Do a parallel + fused linear projection, while ensuring outputs from gate_proj and up_proj are contiguous in memory.
@@ -426,7 +424,7 @@ def Qwen3MoeExperts(
         )
 
     quant = get_quant_from_checkpoint_prefix(checkpoint_prefix, args.quant_config.rules)
-    merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
+    merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
 
     assert args.moe_intermediate_dim % get_tp_size() == 0
     return base_moe_experts_class(
@@ -661,7 +659,7 @@ class TransformerHFLlama(Transformer):
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-            if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
+            if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv:
                 new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
             elif any(
@@ -727,7 +725,7 @@ class TransformerHFLlama(Transformer):
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-            if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
+            if quant not in QuantizationRegistry._allowed_quant_for_merge_gate_up:
                 new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
             elif any(

@@ -223,6 +223,103 @@ def apply_rotary_pos_emb_torch_npu(q, k, cos, sin, rotary_type="hf-llama"):
         raise ValueError(f"Unknown rotary type: {rotary_type}")
 
 
+def unpack_weight_bytes(packed):
+    assert packed.dtype == torch.uint8
+    out, half_in = packed.shape
+
+    high_nibble = packed & 0x0F  # [out, half_in]
+    low_nibble = packed >> 4  # [out, half_in]
+
+    return torch.stack([high_nibble, low_nibble], dim=2).view(out, half_in * 2)
+
+
+def decode_e2m1_from_nibbles(nibbles: torch.Tensor):
+    _LEVELS = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+    )
+    n = nibbles.to(torch.uint8)
+    sign = torch.where((n >> 3).bool(), -1.0, 1.0)
+    idx = (n & 0x7).to(torch.long)
+    levels = _LEVELS.to(n.device)
+    val = sign * levels[idx]
+    return val
+
+
+def pack_weight_nibbles(w_nib):
+    out, inp = w_nib.shape
+    assert inp % 2 == 0
+    high = w_nib[:, 0::2]  # [out, in//2]
+    low = w_nib[:, 1::2]  # [out, in//2]
+    packed = (low << 4) | high
+    return packed  # dtype uint8, shape [out, in//2]
+
+
+def to_e2m1_nibbles(x):
+    _LEVELS = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+    )
+    abs_x = x.abs()
+    levels = _LEVELS.to(abs_x.device).view(*([1] * abs_x.dim()), -1)
+    idx = (abs_x.unsqueeze(-1) == levels).to(torch.uint8).argmax(dim=-1).to(torch.uint8)
+    sign = (x < 0).to(torch.uint8) << 3
+    nibble = sign | idx
+    return nibble
+
+
+def fp4_fake_quant(x, block_size=16, block_scale=None, global_scale=None, quant=False):
+    if x.numel() == 0:
+        return x, x, x
+    shape, dtype = x.size(), x.dtype
+    x = x.reshape(*x.shape[:-1], -1, block_size)
+    if global_scale is None:
+        global_scale = x.abs().max().float() / (448 * 6)
+    if block_scale is None:
+        block_max = torch.max(torch.abs(x), dim=-1, keepdim=True).values
+        block_scale = torch.clamp((block_max / (6 * global_scale)), -448, 448).to(
+            torch.float8_e4m3fn
+        )
+    dq_block_scale = block_scale.to(torch.float32) * global_scale
+    scaled_x = x / dq_block_scale
+    # Quantize to FP4 values: {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}, following round to even
+    abs_scaled_x = torch.abs(scaled_x)
+    qx = fp4_rtn(abs_scaled_x)
+    sign = torch.where(scaled_x >= 0, 1.0, -1.0)
+    if quant:
+        return (qx * sign).reshape(shape).to(dtype), block_scale.squeeze(), global_scale
+    else:
+        qdq_x = qx * dq_block_scale * sign
+        return qdq_x.reshape(shape).to(dtype), block_scale.squeeze(), global_scale
+
+
+def fp4_rtn(abs_scaled_x):
+    qx = torch.where(
+        abs_scaled_x <= 0.25,
+        0.0,
+        torch.where(
+            abs_scaled_x < 0.75,
+            0.5,
+            torch.where(
+                abs_scaled_x <= 1.25,
+                1.0,
+                torch.where(
+                    abs_scaled_x < 1.75,
+                    1.5,
+                    torch.where(
+                        abs_scaled_x <= 2.5,
+                        2,
+                        torch.where(
+                            abs_scaled_x < 3.5,
+                            3.0,
+                            torch.where(abs_scaled_x <= 5.0, 4.0, 6.0),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    return qx
+
+
 def weight_quant_deepseek_v3(
     w: torch.Tensor, block_size: int = 128
 ) -> Tuple[torch.Tensor, torch.Tensor]:
