@@ -47,5 +47,7 @@ COPY . .
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt
-RUN --mount=type=cache,target=/root/.cache/pip \
-    bash script/install.sh "${optional_deps}" "${build_jobs}" "${enable_editable_install}" "${enable_cython}"
+
+# Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
+# compile at install time, and the compile results are environment dependent.
+RUN bash script/install.sh "${optional_deps}" "${build_jobs}" "${enable_editable_install}" "${enable_cython}"
