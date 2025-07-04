@@ -441,7 +441,6 @@ class Transformer(nn.Module):
         rank: int,
         world_size: int,
     ):
-        keys = checkpoint.keys()
         partial_checkpoint = {}
 
         cpl_names = self._get_tensor_column_parallel_layer_names()
@@ -559,7 +558,6 @@ class Transformer(nn.Module):
         """
         shape_w = scale1.shape
         shape_nw = list(shape_w)
-        new_weight = torch.empty(shape_nw, dtype=torch.bfloat16, device="npu")
         scale_fp8_to_32 = torch.tensor(0x7B80, dtype=torch.uint16)
         scale1 = scale1.to(torch.int16)
         new_weight = ((scale1 & 0x0080) << 8) | ((scale1 & 0x007F) << 4)
@@ -581,7 +579,6 @@ class Transformer(nn.Module):
         shape = list(tmp_weight.shape)
         shape[-2] = shape[-1] // 2
         shape[-1] = shape[-2] * 2
-        new_weight = torch.empty(shape, dtype=torch.uint8, device="npu")
         new_weight = tmp_weight.view(torch.uint8)
         new_weight = new_weight.transpose(-2, -1).contiguous()
         new_weight = new_weight.view(torch.int16)

@@ -26,7 +26,6 @@ from chitu.muxi_utils import (
 )
 from chitu.ops import (
     apply_rotary_pos_emb,
-    quant_einsum_shc_hdc_shd,
     silu_and_mul,
     weight_dequant_deepseek_v3,
     weight_dequant_soft_fp8_deepseek_v3,
@@ -50,84 +49,29 @@ torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
 logger = getLogger(__name__)
 
 
-class ParallelAbsorbGemm(torch.nn.Module):
-    def __init__(
-        self,
-        global_n_heads: int,
-        in_features_per_head: int,
-        out_features_per_head: int,
-        dtype=None,
-        block_size: int = 128,
-    ):
-        """
-        The two group GeMMs in "absorb-without-precomp" mode, embaarrassingly parallel among heads.
+def ParallelAbsorbGemm(
+    global_n_heads: int,
+    in_features_per_head: int,
+    out_features_per_head: int,
+    *,
+    checkpoint_prefix: str,
+    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+):
+    """
+    Factory function for the two group GeMMs in "absorb-without-precomp" mode, embaarrassingly parallel among heads.
 
-        It computes `einsum("shc,hdc->shd", x, weight)` where `weight` may be block-fp8 quantized.
-        """
+    It computes `einsum("shc,hdc->shd", x, weight)`, maybe quantized.
+    """
 
-        super().__init__()
+    base_class = QuantizationRegistry.get_quantized_absorb_gemm_class_from_global_args(
+        quant_kwargs=quant_kwargs, checkpoint_prefix=checkpoint_prefix
+    )
 
-        if dtype is None:
-            dtype = torch.get_default_dtype()
+    tp_size = get_tp_size()
+    assert global_n_heads % tp_size == 0
+    local_n_heads = global_n_heads // tp_size
 
-        # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
-        # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
-        args = get_global_args()
-        if (
-            dtype.itemsize == 1
-            and parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1
-        ):
-            dtype = torch.uint8
-
-        tp_size = get_tp_size()
-        assert global_n_heads % tp_size == 0
-        local_n_heads = global_n_heads // tp_size
-
-        self.weight = torch.nn.Parameter(
-            torch.empty(
-                local_n_heads, out_features_per_head, in_features_per_head, dtype=dtype
-            ),
-            requires_grad=False,
-        )
-
-        if dtype.itemsize == 1:
-            assert out_features_per_head % block_size == 0
-            assert in_features_per_head % block_size == 0
-            self.scale = torch.nn.Parameter(
-                torch.empty(
-                    local_n_heads,
-                    out_features_per_head // block_size,
-                    in_features_per_head // block_size,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-        else:
-            self.register_parameter("scale", None)
-
-        self.local_n_heads = local_n_heads
-        self.in_features_per_head = in_features_per_head
-        self.out_features_per_head = out_features_per_head
-        self.block_size = block_size
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() == 3:
-            seq, n_head, n_hidden = x.shape
-            bs = None
-        else:
-            bs, seq, n_head, n_hidden = x.shape
-            x = x.view(bs * seq, n_head, n_hidden)
-
-        y = quant_einsum_shc_hdc_shd(
-            x,
-            self.weight,
-            self.scale,
-            soft_fp8=(get_global_args().infer.raise_lower_bit_float_to == "bfloat16"),
-        )
-
-        if bs is not None:
-            y = y.view(bs, seq, y.shape[-2], y.shape[-1])
-        return y
+    return base_class(local_n_heads, in_features_per_head, out_features_per_head)
 
 
 class AttentionDeepSeekV3(Attention):
@@ -225,23 +169,15 @@ class AttentionDeepSeekV3(Attention):
                 self.n_heads,
                 self.qk_nope_head_dim,
                 self.kv_lora_rank,
-                dtype=(
-                    torch.bfloat16
-                    if quant_method == "blockfp4"
-                    else parse_dtype(args.main_weight_dtype)
-                ),
-                block_size=block_size,
+                quant_kwargs={"blockfp8": {"block_size": block_size}},
+                checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
             )
             self.kv_b_proj_absorb_2 = ParallelAbsorbGemm(
                 self.n_heads,
                 self.kv_lora_rank,
                 self.v_head_dim,
-                dtype=(
-                    torch.bfloat16
-                    if quant_method == "blockfp4"
-                    else parse_dtype(args.main_weight_dtype)
-                ),
-                block_size=block_size,
+                quant_kwargs={"blockfp8": {"block_size": block_size}},
+                checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
             )
 
         self.o_proj = RowParallelLinear(
@@ -360,7 +296,6 @@ class AttentionDeepSeekV3(Attention):
             q_nope, q_pe, kv = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
 
             kv_cache = kv[:, : self.kv_lora_rank]
-            pe_cache = kv[:, -self.qk_rope_head_dim :]
 
             # In-place update to `kv_cache`, which is part of `kv`
             self.kv_a_layernorm(kv_cache, compute_dtype=kv.dtype, out=kv_cache)

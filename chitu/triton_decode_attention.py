@@ -408,12 +408,8 @@ def _decode_grouped_att_m_fwd(
     page_size,
     logit_cap,
 ):
-    BLOCK = 32
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
-
-    if Lk >= 576:
-        BLOCK = 16
 
     if Lk == 576:
         BLOCK_DMODEL = 512

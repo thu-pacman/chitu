@@ -35,6 +35,16 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
     pass
 
 
+class QuantizedAbsorbGemmBase(torch.nn.Module):
+    """
+    The two group GeMMs in "absorb-without-precomp" mode for MLA. This module runs locally on one device.
+
+    Inherit from this class for quantization.
+    """
+
+    pass
+
+
 class QuantizationRegistry:
     """
     Registry of available quantization methods and their implementations.
@@ -42,6 +52,8 @@ class QuantizationRegistry:
 
     _linear_registry: Dict[str, Type[QuantizedLinearBase]] = {}
     _moe_experts_registry: Dict[str, Type[QuantizedMoeExpertsBase]] = {}
+    _absorb_gemm_registry: Dict[str, Type[QuantizedAbsorbGemmBase]] = {}
+
     _allowed_quant_for_merge_qkv_gate_up: List = [
         "blockfp8",
         "autoawq",
@@ -57,8 +69,10 @@ class QuantizationRegistry:
         Returns:
             Set of quantization method names
         """
-        ret = set(cls._linear_registry.keys()).union(
-            set(cls._moe_experts_registry.keys())
+        ret = (
+            set(cls._linear_registry.keys())
+            .union(set(cls._moe_experts_registry.keys()))
+            .union(set(cls._absorb_gemm_registry.keys()))
         )
         ret.remove(None)
         return ret
@@ -75,6 +89,8 @@ class QuantizationRegistry:
             registry = cls._linear_registry
         elif class_type == "moe_experts":
             registry = cls._moe_experts_registry
+        elif class_type == "absorb_gemm":
+            registry = cls._absorb_gemm_registry
         else:
             raise ValueError(f"Unknown class type: {class_type}")
         impl = registry.get(method)
@@ -142,6 +158,30 @@ class QuantizationRegistry:
 
         return cls._get_quantized_class(
             "moe_experts",
+            method,
+            quant_kwargs=quant_kwargs,
+        )
+
+    @classmethod
+    def get_quantized_absorb_gemm_class(
+        cls,
+        method: Optional[str],
+        *,
+        quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+    ) -> Optional[Type[QuantizedAbsorbGemmBase]]:
+        """
+        Get the quantized AbsorbGemm implementation for the specified method.
+
+        Arguments:
+            method: Quantization method name, or None for no quantization
+            quant_kwargs: Nested mapping for additional arguments for specific
+                quantization methods. E.g., `{"quant_method_x": {"arg1": value1, ...}}`
+        Returns:
+            The quantized AbsorbGemm class, or None if method is None or not found
+        """
+
+        return cls._get_quantized_class(
+            "absorb_gemm",
             method,
             quant_kwargs=quant_kwargs,
         )
@@ -218,6 +258,19 @@ class QuantizationRegistry:
         )
 
     @classmethod
+    def get_quantized_absorb_gemm_class_from_global_args(
+        cls,
+        *,
+        quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+        checkpoint_prefix="",
+    ) -> Optional[Type[QuantizedAbsorbGemmBase]]:
+        return cls._get_quantized_class_from_global_args(
+            "absorb_gemm",
+            quant_kwargs=quant_kwargs,
+            checkpoint_prefix=checkpoint_prefix,
+        )
+
+    @classmethod
     def register_linear(
         cls,
         name: Optional[str],
@@ -253,4 +306,23 @@ class QuantizationRegistry:
         if implementation is None:
             return functools.partial(cls.register_moe_experts, name)
         cls._moe_experts_registry[name] = implementation
+        return implementation
+
+    @classmethod
+    def register_absorb_gemm(
+        cls,
+        name: Optional[str],
+        implementation: Optional[Type[QuantizedAbsorbGemmBase]] = None,
+    ) -> None:
+        """
+        Register a new quantization AbsorbGemm layer.
+
+        Arguments:
+            name: Name of the quant. None for non-quantized layer.
+            implementation: Implementation class. If None, return a partial function as
+                a decorator.
+        """
+        if implementation is None:
+            return functools.partial(cls.register_absorb_gemm, name)
+        cls._absorb_gemm_registry[name] = implementation
         return implementation

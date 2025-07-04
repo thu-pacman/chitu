@@ -5,6 +5,7 @@ import torch
 from chitu.quantization.registry import (
     QuantizedLinearBase,
     QuantizedMoeExpertsBase,
+    QuantizedAbsorbGemmBase,
     QuantizationRegistry,
 )
 from chitu.global_vars import get_global_args
@@ -20,7 +21,6 @@ if has_triton:
     from chitu.fused_moe import fused_experts
 
 
-@QuantizationRegistry.register_linear("gguf")
 @QuantizationRegistry.register_linear(None)
 class NormalLinear(QuantizedLinearBase):
     def __init__(
@@ -333,3 +333,45 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
             topk_weights=weights,
             topk_ids=indices,
         )
+
+
+@QuantizationRegistry.register_absorb_gemm(None)
+class NormalAbsorbGemm(QuantizedAbsorbGemmBase):
+    def __init__(
+        self,
+        ############################################
+        # Common parameters for all quantizations
+        n_heads: int,
+        in_features_per_head: int,
+        out_features_per_head: int,
+        *,
+        ############################################
+        # Parameters specific to this quantization
+        dtype=None,
+    ):
+        super().__init__()
+
+        self.weight = torch.nn.Parameter(
+            torch.empty(
+                n_heads, out_features_per_head, in_features_per_head, dtype=dtype
+            ),
+            requires_grad=False,
+        )
+
+        self.n_heads = n_heads
+        self.in_features_per_head = in_features_per_head
+        self.out_features_per_head = out_features_per_head
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 3:
+            seq, n_head, n_hidden = x.shape
+            bs = None
+        else:
+            bs, seq, n_head, n_hidden = x.shape
+            x = x.view(bs * seq, n_head, n_hidden)
+
+        y = torch.einsum("shc,hdc->shd", x, self.weight)
+
+        if bs is not None:
+            y = y.view(bs, seq, y.shape[-2], y.shape[-1])
+        return y

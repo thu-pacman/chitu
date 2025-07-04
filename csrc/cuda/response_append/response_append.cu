@@ -45,6 +45,12 @@ void response_append(torch::Tensor response_list,
     TORCH_CHECK(response_len.size(0) == n, "Length array size mismatch");
     TORCH_CHECK(need_expand.size(0) == n, "Capacity array size mismatch");
 
+    checkTensor(response_list, torch::kLong);
+    checkTensor(new_response_list, torch::kLong);
+    checkTensor(tokens_list, torch::kLong);
+    checkTensor(response_len, torch::kInt);
+    checkTensor(need_expand, torch::kBool);
+
     const int block_size = 256;
     const int grid_size = (n + block_size - 1) / block_size;
 

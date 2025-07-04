@@ -952,8 +952,6 @@ def grouped_matmul_kernel(
     pid_g = tl.program_id(axis=0)
     pid_m = tl.program_id(axis=1)
     pid_n = tl.program_id(axis=2)
-    m = tl.cdiv(M, BLOCK_SIZE_M)
-    n = tl.cdiv(N, BLOCK_SIZE_N)
     k = tl.cdiv(K, BLOCK_SIZE_K)
     scale_k = tl.cdiv(K, group_k)
     scale_n = tl.cdiv(N, group_n)

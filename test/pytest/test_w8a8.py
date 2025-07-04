@@ -110,7 +110,6 @@ def benchmark_w8a8gemv(dim, dtype, provider):
     device = torch.device("cuda")
     a = (torch.randn([2, 1, dim], device=device) * 4).to(torch.int8)
     b = (torch.randn([4096, dim], device=device) * 4).to(torch.int8)
-    c = torch.zeros([2, 1, 4096], dtype=dtype, device=device)
     a_scales = torch.ones([2], device=device).to(torch.float)
     b_scales = torch.ones([4096], device=device).to(torch.float)
 

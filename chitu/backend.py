@@ -201,7 +201,6 @@ class Backend:
         Returns:
             Initialized tokenizer
         """
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
         trust_remote_code = args.models.name.startswith("glm-4")
         force_full_seq_decode = (
             args.models.tokenizer_force_full_seq_decode
@@ -209,7 +208,7 @@ class Backend:
             else False
         )
 
-        if args.models.type in ["hf-llama", "hf-mixtral", "deepseek-v3"]:
+        if args.models.type in ["hf-llama", "hf-glm-z1", "hf-mixtral", "deepseek-v3"]:
             tokenizer = TokenizerHF(
                 path=args.models.tokenizer_path,
                 trust_remote_code=trust_remote_code,
@@ -512,7 +511,12 @@ class Backend:
                 ), f"no checkpoint files found in {args.models.ckpt_dir}"
                 ckpt_path = checkpoints[0]
                 checkpoint = torch.load(ckpt_path, map_location="cpu")
-            elif args.models.type in {"hf-llama", "hf-mixtral", "deepseek-v3"}:
+            elif args.models.type in {
+                "hf-llama",
+                "hf-glm-z1",
+                "hf-mixtral",
+                "deepseek-v3",
+            }:
                 checkpoint = Backend._load_hf_checkpoint(model, args)
             else:
                 raise NotImplementedError(f"Unsupported model type {args.models.type}")
@@ -696,7 +700,6 @@ def load_gguf_deepseek_v3_gguf(
         torch.cuda.empty_cache()
 
     logger.info("initing cpu tensors!")
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     for layer_id in range(3, 61):
         if layer_id in cpu_layers:
             if model.layers[layer_id].mlp.experts.moe == None:

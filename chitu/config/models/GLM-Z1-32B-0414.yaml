@@ -1,13 +1,14 @@
-name: glm-4-9b
-type: hf-llama
-source: "https://www.modelscope.cn/models/ZhipuAI/GLM-4-9B-0414" # Just for displaying. No automatic download.
+name: glm-z1-32b
+type: hf-glm-z1
+source: "https://modelscope.cn/models/ZhipuAI/GLM-Z1-32B-0414/" # Just for displaying. No automatic download.
 ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
 tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
-dim: 4096
-n_layers: 40
-n_heads: 32
+dim: 6144
+n_layers: 61
+n_heads: 48
 n_kv_heads: 2
 vocab_size: 151552
-intermediate_dim: 13696
+intermediate_dim: 23040
 norm_eps: 1e-05
 rope_theta: 10000.0
+qkv_has_bias: False

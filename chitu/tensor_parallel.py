@@ -89,8 +89,8 @@ def get_tp_rank():
 def get_local_linear_class(
     base_linear_class: Optional[type] = None,
     *,
+    checkpoint_prefix: str,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-    checkpoint_prefix: str = "",
 ):
     if base_linear_class is None:
         base_linear_class = (
@@ -104,9 +104,9 @@ def get_local_linear_class(
 def LocalLinear(
     in_features: int,
     out_features: int,
-    checkpoint_prefix: str,
     has_bias: bool = True,
     *,
+    checkpoint_prefix: str,
     base_linear_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
@@ -137,8 +137,8 @@ def LocalLinear(
 def get_column_parallel_linear_class(
     base_linear_class: Optional[type] = None,
     *,
+    checkpoint_prefix: str,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-    checkpoint_prefix="",
 ):
     if base_linear_class is None:
         base_linear_class = (
@@ -162,10 +162,10 @@ def get_column_parallel_linear_class(
 def ColumnParallelLinear(
     in_features: int,
     out_features: int,
-    checkpoint_prefix: str,
     has_bias: bool = True,
     gather_output: bool = True,
     *,
+    checkpoint_prefix: str,
     base_linear_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
@@ -198,8 +198,8 @@ def ColumnParallelLinear(
 def get_row_parallel_linear_class(
     base_linear_class: Optional[type] = None,
     *,
+    checkpoint_prefix: str,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-    checkpoint_prefix="",
 ):
     if base_linear_class is None:
         base_linear_class = (
@@ -223,11 +223,11 @@ def get_row_parallel_linear_class(
 def RowParallelLinear(
     in_features: int,
     out_features: int,
-    checkpoint_prefix: str,
     has_bias: bool = True,
     input_is_parallel: bool = False,
     reduce_output: bool = True,
     *,
+    checkpoint_prefix: str,
     base_linear_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):

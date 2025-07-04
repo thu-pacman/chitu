@@ -244,16 +244,16 @@ class PagedKVCacheManager:
             max_block_num = self.max_blocks_per_req
         else:
             max_block_num = max(len(self.block_table[req_id]) for req_id in req_ids)
-        self.gpu_block_table.set(
-            torch.zeros(
-                (len(req_ids), max_block_num), dtype=torch.int32, device=self.device
-            )
+        cpu_block_table_tensor = torch.zeros(
+            len(req_ids), max_block_num, dtype=torch.int32
         )
         for idx, req_id in enumerate(req_ids):
             block_ids = self.block_table[req_id]
-            self.gpu_block_table.get()[idx, : len(block_ids)] = torch.tensor(
+            cpu_block_table_tensor[idx, : len(block_ids)] = torch.tensor(
                 block_ids, dtype=torch.int32
             )
+        self.gpu_block_table.set_shape(cpu_block_table_tensor.shape)
+        self.gpu_block_table.get().copy_(cpu_block_table_tensor, non_blocking=True)
 
     def finalize_cache_single_decode(self, req_ids):
         for req_id in req_ids:

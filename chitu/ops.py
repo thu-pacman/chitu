@@ -305,6 +305,7 @@ def quant_einsum_shc_hdc_shd(
     group_B: torch.Tensor,
     group_b_s: torch.Tensor,
     *,
+    block_size: int = 128,
     group_n: int = 128,
     group_k: int = 128,
     soft_fp8: bool = False,
@@ -316,23 +317,21 @@ def quant_einsum_shc_hdc_shd(
     assert group_A.shape[2] == group_B.shape[2]
 
     if impl == "auto":
-        if group_b_s is not None and has_triton:
+        if has_triton:
             impl = "triton"
         else:
             impl = "torch"
 
-    if (
-        impl == "torch"
-    ):  # TODO: torch implementation for these two functions need to be added
-        if group_b_s is not None:
-            weight_dequant_fn = (
-                weight_dequant_soft_fp8_deepseek_v3
-                if soft_fp8
-                else weight_dequant_deepseek_v3
-            )
-            group_B = weight_dequant_fn(group_B, group_b_s, block_size=128)
+    if impl == "torch":
+        weight_dequant_fn = (
+            weight_dequant_soft_fp8_deepseek_v3
+            if soft_fp8
+            else weight_dequant_deepseek_v3
+        )
+        group_B = weight_dequant_fn(group_B, group_b_s, block_size=block_size)
         return torch.einsum("shc,hdc->shd", group_A, group_B)
     elif impl == "triton":
+        assert block_size == 128
         return quant_einsum_shc_hdc_shd_triton(
             group_A,
             group_B,
@@ -793,7 +792,11 @@ def response_append_cuda(
     need_expand = response_len == response_capacity
     new_response_list = torch.empty_like(response_list)
     return_response_list = []
-    expand_cpu = need_expand.cpu()
+    expand_cpu = need_expand.cpu().tolist()
+
+    new_response_index = []
+    new_response_ptr = []
+    new_response_capacity = []
 
     for i in range(task_num):
         if expand_cpu[i]:
@@ -801,10 +804,21 @@ def response_append_cuda(
             new_response = torch.empty(
                 new_len, dtype=torch.long, device=response_list.device
             )
-            new_response_list[i] = new_response.data_ptr()
-            response_capacity[i] = new_len
+            new_response_ptr.append(new_response.data_ptr())
+            new_response_index.append(i)
+            new_response_capacity.append(new_len)
             return_response_list.append((i, new_response))
-
+    if len(new_response_ptr) > 0:
+        new_response_list[new_response_index] = torch.tensor(
+            new_response_ptr,
+            device=new_response_list.device,
+            dtype=new_response_list.dtype,
+        )
+        response_capacity[new_response_index] = torch.tensor(
+            new_response_capacity,
+            device=response_capacity.device,
+            dtype=response_capacity.dtype,
+        )
     chitu_backend.cuda_response_append(
         response_list, new_response_list, tokens_list, response_len, need_expand
     )
