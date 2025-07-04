@@ -523,6 +523,18 @@ class Backend:
             else:
                 raise NotImplementedError(f"Unsupported model type {args.models.type}")
 
+            # For the FP8 variants of Qwen (Qwen3-30B-A3B-fp8 and Qwen3-235B-A22B-fp8), some checkpoint parameters
+            # are stored in full precision (FP32) by default, but at runtime they’re also cast to BF16
+            if args.models.name in ["Qwen3-30B-A3B-fp8", "Qwen3-235B-A22B-fp8"]:
+                for k in checkpoint.keys():
+                    if (
+                        checkpoint[k].dtype == torch.float32
+                        and "scale" not in k
+                        and "layernorm" not in k
+                        and "norm" not in k
+                    ):
+                        checkpoint[k] = checkpoint[k].to(torch.get_default_dtype())
+
             # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
             # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
             for k in checkpoint.keys():

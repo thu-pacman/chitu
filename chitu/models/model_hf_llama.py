@@ -805,6 +805,13 @@ class TransformerHFLlama(Transformer):
 
                 del state_dict["transformer.rotary_pos_emb.inv_freq"]
                 state_dict = {map_glm_key(k): v for k, v in state_dict.items()}
+            if self.params.quant_config["type"] == "blockfp8":
+
+                def map_blockfp8_key(k):
+                    k = k.replace(".weight_scale_inv", ".scale")
+                    return k
+
+                state_dict = {map_blockfp8_key(k): v for k, v in state_dict.items()}
 
             if self.model_parallel_size > 1:
                 # QKV and gate/up layers might already be merged in the checkpoint, but they should be split
@@ -893,7 +900,9 @@ class TransformerHFLlama(Transformer):
 
             if (
                 "Qwen3-30B-A3B" in get_global_args().models.name
+                or "Qwen3-30B-A3B-fp8" in get_global_args().models.name
                 or "Qwen3-235B-A22B" in get_global_args().models.name
+                or "Qwen3-235B-A22B-fp8" in get_global_args().models.name
             ):
                 # Qwen3 models have a special structure for experts, so we need to merge them.
                 for key_name in [
@@ -901,6 +910,7 @@ class TransformerHFLlama(Transformer):
                     "weight_scale",
                     "weight_scale_2",
                     "weight",
+                    "scale",
                 ]:
                     state_dict = self._process_state_dict_for_merging_expert(
                         state_dict, key_name
