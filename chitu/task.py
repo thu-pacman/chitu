@@ -427,7 +427,7 @@ class PackedTasksBase:
             PackedTasksBase.configured
         ), "PackedTasksBase must be configured before serialization"
 
-        ret = PackedTasksBase.empty_serialization(device=device)
+        ret = PackedTasksBase.empty_serialization(device="cpu")
         ret[0] = payload_type.value
         for i, tid in enumerate(self.task_ids):
             assert self.task_type != TaskType.Hybrid
@@ -443,7 +443,7 @@ class PackedTasksBase:
         if infer_args.cache_type == "paged" and not infer_args.num_blocks == -1:
             ret[-1] = infer_args.num_blocks
 
-        return ret
+        return ret.to(device)
 
     @classmethod
     def serialize_special(cls, payload_type: SerializedPackedTasksPayloadType, device):
