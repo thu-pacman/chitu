@@ -890,7 +890,7 @@ class TritonAttnBackend(RefAttnBackend):
                 dtype=torch.float32,
                 device=q.device,
             )
-            if softmax_scale == None:
+            if softmax_scale is None:
                 softmax_scale = 1.0 / math.sqrt(q.shape[-1])
             self.decode_attention_fwd(
                 q.view(-1, q.shape[-2], q.shape[-1]),

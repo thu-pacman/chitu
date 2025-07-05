@@ -1,5 +1,3 @@
-import os
-import sys
 import time
 from functools import reduce
 import operator

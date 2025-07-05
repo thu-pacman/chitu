@@ -1,10 +1,8 @@
 import struct
 import packaging
-from typing import Tuple, Optional, List
+from typing import Tuple, List
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 

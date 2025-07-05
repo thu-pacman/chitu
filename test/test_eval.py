@@ -4,11 +4,9 @@ import os
 os.environ["PAGED_SIZE"] = "0"
 from chitu.backend import Backend
 from chitu.global_vars import *
-from chitu.tokenizer import Tokenizer, ChatFormat, TokenizerHF, ChatFormatHF
 from chitu.model import Attention, Transformer, apply_rotary_emb
 from chitu.model_hf_llama import AttentionHFLlama, apply_rotary_pos_emb_torch
 from chitu.utils import VarLens
-import yaml
 import flash_attn
 import hydra
 

@@ -2,7 +2,6 @@ import pytest
 import math
 import torch
 import triton
-import triton.language as tl
 
 from chitu.ops import apply_rotary_pos_emb
 
@@ -121,6 +120,8 @@ def benchmark(batch_size, n_local_heads, head_dim, provider, rotary_type="llama"
                 q, k, cos, sin, rotary_type=rotary_type, impl="cuda"
             )
         )
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
     return ms * 1000
 
 

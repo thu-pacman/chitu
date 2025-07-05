@@ -413,7 +413,6 @@ class KVCacheManager:
     def finalize_cache_all_decode(self, req_id):
         self.curr_varlens = None
         self.curr_req_ids = None
-        pass
 
 
 class KVCache:
@@ -805,7 +804,6 @@ class KVCacheManagerNop:
             ],
             device=self.device,
         )
-        pass
 
     # Prefill:
     # return for every req [layer, seq, n_local_kv_heads, head_dim] * 2 (for k and v)

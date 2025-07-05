@@ -242,8 +242,7 @@ def chitu_run():
         if len(task_ids) == 0:  # no tasks to do, but some tasks are waiting
             chitu_update(task_ids, rank, world_size)
             return
-        if rank == 0:
-            logger.debug(f"Processing {task_ids}")
+        logger.debug(f"Processing {task_ids}")
         tasks = PackedTasks(task_ids, rank)
     else:
         tasks = None

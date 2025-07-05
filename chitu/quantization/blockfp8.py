@@ -2,7 +2,6 @@ from typing import Optional
 from logging import getLogger
 
 import torch
-import torch.nn.functional as F
 
 from chitu.quantization.registry import (
     QuantizedLinearBase,

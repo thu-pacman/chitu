@@ -9,7 +9,7 @@ __all__ = [
 ]
 
 import torch
-from typing import Optional, Mapping, Set, Any
+from typing import Optional, Mapping, Any
 from logging import getLogger
 
 from chitu.global_vars import get_global_args

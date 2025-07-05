@@ -1,9 +1,7 @@
 import torch
-import chitu_backend
 import pytest
-from typing import List, Optional
 import triton
-import triton.language as tl
+
 from chitu.layers.gate import fused_sigmoid_gate
 
 
@@ -115,7 +113,7 @@ def benchmark(seq_length, dtype, params, has_bias, bias_is_float32, provider):
                 scores, bias, seq_length, num_expert_group, topk_group, topk
             )
         )
-    if provider == "triton":
+    elif provider == "triton":
         ms = triton.testing.do_bench(
             lambda: fused_sigmoid_gate(
                 scores,
@@ -125,6 +123,8 @@ def benchmark(seq_length, dtype, params, has_bias, bias_is_float32, provider):
                 e_score_correction_bias=bias,
             )
         )
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
     return ms * 1000
 
 

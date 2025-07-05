@@ -348,7 +348,7 @@ class GGUFLoader:
         t = self.tensor_info[name]
         # if device.lower() == "cpu":
         #     print(f"loading {name} with CPU")
-        if target_dtype == None:
+        if target_dtype is None:
             target_dtype = torch.get_default_dtype()
 
         shape = t["shape"]
@@ -436,7 +436,7 @@ class GGUFLoader:
         rank=0,
         world_size=8,
     ) -> torch.Tensor:
-        if target_dtype == None:
+        if target_dtype is None:
             target_dtype = torch.get_default_dtype()
 
         if ggml_type not in GGML_NAMES:

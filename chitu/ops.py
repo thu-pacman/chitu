@@ -1,27 +1,17 @@
-import struct
-import packaging
 from typing import Tuple, Optional, List
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-from chitu.device_type import is_hopper
 from chitu.utils import try_import_opt_dep
 from chitu.global_vars import get_global_args
 from chitu.device_list import DeviceList
 
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
 torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
-
-try:
-    import triton
-    import triton.language as tl
-
-    has_triton = True
+triton, has_triton = try_import_opt_dep("triton", "triton")
+if has_triton:
     from chitu.triton_ops import *
-except ImportError:
-    has_triton = False
 
 
 def rotate_half(x):
@@ -365,7 +355,6 @@ def silu_and_mul_torch(x: torch.Tensor):
         )
 
 
-# TODO: need to be optimized
 def append_to_paged_kv_cache_torch(
     kv_cache,  # (num_pages, page_size, other contiguous dims...)
     page_table,  # (batch_size, num_pages_per_sample)
@@ -379,7 +368,6 @@ def append_to_paged_kv_cache_torch(
         ] = this_kv[i].clone()
 
 
-# TODO: need to be optimized
 def append_to_non_paged_kv_cache_torch(
     kv_cache,  # (batch_size, seq_len, other contiguous dims...)
     this_kv,  # (batch_size, other contiguous dims...)
@@ -468,13 +456,9 @@ def append_to_paged_kv_cache(
         impl = "triton"
 
     if impl == "triton" and has_triton:
-        return append_to_paged_kv_cache_triton(
-            kv_cache, page_table, this_kv, old_seq_lens
-        )
+        append_to_paged_kv_cache_triton(kv_cache, page_table, this_kv, old_seq_lens)
     else:
-        return append_to_paged_kv_cache_torch(
-            kv_cache, page_table, this_kv, old_seq_lens
-        )
+        append_to_paged_kv_cache_torch(kv_cache, page_table, this_kv, old_seq_lens)
 
 
 def rms_norm(X: torch.Tensor, W: torch.Tensor, eps, compute_dtype, impl: str = "auto"):
@@ -497,9 +481,9 @@ def append_to_non_paged_kv_cache(
         impl = "triton"
 
     if impl == "triton" and has_triton:
-        return append_to_non_paged_kv_cache_triton(kv_cache, this_kv, old_seq_lens)
+        append_to_non_paged_kv_cache_triton(kv_cache, this_kv, old_seq_lens)
     else:
-        return append_to_non_paged_kv_cache_torch(kv_cache, this_kv, old_seq_lens)
+        append_to_non_paged_kv_cache_torch(kv_cache, this_kv, old_seq_lens)
 
 
 def soft_fp8_gemm_deepseek_v3(

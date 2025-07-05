@@ -1,9 +1,8 @@
-from chitu.fused_moe import moe_sum
 import torch
-import random
 import pytest
 import triton
-import triton.language as tl
+
+from chitu.fused_moe import moe_sum
 
 
 def torch_moe_sum(input_tensor, output_tensor):
@@ -45,8 +44,10 @@ def benchmark(M, N, compute_dtype, provider):
     output_tensor = torch.zeros(M, N, device="cuda", dtype=compute_dtype)
     if provider == "torch":
         ms = triton.testing.do_bench(lambda: torch_moe_sum(input_tensor, output_tensor))
-    if provider == "triton":
+    elif provider == "triton":
         ms = triton.testing.do_bench(lambda: moe_sum(input_tensor, output_tensor))
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
     # gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return ms * 1000
 

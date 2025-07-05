@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import random
 from logging import getLogger
 from threading import Thread
 from typing import List, Optional
@@ -10,7 +9,6 @@ import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from omegaconf import DictConfig
 from pydantic import BaseModel, Field
 
 from chitu.async_response import AsyncResponse

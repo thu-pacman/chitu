@@ -64,10 +64,12 @@ def benchmark_w8a8gemm(M, N, K, dtype, provider):
         ms = triton.testing.do_bench(
             lambda: torch.mm(a.to(dtype), b.transpose(0, 1).to(dtype))
         )
-    if provider == "w8a8gemm":
+    elif provider == "w8a8gemm":
         ms = triton.testing.do_bench(
             lambda: w8a8gemm.mm(c, a, b, a_scales, b_scales, None)
         )
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
     return ms * 1000
 
 
@@ -119,8 +121,10 @@ def benchmark_w8a8gemv(dim, dtype, provider):
                 a.reshape(2, dim).to(dtype), b.transpose(0, 1).to(dtype)
             ).reshape(2, 1, 4096)
         )
-    if provider == "w8a8gemv":
+    elif provider == "w8a8gemv":
         ms = triton.testing.do_bench(lambda: w8a8gemv.mv(a, b, a_scales, b_scales))
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
     return ms * 1000
 
 

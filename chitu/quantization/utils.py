@@ -1,6 +1,6 @@
 from typing import Optional
 import re
-from typing import List, Dict
+from typing import List
 
 
 def get_quant_from_checkpoint_prefix(checkpoint_prefix: str, rules) -> Optional[str]:

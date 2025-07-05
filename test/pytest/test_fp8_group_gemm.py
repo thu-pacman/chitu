@@ -2,11 +2,9 @@ import pytest
 import itertools
 
 import torch
-import torch.distributed as dist
 from omegaconf import OmegaConf
 
 import triton
-import triton.language as tl
 
 from chitu.ops import quant_einsum_shc_hdc_shd
 from chitu.global_vars import set_global_args
@@ -94,10 +92,12 @@ def benchmark_quant_einsum_shc_hdc_shd(M, K, N, provider):
                 q_nope.to(torch.float), weight, scale, impl="torch"
             )
         )
-    if provider == "triton":
+    elif provider == "triton":
         ms = triton.testing.do_bench(
             lambda: quant_einsum_shc_hdc_shd(q_nope, weight, scale, impl="triton")
         )
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
     return ms
 
 

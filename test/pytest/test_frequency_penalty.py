@@ -1,15 +1,11 @@
 import torch
-import numpy as np
 from typing import List
-import json
 import time
-import random
 import pytest
 
 from chitu.device_list import DeviceList
 from chitu.ops import apply_frequency_penalty
 from chitu.utils import try_import_opt_dep
-from chitu.device_type import is_muxi
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
 

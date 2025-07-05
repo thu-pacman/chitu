@@ -3,11 +3,10 @@ import pytest
 import packaging.version
 from omegaconf import OmegaConf
 import flashinfer
-from typing import List
-from chitu.triton_flash_attention import context_attention_fwd
+import triton
+
 from chitu.attn_backend import RefAttnBackend, TritonAttnBackend, FlashInferBackend
 from chitu.global_vars import set_global_args
-import triton
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

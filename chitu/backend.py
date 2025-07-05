@@ -1,15 +1,13 @@
 from typing import Callable
 import gc
 import itertools
-import json
 import os
-import sys
 import time
 from enum import Enum
 from glob import glob
 from logging import getLogger
 from pathlib import Path
-from tqdm import tqdm, trange
+from tqdm import tqdm
 from chitu.quantization import get_quant_from_checkpoint_prefix
 
 import torch
@@ -556,6 +554,7 @@ class Backend:
 
         logger.info(f"Checkpoint loaded in {time.time() - start_time:.2f} seconds")
 
+    @staticmethod
     def _load_hf_checkpoint(model, args):
         """
         Load checkpoint for Hugging Face model types.
@@ -713,7 +712,7 @@ def load_gguf_deepseek_v3_gguf(
     logger.info("initing cpu tensors!")
     for layer_id in range(3, 61):
         if layer_id in cpu_layers:
-            if model.layers[layer_id].mlp.experts.moe == None:
+            if model.layers[layer_id].mlp.experts.moe is None:
                 model.layers[layer_id].mlp.experts.init_weights()
 
 

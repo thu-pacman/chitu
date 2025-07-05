@@ -48,7 +48,6 @@ class Executor:
 
     def __init__(self, args):
         self.timers = get_timers()
-        pass
 
     def step(
         self,
