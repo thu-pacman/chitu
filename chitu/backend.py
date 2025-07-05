@@ -373,7 +373,11 @@ class Backend:
                 if hasattr(args.models, "n_kv_heads")
                 else args.models.n_heads
             )
-            n_local_kv_heads = n_kv_heads // model_parallel_size
+            n_local_kv_heads = (
+                n_kv_heads // model_parallel_size
+                if n_kv_heads > model_parallel_size
+                else 1
+            )  # Compatible with tp_size>n_kv_heads
             head_dim = (
                 args.models.head_dim
                 if hasattr(args.models, "head_dim")
