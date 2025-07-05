@@ -20,8 +20,7 @@ assert packaging.version.parse(setuptools.__version__) >= packaging.version.pars
 ), "setuptools>=62.3.0 is required for `**` wildcard in package_data."
 
 import csrc.setup_build as operators
-
-setup_dir = os.path.dirname(os.path.abspath(__file__))
+from get_requires import install_requires, extras_require
 
 
 # We use CUDAExtension instead of CMake for native sources, because many of the non-NVIDIA GPUs have
@@ -93,64 +92,8 @@ if os.environ.get("CHITU_WITH_CYTHON", "0") != "0":
 setup(
     name="chitu",
     version="0.3.7",
-    install_requires=[
-        # Don't put `torch` here because it requires downloading from a specific source
-        "transformers",
-        "fire",
-        "tiktoken>=0.7.0",  # Required by glm4
-        "blobfile",
-        "faker",
-        "hydra-core",
-        "fastapi",
-        "uvicorn",
-        "tqdm",
-        "accelerate",
-        "einops",
-        "typing-extensions",
-    ],
-    extras_require={
-        "quant": [
-            "optimum",
-            "bitsandbytes",
-            "autoawq-kernels==0.0.8",
-            "autoawq[kernels]",
-            "gptqmodel>=2.2.0",
-            "tokenizers>=0.20.3",
-        ],
-        ##########################################################################
-        # Our own kernels for various architectures
-        "muxi_layout_kernels": [
-            "muxi_layout_kernels @ file://localhost"
-            + os.path.join(setup_dir, "third_party/muxi_layout_kernels"),
-        ],
-        "muxi_w8a8_kernels": [
-            "tbsgemm @ file://localhost"
-            + os.path.join(setup_dir, "third_party/muxi_w8a8_kernels/w8a8"),
-        ],
-        "ascend_kernels": [
-            "grouped_gemm @ file://localhost"
-            + os.path.join(setup_dir, "third_party/ascend-kernel/grouped_gemm"),
-        ],
-        ##########################################################################
-        # Really third-party kernels
-        "flash_attn": [
-            "flash-attn<2.8.0",
-            # Although `flash-attn` is available in PyPI, don't make it a required
-            # dependency, because its installation runs forever on some platforms.
-        ],
-        "flashinfer": [
-            "flashinfer-python<=0.2.5",  # Later versions require a too-new torch
-        ],
-        "flash_mla": [
-            "flash_mla @ file://localhost"
-            + os.path.join(setup_dir, "third_party/FlashMLA"),
-        ],
-        "deep_gemm": [
-            "deep_gemm @ file://localhost"
-            + os.path.join(setup_dir, "third_party/DeepGEMM"),
-        ],
-        **operators.get_extras_require(),
-    },
+    install_requires=install_requires,
+    extras_require=extras_require,
     packages=find_packages(),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension, "build_py": my_build_py},

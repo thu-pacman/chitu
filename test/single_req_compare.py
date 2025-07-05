@@ -20,7 +20,6 @@ from chitu.utils import get_config_dir_path, gen_req_id
 
 # -----------utils part begin--------------
 import json
-import math
 import numpy as np
 
 

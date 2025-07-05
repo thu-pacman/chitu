@@ -1,3 +1,5 @@
+#####################################
+# Base Image Stage
 FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel AS base
 
 ARG torch_cuda_arch_list='7.0 7.5 8.0 8.6 8.9 9.0+PTX'
@@ -42,10 +44,58 @@ RUN if [ "${enable_test}" = "true" ]; then \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest; \
 fi
 
+# Always install build time dependencies. Some dependencies may fail to build
+# if some build time dependencies are missing.
+COPY ./requirements-build.txt /tmp/requirements-build.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements-build.txt
+
+
+#####################################
+# Dependency Resolver Stage
+#
+# The only purpose of this stage is to generate a requirements.txt file. This
+# stage may trigger rebuild whenever there is any change in the source code,
+# but this stage runs fast.
+FROM base AS dependency_resolver
+
 WORKDIR /workspace/chitu
 COPY . .
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt
-RUN --mount=type=cache,target=/root/.cache/pip \
-    bash script/install.sh "${optional_deps}" "${build_jobs}" "${enable_editable_install}" "${enable_cython}"
+RUN ./gen_tmp_requirements_txt.py "${optional_deps}" > /tmp/requirements.txt
+
+
+#####################################
+# Dependency Installer Stage
+#
+# This stage installs the dependencies listed in requirements.txt. Some of the
+# dependencies may require compilation, so this stage may take a long time, but
+# this stage only triggers rebuild when the requirements.txt file changes, or
+# this source of the dependencies changes.
+FROM base AS dependency_installer
+
+WORKDIR /workspace/chitu
+COPY --from=dependency_resolver /tmp/requirements.txt /tmp/requirements.txt
+COPY ./third_party ./third_party
+COPY ./csrc/cpuinfer ./csrc/cpuinfer
+
+# Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
+# compile at install time, and the compile results are environment dependent.
+RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt
+
+WORKDIR /workspace
+RUN rm -rf /workspace/chitu
+
+
+#####################################
+# Build Stage
+# 
+# This stage builds chitu.
+FROM dependency_installer AS build
+
+WORKDIR /workspace/chitu
+COPY . .
+
+# Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
+# compile at install time, and the compile results are environment dependent.
+RUN bash script/install.sh "${optional_deps}" "${build_jobs}" "${enable_editable_install}" "${enable_cython}"

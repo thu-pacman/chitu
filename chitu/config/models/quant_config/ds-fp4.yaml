@@ -1,0 +1,20 @@
+type: blockfp4
+quant:
+- model: '.'
+  rules:
+    - regex: '\.self_attn'
+      type: blockfp4
+    - regex: '\.mlp.moe'
+      type: blockfp4
+    - regex: '\.mlp.experts\.'
+      type: blockfp4
+    - regex: '\.mlp.shared_experts'
+      type: blockfp4
+    - regex: '\.mlp.gate_proj'
+      type: blockfp4
+    - regex: '\.mlp.gate_up_proj'
+      type: blockfp4
+    - regex: '\.mlp.up_proj'
+      type: blockfp4
+    - regex: '\.mlp.down_proj'
+      type: blockfp4

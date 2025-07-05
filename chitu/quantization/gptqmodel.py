@@ -102,7 +102,6 @@ def replace_tensor(layer: torch.nn.Module, name: str, new_t: torch.Tensor) -> No
     # the same buffer is reused
     getattr(layer, name).resize_(new_t.shape)
     getattr(layer, name).copy_(new_t)
-    del new_t
 
 
 def marlin_permute_scales(

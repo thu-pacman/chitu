@@ -1,15 +1,14 @@
 from typing import Callable
 import gc
 import itertools
-import json
 import os
-import sys
 import time
 from enum import Enum
 from glob import glob
 from logging import getLogger
 from pathlib import Path
-from tqdm import tqdm, trange
+from tqdm import tqdm
+from chitu.quantization import get_quant_from_checkpoint_prefix
 
 import torch
 import torch.distributed as dist
@@ -466,10 +465,11 @@ class Backend:
         Returns:
             Initialized model architecture
         """
+        if args.models.type == "deepseek-v3":
+            QuantizationRegistry._allowed_quant_for_merge_gate_up.append("blockfp4")
+
         model_parallel_size = args.infer.tp_size
         pipeline_parallel_size = args.infer.pp_size
-        if args.models.type == "deepseek-v3":
-            QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up.append("blockfp4")
 
         model = Backend.build_model(
             args.models,
@@ -521,20 +521,29 @@ class Backend:
             else:
                 raise NotImplementedError(f"Unsupported model type {args.models.type}")
 
+            # For the FP8 variants of Qwen (Qwen3-30B-A3B-fp8 and Qwen3-235B-A22B-fp8), some checkpoint parameters
+            # are stored in full precision (FP32) by default, but at runtime they’re also cast to BF16
+            if args.models.name in ["Qwen3-30B-A3B-fp8", "Qwen3-235B-A22B-fp8"]:
+                for k in checkpoint.keys():
+                    if (
+                        checkpoint[k].dtype == torch.float32
+                        and "scale" not in k
+                        and "layernorm" not in k
+                        and "norm" not in k
+                    ):
+                        checkpoint[k] = checkpoint[k].to(torch.get_default_dtype())
+
             # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
             # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
-            for rule in args.models.quant_config.rules:
+            for k in checkpoint.keys():
+                quant = get_quant_from_checkpoint_prefix(
+                    k, args.models.quant_config.rules
+                )
                 if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
-                    if rule.type == "blockfp8":
-                        for k in checkpoint.keys():
-                            if checkpoint[k].element_size() == 1:
-                                checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
-                        break
-                if rule.type == "blockfp4":
-                    for k in checkpoint.keys():
-                        if checkpoint[k].element_size() == 1:
-                            checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
-                    break
+                    if quant == "blockfp8" and checkpoint[k].element_size() == 1:
+                        checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
+                if quant == "blockfp4" and checkpoint[k].element_size() == 1:
+                    checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
 
             model.load_state_dict_parallel(
                 checkpoint,
@@ -545,6 +554,7 @@ class Backend:
 
         logger.info(f"Checkpoint loaded in {time.time() - start_time:.2f} seconds")
 
+    @staticmethod
     def _load_hf_checkpoint(model, args):
         """
         Load checkpoint for Hugging Face model types.
@@ -702,7 +712,7 @@ def load_gguf_deepseek_v3_gguf(
     logger.info("initing cpu tensors!")
     for layer_id in range(3, 61):
         if layer_id in cpu_layers:
-            if model.layers[layer_id].mlp.experts.moe == None:
+            if model.layers[layer_id].mlp.experts.moe is None:
                 model.layers[layer_id].mlp.experts.init_weights()
 
 

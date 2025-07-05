@@ -24,7 +24,7 @@ from chitu.utils import (
     is_layer,
     try_import_opt_dep,
 )
-from chitu.quantization import QuantizedMoeExpertsBase
+from chitu.quantization import QuantizedMoeExpertsBase, get_quant_from_checkpoint_prefix
 
 torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
@@ -447,12 +447,9 @@ class Transformer(nn.Module):
         rpl_names = self._get_tensor_row_parallel_layer_names()
 
         for name, param in checkpoint.items():
-            quant = None
-            for rule in self.params.quant_config.rules:
-                pattern = rule.get("regex")
-                if pattern and re.search(pattern, name):
-                    quant = rule.type
-                    break
+            quant = get_quant_from_checkpoint_prefix(
+                name, self.params.quant_config.rules
+            )
             if any(is_layer(s, name) for s in cpl_names):
                 if name.split(".")[-1] in self._get_1d_in_tensor_names(
                     quant
@@ -532,20 +529,18 @@ class Transformer(nn.Module):
         return partial_checkpoint
 
     def process_state_dict_for_blockfp4_before_chunk(self, state_dict):
-        quant = (
-            self.params.quant_config.type
-            if hasattr(self.params, "quant_config")
-            else None
-        )
-        if quant == "blockfp4":
-            new_state_dict = {}
-            for key, value in state_dict.items():
-                if key.endswith(".weight_scale_2") or key.endswith(".input_scale"):
-                    new_state_dict[key] = value.view(1, 1)
-                else:
-                    new_state_dict[key] = value
-            state_dict = new_state_dict
-        return state_dict
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            quant = get_quant_from_checkpoint_prefix(
+                key, self.params.quant_config.rules
+            )
+            if quant == "blockfp4" and (
+                key.endswith(".weight_scale_2") or key.endswith(".input_scale")
+            ):
+                new_state_dict[key] = value.view(1, 1)
+            else:
+                new_state_dict[key] = value
+        return new_state_dict
 
     def anti_quant_fp8(self, scale1, scale2):
         """
@@ -632,14 +627,10 @@ class Transformer(nn.Module):
         return param
 
     def process_state_dict_for_blockfp4_after_chunk(self, state_dict):
-        quant = (
-            self.params.quant_config.type
-            if hasattr(self.params, "quant_config")
-            else None
-        )
-        if quant == "blockfp4":
-            new_state_dict = {}
-            for k in state_dict.keys():
+        new_state_dict = {}
+        for k in state_dict.keys():
+            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            if quant == "blockfp4":
                 param = state_dict[k]
                 if param.dtype == torch.uint8 and k.endswith("weight"):
                     # NPU fusion mode preprocess
@@ -658,8 +649,9 @@ class Transformer(nn.Module):
                     scale_2 = state_dict[scale_name]
                     param = self._process_weight_scale_for_npu_fusion(param, scale_2)
                 new_state_dict[k] = param
-            state_dict = new_state_dict
-        return state_dict
+            else:
+                new_state_dict[k] = state_dict[k]
+        return new_state_dict
 
     def process_state_dict_for_renaming_linear_layer(self, checkpoint, n_dense_layers):
         """

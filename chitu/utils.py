@@ -11,7 +11,7 @@ from logging import WARNING, INFO, getLogger
 import os
 from pathlib import Path
 import random
-from typing import Any, List, Tuple, Optional
+from typing import Any, List, Tuple
 
 import numpy as np
 import torch

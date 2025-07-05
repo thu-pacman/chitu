@@ -1,0 +1,11 @@
+quant: 
+- model: '.'
+  rules:
+    - regex : '\.down_proj$'
+      type : blockfp8
+    - regex : '\.gate_proj$'
+      type : blockfp8
+    - regex : '\.up_proj$'
+      type : blockfp8
+    - regex : '^layers\.'
+      type : blockfp8

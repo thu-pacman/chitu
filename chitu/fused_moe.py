@@ -7,19 +7,15 @@ This file has adaption of open-source code from the following sources:
 """
 
 import functools
-import json
-import os
 import struct
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 import triton
 import triton.language as tl
 
-from chitu.device_type import is_muxi, is_nvidia, get_device_name
+from chitu.device_type import is_muxi, is_nvidia
 from chitu.triton_kernels import (
     moe_sum_kernel,
     SIGNED_INT32_0x87F00000,

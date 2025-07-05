@@ -1,8 +1,8 @@
-from chitu.models.model import RMSNorm
 import torch
 import triton
-import triton.language as tl
 import pytest
+
+from chitu.models.model import RMSNorm
 
 
 @pytest.mark.parametrize("compute_dtype", [torch.float32])
@@ -77,10 +77,12 @@ def benchmark(M, N, compute_dtype, provider):
         ms = triton.testing.do_bench(
             lambda: R(x, compute_dtype=compute_dtype, impl="torch")
         )
-    if provider == "triton":
+    elif provider == "triton":
         ms = triton.testing.do_bench(
             lambda: R(x, compute_dtype=compute_dtype, impl="triton")
         )
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
     # gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return ms * 1000
 

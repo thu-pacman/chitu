@@ -1,7 +1,7 @@
-from chitu.ops import silu_and_mul
 import triton
-import triton.language as tl
 import torch
+
+from chitu.ops import silu_and_mul
 
 
 def test_silu_and_mul():
@@ -44,8 +44,10 @@ def benchmark(M, N, provider):
     getattr(torch, DEVICE.type).set_stream(stream)
     if provider == "torch":
         ms = triton.testing.do_bench(lambda: silu_and_mul(x, impl="torch"))
-    if provider == "triton":
+    elif provider == "triton":
         ms = triton.testing.do_bench(lambda: silu_and_mul(x, impl="triton"))
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
     gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms)
 

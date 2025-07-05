@@ -80,9 +80,7 @@ class AttentionHFLlama(Attention):
         quant = get_quant_from_checkpoint_prefix(
             checkpoint_prefix, args.quant_config.rules
         )
-        self.merge_qkv = (
-            quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
-        )
+        self.merge_qkv = quant in QuantizationRegistry._allowed_quant_for_merge_qkv
 
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         model_parallel_size = get_tp_size()
@@ -311,7 +309,7 @@ class FeedForwardHFLlama(nn.Module):
             checkpoint_prefix, params.quant_config.rules
         )
         self.merge_gate_up = (
-            quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
+            quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
         )
 
         # Do a parallel + fused linear projection, while ensuring outputs from gate_proj and up_proj are contiguous in memory.
@@ -426,7 +424,7 @@ def Qwen3MoeExperts(
         )
 
     quant = get_quant_from_checkpoint_prefix(checkpoint_prefix, args.quant_config.rules)
-    merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up
+    merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
 
     assert args.moe_intermediate_dim % get_tp_size() == 0
     return base_moe_experts_class(
@@ -661,7 +659,7 @@ class TransformerHFLlama(Transformer):
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-            if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
+            if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv:
                 new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
             elif any(
@@ -727,7 +725,7 @@ class TransformerHFLlama(Transformer):
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-            if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv_gate_up:
+            if quant not in QuantizationRegistry._allowed_quant_for_merge_gate_up:
                 new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
             elif any(
@@ -807,6 +805,13 @@ class TransformerHFLlama(Transformer):
 
                 del state_dict["transformer.rotary_pos_emb.inv_freq"]
                 state_dict = {map_glm_key(k): v for k, v in state_dict.items()}
+            if self.params.quant_config["type"] == "blockfp8":
+
+                def map_blockfp8_key(k):
+                    k = k.replace(".weight_scale_inv", ".scale")
+                    return k
+
+                state_dict = {map_blockfp8_key(k): v for k, v in state_dict.items()}
 
             if self.model_parallel_size > 1:
                 # QKV and gate/up layers might already be merged in the checkpoint, but they should be split
@@ -895,7 +900,9 @@ class TransformerHFLlama(Transformer):
 
             if (
                 "Qwen3-30B-A3B" in get_global_args().models.name
+                or "Qwen3-30B-A3B-fp8" in get_global_args().models.name
                 or "Qwen3-235B-A22B" in get_global_args().models.name
+                or "Qwen3-235B-A22B-fp8" in get_global_args().models.name
             ):
                 # Qwen3 models have a special structure for experts, so we need to merge them.
                 for key_name in [
@@ -903,6 +910,7 @@ class TransformerHFLlama(Transformer):
                     "weight_scale",
                     "weight_scale_2",
                     "weight",
+                    "scale",
                 ]:
                     state_dict = self._process_state_dict_for_merging_expert(
                         state_dict, key_name
