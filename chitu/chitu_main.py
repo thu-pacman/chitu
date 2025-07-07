@@ -3,6 +3,7 @@ import logging
 import operator
 import os
 from logging import getLogger
+from typing import List
 
 import torch
 import torch.distributed
@@ -205,55 +206,85 @@ def remove_task_other_device(remove_task_ids):
     propagate_tensor_to_all_devices(task_tensor)
 
 
-def update_ongoing_tasks():
-    to_remove = []
-    unwait_tasks = []
-    logits_list = []
+@torch.inference_mode()
+def chitu_run_normal():
+    task_ids = Backend.scheduler.schedule()
+
+    if task_ids:
+        # compute
+        logger.debug(f"Processing {task_ids}")
+        tasks = PackedTasks(task_ids)
+        logits = Backend.executor.step(tasks)
+
+        # postprocess
+        if len(Backend.last_batch_results) > 0:
+            Backend.executor.postprocess_async_part(
+                Backend.last_batch_results.popleft()
+            )
+        curr_batch_result = Backend.executor.postprocess_sync_part(tasks, logits)
+        Backend.last_batch_results.append(curr_batch_result)
+        removed_decode_task_ids = Backend.scheduler.update(task_ids)
+        if torch.distributed.get_world_size() != 1:
+            remove_task_other_device(removed_decode_task_ids)
+    elif len(Backend.last_batch_results) > 0:
+        # ensure the last batch result is processed
+        Backend.executor.postprocess_async_part(Backend.last_batch_results.popleft())
+
+
+def _update_ongoing_tasks():
+    unwait_tasks: List[PackedTasks] = []
+    logits_list: List[torch.Tensor] = []
     for ogr in Backend.ongoing_reqs:
         if ogr.handle.is_completed():
-            to_remove.append(ogr)
+            Backend.ongoing_reqs.remove(ogr)
             unwait_tasks.append(ogr.waiting_task)
             logits_list.append(ogr.logits.view(-1, ogr.logits.shape[-1]))
             for task in ogr.waiting_task.tasks:
                 task.unwait()
-    for tr in to_remove:
-        Backend.ongoing_reqs.remove(tr)
     return unwait_tasks, logits_list
 
 
-def chitu_update(task_ids, rank, world_size):
-    if world_size == 1:
-        Backend.scheduler.update(task_ids)
-    else:
-        unwait_tasks, logits = update_ongoing_tasks()
-        for idx, task in enumerate(unwait_tasks):
-            Backend.executor.update_response(task, logits[idx])
-        unwait_task_ids = [t.task_id for task in unwait_tasks for t in task.tasks]
-        removed_decode_task_ids = Backend.scheduler.update(task_ids, unwait_task_ids)
-        remove_task_other_device(removed_decode_task_ids)
+@torch.inference_mode()
+def chitu_run_pp():
+    task_ids = Backend.scheduler.schedule()
+
+    if task_ids:
+        # compute
+        logger.debug(f"Processing {task_ids}")
+        tasks = PackedTasks(task_ids)
+        Backend.executor.step(tasks)
+
+        # postprocess async part
+        if len(Backend.last_batch_results) > 0:
+            Backend.executor.postprocess_async_part(
+                Backend.last_batch_results.popleft()
+            )
+    elif len(Backend.last_batch_results) > 0:
+        # ensure the last batch result is processed
+        Backend.executor.postprocess_async_part(Backend.last_batch_results.popleft())
+
+    # postprocess sync part
+    unwait_batches, logits = _update_ongoing_tasks()
+    for idx, batch in enumerate(unwait_batches):
+        Backend.last_batch_results.append(
+            Backend.executor.postprocess_sync_part(batch, logits[idx])
+        )
+    unwait_task_ids = [t.task_id for batch in unwait_batches for t in batch.tasks]
+    removed_decode_task_ids = Backend.scheduler.update(task_ids, unwait_task_ids)
+    remove_task_other_device(removed_decode_task_ids)
 
 
 @torch.inference_mode()
 def chitu_run():
     rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
-    if rank == 0:
-        task_ids = Backend.scheduler.schedule()
-        if len(task_ids) == 0:  # no tasks to do, but some tasks are waiting
-            chitu_update(task_ids, rank, world_size)
-            return
-        logger.debug(f"Processing {task_ids}")
-        tasks = PackedTasks(task_ids, rank)
-    else:
-        tasks = None
-    Backend.executor.step(tasks)
+    if rank != 0:
+        Backend.executor.step(None)
+        return
 
-    if Backend.args.infer.pp_size > 1 and rank == 0:
-        chitu_update(task_ids, rank, world_size)
-    elif rank == 0:
-        removed_decode_task_ids = Backend.scheduler.update(task_ids)
-        if world_size != 1:
-            remove_task_other_device(removed_decode_task_ids)
+    if Backend.args.infer.pp_size > 1:
+        chitu_run_pp()
+    else:
+        chitu_run_normal()
 
 
 def chitu_terminate():

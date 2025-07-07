@@ -1,7 +1,7 @@
 import os
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -14,6 +14,8 @@ from chitu.task import (
     PackedTasks,
     PackedTasksBase,
     SerializedPackedTasksPayloadType,
+    Task,
+    TaskLoad,
     TaskType,
 )
 from chitu.tensor_parallel import get_tp_group, get_pp_group, get_cpu_tp_group
@@ -36,6 +38,22 @@ class OngoingRequests:
     logits: torch.Tensor
 
 
+@dataclass
+class BatchResult:
+    """
+    param of postprocess_async_part, returned by postprocess_sync_part.
+    stored in CPU.
+    """
+
+    num_tasks: int
+    tasks: List[Task]
+
+    next_tokens: List[int]
+    return_logprobs: bool = False
+    logprobs: Optional[torch.Tensor] = None
+    token_idxs: Optional[torch.Tensor] = None
+
+
 class Executor:
     @staticmethod
     def build(args):
@@ -53,16 +71,27 @@ class Executor:
         self,
         tasks: PackedTasksBase,
     ):
-        pass
+        """
+        :return: logits: torch.Tensor if not PP, None if PP
+        """
+        raise NotImplementedError
 
-    def _prepare_seq_lens_for_decode(self, tasks):
+    def postprocess_sync_part(
+        self, tasks: PackedTasks, logits: torch.Tensor
+    ) -> BatchResult:
+        raise NotImplementedError
+
+    def postprocess_async_part(self, batch_result: BatchResult) -> None:
+        raise NotImplementedError
+
+    def _prepare_seq_lens_for_decode(self, tasks: PackedTasksBase):
         seq_lens = []
         for req_id in tasks.req_ids:
             seq_len = Backend.cache_manager.seq_lens[req_id]
             seq_lens.append(seq_len)
         return seq_lens
 
-    def _prepare_new_tokens_for_decode(self, tasks):
+    def _prepare_new_tokens_for_decode(self, tasks: PackedTasks):
         new_tokens = []
         for task in tasks.tasks:
             new_tokens.append(task.next_token)
@@ -130,36 +159,59 @@ class NormalExecutor(Executor):
 
         return tokens
 
-    def update_response(self, tasks: PackedTasks, logits: torch.Tensor):
+    def postprocess_sync_part(self, tasks: PackedTasks, logits: torch.Tensor):
+        # --- dependent on logits ---
         logits = logits.view(-1, logits.shape[-1])
         assert (
             len(tasks.tasks) == logits.shape[0]
         ), f"logits has shape {logits.shape}, but there are {len(tasks.tasks)} tasks"
 
         tokens = self.sample(logits, tasks)
-        tokens_cpu = tokens.cpu()
 
         if tasks.return_logprobs:
             logprobs = torch.log_softmax(logits, dim=-1)
             logprobs, token_idxs = logprobs.sort(dim=-1, descending=True)
-            logprobs_cpu = logprobs.cpu()
-            token_idxs_cpu = token_idxs.cpu()
-            for it, task in enumerate(tasks.tasks):
-                task.update_response(
-                    tokens_cpu[it].item(),
-                    logprobs_cpu[it],
-                    token_idxs_cpu[it],
-                )
-        else:
-            for it, task in enumerate(tasks.tasks):
-                task.update_response(tokens_cpu[it].item())
+
+        # --- dependent on tokens ---
         response_append(tasks, tokens, impl="auto")
+
+        token_list = tokens.cpu().tolist()
+
+        # ---dependent on tokens_cpu ---
+        for it, task in enumerate(tasks.tasks):
+            task.update_response_sync(token_list[it])
+
+        # Prepare data needed by further postprocessing
+        return BatchResult(
+            num_tasks=tasks.num_tasks,
+            tasks=tasks.tasks,
+            next_tokens=token_list,
+            return_logprobs=tasks.return_logprobs,
+            logprobs=logprobs.cpu() if tasks.return_logprobs else None,
+            token_idxs=token_idxs.cpu() if tasks.return_logprobs else None,
+        )
+
+    def postprocess_async_part(self, batch_result: BatchResult) -> None:
+        for it, task in enumerate(batch_result.tasks):
+            next_token = batch_result.next_tokens[it]
+            if batch_result.return_logprobs:
+                logprobs, token_idxs = (
+                    batch_result.logprobs[it],
+                    batch_result.token_idxs[it],
+                )
+                logprobs = logprobs[: max(1, task.req.top_logprobs)].tolist()
+                token_idxs = token_idxs[: max(1, task.req.top_logprobs)].tolist()
+                task.req.add_data(next_token, logprobs, token_idxs)
+            else:
+                task.req.add_data(next_token)
+
+        TaskLoad.increase(batch_result.num_tasks)
 
     def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
         """Make every ranks know the task metadata"""
         return tasks  # Need to do nothing if not parallelized
 
-    def prefill_step(self, tasks: PackedTasksBase):
+    def prefill_step(self, tasks: PackedTasks):
         logger.debug(f"Prefill step: {tasks.task_ids}")
         varlens = VarLens(tasks.tokens, "cuda")
         self.timers("prefill").start()
@@ -167,9 +219,8 @@ class NormalExecutor(Executor):
         Backend.cache_manager.curr_req_ids = tasks.req_ids
         logits = Backend.model.prefill(tasks.tokens)
         self.timers("prefill").stop()
-        self.update_response(tasks, logits)
-        for it in range(tasks.num_tasks):
-            tasks.tasks[it].start_decoding()
+        for task in tasks.tasks:
+            task.start_decoding()
         varlens = VarLens(tasks.tokens, "cuda")
         Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
         return logits
@@ -187,7 +238,6 @@ class NormalExecutor(Executor):
         logits = Backend.model.decode(new_tokens, seq_lens)
         self.timers("decode-model").stop()
         self.timers("decode").stop()
-        self.update_response(tasks, logits)
         Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return logits
 
@@ -345,7 +395,7 @@ class PipeTensorExecutor(NormalExecutor):
         Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return out
 
-    def _recv_logits(self, tasks):
+    def _recv_logits(self, tasks: PackedTasks):
         logits = torch.empty(
             [tasks.num_tasks, Backend.model.vocab_size],
             device=self.local_rank,
@@ -455,7 +505,7 @@ class PipeTensorExecutor(NormalExecutor):
 
     def step(
         self,
-        tasks: Optional[PackedTasksBase] = None,
+        tasks: Optional[PackedTasks] = None,
     ):
         # Run tasks
         super().step(tasks)
@@ -523,7 +573,7 @@ class TensorExecutor(NormalExecutor):
 
         return tasks
 
-    def prefill_step(self, tasks):
+    def prefill_step(self, tasks: PackedTasks):
         if self.rank == 0:
             tokens = torch.from_numpy(np.concatenate(tasks.tokens)).to(self.rank)
         else:
@@ -541,13 +591,12 @@ class TensorExecutor(NormalExecutor):
         logits = Backend.model.prefill(tokens, varlens=varlens)
         self.timers("prefill").stop()
         if self.rank == 0:
-            self.update_response(tasks, logits)
-            for it in range(tasks.num_tasks):
-                tasks.tasks[it].start_decoding()
+            for task in tasks.tasks:
+                task.start_decoding()
         Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
         return logits
 
-    def decode_step(self, tasks):
+    def decode_step(self, tasks: PackedTasks):
         if self.rank == 0:
             tokens = []
             for task in tasks.tasks:
@@ -573,7 +622,5 @@ class TensorExecutor(NormalExecutor):
         logits = Backend.model.decode(tokens, seq_lens)
         self.timers("decode-model").stop()
         self.timers("decode").stop()
-        if self.rank == 0:
-            self.update_response(tasks, logits)
         Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return logits

@@ -221,24 +221,12 @@ class Task:
             return True
         return False
 
-    def update_response(
-        self,
-        token: int,
-        logprobs: Optional[torch.Tensor] = None,
-        token_idxs: Optional[torch.Tensor] = None,
-    ):
+    def update_response_sync(self, token: int):
         # TODO: modify if generate more than one token at a time
         assert token is not None
         self.num_new_tokens += 1
         self.next_token = token
         self.prefix_length += 1
-        if self.req.logprobs:
-            logprobs = logprobs[: max(1, self.req.top_logprobs)].tolist()
-            token_idxs = token_idxs[: max(1, self.req.top_logprobs)].tolist()
-            self.req.add_data(self.next_token, logprobs, token_idxs)
-        else:
-            self.req.add_data(self.next_token)
-        TaskLoad.increase(1)
 
     def wait(self, handle):
         self.waiting = True

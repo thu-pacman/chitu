@@ -74,7 +74,7 @@ class Scheduler:
     def schedule(self) -> List[str]:
         raise NotImplementedError()
 
-    def update(self, cur_task_ids, unwait_task_ids=[]):
+    def update(self, cur_task_ids: List[str], unwait_task_ids: List[str] = []):
         removed_task_ids = []
         task_ids = cur_task_ids + unwait_task_ids
         task_ids = list(set(task_ids))
