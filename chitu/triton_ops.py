@@ -422,6 +422,41 @@ def weight_dequant_soft_fp8_deepseek_v3_triton(
 
 
 @auto_retry_triton_compilation
+def w8a8_gemm_pertoken_perchannel_triton(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+):
+    """
+    Perform a matrix multiplication using FP8 precision.
+
+    Args:
+        a (torch.Tensor): The first input matrix, must be contiguous.
+        a_s (torch.Tensor): The scaling factor for the first input matrix, must be contiguous.
+        b (torch.Tensor): The second input matrix, must be contiguous.
+        b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
+
+    Returns:
+        torch.Tensor: The result of the matrix multiplication.
+    """
+    assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
+    assert (
+        a_s.is_contiguous() and b_s.is_contiguous()
+    ), "Scaling factor tensors must be contiguous"
+    K = a.size(-1)
+    M = a.numel() // K
+    N = b.size(0)
+    c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]),
+        triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    w8a8_gemm_pertoken_perchannel_kernel[grid](a, b, c, a_s, b_s, M, N, K)
+    return c
+
+
+@auto_retry_triton_compilation
 def fp8_gemm_deepseek_v3_triton_default(
     a: torch.Tensor,
     a_s: torch.Tensor,

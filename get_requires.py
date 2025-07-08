@@ -1,4 +1,6 @@
 import os
+import packaging.version
+import torch
 
 import csrc.setup_build as operators
 
@@ -46,12 +48,22 @@ extras_require = {
     ##########################################################################
     # Really third-party kernels
     "flash_attn": [
-        "flash-attn<2.8.0",
+        (
+            "flash-attn<2.8.0"
+            if packaging.version.parse(torch.__version__)
+            < packaging.version.parse("2.7.0")
+            else "flash-attn"
+        ),
         # Although `flash-attn` is available in PyPI, don't make it a required
         # dependency, because its installation runs forever on some platforms.
     ],
     "flashinfer": [
-        "flashinfer-python<=0.2.5",  # Later versions require a too-new torch
+        (
+            "flashinfer-python<=0.2.5"
+            if packaging.version.parse(torch.__version__)
+            < packaging.version.parse("2.7.0")
+            else "flashinfer-python"
+        ),
     ],
     "flash_mla": [
         "flash_mla @ file://localhost"

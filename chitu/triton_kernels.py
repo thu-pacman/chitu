@@ -8,6 +8,7 @@ __all__ = [
     "weight_dequant_soft_fp8_deepseek_v3_kernel_step_1",
     "weight_dequant_soft_fp8_deepseek_v3_kernel_step_2",
     "fp8_gemm_deepseek_v3_kernel",
+    "w8a8_gemm_pertoken_perchannel_kernel",
     "soft_fp8_gemm_deepseek_v3_kernel",
     "soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel",
     "soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel",
@@ -354,6 +355,85 @@ def weight_dequant_soft_fp8_deepseek_v3_kernel_step_2(
     s = tl.load(s_ptr + pid_b * m * n + pid_m * n + pid_n)
     y = x * (s * fp8_to_fp32_scale)
     tl.store(y_ptr + offs, y, mask=mask)
+
+
+w8a8_gemm_pertoken_perchannel_configs = [
+    Config(
+        {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": 128},
+        num_stages=num_stages,
+        num_warps=8,
+        pre_hook=functools.partial(
+            auto_tuning_logger,
+            block_m=block_m,
+            block_n=block_n,
+            num_stages=num_stages,
+        ),
+    )
+    for block_m in [16, 32, 64]
+    for block_n in [32, 64, 128]
+    for num_stages in [3, 4, 5, 6]
+]
+
+
+@triton.autotune(configs=w8a8_gemm_pertoken_perchannel_configs, key=["N", "K"])
+@triton.jit
+def w8a8_gemm_pertoken_perchannel_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_s_ptr,
+    b_s_ptr,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    """
+    Performs a matrix multiplication operation on int8 matrices with scaling factors.
+
+    Args:
+        a_ptr (tl.tensor): Pointer to the first input matrix A.
+        b_ptr (tl.tensor): Pointer to the second input matrix B.
+        c_ptr (tl.tensor): Pointer to the output matrix C.
+        a_s_ptr (tl.tensor): Pointer to the scaling factors for matrix A, one item per row (batch, 0-th dim) of A.
+        b_s_ptr (tl.tensor): Pointer to the scaling factors for matrix B, one item per row (output dim, 0-th dim) of B.
+        M (int): Number of rows in matrix A and C.
+        N (tl.constexpr): Number of columns in matrix B and C.
+        K (tl.constexpr): Number of columns in matrix A and rows in matrix B.
+        BLOCK_SIZE_M (tl.constexpr): Block size for the M dimension.
+        BLOCK_SIZE_N (tl.constexpr): Block size for the N dimension.
+        BLOCK_SIZE_K (tl.constexpr): Block size for the K dimension.
+
+    Returns:
+        None
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    k = tl.cdiv(K, BLOCK_SIZE_K)
+    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+    b_ptrs = b_ptr + offs_n[None, :] * K + offs_k[:, None]
+
+    a_s = tl.load(a_s_ptr + offs_m)
+    b_s = tl.load(b_s_ptr + offs_n)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for i in range(k):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K, other=0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=0)
+        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        a_ptrs += BLOCK_SIZE_K
+        b_ptrs += BLOCK_SIZE_K
+    c = accumulator.to(c_ptr.dtype.element_ty)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c, mask=mask)
 
 
 fp8_gemm_deepseek_v3_configs = [
