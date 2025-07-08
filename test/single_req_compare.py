@@ -263,9 +263,10 @@ def main(args: ServeConfig):
     if rank == 0:
         warmup_engine(args)
 
+    update_history = os.getenv("UPDATE_HISTORY", "false").lower() == "true"
     history_path = os.getenv("HISTORY_PATH", "./example/history/history.txt")
     history_result = None
-    if rank == 0:
+    if rank == 0 and not update_history:
         if os.path.exists(history_path):
             history_result = load_result(history_path)
 
@@ -276,17 +277,23 @@ def main(args: ServeConfig):
         now_result = run_normal(args, timers, history_result)
 
     if rank == 0:
-        if history_result is not None:
-            err = [0, 0]
-            check_result(now_result, history_result, "now", "history", err)
-            print("!!!!!!!!!aerr_max: ", err[0])
-            print("!!!!!!!!!rerr_max: ", err[1])
-        else:
-            logger.warning(
-                "No history result to compare. This is OK for a newly added test case. "
-                "Merge this commit to `regression_test_reference` branch to update the "
-                "reference result."
+        if update_history:
+            logger.info(
+                "UPDATE_HISTORY is set to true, saving current result as history."
             )
+            save_result(now_result, history_path)
+        else:
+            if history_result is not None:
+                err = [0, 0]
+                check_result(now_result, history_result, "now", "history", err)
+                print("!!!!!!!!!aerr_max: ", err[0])
+                print("!!!!!!!!!rerr_max: ", err[1])
+            else:
+                logger.warning(
+                    "No history result to compare. This is OK for a newly added test case. "
+                    "Merge this commit to `regression_test_reference` branch to update the "
+                    "reference result."
+                )
 
 
 if __name__ == "__main__":
