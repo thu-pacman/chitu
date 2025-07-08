@@ -1341,6 +1341,8 @@ class NpuAttnBackend(RefAttnBackend):
         if hasattr(self.args.models, "n_kv_heads"):
             self.local_n_kv_heads = (
                 self.args.models.n_kv_heads // self.args.infer.tp_size
+                if self.args.models.n_kv_heads > self.args.infer.tp_size
+                else 1
             )
         else:
             self.local_n_kv_heads = self.local_n_heads
