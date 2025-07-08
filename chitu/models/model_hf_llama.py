@@ -84,9 +84,24 @@ class AttentionHFLlama(Attention):
 
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         model_parallel_size = get_tp_size()
+        assert (
+            args.n_heads % model_parallel_size == 0
+        ), f"n_heads must divisible by tp_size, got n_heads={args.n_heads} and tp_size={model_parallel_size}"
         self.n_local_heads = args.n_heads // model_parallel_size
-        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+
+        if self.n_kv_heads >= model_parallel_size:
+            assert (
+                self.n_kv_heads % model_parallel_size == 0
+            ), f"when n_kv_heads >= tp_size, n_kv_heads must divisible by tp_size, got n_kv_heads={self.n_kv_heads} and tp_size={model_parallel_size}"
+            self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+            self.n_kv_head_multiplier = 1
+        else:
+            assert (
+                model_parallel_size % self.n_kv_heads == 0
+            ), f"when n_kv_heads < tp_size, tp_size must divisible by n_kv_heads, got n_kv_heads={self.n_kv_heads} and tp_size={model_parallel_size}"
+            self.n_local_kv_heads = 1
+            self.n_kv_head_multiplier = model_parallel_size // self.n_kv_heads
+
         self.head_dim = (
             args.head_dim if hasattr(args, "head_dim") else args.dim // args.n_heads
         )
@@ -104,7 +119,8 @@ class AttentionHFLlama(Attention):
         if self.merge_qkv:
             self.qkv_proj = ColumnParallelLinear(
                 args.dim,
-                (args.n_heads + 2 * self.n_kv_heads) * self.head_dim,
+                (args.n_heads + 2 * self.n_kv_heads * self.n_kv_head_multiplier)
+                * self.head_dim,
                 has_bias=qkv_has_bias,
                 gather_output=False,
                 base_linear_class=qkv_proj_linear,
@@ -121,7 +137,7 @@ class AttentionHFLlama(Attention):
             )
             self.k_proj = ColumnParallelLinear(
                 args.dim,
-                self.n_kv_heads * self.head_dim,
+                self.n_kv_heads * self.head_dim * self.n_kv_head_multiplier,
                 has_bias=qkv_has_bias,
                 gather_output=False,
                 base_linear_class=qkv_proj_linear,
@@ -129,7 +145,7 @@ class AttentionHFLlama(Attention):
             )
             self.v_proj = ColumnParallelLinear(
                 args.dim,
-                self.n_kv_heads * self.head_dim,
+                self.n_kv_heads * self.head_dim * self.n_kv_head_multiplier,
                 has_bias=qkv_has_bias,
                 gather_output=False,
                 base_linear_class=qkv_proj_linear,
@@ -279,6 +295,7 @@ class AttentionHFLlama(Attention):
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
         block_table = self.cache.get_gpu_block_table()
         cache_seqlens = self.cache.get_gpu_seq_lens_excl_this_decode()
         paged_k_cache, paged_v_cache = self.cache.get_paged_kv_cache(self.layer_id)
@@ -593,6 +610,9 @@ class TransformerHFLlama(Transformer):
                     else self.params.n_kv_heads
                 )
                 head_dim = self.params.dim // n_heads
+                # maybe fix?
+                # head_dim = (self.params.head_dim if hasattr(self.params, "head_dim") else self.params.dim // n_heads)
+
                 q_weight, k_weight, v_weight = qkv_weight.split(
                     [
                         n_heads * head_dim,
@@ -616,7 +636,11 @@ class TransformerHFLlama(Transformer):
                     if self.params.n_kv_heads is None
                     else self.params.n_kv_heads
                 )
+
                 head_dim = self.params.dim // n_heads
+                # maybe fix?
+                # head_dim = (self.params.head_dim if hasattr(self.params, "head_dim") else self.params.dim // n_heads)
+
                 q_bias, k_bias, v_bias = qkv_bias.split(
                     [
                         n_heads * head_dim,
@@ -774,6 +798,30 @@ class TransformerHFLlama(Transformer):
                 new_checkpoint[k] = checkpoint[k]
         return new_checkpoint
 
+    def _process_state_dict_for_repeat_kv_head(
+        self, checkpoint: Mapping[str, Any], repeats: int
+    ) -> Mapping[str, Any]:
+        """Repeat each kv_head weight [repeats] times, adapt to the situation where tp_size>n_kv_heads
+        Args:
+            checkpoint: state_dict after applying self._process_state_dict_for_splitting_qkv if not skip_preprocess
+            repeats: each v_proj.weight and k_proj.weight in the [checkpoint] will repeat [repeats] times.
+        Returns:
+            checkpoint: [checkpoint] after after repeating each kv_head weight [repeats] times.
+        """
+        head_dim = (
+            self.params.head_dim
+            if hasattr(self.params, "head_dim")
+            else self.params.dim // self.params.n_heads
+        )
+
+        for k in checkpoint.keys():
+            if k.endswith(".k_proj.weight") or k.endswith(".v_proj.weight"):
+                dim = checkpoint[k].shape[-1]
+                checkpoint[k] = checkpoint[k].view([-1, head_dim, dim])
+                checkpoint[k] = checkpoint[k].repeat_interleave(repeats, dim=0)
+                checkpoint[k] = checkpoint[k].view([-1, dim])
+        return checkpoint
+
     def load_state_dict_parallel(
         self,
         state_dict: Mapping[str, Any],
@@ -818,6 +866,21 @@ class TransformerHFLlama(Transformer):
                 # for TP. After we process for TP, we merge them back.
                 state_dict = self._process_state_dict_for_splitting_qkv(state_dict)
                 state_dict = self._process_state_dict_for_splitting_gate_up(state_dict)
+
+        n_kv_heads = (
+            self.params.n_heads
+            if self.params.n_kv_heads is None
+            else self.params.n_kv_heads
+        )
+        model_parallel_size = get_tp_size()
+
+        if (
+            model_parallel_size > n_kv_heads
+        ):  # Compatible with tp_size>n_kv_heads, repeat each kv_head weight n_kv_head_multiplier times.
+            n_kv_head_multiplier = model_parallel_size // n_kv_heads
+            state_dict = self._process_state_dict_for_repeat_kv_head(
+                state_dict, n_kv_head_multiplier
+            )
 
         super().load_state_dict_parallel(
             state_dict, skip_preprocess=skip_preprocess, *args, **kwargs

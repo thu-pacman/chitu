@@ -1,4 +1,5 @@
-from typing import Callable
+from collections import deque
+from typing import TYPE_CHECKING, Callable, Deque, List, Optional
 import gc
 import itertools
 import os
@@ -40,6 +41,10 @@ from chitu.custom_gguf import *
 from chitu.hybrid_device import CPUParameter
 from chitu.models.registry import ModelType, get_model_class
 
+if TYPE_CHECKING:
+    from chitu.scheduler import Scheduler
+    from chitu.executor import BatchResult, Executor, OngoingRequests
+
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
@@ -66,20 +71,31 @@ class BackendState(Enum):
 
 
 class Backend:
+    # init once
     model = None
     tokenizer = None
+    cache_manager = None
     formatter = None
     args = None
+    # --- cache_manager related (not used in the current code)
     curr_varlens = None
     curr_req_ids = None
-    ongoing_reqs = []
     cache_type = ""
-    state = BackendState.Running
+    # ---
     use_gloo = True
     group_gloo = None
     pp_stage = None
     pp_end_stage = None
     pp_main_rank = None
+
+    # components
+    scheduler: Optional["Scheduler"] = None
+    executor: Optional["Executor"] = None
+
+    # mutable
+    ongoing_reqs: List["OngoingRequests"] = []
+    state = BackendState.Running
+    last_batch_results: Deque["BatchResult"] = deque()
 
     @staticmethod
     def build_model(args, cache, *extra_args, **extra_kwargs):
@@ -373,7 +389,11 @@ class Backend:
                 if hasattr(args.models, "n_kv_heads")
                 else args.models.n_heads
             )
-            n_local_kv_heads = n_kv_heads // model_parallel_size
+            n_local_kv_heads = (
+                n_kv_heads // model_parallel_size
+                if n_kv_heads > model_parallel_size
+                else 1
+            )  # Compatible with tp_size>n_kv_heads
             head_dim = (
                 args.models.head_dim
                 if hasattr(args.models, "head_dim")

@@ -75,7 +75,9 @@ async def create_chat_completion(request: ChatRequest):
     message = params.pop("messages")
     logprobs = params.pop("logprobs")
     top_logprobs = params.pop("top_logprobs")
-    max_new_tokens = params.pop("max_tokens", global_args.request.max_new_tokens)
+    max_new_tokens = params.pop("max_tokens")
+    if not max_new_tokens:
+        max_new_tokens = global_args.request.max_new_tokens
     temp = params.pop("temperature")
     top_p = params.pop("top_p")
     top_k = params.pop("top_k")

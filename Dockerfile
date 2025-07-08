@@ -1,6 +1,6 @@
 #####################################
 # Base Image Stage
-FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel AS base
+FROM pytorch/pytorch:2.7.0-cuda12.6-cudnn9-devel AS base
 
 ARG torch_cuda_arch_list='7.0 7.5 8.0 8.6 8.9 9.0+PTX'
 ARG optional_deps='flash_attn,flash_mla,flashinfer'

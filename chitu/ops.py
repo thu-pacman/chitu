@@ -429,6 +429,23 @@ def quant_einsum_shc_hdc_shd(
         raise NotImplementedError(f"Unsupported implementation: {impl}")
 
 
+def w8a8_gemm_pertoken_perchannel(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    impl: str = "auto",
+):
+    if impl == "auto":
+        impl = "triton"
+
+    if impl == "triton":
+        assert has_triton
+        return w8a8_gemm_pertoken_perchannel_triton(a, a_s, b, b_s)
+    else:
+        raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
 def fp8_gemm_deepseek_v3(
     a: torch.Tensor,
     a_s: torch.Tensor,
@@ -439,7 +456,8 @@ def fp8_gemm_deepseek_v3(
     if impl == "auto":
         impl = "triton"
 
-    if impl == "triton" and has_triton:
+    if impl == "triton":
+        assert has_triton
         return fp8_gemm_deepseek_v3_triton_default(a, a_s, b, b_s)
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
