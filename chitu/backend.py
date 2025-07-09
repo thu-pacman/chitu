@@ -548,6 +548,12 @@ class Backend:
                 ), f"no checkpoint files found in {args.models.ckpt_dir}"
                 ckpt_path = checkpoints[0]
                 checkpoint = torch.load(ckpt_path, map_location="cpu")
+            elif args.models.name == "Llama-3-8B-QServe":
+                checkpoint = torch.load(
+                    os.path.join(args.models.ckpt_dir, "pytorch_model.bin"),
+                    map_location="cpu",
+                )
+                checkpoint = Backend._remove_prefix(checkpoint, "model.")
             elif args.models.type in {
                 "hf-llama",
                 "hf-glm-z1",
@@ -592,6 +598,13 @@ class Backend:
         logger.info(f"Checkpoint loaded in {time.time() - start_time:.2f} seconds")
 
     @staticmethod
+    def _remove_prefix(state_dict, prefix):
+        return {
+            k[len(prefix) :] if k.startswith(prefix) else k: v
+            for k, v in state_dict.items()
+        }
+
+    @staticmethod
     def _load_hf_checkpoint(model, args):
         """
         Load checkpoint for Hugging Face model types.
@@ -606,12 +619,6 @@ class Backend:
         quant_name = getattr(quant_config, "name", None)
         ckpt_dir = args.models.ckpt_dir
 
-        def remove_prefix(state_dict, prefix):
-            return {
-                k[len(prefix) :] if k.startswith(prefix) else k: v
-                for k, v in state_dict.items()
-            }
-
         def get_filter_key():
             if getattr(args.models, "type", "") == "deepseek-v3":
                 return lambda k: "model.layers.61" not in k
@@ -621,7 +628,7 @@ class Backend:
 
         if quant_name in ["autoawq", "gptqmodel", "awq"]:
             params = load_state_dict(ckpt_dir)
-            return remove_prefix(params, "model.")
+            return Backend._remove_prefix(params, "model.")
         elif quant_name in ["gguf", "q4km"]:
             loader = GGUFLoader(ckpt_dir)
             return load_state_dict_llama_gguf_mlp_layers(loader, len(model.layers))
@@ -630,7 +637,7 @@ class Backend:
             params = load_state_dict(
                 ckpt_dir, skip_preprocess=args.skip_preprocess, filter_key=filter_key
             )
-            return remove_prefix(params, "model.")
+            return Backend._remove_prefix(params, "model.")
 
     @staticmethod
     def build(args):

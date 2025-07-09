@@ -296,14 +296,12 @@ class Transformer(nn.Module):
         model_parallel_size: int,
         attn_backend: AttnBackend,
         op_impl: str,
-        is_fp4=False,
         **kvargs,
     ):
         super().__init__()
         self.cache = cache
         self.attn_backend = attn_backend
         self.op_impl = op_impl
-        self.is_fp4 = is_fp4
         self.rank = torch.distributed.get_rank()
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = torch.distributed.get_world_size()
@@ -376,6 +374,8 @@ class Transformer(nn.Module):
             ret += ["scale"]
         elif quant == "blockfp4":
             ret += ["weight_scale", "weight_scale_2", "input_scale"]
+        elif quant == "w4a8_per_token_per_channel_asymm":
+            ret += ["qweight"]
         return ret
 
     def _get_2d_in_x_out_tensor_names(self, quant) -> List[str]:
@@ -396,8 +396,10 @@ class Transformer(nn.Module):
         ret = ["bias"]
         if quant == "simple_w8a8":
             ret += ["scale_channel"]
-        if quant == "simple_w8a8_muxi":
+        elif quant == "simple_w8a8_muxi":
             ret += ["scale_channel"]
+        elif quant == "w4a8_per_token_per_channel_asymm":
+            ret += ["s1_scales", "s1_szeros"]
         return ret
 
     def _chunk_checkpoint_for_pipeline_parallel(
@@ -653,6 +655,44 @@ class Transformer(nn.Module):
                 new_state_dict[k] = state_dict[k]
         return new_state_dict
 
+    def process_state_dict_for_int4_after_chunk(self, state_dict):
+        new_state_dict = {}
+        for key in state_dict.keys():
+            quant = get_quant_from_checkpoint_prefix(
+                key, self.params.quant_config.rules
+            )
+            if quant == "w4a8_per_token_per_channel_asymm":
+                param = state_dict[key]
+                if param.dtype == torch.int8 and key.endswith("qweight"):
+                    n, half_k = param.shape
+                    k = half_k * 2
+
+                    # Unpack from qserve format
+                    # (https://github.com/mit-han-lab/deepcompressor/blob/main/deepcompressor/backend/qserve/utils.py#L18)
+                    assert n % 32 == 0
+                    assert k % 32 == 0
+                    weight = param.data.view(
+                        n // 32, k // 32, 1, 8, 4, 2, 2, 1, 4
+                    ).view(torch.uint8)
+                    weight = torch.stack([weight & 0x0F, weight >> 4], dim=0)
+                    weight = (
+                        weight.permute(1, 0, 7, 4, 8, 2, 3, 6, 5, 9)
+                        .contiguous()
+                        .view(n, k)
+                    )
+
+                    # Do our packing
+                    assert k % 128 == 0
+                    weight = (
+                        weight.view(n, k // 128, 2, 64).permute(2, 0, 1, 3).contiguous()
+                    )
+                    weight = weight[0] + (weight[1] << 4)
+                    param.data = weight.view(n, half_k)
+                new_state_dict[key] = param
+            else:
+                new_state_dict[key] = state_dict[key]
+        return new_state_dict
+
     def process_state_dict_for_renaming_linear_layer(self, checkpoint, n_dense_layers):
         """
         重命名专家权重结构的函数以消除冗余的 gate,up,down 层
@@ -716,6 +756,7 @@ class Transformer(nn.Module):
     ):
         if not skip_preprocess:
             state_dict = self.process_state_dict_for_blockfp4_after_chunk(state_dict)
+            state_dict = self.process_state_dict_for_int4_after_chunk(state_dict)
         super().load_state_dict(state_dict, *args, **kwargs)
 
     def _init_pre_layers(self):

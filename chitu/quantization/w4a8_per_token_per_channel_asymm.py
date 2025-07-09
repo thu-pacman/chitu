@@ -1,15 +1,11 @@
 import torch
 
 from chitu.quantization.registry import QuantizedLinearBase, QuantizationRegistry
-from chitu.ops import w8a8_gemm_per_token_per_channel
+from chitu.ops import w4a8_gemm_per_token_per_channel_asymm
 
 
-@QuantizationRegistry.register_linear("simple_w8a8")
-class W8A8Linear(QuantizedLinearBase):
-    """
-    8-bit weight and activation quantized linear layer.
-    """
-
+@QuantizationRegistry.register_linear("w4a8_per_token_per_channel_asymm")
+class W4A8PerTokenPerChannelAsymmLinear(QuantizedLinearBase):
     @staticmethod
     @torch.no_grad()
     def quant_act(act):
@@ -36,18 +32,26 @@ class W8A8Linear(QuantizedLinearBase):
 
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = torch.nn.Parameter(
+        assert self.in_features % 2 == 0, "in_features must be even for int4 packing"
+        self.qweight = torch.nn.Parameter(
             torch.zeros(
                 self.out_features,
-                self.in_features,
-                dtype=torch.int8,
+                self.in_features // 2,
+                dtype=torch.uint8,
             ),
             requires_grad=False,
         )
-        self.scale_channel = torch.nn.Parameter(
+        self.s1_scales = torch.nn.Parameter(
             torch.ones(
                 [self.out_features],
-                dtype=torch.float,
+                dtype=torch.get_default_dtype(),
+            ),
+            requires_grad=False,
+        )
+        self.s1_szeros = torch.nn.Parameter(
+            torch.zeros(
+                [self.out_features],
+                dtype=torch.get_default_dtype(),
             ),
             requires_grad=False,
         )
@@ -55,7 +59,7 @@ class W8A8Linear(QuantizedLinearBase):
             self.bias = torch.nn.Parameter(
                 torch.zeros(
                     (self.out_features,),
-                    dtype=torch.float16,
+                    dtype=torch.get_default_dtype(),
                 ),
                 requires_grad=False,
             )
@@ -64,9 +68,9 @@ class W8A8Linear(QuantizedLinearBase):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        q_x, act_scale = W8A8Linear.quant_act(x)
-        out = w8a8_gemm_per_token_per_channel(
-            q_x, act_scale, self.weight, self.scale_channel
+        q_x, act_scale = W4A8PerTokenPerChannelAsymmLinear.quant_act(x)
+        out = w4a8_gemm_per_token_per_channel_asymm(
+            q_x, act_scale, self.qweight, self.s1_scales, self.s1_szeros
         ).view(*x.shape[:-1], -1)
 
         if self.bias is not None:

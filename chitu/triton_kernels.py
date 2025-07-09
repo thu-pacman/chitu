@@ -8,7 +8,8 @@ __all__ = [
     "weight_dequant_soft_fp8_deepseek_v3_kernel_step_1",
     "weight_dequant_soft_fp8_deepseek_v3_kernel_step_2",
     "fp8_gemm_deepseek_v3_kernel",
-    "w8a8_gemm_pertoken_perchannel_kernel",
+    "w8a8_gemm_per_token_per_channel_kernel",
+    "w4a8_gemm_per_token_per_channel_asymm_kernel",
     "soft_fp8_gemm_deepseek_v3_kernel",
     "soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel",
     "soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel",
@@ -357,7 +358,7 @@ def weight_dequant_soft_fp8_deepseek_v3_kernel_step_2(
     tl.store(y_ptr + offs, y, mask=mask)
 
 
-w8a8_gemm_pertoken_perchannel_configs = [
+w8a8_gemm_per_token_per_channel_configs = [
     Config(
         {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": 128},
         num_stages=num_stages,
@@ -375,9 +376,9 @@ w8a8_gemm_pertoken_perchannel_configs = [
 ]
 
 
-@triton.autotune(configs=w8a8_gemm_pertoken_perchannel_configs, key=["N", "K"])
+@triton.autotune(configs=w8a8_gemm_per_token_per_channel_configs, key=["N", "K"])
 @triton.jit
-def w8a8_gemm_pertoken_perchannel_kernel(
+def w8a8_gemm_per_token_per_channel_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -421,13 +422,91 @@ def w8a8_gemm_pertoken_perchannel_kernel(
     a_s = tl.load(a_s_ptr + offs_m)
     b_s = tl.load(b_s_ptr + offs_n)
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)
     for i in range(k):
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K, other=0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=0)
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K
         b_ptrs += BLOCK_SIZE_K
+    c = (accumulator * a_s[:, None] * b_s[None, :]).to(c_ptr.dtype.element_ty)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c, mask=mask)
+
+
+w4a8_gemm_per_token_per_channel_asymm_configs = [
+    Config(
+        {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": 128},
+        num_stages=num_stages,
+        num_warps=8,
+        pre_hook=functools.partial(
+            auto_tuning_logger,
+            block_m=block_m,
+            block_n=block_n,
+            num_stages=num_stages,
+        ),
+    )
+    for block_m in [16, 32, 64]
+    for block_n in [32, 64, 128]
+    for num_stages in [3, 4, 5, 6]
+]
+
+
+@triton.autotune(configs=w4a8_gemm_per_token_per_channel_asymm_configs, key=["N", "K"])
+@triton.jit
+def w4a8_gemm_per_token_per_channel_asymm_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_s_ptr,
+    b_s_ptr,
+    b_z_ptr,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    k = tl.cdiv(K, BLOCK_SIZE_K)
+    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K // 2)
+    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+    b_ptrs = b_ptr + offs_n[None, :] * (K // 2) + offs_k[:, None]
+
+    a_s = tl.load(a_s_ptr + offs_m)
+    b_s = tl.load(b_s_ptr + offs_n)
+    b_z = tl.load(b_z_ptr + offs_n)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for i in range(k):
+        b_packed = tl.load(b_ptrs)
+
+        a = tl.load(a_ptrs)
+        b = (b_packed.to(tl.uint8, bitcast=True) & 0x0F).to(tl.int8)
+        accumulator += (
+            tl.dot(a, b).to(tl.float32) * b_s[None, :]
+            - tl.sum(a.to(tl.int32), axis=1, keep_dims=True).to(tl.float32)
+            * b_z[None, :]
+        ) * a_s[:, None]
+        a_ptrs += BLOCK_SIZE_K // 2
+
+        a = tl.load(a_ptrs)
+        b = (b_packed.to(tl.uint8, bitcast=True) >> 4).to(tl.int8)
+        accumulator += (
+            tl.dot(a, b).to(tl.float32) * b_s[None, :]
+            - tl.sum(a.to(tl.int32), axis=1, keep_dims=True).to(tl.float32)
+            * b_z[None, :]
+        ) * a_s[:, None]
+        a_ptrs += BLOCK_SIZE_K // 2
+
+        b_ptrs += BLOCK_SIZE_K // 2
     c = accumulator.to(c_ptr.dtype.element_ty)
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
