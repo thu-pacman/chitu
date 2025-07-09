@@ -161,7 +161,7 @@ class NormalExecutor(Executor):
 
     def postprocess_sync_part(self, tasks: PackedTasks, logits: torch.Tensor):
         # --- dependent on logits ---
-        logits = logits.view(-1, logits.shape[-1])
+        logits = logits.view(-1, logits.shape[-1]).contiguous()
         assert (
             len(tasks.tasks) == logits.shape[0]
         ), f"logits has shape {logits.shape}, but there are {len(tasks.tasks)} tasks"

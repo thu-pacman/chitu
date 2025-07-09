@@ -29,6 +29,7 @@ from chitu.cache_manager import (
     KVCacheManagerSkewAware,
     PagedKVCacheManager,
 )
+from chitu.device_type import is_ascend
 from chitu.tensor_parallel import init_tp
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
 from chitu.utils import (
@@ -357,7 +358,11 @@ class Backend:
                 if hasattr(args.models, "n_kv_heads")
                 else args.models.n_heads
             )
-            n_local_kv_heads = n_kv_heads // model_parallel_size
+            n_local_kv_heads = (
+                n_kv_heads // model_parallel_size
+                if n_kv_heads > model_parallel_size
+                else 1
+            )  # Compatible with tp_size>n_kv_heads
             head_dim = (
                 args.models.head_dim
                 if hasattr(args.models, "head_dim")
@@ -415,7 +420,19 @@ class Backend:
         Returns:
             Initialized attention backend
         """
-        if args.infer.attn_type == "flash_attn":
+        if args.infer.attn_type == "auto":
+            if is_ascend():
+                return NpuAttnBackend()
+            elif (
+                "DeepSeek-R1" in args.models.name
+                or "DeepSeek-V3" in args.models.name
+                or "Qwen3-30B-A3B" in args.models.name
+                or "Qwen3-235B-A22B" in args.models.name
+            ) and "Distill" not in args.models.name:
+                return FlashMLABackend()
+            else:
+                return FlashAttnBackend()
+        elif args.infer.attn_type == "flash_attn":
             return FlashAttnBackend()
         elif args.infer.attn_type == "flash_mla":
             return FlashMLABackend()
@@ -531,6 +548,12 @@ class Backend:
                 ), f"no checkpoint files found in {args.models.ckpt_dir}"
                 ckpt_path = checkpoints[0]
                 checkpoint = torch.load(ckpt_path, map_location="cpu")
+            elif args.models.name == "Llama-3-8B-QServe":
+                checkpoint = torch.load(
+                    os.path.join(args.models.ckpt_dir, "pytorch_model.bin"),
+                    map_location="cpu",
+                )
+                checkpoint = Backend._remove_prefix(checkpoint, "model.")
             elif args.models.type in {
                 "hf-llama",
                 "hf-glm-z1",
@@ -575,6 +598,13 @@ class Backend:
         logger.info(f"Checkpoint loaded in {time.time() - start_time:.2f} seconds")
 
     @staticmethod
+    def _remove_prefix(state_dict, prefix):
+        return {
+            k[len(prefix) :] if k.startswith(prefix) else k: v
+            for k, v in state_dict.items()
+        }
+
+    @staticmethod
     def _load_hf_checkpoint(model, args):
         """
         Load checkpoint for Hugging Face model types.
@@ -589,12 +619,6 @@ class Backend:
         quant_name = getattr(quant_config, "name", None)
         ckpt_dir = args.models.ckpt_dir
 
-        def remove_prefix(state_dict, prefix):
-            return {
-                k[len(prefix) :] if k.startswith(prefix) else k: v
-                for k, v in state_dict.items()
-            }
-
         def get_filter_key():
             if getattr(args.models, "type", "") == "deepseek-v3":
                 return lambda k: "model.layers.61" not in k
@@ -604,7 +628,7 @@ class Backend:
 
         if quant_name in ["autoawq", "gptqmodel", "awq"]:
             params = load_state_dict(ckpt_dir)
-            return remove_prefix(params, "model.")
+            return Backend._remove_prefix(params, "model.")
         elif quant_name in ["gguf", "q4km"]:
             loader = GGUFLoader(ckpt_dir)
             return load_state_dict_llama_gguf_mlp_layers(loader, len(model.layers))
@@ -613,7 +637,7 @@ class Backend:
             params = load_state_dict(
                 ckpt_dir, skip_preprocess=args.skip_preprocess, filter_key=filter_key
             )
-            return remove_prefix(params, "model.")
+            return Backend._remove_prefix(params, "model.")
 
     @staticmethod
     def build(args):
@@ -639,6 +663,8 @@ class Backend:
 
         # Initialize attention backend
         attn_backend = Backend._init_attention_backend(args)
+        if args.infer.attn_type == "flash_infer" and args.infer.use_cuda_graph:
+            args.infer.use_cuda_graph = False
 
         # Build and setup model
         Backend._build_and_setup_model(args, attn_backend)
