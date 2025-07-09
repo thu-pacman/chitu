@@ -26,6 +26,12 @@ class TestServeConfigRules:
     def config(self):
         return OmegaConf.create(
             {
+                "models": {
+                    "name": "Qwen3-32B",
+                    "type": "hf-llama",
+                    "n_heads": 64,
+                    "n_kv_heads": 8,
+                },
                 "serve": {"port": 21002},
                 "infer": {
                     "num_blocks": 2,

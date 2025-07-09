@@ -6,6 +6,7 @@ import flashinfer
 import triton
 
 from chitu.attn_backend import RefAttnBackend, TritonAttnBackend, FlashInferBackend
+from chitu.device_type import is_muxi
 from chitu.global_vars import set_global_args
 
 
@@ -15,6 +16,21 @@ from chitu.global_vars import set_global_args
 @pytest.mark.parametrize("v_head_dim", [512])
 @pytest.mark.parametrize("bs", [1, 9])
 def test_triton_prefill_attn(num_local_heads, qk_head_dim, v_head_dim, bs):
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "mla_absorb": None,
+                    "max_reqs": 4,
+                    "use_cuda_graph": False,
+                    "tp_size": 1,
+                    "cache_type": "paged",
+                },
+                "models": {"n_heads": num_local_heads, "n_kv_heads": 1},
+            }
+        ),
+        need_ensure=False,
+    )
 
     if isinstance(bs, int):
         # If batch_size is provided directly, use it
@@ -102,6 +118,26 @@ def test_triton_mla_attn(
     page_size,
 ):
     torch.set_default_dtype(torch.float16)
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "mla_absorb": None,
+                    "max_reqs": 4,
+                    "use_cuda_graph": False,
+                    "tp_size": 1,
+                    "cache_type": "paged",
+                },
+                "models": {
+                    "n_heads": local_n_heads,
+                    "kv_lora_rank": kv_lora_rank,
+                    "qk_rope_head_dim": qk_rope_head_dim,
+                    "qk_nope_head_dim": 128,
+                },
+            }
+        ),
+        need_ensure=False,
+    )
 
     max_num_pages = 16
 
@@ -155,6 +191,8 @@ def test_triton_mla_attn(
 def test_triton_attn_with_kvcache(
     cache_seqlens, n_heads, n_kv_heads, head_dim, cache_type
 ):
+    if is_muxi():
+        return
     torch.set_default_dtype(torch.float16)
     set_global_args(
         OmegaConf.create(

@@ -29,6 +29,7 @@ from chitu.cache_manager import (
     KVCacheManagerSkewAware,
     PagedKVCacheManager,
 )
+from chitu.device_type import is_ascend
 from chitu.tensor_parallel import init_tp
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
 from chitu.utils import (
@@ -419,7 +420,19 @@ class Backend:
         Returns:
             Initialized attention backend
         """
-        if args.infer.attn_type == "flash_attn":
+        if args.infer.attn_type == "auto":
+            if is_ascend():
+                return NpuAttnBackend()
+            elif (
+                "DeepSeek-R1" in args.models.name
+                or "DeepSeek-V3" in args.models.name
+                or "Qwen3-30B-A3B" in args.models.name
+                or "Qwen3-235B-A22B" in args.models.name
+            ) and "Distill" not in args.models.name:
+                return FlashMLABackend()
+            else:
+                return FlashAttnBackend()
+        elif args.infer.attn_type == "flash_attn":
             return FlashAttnBackend()
         elif args.infer.attn_type == "flash_mla":
             return FlashMLABackend()
@@ -643,6 +656,8 @@ class Backend:
 
         # Initialize attention backend
         attn_backend = Backend._init_attention_backend(args)
+        if args.infer.attn_type == "flash_infer" and args.infer.use_cuda_graph:
+            args.infer.use_cuda_graph = False
 
         # Build and setup model
         Backend._build_and_setup_model(args, attn_backend)

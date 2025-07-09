@@ -7,7 +7,9 @@ This file has adaption of open-source code from the following sources:
 __all__ = ["AttnBackend", "FlashAttnBackend", "RefAttnBackend", "NpuAttnBackend"]
 
 import abc
+import bisect
 import math
+import packaging
 from typing import Optional, Union
 
 import torch
@@ -34,6 +36,7 @@ class AttnBackend(abc.ABC):
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__()
         self.qk_nope_head_dim = qk_nope_head_dim
+        self.args = get_global_args()
 
     def prepare_metadata_for_decode(self, *args, **kwargs):
         pass
@@ -823,22 +826,13 @@ class TritonAttnBackend(RefAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
     ):
-        if triton.__version__ < "3.2.0" and block_table is None:
-            # triton has bug, when version < 3.2.0, the "~" operator on bool vector will get wrong results, so fallback to ref_attn
-            return super().attn_with_kvcache(
-                q,
-                k_cache,
-                v_cache,
-                k,
-                v,
-                cache_seqlens,
-                cache_leftpad,
-                block_table,
-                causal,
-                window_size,
-                softcap,
-                softmax_scale,
-            )
+        # triton has bug, when version < 3.2.0, the "~" operator on bool vector will get wrong results
+        assert (
+            packaging.version.parse(triton.__version__)
+            >= packaging.version.parse("3.2.0")
+            or block_table is not None
+        )
+
         if cache_seqlens is int or cache_seqlens.ndim == 0:
             cache_seqlens = torch.full(
                 (q.shape[0],), cache_seqlens, dtype=torch.long, device=q.device
@@ -946,7 +940,6 @@ class FlashMLABackend(TritonAttnBackend):
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
-        self.args = get_global_args()
         self.mtp_size = 1
         self.kv_heads = 1
         self.local_n_heads = self.args.models.n_heads // self.args.infer.tp_size
@@ -961,7 +954,7 @@ class FlashMLABackend(TritonAttnBackend):
         block_size,
         softmax_scale=None,
     ):
-        max_batch_size = get_global_args().infer.max_reqs
+        max_batch_size = self.args.infer.max_reqs
         metadata, num_splits = flash_mla.get_mla_metadata(
             cache_seqlens_incl_this_decode,
             self.mtp_size * self.local_n_heads // self.kv_heads,
@@ -1021,19 +1014,20 @@ class FlashInferBackend(TritonAttnBackend):
     def __init__(self, tot_num_blocks, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
-        args = get_global_args()
         self.is_mla = (
-            args.infer.mla_absorb == "absorb-without-precomp"
-            or args.infer.mla_absorb == "absorb"
+            self.args.infer.mla_absorb == "absorb-without-precomp"
+            or self.args.infer.mla_absorb == "absorb"
         )
-        self.is_paged = args.infer.cache_type == "paged"
+        self.is_paged = self.args.infer.cache_type == "paged"
+        self.use_cuda_graph = self.args.infer.use_cuda_graph
 
         # FlashInfer accepts block tables for Q and KV in CSR format.
         # - For Q, it is trivial because the length for each sample is 1.
         # - For KV, we need to convert `block_table` to CSR format.
         # These buffers must be allocated when initializing
         # `flashinfer.mla.BatchMLAPagedAttentionWrapper` when cuda graph is enabled
-        max_batch_size = get_global_args().infer.max_reqs
+        max_batch_size = self.args.infer.max_reqs
+        self.fixed_bs = self.get_fixed_batch_size(max_batch_size)
         self.q_indptr = StaticTensor(
             torch.empty(max_batch_size + 1, dtype=torch.int32, device="cuda")
         )
@@ -1050,10 +1044,13 @@ class FlashInferBackend(TritonAttnBackend):
         self.prefill_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
             torch.empty(128 * 1024 * 1024, dtype=torch.int8).cuda(),
             "NHD",
-            use_cuda_graph=args.infer.use_cuda_graph,
-            qo_indptr_buf=self.q_indptr.get(),
-            kv_indptr_buf=self.kv_indptr.get(),
+            use_cuda_graph=False,
         )
+        self.decode_wrapper = {}
+        self.decode_wrapper_workspace_buffer = torch.empty(
+            128 * 1024 * 1024, dtype=torch.int8
+        ).cuda()
+
         if self.is_paged == True:
             self.last_page_len = torch.empty(
                 max_batch_size, dtype=torch.int32, device="cuda"
@@ -1061,23 +1058,24 @@ class FlashInferBackend(TritonAttnBackend):
             self.record_pre_page_len = torch.empty(
                 max_batch_size, dtype=torch.int32, device="cuda"
             )
-            self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                torch.empty(128 * 1024 * 1024, dtype=torch.int8).cuda(),
-                "NHD",
-                use_cuda_graph=args.infer.use_cuda_graph,
-                paged_kv_indptr_buffer=self.kv_indptr.get(),
-                paged_kv_indices_buffer=self.kv_indices.get(),
-                paged_kv_last_page_len_buffer=self.last_page_len,
-            )
+            for bs in self.fixed_bs:
+                self.decode_wrapper[bs] = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                    self.decode_wrapper_workspace_buffer,
+                    "NHD",
+                    use_cuda_graph=self.use_cuda_graph,
+                    paged_kv_indptr_buffer=self.kv_indptr.get()[: bs + 1],
+                    paged_kv_indices_buffer=self.kv_indices.get(),
+                    paged_kv_last_page_len_buffer=self.last_page_len[:bs],
+                )
 
-        self.local_n_heads = args.models.n_heads // args.infer.tp_size
+        self.local_n_heads = self.args.models.n_heads // self.args.infer.tp_size
         if self.is_mla:
-            self.kv_lora_rank = args.models.kv_lora_rank
-            self.qk_rope_head_dim = args.models.qk_rope_head_dim
-            self.qk_nope_head_dim = args.models.qk_nope_head_dim
+            self.kv_lora_rank = self.args.models.kv_lora_rank
+            self.qk_rope_head_dim = self.args.models.qk_rope_head_dim
+            self.qk_nope_head_dim = self.args.models.qk_nope_head_dim
             self.mla_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
                 torch.empty(128 * 1024 * 1024, dtype=torch.int8).cuda(),
-                use_cuda_graph=args.infer.use_cuda_graph,
+                use_cuda_graph=self.use_cuda_graph,
                 qo_indptr=self.q_indptr.get(),
                 kv_indptr=self.kv_indptr.get(),
                 kv_indices=self.kv_indices.get(),
@@ -1087,7 +1085,47 @@ class FlashInferBackend(TritonAttnBackend):
         else:
             self.kv_lora_rank = None
             self.qk_rope_head_dim = None
-            self.local_n_kv_heads = args.models.n_kv_heads // args.infer.tp_size
+            self.local_n_kv_heads = (
+                self.args.models.n_kv_heads // self.args.infer.tp_size
+            )
+
+    def get_fixed_batch_size(self, max_reqs):
+        if max_reqs <= 8:
+            fixed_bs = list(range(1, max_reqs + 1))
+        elif max_reqs <= 160:
+            fixed_bs = list(range(1, 9)) + list(range(16, max_reqs + 1, 8))
+        else:
+            fixed_bs = (
+                list(range(1, 9))
+                + list(range(16, 161, 8))
+                + list(range(176, max_reqs + 1, 16))
+            )
+
+        if fixed_bs[-1] < max_reqs:
+            fixed_bs.append(max_reqs)
+
+        return fixed_bs
+
+    def match_batch_size(self, raw_batch_size):
+        index = bisect.bisect_left(self.fixed_bs, raw_batch_size)
+
+        return self.fixed_bs[index]
+
+    def pad_tensor(self, x, target_size, dim=0, value=0):
+        current_size = x.size(dim)
+        assert current_size <= target_size
+
+        if current_size == target_size:
+            return x
+
+        pad_size = target_size - current_size
+        pad_pattern = [0] * (x.dim() * 2)
+        pad_idx = (x.dim() - dim - 1) * 2 + 1
+        pad_pattern[pad_idx] = pad_size
+
+        padded_x = torch.nn.functional.pad(x, pad_pattern, mode="constant", value=value)
+
+        return padded_x
 
     def prepare_metadata_for_decode(
         self,
@@ -1097,7 +1135,12 @@ class FlashInferBackend(TritonAttnBackend):
         block_size,
         softmax_scale=None,
     ):
-        batch_size = cache_seqlens_incl_this_decode.shape[0]
+        raw_batch_size = cache_seqlens_incl_this_decode.shape[0]
+        batch_size = self.match_batch_size(raw_batch_size)
+        cache_seqlens_incl_this_decode = self.pad_tensor(
+            cache_seqlens_incl_this_decode, batch_size
+        )
+        block_table = self.pad_tensor(block_table, batch_size)
         self.q_indptr.set(torch.arange(0, batch_size + 1).cuda().to(torch.int32))
         kv_indptr_list = []
         kv_indices_list = []
@@ -1187,45 +1230,24 @@ class FlashInferBackend(TritonAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
     ):
-        head_dim_qk = q.shape[-1]
-        head_dim_vo = v.shape[-1]
-        # flashinfer prefill not support these cases
-        if head_dim_vo not in [64, 128, 256] or (
-            head_dim_qk != head_dim_vo
-            and not (head_dim_qk == 192 and head_dim_vo == 128)
-        ):
-            o = super().attn_varlen_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                dropout_p,
-                causal,
-                window_size,
-                softcap,
-                softmax_scale,
-            )
-        else:
-            num_qo_heads = q.shape[-2]
-            num_kv_heads = k.shape[-2]
-            self.prefill_wrapper.plan(
-                cu_seqlens_q,
-                cu_seqlens_k,
-                num_qo_heads,
-                num_kv_heads,
-                head_dim_qk=q.shape[-1],
-                head_dim_vo=v.shape[-1],
-                causal=causal,
-                q_data_type=q.dtype,
-                kv_data_type=k.dtype,
-                window_left=window_size[0],
-                logits_soft_cap=softcap,
-                sm_scale=softmax_scale,
-            )
-            o = self.prefill_wrapper.run(q, k, v)
+        # TODO: we do not support DeepSeek-R1 in flashinfer prefill step currently
+        num_qo_heads = q.shape[-2]
+        num_kv_heads = k.shape[-2]
+        self.prefill_wrapper.plan(
+            cu_seqlens_q,
+            cu_seqlens_k,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_qk=q.shape[-1],
+            head_dim_vo=v.shape[-1],
+            causal=causal,
+            q_data_type=q.dtype,
+            kv_data_type=k.dtype,
+            window_left=window_size[0],
+            logits_soft_cap=softcap,
+            sm_scale=softmax_scale,
+        )
+        o = self.prefill_wrapper.run(q, k, v)
         return o
 
     def attn_with_kvcache(
@@ -1243,30 +1265,15 @@ class FlashInferBackend(TritonAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
     ):
-        batch_size = q.shape[0]
+        raw_batch_size = q.shape[0]
+        batch_size = self.match_batch_size(raw_batch_size)
         block_size = k_cache.shape[1]
         head_dim = q.shape[-1]
-        group_size = q.shape[-2] // k_cache.shape[-2]
-        if group_size not in [1, 2, 3, 4, 8]:
-            return super().attn_with_kvcache(
-                q,
-                k_cache,
-                v_cache,
-                k,
-                v,
-                cache_seqlens,
-                cache_leftpad,
-                block_table,
-                causal,
-                window_size,
-                softcap,
-                softmax_scale,
-            )
-        if block_table != None:
+        if block_table is not None:
             # append kv to cache
-            if k != None:
-                assert v != None
-                for i in range(batch_size):
+            if k is not None:
+                assert v is not None
+                for i in range(raw_batch_size):
                     if isinstance(cache_seqlens, torch.Tensor):
                         batch_seq_len = cache_seqlens[i]
                     elif isinstance(cache_seqlens, int):
@@ -1275,15 +1282,9 @@ class FlashInferBackend(TritonAttnBackend):
                         raise RuntimeError(
                             f"Cache_seqlens type must be torch.Tensor or int: {type(cache_seqlens)}"
                         )
-                    k_cache[
-                        block_table[i, batch_seq_len // block_size],
-                        batch_seq_len % block_size,
-                    ] = k[i]
-                    v_cache[
-                        block_table[i, batch_seq_len // block_size],
-                        batch_seq_len % block_size,
-                    ] = v[i]
                     self.last_page_len[i] = batch_seq_len + 1
+                append_to_paged_kv_cache(k_cache, block_table, k, cache_seqlens)
+                append_to_paged_kv_cache(v_cache, block_table, v, cache_seqlens)
 
             def is_new_seq_len():
                 for i in range(batch_size):
@@ -1293,10 +1294,10 @@ class FlashInferBackend(TritonAttnBackend):
 
             if is_new_seq_len():
                 self.record_pre_page_len.copy_(self.last_page_len)
-                self.decode_wrapper.plan(
-                    self.kv_indptr.get(),
+                self.decode_wrapper[batch_size].plan(
+                    self.kv_indptr.get()[: batch_size + 1],
                     self.kv_indices.get(),
-                    self.last_page_len,
+                    self.last_page_len[:batch_size],
                     self.local_n_heads,
                     self.local_n_kv_heads,
                     head_dim,
@@ -1308,9 +1309,15 @@ class FlashInferBackend(TritonAttnBackend):
                     logits_soft_cap=softcap,
                     sm_scale=softmax_scale,
                 )
-            o = self.decode_wrapper.run(
+
+            q = self.pad_tensor(q, batch_size)
+            o = self.decode_wrapper[batch_size].run(
                 q.view(-1, q.shape[-2], q.shape[-1]), (k_cache, v_cache)
             )
+            if raw_batch_size < batch_size:
+                return o.view(q.shape)[:raw_batch_size]
+            else:
+                return o.view(q.shape)
         else:
             o = torch.empty_like(q)
             for i in range(batch_size):
@@ -1331,7 +1338,6 @@ class FlashInferBackend(TritonAttnBackend):
 class NpuAttnBackend(RefAttnBackend):
     def __init__(self, *args, **kwargs):
         super().__init__()
-        self.args = get_global_args()
         self.torch_npu, self.has_torch_npu = try_import_opt_dep(
             "torch_npu", "torch_npu"
         )

@@ -35,6 +35,7 @@ class ServeConfigRules(Callback):
                     f"torch-npu required for attn_type=npu (got {attn_type})"
                 )
         if attn_type not in {
+            "auto",
             "flash_attn",
             "flash_mla",
             "flash_infer",
@@ -43,8 +44,20 @@ class ServeConfigRules(Callback):
             "ref",
         }:
             self._exit_with_error(
-                f"attn_type must be one of [flash_attn, flash_mla, flash_infer, triton, npu, ref], got {attn_type}"
+                f"attn_type must be one of [auto, flash_attn, flash_mla, flash_infer, triton, npu, ref], got {attn_type}"
             )
+
+        model_name = config.models.name
+        model_type = config.models.type
+        if attn_type == "flash_infer":
+            if (
+                "deepseek-v3" in model_type
+                or config.models.n_heads // config.models.n_kv_heads
+                not in [1, 2, 3, 4, 8]
+            ):
+                self._exit_with_error(
+                    f"model {model_name} is not compatible with flash_infer"
+                )
 
         op_impl = config.infer.op_impl
         if op_impl not in {"torch", "muxi_custom_kernel"}:
