@@ -51,7 +51,7 @@ class ChatRequest(BaseModel):
     temperature: float = 0.8  # [0, 2]
     top_p: float = 0.9  # [0,1]
     top_k: int = 50  # -1 or positive integer
-    frequency_penalty: float = 0.1  # [-2, 2]
+    frequency_penalty: float = 0.0  # [-2, 2]
     min_batch_size: int = 1
     stop_with_eos: bool = True
 
@@ -101,7 +101,6 @@ async def create_chat_completion(request: ChatRequest):
             f"{req.request_id}",
             req,
             req.message,
-            max_seq_len=global_args.infer.max_seq_len,
             stop_with_eos=stop_with_eos,
         )
         TaskPool.add(task)

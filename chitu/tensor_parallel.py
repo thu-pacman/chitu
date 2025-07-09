@@ -1,8 +1,4 @@
 __all__ = [
-    "init_tp",
-    "get_tp_group",
-    "get_tp_size",
-    "get_tp_rank",
     "ColumnParallelLinear",
     "RowParallelLinear",
     "VocabParallelEmbedding",
@@ -15,75 +11,9 @@ from logging import getLogger
 from chitu.global_vars import get_global_args
 from chitu.quantization import QuantizationRegistry
 from chitu.device_type import is_ascend
+from chitu.distributed.parallel_state import get_tp_group, get_tp_size
 
 logger = getLogger(__name__)
-
-tp_comm_group = None
-cpu_tp_comm_group = None
-pp_group = {}
-
-
-def generate_tp_rank_list(tp_size: int, pp_size: int):
-    return torch.arange(tp_size * pp_size).reshape(pp_size, tp_size).tolist()
-
-
-def init_tp(tp_size: int, pp_size: int, use_gloo: bool):
-    global tp_comm_group
-    global cpu_tp_comm_group
-    rank_list = generate_tp_rank_list(tp_size, pp_size)
-    global_rank = torch.distributed.get_rank()
-    for ranks in rank_list:
-        group = torch.distributed.new_group(ranks)
-        cpu_group = (
-            torch.distributed.new_group(ranks, backend="gloo") if use_gloo else None
-        )
-        if global_rank in ranks:
-            tp_comm_group = group
-            cpu_tp_comm_group = cpu_group
-
-
-def init_pp_group_npu(tp_size: int, pp_size: int):
-    assert len(pp_group) == 0
-    if pp_size < 2:
-        return
-
-    ranks = [i * tp_size for i in range(pp_size)]
-    for i in range(pp_size):
-        next_i = (i + 1) % pp_size
-        rank_pair = [ranks[i], ranks[next_i]]
-        pg = torch.distributed.new_group(rank_pair)
-        pp_group[(ranks[i], ranks[next_i])] = pg
-        pp_group[(ranks[next_i], ranks[i])] = pg
-
-
-def get_pp_group(rank1, rank2):
-    if len(pp_group) == 0:
-        return None
-    else:
-        key = (rank1, rank2)
-        return pp_group[key]
-
-
-def get_tp_group():
-    return tp_comm_group
-
-
-def get_cpu_tp_group():
-    return cpu_tp_comm_group
-
-
-def get_tp_size():
-    return tp_comm_group.size() if tp_comm_group is not None else 1
-
-
-def get_tp_rank():
-    return (
-        torch.distributed.get_rank(
-            group=get_tp_group()  # Don't pass None. None means world group
-        )
-        if tp_comm_group is not None
-        else 0
-    )
 
 
 def get_local_linear_class(
@@ -275,7 +205,7 @@ class ColumnParallelLinearMixIn:
             gather_output: If set to True, an all-gather operation is performed on the output tensor.
         """
 
-        tp_group = get_tp_group()
+        tp_group = get_tp_group().gpu_group
         tp_size = get_tp_size()
 
         assert out_features % tp_size == 0, "out_features must be divisible by tp_size"
@@ -330,9 +260,9 @@ class RowParallelLinearMixIn:
             reduce_output: If set to True, an all-reduce operation is performed on the output tensor.
         """
 
-        tp_group = get_tp_group()
+        tp_group = get_tp_group().gpu_group
+        rank = get_tp_group().rank_in_group
         tp_size = get_tp_size()
-        rank = get_tp_rank()
 
         assert in_features % tp_size == 0, "in_features must be divisible by tp_size"
         local_in_features = in_features // tp_size
@@ -386,9 +316,9 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         super().__init__()
 
-        self.tp_group = get_tp_group()
+        self.tp_group = get_tp_group().gpu_group
+        self.rank = get_tp_group().rank_in_group
         self.tp_size = get_tp_size()
-        self.rank = get_tp_rank()
 
         assert (
             num_embeddings % self.tp_size == 0

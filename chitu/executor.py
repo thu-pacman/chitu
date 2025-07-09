@@ -18,7 +18,11 @@ from chitu.task import (
     TaskLoad,
     TaskType,
 )
-from chitu.tensor_parallel import get_tp_group, get_pp_group, get_cpu_tp_group
+from chitu.distributed.parallel_state import (
+    get_tp_group,
+    get_pp_pair_group,
+    get_cpu_tp_group,
+)
 from chitu.utils import VarLens, top_k_top_p_min_p_sampling_from_probs_torch
 from chitu.ops import apply_frequency_penalty, response_append
 from chitu.device_list import DeviceList
@@ -52,6 +56,36 @@ class BatchResult:
     return_logprobs: bool = False
     logprobs: Optional[torch.Tensor] = None
     token_idxs: Optional[torch.Tensor] = None
+
+
+class TasksDispatcher:
+    def __init__(self):
+        pass
+
+    # recv metadata from previous worker
+    def recv_metadata(self, metadata: Optional[PackedTasksBase]) -> PackedTasksBase:
+        raise NotImplementedError()
+
+    # send metadata to next worker
+    def send_metadata(self, metadata: PackedTasksBase):
+        raise NotImplementedError()
+
+    # recv payload from previous worker
+    def recv_payload(self, payload: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError()
+
+    # send payload to next worker
+    def send_payload(self, payload: torch.Tensor, tasks: PackedTasks):
+        raise NotImplementedError()
+
+    # epilogue: send payload to next worker and register ongoing tasks
+    def epilogue(
+        self,
+        payload: torch.Tensor,
+        tasks: PackedTasks,
+        ongoing_task_manager,
+    ):
+        raise NotImplementedError()
 
 
 class Executor:
@@ -268,7 +302,7 @@ class PipeTensorExecutor(NormalExecutor):
         self.pp_main_rank = Backend.pp_main_rank
         self.pp_end_stage = Backend.pp_end_stage
         self.last_pp_main_rank = self.pp_end_stage * self.tp_size
-        self.tp_group = get_tp_group()
+        self.tp_group = get_tp_group().gpu_group
         self.cpu_tp_group = get_cpu_tp_group()
 
     def prefill_step(self, tasks: PackedTasksBase):
@@ -298,7 +332,7 @@ class PipeTensorExecutor(NormalExecutor):
                     device=self.local_rank,
                 )
             if self.rank == self.pp_main_rank:
-                pg = get_pp_group(self.rank, self.rank - self.tp_size)
+                pg = get_pp_pair_group(self.rank, self.rank - self.tp_size)
                 torch.distributed.recv(
                     tensor=inp,
                     src=self.rank - self.tp_size,
@@ -315,7 +349,7 @@ class PipeTensorExecutor(NormalExecutor):
 
         self.timers("prefill").stop()
         if self.rank == self.pp_main_rank and self.pp_stage != self.pp_end_stage:
-            pg = get_pp_group(self.rank, self.rank + self.tp_size)
+            pg = get_pp_pair_group(self.rank, self.rank + self.tp_size)
             torch.distributed.isend(
                 tensor=out.contiguous(),  # contiguous() is necessary for NCCL
                 dst=self.rank + self.tp_size,
@@ -325,7 +359,7 @@ class PipeTensorExecutor(NormalExecutor):
         elif self.rank == self.pp_main_rank and self.pp_stage == self.pp_end_stage:
             # send logits to rank 0 to get response words
             torch.cuda.synchronize(self.local_rank)
-            pg = get_pp_group(self.rank, 0)
+            pg = get_pp_pair_group(self.rank, 0)
             torch.distributed.isend(
                 tensor=out.contiguous(),  # contiguous() is necessary for NCCL
                 dst=0,
@@ -357,7 +391,7 @@ class PipeTensorExecutor(NormalExecutor):
                     device=self.local_rank,
                 )
             if self.rank == self.pp_main_rank:
-                pg = get_pp_group(self.rank, self.rank - self.tp_size)
+                pg = get_pp_pair_group(self.rank, self.rank - self.tp_size)
                 torch.distributed.recv(
                     tensor=inp,
                     src=self.rank - self.tp_size,
@@ -375,7 +409,7 @@ class PipeTensorExecutor(NormalExecutor):
         self.timers("decode-model").stop()
         self.timers("decode").stop()
         if self.rank == self.pp_main_rank and self.pp_stage != self.pp_end_stage:
-            pg = get_pp_group(self.rank, self.rank + self.tp_size)
+            pg = get_pp_pair_group(self.rank, self.rank + self.tp_size)
             torch.distributed.isend(
                 tensor=out.contiguous(),  # contiguous() is necessary for NCCL
                 dst=self.rank + self.tp_size,
@@ -385,7 +419,7 @@ class PipeTensorExecutor(NormalExecutor):
         elif self.rank == self.pp_main_rank and self.pp_stage == self.pp_end_stage:
             # Send logits to rank 0 to get response words
             out = out.view(out.shape[0], -1)
-            pg = get_pp_group(self.rank, 0)
+            pg = get_pp_pair_group(self.rank, 0)
             torch.distributed.isend(
                 out.contiguous(),  # contiguous() is necessary for NCCL
                 dst=0,
@@ -401,7 +435,7 @@ class PipeTensorExecutor(NormalExecutor):
             device=self.local_rank,
             dtype=torch.float,
         )
-        pg = get_pp_group(self.rank, self.last_pp_main_rank)
+        pg = get_pp_pair_group(self.rank, self.last_pp_main_rank)
         handle = torch.distributed.irecv(
             logits, src=self.last_pp_main_rank, tag=LOGIT_TAG, group=pg
         )
@@ -448,7 +482,7 @@ class PipeTensorExecutor(NormalExecutor):
                 device="cpu" if Backend.use_gloo else self.local_rank
             )
             if self.rank == self.pp_main_rank:
-                pg = get_pp_group(self.rank, self.rank - self.tp_size)
+                pg = get_pp_pair_group(self.rank, self.rank - self.tp_size)
                 torch.distributed.recv(
                     tensor=task_tensor,
                     src=self.rank - self.tp_size,
@@ -482,7 +516,7 @@ class PipeTensorExecutor(NormalExecutor):
                 remove_kvcache = True
 
         if self.rank == self.pp_main_rank and self.pp_stage != self.pp_end_stage:
-            pg = get_pp_group(self.rank, self.rank + self.tp_size)
+            pg = get_pp_pair_group(self.rank, self.rank + self.tp_size)
             torch.distributed.send(
                 tensor=task_tensor,
                 dst=self.rank + self.tp_size,

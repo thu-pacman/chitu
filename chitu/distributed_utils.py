@@ -2,12 +2,16 @@ import torch.distributed as dist
 
 from chitu.backend import Backend
 from chitu.executor import TASK_TENSOR_TAG
-from chitu.tensor_parallel import get_tp_group, get_pp_group, get_cpu_tp_group
+from chitu.distributed.parallel_state import (
+    get_tp_group,
+    get_cpu_tp_group,
+    get_pp_pair_group,
+)
 
 
 def propagate_tensor_to_all_devices(tensor):
     if Backend.args.infer.pp_size > 1:
-        pg = get_pp_group(0, Backend.args.infer.tp_size)
+        pg = get_pp_pair_group(0, Backend.args.infer.tp_size)
         dist.send(
             tensor=tensor,
             dst=Backend.args.infer.tp_size,

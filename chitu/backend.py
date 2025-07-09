@@ -10,6 +10,7 @@ from logging import getLogger
 from pathlib import Path
 from tqdm import tqdm
 from chitu.quantization import get_quant_from_checkpoint_prefix
+from chitu.distributed.parallel_state import initialize_parallel_groups, get_pp_group
 
 import torch
 import torch.distributed as dist
@@ -30,7 +31,6 @@ from chitu.cache_manager import (
     PagedKVCacheManager,
 )
 from chitu.device_type import is_ascend
-from chitu.tensor_parallel import init_tp
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
 from chitu.utils import (
     compute_layer_dist_in_pipe,
@@ -172,12 +172,9 @@ class Backend:
                 f"Unsupported infer.bind_process_to_cpu={args.infer.bind_process_to_cpu}"
             )
 
-        init_tp(model_parallel_size, pipeline_parallel_size, Backend.use_gloo)
-
-        if args.infer.attn_type == "npu":
-            from chitu.tensor_parallel import init_pp_group_npu
-
-            init_pp_group_npu(model_parallel_size, pipeline_parallel_size)
+        initialize_parallel_groups(
+            tp_size=model_parallel_size, pp_size=pipeline_parallel_size
+        )
 
         Backend.pp_stage = global_rank // model_parallel_size
         Backend.pp_end_stage = (world_size - 1) // model_parallel_size
@@ -279,14 +276,15 @@ class Backend:
 
         # Determine layer distribution for pipeline parallelism
         if pipeline_parallel_size > 1:
+            pipe_stage = get_pp_group().rank_in_group
             num_layers_of_each_rank = compute_layer_dist_in_pipe(
                 args.models.n_layers, pipeline_parallel_size
             )
             first_layer_id_of_each_rank = list(
                 itertools.accumulate([0] + num_layers_of_each_rank)
             )
-            local_begin_layer_id = first_layer_id_of_each_rank[Backend.pp_stage]
-            local_end_layer_id = first_layer_id_of_each_rank[Backend.pp_stage + 1]
+            local_begin_layer_id = first_layer_id_of_each_rank[pipe_stage]
+            local_end_layer_id = first_layer_id_of_each_rank[pipe_stage + 1]
         else:
             local_begin_layer_id = 0
             local_end_layer_id = args.models.n_layers

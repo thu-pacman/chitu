@@ -118,7 +118,6 @@ def warmup_engine(args):
             f"{req.request_id}",
             req,
             req.message,
-            max_seq_len=args.infer.max_seq_len,
         )
         TaskPool.add(task)
 

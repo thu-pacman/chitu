@@ -42,8 +42,8 @@ from chitu.tensor_parallel import (
     LocalLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
-    get_tp_size,
 )
+from chitu.distributed.parallel_state import get_tp_size
 from chitu.utils import parse_dtype, try_import_opt_dep
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
