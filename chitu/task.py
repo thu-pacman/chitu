@@ -426,11 +426,22 @@ class PackedTasksBase:
 
         ret = PackedTasksBase.empty_serialization(device="cpu")
         ret[0] = payload_type.value
-        for i, tid in enumerate(self.task_ids):
-            assert self.task_type != TaskType.Hybrid
-            ret[1 + i] = req_encode(self.task_type, tid)
-            if self.task_type == TaskType.Prefill:
-                ret[1 + PackedTasksBase.max_num_tasks + i] = len(self.tasks[i].tokens)
+
+        assert self.task_type != TaskType.Hybrid
+        task_indices = torch.arange(1, 1 + self.num_tasks, device="cpu")
+        encoded_ids = torch.tensor(
+            [req_encode(self.task_type, tid) for tid in self.task_ids], device="cpu"
+        )
+        ret.scatter_(0, task_indices, encoded_ids)
+
+        if self.task_type == TaskType.Prefill:
+            token_lengths = torch.tensor(
+                [task.req.prompt_len for task in self.tasks],
+                device="cpu",
+            )
+            offset = 1 + PackedTasksBase.max_num_tasks
+            token_indices = torch.arange(offset, offset + self.num_tasks, device="cpu")
+            ret.scatter_(0, token_indices, token_lengths)
 
         slot_handle = get_slot_handle()
         if slot_handle:
