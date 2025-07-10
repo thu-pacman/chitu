@@ -215,6 +215,12 @@ class NormalExecutor(Executor):
         for it, task in enumerate(tasks.tasks):
             task.update_response_sync(token_list[it])
 
+        # test
+        if tasks._test_flag:
+            for it, task in enumerate(tasks.tasks):
+                task.req._test_add_logit(logits[it])
+                task.req._test_add_token(token_list[it])
+
         # Prepare data needed by further postprocessing
         return BatchResult(
             num_tasks=tasks.num_tasks,

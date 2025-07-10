@@ -534,6 +534,9 @@ class PackedTasks(PackedTasksBase):
             device=rank,
         )
 
+        # test only
+        self._test_flag = self.tasks[0].req._test_flag
+
     def pack_tokens(self):
         tokens = []
         for task in self.tasks:
