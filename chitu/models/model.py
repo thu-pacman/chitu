@@ -17,7 +17,8 @@ from chitu.global_vars import get_global_args, get_timers
 from chitu.layers.gate import fused_sigmoid_gate
 from chitu.muxi_utils import has_tbsgemm, grouped_topk, tbsgemm
 from chitu.ops import apply_rotary_pos_emb, rms_norm, topk_softmax
-from chitu.tensor_parallel import get_tp_group, get_tp_size
+
+from chitu.distributed.parallel_state import get_tp_group, get_tp_size
 from chitu.utils import (
     VarLens,
     compute_layer_dist_in_pipe,
@@ -317,7 +318,6 @@ class Transformer(nn.Module):
         self.pp_stage = self.rank // self.model_parallel_size
         self.pp_main_rank = (self.rank // model_parallel_size) * model_parallel_size
         self.pp_end_stage = (self.world_size - 1) // model_parallel_size
-        self.tp_group = get_tp_group()
 
         self.params = params
         self.vocab_size = params.vocab_size
@@ -1067,5 +1067,5 @@ class ParallelMoeBlock(nn.Module):
         if self.shared_experts is not None:
             y += shared_y
         if get_tp_size() > 1:
-            torch.distributed.all_reduce(y, group=get_tp_group())
+            torch.distributed.all_reduce(y, group=get_tp_group().gpu_group)
         return y

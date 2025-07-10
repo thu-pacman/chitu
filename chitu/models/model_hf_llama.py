@@ -31,8 +31,8 @@ from chitu.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
-    get_tp_size,
 )
+from chitu.distributed.parallel_state import get_tp_size
 
 logger = getLogger(__name__)
 

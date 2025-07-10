@@ -69,36 +69,44 @@ class UserRequest:
         logprobs=False,
         top_logprobs=None,
         max_new_tokens=50,
-        temperature=0.8,
         top_p=0.9,
         top_k=50,
-        frequency_penalty=0.1,
+        temperature=0.8,
+        frequency_penalty=0.0,
     ):
+        # input related
         self.message = message
-        self.prompt_len = 0
         self.request_id = request_id
-        self.completed = asyncio.Event()
-        self.logprobs = logprobs
-        self.top_logprobs = 0 if logprobs and not top_logprobs else top_logprobs
-        self.max_new_tokens = max_new_tokens
-        self.async_stream = AsyncDataStream()
-        self.output = ""
-        self._test_flag = False
-        self._test_logits = []
-        self._test_tokens = []
-        self._test_standard_tokens = None
-        self._test_standard_it = 0
-        self.finish_reason = None
-        self.timestamp: str = datetime.now().strftime("%H:%M:%S:%f")
-        self.start_time: int = time.monotonic()
-        self.prefill_end_time: int = 0
-        self.completion_time: int = 0
+        self.prompt_len = 0
         self.params = SampleParams(
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
             frequency_penalty=frequency_penalty,
         )
+
+        # response related
+        self.output = ""
+        self.completed = asyncio.Event()
+        self.async_stream = AsyncDataStream()
+        self.finish_reason = None
+        self.max_new_tokens = max_new_tokens
+
+        # test information related
+        self._test_flag = False
+        self._test_logits = []
+        self._test_tokens = []
+        self._test_standard_tokens = None
+        self._test_standard_it = 0
+        self.logprobs = logprobs
+        self.top_logprobs = 0 if logprobs and not top_logprobs else top_logprobs
+
+        # performance metrics
+        self.timestamp: str = datetime.now().strftime("%H:%M:%S:%f")
+        self.start_time: int = time.monotonic()
+        self.prefill_end_time: int = 0
+        self.completion_time: int = 0
+
         TaskLoad.user_req.add(self)
 
     def add_data(self, data, top_logprobs=None, top_token_idx=None):
@@ -150,21 +158,28 @@ class Task:
         req: UserRequest,
         message,
         priority: int = 1,
-        max_seq_len: int = 1024,
         stop_with_eos: bool = True,
     ):
-        self.task_id = task_id
+        # response related
         self.req = req
         self.response = DeviceList([], dtype=torch.long, device="cuda")
-        self.arrv_ts = time.perf_counter_ns()
-        self.sched_ts = self.arrv_ts
-        self.priority = priority
-        self.sched_score = 0
-        self.stop_with_eos = stop_with_eos
-
-        # response related
         self.num_new_tokens: int = 0
         self.next_token: int = -1  # Only effective when num_new_tokens > 0
+        if isinstance(message, str):
+            self.tokens = Backend.tokenizer.encode(message, bos=True, eos=False)
+        elif hasattr(Backend.tokenizer.model, "apply_chat_template"):
+            self.tokens = Backend.tokenizer.model.apply_chat_template(
+                message, add_generation_prompt=True
+            )
+        else:
+            self.tokens = Backend.formatter.encode_dialog_prompt(message)
+
+        self.req.prompt_len = len(self.tokens)
+
+        # scheduling related
+        self.task_id = task_id
+        self.task_type = TaskType.Prefill  # New Task object is always a prefill task
+        self.stop_with_eos = stop_with_eos
 
         # Waiting is only meaningful in pipeline parallelism. It means either of:
         # 1) waiting logits to return from another node, or
@@ -175,35 +190,29 @@ class Task:
         # The Case 1 waiting task's communication handle
         self.handle = None
 
-        if isinstance(message, str):
-            self.tokens = Backend.tokenizer.encode(message, bos=True, eos=False)
-        elif hasattr(Backend.tokenizer.model, "apply_chat_template"):
-            self.tokens = Backend.tokenizer.model.apply_chat_template(
-                message, add_generation_prompt=True
-            )
-        else:
-            self.tokens = Backend.formatter.encode_dialog_prompt(message)
-        self.task_type = TaskType.Prefill  # New Task object is always a prefill task
-        self.req.prompt_len = len(self.tokens)
-        self.prefix_length = self.req.prompt_len
-        logger.debug(
-            f"Prefill_{req.request_id}: {message}\nseq_len: {self.req.prompt_len}, max_seq_len: {max_seq_len}, max_new_tokens:[{self.req.max_new_tokens}] ==> [{min(self.req.max_new_tokens, max_seq_len - self.req.prompt_len)}]\n"
-        )
+        max_seq_len = get_global_args().infer.max_seq_len
         if self.req.prompt_len >= max_seq_len:
             logger.warning(
                 f"prompt length({self.prefix_length}) cannot be greater than max_seq_len({max_seq_len})"
             )
             raise ValueError("length error")
-        TaskLoad.increase(self.req.prompt_len)
         self.req.max_new_tokens = min(
             self.req.max_new_tokens, max_seq_len - self.req.prompt_len
         )
+
+        # not used
+        self.arrv_ts = time.perf_counter_ns()
+        self.sched_ts = self.arrv_ts
+        self.priority = priority
+        self.sched_score = 0
+        self.prefix_length = self.req.prompt_len
         self.max_output_tokens = 1024  # TODO: replace hardcode by parameter
         self.sched_ddl = (
             time.perf_counter_ns()
             + self.prefix_length * 1000 * 1000
             + self.max_output_tokens * 1000 * 1000
         )
+        TaskLoad.increase(self.req.prompt_len)
 
     def need_remove(self):
         if self.waiting:
@@ -226,7 +235,7 @@ class Task:
         assert token is not None
         self.num_new_tokens += 1
         self.next_token = token
-        self.prefix_length += 1
+        self.prefix_length += 1  # not use
 
     def wait(self, handle):
         self.waiting = True
@@ -417,11 +426,22 @@ class PackedTasksBase:
 
         ret = PackedTasksBase.empty_serialization(device="cpu")
         ret[0] = payload_type.value
-        for i, tid in enumerate(self.task_ids):
-            assert self.task_type != TaskType.Hybrid
-            ret[1 + i] = req_encode(self.task_type, tid)
-            if self.task_type == TaskType.Prefill:
-                ret[1 + PackedTasksBase.max_num_tasks + i] = len(self.tasks[i].tokens)
+
+        assert self.task_type != TaskType.Hybrid
+        task_indices = torch.arange(1, 1 + self.num_tasks, device="cpu")
+        encoded_ids = torch.tensor(
+            [req_encode(self.task_type, tid) for tid in self.task_ids], device="cpu"
+        )
+        ret.scatter_(0, task_indices, encoded_ids)
+
+        if self.task_type == TaskType.Prefill:
+            token_lengths = torch.tensor(
+                [task.req.prompt_len for task in self.tasks],
+                device="cpu",
+            )
+            offset = 1 + PackedTasksBase.max_num_tasks
+            token_indices = torch.arange(offset, offset + self.num_tasks, device="cpu")
+            ret.scatter_(0, token_indices, token_lengths)
 
         slot_handle = get_slot_handle()
         if slot_handle:
@@ -458,6 +478,7 @@ class PackedTasksBase:
 
 class PackedTasks(PackedTasksBase):
     def __init__(self, task_ids: List[str], rank=0):
+        # metadata
         self.task_ids = task_ids
         self.num_tasks = len(task_ids)
         assert self.num_tasks > 0, "No tasks provided"
@@ -474,6 +495,7 @@ class PackedTasks(PackedTasksBase):
         if self.task_type == TaskType.Prefill:
             self.pack_tokens()
 
+        # sample related
         self.is_all_greedy = all(task.req.params.top_k <= 1 for task in self.tasks)
         self.temperatures = torch.tensor(
             [task.req.params.temperature for task in self.tasks]
