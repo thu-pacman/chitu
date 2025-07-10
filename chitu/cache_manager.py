@@ -37,7 +37,7 @@ class PagedKVCacheManager:
           internally uses only K and disables V.
         """
 
-        self.max_blocks_per_req = max_seq_len // block_size + 1
+        self.max_blocks_per_req = (max_seq_len + block_size - 1) // block_size
         self.max_num_blocks = self.max_blocks_per_req * num_hot_req
         self.num_blocks = num_blocks if num_blocks != -1 else num_hot_req
         self.begin_layer_id = begin_layer_id
@@ -244,14 +244,14 @@ class PagedKVCacheManager:
             max_block_num = self.max_blocks_per_req
         else:
             max_block_num = max(len(self.block_table[req_id]) for req_id in req_ids)
-        cpu_block_table_tensor = torch.zeros(
-            len(req_ids), max_block_num, dtype=torch.int32
-        )
-        for idx, req_id in enumerate(req_ids):
-            block_ids = self.block_table[req_id]
-            cpu_block_table_tensor[idx, : len(block_ids)] = torch.tensor(
-                block_ids, dtype=torch.int32
-            )
+
+        all_block_ids = [
+            # pad the block ids to max_block_num
+            self.block_table[req_id]
+            + [0] * (max_block_num - len(self.block_table[req_id]))
+            for req_id in req_ids
+        ]
+        cpu_block_table_tensor = torch.tensor(all_block_ids, dtype=torch.int32)
         self.gpu_block_table.set_shape(cpu_block_table_tensor.shape)
         self.gpu_block_table.get().copy_(cpu_block_table_tensor, non_blocking=True)
 
