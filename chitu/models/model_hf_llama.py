@@ -19,11 +19,11 @@ from chitu.models.model import (
 )
 from chitu.models.registry import ModelType, register_model
 from chitu.muxi_utils import (
-    Blockfp8LinearLayoutContigXContigY,
-    LinearLayoutContigXContigY,
-    LinearLayoutContigXNativeY,
-    LinearLayoutNativeXContigY,
-    preprocess_weights_for_native_layout,
+    Blockfp8LinearMuxiLayoutContigY,
+    LinearMuxiLayoutContigY,
+    LinearMuxiLayoutNativeY,
+    NormalMoeExpertsMuxiLayout,
+    Blockfp8MoeExpertsMuxiLayout,
 )
 from chitu.ops import apply_rotary_pos_emb, silu_and_mul
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
@@ -115,7 +115,7 @@ class AttentionHFLlama(Attention):
         qkv_has_bias = args.qkv_has_bias if hasattr(args, "qkv_has_bias") else True
         o_has_bias = args.o_has_bias if hasattr(args, "o_has_bias") else False
 
-        qkv_proj_linear = o_proj_linear = get_linear_layout_contig_x_contig_y(op_impl)
+        qkv_proj_linear = o_proj_linear = get_linear_layout_contig_y(op_impl)
         if self.merge_qkv:
             self.qkv_proj = ColumnParallelLinear(
                 args.dim,
@@ -332,8 +332,8 @@ class FeedForwardHFLlama(nn.Module):
         # Do a parallel + fused linear projection, while ensuring outputs from gate_proj and up_proj are contiguous in memory.
         # Therefore, the projected shape is [model_parallel_size, 2 * hidden_dim]
 
-        gate_up_proj_linear = get_linear_layout_contig_x_native_y(op_impl)
-        down_proj_linear = get_linear_layout_native_x_contig_y(op_impl)
+        gate_up_proj_linear = get_linear_layout_native_y(op_impl)
+        down_proj_linear = get_linear_layout_contig_y(op_impl)
         if self.merge_gate_up:
             self.gate_up_proj = ColumnParallelLinear(
                 dim,
@@ -504,10 +504,23 @@ class TransformerBlockHFLlama(TransformerBlock):
             checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
         )
         if "Qwen3-30B-A3B" in args.name or "Qwen3-235B-A22B" in args.name:
-            mlp_type = ParallelMoeBlockQwen3
-            self.mlp = mlp_type(
+            base_moe_experts_class = None
+            if op_impl == "muxi_custom_kernel":
+                quant = get_quant_from_checkpoint_prefix(
+                    f"{checkpoint_prefix}.mlp", args.quant_config.rules
+                )
+                if quant is None:
+                    base_moe_experts_class = NormalMoeExpertsMuxiLayout
+                elif quant == "blockfp8":
+                    base_moe_experts_class = Blockfp8MoeExpertsMuxiLayout
+                else:
+                    raise NotImplementedError(
+                        "Unsupported quantization type for muxi_custom_kernel"
+                    )
+            self.mlp = ParallelMoeBlockQwen3(
                 args=args,
                 op_impl=op_impl,
+                base_moe_experts_class=base_moe_experts_class,
                 checkpoint_prefix=f"{checkpoint_prefix}.mlp",
             )
         else:
@@ -951,16 +964,6 @@ class TransformerHFLlama(Transformer):
             state_dict = self._process_state_dict_for_merging_qkv(state_dict)
             state_dict = self._process_state_dict_for_merging_gate_up(state_dict)
 
-            if self.op_impl == "muxi_custom_kernel":
-                rpl_names = self._get_tensor_row_parallel_layer_names()
-                cpl_names = self._get_tensor_column_parallel_layer_names()
-                if "gate" in rpl_names:
-                    # MoE gate from Mixtral. We have not implement muxi kernel for this yet.
-                    rpl_names.remove("gate")
-                state_dict = preprocess_weights_for_native_layout(
-                    state_dict, rpl_names, cpl_names
-                )
-
             if (
                 "Qwen3-30B-A3B" in get_global_args().models.name
                 or "Qwen3-30B-A3B-fp8" in get_global_args().models.name
@@ -1129,7 +1132,7 @@ class RotaryEmbeddingHFLlama(nn.Module):
         self.register_buffer("sin_cached", freqs.sin().to(dtype), persistent=False)
 
 
-def get_linear_layout_contig_x_native_y(op_impl: str):
+def get_linear_layout_native_y(op_impl: str):
     if op_impl == "muxi_custom_kernel":
         args = get_global_args()
         quant_method = (
@@ -1138,10 +1141,10 @@ def get_linear_layout_contig_x_native_y(op_impl: str):
             else args.models.quant_config.type
         )
         if quant_method is None:
-            return LinearLayoutContigXNativeY
+            return LinearMuxiLayoutNativeY
         elif quant_method == "blockfp8":
-            # Blockfp8LinearLayoutContigXNativeY is not implemented. Fall back.
-            return Blockfp8LinearLayoutContigXContigY
+            # Blockfp8LinearMuxiLayoutNativeY is not implemented. Fall back.
+            return Blockfp8LinearMuxiLayoutContigY
         else:
             raise NotImplementedError(
                 f'Quantization method {quant_method} is not implemented for "muxi_custom_kernel"'
@@ -1151,7 +1154,7 @@ def get_linear_layout_contig_x_native_y(op_impl: str):
         return None  # Let QuantizationRegistry pick it
 
 
-def get_linear_layout_native_x_contig_y(op_impl: str):
+def get_linear_layout_contig_y(op_impl: str):
     if op_impl == "muxi_custom_kernel":
         args = get_global_args()
         quant_method = (
@@ -1160,31 +1163,10 @@ def get_linear_layout_native_x_contig_y(op_impl: str):
             else args.models.quant_config.type
         )
         if quant_method is None:
-            return LinearLayoutNativeXContigY
+            return LinearMuxiLayoutContigY
         elif quant_method == "blockfp8":
-            # Blockfp8LinearLayoutNativeXContigY is not implemented. Fall back.
-            return Blockfp8LinearLayoutContigXContigY
-        else:
-            raise NotImplementedError(
-                f'Quantization method {quant_method} is not implemented for "muxi_custom_kernel"'
-            )
-
-    else:
-        return None  # Let QuantizationRegistry pick it
-
-
-def get_linear_layout_contig_x_contig_y(op_impl: str):
-    if op_impl == "muxi_custom_kernel":
-        args = get_global_args()
-        quant_method = (
-            None
-            if not hasattr(args.models, "quant_config")
-            else args.models.quant_config.type
-        )
-        if quant_method is None:
-            return LinearLayoutContigXContigY
-        elif quant_method == "blockfp8":
-            return Blockfp8LinearLayoutContigXContigY
+            # Blockfp8LinearMuxiLayoutContigY is not implemented. Fall back.
+            return Blockfp8LinearMuxiLayoutContigY
         else:
             raise NotImplementedError(
                 f'Quantization method {quant_method} is not implemented for "muxi_custom_kernel"'

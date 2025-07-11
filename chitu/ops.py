@@ -343,15 +343,18 @@ def silu_and_mul_torch(x: torch.Tensor):
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
 
-    elif isinstance(x, muxi_utils.NativeLayoutActivation):
-        d = x.buffer.shape[0] // 2
-        return muxi_utils.NativeLayoutActivation(
-            x.batch_size, x.batch_shape, F.silu(x.buffer[:d]) * x.buffer[d:]
+    elif isinstance(x, muxi_utils.MuxiNativeLayoutActivation):
+        assert x.plain_shape[-1] % 2 == 0
+        assert x.layout_tensor.shape[0] % 2 == 0
+        d = x.layout_tensor.shape[0] // 2
+        return muxi_utils.MuxiNativeLayoutActivation(
+            list(x.plain_shape[:-1]) + [x.plain_shape[-1] // 2],
+            F.silu(x.layout_tensor[:d]) * x.layout_tensor[d:],
         )
 
     else:
         raise ValueError(
-            f"Unsupported input type: {type(x)}. Expected torch.Tensor or muxi_utils.NativeLayoutActivation."
+            f"Unsupported input type: {type(x)}. Expected torch.Tensor or muxi_utils.MuxiNativeLayoutActivation."
         )
 
 
@@ -755,7 +758,7 @@ def silu_and_mul(x, impl="auto"):
     import chitu.muxi_utils as muxi_utils
 
     if impl == "auto":
-        if isinstance(x, muxi_utils.NativeLayoutActivation):
+        if isinstance(x, muxi_utils.MuxiNativeLayoutActivation):
             impl = "torch"
         else:
             impl = "triton"

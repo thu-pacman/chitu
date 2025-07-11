@@ -30,7 +30,7 @@ from chitu.cache_manager import (
     KVCacheManagerSkewAware,
     PagedKVCacheManager,
 )
-from chitu.device_type import is_ascend
+from chitu.device_type import is_ascend, is_muxi
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
 from chitu.utils import (
     compute_layer_dist_in_pipe,
@@ -450,11 +450,23 @@ class Backend:
             param = m._parameters[key]
             if param is not None:
                 if not isinstance(param, CPUParameter):
-                    param.data = param.data.cuda()
+                    if is_muxi():
+                        # Work around a muxi bug that convert from NHWC to NCHW for whatever
+                        # 4-D tensor even its not a convolution weight.
+                        assert param.data.is_contiguous()
+                        param.data = param.data.cuda().contiguous()
+                    else:
+                        param.data = param.data.cuda()
         for key in m._buffers:
             buffer = m._buffers[key]
             if buffer is not None:
-                m._buffers[key] = buffer.cuda()
+                if is_muxi():
+                    # Work around a muxi bug that convert from NHWC to NCHW for whatever
+                    # 4-D tensor even its not a convolution weight.
+                    assert buffer.is_contiguous()
+                    m._buffers[key] = buffer.cuda().contiguous()
+                else:
+                    m._buffers[key] = buffer.cuda()
 
     @staticmethod
     def _build_and_setup_model(args, attn_backend):

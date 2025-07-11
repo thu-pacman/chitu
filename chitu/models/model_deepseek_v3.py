@@ -20,9 +20,10 @@ from chitu.models.model import (
 )
 from chitu.models.registry import ModelType, register_model
 from chitu.muxi_utils import (
-    Blockfp8LinearLayoutContigXContigY,
-    LinearLayoutContigXContigY,
-    preprocess_weights_for_native_layout,
+    Blockfp8LinearMuxiLayoutContigY,
+    LinearMuxiLayoutContigY,
+    NormalMoeExpertsMuxiLayout,
+    Blockfp8MoeExpertsMuxiLayout,
 )
 from chitu.ops import (
     apply_rotary_pos_emb,
@@ -144,7 +145,7 @@ class AttentionDeepSeekV3(Attention):
             ),
             has_bias=False,
             gather_output=False,
-            base_linear_class=get_linear_layout_contig_x_contig_y(
+            base_linear_class=get_linear_layout_contig_y(
                 op_impl,
                 checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",
             ),
@@ -158,7 +159,7 @@ class AttentionDeepSeekV3(Attention):
                 self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
                 has_bias=False,
                 gather_output=False,
-                base_linear_class=get_linear_layout_contig_x_contig_y(
+                base_linear_class=get_linear_layout_contig_y(
                     op_impl,
                     checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
                 ),
@@ -189,7 +190,7 @@ class AttentionDeepSeekV3(Attention):
             self.dim,
             has_bias=False,
             input_is_parallel=True,
-            base_linear_class=get_linear_layout_contig_x_contig_y(
+            base_linear_class=get_linear_layout_contig_y(
                 op_impl,
                 checkpoint_prefix=f"{checkpoint_prefix}.o_proj",
             ),
@@ -505,7 +506,7 @@ class MLPDeepSeekV3(nn.Module):
                 inter_dim * 2,
                 has_bias=False,
                 gather_output=False,
-                base_linear_class=get_linear_layout_contig_x_contig_y(
+                base_linear_class=get_linear_layout_contig_y(
                     op_impl,
                     quant_kwargs={
                         "blockfp4": {
@@ -522,7 +523,7 @@ class MLPDeepSeekV3(nn.Module):
                 inter_dim,
                 has_bias=False,
                 gather_output=False,
-                base_linear_class=get_linear_layout_contig_x_contig_y(
+                base_linear_class=get_linear_layout_contig_y(
                     op_impl,
                     checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
                 ),
@@ -533,7 +534,7 @@ class MLPDeepSeekV3(nn.Module):
                 inter_dim,
                 has_bias=False,
                 gather_output=False,
-                base_linear_class=get_linear_layout_contig_x_contig_y(
+                base_linear_class=get_linear_layout_contig_y(
                     op_impl,
                     checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
                 ),
@@ -545,7 +546,7 @@ class MLPDeepSeekV3(nn.Module):
             has_bias=False,
             input_is_parallel=True,
             reduce_output=(role == "standalone"),
-            base_linear_class=get_linear_layout_contig_x_contig_y(
+            base_linear_class=get_linear_layout_contig_y(
                 op_impl,
                 checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
             ),
@@ -709,6 +710,19 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             mla_absorb=mla_absorb,
             checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
         )
+        base_moe_experts_class = None
+        if op_impl == "muxi_custom_kernel":
+            quant = get_quant_from_checkpoint_prefix(
+                f"{checkpoint_prefix}.mlp", args.quant_config.rules
+            )
+            if quant is None:
+                base_moe_experts_class = NormalMoeExpertsMuxiLayout
+            elif quant == "blockfp8":
+                base_moe_experts_class = Blockfp8MoeExpertsMuxiLayout
+            else:
+                raise NotImplementedError(
+                    "Unsupported quantization type for muxi_custom_kernel"
+                )
         self.mlp = (
             MLPDeepSeekV3(
                 args,
@@ -721,6 +735,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                 ParallelMoeBlockDeepSeekV3(
                     args,
                     op_impl=op_impl,
+                    base_moe_experts_class=base_moe_experts_class,
                     checkpoint_prefix=f"{checkpoint_prefix}.mlp",
                 )
             )
@@ -1353,18 +1368,6 @@ class TransformerDeepSeekV3(Transformer):
                 get_global_args().models.n_dense_layers,
             )
 
-        if self.op_impl == "muxi_custom_kernel":
-            rpl_names = self._get_tensor_row_parallel_layer_names()
-            cpl_names = self._get_tensor_column_parallel_layer_names()
-            cpl_names = [
-                name for name in cpl_names if name not in {"embed_tokens", "lm_head"}
-            ]
-            if self.mla_absorb == "absorb-without-precomp":
-                cpl_names.remove("kv_b_proj")
-            state_dict = preprocess_weights_for_native_layout(
-                state_dict, rpl_names, cpl_names
-            )
-
         super().load_state_dict(
             state_dict, skip_preprocess=skip_preprocess, *args, **kwargs
         )
@@ -1547,7 +1550,7 @@ def compute_softmax_scale_deepseek_v3(args):
     return (qk_head_dim**-0.5) * mscale * mscale
 
 
-def get_linear_layout_contig_x_contig_y(
+def get_linear_layout_contig_y(
     op_impl: str,
     checkpoint_prefix: str,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
@@ -1563,9 +1566,9 @@ def get_linear_layout_contig_x_contig_y(
             else args.models.quant_config.type
         )
         if quant_method is None:
-            return LinearLayoutContigXContigY
+            return LinearMuxiLayoutContigY
         elif quant_method == "blockfp8":
-            return Blockfp8LinearLayoutContigXContigY
+            return Blockfp8LinearMuxiLayoutContigY
         else:
             raise NotImplementedError(
                 f'Quantization method {quant_method} is not implemented for "muxi_custom_kernel"'

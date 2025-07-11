@@ -969,7 +969,14 @@ class MoeGate(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
-        if self.op_impl == "muxi_custom_kernel":
+        if (
+            self.op_impl == "muxi_custom_kernel"
+            and self.n_groups == 8
+            and self.topk_groups == 4
+            and self.topk == 8
+            and self.weight.shape[0] == 256
+            and self.score_func in ["sigmoid", "softmax"]
+        ):
             scores = F.linear(x, self.weight)
             weights, indices = grouped_topk(
                 x,

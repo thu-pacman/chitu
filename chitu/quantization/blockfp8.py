@@ -313,9 +313,7 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         shape = x.size()
         x = x.view(-1, self.dim)
 
-        if self.op_impl == "muxi_custom_kernel":
-            y = self._compute_muxi_fused_experts(x, weights, indices)
-        elif has_triton:
+        if has_triton:
             assert self.merge_gate_up
             if (
                 parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
@@ -508,31 +506,6 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                 ):
                     y += down_proj_outs[i]
         return y.view(shape)
-
-    def _compute_muxi_fused_experts(self, x, weights, indices):
-        from chitu.muxi_utils import muxi_fused_experts
-
-        if self.fuse_shared_experts:
-            raise NotImplementedError(
-                "Fused shared experts is not supported for muxi_layout_kernels"
-            )
-        if not self.merge_gate_up:
-            raise NotImplementedError(
-                "muxi_layout_kernels for fused MoE requires merge_gate_up=True"
-            )
-
-        return muxi_fused_experts(
-            hidden_states=x,
-            w1=self.gate_up_proj_weight,
-            w2=self.down_proj_weight,
-            topk_weights=weights,
-            topk_ids=indices,
-            inplace=True,
-            w1_scale=self.gate_up_proj_scale,
-            w2_scale=self.down_proj_scale,
-            block_shape=[128, 128],
-            soft_fp8=True,
-        )
 
 
 @QuantizationRegistry.register_absorb_gemm("blockfp8")
