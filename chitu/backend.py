@@ -421,12 +421,7 @@ class Backend:
         if args.infer.attn_type == "auto":
             if is_ascend():
                 return NpuAttnBackend()
-            elif (
-                "DeepSeek-R1" in args.models.name
-                or "DeepSeek-V3" in args.models.name
-                or "Qwen3-30B-A3B" in args.models.name
-                or "Qwen3-235B-A22B" in args.models.name
-            ) and "Distill" not in args.models.name:
+            elif "deepseek-v3" in args.models.type:
                 return FlashMLABackend()
             else:
                 return FlashAttnBackend()

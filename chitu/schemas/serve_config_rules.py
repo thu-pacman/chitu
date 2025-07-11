@@ -58,6 +58,11 @@ class ServeConfigRules(Callback):
                 self._exit_with_error(
                     f"model {model_name} is not compatible with flash_infer"
                 )
+        elif attn_type == "flash_mla":
+            if "deepseek-v3" not in model_type:
+                self._exit_with_error(
+                    f"model {model_name} is not compatible with flash_mla"
+                )
 
         op_impl = config.infer.op_impl
         if op_impl not in {"torch", "muxi_custom_kernel"}:
