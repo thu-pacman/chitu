@@ -1,10 +1,11 @@
 from logging import getLogger
 
 import torch
-from typing import Dict, List
+from typing import Dict, List, Optional
 from collections import deque
 from chitu.global_vars import get_slot_handle, get_timers, get_global_args
 from chitu.static_tensor import StaticTensor
+from chitu.utils import VarLens
 
 logger = getLogger(__name__)
 _BLOCK_SIZE = 512  # _BLOCK_SIZE must be a multiple of 256 for FlashAttention
@@ -14,8 +15,8 @@ _MAX_SEQ_LEN = 2048
 class PagedKVCacheManager:
     def __init__(
         self,
-        begin_layer_id,
-        end_layer_id,
+        begin_layer_id: int,
+        end_layer_id: int,
         num_hot_req=16,
         block_size=_BLOCK_SIZE,
         num_blocks: int = -1,
@@ -76,6 +77,8 @@ class PagedKVCacheManager:
             max_nelem=self.max_num_blocks, dtype=torch.int32, device=self.device
         )
         self.free_blocks = deque(range(self.num_blocks))
+        self.paged_k_cache: Optional[torch.Tensor]
+        self.paged_v_cache: Optional[torch.Tensor]
         if self.k_shape_per_sample is not None:
             self.paged_k_cache = torch.zeros(
                 (self.num_layers, self.num_blocks, block_size)
@@ -101,8 +104,19 @@ class PagedKVCacheManager:
         return self.max_num_blocks
 
     # Init block table and kv cache with kv generated during prefill
-    def finalize_cache_bylayer_prefill(self, xk, xv, req_ids, varlen, layer_id):
+    def finalize_cache_bylayer_prefill(
+        self,
+        xk: torch.Tensor,
+        xv: torch.Tensor,
+        req_ids: List[str],
+        varlens: VarLens,
+        layer_id: int,
+    ):
         self.timers("cache_finalize_cache_all_prefill").start()
+
+        layer_idx = layer_id - self.begin_layer_id
+        has_k_cache = self.paged_k_cache is not None
+        has_v_cache = self.paged_v_cache is not None
 
         # reallocate cache blocks according to available memory
         if not self.reallocate_cache:
@@ -110,7 +124,7 @@ class PagedKVCacheManager:
             if infer_args.num_blocks != -1 and infer_args.num_blocks != self.num_blocks:
                 self.num_blocks = min(infer_args.num_blocks, self.max_num_blocks)
                 self.free_blocks = deque(range(self.num_blocks))
-                if self.paged_k_cache is not None:
+                if has_k_cache:
                     del self.paged_k_cache
                     torch.cuda.empty_cache()
                     self.paged_k_cache = torch.zeros(
@@ -118,7 +132,7 @@ class PagedKVCacheManager:
                         + self.k_shape_per_sample,
                         device=self.device,
                     )
-                if self.paged_v_cache is not None:
+                if has_v_cache:
                     del self.paged_v_cache
                     torch.cuda.empty_cache()
                     self.paged_v_cache = torch.zeros(
@@ -137,48 +151,63 @@ class PagedKVCacheManager:
             xk = xk.view(xk.shape[0], -1).contiguous() if xk is not None else None
             xv = xv.view(xv.shape[0], -1).contiguous() if xv is not None else None
 
-        for idx, req_id in enumerate(req_ids):
-            num_blocks_prepared = (
-                varlen.cpu_lens[idx] + self.block_size - 1
-            ) // self.block_size
+        if layer_idx == 0:
+            block_idxs = []
+            indices_in_block = []
+            for req_id, seq_len in zip(req_ids, varlens.cpu_lens):
+                # 设置其他函数会用到的变量
+                self.seq_lens[req_id] = seq_len
 
-            if layer_id == self.begin_layer_id:
-                self.seq_lens[req_id] = varlen.cpu_lens[idx]
-                block_ids = []
-                for chunck_id in range(num_blocks_prepared):
-                    block_idx = self.get_free_block()
-                    block_ids.append(block_idx)
+                # 为请求分配blocks
+                num_blocks_prepared = (seq_len + self.block_size - 1) // self.block_size
+                block_ids = [self.get_free_block() for _ in range(num_blocks_prepared)]
                 self.block_table[req_id] = block_ids
-            else:
-                block_ids = self.block_table[req_id]
 
-            start_pos = varlen.cpu_prefix_lens[idx]
-            end_pos = varlen.cpu_prefix_lens[idx + 1]
-            for chunck_id in range(num_blocks_prepared):
-                block_idx = block_ids[chunck_id]
-                if chunck_id != num_blocks_prepared - 1:
-                    if self.paged_k_cache is not None:
-                        self.paged_k_cache[layer_id - self.begin_layer_id][
-                            block_idx
-                        ] = xk[start_pos : (start_pos + self.block_size)].clone()
-                    if self.paged_v_cache is not None:
-                        self.paged_v_cache[layer_id - self.begin_layer_id][
-                            block_idx
-                        ] = xv[start_pos : (start_pos + self.block_size)].clone()
-                    start_pos += self.block_size
-                else:
-                    tmp_len = end_pos - start_pos
-                    if self.paged_k_cache is not None:
-                        self.paged_k_cache[layer_id - self.begin_layer_id][block_idx][
-                            :tmp_len
-                        ] = xk[start_pos:end_pos].clone()
-                    if self.paged_v_cache is not None:
-                        self.paged_v_cache[layer_id - self.begin_layer_id][block_idx][
-                            :tmp_len
-                        ] = xv[start_pos:end_pos].clone()
+                # 计算每个元素对应的block id 和 block内的索引
+                num_full_block, remainder = divmod(seq_len, self.block_size)
+                if num_full_block > 0:
+                    block_idxs.extend(
+                        [
+                            block_id
+                            for block_id in block_ids[:num_full_block]
+                            for _ in range(self.block_size)
+                        ]
+                    )
+                    indices_in_block.extend(
+                        [
+                            i
+                            for i in range(self.block_size)
+                            for _ in range(num_full_block)
+                        ]
+                    )
+                if remainder > 0:
+                    block_idxs.extend([block_ids[num_full_block]] * remainder)
+                    indices_in_block.extend([i for i in range(remainder)])
+
+            # 在不同layer间共享
+            self.block_idxs = torch.tensor(
+                block_idxs,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.indices_in_block = torch.tensor(
+                indices_in_block,
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+        if has_k_cache:
+            self.paged_k_cache[layer_idx].index_put_(
+                (self.block_idxs, self.indices_in_block), xk
+            )
+        if has_v_cache:
+            self.paged_v_cache[layer_idx].index_put_(
+                (self.block_idxs, self.indices_in_block), xv
+            )
+
         self.timers("cache_finalize_cache_all_prefill").stop()
 
-    def finalize_cache_all_prefill(self, req_ids, varlen):
+    def finalize_cache_all_prefill(self, req_ids, varlens):
         self.curr_varlens = None
         self.curr_req_ids = None
 
