@@ -719,6 +719,9 @@ def apply_rotary_pos_emb(
     """
 
     if impl == "auto":
+        args = get_global_args()
+        # NOTE: npu_rotary_mul has accuracy issues on npu platforms, fallback to torch implementation
+        is_deepseek = args.models.type == "deepseek-v3"
         if (
             q_out is None
             and k_out is None
@@ -731,7 +734,10 @@ def apply_rotary_pos_emb(
         elif rotary_type == "llama" and has_chitu_backend:
             impl = "cuda"
         elif has_torch_npu:
-            impl = "torch_npu"
+            if is_deepseek:
+                impl = "torch"
+            else:
+                impl = "torch_npu"
         else:
             impl = "torch"
 

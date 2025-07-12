@@ -281,6 +281,7 @@ class AttentionDeepSeekV3(Attention):
             self.cache.finalize_cache_bylayer_prefill(
                 k, v, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
             )
+
             x = self.attn_backend.attn_varlen_func(
                 q,
                 k,
@@ -309,6 +310,7 @@ class AttentionDeepSeekV3(Attention):
                 self.layer_id,
             )
             q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
+
             x = self.attn_backend.attn_varlen_func(
                 q_nope_pe.view(-1, q_nope_pe.shape[-2], q_nope_pe.shape[-1]),
                 kv.view(-1, 1, kv.shape[-1]),
