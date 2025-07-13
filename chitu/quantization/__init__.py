@@ -1,7 +1,8 @@
-from chitu.quantization.registry import (
+from chitu.quantization.registry import QuantizationRegistry
+from chitu.quantization.base import (
     QuantizedLinearBase,
     QuantizedMoeExpertsBase,
-    QuantizationRegistry,
+    QuantizedAbsorbGemmBase,
 )
 from chitu.quantization.utils import get_quant_from_checkpoint_prefix
 from chitu.quantization.normal import NormalLinear, NormalMoeExperts

@@ -1,7 +1,8 @@
 import torch
 import ctypes
 
-from chitu.quantization.registry import QuantizationRegistry, QuantizedMoeExpertsBase
+from chitu.quantization.registry import QuantizationRegistry
+from chitu.quantization.base import QuantizedMoeExpertsBase
 from chitu.global_vars import get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.hybrid_device import CPUParameter

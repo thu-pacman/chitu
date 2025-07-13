@@ -1,6 +1,7 @@
 import torch
 
-from chitu.quantization.registry import QuantizedLinearBase, QuantizationRegistry
+from chitu.quantization.registry import QuantizationRegistry
+from chitu.quantization.base import QuantizedLinearBase
 from chitu.ops import w4a8_gemm_per_token_per_channel_asymm
 
 

@@ -1,15 +1,15 @@
 from typing import Optional
+from typing_extensions import override
 
 import torch
 
-from chitu.quantization.registry import (
+from chitu.quantization.base import (
     QuantizedLinearBase,
     QuantizedMoeExpertsBase,
     QuantizedAbsorbGemmBase,
-    QuantizationRegistry,
 )
+from chitu.quantization.registry import QuantizationRegistry
 from chitu.global_vars import get_global_args
-from chitu.ops import silu_and_mul
 from chitu.utils import try_import_opt_dep
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
@@ -164,9 +164,7 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
 
         if has_torch_npu:  # or use op_impl ?
             y = self._compute_npu_fused_experts(x, weights, indices)
-        elif has_triton:
-            assert self.merge_gate_up
-
+        elif has_triton and self.merge_gate_up:
             if not self.fuse_shared_experts:
 
                 y = fused_experts(
@@ -216,89 +214,25 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
                 )
 
         else:
-            y = torch.zeros_like(x)
-            counts = torch.bincount(
-                indices.flatten(), minlength=self.n_routed_experts
-            ).tolist()
+            y = self.forward_iterative(x, weights, indices)
 
-            xs = []
-            for i in range(self.experts_start_idx, self.experts_end_idx):
-                this_x = None
-                if counts[i]:
-                    idx, top = torch.where(indices == i)
-                    this_x = x[idx]
-                xs.append(this_x)
-            if self.fuse_shared_experts:
-                xs += [x] * self.n_fused_shared_experts
-
-            assert len(xs) == self.group_size
-            if self.merge_gate_up:
-                gate_up_proj_outs = []
-                for i in range(self.group_size):
-                    out = None
-                    if xs[i] is not None:
-                        out = torch.nn.functional.linear(
-                            xs[i], self.gate_up_proj_weight[i], bias=None
-                        )
-                    gate_up_proj_outs.append(out)
-                act = [
-                    (
-                        silu_and_mul(gate_up_proj_out)
-                        if gate_up_proj_out is not None
-                        else None
-                    )
-                    for gate_up_proj_out in gate_up_proj_outs
-                ]
-            else:
-                gate_proj_outs = []
-                up_proj_outs = []
-                for i in range(self.group_size):
-                    gate_proj_out = None
-                    up_proj_out = None
-                    if xs[i] is not None:
-                        gate_proj_out = torch.nn.functional.linear(
-                            xs[i], self.gate_proj_weight[i], bias=None
-                        )
-                        up_proj_out = torch.nn.functional.linear(
-                            xs[i], self.up_proj_weight[i], bias=None
-                        )
-                    gate_proj_outs.append(gate_proj_out)
-                    up_proj_outs.append(up_proj_out)
-
-                act = [
-                    (
-                        torch.nn.functional.silu(gate_proj_out) * up_proj_out
-                        if gate_proj_out is not None
-                        else None
-                    )
-                    for gate_proj_out, up_proj_out in zip(gate_proj_outs, up_proj_outs)
-                ]
-
-            down_proj_outs = []
-            for i in range(self.group_size):
-                down_proj_out = None
-                if act[i] is not None:
-                    down_proj_out = torch.nn.functional.linear(
-                        act[i], self.down_proj_weight[i], bias=None
-                    )
-                down_proj_outs.append(down_proj_out)
-
-            for i in range(self.experts_start_idx, self.experts_end_idx):
-                if counts[i]:
-                    idx, top = torch.where(indices == i)
-                    y[idx] += (
-                        down_proj_outs[i - self.experts_start_idx]
-                        * weights[idx, top, None]
-                    )
-            if self.fuse_shared_experts:
-                for i in range(
-                    self.experts_end_idx - self.experts_start_idx,
-                    self.experts_end_idx
-                    - self.experts_start_idx
-                    + self.n_fused_shared_experts,
-                ):
-                    y += down_proj_outs[i]
         return y.view(shape)
+
+    @override
+    def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(x, self.gate_up_proj_weight[i], bias=None)
+
+    @override
+    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(x, self.gate_proj_weight[i], bias=None)
+
+    @override
+    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(x, self.up_proj_weight[i], bias=None)
+
+    @override
+    def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(x, self.down_proj_weight[i], bias=None)
 
     def _compute_npu_fused_experts(self, x, weights, indices):
         return fused_experts_npu(
