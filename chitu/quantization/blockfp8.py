@@ -172,7 +172,6 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         n_activated_experts: int,
         moe_world_size: int,
         moe_rank: int,
-        op_impl: str,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
@@ -187,7 +186,6 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         """
         super().__init__()
 
-        self.op_impl = op_impl
         self.dim = dim
         self.fuse_shared_experts = fuse_shared_experts
         assert (

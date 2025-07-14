@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from chitu.utils import try_import_opt_dep
 from chitu.global_vars import get_global_args
 from chitu.device_list import DeviceList
+from chitu.native_layout import Packed4BitWeightAlongK
 
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
 torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
@@ -555,7 +556,7 @@ def soft_fp8_gemm_deepseek_v3(
 def soft_fp4_raise_to_fp8_gemm_deepseek_v3(
     a: torch.Tensor,
     a_s: torch.Tensor,
-    b: torch.Tensor,
+    b: Packed4BitWeightAlongK,
     b_s: torch.Tensor,
     b_s_2: torch.Tensor,
     act_block_size: int,
@@ -567,7 +568,7 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3(
     Args:
         a (torch.Tensor): The first input matrix, must be contiguous.
         a_s (torch.Tensor): The scaling factor of first input matrix, must be contiguous.
-        b (torch.Tensor): The second input matrix, must be contiguous.
+        b (Packed4BitWeightAlongK): The second input matrix, must be in Packed4BitWeightAlongK layout.
         b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
         b_s_2 (torch.Tensor): The scaling factor for b_s, must be contiguous.
         act_block_size (int): The block size for activation quantization.
@@ -589,7 +590,7 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3(
 
 def soft_fp4_raise_to_bf16_gemm_deepseek_v3(
     a: torch.Tensor,
-    b: torch.Tensor,
+    b: Packed4BitWeightAlongK,
     b_s: torch.Tensor,
     b_s_2: torch.Tensor,
     impl: str = "auto",
@@ -599,7 +600,7 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3(
 
     Args:
         a (torch.Tensor): The first input matrix, must be contiguous.
-        b (torch.Tensor): The second input matrix, must be contiguous.
+        b (Packed4BitWeightAlongK): The second input matrix, must be in Packed4BitWeightAlongK layout.
         b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
         b_s_2 (torch.Tensor): The scaling factor for b_s, must be contiguous.
 

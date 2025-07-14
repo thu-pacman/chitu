@@ -84,7 +84,6 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
         n_activated_experts: int,
         moe_world_size: int,
         moe_rank: int,
-        op_impl: str,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
@@ -95,7 +94,6 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
     ):
         super().__init__()
 
-        self.op_impl = op_impl
         self.dim = dim
         self.fuse_shared_experts = fuse_shared_experts
         assert (
@@ -162,8 +160,15 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
         shape = x.size()
         x = x.view(-1, self.dim)
 
-        if has_torch_npu:  # or use op_impl ?
-            y = self._compute_npu_fused_experts(x, weights, indices)
+        if has_torch_npu and self.merge_gate_up:
+            y = fused_experts_npu(
+                hidden_states=x,
+                w1=self.gate_up_proj_weight,
+                w2=self.down_proj_weight,
+                topk_weights=weights,
+                topk_ids=indices,
+            )
+
         elif has_triton and self.merge_gate_up:
             if not self.fuse_shared_experts:
 
@@ -233,15 +238,6 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
     @override
     def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.linear(x, self.down_proj_weight[i], bias=None)
-
-    def _compute_npu_fused_experts(self, x, weights, indices):
-        return fused_experts_npu(
-            hidden_states=x,
-            w1=self.gate_up_proj_weight,
-            w2=self.down_proj_weight,
-            topk_weights=weights,
-            topk_ids=indices,
-        )
 
 
 @QuantizationRegistry.register_absorb_gemm(None)

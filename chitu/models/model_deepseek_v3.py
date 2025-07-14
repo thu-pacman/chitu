@@ -616,7 +616,6 @@ class GateDeepSeekV3(MoeGate):
 
 def MoeExpertsDeepSeekV3(
     args,
-    op_impl: str,
     checkpoint_prefix: str,
     base_moe_experts_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
@@ -642,7 +641,6 @@ def MoeExpertsDeepSeekV3(
         n_activated_experts=args.n_activated_experts,
         moe_world_size=1,
         moe_rank=0,
-        op_impl=op_impl,
         fuse_shared_experts=get_global_args().infer.fuse_shared_experts,
         checkpoint_prefix=checkpoint_prefix,
         merge_gate_up=merge_gate_up,
@@ -679,7 +677,6 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
             gate=GateDeepSeekV3(args, op_impl=op_impl),
             experts=MoeExpertsDeepSeekV3(
                 args,
-                op_impl=op_impl,
                 checkpoint_prefix=checkpoint_prefix,
                 base_moe_experts_class=base_moe_experts_class,
                 quant_kwargs=quant_kwargs,

@@ -3,15 +3,13 @@ import torch
 import pytest
 import triton
 
-from chitu.utils import try_import_opt_dep
+from chitu.native_layout import Packed4BitWeightAlongK, Packed4BitWeightAlongK
 from chitu.ops import (
     soft_fp4_raise_to_fp8_gemm_deepseek_v3,
     soft_fp4_raise_to_bf16_gemm_deepseek_v3,
     act_quant_deepseek_v3,
 )
 from chitu.device_type import has_native_fp8, is_hopper
-
-chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
 
 
 FP4_E2M1_LEVELS = torch.tensor(
@@ -101,9 +99,6 @@ def do_dequant_a(a_fp8, a_s, dim, act_block_size):
     reason="This test requires the GPU to have native FP8 support",
 )
 @pytest.mark.skipif(
-    not has_chitu_backend, reason="This test requires the chitu_backend enabled"
-)
-@pytest.mark.skipif(
     packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"),
     reason="This test requires Triton version >= 3.2.0",
 )
@@ -120,7 +115,10 @@ def test_fp4_raise_to_bf16_gemm_is_close_to_dequanted_gemm():
     dequant_b = do_dequant_b(b, b_s, b_s_2, dim, block_size).to(default_dtype)
 
     std_y = torch.nn.functional.linear(a, dequant_b)
-    preprocessed_b = chitu_backend.weight_layout_change(b)
+    preprocessed_b = Packed4BitWeightAlongK.convert_from(
+        Packed4BitWeightAlongK((dim, dim), b),
+        k_stride=64,
+    )
     y = soft_fp4_raise_to_bf16_gemm_deepseek_v3(a, preprocessed_b, b_s, b_s_2)
 
     assert torch.allclose(std_y, y, atol=0.1, rtol=0.1)
@@ -164,7 +162,9 @@ def benchmark_fp4_raise_to_bf16_gemm(bs, dim, default_dtype, block_size, provide
         dequant_b = do_dequant_b(b, b_s, b_s_2, dim, block_size).to(default_dtype)
         ms = triton.testing.do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
     elif provider == "triton_fp4_raise_to_bf16":
-        preprocessed_b = chitu_backend.weight_layout_change(b)
+        preprocessed_b = Packed4BitWeightAlongK.convert_from(
+            Packed4BitWeightAlongK((dim, dim), b), k_stride=64
+        )
         ms = triton.testing.do_bench(
             lambda: soft_fp4_raise_to_bf16_gemm_deepseek_v3(
                 a, preprocessed_b, b_s, b_s_2
@@ -182,9 +182,6 @@ def benchmark_fp4_raise_to_bf16_gemm(bs, dim, default_dtype, block_size, provide
 @pytest.mark.skipif(
     not is_hopper(),
     reason="This test requires the GPU to be Hopper or newer",
-)
-@pytest.mark.skipif(
-    not has_chitu_backend, reason="This test requires the chitu_backend enabled"
 )
 @pytest.mark.skipif(
     packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"),
@@ -210,7 +207,9 @@ def test_fp4_raise_to_fp8_gemm_is_close_to_dequanted_gemm():
     dequant_b = do_dequant_b(b, b_s, b_s_2, dim, block_size).to(default_dtype)
 
     std_y = torch.nn.functional.linear(dequant_a, dequant_b)
-    preprocessed_b = chitu_backend.weight_layout_change(b)
+    preprocessed_b = Packed4BitWeightAlongK.convert_from(
+        Packed4BitWeightAlongK((dim, dim), b), k_stride=64
+    )
     y = soft_fp4_raise_to_fp8_gemm_deepseek_v3(
         a_fp8, a_s, preprocessed_b, b_s, b_s_2, act_block_size=act_block_size
     )
@@ -260,7 +259,9 @@ def benchmark_fp4_raise_to_fp8_gemm(
         ms = triton.testing.do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
     elif provider == "triton_fp4_raise_to_fp8":
         a_fp8, a_s = act_quant_deepseek_v3(a, act_block_size)
-        preprocessed_b = chitu_backend.weight_layout_change(b)
+        preprocessed_b = Packed4BitWeightAlongK.convert_from(
+            Packed4BitWeightAlongK((dim, dim), b), k_stride=64
+        )
         ms = triton.testing.do_bench(
             lambda: soft_fp4_raise_to_fp8_gemm_deepseek_v3(
                 a_fp8, a_s, preprocessed_b, b_s, b_s_2, act_block_size=act_block_size

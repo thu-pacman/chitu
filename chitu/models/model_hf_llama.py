@@ -427,7 +427,6 @@ class Qwen3MoeGate(MoeGate):
 
 def Qwen3MoeExperts(
     args,
-    op_impl: str,
     checkpoint_prefix: str,
     base_moe_experts_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
@@ -452,7 +451,6 @@ def Qwen3MoeExperts(
         n_activated_experts=0,
         moe_world_size=1,
         moe_rank=0,
-        op_impl=op_impl,
         fuse_shared_experts=False,
         checkpoint_prefix=f"{checkpoint_prefix}.moe",
         merge_gate_up=merge_gate_up,
@@ -472,7 +470,6 @@ class ParallelMoeBlockQwen3(ParallelMoeBlock):
             gate=Qwen3MoeGate(args, op_impl),
             experts=Qwen3MoeExperts(
                 args,
-                op_impl,
                 checkpoint_prefix,
                 base_moe_experts_class,
                 quant_kwargs,

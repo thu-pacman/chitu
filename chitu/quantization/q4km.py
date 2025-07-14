@@ -36,7 +36,6 @@ class MoeExpertsDeepSeekV3CPU(QuantizedMoeExpertsBase):
         n_activated_experts: int,
         moe_world_size: int,
         moe_rank: int,
-        op_impl: str,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
