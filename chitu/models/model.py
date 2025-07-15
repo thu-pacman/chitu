@@ -740,12 +740,8 @@ class Transformer(nn.Module):
         return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
 
     @torch.inference_mode()
-    def prefill_single_device(self, tokens, varlens=None):
-        if isinstance(
-            tokens, list
-        ):  # else use tensor variable passed by TensorExecutor
-            varlens = VarLens(tokens, self.device)
-            tokens = torch.from_numpy(np.concatenate(tokens)).to(self.device)
+    def prefill_single_device(self, tokens):
+        varlens = self.cache.curr_varlens
         freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_prefill(varlens)
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):
@@ -806,12 +802,10 @@ class Transformer(nn.Module):
         return h
 
     @torch.inference_mode()
-    def prefill(self, tokens, varlens=None):
+    def prefill(self, tokens):
         self.attn_backend.prepare_metadata_for_prefill(self.cache.curr_varlens)
         if self.pipeline_exec:
             return self.prefill_pipeline(tokens)
-        elif self.tensor_exec:
-            return self.prefill_single_device(tokens, varlens)
         else:
             return self.prefill_single_device(tokens)
 

@@ -420,12 +420,23 @@ class PackedTasksBase:
         return payload_type, cls(num_tasks, task_ids, req_ids, task_type, tokens)
 
     def serialize(self, device, payload_type=SerializedPackedTasksPayloadType.Normal):
+
+        if payload_type is None:
+            payload_type = SerializedPackedTasksPayloadType.Normal
+
         assert (
             PackedTasksBase.configured
         ), "PackedTasksBase must be configured before serialization"
 
         ret = PackedTasksBase.empty_serialization(device="cpu")
         ret[0] = payload_type.value
+
+        # special payload
+        if (
+            payload_type == SerializedPackedTasksPayloadType.TerminateBackend
+            or payload_type == SerializedPackedTasksPayloadType.Heartbeat
+        ):
+            return ret.to(device)
 
         assert self.task_type != TaskType.Hybrid
         task_indices = torch.arange(1, 1 + self.num_tasks, device="cpu")
@@ -436,7 +447,7 @@ class PackedTasksBase:
 
         if self.task_type == TaskType.Prefill:
             token_lengths = torch.tensor(
-                [task.req.prompt_len for task in self.tasks],
+                [len(tokens) for tokens in self.tokens],
                 device="cpu",
             )
             offset = 1 + PackedTasksBase.max_num_tasks

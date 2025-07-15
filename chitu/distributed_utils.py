@@ -41,6 +41,6 @@ def _broadcast_to_tp_group(tensor, src_rank):
     if not Backend.use_gloo:
         dist.broadcast(tensor=tensor, src=src_rank)
     elif Backend.args.infer.pp_size == 1:
-        dist.broadcast(tensor=tensor, src=src_rank, group=Backend.group_gloo)
+        dist.broadcast(tensor=tensor, src=src_rank, group=get_cpu_tp_group())
     else:
         dist.broadcast(tensor=tensor, src=src_rank, group=get_cpu_tp_group())

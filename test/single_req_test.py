@@ -111,14 +111,14 @@ def run_pipe_or_tensor_parallelism(args, timers):
                 break  # Rank 0 can temperarily leave to do other things
         timers("overall").stop()
         t_end = time.time()
-        logger.info(f"Tokens generate : {tokens}")
-        logger.info(f"Time cost {t_end - t_start}")
 
         if rank == 0:
+            logger.info(f"Tokens generate : {tokens}")
+            logger.info(f"Time cost {t_end - t_start}")
             for req in reqs:
                 logger.info(f"Response in rank {rank}: {req.output}")
 
-        timers.log()
+            timers.log()
 
     chitu_terminate()
 

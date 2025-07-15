@@ -70,10 +70,7 @@ def get_tp_size() -> int:
 def get_pp_pair_group(
     rank0: int, rank1: int
 ) -> Optional[torch.distributed.ProcessGroup]:
-    if len(_PP_PAIR_GROUP_DICT) == 0:
-        return None
-    else:
-        return _PP_PAIR_GROUP_DICT[(rank0, rank1)]
+    return _PP_PAIR_GROUP_DICT.get((rank0, rank1), None)
 
 
 def get_cpu_tp_group() -> Optional[torch.distributed.ProcessGroup]:
