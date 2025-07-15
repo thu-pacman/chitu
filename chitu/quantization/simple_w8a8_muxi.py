@@ -1,7 +1,8 @@
 from typing import Tuple
 import torch
 
-from chitu.quantization.registry import QuantizedLinearBase, QuantizationRegistry
+from chitu.quantization.registry import QuantizationRegistry
+from chitu.quantization.base import QuantizedLinearBase
 
 
 @QuantizationRegistry.register_linear("simple_w8a8_muxi")

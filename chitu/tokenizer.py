@@ -18,6 +18,8 @@ import tiktoken
 from tiktoken.load import load_tiktoken_bpe
 from transformers import AutoTokenizer
 
+from chitu.global_vars import get_global_args
+
 
 logger = getLogger(__name__)
 
@@ -42,8 +44,6 @@ class Tokenizer:
 
     num_reserved_special_tokens = 256
 
-    pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"  # noqa: E501
-
     def __init__(self, model_path: str, force_full_seq_decode: bool = False):
         """
         Initializes the Tokenizer with a Tiktoken model.
@@ -61,21 +61,52 @@ class Tokenizer:
 
         mergeable_ranks = load_tiktoken_bpe(model_path)
         num_base_tokens = len(mergeable_ranks)
-        special_tokens = [
-            "<|begin_of_text|>",
-            "<|end_of_text|>",
-            "<|reserved_special_token_0|>",
-            "<|reserved_special_token_1|>",
-            "<|reserved_special_token_2|>",
-            "<|reserved_special_token_3|>",
-            "<|start_header_id|>",
-            "<|end_header_id|>",
-            "<|reserved_special_token_4|>",
-            "<|eot_id|>",  # end of turn
-        ] + [
-            f"<|reserved_special_token_{i}|>"
-            for i in range(5, self.num_reserved_special_tokens - 5)
-        ]
+
+        if "Kimi-K2" in get_global_args().models.name:
+            self.pat_str = "|".join(
+                [
+                    r"""[\p{Han}]+""",
+                    r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+                    r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+                    r"""\p{N}{1,3}""",
+                    r""" ?[^\s\p{L}\p{N}]+[\r\n]*""",
+                    r"""\s*[\r\n]+""",
+                    r"""\s+(?!\S)""",
+                    r"""\s+""",
+                ]
+            )
+            special_tokens = [
+                "<|begin_of_text|>",
+                "<|end_of_text|>",
+                "<|im_end|>",
+                "<|im_user|>",
+                "<|im_assistant|>",
+                "<|start_header_id|>",
+                "<|end_header_id|>",
+                "<|eot_id|>",
+                "<|im_system|>",
+                "<|im_middle|>",
+            ] + [
+                f"<|reserved_special_token_{i}|>"
+                for i in range(self.num_reserved_special_tokens - 10)
+            ]
+        else:
+            self.pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"  # noqa: E501
+            special_tokens = [
+                "<|begin_of_text|>",
+                "<|end_of_text|>",
+                "<|reserved_special_token_0|>",
+                "<|reserved_special_token_1|>",
+                "<|reserved_special_token_2|>",
+                "<|reserved_special_token_3|>",
+                "<|start_header_id|>",
+                "<|end_header_id|>",
+                "<|reserved_special_token_4|>",
+                "<|eot_id|>",  # end of turn
+            ] + [
+                f"<|reserved_special_token_{i}|>"
+                for i in range(5, self.num_reserved_special_tokens - 5)
+            ]
         self.tokens_cache = []
         self.special_tokens = {
             token: num_base_tokens + i for i, token in enumerate(special_tokens)

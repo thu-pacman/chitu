@@ -13,36 +13,11 @@ import re
 import torch
 
 from chitu.global_vars import get_global_args
-
-
-class QuantizedLinearBase(torch.nn.Module):
-    """
-    Base class for all quantized linear layers.
-
-    Defines the interface that all quantized linear implementations must follow.
-    """
-
-    pass
-
-
-class QuantizedMoeExpertsBase(torch.nn.Module):
-    """
-    MoE experts after the gate. This module runs locally on one device.
-
-    Inherit from this class for quantization.
-    """
-
-    pass
-
-
-class QuantizedAbsorbGemmBase(torch.nn.Module):
-    """
-    The two group GeMMs in "absorb-without-precomp" mode for MLA. This module runs locally on one device.
-
-    Inherit from this class for quantization.
-    """
-
-    pass
+from chitu.quantization.base import (
+    QuantizedLinearBase,
+    QuantizedMoeExpertsBase,
+    QuantizedAbsorbGemmBase,
+)
 
 
 class QuantizationRegistry:

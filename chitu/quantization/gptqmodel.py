@@ -2,7 +2,8 @@ from typing import List, Tuple
 
 import torch
 
-from chitu.quantization.registry import QuantizedLinearBase, QuantizationRegistry
+from chitu.quantization.registry import QuantizationRegistry
+from chitu.quantization.base import QuantizedLinearBase
 from chitu.utils import try_import_opt_dep
 
 

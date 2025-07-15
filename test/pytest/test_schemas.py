@@ -29,6 +29,7 @@ class TestServeConfigRules:
                 "models": {
                     "name": "Qwen3-32B",
                     "type": "hf-llama",
+                    "tokenizer_type": "hf",
                     "n_heads": 64,
                     "n_kv_heads": 8,
                 },

@@ -56,7 +56,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "$(lscpu | grep x86)" ]; then \
         pip install ./third_party/ascend/torch_npu-2.5.1.post1.dev20250529-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl -i https://pypi.tuna.tsinghua.edu.cn/simple; \
     else \
-        pip install ./third_party/ascend/torch_npu-2.5.1.post1.dev20250529-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl -i https://pypi.tuna.tsinghua.edu.cn/simple; \
+        pip install ./third_party/ascend/torch_npu-2.5.1.post1.dev20250702-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl -i https://pypi.tuna.tsinghua.edu.cn/simple; \
     fi
 # To directly use the stable version of torch-npu, uncomment the following code:
 # RUN --mount=type=cache,target=/root/.cache/pip \

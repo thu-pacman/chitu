@@ -44,13 +44,13 @@ SIGNED_INT16_0x87F0 = tl.constexpr(0x87F0 - 0x10000)
 SIGNED_INT8_0x9C = tl.constexpr(0x9C - 0x100)
 
 
-def auto_tuning_logger(args, **kwargs):
+def auto_tuning_logger(args, *, name: str, **kwargs):
     # NOTE: there are more info in `args`, but normally we don't print it,
     # because there are large tensors inside, which is a run time performance
     # overhead to print them. You can temporarily print them if you want to
     # debug.
     logger.debug(
-        f"Tuning fp8_gemm_deepseek_v3_configs. Trying: "
+        f"Tuning {name}. Trying: "
         + ", ".join([f"{key}={kwargs[key]}" for key in kwargs])
     )
 
@@ -365,6 +365,7 @@ w8a8_gemm_per_token_per_channel_configs = [
         num_warps=8,
         pre_hook=functools.partial(
             auto_tuning_logger,
+            name="w8a8_gemm_per_token_per_channel",
             block_m=block_m,
             block_n=block_n,
             num_stages=num_stages,
@@ -444,6 +445,7 @@ w4a8_gemm_per_token_per_channel_asymm_configs = [
         num_warps=8,
         pre_hook=functools.partial(
             auto_tuning_logger,
+            name="w4a8_gemm_per_token_per_channel_asymm",
             block_m=block_m,
             block_n=block_n,
             num_stages=num_stages,
@@ -522,6 +524,7 @@ fp8_gemm_deepseek_v3_configs = [
         num_warps=8,
         pre_hook=functools.partial(
             auto_tuning_logger,
+            name="fp8_gemm_deepseek_v3",
             block_m=block_m,
             block_n=block_n,
             num_stages=num_stages,
@@ -599,7 +602,26 @@ def fp8_gemm_deepseek_v3_kernel(
     tl.store(c_ptrs, c, mask=mask)
 
 
-@triton.autotune(configs=fp8_gemm_deepseek_v3_configs, key=["N", "K"])
+fp4_gemm_deepseek_v3_configs = [
+    Config(
+        {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n},
+        num_stages=num_stages,
+        num_warps=8,
+        pre_hook=functools.partial(
+            auto_tuning_logger,
+            name="fp4_raise_to_fp8_gemm_deepseek_v3",
+            block_m=block_m,
+            block_n=block_n,
+            num_stages=num_stages,
+        ),
+    )
+    for block_m in [16, 32, 64]
+    for block_n in [32, 64, 128]
+    for num_stages in [3, 4, 5, 6]
+]
+
+
+@triton.autotune(configs=fp4_gemm_deepseek_v3_configs, key=["N", "K"])
 @triton.jit
 def soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel(
     a_ptr,
@@ -623,7 +645,8 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel(
 
     Args:
         a_ptr (tl.tensor): Pointer to the first input matrix A.
-        b_ptr (tl.tensor): Pointer to the second input matrix B.
+        b_ptr (tl.tensor): Pointer to the second input matrix B, in
+            Packed4BitWeightAlongK layout.
         c_ptr (tl.tensor): Pointer to the output matrix C.
         a_s_ptr (tl.tensor): Pointer to the scaling factors for matrix A.
         b_s_ptr (tl.tensor): Pointer to the scaling factors for matrix B.
@@ -661,11 +684,7 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel(
     fp4_to_fp8_scale = 64.0
     fp4_max = 6.0
     for i in range(k):
-        b = tl.load(
-            b_ptrs,
-            mask=offs_k[:, None] < (K - i * BLOCK_SIZE_K - BLOCK_SIZE_K // 2),
-            other=0.0,
-        )
+        b = tl.load(b_ptrs)
         a_s = tl.load(a_s_ptrs + i * BLOCK_SIZE_K // group_k)
         b_s_1 = tl.load(b_s_ptrs).to(tl.float8e4nv, bitcast=True)
         b_s_2 = tl.load(b_s_ptrs + num_b_s_in_block // 2).to(
@@ -675,13 +694,8 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel(
         fp8_weight_2 = (b.to(tl.int8, bitcast=True) >> 2) & SIGNED_INT8_0x9C
         b_s_1 = b_s_1.to(tl.bfloat16)
         b_s_2 = b_s_2.to(tl.bfloat16)
-        a_1 = tl.load(
-            a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K - BLOCK_SIZE_K // 2
-        )
-        a_2 = tl.load(
-            a_ptrs + BLOCK_SIZE_K // 2,
-            mask=offs_k[None, :] < K - i * BLOCK_SIZE_K - BLOCK_SIZE_K // 2,
-        )
+        a_1 = tl.load(a_ptrs)
+        a_2 = tl.load(a_ptrs + BLOCK_SIZE_K // 2)
         fp8_weight_1 = (
             fp8_weight_1.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
             * (fp4_to_fp8_scale / fp4_max)
@@ -815,7 +829,25 @@ def soft_fp8_gemm_deepseek_v3_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.autotune(configs=soft_fp8_gemm_deepseek_v3_configs, key=["N", "K"])
+soft_fp4_gemm_deepseek_v3_configs = [
+    Config(
+        {
+            "BLOCK_SIZE_M": block_m,
+            "BLOCK_SIZE_N": block_n,
+            "GROUP_SIZE_M": group_m,
+        },
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+    for block_m in [16, 32, 64]
+    for block_n in [32, 64, 128]
+    for group_m in [1, 32]
+    for num_stages in [3, 4, 5, 6]
+    for num_warps in [4, 8]
+]
+
+
+@triton.autotune(configs=soft_fp4_gemm_deepseek_v3_configs, key=["N", "K"])
 @triton.jit
 def soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel(
     a_ptr,
@@ -838,7 +870,8 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel(
 
     Args:
         a_ptr (tl.tensor): Pointer to the first input matrix A.
-        b_ptr (tl.tensor): Pointer to the second input matrix B.
+        b_ptr (tl.tensor): Pointer to the second input matrix B, in
+            Packed4BitWeightAlongK layout.
         c_ptr (tl.tensor): Pointer to the output matrix C.
         a_s_ptr (tl.tensor): Pointer to the scaling factors for matrix A.
         b_s_ptr (tl.tensor): Pointer to the scaling factors for matrix B.
@@ -885,7 +918,7 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel(
     else:
         scale_2 = tl.load(b_s_2_ptr)
     for i in range(k):
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < (K - i * BLOCK_SIZE_K), other=0.0)
+        b = tl.load(b_ptrs)
         b = b.to(tl.int8, bitcast=True).to(
             tl.int16
         )  # Do signed cast to copy the sign bit
@@ -903,13 +936,8 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel(
         bf16_s_2 = (b_s_2 << 4) & SIGNED_INT16_0x87F0
         b_s_1 = bf16_s_1.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
         b_s_2 = bf16_s_2.to(tl.bfloat16, bitcast=True) * fp8_to_bf16_scale
-        a_1 = tl.load(
-            a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K - BLOCK_SIZE_K // 2
-        )
-        a_2 = tl.load(
-            a_ptrs + BLOCK_SIZE_K // 2,
-            mask=offs_k[None, :] < K - i * BLOCK_SIZE_K - BLOCK_SIZE_K // 2,
-        )
+        a_1 = tl.load(a_ptrs)
+        a_2 = tl.load(a_ptrs + BLOCK_SIZE_K // 2)
         bf16_weight_1 = (
             bf16_weight_1.to(tl.bfloat16, bitcast=True) * fp4_to_bf16_scale * b_s_1
         )
@@ -1057,6 +1085,7 @@ grouped_matmul_configs = [
         num_warps=8,
         pre_hook=functools.partial(
             auto_tuning_logger,
+            name="grouped_matmul_kernel",
             block_m=block_m,
             block_n=block_n,
             num_stages=num_stages,

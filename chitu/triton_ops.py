@@ -11,6 +11,7 @@ from chitu.device_type import is_hopper
 from chitu.utils import try_import_opt_dep
 from chitu.global_vars import get_global_args
 from chitu.device_list import DeviceList
+from chitu.native_layout import Packed4BitWeightAlongK
 
 
 def to_triton_dtype(dtype: torch.dtype):
@@ -575,7 +576,7 @@ def soft_fp8_gemm_deepseek_v3_triton(
 def soft_fp4_raise_to_fp8_gemm_deepseek_v3_triton(
     a: torch.Tensor,
     a_s: torch.Tensor,
-    b: torch.Tensor,
+    b: Packed4BitWeightAlongK,
     b_s: torch.Tensor,
     b_s_2: torch.Tensor,
     act_block_size: int,
@@ -586,7 +587,7 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3_triton(
     Args:
         a (torch.Tensor): The first input matrix, must be contiguous.
         a_s (torch.Tensor): The scaling factor of first input matrix, must be contiguous.
-        b (torch.Tensor): The second input matrix, must be contiguous.
+        b (Packed4BitWeightAlongK): The second input matrix, must be in Packed4BitWeightAlongK layout.
         b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
         b_s_2 (torch.Tensor): The scaling factor for b_s, must be contiguous.
         act_block_size (int): The block size for activation quantization.
@@ -598,30 +599,35 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3_triton(
     if packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"):
         raise ImportError("Triton version >= 3.2.0 is required for soft fp4")
 
-    assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
+    assert isinstance(b, Packed4BitWeightAlongK)
+    assert b.k_stride == 64
+
+    assert a.is_contiguous()
+    assert b.layout_tensor.is_contiguous()
     assert a_s.is_contiguous(), "Scaling factor of A must be contiguous"
     assert b_s.is_contiguous(), "Scaling factor tensor must be contiguous"
     assert b_s_2.is_contiguous(), "Scaling_2 factor tensor must be contiguous"
 
     assert b_s.dim() == 2
-    assert b_s.shape[0] == b.shape[0]
-    assert b_s.shape[1] == b.shape[1] * 2 // 16
+    assert b_s.shape[0] == b.plain_shape[0]
+    assert b_s.shape[1] == b.plain_shape[1] // 16
     assert b_s_2.dim() == 2
     assert b_s_2.shape[0] == 1 or b_s_2.shape[0] == 2
     assert b_s_2.shape[1] == 1
 
     K = a.size(-1)
     M = a.numel() // K
-    N = b.size(0)
+    N = b.plain_shape[0]
     c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
 
+    BLOCK_SIZE_K = b.k_stride * 2
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]),
         triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
     soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel[grid](
         a,
-        b,
+        b.layout_tensor,
         c,
         a_s,
         b_s,
@@ -632,6 +638,7 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3_triton(
         group_k=act_block_size,
         stride_b_s=16,
         is_w1w3=(b_s_2.shape[0] == 2),
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
     return c
 
@@ -639,7 +646,7 @@ def soft_fp4_raise_to_fp8_gemm_deepseek_v3_triton(
 @auto_retry_triton_compilation
 def soft_fp4_raise_to_bf16_gemm_deepseek_v3_triton(
     a: torch.Tensor,
-    b: torch.Tensor,
+    b: Packed4BitWeightAlongK,
     b_s: torch.Tensor,
     b_s_2: torch.Tensor,
 ):
@@ -648,7 +655,7 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3_triton(
 
     Args:
         a (torch.Tensor): The first input matrix, must be contiguous.
-        b (torch.Tensor): The second input matrix, must be contiguous.
+        b (Packed4BitWeightAlongK): The second input matrix, must be in Packed4BitWeightAlongK layout.
         b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
         b_s_2 (torch.Tensor): The scaling factor for b_s, must be contiguous.
 
@@ -659,28 +666,33 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3_triton(
     if packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"):
         raise ImportError("Triton version >= 3.2.0 is required for soft fp4")
 
-    assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
+    assert isinstance(b, Packed4BitWeightAlongK)
+    assert b.k_stride == 64
+
+    assert a.is_contiguous()
+    assert b.layout_tensor.is_contiguous()
     assert b_s.is_contiguous(), "Scaling factor tensor must be contiguous"
     assert b_s_2.is_contiguous(), "Scaling_2 factor tensor must be contiguous"
 
     assert b_s.dim() == 2
-    assert b_s.shape[0] == b.shape[0]
-    assert b_s.shape[1] == b.shape[1] * 2 // 16
+    assert b_s.shape[0] == b.plain_shape[0]
+    assert b_s.shape[1] == b.plain_shape[1] // 16
     assert b_s_2.dim() == 2
     assert b_s_2.shape[0] == 1 or b_s_2.shape[0] == 2
     assert b_s_2.shape[1] == 1
 
     K = a.size(-1)
     M = a.numel() // K
-    N = b.size(0)
+    N = b.plain_shape[0]
     c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
 
+    BLOCK_SIZE_K = b.k_stride * 2
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
     soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel[grid](
         a,
-        b,
+        b.layout_tensor,
         c,
         b_s,
         b_s_2,
@@ -689,6 +701,7 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3_triton(
         K,
         stride_b_s=16,
         is_w1w3=(b_s_2.shape[0] == 2),
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
     return c
 
