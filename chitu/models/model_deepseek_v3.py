@@ -1334,7 +1334,8 @@ class TransformerDeepSeekV3(Transformer):
                 name = k
                 name = name.replace(".weight_scale_inv", ".scale")
                 name = name.replace(".e_score_correction_bias", ".bias")
-                new_state_dict[name] = state_dict[k]
+                if "self_attn.rotary_emb.inv_freq" not in name:
+                    new_state_dict[name] = state_dict[k]
             state_dict = new_state_dict
 
         super().load_state_dict_parallel(

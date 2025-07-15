@@ -221,7 +221,7 @@ class Backend:
             else False
         )
 
-        if args.models.type in ["hf-llama", "hf-glm-z1", "hf-mixtral", "deepseek-v3"]:
+        if args.models.tokenizer_type == "hf":
             tokenizer = TokenizerHF(
                 path=args.models.tokenizer_path,
                 trust_remote_code=trust_remote_code,
@@ -255,7 +255,7 @@ class Backend:
         Returns:
             Appropriate chat formatter instance
         """
-        if args.models.type in ["hf-llama", "hf-mixtral", "deepseek-v3"]:
+        if args.models.tokenizer_type == "hf":
             return ChatFormatHF(Backend.tokenizer)
         else:
             return ChatFormat(Backend.tokenizer)

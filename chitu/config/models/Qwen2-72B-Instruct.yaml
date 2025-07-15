@@ -3,6 +3,7 @@ type: hf-llama
 source: "https://huggingface.co/Qwen/Qwen2-72B-Instruct" # Just for displaying. No automatic download.
 ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
 tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+tokenizer_type: "hf" # one of: hf, tiktoken
 dim: 8192
 n_layers: 80
 n_heads: 64

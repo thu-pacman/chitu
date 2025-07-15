@@ -64,6 +64,12 @@ class ServeConfigRules(Callback):
                     f"model {model_name} is not compatible with flash_mla"
                 )
 
+        tokenizer_type = config.models.tokenizer_type
+        if tokenizer_type not in {"hf", "tiktoken"}:
+            self._exit_with_error(
+                f"tokenizer_type must be one of [hf, tiktoken], got {tokenizer_type}"
+            )
+
         op_impl = config.infer.op_impl
         if op_impl not in {"torch", "muxi_custom_kernel"}:
             self._exit_with_error(
