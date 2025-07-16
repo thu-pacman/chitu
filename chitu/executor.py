@@ -238,18 +238,14 @@ class Executor:
             self.get_payload_dtype = lambda: torch.int64
 
     def _prepare_seq_lens_for_decode(self, tasks: PackedTasksBase):
-        seq_lens = []
-        for req_id in tasks.req_ids:
-            seq_len = Backend.cache_manager.seq_lens[req_id]
-            seq_lens.append(seq_len)
-        return seq_lens
+        return [Backend.cache_manager.seq_lens[req_id] for req_id in tasks.req_ids]
 
     def _prepare_new_tokens_for_decode(self, tasks: PackedTasks):
-        new_tokens = []
-        for task in tasks.tasks:
-            new_tokens.append(task.next_token)
-        new_tokens = torch.tensor(new_tokens, device="cuda", dtype=torch.long)
-        return new_tokens
+        return torch.tensor(
+            [task.next_token for task in tasks.tasks],
+            device="cuda",
+            dtype=torch.long,
+        )
 
     def step(
         self,

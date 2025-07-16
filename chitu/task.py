@@ -504,7 +504,7 @@ class PackedTasks(PackedTasksBase):
             raise NotImplementedError("Hybrid task not implemented")
 
         if self.task_type == TaskType.Prefill:
-            self.pack_tokens()
+            self.tokens = [task.tokens for task in self.tasks]
 
         # sample related
         self.is_all_greedy = all(task.req.params.top_k <= 1 for task in self.tasks)
@@ -517,16 +517,18 @@ class PackedTasks(PackedTasksBase):
         self.top_ks = torch.tensor([task.req.params.top_k for task in self.tasks]).to(
             device=rank, non_blocking=True
         )
-        self.frequency_penalties = torch.tensor(
-            [task.req.params.frequency_penalty for task in self.tasks],
-            dtype=torch.float32,
-        ).to(device=rank, non_blocking=True)
+        # NOTE: cumulative frequency penalties has been disabled.
+        # self.frequency_penalties = torch.tensor(
+        #     [task.req.params.frequency_penalty for task in self.tasks],
+        #     dtype=torch.float32,
+        # ).to(device=rank, non_blocking=True)
         self.should_apply_frequency_penalty = any(
             task.req.params.frequency_penalty > 0 for task in self.tasks
         )
-        self.cumulative_freq_penalties = torch.zeros(
-            (self.num_tasks, Backend.model.vocab_size), dtype=torch.float32, device=rank
-        )
+        # NOTE: cumulative frequency penalties has been disabled.
+        # self.cumulative_freq_penalties = torch.zeros(
+        #     (self.num_tasks, Backend.model.vocab_size), dtype=torch.float32, device=rank
+        # )
 
         # logprobs
         self.return_logprobs = any(task.req.logprobs for task in self.tasks)
