@@ -1,3 +1,4 @@
+from typing import List
 import hydra
 import torch
 import time
@@ -55,7 +56,7 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens):
             ):
                 return tkn.decode(tokens)
 
-    reqs = []
+    reqs: List[UserRequest] = []
     for i in range(num_reqs):
         msg = generate_prompt(prompt_len - 1, Backend.tokenizer)
         req = UserRequest(msg, f"{gen_req_id()}", max_new_tokens=max_new_tokens)
@@ -64,7 +65,7 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens):
 
 
 def gen_reqs_real(num_reqs, max_new_tokens):
-    reqs = []
+    reqs: List[UserRequest] = []
     for i in range(num_reqs):
         req = UserRequest(
             msgs[i % len(msgs)],
@@ -91,7 +92,7 @@ def run_pipe_or_tensor_parallelism(args, timers):
     if rank == 0:
         warmup_engine(args)
 
-    for i in range(3):
+    for i in range(2):
         if rank == 0:
             reqs = gen_reqs(
                 num_reqs=args.infer.max_reqs,
@@ -101,22 +102,27 @@ def run_pipe_or_tensor_parallelism(args, timers):
                 TaskPool.add(
                     Task(f"{req.request_id}", req, req.message, stop_with_eos=True)
                 )
-        t_start = time.time()
-        timers("overall").start()
+            logger.info(f"------ batch {i} ------")
+            t_start = time.perf_counter()
+            timers("overall").start()
+
         tokens = 0
         while not chitu_is_terminated():
             tokens += 1
             chitu_run()
             if rank == 0 and len(TaskPool.pool) == 0:
-                break  # Rank 0 can temperarily leave to do other things
-        timers("overall").stop()
-        t_end = time.time()
+                break  # Rank 0 can temporarily leave to do other things
 
         if rank == 0:
+            timers("overall").stop()
+            t_end = time.perf_counter()
             logger.info(f"Tokens generate : {tokens}")
             logger.info(f"Time cost {t_end - t_start}")
-            for req in reqs:
-                logger.info(f"Response in rank {rank}: {req.output}")
+            logger.info(
+                f"max GPU memory used: {torch.cuda.max_memory_allocated() / 1024**3} GB"
+            )
+
+            logger.info(f"Response in rank {rank}: {reqs[0].output=}")
 
             timers.log()
 
@@ -136,6 +142,7 @@ def run_normal(args, timers):
             TaskPool.add(
                 Task(f"{req.request_id}", req, req.message, stop_with_eos=True)
             )
+        logger.info(f"------ batch {i} ------")
         t_start = time.time()
         timers("overall").start()
         tokens = 0
@@ -149,8 +156,7 @@ def run_normal(args, timers):
         logger.info(f"Tokens generate : {tokens}")
         logger.info(f"Time cost {t_end - t_start}")
 
-        for req in reqs:
-            logger.info(f"Response in rank {rank}: {req.output}")
+        logger.info(f"Response in rank {rank}: {reqs[0].output}")
 
         timers.log()
 
@@ -170,7 +176,7 @@ def main(args: ServeConfig):
     torch.distributed.barrier()
 
     timers = get_timers()
-    logger.debug(f"finish init")
+    logger.debug("finish init")
     if args.infer.pp_size > 1 or args.infer.tp_size > 1:
         run_pipe_or_tensor_parallelism(args, timers)
     else:
