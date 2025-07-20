@@ -160,7 +160,7 @@ class AttentionHFLlama(Attention):
             checkpoint_prefix=f"{checkpoint_prefix}.o_proj",
         )
 
-        if "Qwen3" in args.name:
+        if getattr(args, "use_qk_norm", False):
             self.q_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
 
@@ -199,8 +199,9 @@ class AttentionHFLlama(Attention):
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
 
-        if hasattr(self, "q_norm") and hasattr(self, "k_norm"):
+        if hasattr(self, "q_norm"):
             xq = self.q_norm(xq)
+        if hasattr(self, "k_norm"):
             xk = self.k_norm(xk)
 
         xq, xk = apply_rotary_pos_emb(
