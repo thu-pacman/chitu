@@ -7,6 +7,7 @@ _model_registry = {}
 class ModelType(str, Enum):
     DEEPSEEK_V3 = "deepseek-v3"
     HF_LLAMA = "hf-llama"
+    HF_QWEN_3_MOE = "hf-qwen-3-moe"
     HF_GLM_Z1 = "hf-glm-z1"
     HF_MIXTRAL = "hf-mixtral"
     LLAMA = "llama"

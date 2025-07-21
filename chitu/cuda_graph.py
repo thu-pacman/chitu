@@ -51,7 +51,7 @@ def make_dispatched_graphed_callables(
         graph_dict: Dict[Any, torch.cuda.CUDAGraph] = {}
         cuda_graph_pool = None
 
-        args_static_tensors: Optinoal[List[StaticTensor]] = None
+        args_static_tensors: Optional[List[StaticTensor]] = None
         kwargs_static_tensors: Optional[Dict[str, StaticTensor]] = None
         output_static_tensor: Optional[StaticTensor] = None
 

@@ -561,6 +561,7 @@ class Backend:
                 checkpoint = Backend._remove_prefix(checkpoint, "model.")
             elif args.models.type in {
                 "hf-llama",
+                "hf-qwen-3-moe",
                 "hf-glm-z1",
                 "hf-mixtral",
                 "deepseek-v3",
