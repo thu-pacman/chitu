@@ -1,35 +1,23 @@
-__all__ = [
-    "append_to_paged_kv_cache_kernel",
-    "append_to_non_paged_kv_cache_kernel",
-    "rotary_embedding_kernel_hf_llama",
-    "rotary_embedding_kernel_llama",
-    "act_quant_deepseek_v3_kernel",
-    "weight_dequant_deepseek_v3_kernel",
-    "weight_dequant_soft_fp8_deepseek_v3_kernel_step_1",
-    "weight_dequant_soft_fp8_deepseek_v3_kernel_step_2",
-    "fp8_gemm_deepseek_v3_kernel",
-    "w8a8_gemm_per_token_per_channel_kernel",
-    "w4a8_gemm_per_token_per_channel_asymm_kernel",
-    "soft_fp8_gemm_deepseek_v3_kernel",
-    "soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel",
-    "soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel",
-    "moe_sum_kernel",
-    "silu_and_mul_kernel",
-    "rms_norm_kernel",
-    "grouped_matmul_kernel",
-    "apply_frequency_penalty_kernel",
-]
+from typing import Tuple
 
 import functools
+import struct
+import packaging
 from logging import getLogger
 
+import torch
 import triton
 import triton.language as tl
 from triton import Config
 
-from chitu.device_type import is_muxi
-
-logger = getLogger(__name__)
+from chitu.device_type import is_muxi, is_hopper
+from chitu.ops.triton_ops.utils import (
+    auto_retry_triton_compilation,
+    to_triton_dtype,
+    auto_tuning_logger,
+)
+from chitu.utils import try_import_opt_dep
+from chitu.native_layout import Packed4BitWeightAlongK
 
 
 # Triton does not support explicitly typed immediate values. Instead, it looks for
@@ -44,219 +32,483 @@ SIGNED_INT16_0x87F0 = tl.constexpr(0x87F0 - 0x10000)
 SIGNED_INT8_0x9C = tl.constexpr(0x9C - 0x100)
 
 
-def auto_tuning_logger(args, *, name: str, **kwargs):
-    # NOTE: there are more info in `args`, but normally we don't print it,
-    # because there are large tensors inside, which is a run time performance
-    # overhead to print them. You can temporarily print them if you want to
-    # debug.
-    logger.debug(
-        f"Tuning {name}. Trying: "
-        + ", ".join([f"{key}={kwargs[key]}" for key in kwargs])
-    )
-
-
-@triton.jit
-def append_to_paged_kv_cache_kernel(
-    kv_cache_ptr,  # (num_pages, page_size, other dims...)
-    page_table_ptr,  # (batch_size, num_pages_per_sample)
-    this_kv_ptr,  # (batch_size, other dims...)
-    old_seq_lens_ptr,  # (batch_size,)
-    PAGE_SIZE: tl.constexpr,
-    BATCH_SIZE: tl.constexpr,
-    NUM_PAGES_PER_SAMPLE: tl.constexpr,
-    TOT_LEN_OF_OTHER_DIMS: tl.constexpr,
-    KV_CACHE_STRIDE0: tl.constexpr,
-    KV_CACHE_STRIDE1: tl.constexpr,
-    THIS_KV_STRIDE0: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,  # GPU block size, not page size
-):
-    batch_id = tl.program_id(axis=0)
-    dim_id_0 = tl.program_id(axis=1)
-    dim_id_1 = tl.arange(0, BLOCK_SIZE)
-    dim_id = dim_id_0 * BLOCK_SIZE + dim_id_1
-    dim_mask = dim_id < TOT_LEN_OF_OTHER_DIMS
-
-    seqlen = tl.load(old_seq_lens_ptr + batch_id)
-
-    page_table_offset = batch_id * NUM_PAGES_PER_SAMPLE + seqlen // PAGE_SIZE
-    page_id = tl.load(page_table_ptr + page_table_offset)
-
-    kv_cache_offset = (
-        page_id * KV_CACHE_STRIDE0 + (seqlen % PAGE_SIZE) * KV_CACHE_STRIDE1 + dim_id
-    )
-    this_kv_offset = batch_id * THIS_KV_STRIDE0 + dim_id
-
-    this_kv_data = tl.load(this_kv_ptr + this_kv_offset, mask=dim_mask)
-    tl.store(kv_cache_ptr + kv_cache_offset, this_kv_data, mask=dim_mask)
-
-
-@triton.jit
-def append_to_non_paged_kv_cache_kernel(
-    kv_cache_ptr,  # (num_pages, page_size, other dims...)
-    this_kv_ptr,  # (batch_size, other dims...)
-    old_seq_lens_ptr,  # (batch_size,)
-    BATCH_SIZE: tl.constexpr,
-    TOT_LEN_OF_OTHER_DIMS: tl.constexpr,
-    KV_CACHE_STRIDE0: tl.constexpr,
-    KV_CACHE_STRIDE1: tl.constexpr,
-    THIS_KV_STRIDE0: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,  # GPU block size, not page size
-):
-    batch_id = tl.program_id(axis=0)
-    dim_id_0 = tl.program_id(axis=1)
-    dim_id_1 = tl.arange(0, BLOCK_SIZE)
-    dim_id = dim_id_0 * BLOCK_SIZE + dim_id_1
-    dim_mask = dim_id < TOT_LEN_OF_OTHER_DIMS
-
-    seqlen = tl.load(old_seq_lens_ptr + batch_id)
-
-    kv_cache_offset = batch_id * KV_CACHE_STRIDE0 + seqlen * KV_CACHE_STRIDE1 + dim_id
-    this_kv_offset = batch_id * THIS_KV_STRIDE0 + dim_id
-
-    this_kv_data = tl.load(this_kv_ptr + this_kv_offset, mask=dim_mask)
-    tl.store(kv_cache_ptr + kv_cache_offset, this_kv_data, mask=dim_mask)
-
-
-@triton.jit
-def rotary_embedding_kernel_hf_llama(
-    Q,
-    COS,
-    SIN,
-    OUTPUT,
-    num_head,
-    stride_q1,
-    stride_q2,
-    stride_cos1,
-    stride_sin1,
-    stride_out1,
-    stride_out2,
-    BLOCK_SIZE: tl.constexpr,
-):
-    # Get the program ID
-    pid = tl.program_id(axis=0)
-
-    # Compute batch index and head index
-    batch_idx = pid // num_head
-    head_idx = pid % num_head
-
-    # Pointers to the beginning of the Q, COS, SIN, and OUTPUT
-    Q_ptr = Q + batch_idx * stride_q1 + head_idx * stride_q2
-    COS_ptr = COS + batch_idx * stride_cos1
-    SIN_ptr = SIN + batch_idx * stride_sin1
-    OUTPUT_ptr = OUTPUT + batch_idx * stride_out1 + head_idx * stride_out2
-
-    # Create block IDs
-    block_id = tl.program_id(axis=1)
-
-    # Create offsets for reading and writing
-    offsets_0 = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE // 2)
-    offsets_1 = block_id * BLOCK_SIZE + BLOCK_SIZE // 2 + tl.arange(0, BLOCK_SIZE // 2)
-
-    # Load data
-    cos0 = tl.load(COS_ptr + offsets_0)
-    sin0 = tl.load(SIN_ptr + offsets_0)
-    q0 = tl.load(Q_ptr + offsets_0)
-    q1 = tl.load(Q_ptr + offsets_1)
-
-    # Apply rotary embedding
-    q_embed0 = q0 * cos0 - q1 * sin0
-    q_embed1 = q1 * cos0 + q0 * sin0
-
-    # Store result
-    tl.store(OUTPUT_ptr + offsets_0, q_embed0)
-    tl.store(OUTPUT_ptr + offsets_1, q_embed1)
-
-
-@triton.jit
-def rotary_embedding_kernel_llama(
-    Q,
-    K,
-    Out_q,
-    Out_k,
-    COS,
-    SIN,
-    stride_q_b: tl.constexpr,
-    stride_q_h: tl.constexpr,
-    stride_k_b: tl.constexpr,
-    stride_k_h: tl.constexpr,
-    stride_oq_b: tl.constexpr,
-    stride_oq_h: tl.constexpr,
-    stride_ok_b: tl.constexpr,
-    stride_ok_h: tl.constexpr,
-    HEAD_DIM_Q: tl.constexpr,
-    HEAD_DIM_K: tl.constexpr,
-    ROTARY_DIM: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
+@auto_retry_triton_compilation
+def act_quant_deepseek_v3_triton(
+    x: torch.Tensor, block_size: int = 128
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Performs rotary embedding on the input tensor Q and K, and stores the results in Out_q and Out_k specified for deepseek.
+    Quantizes the input tensor `x` using block-wise quantization.
 
     Args:
-        Q (tl.tensor): The input tensor Q. Shape: [batch_seq, num_head, rotary_dim]
-        K (tl.tensor): The input tensor K. Shape: [batch_seq, num_head, rotary_dim]
-        Out_q (tl.tensor): The output tensor for Q.
-        Out_k (tl.tensor): The output tensor for K.
+        x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last dimension size must be divisible by `block_size`.
+        block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+            - The quantized tensor with dtype `torch.float8_e4m3fn`.
+            - A tensor of scaling factors with dtype `torch.float32`.
     """
-    cur_batch = tl.program_id(0)
-    cur_block_head_id = tl.program_id(1)
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert (
+        x.size(-1) % block_size == 0
+    ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
+    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
+    grid = lambda meta: (triton.cdiv(x.numel(), meta["BLOCK_SIZE"]),)
+    act_quant_deepseek_v3_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
+    return y, s
 
-    cos_ptr = COS + cur_batch * ROTARY_DIM // 2 + tl.arange(0, ROTARY_DIM // 2)
-    sin_ptr = SIN + cur_batch * ROTARY_DIM // 2 + tl.arange(0, ROTARY_DIM // 2)
-    cos = tl.load(cos_ptr)
-    sin = tl.load(sin_ptr)
 
-    for block_head_start in range(BLOCK_H):
-        cur_head_id = cur_block_head_id * BLOCK_H + block_head_start
+@auto_retry_triton_compilation
+def weight_dequant_deepseek_v3_triton(
+    x: torch.Tensor, s: torch.Tensor, block_size: int = 128
+) -> torch.Tensor:
+    """
+    Dequantizes the given weight tensor using the provided scale tensor.
 
-        if cur_head_id < HEAD_DIM_Q:
-            offs_oq = (
-                cur_batch * stride_oq_b
-                + cur_head_id * stride_oq_h
-                + tl.arange(0, ROTARY_DIM)
-            )
-            offs_q_0 = (
-                cur_batch * stride_q_b
-                + cur_head_id * stride_q_h
-                + tl.arange(0, ROTARY_DIM // 2) * 2
-            )
-            offs_q_1 = (
-                cur_batch * stride_q_b
-                + cur_head_id * stride_q_h
-                + tl.arange(0, ROTARY_DIM // 2) * 2
-                + 1
-            )
-            q_0 = tl.load(Q + offs_q_0)
-            q_1 = tl.load(Q + offs_q_1)
-            o_q_0 = q_0 * cos - q_1 * sin
-            o_q_1 = q_1 * cos + q_0 * sin
-            o_q = tl.interleave(o_q_0, o_q_1)
+    Args:
+        x (torch.Tensor): The quantized weight tensor of shape (M, N).
+        s (torch.Tensor): The scale tensor of shape (M / block_size, N / block_size).
+        block_size (int, optional): The block size to use for dequantization. Defaults to 128.
 
-            tl.store(Out_q + offs_oq, o_q)
+    Returns:
+        torch.Tensor: The dequantized weight tensor of the same shape as `x`.
 
-        if cur_head_id < HEAD_DIM_K:
-            offs_ok = (
-                cur_batch * stride_ok_b
-                + cur_head_id * stride_ok_h
-                + tl.arange(0, ROTARY_DIM)
-            )
-            offs_k_0 = (
-                cur_batch * stride_k_b
-                + cur_head_id * stride_k_h
-                + tl.arange(0, ROTARY_DIM // 2) * 2
-            )
-            offs_k_1 = (
-                cur_batch * stride_k_b
-                + cur_head_id * stride_k_h
-                + tl.arange(0, ROTARY_DIM // 2) * 2
-                + 1
-            )
-            k_0 = tl.load(K + offs_k_0)
-            k_1 = tl.load(K + offs_k_1)
-            o_k_0 = k_0 * cos - k_1 * sin
-            o_k_1 = k_1 * cos + k_0 * sin
-            o_k = tl.interleave(o_k_0, o_k_1)
+    Raises:
+        AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
+    """
+    assert x.is_contiguous() and s.is_contiguous(), "Input tensors must be contiguous"
+    assert (
+        s.dim() == x.dim()
+    ), "Scale tensors must have the same number of dimensions with the weight tensor"
+    if x.dim() == 2:
+        M, N = x.size()
+        B = 1
+    elif x.dim() == 3:
+        B, M, N = x.size()
+    else:
+        assert False, "Weight tensor must have 2 or 3 dimensions"
+    y = torch.empty_like(x, dtype=torch.get_default_dtype())
+    grid = lambda meta: (
+        B,
+        triton.cdiv(M, meta["BLOCK_SIZE"]),
+        triton.cdiv(N, meta["BLOCK_SIZE"]),
+    )
+    weight_dequant_deepseek_v3_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
+    return y
 
-            tl.store(Out_k + offs_ok, o_k)
+
+@auto_retry_triton_compilation
+def weight_dequant_soft_fp8_deepseek_v3_triton(
+    x: torch.Tensor, s: torch.Tensor, block_size: int = 128
+) -> torch.Tensor:
+    """
+    Dequantizes the given weight tensor using the provided scale tensor.
+
+    Args:
+        x (torch.Tensor): The quantized weight tensor of shape (M, N).
+        s (torch.Tensor): The scale tensor of shape (M / block_size, N / block_size).
+        block_size (int, optional): The block size to use for dequantization. Defaults to 128.
+
+    Returns:
+        torch.Tensor: The dequantized weight tensor of the same shape as `x`.
+
+    Raises:
+        AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
+    """
+    assert x.is_contiguous() and s.is_contiguous(), "Input tensors must be contiguous"
+    assert (
+        s.dim() == x.dim()
+    ), "Scale tensors must have the same number of dimensions with the weight tensor"
+    if x.dim() == 2:
+        M, N = x.size()
+        B = 1
+    elif x.dim() == 3:
+        B, M, N = x.size()
+    else:
+        assert False, "Weight tensor must have 2 or 3 dimensions"
+
+    x = x.view(dtype=torch.uint8)
+    if hasattr(torch, "uint32"):
+        bit_reordered_x = torch.empty_like(x, dtype=torch.uint32)
+    elif hasattr(torch, "int32"):
+        bit_reordered_x = torch.empty_like(x, dtype=torch.int32)
+    else:
+        raise ValueError(
+            "The current PyTorch environment supports neither the uint32 type nor the int32 type."
+        )
+
+    grid = lambda meta: (triton.cdiv(B * M * N, meta["BLOCK_SIZE"]),)
+    weight_dequant_soft_fp8_deepseek_v3_kernel_step_1[grid](
+        x, bit_reordered_x, B * M * N, BLOCK_SIZE=block_size
+    )
+    bit_reordered_x = bit_reordered_x.view(dtype=torch.float32)
+
+    # Some of our platforms only has Triton with low versions, where these is no `tl.cast`
+    # which is used for initializing a constant with a given type. Therefore, we need to
+    # pass `fp8_to_fp32_scale` as a constant from outside.
+    fp8_to_fp32_scale = struct.unpack(">f", bytes.fromhex("7b800000"))[0]
+    y = torch.empty_like(x, dtype=torch.get_default_dtype())
+    grid = lambda meta: (
+        B,
+        triton.cdiv(M, meta["BLOCK_SIZE"]),
+        triton.cdiv(N, meta["BLOCK_SIZE"]),
+    )
+    weight_dequant_soft_fp8_deepseek_v3_kernel_step_2[grid](
+        bit_reordered_x,
+        s,
+        y,
+        M,
+        N,
+        BLOCK_SIZE=block_size,
+        fp8_to_fp32_scale=fp8_to_fp32_scale,
+    )
+    return y
+
+
+@auto_retry_triton_compilation
+def w8a8_gemm_per_token_per_channel_triton(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+):
+    """
+    Perform a matrix multiplication using INT8 precision.
+
+    Args:
+        a (torch.Tensor): The first input matrix, must be contiguous.
+        a_s (torch.Tensor): The scaling factor for the first input matrix, must be contiguous.
+        b (torch.Tensor): The second input matrix, must be contiguous.
+        b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
+
+    Returns:
+        torch.Tensor: The result of the matrix multiplication.
+    """
+    assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
+    assert (
+        a_s.is_contiguous() and b_s.is_contiguous()
+    ), "Scaling factor tensors must be contiguous"
+    K = a.size(-1)
+    M = a.numel() // K
+    N = b.size(0)
+    c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]),
+        triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    w8a8_gemm_per_token_per_channel_kernel[grid](a, b, c, a_s, b_s, M, N, K)
+    return c
+
+
+@auto_retry_triton_compilation
+def w4a8_gemm_per_token_per_channel_asymm_triton(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    b_z: torch.Tensor,
+):
+    assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
+    assert (
+        a_s.is_contiguous() and b_s.is_contiguous()
+    ), "Scaling factor tensors must be contiguous"
+    assert b_z.is_contiguous(), "Zero-point tensor must be contiguous"
+    K = a.size(-1)
+    M = a.numel() // K
+    N = b.size(0)
+    c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]),
+        triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    w4a8_gemm_per_token_per_channel_asymm_kernel[grid](a, b, c, a_s, b_s, b_z, M, N, K)
+    return c
+
+
+@auto_retry_triton_compilation
+def fp8_gemm_deepseek_v3_triton_default(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+):
+    """
+    Perform a matrix multiplication using FP8 precision.
+
+    Args:
+        a (torch.Tensor): The first input matrix, must be contiguous.
+        a_s (torch.Tensor): The scaling factor for the first input matrix, must be contiguous.
+        b (torch.Tensor): The second input matrix, must be contiguous.
+        b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
+
+    Returns:
+        torch.Tensor: The result of the matrix multiplication.
+    """
+    assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
+    assert (
+        a_s.is_contiguous() and b_s.is_contiguous()
+    ), "Scaling factor tensors must be contiguous"
+    K = a.size(-1)
+    M = a.numel() // K
+    N = b.size(0)
+    c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]),
+        triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    has_deep_gemm = False
+    if torch.get_default_dtype() == torch.bfloat16 and is_hopper() is True:
+        deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
+    if has_deep_gemm and b.dtype is not torch.uint8:
+        deep_gemm.gemm_fp8_fp8_bf16_nt((a, a_s), (b, b_s), c)
+    else:
+        fp8_gemm_deepseek_v3_kernel[grid](
+            a, b, c, a_s, b_s, M, N, K, group_n=128, group_k=128
+        )
+    return c
+
+
+@auto_retry_triton_compilation
+def soft_fp8_gemm_deepseek_v3_triton(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+):
+    """
+    Perform a matrix multiplication with FP8 dynamically casted to BF16.
+
+    Args:
+        a (torch.Tensor): The first input matrix, must be contiguous.
+        b (torch.Tensor): The second input matrix, must be contiguous.
+        b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
+
+    Returns:
+        torch.Tensor: The result of the matrix multiplication.
+    """
+    assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
+    assert b_s.is_contiguous(), "Scaling factor tensor must be contiguous"
+    K = a.size(-1)
+    M = a.numel() // K
+    N = b.size(0)
+    c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+
+    # Some of our platforms only has Triton with low versions, where these is no `tl.cast`
+    # which is used for initializing a constant with a given type. Therefore, we need to
+    # pass `fp8_to_fp32_scale` as a constant from outside.
+    fp8_to_fp32_scale = struct.unpack(">f", bytes.fromhex("7b800000"))[0]
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    soft_fp8_gemm_deepseek_v3_kernel[grid](
+        a,
+        b.view(dtype=torch.uint8),
+        c,
+        b_s,
+        M,
+        N,
+        K,
+        group_n=128,
+        group_k=128,
+        fp8_to_fp32_scale=fp8_to_fp32_scale,
+        compute_dtype=to_triton_dtype(torch.get_default_dtype()),
+    )
+    return c
+
+
+@auto_retry_triton_compilation
+def soft_fp4_raise_to_fp8_gemm_deepseek_v3_triton(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: Packed4BitWeightAlongK,
+    b_s: torch.Tensor,
+    b_s_2: torch.Tensor,
+    act_block_size: int,
+):
+    """
+    Perform a matrix multiplication with FP8 dynamically casted to BF16.
+
+    Args:
+        a (torch.Tensor): The first input matrix, must be contiguous.
+        a_s (torch.Tensor): The scaling factor of first input matrix, must be contiguous.
+        b (Packed4BitWeightAlongK): The second input matrix, must be in Packed4BitWeightAlongK layout.
+        b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
+        b_s_2 (torch.Tensor): The scaling factor for b_s, must be contiguous.
+        act_block_size (int): The block size for activation quantization.
+
+    Returns:
+        torch.Tensor: The result of the matrix multiplication.
+    """
+
+    if packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"):
+        raise ImportError("Triton version >= 3.2.0 is required for soft fp4")
+
+    assert isinstance(b, Packed4BitWeightAlongK)
+    assert b.k_stride == 64
+
+    assert a.is_contiguous()
+    assert b.layout_tensor.is_contiguous()
+    assert a_s.is_contiguous(), "Scaling factor of A must be contiguous"
+    assert b_s.is_contiguous(), "Scaling factor tensor must be contiguous"
+    assert b_s_2.is_contiguous(), "Scaling_2 factor tensor must be contiguous"
+
+    assert b_s.dim() == 2
+    assert b_s.shape[0] == b.plain_shape[0]
+    assert b_s.shape[1] == b.plain_shape[1] // 16
+    assert b_s_2.dim() == 2
+    assert b_s_2.shape[0] == 1 or b_s_2.shape[0] == 2
+    assert b_s_2.shape[1] == 1
+
+    K = a.size(-1)
+    M = a.numel() // K
+    N = b.plain_shape[0]
+    c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+
+    BLOCK_SIZE_K = b.k_stride * 2
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]),
+        triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel[grid](
+        a,
+        b.layout_tensor,
+        c,
+        a_s,
+        b_s,
+        b_s_2,
+        M,
+        N,
+        K,
+        group_k=act_block_size,
+        stride_b_s=16,
+        is_w1w3=(b_s_2.shape[0] == 2),
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+    )
+    return c
+
+
+@auto_retry_triton_compilation
+def soft_fp4_raise_to_bf16_gemm_deepseek_v3_triton(
+    a: torch.Tensor,
+    b: Packed4BitWeightAlongK,
+    b_s: torch.Tensor,
+    b_s_2: torch.Tensor,
+):
+    """
+    Perform a matrix multiplication with FP8 dynamically casted to BF16.
+
+    Args:
+        a (torch.Tensor): The first input matrix, must be contiguous.
+        b (Packed4BitWeightAlongK): The second input matrix, must be in Packed4BitWeightAlongK layout.
+        b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
+        b_s_2 (torch.Tensor): The scaling factor for b_s, must be contiguous.
+
+    Returns:
+        torch.Tensor: The result of the matrix multiplication.
+    """
+
+    if packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"):
+        raise ImportError("Triton version >= 3.2.0 is required for soft fp4")
+
+    assert isinstance(b, Packed4BitWeightAlongK)
+    assert b.k_stride == 64
+
+    assert a.is_contiguous()
+    assert b.layout_tensor.is_contiguous()
+    assert b_s.is_contiguous(), "Scaling factor tensor must be contiguous"
+    assert b_s_2.is_contiguous(), "Scaling_2 factor tensor must be contiguous"
+
+    assert b_s.dim() == 2
+    assert b_s.shape[0] == b.plain_shape[0]
+    assert b_s.shape[1] == b.plain_shape[1] // 16
+    assert b_s_2.dim() == 2
+    assert b_s_2.shape[0] == 1 or b_s_2.shape[0] == 2
+    assert b_s_2.shape[1] == 1
+
+    K = a.size(-1)
+    M = a.numel() // K
+    N = b.plain_shape[0]
+    c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+
+    BLOCK_SIZE_K = b.k_stride * 2
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel[grid](
+        a,
+        b.layout_tensor,
+        c,
+        b_s,
+        b_s_2,
+        M,
+        N,
+        K,
+        stride_b_s=16,
+        is_w1w3=(b_s_2.shape[0] == 2),
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+    )
+    return c
+
+
+@auto_retry_triton_compilation
+def quant_einsum_shc_hdc_shd_triton(
+    group_A: torch.Tensor,
+    group_B: torch.Tensor,
+    group_b_s: torch.Tensor,
+    *,
+    group_n: int = 128,
+    group_k: int = 128,
+    soft_fp8: bool = False,
+):
+    assert group_B.shape[1] == group_b_s.shape[1] * group_k
+    assert group_B.shape[2] == group_b_s.shape[2] * group_n
+    s, h, c, d = (
+        group_A.shape[0],
+        group_A.shape[1],
+        group_A.shape[2],
+        group_B.shape[1],
+    )
+    group_size = h
+    M = s
+    K = c
+    N = d
+    stride_A_group, stride_A_m = group_A.stride()[1], group_A.stride()[0]
+    stride_B_group, stride_B_1 = group_B.stride()[0], group_B.stride()[1]
+    stride_C_group, stride_C_m = d, h * d
+    assert group_b_s.is_contiguous()
+    group_C = torch.empty((s, h, d), dtype=group_A.dtype, device=group_A.device)
+
+    if soft_fp8:
+        fp8_to_fp32_scale = struct.unpack(">f", bytes.fromhex("7b800000"))[0]
+    else:
+        fp8_to_fp32_scale = None
+
+    grid = lambda META: (
+        group_size,
+        triton.cdiv(M, META["BLOCK_SIZE_M"]),
+        triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+
+    quant_einsum_shc_hdc_shd_kernel[grid](
+        group_A,
+        group_B,
+        group_b_s,
+        group_C,
+        M,
+        K,
+        N,
+        stride_A_group,
+        stride_A_m,
+        stride_B_group,
+        stride_B_1,
+        stride_C_group,
+        stride_C_m,
+        group_n,
+        group_k,
+        fp8_to_fp32_scale=fp8_to_fp32_scale,
+    )
+
+    return group_C
 
 
 @triton.jit
@@ -958,118 +1210,7 @@ def soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel(
     tl.store(c_ptrs, c, mask=mask)
 
 
-@triton.jit
-def moe_sum_kernel(
-    # Pointers to matrices
-    input_ptr,
-    output_ptr,
-    # Matrix dimensions
-    M,
-    topK,
-    N,
-    # Meta-parameters
-    BLOCK_SIZE_N: tl.constexpr,
-):
-    """
-    Kernel for summing a 3D tensor along dimension 1 (topK).
-    Input shape: (M, topK, N)
-    Output shape: (M, N)
-    """
-    # Program ID
-    row_index = tl.program_id(axis=0)
-    # Create offsets for m and n dimensions
-    offs_n = tl.arange(0, BLOCK_SIZE_N)
-
-    # Create a mask to handle the case where the block extends beyond the matrix
-    n_mask = offs_n < N
-
-    # Initialize the output sum to zero
-    output_sum = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
-
-    # Loop over the topK dimension
-    for k in range(topK):
-        # Compute the input offset for the current slice
-        # input[m, k, n] is at input_ptr + m * (topK * N) + k * N + n
-        input_offset = row_index * (topK * N) + k * N + offs_n
-
-        # Load the input values for the current slice
-        x = tl.load(input_ptr + input_offset, n_mask, other=0.0)
-
-        # Add to the running sum
-        output_sum += x
-
-    # Compute the output offset
-    # output[m, n] is at output_ptr + m * N + n
-    output_offset = row_index * N + offs_n
-
-    # Store the final sum to the output tensor
-    tl.store(output_ptr + output_offset, output_sum, mask=n_mask)
-
-
-configs = [
-    triton.Config(
-        {},
-        num_warps=num_warps,
-    )
-    for num_warps in ([4, 8] if is_muxi() else [4, 8, 16])
-]
-
-
-@triton.autotune(configs=configs, key=["output_n_cols"])
-@triton.jit
-def silu_and_mul_kernel(output_ptr, x_ptr, output_n_cols, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)
-    row_start_ptr = x_ptr + row_idx * output_n_cols * 2
-    offsets = tl.arange(0, BLOCK_SIZE)
-    part1 = tl.load(row_start_ptr + offsets, mask=(offsets < output_n_cols), other=0)
-    part2 = tl.load(
-        row_start_ptr + output_n_cols + offsets, mask=(offsets < output_n_cols), other=0
-    )
-    part1_fp32 = part1.to(tl.float32)
-    silu_part1_fp32 = part1_fp32 / (1 + tl.exp(-1 * part1_fp32))
-    silu_part1 = silu_part1_fp32.to(part1.dtype)
-    result = silu_part1 * part2
-    output = output_ptr + row_idx * output_n_cols + offsets
-    tl.store(output, result, mask=(offsets < output_n_cols))
-
-
-@triton.autotune(configs=configs, key=["Y_row_stride", "X_row_stride", "compute_dtype"])
-@triton.jit
-def rms_norm_kernel(
-    Y,
-    Y_row_stride: tl.constexpr,
-    X,
-    X_row_stride: tl.constexpr,
-    W,
-    n_cols: tl.constexpr,
-    eps: tl.constexpr,
-    compute_dtype: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Fast RMS Layernorm kernel
-    Inspiration from a Triton tutorial:
-    https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html
-    """
-    row_idx = tl.program_id(0)
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < n_cols
-
-    Y += row_idx * Y_row_stride
-    X += row_idx * X_row_stride
-
-    X_row = tl.load(X + col_offsets, mask=mask, other=0).to(compute_dtype)
-    W_row = tl.load(W + col_offsets, mask=mask, other=0)
-
-    row_var = tl.sum(X_row * X_row, axis=0) / n_cols
-    inv_var = tl.math.rsqrt(row_var + eps)
-    normed = X_row * inv_var
-    normed = normed.to(W_row.dtype)  # Be consistent with impl="ref"
-    output = normed * W_row
-    tl.store(Y + col_offsets, output, mask=mask)
-
-
-def grouped_matmul_config_filter(*, block_m, block_n, num_stages):
+def quant_einsum_shc_hdc_shd_config_filter(*, block_m, block_n, num_stages):
     # Work around some bugs that not only make a config invalid, and even crashes the program
     if is_muxi():
         if num_stages > 1:
@@ -1078,14 +1219,14 @@ def grouped_matmul_config_filter(*, block_m, block_n, num_stages):
     return True
 
 
-grouped_matmul_configs = [
+quant_einsum_shc_hdc_shd_configs = [
     Config(
         {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": 128},
         num_stages=num_stages,
         num_warps=8,
         pre_hook=functools.partial(
             auto_tuning_logger,
-            name="grouped_matmul_kernel",
+            name="quant_einsum_shc_hdc_shd_kernel",
             block_m=block_m,
             block_n=block_n,
             num_stages=num_stages,
@@ -1094,15 +1235,17 @@ grouped_matmul_configs = [
     for block_m in [16, 32, 64]
     for block_n in [32, 64, 128]
     for num_stages in [1, 3, 5]
-    if grouped_matmul_config_filter(
+    if quant_einsum_shc_hdc_shd_config_filter(
         block_m=block_m, block_n=block_n, num_stages=num_stages
     )
 ]
 
 
-@triton.autotune(configs=grouped_matmul_configs, key=["N", "K", "fp8_to_fp32_scale"])
+@triton.autotune(
+    configs=quant_einsum_shc_hdc_shd_configs, key=["N", "K", "fp8_to_fp32_scale"]
+)
 @triton.jit
-def grouped_matmul_kernel(
+def quant_einsum_shc_hdc_shd_kernel(
     # Pointers:
     group_a_ptrs,
     group_b_ptrs,
@@ -1196,33 +1339,3 @@ def grouped_matmul_kernel(
     )
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(c_ptrs, c, mask=mask)
-
-
-@triton.jit
-def apply_frequency_penalty_kernel(
-    logits_ptr,
-    logits_index_ptr,
-    response_ptr,
-    logits_row_stride: tl.constexpr,
-    logits_col_stride: tl.constexpr,
-    response_row_stride: tl.constexpr,
-    vocab_size: tl.constexpr,
-    response_len_list,
-    frequency_penalty_list,
-    batch_size: tl.constexpr,  # Number of elements in logits_index
-    num_threads: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    thread_id = tl.program_id(axis=1)
-
-    logits_row = tl.load(logits_index_ptr + pid)
-    row_start = logits_row * logits_row_stride
-    response_len = tl.load(response_len_list + pid)
-    frequency_penalty = tl.load(frequency_penalty_list + pid)
-
-    for token_pos in range(thread_id, response_len, num_threads):
-        token_id = tl.load(response_ptr + pid * response_row_stride + token_pos)
-        logits_pos = row_start + token_id * logits_col_stride
-        tl.atomic_add(
-            logits_ptr + logits_pos, -frequency_penalty, token_id < vocab_size
-        )

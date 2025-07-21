@@ -14,7 +14,6 @@ from chitu.cache_manager import PagedKVCacheManager
 from chitu.cuda_graph import make_dispatched_graphed_callables
 from chitu.device_type import is_ascend, is_muxi, is_nvidia
 from chitu.global_vars import get_global_args, get_timers
-from chitu.layers.gate import fused_sigmoid_gate
 from chitu.muxi_utils import (
     has_tbsgemm,
     grouped_topk,
@@ -23,7 +22,7 @@ from chitu.muxi_utils import (
     LinearMuxiLayoutContigY,
     LinearMuxiLayoutNativeY,
 )
-from chitu.ops import apply_rotary_pos_emb, rms_norm, topk_softmax
+from chitu.ops import apply_rotary_pos_emb, rms_norm, topk_softmax, fused_sigmoid_gate
 from chitu.distributed.parallel_state import get_tp_group, get_tp_size
 from chitu.utils import (
     VarLens,

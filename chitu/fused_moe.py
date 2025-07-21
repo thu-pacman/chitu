@@ -16,14 +16,15 @@ import triton
 import triton.language as tl
 
 from chitu.device_type import is_muxi, is_nvidia
-from chitu.triton_kernels import (
-    moe_sum_kernel,
+from chitu.ops import silu_and_mul
+from chitu.ops.triton_ops import moe_sum_triton
+from chitu.ops.triton_ops.quant import (
     SIGNED_INT32_0x87F00000,
     SIGNED_INT16_0x81C0,
     SIGNED_INT16_0x87F0,
     SIGNED_INT8_0x9C,
 )
-from chitu.ops import silu_and_mul, to_triton_dtype
+from chitu.ops.triton_ops.utils import to_triton_dtype
 from chitu.utils import ceil_div, try_import_opt_dep
 
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
@@ -66,7 +67,7 @@ def moe_sum(input_tensor, output_tensor):
     BLOCK_SIZE_N, num_warps = calculate_settings(N)
     # Determine grid and block sizes
 
-    moe_sum_kernel[M,](
+    moe_sum_triton[M,](
         input_tensor,
         output_tensor,
         M,

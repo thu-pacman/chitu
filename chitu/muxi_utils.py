@@ -144,7 +144,7 @@ def _(
             muxi_layout_kernels.muxi_hgemm_layout(
                 w.layout_tensor, x_transposed.layout_tensor, bias=b
             ),
-            multiple_of=x.multiple_of,
+            multiple_of=16,
         )
         y = MuxiNativeLayoutActivation.convert_from(y)
     else:

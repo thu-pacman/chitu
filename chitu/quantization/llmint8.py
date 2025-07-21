@@ -21,7 +21,9 @@ class LLMInt8Linear(QuantizedLinearBase):
         out_features: int,
         has_bias: bool = True,
         ############################################
-        # No parameters specific to this quantization
+        # Parameters specific to this quantization
+        has_fp16_weights: bool = False,
+        threshold: float = 6.0,
     ) -> torch.nn.Module:
 
         super().__init__()
@@ -30,8 +32,8 @@ class LLMInt8Linear(QuantizedLinearBase):
             in_features,
             out_features,
             bias=has_bias,
-            has_fp16_weights=kwargs.get("has_fp16_weights", False),
-            threshold=kwargs.get("threshold", 6.0),
+            has_fp16_weights=has_fp16_weights,
+            threshold=threshold,
         )
         for name, buffer in bnb_module.named_buffers():
             self.register_buffer(name, buffer)

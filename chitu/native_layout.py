@@ -286,7 +286,7 @@ class Packed4BitWeightAlongK(NativeLayoutTensor):
                     -1, k // (2 * tensor.k_stride), 1, tensor.k_stride
                 ).view(torch.uint8)
                 weight = torch.cat([weight & 0x0F, weight >> 4], dim=-2)
-                weight = torch.view(-1, k // (2 * k_stride), 2, k_stride)
+                weight = weight.view(-1, k // (2 * k_stride), 2, k_stride)
                 weight = weight[..., 0, :] + (weight[..., 1, :] << 4)
             weight = weight.view(*tensor.plain_shape[:-1], k // 2).contiguous()
             return cls(
