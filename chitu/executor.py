@@ -1,7 +1,8 @@
 import os
 from dataclasses import dataclass
 from logging import getLogger
-from typing import List, Optional
+from typing import List, Optional, Tuple
+from abc import ABC, abstractmethod
 
 import numpy as np
 import torch
@@ -20,6 +21,7 @@ from chitu.task import (
 )
 from chitu.distributed.parallel_state import (
     get_tp_group,
+    get_pp_group,
     get_pp_pair_group,
     get_cpu_tp_group,
 )
@@ -58,87 +60,324 @@ class BatchResult:
     token_idxs: Optional[torch.Tensor] = None
 
 
-class TasksDispatcher:
+class TasksDispatcher(ABC):
     def __init__(self):
         pass
 
-    # recv metadata from previous worker
-    def recv_metadata(self, metadata: Optional[PackedTasksBase]) -> PackedTasksBase:
-        raise NotImplementedError()
-
-    # send metadata to next worker
-    def send_metadata(self, metadata: PackedTasksBase):
+    # dispatch metadata from previous worker and send to next
+    @abstractmethod
+    def dispatch_metadata(self, *args, **kwargs):
         raise NotImplementedError()
 
     # recv payload from previous worker
-    def recv_payload(self, payload: torch.Tensor) -> torch.Tensor:
+    @abstractmethod
+    def recv_payload(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError()
 
     # send payload to next worker
-    def send_payload(self, payload: torch.Tensor, tasks: PackedTasks):
+    @abstractmethod
+    def send_payload(self, *args, **kwargs):
         raise NotImplementedError()
 
-    # epilogue: send payload to next worker and register ongoing tasks
-    def epilogue(
+
+class PipeDispatcher(TasksDispatcher):
+    def __init__(self):
+        super().__init__()
+        self.pp_group = get_pp_group()
+        self.rank = self.pp_group.global_rank
+        self.local_rank = self.pp_group.local_rank
+
+        self.is_main_rank = 0 in self.pp_group.rank_list
+
+        self.is_first_stage = self.rank == self.pp_group.rank_list[0]
+        self.is_last_stage = self.rank == self.pp_group.rank_list[-1]
+
+        self.next_rank = self.pp_group.next_rank
+        self.prev_rank = self.pp_group.prev_rank
+
+        # Compatible with NPU platforms logic. Otherwise, pair_group is None
+        self.next_pair_group = get_pp_pair_group(self.rank, self.next_rank)
+        self.prev_pair_group = get_pp_pair_group(self.rank, self.prev_rank)
+
+    def dispatch_metadata(
         self,
-        payload: torch.Tensor,
-        tasks: PackedTasks,
-        ongoing_task_manager,
-    ):
-        raise NotImplementedError()
+        tasks: Optional[PackedTasksBase],
+        payload_type: Optional[SerializedPackedTasksPayloadType] = None,
+    ) -> Optional[Tuple[SerializedPackedTasksPayloadType, PackedTasksBase]]:
+        # recv task from previous stage
+        if self.is_first_stage:
+            task_tensor = tasks.serialize(
+                payload_type=payload_type,
+                device="cpu" if Backend.use_gloo else self.local_rank,
+            )
+        else:
+            task_tensor = PackedTasksBase.empty_serialization(
+                device="cpu" if Backend.use_gloo else self.local_rank
+            )
+            torch.distributed.recv(
+                tensor=task_tensor,
+                src=self.prev_rank,
+                tag=TASK_TENSOR_TAG,
+                group=(
+                    Backend.group_gloo if Backend.use_gloo else self.prev_pair_group
+                ),
+            )
+            payload_type, tasks = PackedTasksBase.deserialize(task_tensor)
+
+        # send task to next stage
+        if not self.is_last_stage:
+            torch.distributed.send(  # [NOTE] figure out why isend is not working
+                tensor=task_tensor,
+                dst=self.next_rank,
+                tag=TASK_TENSOR_TAG,
+                group=Backend.group_gloo if Backend.use_gloo else self.next_pair_group,
+            )
+
+        return payload_type, tasks
+
+    def recv_payload(self, payload: torch.Tensor) -> torch.Tensor:
+        # only hidden payload
+        if not self.is_first_stage:
+            torch.distributed.recv(
+                tensor=payload,
+                src=self.prev_rank,
+                tag=HIDDEN_TENSOR_TAG,
+                group=self.prev_pair_group,
+            )
+        return payload
+
+    def send_payload(self, payload: torch.Tensor):
+        # logits / hidden payload
+        if self.is_last_stage:
+            payload = payload.view(payload.shape[0], -1)
+            tag = LOGIT_TAG
+        else:
+            tag = HIDDEN_TENSOR_TAG
+
+        torch.distributed.isend(
+            tensor=payload.contiguous(),  # contiguous() is necessary for NCCL
+            dst=self.next_rank,
+            tag=tag,
+            group=self.next_pair_group,
+        )
+
+
+class TensorDispatcher(TasksDispatcher):
+    def __init__(self):
+        super().__init__()
+        self.tp_group = get_tp_group()
+        self.rank = self.tp_group.global_rank
+        self.local_rank = self.tp_group.local_rank
+
+        self.gpu_group = self.tp_group.gpu_group
+        self.cpu_group = self.tp_group.cpu_group
+
+        self.tp_main_rank = self.tp_group.rank_list[0]
+        self.is_main_rank = self.rank == self.tp_group.rank_list[0]  # not use?
+
+    def dispatch_metadata(
+        self,
+        tasks: Optional[PackedTasksBase],
+        payload_type: Optional[SerializedPackedTasksPayloadType] = None,
+    ) -> Tuple[SerializedPackedTasksPayloadType, PackedTasksBase]:
+        if self.is_main_rank:
+            task_tensor = tasks.serialize(
+                payload_type=payload_type,
+                device="cpu" if Backend.use_gloo else self.local_rank,
+            )
+        else:
+            task_tensor = PackedTasksBase.empty_serialization(
+                device="cpu" if Backend.use_gloo else self.local_rank
+            )
+
+        torch.distributed.broadcast(
+            tensor=task_tensor,
+            src=self.tp_main_rank,
+            group=self.cpu_group if Backend.use_gloo else self.gpu_group,
+        )
+        if not self.is_main_rank:
+            payload_type, tasks = PackedTasksBase.deserialize(task_tensor)
+        return payload_type, tasks
+
+    def recv_payload(self, payload: torch.Tensor) -> torch.Tensor:
+        torch.distributed.broadcast(
+            tensor=payload, src=self.tp_main_rank, group=self.gpu_group
+        )
+        return payload
+
+    def send_payload(self, payload: torch.Tensor):
+        return
 
 
 class Executor:
-    @staticmethod
-    def build(args):
-        if args.infer.pp_size > 1:
-            return PipeTensorExecutor(args)
-        elif args.infer.tp_size > 1:
-            return TensorExecutor(args)
-        else:
-            return NormalExecutor(args)
+
+    @classmethod
+    def build(cls, args) -> "Executor":
+        return cls(args)
 
     def __init__(self, args):
         self.timers = get_timers()
+        self.rank = torch.distributed.get_rank()
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.pp_size = args.infer.pp_size
+        self.tp_size = args.infer.tp_size
+        self.pipe_dispatcher = None
+        self.task_dispatchers = []
+        if self.pp_size > 1:
+            self.pipe_dispatcher = PipeDispatcher()
+            if self.pipe_dispatcher.is_main_rank:
+                self.task_dispatchers.append(self.pipe_dispatcher)
+        if self.tp_size > 1:
+            self.task_dispatchers.append(TensorDispatcher())
+
+        if self.pipe_dispatcher and not self.pipe_dispatcher.is_first_stage:
+            self.get_payload_shape = lambda num_tokens: [num_tokens, args.models.dim]
+            self.get_payload_dtype = lambda: torch.get_default_dtype()
+        else:
+            self.get_payload_shape = lambda num_tokens: [num_tokens]
+            self.get_payload_dtype = lambda: torch.int64
+
+    def _prepare_seq_lens_for_decode(self, tasks: PackedTasksBase):
+        return [Backend.cache_manager.seq_lens[req_id] for req_id in tasks.req_ids]
+
+    def _prepare_new_tokens_for_decode(self, tasks: PackedTasks):
+        return torch.tensor(
+            [task.next_token for task in tasks.tasks],
+            device="cuda",
+            dtype=torch.long,
+        )
 
     def step(
         self,
         tasks: PackedTasksBase,
     ):
-        """
-        :return: logits: torch.Tensor if not PP, None if PP
-        """
-        raise NotImplementedError
+        remove_kvcache = False
 
-    def postprocess_sync_part(
-        self, tasks: PackedTasks, logits: torch.Tensor
-    ) -> BatchResult:
-        raise NotImplementedError
+        # 1. propagate tasks and handle special payload type
+        payload_type = None
+        for dispatcher in self.task_dispatchers:
+            payload_type, tasks = dispatcher.dispatch_metadata(tasks, payload_type)
 
-    def postprocess_async_part(self, batch_result: BatchResult) -> None:
-        raise NotImplementedError
+        is_heartbeat = payload_type == SerializedPackedTasksPayloadType.Heartbeat
+        if payload_type == SerializedPackedTasksPayloadType.TerminateBackend:
+            Backend.state = BackendState.Terminated
+        if payload_type == SerializedPackedTasksPayloadType.EndTask:
+            remove_kvcache = True
+        if is_heartbeat or Backend.state == BackendState.Terminated:
+            return None
+        if remove_kvcache:
+            for rid in tasks.req_ids:
+                Backend.cache_manager.finalize_cache_all_decode(rid)
+            return None
 
-    def _prepare_seq_lens_for_decode(self, tasks: PackedTasksBase):
-        seq_lens = []
-        for req_id in tasks.req_ids:
-            seq_len = Backend.cache_manager.seq_lens[req_id]
-            seq_lens.append(seq_len)
-        return seq_lens
+        # 2. prefill/decode step
+        if tasks.task_type == TaskType.Prefill:
+            out = self.prefill_step(tasks)
+        elif tasks.task_type == TaskType.Decode:
+            out = self.decode_step(tasks)
+        else:
+            raise NotImplementedError  # Hybrid task not implemented
 
-    def _prepare_new_tokens_for_decode(self, tasks: PackedTasks):
-        new_tokens = []
-        for task in tasks.tasks:
-            new_tokens.append(task.next_token)
-        new_tokens = torch.tensor(
-            new_tokens, device="cuda", dtype=torch.long
-        ).unsqueeze(1)
-        return new_tokens
+        # 3. handle ongoing task
+        if self.rank == 0:
+            if tasks.task_type == TaskType.Prefill:
+                # After prefill, new decode tasks are created
+                for task in tasks.tasks:
+                    task.start_decoding()
 
+            if self.pp_size > 1:
+                self._recv_logits(tasks)
 
-class NormalExecutor(Executor):
+        return out
 
-    def __init__(self, args):
-        super().__init__(args)
+    def prefill_step(self, tasks: PackedTasksBase):
+
+        varlens = VarLens(tasks.tokens, device=self.local_rank)
+        Backend.cache_manager.curr_varlens = varlens
+        Backend.cache_manager.curr_req_ids = tasks.req_ids
+
+        num_tokens = varlens.total_len
+
+        if self.rank == 0:
+            payload = torch.from_numpy(np.concatenate(tasks.tokens)).to(self.local_rank)
+        else:
+            payload = torch.empty(
+                self.get_payload_shape(num_tokens),
+                dtype=self.get_payload_dtype(),
+                device=self.local_rank,
+            )
+
+        # payload recv
+        for dispatcher in self.task_dispatchers:
+            payload = dispatcher.recv_payload(payload)
+
+        self.timers("prefill").start()
+        out = Backend.model.prefill(payload)
+        self.timers("prefill").stop()
+
+        # payload send
+        for dispatcher in self.task_dispatchers:
+            dispatcher.send_payload(out)
+
+        Backend.cache_manager.finalize_cache_all_prefill(
+            tasks.req_ids, varlens
+        )  # like reset metadata
+        return out
+
+    def decode_step(self, tasks: PackedTasksBase):
+        Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
+        Backend.cache_manager.curr_req_ids = tasks.req_ids
+        if isinstance(Backend.cache_manager, PagedKVCacheManager):
+            Backend.cache_manager.prepare_block_table_for_decode(tasks.req_ids)
+        seq_lens = self._prepare_seq_lens_for_decode(tasks)
+
+        num_tokens = tasks.num_tasks
+
+        # prepare payload tensor
+        if self.rank == 0:
+            payload = self._prepare_new_tokens_for_decode(tasks)  # tensor
+        else:
+            payload = torch.empty(
+                self.get_payload_shape(num_tokens),
+                dtype=self.get_payload_dtype(),
+                device=self.local_rank,
+            )
+
+        # payload recv
+        for dispatcher in self.task_dispatchers:
+            payload = dispatcher.recv_payload(payload)
+
+        payload = payload.unsqueeze(1)  # convert [B, :] to [B, 1, :]
+
+        self.timers("decode").start()
+        out = Backend.model.decode(payload, seq_lens)
+        self.timers("decode").stop()
+        # check output shape
+
+        # payload send
+        for dispatcher in self.task_dispatchers:
+            dispatcher.send_payload(out)
+
+        Backend.cache_manager.finalize_cache_single_decode(
+            tasks.req_ids
+        )  # update seq_len and reset block table
+        return out
+
+    def _recv_logits(self, tasks: PackedTasks):
+        logits = torch.empty(
+            [tasks.num_tasks, Backend.model.vocab_size],
+            device=self.local_rank,
+            dtype=torch.float,
+        )
+        handle = torch.distributed.irecv(
+            logits,
+            src=self.pipe_dispatcher.prev_rank,
+            tag=LOGIT_TAG,
+            group=self.pipe_dispatcher.prev_pair_group,
+        )
+        Backend.ongoing_reqs.append(OngoingRequests(tasks, handle, logits))
+        for it, task in enumerate(tasks.tasks):
+            task.wait(handle)
 
     def sample(self, logits: torch.Tensor, tasks: PackedTasks):
         # logits is [num_tasks, vocab_size]
@@ -246,421 +485,3 @@ class NormalExecutor(Executor):
                 task.req.add_data(next_token)
 
         TaskLoad.increase(batch_result.num_tasks)
-
-    def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
-        """Make every ranks know the task metadata"""
-        return tasks  # Need to do nothing if not parallelized
-
-    def prefill_step(self, tasks: PackedTasks):
-        logger.debug(f"Prefill step: {tasks.task_ids}")
-        varlens = VarLens(tasks.tokens, "cuda")
-        self.timers("prefill").start()
-        Backend.cache_manager.curr_varlens = varlens
-        Backend.cache_manager.curr_req_ids = tasks.req_ids
-        logits = Backend.model.prefill(tasks.tokens)
-        self.timers("prefill").stop()
-        for task in tasks.tasks:
-            task.start_decoding()
-        varlens = VarLens(tasks.tokens, "cuda")
-        Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
-        return logits
-
-    def decode_step(self, tasks: PackedTasksBase):
-        logger.debug(f"Decode step: {tasks.task_ids}")
-        Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
-        Backend.cache_manager.curr_req_ids = tasks.req_ids
-        if isinstance(Backend.cache_manager, PagedKVCacheManager):
-            Backend.cache_manager.prepare_block_table_for_decode(tasks.req_ids)
-        self.timers("decode").start()
-        new_tokens = self._prepare_new_tokens_for_decode(tasks)
-        seq_lens = self._prepare_seq_lens_for_decode(tasks)
-        self.timers("decode-model").start()
-        logits = Backend.model.decode(new_tokens, seq_lens)
-        self.timers("decode-model").stop()
-        self.timers("decode").stop()
-        Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
-        return logits
-
-    def step(
-        self,
-        tasks: PackedTasksBase,
-    ):
-        tasks = self.propagate_tasks(tasks)
-        if tasks is None:
-            return
-        if tasks.task_type == TaskType.Prefill:
-            return self.prefill_step(tasks)
-        elif tasks.task_type == TaskType.Decode:
-            return self.decode_step(tasks)
-        else:
-            raise NotImplementedError  # Hybrid task not implemented
-
-
-class PipeTensorExecutor(NormalExecutor):
-
-    def __init__(self, args):
-        super().__init__(args)
-        self.rank = torch.distributed.get_rank()
-        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        self.tp_size = args.infer.tp_size
-        self.pp_size = args.infer.pp_size
-        self.pp_stage = Backend.pp_stage
-        self.pp_main_rank = Backend.pp_main_rank
-        self.pp_end_stage = Backend.pp_end_stage
-        self.last_pp_main_rank = self.pp_end_stage * self.tp_size
-        self.tp_group = get_tp_group().gpu_group
-        self.cpu_tp_group = get_cpu_tp_group()
-
-    def prefill_step(self, tasks: PackedTasksBase):
-        varlens = VarLens(tasks.tokens, device=self.local_rank)
-        Backend.cache_manager.curr_varlens = varlens
-        Backend.cache_manager.curr_req_ids = tasks.req_ids
-
-        if self.rank == 0:
-            inp = torch.from_numpy(np.concatenate(tasks.tokens)).to(self.local_rank)
-            if self.tp_size > 1:
-                torch.distributed.broadcast(
-                    tensor=inp, src=self.pp_main_rank, group=self.tp_group
-                )  # TODO main rank 处理统一放后面
-        else:
-            if self.pp_stage == 0:
-                inp = torch.empty(
-                    [sum(len(seq) for seq in tasks.tokens)],
-                    dtype=torch.int64,
-                    device=self.local_rank,
-                )
-            else:
-                inp = torch.empty(
-                    [
-                        sum([len(token) for token in tasks.tokens]),
-                        Backend.model.params.dim,
-                    ],
-                    device=self.local_rank,
-                )
-            if self.rank == self.pp_main_rank:
-                pg = get_pp_pair_group(self.rank, self.rank - self.tp_size)
-                torch.distributed.recv(
-                    tensor=inp,
-                    src=self.rank - self.tp_size,
-                    tag=HIDDEN_TENSOR_TAG,
-                    group=pg,
-                )
-            if self.tp_size > 1:
-                torch.distributed.broadcast(
-                    tensor=inp, src=self.pp_main_rank, group=self.tp_group
-                )
-        self.timers("prefill").start()
-
-        out = Backend.model.prefill(inp)
-
-        self.timers("prefill").stop()
-        if self.rank == self.pp_main_rank and self.pp_stage != self.pp_end_stage:
-            pg = get_pp_pair_group(self.rank, self.rank + self.tp_size)
-            torch.distributed.isend(
-                tensor=out.contiguous(),  # contiguous() is necessary for NCCL
-                dst=self.rank + self.tp_size,
-                tag=HIDDEN_TENSOR_TAG,
-                group=pg,
-            )
-        elif self.rank == self.pp_main_rank and self.pp_stage == self.pp_end_stage:
-            # send logits to rank 0 to get response words
-            torch.cuda.synchronize(self.local_rank)
-            pg = get_pp_pair_group(self.rank, 0)
-            torch.distributed.isend(
-                tensor=out.contiguous(),  # contiguous() is necessary for NCCL
-                dst=0,
-                tag=LOGIT_TAG,
-                group=pg,
-            )
-        Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
-        return out
-
-    def decode_step(self, tasks: PackedTasksBase):
-        Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
-        Backend.cache_manager.curr_req_ids = tasks.req_ids
-        if isinstance(Backend.cache_manager, PagedKVCacheManager):
-            Backend.cache_manager.prepare_block_table_for_decode(tasks.req_ids)
-        if self.rank == 0:
-            inp = self._prepare_new_tokens_for_decode(tasks)  # tensor
-            if self.tp_size > 1:
-                torch.distributed.broadcast(
-                    tensor=inp, src=self.pp_main_rank, group=self.tp_group
-                )
-        else:
-            if self.pp_stage == 0:
-                inp = torch.empty(
-                    [tasks.num_tasks, 1], dtype=torch.int64, device=self.local_rank
-                )
-            else:
-                inp = torch.empty(
-                    [tasks.num_tasks, 1, Backend.model.params.dim],
-                    device=self.local_rank,
-                )
-            if self.rank == self.pp_main_rank:
-                pg = get_pp_pair_group(self.rank, self.rank - self.tp_size)
-                torch.distributed.recv(
-                    tensor=inp,
-                    src=self.rank - self.tp_size,
-                    tag=HIDDEN_TENSOR_TAG,
-                    group=pg,
-                )
-            if self.tp_size > 1:
-                torch.distributed.broadcast(
-                    tensor=inp, src=self.pp_main_rank, group=self.tp_group
-                )
-        self.timers("decode").start()
-        seq_lens = self._prepare_seq_lens_for_decode(tasks)
-        self.timers("decode-model").start()
-        out = Backend.model.decode(inp, seq_lens)
-        self.timers("decode-model").stop()
-        self.timers("decode").stop()
-        if self.rank == self.pp_main_rank and self.pp_stage != self.pp_end_stage:
-            pg = get_pp_pair_group(self.rank, self.rank + self.tp_size)
-            torch.distributed.isend(
-                tensor=out.contiguous(),  # contiguous() is necessary for NCCL
-                dst=self.rank + self.tp_size,
-                tag=HIDDEN_TENSOR_TAG,
-                group=pg,
-            )
-        elif self.rank == self.pp_main_rank and self.pp_stage == self.pp_end_stage:
-            # Send logits to rank 0 to get response words
-            out = out.view(out.shape[0], -1)
-            pg = get_pp_pair_group(self.rank, 0)
-            torch.distributed.isend(
-                out.contiguous(),  # contiguous() is necessary for NCCL
-                dst=0,
-                tag=LOGIT_TAG,
-                group=pg,
-            )
-        Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
-        return out
-
-    def _recv_logits(self, tasks: PackedTasks):
-        logits = torch.empty(
-            [tasks.num_tasks, Backend.model.vocab_size],
-            device=self.local_rank,
-            dtype=torch.float,
-        )
-        pg = get_pp_pair_group(self.rank, self.last_pp_main_rank)
-        handle = torch.distributed.irecv(
-            logits, src=self.last_pp_main_rank, tag=LOGIT_TAG, group=pg
-        )
-        Backend.ongoing_reqs.append(OngoingRequests(tasks, handle, logits))
-        for it, task in enumerate(tasks.tasks):
-            task.wait(handle)
-
-    def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
-        remove_kvcache = False
-        is_heartbeat = False
-
-        # PP stage 0 initialize from the argument. PP stage >= 1 recv task tensor from stage - 1
-        if self.rank == 0:
-            if Backend.state == BackendState.Running:
-                task_tensor = tasks.serialize(
-                    device="cpu" if Backend.use_gloo else self.local_rank
-                )
-            else:
-                assert Backend.state == BackendState.Terminating
-                task_tensor = PackedTasksBase.serialize_special(
-                    SerializedPackedTasksPayloadType.TerminateBackend,
-                    device="cpu" if Backend.use_gloo else self.local_rank,
-                )
-            if self.tp_size > 1:
-                if not Backend.use_gloo:
-                    torch.distributed.broadcast(
-                        tensor=task_tensor, src=self.pp_main_rank, group=self.tp_group
-                    )
-                elif self.pp_size == 1:
-                    torch.distributed.broadcast(
-                        tensor=task_tensor,
-                        src=self.pp_main_rank,
-                        group=Backend.group_gloo,
-                    )
-                else:
-                    torch.distributed.broadcast(
-                        tensor=task_tensor,
-                        src=self.pp_main_rank,
-                        group=self.cpu_tp_group,
-                    )
-
-        else:
-            task_tensor = PackedTasksBase.empty_serialization(
-                device="cpu" if Backend.use_gloo else self.local_rank
-            )
-            if self.rank == self.pp_main_rank:
-                pg = get_pp_pair_group(self.rank, self.rank - self.tp_size)
-                torch.distributed.recv(
-                    tensor=task_tensor,
-                    src=self.rank - self.tp_size,
-                    tag=TASK_TENSOR_TAG,
-                    group=Backend.group_gloo if Backend.use_gloo else pg,
-                )
-            if self.tp_size > 1:
-                if not Backend.use_gloo:
-                    torch.distributed.broadcast(
-                        tensor=task_tensor, src=self.pp_main_rank, group=self.tp_group
-                    )
-                elif self.pp_size == 1:
-                    torch.distributed.broadcast(
-                        tensor=task_tensor,
-                        src=self.pp_main_rank,
-                        group=Backend.group_gloo,
-                    )
-                else:
-                    torch.distributed.broadcast(
-                        tensor=task_tensor,
-                        src=self.pp_main_rank,
-                        group=self.cpu_tp_group,
-                    )
-            task_tensor_type, tasks = PackedTasksBase.deserialize(task_tensor)
-            is_heartbeat = (
-                task_tensor_type == SerializedPackedTasksPayloadType.Heartbeat
-            )
-            if task_tensor_type == SerializedPackedTasksPayloadType.TerminateBackend:
-                Backend.state = BackendState.Terminating
-            if task_tensor_type == SerializedPackedTasksPayloadType.EndTask:
-                remove_kvcache = True
-
-        if self.rank == self.pp_main_rank and self.pp_stage != self.pp_end_stage:
-            pg = get_pp_pair_group(self.rank, self.rank + self.tp_size)
-            torch.distributed.send(
-                tensor=task_tensor,
-                dst=self.rank + self.tp_size,
-                tag=TASK_TENSOR_TAG,
-                group=Backend.group_gloo if Backend.use_gloo else pg,
-            )
-        if is_heartbeat:
-            return None
-        if Backend.state == BackendState.Terminating:
-            Backend.state = BackendState.Terminated
-        if Backend.state == BackendState.Terminated:
-            return None
-
-        if remove_kvcache:
-            for rid in tasks.req_ids:
-                Backend.cache_manager.finalize_cache_all_decode(rid)
-            return None
-
-        return tasks
-
-    def step(
-        self,
-        tasks: Optional[PackedTasks] = None,
-    ):
-        # Run tasks
-        super().step(tasks)
-
-        if Backend.state == BackendState.Terminated:
-            return
-        # Rank 0 recv final logits from last PP stage
-        if self.rank == 0:
-            if tasks.task_type == TaskType.Prefill:
-                # After prefill, new decode tasks are created
-                for it in range(tasks.num_tasks):
-                    tasks.tasks[it].start_decoding()
-                    tasks.tasks[it].wait(None)
-            self._recv_logits(tasks)
-
-
-class TensorExecutor(NormalExecutor):
-    def __init__(self, args):
-        super().__init__(args)
-        self.rank = torch.distributed.get_rank()
-        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-
-    def propagate_tasks(self, tasks: Optional[PackedTasksBase]):
-        """Broadcast task metadata from rank 0 to all other ranks"""
-        remove_kvcache = False
-        if Backend.state == BackendState.Running:
-            task_tensor = (
-                tasks.serialize(device="cpu" if Backend.use_gloo else self.local_rank)
-                if self.rank == 0
-                else PackedTasksBase.empty_serialization(
-                    device="cpu" if Backend.use_gloo else self.local_rank
-                )
-            )
-        else:
-            assert Backend.state == BackendState.Terminating
-            task_tensor = PackedTasksBase.serialize_special(
-                SerializedPackedTasksPayloadType.TerminateBackend,
-                device="cpu" if Backend.use_gloo else self.local_rank,
-            )
-            Backend.state = BackendState.Terminated
-        if Backend.use_gloo:
-            torch.distributed.broadcast(
-                tensor=task_tensor, src=0, group=Backend.group_gloo
-            )
-        else:
-            torch.distributed.broadcast(tensor=task_tensor, src=0)
-
-        if self.rank != 0:
-            task_tensor_type, tasks = PackedTasksBase.deserialize(task_tensor)
-
-        if self.rank != 0:
-            if task_tensor_type == SerializedPackedTasksPayloadType.Heartbeat:
-                return None
-            if task_tensor_type == SerializedPackedTasksPayloadType.TerminateBackend:
-                Backend.state = BackendState.Terminated
-            if task_tensor_type == SerializedPackedTasksPayloadType.EndTask:
-                remove_kvcache = True
-        if Backend.state == BackendState.Terminated:
-            return None
-
-        if remove_kvcache:
-            for rid in tasks.req_ids:
-                Backend.cache_manager.finalize_cache_all_decode(rid)
-            return None
-
-        return tasks
-
-    def prefill_step(self, tasks: PackedTasks):
-        if self.rank == 0:
-            tokens = torch.from_numpy(np.concatenate(tasks.tokens)).to(self.rank)
-        else:
-            tokens = torch.empty(
-                [sum(len(seq) for seq in tasks.tokens)],
-                dtype=torch.int64,
-                device=self.local_rank,
-            )
-        torch.distributed.broadcast(tensor=tokens, src=0)
-
-        varlens = VarLens(tasks.tokens, device=self.local_rank)
-        self.timers("prefill").start()
-        Backend.cache_manager.curr_varlens = varlens
-        Backend.cache_manager.curr_req_ids = tasks.req_ids
-        logits = Backend.model.prefill(tokens, varlens=varlens)
-        self.timers("prefill").stop()
-        if self.rank == 0:
-            for task in tasks.tasks:
-                task.start_decoding()
-        Backend.cache_manager.finalize_cache_all_prefill(tasks.req_ids, varlens)
-        return logits
-
-    def decode_step(self, tasks: PackedTasks):
-        if self.rank == 0:
-            tokens = []
-            for task in tasks.tasks:
-                tokens.append(task.next_token)
-            tokens = torch.tensor(
-                tokens, dtype=torch.int64, device=self.local_rank
-            ).unsqueeze(1)
-            # TODO
-            # inp = self._prepare_new_tokens_for_decode(tasks)
-        else:
-            tokens = torch.empty(
-                [tasks.num_tasks, 1], dtype=torch.int64, device=self.local_rank
-            )
-        torch.distributed.broadcast(tensor=tokens, src=0)
-
-        Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
-        Backend.cache_manager.curr_req_ids = tasks.req_ids
-        if isinstance(Backend.cache_manager, PagedKVCacheManager):
-            Backend.cache_manager.prepare_block_table_for_decode(tasks.req_ids)
-        self.timers("decode").start()
-        seq_lens = self._prepare_seq_lens_for_decode(tasks)
-        self.timers("decode-model").start()
-        logits = Backend.model.decode(tokens, seq_lens)
-        self.timers("decode-model").stop()
-        self.timers("decode").stop()
-        Backend.cache_manager.finalize_cache_single_decode(tasks.req_ids)
-        return logits

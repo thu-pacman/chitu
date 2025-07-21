@@ -35,8 +35,6 @@ class TransformerBlockHFGlmZ1(TransformerBlock):
         )
 
         self.mlp = mlp_type(
-            dim=args.dim,
-            hidden_dim=args.intermediate_dim,
             op_impl=op_impl,
             checkpoint_prefix=f"{checkpoint_prefix}.mlp",
             params=args,

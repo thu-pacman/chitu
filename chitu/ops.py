@@ -129,8 +129,17 @@ def apply_rotary_pos_emb_torch(
         q_embed, k_embed = q_embed.to(q.dtype), k_embed.to(k.dtype)
 
     elif rotary_type == "glm4":
+        # NOTE: "glm4" sets partial_rotary_factor=0.5, which means only half of the
+        # dimensions are rotated, while the remaining half are untouched. Currently
+        # we assert the head dim is 128 and the half dim is 64.
+
+        # TODO: Make partial_rotary_factor configurable.
+
         # TODO: Now we transpose q and k, do the rotary, and transpose back.
         # Maybe we can transpose cos and sin just once instead of transposing q and k.
+
+        assert q.shape[-1] == 128, f"Expected head dim to be 128, got {q.shape[-1]}"
+        assert k.shape[-1] == 128, f"Expected head dim to be 128, got {k.shape[-1]}"
         q, q_pass = q[..., :64], q[..., 64:]
         k, k_pass = k[..., :64], k[..., 64:]
         q = (

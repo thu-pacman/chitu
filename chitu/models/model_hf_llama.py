@@ -14,17 +14,10 @@ from chitu.models.model import (
     RMSNorm,
     Transformer,
     TransformerBlock,
-    MoeGate,
-    ParallelMoeBlock,
+    get_linear_layout_native_y,
+    get_linear_layout_contig_y,
 )
 from chitu.models.registry import ModelType, register_model
-from chitu.muxi_utils import (
-    Blockfp8LinearMuxiLayoutContigY,
-    LinearMuxiLayoutContigY,
-    LinearMuxiLayoutNativeY,
-    NormalMoeExpertsMuxiLayout,
-    Blockfp8MoeExpertsMuxiLayout,
-)
 from chitu.ops import apply_rotary_pos_emb, silu_and_mul
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
 from chitu.tensor_parallel import (
@@ -115,7 +108,12 @@ class AttentionHFLlama(Attention):
         qkv_has_bias = args.qkv_has_bias if hasattr(args, "qkv_has_bias") else True
         o_has_bias = args.o_has_bias if hasattr(args, "o_has_bias") else False
 
-        qkv_proj_linear = o_proj_linear = get_linear_layout_contig_y(op_impl)
+        qkv_proj_linear = get_linear_layout_contig_y(
+            op_impl, checkpoint_prefix=f"{checkpoint_prefix}.qkv_proj"
+        )
+        o_proj_linear = get_linear_layout_contig_y(
+            op_impl, checkpoint_prefix=f"{checkpoint_prefix}.o_proj"
+        )
         if self.merge_qkv:
             self.qkv_proj = ColumnParallelLinear(
                 args.dim,
@@ -125,6 +123,8 @@ class AttentionHFLlama(Attention):
                 gather_output=False,
                 base_linear_class=qkv_proj_linear,
                 checkpoint_prefix=f"{checkpoint_prefix}.qkv_proj",
+                # FIXME: f"{checkpoint_prefix}.qkv_proj" is not a real checkpoint prefix,
+                # implement a joint checkpoint prefix for q_proj, k_proj, v_proj.
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -160,7 +160,7 @@ class AttentionHFLlama(Attention):
             checkpoint_prefix=f"{checkpoint_prefix}.o_proj",
         )
 
-        if "Qwen3" in args.name:
+        if getattr(args, "use_qk_norm", False):
             self.q_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
 
@@ -199,8 +199,9 @@ class AttentionHFLlama(Attention):
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
 
-        if hasattr(self, "q_norm") and hasattr(self, "k_norm"):
+        if hasattr(self, "q_norm"):
             xq = self.q_norm(xq)
+        if hasattr(self, "k_norm"):
             xk = self.k_norm(xk)
 
         xq, xk = apply_rotary_pos_emb(
@@ -315,8 +316,6 @@ class FeedForwardHFLlama(nn.Module):
     def __init__(
         self,
         params,
-        dim: int,
-        hidden_dim: int,
         op_impl: str,
         checkpoint_prefix="",
     ):
@@ -330,23 +329,31 @@ class FeedForwardHFLlama(nn.Module):
         )
 
         # Do a parallel + fused linear projection, while ensuring outputs from gate_proj and up_proj are contiguous in memory.
-        # Therefore, the projected shape is [model_parallel_size, 2 * hidden_dim]
+        # Therefore, the projected shape is [model_parallel_size, 2 * params.intermediate_dim]
 
-        gate_up_proj_linear = get_linear_layout_native_y(op_impl)
-        down_proj_linear = get_linear_layout_contig_y(op_impl)
+        gate_up_proj_linear = get_linear_layout_native_y(
+            op_impl,
+            checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
+        )
+        down_proj_linear = get_linear_layout_contig_y(
+            op_impl,
+            checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
+        )
         if self.merge_gate_up:
             self.gate_up_proj = ColumnParallelLinear(
-                dim,
-                hidden_dim * 2,
+                params.dim,
+                params.intermediate_dim * 2,
                 has_bias=False,
                 gather_output=False,
                 base_linear_class=gate_up_proj_linear,
                 checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
+                # FIXME: f"{checkpoint_prefix}.gate_up_proj" is not a real checkpoint prefix,
+                # implement a joint checkpoint prefix for gate_proj and up_proj.
             )
         else:
             self.gate_proj = ColumnParallelLinear(
-                dim,
-                hidden_dim,
+                params.dim,
+                params.intermediate_dim,
                 has_bias=False,
                 gather_output=False,
                 base_linear_class=gate_up_proj_linear,
@@ -354,8 +361,8 @@ class FeedForwardHFLlama(nn.Module):
             )
 
             self.up_proj = ColumnParallelLinear(
-                dim,
-                hidden_dim,
+                params.dim,
+                params.intermediate_dim,
                 has_bias=False,
                 gather_output=False,
                 base_linear_class=gate_up_proj_linear,
@@ -363,8 +370,8 @@ class FeedForwardHFLlama(nn.Module):
             )
 
         self.down_proj = RowParallelLinear(
-            hidden_dim,
-            dim,
+            params.intermediate_dim,
+            params.dim,
             has_bias=False,
             input_is_parallel=True,
             base_linear_class=down_proj_linear,
@@ -399,85 +406,6 @@ class FeedForwardHFLlama(nn.Module):
         return self.down_proj(silu_and_mul_out)
 
 
-class Qwen3MoeGate(MoeGate):
-    def __init__(
-        self,
-        params,
-        op_impl: str,
-    ):
-        super().__init__(
-            op_impl,
-            params.dim,
-            topk=(
-                params.num_experts_per_tok
-                if hasattr(params, "num_experts_per_tok")
-                else 8
-            ),
-            n_groups=1,
-            topk_groups=1,
-            score_func="softmax",
-            route_scale=1,
-            n_experts=params.num_experts if hasattr(params, "num_experts") else 128,
-            bias=None,
-            norm_prob=(
-                params.norm_topk_prob if hasattr(params, "norm_topk_prob") else False
-            ),
-        )
-
-
-def Qwen3MoeExperts(
-    args,
-    checkpoint_prefix: str,
-    base_moe_experts_class: Optional[type] = None,
-    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-):
-    if base_moe_experts_class is None:
-        base_moe_experts_class = (
-            QuantizationRegistry.get_quantized_moe_experts_class_from_global_args(
-                quant_kwargs=quant_kwargs,
-                checkpoint_prefix=f"{checkpoint_prefix}.moe",
-            )
-        )
-
-    quant = get_quant_from_checkpoint_prefix(checkpoint_prefix, args.quant_config.rules)
-    merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
-
-    assert args.moe_intermediate_dim % get_tp_size() == 0
-    return base_moe_experts_class(
-        dim=args.dim,
-        moe_inter_dim=args.moe_intermediate_dim // get_tp_size(),
-        n_routed_experts=(args.num_experts if hasattr(args, "num_experts") else 128),
-        n_shared_experts=0,
-        n_activated_experts=0,
-        moe_world_size=1,
-        moe_rank=0,
-        fuse_shared_experts=False,
-        checkpoint_prefix=f"{checkpoint_prefix}.moe",
-        merge_gate_up=merge_gate_up,
-    )
-
-
-class ParallelMoeBlockQwen3(ParallelMoeBlock):
-    def __init__(
-        self,
-        args,
-        op_impl: str,
-        checkpoint_prefix: str,
-        base_moe_experts_class: Optional[type] = None,
-        quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-    ):
-        super().__init__(
-            gate=Qwen3MoeGate(args, op_impl),
-            experts=Qwen3MoeExperts(
-                args,
-                checkpoint_prefix,
-                base_moe_experts_class,
-                quant_kwargs,
-            ),
-            non_fused_shared_experts=None,
-        )
-
-
 class TransformerBlockHFLlama(TransformerBlock):
     def __init__(
         self,
@@ -500,34 +428,11 @@ class TransformerBlockHFLlama(TransformerBlock):
             op_impl=op_impl,
             checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
         )
-        if "Qwen3-30B-A3B" in args.name or "Qwen3-235B-A22B" in args.name:
-            base_moe_experts_class = None
-            if op_impl == "muxi_custom_kernel":
-                quant = get_quant_from_checkpoint_prefix(
-                    f"{checkpoint_prefix}.mlp", args.quant_config.rules
-                )
-                if quant is None:
-                    base_moe_experts_class = NormalMoeExpertsMuxiLayout
-                elif quant == "blockfp8":
-                    base_moe_experts_class = Blockfp8MoeExpertsMuxiLayout
-                else:
-                    raise NotImplementedError(
-                        "Unsupported quantization type for muxi_custom_kernel"
-                    )
-            self.mlp = ParallelMoeBlockQwen3(
-                args=args,
-                op_impl=op_impl,
-                base_moe_experts_class=base_moe_experts_class,
-                checkpoint_prefix=f"{checkpoint_prefix}.mlp",
-            )
-        else:
-            self.mlp = mlp_type(
-                args,
-                dim=args.dim,
-                hidden_dim=args.intermediate_dim,
-                op_impl=op_impl,
-                checkpoint_prefix=f"{checkpoint_prefix}.mlp",
-            )
+        self.mlp = mlp_type(
+            args,
+            op_impl=op_impl,
+            checkpoint_prefix=f"{checkpoint_prefix}.mlp",
+        )
         self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
         self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
 
@@ -1127,47 +1032,3 @@ class RotaryEmbeddingHFLlama(nn.Module):
         dtype = torch.get_default_dtype()
         self.register_buffer("cos_cached", freqs.cos().to(dtype), persistent=False)
         self.register_buffer("sin_cached", freqs.sin().to(dtype), persistent=False)
-
-
-def get_linear_layout_native_y(op_impl: str):
-    if op_impl == "muxi_custom_kernel":
-        args = get_global_args()
-        quant_method = (
-            None
-            if not hasattr(args.models, "quant_config")
-            else args.models.quant_config.type
-        )
-        if quant_method is None:
-            return LinearMuxiLayoutNativeY
-        elif quant_method == "blockfp8":
-            # Blockfp8LinearMuxiLayoutNativeY is not implemented. Fall back.
-            return Blockfp8LinearMuxiLayoutContigY
-        else:
-            raise NotImplementedError(
-                f'Quantization method {quant_method} is not implemented for "muxi_custom_kernel"'
-            )
-
-    else:
-        return None  # Let QuantizationRegistry pick it
-
-
-def get_linear_layout_contig_y(op_impl: str):
-    if op_impl == "muxi_custom_kernel":
-        args = get_global_args()
-        quant_method = (
-            None
-            if not hasattr(args.models, "quant_config")
-            else args.models.quant_config.type
-        )
-        if quant_method is None:
-            return LinearMuxiLayoutContigY
-        elif quant_method == "blockfp8":
-            # Blockfp8LinearMuxiLayoutContigY is not implemented. Fall back.
-            return Blockfp8LinearMuxiLayoutContigY
-        else:
-            raise NotImplementedError(
-                f'Quantization method {quant_method} is not implemented for "muxi_custom_kernel"'
-            )
-
-    else:
-        return None  # Let QuantizationRegistry pick it

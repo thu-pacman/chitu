@@ -104,21 +104,21 @@ async def create_chat_completion(request: ChatRequest):
             stop_with_eos=stop_with_eos,
         )
         TaskPool.add(task)
+        if stream:
+            return StreamingResponse(
+                response.stream_generator(), media_type="text/event-stream"
+            )
+        else:
+            try:
+                full_response = await response.full_generator()
+                return JSONResponse(full_response.model_dump())
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=str(e))
     except ValueError:
         del req, response
         raise HTTPException(
             status_code=400, detail="prompt length is greater than max_seqs_len"
         )
-    if stream:
-        return StreamingResponse(
-            response.stream_generator(), media_type="text/event-stream"
-        )
-    else:
-        try:
-            full_response = await response.full_generator()
-            return JSONResponse(full_response.model_dump())
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/init")

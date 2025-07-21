@@ -1,5 +1,5 @@
 name: Qwen3-235B-A22B
-type: hf-llama
+type: hf-qwen-3-moe
 source: "https://huggingface.co/Qwen/Qwen3-235B-A22B" # Just for displaying. No automatic download.
 ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
 tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
@@ -18,4 +18,4 @@ norm_eps: 1e-06
 rope_theta: 1000000.0
 qkv_has_bias: False
 head_dim: 128
-
+use_qk_norm: True

@@ -192,7 +192,6 @@ def chitu_init(args, logging_level=None):
 
 
 def remove_task_other_device(remove_task_ids):
-    # TODO handle in executor?
     if len(remove_task_ids) == 0:
         return
     # Since we are removing, any task type is fine
@@ -288,8 +287,12 @@ def chitu_run():
 
 def chitu_terminate():
     if torch.distributed.get_rank() == 0:
-        Backend.state = BackendState.Terminating
-        Backend.executor.step(None)
+        Backend.state = BackendState.Terminated
+        terminated_task_tensor = PackedTasksBase.serialize_special(
+            SerializedPackedTasksPayloadType.TerminateBackend,
+            device="cpu" if Backend.use_gloo else 0,
+        )
+        propagate_tensor_to_all_devices(terminated_task_tensor)
 
 
 def chitu_is_terminated():

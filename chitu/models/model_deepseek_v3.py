@@ -17,11 +17,10 @@ from chitu.models.model import (
     RMSNorm,
     Transformer,
     TransformerBlock,
+    get_linear_layout_contig_y,
 )
 from chitu.models.registry import ModelType, register_model
 from chitu.muxi_utils import (
-    Blockfp8LinearMuxiLayoutContigY,
-    LinearMuxiLayoutContigY,
     NormalMoeExpertsMuxiLayout,
     Blockfp8MoeExpertsMuxiLayout,
 )
@@ -518,6 +517,8 @@ class MLPDeepSeekV3(nn.Module):
                     checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
                 ),
                 checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
+                # FIXME: f"{checkpoint_prefix}.gate_up_proj" is not a real checkpoint prefix,
+                # implement a joint checkpoint prefix for gate_proj and up_proj.
             )
         else:
             self.gate_proj = ColumnParallelLinear(
@@ -1548,33 +1549,3 @@ def compute_softmax_scale_deepseek_v3(args):
     mscale: float = 1.0
     mscale = 0.1 * mscale * math.log(args.rope_factor) + 1.0
     return (qk_head_dim**-0.5) * mscale * mscale
-
-
-def get_linear_layout_contig_y(
-    op_impl: str,
-    checkpoint_prefix: str,
-    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-):
-    if op_impl == "muxi_custom_kernel":
-        assert (
-            len(quant_kwargs) == 0
-        ), "quant_kwargs is not supported for muxi_custom_kernel"
-        args = get_global_args()
-        quant_method = (
-            None
-            if not hasattr(args.models, "quant_config")
-            else args.models.quant_config.type
-        )
-        if quant_method is None:
-            return LinearMuxiLayoutContigY
-        elif quant_method == "blockfp8":
-            return Blockfp8LinearMuxiLayoutContigY
-        else:
-            raise NotImplementedError(
-                f'Quantization method {quant_method} is not implemented for "muxi_custom_kernel"'
-            )
-
-    else:
-        return QuantizationRegistry.get_quantized_linear_class_from_global_args(
-            quant_kwargs=quant_kwargs, checkpoint_prefix=checkpoint_prefix
-        )

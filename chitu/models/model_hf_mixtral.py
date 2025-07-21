@@ -14,23 +14,10 @@ from chitu.models.registry import ModelType, register_model
 from chitu.tensor_parallel import RowParallelLinear
 
 
-class FeedForwardExpertHFMixtral(FeedForwardHFLlama):
-    def __init__(
-        self,
-        params,
-        dim: int,
-        hidden_dim: int,
-        op_impl: str,
-    ):
-        super().__init__(params, dim, hidden_dim, op_impl=op_impl)
-
-
 class SparseMoeBlockHFMixtral(nn.Module):
     def __init__(
         self,
         params,
-        dim: int,
-        hidden_dim: int,
         num_experts: int,
         top_k: int,
         op_impl: str,
@@ -42,7 +29,7 @@ class SparseMoeBlockHFMixtral(nn.Module):
 
         # num_experts is very low, so don't use ColumnParallelLinear
         self.gate = RowParallelLinear(
-            dim,
+            params.dim,
             num_experts,
             has_bias=False,
             input_is_parallel=False,
@@ -50,10 +37,7 @@ class SparseMoeBlockHFMixtral(nn.Module):
         )
 
         self.experts = nn.ModuleList(
-            [
-                FeedForwardExpertHFMixtral(params, dim, hidden_dim, op_impl=op_impl)
-                for _ in range(num_experts)
-            ]
+            [FeedForwardHFLlama(params, op_impl=op_impl) for _ in range(num_experts)]
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

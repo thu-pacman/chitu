@@ -15,3 +15,4 @@ rope_theta: 1000000.0
 qkv_has_bias: False
 head_dim: 128
 tie_word_embeddings: True
+use_qk_norm: True

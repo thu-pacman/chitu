@@ -15,9 +15,15 @@ from chitu.cuda_graph import make_dispatched_graphed_callables
 from chitu.device_type import is_ascend, is_muxi, is_nvidia
 from chitu.global_vars import get_global_args, get_timers
 from chitu.layers.gate import fused_sigmoid_gate
-from chitu.muxi_utils import has_tbsgemm, grouped_topk, tbsgemm
+from chitu.muxi_utils import (
+    has_tbsgemm,
+    grouped_topk,
+    tbsgemm,
+    Blockfp8LinearMuxiLayoutContigY,
+    LinearMuxiLayoutContigY,
+    LinearMuxiLayoutNativeY,
+)
 from chitu.ops import apply_rotary_pos_emb, rms_norm, topk_softmax
-
 from chitu.distributed.parallel_state import get_tp_group, get_tp_size
 from chitu.utils import (
     VarLens,
@@ -25,7 +31,11 @@ from chitu.utils import (
     is_layer,
     try_import_opt_dep,
 )
-from chitu.quantization import QuantizedMoeExpertsBase, get_quant_from_checkpoint_prefix
+from chitu.quantization import (
+    QuantizationRegistry,
+    QuantizedMoeExpertsBase,
+    get_quant_from_checkpoint_prefix,
+)
 
 torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
@@ -740,12 +750,8 @@ class Transformer(nn.Module):
         return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
 
     @torch.inference_mode()
-    def prefill_single_device(self, tokens, varlens=None):
-        if isinstance(
-            tokens, list
-        ):  # else use tensor variable passed by TensorExecutor
-            varlens = VarLens(tokens, self.device)
-            tokens = torch.from_numpy(np.concatenate(tokens)).to(self.device)
+    def prefill_single_device(self, tokens):
+        varlens = self.cache.curr_varlens
         freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_prefill(varlens)
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):
@@ -806,12 +812,10 @@ class Transformer(nn.Module):
         return h
 
     @torch.inference_mode()
-    def prefill(self, tokens, varlens=None):
+    def prefill(self, tokens):
         self.attn_backend.prepare_metadata_for_prefill(self.cache.curr_varlens)
         if self.pipeline_exec:
             return self.prefill_pipeline(tokens)
-        elif self.tensor_exec:
-            return self.prefill_single_device(tokens, varlens)
         else:
             return self.prefill_single_device(tokens)
 
@@ -1024,3 +1028,72 @@ class ParallelMoeBlock(nn.Module):
         if get_tp_size() > 1:
             torch.distributed.all_reduce(y, group=get_tp_group().gpu_group)
         return y
+
+
+def get_linear_layout_native_y(
+    op_impl: str,
+    checkpoint_prefix: str,
+    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+):
+    if op_impl == "muxi_custom_kernel":
+        args = get_global_args()
+        quant_method = (
+            None
+            if not hasattr(args.models, "quant_config")
+            else args.models.quant_config.type
+        )
+        if quant_method is None:
+            assert (
+                len(quant_kwargs.get(None, {})) == 0
+            ), "quant_kwargs is not supported for muxi_custom_kernel"
+            return LinearMuxiLayoutNativeY
+        elif quant_method == "blockfp8":
+            assert (
+                len(quant_kwargs.get("blockfp8", {})) == 0
+            ), "quant_kwargs is not supported for muxi_custom_kernel"
+            # Blockfp8LinearMuxiLayoutNativeY is not implemented. Fall back.
+            return Blockfp8LinearMuxiLayoutContigY
+        else:
+            raise NotImplementedError(
+                f'Quantization method {quant_method} is not implemented for "muxi_custom_kernel"'
+            )
+
+    else:
+        return QuantizationRegistry.get_quantized_linear_class_from_global_args(
+            quant_kwargs=quant_kwargs, checkpoint_prefix=checkpoint_prefix
+        )
+
+
+def get_linear_layout_contig_y(
+    op_impl: str,
+    checkpoint_prefix: str,
+    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+):
+    if op_impl == "muxi_custom_kernel":
+        args = get_global_args()
+        quant_method = (
+            None
+            if not hasattr(args.models, "quant_config")
+            else args.models.quant_config.type
+        )
+        # FIXME: get layer-specifc quant_method via get_quant_from_checkpoint_prefix
+
+        if quant_method is None:
+            assert (
+                len(quant_kwargs.get(None, {})) == 0
+            ), "quant_kwargs is not supported for muxi_custom_kernel"
+            return LinearMuxiLayoutContigY
+        elif quant_method == "blockfp8":
+            assert (
+                len(quant_kwargs.get("blockfp8", {})) == 0
+            ), "quant_kwargs is not supported for muxi_custom_kernel"
+            return Blockfp8LinearMuxiLayoutContigY
+        else:
+            raise NotImplementedError(
+                f'Quantization method {quant_method} is not implemented for "muxi_custom_kernel"'
+            )
+
+    else:
+        return QuantizationRegistry.get_quantized_linear_class_from_global_args(
+            quant_kwargs=quant_kwargs, checkpoint_prefix=checkpoint_prefix
+        )

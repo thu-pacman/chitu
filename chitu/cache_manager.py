@@ -228,7 +228,7 @@ class PagedKVCacheManager:
         # TODO: When run out of free blocks, use scheduling and preemption in paper instead of exception
         self.timers("get_free_block").start()
         if len(self.free_blocks) == 0:
-            raise Exception(f"No more free blocks.")
+            raise Exception("No more free blocks.")
         idx = self.free_blocks.popleft()
         self.timers("get_free_block").stop()
         return idx
@@ -286,7 +286,7 @@ class PagedKVCacheManager:
 
     def finalize_cache_single_decode(self, req_ids):
         for req_id in req_ids:
-            self.seq_lens[req_id] = self.seq_lens[req_id] + 1
+            self.seq_lens[req_id] += 1
         self.curr_varlens = None
         self.curr_req_ids = None
 
@@ -751,7 +751,7 @@ class KVCacheManagerSkewAware:
                 if slot_id < idx:
                     end_idx = idx
                     break
-            assert end_idx > slot_id, f"get the wrong id in skewkvcache"
+            assert end_idx > slot_id, "get the wrong id in skewkvcache"
             slot_last_id = None
             for idx in range(end_idx - 1, slot_id, -1):
                 if not self.slot_availability[idx]:
