@@ -24,20 +24,14 @@ class Qwen3MoeGate(MoeGate):
         super().__init__(
             op_impl,
             params.dim,
-            topk=(
-                params.num_experts_per_tok
-                if hasattr(params, "num_experts_per_tok")
-                else 8
-            ),
+            topk=params.num_experts_per_tok,
             n_groups=1,
             topk_groups=1,
             score_func="softmax",
             route_scale=1,
-            n_experts=params.num_experts if hasattr(params, "num_experts") else 128,
+            n_experts=params.num_experts,
             bias=None,
-            norm_prob=(
-                params.norm_topk_prob if hasattr(params, "norm_topk_prob") else False
-            ),
+            norm_prob=params.norm_topk_prob,
         )
 
 

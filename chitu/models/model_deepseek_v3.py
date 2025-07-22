@@ -611,7 +611,7 @@ class GateDeepSeekV3(MoeGate):
                 if args.dim == 7168
                 else None
             ),
-            norm_prob=False,
+            norm_prob=args.norm_topk_prob,
         )
 
 
