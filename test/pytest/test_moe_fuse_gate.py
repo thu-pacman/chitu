@@ -2,7 +2,7 @@ import torch
 import pytest
 import triton
 
-from chitu.layers.gate import fused_sigmoid_gate
+from chitu.ops import fused_sigmoid_gate
 
 
 def reference_top_impl(

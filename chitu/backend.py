@@ -581,7 +581,6 @@ class Backend:
                         and "norm" not in k
                     ):
                         checkpoint[k] = checkpoint[k].to(torch.get_default_dtype())
-
             # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
             # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
             for k in checkpoint.keys():

@@ -17,7 +17,7 @@ from chitu.ops import (
     act_quant_deepseek_v3,
     quant_einsum_shc_hdc_shd,
 )
-from chitu.device_type import get_device_name, is_muxi, is_nvidia
+from chitu.device_type import get_device_name, is_muxi, is_nvidia, is_ascend
 from chitu.utils import try_import_opt_dep, parse_dtype
 from chitu.global_vars import get_global_args
 from chitu.ops import weight_dequant_soft_fp8_deepseek_v3
@@ -26,9 +26,50 @@ chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_ba
 triton, has_triton = try_import_opt_dep("triton", "triton")
 if has_triton:
     from chitu.fused_moe import fused_experts
-
+grouped_gemm, _ = try_import_opt_dep("grouped_gemm", "ascend_kernels")
 
 logger = getLogger(__name__)
+
+
+def linear_block_fp8_npu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    expert_tokens = None
+    if get_global_args().models.name in ["Qwen3-32B-FP8"]:
+        # To adapt the operator, treat the dense model as a 1 expert.
+        # scale need torch.float32
+        scale = (
+            scale.unsqueeze(0).to(dtype=torch.float32).transpose_(-1, -2).contiguous()
+        )
+        weight = weight.unsqueeze(0).transpose_(-1, -2).contiguous()
+        # Due to 1 expert, the list of expert_tokens here should be all the lines of the input x.
+        expert_tokens = torch.tensor([x.shape[0]], device=x.device, dtype=torch.int64)
+    scale_off = torch.zeros_like(scale, dtype=torch.float32, device=x.device)
+    output = torch.empty(
+        [x.shape[0], weight.shape[-1]], dtype=torch.bfloat16, device=x.device
+    )
+    flag = False
+    if x.dim() == 3:
+        # Squeeze dimension 1, not 0, otherwise it will affect cases where batch size is 1
+        x = x.squeeze(1)
+        flag = True
+    grouped_gemm.grouped_gemm(
+        x,
+        weight,
+        antiquantOffsetOptional=scale_off,
+        antiquantScaleOptional=scale,
+        groupListOptional=expert_tokens,
+        output=output,
+        type=grouped_gemm.GroupedGemmType.FP8,
+    )
+    if flag:
+        output = output.unsqueeze(1)
+    if bias is not None:
+        output += bias
+    return output
 
 
 def linear_block_fp8(
@@ -62,6 +103,10 @@ def linear_block_fp8(
             if bias is not None:
                 y += bias
             return y
+        elif is_ascend():
+            import torch_npu
+
+            return linear_block_fp8_npu(x, weight, weight_scale, bias)
         else:
             logger.warning(
                 f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
