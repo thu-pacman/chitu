@@ -1,6 +1,5 @@
 import itertools
 import os
-import re
 from logging import getLogger
 from typing import Any, List, Mapping, Optional
 
@@ -633,38 +632,14 @@ class Transformer(nn.Module):
                 new_state_dict[key] = state_dict[key]
         return new_state_dict
 
-    def process_state_dict_for_renaming_linear_layer(self, checkpoint, n_dense_layers):
-        """
-        Function to rename expert weight structures in order to eliminate redundant gate, up, and down layers.
-        Parameter format example:
-        Input key: 'layers.3.mlp.experts.gate_proj.weight'
-        Output key: 'layers.3.mlp.experts.gate_proj_weight'
-        """
-        new_checkpoint = {}
-        for key in checkpoint:
-            pattern_lists = [
-                r"layers\.(\d+)\.mlp\.experts\.gate_up_proj\.([^.]+)",
-                r"layers\.(\d+)\.mlp\.experts\.gate_proj\.([^.]+)",
-                r"layers\.(\d+)\.mlp\.experts\.down_proj\.([^.]+)",
-                r"layers\.(\d+)\.mlp\.experts\.up_proj\.([^.]+)",
-            ]
-            tensor_names = ["gate_up_proj", "gate_proj", "down_proj", "up_proj"]
-            matched = False
-            for tensor_name, pattern in zip(tensor_names, pattern_lists):
-                match = re.fullmatch(pattern, key)
-                if match:
-                    layer_idx = int(match.group(1))
-                    suffix = match.group(2)
-                    if layer_idx < n_dense_layers and self.pp_stage == 0:
-                        break
-                    new_key = f"layers.{layer_idx}.mlp.experts.{tensor_name}_{suffix}"
-                    new_checkpoint[new_key] = checkpoint[key]
-                    matched = True
-                    break
-            if not matched:
-                new_checkpoint[key] = checkpoint[key]
+    def process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
+        return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
 
-        return new_checkpoint
+    def process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
+        return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
+
+    def process_state_dict_for_merging_experts(self, checkpoint: Mapping[str, Any]):
+        return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
 
     def load_state_dict_parallel(
         self,
@@ -695,6 +670,9 @@ class Transformer(nn.Module):
         **kwargs,
     ):
         if not skip_preprocess:
+            state_dict = self.process_state_dict_for_merging_qkv(state_dict)
+            state_dict = self.process_state_dict_for_merging_gate_up(state_dict)
+            state_dict = self.process_state_dict_for_merging_experts(state_dict)
             state_dict = self.process_state_dict_for_blockfp4_after_chunk(state_dict)
             state_dict = self.process_state_dict_for_int4_after_chunk(state_dict)
         super().load_state_dict(state_dict, *args, **kwargs)
