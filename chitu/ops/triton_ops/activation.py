@@ -2,12 +2,19 @@ import torch
 import triton
 import triton.language as tl
 
+from chitu.native_layout import Vector
 from chitu.ops.triton_ops.utils import auto_retry_triton_compilation
 from chitu.device_type import is_muxi
 
 
 @auto_retry_triton_compilation
 def silu_and_mul_triton(x):
+    if isinstance(x, Vector):
+        return Vector(
+            list(x.plain_shape[:-1]) + [x.plain_shape[-1] // 2],
+            silu_and_mul_triton(x.layout_tensor),
+        )
+
     assert isinstance(x, torch.Tensor)
 
     n_rows = x.nelement() // x.shape[-1]
