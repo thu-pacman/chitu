@@ -84,6 +84,7 @@ def linear_block_fp4_npu(
             antiquantScaleOptional=scale,
             groupListOptional=expert_tokens,
             output=output,
+            type=grouped_gemm.GroupedGemmType.FP4,
         )
         output = output.unsqueeze(1)
     else:
@@ -94,6 +95,7 @@ def linear_block_fp4_npu(
             antiquantScaleOptional=scale,
             groupListOptional=expert_tokens,
             output=output,
+            type=grouped_gemm.GroupedGemmType.FP4,
         )
 
     if bias is not None:

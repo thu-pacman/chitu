@@ -554,14 +554,6 @@ class Transformer(nn.Module):
         return new_state_dict
 
     def anti_quant_fp8(self, scale1, scale2):
-        """
-        Pytorch native 反量化函数，用于将FP8 scale1 转换为BF16
-
-        Args:
-            scale1: 输入的FP8 scale1
-            scale2: 输入的FP32 scale2
-
-        """
         shape_w = scale1.shape
         shape_nw = list(shape_w)
         scale_fp8_to_32 = torch.tensor(0x7B80, dtype=torch.uint16)
@@ -578,16 +570,7 @@ class Transformer(nn.Module):
             new_weight[..., shape_nw[-2] // 2 :, :] *= scale2[..., 1, :].unsqueeze(-1)
         return new_weight.to(torch.bfloat16)
 
-    def _process_weight_scale_for_npu_fusion(self, param, scale_2):
-        """处理NPU fusion mode下的权重scale数据
-
-        Args:
-            param: scale参数
-            scale_2: 第二级scale参数
-
-        Returns:
-            处理后的scale参数
-        """
+    def _process_fp4_weight_scale_for_npu_fusion(self, param, scale_2):
         param.data = self.anti_quant_fp8(
             param.data.to(device="npu"), scale_2.data.to(device="npu")
         ).cpu()
@@ -600,13 +583,14 @@ class Transformer(nn.Module):
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if quant == "blockfp4":
                 param = state_dict[k]
-                # 处理scale参数
                 if get_global_args().infer.npu_fusion_fp4 and k.endswith(
                     "weight_scale"
                 ):
                     scale_name = k + "_2"
                     scale_2 = state_dict[scale_name]
-                    param = self._process_weight_scale_for_npu_fusion(param, scale_2)
+                    param = self._process_fp4_weight_scale_for_npu_fusion(
+                        param, scale_2
+                    )
                 new_state_dict[k] = param
             else:
                 new_state_dict[k] = state_dict[k]
@@ -652,10 +636,10 @@ class Transformer(nn.Module):
 
     def process_state_dict_for_renaming_linear_layer(self, checkpoint, n_dense_layers):
         """
-        重命名专家权重结构的函数以消除冗余的 gate,up,down 层
-        参数格式示例：
-        输入键：'layers.3.mlp.experts.gate_proj.weight'
-        输出键：'layers.3.mlp.experts.gate_proj_weight'
+        Function to rename expert weight structures in order to eliminate redundant gate, up, and down layers.
+        Parameter format example:
+        Input key: 'layers.3.mlp.experts.gate_proj.weight'
+        Output key: 'layers.3.mlp.experts.gate_proj_weight'
         """
         new_checkpoint = {}
         for key in checkpoint:

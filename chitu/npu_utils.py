@@ -8,7 +8,6 @@ from chitu.utils import log_with_rank, try_import_opt_dep
 
 grouped_gemm, _ = try_import_opt_dep("grouped_gemm", "ascend_kernels")
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -30,7 +29,6 @@ def fused_group_matmul(
     output = torch.zeros(
         [x.shape[0], weight.shape[-1] * 2], dtype=x.dtype, device=x.device
     )
-
     grouped_gemm.grouped_gemm(
         x,
         weight,
@@ -38,6 +36,7 @@ def fused_group_matmul(
         antiquantScaleOptional=scale,
         groupListOptional=expert_tokens,
         output=output,
+        type=grouped_gemm.GroupedGemmType.FP4,
     )
     return output
 
