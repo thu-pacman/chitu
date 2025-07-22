@@ -611,7 +611,7 @@ class GateDeepSeekV3(MoeGate):
                 if args.dim == 7168
                 else None
             ),
-            norm_prob=False,
+            norm_prob=args.norm_topk_prob,
         )
 
 
@@ -814,7 +814,8 @@ class TransformerDeepSeekV3(Transformer):
     def _get_layer_i_prefixes(self, i: int) -> List[str]:
         return [f"layers.{i}."]
 
-    def _process_state_dict_for_merging_experts(self, checkpoint: Mapping[str, Any]):
+    @override
+    def process_state_dict_for_merging_experts(self, checkpoint: Mapping[str, Any]):
         fuse_shared_experts = get_global_args().infer.fuse_shared_experts
 
         new_checkpoint = {}
@@ -835,7 +836,7 @@ class TransformerDeepSeekV3(Transformer):
                     parts.append(checkpoint[prefix + f"experts.{i}.{w}.{part}"])
                 if fuse_shared_experts:
                     parts.append(checkpoint[prefix + f"shared_experts.{w}.{part}"])
-                new_checkpoint[prefix + f"experts.{w}.{part}"] = torch.stack(
+                new_checkpoint[prefix + f"experts.{w}_{part}"] = torch.stack(
                     parts, dim=0
                 )
             elif re.search(r"\.experts\.\d+", k):
@@ -1216,7 +1217,8 @@ class TransformerDeepSeekV3(Transformer):
 
         return new_checkpoint
 
-    def _process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
+    @override
+    def process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -1267,7 +1269,8 @@ class TransformerDeepSeekV3(Transformer):
                 new_checkpoint[k] = checkpoint[k]
         return new_checkpoint
 
-    def _process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
+    @override
+    def process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -1360,14 +1363,6 @@ class TransformerDeepSeekV3(Transformer):
                         state_dict
                     )
                 )
-            state_dict = self._process_state_dict_for_merging_qkv(state_dict)
-            state_dict = self._process_state_dict_for_merging_gate_up(state_dict)
-
-            state_dict = self._process_state_dict_for_merging_experts(state_dict)
-            state_dict = super().process_state_dict_for_renaming_linear_layer(
-                state_dict,
-                get_global_args().models.n_dense_layers,
-            )
 
         super().load_state_dict(
             state_dict, skip_preprocess=skip_preprocess, *args, **kwargs

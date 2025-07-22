@@ -1,7 +1,7 @@
 import math
-import re
 from logging import getLogger
 from typing import Any, List, Mapping, Optional
+from typing_extensions import override
 
 import torch
 import torch.nn.functional as F
@@ -594,7 +594,8 @@ class TransformerHFLlama(Transformer):
                 new_checkpoint[k] = checkpoint[k]
         return new_checkpoint
 
-    def _process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
+    @override
+    def process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -660,7 +661,8 @@ class TransformerHFLlama(Transformer):
                 new_checkpoint[k] = checkpoint[k]
         return new_checkpoint
 
-    def _process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
+    @override
+    def process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -798,96 +800,6 @@ class TransformerHFLlama(Transformer):
             )
 
         super().load_state_dict_parallel(
-            state_dict, skip_preprocess=skip_preprocess, *args, **kwargs
-        )
-
-    def _process_state_dict_for_merging_expert(
-        self, checkpoint: Mapping[str, Any], key_name: str
-    ):
-        """
-        重构专家权重结构的函数
-        参数格式示例：
-        输入键：'layers.3.mlp.experts.1.gate_proj.key_name'
-        输出键：'layers.3.mlp.experts.gate_proj.key_name' (合并所有该层的专家权重)
-        """
-        from collections import defaultdict
-
-        new_checkpoint = {}
-        gate_up_proj_input_scale = defaultdict(lambda: defaultdict(list))
-        gate_proj_input_scale = defaultdict(lambda: defaultdict(list))
-        down_proj_input_scale = defaultdict(lambda: defaultdict(list))
-        up_proj_input_scale = defaultdict(lambda: defaultdict(list))
-        input_scale_lists = [
-            gate_up_proj_input_scale,
-            gate_proj_input_scale,
-            down_proj_input_scale,
-            up_proj_input_scale,
-        ]
-        pattern_lists = [
-            r"layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_up_proj\." + f"{key_name}$",
-            r"layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_proj\." + f"{key_name}$",
-            r"layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\." + f"{key_name}$",
-            r"layers\.(\d+)\.mlp\.experts\.(\d+)\.up_proj\." + f"{key_name}$",
-        ]
-        tensor_names = ["gate_up_proj", "gate_proj", "down_proj", "up_proj"]
-
-        for key in checkpoint:
-            matched = False
-            for input_scale_list, pattern in zip(input_scale_lists, pattern_lists):
-                match = re.match(pattern, key)
-                if match:
-                    layer_idx, expert_idx = map(int, match.groups())
-                    input_scale_list[layer_idx][expert_idx] = checkpoint[key]
-                    matched = True
-                    break
-            if not matched:
-                new_checkpoint[key] = checkpoint[key]
-
-        for input_scale_list, tensor_name in zip(input_scale_lists, tensor_names):
-            for layer in input_scale_list:
-                experts_ordered = [
-                    input_scale_list[layer][e] for e in sorted(input_scale_list[layer])
-                ]
-                stacked_input_scale = torch.stack(experts_ordered, dim=0)
-                new_key = f"layers.{layer}.mlp.experts.{tensor_name}.{key_name}"
-                new_checkpoint[new_key] = stacked_input_scale
-
-        return new_checkpoint
-
-    def load_state_dict(
-        self,
-        state_dict: Mapping[str, Any],
-        skip_preprocess: bool = False,
-        *args,
-        **kwargs,
-    ):
-        if not skip_preprocess:
-
-            state_dict = self._process_state_dict_for_merging_qkv(state_dict)
-            state_dict = self._process_state_dict_for_merging_gate_up(state_dict)
-
-            if (
-                "Qwen3-30B-A3B" in get_global_args().models.name
-                or "Qwen3-30B-A3B-fp8" in get_global_args().models.name
-                or "Qwen3-235B-A22B" in get_global_args().models.name
-                or "Qwen3-235B-A22B-fp8" in get_global_args().models.name
-            ):
-                # Qwen3 models have a special structure for experts, so we need to merge them.
-                for key_name in [
-                    "input_scale",
-                    "weight_scale",
-                    "weight_scale_2",
-                    "weight",
-                    "scale",
-                ]:
-                    state_dict = self._process_state_dict_for_merging_expert(
-                        state_dict, key_name
-                    )
-                state_dict = super().process_state_dict_for_renaming_linear_layer(
-                    state_dict, n_dense_layers=0
-                )
-
-        super().load_state_dict(
             state_dict, skip_preprocess=skip_preprocess, *args, **kwargs
         )
 

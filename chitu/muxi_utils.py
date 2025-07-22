@@ -351,64 +351,6 @@ def _(
     return y
 
 
-def grouped_topk(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    num_expert_group: int = 0,
-    topk_group: int = 0,
-    scoring_func: str = "softmax",
-    e_score_correction_bias: Optional[torch.Tensor] = None,
-):
-
-    assert (
-        scoring_func == "softmax" or scoring_func == "sigmoid"
-    ), "Only softmax and sigmoid are supported now"
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
-
-    if num_expert_group is None:
-        num_expert_group = 1
-    if topk_group is None:
-        topk_group = 1
-
-    B, H = hidden_states.shape
-
-    expertsIds = torch.empty(B, topk, dtype=torch.int32, device=hidden_states.device)
-    selected_experts_weights = torch.empty(
-        B, topk, dtype=hidden_states.dtype, device=hidden_states.device
-    )
-
-    score_fun = 0
-    if scoring_func == "softmax":
-        score_fun = 0
-    elif scoring_func == "sigmoid":
-        score_fun = 1
-    else:
-        raise ValueError("Unsupported scoring function")
-
-    muxi_layout_kernels.fused_routing_gate(
-        gating_output,
-        score_fun,
-        B,
-        H,
-        num_expert_group,
-        topk_group,
-        expertsIds,
-        selected_experts_weights,
-        topk,
-        e_score_correction_bias,
-    )
-
-    if renormalize:
-        selected_experts_weights = (
-            selected_experts_weights
-            / selected_experts_weights.sum(dim=-1, keepdim=True)
-        )
-
-    return selected_experts_weights, expertsIds
-
-
 def muxi_fused_experts(
     hidden_states: torch.Tensor,
     w1: MuxiNativeLayoutGroupWeight,

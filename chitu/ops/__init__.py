@@ -3,7 +3,7 @@ from chitu.ops.activation import silu_and_mul
 from chitu.ops.sampling import multinomial, apply_frequency_penalty, response_append
 from chitu.ops.kv_cache import append_to_paged_kv_cache, append_to_non_paged_kv_cache
 from chitu.ops.norm import rms_norm
-from chitu.ops.moe_gate import topk_softmax, fused_sigmoid_gate
+from chitu.ops.moe_gate import moe_gate
 from chitu.ops.quant import (
     quant_einsum_shc_hdc_shd,
     w8a8_gemm_per_token_per_channel,

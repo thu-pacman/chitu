@@ -2,27 +2,13 @@ import torch
 import pytest
 import triton
 
-from chitu.ops import fused_sigmoid_gate
+from chitu.ops import moe_gate
+from chitu.utils import try_import_opt_dep
 
-
-def reference_top_impl(
-    scores, bias: torch.Tensor, seq_length, num_expert_group, topk_group, topk
-):
-    scores = scores.sigmoid()
-    original_scores = scores
-    if bias is not None:
-        scores = scores + bias
-    scores = scores.view(seq_length, num_expert_group, -1)
-    if bias is not None:
-        group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-    else:
-        group_scores = scores.amax(dim=-1)
-    indices = group_scores.topk(topk_group, dim=-1)[1]
-    mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
-    scores = (scores * mask.unsqueeze(-1)).flatten(1)
-    indices = torch.topk(scores, topk, dim=-1)[1]
-    weights_ref = original_scores.gather(1, indices)
-    return weights_ref, indices
+chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
+muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
+    "muxi_layout_kernels", "muxi_layout_kernels"
+)
 
 
 @pytest.mark.parametrize(
@@ -30,11 +16,39 @@ def reference_top_impl(
     [1, 16, 128, 256, 512, 1024],
 )
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
-@pytest.mark.parametrize("params", [(256, 8, 4, 8)])
-@pytest.mark.parametrize("has_bias", [True, False])
-@pytest.mark.parametrize("bias_is_float32", [True, False])
-def test_moe_fused_gate_sigmoid(seq_length, dtype, params, has_bias, bias_is_float32):
-    num_experts, num_expert_group, topk_group, topk = params
+@pytest.mark.parametrize(
+    "num_experts,num_expert_group,topk_group,topk,score_func,has_bias,bias_is_float32",
+    [
+        (256, 8, 4, 8, "sigmoid", True, True),
+        (256, 8, 4, 8, "sigmoid", True, False),
+        (128, 1, 1, 8, "softmax", False, False),
+    ],
+)
+@pytest.mark.parametrize("impl", ["cuda", "muxi"])
+def test_moe_fused_gate(
+    seq_length,
+    dtype,
+    num_experts,
+    num_expert_group,
+    topk_group,
+    topk,
+    score_func,
+    has_bias,
+    bias_is_float32,
+    impl,
+):
+    if impl == "cuda" and not has_chitu_backend:
+        pytest.skip("chitu_backend is not available, skipping CUDA tests")
+    if impl == "muxi" and not has_muxi_layout_kernels:
+        pytest.skip("muxi_layout_kernels is not available, skipping Muxi tests")
+    if impl == "muxi" and not (
+        num_experts == 256
+        and num_expert_group == 8
+        and topk_group == 4
+        and topk == 8
+        and not bias_is_float32
+    ):
+        pytest.skip("Muxi implementation is only supported for specific configurations")
 
     torch.manual_seed(seq_length)
     device = torch.device("cuda")
@@ -48,17 +62,28 @@ def test_moe_fused_gate_sigmoid(seq_length, dtype, params, has_bias, bias_is_flo
     else:
         bias = None
 
-    kernel_indices, weights = fused_sigmoid_gate(
+    indices, weights = moe_gate(
         scores,
         topk,
         num_expert_group=num_expert_group,
         topk_group=topk_group,
         e_score_correction_bias=bias,
+        score_func=score_func,
+        impl=impl,
     )
-    weights_ref, indices = reference_top_impl(
-        scores, bias, seq_length, num_expert_group, topk_group, topk
+    indices_ref, weights_ref = moe_gate(
+        scores,
+        topk,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        e_score_correction_bias=bias,
+        score_func=score_func,
+        impl="torch",
     )
 
+    assert torch.all(
+        indices.sort()[0].to(torch.int64) == indices_ref.sort()[0].to(torch.int64)
+    )
     if dtype == torch.bfloat16 or dtype == torch.float16:
         assert torch.allclose(
             weights.sort()[0],
@@ -69,9 +94,6 @@ def test_moe_fused_gate_sigmoid(seq_length, dtype, params, has_bias, bias_is_flo
     else:
         print("not implemented for type besides bfloat16, float16")
         assert False
-    assert torch.allclose(
-        kernel_indices.sort()[0].to(torch.int64), indices.sort()[0].to(torch.int64)
-    )
 
 
 @triton.testing.perf_report(
@@ -79,11 +101,11 @@ def test_moe_fused_gate_sigmoid(seq_length, dtype, params, has_bias, bias_is_flo
         x_names=["seq_length"],
         x_vals=[1, 16, 128, 256, 512, 1024],
         line_arg="provider",
-        line_vals=["torch", "triton"],
-        line_names=["Torch", "Triton"],
+        line_vals=["torch", "cuda"],
+        line_names=["Torch", "CUDA"],
         styles=[("blue", "-"), ("green", "-")],
         ylabel="us",
-        plot_name="moe_fused_gate_sigmoid-performance",
+        plot_name="moe_fused_gate-performance",
         args={
             "dtype": torch.bfloat16,
             "params": (256, 8, 4, 8),
@@ -107,24 +129,17 @@ def benchmark(seq_length, dtype, params, has_bias, bias_is_float32, provider):
     else:
         bias = None
 
-    if provider == "torch":
-        ms = triton.testing.do_bench(
-            lambda: reference_top_impl(
-                scores, bias, seq_length, num_expert_group, topk_group, topk
-            )
+    ms = triton.testing.do_bench(
+        lambda: moe_gate(
+            scores,
+            topk,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            e_score_correction_bias=bias,
+            score_func="sigmoid",
+            impl=provider,
         )
-    elif provider == "triton":
-        ms = triton.testing.do_bench(
-            lambda: fused_sigmoid_gate(
-                scores,
-                topk,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-                e_score_correction_bias=bias,
-            )
-        )
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
+    )
     return ms * 1000
 
 

@@ -1,6 +1,5 @@
 import itertools
 import os
-import re
 from logging import getLogger
 from typing import Any, List, Mapping, Optional
 
@@ -16,13 +15,12 @@ from chitu.device_type import is_ascend, is_muxi, is_nvidia
 from chitu.global_vars import get_global_args, get_timers
 from chitu.muxi_utils import (
     has_tbsgemm,
-    grouped_topk,
     tbsgemm,
     Blockfp8LinearMuxiLayoutContigY,
     LinearMuxiLayoutContigY,
     LinearMuxiLayoutNativeY,
 )
-from chitu.ops import apply_rotary_pos_emb, rms_norm, topk_softmax, fused_sigmoid_gate
+from chitu.ops import apply_rotary_pos_emb, rms_norm, moe_gate
 from chitu.distributed.parallel_state import get_tp_group, get_tp_size
 from chitu.utils import (
     VarLens,
@@ -634,38 +632,14 @@ class Transformer(nn.Module):
                 new_state_dict[key] = state_dict[key]
         return new_state_dict
 
-    def process_state_dict_for_renaming_linear_layer(self, checkpoint, n_dense_layers):
-        """
-        Function to rename expert weight structures in order to eliminate redundant gate, up, and down layers.
-        Parameter format example:
-        Input key: 'layers.3.mlp.experts.gate_proj.weight'
-        Output key: 'layers.3.mlp.experts.gate_proj_weight'
-        """
-        new_checkpoint = {}
-        for key in checkpoint:
-            pattern_lists = [
-                r"layers\.(\d+)\.mlp\.experts\.gate_up_proj\.([^.]+)",
-                r"layers\.(\d+)\.mlp\.experts\.gate_proj\.([^.]+)",
-                r"layers\.(\d+)\.mlp\.experts\.down_proj\.([^.]+)",
-                r"layers\.(\d+)\.mlp\.experts\.up_proj\.([^.]+)",
-            ]
-            tensor_names = ["gate_up_proj", "gate_proj", "down_proj", "up_proj"]
-            matched = False
-            for tensor_name, pattern in zip(tensor_names, pattern_lists):
-                match = re.fullmatch(pattern, key)
-                if match:
-                    layer_idx = int(match.group(1))
-                    suffix = match.group(2)
-                    if layer_idx < n_dense_layers and self.pp_stage == 0:
-                        break
-                    new_key = f"layers.{layer_idx}.mlp.experts.{tensor_name}_{suffix}"
-                    new_checkpoint[new_key] = checkpoint[key]
-                    matched = True
-                    break
-            if not matched:
-                new_checkpoint[key] = checkpoint[key]
+    def process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
+        return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
 
-        return new_checkpoint
+    def process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
+        return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
+
+    def process_state_dict_for_merging_experts(self, checkpoint: Mapping[str, Any]):
+        return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
 
     def load_state_dict_parallel(
         self,
@@ -696,6 +670,9 @@ class Transformer(nn.Module):
         **kwargs,
     ):
         if not skip_preprocess:
+            state_dict = self.process_state_dict_for_merging_qkv(state_dict)
+            state_dict = self.process_state_dict_for_merging_gate_up(state_dict)
+            state_dict = self.process_state_dict_for_merging_experts(state_dict)
             state_dict = self.process_state_dict_for_blockfp4_after_chunk(state_dict)
             state_dict = self.process_state_dict_for_int4_after_chunk(state_dict)
         super().load_state_dict(state_dict, *args, **kwargs)
@@ -891,9 +868,6 @@ class MoeGate(nn.Module):
         self.bias = bias
         self.norm_prob = norm_prob
 
-    def is_fused_sigmoid_gate(self):
-        return self.score_func == "sigmoid" and self.n_groups > 1
-
     def forward(self, x):
         """
         Forward pass for the gating mechanism.
@@ -904,65 +878,19 @@ class MoeGate(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
-        if (
-            self.op_impl == "muxi_custom_kernel"
-            and self.n_groups == 8
-            and self.topk_groups == 4
-            and self.topk == 8
-            and self.weight.shape[0] == 256
-            and self.score_func in ["sigmoid", "softmax"]
-        ):
-            scores = F.linear(x, self.weight)
-            weights, indices = grouped_topk(
-                x,
-                scores,
-                self.topk,
-                renormalize=self.score_func == "sigmoid",
-                num_expert_group=self.n_groups,
-                topk_group=self.topk_groups,
-                scoring_func=self.score_func,
-                e_score_correction_bias=(
-                    None if self.bias is None else self.bias.type_as(scores)
-                ),
-            )
-        elif self.is_fused_sigmoid_gate() and (is_nvidia() or is_muxi()):
-            scores = F.linear(x, self.weight)
-            indices, weights = fused_sigmoid_gate(
-                scores, self.topk, self.n_groups, self.topk_groups, self.bias
-            )
-            weights /= weights.sum(dim=-1, keepdim=True)
-        elif self.score_func == "softmax" and is_nvidia():
-            scores = F.linear(x, self.weight)
-            weights, indices, expert_idx = topk_softmax(
-                scores, self.topk, self.norm_prob, torch.int32
-            )
-        else:
-            scores = F.linear(x, self.weight)
-            if self.score_func == "softmax":
-                scores = scores.softmax(dim=-1, dtype=torch.float32)
-            else:
-                scores = scores.sigmoid()
-            original_scores = scores
-            if self.bias is not None:
-                scores = scores + self.bias
-            if self.n_groups > 1:
-                scores = scores.view(x.size(0), self.n_groups, -1)
-                if self.bias is None:
-                    group_scores = scores.amax(dim=-1)
-                else:
-                    group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-                indices = group_scores.topk(self.topk_groups, dim=-1)[1]
-                mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(
-                    1, indices, False
-                )
-                scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(
-                    1
-                )
-            indices = torch.topk(scores, self.topk, dim=-1)[1]
-            weights = original_scores.gather(1, indices)
 
-            if self.score_func == "sigmoid" or self.norm_prob:
-                weights /= weights.sum(dim=-1, keepdim=True)
+        scores = F.linear(x, self.weight)
+        indices, weights = moe_gate(
+            scores,
+            self.topk,
+            self.n_groups,
+            self.topk_groups,
+            self.bias,
+            self.score_func,
+        )
+        if self.norm_prob:
+            weights /= weights.sum(dim=-1, keepdim=True)
+
         weights *= self.route_scale
         return weights.type_as(x), indices.to(torch.int32)
 

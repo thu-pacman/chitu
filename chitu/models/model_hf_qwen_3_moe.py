@@ -1,4 +1,6 @@
 from typing import Optional, Mapping, Any
+from typing_extensions import override
+import re
 import functools
 import torch
 
@@ -24,20 +26,14 @@ class Qwen3MoeGate(MoeGate):
         super().__init__(
             op_impl,
             params.dim,
-            topk=(
-                params.num_experts_per_tok
-                if hasattr(params, "num_experts_per_tok")
-                else 8
-            ),
+            topk=params.num_experts_per_tok,
             n_groups=1,
             topk_groups=1,
             score_func="softmax",
             route_scale=1,
-            n_experts=params.num_experts if hasattr(params, "num_experts") else 128,
+            n_experts=params.num_experts,
             bias=None,
-            norm_prob=(
-                params.norm_topk_prob if hasattr(params, "norm_topk_prob") else False
-            ),
+            norm_prob=params.norm_topk_prob,
         )
 
 
@@ -62,7 +58,7 @@ def Qwen3MoeExperts(
     return base_moe_experts_class(
         dim=args.dim,
         moe_inter_dim=args.moe_intermediate_dim // get_tp_size(),
-        n_routed_experts=(args.num_experts if hasattr(args, "num_experts") else 128),
+        n_routed_experts=args.num_experts,
         n_shared_experts=0,
         n_activated_experts=0,
         moe_world_size=1,
@@ -163,3 +159,36 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
             op_impl=op_impl,
             **kvargs,
         )
+
+    @override
+    def process_state_dict_for_merging_experts(self, checkpoint: Mapping[str, Any]):
+        """
+        重构专家权重结构的函数
+        参数格式示例：
+        输入键：'layers.3.mlp.experts.1.gate_proj.part_name'
+        输出键：'layers.3.mlp.experts.gate_proj.part_name' (合并所有该层的专家权重)
+        """
+        new_checkpoint = {}
+        for k in checkpoint.keys():
+            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            if any(
+                k.endswith(f".experts.0.{w}.{part}")
+                for w in ["gate_proj", "down_proj", "up_proj", "gate_up_proj"]
+                for part in self._get_2d_out_x_in_tensor_names(quant)
+                + self._get_2d_in_x_out_tensor_names(quant)
+                + self._get_1d_in_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant)
+            ):
+                w, part = k.split(".")[-2:]
+                prefix = k[: -len(f"experts.0.{w}.{part}")]
+                parts = []
+                for i in range(self.params.num_experts):
+                    parts.append(checkpoint[prefix + f"experts.{i}.{w}.{part}"])
+                new_checkpoint[prefix + f"experts.{w}_{part}"] = torch.stack(
+                    parts, dim=0
+                )
+            elif re.search(r"\.experts\.\d+", k):
+                continue
+            else:
+                new_checkpoint[k] = checkpoint[k]
+        return new_checkpoint
