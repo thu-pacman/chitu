@@ -21,6 +21,7 @@ muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     [
         (256, 8, 4, 8, "sigmoid", True, True),
         (256, 8, 4, 8, "sigmoid", True, False),
+        (128, 1, 1, 8, "sigmoid", True, False),
         (128, 1, 1, 8, "softmax", False, False),
     ],
 )
