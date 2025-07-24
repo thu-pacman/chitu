@@ -19,7 +19,7 @@ class TransformerBlockHFGlmZ1(TransformerBlock):
         cache,
         attn_backend,
         op_impl,
-        rotary_type="glm4",
+        rotary_type="interleaved-half",
         mlp_type=FeedForwardHFLlama,
         checkpoint_prefix="",
     ):
@@ -78,7 +78,7 @@ class TransformerHFGlmZ1(TransformerHFLlama):
         pipeline_parallel_size: int,
         model_parallel_size: int,
         attn_backend: AttnBackend,
-        rotary_type: str = "glm4",
+        rotary_type: str = "interleaved-half",
         layer_type: type = TransformerBlockHFGlmZ1,
         op_impl: str = "torch",
         **kvargs,

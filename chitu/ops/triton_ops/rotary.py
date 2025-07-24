@@ -13,37 +13,93 @@ def apply_rotary_pos_emb_triton(
     k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    rotary_type: str = "hf-llama",
+    rotary_type: str = "separated",
     block_size=128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    if rotary_type == "separated-half":
+        # Currently we split and fallback to "interleaved". TODO: Implement a fully
+        # fused kernel including the split and cat.
+        q_rot, q_pass = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
+        k_rot, k_pass = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
+        q_rot_out, k_rot_out = apply_rotary_pos_emb_triton(
+            q_rot,
+            k_rot,
+            cos,
+            sin,
+            rotary_type="separated",
+            block_size=block_size,
+        )
+        q_out = torch.cat([q_rot_out, q_pass], dim=-1)
+        k_out = torch.cat([k_rot_out, k_pass], dim=-1)
+        return q_out, k_out
+
+    if rotary_type == "interleaved-half":
+        # Currently we split and fallback to "interleaved". TODO: Implement a fully
+        # fused kernel including the split and cat.
+        q_rot, q_pass = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
+        k_rot, k_pass = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
+        q_rot_out, k_rot_out = apply_rotary_pos_emb_triton(
+            q_rot, k_rot, cos, sin, rotary_type="interleaved", block_size=block_size
+        )
+        q_out = torch.cat([q_rot_out, q_pass], dim=-1)
+        k_out = torch.cat([k_rot_out, k_pass], dim=-1)
+        return q_out, k_out
+
     # Prepare output tensor
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
 
-    if rotary_type == "hf-llama":
-        # "hf-llama" has an [real, real, ..., real, imag, imag, ..., imag] layout.
+    q_shape = q.shape
+    k_shape = k.shape
+
+    if q.dim() == 4:
+        q = q.view(-1, q_shape[-2], q_shape[-1])
+        q_out = q_out.view(-1, q_shape[-2], q_shape[-1])
+    elif q.dim() == 3:
+        pass
+    elif q.dim() == 2:
+        q = q.view(-1, 1, q_shape[-1])
+        q_out = q_out.view(-1, 1, q_shape[-1])
+    else:
+        assert False
+    if k.dim() == 4:
+        k = k.view(-1, k_shape[-2], k_shape[-1])
+        k_out = k_out.view(-1, k_shape[-2], k_shape[-1])
+    elif k.dim() == 3:
+        pass
+    elif k.dim() == 2:
+        k = k.view(-1, 1, k_shape[-1])
+        k_out = k_out.view(-1, 1, k_shape[-1])
+    else:
+        assert False
+
+    assert q.shape[-1] == k.shape[-1]
+    assert q.shape[0] == k.shape[0]
+    assert q.shape[-1] // 2 == cos.shape[-1]
+    assert q.shape[-1] // 2 == sin.shape[-1]
+
+    if rotary_type == "separated":
+        # "separated" has an [real, real, ..., real, imag, imag, ..., imag] layout.
 
         # Get tensor shapes
         q_batch_size, q_n_local_heads, q_head_dim = q.shape
         k_batch_size, k_n_local_heads, k_head_dim = k.shape
 
         # Define grid size
-        q_grid = (q_batch_size * q_n_local_heads, q_head_dim // block_size)
-        k_grid = (k_batch_size * k_n_local_heads, k_head_dim // block_size)
+        q_grid = (q_batch_size * q_n_local_heads, triton.cdiv(q_head_dim, block_size))
+        k_grid = (k_batch_size * k_n_local_heads, triton.cdiv(k_head_dim, block_size))
 
         # Launch kernel (TODO: use only 1 kernel)
-        assert q.is_contiguous()
-        assert k.is_contiguous()
         assert cos.is_contiguous()
         assert sin.is_contiguous()
-        assert q_out.is_contiguous()
-        assert k_out.is_contiguous()
-        rotary_embedding_kernel_hf_llama[q_grid](
+        rotary_embedding_kernel_separated[q_grid](
             q,
             cos,
             sin,
             q_out,
             q_n_local_heads,
+            q_head_dim,
             q.stride(0),
             q.stride(1),
             cos.stride(0),
@@ -52,12 +108,13 @@ def apply_rotary_pos_emb_triton(
             q_out.stride(1),
             BLOCK_SIZE=block_size,
         )
-        rotary_embedding_kernel_hf_llama[k_grid](
+        rotary_embedding_kernel_separated[k_grid](
             k,
             cos,
             sin,
             k_out,
             k_n_local_heads,
+            k_head_dim,
             k.stride(0),
             k.stride(1),
             cos.stride(0),
@@ -67,39 +124,9 @@ def apply_rotary_pos_emb_triton(
             BLOCK_SIZE=block_size,
         )
 
-        return q_out, k_out
+    elif rotary_type == "interleaved":
+        # "interleaved" has an [real, imag, real, imag, ..., real, imag] layout.
 
-    elif rotary_type == "llama":
-        # "llama" has an [real, imag, real, imag, ..., real, imag] layout.
-
-        q_shape = q.shape
-        k_shape = k.shape
-
-        if q.dim() == 4:
-            q = q.view(-1, q_shape[-2], q_shape[-1])
-            q_out = q_out.view(-1, q_shape[-2], q_shape[-1])
-        elif q.dim() == 3:
-            pass
-        elif q.dim() == 2:
-            q = q.view(-1, 1, q_shape[-1])
-            q_out = q_out.view(-1, 1, q_shape[-1])
-        else:
-            assert False
-        if k.dim() == 4:
-            k = k.view(-1, k_shape[-2], k_shape[-1])
-            k_out = k_out.view(-1, k_shape[-2], k_shape[-1])
-        elif k.dim() == 3:
-            pass
-        elif k.dim() == 2:
-            k = k.view(-1, 1, k_shape[-1])
-            k_out = k_out.view(-1, 1, k_shape[-1])
-        else:
-            assert False
-
-        assert q.shape[-1] == k.shape[-1]
-        assert q.shape[0] == k.shape[0]
-        assert q.shape[-1] // 2 == cos.shape[-1]
-        assert q.shape[-1] // 2 == sin.shape[-1]
         bs, head_num_q, rotary_dim = q.shape
         bs, head_num_k, rotary_dim = k.shape
 
@@ -111,7 +138,7 @@ def apply_rotary_pos_emb_triton(
             triton.cdiv(triton.next_power_of_2(bs), 128), max(head_num_q, head_num_k)
         )
         grid = lambda meta: (bs, triton.cdiv(max(head_num_q, head_num_k), BLOCK_H), 1)
-        rotary_embedding_kernel_llama[grid](
+        rotary_embedding_kernel_interleaved[grid](
             q,
             k,
             q_out,
@@ -132,21 +159,22 @@ def apply_rotary_pos_emb_triton(
             BLOCK_H,
         )
 
-        return q_out.view(q_shape), k_out.view(k_shape)
-
     else:
         raise NotImplementedError(
             f"Unsupported rotary type: {rotary_type} for Triton implementation"
         )
 
+    return q_out.view(q_shape), k_out.view(k_shape)
+
 
 @triton.jit
-def rotary_embedding_kernel_hf_llama(
+def rotary_embedding_kernel_separated(
     Q,
     COS,
     SIN,
     OUTPUT,
     num_head,
+    head_dim,
     stride_q1,
     stride_q2,
     stride_cos1,
@@ -172,26 +200,26 @@ def rotary_embedding_kernel_hf_llama(
     block_id = tl.program_id(axis=1)
 
     # Create offsets for reading and writing
-    offsets_0 = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE // 2)
-    offsets_1 = block_id * BLOCK_SIZE + BLOCK_SIZE // 2 + tl.arange(0, BLOCK_SIZE // 2)
+    offsets_0 = block_id * (BLOCK_SIZE // 2) + tl.arange(0, BLOCK_SIZE // 2)
+    offsets_1 = offsets_0 + head_dim // 2
 
     # Load data
-    cos0 = tl.load(COS_ptr + offsets_0)
-    sin0 = tl.load(SIN_ptr + offsets_0)
-    q0 = tl.load(Q_ptr + offsets_0)
-    q1 = tl.load(Q_ptr + offsets_1)
+    cos0 = tl.load(COS_ptr + offsets_0, mask=offsets_0 < head_dim // 2)
+    sin0 = tl.load(SIN_ptr + offsets_0, mask=offsets_0 < head_dim // 2)
+    q0 = tl.load(Q_ptr + offsets_0, mask=offsets_0 < head_dim // 2)
+    q1 = tl.load(Q_ptr + offsets_1, mask=offsets_1 < head_dim)
 
     # Apply rotary embedding
     q_embed0 = q0 * cos0 - q1 * sin0
     q_embed1 = q1 * cos0 + q0 * sin0
 
     # Store result
-    tl.store(OUTPUT_ptr + offsets_0, q_embed0)
-    tl.store(OUTPUT_ptr + offsets_1, q_embed1)
+    tl.store(OUTPUT_ptr + offsets_0, q_embed0, mask=offsets_0 < head_dim // 2)
+    tl.store(OUTPUT_ptr + offsets_1, q_embed1, mask=offsets_1 < head_dim)
 
 
 @triton.jit
-def rotary_embedding_kernel_llama(
+def rotary_embedding_kernel_interleaved(
     Q,
     K,
     Out_q,

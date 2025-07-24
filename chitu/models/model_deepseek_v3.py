@@ -2,11 +2,11 @@ import math
 import re
 from logging import getLogger
 from typing import Any, List, Mapping, Optional
+from typing_extensions import override
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from typing_extensions import override
 
 from chitu.attn_backend import AttnBackend
 from chitu.global_vars import get_global_args
@@ -234,7 +234,7 @@ class AttentionDeepSeekV3(Attention):
             freqs_cis_sin,
             q_out=q_pe,
             k_out=k_pe,
-            rotary_type="llama",
+            rotary_type="interleaved",
         )
 
         if self.mla_absorb == "none":
@@ -606,11 +606,7 @@ class GateDeepSeekV3(MoeGate):
             score_func=args.score_func,
             route_scale=args.route_scale,
             n_experts=args.n_routed_experts,
-            bias=(
-                nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32))
-                if args.dim == 7168
-                else None
-            ),
+            bias=nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32)),
             norm_prob=args.norm_topk_prob,
         )
 

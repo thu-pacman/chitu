@@ -1,6 +1,7 @@
 import torch
 
 from chitu.utils import try_import_opt_dep
+from chitu.native_layout import Vector
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
 
@@ -14,6 +15,14 @@ def silu_and_mul_torch(x: torch.Tensor):
     if isinstance(x, torch.Tensor):
         d = x.shape[-1] // 2
         return torch.nn.functional.silu(x[..., :d]) * x[..., d:]
+
+    elif isinstance(x, Vector):
+        d = x.plain_shape[-1] // 2
+        return Vector(
+            list(x.plain_shape[:-1]) + [d],
+            torch.nn.functional.silu(x.layout_tensor[..., :d])
+            * x.layout_tensor[..., d:],
+        )
 
     elif isinstance(x, muxi_utils.MuxiNativeLayoutActivation):
         assert x.plain_shape[-1] % 2 == 0

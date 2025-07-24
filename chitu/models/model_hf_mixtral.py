@@ -96,7 +96,7 @@ class TransformerBlockHFMixtral(TransformerBlockHFLlama):
         cache,
         attn_backend,
         op_impl="torch",
-        rotary_type="hf-llama",
+        rotary_type="separated",
         mlp_type=SparseMoeBlockHFMixtral,
         checkpoint_prefix="",
     ):
@@ -127,7 +127,7 @@ class TransformerHFMixtral(TransformerHFLlama):
         pipeline_parallel_size: int,
         model_parallel_size: int,
         attn_backend: AttnBackend,
-        rotary_type: str = "hf-llama",
+        rotary_type: str = "separated",
         layer_type: type = TransformerBlockHFMixtral,
         op_impl: str = "torch",
         **kvargs,

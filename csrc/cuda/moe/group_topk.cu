@@ -358,6 +358,27 @@ void fused_gate_launcher(const T *input, int score_fun, const int batchSize,
     case 256:
         LAUNCH_GATE(256);
         break;
+    case 128:
+        LAUNCH_GATE(128);
+        break;
+    case 64:
+        LAUNCH_GATE(64);
+        break;
+    case 32:
+        LAUNCH_GATE(32);
+        break;
+    case 16:
+        LAUNCH_GATE(16);
+        break;
+    case 8:
+        LAUNCH_GATE(8);
+        break;
+    case 4:
+        LAUNCH_GATE(4);
+        break;
+    case 2:
+        LAUNCH_GATE(2);
+        break;
 
     default:
         assert(

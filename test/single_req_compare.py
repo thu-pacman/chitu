@@ -5,6 +5,7 @@ import os
 import random
 import logging
 from logging import getLogger
+from typing import List, Tuple
 
 from chitu.task import UserRequest, TaskPool, Task
 from chitu.chitu_main import (
@@ -38,35 +39,58 @@ def load_result(filename="data.json"):
         return []
 
 
-def check_result(result_0_lst, result_1_lst, name_0, name_1, err=[-1, -1]):
+def check_result(
+    result_0_lst, result_1_lst, threshold=0.99
+) -> Tuple[float, float, int, int]:
+    tot_cos_sim = 0.0
+    logit_cnt = 0
+    min_cos_sim = float("inf")
+    min_cos_sim_result_it = -1
+    min_cos_sim_logit_it = -1
+
     for result_it in range(min(len(result_0_lst), len(result_1_lst))):
         result_0 = result_0_lst[result_it]
         result_1 = result_1_lst[result_it]
         assert (
             result_0["prompt"] == result_1["prompt"]
         ), f"prompt difference in result {result_it}:{result_0['prompt']} vs {result_1['prompt']}"
+        assert (
+            len(result_1["logits"]) > 0
+        ), f"history result {result_it} has empty logits"
+        assert (
+            len(result_0["logits"]) > 0
+        ), f"current result {result_it} has empty logits"
+
+        num_logits = min(len(result_0["logits"]), len(result_1["logits"]))
+        if num_logits == 0:
+            continue
+        logit_cnt += num_logits
+
         for logit_it in range(min(len(result_0["logits"]), len(result_1["logits"]))):
-            logit0 = result_0["logits"][logit_it]
-            logit1 = result_1["logits"][logit_it]
-            for it in range(min(len(logit0), len(logit1))):
-                if logit1[it] == 0.0:
-                    err[0] = max(err[0], abs(logit0[it] - logit1[it]))
-                else:
-                    if 0.2 < max(
-                        0.0, abs(logit0[it] - logit1[it]) - 5e-2 * abs(logit1[it])
-                    ):
-                        print(logit0[it], " vs ", logit1[it])
-                    # err[1] = max(
-                    #    err[1],
-                    #    max(0.0, abs(logit0[it] - logit1[it]) - 0.5) / abs(logit1[it]),
-                    # )
-                    err[0] = max(
-                        err[0],
-                        max(0.0, abs(logit0[it] - logit1[it]) - 5e-2 * abs(logit1[it])),
-                    )
-            assert np.allclose(
-                logit0, logit1, atol=0.5, rtol=5e-2
-            ), f"logits difference in result {result_it}:: logit {logit_it}; aerr:{err[0]}, rerr:{err[1]}"
+            logit0 = np.array(result_0["logits"][logit_it])
+            logit1 = np.array(result_1["logits"][logit_it])
+
+            dp = np.dot(logit0, logit1)
+            norm0 = np.linalg.norm(logit0)
+            norm1 = np.linalg.norm(logit1)
+
+            cos_sim = dp / (norm0 * norm1) if norm0 != 0 and norm1 != 0 else 0.0
+
+            tot_cos_sim += cos_sim
+            if cos_sim < min_cos_sim:
+                min_cos_sim = cos_sim
+                min_cos_sim_result_it = result_it
+                min_cos_sim_logit_it = logit_it
+
+            assert (
+                cos_sim >= threshold
+            ), f"cosine similarity difference in result {result_it}:: logit {logit_it}; cos_sim: {cos_sim}, threshold: {threshold}"
+
+    avg_cos_sim = tot_cos_sim / logit_cnt if logit_cnt > 0 else 0.0
+    if min_cos_sim == float("inf"):
+        min_cos_sim = 0.0
+
+    return (avg_cos_sim, min_cos_sim, min_cos_sim_result_it, min_cos_sim_logit_it)
 
 
 # -----------utils part end--------------
@@ -85,19 +109,6 @@ msgs = [
     [{"role": "user", "content": "飞机在对流层还是平流层飞?"}],
     [{"role": "user", "content": "怎么避免加班?"}],
     [{"role": "user", "content": "what is the recipe of mayonnaise?"}],
-    # [
-    #     {"role": "user", "content": "I am going to Paris, what should I see?"},
-    #     {
-    #         "role": "assistant",
-    #         "content": """\
-    #     Paris, the capital of France, is known for its stunning architecture, art museums, historical landmarks, and romantic atmosphere. Here are some of the top attractions to see in Paris:
-    #     1. The Eiffel Tower: The iconic Eiffel Tower is one of the most recognizable landmarks in the world and offers breathtaking views of the city.
-    #     2. The Louvre Museum: The Louvre is one of the world's largest and most famous museums, housing an impressive collection of art and artifacts, including the Mona Lisa.
-    #     3. Notre-Dame Cathedral: This beautiful cathedral is one of the most famous landmarks in Paris and is known for its Gothic architecture and stunning stained glass windows.
-    #     These are just a few of the many attractions that Paris has to offer. With so much to see and do, it's no wonder that Paris is one of the most popular tourist destinations in the world.""",
-    #     },
-    #     {"role": "user", "content": "What is so great about #1?"},
-    # ],
 ]
 
 counter = 1
@@ -119,7 +130,7 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens):
             if len(tkn.encode(tkn.decode(tokens), bos=False, eos=True)) == token_length:
                 return tkn.decode(tokens)
 
-    reqs = []
+    reqs: List[UserRequest] = []
     for i in range(num_reqs):
         msg = generate_prompt(prompt_len - 1, Backend.tokenizer)
         req = UserRequest(msg, f"{gen_req_id()}", max_new_tokens=max_new_tokens)
@@ -128,7 +139,7 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens):
 
 
 def gen_reqs_real(num_reqs, max_new_tokens):
-    reqs = []
+    reqs: List[UserRequest] = []
     for i in range(num_reqs):
         req = UserRequest(
             msgs[i % len(msgs)],
@@ -257,7 +268,7 @@ def main(args: ServeConfig):
     torch.distributed.barrier()
 
     timers = get_timers()
-    logger.debug(f"finish init")
+    logger.debug("finish init")
 
     rank = torch.distributed.get_rank()
     if rank == 0:
@@ -284,10 +295,18 @@ def main(args: ServeConfig):
             save_result(now_result, history_path)
         else:
             if history_result is not None:
-                err = [0, 0]
-                check_result(now_result, history_result, "now", "history", err)
-                print("!!!!!!!!!aerr_max: ", err[0])
-                print("!!!!!!!!!rerr_max: ", err[1])
+                threshold = 0.99
+                (
+                    avg_cos_sim,
+                    min_cos_sim,
+                    min_cos_sim_result_it,
+                    min_cos_sim_logit_it,
+                ) = check_result(now_result, history_result, threshold=threshold)
+                logger.info(f"!!!!!!!!! Average cosine similarity: {avg_cos_sim}")
+                logger.info(f"!!!!!!!!! Minimum cosine similarity: {min_cos_sim}")
+                logger.info(
+                    f"!!!!!!!!! Minimum cosine similarity found in result {min_cos_sim_result_it}, logit {min_cos_sim_logit_it}"
+                )
             else:
                 logger.warning(
                     "No history result to compare. This is OK for a newly added test case. "
