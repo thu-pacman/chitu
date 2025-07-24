@@ -63,7 +63,7 @@ class AttentionHFLlama(Attention):
         layer_id,
         cache,
         attn_backend,
-        rotary_type="hf-llama",
+        rotary_type="separated",
         op_impl: str = "torch",
         checkpoint_prefix="",
     ):
@@ -238,8 +238,9 @@ class AttentionHFLlama(Attention):
         xk = xk.view(-1, self.n_local_kv_heads, self.head_dim).contiguous()
         xv = xv.view(-1, self.n_local_kv_heads, self.head_dim).contiguous()
 
-        if hasattr(self, "q_norm") and hasattr(self, "k_norm"):
+        if hasattr(self, "q_norm"):
             xq = self.q_norm(xq)
+        if hasattr(self, "k_norm"):
             xk = self.k_norm(xk)
 
         xq, xk = apply_rotary_pos_emb(
@@ -281,8 +282,9 @@ class AttentionHFLlama(Attention):
         xk = xk.view(-1, self.n_local_kv_heads, self.head_dim).contiguous()
         xv = xv.view(-1, self.n_local_kv_heads, self.head_dim).contiguous()
 
-        if hasattr(self, "q_norm") and hasattr(self, "k_norm"):
+        if hasattr(self, "q_norm"):
             xq = self.q_norm(xq)
+        if hasattr(self, "k_norm"):
             xk = self.k_norm(xk)
 
         xq, xk = apply_rotary_pos_emb(
@@ -414,7 +416,7 @@ class TransformerBlockHFLlama(TransformerBlock):
         cache,
         attn_backend,
         op_impl,
-        rotary_type="hf-llama",
+        rotary_type="separated",
         mlp_type=FeedForwardHFLlama,
         checkpoint_prefix="",
     ):
@@ -467,7 +469,7 @@ class TransformerHFLlama(Transformer):
         model_parallel_size: int,
         attn_backend: AttnBackend,
         op_impl: str,
-        rotary_type: str = "hf-llama",
+        rotary_type: str = "separated",
         layer_type: type = TransformerBlockHFLlama,
         **kvargs,
     ):
@@ -848,7 +850,11 @@ class TransformerHFLlama(Transformer):
             else self.params.dim // self.params.n_heads
         )
         self.rotary_emb = RotaryEmbeddingHFLlama(
-            head_dim // 2 if self.rotary_type == "glm4" else head_dim,
+            (
+                head_dim // 2
+                if self.rotary_type in ["separated-half", "interleaved-half"]
+                else head_dim
+            ),
             max_position_embeddings=max_position_embeddings,
             base=float(self.params.rope_theta),
             rope_scaling=(

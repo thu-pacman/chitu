@@ -98,7 +98,7 @@ class TransformerBlockHFQwen3Moe(TransformerBlockHFLlama):
         cache,
         attn_backend,
         op_impl="torch",
-        rotary_type="hf-llama",
+        rotary_type="separated",
         mlp_type=ParallelMoeBlockQwen3,
         checkpoint_prefix="",
     ):
@@ -142,7 +142,7 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
         pipeline_parallel_size: int,
         model_parallel_size: int,
         attn_backend: AttnBackend,
-        rotary_type: str = "hf-llama",
+        rotary_type: str = "separated",
         layer_type: type = TransformerBlockHFQwen3Moe,
         op_impl: str = "torch",
         **kvargs,

@@ -187,7 +187,7 @@ class Attention(nn.Module):
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xq, xk = apply_rotary_pos_emb(
-            xq, xk, freqs_cis_cos, freqs_cis_sin, rotary_type="llama"
+            xq, xk, freqs_cis_cos, freqs_cis_sin, rotary_type="interleaved"
         )
         self.cache.finalize_cache_bylayer_prefill(
             xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
@@ -216,7 +216,7 @@ class Attention(nn.Module):
         xv = xv.view(-1, self.n_local_kv_heads, self.head_dim)
 
         xq, xk = apply_rotary_pos_emb(
-            xq, xk, freqs_cis_cos, freqs_cis_sin, rotary_type="llama"
+            xq, xk, freqs_cis_cos, freqs_cis_sin, rotary_type="interleaved"
         )
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
@@ -249,7 +249,7 @@ class Attention(nn.Module):
         xv = xv.view(-1, self.n_local_kv_heads, self.head_dim)
 
         xq, xk = apply_rotary_pos_emb(
-            xq, xk, freqs_cis_cos, freqs_cis_sin, rotary_type="llama"
+            xq, xk, freqs_cis_cos, freqs_cis_sin, rotary_type="interleaved"
         )
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)

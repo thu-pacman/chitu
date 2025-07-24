@@ -234,7 +234,7 @@ class AttentionDeepSeekV3(Attention):
             freqs_cis_sin,
             q_out=q_pe,
             k_out=k_pe,
-            rotary_type="llama",
+            rotary_type="interleaved",
         )
 
         if self.mla_absorb == "none":

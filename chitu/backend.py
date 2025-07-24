@@ -110,7 +110,7 @@ class Backend:
 
         model_cls = get_model_class(model_type)
         if args.name.startswith("glm"):
-            extra_kwargs["rotary_type"] = "glm4"
+            extra_kwargs["rotary_type"] = "interleaved-half"
         return model_cls(args, cache, *extra_args, **extra_kwargs)
 
     # FIXME: When cache type is "skew", gloo backend cannot be used.

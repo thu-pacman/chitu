@@ -3,7 +3,6 @@ from typing import Optional, Tuple
 import torch
 
 from chitu.utils import try_import_opt_dep
-from chitu.global_vars import get_global_args
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
 torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
@@ -26,10 +25,6 @@ def rotate_pairwise(x):
 
 
 def reshape_rotary_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    assert freqs_cis.shape == (
-        x.shape[0],
-        x.shape[-1],
-    ), f"{freqs_cis.shape} {x.shape}"
     ndim = x.ndim
     if ndim == 4:
         shape = [1, x.shape[1], 1, x.shape[-1]]
@@ -49,10 +44,10 @@ def apply_rotary_pos_emb_cuda(
     sin: torch.Tensor,
     q_out: Optional[torch.Tensor] = None,
     k_out: Optional[torch.Tensor] = None,
-    rotary_type: str = "hf-llama",
+    rotary_type: str = "separated",
     impl: str = "auto",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if rotary_type == "llama":
+    if rotary_type == "interleaved":
         q_shape = q.shape
         k_shape = k.shape
 
@@ -100,10 +95,10 @@ def apply_rotary_pos_emb_torch(
     sin: torch.Tensor,
     q_out: Optional[torch.Tensor] = None,
     k_out: Optional[torch.Tensor] = None,
-    rotary_type: str = "hf-llama",
+    rotary_type: str = "separated",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if rotary_type == "hf-llama":
-        # "hf-llama" has an [real, real, ..., real, imag, imag, ..., imag] layout.
+    if rotary_type == "separated":
+        # "separated" has an [real, real, ..., real, imag, imag, ..., imag] layout.
         cos = torch.cat([cos, cos], dim=-1)
         sin = torch.cat([sin, sin], dim=-1)
         cos_q = reshape_rotary_for_broadcast(cos, q)
@@ -114,8 +109,8 @@ def apply_rotary_pos_emb_torch(
         k_embed = (k * cos_k) + (rotate_half(k) * sin_k)
         q_embed, k_embed = q_embed.to(q.dtype), k_embed.to(k.dtype)
 
-    elif rotary_type == "llama":
-        # "llama" has an [real, imag, real, imag, ..., real, imag] layout.
+    elif rotary_type == "interleaved":
+        # "interleaved" has an [real, imag, real, imag, ..., real, imag] layout.
         cos = torch.stack([cos, cos], dim=-1).flatten(-2)
         sin = torch.stack([sin, sin], dim=-1).flatten(-2)
         cos_q = reshape_rotary_for_broadcast(cos, q)
@@ -126,53 +121,23 @@ def apply_rotary_pos_emb_torch(
         k_embed = (k * cos_k) + (rotate_pairwise(k) * sin_k)
         q_embed, k_embed = q_embed.to(q.dtype), k_embed.to(k.dtype)
 
-    elif rotary_type == "glm4":
-        # NOTE: "glm4" sets partial_rotary_factor=0.5, which means only half of the
-        # dimensions are rotated, while the remaining half are untouched. Currently
-        # we assert the head dim is 128 and the half dim is 64.
+    elif rotary_type == "separated-half":
+        q_rot, q_pass = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
+        k_rot, k_pass = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
+        q_rot_embed, k_rot_embed = apply_rotary_pos_emb_torch(
+            q_rot, k_rot, cos, sin, rotary_type="separated"
+        )
+        q_embed = torch.cat([q_rot_embed, q_pass], dim=-1)
+        k_embed = torch.cat([k_rot_embed, k_pass], dim=-1)
 
-        # TODO: Make partial_rotary_factor configurable.
-
-        # TODO: Now we transpose q and k, do the rotary, and transpose back.
-        # Maybe we can transpose cos and sin just once instead of transposing q and k.
-
-        assert q.shape[-1] == 128, f"Expected head dim to be 128, got {q.shape[-1]}"
-        assert k.shape[-1] == 128, f"Expected head dim to be 128, got {k.shape[-1]}"
-        q, q_pass = q[..., :64], q[..., 64:]
-        k, k_pass = k[..., :64], k[..., 64:]
-        q = (
-            q.reshape(q.shape[0], q.shape[1], q.shape[2] // 2, 2)
-            .permute(0, 1, 3, 2)
-            .reshape(q.shape[0], q.shape[1], q.shape[2])
+    elif rotary_type == "interleaved-half":
+        q_rot, q_pass = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
+        k_rot, k_pass = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
+        q_rot_embed, k_rot_embed = apply_rotary_pos_emb_torch(
+            q_rot, k_rot, cos, sin, rotary_type="interleaved"
         )
-        k = (
-            k.reshape(k.shape[0], k.shape[1], k.shape[2] // 2, 2)
-            .permute(0, 1, 3, 2)
-            .reshape(k.shape[0], k.shape[1], k.shape[2])
-        )
-        cos = torch.stack([cos, cos], dim=-1).flatten(-2)
-        sin = torch.stack([sin, sin], dim=-1).flatten(-2)
-        cos = reshape_rotary_for_broadcast(cos, q)
-        sin = reshape_rotary_for_broadcast(sin, q)
-        q_embed = (q * cos) + (rotate_half(q) * sin)
-        k_embed = (k * cos) + (rotate_half(k) * sin)
-        q_embed = (
-            q_embed.reshape(
-                q_embed.shape[0], q_embed.shape[1], 2, q_embed.shape[2] // 2
-            )
-            .permute(0, 1, 3, 2)
-            .reshape(q_embed.shape[0], q_embed.shape[1], q_embed.shape[2])
-        )
-        k_embed = (
-            k_embed.reshape(
-                k_embed.shape[0], k_embed.shape[1], 2, k_embed.shape[2] // 2
-            )
-            .permute(0, 1, 3, 2)
-            .reshape(k_embed.shape[0], k_embed.shape[1], k_embed.shape[2])
-        )
-        q_embed, k_embed = torch.cat([q_embed, q_pass], dim=-1), torch.cat(
-            [k_embed, k_pass], dim=-1
-        )
+        q_embed = torch.cat([q_rot_embed, q_pass], dim=-1)
+        k_embed = torch.cat([k_rot_embed, k_pass], dim=-1)
 
     else:
         raise ValueError(f"Unknown rotary type: {rotary_type}")
@@ -188,8 +153,8 @@ def apply_rotary_pos_emb_torch(
     return q_out, k_out
 
 
-def apply_rotary_pos_emb_torch_npu(q, k, cos, sin, rotary_type="hf-llama"):
-    if rotary_type == "hf-llama":
+def apply_rotary_pos_emb_torch_npu(q, k, cos, sin, rotary_type="separated"):
+    if rotary_type == "separated":
         if q.dim() == 3 and cos.dim() == 2 and sin.dim() == 2:
             cos = torch.cat([cos, cos], dim=-1)
             sin = torch.cat([sin, sin], dim=-1)
@@ -206,17 +171,7 @@ def apply_rotary_pos_emb_torch_npu(q, k, cos, sin, rotary_type="hf-llama"):
         else:
             raise ValueError(f"Unsupported shape: {q.shape}")
         return q_embed.to(q.dtype), k_embed.to(k.dtype)
-    elif rotary_type == "llama":
-        # "llama" has an [real, imag, real, imag, ..., real, imag] layout.
-        cos = torch.stack([cos, cos], dim=-1).flatten(-2)
-        sin = torch.stack([sin, sin], dim=-1).flatten(-2)
-        cos_q = reshape_rotary_for_broadcast(cos, q)
-        sin_q = reshape_rotary_for_broadcast(sin, q)
-        cos_k = reshape_rotary_for_broadcast(cos, k)
-        sin_k = reshape_rotary_for_broadcast(sin, k)
-        q_embed = (q * cos_q) + (rotate_pairwise(q) * sin_q)
-        k_embed = (k * cos_k) + (rotate_pairwise(k) * sin_k)
-        return q_embed.to(q.dtype), k_embed.to(k.dtype)
+
     else:
         raise ValueError(f"Unknown rotary type: {rotary_type}")
 
@@ -228,7 +183,7 @@ def apply_rotary_pos_emb(
     sin: torch.Tensor,
     q_out: Optional[torch.Tensor] = None,
     k_out: Optional[torch.Tensor] = None,
-    rotary_type: str = "hf-llama",
+    rotary_type: str = "separated",
     impl: str = "auto",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -241,29 +196,46 @@ def apply_rotary_pos_emb(
         sin: Precomputed sine
         q_out: If set, the query output will be written to this tensor
         k_out: If set, the key output will be written to this tensor
-        rotary_type: Variant of rotary positional embedding
+        rotary_type: Variant of rotary positional embedding:
+            - "interleaved": View the feature dimension as concatenated pairs of real and imaginary parts of
+              complex numbers, i.e., [real, imag, real, imag, ...]. This is useful for computing with builtin
+              complex types. In some cases (e.g., cases without group scaling), "interleaved" can be transformed
+              to "separated" in a mathematical equivalent way via weight preprocessing.
+            - "separated": View the feature dimension as concatenated real parts at the first half, and then
+              imaginary parts at the second half, i.e., [real, real, ..., real, imag, imag, ...]. This is
+              useful for computing with vector instructions of real types. In some cases (e.g., cases without
+              group scaling), "separated" can be transformed to "interleaved" in a mathematical equivalent way
+              via weight preprocessing.
+            - "interleaved-half": This is a special case of "interleaved" where only half of the dimensions
+              are rotated, while the remaining half are untouched. This is noted as `partial_rotary_factor=0.5`
+              in Huggingface transformers.
+            - "separated-half": This is a special case of "separated" where only half of the dimensions are
+              rotated, while the remaining half are untouched. This is noted as `partial_rotary_factor=0.5`
+              in Huggingface transformers.
     """
 
     if impl == "auto":
-        args = get_global_args()
-        # NOTE: npu_rotary_mul has accuracy issues on npu platforms, fallback to torch implementation
-        is_deepseek = args.models.type == "deepseek-v3"
         if (
             q_out is None
             and k_out is None
             and (
-                rotary_type == "hf-llama"
-                or (rotary_type == "llama" and hasattr(triton.language, "interleave"))
+                rotary_type == "separated"
+                or rotary_type == "separated-half"
+                or (
+                    rotary_type == "interleaved"
+                    and hasattr(triton.language, "interleaved")
+                )
+                or (
+                    rotary_type == "interleaved-half"
+                    and hasattr(triton.language, "interleaved")
+                )
             )
         ) and has_triton:
             impl = "triton"
-        elif rotary_type == "llama" and has_chitu_backend:
+        elif rotary_type == "interleaved" and has_chitu_backend:
             impl = "cuda"
-        elif has_torch_npu:
-            if is_deepseek:
-                impl = "torch"
-            else:
-                impl = "torch_npu"
+        elif rotary_type == "separated" and has_torch_npu:
+            impl = "torch_npu"
         else:
             impl = "torch"
 
