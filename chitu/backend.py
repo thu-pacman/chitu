@@ -1,28 +1,26 @@
-from collections import deque
-from typing import TYPE_CHECKING, Callable, Deque, List, Optional
 import gc
 import itertools
 import os
 import time
+from collections import deque
 from enum import Enum
 from glob import glob
 from logging import getLogger
 from pathlib import Path
-from tqdm import tqdm
-from chitu.quantization import get_quant_from_checkpoint_prefix
-from chitu.distributed.parallel_state import initialize_parallel_groups, get_pp_group
+from typing import TYPE_CHECKING, Callable, Deque, List, Optional
 
 import torch
 import torch.distributed as dist
 from safetensors.torch import safe_open
+from tqdm import tqdm
 
 from chitu.attn_backend import (
     FlashAttnBackend,
     FlashInferBackend,
     FlashMLABackend,
+    NpuAttnBackend,
     RefAttnBackend,
     TritonAttnBackend,
-    NpuAttnBackend,
 )
 from chitu.cache_manager import (
     KVCacheManager,
@@ -30,21 +28,23 @@ from chitu.cache_manager import (
     KVCacheManagerSkewAware,
     PagedKVCacheManager,
 )
-from chitu.device_type import is_ascend, is_muxi
-from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
-from chitu.utils import (
-    compute_layer_dist_in_pipe,
-    parse_dtype,
-    try_import_opt_dep,
-)
-from chitu.quantization import QuantizationRegistry, utils
 from chitu.custom_gguf import *
+from chitu.device_type import is_ascend, is_muxi
+from chitu.distributed.parallel_state import get_pp_group, initialize_parallel_groups
+from chitu.global_vars import set_global_args
 from chitu.hybrid_device import CPUParameter
 from chitu.models.registry import ModelType, get_model_class
+from chitu.quantization import (
+    QuantizationRegistry,
+    get_quant_from_checkpoint_prefix,
+    utils,
+)
+from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
+from chitu.utils import compute_layer_dist_in_pipe, parse_dtype, try_import_opt_dep
 
 if TYPE_CHECKING:
-    from chitu.scheduler import Scheduler
     from chitu.executor import BatchResult, Executor, OngoingRequests
+    from chitu.scheduler import Scheduler
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
@@ -131,7 +131,6 @@ class Backend:
         model_parallel_size = args.infer.tp_size
         pipeline_parallel_size = args.infer.pp_size
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
         global_rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
 
@@ -141,36 +140,6 @@ class Backend:
 
         # Bind process to GPU
         torch.cuda.set_device(local_rank)
-
-        # Bind process to CPU NUMA
-        if args.infer.bind_process_to_cpu == "auto":
-            if not has_cpuinfer and not has_numa:
-                args.infer.bind_process_to_cpu = "none"
-            elif not has_numa:
-                logger.warning(
-                    "'cpuinfer' is found but 'numa' is mising. Disabling NUMA binding. "
-                    "For better CPU inference performance, please refer to README.md and "
-                    "install the full '[cpu]' optional dependency."
-                )
-                args.infer.bind_process_to_cpu = "none"
-            elif not numa.available():
-                logger.warning(
-                    "NUMA is not support on this OS or hardware platform. Disabling NUMA binding."
-                )
-                args.infer.bind_process_to_cpu = "none"
-            elif numa.get_max_node() + 1 < local_world_size:
-                logger.info("Disable NUMA binding due to insufficient NUMA nodes.")
-                args.infer.bind_process_to_cpu = "none"
-            else:
-                args.infer.bind_process_to_cpu = "numa"
-        if args.infer.bind_process_to_cpu == "numa":
-            numa.bind({local_rank})
-        elif args.infer.bind_process_to_cpu == "none":
-            pass
-        else:
-            raise ValueError(
-                f"Unsupported infer.bind_process_to_cpu={args.infer.bind_process_to_cpu}"
-            )
 
         initialize_parallel_groups(
             tp_size=model_parallel_size, pp_size=pipeline_parallel_size
@@ -199,9 +168,6 @@ class Backend:
             torch.set_default_dtype(torch.bfloat16)
         else:
             raise NotImplementedError(f"Unsupported float_16bit_variant {args.dtype}")
-
-        # Check checkpoint exists
-        check_checkpoint_path(args)
 
     @staticmethod
     def _init_tokenizer(args):
@@ -668,10 +634,7 @@ class Backend:
 
         # Initialize attention backend
         attn_backend = Backend._init_attention_backend(args)
-        if args.infer.attn_type == "flash_infer" and args.infer.use_cuda_graph:
-            args.infer.use_cuda_graph = False
 
-        # Build and setup model
         Backend._build_and_setup_model(args, attn_backend)
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))

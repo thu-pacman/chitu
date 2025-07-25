@@ -23,7 +23,10 @@ from chitu.task import (
     TaskType,
     UserRequest,
 )
-from chitu.utils import gen_req_id
+from chitu.utils import gen_req_id, try_import_opt_dep
+
+numa, has_numa = try_import_opt_dep("numa", "cpu")
+cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
 logger = getLogger(__name__)
 
@@ -138,6 +141,18 @@ def warmup_engine(args):
     logger.warning("Inference system warmup completed")
 
 
+def check_checkpoint_path(args):
+    if args.models.ckpt_dir is None:
+        raise ValueError(
+            f"No checkpoint path provided. You can set it in command line by adding `models.ckpt_dir=<path>`. The model {args.models.name} can be downloaded from {args.models.source}"
+        )
+    if args.models.tokenizer_path is None:
+        logger.info(
+            f"Using {args.models.ckpt_dir} as the path to tokenizer. If the tokenizer has a different path, please set in command line by adding `models.tokenizer_path=<path>`"
+        )
+        args.models.tokenizer_path = args.models.ckpt_dir
+
+
 def chitu_init(args, logging_level=None):
     debug = os.getenv("CHITU_DEBUG", "0") == "1"
 
@@ -178,9 +193,50 @@ def chitu_init(args, logging_level=None):
         site_packages_path = get_ascend_custom_opp_path()
         os.environ["ASCEND_CUSTOM_OPP_PATH"] = site_packages_path
 
+        # Bind process to CPU NUMA
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+        if args.infer.bind_process_to_cpu == "auto":
+            if not has_cpuinfer and not has_numa:
+                args.infer.bind_process_to_cpu = "none"
+            elif not has_numa:
+                logger.warning(
+                    "'cpuinfer' is found but 'numa' is mising. Disabling NUMA binding. "
+                    "For better CPU inference performance, please refer to README.md and "
+                    "install the full '[cpu]' optional dependency."
+                )
+                args.infer.bind_process_to_cpu = "none"
+            elif not numa.available():
+                logger.warning(
+                    "NUMA is not support on this OS or hardware platform. Disabling NUMA binding."
+                )
+                args.infer.bind_process_to_cpu = "none"
+            elif numa.get_max_node() + 1 < local_world_size:
+                logger.info("Disable NUMA binding due to insufficient NUMA nodes.")
+                args.infer.bind_process_to_cpu = "none"
+            else:
+                args.infer.bind_process_to_cpu = "numa"
+        if args.infer.bind_process_to_cpu == "numa":
+            numa.bind({local_rank})
+        elif args.infer.bind_process_to_cpu == "none":
+            pass
+        else:
+            raise ValueError(
+                f"Unsupported infer.bind_process_to_cpu={args.infer.bind_process_to_cpu}"
+            )
+
+    if args.infer.use_cuda_graph:
+        if args.infer.attn_type == "flash_infer":
+            args.infer.use_cuda_graph = False
+            args.infer.cuda_graph_backend = "flash_infer"
+
+    # Check checkpoint exists
+    check_checkpoint_path(args)
+
     set_quant_variables(args)
     set_global_variables(args, debug=debug)
 
+    args = get_global_args()
     Backend.build(args)
     rank = torch.distributed.get_rank()
     if rank == 0:

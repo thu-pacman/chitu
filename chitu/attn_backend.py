@@ -9,18 +9,16 @@ __all__ = ["AttnBackend", "FlashAttnBackend", "RefAttnBackend", "NpuAttnBackend"
 import abc
 import bisect
 import math
-import packaging
 from typing import Optional, Union
 
+import packaging
 import torch
-from torch.nn.functional import scaled_dot_product_attention
 
-
-from chitu.global_vars import get_global_args
-from chitu.ops import append_to_paged_kv_cache, append_to_non_paged_kv_cache
-from chitu.utils import try_import_opt_dep
-from chitu.static_tensor import StaticTensor
 from chitu.device_type import is_muxi
+from chitu.global_vars import get_global_args
+from chitu.ops import append_to_non_paged_kv_cache, append_to_paged_kv_cache
+from chitu.static_tensor import StaticTensor
+from chitu.utils import try_import_opt_dep
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
@@ -629,13 +627,13 @@ class TritonAttnBackend(RefAttnBackend):
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
         try:
-            from chitu.triton_flash_attention import context_attention_fwd
             from chitu.triton_decode_attention import (
+                decode_attention_fwd,
                 mla_decode,
                 mla_decode_non_paged,
-                decode_attention_fwd,
                 triton_skew_decode,
             )
+            from chitu.triton_flash_attention import context_attention_fwd
 
             self.mla_decode = mla_decode
             self.mla_decode_non_paged = mla_decode_non_paged
@@ -1019,7 +1017,8 @@ class FlashInferBackend(TritonAttnBackend):
             or self.args.infer.mla_absorb == "absorb"
         )
         self.is_paged = self.args.infer.cache_type == "paged"
-        self.use_cuda_graph = self.args.infer.use_cuda_graph
+        cuda_graph_backend = getattr(self.args.infer, "cuda_graph_backend", "none")
+        self.use_cuda_graph = cuda_graph_backend == "flash_infer"
 
         # FlashInfer accepts block tables for Q and KV in CSR format.
         # - For Q, it is trivial because the length for each sample is 1.
