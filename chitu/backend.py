@@ -21,6 +21,8 @@ from chitu.attn_backend import (
     NpuAttnBackend,
     RefAttnBackend,
     TritonAttnBackend,
+    NpuAttnBackend,
+    HybridAttnBackend,
 )
 from chitu.cache_manager import (
     KVCacheManager,
@@ -390,7 +392,7 @@ class Backend:
             elif "deepseek-v3" in args.models.type:
                 return FlashMLABackend()
             else:
-                return FlashAttnBackend()
+                return HybridAttnBackend()
         elif args.infer.attn_type == "flash_attn":
             return FlashAttnBackend()
         elif args.infer.attn_type == "flash_mla":
