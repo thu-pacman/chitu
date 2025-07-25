@@ -448,7 +448,10 @@ class Executor:
         # --- dependent on tokens ---
         response_append(tasks, tokens, impl="auto")
 
-        token_list = tokens.cpu().tolist()
+        if tokens.numel() == 1:
+            token_list = [int(tokens.item())]
+        else:
+            token_list = tokens.cpu().tolist()
 
         # ---dependent on tokens_cpu ---
         for it, task in enumerate(tasks.tasks):

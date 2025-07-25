@@ -4,28 +4,36 @@ This file has adaption of open-source code from the following sources:
 - The implementation of the reference backend (RefAttnBackend) is originally from flash_attn's test (https://github.com/Dao-AILab/flash-attention/blob/main/tests/test_flash_attn.py), licensed under BSD-3-Clause.
 """
 
-__all__ = ["AttnBackend", "FlashAttnBackend", "RefAttnBackend", "NpuAttnBackend"]
+__all__ = [
+    "AttnBackend",
+    "FlashAttnBackend",
+    "RefAttnBackend",
+    "NpuAttnBackend",
+    "HybridAttnBackend",
+]
 
 import abc
 import bisect
 import math
-import packaging
+from functools import lru_cache
+from logging import getLogger
 from typing import Optional, Union
 
+import packaging.version
 import torch
-from torch.nn.functional import scaled_dot_product_attention
 
-
-from chitu.global_vars import get_global_args
-from chitu.ops import append_to_paged_kv_cache, append_to_non_paged_kv_cache
-from chitu.utils import try_import_opt_dep
-from chitu.static_tensor import StaticTensor
 from chitu.device_type import is_muxi
+from chitu.global_vars import get_global_args
+from chitu.ops import append_to_non_paged_kv_cache, append_to_paged_kv_cache
+from chitu.static_tensor import StaticTensor
+from chitu.utils import try_import_opt_dep
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
 flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
 triton, has_triton = try_import_opt_dep("triton", "triton")
+
+logger = getLogger(__name__)
 
 
 class AttnBackend(abc.ABC):
@@ -37,6 +45,20 @@ class AttnBackend(abc.ABC):
         super().__init__()
         self.qk_nope_head_dim = qk_nope_head_dim
         self.args = get_global_args()
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _check_triton_available() -> bool:
+        try:
+            import triton
+
+            if packaging.version.parse(triton.__version__) < packaging.version.parse(
+                "3.2.0"
+            ):
+                return False
+            return True
+        except Exception:
+            return False
 
     def prepare_metadata_for_decode(self, *args, **kwargs):
         pass
@@ -243,7 +265,7 @@ class AttnBackend(abc.ABC):
 
 
 class FlashAttnBackend(AttnBackend):
-
+    # TODO: change to FlashAttention-3 for Hopper GPUs
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
@@ -629,13 +651,13 @@ class TritonAttnBackend(RefAttnBackend):
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
         try:
-            from chitu.triton_flash_attention import context_attention_fwd
             from chitu.triton_decode_attention import (
+                decode_attention_fwd,
                 mla_decode,
                 mla_decode_non_paged,
-                decode_attention_fwd,
                 triton_skew_decode,
             )
+            from chitu.triton_flash_attention import context_attention_fwd
 
             self.mla_decode = mla_decode
             self.mla_decode_non_paged = mla_decode_non_paged
@@ -827,11 +849,7 @@ class TritonAttnBackend(RefAttnBackend):
         softmax_scale=None,
     ):
         # triton has bug, when version < 3.2.0, the "~" operator on bool vector will get wrong results
-        assert (
-            packaging.version.parse(triton.__version__)
-            >= packaging.version.parse("3.2.0")
-            or block_table is not None
-        )
+        assert AttnBackend._check_triton_available() or block_table is not None
 
         if cache_seqlens is int or cache_seqlens.ndim == 0:
             cache_seqlens = torch.full(
@@ -1019,7 +1037,8 @@ class FlashInferBackend(TritonAttnBackend):
             or self.args.infer.mla_absorb == "absorb"
         )
         self.is_paged = self.args.infer.cache_type == "paged"
-        self.use_cuda_graph = self.args.infer.use_cuda_graph
+        cuda_graph_backend = getattr(self.args.infer, "cuda_graph_backend", "none")
+        self.use_cuda_graph = cuda_graph_backend == "flash_infer"
 
         # FlashInfer accepts block tables for Q and KV in CSR format.
         # - For Q, it is trivial because the length for each sample is 1.
@@ -1570,3 +1589,74 @@ class NpuAttnBackend(RefAttnBackend):
         attn_output = attn_output.unsqueeze(1)
 
         return attn_output
+
+
+class HybridAttnBackend(AttnBackend):
+
+    def __init__(
+        self, *, qk_nope_head_dim: Optional[int] = None, batch_threshold: int = 64
+    ):
+        super().__init__(qk_nope_head_dim=qk_nope_head_dim)
+
+        self.triton_backend = TritonAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+        self.flash_attn_backend = FlashAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+
+        self.batch_threshold = batch_threshold
+        self.current_backend = self.flash_attn_backend
+
+    def _select_backend(self, batch_size: int):
+        if not AttnBackend._check_triton_available():
+            logger.warning(
+                "Triton not available, HybridAttnBackend will only use FlashAttnBackend"
+            )
+            return self.flash_attn_backend
+        if batch_size <= self.batch_threshold:
+            return self.triton_backend
+        return self.flash_attn_backend
+
+    def attn_varlen_func(
+        self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs
+    ):
+        batch_size = cu_seqlens_q.shape[0] - 1
+        self.current_backend = self._select_backend(batch_size)
+        return self.current_backend.attn_varlen_func(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs
+        )
+
+    def attn_with_kvcache(
+        self,
+        q,
+        k_cache,
+        v_cache,
+        k=None,
+        v=None,
+        cache_seqlens: Optional[Union[int, torch.Tensor]] = None,
+        cache_leftpad: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
+        causal=False,
+        window_size=(-1, -1),
+        softcap=0.0,
+        softmax_scale=None,
+    ):
+        batch_size = q.shape[0]
+        self.current_backend = self._select_backend(batch_size)
+        return self.current_backend.attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            k=k,
+            v=v,
+            cache_seqlens=cache_seqlens,
+            cache_leftpad=cache_leftpad,
+            block_table=block_table,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            softmax_scale=softmax_scale,
+        )
+
+    def prepare_metadata_for_decode(self, *args, **kwargs):
+        self.current_backend.prepare_metadata_for_decode(*args, **kwargs)
+
+    def prepare_metadata_for_prefill(self, *args, **kwargs):
+        self.current_backend.prepare_metadata_for_prefill(*args, **kwargs)

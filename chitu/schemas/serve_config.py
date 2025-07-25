@@ -1,6 +1,7 @@
-from omegaconf import MISSING
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, List, Optional
+
+from omegaconf import MISSING
 
 
 @dataclass
@@ -24,8 +25,9 @@ class InferConfig:
     soft_fp8: bool = MISSING  # Legacy parameter. To be removed in the future.
     fuse_shared_experts: bool = MISSING
     max_reqs: int = MISSING
-    pp_layer_partition: Optional[list] = MISSING
+    pp_layer_partition: Optional[List[int]] = MISSING
     use_cuda_graph: bool = MISSING
+    cuda_graph_backend: Optional[str] = MISSING  # none, flash_infer
     npu_fusion_fp4: bool = MISSING
     num_blocks: int = MISSING
     bind_process_to_cpu: str = MISSING
@@ -68,6 +70,94 @@ class SchedulerConfig:
     balance: SchedulerCommonConfig = MISSING
 
 
+class StaticConfig:
+    def __init__(self, config_obj):
+        if hasattr(config_obj, "__dataclass_fields__"):
+            from dataclasses import asdict
+
+            self._data = asdict(config_obj)
+        elif hasattr(config_obj, "__dict__"):
+            self._data = config_obj.__dict__
+        elif isinstance(config_obj, dict):
+            self._data = config_obj
+        else:
+            try:
+                from omegaconf import OmegaConf
+
+                self._data = OmegaConf.to_container(config_obj, resolve=True)
+            except Exception:
+                self._data = {}
+        self._convert_nested_structures()
+
+    def _convert_nested_structures(self):
+        for k, v in self._data.items():
+            if isinstance(v, dict):
+                setattr(self, k, StaticConfig(v))
+            elif isinstance(v, list):
+                setattr(self, k, self._convert_list(v))
+            else:
+                setattr(self, k, v)
+
+    def _convert_list(self, lst):
+        result = []
+        for item in lst:
+            if isinstance(item, dict):
+                result.append(StaticConfig(item))
+            elif isinstance(item, list):
+                result.append(self._convert_list(item))
+            else:
+                result.append(item)
+        return result
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            )
+
+        if name in self._data:
+            value = self._data[name]
+            if isinstance(value, dict):
+                static_value = StaticConfig(value)
+                setattr(self, name, static_value)
+                return static_value
+            return value
+
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+
+    def get(self, key, default=None):
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            return default
+
+    def __getitem__(self, key):
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            raise KeyError(key)
+
+    def __setitem__(self, key, value):
+        setattr(self, key, value)
+
+    def __contains__(self, key):
+        return key in self._data
+
+    def keys(self):
+        return self._data.keys()
+
+    def values(self):
+        return [getattr(self, k) for k in self._data.keys()]
+
+    def items(self):
+        return [(k, getattr(self, k)) for k in self._data.keys()]
+
+    def __repr__(self):
+        return f"StaticConfig({self._data!r})"
+
+
 @dataclass
 class ServeConfig:
     serve: ServeAddrConfig = field(default_factory=ServeAddrConfig)
@@ -80,3 +170,6 @@ class ServeConfig:
     float_16bit_variant: str = MISSING
     keep_dtype_in_checkpoint: bool = MISSING
     skip_preprocess: bool = MISSING
+
+    def to_object(self):
+        return StaticConfig(self)

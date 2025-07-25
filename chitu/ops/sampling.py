@@ -126,6 +126,7 @@ def response_append_cuda(
     need_expand = response_len == response_capacity
     new_response_list = torch.empty_like(response_list)
     return_response_list = []
+
     expand_cpu = need_expand.cpu().tolist()
 
     new_response_index = []

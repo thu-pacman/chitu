@@ -1,14 +1,18 @@
-import time
-from functools import reduce
 import operator
-import torch
+import time
+from functools import lru_cache, reduce
 from logging import getLogger
+from typing import Optional
+
+import torch
 from omegaconf import OmegaConf
+
+from chitu.schemas.serve_config import ServeConfig, StaticConfig
 
 logger = getLogger(__name__)
 
 
-_GLOBAL_ARGS = None
+_GLOBAL_ARGS: Optional[ServeConfig] = None
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_TIMERS = None
 _GLOBAL_MEMORY_BUFFER = None
@@ -122,9 +126,18 @@ def _set_tensorboard_writer(args):
             )
 
 
+@lru_cache(maxsize=1)
 def get_global_args():
     _ensure_var_is_initialized(_GLOBAL_ARGS, "global args")
-    return _GLOBAL_ARGS
+    cfg: ServeConfig = OmegaConf.to_object(_GLOBAL_ARGS)
+
+    if isinstance(cfg, dict) and "models" in cfg and isinstance(cfg["models"], dict):
+        cfg["models"] = StaticConfig(cfg["models"])
+    elif hasattr(cfg, "models") and isinstance(cfg.models, dict):
+        cfg.models = StaticConfig(cfg.models)
+    if isinstance(cfg, dict):
+        return StaticConfig(cfg)
+    return cfg
 
 
 def set_global_args(args, need_ensure=True):
@@ -132,6 +145,7 @@ def set_global_args(args, need_ensure=True):
     if need_ensure == True:
         _ensure_var_is_not_initialized(_GLOBAL_ARGS, "global args")
     _GLOBAL_ARGS = args
+    get_global_args.cache_clear()
 
 
 def get_timers():
