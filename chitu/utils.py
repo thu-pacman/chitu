@@ -6,6 +6,7 @@ This file has adaption of open-source code from the following sources:
 """
 
 import functools
+from itertools import accumulate
 import logging
 from logging import WARNING, INFO, getLogger
 import os
@@ -122,17 +123,16 @@ class VarLens:
             if device != "cpu"
             else self.seq_lens_tensor_cpu
         )
-        self.cpu_prefix_lens = [0]
-        for t in tokens:
-            self.cpu_prefix_lens.append(self.cpu_prefix_lens[-1] + len(t))
+        self.cpu_prefix_lens = list(accumulate(self.cpu_lens, initial=0))
+
         self.prefix_lens = torch.tensor(
             self.cpu_prefix_lens, device=device, dtype=torch.int32
         )
-        self.max_len = int(torch.max(self.lens))
-        self.total_len = int(torch.sum(self.lens))
-        self.position_ids = torch.from_numpy(
-            np.concatenate([np.arange(l) for l in self.cpu_lens])
-        ).to(device)
+        self.max_len = int(self.seq_lens_tensor_cpu.max())
+        self.total_len = int(self.seq_lens_tensor_cpu.sum())
+        self.position_ids = torch.cat(
+            [torch.arange(length, device=device) for length in self.lens]
+        )
 
 
 def get_config_dir_path():
