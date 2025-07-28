@@ -9,7 +9,7 @@ from datetime import datetime
 from enum import Enum
 from logging import getLogger
 from pathlib import Path
-from typing import ClassVar, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional
 
 import torch
 
@@ -159,6 +159,7 @@ class Task:
         message,
         priority: int = 1,
         stop_with_eos: bool = True,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
     ):
         # response related
         self.req = req
@@ -168,8 +169,9 @@ class Task:
         if isinstance(message, str):
             self.tokens = Backend.tokenizer.encode(message, bos=True, eos=False)
         elif hasattr(Backend.tokenizer.model, "apply_chat_template"):
+            chat_template_kwargs = chat_template_kwargs or {}
             self.tokens = Backend.tokenizer.model.apply_chat_template(
-                message, add_generation_prompt=True
+                message, add_generation_prompt=True, **chat_template_kwargs
             )
         else:
             self.tokens = Backend.formatter.encode_dialog_prompt(message)

@@ -2,7 +2,7 @@ import asyncio
 import logging
 from logging import getLogger
 from threading import Thread
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import hydra
 import torch
@@ -54,6 +54,7 @@ class ChatRequest(BaseModel):
     frequency_penalty: float = 0.0  # [-2, 2]
     min_batch_size: int = 1
     stop_with_eos: bool = True
+    chat_template_kwargs: dict[str, Any] = {}
 
 
 @app.post("/v1/chat/completions")
@@ -84,6 +85,20 @@ async def create_chat_completion(request: ChatRequest):
     freq_pen = params.pop("frequency_penalty")
     min_batch_size = params.pop("min_batch_size")
     stop_with_eos = params.pop("stop_with_eos")
+    chat_template_kwargs_unsafe = params.pop("chat_template_kwargs")
+
+    # Reconstruct chat_template_kwargs to prevent injection attacks
+    chat_template_kwargs = {}
+    if "enable_thinking" in chat_template_kwargs_unsafe:
+        if not isinstance(chat_template_kwargs_unsafe["enable_thinking"], bool):
+            raise HTTPException(
+                status_code=400,
+                detail="enable_thinking must be a boolean value",
+            )
+        chat_template_kwargs["enable_thinking"] = chat_template_kwargs_unsafe[
+            "enable_thinking"
+        ]
+
     try:
         req = UserRequest(
             message,
@@ -102,6 +117,7 @@ async def create_chat_completion(request: ChatRequest):
             req,
             req.message,
             stop_with_eos=stop_with_eos,
+            chat_template_kwargs=chat_template_kwargs,
         )
         TaskPool.add(task)
         if stream:

@@ -1,0 +1,27 @@
+name: GLM-4.5-Air
+type: hf-glm-4-moe
+source: "https://huggingface.co/zai-org/GLM-4.5-Air" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+tokenizer_type: "hf" # one of: hf, tiktoken
+dim: 4096
+head_dim: 128
+inter_dim: 10944
+moe_inter_dim: 1408
+norm_topk_prob: True
+n_heads: 96
+n_kv_heads: 8
+n_expert_groups: 1
+n_limited_groups: 1
+n_routed_experts: 128
+n_activated_experts: 8
+n_shared_experts: 1
+score_func: "sigmoid"
+route_scale: 1.0
+n_dense_layers: 1
+n_layers: 46
+qkv_has_bias: True
+use_qk_norm: False
+norm_eps: 1e-05
+rope_theta: 10000
+vocab_size: 151552

@@ -122,7 +122,8 @@ def run_pipe_or_tensor_parallelism(args, timers):
                 f"max GPU memory used: {torch.cuda.max_memory_allocated() / 1024**3} GB"
             )
 
-            logger.info(f"Response in rank {rank}: {reqs[0].output=}")
+            for i, req in enumerate(reqs):
+                logger.info(f"Response in rank {rank}: reqs[{i}].output={req.output}")
 
             timers.log()
 
@@ -156,7 +157,8 @@ def run_normal(args, timers):
         logger.info(f"Tokens generate : {tokens}")
         logger.info(f"Time cost {t_end - t_start}")
 
-        logger.info(f"Response in rank {rank}: {reqs[0].output}")
+        for i, req in enumerate(reqs):
+            logger.info(f"Response in rank {rank}: reqs[{i}].output={req.output}")
 
         timers.log()
 

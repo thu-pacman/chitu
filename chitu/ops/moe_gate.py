@@ -2,7 +2,7 @@ from typing import Optional
 
 import torch
 
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_opt_dep, is_power_of_two
 
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
@@ -33,7 +33,11 @@ def moe_gate(
             )
         ):
             impl = "muxi"
-        elif has_chitu_backend:
+        elif (
+            has_chitu_backend
+            and scores.shape[-1] <= 256
+            and is_power_of_two(scores.shape[-1])
+        ):
             impl = "cuda"
         else:
             impl = "torch"

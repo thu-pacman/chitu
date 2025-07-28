@@ -236,6 +236,23 @@ curl localhost:21002/v1/chat/completions   -H "Content-Type: application/json"  
   }'
 ```
 
+Supported optional JSON arguments are:
+
+| Name                   | Type             | Description                                                  |
+| ---------------------- | ---------------- | ------------------------------------------------------------ |
+| `max_tokens`           | `int`            | Stop responding once the number of output tokens reaches this limit. |
+| `temperature`          | `float`          | A sampling argument affecting the diversity of the output.   |
+| `top_p`                | `float`          | A sampling argument affecting the diversity of the output.   |
+| `top_k`                | `int`            | A sampling argument affecting the diversity of the output.   |
+| `frequency_penalty`    | `float`          | A sampling argument affecting the diversity of the output.   |
+| `logprobs`             | `bool`           | If true, also return `log(softmax(logits))` before sampling, useful for precision analysis. |
+| `top_logprobs`         | `int`            | The number of `logprobs` returned.                           |
+| `stream`               | `bool`           | If true, make the HTTP response streaming, which can be used with `requests.post(stream=True)` in Python. |
+| `stop_with_eos`        | `bool`           | If false, keep generating outputs until the number of output tokens reaches `max_tokens`, even if the answer has already ended, useful for a stable speed test. |
+| `chat_template_kwargs` | `Dict[str, Any]` | Additional argument for the chat template. The only currently supported argument is: `{"enable_thinking": false}` for disabling thinking mode for GLM-4.5 models. |
+
+
+
 ## Performance Benchmarking
 
 The framework provides a comprehensive benchmarking tool to measure inference performance, including latency, throughput, and TPS (Tokens Per Second).
