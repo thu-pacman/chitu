@@ -162,7 +162,7 @@ def response_append_cuda(
 
 def response_append(tasks, tokens, impl="auto"):
     if impl == "auto":
-        if tasks.num_tasks > 8:
+        if tasks.num_tasks > 8 and has_chitu_backend:
             impl = "cuda"
         else:
             impl = "torch"

@@ -252,7 +252,10 @@ def remove_task_other_device(remove_task_ids):
         return
     # Since we are removing, any task type is fine
     task_tensor = PackedTasksBase(
-        len(remove_task_ids), remove_task_ids, remove_task_ids, TaskType.Decode
+        num_tasks=len(remove_task_ids),
+        task_ids=remove_task_ids,
+        req_ids=remove_task_ids,
+        task_type=TaskType.Decode,
     ).serialize(
         payload_type=SerializedPackedTasksPayloadType.EndTask,
         device="cpu" if Backend.use_gloo else 0,
