@@ -99,3 +99,8 @@ COPY . .
 # Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
 # compile at install time, and the compile results are environment dependent.
 RUN bash script/install.sh "${optional_deps}" "${build_jobs}" "${enable_editable_install}" "${enable_cython}"
+
+# These are optimization flags for NCCL, but according to our tests, they only make things
+# worse, so we don't use them.
+ENV NCCL_GRAPH_MIXING_SUPPORT=0
+ENV NCCL_GRAPH_REGISTER=0
