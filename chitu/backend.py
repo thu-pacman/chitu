@@ -531,6 +531,7 @@ class Backend:
                 "hf-llama",
                 "hf-qwen-3-moe",
                 "hf-glm-z1",
+                "hf-glm-4-moe",
                 "hf-mixtral",
                 "deepseek-v3",
             }:
@@ -595,6 +596,10 @@ class Backend:
         def get_filter_key():
             if getattr(args.models, "type", "") == "deepseek-v3":
                 return lambda k: "model.layers.61" not in k
+            if getattr(args.models, "name", "") == "GLM-4.5-Air":
+                return lambda k: "model.layers.46" not in k
+            if getattr(args.models, "name", "") == "GLM-4.5":
+                return lambda k: "model.layers.92" not in k
             if getattr(args.models, "name", "") == "QwQ-32B-fp4":
                 return lambda k: not (k.endswith(".k_scale") or k.endswith(".v_scale"))
             return None

@@ -168,6 +168,10 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
+def is_power_of_two(n: int) -> bool:
+    return (n != 0) and (n & (n - 1)) == 0
+
+
 class DataSaver:
     """数据保存装饰器类"""
 

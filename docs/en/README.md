@@ -27,6 +27,35 @@ Chitu is a high-performance inference framework for large language models. Chitu
 
 ## Evaluation
 
+### Deploy GLM-4.5-Air on a single eight-card H20 (96G) server
+
+with input length = 128, output length = 1024:
+
+| Batch size | Output TPS (tokens/s) |
+| ---------- | --------------------- |
+| 1          | 113.28                |
+| 2          | 193.84                |
+| 4          | 352.84                |
+| 8          | 621.75                |
+| 16         | 1058.1                |
+| 32         | 1774.08               |
+| 64         | 2986.52               |
+| 128        | 4757.48               |
+
+### Deploy GLM-4.5 on a single eight-card H20 (96G) server
+
+with input length = 128, output length = 1024:
+
+| Batch size | Output TPS (tokens/s) |
+| ---------- | --------------------- |
+| 1          | 48.14                 |
+| 2          | 83.25                 |
+| 4          | 150.37                |
+| 8          | 265.73                |
+| 16         | 460.33                |
+| 32         | 765.42                |
+| 64         | 1319.64               |
+
 ### Deploy Qwen3-32B on Hygon DCU 4-cards
 
 | Output token/s | input 256, output 256 | input 1024, output 1024|

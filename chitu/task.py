@@ -9,7 +9,7 @@ from datetime import datetime
 from enum import Enum
 from logging import getLogger
 from pathlib import Path
-from typing import ClassVar, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional
 
 import torch
 
@@ -159,6 +159,7 @@ class Task:
         message,
         priority: int = 1,
         stop_with_eos: bool = True,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
     ):
         # response related
         self.req = req
@@ -168,8 +169,9 @@ class Task:
         if isinstance(message, str):
             self.tokens = Backend.tokenizer.encode(message, bos=True, eos=False)
         elif hasattr(Backend.tokenizer.model, "apply_chat_template"):
+            chat_template_kwargs = chat_template_kwargs or {}
             self.tokens = Backend.tokenizer.model.apply_chat_template(
-                message, add_generation_prompt=True
+                message, add_generation_prompt=True, **chat_template_kwargs
             )
         else:
             self.tokens = Backend.formatter.encode_dialog_prompt(message)
@@ -363,8 +365,9 @@ class PackedTasksBase:
     num_tasks: int
     task_ids: List[str]
     req_ids: List[str]
-    task_type: TaskType
+    task_type: Optional[TaskType] = None
     tokens: Optional[List[List[int]]] = None
+    payload_type: Optional[SerializedPackedTasksPayloadType] = None
 
     @classmethod
     def configure(cls, max_num_tasks: int):
@@ -383,41 +386,55 @@ class PackedTasksBase:
             task_tensor = task_tensor.cpu()
         payload_type = SerializedPackedTasksPayloadType(task_tensor[0].item())
 
-        if payload_type == SerializedPackedTasksPayloadType.Heartbeat:
-            return payload_type, None
-
-        decoded_ids = []
-        decoded_types = []
-        lens = []
-        for it in range(cls.max_num_tasks):
-            task_id = task_tensor[1 + it].item()
-            if task_id == 0:
-                break
-            decoded_id, decoded_type = req_decode(task_id)
-            decoded_ids.append(decoded_id)
-            decoded_types.append(decoded_type)
-            if decoded_type == TaskType.Prefill:
-                lens.append(int(task_tensor[1 + cls.max_num_tasks + it]))
-        task_ids = decoded_ids
-        req_ids = task_ids
-        num_tasks = len(task_ids)
+        num_tasks = 0
+        task_ids = []
+        req_ids = []
         task_type = None
         tokens = None
-        if num_tasks > 0:
-            # TODO: need to change task type classification when adding hybrid task
-            task_type = decoded_types[0]
-            if task_type == TaskType.Prefill:
-                tokens = [([0] * lens[it]) for it in range(len(lens))]
 
-        slot_handle = get_slot_handle()
-        if slot_handle:
-            slot_handle.set_slot_idx(task_tensor[-2].item())
+        if (
+            payload_type == SerializedPackedTasksPayloadType.Normal
+            or payload_type == SerializedPackedTasksPayloadType.EndTask
+        ):
+            decoded_ids = []
+            decoded_types = []
+            lens = []
+            for it in range(cls.max_num_tasks):
+                task_id = task_tensor[1 + it].item()
+                if task_id == 0:
+                    break
+                decoded_id, decoded_type = req_decode(task_id)
+                decoded_ids.append(decoded_id)
+                decoded_types.append(decoded_type)
+                if decoded_type == TaskType.Prefill:
+                    lens.append(int(task_tensor[1 + cls.max_num_tasks + it]))
+            task_ids = decoded_ids
+            req_ids = task_ids
+            num_tasks = len(task_ids)
+            task_type = None
+            tokens = None
+            if num_tasks > 0:
+                # TODO: need to change task type classification when adding hybrid task
+                task_type = decoded_types[0]
+                if task_type == TaskType.Prefill:
+                    tokens = [([0] * lens[it]) for it in range(len(lens))]
 
-        num_blocks = task_tensor[-1].item()
-        if not num_blocks == 0:
-            get_global_args().infer.num_blocks = num_blocks
+            slot_handle = get_slot_handle()
+            if slot_handle:
+                slot_handle.set_slot_idx(task_tensor[-2].item())
 
-        return payload_type, cls(num_tasks, task_ids, req_ids, task_type, tokens)
+            num_blocks = task_tensor[-1].item()
+            if not num_blocks == 0:
+                get_global_args().infer.num_blocks = num_blocks
+
+        return payload_type, cls(
+            num_tasks=num_tasks,
+            task_ids=task_ids,
+            req_ids=req_ids,
+            task_type=task_type,
+            tokens=tokens,
+            payload_type=payload_type,
+        )
 
     def serialize(self, device, payload_type=SerializedPackedTasksPayloadType.Normal):
 
