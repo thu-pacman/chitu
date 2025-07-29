@@ -40,7 +40,7 @@ class PagedKVCacheManager:
 
         self.max_blocks_per_req = (max_seq_len + block_size - 1) // block_size
         self.max_num_blocks = self.max_blocks_per_req * num_hot_req
-        self.num_blocks = num_blocks if num_blocks != -1 else num_hot_req
+        self.num_blocks = num_blocks if num_blocks != -1 else self.max_num_blocks
         self.begin_layer_id = begin_layer_id
         self.end_layer_id = end_layer_id
         self.num_layers = end_layer_id - begin_layer_id

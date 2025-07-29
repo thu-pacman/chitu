@@ -9,6 +9,7 @@ import torch
 import torch.distributed
 
 from chitu.backend import Backend, BackendState
+from chitu.cache_manager import PagedKVCacheManager
 from chitu.device_type import is_nvidia
 from chitu.distributed_utils import propagate_tensor_to_all_devices
 from chitu.executor import Executor
@@ -22,6 +23,7 @@ from chitu.task import (
     TaskPool,
     TaskType,
     UserRequest,
+    MockFixedLengthedUserRequest,
 )
 from chitu.utils import gen_req_id, try_import_opt_dep
 
@@ -107,21 +109,17 @@ def warmup_engine(args):
     logger.warning("Starting inference system warmup...")
     init_cache_static()
     num_warmup_reqs = args.infer.max_reqs
-    warmup_msg = [{"role": "user", "content": "Hi"}]
 
     for i in range(num_warmup_reqs):
-        req = UserRequest(
-            warmup_msg,
+        warmup_max_new_tokens = 2
+        req = MockFixedLengthedUserRequest(
+            args.infer.max_seq_len - warmup_max_new_tokens,
             f"{gen_req_id()}",
-            max_new_tokens=10,
+            max_new_tokens=warmup_max_new_tokens,
             temperature=0.7,
             top_k=1,
         )
-        task = Task(
-            f"{req.request_id}",
-            req,
-            req.message,
-        )
+        task = Task(f"{req.request_id}", req)
         TaskPool.add(task)
 
     logger.warning(f"Added {num_warmup_reqs} warmup requests to TaskPool")
@@ -129,13 +127,14 @@ def warmup_engine(args):
     while len(TaskPool.pool) > 0:
         chitu_run()
     if should_calculate_blocks(args):
+        assert isinstance(Backend.cache_manager, PagedKVCacheManager)
         _, total_gpu_memory = torch.cuda.mem_get_info(0)
         gpu_memory_utilization = args.infer.gpu_memory_utilization
         get_global_args().infer.num_blocks = (
             get_additional_block_num(
                 total_gpu_memory, Backend.cache_manager, gpu_memory_utilization
             )
-            + args.infer.max_reqs
+            + Backend.cache_manager.num_blocks
         )
 
     logger.warning("Inference system warmup completed")

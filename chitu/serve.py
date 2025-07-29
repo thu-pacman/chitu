@@ -2,7 +2,7 @@ import asyncio
 import logging
 from logging import getLogger
 from threading import Thread
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Mapping
 
 import hydra
 import torch
@@ -54,7 +54,7 @@ class ChatRequest(BaseModel):
     frequency_penalty: float = 0.0  # [-2, 2]
     min_batch_size: int = 1
     stop_with_eos: bool = True
-    chat_template_kwargs: dict[str, Any] = {}
+    chat_template_kwargs: Mapping[str, Any] = {}
 
 
 @app.post("/v1/chat/completions")
@@ -110,14 +110,13 @@ async def create_chat_completion(request: ChatRequest):
             top_p=top_p,
             top_k=top_k,
             frequency_penalty=freq_pen,
+            chat_template_kwargs=chat_template_kwargs,
         )
         response = AsyncResponse(req)
         task = Task(
             f"{req.request_id}",
             req,
-            req.message,
             stop_with_eos=stop_with_eos,
-            chat_template_kwargs=chat_template_kwargs,
         )
         TaskPool.add(task)
         if stream:

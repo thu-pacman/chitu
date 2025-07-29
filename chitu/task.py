@@ -9,7 +9,8 @@ from datetime import datetime
 from enum import Enum
 from logging import getLogger
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional, Mapping
+from typing_extensions import override
 
 import torch
 
@@ -73,6 +74,7 @@ class UserRequest:
         top_k=50,
         temperature=0.8,
         frequency_penalty=0.0,
+        chat_template_kwargs: Mapping[str, Any] = {},
     ):
         # input related
         self.message = message
@@ -84,6 +86,7 @@ class UserRequest:
             top_k=top_k,
             frequency_penalty=frequency_penalty,
         )
+        self.chat_template_kwargs = chat_template_kwargs
 
         # response related
         self.output = ""
@@ -144,6 +147,46 @@ class UserRequest:
         with open(path, "a") as file:
             file.write(trace_str + "\n")
 
+    def to_tokens(self):
+        return Backend.formatter.encode_dialog_prompt(
+            self.message, chat_template_kwargs=self.chat_template_kwargs
+        )
+
+
+class MockFixedLengthedUserRequest(UserRequest):
+    """
+    A mock request that has a fixed length of tokens, useful for warmup and testing.
+    """
+
+    def __init__(
+        self,
+        input_len: int,
+        request_id,
+        logprobs=False,
+        top_logprobs=None,
+        max_new_tokens=50,
+        top_p=0.9,
+        top_k=50,
+        temperature=0.8,
+        frequency_penalty=0.0,
+    ):
+        super().__init__(
+            message="(this is a mock)",
+            request_id=request_id,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
+            max_new_tokens=max_new_tokens,
+            top_p=top_p,
+            top_k=top_k,
+            temperature=temperature,
+            frequency_penalty=frequency_penalty,
+        )
+        self.input_len = input_len
+
+    @override
+    def to_tokens(self):
+        return [1] * self.input_len
+
 
 class TaskType(Enum):
     Prefill = 1
@@ -156,26 +199,15 @@ class Task:
         self,
         task_id: str,
         req: UserRequest,
-        message,
         priority: int = 1,
         stop_with_eos: bool = True,
-        chat_template_kwargs: Optional[dict[str, Any]] = None,
     ):
         # response related
         self.req = req
         self.response = DeviceList([], dtype=torch.long, device="cuda")
         self.num_new_tokens: int = 0
         self.next_token: int = -1  # Only effective when num_new_tokens > 0
-        if isinstance(message, str):
-            self.tokens = Backend.tokenizer.encode(message, bos=True, eos=False)
-        elif hasattr(Backend.tokenizer.model, "apply_chat_template"):
-            chat_template_kwargs = chat_template_kwargs or {}
-            self.tokens = Backend.tokenizer.model.apply_chat_template(
-                message, add_generation_prompt=True, **chat_template_kwargs
-            )
-        else:
-            self.tokens = Backend.formatter.encode_dialog_prompt(message)
-
+        self.tokens = req.to_tokens()
         self.req.prompt_len = len(self.tokens)
 
         # scheduling related
