@@ -2,6 +2,7 @@ import torch
 
 from chitu.utils import try_import_opt_dep
 from chitu.native_layout import Vector
+from chitu.device_type import is_muxi
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
 
@@ -44,6 +45,10 @@ def silu_and_mul(x, impl="auto"):
 
     if impl == "auto":
         if isinstance(x, muxi_utils.MuxiNativeLayoutActivation):
+            impl = "torch"
+        elif is_muxi() and x.shape.numel() // x.shape[-1] > 1024:
+            # triton implementation fails for large amount of tokens on Muxi.
+            # This happens on prefill stage for large input lengths. (FIXME)
             impl = "torch"
         else:
             impl = "triton"

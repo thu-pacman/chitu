@@ -259,7 +259,15 @@ class ChatFormat:
         tokens.append(self.tokenizer.special_tokens["<|eot_id|>"])
         return tokens
 
-    def encode_dialog_prompt(self, dialog: Dialog) -> List[int]:
+    def encode_dialog_prompt(
+        self,
+        dialog: Dialog,
+        chat_template_kwargs: Mapping[str, Any] = {},
+    ) -> List[int]:
+        if chat_template_kwargs:
+            raise NotImplementedError(
+                "Chat template kwargs are not supported for this tokenizer."
+            )
         tokens = []
         tokens.append(self.tokenizer.special_tokens["<|begin_of_text|>"])
         for message in dialog:

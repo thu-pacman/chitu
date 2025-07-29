@@ -111,9 +111,11 @@ def warmup_engine(args):
     num_warmup_reqs = args.infer.max_reqs
 
     for i in range(num_warmup_reqs):
+        # TODO: After we implement chunked prefill, use the chunk size here for warmup_seq_len
+        warmup_seq_len = 1
         warmup_max_new_tokens = 2
         req = MockFixedLengthedUserRequest(
-            args.infer.max_seq_len - warmup_max_new_tokens,
+            warmup_seq_len,
             f"{gen_req_id()}",
             max_new_tokens=warmup_max_new_tokens,
             temperature=0.7,
