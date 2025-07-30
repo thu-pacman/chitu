@@ -23,7 +23,9 @@ from chitu.distributed.parallel_state import (
     get_tp_group,
     get_pp_group,
     get_pp_pair_group,
-    get_cpu_tp_group,
+)
+from chitu.distributed.moe_token_dispatcher import (
+    get_token_dispatcher,
 )
 from chitu.utils import VarLens, top_k_top_p_min_p_sampling_from_probs_torch
 from chitu.ops import apply_frequency_penalty, response_append
@@ -237,6 +239,10 @@ class Executor:
             self.get_payload_shape = lambda num_tokens: [num_tokens]
             self.get_payload_dtype = lambda: torch.int64
 
+        self.dp_flag = args.infer.dp_size > 1
+
+        self.token_dispatcher = get_token_dispatcher()
+
     def _prepare_seq_lens_for_decode(self, tasks: PackedTasksBase):
         return [Backend.cache_manager.seq_lens[req_id] for req_id in tasks.req_ids]
 
@@ -270,6 +276,9 @@ class Executor:
                 Backend.cache_manager.finalize_cache_all_decode(rid)
             return None
 
+        if self.token_dispatcher is not None:
+            self.token_dispatcher.prepare(tasks.task_type, tasks.num_tokens)
+
         # 2. prefill/decode step
         if tasks.task_type == TaskType.Prefill:
             out = self.prefill_step(tasks)
@@ -279,7 +288,9 @@ class Executor:
             raise NotImplementedError  # Hybrid task not implemented
 
         # 3. handle ongoing task
-        if self.rank == 0:
+        if (
+            self.rank == 0 or self.dp_flag
+        ):  # [HACK] temporary workaround to support dp+ep
             if tasks.task_type == TaskType.Prefill:
                 # After prefill, new decode tasks are created
                 for task in tasks.tasks:
@@ -298,7 +309,9 @@ class Executor:
 
         num_tokens = varlens.total_len
 
-        if self.rank == 0:
+        if (
+            self.rank == 0 or self.dp_flag
+        ):  # [HACK] temporary workaround to support dp+ep
             payload = torch.from_numpy(np.concatenate(tasks.tokens)).to(self.local_rank)
         else:
             payload = torch.empty(
@@ -334,7 +347,9 @@ class Executor:
         num_tokens = tasks.num_tasks
 
         # prepare payload tensor
-        if self.rank == 0:
+        if (
+            self.rank == 0 or self.dp_flag
+        ):  # [HACK] temporary workaround to support dp+ep
             payload = self._prepare_new_tokens_for_decode(tasks)  # tensor
         else:
             payload = torch.empty(

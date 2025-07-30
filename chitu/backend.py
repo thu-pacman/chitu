@@ -43,6 +43,7 @@ from chitu.quantization import (
 )
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
 from chitu.utils import compute_layer_dist_in_pipe, parse_dtype, try_import_opt_dep
+from chitu.distributed.moe_token_dispatcher import init_token_dispatcher
 
 if TYPE_CHECKING:
     from chitu.executor import BatchResult, Executor, OngoingRequests
@@ -132,19 +133,28 @@ class Backend:
 
         model_parallel_size = args.infer.tp_size
         pipeline_parallel_size = args.infer.pp_size
+
+        non_expert_data_parallel_size = args.infer.dp_size
+        expert_parallel_size = args.infer.ep_size
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         global_rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
 
         assert (
-            world_size == model_parallel_size * pipeline_parallel_size
-        ), f"World size not match: {world_size} != {model_parallel_size} * {pipeline_parallel_size}"
+            world_size
+            == model_parallel_size
+            * pipeline_parallel_size
+            * non_expert_data_parallel_size
+        ), f"World size not match: {world_size} != {model_parallel_size} * {pipeline_parallel_size} * {non_expert_data_parallel_size}"
 
         # Bind process to GPU
         torch.cuda.set_device(local_rank)
 
         initialize_parallel_groups(
-            tp_size=model_parallel_size, pp_size=pipeline_parallel_size
+            tp_size=model_parallel_size,
+            pp_size=pipeline_parallel_size,
+            dp_size=non_expert_data_parallel_size,
+            ep_size=expert_parallel_size,
         )
 
         Backend.pp_stage = global_rank // model_parallel_size
@@ -627,6 +637,10 @@ class Backend:
         """
         # Initialize distributed environment
         Backend._init_distributed(args)
+
+        init_token_dispatcher(
+            args.infer.ep_size, args.infer.tp_size, args.infer.dp_size
+        )
 
         # Setup environment and basic configuration
         Backend._setup_environment(args)

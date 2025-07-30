@@ -22,6 +22,7 @@ from chitu.native_layout import (
     Packed4BitWeightAlongK,
     Packed4BitWeightNPUNative,
 )
+from chitu.distributed.parallel_state import get_ep_group
 
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
 triton, has_triton = try_import_opt_dep("triton", "triton")
@@ -77,26 +78,46 @@ def linear_block_fp4_npu(
     if x.dim() == 3:
         # 三维的 x 需要squeeze到二维,在NpuAttnBackend mla_attn_with_kvcache中 x 会被 unsqueeze 到三维
         x = x.squeeze(1)
-        grouped_gemm.grouped_gemm(
-            x,
-            weight,
-            antiquantOffsetOptional=scale_off,
-            antiquantScaleOptional=scale,
-            groupListOptional=expert_tokens,
-            output=output,
-            type=grouped_gemm.GroupedGemmType.FP4,
-        )
+        if x.shape[0] <= 2:
+            grouped_gemm.grouped_gemv(
+                x,
+                weight,
+                scale=scale,
+                groupList=expert_tokens,
+                output=output,
+                type=grouped_gemm.GroupedGemmType.FP4,
+            )
+        else:
+            grouped_gemm.grouped_gemm(
+                x,
+                weight,
+                antiquantOffsetOptional=scale_off,
+                antiquantScaleOptional=scale,
+                groupListOptional=expert_tokens,
+                output=output,
+                type=grouped_gemm.GroupedGemmType.FP4,
+            )
         output = output.unsqueeze(1)
     else:
-        grouped_gemm.grouped_gemm(
-            x,
-            weight,
-            antiquantOffsetOptional=scale_off,
-            antiquantScaleOptional=scale,
-            groupListOptional=expert_tokens,
-            output=output,
-            type=grouped_gemm.GroupedGemmType.FP4,
-        )
+        if x.shape[0] <= 2:
+            grouped_gemm.grouped_gemv(
+                x,
+                weight,
+                scale=scale,
+                groupList=expert_tokens,
+                output=output,
+                type=grouped_gemm.GroupedGemmType.FP4,
+            )
+        else:
+            grouped_gemm.grouped_gemm(
+                x,
+                weight,
+                antiquantOffsetOptional=scale_off,
+                antiquantScaleOptional=scale,
+                groupListOptional=expert_tokens,
+                output=output,
+                type=grouped_gemm.GroupedGemmType.FP4,
+            )
 
     if bias is not None:
         output += bias
@@ -334,8 +355,6 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
         n_routed_experts: int,
         n_shared_experts: int,
         n_activated_experts: int,
-        moe_world_size: int,
-        moe_rank: int,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
@@ -352,17 +371,33 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
 
         self.dim = dim
         self.fuse_shared_experts = fuse_shared_experts
+        self.ep_group = get_ep_group()
+        moe_rank = self.ep_group.rank_in_group
+        moe_world_size = self.ep_group.group_size
         assert (
             n_routed_experts % moe_world_size == 0
-        ), f"Number of experts must be divisible by world size (world_size={moe_world_size})"
+        ), f"Number of experts must be divisible by moe world size (world_size={moe_world_size})"
         self.n_shared_experts = n_shared_experts
         self.n_fused_shared_experts = (
             n_shared_experts if self.fuse_shared_experts else 0
         )
+
         self.n_routed_experts = n_routed_experts
         self.n_local_experts = n_routed_experts // moe_world_size
+        remainder = n_routed_experts % moe_world_size
         self.experts_start_idx = moe_rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        if self.ep_group.is_last_rank:
+            self.experts_end_idx += remainder
+        if moe_world_size > 1:
+            expert_map = [-1] * self.n_routed_experts
+            expert_map[self.experts_start_idx : self.experts_end_idx] = list(
+                range(self.n_local_experts)
+            )
+            self.expert_map = torch.tensor(expert_map, dtype=torch.int32, device="cuda")
+        else:
+            self.expert_map = None
+
         self.group_size = (
             self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts
         )
@@ -595,6 +630,7 @@ class Blockfp4MoeExpertsPackKStride64(
                     use_fp4_w4a8=True,
                     inplace=True,
                     global_num_experts=self.n_routed_experts,
+                    expert_map=self.expert_map,
                     w1_scale=self.gate_up_proj_weight_scale,
                     w2_scale=self.down_proj_weight_scale,
                     w1w3_scale_2=self.gate_up_proj_weight_scale_2,
@@ -637,6 +673,7 @@ class Blockfp4MoeExpertsPackKStride64(
                     use_fp4_w4a8=True,
                     inplace=True,
                     global_num_experts=self.n_routed_experts + self.n_shared_experts,
+                    expert_map=self.expert_map,
                     w1_scale=self.gate_up_proj_weight_scale,
                     w2_scale=self.down_proj_weight_scale,
                     w1w3_scale_2=self.gate_up_proj_weight_scale_2,

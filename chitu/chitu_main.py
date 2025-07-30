@@ -9,6 +9,7 @@ import torch
 import torch.distributed
 
 from chitu.backend import Backend, BackendState
+from chitu.cache_manager import PagedKVCacheManager
 from chitu.device_type import is_nvidia
 from chitu.distributed_utils import propagate_tensor_to_all_devices
 from chitu.executor import Executor
@@ -22,6 +23,7 @@ from chitu.task import (
     TaskPool,
     TaskType,
     UserRequest,
+    MockFixedLengthedUserRequest,
 )
 from chitu.utils import gen_req_id, try_import_opt_dep
 
@@ -29,6 +31,8 @@ numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
 logger = getLogger(__name__)
+
+EDP_SKIP_FLAG = True
 
 
 def init_logger(logging_level=logging.INFO):
@@ -104,24 +108,25 @@ def get_additional_block_num(
 
 
 def warmup_engine(args):
+    if args.infer.dp_size > 1:  # not suppoort non_expert_data_parallel
+        return
+
     logger.warning("Starting inference system warmup...")
     init_cache_static()
     num_warmup_reqs = args.infer.max_reqs
-    warmup_msg = [{"role": "user", "content": "Hi"}]
 
     for i in range(num_warmup_reqs):
-        req = UserRequest(
-            warmup_msg,
+        # TODO: After we implement chunked prefill, use the chunk size here for warmup_seq_len
+        warmup_seq_len = 1
+        warmup_max_new_tokens = 2
+        req = MockFixedLengthedUserRequest(
+            warmup_seq_len,
             f"{gen_req_id()}",
-            max_new_tokens=10,
+            max_new_tokens=warmup_max_new_tokens,
             temperature=0.7,
             top_k=1,
         )
-        task = Task(
-            f"{req.request_id}",
-            req,
-            req.message,
-        )
+        task = Task(f"{req.request_id}", req)
         TaskPool.add(task)
 
     logger.warning(f"Added {num_warmup_reqs} warmup requests to TaskPool")
@@ -129,13 +134,14 @@ def warmup_engine(args):
     while len(TaskPool.pool) > 0:
         chitu_run()
     if should_calculate_blocks(args):
+        assert isinstance(Backend.cache_manager, PagedKVCacheManager)
         _, total_gpu_memory = torch.cuda.mem_get_info(0)
         gpu_memory_utilization = args.infer.gpu_memory_utilization
         get_global_args().infer.num_blocks = (
             get_additional_block_num(
                 total_gpu_memory, Backend.cache_manager, gpu_memory_utilization
             )
-            + args.infer.max_reqs
+            + Backend.cache_manager.num_blocks
         )
 
     logger.warning("Inference system warmup completed")
@@ -155,6 +161,7 @@ def check_checkpoint_path(args):
 
 def chitu_init(args, logging_level=None):
     debug = os.getenv("CHITU_DEBUG", "0") == "1"
+    global EDP_SKIP_FLAG
 
     if (
         is_nvidia()
@@ -239,9 +246,12 @@ def chitu_init(args, logging_level=None):
     args = get_global_args()
     Backend.build(args)
     rank = torch.distributed.get_rank()
-    if rank == 0:
+    if rank == 0 or (
+        args.infer.dp_size > 1
+    ):  # [HACK] temporary workaround to support dp+ep
         scheduler = Scheduler.build(args.scheduler, args.infer)
         Backend.scheduler = scheduler
+        EDP_SKIP_FLAG = False
     executor = Executor.build(args)
     Backend.executor = executor
     PackedTasks.configure(max_num_tasks=args.infer.max_reqs)
@@ -333,8 +343,9 @@ def chitu_run_pp():
 
 @torch.inference_mode()
 def chitu_run():
+    global EDP_SKIP_FLAG
     rank = torch.distributed.get_rank()
-    if rank != 0:
+    if rank != 0 and EDP_SKIP_FLAG:  # [HACK] temporary workaround to support dp+ep
         Backend.executor.step(None)
         return
 

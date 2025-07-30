@@ -12,6 +12,8 @@ from typing import (
     Sequence,
     TypedDict,
     Union,
+    Mapping,
+    Any,
 )
 
 import tiktoken
@@ -257,7 +259,15 @@ class ChatFormat:
         tokens.append(self.tokenizer.special_tokens["<|eot_id|>"])
         return tokens
 
-    def encode_dialog_prompt(self, dialog: Dialog) -> List[int]:
+    def encode_dialog_prompt(
+        self,
+        dialog: Dialog,
+        chat_template_kwargs: Mapping[str, Any] = {},
+    ) -> List[int]:
+        if chat_template_kwargs:
+            raise NotImplementedError(
+                "Chat template kwargs are not supported for this tokenizer."
+            )
         tokens = []
         tokens.append(self.tokenizer.special_tokens["<|begin_of_text|>"])
         for message in dialog:
@@ -321,9 +331,24 @@ class ChatFormatHF:
         tokens.extend(self.tokenizer.encode("\n", bos=False, eos=False))
         return tokens
 
-    def encode_dialog_prompt(self, dialog: Dialog) -> List[int]:
-        tokens = []
-        for message in dialog:
-            tokens.extend(self.encode_message(message))
-        tokens.extend(self.encode_header({"role": "assistant", "content": ""}))
-        return tokens
+    def encode_dialog_prompt(
+        self,
+        dialog: Dialog,
+        chat_template_kwargs: Mapping[str, Any] = {},
+    ) -> List[int]:
+        if hasattr(self.tokenizer.model, "apply_chat_template"):
+            chat_template_kwargs = chat_template_kwargs or {}
+            return self.tokenizer.model.apply_chat_template(
+                dialog, add_generation_prompt=True, **chat_template_kwargs
+            )
+
+        else:
+            if chat_template_kwargs:
+                raise NotImplementedError(
+                    "Chat template kwargs are not supported for this tokenizer."
+                )
+            tokens = []
+            for message in dialog:
+                tokens.extend(self.encode_message(message))
+            tokens.extend(self.encode_header({"role": "assistant", "content": ""}))
+            return tokens

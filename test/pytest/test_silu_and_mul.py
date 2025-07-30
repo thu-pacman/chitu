@@ -1,24 +1,20 @@
+import pytest
 import triton
 import torch
 
 from chitu.ops import silu_and_mul
 
 
-def test_silu_and_mul():
+@pytest.mark.parametrize("M", [32, 64, 128])
+@pytest.mark.parametrize("N", [256, 512, 1024, 18944])
+def test_silu_and_mul(M, N):
     torch.manual_seed(42)
-    M_values = [32, 64, 128]
-    N_values = [256, 512, 1024]
-
-    for M in M_values:
-        for N in N_values:
-            input_tensor = torch.rand(M, N, device="cuda", dtype=torch.bfloat16)
-            baseline_result = silu_and_mul(input_tensor, impl="torch")
-            result = silu_and_mul(input_tensor, impl="triton")
-            assert torch.allclose(
-                baseline_result, result, rtol=1e-3, atol=1e-3
-            ), f"Results don't match for shape M={M}, N={N}"
-
-    print("all case pass")
+    input_tensor = torch.rand(M, N, device="cuda", dtype=torch.bfloat16)
+    baseline_result = silu_and_mul(input_tensor, impl="torch")
+    result = silu_and_mul(input_tensor, impl="triton")
+    assert torch.allclose(
+        baseline_result, result, rtol=1e-3, atol=1e-3
+    ), f"Results don't match for shape M={M}, N={N}"
 
 
 @triton.testing.perf_report(

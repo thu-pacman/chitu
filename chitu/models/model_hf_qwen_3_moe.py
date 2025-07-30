@@ -13,7 +13,7 @@ from chitu.models.model_hf_llama import (
 )
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
-from chitu.distributed.parallel_state import get_tp_size
+from chitu.distributed.parallel_state import get_tp_size, get_ep_size
 from chitu.models.registry import ModelType, register_model
 
 
@@ -54,15 +54,14 @@ def Qwen3MoeExperts(
     quant = get_quant_from_checkpoint_prefix(checkpoint_prefix, args.quant_config.rules)
     merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
 
-    assert args.moe_intermediate_dim % get_tp_size() == 0
+    split_size = get_tp_size() if get_ep_size() == 1 else 1
+    assert args.moe_intermediate_dim % split_size == 0
     return base_moe_experts_class(
         dim=args.dim,
-        moe_inter_dim=args.moe_intermediate_dim // get_tp_size(),
+        moe_inter_dim=args.moe_intermediate_dim // split_size,
         n_routed_experts=args.num_experts,
         n_shared_experts=0,
         n_activated_experts=0,
-        moe_world_size=1,
-        moe_rank=0,
         fuse_shared_experts=False,
         checkpoint_prefix=f"{checkpoint_prefix}.moe",
         merge_gate_up=merge_gate_up,
@@ -172,7 +171,7 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if any(
-                k.endswith(f".experts.0.{w}.{part}")
+                k.endswith(f".experts.{self.experts_start_idx}.{w}.{part}")
                 for w in ["gate_proj", "down_proj", "up_proj", "gate_up_proj"]
                 for part in self._get_2d_out_x_in_tensor_names(quant)
                 + self._get_2d_in_x_out_tensor_names(quant)
@@ -180,9 +179,9 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
                 + self._get_1d_out_tensor_names(quant)
             ):
                 w, part = k.split(".")[-2:]
-                prefix = k[: -len(f"experts.0.{w}.{part}")]
+                prefix = k[: -len(f"experts.{self.experts_start_idx}.{w}.{part}")]
                 parts = []
-                for i in range(self.params.num_experts):
+                for i in range(self.experts_start_idx, self.experts_end_idx):
                     parts.append(checkpoint[prefix + f"experts.{i}.{w}.{part}"])
                 new_checkpoint[prefix + f"experts.{w}_{part}"] = torch.stack(
                     parts, dim=0

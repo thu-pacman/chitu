@@ -1606,8 +1606,8 @@ class HybridAttnBackend(AttnBackend):
 
     def _select_backend(self, batch_size: int):
         if not AttnBackend._check_triton_available():
-            logger.warning(
-                "Triton not available, HybridAttnBackend will only use FlashAttnBackend"
+            logger.warning_once(
+                "Triton not available or too old, HybridAttnBackend will only use FlashAttnBackend"
             )
             return self.flash_attn_backend
         if batch_size <= self.batch_threshold:

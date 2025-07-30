@@ -4,12 +4,14 @@ import os
 import threading
 import time
 import weakref
+import functools
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from logging import getLogger
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional, Mapping
+from typing_extensions import override
 
 import torch
 
@@ -73,17 +75,18 @@ class UserRequest:
         top_k=50,
         temperature=0.8,
         frequency_penalty=0.0,
+        chat_template_kwargs: Mapping[str, Any] = {},
     ):
         # input related
         self.message = message
         self.request_id = request_id
-        self.prompt_len = 0
         self.params = SampleParams(
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
             frequency_penalty=frequency_penalty,
         )
+        self.chat_template_kwargs = chat_template_kwargs
 
         # response related
         self.output = ""
@@ -106,6 +109,13 @@ class UserRequest:
         self.start_time: int = time.monotonic()
         self.prefill_end_time: int = 0
         self.completion_time: int = 0
+
+        max_seq_len = get_global_args().infer.max_seq_len
+        if self.prompt_len >= max_seq_len:
+            raise ValueError(
+                f"prompt length({self.prompt_len}) cannot be greater than max_seq_len({max_seq_len})"
+            )
+        self.max_new_tokens = min(self.max_new_tokens, max_seq_len - self.prompt_len)
 
         TaskLoad.user_req.add(self)
 
@@ -144,6 +154,52 @@ class UserRequest:
         with open(path, "a") as file:
             file.write(trace_str + "\n")
 
+    @functools.cached_property
+    def prompt_tokens(self):
+        return Backend.formatter.encode_dialog_prompt(
+            self.message, chat_template_kwargs=self.chat_template_kwargs
+        )
+
+    @functools.cached_property
+    def prompt_len(self):
+        return len(self.prompt_tokens)
+
+
+class MockFixedLengthedUserRequest(UserRequest):
+    """
+    A mock request that has a fixed length of tokens, useful for warmup and testing.
+    """
+
+    def __init__(
+        self,
+        input_len: int,
+        request_id,
+        logprobs=False,
+        top_logprobs=None,
+        max_new_tokens=50,
+        top_p=0.9,
+        top_k=50,
+        temperature=0.8,
+        frequency_penalty=0.0,
+    ):
+        self.input_len = input_len
+        super().__init__(
+            message="(this is a mock)",
+            request_id=request_id,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
+            max_new_tokens=max_new_tokens,
+            top_p=top_p,
+            top_k=top_k,
+            temperature=temperature,
+            frequency_penalty=frequency_penalty,
+        )
+
+    @override
+    @functools.cached_property
+    def prompt_tokens(self):
+        return [1] * self.input_len
+
 
 class TaskType(Enum):
     Prefill = 1
@@ -156,27 +212,14 @@ class Task:
         self,
         task_id: str,
         req: UserRequest,
-        message,
         priority: int = 1,
         stop_with_eos: bool = True,
-        chat_template_kwargs: Optional[dict[str, Any]] = None,
     ):
         # response related
         self.req = req
         self.response = DeviceList([], dtype=torch.long, device="cuda")
         self.num_new_tokens: int = 0
         self.next_token: int = -1  # Only effective when num_new_tokens > 0
-        if isinstance(message, str):
-            self.tokens = Backend.tokenizer.encode(message, bos=True, eos=False)
-        elif hasattr(Backend.tokenizer.model, "apply_chat_template"):
-            chat_template_kwargs = chat_template_kwargs or {}
-            self.tokens = Backend.tokenizer.model.apply_chat_template(
-                message, add_generation_prompt=True, **chat_template_kwargs
-            )
-        else:
-            self.tokens = Backend.formatter.encode_dialog_prompt(message)
-
-        self.req.prompt_len = len(self.tokens)
 
         # scheduling related
         self.task_id = task_id
@@ -191,16 +234,6 @@ class Task:
 
         # The Case 1 waiting task's communication handle
         self.handle = None
-
-        max_seq_len = get_global_args().infer.max_seq_len
-        if self.req.prompt_len >= max_seq_len:
-            logger.warning(
-                f"prompt length({self.prefix_length}) cannot be greater than max_seq_len({max_seq_len})"
-            )
-            raise ValueError("length error")
-        self.req.max_new_tokens = min(
-            self.req.max_new_tokens, max_seq_len - self.req.prompt_len
-        )
 
         # not used
         self.arrv_ts = time.perf_counter_ns()
@@ -505,7 +538,7 @@ class PackedTasksBase:
 
 
 class PackedTasks(PackedTasksBase):
-    def __init__(self, task_ids: List[str], rank=0):
+    def __init__(self, task_ids: List[str], rank="cuda"):
         # metadata
         self.task_ids = task_ids
         self.num_tasks = len(task_ids)
@@ -521,7 +554,15 @@ class PackedTasks(PackedTasksBase):
             raise NotImplementedError("Hybrid task not implemented")
 
         if self.task_type == TaskType.Prefill:
-            self.tokens = [task.tokens for task in self.tasks]
+            self.tokens = [task.req.prompt_tokens for task in self.tasks]
+
+        # additional modifications are required when adapting to MTP or Hybrid.
+        # also need to be handle in deserialize
+        self.num_tokens = (
+            sum(len(tokens) for tokens in self.tokens)
+            if self.task_type == TaskType.Prefill
+            else self.num_tasks
+        )
 
         # sample related
         self.is_all_greedy = all(task.req.params.top_k <= 1 for task in self.tasks)
@@ -566,13 +607,6 @@ class PackedTasks(PackedTasksBase):
 
         # test only
         self._test_flag = self.tasks[0].req._test_flag
-
-    def pack_tokens(self):
-        tokens = []
-        for task in self.tasks:
-            if task.task_type == TaskType.Prefill:
-                tokens.append(task.tokens)
-        self.tokens = tokens
 
     def update_cumulative_freq_penalties(self, output_tokens: torch.Tensor):
         assert output_tokens.dim() == 1

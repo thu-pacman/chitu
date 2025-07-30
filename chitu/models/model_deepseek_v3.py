@@ -43,8 +43,9 @@ from chitu.tensor_parallel import (
     RowParallelLinear,
     VocabParallelEmbedding,
 )
-from chitu.distributed.parallel_state import get_tp_size
+from chitu.distributed.parallel_state import get_tp_size, get_ep_size
 from chitu.utils import parse_dtype, try_import_opt_dep
+import os
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
@@ -629,15 +630,14 @@ def MoeExpertsDeepSeekV3(
     quant = get_quant_from_checkpoint_prefix(checkpoint_prefix, args.quant_config.rules)
     merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
 
-    assert args.moe_inter_dim % get_tp_size() == 0
+    split_size = get_tp_size() if get_ep_size() == 1 else 1
+    assert args.moe_inter_dim % split_size == 0
     return base_moe_experts_class(
         dim=args.dim,
-        moe_inter_dim=args.moe_inter_dim // get_tp_size(),
+        moe_inter_dim=args.moe_inter_dim // split_size,
         n_routed_experts=args.n_routed_experts,
         n_shared_experts=args.n_shared_experts,
         n_activated_experts=args.n_activated_experts,
-        moe_world_size=1,
-        moe_rank=0,
         fuse_shared_experts=get_global_args().infer.fuse_shared_experts,
         checkpoint_prefix=checkpoint_prefix,
         merge_gate_up=merge_gate_up,
@@ -818,7 +818,7 @@ class TransformerDeepSeekV3(Transformer):
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if any(
-                k.endswith(f".experts.0.{w}.{part}")
+                k.endswith(f".experts.{self.experts_start_idx}.{w}.{part}")
                 for w in ["gate_proj", "down_proj", "up_proj", "gate_up_proj"]
                 for part in self._get_2d_out_x_in_tensor_names(quant)
                 + self._get_2d_in_x_out_tensor_names(quant)
@@ -826,9 +826,9 @@ class TransformerDeepSeekV3(Transformer):
                 + self._get_1d_out_tensor_names(quant)
             ):
                 w, part = k.split(".")[-2:]
-                prefix = k[: -len(f"experts.0.{w}.{part}")]
+                prefix = k[: -len(f"experts.{self.experts_start_idx}.{w}.{part}")]
                 parts = []
-                for i in range(self.params.n_routed_experts):
+                for i in range(self.experts_start_idx, self.experts_end_idx):
                     parts.append(checkpoint[prefix + f"experts.{i}.{w}.{part}"])
                 if fuse_shared_experts:
                     parts.append(checkpoint[prefix + f"shared_experts.{w}.{part}"])

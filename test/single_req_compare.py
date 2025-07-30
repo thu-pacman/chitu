@@ -179,7 +179,7 @@ def run_pipe_or_tensor_parallelism(args, timers, history_result):
                 if not history_result == None:
                     req._test_standard_tokens = history_result[history_it]["tokens"]
                     history_it = history_it + 1
-                TaskPool.add(Task(f"{req.request_id}", req, req.message))
+                TaskPool.add(Task(f"{req.request_id}", req))
                 result_prompt.append(req.message[0]["content"])
         t_start = time.time()
         timers("overall").start()
@@ -226,7 +226,7 @@ def run_normal(args, timers, history_result):
             if not history_result == None:
                 req._test_standard_tokens = history_result[history_it]["tokens"]
                 history_it = history_it + 1
-            TaskPool.add(Task(f"{req.request_id}", req, req.message))
+            TaskPool.add(Task(f"{req.request_id}", req))
             result_prompt.append(req.message[0]["content"])
         t_start = time.time()
         timers("overall").start()
