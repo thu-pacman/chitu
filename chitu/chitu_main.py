@@ -13,7 +13,12 @@ from chitu.cache_manager import PagedKVCacheManager
 from chitu.device_type import is_nvidia
 from chitu.distributed_utils import propagate_tensor_to_all_devices
 from chitu.executor import Executor
-from chitu.global_vars import get_global_args, set_global_variables, set_quant_variables
+from chitu.global_vars import (
+    get_global_args,
+    set_global_variables,
+    set_quant_variables,
+    set_backend_variables,
+)
 from chitu.scheduler import Scheduler
 from chitu.task import (
     PackedTasks,
@@ -241,6 +246,7 @@ def chitu_init(args, logging_level=None):
     check_checkpoint_path(args)
 
     set_quant_variables(args)
+    set_backend_variables(args)
     set_global_variables(args, debug=debug)
 
     args = get_global_args()

@@ -5,3 +5,4 @@ ninja
 cython
 packaging
 pybind11
+py-cpuinfo

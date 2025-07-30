@@ -18,6 +18,10 @@ from chitu.quantization.base import (
     QuantizedMoeExpertsBase,
     QuantizedAbsorbGemmBase,
 )
+from chitu.quantization.utils import (
+    get_quant_from_checkpoint_prefix,
+    get_backend_from_checkpoint_prefix,
+)
 
 
 class QuantizationRegistry:
@@ -25,9 +29,9 @@ class QuantizationRegistry:
     Registry of available quantization methods and their implementations.
     """
 
-    _linear_registry: Dict[str, Type[QuantizedLinearBase]] = {}
-    _moe_experts_registry: Dict[str, Type[QuantizedMoeExpertsBase]] = {}
-    _absorb_gemm_registry: Dict[str, Type[QuantizedAbsorbGemmBase]] = {}
+    _linear_registry: Dict[str, Dict[str, Type[QuantizedLinearBase]]] = {}
+    _moe_experts_registry: Dict[str, Dict[str, Type[QuantizedMoeExpertsBase]]] = {}
+    _absorb_gemm_registry: Dict[str, Dict[str, Type[QuantizedAbsorbGemmBase]]] = {}
 
     _allowed_quant_for_merge_gate_up: List = [
         "blockfp8",
@@ -43,9 +47,25 @@ class QuantizationRegistry:
     ]
 
     @classmethod
+    def allowed_merge_gate_up(cls, checkpoint):
+        quant = get_quant_from_checkpoint_prefix(checkpoint)
+        backend = get_backend_from_checkpoint_prefix(checkpoint)
+        if backend == "cpuinfer":
+            return False
+        return quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
+
+    @classmethod
+    def allowed_merge_qkv(cls, checkpoint):
+        quant = get_quant_from_checkpoint_prefix(checkpoint)
+        backend = get_backend_from_checkpoint_prefix(checkpoint)
+        if backend == "cpuinfer":
+            return False
+        return quant in QuantizationRegistry._allowed_quant_for_merge_qkv
+
+    @classmethod
     def get_all_methods(cls) -> Set[str]:
         """
-        Get all registered quantization methods.
+        Get all registered quantization methods.cinfer
 
         Returns:
             Set of quantization method names
@@ -65,6 +85,7 @@ class QuantizationRegistry:
         method: Optional[str],
         *,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+        backend_type: Optional[str] = "default",
     ):
         if class_type == "linear":
             registry = cls._linear_registry
@@ -74,13 +95,16 @@ class QuantizationRegistry:
             registry = cls._absorb_gemm_registry
         else:
             raise ValueError(f"Unknown class type: {class_type}")
-        impl = registry.get(method)
+        backend_impls = registry.get(backend_type)
+        if not backend_impls:
+            raise ValueError(f"Unknown backend impls: {backend_type}")
 
+        impl = backend_impls.get(method)
         if impl is None:
             raise ValueError(f"Unknown quantization method in `method`: {method}")
 
         for key in quant_kwargs:
-            if key not in registry:
+            if key not in backend_impls:
                 raise ValueError(
                     f"Unknown quantization method in `quant_kwargs`: {key}"
                 )
@@ -181,6 +205,7 @@ class QuantizationRegistry:
             return cls._get_quantized_class(class_type, None, quant_kwargs=quant_kwargs)
 
         rules = getattr(quant_cfg, "rules", [])
+        backend_type = get_backend_from_checkpoint_prefix(checkpoint_prefix)
         for rule in rules:
             pattern = rule.get("regex")
             if not pattern or not re.search(pattern, checkpoint_prefix):
@@ -204,12 +229,14 @@ class QuantizationRegistry:
                 class_type,
                 method,
                 quant_kwargs={method: merged_kwargs},
+                backend_type=backend_type,
             )
 
         return cls._get_quantized_class(
             class_type,
             None,
             quant_kwargs=quant_kwargs,
+            backend_type=backend_type,
         )
 
     @classmethod
@@ -256,6 +283,7 @@ class QuantizationRegistry:
         cls,
         name: Optional[str],
         implementation: Optional[Type[QuantizedLinearBase]] = None,
+        backend_type: str = "default",
     ) -> None:
         """
         Register a new quantization Linear layer.
@@ -266,8 +294,12 @@ class QuantizationRegistry:
                 a decorator.
         """
         if implementation is None:
-            return functools.partial(cls.register_linear, name)
-        cls._linear_registry[name] = implementation
+            return functools.partial(
+                cls.register_linear, name, backend_type=backend_type
+            )
+        if backend_type not in cls._linear_registry:
+            cls._linear_registry[backend_type] = {}
+        cls._linear_registry[backend_type][name] = implementation
         return implementation
 
     @classmethod
@@ -275,6 +307,7 @@ class QuantizationRegistry:
         cls,
         name: Optional[str],
         implementation: Optional[Type[QuantizedMoeExpertsBase]] = None,
+        backend_type: str = "default",
     ) -> None:
         """
         Register a new MoeExperts layer.
@@ -285,8 +318,12 @@ class QuantizationRegistry:
                 a decorator.
         """
         if implementation is None:
-            return functools.partial(cls.register_moe_experts, name)
-        cls._moe_experts_registry[name] = implementation
+            return functools.partial(
+                cls.register_moe_experts, name, backend_type=backend_type
+            )
+        if backend_type not in cls._moe_experts_registry:
+            cls._moe_experts_registry[backend_type] = {}
+        cls._moe_experts_registry[backend_type][name] = implementation
         return implementation
 
     @classmethod
@@ -294,6 +331,7 @@ class QuantizationRegistry:
         cls,
         name: Optional[str],
         implementation: Optional[Type[QuantizedAbsorbGemmBase]] = None,
+        backend_type: str = "default",
     ) -> None:
         """
         Register a new quantization AbsorbGemm layer.
@@ -304,6 +342,10 @@ class QuantizationRegistry:
                 a decorator.
         """
         if implementation is None:
-            return functools.partial(cls.register_absorb_gemm, name)
-        cls._absorb_gemm_registry[name] = implementation
+            return functools.partial(
+                cls.register_absorb_gemm, name, backend_type=backend_type
+            )
+        if backend_type not in cls._absorb_gemm_registry:
+            cls._absorb_gemm_registry[backend_type] = {}
+        cls._absorb_gemm_registry[backend_type][name] = implementation
         return implementation

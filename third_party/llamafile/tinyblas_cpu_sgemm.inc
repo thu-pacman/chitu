@@ -328,7 +328,7 @@ bool llamafile_sgemm(long m, long n, long k, const void* A, long lda, const void
     more Btype accept
     }*/
 
-    if (Ctype == GGML_TYPE_F32){
+    if (Ctype == GGML_TYPE_F32 && Atype != GGML_TYPE_BF16){
         if (iqk_mul_mat(m, n, k * ggml_blck_size(ggml_type(Atype)), Atype, A,lda,Btype, B,ldb, (float*)C, ldc, ith, nth)) {
             return true;
         }

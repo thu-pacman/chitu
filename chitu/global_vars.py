@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 from omegaconf import OmegaConf
+import re
 
 from chitu.schemas.serve_config import ServeConfig, StaticConfig
 
@@ -42,6 +43,20 @@ def set_global_variables(global_args=None, debug=False):
         )
 
 
+def expand_layers(spec):
+    layers = set()
+    for item in spec:
+        if isinstance(item, int):
+            layers.add(item)
+        elif isinstance(item, str) and "-" in item:
+            lo, hi = item.split("-", 1)
+            lo, hi = int(lo), int(hi)
+            layers.update(range(lo, hi + 1))
+        else:
+            raise ValueError(f"Invalid layer spec: {item!r}")
+    return sorted(layers)
+
+
 def set_quant_variables(global_args=None):
     if global_args is None:
         return
@@ -63,8 +78,6 @@ def set_quant_variables(global_args=None):
     for config in quant_list:
         pattern = config.get("model", "")
         if pattern != "":
-            import re
-
             if re.match(pattern, model_name):
                 rules = config.get("rules", [])
                 quant_config["rules"] = []
@@ -75,13 +88,53 @@ def set_quant_variables(global_args=None):
                     rule_type = rule.get("type", None)
                     if not rule_type:
                         rule_type = quant_config["type"]
+                    layers = expand_layers(rule.get("layers", []))
                     OmegaConf.set_struct(rule, False)
                     rule.type = rule_type
+                    rule.layers = layers
                     OmegaConf.set_struct(rule, True)
                     quant_config["rules"].append(rule)
                 models.quant_config = quant_config
                 return
     models.quant_config = quant_config
+
+
+def set_backend_variables(global_args=None):
+    if global_args is None:
+        return
+
+    models = global_args.get("models", {})
+    model_name = models.get("name")
+    assert isinstance(model_name, str)
+
+    model_name = model_name.lower()
+    if models.get("backend_config", None) is None:
+        OmegaConf.set_struct(models, False)
+        models["backend_config"] = {"rules": []}
+        OmegaConf.set_struct(models, True)
+        return
+
+    backend_config = {"rules": []}
+    backend_list = models.backend_config.get("backend", [])
+
+    for config in backend_list:
+        pattern = config.get("model", "")
+        if pattern != "":
+            if re.match(pattern, model_name):
+                rules = config.get("rules", [])
+                backend_config["rules"] = []
+                for index, rule in enumerate(rules):
+                    backend = rule.get("backend", "default")
+                    layers = expand_layers(rule.get("layers", []))
+                    OmegaConf.set_struct(rule, False)
+                    rule.backend = backend
+                    rule.layers = layers
+                    OmegaConf.set_struct(rule, True)
+                    backend_config["rules"].append(rule)
+                models.backend_config = backend_config
+                return
+
+    models.backend_config = backend_config
 
 
 def _set_debug(debug: bool):

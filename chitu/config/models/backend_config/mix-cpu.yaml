@@ -1,0 +1,14 @@
+backend:
+- model: 'deepseek'
+  rules:
+    - regex : 'layers\.(\d+)\.mlp\.moe'
+      layers: ["3-40"]
+      backend: cpuinfer
+    - regex: '\.mlp.experts\.'
+      layers: ["3-40"]
+      backend: cpuinfer
+- model: 'qwen'
+  rules:
+    - regex : 'layers\.(\d+)\.mlp'
+      layers: ["3-20"]
+      backend: cpuinfer

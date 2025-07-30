@@ -7,6 +7,8 @@ from setuptools import Extension, setup, find_packages
 from pathlib import Path
 import subprocess
 import glob
+import platform
+import cpuinfo
 
 setup_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -22,35 +24,63 @@ class CustomBuildExtension(BuildExtension):
         if not isinstance(ext, CMakeExtension):
             super().build_extension(ext)
             return
+
+        info = cpuinfo.get_cpu_info()
+        vendor = info.get("vendor_id_raw", "") or info.get("vendor_id", "")
+        is_intel = "Intel" in vendor
+
         if ext.name == "llama.cpp":
+            cmake_args = [
+                "cmake",
+                "-B",
+                "build",
+                "-D",
+                "BUILD_SHARED_LIBS=ON",
+                "-D",
+                "LLAMA_NATIVE=ON",
+                "-DCMAKE_CXX_COMPILER=g++",
+            ]
+
+            if is_intel:
+                cmake_args += [
+                    "-DLLAMA_AVX=ON",
+                    "-DLLAMA_AVX2=ON",
+                    "-DLLAMA_AVX512=ON",
+                    "-DLLAMA_AVX512_BF16=ON",
+                ]
+            else:
+                print("Non-Intel CPU detected; skipping AVX flags.")
+
+            build_args = [
+                "cmake",
+                "--build",
+                "build",
+                "--config",
+                "Release",
+                "-j",
+            ]
+
             try:
                 subprocess.run(
-                    [
-                        "cmake",
-                        "-B",
-                        "build",
-                        "-D",
-                        "BUILD_SHARED_LIBS=ON",
-                        "-D",
-                        "LLAMA_NATIVE=ON",
-                        "-DCMAKE_CXX_COMPILER=g++",
-                    ],
+                    cmake_args,
                     cwd=ext.sourcedir,
                     check=True,
                     capture_output=True,
                     text=True,
                 )
                 subprocess.run(
-                    ["cmake", "--build", "build", "--config", "Release", "-j"],
+                    build_args,
                     cwd=ext.sourcedir,
                     check=True,
                     capture_output=True,
                     text=True,
                 )
-            except Exception as e:
-                print("STDOUT:\n", e.stdout)
-                print("STDERR:\n", e.stderr)
-                raise e
+            except subprocess.CalledProcessError as e:
+                print("CMake stdout:\n", e.stdout)
+                print("CMake stderr:\n", e.stderr)
+                raise
+        else:
+            super().build_extension(ext)
 
 
 llama_cpp_files = glob.glob("../../third_party/llamafile/*.cpp")
@@ -67,6 +97,7 @@ setup(
                 "affinity.cpp",
                 "bindings.cpp",
                 "moe.cpp",
+                "linear.cpp",
                 "shared_mem_buffer.cpp",
             ]
             + llama_cpp_files,

@@ -38,6 +38,7 @@ from chitu.quantization import (
     QuantizationRegistry,
     QuantizedMoeExpertsBase,
     get_quant_from_checkpoint_prefix,
+    get_backend_from_checkpoint_prefix,
 )
 
 torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
@@ -481,9 +482,8 @@ class Transformer(nn.Module):
         enable_expert_parallel = get_ep_size() > 1
 
         for name, param in checkpoint.items():
-            quant = get_quant_from_checkpoint_prefix(
-                name, self.params.quant_config.rules
-            )
+            quant = get_quant_from_checkpoint_prefix(name)
+            backend = get_backend_from_checkpoint_prefix(name)
 
             if enable_expert_parallel and any(
                 f".experts.{x}." in name
@@ -721,6 +721,10 @@ class Transformer(nn.Module):
             state_dict = self.process_state_dict_for_merging_experts(state_dict)
             state_dict = self.process_state_dict_for_blockfp4_after_chunk(state_dict)
             state_dict = self.process_state_dict_for_int4_after_chunk(state_dict)
+        import gc
+
+        gc.collect()
+
         super().load_state_dict(state_dict, *args, **kwargs)
 
     def _init_pre_layers(self):

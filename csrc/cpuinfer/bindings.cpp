@@ -8,6 +8,7 @@
 #include "cpuinfer.h"
 #include "llamafile/flags.h"
 #include "moe.h"
+#include "linear.h"
 #include "pybind11/functional.h"
 #include "pybind11/operators.h"
 #include "pybind11/pybind11.h"
@@ -18,6 +19,48 @@
 
 namespace py = pybind11;
 using namespace pybind11::literals;
+
+class LinearBindings {
+  public:
+    class WarmUpBindinds {
+      public:
+        struct Args {
+            CPUInfer *cpuinfer;
+            Linear *linear;
+        };
+        static void inner(void *args) {
+            Args *args_ = (Args *)args;
+            args_->cpuinfer->enqueue(&Linear::warm_up, args_->linear);
+        }
+        static std::pair<intptr_t, intptr_t>
+        cpuinfer_interface(Linear &linear) {
+            Args *args = new Args{nullptr, &linear};
+            return std::make_pair((intptr_t)&inner, (intptr_t)args);
+        }
+    };
+    class ForwardBindings {
+      public:
+        struct Args {
+            CPUInfer *cpuinfer;
+            Linear *linear;
+            int qlen;
+            const void *input;
+            void *output;
+        };
+        static void inner(void *args) {
+            Args *args_ = (Args *)args;
+            args_->cpuinfer->enqueue(&Linear::forward, args_->linear,
+                                     args_->qlen, args_->input, args_->output);
+        }
+        static std::pair<intptr_t, intptr_t>
+        cpuinfer_interface(Linear &linear, int qlen, intptr_t input,
+                           intptr_t output) {
+            Args *args = new Args{nullptr, &linear, qlen, (const void *)input,
+                                  (void *)output};
+            return std::make_pair((intptr_t)&inner, (intptr_t)args);
+        }
+    };
+};
 
 class MOEBindings {
   public:
@@ -79,6 +122,18 @@ PYBIND11_MODULE(cpuinfer, m) {
         .def("sync_with_cuda_stream", &CPUInfer::sync_with_cuda_stream);
 
     auto linear_module = m.def_submodule("linear");
+    py::class_<LinearConfig>(linear_module, "LinearConfig")
+        .def(py::init([](int hidden_size, int intermediate_size, int stride,
+                         int group_max_len, intptr_t proj, int proj_type,
+                         int hidden_type) {
+            return LinearConfig(hidden_size, intermediate_size, stride,
+                                group_max_len, (void *)proj,
+                                (ggml_type)proj_type, (ggml_type)hidden_type);
+        }));
+    py::class_<Linear>(linear_module, "Linear")
+        .def(py::init<LinearConfig>())
+        .def("warm_up", &LinearBindings::WarmUpBindinds::cpuinfer_interface)
+        .def("forward", &LinearBindings::ForwardBindings::cpuinfer_interface);
 
     auto moe_module = m.def_submodule("moe");
     py::class_<MOEConfig>(moe_module, "MOEConfig")

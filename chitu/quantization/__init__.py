@@ -4,8 +4,16 @@ from chitu.quantization.base import (
     QuantizedMoeExpertsBase,
     QuantizedAbsorbGemmBase,
 )
-from chitu.quantization.utils import get_quant_from_checkpoint_prefix
-from chitu.quantization.normal import NormalLinear, NormalMoeExperts
+from chitu.quantization.utils import (
+    get_quant_from_checkpoint_prefix,
+    get_backend_from_checkpoint_prefix,
+)
+from chitu.quantization.normal import (
+    NormalLinear,
+    NormalMoeExperts,
+    NormLinearCPUInfer,
+    NormalMoeExpertsCPUInfer,
+)
 from chitu.quantization.llmint8 import LLMInt8Linear
 from chitu.quantization.autoawq import AutoAWQLinear
 from chitu.quantization.gptqmodel import GPTQLinear
@@ -21,4 +29,4 @@ from chitu.quantization.blockfp4 import (
     Blockfp4MoeExpertsPackKStride64,
     Blockfp4MoeExpertsPackNPUNative,
 )
-from chitu.quantization.q4km import MoeExpertsDeepSeekV3CPU
+from chitu.quantization.q4km import MoeExpertsDeepSeekV3CPUInfer

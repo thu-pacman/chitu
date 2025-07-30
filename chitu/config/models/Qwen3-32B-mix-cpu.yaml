@@ -1,12 +1,11 @@
-# DeepSeek-R1-Q4_K_M is a data-type variant of DeepSeek-R1
+# Qwen3-32B-FP8 is a quantization of Qwen3-32B
 defaults:
-  - DeepSeek-R1
-  - backend_config: cpu-mlp
-  - override quant_config: blockfp8_attn_Q4KM_ffn
+  - Qwen3-32B
+  - backend_config: mix-cpu
   - _self_ # Config in this file overrides configs in defaults
 
 # Access info
-name: DeepSeek-R1-Q4_K_M
-
+name: Qwen3-32B-mix-cpu
+source: "https://huggingface.co/Qwen/Qwen3-32B-FP8" # Just for displaying. No automatic download.
 ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
 tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.

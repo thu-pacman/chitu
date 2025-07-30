@@ -7,10 +7,12 @@ from chitu.global_vars import get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.hybrid_device import CPUParameter
 from chitu.distributed.parallel_state import get_ep_group
+from chitu.quantization.cpuinfer_singleton import get_cpu_infer
+from chitu.custom_gguf import GGMLQuantizationType
 
 
-@QuantizationRegistry.register_moe_experts("q4km")
-class MoeExpertsDeepSeekV3CPU(QuantizedMoeExpertsBase):
+@QuantizationRegistry.register_moe_experts("q4km", backend_type="cpuinfer")
+class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
     """
     Mixture-of-Experts (MoE) module.
 
@@ -79,10 +81,26 @@ class MoeExpertsDeepSeekV3CPU(QuantizedMoeExpertsBase):
                 ),
                 requires_grad=False,
             )
+            self.gate_type = CPUParameter(
+                torch.tensor(
+                    (12),
+                    dtype=torch.int,
+                    device="cpu",
+                ),
+                requires_grad=False,
+            )
             self.gguf_up_proj = CPUParameter(
                 torch.empty(
                     int(256 * 2048 * 7168 / 256 * 144),
                     dtype=torch.uint8,
+                    device="cpu",
+                ),
+                requires_grad=False,
+            )
+            self.up_type = CPUParameter(
+                torch.tensor(
+                    (12),
+                    dtype=torch.int,
                     device="cpu",
                 ),
                 requires_grad=False,
@@ -96,6 +114,14 @@ class MoeExpertsDeepSeekV3CPU(QuantizedMoeExpertsBase):
                     ),
                     requires_grad=False,
                 )
+                self.down_type = CPUParameter(
+                    torch.tensor(
+                        (12),
+                        dtype=torch.int,
+                        device="cpu",
+                    ),
+                    requires_grad=False,
+                )
             elif ggml_type == "q6k":
                 self.gguf_down_proj = CPUParameter(
                     torch.empty(
@@ -105,46 +131,17 @@ class MoeExpertsDeepSeekV3CPU(QuantizedMoeExpertsBase):
                     ),
                     requires_grad=False,
                 )
+                self.down_type = CPUParameter(
+                    torch.tensor(
+                        (14),
+                        dtype=torch.int,
+                        device="cpu",
+                    ),
+                    requires_grad=False,
+                )
             else:
                 raise ValueError("ggml quantization type unimplemented !")
 
-            self.gate_type = CPUParameter(
-                torch.empty(
-                    (),
-                    dtype=torch.int,
-                    device="cpu",
-                ),
-                requires_grad=False,
-            )
-            self.up_type = CPUParameter(
-                torch.empty(
-                    (),
-                    dtype=torch.int,
-                    device="cpu",
-                ),
-                requires_grad=False,
-            )
-            self.down_type = CPUParameter(
-                torch.empty(
-                    (),
-                    dtype=torch.int,
-                    device="cpu",
-                ),
-                requires_grad=False,
-            )
-
-        self.stride = 64
-        self.moe = None
-
-        if MoeExpertsDeepSeekV3CPU.cpu_infer is None:
-            import cpuinfer
-
-            MoeExpertsDeepSeekV3CPU.cpu_infer = cpuinfer.CPUInfer(
-                get_global_args().infer.bind_thread_to_cpu
-            )
-
-    def init_weights(self):
-        if self.rank == 0:
             gate_ptr = ctypes.addressof(
                 ctypes.cast(
                     self.gguf_gate_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
@@ -160,15 +157,14 @@ class MoeExpertsDeepSeekV3CPU(QuantizedMoeExpertsBase):
                     self.gguf_down_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
                 ).contents
             )
-
             import cpuinfer
 
-            moe_config = cpuinfer.moe.MOEConfig(
+            self.moe_config = cpuinfer.moe.MOEConfig(
                 self.n_routed_experts,
                 self.n_activated_experts,
                 self.dim,
                 self.moe_inter_dim,
-                self.stride,
+                64,
                 10,
                 1024,
                 gate_ptr,
@@ -177,14 +173,8 @@ class MoeExpertsDeepSeekV3CPU(QuantizedMoeExpertsBase):
                 self.gate_type.item(),
                 self.up_type.item(),
                 self.down_type.item(),
-                30,
+                GGMLQuantizationType.BF16,
             )
-
-            self.moe = cpuinfer.moe.MOE(moe_config)
-
-            # warm up
-            MoeExpertsDeepSeekV3CPU.cpu_infer.submit(self.moe.warm_up())
-            MoeExpertsDeepSeekV3CPU.cpu_infer.sync()
 
             self.input_tensor_cpu = StaticTensor(
                 max_nelem=self.max_batch_size * self.dim,
@@ -216,6 +206,14 @@ class MoeExpertsDeepSeekV3CPU(QuantizedMoeExpertsBase):
                 dtype=torch.bfloat16,
             )
 
+            self.moe = cpuinfer.moe.MOE(self.moe_config)
+            self.cpu_infer = get_cpu_infer()
+
+    def warm_up(self):
+        if self.rank == 0:
+            self.cpu_infer.submit(self.moe.warm_up())
+            self.cpu_infer.sync()
+
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
     ) -> torch.Tensor:
@@ -240,7 +238,7 @@ class MoeExpertsDeepSeekV3CPU(QuantizedMoeExpertsBase):
                 indices = indices.cpu()
                 weights = weights.cpu()
                 output = torch.empty_like(input_tensor).contiguous().pin_memory()
-                MoeExpertsDeepSeekV3CPU.cpu_infer.submit(
+                self.cpu_infer.submit(
                     self.moe.forward(
                         indices.size(0),
                         indices.size(1),
@@ -259,7 +257,7 @@ class MoeExpertsDeepSeekV3CPU(QuantizedMoeExpertsBase):
                 self.input_tensor_cpu.get().copy_(x, non_blocking=True)
                 self.indices_cpu.get().copy_(indices, non_blocking=True)
                 self.weights_cpu.get().copy_(weights, non_blocking=True)
-                MoeExpertsDeepSeekV3CPU.cpu_infer.submit_with_cuda_stream(
+                self.cpu_infer.submit_with_cuda_stream(
                     torch.cuda.current_stream().cuda_stream,
                     self.moe.forward(
                         indices.size(0),

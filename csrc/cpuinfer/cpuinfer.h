@@ -82,9 +82,6 @@ class CPUInfer {
     std::function<void(int)> compute_callback_;
     int active_workers_;
 
-    // Thread-local storage
-    static thread_local int worker_id_;
-
     void initialize_workers() {
         worker_pool_.reserve(workers_.size());
         for (size_t i = 1; i < workers_.size(); ++i) {
@@ -103,7 +100,6 @@ class CPUInfer {
     }
 
     void worker_routine(int worker_id) {
-        worker_id_ = worker_id;
         if (bind_to_physical_core_) {
             bind_cur_thread_to_first_available_physical_core();
         } else {
