@@ -47,7 +47,8 @@ def linear_block_fp8_npu(
         )
         weight = weight.unsqueeze(0).transpose_(-1, -2).contiguous()
         # Due to 1 expert, the list of expert_tokens here should be all the lines of the input x.
-        expert_tokens = torch.tensor([x.shape[0]], device=x.device, dtype=torch.int64)
+        expert_tokens = torch.ones([1], device=x.device, dtype=torch.int64)
+        expert_tokens.fill_(x.shape[0])
     scale_off = torch.zeros_like(scale, dtype=torch.float32, device=x.device)
     output = torch.empty(
         [x.shape[0], weight.shape[-1]], dtype=torch.bfloat16, device=x.device
@@ -57,15 +58,25 @@ def linear_block_fp8_npu(
         # Squeeze dimension 1, not 0, otherwise it will affect cases where batch size is 1
         x = x.squeeze(1)
         flag = True
-    grouped_gemm.grouped_gemm(
-        x,
-        weight,
-        antiquantOffsetOptional=scale_off,
-        antiquantScaleOptional=scale,
-        groupListOptional=expert_tokens,
-        output=output,
-        type=grouped_gemm.GroupedGemmType.FP8,
-    )
+    if x.shape[0] <= 2:
+        grouped_gemm.grouped_gemv(
+            x,
+            weight,
+            scale=scale,
+            groupList=expert_tokens,
+            output=output,
+            type=grouped_gemm.GroupedGemmType.FP8,
+        )
+    else:
+        grouped_gemm.grouped_gemm(
+            x,
+            weight,
+            antiquantOffsetOptional=scale_off,
+            antiquantScaleOptional=scale,
+            groupListOptional=expert_tokens,
+            output=output,
+            type=grouped_gemm.GroupedGemmType.FP8,
+        )
     if flag:
         output = output.unsqueeze(1)
     if bias is not None:

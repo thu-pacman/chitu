@@ -78,26 +78,46 @@ def linear_block_fp4_npu(
     if x.dim() == 3:
         # 三维的 x 需要squeeze到二维,在NpuAttnBackend mla_attn_with_kvcache中 x 会被 unsqueeze 到三维
         x = x.squeeze(1)
-        grouped_gemm.grouped_gemm(
-            x,
-            weight,
-            antiquantOffsetOptional=scale_off,
-            antiquantScaleOptional=scale,
-            groupListOptional=expert_tokens,
-            output=output,
-            type=grouped_gemm.GroupedGemmType.FP4,
-        )
+        if x.shape[0] <= 2:
+            grouped_gemm.grouped_gemv(
+                x,
+                weight,
+                scale=scale,
+                groupList=expert_tokens,
+                output=output,
+                type=grouped_gemm.GroupedGemmType.FP4,
+            )
+        else:
+            grouped_gemm.grouped_gemm(
+                x,
+                weight,
+                antiquantOffsetOptional=scale_off,
+                antiquantScaleOptional=scale,
+                groupListOptional=expert_tokens,
+                output=output,
+                type=grouped_gemm.GroupedGemmType.FP4,
+            )
         output = output.unsqueeze(1)
     else:
-        grouped_gemm.grouped_gemm(
-            x,
-            weight,
-            antiquantOffsetOptional=scale_off,
-            antiquantScaleOptional=scale,
-            groupListOptional=expert_tokens,
-            output=output,
-            type=grouped_gemm.GroupedGemmType.FP4,
-        )
+        if x.shape[0] <= 2:
+            grouped_gemm.grouped_gemv(
+                x,
+                weight,
+                scale=scale,
+                groupList=expert_tokens,
+                output=output,
+                type=grouped_gemm.GroupedGemmType.FP4,
+            )
+        else:
+            grouped_gemm.grouped_gemm(
+                x,
+                weight,
+                antiquantOffsetOptional=scale_off,
+                antiquantScaleOptional=scale,
+                groupListOptional=expert_tokens,
+                output=output,
+                type=grouped_gemm.GroupedGemmType.FP4,
+            )
 
     if bias is not None:
         output += bias
