@@ -339,43 +339,12 @@ class TaskPool:
             cls.pool[task_id].req.completion_time = time.monotonic()
             cls.pool[task_id].req.save_trace_to_json()
             TaskLoad.reduce(cls.pool[task_id].prefix_length)
-            Backend.cache_manager.finalize_cache_all_decode(
-                cls.pool[task_id].req.request_id
-            )
-            if Backend.args.infer.cache_type == "skew":
-                if Backend.args.infer.pp_size > 1:
-                    scheduler = Backend.scheduler
-                    for lst in scheduler.decode_slots:
-                        if task_id in lst:
-                            index = lst.index(task_id)
-                            lst[index] = lst[-1]
-                            lst.pop()
-                            break
-                else:
-                    # adjust decode_task order to adapt skew kv-cache
-                    remove_index = cls.id_list.index(task_id)
-                    for decode_id in reversed(cls.id_list):
-                        if (
-                            cls.pool[decode_id].task_type == TaskType.Decode
-                            and decode_id != task_id
-                        ):
-                            decode_index = cls.id_list.index(decode_id)
-                            (
-                                cls.id_list[remove_index],
-                                cls.id_list[decode_index],
-                            ) = (
-                                cls.id_list[decode_index],
-                                cls.id_list[remove_index],
-                            )
-                            break
 
-        ret = cls.pool.pop(task_id)
+        if cls.pool.pop(task_id) is None:
+            raise ValueError(f"Task {task_id} not found in pool")
         cls.id_list.remove(task_id)
         if len(cls.pool) == 0:
             TaskLoad.clear()
-        if ret is None:
-            return False  # Task not found, failed to remove
-        return True
 
 
 @dataclass

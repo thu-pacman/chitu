@@ -1,8 +1,9 @@
 import time
 from logging import getLogger
 from typing import List  # Please keep Python 3.8 compatible
+from typing_extensions import override
 
-from chitu.global_vars import get_slot_handle
+from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.task import TaskPool, TaskType
 
 logger = getLogger(__name__)
@@ -74,17 +75,38 @@ class Scheduler:
     def schedule(self) -> List[str]:
         raise NotImplementedError()
 
+    def reorder_tasks_for_batching(self, task_ids):
+        args = get_global_args()
+        if args.infer.cache_type == "skew":
+            for task_id in task_ids:
+                if TaskPool.pool[task_id].need_remove():
+                    if TaskPool.pool[task_id].task_type == TaskType.Decode:
+                        remove_index = TaskPool.id_list.index(task_id)
+                        for decode_id in reversed(TaskPool.id_list):
+                            if (
+                                TaskPool.pool[decode_id].task_type == TaskType.Decode
+                                and decode_id != task_id
+                            ):
+                                decode_index = TaskPool.id_list.index(decode_id)
+                                (
+                                    TaskPool.id_list[remove_index],
+                                    TaskPool.id_list[decode_index],
+                                ) = (
+                                    TaskPool.id_list[decode_index],
+                                    TaskPool.id_list[remove_index],
+                                )
+                                break
+
     def update(self, cur_task_ids: List[str], unwait_task_ids: List[str] = []):
         removed_task_ids = []
         task_ids = cur_task_ids + unwait_task_ids
         task_ids = list(set(task_ids))
+        self.reorder_tasks_for_batching(task_ids)
         for task_id in task_ids:
             if TaskPool.pool[task_id].need_remove():
                 if TaskPool.pool[task_id].task_type == TaskType.Decode:
                     removed_task_ids.append(task_id)
-                assert TaskPool.remove(
-                    task_id
-                ), f"Task {task_id} not found in pool {TaskPool.pool.keys()}"
+                TaskPool.remove(task_id)
         return removed_task_ids
 
     def is_done(self):
@@ -251,6 +273,20 @@ class SkewPipelineScheduler(Scheduler):
             self.slot_handle.set_slot_idx(local_idx)
 
         return ret_task_ids
+
+    @override
+    def reorder_tasks_for_batching(self, task_ids):
+        args = get_global_args()
+        if args.infer.cache_type == "skew":
+            for task_id in task_ids:
+                if TaskPool.pool[task_id].need_remove():
+                    if TaskPool.pool[task_id].task_type == TaskType.Decode:
+                        for lst in self.decode_slots:
+                            if task_id in lst:
+                                index = lst.index(task_id)
+                                lst[index] = lst[-1]
+                                lst.pop()
+                                break
 
 
 class StrideScheduler(Scheduler):
