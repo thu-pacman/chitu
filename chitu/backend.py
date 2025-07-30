@@ -13,7 +13,6 @@ import torch
 import torch.distributed as dist
 from safetensors.torch import safe_open
 from tqdm import tqdm
-
 from chitu.attn_backend import (
     FlashAttnBackend,
     FlashInferBackend,
@@ -467,6 +466,7 @@ class Backend:
 
         # Move model to appropriate device
         model.apply(Backend._move_one_module_to_device)
+
         Backend.model = model
         Backend.args = args
 
@@ -578,6 +578,14 @@ class Backend:
                 assign=args.keep_dtype_in_checkpoint,
                 skip_preprocess=args.skip_preprocess,
             )
+        for layer in model.layers:
+            experts = getattr(layer.mlp, "experts", None)
+            if (
+                experts is not None
+                and hasattr(experts, "warm_up")
+                and callable(experts.warm_up)
+            ):
+                experts.warm_up()
 
         logger.info(f"Checkpoint loaded in {time.time() - start_time:.2f} seconds")
 
@@ -745,10 +753,6 @@ def load_gguf_deepseek_v3_gguf(
         torch.cuda.empty_cache()
 
     logger.info("initing cpu tensors!")
-    for layer_id in range(3, 61):
-        if layer_id in cpu_layers:
-            if model.layers[layer_id].mlp.experts.moe is None:
-                model.layers[layer_id].mlp.experts.init_weights()
 
 
 def load_state_dict_llama_gguf_mlp_layers(llama_gguf_loader: GGUFLoader, layer_num=64):

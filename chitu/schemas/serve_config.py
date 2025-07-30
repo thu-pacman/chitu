@@ -46,30 +46,14 @@ class RequestConfig:
 @dataclass
 class SchedulerConfig:
     @dataclass
-    class SchedulerCommonConfig:
-        num_tasks: Optional[int] = MISSING
-        enable_hybrid: bool = MISSING
+    class PpConfig:
+        prefill_num_tasks_divided_by_pp: bool = MISSING
+        prefill_num_tasks: Optional[int] = MISSING
+        enforce_decode_num_tasks_max: bool = MISSING
+        decode_num_tasks: Optional[int] = MISSING
 
-    @dataclass
-    class PrefillFirstConfig:
-        @dataclass
-        class PpConfig:
-            prefill_num_tasks_divided_by_pp: bool = MISSING
-            prefill_num_tasks: Optional[int] = MISSING
-            enforce_decoder_num_tasks_max: bool = MISSING
-            decoder_num_tasks: Optional[int] = MISSING
-
-        num_tasks: Optional[int] = MISSING
-        enable_hybrid: bool = MISSING
-        pp_config: PpConfig = MISSING
-
+    pp_config: PpConfig = MISSING
     type: str = MISSING
-    fcfs: SchedulerCommonConfig = MISSING
-    prefill_first: PrefillFirstConfig = MISSING
-    stride: SchedulerCommonConfig = MISSING
-    deadline: SchedulerCommonConfig = MISSING
-    prefix_align: SchedulerCommonConfig = MISSING
-    balance: SchedulerCommonConfig = MISSING
 
 
 class StaticConfig:

@@ -113,11 +113,7 @@ async def create_chat_completion(request: ChatRequest):
             chat_template_kwargs=chat_template_kwargs,
         )
         response = AsyncResponse(req)
-        task = Task(
-            f"{req.request_id}",
-            req,
-            stop_with_eos=stop_with_eos,
-        )
+        task = Task(req.request_id, req, stop_with_eos=stop_with_eos)
         TaskPool.add(task)
         if stream:
             return StreamingResponse(

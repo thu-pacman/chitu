@@ -7,8 +7,6 @@
 #include <cstdint>
 #include <iostream>
 
-thread_local int CPUInfer::worker_id_ = 0;
-
 MOE::MOE(MOEConfig config) {
     config_ = config;
     gate_proj_ = config_.gate_proj;

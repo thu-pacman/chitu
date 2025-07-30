@@ -13,7 +13,12 @@ from chitu.cache_manager import PagedKVCacheManager
 from chitu.device_type import is_nvidia
 from chitu.distributed_utils import propagate_tensor_to_all_devices
 from chitu.executor import Executor
-from chitu.global_vars import get_global_args, set_global_variables, set_quant_variables
+from chitu.global_vars import (
+    get_global_args,
+    set_global_variables,
+    set_quant_variables,
+    set_backend_variables,
+)
 from chitu.scheduler import Scheduler
 from chitu.task import (
     PackedTasks,
@@ -241,6 +246,7 @@ def chitu_init(args, logging_level=None):
     check_checkpoint_path(args)
 
     set_quant_variables(args)
+    set_backend_variables(args)
     set_global_variables(args, debug=debug)
 
     args = get_global_args()
@@ -257,20 +263,26 @@ def chitu_init(args, logging_level=None):
     PackedTasks.configure(max_num_tasks=args.infer.max_reqs)
 
 
-def remove_task_other_device(remove_task_ids):
+def remove_kvcache_all_device(remove_task_ids):
     if len(remove_task_ids) == 0:
         return
-    # Since we are removing, any task type is fine
-    task_tensor = PackedTasksBase(
-        num_tasks=len(remove_task_ids),
-        task_ids=remove_task_ids,
-        req_ids=remove_task_ids,
-        task_type=TaskType.Decode,
-    ).serialize(
-        payload_type=SerializedPackedTasksPayloadType.EndTask,
-        device="cpu" if Backend.use_gloo else 0,
-    )
-    propagate_tensor_to_all_devices(task_tensor)
+
+    # Remove KV cache on this device
+    for task_id in remove_task_ids:
+        Backend.cache_manager.finalize_cache_all_decode(task_id)
+
+    # Propagate metadata to remove KV cache on other devices
+    if torch.distributed.get_world_size() > 1:
+        task_tensor = PackedTasksBase(
+            num_tasks=len(remove_task_ids),
+            task_ids=remove_task_ids,
+            req_ids=remove_task_ids,
+            task_type=TaskType.Decode,  # Since we are removing, any task type is fine
+        ).serialize(
+            payload_type=SerializedPackedTasksPayloadType.EndTask,
+            device="cpu" if Backend.use_gloo else 0,
+        )
+        propagate_tensor_to_all_devices(task_tensor)
 
 
 @torch.inference_mode()
@@ -291,8 +303,7 @@ def chitu_run_normal():
         curr_batch_result = Backend.executor.postprocess_sync_part(tasks, logits)
         Backend.last_batch_results.append(curr_batch_result)
         removed_decode_task_ids = Backend.scheduler.update(task_ids)
-        if torch.distributed.get_world_size() != 1:
-            remove_task_other_device(removed_decode_task_ids)
+        remove_kvcache_all_device(removed_decode_task_ids)
     elif len(Backend.last_batch_results) > 0:
         # ensure the last batch result is processed
         Backend.executor.postprocess_async_part(Backend.last_batch_results.popleft())
@@ -338,7 +349,7 @@ def chitu_run_pp():
         )
     unwait_task_ids = [t.task_id for batch in unwait_batches for t in batch.tasks]
     removed_decode_task_ids = Backend.scheduler.update(task_ids, unwait_task_ids)
-    remove_task_other_device(removed_decode_task_ids)
+    remove_kvcache_all_device(removed_decode_task_ids)
 
 
 @torch.inference_mode()

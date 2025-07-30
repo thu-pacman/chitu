@@ -36,29 +36,11 @@ request:
   max_new_tokens: 128
 scheduler:
   type: prefill_first
-  fcfs:
-    num_tasks: null
-    enable_hybrid: False
-  prefill_first:
-    num_tasks: null
-    enable_hybrid: False
-    pp_config:
-      prefill_num_tasks_divided_by_pp: True
-      prefill_num_tasks: null
-      enforce_decoder_num_tasks_max: True
-      decoder_num_tasks: null
-  stride:
-    num_tasks: null
-    enable_hybrid: False
-  deadline:
-    num_tasks: null
-    enable_hybrid: False
-  prefix_align:
-    num_tasks: null
-    enable_hybrid: False
-  balance:
-    num_tasks: null
-    enable_hybrid: False
+  pp_config:
+    prefill_num_tasks_divided_by_pp: True
+    prefill_num_tasks: null
+    enforce_decode_num_tasks_max: True
+    decode_num_tasks: null
 quant: null
 dtype: null # Legacy parameter. To be removed in the future.
 float_16bit_variant: bfloat16 # one of: bfloat16, float16. This sets the default_dtype of torch

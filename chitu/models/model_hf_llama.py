@@ -70,10 +70,7 @@ class AttentionHFLlama(Attention):
         super().__init__(layer_id, cache, attn_backend)
         self.rotary_type = rotary_type
         self.op_impl = op_impl
-        quant = get_quant_from_checkpoint_prefix(
-            checkpoint_prefix, args.quant_config.rules
-        )
-        self.merge_qkv = quant in QuantizationRegistry._allowed_quant_for_merge_qkv
+        self.merge_qkv = QuantizationRegistry.allowed_merge_qkv(checkpoint_prefix)
 
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         model_parallel_size = get_tp_size()
@@ -323,11 +320,8 @@ class FeedForwardHFLlama(nn.Module):
     ):
         super().__init__()
         self.op_impl = op_impl
-        quant = get_quant_from_checkpoint_prefix(
-            checkpoint_prefix, params.quant_config.rules
-        )
-        self.merge_gate_up = (
-            quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
+        self.merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
+            checkpoint_prefix
         )
 
         # Do a parallel + fused linear projection, while ensuring outputs from gate_proj and up_proj are contiguous in memory.
@@ -601,7 +595,7 @@ class TransformerHFLlama(Transformer):
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-            if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv:
+            if not QuantizationRegistry.allowed_merge_qkv(k):
                 new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
             elif any(
@@ -668,7 +662,7 @@ class TransformerHFLlama(Transformer):
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-            if quant not in QuantizationRegistry._allowed_quant_for_merge_gate_up:
+            if not QuantizationRegistry.allowed_merge_gate_up(k):
                 new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
             elif any(

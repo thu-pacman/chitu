@@ -97,7 +97,7 @@ class AttentionDeepSeekV3(Attention):
         quant = get_quant_from_checkpoint_prefix(
             checkpoint_prefix, args.quant_config.rules
         )
-        self.merge_qkv = quant in QuantizationRegistry._allowed_quant_for_merge_qkv
+        self.merge_qkv = QuantizationRegistry.allowed_merge_qkv(checkpoint_prefix)
 
         model_parallel_size = get_tp_size()
         self.dim = args.dim
@@ -484,13 +484,10 @@ class MLPDeepSeekV3(nn.Module):
             assert merge_gate_up is not None
             self.merge_gate_up = merge_gate_up
         else:
-            quant = get_quant_from_checkpoint_prefix(
-                checkpoint_prefix, args.quant_config.rules
+            self.merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
+                checkpoint_prefix
             )
-            if quant in QuantizationRegistry._allowed_quant_for_merge_gate_up:
-                self.merge_gate_up = True
-            else:
-                self.merge_gate_up = False
+
         self.op_impl = op_impl
 
         if role == "standalone":
@@ -627,8 +624,7 @@ def MoeExpertsDeepSeekV3(
             )
         )
 
-    quant = get_quant_from_checkpoint_prefix(checkpoint_prefix, args.quant_config.rules)
-    merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
+    merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(checkpoint_prefix)
 
     split_size = get_tp_size() if get_ep_size() == 1 else 1
     assert args.moe_inter_dim % split_size == 0
@@ -654,12 +650,10 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
     ):
         if not get_global_args().infer.fuse_shared_experts:
-            quant = get_quant_from_checkpoint_prefix(
-                checkpoint_prefix, args.quant_config.rules
+            merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
+                checkpoint_prefix
             )
-            merge_gate_up = (
-                quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
-            )
+
             non_fused_shared_experts = MLPDeepSeekV3(
                 args,
                 role="shared_experts",
@@ -1218,7 +1212,7 @@ class TransformerDeepSeekV3(Transformer):
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-            if quant not in QuantizationRegistry._allowed_quant_for_merge_qkv:
+            if not QuantizationRegistry.allowed_merge_qkv(k):
                 new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
             elif any(
@@ -1270,7 +1264,7 @@ class TransformerDeepSeekV3(Transformer):
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-            if quant not in QuantizationRegistry._allowed_quant_for_merge_gate_up:
+            if not QuantizationRegistry.allowed_merge_gate_up(k):
                 new_checkpoint[k] = checkpoint[k]
             # Cat dim 0
             elif any(

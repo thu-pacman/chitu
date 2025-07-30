@@ -2,16 +2,23 @@ from typing import Optional
 from typing_extensions import override
 
 import torch
-
+import ctypes
+from chitu.tensor_parallel import (
+    get_tp_size,
+)
 from chitu.quantization.base import (
     QuantizedLinearBase,
     QuantizedMoeExpertsBase,
     QuantizedAbsorbGemmBase,
 )
+from chitu.hybrid_device import CPUParameter
+from chitu.quantization.cpuinfer_singleton import get_cpu_infer
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.global_vars import get_global_args
 from chitu.utils import try_import_opt_dep
 from chitu.distributed.parallel_state import get_ep_group
+from chitu.static_tensor import StaticTensor
+from chitu.custom_gguf import GGMLQuantizationType
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
 torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
@@ -303,3 +310,332 @@ class NormalAbsorbGemm(QuantizedAbsorbGemmBase):
         if bs is not None:
             y = y.view(bs, seq, y.shape[-2], y.shape[-1])
         return y
+
+
+@QuantizationRegistry.register_linear(None, backend_type="cpuinfer")
+class NormLinearCPUInfer(QuantizedLinearBase):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        has_bias: bool = False,
+        **args,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.stride = 64
+        self.group_max_len = 1024
+        if torch.distributed.get_rank() == 0:
+            self.weight = CPUParameter(
+                torch.empty(
+                    self.out_features,
+                    self.in_features,
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                ),
+                requires_grad=False,
+            )
+
+            import cpuinfer
+
+            linear_config = cpuinfer.linear.LinearConfig(
+                self.in_features,
+                self.out_features,
+                self.stride,
+                self.group_max_len,
+                self.weight.data_ptr(),
+                GGMLQuantizationType.BF16,
+                GGMLQuantizationType.BF16,
+            )
+            self.linear = cpuinfer.linear.Linear(linear_config)
+
+            max_reqs = 256
+            self.input_cpu = StaticTensor(
+                max_nelem=max_reqs * self.in_features,
+                device="cpu",
+                pin_memory=True,
+                dtype=torch.bfloat16,
+            )
+            self.output_cpu = StaticTensor(
+                max_nelem=max_reqs * self.out_features,
+                device="cpu",
+                pin_memory=True,
+                dtype=torch.bfloat16,
+            )
+
+            self.cpu_infer = get_cpu_infer()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if torch.distributed.get_rank() == 0:
+            self.input_cpu.set_shape(x.shape)
+            out_shape = list(x.shape)
+            out_shape[-1] = self.out_features
+            self.output_cpu.set_shape(out_shape)
+
+            if x.device.type == "cpu":
+                inp = x.contiguous().cpu()
+                inp_ptr = inp.data_ptr()
+            else:
+                self.input_cpu.set_shape(x.shape)
+                self.input_cpu.get().copy_(x, non_blocking=True)
+                inp_ptr = self.input_cpu.get().data_ptr()
+
+            self.cpu_infer.submit(
+                self.linear.forward(
+                    x.size(0),
+                    inp_ptr,
+                    self.output_cpu.get().data_ptr(),
+                )
+            )
+            self.cpu_infer.sync()
+            y = self.output_cpu.get().to(x.device, non_blocking=True)
+        else:
+            y = torch.zeros_like(x)
+        return y
+
+
+@QuantizationRegistry.register_moe_experts(None, backend_type="cpuinfer")
+class NormalMoeExpertsCPUInfer(torch.nn.Module):
+    """
+    Mixture-of-Experts (MoE) module.
+
+    Attributes:
+        dim (int): Dimensionality of input features.
+        n_routed_experts (int): Total number of experts in the model.
+        n_local_experts (int): Number of experts handled locally in distributed systems.
+        n_activated_experts (int): Number of experts activated for each input.
+        gate (nn.Module): Gating mechanism to route inputs to experts.
+        experts (nn.ModuleList): List of expert modules.
+        shared_experts (nn.Module): Shared experts applied to all inputs.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        moe_inter_dim: int,
+        n_routed_experts: int,
+        n_shared_experts: int,
+        n_activated_experts: int,
+        moe_world_size: int,
+        moe_rank: int,
+        fuse_shared_experts: bool,
+        checkpoint_prefix: str,
+        merge_gate_up: bool,
+    ):
+        """
+        Initializes the MoE module.
+
+        Args:
+            args (ModelArgs): Model arguments containing MoE parameters.
+        """
+        super().__init__()
+        self.merge_gate_up = merge_gate_up
+        self.moe_inter_dim = moe_inter_dim * get_tp_size()
+        self.dim = dim
+        self.rank = moe_rank
+        self.fuse_shared_experts = fuse_shared_experts
+
+        moe_world_size = 1
+        self.max_batch_size = get_global_args().infer.max_reqs
+        assert (
+            n_routed_experts % moe_world_size == 0
+        ), f"Number of experts must be divisible by world size (world_size={moe_world_size})"
+        self.n_shared_experts = n_shared_experts
+        self.n_fused_shared_experts = (
+            n_shared_experts if self.fuse_shared_experts else 0
+        )
+        self.n_routed_experts = n_routed_experts
+        self.n_local_experts = n_routed_experts // moe_world_size
+        self.n_activated_experts = n_activated_experts
+        self.experts_start_idx = moe_rank * self.n_local_experts
+        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        self.group_size = (
+            self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts
+        )
+        self.checkpoint_prefix = checkpoint_prefix
+
+        # if self.rank == 0:
+        if torch.distributed.get_rank() == 0:
+            self.gate_proj_weight = CPUParameter(
+                torch.empty(
+                    (self.group_size, self.moe_inter_dim, self.dim),
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                ),
+                requires_grad=False,
+            )
+            self.gate_type = torch.tensor(
+                (GGMLQuantizationType.BF16),
+                dtype=torch.int,
+                device="cpu",
+                requires_grad=False,
+            )
+            self.up_proj_weight = CPUParameter(
+                torch.empty(
+                    (self.group_size, self.moe_inter_dim, self.dim),
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                ),
+                requires_grad=False,
+            )
+            self.up_type = torch.tensor(
+                (GGMLQuantizationType.BF16),
+                dtype=torch.int,
+                device="cpu",
+                requires_grad=False,
+            )
+            self.down_proj_weight = CPUParameter(
+                torch.empty(
+                    (self.group_size, self.dim, self.moe_inter_dim),
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                ),
+                requires_grad=False,
+            )
+            self.down_type = torch.tensor(
+                (GGMLQuantizationType.BF16),
+                dtype=torch.int,
+                device="cpu",
+                requires_grad=False,
+            )
+            gate_ptr = ctypes.addressof(
+                ctypes.cast(
+                    self.gate_proj_weight.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+                ).contents
+            )
+            up_ptr = ctypes.addressof(
+                ctypes.cast(
+                    self.up_proj_weight.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+                ).contents
+            )
+            down_ptr = ctypes.addressof(
+                ctypes.cast(
+                    self.down_proj_weight.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+                ).contents
+            )
+            import cpuinfer
+
+            moe_config = cpuinfer.moe.MOEConfig(
+                self.n_routed_experts,
+                self.n_activated_experts,
+                self.dim,
+                self.moe_inter_dim,
+                64,
+                10,
+                1024,
+                gate_ptr,
+                up_ptr,
+                down_ptr,
+                self.gate_type.item(),
+                self.up_type.item(),
+                self.down_type.item(),
+                GGMLQuantizationType.BF16,
+            )
+            self.moe = cpuinfer.moe.MOE(moe_config)
+
+            self.input_tensor_cpu = StaticTensor(
+                max_nelem=self.max_batch_size * self.dim,
+                device="cpu",
+                pin_memory=True,
+                dtype=torch.bfloat16,
+            )
+            self.weights_cpu = StaticTensor(
+                max_nelem=self.max_batch_size * self.n_activated_experts,
+                device="cpu",
+                pin_memory=True,
+                dtype=torch.float32,
+            )
+            self.indices_cpu = StaticTensor(
+                max_nelem=self.max_batch_size * self.n_activated_experts,
+                device="cpu",
+                pin_memory=True,
+                dtype=torch.int64,
+            )
+            self.output_cpu = StaticTensor(
+                max_nelem=self.max_batch_size * self.dim,
+                device="cpu",
+                pin_memory=True,
+                dtype=torch.bfloat16,
+            )
+            self.output_gpu = StaticTensor(
+                max_nelem=self.max_batch_size * self.dim,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            self.cpu_infer = get_cpu_infer()
+
+    def warm_up(self):
+        if torch.distributed.get_rank() == 0:
+            self.cpu_infer.submit(self.moe.warm_up())
+            self.cpu_infer.sync()
+
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Forward pass for the MoE module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            weights (torch.Tensor): Routing weights from the gate.
+            indices (torch.Tensor): Indices of the selected experts.
+
+        Returns:
+            torch.Tensor: Output tensor.
+        """
+        shape = x.size()
+
+        if torch.distributed.get_rank() == 0:
+            indices = indices.contiguous().to(torch.int64)
+            weights = weights.contiguous().to(torch.float32)
+            if x.shape[1] > 1:
+                input_tensor = x.contiguous().cpu()
+                indices = indices.cpu()
+                weights = weights.cpu()
+                output = torch.empty_like(input_tensor).contiguous().pin_memory()
+                self.cpu_infer.submit(
+                    self.moe.forward(
+                        indices.size(0),
+                        indices.size(1),
+                        indices.data_ptr(),
+                        weights.data_ptr(),
+                        input_tensor.data_ptr(),
+                        output.data_ptr(),
+                    )
+                )
+            else:
+                self.input_tensor_cpu.set_shape(x.shape)
+                self.indices_cpu.set_shape(indices.shape)
+                self.weights_cpu.set_shape(weights.shape)
+                self.output_cpu.set_shape(x.shape)
+                self.output_gpu.set_shape(x.shape)
+                self.input_tensor_cpu.get().copy_(x, non_blocking=True)
+                self.indices_cpu.get().copy_(indices, non_blocking=True)
+                self.weights_cpu.get().copy_(weights, non_blocking=True)
+                self.cpu_infer.submit_with_cuda_stream(
+                    torch.cuda.current_stream().cuda_stream,
+                    self.moe.forward(
+                        indices.size(0),
+                        indices.size(1),
+                        self.indices_cpu.get().data_ptr(),
+                        self.weights_cpu.get().data_ptr(),
+                        self.input_tensor_cpu.get().data_ptr(),
+                        self.output_cpu.get().data_ptr(),
+                    ),
+                )
+
+        if torch.distributed.get_rank() == 0:
+            if x.shape[1] > 1:
+                self.cpu_infer.sync()
+                y = output.to(x.device, non_blocking=True).view(shape)
+            else:
+                self.cpu_infer.sync_with_cuda_stream(
+                    torch.cuda.current_stream().cuda_stream
+                )
+                self.output_gpu.get().copy_(self.output_cpu.get(), non_blocking=True)
+                y = self.output_gpu.get()
+        else:
+            y = torch.zeros_like(x)
+
+        return y.view(shape)

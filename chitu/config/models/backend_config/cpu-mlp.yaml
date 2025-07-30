@@ -1,0 +1,6 @@
+backend: 
+- model: 'deepseek'
+  rules:
+    - regex : 'layers\.(\d+)\.mlp\.moe'
+      backend: cpuinfer
+      layers: ["3-60"]
