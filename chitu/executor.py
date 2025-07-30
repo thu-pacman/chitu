@@ -277,7 +277,7 @@ class Executor:
             return None
 
         if self.token_dispatcher is not None:
-            self.token_dispatcher.prepare(tasks.task_type, tasks.num_tokens)
+            self.token_dispatcher.prepare(tasks.task_type, tasks.num_tasks)
 
         # 2. prefill/decode step
         if tasks.task_type == TaskType.Prefill:
