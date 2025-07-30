@@ -57,12 +57,13 @@ extras_require = {
         # Although `flash-attn` is available in PyPI, don't make it a required
         # dependency, because its installation runs forever on some platforms.
     ],
+    # TODO: Upgrade to latest flashInfer version and resolve environment compatibility issues
     "flashinfer": [
         (
             "flashinfer-python<=0.2.5"
             if packaging.version.parse(torch.__version__)
             < packaging.version.parse("2.7.0")
-            else "flashinfer-python"
+            else "flashinfer-python<=0.2.7.post1"
         ),
     ],
     "flash_mla": [
