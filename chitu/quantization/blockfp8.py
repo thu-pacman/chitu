@@ -21,6 +21,7 @@ from chitu.device_type import get_device_name, is_muxi, is_nvidia, is_ascend
 from chitu.utils import try_import_opt_dep, parse_dtype
 from chitu.global_vars import get_global_args
 from chitu.ops import weight_dequant_soft_fp8_deepseek_v3
+from chitu.distributed.parallel_state import get_ep_group
 
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
 triton, has_triton = try_import_opt_dep("triton", "triton")
@@ -215,8 +216,6 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         n_routed_experts: int,
         n_shared_experts: int,
         n_activated_experts: int,
-        moe_world_size: int,
-        moe_rank: int,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
@@ -232,18 +231,34 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         super().__init__()
 
         self.dim = dim
+        self.ep_group = get_ep_group()
+        moe_rank = self.ep_group.rank_in_group
+        moe_world_size = self.ep_group.group_size
         self.fuse_shared_experts = fuse_shared_experts
         assert (
             n_routed_experts % moe_world_size == 0
-        ), f"Number of experts must be divisible by world size (world_size={moe_world_size})"
+        ), f"Number of experts must be divisible by moe world size (world_size={moe_world_size})"
         self.n_shared_experts = n_shared_experts
         self.n_fused_shared_experts = (
             n_shared_experts if self.fuse_shared_experts else 0
         )
+
         self.n_routed_experts = n_routed_experts
         self.n_local_experts = n_routed_experts // moe_world_size
+        remainder = n_routed_experts % moe_world_size
         self.experts_start_idx = moe_rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        if self.ep_group.is_last_rank:
+            self.experts_end_idx += remainder
+        if moe_world_size > 1:
+            expert_map = [-1] * self.n_routed_experts
+            expert_map[self.experts_start_idx : self.experts_end_idx] = list(
+                range(self.n_local_experts)
+            )
+            self.expert_map = torch.tensor(expert_map, dtype=torch.int32, device="cuda")
+        else:
+            self.expert_map = None
+
         self.group_size = (
             self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts
         )
@@ -394,6 +409,7 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                 fused_soft_fp8 = False
 
             if not self.fuse_shared_experts:
+
                 y = fused_experts(
                     x,
                     gate_up_proj_weight,
@@ -403,6 +419,7 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                     use_fp8_w8a8=True,
                     inplace=True,
                     global_num_experts=self.n_routed_experts,
+                    expert_map=self.expert_map,
                     w1_scale=gate_up_proj_scale,
                     w2_scale=down_proj_scale,
                     block_shape=[128, 128],
@@ -410,7 +427,6 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                 )
 
             else:
-
                 indice_shape = indices.shape
                 new_indices = torch.empty(
                     (indice_shape[0], indice_shape[1] + 1),
@@ -442,6 +458,7 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                     use_fp8_w8a8=True,
                     inplace=True,
                     global_num_experts=self.n_routed_experts + self.n_shared_experts,
+                    expert_map=self.expert_map,
                     w1_scale=gate_up_proj_scale,
                     w2_scale=down_proj_scale,
                     block_shape=[128, 128],

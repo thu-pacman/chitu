@@ -3,8 +3,6 @@ from typing import List, Optional
 import torch
 from logging import getLogger
 
-from chitu.distributed.fwd_context import FwdContext
-
 logger = getLogger(__name__)
 
 
@@ -50,6 +48,11 @@ class CommGroup:
         group_size = self.group_size
         return self.rank_list[(rank_in_group - 1) % group_size]
 
+    @property
+    def is_last_rank(self):
+        """Return True if the caller is the last rank in the group"""
+        return self.global_rank == self.rank_list[-1]
+
     def __str__(self):
         return f"{self.__class__.__name__}(group_size={self.group_size}, rank_in_group={self.rank_in_group}, rank_list={self.rank_list})"
 
@@ -63,11 +66,34 @@ class CommGroup:
     def broadcast(self, tensor: torch.Tensor, src: int = 0):
         torch.distributed.broadcast(tensor, src=src, group=self.gpu_group)
 
+    def scatter(
+        self,
+        tensor: torch.Tensor,
+        scatter_list: Optional[List[torch.Tensor]] = None,
+        src: int = 0,
+    ):
+        torch.distributed.scatter(tensor, scatter_list, src=src, group=self.gpu_group)
+
+    def gather(
+        self,
+        tensor: torch.Tensor,
+        gather_list: Optional[List[torch.Tensor]] = None,
+        dst: int = 0,
+    ):
+        torch.distributed.gather(tensor, gather_list, dst=dst, group=self.gpu_group)
+
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         torch.distributed.all_gather_into_tensor(output, input, group=self.gpu_group)
 
-    def all_gatherv_into_tensor(
-        self, input: torch.Tensor, tag: int = 0
+    def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        torch.distributed.reduce_scatter_tensor(output, input, group=self.gpu_group)
+
+    # use for token dispatcher
+
+    def all_gatherv_into_tensor_with_cum_size(
+        self,
+        input: torch.Tensor,
+        cum_size: List[int],
     ) -> torch.Tensor:
         # For allgather v, we cannot assign output tensor beforehand
         # because we don't known the output shape.
@@ -76,48 +102,7 @@ class CommGroup:
         if world_size == 1:
             return input, [input.size()]
 
-        if tag not in self.cached_output_tensor_list:
-            input_size = input.size()
-            input_size_tensor = torch.tensor(
-                input_size, dtype=torch.int32, device=input.device
-            )
-            # logger.info(f"input_size_tensor: {input_size_tensor}, shape: {input_size_tensor.shape}")
-            all_input_size_tensor = torch.empty(
-                (world_size, input_size_tensor.numel()),
-                dtype=torch.int32,
-                device=input.device,
-            )
-            torch.distributed.all_gather_into_tensor(
-                all_input_size_tensor, input_size_tensor, group=self.gpu_group
-            )
-            all_input_size_list_cpu = all_input_size_tensor.cpu().tolist()
-            output_tensor_list = [
-                torch.empty(
-                    all_input_size_list_cpu[i], dtype=input.dtype, device=input.device
-                )
-                for i in range(world_size)
-            ]
-            self.cached_output_tensor_list[tag] = output_tensor_list
-            self.cached_all_input_size_tensor[tag] = all_input_size_list_cpu
-
-        output_tensor_list = self.cached_output_tensor_list[tag]
-        all_input_size_list_cpu = self.cached_all_input_size_tensor[tag]
-
-        torch.distributed.all_gather(output_tensor_list, input, group=self.gpu_group)
-
-        return torch.cat(output_tensor_list, dim=0), all_input_size_list_cpu
-
-    def all_gatherv_into_tensor_with_fwd_context(
-        self, input: torch.Tensor
-    ) -> torch.Tensor:
-        # For allgather v, we cannot assign output tensor beforehand
-        # because we don't known the output shape.
-        world_size = self.group_size
-        # Bypass the function if we are using only 1 GPU.
-        if world_size == 1:
-            return input, [input.size()]
-
-        all_input_size_list_cpu = FwdContext.get_cum_token_size_list()
+        all_input_size_list_cpu = cum_size
         per_input_size = []
         for i in range(world_size):
             per_input_size.append(
@@ -138,31 +123,7 @@ class CommGroup:
 
         return torch.cat(output_tensor_list, dim=0), per_input_size
 
-    def clear_cached_all_input_size_tensor(self):
-        pass
-
-    def reduce_scatterv_tensor(
-        self, input: torch.Tensor, size_list: List[torch.Size]
-    ) -> torch.Tensor:
-        # For reduce scatter v, we cannot assign output tensor beforehand
-        # because we don't known the output shape.
-        # And we need size_list from allgather v
-        self.all_reduce(input)
-        cumsum = 0
-        for idx in range(self.rank_in_group):
-            cumsum += size_list[idx][0]
-        return input[cumsum : cumsum + size_list[self.rank_in_group][0]]
-
-    def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        torch.distributed.reduce_scatter_tensor(output, input, group=self.gpu_group)
-
-    def scatter(
-        self,
-        tensor: torch.Tensor,
-        scatter_list: Optional[List[torch.Tensor]] = None,
-        src: int = 0,
-    ):
-        torch.distributed.scatter(tensor, scatter_list, src=src, group=self.gpu_group)
+    # use for dp task dispatcher
 
     def scatter_v(
         self,
@@ -178,14 +139,6 @@ class CommGroup:
                     torch.distributed.send(send_tensor, dst=self.rank_list[idx])
         else:
             torch.distributed.recv(tensor, src=src)
-
-    def gather(
-        self,
-        tensor: torch.Tensor,
-        gather_list: Optional[List[torch.Tensor]] = None,
-        dst: int = 0,
-    ):
-        torch.distributed.gather(tensor, gather_list, dst=dst, group=self.gpu_group)
 
     def destroy(self):
         torch.distributed.destroy_process_group(self.gpu_group)

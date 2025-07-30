@@ -6,6 +6,7 @@ from chitu.quantization.base import QuantizedMoeExpertsBase
 from chitu.global_vars import get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.hybrid_device import CPUParameter
+from chitu.distributed.parallel_state import get_ep_group
 
 
 @QuantizationRegistry.register_moe_experts("q4km")
@@ -34,8 +35,6 @@ class MoeExpertsDeepSeekV3CPU(QuantizedMoeExpertsBase):
         n_routed_experts: int,
         n_shared_experts: int,
         n_activated_experts: int,
-        moe_world_size: int,
-        moe_rank: int,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
@@ -54,6 +53,10 @@ class MoeExpertsDeepSeekV3CPU(QuantizedMoeExpertsBase):
         self.merge_gate_up = merge_gate_up
         self.moe_inter_dim = moe_inter_dim
         self.dim = dim
+
+        self.ep_group = get_ep_group()
+        moe_rank = self.ep_group.rank_in_group
+        moe_world_size = self.ep_group.group_size
         self.rank = moe_rank
 
         moe_world_size = 1

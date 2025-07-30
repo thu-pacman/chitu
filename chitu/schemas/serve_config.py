@@ -14,6 +14,8 @@ class ServeAddrConfig:
 class InferConfig:
     tp_size: int = MISSING
     pp_size: int = MISSING
+    dp_size: int = MISSING
+    ep_size: int = MISSING
     do_load: bool = MISSING
     seed: float = MISSING
     max_seq_len: int = MISSING

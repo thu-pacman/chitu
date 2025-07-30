@@ -32,6 +32,8 @@ cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
 logger = getLogger(__name__)
 
+EDP_SKIP_FLAG = True
+
 
 def init_logger(logging_level=logging.INFO):
     base_name = __name__.split(".")[0]
@@ -106,6 +108,9 @@ def get_additional_block_num(
 
 
 def warmup_engine(args):
+    if args.infer.dp_size > 1:  # not suppoort non_expert_data_parallel
+        return
+
     logger.warning("Starting inference system warmup...")
     init_cache_static()
     num_warmup_reqs = args.infer.max_reqs
@@ -156,6 +161,7 @@ def check_checkpoint_path(args):
 
 def chitu_init(args, logging_level=None):
     debug = os.getenv("CHITU_DEBUG", "0") == "1"
+    global EDP_SKIP_FLAG
 
     if (
         is_nvidia()
@@ -240,9 +246,12 @@ def chitu_init(args, logging_level=None):
     args = get_global_args()
     Backend.build(args)
     rank = torch.distributed.get_rank()
-    if rank == 0:
+    if rank == 0 or (
+        args.infer.dp_size > 1
+    ):  # [HACK] temporary workaround to support dp+ep
         scheduler = Scheduler.build(args.scheduler, args.infer)
         Backend.scheduler = scheduler
+        EDP_SKIP_FLAG = False
     executor = Executor.build(args)
     Backend.executor = executor
     PackedTasks.configure(max_num_tasks=args.infer.max_reqs)
@@ -334,8 +343,9 @@ def chitu_run_pp():
 
 @torch.inference_mode()
 def chitu_run():
+    global EDP_SKIP_FLAG
     rank = torch.distributed.get_rank()
-    if rank != 0:
+    if rank != 0 and EDP_SKIP_FLAG:  # [HACK] temporary workaround to support dp+ep
         Backend.executor.step(None)
         return
 

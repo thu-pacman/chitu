@@ -538,7 +538,7 @@ class PackedTasksBase:
 
 
 class PackedTasks(PackedTasksBase):
-    def __init__(self, task_ids: List[str], rank=0):
+    def __init__(self, task_ids: List[str], rank="cuda"):
         # metadata
         self.task_ids = task_ids
         self.num_tasks = len(task_ids)
@@ -555,6 +555,14 @@ class PackedTasks(PackedTasksBase):
 
         if self.task_type == TaskType.Prefill:
             self.tokens = [task.req.prompt_tokens for task in self.tasks]
+
+        # additional modifications are required when adapting to MTP or Hybrid.
+        # also need to be handle in deserialize
+        self.num_tokens = (
+            sum(len(tokens) for tokens in self.tokens)
+            if self.task_type == TaskType.Prefill
+            else self.num_tasks
+        )
 
         # sample related
         self.is_all_greedy = all(task.req.params.top_k <= 1 for task in self.tasks)

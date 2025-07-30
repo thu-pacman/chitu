@@ -11,24 +11,11 @@ from chitu.device_type import is_ascend
 logger = getLogger(__name__)
 
 
-class FwdContext:
-    cum_token_size_list = None
-
-    @staticmethod
-    def set_cum_token_size_list(size_list):
-        FwdContext.cum_token_size_list = size_list
-
-    @staticmethod
-    def get_cum_token_size_list():
-        return FwdContext.cum_token_size_list
-
-
 _WORLD_GROUP: Optional[CommGroup] = None
 _TP_GROUP: Optional[CommGroup] = None
 _PP_GROUP: Optional[CommGroup] = None
 _DP_GROUP: Optional[CommGroup] = None
 _EP_GROUP: Optional[CommGroup] = None
-_EP_MODE: Optional[str] = None
 
 _PP_PAIR_GROUP_DICT = {}  # Compatible with NPU platforms
 
@@ -59,12 +46,16 @@ def get_ep_group() -> CommGroup:
     return get_global_var("_EP_GROUP")
 
 
-def get_ep_mode() -> str:
-    return get_global_var("_EP_MODE")
-
-
 def get_tp_size() -> int:
     return get_global_var("_TP_GROUP").group_size
+
+
+def get_dp_size() -> int:
+    return get_global_var("_DP_GROUP").group_size
+
+
+def get_ep_size() -> int:
+    return get_global_var("_EP_GROUP").group_size
 
 
 def get_pp_pair_group(
@@ -126,7 +117,6 @@ def initialize_pp_group(
     _PP_GROUP = CommGroup(rank_list, rank, local_rank)
 
     if is_ascend():
-        # def init_pp_group_npu(tp_size: int, pp_size: int):
         assert len(_PP_PAIR_GROUP_DICT) == 0
         if pp_size < 2:
             return
@@ -162,24 +152,29 @@ def initialize_dp_group(
     logger.info(f"dp group: {_DP_GROUP}")
 
 
-def initialize_ep_group(
-    ep_size: int, ep_mode: str, rank: int, local_rank: int, world_size: int
-):
-    global _EP_GROUP, _EP_MODE
+def initialize_ep_group(ep_size: int, rank: int, local_rank: int, world_size: int):
+    global _EP_GROUP
     assert _EP_GROUP is None
-    _EP_MODE = ep_mode
+
+    dp_size = get_dp_size()
+    tp_size = get_tp_size()
 
     if ep_size > 1:
-        if ep_mode == "tp":
+        assert not (
+            tp_size > 1 and dp_size > 1
+        ), "EP does not support enabling both DP and TP at the same time"
+        if tp_size > 1:
             global _TP_GROUP
             assert _TP_GROUP is not None, "tp should be initialized before ep"
+            assert tp_size == ep_size, "tp_size != ep_size"
             _EP_GROUP = _TP_GROUP
-        elif ep_mode == "dp":
+        elif dp_size > 1:
             global _DP_GROUP
             assert _DP_GROUP is not None, "dp should be initialized before ep"
+            assert dp_size == ep_size, "dp_size != ep_size"
             _EP_GROUP = _DP_GROUP
         else:
-            assert False, f"{ep_mode=} not supported."
+            assert False, "ep mode not supported."
     else:
         _EP_GROUP = CommGroup([[idx] for idx in range(world_size)], rank, local_rank)
     logger.info(f"ep group: {_EP_GROUP}")
@@ -198,14 +193,14 @@ def initialize_parallel_groups(
     initialize_world_group(rank, local_rank, world_size)
     initialize_tp_group(tp_size, pp_size, dp_size, rank, local_rank, world_size)
     initialize_pp_group(tp_size, pp_size, dp_size, rank, local_rank, world_size)
-    # initialize_dp_group(tp_size, pp_size, dp_size, rank, local_rank, world_size)
-    # initialize_ep_group(ep_size, ep_mode, rank, local_rank, world_size)
+    initialize_dp_group(tp_size, pp_size, dp_size, rank, local_rank, world_size)
+    initialize_ep_group(ep_size, rank, local_rank, world_size)
 
 
 def destroy_parallel_groups():
     get_tp_group().destroy()
     get_pp_group().destroy()
     get_world_group().destroy()
-    # get_dp_group().destroy()
+    get_dp_group().destroy()
     # Currently we don't destroy ep_group as it is a copy of tp/dp
     # get_ep_group().destroy()

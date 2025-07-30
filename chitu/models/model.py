@@ -21,7 +21,13 @@ from chitu.muxi_utils import (
     LinearMuxiLayoutNativeY,
 )
 from chitu.ops import apply_rotary_pos_emb, rms_norm, moe_gate
-from chitu.distributed.parallel_state import get_tp_group, get_tp_size
+from chitu.distributed.parallel_state import (
+    get_tp_group,
+    get_tp_size,
+    get_ep_group,
+    get_ep_size,
+)
+from chitu.distributed.moe_token_dispatcher import get_token_dispatcher
 from chitu.utils import (
     VarLens,
     compute_layer_dist_in_pipe,
@@ -322,6 +328,8 @@ class Transformer(nn.Module):
 
         self.tp_size = model_parallel_size
         self.pp_size = pipeline_parallel_size
+        self.ep_group = get_ep_group()
+        self.ep_size = self.ep_group.group_size
         self.pp_stage = self.rank // self.model_parallel_size
         self.pp_main_rank = (self.rank // model_parallel_size) * model_parallel_size
         self.pp_end_stage = (self.world_size - 1) // model_parallel_size
@@ -359,6 +367,21 @@ class Transformer(nn.Module):
             raise NotImplementedError(
                 "Graph capturing is not yet implemented for deepseek models on Ascend NPU"
             )
+
+        if hasattr(self.params, "n_routed_experts"):
+            n_routed_experts = self.params.n_routed_experts
+        elif hasattr(self.params, "num_experts"):
+            n_routed_experts = self.params.num_experts
+        else:
+            n_routed_experts = 0
+
+        # if self.ep_size > 1:
+        n_local_experts = n_routed_experts // self.ep_size
+        remainder = n_routed_experts % self.ep_size
+        self.experts_start_idx = self.ep_group.rank_in_group * n_local_experts
+        self.experts_end_idx = self.experts_start_idx + n_local_experts
+        if self.ep_group.is_last_rank:
+            self.experts_end_idx += remainder
 
     def _get_tensor_column_parallel_layer_names(self) -> List[str]:
         raise NotImplementedError
@@ -455,11 +478,21 @@ class Transformer(nn.Module):
         cpl_names = self._get_tensor_column_parallel_layer_names()
         rpl_names = self._get_tensor_row_parallel_layer_names()
 
+        enable_expert_parallel = get_ep_size() > 1
+
         for name, param in checkpoint.items():
             quant = get_quant_from_checkpoint_prefix(
                 name, self.params.quant_config.rules
             )
-            if any(is_layer(s, name) for s in cpl_names):
+
+            if enable_expert_parallel and any(
+                f".experts.{x}." in name
+                for x in range(self.experts_start_idx, self.experts_end_idx)
+            ):
+                partial_checkpoint[name] = param
+            elif enable_expert_parallel and ".experts." in name:
+                ...
+            elif any(is_layer(s, name) for s in cpl_names):
                 if name.split(".")[-1] in self._get_1d_in_tensor_names(
                     quant
                 ) + self._get_1d_out_tensor_names(quant):
@@ -650,6 +683,19 @@ class Transformer(nn.Module):
     ):
         if not skip_preprocess:
             state_dict = self.process_state_dict_for_blockfp4_before_chunk(state_dict)
+
+            # handle ep param
+            if self.ep_size > 1:
+                keys_to_remove = []
+                for key in state_dict.keys():
+                    if (".experts." in key) and all(
+                        f".experts.{x}." not in key
+                        for x in range(self.experts_start_idx, self.experts_end_idx)
+                    ):
+                        keys_to_remove.append(key)
+                for key in keys_to_remove:
+                    state_dict.pop(key, None)
+
             if self.pipeline_exec:
                 state_dict = self._chunk_checkpoint_for_pipeline_parallel(
                     state_dict, self.global_n_layers, self.pp_stage, self.pp_size
@@ -919,6 +965,8 @@ class ParallelMoeBlock(nn.Module):
         self.experts = experts
         self.shared_experts = non_fused_shared_experts
 
+        self.token_dispatcher = get_token_dispatcher()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for the MoE block.
@@ -930,14 +978,23 @@ class ParallelMoeBlock(nn.Module):
             torch.Tensor: Output tensor after expert routing and computation.
         """
         weights, indices = self.gate(x.view(-1, x.shape[-1]))
+
+        if self.token_dispatcher is not None:
+            x, weights, indices = self.token_dispatcher.token_permutation(
+                x, weights, indices
+            )
+
         if self.shared_experts is not None:
             # Do this before `self.experts`, because `self.experts` may modify `x` in-place
             shared_y = self.shared_experts(x)
         y = self.experts(x, weights, indices)
         if self.shared_experts is not None:
             y += shared_y
-        if get_tp_size() > 1:
+        if get_tp_size() > 1 and self.token_dispatcher is None:
             torch.distributed.all_reduce(y, group=get_tp_group().gpu_group)
+
+        if self.token_dispatcher is not None:
+            y = self.token_dispatcher.token_unpermutation(y)
         return y
 
 
