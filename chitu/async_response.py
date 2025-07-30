@@ -18,7 +18,7 @@ class ChatCompletionResponse(BaseModel):
 
 
 class AsyncDataStream:
-    def __init__(self):
+    def __init__(self, enable_reasoning: bool = True):
         self.tokenizer = Backend.tokenizer
         self.seqs: List[str] = []
         self.tokens_len: int = 0
@@ -27,16 +27,19 @@ class AsyncDataStream:
         self.stop_signal = False
         self.lock = threading.Lock()
         self.data_event = asyncio.Event()
-        self.is_reasoning = False
-        self.reasoning_len = 0
         self.top_logprobs_list = []
         self.top_tokens_list = []
-        self.rs_token_id = Backend.args.models.get("rs_token_id", -1)
-        self.re_token_id = Backend.args.models.get("re_token_id", -1)
+
+        if enable_reasoning:
+            self.enable_reasoning = enable_reasoning
+            self.is_reasoning = False
+            self.reasoning_len = 0
+            self.rs_token_id = Backend.args.models.get("rs_token_id", -1)
+            self.re_token_id = Backend.args.models.get("re_token_id", -1)
 
     def add_data(self, value: int, top_logprobs=None, top_token_idx=None):
         with self.lock:
-            if self.reasoning_handle(value):
+            if self.enable_reasoning and self.reasoning_handle(value):
                 return
             self.tokens_len += 1
             self.cache_tokens.append(value)

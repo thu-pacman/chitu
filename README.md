@@ -209,12 +209,9 @@ torchrun --nnodes 1 \
     infer.tp_size=8 \
     models=DeepSeek-R1 \
     models.ckpt_dir=/data/DeepSeek-R1 \
-    keep_dtype_in_checkpoint=True \
     infer.mla_absorb=absorb-without-precomp \
     infer.raise_lower_bit_float_to=bfloat16 \
-    infer.do_load=True \
     infer.max_reqs=1 \
-    scheduler.prefill_first.num_tasks=100 \
     infer.max_seq_len=4096 \
     request.max_new_tokens=100 \
     infer.use_cuda_graph=True
@@ -239,16 +236,16 @@ curl localhost:21002/v1/chat/completions \
 ### 流水线配置
 
 #### micro batch size 
-|参数 |默认值|说明|
-|:---|:---|:---|
-|prefill_num_tasks_divided_by_pp| True | 当 pp_size > 1，设置为 True 时，prefill_num_tasks = cur_req_size / pp_size |
-|prefill_num_tasks| 8 | 当 prefill_num_tasks_divided_by_pp 为 False 时，通过指定当前值来设置 Prefill 阶段最大并发任务数 |
-|enforce_decoder_num_tasks_max| True | 当 pp_size > 1，设置为 True 时，decoder_num_tasks = cur_req_size |
-|decoder_num_tasks| 8 | 当 enforce_decoder_num_tasks_max 为 False 时，通过指定当前值来设置 Decoder 阶段最大并发任务数。 |
+|参数                             |默认值  |说明|
+|:--------------------------------|:-------|:---|
+|`prefill_num_tasks_divided_by_pp`| `True` | 当 `pp_size > 1`，设置为 `True` 时，`prefill_num_tasks = cur_req_size / pp_size` |
+|`prefill_num_tasks`              | `8`    | 当 `prefill_num_tasks_divided_by_pp` 为 `False` 时，通过指定当前值来设置 Prefill 阶段最大并发任务数 |
+|`enforce_decode_num_tasks_max`   | `True` | 当 `pp_size > 1`，设置为 `True` 时，`decode_num_tasks = cur_req_size` |
+|`decode_num_tasks`               | `8`    | 当 `enforce_decode_num_tasks_max` 为 `False` 时，通过指定当前值来设置 Decode 阶段最大并发任务数。 |
 
 具体使用：
 ```
-# 通过设置 scheduler.prefill_first.pp_config 相关参数调整 micro batch size
+# 通过设置 scheduler.pp_config 相关参数调整 micro batch size
 
 torchrun --nnodes 1 \
     --nproc_per_node 8 \
@@ -260,15 +257,13 @@ torchrun --nnodes 1 \
     infer.tp_size=4 \
     models=DeepSeek-R1 \
     models.ckpt_dir=/data/DeepSeek-R1 \
-    keep_dtype_in_checkpoint=True \
     infer.mla_absorb=absorb-without-precomp \
     infer.raise_lower_bit_float_to=bfloat16 \
-    infer.do_load=True \
     infer.max_reqs=1 \
-    scheduler.prefill_first.pp_config.prefill_num_tasks_divided_by_pp=False \
-    scheduler.prefill_first.pp_config.prefill_num_tasks=8 \
-    scheduler.prefill_first.pp_config.enforce_decoder_num_tasks_max=True \
-    scheduler.prefill_first.pp_config.decoder_num_tasks=8 \
+    scheduler.pp_config.prefill_num_tasks_divided_by_pp=False \
+    scheduler.pp_config.prefill_num_tasks=8 \
+    scheduler.pp_config.enforce_decode_num_tasks_max=True \
+    scheduler.pp_config.decode_num_tasks=8 \
     infer.max_seq_len=4096 \
     request.max_new_tokens=100 \
     infer.use_cuda_graph=True

@@ -207,12 +207,9 @@ torchrun --nnodes 1 \
     models=DeepSeek-R1 \
     models.ckpt_dir=/data/DeepSeek-R1 \
     infer.attn_type=flash_infer \
-    keep_dtype_in_checkpoint=True \
     infer.mla_absorb=absorb-without-precomp \
     infer.raise_lower_bit_float_to=bfloat16 \
-    infer.do_load=True \
     infer.max_reqs=1 \
-    scheduler.prefill_first.num_tasks=100 \
     infer.max_seq_len=4096 \
     request.max_new_tokens=100 \
     infer.use_cuda_graph=True
@@ -236,16 +233,16 @@ curl localhost:21002/v1/chat/completions \
 ### Pipeline Configuration
 
 #### Micro Batch Size
-|Parameter|Default|Description|
-|:---|:---|:---|
-|prefill_num_tasks_divided_by_pp| True | When pp_size > 1, setting this to True means prefill_num_tasks = cur_req_size / pp_size |
-|prefill_num_tasks| 8 | Takes effect only when prefill_num_tasks_divided_by_pp is False. Specifies the max number of tasks in the prefill stage |
-|enforce_decoder_num_tasks_max| True | When pp_size > 1, setting this to True means decoder_num_tasks = cur_req_size / pp_size |
-|decoder_num_tasks| 8 | Takes effect only when enforce_decoder_num_tasks_max is False. Specifies the max number of concurrent tasks in the decoder stage |
+|Parameter                        |Default |Description|
+|:--------------------------------|:-------|:---|
+|`prefill_num_tasks_divided_by_pp`| `True` | When `pp_size > 1`, setting this to `True` means `prefill_num_tasks = cur_req_size / pp_size` |
+|`prefill_num_tasks`              | `8`    | Takes effect only when `prefill_num_tasks_divided_by_pp` is `False`. Specifies the max number of concurrent tasks in the prefill stage |
+|`enforce_decode_num_tasks_max`   | `True` | When `pp_size > 1`, setting this to True means `decode_num_tasks = cur_req_size` |
+|`decode_num_tasks`               | `8`    | Takes effect only when `enforce_decode_num_tasks_max` is `False`. Specifies the max number of concurrent tasks in the decoding stage |
 
 Usage Example
 ```
-# Adjust micro batch size by configuring scheduler.prefill_first.pp_config
+# Adjust micro batch size by configuring scheduler.pp_config
 
 torchrun --nnodes 1 \
     --nproc_per_node 8 \
@@ -257,15 +254,13 @@ torchrun --nnodes 1 \
     infer.tp_size=4 \
     models=DeepSeek-R1 \
     models.ckpt_dir=/data/DeepSeek-R1 \
-    keep_dtype_in_checkpoint=True \
     infer.mla_absorb=absorb-without-precomp \
     infer.raise_lower_bit_float_to=bfloat16 \
-    infer.do_load=True \
     infer.max_reqs=1 \
-    scheduler.prefill_first.pp_config.prefill_num_tasks_divided_by_pp=False \
-    scheduler.prefill_first.pp_config.prefill_num_tasks=8 \
-    scheduler.prefill_first.pp_config.enforce_decoder_num_tasks_max=True \
-    scheduler.prefill_first.pp_config.decoder_num_tasks=8 \
+    scheduler.pp_config.prefill_num_tasks_divided_by_pp=False \
+    scheduler.pp_config.prefill_num_tasks=8 \
+    scheduler.pp_config.enforce_decode_num_tasks_max=True \
+    scheduler.pp_config.decode_num_tasks=8 \
     infer.max_seq_len=4096 \
     request.max_new_tokens=100 \
     infer.use_cuda_graph=True

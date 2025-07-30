@@ -76,6 +76,7 @@ class UserRequest:
         temperature=0.8,
         frequency_penalty=0.0,
         chat_template_kwargs: Mapping[str, Any] = {},
+        enable_reasoning: bool = True,
     ):
         # input related
         self.message = message
@@ -91,7 +92,7 @@ class UserRequest:
         # response related
         self.output = ""
         self.completed = asyncio.Event()
-        self.async_stream = AsyncDataStream()
+        self.async_stream = AsyncDataStream(enable_reasoning=enable_reasoning)
         self.finish_reason = None
         self.max_new_tokens = max_new_tokens
 
@@ -181,6 +182,7 @@ class MockFixedLengthedUserRequest(UserRequest):
         top_k=50,
         temperature=0.8,
         frequency_penalty=0.0,
+        enable_reasoning: bool = True,
     ):
         self.input_len = input_len
         super().__init__(
@@ -193,6 +195,7 @@ class MockFixedLengthedUserRequest(UserRequest):
             top_k=top_k,
             temperature=temperature,
             frequency_penalty=frequency_penalty,
+            enable_reasoning=enable_reasoning,
         )
 
     @override
@@ -204,7 +207,6 @@ class MockFixedLengthedUserRequest(UserRequest):
 class TaskType(Enum):
     Prefill = 1
     Decode = 2
-    Hybrid = 3
 
 
 class Task:
@@ -235,7 +237,6 @@ class Task:
         # The Case 1 waiting task's communication handle
         self.handle = None
 
-        # not used
         self.arrv_ts = time.perf_counter_ns()
         self.sched_ts = self.arrv_ts
         self.priority = priority
@@ -317,6 +318,16 @@ class SerializedPackedTasksPayloadType(Enum):
 class TaskPool:
     pool: Dict[str, Task] = {}
     id_list: List[str] = []
+
+    def __bool__(cls):
+        return len(cls.pool) > 0
+
+    def __len__(cls):
+        return len(cls.pool)
+
+    @classmethod
+    def is_empty(cls):
+        return len(cls.pool) == 0
 
     @classmethod
     def add(cls, task: Task):
@@ -457,7 +468,6 @@ class PackedTasksBase:
         ):
             return ret.to(device)
 
-        assert self.task_type != TaskType.Hybrid
         task_indices = torch.arange(1, 1 + self.num_tasks, device="cpu")
         encoded_ids = torch.tensor(
             [req_encode(self.task_type, tid) for tid in self.task_ids], device="cpu"
@@ -518,9 +528,7 @@ class PackedTasks(PackedTasksBase):
         self.reqs = [task.req for task in self.tasks]
 
         self.task_type = self.tasks[0].task_type
-        if not all(task.task_type == self.task_type for task in self.tasks):
-            self.task_type = TaskType.Hybrid
-            raise NotImplementedError("Hybrid task not implemented")
+        assert all(task.task_type == self.task_type for task in self.tasks)
 
         if self.task_type == TaskType.Prefill:
             self.tokens = [task.req.prompt_tokens for task in self.tasks]
