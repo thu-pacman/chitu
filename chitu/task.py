@@ -5,7 +5,7 @@ import threading
 import time
 import weakref
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from logging import getLogger
@@ -401,6 +401,7 @@ class SerializedPackedTasksPayloadType(Enum):
     TerminateBackend = 2
     EndTask = 3
     Heartbeat = 4
+    Empty = 5
 
 
 class TaskPool:
@@ -464,11 +465,12 @@ class PackedTasksBase:
 
     # Object fields
     num_tasks: int
-    task_ids: List[str]
-    req_ids: List[str]
+    task_ids: List[str] = field(default_factory=list)
+    req_ids: List[str] = field(default_factory=list)
     task_type: Optional[TaskType] = None
     tokens: Optional[List[List[int]]] = None
     payload_type: Optional[SerializedPackedTasksPayloadType] = None
+    num_tokens: int = 0
 
     @classmethod
     def configure(cls, max_num_tasks: int):
@@ -487,6 +489,7 @@ class PackedTasksBase:
             task_tensor = task_tensor.cpu()
         payload_type = SerializedPackedTasksPayloadType(task_tensor[0].item())
 
+        num_tokens = 0
         num_tasks = 0
         task_ids = []
         req_ids = []
@@ -520,6 +523,12 @@ class PackedTasksBase:
                 if task_type == TaskType.Prefill:
                     tokens = [([0] * lens[it]) for it in range(len(lens))]
 
+            num_tokens = (
+                sum(len(it) for it in tokens)
+                if task_type == TaskType.Prefill
+                else num_tasks
+            )
+
             slot_handle = get_slot_handle()
             if slot_handle:
                 slot_handle.set_slot_idx(task_tensor[-2].item())
@@ -534,14 +543,12 @@ class PackedTasksBase:
             req_ids=req_ids,
             task_type=task_type,
             tokens=tokens,
+            num_tokens=num_tokens,
             payload_type=payload_type,
         )
 
     def serialize(self, device, payload_type=SerializedPackedTasksPayloadType.Normal):
-
-        if payload_type is None:
-            payload_type = SerializedPackedTasksPayloadType.Normal
-
+        payload_type = self.payload_type
         assert (
             PackedTasksBase.configured
         ), "PackedTasksBase must be configured before serialization"
@@ -553,6 +560,7 @@ class PackedTasksBase:
         if (
             payload_type == SerializedPackedTasksPayloadType.TerminateBackend
             or payload_type == SerializedPackedTasksPayloadType.Heartbeat
+            or payload_type == SerializedPackedTasksPayloadType.Empty
         ):
             return ret.to(device)
 
@@ -606,6 +614,14 @@ class PackedTasksBase:
 
 class PackedTasks(PackedTasksBase):
     def __init__(self, task_ids: List[str], rank="cuda"):
+        if not task_ids:  # empty packedtask
+            self.num_tasks = 0
+            self.task_ids = []
+            self.req_ids = []
+            self.task_type = None
+            self.tokens = None
+            self.payload_type = SerializedPackedTasksPayloadType.Empty
+            return
         # metadata
         self.task_ids = task_ids
         self.num_tasks = len(task_ids)
@@ -620,6 +636,8 @@ class PackedTasks(PackedTasksBase):
 
         if self.task_type == TaskType.Prefill:
             self.tokens = [task.req.prompt_tokens for task in self.tasks]
+
+        self.payload_type = SerializedPackedTasksPayloadType.Normal
 
         # additional modifications are required when adapting to MTP or Hybrid.
         # also need to be handle in deserialize

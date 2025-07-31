@@ -1,7 +1,7 @@
 import os
 from dataclasses import dataclass
 from logging import getLogger
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -23,6 +23,7 @@ from chitu.distributed.parallel_state import (
     get_tp_group,
     get_pp_group,
     get_pp_pair_group,
+    get_dp_group,
 )
 from chitu.distributed.moe_token_dispatcher import (
     get_token_dispatcher,
@@ -112,6 +113,7 @@ class PipeDispatcher(TasksDispatcher):
                 payload_type=payload_type,
                 device="cpu" if Backend.use_gloo else self.local_rank,
             )
+            payload_type = tasks.payload_type
         else:
             task_tensor = PackedTasksBase.empty_serialization(
                 device="cpu" if Backend.use_gloo else self.local_rank
@@ -187,6 +189,7 @@ class TensorDispatcher(TasksDispatcher):
                 payload_type=payload_type,
                 device="cpu" if Backend.use_gloo else self.local_rank,
             )
+            payload_type = tasks.payload_type
         else:
             task_tensor = PackedTasksBase.empty_serialization(
                 device="cpu" if Backend.use_gloo else self.local_rank
@@ -211,6 +214,118 @@ class TensorDispatcher(TasksDispatcher):
         return
 
 
+class ExpertDataDispatcher(TasksDispatcher):
+    def __init__(self):
+        super().__init__()
+        self.dp_group = get_dp_group()
+        self.dp_size = self.dp_group.group_size
+        self.dp_main_rank = self.dp_group.rank_list[0]
+        self.rank = self.dp_group.global_rank
+        self.device = torch.cuda.current_device()
+        self.is_main_rank = self.dp_group.global_rank == self.dp_main_rank
+        self.rank_in_group = self.dp_group.rank_in_group
+        self.gpu_group = self.dp_group.gpu_group
+        self.cpu_group = self.dp_group.cpu_group
+        self.task_list = None
+
+    def dispatch_metadata(
+        self,
+        tasks: Optional[PackedTasksBase],
+        payload_type: Optional[SerializedPackedTasksPayloadType] = None,
+    ):
+        if self.is_main_rank:
+            if Backend.task_id_list is not None:
+                Backend.all_tasks = PackedTasks(
+                    Backend.all_task_ids
+                )  # use for update in chitu_run
+                tasks_list = [
+                    PackedTasks(task_ids) for task_ids in Backend.task_id_list
+                ]
+            else:  # special payload
+                tasks_list = [tasks] * self.dp_size
+            self.task_list = tasks_list
+            task_tensors = [
+                task.serialize(
+                    payload_type=payload_type,
+                    device="cpu" if Backend.use_gloo else self.device,
+                )
+                for task in tasks_list
+            ]
+        else:
+            task_tensors = None
+
+        task_tensor = PackedTasksBase.empty_serialization(
+            device="cpu" if Backend.use_gloo else self.device
+        )
+        self.dp_group.scatter(
+            tensor=task_tensor,
+            scatter_list=task_tensors,
+            src=self.dp_main_rank,
+            group=self.cpu_group if Backend.use_gloo else self.gpu_group,
+        )
+        if self.is_main_rank:  # to be compatible with prepare_new_token_for_decode
+            tasks = tasks_list[self.rank_in_group]
+            payload_type = tasks.payload_type
+        else:
+            payload_type, tasks = PackedTasksBase.deserialize(task_tensor)
+        return payload_type, tasks
+
+    def recv_payload(
+        self, payload: Union[torch.Tensor, List[torch.Tensor]]
+    ) -> torch.Tensor:
+        if self.is_main_rank:
+            if Backend.all_tasks.task_type == TaskType.Prefill:
+                payload_list = [
+                    (
+                        torch.from_numpy(np.concatenate(task.tokens))
+                        .to(self.device)
+                        .to(torch.int64)
+                        if task.num_tokens > 0
+                        else torch.empty(0, device=self.device, dtype=torch.int64)
+                    )
+                    for task in self.task_list
+                ]
+            elif Backend.all_tasks.task_type == TaskType.Decode:
+                payload_list = [
+                    (
+                        torch.tensor(
+                            [task.next_token for task in tasks.tasks],
+                            device=self.device,
+                            dtype=torch.int64,
+                        )
+                        if tasks.num_tokens > 0
+                        else torch.empty(0, device=self.device, dtype=torch.int64)
+                    )
+                    for tasks in self.task_list
+                ]
+        else:
+            payload_list = None
+
+        self.dp_group.scatter_v(
+            tensor=payload, scatter_list=payload_list, src=self.dp_main_rank
+        )
+        return payload
+
+    def send_payload(self, payload: torch.Tensor):
+        if self.is_main_rank:
+            gather_list = [
+                torch.empty(
+                    (tasks.num_tasks, payload.shape[-1]),
+                    device=self.device,
+                    dtype=payload.dtype,
+                )
+                for tasks in self.task_list
+            ]
+        else:
+            gather_list = None
+        self.dp_group.gather_v(
+            tensor=payload, gather_list=gather_list, dst=self.dp_main_rank
+        )
+
+        if self.is_main_rank:
+            Backend.cat_logits = torch.cat(gather_list, dim=0)
+
+
 class Executor:
 
     @classmethod
@@ -223,6 +338,7 @@ class Executor:
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.pp_size = args.infer.pp_size
         self.tp_size = args.infer.tp_size
+        self.dp_size = args.infer.dp_size
         self.pipe_dispatcher = None
         self.task_dispatchers = []
         if self.pp_size > 1:
@@ -239,8 +355,23 @@ class Executor:
             self.get_payload_shape = lambda num_tokens: [num_tokens]
             self.get_payload_dtype = lambda: torch.int64
 
-        self.dp_flag = args.infer.dp_size > 1
-
+        if self.dp_size > 1:
+            assert not self.task_dispatchers, "Not support DP with other dispatchers"
+            self.task_dispatchers.append(ExpertDataDispatcher())
+            # use for empty step
+            self.dim = args.models.dim
+            self.vocab_size = args.models.vocab_size
+            self.n_dense_layers = (
+                args.models.n_dense_layers
+                if hasattr(args.models, "n_dense_layers")
+                else 0
+            )
+            self.dummy_input = torch.empty(
+                [0, self.dim], dtype=torch.get_default_dtype(), device=self.local_rank
+            )
+            self.dummy_logits = torch.empty(
+                [0, self.vocab_size], dtype=torch.float32, device=self.local_rank
+            )
         self.token_dispatcher = get_token_dispatcher()
 
     def _prepare_seq_lens_for_decode(self, tasks: PackedTasksBase):
@@ -255,12 +386,12 @@ class Executor:
 
     def step(
         self,
-        tasks: PackedTasksBase,
+        tasks: Optional[PackedTasksBase],
     ):
         remove_kvcache = False
 
         # 1. propagate tasks and handle special payload type
-        payload_type = None
+        payload_type = tasks.payload_type if tasks is not None else None
         for dispatcher in self.task_dispatchers:
             payload_type, tasks = dispatcher.dispatch_metadata(tasks, payload_type)
 
@@ -277,21 +408,23 @@ class Executor:
             return None
 
         if self.token_dispatcher is not None:
-            self.token_dispatcher.prepare(tasks.task_type, tasks.num_tasks)
+            self.token_dispatcher.prepare(tasks.task_type, tasks.num_tokens)
 
         # 2. prefill/decode step
         if tasks.task_type == TaskType.Prefill:
             out = self.prefill_step(tasks)
         elif tasks.task_type == TaskType.Decode:
             out = self.decode_step(tasks)
+        elif tasks.task_type is None:
+            out = self.empty_step()
         else:
             raise NotImplementedError  # Hybrid task not implemented
 
         # 3. handle ongoing task
-        if (
-            self.rank == 0 or self.dp_flag
-        ):  # [HACK] temporary workaround to support dp+ep
+        if self.rank == 0:
             if tasks.task_type == TaskType.Prefill:
+                if Backend.all_tasks is not None:
+                    tasks = Backend.all_tasks
                 # After prefill, new decode tasks are created
                 for task in tasks.tasks:
                     task.start_decoding()
@@ -307,12 +440,14 @@ class Executor:
         Backend.cache_manager.curr_varlens = varlens
         Backend.cache_manager.curr_req_ids = tasks.req_ids
 
-        num_tokens = varlens.total_len
+        num_tokens = tasks.num_tokens
 
-        if (
-            self.rank == 0 or self.dp_flag
-        ):  # [HACK] temporary workaround to support dp+ep
-            payload = torch.from_numpy(np.concatenate(tasks.tokens)).to(self.local_rank)
+        if self.rank == 0 and num_tokens > 0:
+            payload = (
+                torch.from_numpy(np.concatenate(tasks.tokens))
+                .to(self.local_rank)
+                .to(torch.int64)
+            )
         else:
             payload = torch.empty(
                 self.get_payload_shape(num_tokens),
@@ -332,9 +467,7 @@ class Executor:
         for dispatcher in self.task_dispatchers:
             dispatcher.send_payload(out)
 
-        Backend.cache_manager.finalize_cache_all_prefill(
-            tasks.req_ids, varlens
-        )  # like reset metadata
+        Backend.cache_manager.finalize_cache_all_prefill()  # like reset metadata
         return out
 
     def decode_step(self, tasks: PackedTasksBase):
@@ -347,9 +480,7 @@ class Executor:
         num_tokens = tasks.num_tasks
 
         # prepare payload tensor
-        if (
-            self.rank == 0 or self.dp_flag
-        ):  # [HACK] temporary workaround to support dp+ep
+        if self.rank == 0:
             payload = self._prepare_new_tokens_for_decode(tasks)  # tensor
         else:
             payload = torch.empty(
@@ -365,7 +496,9 @@ class Executor:
         payload = payload.unsqueeze(1)  # convert [B, :] to [B, 1, :]
 
         self.timers("decode").start()
-        out = Backend.model.decode(payload, seq_lens)
+        out = Backend.model.decode(payload, seq_lens).squeeze(
+            1
+        )  # adapt dispatch payload shape
         self.timers("decode").stop()
         # check output shape
 
@@ -377,6 +510,25 @@ class Executor:
             tasks.req_ids
         )  # update seq_len and reset block table
         return out
+
+    def empty_step(self):
+        """
+        This function is used to skip the attention computation and execute only the MoE logic
+        during Expert parallelism.
+        """
+
+        for dispatcher in self.task_dispatchers:
+            payload = dispatcher.recv_payload(self.dummy_input)
+
+        for it, layer in enumerate(Backend.model.layers):
+            if it < self.n_dense_layers:
+                continue
+            layer.mlp(payload)
+
+        for dispatcher in self.task_dispatchers:
+            payload = dispatcher.send_payload(self.dummy_logits)
+
+        return payload
 
     def _recv_logits(self, tasks: PackedTasks):
         logits = torch.empty(

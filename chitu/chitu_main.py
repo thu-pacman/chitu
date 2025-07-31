@@ -11,7 +11,6 @@ import torch.distributed
 from chitu.backend import Backend, BackendState
 from chitu.cache_manager import PagedKVCacheManager
 from chitu.device_type import is_nvidia
-from chitu.distributed_utils import propagate_tensor_to_all_devices
 from chitu.executor import Executor
 from chitu.global_vars import (
     get_global_args,
@@ -35,11 +34,8 @@ from chitu.utils import gen_req_id, try_import_opt_dep
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
-from chitu.distributed_utils import is_local_master_rank
 
 logger = getLogger(__name__)
-
-EDP_SKIP_FLAG = True
 
 
 def init_logger(logging_level=logging.INFO):
@@ -115,9 +111,6 @@ def get_additional_block_num(
 
 
 def warmup_engine(args):
-    if args.infer.dp_size > 1:  # not suppoort non_expert_data_parallel
-        return
-
     logger.warning("Starting inference system warmup...")
     init_cache_static()
     num_warmup_reqs = args.infer.max_reqs
@@ -168,7 +161,6 @@ def check_checkpoint_path(args):
 
 def chitu_init(args, logging_level=None):
     debug = os.getenv("CHITU_DEBUG", "0") == "1"
-    global EDP_SKIP_FLAG
 
     if (
         is_nvidia()
@@ -254,12 +246,9 @@ def chitu_init(args, logging_level=None):
     args = get_global_args()
     Backend.build(args)
     rank = torch.distributed.get_rank()
-    if rank == 0 or (
-        args.infer.dp_size > 1
-    ):  # [HACK] temporary workaround to support dp+ep
+    if rank == 0:
         scheduler = Scheduler.build(args.scheduler, args.infer)
         Backend.scheduler = scheduler
-        EDP_SKIP_FLAG = False
     executor = Executor.build(args)
     Backend.executor = executor
     PackedTasks.configure(max_num_tasks=args.infer.max_reqs)
@@ -269,23 +258,15 @@ def chitu_init(args, logging_level=None):
 def remove_kvcache_all_device(remove_task_ids):
     if len(remove_task_ids) == 0:
         return
-
-    # Remove KV cache on this device
-    for task_id in remove_task_ids:
-        Backend.cache_manager.finalize_cache_all_decode(task_id)
-
-    # Propagate metadata to remove KV cache on other devices
-    if torch.distributed.get_world_size() > 1:
-        task_tensor = PackedTasksBase(
-            num_tasks=len(remove_task_ids),
-            task_ids=remove_task_ids,
-            req_ids=remove_task_ids,
-            task_type=TaskType.Decode,  # Since we are removing, any task type is fine
-        ).serialize(
-            payload_type=SerializedPackedTasksPayloadType.EndTask,
-            device="cpu" if Backend.use_gloo else 0,
-        )
-        propagate_tensor_to_all_devices(task_tensor)
+    # Since we are removing, any task type is fine
+    tasks = PackedTasksBase(
+        num_tasks=len(remove_task_ids),
+        task_ids=remove_task_ids,
+        req_ids=remove_task_ids,
+        task_type=TaskType.Decode,
+        payload_type=SerializedPackedTasksPayloadType.EndTask,
+    )
+    Backend.executor.step(tasks)
 
 
 @torch.inference_mode()
@@ -295,8 +276,19 @@ def chitu_run_normal():
     if task_ids:
         # compute
         logger.debug(f"Processing {task_ids}")
-        tasks = PackedTasks(task_ids)
+        tasks = (
+            PackedTasks(task_ids[0])
+            if type(task_ids[0]) == list
+            else PackedTasks(task_ids)
+        )
+
         logits = Backend.executor.step(tasks)
+
+        if Backend.task_id_list is not None:
+            tasks = Backend.all_tasks
+            logits = Backend.cat_logits
+            task_ids = Backend.all_task_ids
+            Backend.task_id_list = None
 
         # postprocess
         if len(Backend.last_batch_results) > 0:
@@ -357,9 +349,8 @@ def chitu_run_pp():
 
 @torch.inference_mode()
 def chitu_run():
-    global EDP_SKIP_FLAG
     rank = torch.distributed.get_rank()
-    if rank != 0 and EDP_SKIP_FLAG:  # [HACK] temporary workaround to support dp+ep
+    if rank != 0:
         Backend.executor.step(None)
         return
 
@@ -371,7 +362,7 @@ def chitu_run():
 
 async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
     # only main rank of dp group start enhanced scheduler service
-    if not is_local_master_rank():
+    if rank != 0:
         logger.warning(
             f"[Enhanced Scheduler {rank}] only main rank of dp group start Enhanced Scheduler service"
         )
@@ -575,11 +566,11 @@ async def process_scheduler_request(rank: int, request_data: dict):
 def chitu_terminate():
     if torch.distributed.get_rank() == 0:
         Backend.state = BackendState.Terminated
-        terminated_task_tensor = PackedTasksBase.serialize_special(
-            SerializedPackedTasksPayloadType.TerminateBackend,
-            device="cpu" if Backend.use_gloo else 0,
+        terminated_task = PackedTasksBase(
+            num_tasks=0,
+            payload_type=SerializedPackedTasksPayloadType.TerminateBackend,
         )
-        propagate_tensor_to_all_devices(terminated_task_tensor)
+        Backend.executor.step(terminated_task)
 
 
 def chitu_is_terminated():

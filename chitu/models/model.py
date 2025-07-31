@@ -29,7 +29,6 @@ from chitu.distributed.parallel_state import (
 )
 from chitu.distributed.moe_token_dispatcher import get_token_dispatcher
 from chitu.utils import (
-    VarLens,
     compute_layer_dist_in_pipe,
     is_layer,
     try_import_opt_dep,
@@ -484,13 +483,8 @@ class Transformer(nn.Module):
             quant = get_quant_from_checkpoint_prefix(name)
             backend = get_backend_from_checkpoint_prefix(name)
 
-            if enable_expert_parallel and any(
-                f".experts.{x}." in name
-                for x in range(self.experts_start_idx, self.experts_end_idx)
-            ):
+            if enable_expert_parallel and ".experts." in name:
                 partial_checkpoint[name] = param
-            elif enable_expert_parallel and ".experts." in name:
-                ...
             elif any(is_layer(s, name) for s in cpl_names):
                 if name.split(".")[-1] in self._get_1d_in_tensor_names(
                     quant
@@ -927,6 +921,12 @@ class MoeGate(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
+        if x.shape[0] == 0:
+            return torch.empty(
+                (0, self.topk),
+                dtype=self.weight.dtype,
+                device=self.weight.device,
+            ), torch.empty((0, self.topk), dtype=torch.int32, device=self.weight.device)
 
         scores = F.linear(x, self.weight)
         indices, weights = moe_gate(

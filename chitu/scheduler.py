@@ -6,6 +6,9 @@ from typing_extensions import override
 from chitu.task import TaskPool, TaskType
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.utils import ceil_div
+from chitu.distributed.parallel_state import get_dp_group
+
+from chitu.backend import Backend
 
 logger = getLogger(__name__)
 
@@ -13,6 +16,9 @@ logger = getLogger(__name__)
 class Scheduler:
     @staticmethod
     def build(args, infer_args):
+        if get_dp_group().group_size > 1:
+            return DPFifoScheduler(infer_args.max_reqs)
+
         if get_slot_handle():
             return SkewPipelineScheduler(infer_args.max_reqs)
 
@@ -215,3 +221,76 @@ class SkewPipelineScheduler(Scheduler):
                                 lst[index] = lst[-1]
                                 lst.pop()
                                 break
+
+
+class DPFifoScheduler(Scheduler):  # used for expert_data_parallel
+    def __init__(
+        self,
+        max_num_tasks: int,
+    ):
+        # max num tasks per dp instance
+        self.max_num_tasks_per_dp = max_num_tasks
+        self.dp_size = get_dp_group().group_size
+        self.have_task = None
+
+    def schedule(self) -> List[List[str]]:
+        self.have_task = False
+
+        prefill_task_ids = filter(
+            lambda x: TaskPool.pool[x].task_type == TaskType.Prefill
+            and not TaskPool.pool[x].waiting,
+            TaskPool.pool.keys(),
+        )
+        prefill_task_ids = sorted(
+            prefill_task_ids,
+            key=lambda x: TaskPool.pool[x].req.start_time,
+            reverse=False,
+        )
+        prefill_task_ids = list(prefill_task_ids)[
+            : self.max_num_tasks_per_dp * self.dp_size
+        ]
+
+        if len(prefill_task_ids) > 0:
+            task_lists = [[] for _ in range(self.dp_size)]
+            for i, task_id in enumerate(prefill_task_ids):
+                task = TaskPool.pool[task_id]
+                task.cache_owner = i % self.dp_size
+                task_lists[i % self.dp_size].append(task_id)
+
+            # make sure tasks do not exceed max_num_tasks_per_dp
+            for i in range(self.dp_size):
+                if len(task_lists[i]) > self.max_num_tasks_per_dp:
+                    task_lists[i] = task_lists[i][: self.max_num_tasks_per_dp]
+            self.have_task = True
+        else:
+            # no prefill tasks
+            decode_task_ids = filter(
+                lambda x: TaskPool.pool[x].task_type == TaskType.Decode
+                and not TaskPool.pool[x].waiting,
+                TaskPool.pool.keys(),
+            )
+
+            decode_task_ids = list(decode_task_ids)
+
+            # For decode tasks, we need to make sure they are sent to their cache owner
+            task_lists = [[] for _ in range(self.dp_size)]
+            if len(decode_task_ids) > 0:
+                self.have_task = True
+
+            for task_id in decode_task_ids:
+                task = TaskPool.pool[task_id]
+                task_lists[task.cache_owner].append(task_id)
+
+            # make sure tasks do not exceed max_num_tasks_per_dp
+            for i in range(self.dp_size):
+                if len(task_lists[i]) > self.max_num_tasks_per_dp:
+                    task_lists[i] = task_lists[i][: self.max_num_tasks_per_dp]
+
+        if self.have_task:
+            Backend.task_id_list = task_lists
+            Backend.all_task_ids = [
+                task_id for task_ids in task_lists for task_id in task_ids
+            ]
+            return task_lists
+        else:
+            return []

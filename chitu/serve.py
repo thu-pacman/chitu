@@ -25,7 +25,6 @@ from chitu.task import (
     TaskType,
 )
 from chitu.utils import get_config_dir_path, gen_req_id
-from chitu.distributed_utils import propagate_tensor_to_all_devices
 from chitu.schemas import ServeConfig
 from chitu.global_vars import get_global_args
 
@@ -528,14 +527,12 @@ api_logger.addFilter(IgnoreSpecificPathFilter())
 
 async def process_queue():
     # DP compatible: each DP group's local master rank needs to start heartbeat
-    from chitu.distributed_utils import is_local_master_rank
-
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    rank = torch.distributed.get_rank()
     if rank == 0:
         asyncio.create_task(heartbeat_timer(60))
     global min_batch_size
     while True:
-        if (len(TaskPool.pool) >= min_batch_size) or not is_local_master_rank():
+        if (len(TaskPool.pool) >= min_batch_size) or rank != 0:
             min_batch_size = 1
             chitu_run()
         else:
@@ -544,11 +541,11 @@ async def process_queue():
 
 async def propagate_heartbeat():
     """add heartbeat tasks"""
-    heartbeat_task_tensor = PackedTasksBase.serialize_special(
-        SerializedPackedTasksPayloadType.Heartbeat,
-        device="cpu" if Backend.use_gloo else 0,
+    heartbeat_task = PackedTasksBase(
+        num_tasks=0,
+        payload_type=SerializedPackedTasksPayloadType.Heartbeat,
     )
-    propagate_tensor_to_all_devices(heartbeat_task_tensor)
+    Backend.executor.step(heartbeat_task)
 
 
 async def heartbeat_timer(interval=60):
@@ -742,7 +739,6 @@ def main(args: ServeConfig):
         torch.distributed.barrier()
 
         # warmup - DP compatible: each DP group's local master rank needs to do warmup
-        from chitu.distributed_utils import is_local_master_rank
 
         if rank == 0:
             logger.info(f"[WARMUP] [Rank {rank}] Starting warmup...")
@@ -775,8 +771,6 @@ def main(args: ServeConfig):
         chitu_init(args, logging_level=logging.WARNING)
         torch.distributed.barrier()
         rank = torch.distributed.get_rank()
-
-        from chitu.distributed_utils import is_local_master_rank
 
         if rank == 0:
             warmup_engine(args)

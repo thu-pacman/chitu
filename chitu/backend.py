@@ -100,6 +100,12 @@ class Backend:
     state = BackendState.Running
     last_batch_results: Deque["BatchResult"] = deque()
 
+    # expert data parallel related
+    task_id_list = None
+    all_task_ids = None
+    all_tasks = None
+    cat_logits = None
+
     @staticmethod
     def build_model(args, cache, *extra_args, **extra_kwargs):
         try:

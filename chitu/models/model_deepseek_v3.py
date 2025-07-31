@@ -45,7 +45,6 @@ from chitu.tensor_parallel import (
 )
 from chitu.distributed.parallel_state import get_tp_size, get_ep_size
 from chitu.utils import parse_dtype, try_import_opt_dep
-import os
 
 triton, has_triton = try_import_opt_dep("triton", "triton")
 chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")

@@ -10,7 +10,7 @@ serve:
 infer:
   tp_size: 1
   pp_size: 1
-  dp_size: 1 # Experimental. For internal tests only. Not available for service
+  dp_size: 1
   ep_size: 1
   do_load: True # set it to False for debug purpose
   seed: 0

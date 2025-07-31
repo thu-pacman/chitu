@@ -193,11 +193,6 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
 
         elif has_triton and self.merge_gate_up:
             if not self.fuse_shared_experts:
-                indices = indices - self.experts_start_idx
-                mask = (indices < 0) | (indices >= self.n_local_experts)
-                indices[mask] = (
-                    self.n_local_experts
-                )  # mark index n_local_experts as invalid
                 y = fused_experts(
                     x,
                     self.gate_up_proj_weight,
@@ -205,11 +200,9 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
                     topk_weights=weights,
                     topk_ids=indices,
                     inplace=True,
-                    global_num_experts=self.n_local_experts
-                    + 1,  # +1 avoid memory access violation
-                    # expert_map=self.expert_map,
+                    global_num_experts=self.n_routed_experts,
+                    expert_map=self.expert_map,
                     block_shape=[128, 128],
-                    n_local_experts=self.n_local_experts,  # after moe_align_block_size trun n_local_experts to -1
                 )
 
             else:
