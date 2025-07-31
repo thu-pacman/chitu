@@ -5,9 +5,16 @@ from omegaconf import MISSING
 
 
 @dataclass
+class ApiKey:
+    key: str = MISSING
+    priority: int = MISSING
+
+
+@dataclass
 class ServeAddrConfig:
     host: str = MISSING
     port: int = MISSING
+    api_keys: List[ApiKey] = MISSING
 
 
 @dataclass

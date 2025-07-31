@@ -61,6 +61,14 @@ class ChatRequest(BaseModel):
     min_batch_size: int = 1
     stop_with_eos: bool = True
     chat_template_kwargs: Mapping[str, Any] = {}
+    api_key: str = ""  # If in serve.api_keys, the request will be prioritized
+
+
+def get_priority_from_api_key(api_key: str) -> int:
+    for item in global_args.serve.api_keys:
+        if item.key == api_key:
+            return item.priority
+    return 1
 
 
 @app.post("/v1/chat/completions")
@@ -98,6 +106,7 @@ async def create_chat_completion(request: ChatRequest):
     min_batch_size = params.pop("min_batch_size")
     stop_with_eos = params.pop("stop_with_eos")
     chat_template_kwargs_unsafe = params.pop("chat_template_kwargs")
+    api_key = params.pop("api_key")
 
     # Reconstruct chat_template_kwargs to prevent injection attacks
     chat_template_kwargs = {}
@@ -125,7 +134,12 @@ async def create_chat_completion(request: ChatRequest):
             chat_template_kwargs=chat_template_kwargs,
         )
         response = AsyncResponse(req)
-        task = Task(req.request_id, req, stop_with_eos=stop_with_eos)
+        task = Task(
+            req.request_id,
+            req,
+            stop_with_eos=stop_with_eos,
+            priority=get_priority_from_api_key(api_key),
+        )
         TaskPool.add(task)
         if stream:
             return StreamingResponse(

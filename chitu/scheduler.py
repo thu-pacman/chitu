@@ -46,19 +46,25 @@ class Scheduler:
         """
         Initialize the scheduler.
 
+        Supported scheduling algorithms:
+            - "fcfs": First come, first service.
+            - "fifo": Alias for "fcfs".
+            - "request_preset": Prioritize tasks based on its preset priority.
+            - "prefill_first": Prioritize prefill tasks over decode tasks.
+            - "stride": Each task has a priority value P, and a score S (starts from 0), at scheduling point,
+              update the scores: S += P * elapsed_time. Select the tasks with top scores and reset their
+              scores back to 0.
+            - "deadline": Each task has a deadline time `DDL = request_arrival_time + prefix_length * alpha +
+              max_output_tokens * beta`. Select the tasks with nearest DDL. Alpha and beta are arbitary value,
+              defaults to 1ms.
+            - "prefix_align": Batch tasks with similar input lengths togather.
+
         Args:
             prefill_num_tasks (int): Max batch size for prefill stage
             decode_num_tasks (int): Max batch size for decode stage
-            scheduler_type (str): The type of scheduling algorithm to use.
-                - "fcfs": First come, first service.
-                - "fifo": Alias for "fcfs".
-                - "stride": Each task has a priority value P, and a score S (starts from 0), at scheduling point,
-                  update the scores: S += P * elapsed_time. Select the tasks with top scores and reset their
-                  scores back to 0.
-                - "deadline": Each task has a deadline time `DDL = request_arrival_time + prefix_length * alpha +
-                  max_output_tokens * beta`. Select the tasks with nearest DDL. Alpha and beta are arbitary value,
-                  defaults to 1ms.
-                - "prefix_align": Batch tasks with similar input lengths togather.
+            scheduler_type (str): The type of scheduling algorithm to use. Can be a single string, e.g,
+                "prefill_first", or a comma-separated string of multiple types for multi-key priority, e.g.,
+                "request_preset,prefill_first".
         """
 
         super().__init__()
@@ -68,22 +74,29 @@ class Scheduler:
         self.decode_num_tasks = decode_num_tasks
 
         # determine scoring method
-        if scheduler_type == "prefill_first":
-            self.scorer = lambda task: 1 if task.task_type == TaskType.Prefill else 0
-        elif scheduler_type == "fcfs" or scheduler_type == "fifo":
-            self.scorer = lambda task: -task.arrv_ts
-        elif scheduler_type == "stride":
-            self.scorer = lambda task: task.priority * (
-                self.scheduling_ts - task.arrv_ts
-            )
-        elif scheduler_type == "deadline":
-            self.scorer = lambda task: -task.sched_ddl
-        elif scheduler_type == "prefix_align":
-            self.scorer = lambda task: -task.prefix_length
-        else:
-            raise NotImplementedError(
-                f"Scheduler type {scheduler_type} not implemented"
-            )
+        self.scorers = []
+        for st in scheduler_type.split(","):
+            if st == "request_preset":
+                self.scorers.append(lambda task: task.priority)
+            elif st == "prefill_first":
+                self.scorers.append(
+                    lambda task: 1 if task.task_type == TaskType.Prefill else 0
+                )
+            elif st == "fcfs" or st == "fifo":
+                self.scorers.append(lambda task: -task.arrv_ts)
+            elif st == "stride":
+                self.scorers.append(
+                    lambda task: task.priority * (self.scheduling_ts - task.arrv_ts)
+                )
+            elif st == "deadline":
+                self.scorers.append(lambda task: -task.sched_ddl)
+            elif st == "prefix_align":
+                self.scorers.append(lambda task: -task.prefix_length)
+            else:
+                raise NotImplementedError(f"Scheduler type {st} not implemented")
+
+    def scorer(self, task):
+        return tuple(fn(task) for fn in self.scorers)
 
     def schedule(self) -> List[str]:
         if TaskPool.is_empty():

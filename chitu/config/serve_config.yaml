@@ -7,6 +7,9 @@ defaults:
 serve:
   host: 0.0.0.0
   port: 21002
+  api_keys: # If the request has a api_key field found in this dict, the request will be prioritized.
+    - key: example_key
+      priority: -1 # The higher the value, the higher the priority. Ordinary request has a priority of 1.
 infer:
   tp_size: 1
   pp_size: 1
@@ -35,7 +38,8 @@ request:
   prompt_tokens_len: -1 # use for perf test in single_req_test.py, -1 means use real requests.
   max_new_tokens: 128
 scheduler:
-  type: prefill_first
+  type: "request_preset,prefill_first"  # Ordered comma separated list of scheduler types among: "fcfs", "request_preset",
+                                        # "prefill_first", "stride", "deadline", "prefix_align"
   pp_config:
     prefill_num_tasks_divided_by_pp: True
     prefill_num_tasks: null

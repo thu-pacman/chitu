@@ -87,16 +87,3 @@ class ServeConfigRules(Callback):
             self._exit_with_error(
                 f"bind_thread_to_cpu must be one of [physical_core, logical_core], got {bind_thread_to_cpu}"
             )
-
-        scheduler_type = config.scheduler.type
-        if scheduler_type not in {
-            "fcfs",
-            "prefill_first",
-            "stride",
-            "deadline",
-            "prefix_align",
-            "balance",
-        }:
-            self._exit_with_error(
-                f"scheduler type must be one of [fcfs, prefill_first, stride, deadline, prefix_align, balance], got {scheduler_type}"
-            )

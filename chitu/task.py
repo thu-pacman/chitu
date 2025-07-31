@@ -296,6 +296,8 @@ class Task:
         priority: int = 1,
         stop_with_eos: bool = True,
     ):
+        logger.debug(f"Create Task {task_id} with priority {priority}")
+
         # response related
         self.req = req
         self.response = DeviceList([], dtype=torch.long, device="cuda")
