@@ -100,6 +100,12 @@ class Backend:
     state = BackendState.Running
     last_batch_results: Deque["BatchResult"] = deque()
 
+    # expert data parallel related
+    task_id_list = None
+    all_task_ids = None
+    all_tasks = None
+    cat_logits = None
+
     @staticmethod
     def build_model(args, cache, *extra_args, **extra_kwargs):
         try:
@@ -124,6 +130,12 @@ class Backend:
         Arguments:
             args: Configuration object with distributed parameters
         """
+        is_router_process = os.environ.get("CHITU_ROUTER_PROCESS", "0") == "1"
+        if is_router_process:
+            # Router process: as independent subprocess, skip CUDA device binding
+            logger.info(f"[Router] Router subprocess skip CUDA device binding")
+            return
+
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group("nccl")
 

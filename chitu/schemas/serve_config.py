@@ -5,9 +5,16 @@ from omegaconf import MISSING
 
 
 @dataclass
+class ApiKey:
+    key: str = MISSING
+    priority: int = MISSING
+
+
+@dataclass
 class ServeAddrConfig:
     host: str = MISSING
     port: int = MISSING
+    api_keys: List[ApiKey] = MISSING
 
 
 @dataclass
@@ -54,6 +61,35 @@ class SchedulerConfig:
 
     pp_config: PpConfig = MISSING
     type: str = MISSING
+
+
+@dataclass
+class DpAddressesConfig:
+    host: str = MISSING
+    port: int = MISSING
+
+
+@dataclass
+class RouterConfig:
+    is_router: bool = MISSING
+    host: str = MISSING
+    port: int = MISSING
+    stats_port: int = MISSING
+    token_port: int = MISSING
+    load_balancer_algorithm: str = MISSING
+    dp_addresses: List[DpAddressesConfig] = MISSING
+
+
+@dataclass
+class DpConfig:
+    enabled: bool = MISSING
+    scheduler_base_host: str = MISSING
+    scheduler_base_port: int = MISSING
+    dp_size: int = MISSING
+    dp_id: int = MISSING
+    tp_size: int = MISSING
+    pp_size: int = MISSING
+    router: RouterConfig = MISSING
 
 
 class StaticConfig:
@@ -151,6 +187,7 @@ class ServeConfig:
     infer: InferConfig = field(default_factory=InferConfig)
     request: RequestConfig = field(default_factory=RequestConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    dp_config: DpConfig = field(default_factory=DpConfig)
     quant: Optional[str] = MISSING
     dtype: Optional[str] = MISSING  # Legacy parameter. To be removed in the future.
     float_16bit_variant: str = MISSING

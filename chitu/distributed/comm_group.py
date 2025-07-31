@@ -21,6 +21,9 @@ class CommGroup:
         for rank_list in rank_lists:
             gpu_group = torch.distributed.new_group(rank_list)
             cpu_group = torch.distributed.new_group(rank_list, backend="gloo")
+            logger.info(
+                f"[CommGroup] [Rank {global_rank}] create gpu_group: {rank_list}, cpu_group: {rank_list}"
+            )
 
             if global_rank in rank_list:
                 self.cpu_group = cpu_group
@@ -71,8 +74,9 @@ class CommGroup:
         tensor: torch.Tensor,
         scatter_list: Optional[List[torch.Tensor]] = None,
         src: int = 0,
+        group: torch.distributed.ProcessGroup = None,
     ):
-        torch.distributed.scatter(tensor, scatter_list, src=src, group=self.gpu_group)
+        torch.distributed.scatter(tensor, scatter_list, src=src, group=group)
 
     def gather(
         self,
@@ -139,6 +143,21 @@ class CommGroup:
                     torch.distributed.send(send_tensor, dst=self.rank_list[idx])
         else:
             torch.distributed.recv(tensor, src=src)
+
+    def gather_v(
+        self,
+        tensor: torch.Tensor,
+        gather_list: Optional[List[torch.Tensor]] = None,
+        dst: int = 0,
+    ):
+        if self.global_rank == dst:
+            for idx, recv_tensor in enumerate(gather_list):
+                if self.rank_list[idx] == self.global_rank:
+                    recv_tensor.copy_(tensor)
+                else:
+                    torch.distributed.recv(recv_tensor, src=self.rank_list[idx])
+        else:
+            torch.distributed.send(tensor, dst=dst)
 
     def destroy(self):
         torch.distributed.destroy_process_group(self.gpu_group)

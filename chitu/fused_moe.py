@@ -770,7 +770,6 @@ def moe_align_block_size_cuda(
     expert_ids = torch.zeros(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
-    expert_ids.fill_(-1)
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
     token_cnts_buffer = torch.zeros(
         (num_experts + 1) * num_experts,
@@ -1326,7 +1325,6 @@ def inplace_fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     soft_fp8: bool = False,
-    n_local_experts: int = 0,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -1352,7 +1350,6 @@ def inplace_fused_experts(
         a2_scale,
         block_shape,
         soft_fp8=soft_fp8,
-        n_local_experts=n_local_experts,
     )
 
 
@@ -1427,7 +1424,6 @@ def fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     soft_fp8: bool = False,
-    n_local_experts: int = 0,
 ) -> torch.Tensor:
 
     if inplace:
@@ -1454,7 +1450,6 @@ def fused_experts(
             a2_scale,
             block_shape,
             soft_fp8=soft_fp8,
-            n_local_experts=n_local_experts,
         )
         return hidden_states
     else:
@@ -1505,7 +1500,6 @@ def fused_experts_impl(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     soft_fp8: bool = False,
-    n_local_experts: int = 0,
 ):
     # Check constraints.
     if use_int4_w4a16:
@@ -1595,10 +1589,6 @@ def fused_experts_impl(
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             curr_topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
         )
-
-        if n_local_experts != 0:
-            mask = expert_ids == n_local_experts
-            expert_ids[mask] = -1
 
         invoke_fused_moe_kernel(
             curr_hidden_states,

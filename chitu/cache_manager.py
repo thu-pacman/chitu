@@ -207,7 +207,7 @@ class PagedKVCacheManager:
 
         self.timers("cache_finalize_cache_all_prefill").stop()
 
-    def finalize_cache_all_prefill(self, req_ids, varlens):
+    def finalize_cache_all_prefill(self, req_ids=None, varlens=None):
         self.curr_varlens = None
         self.curr_req_ids = None
 
@@ -292,8 +292,10 @@ class PagedKVCacheManager:
 
     def finalize_cache_all_decode(self, req_id):
         self.timers("finalize_cache_all_decode").start()
-        assert req_id in self.seq_lens
-        assert req_id in self.block_table
+        if req_id not in self.seq_lens:
+            return
+        # assert req_id in self.seq_lens
+        # assert req_id in self.block_table
         self.free_req_cache_blocks(req_id)
         self.curr_varlens = None
         self.curr_req_ids = None
@@ -609,7 +611,7 @@ class KVCacheManagerSkewAware:
         self.timers("cache_finalize_cache_all_prefill").stop()
 
     # Prefill:
-    def finalize_cache_all_prefill(self, req_ids, varlen):
+    def finalize_cache_all_prefill(self, req_ids=None, varlen=None):
         pass
 
     # Decode:
@@ -739,6 +741,8 @@ class KVCacheManagerSkewAware:
 
     # Decode:
     def finalize_cache_all_decode(self, req_id):
+        if req_id not in self.hot_reqs:
+            return
         slot_id = self.hot_reqs.index(req_id)
         if slot_id == -1:  # not in the hot slot
             return

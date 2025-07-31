@@ -248,6 +248,7 @@ curl localhost:21002/v1/chat/completions   -H "Content-Type: application/json"  
 | `stream`               | `bool`           | 若为 `true` 以流模式响应 HTTP 请求，在 Python 中可通过 `requests.post(stream=True)` 使用。 |
 | `stop_with_eos`        | `bool`           | 若为 `false`，即使回答结束，也继续输出，直到输出 token 数达到 `max_tokens` 限制。可用于进行稳定的速度测试。 |
 | `chat_template_kwargs` | `Dict[str, Any]` | Chat template 的额外参数。目前支持的有： `{"enable_thinking": false}` 可禁用 GLM-4.5 模型的思考模式。 |
+| `api_key`              | `str`            | 用于对请求设置优先级，见服务启动时的 `serve.api_keys` 配置。 |
 
 ## 性能测试
 

@@ -5,7 +5,7 @@ import threading
 import time
 import weakref
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from logging import getLogger
@@ -61,6 +61,85 @@ class SampleParams:
         if self.temperature == 0:
             self.temperature = 1
             self.top_k = 1
+
+
+class RouterRequest:
+    """Lightweight request class for Router process without tokenization"""
+
+    def __init__(
+        self,
+        message,
+        request_id,
+        logprobs=False,
+        top_logprobs=None,
+        max_new_tokens=50,
+        top_p=0.9,
+        top_k=50,
+        temperature=0.8,
+        frequency_penalty=0.0,
+        chat_template_kwargs: Mapping[str, Any] = {},
+    ):
+        # input related
+        self.message = message
+        self.request_id = request_id
+        self.params = SampleParams(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            frequency_penalty=frequency_penalty,
+        )
+        self.chat_template_kwargs = chat_template_kwargs
+
+        # response related
+        self.output = ""
+        self.completed = asyncio.Event()
+        self.async_stream = (
+            None  # Will be set by Token Router, Router doesn't need stream processing
+        )
+        self.finish_reason = None
+        self.max_new_tokens = max_new_tokens
+
+        # test information related
+        self._test_flag = False
+        self._test_logits = []
+        self._test_tokens = []
+        self._test_standard_tokens = None
+        self._test_standard_it = 0
+        self.logprobs = logprobs
+        self.top_logprobs = 0 if logprobs and not top_logprobs else top_logprobs
+
+        # performance metrics
+        self.timestamp: str = datetime.now().strftime("%H:%M:%S:%f")
+        self.start_time: int = time.monotonic()
+        self.prefill_end_time: int = 0
+        self.completion_time: int = 0
+
+        # No tokenization or length checking in Router
+        self._prompt_len = 0  # Will be set later by Enhanced Scheduler
+
+    @property
+    def prompt_len(self):
+        """Return prompt_len, initially 0 until set by Enhanced Scheduler"""
+        return self._prompt_len
+
+    def set_prompt_len(self, prompt_len: int):
+        """Set prompt_len when received from Enhanced Scheduler"""
+        self._prompt_len = prompt_len
+
+    def to_user_request(self) -> "UserRequest":
+        """Convert RouterRequest to UserRequest when needed in Enhanced Scheduler"""
+        return UserRequest(
+            message=self.message,
+            request_id=self.request_id,
+            logprobs=self.logprobs,
+            top_logprobs=self.top_logprobs,
+            max_new_tokens=self.max_new_tokens,
+            top_p=self.params.top_p,
+            top_k=self.params.top_k,
+            temperature=self.params.temperature,
+            frequency_penalty=self.params.frequency_penalty,
+            chat_template_kwargs=self.chat_template_kwargs,
+        )
 
 
 class UserRequest:
@@ -217,6 +296,8 @@ class Task:
         priority: int = 1,
         stop_with_eos: bool = True,
     ):
+        logger.debug(f"Create Task {task_id} with priority {priority}")
+
         # response related
         self.req = req
         self.response = DeviceList([], dtype=torch.long, device="cuda")
@@ -295,13 +376,22 @@ def taskid2reqid(task_id):
 
 # +:prefill, -:decode
 def req_encode(task_type: TaskType, task_id: str):
-    if task_type == TaskType.Prefill:
-        return int(task_id, 16)
+    if "_" in task_id:
+        # 分离前缀和实际ID
+        prefix, actual_id = task_id.split("_", 1)
+        hex_id = actual_id
     else:
-        return -int(task_id, 16)
+        hex_id = task_id
+
+    if task_type == TaskType.Prefill:
+        return int(hex_id, 16)
+    else:
+        return -int(hex_id, 16)
 
 
 def req_decode(id_num: int):
+    # NOTE: here only return the hex part, the prefix info is lost in decoding
+    # this is acceptable, because decoding is mainly used for internal processing
     if id_num > 0:
         return hex(id_num)[2:], TaskType.Prefill
     else:
@@ -313,6 +403,7 @@ class SerializedPackedTasksPayloadType(Enum):
     TerminateBackend = 2
     EndTask = 3
     Heartbeat = 4
+    Empty = 5
 
 
 class TaskPool:
@@ -376,11 +467,12 @@ class PackedTasksBase:
 
     # Object fields
     num_tasks: int
-    task_ids: List[str]
-    req_ids: List[str]
+    task_ids: List[str] = field(default_factory=list)
+    req_ids: List[str] = field(default_factory=list)
     task_type: Optional[TaskType] = None
     tokens: Optional[List[List[int]]] = None
     payload_type: Optional[SerializedPackedTasksPayloadType] = None
+    num_tokens: int = 0
 
     @classmethod
     def configure(cls, max_num_tasks: int):
@@ -399,6 +491,7 @@ class PackedTasksBase:
             task_tensor = task_tensor.cpu()
         payload_type = SerializedPackedTasksPayloadType(task_tensor[0].item())
 
+        num_tokens = 0
         num_tasks = 0
         task_ids = []
         req_ids = []
@@ -432,6 +525,12 @@ class PackedTasksBase:
                 if task_type == TaskType.Prefill:
                     tokens = [([0] * lens[it]) for it in range(len(lens))]
 
+            num_tokens = (
+                sum(len(it) for it in tokens)
+                if task_type == TaskType.Prefill
+                else num_tasks
+            )
+
             slot_handle = get_slot_handle()
             if slot_handle:
                 slot_handle.set_slot_idx(task_tensor[-2].item())
@@ -446,14 +545,12 @@ class PackedTasksBase:
             req_ids=req_ids,
             task_type=task_type,
             tokens=tokens,
+            num_tokens=num_tokens,
             payload_type=payload_type,
         )
 
     def serialize(self, device, payload_type=SerializedPackedTasksPayloadType.Normal):
-
-        if payload_type is None:
-            payload_type = SerializedPackedTasksPayloadType.Normal
-
+        payload_type = self.payload_type
         assert (
             PackedTasksBase.configured
         ), "PackedTasksBase must be configured before serialization"
@@ -465,6 +562,7 @@ class PackedTasksBase:
         if (
             payload_type == SerializedPackedTasksPayloadType.TerminateBackend
             or payload_type == SerializedPackedTasksPayloadType.Heartbeat
+            or payload_type == SerializedPackedTasksPayloadType.Empty
         ):
             return ret.to(device)
 
@@ -518,6 +616,14 @@ class PackedTasksBase:
 
 class PackedTasks(PackedTasksBase):
     def __init__(self, task_ids: List[str], rank="cuda"):
+        if not task_ids:  # empty packedtask
+            self.num_tasks = 0
+            self.task_ids = []
+            self.req_ids = []
+            self.task_type = None
+            self.tokens = None
+            self.payload_type = SerializedPackedTasksPayloadType.Empty
+            return
         # metadata
         self.task_ids = task_ids
         self.num_tasks = len(task_ids)
@@ -532,6 +638,8 @@ class PackedTasks(PackedTasksBase):
 
         if self.task_type == TaskType.Prefill:
             self.tokens = [task.req.prompt_tokens for task in self.tasks]
+
+        self.payload_type = SerializedPackedTasksPayloadType.Normal
 
         # additional modifications are required when adapting to MTP or Hybrid.
         # also need to be handle in deserialize

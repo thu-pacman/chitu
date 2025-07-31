@@ -6,6 +6,9 @@ from typing_extensions import override
 from chitu.task import TaskPool, TaskType
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.utils import ceil_div
+from chitu.distributed.parallel_state import get_dp_group
+
+from chitu.backend import Backend
 
 logger = getLogger(__name__)
 
@@ -13,6 +16,9 @@ logger = getLogger(__name__)
 class Scheduler:
     @staticmethod
     def build(args, infer_args):
+        if get_dp_group().group_size > 1:
+            return DPFifoScheduler(infer_args.max_reqs)
+
         if get_slot_handle():
             return SkewPipelineScheduler(infer_args.max_reqs)
 
@@ -40,19 +46,25 @@ class Scheduler:
         """
         Initialize the scheduler.
 
+        Supported scheduling algorithms:
+            - "fcfs": First come, first service.
+            - "fifo": Alias for "fcfs".
+            - "request_preset": Prioritize tasks based on its preset priority.
+            - "prefill_first": Prioritize prefill tasks over decode tasks.
+            - "stride": Each task has a priority value P, and a score S (starts from 0), at scheduling point,
+              update the scores: S += P * elapsed_time. Select the tasks with top scores and reset their
+              scores back to 0.
+            - "deadline": Each task has a deadline time `DDL = request_arrival_time + prefix_length * alpha +
+              max_output_tokens * beta`. Select the tasks with nearest DDL. Alpha and beta are arbitary value,
+              defaults to 1ms.
+            - "prefix_align": Batch tasks with similar input lengths togather.
+
         Args:
             prefill_num_tasks (int): Max batch size for prefill stage
             decode_num_tasks (int): Max batch size for decode stage
-            scheduler_type (str): The type of scheduling algorithm to use.
-                - "fcfs": First come, first service.
-                - "fifo": Alias for "fcfs".
-                - "stride": Each task has a priority value P, and a score S (starts from 0), at scheduling point,
-                  update the scores: S += P * elapsed_time. Select the tasks with top scores and reset their
-                  scores back to 0.
-                - "deadline": Each task has a deadline time `DDL = request_arrival_time + prefix_length * alpha +
-                  max_output_tokens * beta`. Select the tasks with nearest DDL. Alpha and beta are arbitary value,
-                  defaults to 1ms.
-                - "prefix_align": Batch tasks with similar input lengths togather.
+            scheduler_type (str): The type of scheduling algorithm to use. Can be a single string, e.g,
+                "prefill_first", or a comma-separated string of multiple types for multi-key priority, e.g.,
+                "request_preset,prefill_first".
         """
 
         super().__init__()
@@ -62,22 +74,29 @@ class Scheduler:
         self.decode_num_tasks = decode_num_tasks
 
         # determine scoring method
-        if scheduler_type == "prefill_first":
-            self.scorer = lambda task: 1 if task.task_type == TaskType.Prefill else 0
-        elif scheduler_type == "fcfs" or scheduler_type == "fifo":
-            self.scorer = lambda task: -task.arrv_ts
-        elif scheduler_type == "stride":
-            self.scorer = lambda task: task.priority * (
-                self.scheduling_ts - task.arrv_ts
-            )
-        elif scheduler_type == "deadline":
-            self.scorer = lambda task: -task.sched_ddl
-        elif scheduler_type == "prefix_align":
-            self.scorer = lambda task: -task.prefix_length
-        else:
-            raise NotImplementedError(
-                f"Scheduler type {scheduler_type} not implemented"
-            )
+        self.scorers = []
+        for st in scheduler_type.split(","):
+            if st == "request_preset":
+                self.scorers.append(lambda task: task.priority)
+            elif st == "prefill_first":
+                self.scorers.append(
+                    lambda task: 1 if task.task_type == TaskType.Prefill else 0
+                )
+            elif st == "fcfs" or st == "fifo":
+                self.scorers.append(lambda task: -task.arrv_ts)
+            elif st == "stride":
+                self.scorers.append(
+                    lambda task: task.priority * (self.scheduling_ts - task.arrv_ts)
+                )
+            elif st == "deadline":
+                self.scorers.append(lambda task: -task.sched_ddl)
+            elif st == "prefix_align":
+                self.scorers.append(lambda task: -task.prefix_length)
+            else:
+                raise NotImplementedError(f"Scheduler type {st} not implemented")
+
+    def scorer(self, task):
+        return tuple(fn(task) for fn in self.scorers)
 
     def schedule(self) -> List[str]:
         if TaskPool.is_empty():
@@ -215,3 +234,76 @@ class SkewPipelineScheduler(Scheduler):
                                 lst[index] = lst[-1]
                                 lst.pop()
                                 break
+
+
+class DPFifoScheduler(Scheduler):  # used for expert_data_parallel
+    def __init__(
+        self,
+        max_num_tasks: int,
+    ):
+        # max num tasks per dp instance
+        self.max_num_tasks_per_dp = max_num_tasks
+        self.dp_size = get_dp_group().group_size
+        self.have_task = None
+
+    def schedule(self) -> List[List[str]]:
+        self.have_task = False
+
+        prefill_task_ids = filter(
+            lambda x: TaskPool.pool[x].task_type == TaskType.Prefill
+            and not TaskPool.pool[x].waiting,
+            TaskPool.pool.keys(),
+        )
+        prefill_task_ids = sorted(
+            prefill_task_ids,
+            key=lambda x: TaskPool.pool[x].req.start_time,
+            reverse=False,
+        )
+        prefill_task_ids = list(prefill_task_ids)[
+            : self.max_num_tasks_per_dp * self.dp_size
+        ]
+
+        if len(prefill_task_ids) > 0:
+            task_lists = [[] for _ in range(self.dp_size)]
+            for i, task_id in enumerate(prefill_task_ids):
+                task = TaskPool.pool[task_id]
+                task.cache_owner = i % self.dp_size
+                task_lists[i % self.dp_size].append(task_id)
+
+            # make sure tasks do not exceed max_num_tasks_per_dp
+            for i in range(self.dp_size):
+                if len(task_lists[i]) > self.max_num_tasks_per_dp:
+                    task_lists[i] = task_lists[i][: self.max_num_tasks_per_dp]
+            self.have_task = True
+        else:
+            # no prefill tasks
+            decode_task_ids = filter(
+                lambda x: TaskPool.pool[x].task_type == TaskType.Decode
+                and not TaskPool.pool[x].waiting,
+                TaskPool.pool.keys(),
+            )
+
+            decode_task_ids = list(decode_task_ids)
+
+            # For decode tasks, we need to make sure they are sent to their cache owner
+            task_lists = [[] for _ in range(self.dp_size)]
+            if len(decode_task_ids) > 0:
+                self.have_task = True
+
+            for task_id in decode_task_ids:
+                task = TaskPool.pool[task_id]
+                task_lists[task.cache_owner].append(task_id)
+
+            # make sure tasks do not exceed max_num_tasks_per_dp
+            for i in range(self.dp_size):
+                if len(task_lists[i]) > self.max_num_tasks_per_dp:
+                    task_lists[i] = task_lists[i][: self.max_num_tasks_per_dp]
+
+        if self.have_task:
+            Backend.task_id_list = task_lists
+            Backend.all_task_ids = [
+                task_id for task_ids in task_lists for task_id in task_ids
+            ]
+            return task_lists
+        else:
+            return []
