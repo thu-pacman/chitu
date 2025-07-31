@@ -124,6 +124,12 @@ class Backend:
         Arguments:
             args: Configuration object with distributed parameters
         """
+        is_router_process = os.environ.get("CHITU_ROUTER_PROCESS", "0") == "1"
+        if is_router_process:
+            # Router process: as independent subprocess, skip CUDA device binding
+            logger.info(f"[Router] Router subprocess skip CUDA device binding")
+            return
+
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group("nccl")
 

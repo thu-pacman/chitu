@@ -41,6 +41,42 @@ scheduler:
     prefill_num_tasks: null
     enforce_decode_num_tasks_max: True
     decode_num_tasks: null
+dp_config:
+  enabled: False
+  scheduler_base_host: 0.0.0.0
+  scheduler_base_port: 29610
+  dp_size: 1
+  dp_id: 0
+  tp_size: 1
+  pp_size: 1
+  # Router配置
+  router:
+    is_router: False
+    host: 0.0.0.0
+    port: 21003              # HTTP服务端口
+    stats_port: 29600        # ZMQ端口
+    token_port: 29700        # ZMQ端口
+    load_balancer_algorithm: "power_of_two_choices"
+    # Scheduler zmq address, there many scheduler, use dp_id to identify the scheduler
+    # dp_id = 0, scheduler_address = tcp://0.0.0.0:29610
+    # dp_id = 1, scheduler_address = tcp://0.0.0.0:29611
+    dp_addresses:
+      - host: 0.0.0.0
+        port: 29610
+      - host: 0.0.0.0
+        port: 29611
+      - host: 0.0.0.0
+        port: 29612
+      - host: 0.0.0.0
+        port: 29613
+      - host: 0.0.0.0
+        port: 29614
+      - host: 0.0.0.0
+        port: 29615
+      - host: 0.0.0.0
+        port: 29616
+      - host: 0.0.0.0
+        port: 29617
 quant: null
 dtype: null # Legacy parameter. To be removed in the future.
 float_16bit_variant: bfloat16 # one of: bfloat16, float16. This sets the default_dtype of torch

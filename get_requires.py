@@ -20,6 +20,7 @@ install_requires = [
     "accelerate",
     "einops",
     "typing-extensions",
+    "pyzmq>=27.0.0",
 ]
 
 extras_require = {

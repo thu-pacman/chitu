@@ -21,6 +21,9 @@ class CommGroup:
         for rank_list in rank_lists:
             gpu_group = torch.distributed.new_group(rank_list)
             cpu_group = torch.distributed.new_group(rank_list, backend="gloo")
+            logger.info(
+                f"[CommGroup] [Rank {global_rank}] create gpu_group: {rank_list}, cpu_group: {rank_list}"
+            )
 
             if global_rank in rank_list:
                 self.cpu_group = cpu_group

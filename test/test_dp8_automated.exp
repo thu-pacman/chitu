@@ -1,0 +1,136 @@
+#!/usr/bin/expect
+
+# 10 minutes timeout for startup
+set timeout 600
+
+# Enable debug mode for CI - show all output from spawned processes
+log_user 1
+exp_internal 0  # Set to 1 for expect debugging, 0 for cleaner output
+
+# Set environment variables for CI compatibility
+set env(CUDA_LAUNCH_BLOCKING) 1
+set env(CHITU_USE_CONTIGUOUS_DP_GROUPS) 1
+
+puts "=== CI Environment Information ==="
+puts "Working directory: [pwd]"
+puts "CUDA_VISIBLE_DEVICES: $env(CUDA_VISIBLE_DEVICES)"
+
+# Check SLURM_STEP_GPUS with proper Tcl syntax
+if {[info exists env(SLURM_STEP_GPUS)]} {
+    puts "SLURM_STEP_GPUS: $env(SLURM_STEP_GPUS)"
+} else {
+    puts "SLURM_STEP_GPUS: not set"
+}
+
+# Launch the DP=8 service using new script (without srun)
+puts "=== Starting DP=8 Service ==="
+spawn bash script/dp8_seperate_world.sh
+set dp_pid [exp_pid]
+puts "DP service launched, pid is $dp_pid"
+
+# Configure expect to show all output and handle large buffers
+match_max 100000
+
+# Set up a generic handler to display all output
+expect_after {
+    eof {
+        puts "Process ended unexpectedly"
+        exit 1
+    }
+}
+
+# Wait for the Router to start - with better pattern matching
+puts "Waiting for Router to start..."
+expect {
+    -timeout 120 -re "Router process started, PID: (\[0-9\]+)" {
+        puts "SUCCESS: Router started with PID: $expect_out(1,string)"
+    }
+    -timeout 120 "Router process startup failed" {
+        puts "ERROR: Router startup failed explicitly"
+        exit 1
+    }
+    timeout {
+        puts "ERROR: Router startup timeout"
+        exit 1
+    }
+}
+
+# Wait for DP groups to start
+puts "Waiting for DP groups to start..."
+expect {
+    -timeout 120 "Starting Unified DP Groups" {
+        puts "SUCCESS: DP groups starting!"
+    }
+    timeout {
+        puts "ERROR: DP groups startup timeout"
+        exit 1
+    }
+}
+
+# Wait for 8 Enhanced Schedulers to be ready
+puts "Waiting for 8 Enhanced Schedulers to start..."
+set scheduler_count 0
+set max_schedulers 8
+
+while {$scheduler_count < $max_schedulers} {
+    expect {
+        -timeout 300 "Starting to process requests, scheduler listening to requests" {
+            incr scheduler_count
+            puts "SUCCESS: Scheduler $scheduler_count of $max_schedulers is ready!"
+            if {$scheduler_count < $max_schedulers} {
+                puts "Waiting for next scheduler..."
+            }
+        }
+        timeout {
+            puts "ERROR: Timeout waiting for scheduler $scheduler_count. Only $scheduler_count of $max_schedulers schedulers started."
+            exit 1
+        }
+    }
+}
+
+puts "SUCCESS: All $max_schedulers Enhanced Schedulers are ready!"
+
+# Wait a bit for full initialization
+puts "Waiting for full system initialization..."
+sleep 20
+
+# Test the service using Python validation script
+puts "=== Testing DP=8 Service with Python Validation ==="
+spawn python test/validate_dp_req.py --dp-size 8
+expect {
+    -timeout 180 "All tests passed - system working normally" {
+        puts "SUCCESS: DP=8 Python validation test passed!"
+    }
+    -timeout 180 "Tests failed - please check system status" {
+        puts "ERROR: Python validation test failed"
+        exit 1
+    }
+    -timeout 180 "Unexpected error during testing" {
+        puts "ERROR: Python validation test encountered unexpected error"
+        exit 1
+    }
+    -timeout 180 "Test interrupted by user" {
+        puts "ERROR: Python validation test was interrupted"
+        exit 1
+    }
+    timeout {
+        puts "ERROR: Python validation test timeout (180 seconds)"
+        exit 1
+    }
+}
+
+puts "=== DP=8 Test Completed Successfully ==="
+
+# Clean up: kill the main process
+puts "Cleaning up processes..."
+exec kill -TERM $dp_pid
+sleep 5
+
+puts "=== Test Summary ==="
+puts "✓ Router startup: PASSED"
+puts "✓ DP Groups startup: PASSED" 
+puts "✓ 8 Enhanced Schedulers: PASSED"
+puts "✓ Service test: PASSED"
+puts "✓ Cleanup: COMPLETED"
+
+exit 0 

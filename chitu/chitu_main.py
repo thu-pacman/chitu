@@ -35,6 +35,8 @@ from chitu.utils import gen_req_id, try_import_opt_dep
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
+from chitu.distributed_utils import is_local_master_rank
+
 logger = getLogger(__name__)
 
 EDP_SKIP_FLAG = True
@@ -261,6 +263,7 @@ def chitu_init(args, logging_level=None):
     executor = Executor.build(args)
     Backend.executor = executor
     PackedTasks.configure(max_num_tasks=args.infer.max_reqs)
+    logger.warning(f"[CHITU_INIT] [Rank {rank}] Chitu initialized")
 
 
 def remove_kvcache_all_device(remove_task_ids):
@@ -364,6 +367,209 @@ def chitu_run():
         chitu_run_pp()
     else:
         chitu_run_normal()
+
+
+async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
+    # only main rank of dp group start enhanced scheduler service
+    if not is_local_master_rank():
+        logger.warning(
+            f"[Enhanced Scheduler {rank}] only main rank of dp group start Enhanced Scheduler service"
+        )
+        return
+
+    """Start Enhanced Scheduler service, listen to ZMQ requests"""
+    import zmq
+    import zmq.asyncio
+    import msgpack
+    import time
+
+    logger.warning(f"[Enhanced Scheduler {rank}] Starting...")
+
+    # Initialize ZMQ
+    context = zmq.asyncio.Context()
+
+    # Receive request socket
+    request_socket = context.socket(zmq.PULL)
+    request_port = dp_config.scheduler_base_port
+    request_address = f"tcp://{dp_config.scheduler_base_host}:{request_port}"
+    request_socket.bind(request_address)
+    logger.warning(
+        f"[Enhanced Scheduler {rank}] Listening to requests: {request_address}"
+    )
+
+    # Send statistics socket
+    stats_socket = context.socket(zmq.PUSH)
+    stats_address = f"tcp://{dp_config.router.host}:{dp_config.router.stats_port}"  # Router stats port
+    stats_socket.connect(stats_address)
+    logger.warning(
+        f"[Enhanced Scheduler {rank}] connected to stats service: {stats_address}"
+    )
+
+    # Start DP Token Manager
+    try:
+        from chitu.dp_token_sender import start_dp_token_manager
+
+        dp_group_id = rank  # Use rank as DP group ID
+        router_token_address = f"tcp://{dp_config.router.host}:{dp_config.router.token_port}"  # Token Router listen address
+
+        logger.warning(
+            f"[Enhanced Scheduler {rank}] Starting DP Token Manager, group ID={dp_group_id}"
+        )
+        token_manager = await start_dp_token_manager(dp_group_id, router_token_address)
+        logger.warning(
+            f"[Enhanced Scheduler {rank}] DP Token Manager started successfully"
+        )
+    except Exception as e:
+        logger.error(
+            f"[Enhanced Scheduler {rank}] DP Token Manager failed to start: {e}"
+        )
+        # print stack trace
+        import traceback
+
+        logger.error(
+            f"[Enhanced Scheduler {rank}] DP Token Manager failed to start: {traceback.format_exc()}"
+        )
+        return
+
+    # Performance statistics
+    processed_requests = 0
+    start_time = time.time()
+
+    logger.warning(
+        f"[Enhanced Scheduler {rank}] Starting to process requests, scheduler listening to requests on {request_address}"
+    )
+    try:
+        while True:
+            # Check if there are requests
+            if await request_socket.poll(timeout=100):  # 100ms timeout
+                try:
+                    # Receive request
+                    data = await request_socket.recv()
+                    request_data = msgpack.unpackb(data, raw=False)
+
+                    logger.debug(
+                        f"[Enhanced Scheduler {rank}] Received request: {request_data.get('request_id', 'unknown')}"
+                    )
+
+                    # Process request
+                    await process_scheduler_request(rank, request_data)
+                    processed_requests += 1
+
+                except Exception as e:
+                    logger.error(
+                        f"[Enhanced Scheduler {rank}] Failed to process request: {e}"
+                    )
+
+            # Send statistics periodically
+            current_time = time.time()
+            if (
+                processed_requests > 0 and (current_time - start_time) >= 1.0
+            ):  # Send statistics every second
+                elapsed = current_time - start_time
+                throughput = processed_requests / elapsed
+
+                stats = {
+                    "scheduler_id": rank,
+                    "running_requests": (
+                        len(Backend.ongoing_reqs)
+                        if hasattr(Backend, "ongoing_reqs")
+                        else 0
+                    ),
+                    "waiting_requests": (
+                        len(getattr(Backend.scheduler, "waiting_queue", []))
+                        if hasattr(Backend, "scheduler") and Backend.scheduler
+                        else 0
+                    ),
+                    "pending_tokens": 0,  # TODO: calculate pending tokens
+                    "throughput_tokens_per_sec": throughput,
+                    "last_update_time": current_time,
+                }
+
+                try:
+                    stats_data = msgpack.packb(stats)
+                    await stats_socket.send(stats_data)
+                    logger.debug(
+                        f"[Enhanced Scheduler {rank}] throughput: {throughput:.2f}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[Enhanced Scheduler {rank}] throughput send failed: {e}"
+                    )
+
+                # Reset counter
+                processed_requests = 0
+                start_time = current_time
+
+    except KeyboardInterrupt:
+        logger.warning(f"[Enhanced Scheduler {rank}] Received interrupt signal")
+    except Exception as e:
+        logger.error(f"[Enhanced Scheduler {rank}] Service exception: {e}")
+    finally:
+        # Clean up resources
+        request_socket.close()
+        stats_socket.close()
+        context.term()
+        logger.warning(f"[Enhanced Scheduler {rank}] Service stopped")
+
+
+async def process_scheduler_request(rank: int, request_data: dict):
+    """处理来自Router的调度请求"""
+    try:
+        from chitu.task import UserRequest, Task, TaskPool
+        from chitu.utils import gen_req_id
+
+        # 构造UserRequest对象
+        request_id = request_data.get("request_id", gen_req_id())
+        message = request_data.get("message", [])
+        max_new_tokens = request_data.get("max_new_tokens", 50)
+        temperature = request_data.get("temperature", 1.0)
+        top_p = request_data.get("top_p", 1.0)
+        top_k = request_data.get("top_k", 50)
+        logprobs = request_data.get("logprobs", False)
+        top_logprobs = request_data.get("top_logprobs", None)
+
+        # 创建UserRequest
+        user_request = UserRequest(
+            message=message,
+            request_id=request_id,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
+        )
+
+        # 创建Task
+        task = Task(task_id=request_id, req=user_request)
+
+        try:
+            from chitu.dp_token_sender import get_dp_token_manager
+
+            dp_group_id = rank  # 使用rank作为DP组ID
+            token_manager = get_dp_token_manager(dp_group_id)
+
+            if token_manager is not None:
+                # 包装Task以启用Token发送功能
+                wrapped_task = token_manager.wrap_task(task)
+                TaskPool.add(wrapped_task)
+            else:
+                # 如果Token Manager未初始化，直接添加原始Task
+                TaskPool.add(task)
+
+        except Exception as e:
+            # 如果DP Token Manager获取失败，回退到原始Task
+            logger.error(f"[Enhanced Scheduler {rank}] DP Token Manager获取失败: {e}")
+            TaskPool.add(task)
+            logger.warning(f"[Enhanced Scheduler {rank}] 回退到原始任务: {request_id}")
+
+        logger.debug(f"[Enhanced Scheduler {rank}] 任务处理完成: {request_id}")
+
+    except Exception as e:
+        logger.error(f"[Enhanced Scheduler {rank}] 处理请求失败: {e}")
+        import traceback
+
+        logger.error(f"[Enhanced Scheduler {rank}] 错误详情: {traceback.format_exc()}")
 
 
 def chitu_terminate():

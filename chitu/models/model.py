@@ -92,7 +92,6 @@ class RMSNorm(nn.Module):
         # NOTE: Although F.rms_norm uses different dtypes inside itself, and some models directly
         # pass float16 tensors to it, our CI shows it does not work for some models, especially GPTQ
         # quantized models. Maybe we should make the dtype optional.
-
         if compute_dtype is None:
             compute_dtype = torch.float32
 
@@ -991,7 +990,9 @@ class ParallelMoeBlock(nn.Module):
         if self.shared_experts is not None:
             # Do this before `self.experts`, because `self.experts` may modify `x` in-place
             shared_y = self.shared_experts(x)
+
         y = self.experts(x, weights, indices)
+
         if self.shared_experts is not None:
             y += shared_y
         if get_tp_size() > 1 and self.token_dispatcher is None:
