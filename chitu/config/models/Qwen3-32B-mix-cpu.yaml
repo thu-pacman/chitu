@@ -1,4 +1,3 @@
-# Qwen3-32B-FP8 is a quantization of Qwen3-32B
 defaults:
   - Qwen3-32B
   - backend_config: mix-cpu
@@ -6,6 +5,6 @@ defaults:
 
 # Access info
 name: Qwen3-32B-mix-cpu
-source: "https://huggingface.co/Qwen/Qwen3-32B-FP8" # Just for displaying. No automatic download.
+source: "https://huggingface.co/Qwen/Qwen3-32B" # Just for displaying. No automatic download.
 ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
 tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.

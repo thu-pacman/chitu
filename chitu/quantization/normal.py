@@ -410,8 +410,6 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
         n_routed_experts: int,
         n_shared_experts: int,
         n_activated_experts: int,
-        moe_world_size: int,
-        moe_rank: int,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
@@ -425,12 +423,15 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
         super().__init__()
         self.merge_gate_up = merge_gate_up
         self.moe_inter_dim = moe_inter_dim * get_tp_size()
+        self.ep_group = get_ep_group()
         self.dim = dim
-        self.rank = moe_rank
         self.fuse_shared_experts = fuse_shared_experts
-
-        moe_world_size = 1
+        moe_rank = self.ep_group.rank_in_group
+        moe_world_size = self.ep_group.group_size
         self.max_batch_size = get_global_args().infer.max_reqs
+        assert (
+            moe_world_size == 1
+        ), f"moe_world_size must be 1 for this configuration, but got {moe_world_size}"
         assert (
             n_routed_experts % moe_world_size == 0
         ), f"Number of experts must be divisible by world size (world_size={moe_world_size})"
@@ -448,7 +449,6 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
         )
         self.checkpoint_prefix = checkpoint_prefix
 
-        # if self.rank == 0:
         if torch.distributed.get_rank() == 0:
             self.gate_proj_weight = CPUParameter(
                 torch.empty(

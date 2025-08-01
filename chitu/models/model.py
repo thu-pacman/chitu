@@ -482,8 +482,10 @@ class Transformer(nn.Module):
         for name, param in checkpoint.items():
             quant = get_quant_from_checkpoint_prefix(name)
             backend = get_backend_from_checkpoint_prefix(name)
-
-            if enable_expert_parallel and ".experts." in name:
+            if backend == "cpuinfer":
+                if rank == 0:
+                    partial_checkpoint[name] = param
+            elif enable_expert_parallel and ".experts." in name:
                 partial_checkpoint[name] = param
             elif any(is_layer(s, name) for s in cpl_names):
                 if name.split(".")[-1] in self._get_1d_in_tensor_names(

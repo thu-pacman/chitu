@@ -23,5 +23,6 @@ n_layers: 46
 qkv_has_bias: True
 use_qk_norm: False
 norm_eps: 1e-05
-rope_theta: 10000
+rope_theta: 1000000
 vocab_size: 151552
+eos_token_id: [151329, 151336, 151338]
