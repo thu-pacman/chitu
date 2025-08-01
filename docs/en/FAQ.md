@@ -1,25 +1,35 @@
-# FAQ (Frequently Asked Questions)
+# Frequently Asked Questions (FAQ)
 
-### Q1: If a chip itself does not have an FP8 unit, how can I run an FP8 model directly?
-We can use the FP8 format to store weights and the BF16 format to perform operations, which is equivalent to somekind of w8a16, but the 8 here is float8.
-However, since the floating point conversion operation is more complicated than the integer conversion, there are some technical challenges.
-[This post](https://www.zhihu.com/question/14928372981/answer/124606559367?utm_psn=1884175276604384926) on Zhihu explains key optimization points in format conversion.
+### Q1: How to make Chitu support our model?
+If you're a large model developer seeking Chitu compatibility for your model:
+1) Submit a Pull Request - our team will review and merge after confirmation (see [CONTRIBUTING](/docs/en/CONTRIBUTING.md))
+2) For technical difficulties, contact our support team at solution@chitu.ai
 
-### Q2: It is easy to understand that FP8 saves more computing power than BF16, but why is there still speedup?
-In short, saving half of the computing power while achieving several times speedup is a **relatively special case**. More often, Chitu brings cost-effectiveness rather than absolute performance improvement.
-Regarding when this **relatively special case** will occur, [this post](https://www.zhihu.com/question/14928372981/answer/124606559367?utm_psn=1884175276604384926) on Zhihu makes explanations.
+### Q2: How to make Chitu support our chip?
+If you're developing or using an unsupported chip architecture:
+1) Submit a Pull Request for review (see [CONTRIBUTING](/docs/en/CONTRIBUTING.md))
+2) For adaptation challenges, email solution@chitu.ai
 
-### Q3: When will chitu support non-nvidia GPUs?
-The released version v0.1.0 can run on certain non-nvidia GPUs, but the high-performance operator implementation is not yet included. 
+### Q3: How to run FP4/FP8 models without native FP4/FP8 compute units?
+Solution: Store weights in FP8 format but execute computations in BF16 (similar to w8a16 quantization where "8" refers to float8).  
+Note: Floating-point conversion involves greater technical complexity than integer conversion. Technical details are explained in this [Zhihu article](https://www.zhihu.com/question/14928372981/answer/124606559367?utm_psn=1884175276604384926).
 
-### Q4: Why do we need Chitu? There are already open source projects such as vllm, sglang, and llama.cpp.
-Although there are many excellent projects, building Chitu is not reinventing the wheel.
-Chitu is more focused on aspects that existing open source projects do not take good care of, such as diversed non-nvidia GPU support.
-We think it is a useful supplement to the open source ecosystem of large models.
+### Q4: Why does FP4/FP8 sometimes accelerate performance beyond just compute savings?  
+While typically improving cost-performance ratios rather than raw performance, **exceptional cases** may show both compute savings and speedups. This [Zhihu analysis](https://www.zhihu.com/question/14928372981/answer/124606559367?utm_psn=1884175276604384926) explains when such **exceptional cases** occur.
 
-### Q5: Which scenarios are suitable for Chitu and which are not
-As of chitu v0.3.0, Chitu is aimed at users who **do not** have the latest NVIDIA high-end GPU but want to run FP4 and FP8 models directly.
-Chitu can support online conversion of FP4 and FP8 data types on common GPU models such as A800 and H20.
+### Q5: How does Chitu differ from vLLM/SGLang/llama.cpp?  
+Chitu complements rather than replicates existing solutions by focusing on:
+1) Native support for non-nvidia chips (e.g., Ascend/Muxi/Hygon)  
+2) Seamless scalability from minimal to large-scale deployments  
 
-### Q6: Does Chitu support pure CPU inference or CPU+GPU inference?
-Starting from chitu v0.2.2, CPU+GPU heterogeneous inference is supported. Pure CPU inference support is in the plan.
+### Q6: Ideal use cases for Chitu  
+Consider Chitu if you:
+1) Use non-nvidia chips (Ascend/Muxi/Hygon/etc.)  
+2) Employ heterogeneous computing (mixed chips)  
+3) Require high-performance inference  
+4) Seek cost-efficient deployment  
+5) Engaged in research on inference framework
+
+### Q7: Does Chitu support CPU-only or CPU+GPU inference?  
+Since v0.2.2: Supports CPU+GPU heterogeneous inference  
+CPU-only support: Planned feature  

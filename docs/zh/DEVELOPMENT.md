@@ -1,17 +1,99 @@
 # 开发者手册
 ## 安装指引
+### 使用官方镜像
+#### 英伟达
 
-从源码进行安装。注意下面示例命令中的部分参数需要根据实际环境进行调整（见注释）。
+```bash
+docker run --rm --gpus=all --privileged --shm-size=1g \
+  -v <your_model_path>:<container_model_path> \
+  <your_image_name> \
+  <your_command>
+```
+
+#### 昇腾
+
+```
+docker run \
+  --rm \
+  --device /dev/davinci0 \
+  --device /dev/davinci1 \
+  --device /dev/davinci2 \
+  --device /dev/davinci3 \
+  --device /dev/davinci4 \
+  --device /dev/davinci5 \
+  --device /dev/davinci6 \
+  --device /dev/davinci7 \
+  --device /dev/davinci_manager \
+  --device /dev/devmm_svm \
+  --device /dev/hisi_hdc \
+  -v /usr/local/dcmi:/usr/local/dcmi \
+  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+  -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+  -v /etc/ascend_install.info:/etc/ascend_install.info \
+  -v <your_model_path>:<container_model_path> \
+  <your_image_name> \
+  <your_command>
+```
+
+#### 沐曦
+
+```
+docker run \
+  --rm \
+  --device=/dev/dri \
+  --device=/dev/mxcd \
+  --group-add video \
+  --privileged=true \
+  --security-opt seccomp=unconfined \
+  --security-opt apparmor=unconfined \
+  --shm-size=100gb \
+  --ulimit memlock=-1 \
+  -v <your_model_path>:<container_model_path> \
+  <your_image_name> \
+  <your_command>
+```
+
+#### 海光
+
+```
+docker run -dit \
+  -u root \
+  --network=host \
+  --privileged \
+  --device=/dev/kfd \
+  --device=/dev/dri \
+  --ipc=host \
+  --shm-size=100G \
+  --group-add video \
+  --cap-add=SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  --ulimit stack=-1:-1 \
+  --ulimit memlock=-1:-1 \
+  -v /opt/hyhal:/opt/hyhal:ro \
+  -v <your_model_path>:<container_model_path> \
+  <your_image_name> \
+  <your_command>
+```
+
+### 从源码安装
+
+注意下面示例命令中的部分参数需要根据实际环境进行调整（见注释）。
+
 ```bash
 # 下载源码，注意使用 --recursive 选项获取第三方依赖
 git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
 # 如果下载很慢，试试在命令最后加上 “-i https://pypi.tuna.tsinghua.edu.cn/simple”
 pip install -r requirements-build.txt
-# 安装 torch，需要将 cu124 替换为实际的 cuda 版本号
+# 注意: 非英伟达平台请安装对应 torch，英伟达平台请对应修改自己的 cuda 版本
 pip install -U torch --index-url https://download.pytorch.org/whl/cu124 
 # TORCH_CUDA_ARCH_LIST 的值可通过 python -c "import torch; print(torch.cuda.get_device_capability())" 查看
-# ".[flashinfer,flash_mla]" 为可选安装项，如果都不需要，替换为 "." 即可，下文有更多说明
-TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation ".[flashinfer,flash_mla]" 
+TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation .
+# 华为昇腾平台需要先准备 CANN 和 torch_npu 2.5 环境，安装时设置变量 CHITU_ASCEND_BUILD=1
+# 注意：如果要开启 aclgraph 支持，需要通过 third_party/ascend 里的 whl 安装 torch_npu，或者直接使用chitu官方 docker 镜像
+CHITU_ASCEND_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
+# 海光平台需要先准备好 torch 环境，安装时设置环境变量 CHITU_HYGON_BUILD=1
+CHITU_HYGON_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
 ```
 
 当前支持的可选安装项有:
@@ -20,7 +102,6 @@ TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation ".[flashinf
 - `flashinfer`: 用于支持 `infer.attn_type=flash_infer`。
 - `flash_mla`: 用于支持 `infer.attn_type=flash_mla`。
 - `deep_gemm`: 用于支持使用 DeepGEMM 进行 fp8 推理。
-- `quant`：推理量化模型所需的若干额外依赖。
 - `cpu`: 用于支持 CPU+GPU 混合推理。
 - `muxi_layout_kernels`: 用于支持在沐曦 GPU 上使用 `infer.op_impl=muxi_custom_kernel` 模式，在小 batch 场景性能更优。
 
@@ -39,7 +120,8 @@ TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 CHITU_WITH_CYTHON=1 pip install --no-build-i
 注意：
 - 同时设置了 `-e` 和 `CHITU_WITH_CYTHON=1` 时，`-e` 不会起作用。如果已经这么做了，需要 `rm chitu/*.so` 恢复。
 
-## 构建分发产物
+### 构建分发产物
+
 先按照上面小节的安装指引完成环境配置和安装，然后按照下面的步骤构建分发产物。
 
 ```bash
@@ -50,45 +132,63 @@ TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 CHITU_WITH_CYTHON=1 pip install --no-build-i
 
 您也可以选择将 `test/` 目录复制到您想要的位置以运行它们。
 
-## 运行和测试
-=======
+## 运行和测试（非部署服务）
 
-默认的配置文件为 `chitu/config/serve_config.yaml` 。您可以使用命令行参数覆盖相关的参数设置，也可以使用环境变量 `CONFIG_NAME=<your_config_file.yaml>` 另行指定配置文件。
-需要提醒的是，`chitu/config/models/` 目录中的 yaml 文件并非完整的配置文件，切勿直接将 `CONFIG_NAME` 指向它们。
+**如果您与他人共享测试环境，请合理使用作业管理工具进行资源分配，避免资源冲突。**
+
+默认的配置文件为 `chitu/config/serve_config.yaml` 。您可以使用命令行参数覆盖相关的参数设置（参考 [Hydra 文档](https://hydra.cc/docs/advanced/override_grammar/basic/)），也可以使用环境变量 `CONFIG_NAME=<your_config_file.yaml>` 另行指定配置文件。需要提醒的是，`chitu/config/models/` 目录中的 yaml 文件并非完整的配置文件，切勿直接将 `CONFIG_NAME` 指向它们。
+
+### 示例：运行 DeepSeek-R1
+
+> 注：此示例中的参数可能并非最佳。最佳参数需根据实际应用需求与硬件需求调整。
+
+```bash
+torchrun --nproc_per_node 8 test/single_req_test.py \
+    models=deepseek-r1 \
+    models.ckpt_dir=/data/DeepSeek-R1 \
+    infer.tp_size=8 \
+    infer.pp_size=1 \
+    infer.cache_type=paged \
+    infer.attn_type=flash_mla \
+    infer.mla_absorb=absorb-without-precomp \
+    infer.max_reqs=1 \
+    infer.max_seq_len=512 \
+    request.max_new_tokens=100
+```
 
 运行日志存储在 `outputs/` 目录下。
 
-您可以参考运行 DeepSeek-R1 的示例脚本以获得更多信息。
+### 查看支持的模型
 
 ```bash
-bash ./script/run_deepseek_mla.sh
+python3 script/print_supported_models.py
 ```
 
-**单卡测试**
+### 单 GPU 推理
 
 ```bash
-torchrun --nproc_per_node 1 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64
+torchrun --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 models=DeepSeek-R1 models.ckpt_dir=/data/DeepSeek-R1 infer.pp_size=1 infer.tp_size=8
 ```
 
-**张量并行 (TP)**
+### 张量并行 (TP)
 
 ```bash
 torchrun --nproc_per_node 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.tp_size=2
 ```
 
-**流水线并行 (PP)**
+### 流水线并行 (PP)
 
 ```bash
 torchrun --nproc_per_node 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.pp_size=2
 ```
 
-**TP-PP 混合并行**
+### 混合并行 (TP+PP)
 
 ```bash
-torchrun --nproc_per_node 4 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=2
+torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=8 models=DeepSeek-R1 models.ckpt_dir=/data/DeepSeek-R1
 ```
 
-**使用 slurm 在多个节点上运行**
+### 使用 slurm 在多个节点上运行
 
 可以使用以下脚本命令运行：
 
@@ -102,7 +202,7 @@ torchrun --nproc_per_node 4 test/single_req_test.py models=<model-name> models.c
 ./script/srun_multi_node.sh 2 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
 ```
 
-**基于 SSH 连接的多节点运行**
+### 基于 SSH 连接的多节点运行
 
 首先确保各节点直接可以相互无密码 ssh 访问，然后执行以下脚本命令：
 
@@ -116,7 +216,7 @@ torchrun --nproc_per_node 4 test/single_req_test.py models=<model-name> models.c
 ./script/ssh_multi_node.sh "host1,host2" 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
 ```
 
-**基于Docker 容器和 SSH 连接的多节点运行**
+### 基于 Docker 容器和 SSH 连接的多节点运行
 
 首先确保各节点直接可以相互无密码 ssh 访问，然后在各个节点上启动同名的容器，最后执行以下脚本命令：
 
@@ -130,7 +230,7 @@ torchrun --nproc_per_node 4 test/single_req_test.py models=<model-name> models.c
 ./script/ssh_docker_multi_node.sh my_container /workspace "host1,host2" 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
 ```
 
-**固定输入输出长度用于性能测试**
+### 固定输入输出长度用于性能测试
 
 可以通过以下命令设置确定的输入输出长度。
 ```bash
@@ -142,7 +242,7 @@ torchrun --nproc_per_node 1 test/single_req_test.py \
     infer.max_seq_len=192 \
     infer.max_reqs=8 
 ```
-**使用给定的配置预处理模型的 state_dict 并将其保存到新的检查点（checkpoint），并在将来跳过预处理**
+### 使用给定的配置预处理模型的 state_dict 并将其保存到新的检查点（checkpoint），并在将来跳过预处理
 
 `script/preprocess_and_save.py` 可用于：
 - 从完整模型量化并将其保存到新的检查点。
@@ -175,18 +275,17 @@ PREPROCESS_AND_SAVE_DIR=<target_directory> [CONFIG_NAME=<config_file>] torchrun 
 [CONFIG_NAME=<config_file>] torchrun <torchrun_arguments> test/single_req_test.py models=<模型名称> models.ckpt_dir=<路径/到/检查点> quant_ckpt_dir=<目标目录>
 ```
 
-
-**使用 CPU+GPU 异构混合推理**
+### 使用 CPU+GPU 异构混合推理
 
 赤兔支持 CPU 和 GPU 异构混合推理，可以根据实际硬件资源和性能需求灵活配置。以下是一个简单的示例：
 
-首先拉取最新代码，进行安装，以 H20 机器为例
+以 H20 机器为例，在安装时加上 cpu 选项。
 
 ```bash
 TORCH_CUDA_ARCH_LIST=9.0 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation ".[cpu,flash_mla]"
 ```
 
-然后参考下面的启动脚本，其中`+cpu_layer_num=58`表示将其中58层的MoE部分放在CPU上进行运算，可根据GPU显存的容量适当设定层数。
+参考下面的启动脚本，其中`+cpu_layer_num=58`表示将其中58层的MoE部分放在CPU上进行运算，可根据GPU显存的容量适当设定层数。
 
 ```bash
 torchrun --nproc_per_node 1 \
@@ -210,25 +309,46 @@ torchrun --nproc_per_node 1 \
 
 
 ## 部署推理服务
-
-运行以下命令将在某个端口上启动相应服务（默认地址为 0.0.0.0:21002）
-
 ```bash
-torchrun --nproc_per_node 1 -m chitu models=<model-name> models.ckpt_dir=<path/to/checkpoint> serve.host=<host> serve.port=<port>
-```
+# 华为昇腾平台启动额外设置
+# 1. 需要指定 infer.attn_type=npu
+# 2. 设置环境变量优化执行
+#   export TASK_QUEUE_ENABLE=2  # 将部分算子适配任务迁移至二级流水，使两级流水负载更均衡，并减少dequeue唤醒时间
+#   export CPU_AFFINITY_CONF=2  # 优化任务的执行效率，避免跨NUMA（非统一内存访问架构）节点的内存访问，减少任务调度开销
+#   export HCCL_OP_EXPANSION_MODE=AIV  # 利用Device的AI Vector Core计算单元来加速AllReduce
+# 3. 多机推理设置 export HCCL_IF_IP=$LOCAL_IP
 
-可以通过以下命令测试单个请求
+# 在 localhost:21002 启动服务
+export WORLD_SIZE=8
+torchrun --nnodes 1 \
+    --nproc_per_node 8 \
+    --master_port=22525 \
+    -m chitu \
+    serve.port=21002 \
+    infer.cache_type=paged \
+    infer.pp_size=1 \
+    infer.tp_size=8 \
+    models=DeepSeek-R1 \
+    models.ckpt_dir=/data/DeepSeek-R1 \
+    infer.mla_absorb=absorb-without-precomp \
+    infer.raise_lower_bit_float_to=bfloat16 \
+    infer.max_reqs=1 \
+    infer.max_seq_len=4096 \
+    request.max_new_tokens=100 \
+    infer.use_cuda_graph=True
 
-```bash
-curl localhost:21002/v1/chat/completions   -H "Content-Type: application/json"  -d '{
+# 测试服务
+curl localhost:21002/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
     "messages": [
       {
         "role": "system",
-        "content": "You are a poetic assistant, skilled in explaining complex programming concepts with creative flair."
+        "content": "You are a helpful assistant."
       },
       {
         "role": "user",
-        "content": "Compose a poem that explains the concept of recursion in programming."
+        "content": "What is machine learning?"
       }
     ]
   }'
@@ -249,6 +369,41 @@ curl localhost:21002/v1/chat/completions   -H "Content-Type: application/json"  
 | `stop_with_eos`        | `bool`           | 若为 `false`，即使回答结束，也继续输出，直到输出 token 数达到 `max_tokens` 限制。可用于进行稳定的速度测试。 |
 | `chat_template_kwargs` | `Dict[str, Any]` | Chat template 的额外参数。目前支持的有： `{"enable_thinking": false}` 可禁用 GLM-4.5 模型的思考模式。 |
 | `api_key`              | `str`            | 用于对请求设置优先级，见服务启动时的 `serve.api_keys` 配置。 |
+
+### 与 micro batchsize 相关的更多配置
+
+|参数                             |默认值  |说明|
+|:--------------------------------|:-------|:---|
+|`prefill_num_tasks_divided_by_pp`| `True` | 当 `pp_size > 1`，设置为 `True` 时，`prefill_num_tasks = cur_req_size / pp_size` |
+|`prefill_num_tasks`              | `8`    | 当 `prefill_num_tasks_divided_by_pp` 为 `False` 时，通过指定当前值来设置 Prefill 阶段最大并发任务数 |
+|`enforce_decode_num_tasks_max`   | `True` | 当 `pp_size > 1`，设置为 `True` 时，`decode_num_tasks = cur_req_size` |
+|`decode_num_tasks`               | `8`    | 当 `enforce_decode_num_tasks_max` 为 `False` 时，通过指定当前值来设置 Decode 阶段最大并发任务数。 |
+
+具体使用：
+```
+# 通过设置 scheduler.pp_config 相关参数调整 micro batch size
+
+torchrun --nnodes 1 \
+    --nproc_per_node 8 \
+    --master_port=22525 \
+    -m chitu \
+    serve.port=21002 \
+    infer.cache_type=paged \
+    infer.pp_size=2 \
+    infer.tp_size=4 \
+    models=DeepSeek-R1 \
+    models.ckpt_dir=/data/DeepSeek-R1 \
+    infer.mla_absorb=absorb-without-precomp \
+    infer.raise_lower_bit_float_to=bfloat16 \
+    infer.max_reqs=1 \
+    scheduler.pp_config.prefill_num_tasks_divided_by_pp=False \
+    scheduler.pp_config.prefill_num_tasks=8 \
+    scheduler.pp_config.enforce_decode_num_tasks_max=True \
+    scheduler.pp_config.decode_num_tasks=8 \
+    infer.max_seq_len=4096 \
+    request.max_new_tokens=100 \
+    infer.use_cuda_graph=True
+```
 
 ## 性能测试
 

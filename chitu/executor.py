@@ -550,41 +550,33 @@ class Executor:
         # logits is [num_tasks, vocab_size]
 
         # preprocess: apply frequency penalty
-        # TODO(lijian): this is a temporary solution to get max bs
-        # use_cumulative = get_global_args().infer.max_reqs > 64
-        use_cumulative = False
-
         if tasks.should_apply_frequency_penalty:
             logits_index_list = []
             response_list = []
             response_len_list = []
-            if not use_cumulative:
-                for it, task in enumerate(tasks.tasks):
-                    if (
-                        task.req.params.frequency_penalty > 0
-                        and task.task_type == TaskType.Decode
-                        and len(task.response) > 0
-                    ):
-                        logits_index_list.append(it)
-                        response_list.append(task.response)
-                        response_len_list.append(len(task.response))
-                logits_index_list = DeviceList(
-                    logits_index_list, dtype=torch.int64, device=logits.device
-                )
-                response_len_list = DeviceList(
-                    response_len_list, dtype=torch.int64, device=logits.device
-                )
-                apply_frequency_penalty(
-                    logits,
-                    logits_index_list,
-                    response_list,
-                    response_len_list,
-                    tasks.frequency_penalties,
-                    impl="auto",
-                )
-            else:
-                assert tasks.cumulative_freq_penalties is not None
-                logits.sub_(tasks.cumulative_freq_penalties)
+            for it, task in enumerate(tasks.tasks):
+                if (
+                    task.req.params.frequency_penalty > 0
+                    and task.task_type == TaskType.Decode
+                    and len(task.response) > 0
+                ):
+                    logits_index_list.append(it)
+                    response_list.append(task.response)
+                    response_len_list.append(len(task.response))
+            logits_index_list = DeviceList(
+                logits_index_list, dtype=torch.int64, device=logits.device
+            )
+            response_len_list = DeviceList(
+                response_len_list, dtype=torch.int64, device=logits.device
+            )
+            apply_frequency_penalty(
+                logits,
+                logits_index_list,
+                response_list,
+                response_len_list,
+                tasks.frequency_penalties,
+                impl="auto",
+            )
 
         if tasks.is_all_greedy:
             tokens = torch.argmax(logits, dim=-1)
@@ -593,9 +585,6 @@ class Executor:
             tokens = top_k_top_p_min_p_sampling_from_probs_torch(
                 probs, tasks.top_ks, tasks.top_ps
             )
-
-        if use_cumulative:
-            tasks.update_cumulative_freq_penalties(tokens)
 
         return tokens
 

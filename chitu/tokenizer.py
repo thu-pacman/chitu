@@ -296,9 +296,23 @@ class TokenizerHF:
             self.bos_id = self.model.convert_tokens_to_ids("<|im_start|>")
         else:
             self.bos_id = self.model.bos_token_id
-        self.eos_id = self.model.eos_token_id
+        args = get_global_args()
+        if hasattr(args, "models") and hasattr(args.models, "eos_token_id"):
+            config_eos_tokens = args.models.eos_token_id
+        else:
+            config_eos_tokens = self.model.eos_token_id
+
+        if isinstance(config_eos_tokens, list):
+            self.stop_tokens = set(config_eos_tokens)
+            self.eos_id = config_eos_tokens[0]
+        elif isinstance(config_eos_tokens, int):
+            self.stop_tokens = set([config_eos_tokens])
+            self.eos_id = config_eos_tokens
+        else:
+            self.stop_tokens = set()
+            self.eos_id = None
+
         self.pad_id = self.model.pad_token_id
-        self.stop_tokens = self.model.eos_token_id
         self.n_words = self.model.vocab_size
 
     def encode(self, s: str, bos: bool, eos: bool) -> List[int]:
