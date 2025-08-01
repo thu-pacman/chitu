@@ -5,9 +5,9 @@ import pytest
 
 from chitu.device_list import DeviceList
 from chitu.ops import apply_frequency_penalty
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_platform_dep
 
-triton, has_triton = try_import_opt_dep("triton", "triton")
+triton, has_triton = try_import_platform_dep("triton")
 
 
 def benchmark_frequency_penalty(

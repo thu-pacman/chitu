@@ -1,10 +1,10 @@
 import torch
 
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_platform_dep
 from chitu.native_layout import Vector
 from chitu.device_type import is_muxi
 
-triton, has_triton = try_import_opt_dep("triton", "triton")
+triton, has_triton = try_import_platform_dep("triton")
 
 if has_triton:
     from chitu.ops.triton_ops import silu_and_mul_triton

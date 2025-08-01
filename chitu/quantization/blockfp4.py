@@ -15,7 +15,12 @@ from chitu.ops import (
     act_quant_deepseek_v3,
 )
 from chitu.device_type import get_device_name, is_muxi, is_nvidia
-from chitu.utils import ceil_div, try_import_opt_dep, parse_dtype
+from chitu.utils import (
+    ceil_div,
+    try_import_opt_dep,
+    try_import_platform_dep,
+    parse_dtype,
+)
 from chitu.global_vars import get_global_args
 from chitu.native_layout import (
     enable_native_layout_weight,
@@ -24,11 +29,11 @@ from chitu.native_layout import (
 )
 from chitu.distributed.parallel_state import get_ep_group
 
-chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
-triton, has_triton = try_import_opt_dep("triton", "triton")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+triton, has_triton = try_import_platform_dep("triton")
 if has_triton:
     from chitu.fused_moe import fused_experts
-torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
+torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 if has_torch_npu:
     from chitu.npu_utils import fused_experts_npu
 grouped_gemm, _ = try_import_opt_dep("grouped_gemm", "ascend_kernels")

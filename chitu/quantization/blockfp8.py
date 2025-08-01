@@ -18,13 +18,13 @@ from chitu.ops import (
     quant_einsum_shc_hdc_shd,
 )
 from chitu.device_type import get_device_name, is_muxi, is_nvidia, is_ascend
-from chitu.utils import try_import_opt_dep, parse_dtype
+from chitu.utils import try_import_opt_dep, try_import_platform_dep, parse_dtype
 from chitu.global_vars import get_global_args
 from chitu.ops import weight_dequant_soft_fp8_deepseek_v3
 from chitu.distributed.parallel_state import get_ep_group
 
-chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
-triton, has_triton = try_import_opt_dep("triton", "triton")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+triton, has_triton = try_import_platform_dep("triton")
 if has_triton:
     from chitu.fused_moe import fused_experts
 grouped_gemm, _ = try_import_opt_dep("grouped_gemm", "ascend_kernels")

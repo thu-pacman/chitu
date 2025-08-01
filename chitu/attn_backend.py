@@ -26,12 +26,13 @@ from chitu.device_type import is_muxi
 from chitu.global_vars import get_global_args
 from chitu.ops import append_to_non_paged_kv_cache, append_to_paged_kv_cache
 from chitu.static_tensor import StaticTensor
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_opt_dep, try_import_platform_dep
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
 flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
-triton, has_triton = try_import_opt_dep("triton", "triton")
+triton, has_triton = try_import_platform_dep("triton")
+torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 
 logger = getLogger(__name__)
 
@@ -50,8 +51,6 @@ class AttnBackend(abc.ABC):
     @lru_cache(maxsize=1)
     def _check_triton_available() -> bool:
         try:
-            import triton
-
             if packaging.version.parse(triton.__version__) < packaging.version.parse(
                 "3.2.0"
             ):
@@ -1357,11 +1356,6 @@ class FlashInferBackend(TritonAttnBackend):
 class NpuAttnBackend(RefAttnBackend):
     def __init__(self, *args, **kwargs):
         super().__init__()
-        self.torch_npu, self.has_torch_npu = try_import_opt_dep(
-            "torch_npu", "torch_npu"
-        )
-        if not self.has_torch_npu:
-            raise ImportError("torch_npu is not installed")
         self.local_n_heads = self.args.models.n_heads // self.args.infer.tp_size
         if hasattr(self.args.models, "n_kv_heads"):
             self.local_n_kv_heads = (
@@ -1461,7 +1455,7 @@ class NpuAttnBackend(RefAttnBackend):
 
         # q [tokens_num, head_num, head_dim]
         output = torch.empty_like(q)
-        self.torch_npu._npu_flash_attention(
+        torch_npu._npu_flash_attention(
             query=q,
             key=k,
             value=v,
@@ -1496,12 +1490,12 @@ class NpuAttnBackend(RefAttnBackend):
 
         if block_table is None:
             # skew kvcache
-            self.torch_npu.scatter_update_(k_cache, cache_seqlens, k, 1)
-            self.torch_npu.scatter_update_(v_cache, cache_seqlens, v, 1)
+            torch_npu.scatter_update_(k_cache, cache_seqlens, k, 1)
+            torch_npu.scatter_update_(v_cache, cache_seqlens, v, 1)
 
             output_ = torch.empty_like(q)
             lse_ = torch.empty(1, dtype=q.dtype, device="npu")
-            self.torch_npu.npu_fused_infer_attention_score.out(
+            torch_npu.npu_fused_infer_attention_score.out(
                 q,
                 k_cache,
                 v_cache,
@@ -1526,7 +1520,7 @@ class NpuAttnBackend(RefAttnBackend):
 
             output_ = torch.empty_like(q)
             lse_ = torch.empty(1, dtype=q.dtype, device="npu")
-            self.torch_npu.npu_fused_infer_attention_score.out(
+            torch_npu.npu_fused_infer_attention_score.out(
                 q,
                 k_cache,
                 v_cache,
@@ -1575,7 +1569,7 @@ class NpuAttnBackend(RefAttnBackend):
             dtype=query.dtype,
             device=query.device,
         )
-        self.torch_npu._npu_paged_attention_mla(
+        torch_npu._npu_paged_attention_mla(
             query=query,
             key_cache=kv_cache,
             num_kv_heads=1,

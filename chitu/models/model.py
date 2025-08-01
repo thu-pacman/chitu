@@ -31,7 +31,7 @@ from chitu.distributed.moe_token_dispatcher import get_token_dispatcher
 from chitu.utils import (
     compute_layer_dist_in_pipe,
     is_layer,
-    try_import_opt_dep,
+    try_import_platform_dep,
 )
 from chitu.quantization import (
     QuantizationRegistry,
@@ -40,9 +40,9 @@ from chitu.quantization import (
     get_backend_from_checkpoint_prefix,
 )
 
-torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
-chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
-triton, has_triton = try_import_opt_dep("triton", "triton")
+torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+triton, has_triton = try_import_platform_dep("triton")
 
 
 logger = getLogger(__name__)

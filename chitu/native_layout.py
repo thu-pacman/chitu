@@ -4,9 +4,9 @@ from dataclasses import dataclass
 import functools
 import torch
 
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_platform_dep
 
-chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 
 
 @dataclass

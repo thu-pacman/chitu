@@ -25,9 +25,9 @@ from chitu.ops.triton_ops.quant import (
     SIGNED_INT8_0x9C,
 )
 from chitu.ops.triton_ops.utils import to_triton_dtype
-from chitu.utils import ceil_div, try_import_opt_dep
+from chitu.utils import ceil_div, try_import_platform_dep
 
-chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 
 
 def moe_sum(input_tensor, output_tensor):

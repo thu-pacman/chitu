@@ -33,9 +33,56 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> Tuple[Any, bool]:
     `quant` extra of `setup.py`, then you can use this function like `try_import_opt_dep('my_quant_wxax', 'quant')`,
     and the user may install the optional dependency like `pip install chitu[quant]`.
 
+    DO NOT use this function to import platform-specific dependencies that users are unable
+    to install at their will. Use `try_import_platform_dep` instead.
+
     Args:
         pkg_name (str): The name of the Python package to import.
         opt_dep_name (str): The name of the optional dependency category in `setup.py`.
+
+    Returns:
+        [0]: The imported module if successful, or a dummy object that raises an ImportError.
+        [1]: A boolean indicating whether the import was successful.
+    """
+
+    # Keep this sync with get_requires.py
+    opt_deps = {
+        "quant",
+        "muxi_layout_kernels",
+        "muxi_w8a8_kernels",
+        "ascend_kernels",
+        "flash_attn",
+        "flashinfer",
+        "flash_mla",
+        "deep_gemm",
+        "cpu",
+    }
+    assert (
+        opt_dep_name in opt_deps
+    ), f"To chitu developers: Please don't use {opt_dep_name} as an optional dependency name, it is not listed in get_requires.py."
+
+    try:
+        return importlib.import_module(pkg_name), True
+    except ImportError:
+
+        class ReportErrorWhenUsed:
+            def __getattr__(self, item):
+                raise ImportError(
+                    f"Optional dependency '{opt_dep_name}' is not installed. "
+                    f"Please refer to README.md for installation instructions."
+                )
+
+        return ReportErrorWhenUsed(), False
+
+
+def try_import_platform_dep(pkg_name: str) -> Tuple[Any, bool]:
+    """
+    Import a dependency that may not be available on all platforms.
+
+    DO NOT use this functions to import optional dependencies that users can pick. Use `try_import_opt_dep` instead.
+
+    Args:
+        pkg_name (str): The name of the Python package to import.
 
     Returns:
         [0]: The imported module if successful, or a dummy object that raises an ImportError.
@@ -49,8 +96,8 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> Tuple[Any, bool]:
         class ReportErrorWhenUsed:
             def __getattr__(self, item):
                 raise ImportError(
-                    f"Optional dependency '{opt_dep_name}' is not installed. "
-                    f"Please refer to README.md for installation instructions."
+                    f"Chitu does not support this case because '{pkg_name}' is not present on this platform. "
+                    f"This is likely a bug of Chitu."
                 )
 
         return ReportErrorWhenUsed(), False

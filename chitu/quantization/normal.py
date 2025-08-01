@@ -15,14 +15,14 @@ from chitu.hybrid_device import CPUParameter
 from chitu.quantization.cpuinfer_singleton import get_cpu_infer
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.global_vars import get_global_args
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_platform_dep
 from chitu.distributed.parallel_state import get_ep_group
 from chitu.static_tensor import StaticTensor
 from chitu.custom_gguf import GGMLQuantizationType
 
-triton, has_triton = try_import_opt_dep("triton", "triton")
-torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
-chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
+triton, has_triton = try_import_platform_dep("triton")
+torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 if has_torch_npu:
     from chitu.npu_utils import fused_experts_npu
 if has_triton:

@@ -44,11 +44,7 @@ from chitu.tensor_parallel import (
     VocabParallelEmbedding,
 )
 from chitu.distributed.parallel_state import get_tp_size, get_ep_size
-from chitu.utils import parse_dtype, try_import_opt_dep
-
-triton, has_triton = try_import_opt_dep("triton", "triton")
-chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
-torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
+from chitu.utils import parse_dtype
 
 
 logger = getLogger(__name__)
