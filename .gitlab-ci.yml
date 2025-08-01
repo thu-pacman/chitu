@@ -23,6 +23,16 @@ sync-to-gitee:
     - public-main
   when: always
 
+sync-to-wisemodel:
+  stage: sync-to-gitee
+  tags:
+    - ${SYNC_TAGS}
+  script:
+    - sh -c "${SYNC_WISEMODEL_SHELL}"
+  only:
+    - public-main
+  when: always
+
 .build-image-template: &build-platform-template
   stage: build-and-push
   only:
