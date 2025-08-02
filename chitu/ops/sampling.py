@@ -50,7 +50,7 @@ def apply_frequency_penalty(
     logits_index: DeviceList,
     response_list: List[DeviceList],
     response_len_list: DeviceList,
-    frequency_penalty: torch.tensor,
+    frequency_penalty: torch.Tensor,
     impl="auto",
 ):
     bs = len(logits_index)
@@ -79,7 +79,7 @@ def apply_frequency_penalty(
             frequency_penalty,
         )
     elif impl == "torch":
-        for i, idx in enumerate(logits_index):
+        for i, idx in enumerate(logits_index.to_tensor()):
             logits[idx].index_add_(
                 -1,
                 response_list[i].to_tensor(),

@@ -135,14 +135,14 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
     top_ps: torch.Tensor,
-    min_ps: torch.Tensor = None,  # TODO support min_ps
+    # TODO: Support min_ps
 ):
     """A top-k, top-p and min-p sampling implementation with native pytorch operations."""
     from chitu.ops import multinomial
 
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
-    # min_p_thresholds = probs_sort[:, 0] * min_ps
+    # TODO: Support min_ps like: min_p_thresholds = probs_sort[:, 0] * min_ps
 
     top_p_mask = (probs_sum - probs_sort) > top_ps.view(-1, 1)
     top_k_mask = torch.arange(0, probs.shape[-1], device=probs.device).view(
@@ -152,7 +152,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
         probs_sort *= ~(top_p_mask | top_k_mask)
     else:
         probs_sort[top_p_mask | top_k_mask] = 0.0
-    # probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+    # TODO: Support min_ps like:  probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
     probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
     sampled_index = multinomial(probs_sort, num_samples=1, impl="sync-free")
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
@@ -227,9 +227,9 @@ class DataSaver:
         max_files: int = 5,
         save_prob: float = 0.1,
         save_dir: str = "test_data",
-        save_tensors: List[str] = None,
-        save_attrs: List[str] = None,
-        save_locals: List[str] = None,
+        save_tensors: List[str] = [],
+        save_attrs: List[str] = [],
+        save_locals: List[str] = [],
         save_return: bool = True,
     ):
         self.max_files = max_files
@@ -239,9 +239,6 @@ class DataSaver:
         self.replaceable_files: List[str] = []  # 存储可替换的文件名
         self.call_count = 0
         self.random = random.Random(42)  # 使用固定种子确保可重复性
-        self.save_tensors = save_tensors or []  # 指定要保存的张量名称列表
-        self.save_attrs = save_attrs or []  # 指定要保存的类成员变量名称列表
-        self.save_locals = save_locals or []  # 指定要保存的局部变量名称列表
         self.save_return = save_return  # 是否默认保存函数返回值
 
         # 获取当前机器编号和卡号
