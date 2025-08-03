@@ -1,8 +1,8 @@
 import torch
 
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_platform_dep
 
-triton, has_triton = try_import_opt_dep("triton", "triton")
+triton, has_triton = try_import_platform_dep("triton")
 
 if has_triton:
     from chitu.ops.triton_ops import (

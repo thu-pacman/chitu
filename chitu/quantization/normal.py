@@ -15,14 +15,14 @@ from chitu.hybrid_device import CPUParameter
 from chitu.quantization.cpuinfer_singleton import get_cpu_infer
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.global_vars import get_global_args
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_platform_dep
 from chitu.distributed.parallel_state import get_ep_group
 from chitu.static_tensor import StaticTensor
 from chitu.custom_gguf import GGMLQuantizationType
 
-triton, has_triton = try_import_opt_dep("triton", "triton")
-torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
-chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
+triton, has_triton = try_import_platform_dep("triton")
+torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 if has_torch_npu:
     from chitu.npu_utils import fused_experts_npu
 if has_triton:
@@ -98,42 +98,16 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
         # Parameters specific to this quantization
         dtype: Optional[torch.dtype] = None,
     ):
-        super().__init__()
-
-        self.ep_group = get_ep_group()
-        moe_rank = self.ep_group.rank_in_group
-        moe_world_size = self.ep_group.group_size
-        self.dim = dim
-        self.fuse_shared_experts = fuse_shared_experts
-        assert (
-            n_routed_experts % moe_world_size == 0
-        ), f"Number of experts must be divisible by moe world size (world_size={moe_world_size})"
-        self.n_shared_experts = n_shared_experts
-        self.n_fused_shared_experts = (
-            n_shared_experts if self.fuse_shared_experts else 0
+        super().__init__(
+            dim,
+            moe_inter_dim,
+            n_routed_experts,
+            n_shared_experts,
+            n_activated_experts,
+            fuse_shared_experts,
+            checkpoint_prefix,
+            merge_gate_up,
         )
-
-        self.n_routed_experts = n_routed_experts
-        self.n_local_experts = n_routed_experts // moe_world_size
-        remainder = n_routed_experts % moe_world_size
-        self.experts_start_idx = moe_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        if self.ep_group.is_last_rank:
-            self.experts_end_idx += remainder
-        if moe_world_size > 1:
-            expert_map = [-1] * self.n_routed_experts
-            expert_map[self.experts_start_idx : self.experts_end_idx] = list(
-                range(self.n_local_experts)
-            )
-            self.expert_map = torch.tensor(expert_map, dtype=torch.int32, device="cuda")
-        else:
-            self.expert_map = None
-
-        self.group_size = (
-            self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts
-        )
-        self.checkpoint_prefix = checkpoint_prefix
-        self.merge_gate_up = merge_gate_up
 
         if not self.merge_gate_up:
             self.gate_proj_weight = torch.nn.Parameter(

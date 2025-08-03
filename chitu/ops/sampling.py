@@ -2,12 +2,12 @@ from typing import Optional, List
 
 import torch
 
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_platform_dep
 from chitu.device_list import DeviceList
 
-chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
-torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
-triton, has_triton = try_import_opt_dep("triton", "triton")
+triton, has_triton = try_import_platform_dep("triton")
+torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 
 if has_triton:
     from chitu.ops.triton_ops import apply_frequency_penalty_triton
@@ -50,7 +50,7 @@ def apply_frequency_penalty(
     logits_index: DeviceList,
     response_list: List[DeviceList],
     response_len_list: DeviceList,
-    frequency_penalty: torch.tensor,
+    frequency_penalty: torch.Tensor,
     impl="auto",
 ):
     bs = len(logits_index)
@@ -79,7 +79,7 @@ def apply_frequency_penalty(
             frequency_penalty,
         )
     elif impl == "torch":
-        for i, idx in enumerate(logits_index):
+        for i, idx in enumerate(logits_index.to_tensor()):
             logits[idx].index_add_(
                 -1,
                 response_list[i].to_tensor(),

@@ -33,9 +33,56 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> Tuple[Any, bool]:
     `quant` extra of `setup.py`, then you can use this function like `try_import_opt_dep('my_quant_wxax', 'quant')`,
     and the user may install the optional dependency like `pip install chitu[quant]`.
 
+    DO NOT use this function to import platform-specific dependencies that users are unable
+    to install at their will. Use `try_import_platform_dep` instead.
+
     Args:
         pkg_name (str): The name of the Python package to import.
         opt_dep_name (str): The name of the optional dependency category in `setup.py`.
+
+    Returns:
+        [0]: The imported module if successful, or a dummy object that raises an ImportError.
+        [1]: A boolean indicating whether the import was successful.
+    """
+
+    # Keep this sync with get_requires.py
+    opt_deps = {
+        "quant",
+        "muxi_layout_kernels",
+        "muxi_w8a8_kernels",
+        "ascend_kernels",
+        "flash_attn",
+        "flashinfer",
+        "flash_mla",
+        "deep_gemm",
+        "cpu",
+    }
+    assert (
+        opt_dep_name in opt_deps
+    ), f"To chitu developers: Please don't use {opt_dep_name} as an optional dependency name, it is not listed in get_requires.py."
+
+    try:
+        return importlib.import_module(pkg_name), True
+    except ImportError:
+
+        class ReportErrorWhenUsed:
+            def __getattr__(self, item):
+                raise ImportError(
+                    f"Optional dependency '{opt_dep_name}' is not installed. "
+                    f"Please refer to README.md for installation instructions."
+                )
+
+        return ReportErrorWhenUsed(), False
+
+
+def try_import_platform_dep(pkg_name: str) -> Tuple[Any, bool]:
+    """
+    Import a dependency that may not be available on all platforms.
+
+    DO NOT use this functions to import optional dependencies that users can pick. Use `try_import_opt_dep` instead.
+
+    Args:
+        pkg_name (str): The name of the Python package to import.
 
     Returns:
         [0]: The imported module if successful, or a dummy object that raises an ImportError.
@@ -49,8 +96,8 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> Tuple[Any, bool]:
         class ReportErrorWhenUsed:
             def __getattr__(self, item):
                 raise ImportError(
-                    f"Optional dependency '{opt_dep_name}' is not installed. "
-                    f"Please refer to README.md for installation instructions."
+                    f"Chitu does not support this case because '{pkg_name}' is not present on this platform. "
+                    f"This is likely a bug of Chitu."
                 )
 
         return ReportErrorWhenUsed(), False
@@ -88,14 +135,14 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
     top_ps: torch.Tensor,
-    min_ps: torch.Tensor = None,  # TODO support min_ps
+    # TODO: Support min_ps
 ):
     """A top-k, top-p and min-p sampling implementation with native pytorch operations."""
     from chitu.ops import multinomial
 
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
-    # min_p_thresholds = probs_sort[:, 0] * min_ps
+    # TODO: Support min_ps like: min_p_thresholds = probs_sort[:, 0] * min_ps
 
     top_p_mask = (probs_sum - probs_sort) > top_ps.view(-1, 1)
     top_k_mask = torch.arange(0, probs.shape[-1], device=probs.device).view(
@@ -105,7 +152,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
         probs_sort *= ~(top_p_mask | top_k_mask)
     else:
         probs_sort[top_p_mask | top_k_mask] = 0.0
-    # probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+    # TODO: Support min_ps like:  probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
     probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
     sampled_index = multinomial(probs_sort, num_samples=1, impl="sync-free")
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
@@ -180,9 +227,9 @@ class DataSaver:
         max_files: int = 5,
         save_prob: float = 0.1,
         save_dir: str = "test_data",
-        save_tensors: List[str] = None,
-        save_attrs: List[str] = None,
-        save_locals: List[str] = None,
+        save_tensors: List[str] = [],
+        save_attrs: List[str] = [],
+        save_locals: List[str] = [],
         save_return: bool = True,
     ):
         self.max_files = max_files
@@ -192,9 +239,6 @@ class DataSaver:
         self.replaceable_files: List[str] = []  # 存储可替换的文件名
         self.call_count = 0
         self.random = random.Random(42)  # 使用固定种子确保可重复性
-        self.save_tensors = save_tensors or []  # 指定要保存的张量名称列表
-        self.save_attrs = save_attrs or []  # 指定要保存的类成员变量名称列表
-        self.save_locals = save_locals or []  # 指定要保存的局部变量名称列表
         self.save_return = save_return  # 是否默认保存函数返回值
 
         # 获取当前机器编号和卡号

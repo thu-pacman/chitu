@@ -24,7 +24,7 @@ class LLMInt8Linear(QuantizedLinearBase):
         # Parameters specific to this quantization
         has_fp16_weights: bool = False,
         threshold: float = 6.0,
-    ) -> torch.nn.Module:
+    ):
 
         super().__init__()
 

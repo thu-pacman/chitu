@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 import functools
 
 import torch
@@ -33,7 +33,7 @@ class StaticTensor:
         tensor: Optional[torch.Tensor] = None,
         *,
         max_nelem: Optional[int] = None,
-        dtype: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
         pin_memory: Optional[bool] = None,
     ):
@@ -59,7 +59,7 @@ class StaticTensor:
             max_nelem, dtype=dtype, device=device, pin_memory=pin_memory
         )
         self._cur_nelem = 0
-        self._cur_shape = (0,)
+        self._cur_shape: Tuple[int] | torch.Size = (0,)
 
         if tensor is not None:
             self.set(tensor)

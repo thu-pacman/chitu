@@ -109,7 +109,6 @@ class Tokenizer:
                 f"<|reserved_special_token_{i}|>"
                 for i in range(5, self.num_reserved_special_tokens - 5)
             ]
-        self.tokens_cache = []
         self.special_tokens = {
             token: num_base_tokens + i for i, token in enumerate(special_tokens)
         }
@@ -285,7 +284,6 @@ class TokenizerHF:
         force_full_seq_decode: bool = False,
     ):
         self.force_full_seq_decode = force_full_seq_decode
-        self.tokens_cache = []
         self.model = AutoTokenizer.from_pretrained(
             path, trust_remote_code=trust_remote_code
         )

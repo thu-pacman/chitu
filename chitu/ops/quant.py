@@ -2,11 +2,11 @@ from typing import Tuple
 
 import torch
 
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_platform_dep
 from chitu.native_layout import Packed4BitWeightAlongK
 
-chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
-triton, has_triton = try_import_opt_dep("triton", "triton")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+triton, has_triton = try_import_platform_dep("triton")
 if has_triton:
     from chitu.ops.triton_ops import (
         quant_einsum_shc_hdc_shd_triton,

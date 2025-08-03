@@ -2,9 +2,9 @@ from typing import Optional
 
 import torch
 
-from chitu.utils import try_import_opt_dep, is_power_of_two
+from chitu.utils import try_import_opt_dep, try_import_platform_dep, is_power_of_two
 
-chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
 )

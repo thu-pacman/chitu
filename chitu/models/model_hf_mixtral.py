@@ -153,8 +153,8 @@ class TransformerHFMixtral(TransformerHFLlama):
     def load_state_dict_parallel(
         self,
         state_dict: Mapping[str, Any],
-        skip_preprocess: bool = False,
         *args,
+        skip_preprocess: bool = False,
         **kwargs,
     ):
         if not skip_preprocess:
@@ -169,5 +169,5 @@ class TransformerHFMixtral(TransformerHFLlama):
             state_dict = {map_mixtral_key(k): v for k, v in state_dict.items()}
 
         super().load_state_dict_parallel(
-            state_dict, skip_preprocess=skip_preprocess, *args, **kwargs
+            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )

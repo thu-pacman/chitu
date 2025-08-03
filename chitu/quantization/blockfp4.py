@@ -15,20 +15,24 @@ from chitu.ops import (
     act_quant_deepseek_v3,
 )
 from chitu.device_type import get_device_name, is_muxi, is_nvidia
-from chitu.utils import ceil_div, try_import_opt_dep, parse_dtype
+from chitu.utils import (
+    ceil_div,
+    try_import_opt_dep,
+    try_import_platform_dep,
+    parse_dtype,
+)
 from chitu.global_vars import get_global_args
 from chitu.native_layout import (
     enable_native_layout_weight,
     Packed4BitWeightAlongK,
     Packed4BitWeightNPUNative,
 )
-from chitu.distributed.parallel_state import get_ep_group
 
-chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
-triton, has_triton = try_import_opt_dep("triton", "triton")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+triton, has_triton = try_import_platform_dep("triton")
 if has_triton:
     from chitu.fused_moe import fused_experts
-torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
+torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 if has_torch_npu:
     from chitu.npu_utils import fused_experts_npu
 grouped_gemm, _ = try_import_opt_dep("grouped_gemm", "ascend_kernels")
@@ -367,42 +371,16 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
         Args:
             args (ModelArgs): Model arguments containing MoE parameters.
         """
-        super().__init__()
-
-        self.dim = dim
-        self.fuse_shared_experts = fuse_shared_experts
-        self.ep_group = get_ep_group()
-        moe_rank = self.ep_group.rank_in_group
-        moe_world_size = self.ep_group.group_size
-        assert (
-            n_routed_experts % moe_world_size == 0
-        ), f"Number of experts must be divisible by moe world size (world_size={moe_world_size})"
-        self.n_shared_experts = n_shared_experts
-        self.n_fused_shared_experts = (
-            n_shared_experts if self.fuse_shared_experts else 0
+        super().__init__(
+            dim,
+            moe_inter_dim,
+            n_routed_experts,
+            n_shared_experts,
+            n_activated_experts,
+            fuse_shared_experts,
+            checkpoint_prefix,
+            merge_gate_up,
         )
-
-        self.n_routed_experts = n_routed_experts
-        self.n_local_experts = n_routed_experts // moe_world_size
-        remainder = n_routed_experts % moe_world_size
-        self.experts_start_idx = moe_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        if self.ep_group.is_last_rank:
-            self.experts_end_idx += remainder
-        if moe_world_size > 1:
-            expert_map = [-1] * self.n_routed_experts
-            expert_map[self.experts_start_idx : self.experts_end_idx] = list(
-                range(self.n_local_experts)
-            )
-            self.expert_map = torch.tensor(expert_map, dtype=torch.int32, device="cuda")
-        else:
-            self.expert_map = None
-
-        self.group_size = (
-            self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts
-        )
-        self.checkpoint_prefix = checkpoint_prefix
-        self.merge_gate_up = merge_gate_up
 
         quant_scale_stride = 16
 

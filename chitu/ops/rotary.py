@@ -2,11 +2,11 @@ from typing import Optional, Tuple
 
 import torch
 
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_platform_dep
 
-triton, has_triton = try_import_opt_dep("triton", "triton")
-torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
-chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
+triton, has_triton = try_import_platform_dep("triton")
+torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 
 if has_triton:
     from chitu.ops.triton_ops import apply_rotary_pos_emb_triton

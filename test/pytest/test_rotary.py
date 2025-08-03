@@ -170,29 +170,13 @@ def benchmark(batch_size, n_local_heads, head_dim, provider, rotary_type="interl
     cos = complex_freqs.real.contiguous()
     sin = complex_freqs.imag.contiguous()
 
-    if provider == "torch":
-        ms = triton.testing.do_bench(
-            lambda: apply_rotary_pos_emb(
-                q, k, cos, sin, rotary_type=rotary_type, impl="torch"
-            )
+    ms = triton.testing.do_bench(
+        lambda: apply_rotary_pos_emb(
+            q, k, cos, sin, rotary_type=rotary_type, impl=provider
         )
-    elif provider == "triton":
-        ms = triton.testing.do_bench(
-            lambda: apply_rotary_pos_emb(
-                q, k, cos, sin, rotary_type=rotary_type, impl="triton"
-            )
-        )
-    elif provider == "cuda":
-        ms = triton.testing.do_bench(
-            lambda: apply_rotary_pos_emb(
-                q, k, cos, sin, rotary_type=rotary_type, impl="cuda"
-            )
-        )
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
+    )
     return ms * 1000
 
 
 if __name__ == "__main__":
-
     benchmark.run(show_plots=True, print_data=True)

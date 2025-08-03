@@ -31,7 +31,7 @@ class W8A8Linear(QuantizedLinearBase):
         has_bias: bool = True,
         ############################################
         # No parameters specific to this quantization
-    ) -> torch.nn.Module:
+    ):
 
         super().__init__()
 

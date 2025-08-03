@@ -44,11 +44,7 @@ from chitu.tensor_parallel import (
     VocabParallelEmbedding,
 )
 from chitu.distributed.parallel_state import get_tp_size, get_ep_size
-from chitu.utils import parse_dtype, try_import_opt_dep
-
-triton, has_triton = try_import_opt_dep("triton", "triton")
-chitu_backend, has_chitu_backend = try_import_opt_dep("chitu_backend", "chitu_backend")
-torch_npu, has_torch_npu = try_import_opt_dep("torch_npu", "torch_npu")
+from chitu.utils import parse_dtype
 
 
 logger = getLogger(__name__)
@@ -1316,9 +1312,9 @@ class TransformerDeepSeekV3(Transformer):
     def load_state_dict_parallel(
         self,
         state_dict: Mapping[str, Any],
+        *args,
         skip_preprocess: bool = False,
         replace=True,
-        *args,
         **kwargs,
     ):
         if not skip_preprocess and replace:
@@ -1332,15 +1328,15 @@ class TransformerDeepSeekV3(Transformer):
             state_dict = new_state_dict
 
         super().load_state_dict_parallel(
-            state_dict, skip_preprocess=skip_preprocess, *args, **kwargs
+            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )
 
     @override
     def load_state_dict(
         self,
         state_dict: Mapping[str, Any],
-        skip_preprocess: bool = False,
         *args,
+        skip_preprocess: bool = False,
         **kwargs,
     ):
         if not skip_preprocess:
@@ -1354,7 +1350,7 @@ class TransformerDeepSeekV3(Transformer):
                 )
 
         super().load_state_dict(
-            state_dict, skip_preprocess=skip_preprocess, *args, **kwargs
+            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )
 
     @override

@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from logging import getLogger
@@ -10,32 +10,29 @@ class CommGroup:
     def __init__(self, rank_lists: List[List[int]], global_rank: int, local_rank: int):
         self.global_rank = global_rank
         self.local_rank = local_rank
-        self.cpu_group = None
-        self.gpu_group = None
-        self.rank_in_group = None
-        self.group_size = None
-        self.rank_list = None
 
         self.device = torch.device(f"cuda:{local_rank}")
 
+        cpu_groups = []
+        gpu_groups = []
+        contains_this_rank = []
         for rank_list in rank_lists:
             gpu_group = torch.distributed.new_group(rank_list)
             cpu_group = torch.distributed.new_group(rank_list, backend="gloo")
             logger.info(
                 f"[CommGroup] [Rank {global_rank}] create gpu_group: {rank_list}, cpu_group: {rank_list}"
             )
+            cpu_groups.append(cpu_group)
+            gpu_groups.append(gpu_group)
+            contains_this_rank.append(global_rank in rank_list)
 
-            if global_rank in rank_list:
-                self.cpu_group = cpu_group
-                self.gpu_group = gpu_group
-                self.rank_in_group = rank_list.index(global_rank)
-                self.group_size = len(rank_list)
-                self.rank_list = rank_list
-
-        assert self.cpu_group is not None
-        assert self.gpu_group is not None
-        assert self.rank_in_group is not None
-        assert self.group_size is not None
+        assert contains_this_rank.count(True) == 1
+        this_rank_idx = contains_this_rank.index(True)
+        self.cpu_group = cpu_groups[this_rank_idx]
+        self.gpu_group = gpu_groups[this_rank_idx]
+        self.rank_list = rank_lists[this_rank_idx]
+        self.rank_in_group = self.rank_list.index(global_rank)
+        self.group_size = len(self.rank_list)
 
     @property
     def next_rank(self):
@@ -62,7 +59,7 @@ class CommGroup:
     def all_reduce(
         self,
         tensor: torch.Tensor,
-        op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
+        op: torch.distributed.ReduceOp.RedOpType = torch.distributed.ReduceOp.SUM,
     ):
         torch.distributed.all_reduce(tensor, group=self.gpu_group, op=op)
 
@@ -74,7 +71,7 @@ class CommGroup:
         tensor: torch.Tensor,
         scatter_list: Optional[List[torch.Tensor]] = None,
         src: int = 0,
-        group: torch.distributed.ProcessGroup = None,
+        group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         torch.distributed.scatter(tensor, scatter_list, src=src, group=group)
 
@@ -98,13 +95,13 @@ class CommGroup:
         self,
         input: torch.Tensor,
         cum_size: List[int],
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, List[int] | torch.Size]:
         # For allgather v, we cannot assign output tensor beforehand
         # because we don't known the output shape.
         world_size = self.group_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
-            return input, [input.size()]
+            return input, input.size()
 
         all_input_size_list_cpu = cum_size
         per_input_size = []
@@ -136,6 +133,7 @@ class CommGroup:
         src: int = 0,
     ):
         if self.global_rank == src:
+            assert scatter_list is not None
             for idx, send_tensor in enumerate(scatter_list):
                 if self.rank_list[idx] == self.global_rank:
                     tensor.copy_(send_tensor)
@@ -151,6 +149,7 @@ class CommGroup:
         dst: int = 0,
     ):
         if self.global_rank == dst:
+            assert gather_list is not None
             for idx, recv_tensor in enumerate(gather_list):
                 if self.rank_list[idx] == self.global_rank:
                     recv_tensor.copy_(tensor)
