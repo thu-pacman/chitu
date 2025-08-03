@@ -21,7 +21,6 @@ from chitu.device_type import get_device_name, is_muxi, is_nvidia, is_ascend
 from chitu.utils import try_import_opt_dep, try_import_platform_dep, parse_dtype
 from chitu.global_vars import get_global_args
 from chitu.ops import weight_dequant_soft_fp8_deepseek_v3
-from chitu.distributed.parallel_state import get_ep_group
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
@@ -87,9 +86,9 @@ def linear_block_fp8_npu(
 def linear_block_fp8(
     x: torch.Tensor,
     weight: torch.Tensor,
-    weight_scale: Optional[torch.Tensor] = None,
+    weight_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    block_size: Optional[int] = 128,
+    block_size: int = 128,
 ) -> torch.Tensor:
     """
     Applies a linear transformation to the incoming data: y = xA^T + b.
@@ -239,42 +238,16 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         Args:
             args (ModelArgs): Model arguments containing MoE parameters.
         """
-        super().__init__()
-
-        self.dim = dim
-        self.ep_group = get_ep_group()
-        moe_rank = self.ep_group.rank_in_group
-        moe_world_size = self.ep_group.group_size
-        self.fuse_shared_experts = fuse_shared_experts
-        assert (
-            n_routed_experts % moe_world_size == 0
-        ), f"Number of experts must be divisible by moe world size (world_size={moe_world_size})"
-        self.n_shared_experts = n_shared_experts
-        self.n_fused_shared_experts = (
-            n_shared_experts if self.fuse_shared_experts else 0
+        super().__init__(
+            dim,
+            moe_inter_dim,
+            n_routed_experts,
+            n_shared_experts,
+            n_activated_experts,
+            fuse_shared_experts,
+            checkpoint_prefix,
+            merge_gate_up,
         )
-
-        self.n_routed_experts = n_routed_experts
-        self.n_local_experts = n_routed_experts // moe_world_size
-        remainder = n_routed_experts % moe_world_size
-        self.experts_start_idx = moe_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        if self.ep_group.is_last_rank:
-            self.experts_end_idx += remainder
-        if moe_world_size > 1:
-            expert_map = [-1] * self.n_routed_experts
-            expert_map[self.experts_start_idx : self.experts_end_idx] = list(
-                range(self.n_local_experts)
-            )
-            self.expert_map = torch.tensor(expert_map, dtype=torch.int32, device="cuda")
-        else:
-            self.expert_map = None
-
-        self.group_size = (
-            self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts
-        )
-        self.checkpoint_prefix = checkpoint_prefix
-        self.merge_gate_up = merge_gate_up
 
         # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
         # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.

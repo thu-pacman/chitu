@@ -28,7 +28,9 @@ class NativeLayoutTensor:
     """
 
     @classmethod
-    def convert_from(cls, plain_tensor: Any) -> "NativeLayoutTensor":
+    def convert_from(
+        cls, plain_tensor: Any, *subclass_args, **subclass_kwargs
+    ) -> "NativeLayoutTensor":
         """
         Create a NativeLayoutTensor from a tensor in a plain layout or other layouts.
 

@@ -1,5 +1,5 @@
 import os
-from typing import Optional
+from typing import Optional, Dict, Tuple, Any
 
 import torch
 from logging import getLogger
@@ -17,7 +17,7 @@ _PP_GROUP: Optional[CommGroup] = None
 _DP_GROUP: Optional[CommGroup] = None
 _EP_GROUP: Optional[CommGroup] = None
 
-_PP_PAIR_GROUP_DICT = {}  # Compatible with NPU platforms
+_PP_PAIR_GROUP_DICT: Dict[Tuple[int, int], Any] = {}  # Compatible with NPU platforms
 
 
 def get_global_var(name):
@@ -181,11 +181,10 @@ def initialize_ep_group(ep_size: int, rank: int, local_rank: int, world_size: in
 
 
 def initialize_parallel_groups(
-    tp_size: int, pp_size: int, dp_size: int = 1, ep_size: int = 1, ep_mode: str = None
+    tp_size: int, pp_size: int, dp_size: int = 1, ep_size: int = 1
 ):
     logger.info(
-        f"initialize_parallel_groups: {tp_size=}, {pp_size=}, {dp_size=} "
-        f"{ep_size=} {ep_mode=}"
+        f"initialize_parallel_groups: {tp_size=}, {pp_size=}, {dp_size=} {ep_size=}"
     )
     rank = torch.distributed.get_rank()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))

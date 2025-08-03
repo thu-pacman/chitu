@@ -22,9 +22,7 @@ def get_quant_from_checkpoint_prefix(checkpoint_prefix: str, rules={}) -> Option
     return None
 
 
-def get_backend_from_checkpoint_prefix(
-    checkpoint_prefix: str, rules={}
-) -> Optional[str]:
+def get_backend_from_checkpoint_prefix(checkpoint_prefix: str, rules={}) -> str:
     if not rules:
         rules = get_global_args().models.backend_config.rules
     for rule in rules:

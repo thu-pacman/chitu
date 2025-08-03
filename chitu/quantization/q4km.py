@@ -6,7 +6,6 @@ from chitu.quantization.base import QuantizedMoeExpertsBase
 from chitu.global_vars import get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.hybrid_device import CPUParameter
-from chitu.distributed.parallel_state import get_ep_group
 from chitu.quantization.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import GGMLQuantizationType
 
@@ -51,25 +50,20 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
         Args:
             args (ModelArgs): Model arguments containing MoE parameters.
         """
-        super().__init__()
-        self.merge_gate_up = merge_gate_up
-        self.moe_inter_dim = moe_inter_dim
-        self.dim = dim
+        super().__init__(
+            dim,
+            moe_inter_dim,
+            n_routed_experts,
+            n_shared_experts,
+            n_activated_experts,
+            fuse_shared_experts,
+            checkpoint_prefix,
+            merge_gate_up,
+        )
 
-        self.ep_group = get_ep_group()
-        moe_rank = self.ep_group.rank_in_group
-        moe_world_size = self.ep_group.group_size
-        self.rank = moe_rank
-
-        moe_world_size = 1
+        self.rank = self.ep_group.rank_in_group
         self.max_batch_size = get_global_args().infer.max_reqs
-        assert (
-            n_routed_experts % moe_world_size == 0
-        ), f"Number of experts must be divisible by world size (world_size={moe_world_size})"
-        self.n_shared_experts = n_shared_experts
-        self.n_routed_experts = n_routed_experts
-        self.n_local_experts = n_routed_experts // moe_world_size
-        self.n_activated_experts = n_activated_experts
+        self.n_local_experts = n_routed_experts
 
         if self.rank == 0:
 

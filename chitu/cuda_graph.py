@@ -1,4 +1,4 @@
-from typing import Callable, Sequence, Mapping, Any, Optional
+from typing import Callable, Sequence, Mapping, Any, Optional, Dict
 import functools
 import torch
 
@@ -11,7 +11,7 @@ def make_dispatched_graphed_callables(
     *,
     args_max_nelem: Sequence[int],
     kwargs_max_nelem: Mapping[str, int],
-    output_max_nelem_callback: Callable[[int], int],
+    output_max_nelem_callback: Callable[[Any, int], int],
     before_replay_callback: Optional[Callable[[Any], None]] = None,
     enable: bool = True,
 ) -> Callable:
@@ -51,7 +51,7 @@ def make_dispatched_graphed_callables(
         graph_dict: Dict[Any, torch.cuda.CUDAGraph] = {}
         cuda_graph_pool = None
 
-        args_static_tensors: Optional[List[StaticTensor]] = None
+        args_static_tensors: Optional[Sequence[StaticTensor]] = None
         kwargs_static_tensors: Optional[Dict[str, StaticTensor]] = None
         output_static_tensor: Optional[StaticTensor] = None
 
@@ -141,6 +141,9 @@ def make_dispatched_graphed_callables(
                     cuda_graph_pool = graph_dict[key].pool()
 
             else:
+                assert args_static_tensors is not None
+                assert kwargs_static_tensors is not None
+                assert output_static_tensor is not None
                 for static_tensor, arg in zip(args_static_tensors, args):
                     static_tensor.set(arg)
                 for k in kwargs:

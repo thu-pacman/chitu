@@ -738,8 +738,8 @@ class TransformerHFLlama(Transformer):
     def load_state_dict_parallel(
         self,
         state_dict: Mapping[str, Any],
-        skip_preprocess: bool = False,
         *args,
+        skip_preprocess: bool = False,
         **kwargs,
     ):
         if not skip_preprocess:
@@ -796,7 +796,7 @@ class TransformerHFLlama(Transformer):
             )
 
         super().load_state_dict_parallel(
-            state_dict, skip_preprocess=skip_preprocess, *args, **kwargs
+            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )
 
     def _init_pre_layers(self):

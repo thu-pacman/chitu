@@ -1,12 +1,4 @@
-from typing import (
-    Any,
-    Dict,
-    List,
-    Mapping,
-    Optional,
-    Set,
-    Type,
-)
+from typing import Any, Dict, List, Mapping, Optional, Set, Type, Callable
 import functools
 import re
 
@@ -29,9 +21,15 @@ class QuantizationRegistry:
     Registry of available quantization methods and their implementations.
     """
 
-    _linear_registry: Dict[str, Dict[str, Type[QuantizedLinearBase]]] = {}
-    _moe_experts_registry: Dict[str, Dict[str, Type[QuantizedMoeExpertsBase]]] = {}
-    _absorb_gemm_registry: Dict[str, Dict[str, Type[QuantizedAbsorbGemmBase]]] = {}
+    # NOTE: The inner dict's key can either be a `str` typed quantization method
+    # nane, or `None` for no quantization (a.k.a. "normal" quantization)
+    _linear_registry: Dict[str, Dict[str | None, Type[QuantizedLinearBase]]] = {}
+    _moe_experts_registry: Dict[
+        str, Dict[str | None, Type[QuantizedMoeExpertsBase]]
+    ] = {}
+    _absorb_gemm_registry: Dict[
+        str, Dict[str | None, Type[QuantizedAbsorbGemmBase]]
+    ] = {}
 
     _allowed_quant_for_merge_gate_up: List = [
         "blockfp8",
@@ -63,30 +61,15 @@ class QuantizationRegistry:
         return quant in QuantizationRegistry._allowed_quant_for_merge_qkv
 
     @classmethod
-    def get_all_methods(cls) -> Set[str]:
-        """
-        Get all registered quantization methods.cinfer
-
-        Returns:
-            Set of quantization method names
-        """
-        ret = (
-            set(cls._linear_registry.keys())
-            .union(set(cls._moe_experts_registry.keys()))
-            .union(set(cls._absorb_gemm_registry.keys()))
-        )
-        ret.remove(None)
-        return ret
-
-    @classmethod
     def _get_quantized_class(
         cls,
         class_type: str,
         method: Optional[str],
         *,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-        backend_type: Optional[str] = "default",
-    ):
+        backend_type: str = "default",
+    ) -> Type:
+        registry: Dict[str, Dict[str | None, Type]]
         if class_type == "linear":
             registry = cls._linear_registry
         elif class_type == "moe_experts":
@@ -95,13 +78,14 @@ class QuantizationRegistry:
             registry = cls._absorb_gemm_registry
         else:
             raise ValueError(f"Unknown class type: {class_type}")
-        backend_impls = registry.get(backend_type)
-        if not backend_impls:
-            raise ValueError(f"Unknown backend impls: {backend_type}")
 
-        impl = backend_impls.get(method)
-        if impl is None:
+        if backend_type not in registry:
+            raise ValueError(f"Unknown backend impls: {backend_type}")
+        backend_impls = registry[backend_type]
+
+        if method not in backend_impls:
             raise ValueError(f"Unknown quantization method in `method`: {method}")
+        impl: Type = backend_impls[method]
 
         for key in quant_kwargs:
             if key not in backend_impls:
@@ -125,7 +109,7 @@ class QuantizationRegistry:
         method: Optional[str],
         *,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-    ) -> Optional[Type[QuantizedLinearBase]]:
+    ) -> Type[QuantizedLinearBase]:
         """
         Get the quantized linear implementation for the specified method.
 
@@ -149,7 +133,7 @@ class QuantizationRegistry:
         method: Optional[str],
         *,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-    ) -> Optional[Type[QuantizedMoeExpertsBase]]:
+    ) -> Type[QuantizedMoeExpertsBase]:
         """
         Get the quantized MoeExperts implementation for the specified method.
 
@@ -173,7 +157,7 @@ class QuantizationRegistry:
         method: Optional[str],
         *,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-    ) -> Optional[Type[QuantizedAbsorbGemmBase]]:
+    ) -> Type[QuantizedAbsorbGemmBase]:
         """
         Get the quantized AbsorbGemm implementation for the specified method.
 
@@ -198,7 +182,7 @@ class QuantizationRegistry:
         *,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
         checkpoint_prefix="",
-    ) -> Optional[Type[QuantizedLinearBase]]:
+    ) -> Type:
         args = get_global_args()
         quant_cfg = getattr(args.models, "quant_config", None)
         if quant_cfg is None:
@@ -245,7 +229,7 @@ class QuantizationRegistry:
         *,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
         checkpoint_prefix="",
-    ) -> Optional[Type[QuantizedLinearBase]]:
+    ) -> Type[QuantizedLinearBase]:
         return cls._get_quantized_class_from_global_args(
             "linear",
             quant_kwargs=quant_kwargs,
@@ -258,7 +242,7 @@ class QuantizationRegistry:
         *,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
         checkpoint_prefix="",
-    ) -> Optional[Type[QuantizedMoeExpertsBase]]:
+    ) -> Type[QuantizedMoeExpertsBase]:
         return cls._get_quantized_class_from_global_args(
             "moe_experts",
             quant_kwargs=quant_kwargs,
@@ -271,7 +255,7 @@ class QuantizationRegistry:
         *,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
         checkpoint_prefix="",
-    ) -> Optional[Type[QuantizedAbsorbGemmBase]]:
+    ) -> Type[QuantizedAbsorbGemmBase]:
         return cls._get_quantized_class_from_global_args(
             "absorb_gemm",
             quant_kwargs=quant_kwargs,
@@ -284,7 +268,7 @@ class QuantizationRegistry:
         name: Optional[str],
         implementation: Optional[Type[QuantizedLinearBase]] = None,
         backend_type: str = "default",
-    ) -> None:
+    ) -> Callable | Type[QuantizedLinearBase]:
         """
         Register a new quantization Linear layer.
 
@@ -308,7 +292,7 @@ class QuantizationRegistry:
         name: Optional[str],
         implementation: Optional[Type[QuantizedMoeExpertsBase]] = None,
         backend_type: str = "default",
-    ) -> None:
+    ) -> Callable | Type[QuantizedMoeExpertsBase]:
         """
         Register a new MoeExperts layer.
 
@@ -332,7 +316,7 @@ class QuantizationRegistry:
         name: Optional[str],
         implementation: Optional[Type[QuantizedAbsorbGemmBase]] = None,
         backend_type: str = "default",
-    ) -> None:
+    ) -> Callable | Type[QuantizedAbsorbGemmBase]:
         """
         Register a new quantization AbsorbGemm layer.
 

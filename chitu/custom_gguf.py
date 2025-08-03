@@ -14,7 +14,7 @@ import warnings
 import numpy as np
 import re
 import numpy.typing as npt
-from typing import Sequence, Tuple, Dict
+from typing import Sequence, Tuple, Dict, Any, Callable
 import os
 from enum import IntEnum
 import torch
@@ -181,9 +181,8 @@ class GGUFLoader:
         self.tensor_info = {}
         self.gguf_path = gguf_path
         self.tensor_file_map = {}
-        self.file_data_map = {}
+        self.file_data_map: Dict[str, Any] = {}
         self.gguf_file_meta = {}
-        self.tensor_device_map = {}
 
         # I know this is ugly, but I don't want to change the original code too much
         # TODO: merge gguf load and other loads.
@@ -1061,7 +1060,7 @@ def dequantize_bf16_gpu(data, device, target_dtype=torch.get_default_dtype()):
     return res_gpu
 
 
-GGML_DEQUANTIZE = {
+GGML_DEQUANTIZE: Dict[str, Callable] = {
     "F32": dequantize_f32,
     "F16": dequantize_f16,
     "BF16": dequantize_f16,
@@ -1076,7 +1075,7 @@ GGML_DEQUANTIZE = {
     "IQ4_XS": dequantize_iq4_xs,
 }
 
-GGML_DEQUANTIZE_GPU = {
+GGML_DEQUANTIZE_GPU: Dict[str, Callable] = {
     "F32": dequantize_f32_gpu,
     "F16": dequantize_f16_gpu,
     "BF16": dequantize_bf16_gpu,

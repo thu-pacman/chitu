@@ -130,9 +130,9 @@ class TransformerHFGlm4Moe(TransformerHFLlama):
     def load_state_dict_parallel(
         self,
         state_dict: Mapping[str, Any],
+        *args,
         skip_preprocess: bool = False,
         replace=True,
-        *args,
         **kwargs,
     ):
         if not skip_preprocess and replace:
@@ -144,5 +144,5 @@ class TransformerHFGlm4Moe(TransformerHFLlama):
             state_dict = new_state_dict
 
         super().load_state_dict_parallel(
-            state_dict, skip_preprocess=skip_preprocess, *args, **kwargs
+            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )

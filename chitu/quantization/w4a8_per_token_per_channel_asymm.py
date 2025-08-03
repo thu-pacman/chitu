@@ -27,7 +27,7 @@ class W4A8PerTokenPerChannelAsymmLinear(QuantizedLinearBase):
         has_bias: bool = True,
         ############################################
         # No parameters specific to this quantization
-    ) -> torch.nn.Module:
+    ):
 
         super().__init__()
 

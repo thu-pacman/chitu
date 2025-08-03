@@ -672,8 +672,8 @@ class Transformer(nn.Module):
     def load_state_dict_parallel(
         self,
         state_dict: Mapping[str, Any],
-        skip_preprocess: bool = False,
         *args,
+        skip_preprocess: bool = False,
         **kwargs,
     ):
         if not skip_preprocess:
@@ -700,14 +700,14 @@ class Transformer(nn.Module):
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )
         self.load_state_dict(
-            state_dict, skip_preprocess=skip_preprocess, *args, **kwargs
+            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )
 
     def load_state_dict(
         self,
         state_dict: Mapping[str, Any],
-        skip_preprocess: bool = False,
         *args,
+        skip_preprocess: bool = False,
         **kwargs,
     ):
         if not skip_preprocess:
