@@ -22,6 +22,7 @@ n_expert_groups: 1
 n_limited_groups: 1
 route_scale: 2.827
 score_func: "sigmoid"
+norm_topk_prob: True
 q_lora_rank: 1536
 kv_lora_rank: 512
 qk_nope_head_dim: 128
