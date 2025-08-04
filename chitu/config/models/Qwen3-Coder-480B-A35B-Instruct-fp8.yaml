@@ -1,0 +1,11 @@
+# Qwen3-Coder-480B-A35B-Instruct-FP8 is a quantization of Qwen3-Coder-480B-A35B-Instruct
+defaults:
+  - Qwen3-Coder-480B-A35B-Instruct
+  - quant_config: blockfp8_moe
+  - _self_ # Config in this file overrides configs in defaults
+
+# Access info
+name: Qwen3-Coder-480B-A35B-Instruct-fp8
+source: "https://huggingface.co/Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
