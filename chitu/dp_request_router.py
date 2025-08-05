@@ -31,6 +31,8 @@ class SchedulerStats:
     pending_tokens: int
     throughput_tokens_per_sec: float
     last_update_time: float
+    last_heartbeat_time: float = 0.0  # 新增心跳时间戳
+    is_alive: bool = True  # 新增存活状态标记
 
 
 @dataclass
@@ -65,30 +67,54 @@ class LoadBalancer:
             f"[LOAD_BALANCER] Starting scheduler selection with algorithm: {self.config.load_balance_algorithm}"
         )
 
-        if self.config.load_balance_algorithm == "round_robin":
-            scheduler_id = self._round_robin()
-        elif self.config.load_balance_algorithm == "least_loaded":
-            scheduler_id = self._least_loaded()
-        elif self.config.load_balance_algorithm == "power_of_two_choices":
-            # Fix: fallback to round_robin when statistics are insufficient
-            if len(self.scheduler_stats) < 2:
-                logger.debug(
-                    f"[LOAD_BALANCER] power_of_two_choices statistics insufficient ({len(self.scheduler_stats)}), fallback to round_robin"
-                )
+        try:
+            if self.config.load_balance_algorithm == "round_robin":
                 scheduler_id = self._round_robin()
+            elif self.config.load_balance_algorithm == "least_loaded":
+                scheduler_id = self._least_loaded()
+            elif self.config.load_balance_algorithm == "power_of_two_choices":
+                # Fix: fallback to round_robin when statistics are insufficient
+                if len(self.scheduler_stats) < 2:
+                    logger.debug(
+                        f"[LOAD_BALANCER] power_of_two_choices statistics insufficient ({len(self.scheduler_stats)}), fallback to round_robin"
+                    )
+                    scheduler_id = self._round_robin()
+                else:
+                    scheduler_id = self._power_of_two_choices()
             else:
-                scheduler_id = self._power_of_two_choices()
-        else:
-            raise ValueError(
-                f"Unknown load balance algorithm: {self.config.load_balance_algorithm}"
-            )
+                raise ValueError(
+                    f"Unknown load balance algorithm: {self.config.load_balance_algorithm}"
+                )
+        except RuntimeError as e:
+            logger.error(f"[LOAD_BALANCER] Scheduler selection failed: {e}")
+            raise  # 重新抛出异常供上层处理
 
         logger.debug(f"[LOAD_BALANCER] Selected scheduler: {scheduler_id}")
         return scheduler_id
 
+    def _select_alive_schedulers(self) -> list[tuple[int, SchedulerStats]]:
+        """Select only alive schedulers based on stats."""
+        alive_schedulers = [
+            (s_id, stats)
+            for s_id, stats in self.scheduler_stats.items()
+            if stats.is_alive
+        ]
+        if not alive_schedulers:
+            # 抛出异常，表示没有可用调度器
+            raise RuntimeError("No alive schedulers available for request routing.")
+        logger.info(
+            f"[ALIVE_SCHEDULERS] Found {len(alive_schedulers)} alive schedulers out of {len(self.scheduler_stats.items())} total"
+        )
+        return alive_schedulers
+
     def _round_robin(self) -> int:
         """Simple round-robin selection."""
-        scheduler_id = self.round_robin_counter % len(self.config.scheduler_addresses)
+        try:
+            alive_schedulers = self._select_alive_schedulers()
+        except RuntimeError as e:
+            logger.error(f"-ROUND_ROBIN {e}")
+            raise
+        scheduler_id = self.round_robin_counter % len(alive_schedulers)
         self.round_robin_counter += 1
         return scheduler_id
 
@@ -102,8 +128,17 @@ class LoadBalancer:
 
         min_load = float("inf")
         best_scheduler = 0
+        alive_schedulers = self._select_alive_schedulers()
 
-        for scheduler_id, stats in self.scheduler_stats.items():
+        # 只考虑存活的调度器
+        try:
+            alive_schedulers = self._select_alive_schedulers()
+        except RuntimeError as e:
+            logger.error(f"-LEAST_LOADED {e}")
+            raise
+
+        # pick alive schedulers from alive ones
+        for scheduler_id, stats in alive_schedulers:
             # Calculate load score: pending_tokens + running_requests * 100
             load_score = stats.pending_tokens + stats.running_requests * 100
 
@@ -126,8 +161,13 @@ class LoadBalancer:
             )
             return 0
 
-        # Randomly select two schedulers
-        scheduler_ids = list(self.scheduler_stats.keys())
+        try:
+            alive_schedulers = self._select_alive_schedulers()
+        except RuntimeError as e:
+            logger.error(f"-POWER_OF_TWO {e}")
+            raise
+
+        scheduler_ids = [s_id for s_id, _ in alive_schedulers]
         if len(scheduler_ids) < 2:
             logger.warning(
                 f"[POWER_OF_TWO] Available schedulers insufficient ({len(scheduler_ids)}), returning first one"
@@ -185,6 +225,7 @@ class RequestRouter:
             self._stats_collector_task(),
             self._request_processor_task(),
             self._health_monitor_task(),
+            self._heartbeat_monitor_task(),
         )
 
     async def _init_sockets(self):
@@ -217,7 +258,7 @@ class RequestRouter:
 
                     # Safely get statistics data with default values
                     stats = SchedulerStats(
-                        scheduler_id=stats_dict.get("scheduler_id", 0),
+                        scheduler_id=stats_dict.get("dp_group_id", 0),
                         running_requests=stats_dict.get("running_requests", 0),
                         waiting_requests=stats_dict.get("waiting_requests", 0),
                         pending_tokens=stats_dict.get("pending_tokens", 0),
@@ -227,6 +268,8 @@ class RequestRouter:
                         last_update_time=stats_dict.get(
                             "last_update_time", time.time()
                         ),
+                        last_heartbeat_time=time.time(),  # 更新心跳时间戳
+                        is_alive=stats_dict.get("heartbeat", False),  # 标记为存活
                     )
 
                     self.load_balancer.update_stats(stats)
@@ -285,6 +328,23 @@ class RequestRouter:
                 logger.error(f"[REQUEST_ROUTER] Stack trace: {traceback.format_exc()}")
                 await asyncio.sleep(0.1)
 
+    async def _heartbeat_monitor_task(self):
+        """Monitor scheduler heartbeat status"""
+        HEARTBEAT_TIMEOUT = 20.0  # 20秒超时阈值
+        while True:
+            current_time = time.time()
+
+            # 检查所有调度器的心跳状态
+            for scheduler_id, stats in self.load_balancer.scheduler_stats.items():
+                if current_time - stats.last_heartbeat_time > HEARTBEAT_TIMEOUT:
+                    logger.warning(
+                        f"--- [HEARTBEAT_MONITOR] Scheduler {scheduler_id} heartbeat timeout! ---"
+                        f"Last heartbeat: {current_time - stats.last_heartbeat_time:.2f}s ago"
+                    )
+                    # 标记为死亡
+                    stats.is_alive = False
+            await asyncio.sleep(5.0)  # 每5秒检查一次心跳
+
     async def _health_monitor_task(self):
         """Monitor system health and log performance metrics."""
         while True:
@@ -309,7 +369,7 @@ class RequestRouter:
                         scheduler_id,
                         stats,
                     ) in self.load_balancer.scheduler_stats.items():
-                        logger.info(
+                        logger.debug(
                             f"Scheduler {scheduler_id}: "
                             f"running={stats.running_requests}, "
                             f"waiting={stats.waiting_requests}, "
