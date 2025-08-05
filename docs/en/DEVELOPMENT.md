@@ -371,9 +371,14 @@ Supported optional JSON arguments are:
 | `stream`               | `bool`           | If true, make the HTTP response streaming, which can be used with `requests.post(stream=True)` in Python. |
 | `stop_with_eos`        | `bool`           | If false, keep generating outputs until the number of output tokens reaches `max_tokens`, even if the answer has already ended, useful for a stable speed test. |
 | `chat_template_kwargs` | `Dict[str, Any]` | Additional argument for the chat template. The only currently supported argument is: `{"enable_thinking": false}` for disabling thinking mode for GLM-4.5 models. |
-| `api_key`              | `str`            | Used to set the priority of the request, see the `serve.api_keys` configuration when starting the service. |
 
-#### Additional Configuration for Micro Batch Size
+Additional HTTP headers:
+
+| Name                         | Description                                                  |
+| ---------------------------- | ------------------------------------------------------------ |
+| `Authorization`              | Format: `Bearer <api_key>`. If `<api_key>` is in `serve.api_keys`, the request will be prioritized. See the `serve.api_keys` configuration when starting the service for details. |
+
+## Additional Configuration for Micro Batch Size
 
 |Parameter                        |Default |Description|
 |:--------------------------------|:-------|:---|
