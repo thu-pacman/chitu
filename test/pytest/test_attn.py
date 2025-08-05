@@ -2,12 +2,14 @@ import torch
 import pytest
 import packaging.version
 from omegaconf import OmegaConf
-import flashinfer
 import triton
 
 from chitu.attn_backend import RefAttnBackend, TritonAttnBackend, FlashInferBackend
 from chitu.device_type import is_muxi
 from chitu.global_vars import set_global_args
+from chitu.utils import try_import_opt_dep
+
+flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -65,7 +67,7 @@ def test_triton_prefill_attn(num_local_heads, qk_head_dim, v_head_dim, bs):
     softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
     is_causal = True
     attn_backend = TritonAttnBackend(qk_nope_head_dim=qk_head_dim)
-    o = attn_backend.attn_varlen_func(
+    o = attn_backend.prefill_ragged_qkvo(
         q,
         k,
         v,
@@ -73,7 +75,6 @@ def test_triton_prefill_attn(num_local_heads, qk_head_dim, v_head_dim, bs):
         b_start_loc,
         max_seqlen_q,
         max_seqlen_k,
-        dropout_p=0,
         causal=is_causal,
         window_size=(-1, -1),
         softcap=0,
@@ -82,7 +83,7 @@ def test_triton_prefill_attn(num_local_heads, qk_head_dim, v_head_dim, bs):
 
     # Run reference implementation
     ref_attn = RefAttnBackend()
-    new_o = ref_attn.attn_varlen_func(
+    new_o = ref_attn.prefill_ragged_qkvo(
         q,
         k,
         v,
@@ -90,7 +91,6 @@ def test_triton_prefill_attn(num_local_heads, qk_head_dim, v_head_dim, bs):
         b_start_loc,
         max_seqlen_q,
         max_seqlen_k,
-        dropout_p=0,
         causal=is_causal,
         window_size=(-1, -1),
         softcap=0,
@@ -109,7 +109,7 @@ def test_triton_prefill_attn(num_local_heads, qk_head_dim, v_head_dim, bs):
 @pytest.mark.parametrize("kv_lora_rank", [512])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.parametrize("page_size", [256])
-def test_triton_mla_attn(
+def test_triton_mla_decode_paged_kv(
     bs,
     cache_seqlens_excl_this_decode,
     local_n_heads,
@@ -160,7 +160,7 @@ def test_triton_mla_attn(
     attn = TritonAttnBackend(qk_nope_head_dim=128)
     attn_ref = RefAttnBackend(qk_nope_head_dim=128)
 
-    y = attn.mla_attn_with_kvcache(
+    y = attn.mla_decode_paged_kv(
         q_nope,
         q_pe,
         kv_cache,
@@ -169,7 +169,7 @@ def test_triton_mla_attn(
         cache_seqlens_incl_this_decode_tensor,
         page_table,
     )
-    y_ref = attn_ref.mla_attn_with_kvcache(
+    y_ref = attn_ref.mla_decode_paged_kv(
         q_nope,
         q_pe,
         kv_cache,
@@ -187,10 +187,7 @@ def test_triton_mla_attn(
 @pytest.mark.parametrize("n_heads", [4])
 @pytest.mark.parametrize("n_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [256])
-@pytest.mark.parametrize("cache_type", ["paged", "skew"])
-def test_triton_attn_with_kvcache(
-    cache_seqlens, n_heads, n_kv_heads, head_dim, cache_type
-):
+def test_triton_decode_dense_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
     if is_muxi():
         return
     torch.set_default_dtype(torch.float16)
@@ -202,7 +199,7 @@ def test_triton_attn_with_kvcache(
                     "max_reqs": 4,
                     "use_cuda_graph": False,
                     "tp_size": 1,
-                    "cache_type": cache_type,
+                    "cache_type": "skew",
                 },
                 "models": {"n_heads": n_heads, "n_kv_heads": n_kv_heads},
             }
@@ -218,25 +215,91 @@ def test_triton_attn_with_kvcache(
     triton_backend = TritonAttnBackend(qk_nope_head_dim=None)
     ref_backend = RefAttnBackend(qk_nope_head_dim=None)
 
-    if cache_type == "paged":
-        k_cache = torch.randn(
-            (num_blocks, block_size, n_kv_heads, head_dim), device="cuda"
-        )
-        v_cache = torch.randn(
-            (num_blocks, block_size, n_kv_heads, head_dim), device="cuda"
-        )
-        block_table = (
-            torch.arange(num_blocks, device="cuda").to(torch.int32).view(batch_size, -1)
-        )
-    else:
-        max_seq_length = max(cache_seqlens) + 1
-        k_cache = torch.randn(
-            (batch_size, max_seq_length, n_kv_heads, head_dim), device="cuda"
-        )
-        v_cache = torch.randn(
-            (batch_size, max_seq_length, n_kv_heads, head_dim), device="cuda"
-        )
-        block_table = None
+    max_seq_length = max(cache_seqlens) + 1
+    k_cache = torch.randn(
+        (batch_size, max_seq_length, n_kv_heads, head_dim), device="cuda"
+    )
+    v_cache = torch.randn(
+        (batch_size, max_seq_length, n_kv_heads, head_dim), device="cuda"
+    )
+    q = torch.randn((batch_size, 1, n_heads, head_dim), device="cuda")
+    k = torch.randn((batch_size, 1, n_kv_heads, head_dim), device="cuda")
+    v = torch.randn((batch_size, 1, n_kv_heads, head_dim), device="cuda")
+    cache_seqlens = torch.Tensor(cache_seqlens).to(torch.int32).cuda()
+
+    k_cache1 = k_cache.clone()
+    v_cache1 = v_cache.clone()
+    cache_seqlens1 = cache_seqlens.clone()
+    triton_out = triton_backend.decode_dense_kv(
+        q,
+        k_cache1,
+        v_cache1,
+        k,
+        v,
+        cache_seqlens=cache_seqlens1,
+        causal=False,
+        window_size=(-1, -1),
+        softcap=softcap,
+        softmax_scale=sm_scale,
+    )
+
+    k_cache2 = k_cache.clone()
+    v_cache2 = v_cache.clone()
+    cache_seqlens2 = cache_seqlens.clone()
+    ref_out = ref_backend.decode_dense_kv(
+        q,
+        k_cache2,
+        v_cache2,
+        k,
+        v,
+        cache_seqlens=cache_seqlens2,
+        causal=False,
+        window_size=(-1, -1),
+        softcap=softcap,
+        softmax_scale=sm_scale,
+    )
+
+    assert torch.allclose(triton_out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("cache_seqlens", [[512, 19, 15, 22]])
+@pytest.mark.parametrize("n_heads", [4])
+@pytest.mark.parametrize("n_kv_heads", [1])
+@pytest.mark.parametrize("head_dim", [256])
+def test_triton_decode_paged_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
+    if is_muxi():
+        return
+    torch.set_default_dtype(torch.float16)
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "mla_absorb": None,
+                    "max_reqs": 4,
+                    "use_cuda_graph": False,
+                    "tp_size": 1,
+                    "cache_type": "paged",
+                },
+                "models": {"n_heads": n_heads, "n_kv_heads": n_kv_heads},
+            }
+        ),
+        need_ensure=False,
+    )
+
+    batch_size = len(cache_seqlens)
+    num_blocks = 40
+    block_size = 256
+    softcap = 1.3
+    sm_scale = 1.3
+    triton_backend = TritonAttnBackend(qk_nope_head_dim=None)
+    ref_backend = RefAttnBackend(qk_nope_head_dim=None)
+
+    k_cache = torch.randn((num_blocks, block_size, n_kv_heads, head_dim), device="cuda")
+    v_cache = torch.randn((num_blocks, block_size, n_kv_heads, head_dim), device="cuda")
+    block_table = (
+        torch.arange(num_blocks, device="cuda").to(torch.int32).view(batch_size, -1)
+    )
     q = torch.randn((batch_size, 1, n_heads, head_dim), device="cuda")
     k = torch.randn((batch_size, 1, n_kv_heads, head_dim), device="cuda")
     v = torch.randn((batch_size, 1, n_kv_heads, head_dim), device="cuda")
@@ -249,14 +312,13 @@ def test_triton_attn_with_kvcache(
         triton_backend.prepare_metadata_for_decode(
             None, cache_seqlens1, block_table, block_size, None
         )
-    triton_out = triton_backend.attn_with_kvcache(
+    triton_out = triton_backend.decode_paged_kv(
         q,
         k_cache1,
         v_cache1,
         k,
         v,
         cache_seqlens=cache_seqlens1,
-        cache_leftpad=None,
         block_table=block_table,
         causal=False,
         window_size=(-1, -1),
@@ -267,14 +329,13 @@ def test_triton_attn_with_kvcache(
     k_cache2 = k_cache.clone()
     v_cache2 = v_cache.clone()
     cache_seqlens2 = cache_seqlens.clone()
-    ref_out = ref_backend.attn_with_kvcache(
+    ref_out = ref_backend.decode_paged_kv(
         q,
         k_cache2,
         v_cache2,
         k,
         v,
         cache_seqlens=cache_seqlens2,
-        cache_leftpad=None,
         block_table=block_table,
         causal=False,
         window_size=(-1, -1),
@@ -286,14 +347,16 @@ def test_triton_attn_with_kvcache(
 
 
 @pytest.mark.skipif(
-    packaging.version.parse(flashinfer.__version__) < packaging.version.parse("0.2.0"),
-    reason="flashinfer is too old",
+    not has_flashinfer
+    or packaging.version.parse(flashinfer.__version__)
+    < packaging.version.parse("0.2.0"),
+    reason="flashinfer is missing or too old",
 )
 @pytest.mark.parametrize("cu_seqlens_qk", [[0, 9, 22, 33]])
 @pytest.mark.parametrize("n_heads", [4])
 @pytest.mark.parametrize("n_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [256])
-def test_flashinfer_attn_varlen_func(cu_seqlens_qk, n_heads, n_kv_heads, head_dim):
+def test_flashinfer_prefill_ragged_qkvo(cu_seqlens_qk, n_heads, n_kv_heads, head_dim):
     torch.set_default_dtype(torch.float16)
     set_global_args(
         OmegaConf.create(
@@ -320,7 +383,7 @@ def test_flashinfer_attn_varlen_func(cu_seqlens_qk, n_heads, n_kv_heads, head_di
     v = torch.randn((seq_lens, n_kv_heads, head_dim)).cuda()
     cu_seqlens_qk = torch.Tensor(cu_seqlens_qk).to(torch.int32).cuda()
 
-    flashinfer_out = flashinfer_backend.attn_varlen_func(
+    flashinfer_out = flashinfer_backend.prefill_ragged_qkvo(
         q,
         k,
         v,
@@ -328,13 +391,12 @@ def test_flashinfer_attn_varlen_func(cu_seqlens_qk, n_heads, n_kv_heads, head_di
         cu_seqlens_qk,
         2048,
         2048,
-        dropout_p=0.0,
         causal=True,
         window_size=(-1, -1),
         softcap=0.0,
         softmax_scale=0.1352337788608801,
     )
-    ref_out = ref_backend.attn_varlen_func(
+    ref_out = ref_backend.prefill_ragged_qkvo(
         q,
         k,
         v,
@@ -342,7 +404,6 @@ def test_flashinfer_attn_varlen_func(cu_seqlens_qk, n_heads, n_kv_heads, head_di
         cu_seqlens_qk,
         2048,
         2048,
-        dropout_p=0.0,
         causal=True,
         window_size=(-1, -1),
         softcap=0.0,
@@ -353,17 +414,16 @@ def test_flashinfer_attn_varlen_func(cu_seqlens_qk, n_heads, n_kv_heads, head_di
 
 
 @pytest.mark.skipif(
-    packaging.version.parse(flashinfer.__version__) < packaging.version.parse("0.2.0"),
-    reason="flashinfer is too old",
+    not has_flashinfer
+    or packaging.version.parse(flashinfer.__version__)
+    < packaging.version.parse("0.2.0"),
+    reason="flashinfer is missing or too old",
 )
 @pytest.mark.parametrize("cache_seqlens", [[509, 19, 15, 22]])
 @pytest.mark.parametrize("n_heads", [4])
 @pytest.mark.parametrize("n_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [256])
-@pytest.mark.parametrize("cache_type", ["paged", "skew"])
-def test_flashinfer_attn_with_kvcache(
-    cache_seqlens, n_heads, n_kv_heads, head_dim, cache_type
-):
+def test_flashinfer_decode_dense_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
     torch.set_default_dtype(torch.float16)
     set_global_args(
         OmegaConf.create(
@@ -373,7 +433,7 @@ def test_flashinfer_attn_with_kvcache(
                     "max_reqs": 4,
                     "use_cuda_graph": False,
                     "tp_size": 1,
-                    "cache_type": cache_type,
+                    "cache_type": "skew",
                 },
                 "models": {"n_heads": n_heads, "n_kv_heads": n_kv_heads},
             }
@@ -389,25 +449,94 @@ def test_flashinfer_attn_with_kvcache(
     )
     ref_backend = RefAttnBackend(qk_nope_head_dim=None)
 
-    if cache_type == "paged":
-        k_cache = torch.randn(
-            (num_blocks, block_size, n_kv_heads, head_dim), device="cuda"
-        )
-        v_cache = torch.randn(
-            (num_blocks, block_size, n_kv_heads, head_dim), device="cuda"
-        )
-        block_table = (
-            torch.arange(num_blocks, device="cuda").to(torch.int32).view(batch_size, -1)
-        )
-    else:
-        max_seq_length = max(cache_seqlens) + 1
-        k_cache = torch.randn(
-            (batch_size, max_seq_length, n_kv_heads, head_dim), device="cuda"
-        )
-        v_cache = torch.randn(
-            (batch_size, max_seq_length, n_kv_heads, head_dim), device="cuda"
-        )
-        block_table = None
+    max_seq_length = max(cache_seqlens) + 1
+    k_cache = torch.randn(
+        (batch_size, max_seq_length, n_kv_heads, head_dim), device="cuda"
+    )
+    v_cache = torch.randn(
+        (batch_size, max_seq_length, n_kv_heads, head_dim), device="cuda"
+    )
+    q = torch.randn((batch_size, 1, n_heads, head_dim), device="cuda") * 100
+    k = torch.randn((batch_size, 1, n_kv_heads, head_dim), device="cuda") * 100
+    v = torch.randn((batch_size, 1, n_kv_heads, head_dim), device="cuda") * 100
+    cache_seqlens = torch.Tensor(cache_seqlens).to(torch.int32).cuda()
+
+    k_cache1 = k_cache.clone()
+    v_cache1 = v_cache.clone()
+    cache_seqlens1 = cache_seqlens.clone()
+    flashinfer_out = flashinfer_backend.decode_dense_kv(
+        q,
+        k_cache1,
+        v_cache1,
+        k,
+        v,
+        cache_seqlens=cache_seqlens1,
+        causal=False,
+        window_size=(-1, -1),
+        softcap=0.0,
+        softmax_scale=None,
+    )
+
+    k_cache2 = k_cache.clone()
+    v_cache2 = v_cache.clone()
+    cache_seqlens2 = cache_seqlens.clone()
+    ref_out = ref_backend.decode_dense_kv(
+        q,
+        k_cache2,
+        v_cache2,
+        k,
+        v,
+        cache_seqlens=cache_seqlens2,
+        causal=False,
+        window_size=(-1, -1),
+        softcap=0.0,
+        softmax_scale=None,
+    )
+
+    assert torch.allclose(flashinfer_out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not has_flashinfer
+    or packaging.version.parse(flashinfer.__version__)
+    < packaging.version.parse("0.2.0"),
+    reason="flashinfer is missing or too old",
+)
+@pytest.mark.parametrize("cache_seqlens", [[509, 19, 15, 22]])
+@pytest.mark.parametrize("n_heads", [4])
+@pytest.mark.parametrize("n_kv_heads", [1])
+@pytest.mark.parametrize("head_dim", [256])
+def test_flashinfer_decode_paged_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
+    torch.set_default_dtype(torch.float16)
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "mla_absorb": None,
+                    "max_reqs": 4,
+                    "use_cuda_graph": False,
+                    "tp_size": 1,
+                    "cache_type": "paged",
+                },
+                "models": {"n_heads": n_heads, "n_kv_heads": n_kv_heads},
+            }
+        ),
+        need_ensure=False,
+    )
+
+    batch_size = len(cache_seqlens)
+    num_blocks = 40
+    block_size = 256
+    flashinfer_backend = FlashInferBackend(
+        tot_num_blocks=num_blocks, qk_nope_head_dim=None
+    )
+    ref_backend = RefAttnBackend(qk_nope_head_dim=None)
+
+    k_cache = torch.randn((num_blocks, block_size, n_kv_heads, head_dim), device="cuda")
+    v_cache = torch.randn((num_blocks, block_size, n_kv_heads, head_dim), device="cuda")
+    block_table = (
+        torch.arange(num_blocks, device="cuda").to(torch.int32).view(batch_size, -1)
+    )
     q = torch.randn((batch_size, 1, n_heads, head_dim), device="cuda") * 100
     k = torch.randn((batch_size, 1, n_kv_heads, head_dim), device="cuda") * 100
     v = torch.randn((batch_size, 1, n_kv_heads, head_dim), device="cuda") * 100
@@ -420,14 +549,13 @@ def test_flashinfer_attn_with_kvcache(
         flashinfer_backend.prepare_metadata_for_decode(
             None, cache_seqlens1, block_table, block_size, None
         )
-    flashinfer_out = flashinfer_backend.attn_with_kvcache(
+    flashinfer_out = flashinfer_backend.decode_paged_kv(
         q,
         k_cache1,
         v_cache1,
         k,
         v,
         cache_seqlens=cache_seqlens1,
-        cache_leftpad=None,
         block_table=block_table,
         causal=False,
         window_size=(-1, -1),
@@ -438,14 +566,13 @@ def test_flashinfer_attn_with_kvcache(
     k_cache2 = k_cache.clone()
     v_cache2 = v_cache.clone()
     cache_seqlens2 = cache_seqlens.clone()
-    ref_out = ref_backend.attn_with_kvcache(
+    ref_out = ref_backend.decode_paged_kv(
         q,
         k_cache2,
         v_cache2,
         k,
         v,
         cache_seqlens=cache_seqlens2,
-        cache_leftpad=None,
         block_table=block_table,
         causal=False,
         window_size=(-1, -1),
@@ -469,7 +596,9 @@ def test_flashinfer_attn_with_kvcache(
         args={"num_local_heads": 32, "qk_head_dim": 576, "v_head_dim": 512},
     )
 )
-def benchmark_attn_varlen_func(num_local_heads, qk_head_dim, v_head_dim, bs, provider):
+def benchmark_prefill_ragged_qkvo(
+    num_local_heads, qk_head_dim, v_head_dim, bs, provider
+):
     # Create seq_lens list with length=batch_size and values in [0, 128)
     if isinstance(bs, int):
         # If batch_size is provided directly, use it
@@ -493,7 +622,7 @@ def benchmark_attn_varlen_func(num_local_heads, qk_head_dim, v_head_dim, bs, pro
     if provider == "triton":
         attn_backend = TritonAttnBackend(qk_nope_head_dim=qk_head_dim)
         ms = triton.testing.do_bench(
-            lambda: attn_backend.attn_varlen_func(
+            lambda: attn_backend.prefill_ragged_qkvo(
                 q,
                 k,
                 v,
@@ -501,7 +630,6 @@ def benchmark_attn_varlen_func(num_local_heads, qk_head_dim, v_head_dim, bs, pro
                 b_start_loc,
                 max_seqlen_q,
                 max_seqlen_k,
-                dropout_p=0,
                 causal=is_causal,
                 window_size=(-1, -1),
                 softcap=0,
@@ -526,7 +654,7 @@ def benchmark_attn_varlen_func(num_local_heads, qk_head_dim, v_head_dim, bs, pro
         )
         flashinfer_backend = FlashInferBackend(tot_num_blocks=51, qk_nope_head_dim=None)
         ms = triton.testing.do_bench(
-            lambda: flashinfer_backend.attn_varlen_func(
+            lambda: flashinfer_backend.prefill_ragged_qkvo(
                 q,
                 k,
                 v,
@@ -534,7 +662,6 @@ def benchmark_attn_varlen_func(num_local_heads, qk_head_dim, v_head_dim, bs, pro
                 b_start_loc,
                 max_seqlen_q,
                 max_seqlen_k,
-                dropout_p=0,
                 causal=is_causal,
                 window_size=(-1, -1),
                 softcap=0,
@@ -565,7 +692,7 @@ def benchmark_attn_varlen_func(num_local_heads, qk_head_dim, v_head_dim, bs, pro
         },
     )
 )
-def benchmark_mla_attn_with_kvcache(
+def benchmark_mla_decode_paged_kv(
     bs,
     cache_seqlens_excl_this_decode,
     n_heads,
@@ -596,7 +723,7 @@ def benchmark_mla_attn_with_kvcache(
     attn = TritonAttnBackend(qk_nope_head_dim=128)
     if provider == "triton":
         ms = triton.testing.do_bench(
-            lambda: attn.mla_attn_with_kvcache(
+            lambda: attn.mla_decode_paged_kv(
                 q_nope,
                 q_pe,
                 kv_cache,
@@ -638,7 +765,7 @@ def benchmark_mla_attn_with_kvcache(
             None,
         )
         ms = triton.testing.do_bench(
-            lambda: flashinfer_backend.mla_attn_with_kvcache(
+            lambda: flashinfer_backend.mla_decode_paged_kv(
                 q_nope,
                 q_pe,
                 kv_cache,
@@ -654,8 +781,8 @@ def benchmark_mla_attn_with_kvcache(
 
 
 if __name__ == "__main__":
-    benchmark_mla_attn_with_kvcache.run(show_plots=True, print_data=True)
-    # benchmark_attn_varlen_func.run(show_plots=True, print_data=True)
-    # benchmark_attn_varlen_func.run(bs=8, show_plots=True, print_data=True)
-    # benchmark_attn_varlen_func.run(bs=16, show_plots=True, print_data=True)
-    # benchmark_attn_varlen_func.run(bs=32, show_plots=True, print_data=True)
+    benchmark_mla_decode_paged_kv.run(show_plots=True, print_data=True)
+    # benchmark_prefill_ragged_qkvo.run(show_plots=True, print_data=True)
+    # benchmark_prefill_ragged_qkvo.run(bs=8, show_plots=True, print_data=True)
+    # benchmark_prefill_ragged_qkvo.run(bs=16, show_plots=True, print_data=True)
+    # benchmark_prefill_ragged_qkvo.run(bs=32, show_plots=True, print_data=True)

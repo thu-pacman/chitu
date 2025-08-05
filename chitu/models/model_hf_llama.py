@@ -212,7 +212,7 @@ class AttentionHFLlama(Attention):
         self.cache.finalize_cache_bylayer_prefill(
             xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
         )
-        output = self.attn_backend.attn_varlen_func(
+        output = self.attn_backend.prefill_ragged_qkvo(
             xq,
             xk,
             xv,
@@ -256,7 +256,7 @@ class AttentionHFLlama(Attention):
         cache_k = cache[0]
         cache_v = cache[1]
         cache_seqlens = self.cache.get_gpu_seq_lens_excl_this_decode()
-        output = self.attn_backend.attn_with_kvcache(
+        output = self.attn_backend.decode_dense_kv(
             xq,
             cache_k,
             cache_v,
@@ -299,7 +299,7 @@ class AttentionHFLlama(Attention):
         block_table = self.cache.get_gpu_block_table()
         cache_seqlens = self.cache.get_gpu_seq_lens_excl_this_decode()
         paged_k_cache, paged_v_cache = self.cache.get_paged_kv_cache(self.layer_id)
-        output = self.attn_backend.attn_with_kvcache(
+        output = self.attn_backend.decode_paged_kv(
             xq,
             paged_k_cache,
             paged_v_cache,

@@ -80,7 +80,7 @@ def linear_block_fp4_npu(
     expert_tokens = torch.full([1], x.shape[0], device=x.device, dtype=torch.int64)
 
     if x.dim() == 3:
-        # 三维的 x 需要squeeze到二维,在NpuAttnBackend mla_attn_with_kvcache中 x 会被 unsqueeze 到三维
+        # 三维的 x 需要squeeze到二维,在NpuAttnBackend mla_decode_paged_kv 中 x 会被 unsqueeze 到三维
         x = x.squeeze(1)
         if x.shape[0] <= 2:
             grouped_gemm.grouped_gemv(
