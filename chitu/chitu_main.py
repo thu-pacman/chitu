@@ -453,14 +453,16 @@ async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
 
             # Send statistics periodically
             current_time = time.time()
-            if (
-                processed_requests > 0 and (current_time - start_time) >= 1.0
-            ):  # Send statistics every second
+            # Send statistics every second
+            if (current_time - start_time) >= 1.0:
                 elapsed = current_time - start_time
                 throughput = processed_requests / elapsed
 
                 stats = {
                     "scheduler_id": rank,
+                    "dp_group_id": int(
+                        dp_config.dp_id
+                    ),  # 这里利用传入的dp_id作为stat所属dp group的唯一标识，因为rank值全是0，无法作为参考
                     "running_requests": (
                         len(Backend.ongoing_reqs)
                         if hasattr(Backend, "ongoing_reqs")
@@ -474,6 +476,7 @@ async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
                     "pending_tokens": 0,  # TODO: calculate pending tokens
                     "throughput_tokens_per_sec": throughput,
                     "last_update_time": current_time,
+                    "heartbeat": True,
                 }
 
                 try:

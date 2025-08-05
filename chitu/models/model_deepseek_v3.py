@@ -277,7 +277,7 @@ class AttentionDeepSeekV3(Attention):
                 k, v, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
             )
 
-            x = self.attn_backend.attn_varlen_func(
+            x = self.attn_backend.prefill_ragged_qkvo(
                 q,
                 k,
                 v,
@@ -306,7 +306,7 @@ class AttentionDeepSeekV3(Attention):
             )
             q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
 
-            x = self.attn_backend.attn_varlen_func(
+            x = self.attn_backend.prefill_ragged_qkvo(
                 q_nope_pe.view(-1, q_nope_pe.shape[-2], q_nope_pe.shape[-1]),
                 kv.view(-1, 1, kv.shape[-1]),
                 kv_cache.view(-1, 1, kv_cache.shape[-1]),
@@ -348,7 +348,7 @@ class AttentionDeepSeekV3(Attention):
             cache = self.cache.get_cache_decode(self.layer_id)
             cache_k = cache[0]
             cache_v = cache[1]
-            x = self.attn_backend.attn_with_kvcache(
+            x = self.attn_backend.decode_dense_kv(
                 q,
                 cache_k,
                 cache_v,
@@ -369,14 +369,13 @@ class AttentionDeepSeekV3(Attention):
             # In-place update to `this_kv`, which is part of `kv`
             self.kv_a_layernorm(this_kv, compute_dtype=kv.dtype, out=this_kv)
 
-            x = self.attn_backend.mla_attn_with_kvcache(
+            x = self.attn_backend.mla_decode_dense_kv(
                 q_nope,
                 q_pe,
                 kv_cache,
                 kv.view(bsz, seqlen, 1, -1),
                 cache_seqlens_excl_this_decode=cache_seqlens_excl_this_decode,
                 cache_seqlens_incl_this_decode=cache_seqlens_incl_this_decode,
-                block_table=None,
                 softmax_scale=self.softmax_scale,
             )
 
@@ -409,7 +408,7 @@ class AttentionDeepSeekV3(Attention):
             v = v.view(bsz, seqlen, self.n_local_heads, -1)
 
             paged_k_cache, paged_v_cache = self.cache.get_paged_kv_cache(self.layer_id)
-            x = self.attn_backend.attn_with_kvcache(
+            x = self.attn_backend.decode_paged_kv(
                 q,
                 paged_k_cache,
                 paged_v_cache,
@@ -431,7 +430,7 @@ class AttentionDeepSeekV3(Attention):
             # In-place update to `this_kv`, which is part of `kv`
             self.kv_a_layernorm(this_kv, compute_dtype=kv.dtype, out=this_kv)
 
-            x = self.attn_backend.mla_attn_with_kvcache(
+            x = self.attn_backend.mla_decode_paged_kv(
                 q_nope,
                 q_pe,
                 paged_kv_cache,

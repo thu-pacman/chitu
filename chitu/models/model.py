@@ -197,7 +197,7 @@ class Attention(nn.Module):
         self.cache.finalize_cache_bylayer_prefill(
             xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
         )
-        output = self.attn_backend.attn_varlen_func(
+        output = self.attn_backend.prefill_ragged_qkvo(
             xq,
             xk,
             xv,
@@ -232,7 +232,7 @@ class Attention(nn.Module):
         cache_k = cache[0]
         cache_v = cache[1]
         cache_seqlens_excl_this_decode = self.cache.get_gpu_seq_lens_excl_this_decode()
-        output = self.attn_backend.attn_with_kvcache(
+        output = self.attn_backend.decode_dense_kv(
             xq,
             cache_k,
             cache_v,
@@ -264,7 +264,7 @@ class Attention(nn.Module):
         block_table = self.cache.get_gpu_block_table()
         cache_seqlens_excl_this_decode = self.cache.get_gpu_seq_lens_excl_this_decode()
         paged_k_cache, paged_v_cache = self.cache.get_paged_kv_cache(self.layer_id)
-        output = self.attn_backend.attn_with_kvcache(
+        output = self.attn_backend.decode_paged_kv(
             xq,
             paged_k_cache,
             paged_v_cache,
@@ -405,6 +405,8 @@ class Transformer(nn.Module):
             ret += ["weight_scale", "weight_scale_2", "input_scale"]
         elif quant == "w4a8_per_token_per_channel_asymm":
             ret += ["qweight"]
+        elif quant == "mixq":
+            ret += ["fp_weight"]
         return ret
 
     def _get_2d_in_x_out_tensor_names(self, quant) -> List[str]:
@@ -429,6 +431,8 @@ class Transformer(nn.Module):
             ret += ["scale_channel"]
         elif quant == "w4a8_per_token_per_channel_asymm":
             ret += ["s1_scales", "s1_szeros"]
+        elif quant == "mixq":
+            ret += ["fp_idx", "weight_scale"]
         return ret
 
     def _chunk_checkpoint_for_pipeline_parallel(

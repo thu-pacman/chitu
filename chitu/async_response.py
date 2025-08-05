@@ -7,6 +7,7 @@ from typing import List, Optional
 from pydantic import BaseModel
 
 from chitu.backend import Backend
+from chitu.tokenizer import Tokenizer, TokenizerHF
 
 logger = getLogger(__name__)
 
@@ -29,18 +30,32 @@ class AsyncDataStream:
         self.data_event = asyncio.Event()
         self.top_logprobs_list = []
         self.top_tokens_list = []
+        self.enable_reasoning = enable_reasoning
 
         if enable_reasoning:
-            self.enable_reasoning = enable_reasoning
             self.is_reasoning = False
             self.reasoning_len = 0
-            self.rs_token_id = Backend.args.models.get("rs_token_id", -1)
-            self.re_token_id = Backend.args.models.get("re_token_id", -1)
+            if isinstance(self.tokenizer, (Tokenizer, TokenizerHF)):
+                try:
+                    self.rs_token_id, self.re_token_id = self.tokenizer.encode(
+                        "<think></think>", bos=False, eos=False
+                    )
+                except ValueError:
+                    logger.warning(
+                        "Cannot obtain reasoning token ids from tokenizer. Use config."
+                    )
+                    self.rs_token_id = Backend.args.models.get("rs_token_id", -1)
+                    self.re_token_id = Backend.args.models.get("re_token_id", -1)
+            else:
+                self.rs_token_id = Backend.args.models.get("rs_token_id", -1)
+                self.re_token_id = Backend.args.models.get("re_token_id", -1)
+            if self.rs_token_id == -1 or self.re_token_id == -1:
+                self.enable_reasoning = False
 
     def add_data(self, value: int, top_logprobs=None, top_token_idx=None):
         with self.lock:
-            if self.enable_reasoning and self.reasoning_handle(value):
-                return
+            if self.enable_reasoning:
+                self.reasoning_handle(value)
             self.tokens_len += 1
             self.cache_tokens.append(value)
             s = self.tokenizer.decode(self.cache_tokens)
@@ -69,15 +84,11 @@ class AsyncDataStream:
         self.data_event.set()
 
     def reasoning_handle(self, value: int):
-        if self.rs_token_id == -1 or self.re_token_id == -1:
-            return False
         if not self.is_reasoning and self.tokens_len == 0 and value == self.rs_token_id:
             self.is_reasoning = True
-            return True
         if self.is_reasoning and value == self.re_token_id:
+            self.reasoning_len = len(self.seqs) + 1
             self.is_reasoning = False
-            self.reasoning_len = len(self.seqs)
-            return True
 
     def is_reasoning_content(self):
         return self.is_reasoning or self.index - 1 < self.reasoning_len

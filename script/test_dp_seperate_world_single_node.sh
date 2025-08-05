@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 🔧 DP=n 连续分组 + Router 混合模式测试脚本
-# 架构：1个Router + 2个连续DP组，每组2卡
+# 架构：1个Router + 2个连续DP组，每组1卡 (TP=1)
 # Router: 提供HTTP服务，负载均衡到DP组
 # DP组: 使用torch.distributed.new_group + 组内rank编号0~1
 
@@ -17,7 +17,7 @@ DP_GROUPS=2  # 只需改这里即可
 SLURM_PARTITION=debug
 CPUS_PER_GPU=24
 MEM_PER_GPU=242144
-GPUS_PER_GROUP=2
+GPUS_PER_GROUP=1
 NUM_GPUS=$((DP_GROUPS * GPUS_PER_GROUP))
 NUM_CPUS=$((NUM_GPUS * CPUS_PER_GPU))
 NUM_MEMS=$((NUM_GPUS * MEM_PER_GPU))
@@ -31,7 +31,7 @@ echo "架构: 1个Router + ${DP_GROUPS}个连续DP组"
 export CHITU_USE_CONTIGUOUS_DP_GROUPS=1
 export CUDA_LAUNCH_BLOCKING=1
 export DP_GROUPS=2
-export GPUS_PER_GROUP=2
+export GPUS_PER_GROUP=1
 
 echo "=== 启动参数 ==="
 echo "GPU数量: $NUM_GPUS"
@@ -51,7 +51,7 @@ srun --partition=${SLURM_PARTITION} \
         set -e
         export CHITU_USE_CONTIGUOUS_DP_GROUPS=1
         export CUDA_LAUNCH_BLOCKING=1
-        export DP_GROUPS=2 GPUS_PER_GROUP=2
+        export DP_GROUPS=2 GPUS_PER_GROUP=1
 
         # 显示环境信息
         echo '=== 环境信息 ==='
@@ -101,8 +101,8 @@ srun --partition=${SLURM_PARTITION} \
 
         DP_GROUP_PIDS=()
         for ((i=0; i<$DP_GROUPS; i++)); do
-            GPU_START=\$((i * 2)) 
-            GPU_END=\$((GPU_START + 2 - 1))
+            GPU_START=\$((i * 1)) 
+            GPU_END=\$((GPU_START + 1 - 1))
             GPUS=\$(seq -s, \$GPU_START \$GPU_END) 
             MASTER_PORT=\$((29502 + i))
             SCHEDULER_PORT=\$((29610 + i))
@@ -114,12 +114,12 @@ srun --partition=${SLURM_PARTITION} \
 
             if (( i < DP_GROUPS - 1 )); then
                 echo \"=== 启动第 \$((i+1))个DP组 ===\"
-                CUDA_VISIBLE_DEVICES=\$GPUS torchrun --nproc_per_node=2 \
+                CUDA_VISIBLE_DEVICES=\$GPUS torchrun --nproc_per_node=1 \
                     --master_port=\$MASTER_PORT \
                     -m chitu \
                     models='"${MODEL_CONFIG}"' \
                     models.ckpt_dir='"${MODEL_CKPT_DIR}"' \
-                    infer.tp_size=2 \
+                    infer.tp_size=1 \
                     infer.pp_size=1 \
                     infer.cache_type=paged \
                     infer.do_load=True \
@@ -135,12 +135,12 @@ srun --partition=${SLURM_PARTITION} \
                 sleep 30
             else
                 echo \"=== 启动第 \$((i+1))个DP组 ===\"
-                CUDA_VISIBLE_DEVICES=\$GPUS torchrun --nproc_per_node=2 \
+                CUDA_VISIBLE_DEVICES=\$GPUS torchrun --nproc_per_node=1 \
                     --master_port=\$MASTER_PORT \
                     -m chitu \
                     models='"${MODEL_CONFIG}"' \
                     models.ckpt_dir='"${MODEL_CKPT_DIR}"' \
-                    infer.tp_size=2 \
+                    infer.tp_size=1 \
                     infer.pp_size=1 \
                     infer.cache_type=paged \
                     infer.do_load=True \

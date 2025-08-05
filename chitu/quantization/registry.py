@@ -35,12 +35,14 @@ class QuantizationRegistry:
         "blockfp8",
         "autoawq",
         "simple_w8a8",
+        "mixq",
         None,
     ]
     _allowed_quant_for_merge_qkv: List = [
         "blockfp8",
         "autoawq",
         "simple_w8a8",
+        "mixq",
         None,
     ]
 

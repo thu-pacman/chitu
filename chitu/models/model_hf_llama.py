@@ -212,7 +212,7 @@ class AttentionHFLlama(Attention):
         self.cache.finalize_cache_bylayer_prefill(
             xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
         )
-        output = self.attn_backend.attn_varlen_func(
+        output = self.attn_backend.prefill_ragged_qkvo(
             xq,
             xk,
             xv,
@@ -256,7 +256,7 @@ class AttentionHFLlama(Attention):
         cache_k = cache[0]
         cache_v = cache[1]
         cache_seqlens = self.cache.get_gpu_seq_lens_excl_this_decode()
-        output = self.attn_backend.attn_with_kvcache(
+        output = self.attn_backend.decode_dense_kv(
             xq,
             cache_k,
             cache_v,
@@ -299,7 +299,7 @@ class AttentionHFLlama(Attention):
         block_table = self.cache.get_gpu_block_table()
         cache_seqlens = self.cache.get_gpu_seq_lens_excl_this_decode()
         paged_k_cache, paged_v_cache = self.cache.get_paged_kv_cache(self.layer_id)
-        output = self.attn_backend.attn_with_kvcache(
+        output = self.attn_backend.decode_paged_kv(
             xq,
             paged_k_cache,
             paged_v_cache,
@@ -610,9 +610,13 @@ class TransformerHFLlama(Transformer):
                 q_weight = checkpoint[f"{prefix}.q_proj.{tensor_name}"]
                 k_weight = checkpoint[f"{prefix}.k_proj.{tensor_name}"]
                 v_weight = checkpoint[f"{prefix}.v_proj.{tensor_name}"]
-                new_checkpoint[f"{prefix}.qkv_proj.{tensor_name}"] = torch.cat(
-                    [q_weight, k_weight, v_weight], dim=0
+                # For MixQ quantized models, q/k/v share the same fp_idx
+                merged_weight = (
+                    q_weight
+                    if tensor_name == "fp_idx"
+                    else torch.cat([q_weight, k_weight, v_weight], dim=0)
                 )
+                new_checkpoint[f"{prefix}.qkv_proj.{tensor_name}"] = merged_weight
             elif any(
                 k.endswith(f".k_proj.{tensor_name}")
                 for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
@@ -676,9 +680,12 @@ class TransformerHFLlama(Transformer):
                 assert f"{prefix}.gate_up_proj.{tensor_name}" not in checkpoint
                 gate_weight = checkpoint[f"{prefix}.gate_proj.{tensor_name}"]
                 up_weight = checkpoint[f"{prefix}.up_proj.{tensor_name}"]
-                new_checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = torch.cat(
-                    [gate_weight, up_weight], dim=0
+                merged_weight = (
+                    gate_weight
+                    if tensor_name == "fp_idx"
+                    else torch.cat([gate_weight, up_weight], dim=0)
                 )
+                new_checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = merged_weight
             elif any(
                 k.endswith(f".up_proj.{tensor_name}")
                 for tensor_name in self._get_2d_out_x_in_tensor_names(quant)

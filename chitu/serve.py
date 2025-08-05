@@ -3,12 +3,12 @@ import logging
 import time, os
 from logging import getLogger
 from threading import Thread
-from typing import Any, List, Optional, Mapping
+from typing import Any, List, Optional, Mapping, Annotated
 
 import hydra
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -42,6 +42,11 @@ dp_enabled = False
 dp_service_started = False
 
 
+class HttpHeader(BaseModel):
+    # Format: "Bearer <api_key>". If `<api_key>` is in `serve.api_keys`, the request will be prioritized
+    Authorization: Optional[str] = None
+
+
 class Message(BaseModel):
     role: str = "user"
     content: str = "hello, who are you"
@@ -61,7 +66,6 @@ class ChatRequest(BaseModel):
     min_batch_size: int = 1
     stop_with_eos: bool = True
     chat_template_kwargs: Mapping[str, Any] = {}
-    api_key: str = ""  # If in serve.api_keys, the request will be prioritized
 
 
 def get_priority_from_api_key(api_key: str) -> int:
@@ -72,7 +76,9 @@ def get_priority_from_api_key(api_key: str) -> int:
 
 
 @app.post("/v1/chat/completions")
-async def create_chat_completion(request: ChatRequest):
+async def create_chat_completion(
+    request: ChatRequest, http_header: Annotated[HttpHeader, Header()]
+):
     global server_status
     global min_batch_size
     if not server_status:
@@ -90,6 +96,19 @@ async def create_chat_completion(request: ChatRequest):
             status_code=403,
             detail="DP mode is not supported for this endpoint, please use v1/chat/completions/dp",
         )
+
+    headers = http_header.dict()
+    authorization_body = headers.pop("Authorization")
+    if authorization_body is not None:
+        if not authorization_body.startswith("Bearer "):
+            raise HTTPException(
+                status_code=400,
+                detail="Authorization header must start with 'Bearer'",
+            )
+        api_key = authorization_body[len("Bearer ") :]
+    else:
+        api_key = ""
+
     params = request.dict()
     req_id = gen_req_id()
     stream = params.pop("stream", False)
@@ -106,7 +125,6 @@ async def create_chat_completion(request: ChatRequest):
     min_batch_size = params.pop("min_batch_size")
     stop_with_eos = params.pop("stop_with_eos")
     chat_template_kwargs_unsafe = params.pop("chat_template_kwargs")
-    api_key = params.pop("api_key")
 
     # Reconstruct chat_template_kwargs to prevent injection attacks
     chat_template_kwargs = {}
