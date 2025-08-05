@@ -1,0 +1,45 @@
+quant: 
+- model: '.'
+  rules:
+    - regex : q_proj
+      type : mixq
+      kwargs:
+        fp_features_num: 256
+        w_bits: 4
+        a_bits: 4
+    - regex : k_proj
+      type : mixq
+      kwargs:
+        fp_features_num: 256
+        w_bits: 4
+        a_bits: 4
+    - regex : v_proj
+      type : mixq
+      kwargs:
+        fp_features_num: 256
+        w_bits: 4
+        a_bits: 4
+    - regex : o_proj
+      type : mixq
+      kwargs:
+        fp_features_num: 128
+        w_bits: 4
+        a_bits: 4
+    - regex : gate_proj
+      type : mixq
+      kwargs:
+        fp_features_num: 128
+        w_bits: 4
+        a_bits: 4
+    - regex : up_proj
+      type : mixq
+      kwargs:
+        fp_features_num: 128
+        w_bits: 4
+        a_bits: 4
+    - regex : down_proj
+      type : mixq
+      kwargs:
+        fp_features_num: 256
+        w_bits: 8
+        a_bits: 8

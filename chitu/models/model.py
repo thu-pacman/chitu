@@ -405,6 +405,8 @@ class Transformer(nn.Module):
             ret += ["weight_scale", "weight_scale_2", "input_scale"]
         elif quant == "w4a8_per_token_per_channel_asymm":
             ret += ["qweight"]
+        elif quant == "mixq":
+            ret += ["fp_weight"]
         return ret
 
     def _get_2d_in_x_out_tensor_names(self, quant) -> List[str]:
@@ -429,6 +431,8 @@ class Transformer(nn.Module):
             ret += ["scale_channel"]
         elif quant == "w4a8_per_token_per_channel_asymm":
             ret += ["s1_scales", "s1_szeros"]
+        elif quant == "mixq":
+            ret += ["fp_idx", "weight_scale"]
         return ret
 
     def _chunk_checkpoint_for_pipeline_parallel(
