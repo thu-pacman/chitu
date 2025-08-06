@@ -772,12 +772,11 @@ def main(args: ServeConfig):
 
         # warmup - DP compatible: each DP group's local master rank needs to do warmup
 
-        if rank == 0:
-            logger.info(f"[WARMUP] [Rank {rank}] Starting warmup...")
-            warmup_engine(args)
-            logger.info(
-                f"[WARMUP] [Rank {rank}] Warmup done, task pool size: {len(TaskPool.pool)}"
-            )
+        logger.info(f"[WARMUP] [Rank {rank}] Starting warmup...")
+        warmup_engine(args)
+        logger.info(
+            f"[WARMUP] [Rank {rank}] Warmup done, task pool size: {len(TaskPool.pool)}"
+        )
 
         # torch.distributed.barrier()  # Wait for rank 0 warmup to complete
 
@@ -804,8 +803,8 @@ def main(args: ServeConfig):
         torch.distributed.barrier()
         rank = torch.distributed.get_rank()
 
+        warmup_engine(args)
         if rank == 0:
-            warmup_engine(args)
             uvicorn_thread = Thread(target=start_unicorn, args=(args,))
             uvicorn_thread.start()
 

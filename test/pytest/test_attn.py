@@ -7,7 +7,7 @@ import triton
 from chitu.attn_backend import RefAttnBackend, TritonAttnBackend, FlashInferBackend
 from chitu.device_type import is_muxi
 from chitu.global_vars import set_global_args
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_opt_dep, VarLens
 
 flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
 
@@ -17,7 +17,7 @@ flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
 @pytest.mark.parametrize("qk_head_dim", [576])
 @pytest.mark.parametrize("v_head_dim", [512])
 @pytest.mark.parametrize("bs", [1, 9])
-def test_triton_prefill_attn(num_local_heads, qk_head_dim, v_head_dim, bs):
+def test_triton_prefill_attn(num_local_heads, qk_head_dim, v_head_dim, bs: int):
     set_global_args(
         OmegaConf.create(
             {
@@ -34,36 +34,22 @@ def test_triton_prefill_attn(num_local_heads, qk_head_dim, v_head_dim, bs):
         need_ensure=False,
     )
 
-    if isinstance(bs, int):
-        # If batch_size is provided directly, use it
-        seq_lens = [torch.randint(1, 128, (1,)).item() for _ in range(bs)]
-    else:
-        # If seq_lens is already provided as an argument, use that
-        seq_lens = bs
     # Set random seed for reproducibility
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
 
-    max_seq_len = max(seq_lens)
+    seq_lens = VarLens(
+        [[1] * torch.randint(1, 128, (1,)).item() for _ in range(bs)], device="cuda"
+    )
 
     # Create test tensors
     q = torch.randn(
-        sum(seq_lens), num_local_heads, qk_head_dim, dtype=torch.bfloat16
+        seq_lens.total_len, num_local_heads, qk_head_dim, dtype=torch.bfloat16
     ).to("cuda")
-    k = torch.randn(sum(seq_lens), 1, qk_head_dim, dtype=torch.bfloat16).to("cuda")
-    v = torch.randn(sum(seq_lens), 1, v_head_dim, dtype=torch.bfloat16).to("cuda")
-
-    # Create metadata tensors
-    # Create b_start_loc using prefix sum logic
-    # b_start_loc[i] represents the starting index of the i-th batch in the concatenated tensor
-    # The last element is the total length (sum of all sequence lengths)
-    b_start_loc = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device="cuda")
-    for i in range(len(seq_lens)):
-        b_start_loc[i + 1] = b_start_loc[i] + seq_lens[i]
+    k = torch.randn(seq_lens.total_len, 1, qk_head_dim, dtype=torch.bfloat16).to("cuda")
+    v = torch.randn(seq_lens.total_len, 1, v_head_dim, dtype=torch.bfloat16).to("cuda")
 
     # Set attention parameters
-    max_seqlen_q = max_seq_len
-    max_seqlen_k = max_seq_len
     softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
     is_causal = True
     attn_backend = TritonAttnBackend(qk_nope_head_dim=qk_head_dim)
@@ -71,10 +57,7 @@ def test_triton_prefill_attn(num_local_heads, qk_head_dim, v_head_dim, bs):
         q,
         k,
         v,
-        b_start_loc,
-        b_start_loc,
-        max_seqlen_q,
-        max_seqlen_k,
+        seq_lens,
         causal=is_causal,
         window_size=(-1, -1),
         softcap=0,
@@ -83,14 +66,11 @@ def test_triton_prefill_attn(num_local_heads, qk_head_dim, v_head_dim, bs):
 
     # Run reference implementation
     ref_attn = RefAttnBackend()
-    new_o = ref_attn.prefill_ragged_qkvo(
+    ref_o = ref_attn.prefill_ragged_qkvo(
         q,
         k,
         v,
-        b_start_loc,
-        b_start_loc,
-        max_seqlen_q,
-        max_seqlen_k,
+        seq_lens,
         causal=is_causal,
         window_size=(-1, -1),
         softcap=0,
@@ -99,7 +79,7 @@ def test_triton_prefill_attn(num_local_heads, qk_head_dim, v_head_dim, bs):
 
     # Check if tensors are close
     assert torch.allclose(
-        o.to(torch.float32), new_o.to(torch.float32), atol=1e-2, rtol=1e-1
+        o.to(torch.float32), ref_o.to(torch.float32), atol=1e-2, rtol=1e-1
     )
 
 
@@ -352,11 +332,11 @@ def test_triton_decode_paged_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
     < packaging.version.parse("0.2.0"),
     reason="flashinfer is missing or too old",
 )
-@pytest.mark.parametrize("cu_seqlens_qk", [[0, 9, 22, 33]])
+@pytest.mark.parametrize("bs", [1, 9])
 @pytest.mark.parametrize("n_heads", [4])
 @pytest.mark.parametrize("n_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [256])
-def test_flashinfer_prefill_ragged_qkvo(cu_seqlens_qk, n_heads, n_kv_heads, head_dim):
+def test_flashinfer_prefill_ragged_qkvo(bs, n_heads, n_kv_heads, head_dim):
     torch.set_default_dtype(torch.float16)
     set_global_args(
         OmegaConf.create(
@@ -374,23 +354,22 @@ def test_flashinfer_prefill_ragged_qkvo(cu_seqlens_qk, n_heads, n_kv_heads, head
         need_ensure=False,
     )
 
+    seq_lens = VarLens(
+        [[1] * torch.randint(1, 128, (1,)).item() for _ in range(bs)], device="cuda"
+    )
+
     flashinfer_backend = FlashInferBackend(tot_num_blocks=51, qk_nope_head_dim=None)
     ref_backend = RefAttnBackend(qk_nope_head_dim=None)
 
-    seq_lens = cu_seqlens_qk[-1]
-    q = torch.randn((seq_lens, n_heads, head_dim)).cuda()
-    k = torch.randn((seq_lens, n_kv_heads, head_dim)).cuda()
-    v = torch.randn((seq_lens, n_kv_heads, head_dim)).cuda()
-    cu_seqlens_qk = torch.Tensor(cu_seqlens_qk).to(torch.int32).cuda()
+    q = torch.randn((seq_lens.total_len, n_heads, head_dim)).cuda()
+    k = torch.randn((seq_lens.total_len, n_kv_heads, head_dim)).cuda()
+    v = torch.randn((seq_lens.total_len, n_kv_heads, head_dim)).cuda()
 
     flashinfer_out = flashinfer_backend.prefill_ragged_qkvo(
         q,
         k,
         v,
-        cu_seqlens_qk,
-        cu_seqlens_qk,
-        2048,
-        2048,
+        seq_lens,
         causal=True,
         window_size=(-1, -1),
         softcap=0.0,
@@ -400,10 +379,7 @@ def test_flashinfer_prefill_ragged_qkvo(cu_seqlens_qk, n_heads, n_kv_heads, head
         q,
         k,
         v,
-        cu_seqlens_qk,
-        cu_seqlens_qk,
-        2048,
-        2048,
+        seq_lens,
         causal=True,
         window_size=(-1, -1),
         softcap=0.0,

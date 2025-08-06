@@ -271,8 +271,7 @@ def main(args: ServeConfig):
     logger.debug("finish init")
 
     rank = torch.distributed.get_rank()
-    if rank == 0:
-        warmup_engine(args)
+    warmup_engine(args)
 
     update_history = os.getenv("UPDATE_HISTORY", "false").lower() == "true"
     history_path = os.getenv("HISTORY_PATH", "./example/history/history.txt")

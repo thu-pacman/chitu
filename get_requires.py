@@ -9,6 +9,7 @@ setup_dir = os.path.dirname(os.path.abspath(__file__))
 install_requires = [
     # Don't put `torch` here because it requires downloading from a specific source
     "transformers",
+    "safetensors<0.6",  # 0.6 breaks on muxi
     "fire",
     "tiktoken>=0.7.0",  # Required by glm4
     "blobfile",

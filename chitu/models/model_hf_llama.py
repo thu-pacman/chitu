@@ -222,14 +222,7 @@ class AttentionHFLlama(Attention):
             xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
         )
         output = self.attn_backend.prefill_ragged_qkvo(
-            xq,
-            xk,
-            xv,
-            varlens.prefix_lens,
-            varlens.prefix_lens,
-            varlens.max_len,
-            varlens.max_len,
-            causal=True,
+            xq, xk, xv, varlens, causal=True
         ).view(bs_seq, -1)
         return self._run_output_linear(output)
 
@@ -878,8 +871,12 @@ class TransformerHFLlama(Transformer):
 
     def prepare_freqs_cis_prefill(self, varlens):
         return (
-            self.rotary_emb.cos_cached[self.cache.curr_varlens.position_ids],
-            self.rotary_emb.sin_cached[self.cache.curr_varlens.position_ids],
+            self.rotary_emb.cos_cached[
+                self.cache.curr_varlens.position_ids_tensor_device
+            ],
+            self.rotary_emb.sin_cached[
+                self.cache.curr_varlens.position_ids_tensor_device
+            ],
         )
 
     def prepare_freqs_cis_decode(self):

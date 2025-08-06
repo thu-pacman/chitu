@@ -64,9 +64,9 @@ class PagedKVCacheManager:
         self.max_seq_len = max_seq_len
         self.device = torch.device(device)
 
-        self.seq_lens = {}
+        self.seq_lens: Dict[str, int] = {}
         self.timers = get_timers()
-        self.block_table: Dict[int, List[int]] = {}  # (seq_id, block_idx)
+        self.block_table: Dict[str, List[int]] = {}  # (seq_id, block_idx)
         self.curr_seq_lens_gpu_excl_this_decode = StaticTensor(
             max_nelem=num_hot_req, dtype=torch.int32, device=self.device
         )
@@ -95,7 +95,30 @@ class PagedKVCacheManager:
             )
         else:
             self.paged_v_cache = None
-        self.reallocate_cache = False
+
+    def realloc(self, num_blocks):
+        self.num_blocks = min(num_blocks, self.max_num_blocks)
+        logger.info(
+            f"Reallocating KV cache to {self.num_blocks} blocks, each of size {self.block_size}"
+        )
+
+        self.free_blocks = deque(range(self.num_blocks))
+        has_k_cache = self.paged_k_cache is not None
+        has_v_cache = self.paged_v_cache is not None
+        if has_k_cache:
+            del self.paged_k_cache
+            self.paged_k_cache = torch.zeros(
+                (self.num_layers, self.num_blocks, self.block_size)
+                + self.k_shape_per_sample,
+                device=self.device,
+            )
+        if has_v_cache:
+            del self.paged_v_cache
+            self.paged_v_cache = torch.zeros(
+                (self.num_layers, self.num_blocks, self.block_size)
+                + self.v_shape_per_sample,
+                device=self.device,
+            )
 
     def get_block_size(self):
         return self.block_size
@@ -103,11 +126,55 @@ class PagedKVCacheManager:
     def get_num_blocks(self):
         return self.max_num_blocks
 
+    def prepare_cache_prefill(self, req_ids: List[str], varlens: VarLens):
+        self.curr_varlens = varlens
+        self.curr_req_ids = req_ids
+
+        block_idxs = []
+        indices_in_block = []
+        for req_id, seq_len in zip(req_ids, varlens.lens_list):
+            # 设置其他函数会用到的变量
+            self.seq_lens[req_id] = seq_len
+
+            # 为请求分配blocks
+            num_blocks_prepared = (seq_len + self.block_size - 1) // self.block_size
+            block_ids = [self.get_free_block() for _ in range(num_blocks_prepared)]
+            self.block_table[req_id] = block_ids
+
+            # 计算每个元素对应的block id 和 block内的索引
+            num_full_block, remainder = divmod(seq_len, self.block_size)
+            if num_full_block > 0:
+                block_idxs.extend(
+                    [
+                        block_id
+                        for block_id in block_ids[:num_full_block]
+                        for _ in range(self.block_size)
+                    ]
+                )
+                indices_in_block.extend(
+                    [i for i in range(self.block_size) for _ in range(num_full_block)]
+                )
+            if remainder > 0:
+                block_idxs.extend([block_ids[num_full_block]] * remainder)
+                indices_in_block.extend([i for i in range(remainder)])
+
+        # 在不同layer间共享
+        self.new_tokens_block_indices = torch.tensor(
+            block_idxs,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.new_tokens_indices_in_block = torch.tensor(
+            indices_in_block,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
     # Init block table and kv cache with kv generated during prefill
     def finalize_cache_bylayer_prefill(
         self,
-        xk: torch.Tensor,
-        xv: torch.Tensor,
+        xk: Optional[torch.Tensor],
+        xv: Optional[torch.Tensor],
         req_ids: List[str],
         varlens: VarLens,
         layer_id: int,
@@ -115,32 +182,6 @@ class PagedKVCacheManager:
         self.timers("cache_finalize_cache_all_prefill").start()
 
         layer_idx = layer_id - self.begin_layer_id
-        has_k_cache = self.paged_k_cache is not None
-        has_v_cache = self.paged_v_cache is not None
-
-        # reallocate cache blocks according to available memory
-        if not self.reallocate_cache:
-            infer_args = get_global_args().infer
-            if infer_args.num_blocks != -1 and infer_args.num_blocks != self.num_blocks:
-                self.num_blocks = min(infer_args.num_blocks, self.max_num_blocks)
-                self.free_blocks = deque(range(self.num_blocks))
-                if has_k_cache:
-                    del self.paged_k_cache
-                    torch.cuda.empty_cache()
-                    self.paged_k_cache = torch.zeros(
-                        (self.num_layers, self.num_blocks, self.block_size)
-                        + self.k_shape_per_sample,
-                        device=self.device,
-                    )
-                if has_v_cache:
-                    del self.paged_v_cache
-                    torch.cuda.empty_cache()
-                    self.paged_v_cache = torch.zeros(
-                        (self.num_layers, self.num_blocks, self.block_size)
-                        + self.v_shape_per_sample,
-                        device=self.device,
-                    )
-                self.reallocate_cache = True
 
         if (
             get_global_args().infer.attn_type == "npu"
@@ -151,67 +192,26 @@ class PagedKVCacheManager:
             xk = xk.view(xk.shape[0], -1).contiguous() if xk is not None else None
             xv = xv.view(xv.shape[0], -1).contiguous() if xv is not None else None
 
-        if layer_idx == 0:
-            block_idxs = []
-            indices_in_block = []
-            for req_id, seq_len in zip(req_ids, varlens.cpu_lens):
-                # 设置其他函数会用到的变量
-                self.seq_lens[req_id] = seq_len
-
-                # 为请求分配blocks
-                num_blocks_prepared = (seq_len + self.block_size - 1) // self.block_size
-                block_ids = [self.get_free_block() for _ in range(num_blocks_prepared)]
-                self.block_table[req_id] = block_ids
-
-                # 计算每个元素对应的block id 和 block内的索引
-                num_full_block, remainder = divmod(seq_len, self.block_size)
-                if num_full_block > 0:
-                    block_idxs.extend(
-                        [
-                            block_id
-                            for block_id in block_ids[:num_full_block]
-                            for _ in range(self.block_size)
-                        ]
-                    )
-                    indices_in_block.extend(
-                        [
-                            i
-                            for i in range(self.block_size)
-                            for _ in range(num_full_block)
-                        ]
-                    )
-                if remainder > 0:
-                    block_idxs.extend([block_ids[num_full_block]] * remainder)
-                    indices_in_block.extend([i for i in range(remainder)])
-
-            # 在不同layer间共享
-            self.block_idxs = torch.tensor(
-                block_idxs,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            self.indices_in_block = torch.tensor(
-                indices_in_block,
-                dtype=torch.int32,
-                device=self.device,
-            )
-
-        if has_k_cache:
+        if xk is not None:
+            assert self.paged_k_cache is not None
             self.paged_k_cache[layer_idx].index_put_(
-                (self.block_idxs, self.indices_in_block), xk
+                (self.new_tokens_block_indices, self.new_tokens_indices_in_block), xk
             )
-        if has_v_cache:
+        if xv is not None:
+            assert self.paged_v_cache is not None
             self.paged_v_cache[layer_idx].index_put_(
-                (self.block_idxs, self.indices_in_block), xv
+                (self.new_tokens_block_indices, self.new_tokens_indices_in_block), xv
             )
 
         self.timers("cache_finalize_cache_all_prefill").stop()
 
-    def finalize_cache_all_prefill(self, req_ids=None, varlens=None):
+    def finalize_cache_all_prefill(self):
         self.curr_varlens = None
         self.curr_req_ids = None
 
     def prepare_cache_decode(self, req_ids):
+        self.curr_req_ids = req_ids
+
         seq_lens = []
         for req_id in req_ids:
             seq_len = self.seq_lens[req_id]
@@ -223,6 +223,27 @@ class PagedKVCacheManager:
         self.curr_seq_lens_gpu_incl_this_decode.set(
             self.curr_seq_lens_gpu_excl_this_decode.get() + 1
         )
+
+        # Prepare enough block table for next decoding. When decoding, AttnBackend will fill new kv into
+        # paged kv cache in place.
+        for req_id in req_ids:
+            if self.seq_lens[req_id] % self.block_size == 0:
+                self.block_table[req_id].append(self.get_free_block())
+
+        if get_global_args().infer.use_cuda_graph:
+            max_block_num = self.max_blocks_per_req
+        else:
+            max_block_num = max(len(self.block_table[req_id]) for req_id in req_ids)
+
+        all_block_ids = [
+            # pad the block ids to max_block_num
+            self.block_table[req_id]
+            + [0] * (max_block_num - len(self.block_table[req_id]))
+            for req_id in req_ids
+        ]
+        cpu_block_table_tensor = torch.tensor(all_block_ids, dtype=torch.int32)
+        self.gpu_block_table.set_shape(cpu_block_table_tensor.shape)
+        self.gpu_block_table.get().copy_(cpu_block_table_tensor, non_blocking=True)
 
     def get_free_block(self):
         # TODO: When run out of free blocks, use scheduling and preemption in paper instead of exception
@@ -262,27 +283,6 @@ class PagedKVCacheManager:
         del self.block_table[req_id]
         del self.seq_lens[req_id]
         self.timers("free_req_cache_blocks").stop()
-
-    # Prepare enough block table for next decoding. When decoding, flash attention will fill new kv into paged kv cache (inplace).
-    def prepare_block_table_for_decode(self, req_ids):
-        for req_id in req_ids:
-            if self.seq_lens[req_id] % self.block_size == 0:
-                self.block_table[req_id].append(self.get_free_block())
-
-        if get_global_args().infer.use_cuda_graph:
-            max_block_num = self.max_blocks_per_req
-        else:
-            max_block_num = max(len(self.block_table[req_id]) for req_id in req_ids)
-
-        all_block_ids = [
-            # pad the block ids to max_block_num
-            self.block_table[req_id]
-            + [0] * (max_block_num - len(self.block_table[req_id]))
-            for req_id in req_ids
-        ]
-        cpu_block_table_tensor = torch.tensor(all_block_ids, dtype=torch.int32)
-        self.gpu_block_table.set_shape(cpu_block_table_tensor.shape)
-        self.gpu_block_table.get().copy_(cpu_block_table_tensor, non_blocking=True)
 
     def finalize_cache_single_decode(self, req_ids):
         for req_id in req_ids:
@@ -391,58 +391,72 @@ class KVCacheManagerSkewAware:
         self.rounded_max_seq = -1
         self.slot_handle = get_slot_handle()
 
-    # Prefill:
-    # return for every req [layer, seq, n_local_kv_heads, head_dim] * 2 (for k and v)
-    def finalize_cache_bylayer_prefill(
-        self, cache_k, cache_v, req_ids, varlen, layer_id
-    ):
-        self.timers("cache_finalize_cache_all_prefill").start()
-        if (
-            get_global_args().infer.attn_type == "npu"
-            and len(self.k_shape_per_sample) == 1
-        ):
-            # NPU BSH layout
-            cache_k = cache_k.view(cache_k.shape[0], -1).contiguous()
-            cache_v = cache_v.view(cache_v.shape[0], -1).contiguous()
+    def prepare_cache_prefill(self, req_ids: List[str], varlens: VarLens):
+        self.curr_varlens = varlens
+        self.curr_req_ids = req_ids
 
         if self.slot_handle:
             start_idx, _ = self.slot_handle.get_current_slot_start_end_idx()
         else:
             start_idx = 0
-        if layer_id == self.begin_layer_id:
-            for it, req_id in enumerate(req_ids):
-                self.seq_lens[req_id] = varlen.cpu_lens[it]
-                for i in range(start_idx, self.num_hot_req):
-                    if self.slot_availability[i]:
-                        self.req2slot[req_id] = i
-                        self.slot_availability[i] = False
-                        self.hot_reqs[i] = req_id
-                        break
-                assert (
-                    req_id in self.req2slot
-                ), f"Cannot allocate slot: {req_id} {self.req2slot}"
+        for it, req_id in enumerate(req_ids):
+            self.seq_lens[req_id] = varlens.lens_list[it]
+            for i in range(start_idx, self.num_hot_req):
+                if self.slot_availability[i]:
+                    self.req2slot[req_id] = i
+                    self.slot_availability[i] = False
+                    self.hot_reqs[i] = req_id
+                    break
+            assert (
+                req_id in self.req2slot
+            ), f"Cannot allocate slot: {req_id} {self.req2slot}"
+
+    # Prefill:
+    def finalize_cache_bylayer_prefill(
+        self,
+        xk: Optional[torch.Tensor],
+        xv: Optional[torch.Tensor],
+        req_ids: List[str],
+        varlens: VarLens,
+        layer_id: int,
+    ):
+        self.timers("cache_finalize_cache_all_prefill").start()
+
+        if (
+            get_global_args().infer.attn_type == "npu"
+            and len(self.k_shape_per_sample) == 1
+        ):
+            # NPU BSH layout
+            xk = xk.view(xk.shape[0], -1).contiguous() if xk is not None else None
+            xv = xv.view(xv.shape[0], -1).contiguous() if xv is not None else None
 
         start = 0
         for it, req_id in enumerate(req_ids):
-            end = start + varlen.cpu_lens[it]
-            if self.k_buffer is not None:
+            end = start + varlens.lens_list[it]
+            if xk is not None:
+                assert self.k_buffer is not None
                 self.k_buffer[layer_id - self.begin_layer_id][self.req2slot[req_id]][
-                    : varlen.cpu_lens[it]
-                ] = cache_k[start:end]
-            if self.v_buffer is not None:
+                    : varlens.lens_list[it]
+                ] = xk[start:end]
+            if xv is not None:
+                assert self.v_buffer is not None
                 self.v_buffer[layer_id - self.begin_layer_id][self.req2slot[req_id]][
-                    : varlen.cpu_lens[it]
-                ] = cache_v[start:end]
+                    : varlens.lens_list[it]
+                ] = xv[start:end]
             start = end
+
         self.timers("cache_finalize_cache_all_prefill").stop()
 
     # Prefill:
-    def finalize_cache_all_prefill(self, req_ids=None, varlen=None):
-        pass
+    def finalize_cache_all_prefill(self):
+        self.curr_varlens = None
+        self.curr_req_ids = None
 
     # Decode:
     def prepare_cache_decode(self, req_ids):
         self.timers("cache_prepare").start()
+
+        self.curr_req_ids = req_ids
 
         seq_lens = []
         for req_id in req_ids:

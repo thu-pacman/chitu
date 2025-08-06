@@ -65,14 +65,6 @@ def init_logger(logging_level=logging.INFO):
         base_logger.addHandler(handler)
 
 
-def should_calculate_blocks(args):
-    return (
-        args.infer.cache_type == "paged"
-        and args.infer.num_blocks == -1
-        and torch.distributed.get_rank() == 0
-    )
-
-
 def init_cache_static():
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(0)
@@ -102,49 +94,83 @@ def get_additional_block_num(
         * tuple_product(cache_manager.k_shape_per_sample)
         * cache_manager.num_layers
     )
-    if cache_manager.v_shape_per_sample is not None:
-        block_mem *= 2
+    block_mem *= (1 if cache_manager.k_shape_per_sample is not None else 0) + (
+        1 if cache_manager.v_shape_per_sample is not None else 0
+    )
     num_blocks = int(additional_kv_cache_memory) // block_mem
-    if num_blocks < 0:
-        num_blocks = 0
-    return num_blocks
+    return max(0, num_blocks)
 
 
 def warmup_engine(args):
+    if args.infer.pp_size > 1 and args.infer.cache_type == "paged":
+        assert isinstance(Backend.cache_manager, PagedKVCacheManager)
+        logger.warning("Warming-up is not supported when PP is enabled. Skipping")
+        if args.infer.num_blocks == -1:
+            logger.warning(
+                "Auto infer.num_blocks (infer.num_blocks=-1) relies on warming-up to calculate the number of "
+                "blocks, but this is not supported when PP is enabled. A safe but inefficient value is used."
+            )
+            new_num_block = (
+                args.infer.max_reqs
+                * args.infer.max_seq_len
+                // Backend.cache_manager.block_size
+            )
+            get_global_args().infer.num_blocks = new_num_block
+            Backend.cache_manager.realloc(new_num_block)
+        return
+
+    rank = torch.distributed.get_rank()
+
     logger.warning("Starting inference system warmup...")
+
     init_cache_static()
     num_warmup_reqs = args.infer.max_reqs
+    warmup_seq_len = 1
+    warmup_max_new_tokens = 2
+    if rank == 0:
+        for i in range(num_warmup_reqs):
+            # TODO: After we implement chunked prefill, use the chunk size here for warmup_seq_len
+            req = MockFixedLengthedUserRequest(
+                warmup_seq_len,
+                f"{gen_req_id()}",
+                max_new_tokens=warmup_max_new_tokens,
+                temperature=0.7,
+                top_k=1,
+            )
+            task = Task(f"{req.request_id}", req, stop_with_eos=False)
+            TaskPool.add(task)
+            logger.warning(f"Added {num_warmup_reqs} warmup requests to TaskPool")
 
-    for i in range(num_warmup_reqs):
-        # TODO: After we implement chunked prefill, use the chunk size here for warmup_seq_len
-        warmup_seq_len = 1
-        warmup_max_new_tokens = 2
-        req = MockFixedLengthedUserRequest(
-            warmup_seq_len,
-            f"{gen_req_id()}",
-            max_new_tokens=warmup_max_new_tokens,
-            temperature=0.7,
-            top_k=1,
-        )
-        task = Task(f"{req.request_id}", req)
-        TaskPool.add(task)
-
-    logger.warning(f"Added {num_warmup_reqs} warmup requests to TaskPool")
-
-    while len(TaskPool.pool) > 0:
+    if rank > 0:
+        chitu_run()  # An extra run is needed because our implementation is asymmetric
+    for _ in range(warmup_max_new_tokens):
         chitu_run()
-    if should_calculate_blocks(args):
+
+    if rank == 0:
+        assert len(TaskPool.pool) == 0, "TaskPool should be empty after warmup"
+
+    logger.warning("Inference system warmup completed")
+
+    if args.infer.cache_type == "paged" and args.infer.num_blocks == -1:
         assert isinstance(Backend.cache_manager, PagedKVCacheManager)
         _, total_gpu_memory = torch.cuda.mem_get_info(0)
         gpu_memory_utilization = args.infer.gpu_memory_utilization
-        get_global_args().infer.num_blocks = (
+        new_num_block = (
             get_additional_block_num(
                 total_gpu_memory, Backend.cache_manager, gpu_memory_utilization
             )
             + Backend.cache_manager.num_blocks
         )
 
-    logger.warning("Inference system warmup completed")
+        if torch.distributed.get_world_size() > 1:
+            new_num_block_tensor = torch.tensor(new_num_block).cuda()
+            torch.distributed.all_reduce(
+                new_num_block_tensor, torch.distributed.ReduceOp.RedOpType.MIN
+            )
+            new_num_block = new_num_block_tensor.item()
+
+        get_global_args().infer.num_blocks = new_num_block
+        Backend.cache_manager.realloc(new_num_block)
 
 
 def check_checkpoint_path(args):

@@ -198,14 +198,7 @@ class Attention(nn.Module):
             xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
         )
         output = self.attn_backend.prefill_ragged_qkvo(
-            xq,
-            xk,
-            xv,
-            varlens.prefix_lens,
-            varlens.prefix_lens,
-            varlens.max_len,
-            varlens.max_len,
-            causal=True,
+            xq, xk, xv, varlens, causal=True
         ).view(bs_seq, -1)
         return self._run_output_linear(output)
 
@@ -751,7 +744,9 @@ class Transformer(nn.Module):
         )
 
     def prepare_freqs_cis_prefill(self, varlens):
-        curr_freqs_cis = self.freqs_cis[self.cache.curr_varlens.position_ids]
+        curr_freqs_cis = self.freqs_cis[
+            self.cache.curr_varlens.position_ids_tensor_device
+        ]
         return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
 
     def prepare_freqs_cis_decode(self):
@@ -765,7 +760,7 @@ class Transformer(nn.Module):
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):
             h = layer(h, freqs_cis_cos, freqs_cis_sin, varlens)
-        tmp = varlens.cpu_prefix_lens[1:]
+        tmp = varlens.prefix_lens_list[1:]
         h = h[[item - 1 for item in tmp]]
         h = self._post_layers(h)  # Exec post layers AFTER cutting the last token off
         h = h.float()
@@ -796,7 +791,7 @@ class Transformer(nn.Module):
             h = layer(h, freqs_cis_cos, freqs_cis_sin, varlens)
         # end of model
         if self.pp_stage == self.pp_end_stage:
-            tmp = varlens.cpu_prefix_lens[1:]
+            tmp = varlens.prefix_lens_list[1:]
             h = h[[item - 1 for item in tmp]]
             h = self._post_layers(
                 h

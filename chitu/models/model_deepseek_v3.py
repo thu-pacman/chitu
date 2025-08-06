@@ -278,15 +278,7 @@ class AttentionDeepSeekV3(Attention):
             )
 
             x = self.attn_backend.prefill_ragged_qkvo(
-                q,
-                k,
-                v,
-                varlens.prefix_lens,
-                varlens.prefix_lens,
-                varlens.max_len,
-                varlens.max_len,
-                causal=True,
-                softmax_scale=self.softmax_scale,
+                q, k, v, varlens, causal=True, softmax_scale=self.softmax_scale
             )
 
         elif self.mla_absorb == "absorb-without-precomp" or self.mla_absorb == "absorb":
@@ -310,10 +302,7 @@ class AttentionDeepSeekV3(Attention):
                 q_nope_pe.view(-1, q_nope_pe.shape[-2], q_nope_pe.shape[-1]),
                 kv.view(-1, 1, kv.shape[-1]),
                 kv_cache.view(-1, 1, kv_cache.shape[-1]),
-                varlens.prefix_lens,
-                varlens.prefix_lens,
-                varlens.max_len,
-                varlens.max_len,
+                varlens,
                 causal=True,
                 softmax_scale=self.softmax_scale,
             )
@@ -1412,7 +1401,7 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def prepare_freqs_cis_prefill(self, varlens):
-        index = self.cache.curr_varlens.position_ids
+        index = self.cache.curr_varlens.position_ids_tensor_device
         return self.freqs_cis_real[index], self.freqs_cis_imag[index]
 
     @override

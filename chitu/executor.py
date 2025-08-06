@@ -435,10 +435,8 @@ class Executor:
         return out
 
     def prefill_step(self, tasks: PackedTasksBase):
-
         varlens = VarLens(tasks.tokens, device=self.local_rank)
-        Backend.cache_manager.curr_varlens = varlens
-        Backend.cache_manager.curr_req_ids = tasks.req_ids
+        Backend.cache_manager.prepare_cache_prefill(tasks.req_ids, varlens)
 
         num_tokens = tasks.num_tokens
 
@@ -472,9 +470,6 @@ class Executor:
 
     def decode_step(self, tasks: PackedTasksBase):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
-        Backend.cache_manager.curr_req_ids = tasks.req_ids
-        if isinstance(Backend.cache_manager, PagedKVCacheManager):
-            Backend.cache_manager.prepare_block_table_for_decode(tasks.req_ids)
         seq_lens = self._prepare_seq_lens_for_decode(tasks)
 
         num_tokens = tasks.num_tasks
