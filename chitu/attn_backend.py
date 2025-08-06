@@ -27,7 +27,7 @@ from chitu.device_type import is_muxi
 from chitu.global_vars import get_global_args
 from chitu.ops import append_to_non_paged_kv_cache, append_to_paged_kv_cache
 from chitu.static_tensor import StaticTensor
-from chitu.utils import try_import_opt_dep, try_import_platform_dep
+from chitu.utils import try_import_opt_dep, try_import_platform_dep, VarLens
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
@@ -72,10 +72,7 @@ class AttnBackend(abc.ABC):
         q,
         k,
         v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
+        seqlens: VarLens,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -107,12 +104,7 @@ class AttnBackend(abc.ABC):
             q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
             k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
             v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-            cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
-               of the sequences in the batch, used to index into q.
-            cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
-               of the sequences in the batch, used to index into kv.
-            max_seqlen_q: int. Maximum query sequence length in the batch.
-            max_seqlen_k: int. Maximum key sequence length in the batch.
+            seqlens: VarLens. The sequence lengths of the sequences in the batch.
             Default to 1 / sqrt(headdim).
             causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
             window_size: (left, right). If not (-1, -1), implements sliding window local attention.
@@ -373,10 +365,7 @@ class FlashAttnBackend(AttnBackend):
         q,
         k,
         v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
+        seqlens: VarLens,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -392,10 +381,10 @@ class FlashAttnBackend(AttnBackend):
             q,
             k,
             v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
+            seqlens.prefix_lens_tensor_device,
+            seqlens.prefix_lens_tensor_device,
+            seqlens.max_len,
+            seqlens.max_len,
             causal=causal,
             window_size=window_size,
             softmax_scale=softmax_scale,
@@ -605,39 +594,36 @@ class RefAttnBackend(AttnBackend):
         q,
         k,
         v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
+        seqlens: VarLens,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
     ):
         q_batch = torch.zeros(
-            (cu_seqlens_q.shape[0] - 1,) + tuple(q.shape),
+            (seqlens.batch_size,) + tuple(q.shape),
             dtype=q.dtype,
             device=q.device,
         )
         k_batch = torch.zeros(
-            (cu_seqlens_k.shape[0] - 1,) + tuple(k.shape),
+            (seqlens.batch_size,) + tuple(k.shape),
             dtype=k.dtype,
             device=k.device,
         )
         v_batch = torch.zeros(
-            (cu_seqlens_k.shape[0] - 1,) + tuple(v.shape),
+            (seqlens.batch_size,) + tuple(v.shape),
             dtype=v.dtype,
             device=v.device,
         )
-        for i in range(cu_seqlens_q.shape[0] - 1):
-            q_batch[i, 0 : cu_seqlens_q[i + 1] - cu_seqlens_q[i]] = q[
-                cu_seqlens_q[i] : cu_seqlens_q[i + 1]
+        for i in range(seqlens.batch_size):
+            q_batch[i, 0 : seqlens.lens_list[i]] = q[
+                seqlens.prefix_lens_list[i] : seqlens.prefix_lens_list[i + 1]
             ]
-            k_batch[i, 0 : cu_seqlens_k[i + 1] - cu_seqlens_k[i]] = k[
-                cu_seqlens_k[i] : cu_seqlens_k[i + 1]
+            k_batch[i, 0 : seqlens.lens_list[i]] = k[
+                seqlens.prefix_lens_list[i] : seqlens.prefix_lens_list[i + 1]
             ]
-            v_batch[i, 0 : cu_seqlens_k[i + 1] - cu_seqlens_k[i]] = v[
-                cu_seqlens_k[i] : cu_seqlens_k[i + 1]
+            v_batch[i, 0 : seqlens.lens_list[i]] = v[
+                seqlens.prefix_lens_list[i] : seqlens.prefix_lens_list[i + 1]
             ]
         output_batch, _ = self._attention(
             q_batch,
@@ -649,17 +635,14 @@ class RefAttnBackend(AttnBackend):
             softmax_scale=softmax_scale,
         )
         output = torch.empty(
-            (cu_seqlens_q[-1] - cu_seqlens_q[0],) + output_batch.shape[2:],
+            (seqlens.total_len,) + output_batch.shape[2:],
             dtype=output_batch[0].dtype,
             device=output_batch[0].device,
         )
-        for i in range(cu_seqlens_q.shape[0] - 1):
-            # fmt: off
-            output[
-                cu_seqlens_q[i] - cu_seqlens_q[0] :
-                cu_seqlens_q[i + 1] - cu_seqlens_q[0]
-            ] = output_batch[i, 0 : cu_seqlens_q[i + 1] - cu_seqlens_q[i]]
-            # fmt: on
+        for i in range(seqlens.batch_size):
+            output[seqlens.prefix_lens_list[i] : seqlens.prefix_lens_list[i + 1]] = (
+                output_batch[i, 0 : seqlens.lens_list[i]]
+            )
         return output
 
     @override
@@ -811,17 +794,12 @@ class TritonAttnBackend(RefAttnBackend):
         q,
         k,
         v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
+        seqlens: VarLens,
         causal=False,
         window_size=(-1, -1),
         softcap=0,
         softmax_scale=None,
     ):
-        assert torch.equal(cu_seqlens_q, cu_seqlens_k)
-        seq_len = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
         B, local_n_heads, _ = q.shape
         _, _, v_n_hidden = v.shape
         output = torch.empty(
@@ -832,9 +810,9 @@ class TritonAttnBackend(RefAttnBackend):
             k,
             v,
             output,
-            cu_seqlens_q,
-            seq_len,
-            max_seqlen_q,
+            seqlens.prefix_lens_tensor_device,
+            seqlens.lens_tensor_device,
+            seqlens.max_len,
             softmax_scale,
             causal,
         )
@@ -1436,10 +1414,7 @@ class FlashInferBackend(TritonAttnBackend):
         q,
         k,
         v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
+        seqlens: VarLens,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -1449,8 +1424,8 @@ class FlashInferBackend(TritonAttnBackend):
         num_qo_heads = q.shape[-2]
         num_kv_heads = k.shape[-2]
         self.prefill_wrapper.plan(
-            cu_seqlens_q,
-            cu_seqlens_k,
+            seqlens.prefix_lens_tensor_device,
+            seqlens.prefix_lens_tensor_device,
             num_qo_heads,
             num_kv_heads,
             head_dim_qk=q.shape[-1],
@@ -1611,7 +1586,6 @@ class NpuAttnBackend(RefAttnBackend):
             return attn_mask
 
         self.attn_mask = generate_attn_mask(varlens.max_len, torch.bfloat16).cuda()
-        self.seq_lens_tensor_cpu = varlens.seq_lens_tensor_cpu
 
     def prepare_metadata_for_decode(
         self,
@@ -1644,10 +1618,7 @@ class NpuAttnBackend(RefAttnBackend):
         q,
         k,
         v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
+        seqlens: VarLens,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -1658,10 +1629,7 @@ class NpuAttnBackend(RefAttnBackend):
                 q,
                 k,
                 v,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
+                seqlens,
                 causal,
                 window_size,
                 softcap,
@@ -1675,7 +1643,7 @@ class NpuAttnBackend(RefAttnBackend):
             key=k,
             value=v,
             mask=self.attn_mask,
-            seq_len=self.seq_lens_tensor_cpu,
+            seq_len=seqlens.lens_tensor_cpu,
             scale_value=self.scale,
             num_heads=self.local_n_heads,
             num_kv_heads=self.local_n_kv_heads,
@@ -1838,12 +1806,26 @@ class HybridAttnBackend(AttnBackend):
 
     @override
     def prefill_ragged_qkvo(
-        self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs
+        self,
+        q,
+        k,
+        v,
+        seqlens: VarLens,
+        causal=False,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
     ):
-        batch_size = cu_seqlens_q.shape[0] - 1
-        self.current_backend = self._select_backend(batch_size)
+        self.current_backend = self._select_backend(seqlens.batch_size)
         return self.current_backend.prefill_ragged_qkvo(
-            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs
+            q,
+            k,
+            v,
+            seqlens,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            softmax_scale=softmax_scale,
         )
 
     @override

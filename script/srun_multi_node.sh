@@ -20,7 +20,7 @@ THIS_SCRIPT=$(realpath $0)
 
 if [[ "$3" != "--node" ]]; then
     COMMAND=${@:3}
-    PARAMS="--job-name $JOB_NAME --nodes $NODES --ntasks-per-node $NTASKS_PER_NODE --cpus-per-task $NUM_CPUS --mem $NUM_MEMS --gres=gpu:$NUM_GPUS"
+    PARAMS="--pty --job-name $JOB_NAME --nodes $NODES --ntasks-per-node $NTASKS_PER_NODE --cpus-per-task $NUM_CPUS --mem $NUM_MEMS --gres=gpu:$NUM_GPUS"
     exec srun $PARAMS $THIS_SCRIPT $1 $2 --node $COMMAND
 fi
 

@@ -759,6 +759,7 @@ def moe_align_block_size_cuda(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
+    num_experts += 1
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
@@ -1424,7 +1425,13 @@ def fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     soft_fp8: bool = False,
+    experts_start_idx: int = 0,
 ) -> torch.Tensor:
+
+    n_local_experts = w1.shape[0]
+    topk_ids = topk_ids - experts_start_idx
+    mask = (topk_ids < 0) | (topk_ids >= n_local_experts)
+    topk_ids[mask] = n_local_experts
 
     if inplace:
         inplace_fused_experts(

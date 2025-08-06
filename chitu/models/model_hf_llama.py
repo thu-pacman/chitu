@@ -105,11 +105,20 @@ class AttentionHFLlama(Attention):
         qkv_has_bias = args.qkv_has_bias if hasattr(args, "qkv_has_bias") else True
         o_has_bias = args.o_has_bias if hasattr(args, "o_has_bias") else False
 
+        if hasattr(args, "no_input_scale"):
+            quant_kwargs = {"blockfp4": {"no_input_scale": args.no_input_scale}}
+        else:
+            quant_kwargs = {}
+
         qkv_proj_linear = get_linear_layout_contig_y(
-            op_impl, checkpoint_prefix=f"{checkpoint_prefix}.qkv_proj"
+            op_impl,
+            checkpoint_prefix=f"{checkpoint_prefix}.qkv_proj",
+            quant_kwargs=quant_kwargs,
         )
         o_proj_linear = get_linear_layout_contig_y(
-            op_impl, checkpoint_prefix=f"{checkpoint_prefix}.o_proj"
+            op_impl,
+            checkpoint_prefix=f"{checkpoint_prefix}.o_proj",
+            quant_kwargs=quant_kwargs,
         )
         if self.merge_qkv:
             self.qkv_proj = ColumnParallelLinear(
@@ -213,14 +222,7 @@ class AttentionHFLlama(Attention):
             xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
         )
         output = self.attn_backend.prefill_ragged_qkvo(
-            xq,
-            xk,
-            xv,
-            varlens.prefix_lens,
-            varlens.prefix_lens,
-            varlens.max_len,
-            varlens.max_len,
-            causal=True,
+            xq, xk, xv, varlens, causal=True
         ).view(bs_seq, -1)
         return self._run_output_linear(output)
 
@@ -424,6 +426,7 @@ class TransformerBlockHFLlama(TransformerBlock):
             op_impl=op_impl,
             checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
         )
+
         self.mlp = mlp_type(
             args,
             op_impl=op_impl,
@@ -868,8 +871,12 @@ class TransformerHFLlama(Transformer):
 
     def prepare_freqs_cis_prefill(self, varlens):
         return (
-            self.rotary_emb.cos_cached[self.cache.curr_varlens.position_ids],
-            self.rotary_emb.sin_cached[self.cache.curr_varlens.position_ids],
+            self.rotary_emb.cos_cached[
+                self.cache.curr_varlens.position_ids_tensor_device
+            ],
+            self.rotary_emb.sin_cached[
+                self.cache.curr_varlens.position_ids_tensor_device
+            ],
         )
 
     def prepare_freqs_cis_decode(self):

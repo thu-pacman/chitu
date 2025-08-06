@@ -89,8 +89,7 @@ def gen_reqs(num_reqs, max_new_tokens):
 
 def run_pipe_or_tensor_parallelism(args, timers):
     rank = torch.distributed.get_rank()
-    if rank == 0:
-        warmup_engine(args)
+    warmup_engine(args)
 
     for i in range(2):
         if rank == 0:
@@ -130,8 +129,7 @@ def run_pipe_or_tensor_parallelism(args, timers):
 
 def run_normal(args, timers):
     rank = torch.distributed.get_rank()
-    if rank == 0:
-        warmup_engine(args)
+    warmup_engine(args)
 
     for i in range(2):
         reqs = gen_reqs(

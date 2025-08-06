@@ -198,14 +198,7 @@ class Attention(nn.Module):
             xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
         )
         output = self.attn_backend.prefill_ragged_qkvo(
-            xq,
-            xk,
-            xv,
-            varlens.prefix_lens,
-            varlens.prefix_lens,
-            varlens.max_len,
-            varlens.max_len,
-            causal=True,
+            xq, xk, xv, varlens, causal=True
         ).view(bs_seq, -1)
         return self._run_output_linear(output)
 
@@ -751,7 +744,9 @@ class Transformer(nn.Module):
         )
 
     def prepare_freqs_cis_prefill(self, varlens):
-        curr_freqs_cis = self.freqs_cis[self.cache.curr_varlens.position_ids]
+        curr_freqs_cis = self.freqs_cis[
+            self.cache.curr_varlens.position_ids_tensor_device
+        ]
         return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
 
     def prepare_freqs_cis_decode(self):
@@ -765,7 +760,7 @@ class Transformer(nn.Module):
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):
             h = layer(h, freqs_cis_cos, freqs_cis_sin, varlens)
-        tmp = varlens.cpu_prefix_lens[1:]
+        tmp = varlens.prefix_lens_list[1:]
         h = h[[item - 1 for item in tmp]]
         h = self._post_layers(h)  # Exec post layers AFTER cutting the last token off
         h = h.float()
@@ -796,7 +791,7 @@ class Transformer(nn.Module):
             h = layer(h, freqs_cis_cos, freqs_cis_sin, varlens)
         # end of model
         if self.pp_stage == self.pp_end_stage:
-            tmp = varlens.cpu_prefix_lens[1:]
+            tmp = varlens.prefix_lens_list[1:]
             h = h[[item - 1 for item in tmp]]
             h = self._post_layers(
                 h
@@ -975,6 +970,7 @@ class ParallelMoeBlock(nn.Module):
         self.shared_experts = non_fused_shared_experts
 
         self.token_dispatcher = get_token_dispatcher()
+        self.is_tp_mode = get_tp_size() > 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -986,27 +982,35 @@ class ParallelMoeBlock(nn.Module):
         Returns:
             torch.Tensor: Output tensor after expert routing and computation.
         """
-        weights, indices = self.gate(x.view(-1, x.shape[-1]))
+        shape = x.shape  # [TODO] unify decode hidden states shape
+        x = x.view(-1, x.shape[-1])
+        weights, indices = self.gate(x)
+
+        shared_y = None
+        if self.shared_experts is not None:
+            # Do this before `self.experts`, because `self.experts` may modify `x` in-place
+            shared_y = self.shared_experts(x)
 
         if self.token_dispatcher is not None:
             x, weights, indices = self.token_dispatcher.token_permutation(
                 x, weights, indices
             )
 
-        if self.shared_experts is not None:
-            # Do this before `self.experts`, because `self.experts` may modify `x` in-place
-            shared_y = self.shared_experts(x)
-
         y = self.experts(x, weights, indices)
 
-        if self.shared_experts is not None:
-            y += shared_y
-        if get_tp_size() > 1 and self.token_dispatcher is None:
-            torch.distributed.all_reduce(y, group=get_tp_group().gpu_group)
+        # Fuse allreduce to improve performance in TP mode
+        if self.is_tp_mode:
+            if shared_y is not None:
+                y += shared_y
+            if not self.token_dispatcher:
+                torch.distributed.all_reduce(y, group=get_tp_group().gpu_group)
 
         if self.token_dispatcher is not None:
             y = self.token_dispatcher.token_unpermutation(y)
-        return y
+
+        if shared_y is not None and not self.is_tp_mode:
+            y += shared_y
+        return y.view(shape)
 
 
 def get_linear_layout_native_y(

@@ -56,6 +56,7 @@ def Qwen3MoeExperts(
 
     split_size = get_tp_size() if get_ep_size() == 1 else 1
     assert args.moe_intermediate_dim % split_size == 0
+
     return base_moe_experts_class(
         dim=args.dim,
         moe_inter_dim=args.moe_intermediate_dim // split_size,
@@ -77,6 +78,10 @@ class ParallelMoeBlockQwen3(ParallelMoeBlock):
         base_moe_experts_class: Optional[type] = None,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
     ):
+
+        if hasattr(args, "no_input_scale"):
+            quant_kwargs = {"blockfp4": {"no_input_scale": args.no_input_scale}}
+
         super().__init__(
             gate=Qwen3MoeGate(args, op_impl),
             experts=Qwen3MoeExperts(
@@ -102,10 +107,10 @@ class TransformerBlockHFQwen3Moe(TransformerBlockHFLlama):
         checkpoint_prefix="",
     ):
         base_moe_experts_class = None
+        quant = get_quant_from_checkpoint_prefix(
+            f"{checkpoint_prefix}.mlp", args.quant_config.rules
+        )
         if op_impl == "muxi_custom_kernel":
-            quant = get_quant_from_checkpoint_prefix(
-                f"{checkpoint_prefix}.mlp", args.quant_config.rules
-            )
             if quant is None:
                 base_moe_experts_class = NormalMoeExpertsMuxiLayout
             elif quant == "blockfp8":

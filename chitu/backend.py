@@ -271,22 +271,7 @@ class Backend:
         kv_cache_kvargs = Backend._get_kv_cache_params(args)
 
         # Create appropriate cache manager
-        if args.infer.cache_type == "normal":
-            return KVCacheManager(
-                local_begin_layer_id,
-                local_end_layer_id,
-                **kv_cache_kvargs,
-            )
-        elif args.infer.cache_type == "nop":
-            return KVCacheManagerNop(
-                local_begin_layer_id,
-                local_end_layer_id,
-                max_seq_len=args.infer.max_seq_len,
-                num_hot_req=args.infer.max_reqs,
-                device=local_rank,
-                **kv_cache_kvargs,
-            )
-        elif args.infer.cache_type == "paged":
+        if args.infer.cache_type == "paged":
             block_size = 64 if args.infer.mla_absorb != "none" else 256
             if args.infer.attn_type == "npu":
                 block_size = 128

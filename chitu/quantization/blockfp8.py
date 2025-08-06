@@ -402,12 +402,12 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                     topk_ids=indices,
                     use_fp8_w8a8=True,
                     inplace=True,
-                    global_num_experts=self.n_routed_experts,
                     expert_map=self.expert_map,
                     w1_scale=gate_up_proj_scale,
                     w2_scale=down_proj_scale,
                     block_shape=[128, 128],
                     soft_fp8=fused_soft_fp8,
+                    experts_start_idx=self.experts_start_idx,
                 )
 
             else:
