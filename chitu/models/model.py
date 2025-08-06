@@ -971,7 +971,6 @@ class ParallelMoeBlock(nn.Module):
 
         self.token_dispatcher = get_token_dispatcher()
         self.is_tp_mode = get_tp_size() > 1
-        self.use_shared_experts = torch.distributed.get_rank() == 0 or self.is_tp_mode
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -983,27 +982,35 @@ class ParallelMoeBlock(nn.Module):
         Returns:
             torch.Tensor: Output tensor after expert routing and computation.
         """
-        weights, indices = self.gate(x.view(-1, x.shape[-1]))
+        shape = x.shape  # [TODO] unify decode hidden states shape
+        x = x.view(-1, x.shape[-1])
+        weights, indices = self.gate(x)
+
+        shared_y = None
+        if self.shared_experts is not None:
+            # Do this before `self.experts`, because `self.experts` may modify `x` in-place
+            shared_y = self.shared_experts(x)
 
         if self.token_dispatcher is not None:
             x, weights, indices = self.token_dispatcher.token_permutation(
                 x, weights, indices
             )
 
-        if self.shared_experts is not None and self.use_shared_experts:
-            # Do this before `self.experts`, because `self.experts` may modify `x` in-place
-            shared_y = self.shared_experts(x)
-
         y = self.experts(x, weights, indices)
 
-        if self.shared_experts is not None and self.use_shared_experts:
-            y += shared_y
-        if get_tp_size() > 1 and self.token_dispatcher is None:
-            torch.distributed.all_reduce(y, group=get_tp_group().gpu_group)
+        # Fuse allreduce to improve performance in TP mode
+        if self.is_tp_mode:
+            if shared_y is not None:
+                y += shared_y
+            if not self.token_dispatcher:
+                torch.distributed.all_reduce(y, group=get_tp_group().gpu_group)
 
         if self.token_dispatcher is not None:
             y = self.token_dispatcher.token_unpermutation(y)
-        return y
+
+        if shared_y is not None and not self.is_tp_mode:
+            y += shared_y
+        return y.view(shape)
 
 
 def get_linear_layout_native_y(

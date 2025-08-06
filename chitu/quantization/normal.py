@@ -552,11 +552,12 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
             torch.Tensor: Output tensor.
         """
         shape = x.size()
+        capturing = torch.cuda.is_current_stream_capturing()
 
         if torch.distributed.get_rank() == 0:
             indices = indices.contiguous().to(torch.int64)
             weights = weights.contiguous().to(torch.float32)
-            if x.shape[1] > 1:
+            if not capturing:
                 input_tensor = x.contiguous().cpu()
                 indices = indices.cpu()
                 weights = weights.cpu()
@@ -593,7 +594,7 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
                 )
 
         if torch.distributed.get_rank() == 0:
-            if x.shape[1] > 1:
+            if not capturing:
                 self.cpu_infer.sync()
                 y = output.to(x.device, non_blocking=True).view(shape)
             else:
