@@ -216,6 +216,7 @@ class Blockfp4LinearBase(QuantizedLinearBase):
         block_shape: Tuple[int, int] = (16, 1),
         block_shape_2: Optional[Tuple[int, int]] = None,
         act_block_size: int = 128,
+        no_input_scale: bool = False,
     ):
         super().__init__()
 
@@ -270,17 +271,18 @@ class Blockfp4LinearBase(QuantizedLinearBase):
         block_2_in, block_2_out = block_shape_2
         assert out_features % block_2_out == 0, f"{out_features=}, {block_2_out=}"
         assert in_features % block_2_in == 0, f"{in_features=}, {block_2_in=}"
-        self.register_parameter(
-            "input_scale",
-            torch.nn.Parameter(
-                torch.empty(
-                    out_features // block_2_out,
-                    in_features // block_2_in,
-                    dtype=torch.float32,
+        if not no_input_scale:
+            self.register_parameter(
+                "input_scale",
+                torch.nn.Parameter(
+                    torch.empty(
+                        out_features // block_2_out,
+                        in_features // block_2_in,
+                        dtype=torch.float32,
+                    ),
+                    requires_grad=False,
                 ),
-                requires_grad=False,
-            ),
-        )
+            )
         self.register_parameter(
             "weight_scale_2",
             torch.nn.Parameter(
@@ -364,6 +366,7 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
         merge_gate_up: bool,
         ############################################
         # No parameters specific to this quantization
+        no_input_scale: bool = False,
     ):
         """
         Initializes the MoE module.
@@ -464,15 +467,16 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
                 ),
                 requires_grad=False,
             )
-            self.gate_proj_input_scale = torch.nn.Parameter(
-                torch.empty(
-                    self.group_size,
-                    1,
-                    1,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
+            if not no_input_scale:
+                self.gate_proj_input_scale = torch.nn.Parameter(
+                    torch.empty(
+                        self.group_size,
+                        1,
+                        1,
+                        dtype=torch.float32,
+                    ),
+                    requires_grad=False,
+                )
             self.up_proj_weight = torch.nn.Parameter(
                 torch.empty(
                     self.group_size,
@@ -502,15 +506,16 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
                 ),
                 requires_grad=False,
             )
-            self.up_proj_input_scale = torch.nn.Parameter(
-                torch.empty(
-                    self.group_size,
-                    1,
-                    1,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
+            if not no_input_scale:
+                self.up_proj_input_scale = torch.nn.Parameter(
+                    torch.empty(
+                        self.group_size,
+                        1,
+                        1,
+                        dtype=torch.float32,
+                    ),
+                    requires_grad=False,
+                )
         down_proj_scale_in_features = ceil_div(moe_inter_dim, quant_scale_stride)
         down_proj_scale_out_features = dim
         self.down_proj_weight = torch.nn.Parameter(
@@ -542,15 +547,16 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
             ),
             requires_grad=False,
         )
-        self.down_proj_input_scale = torch.nn.Parameter(
-            torch.empty(
-                self.group_size,
-                1,
-                1,
-                dtype=torch.float32,
-            ),
-            requires_grad=False,
-        )
+        if not no_input_scale:
+            self.down_proj_input_scale = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    1,
+                    1,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
 
 
 class Blockfp4MoeExpertsPackKStride64(
@@ -607,7 +613,6 @@ class Blockfp4MoeExpertsPackKStride64(
                     topk_ids=indices,
                     use_fp4_w4a8=True,
                     inplace=True,
-                    global_num_experts=self.n_routed_experts,
                     expert_map=self.expert_map,
                     w1_scale=self.gate_up_proj_weight_scale,
                     w2_scale=self.down_proj_weight_scale,
@@ -615,6 +620,7 @@ class Blockfp4MoeExpertsPackKStride64(
                     w2_scale_2=self.down_proj_weight_scale_2,
                     block_shape=[128, 128],
                     soft_fp8=raise_to_16,
+                    experts_start_idx=self.experts_start_idx,
                 )
 
             else:
@@ -650,7 +656,6 @@ class Blockfp4MoeExpertsPackKStride64(
                     topk_ids=new_indices,
                     use_fp4_w4a8=True,
                     inplace=True,
-                    global_num_experts=self.n_routed_experts + self.n_shared_experts,
                     expert_map=self.expert_map,
                     w1_scale=self.gate_up_proj_weight_scale,
                     w2_scale=self.down_proj_weight_scale,

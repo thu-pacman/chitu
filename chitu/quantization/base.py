@@ -60,10 +60,8 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         if self.ep_group.is_last_rank:
             self.experts_end_idx += remainder
         if moe_world_size > 1:
-            expert_map = [-1] * self.n_routed_experts
-            expert_map[self.experts_start_idx : self.experts_end_idx] = list(
-                range(self.n_local_experts)
-            )
+            expert_map = [-1] * (self.n_local_experts + 1)
+            expert_map[:-1] = list(range(self.n_local_experts))
             self.expert_map = torch.tensor(expert_map, dtype=torch.int32, device="cuda")
         else:
             self.expert_map = None

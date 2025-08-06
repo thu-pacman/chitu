@@ -105,11 +105,20 @@ class AttentionHFLlama(Attention):
         qkv_has_bias = args.qkv_has_bias if hasattr(args, "qkv_has_bias") else True
         o_has_bias = args.o_has_bias if hasattr(args, "o_has_bias") else False
 
+        if hasattr(args, "no_input_scale"):
+            quant_kwargs = {"blockfp4": {"no_input_scale": args.no_input_scale}}
+        else:
+            quant_kwargs = {}
+
         qkv_proj_linear = get_linear_layout_contig_y(
-            op_impl, checkpoint_prefix=f"{checkpoint_prefix}.qkv_proj"
+            op_impl,
+            checkpoint_prefix=f"{checkpoint_prefix}.qkv_proj",
+            quant_kwargs=quant_kwargs,
         )
         o_proj_linear = get_linear_layout_contig_y(
-            op_impl, checkpoint_prefix=f"{checkpoint_prefix}.o_proj"
+            op_impl,
+            checkpoint_prefix=f"{checkpoint_prefix}.o_proj",
+            quant_kwargs=quant_kwargs,
         )
         if self.merge_qkv:
             self.qkv_proj = ColumnParallelLinear(
@@ -424,6 +433,7 @@ class TransformerBlockHFLlama(TransformerBlock):
             op_impl=op_impl,
             checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
         )
+
         self.mlp = mlp_type(
             args,
             op_impl=op_impl,

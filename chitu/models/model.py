@@ -975,6 +975,8 @@ class ParallelMoeBlock(nn.Module):
         self.shared_experts = non_fused_shared_experts
 
         self.token_dispatcher = get_token_dispatcher()
+        self.is_tp_mode = get_tp_size() > 1
+        self.use_shared_experts = torch.distributed.get_rank() == 0 or self.is_tp_mode
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -993,13 +995,13 @@ class ParallelMoeBlock(nn.Module):
                 x, weights, indices
             )
 
-        if self.shared_experts is not None:
+        if self.shared_experts is not None and self.use_shared_experts:
             # Do this before `self.experts`, because `self.experts` may modify `x` in-place
             shared_y = self.shared_experts(x)
 
         y = self.experts(x, weights, indices)
 
-        if self.shared_experts is not None:
+        if self.shared_experts is not None and self.use_shared_experts:
             y += shared_y
         if get_tp_size() > 1 and self.token_dispatcher is None:
             torch.distributed.all_reduce(y, group=get_tp_group().gpu_group)

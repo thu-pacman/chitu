@@ -174,9 +174,9 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
                     topk_weights=weights,
                     topk_ids=indices,
                     inplace=True,
-                    global_num_experts=self.n_routed_experts,
                     expert_map=self.expert_map,
                     block_shape=[128, 128],
+                    experts_start_idx=self.experts_start_idx,
                 )
 
             else:
