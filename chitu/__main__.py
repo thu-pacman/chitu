@@ -1,4 +1,4 @@
-from chitu import serve
+from chitu.serve import main
 
 if __name__ == "__main__":
-    serve.main()
+    main()

@@ -67,7 +67,7 @@ def test_routing_distribution():
 
             start_time = time.time()
             response = requests.post(
-                f"{router_url}/v1/chat/completions/dp", json=test_request, timeout=20
+                f"{router_url}/v1/chat/completions", json=test_request, timeout=20
             )
             end_time = time.time()
 

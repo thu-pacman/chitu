@@ -150,7 +150,7 @@ def test_dp_availability(dp_size=None, concurrent_tests=None):
 
             start_time = time.time()
             response = requests.post(
-                f"{router_url}/v1/chat/completions/dp", json=test_request, timeout=30
+                f"{router_url}/v1/chat/completions", json=test_request, timeout=30
             )
             end_time = time.time()
 
@@ -230,7 +230,7 @@ def test_dp_availability(dp_size=None, concurrent_tests=None):
 
             start_time = time.time()
             response = requests.post(
-                f"{router_url}/v1/chat/completions/dp", json=test_request, timeout=20
+                f"{router_url}/v1/chat/completions", json=test_request, timeout=20
             )
             end_time = time.time()
 
@@ -352,7 +352,7 @@ def test_dp_availability(dp_size=None, concurrent_tests=None):
             }
 
             response = requests.post(
-                f"{router_url}/v1/chat/completions/dp", json=test_request, timeout=15
+                f"{router_url}/v1/chat/completions", json=test_request, timeout=15
             )
 
             if response.status_code == 200:

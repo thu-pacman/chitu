@@ -36,15 +36,18 @@ else:
     ext_modules = operators.get_extensions()
 
 
-cython_unsafe_files = glob.glob(
-    "chitu/ops/triton_ops/*.py"  # Triton kernels inside
-) + [
-    "fused_moe.py",  # Triton kernels inside
-    "triton_decode_attention.py",  # Triton kernels inside
-    "triton_flash_attention.py",  # Triton kernels inside
-    "__main__.py",  # Triton kernels inside
-    "serve.py",  # Reason unkown. Test not passed for Cython. (FIXME)
-]
+cython_unsafe_files = (
+    glob.glob("chitu/ops/triton_ops/*.py")  # Triton kernels inside
+    + [
+        "fused_moe.py",  # Triton kernels inside
+        "triton_decode_attention.py",  # Triton kernels inside
+        "triton_flash_attention.py",  # Triton kernels inside
+        "__main__.py",  # Triton kernels inside
+    ]
+    + [
+        "serve/*.py",  # Reason unkown. Test not passed for Cython. (FIXME)
+    ]
+)
 
 
 def is_cython_unsafe(path):
