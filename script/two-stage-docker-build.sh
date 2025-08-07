@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # This script implements a two-stage Docker build process, where the second stage mounts
 # devices, which is required by some of the backends like Muxi or Ascend.
 #

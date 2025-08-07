@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 defaults:
   - Qwen2.5-3B
   - quant_config: mix-awq-blockfp8

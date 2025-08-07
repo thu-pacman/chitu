@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from logging import getLogger
 from typing import Any, List, Mapping, Optional
@@ -913,6 +917,11 @@ class RotaryEmbeddingHFLlama(nn.Module):
                 # Based on https://github.com/huggingface/transformers/blob/3165eb7c2808832d0de86c8f508d9da6b2124044/src/transformers/modeling_rope_utils.py#L385
                 # licensed under Apache-2.0
 
+                # SPDX-SnippetBegin
+                # SPDX-License-Identifier: Apache-2.0
+                # SPDX-SnippetCopyrightText: 2025 HuggingFace
+                # SDPX—SnippetName: _compute_llama3_parameters from transformers
+
                 factor = rope_scaling.factor  # `8` in the original implementation
                 low_freq_factor = (
                     rope_scaling.low_freq_factor
@@ -946,7 +955,7 @@ class RotaryEmbeddingHFLlama(nn.Module):
                 inv_freq = torch.where(
                     is_medium_freq, smoothed_inv_freq, inv_freq_llama
                 )
-
+            # SPDX-SnippetEnd
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         t = torch.arange(

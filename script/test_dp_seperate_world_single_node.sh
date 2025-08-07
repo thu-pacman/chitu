@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # 🔧 DP=n 连续分组 + Router 混合模式测试脚本
 # 架构：1个Router + 2个连续DP组，每组1卡 (TP=1)
 # Router: 提供HTTP服务，负载均衡到DP组

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 name: Meta-Llama-3-8B-Instruct
 type: hf-llama
 source: "https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct (The default checkpoint. Not the \"original\" one)" # Just for displaying. No automatic download.

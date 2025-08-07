@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2025 kvcache-ai
+// SPDX-FileCopyrightText: 2025 ggml-org
+// SPDX-FileCopyrightText: 2025 Qingcheng.AI
+//
+// SPDX-License-Identifier: Apache-2.0 AND MIT
+
 /**
  * This file has adaption of open-source code from the following sources:
  * - https://github.com/kvcache-ai/ktransformers, licensed under Apache 2.0,

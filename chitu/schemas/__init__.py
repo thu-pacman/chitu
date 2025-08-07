@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 from hydra.core.config_store import ConfigStore
 from chitu.schemas.serve_config import ServeConfig
 from chitu.schemas.serve_config_rules import ServeConfigRules

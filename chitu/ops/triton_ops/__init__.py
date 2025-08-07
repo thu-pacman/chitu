@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 from chitu.ops.triton_ops.rotary import apply_rotary_pos_emb_triton
 from chitu.ops.triton_ops.activation import silu_and_mul_triton
 from chitu.ops.triton_ops.sampling import apply_frequency_penalty_triton

@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: 2025 Qingcheng.AI
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #ifndef CPU_INFER_HPP
 #define CPU_INFER_HPP
 

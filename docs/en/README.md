@@ -41,7 +41,11 @@ Chitu welcomes all forms of contributions! See [CONTRIBUTING](/docs/en/CONTRIBUT
 For questions or concerns, please submit issues.
 
 ## License
-Apache License v2.0 - see [LICENSE](/LICENSE). This repository contains third-party submodules under other open-source licenses found in `third_party/` with their respective license files.
+Apache License v2.0 - see [LICENSE](/LICENSE).
+
+This repository contains code snippets from other open-source projects, and their license information is annotated in the code with the SPDX format. The associated license information can be found in the `LICENSES/` directory.
+
+This repository contains third-party submodules under other open-source licenses found in `third_party/` with their respective license files.
 
 ## FAQ
 [中文](/docs/zh/FAQ.md) | [English](/docs/en/FAQ.md)

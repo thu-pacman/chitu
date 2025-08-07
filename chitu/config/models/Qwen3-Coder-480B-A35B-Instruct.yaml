@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 name: Qwen3-Coder-480B-A35B-Instruct
 type: hf-qwen-3-moe
 source: "https://huggingface.co/Qwen/Qwen3-Coder-480B-A35B-Instruct" # Just for displaying. No automatic download.

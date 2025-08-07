@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import (
     QuantizedLinearBase,

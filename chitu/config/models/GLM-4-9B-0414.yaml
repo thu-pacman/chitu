@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # NOTE: The model architecture of GLM-4-*B series and GLM-4-*B-0414 series is different.
 # This file is for the new GLM-4-*B-0414 series.
 

@@ -1,10 +1,15 @@
-"""
-This file has adaption of open-source code from the following sources:
-- https://github.com/kvcache-ai/ktransformers, licensed under Apache 2.0,
-  which is further adapted from https://github.com/99991/pygguf/blob/main/gguf.py, licensed under MIT,
-  which is further adapted from https://github.com/ggml-org/llama.cpp, licsend under MIT,
-  which is further adapted from https://github.com/ggml-org/ggml, licensed under MIT.
-"""
+# SPDX-FileCopyrightText: 2024 99991
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+# SPDX-FileCopyrightText: 2025 ggml-org
+# SPDX-FileCopyrightText: 2025 kvcache-ai
+#
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+#
+# This file has adaption of open-source code from the following sources:
+# - https://github.com/kvcache-ai/ktransformers, licensed under Apache 2.0,
+#   which is further adapted from https://github.com/99991/pygguf/blob/main/gguf.py, licensed under MIT,
+#   which is further adapted from https://github.com/ggml-org/llama.cpp, licsend under MIT,
+#   which is further adapted from https://github.com/ggml-org/ggml, licensed under MIT.
 
 # GGUF specification:
 # https://github.com/ggerganov/ggml/blob/master/docs/gguf.md

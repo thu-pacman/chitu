@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import time
 from logging import getLogger
 from typing import Iterable, List  # Please keep Python 3.8 compatible

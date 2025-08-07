@@ -1,45 +1,48 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Web API endpoints module for Chitu serve.
+Provides both standard and DP (Distributed Parallel) mode HTTP endpoints.
+"""
+
 import asyncio
 import logging
-import time, os
+import os
+import time
 from logging import getLogger
 from threading import Thread
 from typing import Any, List, Optional, Mapping, Annotated
 
-import hydra
 import torch
+import torch.distributed
 import uvicorn
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+
 from chitu.async_response import AsyncResponse
 from chitu.backend import Backend
-from chitu.chitu_main import chitu_init, chitu_run, warmup_engine
-from chitu.task import (
-    PackedTasksBase,
-    SerializedPackedTasksPayloadType,
-    Task,
-    TaskLoad,
-    TaskPool,
-    UserRequest,
-    TaskType,
-)
-from chitu.utils import get_config_dir_path, gen_req_id
-from chitu.schemas import ServeConfig
+from chitu.chitu_main import chitu_init, warmup_engine
 from chitu.global_vars import get_global_args
+from chitu.schemas import ServeConfig
+from chitu.task import Task, TaskLoad, TaskPool, UserRequest
+from chitu.utils import gen_req_id
+from chitu.serve.common import start_worker
 
 logger = getLogger(__name__)
 
-app = FastAPI()
-
-global_args = None
+# Global variables
 server_status = False
-min_batch_size = 1
 rank = 0
 
 # DP related globals
-dp_enabled = False
 dp_service_started = False
+
+# Create FastAPI app
+app = FastAPI()  # Unified API
 
 
 class HttpHeader(BaseModel):
@@ -69,10 +72,14 @@ class ChatRequest(BaseModel):
 
 
 def get_priority_from_api_key(api_key: str) -> int:
-    for item in global_args.serve.api_keys:
+    args = get_global_args()
+    for item in args.serve.api_keys:
         if item.key == api_key:
             return item.priority
     return 1
+
+
+# ====== Standard HTTP Endpoints ======
 
 
 @app.post("/v1/chat/completions")
@@ -80,22 +87,21 @@ async def create_chat_completion(
     request: ChatRequest, http_header: Annotated[HttpHeader, Header()]
 ):
     global server_status
-    global min_batch_size
+    from chitu.serve.common import min_batch_size
+
     if not server_status:
         return {"message": "Service is not started"}
-    if (
-        global_args.infer.cache_type == "skew"
-        and len(TaskPool.pool) >= global_args.infer.max_reqs
-    ):
+
+    args = get_global_args()
+    if args.infer.cache_type == "skew" and len(TaskPool.pool) >= args.infer.max_reqs:
         raise HTTPException(
             status_code=403, detail="exceeding server processing capacity"
         )
 
-    if dp_enabled:
-        raise HTTPException(
-            status_code=403,
-            detail="DP mode is not supported for this endpoint, please use v1/chat/completions/dp",
-        )
+    # Check if DP mode is enabled and use appropriate processing
+    if get_global_args().dp_config.enabled:
+        logger.debug(f"[HTTP] Using DP mode for request: {request.conversation_id}")
+        return await process_dp_chat_completion(request, http_header)
 
     headers = http_header.dict()
     authorization_body = headers.pop("Authorization")
@@ -117,12 +123,12 @@ async def create_chat_completion(
     top_logprobs = params.pop("top_logprobs")
     max_new_tokens = params.pop("max_tokens")
     if not max_new_tokens:
-        max_new_tokens = global_args.request.max_new_tokens
+        max_new_tokens = args.request.max_new_tokens
     temp = params.pop("temperature")
     top_p = params.pop("top_p")
     top_k = params.pop("top_k")
     freq_pen = params.pop("frequency_penalty")
-    min_batch_size = params.pop("min_batch_size")
+    min_batch_size_local = params.pop("min_batch_size")
     stop_with_eos = params.pop("stop_with_eos")
     chat_template_kwargs_unsafe = params.pop("chat_template_kwargs")
 
@@ -178,11 +184,11 @@ async def create_chat_completion(
 
 @app.post("/init")
 async def init_chitu_service():
-    global global_args
     global server_status
     if server_status:
         return {"message": "Service has been started."}
-    chitu_init(global_args)
+    args = get_global_args()
+    chitu_init(args)
     server_status = True
     return {"message": "Service initial done."}
 
@@ -206,10 +212,11 @@ async def get_chitu_status():
 
 @app.post("/load_status")
 async def get_chitu_load_status():
+    args = get_global_args()
     return {
         "load_score": f"{TaskLoad.get_load()}",
         "handle_reqs": f"{len(TaskLoad.user_req)}",
-        "max_reqs": f"{global_args.infer.max_reqs}",
+        "max_reqs": f"{args.infer.max_reqs}",
     }
 
 
@@ -223,17 +230,18 @@ async def health():
     pass  # TODO Check the inference service
 
 
-# ===================== DP related endpoints =====================
+# ====== DP Processing Functions ======
 
 
-@app.post("/v1/chat/completions/dp")
-async def dp_chat_completions(request: ChatRequest):
-    """DP mode chat completion endpoint"""
-    global dp_enabled, dp_service_started, global_args
+async def process_dp_chat_completion(
+    request: ChatRequest, http_header: Annotated[HttpHeader, Header()] = None
+):
+    """Process chat completion request using DP mode"""
+    global dp_service_started
 
     # Detailed DP request processing logs
     start_time = time.time()
-    logger.debug(f"[DP_HTTP] Received DP mode request: {request.conversation_id}")
+    logger.debug(f"[DP_HTTP] Processing DP mode request: {request.conversation_id}")
 
     try:
         dp_enabled = get_global_args().dp_config.enabled
@@ -304,8 +312,8 @@ async def dp_chat_completions(request: ChatRequest):
         request_router = get_request_router()
 
         # Check Request Router status
-        logger.debug(
-            f"[DP_HTTP] Request Router status: queue_size={len(request_router.pending_requests)}, total_requests={request_router.total_requests}"
+        logger.info(
+            f"[DP_HTTP] Request Router status: queue_size={len(request_router.pending_requests)}, total_requests={request_router.total_requests}, instance_id={id(request_router)}"
         )
 
         await request_router.submit_request(router_request)
@@ -347,19 +355,24 @@ async def dp_chat_completions(request: ChatRequest):
         )
 
 
+# ====== DP Router HTTP Endpoints ======
+
+
 @app.get("/dp/config")
 async def get_dp_config():
     """Get current DP configuration information"""
-    global global_args
-
     try:
-        # Safe check for global_args
-        if global_args is None:
+        # Get global args safely
+        try:
+            args = get_global_args()
+        except Exception:
             # In Router process, global_args may not be set yet
-            logger.warning("global_args is None, returning default DP config info")
+            logger.warning(
+                "global_args not available, returning default DP config info"
+            )
             return {
                 "dp_enabled": True,
-                "dp_size": global_args.dp_config.dp_size,
+                "dp_size": 1,
                 "mode": "Router",
                 "process_type": "Router Process",
                 "note": "Router process, global_args not set",
@@ -375,7 +388,7 @@ async def get_dp_config():
 
         request_router = get_request_router()
         config = {
-            "dp_enabled": True,
+            "dp_enabled": args.dp_config.enabled,
             "dp_service_started": True,
             "mode": "full",
             "scheduler_count": len(request_router.config.scheduler_addresses),
@@ -392,26 +405,27 @@ async def get_dp_config():
 @app.get("/dp/debug")
 async def get_dp_debug_info():
     """Debug endpoint: get DP system detailed status"""
-    global dp_enabled, dp_service_started, global_args
+    dp_service_started
 
     try:
-        # Safe check for global_args
-        if global_args is None:
+        # Get global args safely
+        try:
+            args = get_global_args()
+            dp_enabled = args.dp_config.enabled
+            dp_config = args.dp_config
+            args_status = "Available"
+        except Exception:
             # In Router process, global_args may not be set yet
-            logger.warning("global_args is None, using default status check")
+            logger.warning("global_args not available, using default status check")
             dp_enabled = True  # Router process always enables DP
             dp_config = {"enabled": True, "simple_mode": False}  # Default config
-        else:
-            dp_enabled = global_args.dp_config.enabled
-            dp_config = global_args.dp_config
+            args_status = "None (Router process)"
 
         debug_info = {
             "dp_enabled": dp_enabled,
             "dp_service_started": dp_service_started,
             "dp_config": dp_config if dp_enabled else None,
-            "global_args_status": (
-                "Available" if global_args is not None else "None (Router process)"
-            ),
+            "global_args_status": args_status,
         }
 
         if dp_enabled and dp_service_started:
@@ -536,10 +550,10 @@ async def test_dp_system():
 @app.get("/dp/status")
 async def get_dp_status():
     """Get DP service status"""
-    global dp_enabled, dp_service_started, global_args
+    global dp_service_started, server_status
 
     status = {
-        "dp_enabled": dp_enabled,
+        "dp_enabled": get_global_args().dp_config.enabled,
         "dp_service_started": dp_service_started,
         "server_status": server_status,
     }
@@ -557,135 +571,26 @@ api_logger = getLogger("uvicorn.access")
 api_logger.addFilter(IgnoreSpecificPathFilter())
 
 
-async def process_queue():
-    # DP compatible: each DP group's local master rank needs to start heartbeat
-    rank = torch.distributed.get_rank()
-    if rank == 0:
-        asyncio.create_task(heartbeat_timer(60))
-    global min_batch_size
-    while True:
-        if (len(TaskPool.pool) >= min_batch_size) or rank != 0:
-            min_batch_size = 1
-            chitu_run()
-        else:
-            await asyncio.sleep(0.01)
-
-
-async def propagate_heartbeat():
-    """add heartbeat tasks"""
-    heartbeat_task = PackedTasksBase(
-        num_tasks=0,
-        payload_type=SerializedPackedTasksPayloadType.Heartbeat,
-    )
-    Backend.executor.step(heartbeat_task)
-
-
-async def heartbeat_timer(interval=60):
-    while True:
-        await asyncio.sleep(interval)
-        await propagate_heartbeat()
-
-
-def start_worker():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(process_queue())
-
-
-async def start_dp_components():
-    """Start DP related components"""
-    global dp_service_started
-    args = get_global_args()
-    dp_config = args.dp_config
-
-    try:
-        logger.info("Starting DP components...")
-        logger.debug(f"DP config details: {dp_config}")
-
-        # Dynamic import DP modules to avoid circular dependencies
-        from chitu.dp_token_router import start_token_router
-        from chitu.dp_request_router import start_request_router
-
-        # Start Request Router
-        logger.info("Starting Request Router...")
-        request_router_task = asyncio.create_task(start_request_router())
-        logger.debug("Request Router task created")
-
-        # Start Token Router
-        logger.info("Starting Token Router...")
-        token_router_task = asyncio.create_task(start_token_router(dp_config))
-        logger.debug("Token Router task created")
-
-        # Wait for components to start and check status
-        logger.debug("Waiting for DP components to start...")
-        await asyncio.sleep(1.0)  # Give components more startup time
-
-        # Check task status
-        if token_router_task.done():
-            if token_router_task.exception():
-                logger.error(
-                    f"Token Router task exception: {token_router_task.exception()}"
-                )
-                raise token_router_task.exception()
-            else:
-                logger.warning("Token Router task completed unexpectedly")
-        else:
-            logger.debug("Token Router task is running")
-
-        if request_router_task.done():
-            if request_router_task.exception():
-                logger.error(
-                    f"Request Router task exception: {request_router_task.exception()}"
-                )
-                raise request_router_task.exception()
-            else:
-                logger.warning("Request Router task completed unexpectedly")
-        else:
-            logger.debug("Request Router task is running")
-
-        # Mark service as started
-        dp_service_started = True
-        logger.info("DP service marked as started")
-
-        # Keep background tasks running - don't wait for them to complete, but save references to avoid GC
-        logger.debug(
-            "DP components running in background, continuing to start HTTP service"
-        )
-
-        # Store tasks somewhere to avoid garbage collection
-        if not hasattr(start_dp_components, "_background_tasks"):
-            start_dp_components._background_tasks = []
-        start_dp_components._background_tasks.extend(
-            [token_router_task, request_router_task]
-        )
-        logger.debug(
-            f"Background tasks saved, total: {len(start_dp_components._background_tasks)}"
-        )
-
-    except Exception as e:
-        logger.error(f"DP components startup failed: {e}")
-        import traceback
-
-        logger.error(f"Detailed error info: {traceback.format_exc()}")
-        raise
-
-
 def start_unicorn(args):
+    """Start uvicorn server"""
     uvicorn.run(app, host=args.serve.host, port=args.serve.port, log_level="info")
 
 
 async def start_router_components_and_serve():
     """Start DP components and provide HTTP service"""
-    global server_status  # Add global declaration
+    global dp_service_started, server_status
     args = get_global_args()
 
     logger.info("[ROUTER] Starting DP components...")
     try:
         # Start DP components
+        from chitu.serve.router import start_dp_components
+
         await start_dp_components()
         logger.info("[ROUTER] DP components startup completed")
 
         # Critical fix: set service status to available
+        dp_service_started = True
         server_status = True
         logger.info(
             "[ROUTER] Service status set to available, can accept inference requests"
@@ -696,14 +601,8 @@ async def start_router_components_and_serve():
             f"[ROUTER] Preparing to start HTTP service on port {args.dp_config.router.port}..."
         )
 
-        # Ensure all async tasks have started
-        await asyncio.sleep(0.1)  # Give async tasks some startup time
-
-        logger.info(f"[ROUTER] Starting HTTP service...")
-
+        # Use unified app for DP Router
         # Use uvicorn.Server instead of uvicorn.run to avoid event loop conflicts
-        import uvicorn
-
         config = uvicorn.Config(
             app,
             host=args.dp_config.router.host,
@@ -711,7 +610,7 @@ async def start_router_components_and_serve():
             log_level="warning",
         )
         server = uvicorn.Server(config)
-        # Run server in current event loop
+        # Run server in current event loop - use await instead of asyncio.run!
         await server.serve()
 
     except Exception as e:
@@ -722,98 +621,22 @@ async def start_router_components_and_serve():
         raise
 
 
-@hydra.main(
-    version_base=None, config_path=get_config_dir_path(), config_name="serve_config"
-)
-def main(args: ServeConfig):
-    global global_args, server_status, rank, dp_enabled, dp_service_started
-    global_args = args
+def init_dp_router(args):
+    """Initialize DP Router"""
+    logger.info("[ROUTER] Router starting...")
 
-    dp_config = args.dp_config
+    # Basic initialization
+    from chitu.chitu_main import init_logger
+    from chitu.global_vars import set_global_args
 
-    if dp_config.router.is_router:
-        # only start router when dp_config is enabled
-        logger.info("[ROUTER] Router starting...")
+    init_logger(logging.INFO)
+    set_global_args(args)
 
-        # Basic initialization
-        from chitu.chitu_main import init_logger
-        from chitu.global_vars import set_global_args
+    # Router only needs basic args, no Backend initialization required
+    # Tokenization will be performed in Enhanced Scheduler
+    Backend.args = args  # Set basic args for configuration access
+    logger.info("[ROUTER] Router uses lightweight request handling")
 
-        init_logger(logging.INFO)
-        set_global_args(args)
-
-        # Router only needs basic args, no Backend initialization required
-        # Tokenization will be performed in Enhanced Scheduler
-        Backend.args = args  # Set basic args for configuration access
-        logger.info("[ROUTER] Router uses lightweight request handling")
-
-        # start dp components
-        logger.info("[ROUTER] Starting DP components...")
-        asyncio.run(start_router_components_and_serve())
-        return
-
-    if dp_config.enabled:
-        # DP Enhanced Scheduler process
-        logger.info("[SCHEDULER] Starting DP Enhanced Scheduler...")
-
-        # Initialize torch.distributed (if not already initialized)
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group("nccl")
-
-        rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
-
-        logger.info(
-            f"[SCHEDULER] [Rank {rank}] Starting DP Enhanced Scheduler, world_size={world_size}"
-        )
-
-        chitu_init(args, logging_level=logging.INFO)
-        torch.distributed.barrier()
-
-        # warmup - DP compatible: each DP group's local master rank needs to do warmup
-
-        logger.info(f"[WARMUP] [Rank {rank}] Starting warmup...")
-        warmup_engine(args)
-        logger.info(
-            f"[WARMUP] [Rank {rank}] Warmup done, task pool size: {len(TaskPool.pool)}"
-        )
-
-        # torch.distributed.barrier()  # Wait for rank 0 warmup to complete
-
-        server_status = True
-
-        logger.info(
-            f"[SCHEDULER] [Rank {rank}] Starting parallel tasks: process_queue + Enhanced Scheduler service..."
-        )
-
-        # Run both tasks in the same event loop
-        from chitu.chitu_main import start_enhanced_scheduler_service
-
-        async def run_both_services():
-            # Run process_queue and Enhanced Scheduler service in parallel
-            await asyncio.gather(
-                process_queue(),  # Inference loop queue, processes TaskPool
-                start_enhanced_scheduler_service(rank, dp_config, args),  # ZMQ service
-            )
-
-        asyncio.run(run_both_services())
-
-    else:
-        chitu_init(args, logging_level=logging.WARNING)
-        torch.distributed.barrier()
-        rank = torch.distributed.get_rank()
-
-        warmup_engine(args)
-        if rank == 0:
-            uvicorn_thread = Thread(target=start_unicorn, args=(args,))
-            uvicorn_thread.start()
-
-        server_status = True
-        start_worker()
-
-        if rank == 0:
-            uvicorn_thread.join()
-
-
-if __name__ == "__main__":
-    main()
+    # start dp components
+    logger.info("[ROUTER] Starting DP components...")
+    asyncio.run(start_router_components_and_serve())

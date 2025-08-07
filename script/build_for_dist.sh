@@ -1,5 +1,9 @@
 #!/usr/bin/bash
 
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 export CHITU_WITH_CYTHON=1
 
 # Some of our packages have platform-specific versions, e.g. torch and flash_attn shipped by MUXI.

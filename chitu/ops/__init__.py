@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 from chitu.ops.rotary import apply_rotary_pos_emb
 from chitu.ops.activation import silu_and_mul
 from chitu.ops.sampling import multinomial, apply_frequency_penalty, response_append

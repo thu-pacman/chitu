@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # DeepSeek-R1-Distill-Llama-70B is a finetune of Llama-3.3-70B-Instruct
 defaults:
   - Llama-3.3-70B-Instruct
