@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # ----------------------------------------------------------
 #  Usage (on login node):
 #      sbatch run_2node_dp2_tp4.sh

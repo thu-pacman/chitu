@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 name: GLM-4.5-Air
 type: hf-glm-4-moe
 source: "https://huggingface.co/zai-org/GLM-4.5-Air" # Just for displaying. No automatic download.

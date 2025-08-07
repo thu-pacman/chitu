@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Chitu serve module main entry point.
 This allows the serve package to be executed as a module: python -m chitu.serve

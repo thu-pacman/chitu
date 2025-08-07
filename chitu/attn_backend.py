@@ -1,8 +1,6 @@
-"""
-This file has adaption of open-source code from the following sources:
-- The interface class (AttnBackend) is originally from flash_attn (https://github.com/Dao-AILab/flash-attention), licensed under BSD-3-Clause.
-- The implementation of the reference backend (RefAttnBackend) is originally from flash_attn's test (https://github.com/Dao-AILab/flash-attention/blob/main/tests/test_flash_attn.py), licensed under BSD-3-Clause.
-"""
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
 
 __all__ = [
     "AttnBackend",
@@ -66,6 +64,13 @@ class AttnBackend(abc.ABC):
     def prepare_metadata_for_prefill(self, *args, **kwargs):
         pass
 
+    # SPDX-SnippetBegin
+    # SPDX-License-Identifier: BSD-3-Clause
+    # SPDX-SnippetCopyrightText: 2025 Dao-AILab
+    # SDPX—SnippetName: Attention interface functions
+    #
+    # The interface class (AttnBackend) is originally from flash_attn (https://github.com/Dao-AILab/flash-attention),
+    # licensed under BSD-3-Clause.
     @abc.abstractmethod
     def prefill_ragged_qkvo(
         self,
@@ -252,6 +257,8 @@ class AttnBackend(abc.ABC):
             out: (batch_size, seqlen, nheads, headdim).
         """
         raise NotImplementedError()
+
+    # SPDX-SnippetEnd
 
     def _mla_to_mqa(
         self,
@@ -462,6 +469,13 @@ class FlashAttnBackend(AttnBackend):
         )
 
 
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-SnippetCopyrightText: 2025 Dao-AILab
+# SDPX—SnippetName: Reference attention implementation
+#
+# The implementation of the reference backend (RefAttnBackend) is originally from flash_attn's test
+# (https://github.com/Dao-AILab/flash-attention/blob/main/tests/test_flash_attn.py), licensed under BSD-3-Clause.
 class RefAttnBackend(AttnBackend):
 
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
@@ -772,6 +786,9 @@ class RefAttnBackend(AttnBackend):
             softmax_scale=softmax_scale,
         )
         return output
+
+
+# SPDX-SnippetEnd
 
 
 class TritonAttnBackend(RefAttnBackend):

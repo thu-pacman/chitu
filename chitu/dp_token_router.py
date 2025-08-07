@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Data Parallel Token Router
 Responsible for receiving tokens returned from each DP group and forwarding them to corresponding client connections

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2025 Qingcheng.AI
+//
+// SPDX-License-Identifier: Apache-2.0
+
 #include "common.h"
 #include "moe_kernel.h"
 #include <c10/cuda/CUDAGuard.h>

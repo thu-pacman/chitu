@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # QwQ-32B-simple-w8a8 is a quantization of QwQ-32B
 defaults:
   - QwQ-32B

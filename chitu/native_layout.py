@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Union, Sequence, Mapping, Any
 from typing_extensions import override, final
 from dataclasses import dataclass

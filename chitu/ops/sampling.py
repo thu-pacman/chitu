@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Optional, List
 
 import torch
@@ -24,6 +28,11 @@ def multinomial(
     elif impl == "sync-free":
         # Adapted from
         # https://github.com/vllm-project/vllm/blob/4577fc9abb064d74b2082ffc5005cbb82ca91766/vllm/model_executor/layers/sampler.py#L527
+        # SPDX-SnippetBegin
+        # SPDX-License-Identifier: Apache-2.0
+        # SPDX-SnippetCopyrightText: 2025 vLLM Team
+        # SDPX—SnippetName: _multinomial from vllm
+
         if num_samples > 1:
             probs = probs.repeat_interleave(num_samples, dim=0)
         q = torch.empty_like(probs)
@@ -39,6 +48,7 @@ def multinomial(
                     generator=seq_group.generator
                 )
                 sample_idx += stride
+        # SPDX-SnippetEnd
         return probs.div_(q).argmax(dim=1).view(-1, num_samples)
     else:
         raise NotImplementedError(f"unsupport impl: {impl}")

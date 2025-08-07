@@ -1,9 +1,6 @@
-"""
-This file has adaption of open-source code from the following sources:
-- The triton implementation of MLA is credited to monellz (https://github.com/monellz/vllm/commit/feebaa7c063be6bfb590a876741aeef1c5f58cf8)
-- The triton implementation of _fwd_kernel is originally from SGLang (https://github.com/sgl-project/sglang/commit/df191254abc002b3284560d9c4b94214a4656265),
-  licensed under Apache 2.0.
-"""
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
 
 import math
 import torch
@@ -11,6 +8,15 @@ import triton
 import triton.language as tl
 
 from chitu.device_type import is_muxi
+
+
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-SnippetCopyrightText: 2023-2024 SGLang Team
+# SDPX—SnippetName: The triton implementation of _fwd_kernel
+#
+# The triton implementation of _fwd_kernel is originally from SGLang
+# (https://github.com/sgl-project/sglang/commit/df191254abc002b3284560d9c4b94214a4656265),
 
 
 @triton.jit
@@ -656,6 +662,18 @@ def decode_attention_fwd(
         )
 
 
+# SPDX-SnippetEnd
+
+
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-SnippetCopyrightText: 2025 vLLM Team
+# SPDX-SnippetCopyrightText: monellz
+# SDPX—SnippetName: The triton implementation of MLA
+#
+# The triton implementation of MLA is credited to monellz, which is a fork of vLLM
+# (https://github.com/monellz/vllm/commit/feebaa7c063be6bfb590a876741aeef1c5f58cf8)
+
 _mla_attn_kernel_configs = [
     triton.Config(
         {"BLOCK_N": block_n},
@@ -1126,6 +1144,9 @@ def mla_decode_non_paged(
         b_seq_len,
         num_kv_splits,
     )
+
+
+# SPDX-SnippetEnd
 
 
 block_m_sizes = [32] if is_muxi() else [32, 64]

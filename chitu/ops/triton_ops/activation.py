@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import torch
 import triton
 import triton.language as tl
@@ -27,6 +31,10 @@ def silu_and_mul_triton(x):
     assert x.is_contiguous()
     assert output.is_contiguous()
 
+    # SPDX-SnippetBegin
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-SnippetCopyrightText: 2025 unslothai
+    # SDPX—SnippetName: calculate_settings from unsloth
     def calculate_settings(n):
         # reference: https://github.com/unslothai/unsloth/blob/fd753fed99ed5f10ef8a9b7139588d9de9ddecfb/unsloth/kernels/utils.py#L43
 
@@ -46,6 +54,8 @@ def silu_and_mul_triton(x):
         elif BLOCK_SIZE >= 2048:
             num_warps = 8
         return BLOCK_SIZE, num_warps
+
+    # SPDX-SnippetEnd
 
     BLOCK_SIZE, _ = calculate_settings(n_cols // 2)
     silu_and_mul_kernel[(n_rows,)](

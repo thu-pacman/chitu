@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # DP=2 Contiguous Grouping + Router Hybrid Mode Test Script
 # Architecture: 1 Router + 2 Contiguous DP Groups, 2 GPUs per group
 # Router: Provides HTTP service, load balances to DP groups

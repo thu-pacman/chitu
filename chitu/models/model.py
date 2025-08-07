@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import itertools
 import os
 from logging import getLogger
@@ -631,8 +635,9 @@ class Transformer(nn.Module):
                     n, half_k = param.shape
                     k = half_k * 2
 
-                    # Unpack from qserve format
-                    # (https://github.com/mit-han-lab/deepcompressor/blob/main/deepcompressor/backend/qserve/utils.py#L18)
+                    # Unpack from qserve format. See
+                    # https://github.com/mit-han-lab/deepcompressor/blob/main/deepcompressor/backend/qserve/utils.py#L18
+                    # for the format details
                     assert n % 32 == 0
                     assert k % 32 == 0
                     weight = param.data.view(
@@ -652,6 +657,7 @@ class Transformer(nn.Module):
                     )
                     weight = weight[0] + (weight[1] << 4)
                     param.data = weight.view(n, half_k)
+
                 new_state_dict[key] = param
             else:
                 new_state_dict[key] = state_dict[key]

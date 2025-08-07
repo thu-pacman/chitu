@@ -1,9 +1,7 @@
-"""
-This file has adaption of open-source code from the following sources:
-- The sampling implementation is originally from SGLang
-  (https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/sampler.py),
-  licensed under Apache 2.0.
-"""
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 
 import functools
 from itertools import accumulate
@@ -131,6 +129,14 @@ def compute_layer_dist_in_pipe(num_layers, world_size):
     return num_layers_of_each_rank
 
 
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-SnippetCopyrightText: 2025 SGLang Team
+# SDPX—SnippetName: top_k_top_p_min_p_sampling_from_probs_torch
+#
+# This sampling implementation is originally from SGLang
+# (https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/sampler.py),
+# licensed under Apache 2.0.
 def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -157,6 +163,9 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     sampled_index = multinomial(probs_sort, num_samples=1, impl="sync-free")
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
     return batch_next_token_ids
+
+
+# SPDX-SnippetEnd
 
 
 class VarLens:

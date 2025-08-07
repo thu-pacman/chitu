@@ -1,11 +1,18 @@
+# SPDX-FileCopyrightText: 2025 vLLM Team
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# The serving benchmark logic is partially adapted from vLLM's benchmark_serving
+#  (https://github.com/vllm-project/vllm/blob/main/benchmarks/benchmark_serving.py),
+#  licensed under Apache 2.0. This adaption aims to follow widely-used
+#  benchmarking practices for LLM inference throughput and latency.
+
+
 """
 Benchmark runner for Chitu performance testing.
-
-The serving benchmark logic is partially adapted from vLLM's benchmark_serving
-  (https://github.com/vllm-project/vllm/blob/main/benchmarks/benchmark_serving.py),
-  licensed under Apache 2.0. This adaption aims to follow widely-used
-  benchmarking practices for LLM inference throughput and latency.
 """
+
 
 import requests
 import os

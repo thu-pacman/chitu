@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """
 DP Scheduler service module for Chitu serve.
 Contains the Enhanced Scheduler service logic for DP mode.

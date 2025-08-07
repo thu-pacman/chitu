@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: 2025 Qingcheng.AI
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #pragma once
 
 int get_physical_cpu_id_from_logical_cpu_id(

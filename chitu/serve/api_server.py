@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Web API endpoints module for Chitu serve.
 Provides both standard and DP (Distributed Parallel) mode HTTP endpoints.

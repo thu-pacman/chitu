@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # This is part of the building process in the Dockerfile. DO NOT RUN THIS SCRIPT DIRECTLY.
 #
 # Usage: `./install.sh ${optional_deps} ${build_jobs} ${enable_editable_install} ${enable_cython}`

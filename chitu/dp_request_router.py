@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Request Router for lightweight two-level data parallel scheduling.
 Handles inter-batch data parallel request distribution.

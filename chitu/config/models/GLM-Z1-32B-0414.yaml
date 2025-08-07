@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 name: glm-z1-32b
 type: hf-glm-z1
 source: "https://modelscope.cn/models/ZhipuAI/GLM-Z1-32B-0414/" # Just for displaying. No automatic download.

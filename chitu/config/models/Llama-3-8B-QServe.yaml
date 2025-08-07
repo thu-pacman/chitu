@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Llama-3-8B-QServe is a quantization of Meta-Llama-3-8B-Instruct
 defaults:
   - Meta-Llama-3-8B-Instruct

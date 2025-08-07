@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # This file is used to generate a temporary requirements.txt file from
 # dynamic dependencies to be resolved in setup.py. This is useful for
 # build a Docker stage that only triggers rebuilds by changes of this

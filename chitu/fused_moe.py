@@ -1,10 +1,6 @@
-"""
-This file has adaption of open-source code from the following sources:
-- The Triton implementation of fused MoE kernel is originally from vLLM (https://github.com/vllm-project/vllm/blob/ed6e9075d31e32c8548b480a47d1ffb77da1f54c/vllm/model_executor/layers/fused_moe/fused_moe.py), licensed under Apache 2.0.
-- The CUDA implementation to align block for MoE is originally from SGLang
-  (https://github.com/sgl-project/sglang/commit/ba5112ff691d791a9e38c6c71f59324a5fcb49d0),
-  licensed under Apache 2.0.
-"""
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
 
 import functools
 import struct
@@ -44,6 +40,10 @@ def moe_sum(input_tensor, output_tensor):
     """
     M, topK, N = input_tensor.shape
 
+    # SPDX-SnippetBegin
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-SnippetCopyrightText: 2025 unslothai
+    # SDPX—SnippetName: calculate_settings from unsloth
     def calculate_settings(n):
         # reference: https://github.com/unslothai/unsloth/blob/fd753fed99ed5f10ef8a9b7139588d9de9ddecfb/unsloth/kernels/utils.py#L43
 
@@ -64,6 +64,8 @@ def moe_sum(input_tensor, output_tensor):
             num_warps = 8
         return BLOCK_SIZE, num_warps
 
+    # SPDX-SnippetEnd
+
     BLOCK_SIZE_N, num_warps = calculate_settings(N)
     # Determine grid and block sizes
 
@@ -78,6 +80,18 @@ def moe_sum(input_tensor, output_tensor):
     )
 
 
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-SnippetCopyrightText: 2025 SGLang Team
+# SPDX-SnippetCopyrightText: 2025 vLLM Team
+# SPDX-SnippetCopyrightText: 2025 Qingcheng.AI
+# SDPX—SnippetName: The Triton implementation of fused MoE kernel
+#
+# The Triton implementation of fused MoE kernel is originally from vLLM
+# (https://github.com/vllm-project/vllm/blob/ed6e9075d31e32c8548b480a47d1ffb77da1f54c/vllm/model_executor/layers/fused_moe/fused_moe.py),
+# licensed under Apache 2.0, which is further based on SGLang
+# (https://github.com/sgl-project/sglang/commit/ba5112ff691d791a9e38c6c71f59324a5fcb49d0),
+# licensed under Apache 2.0. Qingcheng.AI added soft fp4/fp8 support to this implementation.
 @triton.jit
 def write_zeros_to_output(
     c_ptr,
@@ -663,8 +677,6 @@ def moe_align_block_size_stage4(
         tl.store(tokens_cnts_ptr + off_t + expert_id, token_cnt + 1)
 
 
-# Triton implementation based on:
-# https://github.com/sgl-project/sglang/commit/ba5112ff691d791a9e38c6c71f59324a5fcb49d0
 def moe_align_block_size_triton(
     topk_ids: torch.Tensor,
     num_experts: int,
@@ -710,90 +722,6 @@ def moe_align_block_size_triton(
         numel,
         tokens_per_thread,
     )
-
-
-def moe_align_block_size_cuda(
-    topk_ids: torch.Tensor,
-    block_size: int,
-    num_experts: int,
-    expert_map: torch.Tensor = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Aligns the token distribution across experts to be compatible with block
-    size for matrix multiplication.
-
-    Parameters:
-    - topk_ids: A tensor of shape [total_tokens, top_k] representing the
-        top-k expert indices for each token.
-    - block_size: The block size used in block matrix multiplication.
-    - num_experts: The total number of experts.
-    - expert_map: A tensor of shape [num_experts] that maps the expert index
-        from the global space to the local index space of the current
-        expert parallel shard. If the expert is not in the current expert
-        parallel shard, the mapping is set to -1.
-
-    Returns:
-    - sorted_token_ids: A tensor containing the sorted token indices according
-        to their allocated expert.
-    - expert_ids: A tensor indicating the assigned expert index for each block.
-    - num_tokens_post_padded: The total number of tokens after padding,
-        ensuring divisibility by block_size.
-
-    This function pads the number of tokens that each expert needs to process
-    so that it is divisible by block_size.
-    Padding ensures that during block matrix multiplication, the dimensions
-    align correctly.
-
-    Example:
-    Given topk_ids = [[2, 3, 4], [1, 2, 4], [1, 3, 4], [1, 2, 3]],
-    block_size = 4, and num_experts = 4:
-    - We initially have 12 tokens (after repeating 'top_k' times) and 4 experts,
-        with each expert needing to process 3 tokens.
-    - As block_size is 4, we pad 1 token for each expert.
-    - First, flatten topk_ids to [2, 3, 4, 1, 2, 4, 1, 3, 4, 1, 2, 3].
-    - Then append padding tokens [12, 12, 12, 12] for each block.
-    - After sorting by expert index, we obtain token_ids
-        [3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12].
-        Tokens 12 are non-existent (padding) and are ignored in
-        the subsequent matrix multiplication.
-    - The padding ensures that the total number of tokens is now divisible
-        by block_size for proper block matrix operations.
-    """
-    num_experts += 1
-    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
-    sorted_ids = torch.empty(
-        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
-    )
-    sorted_ids.fill_(topk_ids.numel())
-    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
-    # Expert ids must be zeroed out to prevent index out of bounds error while
-    # mapping global expert ids to local expert ids in expert parallelism.
-    expert_ids = torch.zeros(
-        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
-    )
-    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    token_cnts_buffer = torch.zeros(
-        (num_experts + 1) * num_experts,
-        dtype=torch.int32,
-        device=topk_ids.device,
-    )
-    cumsum_buffer = torch.zeros(
-        (num_experts + 1,), dtype=torch.int32, device=topk_ids.device
-    )
-    chitu_backend.cuda_moe_align_block_size(
-        topk_ids,
-        num_experts,
-        block_size,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-        token_cnts_buffer,
-        cumsum_buffer,
-    )
-    if expert_map is not None:
-        expert_ids = expert_map[expert_ids]
-
-    return sorted_ids, expert_ids, num_tokens_post_pad
 
 
 def moe_align_block_size_native(
@@ -871,20 +799,6 @@ def moe_align_block_size_native(
         expert_ids = expert_map[expert_ids]
 
     return sorted_ids, expert_ids, num_tokens_post_pad
-
-
-def moe_align_block_size(
-    topk_ids: torch.Tensor,
-    block_size: int,
-    num_experts: int,
-    expert_map: torch.Tensor = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if is_nvidia() or is_muxi():
-        return moe_align_block_size_cuda(topk_ids, block_size, num_experts, expert_map)
-    else:
-        return moe_align_block_size_native(
-            topk_ids, block_size, num_experts, expert_map
-        )
 
 
 @triton.jit
@@ -1659,3 +1573,115 @@ def fused_experts_impl(
         )
 
     return out_hidden_states
+
+
+# SPDX-SnippetEnd
+
+
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-SnippetCopyrightText: 2025 SGLang Team
+# SDPX—SnippetName: The CUDA implementation to align block
+#
+# The CUDA implementation to align block for MoE is originally from SGLang
+# (https://github.com/sgl-project/sglang/commit/ba5112ff691d791a9e38c6c71f59324a5fcb49d0),
+# licensed under Apache 2.0.
+def moe_align_block_size_cuda(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    expert_map: torch.Tensor = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Aligns the token distribution across experts to be compatible with block
+    size for matrix multiplication.
+
+    Parameters:
+    - topk_ids: A tensor of shape [total_tokens, top_k] representing the
+        top-k expert indices for each token.
+    - block_size: The block size used in block matrix multiplication.
+    - num_experts: The total number of experts.
+    - expert_map: A tensor of shape [num_experts] that maps the expert index
+        from the global space to the local index space of the current
+        expert parallel shard. If the expert is not in the current expert
+        parallel shard, the mapping is set to -1.
+
+    Returns:
+    - sorted_token_ids: A tensor containing the sorted token indices according
+        to their allocated expert.
+    - expert_ids: A tensor indicating the assigned expert index for each block.
+    - num_tokens_post_padded: The total number of tokens after padding,
+        ensuring divisibility by block_size.
+
+    This function pads the number of tokens that each expert needs to process
+    so that it is divisible by block_size.
+    Padding ensures that during block matrix multiplication, the dimensions
+    align correctly.
+
+    Example:
+    Given topk_ids = [[2, 3, 4], [1, 2, 4], [1, 3, 4], [1, 2, 3]],
+    block_size = 4, and num_experts = 4:
+    - We initially have 12 tokens (after repeating 'top_k' times) and 4 experts,
+        with each expert needing to process 3 tokens.
+    - As block_size is 4, we pad 1 token for each expert.
+    - First, flatten topk_ids to [2, 3, 4, 1, 2, 4, 1, 3, 4, 1, 2, 3].
+    - Then append padding tokens [12, 12, 12, 12] for each block.
+    - After sorting by expert index, we obtain token_ids
+        [3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12].
+        Tokens 12 are non-existent (padding) and are ignored in
+        the subsequent matrix multiplication.
+    - The padding ensures that the total number of tokens is now divisible
+        by block_size for proper block matrix operations.
+    """
+    num_experts += 1
+    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    sorted_ids = torch.empty(
+        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+    )
+    sorted_ids.fill_(topk_ids.numel())
+    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+    # Expert ids must be zeroed out to prevent index out of bounds error while
+    # mapping global expert ids to local expert ids in expert parallelism.
+    expert_ids = torch.zeros(
+        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+    )
+    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+    token_cnts_buffer = torch.zeros(
+        (num_experts + 1) * num_experts,
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    cumsum_buffer = torch.zeros(
+        (num_experts + 1,), dtype=torch.int32, device=topk_ids.device
+    )
+    chitu_backend.cuda_moe_align_block_size(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        token_cnts_buffer,
+        cumsum_buffer,
+    )
+    if expert_map is not None:
+        expert_ids = expert_map[expert_ids]
+
+    return sorted_ids, expert_ids, num_tokens_post_pad
+
+
+# SPDX-SnippetEnd
+
+
+def moe_align_block_size(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    expert_map: torch.Tensor = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if is_nvidia() or is_muxi():
+        return moe_align_block_size_cuda(topk_ids, block_size, num_experts, expert_map)
+    else:
+        return moe_align_block_size_native(
+            topk_ids, block_size, num_experts, expert_map
+        )

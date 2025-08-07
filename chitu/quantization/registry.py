@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Any, Dict, List, Mapping, Optional, Set, Type, Callable
 import functools
 import re
