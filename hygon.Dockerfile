@@ -1,5 +1,7 @@
 FROM image.sourcefind.cn:5000/dcu/admin/base/pytorch:2.4.1-ubuntu22.04-dtk25.04-py3.10-fixpy AS base
 
+SHELL ["/bin/bash", "-c"]
+
 ARG optional_deps=''
 ARG build_jobs=''
 ARG enable_editable_install='false'
@@ -39,5 +41,5 @@ WORKDIR /workspace/chitu
 COPY . .
 
 ENV CHITU_HYGON_BUILD=1
-RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt
+RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt -c <(pip freeze | grep '==')
 RUN bash script/install.sh "${optional_deps}" "${build_jobs}" "${enable_editable_install}" "${enable_cython}"
