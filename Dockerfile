@@ -2,6 +2,8 @@
 # Base Image Stage
 FROM pytorch/pytorch:2.7.0-cuda12.6-cudnn9-devel AS base
 
+SHELL ["/bin/bash", "-c"]
+
 ARG torch_cuda_arch_list='7.0 7.5 8.0 8.6 8.9 9.0+PTX'
 ARG optional_deps='flash_attn,flash_mla,flashinfer'
 ARG build_jobs=''
@@ -48,7 +50,7 @@ fi
 # if some build time dependencies are missing.
 COPY ./requirements-build.txt /tmp/requirements-build.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements-build.txt
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements-build.txt -c <(pip freeze | grep '==')
 
 
 #####################################
@@ -81,7 +83,7 @@ COPY ./csrc/cpuinfer ./csrc/cpuinfer
 
 # Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
 # compile at install time, and the compile results are environment dependent.
-RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt
+RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt -c <(pip freeze | grep '==' | grep -v "pillow" | grep -v "fsspec")
 
 WORKDIR /workspace
 RUN rm -rf /workspace/chitu

@@ -22,7 +22,7 @@ install_requires = [
     "fastapi",
     "uvicorn",
     "tqdm",
-    "accelerate",
+    "accelerate<1.10",  # 1.10 breaks on muxi
     "einops",
     "typing-extensions",
     "pyzmq>=27.0.0",
@@ -69,7 +69,8 @@ extras_require = {
             "flashinfer-python<=0.2.5"
             if packaging.version.parse(torch.__version__)
             < packaging.version.parse("2.7.0")
-            else "flashinfer-python<=0.2.7.post1"
+            else "flashinfer-python<=0.2.7.post1,!=0.2.6"
+            # !=0.2.6: https://github.com/flashinfer-ai/flashinfer/issues/1139
         ),
     ],
     "flash_mla": [

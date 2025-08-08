@@ -61,16 +61,19 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> Tuple[Any, bool]:
 
     try:
         return importlib.import_module(pkg_name), True
-    except ImportError:
+    except ImportError as e:
 
         class ReportErrorWhenUsed:
+            def __init__(self, e):
+                self.root_cause = e
+
             def __getattr__(self, item):
                 raise ImportError(
                     f"Optional dependency '{opt_dep_name}' is not installed. "
                     f"Please refer to README.md for installation instructions."
-                )
+                ) from self.root_cause
 
-        return ReportErrorWhenUsed(), False
+        return ReportErrorWhenUsed(e), False
 
 
 def try_import_platform_dep(pkg_name: str) -> Tuple[Any, bool]:
@@ -89,16 +92,19 @@ def try_import_platform_dep(pkg_name: str) -> Tuple[Any, bool]:
 
     try:
         return importlib.import_module(pkg_name), True
-    except ImportError:
+    except ImportError as e:
 
         class ReportErrorWhenUsed:
+            def __init__(self, e):
+                self.root_cause = e
+
             def __getattr__(self, item):
                 raise ImportError(
                     f"Chitu does not support this case because '{pkg_name}' is not present on this platform. "
                     f"This is likely a bug of Chitu."
-                )
+                ) from self.root_cause
 
-        return ReportErrorWhenUsed(), False
+        return ReportErrorWhenUsed(e), False
 
 
 def is_layer(layer_name, full_name):

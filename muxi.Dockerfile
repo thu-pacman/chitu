@@ -1,5 +1,7 @@
 FROM mxc500-torch2.1-py310:mc2.29.0.7-ubuntu22.04-amd64 AS base
 
+SHELL ["/bin/bash", "-c"]
+
 ARG optional_deps=''
 ARG build_jobs=''
 ARG enable_editable_install='false'
@@ -47,7 +49,7 @@ WORKDIR /workspace/chitu
 COPY . .
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt -c <(pip freeze | grep '==')
 
 # The actual installing procedure requries a GPU device, which is not available in the `docker build` stage.
 # We delay it to an additional `docker run` stage which runs `script/install.sh`.

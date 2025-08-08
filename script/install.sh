@@ -34,9 +34,9 @@ else
     export OPTIONAL_DEPS_SPECIFIER=""
 fi
 if [ "${enable_editable_install}" == "true" ]; then
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e .${OPTIONAL_DEPS_SPECIFIER}
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e .${OPTIONAL_DEPS_SPECIFIER} -c <(pip freeze | grep '==' | grep -v "pillow" | grep -v "fsspec")
 else
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple .${OPTIONAL_DEPS_SPECIFIER}
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple .${OPTIONAL_DEPS_SPECIFIER} -c <(pip freeze | grep '==' | grep -v "pillow" | grep -v "fsspec")
 
     # Remove the source code. We only need to run the installed package. Keep testings and scripts.
     #
