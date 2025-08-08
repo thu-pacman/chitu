@@ -33,18 +33,6 @@ body:
       description: 系统运行环境：conda环境，pip环境，显卡和驱动信息。
       placeholder: your environment!
       value: "此处输入系统运行的conda环境，pip环境，显卡和驱动信息"
-  - type: dropdown
-    id: version
-    attributes:
-      label: 版本信息
-      description: 您运行的版本是?
-      options:
-        - 0.1.2 (Default)
-        - 0.1.1
-        - 0.1.0
-      default: 0
-    validations:
-      required: true
   - type: textarea
     id: logs
     attributes:

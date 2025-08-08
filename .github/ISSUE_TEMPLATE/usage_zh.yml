@@ -26,18 +26,6 @@ body:
       value: "此处输入您希望如何运行该系统"
     validations:
       required: true
-  - type: dropdown
-    id: version
-    attributes:
-      label: 版本信息
-      description: 您运行的版本是?
-      options:
-        - 0.1.2 (Default)
-        - 0.1.1
-        - 0.1.0
-      default: 0
-    validations:
-      required: true
   - type: checkboxes
     id: terms
     attributes:
