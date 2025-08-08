@@ -100,9 +100,8 @@ class TransformerHFGlm4Moe(TransformerHFLlama):
     @override
     def process_state_dict_for_merging_experts(self, checkpoint: Mapping[str, Any]):
         fuse_shared_experts = get_global_args().infer.fuse_shared_experts
-
-        new_checkpoint = {}
-        for k in checkpoint.keys():
+        checkpoint_keys = list(checkpoint.keys())
+        for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if any(
                 k.endswith(f".experts.0.{w}.{part}")
@@ -116,19 +115,19 @@ class TransformerHFGlm4Moe(TransformerHFLlama):
                 prefix = k[: -len(f"experts.0.{w}.{part}")]
                 parts = []
                 for i in range(self.params.n_routed_experts):
-                    parts.append(checkpoint[prefix + f"experts.{i}.{w}.{part}"])
+                    parts.append(prefix + f"experts.{i}.{w}.{part}")
                 if fuse_shared_experts:
-                    parts.append(checkpoint[prefix + f"shared_experts.{w}.{part}"])
-                new_checkpoint[prefix + f"experts.{w}_{part}"] = torch.stack(
-                    parts, dim=0
+                    parts.append(prefix + f"shared_experts.{w}.{part}")
+                checkpoint[prefix + f"experts.{w}_{part}"] = torch.stack(
+                    [checkpoint.pop(key) for key in parts], dim=0
                 )
             elif re.search(r"\.experts\.\d+", k):
                 continue
             elif fuse_shared_experts and ".shared_experts." in k:
                 continue
             else:
-                new_checkpoint[k] = checkpoint[k]
-        return new_checkpoint
+                continue
+        return checkpoint
 
     @override
     def load_state_dict_parallel(
@@ -140,12 +139,11 @@ class TransformerHFGlm4Moe(TransformerHFLlama):
         **kwargs,
     ):
         if not skip_preprocess and replace:
-            new_state_dict = {}
-            for k in state_dict.keys():
-                name = k
-                name = name.replace(".e_score_correction_bias", ".bias")
-                new_state_dict[name] = state_dict[k]
-            state_dict = new_state_dict
+            state_dict_keys = list(state_dict.keys())
+            for k in state_dict_keys:
+                value = state_dict.pop(k)
+                name = k.replace(".e_score_correction_bias", ".bias")
+                state_dict[name] = value
 
         super().load_state_dict_parallel(
             state_dict, *args, skip_preprocess=skip_preprocess, **kwargs

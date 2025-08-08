@@ -795,8 +795,8 @@ class TransformerDeepSeekV3(Transformer):
     def process_state_dict_for_merging_experts(self, checkpoint: Mapping[str, Any]):
         fuse_shared_experts = get_global_args().infer.fuse_shared_experts
 
-        new_checkpoint = {}
-        for k in checkpoint.keys():
+        checkpoint_keys = list(checkpoint.keys())
+        for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if any(
                 k.endswith(f".experts.{self.experts_start_idx}.{w}.{part}")
@@ -810,27 +810,29 @@ class TransformerDeepSeekV3(Transformer):
                 prefix = k[: -len(f"experts.{self.experts_start_idx}.{w}.{part}")]
                 parts = []
                 for i in range(self.experts_start_idx, self.experts_end_idx):
-                    parts.append(checkpoint[prefix + f"experts.{i}.{w}.{part}"])
+                    parts.append(prefix + f"experts.{i}.{w}.{part}")
                 if fuse_shared_experts:
-                    parts.append(checkpoint[prefix + f"shared_experts.{w}.{part}"])
-                new_checkpoint[prefix + f"experts.{w}_{part}"] = torch.stack(
-                    parts, dim=0
+                    parts.append(prefix + f"shared_experts.{w}.{part}")
+                checkpoint[prefix + f"experts.{w}_{part}"] = torch.stack(
+                    [checkpoint.pop(key) for key in parts], dim=0
                 )
             elif re.search(r"\.experts\.\d+", k):
                 continue
             elif fuse_shared_experts and ".shared_experts." in k:
                 continue
             else:
-                new_checkpoint[k] = checkpoint[k]
-        return new_checkpoint
+                continue
+
+        return checkpoint
 
     def _process_state_dict_for_absorption_without_precomputation(
         self, checkpoint: Mapping[str, Any]
     ):
         model_parallel_size = get_tp_size()
         n_local_heads = self.params.n_heads // model_parallel_size
-        new_checkpoint = {}
-        for k in checkpoint.keys():
+
+        checkpoint_keys = list(checkpoint.keys())
+        for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if any(
                 k.endswith(f".kv_b_proj.{tensor_name}")
@@ -841,14 +843,16 @@ class TransformerDeepSeekV3(Transformer):
                 if k.endswith(f".kv_b_proj.input_scale") or k.endswith(
                     f".kv_b_proj.weight_scale_2"
                 ):
-                    new_checkpoint[f"{prefix}.kv_b_proj_absorb_1.{tensor_name}"] = (
-                        checkpoint[k].view(1, 1)
+                    checkpoint[f"{prefix}.kv_b_proj_absorb_1.{tensor_name}"] = (
+                        checkpoint.pop(k).view(1, 1)
                     )
-                    new_checkpoint[f"{prefix}.kv_b_proj_absorb_2.{tensor_name}"] = (
-                        checkpoint[k].view(1, 1)
+                    checkpoint[f"{prefix}.kv_b_proj_absorb_2.{tensor_name}"] = (
+                        checkpoint.pop(k).view(1, 1)
                     )
                 else:
-                    kv_b_proj_weight = checkpoint[f"{prefix}.kv_b_proj.{tensor_name}"]
+                    kv_b_proj_weight = checkpoint.pop(
+                        f"{prefix}.kv_b_proj.{tensor_name}"
+                    )
                     kv_b_proj_weight = kv_b_proj_weight.view(
                         n_local_heads, -1, kv_b_proj_weight.shape[-1]
                     )
@@ -861,10 +865,10 @@ class TransformerDeepSeekV3(Transformer):
                     kv_b_proj_absorb_2_weight = kv_b_proj_weight[
                         :, self.params.qk_nope_head_dim // ratio :
                     ]
-                    new_checkpoint[f"{prefix}.kv_b_proj_absorb_1.{tensor_name}"] = (
+                    checkpoint[f"{prefix}.kv_b_proj_absorb_1.{tensor_name}"] = (
                         kv_b_proj_absorb_1_weight.permute(0, 2, 1).contiguous()
                     )
-                    new_checkpoint[f"{prefix}.kv_b_proj_absorb_2.{tensor_name}"] = (
+                    checkpoint[f"{prefix}.kv_b_proj_absorb_2.{tensor_name}"] = (
                         kv_b_proj_absorb_2_weight
                     )
             elif any(
@@ -892,9 +896,9 @@ class TransformerDeepSeekV3(Transformer):
                 )
 
             else:
-                new_checkpoint[k] = checkpoint[k]
+                continue
 
-        return new_checkpoint
+        return checkpoint
 
     def _process_state_dict_for_absorption(self, checkpoint: Mapping[str, Any]):
         model_parallel_size = get_tp_size()
@@ -906,20 +910,20 @@ class TransformerDeepSeekV3(Transformer):
             else weight_dequant_deepseek_v3
         )
 
-        new_checkpoint = {}
-        for k in checkpoint.keys():
+        checkpoint_keys = list(checkpoint.keys())
+        for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             block_size = 16 if quant in ["blockfp4"] else 128
 
             if k.endswith(".kv_b_proj.weight"):
                 prefix = k[: -len("kv_b_proj.weight")]
                 assert prefix + "kv_b_proj.weight" in checkpoint
-                kv_b_proj_ckpt_weight = checkpoint[prefix + "kv_b_proj.weight"]
+                kv_b_proj_ckpt_weight = checkpoint.pop(k)
                 if quant in [None, "gguf"]:  # blockfp4 skips quantizing MLA
                     kv_b_proj_weight = kv_b_proj_ckpt_weight
                 elif quant in ["blockfp8", "q4km"]:
                     assert prefix + "kv_b_proj.scale" in checkpoint
-                    kv_b_proj_scale = checkpoint[prefix + "kv_b_proj.scale"]
+                    kv_b_proj_scale = checkpoint.pop(prefix + "kv_b_proj.scale")
                     # FIXME: Keep this on GPU
                     kv_b_proj_weight = weight_dequant_fn(
                         kv_b_proj_ckpt_weight.cuda(), kv_b_proj_scale.cuda(), block_size
@@ -933,14 +937,14 @@ class TransformerDeepSeekV3(Transformer):
                     kv_b_proj_weight = (
                         (
                             up_kv_b_proj_weight
-                            * checkpoint[prefix + "kv_b_proj.weight_scale"]
+                            * checkpoint.pop(prefix + "kv_b_proj.weight_scale")
                             .view(torch.float8_e4m3fn)
                             .unsqueeze(-1)
                             .to(
                                 dtype=up_kv_b_proj_weight.dtype,
                                 device=up_kv_b_proj_weight.device,
                             )
-                            * checkpoint[prefix + "kv_b_proj.weight_scale_2"].to(
+                            * checkpoint.pop(prefix + "kv_b_proj.weight_scale_2").to(
                                 device=up_kv_b_proj_weight.device
                             )
                         )
@@ -964,12 +968,12 @@ class TransformerDeepSeekV3(Transformer):
                 )
 
                 # Absorb into q_b_proj
-                q_b_proj_ckpt_weight = checkpoint[prefix + "q_b_proj.weight"]
+                q_b_proj_ckpt_weight = checkpoint.pop(prefix + "q_b_proj.weight")
                 if quant in [None, "gguf"]:  # blockfp4 skips quantizing MLA
                     q_b_proj_weight = q_b_proj_ckpt_weight
                 elif quant in ["blockfp8", "q4km"]:
                     assert prefix + "q_b_proj.scale" in checkpoint
-                    q_b_proj_scale = checkpoint[prefix + "q_b_proj.scale"]
+                    q_b_proj_scale = checkpoint.pop(prefix + "q_b_proj.scale")
                     # FIXME: Keep this on GPU
                     q_b_proj_weight = weight_dequant_fn(
                         q_b_proj_ckpt_weight.cuda(), q_b_proj_scale.cuda(), block_size
@@ -983,14 +987,14 @@ class TransformerDeepSeekV3(Transformer):
                     q_b_proj_weight = (
                         (
                             up_q_b_proj_weight
-                            * checkpoint[prefix + "q_b_proj.weight_scale"]
+                            * checkpoint.pop(prefix + "q_b_proj.weight_scale")
                             .view(torch.float8_e4m3fn)
                             .unsqueeze(-1)
                             .to(
                                 dtype=up_q_b_proj_weight.dtype,
                                 device=up_q_b_proj_weight.device,
                             )
-                            * checkpoint[prefix + "q_b_proj.weight_scale_2"].to(
+                            * checkpoint.pop(prefix + "q_b_proj.weight_scale_2").to(
                                 device=up_q_b_proj_weight.device
                             )
                         )
@@ -1035,7 +1039,7 @@ class TransformerDeepSeekV3(Transformer):
                     [new_q_b_proj_nope, q_b_proj_rope], dim=1
                 ).view(-1, q_lora_rank)
                 if quant in [None, "gguf"]:  # blockfp4 skips quantizing MLA
-                    new_checkpoint[prefix + "q_b_proj.weight"] = new_q_b_proj
+                    checkpoint[prefix + "q_b_proj.weight"] = new_q_b_proj
                 elif quant in ["blockfp4"]:
                     new_q_b_proj, new_q_b_proj_scale, new_q_b_proj_scale_2 = (
                         fp4_fake_quant(
@@ -1046,11 +1050,11 @@ class TransformerDeepSeekV3(Transformer):
                         )
                     )
                     new_q_b_proj = pack_weight_nibbles(to_e2m1_nibbles(new_q_b_proj))
-                    new_checkpoint[prefix + "q_b_proj.weight"] = new_q_b_proj
-                    new_checkpoint[prefix + "q_b_proj.weight_scale"] = (
+                    checkpoint[prefix + "q_b_proj.weight"] = new_q_b_proj
+                    checkpoint[prefix + "q_b_proj.weight_scale"] = (
                         new_q_b_proj_scale.view(torch.uint8)
                     )
-                    new_checkpoint[prefix + "q_b_proj.weight_scale_2"] = (
+                    checkpoint[prefix + "q_b_proj.weight_scale_2"] = (
                         new_q_b_proj_scale_2.view(1, 1)
                     )
                 elif quant in ["blockfp8", "q4km"]:
@@ -1065,20 +1069,20 @@ class TransformerDeepSeekV3(Transformer):
                         > 1
                     ):
                         new_q_b_proj = new_q_b_proj.view(dtype=torch.uint8)
-                    new_checkpoint[prefix + "q_b_proj.weight"] = new_q_b_proj
-                    new_checkpoint[prefix + "q_b_proj.scale"] = new_q_b_proj_scale
+                    checkpoint[prefix + "q_b_proj.weight"] = new_q_b_proj
+                    checkpoint[prefix + "q_b_proj.scale"] = new_q_b_proj_scale
                 else:
                     raise NotImplementedError(
                         f"infer.mla_absorb=absorb is not implemented for {quant} quantization"
                     )
 
                 # Absorb into o_proj
-                o_proj_ckpt_weight = checkpoint[prefix + "o_proj.weight"]
+                o_proj_ckpt_weight = checkpoint.pop(prefix + "o_proj.weight")
                 if quant in [None, "gguf"]:  # blockfp4 skips quantizing MLA
                     o_proj_weight = o_proj_ckpt_weight
                 elif quant in ["blockfp8", "q4km"]:
                     assert prefix + "o_proj.scale" in checkpoint
-                    o_proj_scale = checkpoint[prefix + "o_proj.scale"]
+                    o_proj_scale = checkpoint.pop(prefix + "o_proj.scale")
                     # FIXME: Keep this on GPU
                     o_proj_weight = weight_dequant_fn(
                         o_proj_ckpt_weight.cuda(), o_proj_scale.cuda(), block_size
@@ -1092,14 +1096,14 @@ class TransformerDeepSeekV3(Transformer):
                     o_proj_weight = (
                         (
                             up_o_proj_weight
-                            * checkpoint[prefix + "o_proj.weight_scale"]
+                            * checkpoint.pop(prefix + "o_proj.weight_scale")
                             .view(torch.float8_e4m3fn)
                             .unsqueeze(-1)
                             .to(
                                 dtype=up_o_proj_weight.dtype,
                                 device=up_o_proj_weight.device,
                             )
-                            * checkpoint[prefix + "o_proj.weight_scale_2"].to(
+                            * checkpoint.pop(prefix + "o_proj.weight_scale_2").to(
                                 device=up_o_proj_weight.device
                             )
                         )
@@ -1123,7 +1127,7 @@ class TransformerDeepSeekV3(Transformer):
                 kv_b_proj_for_o_proj = torch.block_diag(*kv_b_proj_for_o_proj)
                 new_o_proj = o_proj_weight @ kv_b_proj_for_o_proj
                 if quant in [None, "gguf"]:  # blockfp4 skips quantizing MLA
-                    new_checkpoint[prefix + "o_proj.weight"] = new_o_proj
+                    checkpoint[prefix + "o_proj.weight"] = new_o_proj
                 elif quant in ["blockfp8", "q4km"]:
                     # FIXME: Support soft fp8 in weight_quant_deepseek_v3
                     new_o_proj, new_o_proj_scale = weight_quant_deepseek_v3(
@@ -1136,18 +1140,18 @@ class TransformerDeepSeekV3(Transformer):
                         > 1
                     ):
                         new_o_proj = new_o_proj.view(dtype=torch.uint8)
-                    new_checkpoint[prefix + "o_proj.weight"] = new_o_proj
-                    new_checkpoint[prefix + "o_proj.scale"] = new_o_proj_scale
+                    checkpoint[prefix + "o_proj.weight"] = new_o_proj
+                    checkpoint[prefix + "o_proj.scale"] = new_o_proj_scale
                 elif quant in ["blockfp4"]:
                     new_o_proj, new_o_proj_scale, new_o_proj_scale_2 = fp4_fake_quant(
                         new_o_proj, block_scale=None, global_scale=None, quant=True
                     )
                     new_o_proj = pack_weight_nibbles(to_e2m1_nibbles(new_o_proj))
-                    new_checkpoint[prefix + "o_proj.weight"] = new_o_proj
-                    new_checkpoint[prefix + "o_proj.weight_scale"] = (
-                        new_o_proj_scale.view(torch.uint8)
+                    checkpoint[prefix + "o_proj.weight"] = new_o_proj
+                    checkpoint[prefix + "o_proj.weight_scale"] = new_o_proj_scale.view(
+                        torch.uint8
                     )
-                    new_checkpoint[prefix + "o_proj.weight_scale_2"] = (
+                    checkpoint[prefix + "o_proj.weight_scale_2"] = (
                         new_o_proj_scale_2.view(1, 1)
                     )
                 else:
@@ -1155,52 +1159,30 @@ class TransformerDeepSeekV3(Transformer):
                         f"infer.mla_absorb=absorb is not implemented for {quant} quantization"
                     )
 
-            elif (
-                k.endswith(".kv_b_proj.scale")
-                or k.endswith(".kv_b_proj.weight_scale")
-                or k.endswith(".kv_b_proj.weight_scale_2")
-                or k.endswith(".kv_b_proj.input_scale")
-            ):
-                continue
-
             elif k.endswith(".kv_b_proj.bias"):
                 raise NotImplementedError(
                     "infer.mla_absorb=absorb is not implemented for kv_b_proj with a bias"
                 )
-
-            elif (
-                k.endswith(".o_proj.weight")
-                or k.endswith(".o_proj.scale")
-                or k.endswith(".o_proj.weight_scale")
-                or k.endswith(".o_proj.weight_scale_2")
-            ):
-                continue
-
-            elif (
-                k.endswith(".q_b_proj.weight")
-                or k.endswith(".q_b_proj.scale")
-                or k.endswith(".q_b_proj.weight_scale")
-                or k.endswith(".q_b_proj.weight_scale_2")
-            ):
-                continue
 
             elif k.endswith(".q_b_proj.bias"):
                 raise NotImplementedError(
                     "infer.mla_absorb=absorb is not implemented for q_b_proj with a bias"
                 )
 
+            elif k.endswith(".kv_b_proj.input_scale"):
+                checkpoint.pop(k)
             else:
-                new_checkpoint[k] = checkpoint[k]
+                continue
 
-        return new_checkpoint
+        return checkpoint
 
     @override
     def process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
-        new_checkpoint = {}
-        for k in checkpoint.keys():
+        checkpoint_keys = list(checkpoint.keys())
+        for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if not QuantizationRegistry.allowed_merge_qkv(k):
-                new_checkpoint[k] = checkpoint[k]
+                continue
             # Cat dim 0
             elif any(
                 k.endswith(f".q_a_proj.{tensor_name}")
@@ -1210,11 +1192,13 @@ class TransformerDeepSeekV3(Transformer):
                 tensor_name = k.split(".")[-1]
                 prefix = k[: -len(f".q_a_proj.{tensor_name}")]
                 assert f"{prefix}.kv_a_proj_with_mqa.{tensor_name}" in checkpoint
-                q_weight = checkpoint[f"{prefix}.q_a_proj.{tensor_name}"]
-                kv_weight = checkpoint[f"{prefix}.kv_a_proj_with_mqa.{tensor_name}"]
-                new_checkpoint[f"{prefix}.wqkv_a.{tensor_name}"] = torch.cat(
+                q_weight = checkpoint.pop(f"{prefix}.q_a_proj.{tensor_name}")
+                kv_weight = checkpoint.pop(f"{prefix}.kv_a_proj_with_mqa.{tensor_name}")
+                checkpoint[f"{prefix}.wqkv_a.{tensor_name}"] = torch.cat(
                     [q_weight, kv_weight], dim=0
                 )
+                del q_weight
+                del kv_weight
             elif any(
                 k.endswith(f".kv_a_proj_with_mqa.{tensor_name}")
                 for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
@@ -1230,11 +1214,13 @@ class TransformerDeepSeekV3(Transformer):
                 tensor_name = k.split(".")[-1]
                 prefix = k[: -len(f".q_a_proj.{tensor_name}")]
                 assert f"{prefix}.kv_a_proj_with_mqa.{tensor_name}" in checkpoint
-                q_weight = checkpoint[f"{prefix}.q_a_proj.{tensor_name}"]
-                kv_weight = checkpoint[f"{prefix}.kv_a_proj_with_mqa.{tensor_name}"]
-                new_checkpoint[f"{prefix}.wqkv_a.{tensor_name}"] = torch.cat(
+                q_weight = checkpoint.pop(f"{prefix}.q_a_proj.{tensor_name}")
+                kv_weight = checkpoint.pop(f"{prefix}.kv_a_proj_with_mqa.{tensor_name}")
+                checkpoint[f"{prefix}.wqkv_a.{tensor_name}"] = torch.cat(
                     [q_weight, kv_weight], dim=1
                 )
+                del q_weight
+                del kv_weight
             elif any(
                 k.endswith(f".kv_a_proj_with_mqa.{tensor_name}")
                 for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
@@ -1243,16 +1229,17 @@ class TransformerDeepSeekV3(Transformer):
 
             # Unchanged tensors
             else:
-                new_checkpoint[k] = checkpoint[k]
-        return new_checkpoint
+                continue
+
+        return checkpoint
 
     @override
     def process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
-        new_checkpoint = {}
-        for k in checkpoint.keys():
+        checkpoint_keys = list(checkpoint.keys())
+        for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if not QuantizationRegistry.allowed_merge_gate_up(k):
-                new_checkpoint[k] = checkpoint[k]
+                continue
             # Cat dim 0
             elif any(
                 k.endswith(f".gate_proj.{tensor_name}")
@@ -1263,11 +1250,13 @@ class TransformerDeepSeekV3(Transformer):
                 prefix = k[: -len(f".gate_proj.{tensor_name}")]
                 assert f"{prefix}.up_proj.{tensor_name}" in checkpoint
                 assert f"{prefix}.gate_up_proj.{tensor_name}" not in checkpoint
-                gate_weight = checkpoint[f"{prefix}.gate_proj.{tensor_name}"]
-                up_weight = checkpoint[f"{prefix}.up_proj.{tensor_name}"]
-                new_checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = torch.cat(
+                gate_weight = checkpoint.pop(f"{prefix}.gate_proj.{tensor_name}")
+                up_weight = checkpoint.pop(f"{prefix}.up_proj.{tensor_name}")
+                checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = torch.cat(
                     [gate_weight, up_weight], dim=0
                 )
+                del gate_weight
+                del up_weight
             elif any(
                 k.endswith(f".up_proj.{tensor_name}")
                 for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
@@ -1284,11 +1273,13 @@ class TransformerDeepSeekV3(Transformer):
                 prefix = k[: -len(f".gate_proj.{tensor_name}")]
                 assert f"{prefix}.up_proj.{tensor_name}" in checkpoint
                 assert f"{prefix}.gate_up_proj.{tensor_name}" not in checkpoint
-                gate_weight = checkpoint[f"{prefix}.gate_proj.{tensor_name}"]
-                up_weight = checkpoint[f"{prefix}.up_proj.{tensor_name}"]
-                new_checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = torch.cat(
+                gate_weight = checkpoint.pop(f"{prefix}.gate_proj.{tensor_name}")
+                up_weight = checkpoint.pop(f"{prefix}.up_proj.{tensor_name}")
+                checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = torch.cat(
                     [gate_weight, up_weight], dim=1
                 )
+                del gate_weight
+                del up_weight
             elif any(
                 k.endswith(f".up_proj.{tensor_name}")
                 for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
@@ -1297,8 +1288,9 @@ class TransformerDeepSeekV3(Transformer):
 
             # Unchanged tensors
             else:
-                new_checkpoint[k] = checkpoint[k]
-        return new_checkpoint
+                continue
+
+        return checkpoint
 
     @override
     def load_state_dict_parallel(
@@ -1310,15 +1302,14 @@ class TransformerDeepSeekV3(Transformer):
         **kwargs,
     ):
         if not skip_preprocess and replace:
-            new_state_dict = {}
-            for k in state_dict.keys():
-                name = k
-                name = name.replace(".weight_scale_inv", ".scale")
-                name = name.replace(".e_score_correction_bias", ".bias")
-                if "self_attn.rotary_emb.inv_freq" not in name:
-                    new_state_dict[name] = state_dict[k]
-            state_dict = new_state_dict
-
+            state_dict_keys = list(state_dict.keys())
+            for k in state_dict_keys:
+                value = state_dict.pop(k)
+                if "self_attn.rotary_emb.inv_freq" not in k:
+                    name = k
+                    name = name.replace(".weight_scale_inv", ".scale")
+                    name = name.replace(".e_score_correction_bias", ".bias")
+                    state_dict[name] = value
         super().load_state_dict_parallel(
             state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )

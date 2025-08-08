@@ -564,21 +564,23 @@ class Transformer(nn.Module):
 
             else:
                 partial_checkpoint[name] = param
+
         return partial_checkpoint
 
     def process_state_dict_for_blockfp4_before_chunk(self, state_dict):
-        new_state_dict = {}
-        for key, value in state_dict.items():
+        state_dict_keys = list(state_dict.keys())
+        for key in state_dict_keys:
+            value = state_dict[key]
             quant = get_quant_from_checkpoint_prefix(
                 key, self.params.quant_config.rules
             )
             if quant == "blockfp4" and (
                 key.endswith(".weight_scale_2") or key.endswith(".input_scale")
             ):
-                new_state_dict[key] = value.view(1, 1)
+                state_dict[key] = value.view(1, 1)
             else:
-                new_state_dict[key] = value
-        return new_state_dict
+                continue
+        return state_dict
 
     def anti_quant_fp8(self, scale1, scale2):
         shape_w = scale1.shape
@@ -605,11 +607,11 @@ class Transformer(nn.Module):
         return param
 
     def process_state_dict_for_blockfp4_after_chunk(self, state_dict):
-        new_state_dict = {}
-        for k in state_dict.keys():
+        state_dict_keys = list(state_dict.keys())
+        for k in state_dict_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if quant == "blockfp4":
-                param = state_dict[k]
+                param = state_dict.pop(k)
                 if get_global_args().infer.npu_fusion_fp4 and k.endswith(
                     "weight_scale"
                 ):
@@ -618,19 +620,17 @@ class Transformer(nn.Module):
                     param = self._process_fp4_weight_scale_for_npu_fusion(
                         param, scale_2
                     )
-                new_state_dict[k] = param
-            else:
-                new_state_dict[k] = state_dict[k]
-        return new_state_dict
+                state_dict[k] = param
+        return state_dict
 
     def process_state_dict_for_int4_after_chunk(self, state_dict):
-        new_state_dict = {}
-        for key in state_dict.keys():
+        state_dict_keys = list(state_dict.keys())
+        for key in state_dict_keys:
             quant = get_quant_from_checkpoint_prefix(
                 key, self.params.quant_config.rules
             )
             if quant == "w4a8_per_token_per_channel_asymm":
-                param = state_dict[key]
+                param = state_dict.pop(key)
                 if param.dtype == torch.int8 and key.endswith("qweight"):
                     n, half_k = param.shape
                     k = half_k * 2
@@ -657,11 +657,9 @@ class Transformer(nn.Module):
                     )
                     weight = weight[0] + (weight[1] << 4)
                     param.data = weight.view(n, half_k)
+                state_dict[key] = param
 
-                new_state_dict[key] = param
-            else:
-                new_state_dict[key] = state_dict[key]
-        return new_state_dict
+        return state_dict
 
     def process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
         return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
@@ -684,15 +682,13 @@ class Transformer(nn.Module):
 
             # handle ep param
             if self.ep_size > 1:
-                keys_to_remove = []
-                for key in state_dict.keys():
+                state_dict_keys = list(state_dict.keys())
+                for key in state_dict_keys:
                     if (".experts." in key) and all(
                         f".experts.{x}." not in key
                         for x in range(self.experts_start_idx, self.experts_end_idx)
                     ):
-                        keys_to_remove.append(key)
-                for key in keys_to_remove:
-                    state_dict.pop(key, None)
+                        state_dict.pop(key, None)
 
             if self.pipeline_exec:
                 state_dict = self._chunk_checkpoint_for_pipeline_parallel(
@@ -719,9 +715,6 @@ class Transformer(nn.Module):
             state_dict = self.process_state_dict_for_merging_experts(state_dict)
             state_dict = self.process_state_dict_for_blockfp4_after_chunk(state_dict)
             state_dict = self.process_state_dict_for_int4_after_chunk(state_dict)
-        import gc
-
-        gc.collect()
 
         super().load_state_dict(state_dict, *args, **kwargs)
 
