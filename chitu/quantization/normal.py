@@ -167,6 +167,7 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
                 w2=self.down_proj_weight,
                 topk_weights=weights,
                 topk_ids=indices,
+                experts_start_idx=self.experts_start_idx,
             )
 
         elif has_triton and self.merge_gate_up:
