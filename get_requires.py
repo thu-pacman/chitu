@@ -22,7 +22,7 @@ install_requires = [
     "fastapi",
     "uvicorn",
     "tqdm",
-    "accelerate",
+    "accelerate<1.10",  # 1.10 breaks on muxi
     "einops",
     "typing-extensions",
     "pyzmq>=27.0.0",
