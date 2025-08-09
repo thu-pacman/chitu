@@ -34,6 +34,10 @@ Refer to the [Developer Manual](DEVELOPMENT.md) for complete installation instru
 * NVIDIA: qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-nvidia:latest
 * Muxi: qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-muxi:latest
 
+### Supported Models
+
+Please refer to [Supported Models](/docs/en/SUPPORTED_MODELS.md).
+
 ## Contribution Guidelines
 Chitu welcomes all forms of contributions! See [CONTRIBUTING](/docs/en/CONTRIBUTING.md).
 
