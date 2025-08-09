@@ -44,7 +44,7 @@ Chitu「赤兔」是一个专注于效率、灵活性和可用性的高性能大
 
 ### 查看支持的模型
 
-更多模型请参见 [支持的模型](SUPPORTED_MODELS.md)。
+更多模型请参见 [支持的模型](/docs/zh/SUPPORTED_MODELS.md)。
 
 ## 参与开发
 
