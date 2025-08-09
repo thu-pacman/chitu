@@ -1642,16 +1642,39 @@ class NpuAttnBackend(RefAttnBackend):
         softmax_scale=None,
     ):
         if self.args.infer.mla_absorb.lower() != "none":
-            return super().prefill_ragged_qkvo(
-                q,
-                k,
-                v,
-                seqlens,
-                causal,
-                window_size,
-                softcap,
-                softmax_scale,
+            dim_gap = k.shape[-1] - v.shape[-1]
+            # 扩充v的维度以匹配q & k，by adding O
+            if dim_gap >= 0:
+                added_v = torch.cat(
+                    [
+                        v,
+                        torch.zeros(
+                            *v.shape[:-1], dim_gap, device=v.device, dtype=v.dtype
+                        ),
+                    ],
+                    dim=-1,
+                )
+            repeated_k = einops.repeat(
+                k, "b h d -> b (h g) d", g=q.shape[1] // k.shape[1]
             )
+            repeated_v = einops.repeat(
+                added_v, "b h d -> b (h g) d", g=q.shape[1] // added_v.shape[1]
+            )
+            scale = softmax_scale
+            out = torch.empty_like(q)
+            torch_npu._npu_flash_attention(
+                query=q,
+                key=repeated_k,
+                value=repeated_v,
+                mask=self.attn_mask,
+                seq_len=seqlens.lens_tensor_cpu,
+                num_kv_heads=repeated_k.shape[1],
+                num_heads=self.local_n_heads,
+                scale_value=scale,
+                out=out,
+            )
+            npu_out = out[..., : v.shape[-1]]
+            return npu_out
 
         # q [tokens_num, head_num, head_dim]
         output = torch.empty_like(q)
