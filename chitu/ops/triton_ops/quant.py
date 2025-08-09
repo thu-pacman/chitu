@@ -209,24 +209,30 @@ def w8a8_gemm_per_token_per_channel_triton(
 def w4a8_gemm_per_token_per_channel_asymm_triton(
     a: torch.Tensor,
     a_s: torch.Tensor,
-    b: torch.Tensor,
+    b: Packed4BitWeightAlongK,
     b_s: torch.Tensor,
     b_z: torch.Tensor,
 ):
-    assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
+    assert isinstance(b, Packed4BitWeightAlongK)
+    assert b.k_stride == 64
+
+    assert a.is_contiguous(), "Input tensors must be contiguous"
+    assert b.layout_tensor.is_contiguous(), "Input tensors must be contiguous"
     assert (
         a_s.is_contiguous() and b_s.is_contiguous()
     ), "Scaling factor tensors must be contiguous"
     assert b_z.is_contiguous(), "Zero-point tensor must be contiguous"
     K = a.size(-1)
     M = a.numel() // K
-    N = b.size(0)
+    N = b.plain_shape[0]
     c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]),
         triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    w4a8_gemm_per_token_per_channel_asymm_kernel[grid](a, b, c, a_s, b_s, b_z, M, N, K)
+    w4a8_gemm_per_token_per_channel_asymm_kernel[grid](
+        a, b.layout_tensor, c, a_s, b_s, b_z, M, N, K
+    )
     return c
 
 

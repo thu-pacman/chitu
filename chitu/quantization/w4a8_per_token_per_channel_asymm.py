@@ -7,10 +7,18 @@ import torch
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase
 from chitu.ops import w4a8_gemm_per_token_per_channel_asymm
+from chitu.native_layout import (
+    enable_native_layout_weight,
+    Packed4BitWeightAlongK,
+    Packed4BitWeightQServe,
+)
 
 
 @QuantizationRegistry.register_linear("w4a8_per_token_per_channel_asymm")
-class W4A8PerTokenPerChannelAsymmLinear(QuantizedLinearBase):
+class W4A8PerTokenPerChannelAsymmLinear(
+    enable_native_layout_weight("qweight", Packed4BitWeightAlongK, k_stride=64),
+    QuantizedLinearBase,
+):
     @staticmethod
     @torch.no_grad()
     def quant_act(act):
@@ -37,6 +45,11 @@ class W4A8PerTokenPerChannelAsymmLinear(QuantizedLinearBase):
 
         self.in_features = in_features
         self.out_features = out_features
+
+        # In the checkpoint, self.qweight is in Packed4BitWeightQServe layout. Here we
+        # mark the layout via `self._qweight_layout_class` and `self._qweight_plain_shape`,
+        # so `enable_native_layout_weight` can recognize it. After loading,
+        # `enable_native_layout_weight` will convert it to other layouts.
         assert self.in_features % 2 == 0, "in_features must be even for int4 packing"
         self.qweight = torch.nn.Parameter(
             torch.zeros(
@@ -46,6 +59,9 @@ class W4A8PerTokenPerChannelAsymmLinear(QuantizedLinearBase):
             ),
             requires_grad=False,
         )
+        self._qweight_layout_class = Packed4BitWeightQServe
+        self._qweight_plain_shape = (out_features, in_features)
+
         self.s1_scales = torch.nn.Parameter(
             torch.ones(
                 [self.out_features],
@@ -75,7 +91,11 @@ class W4A8PerTokenPerChannelAsymmLinear(QuantizedLinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q_x, act_scale = W4A8PerTokenPerChannelAsymmLinear.quant_act(x)
         out = w4a8_gemm_per_token_per_channel_asymm(
-            q_x, act_scale, self.qweight, self.s1_scales, self.s1_szeros
+            q_x,
+            act_scale,
+            self.get_native_layout_qweight(),
+            self.s1_scales,
+            self.s1_szeros,
         ).view(*x.shape[:-1], -1)
 
         if self.bias is not None:

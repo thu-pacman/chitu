@@ -623,44 +623,6 @@ class Transformer(nn.Module):
                 state_dict[k] = param
         return state_dict
 
-    def process_state_dict_for_int4_after_chunk(self, state_dict):
-        state_dict_keys = list(state_dict.keys())
-        for key in state_dict_keys:
-            quant = get_quant_from_checkpoint_prefix(
-                key, self.params.quant_config.rules
-            )
-            if quant == "w4a8_per_token_per_channel_asymm":
-                param = state_dict.pop(key)
-                if param.dtype == torch.int8 and key.endswith("qweight"):
-                    n, half_k = param.shape
-                    k = half_k * 2
-
-                    # Unpack from qserve format. See
-                    # https://github.com/mit-han-lab/deepcompressor/blob/main/deepcompressor/backend/qserve/utils.py#L18
-                    # for the format details
-                    assert n % 32 == 0
-                    assert k % 32 == 0
-                    weight = param.data.view(
-                        n // 32, k // 32, 1, 8, 4, 2, 2, 1, 4
-                    ).view(torch.uint8)
-                    weight = torch.stack([weight & 0x0F, weight >> 4], dim=0)
-                    weight = (
-                        weight.permute(1, 0, 7, 4, 8, 2, 3, 6, 5, 9)
-                        .contiguous()
-                        .view(n, k)
-                    )
-
-                    # Do our packing
-                    assert k % 128 == 0
-                    weight = (
-                        weight.view(n, k // 128, 2, 64).permute(2, 0, 1, 3).contiguous()
-                    )
-                    weight = weight[0] + (weight[1] << 4)
-                    param.data = weight.view(n, half_k)
-                state_dict[key] = param
-
-        return state_dict
-
     def process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
         return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
 
@@ -714,7 +676,6 @@ class Transformer(nn.Module):
             state_dict = self.process_state_dict_for_merging_gate_up(state_dict)
             state_dict = self.process_state_dict_for_merging_experts(state_dict)
             state_dict = self.process_state_dict_for_blockfp4_after_chunk(state_dict)
-            state_dict = self.process_state_dict_for_int4_after_chunk(state_dict)
 
         super().load_state_dict(state_dict, *args, **kwargs)
 

@@ -213,7 +213,7 @@ def w8a8_gemm_per_token_per_channel(
 def w4a8_gemm_per_token_per_channel_asymm(
     a: torch.Tensor,
     a_s: torch.Tensor,
-    b: torch.Tensor,
+    b: Packed4BitWeightAlongK,
     b_s: torch.Tensor,
     b_z: torch.Tensor,
     impl: str = "auto",
