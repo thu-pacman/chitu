@@ -301,6 +301,36 @@ class Packed4BitWeightAlongK(NativeLayoutTensor):
                 k_stride=k_stride,
             )
 
+        elif isinstance(tensor, Packed4BitWeightQServe):
+            assert len(tensor.plain_shape) == 2
+            n, k = tensor.plain_shape
+
+            # Unpack from qserve format
+            assert n % 32 == 0
+            assert k % 32 == 0
+            weight = tensor.layout_tensor.view(
+                n // 32, k // 32, 1, 8, 4, 2, 2, 1, 4
+            ).view(torch.uint8)
+            weight = torch.stack([weight & 0x0F, weight >> 4], dim=0)
+            weight = (
+                weight.permute(1, 0, 7, 4, 8, 2, 3, 6, 5, 9).contiguous().view(n, k)
+            )
+
+            # Pack to Packed4BitWeightAlongK
+            assert k % k_stride == 0
+            weight = (
+                weight.view(n, k // (2 * k_stride), 2, k_stride)
+                .permute(2, 0, 1, 3)
+                .contiguous()
+            )
+            weight = weight[0] + (weight[1] << 4)
+            weight = weight.view(n, k // 2)
+            return cls(
+                plain_shape=tensor.plain_shape,
+                layout_tensor=weight,
+                k_stride=k_stride,
+            )
+
         else:
             raise TypeError(
                 f"Cannot convert from {type(tensor)} to Packed4BitWeightAlongK"
@@ -395,3 +425,16 @@ class Packed4BitWeightNPUNative(NativeLayoutTensor):
                 "Cannot index a Packed4BitWeightAlongK tensor's last 2 dimensions."
             )
         return Packed4BitWeightAlongK(self.plain_shape[1:], self.layout_tensor[index])
+
+
+@dataclass
+class Packed4BitWeightQServe(NativeLayoutTensor):
+    """
+    Layout used in QServe
+
+    See
+    https://github.com/mit-han-lab/deepcompressor/blob/main/deepcompressor/backend/qserve/utils.py#L18
+    for the format details.
+    """
+
+    pass

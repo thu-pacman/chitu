@@ -176,8 +176,8 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
         输入键：'layers.3.mlp.experts.1.gate_proj.part_name'
         输出键：'layers.3.mlp.experts.gate_proj.part_name' (合并所有该层的专家权重)
         """
-        new_checkpoint = {}
-        for k in checkpoint.keys():
+        checkpoint_keys = list(checkpoint.keys())
+        for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if any(
                 k.endswith(f".experts.{self.experts_start_idx}.{w}.{part}")
@@ -191,12 +191,12 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
                 prefix = k[: -len(f"experts.{self.experts_start_idx}.{w}.{part}")]
                 parts = []
                 for i in range(self.experts_start_idx, self.experts_end_idx):
-                    parts.append(checkpoint[prefix + f"experts.{i}.{w}.{part}"])
-                new_checkpoint[prefix + f"experts.{w}_{part}"] = torch.stack(
-                    parts, dim=0
+                    parts.append(prefix + f"experts.{i}.{w}.{part}")
+                checkpoint[prefix + f"experts.{w}_{part}"] = torch.stack(
+                    [checkpoint.pop(key) for key in parts], dim=0
                 )
             elif re.search(r"\.experts\.\d+", k):
                 continue
             else:
-                new_checkpoint[k] = checkpoint[k]
-        return new_checkpoint
+                continue
+        return checkpoint

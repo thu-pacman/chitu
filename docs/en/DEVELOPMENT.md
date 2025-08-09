@@ -156,11 +156,13 @@ torchrun --nproc_per_node 8 test/single_req_test.py \
 
 The log is stored in `outputs/`.
 
-### List Supported Models
+### Supported Models
 
 ```bash
-python3 script/print_supported_models.py
+python3 script/generate_supported_models_docs.py --print
 ```
+
+See the full list in [Supported Models](SUPPORTED_MODELS.md).
 
 ### Single GPU Inference
 

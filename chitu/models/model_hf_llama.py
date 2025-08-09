@@ -513,14 +513,14 @@ class TransformerHFLlama(Transformer):
         return [f"layers.{i}."]
 
     def _process_state_dict_for_splitting_qkv(self, checkpoint: Mapping[str, Any]):
-        new_checkpoint = {}
-        for k in checkpoint.keys():
+        checkpoint_keys = list(checkpoint.keys())
+        for k in checkpoint_keys:
             if k.endswith(".qkv_proj.weight"):
                 prefix = k[: -len("qkv_proj.weight")]
                 assert prefix + "q_proj.weight" not in checkpoint
                 assert prefix + "k_proj.weight" not in checkpoint
                 assert prefix + "v_proj.weight" not in checkpoint
-                qkv_weight = checkpoint[k]
+                qkv_weight = checkpoint.pop(k)
                 n_heads = self.params.n_heads
                 n_kv_heads = (
                     self.params.n_heads
@@ -539,15 +539,15 @@ class TransformerHFLlama(Transformer):
                     ],
                     dim=0,
                 )
-                new_checkpoint[prefix + "q_proj.weight"] = q_weight
-                new_checkpoint[prefix + "k_proj.weight"] = k_weight
-                new_checkpoint[prefix + "v_proj.weight"] = v_weight
+                checkpoint[prefix + "q_proj.weight"] = q_weight
+                checkpoint[prefix + "k_proj.weight"] = k_weight
+                checkpoint[prefix + "v_proj.weight"] = v_weight
             elif k.endswith(".qkv_proj.bias"):
                 prefix = k[: -len("qkv_proj.bias")]
                 assert prefix + "q_proj.bias" not in checkpoint
                 assert prefix + "k_proj.bias" not in checkpoint
                 assert prefix + "v_proj.bias" not in checkpoint
-                qkv_bias = checkpoint[k]
+                qkv_bias = checkpoint.pop(k)
                 n_heads = self.params.n_heads
                 n_kv_heads = (
                     self.params.n_heads
@@ -567,43 +567,43 @@ class TransformerHFLlama(Transformer):
                     ],
                     dim=0,
                 )
-                new_checkpoint[prefix + "q_proj.bias"] = q_bias
-                new_checkpoint[prefix + "k_proj.bias"] = k_bias
-                new_checkpoint[prefix + "v_proj.bias"] = v_bias
+                checkpoint[prefix + "q_proj.bias"] = q_bias
+                checkpoint[prefix + "k_proj.bias"] = k_bias
+                checkpoint[prefix + "v_proj.bias"] = v_bias
             else:
-                new_checkpoint[k] = checkpoint[k]
-        return new_checkpoint
+                continue
+        return checkpoint
 
     def _process_state_dict_for_splitting_gate_up(self, checkpoint: Mapping[str, Any]):
-        new_checkpoint = {}
-        for k in checkpoint.keys():
+        checkpoint_keys = list(checkpoint.keys())
+        for k in checkpoint_keys:
             if k.endswith(".gate_up_proj.weight"):
                 prefix = k[: -len("gate_up_proj.weight")]
                 assert prefix + "gate_proj.weight" not in checkpoint
                 assert prefix + "up_proj.weight" not in checkpoint
-                gate_up_weight = checkpoint[k]
+                gate_up_weight = checkpoint.pop(k)
                 gate_weight, up_weight = torch.chunk(gate_up_weight, 2, dim=0)
-                new_checkpoint[prefix + "gate_proj.weight"] = gate_weight
-                new_checkpoint[prefix + "up_proj.weight"] = up_weight
+                checkpoint[prefix + "gate_proj.weight"] = gate_weight
+                checkpoint[prefix + "up_proj.weight"] = up_weight
             elif k.endswith(".gate_up_proj.bias"):
                 prefix = k[: -len("gate_up_proj.bias")]
                 assert prefix + "gate_proj.bias" not in checkpoint
                 assert prefix + "up_proj.bias" not in checkpoint
-                gate_up_bias = checkpoint[k]
+                gate_up_bias = checkpoint.pop(k)
                 gate_bias, up_bias = torch.chunk(gate_up_bias, 2, dim=0)
-                new_checkpoint[prefix + "gate_proj.bias"] = gate_bias
-                new_checkpoint[prefix + "up_proj.bias"] = up_bias
+                checkpoint[prefix + "gate_proj.bias"] = gate_bias
+                checkpoint[prefix + "up_proj.bias"] = up_bias
             else:
-                new_checkpoint[k] = checkpoint[k]
-        return new_checkpoint
+                continue
+        return checkpoint
 
     @override
     def process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
-        new_checkpoint = {}
-        for k in checkpoint.keys():
+        checkpoint_keys = list(checkpoint.keys())
+        for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if not QuantizationRegistry.allowed_merge_qkv(k):
-                new_checkpoint[k] = checkpoint[k]
+                continue
             # Cat dim 0
             elif any(
                 k.endswith(f".q_proj.{tensor_name}")
@@ -614,16 +614,16 @@ class TransformerHFLlama(Transformer):
                 prefix = k[: -len(f".q_proj.{tensor_name}")]
                 assert f"{prefix}.k_proj.{tensor_name}" in checkpoint
                 assert f"{prefix}.v_proj.{tensor_name}" in checkpoint
-                q_weight = checkpoint[f"{prefix}.q_proj.{tensor_name}"]
-                k_weight = checkpoint[f"{prefix}.k_proj.{tensor_name}"]
-                v_weight = checkpoint[f"{prefix}.v_proj.{tensor_name}"]
+                q_weight = checkpoint.pop(f"{prefix}.q_proj.{tensor_name}")
+                k_weight = checkpoint.pop(f"{prefix}.k_proj.{tensor_name}")
+                v_weight = checkpoint.pop(f"{prefix}.v_proj.{tensor_name}")
                 # For MixQ quantized models, q/k/v share the same fp_idx
                 merged_weight = (
                     q_weight
                     if tensor_name == "fp_idx"
                     else torch.cat([q_weight, k_weight, v_weight], dim=0)
                 )
-                new_checkpoint[f"{prefix}.qkv_proj.{tensor_name}"] = merged_weight
+                checkpoint[f"{prefix}.qkv_proj.{tensor_name}"] = merged_weight
             elif any(
                 k.endswith(f".k_proj.{tensor_name}")
                 for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
@@ -646,12 +646,15 @@ class TransformerHFLlama(Transformer):
                 prefix = k[: -len(f".q_proj.{tensor_name}")]
                 assert f"{prefix}.k_proj.{tensor_name}" in checkpoint
                 assert f"{prefix}.v_proj.{tensor_name}" in checkpoint
-                q_weight = checkpoint[f"{prefix}.q_proj.{tensor_name}"]
-                k_weight = checkpoint[f"{prefix}.k_proj.{tensor_name}"]
-                v_weight = checkpoint[f"{prefix}.v_proj.{tensor_name}"]
-                new_checkpoint[f"{prefix}.qkv_proj.{tensor_name}"] = torch.cat(
+                q_weight = checkpoint.pop(f"{prefix}.q_proj.{tensor_name}")
+                k_weight = checkpoint.pop(f"{prefix}.k_proj.{tensor_name}")
+                v_weight = checkpoint.pop(f"{prefix}.v_proj.{tensor_name}")
+                checkpoint[f"{prefix}.qkv_proj.{tensor_name}"] = torch.cat(
                     [q_weight, k_weight, v_weight], dim=1
                 )
+                del q_weight
+                del k_weight
+                del v_weight
             elif any(
                 k.endswith(f".k_proj.{tensor_name}")
                 for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
@@ -665,16 +668,16 @@ class TransformerHFLlama(Transformer):
 
             # Unchanged tensors
             else:
-                new_checkpoint[k] = checkpoint[k]
-        return new_checkpoint
+                continue
+        return checkpoint
 
     @override
     def process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
-        new_checkpoint = {}
-        for k in checkpoint.keys():
+        checkpoint_keys = list(checkpoint.keys())
+        for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if not QuantizationRegistry.allowed_merge_gate_up(k):
-                new_checkpoint[k] = checkpoint[k]
+                continue
             # Cat dim 0
             elif any(
                 k.endswith(f".gate_proj.{tensor_name}")
@@ -685,14 +688,14 @@ class TransformerHFLlama(Transformer):
                 prefix = k[: -len(f".gate_proj.{tensor_name}")]
                 assert f"{prefix}.up_proj.{tensor_name}" in checkpoint
                 assert f"{prefix}.gate_up_proj.{tensor_name}" not in checkpoint
-                gate_weight = checkpoint[f"{prefix}.gate_proj.{tensor_name}"]
-                up_weight = checkpoint[f"{prefix}.up_proj.{tensor_name}"]
+                gate_weight = checkpoint.pop(f"{prefix}.gate_proj.{tensor_name}")
+                up_weight = checkpoint.pop(f"{prefix}.up_proj.{tensor_name}")
                 merged_weight = (
                     gate_weight
                     if tensor_name == "fp_idx"
                     else torch.cat([gate_weight, up_weight], dim=0)
                 )
-                new_checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = merged_weight
+                checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = merged_weight
             elif any(
                 k.endswith(f".up_proj.{tensor_name}")
                 for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
@@ -709,11 +712,13 @@ class TransformerHFLlama(Transformer):
                 prefix = k[: -len(f".gate_proj.{tensor_name}")]
                 assert f"{prefix}.up_proj.{tensor_name}" in checkpoint
                 assert f"{prefix}.gate_up_proj.{tensor_name}" not in checkpoint
-                gate_weight = checkpoint[f"{prefix}.gate_proj.{tensor_name}"]
-                up_weight = checkpoint[f"{prefix}.up_proj.{tensor_name}"]
-                new_checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = torch.cat(
+                gate_weight = checkpoint.pop(f"{prefix}.gate_proj.{tensor_name}")
+                up_weight = checkpoint.pop(f"{prefix}.up_proj.{tensor_name}")
+                checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = torch.cat(
                     [gate_weight, up_weight], dim=1
                 )
+                del gate_weight
+                del up_weight
             elif any(
                 k.endswith(f".up_proj.{tensor_name}")
                 for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
@@ -722,8 +727,8 @@ class TransformerHFLlama(Transformer):
 
             # Unchanged tensors
             else:
-                new_checkpoint[k] = checkpoint[k]
-        return new_checkpoint
+                continue
+        return checkpoint
 
     def _process_state_dict_for_repeat_kv_head(
         self, checkpoint: Mapping[str, Any], repeats: int
