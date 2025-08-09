@@ -161,8 +161,10 @@ torchrun --nproc_per_node 8 test/single_req_test.py \
 ### 查看支持的模型
 
 ```bash
-python3 script/print_supported_models.py
+python3 script/generate_supported_models_docs.py --print
 ```
+
+更多模型请参见 [支持的模型](SUPPORTED_MODELS.md)。
 
 ### 单 GPU 推理
 

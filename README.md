@@ -42,6 +42,10 @@ Chitu「赤兔」是一个专注于效率、灵活性和可用性的高性能大
 * 英伟达：qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-nvidia:latest
 * 沐曦：qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-muxi:latest
 
+### 查看支持的模型
+
+更多模型请参见 [支持的模型](SUPPORTED_MODELS.md)。
+
 ## 参与开发
 
 赤兔项目欢迎开源社区的朋友们参与项目共建，请参阅[贡献指南](/docs/zh/CONTRIBUTING.md)。
