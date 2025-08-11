@@ -12,6 +12,9 @@ from chitu.static_tensor import StaticTensor
 from chitu.hybrid_device import CPUParameter
 from chitu.quantization.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import GGMLQuantizationType
+from chitu.utils import try_import_opt_dep
+
+cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
 
 @QuantizationRegistry.register_moe_experts("q4km", backend_type="cpuinfer")
@@ -79,14 +82,16 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
                 ),
                 requires_grad=False,
             )
-            self.gate_type = CPUParameter(
-                torch.tensor(
-                    (12),
-                    dtype=torch.int,
-                    device="cpu",
-                ),
-                requires_grad=False,
-            )
+            with torch.device("cpu"):
+                # The value matters. Don't put onto "meta" device.
+                self.gate_type = CPUParameter(
+                    torch.tensor(
+                        (12),
+                        dtype=torch.int,
+                        device="cpu",
+                    ),
+                    requires_grad=False,
+                )
             self.gguf_up_proj = CPUParameter(
                 torch.empty(
                     int(256 * 2048 * 7168 / 256 * 144),
@@ -95,14 +100,16 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
                 ),
                 requires_grad=False,
             )
-            self.up_type = CPUParameter(
-                torch.tensor(
-                    (12),
-                    dtype=torch.int,
-                    device="cpu",
-                ),
-                requires_grad=False,
-            )
+            with torch.device("cpu"):
+                # The value matters. Don't put onto "meta" device.
+                self.up_type = CPUParameter(
+                    torch.tensor(
+                        (12),
+                        dtype=torch.int,
+                        device="cpu",
+                    ),
+                    requires_grad=False,
+                )
             if ggml_type == "q4k":
                 self.gguf_down_proj = CPUParameter(
                     torch.empty(
@@ -112,14 +119,16 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
                     ),
                     requires_grad=False,
                 )
-                self.down_type = CPUParameter(
-                    torch.tensor(
-                        (12),
-                        dtype=torch.int,
-                        device="cpu",
-                    ),
-                    requires_grad=False,
-                )
+                with torch.device("cpu"):
+                    # The value matters. Don't put onto "meta" device.
+                    self.down_type = CPUParameter(
+                        torch.tensor(
+                            (12),
+                            dtype=torch.int,
+                            device="cpu",
+                        ),
+                        requires_grad=False,
+                    )
             elif ggml_type == "q6k":
                 self.gguf_down_proj = CPUParameter(
                     torch.empty(
@@ -129,50 +138,18 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
                     ),
                     requires_grad=False,
                 )
-                self.down_type = CPUParameter(
-                    torch.tensor(
-                        (14),
-                        dtype=torch.int,
-                        device="cpu",
-                    ),
-                    requires_grad=False,
-                )
+                with torch.device("cpu"):
+                    # The value matters. Don't put onto "meta" device.
+                    self.down_type = CPUParameter(
+                        torch.tensor(
+                            (14),
+                            dtype=torch.int,
+                            device="cpu",
+                        ),
+                        requires_grad=False,
+                    )
             else:
                 raise ValueError("ggml quantization type unimplemented !")
-
-            gate_ptr = ctypes.addressof(
-                ctypes.cast(
-                    self.gguf_gate_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
-                ).contents
-            )
-            up_ptr = ctypes.addressof(
-                ctypes.cast(
-                    self.gguf_up_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
-                ).contents
-            )
-            down_ptr = ctypes.addressof(
-                ctypes.cast(
-                    self.gguf_down_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
-                ).contents
-            )
-            import cpuinfer
-
-            self.moe_config = cpuinfer.moe.MOEConfig(
-                self.n_routed_experts,
-                self.n_activated_experts,
-                self.dim,
-                self.moe_inter_dim,
-                64,
-                10,
-                1024,
-                gate_ptr,
-                up_ptr,
-                down_ptr,
-                self.gate_type.item(),
-                self.up_type.item(),
-                self.down_type.item(),
-                GGMLQuantizationType.BF16,
-            )
 
             self.input_tensor_cpu = StaticTensor(
                 max_nelem=self.max_batch_size * self.dim,
@@ -204,11 +181,44 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
                 dtype=torch.bfloat16,
             )
 
-            self.moe = cpuinfer.moe.MOE(self.moe_config)
             self.cpu_infer = get_cpu_infer()
 
     def warm_up(self):
         if self.rank == 0:
+            # Initialize after __init__ because `data_ptr` may be modified during weight loading
+            gate_ptr = ctypes.addressof(
+                ctypes.cast(
+                    self.gguf_gate_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+                ).contents
+            )
+            up_ptr = ctypes.addressof(
+                ctypes.cast(
+                    self.gguf_up_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+                ).contents
+            )
+            down_ptr = ctypes.addressof(
+                ctypes.cast(
+                    self.gguf_down_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+                ).contents
+            )
+            self.moe_config = cpuinfer.moe.MOEConfig(
+                self.n_routed_experts,
+                self.n_activated_experts,
+                self.dim,
+                self.moe_inter_dim,
+                64,
+                10,
+                1024,
+                gate_ptr,
+                up_ptr,
+                down_ptr,
+                self.gate_type.item(),
+                self.up_type.item(),
+                self.down_type.item(),
+                GGMLQuantizationType.BF16,
+            )
+            self.moe = cpuinfer.moe.MOE(self.moe_config)
+
             self.cpu_infer.submit(self.moe.warm_up())
             self.cpu_infer.sync()
 

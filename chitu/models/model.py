@@ -43,6 +43,7 @@ from chitu.quantization import (
     get_quant_from_checkpoint_prefix,
     get_backend_from_checkpoint_prefix,
 )
+from chitu.hybrid_device import CPUParameter
 
 torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
@@ -65,7 +66,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim), requires_grad=False)
 
     def _ref_norm(self, x, compute_dtype):
         dtype = x.dtype
@@ -188,7 +189,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         freqs_cis_cos: torch.Tensor,
         freqs_cis_sin: torch.Tensor,
-        varlens,
+        seq_len,
     ):
         bs_seq, _ = x.shape
         xq, xk, xv = self._run_linear(x)
@@ -199,10 +200,10 @@ class Attention(nn.Module):
             xq, xk, freqs_cis_cos, freqs_cis_sin, rotary_type="interleaved"
         )
         self.cache.finalize_cache_bylayer_prefill(
-            xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
+            xk, xv, self.cache.curr_req_ids, self.cache.next_seq_len, self.layer_id
         )
         output = self.attn_backend.prefill_ragged_qkvo(
-            xq, xk, xv, varlens, causal=True
+            xq, xk, xv, seq_len, causal=True
         ).view(bs_seq, -1)
         return self._run_output_linear(output)
 
@@ -228,14 +229,14 @@ class Attention(nn.Module):
         cache = self.cache.get_cache_decode(self.layer_id)
         cache_k = cache[0]
         cache_v = cache[1]
-        cache_seqlens_excl_this_decode = self.cache.get_gpu_seq_lens_excl_this_decode()
         output = self.attn_backend.decode_dense_kv(
             xq,
             cache_k,
             cache_v,
             xk,
             xv,
-            cache_seqlens=cache_seqlens_excl_this_decode,
+            prev_seq_len=self.cache.prev_seq_len,
+            next_seq_len=self.cache.next_seq_len,
         ).view(bsz, seqlen, -1)
         return self._run_output_linear(output)
 
@@ -259,7 +260,6 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
         block_table = self.cache.get_gpu_block_table()
-        cache_seqlens_excl_this_decode = self.cache.get_gpu_seq_lens_excl_this_decode()
         paged_k_cache, paged_v_cache = self.cache.get_paged_kv_cache(self.layer_id)
         output = self.attn_backend.decode_paged_kv(
             xq,
@@ -267,14 +267,15 @@ class Attention(nn.Module):
             paged_v_cache,
             xk,
             xv,
-            cache_seqlens=cache_seqlens_excl_this_decode,
+            prev_seq_len=self.cache.prev_seq_len,
+            next_seq_len=self.cache.next_seq_len,
             block_table=block_table,
         ).view(bsz, seqlen, -1)
         return self._run_output_linear(output)
 
-    def forward(self, x, freqs_cis_cos, freqs_cis_sin, varlens=None):
-        if varlens is not None:  # prefill
-            return self.prefill_forward(x, freqs_cis_cos, freqs_cis_sin, varlens)
+    def forward(self, x, freqs_cis_cos, freqs_cis_sin, seq_len=None):
+        if seq_len is not None:  # prefill
+            return self.prefill_forward(x, freqs_cis_cos, freqs_cis_sin, seq_len)
         elif isinstance(self.cache, PagedKVCacheManager):
             return self.decode_forward_paged(x, freqs_cis_cos, freqs_cis_sin)
         else:
@@ -352,7 +353,9 @@ class Transformer(nn.Module):
         if not self.pipeline_exec or self.pp_stage == self.pipeline_parallel_size - 1:
             self._init_post_layers()
 
-        self.precompute_freqs_cis(max_position_embeddings, self.device)
+        with self.device:
+            # precomputed freqs_cis has real data, so we can't put it on "meta" device
+            self.precompute_freqs_cis(max_position_embeddings, self.device)
 
         self.do_decode_callable = None
         self.args = get_global_args()
@@ -600,9 +603,10 @@ class Transformer(nn.Module):
         return new_weight.to(torch.bfloat16)
 
     def _process_fp4_weight_scale_for_npu_fusion(self, param, scale_2):
+        old_device = param.device
         param.data = self.anti_quant_fp8(
             param.data.to(device="npu"), scale_2.data.to(device="npu")
-        ).cpu()
+        ).to(old_device)
         param.data = param.data.transpose(-2, -1).contiguous().transpose(-2, -1)
         return param
 
@@ -660,6 +664,13 @@ class Transformer(nn.Module):
                 state_dict = self._chunk_checkpoint_for_tensor_parallel(
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )
+
+        # TODO: Move `state_dict` to GPU and preprocess on GPU if there is no `CPUParameter`s
+        # Problems:
+        # - Processing on GPU laeds to sever memory fragmentation (13.44 GiB fragements in 94.93
+        #   GiB allocated memory). Disabling torch allocator with `PYTORCH_NO_CUDA_MEMORY_CACHING=1`
+        #   works but may lead to too much performance degradation.
+
         self.load_state_dict(
             state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )
@@ -676,6 +687,36 @@ class Transformer(nn.Module):
             state_dict = self.process_state_dict_for_merging_gate_up(state_dict)
             state_dict = self.process_state_dict_for_merging_experts(state_dict)
             state_dict = self.process_state_dict_for_blockfp4_after_chunk(state_dict)
+
+        # Check inconsistent dtype
+        keep_dtype_in_checkpoint = get_global_args().keep_dtype_in_checkpoint
+        for name, param in self.named_parameters():
+            if name in state_dict and param.dtype != state_dict[name].dtype:
+                if keep_dtype_in_checkpoint:
+                    logger.info(
+                        f"Parameter {name} has inconsistent dtype in the checkpoint "
+                        f"({state_dict[name].dtype}) and the model ({param.dtype}), "
+                        f"using the dtype in the checkpoint. Set `keep_dtype_in_checkpoint=False` "
+                        f"when starting chitu if you want to use the dtype in the model."
+                    )
+                else:
+                    logger.info(
+                        f"Parameter {name} has inconsistent dtype in the checkpoint "
+                        f"({state_dict[name].dtype}) and the model ({param.dtype}), "
+                        f"converting the checkpoint dtype to the model dtype. Set "
+                        f"`keep_dtype_in_checkpoint=True` when starting chitu if you "
+                        f"want to use the dtype in the checkpoint."
+                    )
+                    state_dict[name] = state_dict[name].to(param.dtype)
+
+        for k in state_dict:
+            if isinstance(self.get_parameter(k), CPUParameter):
+                state_dict[k] = CPUParameter(state_dict[k], requires_grad=False)
+            else:
+                # Work around a bug on torch<2.2.2 that creates requires_grad=True inside
+                # `super().load_state_dict`:
+                # See https://github.com/pytorch/pytorch/pull/121157.
+                state_dict[k] = torch.nn.Parameter(state_dict[k], requires_grad=False)
 
         super().load_state_dict(state_dict, *args, **kwargs)
 
@@ -703,24 +744,24 @@ class Transformer(nn.Module):
             device=device,
         )
 
-    def prepare_freqs_cis_prefill(self, varlens):
+    def prepare_freqs_cis_prefill(self, seq_len):
         curr_freqs_cis = self.freqs_cis[
-            self.cache.curr_varlens.position_ids_tensor_device
+            self.cache.next_seq_len.position_ids_tensor_device
         ]
         return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
 
     def prepare_freqs_cis_decode(self):
-        curr_freqs_cis = self.freqs_cis[self.cache.get_gpu_seq_lens_excl_this_decode()]
+        curr_freqs_cis = self.freqs_cis[self.cache.prev_seq_len.lens_tensor_device]
         return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
 
     @torch.inference_mode()
     def prefill_single_device(self, tokens):
-        varlens = self.cache.curr_varlens
-        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_prefill(varlens)
+        next_seq_len = self.cache.next_seq_len
+        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_prefill(next_seq_len)
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis_cos, freqs_cis_sin, varlens)
-        tmp = varlens.prefix_lens_list[1:]
+            h = layer(h, freqs_cis_cos, freqs_cis_sin, next_seq_len)
+        tmp = next_seq_len.prefix_lens_list[1:]
         h = h[[item - 1 for item in tmp]]
         h = self._post_layers(h)  # Exec post layers AFTER cutting the last token off
         h = h.float()
@@ -738,8 +779,8 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def prefill_pipeline(self, tokens):
 
-        varlens = self.cache.curr_varlens
-        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_prefill(varlens)
+        next_seq_len = self.cache.next_seq_len
+        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_prefill(next_seq_len)
 
         # start of model
         if self.pp_stage == 0:
@@ -748,10 +789,10 @@ class Transformer(nn.Module):
             h = tokens
         # layers
         for it, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis_cos, freqs_cis_sin, varlens)
+            h = layer(h, freqs_cis_cos, freqs_cis_sin, next_seq_len)
         # end of model
         if self.pp_stage == self.pp_end_stage:
-            tmp = varlens.prefix_lens_list[1:]
+            tmp = next_seq_len.prefix_lens_list[1:]
             h = h[[item - 1 for item in tmp]]
             h = self._post_layers(
                 h
@@ -777,29 +818,26 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def prefill(self, tokens):
-        self.attn_backend.prepare_metadata_for_prefill(self.cache.curr_varlens)
+        self.attn_backend.prepare_metadata_for_prefill(self.cache.next_seq_len)
         if self.pipeline_exec:
             return self.prefill_pipeline(tokens)
         else:
             return self.prefill_single_device(tokens)
 
     def prepare_decoding_attn(self):
-        cache_seqlens_excl_this_decode = self.cache.get_gpu_seq_lens_excl_this_decode()
-        cache_seqlens_incl_this_decode = self.cache.get_gpu_seq_lens_incl_this_decode()
         block_table = self.cache.get_gpu_block_table()
         block_size = self.cache.get_block_size()
         self.attn_backend.prepare_metadata_for_decode(
-            cache_seqlens_excl_this_decode,
-            cache_seqlens_incl_this_decode,
+            self.cache.prev_seq_len,
+            self.cache.next_seq_len,
             block_table,
             block_size,
         )
 
     @torch.inference_mode()
-    def decode(self, tokens, seq_lens):
+    def decode(self, tokens, batch_size):
         self.prepare_decoding_attn()
 
-        batch_size = len(seq_lens)
         infer_args = get_global_args().infer
         current_cuda_graph_enabled = self.use_cuda_graph and (
             infer_args.cache_type != "paged" or infer_args.num_blocks != -1
@@ -818,7 +856,7 @@ class Transformer(nn.Module):
             if is_ascend():
                 before_replay_callback = lambda graph: graph.update(
                     cpu_update_input=[
-                        {"actual_seq_lengths_kv": self.attn_backend.seq_lens_incl_list}
+                        {"actual_seq_lengths_kv": self.cache.next_seq_len.lens_list}
                     ]
                 )
 

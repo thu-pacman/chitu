@@ -25,4 +25,5 @@ from chitu.ops.quant import (
     fp4_fake_quant,
     pack_weight_nibbles,
     to_e2m1_nibbles,
+    mixq_gemm,
 )

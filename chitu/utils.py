@@ -4,7 +4,6 @@
 
 
 import functools
-from itertools import accumulate
 import logging
 from logging import WARNING, INFO, getLogger
 import os
@@ -172,55 +171,6 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
 
 
 # SPDX-SnippetEnd
-
-
-class VarLens:
-    def __init__(self, tokens, device) -> None:
-        self.lens_list: List[int] = [len(t) for t in tokens]
-        self.device = device
-
-    @functools.cached_property
-    def lens_tensor_cpu(self) -> torch.Tensor:
-        return torch.tensor(self.lens_list, device="cpu", dtype=torch.int32)
-
-    @functools.cached_property
-    def lens_tensor_device(self) -> torch.Tensor:
-        return (
-            self.lens_tensor_cpu.to(self.device)
-            if self.device != "cpu"
-            else self.lens_tensor_cpu
-        )
-
-    @functools.cached_property
-    def prefix_lens_list(self) -> List[int]:
-        return list(accumulate(self.lens_list, initial=0))
-
-    @functools.cached_property
-    def prefix_lens_tensor_device(self) -> torch.Tensor:
-        return torch.tensor(
-            self.prefix_lens_list, device=self.device, dtype=torch.int32
-        )
-
-    @functools.cached_property
-    def position_ids_tensor_device(self) -> torch.Tensor:
-        return torch.cat(
-            [
-                torch.arange(length, device=self.device)
-                for length in self.lens_tensor_device
-            ]
-        )
-
-    @functools.cached_property
-    def batch_size(self) -> int:
-        return len(self.lens_list)
-
-    @functools.cached_property
-    def max_len(self) -> int:
-        return int(self.lens_tensor_cpu.max())
-
-    @functools.cached_property
-    def total_len(self) -> int:
-        return int(self.lens_tensor_cpu.sum())
 
 
 def get_config_dir_path():

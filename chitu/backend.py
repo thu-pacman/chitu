@@ -4,6 +4,7 @@
 
 import gc
 import itertools
+import functools
 import os
 import time
 from collections import deque
@@ -80,7 +81,6 @@ class Backend:
     formatter = None
     args = None
     # --- cache_manager related (not used in the current code)
-    curr_varlens = None
     curr_req_ids = None
     cache_type = ""
     # ---
@@ -409,7 +409,9 @@ class Backend:
             raise ValueError(f"Unknown attn type {args.infer.attn_type}")
 
     @staticmethod
-    def _move_one_module_to_device(m: torch.nn.Module):
+    def _move_one_module_to_device(
+        m: torch.nn.Module, non_blocking: bool = True, ignore_not_loaded: bool = False
+    ):
         # NOTE: m._parameters contains parameters in this module (non-recursive),
         # while m.parameters() returns all parameters in this module and its submodules
         # (recursive).
@@ -417,23 +419,37 @@ class Backend:
             param = m._parameters[key]
             if param is not None:
                 if not isinstance(param, CPUParameter):
+                    if param.device == torch.device("meta"):
+                        if not ignore_not_loaded:
+                            assert False, f"Unexpected unloaded parameter {key}"
+                        else:
+                            continue
                     if is_muxi():
                         # Work around a muxi bug that convert from NHWC to NCHW for whatever
                         # 4-D tensor even its not a convolution weight.
                         assert param.data.is_contiguous()
-                        param.data = param.data.cuda().contiguous()
+                        param.data = param.data.cuda(
+                            non_blocking=non_blocking
+                        ).contiguous()
                     else:
-                        param.data = param.data.cuda()
+                        param.data = param.data.cuda(non_blocking=non_blocking)
         for key in m._buffers:
             buffer = m._buffers[key]
             if buffer is not None:
+                if buffer.device == torch.device("meta"):
+                    if not ignore_not_loaded:
+                        assert False, f"Unexpected unloaded buffer {key}"
+                    else:
+                        continue
                 if is_muxi():
                     # Work around a muxi bug that convert from NHWC to NCHW for whatever
                     # 4-D tensor even its not a convolution weight.
                     assert buffer.is_contiguous()
-                    m._buffers[key] = buffer.cuda().contiguous()
+                    m._buffers[key] = buffer.cuda(
+                        non_blocking=non_blocking
+                    ).contiguous()
                 else:
-                    m._buffers[key] = buffer.cuda()
+                    m._buffers[key] = buffer.cuda(non_blocking=non_blocking)
 
     @staticmethod
     def _build_and_setup_model(args, attn_backend):
@@ -447,12 +463,17 @@ class Backend:
         Returns:
             Fully set up model
         """
-        # Build the model
-        model = Backend._build_model_architecture(args, attn_backend)
-
-        # Load model parameters if needed
         if args.infer.do_load:
+            # Build the model. Don't allocate memory yet.
+            with torch.device("meta"):
+                model = Backend._build_model_architecture(args, attn_backend)
+
+            # Load model parameters
             Backend._load_checkpoint(model, args)
+
+        else:
+            # Use initialized weights
+            model = Backend._build_model_architecture(args, attn_backend)
 
         # Move model to appropriate device
         model.apply(Backend._move_one_module_to_device)
@@ -514,6 +535,8 @@ class Backend:
             load_gguf_deepseek_v3_gguf(model, ds_gguf_loader, 10, args)
 
         else:
+            quant_config = getattr(args.models, "quant_config", None)
+            quant_name = getattr(quant_config, "name", None)
             if args.models.type == "llama":
                 checkpoints = sorted(Path(args.models.ckpt_dir).glob("*.pth"))
                 assert (
@@ -527,6 +550,10 @@ class Backend:
                     map_location="cpu",
                 )
                 checkpoint = Backend._remove_prefix(checkpoint, "model.")
+            elif quant_name in ["gguf", "q4km"]:
+                checkpoint = load_state_dict_llama_gguf_mlp_layers(
+                    GGUFLoader(args.models.ckpt_dir), len(model.layers)
+                )
             elif args.models.type in {
                 "hf-llama",
                 "hf-qwen-3-moe",
@@ -565,7 +592,7 @@ class Backend:
             model.load_state_dict_parallel(
                 checkpoint,
                 strict=True,
-                assign=args.keep_dtype_in_checkpoint,
+                assign=True,  # Replacing "meta" tensors in the model with tensors from the checkpoint
                 skip_preprocess=args.skip_preprocess,
             )
         for layer in model.layers:
@@ -597,8 +624,6 @@ class Backend:
         Returns:
             Loaded checkpoint dictionary
         """
-        quant_config = getattr(args.models, "quant_config", None)
-        quant_name = getattr(quant_config, "name", None)
         ckpt_dir = args.models.ckpt_dir
 
         def get_filter_key():
@@ -612,18 +637,11 @@ class Backend:
                 return lambda k: not (k.endswith(".k_scale") or k.endswith(".v_scale"))
             return None
 
-        if quant_name in ["autoawq", "gptqmodel", "awq"]:
-            params = load_state_dict(ckpt_dir)
-            return Backend._remove_prefix(params, "model.")
-        elif quant_name in ["gguf", "q4km"]:
-            loader = GGUFLoader(ckpt_dir)
-            return load_state_dict_llama_gguf_mlp_layers(loader, len(model.layers))
-        else:
-            filter_key = get_filter_key()
-            params = load_state_dict(
-                ckpt_dir, skip_preprocess=args.skip_preprocess, filter_key=filter_key
-            )
-            return Backend._remove_prefix(params, "model.")
+        filter_key = get_filter_key()
+        params = load_state_dict(
+            ckpt_dir, skip_preprocess=args.skip_preprocess, filter_key=filter_key
+        )
+        return Backend._remove_prefix(params, "model.")
 
     @staticmethod
     def build(args):
@@ -691,7 +709,7 @@ def load_state_dict(
 
 def memory_used():
     logger.debug(
-        f"gpu memory usage : RANK : {torch.cuda.current_device()} {torch.cuda.memory_allocated()/(1024**3)} GB"
+        f"gpu memory usage: {torch.cuda.memory_allocated()/(1024**3)} GB"
     )  # torch.cuda.max_memory_allocated()/(1024**3)) #, torch.cuda.memory_reserved()/(1024**3))
     import resource
 
@@ -711,10 +729,16 @@ def load_gguf_deepseek_v3_gguf(
         checkpoint0,
         strict=False,
         replace=False,
-        assign=args.keep_dtype_in_checkpoint,
+        assign=True,  # Replacing "meta" tensors in the model with tensors from the checkpoint
         skip_preprocess=args.skip_preprocess,
     )
-    model.apply(Backend._move_one_module_to_device)
+    model.apply(
+        functools.partial(
+            Backend._move_one_module_to_device,
+            non_blocking=False,  # Wait for done, and the memory is free'd
+            ignore_not_loaded=True,
+        )
+    )
     del checkpoint0
     gc.collect()
     torch.cuda.empty_cache()
@@ -735,7 +759,7 @@ def load_gguf_deepseek_v3_gguf(
             checkpoint,
             strict=False,
             replace=False,
-            assign=args.keep_dtype_in_checkpoint,
+            assign=True,  # Replacing "meta" tensors in the model with tensors from the checkpoint
             skip_preprocess=args.skip_preprocess,
         )
         del checkpoint

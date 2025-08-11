@@ -32,9 +32,10 @@ from chitu.distributed.parallel_state import (
 from chitu.distributed.moe_token_dispatcher import (
     get_token_dispatcher,
 )
-from chitu.utils import VarLens, top_k_top_p_min_p_sampling_from_probs_torch
+from chitu.utils import top_k_top_p_min_p_sampling_from_probs_torch
 from chitu.ops import apply_frequency_penalty, response_append
 from chitu.device_list import DeviceList
+from chitu.batched_seq_len import BatchedSeqLen
 
 logger = getLogger(__name__)
 
@@ -378,9 +379,6 @@ class Executor:
             )
         self.token_dispatcher = get_token_dispatcher()
 
-    def _prepare_seq_lens_for_decode(self, tasks: PackedTasksBase):
-        return [Backend.cache_manager.seq_lens[req_id] for req_id in tasks.req_ids]
-
     def _prepare_new_tokens_for_decode(self, tasks: PackedTasks):
         return torch.tensor(
             [task.next_token for task in tasks.tasks],
@@ -439,8 +437,10 @@ class Executor:
         return out
 
     def prefill_step(self, tasks: PackedTasksBase):
-        varlens = VarLens(tasks.tokens, device=self.local_rank)
-        Backend.cache_manager.prepare_cache_prefill(tasks.req_ids, varlens)
+        seq_len = BatchedSeqLen.from_tokens(
+            tasks.tokens, device=torch.device(self.local_rank)
+        )
+        Backend.cache_manager.prepare_cache_prefill(tasks.req_ids, seq_len)
 
         num_tokens = tasks.num_tokens
 
@@ -474,7 +474,6 @@ class Executor:
 
     def decode_step(self, tasks: PackedTasksBase):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
-        seq_lens = self._prepare_seq_lens_for_decode(tasks)
 
         num_tokens = tasks.num_tasks
 
@@ -495,7 +494,7 @@ class Executor:
         payload = payload.unsqueeze(1)  # convert [B, :] to [B, 1, :]
 
         self.timers("decode").start()
-        out = Backend.model.decode(payload, seq_lens).squeeze(
+        out = Backend.model.decode(payload, len(tasks.req_ids)).squeeze(
             1
         )  # adapt dispatch payload shape
         self.timers("decode").stop()
