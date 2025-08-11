@@ -53,14 +53,14 @@ class TransformerBlockHFGlmZ1(TransformerBlock):
         x: torch.Tensor,
         freqs_cis_cos: torch.Tensor,
         freqs_cis_sin: torch.Tensor,
-        varlens=None,
+        seq_len=None,
     ):
         impl = get_rms_norm_impl()
         h = self.self_attn(
             self.input_layernorm(x, impl=impl),
             freqs_cis_cos,
             freqs_cis_sin,
-            varlens,
+            seq_len,
         )
         h = self.post_self_attn_layernorm(h, impl=impl)
         h += x

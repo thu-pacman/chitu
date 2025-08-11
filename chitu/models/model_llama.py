@@ -212,10 +212,10 @@ class TransformerBlockLlama(TransformerBlock):
         x: torch.Tensor,
         freqs_cis_cos: torch.Tensor,
         freqs_cis_sin: torch.Tensor,
-        varlens=None,
+        seq_len=None,
     ):
         h = self.attention(
-            self.attention_norm(x), freqs_cis_cos, freqs_cis_sin, varlens
+            self.attention_norm(x), freqs_cis_cos, freqs_cis_sin, seq_len
         )
         h += x
         out = h + self.feed_forward(self.ffn_norm(h))

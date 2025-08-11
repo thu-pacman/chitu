@@ -271,18 +271,18 @@ class AttentionDeepSeekV3(Attention):
         x: torch.Tensor,
         freqs_cis_cos: torch.Tensor,
         freqs_cis_sin: torch.Tensor,
-        varlens,
+        seq_len,
     ):
         bs_seq, _ = x.size()
 
         if self.mla_absorb == "none":
             q, k, v = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
             self.cache.finalize_cache_bylayer_prefill(
-                k, v, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
+                k, v, self.cache.curr_req_ids, self.cache.next_seq_len, self.layer_id
             )
 
             x = self.attn_backend.prefill_ragged_qkvo(
-                q, k, v, varlens, causal=True, softmax_scale=self.softmax_scale
+                q, k, v, seq_len, causal=True, softmax_scale=self.softmax_scale
             )
 
         elif self.mla_absorb == "absorb-without-precomp" or self.mla_absorb == "absorb":
@@ -297,7 +297,7 @@ class AttentionDeepSeekV3(Attention):
                 kv,
                 None,
                 self.cache.curr_req_ids,
-                self.cache.curr_varlens,
+                self.cache.next_seq_len,
                 self.layer_id,
             )
             q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
@@ -306,7 +306,7 @@ class AttentionDeepSeekV3(Attention):
                 q_nope_pe.view(-1, q_nope_pe.shape[-2], q_nope_pe.shape[-1]),
                 kv.view(-1, 1, kv.shape[-1]),
                 kv_cache.view(-1, 1, kv_cache.shape[-1]),
-                varlens,
+                seq_len,
                 causal=True,
                 softmax_scale=self.softmax_scale,
             )
@@ -326,8 +326,6 @@ class AttentionDeepSeekV3(Attention):
     def decode_forward(
         self, x: torch.Tensor, freqs_cis_cos: torch.Tensor, freqs_cis_sin: torch.Tensor
     ):
-        cache_seqlens_excl_this_decode = self.cache.get_gpu_seq_lens_excl_this_decode()
-        cache_seqlens_incl_this_decode = self.cache.get_gpu_seq_lens_incl_this_decode()
         bsz, seqlen, _ = x.size()
 
         if self.mla_absorb == "none":
@@ -347,7 +345,8 @@ class AttentionDeepSeekV3(Attention):
                 cache_v,
                 k,
                 v,
-                cache_seqlens=cache_seqlens_excl_this_decode,
+                prev_seq_len=self.cache.prev_seq_len,
+                next_seq_len=self.cache.next_seq_len,
                 softmax_scale=self.softmax_scale,
             ).view(bsz, seqlen, self.n_local_heads, self.v_head_dim)
 
@@ -367,8 +366,8 @@ class AttentionDeepSeekV3(Attention):
                 q_pe,
                 kv_cache,
                 kv.view(bsz, seqlen, 1, -1),
-                cache_seqlens_excl_this_decode=cache_seqlens_excl_this_decode,
-                cache_seqlens_incl_this_decode=cache_seqlens_incl_this_decode,
+                prev_seq_len=self.cache.prev_seq_len,
+                next_seq_len=self.cache.next_seq_len,
                 softmax_scale=self.softmax_scale,
             )
 
@@ -386,8 +385,6 @@ class AttentionDeepSeekV3(Attention):
     def decode_forward_paged(
         self, x: torch.Tensor, freqs_cis_cos: torch.Tensor, freqs_cis_sin: torch.Tensor
     ):
-        cache_seqlens_excl_this_decode = self.cache.get_gpu_seq_lens_excl_this_decode()
-        cache_seqlens_incl_this_decode = self.cache.get_gpu_seq_lens_incl_this_decode()
         block_table = self.cache.get_gpu_block_table()
 
         bsz, seqlen, _ = x.size()
@@ -407,7 +404,8 @@ class AttentionDeepSeekV3(Attention):
                 paged_v_cache,
                 k,
                 v,
-                cache_seqlens=cache_seqlens_excl_this_decode,
+                prev_seq_len=self.cache.prev_seq_len,
+                next_seq_len=self.cache.next_seq_len,
                 block_table=block_table,
                 softmax_scale=self.softmax_scale,
             ).view(bsz, seqlen, self.n_local_heads, self.v_head_dim)
@@ -428,8 +426,8 @@ class AttentionDeepSeekV3(Attention):
                 q_pe,
                 paged_kv_cache,
                 kv.view(bsz, seqlen, 1, -1),
-                cache_seqlens_excl_this_decode=cache_seqlens_excl_this_decode,
-                cache_seqlens_incl_this_decode=cache_seqlens_incl_this_decode,
+                prev_seq_len=self.cache.prev_seq_len,
+                next_seq_len=self.cache.next_seq_len,
                 block_table=block_table,
                 softmax_scale=self.softmax_scale,
             )
@@ -725,13 +723,13 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         x: torch.Tensor,
         freqs_cis_cos: torch.Tensor,
         freqs_cis_sin: torch.Tensor,
-        varlens=None,
+        seq_len=None,
     ):
         x = x + self.self_attn(
             self.input_layernorm(x, compute_dtype=x.dtype),
             freqs_cis_cos,
             freqs_cis_sin,
-            varlens,
+            seq_len,
         )
         x = x + self.mlp(self.post_attention_layernorm(x, compute_dtype=x.dtype))
         return x
@@ -1395,24 +1393,22 @@ class TransformerDeepSeekV3(Transformer):
         self.freqs_cis_imag = self.freqs_cis.imag.contiguous().to(device)
 
     @override
-    def prepare_freqs_cis_prefill(self, varlens):
-        index = self.cache.curr_varlens.position_ids_tensor_device
+    def prepare_freqs_cis_prefill(self, seq_len):
+        index = self.cache.next_seq_len.position_ids_tensor_device
         return self.freqs_cis_real[index], self.freqs_cis_imag[index]
 
     @override
     def prepare_freqs_cis_decode(self):
-        index = self.cache.get_gpu_seq_lens_excl_this_decode()
+        index = self.cache.prev_seq_len.lens_tensor_device
         return self.freqs_cis_real[index], self.freqs_cis_imag[index]
 
     @override
     def prepare_decoding_attn(self):
-        cache_seqlens_excl_this_decode = self.cache.get_gpu_seq_lens_excl_this_decode()
-        cache_seqlens_incl_this_decode = self.cache.get_gpu_seq_lens_incl_this_decode()
         block_table = self.cache.get_gpu_block_table()
         block_size = self.cache.get_block_size()
         self.attn_backend.prepare_metadata_for_decode(
-            cache_seqlens_excl_this_decode,
-            cache_seqlens_incl_this_decode,
+            self.cache.prev_seq_len,
+            self.cache.next_seq_len,
             block_table,
             block_size,
             softmax_scale=compute_softmax_scale_deepseek_v3(self.params),

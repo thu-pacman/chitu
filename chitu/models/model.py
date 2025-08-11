@@ -189,7 +189,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         freqs_cis_cos: torch.Tensor,
         freqs_cis_sin: torch.Tensor,
-        varlens,
+        seq_len,
     ):
         bs_seq, _ = x.shape
         xq, xk, xv = self._run_linear(x)
@@ -200,10 +200,10 @@ class Attention(nn.Module):
             xq, xk, freqs_cis_cos, freqs_cis_sin, rotary_type="interleaved"
         )
         self.cache.finalize_cache_bylayer_prefill(
-            xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
+            xk, xv, self.cache.curr_req_ids, self.cache.next_seq_len, self.layer_id
         )
         output = self.attn_backend.prefill_ragged_qkvo(
-            xq, xk, xv, varlens, causal=True
+            xq, xk, xv, seq_len, causal=True
         ).view(bs_seq, -1)
         return self._run_output_linear(output)
 
@@ -229,14 +229,14 @@ class Attention(nn.Module):
         cache = self.cache.get_cache_decode(self.layer_id)
         cache_k = cache[0]
         cache_v = cache[1]
-        cache_seqlens_excl_this_decode = self.cache.get_gpu_seq_lens_excl_this_decode()
         output = self.attn_backend.decode_dense_kv(
             xq,
             cache_k,
             cache_v,
             xk,
             xv,
-            cache_seqlens=cache_seqlens_excl_this_decode,
+            prev_seq_len=self.cache.prev_seq_len,
+            next_seq_len=self.cache.next_seq_len,
         ).view(bsz, seqlen, -1)
         return self._run_output_linear(output)
 
@@ -260,7 +260,6 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
         block_table = self.cache.get_gpu_block_table()
-        cache_seqlens_excl_this_decode = self.cache.get_gpu_seq_lens_excl_this_decode()
         paged_k_cache, paged_v_cache = self.cache.get_paged_kv_cache(self.layer_id)
         output = self.attn_backend.decode_paged_kv(
             xq,
@@ -268,14 +267,15 @@ class Attention(nn.Module):
             paged_v_cache,
             xk,
             xv,
-            cache_seqlens=cache_seqlens_excl_this_decode,
+            prev_seq_len=self.cache.prev_seq_len,
+            next_seq_len=self.cache.next_seq_len,
             block_table=block_table,
         ).view(bsz, seqlen, -1)
         return self._run_output_linear(output)
 
-    def forward(self, x, freqs_cis_cos, freqs_cis_sin, varlens=None):
-        if varlens is not None:  # prefill
-            return self.prefill_forward(x, freqs_cis_cos, freqs_cis_sin, varlens)
+    def forward(self, x, freqs_cis_cos, freqs_cis_sin, seq_len=None):
+        if seq_len is not None:  # prefill
+            return self.prefill_forward(x, freqs_cis_cos, freqs_cis_sin, seq_len)
         elif isinstance(self.cache, PagedKVCacheManager):
             return self.decode_forward_paged(x, freqs_cis_cos, freqs_cis_sin)
         else:
@@ -744,24 +744,24 @@ class Transformer(nn.Module):
             device=device,
         )
 
-    def prepare_freqs_cis_prefill(self, varlens):
+    def prepare_freqs_cis_prefill(self, seq_len):
         curr_freqs_cis = self.freqs_cis[
-            self.cache.curr_varlens.position_ids_tensor_device
+            self.cache.next_seq_len.position_ids_tensor_device
         ]
         return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
 
     def prepare_freqs_cis_decode(self):
-        curr_freqs_cis = self.freqs_cis[self.cache.get_gpu_seq_lens_excl_this_decode()]
+        curr_freqs_cis = self.freqs_cis[self.cache.prev_seq_len.lens_tensor_device]
         return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
 
     @torch.inference_mode()
     def prefill_single_device(self, tokens):
-        varlens = self.cache.curr_varlens
-        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_prefill(varlens)
+        next_seq_len = self.cache.next_seq_len
+        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_prefill(next_seq_len)
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis_cos, freqs_cis_sin, varlens)
-        tmp = varlens.prefix_lens_list[1:]
+            h = layer(h, freqs_cis_cos, freqs_cis_sin, next_seq_len)
+        tmp = next_seq_len.prefix_lens_list[1:]
         h = h[[item - 1 for item in tmp]]
         h = self._post_layers(h)  # Exec post layers AFTER cutting the last token off
         h = h.float()
@@ -779,8 +779,8 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def prefill_pipeline(self, tokens):
 
-        varlens = self.cache.curr_varlens
-        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_prefill(varlens)
+        next_seq_len = self.cache.next_seq_len
+        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_prefill(next_seq_len)
 
         # start of model
         if self.pp_stage == 0:
@@ -789,10 +789,10 @@ class Transformer(nn.Module):
             h = tokens
         # layers
         for it, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis_cos, freqs_cis_sin, varlens)
+            h = layer(h, freqs_cis_cos, freqs_cis_sin, next_seq_len)
         # end of model
         if self.pp_stage == self.pp_end_stage:
-            tmp = varlens.prefix_lens_list[1:]
+            tmp = next_seq_len.prefix_lens_list[1:]
             h = h[[item - 1 for item in tmp]]
             h = self._post_layers(
                 h
@@ -818,29 +818,26 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def prefill(self, tokens):
-        self.attn_backend.prepare_metadata_for_prefill(self.cache.curr_varlens)
+        self.attn_backend.prepare_metadata_for_prefill(self.cache.next_seq_len)
         if self.pipeline_exec:
             return self.prefill_pipeline(tokens)
         else:
             return self.prefill_single_device(tokens)
 
     def prepare_decoding_attn(self):
-        cache_seqlens_excl_this_decode = self.cache.get_gpu_seq_lens_excl_this_decode()
-        cache_seqlens_incl_this_decode = self.cache.get_gpu_seq_lens_incl_this_decode()
         block_table = self.cache.get_gpu_block_table()
         block_size = self.cache.get_block_size()
         self.attn_backend.prepare_metadata_for_decode(
-            cache_seqlens_excl_this_decode,
-            cache_seqlens_incl_this_decode,
+            self.cache.prev_seq_len,
+            self.cache.next_seq_len,
             block_table,
             block_size,
         )
 
     @torch.inference_mode()
-    def decode(self, tokens, seq_lens):
+    def decode(self, tokens, batch_size):
         self.prepare_decoding_attn()
 
-        batch_size = len(seq_lens)
         infer_args = get_global_args().infer
         current_cuda_graph_enabled = self.use_cuda_graph and (
             infer_args.cache_type != "paged" or infer_args.num_blocks != -1
@@ -859,7 +856,7 @@ class Transformer(nn.Module):
             if is_ascend():
                 before_replay_callback = lambda graph: graph.update(
                     cpu_update_input=[
-                        {"actual_seq_lengths_kv": self.attn_backend.seq_lens_incl_list}
+                        {"actual_seq_lengths_kv": self.cache.next_seq_len.lens_list}
                     ]
                 )
 

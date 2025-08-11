@@ -7,7 +7,8 @@ import triton
 from chitu.attn_backend import RefAttnBackend, TritonAttnBackend, FlashInferBackend
 from chitu.device_type import is_muxi
 from chitu.global_vars import set_global_args
-from chitu.utils import try_import_opt_dep, VarLens
+from chitu.utils import try_import_opt_dep
+from chitu.batched_seq_len import BatchedSeqLen
 
 flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
 
@@ -38,8 +39,8 @@ def test_triton_prefill_attn(num_local_heads, qk_head_dim, v_head_dim, bs: int):
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
 
-    seq_lens = VarLens(
-        [[1] * torch.randint(1, 128, (1,)).item() for _ in range(bs)], device="cuda"
+    seq_lens = BatchedSeqLen(
+        [torch.randint(1, 128, (1,)).item() for _ in range(bs)], device="cuda"
     )
 
     # Create test tensors
@@ -84,14 +85,14 @@ def test_triton_prefill_attn(num_local_heads, qk_head_dim, v_head_dim, bs: int):
 
 
 @pytest.mark.parametrize("bs", [1])
-@pytest.mark.parametrize("cache_seqlens_excl_this_decode", [512])
+@pytest.mark.parametrize("prev_seq_len_int", [512])
 @pytest.mark.parametrize("local_n_heads", [16])
 @pytest.mark.parametrize("kv_lora_rank", [512])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.parametrize("page_size", [256])
 def test_triton_mla_decode_paged_kv(
     bs,
-    cache_seqlens_excl_this_decode,
+    prev_seq_len_int,
     local_n_heads,
     kv_lora_rank,
     qk_rope_head_dim,
@@ -127,12 +128,11 @@ def test_triton_mla_decode_paged_kv(
         max_num_pages, page_size, kv_lora_rank + qk_rope_head_dim, device="cuda"
     )
     this_kv = torch.randn(bs, 1, 1, kv_lora_rank + qk_rope_head_dim, device="cuda")
-    cache_seqlens_excl_this_decode_tensor = (
-        torch.ones(bs, device="cuda", dtype=torch.int32)
-        * cache_seqlens_excl_this_decode
+    prev_seq_len = BatchedSeqLen([prev_seq_len_int for _ in range(bs)], device="cuda")
+    next_seq_len = BatchedSeqLen(
+        [prev_seq_len_int + 1 for _ in range(bs)], device="cuda"
     )
-    cache_seqlens_incl_this_decode_tensor = cache_seqlens_excl_this_decode_tensor + 1
-    page_cnt_per_sample = (cache_seqlens_excl_this_decode // page_size) + 1
+    page_cnt_per_sample = (prev_seq_len_int // page_size) + 1
     page_table = torch.randperm(max_num_pages, device="cuda", dtype=torch.int32)[
         : bs * page_cnt_per_sample
     ].view(bs, page_cnt_per_sample)
@@ -145,8 +145,8 @@ def test_triton_mla_decode_paged_kv(
         q_pe,
         kv_cache,
         this_kv,
-        cache_seqlens_excl_this_decode_tensor,
-        cache_seqlens_incl_this_decode_tensor,
+        prev_seq_len,
+        next_seq_len,
         page_table,
     )
     y_ref = attn_ref.mla_decode_paged_kv(
@@ -154,8 +154,8 @@ def test_triton_mla_decode_paged_kv(
         q_pe,
         kv_cache,
         this_kv,
-        cache_seqlens_excl_this_decode_tensor,
-        cache_seqlens_incl_this_decode_tensor,
+        prev_seq_len,
+        next_seq_len,
         page_table,
     )
 
@@ -163,11 +163,11 @@ def test_triton_mla_decode_paged_kv(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize("cache_seqlens", [[512, 19, 15, 22]])
+@pytest.mark.parametrize("prev_seq_len_list", [[512, 19, 15, 22]])
 @pytest.mark.parametrize("n_heads", [4])
 @pytest.mark.parametrize("n_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [256])
-def test_triton_decode_dense_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
+def test_triton_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim):
     if is_muxi():
         return
     torch.set_default_dtype(torch.float16)
@@ -187,7 +187,9 @@ def test_triton_decode_dense_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
         need_ensure=False,
     )
 
-    batch_size = len(cache_seqlens)
+    prev_seq_len = BatchedSeqLen(prev_seq_len_list, device="cuda")
+    next_seq_len = BatchedSeqLen([x + 1 for x in prev_seq_len_list], device="cuda")
+    batch_size = prev_seq_len.batch_size
     num_blocks = 40
     block_size = 256
     softcap = 1.3
@@ -195,28 +197,26 @@ def test_triton_decode_dense_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
     triton_backend = TritonAttnBackend(qk_nope_head_dim=None)
     ref_backend = RefAttnBackend(qk_nope_head_dim=None)
 
-    max_seq_length = max(cache_seqlens) + 1
     k_cache = torch.randn(
-        (batch_size, max_seq_length, n_kv_heads, head_dim), device="cuda"
+        (batch_size, prev_seq_len.max_len + 1, n_kv_heads, head_dim), device="cuda"
     )
     v_cache = torch.randn(
-        (batch_size, max_seq_length, n_kv_heads, head_dim), device="cuda"
+        (batch_size, prev_seq_len.max_len + 1, n_kv_heads, head_dim), device="cuda"
     )
     q = torch.randn((batch_size, 1, n_heads, head_dim), device="cuda")
     k = torch.randn((batch_size, 1, n_kv_heads, head_dim), device="cuda")
     v = torch.randn((batch_size, 1, n_kv_heads, head_dim), device="cuda")
-    cache_seqlens = torch.Tensor(cache_seqlens).to(torch.int32).cuda()
 
     k_cache1 = k_cache.clone()
     v_cache1 = v_cache.clone()
-    cache_seqlens1 = cache_seqlens.clone()
     triton_out = triton_backend.decode_dense_kv(
         q,
         k_cache1,
         v_cache1,
         k,
         v,
-        cache_seqlens=cache_seqlens1,
+        prev_seq_len=prev_seq_len,
+        next_seq_len=next_seq_len,
         causal=False,
         window_size=(-1, -1),
         softcap=softcap,
@@ -225,14 +225,14 @@ def test_triton_decode_dense_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
 
     k_cache2 = k_cache.clone()
     v_cache2 = v_cache.clone()
-    cache_seqlens2 = cache_seqlens.clone()
     ref_out = ref_backend.decode_dense_kv(
         q,
         k_cache2,
         v_cache2,
         k,
         v,
-        cache_seqlens=cache_seqlens2,
+        prev_seq_len=prev_seq_len,
+        next_seq_len=next_seq_len,
         causal=False,
         window_size=(-1, -1),
         softcap=softcap,
@@ -243,11 +243,11 @@ def test_triton_decode_dense_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize("cache_seqlens", [[512, 19, 15, 22]])
+@pytest.mark.parametrize("prev_seq_len_list", [[512, 19, 15, 22]])
 @pytest.mark.parametrize("n_heads", [4])
 @pytest.mark.parametrize("n_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [256])
-def test_triton_decode_paged_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
+def test_triton_decode_paged_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim):
     if is_muxi():
         return
     torch.set_default_dtype(torch.float16)
@@ -267,7 +267,9 @@ def test_triton_decode_paged_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
         need_ensure=False,
     )
 
-    batch_size = len(cache_seqlens)
+    prev_seq_len = BatchedSeqLen(prev_seq_len_list, device="cuda")
+    next_seq_len = BatchedSeqLen([x + 1 for x in prev_seq_len_list], device="cuda")
+    batch_size = prev_seq_len.batch_size
     num_blocks = 40
     block_size = 256
     softcap = 1.3
@@ -283,14 +285,12 @@ def test_triton_decode_paged_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
     q = torch.randn((batch_size, 1, n_heads, head_dim), device="cuda")
     k = torch.randn((batch_size, 1, n_kv_heads, head_dim), device="cuda")
     v = torch.randn((batch_size, 1, n_kv_heads, head_dim), device="cuda")
-    cache_seqlens = torch.Tensor(cache_seqlens).to(torch.int32).cuda()
 
     k_cache1 = k_cache.clone()
     v_cache1 = v_cache.clone()
-    cache_seqlens1 = cache_seqlens.clone()
     if block_table is not None:
         triton_backend.prepare_metadata_for_decode(
-            None, cache_seqlens1, block_table, block_size, None
+            prev_seq_len, next_seq_len, block_table, block_size, None
         )
     triton_out = triton_backend.decode_paged_kv(
         q,
@@ -298,7 +298,8 @@ def test_triton_decode_paged_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
         v_cache1,
         k,
         v,
-        cache_seqlens=cache_seqlens1,
+        prev_seq_len=prev_seq_len,
+        next_seq_len=next_seq_len,
         block_table=block_table,
         causal=False,
         window_size=(-1, -1),
@@ -308,14 +309,14 @@ def test_triton_decode_paged_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
 
     k_cache2 = k_cache.clone()
     v_cache2 = v_cache.clone()
-    cache_seqlens2 = cache_seqlens.clone()
     ref_out = ref_backend.decode_paged_kv(
         q,
         k_cache2,
         v_cache2,
         k,
         v,
-        cache_seqlens=cache_seqlens2,
+        prev_seq_len=prev_seq_len,
+        next_seq_len=next_seq_len,
         block_table=block_table,
         causal=False,
         window_size=(-1, -1),
@@ -354,8 +355,8 @@ def test_flashinfer_prefill_ragged_qkvo(bs, n_heads, n_kv_heads, head_dim):
         need_ensure=False,
     )
 
-    seq_lens = VarLens(
-        [[1] * torch.randint(1, 128, (1,)).item() for _ in range(bs)], device="cuda"
+    seq_lens = BatchedSeqLen(
+        [torch.randint(1, 128, (1,)).item() for _ in range(bs)], device="cuda"
     )
 
     flashinfer_backend = FlashInferBackend(tot_num_blocks=51, qk_nope_head_dim=None)
@@ -395,11 +396,11 @@ def test_flashinfer_prefill_ragged_qkvo(bs, n_heads, n_kv_heads, head_dim):
     < packaging.version.parse("0.2.0"),
     reason="flashinfer is missing or too old",
 )
-@pytest.mark.parametrize("cache_seqlens", [[509, 19, 15, 22]])
+@pytest.mark.parametrize("prev_seq_len_list", [[509, 19, 15, 22]])
 @pytest.mark.parametrize("n_heads", [4])
 @pytest.mark.parametrize("n_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [256])
-def test_flashinfer_decode_dense_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
+def test_flashinfer_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim):
     torch.set_default_dtype(torch.float16)
     set_global_args(
         OmegaConf.create(
@@ -417,7 +418,9 @@ def test_flashinfer_decode_dense_kv(cache_seqlens, n_heads, n_kv_heads, head_dim
         need_ensure=False,
     )
 
-    batch_size = len(cache_seqlens)
+    prev_seq_len = BatchedSeqLen(prev_seq_len_list, device="cuda")
+    next_seq_len = BatchedSeqLen([x + 1 for x in prev_seq_len_list], device="cuda")
+    batch_size = prev_seq_len.batch_size
     num_blocks = 40
     block_size = 256
     flashinfer_backend = FlashInferBackend(
@@ -425,28 +428,26 @@ def test_flashinfer_decode_dense_kv(cache_seqlens, n_heads, n_kv_heads, head_dim
     )
     ref_backend = RefAttnBackend(qk_nope_head_dim=None)
 
-    max_seq_length = max(cache_seqlens) + 1
     k_cache = torch.randn(
-        (batch_size, max_seq_length, n_kv_heads, head_dim), device="cuda"
+        (batch_size, prev_seq_len.max_len + 1, n_kv_heads, head_dim), device="cuda"
     )
     v_cache = torch.randn(
-        (batch_size, max_seq_length, n_kv_heads, head_dim), device="cuda"
+        (batch_size, prev_seq_len.max_len + 1, n_kv_heads, head_dim), device="cuda"
     )
     q = torch.randn((batch_size, 1, n_heads, head_dim), device="cuda") * 100
     k = torch.randn((batch_size, 1, n_kv_heads, head_dim), device="cuda") * 100
     v = torch.randn((batch_size, 1, n_kv_heads, head_dim), device="cuda") * 100
-    cache_seqlens = torch.Tensor(cache_seqlens).to(torch.int32).cuda()
 
     k_cache1 = k_cache.clone()
     v_cache1 = v_cache.clone()
-    cache_seqlens1 = cache_seqlens.clone()
     flashinfer_out = flashinfer_backend.decode_dense_kv(
         q,
         k_cache1,
         v_cache1,
         k,
         v,
-        cache_seqlens=cache_seqlens1,
+        prev_seq_len=prev_seq_len,
+        next_seq_len=next_seq_len,
         causal=False,
         window_size=(-1, -1),
         softcap=0.0,
@@ -455,14 +456,14 @@ def test_flashinfer_decode_dense_kv(cache_seqlens, n_heads, n_kv_heads, head_dim
 
     k_cache2 = k_cache.clone()
     v_cache2 = v_cache.clone()
-    cache_seqlens2 = cache_seqlens.clone()
     ref_out = ref_backend.decode_dense_kv(
         q,
         k_cache2,
         v_cache2,
         k,
         v,
-        cache_seqlens=cache_seqlens2,
+        prev_seq_len=prev_seq_len,
+        next_seq_len=next_seq_len,
         causal=False,
         window_size=(-1, -1),
         softcap=0.0,
@@ -478,11 +479,11 @@ def test_flashinfer_decode_dense_kv(cache_seqlens, n_heads, n_kv_heads, head_dim
     < packaging.version.parse("0.2.0"),
     reason="flashinfer is missing or too old",
 )
-@pytest.mark.parametrize("cache_seqlens", [[509, 19, 15, 22]])
+@pytest.mark.parametrize("prev_seq_len_list", [[509, 19, 15, 22]])
 @pytest.mark.parametrize("n_heads", [4])
 @pytest.mark.parametrize("n_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [256])
-def test_flashinfer_decode_paged_kv(cache_seqlens, n_heads, n_kv_heads, head_dim):
+def test_flashinfer_decode_paged_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim):
     torch.set_default_dtype(torch.float16)
     set_global_args(
         OmegaConf.create(
@@ -500,7 +501,9 @@ def test_flashinfer_decode_paged_kv(cache_seqlens, n_heads, n_kv_heads, head_dim
         need_ensure=False,
     )
 
-    batch_size = len(cache_seqlens)
+    prev_seq_len = BatchedSeqLen(prev_seq_len_list, device="cuda")
+    next_seq_len = BatchedSeqLen([x + 1 for x in prev_seq_len_list], device="cuda")
+    batch_size = prev_seq_len.batch_size
     num_blocks = 40
     block_size = 256
     flashinfer_backend = FlashInferBackend(
@@ -516,14 +519,12 @@ def test_flashinfer_decode_paged_kv(cache_seqlens, n_heads, n_kv_heads, head_dim
     q = torch.randn((batch_size, 1, n_heads, head_dim), device="cuda") * 100
     k = torch.randn((batch_size, 1, n_kv_heads, head_dim), device="cuda") * 100
     v = torch.randn((batch_size, 1, n_kv_heads, head_dim), device="cuda") * 100
-    cache_seqlens = torch.Tensor(cache_seqlens).to(torch.int32).cuda()
 
     k_cache1 = k_cache.clone()
     v_cache1 = v_cache.clone()
-    cache_seqlens1 = cache_seqlens.clone()
     if block_table is not None:
         flashinfer_backend.prepare_metadata_for_decode(
-            None, cache_seqlens1, block_table, block_size, None
+            prev_seq_len, next_seq_len, block_table, block_size, None
         )
     flashinfer_out = flashinfer_backend.decode_paged_kv(
         q,
@@ -531,7 +532,8 @@ def test_flashinfer_decode_paged_kv(cache_seqlens, n_heads, n_kv_heads, head_dim
         v_cache1,
         k,
         v,
-        cache_seqlens=cache_seqlens1,
+        prev_seq_len=prev_seq_len,
+        next_seq_len=next_seq_len,
         block_table=block_table,
         causal=False,
         window_size=(-1, -1),
@@ -541,14 +543,14 @@ def test_flashinfer_decode_paged_kv(cache_seqlens, n_heads, n_kv_heads, head_dim
 
     k_cache2 = k_cache.clone()
     v_cache2 = v_cache.clone()
-    cache_seqlens2 = cache_seqlens.clone()
     ref_out = ref_backend.decode_paged_kv(
         q,
         k_cache2,
         v_cache2,
         k,
         v,
-        cache_seqlens=cache_seqlens2,
+        prev_seq_len=prev_seq_len,
+        next_seq_len=next_seq_len,
         block_table=block_table,
         causal=False,
         window_size=(-1, -1),
@@ -660,7 +662,7 @@ def benchmark_prefill_ragged_qkvo(
         ylabel="us",
         plot_name="attn-decode-performance",
         args={
-            "cache_seqlens_excl_this_decode": 512,
+            "prev_seq_len_int": 512,
             "n_heads": 32,
             "kv_lora_rank": 512,
             "qk_rope_head_dim": 64,
@@ -670,7 +672,7 @@ def benchmark_prefill_ragged_qkvo(
 )
 def benchmark_mla_decode_paged_kv(
     bs,
-    cache_seqlens_excl_this_decode,
+    prev_seq_len_int,
     n_heads,
     kv_lora_rank,
     qk_rope_head_dim,
@@ -685,13 +687,12 @@ def benchmark_mla_decode_paged_kv(
         max_num_pages, page_size, kv_lora_rank + qk_rope_head_dim, device="cuda"
     )
     this_kv = torch.randn(bs, 1, 1, kv_lora_rank + qk_rope_head_dim, device="cuda")
-    cache_seqlens_excl_this_decode_tensor = (
-        torch.ones(bs, device="cuda", dtype=torch.int32)
-        * cache_seqlens_excl_this_decode
+    prev_seq_len = BatchedSeqLen([prev_seq_len_int for _ in range(bs)], device="cuda")
+    next_seq_len = BatchedSeqLen(
+        [prev_seq_len_int + 1 for _ in range(bs)], device="cuda"
     )
 
-    cache_seqlens_incl_this_decode_tensor = cache_seqlens_excl_this_decode_tensor + 1
-    page_cnt_per_sample = (cache_seqlens_excl_this_decode // page_size) + 1
+    page_cnt_per_sample = (prev_seq_len_int // page_size) + 1
     page_table = torch.randperm(max_num_pages, device="cuda", dtype=torch.int32)[
         : bs * page_cnt_per_sample
     ].view(bs, page_cnt_per_sample)
@@ -704,8 +705,8 @@ def benchmark_mla_decode_paged_kv(
                 q_pe,
                 kv_cache,
                 this_kv,
-                cache_seqlens_excl_this_decode_tensor,
-                cache_seqlens_incl_this_decode_tensor,
+                prev_seq_len,
+                next_seq_len,
                 page_table,
             )
         )
@@ -734,8 +735,8 @@ def benchmark_mla_decode_paged_kv(
             tot_num_blocks=max_num_pages, qk_nope_head_dim=128
         )
         flashinfer_backend.prepare_metadata_for_decode(
-            cache_seqlens_excl_this_decode_tensor,
-            cache_seqlens_incl_this_decode_tensor,
+            prev_seq_len,
+            next_seq_len,
             page_table,
             page_size,
             None,
@@ -746,8 +747,8 @@ def benchmark_mla_decode_paged_kv(
                 q_pe,
                 kv_cache,
                 this_kv,
-                cache_seqlens_excl_this_decode_tensor,
-                cache_seqlens_incl_this_decode_tensor,
+                prev_seq_len,
+                next_seq_len,
                 page_table,
             )
         )

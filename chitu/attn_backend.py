@@ -25,7 +25,8 @@ from chitu.device_type import is_muxi
 from chitu.global_vars import get_global_args
 from chitu.ops import append_to_non_paged_kv_cache, append_to_paged_kv_cache
 from chitu.static_tensor import StaticTensor
-from chitu.utils import try_import_opt_dep, try_import_platform_dep, VarLens
+from chitu.batched_seq_len import BatchedSeqLen
+from chitu.utils import try_import_opt_dep, try_import_platform_dep
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
@@ -77,7 +78,7 @@ class AttnBackend(abc.ABC):
         q,
         k,
         v,
-        seqlens: VarLens,
+        seqlens: BatchedSeqLen,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -109,7 +110,7 @@ class AttnBackend(abc.ABC):
             q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
             k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
             v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-            seqlens: VarLens. The sequence lengths of the sequences in the batch.
+            seqlens: BatchedSeqLen. The sequence lengths of the sequences in the batch.
             Default to 1 / sqrt(headdim).
             causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
             window_size: (left, right). If not (-1, -1), implements sliding window local attention.
@@ -129,7 +130,8 @@ class AttnBackend(abc.ABC):
         k=None,
         v=None,
         *,
-        cache_seqlens: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -143,7 +145,8 @@ class AttnBackend(abc.ABC):
 
         If you pass in k / v, you must make sure that the cache is large enough to hold the new values.
         For example, the KV cache could be pre-allocated with the max sequence length, and you can use
-        cache_seqlens to keep track of the current sequence lengths of each sequence in the batch.
+        prev_seq_len or next_seq_len to keep track of the current sequence lengths of each sequence in
+        the batch.
 
         See tests/test_flash_attn.py::test_flash_attn_kvcache for examples of how to use this function.
 
@@ -175,9 +178,10 @@ class AttnBackend(abc.ABC):
             k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim)
             v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim)
             k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
-                k with k_cache, starting at the indices specified by cache_seqlens.
+                k with k_cache, starting at the indices specified by prev_seq_len.
             v [optional]: (batch_size, seqlen_new, nheads_k, headdim). Similar to k.
-            cache_seqlens: (batch_size,), dtype torch.int32. The sequence lengths of the KV cache.
+            prev_seq_len: BatchedSeqLen. The sequence lengths before append the new tokens.
+            next_seq_len: BatchedSeqLen. The sequence lengths after append the new tokens.
             causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
             window_size: (left, right). If not (-1, -1), implements sliding window local attention.
             softcap: float. Anything > 0 activates softcapping attention.
@@ -197,7 +201,8 @@ class AttnBackend(abc.ABC):
         k=None,
         v=None,
         *,
-        cache_seqlens: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         block_table: torch.Tensor,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
@@ -212,7 +217,8 @@ class AttnBackend(abc.ABC):
 
         If you pass in k / v, you must make sure that the cache is large enough to hold the new values.
         For example, the KV cache could be pre-allocated with the max sequence length, and you can use
-        cache_seqlens to keep track of the current sequence lengths of each sequence in the batch.
+        prev_seq_len and next_seq_len to keep track of the current sequence lengths of each sequence in
+        the batch.
 
         See tests/test_flash_attn.py::test_flash_attn_kvcache for examples of how to use this function.
 
@@ -244,9 +250,10 @@ class AttnBackend(abc.ABC):
             k_cache: (num_blocks, page_block_size, nheads_k, headdim)
             v_cache: (num_blocks, page_block_size, nheads_k, headdim)
             k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
-                k with k_cache, starting at the indices specified by cache_seqlens.
+                k with k_cache, starting at the indices specified by prev_seq_len.
             v [optional]: (batch_size, seqlen_new, nheads_k, headdim). Similar to k.
-            cache_seqlens: (batch_size,), dtype torch.int32. The sequence lengths of the KV cache.
+            prev_seq_len: BatchedSeqLen. The sequence lengths before append the new tokens.
+            next_seq_len: BatchedSeqLen. The sequence lengths after append the new tokens.
             block_table: (batch_size, max_num_blocks_per_seq), dtype torch.int32.
             causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
             window_size: (left, right). If not (-1, -1), implements sliding window local attention.
@@ -266,8 +273,8 @@ class AttnBackend(abc.ABC):
         q_pe,
         kv_cache,
         kv,
-        cache_seqlens_excl_this_decode: torch.Tensor,
-        cache_seqlens_incl_this_decode: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         softmax_scale,
         mqa_func,
     ):
@@ -311,7 +318,8 @@ class AttnBackend(abc.ABC):
             kv_cache_lora,
             kv,
             kv_lora,
-            cache_seqlens=cache_seqlens_excl_this_decode,
+            prev_seq_len=prev_seq_len,
+            next_seq_len=next_seq_len,
             softmax_scale=softmax_scale,
         )
 
@@ -321,8 +329,8 @@ class AttnBackend(abc.ABC):
         q_pe,
         kv_cache,
         kv,
-        cache_seqlens_excl_this_decode: torch.Tensor,
-        cache_seqlens_incl_this_decode: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         softmax_scale=None,
     ):
         # If not overridden, fall back to a multi-query attention
@@ -331,8 +339,8 @@ class AttnBackend(abc.ABC):
             q_pe,
             kv_cache,
             kv,
-            cache_seqlens_excl_this_decode,
-            cache_seqlens_incl_this_decode,
+            prev_seq_len,
+            next_seq_len,
             softmax_scale,
             self.decode_dense_kv,
         )
@@ -343,8 +351,8 @@ class AttnBackend(abc.ABC):
         q_pe,
         kv_cache,
         kv,
-        cache_seqlens_excl_this_decode: torch.Tensor,
-        cache_seqlens_incl_this_decode: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         block_table: torch.Tensor,
         softmax_scale=None,
     ):
@@ -354,8 +362,8 @@ class AttnBackend(abc.ABC):
             q_pe,
             kv_cache,
             kv,
-            cache_seqlens_excl_this_decode,
-            cache_seqlens_incl_this_decode,
+            prev_seq_len,
+            next_seq_len,
             softmax_scale,
             functools.partial(self.decode_paged_kv, block_table=block_table),
         )
@@ -372,7 +380,7 @@ class FlashAttnBackend(AttnBackend):
         q,
         k,
         v,
-        seqlens: VarLens,
+        seqlens: BatchedSeqLen,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -407,7 +415,8 @@ class FlashAttnBackend(AttnBackend):
         k=None,
         v=None,
         *,
-        cache_seqlens: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -425,7 +434,7 @@ class FlashAttnBackend(AttnBackend):
             v_cache,
             k=k,
             v=v,
-            cache_seqlens=cache_seqlens,
+            cache_seqlens=prev_seq_len.lens_tensor_device,
             causal=causal,
             window_size=window_size,
             softmax_scale=softmax_scale,
@@ -441,7 +450,8 @@ class FlashAttnBackend(AttnBackend):
         k=None,
         v=None,
         *,
-        cache_seqlens: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         block_table: torch.Tensor,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
@@ -460,7 +470,7 @@ class FlashAttnBackend(AttnBackend):
             v_cache,
             k=k,
             v=v,
-            cache_seqlens=cache_seqlens,
+            cache_seqlens=prev_seq_len.lens_tensor_device,
             block_table=block_table,
             causal=causal,
             window_size=window_size,
@@ -608,7 +618,7 @@ class RefAttnBackend(AttnBackend):
         q,
         k,
         v,
-        seqlens: VarLens,
+        seqlens: BatchedSeqLen,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -668,7 +678,8 @@ class RefAttnBackend(AttnBackend):
         k=None,
         v=None,
         *,
-        cache_seqlens: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -677,14 +688,16 @@ class RefAttnBackend(AttnBackend):
         arange = einops.rearrange(
             torch.arange(k_cache.shape[1], device=k_cache.device), "s -> 1 s"
         )
-        cache_seqlens_expanded = einops.rearrange(cache_seqlens, "b -> b 1")
+        prev_seq_len_expanded = einops.rearrange(
+            prev_seq_len.lens_tensor_device, "b -> b 1"
+        )
         if k is None and q is None:
-            key_padding_mask = arange < cache_seqlens_expanded
+            key_padding_mask = arange < prev_seq_len_expanded
         elif k is not None and q is not None:
-            key_padding_mask = arange < cache_seqlens_expanded + 1
-            for i in range(cache_seqlens.shape[0]):
-                k_cache[i][cache_seqlens[i]] = k[i]
-                v_cache[i][cache_seqlens[i]] = v[i]
+            key_padding_mask = arange < prev_seq_len_expanded + 1
+            for i in range(prev_seq_len.batch_size):
+                k_cache[i][prev_seq_len.lens_list[i]] = k[i]
+                v_cache[i][prev_seq_len.lens_list[i]] = v[i]
         else:
             assert False
 
@@ -710,7 +723,8 @@ class RefAttnBackend(AttnBackend):
         k=None,
         v=None,
         *,
-        cache_seqlens: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         block_table: torch.Tensor,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
@@ -720,30 +734,30 @@ class RefAttnBackend(AttnBackend):
         k_cache_paged = k_cache
         v_cache_paged = v_cache
         if k is None and q is None:
-            max_seqlen = torch.amax(cache_seqlens).item()
+            max_seqlen = prev_seq_len.max_len
         elif k is not None and q is not None:
-            max_seqlen = torch.amax(cache_seqlens + 1).item()
+            max_seqlen = prev_seq_len.max_len + 1
         else:
             assert False
         assert isinstance(max_seqlen, int)
         k_cache = torch.zeros(
-            cache_seqlens.shape[0],
+            prev_seq_len.batch_size,
             max_seqlen,
             *k_cache_paged.shape[2:],
             device=k_cache_paged.device,
             dtype=k_cache_paged.dtype,
         )
         v_cache = torch.zeros(
-            cache_seqlens.shape[0],
+            prev_seq_len.batch_size,
             max_seqlen,
             *v_cache_paged.shape[2:],
             device=v_cache_paged.device,
             dtype=v_cache_paged.dtype,
         )
         page_size = k_cache_paged.shape[1]
-        for i in range(cache_seqlens.shape[0]):
-            for j in range(0, cache_seqlens[i], page_size):
-                len_in_this_page = min(page_size, cache_seqlens[i] - j)
+        for i in range(prev_seq_len.batch_size):
+            for j in range(0, prev_seq_len.lens_list[i], page_size):
+                len_in_this_page = min(page_size, prev_seq_len.lens_list[i] - j)
                 k_cache[i, j : j + len_in_this_page] = k_cache_paged[
                     block_table[i, j // page_size], :len_in_this_page
                 ]
@@ -752,25 +766,27 @@ class RefAttnBackend(AttnBackend):
                 ]
             if k is not None and q is not None:
                 k_cache_paged[
-                    block_table[i, cache_seqlens[i] // page_size],
-                    cache_seqlens[i] % page_size,
+                    block_table[i, prev_seq_len.lens_list[i] // page_size],
+                    prev_seq_len.lens_list[i] % page_size,
                 ] = k[i]
                 v_cache_paged[
-                    block_table[i, cache_seqlens[i] // page_size],
-                    cache_seqlens[i] % page_size,
+                    block_table[i, prev_seq_len.lens_list[i] // page_size],
+                    prev_seq_len.lens_list[i] % page_size,
                 ] = v[i]
 
         arange = einops.rearrange(
             torch.arange(k_cache.shape[1], device=k_cache.device), "s -> 1 s"
         )
-        cache_seqlens_expanded = einops.rearrange(cache_seqlens, "b -> b 1")
+        prev_seq_len_expanded = einops.rearrange(
+            prev_seq_len.lens_tensor_device, "b -> b 1"
+        )
         if k is None and q is None:
-            key_padding_mask = arange < cache_seqlens_expanded
+            key_padding_mask = arange < prev_seq_len_expanded
         elif k is not None and q is not None:
-            key_padding_mask = arange < cache_seqlens_expanded + 1
-            for i in range(cache_seqlens.shape[0]):
-                k_cache[i][cache_seqlens[i]] = k[i]
-                v_cache[i][cache_seqlens[i]] = v[i]
+            key_padding_mask = arange < prev_seq_len_expanded + 1
+            for i in range(prev_seq_len.batch_size):
+                k_cache[i][prev_seq_len.lens_list[i]] = k[i]
+                v_cache[i][prev_seq_len.lens_list[i]] = v[i]
         else:
             assert False
 
@@ -797,8 +813,8 @@ class TritonAttnBackend(RefAttnBackend):
 
     def prepare_metadata_for_decode(
         self,
-        cache_seqlens_excl_this_decode,
-        cache_seqlens_incl_this_decode,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         block_table,
         block_size,
         softmax_scale=None,
@@ -811,7 +827,7 @@ class TritonAttnBackend(RefAttnBackend):
         q,
         k,
         v,
-        seqlens: VarLens,
+        seqlens: BatchedSeqLen,
         causal=False,
         window_size=(-1, -1),
         softcap=0,
@@ -842,8 +858,8 @@ class TritonAttnBackend(RefAttnBackend):
         q_pe,
         kv_cache,
         kv,
-        cache_seqlens_excl_this_decode: torch.Tensor,
-        cache_seqlens_incl_this_decode: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         softmax_scale=None,
     ):
         B, local_n_heads, kv_lora_rank = q_nope.shape
@@ -851,7 +867,7 @@ class TritonAttnBackend(RefAttnBackend):
         assert q_pe.shape[1] == local_n_heads
         _, _, qk_rope_head_dim = q_pe.shape
 
-        append_to_non_paged_kv_cache(kv_cache, kv, cache_seqlens_excl_this_decode)
+        append_to_non_paged_kv_cache(kv_cache, kv, prev_seq_len.lens_tensor_device)
 
         o = torch.zeros(
             B,
@@ -906,7 +922,7 @@ class TritonAttnBackend(RefAttnBackend):
             kv_c_cache,
             k_pe_cache,
             o,
-            cache_seqlens_incl_this_decode,
+            next_seq_len.lens_tensor_device,
             attn_logits,
             num_kv_splits,
             softmax_scale,
@@ -921,8 +937,8 @@ class TritonAttnBackend(RefAttnBackend):
         q_pe,
         kv_cache,
         kv,
-        cache_seqlens_excl_this_decode: torch.Tensor,
-        cache_seqlens_incl_this_decode: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         block_table: torch.Tensor,
         softmax_scale=None,
     ):
@@ -933,8 +949,8 @@ class TritonAttnBackend(RefAttnBackend):
                 q_pe,
                 kv_cache,
                 kv,
-                cache_seqlens_excl_this_decode,
-                cache_seqlens_incl_this_decode,
+                prev_seq_len,
+                next_seq_len,
                 block_table,
                 softmax_scale,
             )
@@ -945,7 +961,7 @@ class TritonAttnBackend(RefAttnBackend):
         _, _, qk_rope_head_dim = q_pe.shape
 
         append_to_paged_kv_cache(
-            kv_cache, block_table, kv, cache_seqlens_excl_this_decode
+            kv_cache, block_table, kv, prev_seq_len.lens_tensor_device
         )
 
         o = torch.zeros(
@@ -1002,7 +1018,7 @@ class TritonAttnBackend(RefAttnBackend):
             k_pe_cache,
             o,
             block_table,
-            cache_seqlens_incl_this_decode,
+            next_seq_len.lens_tensor_device,
             attn_logits,
             num_kv_splits,
             softmax_scale,
@@ -1020,7 +1036,8 @@ class TritonAttnBackend(RefAttnBackend):
         k=None,
         v=None,
         *,
-        cache_seqlens: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -1030,29 +1047,35 @@ class TritonAttnBackend(RefAttnBackend):
         assert self.triton_latest_enough
 
         if k is None and q is None:
-            seqlens = cache_seqlens
+            max_len = prev_seq_len.max_len
         elif k is not None and q is not None:
-            seqlens = cache_seqlens + 1
-            append_to_non_paged_kv_cache(k_cache, k.contiguous(), cache_seqlens)
-            append_to_non_paged_kv_cache(v_cache, v.contiguous(), cache_seqlens)
+            max_len = prev_seq_len.max_len + 1
+            append_to_non_paged_kv_cache(
+                k_cache, k.contiguous(), prev_seq_len.lens_tensor_device
+            )
+            append_to_non_paged_kv_cache(
+                v_cache, v.contiguous(), prev_seq_len.lens_tensor_device
+            )
         else:
             assert False
 
         arange = einops.rearrange(
             torch.arange(k_cache.shape[1], device=k_cache.device), "s -> 1 s"
         )
-        cache_seqlens_expanded = einops.rearrange(cache_seqlens, "b -> b 1")
+        prev_seq_len_expanded = einops.rearrange(
+            prev_seq_len.lens_tensor_device, "b -> b 1"
+        )
         if k is None and q is None:
-            key_padding_mask = arange < cache_seqlens_expanded
+            key_padding_mask = arange < prev_seq_len_expanded
         elif k is not None and q is not None:
-            key_padding_mask = arange < cache_seqlens_expanded + 1
+            key_padding_mask = arange < prev_seq_len_expanded + 1
         else:
             assert False
         local_mask = None
         if window_size[0] >= 0 or window_size[1] >= 0:
             local_mask = self._construct_local_mask(
                 1,
-                torch.max(seqlens),
+                max_len,
                 window_size,
                 None,
                 key_padding_mask,
@@ -1081,7 +1104,8 @@ class TritonAttnBackend(RefAttnBackend):
         k=None,
         v=None,
         *,
-        cache_seqlens: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         block_table: torch.Tensor,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
@@ -1089,14 +1113,14 @@ class TritonAttnBackend(RefAttnBackend):
         softmax_scale=None,
     ):
         if k is None and q is None:
-            seqlens = cache_seqlens
+            seqlens = prev_seq_len.lens_tensor_device
         elif k is not None and q is not None:
-            seqlens = cache_seqlens + 1
+            seqlens = prev_seq_len.lens_tensor_device + 1  # FIXME: Pass in next_seq_len
             append_to_paged_kv_cache(
-                k_cache, block_table, k.contiguous(), cache_seqlens
+                k_cache, block_table, k.contiguous(), prev_seq_len.lens_tensor_device
             )
             append_to_paged_kv_cache(
-                v_cache, block_table, v.contiguous(), cache_seqlens
+                v_cache, block_table, v.contiguous(), prev_seq_len.lens_tensor_device
             )
         else:
             assert False
@@ -1161,15 +1185,15 @@ class FlashMLABackend(TritonAttnBackend):
 
     def prepare_metadata_for_decode(
         self,
-        cache_seqlens_excl_this_decode,
-        cache_seqlens_incl_this_decode,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         block_table,
         block_size,
         softmax_scale=None,
     ):
         max_batch_size = self.args.infer.max_reqs
         metadata, num_splits = flash_mla.get_mla_metadata(
-            cache_seqlens_incl_this_decode,
+            next_seq_len.lens_tensor_device,
             self.mtp_size * self.local_n_heads // self.kv_heads,
             self.kv_heads,
         )
@@ -1191,18 +1215,18 @@ class FlashMLABackend(TritonAttnBackend):
         q_pe,
         kv_cache,
         kv,
-        cache_seqlens_excl_this_decode: torch.Tensor,
-        cache_seqlens_incl_this_decode: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         block_table: torch.Tensor,
         softmax_scale=None,
     ):
-        bsz = cache_seqlens_excl_this_decode.shape[0]
+        bsz = prev_seq_len.batch_size
 
         q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
         q_nope_pe = q_nope_pe.view(bsz, 1, q_nope_pe.shape[-2], q_nope_pe.shape[-1])
 
         append_to_paged_kv_cache(
-            kv_cache, block_table, kv, cache_seqlens_excl_this_decode
+            kv_cache, block_table, kv, prev_seq_len.lens_tensor_device
         )
 
         kv_cache = kv_cache.unsqueeze(2)
@@ -1211,7 +1235,7 @@ class FlashMLABackend(TritonAttnBackend):
             q_nope_pe,
             kv_cache,
             block_table,
-            cache_seqlens_incl_this_decode,
+            next_seq_len.lens_tensor_device,
             512,  # dv
             self.metadata.get(),
             self.num_splits.get(),
@@ -1341,16 +1365,16 @@ class FlashInferBackend(TritonAttnBackend):
 
     def prepare_metadata_for_decode(
         self,
-        cache_seqlens_excl_this_decode,
-        cache_seqlens_incl_this_decode,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         block_table,
         block_size,
         softmax_scale=None,
     ):
-        raw_batch_size = cache_seqlens_incl_this_decode.shape[0]
+        raw_batch_size = prev_seq_len.batch_size
         batch_size = self.match_batch_size(raw_batch_size)
-        cache_seqlens_incl_this_decode = self.pad_tensor(
-            cache_seqlens_incl_this_decode, batch_size
+        next_seq_len_tensor_device = self.pad_tensor(
+            next_seq_len.lens_tensor_device, batch_size
         )
         block_table = self.pad_tensor(block_table, batch_size)
         self.q_indptr.set(torch.arange(0, batch_size + 1).cuda().to(torch.int32))
@@ -1359,13 +1383,13 @@ class FlashInferBackend(TritonAttnBackend):
         tot_len = 0
         for i in range(batch_size):
             kv_indptr_list.append(tot_len)
-            cur_len = (cache_seqlens_incl_this_decode[i].item() - 1) // block_size + 1
+            cur_len = (next_seq_len_tensor_device[i].item() - 1) // block_size + 1
             kv_indices_list.append(block_table[i, :cur_len])
             tot_len += cur_len
         kv_indptr_list.append(tot_len)
         self.kv_indptr.set(torch.tensor(kv_indptr_list).cuda().to(torch.int32))
         self.kv_indices.set(torch.cat(kv_indices_list).cuda().to(torch.int32))
-        self.seqlens.set(cache_seqlens_incl_this_decode)
+        self.seqlens.set(next_seq_len_tensor_device)
 
         if softmax_scale is None:
             if self.qk_rope_head_dim is not None and self.qk_nope_head_dim is not None:
@@ -1404,8 +1428,8 @@ class FlashInferBackend(TritonAttnBackend):
         q_pe,
         kv_cache,
         kv,
-        cache_seqlens_excl_this_decode: torch.Tensor,
-        cache_seqlens_incl_this_decode: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         block_table: torch.Tensor,
         softmax_scale=None,
     ):
@@ -1414,7 +1438,7 @@ class FlashInferBackend(TritonAttnBackend):
         assert q_pe.shape[1] == local_n_heads
         _, _, self.qk_rope_head_dim = q_pe.shape
         append_to_paged_kv_cache(
-            kv_cache, block_table, kv, cache_seqlens_excl_this_decode
+            kv_cache, block_table, kv, prev_seq_len.lens_tensor_device
         )
 
         return self.mla_wrapper.run(
@@ -1423,7 +1447,7 @@ class FlashInferBackend(TritonAttnBackend):
             kv_cache[..., : self.kv_lora_rank],
             kv_cache[..., self.kv_lora_rank :],
             return_lse=False,
-        ).view(cache_seqlens_excl_this_decode.shape[0], 1, self.local_n_heads, -1)
+        ).view(prev_seq_len.batch_size, 1, self.local_n_heads, -1)
 
     @override
     def prefill_ragged_qkvo(
@@ -1431,7 +1455,7 @@ class FlashInferBackend(TritonAttnBackend):
         q,
         k,
         v,
-        seqlens: VarLens,
+        seqlens: BatchedSeqLen,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -1466,7 +1490,8 @@ class FlashInferBackend(TritonAttnBackend):
         k=None,
         v=None,
         *,
-        cache_seqlens: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -1478,12 +1503,12 @@ class FlashInferBackend(TritonAttnBackend):
         head_dim = q.shape[-1]
         o = torch.empty_like(q)
         for i in range(batch_size):
-            k_cache[i, cache_seqlens[i]] = k[i]
-            v_cache[i, cache_seqlens[i]] = v[i]
+            k_cache[i, prev_seq_len.lens_list[i]] = k[i]
+            v_cache[i, prev_seq_len.lens_list[i]] = v[i]
             o[i] = flashinfer.single_decode_with_kv_cache(
                 q[i].squeeze(0),
-                k_cache[i, : cache_seqlens[i] + 1],
-                v_cache[i, : cache_seqlens[i] + 1],
+                k_cache[i, : prev_seq_len.lens_list[i] + 1],
+                v_cache[i, : prev_seq_len.lens_list[i] + 1],
                 "NHD",
                 window_left=window_size[0],
                 logits_soft_cap=softcap,
@@ -1500,7 +1525,8 @@ class FlashInferBackend(TritonAttnBackend):
         k=None,
         v=None,
         *,
-        cache_seqlens: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         block_table: torch.Tensor,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
@@ -1515,17 +1541,13 @@ class FlashInferBackend(TritonAttnBackend):
         if k is not None:
             assert v is not None
             for i in range(raw_batch_size):
-                if isinstance(cache_seqlens, torch.Tensor):
-                    batch_seq_len = cache_seqlens[i]
-                elif isinstance(cache_seqlens, int):
-                    batch_seq_len = cache_seqlens
-                else:
-                    raise RuntimeError(
-                        f"Cache_seqlens type must be torch.Tensor or int: {type(cache_seqlens)}"
-                    )
-                self.last_page_len[i] = batch_seq_len + 1
-            append_to_paged_kv_cache(k_cache, block_table, k, cache_seqlens)
-            append_to_paged_kv_cache(v_cache, block_table, v, cache_seqlens)
+                self.last_page_len[i] = prev_seq_len.lens_list[i] + 1
+            append_to_paged_kv_cache(
+                k_cache, block_table, k, prev_seq_len.lens_tensor_device
+            )
+            append_to_paged_kv_cache(
+                v_cache, block_table, v, prev_seq_len.lens_tensor_device
+            )
 
         def is_new_seq_len():
             for i in range(batch_size):
@@ -1583,7 +1605,7 @@ class NpuAttnBackend(RefAttnBackend):
             max_nelem=self.args.infer.max_reqs, dtype=torch.int32, device="cuda"
         )
 
-    def prepare_metadata_for_prefill(self, varlens):
+    def prepare_metadata_for_prefill(self, seq_len):
         def generate_attn_mask(max_seq_len: int, dtype=torch.bfloat16):
             # Construct lower triangle matrix.
             mask_flag = torch.tril(
@@ -1602,32 +1624,29 @@ class NpuAttnBackend(RefAttnBackend):
             ).to(dtype)
             return attn_mask
 
-        self.attn_mask = generate_attn_mask(varlens.max_len, torch.bfloat16).cuda()
+        self.attn_mask = generate_attn_mask(seq_len.max_len, torch.bfloat16).cuda()
 
     def prepare_metadata_for_decode(
         self,
-        cache_seqlens_excl_this_decode,
-        cache_seqlens_incl_this_decode,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         block_table,
         block_size,
         softmax_scale=None,
     ):
-        self.seq_lens_incl_list = cache_seqlens_incl_this_decode.tolist()
-        self.seq_lens_excl_list = cache_seqlens_excl_this_decode.tolist()
         # paged kvcache
         if block_table is not None:
             self.block_table_list = block_table.tolist()
             slot_list = []
             for i in range(len(self.block_table_list)):
                 block_number = self.block_table_list[i][
-                    self.seq_lens_excl_list[i] // block_size
+                    prev_seq_len.lens_list[i] // block_size
                 ]
-                block_offset = self.seq_lens_excl_list[i] % block_size
+                block_offset = prev_seq_len.lens_list[i] % block_size
                 slot_list.append(block_number * block_size + block_offset)
             self.slot_mapping.set(
                 torch.tensor(slot_list, dtype=torch.int32, device="cuda")
             )
-        self.cache_seqlens_incl_this_decode_cpu = cache_seqlens_incl_this_decode.cpu()
 
     @override
     def prefill_ragged_qkvo(
@@ -1635,7 +1654,7 @@ class NpuAttnBackend(RefAttnBackend):
         q,
         k,
         v,
-        seqlens: VarLens,
+        seqlens: BatchedSeqLen,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -1700,7 +1719,8 @@ class NpuAttnBackend(RefAttnBackend):
         k=None,
         v=None,
         *,
-        cache_seqlens: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -1711,8 +1731,8 @@ class NpuAttnBackend(RefAttnBackend):
         k = k.view(k.shape[0], k.shape[1], -1).contiguous()
         v = v.view(v.shape[0], v.shape[1], -1).contiguous()
 
-        torch_npu.scatter_update_(k_cache, cache_seqlens, k, 1)
-        torch_npu.scatter_update_(v_cache, cache_seqlens, v, 1)
+        torch_npu.scatter_update_(k_cache, prev_seq_len.lens_tensor_device, k, 1)
+        torch_npu.scatter_update_(v_cache, prev_seq_len.lens_tensor_device, v, 1)
 
         output_ = torch.empty_like(q)
         lse_ = torch.empty(1, dtype=q.dtype, device="npu")
@@ -1721,7 +1741,7 @@ class NpuAttnBackend(RefAttnBackend):
             k_cache,
             v_cache,
             input_layout="BSH",
-            actual_seq_lengths_kv=self.seq_lens_incl_list,  # List[int]
+            actual_seq_lengths_kv=next_seq_len.lens_list,
             scale=self.scale,
             num_heads=self.local_n_heads,
             num_key_value_heads=self.local_n_kv_heads,
@@ -1738,7 +1758,8 @@ class NpuAttnBackend(RefAttnBackend):
         k=None,
         v=None,
         *,
-        cache_seqlens: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         block_table: torch.Tensor,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
@@ -1765,7 +1786,7 @@ class NpuAttnBackend(RefAttnBackend):
             input_layout="BSH",
             block_size=128,
             block_table=block_table,
-            actual_seq_lengths_kv=self.seq_lens_incl_list,  # List[int]
+            actual_seq_lengths_kv=next_seq_len.lens_list,
             scale=self.scale,
             num_heads=self.local_n_heads,
             num_key_value_heads=self.local_n_kv_heads,
@@ -1780,18 +1801,18 @@ class NpuAttnBackend(RefAttnBackend):
         q_pe,
         kv_cache,
         kv,
-        cache_seqlens_excl_this_decode: torch.Tensor,
-        cache_seqlens_incl_this_decode: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         block_table: torch.Tensor,
         softmax_scale=None,
     ):
-        bsz = cache_seqlens_excl_this_decode.shape[0]
+        bsz = prev_seq_len.batch_size
         tp_size = self.args.infer.tp_size
         query = torch.cat([q_nope, q_pe], dim=-1).view(bsz, q_nope.shape[-2], -1)
 
         for i in range(bsz):
-            kv_cache[block_table[i][cache_seqlens_excl_this_decode[i] // 128]][
-                cache_seqlens_excl_this_decode[i] % 128
+            kv_cache[block_table[i][prev_seq_len.lens_list[i] // 128]][
+                prev_seq_len.lens_list[i] % 128
             ] = kv[i]
         # kv_cache[indices, positions] = kv.squeeze(1) if kv.ndim == 3 and kv.shape[1] == 1 else kv
 
@@ -1812,7 +1833,7 @@ class NpuAttnBackend(RefAttnBackend):
             num_heads=128 // tp_size,
             scale_value=1.0 / math.sqrt(query.shape[-1]),
             block_table=block_table,
-            context_lens=self.cache_seqlens_incl_this_decode_cpu,
+            context_lens=next_seq_len.lens_tensor_cpu,
             mla_vheadsize=512,
             out=attn_output,
         )
@@ -1850,7 +1871,7 @@ class HybridAttnBackend(AttnBackend):
         q,
         k,
         v,
-        seqlens: VarLens,
+        seqlens: BatchedSeqLen,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -1877,7 +1898,8 @@ class HybridAttnBackend(AttnBackend):
         k=None,
         v=None,
         *,
-        cache_seqlens: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         causal=False,
         window_size=(-1, -1),
         softcap=0.0,
@@ -1891,7 +1913,8 @@ class HybridAttnBackend(AttnBackend):
             v_cache,
             k=k,
             v=v,
-            cache_seqlens=cache_seqlens,
+            prev_seq_len=prev_seq_len,
+            next_seq_len=next_seq_len,
             causal=causal,
             window_size=window_size,
             softcap=softcap,
@@ -1907,7 +1930,8 @@ class HybridAttnBackend(AttnBackend):
         k=None,
         v=None,
         *,
-        cache_seqlens: torch.Tensor,
+        prev_seq_len: BatchedSeqLen,
+        next_seq_len: BatchedSeqLen,
         block_table: torch.Tensor,
         causal=False,
         window_size=(-1, -1),
@@ -1922,7 +1946,8 @@ class HybridAttnBackend(AttnBackend):
             v_cache,
             k=k,
             v=v,
-            cache_seqlens=cache_seqlens,
+            prev_seq_len=prev_seq_len,
+            next_seq_len=next_seq_len,
             block_table=block_table,
             causal=causal,
             window_size=window_size,

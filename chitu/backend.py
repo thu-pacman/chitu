@@ -81,7 +81,6 @@ class Backend:
     formatter = None
     args = None
     # --- cache_manager related (not used in the current code)
-    curr_varlens = None
     curr_req_ids = None
     cache_type = ""
     # ---

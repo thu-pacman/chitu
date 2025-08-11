@@ -199,7 +199,7 @@ class AttentionHFLlama(Attention):
         x: torch.Tensor,
         freqs_cis_cos: torch.Tensor,
         freqs_cis_sin: torch.Tensor,
-        varlens,
+        seq_len,
     ):
         # 因为量化后x是个tuple，所以取shape的时候放linear后面
         xq, xk, xv = self._run_linear(x)
@@ -223,10 +223,10 @@ class AttentionHFLlama(Attention):
         )
 
         self.cache.finalize_cache_bylayer_prefill(
-            xk, xv, self.cache.curr_req_ids, self.cache.curr_varlens, self.layer_id
+            xk, xv, self.cache.curr_req_ids, self.cache.next_seq_len, self.layer_id
         )
         output = self.attn_backend.prefill_ragged_qkvo(
-            xq, xk, xv, varlens, causal=True
+            xq, xk, xv, seq_len, causal=True
         ).view(bs_seq, -1)
         return self._run_output_linear(output)
 
@@ -261,14 +261,14 @@ class AttentionHFLlama(Attention):
         cache = self.cache.get_cache_decode(self.layer_id)
         cache_k = cache[0]
         cache_v = cache[1]
-        cache_seqlens = self.cache.get_gpu_seq_lens_excl_this_decode()
         output = self.attn_backend.decode_dense_kv(
             xq,
             cache_k,
             cache_v,
             xk,
             xv,
-            cache_seqlens=cache_seqlens,
+            prev_seq_len=self.cache.prev_seq_len,
+            next_seq_len=self.cache.next_seq_len,
         ).view(bsz, seqlen, -1)
 
         return self._run_output_linear(output)
@@ -303,7 +303,6 @@ class AttentionHFLlama(Attention):
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
         block_table = self.cache.get_gpu_block_table()
-        cache_seqlens = self.cache.get_gpu_seq_lens_excl_this_decode()
         paged_k_cache, paged_v_cache = self.cache.get_paged_kv_cache(self.layer_id)
         output = self.attn_backend.decode_paged_kv(
             xq,
@@ -311,7 +310,8 @@ class AttentionHFLlama(Attention):
             paged_v_cache,
             xk,
             xv,
-            cache_seqlens=cache_seqlens,
+            prev_seq_len=self.cache.prev_seq_len,
+            next_seq_len=self.cache.next_seq_len,
             block_table=block_table,
         ).view(bsz, seqlen, -1)
         return self._run_output_linear(output)
@@ -444,13 +444,13 @@ class TransformerBlockHFLlama(TransformerBlock):
         x: torch.Tensor,
         freqs_cis_cos: torch.Tensor,
         freqs_cis_sin: torch.Tensor,
-        varlens=None,
+        seq_len=None,
     ):
         h = self.self_attn(
             self.input_layernorm(x, impl=get_rms_norm_impl()),
             freqs_cis_cos,
             freqs_cis_sin,
-            varlens,
+            seq_len,
         )
         h += x
         out = h + self.mlp(self.post_attention_layernorm(h, impl=get_rms_norm_impl()))
@@ -878,20 +878,20 @@ class TransformerHFLlama(Transformer):
             device=device,
         )
 
-    def prepare_freqs_cis_prefill(self, varlens):
+    def prepare_freqs_cis_prefill(self, seq_len):
         return (
             self.rotary_emb.cos_cached[
-                self.cache.curr_varlens.position_ids_tensor_device
+                self.cache.next_seq_len.position_ids_tensor_device
             ],
             self.rotary_emb.sin_cached[
-                self.cache.curr_varlens.position_ids_tensor_device
+                self.cache.next_seq_len.position_ids_tensor_device
             ],
         )
 
     def prepare_freqs_cis_decode(self):
         return (
-            self.rotary_emb.cos_cached[self.cache.get_gpu_seq_lens_excl_this_decode()],
-            self.rotary_emb.sin_cached[self.cache.get_gpu_seq_lens_excl_this_decode()],
+            self.rotary_emb.cos_cached[self.cache.prev_seq_len.lens_tensor_device],
+            self.rotary_emb.sin_cached[self.cache.prev_seq_len.lens_tensor_device],
         )
 
 
