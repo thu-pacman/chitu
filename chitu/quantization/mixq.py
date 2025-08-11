@@ -6,30 +6,54 @@ import torch
 
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase
+from chitu.utils import try_import_platform_dep
+from chitu.ops import mixq_gemm
+
+hygon_mixq_kernels, has_hygon = try_import_platform_dep("sugon_mixQ4_kernels")
 
 
 @QuantizationRegistry.register_linear("mixq")
 class MixQLinear(QuantizedLinearBase):
     @staticmethod
-    @torch.no_grad()
-    def quant_act_per_token(x, bit=4):
-        qmax = 2 ** (bit - 1) - 1
-        scale = x.abs().amax(dim=-1, keepdim=True) / qmax
-        scale = torch.clamp(scale, min=1e-8)
-        x_q = torch.round(x / scale).clamp(-qmax, qmax) * scale
-        return x_q
+    def _make_param_shapes(
+        *,
+        in_features: int,
+        out_features: int,
+        fp_features_num: int,
+        w_bits: int,
+        process_block_size: int,
+        use_hygon: bool,
+    ):
+        assert fp_features_num % 128 == 0, f"fp_features_num must be divisible by 128"
 
-    @staticmethod
-    @torch.no_grad()
-    def unpack_int4(w):
-        out, half_in = w.shape
-        w = w.to(torch.uint8)
-        hi = w & 0x0F
-        lo = w >> 4
-        hi = (hi << 4).to(torch.int8) >> 4
-        lo = (lo << 4).to(torch.int8) >> 4
-        weight = torch.stack([hi, lo], dim=2).view(out, half_in * 2)
-        return weight
+        q_in = in_features
+        if w_bits == 4:
+            required = 64 if use_hygon else 2
+            assert (
+                in_features % required == 0
+            ), f"For int4 packing, in_features must be divisible by {required}" + (
+                " on hygon" if use_hygon else " (generic)"
+            )
+            q_in = in_features // 2
+
+        if use_hygon:
+            assert (
+                out_features % 32 == 0
+            ), "out_features must be divisible by 32 on hygon"
+            return {
+                "quantized_in_features": q_in,
+                "weight": (out_features // 32, q_in // 32, 1024),
+                "fp_weight": (out_features // 32, fp_features_num // 16, 512),
+                "outliers_idx_grouped": (fp_features_num + 1,),
+                "outliers_idx_start": (process_block_size + 1,),
+            }
+        else:
+            return {
+                "quantized_in_features": q_in,
+                "weight": (out_features, q_in),
+                "fp_weight": (out_features, fp_features_num),
+                "fp_idx": (fp_features_num,),
+            }
 
     def __init__(
         self,
@@ -44,43 +68,54 @@ class MixQLinear(QuantizedLinearBase):
         w_bits: int = 4,
         a_bits: int = 4,
         fp_features_num: int = 128,
+        # Only used on Hygon path; ignored otherwise
+        process_block_size: int = 512,
     ):
         super().__init__()
-
-        assert fp_features_num % 128 == 0, "fp_features_num must be divisible by 128"
         assert w_bits in (4, 8), "w_bits must be either 4 or 8"
 
-        quantized_in_features = in_features - fp_features_num
-        if w_bits == 4:
-            assert (
-                quantized_in_features % 2 == 0
-            ), "For int4 packing, quantized features must be even"
-            quantized_in_features //= 2
-
+        self.use_hygon = bool(has_hygon)
         self.in_features = in_features
         self.out_features = out_features
         self.w_bits = w_bits
         self.a_bits = a_bits
         self.fp_features_num = fp_features_num
-        self.quantized_in_features = quantized_in_features
+
+        shapes = self._make_param_shapes(
+            in_features=in_features,
+            out_features=out_features,
+            fp_features_num=fp_features_num,
+            w_bits=w_bits,
+            process_block_size=process_block_size,
+            use_hygon=self.use_hygon,
+        )
+        self.quantized_in_features = shapes["quantized_in_features"]
 
         self.weight = torch.nn.Parameter(
-            torch.zeros(
-                self.out_features, self.quantized_in_features, dtype=torch.uint8
-            ),
+            torch.zeros(shapes["weight"], dtype=torch.int8),
             requires_grad=False,
         )
         self.fp_weight = torch.nn.Parameter(
             torch.zeros(
-                self.out_features,
-                self.fp_features_num,
+                shapes["fp_weight"],
                 dtype=torch.get_default_dtype(),
             ),
             requires_grad=False,
         )
-        self.fp_idx = torch.nn.Parameter(
-            torch.zeros((self.fp_features_num), dtype=torch.int32), requires_grad=False
-        )
+        if self.use_hygon:
+            self.outliers_idx_grouped = torch.nn.Parameter(
+                torch.zeros(shapes["outliers_idx_grouped"], dtype=torch.int32),
+                requires_grad=False,
+            )
+            self.outliers_idx_start = torch.nn.Parameter(
+                torch.zeros(shapes["outliers_idx_start"], dtype=torch.int32),
+                requires_grad=False,
+            )
+        else:
+            self.fp_idx = torch.nn.Parameter(
+                torch.zeros(shapes["fp_idx"], dtype=torch.int32), requires_grad=False
+            )
+
         self.weight_scale = torch.nn.Parameter(
             torch.ones([self.out_features], dtype=torch.get_default_dtype()),
             requires_grad=False,
@@ -98,35 +133,18 @@ class MixQLinear(QuantizedLinearBase):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO: Refactor this forward method later
-        all_idx = torch.arange(self.in_features, device=self.weight.device)
-        non_fp_idx = all_idx[~torch.isin(all_idx, self.fp_idx)]
-
-        new_x = torch.zeros_like(x)
-        new_x[..., self.fp_idx] = x[..., self.fp_idx]
-        qdq_x = MixQLinear.quant_act_per_token(x[..., non_fp_idx], bit=self.a_bits)
-        new_x[..., non_fp_idx] = qdq_x
-
-        new_w = torch.zeros(
-            self.out_features, self.in_features, dtype=x.dtype, device=x.device
+        out = mixq_gemm(
+            x,
+            self.weight,
+            self.weight_scale,
+            self.fp_weight,
+            self.fp_features_num,
+            self.fp_idx if not self.use_hygon else self.outliers_idx_grouped,
+            None if not self.use_hygon else self.outliers_idx_start,
+            self.w_bits,
+            self.a_bits,
+            impl="hygon" if self.use_hygon else "triton",
         )
-        if self.w_bits == 4:
-            q = unpack_int4(self.weight)
-            new_w[:, non_fp_idx] = q.to(x.dtype) * self.weight_scale.unsqueeze(-1)
-        else:
-            new_w[:, non_fp_idx] = self.weight.to(torch.int8).to(
-                x.dtype
-            ) * self.weight_scale.view(-1, 1)
-        new_w[:, self.fp_idx] = self.fp_weight
-        return torch.nn.functional.linear(new_x, new_w.to(x.dtype), self.bias)
-
-
-def unpack_int4(w):
-    out, half_in = w.shape
-    w = w.to(torch.uint8)
-    hi = w & 0x0F
-    lo = w >> 4
-    hi = (hi << 4).to(torch.int8) >> 4
-    lo = (lo << 4).to(torch.int8) >> 4
-    weight = torch.stack([hi, lo], dim=2).view(out, half_in * 2)
-    return weight
+        if self.bias is not None:
+            out += self.bias
+        return out

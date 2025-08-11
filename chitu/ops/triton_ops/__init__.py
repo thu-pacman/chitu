@@ -21,5 +21,7 @@ from chitu.ops.triton_ops.quant import (
     weight_dequant_deepseek_v3_triton,
     weight_dequant_soft_fp8_deepseek_v3_triton,
     act_quant_deepseek_v3_triton,
+    mixq_w8a8_gemm_triton,
+    mixq_w4a4_gemm_triton,
 )
 from chitu.ops.triton_ops.moe_sum import moe_sum_triton
