@@ -924,10 +924,10 @@ class TransformerDeepSeekV3(Transformer):
                 elif quant in ["blockfp8", "q4km"]:
                     assert prefix + "kv_b_proj.scale" in checkpoint
                     kv_b_proj_scale = checkpoint.pop(prefix + "kv_b_proj.scale")
-                    # FIXME: Keep this on GPU
+                    old_device = kv_b_proj_ckpt_weight.device
                     kv_b_proj_weight = weight_dequant_fn(
                         kv_b_proj_ckpt_weight.cuda(), kv_b_proj_scale.cuda(), block_size
-                    ).cpu()
+                    ).to(old_device)
                 elif quant in ["blockfp4"]:
                     assert prefix + "kv_b_proj.weight_scale" in checkpoint
                     assert prefix + "kv_b_proj.weight_scale_2" in checkpoint
@@ -974,10 +974,10 @@ class TransformerDeepSeekV3(Transformer):
                 elif quant in ["blockfp8", "q4km"]:
                     assert prefix + "q_b_proj.scale" in checkpoint
                     q_b_proj_scale = checkpoint.pop(prefix + "q_b_proj.scale")
-                    # FIXME: Keep this on GPU
+                    old_device = q_b_proj_ckpt_weight.device
                     q_b_proj_weight = weight_dequant_fn(
                         q_b_proj_ckpt_weight.cuda(), q_b_proj_scale.cuda(), block_size
-                    ).cpu()
+                    ).to(old_device)
                 elif quant in ["blockfp4"]:
                     assert prefix + "q_b_proj.weight_scale" in checkpoint
                     assert prefix + "q_b_proj.weight_scale_2" in checkpoint
@@ -1083,10 +1083,10 @@ class TransformerDeepSeekV3(Transformer):
                 elif quant in ["blockfp8", "q4km"]:
                     assert prefix + "o_proj.scale" in checkpoint
                     o_proj_scale = checkpoint.pop(prefix + "o_proj.scale")
-                    # FIXME: Keep this on GPU
+                    old_device = o_proj_ckpt_weight.device
                     o_proj_weight = weight_dequant_fn(
                         o_proj_ckpt_weight.cuda(), o_proj_scale.cuda(), block_size
-                    ).cpu()
+                    ).to(old_device)
                 elif quant in ["blockfp4"]:
                     assert prefix + "o_proj.weight_scale" in checkpoint
                     assert prefix + "o_proj.weight_scale_2" in checkpoint

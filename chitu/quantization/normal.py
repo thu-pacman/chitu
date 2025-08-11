@@ -19,7 +19,7 @@ from chitu.hybrid_device import CPUParameter
 from chitu.quantization.cpuinfer_singleton import get_cpu_infer
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.global_vars import get_global_args
-from chitu.utils import try_import_platform_dep
+from chitu.utils import try_import_platform_dep, try_import_opt_dep
 from chitu.distributed.parallel_state import get_ep_group
 from chitu.static_tensor import StaticTensor
 from chitu.custom_gguf import GGMLQuantizationType
@@ -27,6 +27,7 @@ from chitu.custom_gguf import GGMLQuantizationType
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 if has_torch_npu:
     from chitu.npu_utils import fused_experts_npu
 if has_triton:
@@ -309,19 +310,6 @@ class NormLinearCPUInfer(QuantizedLinearBase):
                 requires_grad=False,
             )
 
-            import cpuinfer
-
-            linear_config = cpuinfer.linear.LinearConfig(
-                self.in_features,
-                self.out_features,
-                self.stride,
-                self.group_max_len,
-                self.weight.data_ptr(),
-                GGMLQuantizationType.BF16,
-                GGMLQuantizationType.BF16,
-            )
-            self.linear = cpuinfer.linear.Linear(linear_config)
-
             max_reqs = 256
             self.input_cpu = StaticTensor(
                 max_nelem=max_reqs * self.in_features,
@@ -340,6 +328,19 @@ class NormLinearCPUInfer(QuantizedLinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if torch.distributed.get_rank() == 0:
+            # Initialize after __init__ because `data_ptr` may be modified during weight loading
+            if not hasattr(self, "linear"):
+                linear_config = cpuinfer.linear.LinearConfig(
+                    self.in_features,
+                    self.out_features,
+                    self.stride,
+                    self.group_max_len,
+                    self.weight.data_ptr(),
+                    GGMLQuantizationType.BF16,
+                    GGMLQuantizationType.BF16,
+                )
+                self.linear = cpuinfer.linear.Linear(linear_config)
+
             self.input_cpu.set_shape(x.shape)
             out_shape = list(x.shape)
             out_shape[-1] = self.out_features
@@ -437,12 +438,14 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
                 ),
                 requires_grad=False,
             )
-            self.gate_type = torch.tensor(
-                (GGMLQuantizationType.BF16),
-                dtype=torch.int,
-                device="cpu",
-                requires_grad=False,
-            )
+            with torch.device("cpu"):
+                # The value matters. Don't put onto "meta" device.
+                self.gate_type = torch.tensor(
+                    (GGMLQuantizationType.BF16),
+                    dtype=torch.int,
+                    device="cpu",
+                    requires_grad=False,
+                )
             self.up_proj_weight = CPUParameter(
                 torch.empty(
                     (self.group_size, self.moe_inter_dim, self.dim),
@@ -451,12 +454,14 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
                 ),
                 requires_grad=False,
             )
-            self.up_type = torch.tensor(
-                (GGMLQuantizationType.BF16),
-                dtype=torch.int,
-                device="cpu",
-                requires_grad=False,
-            )
+            with torch.device("cpu"):
+                # The value matters. Don't put onto "meta" device.
+                self.up_type = torch.tensor(
+                    (GGMLQuantizationType.BF16),
+                    dtype=torch.int,
+                    device="cpu",
+                    requires_grad=False,
+                )
             self.down_proj_weight = CPUParameter(
                 torch.empty(
                     (self.group_size, self.dim, self.moe_inter_dim),
@@ -465,47 +470,14 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
                 ),
                 requires_grad=False,
             )
-            self.down_type = torch.tensor(
-                (GGMLQuantizationType.BF16),
-                dtype=torch.int,
-                device="cpu",
-                requires_grad=False,
-            )
-            gate_ptr = ctypes.addressof(
-                ctypes.cast(
-                    self.gate_proj_weight.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
-                ).contents
-            )
-            up_ptr = ctypes.addressof(
-                ctypes.cast(
-                    self.up_proj_weight.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
-                ).contents
-            )
-            down_ptr = ctypes.addressof(
-                ctypes.cast(
-                    self.down_proj_weight.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
-                ).contents
-            )
-            import cpuinfer
-
-            moe_config = cpuinfer.moe.MOEConfig(
-                self.n_routed_experts,
-                self.n_activated_experts,
-                self.dim,
-                self.moe_inter_dim,
-                64,
-                10,
-                1024,
-                gate_ptr,
-                up_ptr,
-                down_ptr,
-                self.gate_type.item(),
-                self.up_type.item(),
-                self.down_type.item(),
-                GGMLQuantizationType.BF16,
-            )
-            self.moe = cpuinfer.moe.MOE(moe_config)
-
+            with torch.device("cpu"):
+                # The value matters. Don't put onto "meta" device.
+                self.down_type = torch.tensor(
+                    (GGMLQuantizationType.BF16),
+                    dtype=torch.int,
+                    device="cpu",
+                    requires_grad=False,
+                )
             self.input_tensor_cpu = StaticTensor(
                 max_nelem=self.max_batch_size * self.dim,
                 device="cpu",
@@ -539,6 +511,40 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
 
     def warm_up(self):
         if torch.distributed.get_rank() == 0:
+            # Initialize after __init__ because `data_ptr` may be modified during weight loading
+            gate_ptr = ctypes.addressof(
+                ctypes.cast(
+                    self.gate_proj_weight.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+                ).contents
+            )
+            up_ptr = ctypes.addressof(
+                ctypes.cast(
+                    self.up_proj_weight.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+                ).contents
+            )
+            down_ptr = ctypes.addressof(
+                ctypes.cast(
+                    self.down_proj_weight.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+                ).contents
+            )
+            moe_config = cpuinfer.moe.MOEConfig(
+                self.n_routed_experts,
+                self.n_activated_experts,
+                self.dim,
+                self.moe_inter_dim,
+                64,
+                10,
+                1024,
+                gate_ptr,
+                up_ptr,
+                down_ptr,
+                self.gate_type.item(),
+                self.up_type.item(),
+                self.down_type.item(),
+                GGMLQuantizationType.BF16,
+            )
+            self.moe = cpuinfer.moe.MOE(moe_config)
+
             self.cpu_infer.submit(self.moe.warm_up())
             self.cpu_infer.sync()
 

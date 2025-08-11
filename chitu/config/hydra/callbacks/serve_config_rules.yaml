@@ -1,8 +1,9 @@
+# @package _global_
+
 # SPDX-FileCopyrightText: 2025 Qingcheng.AI
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# @package _global_
 hydra:
   callbacks:
     serve_config_rules:

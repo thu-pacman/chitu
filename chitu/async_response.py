@@ -45,8 +45,9 @@ class AsyncDataStream:
                         "<think></think>", bos=False, eos=False
                     )
                 except ValueError:
-                    logger.warning(
-                        "Cannot obtain reasoning token ids from tokenizer. Use config."
+                    logger.info(
+                        "Cannot obtain reasoning token ids from tokenizer. "
+                        "Falling back to using config."
                     )
                     self.rs_token_id = Backend.args.models.get("rs_token_id", -1)
                     self.re_token_id = Backend.args.models.get("re_token_id", -1)

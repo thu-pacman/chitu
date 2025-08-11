@@ -43,6 +43,7 @@ from chitu.quantization import (
     get_quant_from_checkpoint_prefix,
     get_backend_from_checkpoint_prefix,
 )
+from chitu.hybrid_device import CPUParameter
 
 torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
@@ -65,7 +66,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim), requires_grad=False)
 
     def _ref_norm(self, x, compute_dtype):
         dtype = x.dtype
@@ -352,7 +353,9 @@ class Transformer(nn.Module):
         if not self.pipeline_exec or self.pp_stage == self.pipeline_parallel_size - 1:
             self._init_post_layers()
 
-        self.precompute_freqs_cis(max_position_embeddings, self.device)
+        with self.device:
+            # precomputed freqs_cis has real data, so we can't put it on "meta" device
+            self.precompute_freqs_cis(max_position_embeddings, self.device)
 
         self.do_decode_callable = None
         self.args = get_global_args()
@@ -600,9 +603,10 @@ class Transformer(nn.Module):
         return new_weight.to(torch.bfloat16)
 
     def _process_fp4_weight_scale_for_npu_fusion(self, param, scale_2):
+        old_device = param.device
         param.data = self.anti_quant_fp8(
             param.data.to(device="npu"), scale_2.data.to(device="npu")
-        ).cpu()
+        ).to(old_device)
         param.data = param.data.transpose(-2, -1).contiguous().transpose(-2, -1)
         return param
 
@@ -660,6 +664,13 @@ class Transformer(nn.Module):
                 state_dict = self._chunk_checkpoint_for_tensor_parallel(
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )
+
+        # TODO: Move `state_dict` to GPU and preprocess on GPU if there is no `CPUParameter`s
+        # Problems:
+        # - Processing on GPU laeds to sever memory fragmentation (13.44 GiB fragements in 94.93
+        #   GiB allocated memory). Disabling torch allocator with `PYTORCH_NO_CUDA_MEMORY_CACHING=1`
+        #   works but may lead to too much performance degradation.
+
         self.load_state_dict(
             state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )
@@ -676,6 +687,36 @@ class Transformer(nn.Module):
             state_dict = self.process_state_dict_for_merging_gate_up(state_dict)
             state_dict = self.process_state_dict_for_merging_experts(state_dict)
             state_dict = self.process_state_dict_for_blockfp4_after_chunk(state_dict)
+
+        # Check inconsistent dtype
+        keep_dtype_in_checkpoint = get_global_args().keep_dtype_in_checkpoint
+        for name, param in self.named_parameters():
+            if name in state_dict and param.dtype != state_dict[name].dtype:
+                if keep_dtype_in_checkpoint:
+                    logger.info(
+                        f"Parameter {name} has inconsistent dtype in the checkpoint "
+                        f"({state_dict[name].dtype}) and the model ({param.dtype}), "
+                        f"using the dtype in the checkpoint. Set `keep_dtype_in_checkpoint=False` "
+                        f"when starting chitu if you want to use the dtype in the model."
+                    )
+                else:
+                    logger.info(
+                        f"Parameter {name} has inconsistent dtype in the checkpoint "
+                        f"({state_dict[name].dtype}) and the model ({param.dtype}), "
+                        f"converting the checkpoint dtype to the model dtype. Set "
+                        f"`keep_dtype_in_checkpoint=True` when starting chitu if you "
+                        f"want to use the dtype in the checkpoint."
+                    )
+                    state_dict[name] = state_dict[name].to(param.dtype)
+
+        for k in state_dict:
+            if isinstance(self.get_parameter(k), CPUParameter):
+                state_dict[k] = CPUParameter(state_dict[k], requires_grad=False)
+            else:
+                # Work around a bug on torch<2.2.2 that creates requires_grad=True inside
+                # `super().load_state_dict`:
+                # See https://github.com/pytorch/pytorch/pull/121157.
+                state_dict[k] = torch.nn.Parameter(state_dict[k], requires_grad=False)
 
         super().load_state_dict(state_dict, *args, **kwargs)
 
