@@ -107,21 +107,22 @@ def get_additional_block_num(
 
 
 def warmup_engine(args):
-    if args.infer.pp_size > 1 and args.infer.cache_type == "paged":
-        assert isinstance(Backend.cache_manager, PagedKVCacheManager)
+    if args.infer.pp_size > 1:
         logger.warning("Warming-up is not supported when PP is enabled. Skipping")
-        if args.infer.num_blocks == -1:
-            logger.warning(
-                "Auto infer.num_blocks (infer.num_blocks=-1) relies on warming-up to calculate the number of "
-                "blocks, but this is not supported when PP is enabled. A safe but inefficient value is used."
-            )
-            new_num_block = (
-                args.infer.max_reqs
-                * args.infer.max_seq_len
-                // Backend.cache_manager.block_size
-            )
-            get_global_args().infer.num_blocks = new_num_block
-            Backend.cache_manager.realloc(new_num_block)
+        if args.infer.cache_type == "paged":
+            assert isinstance(Backend.cache_manager, PagedKVCacheManager)
+            if args.infer.num_blocks == -1:
+                logger.warning(
+                    "Auto infer.num_blocks (infer.num_blocks=-1) relies on warming-up to calculate the number of "
+                    "blocks, but this is not supported when PP is enabled. A safe but inefficient value is used."
+                )
+                new_num_block = (
+                    args.infer.max_reqs
+                    * args.infer.max_seq_len
+                    // Backend.cache_manager.block_size
+                )
+                get_global_args().infer.num_blocks = new_num_block
+                Backend.cache_manager.realloc(new_num_block)
         return
 
     rank = torch.distributed.get_rank()
