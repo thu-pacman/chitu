@@ -1,6 +1,10 @@
 import pytest
+import tempfile
+import json
+from pathlib import Path
 from omegaconf import OmegaConf
 from chitu.schemas import ServeConfig, ServeConfigRules
+from chitu.schemas.utils import ModelConfigResolver
 
 
 def test_type_validation():
@@ -59,3 +63,22 @@ class TestServeConfigRules:
         with pytest.raises(SystemExit) as exc_info:
             callback.on_job_start(config=config)
         assert exc_info.value.code == 1
+
+    def test_resolve_config_value(self, callback, config):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_data = {
+                "head_dim": 128,
+            }
+
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config_data, f)
+
+            config.models.ckpt_dir = temp_dir
+            config.models.n_heads = "$(config.json:head_dim)"
+            model_resolver = ModelConfigResolver()
+            config.models = model_resolver.process_config_dict(
+                config.models, config.models.ckpt_dir
+            )
+            assert config.models.n_heads != 64
+            assert config.models.n_heads == 128

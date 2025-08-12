@@ -34,6 +34,7 @@ from chitu.task import (
     MockFixedLengthedUserRequest,
 )
 from chitu.utils import gen_req_id, try_import_opt_dep
+from chitu.schemas.utils import ModelConfigResolver
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
@@ -268,6 +269,11 @@ def chitu_init(args, logging_level=None):
 
     # Check checkpoint exists
     check_checkpoint_path(args)
+
+    # Parse model configuration, supporting dynamic reading from config.json files
+    # Uses $(config.json:field_name) syntax, e.g., n_heads: "$(config.json:head_dim)"
+    model_resolver = ModelConfigResolver()
+    args.models = model_resolver.process_config_dict(args.models, args.models.ckpt_dir)
 
     set_quant_variables(args)
     set_backend_variables(args)

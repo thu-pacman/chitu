@@ -9,7 +9,7 @@ ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<pat
 tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
 tokenizer_type: "hf" # one of: hf, tiktoken
 dim: 3584
-n_layers: 28
+n_layers: 28 # Could be: "$(config.json:head_dim)" to read head_dim from config.json
 n_heads: 28
 n_kv_heads: 4
 vocab_size: 152064
