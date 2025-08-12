@@ -5,9 +5,10 @@
 defaults:
   - hydra/callbacks: 
     - serve_config_rules
-  - models: Qwen2-7B-Instruct
+  - models: Qwen2-7B-Instruct # References chitu/config/models/Qwen2-7B-Instruct.yaml
   - serve_config_schema
   - _self_
+
 serve:
   host: 0.0.0.0
   port: 21002
@@ -32,12 +33,16 @@ infer:
   max_reqs: 8
   pp_layer_partition: null # The number of layers for each pipeline stage, e.g., [10, 12, 12, 10].
   use_cuda_graph: False
-  cuda_graph_backend: "none" # one of: none, flash_infer
   num_blocks: -1 # a positive interger or -1 for auto num blocks calculation
   bind_process_to_cpu: auto # one of: auto, none, numa
   bind_thread_to_cpu: physical_core # one of: physical_core, logical_core
   npu_fusion_fp4: False #  for npu fp4 fusion group_gemm mode
   gpu_memory_utilization: 0.98 # GPU memory utilization for each GPU, e.g., 0.98 means 98% of GPU memory will be used.
+  moe:
+    prefill_token_dispatcher: auto # one of: auto, tp, allgather
+    decode_token_dispatcher: auto # one of: auto, tp, allgather
+    prefill_experts_impl: auto # one of: auto, triton, pytorch, deepgemm-normal
+    decode_experts_impl: auto # one of: auto, triton, pytorch, deepgemm-ll
 request:
   prompt_tokens_len: -1 # use for perf test in single_req_test.py, -1 means use real requests.
   max_new_tokens: 128

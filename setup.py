@@ -42,8 +42,8 @@ else:
 
 cython_unsafe_files = (
     glob.glob("chitu/ops/triton_ops/*.py")  # Triton kernels inside
+    + glob.glob("chitu/moe/experts/*.py")  # Triton kernels inside
     + [
-        "fused_moe.py",  # Triton kernels inside
         "triton_decode_attention.py",  # Triton kernels inside
         "triton_flash_attention.py",  # Triton kernels inside
         "__main__.py",  # Triton kernels inside

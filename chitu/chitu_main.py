@@ -34,6 +34,7 @@ from chitu.task import (
     MockFixedLengthedUserRequest,
 )
 from chitu.utils import gen_req_id, try_import_opt_dep
+from chitu.schemas.utils import ModelConfigResolver
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
@@ -106,21 +107,22 @@ def get_additional_block_num(
 
 
 def warmup_engine(args):
-    if args.infer.pp_size > 1 and args.infer.cache_type == "paged":
-        assert isinstance(Backend.cache_manager, PagedKVCacheManager)
+    if args.infer.pp_size > 1:
         logger.warning("Warming-up is not supported when PP is enabled. Skipping")
-        if args.infer.num_blocks == -1:
-            logger.warning(
-                "Auto infer.num_blocks (infer.num_blocks=-1) relies on warming-up to calculate the number of "
-                "blocks, but this is not supported when PP is enabled. A safe but inefficient value is used."
-            )
-            new_num_block = (
-                args.infer.max_reqs
-                * args.infer.max_seq_len
-                // Backend.cache_manager.block_size
-            )
-            get_global_args().infer.num_blocks = new_num_block
-            Backend.cache_manager.realloc(new_num_block)
+        if args.infer.cache_type == "paged":
+            assert isinstance(Backend.cache_manager, PagedKVCacheManager)
+            if args.infer.num_blocks == -1:
+                logger.warning(
+                    "Auto infer.num_blocks (infer.num_blocks=-1) relies on warming-up to calculate the number of "
+                    "blocks, but this is not supported when PP is enabled. A safe but inefficient value is used."
+                )
+                new_num_block = (
+                    args.infer.max_reqs
+                    * args.infer.max_seq_len
+                    // Backend.cache_manager.block_size
+                )
+                get_global_args().infer.num_blocks = new_num_block
+                Backend.cache_manager.realloc(new_num_block)
         return
 
     rank = torch.distributed.get_rank()
@@ -261,13 +263,13 @@ def chitu_init(args, logging_level=None):
                 f"Unsupported infer.bind_process_to_cpu={args.infer.bind_process_to_cpu}"
             )
 
-    if args.infer.use_cuda_graph:
-        if args.infer.attn_type == "flash_infer":
-            args.infer.use_cuda_graph = False
-            args.infer.cuda_graph_backend = "flash_infer"
-
     # Check checkpoint exists
     check_checkpoint_path(args)
+
+    # Parse model configuration, supporting dynamic reading from config.json files
+    # Uses $(config.json:field_name) syntax, e.g., n_heads: "$(config.json:head_dim)"
+    model_resolver = ModelConfigResolver()
+    args.models = model_resolver.process_config_dict(args.models, args.models.ckpt_dir)
 
     set_quant_variables(args)
     set_backend_variables(args)

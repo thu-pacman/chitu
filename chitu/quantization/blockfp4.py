@@ -35,7 +35,7 @@ from chitu.native_layout import (
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
 if has_triton:
-    from chitu.fused_moe import fused_experts
+    from chitu.moe.experts import fused_experts
 torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 if has_torch_npu:
     from chitu.npu_utils import fused_experts_npu
@@ -583,7 +583,12 @@ class Blockfp4MoeExpertsPackKStride64(
     """
 
     def forward(
-        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        tokens_per_expert: Optional[torch.Tensor] = None,
+        impl: str = "auto",
     ) -> torch.Tensor:
         """
         Forward pass for the MoE module.
@@ -606,68 +611,50 @@ class Blockfp4MoeExpertsPackKStride64(
                 != 1
             )
 
-            if not self.fuse_shared_experts:
-
-                # TODO: Make fused_experts accept native layout weights
-                y = fused_experts(
-                    x,
-                    self.get_native_layout_gate_up_proj_weight().layout_tensor,
-                    self.get_native_layout_down_proj_weight().layout_tensor,
-                    topk_weights=weights,
-                    topk_ids=indices,
-                    use_fp4_w4a8=True,
-                    inplace=True,
-                    expert_map=self.expert_map,
-                    w1_scale=self.gate_up_proj_weight_scale,
-                    w2_scale=self.down_proj_weight_scale,
-                    w1w3_scale_2=self.gate_up_proj_weight_scale_2,
-                    w2_scale_2=self.down_proj_weight_scale_2,
-                    block_shape=[128, 128],
-                    soft_fp8=raise_to_16,
-                    experts_start_idx=self.experts_start_idx,
-                )
-
-            else:
-
+            final_indices = indices
+            final_weights = weights
+            if self.fuse_shared_experts:
                 indice_shape = indices.shape
-                new_indices = torch.empty(
+                final_indices = torch.empty(
                     (indice_shape[0], indice_shape[1] + 1),
                     dtype=indices.dtype,
                     device=indices.device,
                 )
 
-                new_weights = torch.empty(
+                final_weights = torch.empty(
                     (weights.shape[0], weights.shape[1] + 1),
                     dtype=weights.dtype,
                     device=weights.device,
                 )
 
                 chitu_backend.cuda_add_shared_experts(
-                    new_weights,
-                    new_indices,
+                    final_weights,
+                    final_indices,
                     weights,
                     indices,
                     self.n_routed_experts,
                     self.n_shared_experts,
                 )
                 del weights, indices
-                # TODO: Make fused_experts accept native layout weights
-                y = fused_experts(
-                    x,
-                    self.get_native_layout_gate_up_proj_weight().layout_tensor,
-                    self.get_native_layout_down_proj_weight().layout_tensor,
-                    topk_weights=new_weights,
-                    topk_ids=new_indices,
-                    use_fp4_w4a8=True,
-                    inplace=True,
-                    expert_map=self.expert_map,
-                    w1_scale=self.gate_up_proj_weight_scale,
-                    w2_scale=self.down_proj_weight_scale,
-                    w1w3_scale_2=self.gate_up_proj_weight_scale_2,
-                    w2_scale_2=self.down_proj_weight_scale_2,
-                    block_shape=[128, 128],
-                    soft_fp8=raise_to_16,
-                )
+
+            y = fused_experts(
+                hidden_states=x,
+                w1=self.get_native_layout_gate_up_proj_weight().layout_tensor,
+                w2=self.get_native_layout_down_proj_weight().layout_tensor,
+                topk_weights=final_weights,
+                topk_ids=final_indices,
+                inplace=False,
+                use_fp4_w4a8=True,
+                expert_map=self.expert_map,
+                w1_scale=self.gate_up_proj_weight_scale,
+                w2_scale=self.down_proj_weight_scale,
+                w1_scale_2=self.gate_up_proj_weight_scale_2,
+                w2_scale_2=self.down_proj_weight_scale_2,
+                block_shape=[128, 128],
+                soft_fp8=raise_to_16,
+                experts_start_idx=self.experts_start_idx,
+                impl=impl,
+            )
 
         else:
             y = self.forward_iterative(x, weights, indices)
@@ -737,7 +724,12 @@ class Blockfp4MoeExpertsPackNPUNative(
     """
 
     def forward(
-        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        tokens_per_expert: Optional[torch.Tensor] = None,
+        impl: str = "auto",
     ) -> torch.Tensor:
         """
         Forward pass for the MoE module.

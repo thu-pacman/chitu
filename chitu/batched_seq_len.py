@@ -167,13 +167,7 @@ class BatchedSeqLen:
         x = torch.ones(self.total_len, device=self.device, dtype=torch.int32)
         # Example: x = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
 
-        x.scatter_(
-            0,
-            self.prefix_lens_tensor_device[1:-1].to(
-                torch.int64  # scatter_ requires int64
-            ),
-            1 - self.lens_tensor_device[:-1],
-        )
+        x[self.prefix_lens_tensor_device[1:-1]] = 1 - self.lens_tensor_device[:-1]
         # Example: x = [ 1,  1,  1, -2,  1,  1,  1,  1, -4,  1]
 
         x = torch.cumsum(x, dim=0, dtype=torch.int32) - 1

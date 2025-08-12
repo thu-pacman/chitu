@@ -2,36 +2,183 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Dict, List, Sequence, Optional
+from typing_extensions import override
+from dataclasses import dataclass
 from logging import getLogger
-
 import torch
-from typing import Dict, List, Optional
 from collections import deque
+
 from chitu.global_vars import get_slot_handle, get_timers, get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.batched_seq_len import BatchedSeqLen
 
 logger = getLogger(__name__)
-_BLOCK_SIZE = 512  # _BLOCK_SIZE must be a multiple of 256 for FlashAttention
-_MAX_SEQ_LEN = 2048
 
 
-class PagedKVCacheManager:
+class KVCacheAccessor:
+    """
+    Base class for KV cache accessors
+
+    A KV cache accessor locates specific tokens of a specific layer in a KV cache. Data
+    can be read from the accessor, and updates to the accessor apply to the KV cache.
+    """
+
+    pass
+
+
+@dataclass
+class PagedKVCacheAccessor(KVCacheAccessor):
+    block_table: torch.Tensor
+    k: Optional[torch.Tensor]
+    v: Optional[torch.Tensor]
+
+
+@dataclass
+class DenseKVCacheAccessor(KVCacheAccessor):
+    k: Optional[torch.Tensor]  # shape: [num_req, max_seqlen + 1, n_kv_heads, head_dim]
+    v: Optional[torch.Tensor]  # shape: [num_req, max_seqlen + 1, n_kv_heads, head_dim]
+
+
+class KVCacheManagerBase:
+    def __init__(
+        self,
+        begin_layer_id,
+        end_layer_id,
+        *,
+        num_hot_req: int,
+        max_seq_len: int,
+        k_shape_per_sample: Optional[torch.Size | Sequence[int]] = None,
+        v_shape_per_sample: Optional[torch.Size | Sequence[int]] = None,
+        kv_shape_per_sample: Optional[torch.Size | Sequence[int]] = None,
+        n_local_kv_heads: Optional[int] = None,
+        head_dim: Optional[int] = None,
+        device="cuda",
+    ):
+        """
+        Base class for KV cache managers
+
+        Note for KV cache shapes:
+        - You can either set `k_shae_per_sample` and `v_shape_per_sample`, or `n_local_kv_heads` and `head_dim`.
+        - Otherwise, you can set `kv_shape_per_sample`, which means a holistic shape for both K and V, which
+          internally uses only K and disables V.
+        """
+
+        self.begin_layer_id = begin_layer_id
+        self.end_layer_id = end_layer_id
+        self.num_layers = end_layer_id - begin_layer_id
+
+        self.num_hot_req = num_hot_req
+        self.max_seq_len = max_seq_len
+
+        self.device = torch.device(device)
+
+        self.k_shape_per_sample: Optional[torch.Size | Sequence[int]]
+        self.v_shape_per_sample: Optional[torch.Size | Sequence[int]]
+        if kv_shape_per_sample is None:
+            if k_shape_per_sample is not None:
+                self.k_shape_per_sample = k_shape_per_sample
+            else:
+                if n_local_kv_heads is None:
+                    raise ValueError(
+                        "`n_local_kv_heads` must be set if both `kv_shape_per_sample` and `k_shape_per_sample` are None"
+                    )
+                if head_dim is None:
+                    raise ValueError(
+                        "`head_dim` must be set if both `kv_shape_per_sample` and `k_shape_per_sample` are None"
+                    )
+                self.k_shape_per_sample = (n_local_kv_heads, head_dim)
+            if v_shape_per_sample is not None:
+                self.v_shape_per_sample = v_shape_per_sample
+            else:
+                if n_local_kv_heads is None:
+                    raise ValueError(
+                        "`n_local_kv_heads` must be set if both `kv_shape_per_sample` and `k_shape_per_sample` are None"
+                    )
+                if head_dim is None:
+                    raise ValueError(
+                        "`head_dim` must be set if both `kv_shape_per_sample` and `k_shape_per_sample` are None"
+                    )
+                self.v_shape_per_sample = (n_local_kv_heads, head_dim)
+        else:
+            self.k_shape_per_sample = kv_shape_per_sample
+            self.v_shape_per_sample = None
+
+        self.req_id_to_seq_len: Dict[str, int] = {}
+        self.prev_seq_len = BatchedSeqLen([], self.device, max_batch_size=num_hot_req)
+        self.next_seq_len = BatchedSeqLen([], self.device, max_batch_size=num_hot_req)
+
+        self.curr_req_ids: Optional[List[str]] = None
+
+        self.timers = get_timers()
+
+    def prepare_cache_prefill(self, req_ids: List[str], next_seq_len: BatchedSeqLen):
+        self.next_seq_len.copy_from(next_seq_len)
+        self.curr_req_ids = req_ids
+
+    def finalize_cache_bylayer_prefill(
+        self,
+        xk: Optional[torch.Tensor],
+        xv: Optional[torch.Tensor],
+        req_ids: List[str],
+        next_seq_len: BatchedSeqLen,
+        layer_id: int,
+    ):
+        pass
+
+    def finalize_cache_all_prefill(self):
+        self.curr_req_ids = None
+
+    def prepare_cache_decode(self, req_ids: List[str]):
+        self.curr_req_ids = req_ids
+
+        self.prev_seq_len.copy_from(
+            BatchedSeqLen(
+                [self.req_id_to_seq_len[req_id] for req_id in req_ids],
+                device=self.device,
+            )
+        )
+        self.next_seq_len.copy_from(
+            BatchedSeqLen(
+                [self.req_id_to_seq_len[req_id] + 1 for req_id in req_ids],
+                device=self.device,
+            )
+        )
+
+    def get_accessor(self, layer_id: int) -> KVCacheAccessor:
+        raise NotImplementedError()
+
+    def finalize_cache_single_decode(self, req_ids: List[str]):
+        for req_id in req_ids:
+            self.req_id_to_seq_len[req_id] += 1
+        self.curr_req_ids = None
+
+    def finalize_cache_all_decode(self, req_id: str):
+        pass
+
+    def get_gpu_block_table(self):
+        return None
+
+    def get_block_size(self):
+        return 0
+
+
+class PagedKVCacheManager(KVCacheManagerBase):
     def __init__(
         self,
         begin_layer_id: int,
         end_layer_id: int,
-        num_hot_req=16,
-        block_size=_BLOCK_SIZE,
-        num_blocks: int = -1,
-        max_seq_len=_MAX_SEQ_LEN,
-        device="cuda",
         *,
-        k_shape_per_sample=None,
-        v_shape_per_sample=None,
-        kv_shape_per_sample=None,
-        n_local_kv_heads=None,
-        head_dim=None,
+        num_hot_req: int,
+        max_seq_len: int,
+        k_shape_per_sample: Optional[torch.Size | Sequence[int]] = None,
+        v_shape_per_sample: Optional[torch.Size | Sequence[int]] = None,
+        kv_shape_per_sample: Optional[torch.Size | Sequence[int]] = None,
+        n_local_kv_heads: Optional[int] = None,
+        head_dim: Optional[int] = None,
+        device="cuda",
+        block_size: int = 512,  # must be a multiple of 256 for FlashAttention
+        num_blocks: int = -1,
     ):
         """
         Paged KV cache manager
@@ -42,35 +189,25 @@ class PagedKVCacheManager:
           internally uses only K and disables V.
         """
 
+        super().__init__(
+            begin_layer_id,
+            end_layer_id,
+            num_hot_req=num_hot_req,
+            max_seq_len=max_seq_len,
+            k_shape_per_sample=k_shape_per_sample,
+            v_shape_per_sample=v_shape_per_sample,
+            kv_shape_per_sample=kv_shape_per_sample,
+            n_local_kv_heads=n_local_kv_heads,
+            head_dim=head_dim,
+            device=device,
+        )
+
         self.max_blocks_per_req = (max_seq_len + block_size - 1) // block_size
         self.max_num_blocks = self.max_blocks_per_req * num_hot_req
         self.num_blocks = num_blocks if num_blocks != -1 else num_hot_req
-        self.begin_layer_id = begin_layer_id
-        self.end_layer_id = end_layer_id
-        self.num_layers = end_layer_id - begin_layer_id
-
-        if kv_shape_per_sample is None:
-            self.k_shape_per_sample = (
-                k_shape_per_sample
-                if k_shape_per_sample is not None
-                else (n_local_kv_heads, head_dim)
-            )
-            self.v_shape_per_sample = (
-                v_shape_per_sample
-                if v_shape_per_sample is not None
-                else (n_local_kv_heads, head_dim)
-            )
-        else:
-            self.k_shape_per_sample = kv_shape_per_sample
-            self.v_shape_per_sample = None
 
         self.block_size = block_size
-        self.max_seq_len = max_seq_len
-        self.device = torch.device(device)
 
-        self.req_id_to_seq_len: Dict[str, int] = {}
-        self.prev_seq_len = BatchedSeqLen([], self.device, max_batch_size=num_hot_req)
-        self.next_seq_len = BatchedSeqLen([], self.device, max_batch_size=num_hot_req)
         self.block_table: Dict[str, List[int]] = {}  # (seq_id, block_idx)
         self.gpu_block_table = StaticTensor(
             max_nelem=self.max_num_blocks, dtype=torch.int32, device=self.device
@@ -81,7 +218,7 @@ class PagedKVCacheManager:
         if self.k_shape_per_sample is not None:
             self.paged_k_cache = torch.zeros(
                 (self.num_layers, self.num_blocks, block_size)
-                + self.k_shape_per_sample,
+                + tuple(self.k_shape_per_sample),
                 device=device,
             )
         else:
@@ -89,13 +226,11 @@ class PagedKVCacheManager:
         if self.v_shape_per_sample is not None:
             self.paged_v_cache = torch.zeros(
                 (self.num_layers, self.num_blocks, block_size)
-                + self.v_shape_per_sample,
+                + tuple(self.v_shape_per_sample),
                 device=device,
             )
         else:
             self.paged_v_cache = None
-
-        self.timers = get_timers()
 
     def realloc(self, num_blocks):
         self.num_blocks = min(num_blocks, self.max_num_blocks)
@@ -121,15 +256,16 @@ class PagedKVCacheManager:
                 device=self.device,
             )
 
+    @override
     def get_block_size(self):
         return self.block_size
 
     def get_num_blocks(self):
         return self.max_num_blocks
 
+    @override
     def prepare_cache_prefill(self, req_ids: List[str], next_seq_len: BatchedSeqLen):
-        self.next_seq_len.copy_from(next_seq_len)
-        self.curr_req_ids = req_ids
+        super().prepare_cache_prefill(req_ids, next_seq_len)
 
         block_idxs = []
         indices_in_block = []
@@ -172,6 +308,7 @@ class PagedKVCacheManager:
         )
 
     # Init block table and kv cache with kv generated during prefill
+    @override
     def finalize_cache_bylayer_prefill(
         self,
         xk: Optional[torch.Tensor],
@@ -180,12 +317,13 @@ class PagedKVCacheManager:
         next_seq_len: BatchedSeqLen,
         layer_id: int,
     ):
-        self.timers("cache_finalize_cache_all_prefill").start()
+        self.timers("finalize_cache_bylayer_prefill").start()
 
         layer_idx = layer_id - self.begin_layer_id
 
         if (
             get_global_args().infer.attn_type == "npu"
+            and self.k_shape_per_sample is not None
             and len(self.k_shape_per_sample) == 1
             and get_global_args().models.type != "deepseek-v3"
         ):
@@ -204,26 +342,11 @@ class PagedKVCacheManager:
                 (self.new_tokens_block_indices, self.new_tokens_indices_in_block), xv
             )
 
-        self.timers("cache_finalize_cache_all_prefill").stop()
+        self.timers("finalize_cache_bylayer_prefill").stop()
 
-    def finalize_cache_all_prefill(self):
-        self.curr_req_ids = None
-
-    def prepare_cache_decode(self, req_ids):
-        self.curr_req_ids = req_ids
-
-        self.prev_seq_len.copy_from(
-            BatchedSeqLen(
-                [self.req_id_to_seq_len[req_id] for req_id in req_ids],
-                device=self.device,
-            )
-        )
-        self.next_seq_len.copy_from(
-            BatchedSeqLen(
-                [self.req_id_to_seq_len[req_id] + 1 for req_id in req_ids],
-                device=self.device,
-            )
-        )
+    @override
+    def prepare_cache_decode(self, req_ids: List[str]):
+        super().prepare_cache_decode(req_ids)
 
         # Prepare enough block table for next decoding. When decoding, AttnBackend will fill new kv into
         # paged kv cache in place.
@@ -255,10 +378,12 @@ class PagedKVCacheManager:
         self.timers("get_free_block").stop()
         return idx
 
+    @override
     def get_gpu_block_table(self):
         return self.gpu_block_table.get()
 
-    def get_paged_kv_cache(self, layer_id):
+    @override
+    def get_accessor(self, layer_id: int) -> PagedKVCacheAccessor:
         ret_k = (
             self.paged_k_cache[layer_id - self.begin_layer_id]
             if self.paged_k_cache is not None
@@ -269,9 +394,9 @@ class PagedKVCacheManager:
             if self.paged_v_cache is not None
             else None
         )
-        return ret_k, ret_v
+        return PagedKVCacheAccessor(self.get_gpu_block_table(), ret_k, ret_v)
 
-    def free_req_cache_blocks(self, req_id):
+    def free_req_cache_blocks(self, req_id: str):
         self.timers("free_req_cache_blocks").start()
         for block in self.block_table[req_id]:
             self.free_blocks.append(block)
@@ -279,36 +404,31 @@ class PagedKVCacheManager:
         del self.req_id_to_seq_len[req_id]
         self.timers("free_req_cache_blocks").stop()
 
-    def finalize_cache_single_decode(self, req_ids):
-        for req_id in req_ids:
-            self.req_id_to_seq_len[req_id] += 1
-        self.curr_req_ids = None
-
-    def finalize_cache_all_decode(self, req_id):
+    @override
+    def finalize_cache_all_decode(self, req_id: str):
         self.timers("finalize_cache_all_decode").start()
         if req_id not in self.req_id_to_seq_len:
             return
         # assert req_id in self.req_id_to_seq_len
         # assert req_id in self.block_table
         self.free_req_cache_blocks(req_id)
-        self.curr_req_ids = None
         self.timers("finalize_cache_all_decode").stop()
 
 
-class KVCacheManagerSkewAware:
+class DenseKVCacheManager(KVCacheManagerBase):
     def __init__(
         self,
         begin_layer_id,
         end_layer_id,
-        num_hot_req,
-        max_seq_len=2048,
-        device="cuda",
         *,
-        k_shape_per_sample=None,
-        v_shape_per_sample=None,
-        kv_shape_per_sample=None,
-        n_local_kv_heads=None,
-        head_dim=None,
+        num_hot_req: int,
+        max_seq_len: int,
+        k_shape_per_sample: Optional[torch.Size | Sequence[int]] = None,
+        v_shape_per_sample: Optional[torch.Size | Sequence[int]] = None,
+        kv_shape_per_sample: Optional[torch.Size | Sequence[int]] = None,
+        n_local_kv_heads: Optional[int] = None,
+        head_dim: Optional[int] = None,
+        device="cuda",
     ):
         """
         Non-paged KV cache manager
@@ -319,34 +439,25 @@ class KVCacheManagerSkewAware:
           internally uses only K and disables V.
         """
 
-        self.begin_layer_id = begin_layer_id
-        self.end_layer_id = end_layer_id
-        self.num_layers = end_layer_id - begin_layer_id
+        super().__init__(
+            begin_layer_id,
+            end_layer_id,
+            num_hot_req=num_hot_req,
+            max_seq_len=max_seq_len,
+            k_shape_per_sample=k_shape_per_sample,
+            v_shape_per_sample=v_shape_per_sample,
+            kv_shape_per_sample=kv_shape_per_sample,
+            n_local_kv_heads=n_local_kv_heads,
+            head_dim=head_dim,
+            device=device,
+        )
 
-        if kv_shape_per_sample is None:
-            self.k_shape_per_sample = (
-                k_shape_per_sample
-                if k_shape_per_sample is not None
-                else (n_local_kv_heads, head_dim)
-            )
-            self.v_shape_per_sample = (
-                v_shape_per_sample
-                if v_shape_per_sample is not None
-                else (n_local_kv_heads, head_dim)
-            )
-        else:
-            self.k_shape_per_sample = kv_shape_per_sample
-            self.v_shape_per_sample = None
-
-        self.num_hot_req = num_hot_req
         self.slot_availability = [True] * num_hot_req
-        self.hot_reqs = [-1] * num_hot_req
-        self.req2slot = {}
-        self.req_id_to_seq_len = {}
-        self.max_seq_len = max_seq_len
-        self.tmp_storage = []
-        self.device = torch.device(device)
+        self.hot_reqs: List[Optional[str]] = [None] * num_hot_req
+        self.req2slot: Dict[str, int] = {}
 
+        self.k_buffer: Optional[torch.Tensor] = None
+        self.v_buffer: Optional[torch.Tensor] = None
         if self.k_shape_per_sample is not None:
             self.k_buffer = torch.zeros(
                 (
@@ -354,11 +465,9 @@ class KVCacheManagerSkewAware:
                     self.num_hot_req,
                     self.max_seq_len,
                 )
-                + self.k_shape_per_sample,
+                + tuple(self.k_shape_per_sample),
                 device=self.device,
             )
-        else:
-            self.k_buffer = None
         if self.v_shape_per_sample is not None:
             self.v_buffer = torch.zeros(
                 (
@@ -366,24 +475,17 @@ class KVCacheManagerSkewAware:
                     self.num_hot_req,
                     self.max_seq_len,
                 )
-                + self.v_shape_per_sample,
+                + tuple(self.v_shape_per_sample),
                 device=self.device,
             )
-        else:
-            self.v_buffer = None
 
-        self.prev_seq_len = BatchedSeqLen([], self.device, max_batch_size=num_hot_req)
-        self.next_seq_len = BatchedSeqLen([], self.device, max_batch_size=num_hot_req)
-
-        self.prepared_reqs = []
+        self.prepared_reqs: List[str] = []
         self.rounded_max_seq = -1
         self.slot_handle = get_slot_handle()
 
-        self.timers = get_timers()
-
+    @override
     def prepare_cache_prefill(self, req_ids: List[str], next_seq_len: BatchedSeqLen):
-        self.next_seq_len.copy_from(next_seq_len)
-        self.curr_req_ids = req_ids
+        super().prepare_cache_prefill(req_ids, next_seq_len)
 
         if self.slot_handle:
             start_idx, _ = self.slot_handle.get_current_slot_start_end_idx()
@@ -402,6 +504,7 @@ class KVCacheManagerSkewAware:
             ), f"Cannot allocate slot: {req_id} {self.req2slot}"
 
     # Prefill:
+    @override
     def finalize_cache_bylayer_prefill(
         self,
         xk: Optional[torch.Tensor],
@@ -410,10 +513,11 @@ class KVCacheManagerSkewAware:
         next_seq_len: BatchedSeqLen,
         layer_id: int,
     ):
-        self.timers("cache_finalize_cache_all_prefill").start()
+        self.timers("finalize_cache_bylayer_prefill").start()
 
         if (
             get_global_args().infer.attn_type == "npu"
+            and self.k_shape_per_sample is not None
             and len(self.k_shape_per_sample) == 1
         ):
             # NPU BSH layout
@@ -435,30 +539,14 @@ class KVCacheManagerSkewAware:
                 ] = xv[start:end]
             start = end
 
-        self.timers("cache_finalize_cache_all_prefill").stop()
-
-    # Prefill:
-    def finalize_cache_all_prefill(self):
-        self.curr_req_ids = None
+        self.timers("finalize_cache_bylayer_prefill").stop()
 
     # Decode:
-    def prepare_cache_decode(self, req_ids):
+    @override
+    def prepare_cache_decode(self, req_ids: List[str]):
         self.timers("cache_prepare").start()
 
-        self.curr_req_ids = req_ids
-
-        self.prev_seq_len.copy_from(
-            BatchedSeqLen(
-                [self.req_id_to_seq_len[req_id] for req_id in req_ids],
-                device=self.device,
-            )
-        )
-        self.next_seq_len.copy_from(
-            BatchedSeqLen(
-                [self.req_id_to_seq_len[req_id] + 1 for req_id in req_ids],
-                device=self.device,
-            )
-        )
+        super().prepare_cache_decode(req_ids)
         max_seq = self.prev_seq_len.max_len
 
         args = get_global_args()
@@ -532,8 +620,8 @@ class KVCacheManagerSkewAware:
         self.timers("cache_prepare").stop()
 
     # Decode:
-    # return [2, num_req, max_seqlen + 1, n_local_kv_heads, head_dim]
-    def get_cache_decode(self, layer_id):
+    @override
+    def get_accessor(self, layer_id: int) -> DenseKVCacheAccessor:
         ret_k = (
             self.k_prepared_cache[layer_id - self.begin_layer_id]
             if self.k_prepared_cache is not None
@@ -544,26 +632,15 @@ class KVCacheManagerSkewAware:
             if self.v_prepared_cache is not None
             else None
         )
-        return ret_k, ret_v
-
-    def get_gpu_block_table(self):
-        return None
-
-    def get_block_size(self):
-        return 0
+        return DenseKVCacheAccessor(ret_k, ret_v)
 
     # Decode:
-    def finalize_cache_single_decode(self, req_ids):
-        for req_id in req_ids:
-            self.req_id_to_seq_len[req_id] += 1
-        self.curr_req_ids = None
-
-    # Decode:
-    def finalize_cache_all_decode(self, req_id):
+    @override
+    def finalize_cache_all_decode(self, req_id: str):
         if req_id not in self.hot_reqs:
             return
         slot_id = self.hot_reqs.index(req_id)
-        if slot_id == -1:  # not in the hot slot
+        if slot_id is None:  # not in the hot slot
             return
 
         if self.slot_handle:
@@ -604,7 +681,7 @@ class KVCacheManagerSkewAware:
             if req_key is not None:
                 self.req2slot[req_key] = slot_id
                 self.hot_reqs[slot_id] = req_key
-            self.hot_reqs[slot_last_id] = -1
+            self.hot_reqs[slot_last_id] = None
             self.slot_availability[slot_last_id] = True
             if req_id in self.req2slot:
                 self.req2slot.pop(req_id)
@@ -613,7 +690,7 @@ class KVCacheManagerSkewAware:
             if self.v_buffer is not None:
                 self.v_buffer[:, slot_last_id].zero_()
         else:
-            self.hot_reqs[slot_id] = -1
+            self.hot_reqs[slot_id] = None
             self.slot_availability[slot_id] = True
             self.req2slot.pop(req_id)
             if self.k_buffer is not None:

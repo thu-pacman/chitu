@@ -13,6 +13,7 @@ from chitu.hybrid_device import CPUParameter
 from chitu.quantization.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import GGMLQuantizationType
 from chitu.utils import try_import_opt_dep
+from typing import Optional
 
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
@@ -223,7 +224,12 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
             self.cpu_infer.sync()
 
     def forward(
-        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        tokens_per_expert: Optional[torch.Tensor] = None,
+        impl: str = "auto",
     ) -> torch.Tensor:
         """
         Forward pass for the MoE module.

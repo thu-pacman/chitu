@@ -61,8 +61,9 @@ def fused_experts_npu(
     n_local_experts = w1.shape[0]
     topk_ids = topk_ids - experts_start_idx
     mask = (topk_ids < 0) | (topk_ids >= n_local_experts)
-    topk_weights[mask] = 0
-    topk_ids[mask] = 0  # [TODO]: optimize this( expert "0" get too many tokens )
+    # see https://www.hiascend.com/document/detail/zh/Pytorch/60RC3/ptmoddevg/trainingmigrguide/performance_tuning_0033.html
+    topk_weights *= ~mask
+    topk_ids *= ~mask
 
     # Check constraints.
     if not get_global_args().infer.npu_fusion_fp4:

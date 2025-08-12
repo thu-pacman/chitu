@@ -971,8 +971,8 @@ def per_token_group_quant_fp8(
             x_q,
             x_s,
             group_size,
-            x.shape[1],
-            x.stride(0),
+            x.shape[-1],
+            x.shape[-1],
             eps,
             fp8_min=fp8_min,
             fp8_max=fp8_max,
@@ -1331,7 +1331,7 @@ def fused_experts(
     expert_map: Optional[torch.Tensor] = None,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
-    w1w3_scale_2: Optional[torch.Tensor] = None,
+    w1_scale_2: Optional[torch.Tensor] = None,
     w2_scale_2: Optional[torch.Tensor] = None,
     w1_zp: Optional[torch.Tensor] = None,
     w2_zp: Optional[torch.Tensor] = None,
@@ -1340,61 +1340,40 @@ def fused_experts(
     block_shape: Optional[List[int]] = None,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
+    tokens_per_expert: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    assert tokens_per_expert is None
 
     n_local_experts = w1.shape[0]
     topk_ids = topk_ids - experts_start_idx
     mask = (topk_ids < 0) | (topk_ids >= n_local_experts)
     topk_ids[mask] = n_local_experts
 
-    if inplace:
-        inplace_fused_experts(
-            hidden_states,
-            w1,
-            w2,
-            topk_weights,
-            topk_ids,
-            activation,
-            use_fp8_w8a8,
-            use_fp4_w4a8,
-            use_int8_w8a16,
-            use_int4_w4a16,
-            global_num_experts,
-            expert_map,
-            w1_scale,
-            w2_scale,
-            w1w3_scale_2,
-            w2_scale_2,
-            w1_zp,
-            w2_zp,
-            a1_scale,
-            a2_scale,
-            block_shape,
-            soft_fp8=soft_fp8,
-        )
-        return hidden_states
-    else:
-        return torch.ops.vllm.outplace_fused_experts(
-            hidden_states,
-            w1,
-            w2,
-            topk_weights,
-            topk_ids,
-            activation,
-            use_fp8_w8a8,
-            use_int8_w8a16,
-            use_int4_w4a16,
-            global_num_experts,
-            expert_map,
-            w1_scale,
-            w2_scale,
-            w1_zp,
-            w2_zp,
-            a1_scale,
-            a2_scale,
-            block_shape,
-            soft_fp8=soft_fp8,
-        )
+    return fused_experts_impl(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        inplace,
+        activation,
+        use_fp8_w8a8,
+        use_fp4_w4a8,
+        use_int8_w8a16,
+        use_int4_w4a16,
+        global_num_experts,
+        expert_map,
+        w1_scale,
+        w2_scale,
+        w1_scale_2,
+        w2_scale_2,
+        w1_zp,
+        w2_zp,
+        a1_scale,
+        a2_scale,
+        block_shape,
+        soft_fp8,
+    )
 
 
 def fused_experts_impl(

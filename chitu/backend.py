@@ -28,7 +28,7 @@ from chitu.attn_backend import (
     NpuAttnBackend,
     HybridAttnBackend,
 )
-from chitu.cache_manager import KVCacheManagerSkewAware, PagedKVCacheManager
+from chitu.cache_manager import DenseKVCacheManager, PagedKVCacheManager
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
 from chitu.distributed.parallel_state import get_pp_group, initialize_parallel_groups
@@ -42,7 +42,9 @@ from chitu.quantization import (
 )
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
 from chitu.utils import compute_layer_dist_in_pipe, parse_dtype, try_import_opt_dep
-from chitu.distributed.moe_token_dispatcher import init_token_dispatcher
+
+# from chitu.distributed.moe_token_dispatcher import init_token_dispatcher
+from chitu.moe import init_moe_impl
 
 if TYPE_CHECKING:
     from chitu.executor import BatchResult, Executor, OngoingRequests
@@ -290,7 +292,7 @@ class Backend:
                 **kv_cache_kvargs,
             )
         elif args.infer.cache_type == "skew":
-            return KVCacheManagerSkewAware(
+            return DenseKVCacheManager(
                 local_begin_layer_id,
                 local_end_layer_id,
                 max_seq_len=args.infer.max_seq_len,
@@ -654,9 +656,7 @@ class Backend:
         # Initialize distributed environment
         Backend._init_distributed(args)
 
-        init_token_dispatcher(
-            args.infer.ep_size, args.infer.tp_size, args.infer.dp_size
-        )
+        init_moe_impl(args)
 
         # Setup environment and basic configuration
         Backend._setup_environment(args)

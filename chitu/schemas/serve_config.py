@@ -40,12 +40,20 @@ class InferConfig:
     max_reqs: int = MISSING
     pp_layer_partition: Optional[List[int]] = MISSING
     use_cuda_graph: bool = MISSING
-    cuda_graph_backend: Optional[str] = MISSING  # none, flash_infer
     npu_fusion_fp4: bool = MISSING
     num_blocks: int = MISSING
     bind_process_to_cpu: str = MISSING
     bind_thread_to_cpu: str = MISSING
     gpu_memory_utilization: float = MISSING
+
+    @dataclass
+    class MoEConfig:
+        prefill_token_dispatcher: str = MISSING
+        decode_token_dispatcher: str = MISSING
+        prefill_experts_impl: str = MISSING
+        decode_experts_impl: str = MISSING
+
+    moe: MoEConfig = MISSING
 
 
 @dataclass
