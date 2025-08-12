@@ -28,10 +28,8 @@ triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
-if has_torch_npu:
-    from chitu.npu_utils import fused_experts_npu
-if has_triton:
-    from chitu.fused_moe import fused_experts
+if has_triton or has_torch_npu:
+    from chitu.moe.experts import fused_experts
 
 
 @QuantizationRegistry.register_linear(None)
@@ -145,7 +143,14 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
             requires_grad=False,
         )
 
-    def forward(self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        tokens_per_expert: Optional[torch.Tensor] = None,
+        impl: str = "auto",
+    ):
         """
         Forward pass for the MoE module.
 
@@ -160,67 +165,45 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
 
         shape = x.size()
         x = x.view(-1, self.dim)
-
-        if has_torch_npu and self.merge_gate_up:
-            y = fused_experts_npu(
-                hidden_states=x,
-                w1=self.gate_up_proj_weight,
-                w2=self.down_proj_weight,
-                topk_weights=weights,
-                topk_ids=indices,
-                experts_start_idx=self.experts_start_idx,
-            )
-
-        elif has_triton and self.merge_gate_up:
-            if not self.fuse_shared_experts:
-                y = fused_experts(
-                    x,
-                    self.gate_up_proj_weight,
-                    self.down_proj_weight,
-                    topk_weights=weights,
-                    topk_ids=indices,
-                    inplace=True,
-                    expert_map=self.expert_map,
-                    block_shape=[128, 128],
-                    experts_start_idx=self.experts_start_idx,
-                )
-
-            else:
-
+        if self.merge_gate_up and (has_triton or has_torch_npu):
+            final_indices = indices
+            final_weights = weights
+            if self.fuse_shared_experts:
                 indice_shape = indices.shape
-                new_indices = torch.empty(
+                finale_indices = torch.empty(
                     (indice_shape[0], indice_shape[1] + 1),
                     dtype=indices.dtype,
                     device=indices.device,
                 )
 
-                new_weights = torch.empty(
+                final_weights = torch.empty(
                     (weights.shape[0], weights.shape[1] + 1),
                     dtype=weights.dtype,
                     device=weights.device,
                 )
 
                 chitu_backend.cuda_add_shared_experts(
-                    new_weights,
-                    new_indices,
+                    final_weights,
+                    finale_indices,
                     weights,
                     indices,
                     self.n_routed_experts,
                     self.n_shared_experts,
                 )
                 del weights, indices
-                y = fused_experts(
-                    x,
-                    self.gate_up_proj_weight,
-                    self.down_proj_weight,
-                    topk_weights=new_weights,
-                    topk_ids=new_indices,
-                    inplace=True,
-                    global_num_experts=self.n_routed_experts + self.n_shared_experts,
-                    expert_map=self.expert_map,
-                    block_shape=[128, 128],
-                )
 
+            y = fused_experts(
+                hidden_states=x,
+                w1=self.gate_up_proj_weight,
+                w2=self.down_proj_weight,
+                topk_weights=final_weights,
+                topk_ids=final_indices,
+                inplace=False,
+                expert_map=self.expert_map,
+                tokens_per_expert=tokens_per_expert,
+                experts_start_idx=self.experts_start_idx,
+                impl=impl,
+            )
         else:
             y = self.forward_iterative(x, weights, indices)
 

@@ -29,9 +29,7 @@ from chitu.distributed.parallel_state import (
     get_pp_pair_group,
     get_dp_group,
 )
-from chitu.distributed.moe_token_dispatcher import (
-    get_token_dispatcher,
-)
+from chitu.moe import get_moe_impl
 from chitu.utils import top_k_top_p_min_p_sampling_from_probs_torch
 from chitu.ops import apply_frequency_penalty, response_append
 from chitu.device_list import DeviceList
@@ -377,7 +375,7 @@ class Executor:
             self.dummy_logits = torch.empty(
                 [0, self.vocab_size], dtype=torch.float32, device=self.local_rank
             )
-        self.token_dispatcher = get_token_dispatcher()
+        self.moe_impl = get_moe_impl()
 
     def _prepare_new_tokens_for_decode(self, tasks: PackedTasks):
         return torch.tensor(
@@ -409,8 +407,8 @@ class Executor:
                 Backend.cache_manager.finalize_cache_all_decode(rid)
             return None
 
-        if self.token_dispatcher is not None:
-            self.token_dispatcher.prepare(tasks.task_type, tasks.num_tokens)
+        if self.moe_impl is not None:
+            self.moe_impl.prepare(tasks.task_type.to_str(), tasks.num_tokens)
 
         # 2. prefill/decode step
         if tasks.task_type == TaskType.Prefill:

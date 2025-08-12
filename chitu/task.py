@@ -291,6 +291,14 @@ class TaskType(Enum):
     Prefill = 1
     Decode = 2
 
+    def to_str(self) -> str:
+        if self == TaskType.Prefill:
+            return "prefill"
+        elif self == TaskType.Decode:
+            return "decode"
+        else:
+            raise NotImplementedError
+
 
 class Task:
     def __init__(

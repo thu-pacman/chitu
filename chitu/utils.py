@@ -52,6 +52,7 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> Tuple[Any, bool]:
         "flashinfer",
         "flash_mla",
         "deep_gemm",
+        "deep_ep",  # [TODO] add installation support
         "cpu",
     }
     assert (

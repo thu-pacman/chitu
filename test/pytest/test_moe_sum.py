@@ -2,7 +2,7 @@ import torch
 import pytest
 import triton
 
-from chitu.fused_moe import moe_sum
+from chitu.moe.experts.triton_fused_experts import moe_sum
 
 
 def torch_moe_sum(input_tensor, output_tensor):

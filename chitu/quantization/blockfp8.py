@@ -29,7 +29,7 @@ from chitu.ops import weight_dequant_soft_fp8_deepseek_v3
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
 if has_triton:
-    from chitu.fused_moe import fused_experts
+    from chitu.moe.experts import fused_experts
 grouped_gemm, _ = try_import_opt_dep("grouped_gemm", "ascend_kernels")
 
 logger = getLogger(__name__)
@@ -343,7 +343,12 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         )
 
     def forward(
-        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        tokens_per_expert: Optional[torch.Tensor] = None,
+        impl: str = "auto",
     ) -> torch.Tensor:
         """
         Forward pass for the MoE module.
@@ -357,10 +362,9 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
             torch.Tensor: Output tensor.
         """
 
-        shape = x.size()
-        x = x.view(-1, self.dim)
-
         if has_triton and self.merge_gate_up:
+            fused_soft_fp8 = False
+            use_fp8_w8a8 = False
             if (
                 parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
                 == 1
@@ -377,6 +381,7 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                 gate_up_proj_scale = self.gate_up_proj_scale
                 down_proj_weight = self.down_proj_weight
                 down_proj_scale = self.down_proj_scale
+                use_fp8_w8a8 = True
             else:
                 logger.warning(
                     f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
@@ -394,69 +399,54 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                     block_size,
                 )
                 down_proj_scale = None
-                fused_soft_fp8 = False
 
-            if not self.fuse_shared_experts:
-
-                y = fused_experts(
-                    x,
-                    gate_up_proj_weight,
-                    down_proj_weight,
-                    topk_weights=weights,
-                    topk_ids=indices,
-                    use_fp8_w8a8=True,
-                    inplace=True,
-                    expert_map=self.expert_map,
-                    w1_scale=gate_up_proj_scale,
-                    w2_scale=down_proj_scale,
-                    block_shape=[128, 128],
-                    soft_fp8=fused_soft_fp8,
-                    experts_start_idx=self.experts_start_idx,
-                )
-
-            else:
+            final_indices = indices
+            final_weights = weights
+            if self.fuse_shared_experts:
                 indice_shape = indices.shape
-                new_indices = torch.empty(
+                final_indices = torch.empty(
                     (indice_shape[0], indice_shape[1] + 1),
                     dtype=indices.dtype,
                     device=indices.device,
                 )
 
-                new_weights = torch.empty(
+                final_weights = torch.empty(
                     (weights.shape[0], weights.shape[1] + 1),
                     dtype=weights.dtype,
                     device=weights.device,
                 )
 
                 chitu_backend.cuda_add_shared_experts(
-                    new_weights,
-                    new_indices,
+                    final_weights,
+                    final_indices,
                     weights,
                     indices,
                     self.n_routed_experts,
                     self.n_shared_experts,
                 )
                 del weights, indices
-                y = fused_experts(
-                    x,
-                    gate_up_proj_weight,
-                    down_proj_weight,
-                    topk_weights=new_weights,
-                    topk_ids=new_indices,
-                    use_fp8_w8a8=True,
-                    inplace=True,
-                    global_num_experts=self.n_routed_experts + self.n_shared_experts,
-                    expert_map=self.expert_map,
-                    w1_scale=gate_up_proj_scale,
-                    w2_scale=down_proj_scale,
-                    block_shape=[128, 128],
-                    soft_fp8=fused_soft_fp8,
-                )
 
+            y = fused_experts(
+                hidden_states=x,
+                w1=gate_up_proj_weight,
+                w2=down_proj_weight,
+                topk_weights=final_weights,
+                topk_ids=final_indices,
+                inplace=False,
+                use_fp8_w8a8=use_fp8_w8a8,
+                expert_map=self.expert_map,
+                w1_scale=gate_up_proj_scale,
+                w2_scale=down_proj_scale,
+                block_shape=[128, 128],
+                tokens_per_expert=tokens_per_expert,
+                soft_fp8=fused_soft_fp8,
+                experts_start_idx=self.experts_start_idx,
+                impl=impl,
+            )
         else:
             y = self.forward_iterative(x, weights, indices)
 
-        return y.view(shape)
+        return y
 
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:

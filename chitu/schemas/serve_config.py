@@ -46,6 +46,15 @@ class InferConfig:
     bind_thread_to_cpu: str = MISSING
     gpu_memory_utilization: float = MISSING
 
+    @dataclass
+    class MoEConfig:
+        prefill_token_dispatcher: str = MISSING
+        decode_token_dispatcher: str = MISSING
+        prefill_experts_impl: str = MISSING
+        decode_experts_impl: str = MISSING
+
+    moe: MoEConfig = MISSING
+
 
 @dataclass
 class RequestConfig:
