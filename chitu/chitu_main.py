@@ -263,11 +263,6 @@ def chitu_init(args, logging_level=None):
                 f"Unsupported infer.bind_process_to_cpu={args.infer.bind_process_to_cpu}"
             )
 
-    if args.infer.use_cuda_graph:
-        if args.infer.attn_type == "flash_infer":
-            args.infer.use_cuda_graph = False
-            args.infer.cuda_graph_backend = "flash_infer"
-
     # Check checkpoint exists
     check_checkpoint_path(args)
 

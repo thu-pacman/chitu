@@ -349,7 +349,11 @@ def test_flashinfer_prefill_ragged_qkvo(bs, n_heads, n_kv_heads, head_dim):
                     "tp_size": 1,
                     "cache_type": "paged",
                 },
-                "models": {"n_heads": 4, "n_kv_heads": 1},
+                "models": {
+                    "n_heads": n_heads,
+                    "n_kv_heads": n_kv_heads,
+                    "head_dim": head_dim,
+                },
             }
         ),
         need_ensure=False,
@@ -412,7 +416,11 @@ def test_flashinfer_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head
                     "tp_size": 1,
                     "cache_type": "skew",
                 },
-                "models": {"n_heads": n_heads, "n_kv_heads": n_kv_heads},
+                "models": {
+                    "n_heads": n_heads,
+                    "n_kv_heads": n_kv_heads,
+                    "head_dim": head_dim,
+                },
             }
         ),
         need_ensure=False,
@@ -495,7 +503,11 @@ def test_flashinfer_decode_paged_kv(prev_seq_len_list, n_heads, n_kv_heads, head
                     "tp_size": 1,
                     "cache_type": "paged",
                 },
-                "models": {"n_heads": n_heads, "n_kv_heads": n_kv_heads},
+                "models": {
+                    "n_heads": n_heads,
+                    "n_kv_heads": n_kv_heads,
+                    "head_dim": head_dim,
+                },
             }
         ),
         need_ensure=False,

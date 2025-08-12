@@ -1254,8 +1254,6 @@ class FlashInferBackend(TritonAttnBackend):
             or self.args.infer.mla_absorb == "absorb"
         )
         self.is_paged = self.args.infer.cache_type == "paged"
-        cuda_graph_backend = getattr(self.args.infer, "cuda_graph_backend", "none")
-        self.use_cuda_graph = cuda_graph_backend == "flash_infer"
 
         # FlashInfer accepts block tables for Q and KV in CSR format.
         # - For Q, it is trivial because the length for each sample is 1.
@@ -1264,6 +1262,11 @@ class FlashInferBackend(TritonAttnBackend):
         # `flashinfer.mla.BatchMLAPagedAttentionWrapper` when cuda graph is enabled
         max_batch_size = self.args.infer.max_reqs
         self.fixed_bs = self.get_fixed_batch_size(max_batch_size)
+        self.head_dim = (
+            self.args.models.head_dim
+            if hasattr(self.args.models, "head_dim")
+            else self.args.models.dim // self.args.models.n_heads
+        )
         self.q_indptr = StaticTensor(
             torch.empty(max_batch_size + 1, dtype=torch.int32, device="cuda")
         )
@@ -1298,7 +1301,7 @@ class FlashInferBackend(TritonAttnBackend):
                 self.decode_wrapper[bs] = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                     self.decode_wrapper_workspace_buffer,
                     "NHD",
-                    use_cuda_graph=self.use_cuda_graph,
+                    use_cuda_graph=False,
                     paged_kv_indptr_buffer=self.kv_indptr.get()[: bs + 1],
                     paged_kv_indices_buffer=self.kv_indices.get(),
                     paged_kv_last_page_len_buffer=self.last_page_len[:bs],
@@ -1311,7 +1314,7 @@ class FlashInferBackend(TritonAttnBackend):
             self.qk_nope_head_dim = self.args.models.qk_nope_head_dim
             self.mla_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
                 torch.empty(128 * 1024 * 1024, dtype=torch.int8).cuda(),
-                use_cuda_graph=self.use_cuda_graph,
+                use_cuda_graph=False,
                 qo_indptr=self.q_indptr.get(),
                 kv_indptr=self.kv_indptr.get(),
                 kv_indices=self.kv_indices.get(),
@@ -1370,6 +1373,7 @@ class FlashInferBackend(TritonAttnBackend):
         block_table,
         block_size,
         softmax_scale=None,
+        **kwargs,
     ):
         raw_batch_size = prev_seq_len.batch_size
         batch_size = self.match_batch_size(raw_batch_size)
@@ -1419,6 +1423,33 @@ class FlashInferBackend(TritonAttnBackend):
                 sm_scale=softmax_scale,
                 q_data_type=torch.get_default_dtype(),
                 kv_data_type=torch.get_default_dtype(),
+            )
+
+        for i in range(raw_batch_size):
+            self.last_page_len[i] = prev_seq_len.lens_list[i] + 1
+
+        def is_new_seq_len():
+            for i in range(batch_size):
+                if self.record_pre_page_len[i] != self.last_page_len[i]:
+                    return True
+            return False
+
+        if is_new_seq_len():
+            self.record_pre_page_len.copy_(self.last_page_len)
+            self.decode_wrapper[batch_size].plan(
+                self.kv_indptr.get()[: batch_size + 1],
+                self.kv_indices.get(),
+                self.last_page_len[:batch_size],
+                self.local_n_heads,
+                self.local_n_kv_heads,
+                self.head_dim,
+                block_size,
+                pos_encoding_mode="NONE",
+                q_data_type=torch.get_default_dtype(),
+                kv_data_type=torch.get_default_dtype(),
+                window_left=kwargs.get("window_size", (-1, -1))[0],
+                logits_soft_cap=kwargs.get("softcap", 0.0),
+                sm_scale=softmax_scale,
             )
 
     @override
@@ -1540,37 +1571,11 @@ class FlashInferBackend(TritonAttnBackend):
         # append kv to cache
         if k is not None:
             assert v is not None
-            for i in range(raw_batch_size):
-                self.last_page_len[i] = prev_seq_len.lens_list[i] + 1
             append_to_paged_kv_cache(
                 k_cache, block_table, k, prev_seq_len.lens_tensor_device
             )
             append_to_paged_kv_cache(
                 v_cache, block_table, v, prev_seq_len.lens_tensor_device
-            )
-
-        def is_new_seq_len():
-            for i in range(batch_size):
-                if self.record_pre_page_len[i] != self.last_page_len[i]:
-                    return True
-            return False
-
-        if is_new_seq_len():
-            self.record_pre_page_len.copy_(self.last_page_len)
-            self.decode_wrapper[batch_size].plan(
-                self.kv_indptr.get()[: batch_size + 1],
-                self.kv_indices.get(),
-                self.last_page_len[:batch_size],
-                self.local_n_heads,
-                self.local_n_kv_heads,
-                head_dim,
-                block_size,
-                pos_encoding_mode="NONE",
-                q_data_type=q.dtype,
-                kv_data_type=k_cache.dtype,
-                window_left=window_size[0],
-                logits_soft_cap=softcap,
-                sm_scale=softmax_scale,
             )
 
         q = self.pad_tensor(q, batch_size)
