@@ -336,13 +336,9 @@ class AttentionDeepSeekV3(Attention):
             k = k.view(bsz, seqlen, self.n_local_heads, -1)
             v = v.view(bsz, seqlen, self.n_local_heads, -1)
 
-            cache = self.cache.get_cache_decode(self.layer_id)
-            cache_k = cache[0]
-            cache_v = cache[1]
-            x = self.attn_backend.decode_dense_kv(
+            x = self.attn_backend.decode(
                 q,
-                cache_k,
-                cache_v,
+                self.cache.get_accessor(self.layer_id),
                 k,
                 v,
                 prev_seq_len=self.cache.prev_seq_len,
@@ -355,82 +351,21 @@ class AttentionDeepSeekV3(Attention):
                 x.view(bsz * seqlen, -1), freqs_cis_cos, freqs_cis_sin
             )
 
-            kv_cache, _ = self.cache.get_cache_decode(self.layer_id)
             this_kv = kv[..., : self.kv_lora_rank]
 
             # In-place update to `this_kv`, which is part of `kv`
             self.kv_a_layernorm(this_kv, compute_dtype=kv.dtype, out=this_kv)
 
-            x = self.attn_backend.mla_decode_dense_kv(
+            x = self.attn_backend.mla_decode(
                 q_nope,
                 q_pe,
-                kv_cache,
+                self.cache.get_accessor(self.layer_id),
                 kv.view(bsz, seqlen, 1, -1),
                 prev_seq_len=self.cache.prev_seq_len,
                 next_seq_len=self.cache.next_seq_len,
                 softmax_scale=self.softmax_scale,
             )
 
-            if self.mla_absorb == "absorb-without-precomp":
-                x = self.kv_b_proj_absorb_2(x)
-
-        else:
-            raise NotImplementedError(
-                f"MLA absorb mode {self.mla_absorb} not supported"
-            )
-
-        x = self._run_output_linear(x)
-        return x
-
-    def decode_forward_paged(
-        self, x: torch.Tensor, freqs_cis_cos: torch.Tensor, freqs_cis_sin: torch.Tensor
-    ):
-        block_table = self.cache.get_gpu_block_table()
-
-        bsz, seqlen, _ = x.size()
-
-        if self.mla_absorb == "none":
-            q, k, v = self._run_linear(
-                x.view(bsz * seqlen, -1), freqs_cis_cos, freqs_cis_sin
-            )
-            q = q.view(bsz, seqlen, self.n_local_heads, -1)
-            k = k.view(bsz, seqlen, self.n_local_heads, -1)
-            v = v.view(bsz, seqlen, self.n_local_heads, -1)
-
-            paged_k_cache, paged_v_cache = self.cache.get_paged_kv_cache(self.layer_id)
-            x = self.attn_backend.decode_paged_kv(
-                q,
-                paged_k_cache,
-                paged_v_cache,
-                k,
-                v,
-                prev_seq_len=self.cache.prev_seq_len,
-                next_seq_len=self.cache.next_seq_len,
-                block_table=block_table,
-                softmax_scale=self.softmax_scale,
-            ).view(bsz, seqlen, self.n_local_heads, self.v_head_dim)
-
-        elif self.mla_absorb == "absorb-without-precomp" or self.mla_absorb == "absorb":
-            q_nope, q_pe, kv = self._run_linear(
-                x.view(bsz * seqlen, -1), freqs_cis_cos, freqs_cis_sin
-            )
-
-            paged_kv_cache, _ = self.cache.get_paged_kv_cache(self.layer_id)
-            this_kv = kv[..., : self.kv_lora_rank]
-
-            # In-place update to `this_kv`, which is part of `kv`
-            self.kv_a_layernorm(this_kv, compute_dtype=kv.dtype, out=this_kv)
-
-            x = self.attn_backend.mla_decode_paged_kv(
-                q_nope,
-                q_pe,
-                paged_kv_cache,
-                kv.view(bsz, seqlen, 1, -1),
-                prev_seq_len=self.cache.prev_seq_len,
-                next_seq_len=self.cache.next_seq_len,
-                block_table=block_table,
-                softmax_scale=self.softmax_scale,
-            )
             if self.mla_absorb == "absorb-without-precomp":
                 x = self.kv_b_proj_absorb_2(x)
 

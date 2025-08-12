@@ -4,6 +4,7 @@
 
 from typing import Dict, List, Sequence, Optional
 from typing_extensions import override
+from dataclasses import dataclass
 from logging import getLogger
 import torch
 from collections import deque
@@ -13,6 +14,30 @@ from chitu.static_tensor import StaticTensor
 from chitu.batched_seq_len import BatchedSeqLen
 
 logger = getLogger(__name__)
+
+
+class KVCacheAccessor:
+    """
+    Base class for KV cache accessors
+
+    A KV cache accessor locates specific tokens of a specific layer in a KV cache. Data
+    can be read from the accessor, and updates to the accessor apply to the KV cache.
+    """
+
+    pass
+
+
+@dataclass
+class PagedKVCacheAccessor(KVCacheAccessor):
+    block_table: torch.Tensor
+    k: Optional[torch.Tensor]
+    v: Optional[torch.Tensor]
+
+
+@dataclass
+class DenseKVCacheAccessor(KVCacheAccessor):
+    k: Optional[torch.Tensor]  # shape: [num_req, max_seqlen + 1, n_kv_heads, head_dim]
+    v: Optional[torch.Tensor]  # shape: [num_req, max_seqlen + 1, n_kv_heads, head_dim]
 
 
 class KVCacheManagerBase:
@@ -119,6 +144,9 @@ class KVCacheManagerBase:
                 device=self.device,
             )
         )
+
+    def get_accessor(self, layer_id: int) -> KVCacheAccessor:
+        raise NotImplementedError()
 
     def finalize_cache_single_decode(self, req_ids: List[str]):
         for req_id in req_ids:
@@ -354,7 +382,8 @@ class PagedKVCacheManager(KVCacheManagerBase):
     def get_gpu_block_table(self):
         return self.gpu_block_table.get()
 
-    def get_paged_kv_cache(self, layer_id: int):
+    @override
+    def get_accessor(self, layer_id: int) -> PagedKVCacheAccessor:
         ret_k = (
             self.paged_k_cache[layer_id - self.begin_layer_id]
             if self.paged_k_cache is not None
@@ -365,7 +394,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
             if self.paged_v_cache is not None
             else None
         )
-        return ret_k, ret_v
+        return PagedKVCacheAccessor(self.get_gpu_block_table(), ret_k, ret_v)
 
     def free_req_cache_blocks(self, req_id: str):
         self.timers("free_req_cache_blocks").start()
@@ -386,7 +415,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.timers("finalize_cache_all_decode").stop()
 
 
-class KVCacheManagerSkewAware(KVCacheManagerBase):
+class DenseKVCacheManager(KVCacheManagerBase):
     def __init__(
         self,
         begin_layer_id,
@@ -591,8 +620,8 @@ class KVCacheManagerSkewAware(KVCacheManagerBase):
         self.timers("cache_prepare").stop()
 
     # Decode:
-    # return [2, num_req, max_seqlen + 1, n_local_kv_heads, head_dim]
-    def get_cache_decode(self, layer_id: int):
+    @override
+    def get_accessor(self, layer_id: int) -> DenseKVCacheAccessor:
         ret_k = (
             self.k_prepared_cache[layer_id - self.begin_layer_id]
             if self.k_prepared_cache is not None
@@ -603,7 +632,7 @@ class KVCacheManagerSkewAware(KVCacheManagerBase):
             if self.v_prepared_cache is not None
             else None
         )
-        return ret_k, ret_v
+        return DenseKVCacheAccessor(ret_k, ret_v)
 
     # Decode:
     @override

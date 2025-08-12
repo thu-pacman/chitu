@@ -28,7 +28,7 @@ from chitu.attn_backend import (
     NpuAttnBackend,
     HybridAttnBackend,
 )
-from chitu.cache_manager import KVCacheManagerSkewAware, PagedKVCacheManager
+from chitu.cache_manager import DenseKVCacheManager, PagedKVCacheManager
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
 from chitu.distributed.parallel_state import get_pp_group, initialize_parallel_groups
@@ -292,7 +292,7 @@ class Backend:
                 **kv_cache_kvargs,
             )
         elif args.infer.cache_type == "skew":
-            return KVCacheManagerSkewAware(
+            return DenseKVCacheManager(
                 local_begin_layer_id,
                 local_end_layer_id,
                 max_seq_len=args.infer.max_seq_len,

@@ -5,6 +5,7 @@ from omegaconf import OmegaConf
 import triton
 
 from chitu.attn_backend import RefAttnBackend, TritonAttnBackend, FlashInferBackend
+from chitu.cache_manager import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.device_type import is_muxi
 from chitu.global_vars import set_global_args
 from chitu.utils import try_import_opt_dep
@@ -72,20 +73,18 @@ def test_triton_mla_decode_paged_kv(
     y = attn.mla_decode_paged_kv(
         q_nope,
         q_pe,
-        kv_cache,
+        PagedKVCacheAccessor(page_table, kv_cache, None),
         this_kv,
         prev_seq_len,
         next_seq_len,
-        page_table,
     )
     y_ref = attn_ref.mla_decode_paged_kv(
         q_nope,
         q_pe,
-        kv_cache,
+        PagedKVCacheAccessor(page_table, kv_cache, None),
         this_kv,
         prev_seq_len,
         next_seq_len,
-        page_table,
     )
 
     assert torch.allclose(y, y_ref, atol=1e-2, rtol=1e-2)
@@ -225,8 +224,7 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
     v_cache1 = v_cache.clone()
     out = attn_backend.decode_dense_kv(
         q,
-        k_cache1,
-        v_cache1,
+        DenseKVCacheAccessor(k_cache1, v_cache1),
         k,
         v,
         prev_seq_len=prev_seq_len,
@@ -241,8 +239,7 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
     v_cache2 = v_cache.clone()
     ref_out = ref_backend.decode_dense_kv(
         q,
-        k_cache2,
-        v_cache2,
+        DenseKVCacheAccessor(k_cache2, v_cache2),
         k,
         v,
         prev_seq_len=prev_seq_len,
@@ -320,13 +317,11 @@ def test_decode_paged_kv(
     )
     out = attn_backend.decode_paged_kv(
         q,
-        k_cache1,
-        v_cache1,
+        PagedKVCacheAccessor(block_table, k_cache1, v_cache1),
         k,
         v,
         prev_seq_len=prev_seq_len,
         next_seq_len=next_seq_len,
-        block_table=block_table,
         causal=False,
         window_size=(-1, -1),
         softcap=0.0,
@@ -337,13 +332,11 @@ def test_decode_paged_kv(
     v_cache2 = v_cache.clone()
     ref_out = ref_backend.decode_paged_kv(
         q,
-        k_cache2,
-        v_cache2,
+        PagedKVCacheAccessor(block_table, k_cache2, v_cache2),
         k,
         v,
         prev_seq_len=prev_seq_len,
         next_seq_len=next_seq_len,
-        block_table=block_table,
         causal=False,
         window_size=(-1, -1),
         softcap=0.0,
@@ -495,11 +488,10 @@ def benchmark_mla_decode_paged_kv(
             lambda: attn.mla_decode_paged_kv(
                 q_nope,
                 q_pe,
-                kv_cache,
+                PagedKVCacheAccessor(page_table, kv_cache, None),
                 this_kv,
                 prev_seq_len,
                 next_seq_len,
-                page_table,
             )
         )
     elif provider == "flashinfer":
@@ -537,7 +529,7 @@ def benchmark_mla_decode_paged_kv(
             lambda: flashinfer_backend.mla_decode_paged_kv(
                 q_nope,
                 q_pe,
-                kv_cache,
+                PageKVCacheAccessor(page_table, kv_cache, None),
                 this_kv,
                 prev_seq_len,
                 next_seq_len,

@@ -258,62 +258,15 @@ class AttentionHFLlama(Attention):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        cache = self.cache.get_cache_decode(self.layer_id)
-        cache_k = cache[0]
-        cache_v = cache[1]
-        output = self.attn_backend.decode_dense_kv(
+        output = self.attn_backend.decode(
             xq,
-            cache_k,
-            cache_v,
+            self.cache.get_accessor(self.layer_id),
             xk,
             xv,
             prev_seq_len=self.cache.prev_seq_len,
             next_seq_len=self.cache.next_seq_len,
         ).view(bsz, seqlen, -1)
 
-        return self._run_output_linear(output)
-
-    def decode_forward_paged(
-        self, x: torch.Tensor, freqs_cis_cos: torch.Tensor, freqs_cis_sin: torch.Tensor
-    ):
-        # 因为量化后x是个tuple，所以取shape的时候放linear后面
-        xq, xk, xv = self._run_linear(x)
-        bsz, seqlen, _ = xq.shape
-        assert seqlen == 1, "decode_forward only supports single token decoding"
-
-        xq = xq.view(-1, self.n_local_heads, self.head_dim).contiguous()
-        xk = xk.view(-1, self.n_local_kv_heads, self.head_dim).contiguous()
-        xv = xv.view(-1, self.n_local_kv_heads, self.head_dim).contiguous()
-
-        if hasattr(self, "q_norm"):
-            xq = self.q_norm(xq)
-        if hasattr(self, "k_norm"):
-            xk = self.k_norm(xk)
-
-        xq, xk = apply_rotary_pos_emb(
-            xq,
-            xk,
-            freqs_cis_cos,
-            freqs_cis_sin,
-            rotary_type=self.rotary_type,
-        )
-
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-
-        block_table = self.cache.get_gpu_block_table()
-        paged_k_cache, paged_v_cache = self.cache.get_paged_kv_cache(self.layer_id)
-        output = self.attn_backend.decode_paged_kv(
-            xq,
-            paged_k_cache,
-            paged_v_cache,
-            xk,
-            xv,
-            prev_seq_len=self.cache.prev_seq_len,
-            next_seq_len=self.cache.next_seq_len,
-            block_table=block_table,
-        ).view(bsz, seqlen, -1)
         return self._run_output_linear(output)
 
 
