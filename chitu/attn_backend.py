@@ -1291,10 +1291,10 @@ class FlashInferBackend(TritonAttnBackend):
         ).cuda()
 
         if self.is_paged == True:
-            self.last_page_len = torch.empty(
+            self.last_page_len = torch.zeros(
                 max_batch_size, dtype=torch.int32, device="cuda"
             )
-            self.record_pre_page_len = torch.empty(
+            self.record_pre_page_len = torch.zeros(
                 max_batch_size, dtype=torch.int32, device="cuda"
             )
             for bs in self.fixed_bs:
@@ -1373,7 +1373,8 @@ class FlashInferBackend(TritonAttnBackend):
         block_table,
         block_size,
         softmax_scale=None,
-        **kwargs,
+        window_size=(-1, -1),
+        softcap=0.0,
     ):
         raw_batch_size = prev_seq_len.batch_size
         batch_size = self.match_batch_size(raw_batch_size)
@@ -1447,8 +1448,8 @@ class FlashInferBackend(TritonAttnBackend):
                 pos_encoding_mode="NONE",
                 q_data_type=torch.get_default_dtype(),
                 kv_data_type=torch.get_default_dtype(),
-                window_left=kwargs.get("window_size", (-1, -1))[0],
-                logits_soft_cap=kwargs.get("softcap", 0.0),
+                window_left=window_size[0],
+                logits_soft_cap=softcap,
                 sm_scale=softmax_scale,
             )
 
