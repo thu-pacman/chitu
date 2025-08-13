@@ -68,6 +68,9 @@ class ServeConfigRules(Callback):
                     f"model {model_name} is not compatible with flash_mla"
                 )
 
+        if model_type == "hf-gpt-oss" and attn_type != "ref":
+            self._exit_with_error(f"model {model_name} is only compatible with ref")
+
         tokenizer_type = config.models.tokenizer_type
         if tokenizer_type not in {"hf", "tiktoken"}:
             self._exit_with_error(

@@ -37,6 +37,7 @@ class Qwen3MoeGate(MoeGate):
             route_scale=1,
             n_experts=params.num_experts,
             bias=None,
+            e_score_correction_bias=None,
             norm_prob=params.norm_topk_prob,
         )
 

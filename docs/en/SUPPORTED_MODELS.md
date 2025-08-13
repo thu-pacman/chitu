@@ -126,3 +126,7 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=Qwen3-Coder-480B-A35B-Instruct-fp8` command line argument when starting Chitu
 - glm-4-9b-chat
   Usage: Append `models=glm-4-9b-chat` command line argument when starting Chitu
+- gpt-oss-120b-BF16
+  Usage: Append `models=gpt-oss-120b-BF16` command line argument when starting Chitu
+- gpt-oss-20b-BF16
+  Usage: Append `models=gpt-oss-20b-BF16` command line argument when starting Chitu

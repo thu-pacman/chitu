@@ -561,6 +561,7 @@ class Backend:
                 "hf-qwen-3-moe",
                 "hf-glm-z1",
                 "hf-glm-4-moe",
+                "hf-gpt-oss",
                 "hf-mixtral",
                 "deepseek-v3",
             }:
@@ -937,7 +938,7 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
     }
 
     translation_gate = {
-        ".mlp.gate.bias": ".exp_probs_b.bias",
+        ".mlp.gate.e_score_correction_bias": ".exp_probs_b.bias",
         ".mlp.gate.weight": ".ffn_gate_inp.weight",
         ".post_attention_layernorm.weight": ".ffn_norm.weight",
     }

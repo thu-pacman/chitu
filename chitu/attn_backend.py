@@ -87,6 +87,7 @@ class AttnBackend(abc.ABC):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         """
         Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -138,6 +139,7 @@ class AttnBackend(abc.ABC):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         """
         If k and v are not None, kv_cache will be updated *inplace* with the new values from k and v.
@@ -204,6 +206,7 @@ class AttnBackend(abc.ABC):
                 window_size=window_size,
                 softcap=softcap,
                 softmax_scale=softmax_scale,
+                sinks=sinks,
             )
         elif isinstance(kv_cache, PagedKVCacheAccessor):
             return self.decode_paged_kv(
@@ -217,6 +220,7 @@ class AttnBackend(abc.ABC):
                 window_size=window_size,
                 softcap=softcap,
                 softmax_scale=softmax_scale,
+                sinks=sinks,
             )
         else:
             raise NotImplementedError()
@@ -237,6 +241,7 @@ class AttnBackend(abc.ABC):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         raise NotImplementedError()
 
@@ -254,6 +259,7 @@ class AttnBackend(abc.ABC):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         raise NotImplementedError()
 
@@ -410,6 +416,7 @@ class FlashAttnBackend(AttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         # These are arguments only accpeted by new enough flash_attn,
         # so don't pass them if they are set to default values
@@ -445,6 +452,7 @@ class FlashAttnBackend(AttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         # These are arguments only accpeted by new enough flash_attn,
         # so don't pass them if they are set to default values
@@ -479,6 +487,7 @@ class FlashAttnBackend(AttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         # These are arguments only accpeted by new enough flash_attn,
         # so don't pass them if they are set to default values
@@ -559,6 +568,7 @@ class RefAttnBackend(AttnBackend):
         upcast=True,
         reorder_ops=False,
         softmax_scale=None,
+        sinks=None,
     ):
         """
         Arguments:
@@ -615,7 +625,15 @@ class RefAttnBackend(AttnBackend):
             scores.masked_fill_(local_mask, float("-inf"))
         if attn_bias is not None:
             scores = scores + attn_bias
-        attention = torch.softmax(scores, dim=-1).to(v.dtype)
+        if sinks is not None:
+            sinks = sinks.reshape(1, -1, 1, 1).expand(
+                scores.shape[0], -1, scores.shape[-2], -1
+            )
+            scores = torch.cat([scores, sinks], dim=-1)
+            attention = torch.softmax(scores, dim=-1).to(v.dtype)
+            attention = attention[..., :-1]
+        else:
+            attention = torch.softmax(scores, dim=-1).to(v.dtype)
         # Some rows might be completely masked out so we fill them with zero instead of NaN
         if window_size[0] >= 0 or window_size[1] >= 0:
             attention = attention.masked_fill(
@@ -645,6 +663,7 @@ class RefAttnBackend(AttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         q_batch = torch.zeros(
             (seqlens.batch_size,) + tuple(q.shape),
@@ -679,6 +698,7 @@ class RefAttnBackend(AttnBackend):
             window_size=window_size,
             softcap=softcap,
             softmax_scale=softmax_scale,
+            sinks=sinks,
         )
         output = torch.empty(
             (seqlens.total_len,) + output_batch.shape[2:],
@@ -705,6 +725,7 @@ class RefAttnBackend(AttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         arange = einops.rearrange(
             torch.arange(kv_cache.k.shape[1], device=kv_cache.v.device), "s -> 1 s"
@@ -732,6 +753,7 @@ class RefAttnBackend(AttnBackend):
             window_size=window_size,
             softcap=softcap,
             softmax_scale=softmax_scale,
+            sinks=sinks,
         )
         return output
 
@@ -749,6 +771,7 @@ class RefAttnBackend(AttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         k_cache_paged = kv_cache.k
         v_cache_paged = kv_cache.v
@@ -819,6 +842,7 @@ class RefAttnBackend(AttnBackend):
             window_size=window_size,
             softcap=softcap,
             softmax_scale=softmax_scale,
+            sinks=sinks,
         )
         return output
 
@@ -851,6 +875,7 @@ class TritonAttnBackend(RefAttnBackend):
         window_size=(-1, -1),
         softcap=0,
         softmax_scale=None,
+        sinks=None,
     ):
         B, local_n_heads, _ = q.shape
         _, _, v_n_hidden = v.shape
@@ -1058,6 +1083,7 @@ class TritonAttnBackend(RefAttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         # triton has bug, when version < 3.2.0, the "~" operator on bool vector will get wrong results
         assert self.triton_latest_enough
@@ -1125,6 +1151,7 @@ class TritonAttnBackend(RefAttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         if k is None and q is None:
             seqlens = prev_seq_len.lens_tensor_device
@@ -1508,6 +1535,7 @@ class FlashInferBackend(TritonAttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         # TODO: we do not support DeepSeek-R1 in flashinfer prefill step currently
         num_qo_heads = q.shape[-2]
@@ -1543,6 +1571,7 @@ class FlashInferBackend(TritonAttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         raw_batch_size = q.shape[0]
         batch_size = self.match_batch_size(raw_batch_size)
@@ -1576,6 +1605,7 @@ class FlashInferBackend(TritonAttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         raw_batch_size = q.shape[0]
         batch_size = self.match_batch_size(raw_batch_size)
@@ -1677,6 +1707,7 @@ class NpuAttnBackend(RefAttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         if self.args.infer.mla_absorb.lower() != "none":
             dim_gap = k.shape[-1] - v.shape[-1]
@@ -1742,6 +1773,7 @@ class NpuAttnBackend(RefAttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         # [BSND] -> [BSH]
         q = q.view(q.shape[0], q.shape[1], -1).contiguous()
@@ -1780,6 +1812,7 @@ class NpuAttnBackend(RefAttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         # [BSND] -> [BSH]
         q = q.view(q.shape[0], q.shape[1], -1).contiguous()
@@ -1893,6 +1926,7 @@ class HybridAttnBackend(AttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         self.current_backend = self._select_backend(seqlens.batch_size)
         return self.current_backend.prefill_ragged_qkvo(
@@ -1904,6 +1938,7 @@ class HybridAttnBackend(AttnBackend):
             window_size=window_size,
             softcap=softcap,
             softmax_scale=softmax_scale,
+            sinks=sinks,
         )
 
     @override
@@ -1920,6 +1955,7 @@ class HybridAttnBackend(AttnBackend):
         window_size=(-1, -1),
         softcap=0.0,
         softmax_scale=None,
+        sinks=None,
     ):
         batch_size = q.shape[0]
         self.current_backend = self._select_backend(batch_size)
@@ -1934,6 +1970,7 @@ class HybridAttnBackend(AttnBackend):
             window_size=window_size,
             softcap=softcap,
             softmax_scale=softmax_scale,
+            sinks=sinks,
         )
 
     @override
@@ -1950,6 +1987,7 @@ class HybridAttnBackend(AttnBackend):
         window_size=(-1, -1),
         softcap=0.0,
         softmax_scale=None,
+        sinks=None,
     ):
         batch_size = q.shape[0]
         self.current_backend = self._select_backend(batch_size)
@@ -1964,6 +2002,7 @@ class HybridAttnBackend(AttnBackend):
             window_size=window_size,
             softcap=softcap,
             softmax_scale=softmax_scale,
+            sinks=sinks,
         )
 
     def prepare_metadata_for_decode(self, *args, **kwargs):

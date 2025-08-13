@@ -524,7 +524,10 @@ class GateDeepSeekV3(MoeGate):
             score_func=args.score_func,
             route_scale=args.route_scale,
             n_experts=args.n_routed_experts,
-            bias=nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32)),
+            bias=None,
+            e_score_correction_bias=nn.Parameter(
+                torch.empty(args.n_routed_experts, dtype=torch.float32)
+            ),
             norm_prob=args.norm_topk_prob,
         )
 
@@ -1241,7 +1244,6 @@ class TransformerDeepSeekV3(Transformer):
                 if "self_attn.rotary_emb.inv_freq" not in k:
                     name = k
                     name = name.replace(".weight_scale_inv", ".scale")
-                    name = name.replace(".e_score_correction_bias", ".bias")
                     state_dict[name] = value
         super().load_state_dict_parallel(
             state_dict, *args, skip_preprocess=skip_preprocess, **kwargs

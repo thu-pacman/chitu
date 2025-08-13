@@ -372,9 +372,10 @@ class TransformerBlockHFLlama(TransformerBlock):
         rotary_type="separated",
         mlp_type=FeedForwardHFLlama,
         checkpoint_prefix="",
+        attn_type=AttentionHFLlama,
     ):
         super().__init__(layer_id, args, cache, attn_backend, op_impl)
-        self.self_attn = AttentionHFLlama(
+        self.self_attn = attn_type(
             args,
             layer_id,
             cache,
@@ -750,7 +751,10 @@ class TransformerHFLlama(Transformer):
                 # QKV and gate/up layers might already be merged in the checkpoint, but they should be split
                 # for TP. After we process for TP, we merge them back.
                 state_dict = self._process_state_dict_for_splitting_qkv(state_dict)
-                state_dict = self._process_state_dict_for_splitting_gate_up(state_dict)
+                if not self.params.type == "hf-gpt-oss":  # already splitted
+                    state_dict = self._process_state_dict_for_splitting_gate_up(
+                        state_dict
+                    )
 
         n_kv_heads = (
             self.params.n_heads
