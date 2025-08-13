@@ -223,7 +223,7 @@ class AttentionHFLlama(Attention):
         )
 
         self.cache.finalize_cache_bylayer_prefill(
-            xk, xv, self.cache.curr_req_ids, self.cache.next_seq_len, self.layer_id
+            xk, xv, self.cache.curr_req_ids, self.cache.seq_len_delta.new, self.layer_id
         )
         output = self.attn_backend.prefill_ragged_qkvo(
             xq, xk, xv, seq_len, causal=True
@@ -263,8 +263,8 @@ class AttentionHFLlama(Attention):
             self.cache.get_accessor(self.layer_id),
             xk,
             xv,
-            prev_seq_len=self.cache.prev_seq_len,
-            next_seq_len=self.cache.next_seq_len,
+            prev_seq_len=self.cache.seq_len_delta.old,
+            next_seq_len=self.cache.seq_len_delta.new,
         ).view(bsz, seqlen, -1)
 
         return self._run_output_linear(output)
@@ -838,17 +838,17 @@ class TransformerHFLlama(Transformer):
     def prepare_freqs_cis_prefill(self, seq_len):
         return (
             self.rotary_emb.cos_cached[
-                self.cache.next_seq_len.position_ids_tensor_device
+                self.cache.seq_len_delta.new.position_ids_tensor_device
             ],
             self.rotary_emb.sin_cached[
-                self.cache.next_seq_len.position_ids_tensor_device
+                self.cache.seq_len_delta.new.position_ids_tensor_device
             ],
         )
 
     def prepare_freqs_cis_decode(self):
         return (
-            self.rotary_emb.cos_cached[self.cache.prev_seq_len.lens_tensor_device],
-            self.rotary_emb.sin_cached[self.cache.prev_seq_len.lens_tensor_device],
+            self.rotary_emb.cos_cached[self.cache.seq_len_delta.old.lens_tensor_device],
+            self.rotary_emb.sin_cached[self.cache.seq_len_delta.old.lens_tensor_device],
         )
 
 

@@ -11,7 +11,8 @@ from collections import deque
 
 from chitu.global_vars import get_slot_handle, get_timers, get_global_args
 from chitu.static_tensor import StaticTensor
-from chitu.batched_seq_len import BatchedSeqLen
+from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
+from chitu.ops import append_to_paged_kv_cache, append_to_dense_kv_cache
 
 logger = getLogger(__name__)
 
@@ -105,15 +106,29 @@ class KVCacheManagerBase:
             self.v_shape_per_sample = None
 
         self.req_id_to_seq_len: Dict[str, int] = {}
-        self.prev_seq_len = BatchedSeqLen([], self.device, max_batch_size=num_hot_req)
-        self.next_seq_len = BatchedSeqLen([], self.device, max_batch_size=num_hot_req)
+        self.seq_len_delta = BatchedSeqLenDelta(
+            device=self.device,
+            max_batch_size=num_hot_req,
+            max_total_delta_len=num_hot_req
+            * max_seq_len,  # TODO: Use chunk size once we support chunked prefill
+            cache_prefix_lens_tensor_device=True,
+            cache_position_ids_tensor_device=False,
+            cache_delta_position_ids_tensor_device=True,
+            cache_delta_seq_ids_tensor_device=True,
+        )
 
         self.curr_req_ids: Optional[List[str]] = None
 
         self.timers = get_timers()
 
     def prepare_cache_prefill(self, req_ids: List[str], next_seq_len: BatchedSeqLen):
-        self.next_seq_len.copy_from(next_seq_len)
+        prev_seq_len = BatchedSeqLen(
+            [0 for req_id in req_ids],
+            device=self.device,
+            cache_prefix_lens_tensor_device=False,
+            cache_position_ids_tensor_device=False,
+        )
+        self.seq_len_delta.copy_from(prev_seq_len, next_seq_len)
         self.curr_req_ids = req_ids
 
     def finalize_cache_bylayer_prefill(
@@ -132,17 +147,19 @@ class KVCacheManagerBase:
     def prepare_cache_decode(self, req_ids: List[str]):
         self.curr_req_ids = req_ids
 
-        self.prev_seq_len.copy_from(
+        self.seq_len_delta.copy_from(
             BatchedSeqLen(
                 [self.req_id_to_seq_len[req_id] for req_id in req_ids],
                 device=self.device,
-            )
-        )
-        self.next_seq_len.copy_from(
+                cache_prefix_lens_tensor_device=False,
+                cache_position_ids_tensor_device=False,
+            ),
             BatchedSeqLen(
                 [self.req_id_to_seq_len[req_id] + 1 for req_id in req_ids],
                 device=self.device,
-            )
+                cache_prefix_lens_tensor_device=False,
+                cache_position_ids_tensor_device=False,
+            ),
         )
 
     def get_accessor(self, layer_id: int) -> KVCacheAccessor:
@@ -263,6 +280,22 @@ class PagedKVCacheManager(KVCacheManagerBase):
     def get_num_blocks(self):
         return self.max_num_blocks
 
+    def _upd_gpu_block_table(self, req_ids: List[str]):
+        if get_global_args().infer.use_cuda_graph:
+            max_block_num = self.max_blocks_per_req
+        else:
+            max_block_num = max(len(self.block_table[req_id]) for req_id in req_ids)
+
+        all_block_ids = [
+            # pad the block ids to max_block_num
+            self.block_table[req_id]
+            + [0] * (max_block_num - len(self.block_table[req_id]))
+            for req_id in req_ids
+        ]
+        cpu_block_table_tensor = torch.tensor(all_block_ids, dtype=torch.int32)
+        self.gpu_block_table.set_shape(cpu_block_table_tensor.shape)
+        self.gpu_block_table.get().copy_(cpu_block_table_tensor, non_blocking=True)
+
     @override
     def prepare_cache_prefill(self, req_ids: List[str], next_seq_len: BatchedSeqLen):
         super().prepare_cache_prefill(req_ids, next_seq_len)
@@ -278,34 +311,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
             block_ids = [self.get_free_block() for _ in range(num_blocks_prepared)]
             self.block_table[req_id] = block_ids
 
-            # 计算每个元素对应的block id 和 block内的索引
-            num_full_block, remainder = divmod(seq_len, self.block_size)
-            if num_full_block > 0:
-                block_idxs.extend(
-                    [
-                        block_id
-                        for block_id in block_ids[:num_full_block]
-                        for _ in range(self.block_size)
-                    ]
-                )
-                indices_in_block.extend(
-                    [i for i in range(self.block_size) for _ in range(num_full_block)]
-                )
-            if remainder > 0:
-                block_idxs.extend([block_ids[num_full_block]] * remainder)
-                indices_in_block.extend([i for i in range(remainder)])
-
-        # 在不同layer间共享
-        self.new_tokens_block_indices = torch.tensor(
-            block_idxs,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.new_tokens_indices_in_block = torch.tensor(
-            indices_in_block,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        self._upd_gpu_block_table(req_ids)
 
     # Init block table and kv cache with kv generated during prefill
     @override
@@ -332,13 +338,21 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
         if xk is not None:
             assert self.paged_k_cache is not None
-            self.paged_k_cache[layer_idx].index_put_(
-                (self.new_tokens_block_indices, self.new_tokens_indices_in_block), xk
+            append_to_paged_kv_cache(
+                self.paged_k_cache[layer_idx],
+                self.get_gpu_block_table(),
+                xk.contiguous(),
+                self.seq_len_delta.delta_position_ids_tensor_device,
+                self.seq_len_delta.delta_seq_ids_tensor_device,
             )
         if xv is not None:
             assert self.paged_v_cache is not None
-            self.paged_v_cache[layer_idx].index_put_(
-                (self.new_tokens_block_indices, self.new_tokens_indices_in_block), xv
+            append_to_paged_kv_cache(
+                self.paged_v_cache[layer_idx],
+                self.get_gpu_block_table(),
+                xv.contiguous(),
+                self.seq_len_delta.delta_position_ids_tensor_device,
+                self.seq_len_delta.delta_seq_ids_tensor_device,
             )
 
         self.timers("finalize_cache_bylayer_prefill").stop()
@@ -350,23 +364,10 @@ class PagedKVCacheManager(KVCacheManagerBase):
         # Prepare enough block table for next decoding. When decoding, AttnBackend will fill new kv into
         # paged kv cache in place.
         for i, req_id in enumerate(req_ids):
-            if self.prev_seq_len.lens_list[i] % self.block_size == 0:
+            if self.seq_len_delta.old.lens_list[i] % self.block_size == 0:
                 self.block_table[req_id].append(self.get_free_block())
 
-        if get_global_args().infer.use_cuda_graph:
-            max_block_num = self.max_blocks_per_req
-        else:
-            max_block_num = max(len(self.block_table[req_id]) for req_id in req_ids)
-
-        all_block_ids = [
-            # pad the block ids to max_block_num
-            self.block_table[req_id]
-            + [0] * (max_block_num - len(self.block_table[req_id]))
-            for req_id in req_ids
-        ]
-        cpu_block_table_tensor = torch.tensor(all_block_ids, dtype=torch.int32)
-        self.gpu_block_table.set_shape(cpu_block_table_tensor.shape)
-        self.gpu_block_table.get().copy_(cpu_block_table_tensor, non_blocking=True)
+        self._upd_gpu_block_table(req_ids)
 
     def get_free_block(self):
         # TODO: When run out of free blocks, use scheduling and preemption in paper instead of exception
@@ -478,9 +479,14 @@ class DenseKVCacheManager(KVCacheManagerBase):
                 device=self.device,
             )
 
-        self.prepared_reqs: List[str] = []
-        self.rounded_max_seq = -1
         self.slot_handle = get_slot_handle()
+
+        args = get_global_args()
+        if args.infer.pp_size > 1 and args.infer.use_cuda_graph:
+            raise NotImplementedError(
+                "Setting infer.cache_type=skew and infer.use_cuda_graph=True "
+                "simultaneously is not supported when using pipeline parallelism"
+            )
 
     @override
     def prepare_cache_prefill(self, req_ids: List[str], next_seq_len: BatchedSeqLen):
@@ -502,6 +508,8 @@ class DenseKVCacheManager(KVCacheManagerBase):
                 req_id in self.req2slot
             ), f"Cannot allocate slot: {req_id} {self.req2slot}"
 
+        self._prepare_cache(req_ids)
+
     # Prefill:
     @override
     def finalize_cache_bylayer_prefill(
@@ -522,20 +530,22 @@ class DenseKVCacheManager(KVCacheManagerBase):
             xk = xk.view(xk.shape[0], -1).contiguous() if xk is not None else None
             xv = xv.view(xv.shape[0], -1).contiguous() if xv is not None else None
 
-        start = 0
-        for it, req_id in enumerate(req_ids):
-            end = start + next_seq_len.lens_list[it]
-            if xk is not None:
-                assert self.k_buffer is not None
-                self.k_buffer[layer_id - self.begin_layer_id][self.req2slot[req_id]][
-                    : next_seq_len.lens_list[it]
-                ] = xk[start:end]
-            if xv is not None:
-                assert self.v_buffer is not None
-                self.v_buffer[layer_id - self.begin_layer_id][self.req2slot[req_id]][
-                    : next_seq_len.lens_list[it]
-                ] = xv[start:end]
-            start = end
+        if xk is not None:
+            assert self.k_prepared_cache is not None
+            append_to_dense_kv_cache(
+                self.k_prepared_cache[layer_id - self.begin_layer_id],
+                xk.contiguous(),
+                self.seq_len_delta.delta_position_ids_tensor_device,
+                self.seq_len_delta.delta_seq_ids_tensor_device,
+            )
+        if xv is not None:
+            assert self.v_prepared_cache is not None
+            append_to_dense_kv_cache(
+                self.v_prepared_cache[layer_id - self.begin_layer_id],
+                xv.contiguous(),
+                self.seq_len_delta.delta_position_ids_tensor_device,
+                self.seq_len_delta.delta_seq_ids_tensor_device,
+            )
 
         self.timers("finalize_cache_bylayer_prefill").stop()
 
@@ -543,79 +553,24 @@ class DenseKVCacheManager(KVCacheManagerBase):
     @override
     def prepare_cache_decode(self, req_ids: List[str]):
         self.timers("cache_prepare").start()
-
         super().prepare_cache_decode(req_ids)
-        max_seq = self.prev_seq_len.max_len
-
-        args = get_global_args()
-        if args.infer.pp_size == 1:  # Non-PP
-            self.k_prepared_cache = (
-                None if self.k_buffer is None else self.k_buffer[:, : len(req_ids)]
-            )
-            self.v_prepared_cache = (
-                None if self.v_buffer is None else self.v_buffer[:, : len(req_ids)]
-            )
-
-        else:  # PP
-            if args.infer.use_cuda_graph:
-                raise NotImplementedError(
-                    "Setting infer.cache_type=skew and infer.use_cuda_graph=True "
-                    "simultaneously is not supported when using pipeline parallelism"
-                )
-
-            start_pos = self.hot_reqs.index(req_ids[0])
-            assert start_pos + len(req_ids) <= self.num_hot_req
-
-            limit = 16
-            rounded_max_seq = (max_seq + 1 + limit - 1) // limit * limit
-            if (
-                self.rounded_max_seq >= rounded_max_seq
-                and self.prepared_reqs == req_ids
-            ):
-                # prepared cache is long enough
-                self.timers("cache_prepare").stop()
-                return
-
-            self.rounded_max_seq = rounded_max_seq
-            self.prepared_reqs = req_ids
-
-            if self.k_buffer is not None:
-                k_prepared_cache_shape = list(self.k_buffer.shape)
-                k_prepared_cache_stride = list(self.k_buffer.stride())
-                k_prepared_cache_stride[0] = (
-                    k_prepared_cache_shape[1] * k_prepared_cache_stride[1]
-                )
-                k_prepared_cache_shape[1] = len(req_ids)
-                k_prepared_cache_shape[2] = rounded_max_seq
-                k_prepared_cache_offset = start_pos * k_prepared_cache_stride[1]
-                self.k_prepared_cache = torch.as_strided(
-                    self.k_buffer,
-                    k_prepared_cache_shape,
-                    k_prepared_cache_stride,
-                    k_prepared_cache_offset,
-                )
-            else:
-                self.k_prepared_cache = None
-
-            if self.v_buffer is not None:
-                v_prepared_cache_shape = list(self.v_buffer.shape)
-                v_prepared_cache_stride = list(self.v_buffer.stride())
-                v_prepared_cache_stride[0] = (
-                    v_prepared_cache_shape[1] * v_prepared_cache_stride[1]
-                )
-                v_prepared_cache_shape[1] = len(req_ids)
-                v_prepared_cache_shape[2] = rounded_max_seq
-                v_prepared_cache_offset = start_pos * v_prepared_cache_stride[1]
-                self.v_prepared_cache = torch.as_strided(
-                    self.v_buffer,
-                    v_prepared_cache_shape,
-                    v_prepared_cache_stride,
-                    v_prepared_cache_offset,
-                )
-            else:
-                self.v_prepared_cache = None
-
+        self._prepare_cache(req_ids)
         self.timers("cache_prepare").stop()
+
+    def _prepare_cache(self, req_ids: List[str]):
+        start_pos = self.hot_reqs.index(req_ids[0])
+        assert start_pos + len(req_ids) <= self.num_hot_req
+
+        self.k_prepared_cache = (
+            None
+            if self.k_buffer is None
+            else self.k_buffer[:, start_pos : start_pos + len(req_ids)]
+        )
+        self.v_prepared_cache = (
+            None
+            if self.v_buffer is None
+            else self.v_buffer[:, start_pos : start_pos + len(req_ids)]
+        )
 
     # Decode:
     @override

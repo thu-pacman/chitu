@@ -72,7 +72,7 @@ class AttentionHFGptOss(AttentionHFLlama):
         )
 
         self.cache.finalize_cache_bylayer_prefill(
-            xk, xv, self.cache.curr_req_ids, self.cache.next_seq_len, self.layer_id
+            xk, xv, self.cache.curr_req_ids, self.cache.seq_len_delta.new, self.layer_id
         )
         output = self.attn_backend.prefill_ragged_qkvo(
             xq,
@@ -118,8 +118,8 @@ class AttentionHFGptOss(AttentionHFLlama):
             self.cache.get_accessor(self.layer_id),
             xk,
             xv,
-            prev_seq_len=self.cache.prev_seq_len,
-            next_seq_len=self.cache.next_seq_len,
+            prev_seq_len=self.cache.seq_len_delta.old,
+            next_seq_len=self.cache.seq_len_delta.new,
             sinks=self.sinks,
             window_size=(self.sliding_window, -1),
         ).view(bsz, seqlen, -1)
