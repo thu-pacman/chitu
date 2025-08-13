@@ -39,7 +39,7 @@ if has_triton:
 torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 if has_torch_npu:
     from chitu.npu_utils import fused_experts_npu
-grouped_gemm, _ = try_import_opt_dep("grouped_gemm", "ascend_kernels")
+cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 
 logger = getLogger(__name__)
@@ -87,44 +87,44 @@ def linear_block_fp4_npu(
         # 三维的 x 需要squeeze到二维,在NpuAttnBackend mla_decode_paged_kv 中 x 会被 unsqueeze 到三维
         x = x.squeeze(1)
         if x.shape[0] <= 2:
-            grouped_gemm.grouped_gemv(
+            cinfer_ascendc.grouped_soft_gemv(
                 x,
                 weight,
                 scale=scale,
                 groupList=expert_tokens,
                 output=output,
-                type=grouped_gemm.GroupedGemmType.FP4,
+                computeType="fp4",
             )
         else:
-            grouped_gemm.grouped_gemm(
+            cinfer_ascendc.grouped_gemm(
                 x,
                 weight,
                 antiquantOffsetOptional=scale_off,
                 antiquantScaleOptional=scale,
                 groupListOptional=expert_tokens,
                 output=output,
-                type=grouped_gemm.GroupedGemmType.FP4,
+                computeType="fp4",
             )
         output = output.unsqueeze(1)
     else:
         if x.shape[0] <= 2:
-            grouped_gemm.grouped_gemv(
+            cinfer_ascendc.grouped_soft_gemv(
                 x,
                 weight,
                 scale=scale,
                 groupList=expert_tokens,
                 output=output,
-                type=grouped_gemm.GroupedGemmType.FP4,
+                computeType="fp4",
             )
         else:
-            grouped_gemm.grouped_gemm(
+            cinfer_ascendc.grouped_gemm(
                 x,
                 weight,
                 antiquantOffsetOptional=scale_off,
                 antiquantScaleOptional=scale,
                 groupListOptional=expert_tokens,
                 output=output,
-                type=grouped_gemm.GroupedGemmType.FP4,
+                computeType="fp4",
             )
 
     if bias is not None:

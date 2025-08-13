@@ -453,9 +453,7 @@ class Transformer(nn.Module):
             elif enable_expert_parallel and ".experts." in name:
                 partial_checkpoint[name] = param
             elif any(is_layer(s, name) for s in cpl_names):
-                if name.split(".")[-1] in self._get_1d_in_tensor_names(
-                    quant
-                ) + self._get_1d_out_tensor_names(quant):
+                if name.split(".")[-1] in self._get_1d_out_tensor_names(quant):
                     assert (
                         param.dim() == 1
                     ), f"{name} is expected to be 1D, but got {param.dim()}D"
@@ -465,6 +463,12 @@ class Transformer(nn.Module):
                         assert param.shape[0] % world_size == 0
                         chunks = torch.chunk(param, world_size, dim=0)
                         partial_checkpoint[name] = chunks[rank]
+                elif name.split(".")[-1] in self._get_1d_in_tensor_names(quant):
+                    assert (
+                        param.dim() == 1
+                    ), f"{name} is expected to be 1D, but got {param.dim()}D"
+                    if get_tp_group().rank_in_group == 0:
+                        partial_checkpoint[name] = param
                 elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names(quant):
                     assert (
                         param.dim() == 2
@@ -490,9 +494,7 @@ class Transformer(nn.Module):
                     assert False, f"Illegal parallel tensor {name}"
 
             elif any(is_layer(s, name) for s in rpl_names):
-                if name.split(".")[-1] in self._get_1d_in_tensor_names(
-                    quant
-                ) + self._get_1d_out_tensor_names(quant):
+                if name.split(".")[-1] in self._get_1d_in_tensor_names(quant):
                     assert (
                         param.dim() == 1
                     ), f"{name} is expected to be 1D, but got {param.dim()}D"
@@ -502,6 +504,12 @@ class Transformer(nn.Module):
                         assert param.shape[0] % world_size == 0
                         chunks = torch.chunk(param, world_size, dim=0)
                         partial_checkpoint[name] = chunks[rank]
+                elif name.split(".")[-1] in self._get_1d_out_tensor_names(quant):
+                    assert (
+                        param.dim() == 1
+                    ), f"{name} is expected to be 1D, but got {param.dim()}D"
+                    if get_tp_group().rank_in_group == 0:
+                        partial_checkpoint[name] = param
                 elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names(quant):
                     assert (
                         param.dim() == 2
@@ -854,6 +862,7 @@ class MoeGate(nn.Module):
         route_scale,
         n_experts,
         bias,
+        e_score_correction_bias,
         norm_prob,
     ):
         """
@@ -869,6 +878,7 @@ class MoeGate(nn.Module):
         self.route_scale = route_scale
         self.weight = nn.Parameter(torch.empty((n_experts, self.dim)))
         self.bias = bias
+        self.e_score_correction_bias = e_score_correction_bias
         self.norm_prob = norm_prob
 
     def forward(self, x):
@@ -887,14 +897,13 @@ class MoeGate(nn.Module):
                 dtype=self.weight.dtype,
                 device=self.weight.device,
             ), torch.empty((0, self.topk), dtype=torch.int32, device=self.weight.device)
-
-        scores = F.linear(x, self.weight)
+        scores = F.linear(x, self.weight, self.bias)
         indices, weights = moe_gate(
             scores,
             self.topk,
             self.n_groups,
             self.topk_groups,
-            self.bias,
+            self.e_score_correction_bias,
             self.score_func,
         )
         if self.norm_prob:

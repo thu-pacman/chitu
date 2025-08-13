@@ -46,6 +46,7 @@ if has_triton:
         triton_skew_decode,
     )
     from chitu.triton_flash_attention import context_attention_fwd
+cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 logger = getLogger(__name__)
 
@@ -87,6 +88,7 @@ class AttnBackend(abc.ABC):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         """
         Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -138,6 +140,7 @@ class AttnBackend(abc.ABC):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         """
         If k and v are not None, kv_cache will be updated *inplace* with the new values from k and v.
@@ -204,6 +207,7 @@ class AttnBackend(abc.ABC):
                 window_size=window_size,
                 softcap=softcap,
                 softmax_scale=softmax_scale,
+                sinks=sinks,
             )
         elif isinstance(kv_cache, PagedKVCacheAccessor):
             return self.decode_paged_kv(
@@ -217,6 +221,7 @@ class AttnBackend(abc.ABC):
                 window_size=window_size,
                 softcap=softcap,
                 softmax_scale=softmax_scale,
+                sinks=sinks,
             )
         else:
             raise NotImplementedError()
@@ -237,6 +242,7 @@ class AttnBackend(abc.ABC):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         raise NotImplementedError()
 
@@ -254,6 +260,7 @@ class AttnBackend(abc.ABC):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         raise NotImplementedError()
 
@@ -410,6 +417,7 @@ class FlashAttnBackend(AttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         # These are arguments only accpeted by new enough flash_attn,
         # so don't pass them if they are set to default values
@@ -445,6 +453,7 @@ class FlashAttnBackend(AttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         # These are arguments only accpeted by new enough flash_attn,
         # so don't pass them if they are set to default values
@@ -479,6 +488,7 @@ class FlashAttnBackend(AttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         # These are arguments only accpeted by new enough flash_attn,
         # so don't pass them if they are set to default values
@@ -559,6 +569,7 @@ class RefAttnBackend(AttnBackend):
         upcast=True,
         reorder_ops=False,
         softmax_scale=None,
+        sinks=None,
     ):
         """
         Arguments:
@@ -615,7 +626,15 @@ class RefAttnBackend(AttnBackend):
             scores.masked_fill_(local_mask, float("-inf"))
         if attn_bias is not None:
             scores = scores + attn_bias
-        attention = torch.softmax(scores, dim=-1).to(v.dtype)
+        if sinks is not None:
+            sinks = sinks.reshape(1, -1, 1, 1).expand(
+                scores.shape[0], -1, scores.shape[-2], -1
+            )
+            scores = torch.cat([scores, sinks], dim=-1)
+            attention = torch.softmax(scores, dim=-1).to(v.dtype)
+            attention = attention[..., :-1]
+        else:
+            attention = torch.softmax(scores, dim=-1).to(v.dtype)
         # Some rows might be completely masked out so we fill them with zero instead of NaN
         if window_size[0] >= 0 or window_size[1] >= 0:
             attention = attention.masked_fill(
@@ -645,6 +664,7 @@ class RefAttnBackend(AttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         q_batch = torch.zeros(
             (seqlens.batch_size,) + tuple(q.shape),
@@ -679,6 +699,7 @@ class RefAttnBackend(AttnBackend):
             window_size=window_size,
             softcap=softcap,
             softmax_scale=softmax_scale,
+            sinks=sinks,
         )
         output = torch.empty(
             (seqlens.total_len,) + output_batch.shape[2:],
@@ -705,6 +726,7 @@ class RefAttnBackend(AttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         arange = einops.rearrange(
             torch.arange(kv_cache.k.shape[1], device=kv_cache.v.device), "s -> 1 s"
@@ -732,6 +754,7 @@ class RefAttnBackend(AttnBackend):
             window_size=window_size,
             softcap=softcap,
             softmax_scale=softmax_scale,
+            sinks=sinks,
         )
         return output
 
@@ -749,6 +772,7 @@ class RefAttnBackend(AttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         k_cache_paged = kv_cache.k
         v_cache_paged = kv_cache.v
@@ -819,6 +843,7 @@ class RefAttnBackend(AttnBackend):
             window_size=window_size,
             softcap=softcap,
             softmax_scale=softmax_scale,
+            sinks=sinks,
         )
         return output
 
@@ -851,6 +876,7 @@ class TritonAttnBackend(RefAttnBackend):
         window_size=(-1, -1),
         softcap=0,
         softmax_scale=None,
+        sinks=None,
     ):
         B, local_n_heads, _ = q.shape
         _, _, v_n_hidden = v.shape
@@ -1058,6 +1084,7 @@ class TritonAttnBackend(RefAttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         # triton has bug, when version < 3.2.0, the "~" operator on bool vector will get wrong results
         assert self.triton_latest_enough
@@ -1125,6 +1152,7 @@ class TritonAttnBackend(RefAttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         if k is None and q is None:
             seqlens = prev_seq_len.lens_tensor_device
@@ -1508,6 +1536,7 @@ class FlashInferBackend(TritonAttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         # TODO: we do not support DeepSeek-R1 in flashinfer prefill step currently
         num_qo_heads = q.shape[-2]
@@ -1543,6 +1572,7 @@ class FlashInferBackend(TritonAttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         raw_batch_size = q.shape[0]
         batch_size = self.match_batch_size(raw_batch_size)
@@ -1576,6 +1606,7 @@ class FlashInferBackend(TritonAttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         raw_batch_size = q.shape[0]
         batch_size = self.match_batch_size(raw_batch_size)
@@ -1663,7 +1694,7 @@ class NpuAttnBackend(RefAttnBackend):
                 block_offset = prev_seq_len.lens_list[i] % block_size
                 slot_list.append(block_number * block_size + block_offset)
             self.slot_mapping.set(
-                torch.tensor(slot_list, dtype=torch.int32, device="cuda")
+                torch.tensor(slot_list, dtype=torch.int32, device="npu")
             )
 
     @override
@@ -1677,6 +1708,7 @@ class NpuAttnBackend(RefAttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         if self.args.infer.mla_absorb.lower() != "none":
             dim_gap = k.shape[-1] - v.shape[-1]
@@ -1742,29 +1774,38 @@ class NpuAttnBackend(RefAttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
-        # [BSND] -> [BSH]
-        q = q.view(q.shape[0], q.shape[1], -1).contiguous()
-        k = k.view(k.shape[0], k.shape[1], -1).contiguous()
-        v = v.view(v.shape[0], v.shape[1], -1).contiguous()
-
         torch_npu.scatter_update_(kv_cache.k, prev_seq_len.lens_tensor_device, k, 1)
         torch_npu.scatter_update_(kv_cache.v, prev_seq_len.lens_tensor_device, v, 1)
 
         output_ = torch.empty_like(q)
-        lse_ = torch.empty(1, dtype=q.dtype, device="npu")
-        torch_npu.npu_fused_infer_attention_score.out(
-            q,
-            kv_cache.k,
-            kv_cache.v,
-            input_layout="BSH",
-            actual_seq_lengths_kv=next_seq_len.lens_list,
-            scale=self.scale,
-            num_heads=self.local_n_heads,
-            num_key_value_heads=self.local_n_kv_heads,
-            out=[output_, lse_],
-        )
-        return output_
+        if hasattr(cinfer_ascendc, "grouped_query_attention") and q.shape[0] <= 8:
+            cinfer_ascendc.grouped_query_attention(
+                q,
+                kv_cache.k,
+                kv_cache.v,
+                next_seq_len.lens_tensor_device,
+                output_,
+                q.shape[0],
+                "BSND",
+                self.scale,
+            )
+            return output_
+        else:
+            lse_ = torch.empty(1, dtype=q.dtype, device="npu")
+            torch_npu.npu_fused_infer_attention_score.out(
+                q,
+                kv_cache.k,
+                kv_cache.v,
+                input_layout="BSND",
+                actual_seq_lengths_kv=next_seq_len.lens_list,
+                scale=self.scale,
+                num_heads=self.local_n_heads,
+                num_key_value_heads=self.local_n_kv_heads,
+                out=[output_, lse_],
+            )
+            return output_
 
     @override
     def decode_paged_kv(
@@ -1780,6 +1821,7 @@ class NpuAttnBackend(RefAttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         # [BSND] -> [BSH]
         q = q.view(q.shape[0], q.shape[1], -1).contiguous()
@@ -1787,14 +1829,14 @@ class NpuAttnBackend(RefAttnBackend):
         v = v.view(v.shape[0], v.shape[1], -1).contiguous()
 
         # update kv_cache
-        k_cache_ = kv_cache.k.view(
+        kv_cache.k = kv_cache.k.view(
             kv_cache.k.shape[0] * kv_cache.k.shape[1], -1
         ).unsqueeze(1)
-        v_cache_ = kv_cache.v.view(
+        kv_cache.v = kv_cache.v.view(
             kv_cache.v.shape[0] * kv_cache.v.shape[1], -1
         ).unsqueeze(1)
-        k_cache_[self.slot_mapping.get()] = k
-        v_cache_[self.slot_mapping.get()] = v
+        kv_cache.k[self.slot_mapping.get()] = k
+        kv_cache.v[self.slot_mapping.get()] = v
 
         output_ = torch.empty_like(q)
         lse_ = torch.empty(1, dtype=q.dtype, device="npu")
@@ -1893,6 +1935,7 @@ class HybridAttnBackend(AttnBackend):
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
+        sinks=None,
     ):
         self.current_backend = self._select_backend(seqlens.batch_size)
         return self.current_backend.prefill_ragged_qkvo(
@@ -1904,6 +1947,7 @@ class HybridAttnBackend(AttnBackend):
             window_size=window_size,
             softcap=softcap,
             softmax_scale=softmax_scale,
+            sinks=sinks,
         )
 
     @override
@@ -1920,6 +1964,7 @@ class HybridAttnBackend(AttnBackend):
         window_size=(-1, -1),
         softcap=0.0,
         softmax_scale=None,
+        sinks=None,
     ):
         batch_size = q.shape[0]
         self.current_backend = self._select_backend(batch_size)
@@ -1934,6 +1979,7 @@ class HybridAttnBackend(AttnBackend):
             window_size=window_size,
             softcap=softcap,
             softmax_scale=softmax_scale,
+            sinks=sinks,
         )
 
     @override
@@ -1950,6 +1996,7 @@ class HybridAttnBackend(AttnBackend):
         window_size=(-1, -1),
         softcap=0.0,
         softmax_scale=None,
+        sinks=None,
     ):
         batch_size = q.shape[0]
         self.current_backend = self._select_backend(batch_size)
@@ -1964,6 +2011,7 @@ class HybridAttnBackend(AttnBackend):
             window_size=window_size,
             softcap=softcap,
             softmax_scale=softmax_scale,
+            sinks=sinks,
         )
 
     def prepare_metadata_for_decode(self, *args, **kwargs):

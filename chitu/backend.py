@@ -318,28 +318,6 @@ class Backend:
 
         kv_cache_kvargs = {}
 
-        # support NPU BSH layout
-        if args.infer.attn_type == "npu" and args.models.type != "deepseek-v3":
-            n_kv_heads = (
-                args.models.n_kv_heads
-                if hasattr(args.models, "n_kv_heads")
-                else args.models.n_heads
-            )
-            n_local_kv_heads = (
-                n_kv_heads // model_parallel_size
-                if n_kv_heads > model_parallel_size
-                else 1
-            )  # Compatible with tp_size>n_kv_heads
-            head_dim = (
-                args.models.head_dim
-                if hasattr(args.models, "head_dim")
-                else args.models.dim // args.models.n_heads
-            )
-            kv_cache_kvargs["k_shape_per_sample"] = (n_local_kv_heads * head_dim,)
-            kv_cache_kvargs["v_shape_per_sample"] = (n_local_kv_heads * head_dim,)
-
-            return kv_cache_kvargs
-
         if args.models.type == "deepseek-v3":
             if args.infer.mla_absorb in ["absorb", "absorb-without-precomp"]:
                 kv_cache_kvargs["kv_shape_per_sample"] = (
@@ -561,6 +539,7 @@ class Backend:
                 "hf-qwen-3-moe",
                 "hf-glm-z1",
                 "hf-glm-4-moe",
+                "hf-gpt-oss",
                 "hf-mixtral",
                 "deepseek-v3",
             }:
@@ -937,7 +916,7 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
     }
 
     translation_gate = {
-        ".mlp.gate.bias": ".exp_probs_b.bias",
+        ".mlp.gate.e_score_correction_bias": ".exp_probs_b.bias",
         ".mlp.gate.weight": ".ffn_gate_inp.weight",
         ".post_attention_layernorm.weight": ".ffn_norm.weight",
     }

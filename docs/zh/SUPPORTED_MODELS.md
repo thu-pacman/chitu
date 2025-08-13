@@ -126,3 +126,7 @@
   用法: 启动赤兔时追加 `models=Qwen3-Coder-480B-A35B-Instruct-fp8` 启动参数
 - glm-4-9b-chat
   用法: 启动赤兔时追加 `models=glm-4-9b-chat` 启动参数
+- gpt-oss-120b-BF16
+  用法: 启动赤兔时追加 `models=gpt-oss-120b-BF16` 启动参数
+- gpt-oss-20b-BF16
+  用法: 启动赤兔时追加 `models=gpt-oss-20b-BF16` 启动参数

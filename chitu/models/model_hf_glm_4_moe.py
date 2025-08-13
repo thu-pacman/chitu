@@ -142,7 +142,7 @@ class TransformerHFGlm4Moe(TransformerHFLlama):
             state_dict_keys = list(state_dict.keys())
             for k in state_dict_keys:
                 value = state_dict.pop(k)
-                name = k.replace(".e_score_correction_bias", ".bias")
+                name = k
                 state_dict[name] = value
 
         super().load_state_dict_parallel(
