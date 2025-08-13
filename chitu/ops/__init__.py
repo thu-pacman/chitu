@@ -12,6 +12,7 @@ from chitu.ops.quant import (
     quant_einsum_shc_hdc_shd,
     w8a8_gemm_per_token_per_channel,
     w4a8_gemm_per_token_per_channel_asymm,
+    w4a8_gemm_per_token_per_group_asymm,
     fp8_gemm_deepseek_v3,
     soft_fp8_gemm_deepseek_v3,
     soft_fp4_raise_to_fp8_gemm_deepseek_v3,

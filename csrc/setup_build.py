@@ -24,6 +24,7 @@ def get_extensions():
                 os.path.join(this_dir, "cuda/response_append/response_append.cu"),
                 os.path.join(this_dir, "cuda/weight_layout/weight_layout_change.cu"),
                 os.path.join(this_dir, "cuda/dequant/dequant.cu"),
+                os.path.join(this_dir, "cuda/gemm/w4a8_per_group_gemm_cuda.cu"),
             ],
             extra_compile_args={
                 "cxx": ["-std=c++17"],

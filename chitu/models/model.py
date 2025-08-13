@@ -366,6 +366,8 @@ class Transformer(nn.Module):
             ret += ["weight_scale", "weight_scale_2", "input_scale"]
         elif quant == "w4a8_per_token_per_channel_asymm":
             ret += ["qweight"]
+        elif quant == "w4a8_per_token_per_group_asymm":
+            ret += ["qweight"]
         elif quant == "mixq":
             ret += ["fp_weight"]
         return ret
@@ -392,6 +394,8 @@ class Transformer(nn.Module):
             ret += ["scale_channel"]
         elif quant == "w4a8_per_token_per_channel_asymm":
             ret += ["s1_scales", "s1_szeros"]
+        elif quant == "w4a8_per_token_per_group_asymm":
+            ret += ["s1_scales", "s2_scales", "s2_zeros"]
         elif quant == "mixq":
             ret += ["fp_idx", "weight_scale"]
         return ret
