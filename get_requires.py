@@ -28,6 +28,7 @@ install_requires = [
     "pyzmq>=27.0.0",
 ]
 
+
 extras_require = {
     "quant": [
         "optimum",
@@ -48,8 +49,8 @@ extras_require = {
         + os.path.join(setup_dir, "third_party/muxi_w8a8_kernels/w8a8"),
     ],
     "ascend_kernels": [
-        "grouped_gemm @ file://localhost"
-        + os.path.join(setup_dir, "third_party/ascend-kernel/grouped_gemm"),
+        "cinfer_ascendc @ file://localhost"
+        + os.path.join(setup_dir, "third_party/ascend-kernel"),
     ],
     ##########################################################################
     # Really third-party kernels

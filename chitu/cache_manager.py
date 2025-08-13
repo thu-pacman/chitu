@@ -323,7 +323,6 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
         if (
             get_global_args().infer.attn_type == "npu"
-            and self.k_shape_per_sample is not None
             and len(self.k_shape_per_sample) == 1
             and get_global_args().models.type != "deepseek-v3"
         ):
@@ -517,7 +516,6 @@ class DenseKVCacheManager(KVCacheManagerBase):
 
         if (
             get_global_args().infer.attn_type == "npu"
-            and self.k_shape_per_sample is not None
             and len(self.k_shape_per_sample) == 1
         ):
             # NPU BSH layout

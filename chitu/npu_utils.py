@@ -10,7 +10,7 @@ from torch_npu.contrib import transfer_to_npu
 from chitu.global_vars import get_global_args
 from chitu.utils import log_with_rank, try_import_opt_dep
 
-grouped_gemm, _ = try_import_opt_dep("grouped_gemm", "ascend_kernels")
+cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 logger = logging.getLogger(__name__)
 
@@ -33,14 +33,14 @@ def fused_group_matmul(
     output = torch.zeros(
         [x.shape[0], weight.shape[-1] * 2], dtype=x.dtype, device=x.device
     )
-    grouped_gemm.grouped_gemm(
+    cinfer_ascendc.grouped_gemm(
         x,
         weight,
         antiquantOffsetOptional=scale_off,
         antiquantScaleOptional=scale,
         groupListOptional=expert_tokens,
         output=output,
-        type=grouped_gemm.GroupedGemmType.FP4,
+        computeType="fp4",
     )
     return output
 

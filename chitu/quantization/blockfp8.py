@@ -30,7 +30,7 @@ chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
 if has_triton:
     from chitu.moe.experts import fused_experts
-grouped_gemm, _ = try_import_opt_dep("grouped_gemm", "ascend_kernels")
+cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 logger = getLogger(__name__)
 
@@ -62,23 +62,23 @@ def linear_block_fp8_npu(
         x = x.squeeze(1)
         flag = True
     if x.shape[0] <= 2:
-        grouped_gemm.grouped_gemv(
+        cinfer_ascendc.grouped_soft_gemv(
             x,
             weight,
             scale=scale,
             groupList=expert_tokens,
             output=output,
-            type=grouped_gemm.GroupedGemmType.FP8,
+            computeType="fp8",
         )
     else:
-        grouped_gemm.grouped_gemm(
+        cinfer_ascendc.grouped_gemm(
             x,
             weight,
             antiquantOffsetOptional=scale_off,
             antiquantScaleOptional=scale,
             groupListOptional=expert_tokens,
             output=output,
-            type=grouped_gemm.GroupedGemmType.FP8,
+            computeType="fp8",
         )
     if flag:
         output = output.unsqueeze(1)

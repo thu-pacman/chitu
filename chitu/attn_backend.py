@@ -46,6 +46,7 @@ if has_triton:
         triton_skew_decode,
     )
     from chitu.triton_flash_attention import context_attention_fwd
+cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 logger = getLogger(__name__)
 
@@ -1693,7 +1694,7 @@ class NpuAttnBackend(RefAttnBackend):
                 block_offset = prev_seq_len.lens_list[i] % block_size
                 slot_list.append(block_number * block_size + block_offset)
             self.slot_mapping.set(
-                torch.tensor(slot_list, dtype=torch.int32, device="cuda")
+                torch.tensor(slot_list, dtype=torch.int32, device="npu")
             )
 
     @override
@@ -1775,28 +1776,36 @@ class NpuAttnBackend(RefAttnBackend):
         softmax_scale=None,
         sinks=None,
     ):
-        # [BSND] -> [BSH]
-        q = q.view(q.shape[0], q.shape[1], -1).contiguous()
-        k = k.view(k.shape[0], k.shape[1], -1).contiguous()
-        v = v.view(v.shape[0], v.shape[1], -1).contiguous()
-
         torch_npu.scatter_update_(kv_cache.k, prev_seq_len.lens_tensor_device, k, 1)
         torch_npu.scatter_update_(kv_cache.v, prev_seq_len.lens_tensor_device, v, 1)
 
         output_ = torch.empty_like(q)
-        lse_ = torch.empty(1, dtype=q.dtype, device="npu")
-        torch_npu.npu_fused_infer_attention_score.out(
-            q,
-            kv_cache.k,
-            kv_cache.v,
-            input_layout="BSH",
-            actual_seq_lengths_kv=next_seq_len.lens_list,
-            scale=self.scale,
-            num_heads=self.local_n_heads,
-            num_key_value_heads=self.local_n_kv_heads,
-            out=[output_, lse_],
-        )
-        return output_
+        if hasattr(cinfer_ascendc, "grouped_query_attention") and q.shape[0] <= 8:
+            cinfer_ascendc.grouped_query_attention(
+                q,
+                kv_cache.k,
+                kv_cache.v,
+                next_seq_len.lens_tensor_device,
+                output_,
+                q.shape[0],
+                "BSND",
+                self.scale,
+            )
+            return output_
+        else:
+            lse_ = torch.empty(1, dtype=q.dtype, device="npu")
+            torch_npu.npu_fused_infer_attention_score.out(
+                q,
+                kv_cache.k,
+                kv_cache.v,
+                input_layout="BSND",
+                actual_seq_lengths_kv=next_seq_len.lens_list,
+                scale=self.scale,
+                num_heads=self.local_n_heads,
+                num_key_value_heads=self.local_n_kv_heads,
+                out=[output_, lse_],
+            )
+            return output_
 
     @override
     def decode_paged_kv(
@@ -1820,14 +1829,14 @@ class NpuAttnBackend(RefAttnBackend):
         v = v.view(v.shape[0], v.shape[1], -1).contiguous()
 
         # update kv_cache
-        k_cache_ = kv_cache.k.view(
+        kv_cache.k = kv_cache.k.view(
             kv_cache.k.shape[0] * kv_cache.k.shape[1], -1
         ).unsqueeze(1)
-        v_cache_ = kv_cache.v.view(
+        kv_cache.v = kv_cache.v.view(
             kv_cache.v.shape[0] * kv_cache.v.shape[1], -1
         ).unsqueeze(1)
-        k_cache_[self.slot_mapping.get()] = k
-        v_cache_[self.slot_mapping.get()] = v
+        kv_cache.k[self.slot_mapping.get()] = k
+        kv_cache.v[self.slot_mapping.get()] = v
 
         output_ = torch.empty_like(q)
         lse_ = torch.empty(1, dtype=q.dtype, device="npu")
