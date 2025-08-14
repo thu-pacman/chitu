@@ -38,6 +38,8 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=Kimi-K2-Instruct` command line argument when starting Chitu
 - Llama-3-8B-QServe
   Usage: Append `models=Llama-3-8B-QServe` command line argument when starting Chitu
+- Llama-3-8B-QServe-g128
+  Usage: Append `models=Llama-3-8B-QServe-g128` command line argument when starting Chitu
 - Llama-3.3-70B-Instruct
   Usage: Append `models=Llama-3.3-70B-Instruct` command line argument when starting Chitu
 - Meta-Llama-3-8B-Instruct

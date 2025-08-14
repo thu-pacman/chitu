@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from chitu.attn_backend import AttnBackend
-from chitu.cache_manager import PagedKVCacheManager
+from chitu.cache_manager import PagedKVCacheManager, DenseKVCacheManager
 from chitu.cuda_graph import make_dispatched_graphed_callables
 from chitu.device_type import is_ascend, is_muxi, is_nvidia
 from chitu.global_vars import get_global_args, get_timers
@@ -200,7 +200,7 @@ class Attention(nn.Module):
             xq, xk, freqs_cis_cos, freqs_cis_sin, rotary_type="interleaved"
         )
         self.cache.finalize_cache_bylayer_prefill(
-            xk, xv, self.cache.curr_req_ids, self.cache.next_seq_len, self.layer_id
+            xk, xv, self.cache.curr_req_ids, self.cache.seq_len_delta.new, self.layer_id
         )
         output = self.attn_backend.prefill_ragged_qkvo(
             xq, xk, xv, seq_len, causal=True
@@ -231,8 +231,8 @@ class Attention(nn.Module):
             self.cache.get_accessor(self.layer_id),
             xk,
             xv,
-            prev_seq_len=self.cache.prev_seq_len,
-            next_seq_len=self.cache.next_seq_len,
+            prev_seq_len=self.cache.seq_len_delta.old,
+            next_seq_len=self.cache.seq_len_delta.new,
         ).view(bsz, seqlen, -1)
         return self._run_output_linear(output)
 
@@ -366,6 +366,8 @@ class Transformer(nn.Module):
             ret += ["weight_scale", "weight_scale_2", "input_scale"]
         elif quant == "w4a8_per_token_per_channel_asymm":
             ret += ["qweight"]
+        elif quant == "w4a8_per_token_per_group_asymm":
+            ret += ["qweight"]
         elif quant == "mixq":
             ret += ["fp_weight"]
         return ret
@@ -392,6 +394,8 @@ class Transformer(nn.Module):
             ret += ["scale_channel"]
         elif quant == "w4a8_per_token_per_channel_asymm":
             ret += ["s1_scales", "s1_szeros"]
+        elif quant == "w4a8_per_token_per_group_asymm":
+            ret += ["s1_scales", "s2_scales", "s2_zeros"]
         elif quant == "mixq":
             ret += ["fp_idx", "weight_scale"]
         return ret
@@ -715,17 +719,17 @@ class Transformer(nn.Module):
 
     def prepare_freqs_cis_prefill(self, seq_len):
         curr_freqs_cis = self.freqs_cis[
-            self.cache.next_seq_len.position_ids_tensor_device
+            self.cache.seq_len_delta.new.position_ids_tensor_device
         ]
         return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
 
     def prepare_freqs_cis_decode(self):
-        curr_freqs_cis = self.freqs_cis[self.cache.prev_seq_len.lens_tensor_device]
+        curr_freqs_cis = self.freqs_cis[self.cache.seq_len_delta.old.lens_tensor_device]
         return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
 
     @torch.inference_mode()
     def prefill_single_device(self, tokens):
-        next_seq_len = self.cache.next_seq_len
+        next_seq_len = self.cache.seq_len_delta.new
         freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_prefill(next_seq_len)
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):
@@ -748,7 +752,7 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def prefill_pipeline(self, tokens):
 
-        next_seq_len = self.cache.next_seq_len
+        next_seq_len = self.cache.seq_len_delta.new
         freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_prefill(next_seq_len)
 
         # start of model
@@ -787,7 +791,7 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def prefill(self, tokens):
-        self.attn_backend.prepare_metadata_for_prefill(self.cache.next_seq_len)
+        self.attn_backend.prepare_metadata_for_prefill(self.cache.seq_len_delta.new)
         if self.pipeline_exec:
             return self.prefill_pipeline(tokens)
         else:
@@ -797,14 +801,19 @@ class Transformer(nn.Module):
         block_table = self.cache.get_gpu_block_table()
         block_size = self.cache.get_block_size()
         self.attn_backend.prepare_metadata_for_decode(
-            self.cache.prev_seq_len,
-            self.cache.next_seq_len,
+            self.cache.seq_len_delta.old,
+            self.cache.seq_len_delta.new,
             block_table,
             block_size,
         )
 
     @torch.inference_mode()
     def decode(self, tokens, batch_size):
+        if isinstance(self.cache, DenseKVCacheManager):
+            key = (batch_size, self.cache.get_start_idx())
+        else:
+            key = (batch_size,)
+
         self.prepare_decoding_attn()
 
         infer_args = get_global_args().infer
@@ -825,14 +834,18 @@ class Transformer(nn.Module):
             if is_ascend():
                 before_replay_callback = lambda graph: graph.update(
                     cpu_update_input=[
-                        {"actual_seq_lengths_kv": self.cache.next_seq_len.lens_list}
+                        {
+                            "actual_seq_lengths_kv": self.cache.seq_len_delta.new.lens_list
+                        }
                     ]
                 )
 
             @make_dispatched_graphed_callables(
                 args_max_nelem=(tokens.numel() // batch_size * self.max_batch_size,),
                 kwargs_max_nelem={},
-                output_max_nelem_callback=lambda bs, n: n // bs * self.max_batch_size,
+                output_max_nelem_callback=lambda key, n: n
+                // key[0]
+                * self.max_batch_size,
                 before_replay_callback=before_replay_callback,
                 enable=current_cuda_graph_enabled,
             )
@@ -847,7 +860,7 @@ class Transformer(nn.Module):
 
             self.do_decode_callable = do_decode
 
-        return self.do_decode_callable(batch_size, tokens)
+        return self.do_decode_callable(key, tokens)
 
 
 class MoeGate(nn.Module):

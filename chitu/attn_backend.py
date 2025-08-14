@@ -22,7 +22,7 @@ import einops
 
 from chitu.device_type import is_muxi
 from chitu.global_vars import get_global_args
-from chitu.ops import append_to_non_paged_kv_cache, append_to_paged_kv_cache
+from chitu.ops import append_to_dense_kv_cache, append_to_paged_kv_cache
 from chitu.static_tensor import StaticTensor
 from chitu.batched_seq_len import BatchedSeqLen
 from chitu.cache_manager import (
@@ -912,7 +912,7 @@ class TritonAttnBackend(RefAttnBackend):
         assert q_pe.shape[1] == local_n_heads
         _, _, qk_rope_head_dim = q_pe.shape
 
-        append_to_non_paged_kv_cache(kv_cache.k, kv, prev_seq_len.lens_tensor_device)
+        append_to_dense_kv_cache(kv_cache.k, kv, prev_seq_len.lens_tensor_device)
 
         o = torch.zeros(
             B,
@@ -1093,10 +1093,10 @@ class TritonAttnBackend(RefAttnBackend):
             max_len = prev_seq_len.max_len
         elif k is not None and q is not None:
             max_len = prev_seq_len.max_len + 1
-            append_to_non_paged_kv_cache(
+            append_to_dense_kv_cache(
                 kv_cache.k, k.contiguous(), prev_seq_len.lens_tensor_device
             )
-            append_to_non_paged_kv_cache(
+            append_to_dense_kv_cache(
                 kv_cache.v, v.contiguous(), prev_seq_len.lens_tensor_device
             )
         else:

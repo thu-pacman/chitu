@@ -1,0 +1,53 @@
+#!/usr/bin/expect
+
+# Timeout for startup and verification
+set timeout 600
+
+# Show all output
+log_user 1
+exp_internal 0
+
+puts "=== PD Disaggregation 2P3D Test (local, no srun) ==="
+puts "Working directory: [pwd]"
+
+# Launch PD 2P3D environment via Slurm (two nodes) in Mooncake container
+puts "=== Launching PD 2P3D environment via Slurm (two nodes) ==="
+spawn bash script/srun_pd_disagg_2p3d_two_nodes.sh
+set pd_pid [exp_pid]
+puts "Local PD environment launched, pid is $pd_pid"
+
+# Wait for explicit readiness marker from node0 to avoid interleaved logs
+set router_ip ""
+set router_port "21003"
+expect {
+    -re {ROUTER_READY host=([^ ]+) ip=([0-9\.]+) port=(\d+)} {
+        set router_host $expect_out(1,string)
+        set router_ip   $expect_out(2,string)
+        set router_port $expect_out(3,string)
+        puts "Detected Router Ready on $router_host $router_ip:$router_port"
+    }
+    timeout {
+        puts "ERROR: Did not receive ROUTER_READY marker in time"
+        exec kill -TERM $pd_pid
+        exit 1
+    }
+}
+
+# Give services a brief moment to finish initialization
+sleep 120
+
+# Run verification: PD 2P3D topology via existing script
+puts "=== Verifying PD 2P3D topology ==="
+set verify_cmd "python test/verify_xpyd_topology.py --router http://$router_ip:$router_port --concurrency 8 --max_tokens 128 --stream"
+puts "Running: $verify_cmd"
+spawn bash -lc $verify_cmd
+sleep 30
+
+# Cleanup
+puts "Cleaning up PD processes..."
+catch {exec kill -TERM $pd_pid}
+sleep 5
+puts "=== PD Disaggregation 2P3D Test Completed ==="
+exit 0
+
+

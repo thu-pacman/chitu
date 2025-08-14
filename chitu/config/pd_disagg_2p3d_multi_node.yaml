@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# PD disaggregation 2P3D multi-node overlay
+# 仅保留 PD 分离相关配置；其余模型/推理通用项从基础 serve_config 继承
+
+defaults:
+  - serve_config  # 继承基础通用配置（模型/推理/校验等）
+  - _self_
+
+# 仅覆盖 PD 分离必需项
+dp_config:
+  enabled: True
+  scheduler_base_host: 0.0.0.0
+  scheduler_base_port: 29610
+  dp_size: 5           # 2P + 3D = 5
+  dp_id: 0
+  tp_size: 1
+  pp_size: 1
+
+  router:
+    is_router: True
+    host: 0.0.0.0
+    port: 21003
+    stats_port: 29600
+    token_port: 29700
+    load_balancer_algorithm: "power_of_two_choices"
+
+    # PD 分离配置（协调/元数据同步、RDMA 后端与 Bootstrap）
+    pd_disaggregation:
+      enabled: True
+      coordination_port: 29800
+      metadata_sync_port: 29801
+      kv_transfer_backend: "mooncake"
+      ib_device: "mlx5_0"
+      bootstrap_port: 8080
+
+      kv_transfer:
+        buffer_size: 2048
+        transfer_timeout: 30.0
+        max_concurrent_transfers: 8
+
+    # Prefill Scheduler（2 个）
+    prefill_schedulers:
+      - host: 0.0.0.0
+        port: 29620
+        max_batch_size: 32
+        max_total_tokens: 8192
+        batching_strategy: "varlen"
+      - host: 0.0.0.0
+        port: 29621
+        max_batch_size: 32
+        max_total_tokens: 8192
+        batching_strategy: "varlen"
+
+    # Decode Scheduler（3 个）
+    decode_schedulers:
+      - host: 0.0.0.0
+        port: 29630
+        scheduling_strategy: "immediate"
+      - host: 0.0.0.0
+        port: 29631
+        scheduling_strategy: "immediate"
+      - host: 0.0.0.0
+        port: 29632
+        scheduling_strategy: "immediate"
+
+

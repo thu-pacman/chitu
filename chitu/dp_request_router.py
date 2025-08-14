@@ -35,8 +35,8 @@ class SchedulerStats:
     pending_tokens: int
     throughput_tokens_per_sec: float
     last_update_time: float
-    last_heartbeat_time: float = 0.0  # 新增心跳时间戳
-    is_alive: bool = True  # 新增存活状态标记
+    last_heartbeat_time: float = 0.0  # last heartbeat timestamp
+    is_alive: bool = True  # alive status flag
 
 
 @dataclass
@@ -91,7 +91,7 @@ class LoadBalancer:
                 )
         except RuntimeError as e:
             logger.error(f"[LOAD_BALANCER] Scheduler selection failed: {e}")
-            raise  # 重新抛出异常供上层处理
+            raise  # re-raise for upper-layer handling
 
         logger.debug(f"[LOAD_BALANCER] Selected scheduler: {scheduler_id}")
         return scheduler_id
@@ -104,7 +104,7 @@ class LoadBalancer:
             if stats.is_alive
         ]
         if not alive_schedulers:
-            # 抛出异常，表示没有可用调度器
+            # Raise exception to indicate no available scheduler
             raise RuntimeError("No alive schedulers available for request routing.")
         logger.info(
             f"[ALIVE_SCHEDULERS] Found {len(alive_schedulers)} alive schedulers out of {len(self.scheduler_stats.items())} total"
@@ -134,7 +134,7 @@ class LoadBalancer:
         best_scheduler = 0
         alive_schedulers = self._select_alive_schedulers()
 
-        # 只考虑存活的调度器
+        # Consider only alive schedulers
         try:
             alive_schedulers = self._select_alive_schedulers()
         except RuntimeError as e:
@@ -214,10 +214,10 @@ class RequestRouter:
         self.total_requests = 0
         self.total_tokens = 0
         self.start_time = time.time()
-
-        logger.info(
-            f"RequestRouter initialized with {len(config.scheduler_addresses)} schedulers"
-        )
+        if not self.config.pd_disaggregation.enabled:
+            logger.info(
+                f"RequestRouter initialized with {len(config.scheduler_addresses)} schedulers"
+            )
 
     async def start(self):
         """Start the Request Router service."""
@@ -272,8 +272,8 @@ class RequestRouter:
                         last_update_time=stats_dict.get(
                             "last_update_time", time.time()
                         ),
-                        last_heartbeat_time=time.time(),  # 更新心跳时间戳
-                        is_alive=stats_dict.get("heartbeat", False),  # 标记为存活
+                        last_heartbeat_time=time.time(),  # update heartbeat timestamp
+                        is_alive=stats_dict.get("heartbeat", False),  # mark alive
                     )
 
                     self.load_balancer.update_stats(stats)
@@ -334,20 +334,20 @@ class RequestRouter:
 
     async def _heartbeat_monitor_task(self):
         """Monitor scheduler heartbeat status"""
-        HEARTBEAT_TIMEOUT = 20.0  # 20秒超时阈值
+        HEARTBEAT_TIMEOUT = 20.0  # 20s timeout threshold
         while True:
             current_time = time.time()
 
-            # 检查所有调度器的心跳状态
+            # Check heartbeat status for all schedulers
             for scheduler_id, stats in self.load_balancer.scheduler_stats.items():
                 if current_time - stats.last_heartbeat_time > HEARTBEAT_TIMEOUT:
                     logger.warning(
                         f"--- [HEARTBEAT_MONITOR] Scheduler {scheduler_id} heartbeat timeout! ---"
                         f"Last heartbeat: {current_time - stats.last_heartbeat_time:.2f}s ago"
                     )
-                    # 标记为死亡
+                    # Mark as dead
                     stats.is_alive = False
-            await asyncio.sleep(5.0)  # 每5秒检查一次心跳
+            await asyncio.sleep(5.0)  # Check every 5 seconds
 
     async def _health_monitor_task(self):
         """Monitor system health and log performance metrics."""
@@ -556,39 +556,54 @@ async def start_request_router():
     from chitu.backend import Backend
 
     args = get_global_args()
-
     dp_config = args.dp_config
 
-    # get scheduler addresses from serve_config.yaml
-    # Get configuration parameters from dp_config
-    scheduler_addresses = [
-        f"tcp://{dp_address.host}:{dp_address.port}"
-        for dp_address in dp_config.router.dp_addresses
-    ]
-    if len(scheduler_addresses) == 0:
-        logger.warning(
-            f"Failed to get scheduler addresses from dp_config, using default addresses"
+    # Check if PD disaggregation is enabled
+    pd_enabled = (
+        hasattr(dp_config.router, "pd_disaggregation")
+        and dp_config.router.pd_disaggregation.enabled
+    )
+
+    if pd_enabled:
+        logger.info("Creating PD disaggregation router...")
+        from chitu.distributed.pd_disaggregation.pd_request_router import (
+            PDRequestRouter,
         )
-        # If no scheduler_addresses configured, auto-generate based on inter_dp_size
-        inter_dp_size = dp_config.get("dp_size", 1)
+
+        # Create PD router configuration - directly use dp_config.router
+        router = PDRequestRouter(dp_config.router)
+    else:
+        logger.info("Creating DP unified router...")
+
+        # get scheduler addresses from serve_config.yaml
+        # Get configuration parameters from dp_config
         scheduler_addresses = [
-            f"tcp://localhost:{29610 + i}" for i in range(inter_dp_size)
+            f"tcp://{dp_address.host}:{dp_address.port}"
+            for dp_address in dp_config.router.dp_addresses
         ]
+        if len(scheduler_addresses) == 0:
+            logger.warning(
+                f"Failed to get scheduler addresses from dp_config, using default addresses"
+            )
+            # If no scheduler_addresses configured, auto-generate based on inter_dp_size
+            inter_dp_size = dp_config.get("dp_size", 1)
+            scheduler_addresses = [
+                f"tcp://localhost:{29610 + i}" for i in range(inter_dp_size)
+            ]
 
-    logger.info(f"Scheduler addresses: {scheduler_addresses}")
+        logger.info(f"Scheduler addresses: {scheduler_addresses}")
 
-    # Create Router instance
-    config = RouterConfig(
-        scheduler_addresses=scheduler_addresses,
-        load_balance_algorithm=dp_config.router.load_balancer_algorithm,
-        max_batch_size=len(scheduler_addresses) * args.infer.max_reqs,
-        stats_update_interval=0.1,
-    )
-    router = RequestRouter(config)
+        # Create Router instance
+        config = RouterConfig(
+            scheduler_addresses=scheduler_addresses,
+            load_balance_algorithm=dp_config.router.load_balancer_algorithm,
+            max_batch_size=len(scheduler_addresses) * args.infer.max_reqs,
+            stats_update_interval=0.1,
+        )
+        router = RequestRouter(config)
+
     set_global_request_router(router)
-    logger.info(
-        f"Request Router configured with {len(config.scheduler_addresses)} schedulers"
-    )
+    logger.info("Request Router configured successfully")
 
     # Start Router
     await router.start()

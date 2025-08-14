@@ -5,13 +5,14 @@
 from chitu.ops.rotary import apply_rotary_pos_emb
 from chitu.ops.activation import silu_and_mul
 from chitu.ops.sampling import multinomial, apply_frequency_penalty, response_append
-from chitu.ops.kv_cache import append_to_paged_kv_cache, append_to_non_paged_kv_cache
+from chitu.ops.kv_cache import append_to_paged_kv_cache, append_to_dense_kv_cache
 from chitu.ops.norm import rms_norm
 from chitu.ops.moe_gate import moe_gate
 from chitu.ops.quant import (
     quant_einsum_shc_hdc_shd,
     w8a8_gemm_per_token_per_channel,
     w4a8_gemm_per_token_per_channel_asymm,
+    w4a8_gemm_per_token_per_group_asymm,
     fp8_gemm_deepseek_v3,
     soft_fp8_gemm_deepseek_v3,
     soft_fp4_raise_to_fp8_gemm_deepseek_v3,
@@ -25,5 +26,7 @@ from chitu.ops.quant import (
     fp4_fake_quant,
     pack_weight_nibbles,
     to_e2m1_nibbles,
+    hard_fp4_scaled_mm,
+    scaled_fp4_quant,
     mixq_gemm,
 )

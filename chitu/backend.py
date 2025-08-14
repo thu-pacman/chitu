@@ -524,7 +524,10 @@ class Backend:
                 ), f"no checkpoint files found in {args.models.ckpt_dir}"
                 ckpt_path = checkpoints[0]
                 checkpoint = torch.load(ckpt_path, map_location="cpu")
-            elif args.models.name == "Llama-3-8B-QServe":
+            elif (
+                args.models.name == "Llama-3-8B-QServe"
+                or args.models.name == "Llama-3-8B-QServe-g128"
+            ):
                 checkpoint = torch.load(
                     os.path.join(args.models.ckpt_dir, "pytorch_model.bin"),
                     map_location="cpu",

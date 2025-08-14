@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import random
 from typing import Any, List, Tuple
+import socket
 
 import numpy as np
 import torch
@@ -330,7 +331,7 @@ class DataSaver:
                         and cache_manager.curr_req_ids
                     ):
                         req_id = cache_manager.curr_req_ids[0]
-                        decode_step = cache_manager.seq_lens.get(req_id, 0)
+                        decode_step = cache_manager.req_id_to_seq_len.get(req_id, 0)
 
                 # 获取模型名称和数据类型
                 try:
@@ -436,3 +437,35 @@ def log_with_rank(msg, rank=0, prefix="", level=WARNING, logger=logger):
             logger.debug(msg)
         else:
             logger.log(level, msg)
+
+
+# For disaggregation mode
+def get_free_port():
+    # try ipv4
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+    except OSError:
+        # try ipv6
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+
+def get_local_ip() -> str:
+    # try ipv4
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
+
+    try:
+        hostname = socket.gethostname()
+        ip = socket.gethostbyname(hostname)
+        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+            return ip
+    except Exception:
+        pass

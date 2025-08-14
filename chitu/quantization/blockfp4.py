@@ -17,8 +17,9 @@ from chitu.ops import (
     soft_fp4_raise_to_fp8_gemm_deepseek_v3,
     soft_fp4_raise_to_bf16_gemm_deepseek_v3,
     act_quant_deepseek_v3,
+    hard_fp4_scaled_mm,
 )
-from chitu.device_type import get_device_name, is_muxi, is_nvidia
+from chitu.device_type import get_device_name, is_muxi, is_nvidia, is_blackwell
 from chitu.utils import (
     ceil_div,
     try_import_opt_dep,
@@ -69,7 +70,7 @@ def linear_block_fp4_npu(
     assert (
         weight.shape[-1] % 2 == 0
     ), f"Weight shape[-1] must be even, but got {weight.shape[-1]}"
-    # 针对反量化矩阵乘算子做的 shape 适配
+    # Shape adaptation for dequantization matmul operator
     weight = weight.reshape(weight.shape[-1] * 2, weight.shape[-2] // 2)
     weight = weight.unsqueeze(0)
     weight_scale = weight_scale.unsqueeze(0)
@@ -80,11 +81,11 @@ def linear_block_fp4_npu(
     output = torch.empty(
         [x.shape[0], weight.shape[-1] * 2], dtype=x.dtype, device=x.device
     )
-    # NOTE: 生成一个仅有一个元素的 Tensor，值为 N,并且需要保证 export tokens 是一个一维的 Tensor
+    # NOTE: Generate a tensor with a single element (value N) and ensure export tokens is 1-D tensor
     expert_tokens = torch.full([1], x.shape[0], device=x.device, dtype=torch.int64)
 
     if x.dim() == 3:
-        # 三维的 x 需要squeeze到二维,在NpuAttnBackend mla_decode_paged_kv 中 x 会被 unsqueeze 到三维
+        # 3D x needs to be squeezed to 2D; in NpuAttnBackend mla_decode_paged_kv, x will be unsqueezed to 3D
         x = x.squeeze(1)
         if x.shape[0] <= 2:
             cinfer_ascendc.grouped_soft_gemv(
@@ -158,7 +159,21 @@ def linear_block_fp4(
         quantization-aware computations depending on the input parameters.
     """
 
-    if get_global_args().infer.raise_lower_bit_float_to == "bfloat16":
+    if is_blackwell():
+        assert weight.k_stride == 1
+        assert x.shape[-1] == weight.layout_tensor.shape[-1] * 2
+        y = hard_fp4_scaled_mm(
+            x,
+            weight.layout_tensor,
+            weight_scale,
+            weight_scale_2,
+            alpha=None,
+            out_dtype=parse_dtype(get_global_args().infer.raise_lower_bit_float_to),
+        )
+        if bias is not None:
+            y += bias
+        return y
+    elif get_global_args().infer.raise_lower_bit_float_to == "bfloat16":
         if is_nvidia() or is_muxi():
             y = soft_fp4_raise_to_bf16_gemm_deepseek_v3(
                 x, weight, weight_scale, weight_scale_2
@@ -321,6 +336,45 @@ class Blockfp4LinearPackKStride64(
 
     @torch.no_grad()
     def forward(self, x) -> torch.Tensor:
+        return linear_block_fp4(
+            x,
+            self.get_native_layout_weight(),
+            self.weight_scale,
+            self.weight_scale_2,
+            act_block_size=self.act_block_size,
+            bias=self.bias,
+        )
+
+
+class Blockfp4LinearPackKStride1(
+    enable_native_layout_weight("weight", Packed4BitWeightAlongK, k_stride=1),
+    Blockfp4LinearBase,
+):
+    """
+    Blockfp4Linear with weight in Packed4BitWeightAlongK (k_stride=1) layout.
+    """
+
+    is_swizzled = False
+
+    def convert_scale_to_swizzled(self):
+        from chitu.ops.quant import convert_linear_to_swizzled
+
+        weight = self.get_native_layout_weight()
+        weight_scale = self.weight_scale
+
+        def round_up(x, y):
+            return (x + y - 1) // y * y
+
+        rounded_n = round_up(weight.layout_tensor.shape[0], 128)
+        k = weight.layout_tensor.shape[-1] * 2
+        weight_scale = convert_linear_to_swizzled(weight_scale, rounded_n, k, 16)
+        self.is_swizzled = True
+        self.weight_scale.data = weight_scale
+
+    @torch.no_grad()
+    def forward(self, x) -> torch.Tensor:
+        if not self.is_swizzled:
+            self.convert_scale_to_swizzled()
         return linear_block_fp4(
             x,
             self.get_native_layout_weight(),
@@ -813,7 +867,10 @@ if has_torch_npu:
         "blockfp4", Blockfp4MoeExpertsPackNPUNative
     )
 else:
-    QuantizationRegistry.register_linear("blockfp4", Blockfp4LinearPackKStride64)
-    QuantizationRegistry.register_moe_experts(
-        "blockfp4", Blockfp4MoeExpertsPackKStride64
-    )
+    if is_blackwell():
+        QuantizationRegistry.register_linear("blockfp4", Blockfp4LinearPackKStride1)
+    else:
+        QuantizationRegistry.register_linear("blockfp4", Blockfp4LinearPackKStride64)
+        QuantizationRegistry.register_moe_experts(
+            "blockfp4", Blockfp4MoeExpertsPackKStride64
+        )

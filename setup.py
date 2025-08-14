@@ -31,6 +31,7 @@ from get_requires import install_requires, extras_require
 # We use CUDAExtension instead of CMake for native sources, because many of the non-NVIDIA GPUs have
 # their custom CUDAExtension, but not their custom CMake support.
 
+
 if (
     os.environ.get("CHITU_ASCEND_BUILD", "0") == "1"
     or os.environ.get("CHITU_HYGON_BUILD", "0") == "1"
@@ -38,7 +39,6 @@ if (
     ext_modules = []
 else:
     ext_modules = operators.get_extensions()
-
 
 cython_unsafe_files = (
     glob.glob("chitu/ops/triton_ops/*.py")  # Triton kernels inside
@@ -100,7 +100,7 @@ if os.environ.get("CHITU_WITH_CYTHON", "0") != "0":
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="chitu",
-    version="0.4.0",
+    version="0.4.1",
     install_requires=install_requires,
     extras_require=extras_require,
     packages=find_packages(),

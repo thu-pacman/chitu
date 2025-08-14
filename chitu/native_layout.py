@@ -376,7 +376,7 @@ class Packed4BitWeightNPUNative(NativeLayoutTensor):
                 f"Cannot convert from {type(tensor)} to Packed4BitWeightAlongK"
             )
 
-    # 针对npu反量化+矩阵乘融合算子设计
+    # Designed for NPU de-quantization + matmul fused operator
     @classmethod
     def _repack_weight(cls, weight):
         old_device = weight.device

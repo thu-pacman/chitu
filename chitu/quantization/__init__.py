@@ -26,6 +26,9 @@ from chitu.quantization.simple_w8a8_muxi import W8A8MuxiLinear
 from chitu.quantization.w4a8_per_token_per_channel_asymm import (
     W4A8PerTokenPerChannelAsymmLinear,
 )
+from chitu.quantization.w4a8_per_token_per_group_asymm import (
+    W4A8PerTokenPerGroupAsymmLinear,
+)
 from chitu.quantization.mixq import MixQLinear
 from chitu.quantization.blockfp8 import Blockfp8Linear, Blockfp8MoeExperts
 from chitu.quantization.blockfp4 import (

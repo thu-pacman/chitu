@@ -278,7 +278,11 @@ class AttentionDeepSeekV3(Attention):
         if self.mla_absorb == "none":
             q, k, v = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
             self.cache.finalize_cache_bylayer_prefill(
-                k, v, self.cache.curr_req_ids, self.cache.next_seq_len, self.layer_id
+                k,
+                v,
+                self.cache.curr_req_ids,
+                self.cache.seq_len_delta.new,
+                self.layer_id,
             )
 
             x = self.attn_backend.prefill_ragged_qkvo(
@@ -297,7 +301,7 @@ class AttentionDeepSeekV3(Attention):
                 kv,
                 None,
                 self.cache.curr_req_ids,
-                self.cache.next_seq_len,
+                self.cache.seq_len_delta.new,
                 self.layer_id,
             )
             q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
@@ -341,8 +345,8 @@ class AttentionDeepSeekV3(Attention):
                 self.cache.get_accessor(self.layer_id),
                 k,
                 v,
-                prev_seq_len=self.cache.prev_seq_len,
-                next_seq_len=self.cache.next_seq_len,
+                prev_seq_len=self.cache.seq_len_delta.old,
+                next_seq_len=self.cache.seq_len_delta.new,
                 softmax_scale=self.softmax_scale,
             ).view(bsz, seqlen, self.n_local_heads, self.v_head_dim)
 
@@ -361,8 +365,8 @@ class AttentionDeepSeekV3(Attention):
                 q_pe,
                 self.cache.get_accessor(self.layer_id),
                 kv.view(bsz, seqlen, 1, -1),
-                prev_seq_len=self.cache.prev_seq_len,
-                next_seq_len=self.cache.next_seq_len,
+                prev_seq_len=self.cache.seq_len_delta.old,
+                next_seq_len=self.cache.seq_len_delta.new,
                 softmax_scale=self.softmax_scale,
             )
 
@@ -1331,12 +1335,12 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def prepare_freqs_cis_prefill(self, seq_len):
-        index = self.cache.next_seq_len.position_ids_tensor_device
+        index = self.cache.seq_len_delta.new.position_ids_tensor_device
         return self.freqs_cis_real[index], self.freqs_cis_imag[index]
 
     @override
     def prepare_freqs_cis_decode(self):
-        index = self.cache.prev_seq_len.lens_tensor_device
+        index = self.cache.seq_len_delta.old.lens_tensor_device
         return self.freqs_cis_real[index], self.freqs_cis_imag[index]
 
     @override
@@ -1344,8 +1348,8 @@ class TransformerDeepSeekV3(Transformer):
         block_table = self.cache.get_gpu_block_table()
         block_size = self.cache.get_block_size()
         self.attn_backend.prepare_metadata_for_decode(
-            self.cache.prev_seq_len,
-            self.cache.next_seq_len,
+            self.cache.seq_len_delta.old,
+            self.cache.seq_len_delta.new,
             block_table,
             block_size,
             softmax_scale=compute_softmax_scale_deepseek_v3(self.params),

@@ -88,6 +88,8 @@ TORCH_CUDA_ARCH_LIST=9.0 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-is
 CHITU_ASCEND_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
 # For the Hygon platform, the corresponding torch environment needs to be prepared in advance, and set the environment variable CHITU_HYGON_BUILD=1 during installation.
 CHITU_HYGON_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
+# For the Muxi platform, the corresponding torch environment needs to be prepared in advance, and set the environment variable CHITU_MUXI_BUILD=1 during installation.
+CHITU_MUXI_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
 ```
 Append `-e` to `pip install` for editable install. Example:
 

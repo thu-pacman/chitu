@@ -38,6 +38,8 @@
   用法: 启动赤兔时追加 `models=Kimi-K2-Instruct` 启动参数
 - Llama-3-8B-QServe
   用法: 启动赤兔时追加 `models=Llama-3-8B-QServe` 启动参数
+- Llama-3-8B-QServe-g128
+  用法: 启动赤兔时追加 `models=Llama-3-8B-QServe-g128` 启动参数
 - Llama-3.3-70B-Instruct
   用法: 启动赤兔时追加 `models=Llama-3.3-70B-Instruct` 启动参数
 - Meta-Llama-3-8B-Instruct

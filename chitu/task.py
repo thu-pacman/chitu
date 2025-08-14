@@ -389,7 +389,7 @@ def taskid2reqid(task_id):
 # +:prefill, -:decode
 def req_encode(task_type: TaskType, task_id: str):
     if "_" in task_id:
-        # 分离前缀和实际ID
+        # Separate prefix and actual ID
         prefix, actual_id = task_id.split("_", 1)
         hex_id = actual_id
     else:

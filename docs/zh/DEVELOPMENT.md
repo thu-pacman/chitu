@@ -94,6 +94,8 @@ TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation .
 CHITU_ASCEND_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
 # 海光平台需要先准备好 torch 环境，安装时设置环境变量 CHITU_HYGON_BUILD=1
 CHITU_HYGON_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
+# 沐曦平台需要先准备好 torch 环境，安装时设置环境变量 CHITU_MUXI_BUILD=1
+CHITU_MUXI_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
 ```
 
 当前支持的可选安装项有:
