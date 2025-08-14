@@ -9,6 +9,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 
 def get_extensions():
+
     return [
         CUDAExtension(
             name="chitu_backend",
@@ -30,6 +31,9 @@ def get_extensions():
                 "cxx": ["-std=c++17"],
                 "nvcc": ["-std=c++17"],
             },
+            define_macros=[
+                ("CHITU_MUXI_BUILD", os.environ.get("CHITU_MUXI_BUILD", "0")),
+            ],
             include_dirs=[
                 os.path.join(this_dir, "../third_party/spdlog/include"),
                 os.path.join(this_dir, "cuda/common"),

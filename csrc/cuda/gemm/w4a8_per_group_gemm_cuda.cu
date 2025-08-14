@@ -25,6 +25,8 @@
 
 namespace chitu {
 
+#if CHITU_MUXI_BUILD == 0
+
 #define OP_M 16
 #define OP_N 8
 #define OP_K 32
@@ -649,10 +651,15 @@ dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
     }
 }
 
+#endif
+
 void w4a8_per_group_gemm_forward_cuda(
     torch::Tensor _in_feats, torch::Tensor _kernel, torch::Tensor _zeros,
     torch::Tensor _scales_i8, torch::Tensor _wscales, torch::Tensor _ascales,
     torch::Tensor _out_feats) {
+
+#if CHITU_MUXI_BUILD == 0
+
     int num_in_feats = _in_feats.size(0);
     int num_in_channels = _in_feats.size(1);
     auto in_feats = reinterpret_cast<int8_t *>(_in_feats.data_ptr<int8_t>());
@@ -708,6 +715,9 @@ void w4a8_per_group_gemm_forward_cuda(
         constexpr int STAGES = 3;
         KERNEL_LAUNCH_CODE
     }
+
+#endif
+
     return;
 }
 } // namespace chitu

@@ -51,5 +51,7 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt -c <(pip freeze | grep '==')
 
+ENV CHITU_MUXI_BUILD=1
+
 # The actual installing procedure requries a GPU device, which is not available in the `docker build` stage.
 # We delay it to an additional `docker run` stage which runs `script/install.sh`.
