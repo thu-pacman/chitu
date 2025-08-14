@@ -21,8 +21,8 @@ def fused_group_matmul(
     scale: torch.Tensor,
     expert_tokens: torch.Tensor,
 ):
-    # 加载的权重未做预处理的时候是在 K 方向连续，预处理后是在N 方向连续，然后做了一次 reshape
-    # 所以这次 reshape 是为了还原模型加载的权重
+    # When the loaded weight is not preprocessed, it is contiguous along K; after preprocessing, it becomes contiguous along N and is reshaped once.
+    # So this reshape is to restore the weight loaded by the model.
     weight = weight.reshape(
         weight.shape[0], weight.shape[-1] * 2, weight.shape[-2] // 2
     )

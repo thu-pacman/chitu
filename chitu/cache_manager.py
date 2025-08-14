@@ -249,6 +249,27 @@ class PagedKVCacheManager(KVCacheManagerBase):
         else:
             self.paged_v_cache = None
 
+    def get_max_blocks_per_req(self) -> int:
+        """Return the maximum number of blocks a single request can occupy."""
+        return self.max_blocks_per_req
+
+    def reserve_blocks_for_transfer(self, req_id: str, num_blocks: int) -> List[int]:
+        """Reserve a number of free blocks for an incoming transfer on decode side.
+
+        The reserved blocks are removed from the free list immediately to avoid
+        collision and are recorded in `block_table[req_id]`.
+        """
+        reserved: List[int] = []
+        num_blocks = int(num_blocks)
+        if num_blocks <= 0:
+            return reserved
+        for _ in range(min(num_blocks, len(self.free_blocks))):
+            reserved.append(self.get_free_block())
+        # Record the reservation for this request
+        if reserved:
+            self.block_table[req_id] = list(reserved)
+        return reserved
+
     def realloc(self, num_blocks):
         self.num_blocks = min(num_blocks, self.max_num_blocks)
         logger.info(
@@ -306,7 +327,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
             # 设置其他函数会用到的变量
             self.req_id_to_seq_len[req_id] = seq_len
 
-            # 为请求分配blocks
+            # Allocate blocks for the request
             num_blocks_prepared = (seq_len + self.block_size - 1) // self.block_size
             block_ids = [self.get_free_block() for _ in range(num_blocks_prepared)]
             self.block_table[req_id] = block_ids
@@ -413,6 +434,65 @@ class PagedKVCacheManager(KVCacheManagerBase):
         # assert req_id in self.block_table
         self.free_req_cache_blocks(req_id)
         self.timers("finalize_cache_all_decode").stop()
+
+    # --- PD disaggregation support ---
+    def get_contiguous_buf_infos(self):
+        """
+        Return contiguous buffer info for RDMA registration.
+        For each layer, provide base pointer, total length (bytes), and per-item length (bytes) of one page.
+        Note: Use K buffer if available; if V buffer only, use it.
+        """
+        kv_data_ptrs = []
+        kv_data_lens = []
+        kv_item_lens = []
+
+        has_k = self.paged_k_cache is not None
+        has_v = self.paged_v_cache is not None
+        if not has_k and not has_v:
+            return [], [], []
+
+        # choose a reference buffer for sizing
+        ref_buf = self.paged_k_cache if has_k else self.paged_v_cache
+        elem_size = ref_buf.element_size()
+
+        if self.k_shape_per_sample is not None:
+            other_dims = 1
+            for d in self.k_shape_per_sample:
+                other_dims *= int(d)
+        else:
+            other_dims = 1
+
+        item_len = int(self.block_size) * int(other_dims) * int(elem_size)
+        total_len = int(self.num_blocks) * int(item_len)
+
+        for layer in range(self.num_layers):
+            layer_ptr = (
+                self.paged_k_cache[layer].data_ptr()
+                if has_k
+                else self.paged_v_cache[layer].data_ptr()
+            )
+            kv_data_ptrs.append(layer_ptr)
+            kv_data_lens.append(total_len)
+            kv_item_lens.append(item_len)
+
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def get_page_indices(self, req_id):
+        """Return current allocated page indices for a request, empty if not found."""
+        return self.block_table.get(req_id, [])
+
+    def insert_kv_cache_from_transfer(
+        self, req_id: str, page_indices: List[int], prefix_length: int
+    ):
+        """
+        Register transferred KV pages into block table and set the sequence length.
+        Assumes data has been copied into corresponding pages via RDMA.
+        """
+        # validate indices are within total blocks
+        for idx in page_indices:
+            assert 0 <= int(idx) < self.num_blocks, f"invalid page index: {idx}"
+        self.block_table[req_id] = list(int(x) for x in page_indices)
+        self.req_id_to_seq_len[req_id] = int(prefix_length)
 
 
 class DenseKVCacheManager(KVCacheManagerBase):

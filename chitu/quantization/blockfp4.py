@@ -69,7 +69,7 @@ def linear_block_fp4_npu(
     assert (
         weight.shape[-1] % 2 == 0
     ), f"Weight shape[-1] must be even, but got {weight.shape[-1]}"
-    # 针对反量化矩阵乘算子做的 shape 适配
+    # Shape adaptation for dequantization matmul operator
     weight = weight.reshape(weight.shape[-1] * 2, weight.shape[-2] // 2)
     weight = weight.unsqueeze(0)
     weight_scale = weight_scale.unsqueeze(0)
@@ -80,11 +80,11 @@ def linear_block_fp4_npu(
     output = torch.empty(
         [x.shape[0], weight.shape[-1] * 2], dtype=x.dtype, device=x.device
     )
-    # NOTE: 生成一个仅有一个元素的 Tensor，值为 N,并且需要保证 export tokens 是一个一维的 Tensor
+    # NOTE: Generate a tensor with a single element (value N) and ensure export tokens is 1-D tensor
     expert_tokens = torch.full([1], x.shape[0], device=x.device, dtype=torch.int64)
 
     if x.dim() == 3:
-        # 三维的 x 需要squeeze到二维,在NpuAttnBackend mla_decode_paged_kv 中 x 会被 unsqueeze 到三维
+        # 3D x needs to be squeezed to 2D; in NpuAttnBackend mla_decode_paged_kv, x will be unsqueezed to 3D
         x = x.squeeze(1)
         if x.shape[0] <= 2:
             cinfer_ascendc.grouped_soft_gemv(

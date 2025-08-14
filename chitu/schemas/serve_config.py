@@ -82,6 +82,48 @@ class DpAddressesConfig:
 
 
 @dataclass
+class KvTransferConfig:
+    buffer_size: int = 2048
+    transfer_timeout: float = 30.0
+    max_concurrent_transfers: int = 8
+
+
+@dataclass
+class PDDisaggregationConfig:
+    """PD disaggregation configuration"""
+
+    enabled: bool = False
+    coordination_port: int = 29800  # P-D coordination port
+    metadata_sync_port: int = 29801  # metadata sync port
+    kv_transfer_backend: str = "mooncake"  # kv transfer backend: mooncake, nccl
+    ib_device: Optional[str] = "mlx5_0"  # IB device name
+    bootstrap_port: int = 8080  # Bootstrap server port
+    kv_transfer: KvTransferConfig = field(default_factory=KvTransferConfig)
+
+
+@dataclass
+class PrefillSchedulerConfig:
+    """Prefill Scheduler configuration"""
+
+    host: str = MISSING
+    port: int = MISSING
+    max_batch_size: int = MISSING
+    max_total_tokens: int = MISSING
+    batching_strategy: str = MISSING  # varlen, fixed
+    # kv_config: KvTransferConfig = MISSING
+
+
+@dataclass
+class DecodeSchedulerConfig:
+    """Decode Scheduler configuration"""
+
+    host: str = MISSING
+    port: int = MISSING
+    scheduling_strategy: str = MISSING  # immediate, batched
+    # kv_config: KvTransferConfig = MISSING
+
+
+@dataclass
 class RouterConfig:
     is_router: bool = MISSING
     host: str = MISSING
@@ -90,6 +132,12 @@ class RouterConfig:
     token_port: int = MISSING
     load_balancer_algorithm: str = MISSING
     dp_addresses: List[DpAddressesConfig] = MISSING
+    # PD disaggregation configuration
+    pd_disaggregation: PDDisaggregationConfig = field(
+        default_factory=PDDisaggregationConfig
+    )
+    prefill_schedulers: List[PrefillSchedulerConfig] = field(default_factory=list)
+    decode_schedulers: List[DecodeSchedulerConfig] = field(default_factory=list)
 
 
 @dataclass

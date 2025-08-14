@@ -470,6 +470,100 @@ class Executor:
         Backend.cache_manager.finalize_cache_all_prefill()  # like reset metadata
         return out
 
+    def prefill_step_tp_only(self, tasks: PackedTasksBase) -> torch.Tensor:
+        """
+        PD-only prefill that supports TP but not PP.
+        - Uses only Tensor parallel dispatcher to propagate metadata and payload
+        - Does NOT send/recv hidden/logits across pipeline stages
+        """
+        # 1) propagate tasks across TP
+        tensor_dispatcher = TensorDispatcher()
+        payload_type = tasks.payload_type
+        payload_type, tasks = tensor_dispatcher.dispatch_metadata(tasks, payload_type)
+
+        # 2) prepare cache
+        varlens = BatchedSeqLen.from_tokens(
+            tasks.tokens, device=torch.device(self.local_rank)
+        )
+        Backend.cache_manager.prepare_cache_prefill(tasks.req_ids, varlens)
+
+        # 3) prepare payload on TP main rank only
+        num_tokens = tasks.num_tokens
+        tp_group = get_tp_group()
+        is_tp_main_rank = tp_group.global_rank == tp_group.rank_list[0]
+        if is_tp_main_rank and num_tokens > 0:
+            payload = (
+                torch.from_numpy(np.concatenate(tasks.tokens))
+                .to(self.local_rank)
+                .to(torch.int64)
+            )
+        else:
+            payload = torch.empty(
+                self.get_payload_shape(num_tokens),
+                dtype=self.get_payload_dtype(),
+                device=self.local_rank,
+            )
+
+        # 4) broadcast payload to all TP ranks
+        payload = tensor_dispatcher.recv_payload(payload)
+
+        # 5) run model
+        self.timers("prefill").start()
+        out = Backend.model.prefill(payload)
+        self.timers("prefill").stop()
+
+        # 6) finalize cache
+        Backend.cache_manager.finalize_cache_all_prefill()
+
+        # 7) ensure logits are [B, vocab]
+        if out.dim() == 1:
+            out = out.view(1, -1)
+        else:
+            out = out.view(out.shape[0], -1)
+        return out
+
+    def decode_step_tp_only(
+        self, req_ids: List[str], next_tokens: List[int]
+    ) -> torch.Tensor:
+        """
+        PD-only decode that supports TP but not PP.
+        - Broadcasts next_tokens across TP ranks
+        - Runs one decode step and updates KV cache
+        Returns logits with shape [B, vocab]
+        """
+        # 1) prepare cache and seq lens
+        Backend.cache_manager.prepare_cache_decode(req_ids)
+        seq_lens = [Backend.cache_manager.req_id_to_seq_len[rid] for rid in req_ids]
+
+        # 2) build payload on TP main rank only
+        num_tokens = len(next_tokens)
+        tp_group = get_tp_group()
+        is_tp_main_rank = tp_group.global_rank == tp_group.rank_list[0]
+        if is_tp_main_rank and num_tokens > 0:
+            payload = torch.tensor(
+                next_tokens, device=self.local_rank, dtype=torch.int64
+            )
+        else:
+            payload = torch.empty(
+                self.get_payload_shape(num_tokens),
+                dtype=self.get_payload_dtype(),
+                device=self.local_rank,
+            )
+
+        # 3) broadcast payload to all TP ranks and adapt shape to [B, 1]
+        tensor_dispatcher = TensorDispatcher()
+        payload = tensor_dispatcher.recv_payload(payload).unsqueeze(1)
+
+        # 4) run decode and ensure shape [B, vocab]
+        self.timers("decode").start()
+        out = Backend.model.decode(payload, len(req_ids)).squeeze(1)
+        self.timers("decode").stop()
+
+        # 5) finalize cache for this step
+        Backend.cache_manager.finalize_cache_single_decode(req_ids)
+
+        return out
+
     def decode_step(self, tasks: PackedTasksBase):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
 

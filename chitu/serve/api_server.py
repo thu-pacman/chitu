@@ -316,7 +316,8 @@ async def process_dp_chat_completion(
             f"[DP_HTTP] Request Router status: queue_size={len(request_router.pending_requests)}, total_requests={request_router.total_requests}, instance_id={id(request_router)}"
         )
 
-        await request_router.submit_request(router_request)
+        # Use PD-aware path to ensure PDRequestRouter follows disaggregation logic
+        await request_router.add_request(router_request)
         request_router_time = time.time() - request_router_start
         logger.debug(
             f"[DP_HTTP] Request submitted to Request Router in {request_router_time*1000:.2f}ms"
@@ -636,6 +637,17 @@ def init_dp_router(args):
     # Tokenization will be performed in Enhanced Scheduler
     Backend.args = args  # Set basic args for configuration access
     logger.info("[ROUTER] Router uses lightweight request handling")
+
+    # Check if PD disaggregation is enabled
+    pd_enabled = (
+        hasattr(args.dp_config.router, "pd_disaggregation")
+        and args.dp_config.router.pd_disaggregation.enabled
+    )
+
+    if pd_enabled:
+        logger.info("[ROUTER] PD Disaggregation mode enabled")
+    else:
+        logger.info("[ROUTER] Using DP unified Scheduler mode")
 
     # start dp components
     logger.info("[ROUTER] Starting DP components...")

@@ -85,6 +85,24 @@ class TokenRouter:
 
         # Create and return AsyncResponse
         response = AsyncResponse(router_request)
+        # Attach a completion callback to mark this request as finished on router side
+        try:
+            orig_send_stop_signal = router_request.async_stream.send_stop_signal
+
+            def wrapped_send_stop_signal():
+                logger.info(f"Token Router: Stream stop for request {request_id}")
+                orig_send_stop_signal()
+                # Mark finished timestamp for diagnostics
+                ctx = self.active_requests.get(request_id)
+                if ctx is not None:
+                    ctx.finished_time = time.time()
+                    ctx.finished_marked = True
+
+            router_request.async_stream.send_stop_signal = wrapped_send_stop_signal
+        except Exception as e:
+            logger.warning(
+                f"Token Router: failed to wrap stop signal for {request_id}: {e}"
+            )
 
         logger.info(
             f"Token Router: Request {request_id} registered, active requests: {len(self.active_requests)}"
@@ -123,10 +141,22 @@ class TokenRouter:
             logger.warning(
                 f"Token Router: Received token from unknown request: {request_id}"
             )
+            # Extra diagnostics: possible reasons
+            logger.warning(
+                "Token Router: diagnostics => request context not found. Possible reasons: client stream closed, finish already sent, or router restarted."
+            )
             return
 
         context = self.active_requests[request_id]
         logger.debug(f"Token Router: Found request context, processing token...")
+
+        # If the stream has already been marked finished, log and drop
+        if getattr(context, "finished_marked", False):
+            finished_at = getattr(context, "finished_time", 0)
+            logger.warning(
+                f"Token Router: token arrived after stream finished: request_id={request_id}, delay={time.time()-finished_at:.3f}s"
+            )
+            return
 
         # Safety check 3: timestamp validation (prevent replay attacks)
         timestamp = token_data.get("timestamp", 0)
@@ -189,6 +219,9 @@ class TokenRouter:
 
             # Remove from active requests
             del self.active_requests[request_id]
+            logger.info(
+                f"Token Router: Request {request_id} removed from active_requests on finish"
+            )
 
             logger.debug(
                 f"Token Router: Request {request_id} finished, reason={finish_reason}"
@@ -250,6 +283,9 @@ class RequestContext:
         self.user_request = user_request
         self.dp_stream = dp_stream
         self.created_time = created_time
+        # Finish state for graceful teardown
+        self.finished_marked: bool = False
+        self.finished_time: float = 0.0
 
 
 class DPAsyncDataStream(AsyncDataStream):

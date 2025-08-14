@@ -15,7 +15,7 @@ import torch
 import torch.distributed
 
 from chitu.backend import Backend
-from chitu.chitu_main import chitu_init, warmup_engine
+from chitu.chitu_main import chitu_init, warmup_engine_unified
 from chitu.global_vars import get_global_args
 from chitu.serve.common import process_queue
 from chitu.task import TaskPool
@@ -38,10 +38,35 @@ def init_dp_scheduler(args, rank):
     chitu_init(args, logging_level=logging.INFO)
     torch.distributed.barrier()
 
-    logger.info(f"[WARMUP] Starting warmup...")
-    warmup_engine(args)
-    # warmup - DP compatible: each DP group's local master rank needs to do warmup
-    logger.info(f"[WARMUP] Warmup done, task pool size: {len(TaskPool.pool)}")
+    # 统一 warmup（Router 进程在 unified 内会自动跳过）
+    try:
+        warmup_engine_unified(args)
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        logger.warning(f"[SCHEDULER] unified warmup skipped/failed: {e}")
+
+    # Check if PD disaggregation is enabled
+    pd_enabled = (
+        hasattr(args.dp_config.router, "pd_disaggregation")
+        and args.dp_config.router.pd_disaggregation.enabled
+    )
+
+    if pd_enabled:
+        logger.info("[SCHEDULER] PD disaggregation enabled, using PD Scheduler")
+        # Use PD disaggregation scheduler
+        from chitu.distributed.pd_disaggregation.pd_service import init_pd_scheduler
+
+        init_pd_scheduler(args, rank)
+        return
+
+    # Traditional DP scheduler
+    logger.info("[SCHEDULER] Using traditional DP Enhanced Scheduler")
+
+    logger.info(
+        f"[WARMUP] Unified warmup done earlier; task pool size: {len(TaskPool.pool)}"
+    )
 
     logger.info(
         f"[SCHEDULER] Starting parallel tasks: process_queue + Enhanced Scheduler service..."

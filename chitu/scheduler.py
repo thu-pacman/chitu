@@ -39,13 +39,40 @@ class Scheduler:
             prefill_num_tasks = infer_args.max_reqs
             decode_num_tasks = infer_args.max_reqs
 
-        return Scheduler(prefill_num_tasks, decode_num_tasks, args.type.lower())
+        return Scheduler(
+            prefill_num_tasks,
+            decode_num_tasks,
+            Scheduler._normalize_scheduler_type(args.type.lower()),
+            original_scheduler_type=args.type.lower(),
+        )
+
+    @staticmethod
+    def _normalize_scheduler_type(scheduler_type: str) -> str:
+        """Map aliases and PD-specific scheduler types to base types.
+
+        - "prefill_only" -> "prefill_first"
+        - "decode_only"  -> "fcfs"
+        """
+        parts = [p.strip().lower() for p in scheduler_type.split(",") if p.strip()]
+        normalized_parts = []
+        for part in parts:
+            if part == "prefill_only":
+                normalized_parts.append("prefill_first")
+            elif part == "decode_only":
+                normalized_parts.append("fcfs")
+            else:
+                normalized_parts.append(part)
+
+        if not normalized_parts:
+            normalized_parts = ["fcfs"]
+        return ",".join(normalized_parts)
 
     def __init__(
         self,
         prefill_num_tasks: int,
         decode_num_tasks: int,
         scheduler_type: str,
+        original_scheduler_type: str = None,
     ):
         """
         Initialize the scheduler.
@@ -77,8 +104,16 @@ class Scheduler:
         self.prefill_num_tasks = prefill_num_tasks
         self.decode_num_tasks = decode_num_tasks
 
+        # strict-only gating derived from original type string
+        self.strict_allowed_task_type = self._extract_strict_task_type(
+            original_scheduler_type
+            if original_scheduler_type is not None
+            else scheduler_type
+        )
+
         # determine scoring method
         self.scorers = []
+        scheduler_type = Scheduler._normalize_scheduler_type(scheduler_type)
         for st in scheduler_type.split(","):
             if st == "request_preset":
                 self.scorers.append(lambda task: task.priority)
@@ -108,9 +143,23 @@ class Scheduler:
             return []
 
         self.scheduling_ts = time.perf_counter_ns()
+        # collect ready task ids
         task_ids = list(
             filter(lambda x: not TaskPool.pool[x].waiting, TaskPool.id_list)
         )
+
+        # enforce strict-only gating if enabled
+        if getattr(self, "strict_allowed_task_type", None) is not None:
+            task_ids = [
+                tid
+                for tid in task_ids
+                if TaskPool.pool[tid].task_type == self.strict_allowed_task_type
+            ]
+            if len(task_ids) == 0:
+                logger.debug(
+                    "Strict-only gating active and no allowed tasks available."
+                )
+                return []
         if len(task_ids) == 0:
             logger.debug("All tasks are waiting, returning empty task list.")
             return []
@@ -139,6 +188,26 @@ class Scheduler:
 
         logger.debug(f"Selected task_ids: {task_ids}")
         return task_ids
+
+    @staticmethod
+    def _extract_strict_task_type(scheduler_type: str):
+        """Return TaskType when strict-only is requested, otherwise None.
+
+        Recognized tokens:
+        - "prefill_only" => TaskType.Prefill
+        - "decode_only"  => TaskType.Decode
+        If both appear, no strict gating will be applied.
+        """
+        if not scheduler_type:
+            return None
+        parts = [p.strip().lower() for p in scheduler_type.split(",") if p.strip()]
+        has_prefill_only = any(p == "prefill_only" for p in parts)
+        has_decode_only = any(p == "decode_only" for p in parts)
+        if has_prefill_only and not has_decode_only:
+            return TaskType.Prefill
+        if has_decode_only and not has_prefill_only:
+            return TaskType.Decode
+        return None
 
     def reorder_tasks_for_batching(self, task_ids):
         args = get_global_args()

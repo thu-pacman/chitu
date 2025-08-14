@@ -62,13 +62,13 @@ dp_config:
   dp_id: 0
   tp_size: 1
   pp_size: 1
-  # Router配置
+  # Router configuration
   router:
     is_router: False
     host: 0.0.0.0
-    port: 21003              # HTTP服务端口
-    stats_port: 29600        # ZMQ端口
-    token_port: 29700        # ZMQ端口
+    port: 21003              # HTTP service port
+    stats_port: 29600        # ZMQ port
+    token_port: 29700        # ZMQ port
     load_balancer_algorithm: "power_of_two_choices"
     # Scheduler zmq address, there many scheduler, use dp_id to identify the scheduler
     # dp_id = 0, scheduler_address = tcp://0.0.0.0:29610
@@ -90,6 +90,21 @@ dp_config:
         port: 29616
       - host: 0.0.0.0
         port: 29617
+    # PD disaggregation configuration
+    pd_disaggregation:
+      enabled: False            # whether to enable PD disaggregation
+    # Prefill Scheduler list
+    prefill_schedulers:
+      - host: 0.0.0.0
+        port: 29620
+        max_batch_size: 32
+        max_total_tokens: 8192
+        batching_strategy: "varlen"
+    # Decode Scheduler list  
+    decode_schedulers:
+      - host: 0.0.0.0
+        port: 29630
+        scheduling_strategy: "immediate"
 quant: null
 dtype: null # Legacy parameter. To be removed in the future.
 float_16bit_variant: bfloat16 # one of: bfloat16, float16. This sets the default_dtype of torch

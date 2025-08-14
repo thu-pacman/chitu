@@ -106,7 +106,30 @@ def get_additional_block_num(
     return max(0, num_blocks)
 
 
-def warmup_engine(args):
+def _auto_set_num_blocks_after_warmup(args):
+    if args.infer.cache_type == "paged" and args.infer.num_blocks == -1:
+        assert isinstance(Backend.cache_manager, PagedKVCacheManager)
+        _, total_gpu_memory = torch.cuda.mem_get_info(0)
+        gpu_memory_utilization = args.infer.gpu_memory_utilization
+        new_num_block = (
+            get_additional_block_num(
+                total_gpu_memory, Backend.cache_manager, gpu_memory_utilization
+            )
+            + Backend.cache_manager.num_blocks
+        )
+
+        if torch.distributed.get_world_size() > 1:
+            new_num_block_tensor = torch.tensor(new_num_block).cuda()
+            torch.distributed.all_reduce(
+                new_num_block_tensor, torch.distributed.ReduceOp.RedOpType.MIN
+            )
+            new_num_block = new_num_block_tensor.item()
+
+        get_global_args().infer.num_blocks = new_num_block
+        Backend.cache_manager.realloc(new_num_block)
+
+
+def _warmup_via_taskpool(args):
     if args.infer.pp_size > 1:
         logger.warning("Warming-up is not supported when PP is enabled. Skipping")
         if args.infer.cache_type == "paged":
@@ -157,26 +180,88 @@ def warmup_engine(args):
 
     logger.warning("Inference system warmup completed")
 
-    if args.infer.cache_type == "paged" and args.infer.num_blocks == -1:
+
+def _warmup_backend_direct(args, decode_steps: int = 2):
+    logger.warning("Starting local backend warmup (direct)...")
+    init_cache_static()
+    # Minimal request
+    req_id = "__warmup__"
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    tokens = torch.tensor([1], device=torch.device(local_rank), dtype=torch.int64)
+    # Prefill
+    from chitu.batched_seq_len import BatchedSeqLen
+
+    Backend.cache_manager.prepare_cache_prefill(
+        [req_id], BatchedSeqLen.from_tokens([[1]], device=torch.device(local_rank))
+    )
+    _ = Backend.model.prefill(tokens)
+    Backend.cache_manager.finalize_cache_all_prefill()
+    # Decode steps
+    for _ in range(max(1, decode_steps)):
+        Backend.cache_manager.prepare_cache_decode([req_id])
+        step_token = torch.tensor(
+            [0], device=torch.device(local_rank), dtype=torch.int64
+        ).unsqueeze(1)
+        seq_lens = [Backend.cache_manager.req_id_to_seq_len[req_id]]
+        _ = Backend.model.decode(step_token, len(req_id)).squeeze(1)
+        Backend.cache_manager.finalize_cache_single_decode([req_id])
+    # Clean KV for this request
+    Backend.cache_manager.finalize_cache_all_decode(req_id)
+    logger.warning("Local backend warmup (direct) completed")
+
+
+def warmup_engine_unified(args):
+    # Router 进程不做 warmup
+    try:
+        if getattr(args.dp_config.router, "is_router", False):
+            return
+    except Exception:
+        pass
+
+    # PP>1 + paged：保持原跳过与兜底策略
+    if args.infer.pp_size > 1 and args.infer.cache_type == "paged":
         assert isinstance(Backend.cache_manager, PagedKVCacheManager)
-        _, total_gpu_memory = torch.cuda.mem_get_info(0)
-        gpu_memory_utilization = args.infer.gpu_memory_utilization
-        new_num_block = (
-            get_additional_block_num(
-                total_gpu_memory, Backend.cache_manager, gpu_memory_utilization
+        logger.warning("Warming-up is not supported when PP is enabled. Skipping")
+        if args.infer.num_blocks == -1:
+            logger.warning(
+                "Auto infer.num_blocks (infer.num_blocks=-1) relies on warming-up to calculate the number of "
+                "blocks, but this is not supported when PP is enabled. A safe but inefficient value is used."
             )
-            + Backend.cache_manager.num_blocks
+            new_num_block = (
+                args.infer.max_reqs
+                * args.infer.max_seq_len
+                // Backend.cache_manager.block_size
+            )
+            get_global_args().infer.num_blocks = new_num_block
+            Backend.cache_manager.realloc(new_num_block)
+        return
+
+    # 选择 Runner：优先环境变量；否则 PD→direct，非PD→taskpool
+    pd_enabled = False
+    try:
+        pd_enabled = (
+            hasattr(args.dp_config.router, "pd_disaggregation")
+            and args.dp_config.router.pd_disaggregation.enabled
         )
+    except Exception:
+        pd_enabled = False
 
-        if torch.distributed.get_world_size() > 1:
-            new_num_block_tensor = torch.tensor(new_num_block).cuda()
-            torch.distributed.all_reduce(
-                new_num_block_tensor, torch.distributed.ReduceOp.RedOpType.MIN
-            )
-            new_num_block = new_num_block_tensor.item()
+    runner = "direct" if pd_enabled else "taskpool"
+    if runner == "taskpool":
+        _warmup_via_taskpool(args)
+    else:
+        _warmup_backend_direct(args, decode_steps=2)
+    _auto_set_num_blocks_after_warmup(args)
 
-        get_global_args().infer.num_blocks = new_num_block
-        Backend.cache_manager.realloc(new_num_block)
+
+def warmup_engine(args):
+    # 兼容旧入口：统一走新实现
+    return warmup_engine_unified(args)
+
+
+def warmup_engine_pd(args):
+    # 兼容旧入口：统一走新实现（PD/非PD 均复用 direct backend 预热）
+    return warmup_engine_unified(args)
 
 
 def check_checkpoint_path(args):
@@ -494,7 +579,7 @@ async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
                     "scheduler_id": rank,
                     "dp_group_id": int(
                         dp_config.dp_id
-                    ),  # 这里利用传入的dp_id作为stat所属dp group的唯一标识，因为rank值全是0，无法作为参考
+                    ),  # Use provided dp_id as the unique identifier for dp group stats, since all ranks are 0 and cannot be referenced
                     "running_requests": (
                         len(Backend.ongoing_reqs)
                         if hasattr(Backend, "ongoing_reqs")
@@ -539,12 +624,12 @@ async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
 
 
 async def process_scheduler_request(rank: int, request_data: dict):
-    """处理来自Router的调度请求"""
+    """Handle scheduling requests from Router"""
     try:
         from chitu.task import UserRequest, Task, TaskPool
         from chitu.utils import gen_req_id
 
-        # 构造UserRequest对象
+        # Build UserRequest object
         request_id = request_data.get("request_id", gen_req_id())
         message = request_data.get("message", [])
         max_new_tokens = request_data.get("max_new_tokens", 50)
@@ -554,7 +639,7 @@ async def process_scheduler_request(rank: int, request_data: dict):
         logprobs = request_data.get("logprobs", False)
         top_logprobs = request_data.get("top_logprobs", None)
 
-        # 创建UserRequest
+        # Create UserRequest
         user_request = UserRequest(
             message=message,
             request_id=request_id,
@@ -566,36 +651,43 @@ async def process_scheduler_request(rank: int, request_data: dict):
             top_logprobs=top_logprobs,
         )
 
-        # 创建Task
+        # Create Task
         task = Task(task_id=request_id, req=user_request)
 
         try:
             from chitu.dp_token_sender import get_dp_token_manager
 
-            dp_group_id = rank  # 使用rank作为DP组ID
+            dp_group_id = rank  # Use rank as DP group ID
             token_manager = get_dp_token_manager(dp_group_id)
-
+            # ensure token manager started
+            await token_manager.start()
             if token_manager is not None:
-                # 包装Task以启用Token发送功能
+                # Wrap Task to enable token sending
                 wrapped_task = token_manager.wrap_task(task)
                 TaskPool.add(wrapped_task)
             else:
-                # 如果Token Manager未初始化，直接添加原始Task
+                # If Token Manager not initialized, add the original Task directly
                 TaskPool.add(task)
 
         except Exception as e:
-            # 如果DP Token Manager获取失败，回退到原始Task
-            logger.error(f"[Enhanced Scheduler {rank}] DP Token Manager获取失败: {e}")
+            # If DP Token Manager acquisition fails, fall back to original Task
+            logger.error(
+                f"[Enhanced Scheduler {rank}] Failed to get DP Token Manager: {e}"
+            )
             TaskPool.add(task)
-            logger.warning(f"[Enhanced Scheduler {rank}] 回退到原始任务: {request_id}")
+            logger.warning(
+                f"[Enhanced Scheduler {rank}] Fallback to original task: {request_id}"
+            )
 
-        logger.debug(f"[Enhanced Scheduler {rank}] 任务处理完成: {request_id}")
+        logger.debug(f"[Enhanced Scheduler {rank}] Request handled: {request_id}")
 
     except Exception as e:
-        logger.error(f"[Enhanced Scheduler {rank}] 处理请求失败: {e}")
+        logger.error(f"[Enhanced Scheduler {rank}] Failed to process request: {e}")
         import traceback
 
-        logger.error(f"[Enhanced Scheduler {rank}] 错误详情: {traceback.format_exc()}")
+        logger.error(
+            f"[Enhanced Scheduler {rank}] Error details: {traceback.format_exc()}"
+        )
 
 
 def chitu_terminate():
