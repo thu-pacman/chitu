@@ -36,3 +36,9 @@ def is_hopper():
     HOPPER_DEVICE_PATTERNS = ["H20", "H100"]
     device_name = get_device_name()
     return any(pattern in device_name for pattern in HOPPER_DEVICE_PATTERNS)
+
+
+def is_blackwell():
+    BLACKWELL_DEVICE_PATTERNS = ["5090", "B200", "B100"]
+    device_name = get_device_name()
+    return any(pattern in device_name for pattern in BLACKWELL_DEVICE_PATTERNS)

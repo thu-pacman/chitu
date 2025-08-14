@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: 2025 Qingcheng.AI
 #
 # SPDX-License-Identifier: Apache-2.0
+from typing import Tuple, Optional, Dict, Any, List
 
-from typing import Tuple
-
+from chitu.device_type import is_blackwell
 import torch
+import torch.nn.functional as F
 
 from chitu.utils import try_import_platform_dep
 from chitu.native_layout import Packed4BitWeightAlongK
@@ -91,10 +92,14 @@ def fp4_fake_quant(x, block_size=16, block_scale=None, global_scale=None, quant=
     qx = fp4_rtn(abs_scaled_x)
     sign = torch.where(scaled_x >= 0, 1.0, -1.0)
     if quant:
-        return (qx * sign).reshape(shape).to(dtype), block_scale.squeeze(), global_scale
+        return (
+            (qx * sign).reshape(shape).to(dtype),
+            block_scale.squeeze(-1),
+            global_scale,
+        )
     else:
         qdq_x = qx * dq_block_scale * sign
-        return qdq_x.reshape(shape).to(dtype), block_scale.squeeze(), global_scale
+        return qdq_x.reshape(shape).to(dtype), block_scale.squeeze(-1), global_scale
 
 
 def fp4_rtn(abs_scaled_x):
@@ -442,6 +447,152 @@ def weight_dequant_deepseek_v3(
         return weight_dequant_deepseek_v3_triton(x, s, block_size)
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
+def pad_tensor_to_size(tensor, target_size):
+    """
+    Pad the first dimension of tensor to target_size
+    """
+    a, n = tensor.shape
+
+    if target_size <= a:
+        return tensor[:target_size]
+
+    new_tensor = torch.zeros((target_size, n), dtype=tensor.dtype, device=tensor.device)
+    new_tensor[:a] = tensor
+
+    return new_tensor
+
+
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-SnippetCopyrightText: 2025 vllm Team
+# SPDX-SnippetCopyrightText: 2025 Qingcheng.AI
+# SDPX—SnippetName: cutlass_scaled_fp4_mm from vllm
+def cutlass_scaled_fp4_mm(
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    # reference: https://github.com/vllm-project/vllm/blob/a7b8788d2c2fae6bf52c128916de19e85f2b0a25/vllm/_custom_ops.py#L663
+
+    assert x.ndim == 2 and weight.ndim == 2
+    if not isinstance(alpha, torch.Tensor):
+        alpha = torch.tensor(alpha, dtype=torch.float32, device=x.device)
+    m, n = x.shape[0], weight.shape[0]
+    out = torch.empty((m, n), dtype=out_dtype, device=x.device)
+    chitu_backend.cuda_nvfp4_scaled_mm(out, x, weight, x_scale, weight_scale, alpha)
+    return out
+
+
+def convert_linear_to_swizzled(a_sf_linear: torch.Tensor, m, k, block_size):
+    m_tiles = (m + 128 - 1) // 128
+    f = block_size * 4
+    k_tiles = (k + f - 1) // f
+    tmp = torch.reshape(a_sf_linear, (1, m_tiles, 4, 32, k_tiles, 4))
+    tmp = torch.permute(tmp, (0, 1, 4, 3, 2, 5))
+    out = tmp.reshape(m_tiles * 128, k_tiles * f // block_size)
+    return out[0:m, 0:k]
+
+
+def hard_fp4_scaled_mm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    assert is_blackwell()
+    original_shape = x.shape
+    original_lines = x.numel() // x.shape[-1]
+
+    def round_up(x, y):
+        return (x + y - 1) // y * y
+
+    rounded_m = round_up(x.shape[0], 128)
+    k = x.shape[-1]
+
+    if x.ndim > 2:
+        x = x.view(-1, x.shape[-1])
+    # fp4_scaled_mm kernel requires the first dimension of the input matrix to be a multiple of 128
+    x = pad_tensor_to_size(x, rounded_m)
+    x_global_scale = ((448 * 6) / torch.amax(x.flatten(), dim=-1)).to(torch.float32)
+
+    x, x_scale = scaled_fp4_quant(x, x_global_scale)
+    if alpha is None:
+        alpha = ((1.0 / x_global_scale) * weight_scale_2).to(torch.float32).to(x.device)
+
+    y = cutlass_scaled_fp4_mm(
+        x, x_scale, weight, weight_scale.view(torch.float8_e4m3fn), alpha, out_dtype
+    )[:original_lines]
+    y = y.view(*original_shape[:-1], -1)
+    return y
+
+
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-SnippetCopyrightText: 2025 vllm Team
+# SPDX-SnippetCopyrightText: 2025 Qingcheng.AI
+# SDPX—SnippetName: scaled_fp4_quant from vllm
+def scaled_fp4_quant(
+    input: torch.Tensor, input_global_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize input tensor to FP4 and return quantized tensor and scale.
+
+    This function quantizes the last dimension of the given tensor `input`. For
+    every 16 consecutive elements, a single dynamically computed scaling factor
+    is shared. This scaling factor is quantized using the `input_global_scale`
+    and is stored in a swizzled layout (see
+    https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-b-layout-4x).
+
+    Args:
+        input: The input tensor to be quantized to FP4
+        input_global_scale: A scalar scaling factor for the entire tensor.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: The output tensor in FP4 but every
+            two values are packed into a uint8 and float8_e4m3 scaling factors
+            in the sizzled layout.
+    """
+    # reference: https://github.com/vllm-project/vllm/blob/a7b8788d2c2fae6bf52c128916de19e85f2b0a25/vllm/_custom_ops.py#L1117
+
+    assert input.ndim >= 1, f"input.ndim needs to be >= 1, but got {input.ndim}."
+    other_dims = 1 if input.ndim == 1 else -1
+    input = input.reshape(other_dims, input.shape[-1])
+    m, n = input.shape
+    block_size = 16
+    device = input.device
+
+    assert n % block_size == 0, f"last dim has to be multiple of 16, but got {n}."
+    assert input.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ), f"input.dtype needs to be fp16 or bf16 but got {input.dtype}."
+
+    # Two fp4 values will be packed into an uint8.
+    output = torch.empty((m, n // 2), device=device, dtype=torch.uint8)
+
+    # We use the rounded values to store the swizzled values. Due to the
+    # requirement of the Tensor Core, the minimum tile is 128x4 for the scales.
+    # So, we first pad the scales to multiples of 128 and 4. Then, the scales
+    # (in float8_e4m3fn) are packed into an int32 for every 4 values. More:
+    # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-b-layout-4x
+    round_up = lambda x, y: (x + y - 1) // y * y
+    rounded_m = round_up(m, 128)
+    scale_n = n // block_size
+    rounded_n = round_up(scale_n, 4)
+    output_scale = torch.empty(
+        (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
+    )
+
+    chitu_backend.cuda_scaled_fp4_quant(output, input, output_scale, input_global_scale)
+    output_scale = output_scale.view(torch.float8_e4m3fn)
+    return output, output_scale
 
 
 def mixq_gemm(

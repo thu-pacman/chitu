@@ -15,6 +15,8 @@
 #include "response_append/response_append.h"
 #include "rotary/rotary_pos_emb_llama.h"
 #include "weight_layout/weight_layout_change.h"
+#include "hard_fp4/nvfp4_scaled_mm_entry.h"
+#include "hard_fp4/nvfp4_quant_entry.h"
 #include "gemm/w4a8_per_group_gemm_cuda.h"
 
 namespace py = pybind11;
@@ -36,6 +38,10 @@ void init_compute(py::module &m) {
     m.def("cuda_frequency_penalty", &applyFrequencyPenalty, "");
     m.def("cuda_response_append", &response_append, "");
     m.def("w4a8_per_group_gemm_forward_cuda",&w4a8_per_group_gemm_forward_cuda, "");
+#if defined ENABLE_NVFP4 && ENABLE_NVFP4
+    m.def("cuda_nvfp4_scaled_mm", &cutlass_scaled_fp4_mm, "");
+    m.def("cuda_scaled_fp4_quant", &scaled_fp4_quant, "");
+#endif
 }
 
 /**

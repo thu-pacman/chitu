@@ -1,0 +1,112 @@
+#####################################
+# Base Image Stage
+FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel AS base
+
+ARG torch_cuda_arch_list='12.0+PTX'
+ARG optional_deps=''
+ARG build_jobs=''
+ARG enable_editable_install='false'
+ARG enable_cython='true'
+ARG enable_test='false'
+
+RUN if [ "${enable_editable_install}" != "true" ] && [ "${enable_editable_install}" != "false" ]; then \
+    echo "ARG enable_editable_install must either be 'true' or 'false'"; \
+    exit 1; \
+fi
+RUN if [ "${enable_cython}" != "true" ] && [ "${enable_cython}" != "false" ]; then \
+    echo "ARG enable_cython must either be 'true' or 'false'"; \
+    exit 1; \
+fi
+RUN if [ "{enable_cython}" = "true" ] && [ "${enable_editable_install}" = "true" ]; then \
+    echo "Cython is not supported when installing in editable mode"; \
+    exit 1; \
+fi
+RUN if [ "${enable_test}" != "true" ] && [ "${enable_test}" != "false" ]; then \
+    echo "ARG enable_test must either be 'true' or 'false'"; \
+    exit 1; \
+fi
+
+# Required for non-interactive apt install
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+
+ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
+ENV ENABLE_NVFP4=1
+
+RUN apt update -y && apt install -y git gcc-10 g++-10 libnuma-dev
+
+# NOTE: Always apt update before apt install to avoid out-dated docker cache
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# NOTE: Always apt update before apt install to avoid out-dated docker cache
+RUN if [ "${enable_test}" = "true" ]; then \
+    apt update -y && apt install -y expect && \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest; \
+fi
+
+# Always install build time dependencies. Some dependencies may fail to build
+# if some build time dependencies are missing.
+COPY ./requirements-build.txt /tmp/requirements-build.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements-build.txt
+
+
+#####################################
+# Dependency Resolver Stage
+#
+# The only purpose of this stage is to generate a requirements.txt file. This
+# stage may trigger rebuild whenever there is any change in the source code,
+# but this stage runs fast.
+FROM base AS dependency_resolver
+
+WORKDIR /workspace/chitu
+COPY . .
+
+RUN ./gen_tmp_requirements_txt.py "${optional_deps}" > /tmp/requirements.txt
+
+
+#####################################
+# Dependency Installer Stage
+#
+# This stage installs the dependencies listed in requirements.txt. Some of the
+# dependencies may require compilation, so this stage may take a long time, but
+# this stage only triggers rebuild when the requirements.txt file changes, or
+# this source of the dependencies changes.
+FROM base AS dependency_installer
+
+WORKDIR /workspace/chitu
+COPY --from=dependency_resolver /tmp/requirements.txt /tmp/requirements.txt
+COPY ./third_party ./third_party
+COPY ./csrc/cpuinfer ./csrc/cpuinfer
+
+# Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
+# compile at install time, and the compile results are environment dependent.
+RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt
+RUN pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+WORKDIR /workspace
+RUN rm -rf /workspace/chitu
+
+
+#####################################
+# Build Stage
+# 
+# This stage builds chitu.
+FROM dependency_installer AS build
+
+WORKDIR /workspace/chitu
+COPY . .
+
+# Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
+# compile at install time, and the compile results are environment dependent.
+RUN bash script/install.sh "${optional_deps}" "${build_jobs}" "${enable_editable_install}" "${enable_cython}"
+
+COPY ./flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl /tmp/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
+RUN pip install /tmp/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
+RUN pip install triton==3.4.0 -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# These are optimization flags for NCCL, but according to our tests, they only make things
+# worse, so we don't use them.
+ENV NCCL_GRAPH_MIXING_SUPPORT=0
+ENV NCCL_GRAPH_REGISTER=0

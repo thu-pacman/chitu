@@ -3,12 +3,43 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+
+import torch
 from torch.utils.cpp_extension import CUDAExtension
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 
 def get_extensions():
+    cxx_extra_args = []
+    nvcc_extra_args = []
+    extra_sources = []
+    extra_include_dirs = []
+
+    if torch.compiled_with_cxx11_abi():
+        cxx_extra_args.append("-D_GLIBCXX_USE_CXX11_ABI=1")
+        nvcc_extra_args.append("-D_GLIBCXX_USE_CXX11_ABI=1")
+    else:
+        cxx_extra_args.append("-D_GLIBCXX_USE_CXX11_ABI=0")
+        nvcc_extra_args.append("-D_GLIBCXX_USE_CXX11_ABI=0")
+
+    enable_nvfp4 = os.environ.get("ENABLE_NVFP4", "0") == "1"
+
+    if enable_nvfp4:
+        cutlass_path = os.path.join(this_dir, "../third_party/cutlass")
+        cxx_extra_args += ["-DENABLE_NVFP4"]
+        nvcc_extra_args += [
+            "-DENABLE_NVFP4",
+            "-gencode=arch=compute_120a,code=compute_120a",
+        ]
+        extra_include_dirs += [
+            os.path.join(cutlass_path, "include"),
+            os.path.join(cutlass_path, "tools/util/include"),
+        ]
+        extra_sources += [
+            os.path.join(this_dir, "cuda/hard_fp4/nvfp4_scaled_mm_kernels.cu"),
+            os.path.join(this_dir, "cuda/hard_fp4/nvfp4_quant_kernels.cu"),
+        ]
 
     return [
         CUDAExtension(
@@ -26,10 +57,11 @@ def get_extensions():
                 os.path.join(this_dir, "cuda/weight_layout/weight_layout_change.cu"),
                 os.path.join(this_dir, "cuda/dequant/dequant.cu"),
                 os.path.join(this_dir, "cuda/gemm/w4a8_per_group_gemm_cuda.cu"),
-            ],
+            ]
+            + extra_sources,
             extra_compile_args={
-                "cxx": ["-std=c++17"],
-                "nvcc": ["-std=c++17"],
+                "cxx": ["-std=c++17"] + cxx_extra_args,
+                "nvcc": ["-std=c++17"] + nvcc_extra_args,
             },
             define_macros=[
                 ("CHITU_MUXI_BUILD", os.environ.get("CHITU_MUXI_BUILD", "0")),
@@ -37,7 +69,8 @@ def get_extensions():
             include_dirs=[
                 os.path.join(this_dir, "../third_party/spdlog/include"),
                 os.path.join(this_dir, "cuda/common"),
-            ],
+            ]
+            + extra_include_dirs,
         )
     ]
 
