@@ -561,21 +561,18 @@ class DenseKVCacheManager(KVCacheManagerBase):
 
         self.slot_handle = get_slot_handle()
 
-        args = get_global_args()
-        if args.infer.pp_size > 1 and args.infer.use_cuda_graph:
-            raise NotImplementedError(
-                "Setting infer.cache_type=skew and infer.use_cuda_graph=True "
-                "simultaneously is not supported when using pipeline parallelism"
-            )
+    def get_start_idx(self):
+        if self.slot_handle:
+            start_idx, _ = self.slot_handle.get_current_slot_start_end_idx()
+        else:
+            start_idx = 0
+        return start_idx
 
     @override
     def prepare_cache_prefill(self, req_ids: List[str], next_seq_len: BatchedSeqLen):
         super().prepare_cache_prefill(req_ids, next_seq_len)
 
-        if self.slot_handle:
-            start_idx, _ = self.slot_handle.get_current_slot_start_end_idx()
-        else:
-            start_idx = 0
+        start_idx = self.get_start_idx()
         for it, req_id in enumerate(req_ids):
             self.req_id_to_seq_len[req_id] = next_seq_len.lens_list[it]
             for i in range(start_idx, self.num_hot_req):
@@ -638,7 +635,7 @@ class DenseKVCacheManager(KVCacheManagerBase):
         self.timers("cache_prepare").stop()
 
     def _prepare_cache(self, req_ids: List[str]):
-        start_pos = self.hot_reqs.index(req_ids[0])
+        start_pos = self.get_start_idx()
         assert start_pos + len(req_ids) <= self.num_hot_req
 
         self.k_prepared_cache = (

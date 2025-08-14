@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from chitu.attn_backend import AttnBackend
-from chitu.cache_manager import PagedKVCacheManager
+from chitu.cache_manager import PagedKVCacheManager, DenseKVCacheManager
 from chitu.cuda_graph import make_dispatched_graphed_callables
 from chitu.device_type import is_ascend, is_muxi, is_nvidia
 from chitu.global_vars import get_global_args, get_timers
@@ -809,6 +809,11 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def decode(self, tokens, batch_size):
+        if isinstance(self.cache, DenseKVCacheManager):
+            key = (batch_size, self.cache.get_start_idx())
+        else:
+            key = (batch_size,)
+
         self.prepare_decoding_attn()
 
         infer_args = get_global_args().infer
@@ -838,7 +843,9 @@ class Transformer(nn.Module):
             @make_dispatched_graphed_callables(
                 args_max_nelem=(tokens.numel() // batch_size * self.max_batch_size,),
                 kwargs_max_nelem={},
-                output_max_nelem_callback=lambda bs, n: n // bs * self.max_batch_size,
+                output_max_nelem_callback=lambda key, n: n
+                // key[0]
+                * self.max_batch_size,
                 before_replay_callback=before_replay_callback,
                 enable=current_cuda_graph_enabled,
             )
@@ -853,7 +860,7 @@ class Transformer(nn.Module):
 
             self.do_decode_callable = do_decode
 
-        return self.do_decode_callable(batch_size, tokens)
+        return self.do_decode_callable(key, tokens)
 
 
 class MoeGate(nn.Module):
