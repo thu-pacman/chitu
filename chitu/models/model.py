@@ -184,12 +184,11 @@ class Attention(nn.Module):
     def _run_output_linear(self, x):
         raise NotImplementedError
 
-    def prefill_forward(
+    def forward(
         self,
         x: torch.Tensor,
         freqs_cis_cos: torch.Tensor,
         freqs_cis_sin: torch.Tensor,
-        seq_len,
     ):
         bs_seq, _ = x.shape
         xq, xk, xv = self._run_linear(x)
@@ -199,48 +198,15 @@ class Attention(nn.Module):
         xq, xk = apply_rotary_pos_emb(
             xq, xk, freqs_cis_cos, freqs_cis_sin, rotary_type="interleaved"
         )
-        self.cache.finalize_cache_bylayer_prefill(
-            xk, xv, self.cache.curr_req_ids, self.cache.seq_len_delta.new, self.layer_id
-        )
-        output = self.attn_backend.prefill_ragged_qkvo(
-            xq, xk, xv, seq_len, causal=True
-        ).view(bs_seq, -1)
-        return self._run_output_linear(output)
-
-    def decode_forward(
-        self, x: torch.Tensor, freqs_cis_cos: torch.Tensor, freqs_cis_sin: torch.Tensor
-    ):
-        bsz, seqlen, _ = x.shape
-        assert seqlen == 1, "decode_forward only supports single token decoding"
-        xq, xk, xv = self._run_linear(x)
-
-        xq = xq.view(-1, self.n_local_heads, self.head_dim)
-        xk = xk.view(-1, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(-1, self.n_local_kv_heads, self.head_dim)
-
-        xq, xk = apply_rotary_pos_emb(
-            xq, xk, freqs_cis_cos, freqs_cis_sin, rotary_type="interleaved"
-        )
-
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-
-        output = self.attn_backend.decode(
+        output = self.attn_backend(
             xq,
             self.cache.get_accessor(self.layer_id),
             xk,
             xv,
-            prev_seq_len=self.cache.seq_len_delta.old,
-            next_seq_len=self.cache.seq_len_delta.new,
-        ).view(bsz, seqlen, -1)
+            seq_len_delta=self.cache.seq_len_delta,
+            causal=True,
+        ).view(bs_seq, -1)
         return self._run_output_linear(output)
-
-    def forward(self, x, freqs_cis_cos, freqs_cis_sin, seq_len=None):
-        if seq_len is not None:  # prefill
-            return self.prefill_forward(x, freqs_cis_cos, freqs_cis_sin, seq_len)
-        else:
-            return self.decode_forward(x, freqs_cis_cos, freqs_cis_sin)
 
 
 class TransformerBlock(nn.Module):
@@ -733,7 +699,7 @@ class Transformer(nn.Module):
         freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_prefill(next_seq_len)
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis_cos, freqs_cis_sin, next_seq_len)
+            h = layer(h, freqs_cis_cos, freqs_cis_sin)
         tmp = next_seq_len.prefix_lens_list[1:]
         h = h[[item - 1 for item in tmp]]
         h = self._post_layers(h)  # Exec post layers AFTER cutting the last token off
@@ -762,7 +728,7 @@ class Transformer(nn.Module):
             h = tokens
         # layers
         for it, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis_cos, freqs_cis_sin, next_seq_len)
+            h = layer(h, freqs_cis_cos, freqs_cis_sin)
         # end of model
         if self.pp_stage == self.pp_end_stage:
             tmp = next_seq_len.prefix_lens_list[1:]
@@ -801,8 +767,7 @@ class Transformer(nn.Module):
         block_table = self.cache.get_gpu_block_table()
         block_size = self.cache.get_block_size()
         self.attn_backend.prepare_metadata_for_decode(
-            self.cache.seq_len_delta.old,
-            self.cache.seq_len_delta.new,
+            self.cache.seq_len_delta,
             block_table,
             block_size,
         )

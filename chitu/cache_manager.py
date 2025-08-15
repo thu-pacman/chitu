@@ -131,16 +131,6 @@ class KVCacheManagerBase:
         self.seq_len_delta.copy_from(prev_seq_len, next_seq_len)
         self.curr_req_ids = req_ids
 
-    def finalize_cache_bylayer_prefill(
-        self,
-        xk: Optional[torch.Tensor],
-        xv: Optional[torch.Tensor],
-        req_ids: List[str],
-        next_seq_len: BatchedSeqLen,
-        layer_id: int,
-    ):
-        pass
-
     def finalize_cache_all_prefill(self):
         self.curr_req_ids = None
 
@@ -333,50 +323,6 @@ class PagedKVCacheManager(KVCacheManagerBase):
             self.block_table[req_id] = block_ids
 
         self._upd_gpu_block_table(req_ids)
-
-    # Init block table and kv cache with kv generated during prefill
-    @override
-    def finalize_cache_bylayer_prefill(
-        self,
-        xk: Optional[torch.Tensor],
-        xv: Optional[torch.Tensor],
-        req_ids: List[str],
-        next_seq_len: BatchedSeqLen,
-        layer_id: int,
-    ):
-        self.timers("finalize_cache_bylayer_prefill").start()
-
-        layer_idx = layer_id - self.begin_layer_id
-
-        if (
-            get_global_args().infer.attn_type == "npu"
-            and len(self.k_shape_per_sample) == 1
-            and get_global_args().models.type != "deepseek-v3"
-        ):
-            # NPU BSH layout
-            xk = xk.view(xk.shape[0], -1).contiguous() if xk is not None else None
-            xv = xv.view(xv.shape[0], -1).contiguous() if xv is not None else None
-
-        if xk is not None:
-            assert self.paged_k_cache is not None
-            append_to_paged_kv_cache(
-                self.paged_k_cache[layer_idx],
-                self.get_gpu_block_table(),
-                xk.contiguous(),
-                self.seq_len_delta.delta_position_ids_tensor_device,
-                self.seq_len_delta.delta_seq_ids_tensor_device,
-            )
-        if xv is not None:
-            assert self.paged_v_cache is not None
-            append_to_paged_kv_cache(
-                self.paged_v_cache[layer_idx],
-                self.get_gpu_block_table(),
-                xv.contiguous(),
-                self.seq_len_delta.delta_position_ids_tensor_device,
-                self.seq_len_delta.delta_seq_ids_tensor_device,
-            )
-
-        self.timers("finalize_cache_bylayer_prefill").stop()
 
     @override
     def prepare_cache_decode(self, req_ids: List[str]):
@@ -586,45 +532,6 @@ class DenseKVCacheManager(KVCacheManagerBase):
             ), f"Cannot allocate slot: {req_id} {self.req2slot}"
 
         self._prepare_cache(req_ids)
-
-    # Prefill:
-    @override
-    def finalize_cache_bylayer_prefill(
-        self,
-        xk: Optional[torch.Tensor],
-        xv: Optional[torch.Tensor],
-        req_ids: List[str],
-        next_seq_len: BatchedSeqLen,
-        layer_id: int,
-    ):
-        self.timers("finalize_cache_bylayer_prefill").start()
-
-        if (
-            get_global_args().infer.attn_type == "npu"
-            and len(self.k_shape_per_sample) == 1
-        ):
-            # NPU BSH layout
-            xk = xk.view(xk.shape[0], -1).contiguous() if xk is not None else None
-            xv = xv.view(xv.shape[0], -1).contiguous() if xv is not None else None
-
-        if xk is not None:
-            assert self.k_prepared_cache is not None
-            append_to_dense_kv_cache(
-                self.k_prepared_cache[layer_id - self.begin_layer_id],
-                xk.contiguous(),
-                self.seq_len_delta.delta_position_ids_tensor_device,
-                self.seq_len_delta.delta_seq_ids_tensor_device,
-            )
-        if xv is not None:
-            assert self.v_prepared_cache is not None
-            append_to_dense_kv_cache(
-                self.v_prepared_cache[layer_id - self.begin_layer_id],
-                xv.contiguous(),
-                self.seq_len_delta.delta_position_ids_tensor_device,
-                self.seq_len_delta.delta_seq_ids_tensor_device,
-            )
-
-        self.timers("finalize_cache_bylayer_prefill").stop()
 
     # Decode:
     @override

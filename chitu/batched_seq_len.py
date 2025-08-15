@@ -203,9 +203,11 @@ class BatchedSeqLen:
 
 class BatchedSeqLenDelta:
     """
-    Specialization of BatchedSeqLenDelta for prefilling.
+    Increment of a BatchedSeqLen, including the old, the new, and the difference.
 
     Args:
+        old_len_list: Optional initial value of the old `lens_list`.
+        new_len_list: Optional initial value of the new `lens_list`.
         device (torch.device): The device of GPU.
         max_batch_size: Reserved max batch size, used for supporting CUDA graph.
             If not set, use `len(lens_list)` by default.
@@ -239,6 +241,9 @@ class BatchedSeqLenDelta:
 
     def __init__(
         self,
+        old_len_list: List[int] = [],
+        new_len_list: List[int] = [],
+        *,
         device: torch.device | str,
         max_batch_size: Optional[int] = None,
         max_total_len: Optional[int] = None,
@@ -249,7 +254,7 @@ class BatchedSeqLenDelta:
         cache_delta_seq_ids_tensor_device: bool = True,
     ):
         self.old = BatchedSeqLen(
-            [],
+            old_len_list,
             device=device,
             max_batch_size=max_batch_size,
             max_total_len=max_total_len,
@@ -257,7 +262,7 @@ class BatchedSeqLenDelta:
             cache_position_ids_tensor_device=cache_position_ids_tensor_device,
         )
         self.new = BatchedSeqLen(
-            [],
+            new_len_list,
             device=device,
             max_batch_size=max_batch_size,
             max_total_len=max_total_len,
@@ -265,7 +270,9 @@ class BatchedSeqLenDelta:
             cache_position_ids_tensor_device=cache_position_ids_tensor_device,
         )
 
-        self.is_classic_decoding = False  # decoding without MTP
+        self.is_classic_decoding = all(x > 0 for x in self.old.lens_list) and all(
+            (x + 1 == y for x, y in zip(self.old.lens_list, self.new.lens_list))
+        )
 
         self.cache_delta_position_ids_tensor_device = (
             cache_delta_position_ids_tensor_device
@@ -288,11 +295,17 @@ class BatchedSeqLenDelta:
     def copy_from(self, other_old: BatchedSeqLen, other_new: BatchedSeqLen):
         self.old.copy_from(other_old)
         self.new.copy_from(other_new)
-        self.is_classic_decoding = all(
-            (x == y for x, y in zip(self.old.lens_list, self.new.lens_list))
+        self.is_classic_decoding = all(x > 0 for x in self.old.lens_list) and all(
+            (x + 1 == y for x, y in zip(self.old.lens_list, self.new.lens_list))
         )
         self._delta_position_ids_tensor_device_up_to_date = False
         self._delta_seq_ids_tensor_device_up_to_date = False
+
+    @property
+    def batch_size(self):
+        ret = self.old.batch_size
+        assert self.new.batch_size == ret
+        return ret
 
     def _comp_delta_position_ids_tensor_device(self):
         # Example: old = [10, 20, 30], new = [13, 25, 32]
