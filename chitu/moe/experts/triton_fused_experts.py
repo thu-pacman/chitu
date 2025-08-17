@@ -14,7 +14,7 @@ import triton.language as tl
 from chitu.device_type import is_muxi, is_nvidia
 from chitu.ops import silu_and_mul
 from chitu.ops.triton_ops import moe_sum_triton
-from chitu.ops.triton_ops.quant import (
+from chitu.ops.triton_ops.utils import (
     SIGNED_INT32_0x87F00000,
     SIGNED_INT16_0x81C0,
     SIGNED_INT16_0x87F0,

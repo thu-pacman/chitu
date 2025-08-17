@@ -3,11 +3,11 @@ import pytest
 import triton
 
 from chitu.ops import (
-    act_quant_deepseek_v3,
-    fp8_gemm_deepseek_v3,
-    weight_dequant_deepseek_v3,
-    weight_dequant_soft_fp8_deepseek_v3,
-    soft_fp8_gemm_deepseek_v3,
+    blockfp8_act_quant,
+    blockfp8_gemm,
+    blockfp8_weight_dequant,
+    soft_fp8_blockfp8_weight_dequant,
+    soft_fp8_blockfp8_gemm,
 )
 from chitu.device_type import has_native_fp8
 
@@ -42,8 +42,8 @@ def test_dequanted_gemm_is_close_to_fp8_gemm(dtype: torch.dtype):
     a = torch.randn(dim, dim, dtype=dtype, device="cuda")
     b, b_s = init_b_and_b_s(dim, block_size)
 
-    a_fp8, a_s = act_quant_deepseek_v3(a, block_size)
-    std_y = fp8_gemm_deepseek_v3(a_fp8, a_s, b, b_s)
+    a_fp8, a_s = blockfp8_act_quant(a, block_size)
+    std_y = blockfp8_gemm(a_fp8, a_s, b, b_s)
 
     # Dequant from `a_fp8` and `a_s` instead of directly using `a` in dequanted implementation,
     # so the numerical difference is controlled inside the kernels
@@ -56,7 +56,7 @@ def test_dequanted_gemm_is_close_to_fp8_gemm(dtype: torch.dtype):
         .view(dim, dim)
     )
 
-    dequant_b = weight_dequant_deepseek_v3(b, b_s)
+    dequant_b = blockfp8_weight_dequant(b, b_s)
     y = torch.nn.functional.linear(dequant_a, dequant_b)
 
     assert torch.allclose(std_y, y, atol=0.15, rtol=0.15)
@@ -97,11 +97,11 @@ def benchmark_fp8_gemm(bs, dim, dtype, block_size, provider):
     b, b_s = init_b_and_b_s(dim, block_size)
 
     if provider == "torch_bf16":
-        dequant_b = weight_dequant_deepseek_v3(b, b_s)
+        dequant_b = blockfp8_weight_dequant(b, b_s)
         ms = triton.testing.do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
     elif provider == "triton_fp8":
-        a_fp8, a_s = act_quant_deepseek_v3(a, block_size)
-        ms = triton.testing.do_bench(lambda: fp8_gemm_deepseek_v3(a_fp8, a_s, b, b_s))
+        a_fp8, a_s = blockfp8_act_quant(a, block_size)
+        ms = triton.testing.do_bench(lambda: blockfp8_gemm(a_fp8, a_s, b, b_s))
     else:
         assert False, f"Unknown provider: {provider}"
     return ms * 1000
@@ -118,8 +118,8 @@ def test_soft_fp8_dequant_is_close_to_dequant(dtype: torch.dtype):
     block_size = 128
     b, b_s = init_b_and_b_s(dim, block_size)
 
-    dequant_b = weight_dequant_soft_fp8_deepseek_v3(b, b_s)
-    soft_dequant_b = weight_dequant_soft_fp8_deepseek_v3(b, b_s)
+    dequant_b = soft_fp8_blockfp8_weight_dequant(b, b_s)
+    soft_dequant_b = soft_fp8_blockfp8_weight_dequant(b, b_s)
 
     assert torch.allclose(dequant_b, soft_dequant_b, atol=1e-2, rtol=1e-2)
 
@@ -136,9 +136,9 @@ def test_soft_fp8_gemm_is_close_to_dequanted_gemm(dtype: torch.dtype):
     a = torch.randn(dim, dim, dtype=dtype, device="cuda")
     b, b_s = init_b_and_b_s(dim, block_size)
 
-    dequant_b = weight_dequant_soft_fp8_deepseek_v3(b, b_s)
+    dequant_b = soft_fp8_blockfp8_weight_dequant(b, b_s)
     std_y = torch.nn.functional.linear(a, dequant_b)
-    y = soft_fp8_gemm_deepseek_v3(a, b, b_s)
+    y = soft_fp8_blockfp8_gemm(a, b, b_s)
 
     assert torch.allclose(std_y, y, atol=1e-2, rtol=1e-2)
 
@@ -178,10 +178,10 @@ def benchmark_soft_fp8_gemm(bs, dim, dtype, block_size, provider):
     b, b_s = init_b_and_b_s(dim, block_size)
 
     if provider == "torch_bf16":
-        dequant_b = weight_dequant_soft_fp8_deepseek_v3(b, b_s)
+        dequant_b = soft_fp8_blockfp8_weight_dequant(b, b_s)
         ms = triton.testing.do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
     elif provider == "triton_soft_fp8":
-        ms = triton.testing.do_bench(lambda: soft_fp8_gemm_deepseek_v3(a, b, b_s))
+        ms = triton.testing.do_bench(lambda: soft_fp8_blockfp8_gemm(a, b, b_s))
     else:
         assert False, f"Unknown provider: {provider}"
     return ms * 1000
@@ -208,7 +208,7 @@ def benchmark_soft_fp8_dequant(dim, dtype, block_size, provider):
     torch.set_default_dtype(dtype)
     b, b_s = init_b_and_b_s(dim, block_size)
 
-    ms = triton.testing.do_bench(lambda: weight_dequant_soft_fp8_deepseek_v3(b, b_s))
+    ms = triton.testing.do_bench(lambda: soft_fp8_blockfp8_weight_dequant(b, b_s))
     return ms * 1000
 
 
@@ -233,7 +233,7 @@ def benchmark_fp8_dequant(dim, dtype, block_size, provider):
     torch.set_default_dtype(dtype)
     b, b_s = init_b_and_b_s(dim, block_size)
 
-    ms = triton.testing.do_bench(lambda: weight_dequant_deepseek_v3(b, b_s))
+    ms = triton.testing.do_bench(lambda: blockfp8_weight_dequant(b, b_s))
     return ms * 1000
 
 

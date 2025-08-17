@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from chitu import ops
-from chitu.ops.quant import cutlass_scaled_fp4_mm
+from chitu.ops.quant.blockfp4 import cutlass_scaled_fp4_mm
 
 kE2M1ToFloat = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
@@ -152,8 +152,8 @@ def test_nvfp4_gemm(
         torch.float32
     )
     alpha = 1.0 / (a_global_scale * b_global_scale)
-    a_fp4, a_scale_interleaved = ops.scaled_fp4_quant(a_dtype, a_global_scale)
-    b_fp4, b_scale_interleaved = ops.scaled_fp4_quant(b_dtype, b_global_scale)
+    a_fp4, a_scale_interleaved = ops.blockfp4_act_quant(a_dtype, a_global_scale)
+    b_fp4, b_scale_interleaved = ops.blockfp4_act_quant(b_dtype, b_global_scale)
 
     expected_out = get_ref_results(
         a_fp4,

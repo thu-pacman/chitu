@@ -7,7 +7,7 @@ from typing import List, Optional
 import torch
 from deep_gemm import m_grouped_gemm_fp8_fp8_bf16_nt_masked
 
-from chitu.ops.quant import act_quant_deepseek_v3
+from chitu.ops.quant import blockfp8_act_quant
 from chitu.ops.triton_ops.activation import silu_and_mul_masked_post_quant_fwd
 
 
@@ -51,7 +51,7 @@ def deep_gemm_fused_expert(
 
     is_fp8_input = isinstance(hidden_states, tuple)
     if not is_fp8_input:
-        hidden_states_fp8, a1_scale = act_quant_deepseek_v3(
+        hidden_states_fp8, a1_scale = blockfp8_act_quant(
             x=hidden_states,
         )
     else:

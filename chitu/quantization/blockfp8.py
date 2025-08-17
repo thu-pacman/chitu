@@ -15,16 +15,16 @@ from chitu.quantization.base import (
 )
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.ops import (
-    fp8_gemm_deepseek_v3,
-    soft_fp8_gemm_deepseek_v3,
-    weight_dequant_soft_fp8_deepseek_v3,
-    act_quant_deepseek_v3,
-    quant_einsum_shc_hdc_shd,
+    blockfp8_gemm,
+    soft_fp8_blockfp8_gemm,
+    soft_fp8_blockfp8_weight_dequant,
+    blockfp8_act_quant,
+    blockfp8_einsum_shc_hdc_shd,
 )
 from chitu.device_type import get_device_name, is_muxi, is_nvidia, is_ascend
 from chitu.utils import try_import_opt_dep, try_import_platform_dep, parse_dtype
 from chitu.global_vars import get_global_args
-from chitu.ops import weight_dequant_soft_fp8_deepseek_v3
+from chitu.ops import soft_fp8_blockfp8_weight_dequant
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
@@ -114,7 +114,7 @@ def linear_block_fp8(
 
     if get_global_args().infer.raise_lower_bit_float_to == "bfloat16":
         if is_nvidia() or is_muxi():
-            y = soft_fp8_gemm_deepseek_v3(x, weight, weight_scale)
+            y = soft_fp8_blockfp8_gemm(x, weight, weight_scale)
             if bias is not None:
                 y += bias
             return y
@@ -126,7 +126,7 @@ def linear_block_fp8(
             logger.warning(
                 f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
             )
-            weight_dequanted = weight_dequant_soft_fp8_deepseek_v3(
+            weight_dequanted = soft_fp8_blockfp8_weight_dequant(
                 weight, weight_scale, block_size
             )
             return torch.nn.functional.linear(x, weight_dequanted, bias)
@@ -134,9 +134,9 @@ def linear_block_fp8(
         x_dtype = x.dtype
         x_shape = x.shape
         x = x.view(-1, x_shape[-1])
-        x, act_scale = act_quant_deepseek_v3(x, block_size)
+        x, act_scale = blockfp8_act_quant(x, block_size)
         assert weight_scale is not None
-        y = fp8_gemm_deepseek_v3(x, act_scale, weight, weight_scale)
+        y = blockfp8_gemm(x, act_scale, weight, weight_scale)
         if bias is not None:
             y += bias
         return y.view(x_shape[:-1] + y.shape[-1:]).to(x_dtype)
@@ -387,13 +387,13 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                     f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
                 )
                 block_size = 128
-                gate_up_proj_weight = weight_dequant_soft_fp8_deepseek_v3(
+                gate_up_proj_weight = soft_fp8_blockfp8_weight_dequant(
                     self.gate_up_proj_weight,
                     self.gate_up_proj_scale,
                     block_size,
                 )
                 gate_up_proj_scale = None
-                down_proj_weight = weight_dequant_soft_fp8_deepseek_v3(
+                down_proj_weight = soft_fp8_blockfp8_weight_dequant(
                     self.down_proj_weight,
                     self.down_proj_scale,
                     block_size,
@@ -545,7 +545,7 @@ class NormalAbsorbGemm(QuantizedAbsorbGemmBase):
             bs, seq, n_head, n_hidden = x.shape
             x = x.view(bs * seq, n_head, n_hidden)
 
-        y = quant_einsum_shc_hdc_shd(
+        y = blockfp8_einsum_shc_hdc_shd(
             x,
             self.weight,
             self.scale,

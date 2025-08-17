@@ -31,9 +31,9 @@ from chitu.muxi_utils import (
 from chitu.ops import (
     apply_rotary_pos_emb,
     silu_and_mul,
-    weight_dequant_deepseek_v3,
-    weight_dequant_soft_fp8_deepseek_v3,
-    weight_quant_deepseek_v3,
+    blockfp8_weight_dequant,
+    soft_fp8_blockfp8_weight_dequant,
+    blockfp8_weight_quant,
     unpack_weight_bytes,
     decode_e2m1_from_nibbles,
     fp4_fake_quant,
@@ -828,9 +828,9 @@ class TransformerDeepSeekV3(Transformer):
         n_local_heads = self.params.n_heads // model_parallel_size
 
         weight_dequant_fn = (
-            weight_dequant_soft_fp8_deepseek_v3
+            soft_fp8_blockfp8_weight_dequant
             if get_global_args().infer.raise_lower_bit_float_to == "bfloat16"
-            else weight_dequant_deepseek_v3
+            else blockfp8_weight_dequant
         )
 
         checkpoint_keys = list(checkpoint.keys())
@@ -981,8 +981,8 @@ class TransformerDeepSeekV3(Transformer):
                         new_q_b_proj_scale_2.view(1, 1)
                     )
                 elif quant in ["blockfp8", "q4km"]:
-                    # FIXME: Support soft fp8 in weight_quant_deepseek_v3
-                    new_q_b_proj, new_q_b_proj_scale = weight_quant_deepseek_v3(
+                    # FIXME: Support soft fp8 in blockfp8_weight_quant
+                    new_q_b_proj, new_q_b_proj_scale = blockfp8_weight_quant(
                         new_q_b_proj, block_size
                     )
                     if (
@@ -1052,8 +1052,8 @@ class TransformerDeepSeekV3(Transformer):
                 if quant in [None, "gguf"]:  # blockfp4 skips quantizing MLA
                     checkpoint[prefix + "o_proj.weight"] = new_o_proj
                 elif quant in ["blockfp8", "q4km"]:
-                    # FIXME: Support soft fp8 in weight_quant_deepseek_v3
-                    new_o_proj, new_o_proj_scale = weight_quant_deepseek_v3(
+                    # FIXME: Support soft fp8 in blockfp8_weight_quant
+                    new_o_proj, new_o_proj_scale = blockfp8_weight_quant(
                         new_o_proj, block_size
                     )
                     if (

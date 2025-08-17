@@ -14,10 +14,11 @@ from chitu.quantization.base import (
 )
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.ops import (
-    soft_fp4_raise_to_fp8_gemm_deepseek_v3,
-    soft_fp4_raise_to_bf16_gemm_deepseek_v3,
-    act_quant_deepseek_v3,
-    hard_fp4_scaled_mm,
+    soft_fp4_raise_to_fp8_blockfp4_gemm,
+    soft_fp4_raise_to_bf16_blockfp4_gemm,
+    blockfp8_act_quant,
+    blockfp4_gemm,
+    convert_linear_to_swizzled,
 )
 from chitu.device_type import get_device_name, is_muxi, is_nvidia, is_blackwell
 from chitu.utils import (
@@ -162,7 +163,7 @@ def linear_block_fp4(
     if is_blackwell():
         assert weight.k_stride == 1
         assert x.shape[-1] == weight.layout_tensor.shape[-1] * 2
-        y = hard_fp4_scaled_mm(
+        y = blockfp4_gemm(
             x,
             weight.layout_tensor,
             weight_scale,
@@ -175,7 +176,7 @@ def linear_block_fp4(
         return y
     elif get_global_args().infer.raise_lower_bit_float_to == "bfloat16":
         if is_nvidia() or is_muxi():
-            y = soft_fp4_raise_to_bf16_gemm_deepseek_v3(
+            y = soft_fp4_raise_to_bf16_blockfp4_gemm(
                 x, weight, weight_scale, weight_scale_2
             )
             if bias is not None:
@@ -190,9 +191,9 @@ def linear_block_fp4(
         x_dtype = x.dtype
         x_shape = x.shape
         x = x.view(-1, x_shape[-1])
-        x, act_scale = act_quant_deepseek_v3(x, act_block_size)
+        x, act_scale = blockfp8_act_quant(x, act_block_size)
         assert weight_scale is not None
-        y = soft_fp4_raise_to_fp8_gemm_deepseek_v3(
+        y = soft_fp4_raise_to_fp8_blockfp4_gemm(
             x,
             act_scale,
             weight,
@@ -357,8 +358,6 @@ class Blockfp4LinearPackKStride1(
     is_swizzled = False
 
     def convert_scale_to_swizzled(self):
-        from chitu.ops.quant import convert_linear_to_swizzled
-
         weight = self.get_native_layout_weight()
         weight_scale = self.weight_scale
 
