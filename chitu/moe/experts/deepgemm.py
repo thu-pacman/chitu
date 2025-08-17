@@ -8,7 +8,9 @@ import torch
 from deep_gemm import m_grouped_gemm_fp8_fp8_bf16_nt_masked
 
 from chitu.ops.quant import blockfp8_act_quant
-from chitu.ops.triton_ops.activation import silu_and_mul_masked_post_quant_fwd
+from chitu.ops.triton_ops.quant.blockfp8 import (
+    silu_and_mul_and_blockfp8_act_quant_with_expert_mask,
+)
 
 
 def deep_gemm_fused_expert(
@@ -100,7 +102,7 @@ def deep_gemm_fused_expert(
         dtype=torch.float32,
     )
 
-    silu_and_mul_masked_post_quant_fwd(
+    silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
         intermediate_cache1,
         qintermediate_cache2,
         a2q_scale,
