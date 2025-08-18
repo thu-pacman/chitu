@@ -336,6 +336,8 @@ class Transformer(nn.Module):
             ret += ["qweight"]
         elif quant == "mixq":
             ret += ["fp_weight"]
+        elif quant == "ascend_w8a8":
+            ret += ["weight_scale", "weight_offset", "deq_scale"]
         return ret
 
     def _get_2d_in_x_out_tensor_names(self, quant) -> List[str]:
@@ -364,6 +366,8 @@ class Transformer(nn.Module):
             ret += ["s1_scales", "s2_scales", "s2_zeros"]
         elif quant == "mixq":
             ret += ["fp_idx", "weight_scale"]
+        elif quant == "ascend_w8a8":
+            ret += ["input_scale", "input_offset", "quant_bias"]
         return ret
 
     def _chunk_checkpoint_for_pipeline_parallel(
