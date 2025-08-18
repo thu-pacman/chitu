@@ -294,11 +294,13 @@ class MockFixedLengthedUserRequest(UserRequest):
 class TaskType(Enum):
     Prefill = 1
     Decode = 2
+    EmptyPrefill = 3
+    EmptyDecode = 4
 
     def to_str(self) -> str:
-        if self == TaskType.Prefill:
+        if self == TaskType.Prefill or self == TaskType.EmptyPrefill:
             return "prefill"
-        elif self == TaskType.Decode:
+        elif self == TaskType.Decode or self == TaskType.EmptyDecode:
             return "decode"
         else:
             raise NotImplementedError
@@ -514,6 +516,9 @@ class PackedTasksBase:
         task_type = None
         tokens = None
 
+        if payload_type == SerializedPackedTasksPayloadType.Empty:
+            task_type = TaskType(task_tensor[-3].item())
+
         if (
             payload_type == SerializedPackedTasksPayloadType.Normal
             or payload_type == SerializedPackedTasksPayloadType.EndTask
@@ -580,6 +585,8 @@ class PackedTasksBase:
             or payload_type == SerializedPackedTasksPayloadType.Heartbeat
             or payload_type == SerializedPackedTasksPayloadType.Empty
         ):
+            if payload_type == SerializedPackedTasksPayloadType.Empty:
+                ret[-3] = self.task_type.value
             return ret.to(device)
 
         task_indices = torch.arange(1, 1 + self.num_tasks, device="cpu")
@@ -596,6 +603,8 @@ class PackedTasksBase:
             offset = 1 + PackedTasksBase.max_num_tasks
             token_indices = torch.arange(offset, offset + self.num_tasks, device="cpu")
             ret.scatter_(0, token_indices, token_lengths)
+
+        ret[-3] = self.task_type.value
 
         slot_handle = get_slot_handle()
         if slot_handle:
@@ -625,8 +634,9 @@ class PackedTasksBase:
 
         # TODO: We should use torch.empty instead, but we now assume there is a `0`
         # indicating the end of tasks
+        # TODO: temporarily add a filed to indicate the prefill/decode stage
         return torch.zeros(
-            (3 + cls.max_num_tasks * 2,), dtype=torch.int64, device=device
+            (4 + cls.max_num_tasks * 2,), dtype=torch.int64, device=device
         )
 
 
@@ -636,7 +646,7 @@ class PackedTasks(PackedTasksBase):
             self.num_tasks = 0
             self.task_ids = []
             self.req_ids = []
-            self.task_type = None
+            self.task_type = TaskType(Backend.task_type.value + 2)
             self.tokens = None
             self.payload_type = SerializedPackedTasksPayloadType.Empty
             return

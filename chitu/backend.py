@@ -106,6 +106,7 @@ class Backend:
     all_task_ids = None
     all_tasks = None
     cat_logits = None
+    task_type = None
 
     @staticmethod
     def build_model(args, cache, *extra_args, **extra_kwargs):
