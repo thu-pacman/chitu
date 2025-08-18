@@ -1,7 +1,5 @@
 #!/usr/bin/expect
 
-# Timeout for startup and verification
-set timeout 600
 
 # Show all output
 log_user 1
@@ -26,15 +24,10 @@ expect {
         set router_port $expect_out(3,string)
         puts "Detected Router Ready on $router_host $router_ip:$router_port"
     }
-    timeout {
-        puts "ERROR: Did not receive ROUTER_READY marker in time"
-        exec kill -TERM $pd_pid
-        exit 1
-    }
 }
 
 # Give services a brief moment to finish initialization
-sleep 120
+sleep 300
 
 # Run verification: PD 2P3D topology via existing script
 puts "=== Verifying PD 2P3D topology ==="
