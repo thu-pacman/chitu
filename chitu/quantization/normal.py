@@ -15,6 +15,7 @@ from chitu.quantization.base import (
     QuantizedMoeExpertsBase,
     QuantizedAbsorbGemmBase,
 )
+from chitu.ops import linear
 from chitu.hybrid_device import CPUParameter
 from chitu.quantization.cpuinfer_singleton import get_cpu_infer
 from chitu.quantization.registry import QuantizationRegistry
@@ -79,7 +80,7 @@ class NormalLinear(QuantizedLinearBase):
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.linear(x, self.weight, self.bias)
+        return linear(x, self.weight, self.bias)
 
 
 @QuantizationRegistry.register_moe_experts(None)
@@ -211,19 +212,19 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
 
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.linear(x, self.gate_up_proj_weight[i], bias=None)
+        return linear(x, self.gate_up_proj_weight[i], bias=None)
 
     @override
     def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.linear(x, self.gate_proj_weight[i], bias=None)
+        return linear(x, self.gate_proj_weight[i], bias=None)
 
     @override
     def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.linear(x, self.up_proj_weight[i], bias=None)
+        return linear(x, self.up_proj_weight[i], bias=None)
 
     @override
     def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.linear(x, self.down_proj_weight[i], bias=None)
+        return linear(x, self.down_proj_weight[i], bias=None)
 
 
 @QuantizationRegistry.register_absorb_gemm(None)

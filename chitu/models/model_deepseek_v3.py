@@ -31,9 +31,9 @@ from chitu.muxi_utils import (
 from chitu.ops import (
     apply_rotary_pos_emb,
     silu_and_mul,
-    weight_dequant_deepseek_v3,
-    weight_dequant_soft_fp8_deepseek_v3,
-    weight_quant_deepseek_v3,
+    blockfp8_weight_dequant,
+    soft_fp8_blockfp8_weight_dequant,
+    blockfp8_weight_quant,
     unpack_weight_bytes,
     decode_e2m1_from_nibbles,
     fp4_fake_quant,
@@ -271,22 +271,19 @@ class AttentionDeepSeekV3(Attention):
         x: torch.Tensor,
         freqs_cis_cos: torch.Tensor,
         freqs_cis_sin: torch.Tensor,
-        seq_len,
     ):
         bs_seq, _ = x.size()
 
         if self.mla_absorb == "none":
             q, k, v = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
-            self.cache.finalize_cache_bylayer_prefill(
+            x = self.attn_backend.prefill(
+                q,
+                self.cache.get_accessor(self.layer_id),
                 k,
                 v,
-                self.cache.curr_req_ids,
-                self.cache.seq_len_delta.new,
-                self.layer_id,
-            )
-
-            x = self.attn_backend.prefill_ragged_qkvo(
-                q, k, v, seq_len, causal=True, softmax_scale=self.softmax_scale
+                seq_len_delta=self.cache.seq_len_delta,
+                causal=True,
+                softmax_scale=self.softmax_scale,
             )
 
         elif self.mla_absorb == "absorb-without-precomp" or self.mla_absorb == "absorb":
@@ -297,20 +294,13 @@ class AttentionDeepSeekV3(Attention):
             # In-place update to `kv_cache`, which is part of `kv`
             self.kv_a_layernorm(kv_cache, compute_dtype=kv.dtype, out=kv_cache)
 
-            self.cache.finalize_cache_bylayer_prefill(
-                kv,
-                None,
-                self.cache.curr_req_ids,
-                self.cache.seq_len_delta.new,
-                self.layer_id,
-            )
             q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
-
-            x = self.attn_backend.prefill_ragged_qkvo(
+            x = self.attn_backend.prefill(
                 q_nope_pe.view(-1, q_nope_pe.shape[-2], q_nope_pe.shape[-1]),
+                self.cache.get_accessor(self.layer_id),
                 kv.view(-1, 1, kv.shape[-1]),
                 kv_cache.view(-1, 1, kv_cache.shape[-1]),
-                seq_len,
+                seq_len_delta=self.cache.seq_len_delta,
                 causal=True,
                 softmax_scale=self.softmax_scale,
             )
@@ -324,36 +314,30 @@ class AttentionDeepSeekV3(Attention):
                 f"MLA absorb mode {self.mla_absorb} not supported"
             )
 
-        x = self._run_output_linear(x)
-        return x.view(bs_seq, -1)
+        return self.o_proj(x.flatten(-2)).view(bs_seq, -1)
 
     def decode_forward(
         self, x: torch.Tensor, freqs_cis_cos: torch.Tensor, freqs_cis_sin: torch.Tensor
     ):
-        bsz, seqlen, _ = x.size()
+        bsz, _ = x.size()
 
         if self.mla_absorb == "none":
-            q, k, v = self._run_linear(
-                x.view(bsz * seqlen, -1), freqs_cis_cos, freqs_cis_sin
-            )
-            q = q.view(bsz, seqlen, self.n_local_heads, -1)
-            k = k.view(bsz, seqlen, self.n_local_heads, -1)
-            v = v.view(bsz, seqlen, self.n_local_heads, -1)
+            q, k, v = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
+            q = q.view(bsz, self.n_local_heads, -1)
+            k = k.view(bsz, self.n_local_heads, -1)
+            v = v.view(bsz, self.n_local_heads, -1)
 
             x = self.attn_backend.decode(
                 q,
                 self.cache.get_accessor(self.layer_id),
                 k,
                 v,
-                prev_seq_len=self.cache.seq_len_delta.old,
-                next_seq_len=self.cache.seq_len_delta.new,
+                seq_len_delta=self.cache.seq_len_delta,
                 softmax_scale=self.softmax_scale,
-            ).view(bsz, seqlen, self.n_local_heads, self.v_head_dim)
+            ).view(bsz, self.n_local_heads, self.v_head_dim)
 
         elif self.mla_absorb == "absorb-without-precomp" or self.mla_absorb == "absorb":
-            q_nope, q_pe, kv = self._run_linear(
-                x.view(bsz * seqlen, -1), freqs_cis_cos, freqs_cis_sin
-            )
+            q_nope, q_pe, kv = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
 
             this_kv = kv[..., : self.kv_lora_rank]
 
@@ -364,9 +348,8 @@ class AttentionDeepSeekV3(Attention):
                 q_nope,
                 q_pe,
                 self.cache.get_accessor(self.layer_id),
-                kv.view(bsz, seqlen, 1, -1),
-                prev_seq_len=self.cache.seq_len_delta.old,
-                next_seq_len=self.cache.seq_len_delta.new,
+                kv.view(bsz, 1, -1),
+                seq_len_delta=self.cache.seq_len_delta,
                 softmax_scale=self.softmax_scale,
             )
 
@@ -378,11 +361,13 @@ class AttentionDeepSeekV3(Attention):
                 f"MLA absorb mode {self.mla_absorb} not supported"
             )
 
-        x = self._run_output_linear(x)
-        return x
+        return self.o_proj(x.flatten(-2)).view(bsz, -1)
 
-    def _run_output_linear(self, x):
-        return self.o_proj(x.flatten(-2))
+    def forward(self, x, freqs_cis_cos, freqs_cis_sin):
+        if self.cache.seq_len_delta.is_classic_decoding:
+            return self.decode_forward(x, freqs_cis_cos, freqs_cis_sin)
+        else:
+            return self.prefill_forward(x, freqs_cis_cos, freqs_cis_sin)
 
 
 class MLPDeepSeekV3(nn.Module):
@@ -665,13 +650,11 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         x: torch.Tensor,
         freqs_cis_cos: torch.Tensor,
         freqs_cis_sin: torch.Tensor,
-        seq_len=None,
     ):
         x = x + self.self_attn(
             self.input_layernorm(x, compute_dtype=x.dtype),
             freqs_cis_cos,
             freqs_cis_sin,
-            seq_len,
         )
         x = x + self.mlp(self.post_attention_layernorm(x, compute_dtype=x.dtype))
         return x
@@ -845,9 +828,9 @@ class TransformerDeepSeekV3(Transformer):
         n_local_heads = self.params.n_heads // model_parallel_size
 
         weight_dequant_fn = (
-            weight_dequant_soft_fp8_deepseek_v3
+            soft_fp8_blockfp8_weight_dequant
             if get_global_args().infer.raise_lower_bit_float_to == "bfloat16"
-            else weight_dequant_deepseek_v3
+            else blockfp8_weight_dequant
         )
 
         checkpoint_keys = list(checkpoint.keys())
@@ -998,8 +981,8 @@ class TransformerDeepSeekV3(Transformer):
                         new_q_b_proj_scale_2.view(1, 1)
                     )
                 elif quant in ["blockfp8", "q4km"]:
-                    # FIXME: Support soft fp8 in weight_quant_deepseek_v3
-                    new_q_b_proj, new_q_b_proj_scale = weight_quant_deepseek_v3(
+                    # FIXME: Support soft fp8 in blockfp8_weight_quant
+                    new_q_b_proj, new_q_b_proj_scale = blockfp8_weight_quant(
                         new_q_b_proj, block_size
                     )
                     if (
@@ -1069,8 +1052,8 @@ class TransformerDeepSeekV3(Transformer):
                 if quant in [None, "gguf"]:  # blockfp4 skips quantizing MLA
                     checkpoint[prefix + "o_proj.weight"] = new_o_proj
                 elif quant in ["blockfp8", "q4km"]:
-                    # FIXME: Support soft fp8 in weight_quant_deepseek_v3
-                    new_o_proj, new_o_proj_scale = weight_quant_deepseek_v3(
+                    # FIXME: Support soft fp8 in blockfp8_weight_quant
+                    new_o_proj, new_o_proj_scale = blockfp8_weight_quant(
                         new_o_proj, block_size
                     )
                     if (
@@ -1348,8 +1331,7 @@ class TransformerDeepSeekV3(Transformer):
         block_table = self.cache.get_gpu_block_table()
         block_size = self.cache.get_block_size()
         self.attn_backend.prepare_metadata_for_decode(
-            self.cache.seq_len_delta.old,
-            self.cache.seq_len_delta.new,
+            self.cache.seq_len_delta,
             block_table,
             block_size,
             softmax_scale=compute_softmax_scale_deepseek_v3(self.params),

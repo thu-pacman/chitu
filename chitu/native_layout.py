@@ -74,6 +74,23 @@ class NativeLayoutTensor:
 
         raise NotImplementedError()
 
+    @property
+    def device(self):
+        return self.layout_tensor.device
+
+    def to(self, device):
+        if isinstance(device, str):
+            device = torch.device(device)
+        if isinstance(device, torch.device):
+            return type(self)(
+                plain_shape=self.plain_shape,
+                layout_tensor=self.layout_tensor.to(device),
+            )
+        else:
+            raise ValueError(
+                f"NativeLayoutTensor.to only support moving to a device, but got {type(device)}"
+            )
+
 
 def enable_native_layout_weight(
     key: str,

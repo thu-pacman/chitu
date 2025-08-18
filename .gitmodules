@@ -22,3 +22,6 @@
 [submodule "third_party/ascend-kernel"]
     path = third_party/ascend-kernel
     url = https://github.com/QingCheng-AI/ascend-kernel.git
+[submodule "third_party/DeepEP"]
+    path = third_party/DeepEP
+    url = https://git.qcjzai.cn/github-mirror/DeepEP.git

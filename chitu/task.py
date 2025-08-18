@@ -151,6 +151,7 @@ class UserRequest:
         self,
         message,
         request_id,
+        tokens=None,
         logprobs=False,
         top_logprobs=None,
         max_new_tokens=50,
@@ -163,6 +164,7 @@ class UserRequest:
     ):
         # input related
         self.message = message
+        self.tokens = tokens
         self.request_id = request_id
         self.params = SampleParams(
             temperature=temperature,
@@ -240,6 +242,8 @@ class UserRequest:
 
     @functools.cached_property
     def prompt_tokens(self):
+        if self.tokens is not None:
+            return self.tokens
         return Backend.formatter.encode_dialog_prompt(
             self.message, chat_template_kwargs=self.chat_template_kwargs
         )

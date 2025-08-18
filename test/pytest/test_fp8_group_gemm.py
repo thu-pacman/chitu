@@ -6,7 +6,7 @@ from omegaconf import OmegaConf
 
 import triton
 
-from chitu.ops import quant_einsum_shc_hdc_shd
+from chitu.ops import blockfp8_einsum_shc_hdc_shd
 from chitu.global_vars import set_global_args
 from chitu.device_type import is_nvidia
 
@@ -23,7 +23,7 @@ def check_close(x, y):
 @pytest.mark.parametrize("n_heads,in_feats,out_feats", [(16, 128, 512), (16, 512, 128)])
 @pytest.mark.parametrize("compute_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("soft_fp8", [False, True])
-def test_quant_einsum_shc_hdc_shd(
+def test_blockfp8_einsum_shc_hdc_shd(
     n_heads, batch_size, in_feats, out_feats, compute_dtype, soft_fp8
 ):
     set_global_args(OmegaConf.create({"infer": {"soft_fp8": False}}), need_ensure=False)
@@ -45,10 +45,10 @@ def test_quant_einsum_shc_hdc_shd(
     scale = torch.randn(
         (n_heads, out_feats // 128, in_feats // 128), dtype=torch.float32, device="cuda"
     )
-    torch_out = quant_einsum_shc_hdc_shd(
+    torch_out = blockfp8_einsum_shc_hdc_shd(
         q_nope, weight, scale, soft_fp8=soft_fp8, impl="torch"
     )
-    triton_out = quant_einsum_shc_hdc_shd(
+    triton_out = blockfp8_einsum_shc_hdc_shd(
         q_nope, weight, scale, soft_fp8=soft_fp8, impl="triton"
     )
     assert check_close(torch_out, triton_out)
@@ -77,7 +77,7 @@ bench2_N = [512, 1024]
         args={},
     )
 )
-def benchmark_quant_einsum_shc_hdc_shd(M, K, N, provider):
+def benchmark_blockfp8_einsum_shc_hdc_shd(M, K, N, provider):
     q_nope = torch.randn((M, 16, K), dtype=torch.bfloat16, device="cuda")
     weight = torch.randn((16, N, K), dtype=torch.bfloat16, device="cuda").to(
         torch.float8_e4m3fn
@@ -88,13 +88,13 @@ def benchmark_quant_einsum_shc_hdc_shd(M, K, N, provider):
     getattr(torch, DEVICE.type).set_stream(stream)
     if provider == "torch":
         ms = triton.testing.do_bench(
-            lambda: quant_einsum_shc_hdc_shd(
+            lambda: blockfp8_einsum_shc_hdc_shd(
                 q_nope.to(torch.float), weight, scale, impl="torch"
             )
         )
     elif provider == "triton":
         ms = triton.testing.do_bench(
-            lambda: quant_einsum_shc_hdc_shd(q_nope, weight, scale, impl="triton")
+            lambda: blockfp8_einsum_shc_hdc_shd(q_nope, weight, scale, impl="triton")
         )
     else:
         raise ValueError(f"Unknown provider: {provider}")
@@ -102,4 +102,4 @@ def benchmark_quant_einsum_shc_hdc_shd(M, K, N, provider):
 
 
 if __name__ == "__main__":
-    benchmark_quant_einsum_shc_hdc_shd.run(show_plots=False, print_data=True)
+    benchmark_blockfp8_einsum_shc_hdc_shd.run(show_plots=False, print_data=True)

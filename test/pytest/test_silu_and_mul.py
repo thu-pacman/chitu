@@ -3,6 +3,7 @@ import triton
 import torch
 
 from chitu.ops import silu_and_mul
+from chitu.lazy import eval_lazy
 
 
 @pytest.mark.parametrize("M", [32, 64, 128])
@@ -10,8 +11,8 @@ from chitu.ops import silu_and_mul
 def test_silu_and_mul(M, N):
     torch.manual_seed(42)
     input_tensor = torch.rand(M, N, device="cuda", dtype=torch.bfloat16)
-    baseline_result = silu_and_mul(input_tensor, impl="torch")
-    result = silu_and_mul(input_tensor, impl="triton")
+    baseline_result = eval_lazy(silu_and_mul(input_tensor, impl="torch"))
+    result = eval_lazy(silu_and_mul(input_tensor, impl="triton"))
     assert torch.allclose(
         baseline_result, result, rtol=1e-3, atol=1e-3
     ), f"Results don't match for shape M={M}, N={N}"
@@ -39,9 +40,9 @@ def benchmark(M, N, provider):
     stream = getattr(torch, DEVICE.type).Stream()
     getattr(torch, DEVICE.type).set_stream(stream)
     if provider == "torch":
-        ms = triton.testing.do_bench(lambda: silu_and_mul(x, impl="torch"))
+        ms = triton.testing.do_bench(lambda: eval_lazy(silu_and_mul(x, impl="torch")))
     elif provider == "triton":
-        ms = triton.testing.do_bench(lambda: silu_and_mul(x, impl="triton"))
+        ms = triton.testing.do_bench(lambda: eval_lazy(silu_and_mul(x, impl="triton")))
     else:
         raise ValueError(f"Unknown provider: {provider}")
     gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)

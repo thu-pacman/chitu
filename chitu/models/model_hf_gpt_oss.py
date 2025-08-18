@@ -20,6 +20,7 @@ from chitu.models.model_hf_llama import (
 )
 from chitu.models.model_hf_qwen_3_moe import Qwen3MoeExperts
 from chitu.models.registry import ModelType, register_model
+from chitu.ops import linear
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.quantization import get_quant_from_checkpoint_prefix
 from chitu.quantization.normal import NormalMoeExperts
@@ -43,12 +44,11 @@ class AttentionHFGptOss(AttentionHFLlama):
         self.sliding_window = 128 if layer_id % 2 == 0 else -1
         self.sinks = nn.Parameter(torch.empty(self.n_local_heads))
 
-    def prefill_forward(
+    def forward(
         self,
         x: torch.Tensor,
         freqs_cis_cos: torch.Tensor,
         freqs_cis_sin: torch.Tensor,
-        varlens,
     ):
         # 因为量化后x是个tuple，所以取shape的时候放linear后面
         xq, xk, xv = self._run_linear(x)
@@ -71,59 +71,16 @@ class AttentionHFGptOss(AttentionHFLlama):
             rotary_type=self.rotary_type,
         )
 
-        self.cache.finalize_cache_bylayer_prefill(
-            xk, xv, self.cache.curr_req_ids, self.cache.seq_len_delta.new, self.layer_id
-        )
-        output = self.attn_backend.prefill_ragged_qkvo(
-            xq,
-            xk,
-            xv,
-            varlens,
-            causal=True,
-            sinks=self.sinks,
-            window_size=(self.sliding_window, -1),
-        ).view(bs_seq, -1)
-        return self._run_output_linear(output)
-
-    def decode_forward(
-        self, x: torch.Tensor, freqs_cis_cos: torch.Tensor, freqs_cis_sin: torch.Tensor
-    ):
-        bsz, seqlen, _ = x.shape
-        assert seqlen == 1, "decode_forward only supports single token decoding"
-        xq, xk, xv = self._run_linear(x)
-
-        xq = xq.view(-1, self.n_local_heads, self.head_dim).contiguous()
-        xk = xk.view(-1, self.n_local_kv_heads, self.head_dim).contiguous()
-        xv = xv.view(-1, self.n_local_kv_heads, self.head_dim).contiguous()
-
-        if hasattr(self, "q_norm"):
-            xq = self.q_norm(xq)
-        if hasattr(self, "k_norm"):
-            xk = self.k_norm(xk)
-
-        xq, xk = apply_rotary_pos_emb(
-            xq,
-            xk,
-            freqs_cis_cos,
-            freqs_cis_sin,
-            rotary_type=self.rotary_type,
-        )
-
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-
-        output = self.attn_backend.decode(
+        output = self.attn_backend(
             xq,
             self.cache.get_accessor(self.layer_id),
             xk,
             xv,
-            prev_seq_len=self.cache.seq_len_delta.old,
-            next_seq_len=self.cache.seq_len_delta.new,
+            seq_len_delta=self.cache.seq_len_delta,
+            causal=True,
             sinks=self.sinks,
             window_size=(self.sliding_window, -1),
-        ).view(bsz, seqlen, -1)
-
+        ).view(bs_seq, -1)
         return self._run_output_linear(output)
 
 
@@ -160,7 +117,7 @@ class GptOssMoeGate(nn.Module):
                 dtype=self.weight.dtype,
                 device=self.weight.device,
             ), torch.empty((0, self.topk), dtype=torch.int32, device=self.weight.device)
-        scores = torch.nn.functional.linear(x, self.weight, self.bias)
+        scores = linear(x, self.weight, self.bias)
         indices, weights = self.moe_gate(
             scores,
             self.topk,

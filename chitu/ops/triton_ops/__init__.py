@@ -11,16 +11,17 @@ from chitu.ops.triton_ops.kv_cache import (
 )
 from chitu.ops.triton_ops.norm import rms_norm_triton
 from chitu.ops.triton_ops.quant import (
-    quant_einsum_shc_hdc_shd_triton,
+    blockfp8_einsum_shc_hdc_shd_triton,
     w8a8_gemm_per_token_per_channel_triton,
     w4a8_gemm_per_token_per_channel_asymm_triton,
-    fp8_gemm_deepseek_v3_triton_default,
-    soft_fp8_gemm_deepseek_v3_triton,
-    soft_fp4_raise_to_fp8_gemm_deepseek_v3_triton,
-    soft_fp4_raise_to_bf16_gemm_deepseek_v3_triton,
-    weight_dequant_deepseek_v3_triton,
-    weight_dequant_soft_fp8_deepseek_v3_triton,
-    act_quant_deepseek_v3_triton,
+    blockfp8_gemm_triton_default,
+    soft_fp8_blockfp8_gemm_triton,
+    soft_fp4_raise_to_fp8_blockfp4_gemm_triton,
+    soft_fp4_raise_to_bf16_blockfp4_gemm_triton,
+    blockfp8_weight_dequant_triton,
+    soft_fp8_blockfp8_weight_dequant_triton,
+    blockfp8_act_quant_triton,
+    silu_and_mul_and_blockfp8_act_quant_triton,
     mixq_w8a8_gemm_triton,
     mixq_w4a4_gemm_triton,
 )

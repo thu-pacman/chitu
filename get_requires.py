@@ -82,5 +82,8 @@ extras_require = {
         "deep_gemm @ file://localhost"
         + os.path.join(setup_dir, "third_party/DeepGEMM"),
     ],
+    "deep_ep": [
+        "deep_ep @ file://localhost" + os.path.join(setup_dir, "third_party/DeepEP"),
+    ],  # export NVSHMEM_DIR=/path/to/installed/nvshmem
     **operators.get_extras_require(),
 }

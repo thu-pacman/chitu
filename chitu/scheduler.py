@@ -258,39 +258,42 @@ class SkewPipelineScheduler(Scheduler):
 
     @override
     def schedule(self) -> List[str]:
-        #  search for an empty slot to prefill
-        prefill_task_ids = filter(
-            lambda x: TaskPool.pool[x].task_type == TaskType.Prefill
-            and not TaskPool.pool[x].waiting,
-            TaskPool.id_list,
+        # search unwaiting prefill tasks
+        prefill_task_ids = list(
+            filter(
+                lambda x: TaskPool.pool[x].task_type == TaskType.Prefill
+                and not TaskPool.pool[x].waiting,
+                TaskPool.id_list,
+            )
         )
 
+        # find slot_group with one or more empty slots
         local_idx = -1
+        num_tasks = 0
         for idx, slots in enumerate(self.decode_slots):
-            if len(slots) == 0:
+            slot_group_capacity = self.slot_handle.get_slot_size(idx)
+            if len(slots) < slot_group_capacity:
                 local_idx = idx
+                num_tasks = slot_group_capacity - len(slots)
                 break
 
-        num_tasks = 0 if local_idx == -1 else self.slot_handle.get_slot_size(local_idx)
-        assert num_tasks <= self.max_reqs
-        ret_task_ids = list(prefill_task_ids)[:num_tasks]
-
-        if num_tasks:
+        ret_task_ids = []
+        if local_idx != -1 and num_tasks > 0 and prefill_task_ids:
+            # add prefill tasks into selected slot_group: local_idx
+            ret_task_ids = prefill_task_ids[:num_tasks]
             self.decode_slots[local_idx].extend(ret_task_ids)
-
-        decode_task_ids = []
-        if len(ret_task_ids) == 0:
-            for idx, slot_ids in enumerate(self.decode_slots):
-                if len(slot_ids) > 0 and not TaskPool.pool[slot_ids[0]].waiting:
-                    local_idx = idx
-                    decode_task_ids = slot_ids
-                    break
-            ret_task_ids.extend(
-                list(decode_task_ids)[: self.max_reqs - len(ret_task_ids)]
-            )
-
-        if len(ret_task_ids):
             self.slot_handle.set_slot_idx(local_idx)
+
+        # totally separate prefilling and decoding stages
+        if not ret_task_ids:
+            for idx, slot_ids in enumerate(self.decode_slots):
+                if slot_ids and all(
+                    not TaskPool.pool[slot_id].waiting for slot_id in slot_ids
+                ):
+                    decode_task_ids = slot_ids[: self.max_reqs]
+                    ret_task_ids.extend(decode_task_ids)
+                    self.slot_handle.set_slot_idx(idx)
+                    break
 
         return ret_task_ids
 

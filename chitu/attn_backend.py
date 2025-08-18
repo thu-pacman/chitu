@@ -24,7 +24,7 @@ from chitu.device_type import is_muxi
 from chitu.global_vars import get_global_args
 from chitu.ops import append_to_dense_kv_cache, append_to_paged_kv_cache
 from chitu.static_tensor import StaticTensor
-from chitu.batched_seq_len import BatchedSeqLen
+from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
 from chitu.cache_manager import (
     KVCacheAccessor,
     PagedKVCacheAccessor,
@@ -77,13 +77,14 @@ class AttnBackend(abc.ABC):
     #
     # The interface class (AttnBackend) is originally from flash_attn (https://github.com/Dao-AILab/flash-attention),
     # licensed under BSD-3-Clause.
-    @abc.abstractmethod
-    def prefill_ragged_qkvo(
+    def __call__(
         self,
         q,
+        kv_cache: KVCacheAccessor,
         k,
         v,
-        seqlens: BatchedSeqLen,
+        *,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -91,6 +92,11 @@ class AttnBackend(abc.ABC):
         sinks=None,
     ):
         """
+        If k and v are not None, kv_cache will be updated *inplace* with the new values from k and v.
+        If you pass in k / v, you must make sure that the cache is large enough to hold the new values.
+        For example, the KV cache could be pre-allocated with the max sequence length, and you can use
+        seq_len_delta to keep track of the current sequence lengths of each sequence in the batch.
+
         Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
         than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
         For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
@@ -114,10 +120,10 @@ class AttnBackend(abc.ABC):
 
         Arguments:
             q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
+            kv_cache: DenseKVCacheAccessor. Returned from DenseKVCacheManager.get_accessor.
             k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
             v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-            seqlens: BatchedSeqLen. The sequence lengths of the sequences in the batch.
-            Default to 1 / sqrt(headdim).
+            seq_len_delta: BatchedSeqLenDelta. The sequence lengths before and after appending the new tokens.
             causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
             window_size: (left, right). If not (-1, -1), implements sliding window local attention.
             softcap: float. Anything > 0 activates softcapping attention.
@@ -125,7 +131,78 @@ class AttnBackend(abc.ABC):
         Return:
             out: (total, nheads, headdim).
         """
-        raise NotImplementedError()
+
+        if seq_len_delta.is_classic_decoding:
+            return self.decode(
+                q,
+                kv_cache,
+                k,
+                v,
+                seq_len_delta=seq_len_delta,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                softmax_scale=softmax_scale,
+                sinks=sinks,
+            )
+        else:
+            return self.prefill(
+                q,
+                kv_cache,
+                k,
+                v,
+                seq_len_delta=seq_len_delta,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                softmax_scale=softmax_scale,
+                sinks=sinks,
+            )
+
+    # SPDX-SnippetEnd
+
+    def prefill(
+        self,
+        q,
+        kv_cache: KVCacheAccessor,
+        k,
+        v,
+        *,
+        seq_len_delta: BatchedSeqLenDelta,
+        causal=False,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
+        sinks=None,
+    ):
+        if isinstance(kv_cache, DenseKVCacheAccessor):
+            return self.prefill_ragged_qo_dense_kv(
+                q,
+                kv_cache,
+                k,
+                v,
+                seq_len_delta=seq_len_delta,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                softmax_scale=softmax_scale,
+                sinks=sinks,
+            )
+        elif isinstance(kv_cache, PagedKVCacheAccessor):
+            return self.prefill_ragged_qo_paged_kv(
+                q,
+                kv_cache,
+                k,
+                v,
+                seq_len_delta=seq_len_delta,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                softmax_scale=softmax_scale,
+                sinks=sinks,
+            )
+        else:
+            raise NotImplementedError()
 
     def decode(
         self,
@@ -134,75 +211,20 @@ class AttnBackend(abc.ABC):
         k=None,
         v=None,
         *,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
     ):
-        """
-        If k and v are not None, kv_cache will be updated *inplace* with the new values from k and v.
-        This is useful for incremental decoding: you can pass in the cached keys/values from the
-        previous step, and update them with the new keys/values from the current step, and do attention
-        with the updated cache, all in 1 kernel.
-
-        If you pass in k / v, you must make sure that the cache is large enough to hold the new values.
-        For example, the KV cache could be pre-allocated with the max sequence length, and you can use
-        prev_seq_len or next_seq_len to keep track of the current sequence lengths of each sequence in
-        the batch.
-
-        See tests/test_flash_attn.py::test_flash_attn_kvcache for examples of how to use this function.
-
-        Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
-        than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
-        For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
-        0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
-
-        If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
-        For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
-            1 1 1 1 0
-            1 1 1 1 1
-        If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
-            0 0
-            0 0
-            0 0
-            1 0
-            1 1
-        If the row of the mask is all zero, the output will be zero.
-
-        If window_size != (-1, -1), implements sliding window local attention. Query at position i
-        will only attend to keys between
-        [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
-
-        Note: Does not support backward pass.
-
-        Arguments:
-            q: (batch_size, seqlen, nheads, headdim)
-            kv_cache: DenseKVCacheAccessor. Returned from DenseKVCacheManager.get_accessor.
-            k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate k with
-                kv_cache.k, starting at the indices specified by prev_seq_len.
-            v [optional]: (batch_size, seqlen_new, nheads_k, headdim). Similar to k.
-            prev_seq_len: BatchedSeqLen. The sequence lengths before append the new tokens.
-            next_seq_len: BatchedSeqLen. The sequence lengths after append the new tokens.
-            causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
-            window_size: (left, right). If not (-1, -1), implements sliding window local attention.
-            softcap: float. Anything > 0 activates softcapping attention.
-            softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(headdim).
-
-        Return:
-            out: (batch_size, seqlen, nheads, headdim).
-        """
-
         if isinstance(kv_cache, DenseKVCacheAccessor):
             return self.decode_dense_kv(
                 q,
                 kv_cache,
                 k=k,
                 v=v,
-                prev_seq_len=prev_seq_len,
-                next_seq_len=next_seq_len,
+                seq_len_delta=seq_len_delta,
                 causal=causal,
                 window_size=window_size,
                 softcap=softcap,
@@ -215,8 +237,7 @@ class AttnBackend(abc.ABC):
                 kv_cache,
                 k=k,
                 v=v,
-                prev_seq_len=prev_seq_len,
-                next_seq_len=next_seq_len,
+                seq_len_delta=seq_len_delta,
                 causal=causal,
                 window_size=window_size,
                 softcap=softcap,
@@ -226,7 +247,116 @@ class AttnBackend(abc.ABC):
         else:
             raise NotImplementedError()
 
-    # SPDX-SnippetEnd
+    @abc.abstractmethod
+    def prefill_ragged_qkvo(
+        self,
+        q,
+        k,
+        v,
+        seq_len_delta: BatchedSeqLenDelta,
+        causal=False,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
+        sinks=None,
+    ):
+        raise NotImplementedError()
+
+    def prefill_ragged_qo_dense_kv(
+        self,
+        q,
+        kv_cache: DenseKVCacheAccessor,
+        k,
+        v,
+        *,
+        seq_len_delta: BatchedSeqLenDelta,
+        causal=False,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
+        sinks=None,
+    ):
+        if k is not None and kv_cache.k is not None:
+            # TODO: assert kv_cache.k is not None only iff k is not None. Currently
+            # we do not enforce this because we need to reuse this interface for MLA
+            # prefilling
+            append_to_dense_kv_cache(
+                kv_cache.k,
+                k.contiguous(),
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+            )
+        if v is not None and kv_cache.v is not None:
+            # TODO: assert kv_cache.v is not None only iff v is not None. Currently
+            # we do not enforce this because we need to reuse this interface for MLA
+            # prefilling
+            append_to_dense_kv_cache(
+                kv_cache.v,
+                v.contiguous(),
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+            )
+
+        return self.prefill_ragged_qkvo(
+            q,
+            k,
+            v,
+            seq_len_delta,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            softmax_scale=softmax_scale,
+            sinks=sinks,
+        )
+
+    def prefill_ragged_qo_paged_kv(
+        self,
+        q,
+        kv_cache: PagedKVCacheAccessor,
+        k,
+        v,
+        *,
+        seq_len_delta: BatchedSeqLenDelta,
+        causal=False,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
+        sinks=None,
+    ):
+        if k is not None and kv_cache.k is not None:
+            # TODO: assert kv_cache.k is not None only iff k is not None. Currently
+            # we do not enforce this because we need to reuse this interface for MLA
+            # prefilling
+            append_to_paged_kv_cache(
+                kv_cache.k,
+                kv_cache.block_table,
+                k.contiguous(),
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+            )
+        if v is not None and kv_cache.v is not None:
+            # TODO: assert kv_cache.v is not None only iff v is not None. Currently
+            # we do not enforce this because we need to reuse this interface for MLA
+            # prefilling
+            append_to_paged_kv_cache(
+                kv_cache.v,
+                kv_cache.block_table,
+                v.contiguous(),
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+            )
+
+        return self.prefill_ragged_qkvo(
+            q,
+            k,
+            v,
+            seq_len_delta,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            softmax_scale=softmax_scale,
+            sinks=sinks,
+        )
 
     @abc.abstractmethod
     def decode_dense_kv(
@@ -236,8 +366,7 @@ class AttnBackend(abc.ABC):
         k=None,
         v=None,
         *,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -254,8 +383,7 @@ class AttnBackend(abc.ABC):
         k=None,
         v=None,
         *,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -270,17 +398,26 @@ class AttnBackend(abc.ABC):
         q_pe,
         kv_cache: KVCacheAccessor,
         kv,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
     ):
         if isinstance(kv_cache, DenseKVCacheAccessor):
             return self.mla_decode_dense_kv(
-                q_nope, q_pe, kv_cache, kv, prev_seq_len, next_seq_len, softmax_scale
+                q_nope,
+                q_pe,
+                kv_cache,
+                kv,
+                seq_len_delta=seq_len_delta,
+                softmax_scale=softmax_scale,
             )
         elif isinstance(kv_cache, PagedKVCacheAccessor):
             return self.mla_decode_paged_kv(
-                q_nope, q_pe, kv_cache, kv, prev_seq_len, next_seq_len, softmax_scale
+                q_nope,
+                q_pe,
+                kv_cache,
+                kv,
+                seq_len_delta=seq_len_delta,
+                softmax_scale=softmax_scale,
             )
         else:
             raise NotImplementedError()
@@ -291,8 +428,7 @@ class AttnBackend(abc.ABC):
         q_pe,
         kv_cache: KVCacheAccessor,
         kv,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         softmax_scale,
         mqa_func,
     ):
@@ -304,7 +440,6 @@ class AttnBackend(abc.ABC):
         q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
         q_nope_pe = q_nope_pe.view(
             bs,
-            1,  # seqlen
             local_n_heads,
             kv_lora_rank + qk_rope_head_dim,  # hidden
         )
@@ -351,8 +486,7 @@ class AttnBackend(abc.ABC):
             kv_cache,
             kv,
             kv_lora,
-            prev_seq_len=prev_seq_len,
-            next_seq_len=next_seq_len,
+            seq_len_delta=seq_len_delta,
             softmax_scale=softmax_scale,
         )
 
@@ -362,8 +496,7 @@ class AttnBackend(abc.ABC):
         q_pe,
         kv_cache: DenseKVCacheAccessor,
         kv,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
     ):
         # If not overridden, fall back to a multi-query attention
@@ -372,8 +505,7 @@ class AttnBackend(abc.ABC):
             q_pe,
             kv_cache,
             kv,
-            prev_seq_len,
-            next_seq_len,
+            seq_len_delta,
             softmax_scale,
             self.decode_dense_kv,
         )
@@ -384,8 +516,7 @@ class AttnBackend(abc.ABC):
         q_pe,
         kv_cache: PagedKVCacheAccessor,
         kv,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
     ):
         # If not overridden, fall back to a multi-query attention
@@ -394,8 +525,7 @@ class AttnBackend(abc.ABC):
             q_pe,
             kv_cache,
             kv,
-            prev_seq_len,
-            next_seq_len,
+            seq_len_delta,
             softmax_scale,
             self.decode_paged_kv,
         )
@@ -412,7 +542,7 @@ class FlashAttnBackend(AttnBackend):
         q,
         k,
         v,
-        seqlens: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -429,10 +559,10 @@ class FlashAttnBackend(AttnBackend):
             q,
             k,
             v,
-            seqlens.prefix_lens_tensor_device,
-            seqlens.prefix_lens_tensor_device,
-            seqlens.max_len,
-            seqlens.max_len,
+            seq_len_delta.new.prefix_lens_tensor_device,
+            seq_len_delta.new.prefix_lens_tensor_device,
+            seq_len_delta.new.max_len,
+            seq_len_delta.new.max_len,
             causal=causal,
             window_size=window_size,
             softmax_scale=softmax_scale,
@@ -447,8 +577,7 @@ class FlashAttnBackend(AttnBackend):
         k=None,
         v=None,
         *,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -462,17 +591,17 @@ class FlashAttnBackend(AttnBackend):
             extra_kvargs["softcap"] = softcap
 
         return flash_attn.flash_attn_with_kvcache(
-            q,
+            q.unsqueeze(1),
             kv_cache.k,
             kv_cache.v,
-            k=k,
-            v=v,
-            cache_seqlens=prev_seq_len.lens_tensor_device,
+            k=k.unsqueeze(1) if k is not None else None,
+            v=v.unsqueeze(1) if v is not None else None,
+            cache_seqlens=seq_len_delta.old.lens_tensor_device,
             causal=causal,
             window_size=window_size,
             softmax_scale=softmax_scale,
             **extra_kvargs,
-        )
+        ).squeeze(1)
 
     @override
     def decode_paged_kv(
@@ -482,8 +611,7 @@ class FlashAttnBackend(AttnBackend):
         k=None,
         v=None,
         *,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -497,18 +625,18 @@ class FlashAttnBackend(AttnBackend):
             extra_kvargs["softcap"] = softcap
 
         return flash_attn.flash_attn_with_kvcache(
-            q,
+            q.unsqueeze(1),
             kv_cache.k,
             kv_cache.v,
-            k=k,
-            v=v,
-            cache_seqlens=prev_seq_len.lens_tensor_device,
+            k=k.unsqueeze(1) if k is not None else None,
+            v=v.unsqueeze(1) if v is not None else None,
+            cache_seqlens=seq_len_delta.old.lens_tensor_device,
             block_table=kv_cache.block_table,
             causal=causal,
             window_size=window_size,
             softmax_scale=softmax_scale,
             **extra_kvargs,
-        )
+        ).squeeze(1)
 
 
 # SPDX-SnippetBegin
@@ -659,7 +787,7 @@ class RefAttnBackend(AttnBackend):
         q,
         k,
         v,
-        seqlens: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -667,29 +795,35 @@ class RefAttnBackend(AttnBackend):
         sinks=None,
     ):
         q_batch = torch.zeros(
-            (seqlens.batch_size,) + tuple(q.shape),
+            (seq_len_delta.batch_size,) + tuple(q.shape),
             dtype=q.dtype,
             device=q.device,
         )
         k_batch = torch.zeros(
-            (seqlens.batch_size,) + tuple(k.shape),
+            (seq_len_delta.batch_size,) + tuple(k.shape),
             dtype=k.dtype,
             device=k.device,
         )
         v_batch = torch.zeros(
-            (seqlens.batch_size,) + tuple(v.shape),
+            (seq_len_delta.batch_size,) + tuple(v.shape),
             dtype=v.dtype,
             device=v.device,
         )
-        for i in range(seqlens.batch_size):
-            q_batch[i, 0 : seqlens.lens_list[i]] = q[
-                seqlens.prefix_lens_list[i] : seqlens.prefix_lens_list[i + 1]
+        for i in range(seq_len_delta.batch_size):
+            q_batch[i, 0 : seq_len_delta.new.lens_list[i]] = q[
+                seq_len_delta.new.prefix_lens_list[
+                    i
+                ] : seq_len_delta.new.prefix_lens_list[i + 1]
             ]
-            k_batch[i, 0 : seqlens.lens_list[i]] = k[
-                seqlens.prefix_lens_list[i] : seqlens.prefix_lens_list[i + 1]
+            k_batch[i, 0 : seq_len_delta.new.lens_list[i]] = k[
+                seq_len_delta.new.prefix_lens_list[
+                    i
+                ] : seq_len_delta.new.prefix_lens_list[i + 1]
             ]
-            v_batch[i, 0 : seqlens.lens_list[i]] = v[
-                seqlens.prefix_lens_list[i] : seqlens.prefix_lens_list[i + 1]
+            v_batch[i, 0 : seq_len_delta.new.lens_list[i]] = v[
+                seq_len_delta.new.prefix_lens_list[
+                    i
+                ] : seq_len_delta.new.prefix_lens_list[i + 1]
             ]
         output_batch, _ = self._attention(
             q_batch,
@@ -702,14 +836,16 @@ class RefAttnBackend(AttnBackend):
             sinks=sinks,
         )
         output = torch.empty(
-            (seqlens.total_len,) + output_batch.shape[2:],
+            (seq_len_delta.new.total_len,) + output_batch.shape[2:],
             dtype=output_batch[0].dtype,
             device=output_batch[0].device,
         )
-        for i in range(seqlens.batch_size):
-            output[seqlens.prefix_lens_list[i] : seqlens.prefix_lens_list[i + 1]] = (
-                output_batch[i, 0 : seqlens.lens_list[i]]
-            )
+        for i in range(seq_len_delta.batch_size):
+            output[
+                seq_len_delta.new.prefix_lens_list[
+                    i
+                ] : seq_len_delta.new.prefix_lens_list[i + 1]
+            ] = output_batch[i, 0 : seq_len_delta.new.lens_list[i]]
         return output
 
     @override
@@ -720,8 +856,7 @@ class RefAttnBackend(AttnBackend):
         k=None,
         v=None,
         *,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -732,20 +867,20 @@ class RefAttnBackend(AttnBackend):
             torch.arange(kv_cache.k.shape[1], device=kv_cache.v.device), "s -> 1 s"
         )
         prev_seq_len_expanded = einops.rearrange(
-            prev_seq_len.lens_tensor_device, "b -> b 1"
+            seq_len_delta.old.lens_tensor_device, "b -> b 1"
         )
         if k is None and q is None:
             key_padding_mask = arange < prev_seq_len_expanded
         elif k is not None and q is not None:
             key_padding_mask = arange < prev_seq_len_expanded + 1
-            for i in range(prev_seq_len.batch_size):
-                kv_cache.k[i, prev_seq_len.lens_list[i]] = k[i]
-                kv_cache.v[i, prev_seq_len.lens_list[i]] = v[i]
+            for i in range(seq_len_delta.batch_size):
+                kv_cache.k[i, seq_len_delta.old.lens_list[i]] = k[i]
+                kv_cache.v[i, seq_len_delta.old.lens_list[i]] = v[i]
         else:
             assert False
 
         output, _ = self._attention(
-            q,
+            q.unsqueeze(1),
             kv_cache.k,
             kv_cache.v,
             None,
@@ -756,7 +891,7 @@ class RefAttnBackend(AttnBackend):
             softmax_scale=softmax_scale,
             sinks=sinks,
         )
-        return output
+        return output.squeeze(1)
 
     @override
     def decode_paged_kv(
@@ -766,8 +901,7 @@ class RefAttnBackend(AttnBackend):
         k=None,
         v=None,
         *,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -777,30 +911,30 @@ class RefAttnBackend(AttnBackend):
         k_cache_paged = kv_cache.k
         v_cache_paged = kv_cache.v
         if k is None and q is None:
-            max_seqlen = prev_seq_len.max_len
+            max_seqlen = seq_len_delta.old.max_len
         elif k is not None and q is not None:
-            max_seqlen = prev_seq_len.max_len + 1
+            max_seqlen = seq_len_delta.new.max_len
         else:
             assert False
         assert isinstance(max_seqlen, int)
         k_cache = torch.zeros(
-            prev_seq_len.batch_size,
+            seq_len_delta.batch_size,
             max_seqlen,
             *k_cache_paged.shape[2:],
             device=k_cache_paged.device,
             dtype=k_cache_paged.dtype,
         )
         v_cache = torch.zeros(
-            prev_seq_len.batch_size,
+            seq_len_delta.batch_size,
             max_seqlen,
             *v_cache_paged.shape[2:],
             device=v_cache_paged.device,
             dtype=v_cache_paged.dtype,
         )
         page_size = k_cache_paged.shape[1]
-        for i in range(prev_seq_len.batch_size):
-            for j in range(0, prev_seq_len.lens_list[i], page_size):
-                len_in_this_page = min(page_size, prev_seq_len.lens_list[i] - j)
+        for i in range(seq_len_delta.batch_size):
+            for j in range(0, seq_len_delta.old.lens_list[i], page_size):
+                len_in_this_page = min(page_size, seq_len_delta.old.lens_list[i] - j)
                 k_cache[i, j : j + len_in_this_page] = k_cache_paged[
                     kv_cache.block_table[i, j // page_size], :len_in_this_page
                 ]
@@ -809,32 +943,36 @@ class RefAttnBackend(AttnBackend):
                 ]
             if k is not None and q is not None:
                 k_cache_paged[
-                    kv_cache.block_table[i, prev_seq_len.lens_list[i] // page_size],
-                    prev_seq_len.lens_list[i] % page_size,
+                    kv_cache.block_table[
+                        i, seq_len_delta.old.lens_list[i] // page_size
+                    ],
+                    seq_len_delta.old.lens_list[i] % page_size,
                 ] = k[i]
                 v_cache_paged[
-                    kv_cache.block_table[i, prev_seq_len.lens_list[i] // page_size],
-                    prev_seq_len.lens_list[i] % page_size,
+                    kv_cache.block_table[
+                        i, seq_len_delta.old.lens_list[i] // page_size
+                    ],
+                    seq_len_delta.old.lens_list[i] % page_size,
                 ] = v[i]
 
         arange = einops.rearrange(
             torch.arange(k_cache.shape[1], device=k_cache.device), "s -> 1 s"
         )
         prev_seq_len_expanded = einops.rearrange(
-            prev_seq_len.lens_tensor_device, "b -> b 1"
+            seq_len_delta.old.lens_tensor_device, "b -> b 1"
         )
         if k is None and q is None:
             key_padding_mask = arange < prev_seq_len_expanded
         elif k is not None and q is not None:
             key_padding_mask = arange < prev_seq_len_expanded + 1
-            for i in range(prev_seq_len.batch_size):
-                k_cache[i][prev_seq_len.lens_list[i]] = k[i]
-                v_cache[i][prev_seq_len.lens_list[i]] = v[i]
+            for i in range(seq_len_delta.batch_size):
+                k_cache[i][seq_len_delta.old.lens_list[i]] = k[i]
+                v_cache[i][seq_len_delta.old.lens_list[i]] = v[i]
         else:
             assert False
 
         output, _ = self._attention(
-            q,
+            q.unsqueeze(1),
             k_cache,
             v_cache,
             None,
@@ -845,7 +983,7 @@ class RefAttnBackend(AttnBackend):
             softmax_scale=softmax_scale,
             sinks=sinks,
         )
-        return output
+        return output.squeeze(1)
 
 
 # SPDX-SnippetEnd
@@ -857,8 +995,7 @@ class TritonAttnBackend(RefAttnBackend):
 
     def prepare_metadata_for_decode(
         self,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         block_table,
         block_size,
         softmax_scale=None,
@@ -871,7 +1008,7 @@ class TritonAttnBackend(RefAttnBackend):
         q,
         k,
         v,
-        seqlens: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),
         softcap=0,
@@ -888,9 +1025,9 @@ class TritonAttnBackend(RefAttnBackend):
             k,
             v,
             output,
-            seqlens.prefix_lens_tensor_device,
-            seqlens.lens_tensor_device,
-            seqlens.max_len,
+            seq_len_delta.new.prefix_lens_tensor_device,
+            seq_len_delta.new.lens_tensor_device,
+            seq_len_delta.new.max_len,
             softmax_scale,
             causal,
         )
@@ -903,8 +1040,7 @@ class TritonAttnBackend(RefAttnBackend):
         q_pe,
         kv_cache: DenseKVCacheAccessor,
         kv,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
     ):
         B, local_n_heads, kv_lora_rank = q_nope.shape
@@ -912,7 +1048,7 @@ class TritonAttnBackend(RefAttnBackend):
         assert q_pe.shape[1] == local_n_heads
         _, _, qk_rope_head_dim = q_pe.shape
 
-        append_to_dense_kv_cache(kv_cache.k, kv, prev_seq_len.lens_tensor_device)
+        append_to_dense_kv_cache(kv_cache.k, kv, seq_len_delta.old.lens_tensor_device)
 
         o = torch.zeros(
             B,
@@ -967,7 +1103,7 @@ class TritonAttnBackend(RefAttnBackend):
             kv_c_cache,
             k_pe_cache,
             o,
-            next_seq_len.lens_tensor_device,
+            seq_len_delta.new.lens_tensor_device,
             attn_logits,
             num_kv_splits,
             softmax_scale,
@@ -982,20 +1118,13 @@ class TritonAttnBackend(RefAttnBackend):
         q_pe,
         kv_cache: PagedKVCacheAccessor,
         kv,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
     ):
         if is_muxi():
             # Fallback to MQA, which calls `decode_attention_fwd`. Experiments show it is faster than `mla_decode`.
             return super().mla_decode_paged_kv(
-                q_nope,
-                q_pe,
-                kv_cache,
-                kv,
-                prev_seq_len,
-                next_seq_len,
-                softmax_scale,
+                q_nope, q_pe, kv_cache, kv, seq_len_delta, softmax_scale
             )
 
         B, local_n_heads, kv_lora_rank = q_nope.shape
@@ -1004,7 +1133,7 @@ class TritonAttnBackend(RefAttnBackend):
         _, _, qk_rope_head_dim = q_pe.shape
 
         append_to_paged_kv_cache(
-            kv_cache.k, kv_cache.block_table, kv, prev_seq_len.lens_tensor_device
+            kv_cache.k, kv_cache.block_table, kv, seq_len_delta.old.lens_tensor_device
         )
 
         o = torch.zeros(
@@ -1061,7 +1190,7 @@ class TritonAttnBackend(RefAttnBackend):
             k_pe_cache,
             o,
             kv_cache.block_table,
-            next_seq_len.lens_tensor_device,
+            seq_len_delta.new.lens_tensor_device,
             attn_logits,
             num_kv_splits,
             softmax_scale,
@@ -1078,8 +1207,7 @@ class TritonAttnBackend(RefAttnBackend):
         k=None,
         v=None,
         *,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -1089,15 +1217,20 @@ class TritonAttnBackend(RefAttnBackend):
         # triton has bug, when version < 3.2.0, the "~" operator on bool vector will get wrong results
         assert self.triton_latest_enough
 
+        # Legacy shape change. TODO: Remve this
+        q = q.unsqueeze(1)
+        k = k.unsqueeze(1) if k is not None else None
+        v = v.unsqueeze(1) if v is not None else None
+
         if k is None and q is None:
-            max_len = prev_seq_len.max_len
+            max_len = seq_len_delta.old.max_len
         elif k is not None and q is not None:
-            max_len = prev_seq_len.max_len + 1
+            max_len = seq_len_delta.new.max_len
             append_to_dense_kv_cache(
-                kv_cache.k, k.contiguous(), prev_seq_len.lens_tensor_device
+                kv_cache.k, k.contiguous(), seq_len_delta.old.lens_tensor_device
             )
             append_to_dense_kv_cache(
-                kv_cache.v, v.contiguous(), prev_seq_len.lens_tensor_device
+                kv_cache.v, v.contiguous(), seq_len_delta.old.lens_tensor_device
             )
         else:
             assert False
@@ -1106,7 +1239,7 @@ class TritonAttnBackend(RefAttnBackend):
             torch.arange(kv_cache.k.shape[1], device=kv_cache.k.device), "s -> 1 s"
         )
         prev_seq_len_expanded = einops.rearrange(
-            prev_seq_len.lens_tensor_device, "b -> b 1"
+            seq_len_delta.old.lens_tensor_device, "b -> b 1"
         )
         if k is None and q is None:
             key_padding_mask = arange < prev_seq_len_expanded
@@ -1136,6 +1269,9 @@ class TritonAttnBackend(RefAttnBackend):
             local_mask=local_mask,
         )
 
+        # Legacy shape change. TODO: Remve this
+        output = output.squeeze(1)
+
         return output
 
     @override
@@ -1146,29 +1282,33 @@ class TritonAttnBackend(RefAttnBackend):
         k=None,
         v=None,
         *,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
     ):
+        # Legacy shape change. TODO: Remve this
+        q = q.unsqueeze(1)
+        k = k.unsqueeze(1) if k is not None else None
+        v = v.unsqueeze(1) if v is not None else None
+
         if k is None and q is None:
-            seqlens = prev_seq_len.lens_tensor_device
+            seqlens = seq_len_delta.old.lens_tensor_device
         elif k is not None and q is not None:
-            seqlens = next_seq_len.lens_tensor_device
+            seqlens = seq_len_delta.new.lens_tensor_device
             append_to_paged_kv_cache(
                 kv_cache.k,
                 kv_cache.block_table,
                 k.contiguous(),
-                prev_seq_len.lens_tensor_device,
+                seq_len_delta.old.lens_tensor_device,
             )
             append_to_paged_kv_cache(
                 kv_cache.v,
                 kv_cache.block_table,
                 v.contiguous(),
-                prev_seq_len.lens_tensor_device,
+                seq_len_delta.old.lens_tensor_device,
             )
         else:
             assert False
@@ -1218,6 +1358,9 @@ class TritonAttnBackend(RefAttnBackend):
             logit_cap=softcap,
         )
 
+        # Legacy shape change. TODO: Remve this
+        output = output.squeeze(1)
+
         return output
 
 
@@ -1233,15 +1376,14 @@ class FlashMLABackend(TritonAttnBackend):
 
     def prepare_metadata_for_decode(
         self,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         block_table,
         block_size,
         softmax_scale=None,
     ):
         max_batch_size = self.args.infer.max_reqs
         metadata, num_splits = flash_mla.get_mla_metadata(
-            next_seq_len.lens_tensor_device,
+            seq_len_delta.new.lens_tensor_device,
             self.mtp_size * self.local_n_heads // self.kv_heads,
             self.kv_heads,
         )
@@ -1263,24 +1405,23 @@ class FlashMLABackend(TritonAttnBackend):
         q_pe,
         kv_cache: PagedKVCacheAccessor,
         kv,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
     ):
-        bsz = prev_seq_len.batch_size
+        bsz = seq_len_delta.batch_size
 
         q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
         q_nope_pe = q_nope_pe.view(bsz, 1, q_nope_pe.shape[-2], q_nope_pe.shape[-1])
 
         append_to_paged_kv_cache(
-            kv_cache.k, kv_cache.block_table, kv, prev_seq_len.lens_tensor_device
+            kv_cache.k, kv_cache.block_table, kv, seq_len_delta.old.lens_tensor_device
         )
 
         output, _ = flash_mla.flash_mla_with_kvcache(
             q_nope_pe,
             kv_cache.k.unsqueeze(2),
             kv_cache.block_table,
-            next_seq_len.lens_tensor_device,
+            seq_len_delta.new.lens_tensor_device,
             512,  # dv
             self.metadata.get(),
             self.num_splits.get(),
@@ -1413,18 +1554,17 @@ class FlashInferBackend(TritonAttnBackend):
 
     def prepare_metadata_for_decode(
         self,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         block_table,
         block_size,
         softmax_scale=None,
         window_size=(-1, -1),
         softcap=0.0,
     ):
-        raw_batch_size = prev_seq_len.batch_size
+        raw_batch_size = seq_len_delta.batch_size
         batch_size = self.match_batch_size(raw_batch_size)
         next_seq_len_tensor_device = self.pad_tensor(
-            next_seq_len.lens_tensor_device, batch_size
+            seq_len_delta.new.lens_tensor_device, batch_size
         )
         block_table = self.pad_tensor(block_table, batch_size)
         self.q_indptr.set(torch.arange(0, batch_size + 1).cuda().to(torch.int32))
@@ -1472,7 +1612,7 @@ class FlashInferBackend(TritonAttnBackend):
             )
 
         for i in range(raw_batch_size):
-            self.last_page_len[i] = prev_seq_len.lens_list[i] + 1
+            self.last_page_len[i] = seq_len_delta.new.lens_list[i]
 
         def is_new_seq_len():
             for i in range(batch_size):
@@ -1505,8 +1645,7 @@ class FlashInferBackend(TritonAttnBackend):
         q_pe,
         kv_cache: PagedKVCacheAccessor,
         kv,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
     ):
         B, local_n_heads, self.kv_lora_rank = q_nope.shape
@@ -1514,7 +1653,7 @@ class FlashInferBackend(TritonAttnBackend):
         assert q_pe.shape[1] == local_n_heads
         _, _, self.qk_rope_head_dim = q_pe.shape
         append_to_paged_kv_cache(
-            kv_cache.k, kv_cache.block_table, kv, prev_seq_len.lens_tensor_device
+            kv_cache.k, kv_cache.block_table, kv, seq_len_delta.old.lens_tensor_device
         )
 
         return self.mla_wrapper.run(
@@ -1523,7 +1662,7 @@ class FlashInferBackend(TritonAttnBackend):
             kv_cache.k[..., : self.kv_lora_rank],
             kv_cache.k[..., self.kv_lora_rank :],
             return_lse=False,
-        ).view(prev_seq_len.batch_size, 1, self.local_n_heads, -1)
+        ).view(seq_len_delta.batch_size, 1, self.local_n_heads, -1)
 
     @override
     def prefill_ragged_qkvo(
@@ -1531,7 +1670,7 @@ class FlashInferBackend(TritonAttnBackend):
         q,
         k,
         v,
-        seqlens: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -1542,8 +1681,8 @@ class FlashInferBackend(TritonAttnBackend):
         num_qo_heads = q.shape[-2]
         num_kv_heads = k.shape[-2]
         self.prefill_wrapper.plan(
-            seqlens.prefix_lens_tensor_device,
-            seqlens.prefix_lens_tensor_device,
+            seq_len_delta.new.prefix_lens_tensor_device,
+            seq_len_delta.new.prefix_lens_tensor_device,
             num_qo_heads,
             num_kv_heads,
             head_dim_qk=q.shape[-1],
@@ -1566,8 +1705,7 @@ class FlashInferBackend(TritonAttnBackend):
         k=None,
         v=None,
         *,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -1579,12 +1717,12 @@ class FlashInferBackend(TritonAttnBackend):
         head_dim = q.shape[-1]
         o = torch.empty_like(q)
         for i in range(batch_size):
-            kv_cache.k[i, prev_seq_len.lens_list[i]] = k[i]
-            kv_cache.v[i, prev_seq_len.lens_list[i]] = v[i]
+            kv_cache.k[i, seq_len_delta.old.lens_list[i]] = k[i]
+            kv_cache.v[i, seq_len_delta.old.lens_list[i]] = v[i]
             o[i] = flashinfer.single_decode_with_kv_cache(
-                q[i].squeeze(0),
-                kv_cache.k[i, : prev_seq_len.lens_list[i] + 1],
-                kv_cache.v[i, : prev_seq_len.lens_list[i] + 1],
+                q[i],
+                kv_cache.k[i, : seq_len_delta.old.lens_list[i] + 1],
+                kv_cache.v[i, : seq_len_delta.old.lens_list[i] + 1],
                 "NHD",
                 window_left=window_size[0],
                 logits_soft_cap=softcap,
@@ -1600,8 +1738,7 @@ class FlashInferBackend(TritonAttnBackend):
         k=None,
         v=None,
         *,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -1616,10 +1753,16 @@ class FlashInferBackend(TritonAttnBackend):
         if k is not None:
             assert v is not None
             append_to_paged_kv_cache(
-                kv_cache.k, kv_cache.block_table, k, prev_seq_len.lens_tensor_device
+                kv_cache.k,
+                kv_cache.block_table,
+                k,
+                seq_len_delta.old.lens_tensor_device,
             )
             append_to_paged_kv_cache(
-                kv_cache.v, kv_cache.block_table, v, prev_seq_len.lens_tensor_device
+                kv_cache.v,
+                kv_cache.block_table,
+                v,
+                seq_len_delta.old.lens_tensor_device,
             )
 
         q = self.pad_tensor(q, batch_size)
@@ -1677,8 +1820,7 @@ class NpuAttnBackend(RefAttnBackend):
 
     def prepare_metadata_for_decode(
         self,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         block_table,
         block_size,
         softmax_scale=None,
@@ -1689,9 +1831,9 @@ class NpuAttnBackend(RefAttnBackend):
             slot_list = []
             for i in range(len(self.block_table_list)):
                 block_number = self.block_table_list[i][
-                    prev_seq_len.lens_list[i] // block_size
+                    seq_len_delta.old.lens_list[i] // block_size
                 ]
-                block_offset = prev_seq_len.lens_list[i] % block_size
+                block_offset = seq_len_delta.old.lens_list[i] % block_size
                 slot_list.append(block_number * block_size + block_offset)
             self.slot_mapping.set(
                 torch.tensor(slot_list, dtype=torch.int32, device="npu")
@@ -1703,7 +1845,7 @@ class NpuAttnBackend(RefAttnBackend):
         q,
         k,
         v,
-        seqlens: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -1736,7 +1878,7 @@ class NpuAttnBackend(RefAttnBackend):
                 key=repeated_k,
                 value=repeated_v,
                 mask=self.attn_mask,
-                seq_len=seqlens.lens_tensor_cpu,
+                seq_len=seq_len_delta.new.lens_tensor_cpu,
                 num_kv_heads=repeated_k.shape[1],
                 num_heads=self.local_n_heads,
                 scale_value=scale,
@@ -1752,13 +1894,82 @@ class NpuAttnBackend(RefAttnBackend):
             key=k,
             value=v,
             mask=self.attn_mask,
-            seq_len=seqlens.lens_tensor_cpu,
+            seq_len=seq_len_delta.new.lens_tensor_cpu,
             scale_value=self.scale,
             num_heads=self.local_n_heads,
             num_kv_heads=self.local_n_kv_heads,
             out=output,
         )
         return output
+
+    @override
+    def prefill_ragged_qo_dense_kv(
+        self,
+        q,
+        kv_cache: DenseKVCacheAccessor,
+        k,
+        v,
+        *,
+        seq_len_delta: BatchedSeqLenDelta,
+        causal=False,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
+        sinks=None,
+    ):
+        # NPU BSH layout
+        if len(kv_cache.k.shape) == 3:
+            k = k.view(k.shape[0], -1).contiguous() if k is not None else None
+        if len(kv_cache.v.shape) == 3:
+            v = v.view(v.shape[0], -1).contiguous() if v is not None else None
+
+        return super().prefill_ragged_qo_dense_kv(
+            q,
+            kv_cache,
+            k,
+            v,
+            seq_len_delta=seq_len_delta,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            softmax_scale=softmax_scale,
+            sinks=sinks,
+        )
+
+    @override
+    def prefill_ragged_qo_paged_kv(
+        self,
+        q,
+        kv_cache: PagedKVCacheAccessor,
+        k,
+        v,
+        *,
+        seq_len_delta: BatchedSeqLenDelta,
+        causal=False,
+        window_size=(-1, -1),  # -1 means infinite context window
+        softcap=0.0,  # 0.0 means deactivated
+        softmax_scale=None,
+        sinks=None,
+    ):
+        # NPU BSH layout
+        if get_global_args().models.type != "deepseek-v3":
+            if len(kv_cache.k.shape) == 3:
+                k = k.view(k.shape[0], -1).contiguous() if k is not None else None
+            if len(kv_cache.v.shape) == 3:
+                v = v.view(v.shape[0], -1).contiguous() if v is not None else None
+
+        return super().prefill_ragged_qo_paged_kv(
+            q,
+            kv_cache,
+            k,
+            v,
+            seq_len_delta=seq_len_delta,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            softmax_scale=softmax_scale,
+            sinks=sinks,
+        )
 
     @override
     def decode_dense_kv(
@@ -1768,44 +1979,55 @@ class NpuAttnBackend(RefAttnBackend):
         k=None,
         v=None,
         *,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
     ):
-        torch_npu.scatter_update_(kv_cache.k, prev_seq_len.lens_tensor_device, k, 1)
-        torch_npu.scatter_update_(kv_cache.v, prev_seq_len.lens_tensor_device, v, 1)
+        # Legacy shape change. TODO: Remve this
+        q = q.unsqueeze(1)
+        k = k.unsqueeze(1) if k is not None else None
+        v = v.unsqueeze(1) if v is not None else None
 
-        output_ = torch.empty_like(q)
+        torch_npu.scatter_update_(
+            kv_cache.k, seq_len_delta.old.lens_tensor_device, k, 1
+        )
+        torch_npu.scatter_update_(
+            kv_cache.v, seq_len_delta.old.lens_tensor_device, v, 1
+        )
+
+        output = torch.empty_like(q)
         if hasattr(cinfer_ascendc, "grouped_query_attention") and q.shape[0] <= 8:
             cinfer_ascendc.grouped_query_attention(
                 q,
                 kv_cache.k,
                 kv_cache.v,
-                next_seq_len.lens_tensor_device,
-                output_,
+                seq_len_delta.new.lens_tensor_device,
+                output,
                 q.shape[0],
                 "BSND",
                 self.scale,
             )
-            return output_
         else:
-            lse_ = torch.empty(1, dtype=q.dtype, device="npu")
+            lse = torch.empty(1, dtype=q.dtype, device="npu")
             torch_npu.npu_fused_infer_attention_score.out(
                 q,
                 kv_cache.k,
                 kv_cache.v,
                 input_layout="BSND",
-                actual_seq_lengths_kv=next_seq_len.lens_list,
+                actual_seq_lengths_kv=seq_len_delta.new.lens_list,
                 scale=self.scale,
                 num_heads=self.local_n_heads,
                 num_key_value_heads=self.local_n_kv_heads,
-                out=[output_, lse_],
+                out=[output, lse],
             )
-            return output_
+
+        # Legacy shape change. TODO: Remve this
+        output = output.squeeze(1)
+
+        return output
 
     @override
     def decode_paged_kv(
@@ -1815,14 +2037,18 @@ class NpuAttnBackend(RefAttnBackend):
         k=None,
         v=None,
         *,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
     ):
+        # Legacy shape change. TODO: Remve this
+        q = q.unsqueeze(1)
+        k = k.unsqueeze(1) if k is not None else None
+        v = v.unsqueeze(1) if v is not None else None
+
         # [BSND] -> [BSH]
         q = q.view(q.shape[0], q.shape[1], -1).contiguous()
         k = k.view(k.shape[0], k.shape[1], -1).contiguous()
@@ -1838,8 +2064,8 @@ class NpuAttnBackend(RefAttnBackend):
         kv_cache.k[self.slot_mapping.get()] = k
         kv_cache.v[self.slot_mapping.get()] = v
 
-        output_ = torch.empty_like(q)
-        lse_ = torch.empty(1, dtype=q.dtype, device="npu")
+        output = torch.empty_like(q)
+        lse = torch.empty(1, dtype=q.dtype, device="npu")
         torch_npu.npu_fused_infer_attention_score.out(
             q,
             kv_cache.k,
@@ -1847,13 +2073,17 @@ class NpuAttnBackend(RefAttnBackend):
             input_layout="BSH",
             block_size=128,
             block_table=kv_cache.block_table,
-            actual_seq_lengths_kv=next_seq_len.lens_list,
+            actual_seq_lengths_kv=seq_len_delta.new.lens_list,
             scale=self.scale,
             num_heads=self.local_n_heads,
             num_key_value_heads=self.local_n_kv_heads,
-            out=[output_, lse_],
+            out=[output, lse],
         )
-        return output_
+
+        # Legacy shape change. TODO: Remve this
+        output = output.squeeze(1)
+
+        return output
 
     @override
     def mla_decode_paged_kv(
@@ -1862,17 +2092,16 @@ class NpuAttnBackend(RefAttnBackend):
         q_pe,
         kv_cache: PagedKVCacheAccessor,
         kv,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
     ):
-        bsz = prev_seq_len.batch_size
+        bsz = seq_len_delta.batch_size
         tp_size = self.args.infer.tp_size
         query = torch.cat([q_nope, q_pe], dim=-1).view(bsz, q_nope.shape[-2], -1)
 
         for i in range(bsz):
-            kv_cache.k[kv_cache.block_table[i][prev_seq_len.lens_list[i] // 128]][
-                prev_seq_len.lens_list[i] % 128
+            kv_cache.k[kv_cache.block_table[i][seq_len_delta.old.lens_list[i] // 128]][
+                seq_len_delta.old.lens_list[i] % 128
             ] = kv[i]
         # kv_cache[indices, positions] = kv.squeeze(1) if kv.ndim == 3 and kv.shape[1] == 1 else kv
 
@@ -1892,7 +2121,7 @@ class NpuAttnBackend(RefAttnBackend):
             num_heads=128 // tp_size,
             scale_value=1.0 / math.sqrt(query.shape[-1]),
             block_table=kv_cache.block_table,
-            context_lens=next_seq_len.lens_tensor_cpu,
+            context_lens=seq_len_delta.new.lens_tensor_cpu,
             mla_vheadsize=512,
             out=attn_output,
         )
@@ -1930,19 +2159,19 @@ class HybridAttnBackend(AttnBackend):
         q,
         k,
         v,
-        seqlens: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
     ):
-        self.current_backend = self._select_backend(seqlens.batch_size)
+        self.current_backend = self._select_backend(seq_len_delta.batch_size)
         return self.current_backend.prefill_ragged_qkvo(
             q,
             k,
             v,
-            seqlens,
+            seq_len_delta,
             causal=causal,
             window_size=window_size,
             softcap=softcap,
@@ -1958,8 +2187,7 @@ class HybridAttnBackend(AttnBackend):
         k=None,
         v=None,
         *,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),
         softcap=0.0,
@@ -1973,8 +2201,7 @@ class HybridAttnBackend(AttnBackend):
             kv_cache,
             k=k,
             v=v,
-            prev_seq_len=prev_seq_len,
-            next_seq_len=next_seq_len,
+            seq_len_delta=seq_len_delta,
             causal=causal,
             window_size=window_size,
             softcap=softcap,
@@ -1990,8 +2217,7 @@ class HybridAttnBackend(AttnBackend):
         k=None,
         v=None,
         *,
-        prev_seq_len: BatchedSeqLen,
-        next_seq_len: BatchedSeqLen,
+        seq_len_delta: BatchedSeqLenDelta,
         causal=False,
         window_size=(-1, -1),
         softcap=0.0,
@@ -2005,8 +2231,7 @@ class HybridAttnBackend(AttnBackend):
             kv_cache,
             k=k,
             v=v,
-            prev_seq_len=prev_seq_len,
-            next_seq_len=next_seq_len,
+            seq_len_delta=seq_len_delta,
             causal=causal,
             window_size=window_size,
             softcap=softcap,

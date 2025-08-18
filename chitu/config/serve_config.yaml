@@ -7,6 +7,7 @@ defaults:
     - serve_config_rules
   - models: Qwen2-7B-Instruct # References chitu/config/models/Qwen2-7B-Instruct.yaml
   - serve_config_schema
+  - benchmark: default
   - _self_
 
 serve:

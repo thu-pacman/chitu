@@ -5,9 +5,9 @@ import triton
 
 from chitu.native_layout import Packed4BitWeightAlongK, Packed4BitWeightAlongK
 from chitu.ops import (
-    soft_fp4_raise_to_fp8_gemm_deepseek_v3,
-    soft_fp4_raise_to_bf16_gemm_deepseek_v3,
-    act_quant_deepseek_v3,
+    soft_fp4_raise_to_fp8_blockfp4_gemm,
+    soft_fp4_raise_to_bf16_blockfp4_gemm,
+    blockfp8_act_quant,
 )
 from chitu.device_type import has_native_fp8, is_hopper
 
@@ -119,7 +119,7 @@ def test_fp4_raise_to_bf16_gemm_is_close_to_dequanted_gemm():
         Packed4BitWeightAlongK((dim, dim), b),
         k_stride=64,
     )
-    y = soft_fp4_raise_to_bf16_gemm_deepseek_v3(a, preprocessed_b, b_s, b_s_2)
+    y = soft_fp4_raise_to_bf16_blockfp4_gemm(a, preprocessed_b, b_s, b_s_2)
 
     assert torch.allclose(std_y, y, atol=0.1, rtol=0.1)
 
@@ -166,9 +166,7 @@ def benchmark_fp4_raise_to_bf16_gemm(bs, dim, default_dtype, block_size, provide
             Packed4BitWeightAlongK((dim, dim), b), k_stride=64
         )
         ms = triton.testing.do_bench(
-            lambda: soft_fp4_raise_to_bf16_gemm_deepseek_v3(
-                a, preprocessed_b, b_s, b_s_2
-            )
+            lambda: soft_fp4_raise_to_bf16_blockfp4_gemm(a, preprocessed_b, b_s, b_s_2)
         )
     else:
         assert False, f"Unknown provider: {provider}"
@@ -196,7 +194,7 @@ def test_fp4_raise_to_fp8_gemm_is_close_to_dequanted_gemm():
     a = torch.randn(dim, dim, dtype=default_dtype, device="cuda")
     b, b_s, b_s_2 = init_weight_and_scales(dim, block_size)
 
-    a_fp8, a_s = act_quant_deepseek_v3(a, act_block_size)
+    a_fp8, a_s = blockfp8_act_quant(a, act_block_size)
 
     # Dequant from `a_fp8` and `a_s` instead of directly using `a` in dequanted implementation,
     # so the numerical difference is controlled inside the kernels
@@ -210,7 +208,7 @@ def test_fp4_raise_to_fp8_gemm_is_close_to_dequanted_gemm():
     preprocessed_b = Packed4BitWeightAlongK.convert_from(
         Packed4BitWeightAlongK((dim, dim), b), k_stride=64
     )
-    y = soft_fp4_raise_to_fp8_gemm_deepseek_v3(
+    y = soft_fp4_raise_to_fp8_blockfp4_gemm(
         a_fp8, a_s, preprocessed_b, b_s, b_s_2, act_block_size=act_block_size
     )
 
@@ -258,12 +256,12 @@ def benchmark_fp4_raise_to_fp8_gemm(
         dequant_b = do_dequant_b(b, b_s, b_s_2, dim, block_size).to(default_dtype)
         ms = triton.testing.do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
     elif provider == "triton_fp4_raise_to_fp8":
-        a_fp8, a_s = act_quant_deepseek_v3(a, act_block_size)
+        a_fp8, a_s = blockfp8_act_quant(a, act_block_size)
         preprocessed_b = Packed4BitWeightAlongK.convert_from(
             Packed4BitWeightAlongK((dim, dim), b), k_stride=64
         )
         ms = triton.testing.do_bench(
-            lambda: soft_fp4_raise_to_fp8_gemm_deepseek_v3(
+            lambda: soft_fp4_raise_to_fp8_blockfp4_gemm(
                 a_fp8, a_s, preprocessed_b, b_s, b_s_2, act_block_size=act_block_size
             )
         )

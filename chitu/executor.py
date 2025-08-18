@@ -550,13 +550,13 @@ class Executor:
                 device=self.local_rank,
             )
 
-        # 3) broadcast payload to all TP ranks and adapt shape to [B, 1]
+        # 3) broadcast payload to all TP ranks
         tensor_dispatcher = TensorDispatcher()
-        payload = tensor_dispatcher.recv_payload(payload).unsqueeze(1)
+        payload = tensor_dispatcher.recv_payload(payload)
 
         # 4) run decode and ensure shape [B, vocab]
         self.timers("decode").start()
-        out = Backend.model.decode(payload, len(req_ids)).squeeze(1)
+        out = Backend.model.decode(payload, len(req_ids))
         self.timers("decode").stop()
 
         # 5) finalize cache for this step
@@ -583,12 +583,8 @@ class Executor:
         for dispatcher in self.task_dispatchers:
             payload = dispatcher.recv_payload(payload)
 
-        payload = payload.unsqueeze(1)  # convert [B, :] to [B, 1, :]
-
         self.timers("decode").start()
-        out = Backend.model.decode(payload, len(tasks.req_ids)).squeeze(
-            1
-        )  # adapt dispatch payload shape
+        out = Backend.model.decode(payload, len(tasks.req_ids))
         self.timers("decode").stop()
         # check output shape
 

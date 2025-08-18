@@ -194,12 +194,11 @@ class AttentionHFLlama(Attention):
     def _run_output_linear(self, x):
         return self.o_proj(x)
 
-    def prefill_forward(
+    def forward(
         self,
         x: torch.Tensor,
         freqs_cis_cos: torch.Tensor,
         freqs_cis_sin: torch.Tensor,
-        seq_len,
     ):
         # 因为量化后x是个tuple，所以取shape的时候放linear后面
         xq, xk, xv = self._run_linear(x)
@@ -222,51 +221,14 @@ class AttentionHFLlama(Attention):
             rotary_type=self.rotary_type,
         )
 
-        self.cache.finalize_cache_bylayer_prefill(
-            xk, xv, self.cache.curr_req_ids, self.cache.seq_len_delta.new, self.layer_id
-        )
-        output = self.attn_backend.prefill_ragged_qkvo(
-            xq, xk, xv, seq_len, causal=True
-        ).view(bs_seq, -1)
-        return self._run_output_linear(output)
-
-    def decode_forward(
-        self, x: torch.Tensor, freqs_cis_cos: torch.Tensor, freqs_cis_sin: torch.Tensor
-    ):
-        bsz, seqlen, _ = x.shape
-        assert seqlen == 1, "decode_forward only supports single token decoding"
-        xq, xk, xv = self._run_linear(x)
-
-        xq = xq.view(-1, self.n_local_heads, self.head_dim).contiguous()
-        xk = xk.view(-1, self.n_local_kv_heads, self.head_dim).contiguous()
-        xv = xv.view(-1, self.n_local_kv_heads, self.head_dim).contiguous()
-
-        if hasattr(self, "q_norm"):
-            xq = self.q_norm(xq)
-        if hasattr(self, "k_norm"):
-            xk = self.k_norm(xk)
-
-        xq, xk = apply_rotary_pos_emb(
-            xq,
-            xk,
-            freqs_cis_cos,
-            freqs_cis_sin,
-            rotary_type=self.rotary_type,
-        )
-
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-
-        output = self.attn_backend.decode(
+        output = self.attn_backend(
             xq,
             self.cache.get_accessor(self.layer_id),
             xk,
             xv,
-            prev_seq_len=self.cache.seq_len_delta.old,
-            next_seq_len=self.cache.seq_len_delta.new,
-        ).view(bsz, seqlen, -1)
-
+            seq_len_delta=self.cache.seq_len_delta,
+            causal=True,
+        ).view(bs_seq, -1)
         return self._run_output_linear(output)
 
 
@@ -398,13 +360,11 @@ class TransformerBlockHFLlama(TransformerBlock):
         x: torch.Tensor,
         freqs_cis_cos: torch.Tensor,
         freqs_cis_sin: torch.Tensor,
-        seq_len=None,
     ):
         h = self.self_attn(
             self.input_layernorm(x, impl=get_rms_norm_impl()),
             freqs_cis_cos,
             freqs_cis_sin,
-            seq_len,
         )
         h += x
         out = h + self.mlp(self.post_attention_layernorm(h, impl=get_rms_norm_impl()))

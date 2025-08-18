@@ -6,7 +6,7 @@ import torch
 
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase
-from chitu.ops import w4a8_gemm_per_token_per_channel_asymm
+from chitu.ops import w4a8_gemm_per_token_per_channel_asymm, a8_per_token_act_quant
 from chitu.native_layout import (
     enable_native_layout_weight,
     Packed4BitWeightAlongK,
@@ -19,17 +19,6 @@ class W4A8PerTokenPerChannelAsymmLinear(
     enable_native_layout_weight("qweight", Packed4BitWeightAlongK, k_stride=64),
     QuantizedLinearBase,
 ):
-    @staticmethod
-    @torch.no_grad()
-    def quant_act(act):
-        act_shape = act.shape
-        act.view(-1, act_shape[-1])
-        scales = act.abs().max(dim=-1, keepdim=True)[0]
-        scales = scales.to(torch.float)
-        scales.clamp_(min=1e-5).div_(127.0)
-        aa = act.div(scales).round_()
-        return aa.to(torch.int8).view(-1, act_shape[-1]), scales.view(-1)
-
     def __init__(
         self,
         ############################################
@@ -89,7 +78,7 @@ class W4A8PerTokenPerChannelAsymmLinear(
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        q_x, act_scale = W4A8PerTokenPerChannelAsymmLinear.quant_act(x)
+        q_x, act_scale = a8_per_token_act_quant(x)
         out = w4a8_gemm_per_token_per_channel_asymm(
             q_x,
             act_scale,

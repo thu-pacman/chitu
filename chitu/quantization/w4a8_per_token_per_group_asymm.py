@@ -6,7 +6,7 @@ import torch
 
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase
-from chitu.ops import w4a8_gemm_per_token_per_group_asymm
+from chitu.ops import w4a8_gemm_per_token_per_group_asymm, a8_per_token_act_quant
 from chitu.native_layout import (
     enable_native_layout_weight,
     Packed4BitWeightAlongK,
@@ -18,17 +18,6 @@ from chitu.native_layout import (
 class W4A8PerTokenPerGroupAsymmLinear(
     QuantizedLinearBase,
 ):
-    @staticmethod
-    @torch.no_grad()
-    def quant_act(act):
-        act_shape = act.shape
-        act.view(-1, act_shape[-1])
-        scales = act.abs().max(dim=-1, keepdim=True)[0]
-        scales = scales.to(torch.float16)
-        scales.clamp_(min=1e-5).div_(127.0)
-        aa = act.div(scales).round_()
-        return aa.to(torch.int8).view(-1, act_shape[-1]), scales.view(-1)
-
     def __init__(
         self,
         ############################################
@@ -104,7 +93,7 @@ class W4A8PerTokenPerGroupAsymmLinear(
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        q_x, act_scale = W4A8PerTokenPerGroupAsymmLinear.quant_act(x)
+        q_x, act_scale = a8_per_token_act_quant(x, scale_dtype=torch.float16)
 
         out_feats = torch.empty(
             (*q_x.shape[:-1], self.out_features), dtype=torch.half, device=x.device

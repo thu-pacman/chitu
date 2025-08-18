@@ -14,10 +14,12 @@ from chitu.quantization.base import (
 )
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.ops import (
-    soft_fp4_raise_to_fp8_gemm_deepseek_v3,
-    soft_fp4_raise_to_bf16_gemm_deepseek_v3,
-    act_quant_deepseek_v3,
-    hard_fp4_scaled_mm,
+    soft_fp4_raise_to_fp8_blockfp4_gemm,
+    soft_fp4_raise_to_bf16_blockfp4_gemm,
+    soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm,
+    blockfp8_act_quant,
+    blockfp4_gemm,
+    convert_linear_to_swizzled,
 )
 from chitu.device_type import get_device_name, is_muxi, is_nvidia, is_blackwell
 from chitu.utils import (
@@ -40,97 +42,9 @@ if has_triton:
 torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 if has_torch_npu:
     from chitu.npu_utils import fused_experts_npu
-cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 
 logger = getLogger(__name__)
-
-
-def linear_block_fp4_npu(
-    x: torch.Tensor,
-    weight: Packed4BitWeightNPUNative,
-    weight_scale: torch.Tensor,
-    weight_scale_2: torch.Tensor,
-    act_block_size: int,
-    bias: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    assert isinstance(weight, Packed4BitWeightNPUNative)
-    weight = weight.layout_tensor
-
-    if get_global_args().infer.raise_lower_bit_float_to != "bfloat16":
-        raise NotImplementedError(
-            "infer.raise_lower_bit_float_to must be 'bfloat16' for NPU linear_block_fp4_npu"
-        )
-
-    assert act_block_size == 128
-
-    assert (
-        weight.shape[-2] % 2 == 0
-    ), f"Weight shape[-2] must be even, but got {weight.shape[-2]}"
-    assert (
-        weight.shape[-1] % 2 == 0
-    ), f"Weight shape[-1] must be even, but got {weight.shape[-1]}"
-    # Shape adaptation for dequantization matmul operator
-    weight = weight.reshape(weight.shape[-1] * 2, weight.shape[-2] // 2)
-    weight = weight.unsqueeze(0)
-    weight_scale = weight_scale.unsqueeze(0)
-    scale = weight_scale.transpose(-2, -1)
-    if not scale.is_contiguous():
-        scale = scale.contiguous()
-    scale_off = torch.empty_like(scale)
-    output = torch.empty(
-        [x.shape[0], weight.shape[-1] * 2], dtype=x.dtype, device=x.device
-    )
-    # NOTE: Generate a tensor with a single element (value N) and ensure export tokens is 1-D tensor
-    expert_tokens = torch.full([1], x.shape[0], device=x.device, dtype=torch.int64)
-
-    if x.dim() == 3:
-        # 3D x needs to be squeezed to 2D; in NpuAttnBackend mla_decode_paged_kv, x will be unsqueezed to 3D
-        x = x.squeeze(1)
-        if x.shape[0] <= 2:
-            cinfer_ascendc.grouped_soft_gemv(
-                x,
-                weight,
-                scale=scale,
-                groupList=expert_tokens,
-                output=output,
-                computeType="fp4",
-            )
-        else:
-            cinfer_ascendc.grouped_gemm(
-                x,
-                weight,
-                antiquantOffsetOptional=scale_off,
-                antiquantScaleOptional=scale,
-                groupListOptional=expert_tokens,
-                output=output,
-                computeType="fp4",
-            )
-        output = output.unsqueeze(1)
-    else:
-        if x.shape[0] <= 2:
-            cinfer_ascendc.grouped_soft_gemv(
-                x,
-                weight,
-                scale=scale,
-                groupList=expert_tokens,
-                output=output,
-                computeType="fp4",
-            )
-        else:
-            cinfer_ascendc.grouped_gemm(
-                x,
-                weight,
-                antiquantOffsetOptional=scale_off,
-                antiquantScaleOptional=scale,
-                groupListOptional=expert_tokens,
-                output=output,
-                computeType="fp4",
-            )
-
-    if bias is not None:
-        output += bias
-    return output
 
 
 def linear_block_fp4(
@@ -162,7 +76,7 @@ def linear_block_fp4(
     if is_blackwell():
         assert weight.k_stride == 1
         assert x.shape[-1] == weight.layout_tensor.shape[-1] * 2
-        y = hard_fp4_scaled_mm(
+        y = blockfp4_gemm(
             x,
             weight.layout_tensor,
             weight_scale,
@@ -175,7 +89,7 @@ def linear_block_fp4(
         return y
     elif get_global_args().infer.raise_lower_bit_float_to == "bfloat16":
         if is_nvidia() or is_muxi():
-            y = soft_fp4_raise_to_bf16_gemm_deepseek_v3(
+            y = soft_fp4_raise_to_bf16_blockfp4_gemm(
                 x, weight, weight_scale, weight_scale_2
             )
             if bias is not None:
@@ -190,9 +104,9 @@ def linear_block_fp4(
         x_dtype = x.dtype
         x_shape = x.shape
         x = x.view(-1, x_shape[-1])
-        x, act_scale = act_quant_deepseek_v3(x, act_block_size)
+        x, act_scale = blockfp8_act_quant(x, act_block_size)
         assert weight_scale is not None
-        y = soft_fp4_raise_to_fp8_gemm_deepseek_v3(
+        y = soft_fp4_raise_to_fp8_blockfp4_gemm(
             x,
             act_scale,
             weight,
@@ -357,8 +271,6 @@ class Blockfp4LinearPackKStride1(
     is_swizzled = False
 
     def convert_scale_to_swizzled(self):
-        from chitu.ops.quant import convert_linear_to_swizzled
-
         weight = self.get_native_layout_weight()
         weight_scale = self.weight_scale
 
@@ -395,14 +307,12 @@ class Blockfp4LinearPackNPUNative(
 
     @torch.no_grad()
     def forward(self, x) -> torch.Tensor:
-        return linear_block_fp4_npu(
-            x,
-            self.get_native_layout_weight(),
-            self.weight_scale,
-            self.weight_scale_2,
-            act_block_size=self.act_block_size,
-            bias=self.bias,
+        y = soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
+            x, self.get_native_layout_weight(), self.weight_scale
         )
+        if self.bias is not None:
+            y += self.bias
+        return y
 
 
 class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
@@ -818,46 +728,34 @@ class Blockfp4MoeExpertsPackNPUNative(
 
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_block_fp4_npu(
+        return soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
             x,
             self.get_native_layout_gate_up_proj_weight()[i],
             self.gate_up_proj_weight_scale[i],
-            self.gate_up_proj_weight_scale_2[i],
-            128,
-            None,
         )
 
     @override
     def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_block_fp4_npu(
+        return soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
             x,
             self.get_native_layout_gate_proj_weight()[i],
             self.gate_proj_weight_scale[i],
-            self.gate_proj_weight_scale_2[i],
-            128,
-            None,
         )
 
     @override
     def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_block_fp4_npu(
+        return soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
             x,
             self.get_native_layout_up_proj_weight()[i],
             self.up_proj_weight_scale[i],
-            self.up_proj_weight_scale_2[i],
-            128,
-            None,
         )
 
     @override
     def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_block_fp4_npu(
+        return soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
             x,
             self.get_native_layout_down_proj_weight()[i],
             self.down_proj_weight_scale[i],
-            self.down_proj_weight_scale_2[i],
-            128,
-            None,
         )
 
 

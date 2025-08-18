@@ -5,7 +5,6 @@
 from typing import List, Optional, Union
 from typing_extensions import override
 from dataclasses import dataclass
-import functools
 import torch
 
 from chitu.utils import try_import_opt_dep
@@ -21,6 +20,7 @@ from chitu.native_layout import (
     Vector,
     BatchPaddedActivation,
 )
+from chitu.lazy import single_dispatch_lazy_tensor
 
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
@@ -95,7 +95,7 @@ class MuxiNativeLayoutGroupWeight(NativeLayoutTensor):
             )
 
 
-@functools.singledispatch
+@single_dispatch_lazy_tensor
 def linear_muxi_layout_native_y(
     x: Union[torch.Tensor, Vector, BatchPaddedActivation, MuxiNativeLayoutActivation],
     w: MuxiNativeLayoutWeight,
@@ -161,7 +161,7 @@ def _(
     return y
 
 
-@functools.singledispatch
+@single_dispatch_lazy_tensor
 def linear_muxi_layout_contig_y(
     x_transposed: Union[
         torch.Tensor, Vector, BatchPaddedActivation, MuxiNativeLayoutActivation
@@ -262,7 +262,7 @@ def _(
     return y
 
 
-@functools.singledispatch
+@single_dispatch_lazy_tensor
 def blockfp8_linear_muxi_layout_contig_y(
     x: Union[torch.Tensor, Vector, BatchPaddedActivation],
     w: MuxiNativeLayoutGroupWeight,
