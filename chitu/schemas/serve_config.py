@@ -244,6 +244,7 @@ class StaticConfig:
 class ServeConfig:
     serve: ServeAddrConfig = field(default_factory=ServeAddrConfig)
     models: Any = MISSING
+    benchmark: Any = MISSING
     infer: InferConfig = field(default_factory=InferConfig)
     request: RequestConfig = field(default_factory=RequestConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
