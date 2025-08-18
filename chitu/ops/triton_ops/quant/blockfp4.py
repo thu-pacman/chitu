@@ -18,6 +18,7 @@ from chitu.ops.triton_ops.utils import (
     SIGNED_INT16_0x81C0,
     SIGNED_INT16_0x87F0,
 )
+from chitu.lazy import single_dispatch_lazy_tensor
 
 
 @auto_retry_triton_compilation
@@ -91,6 +92,7 @@ def soft_fp4_raise_to_fp8_blockfp4_gemm_triton(
     return c
 
 
+@single_dispatch_lazy_tensor
 @auto_retry_triton_compilation
 def soft_fp4_raise_to_bf16_blockfp4_gemm_triton(
     a: torch.Tensor,

@@ -18,9 +18,12 @@ from chitu.ops.triton_ops.utils import (
     auto_tuning_logger,
     SIGNED_INT32_0x87F00000,
 )
+from chitu.ops.triton_ops.activation import silu_and_mul_triton
+from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.utils import try_import_opt_dep
 
 
+@single_dispatch_lazy_tensor
 @auto_retry_triton_compilation
 def blockfp8_act_quant_triton(
     x: torch.Tensor, block_size: int = 128
@@ -48,6 +51,13 @@ def blockfp8_act_quant_triton(
     return y, s
 
 
+@blockfp8_act_quant_triton.register
+def _(x: silu_and_mul_triton.lazy_tensor_type(), block_size: int = 128):
+    return silu_and_mul_and_blockfp8_act_quant_triton(
+        x.kwargs["x"], block_size=block_size
+    )
+
+
 @triton.jit
 def blockfp8_act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
     """
@@ -69,6 +79,64 @@ def blockfp8_act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
     y = x / s
     y = y.to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + offs, y)
+    tl.store(s_ptr + pid, s)
+
+
+@auto_retry_triton_compilation
+def silu_and_mul_and_blockfp8_act_quant_triton(
+    x: torch.Tensor, block_size: int = 128
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert (
+        x.size(-1) % (2 * block_size) == 0
+    ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
+    y = torch.empty(
+        *x.shape[:-1], x.shape[-1] // 2, dtype=torch.float8_e4m3fn, device=x.device
+    )
+    s = torch.empty(
+        *x.shape[:-1],
+        x.shape[-1] // (2 * block_size),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    grid = lambda meta: (triton.cdiv(y.numel(), meta["BLOCK_SIZE"]),)
+    silu_and_mul_and_blockfp8_act_quant_kernel[grid](
+        x, y, s, HIDDEN_DIM=y.size(-1), BLOCK_SIZE=block_size
+    )
+    return y, s
+
+
+@triton.jit
+def silu_and_mul_and_blockfp8_act_quant_kernel(
+    x_ptr, y_ptr, s_ptr, HIDDEN_DIM: tl.constexpr, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    dim_id = pid // (HIDDEN_DIM // BLOCK_SIZE)
+    blk_id_in_dim = pid % (HIDDEN_DIM // BLOCK_SIZE)
+    x1_offs = (
+        (dim_id * 2) * HIDDEN_DIM
+        + blk_id_in_dim * BLOCK_SIZE
+        + tl.arange(0, BLOCK_SIZE)
+    )
+    x2_offs = (
+        (dim_id * 2 + 1) * HIDDEN_DIM
+        + blk_id_in_dim * BLOCK_SIZE
+        + tl.arange(0, BLOCK_SIZE)
+    )
+    y_offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    x1 = tl.load(x_ptr + x1_offs).to(tl.float32)
+    x2 = tl.load(x_ptr + x2_offs).to(tl.float32)
+
+    x1_fp32 = x1.to(tl.float32)
+    silu_x1_fp32 = x1_fp32 / (1 + tl.exp(-1 * x1_fp32))
+    silu_x1 = silu_x1_fp32.to(x1.dtype)
+    x = silu_x1 * x2
+
+    s = tl.max(tl.abs(x)) / 448.0
+    y = x / s
+    y = y.to(y_ptr.dtype.element_ty)
+
+    tl.store(y_ptr + y_offs, y)
     tl.store(s_ptr + pid, s)
 
 
@@ -388,6 +456,7 @@ def blockfp8_gemm_triton_default(
     return c
 
 
+@single_dispatch_lazy_tensor
 @auto_retry_triton_compilation
 def soft_fp8_blockfp8_gemm_triton(
     a: torch.Tensor,

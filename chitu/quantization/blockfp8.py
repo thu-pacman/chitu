@@ -15,13 +15,14 @@ from chitu.quantization.base import (
 )
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.ops import (
+    linear,
     blockfp8_gemm,
     soft_fp8_blockfp8_gemm,
     soft_fp8_blockfp8_weight_dequant,
     blockfp8_act_quant,
     blockfp8_einsum_shc_hdc_shd,
 )
-from chitu.device_type import get_device_name, is_muxi, is_nvidia, is_ascend
+from chitu.device_type import get_device_name, is_muxi, is_nvidia
 from chitu.utils import try_import_opt_dep, try_import_platform_dep, parse_dtype
 from chitu.global_vars import get_global_args
 from chitu.ops import soft_fp8_blockfp8_weight_dequant
@@ -30,61 +31,8 @@ chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
 if has_triton:
     from chitu.moe.experts import fused_experts
-cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 logger = getLogger(__name__)
-
-
-def linear_block_fp8_npu(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    expert_tokens = None
-    if get_global_args().models.name in ["Qwen3-32B-FP8"]:
-        # To adapt the operator, treat the dense model as a 1 expert.
-        # scale need torch.float32
-        scale = (
-            scale.unsqueeze(0).to(dtype=torch.float32).transpose_(-1, -2).contiguous()
-        )
-        weight = weight.unsqueeze(0).transpose_(-1, -2).contiguous()
-        # Due to 1 expert, the list of expert_tokens here should be all the lines of the input x.
-        expert_tokens = torch.ones([1], device=x.device, dtype=torch.int64)
-        expert_tokens.fill_(x.shape[0])
-    scale_off = torch.zeros_like(scale, dtype=torch.float32, device=x.device)
-    output = torch.empty(
-        [x.shape[0], weight.shape[-1]], dtype=torch.bfloat16, device=x.device
-    )
-    flag = False
-    if x.dim() == 3:
-        # Squeeze dimension 1, not 0, otherwise it will affect cases where batch size is 1
-        x = x.squeeze(1)
-        flag = True
-    if x.shape[0] <= 2:
-        cinfer_ascendc.grouped_soft_gemv(
-            x,
-            weight,
-            scale=scale,
-            groupList=expert_tokens,
-            output=output,
-            computeType="fp8",
-        )
-    else:
-        cinfer_ascendc.grouped_gemm(
-            x,
-            weight,
-            antiquantOffsetOptional=scale_off,
-            antiquantScaleOptional=scale,
-            groupListOptional=expert_tokens,
-            output=output,
-            computeType="fp8",
-        )
-    if flag:
-        output = output.unsqueeze(1)
-    if bias is not None:
-        output += bias
-    return output
 
 
 def linear_block_fp8(
@@ -113,23 +61,19 @@ def linear_block_fp8(
     assert weight.element_size() == 1
 
     if get_global_args().infer.raise_lower_bit_float_to == "bfloat16":
-        if is_nvidia() or is_muxi():
+        try:
             y = soft_fp8_blockfp8_gemm(x, weight, weight_scale)
             if bias is not None:
                 y += bias
             return y
-        elif is_ascend():
-            import torch_npu
-
-            return linear_block_fp8_npu(x, weight, weight_scale, bias)
-        else:
+        except NotImplementedError:
             logger.warning(
                 f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
             )
             weight_dequanted = soft_fp8_blockfp8_weight_dequant(
                 weight, weight_scale, block_size
             )
-            return torch.nn.functional.linear(x, weight_dequanted, bias)
+            return linear(x, weight_dequanted, bias)
     else:
         x_dtype = x.dtype
         x_shape = x.shape

@@ -5,11 +5,15 @@
 import torch
 
 from chitu.device_type import is_blackwell
-from chitu.utils import try_import_platform_dep
-from chitu.native_layout import Packed4BitWeightAlongK
+from chitu.utils import try_import_platform_dep, try_import_opt_dep
+from chitu.native_layout import Packed4BitWeightAlongK, Packed4BitWeightNPUNative
+from chitu.lazy import single_dispatch_lazy_tensor
+from chitu.global_vars import get_global_args
 
 triton, has_triton = try_import_platform_dep("triton")
+torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 if has_triton:
     from chitu.ops.triton_ops import (
@@ -61,7 +65,7 @@ def soft_fp4_raise_to_bf16_blockfp4_gemm(
     impl: str = "auto",
 ):
     """
-    Perform a matrix multiplication with FP8 dynamically casted to BF16.
+    Perform a matrix multiplication with FP4 in blockfp4 dynamically casted to BF16.
 
     Args:
         a (torch.Tensor): The first input matrix, must be contiguous.
@@ -80,6 +84,114 @@ def soft_fp4_raise_to_bf16_blockfp4_gemm(
         return soft_fp4_raise_to_bf16_blockfp4_gemm_triton(a, b, b_s, b_s_2)
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
+def soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
+    a: torch.Tensor,
+    b: Packed4BitWeightNPUNative,
+    b_s: torch.Tensor,
+    impl: str = "auto",
+):
+    """
+    Perform a matrix multiplication with FP4 in blockfp4 (single scale variant) dynamically
+    casted to BF16.
+
+    Args:
+        a (torch.Tensor): The first input matrix, must be contiguous.
+        b (Packed4BitWeightAlongK): The second input matrix, must be in Packed4BitWeightAlongK layout.
+        b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
+
+    Returns:
+        torch.Tensor: The result of the matrix multiplication.
+    """
+
+    if impl == "auto":
+        impl = "npu"
+
+    if impl == "npu":
+        return soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm_npu(a, b, b_s)
+    else:
+        raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
+def soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm_npu(
+    x: torch.Tensor,
+    weight: Packed4BitWeightNPUNative,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    assert isinstance(weight, Packed4BitWeightNPUNative)
+    weight = weight.layout_tensor
+
+    if get_global_args().infer.raise_lower_bit_float_to != "bfloat16":
+        raise NotImplementedError(
+            "infer.raise_lower_bit_float_to must be 'bfloat16' for NPU linear_block_fp4_npu"
+        )
+
+    assert (
+        weight.shape[-2] % 2 == 0
+    ), f"Weight shape[-2] must be even, but got {weight.shape[-2]}"
+    assert (
+        weight.shape[-1] % 2 == 0
+    ), f"Weight shape[-1] must be even, but got {weight.shape[-1]}"
+    # Shape adaptation for dequantization matmul operator
+    weight = weight.reshape(weight.shape[-1] * 2, weight.shape[-2] // 2)
+    weight = weight.unsqueeze(0)
+    weight_scale = weight_scale.unsqueeze(0)
+    scale = weight_scale.transpose(-2, -1)
+    if not scale.is_contiguous():
+        scale = scale.contiguous()
+    scale_off = torch.empty_like(scale)
+    output = torch.empty(
+        [x.shape[0], weight.shape[-1] * 2], dtype=x.dtype, device=x.device
+    )
+    # NOTE: Generate a tensor with a single element (value N) and ensure export tokens is 1-D tensor
+    expert_tokens = torch.full([1], x.shape[0], device=x.device, dtype=torch.int64)
+
+    if x.dim() == 3:
+        # 3D x needs to be squeezed to 2D; in NpuAttnBackend mla_decode_paged_kv, x will be unsqueezed to 3D
+        x = x.squeeze(1)
+        if x.shape[0] <= 2:
+            cinfer_ascendc.grouped_soft_gemv(
+                x,
+                weight,
+                scale=scale,
+                groupList=expert_tokens,
+                output=output,
+                computeType="fp4",
+            )
+        else:
+            cinfer_ascendc.grouped_gemm(
+                x,
+                weight,
+                antiquantOffsetOptional=scale_off,
+                antiquantScaleOptional=scale,
+                groupListOptional=expert_tokens,
+                output=output,
+                computeType="fp4",
+            )
+        output = output.unsqueeze(1)
+    else:
+        if x.shape[0] <= 2:
+            cinfer_ascendc.grouped_soft_gemv(
+                x,
+                weight,
+                scale=scale,
+                groupList=expert_tokens,
+                output=output,
+                computeType="fp4",
+            )
+        else:
+            cinfer_ascendc.grouped_gemm(
+                x,
+                weight,
+                antiquantOffsetOptional=scale_off,
+                antiquantScaleOptional=scale,
+                groupListOptional=expert_tokens,
+                output=output,
+                computeType="fp4",
+            )
+
+    return output
 
 
 def pad_tensor_to_size(tensor, target_size):
@@ -129,6 +241,7 @@ def cutlass_scaled_fp4_mm(
 # SPDX-SnippetCopyrightText: 2025 vllm Team
 # SPDX-SnippetCopyrightText: 2025 Qingcheng.AI
 # SDPX—SnippetName: scaled_fp4_quant from vllm
+@single_dispatch_lazy_tensor
 def blockfp4_act_quant(
     input: torch.Tensor, input_global_scale: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -189,6 +302,7 @@ def blockfp4_act_quant(
 # SPDX-SnippetEnd
 
 
+@single_dispatch_lazy_tensor
 def blockfp4_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,

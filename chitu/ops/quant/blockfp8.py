@@ -6,9 +6,13 @@ from typing import Tuple
 
 import torch
 
-from chitu.utils import try_import_platform_dep
+from chitu.utils import try_import_platform_dep, try_import_opt_dep
+from chitu.lazy import single_dispatch_lazy_tensor
+from chitu.global_vars import get_global_args
 
 triton, has_triton = try_import_platform_dep("triton")
+torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
+cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 if has_triton:
     from chitu.ops.triton_ops import (
@@ -18,6 +22,7 @@ if has_triton:
         blockfp8_weight_dequant_triton,
         soft_fp8_blockfp8_weight_dequant_triton,
         blockfp8_act_quant_triton,
+        silu_and_mul_and_blockfp8_act_quant_triton,
     )
 
 
@@ -125,12 +130,69 @@ def soft_fp8_blockfp8_gemm(
     """
 
     if impl == "auto":
-        impl = "triton"
+        if has_triton:
+            impl = "triton"
+        elif has_torch_npu:
+            impl = "npu"
+        else:
+            raise NotImplementedError("No supported implementation found")
 
-    if impl == "triton" and has_triton:
+    if impl == "triton":
         return soft_fp8_blockfp8_gemm_triton(a, b, b_s)
+    elif impl == "npu":
+        return soft_fp8_blockfp8_gemm_npu(a, b, b_s)
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
+@single_dispatch_lazy_tensor
+def soft_fp8_blockfp8_gemm_npu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    expert_tokens = None
+    if get_global_args().models.name in ["Qwen3-32B-FP8"]:
+        # To adapt the operator, treat the dense model as a 1 expert.
+        # scale need torch.float32
+        scale = (
+            scale.unsqueeze(0).to(dtype=torch.float32).transpose_(-1, -2).contiguous()
+        )
+        weight = weight.unsqueeze(0).transpose_(-1, -2).contiguous()
+        # Due to 1 expert, the list of expert_tokens here should be all the lines of the input x.
+        expert_tokens = torch.ones([1], device=x.device, dtype=torch.int64)
+        expert_tokens.fill_(x.shape[0])
+    scale_off = torch.zeros_like(scale, dtype=torch.float32, device=x.device)
+    output = torch.empty(
+        [x.shape[0], weight.shape[-1]], dtype=torch.bfloat16, device=x.device
+    )
+    flag = False
+    if x.dim() == 3:
+        # Squeeze dimension 1, not 0, otherwise it will affect cases where batch size is 1
+        x = x.squeeze(1)
+        flag = True
+    if x.shape[0] <= 2:
+        cinfer_ascendc.grouped_soft_gemv(
+            x,
+            weight,
+            scale=scale,
+            groupList=expert_tokens,
+            output=output,
+            computeType="fp8",
+        )
+    else:
+        cinfer_ascendc.grouped_gemm(
+            x,
+            weight,
+            antiquantOffsetOptional=scale_off,
+            antiquantScaleOptional=scale,
+            groupListOptional=expert_tokens,
+            output=output,
+            computeType="fp8",
+        )
+    if flag:
+        output = output.unsqueeze(1)
+    return output
 
 
 def soft_fp8_blockfp8_weight_dequant(
@@ -181,6 +243,18 @@ def blockfp8_act_quant(
 
     if impl == "triton" and has_triton:
         return blockfp8_act_quant_triton(x, block_size)
+    else:
+        raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
+def silu_and_mul_and_blockfp8_act_quant(
+    x: torch.Tensor, block_size: int = 128, impl: str = "auto"
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if impl == "auto":
+        impl = "triton"
+
+    if impl == "triton" and has_triton:
+        return silu_and_mul_and_blockfp8_act_quant_triton(x, block_size)
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
 

@@ -20,6 +20,7 @@ from chitu.models.model_hf_llama import (
 )
 from chitu.models.model_hf_qwen_3_moe import Qwen3MoeExperts
 from chitu.models.registry import ModelType, register_model
+from chitu.ops import linear
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.quantization import get_quant_from_checkpoint_prefix
 from chitu.quantization.normal import NormalMoeExperts
@@ -116,7 +117,7 @@ class GptOssMoeGate(nn.Module):
                 dtype=self.weight.dtype,
                 device=self.weight.device,
             ), torch.empty((0, self.topk), dtype=torch.int32, device=self.weight.device)
-        scores = torch.nn.functional.linear(x, self.weight, self.bias)
+        scores = linear(x, self.weight, self.bias)
         indices, weights = self.moe_gate(
             scores,
             self.topk,

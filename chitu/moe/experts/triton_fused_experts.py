@@ -21,6 +21,7 @@ from chitu.ops.triton_ops.utils import (
     SIGNED_INT8_0x9C,
 )
 from chitu.ops.triton_ops.utils import to_triton_dtype
+from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.utils import ceil_div, try_import_platform_dep
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
@@ -801,6 +802,7 @@ def moe_align_block_size_native(
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 
+@single_dispatch_lazy_tensor
 def invoke_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -831,13 +833,10 @@ def invoke_fused_moe_kernel(
 
     if use_fp8_w8a8:
         assert B_scale is not None
-        if block_shape is None:
-            # A, A_scale = ops.scaled_fp8_quant(A, A_scale)
-            assert False
-        elif not soft_fp8:
-            assert len(block_shape) == 2
-            block_n, block_k = block_shape[0], block_shape[1]
-            A, A_scale = blockfp8_act_quant(A, block_k)
+        assert block_shape is not None
+        if not soft_fp8:
+            block_n, block_k = block_shape
+            assert A_scale is not None
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
@@ -853,8 +852,8 @@ def invoke_fused_moe_kernel(
         assert B_scale2 is not None
         assert len(block_shape) == 2
         if not soft_fp8:
-            block_n, block_k = block_shape[0], block_shape[1]
-            A, A_scale = blockfp8_act_quant(A, block_k)
+            block_n, block_k = block_shape
+            assert A_scale is not None
         else:
             A_scale = None
     else:
@@ -1307,6 +1306,11 @@ def fused_experts_impl(
             curr_topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
         )
 
+        if (use_fp8_w8a8 or use_fp4_w4a8) and not soft_fp8:
+            block_n, block_k = block_shape
+            curr_hidden_states, a1_scale = blockfp8_act_quant(
+                curr_hidden_states, block_k
+            )
         invoke_fused_moe_kernel(
             curr_hidden_states,
             w1,
@@ -1338,6 +1342,11 @@ def fused_experts_impl(
         else:
             raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
+        if (use_fp8_w8a8 or use_fp4_w4a8) and not soft_fp8:
+            block_n, block_k = block_shape
+            intermediate_cache2, a2_scale = blockfp8_act_quant(
+                intermediate_cache2, block_k
+            )
         invoke_fused_moe_kernel(
             intermediate_cache2,
             w2,

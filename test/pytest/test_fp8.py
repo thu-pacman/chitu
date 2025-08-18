@@ -3,13 +3,16 @@ import pytest
 import triton
 
 from chitu.ops import (
+    silu_and_mul,
     blockfp8_act_quant,
+    silu_and_mul_and_blockfp8_act_quant,
     blockfp8_gemm,
     blockfp8_weight_dequant,
     soft_fp8_blockfp8_weight_dequant,
     soft_fp8_blockfp8_gemm,
 )
 from chitu.device_type import has_native_fp8
+from chitu.lazy import eval_lazy
 
 
 def init_b_and_b_s(dim, block_size):
@@ -27,6 +30,25 @@ def init_b_and_b_s(dim, block_size):
     return b.view(dim, dim).to(torch.float8_e4m3fn), b_s.view(
         dim // block_size, dim // block_size
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(
+    not has_native_fp8(),
+    reason="This test requires the GPU to have native FP8 support",
+)
+def test_silu_and_mul_and_blockfp8_act_quant(dtype: torch.dtype):
+    torch.set_default_dtype(dtype)
+    dim = 256
+    block_size = 128
+    assert dim % block_size == 0, "dim must be divisible by block_size"
+    a = torch.randn(dim, dim * 2, dtype=dtype, device="cuda")
+
+    a_fp8, a_s = silu_and_mul_and_blockfp8_act_quant(a, block_size)
+    a_fp8_ref, a_s_ref = blockfp8_act_quant(eval_lazy(silu_and_mul(a)), block_size)
+
+    assert torch.allclose(a_fp8.float(), a_fp8_ref.float(), atol=0.15, rtol=0.15)
+    assert torch.allclose(a_s.float(), a_s_ref.float(), atol=0.15, rtol=0.15)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

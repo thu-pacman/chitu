@@ -4,6 +4,7 @@
 
 import random
 import time
+import functools
 from logging import getLogger
 
 import torch
@@ -50,6 +51,7 @@ def auto_retry_triton_compilation(fn):
     # from `~/.triton/cache` to a local directory, or we can make use of `torch.distributed`
     # to synchronize the compilation.
 
+    @functools.wraps(fn)
     def wrapped(*args, **kwargs):
         i = 0
         while True:

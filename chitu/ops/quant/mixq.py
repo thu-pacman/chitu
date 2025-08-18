@@ -5,6 +5,7 @@
 import torch
 
 from chitu.utils import try_import_platform_dep
+from chitu.lazy import single_dispatch_lazy_tensor
 
 triton, has_triton = try_import_platform_dep("triton")
 hygon_mixq_kernels, has_hygon = try_import_platform_dep("sugon_mixQ4_kernels")
@@ -16,6 +17,7 @@ if has_triton:
     )
 
 
+@single_dispatch_lazy_tensor
 def mixq_gemm(
     a: torch.Tensor,
     b: torch.Tensor,

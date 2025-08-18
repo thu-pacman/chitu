@@ -8,9 +8,11 @@ import triton.language as tl
 
 from chitu.native_layout import Vector
 from chitu.ops.triton_ops.utils import auto_retry_triton_compilation
+from chitu.lazy import make_lazy_op
 from chitu.device_type import is_muxi
 
 
+@make_lazy_op
 @auto_retry_triton_compilation
 def silu_and_mul_triton(x):
     if isinstance(x, Vector):
@@ -27,6 +29,9 @@ def silu_and_mul_triton(x):
 
     output_shape = x.shape[:-1] + (n_cols // 2,)
     output = torch.empty(output_shape, device=x.device, dtype=x.dtype)
+
+    if output.device == torch.device("meta"):
+        return output
 
     assert x.is_contiguous()
     assert output.is_contiguous()
