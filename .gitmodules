@@ -24,4 +24,4 @@
     url = https://github.com/QingCheng-AI/ascend-kernel.git
 [submodule "third_party/DeepEP"]
     path = third_party/DeepEP
-    url = https://git.qcjzai.cn/github-mirror/DeepEP.git
+    url = https://github.com/deepseek-ai/DeepEP.git
