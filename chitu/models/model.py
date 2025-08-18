@@ -775,7 +775,7 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def decode(self, tokens, batch_size):
         if isinstance(self.cache, DenseKVCacheManager):
-            key = (batch_size, self.cache.get_start_idx())
+            key = (batch_size, self.cache.get_start_and_end_idx()[0])
         else:
             key = (batch_size,)
 

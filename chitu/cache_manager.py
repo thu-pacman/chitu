@@ -507,43 +507,53 @@ class DenseKVCacheManager(KVCacheManagerBase):
 
         self.slot_handle = get_slot_handle()
 
-    def get_start_idx(self):
+    def get_start_and_end_idx(self):
         if self.slot_handle:
-            start_idx, _ = self.slot_handle.get_current_slot_start_end_idx()
+            start_idx, end_idx = self.slot_handle.get_current_slot_start_end_idx()
         else:
-            start_idx = 0
-        return start_idx
+            start_idx, end_idx = 0, self.num_hot_req
+        return start_idx, end_idx
 
     @override
     def prepare_cache_prefill(self, req_ids: List[str], next_seq_len: BatchedSeqLen):
         super().prepare_cache_prefill(req_ids, next_seq_len)
 
-        start_idx = self.get_start_idx()
+        # get start_idx and end_idx of current slot_group
+        start_idx, end_idx = self.get_start_and_end_idx()
+
+        # Only allocate slots in current slot_group
+        slot_id = start_idx
         for it, req_id in enumerate(req_ids):
             self.req_id_to_seq_len[req_id] = next_seq_len.lens_list[it]
-            for i in range(start_idx, self.num_hot_req):
-                if self.slot_availability[i]:
-                    self.req2slot[req_id] = i
-                    self.slot_availability[i] = False
-                    self.hot_reqs[i] = req_id
+            allocated = False
+            while slot_id < end_idx:
+                if self.slot_availability[slot_id]:
+                    self.req2slot[req_id] = slot_id
+                    self.slot_availability[slot_id] = False
+                    self.hot_reqs[slot_id] = req_id
+                    allocated = True
+                    slot_id += 1
                     break
-            assert (
-                req_id in self.req2slot
-            ), f"Cannot allocate slot: {req_id} {self.req2slot}"
+                slot_id += 1
+            assert allocated, f"Failed to allocate slot for {req_id}"
 
-        self._prepare_cache(req_ids)
+        start_pos = self.req2slot[req_ids[0]]
+
+        self._prepare_cache(req_ids, start_pos)
 
     # Decode:
     @override
     def prepare_cache_decode(self, req_ids: List[str]):
         self.timers("cache_prepare").start()
         super().prepare_cache_decode(req_ids)
-        self._prepare_cache(req_ids)
+        start_pos = self.get_start_and_end_idx()[0]
+        self._prepare_cache(req_ids, start_pos)
         self.timers("cache_prepare").stop()
 
-    def _prepare_cache(self, req_ids: List[str]):
-        start_pos = self.get_start_idx()
-        assert start_pos + len(req_ids) <= self.num_hot_req
+    def _prepare_cache(self, req_ids: List[str], start_pos: int):
+        assert (
+            start_pos + len(req_ids) <= self.num_hot_req
+        ), f"start_pos:{start_pos}, number of req:{len(req_ids)}, num_hot_req:{self.num_hot_req}"
 
         self.k_prepared_cache = (
             None
