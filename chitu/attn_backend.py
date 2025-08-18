@@ -1487,7 +1487,7 @@ class FlashInferBackend(TritonAttnBackend):
                 self.decode_wrapper[bs] = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                     self.decode_wrapper_workspace_buffer,
                     "NHD",
-                    use_cuda_graph=False,
+                    use_cuda_graph=self.args.infer.use_cuda_graph,
                     paged_kv_indptr_buffer=self.kv_indptr.get()[: bs + 1],
                     paged_kv_indices_buffer=self.kv_indices.get(),
                     paged_kv_last_page_len_buffer=self.last_page_len[:bs],
@@ -1625,7 +1625,7 @@ class FlashInferBackend(TritonAttnBackend):
             self.decode_wrapper[batch_size].plan(
                 self.kv_indptr.get()[: batch_size + 1],
                 self.kv_indices.get(),
-                self.last_page_len[:batch_size],
+                self.last_page_len[:batch_size] % block_size,
                 self.local_n_heads,
                 self.local_n_kv_heads,
                 self.head_dim,

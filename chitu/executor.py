@@ -375,6 +375,8 @@ class Executor:
             self.dummy_logits = torch.empty(
                 [0, self.vocab_size], dtype=torch.float32, device=self.local_rank
             )
+            self.empty_decode_step_graph = None
+            self.use_cuda_graph = get_global_args().infer.use_cuda_graph
         self.moe_impl = get_moe_impl()
 
     def _prepare_new_tokens_for_decode(self, tasks: PackedTasks):
@@ -415,8 +417,10 @@ class Executor:
             out = self.prefill_step(tasks)
         elif tasks.task_type == TaskType.Decode:
             out = self.decode_step(tasks)
-        elif tasks.task_type is None:
-            out = self.empty_step()
+        elif tasks.task_type == TaskType.EmptyPrefill:
+            out = self.empty_prefill_step()
+        elif tasks.task_type == TaskType.EmptyDecode:
+            out = self.empty_decode_step()
         else:
             raise NotImplementedError  # Hybrid task not implemented
 
@@ -597,7 +601,7 @@ class Executor:
         )  # update seq_len and reset block table
         return out
 
-    def empty_step(self):
+    def empty_prefill_step(self):
         """
         This function is used to skip the attention computation and execute only the MoE logic
         during Expert parallelism.
@@ -610,6 +614,35 @@ class Executor:
             if it < self.n_dense_layers:
                 continue
             layer.mlp(payload)
+
+        for dispatcher in self.task_dispatchers:
+            payload = dispatcher.send_payload(self.dummy_logits)
+
+        return payload
+
+    def empty_decode_step(self):
+        """
+        This function is used to skip the attention computation and execute only the MoE logic
+        during Expert parallelism.
+        """
+
+        def empty_mlp():
+            for it, layer in enumerate(Backend.model.layers):
+                if it < self.n_dense_layers:
+                    continue
+                layer.mlp(self.dummy_input)
+
+        for dispatcher in self.task_dispatchers:
+            payload = dispatcher.recv_payload(self.dummy_input)
+
+        if self.use_cuda_graph:
+            if self.empty_decode_step_graph is None:
+                self.empty_decode_step_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(self.empty_decode_step_graph):
+                    empty_mlp()
+            self.empty_decode_step_graph.replay()
+        else:
+            empty_mlp()
 
         for dispatcher in self.task_dispatchers:
             payload = dispatcher.send_payload(self.dummy_logits)

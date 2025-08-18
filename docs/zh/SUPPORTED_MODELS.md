@@ -116,6 +116,8 @@
   用法: 启动赤兔时追加 `models=Qwen3-4B-fp4` 启动参数
 - Qwen3-8B
   用法: 启动赤兔时追加 `models=Qwen3-8B` 启动参数
+- Qwen3-8B-ascend-int8
+  用法: 启动赤兔时追加 `models=Qwen3-8B-ascend-int8` 启动参数
 - Qwen3-8B-fp4
   用法: 启动赤兔时追加 `models=Qwen3-8B-fp4` 启动参数
 - Qwen3-Coder-30B-A3B-Instruct

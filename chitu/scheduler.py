@@ -380,6 +380,7 @@ class DPFifoScheduler(Scheduler):  # used for expert_data_parallel
             Backend.all_task_ids = [
                 task_id for task_ids in task_lists for task_id in task_ids
             ]
+            Backend.task_type = TaskPool.pool[Backend.all_task_ids[0]].task_type
             return task_lists
         else:
             return []

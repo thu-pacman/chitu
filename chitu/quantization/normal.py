@@ -164,8 +164,6 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
             torch.Tensor: Output tensor.
         """
 
-        shape = x.size()
-        x = x.view(-1, self.dim)
         if self.merge_gate_up and (has_triton or has_torch_npu):
             final_indices = indices
             final_weights = weights
@@ -208,7 +206,7 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
         else:
             y = self.forward_iterative(x, weights, indices)
 
-        return y.view(shape)
+        return y
 
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:

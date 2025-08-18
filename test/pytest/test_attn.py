@@ -267,7 +267,7 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
     assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("prev_seq_len_list", [[509, 19, 15, 22]])
+@pytest.mark.parametrize("prev_seq_len_list", [[509, 19, 15, 282]])
 @pytest.mark.parametrize("n_heads", [4])
 @pytest.mark.parametrize("n_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [256])
@@ -288,7 +288,7 @@ def test_decode_paged_kv(
                 "infer": {
                     "mla_absorb": None,
                     "max_reqs": 4,
-                    "use_cuda_graph": False,
+                    "use_cuda_graph": True if impl == "flashinfer" else False,
                     "tp_size": 1,
                     "cache_type": "paged",
                 },
