@@ -109,9 +109,17 @@ bool llamafile_sgemm_impl(long m, long n, long k, const void* A, long lda, const
 #elif defined(__AVX512F__)
             if (k % 16)
                 return NOT_SUPPORTED;
-            tinyBLAS<0, 16, __m512, __m512, ggml_bf16_t, float, TC> tb{
+            if (Btype == GGML_TYPE_BF16) {
+                tinyBLAS<0, 16, __m512, __m512, ggml_bf16_t, ggml_bf16_t, TC> tb{
+                k, (const ggml_bf16_t*)A, lda, (const ggml_bf16_t*)B, ldb, C, ldc, ith, nth};
+                tb.matmul(m, n, task);
+            } else if (Btype == GGML_TYPE_F32) {
+                tinyBLAS<0, 16, __m512, __m512, ggml_bf16_t, float, TC> tb{
                 k, (const ggml_bf16_t*)A, lda, (const float*)B, ldb, C, ldc, ith, nth};
-            tb.matmul(m, n, task);
+                tb.matmul(m, n, task);
+            } else {
+                return false;
+            }
             return true;
 #elif defined(__AVX2__)
             if (k % 8)

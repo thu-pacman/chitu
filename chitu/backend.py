@@ -13,7 +13,6 @@ from glob import glob
 from logging import getLogger
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Deque, List, Optional
-
 import torch
 import torch.distributed as dist
 from safetensors.torch import safe_open
@@ -139,8 +138,10 @@ class Backend:
             return
 
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group("nccl")
-
+            if args.infer.op_impl == "cpu":
+                torch.distributed.init_process_group("gloo")
+            else:
+                torch.distributed.init_process_group("nccl")
         if Backend.use_gloo:
             Backend.group_gloo = torch.distributed.new_group(backend="gloo")
 
@@ -161,7 +162,8 @@ class Backend:
         ), f"World size not match: {world_size} != {model_parallel_size} * {pipeline_parallel_size} * {non_expert_data_parallel_size}"
 
         # Bind process to GPU
-        torch.cuda.set_device(local_rank)
+        if args.infer.op_impl != "cpu":
+            torch.cuda.set_device(local_rank)
 
         initialize_parallel_groups(
             tp_size=model_parallel_size,
@@ -257,6 +259,9 @@ class Backend:
             Initialized cache manager
         """
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if args.infer.op_impl == "cpu":
+            local_rank = "cpu"
+
         pipeline_parallel_size = args.infer.pp_size
 
         # Determine layer distribution for pipeline parallelism
@@ -369,10 +374,14 @@ class Backend:
         if args.infer.attn_type == "auto":
             if is_ascend():
                 return NpuAttnBackend()
+            elif args.infer.op_impl == "cpu":
+                return RefAttnBackend()
             elif "deepseek-v3" in args.models.type:
                 return FlashMLABackend()
             else:
                 return HybridAttnBackend()
+        elif args.infer.attn_type == "cpu":
+            return RefAttnBackend()
         elif args.infer.attn_type == "flash_attn":
             return FlashAttnBackend()
         elif args.infer.attn_type == "flash_mla":
@@ -456,9 +465,9 @@ class Backend:
             # Use initialized weights
             model = Backend._build_model_architecture(args, attn_backend)
 
-        # Move model to appropriate device
-        model.apply(Backend._move_one_module_to_device)
-
+        # Move modl to appropriate device
+        if args.infer.op_impl != "cpu":
+            model.apply(Backend._move_one_module_to_device)
         Backend.model = model
         Backend.args = args
 

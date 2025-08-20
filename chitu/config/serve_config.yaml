@@ -38,7 +38,7 @@ infer:
   bind_process_to_cpu: auto # one of: auto, none, numa
   bind_thread_to_cpu: physical_core # one of: physical_core, logical_core
   npu_fusion_fp4: False #  for npu fp4 fusion group_gemm mode
-  gpu_memory_utilization: 0.98 # GPU memory utilization for each GPU, e.g., 0.98 means 98% of GPU memory will be used.
+  memory_utilization: 0.98 # GPU memory utilization for each GPU, e.g., 0.98 means 98% of GPU memory will be used.
   moe:
     prefill_token_dispatcher: auto # one of: auto, tp, allgather
     decode_token_dispatcher: auto # one of: auto, tp, allgather

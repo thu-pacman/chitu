@@ -12,15 +12,18 @@ import triton
 import triton.language as tl
 
 from chitu.device_type import is_muxi, is_nvidia
-from chitu.ops import silu_and_mul, blockfp8_act_quant
-from chitu.ops.triton_ops import moe_sum_triton
-from chitu.ops.triton_ops.utils import (
-    SIGNED_INT32_0x87F00000,
-    SIGNED_INT16_0x81C0,
-    SIGNED_INT16_0x87F0,
-    SIGNED_INT8_0x9C,
-)
-from chitu.ops.triton_ops.utils import to_triton_dtype
+from chitu.ops.activation import silu_and_mul
+from chitu.ops.quant import blockfp8_act_quant
+
+if torch.cuda.is_available():
+    from chitu.ops.triton_ops import moe_sum_triton
+    from chitu.ops.triton_ops.utils import (
+        SIGNED_INT32_0x87F00000,
+        SIGNED_INT16_0x81C0,
+        SIGNED_INT16_0x87F0,
+        SIGNED_INT8_0x9C,
+    )
+    from chitu.ops.triton_ops.utils import to_triton_dtype
 from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.utils import ceil_div, try_import_platform_dep
 

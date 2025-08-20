@@ -15,15 +15,16 @@ from chitu.quantization.base import (
     QuantizedMoeExpertsBase,
     QuantizedAbsorbGemmBase,
 )
-from chitu.ops import linear
+from chitu.ops.quant import linear
 from chitu.hybrid_device import CPUParameter
-from chitu.quantization.cpuinfer_singleton import get_cpu_infer
+from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.global_vars import get_global_args
 from chitu.utils import try_import_platform_dep, try_import_opt_dep
 from chitu.distributed.parallel_state import get_ep_group
 from chitu.static_tensor import StaticTensor
 from chitu.custom_gguf import GGMLQuantizationType
+from chitu.custom_gguf import get_ggml_quant_type
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
@@ -273,8 +274,10 @@ class NormLinearCPUInfer(QuantizedLinearBase):
         self,
         in_features: int,
         out_features: int,
-        has_bias: bool = False,
-        **args,
+        has_bias: bool = True,
+        *,
+        dtype=None,
+        bias_dtype=None,
     ):
         super().__init__()
         self.in_features = in_features
@@ -286,30 +289,31 @@ class NormLinearCPUInfer(QuantizedLinearBase):
                 torch.empty(
                     self.out_features,
                     self.in_features,
-                    dtype=torch.bfloat16,
+                    dtype=dtype,
                     device="cpu",
                 ),
                 requires_grad=False,
             )
-
             max_reqs = 256
             self.input_cpu = StaticTensor(
                 max_nelem=max_reqs * self.in_features,
                 device="cpu",
                 pin_memory=True,
-                dtype=torch.bfloat16,
+                dtype=torch.get_default_dtype(),
             )
             self.output_cpu = StaticTensor(
                 max_nelem=max_reqs * self.out_features,
                 device="cpu",
                 pin_memory=True,
-                dtype=torch.bfloat16,
+                dtype=torch.get_default_dtype(),
             )
 
             self.cpu_infer = get_cpu_infer()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if torch.distributed.get_rank() == 0:
+            import cpuinfer
+
             # Initialize after __init__ because `data_ptr` may be modified during weight loading
             if not hasattr(self, "linear"):
                 linear_config = cpuinfer.linear.LinearConfig(
@@ -336,8 +340,20 @@ class NormLinearCPUInfer(QuantizedLinearBase):
                 self.input_cpu.get().copy_(x, non_blocking=True)
                 inp_ptr = self.input_cpu.get().data_ptr()
 
+            import cpuinfer
+
+            linear_config = cpuinfer.linear.LinearConfig(
+                self.in_features,
+                self.out_features,
+                self.stride,
+                self.group_max_len,
+                self.weight.data_ptr(),
+                get_ggml_quant_type(self.weight),
+                get_ggml_quant_type(x),
+            )
+            linear = cpuinfer.linear.Linear(linear_config)
             self.cpu_infer.submit(
-                self.linear.forward(
+                linear.forward(
                     x.size(0),
                     inp_ptr,
                     self.output_cpu.get().data_ptr(),

@@ -74,9 +74,9 @@ class ServeConfigRules(Callback):
             )
 
         op_impl = config.infer.op_impl
-        if op_impl not in {"torch", "muxi_custom_kernel"}:
+        if op_impl not in {"torch", "muxi_custom_kernel", "cpu"}:
             self._exit_with_error(
-                f"op_impl must be one of [torch, muxi_custom_kernel], got {op_impl}"
+                f"op_impl must be one of [torch, muxi_custom_kernel, cpu], got {op_impl}"
             )
 
         bind_process_to_cpu = config.infer.bind_process_to_cpu

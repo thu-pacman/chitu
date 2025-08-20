@@ -224,7 +224,10 @@ class ExpertDataDispatcher(TasksDispatcher):
         self.dp_size = self.dp_group.group_size
         self.dp_main_rank = self.dp_group.rank_list[0]
         self.rank = self.dp_group.global_rank
-        self.device = torch.cuda.current_device()
+        if get_global_args().infer.op_impl == "cpu":
+            self.device = "cpu"
+        else:
+            self.device = torch.cuda.current_device()
         self.is_main_rank = self.dp_group.global_rank == self.dp_main_rank
         self.rank_in_group = self.dp_group.rank_in_group
         self.gpu_group = self.dp_group.gpu_group
@@ -339,6 +342,8 @@ class Executor:
         self.timers = get_timers()
         self.rank = torch.distributed.get_rank()
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if args.infer.op_impl == "cpu":
+            self.local_rank = "cpu"
         self.pp_size = args.infer.pp_size
         self.tp_size = args.infer.tp_size
         self.dp_size = args.infer.dp_size
@@ -382,7 +387,7 @@ class Executor:
     def _prepare_new_tokens_for_decode(self, tasks: PackedTasks):
         return torch.tensor(
             [task.next_token for task in tasks.tasks],
-            device="cuda",
+            device=self.local_rank,
             dtype=torch.long,
         )
 

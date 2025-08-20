@@ -17,8 +17,12 @@ CPUS_PER_GPU=24
 MEM_PER_GPU=242144
 
 # 计算总的CPU和内存
-NUM_CPUS=$((NUM_GPUS * ${CPUS_PER_GPU}))
-NUM_MEMS=$((NUM_GPUS * ${MEM_PER_GPU}))
+if [ -z "${NUM_CPUS}" ]; then
+    NUM_CPUS=$((NUM_GPUS * ${CPUS_PER_GPU}))
+fi
+if [ -z "${NUM_MEMS}" ]; then
+    NUM_MEMS=$((NUM_GPUS * ${MEM_PER_GPU}))
+fi
 
 THIS_SCRIPT=$(realpath $0)
 

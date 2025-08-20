@@ -6,7 +6,10 @@ import torch
 
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase
-from chitu.ops import w4a8_gemm_per_token_per_channel_asymm, a8_per_token_act_quant
+from chitu.ops.quant import (
+    w4a8_gemm_per_token_per_channel_asymm,
+    a8_per_token_act_quant,
+)
 from chitu.native_layout import (
     enable_native_layout_weight,
     Packed4BitWeightAlongK,

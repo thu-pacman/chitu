@@ -14,8 +14,6 @@
   用法: 启动赤兔时追加 `models=DeepSeek-R1-Q4_K_M` 启动参数
 - DeepSeek-R1-bf16
   用法: 启动赤兔时追加 `models=DeepSeek-R1-bf16` 启动参数
-- DeepSeek-R1-bf16-mix-cpu
-  用法: 启动赤兔时追加 `models=DeepSeek-R1-bf16-mix-cpu` 启动参数
 - DeepSeek-R1-fp4-all
   用法: 启动赤兔时追加 `models=DeepSeek-R1-fp4-all` 启动参数
 - DeepSeek-R1-fp4-mix
@@ -108,8 +106,6 @@
   用法: 启动赤兔时追加 `models=Qwen3-32B-FP8` 启动参数
 - Qwen3-32B-fp4
   用法: 启动赤兔时追加 `models=Qwen3-32B-fp4` 启动参数
-- Qwen3-32B-mix-cpu
-  用法: 启动赤兔时追加 `models=Qwen3-32B-mix-cpu` 启动参数
 - Qwen3-4B
   用法: 启动赤兔时追加 `models=Qwen3-4B` 启动参数
 - Qwen3-4B-fp4

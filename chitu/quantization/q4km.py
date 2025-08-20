@@ -10,7 +10,7 @@ from chitu.quantization.base import QuantizedMoeExpertsBase
 from chitu.global_vars import get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.hybrid_device import CPUParameter
-from chitu.quantization.cpuinfer_singleton import get_cpu_infer
+from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import GGMLQuantizationType
 from chitu.utils import try_import_opt_dep
 from typing import Optional

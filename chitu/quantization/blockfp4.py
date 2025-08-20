@@ -13,7 +13,7 @@ from chitu.quantization.base import (
     QuantizedMoeExpertsBase,
 )
 from chitu.quantization.registry import QuantizationRegistry
-from chitu.ops import (
+from chitu.ops.quant import (
     soft_fp4_raise_to_fp8_blockfp4_gemm,
     soft_fp4_raise_to_bf16_blockfp4_gemm,
     soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm,
@@ -37,7 +37,7 @@ from chitu.native_layout import (
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
-if has_triton:
+if has_triton and torch.cuda.is_available():
     from chitu.moe.experts import fused_experts
 torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 if has_torch_npu:

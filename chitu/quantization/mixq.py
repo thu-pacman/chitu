@@ -7,7 +7,7 @@ import torch
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase
 from chitu.utils import try_import_platform_dep
-from chitu.ops import mixq_gemm
+from chitu.ops.quant import mixq_gemm
 
 hygon_mixq_kernels, has_hygon = try_import_platform_dep("sugon_mixQ4_kernels")
 

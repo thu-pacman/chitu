@@ -19,7 +19,6 @@ from chitu.distributed.parallel_state import get_tp_group, get_tp_size
 from chitu.quantization import (
     QuantizationRegistry,
     get_quant_from_checkpoint_prefix,
-    get_backend_from_checkpoint_prefix,
 )
 
 logger = getLogger(__name__)
@@ -86,9 +85,6 @@ def get_column_parallel_linear_class(
                 checkpoint_prefix=checkpoint_prefix,
             )
         )
-    backend = get_backend_from_checkpoint_prefix(checkpoint_prefix)
-    if backend == "cpuinfer":
-        return base_linear_class
 
     class ColumnParallelLinearImpl(ColumnParallelLinearMixIn, base_linear_class):
         # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
@@ -150,9 +146,6 @@ def get_row_parallel_linear_class(
                 checkpoint_prefix=checkpoint_prefix,
             )
         )
-    backend = get_backend_from_checkpoint_prefix(checkpoint_prefix)
-    if backend == "cpuinfer":
-        return base_linear_class
 
     class RowParallelLinearImpl(RowParallelLinearMixIn, base_linear_class):
         # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph

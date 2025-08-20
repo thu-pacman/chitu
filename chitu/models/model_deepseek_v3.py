@@ -4,6 +4,7 @@
 
 import math
 import re
+import gc
 from logging import getLogger
 from typing import Any, List, Mapping, Optional
 from typing_extensions import override
@@ -739,6 +740,7 @@ class TransformerDeepSeekV3(Transformer):
                 checkpoint[prefix + f"experts.{w}_{part}"] = torch.stack(
                     [checkpoint.pop(key) for key in parts], dim=0
                 )
+                gc.collect()
             elif re.search(r"\.experts\.\d+", k):
                 continue
             elif fuse_shared_experts and ".shared_experts." in k:

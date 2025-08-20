@@ -85,7 +85,9 @@ class CPUInfer {
 
     // Execution context
     std::thread dispatcher_;
+    std::function<void(int)> init_callback_;
     std::function<void(int)> compute_callback_;
+    std::function<void(int)> finalize_callback_;
     int active_workers_;
 
     void initialize_workers() {
@@ -137,7 +139,9 @@ class CPUInfer {
 
     void process_tasks(int worker_id) {
         auto &ctx = workers_[worker_id];
-
+        if (init_callback_ != nullptr) {
+            init_callback_(worker_id);
+        }
         while (true) {
             int task_id =
                 ctx.task_counter.fetch_add(1, std::memory_order_acq_rel);
@@ -146,7 +150,7 @@ class CPUInfer {
             }
             compute_callback_(task_id);
         }
-        for (int t_offset = 1; t_offset < workers_.size(); t_offset++) {
+        for (size_t t_offset = 1; t_offset < workers_.size(); t_offset++) {
             int t_i = (worker_id + t_offset) % workers_.size();
             if (workers_[t_i].state.load(std::memory_order_acquire) !=
                 WorkerState::Active) {
@@ -160,6 +164,9 @@ class CPUInfer {
                 }
                 compute_callback_(task_id);
             }
+        }
+        if (finalize_callback_ != nullptr) {
+            finalize_callback_(worker_id);
         }
         workers_[worker_id].state.store(WorkerState::Idle,
                                         std::memory_order_release);
@@ -280,6 +287,7 @@ class CPUInfer {
             dispatcher_.join();
         shutdown_workers();
     }
+    int get_thread_num() { return active_workers_; }
 
     template <typename Fn, typename... Args>
     void enqueue(Fn &&fn, Args &&...args) {
@@ -298,6 +306,40 @@ class CPUInfer {
         }
     }
 
+    void parallel_for(int task_count, std::function<void(int)> init_fn,
+                      std::function<void(int)> compute_fn,
+                      std::function<void(int)> finalize_fn) {
+        init_callback_ = init_fn;
+        compute_callback_ = compute_fn;
+        finalize_callback_ = finalize_fn;
+
+        active_workers_ =
+            std::min(workers_.size(), static_cast<size_t>(task_count));
+
+        const int base_tasks = task_count / active_workers_;
+        int remaining = task_count % active_workers_;
+
+        workers_[0].task_counter.store(0, std::memory_order_relaxed);
+        workers_[0].task_end = base_tasks + (remaining-- > 0);
+        workers_[0].state.store(WorkerState::Active, std::memory_order_release);
+        for (int i = 1; i < active_workers_; ++i) {
+            workers_[i].task_counter.store(workers_[i - 1].task_end,
+                                           std::memory_order_relaxed);
+            workers_[i].task_end =
+                workers_[i - 1].task_end + base_tasks + (remaining-- > 0);
+            workers_[i].state.store(WorkerState::Active,
+                                    std::memory_order_release);
+        }
+
+        process_tasks(0);
+        for (int i = 1; i < active_workers_; ++i) {
+            while (workers_[i].state.load(std::memory_order_acquire) ==
+                   WorkerState::Active) {
+                std::this_thread::yield();
+            }
+        }
+    }
+
     void parallel_for(int task_count, std::function<void(int)> compute_fn) {
         compute_callback_ = compute_fn;
         active_workers_ =
@@ -310,7 +352,7 @@ class CPUInfer {
         workers_[0].task_end = base_tasks + (remaining-- > 0);
         workers_[0].state.store(WorkerState::Active, std::memory_order_release);
 
-        for (size_t i = 1; i < active_workers_; ++i) {
+        for (int i = 1; i < active_workers_; ++i) {
             workers_[i].task_counter.store(workers_[i - 1].task_end,
                                            std::memory_order_relaxed);
             workers_[i].task_end =
@@ -320,7 +362,7 @@ class CPUInfer {
         }
 
         process_tasks(0);
-        for (size_t i = 1; i < active_workers_; ++i) {
+        for (int i = 1; i < active_workers_; ++i) {
             while (workers_[i].state.load(std::memory_order_acquire) ==
                    WorkerState::Active) {
                 std::this_thread::yield();

@@ -38,7 +38,7 @@ flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 
-if has_triton:
+if has_triton and torch.cuda.is_available():
     from chitu.triton_decode_attention import (
         decode_attention_fwd,
         mla_decode,

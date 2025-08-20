@@ -8,7 +8,7 @@ from chitu.global_vars import set_global_args
 
 def test_prefill_first():
     set_global_args(
-        OmegaConf.create({"infer": {"max_seq_len": 1024}}),
+        OmegaConf.create({"infer": {"max_seq_len": 1024, "op_impl": "torch"}}),
         need_ensure=False,
     )
 
@@ -61,7 +61,7 @@ def test_prefill_first():
 
 def test_fcfs():
     set_global_args(
-        OmegaConf.create({"infer": {"max_seq_len": 1024}}),
+        OmegaConf.create({"infer": {"max_seq_len": 1024, "op_impl": "torch"}}),
         need_ensure=False,
     )
 
@@ -109,7 +109,7 @@ def test_fcfs():
 
 def test_request_preset_over_prefill_first():
     set_global_args(
-        OmegaConf.create({"infer": {"max_seq_len": 1024}}),
+        OmegaConf.create({"infer": {"max_seq_len": 1024, "op_impl": "torch"}}),
         need_ensure=False,
     )
 

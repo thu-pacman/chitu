@@ -90,7 +90,9 @@ class QuantizationRegistry:
         backend_impls = registry[backend_type]
 
         if method not in backend_impls:
-            raise ValueError(f"Unknown quantization method in `method`: {method}")
+            raise ValueError(
+                f"Unknown quantization method in `method`: {method}, `backend`: {backend_type}"
+            )
         impl: Type = backend_impls[method]
 
         for key in quant_kwargs:

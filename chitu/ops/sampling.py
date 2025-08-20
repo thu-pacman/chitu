@@ -13,7 +13,7 @@ triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 
-if has_triton:
+if has_triton and torch.cuda.is_available():
     from chitu.ops.triton_ops import apply_frequency_penalty_triton
 
 

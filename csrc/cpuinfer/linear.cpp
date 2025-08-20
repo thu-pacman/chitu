@@ -54,7 +54,14 @@ void Linear::forward_many(int qlen, const void* input, void* output, CPUInfer *C
         int ith = task_id;
         void* proj_ptr = (uint8_t*)proj_ + ith * config_.stride * config_.input_size * ggml_type_size(config_.proj_type) / ggml_blck_size(config_.proj_type);
         float* proj_output_ptr = proj_output_ + ith * config_.stride;
-        llamafile_sgemm(config_.stride, qlen, config_.input_size / ggml_blck_size(config_.proj_type), proj_ptr, config_.input_size / ggml_blck_size(config_.proj_type), proj_input_ptr, config_.input_size / ggml_blck_size(config_.proj_type), proj_output_ptr, config_.output_size, 0, 1, GGML_TASK_TYPE_COMPUTE, config_.proj_type, ggml_internal_get_type_traits(config_.proj_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
+        bool sgemm_check = llamafile_sgemm(config_.stride, qlen, config_.input_size / ggml_blck_size(config_.proj_type), proj_ptr, config_.input_size / ggml_blck_size(config_.proj_type), proj_input_ptr, config_.input_size / ggml_blck_size(config_.proj_type), proj_output_ptr, config_.output_size, 0, 1, GGML_TASK_TYPE_COMPUTE, config_.proj_type, ggml_internal_get_type_traits(config_.proj_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
+        if(!sgemm_check) {
+            throw std::runtime_error(
+                "llamafile_sgemm check failed: unsupported CPU instruction set or invalid parameters.\n"
+                "This may happen if the binary was compiled with AVX/AVX2/AVX512 "
+                "and your CPU does not support it."
+            );
+        }
         if (config_.stride % ggml_blck_size(config_.hidden_type) == 0) {
             for (int i = 0; i < qlen; i++) {
                 float* output_fp32_ptr = proj_output_ + i * config_.output_size + ith * config_.stride;

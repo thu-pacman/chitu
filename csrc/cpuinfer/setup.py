@@ -23,15 +23,33 @@ class CMakeExtension(Extension):
         self.sourcedir = os.fspath(Path(sourcedir).resolve())
 
 
+def detect_intel():
+    try:
+        with open("/proc/cpuinfo", "r") as f:
+            for line in f:
+                if line.startswith("vendor_id"):
+                    return "Intel" in line
+    except Exception:
+        pass
+
+    try:
+        import cpuinfo
+
+        info = cpuinfo.get_cpu_info()
+        vendor = info.get("vendor_id_raw", "") or info.get("vendor_id", "")
+        if "Intel" in vendor:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
 class CustomBuildExtension(BuildExtension):
     def build_extension(self, ext) -> None:
         if not isinstance(ext, CMakeExtension):
             super().build_extension(ext)
             return
-
-        info = cpuinfo.get_cpu_info()
-        vendor = info.get("vendor_id_raw", "") or info.get("vendor_id", "")
-        is_intel = "Intel" in vendor
 
         if ext.name == "llama.cpp":
             cmake_args = [
@@ -45,12 +63,11 @@ class CustomBuildExtension(BuildExtension):
                 "-DCMAKE_CXX_COMPILER=g++",
             ]
 
-            if is_intel:
+            if detect_intel():
                 cmake_args += [
                     "-DLLAMA_AVX=ON",
                     "-DLLAMA_AVX2=ON",
                     "-DLLAMA_AVX512=ON",
-                    "-DLLAMA_AVX512_BF16=ON",
                 ]
             else:
                 print("Non-Intel CPU detected; skipping AVX flags.")
@@ -102,12 +119,17 @@ setup(
                 "bindings.cpp",
                 "moe.cpp",
                 "linear.cpp",
+                "silu_and_mul.cpp",
+                "rmsnorm.cpp",
+                "moe_gate.cpp",
+                "rotary.cpp",
                 "shared_mem_buffer.cpp",
             ]
             + llama_cpp_files,
             libraries=["ggml_static"],
             include_dirs=[
                 os.path.join(setup_dir, "../../third_party/"),
+                os.path.join(setup_dir),
             ],
             library_dirs=[
                 os.path.join(setup_dir, "../../third_party/llama.cpp/build"),
