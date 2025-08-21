@@ -32,7 +32,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         hidden: int,
         deepep_use_fp8: bool = False,
         profile: bool = False,
-        mode="deepep-ll",
+        mode: str = "deepep-ll",
     ):
         self.num_experts = num_experts
         self._buffer = None

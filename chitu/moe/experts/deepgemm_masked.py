@@ -13,7 +13,7 @@ from chitu.ops.triton_ops.quant.blockfp8 import (
 )
 
 
-def deep_gemm_fused_expert(
+def deepgemm_masked_fused_expert(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,

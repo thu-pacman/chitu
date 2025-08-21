@@ -34,7 +34,7 @@ class DeepEPBuffer:
         cls._num_experts = num_experts
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
-        if deepep_mode in ["auto", "deepep_normal"]:
+        if deepep_mode in ["auto", "deepep-normal"]:
             hidden_bytes = hidden_size * 2
             for config in (
                 deep_ep.Buffer.get_dispatch_config(group.size()),
@@ -65,7 +65,7 @@ class DeepEPBuffer:
             # according to deepep readme, hard code here.
             num_qps_per_rank = 12
         elif deepep_mode in ["deepep-ll", "auto"]:
-            num_qps_per_rank = max(12, num_experts // group.size())
+            num_qps_per_rank = max(24, num_experts // group.size())
         else:
             raise NotImplementedError
 

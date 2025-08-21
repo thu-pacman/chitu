@@ -5,4 +5,5 @@
 from .base import MoETokenDispatcher
 from .allgather_dispatcher import MoEAllGatherTokenDispatcher
 from .tp_dispatcher import MoETPTokenDispatcher
-from .lowlatency_dispatcher import MoELowLatencyTokenDispatcher
+from .deepep_lowlatency_dispatcher import MoELowLatencyTokenDispatcher
+from .deepep_normal_dispatcher import MoENormalTokenDispatcher

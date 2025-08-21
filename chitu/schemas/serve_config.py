@@ -50,8 +50,7 @@ class InferConfig:
     class MoEConfig:
         prefill_token_dispatcher: str = MISSING
         decode_token_dispatcher: str = MISSING
-        prefill_experts_impl: str = MISSING
-        decode_experts_impl: str = MISSING
+        deepep_use_fp8: bool = MISSING
 
     moe: MoEConfig = MISSING
 

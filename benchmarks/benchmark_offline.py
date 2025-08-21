@@ -145,6 +145,7 @@ def run_benchmark(args, timers, is_main_rank):
     warmup_engine(args)
     iters = args.benchmark.iters
     stop_with_eos = args.benchmark.stop_with_eos
+    debug_print = args.benchmark.debug_print
     for i in range(iters):
         if is_main_rank:
             reqs = get_requests(args)
@@ -168,6 +169,8 @@ def run_benchmark(args, timers, is_main_rank):
                 f"Total throughput: {total_num_tokens / total_time:.2f} tps\n"
                 f"Total output throughput: {output_num_tokens / total_time:.2f} tps\n"
             )
+            if debug_print:
+                logger.info(f"First request output: {reqs[0].output}\n")
 
     chitu_terminate()
 
