@@ -62,6 +62,7 @@ class MoEImpl:
         self.use_fp8 = args.infer.moe.deepep_use_fp8
         self.prefill_token_dispatcher_impl = args.infer.moe.prefill_token_dispatcher
         self.decode_token_dispatcher_impl = args.infer.moe.decode_token_dispatcher
+        self.use_cuda_graph = args.infer.use_cuda_graph
 
         self._init_token_dispatcher()
         self._init_experts_impl()
@@ -83,6 +84,9 @@ class MoEImpl:
                 self.decode_token_dispatcher_impl = "deepep-ll"
             else:
                 self.decode_token_dispatcher_impl = "allgather"
+                assert (
+                    not self.use_cuda_graph
+                ), "allgather is not supported with cuda graph"
 
         # impl initialization
         if self.prefill_token_dispatcher_impl == "tp":

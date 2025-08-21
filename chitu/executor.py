@@ -645,7 +645,8 @@ class Executor:
                 self.empty_decode_step_graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(self.empty_decode_step_graph):
                     empty_mlp()
-            self.empty_decode_step_graph.replay()
+            else:
+                self.empty_decode_step_graph.replay()
         else:
             empty_mlp()
 
