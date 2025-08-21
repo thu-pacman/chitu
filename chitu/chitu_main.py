@@ -187,7 +187,7 @@ def _warmup_via_taskpool(args):
             )
             task = Task(f"{req.request_id}", req, stop_with_eos=False)
             TaskPool.add(task)
-            logger.warning(f"Added {num_warmup_reqs} warmup requests to TaskPool")
+        logger.warning(f"Added {num_warmup_reqs} warmup requests to TaskPool")
 
     if rank > 0:
         chitu_run()  # An extra run is needed because our implementation is asymmetric

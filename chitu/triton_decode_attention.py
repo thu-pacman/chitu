@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 
 from chitu.device_type import is_muxi
+import os
 
 
 # SPDX-SnippetBegin
@@ -236,6 +237,32 @@ _fwd_grouped_kernel_stage1_configs = (
         for num_warps in [2, 4, 8, 16]
     ]
 )
+
+if os.environ.get("CI_TESTS", "false") == "true":
+    _fwd_grouped_kernel_stage1_configs = (
+        [
+            triton.Config(
+                {"BLOCK_N": block_n},
+                num_stages=num_stages,
+                num_warps=num_warps,
+                scenario="flashattn-fwd",
+            )
+            for block_n in [32]
+            for num_stages in [1, 2, 3, 4]
+            for num_warps in [2, 4, 8, 16]
+        ]
+        if is_muxi()
+        else [
+            triton.Config(
+                {"BLOCK_N": block_n},
+                num_stages=num_stages,
+                num_warps=num_warps,
+            )
+            for block_n in [32]
+            for num_stages in [1, 2, 3, 4]
+            for num_warps in [2, 4, 8, 16]
+        ]
+    )
 
 
 @triton.autotune(configs=_fwd_grouped_kernel_stage1_configs, key=[])
