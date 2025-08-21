@@ -78,7 +78,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         )
 
     def token_unpermutation(
-        self, expert_outputs, previous_event: Optional[deep_ep.EventOverlap] = None
+        self, expert_outputs, previous_event: Optional["deep_ep.EventOverlap"] = None
     ):
         handle, topk_ids, topk_weights = self.dispatch_ctx
         combined_x, event = self.combine_forward(
@@ -92,7 +92,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         async_finish: bool = False,
-        previous_event: Optional[deep_ep.EventOverlap] = None,
+        previous_event: Optional["deep_ep.EventOverlap"] = None,
     ):
         # NOTES: an optional `previous_event` means a CUDA event captured that you want to make it as a dependency
         # of the dispatch kernel, it may be useful with communication-computation overlap. For more information, please
@@ -150,7 +150,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         topk_weights: torch.Tensor,
         handle: Tuple,
         async_finish: bool = False,
-        previous_event: Optional[deep_ep.EventOverlap] = None,
+        previous_event: Optional["deep_ep.EventOverlap"] = None,
     ):
         if topk_weights.dtype != torch.float32:
             topk_weights = topk_weights.to(torch.float32)
