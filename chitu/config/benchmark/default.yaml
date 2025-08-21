@@ -9,3 +9,4 @@ stop_with_eos: False # whether to stop with eos token
 iters: 3
 dataset: random # random or sharegpt
 dataset_path: null # path to the dataset
+debug_print: False # whether to print the first request output

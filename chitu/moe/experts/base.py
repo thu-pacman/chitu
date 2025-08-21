@@ -17,7 +17,8 @@ if has_torch_npu:
 if has_triton:
     from .triton_fused_experts import fused_experts
 if has_deep_gemm:
-    from .deepgemm import deep_gemm_fused_expert
+    from .deepgemm_masked import deepgemm_masked_fused_expert
+    from .deepgemm_contiguous import deepgemm_contiguous_fused_expert
 
 
 def fused_experts_wrapper(
@@ -87,8 +88,36 @@ def fused_experts_wrapper(
             experts_start_idx=experts_start_idx,
             tokens_per_expert=tokens_per_expert,
         )
-    elif impl == "deepgemm-ll" and has_deep_gemm:
-        return deep_gemm_fused_expert(
+    elif impl == "deepgemm-masked" and has_deep_gemm:
+        return deepgemm_masked_fused_expert(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=inplace,
+            activation=activation,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_fp4_w4a8=use_fp4_w4a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_scale_2=w1_scale_2,
+            w2_scale_2=w2_scale_2,
+            w1_zp=w1_zp,
+            w2_zp=w2_zp,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            block_shape=block_shape,
+            soft_fp8=soft_fp8,
+            experts_start_idx=experts_start_idx,
+            tokens_per_expert=tokens_per_expert,
+        )
+    elif impl == "deepgemm-contiguous" and has_deep_gemm:
+        return deepgemm_contiguous_fused_expert(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,

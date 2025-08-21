@@ -6,6 +6,7 @@ import itertools
 import os
 from logging import getLogger
 from typing import Any, List, Mapping, Optional
+import gc
 
 import numpy as np
 import torch
@@ -18,8 +19,6 @@ from chitu.cuda_graph import make_dispatched_graphed_callables
 from chitu.device_type import is_ascend, is_muxi, is_nvidia
 from chitu.global_vars import get_global_args, get_timers
 from chitu.muxi_utils import (
-    has_tbsgemm,
-    tbsgemm,
     Blockfp8LinearMuxiLayoutContigY,
     LinearMuxiLayoutContigY,
     LinearMuxiLayoutNativeY,
@@ -68,12 +67,6 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim), requires_grad=False)
 
-    def _ref_norm(self, x, compute_dtype):
-        dtype = x.dtype
-        x = x.to(compute_dtype)
-        y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return y.to(dtype) * self.weight
-
     def forward(
         self,
         x: torch.Tensor,
@@ -99,66 +92,7 @@ class RMSNorm(nn.Module):
         if compute_dtype is None:
             compute_dtype = torch.float32
 
-        if impl == "auto":
-            if out is not None and has_chitu_backend:
-                impl = "cuda"
-            elif (
-                has_tbsgemm
-                and get_global_args().dtype == "float16"
-                and self.eps == 1e-6
-            ):
-                impl = "muxi_w8a8_kernels"
-            elif has_triton:
-                impl = "triton"
-            elif has_torch_npu:
-                impl = "torch_npu"
-            elif hasattr(F, "rms_norm"):
-                impl = "torch"
-            else:
-                impl = "ref"
-
-        if impl == "triton":
-            assert out is None
-            return rms_norm(x, self.weight, self.eps, compute_dtype=compute_dtype)
-        elif impl == "cuda":
-            # Currently, this kernel always raise to float32 to compute
-            return chitu_backend.cuda_rms_norm(x, self.weight, eps=self.eps, out=out)
-        elif impl == "muxi_w8a8_kernels":
-            assert out is None
-            assert self.eps == 1e-6
-            assert x.dtype == torch.float16
-            return tbsgemm.norm(x, self.weight)
-        elif impl == "torch_npu":
-            dtype = x.dtype
-            if self.weight.dtype != dtype:
-                self.weight.data = self.weight.data.to(dtype)
-            tmp_out = torch_npu.npu_rms_norm(x, self.weight, epsilon=self.eps)[0].to(
-                dtype
-            )
-            if out is not None:
-                out.copy_(tmp_out)
-            else:
-                out = tmp_out
-            return out
-        elif impl == "torch":
-            dtype = x.dtype
-            tmp_out = F.rms_norm(
-                x.to(compute_dtype), (self.dim,), self.weight, self.eps
-            ).to(dtype)
-            if out is not None:
-                out.copy_(tmp_out)
-            else:
-                out = tmp_out
-            return out
-        elif impl == "ref":
-            tmp_out = self._ref_norm(x, compute_dtype)
-            if out is not None:
-                out.copy_(tmp_out)
-            else:
-                out = tmp_out
-            return out
-        else:
-            raise ValueError(f"Invalid RMSNorm implementation: {impl}")
+        return rms_norm(x, self.weight, self.eps, out, compute_dtype, impl)
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device=None):
@@ -242,6 +176,8 @@ class Transformer(nn.Module):
         self.op_impl = op_impl
         self.rank = torch.distributed.get_rank()
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if get_global_args().infer.op_impl == "cpu":
+            self.local_rank = "cpu"
         self.world_size = torch.distributed.get_world_size()
         self.device = torch.device(self.local_rank)
 
@@ -946,7 +882,7 @@ class ParallelMoeBlock(nn.Module):
         tokens_per_expert = None
         if self.moe_impl is not None:
             experts_impl = self.moe_impl.get_experts_impl()
-            if experts_impl == "deepgemm-ll":
+            if "deepgemm" in experts_impl:
                 indices = indices.to(torch.int64)
             x, indices, weights, tokens_per_expert = self.moe_impl.token_permutation(
                 x, indices, weights

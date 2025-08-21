@@ -59,6 +59,25 @@ class GGMLQuantizationType(IntEnum):
     BF16 = 30
 
 
+TORCH_DTYPE_TO_GGML = {
+    torch.float32: GGMLQuantizationType.F32,
+    torch.float64: GGMLQuantizationType.F64,
+    torch.float16: GGMLQuantizationType.F16,
+    torch.bfloat16: GGMLQuantizationType.BF16,
+    torch.int8: GGMLQuantizationType.I8,
+    torch.int16: GGMLQuantizationType.I16,
+    torch.int32: GGMLQuantizationType.I32,
+    torch.int64: GGMLQuantizationType.I64,
+}
+
+
+def get_ggml_quant_type(tensor: torch.Tensor) -> GGMLQuantizationType:
+    if tensor.dtype in TORCH_DTYPE_TO_GGML:
+        return TORCH_DTYPE_TO_GGML[tensor.dtype]
+    else:
+        raise ValueError(f"Unsupported dtype: {tensor.dtype}")
+
+
 QK_K = 256
 GGML_QUANT_SIZES: Dict[GGMLQuantizationType, Tuple[int, int]] = {
     GGMLQuantizationType.F32: (1, 4),

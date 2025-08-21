@@ -7,12 +7,15 @@ from typing import Optional, Tuple
 import torch
 
 from chitu.utils import try_import_platform_dep
+from chitu.global_vars import get_global_args
+from chitu.cpuinfer_singleton import get_cpu_infer
+from chitu.custom_gguf import get_ggml_quant_type
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 
-if has_triton:
+if has_triton and torch.cuda.is_available():
     from chitu.ops.triton_ops import apply_rotary_pos_emb_triton
 
 
@@ -180,6 +183,87 @@ def apply_rotary_pos_emb_torch_npu(q, k, cos, sin, rotary_type="separated"):
         raise ValueError(f"Unknown rotary type: {rotary_type}")
 
 
+def apply_rotary_pos_emb_cpu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_out: Optional[torch.Tensor] = None,
+    k_out: Optional[torch.Tensor] = None,
+    rotary_type: str = "separated",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    import cpuinfer
+
+    if q.device.type != "cpu":
+        raise ValueError(
+            f"apply_rotary_pos_emb input tensor q must be on CPU, got device: {q.device}"
+        )
+    if k.device.type != "cpu":
+        raise ValueError(
+            f"apply_rotary_pos_emb input tensor k must be on CPU, got device: {k.device}"
+        )
+    if cos.device.type != "cpu":
+        raise ValueError(
+            f"apply_rotary_pos_emb input tensor cos must be on CPU, got device: {cos.device}"
+        )
+    if sin.device.type != "cpu":
+        raise ValueError(
+            f"apply_rotary_pos_emb input tensor sin must be on CPU, got device: {sin.device}"
+        )
+    if rotary_type not in ["separated", "interleaved"]:
+        raise ValueError(f"Unsupported rotary type: {rotary_type}")
+
+    if not q.is_contiguous():
+        q = q.contiguous()
+
+    if not k.is_contiguous():
+        k = k.contiguous()
+
+    if not cos.is_contiguous():
+        cos = cos.contiguous()
+
+    if not sin.is_contiguous():
+        sin = sin.contiguous()
+
+    batch_size = q.size(0)
+    q_len = q.size(1)
+    k_len = k.size(1)
+    head_dim = q.size(-1)
+
+    if q_out is None:
+        q_out = torch.empty_like(q).contiguous()
+    elif not q_out.is_contiguous():
+        q_out = q_out.contiguous()
+
+    if k_out is None:
+        k_out = torch.empty_like(k).contiguous()
+    elif not k_out.is_contiguous():
+        k_out = k_out.contiguous()
+
+    config = cpuinfer.rotary.RotaryConfig(
+        head_dim, 3096, rotary_type, get_ggml_quant_type(q)
+    )
+    rotary = cpuinfer.rotary.Rotary(config)
+
+    cpu_infer = get_cpu_infer()
+    cpu_infer.submit(
+        rotary.forward(
+            batch_size,
+            q_len,
+            k_len,
+            q.data_ptr(),
+            k.data_ptr(),
+            cos.data_ptr(),
+            sin.data_ptr(),
+            q_out.data_ptr(),
+            k_out.data_ptr(),
+        )
+    )
+    cpu_infer.sync()
+
+    return q_out, k_out
+
+
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -219,7 +303,9 @@ def apply_rotary_pos_emb(
     """
 
     if impl == "auto":
-        if (
+        if get_global_args().infer.op_impl == "cpu":
+            impl = "cpu"
+        elif (
             q_out is None
             and k_out is None
             and (
@@ -256,6 +342,10 @@ def apply_rotary_pos_emb(
         )
     elif impl == "torch_npu":
         return apply_rotary_pos_emb_torch_npu(q, k, cos, sin, rotary_type=rotary_type)
+    elif impl == "cpu":
+        return apply_rotary_pos_emb_cpu(
+            q, k, cos, sin, q_out=q_out, k_out=k_out, rotary_type=rotary_type
+        )
     else:
         return apply_rotary_pos_emb_torch(
             q, k, cos, sin, q_out=q_out, k_out=k_out, rotary_type=rotary_type

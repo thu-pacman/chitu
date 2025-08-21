@@ -7,6 +7,9 @@ from typing import Optional
 import torch
 
 from chitu.utils import try_import_opt_dep, try_import_platform_dep, is_power_of_two
+from chitu.global_vars import get_global_args
+from chitu.cpuinfer_singleton import get_cpu_infer
+from chitu.custom_gguf import get_ggml_quant_type
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
@@ -37,6 +40,8 @@ def moe_gate(
             )
         ):
             impl = "muxi"
+        elif get_global_args().infer.op_impl == "cpu":
+            impl = "cpu"
         elif (
             has_chitu_backend
             and scores.shape[-1] <= 256
@@ -76,6 +81,15 @@ def moe_gate(
                 else e_score_correction_bias.type_as(scores)
             ),
             score_func=score_func,
+        )
+    elif impl == "cpu":
+        return moe_gate_cpu(
+            scores,
+            topk,
+            num_expert_group,
+            topk_group,
+            e_score_correction_bias,
+            score_func,
         )
     else:
         raise ValueError(f"Unsupported implementation of moe_gate: {impl}")
@@ -217,3 +231,71 @@ def moe_gate_muxi(
     )
 
     return expertsIds, selected_experts_weights
+
+
+def moe_gate_cpu(
+    scores,
+    topk,
+    num_expert_group,
+    topk_group,
+    e_score_correction_bias=None,
+    score_func="softmax",
+):
+    import cpuinfer
+
+    if scores.device.type != "cpu":
+        raise ValueError(
+            f"moe_gate input tensor must be on CPU, got device: {scores.device}"
+        )
+
+    if score_func not in ["softmax", "sigmoid"]:
+        raise ValueError(f"Unsupported score function: {score_func}")
+
+    if not scores.is_contiguous():
+        scores = scores.contiguous()
+
+    batch_size = scores.shape[0]
+    num_experts = scores.shape[1]
+
+    if (
+        e_score_correction_bias is not None
+        and not e_score_correction_bias.is_contiguous()
+    ):
+        e_score_correction_bias = e_score_correction_bias.contiguous()
+
+    indices = torch.zeros(
+        (batch_size, topk), dtype=torch.int64, device="cpu"
+    ).contiguous()
+    weights = torch.zeros(
+        (batch_size, topk), dtype=torch.float32, device="cpu"
+    ).contiguous()
+
+    config = cpuinfer.moe_gate.MOEGateConfig(
+        num_experts=num_experts,
+        num_expert_group=num_expert_group,
+        topk=topk,
+        topk_group=topk_group,
+        group_max_len=1024,  # Default max sequence length
+        use_correction_bias=e_score_correction_bias is not None,
+        score_func=score_func,
+        hidden_type=get_ggml_quant_type(scores),
+    )
+    moe_gate = cpuinfer.moe_gate.MOEGate(config)
+
+    cpu_infer = get_cpu_infer()
+    cpu_infer.submit(
+        moe_gate.forward(
+            batch_size,
+            scores.data_ptr(),
+            (
+                e_score_correction_bias.data_ptr()
+                if e_score_correction_bias is not None
+                else 0
+            ),
+            indices.data_ptr(),
+            weights.data_ptr(),
+        )
+    )
+    cpu_infer.sync()
+
+    return indices, weights

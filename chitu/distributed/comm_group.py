@@ -23,9 +23,6 @@ class CommGroup:
         for rank_list in rank_lists:
             gpu_group = torch.distributed.new_group(rank_list)
             cpu_group = torch.distributed.new_group(rank_list, backend="gloo")
-            logger.info(
-                f"[CommGroup] create gpu_group: {rank_list}, cpu_group: {rank_list}"
-            )
             cpu_groups.append(cpu_group)
             gpu_groups.append(gpu_group)
             contains_this_rank.append(global_rank in rank_list)

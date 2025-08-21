@@ -7,10 +7,13 @@ import torch
 from chitu.utils import try_import_platform_dep
 from chitu.native_layout import Vector
 from chitu.device_type import is_muxi
+from chitu.cpuinfer_singleton import get_cpu_infer
 
 triton, has_triton = try_import_platform_dep("triton")
+from chitu.custom_gguf import get_ggml_quant_type
+from chitu.global_vars import get_global_args
 
-if has_triton:
+if has_triton and torch.cuda.is_available():
     from chitu.ops.triton_ops import silu_and_mul_triton
 
 
@@ -44,6 +47,40 @@ def silu_and_mul_torch(x: torch.Tensor):
         )
 
 
+def silu_and_mul_cpu(x: torch.Tensor):
+    import cpuinfer
+
+    if x.shape[-1] % 2 != 0:
+        raise ValueError(f"Last dimension must be even, got {x.shape[-1]}")
+    if x.device.type != "cpu":
+        raise ValueError(
+            f"silu_and_mul input tensor must be on CPU, got device: {x.device}"
+        )
+
+    input_size = x.shape[-1]
+    batch_size = x.numel() // input_size
+
+    if not x.is_contiguous():
+        x = x.contiguous()
+
+    output_shape = list(x.shape)
+    output_shape[-1] = output_shape[-1] // 2
+    output = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+
+    config = cpuinfer.silu_and_mul.SiluAndMulConfig(
+        input_size,
+        1024,
+        get_ggml_quant_type(x),
+    )
+    silu_and_mul = cpuinfer.silu_and_mul.SiluAndMul(config)
+    output = torch.zeros_like(x).contiguous()
+    cpu_infer = get_cpu_infer()
+    cpu_infer.submit(silu_and_mul.forward(batch_size, x.data_ptr(), output.data_ptr()))
+    cpu_infer.sync()
+
+    return output
+
+
 def silu_and_mul(x, impl="auto"):
     import chitu.muxi_utils as muxi_utils
 
@@ -54,10 +91,14 @@ def silu_and_mul(x, impl="auto"):
             # triton implementation fails for large amount of tokens on Muxi.
             # This happens on prefill stage for large input lengths. (FIXME)
             impl = "torch"
+        elif get_global_args().infer.op_impl == "cpu":
+            impl = "cpu"
         else:
             impl = "triton"
 
     if impl == "triton" and has_triton:
         return silu_and_mul_triton(x)
+    elif impl == "cpu":
+        return silu_and_mul_cpu(x)
     else:
         return silu_and_mul_torch(x)

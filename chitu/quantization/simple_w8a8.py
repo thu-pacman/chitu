@@ -6,7 +6,7 @@ import torch
 
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase
-from chitu.ops import w8a8_gemm_per_token_per_channel, a8_per_token_act_quant
+from chitu.ops.quant import w8a8_gemm_per_token_per_channel, a8_per_token_act_quant
 
 
 @QuantizationRegistry.register_linear("simple_w8a8")

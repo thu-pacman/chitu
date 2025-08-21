@@ -14,8 +14,6 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=DeepSeek-R1-Q4_K_M` command line argument when starting Chitu
 - DeepSeek-R1-bf16
   Usage: Append `models=DeepSeek-R1-bf16` command line argument when starting Chitu
-- DeepSeek-R1-bf16-mix-cpu
-  Usage: Append `models=DeepSeek-R1-bf16-mix-cpu` command line argument when starting Chitu
 - DeepSeek-R1-fp4-all
   Usage: Append `models=DeepSeek-R1-fp4-all` command line argument when starting Chitu
 - DeepSeek-R1-fp4-mix
@@ -108,8 +106,6 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=Qwen3-32B-FP8` command line argument when starting Chitu
 - Qwen3-32B-fp4
   Usage: Append `models=Qwen3-32B-fp4` command line argument when starting Chitu
-- Qwen3-32B-mix-cpu
-  Usage: Append `models=Qwen3-32B-mix-cpu` command line argument when starting Chitu
 - Qwen3-4B
   Usage: Append `models=Qwen3-4B` command line argument when starting Chitu
 - Qwen3-4B-fp4

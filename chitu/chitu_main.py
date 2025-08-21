@@ -8,6 +8,7 @@ import operator
 import os
 from logging import getLogger
 from typing import List
+import psutil
 
 import torch
 import torch.distributed
@@ -71,28 +72,27 @@ def init_logger(logging_level=logging.INFO):
 
 
 def init_cache_static():
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats(0)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(0)
 
 
-def get_additional_block_num(
-    total_gpu_memory, cache_manager, gpu_memory_utilization=0.98
-):
-    """Calculate additional block numbers based on available memory"""
+def get_additional_block_num(cache_manager, memory_utilization=0.98):
+    """
+    Calculate additional block numbers based on available memory.
+    Works on both CPU and GPU machines.
+
+    Args:
+        cache_manager: The cache manager object.
+        memory_utilization: Fraction of GPU/CPU memory to use (default: 0.98).
+
+    Returns:
+        Number of additional blocks that can be allocated.
+    """
 
     def tuple_product(t):
         return functools.reduce(operator.mul, t, 1)
 
-    peak_memory = torch.cuda.memory_stats(0)["allocated_bytes.all.peak"]
-    torch.cuda.empty_cache()
-    torch_allocated_bytes = torch.cuda.memory_stats(0)["allocated_bytes.all.current"]
-    total_allocated_bytes = (
-        torch.cuda.mem_get_info(0)[1] - torch.cuda.mem_get_info(0)[0]
-    )
-    non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
-    if non_torch_allocations > 0:
-        peak_memory += non_torch_allocations
-    additional_kv_cache_memory = total_gpu_memory * gpu_memory_utilization - peak_memory
     block_mem = (
         2
         * cache_manager.block_size
@@ -102,6 +102,28 @@ def get_additional_block_num(
     block_mem *= (1 if cache_manager.k_shape_per_sample is not None else 0) + (
         1 if cache_manager.v_shape_per_sample is not None else 0
     )
+
+    if get_global_args().infer.op_impl == "cpu":
+        process = psutil.Process(os.getpid())
+        current_process_mem = process.memory_info().vms
+        additional_memory = (
+            psutil.virtual_memory().total * memory_utilization - current_process_mem
+        )
+        num_blocks = int(additional_memory) // block_mem
+        return max(0, num_blocks)
+
+    _, total_memory = torch.cuda.mem_get_info(0)
+    peak_memory = torch.cuda.memory_stats(0)["allocated_bytes.all.peak"]
+    torch.cuda.empty_cache()
+    torch_allocated_bytes = torch.cuda.memory_stats(0)["allocated_bytes.all.current"]
+    total_allocated_bytes = (
+        torch.cuda.mem_get_info(0)[1] - torch.cuda.mem_get_info(0)[0]
+    )
+    non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
+    if non_torch_allocations > 0:
+        peak_memory += non_torch_allocations
+    additional_kv_cache_memory = total_memory * memory_utilization - peak_memory
+
     num_blocks = int(additional_kv_cache_memory) // block_mem
     return max(0, num_blocks)
 
@@ -109,12 +131,9 @@ def get_additional_block_num(
 def _auto_set_num_blocks_after_warmup(args):
     if args.infer.cache_type == "paged" and args.infer.num_blocks == -1:
         assert isinstance(Backend.cache_manager, PagedKVCacheManager)
-        _, total_gpu_memory = torch.cuda.mem_get_info(0)
-        gpu_memory_utilization = args.infer.gpu_memory_utilization
+        memory_utilization = args.infer.memory_utilization
         new_num_block = (
-            get_additional_block_num(
-                total_gpu_memory, Backend.cache_manager, gpu_memory_utilization
-            )
+            get_additional_block_num(Backend.cache_manager, memory_utilization)
             + Backend.cache_manager.num_blocks
         )
 

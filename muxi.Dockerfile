@@ -23,7 +23,7 @@ RUN if [ "${enable_cython}" != "true" ] && [ "${enable_cython}" != "false" ]; th
     echo "ARG enable_cython must either be 'true' or 'false'"; \
     exit 1; \
 fi
-RUN if [ "{enable_cython}" = "true" ] && [ "${enable_editable_install}" = "true" ]; then \
+RUN if [ "${enable_cython}" = "true" ] && [ "${enable_editable_install}" = "true" ]; then \
     echo "Cython is not supported when installing in editable mode"; \
     exit 1; \
 fi
@@ -41,7 +41,19 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
 RUN if [ "${enable_test}" = "true" ]; then \
-    apt update -y && apt install -y expect && \
+    printf '%s\n' \
+      "deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy main restricted universe multiverse" \
+      "deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy-updates main restricted universe multiverse" \
+      "deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy-backports main restricted universe multiverse" \
+      "deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy-security main restricted universe multiverse" \
+      > /etc/apt/sources.list; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates; \
+    update-ca-certificates; \
+    sed -i 's|http://mirrors.tuna.tsinghua.edu.cn|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends expect; \
+    rm -rf /var/lib/apt/lists/*; \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest; \
 fi
 

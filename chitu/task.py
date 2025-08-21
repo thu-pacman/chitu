@@ -318,7 +318,10 @@ class Task:
 
         # response related
         self.req = req
-        self.response = DeviceList([], dtype=torch.long, device="cuda")
+        if get_global_args().infer.op_impl == "cpu":
+            self.response = DeviceList([], dtype=torch.long, device="cpu")
+        else:
+            self.response = DeviceList([], dtype=torch.long, device="cuda")
         self.num_new_tokens: int = 0
         self.next_token: int = -1  # Only effective when num_new_tokens > 0
 
@@ -651,6 +654,9 @@ class PackedTasks(PackedTasksBase):
             self.payload_type = SerializedPackedTasksPayloadType.Empty
             return
         # metadata
+        self.rank = rank
+        if get_global_args().infer.op_impl == "cpu":
+            self.rank = "cpu"
         self.task_ids = task_ids
         self.num_tasks = len(task_ids)
         assert self.num_tasks > 0, "No tasks provided"
@@ -679,17 +685,17 @@ class PackedTasks(PackedTasksBase):
         self.is_all_greedy = all(task.req.params.top_k <= 1 for task in self.tasks)
         self.temperatures = torch.tensor(
             [task.req.params.temperature for task in self.tasks]
-        ).to(device=rank, non_blocking=True)
+        ).to(device=self.rank, non_blocking=True)
         self.top_ps = torch.tensor([task.req.params.top_p for task in self.tasks]).to(
-            device=rank, non_blocking=True
+            device=self.rank, non_blocking=True
         )
         self.top_ks = torch.tensor([task.req.params.top_k for task in self.tasks]).to(
-            device=rank, non_blocking=True
+            device=self.rank, non_blocking=True
         )
         self.frequency_penalties = torch.tensor(
             [task.req.params.frequency_penalty for task in self.tasks],
             dtype=torch.float32,
-        ).to(device=rank, non_blocking=True)
+        ).to(device=self.rank, non_blocking=True)
         self.should_apply_frequency_penalty = any(
             task.req.params.frequency_penalty > 0 for task in self.tasks
         )
@@ -698,17 +704,19 @@ class PackedTasks(PackedTasksBase):
         self.return_logprobs = any(task.req.logprobs for task in self.tasks)
 
         self.response_len = torch.tensor(
-            [len(task.response) for task in self.tasks], dtype=torch.int, device=rank
+            [len(task.response) for task in self.tasks],
+            dtype=torch.int,
+            device=self.rank,
         )
         self.response_capacity = torch.tensor(
             [len(task.response._data) for task in self.tasks],
             dtype=torch.int,
-            device=rank,
+            device=self.rank,
         )
         self.response_ptr = torch.tensor(
             [task.response._data.data_ptr() for task in self.tasks],
             dtype=torch.long,
-            device=rank,
+            device=self.rank,
         )
 
         # test only

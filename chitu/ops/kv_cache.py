@@ -6,10 +6,11 @@ from typing import Optional
 import torch
 
 from chitu.utils import try_import_platform_dep
+from chitu.global_vars import get_global_args
 
 triton, has_triton = try_import_platform_dep("triton")
 
-if has_triton:
+if has_triton and torch.cuda.is_available():
     from chitu.ops.triton_ops import (
         append_to_paged_kv_cache_triton,
         append_to_dense_kv_cache_triton,
@@ -25,7 +26,9 @@ def append_to_paged_kv_cache(
     impl: str = "auto",
 ):
     if impl == "auto":
-        if has_triton:
+        if get_global_args().infer.op_impl == "cpu":
+            impl = "cpu"
+        elif has_triton:
             impl = "triton"
         else:
             impl = "torch"

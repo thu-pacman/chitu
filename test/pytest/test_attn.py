@@ -37,6 +37,7 @@ def test_triton_mla_decode_paged_kv(
                     "max_reqs": 4,
                     "use_cuda_graph": False,
                     "tp_size": 1,
+                    "op_impl": "torch",
                     "cache_type": "paged",
                 },
                 "models": {
@@ -114,6 +115,7 @@ def test_prefill_ragged_qkvo(bs, n_heads, n_kv_heads, qk_head_dim, v_head_dim, i
                 "infer": {
                     "mla_absorb": None,
                     "max_reqs": 4,
+                    "op_impl": "torch",
                     "use_cuda_graph": False,
                     "tp_size": 1,
                     "cache_type": "paged",
@@ -191,6 +193,7 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
             {
                 "infer": {
                     "mla_absorb": None,
+                    "op_impl": "torch",
                     "max_reqs": 4,
                     "use_cuda_graph": False,
                     "tp_size": 1,
@@ -287,6 +290,7 @@ def test_decode_paged_kv(
             {
                 "infer": {
                     "mla_absorb": None,
+                    "op_impl": "torch",
                     "max_reqs": 4,
                     "use_cuda_graph": True if impl == "flashinfer" else False,
                     "tp_size": 1,
@@ -424,6 +428,7 @@ def benchmark_prefill_ragged_qkvo(
                 {
                     "infer": {
                         "mla_absorb": None,
+                        "op_impl": "torch",
                         "max_reqs": 4,
                         "use_cuda_graph": False,
                         "tp_size": 1,
@@ -523,6 +528,7 @@ def benchmark_mla_decode_paged_kv(
                 {
                     "infer": {
                         "mla_absorb": "absorb-without-precomp",
+                        "op_impl": "torch",
                         "max_reqs": bs,
                         "use_cuda_graph": False,
                         "tp_size": 1,

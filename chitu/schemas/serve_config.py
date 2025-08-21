@@ -44,14 +44,13 @@ class InferConfig:
     num_blocks: int = MISSING
     bind_process_to_cpu: str = MISSING
     bind_thread_to_cpu: str = MISSING
-    gpu_memory_utilization: float = MISSING
+    memory_utilization: float = MISSING
 
     @dataclass
     class MoEConfig:
         prefill_token_dispatcher: str = MISSING
         decode_token_dispatcher: str = MISSING
-        prefill_experts_impl: str = MISSING
-        decode_experts_impl: str = MISSING
+        deepep_use_fp8: bool = MISSING
 
     moe: MoEConfig = MISSING
 

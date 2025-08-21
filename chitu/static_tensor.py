@@ -59,6 +59,8 @@ class StaticTensor:
             else:
                 pin_memory = tensor.is_pinned()
 
+        if not torch.cuda.is_available():
+            pin_memory = False
         self._buffer = torch.empty(
             max_nelem, dtype=dtype, device=device, pin_memory=pin_memory
         )

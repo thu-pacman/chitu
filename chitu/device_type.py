@@ -10,7 +10,10 @@ _device_name = None
 def get_device_name():
     global _device_name
     if _device_name is None:
-        _device_name = torch.cuda.get_device_name()
+        if torch.cuda.is_available():
+            _device_name = torch.cuda.get_device_name()
+        else:
+            _device_name = "CPU"
     return _device_name
 
 

@@ -54,11 +54,7 @@ class ServeConfigRules(Callback):
         model_name = config.models.name
         model_type = config.models.type
         if attn_type == "flash_infer":
-            if (
-                "deepseek-v3" in model_type
-                or config.models.n_heads // config.models.n_kv_heads
-                not in [1, 2, 3, 4, 8]
-            ):
+            if config.models.n_heads // config.models.n_kv_heads not in [1, 2, 3, 4, 8]:
                 self._exit_with_error(
                     f"model {model_name} is not compatible with flash_infer"
                 )
@@ -78,9 +74,9 @@ class ServeConfigRules(Callback):
             )
 
         op_impl = config.infer.op_impl
-        if op_impl not in {"torch", "muxi_custom_kernel"}:
+        if op_impl not in {"torch", "muxi_custom_kernel", "cpu"}:
             self._exit_with_error(
-                f"op_impl must be one of [torch, muxi_custom_kernel], got {op_impl}"
+                f"op_impl must be one of [torch, muxi_custom_kernel, cpu], got {op_impl}"
             )
 
         bind_process_to_cpu = config.infer.bind_process_to_cpu
