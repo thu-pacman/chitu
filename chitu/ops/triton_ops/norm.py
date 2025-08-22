@@ -2,17 +2,22 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 from chitu.ops.triton_ops.utils import auto_retry_triton_compilation, to_triton_dtype
 from chitu.device_type import is_muxi
-import os
+from chitu.ops.utils import compatible_with_inplace
 
 
+@compatible_with_inplace
 @auto_retry_triton_compilation
-def rms_norm_triton(X: torch.Tensor, W: torch.Tensor, eps, compute_dtype):
+def rms_norm_triton(
+    X: torch.Tensor, W: torch.Tensor, *, eps, compute_dtype: torch.dtype
+):
     out = torch.empty_like(X)
 
     X_shape = X.shape

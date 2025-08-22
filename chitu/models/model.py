@@ -92,7 +92,14 @@ class RMSNorm(nn.Module):
         if compute_dtype is None:
             compute_dtype = torch.float32
 
-        return rms_norm(x, self.weight, self.eps, out, compute_dtype, impl)
+        return rms_norm(
+            x,
+            self.weight,
+            eps=self.eps,
+            out=out,
+            compute_dtype=compute_dtype,
+            impl=impl,
+        )
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device=None):

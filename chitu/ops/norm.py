@@ -2,13 +2,16 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 
-from chitu.utils import try_import_platform_dep
+from chitu.utils import try_import_platform_dep, try_import_opt_dep
 from chitu.global_vars import get_global_args
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import get_ggml_quant_type
+from chitu.ops.utils import compatible_with_inplace
 from chitu.muxi_utils import (
     has_tbsgemm,
     tbsgemm,
@@ -19,11 +22,11 @@ if has_triton and torch.cuda.is_available():
     from chitu.ops.triton_ops import rms_norm_triton
 torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
 
-def rms_norm_cpu(X: torch.Tensor, W: torch.Tensor, eps=1e-6, compute_dtype=None):
-    import cpuinfer
-
+@compatible_with_inplace
+def rms_norm_cpu(X: torch.Tensor, W: torch.Tensor, *, eps, compute_dtype: torch.dtype):
     if X.device.type != "cpu":
         raise ValueError(
             f"rms_norm input tensor must be on CPU, got device: {X.device}"
@@ -61,19 +64,89 @@ def rms_norm_cpu(X: torch.Tensor, W: torch.Tensor, eps=1e-6, compute_dtype=None)
     return output
 
 
-def ref_norm(x, weight, eps, compute_dtype):
+@compatible_with_inplace
+def rms_norm_ref(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps,
+    compute_dtype: torch.dtype,
+):
     dtype = x.dtype
     x = x.to(compute_dtype)
     y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
     return y.to(dtype) * weight
 
 
+@compatible_with_inplace
+def rms_norm_torch(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps,
+    compute_dtype: torch.dtype,
+):
+    dtype = x.dtype
+    return F.rms_norm(x.to(compute_dtype), (weight.numel(),), weight, eps).to(dtype)
+
+
+@compatible_with_inplace
+def rms_norm_npu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps,
+    compute_dtype: torch.dtype,
+):
+    dtype = x.dtype
+    if weight.dtype != dtype:
+        weight.data = weight.data.to(dtype)
+    return torch_npu.npu_rms_norm(x, weight, epsilon=eps)[0].to(dtype)
+
+
+def rms_norm_cuda(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+    eps,
+    compute_dtype: torch.dtype,
+):
+    # Currently, this kernel always raise to float32 to compute
+    x_shape = x.shape
+    x = x.view(-1, x.shape[-1])
+    if out is not None:
+        out = out.view(-1, out.shape[-1])
+    # if torch.distributed.get_rank() == 0:
+    #    import pdb
+
+    #    pdb.set_trace()
+    # torch.distributed.barrier()
+    out = chitu_backend.cuda_rms_norm(x, weight, eps=eps, out=out)
+    return out.view(x_shape)
+
+
+@compatible_with_inplace
+def rms_norm_muxi(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps,
+    compute_dtype: torch.dtype,
+):
+    # Currently, this kernel always raise to float32 to compute
+    assert eps == 1e-6
+    assert x.dtype == torch.float16
+    return tbsgemm.norm(x, weight)
+
+
 def rms_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
     eps,
-    out: torch.Tensor = None,
-    compute_dtype=None,
+    compute_dtype: torch.dtype,
     impl: str = "auto",
 ):
     if impl == "auto":
@@ -93,44 +166,18 @@ def rms_norm(
             impl = "ref"
 
     if impl == "triton":
-        assert out is None
-        return rms_norm_triton(x, weight, eps, compute_dtype=compute_dtype)
+        return rms_norm_triton(x, weight, out=out, eps=eps, compute_dtype=compute_dtype)
     elif impl == "cpu":
-        return rms_norm_cpu(x, weight, eps, compute_dtype)
+        return rms_norm_cpu(x, weight, out=out, eps=eps, compute_dtype=compute_dtype)
     elif impl == "cuda":
-        # Currently, this kernel always raise to float32 to compute
-        return chitu_backend.cuda_rms_norm(x, weight, eps=eps, out=out)
+        return rms_norm_cuda(x, weight, out=out, eps=eps, compute_dtype=compute_dtype)
     elif impl == "muxi_w8a8_kernels":
-        assert out is None
-        assert eps == 1e-6
-        assert x.dtype == torch.float16
-        return tbsgemm.norm(x, weight)
+        return rms_norm_muxi(x, weight, out=out, eps=eps, compute_dtype=compute_dtype)
     elif impl == "torch_npu":
-        dtype = x.dtype
-        if weight.dtype != dtype:
-            weight.data = weight.data.to(dtype)
-        tmp_out = torch_npu.npu_rms_norm(x, weight, epsilon=eps)[0].to(dtype)
-        if out is not None:
-            out.copy_(tmp_out)
-        else:
-            out = tmp_out
-        return out
+        return rms_norm_npu(x, weight, out=out, eps=eps, compute_dtype=compute_dtype)
     elif impl == "torch":
-        dtype = x.dtype
-        tmp_out = F.rms_norm(x.to(compute_dtype), (weight.numel(),), weight, eps).to(
-            dtype
-        )
-        if out is not None:
-            out.copy_(tmp_out)
-        else:
-            out = tmp_out
-        return out
+        return rms_norm_torch(x, weight, out=out, eps=eps, compute_dtype=compute_dtype)
     elif impl == "ref":
-        tmp_out = ref_norm(x, weight, eps, compute_dtype)
-        if out is not None:
-            out.copy_(tmp_out)
-        else:
-            out = tmp_out
-        return out
+        return rms_norm_ref(x, weight, out=out, eps=eps, compute_dtype=compute_dtype)
     else:
         raise ValueError(f"Invalid RMSNorm implementation: {impl}")
