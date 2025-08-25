@@ -25,14 +25,12 @@ import numpy as np
 
 
 def save_result(data_list, filename="data.json"):
-    with open(filename, "w", encoding="utf-8") as file:
-        json.dump(data_list, file, ensure_ascii=False, indent=4)
+    torch.save(data_list, filename)
 
 
 def load_result(filename="data.json"):
     try:
-        with open(filename, "r", encoding="utf-8") as file:
-            data_list = json.load(file)
+        data_list = torch.load(filename)
         return data_list
     except FileNotFoundError:
         print(f"文件 {filename} 不存在，无法读取数据。")
@@ -66,29 +64,32 @@ def check_result(
             continue
         logit_cnt += num_logits
 
-        for logit_it in range(min(len(result_0["logits"]), len(result_1["logits"]))):
-            logit0 = np.array(result_0["logits"][logit_it])
-            logit1 = np.array(result_1["logits"][logit_it])
+        logit0 = result_0["logits"][:num_logits]
+        logit1 = result_1["logits"][:num_logits]
 
-            dp = np.dot(logit0, logit1)
-            norm0 = np.linalg.norm(logit0)
-            norm1 = np.linalg.norm(logit1)
+        dp = torch.sum(logit0.float() * logit1.float(), dim=-1)
+        norm = torch.norm(logit0.float(), p=2, dim=-1) * torch.norm(
+            logit1.float(), p=2, dim=-1
+        )
+        mask = norm != 0
+        cos_sim = torch.where(mask, dp / norm, 0.0)
 
-            cos_sim = dp / (norm0 * norm1) if norm0 != 0 and norm1 != 0 else 0.0
+        min_val, min_idx = list(map(lambda x: x.item(), torch.min(cos_sim, dim=0)))
+        if min_val < min_cos_sim:
+            min_cos_sim = min_val
+            min_cos_sim_logit_it = min_idx
+            min_cos_sim_result_it = result_it
 
-            tot_cos_sim += cos_sim
-            if cos_sim < min_cos_sim:
-                min_cos_sim = cos_sim
-                min_cos_sim_result_it = result_it
-                min_cos_sim_logit_it = logit_it
+        assert (
+            min_val >= threshold
+        ), f"cosine similarity difference in result {result_it}:: logit {min_idx}, min_cos_sim: {min_val}, threshold: {threshold}"
 
-            assert (
-                cos_sim >= threshold
-            ), f"cosine similarity difference in result {result_it}:: logit {logit_it}; cos_sim: {cos_sim}, threshold: {threshold}"
+        tot_cos_sim += torch.sum(cos_sim).item()
 
-    avg_cos_sim = tot_cos_sim / logit_cnt if logit_cnt > 0 else 0.0
     if min_cos_sim == float("inf"):
         min_cos_sim = 0.0
+
+    avg_cos_sim = tot_cos_sim / logit_cnt if logit_cnt > 0 else 0.0
 
     return (avg_cos_sim, min_cos_sim, min_cos_sim_result_it, min_cos_sim_logit_it)
 
@@ -204,8 +205,8 @@ def run_pipe_or_tensor_parallelism(args, timers, history_result):
     if rank == 0:
         for it in range(len(result_prompt)):
             prompt = result_prompt[it]
-            logits = result_logits[it]
-            tokens = result_tokens[it]
+            logits = torch.tensor(result_logits[it])
+            tokens = torch.tensor(result_tokens[it])
             result.append({"prompt": prompt, "logits": logits, "tokens": tokens})
     return result
 
@@ -247,8 +248,8 @@ def run_normal(args, timers, history_result):
 
     for it in range(len(result_prompt)):
         prompt = result_prompt[it]
-        logits = result_logits[it]
-        tokens = result_tokens[it]
+        logits = torch.tensor(result_logits[it])
+        tokens = torch.tensor(result_tokens[it])
         result.append({"prompt": prompt, "logits": logits, "tokens": tokens})
     return result
 

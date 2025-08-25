@@ -211,7 +211,6 @@ class UserRequest:
 
     def _test_add_logit(self, logit):
         logit = logit.tolist()
-        # logit = logit[0: 9]
         self._test_logits.append(logit)
         # logger.warning(f"add logit {logit}")
 
@@ -371,8 +370,12 @@ class Task:
     def update_response_sync(self, token: int):
         # TODO: modify if generate more than one token at a time
         assert token is not None
-        self.num_new_tokens += 1
         self.next_token = token
+        if (self.req._test_standard_tokens is not None) and (
+            self.num_new_tokens < len(self.req._test_standard_tokens)
+        ):
+            self.next_token = self.req._test_standard_tokens[self.num_new_tokens]
+        self.num_new_tokens += 1
         self.prefix_length += 1  # not use
 
     def wait(self, handle):

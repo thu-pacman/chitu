@@ -267,7 +267,7 @@ class AttentionDeepSeekV3(Attention):
                 f"MLA absorb mode {self.mla_absorb} not supported"
             )
 
-    def prefill_forward(
+    def forward(
         self,
         x: torch.Tensor,
         freqs_cis_cos: torch.Tensor,
@@ -277,7 +277,7 @@ class AttentionDeepSeekV3(Attention):
 
         if self.mla_absorb == "none":
             q, k, v = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
-            x = self.attn_backend.prefill(
+            x = self.attn_backend(
                 q,
                 self.cache.get_accessor(self.layer_id),
                 k,
@@ -289,24 +289,25 @@ class AttentionDeepSeekV3(Attention):
 
         elif self.mla_absorb == "absorb-without-precomp" or self.mla_absorb == "absorb":
             q_nope, q_pe, kv = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
+            q_nope = q_nope.view(bs_seq, self.n_local_heads, -1)
+            q_pe = q_pe.view(bs_seq, self.n_local_heads, -1)
+            kv = kv.view(bs_seq, 1, -1)
 
-            kv_cache = kv[:, : self.kv_lora_rank]
+            this_kv = kv[..., : self.kv_lora_rank]
 
-            # In-place update to `kv_cache`, which is part of `kv`
-            self.kv_a_layernorm(kv_cache, compute_dtype=kv.dtype, out=kv_cache)
+            # In-place update to `this_kv`, which is part of `kv`
+            self.kv_a_layernorm(this_kv, compute_dtype=kv.dtype, out=this_kv)
 
-            q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
-            x = self.attn_backend.prefill(
-                q_nope_pe.view(-1, q_nope_pe.shape[-2], q_nope_pe.shape[-1]),
+            x = self.attn_backend.mla(
+                q_nope,
+                q_pe,
                 self.cache.get_accessor(self.layer_id),
-                kv.view(-1, 1, kv.shape[-1]),
-                kv_cache.view(-1, 1, kv_cache.shape[-1]),
+                kv,
                 seq_len_delta=self.cache.seq_len_delta,
                 causal=True,
                 softmax_scale=self.softmax_scale,
             )
 
-            x = x.view(bs_seq, x.shape[-2], x.shape[-1])
             if self.mla_absorb == "absorb-without-precomp":
                 x = self.kv_b_proj_absorb_2(x)
 
@@ -316,59 +317,6 @@ class AttentionDeepSeekV3(Attention):
             )
 
         return self.o_proj(x.flatten(-2)).view(bs_seq, -1)
-
-    def decode_forward(
-        self, x: torch.Tensor, freqs_cis_cos: torch.Tensor, freqs_cis_sin: torch.Tensor
-    ):
-        bsz, _ = x.size()
-
-        if self.mla_absorb == "none":
-            q, k, v = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
-            q = q.view(bsz, self.n_local_heads, -1)
-            k = k.view(bsz, self.n_local_heads, -1)
-            v = v.view(bsz, self.n_local_heads, -1)
-
-            x = self.attn_backend.decode(
-                q,
-                self.cache.get_accessor(self.layer_id),
-                k,
-                v,
-                seq_len_delta=self.cache.seq_len_delta,
-                softmax_scale=self.softmax_scale,
-            ).view(bsz, self.n_local_heads, self.v_head_dim)
-
-        elif self.mla_absorb == "absorb-without-precomp" or self.mla_absorb == "absorb":
-            q_nope, q_pe, kv = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
-
-            this_kv = kv[..., : self.kv_lora_rank]
-
-            # In-place update to `this_kv`, which is part of `kv`
-            self.kv_a_layernorm(this_kv, compute_dtype=kv.dtype, out=this_kv)
-
-            x = self.attn_backend.mla_decode(
-                q_nope,
-                q_pe,
-                self.cache.get_accessor(self.layer_id),
-                kv.view(bsz, 1, -1),
-                seq_len_delta=self.cache.seq_len_delta,
-                softmax_scale=self.softmax_scale,
-            )
-
-            if self.mla_absorb == "absorb-without-precomp":
-                x = self.kv_b_proj_absorb_2(x)
-
-        else:
-            raise NotImplementedError(
-                f"MLA absorb mode {self.mla_absorb} not supported"
-            )
-
-        return self.o_proj(x.flatten(-2)).view(bsz, -1)
-
-    def forward(self, x, freqs_cis_cos, freqs_cis_sin):
-        if self.cache.seq_len_delta.is_classic_decoding:
-            return self.decode_forward(x, freqs_cis_cos, freqs_cis_sin)
-        else:
-            return self.prefill_forward(x, freqs_cis_cos, freqs_cis_sin)
 
 
 class MLPDeepSeekV3(nn.Module):

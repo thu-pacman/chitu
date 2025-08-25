@@ -92,7 +92,14 @@ class RMSNorm(nn.Module):
         if compute_dtype is None:
             compute_dtype = torch.float32
 
-        return rms_norm(x, self.weight, self.eps, out, compute_dtype, impl)
+        return rms_norm(
+            x,
+            self.weight,
+            eps=self.eps,
+            out=out,
+            compute_dtype=compute_dtype,
+            impl=impl,
+        )
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device=None):
@@ -225,10 +232,6 @@ class Transformer(nn.Module):
         self.max_batch_size = self.args.infer.max_reqs
         self.model_type = self.args.models.type
         self.use_cuda_graph = self.args.infer.use_cuda_graph
-        if self.use_cuda_graph and is_ascend() and self.model_type == "deepseek-v3":
-            raise NotImplementedError(
-                "Graph capturing is not yet implemented for deepseek models on Ascend NPU"
-            )
 
         if hasattr(self.params, "n_routed_experts"):
             n_routed_experts = self.params.n_routed_experts

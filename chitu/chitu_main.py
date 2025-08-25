@@ -15,7 +15,7 @@ import torch.distributed
 
 from chitu.backend import Backend, BackendState
 from chitu.cache_manager import PagedKVCacheManager
-from chitu.device_type import is_nvidia
+from chitu.device_type import is_nvidia, is_ascend
 from chitu.executor import Executor
 from chitu.global_vars import (
     get_global_args,
@@ -187,7 +187,7 @@ def _warmup_via_taskpool(args):
             )
             task = Task(f"{req.request_id}", req, stop_with_eos=False)
             TaskPool.add(task)
-            logger.warning(f"Added {num_warmup_reqs} warmup requests to TaskPool")
+        logger.warning(f"Added {num_warmup_reqs} warmup requests to TaskPool")
 
     if rank > 0:
         chitu_run()  # An extra run is needed because our implementation is asymmetric
@@ -321,7 +321,7 @@ def chitu_init(args, logging_level=None):
         )
         args.float_16bit_variant = args.dtype
 
-    if args.infer.attn_type == "npu":
+    if is_ascend():
         try:
             import torch_npu
             from torch_npu.contrib import transfer_to_npu
@@ -335,6 +335,7 @@ def chitu_init(args, logging_level=None):
         site_packages_path = get_ascend_custom_opp_path()
         os.environ["ASCEND_CUSTOM_OPP_PATH"] = site_packages_path
 
+    if args.infer.attn_type == "npu":
         # Bind process to CPU NUMA
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
