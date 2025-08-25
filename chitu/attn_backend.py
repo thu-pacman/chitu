@@ -32,7 +32,7 @@ from chitu.cache_manager import (
     PagedKVCacheAccessor,
     DenseKVCacheAccessor,
 )
-from chitu.utils import try_import_opt_dep, try_import_platform_dep
+from chitu.utils import pad_tensor, try_import_opt_dep, try_import_platform_dep
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
@@ -1640,22 +1640,6 @@ class FlashInferBackend(TritonAttnBackend):
 
         return self.fixed_bs[index]
 
-    def pad_tensor(self, x, target_size, dim=0, value=0):
-        current_size = x.size(dim)
-        assert current_size <= target_size
-
-        if current_size == target_size:
-            return x
-
-        pad_size = target_size - current_size
-        pad_pattern = [0] * (x.dim() * 2)
-        pad_idx = (x.dim() - dim - 1) * 2 + 1
-        pad_pattern[pad_idx] = pad_size
-
-        padded_x = torch.nn.functional.pad(x, pad_pattern, mode="constant", value=value)
-
-        return padded_x
-
     def prepare_metadata_for_decode(
         self,
         seq_len_delta: BatchedSeqLenDelta,
@@ -1667,10 +1651,10 @@ class FlashInferBackend(TritonAttnBackend):
     ):
         raw_batch_size = seq_len_delta.batch_size
         batch_size = self.match_batch_size(raw_batch_size)
-        next_seq_len_tensor_device = self.pad_tensor(
+        next_seq_len_tensor_device = pad_tensor(
             seq_len_delta.new.lens_tensor_device, batch_size
         )
-        block_table = self.pad_tensor(block_table, batch_size)
+        block_table = pad_tensor(block_table, batch_size)
         self.q_indptr.set(torch.arange(0, batch_size + 1).cuda().to(torch.int32))
         kv_indptr_list = []
         kv_indices_list = []
@@ -1929,7 +1913,7 @@ class FlashInferBackend(TritonAttnBackend):
                 seq_len_delta.old.lens_tensor_device,
             )
 
-        q = self.pad_tensor(q, batch_size)
+        q = pad_tensor(q, batch_size)
         o = self.decode_wrapper[batch_size].run(
             q.view(-1, q.shape[-2], q.shape[-1]), (kv_cache.k, kv_cache.v)
         )

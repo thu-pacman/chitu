@@ -414,8 +414,27 @@ class Executor:
                 Backend.cache_manager.finalize_cache_all_decode(rid)
             return None
 
-        if self.moe_impl is not None:
-            self.moe_impl.prepare(tasks.task_type.to_str(), tasks.num_tokens)
+        if self.dp_size > 1 and self.use_cuda_graph:
+            if tasks.task_type in [TaskType.Decode, TaskType.EmptyDecode]:
+                num_tokens_tensor = torch.tensor([tasks.num_tokens], device="cpu")
+                dp_group_cpu = get_dp_group().cpu_group
+                torch.distributed.all_reduce(
+                    num_tokens_tensor,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=dp_group_cpu,
+                )
+                max_num_tokens = num_tokens_tensor.item()
+
+            if self.moe_impl is not None:
+                if tasks.task_type == TaskType.Decode:
+                    self.moe_impl.prepare(tasks.task_type.to_str(), max_num_tokens)
+                elif tasks.task_type == TaskType.EmptyDecode:
+                    self.moe_impl.prepare(tasks.task_type.to_str(), 0)
+                else:
+                    self.moe_impl.prepare(tasks.task_type.to_str(), tasks.num_tokens)
+        else:
+            if self.moe_impl is not None:
+                self.moe_impl.prepare(tasks.task_type.to_str(), tasks.num_tokens)
 
         # 2. prefill/decode step
         if tasks.task_type == TaskType.Prefill:
@@ -641,6 +660,12 @@ class Executor:
             payload = dispatcher.recv_payload(self.dummy_input)
 
         if self.use_cuda_graph:
+            if self.dp_size > 1:
+                bs_tensor = torch.tensor([0], device="cpu")
+                dp_group_cpu = get_dp_group().cpu_group
+                torch.distributed.all_reduce(
+                    bs_tensor, op=torch.distributed.ReduceOp.MAX, group=dp_group_cpu
+                )
             if self.empty_decode_step_graph is None:
                 self.empty_decode_step_graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(self.empty_decode_step_graph):
