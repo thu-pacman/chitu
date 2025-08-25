@@ -307,7 +307,6 @@ class AttentionDeepSeekV3(Attention):
                 causal=True,
                 softmax_scale=self.softmax_scale,
             )
-            assert x.shape == (bs_seq, self.n_local_heads, self.kv_lora_rank)
 
             if self.mla_absorb == "absorb-without-precomp":
                 x = self.kv_b_proj_absorb_2(x)

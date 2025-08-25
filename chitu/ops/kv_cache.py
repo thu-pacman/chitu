@@ -16,6 +16,8 @@ if has_triton and torch.cuda.is_available():
         append_to_dense_kv_cache_triton,
     )
 
+torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
+
 
 def append_to_paged_kv_cache(
     kv_cache: torch.Tensor,  # (num_pages, page_size, other contiguous dims...)
@@ -55,15 +57,16 @@ def append_to_dense_kv_cache(
             impl = "triton"
         else:
             impl = "torch"
-
     if impl == "triton" and has_triton:
         append_to_dense_kv_cache_triton(
             kv_cache, this_kv, delta_position_ids, delta_seq_ids
         )
-    else:
+    elif impl == "torch":
         append_to_dense_kv_cache_torch(
             kv_cache, this_kv, delta_position_ids, delta_seq_ids
         )
+    elif impl == "torch_npu" and has_torch_npu:
+        torch_npu.scatter_update_(kv_cache, delta_position_ids, this_kv, 1)
 
 
 def append_to_paged_kv_cache_torch(

@@ -17,6 +17,7 @@ import bisect
 import functools
 import math
 from logging import getLogger
+import os
 import packaging.version
 import torch
 import einops
@@ -2153,43 +2154,58 @@ class NpuAttnBackend(RefAttnBackend):
         k = k.unsqueeze(1) if k is not None else None
         v = v.unsqueeze(1) if v is not None else None
 
-        torch_npu.scatter_update_(
-            kv_cache.k, seq_len_delta.old.lens_tensor_device, k, 1
+        scale_to_use = float(softmax_scale) if softmax_scale is not None else self.scale
+        # update kv cache
+        append_to_dense_kv_cache(
+            kv_cache.k,
+            k.contiguous(),
+            seq_len_delta.old.lens_tensor_device,
+            None,
+            impl=("torch" if self.args.models.type == "deepseek-v3" else "torch_npu"),
         )
-        torch_npu.scatter_update_(
-            kv_cache.v, seq_len_delta.old.lens_tensor_device, v, 1
+        append_to_dense_kv_cache(
+            kv_cache.v,
+            v.contiguous(),
+            seq_len_delta.old.lens_tensor_device,
+            None,
+            impl=("torch" if self.args.models.type == "deepseek-v3" else "torch_npu"),
         )
 
-        output = torch.empty_like(q)
-        if hasattr(cinfer_ascendc, "grouped_query_attention") and q.shape[0] <= 8:
+        if hasattr(cinfer_ascendc, "grouped_query_attention") and (
+            self.args.models.type == "deepseek-v3" or q.shape[0] <= 8
+        ):
+            output = torch.empty(
+                (q.shape[0], 1, q.shape[2], kv_cache.v.shape[-1]),
+                dtype=q.dtype,
+                device=q.device,
+            )
             cinfer_ascendc.grouped_query_attention(
-                q,
-                kv_cache.k,
-                kv_cache.v,
+                q.contiguous(),
+                kv_cache.k.contiguous(),
+                kv_cache.v.contiguous(),
                 seq_len_delta.new.lens_tensor_device,
                 output,
                 q.shape[0],
                 "BSND",
-                self.scale,
+                scale_to_use,
             )
+
+            return output
         else:
+            output = torch.empty_like(q)
             lse = torch.empty(1, dtype=q.dtype, device="npu")
             torch_npu.npu_fused_infer_attention_score.out(
-                q,
-                kv_cache.k,
-                kv_cache.v,
+                q.contiguous(),
+                kv_cache.k.contiguous(),
+                kv_cache.v.contiguous(),
                 input_layout="BSND",
                 actual_seq_lengths_kv=seq_len_delta.new.lens_list,
-                scale=self.scale,
+                scale=scale_to_use,
                 num_heads=self.local_n_heads,
                 num_key_value_heads=self.local_n_kv_heads,
                 out=[output, lse],
             )
-
-        # Legacy shape change. TODO: Remve this
-        output = output.squeeze(1)
-
-        return output
+            return output
 
     @override
     def decode_paged_kv(
@@ -2225,6 +2241,8 @@ class NpuAttnBackend(RefAttnBackend):
         kv_cache.k[self.slot_mapping.get()] = k
         kv_cache.v[self.slot_mapping.get()] = v
 
+        scale_to_use = float(softmax_scale) if softmax_scale is not None else self.scale
+
         output = torch.empty_like(q)
         lse = torch.empty(1, dtype=q.dtype, device="npu")
         torch_npu.npu_fused_infer_attention_score.out(
@@ -2235,14 +2253,11 @@ class NpuAttnBackend(RefAttnBackend):
             block_size=128,
             block_table=kv_cache.block_table,
             actual_seq_lengths_kv=seq_len_delta.new.lens_list,
-            scale=self.scale,
+            scale=scale_to_use,
             num_heads=self.local_n_heads,
             num_key_value_heads=self.local_n_kv_heads,
             out=[output, lse],
         )
-
-        # Legacy shape change. TODO: Remve this
-        output = output.squeeze(1)
 
         return output
 
