@@ -212,6 +212,23 @@ def is_power_of_two(n: int) -> bool:
     return (n != 0) and (n & (n - 1)) == 0
 
 
+def pad_tensor(x, target_size, dim=0, value=0):
+    current_size = x.size(dim)
+    assert current_size <= target_size
+
+    if current_size == target_size:
+        return x
+
+    pad_size = target_size - current_size
+    pad_pattern = [0] * (x.dim() * 2)
+    pad_idx = (x.dim() - dim - 1) * 2 + 1
+    pad_pattern[pad_idx] = pad_size
+
+    padded_x = torch.nn.functional.pad(x, pad_pattern, mode="constant", value=value)
+
+    return padded_x
+
+
 class DataSaver:
     """数据保存装饰器类"""
 

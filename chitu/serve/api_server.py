@@ -140,9 +140,15 @@ async def create_chat_completion(
                 status_code=400,
                 detail="enable_thinking must be a boolean value",
             )
-        chat_template_kwargs["enable_thinking"] = chat_template_kwargs_unsafe[
-            "enable_thinking"
-        ]
+        if get_global_args().models.name == "DeepSeek-V3.1":
+            # DeepSeek-V3.1 tokenizer uses `thinking` instead of `enable_thinking`
+            chat_template_kwargs["thinking"] = chat_template_kwargs_unsafe[
+                "enable_thinking"
+            ]
+        else:
+            chat_template_kwargs["enable_thinking"] = chat_template_kwargs_unsafe[
+                "enable_thinking"
+            ]
 
     try:
         req = UserRequest(

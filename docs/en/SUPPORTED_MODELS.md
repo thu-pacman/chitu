@@ -20,6 +20,8 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=DeepSeek-R1-fp4-mix` command line argument when starting Chitu
 - DeepSeek-V3
   Usage: Append `models=DeepSeek-V3` command line argument when starting Chitu
+- DeepSeek-V3.1
+  Usage: Append `models=DeepSeek-V3.1` command line argument when starting Chitu
 - GLM-4-32B-0414
   Usage: Append `models=GLM-4-32B-0414` command line argument when starting Chitu
 - GLM-4-9B-0414
@@ -124,6 +126,8 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=Qwen3-Coder-480B-A35B-Instruct` command line argument when starting Chitu
 - Qwen3-Coder-480B-A35B-Instruct-fp8
   Usage: Append `models=Qwen3-Coder-480B-A35B-Instruct-fp8` command line argument when starting Chitu
+- Seed-OSS-36B-Instruct
+  Usage: Append `models=Seed-OSS-36B-Instruct` command line argument when starting Chitu
 - glm-4-9b-chat
   Usage: Append `models=glm-4-9b-chat` command line argument when starting Chitu
 - gpt-oss-120b-BF16

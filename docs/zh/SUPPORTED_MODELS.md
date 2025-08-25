@@ -20,6 +20,8 @@
   用法: 启动赤兔时追加 `models=DeepSeek-R1-fp4-mix` 启动参数
 - DeepSeek-V3
   用法: 启动赤兔时追加 `models=DeepSeek-V3` 启动参数
+- DeepSeek-V3.1
+  用法: 启动赤兔时追加 `models=DeepSeek-V3.1` 启动参数
 - GLM-4-32B-0414
   用法: 启动赤兔时追加 `models=GLM-4-32B-0414` 启动参数
 - GLM-4-9B-0414
@@ -124,6 +126,8 @@
   用法: 启动赤兔时追加 `models=Qwen3-Coder-480B-A35B-Instruct` 启动参数
 - Qwen3-Coder-480B-A35B-Instruct-fp8
   用法: 启动赤兔时追加 `models=Qwen3-Coder-480B-A35B-Instruct-fp8` 启动参数
+- Seed-OSS-36B-Instruct
+  用法: 启动赤兔时追加 `models=Seed-OSS-36B-Instruct` 启动参数
 - glm-4-9b-chat
   用法: 启动赤兔时追加 `models=glm-4-9b-chat` 启动参数
 - gpt-oss-120b-BF16

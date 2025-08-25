@@ -35,6 +35,9 @@ def append_to_paged_kv_cache(
         else:
             impl = "torch"
 
+    if get_global_args().infer.dp_size > 1:
+        this_kv = this_kv[: delta_position_ids.shape[0]]
+
     if impl == "triton" and has_triton:
         append_to_paged_kv_cache_triton(
             kv_cache, page_table, this_kv, delta_position_ids, delta_seq_ids
@@ -57,6 +60,10 @@ def append_to_dense_kv_cache(
             impl = "triton"
         else:
             impl = "torch"
+
+    if get_global_args().infer.dp_size > 1:
+        this_kv = this_kv[: delta_position_ids.shape[0]]
+
     if impl == "triton" and has_triton:
         append_to_dense_kv_cache_triton(
             kv_cache, this_kv, delta_position_ids, delta_seq_ids

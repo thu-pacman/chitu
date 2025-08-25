@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: Seed-OSS-36B-Instruct
+type: hf-llama
+source: "https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+tokenizer_type: "hf" # one of: hf, tiktoken
+dim: 5120
+n_layers: 64
+n_heads: 80
+n_kv_heads: 8
+vocab_size: 155136
+intermediate_dim: 27648
+norm_eps: 1e-06
+rope_theta: 10000000.0
+qkv_has_bias: True
+head_dim: 128
+use_qk_norm: False
+bos_token_id: 0
+pad_token_id: 1
+eos_token_id: 2
