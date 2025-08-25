@@ -912,10 +912,10 @@ class RefAttnBackend(AttnBackend):
             device=v.device,
         )
         for i in range(seq_len_delta.batch_size):
-            q_batch[i, 0 : seq_len_delta.new.lens_list[i]] = q[
-                seq_len_delta.new.prefix_lens_list[
+            q_batch[i, 0 : seq_len_delta.delta_lens_list[i]] = q[
+                seq_len_delta.delta_prefix_lens_list[
                     i
-                ] : seq_len_delta.new.prefix_lens_list[i + 1]
+                ] : seq_len_delta.delta_prefix_lens_list[i + 1]
             ]
             k_batch[i, 0 : seq_len_delta.new.lens_list[i]] = k[
                 seq_len_delta.new.prefix_lens_list[
@@ -938,16 +938,16 @@ class RefAttnBackend(AttnBackend):
             sinks=sinks,
         )
         output = torch.empty(
-            (seq_len_delta.new.total_len,) + output_batch.shape[2:],
+            (seq_len_delta.delta_total_len,) + output_batch.shape[2:],
             dtype=output_batch[0].dtype,
             device=output_batch[0].device,
         )
         for i in range(seq_len_delta.batch_size):
             output[
-                seq_len_delta.new.prefix_lens_list[
+                seq_len_delta.delta_prefix_lens_list[
                     i
-                ] : seq_len_delta.new.prefix_lens_list[i + 1]
-            ] = output_batch[i, 0 : seq_len_delta.new.lens_list[i]]
+                ] : seq_len_delta.delta_prefix_lens_list[i + 1]
+            ] = output_batch[i, 0 : seq_len_delta.delta_lens_list[i]]
         return output
 
     @override

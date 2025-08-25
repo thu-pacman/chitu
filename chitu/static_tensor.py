@@ -38,7 +38,7 @@ class StaticTensor:
         *,
         max_nelem: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
-        device: Optional[torch.device] = None,
+        device: Optional[torch.device | str] = None,
         pin_memory: Optional[bool] = None,
     ):
         if max_nelem is None:
