@@ -19,6 +19,7 @@ from typing_extensions import override
 
 import torch
 
+from chitu.task_type import TaskType
 from chitu.async_response import AsyncDataStream
 from chitu.backend import Backend
 from chitu.device_list import DeviceList
@@ -114,9 +115,9 @@ class RouterRequest:
 
         # performance metrics
         self.timestamp: str = datetime.now().strftime("%H:%M:%S:%f")
-        self.start_time: int = time.monotonic()
-        self.prefill_end_time: int = 0
-        self.completion_time: int = 0
+        self.start_time: float = time.monotonic()
+        self.prefill_end_time: float = 0
+        self.completion_time: float = 0
 
         # No tokenization or length checking in Router
         self._prompt_len = 0  # Will be set later by Enhanced Scheduler
@@ -192,9 +193,9 @@ class UserRequest:
 
         # performance metrics
         self.timestamp: str = datetime.now().strftime("%H:%M:%S:%f")
-        self.start_time: int = time.monotonic()
-        self.prefill_end_time: int = 0
-        self.completion_time: int = 0
+        self.start_time: float = time.monotonic()
+        self.prefill_end_time: float = 0
+        self.completion_time: float = 0
 
         max_seq_len = get_global_args().infer.max_seq_len
         if self.prompt_len >= max_seq_len:
@@ -288,21 +289,6 @@ class MockFixedLengthedUserRequest(UserRequest):
     @functools.cached_property
     def prompt_tokens(self):
         return [1] * self.input_len
-
-
-class TaskType(Enum):
-    Prefill = 1
-    Decode = 2
-    EmptyPrefill = 3
-    EmptyDecode = 4
-
-    def to_str(self) -> str:
-        if self == TaskType.Prefill or self == TaskType.EmptyPrefill:
-            return "prefill"
-        elif self == TaskType.Decode or self == TaskType.EmptyDecode:
-            return "decode"
-        else:
-            raise NotImplementedError
 
 
 class Task:
@@ -422,14 +408,6 @@ def req_decode(id_num: int):
         return hex(-id_num)[2:], TaskType.Decode
 
 
-class SerializedPackedTasksPayloadType(Enum):
-    Normal = 1
-    TerminateBackend = 2
-    EndTask = 3
-    Heartbeat = 4
-    Empty = 5
-
-
 class TaskPool:
     pool: Dict[str, Task] = {}
     id_list: List[str] = []
@@ -473,6 +451,14 @@ class TaskPool:
             TaskLoad.clear()
 
 
+class SerializedPackedTasksPayloadType(Enum):
+    Normal = 1
+    TerminateBackend = 2
+    EndTask = 3
+    Heartbeat = 4
+    Empty = 5
+
+
 @dataclass
 class PackedTasksBase:
     """
@@ -481,7 +467,7 @@ class PackedTasksBase:
     Serialization format:
 
     ```
-    | payload type | task_id * max_num_tasks | lens * max_num_tasks |
+    | payload type | task type | slot id | task_id * max_num_tasks | lens * max_num_tasks |
     ```
     """
 
@@ -490,12 +476,14 @@ class PackedTasksBase:
     max_num_tasks: ClassVar[Optional[int]] = None
 
     # Object fields
-    num_tasks: int
+    num_tasks: int = 0
     task_ids: List[str] = field(default_factory=list)
     req_ids: List[str] = field(default_factory=list)
     task_type: Optional[TaskType] = None
-    tokens: Optional[List[List[int]]] = None
-    payload_type: Optional[SerializedPackedTasksPayloadType] = None
+    tokens: List[List[int]] = field(default_factory=list)
+    payload_type: SerializedPackedTasksPayloadType = (
+        SerializedPackedTasksPayloadType.Empty
+    )
     num_tokens: int = 0
 
     @classmethod
@@ -523,7 +511,7 @@ class PackedTasksBase:
         tokens = None
 
         if payload_type == SerializedPackedTasksPayloadType.Empty:
-            task_type = TaskType(task_tensor[-3].item())
+            task_type = TaskType(task_tensor[1].item())
 
         if (
             payload_type == SerializedPackedTasksPayloadType.Normal
@@ -533,14 +521,14 @@ class PackedTasksBase:
             decoded_types = []
             lens = []
             for it in range(cls.max_num_tasks):
-                task_id = task_tensor[1 + it].item()
+                task_id = task_tensor[3 + it].item()
                 if task_id == 0:
                     break
                 decoded_id, decoded_type = req_decode(task_id)
                 decoded_ids.append(decoded_id)
                 decoded_types.append(decoded_type)
                 if decoded_type == TaskType.Prefill:
-                    lens.append(int(task_tensor[1 + cls.max_num_tasks + it]))
+                    lens.append(int(task_tensor[3 + cls.max_num_tasks + it]))
             task_ids = decoded_ids
             req_ids = task_ids
             num_tasks = len(task_ids)
@@ -560,11 +548,7 @@ class PackedTasksBase:
 
             slot_handle = get_slot_handle()
             if slot_handle:
-                slot_handle.set_slot_idx(task_tensor[-2].item())
-
-            num_blocks = task_tensor[-1].item()
-            if not num_blocks == 0:
-                get_global_args().infer.num_blocks = num_blocks
+                slot_handle.set_slot_idx(task_tensor[2].item())
 
         return payload_type, cls(
             num_tasks=num_tasks,
@@ -592,33 +576,29 @@ class PackedTasksBase:
             or payload_type == SerializedPackedTasksPayloadType.Empty
         ):
             if payload_type == SerializedPackedTasksPayloadType.Empty:
-                ret[-3] = self.task_type.value
+                ret[1] = self.task_type.value
             return ret.to(device)
 
-        task_indices = torch.arange(1, 1 + self.num_tasks, device="cpu")
+        task_indices = torch.arange(3, 3 + self.num_tasks, device="cpu")
         encoded_ids = torch.tensor(
             [req_encode(self.task_type, tid) for tid in self.task_ids], device="cpu"
         )
-        ret.scatter_(0, task_indices, encoded_ids)
+        ret[task_indices] = encoded_ids
 
         if self.task_type == TaskType.Prefill:
             token_lengths = torch.tensor(
                 [len(tokens) for tokens in self.tokens],
                 device="cpu",
             )
-            offset = 1 + PackedTasksBase.max_num_tasks
+            offset = 3 + PackedTasksBase.max_num_tasks
             token_indices = torch.arange(offset, offset + self.num_tasks, device="cpu")
             ret.scatter_(0, token_indices, token_lengths)
 
-        ret[-3] = self.task_type.value
+        ret[1] = self.task_type.value
 
         slot_handle = get_slot_handle()
         if slot_handle:
-            ret[-2] = slot_handle.get_slot_idx()
-
-        infer_args = get_global_args().infer
-        if infer_args.cache_type == "paged" and not infer_args.num_blocks == -1:
-            ret[-1] = infer_args.num_blocks
+            ret[2] = slot_handle.get_slot_idx()
 
         return ret.to(device)
 
@@ -640,22 +620,24 @@ class PackedTasksBase:
 
         # TODO: We should use torch.empty instead, but we now assume there is a `0`
         # indicating the end of tasks
-        # TODO: temporarily add a filed to indicate the prefill/decode stage
         return torch.zeros(
-            (4 + cls.max_num_tasks * 2,), dtype=torch.int64, device=device
+            (3 + cls.max_num_tasks * 2,), dtype=torch.int64, device=device
         )
 
 
 class PackedTasks(PackedTasksBase):
     def __init__(self, task_ids: List[str], rank="cuda"):
+        super().__init__()
+
         if not task_ids:  # empty packedtask
-            self.num_tasks = 0
-            self.task_ids = []
-            self.req_ids = []
-            self.task_type = TaskType(Backend.task_type.value + 2)
-            self.tokens = None
-            self.payload_type = SerializedPackedTasksPayloadType.Empty
+            if Backend.task_type == TaskType.Prefill:
+                self.task_type = TaskType.EmptyPrefill
+            elif Backend.task_type == TaskType.Decode:
+                self.task_type = TaskType.EmptyDecode
+            else:
+                assert False
             return
+
         # metadata
         self.rank = rank
         if get_global_args().infer.op_impl == "cpu":

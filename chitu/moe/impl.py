@@ -4,9 +4,10 @@
 
 import torch
 from typing import Optional
-from chitu.utils import try_import_opt_dep
 
-from .token_dispatchers import (
+from chitu.task_type import TaskType
+from chitu.utils import try_import_opt_dep
+from chitu.moe.token_dispatchers import (
     MoETokenDispatcher,
     MoETPTokenDispatcher,
     MoEAllGatherTokenDispatcher,
@@ -55,7 +56,7 @@ class MoEImpl:
                 "n_routed_experts or num_experts must be specified in model args"
             )
 
-        self.task_type: str = None
+        self.task_type: Optional[TaskType] = None
 
         self.prefill_experts_impl = "auto"
         self.decode_experts_impl = "auto"
@@ -126,23 +127,26 @@ class MoEImpl:
             )
 
     def _get_current_token_dispatcher(self) -> MoETokenDispatcher:
-        if self.task_type == "prefill":
+        assert self.task_type is not None
+        if self.task_type in [TaskType.Prefill, TaskType.EmptyPrefill]:
             return self.prefill_token_dispatcher
-        elif self.task_type == "decode":
+        elif self.task_type in [TaskType.Decode, TaskType.EmptyDecode]:
             return self.decode_token_dispatcher
         else:
             raise ValueError(f"Invalid task type: {self.task_type}")
 
     def _init_experts_impl(self):
         self.impl_map = {
-            "prefill": self.prefill_experts_impl,
-            "decode": self.decode_experts_impl,
+            TaskType.Prefill: self.prefill_experts_impl,
+            TaskType.EmptyPrefill: self.prefill_experts_impl,
+            TaskType.Decode: self.decode_experts_impl,
+            TaskType.EmptyDecode: self.decode_experts_impl,
         }
 
     def get_experts_impl(self) -> str:
         return self.impl_map[self.task_type]
 
-    def prepare(self, task_type: str, num_tokens: int) -> None:
+    def prepare(self, task_type: TaskType, num_tokens: int) -> None:
         self.task_type = task_type
         self._get_current_token_dispatcher().prepare(num_tokens)
 

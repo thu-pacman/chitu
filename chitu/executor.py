@@ -427,14 +427,14 @@ class Executor:
 
             if self.moe_impl is not None:
                 if tasks.task_type == TaskType.Decode:
-                    self.moe_impl.prepare(tasks.task_type.to_str(), max_num_tokens)
+                    self.moe_impl.prepare(tasks.task_type, max_num_tokens)
                 elif tasks.task_type == TaskType.EmptyDecode:
-                    self.moe_impl.prepare(tasks.task_type.to_str(), 0)
+                    self.moe_impl.prepare(tasks.task_type, 0)
                 else:
-                    self.moe_impl.prepare(tasks.task_type.to_str(), tasks.num_tokens)
+                    self.moe_impl.prepare(tasks.task_type, tasks.num_tokens)
         else:
             if self.moe_impl is not None:
-                self.moe_impl.prepare(tasks.task_type.to_str(), tasks.num_tokens)
+                self.moe_impl.prepare(tasks.task_type, tasks.num_tokens)
 
         # 2. prefill/decode step
         if tasks.task_type == TaskType.Prefill:
