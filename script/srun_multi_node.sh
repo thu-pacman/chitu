@@ -40,7 +40,11 @@ RDVZ_PORT=$((($SLURM_JOB_ID % 10000) +53000))
 RDVZ_ID=chitu
 
 echo prepare torchrun on node $(hostname) 
-
+echo SLURM_STEP_GPUS: $SLURM_STEP_GPUS
+echo CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES
+# optimize nccl for multi-node
+export NCCL_GRAPH_MIXING_SUPPORT=0
+export NCCL_GRAPH_REGISTER=0
 torchrun \
     --nnodes $SLURM_NNODES \
     --nproc-per-node $SLURM_GPUS_ON_NODE \
