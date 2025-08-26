@@ -134,6 +134,12 @@ class KVCacheManagerBase:
     def finalize_cache_all_prefill(self):
         self.curr_req_ids = None
 
+    def req_needs_new_block(self, req_id):
+        """If the req needs new block for decoding.
+        Return True if req needs new block, else False
+        """
+        raise NotImplementedError()
+
     def prepare_cache_decode(self, req_ids: List[str]):
         self.curr_req_ids = req_ids
 
@@ -152,6 +158,28 @@ class KVCacheManagerBase:
             ),
         )
 
+    def get_block_size(self):
+        """Return the number of tokens that a block can accommodate"""
+        raise NotImplementedError()
+
+    def get_max_num_blocks(self):
+        """Return maximun number of total blocks, which is greater than or equal to self.get_num_blocks()"""
+        raise NotImplementedError()
+
+    def get_num_blocks(self):
+        """Return number of total blocks"""
+        raise NotImplementedError()
+
+    @property
+    def num_free_blocks(self):
+        """Return number of free blocks"""
+        raise NotImplementedError()
+
+    @property
+    def num_used_blocks(self):
+        """Renturn number of blocks that has reserved for reqs to use."""
+        raise NotImplementedError()
+
     def get_accessor(self, layer_id: int) -> KVCacheAccessor:
         raise NotImplementedError()
 
@@ -165,9 +193,6 @@ class KVCacheManagerBase:
 
     def get_gpu_block_table(self):
         return None
-
-    def get_block_size(self):
-        return 0
 
 
 class PagedKVCacheManager(KVCacheManagerBase):
@@ -286,10 +311,30 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
     @override
     def get_block_size(self):
+        """Return the number of tokens that a block can accommodate"""
         return self.block_size
 
-    def get_num_blocks(self):
+    @override
+    def get_max_num_blocks(self):
+        """Return maximun number of total blocks, which is greater than or equal to self.get_num_blocks()"""
         return self.max_num_blocks
+
+    @override
+    def get_num_blocks(self):
+        """Return number of total blocks"""
+        return self.num_blocks
+
+    @override
+    @property
+    def num_free_blocks(self):
+        """Return number of free blocks"""
+        return len(self.free_blocks)
+
+    @override
+    @property
+    def num_used_blocks(self):
+        """Renturn number of blocks that has reserved for reqs to use."""
+        return self.num_blocks - len(self.free_blocks)
 
     def _upd_gpu_block_table(self, req_ids: List[str]):
         if get_global_args().infer.use_cuda_graph:
@@ -325,6 +370,12 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self._upd_gpu_block_table(req_ids)
 
     @override
+    def req_needs_new_block(self, req_id):
+        if self.req_id_to_seq_len[req_id] % self.block_size == 0:
+            return True
+        return False
+
+    @override
     def prepare_cache_decode(self, req_ids: List[str]):
         super().prepare_cache_decode(req_ids)
 
@@ -332,6 +383,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         # paged kv cache in place.
         for i, req_id in enumerate(req_ids):
             if self.seq_len_delta.old.lens_list[i] % self.block_size == 0:
+                assert self.req_needs_new_block(req_id)
                 self.block_table[req_id].append(self.get_free_block())
 
         self._upd_gpu_block_table(req_ids)
@@ -340,7 +392,9 @@ class PagedKVCacheManager(KVCacheManagerBase):
         # TODO: When run out of free blocks, use scheduling and preemption in paper instead of exception
         self.timers("get_free_block").start()
         if len(self.free_blocks) == 0:
-            raise Exception("No more free blocks.")
+            raise Exception(
+                f"No more free blocks: cache manager has total {self.get_num_blocks()} blocks, {self.num_used_blocks} blocks has been used."
+            )
         idx = self.free_blocks.popleft()
         self.timers("get_free_block").stop()
         return idx
@@ -507,6 +561,35 @@ class DenseKVCacheManager(KVCacheManagerBase):
 
         self.slot_handle = get_slot_handle()
 
+    @override
+    def get_block_size(self):
+        """Return the number of tokens that a block can accommodate"""
+        return self.max_seq_len
+
+    @override
+    def get_max_num_blocks(self):
+        """Return maximun number of total blocks, which is greater than or equal to self.get_num_blocks()"""
+        return self.get_num_blocks()
+
+    @override
+    def get_num_blocks(self):
+        """Return number of total blocks"""
+        return self.num_hot_req
+
+    @override
+    @property
+    def num_free_blocks(self):
+        """Return number of free blocks"""
+        return sum(1 for is_available in self.slot_availability if is_available == True)
+
+    @override
+    @property
+    def num_used_blocks(self):
+        """Renturn number of blocks that has reserved for reqs to use."""
+        return sum(
+            1 for is_available in self.slot_availability if is_available == False
+        )
+
     def get_start_and_end_idx(self):
         if self.slot_handle:
             start_idx, end_idx = self.slot_handle.get_current_slot_start_end_idx()
@@ -540,6 +623,13 @@ class DenseKVCacheManager(KVCacheManagerBase):
         start_pos = self.req2slot[req_ids[0]]
 
         self._prepare_cache(req_ids, start_pos)
+
+    @override
+    def req_needs_new_block(self, req_id):
+        """If the req needs new block for decoding.
+        Return True if req needs new block, else False
+        """
+        return False
 
     # Decode:
     @override

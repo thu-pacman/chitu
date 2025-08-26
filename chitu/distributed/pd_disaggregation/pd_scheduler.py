@@ -397,7 +397,7 @@ class PDScheduler(Scheduler):
             pass
 
         # Build a PackedTasksBase with one task (avoid TaskPool dependency)
-        tokens = task.req.prompt_tokens
+        tokens = task.req.prefix_tokens
         tasks = PackedTasksBase(
             num_tasks=1,
             task_ids=[task.task_id],
@@ -423,7 +423,7 @@ class PDScheduler(Scheduler):
 
         # Fake prefill on decode node to rebuild KV cache if needed
         try:
-            tokens = task.req.prompt_tokens
+            tokens = task.req.prefix_tokens
             req_id = task.req.request_id
 
             local_rank = int(os.environ.get("LOCAL_RANK", 0))

@@ -146,6 +146,8 @@ def _auto_set_num_blocks_after_warmup(args):
 
         get_global_args().infer.num_blocks = new_num_block
         Backend.cache_manager.realloc(new_num_block)
+        if torch.distributed.get_rank() == 0:
+            Backend.scheduler.reset_kvcache_block_threshold()
 
 
 def _warmup_via_taskpool(args):
@@ -165,6 +167,8 @@ def _warmup_via_taskpool(args):
                 )
                 get_global_args().infer.num_blocks = new_num_block
                 Backend.cache_manager.realloc(new_num_block)
+                if torch.distributed.get_rank() == 0:
+                    Backend.scheduler.reset_kvcache_block_threshold()
         return
 
     rank = torch.distributed.get_rank()
@@ -252,6 +256,8 @@ def warmup_engine_unified(args):
             )
             get_global_args().infer.num_blocks = new_num_block
             Backend.cache_manager.realloc(new_num_block)
+            if torch.distributed.get_rank() == 0:
+                Backend.scheduler.reset_kvcache_block_threshold()
         return
 
     # 选择 Runner：优先环境变量；否则 PD→direct，非PD→taskpool

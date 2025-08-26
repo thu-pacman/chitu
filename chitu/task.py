@@ -165,7 +165,6 @@ class UserRequest:
     ):
         # input related
         self.message = message
-        self.tokens = tokens
         self.request_id = request_id
         self.params = SampleParams(
             temperature=temperature,
@@ -174,6 +173,10 @@ class UserRequest:
             frequency_penalty=frequency_penalty,
         )
         self.chat_template_kwargs = chat_template_kwargs
+
+        # evict related, store prempt and partial decode tokens when the task is evicted.
+        self._prefix_tokens = tokens if tokens is not None else self.prompt_tokens
+        self._prompt_tokens_len = len(self._prefix_tokens)
 
         # response related
         self.output = ""
@@ -208,10 +211,14 @@ class UserRequest:
 
     def add_data(self, data, top_logprobs=None, top_token_idx=None):
         self.async_stream.add_data(data, top_logprobs, top_token_idx)
+        self._prefix_tokens.append(data)
         logger.debug(f"add data: {data}")
 
     def _test_add_logit(self, logit):
-        logit = logit.tolist()
+        # logit = logit.tolist()
+        logit = torch.topk(
+            logit, k=100, dim=-1
+        ).values.tolist()  # Only use top100 logits to compare in single_req_compare to save disk footprint.
         self._test_logits.append(logit)
         # logger.warning(f"add logit {logit}")
 
@@ -240,17 +247,25 @@ class UserRequest:
         with open(path, "a") as file:
             file.write(trace_str + "\n")
 
-    @functools.cached_property
-    def prompt_tokens(self):
-        if self.tokens is not None:
-            return self.tokens
-        return Backend.formatter.encode_dialog_prompt(
-            self.message, chat_template_kwargs=self.chat_template_kwargs
-        )
+    @property
+    def prefix_tokens(self):
+        if self._prefix_tokens:
+            return self._prefix_tokens
+        return self.prompt_tokens
+
+    @property
+    def prefix_tokens_len(self):
+        return len(self.prefix_tokens)
 
     @functools.cached_property
     def prompt_len(self):
-        return len(self.prompt_tokens)
+        return self._prompt_tokens_len
+
+    @functools.cached_property
+    def prompt_tokens(self):
+        return Backend.formatter.encode_dialog_prompt(
+            self.message, chat_template_kwargs=self.chat_template_kwargs
+        )
 
 
 class MockFixedLengthedUserRequest(UserRequest):
@@ -381,7 +396,7 @@ class Task:
 
 
 def taskid2reqid(task_id):
-    return task_id
+    return TaskPool.pool[task_id].req.request_id
 
 
 # +:prefill, -:decode
@@ -654,7 +669,7 @@ class PackedTasks(PackedTasksBase):
         assert all(task.task_type == self.task_type for task in self.tasks)
 
         if self.task_type == TaskType.Prefill:
-            self.tokens = [task.req.prompt_tokens for task in self.tasks]
+            self.tokens = [task.req.prefix_tokens for task in self.tasks]
 
         self.payload_type = SerializedPackedTasksPayloadType.Normal
 

@@ -388,7 +388,7 @@ class Backend:
             return FlashMLABackend()
         elif args.infer.attn_type == "flash_infer":
             assert isinstance(Backend.cache_manager, PagedKVCacheManager)
-            return FlashInferBackend(Backend.cache_manager.get_num_blocks())
+            return FlashInferBackend(Backend.cache_manager.get_max_num_blocks())
         elif args.infer.attn_type == "triton":
             return TritonAttnBackend()
         elif args.infer.attn_type == "npu":
