@@ -221,7 +221,6 @@ def _warmup_backend_direct(args, decode_steps: int = 2):
         step_token = torch.tensor(
             [0], device=torch.device(local_rank), dtype=torch.int64
         ).unsqueeze(1)
-        seq_lens = [Backend.cache_manager.req_id_to_seq_len[req_id]]
         _ = Backend.model.decode(step_token, len(req_id)).squeeze(1)
         Backend.cache_manager.finalize_cache_single_decode([req_id])
     # Clean KV for this request

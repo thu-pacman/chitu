@@ -795,20 +795,14 @@ class TransformerHFLlama(Transformer):
             device=device,
         )
 
-    def prepare_freqs_cis_prefill(self, seq_len):
+    def prepare_freqs_cis(self):
         return (
             self.rotary_emb.cos_cached[
-                self.cache.seq_len_delta.new.position_ids_tensor_device
+                self.cache.seq_len_delta.delta_position_ids_tensor_device
             ],
             self.rotary_emb.sin_cached[
-                self.cache.seq_len_delta.new.position_ids_tensor_device
+                self.cache.seq_len_delta.delta_position_ids_tensor_device
             ],
-        )
-
-    def prepare_freqs_cis_decode(self):
-        return (
-            self.rotary_emb.cos_cached[self.cache.seq_len_delta.old.lens_tensor_device],
-            self.rotary_emb.sin_cached[self.cache.seq_len_delta.old.lens_tensor_device],
         )
 
 

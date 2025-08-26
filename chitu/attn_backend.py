@@ -663,9 +663,9 @@ class FlashAttnBackend(AttnBackend):
             q,
             k,
             v,
+            seq_len_delta.delta_prefix_lens_tensor_device,
             seq_len_delta.new.prefix_lens_tensor_device,
-            seq_len_delta.new.prefix_lens_tensor_device,
-            seq_len_delta.new.max_len,
+            seq_len_delta.delta_max_len,
             seq_len_delta.new.max_len,
             causal=causal,
             window_size=window_size,
@@ -896,26 +896,30 @@ class RefAttnBackend(AttnBackend):
         softmax_scale=None,
         sinks=None,
     ):
+        max_seq_len = seq_len_delta.new.max_len
+
         q_batch = torch.zeros(
-            (seq_len_delta.batch_size,) + tuple(q.shape),
+            (seq_len_delta.batch_size, max_seq_len) + tuple(q.shape[1:]),
             dtype=q.dtype,
             device=q.device,
         )
         k_batch = torch.zeros(
-            (seq_len_delta.batch_size,) + tuple(k.shape),
+            (seq_len_delta.batch_size, max_seq_len) + tuple(k.shape[1:]),
             dtype=k.dtype,
             device=k.device,
         )
         v_batch = torch.zeros(
-            (seq_len_delta.batch_size,) + tuple(v.shape),
+            (seq_len_delta.batch_size, max_seq_len) + tuple(v.shape[1:]),
             dtype=v.dtype,
             device=v.device,
         )
         for i in range(seq_len_delta.batch_size):
-            q_batch[i, 0 : seq_len_delta.new.lens_list[i]] = q[
-                seq_len_delta.new.prefix_lens_list[
+            q_batch[
+                i, seq_len_delta.old.lens_list[i] : seq_len_delta.new.lens_list[i]
+            ] = q[
+                seq_len_delta.delta_prefix_lens_list[
                     i
-                ] : seq_len_delta.new.prefix_lens_list[i + 1]
+                ] : seq_len_delta.delta_prefix_lens_list[i + 1]
             ]
             k_batch[i, 0 : seq_len_delta.new.lens_list[i]] = k[
                 seq_len_delta.new.prefix_lens_list[
@@ -938,16 +942,18 @@ class RefAttnBackend(AttnBackend):
             sinks=sinks,
         )
         output = torch.empty(
-            (seq_len_delta.new.total_len,) + output_batch.shape[2:],
+            (seq_len_delta.delta_total_len,) + output_batch.shape[2:],
             dtype=output_batch[0].dtype,
             device=output_batch[0].device,
         )
         for i in range(seq_len_delta.batch_size):
             output[
-                seq_len_delta.new.prefix_lens_list[
+                seq_len_delta.delta_prefix_lens_list[
                     i
-                ] : seq_len_delta.new.prefix_lens_list[i + 1]
-            ] = output_batch[i, 0 : seq_len_delta.new.lens_list[i]]
+                ] : seq_len_delta.delta_prefix_lens_list[i + 1]
+            ] = output_batch[
+                i, seq_len_delta.old.lens_list[i] : seq_len_delta.new.lens_list[i]
+            ]
         return output
 
     @override
@@ -1125,9 +1131,11 @@ class TritonAttnBackend(RefAttnBackend):
             k,
             v,
             output,
+            seq_len_delta.delta_prefix_lens_tensor_device,
             seq_len_delta.new.prefix_lens_tensor_device,
+            seq_len_delta.delta_lens_tensor_device,
             seq_len_delta.new.lens_tensor_device,
-            seq_len_delta.new.max_len,
+            seq_len_delta.delta_max_len,
             softmax_scale,
             causal,
         )
@@ -1769,7 +1777,7 @@ class FlashInferBackend(TritonAttnBackend):
         ckv = ckv.view(num_pages, page_size, num_kv_head, head_dim_ckv)
         kpe = kpe.view(num_pages, page_size, num_kv_head, head_dim_kpe)
 
-        q_indptr = seq_len_delta.new.prefix_lens_tensor_device
+        q_indptr = seq_len_delta.delta_prefix_lens_tensor_device
         kv_indptr = seq_len_delta.new.prefix_lens_tensor_device
         kv_indices = torch.zeros(
             [
@@ -1831,7 +1839,7 @@ class FlashInferBackend(TritonAttnBackend):
             num_qo_heads = q.shape[-2]
             num_kv_heads = k.shape[-2]
             self.prefill_wrapper.plan(
-                seq_len_delta.new.prefix_lens_tensor_device,
+                seq_len_delta.delta_prefix_lens_tensor_device,
                 seq_len_delta.new.prefix_lens_tensor_device,
                 num_qo_heads,
                 num_kv_heads,

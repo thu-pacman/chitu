@@ -1267,13 +1267,8 @@ class TransformerDeepSeekV3(Transformer):
         self.freqs_cis_imag = self.freqs_cis.imag.contiguous().to(device)
 
     @override
-    def prepare_freqs_cis_prefill(self, seq_len):
-        index = self.cache.seq_len_delta.new.position_ids_tensor_device
-        return self.freqs_cis_real[index], self.freqs_cis_imag[index]
-
-    @override
-    def prepare_freqs_cis_decode(self):
-        index = self.cache.seq_len_delta.old.lens_tensor_device
+    def prepare_freqs_cis(self):
+        index = self.cache.seq_len_delta.delta_position_ids_tensor_device
         return self.freqs_cis_real[index], self.freqs_cis_imag[index]
 
     @override
