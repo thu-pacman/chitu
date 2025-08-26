@@ -4,13 +4,19 @@ import packaging.version
 from omegaconf import OmegaConf
 import triton
 
-from chitu.attn_backend import RefAttnBackend, TritonAttnBackend, FlashInferBackend
+from chitu.attn_backend import (
+    RefAttnBackend,
+    TritonAttnBackend,
+    FlashAttnBackend,
+    FlashInferBackend,
+)
 from chitu.cache_manager import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.device_type import is_muxi
 from chitu.global_vars import set_global_args
 from chitu.utils import try_import_opt_dep
 from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
 
+flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
 
 
@@ -66,6 +72,7 @@ def test_triton_mla_decode_paged_kv(
         device="cuda",
         cache_prefix_lens_tensor_device=False,
         cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
         cache_delta_position_ids_tensor_device=False,
         cache_delta_seq_ids_tensor_device=False,
     )
@@ -99,8 +106,11 @@ def test_triton_mla_decode_paged_kv(
 @pytest.mark.parametrize("n_heads", [32])
 @pytest.mark.parametrize("n_kv_heads", [4])
 @pytest.mark.parametrize("qk_head_dim,v_head_dim", [(256, 256), (576, 512)])
-@pytest.mark.parametrize("impl", ["triton", "flashinfer"])
-def test_prefill_ragged_qkvo(bs, n_heads, n_kv_heads, qk_head_dim, v_head_dim, impl):
+@pytest.mark.parametrize("is_increment", [False, True])
+@pytest.mark.parametrize("impl", ["triton", "flash_attn", "flashinfer"])
+def test_prefill_ragged_qkvo(
+    bs, n_heads, n_kv_heads, qk_head_dim, v_head_dim, is_increment, impl
+):
     if impl == "flashinfer":
         if not has_flashinfer or packaging.version.parse(
             flashinfer.__version__
@@ -108,6 +118,11 @@ def test_prefill_ragged_qkvo(bs, n_heads, n_kv_heads, qk_head_dim, v_head_dim, i
             pytest.skip("flashinfer is missing or too old")
         if qk_head_dim != v_head_dim:
             pytest.skip("flashinfer does not support qk_head_dim != v_head_dim")
+    if impl == "flash_attn":
+        if not has_flash_attn:
+            pytest.skip("flash_attn is missing")
+        if qk_head_dim > 256 or v_head_dim > 256:
+            pytest.skip("FlashAttention only supports head dimension at most 256")
 
     torch.set_default_dtype(torch.float16)
     set_global_args(
@@ -132,25 +147,34 @@ def test_prefill_ragged_qkvo(bs, n_heads, n_kv_heads, qk_head_dim, v_head_dim, i
         need_ensure=False,
     )
 
+    if not is_increment:
+        old_seq_len_list = [0 for _ in range(bs)]
+        new_seq_len_list = [torch.randint(1, 128, (1,)).item() for _ in range(bs)]
+    else:
+        old_seq_len_list = [torch.randint(1, 127, (1,)).item() for _ in range(bs)]
+        new_seq_len_list = [torch.randint(128, 256, (1,)).item() for _ in range(bs)]
     seq_len_delta = BatchedSeqLenDelta(
-        [0 for _ in range(bs)],
-        [torch.randint(1, 128, (1,)).item() for _ in range(bs)],
+        old_seq_len_list,
+        new_seq_len_list,
         device="cuda",
         cache_prefix_lens_tensor_device=False,
         cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
         cache_delta_position_ids_tensor_device=False,
         cache_delta_seq_ids_tensor_device=False,
     )
 
     if impl == "triton":
         attn_backend = TritonAttnBackend()
+    elif impl == "flash_attn":
+        attn_backend = FlashAttnBackend()
     elif impl == "flashinfer":
         attn_backend = FlashInferBackend(tot_num_blocks=51)
     else:
         raise NotImplementedError()
     ref_backend = RefAttnBackend()
 
-    q = torch.randn((seq_len_delta.new.total_len, n_heads, qk_head_dim)).cuda()
+    q = torch.randn((seq_len_delta.delta_total_len, n_heads, qk_head_dim)).cuda()
     k = torch.randn((seq_len_delta.new.total_len, n_kv_heads, qk_head_dim)).cuda()
     v = torch.randn((seq_len_delta.new.total_len, n_kv_heads, v_head_dim)).cuda()
 
@@ -182,12 +206,15 @@ def test_prefill_ragged_qkvo(bs, n_heads, n_kv_heads, qk_head_dim, v_head_dim, i
 @pytest.mark.parametrize("n_heads", [4])
 @pytest.mark.parametrize("n_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [256])
-@pytest.mark.parametrize("impl", ["triton", "flashinfer"])
+@pytest.mark.parametrize("impl", ["triton", "flash_attn", "flashinfer"])
 def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl):
     if not has_flashinfer or packaging.version.parse(
         flashinfer.__version__
     ) < packaging.version.parse("0.2.0"):
         pytest.skip("flashinfer is missing or too old")
+    if impl == "flash_attn":
+        if not has_flash_attn:
+            pytest.skip("flash_attn is missing")
 
     torch.set_default_dtype(torch.float16)
     set_global_args(
@@ -218,6 +245,7 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
         device="cuda",
         cache_prefix_lens_tensor_device=False,
         cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
         cache_delta_position_ids_tensor_device=False,
         cache_delta_seq_ids_tensor_device=False,
     )
@@ -226,6 +254,8 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
     block_size = 256
     if impl == "triton":
         attn_backend = TritonAttnBackend()
+    elif impl == "flash_attn":
+        attn_backend = FlashAttnBackend()
     elif impl == "flashinfer":
         attn_backend = FlashInferBackend(tot_num_blocks=num_blocks)
     else:
@@ -276,7 +306,7 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
 @pytest.mark.parametrize("n_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [256])
 @pytest.mark.parametrize("softmax_scale", [None, 0.13])
-@pytest.mark.parametrize("impl", ["triton", "flashinfer"])
+@pytest.mark.parametrize("impl", ["triton", "flash_attn", "flashinfer"])
 def test_decode_paged_kv(
     prev_seq_len_list, n_heads, n_kv_heads, head_dim, softmax_scale, impl
 ):
@@ -284,6 +314,9 @@ def test_decode_paged_kv(
         flashinfer.__version__
     ) < packaging.version.parse("0.2.0"):
         pytest.skip("flashinfer is missing or too old")
+    if impl == "flash_attn":
+        if not has_flash_attn:
+            pytest.skip("flash_attn is missing")
 
     torch.set_default_dtype(torch.float16)
     set_global_args(
@@ -314,6 +347,7 @@ def test_decode_paged_kv(
         device="cuda",
         cache_prefix_lens_tensor_device=False,
         cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
         cache_delta_position_ids_tensor_device=False,
         cache_delta_seq_ids_tensor_device=False,
     )
@@ -322,6 +356,8 @@ def test_decode_paged_kv(
     block_size = 256
     if impl == "triton":
         attn_backend = TritonAttnBackend()
+    elif impl == "flash_attn":
+        attn_backend = FlashAttnBackend()
     elif impl == "flashinfer":
         attn_backend = FlashInferBackend(tot_num_blocks=num_blocks)
     else:
@@ -503,6 +539,7 @@ def benchmark_mla_decode_paged_kv(
         device="cuda",
         cache_prefix_lens_tensor_device=False,
         cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
         cache_delta_position_ids_tensor_device=False,
         cache_delta_seq_ids_tensor_device=False,
     )

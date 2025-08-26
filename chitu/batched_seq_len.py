@@ -394,6 +394,13 @@ class BatchedSeqLenDelta:
             return self._delta.total_len
 
     @property
+    def delta_max_len(self):
+        if self.is_classic_decoding:
+            return 1
+        else:
+            return self._delta.max_len
+
+    @property
     def delta_lens_list(self):
         if self.is_classic_decoding:
             return [1] * self.batch_size

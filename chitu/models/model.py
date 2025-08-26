@@ -629,20 +629,16 @@ class Transformer(nn.Module):
             device=device,
         )
 
-    def prepare_freqs_cis_prefill(self, seq_len):
+    def prepare_freqs_cis(self):
         curr_freqs_cis = self.freqs_cis[
-            self.cache.seq_len_delta.new.position_ids_tensor_device
+            self.cache.seq_len_delta.delta_position_ids_tensor_device
         ]
         return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
 
-    def prepare_freqs_cis_decode(self):
-        curr_freqs_cis = self.freqs_cis[self.cache.seq_len_delta.old.lens_tensor_device]
-        return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
-
     @torch.inference_mode()
-    def prefill_single_device(self, tokens):
+    def prefill_no_pipeline(self, tokens):
         next_seq_len = self.cache.seq_len_delta.new
-        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_prefill(next_seq_len)
+        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis()
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):
             h = layer(h, freqs_cis_cos, freqs_cis_sin)
@@ -653,7 +649,7 @@ class Transformer(nn.Module):
         return h
 
     @torch.inference_mode()
-    def decode_single_device(self, tokens, freqs_cis_cos, freqs_cis_sin):
+    def decode_no_pipeline(self, tokens, freqs_cis_cos, freqs_cis_sin):
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):
             h = layer(h, freqs_cis_cos, freqs_cis_sin)
@@ -665,7 +661,7 @@ class Transformer(nn.Module):
     def prefill_pipeline(self, tokens):
 
         next_seq_len = self.cache.seq_len_delta.new
-        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_prefill(next_seq_len)
+        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis()
 
         # start of model
         if self.pp_stage == 0:
@@ -707,7 +703,7 @@ class Transformer(nn.Module):
         if self.pipeline_exec:
             return self.prefill_pipeline(tokens)
         else:
-            return self.prefill_single_device(tokens)
+            return self.prefill_no_pipeline(tokens)
 
     def prepare_decoding_attn(self):
         block_table = self.cache.get_gpu_block_table()
@@ -771,13 +767,11 @@ class Transformer(nn.Module):
                 enable=current_cuda_graph_enabled,
             )
             def do_decode(tokens):
-                freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_decode()
+                freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis()
                 if self.pipeline_exec:
                     return self.decode_pipeline(tokens, freqs_cis_cos, freqs_cis_sin)
                 else:
-                    return self.decode_single_device(
-                        tokens, freqs_cis_cos, freqs_cis_sin
-                    )
+                    return self.decode_no_pipeline(tokens, freqs_cis_cos, freqs_cis_sin)
 
             self.do_decode_callable = do_decode
 
