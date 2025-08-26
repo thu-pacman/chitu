@@ -345,12 +345,23 @@ class BatchedSeqLenDelta:
             max_batch_size=max_batch_size,
             max_total_len=max_total_delta_len,
             cache_prefix_lens_tensor_device=cache_delta_prefix_lens_tensor_device,
-            cache_position_ids_tensor_device=cache_delta_position_ids_tensor_device,
+            cache_position_ids_tensor_device=False,  # NOTE: delta_position_ids is NOT _delta.position_ids
             cache_seq_ids_tensor_device=cache_delta_seq_ids_tensor_device,
         )
+
         self.is_classic_decoding = all(x > 0 for x in self.old.lens_list) and all(
             (x + 1 == y for x, y in zip(self.old.lens_list, self.new.lens_list))
         )
+
+        self.cache_delta_position_ids_tensor_device = (
+            cache_delta_position_ids_tensor_device
+        )
+        self._delta_position_ids_tensor_device_up_to_date = False
+        if self.cache_delta_position_ids_tensor_device:
+            assert max_total_delta_len is not None
+            self._delta_position_ids_static_tensor_device = StaticTensor(
+                max_nelem=max_total_delta_len, dtype=torch.int32, device=device
+            )
 
     def copy_from(self, other_old: BatchedSeqLen, other_new: BatchedSeqLen):
         self.old.copy_from(other_old)
@@ -367,6 +378,7 @@ class BatchedSeqLenDelta:
         self.is_classic_decoding = all(x > 0 for x in self.old.lens_list) and all(
             (x + 1 == y for x, y in zip(self.old.lens_list, self.new.lens_list))
         )
+        self._delta_position_ids_tensor_device_up_to_date = False
 
     @property
     def batch_size(self):
@@ -411,12 +423,47 @@ class BatchedSeqLenDelta:
         else:
             return self._delta.prefix_lens_tensor_device
 
+    def _comp_delta_position_ids_tensor_device(self):
+        # Example: old = [10, 20, 30], new = [13, 25, 32]
+
+        delta_lens = self.new.lens_tensor_device - self.old.lens_tensor_device
+        # Example: delta_lens = [3, 5, 2]
+
+        prefix_delta_lens = torch.cumsum(delta_lens, dim=0, dtype=torch.int32)
+        # Example: prefix_delta_lens = [3, 8, 10]
+
+        x = torch.ones(
+            self.new.total_len - self.old.total_len,
+            device=self.old.device,
+            dtype=torch.int32,
+        )
+        # Example: x = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+
+        x[0] = self.old.lens_tensor_device[0] + 1
+        x[prefix_delta_lens[:-1]] = (
+            self.old.lens_tensor_device[1:] - self.new.lens_tensor_device[:-1] + 1
+        )
+        # Example: x = [11, 1, 1, 8, 1, 1, 1, 1, 6, 1]
+
+        x = torch.cumsum(x, dim=0, dtype=torch.int32) - 1
+        # Example: x = [10, 11, 12, 20, 21, 22, 23, 24, 30, 31]
+
+        return x
+
     @property
     def delta_position_ids_tensor_device(self):
+        # NOTE: delta_position_ids is NOT _delta.position_ids
         if self.is_classic_decoding:
             return self.old.lens_tensor_device
+        if self.cache_delta_position_ids_tensor_device:
+            if not self._delta_position_ids_tensor_device_up_to_date:
+                self._delta_position_ids_static_tensor_device.set(
+                    self._comp_delta_position_ids_tensor_device()
+                )
+                self._delta_position_ids_tensor_device_up_to_date = True
+            return self._delta_position_ids_static_tensor_device.get()
         else:
-            return self._delta.position_ids_tensor_device
+            return self._comp_delta_position_ids_tensor_device()
 
     @property
     def delta_seq_ids_tensor_device(self):
