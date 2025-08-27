@@ -342,38 +342,37 @@ def chitu_init(args, logging_level=None):
         site_packages_path = get_ascend_custom_opp_path()
         os.environ["ASCEND_CUSTOM_OPP_PATH"] = site_packages_path
 
-    if args.infer.attn_type == "npu":
-        # Bind process to CPU NUMA
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
-        if args.infer.bind_process_to_cpu == "auto":
-            if not has_cpuinfer and not has_numa:
-                args.infer.bind_process_to_cpu = "none"
-            elif not has_numa:
-                logger.warning(
-                    "'cpuinfer' is found but 'numa' is mising. Disabling NUMA binding. "
-                    "For better CPU inference performance, please refer to README.md and "
-                    "install the full '[cpu]' optional dependency."
-                )
-                args.infer.bind_process_to_cpu = "none"
-            elif not numa.available():
-                logger.warning(
-                    "NUMA is not support on this OS or hardware platform. Disabling NUMA binding."
-                )
-                args.infer.bind_process_to_cpu = "none"
-            elif numa.get_max_node() + 1 < local_world_size:
-                logger.info("Disable NUMA binding due to insufficient NUMA nodes.")
-                args.infer.bind_process_to_cpu = "none"
-            else:
-                args.infer.bind_process_to_cpu = "numa"
-        if args.infer.bind_process_to_cpu == "numa":
-            numa.bind({local_rank})
-        elif args.infer.bind_process_to_cpu == "none":
-            pass
-        else:
-            raise ValueError(
-                f"Unsupported infer.bind_process_to_cpu={args.infer.bind_process_to_cpu}"
+    # Bind process to CPU NUMA
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+    if args.infer.bind_process_to_cpu == "auto":
+        if not has_cpuinfer and not has_numa:
+            args.infer.bind_process_to_cpu = "none"
+        elif not has_numa:
+            logger.warning(
+                "'cpuinfer' is found but 'numa' is mising. Disabling NUMA binding. "
+                "For better CPU inference performance, please refer to README.md and "
+                "install the full '[cpu]' optional dependency."
             )
+            args.infer.bind_process_to_cpu = "none"
+        elif not numa.available():
+            logger.warning(
+                "NUMA is not support on this OS or hardware platform. Disabling NUMA binding."
+            )
+            args.infer.bind_process_to_cpu = "none"
+        elif numa.get_max_node() + 1 < local_world_size:
+            logger.info("Disable NUMA binding due to insufficient NUMA nodes.")
+            args.infer.bind_process_to_cpu = "none"
+        else:
+            args.infer.bind_process_to_cpu = "numa"
+    if args.infer.bind_process_to_cpu == "numa":
+        numa.bind({local_rank})
+    elif args.infer.bind_process_to_cpu == "none":
+        pass
+    else:
+        raise ValueError(
+            f"Unsupported infer.bind_process_to_cpu={args.infer.bind_process_to_cpu}"
+        )
 
     # Check checkpoint exists
     check_checkpoint_path(args)
