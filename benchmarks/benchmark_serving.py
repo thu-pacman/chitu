@@ -180,6 +180,7 @@ class BenchmarkServing:
                                         usage.get("completion_tokens")
                                     )
                                     output.prompt_len = int(usage.get("prompt_tokens"))
+                                    most_recent_timestamp = time.perf_counter()
                                 elif choices := data.get("choices"):
                                     # Note that text could be empty here
                                     # e.g. for special tokens
