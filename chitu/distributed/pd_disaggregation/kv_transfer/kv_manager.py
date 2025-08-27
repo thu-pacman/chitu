@@ -351,7 +351,8 @@ class KVManager:
     def start_decode_thread(self):
         """Start Decode communication thread"""
         self.rank_port = get_free_port()
-        self.server_socket.bind(f"tcp://{self.local_ip}:{self.rank_port}")
+        # 绑定到所有网卡，避免绑定到不可达的本地 IP 导致跨节点连接失败
+        self.server_socket.bind(f"tcp://*:{self.rank_port}")
 
         def decode_thread():
             while True:
@@ -814,7 +815,10 @@ class KVManager:
 
         # Wait for transfers to complete (status updated by sender via ZMQ)
         unfinished = set(room_ids)
-        while unfinished:
+        # 增加超时回退，避免无限等待导致单请求卡死
+        start_wait = time.time()
+        timeout_s = 3.0
+        while unfinished and (time.time() - start_wait) < timeout_s:
             done = [
                 r for r in unfinished if self.request_status.get(r) == KVPoll.Success
             ]
@@ -822,6 +826,11 @@ class KVManager:
                 unfinished.remove(r)
             if unfinished:
                 time.sleep(0.03)
+
+        if unfinished:
+            logger.warning(
+                f"kv transfer status timeout after {timeout_s}s for rooms: {[r.hex for r in unfinished]} — falling back to local prefill"
+            )
 
         # Fetch logits from aux buffer
         logits = self.metadata_buffers.get(aux_indices)

@@ -12,6 +12,7 @@ import time
 from typing import Any, Dict, List, Optional
 import threading
 import queue
+import zmq, os
 from chitu.task import Task
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,10 @@ class DPTokenSender:
         self.dp_group_id = dp_group_id
         self.socket = None
         self.context = None
+        self._send_queue = None
+        self._sender_thread = None
+        self._started = False
+        self._start_lock = threading.Lock()
 
         self.instance_id = id(self)
         logger.info(
@@ -37,28 +42,67 @@ class DPTokenSender:
 
     async def start(self):
         """Start token sender (initialize synchronous ZMQ socket and sender thread)"""
-        self._init_socket()
-        self._start_sender_thread()
-        logger.info(f"DPTokenSender started for group {self.dp_group_id}")
+        with self._start_lock:
+            if self._started:
+                return
+            self._init_socket()
+            self._start_sender_thread()
+            self._started = True
+            logger.info(f"DPTokenSender started for group {self.dp_group_id}")
 
     def _init_socket(self):
         """Initialize synchronous ZMQ socket"""
-        import zmq
+        if self.socket is not None:
+            return
 
         self.context = zmq.Context.instance()
         self.socket = self.context.socket(zmq.PUSH)
         self.socket.setsockopt(zmq.LINGER, 0)
-        self.socket.connect(self.router_address)
-        self._send_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=10000)
+        # 提升缓冲与高水位，减少回压导致的阻塞
+        sndhwm = int(os.getenv("DP_SND_HWM", "200000"))
+        sndbuf = int(os.getenv("DP_SNDBUF", "4194304"))  # 4MB
+        conflate = int(os.getenv("DP_CONFLATE", "0"))
+        tcp_keepalive = int(os.getenv("DP_TCP_KEEPALIVE", "1"))
+        self.socket.setsockopt(zmq.SNDHWM, sndhwm)
+        self.socket.setsockopt(zmq.SNDBUF, sndbuf)
+        self.socket.setsockopt(zmq.CONFLATE, conflate)
+        self.socket.setsockopt(zmq.TCP_KEEPALIVE, tcp_keepalive)
+        from chitu.global_vars import get_global_args
+
+        router_host = get_global_args().dp_config.router.host
+        router_token_base_port = get_global_args().dp_config.router.token_port
+        router_addr = self.router_address
+        if router_host and router_token_base_port is not None:
+            port = int(router_token_base_port) + int(self.dp_group_id)
+            router_addr = f"tcp://{router_host}:{port}"
+            logger.info(f"port: {port}, router_addr: {router_addr}")
+        self.socket.connect(router_addr)
+        logger.info(
+            f"[DPTokenSender] group={self.dp_group_id} connect={router_addr} host_cfg={router_host} base_cfg={router_token_base_port}"
+        )
+        if self._send_queue is None:
+            self._send_queue = queue.Queue(maxsize=10000)
 
     def _start_sender_thread(self):
+        # 避免重复启动多个发送线程（ZeroMQ socket 非线程安全）
+        if self._sender_thread is not None and self._sender_thread.is_alive():
+            return
+
         def _loop():
             while True:
                 try:
                     data = self._send_queue.get()
                     if data is None:
                         break
-                    self.socket.send(data, flags=0)
+                    # 优先非阻塞发送，失败时短暂退避重试，再退化阻塞
+                    try:
+                        self.socket.send(data, flags=zmq.DONTWAIT)
+                    except Exception:
+                        time.sleep(0.0005)
+                        try:
+                            self.socket.send(data, flags=zmq.DONTWAIT)
+                        except Exception:
+                            self.socket.send(data, flags=0)
                 except Exception as e:
                     logger.error(f"DPTokenSender sender thread error: {e}")
                     time.sleep(0.01)
@@ -130,7 +174,7 @@ class DPTokenSender:
                 "request_id": request_id,
                 "text": text,
                 "original_token_id": token,
-                "dp_group_id": self.dp_group_id,
+                "scheduler_id": self.dp_group_id,
                 "timestamp": time.time(),
             }
 
@@ -170,7 +214,7 @@ class DPTokenSender:
                 "type": "finish",
                 "request_id": request_id,
                 "finish_reason": finish_reason,
-                "dp_group_id": self.dp_group_id,
+                "scheduler_id": self.dp_group_id,
                 "timestamp": time.time(),
             }
 
@@ -196,7 +240,7 @@ class DPTokenSender:
                 "type": "error",
                 "request_id": request_id,
                 "error": error_message,
-                "dp_group_id": self.dp_group_id,
+                "scheduler_id": self.dp_group_id,
                 "timestamp": time.time(),
             }
 
@@ -243,6 +287,7 @@ class DPTokenSender:
                 pass
         # do not term the shared context
         self.request_token_cache.clear()
+        self._started = False
         logger.info(f"DPTokenSender closed for group {self.dp_group_id}")
 
 
@@ -319,7 +364,7 @@ class DPTokenManager:
     async def start(self):
         """Start Token Manager"""
         await self.token_sender.start()
-        logger.info(f"DP Token Manager started for group {self.dp_group_id}")
+        logger.debug(f"DP Token Manager started for group {self.dp_group_id}")
 
     def wrap_task(self, task: Task) -> DPTaskWrapper:
         """Wrap Task to enable token sending"""

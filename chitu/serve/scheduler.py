@@ -10,14 +10,17 @@ Contains the Enhanced Scheduler service logic for DP mode.
 import asyncio
 import logging
 from logging import getLogger
+import threading
 
 import torch
 import torch.distributed
 
-from chitu.backend import Backend
-from chitu.chitu_main import chitu_init, warmup_engine_unified
-from chitu.global_vars import get_global_args
-from chitu.serve.common import process_queue
+from chitu.chitu_main import (
+    chitu_init,
+    warmup_engine_unified,
+    start_enhanced_scheduler_service,
+)
+from chitu.serve.common import start_worker
 from chitu.task import TaskPool
 
 logger = getLogger(__name__)
@@ -38,7 +41,7 @@ def init_dp_scheduler(args, rank):
     chitu_init(args, logging_level=logging.INFO)
     torch.distributed.barrier()
 
-    # 统一 warmup（Router 进程在 unified 内会自动跳过）
+    # Router process will skip warmup in unified
     try:
         warmup_engine_unified(args)
     except Exception as e:
@@ -68,21 +71,27 @@ def init_dp_scheduler(args, rank):
         f"[WARMUP] Unified warmup done earlier; task pool size: {len(TaskPool.pool)}"
     )
 
-    logger.info(
-        f"[SCHEDULER] Starting parallel tasks: process_queue + Enhanced Scheduler service..."
+    # Determine actual distributed rank
+    actual_rank = (
+        torch.distributed.get_rank() if torch.distributed.is_initialized() else rank
     )
 
-    # Run both tasks in the same event loop
-    async def run_dp_scheduler_services():
-        # Import here to avoid circular dependency
-        from chitu.chitu_main import start_enhanced_scheduler_service
-
-        dp_config = args.dp_config
-
-        # Run process_queue and Enhanced Scheduler service in parallel
-        await asyncio.gather(
-            process_queue(),  # Inference loop queue, processes TaskPool
-            start_enhanced_scheduler_service(rank, dp_config, args),  # ZMQ service
+    # For non-zero ranks (TP peers), block on compute loop in main thread so that
+    # chitu_run() triggers Backend.executor.step(None) and keeps TP comm alive.
+    if actual_rank != 0:
+        logger.info(
+            f"[SCHEDULER] rank={actual_rank} running process_queue on main thread (no ZMQ service)"
         )
+        start_worker()
+        return
 
-    asyncio.run(run_dp_scheduler_services())
+    logger.info(
+        f"[SCHEDULER] rank=0 starting process_queue in background thread and Enhanced Scheduler service(for zmq service) on main loop..."
+    )
+
+    # Start the compute loop in a dedicated thread/event loop to avoid blocking asyncio
+    t = threading.Thread(target=start_worker, daemon=True)
+    t.start()
+
+    # Run Enhanced Scheduler ZMQ service on the main asyncio loop
+    asyncio.run(start_enhanced_scheduler_service(actual_rank, args.dp_config, args))

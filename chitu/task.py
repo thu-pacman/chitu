@@ -83,6 +83,7 @@ class RouterRequest:
         temperature=0.8,
         frequency_penalty=0.0,
         chat_template_kwargs: Mapping[str, Any] = {},
+        stop_with_eos: bool = True,
     ):
         # input related
         self.message = message
@@ -94,6 +95,7 @@ class RouterRequest:
             frequency_penalty=frequency_penalty,
         )
         self.chat_template_kwargs = chat_template_kwargs
+        self.stop_with_eos = stop_with_eos
 
         # response related
         self.output = ""

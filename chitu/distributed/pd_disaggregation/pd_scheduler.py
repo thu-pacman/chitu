@@ -347,11 +347,27 @@ class PDScheduler(Scheduler):
             ),
         )
 
+        # Respect stop_with_eos/ignore_eos semantics from request (if exists)
+        stop_with_eos = True
+
+        # From dict payload
+        if isinstance(request, dict):
+            if request.get("ignore_eos"):
+                stop_with_eos = False
+            elif not request.get("stop_with_eos"):
+                stop_with_eos = False
+        else:
+            # From object payloads
+            if getattr(request, "ignore_eos", False):
+                stop_with_eos = False
+            elif not getattr(request, "stop_with_eos", True):
+                stop_with_eos = False
+
         task = Task(
             task_id=user_req.request_id,
             req=user_req,
             priority=getattr(request, "priority", 1),
-            stop_with_eos=not getattr(request, "ignore_eos", False),
+            stop_with_eos=stop_with_eos,
         )
         # Wrap task to enable streaming tokens to Router if token_manager is available
         try:
@@ -421,12 +437,10 @@ class PDScheduler(Scheduler):
 
         logger.info(f"executing decode for task: {task.task_id}")
 
-        # Fake prefill on decode node to rebuild KV cache if needed
+        tokens = task.req.prefix_tokens
+        req_id = task.req.request_id
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
         try:
-            tokens = task.req.prefix_tokens
-            req_id = task.req.request_id
-
-            local_rank = int(os.environ.get("LOCAL_RANK", 0))
             Backend.cache_manager.prepare_cache_prefill(
                 [req_id],
                 BatchedSeqLen.from_tokens([tokens], device=torch.device(local_rank)),
@@ -434,16 +448,22 @@ class PDScheduler(Scheduler):
             payload_prefill = torch.tensor(
                 tokens, device=torch.device(local_rank), dtype=torch.int64
             )
-            _ = Backend.model.prefill(payload_prefill)
+            prefill_logits_local = Backend.model.prefill(payload_prefill)
             Backend.cache_manager.finalize_cache_all_prefill()
         except Exception as e:
             import traceback
 
             traceback.print_exc()
             logger.warning(f"fake prefill on decode failed or skipped: {e}")
+            prefill_logits_local = None
 
-        # Sample first token (greedy for simplicity)
-        next_token = torch.argmax(first_token_logits.view(-1)).item()
+        if first_token_logits is not None and first_token_logits.numel() > 0:
+            next_token = torch.argmax(first_token_logits.view(-1)).item()
+        elif prefill_logits_local is not None and prefill_logits_local.numel() > 0:
+            next_token = torch.argmax(prefill_logits_local.view(-1)).item()
+        else:
+            raise ValueError("no logits available for decode")
+
         # Use Task API so DP wrapper can stream token back to Router
         try:
             task.update_response_sync(next_token)
