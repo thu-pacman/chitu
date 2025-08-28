@@ -95,15 +95,13 @@ class ShareGPTDataset:
                     request_id=gen_sequential_id(),
                     tokens=prompt_ids,
                     max_new_tokens=max_new_tokens,
-                    top_k=1,  # same as pacman cinfer default
                 )
             )
         return reqs
 
 
-def random_requests(args):
+def random_requests(args, num_reqs):
     vocab_size = args.model.vocab_size
-    num_reqs = args.bench.num_reqs
     prompt_len = args.bench.prompt_len
     max_new_tokens = args.bench.max_new_tokens
 
@@ -114,22 +112,21 @@ def random_requests(args):
             request_id=gen_sequential_id(),
             tokens=[random.randint(0, vocab_size - 1) for _ in range(prompt_len)],
             max_new_tokens=max_new_tokens,
-            top_k=1,  # same as pacman cinfer default
         )
         reqs.append(req)
     return reqs
 
 
-def get_requests(args) -> List[UserRequest]:
+def get_requests(args, num_reqs) -> List[UserRequest]:
     if args.benchmark.dataset == "random":
-        return random_requests(args)
+        return random_requests(args, num_reqs)
     else:
         dataset = ShareGPTDataset(args.benchmark.dataset_path)
         return dataset.sample(
             AutoTokenizer.from_pretrained(
                 args.models.tokenizer_path, trust_remote_code=True
             ),  # [TODO] support tokenizer other than hf
-            num_requests=args.benchmark.num_reqs,
+            num_requests=num_reqs,
             input_len=args.benchmark.input_len,
             max_new_tokens=args.benchmark.output_len,
         )
@@ -144,33 +141,37 @@ def count_num_tokens(reqs: list[UserRequest]):
 def run_benchmark(args, timers, is_main_rank):
     warmup_engine(args)
     iters = args.benchmark.iters
+    num_reqs_list = args.benchmark.num_reqs_list
     stop_with_eos = args.benchmark.stop_with_eos
     debug_print = args.benchmark.debug_print
-    for i in range(iters):
-        if is_main_rank:
-            reqs = get_requests(args)
-            for req in reqs:
-                TaskPool.add(Task(req.request_id, req, stop_with_eos=stop_with_eos))
-        t_start = time.perf_counter()
-        while not chitu_is_terminated():
-            chitu_run()
-            if is_main_rank and len(TaskPool.pool) == 0:
-                break
-        t_end = time.perf_counter()
+    for num_reqs in num_reqs_list:
+        for i in range(iters):
+            if is_main_rank:
+                reqs = get_requests(args, num_reqs)
+                for req in reqs:
+                    TaskPool.add(Task(req.request_id, req, stop_with_eos=stop_with_eos))
+            t_start = time.perf_counter()
+            while not chitu_is_terminated():
+                chitu_run()
+                if is_main_rank and len(TaskPool.pool) == 0:
+                    break
+            t_end = time.perf_counter()
 
-        if is_main_rank:
-            total_time = t_end - t_start
-            output_num_tokens, total_num_tokens = count_num_tokens(reqs)
-            logger.info(
-                f"------ Iter {i + 1} ------\n"
-                f"Time cost: {total_time:.4f} sec\n"
-                f"Total token: {total_num_tokens}\n"
-                f"Total output token: {output_num_tokens}\n"
-                f"Total throughput: {total_num_tokens / total_time:.2f} tps\n"
-                f"Total output throughput: {output_num_tokens / total_time:.2f} tps\n"
-            )
-            if debug_print:
-                logger.info(f"First request output: {reqs[0].output}\n")
+            if is_main_rank:
+                total_time = t_end - t_start
+                output_num_tokens, total_num_tokens = count_num_tokens(reqs)
+                logger.info(
+                    f"------ NumReqs {num_reqs} Iter {i + 1} ------\n"
+                    f"Time cost: {total_time:.4f} sec\n"
+                    f"Total token: {total_num_tokens}\n"
+                    f"Total output token: {output_num_tokens}\n"
+                    f"Total throughput: {total_num_tokens / total_time:.2f} tps\n"
+                    f"Total output throughput: {output_num_tokens / total_time:.2f} tps\n"
+                )
+                if debug_print:
+                    logger.info(f"First request output: {reqs[0].output}\n")
+
+        torch.cuda.empty_cache()
 
     chitu_terminate()
 

@@ -7,7 +7,7 @@ from logging import getLogger
 from typing import Iterable, List, Optional  # Please keep Python 3.8 compatible
 from typing_extensions import override
 
-from chitu.task import TaskPool, TaskType
+from chitu.task import TaskPool, TaskType, DPTaskCollector
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.utils import ceil_div
 from chitu.distributed.parallel_state import get_dp_group
@@ -244,7 +244,7 @@ class Scheduler:
                 return False
             prefix_token_len = TaskPool.pool[
                 prefill_task_ids[num_tasks]
-            ].req.prefix_tokens_len
+            ].prefix_tokens_len
             num_total_tokens += prefix_token_len
             if (
                 num_total_tokens
@@ -264,7 +264,7 @@ class Scheduler:
             and self.kvcache_block_threshold == Backend.cache_manager.get_num_blocks()
             and num_used_block == 0
         ):
-            prefix_len = TaskPool.pool[prefill_task_ids[0]].req.prefix_tokens_len
+            prefix_len = TaskPool.pool[prefill_task_ids[0]].prefix_tokens_len
             raise Exception(
                 f"KV_cache capacity is insufficient to support prefilling (batch_size=1, prefix_len={prefix_len})"
             )
@@ -274,7 +274,7 @@ class Scheduler:
             for i in range(len(prefill_task_ids)):
                 task = TaskPool.pool[prefill_task_ids[i]]
                 task_remaining_tokens = (
-                    task.req.prefix_tokens_len - task.consumed_req_tokens
+                    task.prefix_tokens_len - task.consumed_req_tokens
                 )
                 task_prefill_chunk_size = min(
                     task_remaining_tokens, self.prefill_chunk_size - prefill_tokens
@@ -317,7 +317,7 @@ class Scheduler:
 
         while not has_enough_block():
             if len(decode_task_ids) == 1:
-                prefix_len = TaskPool.pool[decode_task_ids[0]].req.prefix_tokens_len
+                prefix_len = TaskPool.pool[decode_task_ids[0]].prefix_tokens_len
                 raise Exception(
                     f"KV_cache capacity is insufficient to support decoding completion (batch_size=1, prefix_len={prefix_len})."
                 )
@@ -538,11 +538,7 @@ class DPFifoScheduler(Scheduler):  # used for expert_data_parallel
                     task_lists[i] = task_lists[i][: self.max_num_tasks_per_dp]
 
         if self.have_task:
-            Backend.task_id_list = task_lists
-            Backend.all_task_ids = [
-                task_id for task_ids in task_lists for task_id in task_ids
-            ]
-            Backend.task_type = TaskPool.pool[Backend.all_task_ids[0]].task_type
+            DPTaskCollector.prepare_dp_tasks(task_lists)
             return task_lists
         else:
             return []

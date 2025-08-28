@@ -98,7 +98,6 @@ def initialize_tp_group(
         rank_list.append(list(range(i * tp_size, (i + 1) * tp_size)))
 
     _TP_GROUP = CommGroup(rank_list, rank, local_rank)
-    logger.info(f"tp group: {_TP_GROUP}")
 
 
 def initialize_pp_group(
@@ -132,8 +131,6 @@ def initialize_pp_group(
             _PP_PAIR_GROUP_DICT[(ranks[i], ranks[next_i])] = pg
             _PP_PAIR_GROUP_DICT[(ranks[next_i], ranks[i])] = pg
 
-    logger.info(f"pp group: {_PP_GROUP}")
-
 
 def initialize_dp_group(
     tp_size: int,
@@ -153,7 +150,6 @@ def initialize_dp_group(
         rank_list.append(list(range(i, world_size, num_DP_GROUPs)))
 
     _DP_GROUP = CommGroup(rank_list, rank, local_rank)
-    logger.info(f"dp group: {_DP_GROUP}")
 
 
 def initialize_ep_group(ep_size: int, rank: int, local_rank: int, world_size: int):
@@ -181,7 +177,6 @@ def initialize_ep_group(ep_size: int, rank: int, local_rank: int, world_size: in
             assert False, "ep mode not supported."
     else:
         _EP_GROUP = CommGroup([[idx] for idx in range(world_size)], rank, local_rank)
-    logger.info(f"ep group: {_EP_GROUP}")
 
 
 def initialize_parallel_groups(

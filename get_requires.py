@@ -26,6 +26,7 @@ install_requires = [
     "einops",
     "typing-extensions",
     "pyzmq>=27.0.0",
+    "msgpack",
 ]
 
 
