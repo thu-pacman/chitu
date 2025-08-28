@@ -106,6 +106,8 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=Qwen3-32B` command line argument when starting Chitu
 - Qwen3-32B-FP8
   Usage: Append `models=Qwen3-32B-FP8` command line argument when starting Chitu
+- Qwen3-32B-ascend-int8
+  Usage: Append `models=Qwen3-32B-ascend-int8` command line argument when starting Chitu
 - Qwen3-32B-fp4
   Usage: Append `models=Qwen3-32B-fp4` command line argument when starting Chitu
 - Qwen3-4B

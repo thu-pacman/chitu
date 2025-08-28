@@ -65,6 +65,8 @@ srun $SRUN_PARTITION_ARG \
          export SINGULARITYENV_PYTHONPATH=\"\$PYTHONPATH\"
          # 传入容器运行器
          RUNNER_CMD=\"${RUNNER_CMD}\"
+        # 将外层日志目录常量注入内层变量，避免内层环境缺失 LOG_DIR
+        LOG_DIR_INNER=\"${LOG_DIR}\"
         echo '=== 环境信息 ==='
         echo \"HOST: \$(hostname)\"; echo \"SLURM_PROCID: \$SLURM_PROCID\"; echo \"CUDA_VISIBLE_DEVICES=\$CUDA_VISIBLE_DEVICES\"
         nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv
@@ -115,7 +117,9 @@ srun $SRUN_PARTITION_ARG \
             echo '等待 Router 端口...'
             for i in \$(seq 1 120); do
               if nc -z \"\$ROUTER_IP\" \$ROUTER_HTTP_PORT && nc -z \"\$ROUTER_IP\" \$ROUTER_STATS_PORT && nc -z \"\$ROUTER_IP\" \$ROUTER_COORD_PORT && nc -z \"\$ROUTER_IP\" \$ROUTER_META_PORT && nc -z \"\$ROUTER_IP\" \$BOOTSTRAP_PORT; then echo 'OK'; break; fi; sleep 1; done
-            echo \"ROUTER_READY host=\$ROUTER_HOST ip=\$ROUTER_IP port=\$ROUTER_HTTP_PORT\"
+            READY_LINE=\"ROUTER_READY host=\$ROUTER_HOST ip=\$ROUTER_IP port=\$ROUTER_HTTP_PORT\"
+            echo \"\$READY_LINE\" | tee \"\$LOG_DIR_INNER/router.ready\" >/dev/null
+            echo \"\$READY_LINE\"
 
             echo '=== 启动 Decode1/2/3 (节点0) ==='
             export PD_MASTER_ADDR=\$ROUTER_IP
@@ -137,6 +141,17 @@ srun $SRUN_PARTITION_ARG \
                 dp_config.enabled=True dp_config.router.is_router=False dp_config.router.host=\$ROUTER_IP dp_config.scheduler_base_host=0.0.0.0 dp_config.scheduler_base_port=$((29630 + 2)) dp_config.dp_id=4 \
                 scheduler.type=\"decode_only\" infer.use_cuda_graph=True > \"$LOG_DIR/decode3.log\" 2>&1 &
             D3_PID=\$!
+
+            echo '等待 Decode 端口...'
+            for j in 0 1 2; do \
+              for i in \$(seq 1 180); do \
+                if nc -z \"\$ROUTER_IP\" \$((29630 + j)); then echo \"Decode[\$j] OK\"; break; fi; \
+                sleep 1; \
+              done; \
+            done
+            DECODE_LINE=\"DECODE_READY count=3\"
+            echo \"\$DECODE_LINE\" | tee \"\$LOG_DIR_INNER/decode.ready\" >/dev/null
+            echo \"\$DECODE_LINE\"
 
             # 监控 节点0
             while true; do sleep 5; \
@@ -165,6 +180,17 @@ srun $SRUN_PARTITION_ARG \
                 dp_config.enabled=True dp_config.router.is_router=False dp_config.router.host=\$ROUTER_IP dp_config.scheduler_base_host=0.0.0.0 dp_config.scheduler_base_port=$((29620 + 1)) dp_config.dp_id=1 \
                 scheduler.type=\"prefill_only\" infer.use_cuda_graph=True > \"$LOG_DIR/prefill2.log\" 2>&1 &
             P2_PID=\$!
+
+            echo '等待 Prefill 端口...'
+            for j in 0 1; do \
+              for i in \$(seq 1 180); do \
+                if nc -z \"\$PREFILL_IP\" \$((29620 + j)); then echo \"Prefill[\$j] OK\"; break; fi; \
+                sleep 1; \
+              done; \
+            done
+            PREFILL_LINE=\"PREFILL_READY count=2\"
+            echo \"\$PREFILL_LINE\" | tee \"\$LOG_DIR_INNER/prefill.ready\" >/dev/null
+            echo \"\$PREFILL_LINE\"
 
             # 监控 节点1
             while true; do sleep 5; if ! kill -0 \$P1_PID 2>/dev/null; then echo 'Prefill1 停止'; break; fi; if ! kill -0 \$P2_PID 2>/dev/null; then echo 'Prefill2 停止'; break; fi; done

@@ -30,7 +30,7 @@ from chitu.quantization.w4a8_per_token_per_group_asymm import (
     W4A8PerTokenPerGroupAsymmLinear,
 )
 from chitu.quantization.ascend_w8a8 import (
-    AscnedW8A8Linear,
+    AscendW8A8Linear,
 )
 from chitu.quantization.mixq import MixQLinear
 from chitu.quantization.blockfp8 import Blockfp8Linear, Blockfp8MoeExperts
