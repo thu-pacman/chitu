@@ -27,6 +27,8 @@ if torch.cuda.is_available():
 from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.utils import ceil_div, try_import_platform_dep
 
+from chitu.distributed.parallel_state import get_ep_size
+
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 
 
@@ -1163,10 +1165,11 @@ def fused_experts(
 ) -> torch.Tensor:
     assert tokens_per_expert is None
 
-    n_local_experts = w1.shape[0]
-    topk_ids = topk_ids - experts_start_idx
-    mask = (topk_ids < 0) | (topk_ids >= n_local_experts)
-    topk_ids[mask] = n_local_experts
+    if get_ep_size() > 1:
+        n_local_experts = w1.shape[0]
+        topk_ids = topk_ids - experts_start_idx
+        mask = (topk_ids < 0) | (topk_ids >= n_local_experts)
+        topk_ids[mask] = n_local_experts
 
     return fused_experts_impl(
         hidden_states,
@@ -1441,7 +1444,8 @@ def moe_align_block_size_cuda(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    num_experts += 1
+    if get_ep_size() > 1:
+        num_experts += 1
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
