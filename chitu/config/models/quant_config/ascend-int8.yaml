@@ -6,5 +6,9 @@ quant:
 - model: '.'
   rules:
     - regex : 'down_proj'
+    - regex : 'o_proj'
+      type : ascend_w8a8
+      kwargs:
+        is_rpl: true
     - regex : 'layers\.'
       type : ascend_w8a8

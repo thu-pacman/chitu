@@ -278,8 +278,6 @@ class Transformer(nn.Module):
             ret += ["qweight"]
         elif quant == "mixq":
             ret += ["fp_weight"]
-        elif quant == "ascend_w8a8":
-            ret += ["weight_scale", "weight_offset", "deq_scale"]
         return ret
 
     def _get_2d_in_x_out_tensor_names(self, quant) -> List[str]:
@@ -309,7 +307,7 @@ class Transformer(nn.Module):
         elif quant == "mixq":
             ret += ["fp_idx", "weight_scale"]
         elif quant == "ascend_w8a8":
-            ret += ["input_scale", "input_offset", "quant_bias"]
+            ret += ["input_scale", "input_offset", "quant_bias", "deq_scale"]
         return ret
 
     def _chunk_checkpoint_for_pipeline_parallel(
@@ -424,8 +422,10 @@ class Transformer(nn.Module):
                     assert (
                         param.dim() == 1
                     ), f"{name} is expected to be 1D, but got {param.dim()}D"
-                    if get_tp_group().rank_in_group == 0:
-                        partial_checkpoint[name] = param
+                    if name.split(".")[-1] == "bias":
+                        if get_tp_group().rank_in_group != 0:
+                            continue
+                    partial_checkpoint[name] = param
                 elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names(quant):
                     assert (
                         param.dim() == 2

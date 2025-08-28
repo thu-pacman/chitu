@@ -629,6 +629,13 @@ class Backend:
                 return lambda k: "model.layers.92" not in k
             if getattr(args.models, "name", "") == "QwQ-32B-fp4":
                 return lambda k: not (k.endswith(".k_scale") or k.endswith(".v_scale"))
+            if getattr(args.models, "name", "") in [
+                "Qwen3-8B-ascend-int8",
+                "Qwen3-32B-ascend-int8",
+            ]:
+                return lambda k: not (
+                    k.endswith(".weight_scale") or k.endswith(".weight_offset")
+                )
             return None
 
         filter_key = get_filter_key()
