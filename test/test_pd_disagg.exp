@@ -4,6 +4,7 @@
 # Show all output
 log_user 1
 exp_internal 0
+set timeout -1
 
 puts "=== PD Disaggregation 2P3D Test (local, no srun) ==="
 puts "Working directory: [pwd]"
@@ -14,27 +15,85 @@ spawn bash script/srun_pd_disagg_2p3d_two_nodes.sh
 set pd_pid [exp_pid]
 puts "Local PD environment launched, pid is $pd_pid"
 
-# Wait for explicit readiness marker from node0 to avoid interleaved logs
+# Prefer ready file to avoid stdout buffering; fallback to non-blocking READY line
 set router_ip ""
 set router_port "21003"
-expect {
-    -re {ROUTER_READY host=([^ ]+) ip=([0-9\.]+) port=(\d+)} {
-        set router_host $expect_out(1,string)
-        set router_ip   $expect_out(2,string)
-        set router_port $expect_out(3,string)
-        puts "Detected Router Ready on $router_host $router_ip:$router_port"
+set router_host ""
+set ready_file "logs/router.ready"
+
+while {1} {
+    if {[file exists $ready_file]} {
+        set fh [open $ready_file r]
+        set line [gets $fh]
+        close $fh
+        if {[regexp {ROUTER_READY host=([^ ]+) ip=([0-9\.]+) port=(\d+)} $line -> host ip port]} {
+            set router_host $host
+            set router_ip   $ip
+            set router_port $port
+            puts "Detected Router Ready on $router_host $router_ip:$router_port (via file)"
+            break
+        }
     }
+    # Non-blocking stdout fallback (in case ready file not present)
+    expect -timeout 0 {
+        -re {ROUTER_READY host=([^ ]+) ip=([0-9\.]+) port=(\d+)} {
+            set router_host $expect_out(1,string)
+            set router_ip   $expect_out(2,string)
+            set router_port $expect_out(3,string)
+            puts "Detected Router Ready on $router_host $router_ip:$router_port"
+            break
+        }
+        eof {}
+        timeout {}
+    }
+    sleep 1
 }
 
-# Give services a brief moment to finish initialization
-sleep 300
+# Wait for Prefill/Decode readiness markers instead of fixed sleep
+set decode_ready_file "logs/decode.ready"
+set prefill_ready_file "logs/prefill.ready"
+puts "Waiting for Prefill/Decode readiness..."
+while {1} {
+    set have_decode [file exists $decode_ready_file]
+    set have_prefill [file exists $prefill_ready_file]
+    if {$have_decode && $have_prefill} {
+        puts "Prefill/Decode ready markers detected."
+        break
+    }
+    # Non-blocking check for any error output indicating early failure
+    expect -timeout 0 {
+        -re {ERROR|Exception|Traceback} {
+            puts "Detected error output while waiting for PD readiness." 
+        }
+        eof {}
+        timeout {}
+    }
+    sleep 1
+}
+
+# need to wait P/D warmup finish
+sleep 120
 
 # Run verification: PD 2P3D topology via existing script
 puts "=== Verifying PD 2P3D topology ==="
-set verify_cmd "python test/verify_xpyd_topology.py --router http://$router_ip:$router_port --concurrency 8 --max_tokens 128 --stream"
+set verify_cmd "stdbuf -oL -eL python3 test/verify_xpyd_topology.py --router http://$router_ip:$router_port --concurrency 8 --max_tokens 128 --stream"
 puts "Running: $verify_cmd"
 spawn bash -lc $verify_cmd
-sleep 30
+set verify_spawn_id $spawn_id
+puts "--- Begin verify output ---"
+# Stream verify output for 120s (adjustable), printing in real-time
+expect -i $verify_spawn_id -timeout 120 {
+    -re {.+} {
+        puts -nonewline -- $expect_out(0,string)
+        exp_continue
+    }
+    eof {
+        puts "\n--- Verify finished ---"
+    }
+    timeout {
+        puts "\n--- Verify output timeout (120s), continuing ---"
+    }
+}
 
 # Cleanup
 puts "Cleaning up PD processes..."
