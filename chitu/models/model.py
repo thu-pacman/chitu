@@ -636,15 +636,17 @@ class Transformer(nn.Module):
         return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
 
     @torch.inference_mode()
-    def prefill_no_pipeline(self, tokens):
-        next_seq_len = self.cache.seq_len_delta.new
+    def prefill_no_pipeline(
+        self, tokens, output_token_offsets: torch.Tensor
+    ) -> torch.Tensor:
         freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis()
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):
             h = layer(h, freqs_cis_cos, freqs_cis_sin)
-        tmp = next_seq_len.prefix_lens_list[1:]
-        h = h[[item - 1 for item in tmp]]
-        h = self._post_layers(h)  # Exec post layers AFTER cutting the last token off
+
+        # Exec post layers AFTER cutting the last token off
+        h = h[output_token_offsets]
+        h = self._post_layers(h)
         h = h.float()
         return h
 
@@ -658,9 +660,9 @@ class Transformer(nn.Module):
         return h
 
     @torch.inference_mode()
-    def prefill_pipeline(self, tokens):
-
-        next_seq_len = self.cache.seq_len_delta.new
+    def prefill_pipeline(
+        self, tokens, output_token_offsets: torch.Tensor
+    ) -> torch.Tensor:
         freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis()
 
         # start of model
@@ -668,17 +670,16 @@ class Transformer(nn.Module):
             h = self._pre_layers(tokens)
         else:
             h = tokens
+
         # layers
         for it, layer in enumerate(self.layers):
             h = layer(h, freqs_cis_cos, freqs_cis_sin)
+
         # end of model
         if self.pp_stage == self.pp_end_stage:
-            tmp = next_seq_len.prefix_lens_list[1:]
-            h = h[[item - 1 for item in tmp]]
-            h = self._post_layers(
-                h
-            )  # Exec post layers AFTER cutting the last token off
-
+            # Exec post layers AFTER cutting the last token off
+            h = h[output_token_offsets]
+            h = self._post_layers(h)
             h = h.float()
 
         return h
@@ -698,12 +699,12 @@ class Transformer(nn.Module):
         return h
 
     @torch.inference_mode()
-    def prefill(self, tokens):
+    def prefill(self, tokens, output_token_offsets: torch.Tensor) -> torch.Tensor:
         self.attn_backend.prepare_metadata_for_prefill(self.cache.seq_len_delta.new)
         if self.pipeline_exec:
-            return self.prefill_pipeline(tokens)
+            return self.prefill_pipeline(tokens, output_token_offsets)
         else:
-            return self.prefill_no_pipeline(tokens)
+            return self.prefill_no_pipeline(tokens, output_token_offsets)
 
     def prepare_decoding_attn(self):
         block_table = self.cache.get_gpu_block_table()

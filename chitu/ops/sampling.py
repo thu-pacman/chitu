@@ -172,12 +172,12 @@ def response_append_cuda(
 
 def response_append(tasks, tokens, impl="auto"):
     if impl == "auto":
-        if tasks.num_tasks > 8 and has_chitu_backend:
+        if len(tasks.output_tasks) > 8 and has_chitu_backend:
             impl = "cuda"
         else:
             impl = "torch"
     if impl == "torch":
-        for it, task in enumerate(tasks.tasks):
+        for it, task in enumerate(tasks.output_tasks):
             task.response.append(tokens[it])
     elif impl == "cuda":
         new_response = response_append_cuda(
@@ -185,12 +185,12 @@ def response_append(tasks, tokens, impl="auto"):
             tokens,
             tasks.response_len,
             tasks.response_capacity,
-            task_num=tasks.num_tasks,
+            task_num=len(tasks.output_tasks),
         )
         for idx, response in new_response:
-            tasks.tasks[idx].response._data = response
+            tasks.output_tasks[idx].response._data = response
             tasks.response_ptr[idx] = response.data_ptr()
-        for task in tasks.tasks:
+        for task in tasks.output_tasks:
             task.response._len += 1
         tasks.response_len += 1
     else:

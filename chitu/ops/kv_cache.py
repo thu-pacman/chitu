@@ -154,3 +154,84 @@ def append_to_dense_kv_cache_torch(
     kv_cache[delta_seq_ids, delta_position_ids] = this_kv.view(
         this_kv.shape[0], *kv_cache.shape[2:]
     )
+
+
+def read_from_paged_kv_cache(
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_ids: torch.Tensor,
+    impl: str = "auto",
+) -> torch.Tensor:
+    """
+    Read from paged K/V cache, write to ragged K/V.
+
+    Args:
+        kv_cache: (num_pages, page_size, other contiguous dims...). Data of the paged K/V cache.
+        page_table: (batch_size, num_pages_per_sample). Page table of the paged K/V cache.
+        position_ids: (num_tokens,). Position IDs of the incremented tokens. E.g, if
+            reading the 0th, 1st token of the 1st sequence, and the 0th token of the 2nd
+            sequence, position_ids = [0, 1, 0].
+        seq_ids: (num_tokens,). Sequence IDs of the incremented tokens. E.g, if reading
+            the 0th, 1st token of the 1st sequence, and the 0th token of the 2nd sequence,
+            seq_ids = [1, 1, 2].
+    """
+
+    if impl == "auto":
+        impl = "torch"
+
+    if impl == "torch":
+        return read_from_paged_kv_cache_torch(
+            kv_cache, page_table, position_ids, seq_ids
+        )
+    else:
+        raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
+def read_from_dense_kv_cache(
+    kv_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_ids: torch.Tensor,
+    impl: str = "auto",
+) -> torch.Tensor:
+    """
+    Read from dense K/V cache, write to ragged K/V.
+
+    Args:
+        kv_cache: (batch_size, seq_len, other contiguous dims...). Dense K/V cache.
+        position_ids: (num_tokens,). Position IDs of the incremented tokens. E.g, if
+            reading the 0th, 1st token of the 1st sequence, and the 0th token of the 2nd
+            sequence, position_ids = [0, 1, 0].
+        seq_ids: (num_tokens,). Sequence IDs of the incremented tokens. E.g, if reading
+            the 0th, 1st token of the 1st sequence, and the 0th token of the 2nd sequence,
+            seq_ids = [1, 1, 2].
+
+    Returns:
+        (num_tokens, other contiguous dims...). Ragged K/V.
+    """
+
+    if impl == "auto":
+        impl = "torch"
+
+    if impl == "torch":
+        return read_from_dense_kv_cache_torch(kv_cache, position_ids, seq_ids)
+    else:
+        raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
+def read_from_paged_kv_cache_torch(
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_ids: torch.Tensor,
+) -> torch.Tensor:
+    return kv_cache[
+        page_table[seq_ids, position_ids // kv_cache.shape[1]],
+        position_ids % kv_cache.shape[1],
+    ]
+
+
+def read_from_dense_kv_cache_torch(
+    kv_cache: torch.Tensor, position_ids: torch.Tensor, seq_ids: torch.Tensor
+) -> torch.Tensor:
+    return kv_cache[seq_ids, position_ids]

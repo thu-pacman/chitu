@@ -177,7 +177,18 @@ def _warmup_via_taskpool(args):
 
     init_cache_static()
     num_warmup_reqs = args.infer.max_reqs
-    warmup_seq_len = 1
+    if args.infer.prefill_chunk_size is not None:
+        warmup_seq_len = max(
+            min(
+                args.infer.prefill_chunk_size // num_warmup_reqs, args.infer.max_seq_len
+            ),
+            1,
+        )
+    else:
+        logger.warning(
+            "infer.prefill_chunk_size is not set, GPU memory usage estimation may be incorrect (may cause OOM)"
+        )
+        warmup_seq_len = 1
     warmup_max_new_tokens = 2
     if rank == 0:
         for i in range(num_warmup_reqs):
@@ -191,7 +202,7 @@ def _warmup_via_taskpool(args):
             )
             task = Task(f"{req.request_id}", req, stop_with_eos=False)
             TaskPool.add(task)
-        logger.warning(f"Added {num_warmup_reqs} warmup requests to TaskPool")
+        logger.info(f"Added {num_warmup_reqs} warmup requests to TaskPool")
 
     if rank > 0:
         chitu_run()  # An extra run is needed because our implementation is asymmetric
@@ -201,7 +212,7 @@ def _warmup_via_taskpool(args):
     if rank == 0:
         assert len(TaskPool.pool) == 0, "TaskPool should be empty after warmup"
 
-    logger.warning("Inference system warmup completed")
+    logger.info("Inference system warmup completed")
 
 
 def _warmup_backend_direct(args, decode_steps: int = 2):
@@ -214,9 +225,7 @@ def _warmup_backend_direct(args, decode_steps: int = 2):
     # Prefill
     from chitu.batched_seq_len import BatchedSeqLen
 
-    Backend.cache_manager.prepare_cache_prefill(
-        [req_id], BatchedSeqLen.from_tokens([[1]], device=torch.device(local_rank))
-    )
+    Backend.cache_manager.prepare_cache_prefill([req_id], [1])
     _ = Backend.model.prefill(tokens)
     Backend.cache_manager.finalize_cache_all_prefill()
     # Decode steps
@@ -328,6 +337,16 @@ def chitu_init(args, logging_level=None):
         )
         args.float_16bit_variant = args.dtype
 
+    if (
+        args.infer.prefill_chunk_size is not None
+        and args.infer.prefill_chunk_size > args.infer.max_seq_len
+    ):
+        logger.warning(
+            f"infer.prefill_chunk_size ({args.infer.prefill_chunk_size}) is larger than max_seq_len "
+            f"({args.infer.max_seq_len}), which has no effect. Reducing it to max_seq_len."
+        )
+        args.infer.prefill_chunk_size = args.infer.max_seq_len
+
     if is_ascend():
         try:
             import torch_npu
@@ -341,6 +360,23 @@ def chitu_init(args, logging_level=None):
 
         site_packages_path = get_ascend_custom_opp_path()
         os.environ["ASCEND_CUSTOM_OPP_PATH"] = site_packages_path
+
+    if args.infer.prefill_chunk_size is not None:
+        if args.infer.attn_type == "npu":
+            logger.warning(
+                "Disabling infer.prefill_chunk_size because it is not compatible with infer.attn_type=npu yet"
+            )
+            args.infer.prefill_chunk_size = None
+        if args.infer.dp_size > 1:
+            logger.warning(
+                "Disabling infer.prefill_chunk_size because it is not compatible with DP yet"
+            )
+            args.infer.prefill_chunk_size = None
+        if args.infer.tp_size > 1 and args.infer.cache_type == "skew":
+            logger.warning(
+                "Disabling infer.prefill_chunk_size because it is not compatible with PP+skew yet"
+            )
+            args.infer.prefill_chunk_size = None
 
     # Bind process to CPU NUMA
     local_rank = int(os.environ.get("LOCAL_RANK", 0))

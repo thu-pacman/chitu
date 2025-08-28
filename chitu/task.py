@@ -251,23 +251,39 @@ class UserRequest:
 
     @property
     def prefix_tokens(self):
+        """
+        Prompt tokens + evicted partially computed decoded tokens
+
+        Please always use this for prefilling.
+        """
         if self._prefix_tokens:
             return self._prefix_tokens
         return self.prompt_tokens
 
     @property
     def prefix_tokens_len(self):
+        """
+        Length of self.prefix_tokens
+        """
         return len(self.prefix_tokens)
 
     @functools.cached_property
-    def prompt_len(self):
-        return self._prompt_tokens_len
-
-    @functools.cached_property
     def prompt_tokens(self):
+        """
+        Prompt tokens. Not including evicted partially computed decoded tokens
+
+        Please DO NOT use this for prefilling.
+        """
         return Backend.formatter.encode_dialog_prompt(
             self.message, chat_template_kwargs=self.chat_template_kwargs
         )
+
+    @functools.cached_property
+    def prompt_len(self):
+        """
+        Length of self.prompt_tokens
+        """
+        return self._prompt_tokens_len
 
 
 class MockFixedLengthedUserRequest(UserRequest):
@@ -318,8 +334,19 @@ class Task:
     ):
         logger.debug(f"Create Task {task_id} with priority {priority}")
 
-        # response related
+        # Task meta
+        self.task_id = task_id
+        self.task_type = TaskType.Prefill  # New Task object is always a prefill task
+        self.stop_with_eos = stop_with_eos
+
+        # Request
         self.req = req
+        self.prefill_chunk_size: Optional[int] = (
+            None  # Dynamic in Task, but adds up to be no higher than a static bound in PackedTasks
+        )
+        self.consumed_req_tokens = 0
+
+        # Response
         if get_global_args().infer.op_impl == "cpu":
             self.response = DeviceList([], dtype=torch.long, device="cpu")
         else:
@@ -327,20 +354,14 @@ class Task:
         self.num_new_tokens: int = 0
         self.next_token: int = -1  # Only effective when num_new_tokens > 0
 
-        # scheduling related
-        self.task_id = task_id
-        self.task_type = TaskType.Prefill  # New Task object is always a prefill task
-        self.stop_with_eos = stop_with_eos
-
         # Waiting is only meaningful in pipeline parallelism. It means either of:
         # 1) waiting logits to return from another node, or
         # 2) waiting for a prefill task to end to begin a decode task
         # Data parallelism and tensor parallelism do not need this, because they only call scheduler after finishing a task
         self.waiting = False
+        self.handle = None  # The Case 1 waiting task's communication handle
 
-        # The Case 1 waiting task's communication handle
-        self.handle = None
-
+        # Scheduling priority
         self.arrv_ts = time.perf_counter_ns()
         self.sched_ts = self.arrv_ts
         self.priority = priority
@@ -392,9 +413,49 @@ class Task:
         self.handle = None
         self.wait_logit = None
 
-    def start_decoding(self):
-        self.task_type = TaskType.Decode
-        self.req.prefill_end_time = time.monotonic()
+    def set_prefill_chunk_size_for_one_step(self, prefill_chunk_size: int):
+        """
+        Set prefill_chunk_size. Only effective for the following step. Will be reset by consume_req_tokens
+        """
+
+        self.prefill_chunk_size = prefill_chunk_size
+
+    def next_req_tokens(self):
+        if (
+            self.prefill_chunk_size is None
+            or self.consumed_req_tokens + self.prefill_chunk_size
+            >= self.req.prefix_tokens_len
+        ):
+            return self.req.prefix_tokens[self.consumed_req_tokens :]
+        else:
+            return self.req.prefix_tokens[
+                self.consumed_req_tokens : self.consumed_req_tokens
+                + self.prefill_chunk_size
+            ]
+
+    def consume_req_tokens(self):
+        if (
+            self.prefill_chunk_size is None
+            or self.consumed_req_tokens + self.prefill_chunk_size
+            >= self.req.prefix_tokens_len
+        ):
+            self.consumed_req_tokens = self.req.prefix_tokens_len
+            self.task_type = TaskType.Decode
+            self.req.prefill_end_time = time.monotonic()
+        else:
+            self.consumed_req_tokens += self.prefill_chunk_size
+
+        self.prefill_chunk_size = None
+
+    def has_output(self):
+        return (
+            self.task_type == TaskType.Prefill
+            and (
+                self.prefill_chunk_size is None
+                or self.consumed_req_tokens + self.prefill_chunk_size
+                >= self.req.prefix_tokens_len
+            )
+        ) or self.task_type == TaskType.Decode
 
 
 def taskid2reqid(task_id):
@@ -434,6 +495,11 @@ class TaskPool:
 
     def __len__(cls):
         return len(cls.pool)
+
+    @classmethod
+    def reset(cls):
+        cls.pool = {}
+        cls.id_list = []
 
     @classmethod
     def is_empty(cls):
@@ -484,7 +550,7 @@ class PackedTasksBase:
     Serialization format:
 
     ```
-    | payload type | task type | slot id | task_id * max_num_tasks | lens * max_num_tasks |
+    | payload type | task type | slot id | task_id * max_num_tasks | lens * max_num_tasks | has_output * max_num_tasks |
     ```
     """
 
@@ -502,6 +568,7 @@ class PackedTasksBase:
         SerializedPackedTasksPayloadType.Empty
     )
     num_tokens: int = 0
+    has_outputs: List[int] = field(default_factory=list)
 
     @classmethod
     def configure(cls, max_num_tasks: int):
@@ -525,14 +592,15 @@ class PackedTasksBase:
         task_ids = []
         req_ids = []
         task_type = None
-        tokens = None
+        tokens = []
+        has_outputs = []
 
         if payload_type == SerializedPackedTasksPayloadType.Empty:
             task_type = TaskType(task_tensor[1].item())
 
-        if (
-            payload_type == SerializedPackedTasksPayloadType.Normal
-            or payload_type == SerializedPackedTasksPayloadType.EndTask
+        elif payload_type in (
+            SerializedPackedTasksPayloadType.Normal,
+            SerializedPackedTasksPayloadType.EndTask,
         ):
             decoded_ids = []
             decoded_types = []
@@ -546,11 +614,13 @@ class PackedTasksBase:
                 decoded_types.append(decoded_type)
                 if decoded_type == TaskType.Prefill:
                     lens.append(int(task_tensor[3 + cls.max_num_tasks + it]))
+                    has_outputs.append(
+                        task_tensor[3 + 2 * cls.max_num_tasks + it].bool().item()
+                    )
             task_ids = decoded_ids
             req_ids = task_ids
             num_tasks = len(task_ids)
             task_type = None
-            tokens = None
             if num_tasks > 0:
                 # TODO: need to change task type classification when adding hybrid task
                 task_type = decoded_types[0]
@@ -575,6 +645,7 @@ class PackedTasksBase:
             tokens=tokens,
             num_tokens=num_tokens,
             payload_type=payload_type,
+            has_outputs=has_outputs,
         )
 
     def serialize(self, device, payload_type=SerializedPackedTasksPayloadType.Normal):
@@ -587,20 +658,19 @@ class PackedTasksBase:
         ret[0] = payload_type.value
 
         # special payload
-        if (
-            payload_type == SerializedPackedTasksPayloadType.TerminateBackend
-            or payload_type == SerializedPackedTasksPayloadType.Heartbeat
-            or payload_type == SerializedPackedTasksPayloadType.Empty
+        if payload_type in (
+            SerializedPackedTasksPayloadType.TerminateBackend,
+            SerializedPackedTasksPayloadType.Heartbeat,
+            SerializedPackedTasksPayloadType.Empty,
         ):
             if payload_type == SerializedPackedTasksPayloadType.Empty:
                 ret[1] = self.task_type.value
             return ret.to(device)
 
-        task_indices = torch.arange(3, 3 + self.num_tasks, device="cpu")
         encoded_ids = torch.tensor(
             [req_encode(self.task_type, tid) for tid in self.task_ids], device="cpu"
         )
-        ret[task_indices] = encoded_ids
+        ret[torch.arange(3, 3 + self.num_tasks, device="cpu")] = encoded_ids
 
         if self.task_type == TaskType.Prefill:
             token_lengths = torch.tensor(
@@ -608,8 +678,13 @@ class PackedTasksBase:
                 device="cpu",
             )
             offset = 3 + PackedTasksBase.max_num_tasks
-            token_indices = torch.arange(offset, offset + self.num_tasks, device="cpu")
-            ret.scatter_(0, token_indices, token_lengths)
+            ret[torch.arange(offset, offset + self.num_tasks, device="cpu")] = (
+                token_lengths
+            )
+            offset = 3 + 2 * PackedTasksBase.max_num_tasks
+            ret[torch.arange(offset, offset + self.num_tasks, device="cpu")] = (
+                torch.tensor(self.has_outputs, device="cpu", dtype=torch.int64)
+            )
 
         ret[1] = self.task_type.value
 
@@ -638,7 +713,7 @@ class PackedTasksBase:
         # TODO: We should use torch.empty instead, but we now assume there is a `0`
         # indicating the end of tasks
         return torch.zeros(
-            (3 + cls.max_num_tasks * 2,), dtype=torch.int64, device=device
+            (3 + cls.max_num_tasks * 3,), dtype=torch.int64, device=device
         )
 
 
@@ -671,7 +746,7 @@ class PackedTasks(PackedTasksBase):
         assert all(task.task_type == self.task_type for task in self.tasks)
 
         if self.task_type == TaskType.Prefill:
-            self.tokens = [task.req.prefix_tokens for task in self.tasks]
+            self.tokens = [task.next_req_tokens() for task in self.tasks]
 
         self.payload_type = SerializedPackedTasksPayloadType.Normal
 
@@ -683,40 +758,45 @@ class PackedTasks(PackedTasksBase):
             else self.num_tasks
         )
 
+        self.output_tasks = [task for task in self.tasks if task.has_output()]
+        self.has_outputs = [task.has_output() for task in self.tasks]
+
         # sample related
-        self.is_all_greedy = all(task.req.params.top_k <= 1 for task in self.tasks)
+        self.is_all_greedy = all(
+            task.req.params.top_k <= 1 for task in self.output_tasks
+        )
         self.temperatures = torch.tensor(
-            [task.req.params.temperature for task in self.tasks]
+            [task.req.params.temperature for task in self.output_tasks]
         ).to(device=self.rank, non_blocking=True)
-        self.top_ps = torch.tensor([task.req.params.top_p for task in self.tasks]).to(
-            device=self.rank, non_blocking=True
-        )
-        self.top_ks = torch.tensor([task.req.params.top_k for task in self.tasks]).to(
-            device=self.rank, non_blocking=True
-        )
+        self.top_ps = torch.tensor(
+            [task.req.params.top_p for task in self.output_tasks]
+        ).to(device=self.rank, non_blocking=True)
+        self.top_ks = torch.tensor(
+            [task.req.params.top_k for task in self.output_tasks]
+        ).to(device=self.rank, non_blocking=True)
         self.frequency_penalties = torch.tensor(
-            [task.req.params.frequency_penalty for task in self.tasks],
+            [task.req.params.frequency_penalty for task in self.output_tasks],
             dtype=torch.float32,
         ).to(device=self.rank, non_blocking=True)
         self.should_apply_frequency_penalty = any(
-            task.req.params.frequency_penalty > 0 for task in self.tasks
+            task.req.params.frequency_penalty > 0 for task in self.output_tasks
         )
 
         # logprobs
-        self.return_logprobs = any(task.req.logprobs for task in self.tasks)
+        self.return_logprobs = any(task.req.logprobs for task in self.output_tasks)
 
         self.response_len = torch.tensor(
-            [len(task.response) for task in self.tasks],
+            [len(task.response) for task in self.output_tasks],
             dtype=torch.int,
             device=self.rank,
         )
         self.response_capacity = torch.tensor(
-            [len(task.response._data) for task in self.tasks],
+            [len(task.response._data) for task in self.output_tasks],
             dtype=torch.int,
             device=self.rank,
         )
         self.response_ptr = torch.tensor(
-            [task.response._data.data_ptr() for task in self.tasks],
+            [task.response._data.data_ptr() for task in self.output_tasks],
             dtype=torch.long,
             device=self.rank,
         )

@@ -4,7 +4,7 @@
 
 import time
 from logging import getLogger
-from typing import Iterable, List  # Please keep Python 3.8 compatible
+from typing import Iterable, List, Optional  # Please keep Python 3.8 compatible
 from typing_extensions import override
 
 from chitu.task import TaskPool, TaskType
@@ -44,6 +44,7 @@ class Scheduler:
             decode_num_tasks,
             Scheduler._normalize_scheduler_type(args.type.lower()),
             original_scheduler_type=args.type.lower(),
+            prefill_chunk_size=infer_args.prefill_chunk_size,
         )
 
     @staticmethod
@@ -73,6 +74,7 @@ class Scheduler:
         decode_num_tasks: int,
         scheduler_type: str,
         original_scheduler_type: str = None,
+        prefill_chunk_size: Optional[int] = None,
     ):
         """
         Initialize the scheduler.
@@ -103,6 +105,7 @@ class Scheduler:
         assert decode_num_tasks > 0, "decode_num_tasks must be greater than 0"
         self.prefill_num_tasks = prefill_num_tasks
         self.decode_num_tasks = decode_num_tasks
+        self.prefill_chunk_size = prefill_chunk_size
 
         # strict-only gating derived from original type string
         self.strict_allowed_task_type = self._extract_strict_task_type(
@@ -199,7 +202,21 @@ class Scheduler:
         for task_id in task_ids:
             TaskPool.pool[task_id].sched_ts = self.scheduling_ts
 
-        logger.debug(f"Selected task_ids: {task_ids}")
+        logger.debug(f"Selected task_ids:")
+        for task_id in task_ids:
+            task = TaskPool.pool[task_id]
+            if task.task_type == TaskType.Prefill:
+                if task.prefill_chunk_size is None:
+                    logger.debug(
+                        f"- {task_id}: Prefill token {task.consumed_req_tokens} to end"
+                    )
+                else:
+                    logger.debug(
+                        f"- {task_id}: Prefill token {task.consumed_req_tokens} to {task.consumed_req_tokens + task.prefill_chunk_size}"
+                    )
+            else:
+                logger.debug(f"- {task_id}: Decode")
+
         return task_ids
 
     def _schedule_prefill_tasks(self, task_ids: List[str]) -> List[str]:
@@ -251,6 +268,23 @@ class Scheduler:
             raise Exception(
                 f"KV_cache capacity is insufficient to support prefilling (batch_size=1, prefix_len={prefix_len})"
             )
+
+        if self.prefill_chunk_size is not None:
+            prefill_tokens = 0
+            for i in range(len(prefill_task_ids)):
+                task = TaskPool.pool[prefill_task_ids[i]]
+                task_remaining_tokens = (
+                    task.req.prefix_tokens_len - task.consumed_req_tokens
+                )
+                task_prefill_chunk_size = min(
+                    task_remaining_tokens, self.prefill_chunk_size - prefill_tokens
+                )
+                task.set_prefill_chunk_size_for_one_step(task_prefill_chunk_size)
+                prefill_tokens += task_prefill_chunk_size
+                if prefill_tokens >= self.prefill_chunk_size:
+                    prefill_task_ids = prefill_task_ids[: i + 1]
+                    break
+
         return prefill_task_ids[:num_tasks]
 
     def _schedule_decode_tasks(self, task_ids: List[str]) -> List[str]:

@@ -59,11 +59,60 @@ class MockTokenizer:
         self.stop_tokens = [2]
 
 
-def test_prefill_first():
+def test_chunked_prefill():
+    set_global_args(
+        OmegaConf.create({"infer": {"max_seq_len": 32768, "op_impl": "torch"}}),
+        need_ensure=False,
+    )
+    TaskPool.reset()
+    Backend.cache_manager = MockCacheManager(num_blocks=10000, block_size=512)
+
+    for i in range(4):
+        req = MockFixedLengthedUserRequest(
+            input_len=1000 * (i + 1), request_id=f"req_{i}", enable_reasoning=False
+        )
+        task = Task(f"{req.request_id}", req)
+        TaskPool.add(task)
+
+    scheduler = Scheduler(4, 4, "prefill_first", prefill_chunk_size=4096)
+
+    # Prefill:
+
+    # Remaining: [1000, 2000, 3000, 4000]
+
+    batch1_ids = scheduler.schedule()
+    assert sorted(batch1_ids) == sorted(["req_0", "req_1", "req_2"])
+    for task_id in batch1_ids:
+        TaskPool.pool[task_id].consume_req_tokens()
+
+    # Remaining: [0, 0, 1904, 4000]
+
+    batch2_ids = scheduler.schedule()
+    assert sorted(batch2_ids) == sorted(["req_2", "req_3"])
+    for task_id in batch2_ids:
+        TaskPool.pool[task_id].consume_req_tokens()
+
+    # Remaining: [0, 0, 0, 1808]
+
+    batch3_ids = scheduler.schedule()
+    assert sorted(batch3_ids) == sorted(["req_3"])
+    for task_id in batch3_ids:
+        TaskPool.pool[task_id].consume_req_tokens()
+
+    # Remaining: [0, 0, 0, 0]
+
+    # Decode:
+
+    batch4_ids = scheduler.schedule()
+    assert sorted(batch4_ids) == sorted(["req_0", "req_1", "req_2", "req_3"])
+
+
+def test_priority_prefill_first():
     set_global_args(
         OmegaConf.create({"infer": {"max_seq_len": 1024, "op_impl": "torch"}}),
         need_ensure=False,
     )
+    TaskPool.reset()
     Backend.cache_manager = MockCacheManager(num_blocks=10, block_size=512)
 
     tasks = []
@@ -73,9 +122,9 @@ def test_prefill_first():
         )
         task = Task(f"{req.request_id}", req)
         tasks.append(task)
-    tasks[2].start_decoding()
-    tasks[5].start_decoding()
-    tasks[6].start_decoding()
+    tasks[2].consume_req_tokens()
+    tasks[5].consume_req_tokens()
+    tasks[6].consume_req_tokens()
 
     TaskPool.add(tasks[7])
     TaskPool.add(tasks[2])
@@ -113,11 +162,12 @@ def test_prefill_first():
     assert len(batch5_ids) == 0
 
 
-def test_fcfs():
+def test_priority_fcfs():
     set_global_args(
         OmegaConf.create({"infer": {"max_seq_len": 1024, "op_impl": "torch"}}),
         need_ensure=False,
     )
+    TaskPool.reset()
     Backend.cache_manager = MockCacheManager(num_blocks=10, block_size=512)
 
     tasks = []
@@ -127,9 +177,9 @@ def test_fcfs():
         )
         task = Task(f"{req.request_id}", req)
         tasks.append(task)
-    tasks[6].start_decoding()
-    tasks[7].start_decoding()
-    tasks[8].start_decoding()
+    tasks[6].consume_req_tokens()
+    tasks[7].consume_req_tokens()
+    tasks[8].consume_req_tokens()
 
     TaskPool.add(tasks[7])
     TaskPool.add(tasks[2])
@@ -162,11 +212,12 @@ def test_fcfs():
     assert len(batch4_ids) == 0
 
 
-def test_request_preset_over_prefill_first():
+def test_priority_request_preset_over_prefill_first():
     set_global_args(
         OmegaConf.create({"infer": {"max_seq_len": 1024, "op_impl": "torch"}}),
         need_ensure=False,
     )
+    TaskPool.reset()
     Backend.cache_manager = MockCacheManager(num_blocks=10, block_size=512)
 
     tasks = []
@@ -176,9 +227,9 @@ def test_request_preset_over_prefill_first():
         )
         task = Task(f"{req.request_id}", req, priority=2 if i in [0, 3, 4, 6] else 1)
         tasks.append(task)
-    tasks[2].start_decoding()
-    tasks[5].start_decoding()
-    tasks[6].start_decoding()
+    tasks[2].consume_req_tokens()
+    tasks[5].consume_req_tokens()
+    tasks[6].consume_req_tokens()
 
     TaskPool.add(tasks[7])
     TaskPool.add(tasks[2])
@@ -222,6 +273,8 @@ def test_single_prompt_seq_bigger_than_scheduler_capacity():
         OmegaConf.create({"infer": {"max_seq_len": 2048, "op_impl": "torch"}}),
         need_ensure=False,
     )
+    TaskPool.reset()
+
     NUM_BLOCKS = 2
     BLOCK_SIZE = 512
     Backend.cache_manager = MockCacheManager(
@@ -252,6 +305,8 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
         OmegaConf.create({"infer": {"max_seq_len": 1024, "op_impl": "torch"}}),
         need_ensure=False,
     )
+    TaskPool.reset()
+
     NUM_BLOCKS = 2
     BLOCK_SIZE = 512
     DIFF = 5
@@ -271,7 +326,7 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
     Backend.cache_manager.prepare_cache_prefill(task_ids[0])
     req._prefix_tokens.append(1)
 
-    task.start_decoding()
+    task.consume_req_tokens()
     for step in range(DIFF - 1):
         task_ids = scheduler.schedule()
         assert task_ids == [
@@ -295,6 +350,8 @@ def test_evict_decode_task():
         ),
         need_ensure=False,
     )
+    TaskPool.reset()
+
     NUM_BLOCKS = 10
     BLOCK_SIZE = 512
     DECODE_NUM_TASKS = 4
@@ -317,7 +374,7 @@ def test_evict_decode_task():
         tasks.append(task)
         TaskPool.add(task)  # pool: [req_0,req_1,...,req_9]
         Backend.cache_manager.prepare_cache_prefill(task.task_id)
-        task.start_decoding()
+        task.consume_req_tokens()
 
     # evict low priority tasks(req_8,req_9) when cache manager has no more blocks for decoding
     req_8_prefix_tokens = tasks[-2].req.prefix_tokens

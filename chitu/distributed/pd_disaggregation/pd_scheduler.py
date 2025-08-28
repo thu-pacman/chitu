@@ -378,7 +378,7 @@ class PDScheduler(Scheduler):
         except Exception as e:
             logger.warning(f"failed to wrap task with token manager: {e}")
         if task_type == TaskType.Decode:
-            task.start_decoding()
+            task.consume_req_tokens()
         return task
 
     def _tokenize_messages(self, messages):
@@ -441,10 +441,7 @@ class PDScheduler(Scheduler):
         req_id = task.req.request_id
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         try:
-            Backend.cache_manager.prepare_cache_prefill(
-                [req_id],
-                BatchedSeqLen.from_tokens([tokens], device=torch.device(local_rank)),
-            )
+            Backend.cache_manager.prepare_cache_prefill([req_id], [len(tokens)])
             payload_prefill = torch.tensor(
                 tokens, device=torch.device(local_rank), dtype=torch.int64
             )
