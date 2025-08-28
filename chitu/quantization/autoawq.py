@@ -4,6 +4,7 @@
 
 import torch
 
+from chitu.lazy import eval_lazy
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase
 
@@ -37,17 +38,23 @@ class AutoAWQLinear(QuantizedLinearBase):
         )
 
         for name, buffer in wqlinear.named_buffers():
-            self.register_buffer(name, buffer)
+            self.register_parameter(
+                name, torch.nn.Parameter(buffer, requires_grad=False)
+            )
         for name, param in wqlinear.named_parameters():
             self.register_parameter(name, param)
 
+        if not hasattr(self, "bias"):
+            self.register_parameter("bias", None)
+
         self.w_bit = wqlinear.w_bit
         self.group_size = wqlinear.group_size
-        self.bias = wqlinear.bias
         self.out_features = wqlinear.out_features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from awq.modules.linear.gemm import WQLinearMMFunction
+
+        x = eval_lazy(x)
 
         if x.dtype != torch.float16:
             x = x.to(torch.float16)
