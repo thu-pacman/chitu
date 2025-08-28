@@ -57,6 +57,9 @@ class CommGroup:
     def __str__(self):
         return f"{self.__class__.__name__}(group_size={self.group_size}, rank_in_group={self.rank_in_group}, rank_list={self.rank_list})"
 
+    def barrier(self):
+        torch.distributed.barrier(group=self.gpu_group, device_ids=[self.local_rank])
+
     def all_reduce(
         self,
         tensor: torch.Tensor,

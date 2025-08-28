@@ -104,7 +104,7 @@ class TransformerHFGlm4Moe(TransformerHFLlama):
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if any(
-                k.endswith(f".experts.0.{w}.{part}")
+                k.endswith(f".experts.{self.experts_start_idx}.{w}.{part}")
                 for w in ["gate_proj", "down_proj", "up_proj", "gate_up_proj"]
                 for part in self._get_2d_out_x_in_tensor_names(quant)
                 + self._get_2d_in_x_out_tensor_names(quant)
@@ -112,9 +112,9 @@ class TransformerHFGlm4Moe(TransformerHFLlama):
                 + self._get_1d_out_tensor_names(quant)
             ):
                 w, part = k.split(".")[-2:]
-                prefix = k[: -len(f"experts.0.{w}.{part}")]
+                prefix = k[: -len(f"experts.{self.experts_start_idx}.{w}.{part}")]
                 parts = []
-                for i in range(self.params.n_routed_experts):
+                for i in range(self.experts_start_idx, self.experts_end_idx):
                     parts.append(prefix + f"experts.{i}.{w}.{part}")
                 if fuse_shared_experts:
                     parts.append(prefix + f"shared_experts.{w}.{part}")

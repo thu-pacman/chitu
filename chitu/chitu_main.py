@@ -16,7 +16,7 @@ import torch.distributed
 from chitu.backend import Backend, BackendState
 from chitu.cache_manager import PagedKVCacheManager
 from chitu.device_type import is_nvidia, is_ascend
-from chitu.executor import Executor
+from chitu.executor import Executor, BatchResult
 from chitu.global_vars import (
     get_global_args,
     set_global_variables,
@@ -33,6 +33,7 @@ from chitu.task import (
     TaskType,
     UserRequest,
     MockFixedLengthedUserRequest,
+    DPTaskCollector,
 )
 from chitu.utils import gen_req_id, try_import_opt_dep
 from chitu.schemas.utils import ModelConfigResolver
@@ -461,20 +462,26 @@ def chitu_run_normal():
             else PackedTasks(task_ids)
         )
 
-        logits = Backend.executor.step(tasks)
+        tokens = Backend.executor.step(tasks)
 
-        if Backend.task_id_list is not None:
-            tasks = Backend.all_tasks
-            logits = Backend.cat_logits
-            task_ids = Backend.all_task_ids
-            Backend.task_id_list = None
+        if DPTaskCollector.has_available_tasks():
+            tasks = DPTaskCollector.get_total_packedtasks()
+            task_ids = tasks.task_ids
+            DPTaskCollector.clear()
 
         # postprocess
         if len(Backend.last_batch_results) > 0:
             Backend.executor.postprocess_async_part(
                 Backend.last_batch_results.popleft()
             )
-        curr_batch_result = Backend.executor.postprocess_sync_part(tasks, logits)
+        curr_batch_result = BatchResult(
+            num_tasks=tasks.num_tasks,
+            tasks=tasks.tasks,
+            next_tokens=tokens,
+            return_logprobs=tasks.return_logprobs,
+            logprobs=tasks.logprobs.cpu() if tasks.return_logprobs else None,
+            token_idxs=tasks.token_idxs.cpu() if tasks.return_logprobs else None,
+        )
         Backend.last_batch_results.append(curr_batch_result)
         removed_decode_task_ids = Backend.scheduler.update(task_ids)
         remove_kvcache_all_device(removed_decode_task_ids)

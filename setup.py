@@ -101,7 +101,7 @@ if os.environ.get("CHITU_WITH_CYTHON", "0") != "0":
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="chitu",
-    version="0.4.1",
+    version="0.4.2",
     install_requires=install_requires,
     extras_require=extras_require,
     packages=find_packages(),

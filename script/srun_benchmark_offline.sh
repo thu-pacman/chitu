@@ -24,7 +24,8 @@ MODEL_NAME=${MODEL_NAME:-"DeepSeek-R1"}
 MODEL_PATH=${MODEL_PATH:-"/data/nfs/DeepSeek-R1"}
 
 ITERS=${ITERS:-3}
-NUM_REQS=${NUM_REQS:-128}
+MAX_NUM_REQS=${MAX_NUM_REQS:-128}
+NUM_REQS_LIST=${NUM_REQS_LIST:-"[128]"}
 INPUT_LEN=${INPUT_LEN:-128}
 OUTPUT_LEN=${OUTPUT_LEN:-128}
 STOP_WITH_EOS=${STOP_WITH_EOS:-False}
@@ -44,10 +45,10 @@ NUM_GPU_PER_NODE=$(( (TP * PP * DP) / NODE ))
 ADDITIONAL_ARGS=(
     infer.use_cuda_graph=True
     infer.mla_absorb=absorb-without-precomp
-    infer.moe.prefill_token_dispatcher=allgather
-    infer.moe.decode_token_dispatcher=lowlatency
-    infer.moe.prefill_experts_impl=triton
-    infer.moe.decode_experts_impl=deepgemm-ll
+    infer.moe.prefill_token_dispatcher=auto
+    infer.moe.decode_token_dispatcher=auto
+    infer.moe.deepep_use_fp8=True
+
 )
 bash "$SRUN_PATH" "$NODE" "$NUM_GPU_PER_NODE" \
     "$BENCHMARK_PATH" \
@@ -60,10 +61,10 @@ bash "$SRUN_PATH" "$NODE" "$NUM_GPU_PER_NODE" \
     infer.cache_type=paged \
     infer.attn_type=flash_mla \
     infer.num_blocks=100 \
-    infer.max_reqs="$NUM_REQS" \
+    infer.max_reqs="$MAX_NUM_REQS" \
     infer.max_seq_len="$MAX_SEQ_LEN" \
     benchmark.iters="$ITERS" \
-    benchmark.num_reqs="$NUM_REQS" \
+    benchmark.num_reqs_list="$NUM_REQS_LIST" \
     benchmark.input_len="$INPUT_LEN" \
     benchmark.output_len="$OUTPUT_LEN" \
     benchmark.stop_with_eos="$STOP_WITH_EOS" \

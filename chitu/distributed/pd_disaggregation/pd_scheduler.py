@@ -413,7 +413,7 @@ class PDScheduler(Scheduler):
             pass
 
         # Build a PackedTasksBase with one task (avoid TaskPool dependency)
-        tokens = task.req.prefix_tokens
+        tokens = task.prefix_tokens
         tasks = PackedTasksBase(
             num_tasks=1,
             task_ids=[task.task_id],
@@ -437,7 +437,7 @@ class PDScheduler(Scheduler):
 
         logger.info(f"executing decode for task: {task.task_id}")
 
-        tokens = task.req.prefix_tokens
+        tokens = task.prefix_tokens
         req_id = task.req.request_id
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         try:

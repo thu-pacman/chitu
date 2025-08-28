@@ -9,6 +9,7 @@ from torch_npu.contrib import transfer_to_npu
 
 from chitu.global_vars import get_global_args
 from chitu.utils import log_with_rank, try_import_opt_dep
+from chitu.distributed.parallel_state import get_ep_size
 
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
@@ -58,12 +59,13 @@ def fused_experts_npu(
     **kwargs,
 ):
 
-    n_local_experts = w1.shape[0]
-    topk_ids = topk_ids - experts_start_idx
-    mask = (topk_ids < 0) | (topk_ids >= n_local_experts)
-    # see https://www.hiascend.com/document/detail/zh/Pytorch/60RC3/ptmoddevg/trainingmigrguide/performance_tuning_0033.html
-    topk_weights *= ~mask
-    topk_ids *= ~mask
+    if get_ep_size() > 1:
+        n_local_experts = w1.shape[0]
+        topk_ids = topk_ids - experts_start_idx
+        mask = (topk_ids < 0) | (topk_ids >= n_local_experts)
+        # see https://www.hiascend.com/document/detail/zh/Pytorch/60RC3/ptmoddevg/trainingmigrguide/performance_tuning_0033.html
+        topk_weights *= ~mask
+        topk_ids *= ~mask
 
     # Check constraints.
     if not get_global_args().infer.npu_fusion_fp4:

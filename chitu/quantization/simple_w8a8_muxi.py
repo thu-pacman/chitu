@@ -30,32 +30,40 @@ class W8A8MuxiLinear(QuantizedLinearBase):
 
         self.in_features = in_features
         self.out_features = out_features
-        self.register_buffer(
+        self.register_parameter(
             "weight",
-            torch.zeros(
-                self.out_features,
-                self.in_features,
-                dtype=torch.int8,
+            torch.nn.Parameter(
+                torch.empty(
+                    self.out_features,
+                    self.in_features,
+                    dtype=torch.int8,
+                ),
                 requires_grad=False,
             ),
         )
-        self.register_buffer(
+        self.register_parameter(
             "scale_channel",
-            torch.ones(
-                [self.out_features],
-                dtype=torch.float,
+            torch.nn.Parameter(
+                torch.empty(
+                    self.out_features,
+                    dtype=torch.float,
+                ),
                 requires_grad=False,
             ),
         )
         if has_bias:
-            self.register_buffer(
+            self.register_parameter(
                 "bias",
-                torch.zeros(
-                    (self.out_features,), dtype=torch.float16, requires_grad=False
+                torch.nn.Parameter(
+                    torch.empty(
+                        self.out_features,
+                        dtype=torch.float16,
+                    ),
+                    requires_grad=False,
                 ),
             )
         else:
-            self.register_buffer("bias", None)
+            self.register_parameter("bias", None)
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:

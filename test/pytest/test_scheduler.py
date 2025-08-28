@@ -34,12 +34,12 @@ class MockCacheManager:
         return self._num_used_blocks
 
     def prepare_cache_prefill(self, task_id):
-        prefill_len = TaskPool.pool[task_id].req.prefix_tokens_len
+        prefill_len = TaskPool.pool[task_id].prefix_tokens_len
         needed_blocks = (prefill_len + self.block_size - 1) // self.block_size
         self._num_used_blocks += needed_blocks
 
     def req_needs_new_block(self, task_id):
-        prefix_len_old = TaskPool.pool[task_id].req.prefix_tokens_len
+        prefix_len_old = TaskPool.pool[task_id].prefix_tokens_len
         if prefix_len_old % self.block_size == 0:
             return True
         return False
@@ -49,7 +49,7 @@ class MockCacheManager:
             self._num_used_blocks += 1
 
     def finalize_cache_all_decode(self, task_id):
-        prefix_len = TaskPool.pool[task_id].req.prefix_tokens_len
+        prefix_len = TaskPool.pool[task_id].prefix_tokens_len
         release_blocks = (prefix_len + self.block_size - 1) // self.block_size
         self._num_used_blocks -= release_blocks
 
@@ -324,7 +324,7 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
     scheduler = Scheduler(4, 2, "prefill_first")
     task_ids = scheduler.schedule()
     Backend.cache_manager.prepare_cache_prefill(task_ids[0])
-    req._prefix_tokens.append(1)
+    task._prefix_tokens.append(1)
 
     task.consume_req_tokens()
     for step in range(DIFF - 1):
@@ -333,7 +333,7 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
             "req_0",
         ]
         Backend.cache_manager.prepare_cache_decode(task_ids[0])
-        req._prefix_tokens.append(1)
+        task._prefix_tokens.append(1)
 
     with pytest.raises(Exception) as exc_info:
         scheduler.schedule()
@@ -377,8 +377,8 @@ def test_evict_decode_task():
         task.consume_req_tokens()
 
     # evict low priority tasks(req_8,req_9) when cache manager has no more blocks for decoding
-    req_8_prefix_tokens = tasks[-2].req.prefix_tokens
-    req_9_prefix_tokens = tasks[-1].req.prefix_tokens
+    req_8_prefix_tokens = tasks[-2].prefix_tokens
+    req_9_prefix_tokens = tasks[-1].prefix_tokens
     scheduler = Scheduler(4, DECODE_NUM_TASKS, "prefill_first,fcfs")
     assert scheduler.kvcache_block_threshold == Backend.cache_manager.get_num_blocks()
     task_ids = scheduler.schedule()
@@ -412,5 +412,5 @@ def test_evict_decode_task():
 
     task_ids = scheduler.schedule()
     assert len(task_ids) == 2
-    assert TaskPool.pool[task_ids[-1]].req.prefix_tokens == req_9_prefix_tokens
-    assert TaskPool.pool[task_ids[-2]].req.prefix_tokens == req_8_prefix_tokens
+    assert TaskPool.pool[task_ids[-1]].prefix_tokens == req_9_prefix_tokens
+    assert TaskPool.pool[task_ids[-2]].prefix_tokens == req_8_prefix_tokens

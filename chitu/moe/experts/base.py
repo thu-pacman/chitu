@@ -67,7 +67,7 @@ def fused_experts_wrapper(
             w2=w2,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            inplace=inplace,
+            inplace=True,  # default set True to save gpu memory
             activation=activation,
             use_fp8_w8a8=use_fp8_w8a8,
             use_fp4_w4a8=use_fp4_w4a8,

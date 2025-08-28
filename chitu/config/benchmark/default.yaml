@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-num_reqs: 1
+num_reqs_list: [1] # eg: benchmark.num_reqs_list="[1,2,3,4,5]"
 input_len: 128
 output_len: 128
 stop_with_eos: False # whether to stop with eos token
