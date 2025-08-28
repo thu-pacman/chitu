@@ -24,7 +24,12 @@ import einops
 
 from chitu.device_type import is_muxi
 from chitu.global_vars import get_global_args
-from chitu.ops import append_to_dense_kv_cache, append_to_paged_kv_cache
+from chitu.ops import (
+    append_to_dense_kv_cache,
+    append_to_paged_kv_cache,
+    read_from_dense_kv_cache,
+    read_from_paged_kv_cache,
+)
 from chitu.static_tensor import StaticTensor
 from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
 from chitu.cache_manager import (
@@ -312,6 +317,12 @@ class AttnBackend(abc.ABC):
                 seq_len_delta.delta_position_ids_tensor_device,
                 seq_len_delta.delta_seq_ids_tensor_device,
             )
+            if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefill
+                k = read_from_dense_kv_cache(
+                    kv_cache.k,
+                    seq_len_delta.new.position_ids_tensor_device,
+                    seq_len_delta.new.seq_ids_tensor_device,
+                )
         if v is not None:
             assert kv_cache.v is not None
             append_to_dense_kv_cache(
@@ -320,6 +331,12 @@ class AttnBackend(abc.ABC):
                 seq_len_delta.delta_position_ids_tensor_device,
                 seq_len_delta.delta_seq_ids_tensor_device,
             )
+            if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefill
+                v = read_from_dense_kv_cache(
+                    kv_cache.v,
+                    seq_len_delta.new.position_ids_tensor_device,
+                    seq_len_delta.new.seq_ids_tensor_device,
+                )
 
         return self.prefill_ragged_qkvo(
             q,
@@ -356,6 +373,13 @@ class AttnBackend(abc.ABC):
                 seq_len_delta.delta_position_ids_tensor_device,
                 seq_len_delta.delta_seq_ids_tensor_device,
             )
+            if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefilling
+                k = read_from_paged_kv_cache(
+                    kv_cache.k,
+                    kv_cache.block_table,
+                    seq_len_delta.new.position_ids_tensor_device,
+                    seq_len_delta.new.seq_ids_tensor_device,
+                )
         if v is not None:
             assert kv_cache.v is not None
             append_to_paged_kv_cache(
@@ -365,6 +389,13 @@ class AttnBackend(abc.ABC):
                 seq_len_delta.delta_position_ids_tensor_device,
                 seq_len_delta.delta_seq_ids_tensor_device,
             )
+            if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefilling
+                v = read_from_paged_kv_cache(
+                    kv_cache.v,
+                    kv_cache.block_table,
+                    seq_len_delta.new.position_ids_tensor_device,
+                    seq_len_delta.new.seq_ids_tensor_device,
+                )
 
         return self.prefill_ragged_qkvo(
             q,
@@ -1934,6 +1965,12 @@ class FlashInferBackend(TritonAttnBackend):
 class NpuAttnBackend(RefAttnBackend):
     def __init__(self, *args, **kwargs):
         super().__init__()
+
+        if get_global_args().infer.prefill_chunk_size is not None:
+            raise NotImplementedError(
+                "prefill_chunk_size is not supported yet for NpuAttnBackend"
+            )
+
         self.local_n_heads = self.args.models.n_heads // self.args.infer.tp_size
         if hasattr(self.args.models, "n_kv_heads"):
             self.local_n_kv_heads = (

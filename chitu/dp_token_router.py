@@ -19,6 +19,7 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, JSONResponse
 from chitu.async_response import AsyncDataStream, AsyncResponse
 from chitu.task import UserRequest
+from chitu.dp_request_router import get_request_router
 import logging
 
 logger = logging.getLogger(__name__)
@@ -34,12 +35,17 @@ class TokenRouter:
         # Store active request connection mappings
         self.active_requests: Dict[str, RequestContext] = {}
 
-        # Socket for receiving tokens from DP groups
-        self.token_receiver = None
+        # Socket(s) for receiving tokens from DP groups
+        self.token_receiver = None  # legacy single-socket mode
+        self.token_receivers: Dict[int, zmq.asyncio.Socket] = {}
 
         # Performance statistics
         self.total_tokens_received = 0
         self.start_time = time.time()
+        self._last_stats_log_ts = time.time()
+        self._per_dp_tokens: Dict[int, int] = defaultdict(
+            int
+        )  # dp_id -> tokens in window
 
         logger.info("TokenRouter initialized")
 
@@ -51,19 +57,45 @@ class TokenRouter:
 
         # Start background tasks
         logger.info("Token Router: Starting background tasks...")
-        await asyncio.gather(self._token_receiver_task(), self._cleanup_task())
+        tasks = [self._cleanup_task()]
+        for dp_id, sock in self.token_receivers.items():
+            tasks.append(self._recv_loop(dp_id, sock))
+        await asyncio.gather(*tasks)
 
     async def _init_sockets(self):
-        """Initialize ZMQ sockets"""
-        # Receive tokens returned from DP groups
-        self.token_receiver = self.context.socket(zmq.PULL)
+        """Initialize ZMQ sockets (support multi-PULL via ROUTER_DP_SIZE)"""
+        import os
+
         router_host = self.config.router.host
-        router_token_port = self.config.router.token_port
-        token_address = (
-            f"tcp://{router_host}:{router_token_port}"  # Token receiving port
-        )
-        self.token_receiver.bind(token_address)
-        logger.info(f"Router token receiver listening on {token_address}")
+        base_port = int(self.config.router.token_port)
+
+        # get dp_size from dp_config
+        dp_size = max(1, self.config.dp_size)
+
+        def create_and_bind(port: int):
+            sock = self.context.socket(zmq.PULL)
+
+            rcvhwm = int(os.getenv("ROUTER_RCV_HWM", "200000"))
+            rcvbuf = int(os.getenv("ROUTER_RCVBUF", "4194304"))
+            tcp_keepalive = int(os.getenv("ROUTER_TCP_KEEPALIVE", "1"))
+
+            sock.setsockopt(zmq.RCVHWM, rcvhwm)
+            sock.setsockopt(zmq.RCVBUF, rcvbuf)
+            sock.setsockopt(zmq.TCP_KEEPALIVE, tcp_keepalive)
+            addr = f"tcp://{router_host}:{port}"
+            sock.bind(addr)
+            return sock, addr
+
+        if dp_size <= 1:
+            # Backward compatibility: keep token_receiver but also normalize to token_receivers[0]
+            self.token_receiver, addr = create_and_bind(base_port)
+            self.token_receivers[0] = self.token_receiver
+            logger.info(f"Router token receiver listening on {addr}")
+        else:
+            for dp_id in range(dp_size):
+                sock, addr = create_and_bind(base_port + dp_id)
+                self.token_receivers[dp_id] = sock
+                logger.info(f"Router token receiver[{dp_id}] listening on {addr}")
 
     async def register_request(self, request_id: str, router_request) -> AsyncResponse:
         """Register new request, return AsyncResponse for streaming"""
@@ -109,19 +141,32 @@ class TokenRouter:
         )
         return response
 
-    async def _token_receiver_task(self):
-        """Receive tokens from DP schedulers"""
+    async def _recv_loop(self, dp_id: int, sock):
+        import os
+
+        # 批量排空
+        try:
+            rcv_batch = max(1, int(os.getenv("ROUTER_RCV_BATCH", "256")))
+        except Exception:
+            rcv_batch = 256
         while True:
             try:
-                if await self.token_receiver.poll(timeout=10):  # 10ms timeout
-                    data = await self.token_receiver.recv()
-                    token_data = msgpack.unpackb(data, raw=False)
-
-                    await self._process_token_data(token_data)
-
+                if await sock.poll(timeout=1):
+                    drained = 0
+                    while drained < rcv_batch:
+                        if not await sock.poll(timeout=0):
+                            break
+                        data = await sock.recv()
+                        token_data = msgpack.unpackb(data, raw=False)
+                        if dp_id is not None:
+                            token_data.setdefault("scheduler_id", dp_id)
+                        await self._process_token_data(token_data)
+                        drained += 1
+                else:
+                    await asyncio.sleep(0.001)
             except Exception as e:
-                logger.error(f"Error in token receiver: {e}")
-                await asyncio.sleep(0.1)
+                logger.error(f"Error in token receiver[{dp_id}]: {e}")
+                await asyncio.sleep(0.01)
 
     async def _process_token_data(self, token_data: Dict[str, Any]):
         """Process received token data"""
@@ -141,10 +186,6 @@ class TokenRouter:
             logger.warning(
                 f"Token Router: Received token from unknown request: {request_id}"
             )
-            # Extra diagnostics: possible reasons
-            logger.warning(
-                "Token Router: diagnostics => request context not found. Possible reasons: client stream closed, finish already sent, or router restarted."
-            )
             return
 
         context = self.active_requests[request_id]
@@ -153,7 +194,7 @@ class TokenRouter:
         # If the stream has already been marked finished, log and drop
         if getattr(context, "finished_marked", False):
             finished_at = getattr(context, "finished_time", 0)
-            logger.warning(
+            logger.error(
                 f"Token Router: token arrived after stream finished: request_id={request_id}, delay={time.time()-finished_at:.3f}s"
             )
             return
@@ -161,16 +202,16 @@ class TokenRouter:
         # Safety check 3: timestamp validation (prevent replay attacks)
         timestamp = token_data.get("timestamp", 0)
         if timestamp > 0 and time.time() - timestamp > 30:  # 30 second timeout
-            logger.warning(
+            logger.error(
                 f"Token Router: Received expired token, request_id={request_id}"
             )
             return
 
         # Safety check 4: DP group ID validation (optional)
-        dp_group_id = token_data.get("dp_group_id")
+        dp_group_id = token_data.get("scheduler_id")
         if dp_group_id is not None and hasattr(context, "expected_dp_group"):
             if dp_group_id != context.expected_dp_group:
-                logger.warning(
+                logger.error(
                     f"Token Router: Token from unexpected DP group {dp_group_id}, request_id={request_id}"
                 )
                 return
@@ -210,6 +251,40 @@ class TokenRouter:
                 text, top_logprobs, top_tokens_text, original_token_id
             )
             self.total_tokens_received += 1
+            # per-dp 统计
+            dp_id = int(token_data.get("scheduler_id", -1))
+            if dp_id >= 0:
+                self._per_dp_tokens[dp_id] += 1
+
+            # first token arrival time
+            ctx = self.active_requests.get(request_id)
+            if ctx and not ctx.first_token_logged:
+                ctx.first_token_logged = True
+                created_ts = getattr(ctx, "created_time", self.start_time)
+                ttft_ms = (time.time() - created_ts) * 1000.0
+                logger.debug(
+                    f"[TTFT] request={request_id} ttft_ms={ttft_ms:.1f} dp={token_data.get('scheduler_id')}"
+                )
+                if ttft_ms > 10000.0:
+                    logger.warning(
+                        f"[TTFT] dp={token_data.get('scheduler_id')}, request={request_id}, has long ttft_ms={ttft_ms:.1f}"
+                    )
+                # 首 token 到达即释放 Router 本地准入占位
+                router = get_request_router()
+                if router is not None and hasattr(router, "mark_request_first_token"):
+                    router.mark_request_first_token(request_id)
+
+            # Periodically print per-dp throughput, help locate if all channels are flowing
+            now = time.time()
+            if now - self._last_stats_log_ts >= 5.0:
+                per_dp = ", ".join(
+                    [f"dp{d}:{n}" for d, n in sorted(self._per_dp_tokens.items())]
+                )
+                logger.info(
+                    f"[PER_DP_TOKENS] {per_dp} total={self.total_tokens_received}"
+                )
+                self._per_dp_tokens.clear()
+                self._last_stats_log_ts = now
 
         elif token_data.get("type") == "finish":
             # Request completed
@@ -286,6 +361,8 @@ class RequestContext:
         # Finish state for graceful teardown
         self.finished_marked: bool = False
         self.finished_time: float = 0.0
+        # First token latency logging flag
+        self.first_token_logged: bool = False
 
 
 class DPAsyncDataStream(AsyncDataStream):

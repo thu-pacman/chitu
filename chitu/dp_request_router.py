@@ -8,18 +8,17 @@ Handles inter-batch data parallel request distribution.
 """
 
 import asyncio
+import os
 import logging
-import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 from chitu.global_vars import get_global_args
 import zmq
 import zmq.asyncio
 import msgpack
 
-from chitu.task import UserRequest
 from chitu.utils import gen_req_id
 
 logger = logging.getLogger(__name__)
@@ -39,62 +38,75 @@ class SchedulerStats:
     is_alive: bool = True  # alive status flag
 
 
-@dataclass
-class RouterConfig:
-    """Configuration for Request Router."""
-
-    scheduler_addresses: List[str]  # ZMQ addresses for Enhanced Schedulers
-    stats_update_interval: float = 0.1  # 100ms
-    load_balance_algorithm: str = (
-        "power_of_two_choices"  # or "round_robin", "least_loaded"
-    )
-    max_batch_size: int = 1024
-    timeout_ms: int = 5000
+from chitu.schemas.serve_config import RouterConfig as ServeRouterConfig
 
 
 class LoadBalancer:
     """Load balancing algorithms for request routing."""
 
-    def __init__(self, config: RouterConfig):
+    def __init__(self, config: ServeRouterConfig):
         self.config = config
         self.round_robin_counter = 0
         self.scheduler_stats: Dict[int, SchedulerStats] = {}
+        # admission control: per-scheduler running_requests cap
+        self.max_inflight_per_scheduler = max(
+            1, int(os.getenv("ROUTER_MAX_INFLIGHT_PER_SCHED", "24"))
+        )
+        logger.info(
+            f"[LOAD_BALANCER] max_inflight_per_scheduler: {self.max_inflight_per_scheduler}"
+        )
 
     def update_stats(self, stats: SchedulerStats):
         """Update statistics from Enhanced Schedulers."""
         self.scheduler_stats[stats.scheduler_id] = stats
 
     def select_scheduler(self) -> int:
-        """Select the best scheduler for next request."""
-        # Detailed load balancing decision logs - reduce to debug level
+        """Select the best scheduler for next request (respecting soft admission)."""
+        # Determine eligible ids first (soft admission)
+        eligible_ids = self.eligible_schedulers()
+        if not eligible_ids:
+            raise RuntimeError("No eligible schedulers available for request routing.")
+
+        algorithm = getattr(
+            self.config,
+            "load_balancer_algorithm",
+            getattr(self.config, "load_balance_algorithm", "power_of_two_choices"),
+        )
         logger.debug(
-            f"[LOAD_BALANCER] Starting scheduler selection with algorithm: {self.config.load_balance_algorithm}"
+            f"[LOAD_BALANCER] Starting scheduler selection with algorithm: {algorithm}, candidates={eligible_ids}"
         )
 
-        try:
-            if self.config.load_balance_algorithm == "round_robin":
-                scheduler_id = self._round_robin()
-            elif self.config.load_balance_algorithm == "least_loaded":
-                scheduler_id = self._least_loaded()
-            elif self.config.load_balance_algorithm == "power_of_two_choices":
-                # Fix: fallback to round_robin when statistics are insufficient
-                if len(self.scheduler_stats) < 2:
-                    logger.debug(
-                        f"[LOAD_BALANCER] power_of_two_choices statistics insufficient ({len(self.scheduler_stats)}), fallback to round_robin"
-                    )
-                    scheduler_id = self._round_robin()
-                else:
-                    scheduler_id = self._power_of_two_choices()
-            else:
-                raise ValueError(
-                    f"Unknown load balance algorithm: {self.config.load_balance_algorithm}"
-                )
-        except RuntimeError as e:
-            logger.error(f"[LOAD_BALANCER] Scheduler selection failed: {e}")
-            raise  # re-raise for upper-layer handling
+        # Round-robin among eligible ids
+        if algorithm == "round_robin":
+            idx = self.round_robin_counter % len(eligible_ids)
+            self.round_robin_counter += 1
+            return eligible_ids[idx]
 
-        logger.debug(f"[LOAD_BALANCER] Selected scheduler: {scheduler_id}")
-        return scheduler_id
+        # Least-loaded among eligible ids
+        if algorithm == "least_loaded":
+            min_load = float("inf")
+            best_scheduler = eligible_ids[0]
+            for s_id in eligible_ids:
+                stats = self.scheduler_stats[s_id]
+                load_score = stats.pending_tokens + stats.running_requests * 100
+                if load_score < min_load:
+                    min_load = load_score
+                    best_scheduler = s_id
+            return best_scheduler
+
+        # Power-of-two-choices among eligible ids (fallbacks handled)
+        if algorithm == "power_of_two_choices":
+            import random
+
+            if len(eligible_ids) < 2:
+                return eligible_ids[0]
+            c1, c2 = random.sample(eligible_ids, 2)
+            s1, s2 = self.scheduler_stats[c1], self.scheduler_stats[c2]
+            load1 = s1.pending_tokens + s1.running_requests * 100
+            load2 = s2.pending_tokens + s2.running_requests * 100
+            return c1 if load1 <= load2 else c2
+
+        raise ValueError(f"Unknown load balance algorithm: {algorithm}")
 
     def _select_alive_schedulers(self) -> list[tuple[int, SchedulerStats]]:
         """Select only alive schedulers based on stats."""
@@ -118,9 +130,10 @@ class LoadBalancer:
         except RuntimeError as e:
             logger.error(f"-ROUND_ROBIN {e}")
             raise
-        scheduler_id = self.round_robin_counter % len(alive_schedulers)
+        idx = self.round_robin_counter % len(alive_schedulers)
         self.round_robin_counter += 1
-        return scheduler_id
+        # return actual scheduler id, not index
+        return alive_schedulers[idx][0]
 
     def _least_loaded(self) -> int:
         """Select scheduler with least load."""
@@ -193,14 +206,30 @@ class LoadBalancer:
 
         return selected
 
+    def eligible_schedulers(self) -> list[int]:
+        """Soft-admission: prefer under-cap alive schedulers; fallback to all alive.
+
+        This avoids empty candidate sets causing Router-side pushbacks when the cluster is busy.
+        """
+        alive: list[int] = []
+        under_cap: list[int] = []
+        for s_id, stats in self.scheduler_stats.items():
+            if stats.is_alive:
+                alive.append(s_id)
+                if stats.running_requests < self.max_inflight_per_scheduler:
+                    under_cap.append(s_id)
+        return under_cap if under_cap else alive
+
 
 class RequestRouter:
     """Main Request Router for two-level data parallel scheduling."""
 
-    def __init__(self, config: RouterConfig):
+    def __init__(self, config: ServeRouterConfig):
         self.config = config
         self.load_balancer = LoadBalancer(config)
         self.context = zmq.asyncio.Context()
+        # 轮询游标
+        self._rr_cursor: int = 0
 
         # ZMQ sockets for communication with Enhanced Schedulers
         self.scheduler_sockets = {}
@@ -210,14 +239,34 @@ class RequestRouter:
         self.pending_requests = deque()
         self.request_stats = defaultdict(lambda: {"start_time": 0.0, "tokens": 0})
 
+        # Resolve scheduler addresses from config
+        self._scheduler_addresses: List[str] = []
+        try:
+            if hasattr(self.config, "dp_addresses") and self.config.dp_addresses:
+                self._scheduler_addresses = [
+                    f"tcp://{addr.host}:{addr.port}"
+                    for addr in self.config.dp_addresses
+                ]
+            elif hasattr(self.config, "scheduler_addresses"):
+                # Backward compatibility for legacy configs
+                self._scheduler_addresses = list(self.config.scheduler_addresses)
+        except Exception:
+            self._scheduler_addresses = []
+
         # Performance monitoring
         self.total_requests = 0
         self.total_tokens = 0
         self.start_time = time.time()
-        if not self.config.pd_disaggregation.enabled:
+        pd_disagg = getattr(self.config, "pd_disaggregation", None)
+        pd_enabled = getattr(pd_disagg, "enabled", False) if pd_disagg else False
+        if not pd_enabled:
             logger.info(
-                f"RequestRouter initialized with {len(config.scheduler_addresses)} schedulers"
+                f"RequestRouter initialized with {len(self._scheduler_addresses)} schedulers"
             )
+
+    @property
+    def scheduler_addresses(self) -> List[str]:
+        return self._scheduler_addresses
 
     async def start(self):
         """Start the Request Router service."""
@@ -228,14 +277,14 @@ class RequestRouter:
         await asyncio.gather(
             self._stats_collector_task(),
             self._request_processor_task(),
-            self._health_monitor_task(),
-            self._heartbeat_monitor_task(),
+            # self._health_monitor_task(),
+            # self._heartbeat_monitor_task(),
         )
 
     async def _init_sockets(self):
         """Initialize ZMQ sockets for communication."""
         # Create sockets to Enhanced Schedulers
-        for i, address in enumerate(self.config.scheduler_addresses):
+        for i, address in enumerate(self._scheduler_addresses):
             socket = self.context.socket(zmq.PUSH)
             socket.connect(address)
             self.scheduler_sockets[i] = socket
@@ -262,7 +311,7 @@ class RequestRouter:
 
                     # Safely get statistics data with default values
                     stats = SchedulerStats(
-                        scheduler_id=stats_dict.get("dp_group_id", 0),
+                        scheduler_id=stats_dict.get("scheduler_id", 0),
                         running_requests=stats_dict.get("running_requests", 0),
                         waiting_requests=stats_dict.get("waiting_requests", 0),
                         pending_tokens=stats_dict.get("pending_tokens", 0),
@@ -297,9 +346,18 @@ class RequestRouter:
                     request_counter += 1
                     request = self.pending_requests.popleft()
 
-                    # Select scheduler
+                    # Admission + selection delegated to LoadBalancer (soft admission inside)
                     start_time = time.time()
-                    scheduler_id = self.load_balancer.select_scheduler()
+                    try:
+                        scheduler_id = self.load_balancer.select_scheduler()
+                    except Exception:
+                        # No eligible/alive schedulers currently; push back briefly
+                        self.pending_requests.appendleft(request)
+                        logger.warning(
+                            f"[REQUEST_ROUTER] No capacity now; push back and wait a bit"
+                        )
+                        await asyncio.sleep(0.001)
+                        continue
                     selection_time = time.time() - start_time
                     logger.info(
                         f"[REQUEST_ROUTER] Scheduler id: {scheduler_id}, processing request #{request_counter}: {request.request_id}"
@@ -449,13 +507,21 @@ class RequestRouter:
             ),
             "logprobs": getattr(request, "logprobs", False),
             "top_logprobs": getattr(request, "top_logprobs", None),
+            # honor stop_with_eos from RouterRequest; default True (stop on EOS)
+            "stop_with_eos": getattr(request, "stop_with_eos", True),
             "timestamp": time.time(),
             "scheduler_id": scheduler_id,
         }
 
         try:
             data = msgpack.packb(request_data)
+            send_t0 = time.time()
             await socket.send(data)
+            send_elapsed_ms = (time.time() - send_t0) * 1000.0
+            if send_elapsed_ms > 10.0:
+                logger.warning(
+                    f"[REQUEST_ROUTER] slow send to sched {scheduler_id}: {send_elapsed_ms:.1f} ms, bytes={len(data)}"
+                )
 
             logger.debug(
                 f"[REQUEST_ROUTER] Request {request.request_id} sent successfully ({len(data)} bytes)"
@@ -521,11 +587,13 @@ def get_request_router() -> RequestRouter:
     """Get global Request Router instance"""
     global _request_router
     if _request_router is None:
-        # Use default configuration
-        config = RouterConfig(
-            scheduler_addresses=["tcp://localhost:29610", "tcp://localhost:29611"]
-        )
-        _request_router = RequestRouter(config)
+        args = get_global_args()
+        dp_config = args.dp_config
+        router_cfg = getattr(dp_config, "router", None)
+        if router_cfg is not None:
+            _request_router = RequestRouter(router_cfg)
+        else:
+            raise RuntimeError("dp_config.router not available")
     return _request_router
 
 
@@ -543,7 +611,7 @@ async def start_request_router():
     # Check if there's already a created router instance
     if _request_router is not None:
         logger.info(
-            f"Using existing Request Router instance with {len(_request_router.config.scheduler_addresses)} schedulers"
+            f"Using existing Request Router instance with {len(getattr(_request_router, 'scheduler_addresses', []))} schedulers"
         )
 
         # Start the existing Router
@@ -575,32 +643,17 @@ async def start_request_router():
     else:
         logger.info("Creating DP unified router...")
 
-        # get scheduler addresses from serve_config.yaml
-        # Get configuration parameters from dp_config
-        scheduler_addresses = [
-            f"tcp://{dp_address.host}:{dp_address.port}"
-            for dp_address in dp_config.router.dp_addresses
-        ]
-        if len(scheduler_addresses) == 0:
-            logger.warning(
-                f"Failed to get scheduler addresses from dp_config, using default addresses"
-            )
-            # If no scheduler_addresses configured, auto-generate based on inter_dp_size
-            inter_dp_size = dp_config.get("dp_size", 1)
+        # Prefer using dp_config.router; if no dp_addresses configured, fallback to localhost ports
+        router_cfg = dp_config.router
+        dp_addrs = getattr(router_cfg, "dp_addresses", None)
+        if dp_addrs:
             scheduler_addresses = [
-                f"tcp://localhost:{29610 + i}" for i in range(inter_dp_size)
+                f"tcp://{addr.host}:{addr.port}" for addr in dp_addrs
             ]
-
-        logger.info(f"Scheduler addresses: {scheduler_addresses}")
-
-        # Create Router instance
-        config = RouterConfig(
-            scheduler_addresses=scheduler_addresses,
-            load_balance_algorithm=dp_config.router.load_balancer_algorithm,
-            max_batch_size=len(scheduler_addresses) * args.infer.max_reqs,
-            stats_update_interval=0.1,
-        )
-        router = RequestRouter(config)
+            logger.info(f"Scheduler addresses: {scheduler_addresses}")
+            router = RequestRouter(router_cfg)
+        else:
+            raise RuntimeError(f"Failed to get scheduler addresses from dp_config")
 
     set_global_request_router(router)
     logger.info("Request Router configured successfully")

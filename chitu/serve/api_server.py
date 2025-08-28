@@ -12,12 +12,10 @@ import logging
 import os
 import time
 from logging import getLogger
-from threading import Thread
 from typing import Any, List, Optional, Mapping, Annotated
 
-import torch
-import torch.distributed
 import uvicorn
+import resource
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -27,10 +25,8 @@ from chitu.async_response import AsyncResponse
 from chitu.backend import Backend
 from chitu.chitu_main import chitu_init, warmup_engine
 from chitu.global_vars import get_global_args
-from chitu.schemas import ServeConfig
 from chitu.task import Task, TaskLoad, TaskPool, UserRequest
 from chitu.utils import gen_req_id
-from chitu.serve.common import start_worker
 
 logger = getLogger(__name__)
 
@@ -87,7 +83,6 @@ async def create_chat_completion(
     request: ChatRequest, http_header: Annotated[HttpHeader, Header()]
 ):
     global server_status
-    from chitu.serve.common import min_batch_size
 
     if not server_status:
         return {"message": "Service is not started"}
@@ -275,6 +270,7 @@ async def process_dp_chat_completion(
         top_k = request.top_k
         frequency_penalty = request.frequency_penalty
         stream = request.stream
+        stop_with_eos = request.stop_with_eos
 
         logger.debug(
             f"[DP_HTTP] Request parameters parsed: max_tokens={max_new_tokens}, temp={temperature}, stream={stream}"
@@ -296,6 +292,7 @@ async def process_dp_chat_completion(
             top_p=top_p,
             top_k=top_k,
             frequency_penalty=frequency_penalty,
+            stop_with_eos=stop_with_eos,
         )
 
         # Router no longer performs tokenization, sends raw message directly
@@ -398,9 +395,17 @@ async def get_dp_config():
             "dp_enabled": args.dp_config.enabled,
             "dp_service_started": True,
             "mode": "full",
-            "scheduler_count": len(request_router.config.scheduler_addresses),
-            "load_balance_method": request_router.load_balancer.config.load_balance_algorithm,
-            "scheduler_addresses": request_router.config.scheduler_addresses,
+            "scheduler_count": len(getattr(request_router, "scheduler_addresses", [])),
+            "load_balance_method": getattr(
+                request_router.load_balancer.config,
+                "load_balancer_algorithm",
+                getattr(
+                    request_router.load_balancer.config,
+                    "load_balance_algorithm",
+                    "power_of_two_choices",
+                ),
+            ),
+            "scheduler_addresses": getattr(request_router, "scheduler_addresses", []),
         }
         return config
 
@@ -515,7 +520,9 @@ async def test_dp_system():
                     if hasattr(request_router, "pending_requests")
                     else 0
                 )
-                scheduler_count = len(request_router.config.scheduler_addresses)
+                scheduler_count = len(
+                    getattr(request_router, "scheduler_addresses", [])
+                )
 
                 test_result.update(
                     {
@@ -580,7 +587,35 @@ api_logger.addFilter(IgnoreSpecificPathFilter())
 
 def start_unicorn(args):
     """Start uvicorn server"""
-    uvicorn.run(app, host=args.serve.host, port=args.serve.port, log_level="info")
+    # 大 Batch Size(>1024) 会 too many open files，这里是为了避免这个问题
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = int(os.getenv("NOFILE_SOFT_LIMIT", str(131072)))
+        new_soft = min(
+            max(soft, target), hard if hard != resource.RLIM_INFINITY else target
+        )
+        if new_soft > soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+            logger.info(f"[HTTP] Raised RLIMIT_NOFILE soft from {soft} to {new_soft}")
+    except Exception as e:
+        logger.warning(f"[HTTP] Failed to raise RLIMIT_NOFILE: {e}")
+
+    backlog = int(os.getenv("UVICORN_BACKLOG", "4096"))
+    limit_conc = int(os.getenv("UVICORN_LIMIT_CONCURRENCY", "4096"))
+    keepalive = float(os.getenv("UVICORN_TIMEOUT_KEEP_ALIVE", "2"))
+
+    config = uvicorn.Config(
+        app,
+        host=args.serve.host,
+        port=args.serve.port,
+        log_level="info",
+        backlog=backlog,
+        limit_concurrency=limit_conc,
+        timeout_keep_alive=keepalive,
+        access_log=True,
+    )
+    server = uvicorn.Server(config)
+    server.run()
 
 
 async def start_router_components_and_serve():
@@ -610,11 +645,35 @@ async def start_router_components_and_serve():
 
         # Use unified app for DP Router
         # Use uvicorn.Server instead of uvicorn.run to avoid event loop conflicts
+        # 大 Batch Size(>1024) 会 too many open files，这里是为了避免这个问题
+        try:
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            target = int(os.getenv("NOFILE_SOFT_LIMIT", str(131072)))
+            new_soft = min(
+                max(soft, target), hard if hard != resource.RLIM_INFINITY else target
+            )
+            if new_soft > soft:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+                logger.info(
+                    f"[ROUTER] Raised RLIMIT_NOFILE soft from {soft} to {new_soft}"
+                )
+        except Exception as e:
+            logger.warning(f"[ROUTER] Failed to raise RLIMIT_NOFILE: {e}")
+
+        # Configure uvicorn with sane defaults for high-concurrency
+        backlog = int(os.getenv("UVICORN_BACKLOG", "4096"))
+        limit_conc = int(os.getenv("UVICORN_LIMIT_CONCURRENCY", "4096"))
+        keepalive = float(os.getenv("UVICORN_TIMEOUT_KEEP_ALIVE", "2"))
+
         config = uvicorn.Config(
             app,
             host=args.dp_config.router.host,
             port=args.dp_config.router.port,
-            log_level="warning",
+            log_level="info",
+            access_log=True,
+            backlog=backlog,
+            limit_concurrency=limit_conc,
+            timeout_keep_alive=keepalive,
         )
         server = uvicorn.Server(config)
         # Run server in current event loop - use await instead of asyncio.run!

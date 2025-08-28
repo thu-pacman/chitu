@@ -146,6 +146,8 @@ def _auto_set_num_blocks_after_warmup(args):
 
         get_global_args().infer.num_blocks = new_num_block
         Backend.cache_manager.realloc(new_num_block)
+        if torch.distributed.get_rank() == 0:
+            Backend.scheduler.reset_kvcache_block_threshold()
 
 
 def _warmup_via_taskpool(args):
@@ -165,6 +167,8 @@ def _warmup_via_taskpool(args):
                 )
                 get_global_args().infer.num_blocks = new_num_block
                 Backend.cache_manager.realloc(new_num_block)
+                if torch.distributed.get_rank() == 0:
+                    Backend.scheduler.reset_kvcache_block_threshold()
         return
 
     rank = torch.distributed.get_rank()
@@ -173,7 +177,18 @@ def _warmup_via_taskpool(args):
 
     init_cache_static()
     num_warmup_reqs = args.infer.max_reqs
-    warmup_seq_len = 1
+    if args.infer.prefill_chunk_size is not None:
+        warmup_seq_len = max(
+            min(
+                args.infer.prefill_chunk_size // num_warmup_reqs, args.infer.max_seq_len
+            ),
+            1,
+        )
+    else:
+        logger.warning(
+            "infer.prefill_chunk_size is not set, GPU memory usage estimation may be incorrect (may cause OOM)"
+        )
+        warmup_seq_len = 1
     warmup_max_new_tokens = 2
     if rank == 0:
         for i in range(num_warmup_reqs):
@@ -187,7 +202,7 @@ def _warmup_via_taskpool(args):
             )
             task = Task(f"{req.request_id}", req, stop_with_eos=False)
             TaskPool.add(task)
-        logger.warning(f"Added {num_warmup_reqs} warmup requests to TaskPool")
+        logger.info(f"Added {num_warmup_reqs} warmup requests to TaskPool")
 
     if rank > 0:
         chitu_run()  # An extra run is needed because our implementation is asymmetric
@@ -197,7 +212,7 @@ def _warmup_via_taskpool(args):
     if rank == 0:
         assert len(TaskPool.pool) == 0, "TaskPool should be empty after warmup"
 
-    logger.warning("Inference system warmup completed")
+    logger.info("Inference system warmup completed")
 
 
 def _warmup_backend_direct(args, decode_steps: int = 2):
@@ -210,18 +225,18 @@ def _warmup_backend_direct(args, decode_steps: int = 2):
     # Prefill
     from chitu.batched_seq_len import BatchedSeqLen
 
-    Backend.cache_manager.prepare_cache_prefill(
-        [req_id], BatchedSeqLen.from_tokens([[1]], device=torch.device(local_rank))
-    )
+    Backend.cache_manager.prepare_cache_prefill([req_id], [1])
     _ = Backend.model.prefill(tokens)
     Backend.cache_manager.finalize_cache_all_prefill()
     # Decode steps
     for _ in range(max(1, decode_steps)):
         Backend.cache_manager.prepare_cache_decode([req_id])
+        # decode 期望 tokens 为 1D [batch], 否则 embedding 输出为 3D 导致后续形状不匹配
         step_token = torch.tensor(
             [0], device=torch.device(local_rank), dtype=torch.int64
-        ).unsqueeze(1)
-        _ = Backend.model.decode(step_token, len(req_id)).squeeze(1)
+        )
+        batch_size = step_token.size(0)  # = 1
+        _ = Backend.model.decode(step_token, batch_size)
         Backend.cache_manager.finalize_cache_single_decode([req_id])
     # Clean KV for this request
     Backend.cache_manager.finalize_cache_all_decode(req_id)
@@ -252,9 +267,11 @@ def warmup_engine_unified(args):
             )
             get_global_args().infer.num_blocks = new_num_block
             Backend.cache_manager.realloc(new_num_block)
+            if torch.distributed.get_rank() == 0:
+                Backend.scheduler.reset_kvcache_block_threshold()
         return
 
-    # 选择 Runner：优先环境变量；否则 PD→direct，非PD→taskpool
+    # PD→direct，非PD→taskpool
     pd_enabled = False
     try:
         pd_enabled = (
@@ -320,6 +337,16 @@ def chitu_init(args, logging_level=None):
         )
         args.float_16bit_variant = args.dtype
 
+    if (
+        args.infer.prefill_chunk_size is not None
+        and args.infer.prefill_chunk_size > args.infer.max_seq_len
+    ):
+        logger.warning(
+            f"infer.prefill_chunk_size ({args.infer.prefill_chunk_size}) is larger than max_seq_len "
+            f"({args.infer.max_seq_len}), which has no effect. Reducing it to max_seq_len."
+        )
+        args.infer.prefill_chunk_size = args.infer.max_seq_len
+
     if is_ascend():
         try:
             import torch_npu
@@ -334,38 +361,54 @@ def chitu_init(args, logging_level=None):
         site_packages_path = get_ascend_custom_opp_path()
         os.environ["ASCEND_CUSTOM_OPP_PATH"] = site_packages_path
 
-    if args.infer.attn_type == "npu":
-        # Bind process to CPU NUMA
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
-        if args.infer.bind_process_to_cpu == "auto":
-            if not has_cpuinfer and not has_numa:
-                args.infer.bind_process_to_cpu = "none"
-            elif not has_numa:
-                logger.warning(
-                    "'cpuinfer' is found but 'numa' is mising. Disabling NUMA binding. "
-                    "For better CPU inference performance, please refer to README.md and "
-                    "install the full '[cpu]' optional dependency."
-                )
-                args.infer.bind_process_to_cpu = "none"
-            elif not numa.available():
-                logger.warning(
-                    "NUMA is not support on this OS or hardware platform. Disabling NUMA binding."
-                )
-                args.infer.bind_process_to_cpu = "none"
-            elif numa.get_max_node() + 1 < local_world_size:
-                logger.info("Disable NUMA binding due to insufficient NUMA nodes.")
-                args.infer.bind_process_to_cpu = "none"
-            else:
-                args.infer.bind_process_to_cpu = "numa"
-        if args.infer.bind_process_to_cpu == "numa":
-            numa.bind({local_rank})
-        elif args.infer.bind_process_to_cpu == "none":
-            pass
-        else:
-            raise ValueError(
-                f"Unsupported infer.bind_process_to_cpu={args.infer.bind_process_to_cpu}"
+    if args.infer.prefill_chunk_size is not None:
+        if args.infer.attn_type == "npu":
+            logger.warning(
+                "Disabling infer.prefill_chunk_size because it is not compatible with infer.attn_type=npu yet"
             )
+            args.infer.prefill_chunk_size = None
+        if args.infer.dp_size > 1:
+            logger.warning(
+                "Disabling infer.prefill_chunk_size because it is not compatible with DP yet"
+            )
+            args.infer.prefill_chunk_size = None
+        if args.infer.tp_size > 1 and args.infer.cache_type == "skew":
+            logger.warning(
+                "Disabling infer.prefill_chunk_size because it is not compatible with PP+skew yet"
+            )
+            args.infer.prefill_chunk_size = None
+
+    # Bind process to CPU NUMA
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+    if args.infer.bind_process_to_cpu == "auto":
+        if not has_cpuinfer and not has_numa:
+            args.infer.bind_process_to_cpu = "none"
+        elif not has_numa:
+            logger.warning(
+                "'cpuinfer' is found but 'numa' is mising. Disabling NUMA binding. "
+                "For better CPU inference performance, please refer to README.md and "
+                "install the full '[cpu]' optional dependency."
+            )
+            args.infer.bind_process_to_cpu = "none"
+        elif not numa.available():
+            logger.warning(
+                "NUMA is not support on this OS or hardware platform. Disabling NUMA binding."
+            )
+            args.infer.bind_process_to_cpu = "none"
+        elif numa.get_max_node() + 1 < local_world_size:
+            logger.info("Disable NUMA binding due to insufficient NUMA nodes.")
+            args.infer.bind_process_to_cpu = "none"
+        else:
+            args.infer.bind_process_to_cpu = "numa"
+    if args.infer.bind_process_to_cpu == "numa":
+        numa.bind({local_rank})
+    elif args.infer.bind_process_to_cpu == "none":
+        pass
+    else:
+        raise ValueError(
+            f"Unsupported infer.bind_process_to_cpu={args.infer.bind_process_to_cpu}"
+        )
 
     # Check checkpoint exists
     check_checkpoint_path(args)
@@ -498,9 +541,10 @@ def chitu_run():
 
 async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
     # only main rank of dp group start enhanced scheduler service
+    dp_id = args.dp_config.dp_id
     if rank != 0:
         logger.warning(
-            f"[Enhanced Scheduler {rank}] only main rank of dp group start Enhanced Scheduler service"
+            f"[Enhanced Scheduler {dp_id}] only main rank of dp group start Enhanced Scheduler service"
         )
         return
 
@@ -510,7 +554,7 @@ async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
     import msgpack
     import time
 
-    logger.warning(f"[Enhanced Scheduler {rank}] Starting...")
+    logger.warning(f"[Enhanced Scheduler {dp_id}] Starting...")
 
     # Initialize ZMQ
     context = zmq.asyncio.Context()
@@ -521,7 +565,7 @@ async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
     request_address = f"tcp://{dp_config.scheduler_base_host}:{request_port}"
     request_socket.bind(request_address)
     logger.warning(
-        f"[Enhanced Scheduler {rank}] Listening to requests: {request_address}"
+        f"[Enhanced Scheduler {dp_id}] Listening to requests: {request_address}"
     )
 
     # Send statistics socket
@@ -529,32 +573,32 @@ async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
     stats_address = f"tcp://{dp_config.router.host}:{dp_config.router.stats_port}"  # Router stats port
     stats_socket.connect(stats_address)
     logger.warning(
-        f"[Enhanced Scheduler {rank}] connected to stats service: {stats_address}"
+        f"[Enhanced Scheduler {dp_id}] connected to stats service: {stats_address}"
     )
 
     # Start DP Token Manager
     try:
         from chitu.dp_token_sender import start_dp_token_manager
 
-        dp_group_id = rank  # Use rank as DP group ID
+        dp_id = get_global_args().dp_config.dp_id
         router_token_address = f"tcp://{dp_config.router.host}:{dp_config.router.token_port}"  # Token Router listen address
 
         logger.warning(
-            f"[Enhanced Scheduler {rank}] Starting DP Token Manager, group ID={dp_group_id}"
+            f"[Enhanced Scheduler {dp_id}] Starting DP Token Manager, group ID={dp_id}"
         )
-        token_manager = await start_dp_token_manager(dp_group_id, router_token_address)
+        await start_dp_token_manager(dp_id, router_token_address)
         logger.warning(
-            f"[Enhanced Scheduler {rank}] DP Token Manager started successfully"
+            f"[Enhanced Scheduler {dp_id}] DP Token Manager started successfully"
         )
     except Exception as e:
         logger.error(
-            f"[Enhanced Scheduler {rank}] DP Token Manager failed to start: {e}"
+            f"[Enhanced Scheduler {dp_id}] DP Token Manager failed to start: {e}"
         )
         # print stack trace
         import traceback
 
         logger.error(
-            f"[Enhanced Scheduler {rank}] DP Token Manager failed to start: {traceback.format_exc()}"
+            f"[Enhanced Scheduler {dp_id}] DP Token Manager failed to start: {traceback.format_exc()}"
         )
         return
 
@@ -563,7 +607,7 @@ async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
     start_time = time.time()
 
     logger.warning(
-        f"[Enhanced Scheduler {rank}] Starting to process requests, scheduler listening to requests on {request_address}"
+        f"[Enhanced Scheduler {dp_id}] Starting to process requests, scheduler listening to requests on {request_address}"
     )
     try:
         while True:
@@ -574,8 +618,8 @@ async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
                     data = await request_socket.recv()
                     request_data = msgpack.unpackb(data, raw=False)
 
-                    logger.debug(
-                        f"[Enhanced Scheduler {rank}] Received request: {request_data.get('request_id', 'unknown')}"
+                    logger.info(
+                        f"[Enhanced Scheduler {dp_id}] Received request: {request_data.get('request_id', 'unknown')}"
                     )
 
                     # Process request
@@ -584,7 +628,7 @@ async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
 
                 except Exception as e:
                     logger.error(
-                        f"[Enhanced Scheduler {rank}] Failed to process request: {e}"
+                        f"[Enhanced Scheduler {dp_id}] Failed to process request: {e}"
                     )
 
             # Send statistics periodically
@@ -595,10 +639,7 @@ async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
                 throughput = processed_requests / elapsed
 
                 stats = {
-                    "scheduler_id": rank,
-                    "dp_group_id": int(
-                        dp_config.dp_id
-                    ),  # Use provided dp_id as the unique identifier for dp group stats, since all ranks are 0 and cannot be referenced
+                    "scheduler_id": dp_config.dp_id,
                     "running_requests": (
                         len(Backend.ongoing_reqs)
                         if hasattr(Backend, "ongoing_reqs")
@@ -619,11 +660,11 @@ async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
                     stats_data = msgpack.packb(stats)
                     await stats_socket.send(stats_data)
                     logger.debug(
-                        f"[Enhanced Scheduler {rank}] throughput: {throughput:.2f}"
+                        f"[Enhanced Scheduler {dp_id}] throughput: {throughput:.2f}"
                     )
                 except Exception as e:
                     logger.error(
-                        f"[Enhanced Scheduler {rank}] throughput send failed: {e}"
+                        f"[Enhanced Scheduler {dp_id}] throughput send failed: {e}"
                     )
 
                 # Reset counter
@@ -631,15 +672,15 @@ async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
                 start_time = current_time
 
     except KeyboardInterrupt:
-        logger.warning(f"[Enhanced Scheduler {rank}] Received interrupt signal")
+        logger.warning(f"[Enhanced Scheduler {dp_id}] Received interrupt signal")
     except Exception as e:
-        logger.error(f"[Enhanced Scheduler {rank}] Service exception: {e}")
+        logger.error(f"[Enhanced Scheduler {dp_id}] Service exception: {e}")
     finally:
         # Clean up resources
         request_socket.close()
         stats_socket.close()
         context.term()
-        logger.warning(f"[Enhanced Scheduler {rank}] Service stopped")
+        logger.warning(f"[Enhanced Scheduler {dp_id}] Service stopped")
 
 
 async def process_scheduler_request(rank: int, request_data: dict):
@@ -670,14 +711,20 @@ async def process_scheduler_request(rank: int, request_data: dict):
             top_logprobs=top_logprobs,
         )
 
-        # Create Task
-        task = Task(task_id=request_id, req=user_request)
+        # Create Task, honoring stop/ignore_eos semantics from request_data
+        stop_with_eos = True
+        if request_data.get("ignore_eos"):
+            stop_with_eos = False
+        elif not request_data.get("stop_with_eos"):
+            stop_with_eos = False
+
+        task = Task(task_id=request_id, req=user_request, stop_with_eos=stop_with_eos)
 
         try:
             from chitu.dp_token_sender import get_dp_token_manager
 
-            dp_group_id = rank  # Use rank as DP group ID
-            token_manager = get_dp_token_manager(dp_group_id)
+            dp_id = get_global_args().dp_config.dp_id
+            token_manager = get_dp_token_manager(dp_id)
             # ensure token manager started
             await token_manager.start()
             if token_manager is not None:
@@ -691,21 +738,21 @@ async def process_scheduler_request(rank: int, request_data: dict):
         except Exception as e:
             # If DP Token Manager acquisition fails, fall back to original Task
             logger.error(
-                f"[Enhanced Scheduler {rank}] Failed to get DP Token Manager: {e}"
+                f"[Enhanced Scheduler {dp_id}] Failed to get DP Token Manager: {e}"
             )
             TaskPool.add(task)
             logger.warning(
-                f"[Enhanced Scheduler {rank}] Fallback to original task: {request_id}"
+                f"[Enhanced Scheduler {dp_id}] Fallback to original task: {request_id}"
             )
 
-        logger.debug(f"[Enhanced Scheduler {rank}] Request handled: {request_id}")
+        logger.debug(f"[Enhanced Scheduler {dp_id}] Request handled: {request_id}")
 
     except Exception as e:
-        logger.error(f"[Enhanced Scheduler {rank}] Failed to process request: {e}")
+        logger.error(f"[Enhanced Scheduler {dp_id}] Failed to process request: {e}")
         import traceback
 
         logger.error(
-            f"[Enhanced Scheduler {rank}] Error details: {traceback.format_exc()}"
+            f"[Enhanced Scheduler {dp_id}] Error details: {traceback.format_exc()}"
         )
 
 

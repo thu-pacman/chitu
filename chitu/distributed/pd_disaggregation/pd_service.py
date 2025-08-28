@@ -10,6 +10,7 @@ Integrates PD components into cinfer scheduler service
 import asyncio
 import logging
 from typing import Dict, Optional
+import os
 
 import msgpack
 import zmq
@@ -192,6 +193,16 @@ class PDSchedulerService:
             else:
                 logger.info("prefill-only mode: skip initializing token manager")
 
+            # Run only for Decode-only or Unified modes
+            try:
+                if self.pd_mode in (
+                    PDSchedulerMode.DECODE_ONLY,
+                    PDSchedulerMode.UNIFIED,
+                ):
+                    await self._maybe_run_decode_warmup()
+            except Exception as e:
+                logger.warning(f"decode warmup skipped due to error: {e}")
+
             self.running = True
 
             # Start async tasks
@@ -281,7 +292,16 @@ class PDSchedulerService:
             # Stats reporting socket
             self.stats_socket = self.context.socket(zmq.PUSH)
             stats_port = 29600  # Router stats port
-            self.stats_socket.connect(f"tcp://localhost:{stats_port}")
+            try:
+                # Prefer router.host from config; fallback to PD_MASTER_ADDR; last resort: localhost
+                router_host = getattr(self.args.dp_config.router, "host", "localhost")
+            except Exception:
+                router_host = "localhost"
+            if router_host in ["0.0.0.0", "::", "", None]:
+                connect_host = os.environ.get("PD_MASTER_ADDR", "localhost")
+            else:
+                connect_host = router_host
+            self.stats_socket.connect(f"tcp://{connect_host}:{stats_port}")
 
             logger.info(
                 f"bound to request port {request_port}, connected to stats port {stats_port}"
@@ -290,6 +310,82 @@ class PDSchedulerService:
         except Exception as e:
             logger.error(f"failed to initialize sockets: {e}")
             raise
+
+    # FIXME: 暂时作为临时手段，后续需要优化
+    async def _maybe_run_decode_warmup(self):
+        """Optionally run decode warmup to remove first-token stall.
+
+        Controlled via environment variables:
+        - PD_DECODE_WARMUP_STEPS or CHITU_PD_DECODE_WARMUP_STEPS (int, default 1)
+        - PD_DECODE_WARMUP_ENABLED (bool-ish, default on)
+        """
+        # Enabled flag
+        enabled_env = os.environ.get("PD_DECODE_WARMUP_ENABLED", "1").lower()
+        enabled = enabled_env not in ("0", "false", "no")
+        if not enabled:
+            return
+
+        # Steps
+        steps_str = os.environ.get(
+            "PD_DECODE_WARMUP_STEPS",
+            os.environ.get("CHITU_PD_DECODE_WARMUP_STEPS", "1"),
+        )
+        try:
+            steps = max(0, int(steps_str))
+        except Exception:
+            steps = 1
+        if steps <= 0:
+            return
+
+        start_ts = asyncio.get_event_loop().time()
+        await self._run_decode_warmup(steps)
+        dur_ms = (asyncio.get_event_loop().time() - start_ts) * 1000.0
+        logger.info(f"decode warmup completed: steps={steps}, time={dur_ms:.1f}ms")
+
+    async def _run_decode_warmup(self, steps: int):
+        """Run a minimal fake prefill + decode step to trigger kernel/JIT/graph capture.
+
+        This avoids large latency spike after the first streamed token.
+        """
+        try:
+            from chitu.backend import Backend
+            from chitu.batched_seq_len import BatchedSeqLen
+            import torch  # local import to avoid hard dependency at import time
+
+            # Build a tiny fake request context
+            req_id = f"pd-warmup-{os.getpid()}"
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            device = torch.device(local_rank)
+
+            # Prepare minimal prompt and rebuild KV on decode side
+            tokens = [0]
+            try:
+                Backend.cache_manager.prepare_cache_prefill(
+                    [req_id], BatchedSeqLen.from_tokens([tokens], device=device)
+                )
+                payload_prefill = torch.tensor(tokens, device=device, dtype=torch.int64)
+                _ = Backend.model.prefill(payload_prefill)
+                Backend.cache_manager.finalize_cache_all_prefill()
+            except Exception as e:
+                # Even if fake prefill fails, still try decode_step to warm up executor path
+                logger.warning(f"warmup fake prefill failed or skipped: {e}")
+
+            # Run N decode steps to trigger compilation/graph capture
+            last_token = 0
+            for _ in range(steps):
+                try:
+                    logits = Backend.executor.decode_step_tp_only(
+                        [req_id], [last_token]
+                    )
+                    if logits is not None and hasattr(logits, "view"):
+                        import torch as _torch
+
+                        last_token = int(_torch.argmax(logits.view(-1)).item())
+                except Exception as e:
+                    logger.warning(f"warmup decode step failed: {e}")
+                    break
+        except Exception as e:
+            logger.warning(f"decode warmup encountered error: {e}")
 
     async def _request_handler(self):
         """Handle incoming requests"""
@@ -336,7 +432,7 @@ class PDSchedulerService:
     def _collect_stats(self) -> Dict:
         """Collect scheduler statistics"""
         stats = {
-            "dp_group_id": self.rank,
+            "scheduler_id": self.rank,
             "scheduler_type": self.pd_mode.value,
             "running_requests": 0,  # TODO: implement
             "waiting_requests": 0,  # TODO: implement

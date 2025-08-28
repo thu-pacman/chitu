@@ -287,14 +287,11 @@ class NormLinearCPUInfer(QuantizedLinearBase):
         if torch.distributed.get_rank() == 0:
             self.weight = CPUParameter(
                 torch.empty(
-                    self.out_features,
-                    self.in_features,
-                    dtype=dtype,
-                    device="cpu",
+                    self.out_features, self.in_features, dtype=dtype, device="cpu"
                 ),
                 requires_grad=False,
             )
-            max_reqs = 256
+            max_reqs = get_global_args().infer.max_reqs
             self.input_cpu = StaticTensor(
                 max_nelem=max_reqs * self.in_features,
                 device="cpu",
@@ -312,8 +309,6 @@ class NormLinearCPUInfer(QuantizedLinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if torch.distributed.get_rank() == 0:
-            import cpuinfer
-
             # Initialize after __init__ because `data_ptr` may be modified during weight loading
             if not hasattr(self, "linear"):
                 linear_config = cpuinfer.linear.LinearConfig(
@@ -322,45 +317,43 @@ class NormLinearCPUInfer(QuantizedLinearBase):
                     self.stride,
                     self.group_max_len,
                     self.weight.data_ptr(),
-                    GGMLQuantizationType.BF16,
-                    GGMLQuantizationType.BF16,
+                    get_ggml_quant_type(self.weight),
+                    get_ggml_quant_type(x),
                 )
                 self.linear = cpuinfer.linear.Linear(linear_config)
 
-            self.input_cpu.set_shape(x.shape)
             out_shape = list(x.shape)
             out_shape[-1] = self.out_features
-            self.output_cpu.set_shape(out_shape)
 
-            if x.device.type == "cpu":
+            if x.device.type == "cpu" or not torch.cuda.is_current_stream_capturing():
                 inp = x.contiguous().cpu()
-                inp_ptr = inp.data_ptr()
+                out = torch.empty(
+                    out_shape, device="cpu", dtype=torch.get_default_dtype()
+                )
+
+                self.cpu_infer.submit(
+                    self.linear.forward(x.size(0), inp.data_ptr(), out.data_ptr())
+                )
+                self.cpu_infer.sync()
+
+                y = out.to(x.device, non_blocking=True)
+
             else:
                 self.input_cpu.set_shape(x.shape)
                 self.input_cpu.get().copy_(x, non_blocking=True)
-                inp_ptr = self.input_cpu.get().data_ptr()
+                self.output_cpu.set_shape(out_shape)
 
-            import cpuinfer
-
-            linear_config = cpuinfer.linear.LinearConfig(
-                self.in_features,
-                self.out_features,
-                self.stride,
-                self.group_max_len,
-                self.weight.data_ptr(),
-                get_ggml_quant_type(self.weight),
-                get_ggml_quant_type(x),
-            )
-            linear = cpuinfer.linear.Linear(linear_config)
-            self.cpu_infer.submit(
-                linear.forward(
-                    x.size(0),
-                    inp_ptr,
-                    self.output_cpu.get().data_ptr(),
+                self.cpu_infer.submit(
+                    self.linear.forward(
+                        x.size(0),
+                        self.input_cpu.get().data_ptr(),
+                        self.output_cpu.get().data_ptr(),
+                    )
                 )
-            )
-            self.cpu_infer.sync()
-            y = self.output_cpu.get().to(x.device, non_blocking=True)
+                self.cpu_infer.sync()
+
+                y = self.output_cpu.get().to(x.device, non_blocking=True)
+
         else:
             y = torch.zeros_like(x)
         return y

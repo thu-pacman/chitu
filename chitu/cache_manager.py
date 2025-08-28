@@ -13,6 +13,7 @@ from chitu.global_vars import get_slot_handle, get_timers, get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
 from chitu.ops import append_to_paged_kv_cache, append_to_dense_kv_cache
+from chitu.utils import ceil_div
 
 logger = getLogger(__name__)
 
@@ -106,13 +107,20 @@ class KVCacheManagerBase:
             self.v_shape_per_sample = None
 
         self.req_id_to_seq_len: Dict[str, int] = {}
+
+        prefill_chunk_size = get_global_args().infer.prefill_chunk_size
         self.seq_len_delta = BatchedSeqLenDelta(
             device=self.device,
             max_batch_size=num_hot_req,
-            max_total_delta_len=num_hot_req
-            * max_seq_len,  # TODO: Use chunk size once we support chunked prefill
+            max_total_len=num_hot_req * max_seq_len,
+            max_total_delta_len=(
+                prefill_chunk_size
+                if prefill_chunk_size is not None
+                else num_hot_req * max_seq_len
+            ),
             cache_prefix_lens_tensor_device=True,
-            cache_position_ids_tensor_device=False,
+            cache_position_ids_tensor_device=True,
+            cache_seq_ids_tensor_device=True,
             cache_delta_position_ids_tensor_device=True,
             cache_delta_seq_ids_tensor_device=True,
         )
@@ -121,18 +129,39 @@ class KVCacheManagerBase:
 
         self.timers = get_timers()
 
-    def prepare_cache_prefill(self, req_ids: List[str], next_seq_len: BatchedSeqLen):
+    def prepare_cache_prefill(self, req_ids: List[str], delta_seq_len: List[int]):
+        self.curr_req_ids = req_ids
+
         prev_seq_len = BatchedSeqLen(
-            [0 for req_id in req_ids],
+            [self.req_id_to_seq_len.get(req_id, 0) for req_id in req_ids],
             device=self.device,
             cache_prefix_lens_tensor_device=False,
             cache_position_ids_tensor_device=False,
+            cache_seq_ids_tensor_device=False,
+        )
+        next_seq_len = BatchedSeqLen(
+            [
+                self.req_id_to_seq_len.get(req_id, 0) + d
+                for req_id, d in zip(req_ids, delta_seq_len)
+            ],
+            device=self.device,
+            cache_prefix_lens_tensor_device=False,
+            cache_position_ids_tensor_device=False,
+            cache_seq_ids_tensor_device=False,
         )
         self.seq_len_delta.copy_from(prev_seq_len, next_seq_len)
-        self.curr_req_ids = req_ids
+
+        for req_id, seq_len in zip(req_ids, next_seq_len.lens_list):
+            self.req_id_to_seq_len[req_id] = seq_len
 
     def finalize_cache_all_prefill(self):
         self.curr_req_ids = None
+
+    def req_needs_new_block(self, req_id):
+        """If the req needs new block for decoding.
+        Return True if req needs new block, else False
+        """
+        raise NotImplementedError()
 
     def prepare_cache_decode(self, req_ids: List[str]):
         self.curr_req_ids = req_ids
@@ -143,31 +172,53 @@ class KVCacheManagerBase:
                 device=self.device,
                 cache_prefix_lens_tensor_device=False,
                 cache_position_ids_tensor_device=False,
+                cache_seq_ids_tensor_device=False,
             ),
             BatchedSeqLen(
                 [self.req_id_to_seq_len[req_id] + 1 for req_id in req_ids],
                 device=self.device,
                 cache_prefix_lens_tensor_device=False,
                 cache_position_ids_tensor_device=False,
+                cache_seq_ids_tensor_device=False,
             ),
         )
+
+        for req_id in req_ids:
+            self.req_id_to_seq_len[req_id] += 1
+
+    def get_block_size(self):
+        """Return the number of tokens that a block can accommodate"""
+        raise NotImplementedError()
+
+    def get_max_num_blocks(self):
+        """Return maximun number of total blocks, which is greater than or equal to self.get_num_blocks()"""
+        raise NotImplementedError()
+
+    def get_num_blocks(self):
+        """Return number of total blocks"""
+        raise NotImplementedError()
+
+    @property
+    def num_free_blocks(self):
+        """Return number of free blocks"""
+        raise NotImplementedError()
+
+    @property
+    def num_used_blocks(self):
+        """Renturn number of blocks that has reserved for reqs to use."""
+        raise NotImplementedError()
 
     def get_accessor(self, layer_id: int) -> KVCacheAccessor:
         raise NotImplementedError()
 
     def finalize_cache_single_decode(self, req_ids: List[str]):
-        for req_id in req_ids:
-            self.req_id_to_seq_len[req_id] += 1
         self.curr_req_ids = None
 
     def finalize_cache_all_decode(self, req_id: str):
-        pass
+        del self.req_id_to_seq_len[req_id]
 
     def get_gpu_block_table(self):
         return None
-
-    def get_block_size(self):
-        return 0
 
 
 class PagedKVCacheManager(KVCacheManagerBase):
@@ -211,7 +262,20 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
         self.max_blocks_per_req = (max_seq_len + block_size - 1) // block_size
         self.max_num_blocks = self.max_blocks_per_req * num_hot_req
-        self.num_blocks = num_blocks if num_blocks != -1 else num_hot_req
+        if num_blocks == -1:  # Being warmed-up
+            # Should be consistent with `_warmup_via_taskpool` in `chitu_main.py`
+            if get_global_args().infer.prefill_chunk_size is not None:
+                self.num_blocks = (
+                    ceil_div(
+                        get_global_args().infer.prefill_chunk_size // num_hot_req + 1,
+                        block_size,
+                    )
+                    * num_hot_req
+                )
+            else:
+                self.num_blocks = num_hot_req
+        else:
+            self.num_blocks = num_blocks
 
         self.block_size = block_size
 
@@ -286,10 +350,30 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
     @override
     def get_block_size(self):
+        """Return the number of tokens that a block can accommodate"""
         return self.block_size
 
-    def get_num_blocks(self):
+    @override
+    def get_max_num_blocks(self):
+        """Return maximun number of total blocks, which is greater than or equal to self.get_num_blocks()"""
         return self.max_num_blocks
+
+    @override
+    def get_num_blocks(self):
+        """Return number of total blocks"""
+        return self.num_blocks
+
+    @override
+    @property
+    def num_free_blocks(self):
+        """Return number of free blocks"""
+        return len(self.free_blocks)
+
+    @override
+    @property
+    def num_used_blocks(self):
+        """Renturn number of blocks that has reserved for reqs to use."""
+        return self.num_blocks - len(self.free_blocks)
 
     def _upd_gpu_block_table(self, req_ids: List[str]):
         if get_global_args().infer.use_cuda_graph:
@@ -308,21 +392,27 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.gpu_block_table.get().copy_(cpu_block_table_tensor, non_blocking=True)
 
     @override
-    def prepare_cache_prefill(self, req_ids: List[str], next_seq_len: BatchedSeqLen):
-        super().prepare_cache_prefill(req_ids, next_seq_len)
+    def prepare_cache_prefill(self, req_ids: List[str], delta_seq_len: List[int]):
+        super().prepare_cache_prefill(req_ids, delta_seq_len)
 
         block_idxs = []
         indices_in_block = []
-        for req_id, seq_len in zip(req_ids, next_seq_len.lens_list):
-            # 设置其他函数会用到的变量
-            self.req_id_to_seq_len[req_id] = seq_len
+        for req_id, new_seq_len in zip(req_ids, self.seq_len_delta.new.lens_list):
+            if req_id not in self.block_table:
+                self.block_table[req_id] = []
 
             # Allocate blocks for the request
-            num_blocks_prepared = (seq_len + self.block_size - 1) // self.block_size
-            block_ids = [self.get_free_block() for _ in range(num_blocks_prepared)]
-            self.block_table[req_id] = block_ids
+            while len(self.block_table[req_id]) * self.block_size < new_seq_len:
+                self.block_table[req_id].append(self.get_free_block())
 
         self._upd_gpu_block_table(req_ids)
+
+    @override
+    def req_needs_new_block(self, req_id):
+        return (
+            self.req_id_to_seq_len[req_id]
+            > len(self.block_table[req_id]) * self.block_size
+        )
 
     @override
     def prepare_cache_decode(self, req_ids: List[str]):
@@ -332,6 +422,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         # paged kv cache in place.
         for i, req_id in enumerate(req_ids):
             if self.seq_len_delta.old.lens_list[i] % self.block_size == 0:
+                assert self.req_needs_new_block(req_id)
                 self.block_table[req_id].append(self.get_free_block())
 
         self._upd_gpu_block_table(req_ids)
@@ -340,7 +431,9 @@ class PagedKVCacheManager(KVCacheManagerBase):
         # TODO: When run out of free blocks, use scheduling and preemption in paper instead of exception
         self.timers("get_free_block").start()
         if len(self.free_blocks) == 0:
-            raise Exception("No more free blocks.")
+            raise Exception(
+                f"No more free blocks: cache manager has total {self.get_num_blocks()} blocks, {self.num_used_blocks} blocks has been used."
+            )
         idx = self.free_blocks.popleft()
         self.timers("get_free_block").stop()
         return idx
@@ -368,7 +461,6 @@ class PagedKVCacheManager(KVCacheManagerBase):
         for block in self.block_table[req_id]:
             self.free_blocks.append(block)
         del self.block_table[req_id]
-        del self.req_id_to_seq_len[req_id]
         self.timers("free_req_cache_blocks").stop()
 
     @override
@@ -379,6 +471,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         # assert req_id in self.req_id_to_seq_len
         # assert req_id in self.block_table
         self.free_req_cache_blocks(req_id)
+        super().finalize_cache_all_decode(req_id)
         self.timers("finalize_cache_all_decode").stop()
 
     # --- PD disaggregation support ---
@@ -507,6 +600,35 @@ class DenseKVCacheManager(KVCacheManagerBase):
 
         self.slot_handle = get_slot_handle()
 
+    @override
+    def get_block_size(self):
+        """Return the number of tokens that a block can accommodate"""
+        return self.max_seq_len
+
+    @override
+    def get_max_num_blocks(self):
+        """Return maximun number of total blocks, which is greater than or equal to self.get_num_blocks()"""
+        return self.get_num_blocks()
+
+    @override
+    def get_num_blocks(self):
+        """Return number of total blocks"""
+        return self.num_hot_req
+
+    @override
+    @property
+    def num_free_blocks(self):
+        """Return number of free blocks"""
+        return sum(1 for is_available in self.slot_availability if is_available == True)
+
+    @override
+    @property
+    def num_used_blocks(self):
+        """Renturn number of blocks that has reserved for reqs to use."""
+        return sum(
+            1 for is_available in self.slot_availability if is_available == False
+        )
+
     def get_start_and_end_idx(self):
         if self.slot_handle:
             start_idx, end_idx = self.slot_handle.get_current_slot_start_end_idx()
@@ -515,8 +637,8 @@ class DenseKVCacheManager(KVCacheManagerBase):
         return start_idx, end_idx
 
     @override
-    def prepare_cache_prefill(self, req_ids: List[str], next_seq_len: BatchedSeqLen):
-        super().prepare_cache_prefill(req_ids, next_seq_len)
+    def prepare_cache_prefill(self, req_ids: List[str], delta_seq_len: List[int]):
+        super().prepare_cache_prefill(req_ids, delta_seq_len)
 
         # get start_idx and end_idx of current slot_group
         start_idx, end_idx = self.get_start_and_end_idx()
@@ -524,24 +646,29 @@ class DenseKVCacheManager(KVCacheManagerBase):
         # Only allocate slots in current slot_group
         slot_id = start_idx
         for it, req_id in enumerate(req_ids):
-            self.req_id_to_seq_len[req_id] = next_seq_len.lens_list[it]
-            allocated = False
-            while slot_id < end_idx:
-                if self.slot_availability[slot_id]:
-                    self.req2slot[req_id] = slot_id
-                    self.slot_availability[slot_id] = False
-                    self.hot_reqs[slot_id] = req_id
-                    allocated = True
+            if req_id not in self.req2slot:
+                allocated = False
+                while slot_id < end_idx:
+                    if self.slot_availability[slot_id]:
+                        self.req2slot[req_id] = slot_id
+                        self.slot_availability[slot_id] = False
+                        self.hot_reqs[slot_id] = req_id
+                        allocated = True
+                        slot_id += 1
+                        break
                     slot_id += 1
-                    break
-                slot_id += 1
-            assert allocated, f"Failed to allocate slot for {req_id}"
+                assert allocated, f"Failed to allocate slot for {req_id}"
 
         start_pos = self.req2slot[req_ids[0]]
-
         self._prepare_cache(req_ids, start_pos)
 
-    # Decode:
+    @override
+    def req_needs_new_block(self, req_id):
+        """If the req needs new block for decoding.
+        Return True if req needs new block, else False
+        """
+        return False
+
     @override
     def prepare_cache_decode(self, req_ids: List[str]):
         self.timers("cache_prepare").start()
@@ -566,7 +693,6 @@ class DenseKVCacheManager(KVCacheManagerBase):
             else self.v_buffer[:, start_pos : start_pos + len(req_ids)]
         )
 
-    # Decode:
     @override
     def get_accessor(self, layer_id: int) -> DenseKVCacheAccessor:
         ret_k = (
@@ -581,7 +707,6 @@ class DenseKVCacheManager(KVCacheManagerBase):
         )
         return DenseKVCacheAccessor(ret_k, ret_v)
 
-    # Decode:
     @override
     def finalize_cache_all_decode(self, req_id: str):
         if req_id not in self.hot_reqs:
@@ -644,3 +769,5 @@ class DenseKVCacheManager(KVCacheManagerBase):
                 self.k_buffer[:, slot_id].zero_()
             if self.v_buffer is not None:
                 self.v_buffer[:, slot_id].zero_()
+
+        super().finalize_cache_all_decode(req_id)

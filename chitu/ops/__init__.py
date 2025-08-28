@@ -5,7 +5,12 @@
 from chitu.ops.rotary import apply_rotary_pos_emb
 from chitu.ops.activation import silu_and_mul
 from chitu.ops.sampling import multinomial, apply_frequency_penalty, response_append
-from chitu.ops.kv_cache import append_to_paged_kv_cache, append_to_dense_kv_cache
+from chitu.ops.kv_cache import (
+    append_to_paged_kv_cache,
+    append_to_dense_kv_cache,
+    read_from_paged_kv_cache,
+    read_from_dense_kv_cache,
+)
 from chitu.ops.norm import rms_norm
 from chitu.ops.moe_gate import moe_gate
 from chitu.ops.quant import (

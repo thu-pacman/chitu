@@ -155,16 +155,10 @@ class PipeDispatcher(TasksDispatcher):
 
     def send_payload(self, payload: torch.Tensor):
         # logits / hidden payload
-        if self.is_last_stage:
-            payload = payload.view(payload.shape[0], -1)
-            tag = LOGIT_TAG
-        else:
-            tag = HIDDEN_TENSOR_TAG
-
         torch.distributed.isend(
             tensor=payload.contiguous(),  # contiguous() is necessary for NCCL
             dst=self.next_rank,
-            tag=tag,
+            tag=LOGIT_TAG if self.is_last_stage else HIDDEN_TENSOR_TAG,
             group=self.next_pair_group,
         )
 
@@ -391,10 +385,7 @@ class Executor:
             dtype=torch.long,
         )
 
-    def step(
-        self,
-        tasks: Optional[PackedTasksBase],
-    ):
+    def step(self, tasks: Optional[PackedTasksBase]) -> torch.Tensor:
         remove_kvcache = False
 
         # 1. propagate tasks and handle special payload type
@@ -453,20 +444,34 @@ class Executor:
             if tasks.task_type == TaskType.Prefill:
                 if Backend.all_tasks is not None:
                     tasks = Backend.all_tasks
-                # After prefill, new decode tasks are created
                 for task in tasks.tasks:
-                    task.start_decoding()
+                    task.consume_req_tokens()
 
             if self.pp_size > 1:
                 self._recv_logits(tasks)
 
         return out
 
-    def prefill_step(self, tasks: PackedTasksBase):
-        seq_len = BatchedSeqLen.from_tokens(
-            tasks.tokens, device=torch.device(self.local_rank)
+    def _get_output_token_offsets(self, tasks: PackedTasksBase) -> torch.Tensor:
+        if tasks.task_type == TaskType.Prefill:
+            output_token_offsets = []
+            cnt = 0
+            for i in range(tasks.num_tasks):
+                cnt += len(tasks.tokens[i])
+                if tasks.has_outputs[i]:
+                    output_token_offsets.append(cnt - 1)
+            return torch.tensor(
+                output_token_offsets, dtype=torch.int32, device=self.local_rank
+            )
+        else:
+            return torch.arange(
+                tasks.num_tasks, dtype=torch.int32, device=self.local_rank
+            )
+
+    def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
+        Backend.cache_manager.prepare_cache_prefill(
+            tasks.req_ids, [len(t) for t in tasks.tokens]
         )
-        Backend.cache_manager.prepare_cache_prefill(tasks.req_ids, seq_len)
 
         num_tokens = tasks.num_tokens
 
@@ -488,7 +493,7 @@ class Executor:
             payload = dispatcher.recv_payload(payload)
 
         self.timers("prefill").start()
-        out = Backend.model.prefill(payload)
+        out = Backend.model.prefill(payload, self._get_output_token_offsets(tasks))
         self.timers("prefill").stop()
 
         # payload send
@@ -510,10 +515,9 @@ class Executor:
         payload_type, tasks = tensor_dispatcher.dispatch_metadata(tasks, payload_type)
 
         # 2) prepare cache
-        varlens = BatchedSeqLen.from_tokens(
-            tasks.tokens, device=torch.device(self.local_rank)
+        Backend.cache_manager.prepare_cache_prefill(
+            tasks.req_ids, [len(t) for t in tasks.tokens]
         )
-        Backend.cache_manager.prepare_cache_prefill(tasks.req_ids, varlens)
 
         # 3) prepare payload on TP main rank only
         num_tokens = tasks.num_tokens
@@ -537,7 +541,7 @@ class Executor:
 
         # 5) run model
         self.timers("prefill").start()
-        out = Backend.model.prefill(payload)
+        out = Backend.model.prefill(payload, self._get_output_token_offsets(tasks))
         self.timers("prefill").stop()
 
         # 6) finalize cache
@@ -561,7 +565,6 @@ class Executor:
         """
         # 1) prepare cache and seq lens
         Backend.cache_manager.prepare_cache_decode(req_ids)
-        seq_lens = [Backend.cache_manager.req_id_to_seq_len[rid] for rid in req_ids]
 
         # 2) build payload on TP main rank only
         num_tokens = len(next_tokens)
@@ -682,7 +685,7 @@ class Executor:
 
     def _recv_logits(self, tasks: PackedTasks):
         logits = torch.empty(
-            [tasks.num_tasks, Backend.model.vocab_size],
+            [len(tasks.output_tasks), Backend.model.vocab_size],
             device=self.local_rank,
             dtype=torch.float,
         )
@@ -704,7 +707,7 @@ class Executor:
             logits_index_list = []
             response_list = []
             response_len_list = []
-            for it, task in enumerate(tasks.tasks):
+            for it, task in enumerate(tasks.output_tasks):
                 if (
                     task.req.params.frequency_penalty > 0
                     and task.task_type == TaskType.Decode
@@ -742,8 +745,8 @@ class Executor:
         # --- dependent on logits ---
         logits = logits.view(-1, logits.shape[-1]).contiguous()
         assert (
-            len(tasks.tasks) == logits.shape[0]
-        ), f"logits has shape {logits.shape}, but there are {len(tasks.tasks)} tasks"
+            len(tasks.output_tasks) == logits.shape[0]
+        ), f"logits has shape {logits.shape}, but there are {len(tasks.output_tasks)} output_tasks"
 
         tokens = self.sample(logits, tasks)
 
@@ -760,19 +763,19 @@ class Executor:
             token_list = tokens.cpu().tolist()
 
         # ---dependent on tokens_cpu ---
-        for it, task in enumerate(tasks.tasks):
+        for it, task in enumerate(tasks.output_tasks):
             task.update_response_sync(token_list[it])
 
         # test
         if tasks._test_flag:
-            for it, task in enumerate(tasks.tasks):
+            for it, task in enumerate(tasks.output_tasks):
                 task.req._test_add_logit(logits[it])
                 task.req._test_add_token(token_list[it])
 
         # Prepare data needed by further postprocessing
         return BatchResult(
             num_tasks=tasks.num_tasks,
-            tasks=tasks.tasks,
+            tasks=tasks.output_tasks,
             next_tokens=token_list,
             return_logprobs=tasks.return_logprobs,
             logprobs=logprobs.cpu() if tasks.return_logprobs else None,

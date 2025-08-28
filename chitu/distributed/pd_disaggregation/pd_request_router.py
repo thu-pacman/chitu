@@ -15,7 +15,8 @@ from typing import Dict, List, Optional
 import zmq
 import msgpack
 
-from chitu.dp_request_router import RequestRouter, RouterConfig
+from chitu.dp_request_router import RequestRouter
+from chitu.schemas.serve_config import RouterConfig as ServeRouterConfig
 from chitu.distributed.pd_disaggregation.pd_coordination import PDCoordinationService
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.transfer_engine import (
     MooncakeBootstrapServer,
@@ -32,7 +33,7 @@ logger = logging.getLogger(__name__)
 class PDRequestRouter(RequestRouter):
     """PD disaggregation request router"""
 
-    def __init__(self, config: RouterConfig):
+    def __init__(self, config: ServeRouterConfig):
         super().__init__(config)
 
         # PD disaggregation related configuration
@@ -402,7 +403,10 @@ class PDRequestRouter(RequestRouter):
                 "top_p": top_p,
                 "top_k": top_k,
                 "frequency_penalty": frequency_penalty,
-                "ignore_eos": ignore_eos,
+                # For PD path, align naming with downstream: use explicit ignore_eos flag
+                # True  -> allow generation beyond EOS (i.e., don't stop at EOS)
+                # False -> stop at EOS
+                "ignore_eos": not ignore_eos,
                 "chat_template_kwargs": chat_template_kwargs,
             }
         except Exception:

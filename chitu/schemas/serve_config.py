@@ -45,6 +45,7 @@ class InferConfig:
     bind_process_to_cpu: str = MISSING
     bind_thread_to_cpu: str = MISSING
     memory_utilization: float = MISSING
+    prefill_chunk_size: Optional[int] = MISSING
 
     @dataclass
     class MoEConfig:
