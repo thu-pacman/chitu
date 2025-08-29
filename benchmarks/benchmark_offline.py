@@ -203,4 +203,4 @@ if __name__ == "__main__":
     # As a workaround, we `exec` a dummy process to kill the current process, without
     # returning an error.
     # Don't exec bash because it loads startup scripts
-    os.execl("/usr/bin/echo", "Exiting")  # os.execl rejects "", so print something
+    os.execl("/usr/bin/true", "true")  # /usr/bin/true does nothing but exits
