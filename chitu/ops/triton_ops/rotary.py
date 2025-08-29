@@ -87,42 +87,32 @@ def apply_rotary_pos_emb_triton(
         # "separated" has an [real, real, ..., real, imag, imag, ..., imag] layout.
 
         # Get tensor shapes
-        q_batch_size, q_n_local_heads, q_head_dim = q.shape
-        k_batch_size, k_n_local_heads, k_head_dim = k.shape
+        bs, head_num_q, rotary_dim = q.shape
+        bs, head_num_k, rotary_dim = k.shape
 
-        # Define grid size
-        q_grid = (q_batch_size * q_n_local_heads, triton.cdiv(q_head_dim, block_size))
-        k_grid = (k_batch_size * k_n_local_heads, triton.cdiv(k_head_dim, block_size))
-
-        # Launch kernel (TODO: use only 1 kernel)
         assert cos.is_contiguous()
         assert sin.is_contiguous()
-        rotary_embedding_kernel_separated[q_grid](
+
+        # Launch kernel
+        grid = (bs, max(head_num_q, head_num_k), triton.cdiv(rotary_dim, block_size))
+        rotary_embedding_kernel_separated[grid](
             q,
-            cos,
-            sin,
-            q_out,
-            q_n_local_heads,
-            q_head_dim,
-            q.stride(0),
-            q.stride(1),
-            cos.stride(0),
-            sin.stride(0),
-            q_out.stride(0),
-            q_out.stride(1),
-            BLOCK_SIZE=block_size,
-        )
-        rotary_embedding_kernel_separated[k_grid](
             k,
             cos,
             sin,
+            q_out,
             k_out,
-            k_n_local_heads,
-            k_head_dim,
+            head_num_q,
+            head_num_k,
+            rotary_dim,
+            q.stride(0),
+            q.stride(1),
             k.stride(0),
             k.stride(1),
             cos.stride(0),
             sin.stride(0),
+            q_out.stride(0),
+            q_out.stride(1),
             k_out.stride(0),
             k_out.stride(1),
             BLOCK_SIZE=block_size,
@@ -174,52 +164,72 @@ def apply_rotary_pos_emb_triton(
 @triton.jit
 def rotary_embedding_kernel_separated(
     Q,
+    K,
     COS,
     SIN,
-    OUTPUT,
-    num_head,
+    Q_OUTPUT,
+    K_OUTPUT,
+    q_num_head,
+    k_num_head,
     head_dim,
     stride_q1,
     stride_q2,
+    stride_k1,
+    stride_k2,
     stride_cos1,
     stride_sin1,
-    stride_out1,
-    stride_out2,
+    stride_q_out1,
+    stride_q_out2,
+    stride_k_out1,
+    stride_k_out2,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # Get the program ID
-    pid = tl.program_id(axis=0)
-
-    # Compute batch index and head index
-    batch_idx = pid // num_head
-    head_idx = pid % num_head
-
-    # Pointers to the beginning of the Q, COS, SIN, and OUTPUT
-    Q_ptr = Q + batch_idx * stride_q1 + head_idx * stride_q2
-    COS_ptr = COS + batch_idx * stride_cos1
-    SIN_ptr = SIN + batch_idx * stride_sin1
-    OUTPUT_ptr = OUTPUT + batch_idx * stride_out1 + head_idx * stride_out2
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
 
     # Create block IDs
-    block_id = tl.program_id(axis=1)
+    block_id = tl.program_id(axis=2)
 
     # Create offsets for reading and writing
     offsets_0 = block_id * (BLOCK_SIZE // 2) + tl.arange(0, BLOCK_SIZE // 2)
     offsets_1 = offsets_0 + head_dim // 2
 
-    # Load data
+    # Load cos and sin (shared for both Q and K)
+    COS_ptr = COS + batch_idx * stride_cos1
+    SIN_ptr = SIN + batch_idx * stride_sin1
     cos0 = tl.load(COS_ptr + offsets_0, mask=offsets_0 < head_dim // 2)
     sin0 = tl.load(SIN_ptr + offsets_0, mask=offsets_0 < head_dim // 2)
-    q0 = tl.load(Q_ptr + offsets_0, mask=offsets_0 < head_dim // 2)
-    q1 = tl.load(Q_ptr + offsets_1, mask=offsets_1 < head_dim)
 
-    # Apply rotary embedding
-    q_embed0 = q0 * cos0 - q1 * sin0
-    q_embed1 = q1 * cos0 + q0 * sin0
+    # NOTE: q_num_head and k_num_head can be different.
+    if head_idx < q_num_head:
+        Q_ptr = Q + batch_idx * stride_q1 + head_idx * stride_q2
+        Q_OUTPUT_ptr = Q_OUTPUT + batch_idx * stride_q_out1 + head_idx * stride_q_out2
 
-    # Store result
-    tl.store(OUTPUT_ptr + offsets_0, q_embed0, mask=offsets_0 < head_dim // 2)
-    tl.store(OUTPUT_ptr + offsets_1, q_embed1, mask=offsets_1 < head_dim)
+        q0 = tl.load(Q_ptr + offsets_0, mask=offsets_0 < head_dim // 2)
+        q1 = tl.load(Q_ptr + offsets_1, mask=offsets_1 < head_dim)
+
+        # Apply rotary embedding
+        q_embed0 = q0 * cos0 - q1 * sin0
+        q_embed1 = q1 * cos0 + q0 * sin0
+
+        # Store result
+        tl.store(Q_OUTPUT_ptr + offsets_0, q_embed0, mask=offsets_0 < head_dim // 2)
+        tl.store(Q_OUTPUT_ptr + offsets_1, q_embed1, mask=offsets_1 < head_dim)
+
+    if head_idx < k_num_head:
+        K_ptr = K + batch_idx * stride_k1 + head_idx * stride_k2
+        K_OUTPUT_ptr = K_OUTPUT + batch_idx * stride_k_out1 + head_idx * stride_k_out2
+
+        k0 = tl.load(K_ptr + offsets_0, mask=offsets_0 < head_dim // 2)
+        k1 = tl.load(K_ptr + offsets_1, mask=offsets_1 < head_dim)
+
+        # Apply rotary embedding
+        k_embed0 = k0 * cos0 - k1 * sin0
+        k_embed1 = k1 * cos0 + k0 * sin0
+
+        # Store result
+        tl.store(K_OUTPUT_ptr + offsets_0, k_embed0, mask=offsets_0 < head_dim // 2)
+        tl.store(K_OUTPUT_ptr + offsets_1, k_embed1, mask=offsets_1 < head_dim)
 
 
 @triton.jit
