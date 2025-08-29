@@ -188,10 +188,39 @@ class PDSchedulerService:
                     )
                     if hasattr(self.scheduler, "set_token_manager"):
                         self.scheduler.set_token_manager(token_manager)
+                    # Inject hooks into executor
+                    try:
+                        from chitu.hooks import MooncakeKVTransferHook, DPTokenSink
+
+                        kv_hook = MooncakeKVTransferHook(
+                            getattr(self.scheduler, "kv_manager", None), "decode"
+                        )
+                        Backend.executor.set_kv_hook(kv_hook)
+                        # Decode side streams via DP Token Manager wrapper, avoid duplication
+                        Backend.executor.set_token_sink(DPTokenSink())
+                    except Exception as _e:
+                        import traceback
+
+                        traceback.print_exc()
+                        logger.warning(f"failed to inject kv hook: {_e}")
                 except Exception as e:
                     logger.warning(f"failed to init dp token manager: {e}")
             else:
                 logger.info("prefill-only mode: skip initializing token manager")
+                # Inject prefill-side KV hook
+                try:
+                    from chitu.backend import Backend as _Backend
+                    from chitu.hooks import MooncakeKVTransferHook
+
+                    kv_hook = MooncakeKVTransferHook(
+                        getattr(self.scheduler, "kv_manager", None), "prefill"
+                    )
+                    _Backend.executor.set_kv_hook(kv_hook)
+                except Exception as _e:
+                    import traceback
+
+                    traceback.print_exc()
+                    logger.warning(f"failed to inject kv hook: {_e}")
 
             # Run only for Decode-only or Unified modes
             try:
@@ -349,7 +378,6 @@ class PDSchedulerService:
         """
         try:
             from chitu.backend import Backend
-            from chitu.batched_seq_len import BatchedSeqLen
             import torch  # local import to avoid hard dependency at import time
 
             # Build a tiny fake request context
@@ -357,14 +385,29 @@ class PDSchedulerService:
             local_rank = int(os.environ.get("LOCAL_RANK", "0"))
             device = torch.device(local_rank)
 
+            # Disable PD hooks during warmup (keep it direct/local)
+            prev_hook = None
+            prev_sink = None
+            try:
+                from chitu.hooks import NoopKVTransferHook, LocalTokenSink
+
+                prev_hook = Backend.executor.get_kv_hook()
+                prev_sink = Backend.executor.get_token_sink()
+                Backend.executor.set_kv_hook(NoopKVTransferHook())
+                Backend.executor.set_token_sink(LocalTokenSink())
+            except Exception:
+                pass
+
             # Prepare minimal prompt and rebuild KV on decode side
             tokens = [0]
             try:
-                Backend.cache_manager.prepare_cache_prefill(
-                    [req_id], BatchedSeqLen.from_tokens([tokens], device=device)
-                )
+                # Use list of lengths to match cache manager API
+                Backend.cache_manager.prepare_cache_prefill([req_id], [len(tokens)])
                 payload_prefill = torch.tensor(tokens, device=device, dtype=torch.int64)
-                _ = Backend.model.prefill(payload_prefill)
+                output_token_offsets = torch.tensor(
+                    [payload_prefill.size(0) - 1], dtype=torch.int32, device=device
+                )
+                _ = Backend.model.prefill(payload_prefill, output_token_offsets)
                 Backend.cache_manager.finalize_cache_all_prefill()
             except Exception as e:
                 # Even if fake prefill fails, still try decode_step to warm up executor path
@@ -386,6 +429,15 @@ class PDSchedulerService:
                     break
         except Exception as e:
             logger.warning(f"decode warmup encountered error: {e}")
+        finally:
+            # Restore PD hooks after warmup
+            try:
+                if prev_hook is not None:
+                    Backend.executor.set_kv_hook(prev_hook)
+                if prev_sink is not None:
+                    Backend.executor.set_token_sink(prev_sink)
+            except Exception:
+                pass
 
     async def _request_handler(self):
         """Handle incoming requests"""

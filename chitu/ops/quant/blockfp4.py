@@ -338,43 +338,40 @@ def blockfp4_gemm(
     return y
 
 
-def unpack_weight_bytes(packed):
+FP4_E2M1_LEVELS = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+)
+
+
+def unpack_every_uint8_to_two_fp4_e2m1_in_uint8(packed: torch.Tensor) -> torch.Tensor:
     assert packed.dtype == torch.uint8
     out, half_in = packed.shape
-
-    high_nibble = packed & 0x0F  # [out, half_in]
-    low_nibble = packed >> 4  # [out, half_in]
-
+    high_nibble = packed & 0x0F  # [out, in // 2]
+    low_nibble = packed >> 4  # [out, in // 2]
     return torch.stack([high_nibble, low_nibble], dim=2).view(out, half_in * 2)
 
 
-def decode_e2m1_from_nibbles(nibbles: torch.Tensor):
-    _LEVELS = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
-    )
+def from_fp4_e2m1_in_uint8(nibbles: torch.Tensor) -> torch.Tensor:
     n = nibbles.to(torch.uint8)
     sign = torch.where((n >> 3).bool(), -1.0, 1.0)
     idx = (n & 0x7).to(torch.long)
-    levels = _LEVELS.to(n.device)
+    levels = FP4_E2M1_LEVELS.to(n.device)
     val = sign * levels[idx]
-    return val
+    return val  # float32
 
 
-def pack_weight_nibbles(w_nib):
+def pack_every_two_fp4_e2m1_in_uint8_to_one_uint8(w_nib: torch.Tensor) -> torch.Tensor:
     out, inp = w_nib.shape
     assert inp % 2 == 0
-    high = w_nib[:, 0::2]  # [out, in//2]
-    low = w_nib[:, 1::2]  # [out, in//2]
+    high = w_nib[:, 0::2]  # [out, in // 2]
+    low = w_nib[:, 1::2]  # [out, in // 2]
     packed = (low << 4) | high
-    return packed  # dtype uint8, shape [out, in//2]
+    return packed  # uint8, [out, in // 2]
 
 
-def to_e2m1_nibbles(x):
-    _LEVELS = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
-    )
+def to_fp4_e2m1_in_uint8(x: torch.Tensor) -> torch.Tensor:
     abs_x = x.abs()
-    levels = _LEVELS.to(abs_x.device).view(*([1] * abs_x.dim()), -1)
+    levels = FP4_E2M1_LEVELS.to(abs_x.device).view(*([1] * abs_x.dim()), -1)
     idx = (abs_x.unsqueeze(-1) == levels).to(torch.uint8).argmax(dim=-1).to(torch.uint8)
     sign = (x < 0).to(torch.uint8) << 3
     nibble = sign | idx

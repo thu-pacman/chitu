@@ -36,6 +36,7 @@ from chitu.distributed.parallel_state import (
     get_dp_group,
 )
 from chitu.moe import get_moe_impl
+from chitu.hooks import TokenSink, LocalTokenSink, KVTransferHook, NoopKVTransferHook
 from chitu.utils import top_k_top_p_min_p_sampling_from_probs_torch
 from chitu.ops import apply_frequency_penalty, response_append
 from chitu.device_list import DeviceList
@@ -473,6 +474,23 @@ class Executor:
             self.cuda_graph_captured_bs_set = set()
             self.current_max_num_tokens = 0
         self.moe_impl = get_moe_impl()
+        # Hooks for token streaming and KV transfer. Defaults keep existing behavior.
+        self._token_sink: TokenSink = LocalTokenSink()
+        self._kv_hook: KVTransferHook = NoopKVTransferHook()
+
+    # Hook setters for external injection
+    def set_token_sink(self, sink: TokenSink):
+        self._token_sink = sink
+
+    def set_kv_hook(self, hook: KVTransferHook):
+        self._kv_hook = hook
+
+    # Accessors for temporary overriding in warmup, etc.
+    def get_token_sink(self) -> TokenSink:
+        return self._token_sink
+
+    def get_kv_hook(self) -> KVTransferHook:
+        return self._kv_hook
 
     def _prepare_new_tokens_for_decode(self, tasks: PackedTasks):
         return torch.tensor(
@@ -600,6 +618,15 @@ class Executor:
         out = Backend.model.prefill(payload, self._get_output_token_offsets(tasks))
         self.timers("prefill").stop()
 
+        # Notify KV transfer hook after prefill completes.
+        try:
+            output_req_ids = [
+                tasks.req_ids[i] for i in range(tasks.num_tasks) if tasks.has_outputs[i]
+            ]
+            self._kv_hook.on_prefill_done(output_req_ids, out)
+        except Exception:
+            pass
+
         # payload send
         for dispatcher in self.task_dispatchers:
             dispatcher.send_payload(out)
@@ -648,6 +675,15 @@ class Executor:
         out = Backend.model.prefill(payload, self._get_output_token_offsets(tasks))
         self.timers("prefill").stop()
 
+        # Notify KV hook in TP-only path as well.
+        try:
+            output_req_ids = [
+                tasks.req_ids[i] for i in range(tasks.num_tasks) if tasks.has_outputs[i]
+            ]
+            self._kv_hook.on_prefill_done(output_req_ids, out)
+        except Exception:
+            pass
+
         # 6) finalize cache
         Backend.cache_manager.finalize_cache_all_prefill()
 
@@ -669,6 +705,10 @@ class Executor:
         """
         # 1) prepare cache and seq lens
         Backend.cache_manager.prepare_cache_decode(req_ids)
+        try:
+            self._kv_hook.before_decode_step(req_ids)
+        except Exception:
+            pass
 
         # 2) build payload on TP main rank only
         num_tokens = len(next_tokens)
@@ -701,6 +741,11 @@ class Executor:
 
     def decode_step(self, tasks: PackedTasksBase):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
+        # Ensure KV cache is present for PD decode-only before running decode.
+        try:
+            self._kv_hook.before_decode_step(tasks.req_ids)
+        except Exception:
+            pass
 
         num_tokens = tasks.num_tasks
 
@@ -901,8 +946,8 @@ class Executor:
                 )
                 logprobs = logprobs[: max(1, task.req.top_logprobs)].tolist()
                 token_idxs = token_idxs[: max(1, task.req.top_logprobs)].tolist()
-                task.req.add_data(next_token, logprobs, token_idxs)
+                self._token_sink.emit(task, next_token, logprobs, token_idxs)
             else:
-                task.req.add_data(next_token)
+                self._token_sink.emit(task, next_token)
 
         TaskLoad.increase(batch_result.num_tasks)

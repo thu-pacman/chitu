@@ -188,4 +188,4 @@ if __name__ == "__main__":
     logger.info("Waiting for all ranks to finish...")
     torch.distributed.barrier()
     # Don't exec bash because it loads startup scripts
-    os.execl("/usr/bin/echo", "Exiting")  # os.execl rejects "", so print something
+    os.execl("/usr/bin/true", "true")  # /usr/bin/true does nothing but exits

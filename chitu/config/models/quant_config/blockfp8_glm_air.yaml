@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+quant:
+- model: '.'
+  rules:
+    - regex: 'layers.0.mlp.down_proj'
+    - regex: 'layers.'
+      type: blockfp8

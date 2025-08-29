@@ -35,11 +35,11 @@ from chitu.ops import (
     blockfp8_weight_dequant,
     soft_fp8_blockfp8_weight_dequant,
     blockfp8_weight_quant,
-    unpack_weight_bytes,
-    decode_e2m1_from_nibbles,
+    unpack_every_uint8_to_two_fp4_e2m1_in_uint8,
+    from_fp4_e2m1_in_uint8,
     fp4_fake_quant,
-    pack_weight_nibbles,
-    to_e2m1_nibbles,
+    pack_every_two_fp4_e2m1_in_uint8_to_one_uint8,
+    to_fp4_e2m1_in_uint8,
 )
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
 from chitu.tensor_parallel import (
@@ -804,8 +804,10 @@ class TransformerDeepSeekV3(Transformer):
                 elif quant in ["blockfp4"]:
                     assert prefix + "kv_b_proj.weight_scale" in checkpoint
                     assert prefix + "kv_b_proj.weight_scale_2" in checkpoint
-                    up_kv_b_proj_weight = decode_e2m1_from_nibbles(
-                        unpack_weight_bytes(kv_b_proj_ckpt_weight.cuda())
+                    up_kv_b_proj_weight = from_fp4_e2m1_in_uint8(
+                        unpack_every_uint8_to_two_fp4_e2m1_in_uint8(
+                            kv_b_proj_ckpt_weight.cuda()
+                        )
                     ).reshape(*kv_b_proj_ckpt_weight.shape[:-1], -1, block_size)
                     kv_b_proj_weight = (
                         (
@@ -854,8 +856,10 @@ class TransformerDeepSeekV3(Transformer):
                 elif quant in ["blockfp4"]:
                     assert prefix + "q_b_proj.weight_scale" in checkpoint
                     assert prefix + "q_b_proj.weight_scale_2" in checkpoint
-                    up_q_b_proj_weight = decode_e2m1_from_nibbles(
-                        unpack_weight_bytes(q_b_proj_ckpt_weight.cuda())
+                    up_q_b_proj_weight = from_fp4_e2m1_in_uint8(
+                        unpack_every_uint8_to_two_fp4_e2m1_in_uint8(
+                            q_b_proj_ckpt_weight.cuda()
+                        )
                     ).reshape(*q_b_proj_ckpt_weight.shape[:-1], -1, block_size)
                     q_b_proj_weight = (
                         (
@@ -922,7 +926,9 @@ class TransformerDeepSeekV3(Transformer):
                             quant=True,
                         )
                     )
-                    new_q_b_proj = pack_weight_nibbles(to_e2m1_nibbles(new_q_b_proj))
+                    new_q_b_proj = pack_every_two_fp4_e2m1_in_uint8_to_one_uint8(
+                        to_fp4_e2m1_in_uint8(new_q_b_proj)
+                    )
                     checkpoint[prefix + "q_b_proj.weight"] = new_q_b_proj
                     checkpoint[prefix + "q_b_proj.weight_scale"] = (
                         new_q_b_proj_scale.view(torch.uint8)
@@ -963,8 +969,10 @@ class TransformerDeepSeekV3(Transformer):
                 elif quant in ["blockfp4"]:
                     assert prefix + "o_proj.weight_scale" in checkpoint
                     assert prefix + "o_proj.weight_scale_2" in checkpoint
-                    up_o_proj_weight = decode_e2m1_from_nibbles(
-                        unpack_weight_bytes(o_proj_ckpt_weight.cuda())
+                    up_o_proj_weight = from_fp4_e2m1_in_uint8(
+                        unpack_every_uint8_to_two_fp4_e2m1_in_uint8(
+                            o_proj_ckpt_weight.cuda()
+                        )
                     ).reshape(*o_proj_ckpt_weight.shape[:-1], -1, block_size)
                     o_proj_weight = (
                         (
@@ -1019,7 +1027,9 @@ class TransformerDeepSeekV3(Transformer):
                     new_o_proj, new_o_proj_scale, new_o_proj_scale_2 = fp4_fake_quant(
                         new_o_proj, block_scale=None, global_scale=None, quant=True
                     )
-                    new_o_proj = pack_weight_nibbles(to_e2m1_nibbles(new_o_proj))
+                    new_o_proj = pack_every_two_fp4_e2m1_in_uint8_to_one_uint8(
+                        to_fp4_e2m1_in_uint8(new_o_proj)
+                    )
                     checkpoint[prefix + "o_proj.weight"] = new_o_proj
                     checkpoint[prefix + "o_proj.weight_scale"] = new_o_proj_scale.view(
                         torch.uint8
