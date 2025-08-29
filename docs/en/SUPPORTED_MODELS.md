@@ -30,6 +30,10 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=GLM-4.5` command line argument when starting Chitu
 - GLM-4.5-Air
   Usage: Append `models=GLM-4.5-Air` command line argument when starting Chitu
+- GLM-4.5-Air-qc-fp8
+  Usage: Append `models=GLM-4.5-Air-qc-fp8` command line argument when starting Chitu
+- GLM-4.5-qc-fp8
+  Usage: Append `models=GLM-4.5-qc-fp8` command line argument when starting Chitu
 - GLM-Z1-32B-0414
   Usage: Append `models=GLM-Z1-32B-0414` command line argument when starting Chitu
 - GLM-Z1-9B-0414

@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# GLM-4.5-Air-fp8 is a quantization of GLM-4.5-Air
+defaults:
+  - GLM-4.5-Air
+  - quant_config: blockfp8_glm_air
+  - _self_ # Config in this file overrides configs in defaults
+
+# Access info
+name: GLM-4.5-Air-qc-fp8
+source: "(This is an internal quantized model, only for testing purpose)" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
