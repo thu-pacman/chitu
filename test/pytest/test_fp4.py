@@ -1,55 +1,21 @@
 import packaging.version
 import torch
 import pytest
-import triton
 
 from chitu.native_layout import Packed4BitWeightAlongK, Packed4BitWeightAlongK
 from chitu.ops import (
     soft_fp4_raise_to_fp8_blockfp4_gemm,
     soft_fp4_raise_to_bf16_blockfp4_gemm,
     blockfp8_act_quant,
+    pack_every_two_fp4_e2m1_in_uint8_to_one_uint8,
+    unpack_every_uint8_to_two_fp4_e2m1_in_uint8,
+    to_fp4_e2m1_in_uint8,
+    from_fp4_e2m1_in_uint8,
 )
 from chitu.device_type import has_native_fp8, is_hopper
+from chitu.utils import try_import_platform_dep
 
-
-FP4_E2M1_LEVELS = torch.tensor(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
-)
-
-
-def to_fp4_e2m1_in_uint8(x: torch.Tensor) -> torch.Tensor:
-    abs_x = x.abs()
-    levels = FP4_E2M1_LEVELS.to(abs_x.device).view(*([1] * abs_x.dim()), -1)
-    idx = (abs_x.unsqueeze(-1) == levels).to(torch.uint8).argmax(dim=-1).to(torch.uint8)
-    sign = (x < 0).to(torch.uint8) << 3
-    nibble = sign | idx
-    return nibble
-
-
-def from_fp4_e2m1_in_uint8(nibbles: torch.Tensor) -> torch.Tensor:
-    n = nibbles.to(torch.uint8)
-    sign = torch.where((n >> 3).bool(), -1.0, 1.0)
-    idx = (n & 0x7).to(torch.long)
-    levels = FP4_E2M1_LEVELS.to(n.device)
-    val = sign * levels[idx]
-    return val  # float32
-
-
-def pack_every_two_fp4_e2m1_in_uint8_to_one_uint8(w_nib: torch.Tensor) -> torch.Tensor:
-    out, inp = w_nib.shape
-    assert inp % 2 == 0
-    high = w_nib[:, 0::2]  # [out, in // 2]
-    low = w_nib[:, 1::2]  # [out, in // 2]
-    packed = (low << 4) | high
-    return packed  # uint8, [out, in // 2]
-
-
-def unpack_every_uint8_to_two_fp4_e2m1_in_uint8(packed: torch.Tensor) -> torch.Tensor:
-    assert packed.dtype == torch.uint8
-    out, half_in = packed.shape
-    high_nibble = packed & 0x0F  # [out, in // 2]
-    low_nibble = packed >> 4  # [out, in // 2]
-    return torch.stack([high_nibble, low_nibble], dim=2).view(out, half_in * 2)
+triton, has_triton = try_import_platform_dep("triton")
 
 
 def init_weight_and_scales(dim, block_size):
@@ -129,14 +95,8 @@ def test_fp4_raise_to_bf16_gemm_is_close_to_dequanted_gemm():
         x_names=["bs", "dim"],
         x_vals=[
             (1, 1024),
-            (4, 1024),
-            (16, 1024),
-            (64, 1024),
             (256, 1024),
             (1, 4096),
-            (4, 4096),
-            (16, 4096),
-            (64, 4096),
             (256, 4096),
         ],
         line_arg="provider",
@@ -220,14 +180,8 @@ def test_fp4_raise_to_fp8_gemm_is_close_to_dequanted_gemm():
         x_names=["bs", "dim"],
         x_vals=[
             (1, 1024),
-            (4, 1024),
-            (16, 1024),
-            (64, 1024),
             (256, 1024),
             (1, 4096),
-            (4, 4096),
-            (16, 4096),
-            (64, 4096),
             (256, 4096),
         ],
         line_arg="provider",
