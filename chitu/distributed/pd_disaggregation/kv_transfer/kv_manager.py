@@ -783,49 +783,103 @@ class KVManager:
 
             # Send per-request TransferInfo to prefill so it can start RDMA immediately
             try:
-                # NOTE: 选择目标 prefill engine_rank：优先使用上层传入的 prefill_scheduler_id；否则哈希到 discovered 集合
-                target_engine_rank = self.prefill_target_rank_by_room.get(room, None)
-                if target_engine_rank is None:
-                    if discovered:
-                        target_engine_rank = discovered[room.int % len(discovered)]
-                    else:
-                        target_engine_rank = 0
-                info = self._get_bootstrap_info(engine_rank=target_engine_rank)
-                if info is not None:
-                    endpoint = f"tcp://{info['rank_ip']}:{info['rank_port']}"
-                    session_id = self.get_session_id().encode("ascii")
-                    parts = [
-                        room.bytes,
-                        self.local_ip.encode("ascii"),
-                        str(self.rank_port).encode("ascii"),
-                        session_id,
-                        dst_indices_np.tobytes(),
-                        str(int(aux_index)).encode("ascii"),
-                    ]
-                    self._send_zmq_to_prefill(endpoint, parts)
-                    logger.debug(
-                        f"posted transfer request to prefill for room {room}, dst_blocks={len(dst_indices_np)} aux_index={aux_index}"
+                # Prefer explicit binding, but also broadcast to discovered ranks for robustness
+                preferred = self.prefill_target_rank_by_room.get(room, None)
+                target_ranks = []
+                if preferred is not None:
+                    target_ranks.append(int(preferred))
+                if discovered:
+                    target_ranks.extend(
+                        [er for er in discovered if er not in target_ranks]
                     )
-                else:
+                if not target_ranks:
+                    target_ranks = [0]
+
+                session_id = self.get_session_id().encode("ascii")
+                parts = [
+                    room.bytes,
+                    self.local_ip.encode("ascii"),
+                    str(self.rank_port).encode("ascii"),
+                    session_id,
+                    dst_indices_np.tobytes(),
+                    str(int(aux_index)).encode("ascii"),
+                ]
+                sent_any = False
+                for er in target_ranks:
+                    info = self._get_bootstrap_info(engine_rank=er)
+                    if info is None:
+                        continue
+                    endpoint = f"tcp://{info['rank_ip']}:{info['rank_port']}"
+                    self._send_zmq_to_prefill(endpoint, parts)
+                    sent_any = True
+                    logger.debug(
+                        f"posted transfer request to prefill(er={er}) for room {room}, dst_blocks={len(dst_indices_np)} aux_index={aux_index}"
+                    )
+                if not sent_any:
                     logger.warning(
-                        "bootstrap info missing; cannot send per-request TransferInfo"
+                        "bootstrap info missing; cannot send per-request TransferInfo to any prefill"
                     )
             except Exception as e:
                 logger.error(f"failed to post transfer info for {room}: {e}")
 
         # Wait for transfers to complete (status updated by sender via ZMQ)
         unfinished = set(room_ids)
-        # 增加超时回退，避免无限等待导致单请求卡死
+        # 增加超时与重试，避免丢包或时序问题导致的假超时
         start_wait = time.time()
-        timeout_s = 3.0
+        timeout_s = 10.0
+        last_resend_ts = 0.0
+        resend_interval = 0.5
         while unfinished and (time.time() - start_wait) < timeout_s:
             done = [
                 r for r in unfinished if self.request_status.get(r) == KVPoll.Success
             ]
             for r in done:
                 unfinished.remove(r)
+
+            now = time.time()
+            if unfinished and (now - last_resend_ts) >= resend_interval:
+                # Re-broadcast TransferInfo to all discovered prefill ranks for robustness
+                try:
+                    discovered = self._discover_prefill_engine_ranks()
+                    for idx, room in enumerate(room_ids):
+                        if room not in unfinished:
+                            continue
+                        aux_index = aux_indices[idx]
+                        # we don't know exact dst indices; use reserved (may be empty)
+                        try:
+                            dst_indices = (
+                                self.cache_manager.block_table.get(room.hex, [])
+                                if hasattr(self.cache_manager, "block_table")
+                                else []
+                            )
+                            dst_indices_np = np.asarray(dst_indices, dtype=np.int32)
+                        except Exception:
+                            dst_indices_np = np.array([], dtype=np.int32)
+
+                        session_id = self.get_session_id().encode("ascii")
+                        parts = [
+                            room.bytes,
+                            self.local_ip.encode("ascii"),
+                            str(self.rank_port).encode("ascii"),
+                            session_id,
+                            dst_indices_np.tobytes(),
+                            str(int(aux_index)).encode("ascii"),
+                        ]
+                        for er in discovered:
+                            info = self._get_bootstrap_info(engine_rank=er)
+                            if info is None:
+                                continue
+                            endpoint = f"tcp://{info['rank_ip']}:{info['rank_port']}"
+                            try:
+                                self._send_zmq_to_prefill(endpoint, parts)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                last_resend_ts = now
+
             if unfinished:
-                time.sleep(0.03)
+                time.sleep(0.05)
 
         if unfinished:
             logger.warning(

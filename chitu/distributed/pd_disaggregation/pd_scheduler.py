@@ -185,17 +185,11 @@ class PDScheduler(Scheduler):
             # Create task from request
             task = self._create_task_from_request(original_request, TaskType.Prefill)
 
-            # Execute prefill (simplified)
-            first_token_logits = await self._execute_prefill(task)
-
-            # Send KV cache and first token through KV manager
-            if self.kv_manager:
-                self.kv_manager.send_kv_cache(
-                    logits=first_token_logits,
-                    request_ids=[request_id],
-                    cache_manager=self.kv_manager.cache_manager,
-                )
-                logger.info(f"kv cache sent for prefill request: {request_id}")
+            # Execute prefill (simplified). KV + logits sending is handled by KV hook.
+            _ = await self._execute_prefill(task)
+            logger.info(
+                f"prefill completed for request: {request_id}; kv transfer will be handled by hook"
+            )
 
         except Exception as e:
             import traceback
@@ -421,6 +415,7 @@ class PDScheduler(Scheduler):
             task_type=TaskType.Prefill,
             tokens=[tokens],
             num_tokens=len(tokens),
+            has_outputs=[1],
             payload_type=SerializedPackedTasksPayloadType.Normal,
         )
 
@@ -445,7 +440,14 @@ class PDScheduler(Scheduler):
             payload_prefill = torch.tensor(
                 tokens, device=torch.device(local_rank), dtype=torch.int64
             )
-            prefill_logits_local = Backend.model.prefill(payload_prefill)
+            output_token_offsets = torch.tensor(
+                [payload_prefill.size(0) - 1],
+                dtype=torch.int32,
+                device=payload_prefill.device,
+            )
+            prefill_logits_local = Backend.model.prefill(
+                payload_prefill, output_token_offsets
+            )
             Backend.cache_manager.finalize_cache_all_prefill()
         except Exception as e:
             import traceback

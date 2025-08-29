@@ -227,7 +227,11 @@ def _warmup_backend_direct(args, decode_steps: int = 2):
     from chitu.batched_seq_len import BatchedSeqLen
 
     Backend.cache_manager.prepare_cache_prefill([req_id], [1])
-    _ = Backend.model.prefill(tokens)
+    # output_token_offsets 需要指向每个序列的最后一个 token 下标
+    output_token_offsets = torch.tensor(
+        [tokens.size(0) - 1], dtype=torch.int32, device=tokens.device
+    )
+    _ = Backend.model.prefill(tokens, output_token_offsets)
     Backend.cache_manager.finalize_cache_all_prefill()
     # Decode steps
     for _ in range(max(1, decode_steps)):
