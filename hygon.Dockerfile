@@ -41,5 +41,5 @@ WORKDIR /workspace/chitu
 COPY . .
 
 ENV CHITU_HYGON_BUILD=1
-RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt -c <(pip freeze | grep '==')
+RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt -c <(pip list --format freeze)
 RUN bash script/install.sh "${optional_deps}" "${build_jobs}" "${enable_editable_install}" "${enable_cython}"
