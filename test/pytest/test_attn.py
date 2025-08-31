@@ -20,20 +20,25 @@ flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
 
 
-@pytest.mark.parametrize("bs", [1])
-@pytest.mark.parametrize("prev_seq_len_int", [512])
+@pytest.mark.parametrize("bs", [1, 9])
 @pytest.mark.parametrize("local_n_heads", [16])
 @pytest.mark.parametrize("kv_lora_rank", [512])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
-@pytest.mark.parametrize("page_size", [256])
-def test_triton_mla_decode_paged_kv(
+@pytest.mark.parametrize("qk_nope_head_dim", [128])
+@pytest.mark.parametrize("is_increment", [False, True])
+@pytest.mark.parametrize("impl", ["triton"])
+def test_mla_prefill_ragged_qkvo(
     bs,
-    prev_seq_len_int,
     local_n_heads,
     kv_lora_rank,
     qk_rope_head_dim,
-    page_size,
+    qk_nope_head_dim,
+    is_increment,
+    impl,
 ):
+    if impl == "triton" and not has_triton:
+        pytest.skip("triton is missing")
+
     torch.set_default_dtype(torch.float16)
     set_global_args(
         OmegaConf.create(
@@ -41,31 +46,251 @@ def test_triton_mla_decode_paged_kv(
                 "infer": {
                     "mla_absorb": None,
                     "max_reqs": 4,
+                    "op_impl": "torch",
                     "use_cuda_graph": False,
                     "tp_size": 1,
-                    "op_impl": "torch",
                     "cache_type": "paged",
                     "dp_size": 1,
+                    "mla_absorb": "absorb",
                 },
                 "models": {
                     "n_heads": local_n_heads,
                     "kv_lora_rank": kv_lora_rank,
                     "qk_rope_head_dim": qk_rope_head_dim,
-                    "qk_nope_head_dim": 128,
+                    "qk_nope_head_dim": qk_nope_head_dim,
+                    "dim": 7168,
                 },
             }
         ),
         need_ensure=False,
     )
 
-    max_num_pages = 16
+    if not is_increment:
+        old_seq_len_list = [0 for _ in range(bs)]
+        new_seq_len_list = [torch.randint(1, 128, (1,)).item() for _ in range(bs)]
+    else:
+        old_seq_len_list = [torch.randint(1, 127, (1,)).item() for _ in range(bs)]
+        new_seq_len_list = [torch.randint(128, 256, (1,)).item() for _ in range(bs)]
+    seq_len_delta = BatchedSeqLenDelta(
+        old_seq_len_list,
+        new_seq_len_list,
+        device="cuda",
+        cache_prefix_lens_tensor_device=False,
+        cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
+        cache_delta_position_ids_tensor_device=False,
+        cache_delta_seq_ids_tensor_device=False,
+    )
+
+    if impl == "triton":
+        attn_backend = TritonAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+    else:
+        raise NotImplementedError()
+    ref_backend = RefAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+
+    softmax_scale = 1.0 / ((qk_rope_head_dim + qk_nope_head_dim) ** 0.5)
+
+    q_nope = torch.randn(
+        seq_len_delta.delta_total_len, local_n_heads, kv_lora_rank, device="cuda"
+    )
+    q_pe = torch.randn(
+        seq_len_delta.delta_total_len, local_n_heads, qk_rope_head_dim, device="cuda"
+    )
+    kv = torch.randn(
+        seq_len_delta.new.total_len, 1, kv_lora_rank + qk_rope_head_dim, device="cuda"
+    )
+
+    out = attn_backend.mla_prefill_ragged_qkvo(
+        q_nope, q_pe, kv, seq_len_delta, causal=True, softmax_scale=softmax_scale
+    )
+    ref_out = ref_backend.mla_prefill_ragged_qkvo(
+        q_nope, q_pe, kv, seq_len_delta, causal=True, softmax_scale=softmax_scale
+    )
+
+    assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("bs", [1, 8])
+@pytest.mark.parametrize("local_n_heads", [16])
+@pytest.mark.parametrize("kv_lora_rank", [512])
+@pytest.mark.parametrize("qk_rope_head_dim", [64])
+@pytest.mark.parametrize("qk_nope_head_dim", [128])
+@pytest.mark.parametrize("is_increment", [False, True])
+@pytest.mark.parametrize("impl", ["triton", "flashinfer"])
+def test_mla_prefill_ragged_qo_paged_kv(
+    bs,
+    local_n_heads,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    qk_nope_head_dim,
+    is_increment,
+    impl,
+):
+    if impl == "triton" and not has_triton:
+        pytest.skip("triton is missing")
+    if impl == "flashinfer":
+        if not has_flashinfer or packaging.version.parse(
+            flashinfer.__version__
+        ) < packaging.version.parse("0.2.0"):
+            pytest.skip("flashinfer is missing or too old")
+
+    torch.set_default_dtype(torch.float16)
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "mla_absorb": None,
+                    "max_reqs": 4,
+                    "op_impl": "torch",
+                    "use_cuda_graph": False,
+                    "tp_size": 1,
+                    "cache_type": "paged",
+                    "dp_size": 1,
+                    "mla_absorb": "absorb",
+                },
+                "models": {
+                    "n_heads": local_n_heads,
+                    "kv_lora_rank": kv_lora_rank,
+                    "qk_rope_head_dim": qk_rope_head_dim,
+                    "qk_nope_head_dim": qk_nope_head_dim,
+                    "dim": 7168,
+                },
+            }
+        ),
+        need_ensure=False,
+    )
+
+    num_pages = 1024
+    page_size = 64
+
+    if not is_increment:
+        old_seq_len_list = [0 for _ in range(bs)]
+        new_seq_len_list = [torch.randint(1, 128, (1,)).item() for _ in range(bs)]
+    else:
+        old_seq_len_list = [torch.randint(1, 127, (1,)).item() for _ in range(bs)]
+        new_seq_len_list = [torch.randint(128, 256, (1,)).item() for _ in range(bs)]
+    seq_len_delta = BatchedSeqLenDelta(
+        old_seq_len_list,
+        new_seq_len_list,
+        device="cuda",
+        cache_prefix_lens_tensor_device=False,
+        cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
+        cache_delta_position_ids_tensor_device=False,
+        cache_delta_seq_ids_tensor_device=False,
+    )
+
+    if impl == "triton":
+        attn_backend = TritonAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+    elif impl == "flashinfer":
+        attn_backend = FlashInferBackend(
+            tot_num_blocks=num_pages, qk_nope_head_dim=qk_nope_head_dim
+        )
+    else:
+        raise NotImplementedError()
+    ref_backend = RefAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+
+    softmax_scale = 1.0 / ((qk_rope_head_dim + qk_nope_head_dim) ** 0.5)
+
+    q_nope = torch.randn(
+        seq_len_delta.delta_total_len, local_n_heads, kv_lora_rank, device="cuda"
+    )
+    q_pe = torch.randn(
+        seq_len_delta.delta_total_len, local_n_heads, qk_rope_head_dim, device="cuda"
+    )
+    this_kv = torch.randn(
+        seq_len_delta.delta_total_len, kv_lora_rank + qk_rope_head_dim, device="cuda"
+    )
+    kv_cache = torch.randn(
+        num_pages, page_size, 1, kv_lora_rank + qk_rope_head_dim, device="cuda"
+    )
+    page_table = torch.arange(num_pages, device="cuda").to(torch.int32).view(bs, -1)
+
+    kv_cache_1 = kv_cache.clone()
+    out = attn_backend.mla_prefill_ragged_qo_paged_kv(
+        q_nope,
+        q_pe,
+        PagedKVCacheAccessor(page_table, kv_cache_1, None),
+        this_kv,
+        seq_len_delta,
+        causal=True,
+        softmax_scale=softmax_scale,
+    )
+
+    kv_cache_2 = kv_cache.clone()
+    ref_out = ref_backend.mla_prefill_ragged_qo_paged_kv(
+        q_nope,
+        q_pe,
+        PagedKVCacheAccessor(page_table, kv_cache_2, None),
+        this_kv,
+        seq_len_delta,
+        causal=True,
+        softmax_scale=softmax_scale,
+    )
+
+    assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("bs", [1, 64])
+@pytest.mark.parametrize("prev_seq_len_int", [512])
+@pytest.mark.parametrize("local_n_heads", [16])
+@pytest.mark.parametrize("kv_lora_rank", [512])
+@pytest.mark.parametrize("qk_rope_head_dim", [64])
+@pytest.mark.parametrize("qk_nope_head_dim", [128])
+@pytest.mark.parametrize("page_size", [256])
+@pytest.mark.parametrize("impl", ["triton", "flashinfer"])
+def test_triton_mla_decode_paged_kv(
+    bs,
+    prev_seq_len_int,
+    local_n_heads,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    qk_nope_head_dim,
+    page_size,
+    impl,
+):
+    if impl == "triton" and not has_triton:
+        pytest.skip("triton is missing")
+    if impl == "flashinfer":
+        if not has_flashinfer or packaging.version.parse(
+            flashinfer.__version__
+        ) < packaging.version.parse("0.2.0"):
+            pytest.skip("flashinfer is missing or too old")
+
+    torch.set_default_dtype(torch.float16)
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "mla_absorb": None,
+                    "max_reqs": bs,
+                    "use_cuda_graph": False,
+                    "tp_size": 1,
+                    "op_impl": "torch",
+                    "cache_type": "paged",
+                    "dp_size": 1,
+                    "mla_absorb": "absorb",
+                },
+                "models": {
+                    "n_heads": local_n_heads,
+                    "kv_lora_rank": kv_lora_rank,
+                    "qk_rope_head_dim": qk_rope_head_dim,
+                    "qk_nope_head_dim": qk_nope_head_dim,
+                    "dim": 7168,
+                },
+            }
+        ),
+        need_ensure=False,
+    )
+
+    max_num_pages = 1024
 
     q_nope = torch.randn(bs, local_n_heads, kv_lora_rank, device="cuda")
     q_pe = torch.randn(bs, local_n_heads, qk_rope_head_dim, device="cuda")
     kv_cache = torch.randn(
         max_num_pages, page_size, kv_lora_rank + qk_rope_head_dim, device="cuda"
     )
-    this_kv = torch.randn(bs, 1, 1, kv_lora_rank + qk_rope_head_dim, device="cuda")
+    this_kv = torch.randn(bs, 1, kv_lora_rank + qk_rope_head_dim, device="cuda")
     seq_len_delta = BatchedSeqLenDelta(
         [prev_seq_len_int for _ in range(bs)],
         [prev_seq_len_int + 1 for _ in range(bs)],
@@ -81,8 +306,17 @@ def test_triton_mla_decode_paged_kv(
         : bs * page_cnt_per_sample
     ].view(bs, page_cnt_per_sample)
 
-    attn = TritonAttnBackend(qk_nope_head_dim=128)
-    attn_ref = RefAttnBackend(qk_nope_head_dim=128)
+    if impl == "triton":
+        attn = TritonAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+    elif impl == "flashinfer":
+        attn = FlashInferBackend(
+            tot_num_blocks=max_num_pages, qk_nope_head_dim=qk_nope_head_dim
+        )
+    else:
+        raise NotImplementedError()
+    attn_ref = RefAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+
+    attn.prepare_metadata_for_decode(seq_len_delta, page_table, page_size)
 
     y = attn.mla_decode_paged_kv(
         q_nope,
