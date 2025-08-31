@@ -2,7 +2,7 @@ import packaging.version
 import torch
 import pytest
 
-from chitu.native_layout import Packed4BitWeightAlongK, Packed4BitWeightAlongK
+from chitu.native_layout import Packed4BitWeightAlongK
 from chitu.ops import (
     soft_fp4_raise_to_fp8_blockfp4_gemm,
     soft_fp4_raise_to_bf16_blockfp4_gemm,
@@ -90,49 +90,6 @@ def test_fp4_raise_to_bf16_gemm_is_close_to_dequanted_gemm():
     assert torch.allclose(std_y, y, atol=0.1, rtol=0.1)
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["bs", "dim"],
-        x_vals=[
-            (1, 1024),
-            (256, 1024),
-            (1, 4096),
-            (256, 4096),
-        ],
-        line_arg="provider",
-        line_vals=["torch_bf16", "triton_fp4_raise_to_bf16"],
-        line_names=["Torch_BF16", "Triton_FP4_raise_to_BF16"],
-        styles=[("blue", "-"), ("green", "-")],
-        ylabel="us",
-        plot_name="fp4_raise_to_bf16_gemm-performance",
-        args={
-            "default_dtype": torch.bfloat16,
-            "block_size": 16,
-        },
-    )
-)
-def benchmark_fp4_raise_to_bf16_gemm(bs, dim, default_dtype, block_size, provider):
-    torch.manual_seed(42)
-    torch.set_default_dtype(default_dtype)
-    device = torch.device("cuda")
-    a = torch.randn(bs, dim, dtype=default_dtype, device=device)
-    b, b_s, b_s_2 = init_weight_and_scales(dim, block_size)
-
-    if provider == "torch_bf16":
-        dequant_b = do_dequant_b(b, b_s, b_s_2, dim, block_size).to(default_dtype)
-        ms = triton.testing.do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
-    elif provider == "triton_fp4_raise_to_bf16":
-        preprocessed_b = Packed4BitWeightAlongK.convert_from(
-            Packed4BitWeightAlongK((dim, dim), b), k_stride=64
-        )
-        ms = triton.testing.do_bench(
-            lambda: soft_fp4_raise_to_bf16_blockfp4_gemm(a, preprocessed_b, b_s, b_s_2)
-        )
-    else:
-        assert False, f"Unknown provider: {provider}"
-    return ms * 1000
-
-
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
@@ -173,57 +130,3 @@ def test_fp4_raise_to_fp8_gemm_is_close_to_dequanted_gemm():
     )
 
     assert torch.allclose(std_y, y, atol=0.1, rtol=0.1)
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["bs", "dim"],
-        x_vals=[
-            (1, 1024),
-            (256, 1024),
-            (1, 4096),
-            (256, 4096),
-        ],
-        line_arg="provider",
-        line_vals=["torch_bf16", "triton_fp4_raise_to_fp8"],
-        line_names=["Torch_BF16", "Triton_FP4_raise_to_FP8"],
-        styles=[("blue", "-"), ("green", "-")],
-        ylabel="us",
-        plot_name="fp4_raise_to_fp8_gemm-performance",
-        args={
-            "default_dtype": torch.bfloat16,
-            "block_size": 16,
-            "act_block_size": 128,
-        },
-    )
-)
-def benchmark_fp4_raise_to_fp8_gemm(
-    bs, dim, default_dtype, block_size, act_block_size, provider
-):
-    torch.manual_seed(42)
-    torch.set_default_dtype(default_dtype)
-    device = torch.device("cuda")
-    a = torch.randn(bs, dim, dtype=default_dtype, device=device)
-    b, b_s, b_s_2 = init_weight_and_scales(dim, block_size)
-
-    if provider == "torch_bf16":
-        dequant_b = do_dequant_b(b, b_s, b_s_2, dim, block_size).to(default_dtype)
-        ms = triton.testing.do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
-    elif provider == "triton_fp4_raise_to_fp8":
-        a_fp8, a_s = blockfp8_act_quant(a, act_block_size)
-        preprocessed_b = Packed4BitWeightAlongK.convert_from(
-            Packed4BitWeightAlongK((dim, dim), b), k_stride=64
-        )
-        ms = triton.testing.do_bench(
-            lambda: soft_fp4_raise_to_fp8_blockfp4_gemm(
-                a_fp8, a_s, preprocessed_b, b_s, b_s_2, act_block_size=act_block_size
-            )
-        )
-    else:
-        assert False, f"Unknown provider: {provider}"
-    return ms * 1000
-
-
-if __name__ == "__main__":
-    benchmark_fp4_raise_to_bf16_gemm.run(show_plots=True, print_data=True)
-    benchmark_fp4_raise_to_fp8_gemm.run(show_plots=True, print_data=True)

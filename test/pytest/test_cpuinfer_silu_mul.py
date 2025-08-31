@@ -1,21 +1,11 @@
 import torch
 import pytest
-import triton
-import importlib
 
-cpuinfer_available = importlib.util.find_spec("cpuinfer") is not None
-if cpuinfer_available:
-    try:
-        import cpuinfer
-    except (ImportError, ModuleNotFoundError):
-        cpuinfer_available = False
+from chitu.utils import try_import_platform_dep, try_import_opt_dep
+from chitu.ops.activation import silu_and_mul_torch
 
-cpuinfer_skip_reason = "cpuinfer module not available"
-
-
-def silu_and_mul_torch(x):
-    d = x.shape[-1] // 2
-    return torch.nn.functional.silu(x[..., :d]) * x[..., d:]
+triton, has_triton = try_import_platform_dep("triton")
+cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
 
 def cpuinfer_silu_and_mul(input_tensor, CPUInfer, silu_and_mul):
@@ -34,7 +24,7 @@ def cpuinfer_silu_and_mul(input_tensor, CPUInfer, silu_and_mul):
     return output_tensor
 
 
-@pytest.mark.skipif(not cpuinfer_available, reason=cpuinfer_skip_reason)
+@pytest.mark.skipif(not has_cpuinfer, reason="cpuinfer module not available")
 @pytest.mark.parametrize("input_size", [512, 1024, 8192])
 @pytest.mark.parametrize("qlen", [1, 16, 30])
 @pytest.mark.parametrize("compute_dtype", [torch.float32, torch.bfloat16])
@@ -65,54 +55,3 @@ def test_silu_and_mul(input_size, qlen, compute_dtype):
         torch.abs(torch_output)
     )
     assert diff < 0.01, f"Difference too large: {diff}"
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["input_size"],
-        x_vals=[512, 1024, 2048, 4096, 8192],
-        line_arg="provider",
-        line_vals=["torch", "cpuinfer"],
-        line_names=["Torch", "CPUInfer"],
-        styles=[("blue", "-"), ("green", "-")],
-        ylabel="us",
-        plot_name="silu-and-mul-performance",
-        args={"compute_dtype": torch.float32, "qlen": 32},
-    )
-)
-def benchmark(input_size, qlen, compute_dtype, provider):
-    if provider == "cpuinfer" and not cpuinfer_available:
-        return float("nan")
-
-    group_max_len = 1024
-    hidden_type = 0
-
-    input_tensor = (
-        torch.randn((qlen, input_size), dtype=compute_dtype).contiguous() / 100
-    )
-
-    if provider == "torch":
-        ms = triton.testing.do_bench(lambda: silu_and_mul_torch(input_tensor))
-    elif provider == "cpuinfer":
-        CPUInfer = cpuinfer.CPUInfer("physical_core")
-        config = cpuinfer.silu_and_mul.SiluAndMulConfig(
-            input_size,
-            group_max_len,
-            hidden_type,
-        )
-        silu_and_mul = cpuinfer.silu_and_mul.SiluAndMul(config)
-
-        ms = triton.testing.do_bench(
-            lambda: cpuinfer_silu_and_mul(input_tensor, CPUInfer, silu_and_mul)
-        )
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
-
-    return ms * 1000
-
-
-if __name__ == "__main__":
-    if cpuinfer_available:
-        benchmark.run(show_plots=True, print_data=True)
-    else:
-        print(f"Skipping benchmark: {cpuinfer_skip_reason}")

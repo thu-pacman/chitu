@@ -13,6 +13,7 @@ from chitu.ops.kv_cache import (
 )
 from chitu.ops.norm import rms_norm
 from chitu.ops.moe_gate import moe_gate
+from chitu.ops.moe_sum import moe_sum
 from chitu.ops.quant import (
     linear,
     blockfp8_einsum_shc_hdc_shd,
