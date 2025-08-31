@@ -173,7 +173,3 @@ def test_nvfp4_gemm(
     )
 
     torch.testing.assert_close(out, expected_out.to(dtype=dtype), atol=2e-1, rtol=1e-1)
-
-
-if __name__ == "__main__":
-    test_nvfp4_gemm(dtype=torch.bfloat16, shape=(4, 4096, 2560), device="cuda:0")

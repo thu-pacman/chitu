@@ -33,10 +33,25 @@ if [ -n "${optional_deps}" ]; then
 else
     export OPTIONAL_DEPS_SPECIFIER=""
 fi
+
+# NOTE:
+# 1. Always add `-c` to avoid breaking compatiblity with installed packages.
+# 2. Use `pip list --format freeze` instead of `pip freeze` to generate the constraints, because
+#    the latter does not output versions of packages installed via local `.whl` files.
+# 3. You can exclude some packages from the constraints with `grep -v` if there is no solution.
+# 4. When exluding a package with "-" or "_" in its name, `grep -v` both of the variant, because
+#    `pip` treats `-` and `_` as the same character, and may use any of them in its output.
+# 5. Don't set constraint on `flash-mla`, because it uses build time stamp in the version string.
 if [ "${enable_editable_install}" == "true" ]; then
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e .${OPTIONAL_DEPS_SPECIFIER} -c <(pip freeze | grep '==' | grep -v "pillow" | grep -v "fsspec")
+    pip install \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple \
+        -e .${OPTIONAL_DEPS_SPECIFIER} \
+        -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "flash-mla" | grep -v "flash_mla")
 else
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple .${OPTIONAL_DEPS_SPECIFIER} -c <(pip freeze | grep '==' | grep -v "pillow" | grep -v "fsspec")
+    pip install \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple \
+        .${OPTIONAL_DEPS_SPECIFIER} \
+        -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "flash-mla" | grep -v "flash_mla")
 
     # Remove the source code. We only need to run the installed package. Keep testings and scripts.
     #

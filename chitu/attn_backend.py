@@ -520,7 +520,7 @@ class AttnBackend(abc.ABC):
         self,
         q_nope,
         q_pe,
-        kv_cache: KVCacheAccessor,
+        kv_cache: Optional[KVCacheAccessor],
         kv,
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale,
@@ -538,31 +538,6 @@ class AttnBackend(abc.ABC):
             kv_lora_rank + qk_rope_head_dim,  # hidden
         )
 
-        if isinstance(kv_cache, DenseKVCacheAccessor):
-            k_cache = kv_cache.k.view(
-                kv_cache.k.shape[0],
-                kv_cache.k.shape[1],
-                1,  # head
-                kv_lora_rank + qk_rope_head_dim,  # hidden
-            )
-            assert k_cache.shape[-1] == kv_lora_rank + qk_rope_head_dim
-            v_cache = k_cache[..., :kv_lora_rank]
-            kv_cache = DenseKVCacheAccessor(k_cache, v_cache)
-
-        elif isinstance(kv_cache, PagedKVCacheAccessor):
-            k_cache = kv_cache.k.view(
-                kv_cache.k.shape[0],
-                kv_cache.k.shape[1],
-                1,  # head
-                kv_lora_rank + qk_rope_head_dim,  # hidden
-            )
-            assert k_cache.shape[-1] == kv_lora_rank + qk_rope_head_dim
-            v_cache = k_cache[..., :kv_lora_rank]
-            kv_cache = PagedKVCacheAccessor(kv_cache.block_table, k_cache, v_cache)
-
-        else:
-            raise NotImplementedError()
-
         kv = kv.view(
             kv.shape[0],
             1,  # head
@@ -574,13 +549,68 @@ class AttnBackend(abc.ABC):
             assert self.qk_nope_head_dim is not None
             softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
 
-        return mqa_func(
-            q_nope_pe,
-            kv_cache,
+        if kv_cache is None:
+            return mqa_func(
+                q_nope_pe,
+                kv,
+                kv_lora,
+                seq_len_delta=seq_len_delta,
+                softmax_scale=softmax_scale,
+            )
+
+        else:
+            if isinstance(kv_cache, DenseKVCacheAccessor):
+                k_cache = kv_cache.k.view(
+                    kv_cache.k.shape[0],
+                    kv_cache.k.shape[1],
+                    1,  # head
+                    kv_lora_rank + qk_rope_head_dim,  # hidden
+                )
+                assert k_cache.shape[-1] == kv_lora_rank + qk_rope_head_dim
+                v_cache = k_cache[..., :kv_lora_rank]
+                kv_cache = DenseKVCacheAccessor(k_cache, v_cache)
+
+            elif isinstance(kv_cache, PagedKVCacheAccessor):
+                k_cache = kv_cache.k.view(
+                    kv_cache.k.shape[0],
+                    kv_cache.k.shape[1],
+                    1,  # head
+                    kv_lora_rank + qk_rope_head_dim,  # hidden
+                )
+                assert k_cache.shape[-1] == kv_lora_rank + qk_rope_head_dim
+                v_cache = k_cache[..., :kv_lora_rank]
+                kv_cache = PagedKVCacheAccessor(kv_cache.block_table, k_cache, v_cache)
+
+            else:
+                raise NotImplementedError()
+
+            return mqa_func(
+                q_nope_pe,
+                kv_cache,
+                kv,
+                kv_lora,
+                seq_len_delta=seq_len_delta,
+                softmax_scale=softmax_scale,
+            )
+
+    def mla_prefill_ragged_qkvo(
+        self,
+        q_nope,
+        q_pe,
+        kv,
+        seq_len_delta: BatchedSeqLenDelta,
+        causal: bool = False,
+        softmax_scale=None,
+    ):
+        # If not overridden, fall back to a multi-query attention
+        return self._mla_to_mqa(
+            q_nope,
+            q_pe,
+            None,
             kv,
-            kv_lora,
-            seq_len_delta=seq_len_delta,
-            softmax_scale=softmax_scale,
+            seq_len_delta,
+            softmax_scale,
+            functools.partial(self.prefill_ragged_qkvo, causal=causal),
         )
 
     def mla_prefill_ragged_qo_dense_kv(
@@ -593,15 +623,38 @@ class AttnBackend(abc.ABC):
         causal: bool = False,
         softmax_scale=None,
     ):
-        # If not overridden, fall back to a multi-query attention
-        return self._mla_to_mqa(
+        # Fallback order:
+        #    mla_prefill_ragged_qo_dense_kv
+        # -> mla_prefill_ragged_qkvo
+        # -> prefill_ragged_qkvo
+        #
+        # NOTE: Fallback order is NOT:
+        #    mla_prefill_ragged_qo_dense_kv
+        # -> prefill_ragged_qo_dense_kv
+        # -> prefill_ragged_qkvo
+        # because it incurs redundant KV cache copying.
+
+        assert kv_cache.k is not None
+        append_to_dense_kv_cache(
+            kv_cache.k,
+            kv.contiguous(),
+            seq_len_delta.delta_position_ids_tensor_device,
+            seq_len_delta.delta_seq_ids_tensor_device,
+        )
+        if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefill
+            kv = read_from_dense_kv_cache(
+                kv_cache.k,
+                seq_len_delta.new.position_ids_tensor_device,
+                seq_len_delta.new.seq_ids_tensor_device,
+            )
+
+        return self.mla_prefill_ragged_qkvo(
             q_nope,
             q_pe,
-            kv_cache,
             kv,
             seq_len_delta,
-            softmax_scale,
-            functools.partial(self.prefill_ragged_qo_dense_kv, causal=causal),
+            causal=causal,
+            softmax_scale=softmax_scale,
         )
 
     def mla_prefill_ragged_qo_paged_kv(
@@ -614,15 +667,40 @@ class AttnBackend(abc.ABC):
         causal: bool = False,
         softmax_scale=None,
     ):
-        # If not overridden, fall back to a multi-query attention
-        return self._mla_to_mqa(
+        # Fallback order:
+        #    mla_prefill_ragged_qo_paged_kv
+        # -> mla_prefill_ragged_qkvo
+        # -> prefill_ragged_qkvo
+        #
+        # NOTE: Fallback order is NOT:
+        #    mla_prefill_ragged_qo_paged_kv
+        # -> prefill_ragged_qo_paged_kv
+        # -> prefill_ragged_qkvo
+        # because it incurs redundant KV cache copying.
+
+        assert kv_cache.k is not None
+        append_to_paged_kv_cache(
+            kv_cache.k,
+            kv_cache.block_table,
+            kv.contiguous(),
+            seq_len_delta.delta_position_ids_tensor_device,
+            seq_len_delta.delta_seq_ids_tensor_device,
+        )
+        if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefilling
+            kv = read_from_paged_kv_cache(
+                kv_cache.k,
+                kv_cache.block_table,
+                seq_len_delta.new.position_ids_tensor_device,
+                seq_len_delta.new.seq_ids_tensor_device,
+            )
+
+        return self.mla_prefill_ragged_qkvo(
             q_nope,
             q_pe,
-            kv_cache,
             kv,
             seq_len_delta,
-            softmax_scale,
-            functools.partial(self.prefill_ragged_qo_paged_kv, causal=causal),
+            causal=causal,
+            softmax_scale=softmax_scale,
         )
 
     def mla_decode_dense_kv(
@@ -1738,32 +1816,34 @@ class FlashInferBackend(TritonAttnBackend):
                 kv_data_type=torch.get_default_dtype(),
             )
 
-        for i in range(raw_batch_size):
-            self.last_page_len[i] = seq_len_delta.new.lens_list[i]
+        else:
 
-        def is_new_seq_len():
-            for i in range(batch_size):
-                if self.record_pre_page_len[i] != self.last_page_len[i]:
-                    return True
-            return False
+            for i in range(raw_batch_size):
+                self.last_page_len[i] = seq_len_delta.new.lens_list[i] % block_size
 
-        if is_new_seq_len():
-            self.record_pre_page_len.copy_(self.last_page_len)
-            self.decode_wrapper[batch_size].plan(
-                self.kv_indptr.get()[: batch_size + 1],
-                self.kv_indices.get(),
-                self.last_page_len[:batch_size] % block_size,
-                self.local_n_heads,
-                self.local_n_heads if self.is_mla else self.local_n_kv_heads,
-                self.head_dim,
-                block_size,
-                pos_encoding_mode="NONE",
-                q_data_type=torch.get_default_dtype(),
-                kv_data_type=torch.get_default_dtype(),
-                window_left=window_size[0],
-                logits_soft_cap=softcap,
-                sm_scale=softmax_scale,
-            )
+            def is_new_seq_len():
+                for i in range(batch_size):
+                    if self.record_pre_page_len[i] != self.last_page_len[i]:
+                        return True
+                return False
+
+            if is_new_seq_len():
+                self.record_pre_page_len.copy_(self.last_page_len)
+                self.decode_wrapper[batch_size].plan(
+                    self.kv_indptr.get()[: batch_size + 1],
+                    self.kv_indices.get(),
+                    self.last_page_len[:batch_size],
+                    self.local_n_heads,
+                    self.local_n_heads if self.is_mla else self.local_n_kv_heads,
+                    self.head_dim,
+                    block_size,
+                    pos_encoding_mode="NONE",
+                    q_data_type=torch.get_default_dtype(),
+                    kv_data_type=torch.get_default_dtype(),
+                    window_left=window_size[0],
+                    logits_soft_cap=softcap,
+                    sm_scale=softmax_scale,
+                )
 
     @override
     def mla_decode_paged_kv(
@@ -1791,33 +1871,45 @@ class FlashInferBackend(TritonAttnBackend):
             return_lse=False,
         ).view(seq_len_delta.batch_size, self.local_n_heads, -1)
 
-    def mla_prefill_paged_kv(
+    @override
+    def mla_prefill_ragged_qo_paged_kv(
         self,
         q_nope,
         q_pe,
-        ckv,
-        kpe,
+        kv_cache: PagedKVCacheAccessor,
+        kv,
         seq_len_delta: BatchedSeqLenDelta,
-        causal=False,
+        causal: bool = False,
         softmax_scale=None,
     ):
-        page_size, num_kv_head, head_dim_ckv = ckv.shape
-        head_dim_kpe = kpe.shape[-1]
-        num_pages = 1
-
-        ckv = ckv.view(num_pages, page_size, num_kv_head, head_dim_ckv)
-        kpe = kpe.view(num_pages, page_size, num_kv_head, head_dim_kpe)
+        bs_seq, local_n_heads, self.kv_lora_rank = q_nope.shape
+        assert q_pe.shape[0] == bs_seq
+        assert q_pe.shape[1] == local_n_heads
+        _, _, self.qk_rope_head_dim = q_pe.shape
+        block_size = kv_cache.k.shape[1]
+        append_to_paged_kv_cache(
+            kv_cache.k,
+            kv_cache.block_table,
+            kv,
+            seq_len_delta.delta_position_ids_tensor_device,
+            seq_len_delta.delta_seq_ids_tensor_device,
+        )
 
         q_indptr = seq_len_delta.delta_prefix_lens_tensor_device
-        kv_indptr = seq_len_delta.new.prefix_lens_tensor_device
-        kv_indices = torch.zeros(
-            [
-                page_size,
-            ],
-            dtype=torch.int32,
-            device=q_nope.device,
-        )
-        kv_lens = kv_indptr[1:] - kv_indptr[:-1]
+        kv_indptr_list = []
+        kv_indices_list = []
+        tot_len = 0
+        for i in range(seq_len_delta.batch_size):
+            kv_indptr_list.append(tot_len)
+            cur_len = (
+                seq_len_delta.new.lens_tensor_device[i].item() - 1
+            ) // block_size + 1
+            kv_indices_list.append(kv_cache.block_table[i, :cur_len])
+            tot_len += cur_len
+        kv_indptr_list.append(tot_len)
+        kv_indptr = torch.tensor(kv_indptr_list).cuda().to(torch.int32)
+        kv_indices = torch.cat(kv_indices_list).cuda().to(torch.int32)
+        kv_lens = seq_len_delta.new.lens_tensor_device
 
         self.mla_prefill_wrapper.plan(
             q_indptr,
@@ -1825,16 +1917,22 @@ class FlashInferBackend(TritonAttnBackend):
             kv_indices,
             kv_lens,
             self.local_n_heads,
-            head_dim_ckv,
-            head_dim_kpe,
-            page_size,
-            causal,
-            softmax_scale,
-            q_nope.dtype,
-            ckv.dtype,
+            head_dim_ckv=self.kv_lora_rank,
+            head_dim_kpe=self.qk_rope_head_dim,
+            page_size=block_size,
+            causal=causal,
+            sm_scale=softmax_scale,
+            q_data_type=torch.get_default_dtype(),
+            kv_data_type=torch.get_default_dtype(),
         )
 
-        out = self.mla_prefill_wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
+        out = self.mla_prefill_wrapper.run(
+            q_nope,
+            q_pe,
+            kv_cache.k[..., : self.kv_lora_rank],
+            kv_cache.k[..., self.kv_lora_rank :],
+            return_lse=False,
+        )
         return out
 
     @override
@@ -1850,41 +1948,25 @@ class FlashInferBackend(TritonAttnBackend):
         softmax_scale=None,
         sinks=None,
     ):
-        # Support DeepSeek-R1 in flashinfer prefill step when self.is_mla is True
-        if self.is_mla:
-            q_nope = q[..., : self.kv_lora_rank]
-            q_pe = q[..., self.kv_lora_rank :]
-
-            ckv = k[..., : self.kv_lora_rank]
-            kpe = k[..., self.kv_lora_rank :]
-            return self.mla_prefill_paged_kv(
-                q_nope,
-                q_pe,
-                ckv,
-                kpe,
-                seq_len_delta,
-                causal=causal,
-                softmax_scale=softmax_scale,
-            )
-        else:
-            num_qo_heads = q.shape[-2]
-            num_kv_heads = k.shape[-2]
-            self.prefill_wrapper.plan(
-                seq_len_delta.delta_prefix_lens_tensor_device,
-                seq_len_delta.new.prefix_lens_tensor_device,
-                num_qo_heads,
-                num_kv_heads,
-                head_dim_qk=q.shape[-1],
-                head_dim_vo=v.shape[-1],
-                causal=causal,
-                q_data_type=q.dtype,
-                kv_data_type=k.dtype,
-                window_left=window_size[0],
-                logits_soft_cap=softcap,
-                sm_scale=softmax_scale,
-            )
-            o = self.prefill_wrapper.run(q, k, v)
-            return o
+        assert not self.is_mla
+        num_qo_heads = q.shape[-2]
+        num_kv_heads = k.shape[-2]
+        self.prefill_wrapper.plan(
+            seq_len_delta.delta_prefix_lens_tensor_device,
+            seq_len_delta.new.prefix_lens_tensor_device,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_qk=q.shape[-1],
+            head_dim_vo=v.shape[-1],
+            causal=causal,
+            q_data_type=q.dtype,
+            kv_data_type=k.dtype,
+            window_left=window_size[0],
+            logits_soft_cap=softcap,
+            sm_scale=softmax_scale,
+        )
+        o = self.prefill_wrapper.run(q, k, v)
+        return o
 
     @override
     def decode_dense_kv(

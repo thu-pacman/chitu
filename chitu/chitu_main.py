@@ -480,7 +480,7 @@ def chitu_run_normal():
             )
         curr_batch_result = BatchResult(
             num_tasks=tasks.num_tasks,
-            tasks=tasks.tasks,
+            tasks=tasks.output_tasks,
             next_tokens=tokens,
             return_logprobs=tasks.return_logprobs,
             logprobs=tasks.logprobs.cpu() if tasks.return_logprobs else None,

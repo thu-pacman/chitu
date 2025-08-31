@@ -11,8 +11,15 @@ import csrc.setup_build as operators
 setup_dir = os.path.dirname(os.path.abspath(__file__))
 
 install_requires = [
-    # Don't put `torch` here because it requires downloading from a specific source
-    "transformers",
+    # Special notes on torch:
+    # 1. Users should not expect the installing of chitu to automatically
+    #    install torch, because different variants of torch should be used
+    #    on different platforms.
+    # 2. For the same reason, we don't set specific torch version here.
+    # 3. In order to prevent `pip` from upgrading your platform-specifc
+    #    torch back to the official version, please use `-c` on `pip`.
+    "torch",
+    "transformers[torch]",
     "safetensors<0.6",  # 0.6 breaks on muxi
     "fire",
     "tiktoken>=0.7.0",  # Required by glm4

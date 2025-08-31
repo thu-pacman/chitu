@@ -6,8 +6,62 @@ import triton
 import triton.language as tl
 
 
+def moe_sum_triton(input_tensor, output_tensor):
+    """
+    Sum the input tensor along dimension 1 (topK).
+    Input shape: (M, topK, N)
+    Output shape: (M, N)
+
+    Args:
+        input_tensor: Input tensor of shape (M, topK, N)
+
+    Returns:
+        Output tensor of shape (M, N)
+    """
+    M, topK, N = input_tensor.shape
+
+    # SPDX-SnippetBegin
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-SnippetCopyrightText: 2025 unslothai
+    # SDPX—SnippetName: calculate_settings from unsloth
+    def calculate_settings(n):
+        # reference: https://github.com/unslothai/unsloth/blob/fd753fed99ed5f10ef8a9b7139588d9de9ddecfb/unsloth/kernels/utils.py#L43
+
+        MAX_FUSED_SIZE = 65536
+        BLOCK_SIZE = triton.next_power_of_2(n)
+        if BLOCK_SIZE > MAX_FUSED_SIZE:
+            raise RuntimeError(
+                f"Cannot launch Triton kernel since n = {n} exceeds "
+                f"the recommended Triton blocksize = {MAX_FUSED_SIZE}."
+            )
+
+        num_warps = 4
+        if BLOCK_SIZE >= 32768:
+            num_warps = 32
+        elif BLOCK_SIZE >= 8192:
+            num_warps = 16
+        elif BLOCK_SIZE >= 1024:
+            num_warps = 8
+        return BLOCK_SIZE, num_warps
+
+    # SPDX-SnippetEnd
+
+    BLOCK_SIZE_N, num_warps = calculate_settings(N)
+    # Determine grid and block sizes
+
+    moe_sum_triton_kernel[M,](
+        input_tensor,
+        output_tensor,
+        M,
+        topK,
+        N,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        num_warps=num_warps,
+    )
+
+
 @triton.jit
-def moe_sum_triton(
+def moe_sum_triton_kernel(
     # Pointers to matrices
     input_ptr,
     output_ptr,

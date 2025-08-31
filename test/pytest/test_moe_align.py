@@ -74,7 +74,3 @@ def test_moe_align_block_size_cuda():
                 ]
                 for idx in expert_indices:
                     assert idx in expert_section
-
-
-if __name__ == "__main__":
-    test_moe_align_block_size_cuda()
