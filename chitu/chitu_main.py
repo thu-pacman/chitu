@@ -314,6 +314,11 @@ def check_checkpoint_path(args):
             f"Using {args.models.ckpt_dir} as the path to tokenizer. If the tokenizer has a different path, please set in command line by adding `models.tokenizer_path=<path>`"
         )
         args.models.tokenizer_path = args.models.ckpt_dir
+    if hasattr(args.models, "processor_path") and args.models.processor_path is None:
+        logger.info(
+            f"Using {args.models.ckpt_dir} as the path to processor. If the processor has a different path, please set in command line by adding `models.processor_path=<path>`"
+        )
+        args.models.processor_path = args.models.ckpt_dir
 
 
 def chitu_init(args, logging_level=None):

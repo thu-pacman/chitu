@@ -12,6 +12,7 @@ class ModelType(str, Enum):
     DEEPSEEK_V3 = "deepseek-v3"
     HF_LLAMA = "hf-llama"
     HF_QWEN_3_MOE = "hf-qwen-3-moe"
+    HF_QWEN2_VL = "hf-qwen2-vl"
     HF_GLM_Z1 = "hf-glm-z1"
     HF_GLM_4_MOE = "hf-glm-4-moe"
     HF_GPT_OSS = "hf-gpt-oss"

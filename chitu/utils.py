@@ -7,6 +7,7 @@ import functools
 import logging
 from logging import WARNING, INFO, getLogger
 import os
+import re
 from pathlib import Path
 import random
 from typing import Any, List, Tuple
@@ -108,12 +109,18 @@ def try_import_platform_dep(pkg_name: str) -> Tuple[Any, bool]:
         return ReportErrorWhenUsed(e), False
 
 
-def is_layer(layer_name, full_name):
-    return (
-        f".{layer_name}." in full_name
-        or full_name.startswith(layer_name + ".")
-        or full_name.endswith("." + layer_name)
-    )
+_regex_special_chars = set(".^$*+?{}[]|()")
+
+
+def is_layer(layer_name: str, full_name: str) -> bool:
+    if any(ch in _regex_special_chars for ch in layer_name):
+        return re.search(layer_name, full_name) is not None
+    else:
+        return (
+            f".{layer_name}." in full_name
+            or full_name.startswith(layer_name + ".")
+            or full_name.endswith("." + layer_name)
+        )
 
 
 def compute_layer_dist_in_pipe(num_layers, world_size):

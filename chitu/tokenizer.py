@@ -23,6 +23,7 @@ from typing import (
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
 from transformers import AutoTokenizer
+from transformers import AutoProcessor
 
 from chitu.global_vars import get_global_args
 
@@ -35,10 +36,34 @@ Role = Literal["system", "user", "assistant"]
 
 class Message(TypedDict):
     role: Role
-    content: str
+    content: Union[str, List[Union[str, dict]]]
 
 
 Dialog = Sequence[Message]
+
+
+class Processor:
+    """Multimodal processor for vision-language models using AutoProcessor."""
+
+    def __init__(self, path: str, trust_remote_code: bool = True):
+        """Initialize the processor.
+
+        Args:
+            path: Path to the processor config/model
+            trust_remote_code: Whether to trust remote code for loading
+        """
+        self.processor = AutoProcessor.from_pretrained(
+            path, trust_remote_code=trust_remote_code
+        )
+
+    def process(self, text=None, images=None, **kwargs):
+        return self.processor(text=text, images=images, **kwargs)
+
+    def apply_chat_template(self, dialog):
+        return self.processor.apply_chat_template(dialog)
+
+    def __call__(self, text=None, images=None, **kwargs):
+        return self.process(text=text, images=images, **kwargs)
 
 
 class Tokenizer:
@@ -330,8 +355,9 @@ class TokenizerHF:
 
 
 class ChatFormatHF:
-    def __init__(self, tokenizer: TokenizerHF):
+    def __init__(self, tokenizer: TokenizerHF, processor: Processor):
         self.tokenizer = tokenizer
+        self.processor = processor
 
     def encode_header(self, message: Message) -> List[int]:  # ???
         tokens = []
@@ -351,7 +377,28 @@ class ChatFormatHF:
         self,
         dialog: Dialog,
         chat_template_kwargs: Mapping[str, Any] = {},
-    ) -> List[int]:
+    ):
+        if self.processor:
+            text = self.processor.apply_chat_template(dialog)
+            from qwen_vl_utils import process_vision_info
+
+            image_inputs, video_inputs = process_vision_info(dialog)
+            inputs = self.processor(
+                text=text,
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
+            if "pixel_values" in inputs:
+                return (
+                    inputs["input_ids"].reshape(-1).tolist(),
+                    inputs["pixel_values"],
+                    inputs["image_grid_thw"],
+                )
+            else:
+                return inputs["input_ids"].reshape(-1).tolist()
+
         if hasattr(self.tokenizer.model, "apply_chat_template"):
             chat_template_kwargs = chat_template_kwargs or {}
             return self.tokenizer.model.apply_chat_template(

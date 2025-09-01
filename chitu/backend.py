@@ -39,7 +39,7 @@ from chitu.quantization import (
     get_quant_from_checkpoint_prefix,
     utils,
 )
-from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
+from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF, Processor
 from chitu.utils import compute_layer_dist_in_pipe, parse_dtype, try_import_opt_dep
 
 # from chitu.distributed.moe_token_dispatcher import init_token_dispatcher
@@ -56,18 +56,6 @@ cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 logger = getLogger(__name__)
 
 
-def check_checkpoint_path(args):
-    if args.models.ckpt_dir is None:
-        raise ValueError(
-            f"No checkpoint path provided. You can set it in command line by adding `models.ckpt_dir=<path>`. The model {args.models.name} can be downloaded from {args.models.source}"
-        )
-    if args.models.tokenizer_path is None:
-        logger.info(
-            f"Using {args.models.ckpt_dir} as the path to tokenizer. If the tokenizer has a different path, please set in command line by adding `models.tokenizer_path=<path>`"
-        )
-        args.models.tokenizer_path = args.models.ckpt_dir
-
-
 class BackendState(Enum):
     Running = 1
     Terminating = 2  # All tasks done, but rank 0 should tell others to terminate
@@ -80,6 +68,7 @@ class Backend:
     tokenizer = None
     cache_manager = None
     formatter = None
+    processor = None
     args = None
     # --- cache_manager related (not used in the current code)
     curr_req_ids = None
@@ -225,6 +214,28 @@ class Backend:
         return tokenizer
 
     @staticmethod
+    def _init_processor(args):
+        """
+        Initialize the multimodal processor for vision-language models.
+
+        Arguments:
+            args: Configuration with model settings
+
+        Returns:
+            Initialized processor or None if not a multimodal model
+        """
+        multimodal_models = ["qwen2.5-vl", "qwen2-vl", "qwen2_vl"]
+        is_multimodal = any(mm in args.models.type.lower() for mm in multimodal_models)
+
+        if not is_multimodal:
+            return None
+
+        processor = Processor(path=args.models.processor_path, trust_remote_code=True)
+
+        logger.info(f"Initialized multimodal processor for {args.models.name}")
+        return processor
+
+    @staticmethod
     def _init_formatter(args):
         """
         Initialize the chat formatter based on model type.
@@ -236,7 +247,7 @@ class Backend:
             Appropriate chat formatter instance
         """
         if args.models.tokenizer_type == "hf":
-            return ChatFormatHF(Backend.tokenizer)
+            return ChatFormatHF(Backend.tokenizer, Backend.processor)
         else:
             return ChatFormat(Backend.tokenizer)
 
@@ -458,7 +469,7 @@ class Backend:
             # Use initialized weights
             model = Backend._build_model_architecture(args, attn_backend)
 
-        # Move modl to appropriate device
+        # Move model to appropriate device
         if args.infer.op_impl != "cpu":
             model.apply(Backend._move_one_module_to_device)
         Backend.model = model
@@ -548,6 +559,7 @@ class Backend:
                 "hf-gpt-oss",
                 "hf-mixtral",
                 "deepseek-v3",
+                "hf-qwen2-vl",
             }:
                 checkpoint = Backend._load_hf_checkpoint(model, args)
             else:
@@ -575,7 +587,6 @@ class Backend:
                         checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
                 if quant == "blockfp4" and checkpoint[k].element_size() == 1:
                     checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
-
             model.load_state_dict_parallel(
                 checkpoint,
                 strict=True,
@@ -655,6 +666,7 @@ class Backend:
 
         # Initialize tokenizer and formatter
         Backend.tokenizer = Backend._init_tokenizer(args)
+        Backend.processor = Backend._init_processor(args)
         Backend.formatter = Backend._init_formatter(args)
 
         # Initialize cache manager

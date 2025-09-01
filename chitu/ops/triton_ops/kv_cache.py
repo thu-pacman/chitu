@@ -35,7 +35,9 @@ def append_to_paged_kv_cache_triton(
 
     batch_size, num_pages_per_sample = page_table.shape
     num_tokens = this_kv.shape[0]
-    assert delta_position_ids.shape[0] == num_tokens
+    assert (
+        delta_position_ids.shape[0] == num_tokens
+    ), f"num_tokens: {num_tokens}, delta_position_ids.shape: {delta_position_ids.shape}"
     if delta_seq_ids is not None:
         assert delta_seq_ids.shape[0] == num_tokens
 

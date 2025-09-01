@@ -614,7 +614,7 @@ class Transformer(nn.Module):
     def _init_post_layers(self):
         raise NotImplementedError
 
-    def _pre_layers(self, h):
+    def _pre_layers(self, h, **args):
         raise NotImplementedError
 
     def _post_layers(self, h):
@@ -637,10 +637,10 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def prefill_no_pipeline(
-        self, tokens, output_token_offsets: torch.Tensor
+        self, tokens, output_token_offsets: torch.Tensor, **args
     ) -> torch.Tensor:
         freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis()
-        h = self._pre_layers(tokens)
+        h = self._pre_layers(tokens, **args)
         for it, layer in enumerate(self.layers):
             h = layer(h, freqs_cis_cos, freqs_cis_sin)
 
@@ -661,13 +661,13 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def prefill_pipeline(
-        self, tokens, output_token_offsets: torch.Tensor
+        self, tokens, output_token_offsets: torch.Tensor, **args
     ) -> torch.Tensor:
         freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis()
 
         # start of model
         if self.pp_stage == 0:
-            h = self._pre_layers(tokens)
+            h = self._pre_layers(tokens, **args)
         else:
             h = tokens
 
@@ -699,12 +699,18 @@ class Transformer(nn.Module):
         return h
 
     @torch.inference_mode()
-    def prefill(self, tokens, output_token_offsets: torch.Tensor) -> torch.Tensor:
+    def prefill(
+        self, tokens, output_token_offsets: torch.Tensor, **args
+    ) -> torch.Tensor:
         self.attn_backend.prepare_metadata_for_prefill(self.cache.seq_len_delta.new)
         if self.pipeline_exec:
-            return self.prefill_pipeline(tokens, output_token_offsets)
+            return self.prefill_pipeline(tokens, output_token_offsets, **args)
         else:
-            return self.prefill_no_pipeline(tokens, output_token_offsets)
+            return self.prefill_no_pipeline(tokens, output_token_offsets, **args)
+
+    @torch.inference_mode()
+    def prepare_inputs(self, tokens, **args):
+        return self._pre_layers(tokens)
 
     def prepare_decoding_attn(self):
         block_table = self.cache.get_gpu_block_table()
