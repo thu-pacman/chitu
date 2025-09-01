@@ -191,7 +191,7 @@ def main(args: ServeConfig):
     logger.info(f"Run with args: {args}")
 
     chitu_init(args, logging_level=logging.INFO)
-    torch.distributed.barrier()
+    torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 
     timers = get_timers()
     logger.debug("finish init")
@@ -208,6 +208,6 @@ if __name__ == "__main__":
     # As a workaround, we `exec` a dummy process to kill the current process, without
     # returning an error.
     logger.info("Waiting for all ranks to finish...")
-    torch.distributed.barrier()
+    torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
     # Don't exec bash because it loads startup scripts
     os.execl("/usr/bin/true", "true")  # /usr/bin/true does nothing but exits

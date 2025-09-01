@@ -37,13 +37,18 @@ from chitu.cache_manager import (
     PagedKVCacheAccessor,
     DenseKVCacheAccessor,
 )
-from chitu.utils import pad_tensor, try_import_opt_dep, try_import_platform_dep
+from chitu.utils import (
+    pad_tensor,
+    try_import_opt_dep,
+    try_import_platform_dep,
+    try_import_and_setup_torch_npu,
+)
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
 flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
 triton, has_triton = try_import_platform_dep("triton")
-torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 if has_triton and torch.cuda.is_available():
     from chitu.triton_decode_attention import (
@@ -2045,10 +2050,10 @@ class FlashInferBackend(TritonAttnBackend):
 
 
 class NpuAttnBackend(RefAttnBackend):
-    def __init__(self, *args, **kwargs):
-        super().__init__()
+    def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
+        super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
-        if get_global_args().infer.prefill_chunk_size is not None:
+        if getattr(get_global_args().infer, "prefill_chunk_size", None) is not None:
             raise NotImplementedError(
                 "prefill_chunk_size is not supported yet for NpuAttnBackend"
             )
@@ -2062,57 +2067,34 @@ class NpuAttnBackend(RefAttnBackend):
             )
         else:
             self.local_n_kv_heads = self.local_n_heads
-        if hasattr(self.args.models, "v_head_dim"):
-            self.mla_v_head_dim = self.args.models.v_head_dim
-        self.scale = float(
-            1 / math.sqrt(self.args.models.dim // self.args.models.n_heads)
-        )  # [FIXME] can not be used in mla
-        self.block_size = 128
-        self.slot_mapping = StaticTensor(
-            max_nelem=self.args.infer.max_reqs, dtype=torch.int32, device="cuda"
-        )
 
-    def prepare_metadata_for_prefill(self, seq_len):
-        def generate_attn_mask(max_seq_len: int, dtype=torch.bfloat16):
-            # Construct lower triangle matrix.
-            mask_flag = torch.tril(
-                torch.ones((max_seq_len, max_seq_len), dtype=torch.bool)
-            ).view(max_seq_len, max_seq_len)
-            # Create upper triangle matrix used to mark mask positions.
-            mask_flag = ~mask_flag
-            # Currently for fp16 dtype, the mask value should be set to -inf.
-            # TODO: Eliminate this part in the future.
-            if dtype == torch.float16:
-                mask_value = torch.finfo(torch.float32).min
-            else:
-                mask_value = 1
-            attn_mask = torch.masked_fill(
-                torch.zeros(size=(max_seq_len, max_seq_len)), mask_flag, mask_value
-            ).to(dtype)
-            return attn_mask
+    def prepare_metadata_for_prefill(self, seq_len_delta: BatchedSeqLenDelta):
+        # SPDX-SnippetBegin
+        # SPDX-License-Identifier: Apache-2.0
+        # SPDX-SnippetCopyrightText: 2025 Huawei Technologies Co., Ltd.
+        # SDPX—SnippetName: _generate_attn_mask from vllm-ascend
 
-        self.attn_mask = generate_attn_mask(seq_len.max_len, torch.bfloat16).cuda()
+        # Adapt from https://github.com/vllm-project/vllm-ascend/blob/b72e34013f5f8aa59d7b4060f11c4fc3543f3647/vllm_ascend/attention/attention_mask.py#L18
 
-    def prepare_metadata_for_decode(
-        self,
-        seq_len_delta: BatchedSeqLenDelta,
-        block_table,
-        block_size,
-        softmax_scale=None,
-    ):
-        # paged kvcache
-        if block_table is not None:
-            self.block_table_list = block_table.tolist()
-            slot_list = []
-            for i in range(len(self.block_table_list)):
-                block_number = self.block_table_list[i][
-                    seq_len_delta.old.lens_list[i] // block_size
-                ]
-                block_offset = seq_len_delta.old.lens_list[i] % block_size
-                slot_list.append(block_number * block_size + block_offset)
-            self.slot_mapping.set(
-                torch.tensor(slot_list, dtype=torch.int32, device="npu")
-            )
+        dtype = torch.get_default_dtype()
+        max_seq_len = seq_len_delta.new.max_len
+        # Construct lower triangle matrix.
+        mask_flag = torch.tril(
+            torch.ones((max_seq_len, max_seq_len), dtype=torch.bool)
+        ).view(max_seq_len, max_seq_len)
+        # Create upper triangle matrix used to mark mask positions.
+        mask_flag = ~mask_flag
+        # Currently for fp16 dtype, the mask value should be set to -inf.
+        # TODO: Eliminate this part in the future.
+        if dtype == torch.float16:
+            mask_value = float("-inf")
+        else:
+            mask_value = 1
+        self.attn_mask = torch.zeros(size=(max_seq_len, max_seq_len), dtype=dtype)
+        self.attn_mask.masked_fill_(mask_flag, mask_value)
+        self.attn_mask = self.attn_mask.cuda()
+
+        # SPDX-SnippetEnd
 
     @override
     def prefill_ragged_qkvo(
@@ -2127,26 +2109,26 @@ class NpuAttnBackend(RefAttnBackend):
         softmax_scale=None,
         sinks=None,
     ):
-        if self.args.infer.mla_absorb.lower() != "none":
+        if softmax_scale is None:
+            softmax_scale = float(1 / math.sqrt(q.shape[-1]))
+
+        if k.shape[-1] != v.shape[-1]:
             dim_gap = k.shape[-1] - v.shape[-1]
             # 扩充v的维度以匹配q & k，by adding O
-            if dim_gap >= 0:
-                added_v = torch.cat(
-                    [
-                        v,
-                        torch.zeros(
-                            *v.shape[:-1], dim_gap, device=v.device, dtype=v.dtype
-                        ),
-                    ],
-                    dim=-1,
-                )
+            assert dim_gap >= 0
+            added_v = torch.cat(
+                [
+                    v,
+                    torch.zeros(*v.shape[:-1], dim_gap, device=v.device, dtype=v.dtype),
+                ],
+                dim=-1,
+            )
             repeated_k = einops.repeat(
                 k, "b h d -> b (h g) d", g=q.shape[1] // k.shape[1]
             )
             repeated_v = einops.repeat(
                 added_v, "b h d -> b (h g) d", g=q.shape[1] // added_v.shape[1]
             )
-            scale = softmax_scale
             out = torch.empty_like(q)
             torch_npu._npu_flash_attention(
                 query=q,
@@ -2156,7 +2138,7 @@ class NpuAttnBackend(RefAttnBackend):
                 seq_len=seq_len_delta.new.lens_tensor_cpu,
                 num_kv_heads=repeated_k.shape[1],
                 num_heads=self.local_n_heads,
-                scale_value=scale,
+                scale_value=softmax_scale,
                 out=out,
             )
             npu_out = out[..., : v.shape[-1]]
@@ -2170,7 +2152,7 @@ class NpuAttnBackend(RefAttnBackend):
             value=v,
             mask=self.attn_mask,
             seq_len=seq_len_delta.new.lens_tensor_cpu,
-            scale_value=self.scale,
+            scale_value=softmax_scale,
             num_heads=self.local_n_heads,
             num_kv_heads=self.local_n_kv_heads,
             out=output,
@@ -2260,26 +2242,26 @@ class NpuAttnBackend(RefAttnBackend):
         softmax_scale=None,
         sinks=None,
     ):
+        if softmax_scale is None:
+            softmax_scale = float(1 / math.sqrt(q.shape[-1]))
+
         # Legacy shape change. TODO: Remve this
         q = q.unsqueeze(1)
         k = k.unsqueeze(1) if k is not None else None
         v = v.unsqueeze(1) if v is not None else None
 
-        scale_to_use = float(softmax_scale) if softmax_scale is not None else self.scale
         # update kv cache
         append_to_dense_kv_cache(
             kv_cache.k,
-            k.contiguous(),
+            k,
             seq_len_delta.old.lens_tensor_device,
-            None,
-            impl=("torch" if self.args.models.type == "deepseek-v3" else "torch_npu"),
+            impl="torch" if self.args.models.type == "deepseek-v3" else "torch_npu",
         )
         append_to_dense_kv_cache(
             kv_cache.v,
-            v.contiguous(),
+            v,
             seq_len_delta.old.lens_tensor_device,
-            None,
-            impl=("torch" if self.args.models.type == "deepseek-v3" else "torch_npu"),
+            impl="torch" if self.args.models.type == "deepseek-v3" else "torch_npu",
         )
 
         if hasattr(cinfer_ascendc, "grouped_query_attention") and (
@@ -2298,7 +2280,7 @@ class NpuAttnBackend(RefAttnBackend):
                 output,
                 q.shape[0],
                 "BSND",
-                scale_to_use,
+                softmax_scale,
             )
 
             return output
@@ -2311,7 +2293,7 @@ class NpuAttnBackend(RefAttnBackend):
                 kv_cache.v.contiguous(),
                 input_layout="BSND",
                 actual_seq_lengths_kv=seq_len_delta.new.lens_list,
-                scale=scale_to_use,
+                scale=softmax_scale,
                 num_heads=self.local_n_heads,
                 num_key_value_heads=self.local_n_kv_heads,
                 out=[output, lse],
@@ -2332,6 +2314,9 @@ class NpuAttnBackend(RefAttnBackend):
         softmax_scale=None,
         sinks=None,
     ):
+        if softmax_scale is None:
+            softmax_scale = float(1 / math.sqrt(q.shape[-1]))
+
         # Legacy shape change. TODO: Remve this
         q = q.unsqueeze(1)
         k = k.unsqueeze(1) if k is not None else None
@@ -2343,16 +2328,28 @@ class NpuAttnBackend(RefAttnBackend):
         v = v.view(v.shape[0], v.shape[1], -1).contiguous()
 
         # update kv_cache
+        append_to_paged_kv_cache(
+            kv_cache.k,
+            kv_cache.block_table,
+            k,
+            seq_len_delta.old.lens_tensor_device,
+        )
+        append_to_paged_kv_cache(
+            kv_cache.v,
+            kv_cache.block_table,
+            v,
+            seq_len_delta.old.lens_tensor_device,
+        )
+
+        block_size = kv_cache.k.shape[1]
+
         kv_cache.k = kv_cache.k.view(
             kv_cache.k.shape[0] * kv_cache.k.shape[1], -1
         ).unsqueeze(1)
+
         kv_cache.v = kv_cache.v.view(
             kv_cache.v.shape[0] * kv_cache.v.shape[1], -1
         ).unsqueeze(1)
-        kv_cache.k[self.slot_mapping.get()] = k
-        kv_cache.v[self.slot_mapping.get()] = v
-
-        scale_to_use = float(softmax_scale) if softmax_scale is not None else self.scale
 
         output = torch.empty_like(q)
         lse = torch.empty(1, dtype=q.dtype, device="npu")
@@ -2361,10 +2358,10 @@ class NpuAttnBackend(RefAttnBackend):
             kv_cache.k,
             kv_cache.v,
             input_layout="BSH",
-            block_size=128,
+            block_size=block_size,
             block_table=kv_cache.block_table,
             actual_seq_lengths_kv=seq_len_delta.new.lens_list,
-            scale=scale_to_use,
+            scale=softmax_scale,
             num_heads=self.local_n_heads,
             num_key_value_heads=self.local_n_kv_heads,
             out=[output, lse],
@@ -2382,22 +2379,27 @@ class NpuAttnBackend(RefAttnBackend):
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
     ):
-        bsz = seq_len_delta.batch_size
-        tp_size = self.args.infer.tp_size
+        bsz, local_n_heads, kv_lora_rank = q_nope.shape
+        _, _, qk_rope_head_dim = q_pe.shape
         query = torch.cat([q_nope, q_pe], dim=-1).view(bsz, q_nope.shape[-2], -1)
 
-        for i in range(bsz):
-            kv_cache.k[kv_cache.block_table[i][seq_len_delta.old.lens_list[i] // 128]][
-                seq_len_delta.old.lens_list[i] % 128
-            ] = kv[i]
+        if softmax_scale is None:
+            assert self.qk_nope_head_dim is not None
+            softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
+
+        append_to_paged_kv_cache(
+            kv_cache.k,
+            kv_cache.block_table,
+            kv,
+            seq_len_delta.old.lens_tensor_device,
+        )
         # kv_cache[indices, positions] = kv.squeeze(1) if kv.ndim == 3 and kv.shape[1] == 1 else kv
 
-        # slots = attn_metadata.slot_mapping
         # torch_npu._npu_reshape_and_cache_siso(key=kv_cache.k,
         #                                       key_cache=key_cache,
         #                                       slot_indices=slots)
         attn_output = torch.zeros(
-            [bsz, self.mla_v_head_dim // tp_size, 512],
+            [bsz, local_n_heads, kv_lora_rank],
             dtype=query.dtype,
             device=query.device,
         )
@@ -2405,11 +2407,11 @@ class NpuAttnBackend(RefAttnBackend):
             query=query,
             key_cache=kv_cache.k.unsqueeze(2),
             num_kv_heads=1,
-            num_heads=128 // tp_size,
-            scale_value=1.0 / math.sqrt(query.shape[-1]),
+            num_heads=local_n_heads,
+            scale_value=softmax_scale,
             block_table=kv_cache.block_table,
             context_lens=seq_len_delta.new.lens_tensor_cpu,
-            mla_vheadsize=512,
+            mla_vheadsize=kv_lora_rank,
             out=attn_output,
         )
 

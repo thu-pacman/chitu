@@ -47,7 +47,6 @@ from chitu.quantization import (
 )
 from chitu.hybrid_device import CPUParameter
 
-torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
 
@@ -702,7 +701,7 @@ class Transformer(nn.Module):
     def prefill(
         self, tokens, output_token_offsets: torch.Tensor, **args
     ) -> torch.Tensor:
-        self.attn_backend.prepare_metadata_for_prefill(self.cache.seq_len_delta.new)
+        self.attn_backend.prepare_metadata_for_prefill(self.cache.seq_len_delta)
         if self.pipeline_exec:
             return self.prefill_pipeline(tokens, output_token_offsets, **args)
         else:

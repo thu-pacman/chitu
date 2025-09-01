@@ -6,11 +6,11 @@ from typing import Optional, List
 
 import torch
 
-from chitu.utils import try_import_platform_dep
+from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 from chitu.device_list import DeviceList
 
 triton, has_triton = try_import_platform_dep("triton")
-torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 
 if has_triton and torch.cuda.is_available():

@@ -35,11 +35,12 @@ from chitu.task import (
     MockFixedLengthedUserRequest,
     DPTaskCollector,
 )
-from chitu.utils import gen_req_id, try_import_opt_dep
+from chitu.utils import gen_req_id, try_import_opt_dep, try_import_and_setup_torch_npu
 from chitu.schemas.utils import ModelConfigResolver
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
 logger = getLogger(__name__)
@@ -357,20 +358,6 @@ def chitu_init(args, logging_level=None):
         )
         args.infer.prefill_chunk_size = args.infer.max_seq_len
 
-    if is_ascend():
-        try:
-            import torch_npu
-            from torch_npu.contrib import transfer_to_npu
-
-            torch.cuda.CUDAGraph = torch.npu.NPUGraph
-        except ImportError:
-            raise ImportError("torch_npu is not installed")
-        # Set environ for ascend
-        from chitu.utils import get_ascend_custom_opp_path
-
-        site_packages_path = get_ascend_custom_opp_path()
-        os.environ["ASCEND_CUSTOM_OPP_PATH"] = site_packages_path
-
     if args.infer.prefill_chunk_size is not None:
         if args.infer.attn_type == "npu":
             logger.warning(
@@ -441,7 +428,7 @@ def chitu_init(args, logging_level=None):
     executor = Executor.build(args)
     Backend.executor = executor
     PackedTasks.configure(max_num_tasks=args.infer.max_reqs)
-    logger.warning(f"[CHITU_INIT] [Rank {rank}] Chitu initialized")
+    logger.info("Chitu has been initialized")
 
 
 def remove_kvcache_all_device(remove_task_ids):
