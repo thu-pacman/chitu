@@ -8,16 +8,30 @@ from chitu.attn_backend import (
     TritonAttnBackend,
     FlashAttnBackend,
     FlashInferBackend,
+    NpuAttnBackend,
 )
 from chitu.cache_manager import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.device_type import is_muxi
 from chitu.global_vars import set_global_args
-from chitu.utils import try_import_opt_dep, try_import_platform_dep
+from chitu.utils import (
+    try_import_opt_dep,
+    try_import_platform_dep,
+    try_import_and_setup_torch_npu,
+)
 from chitu.batched_seq_len import BatchedSeqLenDelta
 
 triton, has_triton = try_import_platform_dep("triton")
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+
+
+def check_close(x, y):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    sim = 2 * (x * y).sum() / denominator
+    diff = 1 - sim
+    return diff < 0.001
 
 
 @pytest.mark.parametrize("bs", [1, 9])
@@ -26,7 +40,7 @@ flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
 @pytest.mark.parametrize("is_increment", [False, True])
-@pytest.mark.parametrize("impl", ["triton"])
+@pytest.mark.parametrize("impl", ["triton", "npu"])
 def test_mla_prefill_ragged_qkvo(
     bs,
     local_n_heads,
@@ -38,6 +52,11 @@ def test_mla_prefill_ragged_qkvo(
 ):
     if impl == "triton" and not has_triton:
         pytest.skip("triton is missing")
+    if impl == "npu":
+        if not has_torch_npu:
+            pytest.skip("torch_npu is missing")
+        if is_increment:
+            pytest.skip("NpuAttnBackend has not supported incremental prefilling yet")
 
     torch.set_default_dtype(torch.float16)
     set_global_args(
@@ -84,6 +103,9 @@ def test_mla_prefill_ragged_qkvo(
 
     if impl == "triton":
         attn_backend = TritonAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+    elif impl == "npu":
+        attn_backend = NpuAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+        attn_backend.prepare_metadata_for_prefill(seq_len_delta)
     else:
         raise NotImplementedError()
     ref_backend = RefAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
@@ -116,7 +138,7 @@ def test_mla_prefill_ragged_qkvo(
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
 @pytest.mark.parametrize("is_increment", [False, True])
-@pytest.mark.parametrize("impl", ["triton", "flashinfer"])
+@pytest.mark.parametrize("impl", ["triton", "flashinfer", "npu"])
 def test_mla_prefill_ragged_qo_paged_kv(
     bs,
     local_n_heads,
@@ -133,6 +155,11 @@ def test_mla_prefill_ragged_qo_paged_kv(
             flashinfer.__version__
         ) < packaging.version.parse("0.2.0"):
             pytest.skip("flashinfer is missing or too old")
+    if impl == "npu":
+        if not has_torch_npu:
+            pytest.skip("torch_npu is missing")
+        if is_increment:
+            pytest.skip("NpuAttnBackend has not supported incremental prefilling yet")
 
     torch.set_default_dtype(torch.float16)
     set_global_args(
@@ -186,6 +213,9 @@ def test_mla_prefill_ragged_qo_paged_kv(
         attn_backend = FlashInferBackend(
             tot_num_blocks=num_pages, qk_nope_head_dim=qk_nope_head_dim
         )
+    elif impl == "npu":
+        attn_backend = NpuAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+        attn_backend.prepare_metadata_for_prefill(seq_len_delta)
     else:
         raise NotImplementedError()
     ref_backend = RefAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
@@ -238,8 +268,8 @@ def test_mla_prefill_ragged_qo_paged_kv(
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
 @pytest.mark.parametrize("page_size", [256])
-@pytest.mark.parametrize("impl", ["triton", "flashinfer"])
-def test_triton_mla_decode_paged_kv(
+@pytest.mark.parametrize("impl", ["triton", "flashinfer", "npu"])
+def test_mla_decode_paged_kv(
     bs,
     prev_seq_len_int,
     local_n_heads,
@@ -256,6 +286,8 @@ def test_triton_mla_decode_paged_kv(
             flashinfer.__version__
         ) < packaging.version.parse("0.2.0"):
             pytest.skip("flashinfer is missing or too old")
+    if impl == "npu" and not has_torch_npu:
+        pytest.skip("torch_npu is missing")
 
     torch.set_default_dtype(torch.float16)
     set_global_args(
@@ -312,6 +344,8 @@ def test_triton_mla_decode_paged_kv(
         attn = FlashInferBackend(
             tot_num_blocks=max_num_pages, qk_nope_head_dim=qk_nope_head_dim
         )
+    elif impl == "npu":
+        attn = NpuAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
     else:
         raise NotImplementedError()
     attn_ref = RefAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
@@ -333,7 +367,12 @@ def test_triton_mla_decode_paged_kv(
         seq_len_delta=seq_len_delta,
     )
 
-    assert torch.allclose(y, y_ref, atol=1e-2, rtol=1e-2)
+    if impl == "npu":
+        # Results of impl="npu" is not stable. You may find a small number of items have
+        # a large error after multiple runs.
+        assert check_close(y, y_ref)  # TODO: Does it make sense?
+    else:
+        assert torch.allclose(y, y_ref, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("bs", [1, 9])
@@ -341,7 +380,7 @@ def test_triton_mla_decode_paged_kv(
 @pytest.mark.parametrize("n_kv_heads", [4])
 @pytest.mark.parametrize("qk_head_dim,v_head_dim", [(256, 256), (576, 512)])
 @pytest.mark.parametrize("is_increment", [False, True])
-@pytest.mark.parametrize("impl", ["triton", "flash_attn", "flashinfer"])
+@pytest.mark.parametrize("impl", ["triton", "flash_attn", "flashinfer", "npu"])
 def test_prefill_ragged_qkvo(
     bs, n_heads, n_kv_heads, qk_head_dim, v_head_dim, is_increment, impl
 ):
@@ -359,6 +398,11 @@ def test_prefill_ragged_qkvo(
             pytest.skip("flash_attn is missing")
         if qk_head_dim > 256 or v_head_dim > 256:
             pytest.skip("FlashAttention only supports head dimension at most 256")
+    if impl == "npu":
+        if not has_torch_npu:
+            pytest.skip("torch_npu is missing")
+        if is_increment:
+            pytest.skip("NpuAttnBackend has not supported incremental prefilling yet")
 
     torch.set_default_dtype(torch.float16)
     set_global_args(
@@ -406,6 +450,9 @@ def test_prefill_ragged_qkvo(
         attn_backend = FlashAttnBackend()
     elif impl == "flashinfer":
         attn_backend = FlashInferBackend(tot_num_blocks=51)
+    elif impl == "npu":
+        attn_backend = NpuAttnBackend()
+        attn_backend.prepare_metadata_for_prefill(seq_len_delta)
     else:
         raise NotImplementedError()
     ref_backend = RefAttnBackend()
@@ -435,14 +482,19 @@ def test_prefill_ragged_qkvo(
         softmax_scale=0.1352337788608801,
     )
 
-    assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
+    if impl == "npu":
+        # Results of impl="npu" is not stable. You may find a small number of items have
+        # a large error after multiple runs.
+        assert check_close(out, ref_out)  # TODO: Does it make sense?
+    else:
+        assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("prev_seq_len_list", [[509, 19, 15, 22]])
 @pytest.mark.parametrize("n_heads", [4])
 @pytest.mark.parametrize("n_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [256])
-@pytest.mark.parametrize("impl", ["triton", "flash_attn", "flashinfer"])
+@pytest.mark.parametrize("impl", ["triton", "flash_attn", "flashinfer", "npu"])
 def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl):
     if impl == "triton" and not has_triton:
         pytest.skip("triton is missing")
@@ -453,6 +505,8 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
     if impl == "flash_attn":
         if not has_flash_attn:
             pytest.skip("flash_attn is missing")
+    if impl == "npu" and not has_torch_npu:
+        pytest.skip("torch_npu is missing")
 
     torch.set_default_dtype(torch.float16)
     set_global_args(
@@ -496,6 +550,8 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
         attn_backend = FlashAttnBackend()
     elif impl == "flashinfer":
         attn_backend = FlashInferBackend(tot_num_blocks=num_blocks)
+    elif impl == "npu":
+        attn_backend = NpuAttnBackend()
     else:
         raise NotImplementedError()
     ref_backend = RefAttnBackend()
@@ -544,7 +600,7 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
 @pytest.mark.parametrize("n_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [256])
 @pytest.mark.parametrize("softmax_scale", [None, 0.13])
-@pytest.mark.parametrize("impl", ["triton", "flash_attn", "flashinfer"])
+@pytest.mark.parametrize("impl", ["triton", "flash_attn", "flashinfer", "npu"])
 def test_decode_paged_kv(
     prev_seq_len_list, n_heads, n_kv_heads, head_dim, softmax_scale, impl
 ):
@@ -554,9 +610,10 @@ def test_decode_paged_kv(
         flashinfer.__version__
     ) < packaging.version.parse("0.2.0"):
         pytest.skip("flashinfer is missing or too old")
-    if impl == "flash_attn":
-        if not has_flash_attn:
-            pytest.skip("flash_attn is missing")
+    if impl == "flash_attn" and not has_flash_attn:
+        pytest.skip("flash_attn is missing")
+    if impl == "npu" and not has_torch_npu:
+        pytest.skip("torch_npu is missing")
 
     torch.set_default_dtype(torch.float16)
     set_global_args(
@@ -600,6 +657,8 @@ def test_decode_paged_kv(
         attn_backend = FlashAttnBackend()
     elif impl == "flashinfer":
         attn_backend = FlashInferBackend(tot_num_blocks=num_blocks)
+    elif impl == "npu":
+        attn_backend = NpuAttnBackend()
     else:
         raise NotImplementedError()
     ref_backend = RefAttnBackend()

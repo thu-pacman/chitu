@@ -3,9 +3,11 @@ import math
 import torch
 
 from chitu.ops import apply_rotary_pos_emb
-from chitu.utils import try_import_platform_dep
+from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 
 triton, has_triton = try_import_platform_dep("triton")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
 @pytest.mark.parametrize(
@@ -18,22 +20,29 @@ triton, has_triton = try_import_platform_dep("triton")
     ],
 )
 @pytest.mark.parametrize("is_mqa", [False, True])
-@pytest.mark.parametrize("impl", ["cuda", "triton"])
+@pytest.mark.parametrize("impl", ["cuda", "triton", "torch_npu"])
 def test_apply_rotary_pos_emb(
     rotary_type, batch_size, n_local_heads, head_dim, is_mqa, impl
 ):
-    if (
-        impl == "triton"
-        and rotary_type in ["interleaved", "interleaved-half"]
-        and not hasattr(triton.language, "interleaved")
-    ):
-        pytest.skip("This op require Triton to support tl.interleave")
-    if impl == "cuda" and rotary_type in [
-        "separated",
-        "separated-half",
-        "interleaved-half",
-    ]:
-        pytest.skip("This op is not implemented in CUDA yet")
+    if impl == "triton":
+        if not has_triton:
+            pytest.skip("triton is missing")
+        if rotary_type in ["interleaved", "interleaved-half"] and not hasattr(
+            triton.language, "interleaved"
+        ):
+            pytest.skip("This op require Triton to support tl.interleave")
+    if impl == "cuda":
+        if not has_chitu_backend:
+            pytest.skip("chitu_backend is not available, skipping CUDA tests")
+        if rotary_type in ["separated", "separated-half", "interleaved-half"]:
+            pytest.skip("This op is not implemented in CUDA yet")
+    if impl == "torch_npu":
+        if not has_torch_npu:
+            pytest.skip("torch_npu is missing")
+        if rotary_type in ["interleaved", "interleaved-half"]:
+            pytest.skip("This op is not implemented in torch_npu yet")
+        if is_mqa:
+            pytest.skip("This op is not implemented in torch_npu yet")
 
     torch.set_default_dtype(torch.float16)
     q = torch.randn(batch_size, n_local_heads, head_dim, device="cuda")
@@ -85,17 +94,30 @@ def test_apply_rotary_pos_emb(
 )
 @pytest.mark.parametrize("is_mqa", [False, True])
 @pytest.mark.parametrize(
-    "impl", ["cuda", "torch"]
+    "impl", ["cuda", "triton", "torch_npu", "torch"]
 )  # Also test "torch"'s in-place with itself's out-of-place
 def test_apply_rotary_pos_emb_in_place(
     rotary_type, batch_size, n_local_heads, head_dim, is_mqa, impl
 ):
-    if impl == "cuda" and rotary_type in [
-        "separated",
-        "separated-half",
-        "interleaved-half",
-    ]:
-        pytest.skip("This op is not implemented in CUDA yet")
+    if impl == "triton":
+        if not has_triton:
+            pytest.skip("triton is missing")
+        if rotary_type in ["interleaved", "interleaved-half"] and not hasattr(
+            triton.language, "interleaved"
+        ):
+            pytest.skip("This op require Triton to support tl.interleave")
+    if impl == "cuda":
+        if not has_chitu_backend:
+            pytest.skip("chitu_backend is not available, skipping CUDA tests")
+        if rotary_type in ["separated", "separated-half", "interleaved-half"]:
+            pytest.skip("This op is not implemented in CUDA yet")
+    if impl == "torch_npu":
+        if not has_torch_npu:
+            pytest.skip("torch_npu is missing")
+        if rotary_type in ["interleaved", "interleaved-half"]:
+            pytest.skip("This op is not implemented in torch_npu yet")
+        if is_mqa:
+            pytest.skip("This op is not implemented in torch_npu yet")
 
     torch.set_default_dtype(torch.float16)
     q = torch.randn(batch_size, n_local_heads, head_dim, device="cuda")

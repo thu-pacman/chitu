@@ -160,7 +160,15 @@ def apply_rotary_pos_emb_torch(
     return q_out, k_out
 
 
-def apply_rotary_pos_emb_torch_npu(q, k, cos, sin, rotary_type="separated"):
+def apply_rotary_pos_emb_torch_npu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_out: Optional[torch.Tensor] = None,
+    k_out: Optional[torch.Tensor] = None,
+    rotary_type: str = "separated",
+) -> Tuple[torch.Tensor, torch.Tensor]:
     if rotary_type == "separated":
         if q.dim() == 3 and cos.dim() == 2 and sin.dim() == 2:
             cos = torch.cat([cos, cos], dim=-1)
@@ -177,10 +185,29 @@ def apply_rotary_pos_emb_torch_npu(q, k, cos, sin, rotary_type="separated"):
             )[0]
         else:
             raise ValueError(f"Unsupported shape: {q.shape}")
-        return q_embed.to(q.dtype), k_embed.to(k.dtype)
+        q_embed, k_embed = q_embed.to(q.dtype), k_embed.to(k.dtype)
+
+    elif rotary_type == "separated-half":
+        q_rot, q_pass = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
+        k_rot, k_pass = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
+        q_rot_embed, k_rot_embed = apply_rotary_pos_emb_torch_npu(
+            q_rot, k_rot, cos, sin, rotary_type="separated"
+        )
+        q_embed = torch.cat([q_rot_embed, q_pass], dim=-1)
+        k_embed = torch.cat([k_rot_embed, k_pass], dim=-1)
 
     else:
         raise ValueError(f"Unknown rotary type: {rotary_type}")
+
+    if q_out is not None:
+        q_out.copy_(q_embed)
+    else:
+        q_out = q_embed
+    if k_out is not None:
+        k_out.copy_(k_embed)
+    else:
+        k_out = k_embed
+    return q_out, k_out
 
 
 def apply_rotary_pos_emb_cpu(
@@ -330,18 +357,25 @@ def apply_rotary_pos_emb(
             impl = "torch"
 
     if impl == "triton" and has_triton:
-        # NOTE: some platform such as muxi now doesn't support triton.language.interleave, so we need check attr
+        if rotary_type in ["interleaved", "interleaved-half"] and not hasattr(
+            triton.language, "interleaved"
+        ):
+            raise RuntimeError(
+                "triton.language.interleave is not supported, please check triton version"
+            )
         # NOTE: Performance of triton rotary kernel is untested for large batch sizes.
         # If it's slow on prefill, just switch to torch implementation on the else case.
-        assert q_out is None  # Triton does not support in-place operation
-        assert k_out is None
-        return apply_rotary_pos_emb_triton(q, k, cos, sin, rotary_type=rotary_type)
+        return apply_rotary_pos_emb_triton(
+            q, k, cos, sin, q_out=q_out, k_out=k_out, rotary_type=rotary_type
+        )
     elif impl == "cuda":
         return apply_rotary_pos_emb_cuda(
             q, k, cos, sin, q_out=q_out, k_out=k_out, rotary_type=rotary_type
         )
     elif impl == "torch_npu":
-        return apply_rotary_pos_emb_torch_npu(q, k, cos, sin, rotary_type=rotary_type)
+        return apply_rotary_pos_emb_torch_npu(
+            q, k, cos, sin, q_out=q_out, k_out=k_out, rotary_type=rotary_type
+        )
     elif impl == "cpu":
         return apply_rotary_pos_emb_cpu(
             q, k, cos, sin, q_out=q_out, k_out=k_out, rotary_type=rotary_type

@@ -4,14 +4,20 @@
 
 import torch
 
-from chitu.utils import try_import_platform_dep
+from chitu.utils import (
+    try_import_platform_dep,
+    try_import_opt_dep,
+    try_import_and_setup_torch_npu,
+)
 from chitu.native_layout import Vector
 from chitu.device_type import is_muxi
 from chitu.cpuinfer_singleton import get_cpu_infer
-
-triton, has_triton = try_import_platform_dep("triton")
 from chitu.custom_gguf import get_ggml_quant_type
 from chitu.global_vars import get_global_args
+
+triton, has_triton = try_import_platform_dep("triton")
+cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 if has_triton and torch.cuda.is_available():
     from chitu.ops.triton_ops import silu_and_mul_triton
@@ -48,8 +54,6 @@ def silu_and_mul_torch(x: torch.Tensor):
 
 
 def silu_and_mul_cpu(x: torch.Tensor):
-    import cpuinfer
-
     if x.shape[-1] % 2 != 0:
         raise ValueError(f"Last dimension must be even, got {x.shape[-1]}")
     if x.device.type != "cpu":
@@ -87,6 +91,8 @@ def silu_and_mul(x, impl="auto"):
     if impl == "auto":
         if isinstance(x, muxi_utils.MuxiNativeLayoutActivation):
             impl = "torch"
+        elif has_torch_npu:
+            impl = "torch_npu"
         elif is_muxi() and x.shape.numel() // x.shape[-1] > 1024:
             # triton implementation fails for large amount of tokens on Muxi.
             # This happens on prefill stage for large input lengths. (FIXME)
@@ -98,6 +104,8 @@ def silu_and_mul(x, impl="auto"):
 
     if impl == "triton" and has_triton:
         return silu_and_mul_triton(x)
+    elif impl == "torch_npu":
+        return torch_npu.npu_swiglu(x)
     elif impl == "cpu":
         return silu_and_mul_cpu(x)
     else:
