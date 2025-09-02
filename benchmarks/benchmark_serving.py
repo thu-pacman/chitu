@@ -22,16 +22,15 @@ import json
 import argparse
 import traceback
 import numpy as np
-import torch
 from typing import List
 from dataclasses import dataclass, field
 
 import aiohttp
 import asyncio
 
-import pkg_resources
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+RESULT_FILE = "benchmark_results.jsonl"
 
 
 @dataclass
@@ -421,13 +420,17 @@ def process_one_metric(
         result[f"p{p_word}_{metric_attribute_name}_ms"] = value
 
 
-def save_dict_result(result: dict, output_dir: str):
+def save_dict_result(result: dict, output_dir: str, append: bool = False):
     """Save dict benchmark results to JSON file."""
     os.makedirs(output_dir, exist_ok=True)
 
-    output_file = os.path.join(output_dir, "benchmark_results.json")
-    with open(output_file, "w") as f:
-        json.dump(result, f, indent=2)
+    output_file = os.path.join(output_dir, RESULT_FILE)
+    if append:
+        with open(output_file, "a") as f:
+            f.write(json.dumps(result) + "\n")
+    else:
+        with open(output_file, "w") as f:
+            json.dump(result, f, indent=2)
 
 
 def main():
@@ -442,6 +445,7 @@ def main():
     parser.add_argument("--base-url", help="URL of the Chitu server endpoint")
     parser.add_argument("--metric-percentiles", type=str, default="99")
     parser.add_argument("--percentile-metrics", type=str, default="ttft,tpot,itl")
+    parser.add_argument("--append-result", action="store_true")
 
     args = parser.parse_args()
 
@@ -492,19 +496,11 @@ def main():
         )
     )
 
-    codebase = {
-        "name": "chitu",
-        "version": pkg_resources.get_distribution("chitu").version,
-    }
-
     model = {"name": config.model_name}
 
     result = {
-        "env": [
-            torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())
-        ],
-        "codebase": codebase,
         "model": model,
+        "batch_size": config.batch_size,
         "duration": total_time,
         "completed": metrics.completed,
         "total_input_tokens": metrics.total_input,
@@ -558,8 +554,8 @@ def main():
     print("=" * 50)
 
     if args.output_dir:
-        save_dict_result(result, args.output_dir)
-        print(f"\nDetailed results saved to {args.output_dir}/benchmark_results.json")
+        save_dict_result(result, args.output_dir, append=args.append_result)
+        print(f"\nDetailed results saved to {args.output_dir}/{RESULT_FILE}")
 
 
 if __name__ == "__main__":
