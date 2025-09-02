@@ -8,9 +8,10 @@ from dataclasses import dataclass
 import functools
 import torch
 
-from chitu.utils import try_import_platform_dep
+from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
 @dataclass
@@ -455,3 +456,102 @@ class Packed4BitWeightQServe(NativeLayoutTensor):
     """
 
     pass
+
+
+@dataclass
+class NpuFractalNzTensor(NativeLayoutTensor):
+    """
+    FRACTAL_NZ is a matmul-friendly layout used on Ascend.
+
+    See https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/opdevg/Ascendcopdevg/atlas_ascendc_10_0099.html
+
+    NOTE: FRACTAL_NZ and FRACTAL_ZN are transpositions of each other, which means converting an INxOUT weight to FRACTAL_NZ
+    is equivalent to converting an OUTxIN weight to FRACTAL_ZN. NpuFractalNzTensor just convert form what you pass to
+    `convert_from`.
+
+    Suppose you use NpuFractalNzTensor on an OUTxIN weight (common in torch.nn.Linear), equivalent to FRACTAL_ZN on an
+    INxOUT weight, then the resulting tensor can be used like:
+    - The pactice described in https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/opdevg/Ascendcopdevg/atlas_ascendc_10_0099.html.
+    - What is done by default for all torch.nn.Linear in torch_npu: https://github.com/Ascend/pytorch/blob/dd2acaaa361cc0937852a26dcbfb5ef604114664/torch_npu/utils/_module.py#L81.
+    """
+
+    @classmethod
+    @override
+    def convert_from(cls, tensor: torch.Tensor) -> "NpuFractalNzTensor":
+        if isinstance(tensor, torch.Tensor):
+            # See https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/API/appdevgapi/aclpythondevg_01_0914.html
+            # for the layout ID
+            ACL_FORMAT_FRACTAL_NZ = 29
+
+            old_device = tensor.device
+            return cls(
+                plain_shape=tensor.shape,
+                layout_tensor=torch_npu.npu_format_cast(
+                    tensor.npu().contiguous(), ACL_FORMAT_FRACTAL_NZ
+                ).to(old_device),
+            )
+
+        else:
+            raise TypeError(f"Cannot convert from {type(tensor)} to Vector")
+
+    @override
+    def convert_to_plain(self) -> torch.Tensor:
+        # See https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/API/appdevgapi/aclpythondevg_01_0914.html
+        # for the layout ID
+        ACL_FORMAT_ND = 2
+
+        old_device = self.layout_tensor.device
+        return torch_npu.npu_format_cast(self.layout_tensor.npu(), ACL_FORMAT_ND).to(
+            old_device
+        )
+
+
+@dataclass
+class NpuFractalZnTensor(NativeLayoutTensor):
+    """
+    FRACTAL_ZN in https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/opdevg/Ascendcopdevg/atlas_ascendc_10_0099.html
+
+    NOTE: FRACTAL_NZ and FRACTAL_ZN are transpositions of each other, which means converting a INxOUT weight to FRACTAL_NZ
+    is equivalent to converting an OUTxIN weight to FRACTAL_ZN. NpuFractalZnTensor just convert form what you pass to
+    `convert_from`.
+
+    torch_npu only provide an interface for FRACTAL_NZ, so NpuFractalZnTensor is implemented by first transposing the tenor
+    and then converting it to FRACTAL_NZ.
+
+    Suppose you use NpuFractalZnTensor on an OUTxIN weight (common in torch.nn.Linear), equivalent to FRACTAL_NZ on an
+    INxOUT weight, then the resulting tensor can be used like:
+    - What is done for MoE layers in OmniInfer: https://gitee.com/omniai/omniinfer/blob/745842ca9937ad445d56036af5289740287d6c11/omni/models/common/layers/moe/fused_moe/layer.py#L144.
+    - What is required by npu_mla_prolog_v2: https://www.hiascend.com/document/detail/zh/Pytorch/710/apiref/torchnpuCustomsapi/context/torch_npu-npu_mla_prolog_v2.md.
+    """
+
+    @classmethod
+    @override
+    def convert_from(cls, tensor: torch.Tensor) -> "NpuFractalNzTensor":
+        if isinstance(tensor, torch.Tensor):
+            # See https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/API/appdevgapi/aclpythondevg_01_0914.html
+            # for the layout ID
+            ACL_FORMAT_FRACTAL_NZ = 29
+
+            old_device = tensor.device
+            return cls(
+                plain_shape=tensor.shape,
+                layout_tensor=torch_npu.npu_format_cast(
+                    tensor.npu().t().contiguous(), ACL_FORMAT_FRACTAL_NZ
+                ).to(old_device),
+            )
+
+        else:
+            raise TypeError(f"Cannot convert from {type(tensor)} to Vector")
+
+    @override
+    def convert_to_plain(self) -> torch.Tensor:
+        # See https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/API/appdevgapi/aclpythondevg_01_0914.html
+        # for the layout ID
+        ACL_FORMAT_ND = 2
+
+        old_device = self.layout_tensor.device
+        return (
+            torch_npu.npu_format_cast(self.layout_tensor.npu(), ACL_FORMAT_ND)
+            .t()
+            .to(old_device)
+        )
