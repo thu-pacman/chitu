@@ -65,7 +65,8 @@ def do_dequant_a(a_fp8, a_s, dim, act_block_size):
     reason="This test requires the GPU to have native FP8 support",
 )
 @pytest.mark.skipif(
-    packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"),
+    not has_triton
+    or packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"),
     reason="This test requires Triton version >= 3.2.0",
 )
 def test_fp4_raise_to_bf16_gemm_is_close_to_dequanted_gemm():
@@ -99,7 +100,8 @@ def test_fp4_raise_to_bf16_gemm_is_close_to_dequanted_gemm():
     reason="This test requires the GPU to be Hopper or newer",
 )
 @pytest.mark.skipif(
-    packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"),
+    not has_triton
+    or packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"),
     reason="This test requires Triton version >= 3.2.0",
 )
 def test_fp4_raise_to_fp8_gemm_is_close_to_dequanted_gemm():

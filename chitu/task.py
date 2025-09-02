@@ -250,13 +250,18 @@ class UserRequest:
         """
         Prompt tokens.
         """
-        return (
-            Backend.formatter.encode_dialog_prompt(
+        if self.message:
+            tokens = Backend.formatter.encode_dialog_prompt(
                 self.message, chat_template_kwargs=self.chat_template_kwargs
             )
-            if self.tokens is None
-            else self.tokens
-        )
+            if isinstance(tokens, tuple):
+                self.tokens = tokens[0]
+                self.pixel_values = tokens[1]
+                self.grid_thw = tokens[2]
+            else:
+                self.tokens = tokens
+        assert self.tokens is not None
+        return self.tokens
 
     @functools.cached_property
     def prompt_len(self):
@@ -345,6 +350,9 @@ class Task:
             self.response = DeviceList([], dtype=torch.long, device="cuda")
         self.num_new_tokens: int = 0
         self.next_token: int = -1  # Only effective when num_new_tokens > 0
+
+        self.pixel_values = getattr(req, "pixel_values", None)
+        self.grid_thw = getattr(req, "grid_thw", None)
 
         # Waiting is only meaningful in pipeline parallelism. It means either of:
         # 1) waiting logits to return from another node, or
@@ -774,6 +782,26 @@ class PackedTasks(PackedTasksBase):
         if self.task_type == TaskType.Prefill:
             self.tokens = [task.next_req_tokens() for task in self.tasks]
 
+        self.pixel_values = []
+        self.grid_thw = []
+        for task in self.tasks:
+            if task.pixel_values is not None:
+                self.pixel_values.append(task.pixel_values)
+            if task.grid_thw is not None:
+                self.grid_thw.append(task.grid_thw)
+
+        self.pixel_values = (
+            torch.stack(self.pixel_values).to(
+                device=rank, dtype=torch.bfloat16, non_blocking=True
+            )
+            if self.pixel_values
+            else None
+        )
+        self.grid_thw = (
+            torch.cat(self.grid_thw, dim=0).to(device=rank, non_blocking=True)
+            if self.grid_thw
+            else None
+        )
         self.payload_type = SerializedPackedTasksPayloadType(self.task_type.value)
 
         # additional modifications are required when adapting to MTP or Hybrid.

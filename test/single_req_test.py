@@ -34,6 +34,17 @@ msgs = [
     [{"role": "user", "content": "怎么避免加班?"}],
     [{"role": "user", "content": "what is the recipe of mayonnaise?"}],
 ]
+msgs_vl = [
+    [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "请描述这张图片的内容"},
+                {"type": "image", "image": "test/test_images/test.jpg"},
+            ],
+        }
+    ]
+]
 counter = 1
 
 
@@ -64,27 +75,35 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens):
     return reqs
 
 
-def gen_reqs_real(num_reqs, max_new_tokens):
+def gen_reqs_real(num_reqs, max_new_tokens, is_vl=False):
     reqs: List[UserRequest] = []
     for i in range(num_reqs):
-        req = UserRequest(
-            msgs[i % len(msgs)],
-            f"{gen_req_id()}",
-            max_new_tokens=max_new_tokens,
-            temperature=1,
-        )
+        if is_vl:
+            req = UserRequest(
+                msgs_vl[i % len(msgs_vl)],
+                f"{gen_req_id()}",
+                max_new_tokens=max_new_tokens,
+                temperature=1,
+            )
+        else:
+            req = UserRequest(
+                msgs[i % len(msgs)],
+                f"{gen_req_id()}",
+                max_new_tokens=max_new_tokens,
+                temperature=1,
+            )
         reqs.append(req)
     return reqs
 
 
-def gen_reqs(num_reqs, max_new_tokens):
+def gen_reqs(num_reqs, max_new_tokens, is_vl=False):
     global local_args
     if local_args.request.prompt_tokens_len > 0:
         return gen_reqs_fake(
             num_reqs, local_args.request.prompt_tokens_len, max_new_tokens
         )
     else:
-        return gen_reqs_real(num_reqs, max_new_tokens)
+        return gen_reqs_real(num_reqs, max_new_tokens, is_vl)
 
 
 def run_pipe_or_tensor_parallelism(args, timers):
@@ -96,6 +115,7 @@ def run_pipe_or_tensor_parallelism(args, timers):
             reqs = gen_reqs(
                 num_reqs=args.infer.max_reqs,
                 max_new_tokens=args.request.max_new_tokens,
+                is_vl=hasattr(args.models, "vision_config"),
             )
             for req in reqs:
                 TaskPool.add(Task(req.request_id, req, stop_with_eos=True))
@@ -133,7 +153,9 @@ def run_normal(args, timers):
 
     for i in range(2):
         reqs = gen_reqs(
-            num_reqs=args.infer.max_reqs, max_new_tokens=args.request.max_new_tokens
+            num_reqs=args.infer.max_reqs,
+            max_new_tokens=args.request.max_new_tokens,
+            is_vl=hasattr(args.models, "vision_config"),
         )
         for req in reqs:
             TaskPool.add(Task(req.request_id, req, stop_with_eos=True))
@@ -169,7 +191,7 @@ def main(args: ServeConfig):
     logger.info(f"Run with args: {args}")
 
     chitu_init(args, logging_level=logging.INFO)
-    torch.distributed.barrier()
+    torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 
     timers = get_timers()
     logger.debug("finish init")
@@ -186,6 +208,6 @@ if __name__ == "__main__":
     # As a workaround, we `exec` a dummy process to kill the current process, without
     # returning an error.
     logger.info("Waiting for all ranks to finish...")
-    torch.distributed.barrier()
+    torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
     # Don't exec bash because it loads startup scripts
     os.execl("/usr/bin/true", "true")  # /usr/bin/true does nothing but exits

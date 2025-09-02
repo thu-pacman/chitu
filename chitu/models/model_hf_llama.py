@@ -203,7 +203,7 @@ class AttentionHFLlama(Attention):
         # 因为量化后x是个tuple，所以取shape的时候放linear后面
         xq, xk, xv = self._run_linear(x)
 
-        bs_seq, _ = xq.shape
+        bs_seq = xq.numel() // xq.shape[-1]
         xq = xq.view(bs_seq, self.n_local_heads, self.head_dim).contiguous()
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
@@ -229,7 +229,7 @@ class AttentionHFLlama(Attention):
             seq_len_delta=self.cache.seq_len_delta,
             causal=True,
         ).view(bs_seq, -1)
-        return self._run_output_linear(output)
+        return self._run_output_linear(output).reshape(x.shape)
 
 
 class FeedForwardHFLlama(nn.Module):
@@ -238,6 +238,7 @@ class FeedForwardHFLlama(nn.Module):
         params,
         op_impl: str,
         checkpoint_prefix="",
+        has_bias: bool = False,
     ):
         super().__init__()
         self.op_impl = op_impl
@@ -260,7 +261,7 @@ class FeedForwardHFLlama(nn.Module):
             self.gate_up_proj = ColumnParallelLinear(
                 params.dim,
                 params.intermediate_dim * 2,
-                has_bias=False,
+                has_bias=has_bias,
                 gather_output=False,
                 base_linear_class=gate_up_proj_linear,
                 checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
@@ -271,7 +272,7 @@ class FeedForwardHFLlama(nn.Module):
             self.gate_proj = ColumnParallelLinear(
                 params.dim,
                 params.intermediate_dim,
-                has_bias=False,
+                has_bias=has_bias,
                 gather_output=False,
                 base_linear_class=gate_up_proj_linear,
                 checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
@@ -280,7 +281,7 @@ class FeedForwardHFLlama(nn.Module):
             self.up_proj = ColumnParallelLinear(
                 params.dim,
                 params.intermediate_dim,
-                has_bias=False,
+                has_bias=has_bias,
                 gather_output=False,
                 base_linear_class=gate_up_proj_linear,
                 checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
@@ -289,7 +290,7 @@ class FeedForwardHFLlama(nn.Module):
         self.down_proj = RowParallelLinear(
             params.intermediate_dim,
             params.dim,
-            has_bias=False,
+            has_bias=has_bias,
             input_is_parallel=True,
             base_linear_class=down_proj_linear,
             checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
@@ -764,7 +765,7 @@ class TransformerHFLlama(Transformer):
             checkpoint_prefix=f"lm_head",
         )
 
-    def _pre_layers(self, h):
+    def _pre_layers(self, h, **args):
         return self.embed_tokens(h)
 
     def _post_layers(self, h):

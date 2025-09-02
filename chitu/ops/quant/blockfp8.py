@@ -6,12 +6,16 @@ from typing import Tuple
 
 import torch
 
-from chitu.utils import try_import_platform_dep, try_import_opt_dep
+from chitu.utils import (
+    try_import_platform_dep,
+    try_import_opt_dep,
+    try_import_and_setup_torch_npu,
+)
 from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.global_vars import get_global_args
 
 triton, has_triton = try_import_platform_dep("triton")
-torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 if has_triton:

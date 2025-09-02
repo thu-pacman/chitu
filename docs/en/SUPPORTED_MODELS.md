@@ -82,6 +82,10 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=Qwen2.5-7B` command line argument when starting Chitu
 - Qwen2.5-7B-Instruct
   Usage: Append `models=Qwen2.5-7B-Instruct` command line argument when starting Chitu
+- Qwen2.5-VL
+  Usage: Append `models=Qwen2.5-VL` command line argument when starting Chitu
+- Qwen2.5-VL-7B-Instruct
+  Usage: Append `models=Qwen2.5-VL-7B-Instruct` command line argument when starting Chitu
 - Qwen3-0.6B
   Usage: Append `models=Qwen3-0.6B` command line argument when starting Chitu
 - Qwen3-1.7B

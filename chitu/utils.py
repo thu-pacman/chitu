@@ -7,10 +7,12 @@ import functools
 import logging
 from logging import WARNING, INFO, getLogger
 import os
+import re
 from pathlib import Path
 import random
 from typing import Any, List, Tuple
 import socket
+import site
 
 import numpy as np
 import torch
@@ -108,12 +110,45 @@ def try_import_platform_dep(pkg_name: str) -> Tuple[Any, bool]:
         return ReportErrorWhenUsed(e), False
 
 
-def is_layer(layer_name, full_name):
-    return (
-        f".{layer_name}." in full_name
-        or full_name.startswith(layer_name + ".")
-        or full_name.endswith("." + layer_name)
-    )
+_torch_npu_has_set_up = False
+
+
+def try_import_and_setup_torch_npu():
+    """
+    Try importing `torch_npu`. If successful, also do some setup.
+    """
+
+    global _torch_npu_has_set_up
+
+    torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
+
+    if has_torch_npu and not _torch_npu_has_set_up:
+        # Make "torch.cuda" point to NPU devices
+        from torch_npu.contrib import transfer_to_npu
+
+        torch.cuda.CUDAGraph = torch.npu.NPUGraph
+
+        # Setup paths to op libraries
+        site_packages_path = get_ascend_custom_opp_path()
+        os.environ["ASCEND_CUSTOM_OPP_PATH"] = site_packages_path
+
+        _torch_npu_has_set_up = True
+
+    return torch_npu, has_torch_npu
+
+
+_regex_special_chars = set(".^$*+?{}[]|()")
+
+
+def is_layer(layer_name: str, full_name: str) -> bool:
+    if any(ch in _regex_special_chars for ch in layer_name):
+        return re.search(layer_name, full_name) is not None
+    else:
+        return (
+            f".{layer_name}." in full_name
+            or full_name.startswith(layer_name + ".")
+            or full_name.endswith("." + layer_name)
+        )
 
 
 def compute_layer_dist_in_pipe(num_layers, world_size):
@@ -183,8 +218,6 @@ def get_config_dir_path():
 
 
 def get_ascend_custom_opp_path():
-    import site
-
     site_packages_path = os.path.join(site.getsitepackages()[0], "vendors", "customize")
     return site_packages_path
 

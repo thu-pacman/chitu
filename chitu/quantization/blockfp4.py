@@ -26,6 +26,7 @@ from chitu.utils import (
     ceil_div,
     try_import_opt_dep,
     try_import_platform_dep,
+    try_import_and_setup_torch_npu,
     parse_dtype,
 )
 from chitu.global_vars import get_global_args
@@ -37,9 +38,9 @@ from chitu.native_layout import (
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 if has_triton and torch.cuda.is_available():
     from chitu.moe.experts import fused_experts
-torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 if has_torch_npu:
     from chitu.npu_utils import fused_experts_npu
 

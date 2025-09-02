@@ -34,6 +34,7 @@ install_requires = [
     "typing-extensions",
     "pyzmq>=27.0.0",
     "msgpack",
+    "qwen_vl_utils",
 ]
 
 

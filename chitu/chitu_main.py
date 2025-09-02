@@ -35,11 +35,12 @@ from chitu.task import (
     MockFixedLengthedUserRequest,
     DPTaskCollector,
 )
-from chitu.utils import gen_req_id, try_import_opt_dep
+from chitu.utils import gen_req_id, try_import_opt_dep, try_import_and_setup_torch_npu
 from chitu.schemas.utils import ModelConfigResolver
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
 logger = getLogger(__name__)
@@ -314,6 +315,11 @@ def check_checkpoint_path(args):
             f"Using {args.models.ckpt_dir} as the path to tokenizer. If the tokenizer has a different path, please set in command line by adding `models.tokenizer_path=<path>`"
         )
         args.models.tokenizer_path = args.models.ckpt_dir
+    if hasattr(args.models, "processor_path") and args.models.processor_path is None:
+        logger.info(
+            f"Using {args.models.ckpt_dir} as the path to processor. If the processor has a different path, please set in command line by adding `models.processor_path=<path>`"
+        )
+        args.models.processor_path = args.models.ckpt_dir
 
 
 def chitu_init(args, logging_level=None):
@@ -351,20 +357,6 @@ def chitu_init(args, logging_level=None):
             f"({args.infer.max_seq_len}), which has no effect. Reducing it to max_seq_len."
         )
         args.infer.prefill_chunk_size = args.infer.max_seq_len
-
-    if is_ascend():
-        try:
-            import torch_npu
-            from torch_npu.contrib import transfer_to_npu
-
-            torch.cuda.CUDAGraph = torch.npu.NPUGraph
-        except ImportError:
-            raise ImportError("torch_npu is not installed")
-        # Set environ for ascend
-        from chitu.utils import get_ascend_custom_opp_path
-
-        site_packages_path = get_ascend_custom_opp_path()
-        os.environ["ASCEND_CUSTOM_OPP_PATH"] = site_packages_path
 
     if args.infer.prefill_chunk_size is not None:
         if args.infer.attn_type == "npu":
@@ -436,7 +428,7 @@ def chitu_init(args, logging_level=None):
     executor = Executor.build(args)
     Backend.executor = executor
     PackedTasks.configure(max_num_tasks=args.infer.max_reqs)
-    logger.warning(f"[CHITU_INIT] [Rank {rank}] Chitu initialized")
+    logger.info("Chitu has been initialized")
 
 
 def remove_kvcache_all_device(remove_task_ids):

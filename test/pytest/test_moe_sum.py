@@ -10,6 +10,7 @@ triton, has_triton = try_import_platform_dep("triton")
 @pytest.mark.parametrize("M", [32, 64, 128])
 @pytest.mark.parametrize("N", [256, 512, 1024])
 @pytest.mark.parametrize("compute_dtype", [torch.float16])
+@pytest.mark.skipif(not has_triton, reason="triton is not available")
 def test_moe_sum(M, N, compute_dtype):
     topk = 8
     input_tensor = torch.rand(M, topk, N, device="cuda", dtype=compute_dtype)

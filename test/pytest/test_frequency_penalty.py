@@ -6,6 +6,7 @@ from chitu.ops import apply_frequency_penalty
 from chitu.utils import try_import_platform_dep
 
 triton, has_triton = try_import_platform_dep("triton")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 
 
 @pytest.mark.parametrize("batch_size", [1, 128])
@@ -15,6 +16,8 @@ triton, has_triton = try_import_platform_dep("triton")
 def test_frequency_penalty(batch_size, vocab_size, response_len, impl):
     if impl == "triton" and not has_triton:
         pytest.skip("Triton is not installed")
+    if impl == "cuda" and not has_chitu_backend:
+        pytest.skip("chitu_backend is not available, skipping CUDA tests")
 
     logits = torch.randn((batch_size, vocab_size), dtype=torch.float, device="cuda")
 

@@ -7,7 +7,11 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from chitu.utils import try_import_platform_dep, try_import_opt_dep
+from chitu.utils import (
+    try_import_platform_dep,
+    try_import_opt_dep,
+    try_import_and_setup_torch_npu,
+)
 from chitu.global_vars import get_global_args
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import get_ggml_quant_type
@@ -20,7 +24,7 @@ from chitu.muxi_utils import (
 triton, has_triton = try_import_platform_dep("triton")
 if has_triton and torch.cuda.is_available():
     from chitu.ops.triton_ops import rms_norm_triton
-torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
@@ -117,11 +121,6 @@ def rms_norm_cuda(
     x = x.view(-1, x.shape[-1])
     if out is not None:
         out = out.view(-1, out.shape[-1])
-    # if torch.distributed.get_rank() == 0:
-    #    import pdb
-
-    #    pdb.set_trace()
-    # torch.distributed.barrier()
     out = chitu_backend.cuda_rms_norm(x, weight, eps=eps, out=out)
     return out.view(x_shape)
 

@@ -3,12 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
-from chitu.utils import try_import_platform_dep
+from chitu.utils import try_import_and_setup_torch_npu
 from chitu.quantization.base import QuantizedLinearBase
 from chitu.distributed.parallel_state import get_tp_group
 from chitu.quantization.registry import QuantizationRegistry
 
-torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 ACL_FORMAT_FRACTAL_NZ = 29
 

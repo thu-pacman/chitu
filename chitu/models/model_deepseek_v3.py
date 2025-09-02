@@ -1258,7 +1258,7 @@ class TransformerDeepSeekV3(Transformer):
         )
 
     @override
-    def _pre_layers(self, h):
+    def _pre_layers(self, h, **args):
         return self.embed_tokens(h)
 
     @override

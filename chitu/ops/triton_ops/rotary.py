@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
 import triton
@@ -11,8 +11,33 @@ import triton.language as tl
 from chitu.ops.triton_ops.utils import auto_retry_triton_compilation
 
 
-@auto_retry_triton_compilation
 def apply_rotary_pos_emb_triton(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_out: Optional[torch.Tensor] = None,
+    k_out: Optional[torch.Tensor] = None,
+    rotary_type: str = "separated",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Triton does not support in-place operation. This function is only a compatitive
+    # adaptor for in-place interface, but not for performance.
+    q_embed, k_embed = apply_rotary_pos_emb_triton_out_of_place(
+        q, k, cos, sin, rotary_type
+    )
+    if q_out is not None:
+        q_out.copy_(q_embed)
+    else:
+        q_out = q_embed
+    if k_out is not None:
+        k_out.copy_(k_embed)
+    else:
+        k_out = k_embed
+    return q_out, k_out
+
+
+@auto_retry_triton_compilation
+def apply_rotary_pos_emb_triton_out_of_place(
     q: torch.Tensor,
     k: torch.Tensor,
     cos: torch.Tensor,
@@ -26,7 +51,7 @@ def apply_rotary_pos_emb_triton(
         # fused kernel including the split and cat.
         q_rot, q_pass = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
         k_rot, k_pass = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
-        q_rot_out, k_rot_out = apply_rotary_pos_emb_triton(
+        q_rot_out, k_rot_out = apply_rotary_pos_emb_triton_out_of_place(
             q_rot,
             k_rot,
             cos,
@@ -43,7 +68,7 @@ def apply_rotary_pos_emb_triton(
         # fused kernel including the split and cat.
         q_rot, q_pass = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
         k_rot, k_pass = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
-        q_rot_out, k_rot_out = apply_rotary_pos_emb_triton(
+        q_rot_out, k_rot_out = apply_rotary_pos_emb_triton_out_of_place(
             q_rot, k_rot, cos, sin, rotary_type="interleaved", block_size=block_size
         )
         q_out = torch.cat([q_rot_out, q_pass], dim=-1)

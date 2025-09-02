@@ -137,7 +137,7 @@ class TransformerLlama(Transformer):
             checkpoint_prefix=f"output",
         )
 
-    def _pre_layers(self, h):
+    def _pre_layers(self, h, **args):
         return self.tok_embeddings(h)
 
     def _post_layers(self, h):

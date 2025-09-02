@@ -6,10 +6,14 @@ import torch
 
 from typing import List, Optional
 
-from chitu.utils import try_import_opt_dep, try_import_platform_dep
+from chitu.utils import (
+    try_import_opt_dep,
+    try_import_platform_dep,
+    try_import_and_setup_torch_npu,
+)
 
 triton, has_triton = try_import_platform_dep("triton")
-torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 
 if has_torch_npu:

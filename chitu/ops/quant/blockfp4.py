@@ -11,7 +11,6 @@ from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.global_vars import get_global_args
 
 triton, has_triton = try_import_platform_dep("triton")
-torch_npu, has_torch_npu = try_import_platform_dep("torch_npu")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 

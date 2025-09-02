@@ -615,7 +615,12 @@ class Executor:
             payload = dispatcher.recv_payload(payload)
 
         self.timers("prefill").start()
-        out = Backend.model.prefill(payload, self._get_output_token_offsets(tasks))
+        out = Backend.model.prefill(
+            payload,
+            self._get_output_token_offsets(tasks),
+            pixel_values=getattr(tasks, "pixel_values", None),
+            grid_thw=getattr(tasks, "grid_thw", None),
+        )
         self.timers("prefill").stop()
 
         # Notify KV transfer hook after prefill completes.
@@ -672,7 +677,12 @@ class Executor:
 
         # 5) run model
         self.timers("prefill").start()
-        out = Backend.model.prefill(payload, self._get_output_token_offsets(tasks))
+        out = Backend.model.prefill(
+            payload,
+            self._get_output_token_offsets(tasks),
+            pixel_values=getattr(tasks, "pixel_values", None),
+            grid_thw=getattr(tasks, "grid_thw", None),
+        )
         self.timers("prefill").stop()
 
         # Notify KV hook in TP-only path as well.

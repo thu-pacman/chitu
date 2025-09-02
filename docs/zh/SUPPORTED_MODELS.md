@@ -82,6 +82,10 @@
   用法: 启动赤兔时追加 `models=Qwen2.5-7B` 启动参数
 - Qwen2.5-7B-Instruct
   用法: 启动赤兔时追加 `models=Qwen2.5-7B-Instruct` 启动参数
+- Qwen2.5-VL
+  用法: 启动赤兔时追加 `models=Qwen2.5-VL` 启动参数
+- Qwen2.5-VL-7B-Instruct
+  用法: 启动赤兔时追加 `models=Qwen2.5-VL-7B-Instruct` 启动参数
 - Qwen3-0.6B
   用法: 启动赤兔时追加 `models=Qwen3-0.6B` 启动参数
 - Qwen3-1.7B
