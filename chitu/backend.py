@@ -224,10 +224,8 @@ class Backend:
         Returns:
             Initialized processor or None if not a multimodal model
         """
-        multimodal_models = ["qwen2.5-vl", "qwen2-vl", "qwen2_vl"]
-        is_multimodal = any(mm in args.models.type.lower() for mm in multimodal_models)
 
-        if not is_multimodal:
+        if not hasattr(args.models, "vision_config"):
             return None
 
         processor = Processor(path=args.models.processor_path, trust_remote_code=True)

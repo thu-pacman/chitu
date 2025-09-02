@@ -56,14 +56,11 @@ class Processor:
             path, trust_remote_code=trust_remote_code
         )
 
-    def process(self, text=None, images=None, **kwargs):
-        return self.processor(text=text, images=images, **kwargs)
+    def apply_chat_template(self, dialog, **kwargs):
+        return self.processor.apply_chat_template(dialog, **kwargs)
 
-    def apply_chat_template(self, dialog):
-        return self.processor.apply_chat_template(dialog)
-
-    def __call__(self, text=None, images=None, **kwargs):
-        return self.process(text=text, images=images, **kwargs)
+    def __call__(self, **kwargs):
+        return self.processor(**kwargs)
 
 
 class Tokenizer:
@@ -379,15 +376,11 @@ class ChatFormatHF:
         chat_template_kwargs: Mapping[str, Any] = {},
     ):
         if self.processor:
-            text = self.processor.apply_chat_template(dialog)
-            from qwen_vl_utils import process_vision_info
-
-            image_inputs, video_inputs = process_vision_info(dialog)
-            inputs = self.processor(
-                text=text,
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
+            inputs = self.processor.apply_chat_template(
+                dialog,
+                tokenize=True,
+                return_dict=True,
+                add_generation_prompt=True,
                 return_tensors="pt",
             )
             if "pixel_values" in inputs:

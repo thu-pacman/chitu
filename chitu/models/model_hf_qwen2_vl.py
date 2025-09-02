@@ -44,6 +44,7 @@ class VisionMLP(nn.Module):
         hidden_features: Optional[int] = None,
         op_impl: str = "",
         checkpoint_prefix: str = "",
+        has_bias: bool = True,
     ):
         super().__init__()
         self.hidden_size = in_features
@@ -53,26 +54,26 @@ class VisionMLP(nn.Module):
             self.gate_up_proj = LocalLinear(
                 self.hidden_size,
                 self.intermediate_size * 2,
-                has_bias=True,
+                has_bias=has_bias,
                 checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
             )
         else:
             self.gate_proj = LocalLinear(
                 self.hidden_size,
                 self.intermediate_size,
-                has_bias=True,
+                has_bias=has_bias,
                 checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
             )
             self.up_proj = LocalLinear(
                 self.hidden_size,
                 self.intermediate_size,
-                has_bias=True,
+                has_bias=has_bias,
                 checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
             )
         self.down_proj = LocalLinear(
             self.intermediate_size,
             self.hidden_size,
-            has_bias=True,
+            has_bias=has_bias,
             checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
         )
 
@@ -96,6 +97,7 @@ class VisionPatchEmbed(nn.Module):
         temporal_patch_size: int = 2,
         in_channels: int = 3,
         embed_dim: int = 1152,
+        has_bias: bool = False,
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -109,7 +111,7 @@ class VisionPatchEmbed(nn.Module):
             embed_dim,
             kernel_size=kernel_size,
             stride=kernel_size,
-            bias=False,
+            bias=has_bias,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -130,7 +132,6 @@ class VisionRotaryEmbedding(nn.Module):
         self.inv_freq = 1.0 / (
             theta ** (torch.arange(0, dim, 2, dtype=torch.float, device="cuda") / dim)
         )
-        # self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, seqlen) -> torch.Tensor:
         seq = torch.arange(
@@ -200,24 +201,28 @@ class VisionAttention(nn.Module):
 
     def __init__(
         self,
-        config,
+        dim,
+        num_heads,
         op_impl: str = "",
         checkpoint_prefix: str = "",
+        has_bias: bool = True,
     ):
         super().__init__()
-        self.dim = config.hidden_size
-        self.num_heads = config.num_heads
-        self.head_dim = self.dim // self.num_heads
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
         self.scaling = self.head_dim**-0.5
         self.attn_backend = RefAttnBackend()
         self.qkv = LocalLinear(
-            self.dim,
-            self.dim * 3,
-            has_bias=True,
+            dim,
+            dim * 3,
+            has_bias=has_bias,
             checkpoint_prefix=f"{checkpoint_prefix}.qkv",
         )
         self.proj = LocalLinear(
-            self.dim, self.dim, checkpoint_prefix=f"{checkpoint_prefix}.proj"
+            dim,
+            dim,
+            checkpoint_prefix=f"{checkpoint_prefix}.proj",
+            has_bias=has_bias,
         )
 
     def forward(
@@ -286,23 +291,29 @@ class VisionBlock(nn.Module):
 
     def __init__(
         self,
-        config,
+        hidden_size,
+        hidden_features,
+        num_heads,
         op_impl: str = "",
         checkpoint_prefix: str = "",
+        has_bias: bool = True,
     ):
         super().__init__()
-        self.norm1 = RMSNorm(config.hidden_size, eps=1e-6)
-        self.norm2 = RMSNorm(config.hidden_size, eps=1e-6)
+        self.norm1 = RMSNorm(hidden_size, eps=1e-6)
+        self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         self.attn = VisionAttention(
-            config,
+            hidden_size,
+            num_heads,
             op_impl,
             checkpoint_prefix=f"{checkpoint_prefix}.attn",
+            has_bias=has_bias,
         )
         self.mlp = VisionMLP(
-            in_features=config.hidden_size,
-            hidden_features=config.intermediate_size,
+            in_features=hidden_size,
+            hidden_features=hidden_features,
             op_impl=op_impl,
             checkpoint_prefix=f"{checkpoint_prefix}.mlp",
+            has_bias=has_bias,
         )
 
     def forward(
@@ -353,7 +364,9 @@ class VisionTransformer(nn.Module):
         self.blocks = nn.ModuleList(
             [
                 VisionBlock(
-                    config,
+                    config.hidden_size,
+                    config.intermediate_size,
+                    config.num_heads,
                     op_impl=op_impl,
                     checkpoint_prefix=f"{checkpoint_prefix}.blocks.{i}",
                 )
@@ -394,7 +407,7 @@ class VisionTransformer(nn.Module):
         max_grid_size = grid_thw[:, 1:].max()
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
-        return rotary_pos_emb
+        return rotary_pos_emb, pos_ids
 
     def get_window_index(self, grid_thw):
         window_index: list = []
@@ -457,7 +470,7 @@ class VisionTransformer(nn.Module):
             `torch.Tensor`: hidden_states.
         """
         hidden_states = self.patch_embed(hidden_states)
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        rotary_pos_emb, _ = self.rot_pos_emb(grid_thw)
         window_index, cu_window_seqlens = self.get_window_index(grid_thw)
         cu_window_seqlens = torch.tensor(
             cu_window_seqlens,
@@ -527,6 +540,7 @@ class TransformerQwen2VL(TransformerHFLlama):
         op_impl: str,
         rotary_type: str = "separated",
         layer_type: type = TransformerBlockHFLlama,
+        visual_type: type = VisionTransformer,
         **kwargs,
     ):
         self.config = getattr(params, "vision_config", {})
@@ -544,16 +558,18 @@ class TransformerQwen2VL(TransformerHFLlama):
             **kwargs,
         )
 
-        self.visual = VisionTransformer(
-            config=self.config,
-            op_impl=op_impl,
-            checkpoint_prefix="visual",
-        )
+        if self.config:
+            self.visual = visual_type(
+                config=self.config,
+                op_impl=op_impl,
+                checkpoint_prefix="visual",
+            )
 
     def get_visual_features(
         self,
         pixel_values: torch.FloatTensor,
         grid_thw: Optional[torch.LongTensor] = None,
+        visual_type: str = "image",
     ):
         visual_embeds = self.visual(pixel_values, grid_thw=grid_thw)
         split_sizes = (grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
@@ -617,7 +633,7 @@ class TransformerQwen2VL(TransformerHFLlama):
         input_ids = input_ids.reshape(-1)
         inputs_embeds = super()._pre_layers(input_ids)
         if pixel_values is not None:
-            image_embeds = self.get_visual_features(pixel_values, grid_thw)
+            image_embeds = self.get_visual_features(pixel_values, grid_thw, "image")
             image_embeds = torch.cat(image_embeds, dim=0)
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
@@ -625,7 +641,9 @@ class TransformerQwen2VL(TransformerHFLlama):
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if pixel_values_videos is not None:
-            video_embeds = self.get_visual_features(pixel_values_videos, video_grid_thw)
+            video_embeds = self.get_visual_features(
+                pixel_values_videos, video_grid_thw, "video"
+            )
             video_embeds = torch.cat(video_embeds, dim=0).to(
                 inputs_embeds.device, inputs_embeds.dtype
             )
@@ -634,8 +652,9 @@ class TransformerQwen2VL(TransformerHFLlama):
             )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-        torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
-        torch.distributed.broadcast(inputs_embeds, src=0)
+        if get_tp_size() > 1:
+            torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+            torch.distributed.broadcast(inputs_embeds, src=0)
         return inputs_embeds
 
     @override

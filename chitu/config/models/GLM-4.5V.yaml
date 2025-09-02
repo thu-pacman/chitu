@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: GLM-4.5V
+type: hf-glm-4-moe
+source: "https://huggingface.co/zai-org/GLM-4.5V" # Just for displaying. No automatic download.
+tokenizer_type: "hf" # one of: hf, tiktoken
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+processor_path: null # By default the same as ckpt_dir, or you can override it with `models.processor_path=<path>`.
+
+dim: 4096                    # hidden_size
+head_dim: 128
+inter_dim: 10944             # intermediate_size
+moe_inter_dim: 1408          # moe_intermediate_size
+norm_topk_prob: true
+n_heads: 96                  # num_attention_heads
+n_kv_heads: 8                # num_key_value_heads
+n_expert_groups: 1           # n_group
+n_limited_groups: 1          # topk_group
+n_routed_experts: 128
+n_activated_experts: 8       # num_experts_per_tok
+n_shared_experts: 1
+score_func: "sigmoid"
+route_scale: 1.0             # routed_scaling_factor
+n_dense_layers: 1            # first_k_dense_replace
+n_layers: 46                 # num_hidden_layers
+qkv_has_bias: true           # attention_bias
+use_qk_norm: false
+norm_eps: 1e-05              # rms_norm_eps
+rope_theta: 10000.0
+vocab_size: 151552
+pad_token_id: 151329
+eos_token_id: [151329, 151336, 151338]
+
+rope_scaling:
+  rope_type: mrope
+  mrope_section: [16, 24, 24]
+  factor: 1.0
+
+vision_config:
+  attention_bias: false
+  attention_dropout: 0.0
+  depth: 24
+  hidden_act: "silu"
+  hidden_size: 1536
+  image_size: 336
+  in_channels: 3
+  initializer_range: 0.02
+  intermediate_size: 10944
+  model_type: "glm4v_moe"
+  num_heads: 12
+  out_hidden_size: 4096
+  patch_size: 14
+  rms_norm_eps: 1e-05
+  spatial_merge_size: 2
+  temporal_patch_size: 2
+  video_end_token_id: 151342
+  video_start_token_id: 151341
+  video_token_id: 151364
+  image_start_token_id: 151339
+  image_end_token_id: 151340
+  image_token_id: 151363
