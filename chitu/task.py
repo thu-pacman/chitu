@@ -400,7 +400,7 @@ class Task:
             and (self.req._test_standard_tokens is not None)
             and (self.num_new_tokens < len(self.req._test_standard_tokens))
         ):
-            self.next_token = self.req._test_standard_tokens[self.num_new_tokens]
+            self.next_token = self.req._test_standard_tokens[self.num_new_tokens].item()
         self._prefix_tokens.append(token)
         self.num_new_tokens += 1
         self.prefix_length += 1  # not use
