@@ -898,8 +898,6 @@ class ParallelMoeBlock(nn.Module):
         tokens_per_expert = None
         if self.moe_impl is not None:
             experts_impl = self.moe_impl.get_experts_impl()
-            if "deepgemm" in experts_impl:
-                indices = indices.to(torch.int64)
             x, indices, weights, tokens_per_expert = self.moe_impl.token_permutation(
                 x, indices, weights
             )

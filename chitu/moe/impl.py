@@ -102,7 +102,7 @@ class MoEImpl:
                     else "deepep-normal"
                 ),
             )
-            self.prefill_experts_impl = "deepgemm-contiguous"
+            self.prefill_experts_impl = "ep_group_gemm_contiguous"
         elif self.prefill_token_dispatcher_impl == "allgather":
             self.prefill_token_dispatcher = MoEAllGatherTokenDispatcher()
         else:
@@ -118,7 +118,7 @@ class MoEImpl:
                 self.hidden_dim,
                 deepep_use_fp8=self.use_fp8,
             )
-            self.decode_experts_impl = "deepgemm-masked"
+            self.decode_experts_impl = "ep_group_gemm_masked"
         elif self.decode_token_dispatcher_impl == "allgather":
             self.decode_token_dispatcher = MoEAllGatherTokenDispatcher()
         else:

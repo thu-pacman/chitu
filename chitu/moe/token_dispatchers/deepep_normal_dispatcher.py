@@ -58,6 +58,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         return t.size(1) * max(t.element_size(), 2)
 
     def token_permutation(self, tokens, topk_ids, topk_weights, layer_id: int = 0):
+        topk_ids = topk_ids.to(torch.int64)
         topk_weights = topk_weights.to(torch.float32)
         (
             recv_hidden_states,
