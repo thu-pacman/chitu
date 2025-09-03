@@ -2053,11 +2053,6 @@ class NpuAttnBackend(RefAttnBackend):
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
-        if getattr(get_global_args().infer, "prefill_chunk_size", None) is not None:
-            raise NotImplementedError(
-                "prefill_chunk_size is not supported yet for NpuAttnBackend"
-            )
-
         self.local_n_heads = self.args.models.n_heads // self.args.infer.tp_size
         if hasattr(self.args.models, "n_kv_heads"):
             self.local_n_kv_heads = (
@@ -2069,32 +2064,41 @@ class NpuAttnBackend(RefAttnBackend):
             self.local_n_kv_heads = self.local_n_heads
 
     def prepare_metadata_for_prefill(self, seq_len_delta: BatchedSeqLenDelta):
-        # SPDX-SnippetBegin
-        # SPDX-License-Identifier: Apache-2.0
-        # SPDX-SnippetCopyrightText: 2025 Huawei Technologies Co., Ltd.
-        # SDPX—SnippetName: _generate_attn_mask from vllm-ascend
+        """construct attention mask for prefilling, different sequences will not attend each other
+        Args:
+            seq_len_delta: sequence length infomation before and after prefill
+            causal: True for casual mask
+        mask: shape=(q_total_len,k_total_len), the value in mask: False for keeping qk, True for masking out.
+        """
+        q_total_len = seq_len_delta.delta_total_len
+        k_total_len = seq_len_delta.new.total_len
 
-        # Adapt from https://github.com/vllm-project/vllm-ascend/blob/b72e34013f5f8aa59d7b4060f11c4fc3543f3647/vllm_ascend/attention/attention_mask.py#L18
+        self.casual_attn_mask = torch.ones([q_total_len, k_total_len]).bool()
+        self.noncasual_attn_mask = torch.ones([q_total_len, k_total_len]).bool()
+        q_start = 0
+        k_start = 0
 
-        dtype = torch.get_default_dtype()
-        max_seq_len = seq_len_delta.new.max_len
-        # Construct lower triangle matrix.
-        mask_flag = torch.tril(
-            torch.ones((max_seq_len, max_seq_len), dtype=torch.bool)
-        ).view(max_seq_len, max_seq_len)
-        # Create upper triangle matrix used to mark mask positions.
-        mask_flag = ~mask_flag
-        # Currently for fp16 dtype, the mask value should be set to -inf.
-        # TODO: Eliminate this part in the future.
-        if dtype == torch.float16:
-            mask_value = float("-inf")
-        else:
-            mask_value = 1
-        self.attn_mask = torch.zeros(size=(max_seq_len, max_seq_len), dtype=dtype)
-        self.attn_mask.masked_fill_(mask_flag, mask_value)
-        self.attn_mask = self.attn_mask.cuda()
+        old_lens = seq_len_delta.old.lens_tensor_device
+        new_lens = seq_len_delta.new.lens_tensor_device
+        delta_lens = seq_len_delta.delta_lens_tensor_device
 
-        # SPDX-SnippetEnd
+        for i in range(len(old_lens)):
+            q_len = delta_lens[i].item()
+            k_len = new_lens[i].item()
+
+            if q_len > 0 and k_len > 0:
+                q_end = q_start + q_len
+                k_end = k_start + k_len
+                # keep casual attention within the current sequence
+                self.casual_attn_mask[q_start:q_end, k_start:k_end] = torch.triu(
+                    torch.ones([q_len, k_len]), diagonal=k_len - q_len + 1
+                ).bool()
+                # tokens can attend to each other within the current sequence
+                self.noncasual_attn_mask[q_start:q_end, k_start:k_end] = torch.zeros(
+                    [q_len, k_len]
+                ).bool()
+            q_start += q_len
+            k_start += k_len
 
     @override
     def prefill_ragged_qkvo(
@@ -2111,6 +2115,13 @@ class NpuAttnBackend(RefAttnBackend):
     ):
         if softmax_scale is None:
             softmax_scale = float(1 / math.sqrt(q.shape[-1]))
+
+        if causal:
+            atten_mask_npu = self.casual_attn_mask.to(q.device)
+        else:
+            atten_mask_npu = self.noncasual_attn_mask.to(q.device)
+
+        head_num = q.shape[1]
 
         if k.shape[-1] != v.shape[-1]:
             dim_gap = k.shape[-1] - v.shape[-1]
@@ -2129,35 +2140,49 @@ class NpuAttnBackend(RefAttnBackend):
             repeated_v = einops.repeat(
                 added_v, "b h d -> b (h g) d", g=q.shape[1] // added_v.shape[1]
             )
-            out = torch.empty_like(q)
-            torch_npu._npu_flash_attention(
-                query=q,
-                key=repeated_k,
-                value=repeated_v,
-                mask=self.attn_mask,
-                seq_len=seq_len_delta.new.lens_tensor_cpu,
-                num_kv_heads=repeated_k.shape[1],
-                num_heads=self.local_n_heads,
-                scale_value=softmax_scale,
-                out=out,
-            )
-            npu_out = out[..., : v.shape[-1]]
-            return npu_out
+            return torch_npu.npu_fusion_attention(
+                q,
+                repeated_k,
+                repeated_v,
+                head_num,
+                pse=None,
+                atten_mask=atten_mask_npu,
+                scale=softmax_scale,
+                keep_prob=1,
+                input_layout="TND",
+                actual_seq_qlen=tuple(
+                    seq_len_delta.delta_prefix_lens_tensor_device[1:]
+                    .cpu()
+                    .numpy()
+                    .tolist()
+                ),
+                actual_seq_kvlen=tuple(
+                    seq_len_delta.new.prefix_lens_tensor_device[1:]
+                    .cpu()
+                    .numpy()
+                    .tolist()
+                ),
+                sparse_mode=1,
+            )[0][..., : v.shape[-1]]
 
-        # q [tokens_num, head_num, head_dim]
-        output = torch.empty_like(q)
-        torch_npu._npu_flash_attention(
-            query=q,
-            key=k,
-            value=v,
-            mask=self.attn_mask,
-            seq_len=seq_len_delta.new.lens_tensor_cpu,
-            scale_value=softmax_scale,
-            num_heads=self.local_n_heads,
-            num_kv_heads=self.local_n_kv_heads,
-            out=output,
-        )
-        return output
+        return torch_npu.npu_fusion_attention(
+            q,
+            k,
+            v,
+            head_num,
+            pse=None,
+            atten_mask=atten_mask_npu,
+            scale=softmax_scale,
+            keep_prob=1,
+            input_layout="TND",
+            actual_seq_qlen=tuple(
+                seq_len_delta.delta_prefix_lens_tensor_device[1:].cpu().numpy().tolist()
+            ),
+            actual_seq_kvlen=tuple(
+                seq_len_delta.new.prefix_lens_tensor_device[1:].cpu().numpy().tolist()
+            ),
+            sparse_mode=1,
+        )[0]
 
     @override
     def prefill_ragged_qo_dense_kv(
