@@ -107,6 +107,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         self.num_max_dispatch_tokens_per_rank = num_tokens_per_rank
 
     def token_permutation(self, tokens, topk_ids, topk_weights, layer_id: int = 0):
+        topk_ids = topk_ids.to(torch.int64)
         recv_hidden_states, recv_expert_count, deepep_handle, event, hook = (
             self.deepep_token_dispatch(
                 tokens,

@@ -1109,7 +1109,6 @@ def fused_experts(
     experts_start_idx: int = 0,
     tokens_per_expert: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert tokens_per_expert is None
 
     if get_ep_size() > 1:
         n_local_experts = w1.shape[0]
