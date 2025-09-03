@@ -416,7 +416,7 @@ class PDScheduler(Scheduler):
             tokens=[tokens],
             num_tokens=len(tokens),
             has_outputs=[1],
-            payload_type=SerializedPackedTasksPayloadType.Normal,
+            payload_type=SerializedPackedTasksPayloadType.Prefill,
         )
 
         # Run through executor TP-only path (PP not supported in PD mode for now)

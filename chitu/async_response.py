@@ -35,6 +35,7 @@ class AsyncDataStream:
         self.top_logprobs_list = []
         self.top_tokens_list = []
         self.enable_reasoning = enable_reasoning
+        self.loop = asyncio.get_event_loop()
 
         if enable_reasoning:
             self.is_reasoning = False
@@ -81,12 +82,12 @@ class AsyncDataStream:
             if top_logprobs:
                 self.top_logprobs_list.append(top_logprobs)
                 self.top_tokens_list.append(top_tokens)
-        self.data_event.set()
+        self.loop.call_soon_threadsafe(self.data_event.set)
 
     def send_stop_signal(self):
         with self.lock:
             self.stop_signal = True
-        self.data_event.set()
+        self.loop.call_soon_threadsafe(self.data_event.set)
 
     def reasoning_handle(self, value: int):
         if not self.is_reasoning and self.tokens_len == 0 and value == self.rs_token_id:

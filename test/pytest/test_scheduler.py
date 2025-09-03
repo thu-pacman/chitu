@@ -9,6 +9,15 @@ import pytest
 from chitu.task_type import TaskType
 
 
+class MockExecutor:
+    def __init__(self):
+        pass
+
+    def step(self, tasks):
+        for rid in tasks.req_ids:
+            Backend.cache_manager.finalize_cache_all_decode(rid)
+
+
 class MockCacheManager:
     def __init__(self, num_blocks, block_size):
         self.num_blocks = num_blocks
@@ -38,14 +47,14 @@ class MockCacheManager:
         needed_blocks = (prefill_len + self.block_size - 1) // self.block_size
         self._num_used_blocks += needed_blocks
 
-    def req_needs_new_block(self, task_id):
+    def is_block_full_for_req(self, task_id):
         prefix_len_old = TaskPool.pool[task_id].prefix_tokens_len
         if prefix_len_old % self.block_size == 0:
             return True
         return False
 
     def prepare_cache_decode(self, task_id):
-        if self.req_needs_new_block(task_id):
+        if self.is_block_full_for_req(task_id):
             self._num_used_blocks += 1
 
     def finalize_cache_all_decode(self, task_id):
@@ -356,6 +365,7 @@ def test_evict_decode_task():
     BLOCK_SIZE = 512
     DECODE_NUM_TASKS = 4
 
+    Backend.executor = MockExecutor()
     Backend.cache_manager = MockCacheManager(
         num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE
     )  # kv_cache capacity = 5120

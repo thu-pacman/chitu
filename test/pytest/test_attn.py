@@ -55,8 +55,6 @@ def test_mla_prefill_ragged_qkvo(
     if impl == "npu":
         if not has_torch_npu:
             pytest.skip("torch_npu is missing")
-        if is_increment:
-            pytest.skip("NpuAttnBackend has not supported incremental prefilling yet")
 
     torch.set_default_dtype(torch.float16)
     set_global_args(
@@ -158,8 +156,6 @@ def test_mla_prefill_ragged_qo_paged_kv(
     if impl == "npu":
         if not has_torch_npu:
             pytest.skip("torch_npu is missing")
-        if is_increment:
-            pytest.skip("NpuAttnBackend has not supported incremental prefilling yet")
 
     torch.set_default_dtype(torch.float16)
     set_global_args(
@@ -401,8 +397,6 @@ def test_prefill_ragged_qkvo(
     if impl == "npu":
         if not has_torch_npu:
             pytest.skip("torch_npu is missing")
-        if is_increment:
-            pytest.skip("NpuAttnBackend has not supported incremental prefilling yet")
 
     torch.set_default_dtype(torch.float16)
     set_global_args(

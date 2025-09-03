@@ -157,30 +157,16 @@ class KVCacheManagerBase:
     def finalize_cache_all_prefill(self):
         self.curr_req_ids = None
 
-    def req_needs_new_block(self, req_id):
-        """If the req needs new block for decoding.
-        Return True if req needs new block, else False
-        """
+    def is_block_full_for_req(self, req_id):
+        """Check if the KV cache blocks for the given request are fully utilized. Called by the scheduler to determine whether a new KV cache block needs to be allocated for the specified request."""
         raise NotImplementedError()
 
     def prepare_cache_decode(self, req_ids: List[str]):
         self.curr_req_ids = req_ids
 
-        self.seq_len_delta.copy_from(
-            BatchedSeqLen(
-                [self.req_id_to_seq_len[req_id] for req_id in req_ids],
-                device=self.device,
-                cache_prefix_lens_tensor_device=False,
-                cache_position_ids_tensor_device=False,
-                cache_seq_ids_tensor_device=False,
-            ),
-            BatchedSeqLen(
-                [self.req_id_to_seq_len[req_id] + 1 for req_id in req_ids],
-                device=self.device,
-                cache_prefix_lens_tensor_device=False,
-                cache_position_ids_tensor_device=False,
-                cache_seq_ids_tensor_device=False,
-            ),
+        self.seq_len_delta.copy_from_list(
+            [self.req_id_to_seq_len[req_id] for req_id in req_ids],
+            [self.req_id_to_seq_len[req_id] + 1 for req_id in req_ids],
         )
 
         for req_id in req_ids:
@@ -408,23 +394,22 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self._upd_gpu_block_table(req_ids)
 
     @override
-    def req_needs_new_block(self, req_id):
-        return (
-            self.req_id_to_seq_len[req_id]
-            > len(self.block_table[req_id]) * self.block_size
+    def is_block_full_for_req(self, req_id):
+        """Check if the KV cache blocks for the given request are fully utilized. Called by the scheduler to determine whether a new KV cache block needs to be allocated for the specified request."""
+        return self.req_id_to_seq_len[req_id] == self.block_size * len(
+            self.block_table[req_id]
         )
 
     @override
     def prepare_cache_decode(self, req_ids: List[str]):
-        super().prepare_cache_decode(req_ids)
-
         # Prepare enough block table for next decoding. When decoding, AttnBackend will fill new kv into
         # paged kv cache in place.
         for i, req_id in enumerate(req_ids):
-            if self.seq_len_delta.old.lens_list[i] % self.block_size == 0:
-                assert self.req_needs_new_block(req_id)
+            # if self.seq_len_delta.old.lens_list[i] % self.block_size == 0:
+            if self.is_block_full_for_req(req_id):
                 self.block_table[req_id].append(self.get_free_block())
 
+        super().prepare_cache_decode(req_ids)
         self._upd_gpu_block_table(req_ids)
 
     def get_free_block(self):
@@ -663,10 +648,8 @@ class DenseKVCacheManager(KVCacheManagerBase):
         self._prepare_cache(req_ids, start_pos)
 
     @override
-    def req_needs_new_block(self, req_id):
-        """If the req needs new block for decoding.
-        Return True if req needs new block, else False
-        """
+    def is_block_full_for_req(self, req_id):
+        """Check if the KV cache blocks for the given request are fully utilized. Called by the scheduler to determine whether a new KV cache block needs to be allocated for the specified request."""
         return False
 
     @override

@@ -7,6 +7,8 @@ import logging
 import asyncio
 import threading
 from typing import Dict, Union
+import os
+from chitu.device_type import is_ascend
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +26,40 @@ class MooncakeTransferEngine:
 
             self.engine = TransferEngine()
 
-            self.initialize(
-                hostname=self.hostname,
-                device_name=self.ib_device,
-            )
+            if is_ascend():
+                # Build Ascend-compliant local_server_name: ip:port:npu_<phy_id>
+                phy_id_str = os.environ.get("ASCEND_PHY_ID")
+                if phy_id_str is None:
+                    # Fallback: first device from ASCEND_RT_VISIBLE_DEVICES
+                    visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
+                    phy_id_str = visible.split(",")[0].strip() if visible else "-1"
+                try:
+                    phy_id = int(phy_id_str)
+                except Exception:
+                    phy_id = -1
+
+                # Choose a deterministic unique port per card
+                if phy_id >= 0:
+                    local_port = 10000 + phy_id
+                else:
+                    local_port = 12000 + (os.getpid() % 1000)
+
+                local_server_name = f"{self.hostname}:{local_port}:npu_{phy_id}"
+                self.initialize(
+                    hostname=local_server_name,
+                    device_name=self.ib_device,
+                    protocol="hccl",
+                    metadata_server="P2PHANDSHAKE",
+                )
+            else:
+                # Non-Ascend: keep original behavior (RDMA with default hostname)
+                self.initialize(
+                    hostname=self.hostname,
+                    device_name=self.ib_device,
+                    protocol="rdma",
+                    metadata_server="P2PHANDSHAKE",
+                )
+
             self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
             logger.info("mooncake transfer engine initialized successfully")
 
@@ -68,16 +100,20 @@ class MooncakeTransferEngine:
         self,
         hostname: str,
         device_name: Optional[str],
+        protocol: str = "rdma",
+        metadata_server: str = "P2PHANDSHAKE",
     ) -> None:
         """Initialize the mooncake instance"""
         if self.mock_mode:
-            logger.debug(f"mock: initialize hostname={hostname}, device={device_name}")
+            logger.debug(
+                f"mock: initialize hostname={hostname}, device={device_name}, protocol={protocol}"
+            )
             return  # Success in mock mode
 
         ret_value = self.engine.initialize(
             hostname,
-            "P2PHANDSHAKE",
-            "rdma",
+            metadata_server,
+            protocol,
             device_name if device_name is not None else "",
         )
         if ret_value != 0:

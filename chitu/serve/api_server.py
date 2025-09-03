@@ -88,10 +88,6 @@ async def create_chat_completion(
         return {"message": "Service is not started"}
 
     args = get_global_args()
-    if args.infer.cache_type == "skew" and len(TaskPool.pool) >= args.infer.max_reqs:
-        raise HTTPException(
-            status_code=403, detail="exceeding server processing capacity"
-        )
 
     # Check if DP mode is enabled and use appropriate processing
     if get_global_args().dp_config.enabled:

@@ -13,6 +13,10 @@ from chitu.utils import ceil_div
 from chitu.distributed.parallel_state import get_dp_group
 
 from chitu.backend import Backend
+from chitu.task import (
+    PackedTasksBase,
+    SerializedPackedTasksPayloadType,
+)
 
 logger = getLogger(__name__)
 
@@ -300,11 +304,13 @@ class Scheduler:
                 task_ids,
             )
         )
-        task_needs_new_block = Backend.cache_manager.req_needs_new_block
+        task_needs_new_block = Backend.cache_manager.is_block_full_for_req
 
         def has_enough_block():
             num_need_blocks = sum(
-                1 for task_id in decode_task_ids if task_needs_new_block(task_id)
+                1
+                for task_id in decode_task_ids
+                if task_needs_new_block(TaskPool.pool[task_id].req.request_id)
             )
             num_need_blocks = min(num_need_blocks, self.prefill_num_tasks)
             num_free_blocks = Backend.cache_manager.num_free_blocks
@@ -333,10 +339,17 @@ class Scheduler:
         """
         task = TaskPool.pool[task_id]
         task.next_token = -1
-        task.task_type = TaskType.Prefill
         task.waiting = False
         task.handle = None
-        Backend.cache_manager.finalize_cache_all_decode(task_id)
+        tasks = PackedTasksBase(
+            num_tasks=1,
+            task_ids=[task_id],
+            req_ids=[task.req.request_id],
+            task_type=TaskType.Decode,
+            payload_type=SerializedPackedTasksPayloadType.EndTask,
+        )
+        Backend.executor.step(tasks)
+        task.task_type = TaskType.Prefill
         self.kvcache_block_threshold = max(1, self.kvcache_block_threshold // 2)
         logger.debug(
             f"Temporarily evicting task({task_id}), reducing kvcache_block_threshold to {self.kvcache_block_threshold}, while the number of total blocks is {Backend.cache_manager.get_num_blocks()}"

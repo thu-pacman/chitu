@@ -182,7 +182,8 @@ def _warmup_via_taskpool(args):
     if args.infer.prefill_chunk_size is not None:
         warmup_seq_len = max(
             min(
-                args.infer.prefill_chunk_size // num_warmup_reqs, args.infer.max_seq_len
+                args.infer.prefill_chunk_size // num_warmup_reqs,
+                args.infer.max_seq_len - 1,
             ),
             1,
         )
@@ -359,11 +360,6 @@ def chitu_init(args, logging_level=None):
         args.infer.prefill_chunk_size = args.infer.max_seq_len
 
     if args.infer.prefill_chunk_size is not None:
-        if args.infer.attn_type == "npu":
-            logger.warning(
-                "Disabling infer.prefill_chunk_size because it is not compatible with infer.attn_type=npu yet"
-            )
-            args.infer.prefill_chunk_size = None
         if args.infer.dp_size > 1:
             logger.warning(
                 "Disabling infer.prefill_chunk_size because it is not compatible with DP yet"
