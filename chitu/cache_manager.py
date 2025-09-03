@@ -166,21 +166,9 @@ class KVCacheManagerBase:
     def prepare_cache_decode(self, req_ids: List[str]):
         self.curr_req_ids = req_ids
 
-        self.seq_len_delta.copy_from(
-            BatchedSeqLen(
-                [self.req_id_to_seq_len[req_id] for req_id in req_ids],
-                device=self.device,
-                cache_prefix_lens_tensor_device=False,
-                cache_position_ids_tensor_device=False,
-                cache_seq_ids_tensor_device=False,
-            ),
-            BatchedSeqLen(
-                [self.req_id_to_seq_len[req_id] + 1 for req_id in req_ids],
-                device=self.device,
-                cache_prefix_lens_tensor_device=False,
-                cache_position_ids_tensor_device=False,
-                cache_seq_ids_tensor_device=False,
-            ),
+        self.seq_len_delta.copy_from_list(
+            [self.req_id_to_seq_len[req_id] for req_id in req_ids],
+            [self.req_id_to_seq_len[req_id] + 1 for req_id in req_ids],
         )
 
         for req_id in req_ids:

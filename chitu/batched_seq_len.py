@@ -110,6 +110,32 @@ class BatchedSeqLen:
             cache_seq_ids_tensor_device=cache_seq_ids_tensor_device,
         )
 
+    def copy_from_list(self, lens_list: List[int]):
+        self.lens_list = lens_list
+        self.lens_static_tensor_device.set(
+            torch.tensor(self.lens_list, device=self.device, dtype=torch.int32)
+        )
+
+        if self.cache_prefix_lens_tensor_device:
+            self._prefix_lens_tensor_device_up_to_date = False
+        if self.cache_position_ids_tensor_device:
+            self._position_ids_tensor_device_up_to_date = False
+        if self.cache_seq_ids_tensor_device:
+            self._seq_ids_tensor_device_up_to_date = False
+
+        # `@cached_property` properties can be invalidated by just deleting them
+        # See https://docs.python.org/3/library/functools.html#functools.cached_property
+        if hasattr(self, "lens_tensor_cpu"):
+            del self.lens_tensor_cpu
+        if hasattr(self, "prefix_lens_list"):
+            del self.prefix_lens_list
+        if hasattr(self, "batch_size"):
+            del self.batch_size
+        if hasattr(self, "total_len"):
+            del self.total_len
+        if hasattr(self, "max_len"):
+            del self.max_len
+
     def copy_from(self, other: "BatchedSeqLen"):
         assert (
             self.device == other.device
@@ -362,6 +388,17 @@ class BatchedSeqLenDelta:
             self._delta_position_ids_static_tensor_device = StaticTensor(
                 max_nelem=max_total_delta_len, dtype=torch.int32, device=device
             )
+
+    def copy_from_list(self, old_len_list: List[int], new_len_list: List[int]):
+        self.old.copy_from_list(old_len_list)
+        self.new.copy_from_list(new_len_list)
+        self._delta.copy_from_list(
+            [x - y for x, y in zip(self.new.lens_list, self.old.lens_list)]
+        )
+        self.is_classic_decoding = all(x > 0 for x in self.old.lens_list) and all(
+            (x + 1 == y for x, y in zip(self.old.lens_list, self.new.lens_list))
+        )
+        self._delta_position_ids_tensor_device_up_to_date = False
 
     def copy_from(self, other_old: BatchedSeqLen, other_new: BatchedSeqLen):
         self.old.copy_from(other_old)
