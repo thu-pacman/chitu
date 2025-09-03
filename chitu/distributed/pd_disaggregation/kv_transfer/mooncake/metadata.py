@@ -16,15 +16,12 @@ class MetadataBuffers:
     def __init__(self, size: int):
         # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
         # Currently we need to transfer the first token logits
-        try:
-            args = get_global_args()
-            # Check if models config exists
-            if hasattr(args, "models") and hasattr(args.models, "vocab_size"):
-                vocab_size = args.models.vocab_size
-            else:
-                vocab_size = 32000  # Default vocab size
-        except:
-            vocab_size = 32000  # Fallback default
+        args = get_global_args()
+        # Check if models config exists
+        if hasattr(args, "models") and hasattr(args.models, "vocab_size"):
+            vocab_size = args.models.vocab_size
+        else:
+            vocab_size = 32000  # Default vocab size
 
         self.output_tokens = torch.empty(
             (size, vocab_size),

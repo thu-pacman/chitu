@@ -157,8 +157,9 @@ class KVManager:
             ib_device=ib_device,
         )
 
-        # ZMQ communication
-        self.server_socket = zmq.Context().socket(zmq.PULL)
+        # ZMQ communication (reuse a shared context)
+        self.zmq_ctx = zmq.Context.instance()
+        self.server_socket = self.zmq_ctx.socket(zmq.PULL)
         self.bootstrap_port = bootstrap_port
         self.request_status: Dict[UUID, KVPoll] = {}
 
@@ -431,10 +432,12 @@ class KVManager:
         return b"".join(struct.pack("Q", int(p)) for p in ptr_list)
 
     def _send_zmq_to_prefill(self, endpoint: str, parts: List[bytes]):
-        sock = zmq.Context().socket(zmq.PUSH)
-        sock.connect(endpoint)
-        sock.send_multipart(parts)
-        sock.close()
+        sock = self.zmq_ctx.socket(zmq.PUSH)
+        try:
+            sock.connect(endpoint)
+            sock.send_multipart(parts)
+        finally:
+            sock.close()
 
     def _register_to_bootstrap(self):
         """Register to bootstrap server (fallback mode)"""
@@ -619,23 +622,25 @@ class KVManager:
     ):
         """Sync status to decode endpoint"""
         try:
-            socket = zmq.Context().socket(zmq.PUSH)
-            socket.connect(f"tcp://{remote_ip}:{remote_port}")
-            # Normalize status to numeric ascii
-            if isinstance(status, KVPoll):
-                status_payload = str(status.value)
-            elif isinstance(status, int):
-                status_payload = str(status)
-            elif isinstance(status, str):
-                status_payload = (
-                    "1"
-                    if "Success" in status
-                    else (status if status.isdigit() else "0")
-                )
-            else:
-                status_payload = "0"
-            socket.send_multipart([room.bytes, status_payload.encode("ascii")])
-            socket.close()
+            socket = self.zmq_ctx.socket(zmq.PUSH)
+            try:
+                socket.connect(f"tcp://{remote_ip}:{remote_port}")
+                # Normalize status to numeric ascii
+                if isinstance(status, KVPoll):
+                    status_payload = str(status.value)
+                elif isinstance(status, int):
+                    status_payload = str(status)
+                elif isinstance(status, str):
+                    status_payload = (
+                        "1"
+                        if "Success" in status
+                        else (status if status.isdigit() else "0")
+                    )
+                else:
+                    status_payload = "0"
+                socket.send_multipart([room.bytes, status_payload.encode("ascii")])
+            finally:
+                socket.close()
         except Exception as e:
             logger.error(f"failed to sync status to decode endpoint: {e}")
 
