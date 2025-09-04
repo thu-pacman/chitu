@@ -6,11 +6,16 @@ from typing import Optional, Tuple
 
 import torch
 
-from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
+from chitu.utils import (
+    try_import_platform_dep,
+    try_import_and_setup_torch_npu,
+    try_import_opt_dep,
+)
 from chitu.global_vars import get_global_args
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import get_ggml_quant_type
 
+cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
@@ -169,22 +174,49 @@ def apply_rotary_pos_emb_torch_npu(
     k_out: Optional[torch.Tensor] = None,
     rotary_type: str = "separated",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if rotary_type == "separated":
-        if q.dim() == 3 and cos.dim() == 2 and sin.dim() == 2:
+    if rotary_type in ["separated", "interleaved"]:
+        if rotary_type == "separated":
             cos = torch.cat([cos, cos], dim=-1)
             sin = torch.cat([sin, sin], dim=-1)
-            q_embed = torch_npu.npu_rotary_mul(
-                q.unsqueeze(0),
-                cos.unsqueeze(1).unsqueeze(0),
-                sin.unsqueeze(1).unsqueeze(0),
-            )[0]
-            k_embed = torch_npu.npu_rotary_mul(
-                k.unsqueeze(0),
-                cos.unsqueeze(1).unsqueeze(0),
-                sin.unsqueeze(1).unsqueeze(0),
-            )[0]
+        elif rotary_type == "interleaved":
+            cos = torch.stack([cos, cos], dim=-1).flatten(-2)
+            sin = torch.stack([sin, sin], dim=-1).flatten(-2)
         else:
-            raise ValueError(f"Unsupported shape: {q.shape}")
+            assert False
+
+        # Reshape q, k, cos, sin all to batch * seq_len * head * dim
+
+        if cos.dim() == 2:  # seq_len * dim
+            cos = cos.view(1, cos.shape[0], 1, cos.shape[1])
+
+        if sin.dim() == 2:  # seq_len * dim
+            sin = sin.view(1, sin.shape[0], 1, sin.shape[1])
+
+        q_shape = q.shape
+        if q.dim() == 2:  # seq_len * dim
+            q = q.view(1, q.shape[0], 1, q.shape[1])
+        elif q.dim() == 3:  # seq_len * head * dim
+            q = q.view(1, q.shape[0], q.shape[1], q.shape[2])
+
+        k_shape = k.shape
+        if k.dim() == 2:  # seq_len * dim
+            k = k.view(1, k.shape[0], 1, k.shape[1])
+        elif k.dim() == 3:  # seq_len * head * dim
+            k = k.view(1, k.shape[0], k.shape[1], k.shape[2])
+
+        q_embed = torch_npu.npu_rotary_mul(
+            q,
+            cos,
+            sin,
+            rotary_mode="half" if rotary_type == "separated" else "interleave",
+        ).view(q_shape)
+        k_embed = torch_npu.npu_rotary_mul(
+            k,
+            cos,
+            sin,
+            rotary_mode="half" if rotary_type == "separated" else "interleave",
+        ).view(k_shape)
+
         q_embed, k_embed = q_embed.to(q.dtype), k_embed.to(k.dtype)
 
     elif rotary_type == "separated-half":
@@ -192,6 +224,15 @@ def apply_rotary_pos_emb_torch_npu(
         k_rot, k_pass = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
         q_rot_embed, k_rot_embed = apply_rotary_pos_emb_torch_npu(
             q_rot, k_rot, cos, sin, rotary_type="separated"
+        )
+        q_embed = torch.cat([q_rot_embed, q_pass], dim=-1)
+        k_embed = torch.cat([k_rot_embed, k_pass], dim=-1)
+
+    elif rotary_type == "interleaved-half":
+        q_rot, q_pass = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
+        k_rot, k_pass = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
+        q_rot_embed, k_rot_embed = apply_rotary_pos_emb_torch_npu(
+            q_rot, k_rot, cos, sin, rotary_type="interleaved"
         )
         q_embed = torch.cat([q_rot_embed, q_pass], dim=-1)
         k_embed = torch.cat([k_rot_embed, k_pass], dim=-1)
@@ -219,8 +260,6 @@ def apply_rotary_pos_emb_cpu(
     k_out: Optional[torch.Tensor] = None,
     rotary_type: str = "separated",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    import cpuinfer
-
     if q.device.type != "cpu":
         raise ValueError(
             f"apply_rotary_pos_emb input tensor q must be on CPU, got device: {q.device}"
@@ -330,7 +369,7 @@ def apply_rotary_pos_emb(
     """
 
     if impl == "auto":
-        if get_global_args().infer.op_impl == "cpu":
+        if has_cpuinfer and get_global_args().infer.op_impl == "cpu":
             impl = "cpu"
         elif (
             q_out is None
@@ -351,7 +390,7 @@ def apply_rotary_pos_emb(
             impl = "triton"
         elif rotary_type == "interleaved" and has_chitu_backend:
             impl = "cuda"
-        elif rotary_type == "separated" and has_torch_npu:
+        elif has_torch_npu:
             impl = "torch_npu"
         else:
             impl = "torch"

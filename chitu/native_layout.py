@@ -536,7 +536,7 @@ class NpuFractalZnTensor(NativeLayoutTensor):
             return cls(
                 plain_shape=tensor.shape,
                 layout_tensor=torch_npu.npu_format_cast(
-                    tensor.npu().t().contiguous(), ACL_FORMAT_FRACTAL_NZ
+                    tensor.npu().transpose(-1, -2).contiguous(), ACL_FORMAT_FRACTAL_NZ
                 ).to(old_device),
             )
 
@@ -552,6 +552,6 @@ class NpuFractalZnTensor(NativeLayoutTensor):
         old_device = self.layout_tensor.device
         return (
             torch_npu.npu_format_cast(self.layout_tensor.npu(), ACL_FORMAT_ND)
-            .t()
+            .transpose(-1, -2)
             .to(old_device)
         )
