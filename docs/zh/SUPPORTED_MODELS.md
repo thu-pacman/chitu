@@ -8,6 +8,8 @@
   用法: 启动赤兔时追加 `models=DeepSeek-R1-Distill-Llama-70B` 启动参数
 - DeepSeek-R1-Distill-Qwen-14B
   用法: 启动赤兔时追加 `models=DeepSeek-R1-Distill-Qwen-14B` 启动参数
+- DeepSeek-R1-Distill-Qwen-14B-fp8
+  用法: 启动赤兔时追加 `models=DeepSeek-R1-Distill-Qwen-14B-fp8` 启动参数
 - DeepSeek-R1-FP4
   用法: 启动赤兔时追加 `models=DeepSeek-R1-FP4` 启动参数
 - DeepSeek-R1-Q4_K_M
@@ -92,6 +94,8 @@
   用法: 启动赤兔时追加 `models=Qwen3-1.7B` 启动参数
 - Qwen3-14B
   用法: 启动赤兔时追加 `models=Qwen3-14B` 启动参数
+- Qwen3-14B-FP8
+  用法: 启动赤兔时追加 `models=Qwen3-14B-FP8` 启动参数
 - Qwen3-14B-fp4
   用法: 启动赤兔时追加 `models=Qwen3-14B-fp4` 启动参数
 - Qwen3-14B-mixq-mix

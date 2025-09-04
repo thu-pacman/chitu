@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - DeepSeek-R1-Distill-Qwen-14B
+  - quant_config: blockfp8
+  - _self_ # Config in this file overrides configs in defaults
+name: DeepSeek-R1-Distill-Qwen-14B-fp8
+source: "" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
