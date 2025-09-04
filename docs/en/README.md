@@ -26,7 +26,7 @@ Positioned as an "enterprise-grade large model inference engine", Chitu thorough
 The project team appreciates valuable feedback from users and the open-source community and will continue improving the Chitu inference engine. However, limited by team capacity, we cannot guarantee timely resolution of all issues encountered by users. For professional technical services, please email solution@chitu.ai.
 
 ## Benchmark Data
-Please refer to our self-tested [performance data](/docs/en/PERFORMANCE.md). Results may vary based on your hardware configuration, software versions, and test workloads, with possible fluctuations across multiple tests.
+Please refer to our self-tested [performance data](/docs/en/PERFORMANCE.md). Results may vary based on your hardware configuration, software versions, and test workloads, with possible fluctuations across multiple tests. Welcome to [share your test results](https://github.com/thu-pacman/chitu/discussions/104).
 
 ## Installation & Usage
 Refer to the [Developer Manual](DEVELOPMENT.md) for complete installation instructions. For quick validation in standalone environments, we recommend using official images currently available for:

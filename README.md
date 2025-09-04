@@ -29,7 +29,7 @@ Chitu「赤兔」是一个专注于效率、灵活性和可用性的高性能大
 
 ## 测试数据
 
-请参阅赤兔开发团队自测的[性能数据](docs/zh/PERFORMANCE.md)。
+请参阅赤兔开发团队测试的[性能数据](docs/zh/PERFORMANCE.md)，也欢迎分享您的[自测数据](https://github.com/thu-pacman/chitu/discussions/104)。
 
 性能数据与您的硬件配置、软件版本、测试负载相关，多次测试结果可能存在波动。
 
