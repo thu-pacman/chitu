@@ -149,7 +149,7 @@ def rms_norm(
     impl: str = "auto",
 ):
     if impl == "auto":
-        if get_global_args().infer.op_impl == "cpu":
+        if has_cpuinfer and get_global_args().infer.op_impl == "cpu":
             impl = "cpu"
         elif out is not None and has_chitu_backend:
             impl = "cuda"

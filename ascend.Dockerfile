@@ -1,6 +1,6 @@
 # NOTE: CANN version is coupled with torch-npu version.
 # See https://github.com/Ascend/pytorch/tags for the mapping.
-FROM quay.io/ascend/cann:8.2.rc1.alpha002-910b-ubuntu22.04-py3.10 AS base
+FROM quay.io/ascend/cann:8.3.rc1.alpha001-910b-ubuntu22.04-py3.11 AS base
 
 ARG optional_deps=''
 ARG build_jobs=''
@@ -40,9 +40,9 @@ fi
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "$(lscpu | grep x86)" ]; then \
-        pip install -U torch==2.5.1+cpu -i https://download.pytorch.org/whl/cpu; \
+        pip install -U torch==2.6.0+cpu -i https://download.pytorch.org/whl/cpu; \
     else \
-        pip install -U torch==2.5.1 -i https://pypi.tuna.tsinghua.edu.cn/simple; \
+        pip install -U torch==2.6.0 -i https://pypi.tuna.tsinghua.edu.cn/simple; \
     fi
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install pyyaml setuptools -i https://pypi.tuna.tsinghua.edu.cn/simple
@@ -54,13 +54,13 @@ COPY . .
 # The .whl files are in our repo, so these lines should be after COPY.
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "$(lscpu | grep x86)" ]; then \
-        pip install ./third_party/ascend/torch_npu-2.5.1.post1.dev20250529-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl -i https://pypi.tuna.tsinghua.edu.cn/simple; \
+        pip install ./third_party/ascend/torch_npu-2.6.0.post1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl -i https://pypi.tuna.tsinghua.edu.cn/simple; \
     else \
-        pip install ./third_party/ascend/torch_npu-2.5.1.post1.dev20250702-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl -i https://pypi.tuna.tsinghua.edu.cn/simple; \
+        pip install ./third_party/ascend/torch_npu-2.6.0.post1-cp311-cp311-manylinux_2_28_aarch64.whl -i https://pypi.tuna.tsinghua.edu.cn/simple; \
     fi
 # To directly use the stable version of torch-npu, uncomment the following code:
 # RUN --mount=type=cache,target=/root/.cache/pip \
-#     pip install torch-npu==2.5.1 -i https://pypi.tuna.tsinghua.edu.cn/simple
+#     pip install torch-npu==2.6.0 -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt

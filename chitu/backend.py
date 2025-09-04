@@ -119,6 +119,12 @@ class Backend:
             logger.info(f"[Router] Router subprocess skip CUDA device binding")
             return
 
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+        # Bind process to GPU. Please put it before init_process_group
+        if args.infer.op_impl != "cpu":
+            torch.cuda.set_device(local_rank)
+
         if not torch.distributed.is_initialized():
             if args.infer.op_impl == "cpu":
                 torch.distributed.init_process_group("gloo")
@@ -132,7 +138,6 @@ class Backend:
 
         non_expert_data_parallel_size = args.infer.dp_size
         expert_parallel_size = args.infer.ep_size
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
         global_rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
 
@@ -142,10 +147,6 @@ class Backend:
             * pipeline_parallel_size
             * non_expert_data_parallel_size
         ), f"World size not match: {world_size} != {model_parallel_size} * {pipeline_parallel_size} * {non_expert_data_parallel_size}"
-
-        # Bind process to GPU
-        if args.infer.op_impl != "cpu":
-            torch.cuda.set_device(local_rank)
 
         initialize_parallel_groups(
             tp_size=model_parallel_size,
@@ -224,10 +225,8 @@ class Backend:
         Returns:
             Initialized processor or None if not a multimodal model
         """
-        multimodal_models = ["qwen2.5-vl", "qwen2-vl", "qwen2_vl"]
-        is_multimodal = any(mm in args.models.type.lower() for mm in multimodal_models)
 
-        if not is_multimodal:
+        if not hasattr(args.models, "vision_config"):
             return None
 
         processor = Processor(path=args.models.processor_path, trust_remote_code=True)

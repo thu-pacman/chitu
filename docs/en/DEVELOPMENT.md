@@ -426,8 +426,10 @@ First start the service like above, then you can use the following command to be
 ```bash
 python benchmarks/benchmark_serving.py \
     --model "deepseek-r1" \
+    --batch-size 1 \
     --iterations 10 \
-    --seq-len 10 \
+    --input-len 128 \
+    --output-len 1024 \
     --warmup 3 \
     --base-url http://localhost:21002
 ```

@@ -36,6 +36,8 @@
   用法: 启动赤兔时追加 `models=GLM-4.5-Air-qc-fp8` 启动参数
 - GLM-4.5-qc-fp8
   用法: 启动赤兔时追加 `models=GLM-4.5-qc-fp8` 启动参数
+- GLM-4.5V
+  用法: 启动赤兔时追加 `models=GLM-4.5V` 启动参数
 - GLM-Z1-32B-0414
   用法: 启动赤兔时追加 `models=GLM-Z1-32B-0414` 启动参数
 - GLM-Z1-9B-0414

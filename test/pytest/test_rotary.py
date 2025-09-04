@@ -36,13 +36,8 @@ def test_apply_rotary_pos_emb(
             pytest.skip("chitu_backend is not available, skipping CUDA tests")
         if rotary_type in ["separated", "separated-half", "interleaved-half"]:
             pytest.skip("This op is not implemented in CUDA yet")
-    if impl == "torch_npu":
-        if not has_torch_npu:
-            pytest.skip("torch_npu is missing")
-        if rotary_type in ["interleaved", "interleaved-half"]:
-            pytest.skip("This op is not implemented in torch_npu yet")
-        if is_mqa:
-            pytest.skip("This op is not implemented in torch_npu yet")
+    if impl == "torch_npu" and not has_torch_npu:
+        pytest.skip("torch_npu is missing")
 
     torch.set_default_dtype(torch.float16)
     q = torch.randn(batch_size, n_local_heads, head_dim, device="cuda")
@@ -111,13 +106,8 @@ def test_apply_rotary_pos_emb_in_place(
             pytest.skip("chitu_backend is not available, skipping CUDA tests")
         if rotary_type in ["separated", "separated-half", "interleaved-half"]:
             pytest.skip("This op is not implemented in CUDA yet")
-    if impl == "torch_npu":
-        if not has_torch_npu:
-            pytest.skip("torch_npu is missing")
-        if rotary_type in ["interleaved", "interleaved-half"]:
-            pytest.skip("This op is not implemented in torch_npu yet")
-        if is_mqa:
-            pytest.skip("This op is not implemented in torch_npu yet")
+    if impl == "torch_npu" and not has_torch_npu:
+        pytest.skip("torch_npu is missing")
 
     torch.set_default_dtype(torch.float16)
     q = torch.randn(batch_size, n_local_heads, head_dim, device="cuda")
