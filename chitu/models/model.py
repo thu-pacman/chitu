@@ -279,6 +279,8 @@ class Transformer(nn.Module):
             ret += ["qweight"]
         elif quant == "mixq":
             ret += ["fp_weight"]
+        elif quant == "ascend_w8a8_dynamic":
+            ret += ["weight_scale", "weight_offset"]
         return ret
 
     def _get_2d_in_x_out_tensor_names(self, quant) -> List[str]:
