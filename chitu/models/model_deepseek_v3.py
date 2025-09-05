@@ -30,7 +30,7 @@ from chitu.muxi_utils import (
     Blockfp8MoeExpertsMuxiLayout,
 )
 from chitu.ops import (
-    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_partial,
     silu_and_mul,
     blockfp8_weight_dequant,
     soft_fp8_blockfp8_weight_dequant,
@@ -215,6 +215,15 @@ class AttentionDeepSeekV3(Attention):
 
         q = q.view(bs_seq, self.n_local_heads, -1)
 
+        apply_rotary_pos_emb_partial(
+            q,
+            kv,
+            freqs_cis_cos,
+            freqs_cis_sin,
+            q_rotary_begin=q.shape[-1] - self.qk_rope_head_dim,
+            k_rotary_begin=self.kv_lora_rank,
+            rotary_type="interleaved",
+        )
         q_nope, q_pe = torch.split(
             q,
             [
@@ -225,17 +234,6 @@ class AttentionDeepSeekV3(Attention):
         )
         kv_lora, k_pe = torch.split(
             kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
-
-        # In-place update to `q_pe` and `k_pe`, which are part of `q` and `kv`, respectively
-        apply_rotary_pos_emb(
-            q_pe,
-            k_pe,
-            freqs_cis_cos,
-            freqs_cis_sin,
-            q_out=q_pe,
-            k_out=k_pe,
-            rotary_type="interleaved",
         )
 
         if self.mla_absorb == "none":

@@ -45,36 +45,6 @@ def apply_rotary_pos_emb_triton_out_of_place(
     rotary_type: str = "separated",
     block_size=128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-
-    if rotary_type == "separated-half":
-        # Currently we split and fallback to "interleaved". TODO: Implement a fully
-        # fused kernel including the split and cat.
-        q_rot, q_pass = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
-        k_rot, k_pass = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
-        q_rot_out, k_rot_out = apply_rotary_pos_emb_triton_out_of_place(
-            q_rot,
-            k_rot,
-            cos,
-            sin,
-            rotary_type="separated",
-            block_size=block_size,
-        )
-        q_out = torch.cat([q_rot_out, q_pass], dim=-1)
-        k_out = torch.cat([k_rot_out, k_pass], dim=-1)
-        return q_out, k_out
-
-    if rotary_type == "interleaved-half":
-        # Currently we split and fallback to "interleaved". TODO: Implement a fully
-        # fused kernel including the split and cat.
-        q_rot, q_pass = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
-        k_rot, k_pass = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
-        q_rot_out, k_rot_out = apply_rotary_pos_emb_triton_out_of_place(
-            q_rot, k_rot, cos, sin, rotary_type="interleaved", block_size=block_size
-        )
-        q_out = torch.cat([q_rot_out, q_pass], dim=-1)
-        k_out = torch.cat([k_rot_out, k_pass], dim=-1)
-        return q_out, k_out
-
     # Prepare output tensor
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)

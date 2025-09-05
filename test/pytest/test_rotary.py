@@ -21,8 +21,19 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 )
 @pytest.mark.parametrize("is_mqa", [False, True])
 @pytest.mark.parametrize("impl", ["cuda", "triton", "torch_npu"])
+@pytest.mark.parametrize(
+    "qk_dtype,freqs_dtype",
+    [(torch.float16, torch.float16), (torch.float16, torch.float32)],
+)
 def test_apply_rotary_pos_emb(
-    rotary_type, batch_size, n_local_heads, head_dim, is_mqa, impl
+    rotary_type,
+    batch_size,
+    n_local_heads,
+    head_dim,
+    is_mqa,
+    qk_dtype,
+    freqs_dtype,
+    impl,
 ):
     if impl == "triton":
         if not has_triton:
@@ -39,7 +50,7 @@ def test_apply_rotary_pos_emb(
     if impl == "torch_npu" and not has_torch_npu:
         pytest.skip("torch_npu is missing")
 
-    torch.set_default_dtype(torch.float16)
+    torch.set_default_dtype(qk_dtype)
     q = torch.randn(batch_size, n_local_heads, head_dim, device="cuda")
     if is_mqa:
         k = torch.randn(batch_size, head_dim, device="cuda")
@@ -61,8 +72,8 @@ def test_apply_rotary_pos_emb(
         * 2
         * math.pi,
     )
-    cos = complex_freqs.real.contiguous()
-    sin = complex_freqs.imag.contiguous()
+    cos = complex_freqs.real.contiguous().to(freqs_dtype)
+    sin = complex_freqs.imag.contiguous().to(freqs_dtype)
 
     out_q, out_k = apply_rotary_pos_emb(
         q, k, cos, sin, rotary_type=rotary_type, impl=impl
@@ -70,6 +81,7 @@ def test_apply_rotary_pos_emb(
     out_q_torch, out_k_torch = apply_rotary_pos_emb(
         q, k, cos, sin, rotary_type=rotary_type, impl="torch"
     )
+
     # Check if out_q and out_q_torch are the same
     # Use rtol and atol for more precise comparison
     rtol = 5e-3
@@ -89,10 +101,21 @@ def test_apply_rotary_pos_emb(
 )
 @pytest.mark.parametrize("is_mqa", [False, True])
 @pytest.mark.parametrize(
+    "qk_dtype,freqs_dtype",
+    [(torch.float16, torch.float16), (torch.float16, torch.float32)],
+)
+@pytest.mark.parametrize(
     "impl", ["cuda", "triton", "torch_npu", "torch"]
 )  # Also test "torch"'s in-place with itself's out-of-place
 def test_apply_rotary_pos_emb_in_place(
-    rotary_type, batch_size, n_local_heads, head_dim, is_mqa, impl
+    rotary_type,
+    batch_size,
+    n_local_heads,
+    head_dim,
+    is_mqa,
+    qk_dtype,
+    freqs_dtype,
+    impl,
 ):
     if impl == "triton":
         if not has_triton:
@@ -109,7 +132,7 @@ def test_apply_rotary_pos_emb_in_place(
     if impl == "torch_npu" and not has_torch_npu:
         pytest.skip("torch_npu is missing")
 
-    torch.set_default_dtype(torch.float16)
+    torch.set_default_dtype(qk_dtype)
     q = torch.randn(batch_size, n_local_heads, head_dim, device="cuda")
     if is_mqa:
         k = torch.randn(batch_size, head_dim, device="cuda")
@@ -131,14 +154,17 @@ def test_apply_rotary_pos_emb_in_place(
         * 2
         * math.pi,
     )
-    cos = complex_freqs.real.contiguous()
-    sin = complex_freqs.imag.contiguous()
+    cos = complex_freqs.real.contiguous().to(freqs_dtype)
+    sin = complex_freqs.imag.contiguous().to(freqs_dtype)
 
-    out_q = q.clone()
-    out_k = k.clone()
+    q_clone = q.clone()
+    k_clone = k.clone()
+    out_q = q_clone
+    out_k = k_clone
+
     apply_rotary_pos_emb(
-        out_q,
-        out_k,
+        q_clone,
+        k_clone,
         cos,
         sin,
         rotary_type=rotary_type,
@@ -149,6 +175,7 @@ def test_apply_rotary_pos_emb_in_place(
     out_q_torch, out_k_torch = apply_rotary_pos_emb(
         q, k, cos, sin, rotary_type=rotary_type, impl="torch"
     )
+
     # Check if out_q and out_q_torch are the same
     # Use rtol and atol for more precise comparison
     rtol = 5e-3

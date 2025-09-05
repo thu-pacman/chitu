@@ -16,13 +16,13 @@ namespace chitu {
 // FIXME: set it as a template parameter according to the device
 #define WARP_SIZE 32
 
-template <typename T>
+template <typename T, typename U>
 __global__ void rotary_pos_emb_llama_kernel(
-    const T *q, const T *k, const float *__restrict__ freqs_cis_cos,
-    const float *__restrict__ freqs_cis_sin, T *q_out, T *k_out,
-    size_t batch_size, size_t q_n_heads, size_t k_n_heads, size_t n_hidden,
-    size_t q_batch_stride, size_t k_batch_stride, size_t q_head_stride,
-    size_t k_head_stride, size_t cos_sin_stride) {
+    const T *q, const T *k, const U *__restrict__ freqs_cis_cos,
+    const U *__restrict__ freqs_cis_sin, T *q_out, T *k_out, size_t batch_size,
+    size_t q_n_heads, size_t k_n_heads, size_t n_hidden, size_t q_batch_stride,
+    size_t k_batch_stride, size_t q_head_stride, size_t k_head_stride,
+    size_t cos_sin_stride) {
     // NOTE: No restrict pointers because `q` may be alias to `q_out` and `k`
     // may be alias to `k_out`
 
@@ -34,16 +34,17 @@ __global__ void rotary_pos_emb_llama_kernel(
     for (size_t t = tid; t < n_hidden / 2; t += blockDim.x) {
         size_t cos_sin_idx = i * cos_sin_stride + t;
 
+        float c = to_scalar<float>(freqs_cis_cos[cos_sin_idx]);
+        float s = to_scalar<float>(freqs_cis_sin[cos_sin_idx]);
+
         if (j < q_n_heads) {
             size_t q_offset = i * q_batch_stride + j * q_head_stride;
             size_t q1_idx = q_offset + t * 2;
             size_t q2_idx = q1_idx + 1;
             float q1 = to_scalar<float>(q[q1_idx]);
             float q2 = to_scalar<float>(q[q2_idx]);
-            q_out[q1_idx] = to_scalar<T>(q1 * freqs_cis_cos[cos_sin_idx] -
-                                         q2 * freqs_cis_sin[cos_sin_idx]);
-            q_out[q2_idx] = to_scalar<T>(q2 * freqs_cis_cos[cos_sin_idx] +
-                                         q1 * freqs_cis_sin[cos_sin_idx]);
+            q_out[q1_idx] = to_scalar<T>(q1 * c - q2 * s);
+            q_out[q2_idx] = to_scalar<T>(q2 * c + q1 * s);
         }
 
         if (j < k_n_heads) {
@@ -52,15 +53,13 @@ __global__ void rotary_pos_emb_llama_kernel(
             size_t k2_idx = k1_idx + 1;
             float k1 = to_scalar<float>(k[k1_idx]);
             float k2 = to_scalar<float>(k[k2_idx]);
-            k_out[k1_idx] = to_scalar<T>(k1 * freqs_cis_cos[cos_sin_idx] -
-                                         k2 * freqs_cis_sin[cos_sin_idx]);
-            k_out[k2_idx] = to_scalar<T>(k2 * freqs_cis_cos[cos_sin_idx] +
-                                         k1 * freqs_cis_sin[cos_sin_idx]);
+            k_out[k1_idx] = to_scalar<T>(k1 * c - k2 * s);
+            k_out[k2_idx] = to_scalar<T>(k2 * c + k1 * s);
         }
     }
 }
 
-template <typename T>
+template <typename T, typename U>
 void rotary_pos_emb_llama_impl(torch::Tensor q, torch::Tensor k,
                                torch::Tensor freqs_cis_cos,
                                torch::Tensor freqs_cis_sin, torch::Tensor q_out,
@@ -114,7 +113,10 @@ void rotary_pos_emb_llama_impl(torch::Tensor q, torch::Tensor k,
                                   stream>>>(
         reinterpret_cast<typename map_to_cuda_type<T>::type *>(q.data_ptr<T>()),
         reinterpret_cast<typename map_to_cuda_type<T>::type *>(k.data_ptr<T>()),
-        freqs_cis_cos.data_ptr<float>(), freqs_cis_sin.data_ptr<float>(),
+        reinterpret_cast<typename map_to_cuda_type<U>::type *>(
+            freqs_cis_cos.data_ptr<U>()),
+        reinterpret_cast<typename map_to_cuda_type<U>::type *>(
+            freqs_cis_sin.data_ptr<U>()),
         reinterpret_cast<typename map_to_cuda_type<T>::type *>(
             q_out.data_ptr<T>()),
         reinterpret_cast<typename map_to_cuda_type<T>::type *>(
@@ -152,14 +154,18 @@ rotary_pos_emb_llama(torch::Tensor q, torch::Tensor k,
                "Tensor q_out should have the same dtype as q");
     ASSERTWITH(k_out->dtype() == k.dtype(),
                "Tensor k_out should have the same dtype as k");
-    ASSERTWITH(freqs_cis_cos.dtype() == torch::kFloat,
-               "Tensor freqs_cis_cos should be float32");
-    ASSERTWITH(freqs_cis_sin.dtype() == torch::kFloat,
-               "Tensor freqs_cis_sin should be float32");
+    ASSERTWITH(
+        freqs_cis_cos.dtype() == freqs_cis_sin.dtype(),
+        "Tensor freqs_cis_cos and freqs_cis_sin should have the same dtype");
 
     DISPATCH_FLOAT_TYPES(q.scalar_type(), "rotary_pos_emb_llama_kernel", [&] {
-        rotary_pos_emb_llama_impl<scalar_t>(q, k, freqs_cis_cos, freqs_cis_sin,
-                                            *q_out, *k_out);
+        using T = scalar_t;
+        DISPATCH_FLOAT_TYPES(
+            freqs_cis_cos.scalar_type(), "rotary_pos_emb_llama_kernel", [&] {
+                using U = scalar_t;
+                rotary_pos_emb_llama_impl<T, U>(q, k, freqs_cis_cos,
+                                                freqs_cis_sin, *q_out, *k_out);
+            });
     });
 
     return std::make_tuple(*q_out, *k_out);

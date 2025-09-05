@@ -133,24 +133,6 @@ def apply_rotary_pos_emb_torch(
         k_embed = (k * cos_k) + (rotate_pairwise(k) * sin_k)
         q_embed, k_embed = q_embed.to(q.dtype), k_embed.to(k.dtype)
 
-    elif rotary_type == "separated-half":
-        q_rot, q_pass = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
-        k_rot, k_pass = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
-        q_rot_embed, k_rot_embed = apply_rotary_pos_emb_torch(
-            q_rot, k_rot, cos, sin, rotary_type="separated"
-        )
-        q_embed = torch.cat([q_rot_embed, q_pass], dim=-1)
-        k_embed = torch.cat([k_rot_embed, k_pass], dim=-1)
-
-    elif rotary_type == "interleaved-half":
-        q_rot, q_pass = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
-        k_rot, k_pass = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
-        q_rot_embed, k_rot_embed = apply_rotary_pos_emb_torch(
-            q_rot, k_rot, cos, sin, rotary_type="interleaved"
-        )
-        q_embed = torch.cat([q_rot_embed, q_pass], dim=-1)
-        k_embed = torch.cat([k_rot_embed, k_pass], dim=-1)
-
     else:
         raise ValueError(f"Unknown rotary type: {rotary_type}")
 
@@ -218,24 +200,6 @@ def apply_rotary_pos_emb_torch_npu(
         ).view(k_shape)
 
         q_embed, k_embed = q_embed.to(q.dtype), k_embed.to(k.dtype)
-
-    elif rotary_type == "separated-half":
-        q_rot, q_pass = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
-        k_rot, k_pass = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
-        q_rot_embed, k_rot_embed = apply_rotary_pos_emb_torch_npu(
-            q_rot, k_rot, cos, sin, rotary_type="separated"
-        )
-        q_embed = torch.cat([q_rot_embed, q_pass], dim=-1)
-        k_embed = torch.cat([k_rot_embed, k_pass], dim=-1)
-
-    elif rotary_type == "interleaved-half":
-        q_rot, q_pass = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
-        k_rot, k_pass = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
-        q_rot_embed, k_rot_embed = apply_rotary_pos_emb_torch_npu(
-            q_rot, k_rot, cos, sin, rotary_type="interleaved"
-        )
-        q_embed = torch.cat([q_rot_embed, q_pass], dim=-1)
-        k_embed = torch.cat([k_rot_embed, k_pass], dim=-1)
 
     else:
         raise ValueError(f"Unknown rotary type: {rotary_type}")
@@ -338,6 +302,7 @@ def apply_rotary_pos_emb(
     q_out: Optional[torch.Tensor] = None,
     k_out: Optional[torch.Tensor] = None,
     rotary_type: str = "separated",
+    inplace: bool = True,
     impl: str = "auto",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -360,13 +325,31 @@ def apply_rotary_pos_emb(
               useful for computing with vector instructions of real types. In some cases (e.g., cases without
               group scaling), "separated" can be transformed to "interleaved" in a mathematical equivalent way
               via weight preprocessing.
-            - "interleaved-half": This is a special case of "interleaved" where only half of the dimensions
-              are rotated, while the remaining half are untouched. This is noted as `partial_rotary_factor=0.5`
-              in Huggingface transformers.
-            - "separated-half": This is a special case of "separated" where only half of the dimensions are
-              rotated, while the remaining half are untouched. This is noted as `partial_rotary_factor=0.5`
-              in Huggingface transformers.
+            - "interleaved-half": LEGACY API. THIS ACTUALLY CALLS `apply_rotary_pos_emb_partial`. This is a
+              special case of "interleaved" where only half of the dimensions are rotated, while the remaining
+              half are untouched. This is noted as `partial_rotary_factor=0.5` in Huggingface transformers.
+            - "separated-half": LEGACY API. THIS ACTUALLY CALLS `apply_rotary_pos_emb_partial`. This is a special
+              case of "separated" where only half of the dimensions are rotated, while the remaining half are
+              untouched. This is noted as `partial_rotary_factor=0.5` in Huggingface transformers.
+        inplace: If true, the operator may touch `q` and `k`.
     """
+
+    if rotary_type in ["interleaved-half", "separated-half"]:
+        assert q.shape[-1] % 2 == 0
+        assert k.shape[-1] % 2 == 0
+        return apply_rotary_pos_emb_partial(
+            q,
+            k,
+            cos,
+            sin,
+            q_rotary_end=q.shape[-1] // 2,
+            k_rotary_end=k.shape[-1] // 2,
+            rotary_type=(
+                "interleaved" if rotary_type == "interleaved-half" else "separated"
+            ),
+            inplace=inplace,
+            impl=impl,
+        )
 
     if impl == "auto":
         if has_cpuinfer and get_global_args().infer.op_impl == "cpu":
@@ -376,13 +359,8 @@ def apply_rotary_pos_emb(
             and k_out is None
             and (
                 rotary_type == "separated"
-                or rotary_type == "separated-half"
                 or (
                     rotary_type == "interleaved"
-                    and hasattr(triton.language, "interleaved")
-                )
-                or (
-                    rotary_type == "interleaved-half"
                     and hasattr(triton.language, "interleaved")
                 )
             )
@@ -396,9 +374,7 @@ def apply_rotary_pos_emb(
             impl = "torch"
 
     if impl == "triton" and has_triton:
-        if rotary_type in ["interleaved", "interleaved-half"] and not hasattr(
-            triton.language, "interleaved"
-        ):
+        if rotary_type == "interleaved" and not hasattr(triton.language, "interleaved"):
             raise RuntimeError(
                 "triton.language.interleave is not supported, please check triton version"
             )
@@ -423,3 +399,101 @@ def apply_rotary_pos_emb(
         return apply_rotary_pos_emb_torch(
             q, k, cos, sin, q_out=q_out, k_out=k_out, rotary_type=rotary_type
         )
+
+
+def apply_rotary_pos_emb_partial(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_rotary_begin: Optional[int] = None,
+    q_rotary_end: Optional[int] = None,
+    k_rotary_begin: Optional[int] = None,
+    k_rotary_end: Optional[int] = None,
+    rotary_type: str = "separated",
+    inplace: bool = True,
+    impl: str = "auto",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Run `apply_rotary_pos_emb` only on a part of the `q` and `k`. Other parts of `q` and `k` are returned as-is.
+
+    This is potentially useful for:
+    1. Implementing partial rotary positional embedding algorithms, like `partial_rotary_factor!=1` in Huggingface
+       transformers.
+    2. Apply positional embedding only on embedded parts in MLA.
+
+    Args:
+        q: Query tensor.
+        k: Key tensor.
+        q_rotary_begin: Index of the first item to apply rotary positional embedding on `q`. Defaults to 0.
+        q_rotary_end: Index of the last item + 1 to apply rotary positional embedding on `q`. Defaults to
+            `q.shape[-1]`.
+        k_rotary_begin: Index of the first item to apply rotary positional embedding on `k`. Defaults to 0.
+        k_rotary_end: Index of the last item + 1 to apply rotary positional embedding on `k`. Defaults to
+            `k.shape[-1]`.
+        cos: Cosine tensor.
+        sin: Sine tensor.
+        rotary_type: Rotary positional embedding type. See `apply_rotary_pos_emb` for details.
+        inplace: If true, the operator may touch `q` and `k`.
+    """
+
+    if q_rotary_begin is None:
+        q_rotary_begin = 0
+    if q_rotary_end is None:
+        q_rotary_end = q.shape[-1]
+    if k_rotary_begin is None:
+        k_rotary_begin = 0
+    if k_rotary_end is None:
+        k_rotary_end = k.shape[-1]
+
+    q_rotary_dim = q_rotary_end - q_rotary_begin
+    k_rotary_dim = k_rotary_end - k_rotary_begin
+    assert q_rotary_dim == k_rotary_dim
+    assert q_rotary_dim == cos.shape[-1] * 2
+    assert q_rotary_dim == sin.shape[-1] * 2
+
+    q_dim = q.shape[-1]
+    k_dim = k.shape[-1]
+    if q_dim == q_rotary_dim and k_dim == k_rotary_dim:
+        return apply_rotary_pos_emb(q, k, cos, sin, rotary_type=rotary_type, impl=impl)
+
+    if inplace:
+        q_rotary_part = q[..., q_rotary_begin:q_rotary_end]
+        k_rotary_part = k[..., k_rotary_begin:k_rotary_end]
+        apply_rotary_pos_emb(
+            q_rotary_part,
+            k_rotary_part,
+            cos,
+            sin,
+            q_out=q_rotary_part,
+            k_out=k_rotary_part,
+            rotary_type=rotary_type,
+            impl=impl,
+        )
+        q_out = q
+        k_out = k
+
+    else:
+        q_rotary_part = q[..., q_rotary_begin:q_rotary_end]
+        k_rotary_part = k[..., k_rotary_begin:k_rotary_end]
+        q_rotary_out, k_rotary_out = apply_rotary_pos_emb(
+            q_rotary_part, k_rotary_part, cos, sin, rotary_type=rotary_type, impl=impl
+        )
+        if q_rotary_begin == 0:
+            q_out = torch.cat([q_rotary_out, q[..., q_rotary_end:]], dim=-1)
+        elif q_rotary_end == q_dim:
+            q_out = torch.cat([q[..., :q_rotary_begin], q_rotary_out], dim=-1)
+        else:
+            q_out = torch.cat(
+                [q[..., :q_rotary_begin], q_rotary_out, q[..., q_rotary_end:]], dim=-1
+            )
+        if k_rotary_begin == 0:
+            k_out = torch.cat([k_rotary_out, k[..., k_rotary_end:]], dim=-1)
+        elif k_rotary_end == k_dim:
+            k_out = torch.cat([k[..., :k_rotary_begin], k_rotary_out], dim=-1)
+        else:
+            k_out = torch.cat(
+                [k[..., :k_rotary_begin], k_rotary_out, k[..., k_rotary_end:]], dim=-1
+            )
+
+    return q_out, k_out
