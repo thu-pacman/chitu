@@ -351,6 +351,21 @@ class TokenizerHF:
         return self.model.decode(t, skip_special_tokens=True)
 
 
+def normalize_dialog(dialog):
+    new_dialog = []
+    for message in dialog:
+        if isinstance(message.get("content"), str):
+            new_dialog.append(
+                {
+                    "role": message["role"],
+                    "content": [{"type": "text", "text": message["content"]}],
+                }
+            )
+        else:
+            new_dialog.append(message)
+    return new_dialog
+
+
 class ChatFormatHF:
     def __init__(self, tokenizer: TokenizerHF, processor: Processor):
         self.tokenizer = tokenizer
@@ -377,7 +392,7 @@ class ChatFormatHF:
     ):
         if self.processor:
             inputs = self.processor.apply_chat_template(
-                dialog,
+                normalize_dialog(dialog),
                 tokenize=True,
                 return_dict=True,
                 add_generation_prompt=True,

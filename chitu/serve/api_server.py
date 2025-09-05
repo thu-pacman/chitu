@@ -12,7 +12,7 @@ import logging
 import os
 import time
 from logging import getLogger
-from typing import Any, List, Optional, Mapping, Annotated
+from typing import Any, List, Optional, Mapping, Annotated, Union
 
 import uvicorn
 import resource
@@ -48,7 +48,7 @@ class HttpHeader(BaseModel):
 
 class Message(BaseModel):
     role: str = "user"
-    content: str = "hello, who are you"
+    content: Union[str, List[Union[str, dict]]] = "hello, who are you"
 
 
 class ChatRequest(BaseModel):
