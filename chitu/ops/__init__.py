@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from chitu.ops.rotary import apply_rotary_pos_emb
+from chitu.ops.rotary import apply_rotary_pos_emb, apply_rotary_pos_emb_partial
 from chitu.ops.activation import silu_and_mul
 from chitu.ops.sampling import multinomial, apply_frequency_penalty, response_append
 from chitu.ops.kv_cache import (

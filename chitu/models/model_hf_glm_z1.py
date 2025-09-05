@@ -60,7 +60,6 @@ class TransformerBlockHFGlmZ1(TransformerBlock):
             self.input_layernorm(x, impl=impl),
             freqs_cis_cos,
             freqs_cis_sin,
-            seq_len,
         )
         h = self.post_self_attn_layernorm(h, impl=impl)
         h += x
