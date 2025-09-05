@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from chitu.attn_backend import AttnBackend
+from chitu.attn_backend import AttnBackend, NpuAttnBackend
 from chitu.cache_manager import PagedKVCacheManager, DenseKVCacheManager
 from chitu.cuda_graph import make_dispatched_graphed_callables
 from chitu.device_type import is_ascend, is_muxi, is_nvidia
@@ -38,6 +38,7 @@ from chitu.utils import (
     is_layer,
     pad_tensor,
     try_import_platform_dep,
+    try_import_opt_dep,
 )
 from chitu.quantization import (
     QuantizationRegistry,
@@ -49,6 +50,7 @@ from chitu.hybrid_device import CPUParameter
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
+cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 
 logger = getLogger(__name__)
@@ -754,7 +756,13 @@ class Transformer(nn.Module):
         if self.do_decode_callable is None:
 
             before_replay_callback = None
-            if is_ascend():
+
+            if is_ascend() and not (
+                infer_args.cache_type == "skew"
+                and NpuAttnBackend.should_use_attn_from_cinfer_ascendc(
+                    self.args.models.type, infer_args.max_reqs
+                )
+            ):
                 before_replay_callback = lambda graph: graph.update(
                     cpu_update_input=[
                         {

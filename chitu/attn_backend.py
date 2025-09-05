@@ -2063,6 +2063,14 @@ class NpuAttnBackend(RefAttnBackend):
         else:
             self.local_n_kv_heads = self.local_n_heads
 
+    @classmethod
+    def should_use_attn_from_cinfer_ascendc(cls, model_type, batch_size):
+        return (
+            hasattr(cinfer_ascendc, "grouped_query_attention")
+            and model_type == "deepseek-v3"
+            or batch_size <= 32
+        )
+
     def prepare_metadata_for_prefill(self, seq_len_delta: BatchedSeqLenDelta):
         """construct attention mask for prefilling, different sequences will not attend each other
         Args:
@@ -2289,9 +2297,7 @@ class NpuAttnBackend(RefAttnBackend):
             impl="torch" if self.args.models.type == "deepseek-v3" else "torch_npu",
         )
 
-        if hasattr(cinfer_ascendc, "grouped_query_attention") and (
-            self.args.models.type == "deepseek-v3" or q.shape[0] <= 8
-        ):
+        if self.should_use_attn_from_cinfer_ascendc(self.args.models.type, q.shape[0]):
             output = torch.empty(
                 (q.shape[0], 1, q.shape[2], kv_cache.v.shape[-1]),
                 dtype=q.dtype,
