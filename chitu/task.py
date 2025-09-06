@@ -204,7 +204,9 @@ class UserRequest:
             raise ValueError(
                 f"prompt length({self.prompt_len}) cannot be greater than max_seq_len({max_seq_len})"
             )
-        self.max_new_tokens = min(self.max_new_tokens, max_seq_len - self.prompt_len)
+        self.max_new_tokens = min(
+            self.max_new_tokens, max_seq_len - self.prompt_len + 1
+        )
 
         TaskLoad.user_req.add(self)
 

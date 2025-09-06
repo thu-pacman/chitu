@@ -246,7 +246,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
             device=device,
         )
 
-        self.max_blocks_per_req = (max_seq_len + block_size - 1) // block_size
+        self.max_blocks_per_req = ceil_div(max_seq_len, block_size)
         self.max_num_blocks = self.max_blocks_per_req * num_hot_req
         if num_blocks == -1:  # Being warmed-up
             # Should be consistent with `_warmup_via_taskpool` in `chitu_main.py`
