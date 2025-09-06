@@ -79,6 +79,10 @@ class NativeLayoutTensor:
     def device(self):
         return self.layout_tensor.device
 
+    @property
+    def dtype(self):
+        return self.layout_tensor.dtype
+
     def to(self, device):
         if isinstance(device, str):
             device = torch.device(device)
@@ -555,3 +559,93 @@ class NpuFractalZnTensor(NativeLayoutTensor):
             .transpose(-1, -2)
             .to(old_device)
         )
+
+
+@dataclass
+class ColumnOddEvenSeparatedTensor(NativeLayoutTensor):
+    """
+    A tensor with its last dimension's odd and even elements separated.
+
+    Plain tensor: [1, 2, 3, 4, 5, 6]
+
+    Layout tensor: [1, 3, 5, 2, 4, 6]
+    """
+
+    @classmethod
+    @override
+    def convert_from(cls, tensor: torch.Tensor) -> "ColumnOddEvenSeparatedTensor":
+        if isinstance(tensor, torch.Tensor):
+            return cls(
+                plain_shape=tensor.shape,
+                layout_tensor=tensor.view(*tensor.shape[:-1], tensor.shape[-1] // 2, 2)
+                .transpose(-1, -2)
+                .contiguous()
+                .view(*tensor.shape),
+            )
+
+        else:
+            raise TypeError(f"Cannot convert from {type(tensor)} to Vector")
+
+    @override
+    def convert_to_plain(self) -> torch.Tensor:
+        return (
+            self.layout_tensor.view(
+                *self.plain_shape[:-1], 2, self.plain_shape[-1] // 2
+            )
+            .transpose(-1, -2)
+            .contiguous()
+            .view(*self.plain_shape)
+        )
+
+
+@dataclass
+class PartialColumnOddEvenSeparatedTensor(NativeLayoutTensor):
+    """
+    Similar to `ColumnOddEvenSeparatedTensor`, but only the `[begin_idx, end_idx)`
+    part of the last dimension is separated.
+    """
+
+    begin_idx: int
+    end_idx: int
+
+    @classmethod
+    @override
+    def convert_from(
+        cls, tensor: torch.Tensor, *, begin_idx, end_idx
+    ) -> "PartialColumnOddEvenSeparatedTensor":
+        if isinstance(tensor, torch.Tensor):
+            layout_tensor = tensor.clone()
+            separated_part = layout_tensor[..., begin_idx:end_idx]
+            separated_part = (
+                separated_part.view(
+                    *separated_part.shape[:-1], separated_part.shape[-1] // 2, 2
+                )
+                .transpose(-1, -2)
+                .contiguous()
+                .view(*separated_part.shape)
+            )
+            layout_tensor[..., begin_idx:end_idx] = separated_part
+            return cls(
+                plain_shape=tensor.shape,
+                layout_tensor=layout_tensor,
+                begin_idx=begin_idx,
+                end_idx=end_idx,
+            )
+
+        else:
+            raise TypeError(f"Cannot convert from {type(tensor)} to Vector")
+
+    @override
+    def convert_to_plain(self) -> torch.Tensor:
+        ret = self.layout_tensor.clone()
+        separated_part = ret[..., self.begin_idx : self.end_idx]
+        separated_part = (
+            separated_part.view(
+                *separated_part.shape[:-1], 2, separated_part.shape[-1] // 2
+            )
+            .transpose(-1, -2)
+            .contiguous()
+            .view(*separated_part.shape)
+        )
+        ret[..., self.begin_idx : self.end_idx] = separated_part
+        return ret

@@ -881,6 +881,10 @@ class RotaryEmbeddingHFLlama(nn.Module):
 
         freqs = torch.outer(t, self.inv_freq)
 
-        dtype = torch.get_default_dtype()
+        dtype = (
+            torch.float32
+            if get_global_args().use_float32_rotary
+            else torch.get_default_dtype()
+        )
         self.register_buffer("cos_cached", freqs.cos().to(dtype), persistent=False)
         self.register_buffer("sin_cached", freqs.sin().to(dtype), persistent=False)

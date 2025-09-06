@@ -252,6 +252,7 @@ class ServeConfig:
     quant: Optional[str] = MISSING
     dtype: Optional[str] = MISSING  # Legacy parameter. To be removed in the future.
     float_16bit_variant: str = MISSING
+    use_float32_rotary: bool = MISSING
     keep_dtype_in_checkpoint: bool = MISSING
     skip_preprocess: bool = MISSING
 

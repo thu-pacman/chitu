@@ -106,16 +106,6 @@ class RMSNorm(nn.Module):
         )
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device=None):
-    freqs = 1.0 / (
-        theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim)
-    )
-    t = torch.arange(end, device=device, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
-
-
 class Attention(nn.Module):
     def __init__(self, layer_id, cache, attn_backend):
         super().__init__()
@@ -625,18 +615,33 @@ class Transformer(nn.Module):
         raise NotImplementedError
 
     def precompute_freqs_cis(self, max_position_embeddings, device):
-        self.freqs_cis = precompute_freqs_cis(
-            self.params.dim // self.params.n_heads,
-            max_position_embeddings * 2,
-            self.params.rope_theta,
-            device=device,
+        dim = (self.params.dim // self.params.n_heads,)
+        freqs = 1.0 / (
+            self.params.rope_theta
+            ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim)
         )
+        t = torch.arange(
+            max_position_embeddings * 2, device=device, dtype=torch.float32
+        )
+        freqs = torch.outer(t, freqs)
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+        rotary_dtype = (
+            torch.float32
+            if get_global_args().use_float32_rotary
+            else torch.get_default_dtype()
+        )
+        self.freqs_cis_real = freqs_cis.real.contiguous().to(rotary_dtype)
+        self.freqs_cis_imag = freqs_cis.imag.contiguous().to(rotary_dtype)
 
     def prepare_freqs_cis(self):
-        curr_freqs_cis = self.freqs_cis[
-            self.cache.seq_len_delta.delta_position_ids_tensor_device
-        ]
-        return curr_freqs_cis.real.contiguous(), curr_freqs_cis.imag.contiguous()
+        return (
+            self.freqs_cis_real[
+                self.cache.seq_len_delta.delta_position_ids_tensor_device
+            ],
+            self.freqs_cis_imag[
+                self.cache.seq_len_delta.delta_position_ids_tensor_device
+            ],
+        )
 
     @torch.inference_mode()
     def prefill_no_pipeline(

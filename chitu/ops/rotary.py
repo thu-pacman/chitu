@@ -14,6 +14,11 @@ from chitu.utils import (
 from chitu.global_vars import get_global_args
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import get_ggml_quant_type
+from chitu.native_layout import (
+    NativeLayoutTensor,
+    ColumnOddEvenSeparatedTensor,
+    PartialColumnOddEvenSeparatedTensor,
+)
 
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 triton, has_triton = try_import_platform_dep("triton")
@@ -215,6 +220,71 @@ def apply_rotary_pos_emb_torch_npu(
     return q_out, k_out
 
 
+def apply_rotary_pos_emb_torch_npu_with_output_layout(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_out: Optional[ColumnOddEvenSeparatedTensor] = None,
+    k_out: Optional[ColumnOddEvenSeparatedTensor] = None,
+    rotary_type: str = "separated",
+) -> Tuple[ColumnOddEvenSeparatedTensor, ColumnOddEvenSeparatedTensor]:
+    if rotary_type != "interleaved":
+        raise NotImplementedError(
+            "apply_rotary_pos_emb_torch_npu_with_output_layout only support interleave"
+        )
+
+    hidden_dim = q.shape[-1]
+    assert k.shape[-1] == hidden_dim
+    assert cos.shape[-1] * 2 == hidden_dim
+    assert sin.shape[-1] * 2 == hidden_dim
+    if hidden_dim != 64:
+        raise NotImplementedError(
+            "apply_rotary_pos_emb_torch_npu_with_output_layout only support hidden_dim=64"
+        )
+
+    cos = torch.cat([cos, cos], dim=-1)
+    sin = torch.cat([sin, sin], dim=-1)
+
+    # Reshape q, k, cos, sin all to batch * head * 1 * dim.
+    #
+    # NOTE: We treat the inputs to only have `batch` but not `seq_len`, to meet the requirements
+    # by `torch_npu.npu_interleave_rope`
+
+    if cos.dim() == 2:  # batch * dim
+        cos = cos.view(cos.shape[0], 1, 1, cos.shape[1])
+
+    if sin.dim() == 2:  # batch * dim
+        sin = sin.view(sin.shape[0], 1, 1, sin.shape[1])
+
+    q_shape = q.shape
+    if q.dim() == 2:  # batch * dim
+        q = q.view(q.shape[0], 1, 1, q.shape[1])
+    elif q.dim() == 3:  # batch * head * dim
+        q = q.view(q.shape[0], q.shape[1], 1, q.shape[2])
+
+    k_shape = k.shape
+    if k.dim() == 2:  # batch * dim
+        k = k.view(k.shape[0], 1, 1, k.shape[1])
+    elif k.dim() == 3:  # batch * head * dim
+        k = k.view(k.shape[0], k.shape[1], 1, k.shape[2])
+
+    q_embed = torch_npu.npu_interleave_rope(q, cos, sin).view(q_shape)
+    k_embed = torch_npu.npu_interleave_rope(k, cos, sin).view(k_shape)
+
+    if q_out is not None:
+        assert isinstance(q_out, ColumnOddEvenSeparatedTensor)
+        q_out.layout_tensor.copy_(q_embed)
+    else:
+        q_out = ColumnOddEvenSeparatedTensor(plain_shape=q_shape, layout_tensor=q_embed)
+    if k_out is not None:
+        assert isinstance(k_out, ColumnOddEvenSeparatedTensor)
+        k_out.layout_tensor.copy_(k_embed)
+    else:
+        k_out = ColumnOddEvenSeparatedTensor(plain_shape=k_shape, layout_tensor=k_embed)
+    return q_out, k_out
+
+
 def apply_rotary_pos_emb_cpu(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -299,12 +369,12 @@ def apply_rotary_pos_emb(
     k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    q_out: Optional[torch.Tensor] = None,
-    k_out: Optional[torch.Tensor] = None,
+    q_out: Optional[torch.Tensor | NativeLayoutTensor] = None,
+    k_out: Optional[torch.Tensor | NativeLayoutTensor] = None,
     rotary_type: str = "separated",
     inplace: bool = True,
     impl: str = "auto",
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor | NativeLayoutTensor, torch.Tensor | NativeLayoutTensor]:
     """
     Rotary positional embedding
 
@@ -332,12 +402,19 @@ def apply_rotary_pos_emb(
               case of "separated" where only half of the dimensions are rotated, while the remaining half are
               untouched. This is noted as `partial_rotary_factor=0.5` in Huggingface transformers.
         inplace: If true, the operator may touch `q` and `k`.
+
+    Returns:
+        [0]: Rotated query
+        [1]: Rotated key
     """
+
+    assert q.dtype == k.dtype
+    assert cos.dtype == sin.dtype
 
     if rotary_type in ["interleaved-half", "separated-half"]:
         assert q.shape[-1] % 2 == 0
         assert k.shape[-1] % 2 == 0
-        return apply_rotary_pos_emb_partial(
+        q_out, k_out, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
             q,
             k,
             cos,
@@ -350,6 +427,7 @@ def apply_rotary_pos_emb(
             inplace=inplace,
             impl=impl,
         )
+        return q_out, k_out
 
     if impl == "auto":
         if has_cpuinfer and get_global_args().infer.op_impl == "cpu":
@@ -369,7 +447,16 @@ def apply_rotary_pos_emb(
         elif rotary_type == "interleaved" and has_chitu_backend:
             impl = "cuda"
         elif has_torch_npu:
-            impl = "torch_npu"
+            if (
+                rotary_type == "interleaved"
+                and q.shape[-1] == 64
+                and q.dtype == cos.dtype
+                and (q_out is None or isinstance(q_out, ColumnOddEvenSeparatedTensor))
+                and (k_out is None or isinstance(k_out, ColumnOddEvenSeparatedTensor))
+            ):
+                impl = "torch_npu_with_output_layout"
+            else:
+                impl = "torch_npu"
         else:
             impl = "torch"
 
@@ -389,6 +476,10 @@ def apply_rotary_pos_emb(
         )
     elif impl == "torch_npu":
         return apply_rotary_pos_emb_torch_npu(
+            q, k, cos, sin, q_out=q_out, k_out=k_out, rotary_type=rotary_type
+        )
+    elif impl == "torch_npu_with_output_layout":
+        return apply_rotary_pos_emb_torch_npu_with_output_layout(
             q, k, cos, sin, q_out=q_out, k_out=k_out, rotary_type=rotary_type
         )
     elif impl == "cpu":
@@ -413,7 +504,16 @@ def apply_rotary_pos_emb_partial(
     rotary_type: str = "separated",
     inplace: bool = True,
     impl: str = "auto",
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[
+    torch.Tensor | NativeLayoutTensor,
+    torch.Tensor | NativeLayoutTensor,
+    torch.Tensor,
+    torch.Tensor | NativeLayoutTensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | NativeLayoutTensor,
+    torch.Tensor,
+]:
     """
     Run `apply_rotary_pos_emb` only on a part of the `q` and `k`. Other parts of `q` and `k` are returned as-is.
 
@@ -435,6 +535,16 @@ def apply_rotary_pos_emb_partial(
         sin: Sine tensor.
         rotary_type: Rotary positional embedding type. See `apply_rotary_pos_emb` for details.
         inplace: If true, the operator may touch `q` and `k`.
+
+    Returns:
+        [0]: Partially rotated query
+        [1]: Partially rotated key
+        [2]: The leading non-rotated part of the query result, which is a slice of return value [0]
+        [3]: The rotated part of the query result, which is a slice of return value [0]
+        [4]: The trailing non-rotated part of the query result, which is a slice of return value [0]
+        [5]: The leading non-rotated part of the key result, which is a slice of return value [1]
+        [6]: The rotated part of the key result, which is a slice of return value [1]
+        [7]: The trailing non-rotated part of the key result, which is a slice of return value [1]
     """
 
     if q_rotary_begin is None:
@@ -452,48 +562,101 @@ def apply_rotary_pos_emb_partial(
     assert q_rotary_dim == cos.shape[-1] * 2
     assert q_rotary_dim == sin.shape[-1] * 2
 
-    q_dim = q.shape[-1]
-    k_dim = k.shape[-1]
-    if q_dim == q_rotary_dim and k_dim == k_rotary_dim:
-        return apply_rotary_pos_emb(q, k, cos, sin, rotary_type=rotary_type, impl=impl)
+    assert q.dtype == k.dtype
+    assert cos.dtype == sin.dtype
+
+    if (
+        impl == "auto"
+        and has_torch_npu
+        and rotary_type == "interleaved"
+        and q_rotary_dim == 64
+        and q.dtype == cos.dtype
+    ):
+        impl = "torch_npu_with_output_layout"
 
     if inplace:
         q_rotary_part = q[..., q_rotary_begin:q_rotary_end]
         k_rotary_part = k[..., k_rotary_begin:k_rotary_end]
+
+        if impl == "torch_npu_with_output_layout":
+            q_rotary_part_out = ColumnOddEvenSeparatedTensor(
+                plain_shape=q_rotary_part.shape, layout_tensor=q_rotary_part
+            )
+            k_rotary_part_out = ColumnOddEvenSeparatedTensor(
+                plain_shape=k_rotary_part.shape, layout_tensor=k_rotary_part
+            )
+        else:
+            q_rotary_part_out = q_rotary_part
+            k_rotary_part_out = k_rotary_part
+
         apply_rotary_pos_emb(
             q_rotary_part,
             k_rotary_part,
             cos,
             sin,
-            q_out=q_rotary_part,
-            k_out=k_rotary_part,
+            q_out=q_rotary_part_out,
+            k_out=k_rotary_part_out,
             rotary_type=rotary_type,
             impl=impl,
         )
+
         q_out = q
         k_out = k
 
     else:
         q_rotary_part = q[..., q_rotary_begin:q_rotary_end]
         k_rotary_part = k[..., k_rotary_begin:k_rotary_end]
-        q_rotary_out, k_rotary_out = apply_rotary_pos_emb(
+        q_rotary_part_out, k_rotary_part_out = apply_rotary_pos_emb(
             q_rotary_part, k_rotary_part, cos, sin, rotary_type=rotary_type, impl=impl
         )
-        if q_rotary_begin == 0:
-            q_out = torch.cat([q_rotary_out, q[..., q_rotary_end:]], dim=-1)
-        elif q_rotary_end == q_dim:
-            q_out = torch.cat([q[..., :q_rotary_begin], q_rotary_out], dim=-1)
-        else:
-            q_out = torch.cat(
-                [q[..., :q_rotary_begin], q_rotary_out, q[..., q_rotary_end:]], dim=-1
-            )
-        if k_rotary_begin == 0:
-            k_out = torch.cat([k_rotary_out, k[..., k_rotary_end:]], dim=-1)
-        elif k_rotary_end == k_dim:
-            k_out = torch.cat([k[..., :k_rotary_begin], k_rotary_out], dim=-1)
-        else:
-            k_out = torch.cat(
-                [k[..., :k_rotary_begin], k_rotary_out, k[..., k_rotary_end:]], dim=-1
-            )
 
-    return q_out, k_out
+        if q.shape[-1] == q_rotary_dim:
+            q_out = q_rotary_part_out
+        else:
+            q_out = q.clone()
+            if impl == "torch_npu_with_output_layout":
+                q_out[..., q_rotary_begin:q_rotary_end] = (
+                    q_rotary_part_out.layout_tensor
+                )
+            else:
+                q_out[..., q_rotary_begin:q_rotary_end] = q_rotary_part_out
+
+        if k.shape[-1] == k_rotary_dim:
+            k_out = k_rotary_part_out
+        else:
+            k_out = k.clone()
+            if impl == "torch_npu_with_output_layout":
+                k_out[..., k_rotary_begin:k_rotary_end] = (
+                    k_rotary_part_out.layout_tensor
+                )
+            else:
+                k_out[..., k_rotary_begin:k_rotary_end] = k_rotary_part_out
+
+    q_out_leading_part = q_out[..., :q_rotary_begin]
+    k_out_leading_part = k_out[..., :k_rotary_begin]
+    q_out_trailing_part = q_out[..., q_rotary_end:]
+    k_out_trailing_part = k_out[..., k_rotary_end:]
+    if impl == "torch_npu_with_output_layout":
+        q_out = PartialColumnOddEvenSeparatedTensor(
+            plain_shape=q_out.shape,
+            layout_tensor=q_out,
+            begin_idx=q_rotary_begin,
+            end_idx=q_rotary_end,
+        )
+        k_out = PartialColumnOddEvenSeparatedTensor(
+            plain_shape=k_out.shape,
+            layout_tensor=k_out,
+            begin_idx=k_rotary_begin,
+            end_idx=k_rotary_end,
+        )
+
+    return (
+        q_out,
+        k_out,
+        q_out_leading_part,
+        q_rotary_part_out,
+        q_out_trailing_part,
+        k_out_leading_part,
+        k_rotary_part_out,
+        k_out_trailing_part,
+    )

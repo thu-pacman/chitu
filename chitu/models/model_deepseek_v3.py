@@ -25,6 +25,7 @@ from chitu.models.model import (
     get_linear_layout_contig_y,
 )
 from chitu.models.registry import ModelType, register_model
+from chitu.native_layout import NativeLayoutTensor
 from chitu.muxi_utils import (
     NormalMoeExpertsMuxiLayout,
     Blockfp8MoeExpertsMuxiLayout,
@@ -214,8 +215,9 @@ class AttentionDeepSeekV3(Attention):
         q = self.q_b_proj(self.q_a_layernorm(q_a, compute_dtype=q_a.dtype))
 
         q = q.view(bs_seq, self.n_local_heads, -1)
+        kv = kv.view(bs_seq, 1, -1)
 
-        apply_rotary_pos_emb_partial(
+        q, kv, q_nope, q_pe, _, kv_lora, k_pe, _ = apply_rotary_pos_emb_partial(
             q,
             kv,
             freqs_cis_cos,
@@ -224,19 +226,11 @@ class AttentionDeepSeekV3(Attention):
             k_rotary_begin=self.kv_lora_rank,
             rotary_type="interleaved",
         )
-        q_nope, q_pe = torch.split(
-            q,
-            [
-                q.shape[-1] - self.qk_rope_head_dim,  # Depends on absorption mode
-                self.qk_rope_head_dim,
-            ],
-            dim=-1,
-        )
-        kv_lora, k_pe = torch.split(
-            kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
 
         if self.mla_absorb == "none":
+            if isinstance(k_pe, NativeLayoutTensor):
+                k_pe = k_pe.convert_to_plain()
+
             kv = self.kv_b_proj(self.kv_a_layernorm(kv_lora))
 
             kv = kv.view(
@@ -255,11 +249,16 @@ class AttentionDeepSeekV3(Attention):
                 dim=-1,
             )
             return q, k, v
-        elif self.mla_absorb == "absorb-without-precomp":
-            q_nope = self.kv_b_proj_absorb_1(q_nope)
+
+        elif self.mla_absorb in ["absorb-without-precomp", "absorb"]:
+            if self.mla_absorb == "absorb-without-precomp":
+                q_nope = self.kv_b_proj_absorb_1(q_nope)
+
+            # In-place update to `kv_lora`, which is part of `kv`
+            self.kv_a_layernorm(kv_lora, compute_dtype=kv.dtype, out=kv_lora)
+
             return q_nope, q_pe, kv
-        elif self.mla_absorb == "absorb":
-            return q_nope, q_pe, kv
+
         else:
             raise NotImplementedError(
                 f"MLA absorb mode {self.mla_absorb} not supported"
@@ -285,17 +284,8 @@ class AttentionDeepSeekV3(Attention):
                 softmax_scale=self.softmax_scale,
             )
 
-        elif self.mla_absorb == "absorb-without-precomp" or self.mla_absorb == "absorb":
+        elif self.mla_absorb in ["absorb-without-precomp", "absorb"]:
             q_nope, q_pe, kv = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
-            q_nope = q_nope.view(bs_seq, self.n_local_heads, -1)
-            q_pe = q_pe.view(bs_seq, self.n_local_heads, -1)
-            kv = kv.view(bs_seq, 1, -1)
-
-            this_kv = kv[..., : self.kv_lora_rank]
-
-            # In-place update to `this_kv`, which is part of `kv`
-            self.kv_a_layernorm(this_kv, compute_dtype=kv.dtype, out=this_kv)
-
             x = self.attn_backend.mla(
                 q_nope,
                 q_pe,
@@ -1271,8 +1261,17 @@ class TransformerDeepSeekV3(Transformer):
         self.freqs_cis = precompute_freqs_cis_deepseek_v3(
             self.params, max_position_embeddings
         )
-        self.freqs_cis_real = self.freqs_cis.real.contiguous().to(device)
-        self.freqs_cis_imag = self.freqs_cis.imag.contiguous().to(device)
+        rotary_dtype = (
+            torch.float32
+            if get_global_args().use_float32_rotary
+            else torch.get_default_dtype()
+        )
+        self.freqs_cis_real = (
+            self.freqs_cis.real.contiguous().to(device).to(rotary_dtype)
+        )
+        self.freqs_cis_imag = (
+            self.freqs_cis.imag.contiguous().to(device).to(rotary_dtype)
+        )
 
     @override
     def prepare_freqs_cis(self):
