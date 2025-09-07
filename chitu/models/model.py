@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from chitu.attn_backend import AttnBackend, NpuAttnBackend
+from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.cache_manager import PagedKVCacheManager, DenseKVCacheManager
 from chitu.cuda_graph import make_dispatched_graphed_callables
 from chitu.device_type import is_ascend, is_muxi, is_nvidia
@@ -119,20 +120,13 @@ class Attention(nn.Module):
     def _run_output_linear(self, x):
         raise NotImplementedError
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis_cos: torch.Tensor,
-        freqs_cis_sin: torch.Tensor,
-    ):
+    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
         bs_seq, _ = x.shape
         xq, xk, xv = self._run_linear(x)
         xq = xq.view(bs_seq, self.n_local_heads, self.head_dim)
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim)
-        xq, xk = apply_rotary_pos_emb(
-            xq, xk, freqs_cis_cos, freqs_cis_sin, rotary_type="interleaved"
-        )
+        xq, xk = apply_rotary_pos_emb(xq, xk, freqs_cis, rotary_type="interleaved")
         output = self.attn_backend(
             xq,
             self.cache.get_accessor(self.layer_id),
@@ -633,8 +627,8 @@ class Transformer(nn.Module):
         self.freqs_cis_real = freqs_cis.real.contiguous().to(rotary_dtype)
         self.freqs_cis_imag = freqs_cis.imag.contiguous().to(rotary_dtype)
 
-    def prepare_freqs_cis(self):
-        return (
+    def prepare_freqs_cis(self) -> BatchedFreqsCis:
+        return BatchedFreqsCis(
             self.freqs_cis_real[
                 self.cache.seq_len_delta.delta_position_ids_tensor_device
             ],
@@ -647,10 +641,10 @@ class Transformer(nn.Module):
     def prefill_no_pipeline(
         self, tokens, output_token_offsets: torch.Tensor, **args
     ) -> torch.Tensor:
-        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis()
+        freqs_cis = self.prepare_freqs_cis()
         h = self._pre_layers(tokens, **args)
         for it, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis_cos, freqs_cis_sin)
+            h = layer(h, freqs_cis)
 
         # Exec post layers AFTER cutting the last token off
         h = h[output_token_offsets]
@@ -659,10 +653,10 @@ class Transformer(nn.Module):
         return h
 
     @torch.inference_mode()
-    def decode_no_pipeline(self, tokens, freqs_cis_cos, freqs_cis_sin):
+    def decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
         h = self._pre_layers(tokens)
         for it, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis_cos, freqs_cis_sin)
+            h = layer(h, freqs_cis)
         h = self._post_layers(h)
         h = h.float()
         return h
@@ -671,7 +665,7 @@ class Transformer(nn.Module):
     def prefill_pipeline(
         self, tokens, output_token_offsets: torch.Tensor, **args
     ) -> torch.Tensor:
-        freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis()
+        freqs_cis = self.prepare_freqs_cis()
 
         # start of model
         if self.pp_stage == 0:
@@ -681,7 +675,7 @@ class Transformer(nn.Module):
 
         # layers
         for it, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis_cos, freqs_cis_sin)
+            h = layer(h, freqs_cis)
 
         # end of model
         if self.pp_stage == self.pp_end_stage:
@@ -693,13 +687,13 @@ class Transformer(nn.Module):
         return h
 
     @torch.inference_mode()
-    def decode_pipeline(self, tokens, freqs_cis_cos, freqs_cis_sin):
+    def decode_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
         if self.pp_stage == 0:
             h = self._pre_layers(tokens)
         else:
             h = tokens
         for it, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis_cos, freqs_cis_sin)
+            h = layer(h, freqs_cis)
         if self.pp_stage == self.pp_end_stage:
             h = self._post_layers(h)
             h = h.float()
@@ -788,11 +782,11 @@ class Transformer(nn.Module):
                 enable=current_cuda_graph_enabled,
             )
             def do_decode(tokens):
-                freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis()
+                freqs_cis = self.prepare_freqs_cis()
                 if self.pipeline_exec:
-                    return self.decode_pipeline(tokens, freqs_cis_cos, freqs_cis_sin)
+                    return self.decode_pipeline(tokens, freqs_cis)
                 else:
-                    return self.decode_no_pipeline(tokens, freqs_cis_cos, freqs_cis_sin)
+                    return self.decode_no_pipeline(tokens, freqs_cis)
 
             self.do_decode_callable = do_decode
 

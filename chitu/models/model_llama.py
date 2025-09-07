@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from chitu.attn_backend import AttnBackend
+from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.models.model import Attention, RMSNorm, Transformer, TransformerBlock
 from chitu.models.registry import ModelType, register_model
 from chitu.tensor_parallel import (
@@ -207,13 +208,8 @@ class TransformerBlockLlama(TransformerBlock):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis_cos: torch.Tensor,
-        freqs_cis_sin: torch.Tensor,
-    ):
-        h = self.attention(self.attention_norm(x), freqs_cis_cos, freqs_cis_sin)
+    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
+        h = self.attention(self.attention_norm(x), freqs_cis)
         h += x
         out = h + self.feed_forward(self.ffn_norm(h))
         return out

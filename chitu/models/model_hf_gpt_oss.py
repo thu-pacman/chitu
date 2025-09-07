@@ -10,6 +10,7 @@ from typing import Any, List, Mapping, Optional
 from typing_extensions import override
 
 from chitu.attn_backend import AttnBackend
+from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.distributed.parallel_state import get_tp_size, get_ep_size, get_tp_group
 from chitu.models.model import MoeGate, ParallelMoeBlock
 from chitu.models.model_hf_llama import (
@@ -44,12 +45,7 @@ class AttentionHFGptOss(AttentionHFLlama):
         self.sliding_window = 128 if layer_id % 2 == 0 else -1
         self.sinks = nn.Parameter(torch.empty(self.n_local_heads))
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis_cos: torch.Tensor,
-        freqs_cis_sin: torch.Tensor,
-    ):
+    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
         # 因为量化后x是个tuple，所以取shape的时候放linear后面
         xq, xk, xv = self._run_linear(x)
 
@@ -63,13 +59,7 @@ class AttentionHFGptOss(AttentionHFLlama):
         if hasattr(self, "k_norm"):
             xk = self.k_norm(xk)
 
-        xq, xk = apply_rotary_pos_emb(
-            xq,
-            xk,
-            freqs_cis_cos,
-            freqs_cis_sin,
-            rotary_type=self.rotary_type,
-        )
+        xq, xk = apply_rotary_pos_emb(xq, xk, freqs_cis, rotary_type=self.rotary_type)
 
         output = self.attn_backend(
             xq,

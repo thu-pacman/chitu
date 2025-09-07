@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from chitu.attn_backend import AttnBackend
+from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.global_vars import get_global_args
 from chitu.models.model import (
     Attention,
@@ -197,8 +198,7 @@ class AttentionHFLlama(Attention):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis_cos: torch.Tensor,
-        freqs_cis_sin: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
     ):
         # 因为量化后x是个tuple，所以取shape的时候放linear后面
         xq, xk, xv = self._run_linear(x)
@@ -213,13 +213,7 @@ class AttentionHFLlama(Attention):
         if hasattr(self, "k_norm"):
             xk = self.k_norm(xk)
 
-        xq, xk = apply_rotary_pos_emb(
-            xq,
-            xk,
-            freqs_cis_cos,
-            freqs_cis_sin,
-            rotary_type=self.rotary_type,
-        )
+        xq, xk = apply_rotary_pos_emb(xq, xk, freqs_cis, rotary_type=self.rotary_type)
 
         output = self.attn_backend(
             xq,
@@ -359,14 +353,9 @@ class TransformerBlockHFLlama(TransformerBlock):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis_cos: torch.Tensor,
-        freqs_cis_sin: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
     ):
-        h = self.self_attn(
-            self.input_layernorm(x, impl=get_rms_norm_impl()),
-            freqs_cis_cos,
-            freqs_cis_sin,
-        )
+        h = self.self_attn(self.input_layernorm(x, impl=get_rms_norm_impl()), freqs_cis)
         h += x
         out = h + self.mlp(self.post_attention_layernorm(h, impl=get_rms_norm_impl()))
 
@@ -796,8 +785,9 @@ class TransformerHFLlama(Transformer):
             device=device,
         )
 
-    def prepare_freqs_cis(self):
-        return (
+    @override
+    def prepare_freqs_cis(self) -> BatchedFreqsCis:
+        return BatchedFreqsCis(
             self.rotary_emb.cos_cached[
                 self.cache.seq_len_delta.delta_position_ids_tensor_device
             ],

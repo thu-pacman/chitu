@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from chitu.attn_backend import AttnBackend
+from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.global_vars import get_global_args
 from chitu.models.model import (
     Attention,
@@ -199,7 +200,7 @@ class AttentionDeepSeekV3(Attention):
         )
         self.softmax_scale = compute_softmax_scale_deepseek_v3(args)
 
-    def _run_linear(self, x, freqs_cis_cos, freqs_cis_sin):
+    def _run_linear(self, x, freqs_cis: BatchedFreqsCis):
         bs_seq, _ = x.size()
         assert self.q_lora_rank > 0
         if self.merge_qkv:
@@ -220,8 +221,7 @@ class AttentionDeepSeekV3(Attention):
         q, kv, q_nope, q_pe, _, kv_lora, k_pe, _ = apply_rotary_pos_emb_partial(
             q,
             kv,
-            freqs_cis_cos,
-            freqs_cis_sin,
+            freqs_cis,
             q_rotary_begin=q.shape[-1] - self.qk_rope_head_dim,
             k_rotary_begin=self.kv_lora_rank,
             rotary_type="interleaved",
@@ -264,16 +264,11 @@ class AttentionDeepSeekV3(Attention):
                 f"MLA absorb mode {self.mla_absorb} not supported"
             )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis_cos: torch.Tensor,
-        freqs_cis_sin: torch.Tensor,
-    ):
+    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
         bs_seq, _ = x.size()
 
         if self.mla_absorb == "none":
-            q, k, v = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
+            q, k, v = self._run_linear(x, freqs_cis)
             x = self.attn_backend(
                 q,
                 self.cache.get_accessor(self.layer_id),
@@ -285,7 +280,7 @@ class AttentionDeepSeekV3(Attention):
             )
 
         elif self.mla_absorb in ["absorb-without-precomp", "absorb"]:
-            q_nope, q_pe, kv = self._run_linear(x, freqs_cis_cos, freqs_cis_sin)
+            q_nope, q_pe, kv = self._run_linear(x, freqs_cis)
             x = self.attn_backend.mla(
                 q_nope,
                 q_pe,
@@ -582,16 +577,9 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         self.input_layernorm = RMSNorm(args.dim)
         self.post_attention_layernorm = RMSNorm(args.dim)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis_cos: torch.Tensor,
-        freqs_cis_sin: torch.Tensor,
-    ):
+    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
         x = x + self.self_attn(
-            self.input_layernorm(x, compute_dtype=x.dtype),
-            freqs_cis_cos,
-            freqs_cis_sin,
+            self.input_layernorm(x, compute_dtype=x.dtype), freqs_cis
         )
         x = x + self.mlp(self.post_attention_layernorm(x, compute_dtype=x.dtype))
         return x
@@ -1274,9 +1262,9 @@ class TransformerDeepSeekV3(Transformer):
         )
 
     @override
-    def prepare_freqs_cis(self):
+    def prepare_freqs_cis(self) -> BatchedFreqsCis:
         index = self.cache.seq_len_delta.delta_position_ids_tensor_device
-        return self.freqs_cis_real[index], self.freqs_cis_imag[index]
+        return BatchedFreqsCis(self.freqs_cis_real[index], self.freqs_cis_imag[index])
 
     @override
     def prepare_decoding_attn(self):

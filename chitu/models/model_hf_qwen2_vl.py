@@ -14,6 +14,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from chitu.attn_backend import AttnBackend, RefAttnBackend
+from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.global_vars import get_global_args
 from chitu.models.model import (
@@ -229,8 +230,7 @@ class VisionAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        rotary_pos_emb: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        position_embeddings: BatchedFreqsCis,
         **kwargs,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
@@ -240,17 +240,8 @@ class VisionAttention(nn.Module):
             .permute(1, 0, 2, 3)
             .unbind(0)
         )
-        if position_embeddings is None:
-            cos = rotary_pos_emb.cos()
-            sin = rotary_pos_emb.sin()
-        else:
-            cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(
-            query_states,
-            key_states,
-            cos,
-            sin,
-            rotary_type="separated",
+            query_states, key_states, position_embeddings, rotary_type="separated"
         )
 
         lengths = cu_seqlens[1:] - cu_seqlens[:-1]
@@ -320,14 +311,12 @@ class VisionBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        rotary_pos_emb: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        position_embeddings: BatchedFreqsCis,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
-            rotary_pos_emb=rotary_pos_emb,
             position_embeddings=position_embeddings,
             **kwargs,
         )
@@ -490,7 +479,9 @@ class VisionTransformer(nn.Module):
         )
         rotary_pos_emb = rotary_pos_emb[window_index, :, :]
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-        position_embeddings = (rotary_pos_emb.cos(), rotary_pos_emb.sin())
+        position_embeddings = BatchedFreqsCis(
+            rotary_pos_emb.cos(), rotary_pos_emb.sin()
+        )
 
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]

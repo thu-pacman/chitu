@@ -5,6 +5,7 @@
 import torch
 
 from chitu.attn_backend import AttnBackend
+from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.models.model import RMSNorm, TransformerBlock
 from chitu.models.model_hf_llama import (
     AttentionHFLlama,
@@ -51,16 +52,11 @@ class TransformerBlockHFGlmZ1(TransformerBlock):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis_cos: torch.Tensor,
-        freqs_cis_sin: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
         seq_len=None,
     ):
         impl = get_rms_norm_impl()
-        h = self.self_attn(
-            self.input_layernorm(x, impl=impl),
-            freqs_cis_cos,
-            freqs_cis_sin,
-        )
+        h = self.self_attn(self.input_layernorm(x, impl=impl), freqs_cis)
         h = self.post_self_attn_layernorm(h, impl=impl)
         h += x
         out = h + self.post_mlp_layernorm(

@@ -2,6 +2,7 @@ import pytest
 import math
 import torch
 
+from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.ops import apply_rotary_pos_emb
 from chitu.native_layout import NativeLayoutTensor, ColumnOddEvenSeparatedTensor
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
@@ -84,14 +85,16 @@ def test_apply_rotary_pos_emb(
         * 2
         * math.pi,
     )
-    cos = complex_freqs.real.contiguous().to(freqs_dtype)
-    sin = complex_freqs.imag.contiguous().to(freqs_dtype)
+    freqs_cis = BatchedFreqsCis(
+        complex_freqs.real.contiguous().to(freqs_dtype),
+        complex_freqs.imag.contiguous().to(freqs_dtype),
+    )
 
     out_q, out_k = apply_rotary_pos_emb(
-        q, k, cos, sin, rotary_type=rotary_type, impl=impl
+        q, k, freqs_cis, rotary_type=rotary_type, impl=impl
     )
     out_q_torch, out_k_torch = apply_rotary_pos_emb(
-        q, k, cos, sin, rotary_type=rotary_type, impl="torch"
+        q, k, freqs_cis, rotary_type=rotary_type, impl="torch"
     )
 
     if isinstance(out_q, NativeLayoutTensor):
@@ -180,8 +183,10 @@ def test_apply_rotary_pos_emb_in_place(
         * 2
         * math.pi,
     )
-    cos = complex_freqs.real.contiguous().to(freqs_dtype)
-    sin = complex_freqs.imag.contiguous().to(freqs_dtype)
+    freqs_cis = BatchedFreqsCis(
+        complex_freqs.real.contiguous().to(freqs_dtype),
+        complex_freqs.imag.contiguous().to(freqs_dtype),
+    )
 
     q_clone = q.clone()
     k_clone = k.clone()
@@ -199,15 +204,14 @@ def test_apply_rotary_pos_emb_in_place(
     apply_rotary_pos_emb(
         q_clone,
         k_clone,
-        cos,
-        sin,
+        freqs_cis,
         rotary_type=rotary_type,
         q_out=out_q,
         k_out=out_k,
         impl=impl,
     )
     out_q_torch, out_k_torch = apply_rotary_pos_emb(
-        q, k, cos, sin, rotary_type=rotary_type, impl="torch"
+        q, k, freqs_cis, rotary_type=rotary_type, impl="torch"
     )
 
     if isinstance(out_q, NativeLayoutTensor):
