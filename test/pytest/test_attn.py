@@ -11,7 +11,6 @@ from chitu.attn_backend import (
     NpuAttnBackend,
 )
 from chitu.cache_manager import PagedKVCacheAccessor, DenseKVCacheAccessor
-from chitu.device_type import is_muxi
 from chitu.global_vars import set_global_args
 from chitu.utils import (
     try_import_opt_dep,
@@ -61,7 +60,6 @@ def test_mla_prefill_ragged_qkvo(
         OmegaConf.create(
             {
                 "infer": {
-                    "mla_absorb": None,
                     "max_reqs": 4,
                     "op_impl": "torch",
                     "use_cuda_graph": False,
@@ -162,7 +160,6 @@ def test_mla_prefill_ragged_qo_paged_kv(
         OmegaConf.create(
             {
                 "infer": {
-                    "mla_absorb": None,
                     "max_reqs": 4,
                     "op_impl": "torch",
                     "use_cuda_graph": False,
@@ -290,7 +287,6 @@ def test_mla_decode_paged_kv(
         OmegaConf.create(
             {
                 "infer": {
-                    "mla_absorb": None,
                     "max_reqs": bs,
                     "use_cuda_graph": False,
                     "tp_size": 1,
@@ -537,7 +533,6 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
     )
     batch_size = seq_len_delta.batch_size
     num_blocks = 40
-    block_size = 256
     if impl == "triton":
         attn_backend = TritonAttnBackend()
     elif impl == "flash_attn":

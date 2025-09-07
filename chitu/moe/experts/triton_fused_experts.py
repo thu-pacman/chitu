@@ -1214,9 +1214,6 @@ def fused_experts_impl(
     intermediate_cache1 = torch.empty(
         (M, top_k_num, N), device=hidden_states.device, dtype=hidden_states.dtype
     )
-    intermediate_cache2 = torch.empty(
-        (M * top_k_num, N // 2), device=hidden_states.device, dtype=hidden_states.dtype
-    )
     intermediate_cache3 = torch.empty(
         (M, top_k_num, w2.shape[1]),
         device=hidden_states.device,

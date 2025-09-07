@@ -11,13 +11,12 @@ import asyncio
 import time
 from enum import Enum
 from logging import getLogger
-from typing import List, Optional, Dict, Any
-from uuid import UUID
+from typing import Optional, Dict, Any
 import os
 import torch
 
 from chitu.scheduler import Scheduler
-from chitu.task import TaskPool, TaskType, Task
+from chitu.task import TaskType, Task
 from chitu.global_vars import get_global_args
 from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
     KVManager,
@@ -26,8 +25,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
 )
-from chitu.distributed.pd_disaggregation.pd_types import PDRequestStatus, SchedulerType
-from chitu.batched_seq_len import BatchedSeqLen
+from chitu.distributed.pd_disaggregation.pd_types import PDRequestStatus
 
 logger = getLogger(__name__)
 
@@ -103,8 +101,6 @@ class PDScheduler(Scheduler):
             return
 
         try:
-            # args = get_global_args()
-
             # Create metadata buffers
             buffer_size = max(self.prefill_num_tasks, self.decode_num_tasks) * 2
             self.metadata_buffers = MetadataBuffers(buffer_size)
@@ -389,7 +385,6 @@ class PDScheduler(Scheduler):
             TaskType,
             SerializedPackedTasksPayloadType,
         )
-        from chitu.global_vars import get_global_args
 
         logger.info(f"executing prefill for task: {task.task_id}")
 

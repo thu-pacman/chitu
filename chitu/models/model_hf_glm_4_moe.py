@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.models.model import RMSNorm
-from chitu.models.model_hf_llama import TransformerHFLlama, TransformerBlockHFLlama
+from chitu.models.model_hf_llama import TransformerBlockHFLlama
 from chitu.models.model_hf_qwen2_vl import (
     VisionMLP,
     VisionPatchEmbed,
@@ -30,7 +30,6 @@ from chitu.muxi_utils import (
     NormalMoeExpertsMuxiLayout,
     Blockfp8MoeExpertsMuxiLayout,
 )
-from chitu.quantization import QuantizationRegistry
 from chitu.tensor_parallel import LocalLinear
 
 

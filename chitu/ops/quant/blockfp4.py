@@ -318,7 +318,6 @@ def blockfp4_gemm(
         return (x + y - 1) // y * y
 
     rounded_m = round_up(x.shape[0], 128)
-    k = x.shape[-1]
 
     if x.ndim > 2:
         x = x.view(-1, x.shape[-1])

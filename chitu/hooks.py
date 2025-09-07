@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-from typing import List, Optional, Protocol
+from typing import List, Protocol
 import logging
 
 

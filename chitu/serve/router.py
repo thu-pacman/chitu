@@ -11,7 +11,6 @@ import asyncio
 import logging
 from logging import getLogger
 
-from chitu.backend import Backend
 from chitu.global_vars import get_global_args
 
 logger = getLogger(__name__)

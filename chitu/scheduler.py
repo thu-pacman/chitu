@@ -4,7 +4,7 @@
 
 import time
 from logging import getLogger
-from typing import Iterable, List, Optional  # Please keep Python 3.8 compatible
+from typing import List, Optional  # Please keep Python 3.8 compatible
 from typing_extensions import override
 
 from chitu.task import TaskPool, TaskType, DPTaskCollector

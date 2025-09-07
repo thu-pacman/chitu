@@ -221,7 +221,6 @@ class DPTokenSender:
             self._send_data(data)
 
             if request_id in self.request_token_cache:
-                cache_size = len(self.request_token_cache[request_id])
                 del self.request_token_cache[request_id]
 
             last_decoded_len_key = f"_last_decoded_len_{request_id}"
@@ -247,7 +246,6 @@ class DPTokenSender:
             self._send_data(data)
 
             if request_id in self.request_token_cache:
-                cache_size = len(self.request_token_cache[request_id])
                 del self.request_token_cache[request_id]
 
             last_decoded_len_key = f"_last_decoded_len_{request_id}"

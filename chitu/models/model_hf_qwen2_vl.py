@@ -2,27 +2,18 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import math
 from logging import getLogger
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import List, Optional
 from typing_extensions import override
-from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 
 from chitu.attn_backend import AttnBackend, RefAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.batched_seq_len import BatchedSeqLenDelta
-from chitu.global_vars import get_global_args
-from chitu.models.model import (
-    Attention,
-    RMSNorm,
-    Transformer,
-    TransformerBlock,
-)
+from chitu.models.model import RMSNorm
 from chitu.models.model_hf_llama import (
     TransformerBlockHFLlama,
     TransformerHFLlama,

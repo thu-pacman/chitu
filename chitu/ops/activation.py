@@ -67,10 +67,6 @@ def silu_and_mul_cpu(x: torch.Tensor):
     if not x.is_contiguous():
         x = x.contiguous()
 
-    output_shape = list(x.shape)
-    output_shape[-1] = output_shape[-1] // 2
-    output = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-
     config = cpuinfer.silu_and_mul.SiluAndMulConfig(
         input_size,
         1024,

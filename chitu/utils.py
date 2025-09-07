@@ -14,7 +14,6 @@ from typing import Any, List, Tuple
 import socket
 import site
 
-import numpy as np
 import torch
 import importlib
 from chitu.device_type import is_ascend

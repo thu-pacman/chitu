@@ -10,11 +10,7 @@ import torch
 
 from chitu.attn_backend import AttnBackend
 from chitu.models.model import MoeGate, ParallelMoeBlock
-from chitu.models.model_hf_llama import (
-    FeedForwardHFLlama,
-    TransformerBlockHFLlama,
-    TransformerHFLlama,
-)
+from chitu.models.model_hf_llama import TransformerBlockHFLlama, TransformerHFLlama
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
 from chitu.distributed.parallel_state import get_tp_size, get_ep_size

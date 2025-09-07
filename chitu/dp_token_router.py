@@ -9,18 +9,16 @@ Responsible for receiving tokens returned from each DP group and forwarding them
 
 import asyncio
 import time
-import threading
 from collections import defaultdict, deque
-from typing import Dict, List, Optional, Any
+from typing import Dict, Any
 import zmq
 import zmq.asyncio
 import msgpack
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse, JSONResponse
+import logging
+
 from chitu.async_response import AsyncDataStream, AsyncResponse
 from chitu.task import UserRequest
 from chitu.dp_request_router import get_request_router
-import logging
 
 logger = logging.getLogger(__name__)
 

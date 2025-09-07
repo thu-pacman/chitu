@@ -16,7 +16,6 @@ import msgpack
 import zmq
 import zmq.asyncio
 
-from chitu.global_vars import get_global_args
 from chitu.distributed.parallel_state import get_tp_group
 from chitu.distributed.pd_disaggregation.pd_scheduler import (
     PDScheduler,

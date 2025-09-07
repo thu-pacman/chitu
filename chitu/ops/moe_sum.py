@@ -34,9 +34,9 @@ def moe_sum(
             impl = "torch"
 
     if impl == "triton":
-        return moe_sum_triton(input_tensor, output_tensor)
+        moe_sum_triton(input_tensor, output_tensor)
     elif impl == "torch":
-        return moe_sum_torch(input_tensor, output_tensor)
+        moe_sum_torch(input_tensor, output_tensor)
     else:
         raise ValueError(f"Unknown implementation: {impl}")
 

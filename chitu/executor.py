@@ -16,7 +16,6 @@ import torch
 import torch.distributed
 
 from chitu.backend import Backend, BackendState
-from chitu.cache_manager import PagedKVCacheManager
 from chitu.global_vars import get_timers, get_global_args
 from chitu.task import (
     PackedTasks,
@@ -40,7 +39,6 @@ from chitu.hooks import TokenSink, LocalTokenSink, KVTransferHook, NoopKVTransfe
 from chitu.utils import top_k_top_p_min_p_sampling_from_probs_torch
 from chitu.ops import apply_frequency_penalty, response_append
 from chitu.device_list import DeviceList
-from chitu.batched_seq_len import BatchedSeqLen
 
 logger = getLogger(__name__)
 

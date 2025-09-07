@@ -14,9 +14,7 @@ import hydra
 import torch
 import torch.distributed
 
-from chitu.backend import Backend
 from chitu.chitu_main import chitu_init, warmup_engine_unified
-from chitu.global_vars import get_global_args, set_global_args
 from chitu.schemas import ServeConfig
 from chitu.serve.api_server import init_dp_router, start_unicorn
 from chitu.serve.common import start_worker

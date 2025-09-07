@@ -84,7 +84,6 @@ def append_to_dense_kv_cache_triton(
 
     assert delta_position_ids.is_contiguous()
 
-    batch_size = kv_cache.shape[0]
     num_tokens = this_kv.shape[0]
     assert delta_position_ids.shape[0] == num_tokens
     if delta_seq_ids is not None:

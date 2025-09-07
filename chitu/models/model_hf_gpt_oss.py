@@ -12,14 +12,13 @@ from typing_extensions import override
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.distributed.parallel_state import get_tp_size, get_ep_size, get_tp_group
-from chitu.models.model import MoeGate, ParallelMoeBlock
+from chitu.models.model import ParallelMoeBlock
 from chitu.models.model_hf_llama import (
     AttentionHFLlama,
     TransformerHFLlama,
     TransformerBlockHFLlama,
     apply_rotary_pos_emb,
 )
-from chitu.models.model_hf_qwen_3_moe import Qwen3MoeExperts
 from chitu.models.registry import ModelType, register_model
 from chitu.ops import linear
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout

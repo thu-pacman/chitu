@@ -6,7 +6,6 @@ Validates whether requests are correctly routed to different Schedulers
 """
 
 import requests
-import json
 import time
 import threading
 from collections import Counter

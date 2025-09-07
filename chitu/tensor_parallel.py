@@ -12,14 +12,10 @@ import torch
 from typing import Optional, Mapping, Any
 from logging import getLogger
 
-from chitu.global_vars import get_global_args
 from chitu.quantization import QuantizationRegistry
 from chitu.device_type import is_ascend
 from chitu.distributed.parallel_state import get_tp_group, get_tp_size
-from chitu.quantization import (
-    QuantizationRegistry,
-    get_quant_from_checkpoint_prefix,
-)
+from chitu.quantization import QuantizationRegistry
 
 logger = getLogger(__name__)
 

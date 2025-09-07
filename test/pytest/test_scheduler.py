@@ -3,7 +3,7 @@ from omegaconf import OmegaConf
 
 from chitu.task import Task, TaskPool, MockFixedLengthedUserRequest
 from chitu.scheduler import Scheduler
-from chitu.global_vars import set_global_args, get_global_args
+from chitu.global_vars import set_global_args
 from chitu.backend import Backend
 import pytest
 from chitu.task_type import TaskType
