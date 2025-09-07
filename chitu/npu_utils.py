@@ -56,6 +56,7 @@ def fused_experts_npu(
     w1_scale=None,
     w2_scale=None,
     experts_start_idx=0,
+    use_int8_w8a8=False,
     **kwargs,
 ):
 
@@ -68,7 +69,7 @@ def fused_experts_npu(
         topk_ids *= ~mask
 
     # Check constraints.
-    if not get_global_args().infer.npu_fusion_fp4:
+    if not get_global_args().infer.npu_fusion_fp4 and not use_int8_w8a8:
         assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
@@ -95,6 +96,13 @@ def fused_experts_npu(
 
     expert_tokens = torch_npu.npu_moe_compute_expert_tokens(expanded_expert_idx, E)
     expert_tokens = expert_tokens.to(torch.int64)
+    if use_int8_w8a8:
+        counts = torch.empty_like(expert_tokens)
+        counts[0] = expert_tokens[0]
+        counts[1:] = expert_tokens[1:] - expert_tokens[:-1]
+        expanded_x, dynamic_scale = torch_npu.npu_dynamic_quant(expanded_x)
+        expanded_x = expanded_x.contiguous()
+        dynamic_scale = dynamic_scale.to(torch.float32).contiguous()
 
     if get_global_args().infer.npu_fusion_fp4:
         gate_up_out = fused_group_matmul(
@@ -104,19 +112,34 @@ def fused_experts_npu(
             expert_tokens=expert_tokens,
         )
     else:
-        w1 = w1.transpose(1, 2)
-        gate_up_out_list = torch_npu.npu_grouped_matmul(
+        w1 = w1.transpose(1, 2) if not use_int8_w8a8 else w1
+        gate_up_out = torch_npu.npu_grouped_matmul(
             x=[expanded_x],
             weight=[w1],
             split_item=2,
             group_list_type=0,
             group_type=0,
             group_list=expert_tokens,
-        )
-        # TODO: Remove this in the future.
-        gate_up_out = torch.cat(gate_up_out_list, dim=0)
+            output_dtype=(
+                torch.int32 if use_int8_w8a8 else None
+            ),  # None means output dytpe same as input dtype
+        )[0]
 
-    gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+    if use_int8_w8a8:
+        w1_scale_fp32 = w1_scale.to(torch.float32).contiguous()
+        gate_up_out, gate_up_out_scale = torch_npu.npu_dequant_swiglu_quant(
+            x=gate_up_out,
+            weight_scale=w1_scale_fp32,
+            activation_scale=dynamic_scale,
+            bias=None,
+            quant_scale=None,
+            quant_offset=None,
+            group_index=counts,  # Only support group_list_type=1, so use expert counts
+            activate_left=True,
+            quant_mode=1,
+        )
+    else:
+        gate_up_out = torch_npu.npu_swiglu(gate_up_out)
 
     if get_global_args().infer.npu_fusion_fp4:
         down_out_list = fused_group_matmul(
@@ -126,16 +149,20 @@ def fused_experts_npu(
             expert_tokens=expert_tokens,
         )
     else:
-        w2 = w2.transpose(1, 2)
+        w2 = w2.transpose(1, 2) if not use_int8_w8a8 else w2
         down_out_list = torch_npu.npu_grouped_matmul(
             x=[gate_up_out],
             weight=[w2],
+            scale=[w2_scale.contiguous()] if use_int8_w8a8 else None,
+            per_token_scale=[gate_up_out_scale] if use_int8_w8a8 else None,
             split_item=2,
             group_list_type=0,
             group_type=0,
             group_list=expert_tokens,
-        )
-        down_out_list = torch.cat(down_out_list, dim=0)
+            output_dtype=(
+                w2_scale.dtype if use_int8_w8a8 else None
+            ),  # make sure the output dtype is bf16
+        )[0]
 
     # TODO: Reorder device memory 2 times here, replace the current
     # implementation here when suitable operators become available.

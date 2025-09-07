@@ -11,7 +11,6 @@ from chitu.task import TaskPool, TaskType, DPTaskCollector
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.utils import ceil_div
 from chitu.distributed.parallel_state import get_dp_group
-
 from chitu.backend import Backend
 from chitu.task import (
     PackedTasksBase,
@@ -255,10 +254,8 @@ class Scheduler:
                 > get_global_args().infer.max_seq_len * self.prefill_num_tasks
             ):
                 return False
-            num_needed_block += (prefix_token_len + block_size - 1) // block_size
-            if num_needed_block + num_used_block <= self.kvcache_block_threshold:
-                return True
-            return False
+            num_needed_block += ceil_div(prefix_token_len, block_size)
+            return num_needed_block + num_used_block <= self.kvcache_block_threshold
 
         while has_enough_block(num_tasks):
             num_tasks += 1
@@ -269,7 +266,7 @@ class Scheduler:
             and num_used_block == 0
         ):
             prefix_len = TaskPool.pool[prefill_task_ids[0]].prefix_tokens_len
-            raise Exception(
+            raise RuntimeError(
                 f"KV_cache capacity is insufficient to support prefilling (batch_size=1, prefix_len={prefix_len})"
             )
 

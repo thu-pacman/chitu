@@ -20,6 +20,8 @@
   用法: 启动赤兔时追加 `models=DeepSeek-R1-fp4-all` 启动参数
 - DeepSeek-R1-fp4-mix
   用法: 启动赤兔时追加 `models=DeepSeek-R1-fp4-mix` 启动参数
+- DeepSeek-R1-int8-ascend
+  用法: 启动赤兔时追加 `models=DeepSeek-R1-int8-ascend` 启动参数
 - DeepSeek-V3
   用法: 启动赤兔时追加 `models=DeepSeek-V3` 启动参数
 - DeepSeek-V3.1

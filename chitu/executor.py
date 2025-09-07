@@ -500,21 +500,20 @@ class Executor:
         )
 
     def step(self, tasks: Optional[PackedTasksBase]) -> torch.Tensor:
-        remove_kvcache = False
-
         # 1. propagate tasks and handle special payload type
         payload_type = tasks.payload_type if tasks is not None else None
         for dispatcher in self.task_dispatchers:
             payload_type, tasks = dispatcher.dispatch_metadata(tasks, payload_type)
 
-        is_heartbeat = payload_type == SerializedPackedTasksPayloadType.Heartbeat
         if payload_type == SerializedPackedTasksPayloadType.TerminateBackend:
             Backend.state = BackendState.Terminated
-        if payload_type == SerializedPackedTasksPayloadType.EndTask:
-            remove_kvcache = True
-        if is_heartbeat or Backend.state == BackendState.Terminated:
+        if (
+            payload_type == SerializedPackedTasksPayloadType.Heartbeat
+            or Backend.state == BackendState.Terminated
+        ):
             return None
-        if remove_kvcache:
+        if payload_type == SerializedPackedTasksPayloadType.EndTask:
+            # Delete item from KV cache
             for rid in tasks.req_ids:
                 Backend.cache_manager.finalize_cache_all_decode(rid)
             return None
@@ -540,9 +539,8 @@ class Executor:
                     self.moe_impl.prepare(tasks.task_type, 0)
                 else:
                     self.moe_impl.prepare(tasks.task_type, tasks.num_tokens)
-        else:
-            if self.moe_impl is not None:
-                self.moe_impl.prepare(tasks.task_type, tasks.num_tokens)
+        elif self.moe_impl is not None:
+            self.moe_impl.prepare(tasks.task_type, tasks.num_tokens)
 
         # 2. prefill/decode step
         if tasks.task_type == TaskType.Prefill:

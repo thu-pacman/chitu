@@ -10,7 +10,7 @@ __all__ = [
     "HybridAttnBackend",
 ]
 
-from typing import Optional
+from typing import Optional, Callable
 from typing_extensions import override
 import abc
 import bisect
@@ -36,6 +36,10 @@ from chitu.cache_manager import (
     KVCacheAccessor,
     PagedKVCacheAccessor,
     DenseKVCacheAccessor,
+)
+from chitu.native_layout import (
+    ColumnOddEvenSeparatedTensor,
+    PartialColumnOddEvenSeparatedTensor,
 )
 from chitu.utils import (
     pad_tensor,
@@ -174,14 +178,32 @@ class AttnBackend(abc.ABC):
 
     def mla(
         self,
-        q_nope,
-        q_pe,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor | ColumnOddEvenSeparatedTensor,
         kv_cache: KVCacheAccessor,
-        kv,
+        kv: PartialColumnOddEvenSeparatedTensor,
         seq_len_delta: BatchedSeqLenDelta,
         causal: bool = False,
         softmax_scale=None,
     ):
+        # If Q and K has the same layout on their columns, no matter what layout
+        # they have, the result will be the same, because the operation between
+        # Q and K is dot.
+        if (
+            isinstance(q_pe, ColumnOddEvenSeparatedTensor)
+            and isinstance(kv, PartialColumnOddEvenSeparatedTensor)
+            and kv.begin_idx == q_nope.shape[-1]
+            and kv.end_idx == q_nope.shape[-1] + q_pe.plain_shape[-1]
+        ):
+            q_pe = q_pe.layout_tensor
+            kv = kv.layout_tensor
+        if not isinstance(q_nope, torch.Tensor):
+            raise NotImplementedError(f"Unsupported type {type(q_nope)} for q_nope")
+        if not isinstance(q_pe, torch.Tensor):
+            raise NotImplementedError(f"Unsupported type {type(q_pe)} for q_pe")
+        if not isinstance(kv, torch.Tensor):
+            raise NotImplementedError(f"Unsupported type {type(kv)} for kv")
+
         if seq_len_delta.is_classic_decoding:
             return self.mla_decode(
                 q_nope,

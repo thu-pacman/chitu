@@ -109,5 +109,7 @@ dp_config:
 quant: null
 dtype: null # Legacy parameter. To be removed in the future.
 float_16bit_variant: bfloat16 # one of: bfloat16, float16. This sets the default_dtype of torch
+use_float32_rotary: False # If True, use float32 for RoPE. Otherwise, use the same dtype as `float_16bit_variant`.
+                          # float32 may be helpful if the context length is very long.
 keep_dtype_in_checkpoint: False
 skip_preprocess: False

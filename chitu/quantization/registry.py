@@ -40,6 +40,7 @@ class QuantizationRegistry:
         "autoawq",
         "simple_w8a8",
         "mixq",
+        "ascend_w8a8_dynamic",
         None,
     ]
     _allowed_quant_for_merge_qkv: List = [

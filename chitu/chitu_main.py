@@ -114,6 +114,7 @@ def get_additional_block_num(cache_manager, memory_utilization=0.98):
         num_blocks = int(additional_memory) // block_mem
         return max(0, num_blocks)
 
+    torch.cuda.synchronize()  # Wait for all kernels to finish before we can get peak memory usage
     _, total_memory = torch.cuda.mem_get_info(0)
     peak_memory = torch.cuda.memory_stats(0)["allocated_bytes.all.peak"]
     torch.cuda.empty_cache()
@@ -133,11 +134,10 @@ def get_additional_block_num(cache_manager, memory_utilization=0.98):
 def _auto_set_num_blocks_after_warmup(args):
     if args.infer.cache_type == "paged" and args.infer.num_blocks == -1:
         assert isinstance(Backend.cache_manager, PagedKVCacheManager)
-        memory_utilization = args.infer.memory_utilization
-        new_num_block = (
-            get_additional_block_num(Backend.cache_manager, memory_utilization)
-            + Backend.cache_manager.num_blocks
+        additional_blocks = get_additional_block_num(
+            Backend.cache_manager, args.infer.memory_utilization
         )
+        new_num_block = Backend.cache_manager.num_blocks + additional_blocks
 
         if torch.distributed.get_world_size() > 1:
             new_num_block_tensor = torch.tensor(new_num_block).cuda()
@@ -175,7 +175,7 @@ def _warmup_via_taskpool(args):
 
     rank = torch.distributed.get_rank()
 
-    logger.warning("Starting inference system warmup...")
+    logger.info("Starting inference system warmup...")
 
     init_cache_static()
     num_warmup_reqs = args.infer.max_reqs
@@ -192,14 +192,12 @@ def _warmup_via_taskpool(args):
             "infer.prefill_chunk_size is not set, GPU memory usage estimation may be incorrect (may cause OOM)"
         )
         warmup_seq_len = 1
-    warmup_max_new_tokens = 2
     if rank == 0:
         for i in range(num_warmup_reqs):
-            # TODO: After we implement chunked prefill, use the chunk size here for warmup_seq_len
             req = MockFixedLengthedUserRequest(
                 warmup_seq_len,
                 f"{gen_req_id()}",
-                max_new_tokens=warmup_max_new_tokens,
+                max_new_tokens=2,  # 1 prefill + 1 decode
                 temperature=0.7,
                 top_k=1,
             )
@@ -207,19 +205,27 @@ def _warmup_via_taskpool(args):
             TaskPool.add(task)
         logger.info(f"Added {num_warmup_reqs} warmup requests to TaskPool")
 
-    if rank > 0:
-        chitu_run()  # An extra run is needed because our implementation is asymmetric
-    for _ in range(warmup_max_new_tokens):
-        chitu_run()
+    # Prefill
+    chitu_run()
+    if rank == 0:
+        assert (
+            len(TaskPool.pool) == num_warmup_reqs
+        ), "Tasks should still be there after prefill"
 
+    # Decode
+    chitu_run()
     if rank == 0:
         assert len(TaskPool.pool) == 0, "TaskPool should be empty after warmup"
+
+    # An extra run is needed to receive "finalize KV cache" message from rank 0
+    if rank > 0:
+        chitu_run()
 
     logger.info("Inference system warmup completed")
 
 
 def _warmup_backend_direct(args, decode_steps: int = 2):
-    logger.warning("Starting local backend warmup (direct)...")
+    logger.info("Starting local backend warmup (direct)...")
     init_cache_static()
     # Minimal request
     req_id = "__warmup__"
@@ -247,10 +253,10 @@ def _warmup_backend_direct(args, decode_steps: int = 2):
         Backend.cache_manager.finalize_cache_single_decode([req_id])
     # Clean KV for this request
     Backend.cache_manager.finalize_cache_all_decode(req_id)
-    logger.warning("Local backend warmup (direct) completed")
+    logger.info("Local backend warmup (direct) completed")
 
 
-def warmup_engine_unified(args):
+def warmup_engine(args):
     # Router 进程不做 warmup
     try:
         if getattr(args.dp_config.router, "is_router", False):
@@ -294,16 +300,6 @@ def warmup_engine_unified(args):
     else:
         _warmup_backend_direct(args, decode_steps=2)
     _auto_set_num_blocks_after_warmup(args)
-
-
-def warmup_engine(args):
-    # 兼容旧入口：统一走新实现
-    return warmup_engine_unified(args)
-
-
-def warmup_engine_pd(args):
-    # 兼容旧入口：统一走新实现（PD/非PD 均复用 direct backend 预热）
-    return warmup_engine_unified(args)
 
 
 def check_checkpoint_path(args):
@@ -351,13 +347,15 @@ def chitu_init(args, logging_level=None):
 
     if (
         args.infer.prefill_chunk_size is not None
-        and args.infer.prefill_chunk_size > args.infer.max_seq_len
+        and args.infer.prefill_chunk_size > args.infer.max_reqs * args.infer.max_seq_len
     ):
         logger.warning(
-            f"infer.prefill_chunk_size ({args.infer.prefill_chunk_size}) is larger than max_seq_len "
-            f"({args.infer.max_seq_len}), which has no effect. Reducing it to max_seq_len."
+            f"infer.prefill_chunk_size ({args.infer.prefill_chunk_size}) is larger than "
+            f"infer.max_reqs ({args.infer.max_reqs}) * infer.max_seq_len "
+            f"({args.infer.max_seq_len}), which has no effect. Reducing it to infer.max_reqs "
+            f" * infer.max_seq_len."
         )
-        args.infer.prefill_chunk_size = args.infer.max_seq_len
+        args.infer.prefill_chunk_size = args.infer.max_reqs * args.infer.max_seq_len
 
     if args.infer.prefill_chunk_size is not None:
         if args.infer.dp_size > 1:

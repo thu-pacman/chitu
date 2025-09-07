@@ -8,14 +8,14 @@ import torch
 import triton
 import triton.language as tl
 
+from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.ops.triton_ops.utils import auto_retry_triton_compilation
 
 
 def apply_rotary_pos_emb_triton(
     q: torch.Tensor,
     k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
     q_out: Optional[torch.Tensor] = None,
     k_out: Optional[torch.Tensor] = None,
     rotary_type: str = "separated",
@@ -23,7 +23,7 @@ def apply_rotary_pos_emb_triton(
     # Triton does not support in-place operation. This function is only a compatitive
     # adaptor for in-place interface, but not for performance.
     q_embed, k_embed = apply_rotary_pos_emb_triton_out_of_place(
-        q, k, cos, sin, rotary_type
+        q, k, freqs_cis, rotary_type
     )
     if q_out is not None:
         q_out.copy_(q_embed)
@@ -40,8 +40,7 @@ def apply_rotary_pos_emb_triton(
 def apply_rotary_pos_emb_triton_out_of_place(
     q: torch.Tensor,
     k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
     rotary_type: str = "separated",
     block_size=128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -75,8 +74,8 @@ def apply_rotary_pos_emb_triton_out_of_place(
 
     assert q.shape[-1] == k.shape[-1]
     assert q.shape[0] == k.shape[0]
-    assert q.shape[-1] // 2 == cos.shape[-1]
-    assert q.shape[-1] // 2 == sin.shape[-1]
+    assert q.shape[-1] // 2 == freqs_cis.cos.shape[-1]
+    assert q.shape[-1] // 2 == freqs_cis.sin.shape[-1]
 
     if rotary_type == "separated":
         # "separated" has an [real, real, ..., real, imag, imag, ..., imag] layout.
@@ -85,16 +84,16 @@ def apply_rotary_pos_emb_triton_out_of_place(
         bs, head_num_q, rotary_dim = q.shape
         bs, head_num_k, rotary_dim = k.shape
 
-        assert cos.is_contiguous()
-        assert sin.is_contiguous()
+        assert freqs_cis.cos.is_contiguous()
+        assert freqs_cis.sin.is_contiguous()
 
         # Launch kernel
         grid = (bs, max(head_num_q, head_num_k), triton.cdiv(rotary_dim, block_size))
         rotary_embedding_kernel_separated[grid](
             q,
             k,
-            cos,
-            sin,
+            freqs_cis.cos,
+            freqs_cis.sin,
             q_out,
             k_out,
             head_num_q,
@@ -104,8 +103,8 @@ def apply_rotary_pos_emb_triton_out_of_place(
             q.stride(1),
             k.stride(0),
             k.stride(1),
-            cos.stride(0),
-            sin.stride(0),
+            freqs_cis.cos.stride(0),
+            freqs_cis.sin.stride(0),
             q_out.stride(0),
             q_out.stride(1),
             k_out.stride(0),
@@ -119,8 +118,8 @@ def apply_rotary_pos_emb_triton_out_of_place(
         bs, head_num_q, rotary_dim = q.shape
         bs, head_num_k, rotary_dim = k.shape
 
-        assert cos.is_contiguous()
-        assert sin.is_contiguous()
+        assert freqs_cis.cos.is_contiguous()
+        assert freqs_cis.sin.is_contiguous()
 
         # Launch kernel
         BLOCK_H = min(
@@ -132,8 +131,8 @@ def apply_rotary_pos_emb_triton_out_of_place(
             k,
             q_out,
             k_out,
-            cos,
-            sin,
+            freqs_cis.cos,
+            freqs_cis.sin,
             q.stride(0),
             q.stride(1),
             k.stride(0),

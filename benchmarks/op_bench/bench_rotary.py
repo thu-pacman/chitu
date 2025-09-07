@@ -6,6 +6,7 @@ import math
 import torch
 import triton
 
+from batched_freqs_cis import BatchedFreqsCis
 from chitu.ops import apply_rotary_pos_emb
 
 
@@ -33,12 +34,13 @@ def benchmark(batch_size, n_local_heads, head_dim, provider, rotary_type="interl
         * 2
         * math.pi,
     )
-    cos = complex_freqs.real.contiguous()
-    sin = complex_freqs.imag.contiguous()
+    freqs_cis = BatchedFreqsCis(
+        complex_freqs.real.contiguous(), complex_freqs.imag.contiguous()
+    )
 
     ms = triton.testing.do_bench(
         lambda: apply_rotary_pos_emb(
-            q, k, cos, sin, rotary_type=rotary_type, impl=provider
+            q, k, freqs_cis, rotary_type=rotary_type, impl=provider
         )
     )
     return ms * 1000

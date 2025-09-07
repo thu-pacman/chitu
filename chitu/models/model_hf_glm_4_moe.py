@@ -11,7 +11,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from chitu.attn_backend import AttnBackend
+from chitu.batched_freqs_cis import BatchedFreqsCis
+from chitu.models.model import RMSNorm
 from chitu.models.model_hf_llama import TransformerHFLlama, TransformerBlockHFLlama
+from chitu.models.model_hf_qwen2_vl import (
+    VisionMLP,
+    VisionPatchEmbed,
+    VisionRotaryEmbedding,
+    VisionBlock,
+    VisionTransformer,
+    TransformerQwen2VL,
+)
 from chitu.models.model_deepseek_v3 import MLPDeepSeekV3, ParallelMoeBlockDeepSeekV3
 from chitu.models.registry import ModelType, register_model
 from chitu.global_vars import get_global_args
@@ -21,17 +31,7 @@ from chitu.muxi_utils import (
     Blockfp8MoeExpertsMuxiLayout,
 )
 from chitu.quantization import QuantizationRegistry
-from chitu.models.model import RMSNorm
-
 from chitu.tensor_parallel import LocalLinear
-from chitu.models.model_hf_qwen2_vl import (
-    VisionMLP,
-    VisionPatchEmbed,
-    VisionRotaryEmbedding,
-    VisionBlock,
-    VisionTransformer,
-    TransformerQwen2VL,
-)
 
 
 class Glm4vVisionEmbeddings(nn.Module):
@@ -232,7 +232,9 @@ class Glm4vVisionTransformer(VisionTransformer):
         hidden_states = self.post_conv_layernorm(hidden_states)
 
         rotary_pos_emb, image_type_ids = self.rot_pos_emb(grid_thw)
-        position_embeddings = (rotary_pos_emb.cos(), rotary_pos_emb.sin())
+        position_embeddings = BatchedFreqsCis(
+            rotary_pos_emb.cos(), rotary_pos_emb.sin()
+        )
 
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
