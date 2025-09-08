@@ -462,6 +462,12 @@ class Packed4BitWeightQServe(NativeLayoutTensor):
     pass
 
 
+# See https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/API/appdevgapi/aclpythondevg_01_0914.html
+# for the layout ID
+ACL_FORMAT_FRACTAL_NZ = 29
+ACL_FORMAT_ND = 2
+
+
 @dataclass
 class NpuFractalNzTensor(NativeLayoutTensor):
     """
@@ -483,16 +489,13 @@ class NpuFractalNzTensor(NativeLayoutTensor):
     @override
     def convert_from(cls, tensor: torch.Tensor) -> "NpuFractalNzTensor":
         if isinstance(tensor, torch.Tensor):
-            # See https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/API/appdevgapi/aclpythondevg_01_0914.html
-            # for the layout ID
-            ACL_FORMAT_FRACTAL_NZ = 29
-
-            old_device = tensor.device
+            # NPU formats only live on NPU. Once we move to CPU and then move back, the format will disappear.
+            # Therefore, we force this tensor to be on NPU.
             return cls(
                 plain_shape=tensor.shape,
                 layout_tensor=torch_npu.npu_format_cast(
                     tensor.npu().contiguous(), ACL_FORMAT_FRACTAL_NZ
-                ).to(old_device),
+                ),
             )
 
         else:
@@ -500,14 +503,8 @@ class NpuFractalNzTensor(NativeLayoutTensor):
 
     @override
     def convert_to_plain(self) -> torch.Tensor:
-        # See https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/API/appdevgapi/aclpythondevg_01_0914.html
-        # for the layout ID
-        ACL_FORMAT_ND = 2
-
-        old_device = self.layout_tensor.device
-        return torch_npu.npu_format_cast(self.layout_tensor.npu(), ACL_FORMAT_ND).to(
-            old_device
-        )
+        assert self.layout_tensor.device.type == "npu"
+        return torch_npu.npu_format_cast(self.layout_tensor, ACL_FORMAT_ND)
 
 
 @dataclass
@@ -532,16 +529,13 @@ class NpuFractalZnTensor(NativeLayoutTensor):
     @override
     def convert_from(cls, tensor: torch.Tensor) -> "NpuFractalNzTensor":
         if isinstance(tensor, torch.Tensor):
-            # See https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/API/appdevgapi/aclpythondevg_01_0914.html
-            # for the layout ID
-            ACL_FORMAT_FRACTAL_NZ = 29
-
-            old_device = tensor.device
+            # NPU formats only live on NPU. Once we move to CPU and then move back, the format will disappear.
+            # Therefore, we force this tensor to be on NPU.
             return cls(
                 plain_shape=tensor.shape,
                 layout_tensor=torch_npu.npu_format_cast(
                     tensor.npu().transpose(-1, -2).contiguous(), ACL_FORMAT_FRACTAL_NZ
-                ).to(old_device),
+                ),
             )
 
         else:
@@ -549,15 +543,9 @@ class NpuFractalZnTensor(NativeLayoutTensor):
 
     @override
     def convert_to_plain(self) -> torch.Tensor:
-        # See https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/API/appdevgapi/aclpythondevg_01_0914.html
-        # for the layout ID
-        ACL_FORMAT_ND = 2
-
-        old_device = self.layout_tensor.device
-        return (
-            torch_npu.npu_format_cast(self.layout_tensor.npu(), ACL_FORMAT_ND)
-            .transpose(-1, -2)
-            .to(old_device)
+        assert self.layout_tensor.device.type == "npu"
+        return torch_npu.npu_format_cast(self.layout_tensor, ACL_FORMAT_ND).transpose(
+            -1, -2
         )
 
 

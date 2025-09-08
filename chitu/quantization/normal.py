@@ -27,7 +27,11 @@ from chitu.utils import (
 )
 from chitu.distributed.parallel_state import get_ep_group
 from chitu.static_tensor import StaticTensor
-from chitu.native_layout import enable_native_layout_weight, NpuFractalNzTensor
+from chitu.native_layout import (
+    enable_native_layout_weight,
+    NpuFractalNzTensor,
+    ACL_FORMAT_FRACTAL_NZ,
+)
 from chitu.custom_gguf import GGMLQuantizationType, get_ggml_quant_type
 
 triton, has_triton = try_import_platform_dep("triton")
@@ -38,6 +42,7 @@ if has_triton or has_torch_npu:
     from chitu.moe.experts import fused_experts
 
 
+@QuantizationRegistry.register_linear(None)
 class NormalLinear(QuantizedLinearBase):
     def __init__(
         self,
@@ -90,7 +95,10 @@ class NormalLinear(QuantizedLinearBase):
 class NormalLinearNpuFractalNz(
     enable_native_layout_weight("weight", NpuFractalNzTensor), NormalLinear
 ):
-    pass
+    @override
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        assert torch_npu.get_npu_format(self.weight) == ACL_FORMAT_FRACTAL_NZ
+        return super().forward(x)
 
 
 @QuantizationRegistry.register_moe_experts(None)
@@ -618,9 +626,3 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
             y = torch.zeros_like(x)
 
         return y.view(shape)
-
-
-if has_torch_npu:
-    QuantizationRegistry.register_linear(None, NormalLinearNpuFractalNz)
-else:
-    QuantizationRegistry.register_linear(None, NormalLinear)

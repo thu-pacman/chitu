@@ -363,7 +363,7 @@ def chitu_init(args, logging_level=None):
                 "Disabling infer.prefill_chunk_size because it is not compatible with DP yet"
             )
             args.infer.prefill_chunk_size = None
-        if args.infer.tp_size > 1 and args.infer.cache_type == "skew":
+        if args.infer.pp_size > 1 and args.infer.cache_type == "skew":
             logger.warning(
                 "Disabling infer.prefill_chunk_size because it is not compatible with PP+skew yet"
             )
