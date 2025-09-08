@@ -5,11 +5,13 @@
 import logging
 import torch
 import torch_npu
+import torch.distributed as dist
 from torch_npu.contrib import transfer_to_npu
 
 from chitu.global_vars import get_global_args
-from chitu.utils import try_import_opt_dep
-from chitu.distributed.parallel_state import get_ep_size
+from chitu.utils import log_with_rank, try_import_opt_dep
+from chitu.distributed.parallel_state import get_ep_size, get_ep_group
+
 
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
@@ -44,6 +46,210 @@ def fused_group_matmul(
         computeType="fp4",
     )
     return output
+
+
+def get_hcomm_info(rank, comm_group):
+    if torch.__version__ > "2.0.1":
+        hcomm_info = comm_group._get_backend(torch.device("npu")).get_hccl_comm_name(
+            rank
+        )
+    else:
+        hcomm_info = comm_group.get_hccl_comm_name(rank)
+    return hcomm_info
+
+
+def fused_experts_npu_with_a2a_communication(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int = 8,
+    w1_scale=None,
+    w2_scale=None,
+    experts_start_idx=0,
+    max_bs: int = 0,
+    **kwargs,
+):
+    """
+    hidden_states / w1 / w2 / topk_weights / topk_ids / experts_start_idx
+    """
+    assert hidden_states.dim() == 2, "hidden_states must be 2D"
+    assert (
+        hidden_states.dtype == topk_weights.dtype
+    ), "hidden_states and topk_weights must have the same dtype"
+    topk_ids = topk_ids.int()
+    n_local_experts = w1.shape[0]
+    ep_size = get_ep_size()
+    max_num_deployed_expert = n_local_experts * ep_size
+
+    expert_range = [0, max_num_deployed_expert]
+    expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = (
+        torch_npu.npu_moe_init_routing_v2(
+            hidden_states,
+            expert_idx=topk_ids,
+            scale=None,
+            expert_num=max_num_deployed_expert,
+            active_expert_range=expert_range,
+            expert_tokens_num_type=1,
+            expert_tokens_num_flag=True,
+            active_num=topk_ids.numel(),
+            drop_pad_mode=0,
+            row_idx_type=0,
+            quant_mode=-1,
+        )
+    )
+    tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
+    dist.all_to_all_single(
+        tokens_per_expert_group, tokens_per_expert
+    )  # (total_experts,) --> (total_ranks * n_routed_experts_per_rank)
+    combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
+
+    combine_tokens = combine_tokens.view(2, ep_size, -1).sum(2)
+    all_tokens = combine_tokens[0].sum()
+    combine_tokens_cpu = combine_tokens.cpu().tolist()
+    # alltoall input splits, the total number of tokens routed from the current rank to other ranks
+    input_splits = combine_tokens_cpu[1]
+    # alltoall output splits, the number of tokens each rank receives from other cards
+    output_splits = combine_tokens_cpu[0]
+    # alltoall output, unfolded into one dimension, the size is the sum of the number of tokens routed from other cards to the current rank.
+    gathered_tokens = expanded_x.new_empty(all_tokens.item(), expanded_x.shape[1])
+    dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits)
+    (
+        hidden_states_sorted_by_experts,
+        _,
+        gathered_idxs_unsort,
+        tokens_per_local_expert,
+    ) = torch_npu.npu_moe_re_routing(
+        gathered_tokens,
+        tokens_per_expert_group.view(ep_size, -1),
+        per_token_scales=None,
+    )
+    group_list = tokens_per_local_expert.to(torch.int64)
+    w1 = w1.transpose(1, 2)
+    mm1_mm3 = torch_npu.npu_grouped_matmul(
+        [hidden_states_sorted_by_experts],
+        [w1],
+        group_list=group_list,
+        split_item=3,
+        group_type=0,
+        group_list_type=1,
+    )[0]
+    intermediate_h = torch_npu.npu_swiglu(mm1_mm3)
+    # gmm2: down
+    w2 = w2.transpose(1, 2)
+    hidden_states_ordered_by_experts = torch_npu.npu_grouped_matmul(
+        [intermediate_h],
+        [w2],
+        bias=None,
+        group_list=group_list,
+        split_item=3,
+        group_type=0,
+        group_list_type=1,
+    )[0]
+    new_x = torch.index_select(
+        hidden_states_ordered_by_experts,
+        0,
+        gathered_idxs_unsort.to(torch.float32).argsort().to(torch.int32),
+    )
+    gathered_tokens = new_x.new_empty(*expanded_x.shape)
+
+    dist.all_to_all_single(gathered_tokens, new_x, input_splits, output_splits)
+
+    # return hidden_states, gathered_tokens, topk_weight, expanded_row_idx
+    final_hidden_states = torch_npu.npu_moe_finalize_routing(
+        gathered_tokens,
+        skip1=None,
+        skip2=None,
+        bias=None,
+        scales=topk_weights.to(gathered_tokens.dtype),
+        expanded_src_to_dst_row=expanded_row_idx,
+        export_for_source_row=None,
+        drop_pad_mode=2,
+    )
+    return final_hidden_states
+
+
+def fused_experts_npu_with_communication(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int = 8,
+    w1_scale=None,
+    w2_scale=None,
+    experts_start_idx=0,
+    max_bs: int = 16,
+    **kwargs,
+):
+    ep_size = get_ep_size()  # if use A2 device, it should satisfy ep_size % 16 == 0
+    n_local_experts = w1.shape[0]
+    rank = torch.distributed.get_rank()
+    global_num_experts = n_local_experts * ep_size
+    ep_hcomm_info = get_hcomm_info(rank, get_ep_group().gpu_group)
+    act_dtype = hidden_states.dtype
+
+    (
+        expand_x,
+        dynamic_scales,
+        expand_idx,
+        expert_token_nums,
+        ep_recv_counts,
+        tp_recv_counts,
+        expand_scales,
+    ) = torch_npu.npu_moe_distribute_dispatch_v2(
+        x=hidden_states,
+        expert_ids=topk_ids,
+        group_ep=ep_hcomm_info,
+        ep_world_size=ep_size,
+        ep_rank_id=rank,
+        shared_expert_rank_num=0,
+        moe_expert_num=global_num_experts,
+        quant_mode=0,
+        global_bs=max_bs * ep_size,
+    )
+    group_list = expert_token_nums.to(torch.int64)
+    w1 = w1.transpose(1, 2)
+
+    gate_up_proj = torch_npu.npu_grouped_matmul(
+        [expand_x],
+        [w1],
+        bias=None,
+        group_list=group_list,
+        split_item=3,
+        group_type=0,
+        group_list_type=1,
+    )[0]
+    gate_up_proj = torch_npu.npu_swiglu(gate_up_proj)
+
+    w2 = w2.transpose(1, 2)
+    hidden_states_experts = torch_npu.npu_grouped_matmul(
+        [gate_up_proj],
+        [w2],
+        bias=None,
+        group_list=group_list,
+        split_item=3,
+        output_dtype=act_dtype,
+        group_type=0,
+        group_list_type=1,
+    )[0]
+
+    hidden_states_route = torch_npu.npu_moe_distribute_combine_v2(
+        expand_x=hidden_states_experts,
+        expert_ids=topk_ids,
+        assist_info_for_combine=expand_idx,
+        ep_send_counts=ep_recv_counts,
+        expert_scales=topk_weights.to(torch.float),
+        tp_send_counts=tp_recv_counts,
+        group_ep=ep_hcomm_info,
+        expand_scales=expand_scales,
+        ep_world_size=ep_size,
+        ep_rank_id=rank,
+        moe_expert_num=global_num_experts,
+        global_bs=max_bs * ep_size,
+    )
+    return hidden_states_route
 
 
 def fused_experts_npu(
