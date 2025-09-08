@@ -42,8 +42,10 @@ from chitu.ops import (
     fp4_fake_quant,
     pack_every_two_fp4_e2m1_in_uint8_to_one_uint8,
     to_fp4_e2m1_in_uint8,
+    mla_prologue_normal,
 )
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
+from chitu.quantization.normal import NormalLinearNpuFractalZn
 from chitu.tensor_parallel import (
     ColumnParallelLinear,
     LocalLinear,
@@ -51,8 +53,9 @@ from chitu.tensor_parallel import (
     VocabParallelEmbedding,
 )
 from chitu.distributed.parallel_state import get_tp_size, get_ep_size
-from chitu.utils import parse_dtype
+from chitu.utils import parse_dtype, try_import_and_setup_torch_npu
 
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 logger = getLogger(__name__)
 
@@ -101,10 +104,9 @@ class AttentionDeepSeekV3(Attention):
         )
         self.merge_qkv = QuantizationRegistry.allowed_merge_qkv(checkpoint_prefix)
 
-        model_parallel_size = get_tp_size()
         self.dim = args.dim
         self.n_heads = args.n_heads
-        self.n_local_heads = args.n_heads // model_parallel_size
+        self.n_local_heads = args.n_heads // get_tp_size()
         self.q_lora_rank = args.q_lora_rank
         self.kv_lora_rank = args.kv_lora_rank
         self.qk_nope_head_dim = args.qk_nope_head_dim
@@ -113,6 +115,25 @@ class AttentionDeepSeekV3(Attention):
         self.v_head_dim = args.v_head_dim
 
         block_size = 16 if quant == "blockfp4" else 128
+
+        # This restriction is from
+        # https://www.hiascend.com/document/detail/zh/Pytorch/710/apiref/torchnpuCustomsapi/context/torch_npu-npu_mla_prolog_v2.md
+        # Should be synchronized in the following files:
+        # - chitu/models/model_deepseek_v3.py
+        # - chitu/quantization/registry.py
+        # - chitu/ops/mla_prologue.py
+        self.can_use_mla_prologue_normal_torch_npu = (
+            has_torch_npu
+            and quant is None
+            and not self.merge_qkv
+            and torch.get_default_dtype() == torch.bfloat16
+            and self.dim == 7168
+            and self.q_lora_rank == 1536
+            and self.n_local_heads in [8, 16, 32, 64, 128]
+            and self.kv_lora_rank == 512
+            and self.qk_nope_head_dim == 128
+            and self.qk_rope_head_dim == 64
+        )
 
         if self.merge_qkv:
             # fp8 gemm can handle weights not divisible by block_size, but it does not hold
@@ -130,12 +151,22 @@ class AttentionDeepSeekV3(Attention):
                 self.q_lora_rank,
                 has_bias=False,
                 checkpoint_prefix=f"{checkpoint_prefix}.q_a_proj",
+                base_linear_class=(
+                    NormalLinearNpuFractalZn
+                    if self.can_use_mla_prologue_normal_torch_npu
+                    else None
+                ),
             )  # FIXME: Run this layer with muxi_layout_kernels
             self.kv_a_proj_with_mqa = LocalLinear(
                 self.dim,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 has_bias=False,
                 checkpoint_prefix=f"{checkpoint_prefix}.kv_a_proj_with_mqa",
+                base_linear_class=(
+                    NormalLinearNpuFractalZn
+                    if self.can_use_mla_prologue_normal_torch_npu
+                    else None
+                ),
             )  # FIXME: Run this layer with muxi_layout_kernels
         self.q_a_layernorm = RMSNorm(self.q_lora_rank)
         self.q_b_proj = ColumnParallelLinear(
@@ -147,9 +178,13 @@ class AttentionDeepSeekV3(Attention):
             ),
             has_bias=False,
             gather_output=False,
-            base_linear_class=get_linear_layout_contig_y(
-                op_impl,
-                checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",
+            base_linear_class=(
+                NormalLinearNpuFractalZn
+                if self.can_use_mla_prologue_normal_torch_npu
+                else get_linear_layout_contig_y(
+                    op_impl,
+                    checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",
+                )
             ),
             checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",
         )
@@ -201,6 +236,21 @@ class AttentionDeepSeekV3(Attention):
         self.softmax_scale = compute_softmax_scale_deepseek_v3(args)
 
     def _run_linear(self, x, freqs_cis: BatchedFreqsCis):
+        if self.can_use_mla_prologue_normal_torch_npu:
+            return mla_prologue_normal(
+                x,
+                self.q_a_proj.get_native_layout_weight(),
+                self.q_b_proj.get_native_layout_weight(),
+                self.kv_b_proj_absorb_1.weight,
+                self.kv_a_proj_with_mqa.get_native_layout_weight(),
+                self.q_a_layernorm.weight,
+                self.kv_a_layernorm.weight,
+                freqs_cis,
+                self.q_a_layernorm.eps,
+                self.kv_a_layernorm.eps,
+                impl="torch_npu",
+            )
+
         bs_seq, _ = x.size()
         assert self.q_lora_rank > 0
         if self.merge_qkv:

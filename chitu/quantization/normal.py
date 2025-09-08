@@ -30,6 +30,7 @@ from chitu.static_tensor import StaticTensor
 from chitu.native_layout import (
     enable_native_layout_weight,
     NpuFractalNzTensor,
+    NpuFractalZnTensor,
     ACL_FORMAT_FRACTAL_NZ,
 )
 from chitu.custom_gguf import GGMLQuantizationType, get_ggml_quant_type
@@ -99,6 +100,17 @@ class NormalLinearNpuFractalNz(
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert torch_npu.get_npu_format(self.weight) == ACL_FORMAT_FRACTAL_NZ
         return super().forward(x)
+
+
+class NormalLinearNpuFractalZn(
+    enable_native_layout_weight("weight", NpuFractalZnTensor), NormalLinear
+):
+    @override
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError(
+            "NormalLinearNpuFractalZn is not designed to be run directly. It is supposed to form "
+            "a fused operator. Please use NormalLinearNpuFractalNz if you want a stand-alone layer."
+        )
 
 
 @QuantizationRegistry.register_moe_experts(None)
