@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Union, Sequence, Mapping, Any
+from typing import Union, Sequence, Any
 from typing_extensions import override, final
 from dataclasses import dataclass
 import functools

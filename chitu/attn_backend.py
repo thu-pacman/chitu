@@ -10,14 +10,13 @@ __all__ = [
     "HybridAttnBackend",
 ]
 
-from typing import Optional, Callable
+from typing import Optional
 from typing_extensions import override
 import abc
 import bisect
 import functools
 import math
 from logging import getLogger
-import os
 import packaging.version
 import torch
 import einops
@@ -31,7 +30,7 @@ from chitu.ops import (
     read_from_paged_kv_cache,
 )
 from chitu.static_tensor import StaticTensor
-from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
+from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.cache_manager import (
     KVCacheAccessor,
     PagedKVCacheAccessor,
@@ -1335,7 +1334,6 @@ class TritonAttnBackend(RefAttnBackend):
             k_pe_cache = kv_c_and_k_pe_cache[..., kv_lora_rank:]
 
         kv_c_cache = kv_c_and_k_pe_cache[..., :kv_lora_rank]
-        PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
 
         if softmax_scale is None:
             assert self.qk_nope_head_dim is not None
@@ -2011,7 +2009,6 @@ class FlashInferBackend(TritonAttnBackend):
     ):
         raw_batch_size = q.shape[0]
         batch_size = self.match_batch_size(raw_batch_size)
-        head_dim = q.shape[-1]
         o = torch.empty_like(q)
         for i in range(batch_size):
             kv_cache.k[i, seq_len_delta.old.lens_list[i]] = k[i]
@@ -2044,7 +2041,6 @@ class FlashInferBackend(TritonAttnBackend):
         raw_batch_size = q.shape[0]
         batch_size = self.match_batch_size(raw_batch_size)
         block_size = kv_cache.k.shape[1]
-        head_dim = q.shape[-1]
         # append kv to cache
         if k is not None:
             assert v is not None

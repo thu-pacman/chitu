@@ -15,11 +15,7 @@ import threading
 import torch
 import torch.distributed
 
-from chitu.chitu_main import (
-    chitu_init,
-    warmup_engine_unified,
-    start_enhanced_scheduler_service,
-)
+from chitu.chitu_main import chitu_init, warmup_engine, start_enhanced_scheduler_service
 from chitu.serve.common import start_worker
 from chitu.task import TaskPool
 
@@ -43,7 +39,7 @@ def init_dp_scheduler(args, rank):
 
     # Router process will skip warmup in unified
     try:
-        warmup_engine_unified(args)
+        warmup_engine(args)
     except Exception as e:
         import traceback
 

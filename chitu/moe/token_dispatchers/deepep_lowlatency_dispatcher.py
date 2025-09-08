@@ -9,7 +9,6 @@ from typing import Tuple
 from logging import getLogger
 
 import torch
-import torch.distributed as dist
 
 from chitu.distributed.parallel_state import get_ep_group
 from chitu.utils import try_import_opt_dep

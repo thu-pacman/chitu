@@ -7,11 +7,6 @@ import torch
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase
 from chitu.ops.quant import w4a8_gemm_per_token_per_group_asymm, a8_per_token_act_quant
-from chitu.native_layout import (
-    enable_native_layout_weight,
-    Packed4BitWeightAlongK,
-    Packed4BitWeightQServe,
-)
 
 
 @QuantizationRegistry.register_linear("w4a8_per_token_per_group_asymm")
@@ -36,10 +31,6 @@ class W4A8PerTokenPerGroupAsymmLinear(
         self.out_features = out_features
         self.group_size = group_size
 
-        # In the checkpoint, self.qweight is in Packed4BitWeightQServe layout. Here we
-        # mark the layout via `self._qweight_layout_class` and `self._qweight_plain_shape`,
-        # so `enable_native_layout_weight` can recognize it. After loading,
-        # `enable_native_layout_weight` will convert it to other layouts.
         assert self.in_features % 2 == 0, "in_features must be even for int4 packing"
         self.qweight = torch.nn.Parameter(
             torch.zeros(

@@ -6,9 +6,7 @@ import itertools
 import os
 from logging import getLogger
 from typing import Any, List, Mapping, Optional
-import gc
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -17,7 +15,7 @@ from chitu.attn_backend import AttnBackend, NpuAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.cache_manager import PagedKVCacheManager, DenseKVCacheManager
 from chitu.cuda_graph import make_dispatched_graphed_callables
-from chitu.device_type import is_ascend, is_muxi, is_nvidia
+from chitu.device_type import is_ascend
 from chitu.global_vars import get_global_args, get_timers
 from chitu.muxi_utils import (
     Blockfp8LinearMuxiLayoutContigY,
@@ -148,7 +146,7 @@ class TransformerBlock(nn.Module):
         self.layer_id = layer_id
         self.timers = get_timers()
 
-    def forward(self):
+    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
         raise NotImplementedError
 
 
@@ -737,8 +735,10 @@ class Transformer(nn.Module):
                 tokens = pad_tensor(tokens, batch_size)
         if isinstance(self.cache, DenseKVCacheManager):
             key = (batch_size, self.cache.get_start_and_end_idx()[0])
-        else:
+        elif isinstance(self.cache, PagedKVCacheManager):
             key = (batch_size,)
+        else:
+            assert False
 
         self.prepare_decoding_attn()
 

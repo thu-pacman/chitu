@@ -121,7 +121,7 @@
   - Token Manager：仅在 Decode-only 或 Unified 模式初始化；Prefill-only 模式跳过，不做 Token 回传。
 
 ## 启动与 warmup
-- warmup统一走本地 direct warmup（不依赖 Router/Bootstrap/P↔D）：`warmup_engine_unified()`
+- warmup统一走本地 direct warmup（不依赖 Router/Bootstrap/P↔D）：`warmup_engine()`
   - 仅warmup算子/JIT/缓存；Router 独立启动 Bootstrap 与 PDCoordination，不参与warmup。
   - 注意：`model.decode(tokens, batch_size)` 的第二个参数是整型“BatchSize”，不是长度列表。
 

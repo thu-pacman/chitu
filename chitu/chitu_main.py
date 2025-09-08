@@ -15,7 +15,7 @@ import torch.distributed
 
 from chitu.backend import Backend, BackendState
 from chitu.cache_manager import PagedKVCacheManager
-from chitu.device_type import is_nvidia, is_ascend
+from chitu.device_type import is_nvidia
 from chitu.executor import Executor, BatchResult
 from chitu.global_vars import (
     get_global_args,
@@ -683,9 +683,6 @@ async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
 async def process_scheduler_request(rank: int, request_data: dict):
     """Handle scheduling requests from Router"""
     try:
-        from chitu.task import UserRequest, Task, TaskPool
-        from chitu.utils import gen_req_id
-
         # Build UserRequest object
         request_id = request_data.get("request_id", gen_req_id())
         message = request_data.get("message", [])

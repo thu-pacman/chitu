@@ -59,7 +59,4 @@ def test_cpu_linear(input_size, output_size, qlen, compute_dtype):
 
     torch_output = torch_linear(input_tensor, proj)
 
-    diff = torch.mean(torch.abs(cpuinfer_output - torch_output)) / torch.mean(
-        torch.abs(torch_output)
-    )
     assert torch.allclose(cpuinfer_output, torch_output, rtol=1e-2, atol=1e-2)

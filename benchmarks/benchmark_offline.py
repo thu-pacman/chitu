@@ -29,7 +29,7 @@ from chitu.chitu_main import (
 )
 from chitu.global_vars import get_timers
 from chitu.schemas import ServeConfig
-from chitu.utils import get_config_dir_path, gen_req_id
+from chitu.utils import get_config_dir_path
 
 logger = getLogger(__name__)
 

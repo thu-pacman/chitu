@@ -2,11 +2,9 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Dict, List, Mapping, Optional, Set, Type, Callable
+from typing import Any, Dict, List, Mapping, Optional, Type, Callable
 import functools
 import re
-
-import torch
 
 from chitu.global_vars import get_global_args
 from chitu.quantization.base import (

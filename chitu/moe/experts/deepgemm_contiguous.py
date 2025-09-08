@@ -49,7 +49,6 @@ def deepgemm_contiguous_fused_expert(
     assert w1_zp is None
     assert w2_zp is None
 
-    M = hidden_states.shape[0]
     E, N, K = w1.shape
     all_tokens = sum(tokens_per_expert)
 

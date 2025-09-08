@@ -2,7 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import torch
 from typing import Optional
 
 from chitu.task_type import TaskType

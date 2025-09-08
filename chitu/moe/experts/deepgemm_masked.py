@@ -61,8 +61,6 @@ def deepgemm_masked_fused_expert(
 
     M = hidden_states_fp8.shape[1]
     E, N, _ = w1.shape
-    if global_num_experts == -1:
-        global_num_experts = E
 
     intermediate_cache1 = torch.empty(
         (E, M, N), device=hidden_states_fp8.device, dtype=torch.bfloat16

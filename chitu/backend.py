@@ -31,7 +31,6 @@ from chitu.cache_manager import DenseKVCacheManager, PagedKVCacheManager
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
 from chitu.distributed.parallel_state import get_pp_group, initialize_parallel_groups
-from chitu.global_vars import set_global_args
 from chitu.hybrid_device import CPUParameter
 from chitu.models.registry import ModelType, get_model_class
 from chitu.quantization import (
@@ -730,7 +729,6 @@ def memory_used():
 def load_gguf_deepseek_v3_gguf(
     model, ds_gguf_loader: GGUFLoader, layer_load_per_iter=10, args=None
 ):
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     logger.debug(f"loading layer : from 0 to 3")
     checkpoint0 = load_state_dict_deepseek_v3_gguf_mlp_layer(
         ds_gguf_loader, main_weight_dtype=args.models.main_weight_dtype

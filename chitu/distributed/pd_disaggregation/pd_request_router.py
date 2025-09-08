@@ -10,7 +10,7 @@ Extends the original RequestRouter to support Prefill-Decode disaggregation
 import asyncio
 import logging
 import time
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import zmq
 import msgpack

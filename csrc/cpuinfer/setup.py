@@ -6,12 +6,11 @@ import os
 
 from setuptools import Extension
 from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension
-from setuptools import Extension, setup, find_packages
+from setuptools import Extension, setup
 
 from pathlib import Path
 import subprocess
 import glob
-import platform
 import cpuinfo
 
 setup_dir = os.path.dirname(os.path.abspath(__file__))
@@ -33,8 +32,6 @@ def detect_intel():
         pass
 
     try:
-        import cpuinfo
-
         info = cpuinfo.get_cpu_info()
         vendor = info.get("vendor_id_raw", "") or info.get("vendor_id", "")
         if "Intel" in vendor:

@@ -21,7 +21,6 @@ from chitu.utils import get_config_dir_path, gen_req_id
 
 # -----------utils part begin--------------
 import json
-import numpy as np
 
 
 def save_result(data_list, filename="data.json"):

@@ -24,7 +24,6 @@ from chitu.ops.quant import (
 from chitu.device_type import get_device_name, is_muxi, is_nvidia, is_blackwell
 from chitu.utils import (
     ceil_div,
-    try_import_opt_dep,
     try_import_platform_dep,
     try_import_and_setup_torch_npu,
     parse_dtype,

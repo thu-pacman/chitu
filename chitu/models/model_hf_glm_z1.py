@@ -49,12 +49,7 @@ class TransformerBlockHFGlmZ1(TransformerBlock):
         self.post_self_attn_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
         self.post_mlp_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: BatchedFreqsCis,
-        seq_len=None,
-    ):
+    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
         impl = get_rms_norm_impl()
         h = self.self_attn(self.input_layernorm(x, impl=impl), freqs_cis)
         h = self.post_self_attn_layernorm(h, impl=impl)
@@ -62,7 +57,6 @@ class TransformerBlockHFGlmZ1(TransformerBlock):
         out = h + self.post_mlp_layernorm(
             self.mlp(self.post_attention_layernorm(h, impl=impl)), impl=impl
         )
-
         return out
 
 

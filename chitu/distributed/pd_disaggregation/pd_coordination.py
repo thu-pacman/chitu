@@ -179,8 +179,6 @@ class PDCoordinationService:
             logger.warning(f"pd pair info not found for request: {request_id}")
             return
 
-        pair_info = self.pd_pairs[request_id]
-
         # Update transfer metadata
         if request_id in self.kv_transfer_metadata:
             metadata = self.kv_transfer_metadata[request_id]
@@ -338,8 +336,6 @@ class PDCoordinationService:
         if decode_scheduler_id not in self.decode_schedulers:
             logger.error(f"decode scheduler {decode_scheduler_id} not found")
             return
-
-        scheduler_info = self.decode_schedulers[decode_scheduler_id]
 
         # Here we should notify the Decode Scheduler via ZMQ
         # The concrete implementation will be added in later stages

@@ -5,7 +5,7 @@
 from typing import Optional
 import re
 from typing import List
-from typing import Optional, Union, List, Any
+from typing import Optional, List
 from chitu.global_vars import get_global_args
 
 

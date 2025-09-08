@@ -4,7 +4,7 @@
 
 import math
 from logging import getLogger
-from typing import Any, List, Mapping, Optional
+from typing import Any, List, Mapping
 from typing_extensions import override
 
 import torch
@@ -350,15 +350,10 @@ class TransformerBlockHFLlama(TransformerBlock):
         self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
         self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: BatchedFreqsCis,
-    ):
+    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
         h = self.self_attn(self.input_layernorm(x, impl=get_rms_norm_impl()), freqs_cis)
         h += x
         out = h + self.mlp(self.post_attention_layernorm(h, impl=get_rms_norm_impl()))
-
         return out
 
 

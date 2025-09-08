@@ -8,7 +8,7 @@ import torch_npu
 from torch_npu.contrib import transfer_to_npu
 
 from chitu.global_vars import get_global_args
-from chitu.utils import log_with_rank, try_import_opt_dep
+from chitu.utils import try_import_opt_dep
 from chitu.distributed.parallel_state import get_ep_size
 
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")

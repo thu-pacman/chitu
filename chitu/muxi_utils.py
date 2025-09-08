@@ -4,7 +4,6 @@
 
 from typing import List, Optional, Union
 from typing_extensions import override
-from dataclasses import dataclass
 import torch
 
 from chitu.utils import try_import_opt_dep

@@ -5,7 +5,7 @@
 import torch
 from chitu.utils import try_import_and_setup_torch_npu
 from chitu.quantization.base import QuantizedLinearBase, QuantizedMoeExpertsBase
-from chitu.distributed.parallel_state import get_tp_group, get_ep_size
+from chitu.distributed.parallel_state import get_tp_group
 from chitu.quantization.registry import QuantizationRegistry
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -183,7 +183,6 @@ class AscendW8A8Linear(QuantizedLinearBase):
                 -1,
                 False,
             )
-        rank = torch.distributed.get_rank()
         quant_bias = (
             self.quant_bias
             if ((get_tp_group().rank_in_group == 0 and self.is_rpl) or not self.is_rpl)

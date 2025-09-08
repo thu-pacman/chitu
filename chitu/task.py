@@ -512,11 +512,11 @@ class TaskPool:
     pool: Dict[str, Task] = {}
     id_list: List[str] = []
 
-    def __bool__(cls):
-        return len(cls.pool) > 0
+    def __bool__(self):
+        return len(self.pool) > 0
 
-    def __len__(cls):
-        return len(cls.pool)
+    def __len__(self):
+        return len(self.pool)
 
     @classmethod
     def reset(cls):

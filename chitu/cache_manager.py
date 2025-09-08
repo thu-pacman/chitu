@@ -12,7 +12,6 @@ from collections import deque
 from chitu.global_vars import get_slot_handle, get_timers, get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
-from chitu.ops import append_to_paged_kv_cache, append_to_dense_kv_cache
 from chitu.utils import ceil_div
 
 logger = getLogger(__name__)
@@ -381,8 +380,6 @@ class PagedKVCacheManager(KVCacheManagerBase):
     def prepare_cache_prefill(self, req_ids: List[str], delta_seq_len: List[int]):
         super().prepare_cache_prefill(req_ids, delta_seq_len)
 
-        block_idxs = []
-        indices_in_block = []
         for req_id, new_seq_len in zip(req_ids, self.seq_len_delta.new.lens_list):
             if req_id not in self.block_table:
                 self.block_table[req_id] = []

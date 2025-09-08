@@ -9,7 +9,6 @@ from logging import getLogger
 from typing import Optional, Tuple, Union
 
 import torch
-import torch.distributed as dist
 
 from chitu.distributed.parallel_state import get_ep_group
 from chitu.utils import try_import_opt_dep
@@ -52,10 +51,6 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             self.group, self.hidden, 2, self.mode, 256, self.num_experts
         )  # FIXME 256 is hard code
         DeepEPBuffer.set_dispatch_mode_as_normal()
-
-    def get_hidden_bytes(x: torch.Tensor) -> int:
-        t = x[0] if isinstance(x, tuple) else x
-        return t.size(1) * max(t.element_size(), 2)
 
     def token_permutation(self, tokens, topk_ids, topk_weights, layer_id: int = 0):
         topk_ids = topk_ids.to(torch.int64)

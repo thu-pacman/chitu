@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 from chitu.async_response import AsyncResponse
 from chitu.backend import Backend
-from chitu.chitu_main import chitu_init, warmup_engine
+from chitu.chitu_main import chitu_init
 from chitu.global_vars import get_global_args
 from chitu.task import Task, TaskLoad, TaskPool, UserRequest
 from chitu.utils import gen_req_id
@@ -119,7 +119,6 @@ async def create_chat_completion(
     top_p = params.pop("top_p")
     top_k = params.pop("top_k")
     freq_pen = params.pop("frequency_penalty")
-    min_batch_size_local = params.pop("min_batch_size")
     stop_with_eos = params.pop("stop_with_eos")
     chat_template_kwargs_unsafe = params.pop("chat_template_kwargs")
 
@@ -345,7 +344,6 @@ async def process_dp_chat_completion(
         # print traceback
         import traceback
 
-        error_time = time.time() - start_time
         logger.error(
             f"[DP_HTTP] DP request processing failed for {request.conversation_id}: {e}"
         )
