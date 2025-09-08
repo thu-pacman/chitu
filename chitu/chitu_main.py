@@ -37,6 +37,7 @@ from chitu.task import (
 )
 from chitu.utils import gen_req_id, try_import_opt_dep, try_import_and_setup_torch_npu
 from chitu.schemas.utils import ModelConfigResolver
+from chitu.utils import ceil_div
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
@@ -179,10 +180,11 @@ def _warmup_via_taskpool(args):
 
     init_cache_static()
     num_warmup_reqs = args.infer.max_reqs
-    if args.infer.prefill_chunk_size is not None:
+    prefill_chunk_size = args.infer.prefill_chunk_size
+    if prefill_chunk_size is not None:
         warmup_seq_len = max(
             min(
-                args.infer.prefill_chunk_size // num_warmup_reqs,
+                prefill_chunk_size // num_warmup_reqs,
                 args.infer.max_seq_len - 1,
             ),
             1,
@@ -192,6 +194,7 @@ def _warmup_via_taskpool(args):
             "infer.prefill_chunk_size is not set, GPU memory usage estimation may be incorrect (may cause OOM)"
         )
         warmup_seq_len = 1
+        prefill_chunk_size = args.infer.max_seq_len
     if rank == 0:
         for i in range(num_warmup_reqs):
             req = MockFixedLengthedUserRequest(
@@ -204,18 +207,27 @@ def _warmup_via_taskpool(args):
             task = Task(f"{req.request_id}", req, stop_with_eos=False)
             TaskPool.add(task)
         logger.info(f"Added {num_warmup_reqs} warmup requests to TaskPool")
+        Backend.scheduler.start_warmup()
 
-    # Prefill
-    chitu_run()
+    num_required_prefill_schedules = ceil_div(
+        warmup_seq_len * num_warmup_reqs, prefill_chunk_size
+    )  # The number of times the prefill tasks needs to be scheduled to be completed
+
+    # prefill
+    for _ in range(num_required_prefill_schedules):
+        chitu_run()
+
     if rank == 0:
         assert (
             len(TaskPool.pool) == num_warmup_reqs
         ), "Tasks should still be there after prefill"
 
-    # Decode
+    # decode
     chitu_run()
+
     if rank == 0:
         assert len(TaskPool.pool) == 0, "TaskPool should be empty after warmup"
+        Backend.scheduler.end_warmup()
 
     # An extra run is needed to receive "finalize KV cache" message from rank 0
     if rank > 0:
@@ -363,7 +375,7 @@ def chitu_init(args, logging_level=None):
                 "Disabling infer.prefill_chunk_size because it is not compatible with DP yet"
             )
             args.infer.prefill_chunk_size = None
-        if args.infer.tp_size > 1 and args.infer.cache_type == "skew":
+        if args.infer.pp_size > 1 and args.infer.cache_type == "skew":
             logger.warning(
                 "Disabling infer.prefill_chunk_size because it is not compatible with PP+skew yet"
             )

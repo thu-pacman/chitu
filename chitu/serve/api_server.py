@@ -12,13 +12,13 @@ import logging
 import os
 import time
 from logging import getLogger
-from typing import Any, List, Optional, Mapping, Annotated
+from typing import Any, List, Optional, Mapping, Annotated, Union
 
 import uvicorn
 import resource
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 
 from chitu.async_response import AsyncResponse
@@ -48,7 +48,7 @@ class HttpHeader(BaseModel):
 
 class Message(BaseModel):
     role: str = "user"
-    content: str = "hello, who are you"
+    content: Union[str, List[Union[str, dict]]] = "hello, who are you"
 
 
 class ChatRequest(BaseModel):
@@ -80,7 +80,7 @@ def get_priority_from_api_key(api_key: str) -> int:
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(
-    request: ChatRequest, http_header: Annotated[HttpHeader, Header()]
+    raw_request: Request, http_header: Annotated[HttpHeader, Header()]
 ):
     global server_status
 
@@ -88,6 +88,20 @@ async def create_chat_completion(
         return {"message": "Service is not started"}
 
     args = get_global_args()
+
+    # Parse JSON body tolerant to missing/incorrect content-type
+    try:
+        data = await raw_request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400, detail="Invalid JSON body. Expecting JSON payload."
+        )
+
+    try:
+        request = ChatRequest.model_validate(data)
+    except ValidationError as e:
+        # Keep consistency with FastAPI default behavior for body validation errors
+        raise HTTPException(status_code=422, detail=e.errors())
 
     # Check if DP mode is enabled and use appropriate processing
     if get_global_args().dp_config.enabled:

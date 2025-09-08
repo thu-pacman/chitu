@@ -5,14 +5,16 @@
 from typing import Optional
 
 from chitu.task_type import TaskType
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_opt_dep, try_import_and_setup_torch_npu
 from chitu.moe.token_dispatchers import (
     MoETokenDispatcher,
+    MoEEmptyTokenDispatcher,
     MoETPTokenDispatcher,
     MoEAllGatherTokenDispatcher,
 )
 
 deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 if has_deep_ep:
     from .token_dispatchers import MoELowLatencyTokenDispatcher
@@ -74,6 +76,8 @@ class MoEImpl:
                 self.prefill_token_dispatcher_impl = "tp"
             elif has_deep_ep:
                 self.prefill_token_dispatcher_impl = "deepep-nl"
+            elif has_torch_npu:
+                self.prefill_token_dispatcher_impl = "empty"
             else:
                 self.prefill_token_dispatcher_impl = "allgather"
 
@@ -82,6 +86,10 @@ class MoEImpl:
                 self.decode_token_dispatcher_impl = "tp"
             elif has_deep_ep:
                 self.decode_token_dispatcher_impl = "deepep-ll"
+            elif (
+                has_torch_npu
+            ):  # use empty for npu_fused_experts_with_communication kernel
+                self.decode_token_dispatcher_impl = "empty"
             else:
                 self.decode_token_dispatcher_impl = "allgather"
                 assert (
@@ -102,6 +110,9 @@ class MoEImpl:
                 ),
             )
             self.prefill_experts_impl = "ep_group_gemm_contiguous"
+        elif self.prefill_token_dispatcher_impl == "empty":
+            self.prefill_token_dispatcher = MoEEmptyTokenDispatcher()
+            self.prefill_experts_impl = "fused_experts_with_a2a_communication"
         elif self.prefill_token_dispatcher_impl == "allgather":
             self.prefill_token_dispatcher = MoEAllGatherTokenDispatcher()
         else:
@@ -118,6 +129,9 @@ class MoEImpl:
                 deepep_use_fp8=self.use_fp8,
             )
             self.decode_experts_impl = "ep_group_gemm_masked"
+        elif self.decode_token_dispatcher_impl == "empty":
+            self.decode_token_dispatcher = MoEEmptyTokenDispatcher()
+            self.decode_experts_impl = "fused_experts_with_communication"
         elif self.decode_token_dispatcher_impl == "allgather":
             self.decode_token_dispatcher = MoEAllGatherTokenDispatcher()
         else:

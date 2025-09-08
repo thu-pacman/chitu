@@ -141,11 +141,23 @@ class Scheduler:
                 raise NotImplementedError(f"Scheduler type {st} not implemented")
 
         self.kvcache_block_threshold = Backend.cache_manager.get_num_blocks()
+        self.is_warmup_stage = False
 
     def reset_kvcache_block_threshold(self):
         self.kvcache_block_threshold = Backend.cache_manager.get_num_blocks()
 
+    def start_warmup(self):
+        self.is_warmup_stage = True
+
+    def end_warmup(self):
+        self.is_warmup_stage = False
+
     def scorer(self, task):
+        if self.is_warmup_stage:
+            fn = lambda task: (
+                1 if task.task_type == TaskType.Prefill else 0
+            )  # prefill first
+            return (fn(task),)
         return tuple(fn(task) for fn in self.scorers)
 
     def schedule(self) -> List[str]:

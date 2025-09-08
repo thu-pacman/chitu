@@ -42,3 +42,19 @@ class MoETokenDispatcher(ABC):
     @abstractmethod
     def prepare(self, num_tokens):
         raise NotImplementedError("prepare function not implemented.")
+
+
+class MoEEmptyTokenDispatcher(MoETokenDispatcher):
+    def __init__(self):
+        pass
+
+    def prepare(self, num_tokens):
+        pass
+
+    def token_permutation(
+        self, tokens: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor
+    ):
+        return tokens, topk_ids, topk_weights, None
+
+    def token_unpermutation(self, expert_outputs: torch.Tensor) -> torch.Tensor:
+        return expert_outputs

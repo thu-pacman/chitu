@@ -402,7 +402,6 @@ class PagedKVCacheManager(KVCacheManagerBase):
         # Prepare enough block table for next decoding. When decoding, AttnBackend will fill new kv into
         # paged kv cache in place.
         for i, req_id in enumerate(req_ids):
-            # if self.seq_len_delta.old.lens_list[i] % self.block_size == 0:
             if self.is_block_full_for_req(req_id):
                 self.block_table[req_id].append(self.get_free_block())
 
@@ -410,7 +409,6 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self._upd_gpu_block_table(req_ids)
 
     def get_free_block(self):
-        # TODO: When run out of free blocks, use scheduling and preemption in paper instead of exception
         self.timers("get_free_block").start()
         if len(self.free_blocks) == 0:
             raise Exception(

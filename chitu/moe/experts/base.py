@@ -17,13 +17,18 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 
 if has_torch_npu:
-    from chitu.npu_utils import fused_experts_npu
+    from chitu.npu_utils import (
+        fused_experts_npu,
+        fused_experts_npu_with_communication,
+        fused_experts_npu_with_a2a_communication,
+    )
 if has_triton:
     from .triton_fused_experts import fused_experts
     from .triton_batched_experts import triton_batched_experts
 if has_deep_gemm:
     from .deepgemm_masked import deepgemm_masked_fused_expert
     from .deepgemm_contiguous import deepgemm_contiguous_fused_expert
+from chitu.distributed.parallel_state import get_ep_size, get_tp_group
 
 
 def fused_experts_wrapper(
@@ -191,6 +196,24 @@ def fused_experts_wrapper(
             )
         else:
             raise NotImplementedError
+    elif impl == "fused_experts_with_communication":
+        return fused_experts_npu_with_communication(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start_idx=experts_start_idx,
+        )
+    elif impl == "fused_experts_with_a2a_communication":
+        return fused_experts_npu_with_a2a_communication(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start_idx=experts_start_idx,
+        )
     elif impl == "torch_npu":
         return fused_experts_npu(
             hidden_states=hidden_states,

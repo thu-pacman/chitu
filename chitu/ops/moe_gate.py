@@ -6,12 +6,18 @@ from typing import Optional
 
 import torch
 
-from chitu.utils import try_import_opt_dep, try_import_platform_dep, is_power_of_two
+from chitu.utils import (
+    try_import_opt_dep,
+    try_import_platform_dep,
+    try_import_and_setup_torch_npu,
+    is_power_of_two,
+)
 from chitu.global_vars import get_global_args
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import get_ggml_quant_type
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
 )
@@ -48,6 +54,22 @@ def moe_gate(
             and is_power_of_two(scores.shape[-1])
         ):
             impl = "cuda"
+        elif has_torch_npu and (
+            (
+                scores.shape[-1] == 256
+                and topk >= 1
+                and topk <= 32
+                and e_score_correction_bias is not None
+                and topk_group == 4
+                and num_expert_group == 8
+            )
+            or (
+                score_func == "softmax"
+                and e_score_correction_bias is None
+                and num_expert_group == 1
+            )
+        ):
+            impl = "npu"
         else:
             impl = "torch"
 
@@ -84,6 +106,15 @@ def moe_gate(
         )
     elif impl == "cpu":
         return moe_gate_cpu(
+            scores,
+            topk,
+            num_expert_group,
+            topk_group,
+            e_score_correction_bias,
+            score_func,
+        )
+    elif impl == "npu":
+        return moe_gate_npu(
             scores,
             topk,
             num_expert_group,
@@ -298,4 +329,44 @@ def moe_gate_cpu(
     )
     cpu_infer.sync()
 
+    return indices, weights
+
+
+def moe_gate_npu(
+    scores,
+    topk,
+    num_expert_group,
+    topk_group,
+    e_score_correction_bias=None,
+    score_func="softmax",
+):
+    B = scores.shape[0]
+    if score_func == "softmax":
+        norm_type = 0
+    elif score_func == "sigmoid":
+        norm_type = 1
+    else:
+        raise ValueError(f"Unsupported score function: {score_func}")
+    if e_score_correction_bias is None:
+        # TODO: there are no examples in ci that e_score_correction_bias is None
+        # npu_moe_gating_top_k need bias is not None
+        weights, indices, row_idx = torch_npu.npu_moe_gating_top_k_softmax(
+            scores, k=topk
+        )
+    else:
+        # if e_score_correction_bias is not none, then score is bf16, e_score_correction_bias is fp32, we need transform scores to fp32,
+        scores = scores.to(e_score_correction_bias.dtype)
+        weights, indices, out_npu = torch_npu.npu_moe_gating_top_k(
+            scores,
+            topk,
+            bias=e_score_correction_bias,
+            k_group=topk_group,
+            group_count=num_expert_group,
+            group_select_mode=1,
+            renorm=0,
+            norm_type=norm_type,
+            out_flag=False,
+            routed_scaling_factor=1.0,
+            eps=1e-20,
+        )
     return indices, weights
