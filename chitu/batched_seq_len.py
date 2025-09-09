@@ -8,6 +8,7 @@ import functools
 import torch
 
 from chitu.static_tensor import StaticTensor
+from chitu.utils import invalidate_cached_property
 
 
 class BatchedSeqLen:
@@ -123,18 +124,11 @@ class BatchedSeqLen:
         if self.cache_seq_ids_tensor_device:
             self._seq_ids_tensor_device_up_to_date = False
 
-        # `@cached_property` properties can be invalidated by just deleting them
-        # See https://docs.python.org/3/library/functools.html#functools.cached_property
-        if hasattr(self, "lens_tensor_cpu"):
-            del self.lens_tensor_cpu
-        if hasattr(self, "prefix_lens_list"):
-            del self.prefix_lens_list
-        if hasattr(self, "batch_size"):
-            del self.batch_size
-        if hasattr(self, "total_len"):
-            del self.total_len
-        if hasattr(self, "max_len"):
-            del self.max_len
+        invalidate_cached_property(self, "lens_tensor_cpu")
+        invalidate_cached_property(self, "prefix_lens_list")
+        invalidate_cached_property(self, "batch_size")
+        invalidate_cached_property(self, "total_len")
+        invalidate_cached_property(self, "max_len")
 
     def copy_from(self, other: "BatchedSeqLen"):
         assert (
@@ -168,18 +162,11 @@ class BatchedSeqLen:
             if self._seq_ids_tensor_device_up_to_date:
                 self._seq_ids_static_tensor_device.set(other.seq_ids_tensor_device)
 
-        # `@cached_property` properties can be invalidated by just deleting them
-        # See https://docs.python.org/3/library/functools.html#functools.cached_property
-        if hasattr(self, "lens_tensor_cpu"):
-            del self.lens_tensor_cpu
-        if hasattr(self, "prefix_lens_list"):
-            del self.prefix_lens_list
-        if hasattr(self, "batch_size"):
-            del self.batch_size
-        if hasattr(self, "total_len"):
-            del self.total_len
-        if hasattr(self, "max_len"):
-            del self.max_len
+        invalidate_cached_property(self, "lens_tensor_cpu")
+        invalidate_cached_property(self, "prefix_lens_list")
+        invalidate_cached_property(self, "batch_size")
+        invalidate_cached_property(self, "total_len")
+        invalidate_cached_property(self, "max_len")
 
     @functools.cached_property
     def lens_tensor_cpu(self) -> torch.Tensor:

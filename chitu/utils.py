@@ -518,3 +518,27 @@ def get_local_ip() -> str:
             return ip
     except Exception:
         pass
+
+
+def invalidate_cached_property(obj, name):
+    """
+    Suppose `obj` has a `functools.cached_property` named `name`, this function invalidate the cache
+
+    `@cached_property` properties can be invalidated by just deleting them. See
+    https://docs.python.org/3/library/functools.html#functools.cached_property
+
+    However, we shall NOT do the following:
+    ```
+    if hasattr(obj, name):
+        delattr(obj, name)
+    ```
+
+    because `hasattr` evaluates the property first, which is redundant.
+
+    Therefore, we shall try and catch
+    """
+
+    try:
+        delattr(obj, name)
+    except AttributeError:
+        pass
