@@ -56,7 +56,7 @@ class NativeLayoutTensor:
         """
 
         if out_type is torch.Tensor:
-            return self.conver_to_plain()
+            return self.convert_to_plain()
         elif isinstance(out_type, NativeLayoutTensor):
             return out_type.convert_from(self)
         else:
@@ -101,8 +101,8 @@ def enable_native_layout_weight(
     key: str,
     native_layout_tensor_class: type,
     allow_missing: bool = False,
-    *other_args,
-    **other_kwargs,
+    *static_args,
+    **static_kwargs,
 ) -> type:
     """
     Return a mix-in class that can be inherit by a Module class, which will enable the Module class to
@@ -138,8 +138,8 @@ def enable_native_layout_weight(
              getter will be named after `self.get_native_layout_{key}`.
         native_layout_tensor_class: A subclass of `NativeLayoutTensor` representing the layout.
         allow_missing: If True, elegantly skip the preprocessing if `self.{key}` does not exists.
-        other_args: Other positional arguments passed to `NativeLayoutTensor`.
-        other_kwargs: Other keyword arguments passed to `NativeLayoutTensor`.
+        static_args: Other positional arguments passed to `NativeLayoutTensor`.
+        static_kwargs: Other keyword arguments passed to `NativeLayoutTensor`.
     """
 
     class EnableNativeLayoutWeightMixIn:
@@ -179,6 +179,23 @@ def enable_native_layout_weight(
                     old_tensor = _get_native_layout_tensor()
                 else:
                     old_tensor = module.__getattr__(key)
+
+                inst_args = getattr(module, f"_{key}_layout_args", None)
+                inst_kwargs = getattr(module, f"_{key}_layout_kwargs", None)
+                other_args = inst_args if inst_args is not None else static_args
+                other_kwargs = inst_kwargs if inst_kwargs is not None else static_kwargs
+
+                def _eval(p):
+                    if callable(p):
+                        try:
+                            return p(module)  # e.g. lambda m: m.in_features
+                        except TypeError:
+                            return p()  # e.g. torch.get_default_dtype
+                    return p
+
+                other_args = tuple(_eval(a) for a in other_args)
+                other_kwargs = {k: _eval(v) for k, v in other_kwargs.items()}
+
                 new_tensor = native_layout_tensor_class.convert_from(
                     old_tensor,
                     *other_args,
@@ -637,3 +654,76 @@ class PartialColumnOddEvenSeparatedTensor(NativeLayoutTensor):
         )
         ret[..., self.begin_idx : self.end_idx] = separated_part
         return ret
+
+
+@dataclass
+class Repeat1ToLength(NativeLayoutTensor):
+    """
+    Repeat a scalar or a tensor with a final dimension of size 1 along the last
+    dimension to a specified `length`. Optionally cast the values to `out_dtype`.
+
+    Notes:
+      - `plain_shape` stores the original shape of the input tensor.
+      - `layout_tensor` stores the repeated 1-D tensor with shape [length].
+    """
+
+    length: int
+    out_dtype: torch.dtype
+
+    @classmethod
+    @override
+    def convert_from(
+        cls, tensor: torch.Tensor, *, length: int, out_dtype: torch.dtype = None
+    ):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"Cannot convert from {type(tensor)} to Repeat1ToLength")
+        if tensor.numel() != 1:
+            raise ValueError(
+                f"Repeat1ToLength expects a scalar/size-1 tensor, but got shape {tuple(tensor.shape)}"
+            )
+
+        if out_dtype is None:
+            out_dtype = tensor.dtype
+
+        layout = tensor.detach().to(out_dtype).view(1).repeat(length).contiguous()
+        return cls(
+            plain_shape=tensor.shape,
+            layout_tensor=layout,
+            length=length,
+            out_dtype=out_dtype,
+        )
+
+    @override
+    def convert_to_plain(self) -> torch.Tensor:
+        val = self.layout_tensor[0].to(self.out_dtype)
+        return val.view(self.plain_shape)
+
+
+@dataclass
+class SqueezeLastSingleton(NativeLayoutTensor):
+    """
+    Remove the trailing singleton dimension of a tensor.
+
+    Shape transform: [..., K, 1] -> [..., K]
+
+    This only changes the view (no data copy) and does not alter the underlying data.
+    """
+
+    @classmethod
+    @override
+    def convert_from(cls, tensor: torch.Tensor) -> "SqueezeLastSingleton":
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"Cannot convert from {type(tensor)} to SqueezeLastSingleton"
+            )
+        if tensor.shape[-1] != 1:
+            raise ValueError(
+                f"SqueezeLastSingleton expects last dim == 1, but got shape {tuple(tensor.shape)}"
+            )
+        return cls(
+            plain_shape=tensor.shape, layout_tensor=tensor.view(*tensor.shape[:-1])
+        )
+
+    @override
+    def convert_to_plain(self) -> torch.Tensor:
+        return self.layout_tensor.view(*self.plain_shape)

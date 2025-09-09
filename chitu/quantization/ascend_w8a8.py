@@ -5,18 +5,37 @@
 import torch
 from chitu.utils import try_import_and_setup_torch_npu
 from chitu.quantization.base import QuantizedLinearBase, QuantizedMoeExpertsBase
-from chitu.distributed.parallel_state import get_tp_group
+from chitu.distributed.parallel_state import get_tp_group, get_ep_size
 from chitu.quantization.registry import QuantizationRegistry
+from chitu.native_layout import (
+    enable_native_layout_weight,
+    NpuFractalZnTensor,
+    Repeat1ToLength,
+    SqueezeLastSingleton,
+)
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 if has_torch_npu:
     from chitu.npu_utils import fused_experts_npu
 
-ACL_FORMAT_FRACTAL_NZ = 29
-
 
 @QuantizationRegistry.register_linear("ascend_w8a8")
-class AscendW8A8Linear(QuantizedLinearBase):
+class AscendW8A8Linear(
+    enable_native_layout_weight("weight", NpuFractalZnTensor),
+    enable_native_layout_weight(
+        "input_scale",
+        Repeat1ToLength,
+        length=(lambda m: m.in_features),
+        out_dtype=(lambda m: torch.get_default_dtype()),
+    ),
+    enable_native_layout_weight(
+        "input_offset",
+        Repeat1ToLength,
+        length=(lambda m: m.in_features),
+        out_dtype=(lambda m: torch.get_default_dtype()),
+    ),
+    QuantizedLinearBase,
+):
     def __init__(
         self,
         ############################################
@@ -71,109 +90,38 @@ class AscendW8A8Linear(QuantizedLinearBase):
             requires_grad=False,
         )
         self.is_rpl = is_rpl
-        self.register_load_state_dict_post_hook(self._on_post_load)
-
-    # FIXME: these hooks will refactor later
-    def _on_post_load(self, module, incompatible_keys):
-        self._schedule_finalize()
-
-    def _param_is_meta(self, t):
-        return (t is None) or (hasattr(t, "is_meta") and t.is_meta)
-
-    def _ready_to_finalize(self):
-        return not any(
-            [
-                self._param_is_meta(getattr(self, "weight", None)),
-                self._param_is_meta(getattr(self, "input_scale", None)),
-                self._param_is_meta(getattr(self, "input_offset", None)),
-            ]
+        self._input_scale_layout_kwargs = dict(
+            length=self.in_features, out_dtype=torch.get_default_dtype()
         )
-
-    def _schedule_finalize(self):
-        if getattr(self, "_finalized", False):
-            return
-
-        if self._ready_to_finalize():
-            self._cpu_finalize_once()
-            self._maybe_npu_cast_once()
-            self._finalized = True
-            return
-
-        if getattr(self, "_finalize_hook", None) is None:
-
-            def _pre_hook(mod, _inp):
-                if getattr(mod, "_finalized", False):
-                    return
-                if mod._ready_to_finalize():
-                    mod._cpu_finalize_once()
-                    mod._maybe_npu_cast_once()
-                    mod._finalized = True
-                    if mod._finalize_hook is not None:
-                        mod._finalize_hook.remove()
-                        mod._finalize_hook = None
-
-            self._finalize_hook = self.register_forward_pre_hook(_pre_hook)
-
-    def _cpu_finalize_once(self):
-        expanding_factor = int(self.weight.shape[1])
-        device = self.weight.device
-
-        self.aclnn_input_scale = torch.nn.Parameter(
-            self.input_scale.detach().repeat(expanding_factor).to(device),
-            requires_grad=False,
+        self._input_offset_layout_kwargs = dict(
+            length=self.in_features, out_dtype=torch.get_default_dtype()
         )
+        self._ready = False
 
-        rec = (1.0 / self.aclnn_input_scale).detach().to(device)
+    @torch.no_grad()
+    def _maybe_build_quant_params(self):
+        if getattr(self, "_ready", False):
+            return
+        scale_vec = self.input_scale.detach()
+        rec = (1.0 / scale_vec).to(scale_vec.dtype)
+
         if hasattr(self, "aclnn_input_scale_reciprocal"):
             self.aclnn_input_scale_reciprocal.copy_(rec)
         else:
             self.register_buffer("aclnn_input_scale_reciprocal", rec, persistent=True)
 
-        self.aclnn_input_offset = torch.nn.Parameter(
-            self.input_offset.detach()
-            .repeat(expanding_factor)
-            .to(device=device, dtype=self.aclnn_input_scale.dtype),
-            requires_grad=False,
-        )
-
-        self.weight.data = self.weight.data.transpose(0, 1).contiguous()
-
-    def _on_npu(self) -> bool:
-        dev = self.weight.device.type
-        return dev in ("npu")
-
-    def _maybe_npu_cast_once(self):
-        if getattr(self, "_npu_cast_done", False):
-            return
-
-        if self._on_npu():
-            try:
-                self.weight.data = torch_npu.npu_format_cast(
-                    self.weight.data, ACL_FORMAT_FRACTAL_NZ
-                )
-                self._npu_cast_done = True
-                return
-            except Exception:
-                pass
-
-        if getattr(self, "_npu_cast_hook", None) is None:
-
-            def _pre_hook(mod, _inp):
-                if getattr(mod, "_npu_cast_done", False):
-                    return
-                if mod._on_npu():
-                    mod.weight.data = torch_npu.npu_format_cast(
-                        mod.weight.data, ACL_FORMAT_FRACTAL_NZ
-                    )
-                    mod._npu_cast_done = True
-                    if mod._npu_cast_hook is not None:
-                        mod._npu_cast_hook.remove()
-                        mod._npu_cast_hook = None
-
-            self._npu_cast_hook = self.register_forward_pre_hook(_pre_hook)
+        off = self.input_offset.detach().to(dtype=scale_vec.dtype)
+        if hasattr(self, "aclnn_input_offset"):
+            self.aclnn_input_offset.copy_(off)
+        else:
+            self.register_buffer("aclnn_input_offset", off, persistent=True)
+        self._ready = True
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+        self._maybe_build_quant_params()
+
         if x.dtype != torch.int8:
             x = torch_npu.npu_quantize(
                 x,
@@ -199,7 +147,11 @@ class AscendW8A8Linear(QuantizedLinearBase):
 
 
 @QuantizationRegistry.register_linear("ascend_w8a8_dynamic")
-class AscendW8A8DynamicLinear(QuantizedLinearBase):
+class AscendW8A8DynamicLinear(
+    enable_native_layout_weight("weight", NpuFractalZnTensor),
+    enable_native_layout_weight("weight_scale", SqueezeLastSingleton),
+    QuantizedLinearBase,
+):
     def __init__(
         self,
         ############################################
@@ -231,95 +183,6 @@ class AscendW8A8DynamicLinear(QuantizedLinearBase):
             requires_grad=False,
         )
 
-        self.register_load_state_dict_post_hook(self._on_post_load)
-
-    # FIXME: these hooks will refactor later
-    def _on_post_load(self, module, incompatible_keys):
-        self._schedule_finalize()
-
-    def _is_meta(self, t):
-        return (t is None) or (hasattr(t, "is_meta") and t.is_meta)
-
-    def _on_npu(self) -> bool:
-        dev = getattr(self.weight, "device", torch.device("cpu"))
-        return dev.type in ("privateuseone", "npu")
-
-    def _ready_cpu_finalize(self) -> bool:
-        return not any(
-            [
-                self._is_meta(getattr(self, "weight", None)),
-                self._is_meta(getattr(self, "weight_scale", None)),
-            ]
-        )
-
-    def _schedule_finalize(self):
-        if getattr(self, "_finalized", False):
-            return
-
-        if self._ready_cpu_finalize():
-            self._cpu_finalize_once()
-            self._maybe_npu_cast_once()
-            self._finalized = True
-            return
-
-        if getattr(self, "_finalize_hook", None) is None:
-
-            def _pre_hook(mod, _inp):
-                if getattr(mod, "_finalized", False):
-                    return
-                if mod._ready_cpu_finalize():
-                    mod._cpu_finalize_once()
-                    mod._maybe_npu_cast_once()
-                    mod._finalized = True
-                    if mod._finalize_hook is not None:
-                        mod._finalize_hook.remove()
-                        mod._finalize_hook = None
-
-            self._finalize_hook = self.register_forward_pre_hook(_pre_hook)
-
-    def _cpu_finalize_once(self):
-        self.weight.data = self.weight.data.transpose(0, 1).contiguous()
-        self.weight_scale.data = self.weight_scale.data.flatten()
-
-        if not hasattr(self, "weight_scale_fp32"):
-            self.register_buffer(
-                "weight_scale_fp32",
-                self.weight_scale.detach().to(torch.float32),
-                persistent=False,
-            )
-        else:
-            self.weight_scale_fp32.copy_(self.weight_scale.detach().to(torch.float32))
-
-    def _maybe_npu_cast_once(self):
-        if getattr(self, "_npu_cast_done", False):
-            return
-
-        if self._on_npu():
-            try:
-                self.weight.data = torch_npu.npu_format_cast(
-                    self.weight.data, ACL_FORMAT_FRACTAL_NZ
-                )
-                self._npu_cast_done = True
-                return
-            except Exception:
-                pass
-
-        if getattr(self, "_npu_cast_hook", None) is None:
-
-            def _pre_hook(mod, _inp):
-                if getattr(mod, "_npu_cast_done", False):
-                    return
-                if mod._on_npu():
-                    mod.weight.data = torch_npu.npu_format_cast(
-                        mod.weight.data, ACL_FORMAT_FRACTAL_NZ
-                    )
-                    mod._npu_cast_done = True
-                    if mod._npu_cast_hook is not None:
-                        mod._npu_cast_hook.remove()
-                        mod._npu_cast_hook = None
-
-            self._npu_cast_hook = self.register_forward_pre_hook(_pre_hook)
-
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         output_dtype = x.dtype
@@ -336,7 +199,13 @@ class AscendW8A8DynamicLinear(QuantizedLinearBase):
 
 
 @QuantizationRegistry.register_moe_experts("ascend_w8a8_dynamic")
-class AscendW8A8DynamicMoeExperts(QuantizedMoeExpertsBase):
+class AscendW8A8DynamicMoeExperts(
+    enable_native_layout_weight("gate_up_proj_weight", NpuFractalZnTensor),
+    enable_native_layout_weight("down_proj_weight", NpuFractalZnTensor),
+    enable_native_layout_weight("gate_up_proj_weight_scale", SqueezeLastSingleton),
+    enable_native_layout_weight("down_proj_weight_scale", SqueezeLastSingleton),
+    QuantizedMoeExpertsBase,
+):
     """
     AscendW8A8Dynamic quantized MoeExperts
     """
@@ -405,135 +274,6 @@ class AscendW8A8DynamicMoeExperts(QuantizedMoeExpertsBase):
             ),
             requires_grad=False,
         )
-
-        self.register_load_state_dict_post_hook(self._on_post_load)
-
-    # FIXME: these hooks will refactor later
-    def _on_post_load(self, module, incompatible_keys):
-        self._schedule_finalize()
-
-    def _is_meta(self, t):
-        return (t is None) or (hasattr(t, "is_meta") and t.is_meta)
-
-    def _on_npu(self) -> bool:
-        dev = getattr(self.down_proj_weight, "device", torch.device("cpu"))
-        return dev.type in ("privateuseone", "npu")
-
-    def _ready_cpu_finalize(self) -> bool:
-        needed = [
-            getattr(self, "down_proj_weight", None),
-            getattr(self, "down_proj_weight_scale", None),
-        ]
-        if self.merge_gate_up:
-            needed += [
-                getattr(self, "gate_up_proj_weight", None),
-                getattr(self, "gate_up_proj_weight_scale", None),
-            ]
-        else:
-            raise NotImplementedError("Ascend MoE must use merged gate up")
-        return all(not self._is_meta(t) for t in needed)
-
-    def _schedule_finalize(self):
-        if getattr(self, "_finalized", False):
-            return
-
-        if self._ready_cpu_finalize():
-            self._cpu_finalize_once()
-            self._maybe_npu_cast_once()
-            self._finalized = True
-            return
-
-        if getattr(self, "_finalize_hook", None) is None:
-
-            def _pre_hook(mod, _inp):
-                if getattr(mod, "_finalized", False):
-                    return
-                if mod._ready_cpu_finalize():
-                    mod._cpu_finalize_once()
-                    mod._maybe_npu_cast_once()
-                    mod._finalized = True
-                    if mod._finalize_hook is not None:
-                        mod._finalize_hook.remove()
-                        mod._finalize_hook = None
-
-            self._finalize_hook = self.register_forward_pre_hook(_pre_hook)
-
-    def _cpu_finalize_once(self):
-        if self.merge_gate_up:
-            self.gate_up_proj_weight.data = self.gate_up_proj_weight.data.transpose(
-                1, 2
-            ).contiguous()
-        else:
-            raise NotImplementedError("Ascend MoE must use merged gate up")
-
-        self.down_proj_weight.data = self.down_proj_weight.data.transpose(
-            1, 2
-        ).contiguous()
-
-        if self.merge_gate_up:
-            self.gate_up_proj_weight_scale.data = (
-                self.gate_up_proj_weight_scale.data.view(
-                    self.gate_up_proj_weight_scale.data.shape[0], -1
-                )
-            )
-        else:
-            raise NotImplementedError("Ascend MoE must use merged gate up")
-
-        self.down_proj_weight_scale.data = self.down_proj_weight_scale.data.view(
-            self.down_proj_weight_scale.data.shape[0], -1
-        )
-        if not hasattr(self, "down_proj_weight_scale_fp32"):
-            self.register_buffer(
-                "down_proj_weight_scale_fp32",
-                self.down_proj_weight_scale.detach().to(torch.float32),
-                persistent=False,
-            )
-        else:
-            self.down_proj_weight_scale_fp32.copy_(
-                self.down_proj_weight_scale.detach().to(torch.float32)
-            )
-
-    def _maybe_npu_cast_once(self):
-        if getattr(self, "_npu_cast_done", False):
-            return
-
-        if self._on_npu():
-            try:
-                if self.merge_gate_up:
-                    self.gate_up_proj_weight.data = torch_npu.npu_format_cast(
-                        self.gate_up_proj_weight.data, ACL_FORMAT_FRACTAL_NZ
-                    )
-                else:
-                    raise NotImplementedError("Ascend MoE must use merged gate up")
-                self.down_proj_weight.data = torch_npu.npu_format_cast(
-                    self.down_proj_weight.data, ACL_FORMAT_FRACTAL_NZ
-                )
-                self._npu_cast_done = True
-                return
-            except Exception:
-                pass
-
-        if getattr(self, "_npu_cast_hook", None) is None:
-
-            def _pre_hook(mod, _inp):
-                if getattr(mod, "_npu_cast_done", False):
-                    return
-                if mod._on_npu():
-                    if mod.merge_gate_up:
-                        mod.gate_up_proj_weight.data = torch_npu.npu_format_cast(
-                            mod.gate_up_proj_weight.data, ACL_FORMAT_FRACTAL_NZ
-                        )
-                    else:
-                        raise NotImplementedError("Ascend MoE must use merged gate up")
-                    mod.down_proj_weight.data = torch_npu.npu_format_cast(
-                        mod.down_proj_weight.data, ACL_FORMAT_FRACTAL_NZ
-                    )
-                    mod._npu_cast_done = True
-                    if mod._npu_cast_hook is not None:
-                        mod._npu_cast_hook.remove()
-                        mod._npu_cast_hook = None
-
-            self._npu_cast_hook = self.register_forward_pre_hook(_pre_hook)
 
     def forward(
         self,

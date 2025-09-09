@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Qwen3-235B-A22B-fp8 is a quantization of Qwen3-235B-A22B
+defaults:
+  - Qwen3-235B-A22B
+  - quant_config: qwen-moe-ascend-int8
+  - _self_ # Config in this file overrides configs in defaults
+
+# Access info
+name: Qwen3-235B-A22B-ascend-int8
+source: "*" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+
