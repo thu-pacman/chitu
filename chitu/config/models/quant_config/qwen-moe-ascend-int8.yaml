@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+quant: 
+- model: '.'
+  rules:
+    - regex: '\.self_attn'
+    - regex: '\.mlp.moe'
+      type: ascend_w8a8_dynamic
+    - regex: '\.mlp.experts\.'
+      type: ascend_w8a8_dynamic
+    - regex: '\.mlp.gate_proj'
+      type: ascend_w8a8_dynamic
+    - regex: '\.mlp.gate_up_proj'
+      type: ascend_w8a8_dynamic
+    - regex: '\.mlp.up_proj'
+      type: ascend_w8a8_dynamic
+    - regex: '\.mlp.down_proj'
+      type: ascend_w8a8_dynamic

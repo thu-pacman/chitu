@@ -108,6 +108,8 @@
   用法: 启动赤兔时追加 `models=Qwen3-14B-mixq-w8a8` 启动参数
 - Qwen3-235B-A22B
   用法: 启动赤兔时追加 `models=Qwen3-235B-A22B` 启动参数
+- Qwen3-235B-A22B-ascend-int8
+  用法: 启动赤兔时追加 `models=Qwen3-235B-A22B-ascend-int8` 启动参数
 - Qwen3-235B-A22B-fp8
   用法: 启动赤兔时追加 `models=Qwen3-235B-A22B-fp8` 启动参数
 - Qwen3-30B-A3B
