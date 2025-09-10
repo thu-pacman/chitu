@@ -477,6 +477,6 @@ class BatchedSeqLenDelta:
     @property
     def delta_seq_ids_tensor_device(self):
         if self.is_classic_decoding:
-            return self.old.lens_tensor_device
+            return torch.arange(self.batch_size, device=self.device, dtype=torch.int32)
         else:
             return self._delta.seq_ids_tensor_device
