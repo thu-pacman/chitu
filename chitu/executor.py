@@ -36,7 +36,7 @@ from chitu.distributed.parallel_state import (
 )
 from chitu.moe import get_moe_impl
 from chitu.hooks import TokenSink, LocalTokenSink, KVTransferHook, NoopKVTransferHook
-from chitu.utils import top_k_top_p_min_p_sampling_from_probs_torch
+from chitu.utils import top_k_top_p_min_p_sampling_from_logits
 from chitu.ops import apply_frequency_penalty, response_append
 from chitu.device_list import DeviceList
 
@@ -889,9 +889,9 @@ class Executor:
         if tasks.is_all_greedy:
             tokens = torch.argmax(logits, dim=-1)
         else:
-            probs = torch.softmax(logits / tasks.temperatures.view(-1, 1), dim=-1)
-            tokens = top_k_top_p_min_p_sampling_from_probs_torch(
-                probs, tasks.top_ks, tasks.top_ps
+            logits = logits / tasks.temperatures.view(-1, 1)
+            tokens = top_k_top_p_min_p_sampling_from_logits(
+                logits, tasks.top_ks, tasks.top_ps
             )
 
         return tokens
