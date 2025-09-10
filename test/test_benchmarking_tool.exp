@@ -1,25 +1,110 @@
 #!/usr/bin/expect
 
+# Execute the check_npus.sh script to get NPU information
+set check_output [exec bash -c "source script/check_npus.sh 2>/dev/null"]
+
+exec pip install aiohttp -i https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null
+
+# Initialize variables
+set USE_NPU 0
+set NPU_TYPE ""
+
+# Parse the output to get USE_NPU and NPU_TYPE
+foreach line [split $check_output "\n"] {
+    if {[string match "USE_NPU=*" $line]} {
+        set USE_NPU [string range $line 8 end]
+    }
+    if {[string match "NPU_TYPE=*" $line]} {
+        set NPU_TYPE [string range $line 9 end]
+    }
+}
+
+puts "USE_NPU = $USE_NPU"
+if {$USE_NPU == 1} {
+    puts "NPU_TYPE = $NPU_TYPE"
+}
+
+set ATNN_TYPE_ARG "infer.attn_type=flash_attn"
+set MODEL_DIR "/data/nfs/Qwen3-32B"
+if {$USE_NPU == 1} {
+    set ATNN_TYPE_ARG "infer.attn_type=npu"
+    set MODEL_DIR "/data/models/Qwen3-32B"
+}
+
 # Launch the server
-spawn grun timeout 10m torchrun --nproc_per_node 1 -m chitu \
-    models=Qwen2-7B-Instruct \
-    models.ckpt_dir=/home/share/models/Qwen2-7B-Instruct \
-    infer.cache_type=paged \
-    infer.max_reqs=2 \
-    infer.max_seq_len=1024 \
-    serve.host=127.0.0.1 \
-    serve.port=21100
+    spawn torchrun --nproc_per_node 2 --master_port=29587 -m chitu \
+        models=Qwen3-32B \
+        models.ckpt_dir=$MODEL_DIR \
+        infer.cache_type=paged \
+        $ATNN_TYPE_ARG \
+        infer.max_reqs=128 \
+        infer.max_seq_len=1200 \
+        infer.tp_size=2 \
+        infer.use_cuda_graph=True
+
 set pid [exp_pid]
-system echo "Launching sever, pid is $pid"
+puts "Launching server, pid is $pid"
 
 # Wait for the server to start
 expect -timeout -1 "Uvicorn running on"
 
-# Test the server
-system echo "Starting test..."
-system python benchmarks/benchmark_serving.py --model "qwen2-7b" --iterations 10 --warmup 3 --input-len 10 --output-len 10 --base-url http://127.0.0.1:21100 || exit 1
+# Initialize formatted records with header
+set benchmark_formated_records "Batch Size;Benchmark duration (s);TPS (tok/s);TTFT (s);TPOT (s);Total Throughput (tok/s)\n"
+
+# Loop over batch sizes: 1 and 64
+foreach bs {1 64} {
+    puts "Starting test with batch size = $bs..."
+
+    # Run benchmark and capture output (including stderr)
+    if {[catch {
+        set output [exec python benchmarks/benchmark_serving.py \
+            --model "Qwen3-32B" \
+            --batch-size $bs \
+            --iterations 1 \
+            --warmup 1 \
+            --input-len 128 \
+            --output-len 1024 \
+            --base-url http://127.0.0.1:21002 2>@1]
+    } err]} {
+        puts "Benchmark failed for batch size $bs: $err"
+        set duration "N/A"
+        set output_throughput "N/A"
+        set total_throughput "N/A"
+        set mean_tpot "N/A"
+        set mean_ttft "N/A"
+    } else {
+        # Extract metrics
+        set duration [exec echo $output | grep "Benchmark duration" | awk {{print $NF}} 2>/dev/null]
+        set output_throughput [exec echo $output | grep "Output token throughput" | awk {{print $NF}} 2>/dev/null]
+        set total_throughput [exec echo $output | grep "Total Token throughput" | awk {{print $NF}} 2>/dev/null]
+        set mean_tpot [exec echo $output | grep "Mean TPOT" | awk {{print $NF}} 2>/dev/null]
+        set mean_ttft [exec echo $output | grep "Mean TTFT" | awk {{print $NF}} 2>/dev/null]
+
+        # If empty, set to N/A
+        if {$duration eq ""} { set output_throughput "N/A" }
+        if {$output_throughput eq ""} { set output_throughput "N/A" }
+        if {$total_throughput eq ""} { set total_throughput "N/A" }
+        if {$mean_tpot eq ""} { set mean_tpot "N/A" }
+        if {$mean_ttft eq ""} { set mean_ttft "N/A" }
+    }
+
+    # Append formatted record
+    append benchmark_formated_records "$bs;$duration;$output_throughput;$mean_ttft;$mean_tpot;$total_throughput\n"
+}
+
+# Print table
+puts "==================== BENCHMARK SUMMARY ===================="
+if {[catch {
+    set formatted_table [exec echo $benchmark_formated_records | column -t -s \;]
+    puts $formatted_table
+} err]} {
+    # Fallback: print raw if column fails
+    puts $benchmark_formated_records
+}
+puts "==========================================================="
+
 
 # Clean up
-system echo "Testing done. You may see some killing messages following, which is expected."
-system echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-system kill $pid
+puts "Testing done. You may see some killing messages following, which is expected."
+puts "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+exec kill $pid

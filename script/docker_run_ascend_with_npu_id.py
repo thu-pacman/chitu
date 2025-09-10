@@ -19,29 +19,45 @@ if not "ASCEND_RT_VISIBLE_DEVICES" in os.environ:
     print(f"{sys.argv[0]} is supposed to be used with ASCEND_RT_VISIBLE_DEVICES set.")
     exit(1)
 
+
 npu_ids = os.environ["ASCEND_RT_VISIBLE_DEVICES"].split(",")
 
 cmd = "docker"
 args = [
     "docker",
     "run",
-    "--device",
-    "/dev/davinci_manager",
-    "--device",
-    "/dev/devmm_svm",
-    "--device",
-    "/dev/hisi_hdc",
-    "-v",
-    "/usr/local/dcmi:/usr/local/dcmi",
-    "-v",
-    "/usr/local/bin/npu-smi:/usr/local/bin/npu-smi",
-    "-v",
-    "/usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/",
-    "-v",
-    "/usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info",
-    "-v",
-    "/etc/ascend_install.info:/etc/ascend_install.info",
 ]
+
+if "--benchmark" not in sys.argv[1:]:
+    args.extend(
+        [
+            # open CANN plog
+            "-e",
+            "ASCEND_GLOBAL_LOG_LEVEL=0",
+        ]
+    )
+else:
+    del sys.argv[sys.argv.index("--benchmark")]
+args.extend(
+    [
+        "--device",
+        "/dev/davinci_manager",
+        "--device",
+        "/dev/devmm_svm",
+        "--device",
+        "/dev/hisi_hdc",
+        "-v",
+        "/usr/local/dcmi:/usr/local/dcmi",
+        "-v",
+        "/usr/local/bin/npu-smi:/usr/local/bin/npu-smi",
+        "-v",
+        "/usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/",
+        "-v",
+        "/usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info",
+        "-v",
+        "/etc/ascend_install.info:/etc/ascend_install.info",
+    ]
+)
 for npu_id in npu_ids:
     args += ["--device", f"/dev/davinci{npu_id}"]
 for arg in sys.argv[1:]:
