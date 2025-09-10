@@ -398,6 +398,8 @@ class AttnBackend(abc.ABC):
                 k.contiguous(),
                 seq_len_delta.delta_position_ids_tensor_device,
                 seq_len_delta.delta_seq_ids_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
             )
             if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefilling
                 k = read_from_paged_kv_cache(
@@ -414,6 +416,8 @@ class AttnBackend(abc.ABC):
                 v.contiguous(),
                 seq_len_delta.delta_position_ids_tensor_device,
                 seq_len_delta.delta_seq_ids_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
             )
             if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefilling
                 v = read_from_paged_kv_cache(
@@ -711,6 +715,8 @@ class AttnBackend(abc.ABC):
             kv.contiguous(),
             seq_len_delta.delta_position_ids_tensor_device,
             seq_len_delta.delta_seq_ids_tensor_device,
+            get_page_ids=kv_cache.get_page_ids,
+            get_offs_in_page=kv_cache.get_offs_in_page,
         )
         if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefilling
             kv = read_from_paged_kv_cache(
@@ -1375,7 +1381,12 @@ class TritonAttnBackend(RefAttnBackend):
         _, _, qk_rope_head_dim = q_pe.shape
 
         append_to_paged_kv_cache(
-            kv_cache.k, kv_cache.block_table, kv, seq_len_delta.old.lens_tensor_device
+            kv_cache.k,
+            kv_cache.block_table,
+            kv,
+            seq_len_delta.old.lens_tensor_device,
+            get_page_ids=kv_cache.get_page_ids,
+            get_offs_in_page=kv_cache.get_offs_in_page,
         )
 
         o = torch.zeros(
@@ -1543,12 +1554,16 @@ class TritonAttnBackend(RefAttnBackend):
                 kv_cache.block_table,
                 k.contiguous(),
                 seq_len_delta.old.lens_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
             )
             append_to_paged_kv_cache(
                 kv_cache.v,
                 kv_cache.block_table,
                 v.contiguous(),
                 seq_len_delta.old.lens_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
             )
         else:
             assert False
@@ -1654,7 +1669,12 @@ class FlashMLABackend(TritonAttnBackend):
         q_nope_pe = q_nope_pe.view(bsz, 1, q_nope_pe.shape[-2], q_nope_pe.shape[-1])
 
         append_to_paged_kv_cache(
-            kv_cache.k, kv_cache.block_table, kv, seq_len_delta.old.lens_tensor_device
+            kv_cache.k,
+            kv_cache.block_table,
+            kv,
+            seq_len_delta.old.lens_tensor_device,
+            get_page_ids=kv_cache.get_page_ids,
+            get_offs_in_page=kv_cache.get_offs_in_page,
         )
 
         output, _ = flash_mla.flash_mla_with_kvcache(
@@ -1885,7 +1905,12 @@ class FlashInferBackend(TritonAttnBackend):
         assert q_pe.shape[1] == local_n_heads
         _, _, self.qk_rope_head_dim = q_pe.shape
         append_to_paged_kv_cache(
-            kv_cache.k, kv_cache.block_table, kv, seq_len_delta.old.lens_tensor_device
+            kv_cache.k,
+            kv_cache.block_table,
+            kv,
+            seq_len_delta.old.lens_tensor_device,
+            get_page_ids=kv_cache.get_page_ids,
+            get_offs_in_page=kv_cache.get_offs_in_page,
         )
 
         return self.mla_decode_wrapper.run(
@@ -1918,6 +1943,8 @@ class FlashInferBackend(TritonAttnBackend):
             kv,
             seq_len_delta.delta_position_ids_tensor_device,
             seq_len_delta.delta_seq_ids_tensor_device,
+            get_page_ids=kv_cache.get_page_ids,
+            get_offs_in_page=kv_cache.get_offs_in_page,
         )
 
         q_indptr = seq_len_delta.delta_prefix_lens_tensor_device
@@ -2049,12 +2076,16 @@ class FlashInferBackend(TritonAttnBackend):
                 kv_cache.block_table,
                 k,
                 seq_len_delta.old.lens_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
             )
             append_to_paged_kv_cache(
                 kv_cache.v,
                 kv_cache.block_table,
                 v,
                 seq_len_delta.old.lens_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
             )
 
         q = pad_tensor(q, batch_size)
@@ -2382,12 +2413,16 @@ class NpuAttnBackend(RefAttnBackend):
             kv_cache.block_table,
             k,
             seq_len_delta.old.lens_tensor_device,
+            get_page_ids=kv_cache.get_page_ids,
+            get_offs_in_page=kv_cache.get_offs_in_page,
         )
         append_to_paged_kv_cache(
             kv_cache.v,
             kv_cache.block_table,
             v,
             seq_len_delta.old.lens_tensor_device,
+            get_page_ids=kv_cache.get_page_ids,
+            get_offs_in_page=kv_cache.get_offs_in_page,
         )
 
         block_size = kv_cache.k.shape[1]
@@ -2441,6 +2476,8 @@ class NpuAttnBackend(RefAttnBackend):
             kv_cache.block_table,
             kv,
             seq_len_delta.old.lens_tensor_device,
+            get_page_ids=kv_cache.get_page_ids,
+            get_offs_in_page=kv_cache.get_offs_in_page,
         )
         # kv_cache[indices, positions] = kv.squeeze(1) if kv.ndim == 3 and kv.shape[1] == 1 else kv
 

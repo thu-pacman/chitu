@@ -2,13 +2,14 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Dict, List, Sequence, Optional
+from typing import Dict, List, Sequence, Optional, Callable
 from typing_extensions import override
 from dataclasses import dataclass
 from logging import getLogger
 import torch
 from collections import deque
 
+from chitu.cuda_graph import cuda_graph_safe_cached_property
 from chitu.global_vars import get_slot_handle, get_timers, get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
@@ -33,6 +34,8 @@ class PagedKVCacheAccessor(KVCacheAccessor):
     block_table: torch.Tensor
     k: Optional[torch.Tensor]
     v: Optional[torch.Tensor]
+    get_page_ids: Optional[Callable[[], torch.Tensor]] = None
+    get_offs_in_page: Optional[Callable[[], torch.Tensor]] = None
 
 
 @dataclass
@@ -108,15 +111,20 @@ class KVCacheManagerBase:
         self.req_id_to_seq_len: Dict[str, int] = {}
 
         prefill_chunk_size = get_global_args().infer.prefill_chunk_size
-        self.seq_len_delta = BatchedSeqLenDelta(
-            device=self.device,
-            max_batch_size=num_hot_req,
-            max_total_len=num_hot_req * max_seq_len,
-            max_total_delta_len=(
+        self.max_total_len = num_hot_req * max_seq_len
+        self.max_total_delta_len = max(
+            (
                 prefill_chunk_size
                 if prefill_chunk_size is not None
                 else num_hot_req * max_seq_len
-            ),
+            ),  # prefill
+            num_hot_req,  # decode
+        )
+        self.seq_len_delta = BatchedSeqLenDelta(
+            device=self.device,
+            max_batch_size=num_hot_req,
+            max_total_len=self.max_total_len,
+            max_total_delta_len=self.max_total_delta_len,
             cache_prefix_lens_tensor_device=True,
             cache_position_ids_tensor_device=True,
             cache_seq_ids_tensor_device=True,
@@ -271,6 +279,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.free_blocks = deque(range(self.num_blocks))
         self.paged_k_cache: Optional[torch.Tensor]
         self.paged_v_cache: Optional[torch.Tensor]
+
         if self.k_shape_per_sample is not None:
             self.paged_k_cache = torch.zeros(
                 (self.num_layers, self.num_blocks, block_size)
@@ -287,6 +296,15 @@ class PagedKVCacheManager(KVCacheManagerBase):
             )
         else:
             self.paged_v_cache = None
+
+        self._page_ids_static_tensor = StaticTensor(
+            max_nelem=self.max_total_delta_len, device=device, dtype=torch.int32
+        )
+        self._offs_in_page_static_tensor = StaticTensor(
+            max_nelem=self.max_total_delta_len, device=device, dtype=torch.int32
+        )
+        self._page_ids_up_to_date = False
+        self._offs_in_page_up_to_date = False
 
     def get_max_blocks_per_req(self) -> int:
         """Return the maximum number of blocks a single request can occupy."""
@@ -360,6 +378,19 @@ class PagedKVCacheManager(KVCacheManagerBase):
         """Renturn number of blocks that has reserved for reqs to use."""
         return self.num_blocks - len(self.free_blocks)
 
+    @cuda_graph_safe_cached_property("_page_ids_static_tensor", "_page_ids_up_to_date")
+    def page_ids(self):
+        return self.gpu_block_table.get()[
+            self.seq_len_delta.delta_seq_ids_tensor_device,
+            self.seq_len_delta.delta_position_ids_tensor_device // self.block_size,
+        ]
+
+    @cuda_graph_safe_cached_property(
+        "_offs_in_page_static_tensor", "_offs_in_page_up_to_date"
+    )
+    def offs_in_page(self):
+        return self.seq_len_delta.delta_position_ids_tensor_device % self.block_size
+
     def _upd_gpu_block_table(self, req_ids: List[str]):
         if get_global_args().infer.use_cuda_graph:
             max_block_num = self.max_blocks_per_req
@@ -375,6 +406,9 @@ class PagedKVCacheManager(KVCacheManagerBase):
         cpu_block_table_tensor = torch.tensor(all_block_ids, dtype=torch.int32)
         self.gpu_block_table.set_shape(cpu_block_table_tensor.shape)
         self.gpu_block_table.get().copy_(cpu_block_table_tensor, non_blocking=True)
+
+        self._page_ids_up_to_date = False
+        self._offs_in_page_up_to_date = False
 
     @override
     def prepare_cache_prefill(self, req_ids: List[str], delta_seq_len: List[int]):
@@ -434,7 +468,13 @@ class PagedKVCacheManager(KVCacheManagerBase):
             if self.paged_v_cache is not None
             else None
         )
-        return PagedKVCacheAccessor(self.get_gpu_block_table(), ret_k, ret_v)
+        return PagedKVCacheAccessor(
+            self.get_gpu_block_table(),
+            ret_k,
+            ret_v,
+            lambda: self.page_ids,
+            lambda: self.offs_in_page,
+        )
 
     def free_req_cache_blocks(self, req_id: str):
         self.timers("free_req_cache_blocks").start()

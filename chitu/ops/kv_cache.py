@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
+from typing import Optional, Callable
 import torch
 
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
@@ -24,6 +24,8 @@ def append_to_paged_kv_cache(
     this_kv: torch.Tensor,
     delta_position_ids: torch.Tensor,
     delta_seq_ids: Optional[torch.Tensor] = None,
+    get_page_ids: Optional[Callable[[], torch.Tensor]] = None,
+    get_offs_in_page: Optional[Callable[[], torch.Tensor]] = None,
     impl: str = "auto",
 ):
     """
@@ -59,7 +61,13 @@ def append_to_paged_kv_cache(
         )
     else:
         append_to_paged_kv_cache_torch(
-            kv_cache, page_table, this_kv, delta_position_ids, delta_seq_ids
+            kv_cache,
+            page_table,
+            this_kv,
+            delta_position_ids,
+            delta_seq_ids,
+            get_page_ids,
+            get_offs_in_page,
         )
 
 
@@ -112,24 +120,37 @@ def append_to_paged_kv_cache_torch(
     this_kv: torch.Tensor,  # (num_tokens, other contiguous dims...)
     delta_position_ids: torch.Tensor,  # (num_tokens,)
     delta_seq_ids: Optional[torch.Tensor] = None,  # (num_tokens,)
+    get_page_ids: Optional[Callable[[], torch.Tensor]] = None,  # fn -> (num_tokens,)
+    get_offs_in_page: Optional[
+        Callable[[], torch.Tensor]
+    ] = None,  # fn -> (num_tokens,)
 ):
-    if delta_seq_ids is None:
-        if page_table.shape[0] != delta_position_ids.shape[0]:
-            raise ValueError(
-                f"batch_size ({page_table.shape[0]}) must be equal to num_tokens "
-                f"({delta_position_ids.shape[0]}) if ignoring delta_seq_ids"
-            )
-        delta_seq_ids = torch.arange(
-            delta_position_ids.shape[0],
-            dtype=delta_position_ids.dtype,
-            device=delta_position_ids.device,
-        )
-
     page_size = kv_cache.shape[1]
-    kv_cache[
-        page_table[delta_seq_ids, delta_position_ids // page_size],
-        delta_position_ids % page_size,
-    ] = this_kv.view(this_kv.shape[0], *kv_cache.shape[2:])
+
+    if get_page_ids is None:
+        if delta_seq_ids is None:
+            if page_table.shape[0] != delta_position_ids.shape[0]:
+                raise ValueError(
+                    f"batch_size ({page_table.shape[0]}) must be equal to num_tokens "
+                    f"({delta_position_ids.shape[0]}) if ignoring delta_seq_ids"
+                )
+            delta_seq_ids = torch.arange(
+                delta_position_ids.shape[0],
+                dtype=delta_position_ids.dtype,
+                device=delta_position_ids.device,
+            )
+        page_ids = page_table[delta_seq_ids, delta_position_ids // page_size]
+    else:
+        page_ids = get_page_ids()
+
+    if get_offs_in_page is None:
+        offs_in_page = delta_position_ids % page_size
+    else:
+        offs_in_page = get_offs_in_page()
+
+    kv_cache[page_ids, offs_in_page] = this_kv.view(
+        this_kv.shape[0], *kv_cache.shape[2:]
+    )
 
 
 def append_to_dense_kv_cache_torch(

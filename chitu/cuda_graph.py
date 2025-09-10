@@ -2,12 +2,27 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Callable, Sequence, Mapping, Any, Optional, Dict
+from typing import Callable, Sequence, Mapping, Any, Optional, Dict, List
 import functools
 import torch
 
 from chitu.static_tensor import StaticTensor
 from chitu.device_type import is_ascend
+
+_is_warming_up_before_cuda_graph_capture = False
+_currently_capturing_graph_object = None
+_post_hook_per_graph_object: Dict[torch.cuda.CUDAGraph, List[Callable[[], None]]] = {}
+
+
+def is_warming_up_before_cuda_graph_capture():
+    return _is_warming_up_before_cuda_graph_capture
+
+
+def add_post_hook_for_currently_capturing_graph_object(hook: Callable[[], None]):
+    assert isinstance(_currently_capturing_graph_object, torch.cuda.CUDAGraph)
+    if _currently_capturing_graph_object not in _post_hook_per_graph_object:
+        _post_hook_per_graph_object[_currently_capturing_graph_object] = []
+    _post_hook_per_graph_object[_currently_capturing_graph_object].append(hook)
 
 
 def make_dispatched_graphed_callables(
@@ -64,6 +79,9 @@ def make_dispatched_graphed_callables(
         output_device_dict = {}
 
         def new_callable(key: Any, *args, **kwargs):
+            global _is_warming_up_before_cuda_graph_capture
+            global _currently_capturing_graph_object
+
             nonlocal graph_dict
             nonlocal cuda_graph_pool
             nonlocal args_static_tensors
@@ -75,10 +93,15 @@ def make_dispatched_graphed_callables(
 
             if key not in graph_dict:
                 # Warmup
-                sample_output = f(*args, **kwargs)
-                output_shape_dict[key] = sample_output.shape
-                output_dtype_dict[key] = sample_output.dtype
-                output_device_dict[key] = sample_output.device
+                assert _is_warming_up_before_cuda_graph_capture is False
+                try:
+                    _is_warming_up_before_cuda_graph_capture = True
+                    sample_output = f(*args, **kwargs)
+                    output_shape_dict[key] = sample_output.shape
+                    output_dtype_dict[key] = sample_output.dtype
+                    output_device_dict[key] = sample_output.device
+                finally:
+                    _is_warming_up_before_cuda_graph_capture = False
 
                 # Allocate static tensors
                 if args_static_tensors is None:
@@ -108,15 +131,30 @@ def make_dispatched_graphed_callables(
 
                 # Capture the graph
                 graph_dict[key] = torch.cuda.CUDAGraph()
-                if is_ascend():
-                    capturing_stream = torch.npu.Stream(device=sample_output.device)
-                    capturing_stream.wait_stream(torch.npu.current_stream())
-                    with torch.npu.stream(capturing_stream):
-                        with torch.cuda.graph(
-                            graph_dict[key],
-                            pool=cuda_graph_pool,
-                            auto_dispatch_capture=True,
-                        ):
+                try:
+                    _currently_capturing_graph_object = graph_dict[key]
+                    if is_ascend():
+                        capturing_stream = torch.npu.Stream(device=sample_output.device)
+                        capturing_stream.wait_stream(torch.npu.current_stream())
+                        with torch.npu.stream(capturing_stream):
+                            with torch.cuda.graph(
+                                graph_dict[key],
+                                pool=cuda_graph_pool,
+                                auto_dispatch_capture=True,
+                            ):
+                                output = f(
+                                    *[
+                                        static_tensor.get()
+                                        for static_tensor in args_static_tensors
+                                    ],
+                                    **{
+                                        k: static_tensor.get()
+                                        for k, static_tensor in kwargs_static_tensors.items()
+                                    },
+                                )
+                                output_static_tensor.set(output)
+                    else:
+                        with torch.cuda.graph(graph_dict[key], pool=cuda_graph_pool):
                             output = f(
                                 *[
                                     static_tensor.get()
@@ -128,19 +166,8 @@ def make_dispatched_graphed_callables(
                                 },
                             )
                             output_static_tensor.set(output)
-                else:
-                    with torch.cuda.graph(graph_dict[key], pool=cuda_graph_pool):
-                        output = f(
-                            *[
-                                static_tensor.get()
-                                for static_tensor in args_static_tensors
-                            ],
-                            **{
-                                k: static_tensor.get()
-                                for k, static_tensor in kwargs_static_tensors.items()
-                            },
-                        )
-                        output_static_tensor.set(output)
+                finally:
+                    _currently_capturing_graph_object = None
                 if cuda_graph_pool is None:
                     cuda_graph_pool = graph_dict[key].pool()
 
@@ -163,6 +190,9 @@ def make_dispatched_graphed_callables(
                     before_replay_callback(graph_dict[key])
                 graph_dict[key].replay()
 
+            for hooks in _post_hook_per_graph_object.get(graph_dict[key], []):
+                hooks()
+
             return output_static_tensor.get()
 
     else:  # not enable
@@ -171,3 +201,68 @@ def make_dispatched_graphed_callables(
             return f(*args, **kwargs)
 
     return functools.update_wrapper(new_callable, f)
+
+
+def cuda_graph_safe_cached_property(
+    static_tensor_name: str,
+    up_to_date_flag_name: str,
+    *,
+    enable_flag_name: Optional[str] = None,
+):
+    """
+    Similar to `functools.cached_property`, but the returned value is a tensor, and can be used
+    within or without a CUDA graph.
+
+    This decorator is intended for:
+    1. caching a tensor and then reusing it without a CUDA graph.
+    2. caching a tensor and then reusing it within a CUDA graph.
+    3. caching a tensor before a CUDA graph, and then reusing it within a CUDA graph.
+    4. caching a tensor within a CUDA graph, and then reusing it after the CUDA graph.
+
+    Note that the reusing behaviour should be consistent for the same graph object, which means
+    you can NOT sometimes do case 2 and sometimes do case 3. If you need to support such cases,
+    please add a key to `make_dispatched_graphed_callables` and capture multiple graph objects.
+    Currently this function is NOT checking the consistency, and the user should ensure it.
+
+    In order to support 3 and 4, the tensor is stored in an external `StaticTensor` as inputs
+    or outputs of the CUDA graph, instead of storing it directly in a property like `functools.cached_property`.
+
+    In order to support 3, the cache will not be updated during the warming up phase before a graph
+    capture. Otherwise, the value update will be incorrectly skipped in the graph before it is
+    falsefully already "cached".
+
+    Example usage:
+    ```
+    class A:
+        def __init__(self):
+            self._xxx_static_tensor = StaticTensor(...)  # Should be large enough to hold the tensor
+            self._xxx_up_to_date = False
+
+        @cuda_graph_safe_cached_property("_xxx_static_tensor", "_xxx_up_to_date")
+        def xxx(self):
+            return ...
+    ```
+    """
+
+    def decorator(fn: Callable):
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            if enable_flag_name is None or getattr(self, enable_flag_name):
+                static_tensor = getattr(self, static_tensor_name)
+                assert isinstance(static_tensor, StaticTensor)
+                assert isinstance(getattr(self, up_to_date_flag_name), bool)
+                if not getattr(self, up_to_date_flag_name):
+                    static_tensor.set(fn(self, *args, **kwargs))
+                    if not is_warming_up_before_cuda_graph_capture():
+                        setattr(self, up_to_date_flag_name, True)
+                    if torch.cuda.is_current_stream_capturing():
+                        add_post_hook_for_currently_capturing_graph_object(
+                            lambda: setattr(self, up_to_date_flag_name, True)
+                        )
+                return static_tensor.get()
+            else:
+                return fn(self, *args, **kwargs)
+
+        return property(wrapper)
+
+    return decorator
