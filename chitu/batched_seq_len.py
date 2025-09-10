@@ -8,6 +8,7 @@ import functools
 import torch
 
 from chitu.static_tensor import StaticTensor
+from chitu.cuda_graph import cuda_graph_safe_cached_property
 from chitu.utils import invalidate_cached_property
 
 
@@ -180,7 +181,12 @@ class BatchedSeqLen:
     def prefix_lens_list(self) -> List[int]:
         return list(itertools.accumulate(self.lens_list, initial=0))
 
-    def _comp_prefix_lens_tensor_device(self):
+    @cuda_graph_safe_cached_property(
+        static_tensor_name="_prefix_lens_static_tensor_device",
+        up_to_date_flag_name="_prefix_lens_tensor_device_up_to_date",
+        enable_flag_name="cache_prefix_lens_tensor_device",
+    )
+    def prefix_lens_tensor_device(self) -> torch.Tensor:
         return torch.cat(
             [
                 torch.zeros((1,), device=self.device, dtype=torch.int32),
@@ -189,19 +195,12 @@ class BatchedSeqLen:
             dim=0,
         )
 
-    @property
-    def prefix_lens_tensor_device(self) -> torch.Tensor:
-        if self.cache_prefix_lens_tensor_device:
-            if not self._prefix_lens_tensor_device_up_to_date:
-                self._prefix_lens_static_tensor_device.set(
-                    self._comp_prefix_lens_tensor_device()
-                )
-                self._prefix_lens_tensor_device_up_to_date = True
-            return self._prefix_lens_static_tensor_device.get()
-        else:
-            return self._comp_prefix_lens_tensor_device()
-
-    def _comp_position_ids_tensor_device(self):
+    @cuda_graph_safe_cached_property(
+        static_tensor_name="_position_ids_static_tensor_device",
+        up_to_date_flag_name="_position_ids_tensor_device_up_to_date",
+        enable_flag_name="cache_position_ids_tensor_device",
+    )
+    def position_ids_tensor_device(self) -> torch.Tensor:
         if not torch.any(self.lens_tensor_device == 0):
             x = torch.ones(self.total_len, device=self.device, dtype=torch.int32)
             # Example: x = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
@@ -225,19 +224,12 @@ class BatchedSeqLen:
 
         return x
 
-    @property
-    def position_ids_tensor_device(self) -> torch.Tensor:
-        if self.cache_position_ids_tensor_device:
-            if not self._position_ids_tensor_device_up_to_date:
-                self._position_ids_static_tensor_device.set(
-                    self._comp_position_ids_tensor_device()
-                )
-                self._position_ids_tensor_device_up_to_date = True
-            return self._position_ids_static_tensor_device.get()
-        else:
-            return self._comp_position_ids_tensor_device()
-
-    def _comp_seq_ids_tensor_device(self):
+    @cuda_graph_safe_cached_property(
+        static_tensor_name="_seq_ids_static_tensor_device",
+        up_to_date_flag_name="_seq_ids_tensor_device_up_to_date",
+        enable_flag_name="cache_seq_ids_tensor_device",
+    )
+    def seq_ids_tensor_device(self) -> torch.Tensor:
         # Example: lens = [3, 5, 2]
 
         ret = torch.repeat_interleave(
@@ -248,18 +240,6 @@ class BatchedSeqLen:
         # Example: ret = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2]
 
         return ret
-
-    @property
-    def seq_ids_tensor_device(self) -> torch.Tensor:
-        if self.cache_seq_ids_tensor_device:
-            if not self._seq_ids_tensor_device_up_to_date:
-                self._seq_ids_static_tensor_device.set(
-                    self._comp_seq_ids_tensor_device()
-                )
-                self._seq_ids_tensor_device_up_to_date = True
-            return self._seq_ids_static_tensor_device.get()
-        else:
-            return self._comp_seq_ids_tensor_device()
 
     @functools.cached_property
     def batch_size(self) -> int:
@@ -454,7 +434,12 @@ class BatchedSeqLenDelta:
         else:
             return self._delta.prefix_lens_tensor_device
 
-    def _comp_delta_position_ids_tensor_device(self):
+    @cuda_graph_safe_cached_property(
+        static_tensor_name="_delta_position_ids_static_tensor_device",
+        up_to_date_flag_name="_delta_position_ids_tensor_device_up_to_date",
+        enable_flag_name="cache_delta_position_ids_tensor_device",
+    )
+    def _delta_position_ids_tensor_device_impl(self):
         # Example: old = [10, 20, 30], new = [13, 25, 32]
 
         delta_lens = self.new.lens_tensor_device - self.old.lens_tensor_device
@@ -486,15 +471,8 @@ class BatchedSeqLenDelta:
         # NOTE: delta_position_ids is NOT _delta.position_ids
         if self.is_classic_decoding:
             return self.old.lens_tensor_device
-        if self.cache_delta_position_ids_tensor_device:
-            if not self._delta_position_ids_tensor_device_up_to_date:
-                self._delta_position_ids_static_tensor_device.set(
-                    self._comp_delta_position_ids_tensor_device()
-                )
-                self._delta_position_ids_tensor_device_up_to_date = True
-            return self._delta_position_ids_static_tensor_device.get()
         else:
-            return self._comp_delta_position_ids_tensor_device()
+            return self._delta_position_ids_tensor_device_impl
 
     @property
     def delta_seq_ids_tensor_device(self):

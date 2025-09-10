@@ -112,10 +112,13 @@ class KVCacheManagerBase:
             device=self.device,
             max_batch_size=num_hot_req,
             max_total_len=num_hot_req * max_seq_len,
-            max_total_delta_len=(
-                prefill_chunk_size
-                if prefill_chunk_size is not None
-                else num_hot_req * max_seq_len
+            max_total_delta_len=max(
+                (
+                    prefill_chunk_size
+                    if prefill_chunk_size is not None
+                    else num_hot_req * max_seq_len
+                ),  # prefill
+                num_hot_req,  # decode
             ),
             cache_prefix_lens_tensor_device=True,
             cache_position_ids_tensor_device=True,
