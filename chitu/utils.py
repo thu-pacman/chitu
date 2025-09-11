@@ -170,45 +170,6 @@ def compute_layer_dist_in_pipe(num_layers, world_size):
     return num_layers_of_each_rank
 
 
-# SPDX-SnippetBegin
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-SnippetCopyrightText: 2025 SGLang Team
-# SDPX—SnippetName: top_k_top_p_min_p_sampling_from_probs_torch
-#
-# This sampling implementation is originally from SGLang
-# (https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/sampler.py),
-# licensed under Apache 2.0.
-def top_k_top_p_min_p_sampling_from_probs_torch(
-    probs: torch.Tensor,
-    top_ks: torch.Tensor,
-    top_ps: torch.Tensor,
-    # TODO: Support min_ps
-):
-    """A top-k, top-p and min-p sampling implementation with native pytorch operations."""
-    from chitu.ops import multinomial
-
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    # TODO: Support min_ps like: min_p_thresholds = probs_sort[:, 0] * min_ps
-
-    top_p_mask = (probs_sum - probs_sort) > top_ps.view(-1, 1)
-    top_k_mask = torch.arange(0, probs.shape[-1], device=probs.device).view(
-        1, -1
-    ) >= top_ks.view(-1, 1)
-    if is_ascend():
-        probs_sort *= ~(top_p_mask | top_k_mask)
-    else:
-        probs_sort[top_p_mask | top_k_mask] = 0.0
-    # TODO: Support min_ps like:  probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
-    probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
-    sampled_index = multinomial(probs_sort, num_samples=1, impl="sync-free")
-    batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
-    return batch_next_token_ids
-
-
-# SPDX-SnippetEnd
-
-
 def get_config_dir_path():
     # Deprecated, but we need to support Python 3.8. importlib.resources is preferred in the future.
     import pkg_resources
@@ -518,6 +479,61 @@ def get_local_ip() -> str:
             return ip
     except Exception:
         pass
+
+
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+
+
+def top_k_top_p_min_p_sampling_from_logits(
+    logits: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    # TODO: Support min_ps
+):
+    """A top-k, top-p and min-p sampling implementation."""
+    from chitu.ops import multinomial
+
+    if is_ascend() and has_torch_npu:
+        assert logits.dim() == 2
+        assert (
+            top_ps.shape[0] == logits.shape[0]
+        ), f"top_ps.shape[0]={top_ps.shape[0]} didn't match logits.shape[0]={logits.shape[0]}"
+        assert (
+            top_ks.shape[0] == logits.shape[0]
+        ), f"top_ks.shape[0]={top_ks.shape[0]} didn't match logits.shape[0]={logits.shape[0]}"
+        top_ps = top_ps.to(torch.float)
+        top_ks = top_ks.to(torch.int32)
+        logits = torch_npu.npu_top_k_top_p(logits, top_ps, top_ks)
+        sampled_index = multinomial(logits, num_samples=1, impl="sync-free").view(-1)
+        return sampled_index
+
+    # SPDX-SnippetBegin
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-SnippetCopyrightText: 2025 SGLang Team
+    # SPDX—SnippetName: top_k_top_p_min_p_sampling_from_logits_torch
+    #
+    # This sampling implementation is originally from SGLang
+    # (https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/sampler.py),
+    # licensed under Apache 2.0.
+    probs = torch.softmax(logits, dim=-1)
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    # TODO: Support min_ps like: min_p_thresholds = probs_sort[:, 0] * min_ps
+
+    top_p_mask = (probs_sum - probs_sort) > top_ps.view(-1, 1)
+    top_k_mask = torch.arange(0, probs.shape[-1], device=probs.device).view(
+        1, -1
+    ) >= top_ks.view(-1, 1)
+    if is_ascend():
+        probs_sort *= ~(top_p_mask | top_k_mask)
+    else:
+        probs_sort[top_p_mask | top_k_mask] = 0.0
+    # TODO: Support min_ps like:  probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+    probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
+    sampled_index = multinomial(probs_sort, num_samples=1, impl="sync-free")
+    batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
+    return batch_next_token_ids
+    # SPDX-SnippetEnd
 
 
 def invalidate_cached_property(obj, name):
