@@ -558,3 +558,21 @@ def invalidate_cached_property(obj, name):
         delattr(obj, name)
     except AttributeError:
         pass
+
+
+def try_get_profiler(
+    profiler_dir: str,
+    wait: int = 0,
+    warmup: int = 0,
+    active: int = 1000,
+    repeat: int = 0,
+    with_stack: bool = False,
+):
+    if has_torch_npu:
+        from chitu.npu_utils import try_get_npu_profiler
+
+        return try_get_npu_profiler(
+            profiler_dir, wait, warmup, active, repeat, with_stack
+        )
+    else:  # TODO add nvidia profiler
+        raise NotImplementedError("Not supported yet")

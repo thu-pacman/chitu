@@ -54,6 +54,7 @@ from chitu.tensor_parallel import (
 )
 from chitu.distributed.parallel_state import get_tp_size, get_ep_size
 from chitu.utils import parse_dtype, try_import_and_setup_torch_npu
+from chitu.device_type import is_ascend_910b
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
@@ -124,6 +125,7 @@ class AttentionDeepSeekV3(Attention):
         # - chitu/ops/mla_prologue.py
         self.can_use_mla_prologue_normal_torch_npu = (
             has_torch_npu
+            and is_ascend_910b()
             and quant is None
             and not self.merge_qkv
             and torch.get_default_dtype() == torch.bfloat16

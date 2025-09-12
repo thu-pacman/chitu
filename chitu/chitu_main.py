@@ -762,6 +762,10 @@ async def process_scheduler_request(rank: int, request_data: dict):
         )
 
 
+def chitu_start():
+    Backend.state = BackendState.Running
+
+
 def chitu_terminate():
     if torch.distributed.get_rank() == 0:
         Backend.state = BackendState.Terminated

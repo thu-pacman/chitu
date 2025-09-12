@@ -11,6 +11,7 @@ from chitu.task import UserRequest, TaskPool, Task
 from chitu.chitu_main import (
     chitu_init,
     chitu_run,
+    chitu_start,
     chitu_terminate,
     chitu_is_terminated,
     warmup_engine,
@@ -111,6 +112,7 @@ def run_pipe_or_tensor_parallelism(args, timers):
     warmup_engine(args)
 
     for i in range(2):
+        chitu_start()
         if rank == 0:
             reqs = gen_reqs(
                 num_reqs=args.infer.max_reqs,
@@ -143,8 +145,7 @@ def run_pipe_or_tensor_parallelism(args, timers):
                 logger.info(f"Response in rank {rank}: reqs[{i}].output={req.output}")
 
             timers.log()
-
-    chitu_terminate()
+        chitu_terminate()
 
 
 def run_normal(args, timers):

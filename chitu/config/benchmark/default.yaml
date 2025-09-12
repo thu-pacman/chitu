@@ -10,3 +10,5 @@ iters: 3
 dataset: random # random or sharegpt
 dataset_path: null # path to the dataset
 debug_print: False # whether to print the first request output
+profile_dir: null # path to the profile directory
+profiler_with_stack: False

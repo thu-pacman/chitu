@@ -387,22 +387,19 @@ def fused_experts_npu(
 
 
 def try_get_npu_profiler(
-    result_path: str = "./trace_result", wait: int = 0, warmup: int = 2
+    profiler_dir: str,
+    wait: int = 0,
+    warmup: int = 0,
+    active: int = 1000,
+    repeat: int = 0,
+    with_stack: bool = False,
 ):
 
-    import os
-    import time
-    from datetime import datetime
-    from contextlib import contextmanager
-
-    @contextmanager
-    def nullcontext(enter_result=None):
-        yield enter_result
-
     try:
+        import os
         import torch_npu
     except ImportError:
-        return nullcontext
+        raise ImportError("torch_npu is not installed")
 
     experimental_config = torch_npu.profiler._ExperimentalConfig(
         export_type=torch_npu.profiler.ExportType.Text,
@@ -416,22 +413,20 @@ def try_get_npu_profiler(
         gc_detect_threshold=None,
     )
 
-    os.makedirs(result_path, exist_ok=True)
-    time_str = datetime.now().strftime("%H_%M")
     profiler = torch_npu.profiler.profile(
         activities=[
             torch_npu.profiler.ProfilerActivity.CPU,
             torch_npu.profiler.ProfilerActivity.NPU,
         ],
         schedule=torch_npu.profiler.schedule(
-            wait=wait, warmup=warmup, active=1000, repeat=0
+            wait=wait, warmup=warmup, active=active, repeat=repeat
         ),
         on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-            dir_name=result_path, worker_name=f"trace_{time_str}"
+            dir_name=profiler_dir, worker_name=f"rank_{torch.distributed.get_rank()}"
         ),
         record_shapes=False,
         profile_memory=False,
-        with_stack=False,
+        with_stack=with_stack,
         with_modules=False,
         with_flops=False,
         experimental_config=experimental_config,

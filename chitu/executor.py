@@ -228,7 +228,7 @@ class ExpertDataDispatcher(TasksDispatcher):
         self.init_zmq()
 
     def init_zmq(self):
-        self.ctx = zmq.Context().instance()
+        self.ctx = zmq.Context.instance()
         self.master_addr = os.environ.get("MASTER_ADDR", "localhost")
         self.master_port = 26120  # hard-coded here
         self.url = f"tcp://{self.master_addr}:{self.master_port}"

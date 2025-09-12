@@ -293,7 +293,8 @@ class Backend:
                 local_begin_layer_id,
                 local_end_layer_id,
                 max_seq_len=args.infer.max_seq_len,
-                num_hot_req=args.infer.max_reqs,
+                num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
+                // args.infer.dp_size,
                 block_size=block_size,
                 num_blocks=args.infer.num_blocks,
                 device=local_rank,
@@ -304,7 +305,8 @@ class Backend:
                 local_begin_layer_id,
                 local_end_layer_id,
                 max_seq_len=args.infer.max_seq_len,
-                num_hot_req=args.infer.max_reqs,
+                num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
+                // args.infer.dp_size,
                 device=local_rank,
                 **kv_cache_kvargs,
             )

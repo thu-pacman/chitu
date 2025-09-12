@@ -17,6 +17,7 @@ from chitu.native_layout import (
     PartialColumnOddEvenSeparatedTensor,
 )
 from chitu.utils import ceil_div, try_import_and_setup_torch_npu
+from chitu.device_type import is_ascend_910b
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
@@ -45,6 +46,7 @@ def mla_prologue_normal(
         # - chitu/ops/mla_prologue.py
         if (
             has_torch_npu
+            and is_ascend_910b()
             and x.dtype == torch.bfloat16
             and x.shape[-1] == 7168
             and q_a_layernorm_weight.shape[0] == 1536
