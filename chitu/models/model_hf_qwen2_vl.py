@@ -635,7 +635,6 @@ class TransformerQwen2VL(TransformerHFLlama):
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         if get_tp_size() > 1:
-            torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
             torch.distributed.broadcast(inputs_embeds, src=0)
         return inputs_embeds
 
