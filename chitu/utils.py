@@ -127,6 +127,9 @@ def try_import_and_setup_torch_npu():
 
         torch.cuda.CUDAGraph = torch.npu.NPUGraph
 
+        # Allow using NpuFractalNzTensor and NpuFractalZnTensor
+        torch_npu.npu.config.allow_internal_format = True
+
         # Setup paths to op libraries
         site_packages_path = get_ascend_custom_opp_path()
         os.environ["ASCEND_CUSTOM_OPP_PATH"] = site_packages_path

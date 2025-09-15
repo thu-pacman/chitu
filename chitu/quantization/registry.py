@@ -19,7 +19,6 @@ from chitu.quantization.utils import (
 )
 from chitu.distributed.parallel_state import get_tp_size
 from chitu.utils import try_import_and_setup_torch_npu
-from chitu.device_type import is_ascend_910b
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
@@ -81,7 +80,6 @@ class QuantizationRegistry:
         args = get_global_args()
         if (
             has_torch_npu
-            and is_ascend_910b()
             and quant is None
             and args.models.type == "deepseek-v3"
             and torch.get_default_dtype() == torch.bfloat16
