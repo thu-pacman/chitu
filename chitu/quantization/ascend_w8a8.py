@@ -96,6 +96,17 @@ class AscendW8A8Linear(
         self._input_offset_layout_kwargs = dict(
             length=self.in_features, out_dtype=torch.get_default_dtype()
         )
+        if has_bias:
+            self.register_parameter(
+                "bias",
+                torch.nn.Parameter(
+                    torch.empty(out_features, dtype=torch.get_default_dtype()),
+                    requires_grad=False,
+                ),
+            )
+        else:
+            self.register_parameter("bias", None)
+
         self._ready = False
 
     @torch.no_grad()
@@ -143,6 +154,8 @@ class AscendW8A8Linear(
             bias=quant_bias,
             output_dtype=torch.get_default_dtype(),
         )
+        if self.bias is not None:
+            output += self.bias
         return output
 
 
@@ -186,7 +199,9 @@ class AscendW8A8DynamicLinear(
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         output_dtype = x.dtype
-        quantized_x, dynamic_scale = torch_npu.npu_dynamic_quant(x)
+        quantized_x, dynamic_scale = torch_npu.npu_dynamic_quant(
+            x.view(-1, self.in_features)
+        )
         output = torch_npu.npu_quant_matmul(
             quantized_x,
             self.weight,

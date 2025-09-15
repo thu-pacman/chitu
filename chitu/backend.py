@@ -635,7 +635,10 @@ class Backend:
                 return lambda k: not (k.endswith(".k_scale") or k.endswith(".v_scale"))
             if getattr(args.models, "name", "") in [
                 "Qwen3-8B-ascend-int8",
+                "Qwen3-14B-ascend-int8",
                 "Qwen3-32B-ascend-int8",
+                "Qwen2.5-72B-Instruct-ascend-int8",
+                "Qwen2.5-VL-32B-Instruct-ascend-int8",
             ]:
                 return lambda k: not (
                     k.endswith(".weight_scale") or k.endswith(".weight_offset")

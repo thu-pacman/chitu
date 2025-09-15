@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - Qwen2.5-VL
+  - _self_ # Config in this file overrides configs in defaults
+
+name: Qwen2.5-VL-32B-Instruct
+type: hf-qwen2-vl
+source: "https://huggingface.co/Qwen/Qwen2.5-VL-32B-Instruct" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+processor_path: null # By default the same as ckpt_dir, or you can override it with `models.processor_path=<path>`.
+
+
+dim: 5120
+n_heads: 40
+n_kv_heads: 8
+n_layers: 64
+intermediate_dim: 27648
+
+
+vision_config:
+  depth: 32
+  hidden_size: 1280
+  intermediate_size: 3456
+  num_heads: 16
+  in_channels: 3
+  out_hidden_size: 5120
+  patch_size: 14
+  spatial_merge_size: 2
+  spatial_patch_size: 14
+  window_size: 112
+  fullatt_block_indexes: [7, 15, 23, 31]
+  temporal_patch_size: 2
+  vision_start_token_id: 151652
+  image_token_id: 151655
+  video_token_id: 151656
