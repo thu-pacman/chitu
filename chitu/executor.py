@@ -943,17 +943,25 @@ class Executor:
             return token_list
 
     def postprocess_async_part(self, batch_result: BatchResult) -> None:
+        next_token_list: List[int] = []
+        logprobs_list: List[List[float]] = []
+        token_idxs_list: List[List[int]] = []
         for it, task in enumerate(batch_result.tasks):
-            next_token = batch_result.next_tokens[it]
-            if batch_result.return_logprobs:
+            next_token_list.append(batch_result.next_tokens[it])
+        if batch_result.return_logprobs:
+            for it, task in enumerate(batch_result.tasks):
                 logprobs, token_idxs = (
                     batch_result.logprobs[it],
                     batch_result.token_idxs[it],
                 )
-                logprobs = logprobs[: max(1, task.req.top_logprobs)].tolist()
-                token_idxs = token_idxs[: max(1, task.req.top_logprobs)].tolist()
-                self._token_sink.emit(task, next_token, logprobs, token_idxs)
-            else:
-                self._token_sink.emit(task, next_token)
+                logprobs_list.append(logprobs[: max(1, task.req.top_logprobs)].tolist())
+                token_idxs_list.append(
+                    token_idxs[: max(1, task.req.top_logprobs)].tolist()
+                )
+            self._token_sink.emit_batch(
+                batch_result.tasks, next_token_list, logprobs_list, token_idxs_list
+            )
+        else:
+            self._token_sink.emit_batch(batch_result.tasks, next_token_list)
 
         TaskLoad.increase(batch_result.num_tasks)

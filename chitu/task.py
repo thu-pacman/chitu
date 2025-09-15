@@ -210,9 +210,24 @@ class UserRequest:
 
         TaskLoad.user_req.add(self)
 
-    def add_data(self, data, top_logprobs=None, top_token_idx=None):
-        self.async_stream.add_data(data, top_logprobs, top_token_idx)
-        logger.debug(f"add data: {data}")
+    def add_data(
+        self,
+        value: int,
+        top_logprobs=None,
+        top_token_idx=None,
+        *,
+        notify_server: bool = True,
+    ):
+        self.async_stream.add_data(
+            value, top_logprobs, top_token_idx, notify_server=notify_server
+        )
+        logger.debug(f"add data: {value}")
+
+    def notify_server_data_added_from_server_thread(self):
+        self.async_stream.notify_server_from_server_thread()
+
+    def notify_server_data_added_threadsafe(self):
+        self.async_stream.notify_server_threadsafe()
 
     def _test_add_logit(self, logit):
         # logit = logit.tolist()

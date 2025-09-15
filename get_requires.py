@@ -27,7 +27,7 @@ install_requires = [
     "faker",
     "hydra-core",
     "fastapi",
-    "uvicorn",
+    "uvicorn[standard]",
     "tqdm",
     "accelerate<1.10",  # 1.10 breaks on muxi
     "einops",

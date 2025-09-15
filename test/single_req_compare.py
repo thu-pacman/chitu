@@ -98,12 +98,7 @@ def check_result(
 logger = getLogger(__name__)
 
 msgs = [
-    [
-        {
-            "role": "user",
-            "content": "宫保鸡丁怎么做?",
-        }
-    ],
+    [{"role": "user", "content": "宫保鸡丁怎么做?"}],
     [{"role": "user", "content": "what is the recipe of Kung Pao chicken?"}],
     [{"role": "user", "content": "怎么写程序?"}],
     [{"role": "user", "content": "飞机在对流层还是平流层飞?"}],
