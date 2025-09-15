@@ -17,6 +17,7 @@ from chitu.native_layout import (
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 if has_torch_npu:
     from chitu.npu_utils import fused_experts_npu
+    from chitu.moe.experts import fused_experts
 
 
 @QuantizationRegistry.register_linear("ascend_w8a8")
@@ -302,7 +303,7 @@ class AscendW8A8DynamicMoeExperts(
         shape = x.size()
         x = x.view(-1, self.dim)
         if self.merge_gate_up:
-            y = fused_experts_npu(
+            y = fused_experts(
                 hidden_states=x,
                 w1=self.gate_up_proj_weight,
                 w1_scale=self.gate_up_proj_weight_scale,  # fp32
@@ -311,6 +312,7 @@ class AscendW8A8DynamicMoeExperts(
                 topk_weights=weights,
                 topk_ids=indices,
                 use_int8_w8a8=True,
+                impl=impl,
             )
         else:
             y = self.forward_iterative(x, weights, indices)

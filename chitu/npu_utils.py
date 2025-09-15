@@ -69,6 +69,7 @@ def fused_experts_npu_with_a2a_communication(
     w2_scale=None,
     experts_start_idx=0,
     max_bs: int = 0,
+    use_int8_w8a8=False,
     **kwargs,
 ):
     """
@@ -96,7 +97,7 @@ def fused_experts_npu_with_a2a_communication(
             active_num=topk_ids.numel(),
             drop_pad_mode=0,
             row_idx_type=0,
-            quant_mode=-1,
+            quant_mode=1 if use_int8_w8a8 else -1,
         )
     )
     tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
@@ -115,18 +116,28 @@ def fused_experts_npu_with_a2a_communication(
     # alltoall output, unfolded into one dimension, the size is the sum of the number of tokens routed from other cards to the current rank.
     gathered_tokens = expanded_x.new_empty(all_tokens.item(), expanded_x.shape[1])
     dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits)
+    if use_int8_w8a8:
+        gathered_scales = pertoken_scale.new_empty(all_tokens.item(), 1)
+        dist.all_to_all_single(
+            gathered_scales, pertoken_scale, output_splits, input_splits
+        )
     (
         hidden_states_sorted_by_experts,
-        _,
+        permute_per_token_scales,
         gathered_idxs_unsort,
         tokens_per_local_expert,
     ) = torch_npu.npu_moe_re_routing(
         gathered_tokens,
         tokens_per_expert_group.view(ep_size, -1),
-        per_token_scales=None,
+        per_token_scales=None if not use_int8_w8a8 else gathered_scales,
     )
+
+    if use_int8_w8a8:
+        counts = torch.empty_like(tokens_per_local_expert)
+        counts = tokens_per_local_expert.to(torch.int64)
+
     group_list = tokens_per_local_expert.to(torch.int64)
-    w1 = w1.transpose(1, 2)
+    w1 = w1.transpose(1, 2) if not use_int8_w8a8 else w1
     mm1_mm3 = torch_npu.npu_grouped_matmul(
         [hidden_states_sorted_by_experts],
         [w1],
@@ -134,21 +145,43 @@ def fused_experts_npu_with_a2a_communication(
         split_item=3,
         group_type=0,
         group_list_type=1,
+        output_dtype=(torch.int32 if use_int8_w8a8 else None),
     )[0]
-    intermediate_h = torch_npu.npu_swiglu(mm1_mm3)
+
+    if use_int8_w8a8:
+        w1_scale_fp32 = w1_scale.to(torch.float32).contiguous()
+        intermediate_h, gate_up_out_scale = torch_npu.npu_dequant_swiglu_quant(
+            x=mm1_mm3,
+            weight_scale=w1_scale_fp32,
+            activation_scale=permute_per_token_scales,
+            bias=None,
+            quant_scale=None,
+            quant_offset=None,
+            group_index=counts,  # Only support group_list_type=1, so use expert counts
+            activate_left=True,
+            quant_mode=1,
+        )
+    else:
+        intermediate_h = torch_npu.npu_swiglu(mm1_mm3)
+
     # gmm2: down
-    w2 = w2.transpose(1, 2)
-    hidden_states_ordered_by_experts = torch_npu.npu_grouped_matmul(
-        [intermediate_h],
-        [w2],
-        bias=None,
-        group_list=group_list,
+    w2 = w2.transpose(1, 2) if not use_int8_w8a8 else w2
+    hidden_states_experts = torch_npu.npu_grouped_matmul(
+        x=[intermediate_h],
+        weight=[w2],
+        scale=[w2_scale.contiguous()] if use_int8_w8a8 else None,
+        per_token_scale=[gate_up_out_scale] if use_int8_w8a8 else None,
         split_item=3,
-        group_type=0,
         group_list_type=1,
+        group_type=0,
+        group_list=group_list,
+        output_dtype=(
+            w2_scale.dtype if use_int8_w8a8 else None
+        ),  # make sure the output dtype is bf16
     )[0]
+
     new_x = torch.index_select(
-        hidden_states_ordered_by_experts,
+        hidden_states_experts,
         0,
         gathered_idxs_unsort.to(torch.float32).argsort().to(torch.int32),
     )
@@ -181,6 +214,7 @@ def fused_experts_npu_with_communication(
     w2_scale=None,
     experts_start_idx=0,
     max_bs: int = 16,
+    use_int8_w8a8=False,
     **kwargs,
 ):
     ep_size = get_ep_size()  # if use A2 device, it should satisfy ep_size % 16 == 0
@@ -206,11 +240,15 @@ def fused_experts_npu_with_communication(
         ep_rank_id=rank,
         shared_expert_rank_num=0,
         moe_expert_num=global_num_experts,
-        quant_mode=0,
+        quant_mode=0 if not use_int8_w8a8 else 2,
         global_bs=max_bs * ep_size,
     )
+
     group_list = expert_token_nums.to(torch.int64)
-    w1 = w1.transpose(1, 2)
+    w1 = w1.transpose(1, 2) if not use_int8_w8a8 else w1
+
+    if use_int8_w8a8:
+        dynamic_scales = dynamic_scales.to(torch.float32).contiguous()
 
     gate_up_proj = torch_npu.npu_grouped_matmul(
         [expand_x],
@@ -220,19 +258,38 @@ def fused_experts_npu_with_communication(
         split_item=3,
         group_type=0,
         group_list_type=1,
+        output_dtype=(torch.int32 if use_int8_w8a8 else None),
     )[0]
-    gate_up_proj = torch_npu.npu_swiglu(gate_up_proj)
 
-    w2 = w2.transpose(1, 2)
+    if use_int8_w8a8:
+        w1_scale_fp32 = w1_scale.to(torch.float32).contiguous()
+        gate_up_out, gate_up_out_scale = torch_npu.npu_dequant_swiglu_quant(
+            x=gate_up_proj,
+            weight_scale=w1_scale_fp32,
+            activation_scale=dynamic_scales,
+            bias=None,
+            quant_scale=None,
+            quant_offset=None,
+            group_index=group_list,  # Only support group_list_type=1, so use expert counts
+            activate_left=True,
+            quant_mode=1,
+        )
+    else:
+        gate_up_out = torch_npu.npu_swiglu(gate_up_proj)
+
+    w2 = w2.transpose(1, 2) if not use_int8_w8a8 else w2
     hidden_states_experts = torch_npu.npu_grouped_matmul(
-        [gate_up_proj],
-        [w2],
-        bias=None,
-        group_list=group_list,
+        x=[gate_up_out],
+        weight=[w2],
+        scale=[w2_scale.contiguous()] if use_int8_w8a8 else None,
+        per_token_scale=[gate_up_out_scale] if use_int8_w8a8 else None,
         split_item=3,
-        output_dtype=act_dtype,
-        group_type=0,
         group_list_type=1,
+        group_type=0,
+        group_list=group_list,
+        output_dtype=(
+            w2_scale.dtype if use_int8_w8a8 else None
+        ),  # make sure the output dtype is bf16
     )[0]
 
     hidden_states_route = torch_npu.npu_moe_distribute_combine_v2(
@@ -248,6 +305,7 @@ def fused_experts_npu_with_communication(
         ep_rank_id=rank,
         moe_expert_num=global_num_experts,
         global_bs=max_bs * ep_size,
+        comm_quant_mode=2 if use_int8_w8a8 else 0,
     )
     return hidden_states_route
 
