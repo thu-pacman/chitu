@@ -466,24 +466,27 @@ def chitu_run_normal():
 
         tokens = Backend.executor.step(tasks)
 
-        if DPTaskCollector.has_available_tasks():
-            tasks = DPTaskCollector.get_total_packedtasks()
-            task_ids = tasks.task_ids
-            DPTaskCollector.clear()
-
         # postprocess
         if len(Backend.last_batch_results) > 0:
             Backend.executor.postprocess_async_part(
                 Backend.last_batch_results.popleft()
             )
-        curr_batch_result = BatchResult(
-            num_tasks=tasks.num_tasks,
-            tasks=tasks.output_tasks,
-            next_tokens=tokens,
-            return_logprobs=tasks.return_logprobs,
-            logprobs=tasks.logprobs.cpu() if tasks.return_logprobs else None,
-            token_idxs=tasks.token_idxs.cpu() if tasks.return_logprobs else None,
-        )
+
+        if DPTaskCollector.has_available_tasks():
+            tasks = DPTaskCollector.get_total_packedtasks()
+            task_ids = tasks.task_ids
+            curr_batch_result = BatchResult(
+                num_tasks=tasks.num_tasks,
+                tasks=tasks.output_tasks,
+                next_tokens=tokens,
+                return_logprobs=tasks.return_logprobs,
+                logprobs=tasks.logprobs.cpu() if tasks.return_logprobs else None,
+                token_idxs=tasks.token_idxs.cpu() if tasks.return_logprobs else None,
+            )
+            DPTaskCollector.clear()
+        else:
+            curr_batch_result = Backend.executor.postprocess_sync_part(tasks, tokens)
+
         Backend.last_batch_results.append(curr_batch_result)
         removed_decode_task_ids = Backend.scheduler.update(task_ids)
         remove_kvcache_all_device(removed_decode_task_ids)

@@ -562,9 +562,6 @@ class Executor:
 
             if self.pp_size > 1:
                 self._recv_logits(tasks)
-            else:
-                tokens = self.postprocess_sync_part(tasks, out)
-                return tokens
 
         return out
 
@@ -930,7 +927,9 @@ class Executor:
                 task.req._test_add_logit(logits[it])
                 task.req._test_add_token(token_list[it])
 
-        if self.pp_size > 1:
+        if self.dp_size > 1:
+            return token_list
+        else:
             return BatchResult(
                 num_tasks=tasks.num_tasks,
                 tasks=tasks.output_tasks,
@@ -939,8 +938,6 @@ class Executor:
                 logprobs=logprobs.cpu() if tasks.return_logprobs else None,
                 token_idxs=token_idxs.cpu() if tasks.return_logprobs else None,
             )
-        else:
-            return token_list
 
     def postprocess_async_part(self, batch_result: BatchResult) -> None:
         next_token_list: List[int] = []
