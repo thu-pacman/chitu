@@ -20,7 +20,7 @@ install_requires = [
     #    torch back to the official version, please use `-c` on `pip`.
     "torch",
     "transformers[torch]",
-    "safetensors<0.6",  # 0.6 breaks on muxi
+    "safetensors",
     "fire",
     "tiktoken>=0.7.0",  # Required by glm4
     "blobfile",
@@ -29,7 +29,7 @@ install_requires = [
     "fastapi",
     "uvicorn[standard]",
     "tqdm",
-    "accelerate<1.10",  # 1.10 breaks on muxi
+    "accelerate",
     "einops",
     "typing-extensions",
     "pyzmq>=27.0.0",
