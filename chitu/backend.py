@@ -30,7 +30,10 @@ from chitu.attn_backend import (
 from chitu.cache_manager import DenseKVCacheManager, PagedKVCacheManager
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
-from chitu.distributed.parallel_state import get_pp_group, initialize_parallel_groups
+from chitu.distributed.parallel_state import (
+    get_pp_group,
+    initialize_parallel_groups,
+)
 from chitu.hybrid_device import CPUParameter
 from chitu.models.registry import ModelType, get_model_class
 from chitu.quantization import (
@@ -293,7 +296,8 @@ class Backend:
                 local_begin_layer_id,
                 local_end_layer_id,
                 max_seq_len=args.infer.max_seq_len,
-                num_hot_req=args.infer.max_reqs,
+                num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
+                // args.infer.dp_size,
                 block_size=block_size,
                 num_blocks=args.infer.num_blocks,
                 device=local_rank,
@@ -304,7 +308,8 @@ class Backend:
                 local_begin_layer_id,
                 local_end_layer_id,
                 max_seq_len=args.infer.max_seq_len,
-                num_hot_req=args.infer.max_reqs,
+                num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
+                // args.infer.dp_size,
                 device=local_rank,
                 **kv_cache_kvargs,
             )
@@ -633,7 +638,10 @@ class Backend:
                 return lambda k: not (k.endswith(".k_scale") or k.endswith(".v_scale"))
             if getattr(args.models, "name", "") in [
                 "Qwen3-8B-ascend-int8",
+                "Qwen3-14B-ascend-int8",
                 "Qwen3-32B-ascend-int8",
+                "Qwen2.5-72B-Instruct-ascend-int8",
+                "Qwen2.5-VL-32B-Instruct-ascend-int8",
             ]:
                 return lambda k: not (
                     k.endswith(".weight_scale") or k.endswith(".weight_offset")

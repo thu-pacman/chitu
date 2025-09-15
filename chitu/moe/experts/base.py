@@ -41,6 +41,7 @@ def fused_experts_wrapper(
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_fp4_w4a8: bool = False,
+    use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     global_num_experts: int = -1,
@@ -200,19 +201,25 @@ def fused_experts_wrapper(
         return fused_experts_npu_with_communication(
             hidden_states=hidden_states,
             w1=w1,
+            w1_scale=w1_scale,  # fp32
             w2=w2,
+            w2_scale=w2_scale,  # bf16
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             experts_start_idx=experts_start_idx,
+            use_int8_w8a8=use_int8_w8a8,
         )
     elif impl == "fused_experts_with_a2a_communication":
         return fused_experts_npu_with_a2a_communication(
             hidden_states=hidden_states,
             w1=w1,
+            w1_scale=w1_scale,  # fp32
             w2=w2,
+            w2_scale=w2_scale,  # bf16
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             experts_start_idx=experts_start_idx,
+            use_int8_w8a8=use_int8_w8a8,
         )
     elif impl == "torch_npu":
         return fused_experts_npu(

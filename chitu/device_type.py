@@ -31,6 +31,10 @@ def is_ascend():
     return "Ascend" in get_device_name()
 
 
+def is_ascend_910b():
+    return "910B" in get_device_name()
+
+
 def has_native_fp8():
     return is_nvidia() and torch.cuda.get_device_capability() >= (8, 9)
 

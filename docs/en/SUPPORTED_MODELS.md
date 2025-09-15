@@ -6,6 +6,8 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=DeepSeek-R1` command line argument when starting Chitu
 - DeepSeek-R1-Distill-Llama-70B
   Usage: Append `models=DeepSeek-R1-Distill-Llama-70B` command line argument when starting Chitu
+- DeepSeek-R1-Distill-Llama-70B-ascend-int8
+  Usage: Append `models=DeepSeek-R1-Distill-Llama-70B-ascend-int8` command line argument when starting Chitu
 - DeepSeek-R1-Distill-Qwen-14B
   Usage: Append `models=DeepSeek-R1-Distill-Qwen-14B` command line argument when starting Chitu
 - DeepSeek-R1-Distill-Qwen-14B-fp8
@@ -84,12 +86,18 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=Qwen2.5-3B` command line argument when starting Chitu
 - Qwen2.5-3B-Mix
   Usage: Append `models=Qwen2.5-3B-Mix` command line argument when starting Chitu
+- Qwen2.5-72B-Instruct-ascend-int8
+  Usage: Append `models=Qwen2.5-72B-Instruct-ascend-int8` command line argument when starting Chitu
 - Qwen2.5-7B
   Usage: Append `models=Qwen2.5-7B` command line argument when starting Chitu
 - Qwen2.5-7B-Instruct
   Usage: Append `models=Qwen2.5-7B-Instruct` command line argument when starting Chitu
 - Qwen2.5-VL
   Usage: Append `models=Qwen2.5-VL` command line argument when starting Chitu
+- Qwen2.5-VL-32B-Instruct
+  Usage: Append `models=Qwen2.5-VL-32B-Instruct` command line argument when starting Chitu
+- Qwen2.5-VL-32B-Instruct-ascend-int8
+  Usage: Append `models=Qwen2.5-VL-32B-Instruct-ascend-int8` command line argument when starting Chitu
 - Qwen2.5-VL-7B-Instruct
   Usage: Append `models=Qwen2.5-VL-7B-Instruct` command line argument when starting Chitu
 - Qwen3-0.6B
@@ -100,6 +108,8 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=Qwen3-14B` command line argument when starting Chitu
 - Qwen3-14B-FP8
   Usage: Append `models=Qwen3-14B-FP8` command line argument when starting Chitu
+- Qwen3-14B-ascend-int8
+  Usage: Append `models=Qwen3-14B-ascend-int8` command line argument when starting Chitu
 - Qwen3-14B-fp4
   Usage: Append `models=Qwen3-14B-fp4` command line argument when starting Chitu
 - Qwen3-14B-mixq-mix

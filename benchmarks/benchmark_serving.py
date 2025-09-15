@@ -426,11 +426,11 @@ def save_dict_result(result: dict, output_dir: str, append: bool = False):
 
     output_file = os.path.join(output_dir, RESULT_FILE)
     if append:
-        with open(output_file, "a") as f:
-            f.write(json.dumps(result) + "\n")
+        with open(output_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(result, ensure_ascii=False) + "\n")
     else:
-        with open(output_file, "w") as f:
-            json.dump(result, f, indent=2)
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
 
 
 def main():

@@ -506,14 +506,16 @@ class NpuFractalNzTensor(NativeLayoutTensor):
     @override
     def convert_from(cls, tensor: torch.Tensor) -> "NpuFractalNzTensor":
         if isinstance(tensor, torch.Tensor):
+            layout_tensor = torch_npu.npu_format_cast(
+                tensor.npu().contiguous(), ACL_FORMAT_FRACTAL_NZ
+            )
+
+            # The assertion is necessary, because npu_format_cast may fail silently as a no-op on some environments
+            assert torch_npu.get_npu_format(layout_tensor) == ACL_FORMAT_FRACTAL_NZ
+
             # NPU formats only live on NPU. Once we move to CPU and then move back, the format will disappear.
             # Therefore, we force this tensor to be on NPU.
-            return cls(
-                plain_shape=tensor.shape,
-                layout_tensor=torch_npu.npu_format_cast(
-                    tensor.npu().contiguous(), ACL_FORMAT_FRACTAL_NZ
-                ),
-            )
+            return cls(plain_shape=tensor.shape, layout_tensor=layout_tensor)
 
         else:
             raise TypeError(f"Cannot convert from {type(tensor)} to Vector")
@@ -546,14 +548,16 @@ class NpuFractalZnTensor(NativeLayoutTensor):
     @override
     def convert_from(cls, tensor: torch.Tensor) -> "NpuFractalNzTensor":
         if isinstance(tensor, torch.Tensor):
+            layout_tensor = torch_npu.npu_format_cast(
+                tensor.npu().transpose(-1, -2).contiguous(), ACL_FORMAT_FRACTAL_NZ
+            )
+
+            # The assertion is necessary, because npu_format_cast may fail silently as a no-op on some environments
+            assert torch_npu.get_npu_format(layout_tensor) == ACL_FORMAT_FRACTAL_NZ
+
             # NPU formats only live on NPU. Once we move to CPU and then move back, the format will disappear.
             # Therefore, we force this tensor to be on NPU.
-            return cls(
-                plain_shape=tensor.shape,
-                layout_tensor=torch_npu.npu_format_cast(
-                    tensor.npu().transpose(-1, -2).contiguous(), ACL_FORMAT_FRACTAL_NZ
-                ),
-            )
+            return cls(plain_shape=tensor.shape, layout_tensor=layout_tensor)
 
         else:
             raise TypeError(f"Cannot convert from {type(tensor)} to Vector")

@@ -17,6 +17,7 @@ from chitu.native_layout import (
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 if has_torch_npu:
     from chitu.npu_utils import fused_experts_npu
+    from chitu.moe.experts import fused_experts
 
 
 @QuantizationRegistry.register_linear("ascend_w8a8")
@@ -96,6 +97,17 @@ class AscendW8A8Linear(
         self._input_offset_layout_kwargs = dict(
             length=self.in_features, out_dtype=torch.get_default_dtype()
         )
+        if has_bias:
+            self.register_parameter(
+                "bias",
+                torch.nn.Parameter(
+                    torch.empty(out_features, dtype=torch.get_default_dtype()),
+                    requires_grad=False,
+                ),
+            )
+        else:
+            self.register_parameter("bias", None)
+
         self._ready = False
 
     @torch.no_grad()
@@ -143,6 +155,8 @@ class AscendW8A8Linear(
             bias=quant_bias,
             output_dtype=torch.get_default_dtype(),
         )
+        if self.bias is not None:
+            output += self.bias
         return output
 
 
@@ -186,7 +200,9 @@ class AscendW8A8DynamicLinear(
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         output_dtype = x.dtype
-        quantized_x, dynamic_scale = torch_npu.npu_dynamic_quant(x)
+        quantized_x, dynamic_scale = torch_npu.npu_dynamic_quant(
+            x.view(-1, self.in_features)
+        )
         output = torch_npu.npu_quant_matmul(
             quantized_x,
             self.weight,
@@ -287,7 +303,7 @@ class AscendW8A8DynamicMoeExperts(
         shape = x.size()
         x = x.view(-1, self.dim)
         if self.merge_gate_up:
-            y = fused_experts_npu(
+            y = fused_experts(
                 hidden_states=x,
                 w1=self.gate_up_proj_weight,
                 w1_scale=self.gate_up_proj_weight_scale,  # fp32
@@ -296,6 +312,7 @@ class AscendW8A8DynamicMoeExperts(
                 topk_weights=weights,
                 topk_ids=indices,
                 use_int8_w8a8=True,
+                impl=impl,
             )
         else:
             y = self.forward_iterative(x, weights, indices)

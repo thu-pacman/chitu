@@ -228,7 +228,7 @@ class ExpertDataDispatcher(TasksDispatcher):
         self.init_zmq()
 
     def init_zmq(self):
-        self.ctx = zmq.Context().instance()
+        self.ctx = zmq.Context.instance()
         self.master_addr = os.environ.get("MASTER_ADDR", "localhost")
         self.master_port = 26120  # hard-coded here
         self.url = f"tcp://{self.master_addr}:{self.master_port}"
@@ -562,9 +562,6 @@ class Executor:
 
             if self.pp_size > 1:
                 self._recv_logits(tasks)
-            else:
-                tokens = self.postprocess_sync_part(tasks, out)
-                return tokens
 
         return out
 
@@ -930,7 +927,9 @@ class Executor:
                 task.req._test_add_logit(logits[it])
                 task.req._test_add_token(token_list[it])
 
-        if self.pp_size > 1:
+        if self.dp_size > 1:
+            return token_list
+        else:
             return BatchResult(
                 num_tasks=tasks.num_tasks,
                 tasks=tasks.output_tasks,
@@ -939,21 +938,27 @@ class Executor:
                 logprobs=logprobs.cpu() if tasks.return_logprobs else None,
                 token_idxs=token_idxs.cpu() if tasks.return_logprobs else None,
             )
-        else:
-            return token_list
 
     def postprocess_async_part(self, batch_result: BatchResult) -> None:
+        next_token_list: List[int] = []
+        logprobs_list: List[List[float]] = []
+        token_idxs_list: List[List[int]] = []
         for it, task in enumerate(batch_result.tasks):
-            next_token = batch_result.next_tokens[it]
-            if batch_result.return_logprobs:
+            next_token_list.append(batch_result.next_tokens[it])
+        if batch_result.return_logprobs:
+            for it, task in enumerate(batch_result.tasks):
                 logprobs, token_idxs = (
                     batch_result.logprobs[it],
                     batch_result.token_idxs[it],
                 )
-                logprobs = logprobs[: max(1, task.req.top_logprobs)].tolist()
-                token_idxs = token_idxs[: max(1, task.req.top_logprobs)].tolist()
-                self._token_sink.emit(task, next_token, logprobs, token_idxs)
-            else:
-                self._token_sink.emit(task, next_token)
+                logprobs_list.append(logprobs[: max(1, task.req.top_logprobs)].tolist())
+                token_idxs_list.append(
+                    token_idxs[: max(1, task.req.top_logprobs)].tolist()
+                )
+            self._token_sink.emit_batch(
+                batch_result.tasks, next_token_list, logprobs_list, token_idxs_list
+            )
+        else:
+            self._token_sink.emit_batch(batch_result.tasks, next_token_list)
 
         TaskLoad.increase(batch_result.num_tasks)

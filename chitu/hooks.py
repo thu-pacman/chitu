@@ -3,8 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-from typing import List, Protocol
+from typing import List, Protocol, Optional
 import logging
+import asyncio
+
+from chitu.task import Task
 
 
 class KVTransferHook(Protocol):
@@ -36,16 +39,38 @@ class TokenSink(Protocol):
     override to push tokens to a distributed token router.
     """
 
-    def emit(self, task, token: int, logprobs=None, token_idxs=None) -> None:
+    def emit_batch(
+        self,
+        task_list: List[Task],
+        token_list: List[int],
+        logprobs_list: Optional[List[List[float]]] = None,
+        token_idxs_list: Optional[List[List[int]]] = None,
+    ) -> None:
         pass
 
 
 class LocalTokenSink:
-    def emit(self, task, token: int, logprobs=None, token_idxs=None) -> None:
-        if logprobs is None or token_idxs is None:
-            task.req.add_data(token)
+    def emit_batch(
+        self,
+        task_list: List[Task],
+        token_list: List[int],
+        logprobs_list: Optional[List[List[float]]] = None,
+        token_idxs_list: Optional[List[List[int]]] = None,
+    ) -> None:
+        if logprobs_list is None or token_idxs_list is None:
+            for task, token in zip(task_list, token_list):
+                task.req.add_data(token, notify_server=False)
         else:
-            task.req.add_data(token, logprobs, token_idxs)
+            for task, token, logprobs, token_idxs in zip(
+                task_list, token_list, logprobs_list, token_idxs_list
+            ):
+                task.req.add_data(token, logprobs, token_idxs, notify_server=False)
+
+        def notify_all_response_in_batch():
+            for task in task_list:
+                task.req.notify_server_data_added_from_server_thread()
+
+        asyncio.get_event_loop().call_soon_threadsafe(notify_all_response_in_batch)
 
 
 class DPTokenSink:
@@ -55,7 +80,13 @@ class DPTokenSink:
     postprocess_sync_part. Emitting again here would duplicate outputs.
     """
 
-    def emit(self, task, token: int, logprobs=None, token_idxs=None) -> None:
+    def emit_batch(
+        self,
+        task_list: List[Task],
+        token_list: List[int],
+        logprobs_list: Optional[List[List[float]]] = None,
+        token_idxs_list: Optional[List[List[int]]] = None,
+    ) -> None:
         return
 
 

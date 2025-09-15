@@ -14,6 +14,7 @@ import logging
 import json
 import hydra
 import torch
+from datetime import datetime
 
 from logging import getLogger
 from typing import List
@@ -23,13 +24,14 @@ from chitu.task import UserRequest, TaskPool, Task
 from chitu.chitu_main import (
     chitu_init,
     chitu_run,
+    chitu_start,
     chitu_terminate,
     chitu_is_terminated,
     warmup_engine,
 )
 from chitu.global_vars import get_timers
 from chitu.schemas import ServeConfig
-from chitu.utils import get_config_dir_path
+from chitu.utils import get_config_dir_path, try_get_profiler
 
 logger = getLogger(__name__)
 
@@ -138,14 +140,28 @@ def count_num_tokens(reqs: list[UserRequest]):
     return output_num_tokens, total_num_tokens
 
 
-def run_benchmark(args, timers, is_main_rank):
+def run_benchmark(args, timers, is_main_rank, rank):
     warmup_engine(args)
     iters = args.benchmark.iters
     num_reqs_list = args.benchmark.num_reqs_list
     stop_with_eos = args.benchmark.stop_with_eos
     debug_print = args.benchmark.debug_print
+    profiler_dir = args.benchmark.profile_dir
+    with_stack = args.benchmark.profiler_with_stack
+
+    profiler = None
+    if profiler_dir is not None:
+        time_str = datetime.now().strftime("%m%d_%H%M")
+        profiler_dir = os.path.join(profiler_dir, f"profiler_{time_str}")
+        os.makedirs(profiler_dir, exist_ok=True)
+        profiler = try_get_profiler(
+            profiler_dir, warmup=1, active=1, repeat=0, with_stack=with_stack
+        )
+        profiler.start()
+
     for num_reqs in num_reqs_list:
         for i in range(iters):
+            chitu_start()
             if is_main_rank:
                 reqs = get_requests(args, num_reqs)
                 for req in reqs:
@@ -171,9 +187,26 @@ def run_benchmark(args, timers, is_main_rank):
                 if debug_print:
                     logger.info(f"First request output: {reqs[0].output}\n")
 
+            if profiler:
+                profiler.step()
+
+            chitu_terminate()  # terminate in iters loop
+
         torch.cuda.empty_cache()
 
-    chitu_terminate()
+    if profiler:
+        profiler.stop()
+
+
+def adjust_benchmark_args(args):
+    if args.benchmark.profile_dir is not None:
+        args.benchmark.output_len = 5  # only decode 10 tokens for profiling
+        num_reqs_list = args.benchmark.num_reqs_list
+        if len(num_reqs_list) > 1:
+            args.benchmark.num_reqs_list = num_reqs_list[-1:]
+            logger.info(
+                f"Adjust num_reqs_list to {args.benchmark.num_reqs_list} for profiling"
+            )
 
 
 @hydra.main(
@@ -185,13 +218,15 @@ def main(args: ServeConfig):
     logger.setLevel(logging.DEBUG)
     logger.info(f"Run with args: {args}")
 
+    adjust_benchmark_args(args)
+
     chitu_init(args, logging_level=logging.INFO)
     torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 
     timers = get_timers()
     rank = torch.distributed.get_rank()
     is_main_rank = rank == 0
-    run_benchmark(args, timers, is_main_rank)
+    run_benchmark(args, timers, is_main_rank, rank)
     logger.info("Waiting for all ranks to finish...")
     torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 

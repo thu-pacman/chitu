@@ -6,6 +6,8 @@
   用法: 启动赤兔时追加 `models=DeepSeek-R1` 启动参数
 - DeepSeek-R1-Distill-Llama-70B
   用法: 启动赤兔时追加 `models=DeepSeek-R1-Distill-Llama-70B` 启动参数
+- DeepSeek-R1-Distill-Llama-70B-ascend-int8
+  用法: 启动赤兔时追加 `models=DeepSeek-R1-Distill-Llama-70B-ascend-int8` 启动参数
 - DeepSeek-R1-Distill-Qwen-14B
   用法: 启动赤兔时追加 `models=DeepSeek-R1-Distill-Qwen-14B` 启动参数
 - DeepSeek-R1-Distill-Qwen-14B-fp8
@@ -84,12 +86,18 @@
   用法: 启动赤兔时追加 `models=Qwen2.5-3B` 启动参数
 - Qwen2.5-3B-Mix
   用法: 启动赤兔时追加 `models=Qwen2.5-3B-Mix` 启动参数
+- Qwen2.5-72B-Instruct-ascend-int8
+  用法: 启动赤兔时追加 `models=Qwen2.5-72B-Instruct-ascend-int8` 启动参数
 - Qwen2.5-7B
   用法: 启动赤兔时追加 `models=Qwen2.5-7B` 启动参数
 - Qwen2.5-7B-Instruct
   用法: 启动赤兔时追加 `models=Qwen2.5-7B-Instruct` 启动参数
 - Qwen2.5-VL
   用法: 启动赤兔时追加 `models=Qwen2.5-VL` 启动参数
+- Qwen2.5-VL-32B-Instruct
+  用法: 启动赤兔时追加 `models=Qwen2.5-VL-32B-Instruct` 启动参数
+- Qwen2.5-VL-32B-Instruct-ascend-int8
+  用法: 启动赤兔时追加 `models=Qwen2.5-VL-32B-Instruct-ascend-int8` 启动参数
 - Qwen2.5-VL-7B-Instruct
   用法: 启动赤兔时追加 `models=Qwen2.5-VL-7B-Instruct` 启动参数
 - Qwen3-0.6B
@@ -100,6 +108,8 @@
   用法: 启动赤兔时追加 `models=Qwen3-14B` 启动参数
 - Qwen3-14B-FP8
   用法: 启动赤兔时追加 `models=Qwen3-14B-FP8` 启动参数
+- Qwen3-14B-ascend-int8
+  用法: 启动赤兔时追加 `models=Qwen3-14B-ascend-int8` 启动参数
 - Qwen3-14B-fp4
   用法: 启动赤兔时追加 `models=Qwen3-14B-fp4` 启动参数
 - Qwen3-14B-mixq-mix

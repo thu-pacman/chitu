@@ -35,7 +35,6 @@ class AsyncDataStream:
         self.top_logprobs_list = []
         self.top_tokens_list = []
         self.enable_reasoning = enable_reasoning
-        self.loop = asyncio.get_event_loop()
 
         if enable_reasoning:
             self.is_reasoning = False
@@ -58,7 +57,14 @@ class AsyncDataStream:
             if self.rs_token_id == -1 or self.re_token_id == -1:
                 self.enable_reasoning = False
 
-    def add_data(self, value: int, top_logprobs=None, top_token_idx=None):
+    def add_data(
+        self,
+        value: int,
+        top_logprobs=None,
+        top_token_idx=None,
+        *,
+        notify_server: bool = True,
+    ):
         with self.lock:
             if self.enable_reasoning:
                 self.reasoning_handle(value)
@@ -82,12 +88,13 @@ class AsyncDataStream:
             if top_logprobs:
                 self.top_logprobs_list.append(top_logprobs)
                 self.top_tokens_list.append(top_tokens)
-        self.loop.call_soon_threadsafe(self.data_event.set)
+        if notify_server:
+            self.notify_server_threadsafe()
 
     def send_stop_signal(self):
         with self.lock:
             self.stop_signal = True
-        self.loop.call_soon_threadsafe(self.data_event.set)
+        self.notify_server_threadsafe()
 
     def reasoning_handle(self, value: int):
         if not self.is_reasoning and self.tokens_len == 0 and value == self.rs_token_id:
@@ -98,6 +105,12 @@ class AsyncDataStream:
 
     def is_reasoning_content(self):
         return self.is_reasoning or self.index - 1 < self.reasoning_len
+
+    def notify_server_from_server_thread(self):
+        self.data_event.set()
+
+    def notify_server_threadsafe(self):
+        asyncio.get_event_loop().call_soon_threadsafe(self.data_event.set)
 
     def __aiter__(self):
         self.index = 0

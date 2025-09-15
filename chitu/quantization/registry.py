@@ -5,6 +5,7 @@
 from typing import Any, Dict, List, Mapping, Optional, Type, Callable
 import functools
 import re
+import torch
 
 from chitu.global_vars import get_global_args
 from chitu.quantization.base import (
@@ -16,6 +17,10 @@ from chitu.quantization.utils import (
     get_quant_from_checkpoint_prefix,
     get_backend_from_checkpoint_prefix,
 )
+from chitu.distributed.parallel_state import get_tp_size
+from chitu.utils import try_import_and_setup_torch_npu
+
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
 class QuantizationRegistry:
@@ -46,6 +51,7 @@ class QuantizationRegistry:
         "autoawq",
         "simple_w8a8",
         "mixq",
+        "ascend_w8a8_dynamic",
         None,
     ]
 
@@ -60,9 +66,32 @@ class QuantizationRegistry:
     @classmethod
     def allowed_merge_qkv(cls, checkpoint):
         quant = get_quant_from_checkpoint_prefix(checkpoint)
+
         backend = get_backend_from_checkpoint_prefix(checkpoint)
         if backend == "cpuinfer":
             return False
+
+        # This restriction is from
+        # https://www.hiascend.com/document/detail/zh/Pytorch/710/apiref/torchnpuCustomsapi/context/torch_npu-npu_mla_prolog_v2.md
+        # Should be synchronized in the following files:
+        # - chitu/models/model_deepseek_v3.py
+        # - chitu/quantization/registry.py
+        # - chitu/ops/mla_prologue.py
+        args = get_global_args()
+        if (
+            has_torch_npu
+            and quant is None
+            and args.models.type == "deepseek-v3"
+            and torch.get_default_dtype() == torch.bfloat16
+            and args.models.dim == 7168
+            and args.models.q_lora_rank == 1536
+            and args.models.n_heads // get_tp_size() in [8, 16, 32, 64, 128]
+            and args.models.kv_lora_rank == 512
+            and args.models.qk_nope_head_dim == 128
+            and args.models.qk_rope_head_dim == 64
+        ):
+            return False  # Not merging, so we can use mla_prologue_normal(impl=torch_npu), which is even better
+
         return quant in QuantizationRegistry._allowed_quant_for_merge_qkv
 
     @classmethod

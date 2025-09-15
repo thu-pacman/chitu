@@ -407,7 +407,14 @@ class DPAsyncDataStream(AsyncDataStream):
         # Trigger data event
         self.data_event.set()
 
-    def add_data(self, value: int, top_logprobs=None, top_token_idx=None):
+    def add_data(
+        self,
+        value: int,
+        top_logprobs=None,
+        top_token_idx=None,
+        *,
+        notify_server: bool = True,
+    ):
         """Override add_data method, optimized for DP scenarios
 
         Note: This method should rarely be called now, as we use add_text_data
@@ -476,7 +483,8 @@ class DPAsyncDataStream(AsyncDataStream):
                 self.top_logprobs_list.append(top_logprobs)
                 self.top_tokens_list.append(top_tokens)
 
-        self.data_event.set()
+        if notify_server:
+            asyncio.get_event_loop().call_soon_threadsafe(self.data_event.set)
 
 
 # Global Token Router instance

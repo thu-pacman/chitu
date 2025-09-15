@@ -41,3 +41,4 @@ from chitu.ops.quant import (
     mixq_gemm,
     convert_linear_to_swizzled,
 )
+from chitu.ops.mla_prologue import mla_prologue_normal

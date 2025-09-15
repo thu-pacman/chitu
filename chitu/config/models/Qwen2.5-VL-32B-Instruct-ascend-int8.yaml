@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Qwen2.5-VL-32B-Instruct-ascend-int8 is a quantization of Qwen2.5-VL-32B-Instruct
+defaults:
+  - Qwen2.5-VL-32B-Instruct
+  - quant_config: ascend-int8
+  - _self_ # Config in this file overrides configs in defaults
+
+# Access info
+name: Qwen2.5-VL-32B-Instruct-ascend-int8
+source: "*" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
