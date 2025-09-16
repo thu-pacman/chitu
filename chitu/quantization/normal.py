@@ -29,6 +29,7 @@ from chitu.distributed.parallel_state import get_ep_group
 from chitu.static_tensor import StaticTensor
 from chitu.native_layout import (
     enable_native_layout_weight,
+    PermutedTensor,
     NpuFractalNzTensor,
     NpuFractalZnTensor,
     ACL_FORMAT_FRACTAL_NZ,
@@ -291,6 +292,26 @@ class NormalAbsorbGemm(QuantizedAbsorbGemmBase):
             x = x.view(bs * seq, n_head, n_hidden)
 
         y = torch.einsum("shc,hdc->shd", x, self.weight)
+
+        if bs is not None:
+            y = y.view(bs, seq, y.shape[-2], y.shape[-1])
+        return y
+
+
+class NormalAbsorbGemmPermuted021(
+    enable_native_layout_weight("weight", PermutedTensor, perm=(0, 2, 1)),
+    NormalAbsorbGemm,
+):
+    @override
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 3:
+            seq, n_head, n_hidden = x.shape
+            bs = None
+        else:
+            bs, seq, n_head, n_hidden = x.shape
+            x = x.view(bs * seq, n_head, n_hidden)
+
+        y = torch.einsum("shc,hcd->shd", x, self.weight)
 
         if bs is not None:
             y = y.view(bs, seq, y.shape[-2], y.shape[-1])

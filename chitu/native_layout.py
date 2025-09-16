@@ -245,6 +245,39 @@ class Vector(NativeLayoutTensor):
 
 
 @dataclass
+class PermutedTensor(NativeLayoutTensor):
+    """
+    A contiguous tensor with dimensions permuted
+    """
+
+    perm: Sequence[int]
+
+    @classmethod
+    @override
+    def convert_from(cls, tensor: torch.Tensor, *, perm: Sequence[int]) -> "Vector":
+        # NOTE: @functools.singledispatchmethod has a bug in Python 3.8
+        # (https://stackoverflow.com/questions/62696796/singledispatchmethod-and-class-method-decorators-in-python-3-8)
+        # Use `if` for now
+
+        if isinstance(tensor, torch.Tensor):
+            return cls(
+                plain_shape=tensor.shape,
+                layout_tensor=tensor.permute(*perm).contiguous(),
+                perm=perm,
+            )
+
+        else:
+            raise TypeError(f"Cannot convert from {type(tensor)} to Vector")
+
+    @override
+    def convert_to_plain(self) -> torch.Tensor:
+        return self.layout_tensor.permute(*self._get_inverse_perm())
+
+    def _get_inverse_perm(self) -> Sequence[int]:
+        return [self.perm.index(i) for i in range(len(self.perm))]
+
+
+@dataclass
 class BatchPaddedActivation(NativeLayoutTensor):
     """
     Considering all dimensions except the last one as batch dimensions, this layout padded the batch dimensions

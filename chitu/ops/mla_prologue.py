@@ -12,6 +12,7 @@ from chitu.ops.norm import rms_norm
 from chitu.ops.rotary import apply_rotary_pos_emb_partial
 from chitu.native_layout import (
     NativeLayoutTensor,
+    PermutedTensor,
     NpuFractalZnTensor,
     ColumnOddEvenSeparatedTensor,
     PartialColumnOddEvenSeparatedTensor,
@@ -25,7 +26,7 @@ def mla_prologue_normal(
     x: torch.Tensor,
     q_a_proj_weight: torch.Tensor | NativeLayoutTensor,
     q_b_proj_weight: torch.Tensor | NativeLayoutTensor,
-    kv_b_proj_absorb_1_weight: torch.Tensor,
+    kv_b_proj_absorb_1_weight: torch.Tensor | NativeLayoutTensor,
     kv_a_proj_with_mqa_weight: torch.Tensor | NativeLayoutTensor,
     q_a_layernorm_weight: torch.Tensor,
     kv_a_layernorm_weight: torch.Tensor,
@@ -54,12 +55,15 @@ def mla_prologue_normal(
             and freqs_cis.cos.shape[-1] * 2 == 64
             and isinstance(q_a_proj_weight, NpuFractalZnTensor)
             and isinstance(q_b_proj_weight, NpuFractalZnTensor)
+            and isinstance(kv_b_proj_absorb_1_weight, PermutedTensor)
+            and tuple(kv_b_proj_absorb_1_weight.perm) == (0, 2, 1)
             and isinstance(kv_a_proj_with_mqa_weight, NpuFractalZnTensor)
         ):
             impl = "torch_npu"
         elif (
             isinstance(q_a_proj_weight, torch.Tensor)
             and isinstance(q_b_proj_weight, torch.Tensor)
+            and isinstance(kv_b_proj_absorb_1_weight, torch.Tensor)
             and isinstance(kv_a_proj_with_mqa_weight, torch.Tensor)
         ):
             impl = "torch"
@@ -114,6 +118,7 @@ def mla_prologue_normal_torch(
 ]:  # q_nope, q_pe, kv
     assert isinstance(q_a_proj_weight, torch.Tensor)
     assert isinstance(q_b_proj_weight, torch.Tensor)
+    assert isinstance(kv_b_proj_absorb_1_weight, torch.Tensor)
     assert isinstance(kv_a_proj_with_mqa_weight, torch.Tensor)
 
     bs_seq, _ = x.shape
@@ -172,10 +177,12 @@ def mla_prologue_normal_torch_npu(
 ]:  # q_nope, q_pe, kv
     assert isinstance(q_a_proj_weight, NpuFractalZnTensor)
     assert isinstance(q_b_proj_weight, NpuFractalZnTensor)
+    assert isinstance(kv_b_proj_absorb_1_weight, PermutedTensor)
+    assert tuple(kv_b_proj_absorb_1_weight.perm) == (0, 2, 1)
     assert isinstance(kv_a_proj_with_mqa_weight, NpuFractalZnTensor)
 
     bs_seq, _ = x.shape
-    n_heads, kv_lora_rank, _ = kv_b_proj_absorb_1_weight.shape
+    n_heads, kv_lora_rank, _ = kv_b_proj_absorb_1_weight.plain_shape
     kv_lora_rank_plus_qk_rope_head_dim, _ = kv_a_proj_with_mqa_weight.plain_shape
     qk_rope_head_dim = kv_lora_rank_plus_qk_rope_head_dim - kv_lora_rank
 
@@ -197,7 +204,7 @@ def mla_prologue_normal_torch_npu(
         token_x=x,
         weight_dq=q_a_proj_weight.layout_tensor,
         weight_uq_qr=q_b_proj_weight.layout_tensor,
-        weight_uk=kv_b_proj_absorb_1_weight.transpose(-1, -2),
+        weight_uk=kv_b_proj_absorb_1_weight.layout_tensor,
         weight_dkv_kr=kv_a_proj_with_mqa_weight.layout_tensor,
         rmsnorm_gamma_cq=q_a_layernorm_weight,
         rmsnorm_gamma_ckv=kv_a_layernorm_weight,

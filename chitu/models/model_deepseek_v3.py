@@ -45,7 +45,10 @@ from chitu.ops import (
     mla_prologue_normal,
 )
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
-from chitu.quantization.normal import NormalLinearNpuFractalZn
+from chitu.quantization.normal import (
+    NormalAbsorbGemmPermuted021,
+    NormalLinearNpuFractalZn,
+)
 from chitu.tensor_parallel import (
     ColumnParallelLinear,
     LocalLinear,
@@ -66,17 +69,21 @@ def ParallelAbsorbGemm(
     out_features_per_head: int,
     *,
     checkpoint_prefix: str,
+    base_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     """
-    Factory function for the two group GeMMs in "absorb-without-precomp" mode, embaarrassingly parallel among heads.
+    Factory function for the two group GeMMs in "absorb-without-precomp" mode, embarrassingly parallel among heads.
 
     It computes `einsum("shc,hdc->shd", x, weight)`, maybe quantized.
     """
 
-    base_class = QuantizationRegistry.get_quantized_absorb_gemm_class_from_global_args(
-        quant_kwargs=quant_kwargs, checkpoint_prefix=checkpoint_prefix
-    )
+    if base_class is None:
+        base_class = (
+            QuantizationRegistry.get_quantized_absorb_gemm_class_from_global_args(
+                quant_kwargs=quant_kwargs, checkpoint_prefix=checkpoint_prefix
+            )
+        )
 
     tp_size = get_tp_size()
     assert global_n_heads % tp_size == 0
@@ -207,6 +214,11 @@ class AttentionDeepSeekV3(Attention):
                 self.n_heads,
                 self.qk_nope_head_dim,
                 self.kv_lora_rank,
+                base_class=(
+                    NormalAbsorbGemmPermuted021
+                    if self.can_use_mla_prologue_normal_torch_npu
+                    else None
+                ),
                 quant_kwargs={"blockfp8": {"block_size": block_size}},
                 checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
             )
@@ -241,7 +253,7 @@ class AttentionDeepSeekV3(Attention):
                 x,
                 self.q_a_proj.get_native_layout_weight(),
                 self.q_b_proj.get_native_layout_weight(),
-                self.kv_b_proj_absorb_1.weight,
+                self.kv_b_proj_absorb_1.get_native_layout_weight(),
                 self.kv_a_proj_with_mqa.get_native_layout_weight(),
                 self.q_a_layernorm.weight,
                 self.kv_a_layernorm.weight,

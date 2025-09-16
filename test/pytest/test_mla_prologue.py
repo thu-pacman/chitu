@@ -3,7 +3,7 @@ import torch
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.ops import mla_prologue_normal
-from chitu.native_layout import NativeLayoutTensor, NpuFractalZnTensor
+from chitu.native_layout import NativeLayoutTensor, PermutedTensor, NpuFractalZnTensor
 from chitu.utils import try_import_and_setup_torch_npu
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -55,6 +55,9 @@ def test_mla_prologue_normal_torch_npu(
 
     q_a_proj_weight_zn = NpuFractalZnTensor.convert_from(q_a_proj_weight)
     q_b_proj_weight_zn = NpuFractalZnTensor.convert_from(q_b_proj_weight)
+    kv_b_proj_absorb_1_weight_permuted = PermutedTensor.convert_from(
+        kv_b_proj_absorb_1_weight, perm=(0, 2, 1)
+    )
     kv_a_proj_with_mqa_weight_zn = NpuFractalZnTensor.convert_from(
         kv_a_proj_with_mqa_weight
     )
@@ -69,7 +72,7 @@ def test_mla_prologue_normal_torch_npu(
         x=x,
         q_a_proj_weight=q_a_proj_weight_zn,
         q_b_proj_weight=q_b_proj_weight_zn,
-        kv_b_proj_absorb_1_weight=kv_b_proj_absorb_1_weight,
+        kv_b_proj_absorb_1_weight=kv_b_proj_absorb_1_weight_permuted,
         kv_a_proj_with_mqa_weight=kv_a_proj_with_mqa_weight_zn,
         q_a_layernorm_weight=q_a_layernorm_weight,
         kv_a_layernorm_weight=kv_a_layernorm_weight,

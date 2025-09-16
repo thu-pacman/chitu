@@ -264,7 +264,7 @@ def _(
 @single_dispatch_lazy_tensor
 def blockfp8_linear_muxi_layout_contig_y(
     x: Union[torch.Tensor, Vector, BatchPaddedActivation],
-    w: MuxiNativeLayoutGroupWeight,
+    w: MuxiNativeLayoutWeight,
     b=None,
     weight_scale=None,
 ) -> Union[Vector, BatchPaddedActivation]:
@@ -274,7 +274,7 @@ def blockfp8_linear_muxi_layout_contig_y(
 @blockfp8_linear_muxi_layout_contig_y.register
 def _(
     x: torch.Tensor,
-    w: MuxiNativeLayoutGroupWeight,
+    w: MuxiNativeLayoutWeight,
     b=None,
     weight_scale=None,
 ) -> Union[Vector, BatchPaddedActivation]:
@@ -288,7 +288,7 @@ def _(
 @blockfp8_linear_muxi_layout_contig_y.register
 def _(
     x: Vector,
-    w: MuxiNativeLayoutGroupWeight,
+    w: MuxiNativeLayoutWeight,
     b=None,
     weight_scale=None,
 ) -> Vector:
@@ -310,7 +310,7 @@ def _(
 @blockfp8_linear_muxi_layout_contig_y.register
 def _(
     x: BatchPaddedActivation,
-    w: MuxiNativeLayoutGroupWeight,
+    w: MuxiNativeLayoutWeight,
     b=None,
     weight_scale=None,
 ) -> BatchPaddedActivation:
