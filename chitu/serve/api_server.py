@@ -7,7 +7,6 @@ Web API endpoints module for Chitu serve.
 Provides both standard and DP (Distributed Parallel) mode HTTP endpoints.
 """
 
-import asyncio
 import logging
 import os
 import time
@@ -27,6 +26,7 @@ from chitu.chitu_main import chitu_init
 from chitu.global_vars import get_global_args
 from chitu.task import Task, TaskLoad, TaskPool, UserRequest
 from chitu.utils import gen_req_id
+from chitu.serve.event_loop import start_server_in_new_event_loop
 
 logger = getLogger(__name__)
 
@@ -593,7 +593,7 @@ api_logger = getLogger("uvicorn.access")
 api_logger.addFilter(IgnoreSpecificPathFilter())
 
 
-def start_unicorn(args):
+async def start_uvicorn_async(args):
     """Start uvicorn server"""
     # 大 Batch Size(>1024) 会 too many open files，这里是为了避免这个问题
     try:
@@ -623,7 +623,12 @@ def start_unicorn(args):
         access_log=True,
     )
     server = uvicorn.Server(config)
-    server.run()
+    # Run server in current event loop - use await instead of asyncio.run!
+    await server.serve()
+
+
+def start_uvicorn(args):
+    start_server_in_new_event_loop(start_uvicorn_async(args))
 
 
 async def start_router_components_and_serve():
@@ -724,4 +729,4 @@ def init_dp_router(args):
 
     # start dp components
     logger.info("[ROUTER] Starting DP components...")
-    asyncio.run(start_router_components_and_serve())
+    start_server_in_new_event_loop(start_router_components_and_serve())

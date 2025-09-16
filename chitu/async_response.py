@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from chitu.backend import Backend
 from chitu.tokenizer import Tokenizer, TokenizerHF
+from chitu.serve.event_loop import get_server_event_loop
 
 logger = getLogger(__name__)
 
@@ -110,7 +111,9 @@ class AsyncDataStream:
         self.data_event.set()
 
     def notify_server_threadsafe(self):
-        asyncio.get_event_loop().call_soon_threadsafe(self.data_event.set)
+        if (loop := get_server_event_loop()) is not None:
+            # No need to notify if there is no server (e.g. offline inference)
+            loop.call_soon_threadsafe(self.data_event.set)
 
     def __aiter__(self):
         self.index = 0

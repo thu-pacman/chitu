@@ -8,6 +8,7 @@ import logging
 import asyncio
 
 from chitu.task import Task
+from chitu.serve.event_loop import get_server_event_loop
 
 
 class KVTransferHook(Protocol):
@@ -70,7 +71,9 @@ class LocalTokenSink:
             for task in task_list:
                 task.req.notify_server_data_added_from_server_thread()
 
-        asyncio.get_event_loop().call_soon_threadsafe(notify_all_response_in_batch)
+        if (loop := get_server_event_loop()) is not None:
+            # No need to notify if there is no server (e.g. offline inference)
+            loop.call_soon_threadsafe(notify_all_response_in_batch)
 
 
 class DPTokenSink:

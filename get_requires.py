@@ -29,7 +29,6 @@ install_requires = [
     "fastapi",
     "uvicorn[standard]",
     "tqdm",
-    "accelerate",
     "einops",
     "typing-extensions",
     "pyzmq>=27.0.0",

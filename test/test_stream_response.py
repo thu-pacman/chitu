@@ -1,7 +1,6 @@
 import requests
 import json
 import sys
-import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 
@@ -61,7 +60,6 @@ def send_request(index: int):
 
                 with lock:
                     indices_received.append(index)
-                time.sleep(0.01)  # Let another thread to receive
                 print(f"Response received from request {index}", flush=True)
 
             return (
