@@ -19,6 +19,7 @@ import logging
 from chitu.async_response import AsyncDataStream, AsyncResponse
 from chitu.task import UserRequest
 from chitu.dp_request_router import get_request_router
+from chitu.serve.event_loop import get_server_event_loop
 
 logger = logging.getLogger(__name__)
 
@@ -483,8 +484,9 @@ class DPAsyncDataStream(AsyncDataStream):
                 self.top_logprobs_list.append(top_logprobs)
                 self.top_tokens_list.append(top_tokens)
 
-        if notify_server:
-            asyncio.get_event_loop().call_soon_threadsafe(self.data_event.set)
+        if notify_server and (loop := get_server_event_loop()) is not None:
+            # No need to notify if there is no server (e.g. offline inference)
+            loop.call_soon_threadsafe(self.data_event.set)
 
 
 # Global Token Router instance

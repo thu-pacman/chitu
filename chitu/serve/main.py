@@ -16,7 +16,7 @@ import torch.distributed
 
 from chitu.chitu_main import chitu_init, warmup_engine
 from chitu.schemas import ServeConfig
-from chitu.serve.api_server import init_dp_router, start_unicorn
+from chitu.serve.api_server import init_dp_router, start_uvicorn
 from chitu.serve.common import start_worker
 from chitu.utils import get_config_dir_path
 
@@ -48,7 +48,7 @@ def main(args: ServeConfig):
 
         warmup_engine(args)
         if rank == 0:
-            uvicorn_thread = Thread(target=start_unicorn, args=(args,))
+            uvicorn_thread = Thread(target=start_uvicorn, args=(args,))
             uvicorn_thread.start()
 
         # Set server status at module level

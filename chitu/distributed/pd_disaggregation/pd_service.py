@@ -23,6 +23,7 @@ from chitu.distributed.pd_disaggregation.pd_scheduler import (
     PrefillOnlyScheduler,
     DecodeOnlyScheduler,
 )
+from chitu.serve.event_loop import get_server_event_loop
 
 logger = logging.getLogger(__name__)
 
@@ -365,9 +366,9 @@ class PDSchedulerService:
         if steps <= 0:
             return
 
-        start_ts = asyncio.get_event_loop().time()
+        start_ts = get_server_event_loop().time()
         await self._run_decode_warmup(steps)
-        dur_ms = (asyncio.get_event_loop().time() - start_ts) * 1000.0
+        dur_ms = (get_server_event_loop().time() - start_ts) * 1000.0
         logger.info(f"decode warmup completed: steps={steps}, time={dur_ms:.1f}ms")
 
     async def _run_decode_warmup(self, steps: int):
@@ -489,7 +490,7 @@ class PDSchedulerService:
             "waiting_requests": 0,  # TODO: implement
             "pending_tokens": 0,  # TODO: implement
             "throughput_tokens_per_sec": 0.0,  # TODO: implement
-            "last_update_time": asyncio.get_event_loop().time(),
+            "last_update_time": get_server_event_loop().time(),
             "heartbeat": True,
         }
 
