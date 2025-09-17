@@ -126,48 +126,15 @@ def response_append_cuda(
     response_list,
     tokens_list,
     response_len,
-    response_capacity,
     task_num,
 ):
     assert response_list.dtype == torch.long, f"{response_list.dtype=}"
     assert tokens_list.dtype == torch.long, f"{tokens_list.dtype=}"
     assert response_len.dtype == torch.int, f"{response_len.dtype=}"
-    assert response_capacity.dtype == torch.int, f"{response_capacity.dtype=}"
-    need_expand = response_len == response_capacity
-    new_response_list = torch.empty_like(response_list)
-    return_response_list = []
-
-    expand_cpu = need_expand.cpu().tolist()
-
-    new_response_index = []
-    new_response_ptr = []
-    new_response_capacity = []
-
-    for i in range(task_num):
-        if expand_cpu[i]:
-            new_len = max(2 * response_capacity[i], 32)
-            new_response = torch.empty(
-                new_len, dtype=torch.long, device=response_list.device
-            )
-            new_response_ptr.append(new_response.data_ptr())
-            new_response_index.append(i)
-            new_response_capacity.append(new_len)
-            return_response_list.append((i, new_response))
-    if len(new_response_ptr) > 0:
-        new_response_list[new_response_index] = torch.tensor(
-            new_response_ptr,
-            device=new_response_list.device,
-            dtype=new_response_list.dtype,
-        )
-        response_capacity[new_response_index] = torch.tensor(
-            new_response_capacity,
-            device=response_capacity.device,
-            dtype=response_capacity.dtype,
-        )
+    need_expand = torch.zeros(len(response_len), device=response_len.device).bool()
     chitu_backend.cuda_response_append(
-        response_list, new_response_list, tokens_list, response_len, need_expand
+        response_list, response_list, tokens_list, response_len, need_expand
     )
-    return return_response_list
 
 
 def response_append(tasks, tokens, impl="auto"):
@@ -176,20 +143,22 @@ def response_append(tasks, tokens, impl="auto"):
             impl = "cuda"
         else:
             impl = "torch"
+
+    need_expand = tasks.response_len == tasks.response_capacity
+    assert torch.all(
+        need_expand == False
+    ), f"Cannot append: DeviceList's length equals capacity."
     if impl == "torch":
-        for it, task in enumerate(tasks.output_tasks):
-            task.response.append(tokens[it])
+        tasks.response_list_manager.batch_append(
+            [task.response for task in tasks.output_tasks], tokens
+        )
     elif impl == "cuda":
-        new_response = response_append_cuda(
+        response_append_cuda(
             tasks.response_ptr,
             tokens,
             tasks.response_len,
-            tasks.response_capacity,
             task_num=len(tasks.output_tasks),
         )
-        for idx, response in new_response:
-            tasks.output_tasks[idx].response._data = response
-            tasks.response_ptr[idx] = response.data_ptr()
         for task in tasks.output_tasks:
             task.response._len += 1
         tasks.response_len += 1
