@@ -1,0 +1,84 @@
+#!/usr/bin/expect
+
+# parse parameters
+set model_arg "Qwen3-32B"
+set model_dir_arg "/data/nfs/Qwen3-32B"
+set tp_size_arg 2
+set eval_batch_size_arg 4
+
+if {[llength $argv] > 0} {
+    for {set i 0} {$i < [llength $argv]} {incr i} {
+        set arg [lindex $argv $i]
+        if {$arg eq "--model"} {
+            incr i
+            set model_arg [lindex $argv $i]
+        } elseif {$arg eq "--model-dir"} {
+            incr i
+            set model_dir_arg [lindex $argv $i]
+        } elseif {$arg eq "--tp-size"} {
+            incr i
+            set tp_size_arg [lindex $argv $i]
+        } elseif {$arg eq "--eval-batch-size"} {
+            incr i
+            set eval_batch_size_arg [lindex $argv $i]
+        }
+    }
+}
+
+# Execute the check_npus.sh script to get NPU information
+set check_output [exec bash -c "source script/check_npus.sh 2>/dev/null"]
+
+exec pip install evalscope -i https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null
+
+# Initialize variables
+set USE_NPU 0
+set NPU_TYPE ""
+
+# Parse the output to get USE_NPU and NPU_TYPE
+foreach line [split $check_output "\n"] {
+    if {[string match "USE_NPU=*" $line]} {
+        set USE_NPU [string range $line 8 end]
+    }
+    if {[string match "NPU_TYPE=*" $line]} {
+        set NPU_TYPE [string range $line 9 end]
+    }
+}
+
+puts "USE_NPU = $USE_NPU"
+if {$USE_NPU == 1} {
+    puts "NPU_TYPE = $NPU_TYPE"
+}
+
+set ATNN_TYPE_ARG "infer.attn_type=flash_attn"
+if {$USE_NPU == 1} {
+    set ATNN_TYPE_ARG "infer.attn_type=npu"
+}
+
+# Launch the server
+spawn torchrun --nproc_per_node $tp_size_arg -m chitu \
+    models=$model_arg \
+    models.ckpt_dir=$model_dir_arg \
+    infer.cache_type=paged \
+    $ATNN_TYPE_ARG \
+    infer.max_reqs=128 \
+    infer.max_seq_len=1200 \
+    infer.tp_size=$tp_size_arg \
+    infer.use_cuda_graph=True
+
+set pid [exp_pid]
+puts "Launching server, pid is $pid"
+
+# Wait for the server to start
+expect -timeout -1 "Uvicorn running on"
+puts "Starting MMLU evaluation..."
+
+set datasets_json "\[\"mmlu\"\]"
+set config_json "\{\"model\":\"$model_arg\", \"datasets\":$datasets_json,\"api_url\":\"http://localhost:21002\", \"eval_type\":\"server\", \"eval_batch_size\":$eval_batch_size_arg\}"
+
+spawn python test/test_mmlu.py --config $config_json
+
+expect -timeout -1 "Finished evaluation"
+
+puts "Evaluation completed. Terminating server..."
+puts "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+exec kill $pid

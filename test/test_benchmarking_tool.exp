@@ -1,5 +1,26 @@
 #!/usr/bin/expect
 
+# parse parameters
+set model_arg "Qwen3-32B"
+set model_dir_arg "/data/nfs/Qwen3-32B"
+set tp_size_arg 2
+
+if {[llength $argv] > 0} {
+    for {set i 0} {$i < [llength $argv]} {incr i} {
+        set arg [lindex $argv $i]
+        if {$arg eq "--model"} {
+            incr i
+            set model_arg [lindex $argv $i]
+        } elseif {$arg eq "--model-dir"} {
+            incr i
+            set model_dir_arg [lindex $argv $i]
+        } elseif {$arg eq "--tp-size"} {
+            incr i
+            set tp_size_arg [lindex $argv $i]
+        }
+    }
+}
+
 # Execute the check_npus.sh script to get NPU information
 set check_output [exec bash -c "source script/check_npus.sh 2>/dev/null"]
 
@@ -25,22 +46,20 @@ if {$USE_NPU == 1} {
 }
 
 set ATNN_TYPE_ARG "infer.attn_type=flash_attn"
-set MODEL_DIR "/data/nfs/Qwen3-32B"
 if {$USE_NPU == 1} {
     set ATNN_TYPE_ARG "infer.attn_type=npu"
-    set MODEL_DIR "/data/models/Qwen3-32B"
 }
 
 # Launch the server
-    spawn torchrun --nproc_per_node 2 --master_port=29587 -m chitu \
-        models=Qwen3-32B \
-        models.ckpt_dir=$MODEL_DIR \
-        infer.cache_type=paged \
-        $ATNN_TYPE_ARG \
-        infer.max_reqs=128 \
-        infer.max_seq_len=1200 \
-        infer.tp_size=2 \
-        infer.use_cuda_graph=True
+spawn torchrun --nproc_per_node $tp_size_arg -m chitu \
+    models=$model_arg \
+    models.ckpt_dir=$model_dir_arg \
+    infer.cache_type=paged \
+    $ATNN_TYPE_ARG \
+    infer.max_reqs=128 \
+    infer.max_seq_len=1200 \
+    infer.tp_size=$tp_size_arg \
+    infer.use_cuda_graph=True
 
 set pid [exp_pid]
 puts "Launching server, pid is $pid"
@@ -58,7 +77,7 @@ foreach bs {1 64} {
     # Run benchmark and capture output (including stderr)
     if {[catch {
         set output [exec python benchmarks/benchmark_serving.py \
-            --model "Qwen3-32B" \
+            --model $model_arg \
             --batch-size $bs \
             --iterations 1 \
             --warmup 1 \
