@@ -625,32 +625,34 @@ class Backend:
         Returns:
             Loaded checkpoint dictionary
         """
-        ckpt_dir = args.models.ckpt_dir
 
-        def get_filter_key():
-            if getattr(args.models, "type", "") == "deepseek-v3":
-                return lambda k: "model.layers.61" not in k
-            if getattr(args.models, "name", "") == "GLM-4.5-Air":
-                return lambda k: "model.layers.46" not in k
-            if getattr(args.models, "name", "") == "GLM-4.5":
-                return lambda k: "model.layers.92" not in k
-            if getattr(args.models, "name", "") == "QwQ-32B-fp4":
-                return lambda k: not (k.endswith(".k_scale") or k.endswith(".v_scale"))
-            if getattr(args.models, "name", "") in [
+        def key_filter(k: str) -> bool:
+            if args.models.type == "deepseek-v3" and "model.layers.61" in k:
+                return False
+            if args.models.name == "GLM-4.5-Air" and "model.layers.46" in k:
+                return False
+            if args.models.name == "GLM-4.5" and "model.layers.92" in k:
+                return False
+            if args.models.name == "QwQ-32B-fp4" and (
+                k.endswith(".k_scale") or k.endswith(".v_scale")
+            ):
+                return False
+            if args.models.name in [
                 "Qwen3-8B-ascend-int8",
                 "Qwen3-14B-ascend-int8",
                 "Qwen3-32B-ascend-int8",
                 "Qwen2.5-72B-Instruct-ascend-int8",
                 "Qwen2.5-VL-32B-Instruct-ascend-int8",
-            ]:
-                return lambda k: not (
-                    k.endswith(".weight_scale") or k.endswith(".weight_offset")
-                )
-            return None
+            ] and (k.endswith(".weight_scale") or k.endswith(".weight_offset")):
+                return False
+            if getattr(args.models, "tie_word_embeddings", False) and "lm_head." in k:
+                return False
+            return True
 
-        filter_key = get_filter_key()
         params = load_state_dict(
-            ckpt_dir, skip_preprocess=args.skip_preprocess, filter_key=filter_key
+            args.models.ckpt_dir,
+            skip_preprocess=args.skip_preprocess,
+            filter_key=key_filter,
         )
         return Backend._remove_prefix(params, "model.")
 

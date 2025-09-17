@@ -387,7 +387,7 @@ class TransformerHFLlama(Transformer):
         )
 
     def _get_tensor_column_parallel_layer_names(self) -> List[str]:
-        return [
+        ret = [
             "qkv_proj",  # new after merge_qkv
             "q_proj",  # for compatibility if not using merge_qkv
             "k_proj",  # for compatibility if not using merge_qkv
@@ -395,9 +395,11 @@ class TransformerHFLlama(Transformer):
             "gate_up_proj",  # new after merge_gate_up
             "gate_proj",  # for compatibility if not using merge_gate_up
             "up_proj",  # for compatibility if not using merge_gate_up
-            "lm_head",
             "embed_tokens",
         ]
+        if not getattr(self.params, "tie_word_embeddings", False):
+            ret.append("lm_head")
+        return ret
 
     def _get_tensor_row_parallel_layer_names(self) -> List[str]:
         return ["down_proj", "o_proj"]
@@ -406,7 +408,10 @@ class TransformerHFLlama(Transformer):
         return ["embed_tokens."]
 
     def _get_post_layer_prefixes(self) -> List[str]:
-        return ["lm_head.", "norm."]
+        if not getattr(self.params, "tie_word_embeddings", False):
+            return ["lm_head.", "norm."]
+        else:
+            return ["embed_tokens.", "norm."]
 
     def _get_layer_i_prefixes(self, i: int) -> List[str]:
         return [f"layers.{i}."]
@@ -661,9 +666,6 @@ class TransformerHFLlama(Transformer):
         **kwargs,
     ):
         if not skip_preprocess:
-            if getattr(self.params, "tie_word_embeddings", False):
-                state_dict["lm_head.weight"] = state_dict["embed_tokens.weight"]
-
             if self.params.name.startswith("glm") and self.params.type == "hf-llama":
                 # Classic GLM-4 (instead of GLM-4-0414) has non-standard key names because they use "custom code"
                 # in model files instead of using code in transformers' repo.
@@ -742,12 +744,13 @@ class TransformerHFLlama(Transformer):
 
     def _init_post_layers(self):
         self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps)
-        self.lm_head = ColumnParallelLinear(
-            self.params.dim,
-            self.params.vocab_size,
-            has_bias=False,
-            checkpoint_prefix=f"lm_head",
-        )
+        if not getattr(self.params, "tie_word_embeddings", False):
+            self.lm_head = ColumnParallelLinear(
+                self.params.dim,
+                self.params.vocab_size,
+                has_bias=False,
+                checkpoint_prefix=f"lm_head",
+            )
 
     def _pre_layers(self, h, **args):
         return self.embed_tokens(h)
@@ -755,7 +758,10 @@ class TransformerHFLlama(Transformer):
     def _post_layers(self, h):
         """NOTE: _post_layers is assumed to be a token-wise computation"""
         h = self.norm(h, impl=get_rms_norm_impl())
-        h = self.lm_head(h)
+        if not getattr(self.params, "tie_word_embeddings", False):
+            h = self.lm_head(h)
+        else:
+            h = self.embed_tokens.forward_as_lm_head(h)
         return h
 
     def precompute_freqs_cis(self, max_position_embeddings, device):

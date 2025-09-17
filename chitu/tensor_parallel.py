@@ -15,6 +15,7 @@ from logging import getLogger
 from chitu.quantization import QuantizationRegistry
 from chitu.device_type import is_ascend
 from chitu.distributed.parallel_state import get_tp_group, get_tp_size
+from chitu.ops.quant import linear
 
 logger = getLogger(__name__)
 
@@ -351,4 +352,17 @@ class VocabParallelEmbedding(torch.nn.Module):
             else:
                 y[mask] = 0
             torch.distributed.all_reduce(y, group=self.tp_group)
+        return y
+
+    def forward_as_lm_head(self, x: torch.Tensor) -> torch.Tensor:
+        y = linear(x, self.weight)
+        if self.tp_size > 1:
+            y_transposed = y.permute(-1, *range(y.dim() - 1)).contiguous()
+            shape = list(y_transposed.shape)
+            shape[0] *= self.tp_size
+            y_gathered = y.new_empty(shape)
+            torch.distributed.all_gather_into_tensor(
+                y_gathered, y_transposed, group=self.tp_group
+            )
+            y = y_gathered.permute(*range(1, y.dim()), 0)
         return y
