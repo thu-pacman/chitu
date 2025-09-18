@@ -546,30 +546,20 @@ class Blockfp4MoeExpertsPackKStride64(
     blockfp4 quantized MoeExperts with weights in Packed4BitWeightAlongK (k_stride=64) layout.
     """
 
+    @override
     def forward(
         self,
         x: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
         tokens_per_expert: Optional[torch.Tensor] = None,
+        inplace: bool = False,
         impl: str = "auto",
     ) -> torch.Tensor:
-        """
-        Forward pass for the MoE module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            weights (torch.Tensor): Routing weights from the gate.
-            indices (torch.Tensor): Indices of the selected experts.
-
-        Returns:
-            torch.Tensor: Output tensor.
-        """
-
-        shape = x.size()
-        x = x.view(-1, self.dim)
-
         if has_triton and self.merge_gate_up:
+            shape = x.size()
+            x = x.view(-1, self.dim)
+
             raise_to_16 = (
                 parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
                 != 1
@@ -607,7 +597,7 @@ class Blockfp4MoeExpertsPackKStride64(
                 w2=self.get_native_layout_down_proj_weight().layout_tensor,
                 topk_weights=final_weights,
                 topk_ids=final_indices,
-                inplace=False,
+                inplace=inplace,
                 use_fp4_w4a8=True,
                 expert_map=self.expert_map,
                 w1_scale=self.gate_up_proj_weight_scale,
@@ -620,10 +610,12 @@ class Blockfp4MoeExpertsPackKStride64(
                 impl=impl,
             )
 
-        else:
-            y = self.forward_iterative(x, weights, indices)
+            return y.view(shape)
 
-        return y.view(shape)
+        else:
+            return super().forward(
+                x, weights, indices, tokens_per_expert, inplace=inplace, impl=impl
+            )
 
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
@@ -687,30 +679,19 @@ class Blockfp4MoeExpertsPackNPUNative(
     blockfp4 quantized MoeExperts with weights in Packed4BitWeightNPUNative layout.
     """
 
+    @override
     def forward(
         self,
         x: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
         tokens_per_expert: Optional[torch.Tensor] = None,
+        inplace: bool = False,
         impl: str = "auto",
     ) -> torch.Tensor:
-        """
-        Forward pass for the MoE module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            weights (torch.Tensor): Routing weights from the gate.
-            indices (torch.Tensor): Indices of the selected experts.
-
-        Returns:
-            torch.Tensor: Output tensor.
-        """
-
-        shape = x.size()
-        x = x.view(-1, self.dim)
-
         if self.merge_gate_up:
+            shape = x.size()
+            x = x.view(-1, self.dim)
             y = fused_experts_npu(
                 hidden_states=x,
                 w1=self.gate_up_proj_weight,
@@ -720,11 +701,12 @@ class Blockfp4MoeExpertsPackNPUNative(
                 w1_scale=self.gate_up_proj_weight_scale,
                 w2_scale=self.down_proj_weight_scale,
             )
+            return y.view(shape)
 
         else:
-            y = self.forward_iterative(x, weights, indices)
-
-        return y.view(shape)
+            return super().forward(
+                x, weights, indices, tokens_per_expert, inplace=inplace, impl=impl
+            )
 
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:

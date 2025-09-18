@@ -880,6 +880,9 @@ class ParallelMoeBlock(nn.Module):
         self.experts = experts
         self.shared_experts = non_fused_shared_experts
 
+        if self.shared_experts is not None:
+            self.shared_experts_stream = torch.cuda.Stream()
+
         self.moe_impl = get_moe_impl()
         self.is_tp_mode = get_tp_size() > 1
 
@@ -899,9 +902,12 @@ class ParallelMoeBlock(nn.Module):
         weights, indices = self.gate(x)
 
         shared_y = None
+        x_in_use_simultenously = False
         if self.shared_experts is not None:
-            # Do this before `self.experts`, because `self.experts` may modify `x` in-place
-            shared_y = self.shared_experts(x)
+            self.shared_experts_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.shared_experts_stream):
+                shared_y = self.shared_experts(x)
+                x_in_use_simultenously = True
 
         experts_impl = "auto"
         tokens_per_expert = None
@@ -910,12 +916,21 @@ class ParallelMoeBlock(nn.Module):
             x, indices, weights, tokens_per_expert = self.moe_impl.token_permutation(
                 x, indices, weights
             )
+            x_in_use_simultenously = False
 
-        y = self.experts(x, weights, indices, tokens_per_expert, experts_impl)
+        y = self.experts(
+            x,
+            weights,
+            indices,
+            tokens_per_expert,
+            inplace=not x_in_use_simultenously,
+            impl=experts_impl,
+        )
 
         # Fuse allreduce to improve performance in TP mode
         if self.is_tp_mode:
             if shared_y is not None:
+                torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
                 y += shared_y
             if not self.moe_impl:
                 torch.distributed.all_reduce(y, group=get_tp_group().gpu_group)
@@ -924,7 +939,9 @@ class ParallelMoeBlock(nn.Module):
             y = self.moe_impl.token_unpermutation(y)
 
         if shared_y is not None and not self.is_tp_mode:
+            torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
             y += shared_y
+
         return y.view(shape)
 
 

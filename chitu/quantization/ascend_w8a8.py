@@ -2,7 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
+from typing_extensions import override
 import torch
+
 from chitu.utils import try_import_and_setup_torch_npu
 from chitu.quantization.base import QuantizedLinearBase, QuantizedMoeExpertsBase
 from chitu.distributed.parallel_state import get_tp_group, get_ep_size
@@ -291,18 +294,19 @@ class AscendW8A8DynamicMoeExperts(
             requires_grad=False,
         )
 
+    @override
     def forward(
         self,
         x: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
-        tokens_per_expert: torch.Tensor,
+        tokens_per_expert: Optional[torch.Tensor] = None,
+        inplace: bool = False,
         impl: str = "npu",
     ) -> torch.Tensor:
-
-        shape = x.size()
-        x = x.view(-1, self.dim)
         if self.merge_gate_up:
+            shape = x.size()
+            x = x.view(-1, self.dim)
             y = fused_experts(
                 hidden_states=x,
                 w1=self.gate_up_proj_weight,
@@ -314,7 +318,9 @@ class AscendW8A8DynamicMoeExperts(
                 use_int8_w8a8=True,
                 impl=impl,
             )
-        else:
-            y = self.forward_iterative(x, weights, indices)
+            return y.view(shape)
 
-        return y.view(shape)
+        else:
+            return super().forward(
+                x, weights, indices, tokens_per_expert, inplace=inplace, impl=impl
+            )
