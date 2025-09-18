@@ -151,6 +151,9 @@ def test_mla_prologue_normal_torch_npu_int8_weight_q_b_proj(
     kv_a_proj_with_mqa_weight_zn_bf16 = NpuFractalZnTensor.convert_from(
         kv_a_proj_with_mqa_weight
     )
+    kv_b_proj_absorb_1_weight_permuted = PermutedTensor.convert_from(
+        kv_b_proj_absorb_1_weight, perm=(0, 2, 1)
+    )
 
     rope_sin = torch.rand(bs_seq, qk_rope_head_dim // 2, dtype=torch.bfloat16).cuda()
     rope_cos = torch.rand(bs_seq, qk_rope_head_dim // 2, dtype=torch.bfloat16).cuda()
@@ -183,13 +186,13 @@ def test_mla_prologue_normal_torch_npu_int8_weight_q_b_proj(
     q_b_proj_weight_zn_int8 = NpuFractalZnTensor.convert_from(q_b_int8)
 
     out_dim = q_b_proj_weight.shape[0]
-    dequant_scale_q_b_proj = scale_w.to(torch.float32).unsqueeze(0).to(x.device)
+    dequant_scale_q_b_proj = scale_w.to(torch.float32).to(x.device)
 
     q_nope_i8, q_pe_i8, kv_i8 = mla_prologue_normal(
         x=x,
         q_a_proj_weight=q_a_proj_weight_zn_bf16,
         q_b_proj_weight=q_b_proj_weight_zn_int8,
-        kv_b_proj_absorb_1_weight=kv_b_proj_absorb_1_weight,
+        kv_b_proj_absorb_1_weight=kv_b_proj_absorb_1_weight_permuted,
         kv_a_proj_with_mqa_weight=kv_a_proj_with_mqa_weight_zn_bf16,
         q_a_layernorm_weight=q_a_layernorm_weight,
         kv_a_layernorm_weight=kv_a_layernorm_weight,
