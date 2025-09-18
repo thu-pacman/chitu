@@ -219,8 +219,12 @@ def mla_prologue_normal_torch_npu(
         cache_index=torch.arange(bs_seq, device=x.device, dtype=torch.int64),
         kv_cache=k_lora,
         kr_cache=k_pe,
-        dequant_scale_w_uq_qr=dequant_scale_q_b_proj,
-        smooth_scales_cq=smooth_scales,
+        dequant_scale_w_uq_qr=(
+            None
+            if dequant_scale_q_b_proj is None
+            else dequant_scale_q_b_proj.unsqueeze(0)
+        ),
+        smooth_scales_cq=smooth_scales,  # None
         rmsnorm_epsilon_cq=q_a_layernorm_eps,
         rmsnorm_epsilon_ckv=kv_a_layernorm_eps,
     )

@@ -109,7 +109,29 @@ class AttentionDeepSeekV3(Attention):
         quant = get_quant_from_checkpoint_prefix(
             checkpoint_prefix, args.quant_config.rules
         )
-        self.merge_qkv = QuantizationRegistry.allowed_merge_qkv(checkpoint_prefix)
+        mla_prologue_int8 = (
+            get_quant_from_checkpoint_prefix(
+                checkpoint_prefix + ".kv_b_proj", args.quant_config.rules
+            )
+            is None
+            and get_quant_from_checkpoint_prefix(
+                checkpoint_prefix + ".q_a_proj", args.quant_config.rules
+            )
+            is None
+            and get_quant_from_checkpoint_prefix(
+                checkpoint_prefix + ".kv_a_proj_with_mqa", args.quant_config.rules
+            )
+            is None
+            and get_quant_from_checkpoint_prefix(
+                checkpoint_prefix + ".q_b_proj", args.quant_config.rules
+            )
+            == "ascend_w8a8_dynamic"
+        )
+        self.merge_qkv = (
+            QuantizationRegistry.allowed_merge_qkv(checkpoint_prefix)
+            if not mla_prologue_int8
+            else False
+        )
 
         self.dim = args.dim
         self.n_heads = args.n_heads
@@ -131,7 +153,7 @@ class AttentionDeepSeekV3(Attention):
         # - chitu/ops/mla_prologue.py
         self.can_use_mla_prologue_normal_torch_npu = (
             has_torch_npu
-            and quant is None
+            and (quant is None or mla_prologue_int8)
             and not self.merge_qkv
             and torch.get_default_dtype() == torch.bfloat16
             and self.dim == 7168
@@ -187,7 +209,9 @@ class AttentionDeepSeekV3(Attention):
             gather_output=False,
             base_linear_class=(
                 NormalLinearNpuFractalZn
-                if self.can_use_mla_prologue_normal_torch_npu
+                if (
+                    self.can_use_mla_prologue_normal_torch_npu and not mla_prologue_int8
+                )
                 else get_linear_layout_contig_y(
                     op_impl,
                     checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",
@@ -260,6 +284,8 @@ class AttentionDeepSeekV3(Attention):
                 freqs_cis,
                 self.q_a_layernorm.eps,
                 self.kv_a_layernorm.eps,
+                dequant_scale_q_b_proj=getattr(self.q_b_proj, "weight_scale", None),
+                smooth_scales=None,
                 impl="torch_npu",
             )
 

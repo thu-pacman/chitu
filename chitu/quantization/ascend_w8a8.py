@@ -177,7 +177,8 @@ class AscendW8A8DynamicLinear(
         out_features: int,
         has_bias: bool = True,
         ############################################
-        # No parameters specific to this quantization
+        # Parameters specific to this quantization
+        weight_scale_dtype: torch.dtype = None,
     ):
         super().__init__()
         self.in_features = in_features
@@ -195,7 +196,11 @@ class AscendW8A8DynamicLinear(
             torch.ones(
                 self.out_features,
                 1,
-                dtype=torch.get_default_dtype(),
+                dtype=(
+                    torch.get_default_dtype()
+                    if weight_scale_dtype is None
+                    else eval(weight_scale_dtype)
+                ),
             ),
             requires_grad=False,
         )
