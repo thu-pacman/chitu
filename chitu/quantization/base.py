@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
 import torch
 
 from chitu.ops import silu_and_mul
@@ -199,6 +200,30 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
             ):
                 y += down_proj_outs[i]
         return y.view(shape)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        tokens_per_expert: Optional[torch.Tensor] = None,
+        inplace: bool = False,
+        impl: str = "auto",
+    ):
+        """
+        Forward pass for the MoE module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            weights (torch.Tensor): Routing weights from the gate.
+            indices (torch.Tensor): Indices of the selected experts.
+            inplace (bool): If true, `x` may be modified in-place.
+
+        Returns:
+            torch.Tensor: Output tensor.
+        """
+
+        return self.forward_iterative(x, weights, indices)
 
 
 class QuantizedAbsorbGemmBase(torch.nn.Module):

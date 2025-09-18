@@ -33,6 +33,8 @@ def mla_prologue_normal(
     freqs_cis: BatchedFreqsCis,
     q_a_layernorm_eps: float,
     kv_a_layernorm_eps: float,
+    dequant_scale_q_b_proj: torch.Tensor | None = None,
+    smooth_scales: torch.Tensor | None = None,
     impl: str = "auto",
 ) -> Tuple[
     torch.Tensor, torch.Tensor | NativeLayoutTensor, torch.Tensor | NativeLayoutTensor
@@ -84,6 +86,8 @@ def mla_prologue_normal(
             freqs_cis=freqs_cis,
             q_a_layernorm_eps=q_a_layernorm_eps,
             kv_a_layernorm_eps=kv_a_layernorm_eps,
+            dequant_scale_q_b_proj=dequant_scale_q_b_proj,
+            smooth_scales=smooth_scales,
         )
     elif impl == "torch":
         return mla_prologue_normal_torch(
@@ -172,6 +176,8 @@ def mla_prologue_normal_torch_npu(
     freqs_cis: BatchedFreqsCis,  # a.k.a. rope_sin, rope_cos
     q_a_layernorm_eps: float,  # a.k.a. rmsnorm_epsilon_cq
     kv_a_layernorm_eps: float,  # a.k.a. rmsnorm_epsilon_ckv
+    dequant_scale_q_b_proj: torch.Tensor | None = None,
+    smooth_scales: torch.Tensor | None = None,
 ) -> Tuple[
     torch.Tensor, ColumnOddEvenSeparatedTensor, PartialColumnOddEvenSeparatedTensor
 ]:  # q_nope, q_pe, kv
@@ -213,6 +219,8 @@ def mla_prologue_normal_torch_npu(
         cache_index=torch.arange(bs_seq, device=x.device, dtype=torch.int64),
         kv_cache=k_lora,
         kr_cache=k_pe,
+        dequant_scale_w_uq_qr=dequant_scale_q_b_proj,
+        smooth_scales_cq=smooth_scales,
         rmsnorm_epsilon_cq=q_a_layernorm_eps,
         rmsnorm_epsilon_ckv=kv_a_layernorm_eps,
     )

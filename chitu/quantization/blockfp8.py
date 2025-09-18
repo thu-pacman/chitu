@@ -285,26 +285,16 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
             requires_grad=False,
         )
 
+    @override
     def forward(
         self,
         x: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
         tokens_per_expert: Optional[torch.Tensor] = None,
+        inplace: bool = False,
         impl: str = "auto",
     ) -> torch.Tensor:
-        """
-        Forward pass for the MoE module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            weights (torch.Tensor): Routing weights from the gate.
-            indices (torch.Tensor): Indices of the selected experts.
-
-        Returns:
-            torch.Tensor: Output tensor.
-        """
-
         if has_triton and self.merge_gate_up:
             fused_soft_fp8 = False
             use_fp8_w8a8 = False
@@ -369,13 +359,13 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                 )
                 del weights, indices
 
-            y = fused_experts(
+            return fused_experts(
                 hidden_states=x,
                 w1=gate_up_proj_weight,
                 w2=down_proj_weight,
                 topk_weights=final_weights,
                 topk_ids=final_indices,
-                inplace=False,
+                inplace=inplace,
                 use_fp8_w8a8=use_fp8_w8a8,
                 expert_map=self.expert_map,
                 w1_scale=gate_up_proj_scale,
@@ -386,10 +376,11 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                 experts_start_idx=self.experts_start_idx,
                 impl=impl,
             )
-        else:
-            y = self.forward_iterative(x, weights, indices)
 
-        return y
+        else:
+            return super().forward(
+                x, weights, indices, tokens_per_expert, inplace=inplace, impl=impl
+            )
 
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:

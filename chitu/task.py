@@ -22,7 +22,7 @@ import torch
 from chitu.task_type import TaskType
 from chitu.async_response import AsyncDataStream
 from chitu.backend import Backend
-from chitu.device_list import DeviceList
+from chitu.device_list import DeviceList, StaticDeviceListManager
 from chitu.global_vars import get_slot_handle, get_global_args
 
 logger = getLogger(__name__)
@@ -566,7 +566,10 @@ class TaskPool:
             cls.pool[task_id].req.completion_time = time.monotonic()
             cls.pool[task_id].req.save_trace_to_json()
             TaskLoad.reduce(cls.pool[task_id].prefix_length)
-
+        if PackedTasksBase.response_list_manager is not None:
+            PackedTasksBase.response_list_manager.remove_list(
+                cls.pool[task_id].response
+            )
         if cls.pool.pop(task_id) is None:
             raise ValueError(f"Task {task_id} not found in pool")
         cls.id_list.remove(task_id)
@@ -630,6 +633,7 @@ class PackedTasksBase:
     )
     num_tokens: int = 0
     has_outputs: List[int] = field(default_factory=list)
+    response_list_manager = None
 
     @classmethod
     def configure(cls, max_num_tasks: int):
@@ -783,7 +787,8 @@ class PackedTasks(PackedTasksBase):
 
         # metadata
         self.rank = rank
-        if get_global_args().infer.op_impl == "cpu":
+        args = get_global_args()
+        if args.infer.op_impl == "cpu":
             self.rank = "cpu"
         self.task_ids = task_ids
         self.num_tasks = len(task_ids)
@@ -855,6 +860,25 @@ class PackedTasks(PackedTasksBase):
         self.return_logprobs = any(
             getattr(task.req, "logprobs", False) for task in self.output_tasks
         )
+
+        if PackedTasksBase.response_list_manager is None:
+            if args.infer.op_impl == "cpu":
+                PackedTasksBase.response_list_manager = StaticDeviceListManager(
+                    max_num_rows=args.infer.max_reqs,
+                    max_num_cols=args.infer.max_seq_len,
+                    dtype=torch.long,
+                    device="cpu",
+                )
+            else:
+                PackedTasksBase.response_list_manager = StaticDeviceListManager(
+                    max_num_rows=args.infer.max_reqs,
+                    max_num_cols=args.infer.max_seq_len,
+                    dtype=torch.long,
+                    device="cuda",
+                )
+
+        for task in self.output_tasks:
+            PackedTasksBase.response_list_manager.push_list(task.response)
 
         self.response_len = torch.tensor(
             [len(task.response) for task in self.output_tasks],

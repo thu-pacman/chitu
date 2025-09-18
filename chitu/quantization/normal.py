@@ -175,26 +175,16 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
             requires_grad=False,
         )
 
+    @override
     def forward(
         self,
         x: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
         tokens_per_expert: Optional[torch.Tensor] = None,
+        inplace: bool = False,
         impl: str = "auto",
     ):
-        """
-        Forward pass for the MoE module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            weights (torch.Tensor): Routing weights from the gate.
-            indices (torch.Tensor): Indices of the selected experts.
-
-        Returns:
-            torch.Tensor: Output tensor.
-        """
-
         if self.merge_gate_up and (has_triton or has_torch_npu):
             final_indices = indices
             final_weights = weights
@@ -222,22 +212,23 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
                 )
                 del weights, indices
 
-            y = fused_experts(
+            return fused_experts(
                 hidden_states=x,
                 w1=self.gate_up_proj_weight,
                 w2=self.down_proj_weight,
                 topk_weights=final_weights,
                 topk_ids=final_indices,
-                inplace=False,
+                inplace=inplace,
                 expert_map=self.expert_map,
                 tokens_per_expert=tokens_per_expert,
                 experts_start_idx=self.experts_start_idx,
                 impl=impl,
             )
-        else:
-            y = self.forward_iterative(x, weights, indices)
 
-        return y
+        else:
+            return super().forward(
+                x, weights, indices, tokens_per_expert, inplace=inplace, impl=impl
+            )
 
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:

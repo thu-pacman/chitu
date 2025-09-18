@@ -210,12 +210,14 @@ class GptOssMoeExperts(NormalMoeExperts):
             else None
         )
 
+    @override
     def forward(
         self,
         x: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
         tokens_per_expert: Optional[torch.Tensor] = None,
+        inplace: bool = False,
         impl: str = "auto",
     ):
 

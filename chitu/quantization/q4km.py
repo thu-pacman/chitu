@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
+from typing_extensions import override
 import torch
 import ctypes
 
@@ -13,7 +15,6 @@ from chitu.hybrid_device import CPUParameter
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import GGMLQuantizationType
 from chitu.utils import try_import_opt_dep
-from typing import Optional
 
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
@@ -223,25 +224,16 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
             self.cpu_infer.submit(self.moe.warm_up())
             self.cpu_infer.sync()
 
+    @override
     def forward(
         self,
         x: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
         tokens_per_expert: Optional[torch.Tensor] = None,
+        inplace: bool = False,
         impl: str = "auto",
     ) -> torch.Tensor:
-        """
-        Forward pass for the MoE module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            weights (torch.Tensor): Routing weights from the gate.
-            indices (torch.Tensor): Indices of the selected experts.
-
-        Returns:
-            torch.Tensor: Output tensor.
-        """
         shape = x.size()
         capturing = torch.cuda.is_current_stream_capturing()
 
