@@ -16,7 +16,7 @@ import torch
 import torch.distributed
 
 from chitu.backend import Backend, BackendState
-from chitu.global_vars import get_timers, get_global_args
+from chitu.global_vars import get_timers
 from chitu.task import (
     PackedTasks,
     PackedTasksBase,
@@ -39,6 +39,7 @@ from chitu.hooks import TokenSink, LocalTokenSink, KVTransferHook, NoopKVTransfe
 from chitu.utils import top_k_top_p_min_p_sampling_from_logits
 from chitu.ops import apply_frequency_penalty, response_append
 from chitu.device_list import DeviceList
+from chitu.device_type import is_ascend
 
 logger = getLogger(__name__)
 
@@ -456,21 +457,22 @@ class Executor:
             # use for empty step
             self.dim = args.models.dim
             self.vocab_size = args.models.vocab_size
+            self.use_cuda_graph = args.infer.use_cuda_graph
             self.n_dense_layers = (
                 args.models.n_dense_layers
                 if hasattr(args.models, "n_dense_layers")
                 else 0
             )
+            dummy_input_shape = [1, self.dim] if is_ascend() else [0, self.dim]
             self.dummy_input = torch.empty(
-                [0, self.dim], dtype=torch.get_default_dtype(), device=self.local_rank
+                dummy_input_shape,
+                dtype=torch.get_default_dtype(),
+                device=self.local_rank,
             )
             self.dummy_logits = torch.empty(
                 [0, self.vocab_size], dtype=torch.float32, device=self.local_rank
             )
             self.empty_decode_step_graph = None
-            self.use_cuda_graph = get_global_args().infer.use_cuda_graph
-            self.cuda_graph_captured_bs_set = set()
-            self.current_max_num_tokens = 0
         self.moe_impl = get_moe_impl()
         # Hooks for token streaming and KV transfer. Defaults keep existing behavior.
         self._token_sink: TokenSink = LocalTokenSink()
@@ -516,28 +518,7 @@ class Executor:
                 Backend.cache_manager.finalize_cache_all_decode(rid)
             return None
 
-        if self.dp_size > 1 and self.use_cuda_graph:
-            if tasks.task_type in [TaskType.Decode, TaskType.EmptyDecode]:
-                num_tokens_tensor = torch.tensor([tasks.num_tokens], device="cpu")
-                dp_group_cpu = get_dp_group().cpu_group
-                torch.distributed.all_reduce(
-                    num_tokens_tensor,
-                    op=torch.distributed.ReduceOp.MAX,
-                    group=dp_group_cpu,
-                )
-                max_num_tokens = num_tokens_tensor.item()
-                self.current_max_num_tokens = max_num_tokens
-                if tasks.task_type == TaskType.Decode:
-                    self.cuda_graph_captured_bs_set.add(max_num_tokens)
-
-            if self.moe_impl is not None:
-                if tasks.task_type == TaskType.Decode:
-                    self.moe_impl.prepare(tasks.task_type, max_num_tokens)
-                elif tasks.task_type == TaskType.EmptyDecode:
-                    self.moe_impl.prepare(tasks.task_type, 0)
-                else:
-                    self.moe_impl.prepare(tasks.task_type, tasks.num_tokens)
-        elif self.moe_impl is not None:
+        if self.moe_impl is not None:
             self.moe_impl.prepare(tasks.task_type, tasks.num_tokens)
 
         # 2. prefill/decode step
@@ -819,14 +800,7 @@ class Executor:
                 self.empty_decode_step_graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(self.empty_decode_step_graph):
                     empty_mlp()
-            else:
-                self.empty_decode_step_graph.replay()
-
-            if (
-                self.current_max_num_tokens not in self.cuda_graph_captured_bs_set
-            ):  # To align with two executions in CUDA graph capture, we replay once more for other DP ranks to capture the graph
-                self.cuda_graph_captured_bs_set.add(self.current_max_num_tokens)
-                self.empty_decode_step_graph.replay()
+            self.empty_decode_step_graph.replay()
         else:
             empty_mlp()
 
