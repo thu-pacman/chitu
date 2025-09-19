@@ -367,7 +367,6 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                 topk_ids=final_indices,
                 inplace=inplace,
                 use_fp8_w8a8=use_fp8_w8a8,
-                expert_map=self.expert_map,
                 w1_scale=gate_up_proj_scale,
                 w2_scale=down_proj_scale,
                 block_shape=[128, 128],

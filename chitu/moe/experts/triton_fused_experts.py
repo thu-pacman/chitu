@@ -78,6 +78,7 @@ def fused_moe_kernel_soft_fp4(
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
     # Matrix dimensions
+    E,
     N,
     K,
     EM,
@@ -166,7 +167,7 @@ def fused_moe_kernel_soft_fp4(
     token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-    if off_experts == -1:
+    if off_experts < 0 or off_experts >= E:
         # -----------------------------------------------------------
         # Write back zeros to the output when the expert is not
         # in the current expert parallel rank.
@@ -344,6 +345,7 @@ def fused_moe_kernel(
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
     # Matrix dimensions
+    E,
     N,
     K,
     EM,
@@ -433,7 +435,7 @@ def fused_moe_kernel(
     token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-    if off_experts == -1:
+    if off_experts < 0 or off_experts >= E:
         # -----------------------------------------------------------
         # Write back zeros to the output when the expert is not
         # in the current expert parallel rank.
@@ -680,7 +682,6 @@ def moe_align_block_size_native(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
-    expert_map: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block
@@ -691,10 +692,6 @@ def moe_align_block_size_native(
         top-k expert indices for each token.
     - block_size: The block size used in block matrix multiplication.
     - num_experts: The total number of experts.
-    - expert_map: A tensor of shape [num_experts] that maps the expert index
-        from the global space to the local index space of the current
-        expert parallel shard. If the expert is not in the current expert
-        parallel shard, the mapping is set to -1.
 
     Returns:
     - sorted_token_ids: A tensor containing the sorted token indices according
@@ -747,8 +744,6 @@ def moe_align_block_size_native(
         num_tokens_post_pad,
         cumsum_buffer,
     )
-    if expert_map is not None:
-        expert_ids = expert_map[expert_ids]
 
     return sorted_ids, expert_ids, num_tokens_post_pad
 
@@ -839,6 +834,7 @@ def invoke_fused_moe_kernel(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
+            B.shape[0],
             B.shape[1],
             A.shape[1],
             EM,
@@ -876,6 +872,7 @@ def invoke_fused_moe_kernel(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
+            B.shape[0],
             B.shape[1],
             A.shape[1],
             EM,
@@ -996,7 +993,6 @@ def inplace_fused_experts(
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     global_num_experts: int = -1,
-    expert_map: Optional[torch.Tensor] = None,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_scale2: Optional[torch.Tensor] = None,
@@ -1021,7 +1017,6 @@ def inplace_fused_experts(
         use_int8_w8a16,
         use_int4_w4a16,
         global_num_experts,
-        expert_map,
         w1_scale,
         w2_scale,
         w1_scale2,
@@ -1047,7 +1042,6 @@ def outplace_fused_experts(
     use_int4_w4a16: bool = False,
     use_fp4_w4a8: bool = False,
     global_num_experts: int = -1,
-    expert_map: Optional[torch.Tensor] = None,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_zp: Optional[torch.Tensor] = None,
@@ -1070,7 +1064,6 @@ def outplace_fused_experts(
         use_int8_w8a16,
         use_int4_w4a16,
         global_num_experts,
-        expert_map,
         w1_scale,
         w2_scale,
         w1_zp,
@@ -1095,7 +1088,6 @@ def fused_experts(
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     global_num_experts: int = -1,
-    expert_map: Optional[torch.Tensor] = None,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_scale_2: Optional[torch.Tensor] = None,
@@ -1129,7 +1121,6 @@ def fused_experts(
         use_int8_w8a16,
         use_int4_w4a16,
         global_num_experts,
-        expert_map,
         w1_scale,
         w2_scale,
         w1_scale_2,
@@ -1156,7 +1147,6 @@ def fused_experts_impl(
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     global_num_experts: int = -1,
-    expert_map: Optional[torch.Tensor] = None,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_scale2: Optional[torch.Tensor] = None,
@@ -1251,7 +1241,7 @@ def fused_experts_impl(
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            curr_topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
+            curr_topk_ids, config["BLOCK_SIZE_M"], global_num_experts
         )
 
         if (use_fp8_w8a8 or use_fp4_w4a8) and not soft_fp8:
@@ -1343,7 +1333,6 @@ def moe_align_block_size_cuda(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
-    expert_map: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block
@@ -1354,10 +1343,6 @@ def moe_align_block_size_cuda(
         top-k expert indices for each token.
     - block_size: The block size used in block matrix multiplication.
     - num_experts: The total number of experts.
-    - expert_map: A tensor of shape [num_experts] that maps the expert index
-        from the global space to the local index space of the current
-        expert parallel shard. If the expert is not in the current expert
-        parallel shard, the mapping is set to -1.
 
     Returns:
     - sorted_token_ids: A tensor containing the sorted token indices according
@@ -1418,9 +1403,6 @@ def moe_align_block_size_cuda(
         token_cnts_buffer,
         cumsum_buffer,
     )
-    if expert_map is not None:
-        expert_ids = expert_map[expert_ids]
-
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 
@@ -1431,11 +1413,8 @@ def moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
-    expert_map: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if is_nvidia() or is_muxi():
-        return moe_align_block_size_cuda(topk_ids, block_size, num_experts, expert_map)
+        return moe_align_block_size_cuda(topk_ids, block_size, num_experts)
     else:
-        return moe_align_block_size_native(
-            topk_ids, block_size, num_experts, expert_map
-        )
+        return moe_align_block_size_native(topk_ids, block_size, num_experts)
