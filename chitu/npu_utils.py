@@ -213,7 +213,6 @@ def fused_experts_npu_with_communication(
     w1_scale=None,
     w2_scale=None,
     experts_start_idx=0,
-    max_bs: int = 16,
     use_int8_w8a8=False,
     **kwargs,
 ):
@@ -222,6 +221,7 @@ def fused_experts_npu_with_communication(
     rank = torch.distributed.get_rank()
     global_num_experts = n_local_experts * ep_size
     ep_hcomm_info = get_hcomm_info(rank, get_ep_group().gpu_group)
+    global_bs = get_global_args().infer.max_reqs
     act_dtype = hidden_states.dtype
 
     (
@@ -241,7 +241,7 @@ def fused_experts_npu_with_communication(
         shared_expert_rank_num=0,
         moe_expert_num=global_num_experts,
         quant_mode=0 if not use_int8_w8a8 else 2,
-        global_bs=max_bs * ep_size,
+        global_bs=global_bs,
     )
 
     group_list = expert_token_nums.to(torch.int64)
@@ -304,7 +304,7 @@ def fused_experts_npu_with_communication(
         ep_world_size=ep_size,
         ep_rank_id=rank,
         moe_expert_num=global_num_experts,
-        global_bs=max_bs * ep_size,
+        global_bs=global_bs,
         comm_quant_mode=2 if use_int8_w8a8 else 0,
     )
     return hidden_states_route

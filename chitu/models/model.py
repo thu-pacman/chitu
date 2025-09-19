@@ -28,14 +28,11 @@ from chitu.distributed.parallel_state import (
     get_tp_size,
     get_ep_group,
     get_ep_size,
-    get_dp_group,
-    get_dp_size,
 )
 from chitu.moe import get_moe_impl
 from chitu.utils import (
     compute_layer_dist_in_pipe,
     is_layer,
-    pad_tensor,
     try_import_platform_dep,
     try_import_opt_dep,
 )
@@ -723,16 +720,6 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def decode(self, tokens, batch_size):
-        raw_batch_size = batch_size
-        if self.use_cuda_graph and get_dp_size() > 1:
-            bs_tensor = torch.tensor([raw_batch_size], device="cpu")
-            dp_group_cpu = get_dp_group().cpu_group
-            torch.distributed.all_reduce(
-                bs_tensor, op=torch.distributed.ReduceOp.MAX, group=dp_group_cpu
-            )
-            batch_size = bs_tensor.item()
-            if batch_size > raw_batch_size:
-                tokens = pad_tensor(tokens, batch_size)
         if isinstance(self.cache, DenseKVCacheManager):
             key = (batch_size, self.cache.get_start_and_end_idx()[0])
         elif isinstance(self.cache, PagedKVCacheManager):
@@ -790,7 +777,7 @@ class Transformer(nn.Module):
 
             self.do_decode_callable = do_decode
 
-        return self.do_decode_callable(key, tokens)[:raw_batch_size]
+        return self.do_decode_callable(key, tokens)
 
 
 class MoeGate(nn.Module):
