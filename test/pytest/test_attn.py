@@ -74,6 +74,7 @@ def test_mla_prefill_ragged_qkvo(
                     "qk_rope_head_dim": qk_rope_head_dim,
                     "qk_nope_head_dim": qk_nope_head_dim,
                     "dim": 7168,
+                    "type": None,
                 },
             }
         ),
@@ -174,6 +175,7 @@ def test_mla_prefill_ragged_qo_paged_kv(
                     "qk_rope_head_dim": qk_rope_head_dim,
                     "qk_nope_head_dim": qk_nope_head_dim,
                     "dim": 7168,
+                    "type": None,
                 },
             }
         ),
@@ -301,6 +303,7 @@ def test_mla_decode_paged_kv(
                     "qk_rope_head_dim": qk_rope_head_dim,
                     "qk_nope_head_dim": qk_nope_head_dim,
                     "dim": 7168,
+                    "type": None,
                 },
             }
         ),
@@ -411,6 +414,7 @@ def test_prefill_ragged_qkvo(
                     "n_heads": n_heads,
                     "n_kv_heads": n_kv_heads,
                     "head_dim": qk_head_dim if qk_head_dim == v_head_dim else None,
+                    "type": None,
                 },
             }
         ),
@@ -515,6 +519,7 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
                     "n_heads": n_heads,
                     "n_kv_heads": n_kv_heads,
                     "head_dim": head_dim,
+                    "type": None,
                 },
             }
         ),
@@ -621,6 +626,7 @@ def test_decode_paged_kv(
                     "n_heads": n_heads,
                     "n_kv_heads": n_kv_heads,
                     "head_dim": head_dim,
+                    "type": None,
                 },
             }
         ),

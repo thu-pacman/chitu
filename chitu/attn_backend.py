@@ -21,7 +21,7 @@ import packaging.version
 import torch
 import einops
 
-from chitu.device_type import is_muxi
+from chitu.device_type import is_muxi, get_device_name
 from chitu.global_vars import get_global_args
 from chitu.ops import (
     append_to_dense_kv_cache,
@@ -2111,14 +2111,28 @@ class NpuAttnBackend(RefAttnBackend):
             )
         else:
             self.local_n_kv_heads = self.local_n_heads
+        if (
+            self.args.models.type == "deepseek-v3"
+            and self.args.infer.mla_absorb == "absorb-without-precomp"
+        ):
+            self.local_n_kv_heads = 1
+        platform = get_device_name()
+        if platform == "Ascend910_9392":
+            self.max_aiv_num = 50
+        elif platform == "Ascend910B2":
+            self.max_aiv_num = 48
+        elif platform == "Ascend910B3":
+            self.max_aiv_num = 40
+        else:
+            raise RuntimeError("Unsupported platform: ", platform)
+        self.max_seq_len = StaticTensor(max_nelem=1, dtype=torch.int32, device="npu")
+        self.first_seq_id_per_core = StaticTensor(
+            max_nelem=self.max_aiv_num + 1, dtype=torch.int32, device="npu"
+        )
 
     @classmethod
     def should_use_attn_from_cinfer_ascendc(cls, model_type, batch_size):
-        return (
-            hasattr(cinfer_ascendc, "grouped_query_attention")
-            and model_type == "deepseek-v3"
-            or batch_size <= 32
-        )
+        return hasattr(cinfer_ascendc, "incre_flash_attention")
 
     def prepare_metadata_for_prefill(self, seq_len_delta: BatchedSeqLenDelta):
         """construct attention mask for prefilling, different sequences will not attend each other
@@ -2156,6 +2170,49 @@ class NpuAttnBackend(RefAttnBackend):
                 ).bool()
             q_start += q_len
             k_start += k_len
+
+    def prepare_metadata_for_decode(
+        self,
+        seq_len_delta: BatchedSeqLenDelta,
+        block_table,
+        block_size,
+        softmax_scale=None,
+    ):
+        seqlen = seq_len_delta.new.lens_tensor_device
+        if self.should_use_attn_from_cinfer_ascendc(
+            self.args.models.type, seqlen.shape[0]
+        ):
+            batch = seqlen.shape[0]
+            kvNumHeads = self.local_n_kv_heads
+            seqlen_ = (
+                seqlen.reshape(batch, 1).broadcast_to(batch, kvNumHeads).reshape(-1)
+            )
+            seqlen_cumsum = torch.cumsum(seqlen_, 0)
+            tot_seqlen = seq_len_delta.new.total_len
+            used_core_num = (
+                self.max_aiv_num
+                if self.max_aiv_num < batch * kvNumHeads
+                else batch * kvNumHeads
+            )
+            seqlen_cumsum_start_per_core = torch.linspace(
+                0, tot_seqlen, used_core_num + 1, device=seqlen_.device
+            )
+            self.first_seq_id_per_core.set(
+                torch.argmax(
+                    (
+                        seqlen_cumsum_start_per_core.view(-1, 1)
+                        < seqlen_cumsum.view(1, -1)
+                    ).to(dtype=torch.int32),
+                    dim=1,
+                ).to(dtype=torch.int32)
+            )
+
+            seqlen_max = seq_len_delta.new.max_len
+            self.max_seq_len.set(
+                torch.linspace(
+                    seqlen_max, seqlen_max, 1, dtype=torch.int32, device=seqlen_.device
+                )
+            )
 
     @override
     def prefill_ragged_qkvo(
@@ -2352,15 +2409,19 @@ class NpuAttnBackend(RefAttnBackend):
                 dtype=q.dtype,
                 device=q.device,
             )
-            cinfer_ascendc.grouped_query_attention(
+
+            cinfer_ascendc.incre_flash_attention(
                 q.contiguous(),
                 kv_cache.k.contiguous(),
                 kv_cache.v.contiguous(),
                 seq_len_delta.new.lens_tensor_device,
+                self.max_seq_len.get(),
+                self.first_seq_id_per_core.get(),
                 output,
-                q.shape[0],
-                "BSND",
+                self.local_n_heads,
                 softmax_scale,
+                "BSND",
+                self.local_n_kv_heads,
             )
 
             return output
