@@ -861,40 +861,41 @@ class PackedTasks(PackedTasksBase):
             getattr(task.req, "logprobs", False) for task in self.output_tasks
         )
 
-        if PackedTasksBase.response_list_manager is None:
-            if args.infer.op_impl == "cpu":
-                PackedTasksBase.response_list_manager = StaticDeviceListManager(
-                    max_num_rows=args.infer.max_reqs,
-                    max_num_cols=args.infer.max_seq_len,
-                    dtype=torch.long,
-                    device="cpu",
-                )
-            else:
-                PackedTasksBase.response_list_manager = StaticDeviceListManager(
-                    max_num_rows=args.infer.max_reqs,
-                    max_num_cols=args.infer.max_seq_len,
-                    dtype=torch.long,
-                    device="cuda",
-                )
+        if self.should_apply_frequency_penalty:
+            if PackedTasksBase.response_list_manager is None:
+                if args.infer.op_impl == "cpu":
+                    PackedTasksBase.response_list_manager = StaticDeviceListManager(
+                        max_num_rows=args.infer.max_reqs,
+                        max_num_cols=args.infer.max_seq_len,
+                        dtype=torch.long,
+                        device="cpu",
+                    )
+                else:
+                    PackedTasksBase.response_list_manager = StaticDeviceListManager(
+                        max_num_rows=args.infer.max_reqs,
+                        max_num_cols=args.infer.max_seq_len,
+                        dtype=torch.long,
+                        device="cuda",
+                    )
 
-        for task in self.output_tasks:
-            PackedTasksBase.response_list_manager.push_list(task.response)
+            for task in self.output_tasks:
+                PackedTasksBase.response_list_manager.push_list(task.response)
 
-        self.response_len = torch.tensor(
-            [len(task.response) for task in self.output_tasks],
-            dtype=torch.int,
-            device=self.rank,
-        )
-        self.response_capacity = torch.tensor(
-            [len(task.response._data) for task in self.output_tasks],
-            dtype=torch.int,
-            device=self.rank,
-        )
-        self.response_ptr = torch.tensor(
-            [task.response._data.data_ptr() for task in self.output_tasks],
-            dtype=torch.long,
-            device=self.rank,
-        )
+            self.response_len = torch.tensor(
+                [len(task.response) for task in self.output_tasks],
+                dtype=torch.int,
+                device=self.rank,
+            )
+            self.response_capacity = torch.tensor(
+                [len(task.response._data) for task in self.output_tasks],
+                dtype=torch.int,
+                device=self.rank,
+            )
+            self.response_ptr = torch.tensor(
+                [task.response._data.data_ptr() for task in self.output_tasks],
+                dtype=torch.long,
+                device=self.rank,
+            )
 
         # test only
         # self._test_flag = self.tasks[0].req._test_flag

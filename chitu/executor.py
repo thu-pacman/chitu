@@ -392,7 +392,8 @@ class ExpertDataDispatcher(TasksDispatcher):
             return
 
         # update local response
-        response_append(tasks, tokens, impl="auto")
+        if tasks.should_apply_frequency_penalty:
+            response_append(tasks, tokens, impl="auto")
 
         if self.is_main_rank:
             tasks = DPTaskCollector.get_total_packedtasks()
@@ -884,7 +885,8 @@ class Executor:
             tasks.token_idxs = token_idxs
 
         # --- dependent on tokens ---
-        response_append(tasks, tokens, impl="auto")
+        if tasks.should_apply_frequency_penalty:
+            response_append(tasks, tokens, impl="auto")
 
         if tokens.numel() == 1:
             token_list = [int(tokens.item())]
