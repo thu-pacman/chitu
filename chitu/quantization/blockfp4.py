@@ -599,7 +599,6 @@ class Blockfp4MoeExpertsPackKStride64(
                 topk_ids=final_indices,
                 inplace=inplace,
                 use_fp4_w4a8=True,
-                expert_map=self.expert_map,
                 w1_scale=self.gate_up_proj_weight_scale,
                 w2_scale=self.down_proj_weight_scale,
                 w1_scale_2=self.gate_up_proj_weight_scale_2,

@@ -219,7 +219,6 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
                 topk_weights=final_weights,
                 topk_ids=final_indices,
                 inplace=inplace,
-                expert_map=self.expert_map,
                 tokens_per_expert=tokens_per_expert,
                 experts_start_idx=self.experts_start_idx,
                 impl=impl,

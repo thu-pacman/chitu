@@ -26,7 +26,6 @@ def deepgemm_contiguous_fused_expert(
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     global_num_experts: int = -1,
-    expert_map: Optional[torch.Tensor] = None,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_scale_2: Optional[torch.Tensor] = None,
