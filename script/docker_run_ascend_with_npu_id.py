@@ -21,6 +21,7 @@ if not "ASCEND_RT_VISIBLE_DEVICES" in os.environ:
 
 
 npu_ids = os.environ["ASCEND_RT_VISIBLE_DEVICES"].split(",")
+pwd = os.path.abspath("./")
 
 cmd = "docker"
 args = [
@@ -42,6 +43,10 @@ args = [
     "/usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info",
     "-v",
     "/etc/ascend_install.info:/etc/ascend_install.info",
+    "-v",
+    f"{pwd}:/tmp/chitu",
+    "-w",
+    "/workspace/chitu",
 ]
 for npu_id in npu_ids:
     args += ["--device", f"/dev/davinci{npu_id}"]

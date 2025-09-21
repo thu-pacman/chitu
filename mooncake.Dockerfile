@@ -86,9 +86,25 @@ COPY ./csrc/cpuinfer ./csrc/cpuinfer
 # compile at install time, and the compile results are environment dependent.
 RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec")
 
-WORKDIR /workspace
-RUN rm -rf /workspace/chitu
+RUN rm -rf /workspace/chitu/*
 
+#####################################
+# Wheel build Stage
+#
+# This stage build wheel file of chitu.
+FROM dependency_installer AS wheel_builder
+
+WORKDIR /workspace/chitu
+COPY . .
+
+# build wheel of chitu
+RUN python setup.py bdist_wheel
+
+# verify the wheel was created
+RUN cp dist/*.whl /tmp/
+RUN ls -al /tmp/
+
+RUN rm -rf /workspace/chitu/*
 
 #####################################
 # Build Stage
@@ -96,12 +112,15 @@ RUN rm -rf /workspace/chitu
 # This stage builds chitu.
 FROM dependency_installer AS build
 
-WORKDIR /workspace/chitu
-COPY . .
+COPY --from=wheel_builder /tmp/ /tmp/
 
 # Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
 # compile at install time, and the compile results are environment dependent.
-RUN bash script/install.sh "${optional_deps}" "${build_jobs}" "${enable_editable_install}" "${enable_cython}"
+RUN bash -c "pip install -i https://pypi.tuna.tsinghua.edu.cn/simple /tmp/*.whl -c <(pip list --format freeze | grep -v 'pillow' | grep -v 'fsspec' | grep -v 'flash-mla' | grep -v 'flash_mla')"
+
+RUN rm -rf /tmp/
+COPY ./test ./test
+COPY ./script ./script 
 
 # These are optimization flags for NCCL, but according to our tests, they only make things
 # worse, so we don't use them.

@@ -30,6 +30,12 @@ image_name=$7
 image_version=$8
 docker_run_prefix="${@:9}"
 
+if [ "${dockerfile}" = "ascend.Dockerfile" ]; then
+    install_script="./script/ascend_install.sh"
+elif [ "${dockerfile}" = "muxi.Dockerfile" ]; then
+    install_script="./script/muxi_install.sh"
+fi
+
 container_base_name=$(basename ${image_name})
 
 docker image rm ${image_name}:${image_version} || true
@@ -43,10 +49,20 @@ docker build \
     --build-arg enable_test="${enable_test}" \
     -t ${image_name}:${image_version}-stage0 \
     .
-${docker_run_prefix} \
-    --name ${container_base_name}-${image_version}-stage1 \
-    ${image_name}:${image_version}-stage0 \
-    bash ./script/install.sh "${optional_deps}" "${build_jobs}" "${enable_editable_install}" "${enable_cython}"
+
+if [ "${enable_editable_install}" == "true" ]; then
+    ${docker_run_prefix} \
+        --name ${container_base_name}-${image_version}-stage1 \
+        ${image_name}:${image_version}-stage0 \
+        bash -c "cp -r /tmp/chitu/* /workspace/chitu && \"${install_script}\" \"${optional_deps}\" \"${build_jobs}\" \"${enable_editable_install}\" \"${enable_cython}\""
+else
+    ${docker_run_prefix} \
+        --name ${container_base_name}-${image_version}-stage1 \
+        ${image_name}:${image_version}-stage0 \
+        bash -c "cd /tmp/chitu && \"${install_script}\" \"${optional_deps}\" \"${build_jobs}\" \"${enable_editable_install}\" \"${enable_cython}\""
+fi
+
+
 docker commit ${container_base_name}-${image_version}-stage1 ${image_name}:${image_version}
 docker rm ${container_base_name}-${image_version}-stage1
 docker image rm ${image_name}:${image_version}-stage0
