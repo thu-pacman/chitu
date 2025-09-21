@@ -48,23 +48,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install pyyaml setuptools -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 WORKDIR /workspace/chitu
-COPY . .
+COPY ./test ./test
+COPY ./script ./script 
 
-# Currently, we require a development version of torch-npu to support aclgraph:
-# The .whl files are in our repo, so these lines should be after COPY.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$(lscpu | grep x86)" ]; then \
-        pip install ./third_party/ascend/torch_npu-2.6.0.post1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl -i https://pypi.tuna.tsinghua.edu.cn/simple; \
-    else \
-        pip install ./third_party/ascend/torch_npu-2.6.0.post1-cp311-cp311-manylinux_2_28_aarch64.whl -i https://pypi.tuna.tsinghua.edu.cn/simple; \
-    fi
-# To directly use the stable version of torch-npu, uncomment the following code:
-# RUN --mount=type=cache,target=/root/.cache/pip \
-#     pip install torch-npu==2.6.0 -i https://pypi.tuna.tsinghua.edu.cn/simple
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt
-
+# Currently, we require a development version of torch-npu to support aclgraph
 ENV CHITU_ASCEND_BUILD=1
 
 # The actual installing procedure requries a NPU device, which is not available in the `docker build` stage.

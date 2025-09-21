@@ -58,10 +58,8 @@ RUN if [ "${enable_test}" = "true" ]; then \
 fi
 
 WORKDIR /workspace/chitu
-COPY . .
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt -c <(pip list --format freeze)
+COPY ./test ./test
+COPY ./script ./script 
 
 ENV CHITU_MUXI_BUILD=1
 

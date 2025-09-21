@@ -17,7 +17,7 @@ RUN if [ "${enable_cython}" != "true" ] && [ "${enable_cython}" != "false" ]; th
     echo "ARG enable_cython must either be 'true' or 'false'"; \
     exit 1; \
 fi
-RUN if [ "{enable_cython}" = "true" ] && [ "${enable_editable_install}" = "true" ]; then \
+RUN if [ "${enable_cython}" = "true" ] && [ "${enable_editable_install}" = "true" ]; then \
     echo "Cython is not supported when installing in editable mode"; \
     exit 1; \
 fi
@@ -33,7 +33,7 @@ ENV TZ=Etc/UTC
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 ENV ENABLE_NVFP4=1
 
-RUN apt update -y && apt install -y git gcc-10 g++-10 libnuma-dev
+RUN apt update -y && apt install -y git gcc-11 g++-11 libnuma-dev build-essential cmake ninja-build
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -85,9 +85,24 @@ COPY ./csrc/cpuinfer ./csrc/cpuinfer
 RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt
 RUN pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-WORKDIR /workspace
-RUN rm -rf /workspace/chitu
+RUN rm -rf /workspace/chitu/*
 
+#####################################
+# Wheel build Stage
+#
+# This stage build wheel file of chitu.
+FROM dependency_installer AS wheel_builder
+
+WORKDIR /workspace/chitu
+COPY . .
+
+RUN cd /workspace/chitu && python setup.py bdist_wheel
+
+# verify the wheel was created
+RUN cp dist/*.whl /tmp/
+RUN ls -al /tmp/
+
+RUN rm -rf /workspace/chitu/*
 
 #####################################
 # Build Stage
@@ -95,16 +110,18 @@ RUN rm -rf /workspace/chitu
 # This stage builds chitu.
 FROM dependency_installer AS build
 
-WORKDIR /workspace/chitu
-COPY . .
+COPY --from=wheel_builder /tmp/ /tmp/
 
 # Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
 # compile at install time, and the compile results are environment dependent.
-RUN bash script/install.sh "${optional_deps}" "${build_jobs}" "${enable_editable_install}" "${enable_cython}"
+RUN bash -c "pip install -i https://pypi.tuna.tsinghua.edu.cn/simple /tmp/*.whl -c <(pip list --format freeze | grep -v 'pillow' | grep -v 'fsspec' | grep -v 'flash-mla' | grep -v 'flash_mla')"
 
 COPY ./flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl /tmp/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
 RUN pip install /tmp/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
 RUN pip install triton==3.4.0 -i https://pypi.tuna.tsinghua.edu.cn/simple
+RUN rm -rf /tmp/*
+COPY ./test ./test
+COPY ./script ./script 
 
 # These are optimization flags for NCCL, but according to our tests, they only make things
 # worse, so we don't use them.
