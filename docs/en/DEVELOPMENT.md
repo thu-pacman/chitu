@@ -150,12 +150,6 @@ Note:
 
 #### Options
 
-Append `-e` to `pip install` for editable install. Example:
-
-```bash
-TORCH_CUDA_ARCH_LIST=9.0 pip install --no-build-isolation -e .
-```
-
 Append `[optional-dependency-name]` after `.` for optional dependencies. Example:
 
 ```bash
@@ -169,6 +163,12 @@ Currently supported optional dependencies are:
 - `deep_gemm`: Support using DeepGEMM for fp8 inference.
 - `cpu`: Support hybrid CPU+GPU inference.
 - `muxi_layout_kernels`: Additional kernels for running on MetaX GPUs with `infer.op_impl=muxi_custom_kernel`, optimized for small batches.
+
+Append `-e` to `pip install` for editable install. Example:
+
+```bash
+TORCH_CUDA_ARCH_LIST=9.0 pip install --no-build-isolation -e .
+```
 
 Set `CHITU_WITH_CYTHON=1` to compile Python sources with Cython. Example:
 
@@ -478,7 +478,7 @@ torchrun --nnodes 1 \
 
 The framework provides a comprehensive benchmarking tool to measure inference performance, including latency, throughput, and TPS (Tokens Per Second).
 
-First start the service like above, then you can use the following command to benchmark the service:
+First start the service like above, then you can use the following command to benchmark the service. **Please note that `http://` can NOT be omitted.**
 
 ```bash
 python benchmarks/benchmark_serving.py \
@@ -490,3 +490,9 @@ python benchmarks/benchmark_serving.py \
     --warmup 3 \
     --base-url http://localhost:21002
 ```
+
+The benchmark follows the following assumption, and you should keep them consistent when comparing between frameworks or platforms:
+
+- The output length of each request is fixed to the value you set, even if the answer has ended, which means EOS (end of sequence) is ignored.
+- Default sampling parameters are used. See `class UserRequest` in `chitu/task.py` for default values.
+- There is no caching between requests.

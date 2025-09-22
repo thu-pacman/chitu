@@ -2188,7 +2188,7 @@ class NpuAttnBackend(RefAttnBackend):
                 seqlen.reshape(batch, 1).broadcast_to(batch, kvNumHeads).reshape(-1)
             )
             seqlen_cumsum = torch.cumsum(seqlen_, 0)
-            tot_seqlen = seq_len_delta.new.total_len
+            tot_seqlen = seq_len_delta.new.total_len * kvNumHeads
             used_core_num = (
                 self.max_aiv_num
                 if self.max_aiv_num < batch * kvNumHeads
