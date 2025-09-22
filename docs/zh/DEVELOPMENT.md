@@ -78,25 +78,70 @@ docker run -dit \
 
 ### 从源码安装
 
-注意下面示例命令中的部分参数需要根据实际环境进行调整（见注释）。
+#### 1. 获取源码
 
 ```bash
 # 下载源码，注意使用 --recursive 选项获取第三方依赖
 git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
-# 如果下载很慢，试试在命令最后加上 “-i https://pypi.tuna.tsinghua.edu.cn/simple”
-pip install -r requirements-build.txt
-# 注意: 非英伟达平台请安装对应 torch，英伟达平台请对应修改自己的 cuda 版本
-pip install -U torch --index-url https://download.pytorch.org/whl/cu124 
-# TORCH_CUDA_ARCH_LIST 的值可通过 python -c "import torch; print(torch.cuda.get_device_capability())" 查看
-TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation .
-# 华为昇腾平台需要先准备 CANN 和 torch_npu 2.5 环境，安装时设置变量 CHITU_ASCEND_BUILD=1
-# 注意：如果要开启 aclgraph 支持，需要通过 third_party/ascend 里的 whl 安装 torch_npu，或者直接使用chitu官方 docker 镜像
-CHITU_ASCEND_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
-# 海光平台需要先准备好 torch 环境，安装时设置环境变量 CHITU_HYGON_BUILD=1
-CHITU_HYGON_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
-# 沐曦平台需要先准备好 torch 环境，安装时设置环境变量 CHITU_MUXI_BUILD=1
-CHITU_MUXI_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
 ```
+
+#### 2. 安装普通构建时依赖
+
+```bash
+pip install -r requirements-build.txt
+```
+
+#### 3. 安装 PyTorch
+
+在英伟达平台，可以安装最新 PyTorch：
+
+```bash
+# 选项 A：安装默认 PyTorch 版本
+pip install -U torch
+# 选项 B：安装以特定版本 CUDA 构建的 PyTorch 版本（将下列命令中的 cu124 修改成你需要的 CUDA 版本）
+pip install -U torch --index-url https://download.pytorch.org/whl/cu124
+```
+
+在其他平台，请从该平台的提供商处获得相应的 PyTorch 版本。
+
+#### 4. 安装赤兔
+
+**英伟达平台：**
+
+```bash
+# TORCH_CUDA_ARCH_LIST 的值可通过 `python -c "import torch; print(torch.cuda.get_device_capability())"`` 查看
+TORCH_CUDA_ARCH_LIST=9.0 pip install --no-build-isolation . -c <(pip list --format freeze | grep -v "flash-mla" | grep -v "flash_mla")
+```
+
+注：
+
+- 通过 `-c` 指定的 constraint 选项使 pip 强制赤兔与系统中已有的软件包兼容，而不是在不兼容时自动升级依赖软件包。这有助于避免安装过程破坏系统中已有的 PyTorch 版本。如果你确实需要升级某些软件包，可以将这些软件包从 `-c` 指定的列表中移除。
+
+**昇腾平台：**
+
+```bash
+CHITU_ASCEND_BUILD=1 pip install --no-build-isolation . -c <(pip list --format freeze)
+```
+
+注：
+
+- 依赖 CANN 和 `torch_npu>=2.5`。
+- 建议通过  `third_party/ascend` 目录中的 `whl` 文件安装我们测试过的 `torch_npu` 版本。
+- 通过 `-c` 指定的 constraint 选项使 pip 强制赤兔与系统中已有的软件包兼容，而不是在不兼容时自动升级依赖软件包。这有助于避免安装过程破坏系统中已有的 PyTorch 版本。如果你确实需要升级某些软件包，可以将这些软件包从 `-c` 指定的列表中移除。
+
+**海光平台：**
+
+```
+CHITU_HYGON_BUILD=1 pip install --no-build-isolation . -c <(pip list --format freeze)
+```
+
+**沐曦平台：**
+
+```
+CHITU_MUXI_BUILD=1 pip install --no-build-isolation . -c <(pip list --format freeze)
+```
+
+#### 选项
 
 当前支持的可选安装项有:
 - `flash_attn`: 用于支持 `infer.attn_type=flash_attn`。
@@ -110,13 +155,13 @@ CHITU_MUXI_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
 如果需要用于开发，建议加上 `-e` 选项启用 editable install，如
 
 ```bash
-TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation -e .
+TORCH_CUDA_ARCH_LIST=9.0 pip install --no-build-isolation -e .
 ```
 
 可以通过 `CHITU_WITH_CYTHON=1` 使用 Cython 对 Python 代码进行编译，如：
 
 ```bash
-TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 CHITU_WITH_CYTHON=1 pip install --no-build-isolation .
+TORCH_CUDA_ARCH_LIST=9.0 CHITU_WITH_CYTHON=1 pip install --no-build-isolation .
 ```
 
 注意：
