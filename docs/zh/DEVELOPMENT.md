@@ -160,7 +160,7 @@ TORCH_CUDA_ARCH_LIST=9.0 pip install --no-build-isolation ".[flash_mla]"
 当前支持的可选依赖项有:
 
 - `flash_attn`: 用于支持 `infer.attn_type=flash_attn`。
-    
+  
     > 直接安装 flash_attn 可能很慢，可以到 flash_attn 的 github 上下载相应的预编译包（一个 .whl 文件），然后通过 pip install 这个 .whl 文件。
 - `flashinfer`: 用于支持 `infer.attn_type=flash_infer`。
 - `flash_mla`: 用于支持 `infer.attn_type=flash_mla`。
@@ -478,6 +478,7 @@ torchrun --nnodes 1 \
 ## 性能测试
 
 本项目源码中附带了一个性能测试工具，用于测量推理的性能，包括 latency、throughput、tokens per second 等。
+
 要进行性能测试，请先按照上述方式启动推理服务，然后使用下面的命令进行测试。其中的参数可以自行调整。**base-url 需要包含 http:// 字段，否则可能报错。**
 
 ```bash
@@ -490,3 +491,9 @@ python benchmarks/benchmark_serving.py \
     --warmup 3 \
     --base-url http://localhost:21002
 ```
+
+此性能测试假设了如下场景。在不同推理引擎或不同平台间进行性能对比时，应保证这些假设一致：
+
+- 即使回答已经结束，每个请求的输出长度也会被固定为你所设置的值（即推理引擎会无视表示序列结束的 EOS token）。
+- 会使用默认的采样参数进行推理。默认的采样参数可在 `chitu/task.py` 中的 `class UserRequest` 中查看。
+- 不在请求间进行缓存。
