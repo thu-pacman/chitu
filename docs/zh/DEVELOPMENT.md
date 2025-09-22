@@ -135,16 +135,32 @@ CHITU_ASCEND_BUILD=1 pip install --no-build-isolation . -c <(pip list --format f
 CHITU_HYGON_BUILD=1 pip install --no-build-isolation . -c <(pip list --format freeze)
 ```
 
+注：
+
+- 通过 `-c` 指定的 constraint 选项使 pip 强制赤兔与系统中已有的软件包兼容，而不是在不兼容时自动升级依赖软件包。这有助于避免安装过程破坏系统中已有的 PyTorch 版本。如果你确实需要升级某些软件包，可以将这些软件包从 `-c` 指定的列表中移除。
+
 **沐曦平台：**
 
 ```
 CHITU_MUXI_BUILD=1 pip install --no-build-isolation . -c <(pip list --format freeze)
 ```
 
+注：
+
+- 通过 `-c` 指定的 constraint 选项使 pip 强制赤兔与系统中已有的软件包兼容，而不是在不兼容时自动升级依赖软件包。这有助于避免安装过程破坏系统中已有的 PyTorch 版本。如果你确实需要升级某些软件包，可以将这些软件包从 `-c` 指定的列表中移除。
+
 #### 选项
 
-当前支持的可选安装项有:
+一些可选依赖可通过追加  `[optional-dependency-name]` 字样安装，例如：
+
+```bash
+TORCH_CUDA_ARCH_LIST=9.0 pip install --no-build-isolation ".[flash_mla]"
+```
+
+当前支持的可选依赖项有:
+
 - `flash_attn`: 用于支持 `infer.attn_type=flash_attn`。
+    
     > 直接安装 flash_attn 可能很慢，可以到 flash_attn 的 github 上下载相应的预编译包（一个 .whl 文件），然后通过 pip install 这个 .whl 文件。
 - `flashinfer`: 用于支持 `infer.attn_type=flash_infer`。
 - `flash_mla`: 用于支持 `infer.attn_type=flash_mla`。

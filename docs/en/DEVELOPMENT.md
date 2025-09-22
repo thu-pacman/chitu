@@ -134,11 +134,19 @@ Note:
 CHITU_HYGON_BUILD=1 pip install --no-build-isolation . -c <(pip list --format freeze)
 ```
 
+Note:
+
+- The constraints after `-c` enforces chitu to be compatible with all your installed packages, instead of upgrading non-compatible packages. This helps keeping the PyTorch installed in your system untouched. You can exclude some packages from the constraint list if you want to upgrade them.
+
 **For Muxi platforms:**
 
 ```bash
 CHITU_MUXI_BUILD=1 pip install --no-build-isolation . -c <(pip list --format freeze)
 ```
+
+Note:
+
+- The constraints after `-c` enforces chitu to be compatible with all your installed packages, instead of upgrading non-compatible packages. This helps keeping the PyTorch installed in your system untouched. You can exclude some packages from the constraint list if you want to upgrade them.
 
 #### Options
 
