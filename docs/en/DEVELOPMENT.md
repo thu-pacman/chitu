@@ -76,31 +76,82 @@ docker run -dit \
   <your_command>
 ```
 ### Build from Source
+
+#### 1. Get the code
+
 ```bash
 # Don't forget --recursive to include third-party dependnecies.
 git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
-pip install -r requirements-build.txt
-# Note: For non-NVIDIA platforms, please install the corresponding version of Torch. For NVIDIA platforms, please make sure to match the installation with your CUDA version.
-pip install -U torch --index-url https://download.pytorch.org/whl/cu124  # Change according to your CUDA version
-TORCH_CUDA_ARCH_LIST=9.0 CHITU_SETUP_JOBS=4 MAX_JOBS=4 pip install --no-build-isolation . # Change `8.6` to your desired CUDA arch list.
-# For the Ascend platform, you need set up the CANN and torch_npu 2.5 environments, and set the environment variable CHITU_ASCEND_BUILD=1 during installation.
-# Note: To enable aclgraph support, you need to install torch_npu via the whl in third_party/ascend, or directly use the official chitu docker image.
-CHITU_ASCEND_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
-# For the Hygon platform, the corresponding torch environment needs to be prepared in advance, and set the environment variable CHITU_HYGON_BUILD=1 during installation.
-CHITU_HYGON_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
-# For the Muxi platform, the corresponding torch environment needs to be prepared in advance, and set the environment variable CHITU_MUXI_BUILD=1 during installation.
-CHITU_MUXI_BUILD=1 MAX_JOBS=4 pip install --no-build-isolation .
 ```
+
+#### 2. Install ordinary build-time dependencies
+
+```bash
+pip install -r requirements-build.txt
+```
+
+#### 3. Install PyTorch
+
+On NVIDIA platforms, you can install latest PyTorch:
+
+```bash
+# Option A: Install default PyTorch release
+pip install -U torch
+# Option B: Install PyTorch built with a specific CUDA version (change cu124 to the CUDA verson you want)
+pip install -U torch --index-url https://download.pytorch.org/whl/cu124
+```
+
+On other platforms, please get a PyTorch release from the vender.
+
+#### 4. Install chitu
+
+**For NVIDIA platforms:**
+
+```bash
+# The value for TORCH_CUDA_ARCH_LIST can be viewed from `python -c "import torch; print(torch.cuda.get_device_capability())"`
+TORCH_CUDA_ARCH_LIST=9.0 pip install --no-build-isolation . -c <(pip list --format freeze | grep -v "flash-mla" | grep -v "flash_mla")
+```
+
+Note:
+
+- The constraints after `-c` enforces chitu to be compatible with all your installed packages, instead of upgrading non-compatible packages. This helps keeping the PyTorch installed in your system untouched. You can exclude some packages from the constraint list if you want to upgrade them.
+
+**For Ascend platforms:**
+
+```bash
+CHITU_ASCEND_BUILD=1 pip install --no-build-isolation . -c <(pip list --format freeze)
+```
+
+Note:
+
+- Dependent on CANN and `torch_npu>=2.5`.
+- We suggest install our tested `torch_npu` version via the `whl` file in `third_party/ascend` directory.
+- The constraints after `-c` enforces chitu to be compatible with all your installed packages, instead of upgrading non-compatible packages. This helps keeping the PyTorch installed in your system untouched. You can exclude some packages from the constraint list if you want to upgrade them.
+
+**For Hygon platforms:**
+
+```bash
+CHITU_HYGON_BUILD=1 pip install --no-build-isolation . -c <(pip list --format freeze)
+```
+
+**For Muxi platforms:**
+
+```bash
+CHITU_MUXI_BUILD=1 pip install --no-build-isolation . -c <(pip list --format freeze)
+```
+
+#### Options
+
 Append `-e` to `pip install` for editable install. Example:
 
 ```bash
-TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation -e .
+TORCH_CUDA_ARCH_LIST=9.0 pip install --no-build-isolation -e .
 ```
 
 Append `[optional-dependency-name]` after `.` for optional dependencies. Example:
 
 ```bash
-TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 pip install --no-build-isolation ".[flash_mla]"
+TORCH_CUDA_ARCH_LIST=9.0 pip install --no-build-isolation ".[flash_mla]"
 ```
 
 Currently supported optional dependencies are:
@@ -109,18 +160,16 @@ Currently supported optional dependencies are:
 - `flash_mla`: Support `infer.attn_type=flash_mla`.
 - `deep_gemm`: Support using DeepGEMM for fp8 inference.
 - `cpu`: Support hybrid CPU+GPU inference.
-- `muxi_layout_kernels`: Addtional kernels for running on MetaX GPUs with `infer.op_impl=muxi_custom_kernel`, optimized for small batches.
+- `muxi_layout_kernels`: Additional kernels for running on MetaX GPUs with `infer.op_impl=muxi_custom_kernel`, optimized for small batches.
 
 Set `CHITU_WITH_CYTHON=1` to compile Python sources with Cython. Example:
 
 ```bash
-TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=4 CHITU_WITH_CYTHON=1 pip install --no-build-isolation .
+TORCH_CUDA_ARCH_LIST=9.0 CHITU_WITH_CYTHON=1 pip install --no-build-isolation .
 ```
 
 Note:
 - You won't get the "editable" feature if you set both `-e` and `CHITU_WITH_CYTHON=1`. If you have accidentally done this and want to switch back, you will need to do `rm chitu/*.so`.
-
-> Note for Qingcheng.AI employees: If you are encountering network issues, you may try appending `-i https://pypi.tuna.tsinghua.edu.cn/simple` to your `pip` commands.
 
 ### Build for Distribution
 
