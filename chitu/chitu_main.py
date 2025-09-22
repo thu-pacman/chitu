@@ -210,7 +210,7 @@ def _warmup_via_taskpool(args):
         Backend.scheduler.start_warmup()
 
     num_required_prefill_schedules = ceil_div(
-        warmup_seq_len * num_warmup_reqs, prefill_chunk_size
+        warmup_seq_len * num_warmup_reqs // args.infer.dp_size, prefill_chunk_size
     )  # The number of times the prefill tasks needs to be scheduled to be completed
 
     # prefill
