@@ -5,12 +5,14 @@
 from typing import List, Optional
 
 import torch
-from deep_gemm import m_grouped_gemm_fp8_fp8_bf16_nt_masked
 
 from chitu.ops.quant import blockfp8_act_quant
 from chitu.ops.triton_ops.quant.blockfp8 import (
     silu_and_mul_and_blockfp8_act_quant_with_expert_mask,
 )
+from chitu.utils import try_import_opt_dep
+
+deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 
 
 def deepgemm_masked_fused_expert(
@@ -48,7 +50,6 @@ def deepgemm_masked_fused_expert(
     assert activation == "silu"
     assert w1_zp is None
     assert w2_zp is None
-    assert not inplace
 
     is_fp8_input = isinstance(hidden_states, tuple)
     if not is_fp8_input:
@@ -71,7 +72,7 @@ def deepgemm_masked_fused_expert(
         dtype=torch.bfloat16,
     )
 
-    m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+    deep_gemm.m_grouped_fp8_gemm_nt_masked(
         (hidden_states_fp8, a1_scale),
         (w1, w1_scale),
         intermediate_cache1,
@@ -107,7 +108,7 @@ def deepgemm_masked_fused_expert(
         tokens_per_expert,
     )
 
-    m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+    deep_gemm.m_grouped_fp8_gemm_nt_masked(
         (qintermediate_cache2, a2q_scale),
         (w2, w2_scale),
         intermediate_cache3,

@@ -5,12 +5,13 @@
 import torch
 from typing import List, Optional
 
-from deep_gemm import m_grouped_gemm_fp8_fp8_bf16_nt_contiguous
-
 from chitu.ops import silu_and_mul
 from chitu.ops.quant import blockfp8_act_quant
 from chitu.ops.triton_ops.permutation import ep_gather, ep_scatter
 from chitu.ops.triton_ops.quant_gemm import tma_align_input_scale
+from chitu.utils import try_import_opt_dep
+
+deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 
 
 def deepgemm_contiguous_fused_expert(
@@ -102,7 +103,7 @@ def deepgemm_contiguous_fused_expert(
         output_index,
     )
     input_tensor[1] = tma_align_input_scale(input_tensor[1])
-    m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
         (input_tensor[0], input_tensor[1]),
         (w1, w1_scale),
         intermediate_cache1,
@@ -110,7 +111,6 @@ def deepgemm_contiguous_fused_expert(
     )
 
     intermediate_cache2 = silu_and_mul(intermediate_cache1.view(-1, N), impl="triton")
-    # silu_and_mul(intermediate_cache1.view(-1, N), y=intermediate_cache2)
 
     qintermediate_cache2, a2q_scale = blockfp8_act_quant(
         x=intermediate_cache2,
@@ -120,7 +120,7 @@ def deepgemm_contiguous_fused_expert(
         device=hidden_states.device,
         dtype=torch.bfloat16,
     )
-    m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
         (qintermediate_cache2, a2q_scale),
         (w2, w2_scale),
         intermediate_cache3,

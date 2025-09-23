@@ -22,6 +22,8 @@ from chitu.ops.triton_ops.activation import silu_and_mul_triton
 from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.utils import try_import_opt_dep
 
+deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
+
 
 @single_dispatch_lazy_tensor
 @auto_retry_triton_compilation
@@ -446,11 +448,12 @@ def blockfp8_gemm_triton_default(
         triton.cdiv(M, META["BLOCK_SIZE_M"]),
         triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    has_deep_gemm = False
-    if torch.get_default_dtype() == torch.bfloat16 and is_hopper() is True:
-        deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
-    if has_deep_gemm and b.dtype is not torch.uint8:
-        deep_gemm.gemm_fp8_fp8_bf16_nt((a, a_s), (b, b_s), c)
+    if (
+        has_deep_gemm
+        and torch.get_default_dtype() == torch.bfloat16
+        and is_hopper() is True
+    ):
+        deep_gemm.fp8_gemm_nt((a, a_s), (b.view(torch.float8_e4m3fn), b_s), c)
     else:
         blockfp8_gemm_kernel[grid](a, b, c, a_s, b_s, M, N, K, group_n=128, group_k=128)
     return c
