@@ -597,13 +597,15 @@ class Backend:
                 skip_preprocess=args.skip_preprocess,
             )
         for layer in model.layers:
-            experts = getattr(layer.mlp, "experts", None)
-            if (
-                experts is not None
-                and hasattr(experts, "warm_up")
-                and callable(experts.warm_up)
-            ):
-                experts.warm_up()
+            mlp_component = getattr(layer, "mlp", None)
+            if mlp_component is not None:
+                experts = getattr(mlp_component, "experts", None)
+                if (
+                    experts is not None
+                    and hasattr(experts, "warm_up")
+                    and callable(experts.warm_up)
+                ):
+                    experts.warm_up()
 
         logger.info(f"Checkpoint loaded in {time.time() - start_time:.2f} seconds")
 

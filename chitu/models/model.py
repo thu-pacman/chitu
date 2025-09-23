@@ -625,7 +625,7 @@ class Transformer(nn.Module):
         raise NotImplementedError
 
     def precompute_freqs_cis(self, max_position_embeddings, device):
-        dim = (self.params.dim // self.params.n_heads,)
+        dim = self.params.dim // self.params.n_heads
         freqs = 1.0 / (
             self.params.rope_theta
             ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim)
