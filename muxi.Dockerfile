@@ -59,7 +59,8 @@ fi
 
 WORKDIR /workspace/chitu
 COPY ./test ./test
-COPY ./script ./script 
+COPY ./script ./script
+COPY ./benchmarks ./benchmarks
 
 ENV CHITU_MUXI_BUILD=1
 

@@ -27,6 +27,7 @@ from chitu.global_vars import get_global_args
 from chitu.task import Task, TaskLoad, TaskPool, UserRequest
 from chitu.utils import gen_req_id
 from chitu.serve.event_loop import start_server_in_new_event_loop
+from chitu.serve.common import set_min_batch_size
 
 logger = getLogger(__name__)
 
@@ -135,6 +136,7 @@ async def create_chat_completion(
     freq_pen = params.pop("frequency_penalty")
     stop_with_eos = params.pop("stop_with_eos")
     chat_template_kwargs_unsafe = params.pop("chat_template_kwargs")
+    set_min_batch_size(params.pop("min_batch_size", 1))
 
     # Reconstruct chat_template_kwargs to prevent injection attacks
     chat_template_kwargs = {}

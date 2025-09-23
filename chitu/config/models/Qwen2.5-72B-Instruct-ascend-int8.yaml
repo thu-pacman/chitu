@@ -4,7 +4,7 @@
 
 defaults:
   - Qwen2-72B-Instruct
-  - quant_config: ascend-int8
+  - quant_config: ascend-int8-with-bias
   - _self_ # Config in this file overrides configs in defaults
 
 # Access info

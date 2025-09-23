@@ -2,11 +2,36 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
 import re
-from typing import List
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from chitu.global_vars import get_global_args
+
+
+def get_quant_kwargs_from_checkpoint_prefix(
+    checkpoint_prefix: str, rules: Optional[list] = None
+) -> Dict[str, Any]:
+    if not rules:
+        rules = get_global_args().models.quant_config.rules
+
+    for rule in rules:
+        pattern = rule.get("regex")
+        if not pattern:
+            continue
+        if not re.search(pattern, checkpoint_prefix):
+            continue
+
+        layers = rule.get("layers")
+        if layers:
+            m = re.search(r"layers\.(\d+)\.", checkpoint_prefix)
+            if not m:
+                continue
+            layer_id = int(m.group(1))
+            if layer_id not in layers:
+                continue
+
+        return dict(rule.get("kwargs") or {})
+
+    return {}
 
 
 def get_quant_from_checkpoint_prefix(checkpoint_prefix: str, rules={}) -> Optional[str]:

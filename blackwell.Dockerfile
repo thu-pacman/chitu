@@ -121,7 +121,8 @@ RUN pip install /tmp/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp311-cp311
 RUN pip install triton==3.4.0 -i https://pypi.tuna.tsinghua.edu.cn/simple
 RUN rm -rf /tmp/*
 COPY ./test ./test
-COPY ./script ./script 
+COPY ./script ./script
+COPY ./benchmarks ./benchmarks
 
 # These are optimization flags for NCCL, but according to our tests, they only make things
 # worse, so we don't use them.

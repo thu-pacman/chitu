@@ -49,7 +49,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 WORKDIR /workspace/chitu
 COPY ./test ./test
-COPY ./script ./script 
+COPY ./script ./script
+COPY ./benchmarks ./benchmarks
 
 # Currently, we require a development version of torch-npu to support aclgraph
 ENV CHITU_ASCEND_BUILD=1

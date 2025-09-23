@@ -11,6 +11,7 @@ from chitu.quantization.base import (
 from chitu.quantization.utils import (
     get_quant_from_checkpoint_prefix,
     get_backend_from_checkpoint_prefix,
+    get_quant_kwargs_from_checkpoint_prefix,
 )
 from chitu.quantization.normal import (
     NormalLinear,

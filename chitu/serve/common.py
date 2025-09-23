@@ -23,6 +23,11 @@ logger = getLogger(__name__)
 min_batch_size = 1
 
 
+def set_min_batch_size(value: int):
+    global min_batch_size
+    min_batch_size = value
+
+
 async def process_queue():
     """Process the task queue - common function used by both normal and DP modes"""
     # DP compatible: each DP group's local master rank needs to start heartbeat

@@ -21,16 +21,22 @@ from chitu.models.model import (
     TransformerBlock,
     get_linear_layout_native_y,
     get_linear_layout_contig_y,
+    get_rmsnorm,
 )
 from chitu.models.registry import ModelType, register_model
 from chitu.ops import apply_rotary_pos_emb, silu_and_mul
-from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
+from chitu.quantization import (
+    QuantizationRegistry,
+    get_quant_from_checkpoint_prefix,
+    get_quant_kwargs_from_checkpoint_prefix,
+)
 from chitu.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
 )
 from chitu.distributed.parallel_state import get_tp_size
+
 
 logger = getLogger(__name__)
 
@@ -347,8 +353,21 @@ class TransformerBlockHFLlama(TransformerBlock):
             op_impl=op_impl,
             checkpoint_prefix=f"{checkpoint_prefix}.mlp",
         )
-        self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
+
+        self.input_layernorm = get_rmsnorm(
+            args.dim,
+            use_bias=get_quant_kwargs_from_checkpoint_prefix(
+                checkpoint_prefix + ".input_layernorm", args.quant_config.rules
+            ).get("bias"),
+            eps=args.norm_eps,
+        )
+        self.post_attention_layernorm = get_rmsnorm(
+            args.dim,
+            use_bias=get_quant_kwargs_from_checkpoint_prefix(
+                checkpoint_prefix + ".post_attention_layernorm", args.quant_config.rules
+            ).get("bias"),
+            eps=args.norm_eps,
+        )
 
     def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
         h = self.self_attn(self.input_layernorm(x, impl=get_rms_norm_impl()), freqs_cis)
@@ -743,7 +762,13 @@ class TransformerHFLlama(Transformer):
             )
 
     def _init_post_layers(self):
-        self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps)
+        self.norm = get_rmsnorm(
+            self.params.dim,
+            use_bias=get_quant_kwargs_from_checkpoint_prefix(
+                "lm_head.norm", self.params.quant_config.rules
+            ).get("bias"),
+            eps=self.params.norm_eps,
+        )
         if not getattr(self.params, "tie_word_embeddings", False):
             self.lm_head = ColumnParallelLinear(
                 self.params.dim,

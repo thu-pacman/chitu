@@ -19,6 +19,7 @@ install_requires = [
     # 3. In order to prevent `pip` from upgrading your platform-specifc
     #    torch back to the official version, please use `-c` on `pip`.
     "torch",
+    "torchvision",
     "transformers[torch]",
     "safetensors",
     "fire",

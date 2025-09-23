@@ -447,7 +447,7 @@ def apply_rotary_pos_emb(
             impl = "torch"
 
     if impl == "triton" and has_triton:
-        if rotary_type == "interleaved" and not hasattr(triton.language, "interleaved"):
+        if rotary_type == "interleaved" and not hasattr(triton.language, "interleave"):
             raise RuntimeError(
                 "triton.language.interleave is not supported, please check triton version"
             )
