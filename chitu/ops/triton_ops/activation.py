@@ -33,6 +33,9 @@ def silu_and_mul_triton(x):
     if output.device == torch.device("meta"):
         return output
 
+    if output.numel() == 0:
+        return output
+
     assert x.is_contiguous()
     assert output.is_contiguous()
 

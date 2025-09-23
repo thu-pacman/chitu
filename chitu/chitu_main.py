@@ -467,7 +467,7 @@ def chitu_run_normal():
         tokens = Backend.executor.step(tasks)
 
         # postprocess
-        if len(Backend.last_batch_results) > 0:
+        if len(Backend.last_batch_results) > 0 and Backend.args.infer.dp_size <= 1:
             Backend.executor.postprocess_async_part(
                 Backend.last_batch_results.popleft()
             )

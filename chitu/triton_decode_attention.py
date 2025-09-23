@@ -2,14 +2,15 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import inspect
 import math
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 from chitu.device_type import is_muxi
-import os
-
 
 # SPDX-SnippetBegin
 # SPDX-License-Identifier: Apache-2.0
@@ -213,56 +214,48 @@ def _decode_att_m_fwd(
     )
 
 
-_fwd_grouped_kernel_stage1_configs = (
-    [
-        triton.Config(
+_muxi_triton_supports_scenario = None
+
+
+def _check_muxi_triton_scenario_support():
+    global _muxi_triton_supports_scenario
+    if _muxi_triton_supports_scenario is None:
+        config_signature = inspect.signature(triton.Config.__init__)
+        config_params = list(config_signature.parameters.keys())[1:]
+        _muxi_triton_supports_scenario = "scenario" in config_params
+    return _muxi_triton_supports_scenario
+
+
+def _create_triton_config(block_n, num_stages, num_warps):
+    if is_muxi() and _check_muxi_triton_scenario_support():
+        return triton.Config(
             {"BLOCK_N": block_n},
             num_stages=num_stages,
             num_warps=num_warps,
             scenario="flashattn-fwd",
         )
-        for block_n in [16, 32, 64, 128]
-        for num_stages in [1, 2, 3, 4]
-        for num_warps in [2, 4, 8, 16]
-    ]
-    if is_muxi()
-    else [
-        triton.Config(
+    else:
+        return triton.Config(
             {"BLOCK_N": block_n},
             num_stages=num_stages,
             num_warps=num_warps,
         )
-        for block_n in [16, 32, 64, 128]
+
+
+_fwd_grouped_kernel_stage1_configs = [
+    _create_triton_config(block_n, num_stages, num_warps)
+    for block_n in [16, 32, 64, 128]
+    for num_stages in [1, 2, 3, 4]
+    for num_warps in [2, 4, 8, 16]
+]
+
+if os.environ.get("CI_TESTS", "false") == "true":
+    _fwd_grouped_kernel_stage1_configs = [
+        _create_triton_config(block_n, num_stages, num_warps)
+        for block_n in [32]
         for num_stages in [1, 2, 3, 4]
         for num_warps in [2, 4, 8, 16]
     ]
-)
-
-if os.environ.get("CI_TESTS", "false") == "true":
-    _fwd_grouped_kernel_stage1_configs = (
-        [
-            triton.Config(
-                {"BLOCK_N": block_n},
-                num_stages=num_stages,
-                num_warps=num_warps,
-                scenario="flashattn-fwd",
-            )
-            for block_n in [32]
-            for num_stages in [1, 2, 3, 4]
-            for num_warps in [2, 4, 8, 16]
-        ]
-        if is_muxi()
-        else [
-            triton.Config(
-                {"BLOCK_N": block_n},
-                num_stages=num_stages,
-                num_warps=num_warps,
-            )
-            for block_n in [32]
-            for num_stages in [1, 2, 3, 4]
-            for num_warps in [2, 4, 8, 16]
-        ]
-    )
 
 
 @triton.autotune(configs=_fwd_grouped_kernel_stage1_configs, key=[])

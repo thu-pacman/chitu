@@ -366,6 +366,10 @@ class ExpertDataDispatcher(TasksDispatcher):
 
     def epilogue(self, tasks: PackedTasks, logits: torch.Tensor):
         # collect all tokens to DP rank0, and update response
+        if len(Backend.last_batch_results) > 0:
+            Backend.executor.postprocess_async_part(
+                Backend.last_batch_results.popleft()
+            )
         # sampling
         if logits.numel() == 0:  # empty task skip sampling and update response
             tokens = torch.empty(0, device=self.device, dtype=torch.int64)
