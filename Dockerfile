@@ -117,7 +117,8 @@ RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple /tmp/*.whl -c <(pip 
 
 RUN rm -rf /tmp/
 COPY ./test ./test
-COPY ./script ./script 
+COPY ./script ./script
+COPY ./benchmarks ./benchmarks
 
 # These are optimization flags for NCCL, but according to our tests, they only make things
 # worse, so we don't use them.

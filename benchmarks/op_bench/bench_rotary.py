@@ -6,7 +6,7 @@ import math
 import torch
 import triton
 
-from batched_freqs_cis import BatchedFreqsCis
+from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.ops import apply_rotary_pos_emb
 
 
