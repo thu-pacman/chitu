@@ -43,7 +43,7 @@ def test_apply_rotary_pos_emb(
         if not has_triton:
             pytest.skip("triton is missing")
         if rotary_type in ["interleaved", "interleaved-half"] and not hasattr(
-            triton.language, "interleaved"
+            triton.language, "interleave"
         ):
             pytest.skip("This op require Triton to support tl.interleave")
     if impl == "cuda":
@@ -141,7 +141,7 @@ def test_apply_rotary_pos_emb_in_place(
         if not has_triton:
             pytest.skip("triton is missing")
         if rotary_type in ["interleaved", "interleaved-half"] and not hasattr(
-            triton.language, "interleaved"
+            triton.language, "interleave"
         ):
             pytest.skip("This op require Triton to support tl.interleave")
     if impl == "cuda":
