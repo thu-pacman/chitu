@@ -28,6 +28,8 @@
   用法: 启动赤兔时追加 `models=DeepSeek-V3` 启动参数
 - DeepSeek-V3.1
   用法: 启动赤兔时追加 `models=DeepSeek-V3.1` 启动参数
+- DeepSeek-V3.1-Terminus
+  用法: 启动赤兔时追加 `models=DeepSeek-V3.1-Terminus` 启动参数
 - GLM-4-32B-0414
   用法: 启动赤兔时追加 `models=GLM-4-32B-0414` 启动参数
 - GLM-4-9B-0414
