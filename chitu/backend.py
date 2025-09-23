@@ -424,7 +424,7 @@ class Backend:
                     if is_muxi():
                         # Work around a muxi bug that convert from NHWC to NCHW for whatever
                         # 4-D tensor even its not a convolution weight.
-                        assert param.data.is_contiguous()
+                        param.data = param.data.contiguous()
                         param.data = param.data.cuda(
                             non_blocking=non_blocking
                         ).contiguous()

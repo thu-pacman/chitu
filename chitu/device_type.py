@@ -22,9 +22,11 @@ def is_nvidia():
 
 
 def is_muxi():
-    MUXI_DEVICE_PATTERNS = ["4000", "4001"]
+    MUXI_DEVICE_PATTERNS = ["4000", "4001", "MetaX"]
     device_name = get_device_name()
-    return any(pattern in device_name for pattern in MUXI_DEVICE_PATTERNS)
+    return any(
+        pattern.lower() in device_name.lower() for pattern in MUXI_DEVICE_PATTERNS
+    )
 
 
 def is_ascend():

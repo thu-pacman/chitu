@@ -589,7 +589,12 @@ class Blockfp8MoeExpertsMuxiLayout(
         )
 
     def forward(
-        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        tokens_per_expert: Optional[torch.Tensor] = None,
+        impl: str = "auto",
     ) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)

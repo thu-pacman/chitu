@@ -490,11 +490,17 @@ def test_prefill_ragged_qkvo(
 @pytest.mark.parametrize("head_dim", [256])
 @pytest.mark.parametrize("impl", ["triton", "flash_attn", "flashinfer", "npu"])
 def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl):
-    if impl == "triton" and not has_triton:
-        pytest.skip("triton is missing")
-    if not has_flashinfer or packaging.version.parse(
-        flashinfer.__version__
-    ) < packaging.version.parse("0.2.0"):
+    if impl == "triton" and (
+        not has_triton
+        or packaging.version.parse(triton.__version__)
+        < packaging.version.parse("3.2.0")
+    ):
+        pytest.skip("triton is missing or too old")
+    if impl == "flashinfer" and (
+        not has_flashinfer
+        or packaging.version.parse(flashinfer.__version__)
+        < packaging.version.parse("0.2.3")
+    ):
         pytest.skip("flashinfer is missing or too old")
     if impl == "flash_attn":
         if not has_flash_attn:
@@ -546,19 +552,41 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
         attn_backend = FlashInferBackend(tot_num_blocks=num_blocks)
     elif impl == "npu":
         attn_backend = NpuAttnBackend()
+        attn_backend.prepare_metadata_for_decode(
+            seq_len_delta, block_table=None, block_size=None
+        )
     else:
         raise NotImplementedError()
     ref_backend = RefAttnBackend()
 
     k_cache = torch.randn(
-        (batch_size, seq_len_delta.new.max_len, n_kv_heads, head_dim), device="cuda"
+        (batch_size, seq_len_delta.new.max_len, n_kv_heads, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
     )
     v_cache = torch.randn(
-        (batch_size, seq_len_delta.new.max_len, n_kv_heads, head_dim), device="cuda"
+        (batch_size, seq_len_delta.new.max_len, n_kv_heads, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
     )
-    q = torch.randn((batch_size, n_heads, head_dim), device="cuda") * 100
-    k = torch.randn((batch_size, n_kv_heads, head_dim), device="cuda") * 100
-    v = torch.randn((batch_size, n_kv_heads, head_dim), device="cuda") * 100
+    q = (
+        torch.randn(
+            (batch_size, n_heads, head_dim), device="cuda", dtype=torch.bfloat16
+        )
+        * 100
+    )
+    k = (
+        torch.randn(
+            (batch_size, n_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+        )
+        * 100
+    )
+    v = (
+        torch.randn(
+            (batch_size, n_kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+        )
+        * 100
+    )
 
     k_cache1 = k_cache.clone()
     v_cache1 = v_cache.clone()
@@ -572,6 +600,8 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
         softcap=0.0,
         softmax_scale=None,
     )
+    if impl == "npu":
+        out = out.squeeze(1)
 
     k_cache2 = k_cache.clone()
     v_cache2 = v_cache.clone()
@@ -600,9 +630,11 @@ def test_decode_paged_kv(
 ):
     if impl == "triton" and not has_triton:
         pytest.skip("triton is missing")
-    if not has_flashinfer or packaging.version.parse(
-        flashinfer.__version__
-    ) < packaging.version.parse("0.2.0"):
+    if impl == "flashinfer" and (
+        not has_flashinfer
+        or packaging.version.parse(flashinfer.__version__)
+        < packaging.version.parse("0.2.3")
+    ):
         pytest.skip("flashinfer is missing or too old")
     if impl == "flash_attn" and not has_flash_attn:
         pytest.skip("flash_attn is missing")
@@ -682,6 +714,8 @@ def test_decode_paged_kv(
         softcap=0.0,
         softmax_scale=softmax_scale,
     )
+    if impl == "npu":
+        out = out.view(out.shape[0], n_heads, head_dim)
 
     k_cache2 = k_cache.clone()
     v_cache2 = v_cache.clone()
