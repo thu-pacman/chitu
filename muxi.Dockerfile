@@ -1,4 +1,4 @@
-FROM mxc500-torch2.1-py310:mc2.29.0.7-ubuntu22.04-amd64 AS base
+FROM maca-pytorch:3.0.0.4-torch2.6-py310-ubuntu24.04-amd64 AS base
 
 SHELL ["/bin/bash", "-c"]
 

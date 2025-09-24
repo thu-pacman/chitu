@@ -28,6 +28,8 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=DeepSeek-V3` command line argument when starting Chitu
 - DeepSeek-V3.1
   Usage: Append `models=DeepSeek-V3.1` command line argument when starting Chitu
+- DeepSeek-V3.1-Terminus
+  Usage: Append `models=DeepSeek-V3.1-Terminus` command line argument when starting Chitu
 - GLM-4-32B-0414
   Usage: Append `models=GLM-4-32B-0414` command line argument when starting Chitu
 - GLM-4-9B-0414
