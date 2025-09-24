@@ -2,24 +2,31 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import torch
 from typing import List, Optional
 
+from chitu.moe.batched_routed_activation import (
+    BatchedRoutedActivation,
+    IndexedBatchedRoutedActivation,
+    IndexedBatchedRoutedActivationBlockfp8,
+    ExpertBlockPermutedBatchedRoutedActivationBlockfp8,
+)
 from chitu.ops import silu_and_mul
 from chitu.ops.quant import blockfp8_act_quant
-from chitu.ops.triton_ops.permutation import ep_gather, ep_scatter
+from chitu.ops.triton_ops.batched_routed_activation import ep_gather
 from chitu.ops.triton_ops.quant_gemm import tma_align_input_scale
 from chitu.utils import try_import_opt_dep
 
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 
 
+@functools.singledispatch
 def deepgemm_contiguous_fused_expert(
-    hidden_states: torch.Tensor,
+    hidden_states: BatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
     inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
@@ -39,6 +46,167 @@ def deepgemm_contiguous_fused_expert(
     soft_fp8: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
     experts_start_idx: int = 0,
+    out: Optional[torch.Tensor] = None,
+):
+    raise ValueError(f"Unsupported hidden_states type: {type(hidden_states)}")
+
+
+@deepgemm_contiguous_fused_expert.register
+def _(
+    hidden_states: IndexedBatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    inplace: bool = False,
+    activation: str = "silu",
+    use_fp8_w8a8: bool = False,
+    use_fp4_w4a8: bool = False,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    global_num_experts: int = -1,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_scale_2: Optional[torch.Tensor] = None,
+    w2_scale_2: Optional[torch.Tensor] = None,
+    w1_zp: Optional[torch.Tensor] = None,
+    w2_zp: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[List[int]] = None,
+    soft_fp8: bool = False,
+    tokens_per_expert: Optional[torch.Tensor] = None,
+    experts_start_idx: int = 0,
+    out: Optional[torch.Tensor] = None,
+):
+    if out is None and inplace:
+        out = hidden_states.activation
+
+    quant_hidden_states, hidden_states_scale = blockfp8_act_quant(
+        hidden_states.activation
+    )
+    return deepgemm_contiguous_fused_expert(
+        IndexedBatchedRoutedActivationBlockfp8(
+            activation=quant_hidden_states,
+            activation_scale=hidden_states_scale,
+            token_to_expert_indices=hidden_states.token_to_expert_indices,
+        ),
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        inplace=inplace,
+        activation=activation,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_fp4_w4a8=use_fp4_w4a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        global_num_experts=global_num_experts,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_scale_2=w1_scale_2,
+        w2_scale_2=w2_scale_2,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        block_shape=block_shape,
+        soft_fp8=soft_fp8,
+        tokens_per_expert=tokens_per_expert,
+        out=out,
+    )
+
+
+@deepgemm_contiguous_fused_expert.register
+def _(
+    hidden_states: IndexedBatchedRoutedActivationBlockfp8,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    inplace: bool = False,
+    activation: str = "silu",
+    use_fp8_w8a8: bool = False,
+    use_fp4_w4a8: bool = False,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    global_num_experts: int = -1,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_scale_2: Optional[torch.Tensor] = None,
+    w2_scale_2: Optional[torch.Tensor] = None,
+    w1_zp: Optional[torch.Tensor] = None,
+    w2_zp: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[List[int]] = None,
+    soft_fp8: bool = False,
+    tokens_per_expert: Optional[torch.Tensor] = None,
+    experts_start_idx: int = 0,
+    out: Optional[torch.Tensor] = None,
+):
+    n_tokens_padded = sum(tokens_per_expert)
+    tokens_per_expert_gpu = torch.tensor(
+        tokens_per_expert,
+        dtype=torch.int32,
+        pin_memory=True,
+        device="cpu",
+    ).cuda(non_blocking=True)
+    return deepgemm_contiguous_fused_expert(
+        ExpertBlockPermutedBatchedRoutedActivationBlockfp8.convert_from(
+            hidden_states,
+            block_size=128,
+            n_tokens_padded=n_tokens_padded,
+            n_tokens_per_expert_padded=tokens_per_expert_gpu,
+        ),
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        inplace=inplace,
+        activation=activation,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_fp4_w4a8=use_fp4_w4a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        global_num_experts=global_num_experts,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_scale_2=w1_scale_2,
+        w2_scale_2=w2_scale_2,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        block_shape=block_shape,
+        soft_fp8=soft_fp8,
+        tokens_per_expert=tokens_per_expert,
+        out=out,
+    )
+
+
+@deepgemm_contiguous_fused_expert.register
+def _(
+    hidden_states: ExpertBlockPermutedBatchedRoutedActivationBlockfp8,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    inplace: bool = False,
+    activation: str = "silu",
+    use_fp8_w8a8: bool = False,
+    use_fp4_w4a8: bool = False,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    global_num_experts: int = -1,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_scale_2: Optional[torch.Tensor] = None,
+    w2_scale_2: Optional[torch.Tensor] = None,
+    w1_zp: Optional[torch.Tensor] = None,
+    w2_zp: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[List[int]] = None,
+    soft_fp8: bool = False,
+    tokens_per_expert: Optional[torch.Tensor] = None,
+    experts_start_idx: int = 0,
+    out: Optional[torch.Tensor] = None,
 ):
     assert use_fp8_w8a8
     assert block_shape is not None
@@ -50,64 +218,38 @@ def deepgemm_contiguous_fused_expert(
     assert w2_zp is None
 
     E, N, K = w1.shape
-    all_tokens = sum(tokens_per_expert)
+    n_tokens_padded = (
+        hidden_states.blocked_activation.shape[0]
+        * hidden_states.blocked_activation.shape[1]
+    )
+
+    if out is None:
+        out = torch.empty(
+            topk_weights.shape[0],
+            K,
+            device=hidden_states.activation.device,
+            dtype=torch.bfloat16,
+        )
 
     intermediate_cache1 = torch.empty(
-        (all_tokens, N), device=hidden_states.device, dtype=hidden_states.dtype
+        (n_tokens_padded, N),
+        device=hidden_states.blocked_activation.device,
+        dtype=torch.bfloat16,
     )
-
-    if inplace:
-        gather_out = hidden_states
-    else:
-        gather_out = torch.empty_like(hidden_states)
-
-    is_fp8_input = isinstance(hidden_states, tuple)
-    if not is_fp8_input:
-        hidden_states, a1_scale = blockfp8_act_quant(
-            x=hidden_states,
-        )
-    else:
-        hidden_states, a1_scale = hidden_states
-
-    input_tensor = [
-        torch.empty(
-            (all_tokens, K),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        ),
-        torch.empty(
-            (all_tokens, K // 128),
-            device=a1_scale.device,
-            dtype=a1_scale.dtype,
-        ),
-    ]
-    m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
-    output_index = topk_ids.clone()
-
-    num_recv_tokens_per_expert_gpu = torch.tensor(
-        tokens_per_expert,
-        dtype=torch.int32,
-        pin_memory=True,
-        device="cpu",
-    ).cuda(non_blocking=True)
-    expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
-    ep_scatter(
-        hidden_states,
-        a1_scale,
-        topk_ids,
-        num_recv_tokens_per_expert_gpu,
-        expert_start_loc,
-        input_tensor[0],
-        input_tensor[1],
-        m_indices,
-        output_index,
-    )
-    input_tensor[1] = tma_align_input_scale(input_tensor[1])
     deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-        (input_tensor[0], input_tensor[1]),
+        (
+            hidden_states.blocked_activation.view(
+                n_tokens_padded, hidden_states.blocked_activation.shape[-1]
+            ),
+            tma_align_input_scale(
+                hidden_states.blocked_activation_scale.view(
+                    n_tokens_padded, hidden_states.blocked_activation_scale.shape[-1]
+                )
+            ),
+        ),
         (w1, w1_scale),
         intermediate_cache1,
-        m_indices,
+        hidden_states.block_to_expert_indices.flatten(),
     )
 
     intermediate_cache2 = silu_and_mul(intermediate_cache1.view(-1, N), impl="triton")
@@ -116,21 +258,20 @@ def deepgemm_contiguous_fused_expert(
         x=intermediate_cache2,
     )
     intermediate_cache3 = torch.empty(
-        (all_tokens, K),
-        device=hidden_states.device,
+        (n_tokens_padded, K),
+        device=hidden_states.blocked_activation.device,
         dtype=torch.bfloat16,
     )
     deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
         (qintermediate_cache2, a2q_scale),
         (w2, w2_scale),
         intermediate_cache3,
-        m_indices,
+        hidden_states.block_to_expert_indices.flatten(),
     )
     ep_gather(
         intermediate_cache3,
-        topk_ids,
         topk_weights,
-        output_index,
-        gather_out,
+        hidden_states.token_comma_topk_to_block_x_item_indices,
+        out,
     )
-    return gather_out
+    return out

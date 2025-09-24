@@ -9,15 +9,15 @@
 #include <torch/torch.h>
 
 #include "dequant/ops.h"
+#include "frequency_penalty/frequency_penalty.h"
+#include "gemm/w4a8_per_group_gemm_cuda.h"
+#include "hard_fp4/nvfp4_quant_entry.h"
+#include "hard_fp4/nvfp4_scaled_mm_entry.h"
 #include "moe/moe_kernel.h"
 #include "norm/rms_norm.h"
-#include "frequency_penalty/frequency_penalty.h"
 #include "response_append/response_append.h"
 #include "rotary/rotary_pos_emb_llama.h"
 #include "weight_layout/weight_layout_change.h"
-#include "hard_fp4/nvfp4_scaled_mm_entry.h"
-#include "hard_fp4/nvfp4_quant_entry.h"
-#include "gemm/w4a8_per_group_gemm_cuda.h"
 
 namespace py = pybind11;
 using namespace pybind11::literals;
@@ -25,7 +25,8 @@ using namespace pybind11::literals;
 namespace chitu {
 
 void init_compute(py::module &m) {
-    m.def("cuda_moe_align_block_size", &moe_align_block_size, "");
+    m.def("cuda_batched_routed_activation_indexed_to_expert_block_indexed",
+          &batched_routed_activation_indexed_to_expert_block_indexed, "");
     m.def("cuda_add_shared_experts", &add_shared_experts, "");
     m.def("cuda_route_gate", &route_gate, "");
     m.def("cuda_rotary_pos_emb_llama", &rotary_pos_emb_llama, "q"_a, "k"_a,
@@ -37,7 +38,8 @@ void init_compute(py::module &m) {
     m.def("cuda_topk_softmax", &topk_softmax, "");
     m.def("cuda_frequency_penalty", &applyFrequencyPenalty, "");
     m.def("cuda_response_append", &response_append, "");
-    m.def("w4a8_per_group_gemm_forward_cuda",&w4a8_per_group_gemm_forward_cuda, "");
+    m.def("w4a8_per_group_gemm_forward_cuda", &w4a8_per_group_gemm_forward_cuda,
+          "");
 #if defined ENABLE_NVFP4 && ENABLE_NVFP4
     m.def("cuda_nvfp4_scaled_mm", &cutlass_scaled_fp4_mm, "");
     m.def("cuda_scaled_fp4_quant", &scaled_fp4_quant, "");

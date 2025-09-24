@@ -6,6 +6,7 @@ from typing import List, Optional
 
 import torch
 
+from chitu.moe.batched_routed_activation import PerExpertDenseBatchedRoutedActivation
 from chitu.ops.quant import blockfp8_act_quant
 from chitu.ops.triton_ops.quant.blockfp8 import (
     silu_and_mul_and_blockfp8_act_quant_with_expert_mask,
@@ -16,7 +17,7 @@ deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 
 
 def deepgemm_masked_fused_expert(
-    hidden_states: torch.Tensor,
+    hidden_states: PerExpertDenseBatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -38,7 +39,6 @@ def deepgemm_masked_fused_expert(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     soft_fp8: bool = False,
-    tokens_per_expert: Optional[torch.Tensor] = None,
     experts_start_idx: int = 0,
 ):
     # dtype check
@@ -51,13 +51,9 @@ def deepgemm_masked_fused_expert(
     assert w1_zp is None
     assert w2_zp is None
 
-    is_fp8_input = isinstance(hidden_states, tuple)
-    if not is_fp8_input:
-        hidden_states_fp8, a1_scale = blockfp8_act_quant(
-            x=hidden_states,
-        )
-    else:
-        hidden_states_fp8, a1_scale = hidden_states
+    hidden_states_fp8, a1_scale = blockfp8_act_quant(
+        hidden_states.activation_per_expert
+    )
 
     M = hidden_states_fp8.shape[1]
     E, N, _ = w1.shape
@@ -76,7 +72,7 @@ def deepgemm_masked_fused_expert(
         (hidden_states_fp8, a1_scale),
         (w1, w1_scale),
         intermediate_cache1,
-        tokens_per_expert,
+        hidden_states.n_tokens_per_expert,
         M,
     )
 
@@ -105,14 +101,14 @@ def deepgemm_masked_fused_expert(
         qintermediate_cache2,
         a2q_scale,
         scale_block_size,
-        tokens_per_expert,
+        hidden_states.n_tokens_per_expert,
     )
 
     deep_gemm.m_grouped_fp8_gemm_nt_masked(
         (qintermediate_cache2, a2q_scale),
         (w2, w2_scale),
         intermediate_cache3,
-        tokens_per_expert,
+        hidden_states.n_tokens_per_expert,
         M,
     )
 

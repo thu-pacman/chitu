@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from chitu.ops import silu_and_mul
+from chitu.moe.batched_routed_activation import PerExpertDenseBatchedRoutedActivation
 
 
 # SPDX-SnippetBegin
@@ -496,57 +497,41 @@ def invoke_moe_batched_triton_kernel(
 
 
 def triton_batched_experts(
-    hidden_states: torch.Tensor,
+    hidden_states: PerExpertDenseBatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: Optional[torch.Tensor] = None,
-    topk_ids: Optional[torch.Tensor] = None,
-    inplace: bool = False,
-    activation: str = "silu",
-    use_fp8_w8a8: bool = False,
-    use_fp4_w4a8: bool = False,
-    use_int8_w8a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
-    global_num_experts: int = -1,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    w1_scale_2: Optional[torch.Tensor] = None,
-    w2_scale_2: Optional[torch.Tensor] = None,
-    w1_zp: Optional[torch.Tensor] = None,
-    w2_zp: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[List[int]] = None,
-    soft_fp8: bool = False,
-    experts_start_idx: int = 0,
-    tokens_per_expert: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Simplified version of batched fused experts only support bfloat16 inputs and parameters
     """
-    assert hidden_states.dim() == 3, "hidden_states is not a three-dimensional tensor"
-    assert hidden_states.dtype == torch.bfloat16, "only support input bfloat16"
+    assert (
+        hidden_states.activation_per_expert.dim() == 3
+    ), "hidden_states.activation_per_expert is not a three-dimensional tensor"
+    assert (
+        hidden_states.activation_per_expert.dtype == torch.bfloat16
+    ), "only support input bfloat16"
     assert (w1.dtype == torch.bfloat16) and (
         w2.dtype == torch.bfloat16
     ), "only support bfloat16 inputs and parameters"
 
-    E, M, _ = hidden_states.shape
+    E, M, _ = hidden_states.activation_per_expert.shape
     N = w1.shape[1]
     intermediate_cache1 = torch.zeros(
-        (E, M, N), dtype=hidden_states.dtype, device=hidden_states.device
+        (E, M, N),
+        dtype=hidden_states.activation_per_expert.dtype,
+        device=hidden_states.activation_per_expert.device,
     )
-    output = torch.zeros_like(hidden_states)
+    output = torch.zeros_like(hidden_states.activation_per_expert)
     config = {
         "BLOCK_SIZE_M": 64,
         "BLOCK_SIZE_N": 64,
         "BLOCK_SIZE_K": 32,
     }
     invoke_moe_batched_triton_kernel(
-        A=hidden_states,
+        A=hidden_states.activation_per_expert,
         B=w1,
         C=intermediate_cache1,
-        expert_num_tokens=tokens_per_expert,
+        expert_num_tokens=hidden_states.n_tokens_per_expert,
         compute_type=tl.bfloat16,
         A_scale=None,
         B_scale=None,
@@ -568,7 +553,7 @@ def triton_batched_experts(
         A=intermediate_cache2,
         B=w2,
         C=output,
-        expert_num_tokens=tokens_per_expert,
+        expert_num_tokens=hidden_states.n_tokens_per_expert,
         compute_type=tl.bfloat16,
         A_scale=None,
         B_scale=None,
@@ -584,52 +569,39 @@ def triton_batched_experts(
 
 
 def triton_batched_experts_ref(
-    hidden_states: torch.Tensor,
+    hidden_states: PerExpertDenseBatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: Optional[torch.Tensor] = None,
-    topk_ids: Optional[torch.Tensor] = None,
-    inplace: bool = False,
-    activation: str = "silu",
-    use_fp8_w8a8: bool = False,
-    use_fp4_w4a8: bool = False,
-    use_int8_w8a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
-    global_num_experts: int = -1,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    w1_scale_2: Optional[torch.Tensor] = None,
-    w2_scale_2: Optional[torch.Tensor] = None,
-    w1_zp: Optional[torch.Tensor] = None,
-    w2_zp: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[List[int]] = None,
-    soft_fp8: bool = False,
-    experts_start_idx: int = 0,
-    tokens_per_expert: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert hidden_states.dim() == 3, "hidden_states is not a three-dimensional tensor"
-    assert hidden_states.dtype == torch.bfloat16, "only support input bfloat16"
+    assert (
+        hidden_states.activation_per_expert.dim() == 3
+    ), "hidden_states.activation_per_expert is not a three-dimensional tensor"
+    assert (
+        hidden_states.activation_per_expert.dtype == torch.bfloat16
+    ), "only support input bfloat16"
     assert (w1.dtype == torch.bfloat16) and (
         w2.dtype == torch.bfloat16
     ), "only support bfloat16 params"
 
-    E, M, _ = hidden_states.shape
+    E, M, _ = hidden_states.activation_per_expert.shape
     N = w1.shape[1]
     intermediate_output1 = torch.zeros(
-        (E, M, N), dtype=hidden_states.dtype, device=hidden_states.device
+        (E, M, N),
+        dtype=hidden_states.activation_per_expert.dtype,
+        device=hidden_states.activation_per_expert.device,
     )
-    output = torch.zeros_like(hidden_states)
+    output = torch.zeros_like(hidden_states.activation_per_expert)
     for i in range(E):
-        intermediate_output1[i][: tokens_per_expert[i]] = torch.matmul(
-            hidden_states[i][: tokens_per_expert[i]], w1[i].T
+        intermediate_output1[i][: hidden_states.n_tokens_per_expert[i]] = torch.matmul(
+            hidden_states.activation_per_expert[i][
+                : hidden_states.n_tokens_per_expert[i]
+            ],
+            w1[i].T,
         )
     intermediate_output2 = silu_and_mul(intermediate_output1.view(-1, N), impl="torch")
     intermediate_output2 = intermediate_output2.view(E, M, N // 2)
     for i in range(E):
-        output[i][: tokens_per_expert[i]] = torch.matmul(
-            intermediate_output2[i][: tokens_per_expert[i]], w2[i].T
+        output[i][: hidden_states.n_tokens_per_expert[i]] = torch.matmul(
+            intermediate_output2[i][: hidden_states.n_tokens_per_expert[i]], w2[i].T
         )
     return output

@@ -57,10 +57,11 @@ count_and_sort_expert_tokens_kernel(const scalar_t *__restrict__ topk_ids,
 }
 
 template <typename scalar_t>
-__global__ void moe_align_block_size_kernel(
+__global__ void
+batched_routed_activation_indexed_to_expert_block_indexed_kernel(
     const scalar_t *__restrict__ topk_ids,
     int32_t *__restrict__ sorted_token_ids, int32_t *__restrict__ expert_ids,
-    int32_t *__restrict__ total_tokens_post_pad, int32_t num_experts,
+    int32_t *__restrict__ total_blocks_post_pad, int32_t num_experts,
     int32_t padded_num_experts, int32_t experts_per_warp, int32_t block_size,
     size_t numel, int32_t *__restrict__ cumsum) {
     extern __shared__ int32_t shared_counts[];
@@ -118,7 +119,7 @@ __global__ void moe_align_block_size_kernel(
     if (tid <= num_experts) {
         cumsum[tid] = shared_data[tid] * block_size;
         if (tid == num_experts) {
-            *total_tokens_post_pad = shared_data[tid] * block_size;
+            *total_blocks_post_pad = shared_data[tid];
         } else {
             for (int i = shared_data[tid]; i < shared_data[tid + 1]; i++) {
                 expert_ids[i] = tid;
@@ -127,12 +128,11 @@ __global__ void moe_align_block_size_kernel(
     }
 }
 
-void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
-                          int64_t block_size, torch::Tensor sorted_token_ids,
-                          torch::Tensor experts_ids,
-                          torch::Tensor num_tokens_post_pad,
-                          torch::Tensor token_cnts_buffer,
-                          torch::Tensor cumsum_buffer) {
+void batched_routed_activation_indexed_to_expert_block_indexed(
+    torch::Tensor topk_ids, int64_t num_experts, int64_t block_size,
+    torch::Tensor sorted_token_ids, torch::Tensor experts_ids,
+    torch::Tensor num_block_post_pad, torch::Tensor token_cnts_buffer,
+    torch::Tensor cumsum_buffer) {
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     int64_t padded_num_experts =
@@ -155,8 +155,12 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
     threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
 
     DISPATCH_INTEGRAL_TYPES(
-        topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
-            auto align_kernel = moe_align_block_size_kernel<scalar_t>;
+        topk_ids.scalar_type(),
+        "batched_routed_activation_indexed_to_expert_block_indexed_kernel",
+        [&] {
+            auto align_kernel =
+                batched_routed_activation_indexed_to_expert_block_indexed_kernel<
+                    scalar_t>;
 
             size_t num_warps = ceil_div(padded_num_experts, experts_per_warp);
             size_t shared_mem_size =
@@ -166,7 +170,7 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
                 topk_ids.data_ptr<scalar_t>(),
                 sorted_token_ids.data_ptr<int32_t>(),
                 experts_ids.data_ptr<int32_t>(),
-                num_tokens_post_pad.data_ptr<int32_t>(), num_experts,
+                num_block_post_pad.data_ptr<int32_t>(), num_experts,
                 padded_num_experts, experts_per_warp, block_size,
                 topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>());
 
