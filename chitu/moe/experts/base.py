@@ -6,6 +6,10 @@ import torch
 
 from typing import List, Optional
 
+from chitu.moe.batched_routed_activation import (
+    IndexedBatchedRoutedActivation,
+    PerExpertDenseBatchedRoutedActivation,
+)
 from chitu.utils import (
     try_import_opt_dep,
     try_import_platform_dep,
@@ -72,11 +76,10 @@ def fused_experts_wrapper(
 
     if impl == "triton":
         return fused_experts(
-            hidden_states=hidden_states,
+            hidden_states=IndexedBatchedRoutedActivation(hidden_states, topk_ids),
             w1=w1,
             w2=w2,
             topk_weights=topk_weights,
-            topk_ids=topk_ids,
             inplace=inplace,
             activation=activation,
             use_fp8_w8a8=use_fp8_w8a8,
@@ -100,7 +103,9 @@ def fused_experts_wrapper(
     elif impl == "ep_group_gemm_masked":
         if w1.dtype == torch.float8_e4m3fn and has_deep_gemm:
             return deepgemm_masked_fused_expert(
-                hidden_states=hidden_states,
+                hidden_states=PerExpertDenseBatchedRoutedActivation(
+                    hidden_states, tokens_per_expert
+                ),
                 w1=w1,
                 w2=w2,
                 topk_weights=topk_weights,
@@ -123,14 +128,14 @@ def fused_experts_wrapper(
                 block_shape=block_shape,
                 soft_fp8=soft_fp8,
                 experts_start_idx=experts_start_idx,
-                tokens_per_expert=tokens_per_expert,
             )
         elif w1.dtype == torch.bfloat16 and has_triton:
             return triton_batched_experts(
-                hidden_states=hidden_states,
+                hidden_states=PerExpertDenseBatchedRoutedActivation(
+                    hidden_states, tokens_per_expert
+                ),
                 w1=w1,
                 w2=w2,
-                tokens_per_expert=tokens_per_expert,
             )
         else:
             raise NotImplementedError
@@ -138,11 +143,10 @@ def fused_experts_wrapper(
     elif impl == "ep_group_gemm_contiguous":
         if w1.dtype == torch.float8_e4m3fn and has_deep_gemm:
             return deepgemm_contiguous_fused_expert(
-                hidden_states=hidden_states,
+                IndexedBatchedRoutedActivation(hidden_states, topk_ids),
                 w1=w1,
                 w2=w2,
                 topk_weights=topk_weights,
-                topk_ids=topk_ids,
                 inplace=inplace,
                 activation=activation,
                 use_fp8_w8a8=use_fp8_w8a8,
@@ -165,11 +169,10 @@ def fused_experts_wrapper(
             )
         elif has_triton:
             return fused_experts(
-                hidden_states=hidden_states,
+                hidden_states=IndexedBatchedRoutedActivation(hidden_states, topk_ids),
                 w1=w1,
                 w2=w2,
                 topk_weights=topk_weights,
-                topk_ids=topk_ids,
                 inplace=inplace,
                 activation=activation,
                 use_fp8_w8a8=use_fp8_w8a8,

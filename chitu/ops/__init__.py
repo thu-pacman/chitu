@@ -42,3 +42,7 @@ from chitu.ops.quant import (
     convert_linear_to_swizzled,
 )
 from chitu.ops.mla_prologue import mla_prologue_normal
+from chitu.ops.batched_routed_activation import (
+    batched_routed_activation_indexed_to_expert_block_indexed,
+    batched_routed_activation_indexed_to_expert_block_permuted_blockfp8,
+)

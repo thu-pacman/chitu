@@ -21,17 +21,39 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
 )
+cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
 
 def moe_gate(
-    scores,
-    topk,
-    num_expert_group,
-    topk_group,
-    e_score_correction_bias,
+    scores: torch.Tensor,
+    topk: int,
+    num_expert_group: int,
+    topk_group: int,
+    e_score_correction_bias: Optional[torch.Tensor],
     score_func: str,
     impl: str = "auto",
 ):
+    """
+    MoE gate
+
+    Args:
+        scores (torch.Tensor): scores[i, j] is the score of Expert j for sample i.
+        topk (int): The number of selected experts.
+        num_expert_group (int): The total number of expert groups to select from. Set to 1 if
+            there is no expert grouping.
+        topk_group (int): The number of selected expert groups before selecting individual
+            experts. Set to 1 if there is no expert grouping.
+        e_score_correction_bias (torch.Tensor): Bias added after normalization (softmax/sigmoid)
+            and before selecting.
+        score_func (str): "softmax" or "sigmoid"
+
+    Returns:
+        [0] (torch.Tensor): indices. indices[i, j] is the index of the j-th selected expert
+            for sample i.
+        [1] (torch.Tensor): weight. weight[i, j] is the weight of the j-th selected expert
+            for sample i.
+    """
+
     if impl == "auto":
         if (
             has_muxi_layout_kernels
@@ -223,7 +245,6 @@ def moe_gate_muxi(
     e_score_correction_bias: Optional[torch.Tensor] = None,
     score_func: str = "softmax",
 ):
-
     assert (
         score_func == "softmax" or score_func == "sigmoid"
     ), "Only softmax and sigmoid are supported now"
@@ -272,8 +293,6 @@ def moe_gate_cpu(
     e_score_correction_bias=None,
     score_func="softmax",
 ):
-    import cpuinfer
-
     if scores.device.type != "cpu":
         raise ValueError(
             f"moe_gate input tensor must be on CPU, got device: {scores.device}"

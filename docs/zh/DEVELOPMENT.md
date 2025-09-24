@@ -185,10 +185,16 @@ TORCH_CUDA_ARCH_LIST=9.0 CHITU_WITH_CYTHON=1 pip install --no-build-isolation .
 
 ### 构建分发产物
 
-先按照上面小节的安装指引完成环境配置和安装，然后按照下面的步骤构建分发产物。
+可按如下步骤构建分发产物：
 
 ```bash
-./script/build_for_dist.sh
+./script/build_for_dist.sh <whether-enable-cython>
+```
+
+例如：
+
+```bash
+./script/build_for_dist.sh true
 ```
 
 这将创建一个包含 wheel 文件的 `dist/` 目录。将它们复制到您想要的位置，然后使用 `pip install <wheel_file>` 安装它们。如果您必须使用平台的自定义依赖项（例如 `torch`），请在 `pip install` 命令后附加 `--no-deps`。

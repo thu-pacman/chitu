@@ -98,7 +98,7 @@ WORKDIR /workspace/chitu
 COPY . .
 
 # build wheel of chitu
-RUN python setup.py bdist_wheel
+RUN ./script/build_for_dist.sh "${enable_cython}"
 
 # verify the wheel was created
 RUN cp dist/*.whl /tmp/

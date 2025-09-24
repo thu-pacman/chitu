@@ -14,6 +14,7 @@ from chitu.device_type import is_ascend
 
 logger = getLogger(__name__)
 
+_PARALLEL_GROUPS_INITIALIZED = False
 
 _WORLD_GROUP: Optional[CommGroup] = None
 _TP_GROUP: Optional[CommGroup] = None
@@ -182,6 +183,9 @@ def initialize_ep_group(ep_size: int, rank: int, local_rank: int, world_size: in
 def initialize_parallel_groups(
     tp_size: int, pp_size: int, dp_size: int = 1, ep_size: int = 1
 ):
+    global _PARALLEL_GROUPS_INITIALIZED
+    assert not _PARALLEL_GROUPS_INITIALIZED
+
     logger.info(
         f"initialize_parallel_groups: {tp_size=}, {pp_size=}, {dp_size=} {ep_size=}"
     )
@@ -193,6 +197,12 @@ def initialize_parallel_groups(
     initialize_pp_group(tp_size, pp_size, dp_size, rank, local_rank, world_size)
     initialize_dp_group(tp_size, pp_size, dp_size, rank, local_rank, world_size)
     initialize_ep_group(ep_size, rank, local_rank, world_size)
+
+    _PARALLEL_GROUPS_INITIALIZED = True
+
+
+def parallel_groups_initialized():
+    return _PARALLEL_GROUPS_INITIALIZED
 
 
 def destroy_parallel_groups():

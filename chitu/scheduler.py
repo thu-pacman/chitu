@@ -257,16 +257,18 @@ class Scheduler:
             nonlocal num_needed_block, num_total_tokens
             if num_tasks >= len(prefill_task_ids):
                 return False
-            prefix_token_len = TaskPool.pool[
-                prefill_task_ids[num_tasks]
-            ].prefix_tokens_len
-            num_total_tokens += prefix_token_len
+            task = TaskPool.pool[prefill_task_ids[num_tasks]]
+            if task.consumed_req_tokens == 0:
+                """Only tasks that are not allocated kv blocks before need new blocks"""
+                prefix_token_len = task.prefix_tokens_len
+                num_total_tokens += prefix_token_len
+                num_needed_block += ceil_div(prefix_token_len, block_size)
+
             if (
                 num_total_tokens
                 > get_global_args().infer.max_seq_len * self.prefill_num_tasks
             ):
                 return False
-            num_needed_block += ceil_div(prefix_token_len, block_size)
             return num_needed_block + num_used_block <= self.kvcache_block_threshold
 
         while has_enough_block(num_tasks):

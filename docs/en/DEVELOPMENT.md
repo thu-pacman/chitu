@@ -181,10 +181,16 @@ Note:
 
 ### Build for Distribution
 
-First follow "Setup for Development" to install to your local environment, including your optional choices of `[quant]`, etc. Then run the following to build wheel files:
+Run the following to build wheel files:
 
 ```bash
-./script/build_for_dist.sh
+./script/build_for_dist.sh <whether-enable-cython>
+```
+
+Example:
+
+```bash
+./script/build_for_dist.sh true
 ```
 
 This will create a `dist/` directory containing the wheel files. Copy them to your desired location and install them with `pip install <wheel_file>`. If you have to use custom dependencies (e.g. `torch`) of your platform, append `--no-deps` to the `pip install` command.
