@@ -34,7 +34,7 @@ ENV TZ=Etc/UTC
 
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 
-RUN apt update -y && apt install -y git gcc-10 g++-10 libnuma-dev
+RUN apt update -y && apt install -y git gcc-10 g++-10 libnuma-dev vim tmux telnet htop lsof strace iputils-ping curl
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
 RUN --mount=type=cache,target=/root/.cache/pip \

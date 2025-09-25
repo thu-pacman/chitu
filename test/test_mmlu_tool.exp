@@ -60,7 +60,7 @@ spawn torchrun --nproc_per_node $tp_size_arg -m chitu \
     models.ckpt_dir=$model_dir_arg \
     infer.cache_type=paged \
     $ATNN_TYPE_ARG \
-    infer.max_reqs=128 \
+    infer.max_reqs=$eval_batch_size_arg \
     infer.max_seq_len=1200 \
     infer.tp_size=$tp_size_arg \
     infer.use_cuda_graph=True
@@ -73,7 +73,7 @@ expect -timeout -1 "Uvicorn running on"
 puts "Starting MMLU evaluation..."
 
 set datasets_json "\[\"mmlu\"\]"
-set config_json "\{\"model\":\"$model_arg\", \"datasets\":$datasets_json,\"api_url\":\"http://localhost:21002\", \"eval_type\":\"server\", \"eval_batch_size\":$eval_batch_size_arg\}"
+set config_json "\{\"model\":\"$model_arg\", \"datasets\":$datasets_json,\"api_url\":\"http://localhost:21002/v1\", \"eval_type\":\"service\", \"eval_batch_size\":$eval_batch_size_arg\}"
 
 spawn python test/test_mmlu.py --config $config_json
 

@@ -1,10 +1,14 @@
 #!/usr/bin/expect
 
-# parse parameters
+# Parse command line parameters
 set model_arg "Qwen3-32B"
 set model_dir_arg "/data/nfs/Qwen3-32B"
 set tp_size_arg 2
+set cache_type_arg "paged"
+set batch_sizes_arg "1 2 4 8 16 32"
+set send_notification 1
 
+# Process command line arguments
 if {[llength $argv] > 0} {
     for {set i 0} {$i < [llength $argv]} {incr i} {
         set arg [lindex $argv $i]
@@ -17,20 +21,29 @@ if {[llength $argv] > 0} {
         } elseif {$arg eq "--tp-size"} {
             incr i
             set tp_size_arg [lindex $argv $i]
+        } elseif {$arg eq "--cache-type"} {
+            incr i
+            set cache_type_arg [lindex $argv $i]
+        } elseif {$arg eq "--benchmark-batch-sizes"} {
+            incr i
+            set batch_sizes_arg [lindex $argv $i]
+        } elseif {$arg eq "--no-notify"} {
+            # Flag to disable notification sending
+            set send_notification 0
         }
     }
 }
 
-# Execute the check_npus.sh script to get NPU information
+# Detect hardware environment - Check if NPUs are available
 set check_output [exec bash -c "source script/check_npus.sh 2>/dev/null"]
-
+# Install required dependencies
 exec pip install aiohttp -i https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null
 
-# Initialize variables
+# Initialize hardware detection variables
 set USE_NPU 0
 set NPU_TYPE ""
 
-# Parse the output to get USE_NPU and NPU_TYPE
+# Parse the output from hardware detection script
 foreach line [split $check_output "\n"] {
     if {[string match "USE_NPU=*" $line]} {
         set USE_NPU [string range $line 8 end]
@@ -40,26 +53,48 @@ foreach line [split $check_output "\n"] {
     }
 }
 
+# Display detected hardware information
 puts "USE_NPU = $USE_NPU"
 if {$USE_NPU == 1} {
     puts "NPU_TYPE = $NPU_TYPE"
 }
 
-set ATNN_TYPE_ARG "infer.attn_type=flash_attn"
+# Select appropriate attention implementation based on hardware
+set ATNN_TYPE_ARG "auto"
 if {$USE_NPU == 1} {
-    set ATNN_TYPE_ARG "infer.attn_type=npu"
+    set ATNN_TYPE_ARG "npu"
 }
+
+# Configure model-specific parameters
+set extra_args ""
+set MAX_REQS 128
+
+# Special handling for DeepSeek-R1 models
+if {[string first "DeepSeek-R1" $model_arg] != -1} {
+    append extra_args " infer.mla_absorb=absorb-without-precomp"
+    
+    # Check if it's FP4 version and running on NPU
+    if {[string first "FP4" $model_arg] != -1 && $USE_NPU == 1} {
+        append extra_args " infer.npu_fusion_fp4=True"
+        append extra_args " infer.raise_lower_bit_float_to=bfloat16"
+        append extra_args " keep_dtype_in_checkpoint=True"
+        set MAX_REQS 8
+    }
+}
+
+puts "Model extra args: $extra_args"
 
 # Launch the server
 spawn torchrun --nproc_per_node $tp_size_arg -m chitu \
     models=$model_arg \
     models.ckpt_dir=$model_dir_arg \
-    infer.cache_type=paged \
-    $ATNN_TYPE_ARG \
-    infer.max_reqs=128 \
+    infer.cache_type=$cache_type_arg \
+    infer.attn_type=$ATNN_TYPE_ARG \
+    infer.max_reqs=$MAX_REQS \
     infer.max_seq_len=1200 \
     infer.tp_size=$tp_size_arg \
-    infer.use_cuda_graph=True
+    infer.use_cuda_graph=True \
+    {*}$extra_args
 
 set pid [exp_pid]
 puts "Launching server, pid is $pid"
@@ -67,11 +102,25 @@ puts "Launching server, pid is $pid"
 # Wait for the server to start
 expect -timeout -1 "Uvicorn running on"
 
-# Initialize formatted records with header
-set benchmark_formated_records "Batch Size;Benchmark duration (s);TPS (tok/s);TTFT (s);TPOT (s);Total Throughput (tok/s)\n"
+# Prepare model configuration summary for reporting
+set model_info "Model: $model_arg\n"
+append model_info "TP Size: $tp_size_arg\n"
+append model_info "Attention Type: $ATNN_TYPE_ARG\n"
+append model_info "Cache Type: $cache_type_arg\n"
+append model_info "Use_cuda_graph: True\n"
+append model_info "\n"
 
-# Loop over batch sizes: 1 and 64
-foreach bs {1 64} {
+# Initialize formatted records with header
+set column_format "%-12s %-24s %-14s %-11s %-11s %s"
+set benchmark_formated_records [format $column_format "Batch Size" "Benchmark duration (s)" "TPS (tok/s)" "TTFT (ms)" "TPOT (ms)" "Total Throughput (tok/s)"]
+append benchmark_formated_records "\n"
+
+append benchmark_formated_records [format $column_format "------------" "------------------------" "--------------" "-----------" "-----------" "-------------------------"]
+append benchmark_formated_records "\n\n"
+
+# Loop over batch sizes
+set batch_sizes [split $batch_sizes_arg " "]
+foreach bs $batch_sizes {
     puts "Starting test with batch size = $bs..."
 
     # Run benchmark and capture output (including stderr)
@@ -108,19 +157,44 @@ foreach bs {1 64} {
     }
 
     # Append formatted record
-    append benchmark_formated_records "$bs;$duration;$output_throughput;$mean_ttft;$mean_tpot;$total_throughput\n"
+    append benchmark_formated_records [format $column_format $bs $duration $output_throughput $mean_ttft $mean_tpot $total_throughput]
+    append benchmark_formated_records "\n"
 }
-
 # Print table
 puts "==================== BENCHMARK SUMMARY ===================="
-if {[catch {
-    set formatted_table [exec echo $benchmark_formated_records | column -t -s \;]
-    puts $formatted_table
-} err]} {
-    # Fallback: print raw if column fails
-    puts $benchmark_formated_records
-}
+puts $model_info
+puts $benchmark_formated_records
 puts "==========================================================="
+
+proc send_to_lark {message} {
+    set webhook_url "https://open.feishu.cn/open-apis/bot/v2/hook/d78cfb94-927b-4bdf-b1bc-b422a0b60908"
+    
+    set escaped_message [string map {
+        "\\" "\\\\" 
+        "\"" "\\\"" 
+        "\n" "\\n"
+    } $message]
+    
+    set json_data "{\"msg_type\": \"text\", \"content\": {\"text\": \"$escaped_message\"}}"
+    
+    if {[catch {
+        set result [exec curl -X POST $webhook_url \
+            -H "Content-Type: application/json" \
+            -d $json_data 2>@1]
+        puts "Curl response: $result"
+    } error_msg]} {
+        puts "Failed to send to Lark: $error_msg"
+    } else {
+        puts "Successfully sent to Lark"
+    }
+}
+if {$send_notification == 1} {
+    set lark_message "$model_info$benchmark_formated_records"
+    puts "Sending benchmark results to Lark..."
+    send_to_lark $lark_message
+} else {
+    puts "Notification sending is disabled (--no-notify flag was used)"
+}
 
 
 # Clean up
