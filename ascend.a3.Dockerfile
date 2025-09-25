@@ -3,20 +3,11 @@ FROM quay.io/ascend/vllm-ascend:v0.10.0rc1-a3-openeuler AS base
 
 ARG optional_deps=''
 ARG build_jobs=''
-ARG enable_editable_install='false'
 ARG enable_cython='true'
 ARG enable_test='false'
 
-RUN if [ "${enable_editable_install}" != "true" ] && [ "${enable_editable_install}" != "false" ]; then \
-    echo "ARG enable_editable_install must either be 'true' or 'false'"; \
-    exit 1; \
-fi
 RUN if [ "${enable_cython}" != "true" ] && [ "${enable_cython}" != "false" ]; then \
     echo "ARG enable_cython must either be 'true' or 'false'"; \
-    exit 1; \
-fi
-RUN if [ "${enable_cython}" = "true" ] && [ "${enable_editable_install}" = "true" ]; then \
-    echo "Cython is not supported when installing in editable mode"; \
     exit 1; \
 fi
 RUN if [ "${enable_test}" != "true" ] && [ "${enable_test}" != "false" ]; then \

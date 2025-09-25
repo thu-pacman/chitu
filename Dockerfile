@@ -7,20 +7,11 @@ SHELL ["/bin/bash", "-c"]
 ARG torch_cuda_arch_list='7.0 7.5 8.0 8.6 8.9 9.0+PTX'
 ARG optional_deps='flash_attn,flash_mla,flashinfer'
 ARG build_jobs=''
-ARG enable_editable_install='false'
 ARG enable_cython='true'
 ARG enable_test='false'
 
-RUN if [ "${enable_editable_install}" != "true" ] && [ "${enable_editable_install}" != "false" ]; then \
-    echo "ARG enable_editable_install must either be 'true' or 'false'"; \
-    exit 1; \
-fi
 RUN if [ "${enable_cython}" != "true" ] && [ "${enable_cython}" != "false" ]; then \
     echo "ARG enable_cython must either be 'true' or 'false'"; \
-    exit 1; \
-fi
-RUN if [ "${enable_cython}" = "true" ] && [ "${enable_editable_install}" = "true" ]; then \
-    echo "Cython is not supported when installing in editable mode"; \
     exit 1; \
 fi
 RUN if [ "${enable_test}" != "true" ] && [ "${enable_test}" != "false" ]; then \
