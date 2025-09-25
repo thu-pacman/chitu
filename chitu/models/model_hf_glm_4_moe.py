@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.models.model import RMSNorm
+from chitu.models.model import RMSNorm, get_linear_layout_native_y
 from chitu.models.model_hf_llama import TransformerBlockHFLlama
 from chitu.models.model_hf_qwen2_vl import (
     VisionMLP,
@@ -30,7 +30,7 @@ from chitu.muxi_utils import (
     NormalMoeExpertsMuxiLayout,
     Blockfp8MoeExpertsMuxiLayout,
 )
-from chitu.tensor_parallel import LocalLinear
+from chitu.tensor_parallel import ColumnParallelLinear
 
 
 class Glm4vVisionEmbeddings(nn.Module):
@@ -140,6 +140,7 @@ class Glm4vVisionPatchMerger(VisionMLP):
         hidden_features: Optional[int] = None,
         checkpoint_prefix: str = "",
         has_bias: bool = False,
+        op_impl: str = "",
     ):
         super().__init__(
             in_features=in_features,
@@ -147,11 +148,13 @@ class Glm4vVisionPatchMerger(VisionMLP):
             checkpoint_prefix=checkpoint_prefix,
             has_bias=has_bias,
         )
-
-        self.proj = LocalLinear(
+        self.proj = ColumnParallelLinear(
             in_features,
             in_features,
             has_bias=has_bias,
+            base_linear_class=get_linear_layout_native_y(
+                op_impl, checkpoint_prefix=f"{checkpoint_prefix}.proj"
+            ),
             checkpoint_prefix=f"{checkpoint_prefix}.proj",
         )
         self.post_projection_norm = nn.LayerNorm(in_features)
@@ -204,6 +207,7 @@ class Glm4vVisionTransformer(VisionTransformer):
             in_features=config.out_hidden_size,
             hidden_features=config.intermediate_size,
             checkpoint_prefix=f"{checkpoint_prefix}.merger",
+            op_impl=op_impl,
         )
         self.post_conv_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.downsample = nn.Conv2d(
@@ -443,13 +447,15 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
             "q_proj",
             "k_proj",
             "v_proj",
-            "layers.*gate_up_proj",
-            "layers.*gate_proj",
-            "layers.*up_proj",
+            "gate_up_proj",
+            "gate_proj",
+            "up_proj",
             "lm_head",
+            "merger\.proj",
+            "attn\.proj",
             "embed_tokens",
         ]
 
     @override
     def _get_tensor_row_parallel_layer_names(self) -> List[str]:
-        return ["layers.*down_proj", "o_proj"]
+        return ["down_proj", "o_proj"]

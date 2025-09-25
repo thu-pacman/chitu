@@ -441,12 +441,14 @@ class Executor:
         self.dp_size = args.infer.dp_size
         self.pipe_dispatcher = None
         self.task_dispatchers = []
+        self.tp_group = None
         if self.pp_size > 1:
             self.pipe_dispatcher = PipeDispatcher()
             if self.pipe_dispatcher.is_main_rank:
                 self.task_dispatchers.append(self.pipe_dispatcher)
         if self.tp_size > 1:
             self.task_dispatchers.append(TensorDispatcher())
+            self.tp_group = get_tp_group()
 
         if self.pipe_dispatcher and not self.pipe_dispatcher.is_first_stage:
             self.get_payload_shape = lambda num_tokens: [num_tokens, args.models.dim]
@@ -503,6 +505,82 @@ class Executor:
             device=self.local_rank,
             dtype=torch.long,
         )
+
+    def vision_tensor_broadcast(
+        self,
+        tensor,
+        expected_ndim: int,
+        dtype: torch.dtype,
+        stack: bool = True,
+    ) -> Optional[torch.Tensor]:
+        """Broadcast multimodal tensor across TP ranks if TP size > 1.
+
+        Args:
+            tensor: The tensor to broadcast, can be None
+            expected_ndim: Expected number of dimensions for the tensor
+            dtype: Data type for the tensor
+            stack: torch.stack or torch.cat
+        Returns:
+            The broadcasted tensor on all ranks, or None if input was None
+        """
+        if self.tp_size <= 1:
+            if tensor == None or len(tensor) == 0:
+                return None
+            if stack:
+                return torch.stack(tensor).to(dtype=dtype, device=self.local_rank)
+            else:
+                return torch.cat(tensor, dim=0).to(dtype=dtype, device=self.local_rank)
+
+        tp_group = self.tp_group
+
+        if tp_group.rank_in_group == 0:
+            has_tensor = (
+                1
+                if (
+                    tensor is not None
+                    and (not isinstance(tensor, list) or len(tensor) > 0)
+                )
+                else 0
+            )
+            flag = torch.tensor([has_tensor], dtype=torch.int32, device=self.local_rank)
+        else:
+            flag = torch.zeros(1, dtype=torch.int32, device=self.local_rank)
+
+        torch.distributed.broadcast(
+            flag, src=tp_group.rank_list[0], group=tp_group.gpu_group
+        )
+
+        if flag.item() == 0:
+            return None
+
+        if tp_group.rank_in_group == 0:
+            if stack:
+                tensor = torch.stack(tensor)
+            else:
+                tensor = torch.cat(tensor, dim=0)
+            tensor = tensor.to(dtype=dtype).to(self.local_rank)
+            shape_tensor = torch.tensor(
+                tensor.shape, dtype=torch.int64, device=self.local_rank
+            )
+        else:
+            shape_tensor = torch.zeros(
+                expected_ndim, dtype=torch.int64, device=self.local_rank
+            )
+
+        torch.distributed.broadcast(
+            shape_tensor, src=tp_group.rank_list[0], group=tp_group.gpu_group
+        )
+
+        if tp_group.rank_in_group != 0:
+            tensor = torch.empty(
+                tuple(shape_tensor.tolist()), dtype=dtype, device=self.local_rank
+            )
+
+        torch.distributed.broadcast(
+            tensor, src=tp_group.rank_list[0], group=tp_group.gpu_group
+        )
+
+        return tensor
 
     def step(self, tasks: Optional[PackedTasksBase]) -> torch.Tensor:
         # 1. propagate tasks and handle special payload type
@@ -597,8 +675,12 @@ class Executor:
         out = Backend.model.prefill(
             payload,
             self._get_output_token_offsets(tasks),
-            pixel_values=getattr(tasks, "pixel_values", None),
-            grid_thw=getattr(tasks, "grid_thw", None),
+            pixel_values=self.vision_tensor_broadcast(
+                getattr(tasks, "pixel_values", None), 3, torch.bfloat16
+            ),
+            grid_thw=self.vision_tensor_broadcast(
+                getattr(tasks, "grid_thw", None), 2, torch.int64, stack=False
+            ),
         )
         self.timers("prefill").stop()
 
@@ -659,8 +741,12 @@ class Executor:
         out = Backend.model.prefill(
             payload,
             self._get_output_token_offsets(tasks),
-            pixel_values=getattr(tasks, "pixel_values", None),
-            grid_thw=getattr(tasks, "grid_thw", None),
+            pixel_values=self.vision_tensor_broadcast(
+                getattr(tasks, "pixel_values", None), 3, torch.bfloat16
+            ),
+            grid_thw=self.vision_tensor_broadcast(
+                getattr(tasks, "grid_thw", None), 2, torch.int64, stack=False
+            ),
         )
         self.timers("prefill").stop()
 

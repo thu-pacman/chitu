@@ -812,18 +812,6 @@ class PackedTasks(PackedTasksBase):
             if task.grid_thw is not None:
                 self.grid_thw.append(task.grid_thw)
 
-        self.pixel_values = (
-            torch.stack(self.pixel_values).to(
-                device=rank, dtype=torch.bfloat16, non_blocking=True
-            )
-            if self.pixel_values
-            else None
-        )
-        self.grid_thw = (
-            torch.cat(self.grid_thw, dim=0).to(device=rank, non_blocking=True)
-            if self.grid_thw
-            else None
-        )
         self.payload_type = SerializedPackedTasksPayloadType(self.task_type.value)
 
         # additional modifications are required when adapting to MTP or Hybrid.

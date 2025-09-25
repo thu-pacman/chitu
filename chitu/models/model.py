@@ -726,10 +726,6 @@ class Transformer(nn.Module):
         else:
             return self.prefill_no_pipeline(tokens, output_token_offsets, **args)
 
-    @torch.inference_mode()
-    def prepare_inputs(self, tokens, **args):
-        return self._pre_layers(tokens)
-
     def prepare_decoding_attn(self):
         block_table = self.cache.get_gpu_block_table()
         block_size = self.cache.get_block_size()

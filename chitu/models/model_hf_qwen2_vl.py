@@ -5,79 +5,52 @@
 from logging import getLogger
 from typing import List, Optional
 from typing_extensions import override
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from chitu.attn_backend import AttnBackend, RefAttnBackend
+from chitu.attn_backend import AttnBackend, RefAttnBackend, FlashAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.models.model import RMSNorm
 from chitu.models.model_hf_llama import (
+    FeedForwardHFLlama,
     TransformerBlockHFLlama,
     TransformerHFLlama,
+    get_linear_layout_native_y,
+    get_linear_layout_contig_y,
 )
 from chitu.models.registry import ModelType, register_model
 from chitu.ops import apply_rotary_pos_emb, silu_and_mul
 from chitu.quantization import QuantizationRegistry
 from chitu.tensor_parallel import (
+    ColumnParallelLinear,
+    RowParallelLinear,
     LocalLinear,
+    VocabParallelEmbedding,
 )
-from chitu.distributed.parallel_state import get_tp_size
+from chitu.distributed.parallel_state import get_tp_size, get_tp_group
+from chitu.utils import try_import_opt_dep
+
+flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 
 logger = getLogger(__name__)
 
 
-class VisionMLP(nn.Module):
+class VisionMLP(FeedForwardHFLlama):
     def __init__(
         self,
         in_features: int,
         hidden_features: Optional[int] = None,
         op_impl: str = "",
         checkpoint_prefix: str = "",
-        has_bias: bool = True,
+        has_bias=True,
     ):
-        super().__init__()
-        self.hidden_size = in_features
-        self.intermediate_size = hidden_features
-        self.merge_gate_up = QuantizationRegistry.allowed_merge_qkv(checkpoint_prefix)
-        if self.merge_gate_up:
-            self.gate_up_proj = LocalLinear(
-                self.hidden_size,
-                self.intermediate_size * 2,
-                has_bias=has_bias,
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
-            )
-        else:
-            self.gate_proj = LocalLinear(
-                self.hidden_size,
-                self.intermediate_size,
-                has_bias=has_bias,
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
-            )
-            self.up_proj = LocalLinear(
-                self.hidden_size,
-                self.intermediate_size,
-                has_bias=has_bias,
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
-            )
-        self.down_proj = LocalLinear(
-            self.intermediate_size,
-            self.hidden_size,
-            has_bias=has_bias,
-            checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
-        )
+        params = SimpleNamespace(dim=in_features, intermediate_dim=hidden_features)
 
-    def forward(self, x):
-        if self.merge_gate_up:
-            gate_up_out = self.gate_up_proj(x)
-            silu_and_mul_out = silu_and_mul(gate_up_out)
-        else:
-            gate_out = self.gate_proj(x)
-            up_out = self.up_proj(x)
-            silu_and_mul_out = F.silu(gate_out) * up_out
-        return self.down_proj(silu_and_mul_out)
+        super().__init__(params, op_impl, checkpoint_prefix, has_bias=has_bias)
 
 
 class VisionPatchEmbed(nn.Module):
@@ -203,18 +176,25 @@ class VisionAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scaling = self.head_dim**-0.5
-        self.attn_backend = RefAttnBackend()
+        self.use_flash_attn = has_flash_attn
+        if self.use_flash_attn:
+            self.attn_backend = FlashAttnBackend()
+        else:
+            self.attn_backend = RefAttnBackend()
         self.qkv = LocalLinear(
             dim,
             dim * 3,
             has_bias=has_bias,
             checkpoint_prefix=f"{checkpoint_prefix}.qkv",
         )
-        self.proj = LocalLinear(
+        self.proj = ColumnParallelLinear(
             dim,
             dim,
-            checkpoint_prefix=f"{checkpoint_prefix}.proj",
             has_bias=has_bias,
+            base_linear_class=get_linear_layout_contig_y(
+                op_impl, checkpoint_prefix=f"{checkpoint_prefix}.proj"
+            ),
+            checkpoint_prefix=f"{checkpoint_prefix}.proj",
         )
 
     def forward(
@@ -234,33 +214,53 @@ class VisionAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, position_embeddings, rotary_type="separated"
         )
-
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        splits = [
-            torch.split(tensor, lengths.tolist(), dim=0)
-            for tensor in (query_states, key_states, value_states)
-        ]
-        attn_outputs = [
-            self.attn_backend.prefill_ragged_qkvo(
-                q,
-                k,
-                v,
-                BatchedSeqLenDelta(
-                    [0],
-                    [q.size(0)],
-                    device=hidden_states.device,
-                    cache_prefix_lens_tensor_device=True,
-                    cache_position_ids_tensor_device=False,
-                    cache_delta_position_ids_tensor_device=False,
-                    cache_delta_seq_ids_tensor_device=False,
-                ),
+        if self.use_flash_attn:
+            lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+            seq_len_delta = BatchedSeqLenDelta(
+                [0] * len(lengths),
+                lengths,
+                device=hidden_states.device,
+                cache_prefix_lens_tensor_device=True,
+                cache_position_ids_tensor_device=False,
+                cache_delta_position_ids_tensor_device=False,
+                cache_delta_seq_ids_tensor_device=False,
+            )
+            attn_output = self.attn_backend.prefill_ragged_qkvo(
+                query_states,
+                key_states,
+                value_states,
+                seq_len_delta,
                 causal=False,
                 softmax_scale=self.scaling,
             )
-            for q, k, v in zip(*splits)
-        ]
-        attn_output = torch.cat(attn_outputs, dim=0)
-        attn_output = attn_output.view(seq_length, -1).contiguous()
+            attn_output = attn_output.view(seq_length, -1).contiguous()
+        else:
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            splits = [
+                torch.split(tensor, lengths.tolist(), dim=0)
+                for tensor in (query_states, key_states, value_states)
+            ]
+            attn_outputs = [
+                self.attn_backend.prefill_ragged_qkvo(
+                    q,
+                    k,
+                    v,
+                    BatchedSeqLenDelta(
+                        [0],
+                        [q.size(0)],
+                        device=hidden_states.device,
+                        cache_prefix_lens_tensor_device=True,
+                        cache_position_ids_tensor_device=False,
+                        cache_delta_position_ids_tensor_device=False,
+                        cache_delta_seq_ids_tensor_device=False,
+                    ),
+                    causal=False,
+                    softmax_scale=self.scaling,
+                )
+                for q, k, v in zip(*splits)
+            ]
+            attn_output = torch.cat(attn_outputs, dim=0)
+            attn_output = attn_output.view(seq_length, -1).contiguous()
         attn_output = self.proj(attn_output)
         return attn_output
 
@@ -612,14 +612,64 @@ class TransformerQwen2VL(TransformerHFLlama):
         pixel_values_videos: Optional[torch.FloatTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
     ) -> Optional[torch.Tensor]:
+        """
+        Args:
+            pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+                The tensors corresponding to the input images.
+            grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+                The temporal, height and width of feature shape of each image in LLM.
+            pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+                The tensors corresponding to the input videos.
+            video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+                The temporal, height and width of feature shape of each video in LLM.
+        """
+
         input_ids = input_ids.reshape(-1)
         inputs_embeds = super()._pre_layers(input_ids)
         if pixel_values is not None:
             image_embeds = self.get_visual_features(pixel_values, grid_thw, "image")
             image_embeds = torch.cat(image_embeds, dim=0)
+
+            # Build mask without strict length check first
             image_mask, _ = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+                input_ids, inputs_embeds=inputs_embeds
             )
+
+            # Align feature count with placeholder tokens if needed
+            n_image_tokens: int = (input_ids == self.config.image_token_id).sum().item()
+            if image_embeds.shape[0] != n_image_tokens:
+                if (
+                    image_embeds.shape[0] % max(n_image_tokens, 1) == 0
+                    and n_image_tokens > 0
+                ):
+                    ratio = image_embeds.shape[0] // n_image_tokens
+                    # Merge contiguous feature groups to match token placeholders
+                    image_embeds = image_embeds.view(n_image_tokens, ratio, -1).mean(
+                        dim=1
+                    )
+                else:
+                    # Fallback: crop or pad to match the placeholder length to avoid hard failure
+                    if n_image_tokens > 0:
+                        if image_embeds.shape[0] > n_image_tokens:
+                            image_embeds = image_embeds[-n_image_tokens:, :]
+                        else:
+                            pad = torch.zeros(
+                                n_image_tokens - image_embeds.shape[0],
+                                image_embeds.shape[1],
+                                dtype=image_embeds.dtype,
+                                device=image_embeds.device,
+                            )
+                            image_embeds = torch.cat([image_embeds, pad], dim=0)
+                        logger.warning(
+                            "Adjusted image embeddings to match placeholder tokens: tokens=%d, features=%d",
+                            n_image_tokens,
+                            image_embeds.shape[0],
+                        )
+                    else:
+                        # No image tokens, drop features
+                        image_embeds = image_embeds[:0]
+
+            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if pixel_values_videos is not None:
@@ -629,13 +679,44 @@ class TransformerQwen2VL(TransformerHFLlama):
             video_embeds = torch.cat(video_embeds, dim=0).to(
                 inputs_embeds.device, inputs_embeds.dtype
             )
-            _, video_mask = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-        if get_tp_size() > 1:
-            torch.distributed.broadcast(inputs_embeds, src=0)
+            # Build mask without strict length check first
+            _, video_mask = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds
+            )
+
+            # Align feature count with placeholder tokens if needed
+            n_video_tokens: int = (input_ids == self.config.video_token_id).sum().item()
+            if video_embeds.shape[0] != n_video_tokens:
+                if (
+                    video_embeds.shape[0] % max(n_video_tokens, 1) == 0
+                    and n_video_tokens > 0
+                ):
+                    ratio = video_embeds.shape[0] // n_video_tokens
+                    video_embeds = video_embeds.view(n_video_tokens, ratio, -1).mean(
+                        dim=1
+                    )
+                else:
+                    if n_video_tokens > 0:
+                        if video_embeds.shape[0] > n_video_tokens:
+                            video_embeds = video_embeds[-n_video_tokens:, :]
+                        else:
+                            pad = torch.zeros(
+                                n_video_tokens - video_embeds.shape[0],
+                                video_embeds.shape[1],
+                                dtype=video_embeds.dtype,
+                                device=video_embeds.device,
+                            )
+                            video_embeds = torch.cat([video_embeds, pad], dim=0)
+                        logger.warning(
+                            "Adjusted video embeddings to match placeholder tokens: tokens=%d, features=%d",
+                            n_video_tokens,
+                            video_embeds.shape[0],
+                        )
+                    else:
+                        video_embeds = video_embeds[:0]
+
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
         return inputs_embeds
 
     @override
@@ -645,13 +726,14 @@ class TransformerQwen2VL(TransformerHFLlama):
             "q_proj",
             "k_proj",
             "v_proj",
-            "layers.*gate_up_proj",
-            "layers.*gate_proj",
-            "layers.*up_proj",
+            "gate_up_proj",
+            "gate_proj",
+            "up_proj",
             "lm_head",
+            "attn\.proj",
             "embed_tokens",
         ]
 
     @override
     def _get_tensor_row_parallel_layer_names(self) -> List[str]:
-        return ["layers.*down_proj", "o_proj"]
+        return ["down_proj", "o_proj"]
