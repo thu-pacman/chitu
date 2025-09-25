@@ -392,7 +392,7 @@ class ExpertDataDispatcher(TasksDispatcher):
             tensor=tokens, gather_list=gather_list, dst=self.dp_main_rank
         )
 
-        if tokens.numel() == 0:
+        if tokens.numel() == 0 and not self.is_main_rank:
             return
 
         # update local response

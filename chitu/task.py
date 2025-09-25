@@ -775,6 +775,12 @@ class PackedTasks(PackedTasksBase):
     def __init__(self, task_ids: List[str], rank="cuda"):
         super().__init__()
 
+        self.tasks: List[Task] = [TaskPool.pool[tid] for tid in task_ids]
+        self.output_tasks = [task for task in self.tasks if task.has_output()]
+        self.should_apply_frequency_penalty = any(
+            task.params.frequency_penalty > 0 for task in self.output_tasks
+        )
+
         if not task_ids:  # only dp rank0 use this method to create empty packedtasks
             task_type = DPTaskCollector.get_current_task_type()
             if task_type == TaskType.Prefill:
@@ -793,7 +799,6 @@ class PackedTasks(PackedTasksBase):
         self.task_ids = task_ids
         self.num_tasks = len(task_ids)
         assert self.num_tasks > 0, "No tasks provided"
-        self.tasks: List[Task] = [TaskPool.pool[tid] for tid in task_ids]
 
         self.req_ids = task_ids
         self.reqs = [task.req for task in self.tasks]
@@ -822,7 +827,6 @@ class PackedTasks(PackedTasksBase):
             else self.num_tasks
         )
 
-        self.output_tasks = [task for task in self.tasks if task.has_output()]
         self.has_outputs = [task.has_output() for task in self.tasks]
 
         # sample related
@@ -840,9 +844,6 @@ class PackedTasks(PackedTasksBase):
             [task.params.frequency_penalty for task in self.output_tasks],
             dtype=torch.float32,
         ).to(device=self.rank, non_blocking=True)
-        self.should_apply_frequency_penalty = any(
-            task.params.frequency_penalty > 0 for task in self.output_tasks
-        )
 
         # logprobs
         self.return_logprobs = any(
