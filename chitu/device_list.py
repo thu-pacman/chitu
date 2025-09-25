@@ -4,7 +4,6 @@
 
 import torch
 from collections import OrderedDict, deque
-from typing import Dict, Union
 import logging
 import functools
 

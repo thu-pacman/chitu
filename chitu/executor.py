@@ -7,7 +7,7 @@ import zmq
 import msgpack
 from dataclasses import dataclass, asdict
 from logging import getLogger
-from typing import List, Optional, Tuple, Union
+from typing import Optional
 from abc import ABC, abstractmethod
 
 
@@ -64,9 +64,9 @@ class BatchResult:
     """
 
     num_tasks: int
-    tasks: List[Task]
+    tasks: list[Task]
 
-    next_tokens: List[int]
+    next_tokens: list[int]
     return_logprobs: bool = False
     logprobs: Optional[torch.Tensor] = None
     token_idxs: Optional[torch.Tensor] = None
@@ -115,7 +115,7 @@ class PipeDispatcher(TasksDispatcher):
         self,
         tasks: Optional[PackedTasksBase],
         payload_type: Optional[SerializedPackedTasksPayloadType] = None,
-    ) -> Optional[Tuple[SerializedPackedTasksPayloadType, PackedTasksBase]]:
+    ) -> Optional[tuple[SerializedPackedTasksPayloadType, PackedTasksBase]]:
         # recv task from previous stage
         if self.is_first_stage:
             task_tensor = tasks.serialize(
@@ -186,7 +186,7 @@ class TensorDispatcher(TasksDispatcher):
         self,
         tasks: Optional[PackedTasksBase],
         payload_type: Optional[SerializedPackedTasksPayloadType] = None,
-    ) -> Tuple[SerializedPackedTasksPayloadType, PackedTasksBase]:
+    ) -> tuple[SerializedPackedTasksPayloadType, PackedTasksBase]:
         if self.is_main_rank:
             task_tensor = tasks.serialize(
                 payload_type=payload_type,
@@ -259,7 +259,7 @@ class ExpertDataDispatcher(TasksDispatcher):
         if self.socket not in events:
             raise RuntimeError(f"rank {self.rank}: connect timeout ({timeout}ms)")
 
-    def serialize_tasks(self, tasks: List[Task]) -> bytes:
+    def serialize_tasks(self, tasks: list[Task]) -> bytes:
         tasks_data = [asdict(task) for task in tasks]
         return msgpack.packb(tasks_data, use_bin_type=True)
 
@@ -420,7 +420,7 @@ class ExpertDataDispatcher(TasksDispatcher):
     def send_payload(self, payload: torch.Tensor):
         return payload
 
-    def recv_payload(self, payload: Union[torch.Tensor, List[torch.Tensor]]):
+    def recv_payload(self, payload: torch.Tensor | list[torch.Tensor]):
         return payload
 
 
@@ -770,7 +770,7 @@ class Executor:
         return out
 
     def decode_step_tp_only(
-        self, req_ids: List[str], next_tokens: List[int]
+        self, req_ids: list[str], next_tokens: list[int]
     ) -> torch.Tensor:
         """
         PD-only decode that supports TP but not PP.
@@ -1006,9 +1006,9 @@ class Executor:
             )
 
     def postprocess_async_part(self, batch_result: BatchResult) -> None:
-        next_token_list: List[int] = []
-        logprobs_list: List[List[float]] = []
-        token_idxs_list: List[List[int]] = []
+        next_token_list: list[int] = []
+        logprobs_list: list[list[float]] = []
+        token_idxs_list: list[list[int]] = []
         for it, task in enumerate(batch_result.tasks):
             next_token_list.append(batch_result.next_tokens[it])
         if batch_result.return_logprobs:

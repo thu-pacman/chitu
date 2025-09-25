@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Union, Sequence, Any
+from typing import Sequence, Any
 from typing_extensions import override, final
 from dataclasses import dataclass
 import functools
@@ -22,7 +22,7 @@ class NativeLayoutTensor:
     Inherit from this class to implement specific layouts.
     """
 
-    plain_shape: Union[torch.Size, Sequence[int]]
+    plain_shape: torch.Size | Sequence[int]
     """
     The shape of the tensor in its mathematical representation.
     """

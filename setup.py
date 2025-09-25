@@ -99,6 +99,7 @@ if os.environ.get("CHITU_WITH_CYTHON", "0") != "0":
 setup(
     name="chitu",
     version="0.4.3",
+    python_requires=">=3.10",
     install_requires=install_requires,
     extras_require=extras_require,
     packages=find_packages(),

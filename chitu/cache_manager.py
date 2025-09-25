@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Dict, List, Sequence, Optional, Callable
+from typing import Sequence, Optional, Callable
 from typing_extensions import override
 from dataclasses import dataclass
 from logging import getLogger
@@ -108,7 +108,7 @@ class KVCacheManagerBase:
             self.k_shape_per_sample = kv_shape_per_sample
             self.v_shape_per_sample = None
 
-        self.req_id_to_seq_len: Dict[str, int] = {}
+        self.req_id_to_seq_len: dict[str, int] = {}
 
         prefill_chunk_size = get_global_args().infer.prefill_chunk_size
         self.max_total_len = num_hot_req * max_seq_len
@@ -132,11 +132,11 @@ class KVCacheManagerBase:
             cache_delta_seq_ids_tensor_device=True,
         )
 
-        self.curr_req_ids: Optional[List[str]] = None
+        self.curr_req_ids: Optional[list[str]] = None
 
         self.timers = get_timers()
 
-    def prepare_cache_prefill(self, req_ids: List[str], delta_seq_len: List[int]):
+    def prepare_cache_prefill(self, req_ids: list[str], delta_seq_len: list[int]):
         self.curr_req_ids = req_ids
 
         prev_seq_len = BatchedSeqLen(
@@ -168,7 +168,7 @@ class KVCacheManagerBase:
         """Check if the KV cache blocks for the given request are fully utilized. Called by the scheduler to determine whether a new KV cache block needs to be allocated for the specified request."""
         raise NotImplementedError()
 
-    def prepare_cache_decode(self, req_ids: List[str]):
+    def prepare_cache_decode(self, req_ids: list[str]):
         self.curr_req_ids = req_ids
 
         self.seq_len_delta.copy_from_list(
@@ -204,7 +204,7 @@ class KVCacheManagerBase:
     def get_accessor(self, layer_id: int) -> KVCacheAccessor:
         raise NotImplementedError()
 
-    def finalize_cache_single_decode(self, req_ids: List[str]):
+    def finalize_cache_single_decode(self, req_ids: list[str]):
         self.curr_req_ids = None
 
     def finalize_cache_all_decode(self, req_id: str):
@@ -272,7 +272,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
         self.block_size = block_size
 
-        self.block_table: Dict[str, List[int]] = {}  # (seq_id, block_idx)
+        self.block_table: dict[str, list[int]] = {}  # (seq_id, block_idx)
         self.gpu_block_table = StaticTensor(
             max_nelem=self.max_num_blocks, dtype=torch.int32, device=self.device
         )
@@ -310,13 +310,13 @@ class PagedKVCacheManager(KVCacheManagerBase):
         """Return the maximum number of blocks a single request can occupy."""
         return self.max_blocks_per_req
 
-    def reserve_blocks_for_transfer(self, req_id: str, num_blocks: int) -> List[int]:
+    def reserve_blocks_for_transfer(self, req_id: str, num_blocks: int) -> list[int]:
         """Reserve a number of free blocks for an incoming transfer on decode side.
 
         The reserved blocks are removed from the free list immediately to avoid
         collision and are recorded in `block_table[req_id]`.
         """
-        reserved: List[int] = []
+        reserved: list[int] = []
         num_blocks = int(num_blocks)
         if num_blocks <= 0:
             return reserved
@@ -391,7 +391,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
     def offs_in_page(self):
         return self.seq_len_delta.delta_position_ids_tensor_device % self.block_size
 
-    def _upd_gpu_block_table(self, req_ids: List[str]):
+    def _upd_gpu_block_table(self, req_ids: list[str]):
         if get_global_args().infer.use_cuda_graph:
             max_block_num = self.max_blocks_per_req
         else:
@@ -411,7 +411,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self._offs_in_page_up_to_date = False
 
     @override
-    def prepare_cache_prefill(self, req_ids: List[str], delta_seq_len: List[int]):
+    def prepare_cache_prefill(self, req_ids: list[str], delta_seq_len: list[int]):
         super().prepare_cache_prefill(req_ids, delta_seq_len)
 
         for req_id, new_seq_len in zip(req_ids, self.seq_len_delta.new.lens_list):
@@ -432,7 +432,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         )
 
     @override
-    def prepare_cache_decode(self, req_ids: List[str]):
+    def prepare_cache_decode(self, req_ids: list[str]):
         # Prepare enough block table for next decoding. When decoding, AttnBackend will fill new kv into
         # paged kv cache in place.
         for i, req_id in enumerate(req_ids):
@@ -541,7 +541,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         return self.block_table.get(req_id, [])
 
     def insert_kv_cache_from_transfer(
-        self, req_id: str, page_indices: List[int], prefix_length: int
+        self, req_id: str, page_indices: list[int], prefix_length: int
     ):
         """
         Register transferred KV pages into block table and set the sequence length.
@@ -592,8 +592,8 @@ class DenseKVCacheManager(KVCacheManagerBase):
         )
 
         self.slot_availability = [True] * num_hot_req
-        self.hot_reqs: List[Optional[str]] = [None] * num_hot_req
-        self.req2slot: Dict[str, int] = {}
+        self.hot_reqs: list[Optional[str]] = [None] * num_hot_req
+        self.req2slot: dict[str, int] = {}
 
         self.k_buffer: Optional[torch.Tensor] = None
         self.v_buffer: Optional[torch.Tensor] = None
@@ -657,7 +657,7 @@ class DenseKVCacheManager(KVCacheManagerBase):
         return start_idx, end_idx
 
     @override
-    def prepare_cache_prefill(self, req_ids: List[str], delta_seq_len: List[int]):
+    def prepare_cache_prefill(self, req_ids: list[str], delta_seq_len: list[int]):
         super().prepare_cache_prefill(req_ids, delta_seq_len)
 
         # get start_idx and end_idx of current slot_group
@@ -688,14 +688,14 @@ class DenseKVCacheManager(KVCacheManagerBase):
         return False
 
     @override
-    def prepare_cache_decode(self, req_ids: List[str]):
+    def prepare_cache_decode(self, req_ids: list[str]):
         self.timers("cache_prepare").start()
         super().prepare_cache_decode(req_ids)
         start_pos = self.get_start_and_end_idx()[0]
         self._prepare_cache(req_ids, start_pos)
         self.timers("cache_prepare").stop()
 
-    def _prepare_cache(self, req_ids: List[str], start_pos: int):
+    def _prepare_cache(self, req_ids: list[str], start_pos: int):
         assert (
             start_pos + len(req_ids) <= self.num_hot_req
         ), f"start_pos:{start_pos}, number of req:{len(req_ids)}, num_hot_req:{self.num_hot_req}"

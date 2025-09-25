@@ -12,7 +12,7 @@ from enum import Enum
 from glob import glob
 from logging import getLogger
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Deque, List, Optional
+from typing import TYPE_CHECKING, Callable, Deque, Optional
 import torch
 import torch.distributed as dist
 from safetensors.torch import safe_open
@@ -87,7 +87,7 @@ class Backend:
     executor: Optional["Executor"] = None
 
     # mutable
-    ongoing_reqs: List["OngoingRequests"] = []
+    ongoing_reqs: list["OngoingRequests"] = []
     state = BackendState.Running
     last_batch_results: Deque["BatchResult"] = deque()
 

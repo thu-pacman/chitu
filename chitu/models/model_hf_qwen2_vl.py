@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from logging import getLogger
-from typing import List, Optional
+from typing import Optional
 from typing_extensions import override
 from types import SimpleNamespace
 
@@ -720,7 +720,7 @@ class TransformerQwen2VL(TransformerHFLlama):
         return inputs_embeds
 
     @override
-    def _get_tensor_column_parallel_layer_names(self) -> List[str]:
+    def _get_tensor_column_parallel_layer_names(self) -> list[str]:
         return [
             "qkv_proj",
             "q_proj",
@@ -735,5 +735,5 @@ class TransformerQwen2VL(TransformerHFLlama):
         ]
 
     @override
-    def _get_tensor_row_parallel_layer_names(self) -> List[str]:
+    def _get_tensor_row_parallel_layer_names(self) -> list[str]:
         return ["down_proj", "o_proj"]

@@ -4,7 +4,7 @@
 
 import functools
 import struct
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 from logging import getLogger
 
 import torch
@@ -568,13 +568,13 @@ def invoke_fused_moe_kernel(
     num_blocks_post_padded: torch.Tensor,
     mul_routed_weight: bool,
     top_k: int,
-    config: Dict[str, Any],
+    config: dict[str, Any],
     compute_type: tl.dtype,
     use_fp8_w8a8: bool,  # NOTE only support fp8_w8a8
     use_fp4_w4a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
-    block_shape: Optional[List[int]] = None,
+    block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     is_w1w3: bool = False,
 ) -> None:
@@ -714,8 +714,8 @@ def get_default_config(
     topk: int,
     dtype: Optional[str],
     is_marlin: bool,
-    block_shape: Optional[List[int]] = None,
-) -> Dict[str, int]:
+    block_shape: Optional[list[int]] = None,
+) -> dict[str, int]:
     if (dtype == "fp8_w8a8" or dtype == "fp4_w4a8") and block_shape is not None:
         # Block-wise quant: BLOCK_SIZE_N must be divisible by block_shape[0]
         # BLOCK_SIZE_K must be divisible by block_shape[1]
@@ -746,13 +746,13 @@ def get_default_config(
 
 
 def try_get_optimal_moe_config(
-    w1_shape: Tuple[int, ...],
-    w2_shape: Tuple[int, ...],
+    w1_shape: tuple[int, ...],
+    w2_shape: tuple[int, ...],
     top_k: int,
     dtype: Optional[str],
     M: int,
     is_marlin: bool = False,
-    block_shape: Optional[List[int]] = None,
+    block_shape: Optional[list[int]] = None,
 ):
     # First try to load optimal config from the file
     E, _, N = w2_shape
@@ -805,7 +805,7 @@ def fused_experts(
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[List[int]] = None,
+    block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
     tokens_per_expert: Optional[torch.Tensor] = None,
@@ -870,7 +870,7 @@ def fused_experts_impl(
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[List[int]] = None,
+    block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
 ):
     raise ValueError(f"Unsupported hidden_states type: {type(hidden_states)}")
@@ -897,7 +897,7 @@ def _(
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[List[int]] = None,
+    block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
 ):
     assert (
@@ -975,7 +975,7 @@ def _(
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[List[int]] = None,
+    block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
 ):
     # Check constraints.

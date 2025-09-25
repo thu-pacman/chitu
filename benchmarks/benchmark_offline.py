@@ -17,7 +17,6 @@ import torch
 from datetime import datetime
 
 from logging import getLogger
-from typing import List
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from chitu.task import UserRequest, TaskPool, Task
@@ -119,7 +118,7 @@ def random_requests(args, num_reqs):
     return reqs
 
 
-def get_requests(args, num_reqs) -> List[UserRequest]:
+def get_requests(args, num_reqs) -> list[UserRequest]:
     if args.benchmark.dataset == "random":
         return random_requests(args, num_reqs)
     else:

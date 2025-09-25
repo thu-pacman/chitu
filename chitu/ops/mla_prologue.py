@@ -2,8 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Tuple
-
 import torch
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
@@ -36,7 +34,7 @@ def mla_prologue_normal(
     dequant_scale_q_b_proj: torch.Tensor | None = None,
     smooth_scales: torch.Tensor | None = None,
     impl: str = "auto",
-) -> Tuple[
+) -> tuple[
     torch.Tensor, torch.Tensor | NativeLayoutTensor, torch.Tensor | NativeLayoutTensor
 ]:  # q_nope, q_pe, kv
     if impl == "auto":
@@ -117,7 +115,7 @@ def mla_prologue_normal_torch(
     freqs_cis: BatchedFreqsCis,
     q_a_layernorm_eps: float,
     kv_a_layernorm_eps: float,
-) -> Tuple[
+) -> tuple[
     torch.Tensor, torch.Tensor | NativeLayoutTensor, torch.Tensor | NativeLayoutTensor
 ]:  # q_nope, q_pe, kv
     assert isinstance(q_a_proj_weight, torch.Tensor)
@@ -178,7 +176,7 @@ def mla_prologue_normal_torch_npu(
     kv_a_layernorm_eps: float,  # a.k.a. rmsnorm_epsilon_ckv
     dequant_scale_q_b_proj: torch.Tensor | None = None,
     smooth_scales: torch.Tensor | None = None,
-) -> Tuple[
+) -> tuple[
     torch.Tensor, ColumnOddEvenSeparatedTensor, PartialColumnOddEvenSeparatedTensor
 ]:  # q_nope, q_pe, kv
     assert isinstance(q_a_proj_weight, NpuFractalZnTensor)

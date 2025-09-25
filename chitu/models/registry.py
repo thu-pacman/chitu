@@ -2,7 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Union
 from enum import Enum
 
 _model_registry = {}
@@ -20,7 +19,7 @@ class ModelType(str, Enum):
     LLAMA = "llama"
 
 
-def register_model(name: Union[str, ModelType]):
+def register_model(name: str | ModelType):
     def decorator(cls):
         name_str = str(name)
         if name_str in _model_registry:
@@ -31,7 +30,7 @@ def register_model(name: Union[str, ModelType]):
     return decorator
 
 
-def get_model_class(name: Union[str, ModelType]):
+def get_model_class(name: str | ModelType):
     name_str = str(name)
     model_class = _model_registry.get(name_str)
     if model_class is None:

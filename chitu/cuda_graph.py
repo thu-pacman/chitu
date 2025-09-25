@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Callable, Sequence, Mapping, Any, Optional, Dict, List
+from typing import Callable, Sequence, Mapping, Any, Optional
 import functools
 import torch
 
@@ -11,7 +11,7 @@ from chitu.device_type import is_ascend
 
 _is_warming_up_before_cuda_graph_capture = False
 _currently_capturing_graph_object = None
-_post_hook_per_graph_object: Dict[torch.cuda.CUDAGraph, List[Callable[[], None]]] = {}
+_post_hook_per_graph_object: dict[torch.cuda.CUDAGraph, list[Callable[[], None]]] = {}
 
 
 def is_warming_up_before_cuda_graph_capture():
@@ -67,11 +67,11 @@ def make_dispatched_graphed_callables(
 
     if enable:
 
-        graph_dict: Dict[Any, torch.cuda.CUDAGraph] = {}
+        graph_dict: dict[Any, torch.cuda.CUDAGraph] = {}
         cuda_graph_pool = None
 
         args_static_tensors: Optional[Sequence[StaticTensor]] = None
-        kwargs_static_tensors: Optional[Dict[str, StaticTensor]] = None
+        kwargs_static_tensors: Optional[dict[str, StaticTensor]] = None
         output_static_tensor: Optional[StaticTensor] = None
 
         output_shape_dict = {}

@@ -6,15 +6,14 @@ import argparse
 import glob
 import os
 import sys
-from typing import List
 
 ZH_FILE = os.path.join("docs", "zh", "SUPPORTED_MODELS.md")
 EN_FILE = os.path.join("docs", "en", "SUPPORTED_MODELS.md")
 
 
-def _collect_model_names() -> List[str]:
+def _collect_model_names() -> list[str]:
     config_dir = os.path.join("chitu", "config", "models")
-    names: List[str] = []
+    names: list[str] = []
     for model_file in glob.iglob(os.path.join(config_dir, "*.yaml")):
         base = os.path.basename(model_file)
         if base.endswith(".yaml"):
@@ -23,7 +22,7 @@ def _collect_model_names() -> List[str]:
     return names
 
 
-def _render_full_doc(names: List[str], lang: str) -> str:
+def _render_full_doc(names: list[str], lang: str) -> str:
     if lang == "zh":
         title = "# 支持的模型\n\n"
         intro = (
@@ -37,7 +36,7 @@ def _render_full_doc(names: List[str], lang: str) -> str:
             "To update, run: `python3 script/generate_supported_models_docs.py`.\n\n"
         )
 
-    lines: List[str] = []
+    lines: list[str] = []
     for name in names:
         if lang == "zh":
             lines.append(f"- {name}")

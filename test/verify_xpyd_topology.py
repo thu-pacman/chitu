@@ -6,12 +6,11 @@ import os
 import re
 import sys
 import time
-from typing import List, Tuple, Dict
 
 import requests
 
 
-def _format_messages(messages: List[dict]) -> str:
+def _format_messages(messages: list[dict]) -> str:
     parts = []
     for m in messages:
         if isinstance(m, dict):
@@ -23,8 +22,8 @@ def _format_messages(messages: List[dict]) -> str:
 
 
 def send_request(
-    base_url: str, model_path: str, messages: List[dict], max_tokens: int, stream: bool
-) -> Tuple[bool, str]:
+    base_url: str, model_path: str, messages: list[dict], max_tokens: int, stream: bool
+) -> tuple[bool, str]:
     url = f"{base_url.rstrip('/')}/v1/chat/completions"
     body = {
         "model": model_path,
@@ -40,7 +39,7 @@ def send_request(
                 if resp.status_code != 200:
                     return False, f"HTTP {resp.status_code}"
                 # Accumulate streamed tokens, print once per request
-                generated_chunks: List[str] = []
+                generated_chunks: list[str] = []
                 for raw in resp.iter_lines():
                     if not raw:
                         continue
@@ -90,10 +89,10 @@ def query_router_status(base_url: str) -> dict:
     return {}
 
 
-def _discover_log_files(log_dir: str) -> Tuple[Dict[int, str], Dict[int, str], str]:
+def _discover_log_files(log_dir: str) -> tuple[dict[int, str], dict[int, str], str]:
     """Recursively discover prefill*.log / decode*.log / router.log under log_dir."""
-    prefill_map: Dict[int, str] = {}
-    decode_map: Dict[int, str] = {}
+    prefill_map: dict[int, str] = {}
+    decode_map: dict[int, str] = {}
     router_log = os.path.join(log_dir, "router.log")
 
     if not os.path.isdir(log_dir):
@@ -128,9 +127,9 @@ def parse_logs(log_dir: str) -> dict:
     prefill_map, decode_map, router_log = _discover_log_files(log_dir)
 
     # Initialize counters
-    router_rr: Dict[str, int] = {}
-    prefill_ids: Dict[str, set] = {f"P{i}": set() for i in sorted(prefill_map.keys())}
-    decode_ids: Dict[str, set] = {f"D{j}": set() for j in sorted(decode_map.keys())}
+    router_rr: dict[str, int] = {}
+    prefill_ids: dict[str, set] = {f"P{i}": set() for i in sorted(prefill_map.keys())}
+    decode_ids: dict[str, set] = {f"D{j}": set() for j in sorted(decode_map.keys())}
 
     # Router routing decisions
     if os.path.exists(router_log):

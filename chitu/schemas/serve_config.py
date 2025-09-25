@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, Optional
 
 from omegaconf import MISSING
 
@@ -18,7 +18,7 @@ class ApiKey:
 class ServeAddrConfig:
     host: str = MISSING
     port: int = MISSING
-    api_keys: List[ApiKey] = MISSING
+    api_keys: list[ApiKey] = MISSING
 
 
 @dataclass
@@ -38,7 +38,7 @@ class InferConfig:
     soft_fp8: bool = MISSING  # Legacy parameter. To be removed in the future.
     fuse_shared_experts: bool = MISSING
     max_reqs: int = MISSING
-    pp_layer_partition: Optional[List[int]] = MISSING
+    pp_layer_partition: Optional[list[int]] = MISSING
     use_cuda_graph: bool = MISSING
     npu_fusion_fp4: bool = MISSING
     num_blocks: int = MISSING
@@ -131,13 +131,13 @@ class RouterConfig:
     stats_port: int = MISSING
     token_port: int = MISSING
     load_balancer_algorithm: str = MISSING
-    dp_addresses: List[DpAddressesConfig] = MISSING
+    dp_addresses: list[DpAddressesConfig] = MISSING
     # PD disaggregation configuration
     pd_disaggregation: PDDisaggregationConfig = field(
         default_factory=PDDisaggregationConfig
     )
-    prefill_schedulers: List[PrefillSchedulerConfig] = field(default_factory=list)
-    decode_schedulers: List[DecodeSchedulerConfig] = field(default_factory=list)
+    prefill_schedulers: list[PrefillSchedulerConfig] = field(default_factory=list)
+    decode_schedulers: list[DecodeSchedulerConfig] = field(default_factory=list)
 
 
 @dataclass

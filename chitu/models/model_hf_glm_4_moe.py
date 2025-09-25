@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Mapping, Any, Optional, List
+from typing import Mapping, Any, Optional
 from typing_extensions import override
 import re
 import functools
@@ -441,7 +441,7 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
         )
 
     @override
-    def _get_tensor_column_parallel_layer_names(self) -> List[str]:
+    def _get_tensor_column_parallel_layer_names(self) -> list[str]:
         return [
             "qkv_proj",
             "q_proj",
@@ -457,5 +457,5 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
         ]
 
     @override
-    def _get_tensor_row_parallel_layer_names(self) -> List[str]:
+    def _get_tensor_row_parallel_layer_names(self) -> list[str]:
         return ["down_proj", "o_proj"]

@@ -4,7 +4,7 @@
 
 import math
 from logging import getLogger
-from typing import Any, List, Mapping
+from typing import Any, Mapping
 from typing_extensions import override
 
 import torch
@@ -405,7 +405,7 @@ class TransformerHFLlama(Transformer):
             **kvargs,
         )
 
-    def _get_tensor_column_parallel_layer_names(self) -> List[str]:
+    def _get_tensor_column_parallel_layer_names(self) -> list[str]:
         ret = [
             "qkv_proj",  # new after merge_qkv
             "q_proj",  # for compatibility if not using merge_qkv
@@ -420,19 +420,19 @@ class TransformerHFLlama(Transformer):
             ret.append("lm_head")
         return ret
 
-    def _get_tensor_row_parallel_layer_names(self) -> List[str]:
+    def _get_tensor_row_parallel_layer_names(self) -> list[str]:
         return ["down_proj", "o_proj"]
 
-    def _get_pre_layer_prefixes(self) -> List[str]:
+    def _get_pre_layer_prefixes(self) -> list[str]:
         return ["embed_tokens."]
 
-    def _get_post_layer_prefixes(self) -> List[str]:
+    def _get_post_layer_prefixes(self) -> list[str]:
         if not getattr(self.params, "tie_word_embeddings", False):
             return ["lm_head.", "norm."]
         else:
             return ["embed_tokens.", "norm."]
 
-    def _get_layer_i_prefixes(self, i: int) -> List[str]:
+    def _get_layer_i_prefixes(self, i: int) -> list[str]:
         return [f"layers.{i}."]
 
     def _process_state_dict_for_splitting_qkv(self, checkpoint: Mapping[str, Any]):

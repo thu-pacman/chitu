@@ -10,7 +10,7 @@ Extends the original RequestRouter to support Prefill-Decode disaggregation
 import asyncio
 import logging
 import time
-from typing import Dict, Optional
+from typing import Optional
 
 import zmq
 import msgpack
@@ -46,9 +46,9 @@ class PDRequestRouter(RequestRouter):
             logger.info("pd disaggregation enabled")
 
             # PD disaggregation related state
-            self.pending_pd_requests: Dict[str, PendingPDRequest] = {}
-            self.prefill_schedulers: Dict[int, Dict] = {}  # scheduler_id -> info
-            self.decode_schedulers: Dict[int, Dict] = {}  # scheduler_id -> info
+            self.pending_pd_requests: dict[str, PendingPDRequest] = {}
+            self.prefill_schedulers: dict[int, dict] = {}  # scheduler_id -> info
+            self.decode_schedulers: dict[int, dict] = {}  # scheduler_id -> info
 
             # Load-balancing counters
             self.prefill_round_robin = 0
@@ -522,7 +522,7 @@ class PDRequestRouter(RequestRouter):
                     pd_request.status = PDRequestStatus.FAILED
                     pd_request.error_message = "request timeout"
 
-    def get_performance_stats(self) -> Dict:
+    def get_performance_stats(self) -> dict:
         """Get performance statistics"""
         stats = super().get_performance_stats()
 

@@ -22,7 +22,6 @@ import json
 import argparse
 import traceback
 import numpy as np
-from typing import List
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -105,7 +104,7 @@ class BenchmarkServing:
         """
         self.config = config
         self.base_url = base_url
-        self.results: List[BenchmarkResult] = []
+        self.results: list[BenchmarkResult] = []
         self.current_run_metrics = {}
         self.example = "This is a test message for benchmark serving "
         self.single_len = self._get_single_len()

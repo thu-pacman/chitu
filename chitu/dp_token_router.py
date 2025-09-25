@@ -10,7 +10,7 @@ Responsible for receiving tokens returned from each DP group and forwarding them
 import asyncio
 import time
 from collections import defaultdict, deque
-from typing import Dict, Any
+from typing import Any
 import zmq
 import zmq.asyncio
 import msgpack
@@ -32,17 +32,17 @@ class TokenRouter:
         self.context = zmq.asyncio.Context()
 
         # Store active request connection mappings
-        self.active_requests: Dict[str, RequestContext] = {}
+        self.active_requests: dict[str, RequestContext] = {}
 
         # Socket(s) for receiving tokens from DP groups
         self.token_receiver = None  # legacy single-socket mode
-        self.token_receivers: Dict[int, zmq.asyncio.Socket] = {}
+        self.token_receivers: dict[int, zmq.asyncio.Socket] = {}
 
         # Performance statistics
         self.total_tokens_received = 0
         self.start_time = time.time()
         self._last_stats_log_ts = time.time()
-        self._per_dp_tokens: Dict[int, int] = defaultdict(
+        self._per_dp_tokens: dict[int, int] = defaultdict(
             int
         )  # dp_id -> tokens in window
 
@@ -167,7 +167,7 @@ class TokenRouter:
                 logger.error(f"Error in token receiver[{dp_id}]: {e}")
                 await asyncio.sleep(0.01)
 
-    async def _process_token_data(self, token_data: Dict[str, Any]):
+    async def _process_token_data(self, token_data: dict[str, Any]):
         """Process received token data"""
         request_id = token_data.get("request_id")
 

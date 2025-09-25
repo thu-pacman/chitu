@@ -2,7 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Tuple
 import struct
 import functools
 
@@ -29,7 +28,7 @@ deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 @auto_retry_triton_compilation
 def blockfp8_act_quant_triton(
     x: torch.Tensor, block_size: int = 128
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantizes the input tensor `x` using block-wise quantization.
 
@@ -38,7 +37,7 @@ def blockfp8_act_quant_triton(
         block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+        tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - The quantized tensor with dtype `torch.float8_e4m3fn`.
             - A tensor of scaling factors with dtype `torch.float32`.
     """
@@ -87,7 +86,7 @@ def blockfp8_act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
 @auto_retry_triton_compilation
 def silu_and_mul_and_blockfp8_act_quant_triton(
     x: torch.Tensor, block_size: int = 128
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     assert x.is_contiguous(), "Input tensor must be contiguous"
     assert (
         x.size(-1) % (2 * block_size) == 0

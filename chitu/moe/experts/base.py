@@ -4,7 +4,7 @@
 
 import torch
 
-from typing import List, Optional
+from typing import Optional
 
 from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivation,
@@ -57,7 +57,7 @@ def fused_experts_wrapper(
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[List[int]] = None,
+    block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
     tokens_per_expert: Optional[torch.Tensor] = None,

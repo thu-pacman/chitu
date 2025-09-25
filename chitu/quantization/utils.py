@@ -3,13 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import re
-from typing import Optional, List, Dict, Any
+from typing import Optional, Any
 from chitu.global_vars import get_global_args
 
 
 def get_quant_kwargs_from_checkpoint_prefix(
     checkpoint_prefix: str, rules: Optional[list] = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if not rules:
         rules = get_global_args().models.quant_config.rules
 
@@ -68,7 +68,7 @@ def get_backend_from_checkpoint_prefix(checkpoint_prefix: str, rules={}) -> str:
     return "default"
 
 
-def collect_layers_by_type(type_list: List[str], rules) -> List[int]:
+def collect_layers_by_type(type_list: list[str], rules) -> list[int]:
     layer_set = set()
     for rule in rules:
         if rule.get("type") in type_list:

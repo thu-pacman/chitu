@@ -14,7 +14,7 @@ from datetime import datetime
 from enum import Enum
 from logging import getLogger
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional, Mapping
+from typing import Any, ClassVar, Optional, Mapping
 from typing_extensions import override
 
 import torch
@@ -524,8 +524,8 @@ def req_decode(id_num: int):
 
 
 class TaskPool:
-    pool: Dict[str, Task] = {}
-    id_list: List[str] = []
+    pool: dict[str, Task] = {}
+    id_list: list[str] = []
 
     def __bool__(self):
         return len(self.pool) > 0
@@ -624,15 +624,15 @@ class PackedTasksBase:
 
     # Object fields
     num_tasks: int = 0
-    task_ids: List[str] = field(default_factory=list)
-    req_ids: List[str] = field(default_factory=list)
+    task_ids: list[str] = field(default_factory=list)
+    req_ids: list[str] = field(default_factory=list)
     task_type: Optional[TaskType] = None
-    tokens: List[List[int]] = field(default_factory=list)
+    tokens: list[list[int]] = field(default_factory=list)
     payload_type: SerializedPackedTasksPayloadType = (
         SerializedPackedTasksPayloadType.NoneType
     )
     num_tokens: int = 0
-    has_outputs: List[int] = field(default_factory=list)
+    has_outputs: list[int] = field(default_factory=list)
     response_list_manager = None
 
     @classmethod
@@ -772,10 +772,10 @@ class PackedTasksBase:
 
 
 class PackedTasks(PackedTasksBase):
-    def __init__(self, task_ids: List[str], rank="cuda"):
+    def __init__(self, task_ids: list[str], rank="cuda"):
         super().__init__()
 
-        self.tasks: List[Task] = [TaskPool.pool[tid] for tid in task_ids]
+        self.tasks: list[Task] = [TaskPool.pool[tid] for tid in task_ids]
         self.output_tasks = [task for task in self.tasks if task.has_output()]
         self.should_apply_frequency_penalty = any(
             task.params.frequency_penalty > 0 for task in self.output_tasks
@@ -900,10 +900,10 @@ class DPTaskCollector:
     """
 
     _total_packedtasks: PackedTasks = None
-    _task_ids_list: List[List[str]] = []
+    _task_ids_list: list[list[str]] = []
 
     @staticmethod
-    def prepare_dp_tasks(task_ids_list: List[List[str]]):
+    def prepare_dp_tasks(task_ids_list: list[list[str]]):
         DPTaskCollector._task_ids_list = task_ids_list
         DPTaskCollector._total_packedtasks = PackedTasks(
             [task_id for task_ids in task_ids_list for task_id in task_ids]

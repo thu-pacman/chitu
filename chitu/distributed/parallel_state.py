@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-from typing import Optional, Dict, Tuple, Any
+from typing import Optional, Any
 
 import torch
 from logging import getLogger
@@ -22,7 +22,7 @@ _PP_GROUP: Optional[CommGroup] = None
 _DP_GROUP: Optional[CommGroup] = None
 _EP_GROUP: Optional[CommGroup] = None
 
-_PP_PAIR_GROUP_DICT: Dict[Tuple[int, int], Any] = {}  # Compatible with NPU platforms
+_PP_PAIR_GROUP_DICT: dict[tuple[int, int], Any] = {}  # Compatible with NPU platforms
 
 
 def get_global_var(name):

@@ -6,7 +6,7 @@ import asyncio
 import threading
 from datetime import datetime
 from logging import getLogger
-from typing import List, Optional
+from typing import Optional
 
 from pydantic import BaseModel
 
@@ -26,10 +26,10 @@ class ChatCompletionResponse(BaseModel):
 class AsyncDataStream:
     def __init__(self, enable_reasoning: bool = True):
         self.tokenizer = Backend.tokenizer
-        self.seqs: List[str] = []
+        self.seqs: list[str] = []
         self.tokens_len: int = 0
         self.chars_len: int = 0
-        self.cache_tokens: List[int] = []
+        self.cache_tokens: list[int] = []
         self.stop_signal = False
         self.lock = threading.Lock()
         self.data_event = asyncio.Event()

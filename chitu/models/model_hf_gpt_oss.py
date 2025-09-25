@@ -6,7 +6,7 @@ import functools
 import re
 import torch
 from torch import nn
-from typing import Any, List, Mapping, Optional
+from typing import Any, Mapping, Optional
 from typing_extensions import override
 
 from chitu.attn_backend import AttnBackend
@@ -359,12 +359,12 @@ class TransformerHFGptOss(TransformerHFLlama):
             **kvargs,
         )
 
-    def _get_1d_out_tensor_names(self, quant) -> List[str]:
+    def _get_1d_out_tensor_names(self, quant) -> list[str]:
         return super()._get_1d_out_tensor_names(quant) + [
             "sinks",
         ]
 
-    def _get_tensor_column_parallel_layer_names(self) -> List[str]:
+    def _get_tensor_column_parallel_layer_names(self) -> list[str]:
         return super()._get_tensor_column_parallel_layer_names() + [
             "sinks",
         ]

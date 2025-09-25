@@ -2,8 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Tuple
-
 import torch
 
 from chitu.quantization.registry import QuantizationRegistry
@@ -89,7 +87,7 @@ def marlin_make_workspace(
     )
 
 
-def marlin_sort_g_idx(g_idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def marlin_sort_g_idx(g_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     g_idx_sort_indices = torch.argsort(g_idx).to(torch.int)
     return g_idx[g_idx_sort_indices], g_idx_sort_indices
 
@@ -124,10 +122,10 @@ def marlin_permute_scales(
 
 
 def get_scale_perms():
-    scale_perm: List[int] = []
+    scale_perm: list[int] = []
     for i in range(8):
         scale_perm.extend([i + 8 * j for j in range(8)])
-    scale_perm_single: List[int] = []
+    scale_perm_single: list[int] = []
     for i in range(4):
         scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
     return scale_perm, scale_perm_single

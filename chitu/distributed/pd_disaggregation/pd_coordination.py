@@ -9,7 +9,6 @@ Responsible for metadata synchronization and coordination between Prefill (P) an
 
 import asyncio
 import logging
-from typing import Dict
 
 import zmq
 import zmq.asyncio
@@ -36,12 +35,12 @@ class PDCoordinationService:
         self.metadata_sync_port = metadata_sync_port
 
         # State management
-        self.pd_pairs: Dict[str, PDPairInfo] = {}  # request_id -> PDPairInfo
-        self.kv_transfer_metadata: Dict[str, KVTransferMetadata] = (
+        self.pd_pairs: dict[str, PDPairInfo] = {}  # request_id -> PDPairInfo
+        self.kv_transfer_metadata: dict[str, KVTransferMetadata] = (
             {}
         )  # request_id -> metadata
-        self.prefill_schedulers: Dict[int, SchedulerInfo] = {}  # scheduler_id -> info
-        self.decode_schedulers: Dict[int, SchedulerInfo] = {}  # scheduler_id -> info
+        self.prefill_schedulers: dict[int, SchedulerInfo] = {}  # scheduler_id -> info
+        self.decode_schedulers: dict[int, SchedulerInfo] = {}  # scheduler_id -> info
 
         # ZMQ related
         self.context = zmq.asyncio.Context()
@@ -138,7 +137,7 @@ class PDCoordinationService:
             logger.info(f"registered decode scheduler: {scheduler_id} at {host}:{port}")
 
     async def handle_prefill_complete(
-        self, request_id: str, prefill_scheduler_id: int, kv_metadata: Dict
+        self, request_id: str, prefill_scheduler_id: int, kv_metadata: dict
     ):
         """Handle Prefill-complete notification"""
         if request_id not in self.pd_pairs:
@@ -172,7 +171,7 @@ class PDCoordinationService:
         )
 
     async def handle_kv_transfer_ready(
-        self, request_id: str, prefill_info: Dict, decode_info: Dict
+        self, request_id: str, prefill_info: dict, decode_info: dict
     ):
         """Handle KV transfer ready notification"""
         if request_id not in self.pd_pairs:
@@ -266,7 +265,7 @@ class PDCoordinationService:
         except Exception as e:
             logger.error(f"failed to process coordination message: {e}")
 
-    async def _process_metadata_request(self, request_data: Dict) -> Dict:
+    async def _process_metadata_request(self, request_data: dict) -> dict:
         """Process metadata request"""
         request_type = request_data.get("type")
 
@@ -343,7 +342,7 @@ class PDCoordinationService:
             f"notifying decode scheduler {decode_scheduler_id} to prepare for kv cache: {metadata.request_id}"
         )
 
-    def get_pd_stats(self) -> Dict:
+    def get_pd_stats(self) -> dict:
         """Get PD disaggregation statistics"""
         stats = {
             "total_pairs": len(self.pd_pairs),

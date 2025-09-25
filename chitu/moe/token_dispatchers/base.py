@@ -8,7 +8,7 @@
 import torch
 
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple
+from typing import Optional
 
 
 class MoETokenDispatcher(ABC):
@@ -20,7 +20,7 @@ class MoETokenDispatcher(ABC):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         layer_id: int = None,
-    ) -> Tuple[
+    ) -> tuple[
         torch.Tensor,
         Optional[torch.Tensor],
         Optional[torch.Tensor],

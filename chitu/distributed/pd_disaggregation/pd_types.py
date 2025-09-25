@@ -9,7 +9,7 @@ Data types and enum definitions for PD disaggregation
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 import torch
 
@@ -96,7 +96,7 @@ class PrefillCompleteMessage:
     prefill_scheduler_id: int
     decode_scheduler_id: int
     first_token_logits: Optional[torch.Tensor] = None
-    kv_transfer_metadata: Optional[Dict[str, Any]] = None
+    kv_transfer_metadata: Optional[dict[str, Any]] = None
     timestamp: float = field(default_factory=time.time)
 
 
@@ -105,8 +105,8 @@ class DecodeReadyMessage:
     """Decode ready message"""
 
     request_id: str
-    prefill_scheduler_info: Dict[str, Any]
-    kv_transfer_metadata: Dict[str, Any]
+    prefill_scheduler_info: dict[str, Any]
+    kv_transfer_metadata: dict[str, Any]
     timestamp: float = field(default_factory=time.time)
 
 
@@ -118,7 +118,7 @@ class PDCoordinationMessage:
     request_id: str
     sender_type: SchedulerType
     sender_id: int
-    payload: Dict[str, Any] = field(default_factory=dict)
+    payload: dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
 
 
@@ -131,7 +131,7 @@ class SchedulerInfo:
     host: str
     port: int
     status: str = "online"  # online, offline, busy
-    load_info: Dict[str, Any] = field(default_factory=dict)
+    load_info: dict[str, Any] = field(default_factory=dict)
     last_heartbeat: float = field(default_factory=time.time)
 
 
@@ -156,9 +156,9 @@ class BatchInfo:
     """Batch information"""
 
     batch_id: str
-    request_ids: List[str]
+    request_ids: list[str]
     prefill_scheduler_id: int
-    decode_scheduler_ids: List[int]  # might be dispatched to multiple decode schedulers
+    decode_scheduler_ids: list[int]  # might be dispatched to multiple decode schedulers
     batch_size: int
     total_tokens: int
     created_time: float = field(default_factory=time.time)

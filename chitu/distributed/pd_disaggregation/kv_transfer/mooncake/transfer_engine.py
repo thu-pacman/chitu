@@ -6,7 +6,6 @@ from typing import Optional
 import logging
 import asyncio
 import threading
-from typing import Dict, Union
 import os
 from chitu.device_type import is_ascend
 
@@ -162,7 +161,7 @@ class MooncakeBootstrapServer:
     def __init__(self, port: int):
         self.port = port
         self.dp_size = 1  # fallback for 1P1D; can be extended to config-driven
-        self.prefill_port_table: Dict[int, Dict[str, Union[str, int]]] = {}
+        self.prefill_port_table: dict[int, dict[str, str | int]] = {}
         self._loop = None
         self._runner = None
         self._lock = threading.Lock()

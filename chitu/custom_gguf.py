@@ -19,7 +19,7 @@ import warnings
 import numpy as np
 import re
 import numpy.typing as npt
-from typing import Sequence, Tuple, Dict, Any, Callable
+from typing import Sequence, Any, Callable
 import os
 from enum import IntEnum
 import torch
@@ -79,7 +79,7 @@ def get_ggml_quant_type(tensor: torch.Tensor) -> GGMLQuantizationType:
 
 
 QK_K = 256
-GGML_QUANT_SIZES: Dict[GGMLQuantizationType, Tuple[int, int]] = {
+GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.F32: (1, 4),
     GGMLQuantizationType.F16: (1, 2),
     GGMLQuantizationType.Q4_0: (32, 2 + 16),
@@ -205,7 +205,7 @@ class GGUFLoader:
         self.tensor_info = {}
         self.gguf_path = gguf_path
         self.tensor_file_map = {}
-        self.file_data_map: Dict[str, Any] = {}
+        self.file_data_map: dict[str, Any] = {}
         self.gguf_file_meta = {}
 
         # I know this is ugly, but I don't want to change the original code too much
@@ -1084,7 +1084,7 @@ def dequantize_bf16_gpu(data, device, target_dtype=torch.get_default_dtype()):
     return res_gpu
 
 
-GGML_DEQUANTIZE: Dict[str, Callable] = {
+GGML_DEQUANTIZE: dict[str, Callable] = {
     "F32": dequantize_f32,
     "F16": dequantize_f16,
     "BF16": dequantize_f16,
@@ -1099,7 +1099,7 @@ GGML_DEQUANTIZE: Dict[str, Callable] = {
     "IQ4_XS": dequantize_iq4_xs,
 }
 
-GGML_DEQUANTIZE_GPU: Dict[str, Callable] = {
+GGML_DEQUANTIZE_GPU: dict[str, Callable] = {
     "F32": dequantize_f32_gpu,
     "F16": dequantize_f16_gpu,
     "BF16": dequantize_bf16_gpu,

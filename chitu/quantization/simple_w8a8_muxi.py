@@ -2,7 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Tuple
 import torch
 
 from chitu.quantization.registry import QuantizationRegistry
@@ -72,7 +71,7 @@ class W8A8MuxiLinear(QuantizedLinearBase):
         if x.dtype != torch.float16:
             x = x.to(torch.float16)
 
-        if isinstance(x, Tuple):
+        if isinstance(x, tuple):
             q_x = x[0]
             act_scale = x[1]
             if q_x.dim() == 2:

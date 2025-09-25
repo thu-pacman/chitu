@@ -13,7 +13,7 @@ import struct
 import threading
 import time
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Optional
 from uuid import UUID, uuid5, NAMESPACE_DNS
 import dataclasses
 
@@ -77,7 +77,7 @@ class KVArgsRegisterInfo:
     dst_aux_ptr: int
 
     @classmethod
-    def from_zmq(cls, msg: List[bytes]):
+    def from_zmq(cls, msg: list[bytes]):
         return cls(
             room=UUID(bytes=msg[0]),
             endpoint=msg[1].decode("ascii"),
@@ -100,7 +100,7 @@ class TransferInfo:
     dst_aux_index: int
 
     @classmethod
-    def from_zmq(cls, msg: List[bytes]):
+    def from_zmq(cls, msg: list[bytes]):
         dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
         dst_aux_index = int(msg[5].decode("ascii"))
         return cls(
@@ -140,7 +140,7 @@ class KVManager:
         except Exception:
             self.dp_id = 0
         # per-request 目标 prefill engine_rank（由 Decode Scheduler 注入）
-        self.prefill_target_rank_by_room: Dict[UUID, int] = {}
+        self.prefill_target_rank_by_room: dict[UUID, int] = {}
 
         # Get PD disaggregation config
         pd_config = (
@@ -161,7 +161,7 @@ class KVManager:
         self.zmq_ctx = zmq.Context.instance()
         self.server_socket = self.zmq_ctx.socket(zmq.PULL)
         self.bootstrap_port = bootstrap_port
-        self.request_status: Dict[UUID, KVPoll] = {}
+        self.request_status: dict[UUID, KVPoll] = {}
 
         # Register buffers to transfer engine (defer until cache_manager is set)
         self._registered_ptrs = set()
@@ -200,8 +200,8 @@ class KVManager:
         logger.info("initializing kv manager in prefill mode")
 
         # Prefill mode state
-        self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
-        self.transfer_infos: Dict[UUID, TransferInfo] = {}
+        self.decode_kv_args_table: dict[str, KVArgsRegisterInfo] = {}
+        self.transfer_infos: dict[UUID, TransferInfo] = {}
 
         # Start communication thread
         self.start_prefill_thread()
@@ -231,8 +231,8 @@ class KVManager:
         logger.info("initializing kv manager in decode mode")
 
         # Decode mode state
-        self.prefill_dp_size_table: Dict[str, int] = {}
-        self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
+        self.prefill_dp_size_table: dict[str, int] = {}
+        self.connection_pool: dict[str, dict[str, str | int]] = {}
 
         # Start communication thread
         self.start_decode_thread()
@@ -383,9 +383,7 @@ class KVManager:
         threading.Thread(target=decode_thread, daemon=True).start()
         logger.info(f"started decode communication thread on port {self.rank_port}")
 
-    def _get_bootstrap_info(
-        self, engine_rank: int
-    ) -> Optional[Dict[str, Union[str, int]]]:
+    def _get_bootstrap_info(self, engine_rank: int) -> Optional[dict[str, str | int]]:
         """Fetch prefill endpoint info from bootstrap server"""
         ip_address = os.environ.get("PD_MASTER_ADDR", None)
         if ip_address is None:
@@ -410,11 +408,11 @@ class KVManager:
             logger.debug(f"bootstrap GET error: {e}")
             return None
 
-    def _discover_prefill_engine_ranks(self, max_probe: int = 64) -> List[int]:
+    def _discover_prefill_engine_ranks(self, max_probe: int = 64) -> list[int]:
         """Discover available prefill engine_ranks by probing bootstrap sequentially.
         Stops after several consecutive misses to avoid long delays.
         """
-        found: List[int] = []
+        found: list[int] = []
         consecutive_misses = 0
         for er in range(max_probe):
             info = self._get_bootstrap_info(engine_rank=er)
@@ -428,10 +426,10 @@ class KVManager:
         return found
 
     @staticmethod
-    def _pack_ptrs(ptr_list: List[int]) -> bytes:
+    def _pack_ptrs(ptr_list: list[int]) -> bytes:
         return b"".join(struct.pack("Q", int(p)) for p in ptr_list)
 
-    def _send_zmq_to_prefill(self, endpoint: str, parts: List[bytes]):
+    def _send_zmq_to_prefill(self, endpoint: str, parts: list[bytes]):
         sock = self.zmq_ctx.socket(zmq.PUSH)
         try:
             sock.connect(endpoint)
@@ -667,7 +665,7 @@ class KVManager:
             )
 
     def send_kv_cache(
-        self, logits: torch.Tensor, request_ids: List[str], cache_manager
+        self, logits: torch.Tensor, request_ids: list[str], cache_manager
     ):
         """Send KV cache for multiple requests (Prefill mode)"""
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
@@ -716,7 +714,7 @@ class KVManager:
         )
 
     def recv_kv_cache_and_insert(
-        self, request_ids: List[str], cache_manager
+        self, request_ids: list[str], cache_manager
     ) -> torch.Tensor:
         """Receive KV cache and insert to cache manager (Decode mode)"""
         if self.disaggregation_mode != DisaggregationMode.DECODE:
@@ -759,7 +757,7 @@ class KVManager:
 
         # Allocate aux buffer slots to receive logits and pre-reserve dst kv indices
         aux_indices = []
-        room_ids: List[UUID] = []
+        room_ids: list[UUID] = []
         for request_id in request_ids:
             room = self._to_uuid(request_id)
             aux_index = self.metadata_buffers.allocate(room)

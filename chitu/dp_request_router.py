@@ -13,7 +13,6 @@ import logging
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Dict, List
 from chitu.global_vars import get_global_args
 import zmq
 import zmq.asyncio
@@ -47,7 +46,7 @@ class LoadBalancer:
     def __init__(self, config: ServeRouterConfig):
         self.config = config
         self.round_robin_counter = 0
-        self.scheduler_stats: Dict[int, SchedulerStats] = {}
+        self.scheduler_stats: dict[int, SchedulerStats] = {}
         # admission control: per-scheduler running_requests cap
         self.max_inflight_per_scheduler = max(
             1, int(os.getenv("ROUTER_MAX_INFLIGHT_PER_SCHED", "24"))
@@ -240,7 +239,7 @@ class RequestRouter:
         self.request_stats = defaultdict(lambda: {"start_time": 0.0, "tokens": 0})
 
         # Resolve scheduler addresses from config
-        self._scheduler_addresses: List[str] = []
+        self._scheduler_addresses: list[str] = []
         try:
             if hasattr(self.config, "dp_addresses") and self.config.dp_addresses:
                 self._scheduler_addresses = [
@@ -265,7 +264,7 @@ class RequestRouter:
             )
 
     @property
-    def scheduler_addresses(self) -> List[str]:
+    def scheduler_addresses(self) -> list[str]:
         return self._scheduler_addresses
 
     async def start(self):
@@ -546,7 +545,7 @@ class RequestRouter:
             f"Added request {request.request_id} to queue (queue size: {len(self.pending_requests)})"
         )
 
-    def get_performance_stats(self) -> Dict:
+    def get_performance_stats(self) -> dict:
         """Get current performance statistics."""
         current_time = time.time()
         elapsed_time = current_time - self.start_time
