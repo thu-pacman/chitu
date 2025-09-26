@@ -17,6 +17,7 @@ class ModelType(str, Enum):
     HF_GPT_OSS = "hf-gpt-oss"
     HF_MIXTRAL = "hf-mixtral"
     LLAMA = "llama"
+    HF_QWEN3_NEXT = "hf-qwen3-next"
 
 
 def register_model(name: str | ModelType):

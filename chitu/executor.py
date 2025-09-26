@@ -16,7 +16,7 @@ import torch
 import torch.distributed
 
 from chitu.backend import Backend, BackendState
-from chitu.global_vars import get_timers
+from chitu.global_vars import get_global_args, get_timers
 from chitu.task import (
     PackedTasks,
     PackedTasksBase,
@@ -599,6 +599,8 @@ class Executor:
             # Delete item from KV cache
             for rid in tasks.req_ids:
                 Backend.cache_manager.finalize_cache_all_decode(rid)
+                if get_global_args().models.type == "hf-qwen3-next":
+                    Backend.linear_attn_cache_manager.finalize_cache_all_decode(rid)
             return None
 
         if self.moe_impl is not None:
@@ -649,6 +651,10 @@ class Executor:
         Backend.cache_manager.prepare_cache_prefill(
             tasks.req_ids, [len(t) for t in tasks.tokens]
         )
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.prepare_cache_prefill(
+                tasks.req_ids, [len(t) for t in tasks.tokens]
+            )
 
         num_tokens = tasks.num_tokens
 
@@ -698,6 +704,8 @@ class Executor:
             dispatcher.send_payload(out)
 
         Backend.cache_manager.finalize_cache_all_prefill()  # like reset metadata
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.finalize_cache_all_prefill()
         return out
 
     def prefill_step_tp_only(self, tasks: PackedTasksBase) -> torch.Tensor:
@@ -715,6 +723,10 @@ class Executor:
         Backend.cache_manager.prepare_cache_prefill(
             tasks.req_ids, [len(t) for t in tasks.tokens]
         )
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.prepare_cache_prefill(
+                tasks.req_ids, [len(t) for t in tasks.tokens]
+            )
 
         # 3) prepare payload on TP main rank only
         num_tokens = tasks.num_tokens
@@ -761,7 +773,8 @@ class Executor:
 
         # 6) finalize cache
         Backend.cache_manager.finalize_cache_all_prefill()
-
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.finalize_cache_all_prefill()
         # 7) ensure logits are [B, vocab]
         if out.dim() == 1:
             out = out.view(1, -1)
@@ -780,6 +793,8 @@ class Executor:
         """
         # 1) prepare cache and seq lens
         Backend.cache_manager.prepare_cache_decode(req_ids)
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.prepare_cache_decode(req_ids)
         try:
             self._kv_hook.before_decode_step(req_ids)
         except Exception:
@@ -811,11 +826,14 @@ class Executor:
 
         # 5) finalize cache for this step
         Backend.cache_manager.finalize_cache_single_decode(req_ids)
-
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.finalize_cache_single_decode(req_ids)
         return out
 
     def decode_step(self, tasks: PackedTasksBase):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.prepare_cache_decode(tasks.req_ids)
         # Ensure KV cache is present for PD decode-only before running decode.
         try:
             self._kv_hook.before_decode_step(tasks.req_ids)
@@ -850,6 +868,10 @@ class Executor:
         Backend.cache_manager.finalize_cache_single_decode(
             tasks.req_ids
         )  # update seq_len and reset block table
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.finalize_cache_single_decode(
+                tasks.req_ids
+            )
         return out
 
     def empty_prefill_step(self):

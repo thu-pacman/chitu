@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Sequence, Optional, Callable
+from typing import Sequence, Optional, Callable, Dict
 from typing_extensions import override
 from dataclasses import dataclass
 from logging import getLogger
@@ -36,6 +36,7 @@ class PagedKVCacheAccessor(KVCacheAccessor):
     v: Optional[torch.Tensor]
     get_page_ids: Optional[Callable[[], torch.Tensor]] = None
     get_offs_in_page: Optional[Callable[[], torch.Tensor]] = None
+    add: Optional[Dict[str, torch.Tensor]] = None
 
 
 @dataclass
@@ -58,6 +59,9 @@ class KVCacheManagerBase:
         n_local_kv_heads: Optional[int] = None,
         head_dim: Optional[int] = None,
         device="cuda",
+        additional_cache_shape_dict: Optional[
+            Dict[str, torch.Size | Sequence[int]]
+        ] = None,
     ):
         """
         Base class for KV cache managers
@@ -79,33 +83,39 @@ class KVCacheManagerBase:
 
         self.k_shape_per_sample: Optional[torch.Size | Sequence[int]]
         self.v_shape_per_sample: Optional[torch.Size | Sequence[int]]
-        if kv_shape_per_sample is None:
-            if k_shape_per_sample is not None:
-                self.k_shape_per_sample = k_shape_per_sample
+        if additional_cache_shape_dict is None:
+            if kv_shape_per_sample is None:
+                if k_shape_per_sample is not None:
+                    self.k_shape_per_sample = k_shape_per_sample
+                else:
+                    if n_local_kv_heads is None:
+                        raise ValueError(
+                            "`n_local_kv_heads` must be set if both `kv_shape_per_sample` and `k_shape_per_sample` are None"
+                        )
+                    if head_dim is None:
+                        raise ValueError(
+                            "`head_dim` must be set if both `kv_shape_per_sample` and `k_shape_per_sample` are None"
+                        )
+                    self.k_shape_per_sample = (n_local_kv_heads, head_dim)
+                if v_shape_per_sample is not None:
+                    self.v_shape_per_sample = v_shape_per_sample
+                else:
+                    if n_local_kv_heads is None:
+                        raise ValueError(
+                            "`n_local_kv_heads` must be set if both `kv_shape_per_sample` and `k_shape_per_sample` are None"
+                        )
+                    if head_dim is None:
+                        raise ValueError(
+                            "`head_dim` must be set if both `kv_shape_per_sample` and `k_shape_per_sample` are None"
+                        )
+                    self.v_shape_per_sample = (n_local_kv_heads, head_dim)
             else:
-                if n_local_kv_heads is None:
-                    raise ValueError(
-                        "`n_local_kv_heads` must be set if both `kv_shape_per_sample` and `k_shape_per_sample` are None"
-                    )
-                if head_dim is None:
-                    raise ValueError(
-                        "`head_dim` must be set if both `kv_shape_per_sample` and `k_shape_per_sample` are None"
-                    )
-                self.k_shape_per_sample = (n_local_kv_heads, head_dim)
-            if v_shape_per_sample is not None:
-                self.v_shape_per_sample = v_shape_per_sample
-            else:
-                if n_local_kv_heads is None:
-                    raise ValueError(
-                        "`n_local_kv_heads` must be set if both `kv_shape_per_sample` and `k_shape_per_sample` are None"
-                    )
-                if head_dim is None:
-                    raise ValueError(
-                        "`head_dim` must be set if both `kv_shape_per_sample` and `k_shape_per_sample` are None"
-                    )
-                self.v_shape_per_sample = (n_local_kv_heads, head_dim)
+                self.k_shape_per_sample = kv_shape_per_sample
+                self.v_shape_per_sample = None
+            self.additional_cache_shape_dict = None
         else:
-            self.k_shape_per_sample = kv_shape_per_sample
+            self.additional_cache_shape_dict = additional_cache_shape_dict
+            self.k_shape_per_sample = None
             self.v_shape_per_sample = None
 
         self.req_id_to_seq_len: dict[str, int] = {}
@@ -230,6 +240,10 @@ class PagedKVCacheManager(KVCacheManagerBase):
         device="cuda",
         block_size: int = 512,  # must be a multiple of 256 for FlashAttention
         num_blocks: int = -1,
+        additional_cache_shape_dict: Optional[
+            Dict[str, torch.Size | Sequence[int]]
+        ] = None,
+        lazy_mode=False,
     ):
         """
         Paged KV cache manager
@@ -251,6 +265,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
             n_local_kv_heads=n_local_kv_heads,
             head_dim=head_dim,
             device=device,
+            additional_cache_shape_dict=additional_cache_shape_dict,
         )
 
         self.max_blocks_per_req = ceil_div(max_seq_len, block_size)
@@ -297,6 +312,16 @@ class PagedKVCacheManager(KVCacheManagerBase):
         else:
             self.paged_v_cache = None
 
+        if self.additional_cache_shape_dict is not None:
+            self.additional_paged_cache = {}
+            for key, value in self.additional_cache_shape_dict.items():
+                self.additional_paged_cache[key] = torch.zeros(
+                    (self.num_layers, self.num_blocks, block_size) + tuple(value),
+                    device=device,
+                )
+        else:
+            self.additional_paged_cache = None
+
         self._page_ids_static_tensor = StaticTensor(
             max_nelem=self.max_total_delta_len, device=device, dtype=torch.int32
         )
@@ -305,6 +330,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         )
         self._page_ids_up_to_date = False
         self._offs_in_page_up_to_date = False
+        self.lazy_mode = lazy_mode
 
     def get_max_blocks_per_req(self) -> int:
         """Return the maximum number of blocks a single request can occupy."""
@@ -336,6 +362,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.free_blocks = deque(range(self.num_blocks))
         has_k_cache = self.paged_k_cache is not None
         has_v_cache = self.paged_v_cache is not None
+        has_additional_cache = self.additional_paged_cache is not None
         if has_k_cache:
             del self.paged_k_cache
             self.paged_k_cache = torch.zeros(
@@ -350,6 +377,13 @@ class PagedKVCacheManager(KVCacheManagerBase):
                 + self.v_shape_per_sample,
                 device=self.device,
             )
+        if has_additional_cache:
+            self.additional_paged_cache.clear()
+            for key, value in self.additional_cache_shape_dict.items():
+                self.additional_paged_cache[key] = torch.zeros(
+                    (self.num_layers, self.num_blocks, self.block_size) + tuple(value),
+                    device=self.device,
+                )
 
     @override
     def get_block_size(self):
@@ -419,8 +453,11 @@ class PagedKVCacheManager(KVCacheManagerBase):
                 self.block_table[req_id] = []
 
             # Allocate blocks for the request
-            while len(self.block_table[req_id]) * self.block_size < new_seq_len:
+            if self.lazy_mode:
                 self.block_table[req_id].append(self.get_free_block())
+            else:
+                while len(self.block_table[req_id]) * self.block_size < new_seq_len:
+                    self.block_table[req_id].append(self.get_free_block())
 
         self._upd_gpu_block_table(req_ids)
 
@@ -435,9 +472,10 @@ class PagedKVCacheManager(KVCacheManagerBase):
     def prepare_cache_decode(self, req_ids: list[str]):
         # Prepare enough block table for next decoding. When decoding, AttnBackend will fill new kv into
         # paged kv cache in place.
-        for i, req_id in enumerate(req_ids):
-            if self.is_block_full_for_req(req_id):
-                self.block_table[req_id].append(self.get_free_block())
+        if not self.lazy_mode:
+            for i, req_id in enumerate(req_ids):
+                if self.is_block_full_for_req(req_id):
+                    self.block_table[req_id].append(self.get_free_block())
 
         super().prepare_cache_decode(req_ids)
         self._upd_gpu_block_table(req_ids)
@@ -468,12 +506,20 @@ class PagedKVCacheManager(KVCacheManagerBase):
             if self.paged_v_cache is not None
             else None
         )
+        if self.additional_paged_cache is not None:
+            ret_add = {
+                key: cache[layer_id - self.begin_layer_id]
+                for key, cache in self.additional_paged_cache.items()
+            }
+        else:
+            ret_add = None
         return PagedKVCacheAccessor(
             self.get_gpu_block_table(),
             ret_k,
             ret_v,
             lambda: self.page_ids,
             lambda: self.offs_in_page,
+            ret_add,
         )
 
     def free_req_cache_blocks(self, req_id: str):

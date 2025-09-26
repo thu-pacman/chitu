@@ -317,6 +317,44 @@ class Backend:
             raise ValueError(f"Unknown cache type {args.infer.cache_type}")
 
     @staticmethod
+    def _init_linear_attn_cache_manager(args):
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if args.infer.op_impl == "cpu":
+            local_rank = "cpu"
+
+        pipeline_parallel_size = args.infer.pp_size
+
+        # Determine layer distribution for pipeline parallelism
+        if pipeline_parallel_size > 1:
+            pipe_stage = get_pp_group().rank_in_group
+            num_layers_of_each_rank = compute_layer_dist_in_pipe(
+                args.models.n_layers, pipeline_parallel_size
+            )
+            first_layer_id_of_each_rank = list(
+                itertools.accumulate([0] + num_layers_of_each_rank)
+            )
+            local_begin_layer_id = first_layer_id_of_each_rank[pipe_stage]
+            local_end_layer_id = first_layer_id_of_each_rank[pipe_stage + 1]
+        else:
+            local_begin_layer_id = 0
+            local_end_layer_id = args.models.n_layers
+
+        additional_cache_shape_dict = Backend._get_linear_attn_cache_params(args)
+
+        return PagedKVCacheManager(
+            local_begin_layer_id,
+            local_end_layer_id,
+            max_seq_len=args.infer.max_seq_len,
+            num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
+            // args.infer.dp_size,
+            block_size=1,
+            num_blocks=args.infer.num_blocks,
+            device=local_rank,
+            additional_cache_shape_dict=additional_cache_shape_dict,
+            lazy_mode=True,
+        )
+
+    @staticmethod
     def _get_kv_cache_params(args):
         """
         Calculate the KV cache parameters based on model type and configuration.
@@ -366,6 +404,27 @@ class Backend:
             kv_cache_kvargs["head_dim"] = head_dim
 
         return kv_cache_kvargs
+
+    @staticmethod
+    def _get_linear_attn_cache_params(args):
+        model_parallel_size = args.infer.tp_size
+
+        n_v_heads = args.models.linear_n_v_heads
+        n_qk_heads = args.models.linear_n_qk_heads
+        head_dim = args.models.linear_head_dim
+        conv_kernel_size = args.models.linear_conv_kernel_dim
+
+        n_local_v_heads = n_v_heads // model_parallel_size
+        local_conv_dim = (n_qk_heads * 2 + n_v_heads) * head_dim // model_parallel_size
+
+        return {
+            "conv_state": (local_conv_dim, conv_kernel_size),
+            "recurrent_state": (n_local_v_heads, head_dim, head_dim),
+        }
+
+    # @staticmethod
+    # def _init_linear_attn_cache(args):
+    #     return Qwen3LinearAttnCacheManager()
 
     @staticmethod
     def _init_attention_backend(args):
@@ -499,16 +558,29 @@ class Backend:
         model_parallel_size = args.infer.tp_size
         pipeline_parallel_size = args.infer.pp_size
 
-        model = Backend.build_model(
-            args.models,
-            Backend.cache_manager,
-            max_position_embeddings=args.infer.max_seq_len,
-            pipeline_parallel_size=pipeline_parallel_size,
-            model_parallel_size=model_parallel_size,
-            attn_backend=attn_backend,
-            op_impl=args.infer.op_impl,
-            mla_absorb=args.infer.mla_absorb,
-        )
+        if args.models.type == "hf-qwen3-next":
+            model = Backend.build_model(
+                args.models,
+                Backend.cache_manager,
+                max_position_embeddings=args.infer.max_seq_len,
+                pipeline_parallel_size=pipeline_parallel_size,
+                model_parallel_size=model_parallel_size,
+                attn_backend=attn_backend,
+                op_impl=args.infer.op_impl,
+                mla_absorb=args.infer.mla_absorb,
+                linear_attn_cache=Backend.linear_attn_cache_manager,
+            )
+        else:
+            model = Backend.build_model(
+                args.models,
+                Backend.cache_manager,
+                max_position_embeddings=args.infer.max_seq_len,
+                pipeline_parallel_size=pipeline_parallel_size,
+                model_parallel_size=model_parallel_size,
+                attn_backend=attn_backend,
+                op_impl=args.infer.op_impl,
+                mla_absorb=args.infer.mla_absorb,
+            )
 
         return model
 
@@ -563,6 +635,7 @@ class Backend:
                 "hf-mixtral",
                 "deepseek-v3",
                 "hf-qwen2-vl",
+                "hf-qwen3-next",
             }:
                 checkpoint = Backend._load_hf_checkpoint(model, args)
             else:
@@ -682,6 +755,11 @@ class Backend:
         # Initialize cache manager
         Backend.cache_manager = Backend._init_cache_manager(args)
         Backend.cache_type = args.infer.cache_type
+
+        if args.models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager = Backend._init_linear_attn_cache_manager(
+                args
+            )
 
         # Initialize attention backend
         attn_backend = Backend._init_attention_backend(args)
