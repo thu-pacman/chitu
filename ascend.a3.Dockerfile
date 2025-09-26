@@ -21,7 +21,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Install test deps (expect + pytest) only when enabled
 RUN if [ "${enable_test}" = "true" ]; then \
     dnf makecache && dnf install -y expect && \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest; \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp; \
 fi
 
 RUN --mount=type=cache,target=/root/.cache/pip \

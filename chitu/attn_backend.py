@@ -2121,7 +2121,7 @@ class NpuAttnBackend(RefAttnBackend):
             self.max_aiv_num = 50
         elif platform == "Ascend910B2":
             self.max_aiv_num = 48
-        elif platform == "Ascend910B3":
+        elif platform == "Ascend910B3" or platform == "Ascend910B4":
             self.max_aiv_num = 40
         else:
             raise RuntimeError("Unsupported platform: ", platform)

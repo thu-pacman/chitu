@@ -4,6 +4,7 @@
 
 from typing_extensions import override
 from dataclasses import dataclass
+import plum
 import torch
 
 from chitu.ops.batched_routed_activation import (
@@ -75,25 +76,16 @@ class ExpertBlockIndexedBatchedRoutedActivation(BatchedRoutedActivation):
 
     @classmethod
     @override
+    @plum.dispatch
     def convert_from(
-        cls, old: BatchedRoutedActivation, *, n_experts: int, block_size: int
+        cls, old: IndexedBatchedRoutedActivation, *, n_experts: int, block_size: int
     ) -> "ExpertBlockIndexedBatchedRoutedActivation":
-        # NOTE: @functools.singledispatchmethod has a bug in Python 3.8
-        # (https://stackoverflow.com/questions/62696796/singledispatchmethod-and-class-method-decorators-in-python-3-8)
-        # Use `if` for now
-
-        if isinstance(old, IndexedBatchedRoutedActivation):
-            return cls(
-                old.activation,
-                *batched_routed_activation_indexed_to_expert_block_indexed(
-                    old.token_to_expert_indices, block_size, n_experts
-                ),
-            )
-
-        else:
-            raise TypeError(
-                f"Cannot convert from {type(old)} to ExpertBlockIndexedBatchedRoutedActivation"
-            )
+        return cls(
+            old.activation,
+            *batched_routed_activation_indexed_to_expert_block_indexed(
+                old.token_to_expert_indices, block_size, n_experts
+            ),
+        )
 
 
 @dataclass
@@ -126,43 +118,34 @@ class ExpertBlockPermutedBatchedRoutedActivationBlockfp8(
 
     @classmethod
     @override
+    @plum.dispatch
     def convert_from(
         cls,
-        old: BatchedRoutedActivation,
+        old: IndexedBatchedRoutedActivationBlockfp8,
         *,
         block_size: int,
         n_tokens_padded: int,
         n_tokens_per_expert_padded: torch.Tensor,
     ) -> "ExpertBlockPermutedBatchedRoutedActivationBlockfp8":
-        # NOTE: @functools.singledispatchmethod has a bug in Python 3.8
-        # (https://stackoverflow.com/questions/62696796/singledispatchmethod-and-class-method-decorators-in-python-3-8)
-        # Use `if` for now
-
-        if isinstance(old, IndexedBatchedRoutedActivationBlockfp8):
-            (
-                blocked_activation,
-                blocked_activation_scale,
-                token_comma_topk_to_block_x_item_indices,
-                block_to_expert_indices,
-            ) = batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
-                old.activation,
-                old.activation_scale,
-                old.token_to_expert_indices,
-                block_size=block_size,
-                n_tokens_padded=n_tokens_padded,
-                n_tokens_per_expert_padded=n_tokens_per_expert_padded,
-            )
-            return cls(
-                blocked_activation=blocked_activation,
-                blocked_activation_scale=blocked_activation_scale,
-                token_comma_topk_to_block_x_item_indices=token_comma_topk_to_block_x_item_indices,
-                block_to_expert_indices=block_to_expert_indices,
-            )
-
-        else:
-            raise TypeError(
-                f"Cannot convert from {type(old)} to ExpertBlockPermutedBatchedRoutedActivationBlockfp8"
-            )
+        (
+            blocked_activation,
+            blocked_activation_scale,
+            token_comma_topk_to_block_x_item_indices,
+            block_to_expert_indices,
+        ) = batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
+            old.activation,
+            old.activation_scale,
+            old.token_to_expert_indices,
+            block_size=block_size,
+            n_tokens_padded=n_tokens_padded,
+            n_tokens_per_expert_padded=n_tokens_per_expert_padded,
+        )
+        return cls(
+            blocked_activation=blocked_activation,
+            blocked_activation_scale=blocked_activation_scale,
+            token_comma_topk_to_block_x_item_indices=token_comma_topk_to_block_x_item_indices,
+            block_to_expert_indices=block_to_expert_indices,
+        )
 
 
 @dataclass

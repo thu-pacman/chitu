@@ -43,9 +43,9 @@ RUN if [ "${enable_test}" = "true" ]; then \
     update-ca-certificates; \
     sed -i 's|http://mirrors.tuna.tsinghua.edu.cn|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list; \
     apt-get update; \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends expect; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends expect vim tmux telnet htop lsof strace iputils-ping curl; \
     rm -rf /var/lib/apt/lists/*; \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest; \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp; \
 fi
 
 WORKDIR /workspace/chitu

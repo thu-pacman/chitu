@@ -25,7 +25,7 @@ ENV TZ=Etc/UTC
 
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 
-RUN apt update -y && apt install -y git gcc-10 g++-10 libnuma-dev vim tmux telnet htop lsof strace iputils-ping curl
+RUN apt update -y && apt install -y git gcc-10 g++-10 libnuma-dev
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -33,8 +33,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
 RUN if [ "${enable_test}" = "true" ]; then \
-    apt update -y && apt install -y expect && \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest; \
+    apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping curl && \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp; \
 fi
 
 # Always install build time dependencies. Some dependencies may fail to build
@@ -69,14 +69,12 @@ FROM base AS dependency_installer
 
 WORKDIR /workspace/chitu
 COPY --from=dependency_resolver /tmp/requirements.txt /tmp/requirements.txt
-COPY ./third_party ./third_party
-COPY ./csrc/cpuinfer ./csrc/cpuinfer
 
 # Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
 # compile at install time, and the compile results are environment dependent.
-RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec")
-
-RUN rm -rf /workspace/chitu/*
+RUN --mount=type=bind,source=./third_party,target=./third_party,readwrite \
+    --mount=type=bind,source=./csrc/cpuinfer,target=./csrc/cpuinfer,readwrite \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec")
 
 #####################################
 # Wheel build Stage

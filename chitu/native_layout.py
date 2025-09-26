@@ -6,6 +6,7 @@ from typing import Sequence, Any
 from typing_extensions import override, final
 from dataclasses import dataclass
 import functools
+import plum
 import torch
 
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
@@ -45,7 +46,10 @@ class NativeLayoutTensor:
         only interact with tensors with a specifc layout.
         """
 
-        raise NotImplementedError()
+        raise NotImplementedError(
+            f"Unable to convert from {type(plain_tensor)} (with args {subclass_args} and "
+            f"kwargs {subclass_kwargs}) to NativeLayoutTensor {cls}"
+        )
 
     @final
     def convert_to(self, out_type):
@@ -221,23 +225,16 @@ class Vector(NativeLayoutTensor):
 
     @classmethod
     @override
+    @plum.dispatch
     def convert_from(cls, tensor: torch.Tensor) -> "Vector":
-        # NOTE: @functools.singledispatchmethod has a bug in Python 3.8
-        # (https://stackoverflow.com/questions/62696796/singledispatchmethod-and-class-method-decorators-in-python-3-8)
-        # Use `if` for now
-
-        if isinstance(tensor, torch.Tensor):
-            if tensor.numel() != tensor.shape[-1]:
-                raise ValueError(
-                    f"Vector expects a tensor with batch size equal to 1, but got {tensor.shape}"
-                )
-            return cls(
-                plain_shape=tensor.shape,
-                layout_tensor=tensor.view(tensor.shape[-1]),
+        if tensor.numel() != tensor.shape[-1]:
+            raise ValueError(
+                f"Vector expects a tensor with batch size equal to 1, but got {tensor.shape}"
             )
-
-        else:
-            raise TypeError(f"Cannot convert from {type(tensor)} to Vector")
+        return cls(
+            plain_shape=tensor.shape,
+            layout_tensor=tensor.view(tensor.shape[-1]),
+        )
 
     @override
     def convert_to_plain(self) -> torch.Tensor:
@@ -254,20 +251,15 @@ class PermutedTensor(NativeLayoutTensor):
 
     @classmethod
     @override
-    def convert_from(cls, tensor: torch.Tensor, *, perm: Sequence[int]) -> "Vector":
-        # NOTE: @functools.singledispatchmethod has a bug in Python 3.8
-        # (https://stackoverflow.com/questions/62696796/singledispatchmethod-and-class-method-decorators-in-python-3-8)
-        # Use `if` for now
-
-        if isinstance(tensor, torch.Tensor):
-            return cls(
-                plain_shape=tensor.shape,
-                layout_tensor=tensor.permute(*perm).contiguous(),
-                perm=perm,
-            )
-
-        else:
-            raise TypeError(f"Cannot convert from {type(tensor)} to Vector")
+    @plum.dispatch
+    def convert_from(
+        cls, tensor: torch.Tensor, *, perm: Sequence[int]
+    ) -> "PermutedTensor":
+        return cls(
+            plain_shape=tensor.shape,
+            layout_tensor=tensor.permute(*perm).contiguous(),
+            perm=perm,
+        )
 
     @override
     def convert_to_plain(self) -> torch.Tensor:
@@ -288,37 +280,28 @@ class BatchPaddedActivation(NativeLayoutTensor):
 
     @classmethod
     @override
+    @plum.dispatch
     def convert_from(
-        cls, tensor: torch.Tensor, multiple_of: int
+        cls, tensor: torch.Tensor, *, multiple_of: int
     ) -> "BatchPaddedActivation":
-        # NOTE: @functools.singledispatchmethod has a bug in Python 3.8
-        # (https://stackoverflow.com/questions/62696796/singledispatchmethod-and-class-method-decorators-in-python-3-8)
-        # Use `if` for now
-
-        if isinstance(tensor, torch.Tensor):
-            plain_shape = tensor.shape
-            plain_batch_size = functools.reduce(lambda x, y: x * y, plain_shape[:-1], 1)
-            padded_batch_size = (
-                (plain_batch_size + multiple_of - 1) // multiple_of * multiple_of
-            )
-            padded_shape = [padded_batch_size, plain_shape[-1]]
-            if padded_batch_size == plain_batch_size:
-                layout_tensor = tensor.view(-1, plain_shape[-1])
-            else:
-                layout_tensor = torch.zeros(
-                    padded_shape, dtype=tensor.dtype, device=tensor.device
-                )
-                layout_tensor[:plain_batch_size].copy_(tensor.view(-1, plain_shape[-1]))
-            return cls(
-                plain_shape=plain_shape,
-                layout_tensor=layout_tensor,
-                multiple_of=multiple_of,
-            )
-
+        plain_shape = tensor.shape
+        plain_batch_size = functools.reduce(lambda x, y: x * y, plain_shape[:-1], 1)
+        padded_batch_size = (
+            (plain_batch_size + multiple_of - 1) // multiple_of * multiple_of
+        )
+        padded_shape = [padded_batch_size, plain_shape[-1]]
+        if padded_batch_size == plain_batch_size:
+            layout_tensor = tensor.view(-1, plain_shape[-1])
         else:
-            raise TypeError(
-                f"Cannot convert from {type(tensor)} to BatchPaddedActivation"
+            layout_tensor = torch.zeros(
+                padded_shape, dtype=tensor.dtype, device=tensor.device
             )
+            layout_tensor[:plain_batch_size].copy_(tensor.view(-1, plain_shape[-1]))
+        return cls(
+            plain_shape=plain_shape,
+            layout_tensor=layout_tensor,
+            multiple_of=multiple_of,
+        )
 
     @override
     def convert_to_plain(self) -> torch.Tensor:
@@ -341,72 +324,66 @@ class Packed4BitWeightAlongK(NativeLayoutTensor):
 
     @classmethod
     @override
+    @plum.dispatch
     def convert_from(
-        cls, tensor: "Packed4BitWeightAlongK", k_stride: int = 1
+        cls, tensor: "Packed4BitWeightAlongK", *, k_stride: int = 1
     ) -> "Packed4BitWeightAlongK":
-        # NOTE: @functools.singledispatchmethod has a bug in Python 3.8
-        # (https://stackoverflow.com/questions/62696796/singledispatchmethod-and-class-method-decorators-in-python-3-8)
-        # Use `if` for now
-
-        if isinstance(tensor, Packed4BitWeightAlongK):
-            if tensor.k_stride == k_stride:
-                return tensor
-            k = tensor.plain_shape[-1]
-            assert k % (2 * tensor.k_stride) == 0
-            assert k % (2 * k_stride) == 0
-            if has_chitu_backend and tensor.k_stride == 1 and k_stride == 64:
-                device = tensor.layout_tensor.device
-                weight = chitu_backend.weight_layout_change(
-                    tensor.layout_tensor.cuda()
-                ).to(device)
-            else:
-                weight = tensor.layout_tensor.view(
-                    -1, k // (2 * tensor.k_stride), 1, tensor.k_stride
-                ).view(torch.uint8)
-                weight = torch.cat([weight & 0x0F, weight >> 4], dim=-2)
-                weight = weight.view(-1, k // (2 * k_stride), 2, k_stride)
-                weight = weight[..., 0, :] + (weight[..., 1, :] << 4)
-            weight = weight.view(*tensor.plain_shape[:-1], k // 2).contiguous()
-            return cls(
-                plain_shape=tensor.plain_shape,
-                layout_tensor=weight,
-                k_stride=k_stride,
+        if tensor.k_stride == k_stride:
+            return tensor
+        k = tensor.plain_shape[-1]
+        assert k % (2 * tensor.k_stride) == 0
+        assert k % (2 * k_stride) == 0
+        if has_chitu_backend and tensor.k_stride == 1 and k_stride == 64:
+            device = tensor.layout_tensor.device
+            weight = chitu_backend.weight_layout_change(tensor.layout_tensor.cuda()).to(
+                device
             )
-
-        elif isinstance(tensor, Packed4BitWeightQServe):
-            assert len(tensor.plain_shape) == 2
-            n, k = tensor.plain_shape
-
-            # Unpack from qserve format
-            assert n % 32 == 0
-            assert k % 32 == 0
-            weight = tensor.layout_tensor.view(
-                n // 32, k // 32, 1, 8, 4, 2, 2, 1, 4
-            ).view(torch.uint8)
-            weight = torch.stack([weight & 0x0F, weight >> 4], dim=0)
-            weight = (
-                weight.permute(1, 0, 7, 4, 8, 2, 3, 6, 5, 9).contiguous().view(n, k)
-            )
-
-            # Pack to Packed4BitWeightAlongK
-            assert k % k_stride == 0
-            weight = (
-                weight.view(n, k // (2 * k_stride), 2, k_stride)
-                .permute(2, 0, 1, 3)
-                .contiguous()
-            )
-            weight = weight[0] + (weight[1] << 4)
-            weight = weight.view(n, k // 2)
-            return cls(
-                plain_shape=tensor.plain_shape,
-                layout_tensor=weight,
-                k_stride=k_stride,
-            )
-
         else:
-            raise TypeError(
-                f"Cannot convert from {type(tensor)} to Packed4BitWeightAlongK"
-            )
+            weight = tensor.layout_tensor.view(
+                -1, k // (2 * tensor.k_stride), 1, tensor.k_stride
+            ).view(torch.uint8)
+            weight = torch.cat([weight & 0x0F, weight >> 4], dim=-2)
+            weight = weight.view(-1, k // (2 * k_stride), 2, k_stride)
+            weight = weight[..., 0, :] + (weight[..., 1, :] << 4)
+        weight = weight.view(*tensor.plain_shape[:-1], k // 2).contiguous()
+        return cls(
+            plain_shape=tensor.plain_shape,
+            layout_tensor=weight,
+            k_stride=k_stride,
+        )
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(
+        cls, tensor: "Packed4BitWeightQServe", *, k_stride: int = 1
+    ) -> "Packed4BitWeightAlongK":
+        assert len(tensor.plain_shape) == 2
+        n, k = tensor.plain_shape
+
+        # Unpack from qserve format
+        assert n % 32 == 0
+        assert k % 32 == 0
+        weight = tensor.layout_tensor.view(n // 32, k // 32, 1, 8, 4, 2, 2, 1, 4).view(
+            torch.uint8
+        )
+        weight = torch.stack([weight & 0x0F, weight >> 4], dim=0)
+        weight = weight.permute(1, 0, 7, 4, 8, 2, 3, 6, 5, 9).contiguous().view(n, k)
+
+        # Pack to Packed4BitWeightAlongK
+        assert k % k_stride == 0
+        weight = (
+            weight.view(n, k // (2 * k_stride), 2, k_stride)
+            .permute(2, 0, 1, 3)
+            .contiguous()
+        )
+        weight = weight[0] + (weight[1] << 4)
+        weight = weight.view(n, k // 2)
+        return cls(
+            plain_shape=tensor.plain_shape,
+            layout_tensor=weight,
+            k_stride=k_stride,
+        )
 
     def __getitem__(self, index):
         """
@@ -430,14 +407,11 @@ class Packed4BitWeightAlongK(NativeLayoutTensor):
 class Packed4BitWeightNPUNative(NativeLayoutTensor):
     @classmethod
     @override
+    @plum.dispatch
     def convert_from(
         cls, tensor: Packed4BitWeightAlongK
     ) -> "Packed4BitWeightNPUNative":
-        # NOTE: @functools.singledispatchmethod has a bug in Python 3.8
-        # (https://stackoverflow.com/questions/62696796/singledispatchmethod-and-class-method-decorators-in-python-3-8)
-        # Use `if` for now
-
-        if isinstance(tensor, Packed4BitWeightAlongK) and tensor.k_stride == 1:
+        if tensor.k_stride == 1:
             return cls(
                 plain_shape=tensor.plain_shape,
                 layout_tensor=cls._repack_weight(tensor.layout_tensor),
@@ -445,7 +419,7 @@ class Packed4BitWeightNPUNative(NativeLayoutTensor):
 
         else:
             raise TypeError(
-                f"Cannot convert from {type(tensor)} to Packed4BitWeightAlongK"
+                f"Cannot convert from {type(tensor)} to Packed4BitWeightAlongK with k_stride={tensor.k_stride}"
             )
 
     # Designed for NPU de-quantization + matmul fused operator
@@ -537,21 +511,18 @@ class NpuFractalNzTensor(NativeLayoutTensor):
 
     @classmethod
     @override
+    @plum.dispatch
     def convert_from(cls, tensor: torch.Tensor) -> "NpuFractalNzTensor":
-        if isinstance(tensor, torch.Tensor):
-            layout_tensor = torch_npu.npu_format_cast(
-                tensor.npu().contiguous(), ACL_FORMAT_FRACTAL_NZ
-            )
+        layout_tensor = torch_npu.npu_format_cast(
+            tensor.npu().contiguous(), ACL_FORMAT_FRACTAL_NZ
+        )
 
-            # The assertion is necessary, because npu_format_cast may fail silently as a no-op on some environments
-            assert torch_npu.get_npu_format(layout_tensor) == ACL_FORMAT_FRACTAL_NZ
+        # The assertion is necessary, because npu_format_cast may fail silently as a no-op on some environments
+        assert torch_npu.get_npu_format(layout_tensor) == ACL_FORMAT_FRACTAL_NZ
 
-            # NPU formats only live on NPU. Once we move to CPU and then move back, the format will disappear.
-            # Therefore, we force this tensor to be on NPU.
-            return cls(plain_shape=tensor.shape, layout_tensor=layout_tensor)
-
-        else:
-            raise TypeError(f"Cannot convert from {type(tensor)} to Vector")
+        # NPU formats only live on NPU. Once we move to CPU and then move back, the format will disappear.
+        # Therefore, we force this tensor to be on NPU.
+        return cls(plain_shape=tensor.shape, layout_tensor=layout_tensor)
 
     @override
     def convert_to_plain(self) -> torch.Tensor:
@@ -579,21 +550,18 @@ class NpuFractalZnTensor(NativeLayoutTensor):
 
     @classmethod
     @override
-    def convert_from(cls, tensor: torch.Tensor) -> "NpuFractalNzTensor":
-        if isinstance(tensor, torch.Tensor):
-            layout_tensor = torch_npu.npu_format_cast(
-                tensor.npu().transpose(-1, -2).contiguous(), ACL_FORMAT_FRACTAL_NZ
-            )
+    @plum.dispatch
+    def convert_from(cls, tensor: torch.Tensor) -> "NpuFractalZnTensor":
+        layout_tensor = torch_npu.npu_format_cast(
+            tensor.npu().transpose(-1, -2).contiguous(), ACL_FORMAT_FRACTAL_NZ
+        )
 
-            # The assertion is necessary, because npu_format_cast may fail silently as a no-op on some environments
-            assert torch_npu.get_npu_format(layout_tensor) == ACL_FORMAT_FRACTAL_NZ
+        # The assertion is necessary, because npu_format_cast may fail silently as a no-op on some environments
+        assert torch_npu.get_npu_format(layout_tensor) == ACL_FORMAT_FRACTAL_NZ
 
-            # NPU formats only live on NPU. Once we move to CPU and then move back, the format will disappear.
-            # Therefore, we force this tensor to be on NPU.
-            return cls(plain_shape=tensor.shape, layout_tensor=layout_tensor)
-
-        else:
-            raise TypeError(f"Cannot convert from {type(tensor)} to Vector")
+        # NPU formats only live on NPU. Once we move to CPU and then move back, the format will disappear.
+        # Therefore, we force this tensor to be on NPU.
+        return cls(plain_shape=tensor.shape, layout_tensor=layout_tensor)
 
     @override
     def convert_to_plain(self) -> torch.Tensor:
@@ -615,18 +583,15 @@ class ColumnOddEvenSeparatedTensor(NativeLayoutTensor):
 
     @classmethod
     @override
+    @plum.dispatch
     def convert_from(cls, tensor: torch.Tensor) -> "ColumnOddEvenSeparatedTensor":
-        if isinstance(tensor, torch.Tensor):
-            return cls(
-                plain_shape=tensor.shape,
-                layout_tensor=tensor.view(*tensor.shape[:-1], tensor.shape[-1] // 2, 2)
-                .transpose(-1, -2)
-                .contiguous()
-                .view(*tensor.shape),
-            )
-
-        else:
-            raise TypeError(f"Cannot convert from {type(tensor)} to Vector")
+        return cls(
+            plain_shape=tensor.shape,
+            layout_tensor=tensor.view(*tensor.shape[:-1], tensor.shape[-1] // 2, 2)
+            .transpose(-1, -2)
+            .contiguous()
+            .view(*tensor.shape),
+        )
 
     @override
     def convert_to_plain(self) -> torch.Tensor:
@@ -652,30 +617,27 @@ class PartialColumnOddEvenSeparatedTensor(NativeLayoutTensor):
 
     @classmethod
     @override
+    @plum.dispatch
     def convert_from(
         cls, tensor: torch.Tensor, *, begin_idx, end_idx
     ) -> "PartialColumnOddEvenSeparatedTensor":
-        if isinstance(tensor, torch.Tensor):
-            layout_tensor = tensor.clone()
-            separated_part = layout_tensor[..., begin_idx:end_idx]
-            separated_part = (
-                separated_part.view(
-                    *separated_part.shape[:-1], separated_part.shape[-1] // 2, 2
-                )
-                .transpose(-1, -2)
-                .contiguous()
-                .view(*separated_part.shape)
+        layout_tensor = tensor.clone()
+        separated_part = layout_tensor[..., begin_idx:end_idx]
+        separated_part = (
+            separated_part.view(
+                *separated_part.shape[:-1], separated_part.shape[-1] // 2, 2
             )
-            layout_tensor[..., begin_idx:end_idx] = separated_part
-            return cls(
-                plain_shape=tensor.shape,
-                layout_tensor=layout_tensor,
-                begin_idx=begin_idx,
-                end_idx=end_idx,
-            )
-
-        else:
-            raise TypeError(f"Cannot convert from {type(tensor)} to Vector")
+            .transpose(-1, -2)
+            .contiguous()
+            .view(*separated_part.shape)
+        )
+        layout_tensor[..., begin_idx:end_idx] = separated_part
+        return cls(
+            plain_shape=tensor.shape,
+            layout_tensor=layout_tensor,
+            begin_idx=begin_idx,
+            end_idx=end_idx,
+        )
 
     @override
     def convert_to_plain(self) -> torch.Tensor:
@@ -709,11 +671,10 @@ class Repeat1ToLength(NativeLayoutTensor):
 
     @classmethod
     @override
+    @plum.dispatch
     def convert_from(
         cls, tensor: torch.Tensor, *, length: int, out_dtype: torch.dtype = None
     ):
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"Cannot convert from {type(tensor)} to Repeat1ToLength")
         if tensor.numel() != 1:
             raise ValueError(
                 f"Repeat1ToLength expects a scalar/size-1 tensor, but got shape {tuple(tensor.shape)}"
@@ -748,11 +709,8 @@ class SqueezeLastSingleton(NativeLayoutTensor):
 
     @classmethod
     @override
+    @plum.dispatch
     def convert_from(cls, tensor: torch.Tensor) -> "SqueezeLastSingleton":
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(
-                f"Cannot convert from {type(tensor)} to SqueezeLastSingleton"
-            )
         if tensor.shape[-1] != 1:
             raise ValueError(
                 f"SqueezeLastSingleton expects last dim == 1, but got shape {tuple(tensor.shape)}"

@@ -4,6 +4,7 @@
 
 from typing import Optional
 from typing_extensions import override
+import plum
 import torch
 
 from chitu.utils import try_import_opt_dep
@@ -30,68 +31,44 @@ tbsgemm, has_tbsgemm = try_import_opt_dep("tbsgemm", "muxi_w8a8_kernels")
 class MuxiNativeLayoutActivation(NativeLayoutTensor):
     @classmethod
     @override
+    @plum.dispatch
     def convert_from(
         cls, tensor: BatchPaddedActivation
     ) -> "MuxiNativeLayoutActivation":
-        # NOTE: @functools.singledispatchmethod has a bug in Python 3.8
-        # (https://stackoverflow.com/questions/62696796/singledispatchmethod-and-class-method-decorators-in-python-3-8)
-        # Use `if` for now
-
-        if isinstance(tensor, BatchPaddedActivation):
-            assert tensor.multiple_of == 16
-            return cls(
-                tensor.plain_shape, muxi_layout_kernels.layoutB(tensor.layout_tensor)
-            )
-        else:
-            raise TypeError(
-                f"Cannot convert from {type(tensor)} to MuxiNativeLayoutActivation"
-            )
+        assert tensor.multiple_of == 16
+        return cls(
+            tensor.plain_shape, muxi_layout_kernels.layoutB(tensor.layout_tensor)
+        )
 
 
 class MuxiNativeLayoutWeight(NativeLayoutTensor):
     @classmethod
     @override
+    @plum.dispatch
     def convert_from(cls, tensor: torch.Tensor) -> "MuxiNativeLayoutWeight":
-        # NOTE: @functools.singledispatchmethod has a bug in Python 3.8
-        # (https://stackoverflow.com/questions/62696796/singledispatchmethod-and-class-method-decorators-in-python-3-8)
-        # Use `if` for now
-
-        if isinstance(tensor, torch.Tensor):
-            m, k = tensor.shape
-            assert m % 128 == 0
-            assert k % 128 == 0
-            return cls(
-                tensor.shape,
-                tensor.reshape(m // 16, 16, k // 8, 8).permute(0, 2, 1, 3).contiguous(),
-            )
-        else:
-            raise TypeError(
-                f"Cannot convert from {type(tensor)} to MuxiNativeLayoutWeight"
-            )
+        m, k = tensor.shape
+        assert m % 128 == 0
+        assert k % 128 == 0
+        return cls(
+            tensor.shape,
+            tensor.reshape(m // 16, 16, k // 8, 8).permute(0, 2, 1, 3).contiguous(),
+        )
 
 
 class MuxiNativeLayoutGroupWeight(NativeLayoutTensor):
     @classmethod
     @override
+    @plum.dispatch
     def convert_from(cls, tensor: torch.Tensor) -> "MuxiNativeLayoutGroupWeight":
-        # NOTE: @functools.singledispatchmethod has a bug in Python 3.8
-        # (https://stackoverflow.com/questions/62696796/singledispatchmethod-and-class-method-decorators-in-python-3-8)
-        # Use `if` for now
-
-        if isinstance(tensor, torch.Tensor):
-            e, m, k = tensor.shape
-            assert m % 128 == 0
-            assert k % 128 == 0
-            return cls(
-                tensor.shape,
-                tensor.reshape(e, m // 16, 16, k // 8, 8)
-                .permute(0, 1, 3, 2, 4)
-                .contiguous(),
-            )
-        else:
-            raise TypeError(
-                f"Cannot convert from {type(tensor)} to MuxiNativeLayoutGroupWeight"
-            )
+        e, m, k = tensor.shape
+        assert m % 128 == 0
+        assert k % 128 == 0
+        return cls(
+            tensor.shape,
+            tensor.reshape(e, m // 16, 16, k // 8, 8)
+            .permute(0, 1, 3, 2, 4)
+            .contiguous(),
+        )
 
 
 @single_dispatch_lazy_tensor

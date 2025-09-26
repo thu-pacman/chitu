@@ -7,6 +7,11 @@ set tp_size_arg 2
 set cache_type_arg "paged"
 set batch_sizes_arg "1 2 4 8 16 32"
 set send_notification 1
+if {[info exists env(FEISHU_BOT_URL)]} {
+    set webhook_url_arg $env(FEISHU_BOT_URL)
+} else {
+    set webhook_url_arg ""
+}
 
 # Process command line arguments
 if {[llength $argv] > 0} {
@@ -30,6 +35,9 @@ if {[llength $argv] > 0} {
         } elseif {$arg eq "--no-notify"} {
             # Flag to disable notification sending
             set send_notification 0
+        } elseif {$arg eq "--webhook-url"} {
+            incr i
+            set webhook_url_arg [lindex $argv $i]
         }
     }
 }
@@ -149,7 +157,7 @@ foreach bs $batch_sizes {
         set mean_ttft [exec echo $output | grep "Mean TTFT" | awk {{print $NF}} 2>/dev/null]
 
         # If empty, set to N/A
-        if {$duration eq ""} { set output_throughput "N/A" }
+        if {$duration eq ""} { set duration "N/A" }
         if {$output_throughput eq ""} { set output_throughput "N/A" }
         if {$total_throughput eq ""} { set total_throughput "N/A" }
         if {$mean_tpot eq ""} { set mean_tpot "N/A" }
@@ -166,9 +174,7 @@ puts $model_info
 puts $benchmark_formated_records
 puts "==========================================================="
 
-proc send_to_lark {message} {
-    set webhook_url "https://open.feishu.cn/open-apis/bot/v2/hook/d78cfb94-927b-4bdf-b1bc-b422a0b60908"
-    
+proc send_to_lark {webhook_url message} {
     set escaped_message [string map {
         "\\" "\\\\" 
         "\"" "\\\"" 
@@ -188,12 +194,14 @@ proc send_to_lark {message} {
         puts "Successfully sent to Lark"
     }
 }
-if {$send_notification == 1} {
+if {$send_notification && $webhook_url_arg ne ""} {
     set lark_message "$model_info$benchmark_formated_records"
-    puts "Sending benchmark results to Lark..."
-    send_to_lark $lark_message
+    puts "Sending benchmark results to Lark via $webhook_url_arg..."
+    send_to_lark $webhook_url_arg $lark_message
+} elseif {$send_notification} {
+    puts "Webhook URL missing, skip notification."
 } else {
-    puts "Notification sending is disabled (--no-notify flag was used)"
+    puts "Notification disabled (--no-notify)."
 }
 
 
