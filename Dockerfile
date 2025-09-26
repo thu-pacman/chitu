@@ -69,14 +69,12 @@ FROM base AS dependency_installer
 
 WORKDIR /workspace/chitu
 COPY --from=dependency_resolver /tmp/requirements.txt /tmp/requirements.txt
-COPY ./third_party ./third_party
-COPY ./csrc/cpuinfer ./csrc/cpuinfer
 
 # Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
 # compile at install time, and the compile results are environment dependent.
-RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec")
-
-RUN rm -rf /workspace/chitu/*
+RUN --mount=type=bind,source=./third_party,target=./third_party,readwrite \
+    --mount=type=bind,source=./csrc/cpuinfer,target=./csrc/cpuinfer,readwrite \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec")
 
 #####################################
 # Wheel build Stage
