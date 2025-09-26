@@ -31,6 +31,10 @@ from chitu.quantization import QuantizationRegistry
 from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 
 
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-SnippetCopyrightText: 2025 HuggingFace
+# SDPX—SnippetName: torch_causal_conv1d_update from transformers
 def torch_causal_conv1d_update(
     hidden_states,
     conv_state,
@@ -50,6 +54,13 @@ def torch_causal_conv1d_update(
     return out, conv_state
 
 
+# SPDX-SnippetEnd
+
+
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-SnippetCopyrightText: 2025 HuggingFace
+# SDPX—SnippetName: torch_chunk_gated_delta_rule from transformers
 def torch_chunk_gated_delta_rule(
     query,
     key,
@@ -145,6 +156,13 @@ def torch_chunk_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
+# SPDX-SnippetEnd
+
+
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-SnippetCopyrightText: 2025 HuggingFace
+# SDPX—SnippetName: torch_recurrent_gated_delta_rule from transformers
 def torch_recurrent_gated_delta_rule(
     query,
     key,
@@ -201,6 +219,9 @@ def torch_recurrent_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
+# SPDX-SnippetEnd
+
+
 def extract_and_merge(x, seq_len_list):
     n = x.size(0)
     result = []
@@ -211,6 +232,10 @@ def extract_and_merge(x, seq_len_list):
     return torch.cat(result, dim=0)
 
 
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-SnippetCopyrightText: 2025 HuggingFace
+# SDPX—SnippetName: Qwen3NextRMSNorm from transformers
 class Qwen3NextRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -228,6 +253,13 @@ class Qwen3NextRMSNorm(nn.Module):
         return output.type_as(x)
 
 
+# SPDX-SnippetEnd
+
+
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-SnippetCopyrightText: 2025 HuggingFace
+# SDPX—SnippetName: Qwen3NextRMSNormGated from transformers
 class Qwen3NextRMSNormGated(nn.Module):
     def __init__(self, hidden_size, eps=1e-6, **kwargs):
         super().__init__()
@@ -244,6 +276,9 @@ class Qwen3NextRMSNormGated(nn.Module):
         hidden_states = hidden_states * F.silu(gate.to(torch.float32))
 
         return hidden_states.to(input_dtype)
+
+
+# SPDX-SnippetEnd
 
 
 class Qwen3NextGatedDeltaNet(nn.Module):
