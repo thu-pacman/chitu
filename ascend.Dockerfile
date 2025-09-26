@@ -20,15 +20,13 @@ fi
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 
-RUN apt update -y && apt install -y vim tmux telnet htop lsof strace iputils-ping curl
-
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
 RUN if [ "${enable_test}" = "true" ]; then \
-    apt update -y && apt install -y expect && \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest; \
+    apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping curl && \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp; \
 fi
 
 RUN --mount=type=cache,target=/root/.cache/pip \

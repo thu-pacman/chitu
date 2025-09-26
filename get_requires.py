@@ -34,7 +34,7 @@ install_requires = [
     "typing-extensions",
     "pyzmq>=27.0.0",
     "msgpack",
-    "aiohttp",
+    "plum-dispatch",
 ]
 
 

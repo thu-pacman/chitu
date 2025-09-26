@@ -30,10 +30,7 @@ from chitu.attn_backend import (
 from chitu.cache_manager import DenseKVCacheManager, PagedKVCacheManager
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
-from chitu.distributed.parallel_state import (
-    get_pp_group,
-    initialize_parallel_groups,
-)
+from chitu.distributed.parallel_state import get_pp_group, initialize_parallel_groups
 from chitu.hybrid_device import CPUParameter
 from chitu.models.registry import ModelType, get_model_class
 from chitu.quantization import (
