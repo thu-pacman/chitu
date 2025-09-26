@@ -5,7 +5,7 @@
 import itertools
 import os
 from logging import getLogger
-from typing import Any, List, Mapping, Optional
+from typing import Any, Mapping, Optional
 
 import torch
 import torch.nn.functional as F
@@ -252,22 +252,22 @@ class Transformer(nn.Module):
         if self.ep_group.is_last_rank:
             self.experts_end_idx += remainder
 
-    def _get_tensor_column_parallel_layer_names(self) -> List[str]:
+    def _get_tensor_column_parallel_layer_names(self) -> list[str]:
         raise NotImplementedError
 
-    def _get_tensor_row_parallel_layer_names(self) -> List[str]:
+    def _get_tensor_row_parallel_layer_names(self) -> list[str]:
         raise NotImplementedError
 
-    def _get_pre_layer_prefixes(self) -> List[str]:
+    def _get_pre_layer_prefixes(self) -> list[str]:
         raise NotImplementedError
 
-    def _get_post_layer_prefixes(self) -> List[str]:
+    def _get_post_layer_prefixes(self) -> list[str]:
         raise NotImplementedError
 
-    def _get_layer_i_prefixes(self, i: int) -> List[str]:
+    def _get_layer_i_prefixes(self, i: int) -> list[str]:
         raise NotImplementedError
 
-    def _get_2d_out_x_in_tensor_names(self, quant) -> List[str]:
+    def _get_2d_out_x_in_tensor_names(self, quant) -> list[str]:
         ret = ["weight"]
         if quant == "blockfp8" or quant == "q4km":
             ret += ["scale"]
@@ -283,7 +283,7 @@ class Transformer(nn.Module):
             ret += ["weight_scale", "weight_offset"]
         return ret
 
-    def _get_2d_in_x_out_tensor_names(self, quant) -> List[str]:
+    def _get_2d_in_x_out_tensor_names(self, quant) -> list[str]:
         ret = []
         if quant == "autoawq":
             ret += ["qweight", "qzeros", "scales"]
@@ -291,13 +291,13 @@ class Transformer(nn.Module):
             ret += ["qweight", "qzeros", "scales"]
         return ret
 
-    def _get_1d_in_tensor_names(self, quant) -> List[str]:
+    def _get_1d_in_tensor_names(self, quant) -> list[str]:
         ret = []
         if quant == "gptqmodel":
             ret += ["g_idx"]
         return ret
 
-    def _get_1d_out_tensor_names(self, quant) -> List[str]:
+    def _get_1d_out_tensor_names(self, quant) -> list[str]:
         ret = ["bias"]
         if quant == "simple_w8a8":
             ret += ["scale_channel"]
@@ -726,10 +726,6 @@ class Transformer(nn.Module):
         else:
             return self.prefill_no_pipeline(tokens, output_token_offsets, **args)
 
-    @torch.inference_mode()
-    def prepare_inputs(self, tokens, **args):
-        return self._pre_layers(tokens)
-
     def prepare_decoding_attn(self):
         block_table = self.cache.get_gpu_block_table()
         block_size = self.cache.get_block_size()
@@ -840,7 +836,7 @@ class MoeGate(nn.Module):
             x (torch.Tensor): Input tensor.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
+            tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
         if x.shape[0] == 0:
             return torch.empty(

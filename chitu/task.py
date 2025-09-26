@@ -14,7 +14,7 @@ from datetime import datetime
 from enum import Enum
 from logging import getLogger
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional, Mapping
+from typing import Any, ClassVar, Optional, Mapping
 from typing_extensions import override
 
 import torch
@@ -524,8 +524,8 @@ def req_decode(id_num: int):
 
 
 class TaskPool:
-    pool: Dict[str, Task] = {}
-    id_list: List[str] = []
+    pool: dict[str, Task] = {}
+    id_list: list[str] = []
 
     def __bool__(self):
         return len(self.pool) > 0
@@ -624,15 +624,15 @@ class PackedTasksBase:
 
     # Object fields
     num_tasks: int = 0
-    task_ids: List[str] = field(default_factory=list)
-    req_ids: List[str] = field(default_factory=list)
+    task_ids: list[str] = field(default_factory=list)
+    req_ids: list[str] = field(default_factory=list)
     task_type: Optional[TaskType] = None
-    tokens: List[List[int]] = field(default_factory=list)
+    tokens: list[list[int]] = field(default_factory=list)
     payload_type: SerializedPackedTasksPayloadType = (
         SerializedPackedTasksPayloadType.NoneType
     )
     num_tokens: int = 0
-    has_outputs: List[int] = field(default_factory=list)
+    has_outputs: list[int] = field(default_factory=list)
     response_list_manager = None
 
     @classmethod
@@ -772,8 +772,14 @@ class PackedTasksBase:
 
 
 class PackedTasks(PackedTasksBase):
-    def __init__(self, task_ids: List[str], rank="cuda"):
+    def __init__(self, task_ids: list[str], rank="cuda"):
         super().__init__()
+
+        self.tasks: list[Task] = [TaskPool.pool[tid] for tid in task_ids]
+        self.output_tasks = [task for task in self.tasks if task.has_output()]
+        self.should_apply_frequency_penalty = any(
+            task.params.frequency_penalty > 0 for task in self.output_tasks
+        )
 
         if not task_ids:  # only dp rank0 use this method to create empty packedtasks
             task_type = DPTaskCollector.get_current_task_type()
@@ -793,7 +799,6 @@ class PackedTasks(PackedTasksBase):
         self.task_ids = task_ids
         self.num_tasks = len(task_ids)
         assert self.num_tasks > 0, "No tasks provided"
-        self.tasks: List[Task] = [TaskPool.pool[tid] for tid in task_ids]
 
         self.req_ids = task_ids
         self.reqs = [task.req for task in self.tasks]
@@ -812,18 +817,6 @@ class PackedTasks(PackedTasksBase):
             if task.grid_thw is not None:
                 self.grid_thw.append(task.grid_thw)
 
-        self.pixel_values = (
-            torch.stack(self.pixel_values).to(
-                device=rank, dtype=torch.bfloat16, non_blocking=True
-            )
-            if self.pixel_values
-            else None
-        )
-        self.grid_thw = (
-            torch.cat(self.grid_thw, dim=0).to(device=rank, non_blocking=True)
-            if self.grid_thw
-            else None
-        )
         self.payload_type = SerializedPackedTasksPayloadType(self.task_type.value)
 
         # additional modifications are required when adapting to MTP or Hybrid.
@@ -834,7 +827,6 @@ class PackedTasks(PackedTasksBase):
             else self.num_tasks
         )
 
-        self.output_tasks = [task for task in self.tasks if task.has_output()]
         self.has_outputs = [task.has_output() for task in self.tasks]
 
         # sample related
@@ -852,9 +844,6 @@ class PackedTasks(PackedTasksBase):
             [task.params.frequency_penalty for task in self.output_tasks],
             dtype=torch.float32,
         ).to(device=self.rank, non_blocking=True)
-        self.should_apply_frequency_penalty = any(
-            task.params.frequency_penalty > 0 for task in self.output_tasks
-        )
 
         # logprobs
         self.return_logprobs = any(
@@ -911,10 +900,10 @@ class DPTaskCollector:
     """
 
     _total_packedtasks: PackedTasks = None
-    _task_ids_list: List[List[str]] = []
+    _task_ids_list: list[list[str]] = []
 
     @staticmethod
-    def prepare_dp_tasks(task_ids_list: List[List[str]]):
+    def prepare_dp_tasks(task_ids_list: list[list[str]]):
         DPTaskCollector._task_ids_list = task_ids_list
         DPTaskCollector._total_packedtasks = PackedTasks(
             [task_id for task_ids in task_ids_list for task_id in task_ids]

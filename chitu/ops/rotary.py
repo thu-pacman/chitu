@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
@@ -63,7 +63,7 @@ def apply_rotary_pos_emb_cuda(
     k_out: Optional[torch.Tensor] = None,
     rotary_type: str = "separated",
     impl: str = "auto",
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     if rotary_type == "interleaved":
         q_shape = q.shape
         k_shape = k.shape
@@ -112,7 +112,7 @@ def apply_rotary_pos_emb_torch(
     q_out: Optional[torch.Tensor] = None,
     k_out: Optional[torch.Tensor] = None,
     rotary_type: str = "separated",
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     if rotary_type == "separated":
         # "separated" has an [real, real, ..., real, imag, imag, ..., imag] layout.
         cos = freqs_cis.separatedly_doubled_cos
@@ -158,7 +158,7 @@ def apply_rotary_pos_emb_torch_npu(
     q_out: Optional[torch.Tensor] = None,
     k_out: Optional[torch.Tensor] = None,
     rotary_type: str = "separated",
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     if rotary_type in ["separated", "interleaved"]:
         if rotary_type == "separated":
             cos = freqs_cis.separatedly_doubled_cos
@@ -225,7 +225,7 @@ def apply_rotary_pos_emb_torch_npu_with_output_layout(
     q_out: Optional[ColumnOddEvenSeparatedTensor] = None,
     k_out: Optional[ColumnOddEvenSeparatedTensor] = None,
     rotary_type: str = "separated",
-) -> Tuple[ColumnOddEvenSeparatedTensor, ColumnOddEvenSeparatedTensor]:
+) -> tuple[ColumnOddEvenSeparatedTensor, ColumnOddEvenSeparatedTensor]:
     if rotary_type != "interleaved":
         raise NotImplementedError(
             "apply_rotary_pos_emb_torch_npu_with_output_layout only support interleave"
@@ -289,7 +289,7 @@ def apply_rotary_pos_emb_cpu(
     q_out: Optional[torch.Tensor] = None,
     k_out: Optional[torch.Tensor] = None,
     rotary_type: str = "separated",
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     if q.device.type != "cpu":
         raise ValueError(
             f"apply_rotary_pos_emb input tensor q must be on CPU, got device: {q.device}"
@@ -362,7 +362,7 @@ def apply_rotary_pos_emb(
     rotary_type: str = "separated",
     inplace: bool = True,
     impl: str = "auto",
-) -> Tuple[torch.Tensor | NativeLayoutTensor, torch.Tensor | NativeLayoutTensor]:
+) -> tuple[torch.Tensor | NativeLayoutTensor, torch.Tensor | NativeLayoutTensor]:
     """
     Rotary positional embedding
 
@@ -489,7 +489,7 @@ def apply_rotary_pos_emb_partial(
     rotary_type: str = "separated",
     inplace: bool = True,
     impl: str = "auto",
-) -> Tuple[
+) -> tuple[
     torch.Tensor | NativeLayoutTensor,
     torch.Tensor | NativeLayoutTensor,
     torch.Tensor,

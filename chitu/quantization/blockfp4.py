@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional, Tuple
+from typing import Optional
 from typing_extensions import override
 from logging import getLogger
 
@@ -146,8 +146,8 @@ class Blockfp4LinearBase(QuantizedLinearBase):
         ############################################
         # Parameters specific to this quantization
         bias_dtype=None,
-        block_shape: Tuple[int, int] = (16, 1),
-        block_shape_2: Optional[Tuple[int, int]] = None,
+        block_shape: tuple[int, int] = (16, 1),
+        block_shape_2: Optional[tuple[int, int]] = None,
         act_block_size: int = 128,
         no_input_scale: bool = False,
     ):

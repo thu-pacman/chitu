@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 import re
 from logging import getLogger
 import json
@@ -39,7 +39,7 @@ class ModelConfigResolver:
     """
 
     def __init__(self):
-        self._config_cache: Dict[str, Dict[str, Any]] = {}
+        self._config_cache: dict[str, dict[str, Any]] = {}
 
     def resolve_config_value(self, value: Any, ckpt_dir: Optional[str] = None) -> Any:
         match = re.match(r"^\$\(config\.json:([^)]+)\)$", str(value))
@@ -80,7 +80,7 @@ class ModelConfigResolver:
             logger.warning(f"Error parsing config value '{value}': {e}")
             return value
 
-    def _load_config_json(self, ckpt_dir: str) -> Optional[Dict[str, Any]]:
+    def _load_config_json(self, ckpt_dir: str) -> Optional[dict[str, Any]]:
 
         config_path = Path(ckpt_dir) / "config.json"
 
@@ -102,11 +102,11 @@ class ModelConfigResolver:
 
     def process_config_dict(
         self, config_dict: Any, ckpt_dir: Optional[str] = None
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         if isinstance(config_dict, DictConfig):
             config_dict = OmegaConf.to_container(config_dict, resolve=True)
 
-        processed_dict: Dict[str, Any] = {}
+        processed_dict: dict[str, Any] = {}
         for key, value in config_dict.items():
             if isinstance(value, dict):
                 processed_dict[key] = self.process_config_dict(value, ckpt_dir)

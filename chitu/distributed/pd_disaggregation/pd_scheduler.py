@@ -11,7 +11,7 @@ import asyncio
 import time
 from enum import Enum
 from logging import getLogger
-from typing import Optional, Dict, Any
+from typing import Optional, Any
 import os
 import torch
 
@@ -61,7 +61,7 @@ class PDScheduler(Scheduler):
         self.original_scheduler_type = scheduler_type
 
         # PD disaggregation related state
-        self.pending_decode_requests: Dict[str, Dict] = {}  # request_id -> request_info
+        self.pending_decode_requests: dict[str, dict] = {}  # request_id -> request_info
         self.kv_manager: Optional[KVManager] = None
         self.metadata_buffers: Optional[MetadataBuffers] = None
         self.token_manager = None  # DP token manager for streaming back to Router
@@ -143,7 +143,7 @@ class PDScheduler(Scheduler):
         self.token_manager = token_manager
         logger.info("token manager set for pd scheduler")
 
-    async def process_request(self, request_data: Dict[str, Any]):
+    async def process_request(self, request_data: dict[str, Any]):
         """Process incoming request"""
         request_id = request_data.get("request_id")
         request_type = request_data.get("type", "regular")
@@ -170,7 +170,7 @@ class PDScheduler(Scheduler):
             # Regular request - use traditional processing
             await self._process_regular_request(request_data)
 
-    async def _process_prefill_request(self, request_data: Dict[str, Any]):
+    async def _process_prefill_request(self, request_data: dict[str, Any]):
         """Process Prefill-only request"""
         request_id = request_data["request_id"]
         original_request = request_data["request"]
@@ -193,7 +193,7 @@ class PDScheduler(Scheduler):
             traceback.print_exc()
             logger.error(f"failed to process prefill request {request_id}: {e}")
 
-    async def _process_decode_request(self, request_data: Dict[str, Any]):
+    async def _process_decode_request(self, request_data: dict[str, Any]):
         """Process Decode-only request"""
         request_id = request_data["request_id"]
         original_request = request_data["request"]
@@ -281,7 +281,7 @@ class PDScheduler(Scheduler):
                 decode_info["status"] = PDRequestStatus.FAILED
                 decode_info["error_message"] = str(e)
 
-    async def _process_regular_request(self, request_data: Dict[str, Any]):
+    async def _process_regular_request(self, request_data: dict[str, Any]):
         """Process regular request (traditional mode)"""
         # Use parent class logic for regular requests
         logger.info("processing regular request in traditional mode")
@@ -481,7 +481,7 @@ class PDScheduler(Scheduler):
 
         logger.info(f"decode completed for task: {task.task_id}")
 
-    def get_pd_stats(self) -> Dict:
+    def get_pd_stats(self) -> dict:
         """Get PD disaggregation statistics"""
         stats = {
             "pd_mode": self.pd_mode.value,

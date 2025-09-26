@@ -11,7 +11,7 @@ import logging
 import os
 import time
 from logging import getLogger
-from typing import Any, List, Optional, Mapping, Annotated, Union
+from typing import Any, Optional, Mapping, Annotated
 
 import uvicorn
 import resource
@@ -49,12 +49,12 @@ class HttpHeader(BaseModel):
 
 class Message(BaseModel):
     role: str = "user"
-    content: Union[str, List[Union[str, dict]]] = "hello, who are you"
+    content: str | list[str | dict] = "hello, who are you"
 
 
 class ChatRequest(BaseModel):
     conversation_id: str = Field(default_factory=gen_req_id)
-    messages: List[Message]
+    messages: list[Message]
     logprobs: bool = False
     top_logprobs: Optional[int] = None
     max_tokens: Optional[int] = None

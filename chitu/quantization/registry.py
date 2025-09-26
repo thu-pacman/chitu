@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Dict, List, Mapping, Optional, Type, Callable
+from typing import Any, Mapping, Optional, Type, Callable
 import functools
 import re
 import torch
@@ -30,15 +30,15 @@ class QuantizationRegistry:
 
     # NOTE: The inner dict's key can either be a `str` typed quantization method
     # nane, or `None` for no quantization (a.k.a. "normal" quantization)
-    _linear_registry: Dict[str, Dict[str | None, Type[QuantizedLinearBase]]] = {}
-    _moe_experts_registry: Dict[
-        str, Dict[str | None, Type[QuantizedMoeExpertsBase]]
+    _linear_registry: dict[str, dict[str | None, Type[QuantizedLinearBase]]] = {}
+    _moe_experts_registry: dict[
+        str, dict[str | None, Type[QuantizedMoeExpertsBase]]
     ] = {}
-    _absorb_gemm_registry: Dict[
-        str, Dict[str | None, Type[QuantizedAbsorbGemmBase]]
+    _absorb_gemm_registry: dict[
+        str, dict[str | None, Type[QuantizedAbsorbGemmBase]]
     ] = {}
 
-    _allowed_quant_for_merge_gate_up: List = [
+    _allowed_quant_for_merge_gate_up: list = [
         "blockfp8",
         "autoawq",
         "simple_w8a8",
@@ -46,7 +46,7 @@ class QuantizationRegistry:
         "ascend_w8a8_dynamic",
         None,
     ]
-    _allowed_quant_for_merge_qkv: List = [
+    _allowed_quant_for_merge_qkv: list = [
         "blockfp8",
         "autoawq",
         "simple_w8a8",
@@ -103,7 +103,7 @@ class QuantizationRegistry:
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
         backend_type: str = "default",
     ) -> Type:
-        registry: Dict[str, Dict[str | None, Type]]
+        registry: dict[str, dict[str | None, Type]]
         if class_type == "linear":
             registry = cls._linear_registry
         elif class_type == "moe_experts":

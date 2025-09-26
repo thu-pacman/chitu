@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Optional
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -95,19 +95,19 @@ class TransformerLlama(Transformer):
         if merge_qkv_gate_up:
             raise NotImplementedError("merge_qkv_gate_up is not supported in llama")
 
-    def _get_tensor_column_parallel_layer_names(self) -> List[str]:
+    def _get_tensor_column_parallel_layer_names(self) -> list[str]:
         return ["wq", "wk", "wv", "w1", "w3", "output", "embed"]
 
-    def _get_tensor_row_parallel_layer_names(self) -> List[str]:
+    def _get_tensor_row_parallel_layer_names(self) -> list[str]:
         return ["wo", "w2"]
 
-    def _get_pre_layer_prefixes(self) -> List[str]:
+    def _get_pre_layer_prefixes(self) -> list[str]:
         return ["tok_embeddings."]
 
-    def _get_post_layer_prefixes(self) -> List[str]:
+    def _get_post_layer_prefixes(self) -> list[str]:
         return ["output.", "norm."]
 
-    def _get_layer_i_prefixes(self, i: int) -> List[str]:
+    def _get_layer_i_prefixes(self, i: int) -> list[str]:
         return [f"layers.{i}."]
 
     def _init_pre_layers(self):

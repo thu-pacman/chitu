@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional, Tuple
+from typing import Optional
 import functools
 
 import torch
@@ -65,7 +65,7 @@ class StaticTensor:
             max_nelem, dtype=dtype, device=device, pin_memory=pin_memory
         )
         self._cur_nelem = 0
-        self._cur_shape: Tuple[int] | torch.Size = (0,)
+        self._cur_shape: tuple[int] | torch.Size = (0,)
 
         if tensor is not None:
             self.set(tensor)

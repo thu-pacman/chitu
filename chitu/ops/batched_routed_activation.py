@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Tuple, Optional
+from typing import Optional
 import torch
 
 from chitu.utils import try_import_platform_dep
@@ -23,7 +23,7 @@ def batched_routed_activation_indexed_to_expert_block_indexed(
     block_size: int,
     num_experts: int,
     impl: str = "auto",
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # SPDX-SnippetBegin
     # SPDX-License-Identifier: Apache-2.0
     # SPDX-SnippetCopyrightText: 2025 SGLang Team
@@ -105,7 +105,7 @@ def batched_routed_activation_indexed_to_expert_block_indexed_cuda(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if parallel_groups_initialized() and get_ep_size() > 1:
         num_experts += 1
     # The case of max_num_m_blocks: Suppose the first `num_experts` tokens each
@@ -159,7 +159,7 @@ def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
     n_tokens_padded: int,
     n_tokens_per_expert_padded: torch.Tensor,
     impl: str = "auto",
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Transform from IndexedBatchedRoutedActivationBlockfp8 to
     ExpertBlockPermutedBatchedRoutedActivationBlockfp8

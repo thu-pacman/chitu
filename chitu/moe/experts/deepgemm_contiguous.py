@@ -4,7 +4,7 @@
 
 import functools
 import torch
-from typing import List, Optional
+from typing import Optional
 
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
@@ -42,7 +42,7 @@ def deepgemm_contiguous_fused_expert(
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[List[int]] = None,
+    block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
     experts_start_idx: int = 0,
@@ -72,7 +72,7 @@ def _(
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[List[int]] = None,
+    block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
     experts_start_idx: int = 0,
@@ -136,7 +136,7 @@ def _(
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[List[int]] = None,
+    block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
     experts_start_idx: int = 0,
@@ -202,7 +202,7 @@ def _(
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[List[int]] = None,
+    block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
     experts_start_idx: int = 0,

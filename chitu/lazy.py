@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Callable, Sequence, Mapping, Dict, Any
+from typing import Callable, Sequence, Mapping, Any
 from typing_extensions import override
 from dataclasses import dataclass
 import abc
@@ -78,7 +78,7 @@ class LazyTensor:
                 )
 
         # Merge into a single dictionary
-        merged_kwargs: Dict[str, Any] = {}
+        merged_kwargs: dict[str, Any] = {}
         for name, value in bound.arguments.items():
             param = sig.parameters[name]
             if param.kind == param.VAR_KEYWORD:

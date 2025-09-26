@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import torch
 from logging import getLogger
@@ -11,7 +11,7 @@ logger = getLogger(__name__)
 
 
 class CommGroup:
-    def __init__(self, rank_lists: List[List[int]], global_rank: int, local_rank: int):
+    def __init__(self, rank_lists: list[list[int]], global_rank: int, local_rank: int):
         self.global_rank = global_rank
         self.local_rank = local_rank
 
@@ -73,7 +73,7 @@ class CommGroup:
     def scatter(
         self,
         tensor: torch.Tensor,
-        scatter_list: Optional[List[torch.Tensor]] = None,
+        scatter_list: Optional[list[torch.Tensor]] = None,
         src: int = 0,
         group: Optional[torch.distributed.ProcessGroup] = None,
     ):
@@ -82,7 +82,7 @@ class CommGroup:
     def gather(
         self,
         tensor: torch.Tensor,
-        gather_list: Optional[List[torch.Tensor]] = None,
+        gather_list: Optional[list[torch.Tensor]] = None,
         dst: int = 0,
     ):
         torch.distributed.gather(tensor, gather_list, dst=dst, group=self.gpu_group)
@@ -98,8 +98,8 @@ class CommGroup:
     def all_gatherv_into_tensor_with_cum_size(
         self,
         input: torch.Tensor,
-        cum_size: List[int],
-    ) -> Tuple[torch.Tensor, List[int] | torch.Size]:
+        cum_size: list[int],
+    ) -> tuple[torch.Tensor, list[int] | torch.Size]:
         # For allgather v, we cannot assign output tensor beforehand
         # because we don't known the output shape.
         world_size = self.group_size
@@ -133,7 +133,7 @@ class CommGroup:
     def scatter_v(
         self,
         tensor: torch.Tensor,
-        scatter_list: Optional[List[torch.Tensor]] = None,
+        scatter_list: Optional[list[torch.Tensor]] = None,
         src: int = 0,
     ):
         if self.global_rank == src:
@@ -149,7 +149,7 @@ class CommGroup:
     def gather_v(
         self,
         tensor: torch.Tensor,
-        gather_list: Optional[List[torch.Tensor]] = None,
+        gather_list: Optional[list[torch.Tensor]] = None,
         dst: int = 0,
     ):
         if self.global_rank == dst:

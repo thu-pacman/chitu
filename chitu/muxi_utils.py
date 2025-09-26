@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Optional, Union
+from typing import Optional
 from typing_extensions import override
 import torch
 
@@ -96,17 +96,17 @@ class MuxiNativeLayoutGroupWeight(NativeLayoutTensor):
 
 @single_dispatch_lazy_tensor
 def linear_muxi_layout_native_y(
-    x: Union[torch.Tensor, Vector, BatchPaddedActivation, MuxiNativeLayoutActivation],
+    x: torch.Tensor | Vector | BatchPaddedActivation | MuxiNativeLayoutActivation,
     w: MuxiNativeLayoutWeight,
     b=None,
-) -> Union[Vector, MuxiNativeLayoutActivation]:
+) -> Vector | MuxiNativeLayoutActivation:
     raise ValueError(f"Unsupported input type: {type(x)}")
 
 
 @linear_muxi_layout_native_y.register
 def _(
     x: torch.Tensor, w: MuxiNativeLayoutWeight, b=None
-) -> Union[Vector, MuxiNativeLayoutActivation]:
+) -> Vector | MuxiNativeLayoutActivation:
     if x.numel() == x.shape[-1]:
         x = Vector.convert_from(x)
     else:
@@ -162,19 +162,19 @@ def _(
 
 @single_dispatch_lazy_tensor
 def linear_muxi_layout_contig_y(
-    x_transposed: Union[
-        torch.Tensor, Vector, BatchPaddedActivation, MuxiNativeLayoutActivation
-    ],
+    x_transposed: (
+        torch.Tensor | Vector | BatchPaddedActivation | MuxiNativeLayoutActivation
+    ),
     w: MuxiNativeLayoutWeight,
     b=None,
-) -> Union[Vector, BatchPaddedActivation]:
+) -> Vector | BatchPaddedActivation:
     raise ValueError(f"Unsupported input type: {type(x_transposed)}")
 
 
 @linear_muxi_layout_contig_y.register
 def _(
     x: torch.Tensor, w: MuxiNativeLayoutWeight, b=None
-) -> Union[Vector, BatchPaddedActivation]:
+) -> Vector | BatchPaddedActivation:
     if x.numel() == x.shape[-1]:
         x = Vector.convert_from(x)
     else:
@@ -263,11 +263,11 @@ def _(
 
 @single_dispatch_lazy_tensor
 def blockfp8_linear_muxi_layout_contig_y(
-    x: Union[torch.Tensor, Vector, BatchPaddedActivation],
+    x: torch.Tensor | Vector | BatchPaddedActivation,
     w: MuxiNativeLayoutWeight,
     b=None,
     weight_scale=None,
-) -> Union[Vector, BatchPaddedActivation]:
+) -> Vector | BatchPaddedActivation:
     raise ValueError(f"Unsupported input type: {type(x)}")
 
 
@@ -277,7 +277,7 @@ def _(
     w: MuxiNativeLayoutWeight,
     b=None,
     weight_scale=None,
-) -> Union[Vector, BatchPaddedActivation]:
+) -> Vector | BatchPaddedActivation:
     if x.numel() == x.shape[-1]:
         x = Vector.convert_from(x)
     else:
@@ -367,7 +367,7 @@ def muxi_fused_experts(
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[List[int]] = None,
+    block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
 ):
     """
@@ -458,9 +458,7 @@ class LinearMuxiLayoutNativeY(
 ):
     def forward(
         self,
-        x: Union[
-            torch.Tensor, Vector, BatchPaddedActivation, MuxiNativeLayoutActivation
-        ],
+        x: torch.Tensor | Vector | BatchPaddedActivation | MuxiNativeLayoutActivation,
     ) -> MuxiNativeLayoutActivation:
         return linear_muxi_layout_native_y(
             x, self.get_native_layout_weight(), self.bias
@@ -472,9 +470,7 @@ class LinearMuxiLayoutContigY(
 ):
     def forward(
         self,
-        x: Union[
-            torch.Tensor, Vector, BatchPaddedActivation, MuxiNativeLayoutActivation
-        ],
+        x: torch.Tensor | Vector | BatchPaddedActivation | MuxiNativeLayoutActivation,
     ) -> torch.Tensor:
         return linear_muxi_layout_contig_y(
             x, self.get_native_layout_weight(), self.bias
@@ -484,9 +480,7 @@ class LinearMuxiLayoutContigY(
 class Blockfp8LinearMuxiLayoutContigY(
     enable_native_layout_weight("weight", MuxiNativeLayoutWeight), Blockfp8Linear
 ):
-    def forward(
-        self, x: Union[torch.Tensor, Vector, BatchPaddedActivation]
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor | Vector | BatchPaddedActivation) -> torch.Tensor:
         return blockfp8_linear_muxi_layout_contig_y(
             x, self.get_native_layout_weight(), self.bias, self.scale
         ).convert_to_plain()

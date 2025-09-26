@@ -9,7 +9,7 @@ Integrates PD components into cinfer scheduler service
 
 import asyncio
 import logging
-from typing import Dict, Optional
+from typing import Optional
 import os
 
 import msgpack
@@ -481,7 +481,7 @@ class PDSchedulerService:
                 logger.error(f"error in stats reporter: {e}")
                 await asyncio.sleep(1.0)
 
-    def _collect_stats(self) -> Dict:
+    def _collect_stats(self) -> dict:
         """Collect scheduler statistics"""
         stats = {
             "scheduler_id": self.rank,

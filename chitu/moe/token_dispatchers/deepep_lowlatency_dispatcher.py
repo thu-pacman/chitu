@@ -5,7 +5,6 @@
 # Modified from DeepSeek's DeepEP project
 # https://github.com/deepseek-ai/DeepEP
 
-from typing import Tuple
 from logging import getLogger
 
 import torch
@@ -177,7 +176,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        handle: Tuple,
+        handle: tuple,
         zero_copy: bool = False,
         async_finish: bool = False,
         return_recv_hook: bool = False,

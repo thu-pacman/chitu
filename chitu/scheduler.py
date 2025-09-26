@@ -4,7 +4,7 @@
 
 import time
 from logging import getLogger
-from typing import List, Optional  # Please keep Python 3.8 compatible
+from typing import Optional
 from typing_extensions import override
 
 from chitu.task import TaskPool, TaskType, DPTaskCollector
@@ -160,7 +160,7 @@ class Scheduler:
             return (fn(task),)
         return tuple(fn(task) for fn in self.scorers)
 
-    def schedule(self) -> List[str]:
+    def schedule(self) -> list[str]:
         if TaskPool.is_empty():
             logger.debug("TaskPool is empty, returning empty task list.")
             return []
@@ -234,7 +234,7 @@ class Scheduler:
 
         return task_ids
 
-    def _schedule_prefill_tasks(self, task_ids: List[str]) -> List[str]:
+    def _schedule_prefill_tasks(self, task_ids: list[str]) -> list[str]:
         """Prefill tasks scheduling with congestion control
         Args:
             task_ids: list of unwait task ids
@@ -302,7 +302,7 @@ class Scheduler:
 
         return prefill_task_ids[:num_tasks]
 
-    def _schedule_decode_tasks(self, task_ids: List[str]) -> List[str]:
+    def _schedule_decode_tasks(self, task_ids: list[str]) -> list[str]:
         """Decode tasks scheduling, evicting the last prioriety decode task when these is no more block
         Args:
             task_ids: list of unwait task ids
@@ -408,7 +408,7 @@ class Scheduler:
                                 )
                                 break
 
-    def update(self, cur_task_ids: List[str], unwait_task_ids: List[str] = []):
+    def update(self, cur_task_ids: list[str], unwait_task_ids: list[str] = []):
         removed_task_ids = []
         task_ids = cur_task_ids + unwait_task_ids
         task_ids = list(set(task_ids))
@@ -442,7 +442,7 @@ class SkewPipelineScheduler(Scheduler):
         self.slot_id = 0
 
     @override
-    def schedule(self) -> List[str]:
+    def schedule(self) -> list[str]:
         # search unwaiting prefill tasks
         prefill_task_ids = list(
             filter(
@@ -508,7 +508,7 @@ class DPFifoScheduler(Scheduler):  # used for expert_data_parallel
         self.have_task = None
         self.kvcache_block_threshold = 0
 
-    def schedule(self) -> List[List[str]]:
+    def schedule(self) -> list[list[str]]:
         self.have_task = False
 
         prefill_task_ids = filter(

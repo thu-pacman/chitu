@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Tuple, Optional
+from typing import Optional
 
 import torch
 import triton
@@ -157,7 +157,7 @@ def batched_routed_activation_indexed_to_expert_block_indexed_triton(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # The case of max_num_m_blocks: Suppose the first `num_experts` tokens each
     # routed to a different expert, each occupying one block. For the reset
     # `topk_ids.numel() - num_experts` tokens, every `block_size` tokens contributes
@@ -457,7 +457,7 @@ def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8_triton(
     block_size: int,
     n_tokens_padded: int,
     n_tokens_per_expert_padded: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     assert n_tokens_padded % block_size == 0
     n_blocks = n_tokens_padded // block_size
 

@@ -6,7 +6,7 @@
 # https://github.com/deepseek-ai/DeepEP
 
 from logging import getLogger
-from typing import Optional, Tuple, Union
+from typing import Optional
 
 import torch
 
@@ -84,7 +84,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
 
     def dispatch_forward(
         self,
-        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         async_finish: bool = False,
@@ -144,7 +144,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         self,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
-        handle: Tuple,
+        handle: tuple,
         async_finish: bool = False,
         previous_event: Optional["deep_ep.EventOverlap"] = None,
     ):

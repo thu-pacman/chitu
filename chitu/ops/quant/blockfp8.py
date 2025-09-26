@@ -2,8 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Tuple
-
 import torch
 
 from chitu.utils import (
@@ -32,7 +30,7 @@ if has_triton:
 
 def blockfp8_weight_quant(
     w: torch.Tensor, block_size: int = 128
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     row, col = w.shape
     assert row % block_size == 0
     assert col % block_size == 0
@@ -228,7 +226,7 @@ def soft_fp8_blockfp8_weight_dequant(
 
 def blockfp8_act_quant(
     x: torch.Tensor, block_size: int = 128, impl: str = "auto"
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantizes the input tensor `x` using block-wise quantization.
 
@@ -237,7 +235,7 @@ def blockfp8_act_quant(
         block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+        tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - The quantized tensor with dtype `torch.float8_e4m3fn`.
             - A tensor of scaling factors with dtype `torch.float32`.
     """
@@ -253,7 +251,7 @@ def blockfp8_act_quant(
 
 def silu_and_mul_and_blockfp8_act_quant(
     x: torch.Tensor, block_size: int = 128, impl: str = "auto"
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     if impl == "auto":
         impl = "triton"
 

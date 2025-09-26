@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Tuple, Optional
+from typing import Optional
 
 import torch
 import triton
@@ -19,7 +19,7 @@ def apply_rotary_pos_emb_triton(
     q_out: Optional[torch.Tensor] = None,
     k_out: Optional[torch.Tensor] = None,
     rotary_type: str = "separated",
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     # Triton does not support in-place operation. This function is only a compatitive
     # adaptor for in-place interface, but not for performance.
     q_embed, k_embed = apply_rotary_pos_emb_triton_out_of_place(
@@ -43,7 +43,7 @@ def apply_rotary_pos_emb_triton_out_of_place(
     freqs_cis: BatchedFreqsCis,
     rotary_type: str = "separated",
     block_size=128,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     # Prepare output tensor
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)

@@ -6,7 +6,7 @@ import math
 import re
 import gc
 from logging import getLogger
-from typing import Any, List, Mapping, Optional
+from typing import Any, Mapping, Optional
 from typing_extensions import override
 
 import torch
@@ -700,7 +700,7 @@ class TransformerDeepSeekV3(Transformer):
         )
 
     @override
-    def _get_tensor_column_parallel_layer_names(self) -> List[str]:
+    def _get_tensor_column_parallel_layer_names(self) -> list[str]:
         return [
             "embed_tokens",
             "q_b_proj",
@@ -712,19 +712,19 @@ class TransformerDeepSeekV3(Transformer):
         ]
 
     @override
-    def _get_tensor_row_parallel_layer_names(self) -> List[str]:
+    def _get_tensor_row_parallel_layer_names(self) -> list[str]:
         return ["o_proj", "down_proj"]
 
     @override
-    def _get_pre_layer_prefixes(self) -> List[str]:
+    def _get_pre_layer_prefixes(self) -> list[str]:
         return ["embed_tokens."]
 
     @override
-    def _get_post_layer_prefixes(self) -> List[str]:
+    def _get_post_layer_prefixes(self) -> list[str]:
         return ["lm_head.", "norm."]
 
     @override
-    def _get_layer_i_prefixes(self, i: int) -> List[str]:
+    def _get_layer_i_prefixes(self, i: int) -> list[str]:
         return [f"layers.{i}."]
 
     @override
@@ -1414,7 +1414,7 @@ def precompute_freqs_cis_deepseek_v3(args, max_position_embeddings) -> torch.Ten
             max_seq_len (int): Maximum sequence length.
 
         Returns:
-            Tuple[int, int]: The range of correction dimensions (low, high), clamped to valid indices.
+            tuple[int, int]: The range of correction dimensions (low, high), clamped to valid indices.
         """
         low = math.floor(find_correction_dim(low_rot, dim, base, max_seq_len))
         high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))

@@ -10,12 +10,13 @@ import os
 import re
 from pathlib import Path
 import random
-from typing import Any, List, Tuple
+from typing import Any
 import socket
 import site
 
 import torch
 import importlib
+import importlib.resources
 from chitu.device_type import is_ascend
 
 from chitu.global_vars import get_global_args
@@ -23,7 +24,7 @@ from chitu.global_vars import get_global_args
 logger = getLogger(__name__)
 
 
-def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> Tuple[Any, bool]:
+def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> tuple[Any, bool]:
     """
     Import an optional dependency.
 
@@ -78,7 +79,7 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> Tuple[Any, bool]:
         return ReportErrorWhenUsed(e), False
 
 
-def try_import_platform_dep(pkg_name: str) -> Tuple[Any, bool]:
+def try_import_platform_dep(pkg_name: str) -> tuple[Any, bool]:
     """
     Import a dependency that may not be available on all platforms.
 
@@ -174,10 +175,7 @@ def compute_layer_dist_in_pipe(num_layers, world_size):
 
 
 def get_config_dir_path():
-    # Deprecated, but we need to support Python 3.8. importlib.resources is preferred in the future.
-    import pkg_resources
-
-    return pkg_resources.resource_filename("chitu", "config")
+    return str(importlib.resources.files("chitu") / "config")
 
 
 def get_ascend_custom_opp_path():
@@ -233,16 +231,16 @@ class DataSaver:
         max_files: int = 5,
         save_prob: float = 0.1,
         save_dir: str = "test_data",
-        save_tensors: List[str] = [],
-        save_attrs: List[str] = [],
-        save_locals: List[str] = [],
+        save_tensors: list[str] = [],
+        save_attrs: list[str] = [],
+        save_locals: list[str] = [],
         save_return: bool = True,
     ):
         self.max_files = max_files
         self.save_prob = save_prob
         self.save_dir = Path(save_dir + "/")
-        self.saved_files: List[str] = []  # 存储所有保存的文件名
-        self.replaceable_files: List[str] = []  # 存储可替换的文件名
+        self.saved_files: list[str] = []  # 存储所有保存的文件名
+        self.replaceable_files: list[str] = []  # 存储可替换的文件名
         self.call_count = 0
         self.random = random.Random(42)  # 使用固定种子确保可重复性
         self.save_return = save_return  # 是否默认保存函数返回值

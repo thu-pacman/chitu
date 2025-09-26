@@ -44,7 +44,6 @@ docker rm ${container_base_name}-${image_version}-stage1 || true
 docker build \
     -f "${dockerfile}" \
     --build-arg optional_deps="${optional_deps}" \
-    --build-arg enable_editable_install="${enable_editable_install}" \
     --build-arg enable_cython="${enable_cython}" \
     --build-arg enable_test="${enable_test}" \
     -t ${image_name}:${image_version}-stage0 \

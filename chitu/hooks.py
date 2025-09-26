@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-from typing import List, Protocol, Optional
+from typing import Protocol, Optional
 import logging
 import asyncio
 
@@ -18,18 +18,18 @@ class KVTransferHook(Protocol):
     receive KV before decode. Default (NoopKVTransferHook) does nothing.
     """
 
-    def on_prefill_done(self, req_ids_output: List[str], logits):
+    def on_prefill_done(self, req_ids_output: list[str], logits):
         pass
 
-    def before_decode_step(self, req_ids: List[str]):
+    def before_decode_step(self, req_ids: list[str]):
         pass
 
 
 class NoopKVTransferHook:
-    def on_prefill_done(self, req_ids_output: List[str], logits):
+    def on_prefill_done(self, req_ids_output: list[str], logits):
         return
 
-    def before_decode_step(self, req_ids: List[str]):
+    def before_decode_step(self, req_ids: list[str]):
         return
 
 
@@ -42,10 +42,10 @@ class TokenSink(Protocol):
 
     def emit_batch(
         self,
-        task_list: List[Task],
-        token_list: List[int],
-        logprobs_list: Optional[List[List[float]]] = None,
-        token_idxs_list: Optional[List[List[int]]] = None,
+        task_list: list[Task],
+        token_list: list[int],
+        logprobs_list: Optional[list[list[float]]] = None,
+        token_idxs_list: Optional[list[list[int]]] = None,
     ) -> None:
         pass
 
@@ -53,10 +53,10 @@ class TokenSink(Protocol):
 class LocalTokenSink:
     def emit_batch(
         self,
-        task_list: List[Task],
-        token_list: List[int],
-        logprobs_list: Optional[List[List[float]]] = None,
-        token_idxs_list: Optional[List[List[int]]] = None,
+        task_list: list[Task],
+        token_list: list[int],
+        logprobs_list: Optional[list[list[float]]] = None,
+        token_idxs_list: Optional[list[list[int]]] = None,
     ) -> None:
         if logprobs_list is None or token_idxs_list is None:
             for task, token in zip(task_list, token_list):
@@ -85,10 +85,10 @@ class DPTokenSink:
 
     def emit_batch(
         self,
-        task_list: List[Task],
-        token_list: List[int],
-        logprobs_list: Optional[List[List[float]]] = None,
-        token_idxs_list: Optional[List[List[int]]] = None,
+        task_list: list[Task],
+        token_list: list[int],
+        logprobs_list: Optional[list[list[float]]] = None,
+        token_idxs_list: Optional[list[list[int]]] = None,
     ) -> None:
         return
 
@@ -105,7 +105,7 @@ class MooncakeKVTransferHook:
         self.kv_manager = kv_manager
         self.mode = disaggregation_mode
 
-    def on_prefill_done(self, req_ids_output: List[str], logits):
+    def on_prefill_done(self, req_ids_output: list[str], logits):
         if self.kv_manager is None:
             return
         if self.mode != "prefill":
@@ -125,7 +125,7 @@ class MooncakeKVTransferHook:
             # Avoid bringing down the compute path if transfer fails; log upstream.
             pass
 
-    def before_decode_step(self, req_ids: List[str]):
+    def before_decode_step(self, req_ids: list[str]):
         if self.kv_manager is None:
             return
         if self.mode != "decode":
@@ -139,7 +139,7 @@ class MooncakeKVTransferHook:
                 return
             # Short-circuit if KV already present for all requests
             try:
-                pending: List[str] = []
+                pending: list[str] = []
                 for rid in req_ids:
                     has_kv = False
                     if hasattr(cache_manager, "get_page_indices"):

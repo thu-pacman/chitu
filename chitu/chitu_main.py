@@ -7,7 +7,6 @@ import logging
 import operator
 import os
 from logging import getLogger
-from typing import List
 import psutil
 
 import torch
@@ -496,8 +495,8 @@ def chitu_run_normal():
 
 
 def _update_ongoing_tasks():
-    unwait_tasks: List[PackedTasks] = []
-    logits_list: List[torch.Tensor] = []
+    unwait_tasks: list[PackedTasks] = []
+    logits_list: list[torch.Tensor] = []
     for ogr in Backend.ongoing_reqs:
         if ogr.handle.is_completed():
             Backend.ongoing_reqs.remove(ogr)

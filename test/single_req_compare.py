@@ -5,7 +5,6 @@ import os
 import random
 import logging
 from logging import getLogger
-from typing import List, Tuple
 
 from chitu.task import UserRequest, TaskPool, Task
 from chitu.chitu_main import (
@@ -38,7 +37,7 @@ def load_result(filename="data.json"):
 
 def check_result(
     result_0_lst, result_1_lst, threshold=0.99
-) -> Tuple[float, float, int, int]:
+) -> tuple[float, float, int, int]:
     tot_cos_sim = 0.0
     logit_cnt = 0
     min_cos_sim = float("inf")
@@ -125,7 +124,7 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens):
             if len(tkn.encode(tkn.decode(tokens), bos=False, eos=True)) == token_length:
                 return tkn.decode(tokens)
 
-    reqs: List[UserRequest] = []
+    reqs: list[UserRequest] = []
     for i in range(num_reqs):
         msg = generate_prompt(prompt_len - 1, Backend.tokenizer)
         req = UserRequest(msg, f"{gen_req_id()}", max_new_tokens=max_new_tokens)
@@ -134,7 +133,7 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens):
 
 
 def gen_reqs_real(num_reqs, max_new_tokens):
-    reqs: List[UserRequest] = []
+    reqs: list[UserRequest] = []
     for i in range(num_reqs):
         req = UserRequest(
             msgs[i % len(msgs)],

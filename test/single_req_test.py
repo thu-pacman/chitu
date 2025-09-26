@@ -1,4 +1,3 @@
-from typing import List
 import hydra
 import torch
 import time
@@ -63,7 +62,7 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens):
             ):
                 return tkn.decode(tokens)
 
-    reqs: List[UserRequest] = []
+    reqs: list[UserRequest] = []
     for i in range(num_reqs):
         msg = generate_prompt(prompt_len - 1, Backend.tokenizer)
         req = UserRequest(msg, f"{gen_req_id()}", max_new_tokens=max_new_tokens)
@@ -72,7 +71,7 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens):
 
 
 def gen_reqs_real(num_reqs, max_new_tokens, is_vl=False):
-    reqs: List[UserRequest] = []
+    reqs: list[UserRequest] = []
     for i in range(num_reqs):
         if is_vl:
             req = UserRequest(

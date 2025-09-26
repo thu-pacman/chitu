@@ -9,13 +9,10 @@ from typing import (
     AbstractSet,
     cast,
     Collection,
-    Dict,
     Iterator,
-    List,
     Literal,
     Sequence,
     TypedDict,
-    Union,
     Mapping,
     Any,
 )
@@ -36,7 +33,7 @@ Role = Literal["system", "user", "assistant"]
 
 class Message(TypedDict):
     role: Role
-    content: Union[str, List[Union[str, dict]]]
+    content: str | list[str | dict]
 
 
 Dialog = Sequence[Message]
@@ -68,7 +65,7 @@ class Tokenizer:
     Tokenizing and encoding/decoding text using the Tiktoken tokenizer.
     """
 
-    special_tokens: Dict[str, int]
+    special_tokens: dict[str, int]
 
     num_reserved_special_tokens = 256
 
@@ -165,9 +162,9 @@ class Tokenizer:
         *,
         bos: bool,
         eos: bool,
-        allowed_special: Union[Literal["all"], AbstractSet[str]] = set(),
-        disallowed_special: Union[Literal["all"], Collection[str]] = (),
-    ) -> List[int]:
+        allowed_special: Literal["all"] | AbstractSet[str] = set(),
+        disallowed_special: Literal["all"] | Collection[str] = (),
+    ) -> list[int]:
         """
         Encodes a string into a list of token IDs.
 
@@ -207,7 +204,7 @@ class Tokenizer:
                 s[i : i + TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS
             )
         )
-        t: List[int] = []
+        t: list[int] = []
         for substr in substrs:
             t.extend(
                 self.model.encode(
@@ -227,7 +224,7 @@ class Tokenizer:
         Decodes a list of token IDs into a string.
 
         Args:
-            t (List[int]): The list of token IDs to be decoded.
+            t (list[int]): The list of token IDs to be decoded.
 
         Returns:
             str: The decoded string.
@@ -235,7 +232,7 @@ class Tokenizer:
         # Typecast is safe here. Tiktoken doesn't do anything list-related with the sequence.
         if len(t) == 1 and t[0] in self.stop_tokens:
             return ""
-        return self.model.decode(cast(List[int], t))
+        return self.model.decode(cast(list[int], t))
 
     @staticmethod
     def _split_whitespaces_or_nonwhitespaces(
@@ -268,7 +265,7 @@ class ChatFormat:
     def __init__(self, tokenizer: Tokenizer):
         self.tokenizer = tokenizer
 
-    def encode_header(self, message: Message) -> List[int]:
+    def encode_header(self, message: Message) -> list[int]:
         tokens = []
         tokens.append(self.tokenizer.special_tokens["<|start_header_id|>"])
         tokens.extend(self.tokenizer.encode(message["role"], bos=False, eos=False))
@@ -276,7 +273,7 @@ class ChatFormat:
         tokens.extend(self.tokenizer.encode("\n\n", bos=False, eos=False))
         return tokens
 
-    def encode_message(self, message: Message) -> List[int]:
+    def encode_message(self, message: Message) -> list[int]:
         tokens = self.encode_header(message)
         tokens.extend(
             self.tokenizer.encode(message["content"].strip(), bos=False, eos=False)
@@ -288,7 +285,7 @@ class ChatFormat:
         self,
         dialog: Dialog,
         chat_template_kwargs: Mapping[str, Any] = {},
-    ) -> List[int]:
+    ) -> list[int]:
         if chat_template_kwargs:
             raise NotImplementedError(
                 "Chat template kwargs are not supported for this tokenizer."
@@ -339,7 +336,7 @@ class TokenizerHF:
         self.pad_id = self.model.pad_token_id
         self.n_words = self.model.vocab_size
 
-    def encode(self, s: str, bos: bool, eos: bool) -> List[int]:
+    def encode(self, s: str, bos: bool, eos: bool) -> list[int]:
         t = self.model.encode(s, add_special_tokens=False)
         if bos and self.bos_id is not None:
             t.insert(0, self.bos_id)
@@ -371,13 +368,13 @@ class ChatFormatHF:
         self.tokenizer = tokenizer
         self.processor = processor
 
-    def encode_header(self, message: Message) -> List[int]:  # ???
+    def encode_header(self, message: Message) -> list[int]:  # ???
         tokens = []
         tokens.extend(self.tokenizer.encode(message["role"], bos=True, eos=False))
         tokens.extend(self.tokenizer.encode("\n", bos=False, eos=False))
         return tokens
 
-    def encode_message(self, message: Message) -> List[int]:
+    def encode_message(self, message: Message) -> list[int]:
         tokens = self.encode_header(message)
         tokens.extend(
             self.tokenizer.encode(message["content"].strip(), bos=False, eos=True)

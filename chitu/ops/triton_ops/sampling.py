@@ -2,8 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List
-
 import torch
 import triton
 import triton.language as tl
@@ -16,7 +14,7 @@ from chitu.device_list import DeviceList
 def apply_frequency_penalty_triton(
     logits: torch.Tensor,
     logits_index: torch.Tensor,
-    response_list: List[DeviceList],
+    response_list: list[DeviceList],
     response_len_list: torch.Tensor,
     frequency_penalty: torch.Tensor,
 ):

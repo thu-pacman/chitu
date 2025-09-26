@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional, List
+from typing import Optional
 
 import torch
 
@@ -20,7 +20,7 @@ if has_triton and torch.cuda.is_available():
 def multinomial(
     probs: torch.Tensor,
     num_samples: int,
-    seq_groups: Optional[List] = None,
+    seq_groups: Optional[list] = None,
     impl: str = "torch",
 ) -> torch.Tensor:
     if impl == "torch":
@@ -58,7 +58,7 @@ def multinomial(
 def apply_frequency_penalty(
     logits: torch.Tensor,
     logits_index: DeviceList,
-    response_list: List[DeviceList],
+    response_list: list[DeviceList],
     response_len_list: DeviceList,
     frequency_penalty: torch.Tensor,
     impl="auto",

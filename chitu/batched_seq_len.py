@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Optional
+from typing import Optional
 import itertools
 import functools
 import torch
@@ -20,7 +20,7 @@ class BatchedSeqLen:
     set, and update it in place via `copy_from`.
 
     Args:
-        lens_list (List[int]): The lengths of different sequences in one batch
+        lens_list (list[int]): The lengths of different sequences in one batch
         device (torch.device): The device of GPU.
         max_batch_size: Reserved max batch size, used for supporting CUDA graph.
             If not set, use `len(lens_list)` by default.
@@ -46,7 +46,7 @@ class BatchedSeqLen:
 
     def __init__(
         self,
-        lens_list: List[int],
+        lens_list: list[int],
         device: torch.device | str,
         *,
         max_batch_size: Optional[int] = None,
@@ -93,7 +93,7 @@ class BatchedSeqLen:
     @classmethod
     def from_tokens(
         cls,
-        tokens: List[List[int]],
+        tokens: list[list[int]],
         device: torch.device | str,
         *,
         max_batch_size: Optional[int] = None,
@@ -112,7 +112,7 @@ class BatchedSeqLen:
             cache_seq_ids_tensor_device=cache_seq_ids_tensor_device,
         )
 
-    def copy_from_list(self, lens_list: List[int]):
+    def copy_from_list(self, lens_list: list[int]):
         self.lens_list = lens_list
         self.lens_static_tensor_device.set(
             torch.tensor(self.lens_list, device=self.device, dtype=torch.int32)
@@ -178,7 +178,7 @@ class BatchedSeqLen:
         return self.lens_static_tensor_device.get()
 
     @functools.cached_property
-    def prefix_lens_list(self) -> List[int]:
+    def prefix_lens_list(self) -> list[int]:
         return list(itertools.accumulate(self.lens_list, initial=0))
 
     @cuda_graph_safe_cached_property(
@@ -298,8 +298,8 @@ class BatchedSeqLenDelta:
 
     def __init__(
         self,
-        old_len_list: List[int] = [],
-        new_len_list: List[int] = [],
+        old_len_list: list[int] = [],
+        new_len_list: list[int] = [],
         *,
         device: torch.device | str,
         max_batch_size: Optional[int] = None,
@@ -356,7 +356,7 @@ class BatchedSeqLenDelta:
                 max_nelem=max_total_delta_len, dtype=torch.int32, device=device
             )
 
-    def copy_from_list(self, old_len_list: List[int], new_len_list: List[int]):
+    def copy_from_list(self, old_len_list: list[int], new_len_list: list[int]):
         self.old.copy_from_list(old_len_list)
         self.new.copy_from_list(new_len_list)
         self._delta.copy_from_list(

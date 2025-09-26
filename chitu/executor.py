@@ -7,7 +7,7 @@ import zmq
 import msgpack
 from dataclasses import dataclass, asdict
 from logging import getLogger
-from typing import List, Optional, Tuple, Union
+from typing import Optional
 from abc import ABC, abstractmethod
 
 
@@ -16,7 +16,7 @@ import torch
 import torch.distributed
 
 from chitu.backend import Backend, BackendState
-from chitu.global_vars import get_timers
+from chitu.global_vars import get_global_args, get_timers
 from chitu.task import (
     PackedTasks,
     PackedTasksBase,
@@ -64,9 +64,9 @@ class BatchResult:
     """
 
     num_tasks: int
-    tasks: List[Task]
+    tasks: list[Task]
 
-    next_tokens: List[int]
+    next_tokens: list[int]
     return_logprobs: bool = False
     logprobs: Optional[torch.Tensor] = None
     token_idxs: Optional[torch.Tensor] = None
@@ -115,7 +115,7 @@ class PipeDispatcher(TasksDispatcher):
         self,
         tasks: Optional[PackedTasksBase],
         payload_type: Optional[SerializedPackedTasksPayloadType] = None,
-    ) -> Optional[Tuple[SerializedPackedTasksPayloadType, PackedTasksBase]]:
+    ) -> Optional[tuple[SerializedPackedTasksPayloadType, PackedTasksBase]]:
         # recv task from previous stage
         if self.is_first_stage:
             task_tensor = tasks.serialize(
@@ -186,7 +186,7 @@ class TensorDispatcher(TasksDispatcher):
         self,
         tasks: Optional[PackedTasksBase],
         payload_type: Optional[SerializedPackedTasksPayloadType] = None,
-    ) -> Tuple[SerializedPackedTasksPayloadType, PackedTasksBase]:
+    ) -> tuple[SerializedPackedTasksPayloadType, PackedTasksBase]:
         if self.is_main_rank:
             task_tensor = tasks.serialize(
                 payload_type=payload_type,
@@ -259,7 +259,7 @@ class ExpertDataDispatcher(TasksDispatcher):
         if self.socket not in events:
             raise RuntimeError(f"rank {self.rank}: connect timeout ({timeout}ms)")
 
-    def serialize_tasks(self, tasks: List[Task]) -> bytes:
+    def serialize_tasks(self, tasks: list[Task]) -> bytes:
         tasks_data = [asdict(task) for task in tasks]
         return msgpack.packb(tasks_data, use_bin_type=True)
 
@@ -392,7 +392,7 @@ class ExpertDataDispatcher(TasksDispatcher):
             tensor=tokens, gather_list=gather_list, dst=self.dp_main_rank
         )
 
-        if tokens.numel() == 0:
+        if tokens.numel() == 0 and not self.is_main_rank:
             return
 
         # update local response
@@ -420,7 +420,7 @@ class ExpertDataDispatcher(TasksDispatcher):
     def send_payload(self, payload: torch.Tensor):
         return payload
 
-    def recv_payload(self, payload: Union[torch.Tensor, List[torch.Tensor]]):
+    def recv_payload(self, payload: torch.Tensor | list[torch.Tensor]):
         return payload
 
 
@@ -441,12 +441,14 @@ class Executor:
         self.dp_size = args.infer.dp_size
         self.pipe_dispatcher = None
         self.task_dispatchers = []
+        self.tp_group = None
         if self.pp_size > 1:
             self.pipe_dispatcher = PipeDispatcher()
             if self.pipe_dispatcher.is_main_rank:
                 self.task_dispatchers.append(self.pipe_dispatcher)
         if self.tp_size > 1:
             self.task_dispatchers.append(TensorDispatcher())
+            self.tp_group = get_tp_group()
 
         if self.pipe_dispatcher and not self.pipe_dispatcher.is_first_stage:
             self.get_payload_shape = lambda num_tokens: [num_tokens, args.models.dim]
@@ -504,6 +506,82 @@ class Executor:
             dtype=torch.long,
         )
 
+    def vision_tensor_broadcast(
+        self,
+        tensor,
+        expected_ndim: int,
+        dtype: torch.dtype,
+        stack: bool = True,
+    ) -> Optional[torch.Tensor]:
+        """Broadcast multimodal tensor across TP ranks if TP size > 1.
+
+        Args:
+            tensor: The tensor to broadcast, can be None
+            expected_ndim: Expected number of dimensions for the tensor
+            dtype: Data type for the tensor
+            stack: torch.stack or torch.cat
+        Returns:
+            The broadcasted tensor on all ranks, or None if input was None
+        """
+        if self.tp_size <= 1:
+            if tensor == None or len(tensor) == 0:
+                return None
+            if stack:
+                return torch.stack(tensor).to(dtype=dtype, device=self.local_rank)
+            else:
+                return torch.cat(tensor, dim=0).to(dtype=dtype, device=self.local_rank)
+
+        tp_group = self.tp_group
+
+        if tp_group.rank_in_group == 0:
+            has_tensor = (
+                1
+                if (
+                    tensor is not None
+                    and (not isinstance(tensor, list) or len(tensor) > 0)
+                )
+                else 0
+            )
+            flag = torch.tensor([has_tensor], dtype=torch.int32, device=self.local_rank)
+        else:
+            flag = torch.zeros(1, dtype=torch.int32, device=self.local_rank)
+
+        torch.distributed.broadcast(
+            flag, src=tp_group.rank_list[0], group=tp_group.gpu_group
+        )
+
+        if flag.item() == 0:
+            return None
+
+        if tp_group.rank_in_group == 0:
+            if stack:
+                tensor = torch.stack(tensor)
+            else:
+                tensor = torch.cat(tensor, dim=0)
+            tensor = tensor.to(dtype=dtype).to(self.local_rank)
+            shape_tensor = torch.tensor(
+                tensor.shape, dtype=torch.int64, device=self.local_rank
+            )
+        else:
+            shape_tensor = torch.zeros(
+                expected_ndim, dtype=torch.int64, device=self.local_rank
+            )
+
+        torch.distributed.broadcast(
+            shape_tensor, src=tp_group.rank_list[0], group=tp_group.gpu_group
+        )
+
+        if tp_group.rank_in_group != 0:
+            tensor = torch.empty(
+                tuple(shape_tensor.tolist()), dtype=dtype, device=self.local_rank
+            )
+
+        torch.distributed.broadcast(
+            tensor, src=tp_group.rank_list[0], group=tp_group.gpu_group
+        )
+
+        return tensor
+
     def step(self, tasks: Optional[PackedTasksBase]) -> torch.Tensor:
         # 1. propagate tasks and handle special payload type
         payload_type = tasks.payload_type if tasks is not None else None
@@ -521,6 +599,8 @@ class Executor:
             # Delete item from KV cache
             for rid in tasks.req_ids:
                 Backend.cache_manager.finalize_cache_all_decode(rid)
+                if get_global_args().models.type == "hf-qwen3-next":
+                    Backend.linear_attn_cache_manager.finalize_cache_all_decode(rid)
             return None
 
         if self.moe_impl is not None:
@@ -571,6 +651,10 @@ class Executor:
         Backend.cache_manager.prepare_cache_prefill(
             tasks.req_ids, [len(t) for t in tasks.tokens]
         )
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.prepare_cache_prefill(
+                tasks.req_ids, [len(t) for t in tasks.tokens]
+            )
 
         num_tokens = tasks.num_tokens
 
@@ -597,8 +681,12 @@ class Executor:
         out = Backend.model.prefill(
             payload,
             self._get_output_token_offsets(tasks),
-            pixel_values=getattr(tasks, "pixel_values", None),
-            grid_thw=getattr(tasks, "grid_thw", None),
+            pixel_values=self.vision_tensor_broadcast(
+                getattr(tasks, "pixel_values", None), 3, torch.bfloat16
+            ),
+            grid_thw=self.vision_tensor_broadcast(
+                getattr(tasks, "grid_thw", None), 2, torch.int64, stack=False
+            ),
         )
         self.timers("prefill").stop()
 
@@ -616,6 +704,8 @@ class Executor:
             dispatcher.send_payload(out)
 
         Backend.cache_manager.finalize_cache_all_prefill()  # like reset metadata
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.finalize_cache_all_prefill()
         return out
 
     def prefill_step_tp_only(self, tasks: PackedTasksBase) -> torch.Tensor:
@@ -633,6 +723,10 @@ class Executor:
         Backend.cache_manager.prepare_cache_prefill(
             tasks.req_ids, [len(t) for t in tasks.tokens]
         )
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.prepare_cache_prefill(
+                tasks.req_ids, [len(t) for t in tasks.tokens]
+            )
 
         # 3) prepare payload on TP main rank only
         num_tokens = tasks.num_tokens
@@ -659,8 +753,12 @@ class Executor:
         out = Backend.model.prefill(
             payload,
             self._get_output_token_offsets(tasks),
-            pixel_values=getattr(tasks, "pixel_values", None),
-            grid_thw=getattr(tasks, "grid_thw", None),
+            pixel_values=self.vision_tensor_broadcast(
+                getattr(tasks, "pixel_values", None), 3, torch.bfloat16
+            ),
+            grid_thw=self.vision_tensor_broadcast(
+                getattr(tasks, "grid_thw", None), 2, torch.int64, stack=False
+            ),
         )
         self.timers("prefill").stop()
 
@@ -675,7 +773,8 @@ class Executor:
 
         # 6) finalize cache
         Backend.cache_manager.finalize_cache_all_prefill()
-
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.finalize_cache_all_prefill()
         # 7) ensure logits are [B, vocab]
         if out.dim() == 1:
             out = out.view(1, -1)
@@ -684,7 +783,7 @@ class Executor:
         return out
 
     def decode_step_tp_only(
-        self, req_ids: List[str], next_tokens: List[int]
+        self, req_ids: list[str], next_tokens: list[int]
     ) -> torch.Tensor:
         """
         PD-only decode that supports TP but not PP.
@@ -694,6 +793,8 @@ class Executor:
         """
         # 1) prepare cache and seq lens
         Backend.cache_manager.prepare_cache_decode(req_ids)
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.prepare_cache_decode(req_ids)
         try:
             self._kv_hook.before_decode_step(req_ids)
         except Exception:
@@ -725,11 +826,14 @@ class Executor:
 
         # 5) finalize cache for this step
         Backend.cache_manager.finalize_cache_single_decode(req_ids)
-
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.finalize_cache_single_decode(req_ids)
         return out
 
     def decode_step(self, tasks: PackedTasksBase):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.prepare_cache_decode(tasks.req_ids)
         # Ensure KV cache is present for PD decode-only before running decode.
         try:
             self._kv_hook.before_decode_step(tasks.req_ids)
@@ -764,6 +868,10 @@ class Executor:
         Backend.cache_manager.finalize_cache_single_decode(
             tasks.req_ids
         )  # update seq_len and reset block table
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.finalize_cache_single_decode(
+                tasks.req_ids
+            )
         return out
 
     def empty_prefill_step(self):
@@ -920,9 +1028,9 @@ class Executor:
             )
 
     def postprocess_async_part(self, batch_result: BatchResult) -> None:
-        next_token_list: List[int] = []
-        logprobs_list: List[List[float]] = []
-        token_idxs_list: List[List[int]] = []
+        next_token_list: list[int] = []
+        logprobs_list: list[list[float]] = []
+        token_idxs_list: list[list[int]] = []
         for it, task in enumerate(batch_result.tasks):
             next_token_list.append(batch_result.next_tokens[it])
         if batch_result.return_logprobs:

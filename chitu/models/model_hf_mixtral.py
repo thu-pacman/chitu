@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-from typing import Any, List, Mapping
+from typing import Any, Mapping
 
 import torch
 from torch import nn
@@ -149,7 +149,7 @@ class TransformerHFMixtral(TransformerHFLlama):
             **kvargs,
         )
 
-    def _get_tensor_row_parallel_layer_names(self) -> List[str]:
+    def _get_tensor_row_parallel_layer_names(self) -> list[str]:
         return super()._get_tensor_row_parallel_layer_names() + [
             "gate",  # MoE gate
         ]
