@@ -154,6 +154,7 @@ class AttentionDeepSeekV3(Attention):
         self.can_use_mla_prologue_normal_torch_npu = (
             has_torch_npu
             and (quant is None or mla_prologue_int8)
+            and self.mla_absorb == "absorb-without-precomp"
             and not self.merge_qkv
             and torch.get_default_dtype() == torch.bfloat16
             and self.dim == 7168

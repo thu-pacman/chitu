@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import functools
 import torch
 import torch_npu
 import torch.distributed as dist
@@ -11,6 +12,11 @@ from torch_npu.contrib import transfer_to_npu
 from chitu.global_vars import get_global_args
 from chitu.utils import log_with_rank, try_import_opt_dep
 from chitu.distributed.parallel_state import get_ep_size, get_ep_group
+from chitu.moe.batched_routed_activation import (
+    BatchedRoutedActivation,
+    IndexedBatchedRoutedActivation,
+    ConcatPermutedBatchedRoutedActivation,
+)
 
 
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
@@ -312,79 +318,135 @@ def fused_experts_npu_with_communication(
 
 
 def fused_experts_npu(
-    hidden_states: torch.Tensor,
+    hidden_states: BatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    top_k: int = 8,
     w1_scale=None,
     w2_scale=None,
-    experts_start_idx=0,
+    experts_start_idx: int = 0,
     use_int8_w8a8=False,
-    **kwargs,
 ):
-
     if get_ep_size() > 1:
+        assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
         n_local_experts = w1.shape[0]
-        topk_ids = topk_ids - experts_start_idx
-        mask = (topk_ids < 0) | (topk_ids >= n_local_experts)
+        new_token_to_expert_indices = (
+            hidden_states.token_to_expert_indices - experts_start_idx
+        )
+        mask = (new_token_to_expert_indices < 0) | (
+            new_token_to_expert_indices >= n_local_experts
+        )
         # see https://www.hiascend.com/document/detail/zh/Pytorch/60RC3/ptmoddevg/trainingmigrguide/performance_tuning_0033.html
         topk_weights *= ~mask
-        topk_ids *= ~mask
+        new_token_to_expert_indices *= ~mask
+        hidden_states = IndexedBatchedRoutedActivation(
+            hidden_states.activation, new_token_to_expert_indices
+        )
 
+    return fused_experts_npu_impl(
+        hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        use_int8_w8a8=use_int8_w8a8,
+    )
+
+
+@functools.singledispatch
+def fused_experts_npu_impl(
+    hidden_states: BatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w1_scale=None,
+    w2_scale=None,
+    use_int8_w8a8=False,
+):
+    raise ValueError(f"Unsupported hidden_states type: {type(hidden_states)}")
+
+
+@fused_experts_npu_impl.register
+def _(
+    hidden_states: IndexedBatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w1_scale=None,
+    w2_scale=None,
+    use_int8_w8a8=False,
+):
+    assert (
+        topk_weights.shape == hidden_states.token_to_expert_indices.shape
+    ), "topk shape mismatch"
+
+    return fused_experts_npu_impl(
+        ConcatPermutedBatchedRoutedActivation.convert_from(
+            hidden_states, n_experts=w1.shape[0]
+        ),
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        use_int8_w8a8=use_int8_w8a8,
+    )
+
+
+@fused_experts_npu_impl.register
+def _(
+    hidden_states: ConcatPermutedBatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w1_scale=None,
+    w2_scale=None,
+    use_int8_w8a8=False,
+):
     # Check constraints.
     if not get_global_args().infer.npu_fusion_fp4 and not use_int8_w8a8:
-        assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
-    assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
-    assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
+        assert (
+            hidden_states.concat_activation.shape[1] == w1.shape[2]
+        ), "Hidden size mismatch"
+    assert (
+        hidden_states.concat_activation.is_contiguous()
+    ), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
-    assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
-    ori_shape = hidden_states.shape
-    if len(ori_shape) == 3:
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+    assert hidden_states.concat_activation.dtype in [
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+    ]
 
-    num_tokens, _ = hidden_states.shape
-    E, N, _ = w1.shape
+    concat_activation = hidden_states.concat_activation
 
-    row_idx_len = num_tokens * top_k
-    row_idx = (
-        torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
-        .view(top_k, -1)
-        .permute(1, 0)
-        .contiguous()
-    )
-    expanded_x, expanded_row_idx, expanded_expert_idx = torch_npu.npu_moe_init_routing(
-        hidden_states, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
-    )
-
-    expert_tokens = torch_npu.npu_moe_compute_expert_tokens(expanded_expert_idx, E)
-    expert_tokens = expert_tokens.to(torch.int64)
     if use_int8_w8a8:
-        counts = torch.empty_like(expert_tokens)
-        counts[0] = expert_tokens[0]
-        counts[1:] = expert_tokens[1:] - expert_tokens[:-1]
-        expanded_x, dynamic_scale = torch_npu.npu_dynamic_quant(expanded_x)
-        expanded_x = expanded_x.contiguous()
+        concat_activation, dynamic_scale = torch_npu.npu_dynamic_quant(
+            concat_activation
+        )
+        concat_activation = concat_activation.contiguous()
         dynamic_scale = dynamic_scale.to(torch.float32).contiguous()
 
     if get_global_args().infer.npu_fusion_fp4:
         gate_up_out = fused_group_matmul(
-            x=expanded_x,
+            x=concat_activation,
             weight=w1,
             scale=w1_scale,
-            expert_tokens=expert_tokens,
+            expert_tokens=torch.cumsum(
+                hidden_states.n_tokens_per_expert, dim=0
+            ),  # FIXME: Do cumsum inside the kernel
         )
     else:
         w1 = w1.transpose(1, 2) if not use_int8_w8a8 else w1
         gate_up_out = torch_npu.npu_grouped_matmul(
-            x=[expanded_x],
+            x=[concat_activation],
             weight=[w1],
             split_item=2,
-            group_list_type=0,
+            group_list_type=1,
             group_type=0,
-            group_list=expert_tokens,
+            group_list=hidden_states.n_tokens_per_expert,
             output_dtype=(
                 torch.int32 if use_int8_w8a8 else None
             ),  # None means output dytpe same as input dtype
@@ -399,7 +461,7 @@ def fused_experts_npu(
             bias=None,
             quant_scale=None,
             quant_offset=None,
-            group_index=counts,  # Only support group_list_type=1, so use expert counts
+            group_index=hidden_states.n_tokens_per_expert,
             activate_left=True,
             quant_mode=1,
         )
@@ -411,7 +473,9 @@ def fused_experts_npu(
             x=gate_up_out,
             weight=w2,
             scale=w2_scale,
-            expert_tokens=expert_tokens,
+            expert_tokens=torch.cumsum(
+                hidden_states.n_tokens_per_expert, dim=0
+            ),  # FIXME: Do cumsum inside the kernel
         )
     else:
         w2 = w2.transpose(1, 2) if not use_int8_w8a8 else w2
@@ -421,9 +485,9 @@ def fused_experts_npu(
             scale=[w2_scale.contiguous()] if use_int8_w8a8 else None,
             per_token_scale=[gate_up_out_scale] if use_int8_w8a8 else None,
             split_item=2,
-            group_list_type=0,
+            group_list_type=1,
             group_type=0,
-            group_list=expert_tokens,
+            group_list=hidden_states.n_tokens_per_expert,
             output_dtype=(
                 w2_scale.dtype if use_int8_w8a8 else None
             ),  # make sure the output dtype is bf16
@@ -431,18 +495,16 @@ def fused_experts_npu(
 
     # TODO: Reorder device memory 2 times here, replace the current
     # implementation here when suitable operators become available.
-    hidden_states = torch_npu.npu_moe_finalize_routing(
+    return torch_npu.npu_moe_finalize_routing(
         down_out_list,
         skip1=None,
         skip2=None,
         bias=None,
         scales=topk_weights,
-        expanded_src_to_dst_row=expanded_row_idx,
-        export_for_source_row=topk_ids,
+        expanded_src_to_dst_row=hidden_states.token_comma_topk_to_concat_indices.flatten(),
+        export_for_source_row=None,
+        drop_pad_mode=2,
     )
-    if len(ori_shape) == 3:
-        hidden_states = hidden_states.view(ori_shape)
-    return hidden_states
 
 
 def try_get_npu_profiler(

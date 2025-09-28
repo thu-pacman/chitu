@@ -30,10 +30,13 @@ image_name=$7
 image_version=$8
 docker_run_prefix="${@:9}"
 
-if [ "${dockerfile}" = "ascend.Dockerfile" ]; then
+if [ "${dockerfile}" = "ascend.Dockerfile" ] || [ "${dockerfile}" = "ascend.a3.Dockerfile" ]; then
     install_script="./script/ascend_install.sh"
 elif [ "${dockerfile}" = "muxi.Dockerfile" ]; then
     install_script="./script/muxi_install.sh"
+else
+    echo "Unknown dockerfile: ${dockerfile}"
+    exit 1
 fi
 
 container_base_name=$(basename ${image_name})

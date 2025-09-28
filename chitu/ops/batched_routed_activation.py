@@ -5,11 +5,12 @@
 from typing import Optional
 import torch
 
-from chitu.utils import try_import_platform_dep
+from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 from chitu.distributed.parallel_state import get_ep_size, parallel_groups_initialized
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 if has_triton and torch.cuda.is_available():
     from chitu.ops.triton_ops import (
@@ -202,3 +203,68 @@ def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
         )
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
+def batched_routed_activation_indexed_to_concat_permuted(
+    activation: torch.Tensor,
+    token_to_expert_indices: torch.Tensor,
+    *,
+    n_experts: int,
+    impl: str = "auto",
+):
+    """
+    Transform from IndexedBatchedRoutedActivation to ConcatPermutedBatchedRoutedActivation
+
+    Args:
+        activation: IndexedBatchedRoutedActivation.activation.
+        token_to_expert_indices: IndexedBatchedRoutedActivation.token_to_expert_indices.
+        n_experts: Number of experts.
+
+    Returns:
+        [0]: ConcatPermutedBatchedRoutedActivation.concat_activation.
+        [1]: ConcatPermutedBatchedRoutedActivation.token_x_topk_to_concat_indices.
+        [2]: ConcatPermutedBatchedRoutedActivation.n_tokens_per_expert
+    """
+
+    if impl == "auto":
+        if has_torch_npu:
+            impl = "torch_npu"
+        else:
+            raise NotImplementedError(
+                "No available implementation found for "
+                "batched_routed_activation_indexed_to_concat_permuted"
+            )
+
+    if impl == "torch_npu":
+        return batched_routed_activation_indexed_to_concat_permuted_torch_npu(
+            activation, token_to_expert_indices, n_experts=n_experts
+        )
+    else:
+        raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
+def batched_routed_activation_indexed_to_concat_permuted_torch_npu(
+    activation: torch.Tensor,
+    token_to_expert_indices: torch.Tensor,
+    *,
+    n_experts: int,
+):
+    n_tokens, top_k = token_to_expert_indices.shape
+    concat_activation, concat_to_token_indices, n_tokens_per_expert, _ = (
+        torch_npu.npu_moe_init_routing_v2(
+            activation,
+            token_to_expert_indices,
+            active_num=n_tokens * top_k,
+            expert_num=n_experts,
+            expert_tokens_num_type=1,  # 0: output cumsum(n_tokens_per_expert); 1: output n_tokens_per_expert
+            expert_tokens_num_flag=True,  # False: don't output n_tokens_per_expert; True: output n_tokens_per_expert
+            quant_mode=-1,  # -1: No quant, but may permute quant sacles; 0: Static quant; 1: Dynamic quant
+            active_expert_range=[0, n_experts],  # TODO: narrow this range for EP
+            row_idx_type=0,  # 0: output (token,topk)->concat indices; 1: output concat->(token,topk) indices
+        )
+    )
+    return (
+        concat_activation,
+        concat_to_token_indices.view(n_tokens, top_k),
+        n_tokens_per_expert,
+    )

@@ -10,6 +10,7 @@ import torch
 from chitu.ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_expert_block_indexed,
     batched_routed_activation_indexed_to_expert_block_permuted_blockfp8,
+    batched_routed_activation_indexed_to_concat_permuted,
 )
 
 
@@ -158,3 +159,34 @@ class PerExpertDenseBatchedRoutedActivation(BatchedRoutedActivation):
         torch.Tensor
     )  # [n_experts, max_n_tokens_per_expert, hidden_size]
     n_tokens_per_expert: torch.Tensor  # [n_experts]
+
+
+@dataclass
+class ConcatPermutedBatchedRoutedActivation(BatchedRoutedActivation):
+    """
+    Activations are permuted for each experts and then concatenated, with indices
+    expressing the relation between the permuted activation and tokens, and between
+    the permuted activation and experts.
+
+    Each (token, topk) pair maps to one row in the permuted activation, expressed by
+    `token_comma_topk_to_concat_indices`.
+
+    Each contiguous segment of `n_tokens_per_expert` rows in the concatenated activation
+    maps to an expert.
+    """
+
+    concat_activation: torch.Tensor  # [batch_size * topk, hidden_size]
+    token_comma_topk_to_concat_indices: torch.Tensor  # [batch_size, topk]
+    n_tokens_per_expert: torch.Tensor  # [n_experts]
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(
+        cls, old: IndexedBatchedRoutedActivation, *, n_experts: int
+    ) -> "ConcatPermutedBatchedRoutedActivation":
+        return cls(
+            *batched_routed_activation_indexed_to_concat_permuted(
+                old.activation, old.token_to_expert_indices, n_experts=n_experts
+            )
+        )
