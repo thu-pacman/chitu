@@ -419,6 +419,7 @@ def chitu_init(args, logging_level=None):
         if args.models.name in [
             "Mixtral-8x7B-Instruct-v0.1",
             "Qwen3-30B-A3B-mix-fp4-fp8",
+            "Qwen3-Next-80B-A3B-Instruct",
         ]:
             args.infer.use_cuda_graph = False
         elif args.infer.dp_size > 1 and spec is None:
