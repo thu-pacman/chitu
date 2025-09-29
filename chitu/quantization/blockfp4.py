@@ -34,6 +34,7 @@ from chitu.native_layout import (
     Packed4BitWeightAlongK,
     Packed4BitWeightNPUNative,
 )
+from chitu.moe.batched_routed_activation import IndexedBatchedRoutedActivation
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
@@ -690,13 +691,13 @@ class Blockfp4MoeExpertsPackNPUNative(
     ) -> torch.Tensor:
         if self.merge_gate_up:
             shape = x.size()
-            x = x.view(-1, self.dim)
             y = fused_experts_npu(
-                hidden_states=x,
+                hidden_states=IndexedBatchedRoutedActivation(
+                    x.view(-1, self.dim), indices
+                ),
                 w1=self.gate_up_proj_weight,
                 w2=self.down_proj_weight,
                 topk_weights=weights,
-                topk_ids=indices,
                 w1_scale=self.gate_up_proj_weight_scale,
                 w2_scale=self.down_proj_weight_scale,
             )

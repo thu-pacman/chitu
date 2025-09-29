@@ -1,5 +1,6 @@
-# NOTE: A3 base image (openEuler). No extra torch or torch-npu installation required.
-FROM quay.io/ascend/vllm-ascend:v0.10.0rc1-a3-openeuler AS base
+# NOTE: CANN version is coupled with torch-npu version.
+# See https://github.com/Ascend/pytorch/tags for the mapping.
+FROM quay.io/ascend/cann:8.3.rc1.alpha001-a3-ubuntu22.04-py3.11 AS base
 
 ARG optional_deps=''
 ARG build_jobs=''
@@ -15,25 +16,32 @@ RUN if [ "${enable_test}" != "true" ] && [ "${enable_test}" != "false" ]; then \
     exit 1; \
 fi
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
+# Required for non-interactive apt install
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
 
-# Install test deps (expect + pytest) only when enabled
+RUN pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# NOTE: Always apt update before apt install to avoid out-dated docker cache
 RUN if [ "${enable_test}" = "true" ]; then \
-    dnf makecache && dnf install -y expect && \
+    apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping curl && \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp; \
 fi
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install pyyaml setuptools -i https://pypi.tuna.tsinghua.edu.cn/simple
+RUN if [ "$(lscpu | grep x86)" ]; then \
+        pip install -U torch==2.6.0+cpu -i https://download.pytorch.org/whl/cpu; \
+    else \
+        pip install -U torch==2.6.0 -i https://pypi.tuna.tsinghua.edu.cn/simple; \
+    fi
+RUN pip install pyyaml setuptools -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 WORKDIR /workspace/chitu
-COPY . .
+COPY ./test ./test
+COPY ./script ./script
+COPY ./benchmarks ./benchmarks
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt
-
+# Currently, we require a development version of torch-npu to support aclgraph
 ENV CHITU_ASCEND_BUILD=1
 
-# The actual installing procedure requires a NPU device, which is not available in the `docker build` stage.
+# The actual installing procedure requries a NPU device, which is not available in the `docker build` stage.
 # We delay it to an additional `docker run` stage which runs `script/install.sh`.

@@ -221,13 +221,12 @@ def fused_experts_wrapper(
         )
     elif impl == "torch_npu":
         return fused_experts_npu(
-            hidden_states=hidden_states,
+            hidden_states=IndexedBatchedRoutedActivation(hidden_states, topk_ids),
             w1=w1,
             w1_scale=w1_scale,
             w2=w2,
             w2_scale=w2_scale,
             topk_weights=topk_weights,
-            topk_ids=topk_ids,
             experts_start_idx=experts_start_idx,
             use_int8_w8a8=use_int8_w8a8,
         )

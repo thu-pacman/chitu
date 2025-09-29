@@ -82,6 +82,7 @@ class QuantizationRegistry:
             has_torch_npu
             and quant is None
             and args.models.type == "deepseek-v3"
+            and args.infer.mla_absorb == "absorb-without-precomp"
             and torch.get_default_dtype() == torch.bfloat16
             and args.models.dim == 7168
             and args.models.q_lora_rank == 1536
