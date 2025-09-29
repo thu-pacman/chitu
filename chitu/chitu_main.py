@@ -193,7 +193,7 @@ def _warmup_via_taskpool(args):
             "infer.prefill_chunk_size is not set, GPU memory usage estimation may be incorrect (may cause OOM)"
         )
         warmup_seq_len = 1
-        prefill_chunk_size = args.infer.max_seq_len
+        prefill_chunk_size = args.infer.max_seq_len * args.infer.max_reqs
     if rank == 0:
         for i in range(num_warmup_reqs):
             req = MockFixedLengthedUserRequest(
@@ -209,7 +209,8 @@ def _warmup_via_taskpool(args):
         Backend.scheduler.start_warmup()
 
     num_required_prefill_schedules = ceil_div(
-        warmup_seq_len * num_warmup_reqs // args.infer.dp_size, prefill_chunk_size
+        ceil_div(warmup_seq_len * num_warmup_reqs, prefill_chunk_size),
+        args.infer.dp_size,
     )  # The number of times the prefill tasks needs to be scheduled to be completed
 
     # prefill
