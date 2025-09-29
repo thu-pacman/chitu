@@ -8,6 +8,7 @@ import operator
 import os
 from logging import getLogger
 import psutil
+import importlib.util
 
 import torch
 import torch.distributed
@@ -412,6 +413,29 @@ def chitu_init(args, logging_level=None):
         raise ValueError(
             f"Unsupported infer.bind_process_to_cpu={args.infer.bind_process_to_cpu}"
         )
+
+    if args.infer.use_cuda_graph == "auto":
+        spec = importlib.util.find_spec("deep_ep")
+        if args.models.name in [
+            "Mixtral-8x7B-Instruct-v0.1",
+            "Qwen3-30B-A3B-mix-fp4-fp8",
+        ]:
+            args.infer.use_cuda_graph = False
+        elif args.infer.dp_size > 1 and spec is None:
+            args.infer.use_cuda_graph = False
+        elif args.infer.attn_type == "ref":
+            args.infer.use_cuda_graph = False
+        elif args.infer.op_impl is not None and args.infer.op_impl == "cpu":
+            args.infer.use_cuda_graph = False
+        elif (
+            args.models is not None
+            and str(args.models).find("'backend': 'cpuinfer'") != -1
+        ):
+            args.infer.use_cuda_graph = False
+        elif args.models is not None and str(args.models).find("'type': 'mixq'") != -1:
+            args.infer.use_cuda_graph = False
+        else:
+            args.infer.use_cuda_graph = True
 
     # Check checkpoint exists
     check_checkpoint_path(args)

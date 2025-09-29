@@ -194,8 +194,6 @@ def quant_int8_and_process_outliers(a: torch.Tensor, fp_idx: torch.Tensor):
 
     if fp_idx.numel() > 0:
         fp_idx = fp_idx.to(device=device, dtype=torch.int32).contiguous()
-        if torch.unique(fp_idx).numel() != fp_idx.numel():
-            raise ValueError("fp_idx must be unique when keep_order=True")
         n_fp = int(fp_idx.numel())
     else:
         fp_idx = torch.empty(0, device=device, dtype=torch.int32)
@@ -433,8 +431,6 @@ def quant_int4_and_process_outliers(a: torch.Tensor, fp_idx: torch.Tensor):
 
     if fp_idx.numel() > 0:
         fp_idx = fp_idx.to(device=device, dtype=torch.int32).contiguous()
-        if torch.unique(fp_idx).numel() != fp_idx.numel():
-            raise ValueError("fp_idx must be unique (keep-order mode).")
         n_fp = int(fp_idx.numel())
     else:
         fp_idx = torch.empty(0, device=device, dtype=torch.int32)
@@ -563,8 +559,6 @@ def mixq_w4a4_gemm_triton(
     A2D = a.reshape(M, K).contiguous()
 
     fp_idx = outliers_idx_grouped.to(device=device, dtype=torch.int32).contiguous()
-    if fp_idx.numel() > 0 and torch.unique(fp_idx).numel() != fp_idx.numel():
-        raise ValueError("fp_idx must be unique (keep-order).")
     A_p4, A_s, A_fp = quant_int4_and_process_outliers(A2D, fp_idx)
 
     a_s_vec = A_s.reshape(M).contiguous()

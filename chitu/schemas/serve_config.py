@@ -39,7 +39,7 @@ class InferConfig:
     fuse_shared_experts: bool = MISSING
     max_reqs: int = MISSING
     pp_layer_partition: Optional[list[int]] = MISSING
-    use_cuda_graph: bool = MISSING
+    use_cuda_graph: bool | str = MISSING
     npu_fusion_fp4: bool = MISSING
     num_blocks: int = MISSING
     bind_process_to_cpu: str = MISSING
