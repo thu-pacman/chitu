@@ -419,6 +419,8 @@ def chitu_init(args, logging_level=None):
         if args.models.name in [
             "Mixtral-8x7B-Instruct-v0.1",
             "Qwen3-30B-A3B-mix-fp4-fp8",
+            "Qwen3-Next-80B-A3B-Instruct",
+            "DeepSeek-V3.2-Exp",
         ]:
             args.infer.use_cuda_graph = False
         elif args.infer.dp_size > 1 and spec is None:
@@ -433,6 +435,12 @@ def chitu_init(args, logging_level=None):
         ):
             args.infer.use_cuda_graph = False
         elif args.models is not None and str(args.models).find("'type': 'mixq'") != -1:
+            args.infer.use_cuda_graph = False
+        elif (
+            args.infer.attn_type == "npu"
+            and args.infer.cache_type == "paged"
+            and (args.models.type is not None and args.models.type == "deepseek-v3")
+        ):
             args.infer.use_cuda_graph = False
         else:
             args.infer.use_cuda_graph = True

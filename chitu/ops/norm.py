@@ -151,7 +151,8 @@ def rms_norm(
     if impl == "auto":
         if has_cpuinfer and get_global_args().infer.op_impl == "cpu":
             impl = "cpu"
-        elif out is not None and has_chitu_backend:
+        elif out is not None and has_chitu_backend and x.dtype == weight.dtype:
+            # FIXME: Support x.dtype != weight.dtype
             impl = "cuda"
         elif has_tbsgemm and get_global_args().dtype == "float16" and eps == 1e-6:
             impl = "muxi_w8a8_kernels"

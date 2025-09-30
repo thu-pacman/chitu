@@ -186,7 +186,9 @@ def get_ascend_custom_opp_path():
 def parse_dtype(
     name: str,
 ) -> torch.dtype:
-    if name == "float16":
+    if name == "float32":
+        return torch.float32
+    elif name == "float16":
         return torch.float16
     elif name == "bfloat16":
         return torch.bfloat16
