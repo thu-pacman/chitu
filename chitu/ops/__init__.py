@@ -40,6 +40,7 @@ from chitu.ops.quant import (
     blockfp4_act_quant,
     mixq_gemm,
     convert_linear_to_swizzled,
+    blockfp8_index_score_dense_dsv32,
 )
 from chitu.ops.mla_prologue import mla_prologue_normal
 from chitu.ops.batched_routed_activation import (

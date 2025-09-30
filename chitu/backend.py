@@ -480,7 +480,6 @@ class Backend:
                     if is_muxi():
                         # Work around a muxi bug that convert from NHWC to NCHW for whatever
                         # 4-D tensor even its not a convolution weight.
-                        param.data = param.data.contiguous()
                         param.data = param.data.cuda(
                             non_blocking=non_blocking
                         ).contiguous()
@@ -490,14 +489,13 @@ class Backend:
             buffer = m._buffers[key]
             if buffer is not None:
                 if buffer.device == torch.device("meta"):
-                    if not ignore_not_loaded:
-                        assert False, f"Unexpected unloaded buffer {key}"
-                    else:
-                        continue
-                if is_muxi():
+                    # Buffers are expected possibly not to be loaded, so buffer.device may be "meta"
+                    m._buffers[key] = torch.empty(
+                        buffer.shape, dtype=buffer.dtype, device="cuda"
+                    )
+                elif is_muxi():
                     # Work around a muxi bug that convert from NHWC to NCHW for whatever
                     # 4-D tensor even its not a convolution weight.
-                    assert buffer.is_contiguous()
                     m._buffers[key] = buffer.cuda(
                         non_blocking=non_blocking
                     ).contiguous()

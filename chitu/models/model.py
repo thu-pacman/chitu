@@ -52,6 +52,22 @@ cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 logger = getLogger(__name__)
 
 
+class LayerNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6, dtype=None):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim, dtype=dtype), requires_grad=False)
+        self.bias = nn.Parameter(torch.zeros(dim, dtype=dtype), requires_grad=False)
+
+    def forward(self, x: torch.Tensor, compute_dtype=None):
+        if compute_dtype is None:
+            compute_dtype = torch.float32
+        return torch.nn.functional.layer_norm(
+            x.to(compute_dtype), (self.dim,), self.weight, self.bias, self.eps
+        ).type_as(x)
+
+
 class RMSNorm(nn.Module):
     """
     Root Mean Square Layer Normalization (RMSNorm).
@@ -61,11 +77,11 @@ class RMSNorm(nn.Module):
         eps (float): Epsilon value for numerical stability. Defaults to 1e-6.
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, dtype=None):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim), requires_grad=False)
+        self.weight = nn.Parameter(torch.ones(dim, dtype=dtype), requires_grad=False)
 
     def forward(
         self,

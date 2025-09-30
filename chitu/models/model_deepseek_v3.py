@@ -9,11 +9,13 @@ from logging import getLogger
 from typing import Any, Mapping, Optional
 from typing_extensions import override
 
+import einops
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from chitu.attn_backend import AttnBackend
+from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.global_vars import get_global_args
 from chitu.models.model import (
@@ -21,6 +23,7 @@ from chitu.models.model import (
     MoeGate,
     ParallelMoeBlock,
     RMSNorm,
+    LayerNorm,
     Transformer,
     TransformerBlock,
     get_linear_layout_contig_y,
@@ -32,6 +35,7 @@ from chitu.muxi_utils import (
     Blockfp8MoeExpertsMuxiLayout,
 )
 from chitu.ops import (
+    apply_rotary_pos_emb,
     apply_rotary_pos_emb_partial,
     silu_and_mul,
     blockfp8_weight_dequant,
@@ -43,9 +47,12 @@ from chitu.ops import (
     pack_every_two_fp4_e2m1_in_uint8_to_one_uint8,
     to_fp4_e2m1_in_uint8,
     mla_prologue_normal,
+    blockfp8_act_quant,
+    blockfp8_index_score_dense_dsv32,
 )
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
 from chitu.quantization.normal import (
+    NormalLinear,
     NormalAbsorbGemmPermuted021,
     NormalLinearNpuFractalZn,
 )
@@ -90,6 +97,176 @@ def ParallelAbsorbGemm(
     local_n_heads = global_n_heads // tp_size
 
     return base_class(local_n_heads, in_features_per_head, out_features_per_head)
+
+
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: MIT
+# SPDX-SnippetCopyrightText: 2023 DeepSeek
+# SDPX—SnippetName: Indexer layer
+#
+# From https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py
+class Indexer(torch.nn.Module):
+    def __init__(self, args, *, checkpoint_prefix: str):
+        super().__init__()
+        self.dim: int = args.dim
+        self.n_heads: int = args.index_n_heads
+        self.head_dim: int = args.index_head_dim
+        self.rope_head_dim: int = args.qk_rope_head_dim
+        self.index_topk: int = args.index_topk
+        self.q_lora_rank: int = args.q_lora_rank
+        self.wq_b = LocalLinear(
+            self.q_lora_rank,
+            self.n_heads * self.head_dim,
+            has_bias=False,
+            checkpoint_prefix=f"{checkpoint_prefix}.wq_a",
+        )
+        self.wk = LocalLinear(
+            self.dim,
+            self.head_dim,
+            has_bias=False,
+            checkpoint_prefix=f"{checkpoint_prefix}.wk",
+        )
+        self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
+        self.weights_proj = LocalLinear(
+            self.dim,
+            self.n_heads,
+            base_linear_class=NormalLinear,
+            has_bias=False,
+            checkpoint_prefix=f"{checkpoint_prefix}.weights_proj",
+        )
+        self.softmax_scale = self.head_dim**-0.5
+
+        max_reqs = get_global_args().infer.max_reqs
+        max_seq_len = get_global_args().infer.max_seq_len
+
+        block_size = 128
+        self.register_buffer(
+            "k_cache",
+            torch.empty(
+                max_reqs, max_seq_len, self.head_dim, dtype=torch.float8_e4m3fn
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "k_scale_cache",
+            torch.empty(
+                max_reqs, max_seq_len, self.head_dim // block_size, dtype=torch.float32
+            ),
+            persistent=False,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        seq_len_delta: BatchedSeqLenDelta,
+        freqs_cis: BatchedFreqsCis,
+        is_causal: bool,
+    ):
+        assert x.ndim == 2
+        q = self.wq_b(qr)
+        q = einops.rearrange(q, "s (h d) -> s h d", d=self.head_dim)
+        q_pe, q_nope = torch.split(
+            q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        )
+        k = self.wk(x)
+        k = self.k_norm(k)
+        k_pe, k_nope = torch.split(
+            k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        )
+        q_pe, k_pe = apply_rotary_pos_emb(
+            q_pe,
+            k_pe,
+            freqs_cis,
+            rotary_type="interleaved",
+            impl="torch",  # FIXME: adjust impl
+        )
+        q = torch.cat([q_pe, q_nope], dim=-1)
+        k = torch.cat([k_pe, k_nope], dim=-1)
+
+        # NOTE: DeepSeek-V3.2-Exp reference code do the following, but vLLM skips it
+        # (https://github.com/heheda12345/vllm/blob/618d877f48f5bb02f9f07ca6d19e90a044c24870/vllm/model_executor/models/deepseek_v2.py#L836).
+        # We follow vLLM for now (FIXME)
+        # q = self._rotate_activation(q)
+        # k = self._rotate_activation(k)
+
+        q_fp8, q_scale = blockfp8_act_quant(q, block_size=128)
+        k_fp8, k_scale = blockfp8_act_quant(k, block_size=128)
+        self.k_cache[
+            : seq_len_delta.batch_size, seq_len_delta.delta_position_ids_tensor_device
+        ] = k_fp8
+        self.k_scale_cache[
+            : seq_len_delta.batch_size, seq_len_delta.delta_position_ids_tensor_device
+        ] = k_scale
+        weights = self.weights_proj(x) * self.n_heads**-0.5
+        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+
+        # Indexer with Dense KV cache with out-of-range items zeroed out:
+        delta_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
+        delta_pos_ids = seq_len_delta.delta_position_ids_tensor_device
+        new_seq_ids = seq_len_delta.new.seq_ids_tensor_device
+        new_pos_ids = seq_len_delta.new.position_ids_tensor_device
+        q_fp8_dense = torch.zeros(
+            seq_len_delta.new.batch_size,
+            seq_len_delta.new.max_len,
+            *q_fp8.shape[1:],
+            dtype=q_fp8.dtype,
+            device=q_fp8.device,
+        )
+        weights_dense = torch.zeros(
+            seq_len_delta.new.batch_size,
+            seq_len_delta.new.max_len,
+            *weights.shape[1:],
+            dtype=weights.dtype,
+            device=weights.device,
+        )
+        k_cache_dense = torch.zeros(
+            seq_len_delta.new.batch_size,
+            seq_len_delta.new.max_len,
+            *self.k_cache.shape[2:],
+            dtype=self.k_cache.dtype,
+            device=self.k_cache.device,
+        )
+        k_scale_cache_dense = torch.zeros(
+            seq_len_delta.new.batch_size,
+            seq_len_delta.new.max_len,
+            *self.k_scale_cache.shape[2:],
+            dtype=self.k_scale_cache.dtype,
+            device=self.k_scale_cache.device,
+        )
+        q_fp8_dense[delta_seq_ids, delta_pos_ids] = q_fp8
+        weights_dense[delta_seq_ids, delta_pos_ids] = weights
+        k_cache_dense[new_seq_ids, new_pos_ids] = self.k_cache[new_seq_ids, new_pos_ids]
+        k_scale_cache_dense[new_seq_ids, new_pos_ids] = self.k_scale_cache[
+            new_seq_ids, new_pos_ids
+        ]
+        index_score = blockfp8_index_score_dense_dsv32(
+            q_fp8_dense, weights_dense, k_cache_dense, k_scale_cache_dense
+        )
+
+        if is_causal:
+            index_score += torch.full(
+                (seq_len_delta.new.max_len, seq_len_delta.new.max_len),
+                float("-inf"),
+                device=index_score.device,
+            ).triu_(1)
+        _, topk_indices_dense = index_score.topk(
+            min(self.index_topk, seq_len_delta.new.max_len), dim=-1
+        )  # shape: [bs, seq_q, topk(seq_k)]. May select some out-of-range items as -inf, which is fine
+        topk_indices = topk_indices_dense[
+            delta_seq_ids, delta_pos_ids
+        ]  # shape: [bs * seq_q, topk(seq_k)]
+        return topk_indices
+
+    def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
+        assert x.dtype == torch.bfloat16
+        from fast_hadamard_transform import hadamard_transform
+
+        hidden_size = x.size(-1)
+        return hadamard_transform(x, scale=hidden_size**-0.5)
+
+
+# SPDX-SnippetEnd
 
 
 class AttentionDeepSeekV3(Attention):
@@ -142,6 +319,9 @@ class AttentionDeepSeekV3(Attention):
         self.qk_rope_head_dim = args.qk_rope_head_dim
         self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
         self.v_head_dim = args.v_head_dim
+        self.index_head_dim = getattr(args, "index_head_dim", None)
+        self.index_n_heads = getattr(args, "index_n_heads", None)
+        self.index_topk = getattr(args, "index_topk", None)
 
         block_size = 16 if quant == "blockfp4" else 128
 
@@ -198,7 +378,14 @@ class AttentionDeepSeekV3(Attention):
                     else None
                 ),
             )  # FIXME: Run this layer with muxi_layout_kernels
-        self.q_a_layernorm = RMSNorm(self.q_lora_rank)
+        self.q_a_layernorm = RMSNorm(
+            self.q_lora_rank,
+            dtype=(
+                parse_dtype(args.rms_norm_dtype)
+                if hasattr(args, "rms_norm_dtype")
+                else None
+            ),
+        )
         self.q_b_proj = ColumnParallelLinear(
             self.q_lora_rank,
             (
@@ -220,7 +407,14 @@ class AttentionDeepSeekV3(Attention):
             ),
             checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",
         )
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank)
+        self.kv_a_layernorm = RMSNorm(
+            self.kv_lora_rank,
+            dtype=(
+                parse_dtype(args.rms_norm_dtype)
+                if hasattr(args, "rms_norm_dtype")
+                else None
+            ),
+        )
 
         if self.mla_absorb == "none":
             self.kv_b_proj = ColumnParallelLinear(
@@ -270,7 +464,13 @@ class AttentionDeepSeekV3(Attention):
             ),
             checkpoint_prefix=f"{checkpoint_prefix}.o_proj",
         )
+
         self.softmax_scale = compute_softmax_scale_deepseek_v3(args)
+
+        if self.index_topk is not None:
+            self.indexer = Indexer(
+                args, checkpoint_prefix=f"{checkpoint_prefix}.indexer"
+            )
 
     def _run_linear(self, x, freqs_cis: BatchedFreqsCis):
         if self.can_use_mla_prologue_normal_torch_npu:
@@ -302,7 +502,8 @@ class AttentionDeepSeekV3(Attention):
         else:
             q_a = self.q_a_proj(x)
             kv = self.kv_a_proj_with_mqa(x)
-        q = self.q_b_proj(self.q_a_layernorm(q_a, compute_dtype=q_a.dtype))
+        qr = self.q_a_layernorm(q_a, compute_dtype=q_a.dtype)
+        q = self.q_b_proj(qr)
 
         q = q.view(bs_seq, self.n_local_heads, -1)
         kv = kv.view(bs_seq, 1, -1)
@@ -337,7 +538,7 @@ class AttentionDeepSeekV3(Attention):
                 ],
                 dim=-1,
             )
-            return q, k, v
+            return q, k, v, qr
 
         elif self.mla_absorb in ["absorb-without-precomp", "absorb"]:
             if self.mla_absorb == "absorb-without-precomp":
@@ -346,7 +547,7 @@ class AttentionDeepSeekV3(Attention):
             # In-place update to `kv_lora`, which is part of `kv`
             self.kv_a_layernorm(kv_lora, compute_dtype=kv.dtype, out=kv_lora)
 
-            return q_nope, q_pe, kv
+            return q_nope, q_pe, kv, qr
 
         else:
             raise NotImplementedError(
@@ -357,7 +558,13 @@ class AttentionDeepSeekV3(Attention):
         bs_seq, _ = x.size()
 
         if self.mla_absorb == "none":
-            q, k, v = self._run_linear(x, freqs_cis)
+            q, k, v, qr = self._run_linear(x, freqs_cis)
+            if self.index_topk is not None:
+                topk_indices = self.indexer(
+                    x, qr, self.cache.seq_len_delta, freqs_cis, is_causal=True
+                )
+            else:
+                topk_indices = None
             x = self.attn_backend(
                 q,
                 self.cache.get_accessor(self.layer_id),
@@ -366,10 +573,17 @@ class AttentionDeepSeekV3(Attention):
                 seq_len_delta=self.cache.seq_len_delta,
                 causal=True,
                 softmax_scale=self.softmax_scale,
+                topk_indices=topk_indices,
             )
 
         elif self.mla_absorb in ["absorb-without-precomp", "absorb"]:
-            q_nope, q_pe, kv = self._run_linear(x, freqs_cis)
+            q_nope, q_pe, kv, qr = self._run_linear(x, freqs_cis)
+            if self.index_topk is not None:
+                topk_indices = self.indexer(
+                    x, qr, self.cache.seq_len_delta, freqs_cis, is_causal=True
+                )
+            else:
+                topk_indices = None
             x = self.attn_backend.mla(
                 q_nope,
                 q_pe,
@@ -378,6 +592,7 @@ class AttentionDeepSeekV3(Attention):
                 seq_len_delta=self.cache.seq_len_delta,
                 causal=True,
                 softmax_scale=self.softmax_scale,
+                topk_indices=topk_indices,
             )
 
             if self.mla_absorb == "absorb-without-precomp":
@@ -663,8 +878,22 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                 )
             )
         )
-        self.input_layernorm = RMSNorm(args.dim)
-        self.post_attention_layernorm = RMSNorm(args.dim)
+        self.input_layernorm = RMSNorm(
+            args.dim,
+            dtype=(
+                parse_dtype(args.rms_norm_dtype)
+                if hasattr(args, "rms_norm_dtype")
+                else None
+            ),
+        )
+        self.post_attention_layernorm = RMSNorm(
+            args.dim,
+            dtype=(
+                parse_dtype(args.rms_norm_dtype)
+                if hasattr(args, "rms_norm_dtype")
+                else None
+            ),
+        )
 
     def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
         x = x + self.self_attn(
@@ -1313,7 +1542,14 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def _init_post_layers(self):
-        self.norm = RMSNorm(self.params.dim)
+        self.norm = RMSNorm(
+            self.params.dim,
+            dtype=(
+                parse_dtype(self.params.rms_norm_dtype)
+                if hasattr(self.params, "rms_norm_dtype")
+                else None
+            ),
+        )
         self.lm_head = ColumnParallelLinear(
             self.params.dim,
             self.params.vocab_size,

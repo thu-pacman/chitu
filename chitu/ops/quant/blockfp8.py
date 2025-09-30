@@ -286,3 +286,50 @@ def blockfp8_weight_dequant(
         return blockfp8_weight_dequant_triton(x, s, block_size)
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
+def blockfp8_index_score_dense_dsv32(
+    q: torch.Tensor,  # [b, m, h=64, d=128], fp8
+    q_s: torch.Tensor,  # [b, m, h=64, d/block_size=1], fp32
+    k: torch.Tensor,  # [b, n, d=128], fp8
+    k_s: torch.Tensor,  # [b, n, d/block_size=1], fp32
+    impl: str = "auto",
+):
+    """
+    Compute index score originally from DeepSeek-V3.2-Exp in dense KV cache
+    """
+
+    if impl == "auto":
+        impl = "torch"
+
+    if impl == "torch":
+        return blockfp8_index_score_dsv32_torch(q, q_s, k, k_s)
+    else:
+        raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
+def blockfp8_index_score_dsv32_torch(
+    q: torch.Tensor,  # [b, m, h=64, d=128], fp8
+    q_s: torch.Tensor,  # [b, m, h=64, d/block_size=1], fp32
+    k: torch.Tensor,  # [b, n, d=128], fp8
+    k_s: torch.Tensor,  # [b, n, d/block_size=1], fp32
+):
+    b, m, h, d = q.shape
+    _, n, _ = k.shape
+    assert tuple(q_s.shape) == (b, m, h, 1)
+    assert tuple(k.shape) == (b, n, d)
+    assert tuple(k_s.shape) == (b, n, 1)
+
+    # Cast to bf16 as a reference fallback
+    q_bf16 = q.to(torch.bfloat16)
+    k_bf16 = k.to(torch.bfloat16)
+
+    logits = torch.einsum("bmhd,bnd->bmnh", q_bf16, k_bf16)
+    logits = torch.nn.functional.relu(logits)
+    logits = logits * q_s.view(b, m, 1, h)
+
+    logits_sum = logits.sum(dim=-1)  # bmn
+
+    output = logits_sum * k_s.view(b, 1, n)  # bmn
+
+    return output.to(torch.get_default_dtype())

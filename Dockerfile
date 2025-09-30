@@ -43,6 +43,8 @@ COPY ./requirements-build.txt /tmp/requirements-build.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements-build.txt -c <(pip list --format freeze)
 
+ENV FLASH_MLA_DISABLE_SM100=1
+
 
 #####################################
 # Dependency Resolver Stage

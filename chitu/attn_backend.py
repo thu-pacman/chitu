@@ -184,6 +184,7 @@ class AttnBackend(abc.ABC):
         seq_len_delta: BatchedSeqLenDelta,
         causal: bool = False,
         softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         # If Q and K has the same layout on their columns, no matter what layout
         # they have, the result will be the same, because the operation between
@@ -211,6 +212,7 @@ class AttnBackend(abc.ABC):
                 kv,
                 seq_len_delta=seq_len_delta,
                 softmax_scale=softmax_scale,
+                topk_indices=topk_indices,
             )
         else:
             return self.mla_prefill(
@@ -221,6 +223,7 @@ class AttnBackend(abc.ABC):
                 seq_len_delta=seq_len_delta,
                 causal=causal,
                 softmax_scale=softmax_scale,
+                topk_indices=topk_indices,
             )
 
     def prefill(
@@ -318,6 +321,7 @@ class AttnBackend(abc.ABC):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         raise NotImplementedError()
 
@@ -452,6 +456,7 @@ class AttnBackend(abc.ABC):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         raise NotImplementedError()
 
@@ -468,6 +473,7 @@ class AttnBackend(abc.ABC):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         raise NotImplementedError()
 
@@ -480,6 +486,7 @@ class AttnBackend(abc.ABC):
         seq_len_delta: BatchedSeqLenDelta,
         causal: bool = False,
         softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         if isinstance(kv_cache, DenseKVCacheAccessor):
             # Call self.mla_prefill_ragged_qo_dense_kv here instead of directly calling
@@ -493,6 +500,7 @@ class AttnBackend(abc.ABC):
                 seq_len_delta=seq_len_delta,
                 causal=causal,
                 softmax_scale=softmax_scale,
+                topk_indices=topk_indices,
             )
         elif isinstance(kv_cache, PagedKVCacheAccessor):
             # Call self.mla_prefill_ragged_qo_paged_kv here instead of directly calling
@@ -506,6 +514,7 @@ class AttnBackend(abc.ABC):
                 seq_len_delta=seq_len_delta,
                 causal=causal,
                 softmax_scale=softmax_scale,
+                topk_indices=topk_indices,
             )
         else:
             raise NotImplementedError()
@@ -518,6 +527,7 @@ class AttnBackend(abc.ABC):
         kv,
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         if isinstance(kv_cache, DenseKVCacheAccessor):
             # Call self.mla_decode_dense_kv here instead of directly calling
@@ -530,6 +540,7 @@ class AttnBackend(abc.ABC):
                 kv,
                 seq_len_delta=seq_len_delta,
                 softmax_scale=softmax_scale,
+                topk_indices=topk_indices,
             )
         elif isinstance(kv_cache, PagedKVCacheAccessor):
             # Call self.mla_decode_paged_kv here instead of directly calling
@@ -542,6 +553,7 @@ class AttnBackend(abc.ABC):
                 kv,
                 seq_len_delta=seq_len_delta,
                 softmax_scale=softmax_scale,
+                topk_indices=topk_indices,
             )
         else:
             raise NotImplementedError()
@@ -554,6 +566,7 @@ class AttnBackend(abc.ABC):
         kv,
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale,
+        topk_indices: Optional[torch.Tensor],
         mqa_func,
     ):
         bs, local_n_heads, kv_lora_rank = q_nope.shape
@@ -586,6 +599,7 @@ class AttnBackend(abc.ABC):
                 kv_lora,
                 seq_len_delta=seq_len_delta,
                 softmax_scale=softmax_scale,
+                topk_indices=topk_indices,
             )
 
         else:
@@ -621,6 +635,7 @@ class AttnBackend(abc.ABC):
                 kv_lora,
                 seq_len_delta=seq_len_delta,
                 softmax_scale=softmax_scale,
+                topk_indices=topk_indices,
             )
 
     def mla_prefill_ragged_qkvo(
@@ -631,6 +646,7 @@ class AttnBackend(abc.ABC):
         seq_len_delta: BatchedSeqLenDelta,
         causal: bool = False,
         softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         # If not overridden, fall back to a multi-query attention
         return self._mla_to_mqa(
@@ -640,6 +656,7 @@ class AttnBackend(abc.ABC):
             kv,
             seq_len_delta,
             softmax_scale,
+            topk_indices,
             functools.partial(self.prefill_ragged_qkvo, causal=causal),
         )
 
@@ -652,6 +669,7 @@ class AttnBackend(abc.ABC):
         seq_len_delta: BatchedSeqLenDelta,
         causal: bool = False,
         softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         # Fallback order:
         #    mla_prefill_ragged_qo_dense_kv
@@ -685,6 +703,7 @@ class AttnBackend(abc.ABC):
             seq_len_delta,
             causal=causal,
             softmax_scale=softmax_scale,
+            topk_indices=topk_indices,
         )
 
     def mla_prefill_ragged_qo_paged_kv(
@@ -696,6 +715,7 @@ class AttnBackend(abc.ABC):
         seq_len_delta: BatchedSeqLenDelta,
         causal: bool = False,
         softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         # Fallback order:
         #    mla_prefill_ragged_qo_paged_kv
@@ -733,6 +753,7 @@ class AttnBackend(abc.ABC):
             seq_len_delta,
             causal=causal,
             softmax_scale=softmax_scale,
+            topk_indices=topk_indices,
         )
 
     def mla_decode_dense_kv(
@@ -743,6 +764,7 @@ class AttnBackend(abc.ABC):
         kv,
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         # If not overridden, fall back to a multi-query attention
         return self._mla_to_mqa(
@@ -752,6 +774,7 @@ class AttnBackend(abc.ABC):
             kv,
             seq_len_delta,
             softmax_scale,
+            topk_indices,
             self.decode_dense_kv,
         )
 
@@ -763,6 +786,7 @@ class AttnBackend(abc.ABC):
         kv,
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         # If not overridden, fall back to a multi-query attention
         return self._mla_to_mqa(
@@ -772,6 +796,7 @@ class AttnBackend(abc.ABC):
             kv,
             seq_len_delta,
             softmax_scale,
+            topk_indices,
             self.decode_paged_kv,
         )
 
@@ -793,7 +818,11 @@ class FlashAttnBackend(AttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            raise NotImplementedError()
+
         # These are arguments only accpeted by new enough flash_attn,
         # so don't pass them if they are set to default values
         extra_kvargs = {}
@@ -827,7 +856,11 @@ class FlashAttnBackend(AttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            raise NotImplementedError()
+
         # These are arguments only accpeted by new enough flash_attn,
         # so don't pass them if they are set to default values
         extra_kvargs = {}
@@ -860,7 +893,11 @@ class FlashAttnBackend(AttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            raise NotImplementedError()
+
         # These are arguments only accpeted by new enough flash_attn,
         # so don't pass them if they are set to default values
         extra_kvargs = {}
@@ -941,6 +978,7 @@ class RefAttnBackend(AttnBackend):
         reorder_ops=False,
         softmax_scale=None,
         sinks=None,
+        topk_indices_batch: Optional[torch.Tensor] = None,
     ):
         """
         Arguments:
@@ -995,6 +1033,18 @@ class RefAttnBackend(AttnBackend):
                 q.device,
             )
             scores.masked_fill_(local_mask, float("-inf"))
+        else:
+            local_mask = None
+        if topk_indices_batch is not None:
+            index_mask = torch.full(
+                (q.shape[0], seqlen_q, seqlen_k), True, device=q.device
+            ).scatter_(-1, topk_indices_batch, False)
+            scores.masked_fill_(
+                index_mask.unsqueeze(1),  # unsqueeze head
+                float("-inf"),
+            )
+        else:
+            index_mask = None
         if attn_bias is not None:
             scores = scores + attn_bias
         if sinks is not None:
@@ -1007,9 +1057,13 @@ class RefAttnBackend(AttnBackend):
         else:
             attention = torch.softmax(scores, dim=-1).to(v.dtype)
         # Some rows might be completely masked out so we fill them with zero instead of NaN
-        if window_size[0] >= 0 or window_size[1] >= 0:
+        if local_mask is not None:
             attention = attention.masked_fill(
                 torch.all(local_mask, dim=-1, keepdim=True), 0.0
+            )
+        if index_mask is not None:
+            attention = attention.masked_fill(
+                torch.all(index_mask.unsqueeze(1), dim=-1, keepdim=True), 0.0
             )
         # We want to mask here so that the attention matrix doesn't have any NaNs
         # Otherwise we'll get NaN in dV
@@ -1036,6 +1090,7 @@ class RefAttnBackend(AttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         max_seq_len = seq_len_delta.new.max_len
 
@@ -1054,6 +1109,14 @@ class RefAttnBackend(AttnBackend):
             dtype=v.dtype,
             device=v.device,
         )
+        if topk_indices is not None:
+            topk_indices_batch = torch.zeros(
+                (seq_len_delta.batch_size, max_seq_len) + tuple(topk_indices.shape[1:]),
+                dtype=topk_indices.dtype,
+                device=topk_indices.device,
+            )
+        else:
+            topk_indices_batch = None
         for i in range(seq_len_delta.batch_size):
             q_batch[
                 i, seq_len_delta.old.lens_list[i] : seq_len_delta.new.lens_list[i]
@@ -1072,6 +1135,14 @@ class RefAttnBackend(AttnBackend):
                     i
                 ] : seq_len_delta.new.prefix_lens_list[i + 1]
             ]
+            if topk_indices is not None:
+                topk_indices_batch[
+                    i, seq_len_delta.old.lens_list[i] : seq_len_delta.new.lens_list[i]
+                ] = topk_indices[
+                    seq_len_delta.delta_prefix_lens_list[
+                        i
+                    ] : seq_len_delta.delta_prefix_lens_list[i + 1]
+                ]
         output_batch, _ = self._attention(
             q_batch,
             k_batch,
@@ -1081,6 +1152,7 @@ class RefAttnBackend(AttnBackend):
             softcap=softcap,
             softmax_scale=softmax_scale,
             sinks=sinks,
+            topk_indices_batch=topk_indices_batch,
         )
         output = torch.empty(
             (seq_len_delta.delta_total_len,) + output_batch.shape[2:],
@@ -1110,6 +1182,7 @@ class RefAttnBackend(AttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         arange = einops.rearrange(
             torch.arange(kv_cache.k.shape[1], device=kv_cache.v.device), "s -> 1 s"
@@ -1138,6 +1211,9 @@ class RefAttnBackend(AttnBackend):
             softcap=softcap,
             softmax_scale=softmax_scale,
             sinks=sinks,
+            topk_indices_batch=(
+                topk_indices.unsqueeze(1) if topk_indices is not None else None
+            ),
         )
         return output.squeeze(1)
 
@@ -1154,6 +1230,7 @@ class RefAttnBackend(AttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         k_cache_paged = kv_cache.k
         v_cache_paged = kv_cache.v
@@ -1229,6 +1306,9 @@ class RefAttnBackend(AttnBackend):
             softcap=softcap,
             softmax_scale=softmax_scale,
             sinks=sinks,
+            topk_indices_batch=(
+                topk_indices.unsqueeze(1) if topk_indices is not None else None
+            ),
         )
         return output.squeeze(1)
 
@@ -1261,7 +1341,23 @@ class TritonAttnBackend(RefAttnBackend):
         softcap=0,
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            # Fallback to RefAttnBackend
+            return super().prefill_ragged_qkvo(
+                q,
+                k,
+                v,
+                seq_len_delta,
+                causal,
+                window_size,
+                softcap,
+                softmax_scale,
+                sinks,
+                topk_indices,
+            )
+
         B, local_n_heads, _ = q.shape
         _, _, v_n_hidden = v.shape
         output = torch.empty(
@@ -1291,7 +1387,20 @@ class TritonAttnBackend(RefAttnBackend):
         kv,
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            # Fallback to RefAttnBackend
+            return super().mla_decode_dense_kv(
+                q_nope,
+                q_pe,
+                kv_cache,
+                kv,
+                seq_len_delta,
+                softmax_scale,
+                topk_indices,
+            )
+
         B, local_n_heads, kv_lora_rank = q_nope.shape
         assert q_pe.shape[0] == B
         assert q_pe.shape[1] == local_n_heads
@@ -1368,11 +1477,24 @@ class TritonAttnBackend(RefAttnBackend):
         kv,
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            # Fallback to RefAttnBackend
+            return super().mla_decode_paged_kv(
+                q_nope,
+                q_pe,
+                kv_cache,
+                kv,
+                seq_len_delta,
+                softmax_scale,
+                topk_indices,
+            )
+
         if is_muxi():
             # Fallback to MQA, which calls `decode_attention_fwd`. Experiments show it is faster than `mla_decode`.
             return super().mla_decode_paged_kv(
-                q_nope, q_pe, kv_cache, kv, seq_len_delta, softmax_scale
+                q_nope, q_pe, kv_cache, kv, seq_len_delta, softmax_scale, topk_indices
             )
 
         B, local_n_heads, kv_lora_rank = q_nope.shape
@@ -1465,7 +1587,23 @@ class TritonAttnBackend(RefAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            # Fallback to RefAttnBackend
+            return super().decode_dense_kv(
+                q,
+                kv_cache,
+                k=k,
+                v=v,
+                seq_len_delta=seq_len_delta,
+                window_size=window_size,
+                softcap=softcap,
+                softmax_scale=softmax_scale,
+                sinks=sinks,
+                topk_indices=topk_indices,
+            )
+
         # triton has bug, when version < 3.2.0, the "~" operator on bool vector will get wrong results
         assert self.triton_latest_enough
 
@@ -1539,7 +1677,23 @@ class TritonAttnBackend(RefAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            # Fallback to RefAttnBackend
+            return super().decode_paged_kv(
+                q,
+                kv_cache,
+                k=k,
+                v=v,
+                seq_len_delta=seq_len_delta,
+                window_size=window_size,
+                softcap=softcap,
+                softmax_scale=softmax_scale,
+                sinks=sinks,
+                topk_indices=topk_indices,
+            )
+
         # Legacy shape change. TODO: Remve this
         q = q.unsqueeze(1)
         k = k.unsqueeze(1) if k is not None else None
@@ -1662,6 +1816,7 @@ class FlashMLABackend(TritonAttnBackend):
         kv,
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         bsz = seq_len_delta.batch_size
 
@@ -1685,8 +1840,19 @@ class FlashMLABackend(TritonAttnBackend):
             512,  # dv
             self.metadata.get(),
             self.num_splits.get(),
-            causal=True,
+            causal=(
+                True if topk_indices is None else False
+            ),  # flash_mla requires "causal must be `false` if sparse attention is enabled"
             softmax_scale=softmax_scale,
+            indices=(
+                topk_indices.view(
+                    seq_len_delta.batch_size, 1, topk_indices.shape[-1]
+                ).to(
+                    torch.int32
+                )  # TODO: Convert in advance (but topk outputs int64 and RefAttnBackend requires int64)
+                if topk_indices is not None
+                else None
+            ),
         )
         return output.view(bsz, output.shape[-2], output.shape[-1])
 
@@ -1899,7 +2065,11 @@ class FlashInferBackend(TritonAttnBackend):
         kv,
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            raise NotImplementedError()
+
         B, local_n_heads, self.kv_lora_rank = q_nope.shape
         assert q_pe.shape[0] == B
         assert q_pe.shape[1] == local_n_heads
@@ -1931,7 +2101,11 @@ class FlashInferBackend(TritonAttnBackend):
         seq_len_delta: BatchedSeqLenDelta,
         causal: bool = False,
         softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            raise NotImplementedError()
+
         bs_seq, local_n_heads, self.kv_lora_rank = q_nope.shape
         assert q_pe.shape[0] == bs_seq
         assert q_pe.shape[1] == local_n_heads
@@ -1999,7 +2173,11 @@ class FlashInferBackend(TritonAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            raise NotImplementedError()
+
         assert not self.is_mla
         num_qo_heads = q.shape[-2]
         num_kv_heads = k.shape[-2]
@@ -2033,7 +2211,11 @@ class FlashInferBackend(TritonAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            raise NotImplementedError()
+
         raw_batch_size = q.shape[0]
         batch_size = self.match_batch_size(raw_batch_size)
         o = torch.empty_like(q)
@@ -2064,7 +2246,11 @@ class FlashInferBackend(TritonAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            raise NotImplementedError()
+
         raw_batch_size = q.shape[0]
         batch_size = self.match_batch_size(raw_batch_size)
         block_size = kv_cache.k.shape[1]
@@ -2226,7 +2412,11 @@ class NpuAttnBackend(RefAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            raise NotImplementedError()
+
         if softmax_scale is None:
             softmax_scale = float(1 / math.sqrt(q.shape[-1]))
 
@@ -2380,7 +2570,11 @@ class NpuAttnBackend(RefAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            raise NotImplementedError()
+
         if softmax_scale is None:
             softmax_scale = float(1 / math.sqrt(q.shape[-1]))
 
@@ -2454,7 +2648,11 @@ class NpuAttnBackend(RefAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            raise NotImplementedError()
+
         if softmax_scale is None:
             softmax_scale = float(1 / math.sqrt(q.shape[-1]))
 
@@ -2523,7 +2721,11 @@ class NpuAttnBackend(RefAttnBackend):
         kv,
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            raise NotImplementedError()
+
         bsz, local_n_heads, kv_lora_rank = q_nope.shape
         _, _, qk_rope_head_dim = q_pe.shape
         query = torch.cat([q_nope, q_pe], dim=-1).view(bsz, q_nope.shape[-2], -1)
@@ -2600,6 +2802,7 @@ class HybridAttnBackend(AttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         self.current_backend = self._select_backend(seq_len_delta.batch_size)
         return self.current_backend.prefill_ragged_qkvo(
@@ -2612,6 +2815,7 @@ class HybridAttnBackend(AttnBackend):
             softcap=softcap,
             softmax_scale=softmax_scale,
             sinks=sinks,
+            topk_indices=topk_indices,
         )
 
     @override
@@ -2627,6 +2831,7 @@ class HybridAttnBackend(AttnBackend):
         softcap=0.0,
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         batch_size = q.shape[0]
         self.current_backend = self._select_backend(batch_size)
@@ -2640,6 +2845,7 @@ class HybridAttnBackend(AttnBackend):
             softcap=softcap,
             softmax_scale=softmax_scale,
             sinks=sinks,
+            topk_indices=topk_indices,
         )
 
     @override
@@ -2655,6 +2861,7 @@ class HybridAttnBackend(AttnBackend):
         softcap=0.0,
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         batch_size = q.shape[0]
         self.current_backend = self._select_backend(batch_size)
@@ -2668,6 +2875,7 @@ class HybridAttnBackend(AttnBackend):
             softcap=softcap,
             softmax_scale=softmax_scale,
             sinks=sinks,
+            topk_indices=topk_indices,
         )
 
     def prepare_metadata_for_decode(self, *args, **kwargs):
