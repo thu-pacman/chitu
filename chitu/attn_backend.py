@@ -1049,9 +1049,12 @@ class RefAttnBackend(AttnBackend):
         else:
             local_mask = None
         if topk_indices_batch is not None:
+            max_in_topk_indices = torch.max(topk_indices_batch)
             index_mask = torch.full(
-                (q.shape[0], seqlen_q, seqlen_k), True, device=q.device
-            ).scatter_(-1, topk_indices_batch, False)
+                (q.shape[0], seqlen_q, max(seqlen_k, max_in_topk_indices + 1)),
+                True,
+                device=q.device,
+            ).scatter_(-1, topk_indices_batch, False)[:, :, :seqlen_k]
             scores.masked_fill_(
                 index_mask.unsqueeze(1),  # unsqueeze head
                 float("-inf"),
@@ -1402,16 +1405,10 @@ class TritonAttnBackend(RefAttnBackend):
         softmax_scale=None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
-        if topk_indices is not None:
-            # Fallback to RefAttnBackend
+        if is_muxi() and topk_indices is None:
+            # Fallback to MQA, which calls `decode_attention_fwd`. Experiments show it is faster than `mla_decode`.
             return super().mla_decode_dense_kv(
-                q_nope,
-                q_pe,
-                kv_cache,
-                kv,
-                seq_len_delta,
-                softmax_scale,
-                topk_indices,
+                q_nope, q_pe, kv_cache, kv, seq_len_delta, softmax_scale, topk_indices
             )
 
         B, local_n_heads, kv_lora_rank = q_nope.shape
@@ -1454,13 +1451,8 @@ class TritonAttnBackend(RefAttnBackend):
         )
 
         assert kv_cache.k.ndim == 3  # (num_blocks, block_size, dim)
-
-        if is_muxi():
-            kv_c_and_k_pe_cache = kv_cache.k.unsqueeze(2)  # Add a head dim of 1
-        else:
-            kv_c_and_k_pe_cache = kv_cache.k
-            k_pe_cache = kv_c_and_k_pe_cache[..., kv_lora_rank:]
-
+        kv_c_and_k_pe_cache = kv_cache.k
+        k_pe_cache = kv_c_and_k_pe_cache[..., kv_lora_rank:]
         kv_c_cache = kv_c_and_k_pe_cache[..., :kv_lora_rank]
 
         if softmax_scale is None:
@@ -1477,6 +1469,7 @@ class TritonAttnBackend(RefAttnBackend):
             attn_logits,
             num_kv_splits,
             softmax_scale,
+            topk_indices,
         )
 
         return o.view(B, local_n_heads, -1)
@@ -1492,19 +1485,7 @@ class TritonAttnBackend(RefAttnBackend):
         softmax_scale=None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
-        if topk_indices is not None:
-            # Fallback to RefAttnBackend
-            return super().mla_decode_paged_kv(
-                q_nope,
-                q_pe,
-                kv_cache,
-                kv,
-                seq_len_delta,
-                softmax_scale,
-                topk_indices,
-            )
-
-        if is_muxi():
+        if is_muxi() and topk_indices is None:
             # Fallback to MQA, which calls `decode_attention_fwd`. Experiments show it is faster than `mla_decode`.
             return super().mla_decode_paged_kv(
                 q_nope, q_pe, kv_cache, kv, seq_len_delta, softmax_scale, topk_indices
@@ -1557,13 +1538,8 @@ class TritonAttnBackend(RefAttnBackend):
         )
 
         assert kv_cache.k.ndim == 3  # (num_blocks, block_size, dim)
-
-        if is_muxi():
-            kv_c_and_k_pe_cache = kv_cache.k.unsqueeze(2)  # Add a head dim of 1
-        else:
-            kv_c_and_k_pe_cache = kv_cache.k
-            k_pe_cache = kv_c_and_k_pe_cache[..., kv_lora_rank:]
-
+        kv_c_and_k_pe_cache = kv_cache.k
+        k_pe_cache = kv_c_and_k_pe_cache[..., kv_lora_rank:]
         kv_c_cache = kv_c_and_k_pe_cache[..., :kv_lora_rank]
         PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
 
@@ -1583,6 +1559,7 @@ class TritonAttnBackend(RefAttnBackend):
             num_kv_splits,
             softmax_scale,
             PAGE_SIZE,
+            topk_indices,
         )
 
         return o.view(B, local_n_heads, -1)
@@ -2312,7 +2289,7 @@ class NpuAttnBackend(RefAttnBackend):
             self.local_n_kv_heads = self.local_n_heads
         if (
             self.args.models.type == "deepseek-v3"
-            and self.args.infer.mla_absorb == "absorb-without-precomp"
+            and self.args.infer.mla_absorb != "none"
         ):
             self.local_n_kv_heads = 1
         platform = get_device_name()
@@ -2635,7 +2612,6 @@ class NpuAttnBackend(RefAttnBackend):
                 self.local_n_kv_heads,
             )
 
-            return output
         else:
             output = torch.empty_like(q)
             lse = torch.empty(1, dtype=q.dtype, device="npu")
@@ -2650,7 +2626,8 @@ class NpuAttnBackend(RefAttnBackend):
                 num_key_value_heads=self.local_n_kv_heads,
                 out=[output, lse],
             )
-            return output
+
+        return output.squeeze(1)
 
     @override
     def decode_paged_kv(
