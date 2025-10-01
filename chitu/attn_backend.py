@@ -105,6 +105,7 @@ class AttnBackend(abc.ABC):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         """
         If k and v are not None, kv_cache will be updated *inplace* with the new values from k and v.
@@ -158,6 +159,7 @@ class AttnBackend(abc.ABC):
                 softcap=softcap,
                 softmax_scale=softmax_scale,
                 sinks=sinks,
+                topk_indices=topk_indices,
             )
         else:
             return self.prefill(
@@ -171,6 +173,7 @@ class AttnBackend(abc.ABC):
                 softcap=softcap,
                 softmax_scale=softmax_scale,
                 sinks=sinks,
+                topk_indices=topk_indices,
             )
 
     # SPDX-SnippetEnd
@@ -239,6 +242,7 @@ class AttnBackend(abc.ABC):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         if isinstance(kv_cache, DenseKVCacheAccessor):
             return self.prefill_ragged_qo_dense_kv(
@@ -252,6 +256,7 @@ class AttnBackend(abc.ABC):
                 softcap=softcap,
                 softmax_scale=softmax_scale,
                 sinks=sinks,
+                topk_indices=topk_indices,
             )
         elif isinstance(kv_cache, PagedKVCacheAccessor):
             return self.prefill_ragged_qo_paged_kv(
@@ -265,6 +270,7 @@ class AttnBackend(abc.ABC):
                 softcap=softcap,
                 softmax_scale=softmax_scale,
                 sinks=sinks,
+                topk_indices=topk_indices,
             )
         else:
             raise NotImplementedError()
@@ -281,6 +287,7 @@ class AttnBackend(abc.ABC):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         if isinstance(kv_cache, DenseKVCacheAccessor):
             return self.decode_dense_kv(
@@ -293,6 +300,7 @@ class AttnBackend(abc.ABC):
                 softcap=softcap,
                 softmax_scale=softmax_scale,
                 sinks=sinks,
+                topk_indices=topk_indices,
             )
         elif isinstance(kv_cache, PagedKVCacheAccessor):
             return self.decode_paged_kv(
@@ -305,6 +313,7 @@ class AttnBackend(abc.ABC):
                 softcap=softcap,
                 softmax_scale=softmax_scale,
                 sinks=sinks,
+                topk_indices=topk_indices,
             )
         else:
             raise NotImplementedError()
@@ -338,6 +347,7 @@ class AttnBackend(abc.ABC):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         if k is not None:
             assert kv_cache.k is not None
@@ -378,6 +388,7 @@ class AttnBackend(abc.ABC):
             softcap=softcap,
             softmax_scale=softmax_scale,
             sinks=sinks,
+            topk_indices=topk_indices,
         )
 
     def prefill_ragged_qo_paged_kv(
@@ -393,6 +404,7 @@ class AttnBackend(abc.ABC):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         if k is not None:
             assert kv_cache.k is not None
@@ -441,6 +453,7 @@ class AttnBackend(abc.ABC):
             softcap=softcap,
             softmax_scale=softmax_scale,
             sinks=sinks,
+            topk_indices=topk_indices,
         )
 
     @abc.abstractmethod
@@ -2502,6 +2515,7 @@ class NpuAttnBackend(RefAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         # NPU BSH layout
         if len(kv_cache.k.shape) == 3:
@@ -2520,6 +2534,7 @@ class NpuAttnBackend(RefAttnBackend):
             softcap=softcap,
             softmax_scale=softmax_scale,
             sinks=sinks,
+            topk_indices=topk_indices,
         )
 
     @override
@@ -2536,6 +2551,7 @@ class NpuAttnBackend(RefAttnBackend):
         softcap=0.0,  # 0.0 means deactivated
         softmax_scale=None,
         sinks=None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         # NPU BSH layout
         if get_global_args().models.type != "deepseek-v3":
@@ -2555,6 +2571,7 @@ class NpuAttnBackend(RefAttnBackend):
             softcap=softcap,
             softmax_scale=softmax_scale,
             sinks=sinks,
+            topk_indices=topk_indices,
         )
 
     @override
