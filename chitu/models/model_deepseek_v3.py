@@ -334,6 +334,7 @@ class AttentionDeepSeekV3(Attention):
         self.can_use_mla_prologue_normal_torch_npu = (
             has_torch_npu
             and (quant is None or mla_prologue_int8)
+            and self.index_topk is None
             and self.mla_absorb == "absorb-without-precomp"
             and not self.merge_qkv
             and torch.get_default_dtype() == torch.bfloat16
@@ -474,7 +475,7 @@ class AttentionDeepSeekV3(Attention):
 
     def _run_linear(self, x, freqs_cis: BatchedFreqsCis):
         if self.can_use_mla_prologue_normal_torch_npu:
-            return mla_prologue_normal(
+            q, k, v = mla_prologue_normal(
                 x,
                 self.q_a_proj.get_native_layout_weight(),
                 self.q_b_proj.get_native_layout_weight(),
@@ -489,6 +490,7 @@ class AttentionDeepSeekV3(Attention):
                 smooth_scales=None,
                 impl="torch_npu",
             )
+            return q, k, v, None
 
         bs_seq, _ = x.size()
         assert self.q_lora_rank > 0
