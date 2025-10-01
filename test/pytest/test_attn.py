@@ -13,11 +13,13 @@ from chitu.attn_backend import (
 from chitu.cache_manager import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.global_vars import set_global_args
 from chitu.utils import (
+    ceil_div,
     try_import_opt_dep,
     try_import_platform_dep,
     try_import_and_setup_torch_npu,
 )
 from chitu.batched_seq_len import BatchedSeqLenDelta
+from chitu.device_type import is_muxi
 
 triton, has_triton = try_import_platform_dep("triton")
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
@@ -257,32 +259,162 @@ def test_mla_prefill_ragged_qo_paged_kv(
 
 
 @pytest.mark.parametrize("bs", [1, 64])
-@pytest.mark.parametrize("prev_seq_len_int", [512])
+@pytest.mark.parametrize("local_n_heads", [16])
+@pytest.mark.parametrize("kv_lora_rank", [512])
+@pytest.mark.parametrize("qk_rope_head_dim", [64])
+@pytest.mark.parametrize("qk_nope_head_dim", [128])
+@pytest.mark.parametrize("topk", [None, 128])
+@pytest.mark.parametrize("impl", ["triton", "npu"])
+def test_mla_decode_dense_kv(
+    bs,
+    local_n_heads,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    qk_nope_head_dim,
+    topk,
+    impl,
+):
+    if impl == "triton":
+        if not has_triton:
+            pytest.skip("triton is missing")
+        if is_muxi():
+            if topk is not None:
+                # It runs forever for unknown reasons (FIXME)
+                pytest.skip("triton does not support topk")
+            if packaging.version.parse(triton.__version__) < packaging.version.parse(
+                "3.2.0"
+            ):
+                # muxi runs a fallback path when topk is None, but requries triton >= 3.2.0
+                pytest.skip("triton too old")
+    if impl == "npu":
+        if not has_torch_npu:
+            pytest.skip("torch_npu is missing")
+        if topk is not None:
+            pytest.skip("torch_npu does not support topk")
+
+    torch.set_default_dtype(torch.bfloat16)
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_reqs": bs,
+                    "use_cuda_graph": False,
+                    "tp_size": 1,
+                    "op_impl": "torch",
+                    "cache_type": "skew",
+                    "dp_size": 1,
+                    "mla_absorb": "absorb",
+                },
+                "models": {
+                    "n_heads": local_n_heads,
+                    "kv_lora_rank": kv_lora_rank,
+                    "qk_rope_head_dim": qk_rope_head_dim,
+                    "qk_nope_head_dim": qk_nope_head_dim,
+                    "dim": 7168,
+                    "type": "deepseek-v3",
+                },
+            }
+        ),
+        need_ensure=False,
+    )
+
+    prev_seq_len_list = [torch.randint(1, 4096, (1,)).item() for _ in range(bs)]
+    seq_len_delta = BatchedSeqLenDelta(
+        prev_seq_len_list,
+        [item + 1 for item in prev_seq_len_list],
+        device="cuda",
+        cache_prefix_lens_tensor_device=False,
+        cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
+        cache_delta_position_ids_tensor_device=False,
+        cache_delta_seq_ids_tensor_device=False,
+    )
+    q_nope = torch.randn(bs, local_n_heads, kv_lora_rank, device="cuda")
+    q_pe = torch.randn(bs, local_n_heads, qk_rope_head_dim, device="cuda")
+    kv_cache = torch.randn(
+        bs, seq_len_delta.new.max_len, kv_lora_rank + qk_rope_head_dim, device="cuda"
+    )
+    this_kv = torch.randn(bs, 1, kv_lora_rank + qk_rope_head_dim, device="cuda")
+    if topk is not None:
+        # NOTE: topk_indices may be out of the range of sequence length, and
+        # the attention backend being tested should handle that.
+        topk_indices_list = []
+        for i in range(bs):
+            topk_indices_list.append(
+                torch.randperm(
+                    max(topk, seq_len_delta.new.lens_list[i]), device="cuda"
+                )[:topk]
+            )
+        topk_indices = torch.stack(topk_indices_list, dim=0)
+    else:
+        topk_indices = None
+
+    if impl == "triton":
+        attn = TritonAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+    elif impl == "npu":
+        attn = NpuAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+    else:
+        raise NotImplementedError()
+    attn_ref = RefAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+
+    attn.prepare_metadata_for_decode(seq_len_delta, None, 0)
+
+    y = attn.mla_decode_dense_kv(
+        q_nope,
+        q_pe,
+        DenseKVCacheAccessor(kv_cache, None),
+        this_kv,
+        seq_len_delta=seq_len_delta,
+        topk_indices=topk_indices,
+    )
+    y_ref = attn_ref.mla_decode_dense_kv(
+        q_nope,
+        q_pe,
+        DenseKVCacheAccessor(kv_cache, None),
+        this_kv,
+        seq_len_delta=seq_len_delta,
+        topk_indices=topk_indices,
+    )
+
+    assert torch.allclose(y, y_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("bs", [1, 64])
 @pytest.mark.parametrize("local_n_heads", [16])
 @pytest.mark.parametrize("kv_lora_rank", [512])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
 @pytest.mark.parametrize("page_size", [256])
+@pytest.mark.parametrize("topk", [None, 128])
 @pytest.mark.parametrize("impl", ["triton", "flashinfer", "npu"])
 def test_mla_decode_paged_kv(
     bs,
-    prev_seq_len_int,
     local_n_heads,
     kv_lora_rank,
     qk_rope_head_dim,
     qk_nope_head_dim,
     page_size,
+    topk,
     impl,
 ):
-    if impl == "triton" and not has_triton:
-        pytest.skip("triton is missing")
+    if impl == "triton":
+        if not has_triton:
+            pytest.skip("triton is missing")
+        if topk is not None and is_muxi():
+            # It runs forever for unknown reasons (FIXME)
+            pytest.skip("triton does not support topk")
     if impl == "flashinfer":
         if not has_flashinfer or packaging.version.parse(
             flashinfer.__version__
         ) < packaging.version.parse("0.2.0"):
             pytest.skip("flashinfer is missing or too old")
-    if impl == "npu" and not has_torch_npu:
-        pytest.skip("torch_npu is missing")
+        if topk is not None:
+            pytest.skip("flashinfer does not support topk")
+    if impl == "npu":
+        if not has_torch_npu:
+            pytest.skip("torch_npu is missing")
+        if topk is not None:
+            pytest.skip("torch_npu does not support topk")
 
     torch.set_default_dtype(torch.float16)
     set_global_args(
@@ -310,17 +442,13 @@ def test_mla_decode_paged_kv(
         need_ensure=False,
     )
 
-    max_num_pages = 1024
+    page_cnt_per_sample = ceil_div(4096, page_size)
+    max_num_pages = page_cnt_per_sample * bs
 
-    q_nope = torch.randn(bs, local_n_heads, kv_lora_rank, device="cuda")
-    q_pe = torch.randn(bs, local_n_heads, qk_rope_head_dim, device="cuda")
-    kv_cache = torch.randn(
-        max_num_pages, page_size, kv_lora_rank + qk_rope_head_dim, device="cuda"
-    )
-    this_kv = torch.randn(bs, 1, kv_lora_rank + qk_rope_head_dim, device="cuda")
+    prev_seq_len_list = [torch.randint(1, 4096, (1,)).item() for _ in range(bs)]
     seq_len_delta = BatchedSeqLenDelta(
-        [prev_seq_len_int for _ in range(bs)],
-        [prev_seq_len_int + 1 for _ in range(bs)],
+        prev_seq_len_list,
+        [item + 1 for item in prev_seq_len_list],
         device="cuda",
         cache_prefix_lens_tensor_device=False,
         cache_position_ids_tensor_device=False,
@@ -328,7 +456,26 @@ def test_mla_decode_paged_kv(
         cache_delta_position_ids_tensor_device=False,
         cache_delta_seq_ids_tensor_device=False,
     )
-    page_cnt_per_sample = (prev_seq_len_int // page_size) + 1
+    q_nope = torch.randn(bs, local_n_heads, kv_lora_rank, device="cuda")
+    q_pe = torch.randn(bs, local_n_heads, qk_rope_head_dim, device="cuda")
+    kv_cache = torch.randn(
+        max_num_pages, page_size, kv_lora_rank + qk_rope_head_dim, device="cuda"
+    )
+    this_kv = torch.randn(bs, 1, kv_lora_rank + qk_rope_head_dim, device="cuda")
+    if topk is not None:
+        # NOTE: topk_indices may be out of the range of sequence length, and
+        # the attention backend being tested should handle that.
+        topk_indices_list = []
+        for i in range(bs):
+            topk_indices_list.append(
+                torch.randperm(
+                    max(topk, seq_len_delta.new.lens_list[i]), device="cuda"
+                )[:topk]
+            )
+        topk_indices = torch.stack(topk_indices_list, dim=0)
+    else:
+        topk_indices = None
+
     page_table = torch.randperm(max_num_pages, device="cuda", dtype=torch.int32)[
         : bs * page_cnt_per_sample
     ].view(bs, page_cnt_per_sample)
@@ -353,6 +500,7 @@ def test_mla_decode_paged_kv(
         PagedKVCacheAccessor(page_table, kv_cache, None),
         this_kv,
         seq_len_delta=seq_len_delta,
+        topk_indices=topk_indices,
     )
     y_ref = attn_ref.mla_decode_paged_kv(
         q_nope,
@@ -360,6 +508,7 @@ def test_mla_decode_paged_kv(
         PagedKVCacheAccessor(page_table, kv_cache, None),
         this_kv,
         seq_len_delta=seq_len_delta,
+        topk_indices=topk_indices,
     )
 
     if impl == "npu":
