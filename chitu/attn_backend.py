@@ -54,13 +54,13 @@ triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 if has_triton and torch.cuda.is_available():
-    from chitu.triton_decode_attention import (
-        decode_attention_fwd,
-        mla_decode,
-        mla_decode_non_paged,
-        triton_skew_decode,
+    from chitu.ops.triton_ops import (
+        prefill_ragged_qkvo_triton,
+        decode_paged_kv_triton,
+        mla_decode_paged_kv_triton,
+        mla_decode_dense_kv_triton,
+        decode_dense_kv_triton,
     )
-    from chitu.triton_flash_attention import context_attention_fwd
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 logger = getLogger(__name__)
@@ -1379,7 +1379,7 @@ class TritonAttnBackend(RefAttnBackend):
         output = torch.empty(
             B, local_n_heads, v_n_hidden, dtype=q.dtype, device=q.device
         )
-        context_attention_fwd(
+        prefill_ragged_qkvo_triton(
             q,
             k,
             v,
@@ -1406,7 +1406,7 @@ class TritonAttnBackend(RefAttnBackend):
         topk_indices: Optional[torch.Tensor] = None,
     ):
         if is_muxi() and topk_indices is None:
-            # Fallback to MQA, which calls `decode_attention_fwd`. Experiments show it is faster than `mla_decode`.
+            # Fallback to MQA, which calls `decode_paged_kv_triton`. Experiments show it is faster than `mla_decode_paged_kv_triton`.
             return super().mla_decode_dense_kv(
                 q_nope, q_pe, kv_cache, kv, seq_len_delta, softmax_scale, topk_indices
             )
@@ -1459,7 +1459,7 @@ class TritonAttnBackend(RefAttnBackend):
             assert self.qk_nope_head_dim is not None
             softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
 
-        mla_decode_non_paged(
+        mla_decode_dense_kv_triton(
             q_nope,
             q_pe,
             kv_c_cache,
@@ -1486,7 +1486,7 @@ class TritonAttnBackend(RefAttnBackend):
         topk_indices: Optional[torch.Tensor] = None,
     ):
         if is_muxi() and topk_indices is None:
-            # Fallback to MQA, which calls `decode_attention_fwd`. Experiments show it is faster than `mla_decode`.
+            # Fallback to MQA, which calls `decode_paged_kv_triton`. Experiments show it is faster than `mla_decode_paged_kv_triton`.
             return super().mla_decode_paged_kv(
                 q_nope, q_pe, kv_cache, kv, seq_len_delta, softmax_scale, topk_indices
             )
@@ -1547,7 +1547,7 @@ class TritonAttnBackend(RefAttnBackend):
             assert self.qk_nope_head_dim is not None
             softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
 
-        mla_decode(
+        mla_decode_paged_kv_triton(
             q_nope,
             q_pe,
             kv_c_cache,
@@ -1637,7 +1637,7 @@ class TritonAttnBackend(RefAttnBackend):
                 key_padding_mask,
                 q.device,
             )
-        output = triton_skew_decode(
+        output = decode_dense_kv_triton(
             q,
             kv_cache.k,
             kv_cache.v,
@@ -1743,7 +1743,7 @@ class TritonAttnBackend(RefAttnBackend):
         )
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
-        decode_attention_fwd(
+        decode_paged_kv_triton(
             q.view(-1, q.shape[-2], q.shape[-1]),
             kv_cache.k,
             kv_cache.v,

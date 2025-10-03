@@ -31,3 +31,10 @@ from chitu.ops.triton_ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_expert_block_indexed_triton,
     batched_routed_activation_indexed_to_expert_block_permuted_blockfp8_triton,
 )
+from chitu.ops.triton_ops.attn import (
+    prefill_ragged_qkvo_triton,
+    decode_paged_kv_triton,
+    decode_dense_kv_triton,
+    mla_decode_paged_kv_triton,
+    mla_decode_dense_kv_triton,
+)

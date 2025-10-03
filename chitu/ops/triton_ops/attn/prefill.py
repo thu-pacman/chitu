@@ -184,7 +184,7 @@ def _fwd_kernel(
     )
 
 
-def context_attention_fwd(
+def prefill_ragged_qkvo_triton(
     q,
     k,
     v,
