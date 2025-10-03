@@ -48,6 +48,7 @@ from chitu.ops import (
     mla_prologue_normal,
     blockfp8_act_quant,
     blockfp8_index_score_dense_dsv32,
+    hadamard_transform,
 )
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
 from chitu.quantization.normal import (
@@ -179,11 +180,8 @@ class Indexer(torch.nn.Module):
             rotary_type="interleaved",
         )
 
-        # NOTE: DeepSeek-V3.2-Exp reference code do the following, but vLLM skips it
-        # (https://github.com/heheda12345/vllm/blob/618d877f48f5bb02f9f07ca6d19e90a044c24870/vllm/model_executor/models/deepseek_v2.py#L836).
-        # We follow vLLM for now (FIXME)
-        # q = self._rotate_activation(q)
-        # k = self._rotate_activation(k)
+        q = self._rotate_activation(q)
+        k = self._rotate_activation(k)
 
         q_fp8, q_scale = blockfp8_act_quant(q, block_size=128)
         k_fp8, k_scale = blockfp8_act_quant(k, block_size=128)
@@ -253,10 +251,8 @@ class Indexer(torch.nn.Module):
         ]  # shape: [bs * seq_q, topk(seq_k)]
         return topk_indices
 
-    def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    def _rotate_activation(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dtype == torch.bfloat16
-        from fast_hadamard_transform import hadamard_transform
-
         hidden_size = x.size(-1)
         return hadamard_transform(x, scale=hidden_size**-0.5)
 
