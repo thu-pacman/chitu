@@ -20,9 +20,9 @@ namespace chitu {
 // FIXME: set it as a template parameter according to the device
 #define WARP_SIZE 32
 
-template <typename T>
-__global__ void cuda_rms_norm_kernel(const T *x, const T *__restrict__ w,
-                                     T *out, int dim, float eps,
+template <typename Tx, typename Tw>
+__global__ void cuda_rms_norm_kernel(const Tx *x, const Tw *__restrict__ w,
+                                     Tx *out, int dim, float eps,
                                      size_t x_row_stride) {
     // NOTE: No restrict pointers because `x` may be alias to `out`
 
@@ -48,11 +48,11 @@ __global__ void cuda_rms_norm_kernel(const T *x, const T *__restrict__ w,
         auto x_value = to_scalar<float>(x[offset + t]);
         auto w_value = to_scalar<float>(w[t]);
         out[offset + t] =
-            to_scalar<T>(x_value * rsqrt(shared_data[0] + eps) * w_value);
+            to_scalar<Tx>(x_value * rsqrt(shared_data[0] + eps) * w_value);
     }
 }
 
-template <typename T>
+template <typename Tx, typename Tw>
 void rms_norm_impl(torch::Tensor x, torch::Tensor w, torch::Tensor out,
                    float eps) {
     ASSERTWITH(x.dim() == 2, "Tensor x should be 2D");
@@ -77,10 +77,12 @@ void rms_norm_impl(torch::Tensor x, torch::Tensor w, torch::Tensor out,
 
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     cuda_rms_norm_kernel<<<grid_dim, block_dim, shared_mem_size, stream>>>(
-        reinterpret_cast<typename map_to_cuda_type<T>::type *>(x.data_ptr<T>()),
-        reinterpret_cast<typename map_to_cuda_type<T>::type *>(w.data_ptr<T>()),
-        reinterpret_cast<typename map_to_cuda_type<T>::type *>(
-            out.data_ptr<T>()),
+        reinterpret_cast<typename map_to_cuda_type<Tx>::type *>(
+            x.data_ptr<Tx>()),
+        reinterpret_cast<typename map_to_cuda_type<Tw>::type *>(
+            w.data_ptr<Tw>()),
+        reinterpret_cast<typename map_to_cuda_type<Tx>::type *>(
+            out.data_ptr<Tx>()),
         num_cols, eps, x.stride(x.dim() - 2));
 }
 
@@ -95,13 +97,16 @@ torch::Tensor rms_norm(torch::Tensor x, torch::Tensor w, float eps,
     ASSERTWITH(out->device().type() == torch::kCUDA,
                "Tensor out should be on CUDA");
 
-    ASSERTWITH(x.dtype() == w.dtype(),
-               "Tensor x and w should have the same dtype");
     ASSERTWITH(out->dtype() == x.dtype(),
                "Tensor out should have the same dtype as x");
 
-    DISPATCH_FLOAT_TYPES(x.scalar_type(), "rms_norm",
-                         [&] { rms_norm_impl<scalar_t>(x, w, *out, eps); });
+    DISPATCH_FLOAT_TYPES(x.scalar_type(), "rms_norm", [&] {
+        using Tx = scalar_t;
+        DISPATCH_FLOAT_TYPES(w.scalar_type(), "rms_norm", [&] {
+            using Tw = scalar_t;
+            rms_norm_impl<Tx, Tw>(x, w, *out, eps);
+        });
+    });
 
     return *out;
 }

@@ -165,8 +165,11 @@ TORCH_CUDA_ARCH_LIST=9.0 pip install --no-build-isolation ".[flash_mla]"
 - `flashinfer`: 用于支持 `infer.attn_type=flash_infer`。
 - `flash_mla`: 用于支持 `infer.attn_type=flash_mla`。
 - `deep_gemm`: 用于支持使用 DeepGEMM 进行 fp8 推理。
+- `deep_ep`: 用于支持使用 DeepEP 进行 MoE 通信（需要先在系统中安装 NVSHMEM，并设置 `NVSHMEM_DIR=/path/to/installed/nvshmem` 环境变量）
 - `cpu`: 用于支持 CPU+GPU 混合推理。
 - `muxi_layout_kernels`: 用于支持在沐曦 GPU 上使用 `infer.op_impl=muxi_custom_kernel` 模式，在小 batch 场景性能更优。
+- `scipy`: 用于支持 DeepSeek-V3.2-Exp 中的 indexer 的可选依赖。
+- `fast_hadamard_transform`: 用于支持 DeepSeek-V3.2-Exp 中的 indexer 的可选依赖。
 
 如果需要用于开发，建议加上 `-e` 选项启用 editable install，如
 

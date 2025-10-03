@@ -94,5 +94,10 @@ extras_require = {
     "deep_ep": [
         "deep_ep @ file://localhost" + os.path.join(setup_dir, "third_party/DeepEP"),
     ],  # export NVSHMEM_DIR=/path/to/installed/nvshmem
+    "scipy": ["scipy"],
+    "fast_hadamard_transform": [
+        "fast-hadamard-transform @ file://localhost"
+        + os.path.join(setup_dir, "third_party/fast-hadamard-transform")
+    ],
     **operators.get_extras_require(),
 }

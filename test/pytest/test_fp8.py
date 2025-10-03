@@ -9,6 +9,7 @@ from chitu.ops import (
     blockfp8_weight_dequant,
     soft_fp8_blockfp8_weight_dequant,
     soft_fp8_blockfp8_gemm,
+    blockfp8_index_score_dense_dsv32,
 )
 from chitu.device_type import has_native_fp8
 from chitu.lazy import eval_lazy
@@ -120,3 +121,27 @@ def test_soft_fp8_gemm_is_close_to_dequanted_gemm(dtype: torch.dtype):
     y = soft_fp8_blockfp8_gemm(a, b, b_s)
 
     assert torch.allclose(std_y, y, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("b", [1, 2])
+@pytest.mark.parametrize("m", [1, 4000])
+@pytest.mark.parametrize("n", [1, 5000])
+@pytest.mark.parametrize("h", [64])
+@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("impl", ["triton"])
+@pytest.mark.skipif(
+    not has_native_fp8(),
+    reason="This test requires the GPU to have native FP8 support",
+)
+def test_blockfp8_index_score_dense_dsv32(b, m, n, h, d, block_size, impl):
+    q_bf16 = torch.randn(b, m, h, d, dtype=torch.bfloat16, device="cuda")
+    q_fp8, q_s = blockfp8_act_quant(q_bf16, block_size)
+
+    k_bf16 = torch.randn(b, n, d, dtype=torch.bfloat16, device="cuda")
+    k_fp8, k_s = blockfp8_act_quant(k_bf16, block_size)
+
+    output = blockfp8_index_score_dense_dsv32(q_fp8, q_s, k_fp8, k_s, impl=impl)
+    output_ref = blockfp8_index_score_dense_dsv32(q_fp8, q_s, k_fp8, k_s, impl="torch")
+
+    assert torch.allclose(output, output_ref, atol=0.15, rtol=0.15)

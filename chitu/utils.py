@@ -57,6 +57,8 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> tuple[Any, bool]:
         "deep_gemm",
         "deep_ep",  # [TODO] add installation support
         "cpu",
+        "scipy",
+        "fast_hadamard_transform",
     }
     assert (
         opt_dep_name in opt_deps
@@ -206,6 +208,10 @@ def ceil_div(a, b):
 
 def is_power_of_two(n: int) -> bool:
     return (n != 0) and (n & (n - 1)) == 0
+
+
+def next_power_of_two(n: int) -> int:
+    return 1 if n == 0 else 2 ** (n - 1).bit_length()
 
 
 def pad_tensor(x, target_size, dim=0, value=0):

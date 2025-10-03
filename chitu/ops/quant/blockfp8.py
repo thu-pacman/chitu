@@ -25,6 +25,7 @@ if has_triton:
         soft_fp8_blockfp8_weight_dequant_triton,
         blockfp8_act_quant_triton,
         silu_and_mul_and_blockfp8_act_quant_triton,
+        blockfp8_index_score_dense_dsv32_triton,
     )
 
 
@@ -300,15 +301,20 @@ def blockfp8_index_score_dense_dsv32(
     """
 
     if impl == "auto":
-        impl = "torch"
+        if has_triton:
+            impl = "triton"
+        else:
+            impl = "torch"
 
     if impl == "torch":
-        return blockfp8_index_score_dsv32_torch(q, q_s, k, k_s)
+        return blockfp8_index_score_dense_dsv32_torch(q, q_s, k, k_s)
+    elif impl == "triton":
+        return blockfp8_index_score_dense_dsv32_triton(q, q_s, k, k_s)
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
 
 
-def blockfp8_index_score_dsv32_torch(
+def blockfp8_index_score_dense_dsv32_torch(
     q: torch.Tensor,  # [b, m, h=64, d=128], fp8
     q_s: torch.Tensor,  # [b, m, h=64, d/block_size=1], fp32
     k: torch.Tensor,  # [b, n, d=128], fp8
@@ -325,8 +331,8 @@ def blockfp8_index_score_dsv32_torch(
     k_bf16 = k.to(torch.bfloat16)
 
     logits = torch.einsum("bmhd,bnd->bmnh", q_bf16, k_bf16)
-    logits = torch.nn.functional.relu(logits)
-    logits = logits * q_s.view(b, m, 1, h)
+    logits = logits.relu_()
+    logits *= q_s.view(b, m, 1, h)
 
     logits_sum = logits.sum(dim=-1)  # bmn
 

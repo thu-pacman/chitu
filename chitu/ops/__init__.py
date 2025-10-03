@@ -48,3 +48,4 @@ from chitu.ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_expert_block_permuted_blockfp8,
     batched_routed_activation_indexed_to_concat_permuted,
 )
+from chitu.ops.hadamard import hadamard_transform

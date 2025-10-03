@@ -35,7 +35,6 @@ from chitu.muxi_utils import (
     Blockfp8MoeExpertsMuxiLayout,
 )
 from chitu.ops import (
-    apply_rotary_pos_emb,
     apply_rotary_pos_emb_partial,
     silu_and_mul,
     blockfp8_weight_dequant,
@@ -49,6 +48,7 @@ from chitu.ops import (
     mla_prologue_normal,
     blockfp8_act_quant,
     blockfp8_index_score_dense_dsv32,
+    hadamard_transform,
 )
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
 from chitu.quantization.normal import (
@@ -171,24 +171,17 @@ class Indexer(torch.nn.Module):
         )
         k = self.wk(x)
         k = self.k_norm(k)
-        k_pe, k_nope = torch.split(
-            k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
-        )
-        q_pe, k_pe = apply_rotary_pos_emb(
-            q_pe,
-            k_pe,
+        q, k, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
+            q,
+            k,
             freqs_cis,
+            q_rotary_end=self.rope_head_dim,
+            k_rotary_end=self.rope_head_dim,
             rotary_type="interleaved",
-            impl="torch",  # FIXME: adjust impl
         )
-        q = torch.cat([q_pe, q_nope], dim=-1)
-        k = torch.cat([k_pe, k_nope], dim=-1)
 
-        # NOTE: DeepSeek-V3.2-Exp reference code do the following, but vLLM skips it
-        # (https://github.com/heheda12345/vllm/blob/618d877f48f5bb02f9f07ca6d19e90a044c24870/vllm/model_executor/models/deepseek_v2.py#L836).
-        # We follow vLLM for now (FIXME)
-        # q = self._rotate_activation(q)
-        # k = self._rotate_activation(k)
+        q = self._rotate_activation(q)
+        k = self._rotate_activation(k)
 
         q_fp8, q_scale = blockfp8_act_quant(q, block_size=128)
         k_fp8, k_scale = blockfp8_act_quant(k, block_size=128)
@@ -258,10 +251,8 @@ class Indexer(torch.nn.Module):
         ]  # shape: [bs * seq_q, topk(seq_k)]
         return topk_indices
 
-    def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    def _rotate_activation(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dtype == torch.bfloat16
-        from fast_hadamard_transform import hadamard_transform
-
         hidden_size = x.size(-1)
         return hadamard_transform(x, scale=hidden_size**-0.5)
 

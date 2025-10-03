@@ -79,7 +79,7 @@ def rms_norm_ref(
     dtype = x.dtype
     x = x.to(compute_dtype)
     y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-    return y.to(dtype) * weight
+    return (y.to(weight.dtype) * weight).to(dtype)
 
 
 @compatible_with_inplace
@@ -103,9 +103,7 @@ def rms_norm_npu(
     compute_dtype: torch.dtype,
 ):
     dtype = x.dtype
-    if weight.dtype != dtype:
-        weight.data = weight.data.to(dtype)
-    return torch_npu.npu_rms_norm(x, weight, epsilon=eps)[0].to(dtype)
+    return torch_npu.npu_rms_norm(x.to(weight.dtype), weight, epsilon=eps)[0].to(dtype)
 
 
 def rms_norm_cuda(
@@ -151,8 +149,7 @@ def rms_norm(
     if impl == "auto":
         if has_cpuinfer and get_global_args().infer.op_impl == "cpu":
             impl = "cpu"
-        elif out is not None and has_chitu_backend and x.dtype == weight.dtype:
-            # FIXME: Support x.dtype != weight.dtype
+        elif out is not None and has_chitu_backend:
             impl = "cuda"
         elif has_tbsgemm and get_global_args().dtype == "float16" and eps == 1e-6:
             impl = "muxi_w8a8_kernels"

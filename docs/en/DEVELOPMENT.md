@@ -161,8 +161,11 @@ Currently supported optional dependencies are:
 - `flashinfer`: Support `infer.attn_type=flash_infer`.
 - `flash_mla`: Support `infer.attn_type=flash_mla`.
 - `deep_gemm`: Support using DeepGEMM for fp8 inference.
+- `deep_ep`: Support using DeepEP for MoE communication (requiring NVSHMEM installed on your system, and setting `NVSHMEM_DIR=/path/to/installed/nvshmem` environment variable).
 - `cpu`: Support hybrid CPU+GPU inference.
 - `muxi_layout_kernels`: Additional kernels for running on MetaX GPUs with `infer.op_impl=muxi_custom_kernel`, optimized for small batches.
+- `scipy`: Optional dependency for indexer in DeepSeek-V3.2-Exp.
+- `fast_hadamard_transform`: Optional dependency for indexer in DeepSeek-V3.2-Exp.
 
 Append `-e` to `pip install` for editable install. Example:
 
