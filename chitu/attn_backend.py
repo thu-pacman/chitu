@@ -1073,14 +1073,15 @@ class RefAttnBackend(AttnBackend):
         else:
             attention = torch.softmax(scores, dim=-1).to(v.dtype)
         # Some rows might be completely masked out so we fill them with zero instead of NaN
+        row_mask = torch.zeros(
+            attention.shape, dtype=torch.bool, device=attention.device
+        )  # shape: (batch, head, seqlen_q, seqlen_k)
         if local_mask is not None:
-            attention = attention.masked_fill(
-                torch.all(local_mask, dim=-1, keepdim=True), 0.0
-            )
+            row_mask |= local_mask
         if index_mask is not None:
-            attention = attention.masked_fill(
-                torch.all(index_mask.unsqueeze(1), dim=-1, keepdim=True), 0.0
-            )
+            row_mask |= index_mask.unsqueeze(1)  # unsqueeze head
+        row_mask = torch.all(row_mask, dim=-1, keepdim=True)
+        attention = attention.masked_fill(row_mask, 0.0)
         # We want to mask here so that the attention matrix doesn't have any NaNs
         # Otherwise we'll get NaN in dV
         if query_padding_mask is not None:
