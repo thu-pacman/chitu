@@ -601,6 +601,11 @@ class Executor:
                 Backend.cache_manager.finalize_cache_all_decode(rid)
                 if get_global_args().models.type == "hf-qwen3-next":
                     Backend.linear_attn_cache_manager.finalize_cache_all_decode(rid)
+                if (
+                    getattr(Backend, "indexer_cache_manager", None) is not None
+                    and get_global_args().models.type == "deepseek-v3"
+                ):
+                    Backend.indexer_cache_manager.finalize_cache_all_decode(rid)
             return None
 
         if self.moe_impl is not None:
@@ -655,6 +660,13 @@ class Executor:
             Backend.linear_attn_cache_manager.prepare_cache_prefill(
                 tasks.req_ids, [len(t) for t in tasks.tokens]
             )
+        if (
+            getattr(Backend, "indexer_cache_manager", None) is not None
+            and get_global_args().models.type == "deepseek-v3"
+        ):
+            Backend.indexer_cache_manager.prepare_cache_prefill(
+                tasks.req_ids, [len(t) for t in tasks.tokens]
+            )
 
         num_tokens = tasks.num_tokens
 
@@ -706,6 +718,11 @@ class Executor:
         Backend.cache_manager.finalize_cache_all_prefill()  # like reset metadata
         if get_global_args().models.type == "hf-qwen3-next":
             Backend.linear_attn_cache_manager.finalize_cache_all_prefill()
+        if (
+            getattr(Backend, "indexer_cache_manager", None) is not None
+            and get_global_args().models.type == "deepseek-v3"
+        ):
+            Backend.indexer_cache_manager.finalize_cache_all_prefill()
         return out
 
     def prefill_step_tp_only(self, tasks: PackedTasksBase) -> torch.Tensor:
@@ -725,6 +742,13 @@ class Executor:
         )
         if get_global_args().models.type == "hf-qwen3-next":
             Backend.linear_attn_cache_manager.prepare_cache_prefill(
+                tasks.req_ids, [len(t) for t in tasks.tokens]
+            )
+        if (
+            getattr(Backend, "indexer_cache_manager", None) is not None
+            and get_global_args().models.type == "deepseek-v3"
+        ):
+            Backend.indexer_cache_manager.prepare_cache_prefill(
                 tasks.req_ids, [len(t) for t in tasks.tokens]
             )
 
@@ -775,6 +799,11 @@ class Executor:
         Backend.cache_manager.finalize_cache_all_prefill()
         if get_global_args().models.type == "hf-qwen3-next":
             Backend.linear_attn_cache_manager.finalize_cache_all_prefill()
+        if (
+            getattr(Backend, "indexer_cache_manager", None) is not None
+            and get_global_args().models.type == "deepseek-v3"
+        ):
+            Backend.indexer_cache_manager.finalize_cache_all_prefill()
         # 7) ensure logits are [B, vocab]
         if out.dim() == 1:
             out = out.view(1, -1)
@@ -795,6 +824,11 @@ class Executor:
         Backend.cache_manager.prepare_cache_decode(req_ids)
         if get_global_args().models.type == "hf-qwen3-next":
             Backend.linear_attn_cache_manager.prepare_cache_decode(req_ids)
+        if (
+            getattr(Backend, "indexer_cache_manager", None) is not None
+            and get_global_args().models.type == "deepseek-v3"
+        ):
+            Backend.indexer_cache_manager.prepare_cache_decode(req_ids)
         try:
             self._kv_hook.before_decode_step(req_ids)
         except Exception:
@@ -828,12 +862,22 @@ class Executor:
         Backend.cache_manager.finalize_cache_single_decode(req_ids)
         if get_global_args().models.type == "hf-qwen3-next":
             Backend.linear_attn_cache_manager.finalize_cache_single_decode(req_ids)
+        if (
+            getattr(Backend, "indexer_cache_manager", None) is not None
+            and get_global_args().models.type == "deepseek-v3"
+        ):
+            Backend.indexer_cache_manager.finalize_cache_single_decode(req_ids)
         return out
 
     def decode_step(self, tasks: PackedTasksBase):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
         if get_global_args().models.type == "hf-qwen3-next":
             Backend.linear_attn_cache_manager.prepare_cache_decode(tasks.req_ids)
+        if (
+            getattr(Backend, "indexer_cache_manager", None) is not None
+            and get_global_args().models.type == "deepseek-v3"
+        ):
+            Backend.indexer_cache_manager.prepare_cache_decode(tasks.req_ids)
         # Ensure KV cache is present for PD decode-only before running decode.
         try:
             self._kv_hook.before_decode_step(tasks.req_ids)
@@ -872,6 +916,11 @@ class Executor:
             Backend.linear_attn_cache_manager.finalize_cache_single_decode(
                 tasks.req_ids
             )
+        if (
+            getattr(Backend, "indexer_cache_manager", None) is not None
+            and get_global_args().models.type == "deepseek-v3"
+        ):
+            Backend.indexer_cache_manager.finalize_cache_single_decode(tasks.req_ids)
         return out
 
     def empty_prefill_step(self):

@@ -54,13 +54,14 @@ triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 if has_triton and torch.cuda.is_available():
-    from chitu.triton_decode_attention import (
-        decode_attention_fwd,
-        mla_decode,
-        mla_decode_non_paged,
-        triton_skew_decode,
+    from chitu.ops.triton_ops import (
+        prefill_ragged_qkvo_triton,
+        decode_paged_kv_triton,
+        decode_dense_kv_triton,
+        mla_decode_paged_kv_triton,
+        mla_decode_dense_kv_triton,
+        mla_decode_topk_ragged_qkvo_triton,
     )
-    from chitu.triton_flash_attention import context_attention_fwd
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 logger = getLogger(__name__)
@@ -1073,14 +1074,15 @@ class RefAttnBackend(AttnBackend):
         else:
             attention = torch.softmax(scores, dim=-1).to(v.dtype)
         # Some rows might be completely masked out so we fill them with zero instead of NaN
+        row_mask = torch.zeros(
+            attention.shape, dtype=torch.bool, device=attention.device
+        )  # shape: (batch, head, seqlen_q, seqlen_k)
         if local_mask is not None:
-            attention = attention.masked_fill(
-                torch.all(local_mask, dim=-1, keepdim=True), 0.0
-            )
+            row_mask |= local_mask
         if index_mask is not None:
-            attention = attention.masked_fill(
-                torch.all(index_mask.unsqueeze(1), dim=-1, keepdim=True), 0.0
-            )
+            row_mask |= index_mask.unsqueeze(1)  # unsqueeze head
+        row_mask = torch.all(row_mask, dim=-1, keepdim=True)
+        attention = attention.masked_fill(row_mask, 0.0)
         # We want to mask here so that the attention matrix doesn't have any NaNs
         # Otherwise we'll get NaN in dV
         if query_padding_mask is not None:
@@ -1379,7 +1381,7 @@ class TritonAttnBackend(RefAttnBackend):
         output = torch.empty(
             B, local_n_heads, v_n_hidden, dtype=q.dtype, device=q.device
         )
-        context_attention_fwd(
+        prefill_ragged_qkvo_triton(
             q,
             k,
             v,
@@ -1395,6 +1397,92 @@ class TritonAttnBackend(RefAttnBackend):
         return output
 
     @override
+    def mla_prefill_ragged_qkvo(
+        self,
+        q_nope,
+        q_pe,
+        kv,
+        seq_len_delta: BatchedSeqLenDelta,
+        causal: bool = False,
+        softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
+    ):
+        if topk_indices is None or not causal:
+            # Fallback to MQA
+            return super().mla_prefill_ragged_qkvo(
+                q_nope,
+                q_pe,
+                kv,
+                seq_len_delta,
+                causal,
+                softmax_scale,
+                topk_indices,
+            )
+
+        B, local_n_heads, kv_lora_rank = q_nope.shape
+        assert q_pe.shape[0] == B
+        assert q_pe.shape[1] == local_n_heads
+        _, _, qk_rope_head_dim = q_pe.shape
+
+        o = torch.zeros(
+            B,
+            local_n_heads,
+            kv_lora_rank,
+            dtype=q_nope.dtype,
+            device=q_nope.device,
+        )
+
+        num_kv_splits = None
+        if is_muxi():
+            if B > 32:
+                num_kv_splits = 3
+            elif B > 1:
+                num_kv_splits = 8
+            else:
+                num_kv_splits = 16
+        else:
+            num_kv_splits = 4
+        assert num_kv_splits is not None
+
+        attn_logits = torch.empty(
+            (
+                B,
+                local_n_heads,
+                num_kv_splits,
+                kv_lora_rank + 1,
+            ),
+            dtype=torch.float32,
+            device=q_nope.device,
+        )
+
+        k_pe = kv[..., kv_lora_rank:]
+        kv_c = kv[..., :kv_lora_rank]
+
+        if softmax_scale is None:
+            assert self.qk_nope_head_dim is not None
+            softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
+
+        # NOTE: When topk_indices is enabled during prefill, we can't reuse Q along its sequence
+        # dimensions. This makes the prefill kernel behave more like a decode kernel. Therefore,
+        # this `mla_decode_ragged_qkvo_triton` is actually for prefilling.
+        mla_decode_topk_ragged_qkvo_triton(
+            q_nope,
+            q_pe,
+            kv_c,
+            k_pe,
+            o,
+            seq_len_delta.delta_position_ids_tensor_device,
+            seq_len_delta.delta_seq_ids_tensor_device,
+            seq_len_delta.new.prefix_lens_tensor_device,
+            attn_logits,
+            num_kv_splits,
+            softmax_scale,
+            topk_indices,
+        )
+
+        return o.view(B, local_n_heads, -1)
+
+    @override
     def mla_decode_dense_kv(
         self,
         q_nope,
@@ -1406,7 +1494,7 @@ class TritonAttnBackend(RefAttnBackend):
         topk_indices: Optional[torch.Tensor] = None,
     ):
         if is_muxi() and topk_indices is None:
-            # Fallback to MQA, which calls `decode_attention_fwd`. Experiments show it is faster than `mla_decode`.
+            # Fallback to MQA, which calls `decode_paged_kv_triton`. Experiments show it is faster than `mla_decode_paged_kv_triton`.
             return super().mla_decode_dense_kv(
                 q_nope, q_pe, kv_cache, kv, seq_len_delta, softmax_scale, topk_indices
             )
@@ -1436,7 +1524,6 @@ class TritonAttnBackend(RefAttnBackend):
                 num_kv_splits = 16
         else:
             num_kv_splits = 4
-
         assert num_kv_splits is not None
 
         attn_logits = torch.empty(
@@ -1450,7 +1537,7 @@ class TritonAttnBackend(RefAttnBackend):
             device=q_nope.device,
         )
 
-        assert kv_cache.k.ndim == 3  # (num_blocks, block_size, dim)
+        assert kv_cache.k.ndim == 3  # (batch_size, seq_len, dim)
         kv_c_and_k_pe_cache = kv_cache.k
         k_pe_cache = kv_c_and_k_pe_cache[..., kv_lora_rank:]
         kv_c_cache = kv_c_and_k_pe_cache[..., :kv_lora_rank]
@@ -1459,7 +1546,7 @@ class TritonAttnBackend(RefAttnBackend):
             assert self.qk_nope_head_dim is not None
             softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
 
-        mla_decode_non_paged(
+        mla_decode_dense_kv_triton(
             q_nope,
             q_pe,
             kv_c_cache,
@@ -1486,7 +1573,7 @@ class TritonAttnBackend(RefAttnBackend):
         topk_indices: Optional[torch.Tensor] = None,
     ):
         if is_muxi() and topk_indices is None:
-            # Fallback to MQA, which calls `decode_attention_fwd`. Experiments show it is faster than `mla_decode`.
+            # Fallback to MQA, which calls `decode_paged_kv_triton`. Experiments show it is faster than `mla_decode_paged_kv_triton`.
             return super().mla_decode_paged_kv(
                 q_nope, q_pe, kv_cache, kv, seq_len_delta, softmax_scale, topk_indices
             )
@@ -1523,7 +1610,6 @@ class TritonAttnBackend(RefAttnBackend):
                 num_kv_splits = 16
         else:
             num_kv_splits = 4
-
         assert num_kv_splits is not None
 
         attn_logits = torch.empty(
@@ -1547,7 +1633,7 @@ class TritonAttnBackend(RefAttnBackend):
             assert self.qk_nope_head_dim is not None
             softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
 
-        mla_decode(
+        mla_decode_paged_kv_triton(
             q_nope,
             q_pe,
             kv_c_cache,
@@ -1637,7 +1723,7 @@ class TritonAttnBackend(RefAttnBackend):
                 key_padding_mask,
                 q.device,
             )
-        output = triton_skew_decode(
+        output = decode_dense_kv_triton(
             q,
             kv_cache.k,
             kv_cache.v,
@@ -1743,7 +1829,7 @@ class TritonAttnBackend(RefAttnBackend):
         )
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
-        decode_attention_fwd(
+        decode_paged_kv_triton(
             q.view(-1, q.shape[-2], q.shape[-1]),
             kv_cache.k,
             kv_cache.v,

@@ -62,6 +62,7 @@ class KVCacheManagerBase:
         additional_cache_shape_dict: Optional[
             Dict[str, torch.Size | Sequence[int]]
         ] = None,
+        additional_cache_dtype_dict: Optional[Dict[str, torch.dtype]] = None,
     ):
         """
         Base class for KV cache managers
@@ -113,8 +114,10 @@ class KVCacheManagerBase:
                 self.k_shape_per_sample = kv_shape_per_sample
                 self.v_shape_per_sample = None
             self.additional_cache_shape_dict = None
+            self.additional_cache_dtype_dict = None
         else:
             self.additional_cache_shape_dict = additional_cache_shape_dict
+            self.additional_cache_dtype_dict = additional_cache_dtype_dict or {}
             self.k_shape_per_sample = None
             self.v_shape_per_sample = None
 
@@ -244,6 +247,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
             Dict[str, torch.Size | Sequence[int]]
         ] = None,
         lazy_mode=False,
+        additional_cache_dtype_dict: Optional[Dict[str, torch.dtype]] = None,
     ):
         """
         Paged KV cache manager
@@ -266,6 +270,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
             head_dim=head_dim,
             device=device,
             additional_cache_shape_dict=additional_cache_shape_dict,
+            additional_cache_dtype_dict=additional_cache_dtype_dict,
         )
 
         self.max_blocks_per_req = ceil_div(max_seq_len, block_size)
@@ -315,9 +320,16 @@ class PagedKVCacheManager(KVCacheManagerBase):
         if self.additional_cache_shape_dict is not None:
             self.additional_paged_cache = {}
             for key, value in self.additional_cache_shape_dict.items():
+                dtype = (
+                    self.additional_cache_dtype_dict.get(key, torch.get_default_dtype())
+                    if hasattr(self, "additional_cache_dtype_dict")
+                    and self.additional_cache_dtype_dict is not None
+                    else torch.get_default_dtype()
+                )
                 self.additional_paged_cache[key] = torch.zeros(
                     (self.num_layers, self.num_blocks, block_size) + tuple(value),
                     device=device,
+                    dtype=dtype,
                 )
         else:
             self.additional_paged_cache = None
@@ -380,9 +392,16 @@ class PagedKVCacheManager(KVCacheManagerBase):
         if has_additional_cache:
             self.additional_paged_cache.clear()
             for key, value in self.additional_cache_shape_dict.items():
+                dtype = (
+                    self.additional_cache_dtype_dict.get(key, torch.float32)
+                    if hasattr(self, "additional_cache_dtype_dict")
+                    and self.additional_cache_dtype_dict is not None
+                    else torch.float32
+                )
                 self.additional_paged_cache[key] = torch.zeros(
                     (self.num_layers, self.num_blocks, self.block_size) + tuple(value),
                     device=self.device,
+                    dtype=dtype,
                 )
 
     @override

@@ -1,6 +1,9 @@
 <img src="../logo.png" width="20%">
 
 # Chitu「赤兔」
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/thu-pacman/chitu)
+
 [中文](/README.md) | English
 
 **Some documents in this repo are originally written in Chinese and then translated into English by LLM.**

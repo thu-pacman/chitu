@@ -17,6 +17,7 @@ from torch import nn
 from chitu.attn_backend import AttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.batched_freqs_cis import BatchedFreqsCis
+from chitu.cache_manager import KVCacheManagerBase, KVCacheAccessor
 from chitu.global_vars import get_global_args
 from chitu.models.model import (
     Attention,
@@ -48,8 +49,11 @@ from chitu.ops import (
     mla_prologue_normal,
     blockfp8_act_quant,
     blockfp8_index_score_dense_dsv32,
+    append_to_paged_kv_cache,
+    read_from_paged_kv_cache,
     hadamard_transform,
 )
+import torch.distributed as dist
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
 from chitu.quantization.normal import (
     NormalLinear,
@@ -99,12 +103,6 @@ def ParallelAbsorbGemm(
     return base_class(local_n_heads, in_features_per_head, out_features_per_head)
 
 
-# SPDX-SnippetBegin
-# SPDX-License-Identifier: MIT
-# SPDX-SnippetCopyrightText: 2023 DeepSeek
-# SDPX—SnippetName: Indexer layer
-#
-# From https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py
 class Indexer(torch.nn.Module):
     def __init__(self, args, *, checkpoint_prefix: str):
         super().__init__()
@@ -135,25 +133,7 @@ class Indexer(torch.nn.Module):
             checkpoint_prefix=f"{checkpoint_prefix}.weights_proj",
         )
         self.softmax_scale = self.head_dim**-0.5
-
-        max_reqs = get_global_args().infer.max_reqs
-        max_seq_len = get_global_args().infer.max_seq_len
-
-        block_size = 128
-        self.register_buffer(
-            "k_cache",
-            torch.empty(
-                max_reqs, max_seq_len, self.head_dim, dtype=torch.float8_e4m3fn
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "k_scale_cache",
-            torch.empty(
-                max_reqs, max_seq_len, self.head_dim // block_size, dtype=torch.float32
-            ),
-            persistent=False,
-        )
+        self.block_size = 128
 
     def forward(
         self,
@@ -162,6 +142,7 @@ class Indexer(torch.nn.Module):
         seq_len_delta: BatchedSeqLenDelta,
         freqs_cis: BatchedFreqsCis,
         is_causal: bool,
+        cache_accessor: KVCacheAccessor,
     ):
         assert x.ndim == 2
         q = self.wq_b(qr)
@@ -183,58 +164,94 @@ class Indexer(torch.nn.Module):
         q = self._rotate_activation(q)
         k = self._rotate_activation(k)
 
-        q_fp8, q_scale = blockfp8_act_quant(q, block_size=128)
-        k_fp8, k_scale = blockfp8_act_quant(k, block_size=128)
-        self.k_cache[
-            : seq_len_delta.batch_size, seq_len_delta.delta_position_ids_tensor_device
-        ] = k_fp8
-        self.k_scale_cache[
-            : seq_len_delta.batch_size, seq_len_delta.delta_position_ids_tensor_device
-        ] = k_scale
-        weights = self.weights_proj(x) * self.n_heads**-0.5
-        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        q_fp8, q_scale = blockfp8_act_quant(q, block_size=self.block_size)
+        k_fp8, k_scale = blockfp8_act_quant(k, block_size=self.block_size)
 
-        # Indexer with Dense KV cache with out-of-range items zeroed out:
+        append_to_paged_kv_cache(
+            cache_accessor.add["indexer_k"],
+            cache_accessor.block_table,
+            k_fp8.contiguous(),
+            seq_len_delta.delta_position_ids_tensor_device,
+            seq_len_delta.delta_seq_ids_tensor_device,
+            get_page_ids=cache_accessor.get_page_ids,
+            get_offs_in_page=cache_accessor.get_offs_in_page,
+        )
+        append_to_paged_kv_cache(
+            cache_accessor.add["indexer_ks"],
+            cache_accessor.block_table,
+            k_scale.contiguous(),
+            seq_len_delta.delta_position_ids_tensor_device,
+            seq_len_delta.delta_seq_ids_tensor_device,
+            get_page_ids=cache_accessor.get_page_ids,
+            get_offs_in_page=cache_accessor.get_offs_in_page,
+        )
+
         delta_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
         delta_pos_ids = seq_len_delta.delta_position_ids_tensor_device
-        new_seq_ids = seq_len_delta.new.seq_ids_tensor_device
-        new_pos_ids = seq_len_delta.new.position_ids_tensor_device
+        bs = seq_len_delta.new.batch_size
+        M = seq_len_delta.new.max_len
+        # Build dense q/q_s for the reference operator, without mean aggregation
+        S = q_fp8.shape[0]
+        if S == 0:
+            return torch.empty(
+                0, min(self.index_topk, M), dtype=torch.long, device=q_fp8.device
+            )
         q_fp8_dense = torch.zeros(
-            seq_len_delta.new.batch_size,
-            seq_len_delta.new.max_len,
+            bs,
+            M,
             *q_fp8.shape[1:],
             dtype=q_fp8.dtype,
             device=q_fp8.device,
         )
-        weights_dense = torch.zeros(
-            seq_len_delta.new.batch_size,
-            seq_len_delta.new.max_len,
-            *weights.shape[1:],
-            dtype=weights.dtype,
-            device=weights.device,
-        )
-        k_cache_dense = torch.zeros(
-            seq_len_delta.new.batch_size,
-            seq_len_delta.new.max_len,
-            *self.k_cache.shape[2:],
-            dtype=self.k_cache.dtype,
-            device=self.k_cache.device,
-        )
-        k_scale_cache_dense = torch.zeros(
-            seq_len_delta.new.batch_size,
-            seq_len_delta.new.max_len,
-            *self.k_scale_cache.shape[2:],
-            dtype=self.k_scale_cache.dtype,
-            device=self.k_scale_cache.device,
-        )
         q_fp8_dense[delta_seq_ids, delta_pos_ids] = q_fp8
-        weights_dense[delta_seq_ids, delta_pos_ids] = weights
-        k_cache_dense[new_seq_ids, new_pos_ids] = self.k_cache[new_seq_ids, new_pos_ids]
-        k_scale_cache_dense[new_seq_ids, new_pos_ids] = self.k_scale_cache[
-            new_seq_ids, new_pos_ids
-        ]
+        # q_s: use amax over blocks per head to form a scalar, then apply per-head weight
+        q_s_dense = torch.zeros(
+            bs,
+            M,
+            self.n_heads,
+            1,
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
+        q_scale_scalar = q_scale.amax(dim=-1, keepdim=True).to(
+            torch.float32
+        )  # [S, H, 1]
+        q_head_weight = (
+            self.weights_proj(x).to(torch.float32)
+            * self.n_heads**-0.5
+            * self.softmax_scale
+        ).unsqueeze(
+            -1
+        )  # [S, H, 1]
+        q_s_tokens = (q_scale_scalar * q_head_weight).squeeze(-1)  # [S, H]
+        q_s_dense[delta_seq_ids, delta_pos_ids, :, 0] = q_s_tokens
+
+        # Read full [0, M) for each sample and reshape to dense
+        pos_full = torch.arange(M, device=q_fp8.device, dtype=torch.int32)
+        seq_full = torch.arange(bs, device=q_fp8.device, dtype=torch.int32)
+        pos_full_rep = pos_full.repeat(bs)
+        seq_full_rep = seq_full.repeat_interleave(M)
+        k_read = read_from_paged_kv_cache(
+            cache_accessor.add["indexer_k"],
+            cache_accessor.block_table,
+            pos_full_rep,
+            seq_full_rep,
+        )
+        ks_read = read_from_paged_kv_cache(
+            cache_accessor.add["indexer_ks"],
+            cache_accessor.block_table,
+            pos_full_rep,
+            seq_full_rep,
+        )
+        k_cache_dense = k_read.view(bs, M, self.head_dim)
+        # k_s: amax over blocks per token -> scalar
+        k_scale_cache_dense = (
+            ks_read.view(bs, M, -1).amax(dim=-1, keepdim=True).to(torch.float32)
+        )
+
+        # Use reference op for scoring
         index_score = blockfp8_index_score_dense_dsv32(
-            q_fp8_dense, weights_dense, k_cache_dense, k_scale_cache_dense
+            q_fp8_dense, q_s_dense, k_cache_dense, k_scale_cache_dense
         )
 
         if is_causal:
@@ -245,19 +262,17 @@ class Indexer(torch.nn.Module):
             ).triu_(1)
         _, topk_indices_dense = index_score.topk(
             min(self.index_topk, seq_len_delta.new.max_len), dim=-1
-        )  # shape: [bs, seq_q, topk(seq_k)]. May select some out-of-range items as -inf, which is fine
+        )  # [bs, M, topk]
         topk_indices = topk_indices_dense[
-            delta_seq_ids, delta_pos_ids
-        ]  # shape: [bs * seq_q, topk(seq_k)]
+            seq_len_delta.delta_seq_ids_tensor_device,
+            seq_len_delta.delta_position_ids_tensor_device,
+        ]  # [S, topk]
         return topk_indices
 
     def _rotate_activation(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dtype == torch.bfloat16
         hidden_size = x.size(-1)
         return hadamard_transform(x, scale=hidden_size**-0.5)
-
-
-# SPDX-SnippetEnd
 
 
 class AttentionDeepSeekV3(Attention):
@@ -270,10 +285,12 @@ class AttentionDeepSeekV3(Attention):
         op_impl: str,
         mla_absorb,
         checkpoint_prefix: str,
+        indexer_cache: Optional[KVCacheManagerBase] = None,
     ):
         super().__init__(layer_id, cache, attn_backend)
         self.op_impl = op_impl
         self.mla_absorb = mla_absorb
+        self.indexer_cache = indexer_cache
         quant = get_quant_from_checkpoint_prefix(
             checkpoint_prefix, args.quant_config.rules
         )
@@ -553,8 +570,14 @@ class AttentionDeepSeekV3(Attention):
         if self.mla_absorb == "none":
             q, k, v, qr = self._run_linear(x, freqs_cis)
             if self.index_topk is not None:
+                assert self.indexer_cache is not None
                 topk_indices = self.indexer(
-                    x, qr, self.cache.seq_len_delta, freqs_cis, is_causal=True
+                    x,
+                    qr,
+                    self.cache.seq_len_delta,
+                    freqs_cis,
+                    is_causal=True,
+                    cache_accessor=self.indexer_cache.get_accessor(self.layer_id),
                 )
             else:
                 topk_indices = None
@@ -566,14 +589,19 @@ class AttentionDeepSeekV3(Attention):
                 seq_len_delta=self.cache.seq_len_delta,
                 causal=True,
                 softmax_scale=self.softmax_scale,
-                topk_indices=topk_indices,
             )
 
         elif self.mla_absorb in ["absorb-without-precomp", "absorb"]:
             q_nope, q_pe, kv, qr = self._run_linear(x, freqs_cis)
             if self.index_topk is not None:
+                assert self.indexer_cache is not None
                 topk_indices = self.indexer(
-                    x, qr, self.cache.seq_len_delta, freqs_cis, is_causal=True
+                    x,
+                    qr,
+                    self.cache.seq_len_delta,
+                    freqs_cis,
+                    is_causal=True,
+                    cache_accessor=self.indexer_cache.get_accessor(self.layer_id),
                 )
             else:
                 topk_indices = None
@@ -827,6 +855,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         op_impl,
         mla_absorb,
         checkpoint_prefix="",
+        indexer_cache: Optional[KVCacheManagerBase] = None,
     ):
         super().__init__(
             layer_id, args, cache, attn_backend=attn_backend, op_impl=op_impl
@@ -840,6 +869,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             op_impl=op_impl,
             mla_absorb=mla_absorb,
             checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
+            indexer_cache=indexer_cache,
         )
         base_moe_experts_class = None
         if op_impl == "muxi_custom_kernel":
@@ -909,8 +939,10 @@ class TransformerDeepSeekV3(Transformer):
         attn_backend: AttnBackend,
         op_impl: str,
         mla_absorb: str,
+        indexer_cache: Optional[KVCacheManagerBase] = None,
     ):
         self.mla_absorb = mla_absorb
+        self.indexer_cache = indexer_cache
         super().__init__(
             params,
             cache,
@@ -1530,6 +1562,7 @@ class TransformerDeepSeekV3(Transformer):
                     self.op_impl,
                     mla_absorb=self.mla_absorb,
                     checkpoint_prefix=f"layers.{layer_id}",
+                    indexer_cache=self.indexer_cache,
                 )
             )
 
