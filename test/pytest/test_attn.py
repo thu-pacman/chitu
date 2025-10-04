@@ -35,12 +35,13 @@ def check_close(x, y):
     return diff < 0.001
 
 
-@pytest.mark.parametrize("bs", [1, 9])
+@pytest.mark.parametrize("bs", [1, 3])
 @pytest.mark.parametrize("local_n_heads", [16])
 @pytest.mark.parametrize("kv_lora_rank", [512])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
 @pytest.mark.parametrize("is_increment", [False, True])
+@pytest.mark.parametrize("topk", [None, 128])
 @pytest.mark.parametrize("impl", ["triton", "npu"])
 def test_mla_prefill_ragged_qkvo(
     bs,
@@ -49,6 +50,7 @@ def test_mla_prefill_ragged_qkvo(
     qk_rope_head_dim,
     qk_nope_head_dim,
     is_increment,
+    topk,
     impl,
 ):
     if impl == "triton" and not has_triton:
@@ -56,6 +58,8 @@ def test_mla_prefill_ragged_qkvo(
     if impl == "npu":
         if not has_torch_npu:
             pytest.skip("torch_npu is missing")
+        if topk is not None:
+            pytest.skip("torch_npu does not support topk")
 
     torch.set_default_dtype(torch.float16)
     set_global_args(
@@ -85,10 +89,10 @@ def test_mla_prefill_ragged_qkvo(
 
     if not is_increment:
         old_seq_len_list = [0 for _ in range(bs)]
-        new_seq_len_list = [torch.randint(1, 128, (1,)).item() for _ in range(bs)]
+        new_seq_len_list = [torch.randint(1, 2048, (1,)).item() for _ in range(bs)]
     else:
-        old_seq_len_list = [torch.randint(1, 127, (1,)).item() for _ in range(bs)]
-        new_seq_len_list = [torch.randint(128, 256, (1,)).item() for _ in range(bs)]
+        old_seq_len_list = [torch.randint(1, 2047, (1,)).item() for _ in range(bs)]
+        new_seq_len_list = [torch.randint(2048, 4096, (1,)).item() for _ in range(bs)]
     seq_len_delta = BatchedSeqLenDelta(
         old_seq_len_list,
         new_seq_len_list,
@@ -99,6 +103,21 @@ def test_mla_prefill_ragged_qkvo(
         cache_delta_position_ids_tensor_device=False,
         cache_delta_seq_ids_tensor_device=False,
     )
+
+    if topk is not None:
+        # NOTE: topk_indices may be out of the range of sequence length, and
+        # the attention backend being tested should handle that.
+        topk_indices_list = []
+        for i in range(bs):
+            for j in range(
+                seq_len_delta.old.lens_list[i] + 1, seq_len_delta.new.lens_list[i] + 1
+            ):
+                topk_indices_list.append(
+                    torch.randperm(max(topk, j), device="cuda")[:topk]
+                )
+        topk_indices = torch.stack(topk_indices_list, dim=0)
+    else:
+        topk_indices = None
 
     if impl == "triton":
         attn_backend = TritonAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
@@ -122,10 +141,22 @@ def test_mla_prefill_ragged_qkvo(
     )
 
     out = attn_backend.mla_prefill_ragged_qkvo(
-        q_nope, q_pe, kv, seq_len_delta, causal=True, softmax_scale=softmax_scale
+        q_nope,
+        q_pe,
+        kv,
+        seq_len_delta,
+        causal=True,
+        softmax_scale=softmax_scale,
+        topk_indices=topk_indices,
     )
     ref_out = ref_backend.mla_prefill_ragged_qkvo(
-        q_nope, q_pe, kv, seq_len_delta, causal=True, softmax_scale=softmax_scale
+        q_nope,
+        q_pe,
+        kv,
+        seq_len_delta,
+        causal=True,
+        softmax_scale=softmax_scale,
+        topk_indices=topk_indices,
     )
 
     assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)

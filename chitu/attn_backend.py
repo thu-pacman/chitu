@@ -57,9 +57,10 @@ if has_triton and torch.cuda.is_available():
     from chitu.ops.triton_ops import (
         prefill_ragged_qkvo_triton,
         decode_paged_kv_triton,
+        decode_dense_kv_triton,
         mla_decode_paged_kv_triton,
         mla_decode_dense_kv_triton,
-        decode_dense_kv_triton,
+        mla_decode_topk_ragged_qkvo_triton,
     )
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
@@ -1396,6 +1397,92 @@ class TritonAttnBackend(RefAttnBackend):
         return output
 
     @override
+    def mla_prefill_ragged_qkvo(
+        self,
+        q_nope,
+        q_pe,
+        kv,
+        seq_len_delta: BatchedSeqLenDelta,
+        causal: bool = False,
+        softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
+    ):
+        if topk_indices is None or not causal:
+            # Fallback to MQA
+            return super().mla_prefill_ragged_qkvo(
+                q_nope,
+                q_pe,
+                kv,
+                seq_len_delta,
+                causal,
+                softmax_scale,
+                topk_indices,
+            )
+
+        B, local_n_heads, kv_lora_rank = q_nope.shape
+        assert q_pe.shape[0] == B
+        assert q_pe.shape[1] == local_n_heads
+        _, _, qk_rope_head_dim = q_pe.shape
+
+        o = torch.zeros(
+            B,
+            local_n_heads,
+            kv_lora_rank,
+            dtype=q_nope.dtype,
+            device=q_nope.device,
+        )
+
+        num_kv_splits = None
+        if is_muxi():
+            if B > 32:
+                num_kv_splits = 3
+            elif B > 1:
+                num_kv_splits = 8
+            else:
+                num_kv_splits = 16
+        else:
+            num_kv_splits = 4
+        assert num_kv_splits is not None
+
+        attn_logits = torch.empty(
+            (
+                B,
+                local_n_heads,
+                num_kv_splits,
+                kv_lora_rank + 1,
+            ),
+            dtype=torch.float32,
+            device=q_nope.device,
+        )
+
+        k_pe = kv[..., kv_lora_rank:]
+        kv_c = kv[..., :kv_lora_rank]
+
+        if softmax_scale is None:
+            assert self.qk_nope_head_dim is not None
+            softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
+
+        # NOTE: When topk_indices is enabled during prefill, we can't reuse Q along its sequence
+        # dimensions. This makes the prefill kernel behave more like a decode kernel. Therefore,
+        # this `mla_decode_ragged_qkvo_triton` is actually for prefilling.
+        mla_decode_topk_ragged_qkvo_triton(
+            q_nope,
+            q_pe,
+            kv_c,
+            k_pe,
+            o,
+            seq_len_delta.delta_position_ids_tensor_device,
+            seq_len_delta.delta_seq_ids_tensor_device,
+            seq_len_delta.new.prefix_lens_tensor_device,
+            attn_logits,
+            num_kv_splits,
+            softmax_scale,
+            topk_indices,
+        )
+
+        return o.view(B, local_n_heads, -1)
+
+    @override
     def mla_decode_dense_kv(
         self,
         q_nope,
@@ -1437,7 +1524,6 @@ class TritonAttnBackend(RefAttnBackend):
                 num_kv_splits = 16
         else:
             num_kv_splits = 4
-
         assert num_kv_splits is not None
 
         attn_logits = torch.empty(
@@ -1451,7 +1537,7 @@ class TritonAttnBackend(RefAttnBackend):
             device=q_nope.device,
         )
 
-        assert kv_cache.k.ndim == 3  # (num_blocks, block_size, dim)
+        assert kv_cache.k.ndim == 3  # (batch_size, seq_len, dim)
         kv_c_and_k_pe_cache = kv_cache.k
         k_pe_cache = kv_c_and_k_pe_cache[..., kv_lora_rank:]
         kv_c_cache = kv_c_and_k_pe_cache[..., :kv_lora_rank]
@@ -1524,7 +1610,6 @@ class TritonAttnBackend(RefAttnBackend):
                 num_kv_splits = 16
         else:
             num_kv_splits = 4
-
         assert num_kv_splits is not None
 
         attn_logits = torch.empty(
