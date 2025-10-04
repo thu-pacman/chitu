@@ -16,10 +16,6 @@ from chitu.global_vars import get_global_args
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import get_ggml_quant_type
 from chitu.ops.utils import compatible_with_inplace
-from chitu.muxi_utils import (
-    has_tbsgemm,
-    tbsgemm,
-)
 
 triton, has_triton = try_import_platform_dep("triton")
 if has_triton and torch.cuda.is_available():
@@ -27,6 +23,7 @@ if has_triton and torch.cuda.is_available():
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
+tbsgemm, has_tbsgemm = try_import_opt_dep("tbsgemm", "muxi_w8a8_kernels")
 
 
 @compatible_with_inplace

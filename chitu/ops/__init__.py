@@ -13,7 +13,11 @@ from chitu.ops.kv_cache import (
 )
 from chitu.ops.norm import rms_norm
 from chitu.ops.moe_gate import moe_gate
-from chitu.ops.moe_sum import moe_sum
+from chitu.ops.moe_sum import (
+    moe_sum_per_token,
+    moe_sum_expert_block_permuted,
+    moe_sum_expert_concat_permuted,
+)
 from chitu.ops.quant import (
     linear,
     blockfp8_einsum_shc_hdc_shd,
@@ -41,6 +45,8 @@ from chitu.ops.quant import (
     mixq_gemm,
     convert_linear_to_swizzled,
     blockfp8_index_score_dense_dsv32,
+    blockfp8_index_score_ragged_q_dense_k_dsv32,
+    blockfp8_index_score_ragged_q_paged_k_dsv32,
 )
 from chitu.ops.mla_prologue import mla_prologue_normal
 from chitu.ops.batched_routed_activation import (

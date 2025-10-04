@@ -18,9 +18,9 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivation,
     ExpertBlockIndexedBatchedRoutedActivation,
 )
+from chitu.moe.batched_expert_result import PerTokenBatchedExpertResult
 from chitu.ops.activation import silu_and_mul
 from chitu.ops.quant import blockfp8_act_quant
-from chitu.ops.moe_sum import moe_sum
 
 if torch.cuda.is_available():
     from chitu.ops.triton_ops.utils import (
@@ -77,7 +77,6 @@ def fused_moe_kernel_soft_fp4(
     a_scale_ptr,
     b_scale_ptr,
     b_scale2_ptr,
-    topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_blocks_post_padded_ptr,
@@ -86,7 +85,7 @@ def fused_moe_kernel_soft_fp4(
     N,
     K,
     EM,
-    num_valid_tokens,
+    num_valid_tokens_x_topk,
     # The stride variables represent how much to increase the ptr by when
     # moving by 1 element in a particular dimension. E.g. `stride_am` is
     # how much to increase `a_ptr` by to get the element one row down
@@ -112,7 +111,6 @@ def fused_moe_kernel_soft_fp4(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     soft_fp8: tl.constexpr,
@@ -168,7 +166,7 @@ def fused_moe_kernel_soft_fp4(
         return
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
-    token_mask = offs_token < num_valid_tokens
+    token_mask = offs_token < num_valid_tokens_x_topk
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_experts < 0 or off_experts >= E:
@@ -321,9 +319,6 @@ def fused_moe_kernel_soft_fp4(
         b_ptrs += BLOCK_SIZE_K * stride_bk // 2
         b_scale_ptrs += num_b_s_in_block
 
-    if MUL_ROUTED_WEIGHT:
-        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
-        accumulator = accumulator * moe_weight[:, None]
     if not soft_fp8:
         accumulator *= fp4_max
     accumulator *= b_scale2
@@ -344,7 +339,6 @@ def fused_moe_kernel(
     c_ptr,
     a_scale_ptr,
     b_scale_ptr,
-    topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_blocks_post_padded_ptr,
@@ -378,7 +372,6 @@ def fused_moe_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
@@ -533,9 +526,6 @@ def fused_moe_kernel(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    if MUL_ROUTED_WEIGHT:
-        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
-        accumulator = accumulator * moe_weight[:, None]
     if use_int8_w8a16:
         accumulator = (accumulator * b_scale).to(compute_type)
     elif use_fp8_w8a8:
@@ -562,11 +552,10 @@ def invoke_fused_moe_kernel(
     B_scale: Optional[torch.Tensor],
     B_scale2: Optional[torch.Tensor],
     B_zp: Optional[torch.Tensor],
-    topk_weights: torch.Tensor,
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_blocks_post_padded: torch.Tensor,
-    mul_routed_weight: bool,
+    num_valid_tokens_x_topk: int,
     top_k: int,
     config: dict[str, Any],
     compute_type: tl.dtype,
@@ -578,7 +567,6 @@ def invoke_fused_moe_kernel(
     soft_fp8: bool = False,
     is_w1w3: bool = False,
 ) -> None:
-    assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
     if use_fp8_w8a8:
@@ -634,7 +622,6 @@ def invoke_fused_moe_kernel(
             A_scale,
             B_scale,
             B_scale2,
-            topk_weights,
             sorted_token_ids,
             expert_ids,
             num_blocks_post_padded,
@@ -642,7 +629,7 @@ def invoke_fused_moe_kernel(
             B.shape[1],
             A.shape[1],
             EM,
-            topk_weights.numel(),
+            num_valid_tokens_x_topk,
             A.stride(0),
             A.stride(1),
             B.stride(0),
@@ -658,7 +645,6 @@ def invoke_fused_moe_kernel(
             16,
             0 if block_shape is None else block_shape[0],
             0 if block_shape is None else block_shape[1],
-            MUL_ROUTED_WEIGHT=mul_routed_weight,
             top_k=top_k,
             compute_type=compute_type,
             soft_fp8=soft_fp8,
@@ -672,7 +658,6 @@ def invoke_fused_moe_kernel(
             C,
             A_scale,
             B_scale,
-            topk_weights,
             sorted_token_ids,
             expert_ids,
             num_blocks_post_padded,
@@ -680,7 +665,7 @@ def invoke_fused_moe_kernel(
             B.shape[1],
             A.shape[1],
             EM,
-            topk_weights.numel(),
+            num_valid_tokens_x_topk,
             A.stride(0),
             A.stride(1),
             B.stride(0),
@@ -695,7 +680,6 @@ def invoke_fused_moe_kernel(
             B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
             0 if block_shape is None else block_shape[0],
             0 if block_shape is None else block_shape[1],
-            MUL_ROUTED_WEIGHT=mul_routed_weight,
             top_k=top_k,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
@@ -1064,11 +1048,10 @@ def _(
         w1_scale,
         w1_scale2,
         w1_zp,
-        topk_weights,
         hidden_states.block_to_token_x_topk_indices.flatten(),
         hidden_states.block_to_expert_indices,
         hidden_states.n_blocks_scalar_tensor,
-        False,
+        topk_weights.numel(),
         top_k_num,
         config,
         compute_type=compute_type,
@@ -1097,11 +1080,10 @@ def _(
         w2_scale,
         w2_scale2,
         w2_zp,
-        topk_weights,
         hidden_states.block_to_token_x_topk_indices.flatten(),
         hidden_states.block_to_expert_indices,
         hidden_states.n_blocks_scalar_tensor,
-        True,
+        topk_weights.numel(),
         1,
         config,
         compute_type=compute_type,
@@ -1113,9 +1095,9 @@ def _(
         soft_fp8=soft_fp8,
     )
 
-    moe_sum(intermediate_cache3.view(*intermediate_cache3.shape), out_hidden_states)
-
-    return out_hidden_states
+    return PerTokenBatchedExpertResult(
+        intermediate_cache3.view(*intermediate_cache3.shape)
+    ).weighted_sum(topk_weights, out=out_hidden_states)
 
 
 # SPDX-SnippetEnd

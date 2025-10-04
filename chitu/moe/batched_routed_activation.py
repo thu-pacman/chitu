@@ -102,7 +102,7 @@ class ExpertBlockPermutedBatchedRoutedActivation(BatchedRoutedActivation):
 
     token_comma_topk_to_block_x_item_indices: (
         torch.Tensor
-    )  # [batch_size, topk, n_blocks * block_size]
+    )  # [batch_size, topk] -> n_blocks * block_size
 
     # As requried by DeepGEMM, `block_to_expert_indices` is a 2-D tensor, where values
     # are repeated inside a block
@@ -176,7 +176,9 @@ class ConcatPermutedBatchedRoutedActivation(BatchedRoutedActivation):
     """
 
     concat_activation: torch.Tensor  # [batch_size * topk, hidden_size]
-    token_comma_topk_to_concat_indices: torch.Tensor  # [batch_size, topk]
+    token_comma_topk_to_concat_indices: (
+        torch.Tensor
+    )  # [batch_size, topk] -> batch_size * topk
     n_tokens_per_expert: torch.Tensor  # [n_experts]
 
     @classmethod

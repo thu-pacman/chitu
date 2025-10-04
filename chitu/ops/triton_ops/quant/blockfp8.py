@@ -1055,7 +1055,7 @@ def blockfp8_index_score_dense_dsv32_triton(
     q_s: torch.Tensor,  # [b, m, h=64, d/block_size=1], fp32
     k: torch.Tensor,  # [b, n, d=128], fp8
     k_s: torch.Tensor,  # [b, n, d/block_size=1], fp32
-):
+) -> torch.Tensor:  # [b, m, n]
     b, m, h, d = q.shape
     n = k.shape[1]
 
