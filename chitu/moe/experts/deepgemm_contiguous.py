@@ -12,9 +12,9 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivationBlockfp8,
     ExpertBlockPermutedBatchedRoutedActivationBlockfp8,
 )
+from chitu.moe.batched_expert_result import ExpertBlockPermutedBatchedExpertResult
 from chitu.ops import silu_and_mul
 from chitu.ops.quant import blockfp8_act_quant
-from chitu.ops.triton_ops.batched_routed_activation import ep_gather
 from chitu.ops.triton_ops.quant_gemm import tma_align_input_scale
 from chitu.utils import try_import_opt_dep
 
@@ -268,10 +268,7 @@ def _(
         intermediate_cache3,
         hidden_states.block_to_expert_indices.flatten(),
     )
-    ep_gather(
-        intermediate_cache3,
-        topk_weights,
-        hidden_states.token_comma_topk_to_block_x_item_indices,
-        out,
-    )
-    return out
+
+    return ExpertBlockPermutedBatchedExpertResult(
+        intermediate_cache3, hidden_states.token_comma_topk_to_block_x_item_indices
+    ).weighted_sum(topk_weights, out=out)

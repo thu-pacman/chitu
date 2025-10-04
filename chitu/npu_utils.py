@@ -17,6 +17,7 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivation,
     ConcatPermutedBatchedRoutedActivation,
 )
+from chitu.moe.batched_expert_result import ConcatPermutedBatchedExpertResult
 
 
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
@@ -495,18 +496,9 @@ def _(
             ),  # make sure the output dtype is bf16
         )[0]
 
-    # TODO: Reorder device memory 2 times here, replace the current
-    # implementation here when suitable operators become available.
-    return torch_npu.npu_moe_finalize_routing(
-        down_out_list,
-        skip1=None,
-        skip2=None,
-        bias=None,
-        scales=topk_weights,
-        expanded_src_to_dst_row=hidden_states.token_comma_topk_to_concat_indices.flatten(),
-        export_for_source_row=None,
-        drop_pad_mode=2,
-    )
+    return ConcatPermutedBatchedExpertResult(
+        down_out_list, hidden_states.token_comma_topk_to_concat_indices
+    ).weighted_sum(topk_weights)
 
 
 def try_get_npu_profiler(

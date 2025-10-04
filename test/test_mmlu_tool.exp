@@ -4,6 +4,7 @@
 set model_arg "Qwen3-32B"
 set model_dir_arg "/data/nfs/Qwen3-32B"
 set tp_size_arg 2
+set pp_size_arg 1
 set eval_batch_size_arg 4
 
 if {[llength $argv] > 0} {
@@ -18,12 +19,17 @@ if {[llength $argv] > 0} {
         } elseif {$arg eq "--tp-size"} {
             incr i
             set tp_size_arg [lindex $argv $i]
+        } elseif {$arg eq "--pp-size"} {
+            incr i
+            set pp_size_arg [lindex $argv $i]
         } elseif {$arg eq "--eval-batch-size"} {
             incr i
             set eval_batch_size_arg [lindex $argv $i]
         }
     }
 }
+
+set world_size_arg [expr {$tp_size_arg * $pp_size_arg}]
 
 # Execute the check_npus.sh script to get NPU information
 set check_output [exec bash -c "source script/check_npus.sh 2>/dev/null"]
@@ -55,7 +61,7 @@ if {$USE_NPU == 1} {
 }
 
 # Launch the server
-spawn torchrun --nproc_per_node $tp_size_arg -m chitu \
+spawn torchrun --nproc_per_node $world_size_arg -m chitu \
     models=$model_arg \
     models.ckpt_dir=$model_dir_arg \
     infer.cache_type=paged \
@@ -63,6 +69,7 @@ spawn torchrun --nproc_per_node $tp_size_arg -m chitu \
     infer.max_reqs=$eval_batch_size_arg \
     infer.max_seq_len=1200 \
     infer.tp_size=$tp_size_arg \
+    infer.pp_size=$pp_size_arg \
     infer.use_cuda_graph=True
 
 set pid [exp_pid]

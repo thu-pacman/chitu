@@ -13,7 +13,11 @@ from chitu.ops.kv_cache import (
 )
 from chitu.ops.norm import rms_norm
 from chitu.ops.moe_gate import moe_gate
-from chitu.ops.moe_sum import moe_sum
+from chitu.ops.moe_sum import (
+    moe_sum_per_token,
+    moe_sum_expert_block_permuted,
+    moe_sum_expert_concat_permuted,
+)
 from chitu.ops.quant import (
     linear,
     blockfp8_einsum_shc_hdc_shd,
