@@ -106,7 +106,7 @@ COPY --from=wheel_builder /tmp/ /tmp/
 
 RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple /tmp/*.whl -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "flash-mla" | grep -v "flash_mla")
 
-RUN rm -rf /tmp/
+RUN rm -rf /tmp/*
 COPY ./test ./test
 COPY ./script ./script
 COPY ./benchmarks ./benchmarks
