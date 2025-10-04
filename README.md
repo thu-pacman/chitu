@@ -2,6 +2,8 @@
 
 # Chitu「赤兔」
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/thu-pacman/chitu)
+
 中文 | [English](/docs/en/README.md)
 
 Chitu「赤兔」是一个专注于效率、灵活性和可用性的高性能大模型推理框架。
