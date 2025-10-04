@@ -17,7 +17,12 @@ from torch import nn
 from chitu.attn_backend import AttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.cache_manager import KVCacheManagerBase, KVCacheAccessor
+from chitu.cache_manager import (
+    KVCacheManagerBase,
+    KVCacheAccessor,
+    PagedKVCacheAccessor,
+    DenseKVCacheAccessor,
+)
 from chitu.global_vars import get_global_args
 from chitu.models.model import (
     Attention,
@@ -48,9 +53,10 @@ from chitu.ops import (
     to_fp4_e2m1_in_uint8,
     mla_prologue_normal,
     blockfp8_act_quant,
-    blockfp8_index_score_dense_dsv32,
+    blockfp8_index_score_ragged_q_paged_k_dsv32,
+    blockfp8_index_score_ragged_q_dense_k_dsv32,
     append_to_paged_kv_cache,
-    read_from_paged_kv_cache,
+    append_to_dense_kv_cache,
     hadamard_transform,
 )
 import torch.distributed as dist
@@ -167,106 +173,77 @@ class Indexer(torch.nn.Module):
         q_fp8, q_scale = blockfp8_act_quant(q, block_size=self.block_size)
         k_fp8, k_scale = blockfp8_act_quant(k, block_size=self.block_size)
 
-        append_to_paged_kv_cache(
-            cache_accessor.add["indexer_k"],
-            cache_accessor.block_table,
-            k_fp8.contiguous(),
-            seq_len_delta.delta_position_ids_tensor_device,
-            seq_len_delta.delta_seq_ids_tensor_device,
-            get_page_ids=cache_accessor.get_page_ids,
-            get_offs_in_page=cache_accessor.get_offs_in_page,
-        )
-        append_to_paged_kv_cache(
-            cache_accessor.add["indexer_ks"],
-            cache_accessor.block_table,
-            k_scale.contiguous(),
-            seq_len_delta.delta_position_ids_tensor_device,
-            seq_len_delta.delta_seq_ids_tensor_device,
-            get_page_ids=cache_accessor.get_page_ids,
-            get_offs_in_page=cache_accessor.get_offs_in_page,
-        )
-
         delta_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
         delta_pos_ids = seq_len_delta.delta_position_ids_tensor_device
-        bs = seq_len_delta.new.batch_size
-        M = seq_len_delta.new.max_len
-        # Build dense q/q_s for the reference operator, without mean aggregation
-        S = q_fp8.shape[0]
-        if S == 0:
-            return torch.empty(
-                0, min(self.index_topk, M), dtype=torch.long, device=q_fp8.device
+        new_seq_ids = seq_len_delta.new.seq_ids_tensor_device
+        new_pos_ids = seq_len_delta.new.position_ids_tensor_device
+
+        if isinstance(cache_accessor, PagedKVCacheAccessor):
+            append_to_paged_kv_cache(
+                cache_accessor.add["indexer_k"],
+                cache_accessor.block_table,
+                k_fp8,
+                delta_pos_ids,
+                delta_seq_ids,
+                get_page_ids=cache_accessor.get_page_ids,
+                get_offs_in_page=cache_accessor.get_offs_in_page,
             )
-        q_fp8_dense = torch.zeros(
-            bs,
-            M,
-            *q_fp8.shape[1:],
-            dtype=q_fp8.dtype,
-            device=q_fp8.device,
-        )
-        q_fp8_dense[delta_seq_ids, delta_pos_ids] = q_fp8
-        # q_s: use amax over blocks per head to form a scalar, then apply per-head weight
-        q_s_dense = torch.zeros(
-            bs,
-            M,
-            self.n_heads,
-            1,
-            dtype=torch.float32,
-            device=q_fp8.device,
-        )
-        q_scale_scalar = q_scale.amax(dim=-1, keepdim=True).to(
-            torch.float32
-        )  # [S, H, 1]
-        q_head_weight = (
-            self.weights_proj(x).to(torch.float32)
-            * self.n_heads**-0.5
-            * self.softmax_scale
-        ).unsqueeze(
-            -1
-        )  # [S, H, 1]
-        q_s_tokens = (q_scale_scalar * q_head_weight).squeeze(-1)  # [S, H]
-        q_s_dense[delta_seq_ids, delta_pos_ids, :, 0] = q_s_tokens
-
-        # Read full [0, M) for each sample and reshape to dense
-        pos_full = torch.arange(M, device=q_fp8.device, dtype=torch.int32)
-        seq_full = torch.arange(bs, device=q_fp8.device, dtype=torch.int32)
-        pos_full_rep = pos_full.repeat(bs)
-        seq_full_rep = seq_full.repeat_interleave(M)
-        k_read = read_from_paged_kv_cache(
-            cache_accessor.add["indexer_k"],
-            cache_accessor.block_table,
-            pos_full_rep,
-            seq_full_rep,
-        )
-        ks_read = read_from_paged_kv_cache(
-            cache_accessor.add["indexer_ks"],
-            cache_accessor.block_table,
-            pos_full_rep,
-            seq_full_rep,
-        )
-        k_cache_dense = k_read.view(bs, M, self.head_dim)
-        # k_s: amax over blocks per token -> scalar
-        k_scale_cache_dense = (
-            ks_read.view(bs, M, -1).amax(dim=-1, keepdim=True).to(torch.float32)
-        )
-
-        # Use reference op for scoring
-        index_score = blockfp8_index_score_dense_dsv32(
-            q_fp8_dense, q_s_dense, k_cache_dense, k_scale_cache_dense
-        )
+            append_to_paged_kv_cache(
+                cache_accessor.add["indexer_ks"],
+                cache_accessor.block_table,
+                k_scale,
+                delta_pos_ids,
+                delta_seq_ids,
+                get_page_ids=cache_accessor.get_page_ids,
+                get_offs_in_page=cache_accessor.get_offs_in_page,
+            )
+            index_score = blockfp8_index_score_ragged_q_paged_k_dsv32(
+                q_fp8,
+                q_scale,
+                cache_accessor.add["indexer_k"],
+                cache_accessor.add["indexer_ks"],
+                q_seq_ids=delta_seq_ids,
+                q_pos_ids=delta_pos_ids,
+                k_seq_ids=new_seq_ids,
+                k_pos_ids=new_pos_ids,
+                k_page_table=cache_accessor.block_table,
+            )
+        elif isinstance(cache_accessor, DenseKVCacheAccessor):
+            append_to_dense_kv_cache(
+                cache_accessor.add["indexer_k"], k_fp8, delta_pos_ids, delta_seq_ids
+            )
+            append_to_dense_kv_cache(
+                cache_accessor.add["indexer_ks"], k_scale, delta_pos_ids, delta_seq_ids
+            )
+            index_score = blockfp8_index_score_ragged_q_dense_k_dsv32(
+                q_fp8,
+                q_scale,
+                cache_accessor.add["indexer_k"],
+                cache_accessor.add["indexer_ks"],
+                q_seq_ids=delta_seq_ids,
+                q_pos_ids=delta_pos_ids,
+            )
+        else:
+            raise NotImplementedError()
 
         if is_causal:
-            index_score += torch.full(
+            index_score_dense = torch.empty(
+                seq_len_delta.batch_size,
+                seq_len_delta.new.max_len,
+                seq_len_delta.new.max_len,
+                dtype=index_score.dtype,
+                device=index_score.device,
+            )
+            index_score_dense[delta_seq_ids, delta_pos_ids] = index_score
+            index_score_dense += torch.full(
                 (seq_len_delta.new.max_len, seq_len_delta.new.max_len),
                 float("-inf"),
                 device=index_score.device,
             ).triu_(1)
-        _, topk_indices_dense = index_score.topk(
+            index_score = index_score_dense[delta_seq_ids, delta_pos_ids]
+        _, topk_indices = index_score.topk(
             min(self.index_topk, seq_len_delta.new.max_len), dim=-1
-        )  # [bs, M, topk]
-        topk_indices = topk_indices_dense[
-            seq_len_delta.delta_seq_ids_tensor_device,
-            seq_len_delta.delta_position_ids_tensor_device,
-        ]  # [S, topk]
+        )  # shape: [bs_seq_q, topk(seq_k)]. May select some out-of-range items as -inf, which is fine
         return topk_indices
 
     def _rotate_activation(self, x: torch.Tensor) -> torch.Tensor:
