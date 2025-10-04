@@ -39,7 +39,12 @@ from chitu.quantization import (
     utils,
 )
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF, Processor
-from chitu.utils import compute_layer_dist_in_pipe, parse_dtype, try_import_opt_dep
+from chitu.utils import (
+    compute_layer_dist_in_pipe,
+    parse_dtype,
+    try_import_opt_dep,
+    ceil_div,
+)
 
 # from chitu.distributed.moe_token_dispatcher import init_token_dispatcher
 from chitu.moe import init_moe_impl
@@ -87,6 +92,7 @@ class Backend:
     ongoing_reqs: list["OngoingRequests"] = []
     state = BackendState.Running
     last_batch_results: Deque["BatchResult"] = deque()
+    indexer_cache_manager = None
 
     @staticmethod
     def build_model(args, cache, *extra_args, **extra_kwargs):
@@ -289,6 +295,7 @@ class Backend:
             block_size = 64 if args.infer.mla_absorb != "none" else 256
             if args.infer.attn_type == "npu":
                 block_size = 128
+
             return PagedKVCacheManager(
                 local_begin_layer_id,
                 local_end_layer_id,
@@ -349,6 +356,73 @@ class Backend:
             device=local_rank,
             additional_cache_shape_dict=additional_cache_shape_dict,
             lazy_mode=True,
+        )
+
+    @staticmethod
+    def _init_indexer_cache_manager(args):
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if args.infer.op_impl == "cpu":
+            local_rank = "cpu"
+
+        pipeline_parallel_size = args.infer.pp_size
+
+        if pipeline_parallel_size > 1:
+            pipe_stage = get_pp_group().rank_in_group
+            num_layers_of_each_rank = compute_layer_dist_in_pipe(
+                args.models.n_layers, pipeline_parallel_size
+            )
+            first_layer_id_of_each_rank = list(
+                itertools.accumulate([0] + num_layers_of_each_rank)
+            )
+            local_begin_layer_id = first_layer_id_of_each_rank[pipe_stage]
+            local_end_layer_id = first_layer_id_of_each_rank[pipe_stage + 1]
+        else:
+            local_begin_layer_id = 0
+            local_end_layer_id = args.models.n_layers
+
+        # Shapes for indexer caches
+        index_head_dim = getattr(args.models, "index_head_dim", None)
+        if index_head_dim is None or index_head_dim <= 0:
+            logger.warning(
+                f"Index head dim is not set or is not positive, skipping indexer cache manager"
+            )
+            return None
+
+        additional_cache_shape_dict = {
+            "indexer_k": (int(index_head_dim),),
+            "indexer_ks": (int(index_head_dim) // 128,),
+        }
+        additional_cache_dtype_dict = {
+            "indexer_k": torch.float8_e4m3fn,
+            "indexer_ks": torch.float32,
+        }
+
+        # Align page size with main paged KV
+        block_size = 64 if args.infer.mla_absorb != "none" else 256
+        if args.infer.attn_type == "npu":
+            block_size = 128
+
+        # FIXME: for now, we use the same block size as the main paged KV cache manager
+        # Compute sufficient num_blocks for indexer cache when not provided
+        # Ensure enough pages for max_seq_len per hot request to avoid OOB when crossing pages
+        num_hot_req = ceil_div(args.infer.max_reqs, args.infer.dp_size)
+        auto_num_blocks = ceil_div(args.infer.max_seq_len, block_size) * num_hot_req
+        num_blocks = (
+            args.infer.num_blocks if args.infer.num_blocks != -1 else auto_num_blocks
+        )
+
+        return PagedKVCacheManager(
+            local_begin_layer_id,
+            local_end_layer_id,
+            max_seq_len=args.infer.max_seq_len,
+            num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
+            // args.infer.dp_size,
+            block_size=block_size,
+            num_blocks=num_blocks,
+            device=local_rank,
+            additional_cache_shape_dict=additional_cache_shape_dict,
+            additional_cache_dtype_dict=additional_cache_dtype_dict,
+            lazy_mode=False,
         )
 
     @staticmethod
@@ -565,6 +639,21 @@ class Backend:
                 mla_absorb=args.infer.mla_absorb,
                 linear_attn_cache=Backend.linear_attn_cache_manager,
             )
+        elif (
+            args.models.type == "deepseek-v3"
+            and Backend.indexer_cache_manager is not None
+        ):
+            model = Backend.build_model(
+                args.models,
+                Backend.cache_manager,
+                max_position_embeddings=args.infer.max_seq_len,
+                pipeline_parallel_size=pipeline_parallel_size,
+                model_parallel_size=model_parallel_size,
+                attn_backend=attn_backend,
+                op_impl=args.infer.op_impl,
+                mla_absorb=args.infer.mla_absorb,
+                indexer_cache=Backend.indexer_cache_manager,
+            )
         else:
             model = Backend.build_model(
                 args.models,
@@ -755,6 +844,11 @@ class Backend:
             Backend.linear_attn_cache_manager = Backend._init_linear_attn_cache_manager(
                 args
             )
+        # Initialize indexer cache manager (paged additional caches), following linear attention pattern
+        if getattr(args.models, "type", "") == "deepseek-v3" and getattr(
+            args.models, "index_head_dim", None
+        ):
+            Backend.indexer_cache_manager = Backend._init_indexer_cache_manager(args)
 
         # Initialize attention backend
         attn_backend = Backend._init_attention_backend(args)
