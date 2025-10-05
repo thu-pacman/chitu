@@ -12,12 +12,14 @@ from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.distributed.parallel_state import get_tp_group, get_tp_size
 from chitu.models.model import (
     TransformerBlock,
+    ParallelMoeBlock,
     get_linear_layout_native_y,
     get_linear_layout_contig_y,
 )
 from chitu.models.model_hf_llama import AttentionHFLlama
 from chitu.models.model_hf_qwen_3_moe import (
-    ParallelMoeBlockQwen3,
+    Qwen3MoeGate,
+    Qwen3MoeExperts,
     TransformerHFQwen3Moe,
 )
 from chitu.models.registry import ModelType, register_model
@@ -28,7 +30,7 @@ from chitu.ops import (
     silu_and_mul,
 )
 from chitu.quantization import QuantizationRegistry
-from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear
+from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear, LocalLinear
 
 
 # SPDX-SnippetBegin
@@ -683,7 +685,28 @@ class MLPQwen3Next(nn.Module):
         return self.down_proj(silu_and_mul_out)
 
 
-class ParallelMoeBlockQwen3Next(ParallelMoeBlockQwen3):
+class SharedExpertGateAndBodyQwen3Next(torch.nn.Module):
+    def __init__(self, args, op_impl: str, checkpoint_prefix: str):
+        super().__init__()
+        self.gate = LocalLinear(
+            args.dim,
+            1,
+            has_bias=False,
+            checkpoint_prefix=f"{checkpoint_prefix}.shared_expert_gate",
+        )
+        self.body = MLPQwen3Next(
+            args,
+            intermediate_dim=args.moe_intermediate_dim,
+            op_impl=op_impl,
+            checkpoint_prefix=f"{checkpoint_prefix}.shared_expert",
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = self.gate(x)
+        return torch.nn.functional.sigmoid(gate) * self.body(x)
+
+
+class ParallelMoeBlockQwen3Next(ParallelMoeBlock):
     def __init__(
         self,
         args,
@@ -693,64 +716,17 @@ class ParallelMoeBlockQwen3Next(ParallelMoeBlockQwen3):
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
     ):
         super().__init__(
-            args,
-            op_impl,
-            checkpoint_prefix,
-            base_moe_experts_class,
-            quant_kwargs,
+            gate=Qwen3MoeGate(args, op_impl),
+            experts=Qwen3MoeExperts(
+                args,
+                checkpoint_prefix,
+                base_moe_experts_class,
+                quant_kwargs,
+            ),
+            non_fused_shared_experts=SharedExpertGateAndBodyQwen3Next(
+                args, op_impl=op_impl, checkpoint_prefix=checkpoint_prefix
+            ),
         )
-
-        self.shared_expert = MLPQwen3Next(
-            args,
-            intermediate_dim=args.moe_intermediate_dim,
-            op_impl=op_impl,
-            checkpoint_prefix=f"{checkpoint_prefix}.shared_expert",
-        )
-        self.shared_expert_gate = nn.Linear(args.dim, 1, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the MoE block.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
-        """
-        shape = x.shape  # [TODO] unify decode hidden states shape
-        x = x.view(-1, x.shape[-1])
-
-        weights, indices = self.gate(x)
-
-        shared_y = None
-        if self.shared_expert is not None:
-            # Do this before `self.experts`, because `self.experts` may modify `x` in-place
-            shared_y = F.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
-
-        experts_impl = "auto"
-        tokens_per_expert = None
-        if self.moe_impl is not None:
-            experts_impl = self.moe_impl.get_experts_impl()
-            x, indices, weights, tokens_per_expert = self.moe_impl.token_permutation(
-                x, indices, weights
-            )
-
-        y = self.experts(x, weights, indices, tokens_per_expert, experts_impl)
-
-        # Fuse allreduce to improve performance in TP mode
-        if self.is_tp_mode:
-            if shared_y is not None:
-                y += shared_y
-            if not self.moe_impl:
-                torch.distributed.all_reduce(y, group=get_tp_group().gpu_group)
-
-        if self.moe_impl is not None:
-            y = self.moe_impl.token_unpermutation(y)
-
-        if shared_y is not None and not self.is_tp_mode:
-            y += shared_y
-        return y.view(shape)
 
 
 class TransformerBlockHFQwen3Next(TransformerBlock):
@@ -992,10 +968,17 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                 state_dict = self.qwen_next_chunk_checkpoint_for_tensor_parallel_splitting_merging(
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )
-            checkpoint_keys = list(state_dict.keys())
-            for k in checkpoint_keys:
+            state_dict_keys = list(state_dict.keys())
+            for k in state_dict_keys:
                 if k.startswith("mtp."):
                     del state_dict[k]
+            state_dict_keys = list(state_dict.keys())
+            for k in state_dict_keys:
+                v = state_dict.pop(k)
+                new_k = k
+                new_k = new_k.replace(".shared_expert.", ".shared_experts.body.")
+                new_k = new_k.replace(".shared_expert_gate.", ".shared_experts.gate.")
+                state_dict[new_k] = v
         super().load_state_dict_parallel(
             state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )

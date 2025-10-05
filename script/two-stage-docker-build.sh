@@ -30,6 +30,8 @@ image_name=$7
 image_version=$8
 docker_run_prefix="${@:9}"
 
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+
 if [ "${dockerfile}" = "ascend.Dockerfile" ] || [ "${dockerfile}" = "ascend.a3.Dockerfile" ]; then
     install_script="./script/ascend_install.sh"
 elif [ "${dockerfile}" = "muxi.Dockerfile" ]; then
@@ -54,14 +56,16 @@ docker build \
 
 if [ "${enable_editable_install}" == "true" ]; then
     ${docker_run_prefix} \
+        -v ${SCRIPT_DIR}/..:/workspace/chitu \
         --name ${container_base_name}-${image_version}-stage1 \
         ${image_name}:${image_version}-stage0 \
-        bash -c "cp -r /tmp/chitu/* /workspace/chitu && \"${install_script}\" \"${optional_deps}\" \"${build_jobs}\" \"${enable_editable_install}\" \"${enable_cython}\""
+        bash -c "\"${install_script}\" \"${optional_deps}\" \"${build_jobs}\" \"${enable_editable_install}\" \"${enable_cython}\""
 else
     ${docker_run_prefix} \
+        -v ${SCRIPT_DIR}/..:/workspace/chitu \
         --name ${container_base_name}-${image_version}-stage1 \
         ${image_name}:${image_version}-stage0 \
-        bash -c "cd /tmp/chitu && \"${install_script}\" \"${optional_deps}\" \"${build_jobs}\" \"${enable_editable_install}\" \"${enable_cython}\""
+        bash -c "\"${install_script}\" \"${optional_deps}\" \"${build_jobs}\" \"${enable_editable_install}\" \"${enable_cython}\""
 fi
 
 

@@ -17,7 +17,7 @@ from chitu.ops.triton_ops.utils import (
     auto_tuning_logger,
     SIGNED_INT32_0x87F00000,
 )
-from chitu.ops.triton_ops.activation import silu_and_mul_triton
+from chitu.ops.activation import silu_and_mul
 from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.utils import try_import_opt_dep
@@ -54,7 +54,7 @@ def blockfp8_act_quant_triton(
 
 
 @blockfp8_act_quant_triton.register
-def _(x: silu_and_mul_triton.lazy_tensor_type(), block_size: int = 128):
+def _(x: silu_and_mul.lazy_tensor_type(), block_size: int = 128):
     return silu_and_mul_and_blockfp8_act_quant_triton(
         x.kwargs["x"], block_size=block_size
     )
