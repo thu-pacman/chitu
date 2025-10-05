@@ -202,11 +202,10 @@ class Indexer(torch.nn.Module):
                 q_scale,
                 cache_accessor.add["indexer_k"],
                 cache_accessor.add["indexer_ks"],
-                q_seq_ids=delta_seq_ids,
-                q_pos_ids=delta_pos_ids,
-                k_seq_ids=new_seq_ids,
-                k_pos_ids=new_pos_ids,
+                seq_len_delta=seq_len_delta,
                 k_page_table=cache_accessor.block_table,
+                static_max_n=get_global_args().infer.max_seq_len,
+                causal=is_causal,
             )
         elif isinstance(cache_accessor, DenseKVCacheAccessor):
             append_to_dense_kv_cache(
@@ -220,27 +219,12 @@ class Indexer(torch.nn.Module):
                 q_scale,
                 cache_accessor.add["indexer_k"],
                 cache_accessor.add["indexer_ks"],
-                q_seq_ids=delta_seq_ids,
-                q_pos_ids=delta_pos_ids,
+                seq_len_delta=seq_len_delta,
+                causal=is_causal,
             )
         else:
             raise NotImplementedError()
 
-        if is_causal:
-            index_score_dense = torch.empty(
-                seq_len_delta.batch_size,
-                seq_len_delta.new.max_len,
-                seq_len_delta.new.max_len,
-                dtype=index_score.dtype,
-                device=index_score.device,
-            )
-            index_score_dense[delta_seq_ids, delta_pos_ids] = index_score
-            index_score_dense += torch.full(
-                (seq_len_delta.new.max_len, seq_len_delta.new.max_len),
-                float("-inf"),
-                device=index_score.device,
-            ).triu_(1)
-            index_score = index_score_dense[delta_seq_ids, delta_pos_ids]
         _, topk_indices = index_score.topk(
             min(self.index_topk, seq_len_delta.new.max_len), dim=-1
         )  # shape: [bs_seq_q, topk(seq_k)]. May select some out-of-range items as -inf, which is fine

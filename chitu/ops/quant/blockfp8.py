@@ -11,6 +11,7 @@ from chitu.utils import (
 )
 from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.global_vars import get_global_args
+from chitu.batched_seq_len import BatchedSeqLenDelta
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -26,6 +27,8 @@ if has_triton:
         blockfp8_act_quant_triton,
         silu_and_mul_and_blockfp8_act_quant_triton,
         blockfp8_index_score_dense_dsv32_triton,
+        blockfp8_index_score_ragged_q_dense_k_dsv32_triton,
+        blockfp8_index_score_ragged_q_paged_k_dsv32_triton,
     )
 
 
@@ -294,6 +297,7 @@ def blockfp8_index_score_dense_dsv32(
     q_s: torch.Tensor,  # [b, m, h=64, d/block_size=1], fp32
     k: torch.Tensor,  # [b, n, d=128], fp8
     k_s: torch.Tensor,  # [b, n, d/block_size=1], fp32
+    causal: bool,
     impl: str = "auto",
 ) -> torch.Tensor:  # [b, m, n]
     """
@@ -307,9 +311,9 @@ def blockfp8_index_score_dense_dsv32(
             impl = "torch"
 
     if impl == "torch":
-        return blockfp8_index_score_dense_dsv32_torch(q, q_s, k, k_s)
+        return blockfp8_index_score_dense_dsv32_torch(q, q_s, k, k_s, causal=causal)
     elif impl == "triton":
-        return blockfp8_index_score_dense_dsv32_triton(q, q_s, k, k_s)
+        return blockfp8_index_score_dense_dsv32_triton(q, q_s, k, k_s, causal=causal)
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
 
@@ -319,6 +323,7 @@ def blockfp8_index_score_dense_dsv32_torch(
     q_s: torch.Tensor,  # [b, m, h=64, d/block_size=1], fp32
     k: torch.Tensor,  # [b, n, d=128], fp8
     k_s: torch.Tensor,  # [b, n, d/block_size=1], fp32
+    causal: bool,
 ) -> torch.Tensor:  # [b, m, n]
     b, m, h, d = q.shape
     _, n, _ = k.shape
@@ -338,6 +343,10 @@ def blockfp8_index_score_dense_dsv32_torch(
 
     output = logits_sum * k_s.view(b, 1, n)  # bmn
 
+    if causal:
+        # NOTE: No need to set to -inf, because index score >= 0
+        output *= torch.ones(m, n, dtype=output.dtype, device=output.device).tril_()
+
     return output.to(torch.get_default_dtype())
 
 
@@ -346,16 +355,23 @@ def blockfp8_index_score_ragged_q_dense_k_dsv32(
     q_s: torch.Tensor,  # [bm, h=64, d/block_size=1], fp32
     k: torch.Tensor,  # [b, n, d=128], fp8
     k_s: torch.Tensor,  # [b, n, d/block_size=1], fp32
-    q_seq_ids: torch.Tensor,  # [bm]
-    q_pos_ids: torch.Tensor,  # [bm]
+    seq_len_delta: BatchedSeqLenDelta,
+    causal: bool,
     impl: str = "auto",
 ) -> torch.Tensor:  # [bm, n]
     if impl == "auto":
-        impl = "torch"
+        if has_triton:
+            impl = "triton"
+        else:
+            impl = "torch"
 
     if impl == "torch":
         return blockfp8_index_score_ragged_q_dense_k_dsv32_torch(
-            q, q_s, k, k_s, q_seq_ids, q_pos_ids
+            q, q_s, k, k_s, seq_len_delta, causal=causal
+        )
+    elif impl == "triton":
+        return blockfp8_index_score_ragged_q_dense_k_dsv32_triton(
+            q, q_s, k, k_s, seq_len_delta, causal=causal
         )
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
@@ -366,16 +382,30 @@ def blockfp8_index_score_ragged_q_dense_k_dsv32_torch(
     q_s: torch.Tensor,  # [bm, h=64, d/block_size=1], fp32
     k: torch.Tensor,  # [b, n, d=128], fp8
     k_s: torch.Tensor,  # [b, n, d/block_size=1], fp32
-    q_seq_ids: torch.Tensor,  # [bm]
-    q_pos_ids: torch.Tensor,  # [bm]
+    seq_len_delta: BatchedSeqLenDelta,
+    causal: bool,
 ) -> torch.Tensor:  # [bm, n]
+    q_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
+    q_pos_ids = seq_len_delta.delta_position_ids_tensor_device
+    k_seq_ids = seq_len_delta.new.seq_ids_tensor_device
+    k_pos_ids = seq_len_delta.new.position_ids_tensor_device
+
     b, _, _ = k.shape
-    m = torch.amax(q_pos_ids).item() + 1
+    m = seq_len_delta.new.max_len
+
     q_dense = torch.zeros(b, m, *q.shape[1:], dtype=q.dtype, device=q.device)
     q_s_dense = torch.zeros(b, m, *q_s.shape[1:], dtype=q_s.dtype, device=q_s.device)
     q_dense[q_seq_ids, q_pos_ids] = q
     q_s_dense[q_seq_ids, q_pos_ids] = q_s
-    score_dense = blockfp8_index_score_dense_dsv32(q_dense, q_s_dense, k, k_s)
+
+    k_filtered = torch.zeros_like(k)
+    k_s_filtered = torch.zeros_like(k_s)
+    k_filtered[k_seq_ids, k_pos_ids] = k[k_seq_ids, k_pos_ids]
+    k_s_filtered[k_seq_ids, k_pos_ids] = k_s[k_seq_ids, k_pos_ids]
+
+    score_dense = blockfp8_index_score_dense_dsv32(
+        q_dense, q_s_dense, k_filtered, k_s_filtered, causal=causal
+    )
     return score_dense[q_seq_ids, q_pos_ids]
 
 
@@ -384,19 +414,39 @@ def blockfp8_index_score_ragged_q_paged_k_dsv32(
     q_s: torch.Tensor,  # [bm, h=64, d/block_size=1], fp32
     k: torch.Tensor,  # [n_pages, page_size, d=128], fp8
     k_s: torch.Tensor,  # [n_pages, page_size, d/block_size=1], fp32
-    q_seq_ids: torch.Tensor,  # [bm]
-    q_pos_ids: torch.Tensor,  # [bm]
-    k_seq_ids: torch.Tensor,  # [bn]
-    k_pos_ids: torch.Tensor,  # [bn]
+    seq_len_delta: BatchedSeqLenDelta,
     k_page_table: torch.Tensor,  # [b, n_pages_per_seq]
+    static_max_n: int,
+    causal: bool,
     impl: str = "auto",
 ) -> torch.Tensor:  # [bm, n]
     if impl == "auto":
-        impl = "torch"
+        if has_triton:
+            impl = "triton"
+        else:
+            impl = "torch"
 
     if impl == "torch":
         return blockfp8_index_score_ragged_q_paged_k_dsv32_torch(
-            q, q_s, k, k_s, q_seq_ids, q_pos_ids, k_seq_ids, k_pos_ids, k_page_table
+            q,
+            q_s,
+            k,
+            k_s,
+            seq_len_delta,
+            k_page_table,
+            static_max_n=static_max_n,
+            causal=causal,
+        )
+    elif impl == "triton":
+        return blockfp8_index_score_ragged_q_paged_k_dsv32_triton(
+            q,
+            q_s,
+            k,
+            k_s,
+            seq_len_delta,
+            k_page_table,
+            static_max_n=static_max_n,
+            causal=causal,
         )
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
@@ -407,15 +457,18 @@ def blockfp8_index_score_ragged_q_paged_k_dsv32_torch(
     q_s: torch.Tensor,  # [bm, h=64, d/block_size=1], fp32
     k: torch.Tensor,  # [n_pages, page_size, d=128], fp8
     k_s: torch.Tensor,  # [n_pages, page_size, d/block_size=1], fp32
-    q_seq_ids: torch.Tensor,  # [bm]
-    q_pos_ids: torch.Tensor,  # [bm]
-    k_seq_ids: torch.Tensor,  # [bn]
-    k_pos_ids: torch.Tensor,  # [bn]
+    seq_len_delta: BatchedSeqLenDelta,
     k_page_table: torch.Tensor,  # [b, n_pages_per_seq]
+    static_max_n: int,
+    causal: bool,
 ) -> torch.Tensor:  # [bm, n]
+    k_seq_ids = seq_len_delta.new.seq_ids_tensor_device
+    k_pos_ids = seq_len_delta.new.position_ids_tensor_device
+
     b, _ = k_page_table.shape
     _, page_size, _ = k.shape
-    n = torch.amax(k_pos_ids).item() + 1
+    n = static_max_n
+
     k_dense = torch.zeros(b, n, *k.shape[2:], dtype=k.dtype, device=k.device)
     k_s_dense = torch.zeros(b, n, *k_s.shape[2:], dtype=k_s.dtype, device=k_s.device)
     k_page_id = k_pos_ids // page_size
@@ -424,6 +477,7 @@ def blockfp8_index_score_ragged_q_paged_k_dsv32_torch(
     k_s_dense[k_seq_ids, k_pos_ids] = k_s[
         k_page_table[k_seq_ids, k_page_id], k_page_off
     ]
+
     return blockfp8_index_score_ragged_q_dense_k_dsv32(
-        q, q_s, k_dense, k_s_dense, q_seq_ids, q_pos_ids
+        q, q_s, k_dense, k_s_dense, seq_len_delta, causal=causal
     )

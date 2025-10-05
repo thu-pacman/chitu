@@ -11,6 +11,8 @@ from chitu.ops.triton_ops.quant.blockfp8 import (
     blockfp8_act_quant_triton,
     silu_and_mul_and_blockfp8_act_quant_triton,
     blockfp8_index_score_dense_dsv32_triton,
+    blockfp8_index_score_ragged_q_dense_k_dsv32_triton,
+    blockfp8_index_score_ragged_q_paged_k_dsv32_triton,
 )
 from chitu.ops.triton_ops.quant.blockfp4 import (
     soft_fp4_raise_to_fp8_blockfp4_gemm_triton,

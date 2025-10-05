@@ -25,6 +25,8 @@ from chitu.ops.triton_ops.quant import (
     mixq_w8a8_gemm_triton,
     mixq_w4a4_gemm_triton,
     blockfp8_index_score_dense_dsv32_triton,
+    blockfp8_index_score_ragged_q_dense_k_dsv32_triton,
+    blockfp8_index_score_ragged_q_paged_k_dsv32_triton,
 )
 from chitu.ops.triton_ops.moe_sum import (
     moe_sum_per_token_triton,
