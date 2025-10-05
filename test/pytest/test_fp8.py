@@ -10,10 +10,13 @@ from chitu.ops import (
     soft_fp8_blockfp8_weight_dequant,
     soft_fp8_blockfp8_gemm,
     blockfp8_index_score_dense_dsv32,
+    blockfp8_index_score_ragged_q_dense_k_dsv32,
+    blockfp8_index_score_ragged_q_paged_k_dsv32,
 )
 from chitu.device_type import has_native_fp8
 from chitu.lazy import eval_lazy
-from chitu.utils import try_import_platform_dep
+from chitu.batched_seq_len import BatchedSeqLenDelta
+from chitu.utils import try_import_platform_dep, ceil_div
 
 triton, has_triton = try_import_platform_dep("triton")
 
@@ -129,19 +132,136 @@ def test_soft_fp8_gemm_is_close_to_dequanted_gemm(dtype: torch.dtype):
 @pytest.mark.parametrize("h", [64])
 @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("impl", ["triton"])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
-def test_blockfp8_index_score_dense_dsv32(b, m, n, h, d, block_size, impl):
+def test_blockfp8_index_score_dense_dsv32(b, m, n, h, d, block_size, causal, impl):
     q_bf16 = torch.randn(b, m, h, d, dtype=torch.bfloat16, device="cuda")
     q_fp8, q_s = blockfp8_act_quant(q_bf16, block_size)
 
     k_bf16 = torch.randn(b, n, d, dtype=torch.bfloat16, device="cuda")
     k_fp8, k_s = blockfp8_act_quant(k_bf16, block_size)
 
-    output = blockfp8_index_score_dense_dsv32(q_fp8, q_s, k_fp8, k_s, impl=impl)
-    output_ref = blockfp8_index_score_dense_dsv32(q_fp8, q_s, k_fp8, k_s, impl="torch")
+    output = blockfp8_index_score_dense_dsv32(
+        q_fp8, q_s, k_fp8, k_s, causal=causal, impl=impl
+    )
+    output_ref = blockfp8_index_score_dense_dsv32(
+        q_fp8, q_s, k_fp8, k_s, causal=causal, impl="torch"
+    )
+
+    assert torch.allclose(output, output_ref, atol=0.15, rtol=0.15)
+
+
+@pytest.mark.parametrize("b", [1, 2])
+@pytest.mark.parametrize("h", [64])
+@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("impl", ["triton"])
+@pytest.mark.skipif(
+    not has_native_fp8(),
+    reason="This test requires the GPU to have native FP8 support",
+)
+def test_blockfp8_index_score_ragged_q_dense_k_dsv32(b, h, d, block_size, causal, impl):
+    old_seq_len_list = [torch.randint(1, 2047, (1,)).item() for _ in range(b)]
+    new_seq_len_list = [torch.randint(2048, 4096, (1,)).item() for _ in range(b)]
+    seq_len_delta = BatchedSeqLenDelta(
+        old_seq_len_list,
+        new_seq_len_list,
+        device="cuda",
+        cache_prefix_lens_tensor_device=False,
+        cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
+        cache_delta_position_ids_tensor_device=False,
+        cache_delta_seq_ids_tensor_device=False,
+    )
+
+    q_bf16 = torch.randn(
+        seq_len_delta.delta_total_len, h, d, dtype=torch.bfloat16, device="cuda"
+    )
+    q_fp8, q_s = blockfp8_act_quant(q_bf16, block_size)
+
+    k_bf16 = torch.randn(
+        b, seq_len_delta.new.max_len, d, dtype=torch.bfloat16, device="cuda"
+    )
+    k_fp8, k_s = blockfp8_act_quant(k_bf16, block_size)
+
+    output = blockfp8_index_score_ragged_q_dense_k_dsv32(
+        q_fp8, q_s, k_fp8, k_s, seq_len_delta, causal=causal, impl=impl
+    )
+    output_ref = blockfp8_index_score_ragged_q_dense_k_dsv32(
+        q_fp8, q_s, k_fp8, k_s, seq_len_delta, causal=causal, impl="torch"
+    )
+
+    assert torch.allclose(output, output_ref, atol=0.15, rtol=0.15)
+
+
+@pytest.mark.parametrize("b", [1, 2])
+@pytest.mark.parametrize("h", [64])
+@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("page_size", [64])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("impl", ["triton"])
+@pytest.mark.skipif(
+    not has_native_fp8(),
+    reason="This test requires the GPU to have native FP8 support",
+)
+def test_blockfp8_index_score_ragged_q_paged_k_dsv32(
+    b, h, d, block_size, page_size, causal, impl
+):
+    old_seq_len_list = [torch.randint(1, 2047, (1,)).item() for _ in range(b)]
+    new_seq_len_list = [torch.randint(2048, 4096, (1,)).item() for _ in range(b)]
+    seq_len_delta = BatchedSeqLenDelta(
+        old_seq_len_list,
+        new_seq_len_list,
+        device="cuda",
+        cache_prefix_lens_tensor_device=False,
+        cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
+        cache_delta_position_ids_tensor_device=False,
+        cache_delta_seq_ids_tensor_device=False,
+    )
+
+    page_cnt_per_sample = ceil_div(seq_len_delta.new.max_len, page_size)
+    n_pages = page_cnt_per_sample * b
+
+    q_bf16 = torch.randn(
+        seq_len_delta.delta_total_len, h, d, dtype=torch.bfloat16, device="cuda"
+    )
+    q_fp8, q_s = blockfp8_act_quant(q_bf16, block_size)
+
+    k_bf16 = torch.randn(n_pages, page_size, d, dtype=torch.bfloat16, device="cuda")
+    k_fp8, k_s = blockfp8_act_quant(k_bf16, block_size)
+
+    page_table = torch.randperm(n_pages, device="cuda", dtype=torch.int32).view(
+        b, page_cnt_per_sample
+    )
+
+    output = blockfp8_index_score_ragged_q_paged_k_dsv32(
+        q_fp8,
+        q_s,
+        k_fp8,
+        k_s,
+        seq_len_delta,
+        page_table,
+        static_max_n=4096,
+        causal=causal,
+        impl=impl,
+    )
+    output_ref = blockfp8_index_score_ragged_q_paged_k_dsv32(
+        q_fp8,
+        q_s,
+        k_fp8,
+        k_s,
+        seq_len_delta,
+        page_table,
+        static_max_n=4096,
+        causal=causal,
+        impl="torch",
+    )
 
     assert torch.allclose(output, output_ref, atol=0.15, rtol=0.15)

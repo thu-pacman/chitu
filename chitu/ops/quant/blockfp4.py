@@ -113,6 +113,7 @@ def soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
         raise NotImplementedError(f"Unsupported implementation: {impl}")
 
 
+@single_dispatch_lazy_tensor
 def soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm_npu(
     x: torch.Tensor,
     weight: Packed4BitWeightNPUNative,

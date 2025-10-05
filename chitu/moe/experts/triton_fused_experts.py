@@ -792,7 +792,6 @@ def fused_experts(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
-    tokens_per_expert: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if get_ep_size() > 1:
         assert isinstance(hidden_states, IndexedBatchedRoutedActivation)

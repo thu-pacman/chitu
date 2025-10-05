@@ -37,7 +37,11 @@ class LazyTensor:
         )  # args will be merged into kwargs
 
         meta_tensor = func(**self._move_to_meta(self.kwargs))
-        self.shape = meta_tensor.shape
+        self.shape = (
+            meta_tensor.plain_shape
+            if isinstance(meta_tensor, NativeLayoutTensor)
+            else meta_tensor.shape
+        )
         self.dtype = meta_tensor.dtype
         self.device = self._get_first_device(self.kwargs)
 
@@ -51,7 +55,16 @@ class LazyTensor:
         if not self.evaluation.is_evaluated:
             self.evaluation.result = self.func(**self.kwargs)
             self.evaluation.is_evaluated = True
-        return self.evaluation.result.view(self.result_view_shape)
+        if isinstance(self.evaluation.result, NativeLayoutTensor):
+            if tuple(self.evaluation.result.plain_shape) != tuple(
+                self.result_view_shape
+            ):
+                raise NotImplementedError(
+                    "`view` on NativeLayoutTensor is not supported"
+                )
+            return self.evaluation.result
+        else:
+            return self.evaluation.result.view(self.result_view_shape)
 
     def view(self, *shape):
         if len(shape) == 1 and isinstance(shape[0], Sequence):

@@ -70,7 +70,11 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             recv_hidden_states,
             recv_topk_idx,
             recv_topk_weights,
-            num_recv_tokens_per_expert_list,
+            torch.tensor(
+                num_recv_tokens_per_expert_list,
+                dtype=torch.int32,
+                device=recv_topk_idx.device,
+            ),
         )
 
     def token_unpermutation(

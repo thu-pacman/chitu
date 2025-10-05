@@ -8,8 +8,8 @@ from typing import Optional
 
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
-    IndexedBatchedRoutedActivation,
-    IndexedBatchedRoutedActivationBlockfp8,
+    IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
+    IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
     ExpertBlockPermutedBatchedRoutedActivationBlockfp8,
 )
 from chitu.moe.batched_expert_result import ExpertBlockPermutedBatchedExpertResult
@@ -44,7 +44,6 @@ def deepgemm_contiguous_fused_expert(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
-    tokens_per_expert: Optional[torch.Tensor] = None,
     experts_start_idx: int = 0,
     out: Optional[torch.Tensor] = None,
 ):
@@ -53,7 +52,7 @@ def deepgemm_contiguous_fused_expert(
 
 @deepgemm_contiguous_fused_expert.register
 def _(
-    hidden_states: IndexedBatchedRoutedActivation,
+    hidden_states: IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -74,7 +73,6 @@ def _(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
-    tokens_per_expert: Optional[torch.Tensor] = None,
     experts_start_idx: int = 0,
     out: Optional[torch.Tensor] = None,
 ):
@@ -85,10 +83,11 @@ def _(
         hidden_states.activation
     )
     return deepgemm_contiguous_fused_expert(
-        IndexedBatchedRoutedActivationBlockfp8(
+        IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
             activation=quant_hidden_states,
             activation_scale=hidden_states_scale,
             token_to_expert_indices=hidden_states.token_to_expert_indices,
+            n_tokens_per_expert_padded=hidden_states.n_tokens_per_expert_padded,
         ),
         w1=w1,
         w2=w2,
@@ -110,14 +109,13 @@ def _(
         a2_scale=a2_scale,
         block_shape=block_shape,
         soft_fp8=soft_fp8,
-        tokens_per_expert=tokens_per_expert,
         out=out,
     )
 
 
 @deepgemm_contiguous_fused_expert.register
 def _(
-    hidden_states: IndexedBatchedRoutedActivationBlockfp8,
+    hidden_states: IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -138,23 +136,12 @@ def _(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
-    tokens_per_expert: Optional[torch.Tensor] = None,
     experts_start_idx: int = 0,
     out: Optional[torch.Tensor] = None,
 ):
-    n_tokens_padded = sum(tokens_per_expert)
-    tokens_per_expert_gpu = torch.tensor(
-        tokens_per_expert,
-        dtype=torch.int32,
-        pin_memory=True,
-        device="cpu",
-    ).cuda(non_blocking=True)
     return deepgemm_contiguous_fused_expert(
         ExpertBlockPermutedBatchedRoutedActivationBlockfp8.convert_from(
-            hidden_states,
-            block_size=128,
-            n_tokens_padded=n_tokens_padded,
-            n_tokens_per_expert_padded=tokens_per_expert_gpu,
+            hidden_states, block_size=128
         ),
         w1=w1,
         w2=w2,
@@ -176,7 +163,6 @@ def _(
         a2_scale=a2_scale,
         block_shape=block_shape,
         soft_fp8=soft_fp8,
-        tokens_per_expert=tokens_per_expert,
         out=out,
     )
 
@@ -204,7 +190,6 @@ def _(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
-    tokens_per_expert: Optional[torch.Tensor] = None,
     experts_start_idx: int = 0,
     out: Optional[torch.Tensor] = None,
 ):

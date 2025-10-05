@@ -14,6 +14,7 @@ from chitu.device_type import is_muxi
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import get_ggml_quant_type
 from chitu.global_vars import get_global_args
+from chitu.lazy import make_lazy_op
 
 triton, has_triton = try_import_platform_dep("triton")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
@@ -81,6 +82,7 @@ def silu_and_mul_cpu(x: torch.Tensor):
     return output
 
 
+@make_lazy_op
 def silu_and_mul(x, impl="auto"):
     import chitu.muxi_utils as muxi_utils
 
