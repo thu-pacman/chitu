@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: 2022 NVIDIA CORPORATION
 # SPDX-FileCopyrightText: 2025 Qingcheng.AI
 #
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: Megatron-LM
 #
 # This file has adaption of open-source code from the following sources:
-# - https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/training/global_vars.py, licensed under Apache 2.0
+# - https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/training/global_vars.py
 
 import operator
 import time
