@@ -8,6 +8,7 @@ from typing import Optional
 
 from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivation,
+    IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
     PerExpertDenseBatchedRoutedActivation,
 )
 from chitu.utils import (
@@ -98,7 +99,6 @@ def fused_experts_wrapper(
             block_shape=block_shape,
             soft_fp8=soft_fp8,
             experts_start_idx=experts_start_idx,  # compatible with the local expert idx format returned by deepep-normal
-            tokens_per_expert=tokens_per_expert,
         )
     elif impl == "ep_group_gemm_masked":
         if w1.dtype == torch.float8_e4m3fn and has_deep_gemm:
@@ -143,7 +143,9 @@ def fused_experts_wrapper(
     elif impl == "ep_group_gemm_contiguous":
         if w1.dtype == torch.float8_e4m3fn and has_deep_gemm:
             return deepgemm_contiguous_fused_expert(
-                IndexedBatchedRoutedActivation(hidden_states, topk_ids),
+                IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
+                    hidden_states, topk_ids, tokens_per_expert
+                ),
                 w1=w1,
                 w2=w2,
                 topk_weights=topk_weights,
@@ -165,7 +167,6 @@ def fused_experts_wrapper(
                 block_shape=block_shape,
                 soft_fp8=soft_fp8,
                 experts_start_idx=experts_start_idx,
-                tokens_per_expert=tokens_per_expert,
             )
         elif has_triton:
             return fused_experts(
@@ -191,7 +192,6 @@ def fused_experts_wrapper(
                 block_shape=block_shape,
                 soft_fp8=soft_fp8,
                 experts_start_idx=0,  # compatible with the local expert idx format returned by deepep-normal
-                tokens_per_expert=tokens_per_expert,
             )
         else:
             raise NotImplementedError

@@ -57,6 +57,30 @@ class IndexedBatchedRoutedActivationBlockfp8(IndexedBatchedRoutedActivation):
 
 
 @dataclass
+class IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
+    IndexedBatchedRoutedActivation
+):
+    """
+    IndexedBatchedRoutedActivation with extra info used for optianlly converting to
+    ExpertBlockPermutedBatchedRoutedActivation
+    """
+
+    n_tokens_per_expert_padded: torch.Tensor
+
+
+@dataclass
+class IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
+    IndexedBatchedRoutedActivationBlockfp8
+):
+    """
+    IndexedBatchedRoutedActivationBlockfp8 with extra info used for optianlly converting to
+    ExpertBlockPermutedBatchedRoutedActivationBlockfp8
+    """
+
+    n_tokens_per_expert_padded: torch.Tensor
+
+
+@dataclass
 class ExpertBlockIndexedBatchedRoutedActivation(BatchedRoutedActivation):
     """
     Activation stored in a dense batch, with blocked indices expressing the relation
@@ -122,11 +146,9 @@ class ExpertBlockPermutedBatchedRoutedActivationBlockfp8(
     @plum.dispatch
     def convert_from(
         cls,
-        old: IndexedBatchedRoutedActivationBlockfp8,
+        old: IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
         *,
         block_size: int,
-        n_tokens_padded: int,
-        n_tokens_per_expert_padded: torch.Tensor,
     ) -> "ExpertBlockPermutedBatchedRoutedActivationBlockfp8":
         (
             blocked_activation,
@@ -137,9 +159,9 @@ class ExpertBlockPermutedBatchedRoutedActivationBlockfp8(
             old.activation,
             old.activation_scale,
             old.token_to_expert_indices,
+            n_tokens_padded=old.n_tokens_per_expert_padded.sum().item(),
+            n_tokens_per_expert_padded=old.n_tokens_per_expert_padded,
             block_size=block_size,
-            n_tokens_padded=n_tokens_padded,
-            n_tokens_per_expert_padded=n_tokens_per_expert_padded,
         )
         return cls(
             blocked_activation=blocked_activation,
