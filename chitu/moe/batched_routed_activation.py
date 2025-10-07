@@ -184,6 +184,15 @@ class PerExpertDenseBatchedRoutedActivation(BatchedRoutedActivation):
 
 
 @dataclass
+class PerExpertDenseBatchedRoutedActivationBlockfp8(
+    PerExpertDenseBatchedRoutedActivation
+):
+    activation_scale_per_expert: (
+        torch.Tensor
+    )  # [n_experts, max_n_tokens_per_expert, hidden_size // quant_block_size]
+
+
+@dataclass
 class ConcatPermutedBatchedRoutedActivation(BatchedRoutedActivation):
     """
     Activations are permuted for each experts and then concatenated, with indices

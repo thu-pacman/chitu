@@ -16,6 +16,7 @@ from chitu.native_layout import (
     Repeat1ToLength,
     SqueezeLastSingleton,
 )
+from chitu.moe.batched_routed_activation import BatchedRoutedActivation
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 if has_torch_npu:
@@ -302,30 +303,22 @@ class AscendW8A8DynamicMoeExperts(
     @override
     def forward(
         self,
-        x: torch.Tensor,
+        routed_x: BatchedRoutedActivation,
         weights: torch.Tensor,
-        indices: torch.Tensor,
-        tokens_per_expert: Optional[torch.Tensor] = None,
         inplace: bool = False,
         impl: str = "npu",
     ) -> torch.Tensor:
         if self.merge_gate_up:
-            shape = x.size()
-            x = x.view(-1, self.dim)
-            y = fused_experts(
-                hidden_states=x,
+            return fused_experts(
+                routed_x,
                 w1=self.gate_up_proj_weight,
                 w1_scale=self.gate_up_proj_weight_scale,  # fp32
                 w2=self.down_proj_weight,
                 w2_scale=self.down_proj_weight_scale,  # bf16
                 topk_weights=weights,
-                topk_ids=indices,
                 use_int8_w8a8=True,
                 impl=impl,
             )
-            return y.view(shape)
 
         else:
-            return super().forward(
-                x, weights, indices, tokens_per_expert, inplace=inplace, impl=impl
-            )
+            return super().forward(routed_x, weights, inplace=inplace, impl=impl)

@@ -22,8 +22,8 @@ from chitu.models.model_hf_llama import (
 from chitu.models.registry import ModelType, register_model
 from chitu.ops import linear
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
-from chitu.quantization import get_quant_from_checkpoint_prefix
-from chitu.quantization.normal import NormalMoeExperts
+from chitu.quantization import get_quant_from_checkpoint_prefix, QuantizedMoeExpertsBase
+from chitu.moe.batched_routed_activation import BatchedRoutedActivation
 
 
 class AttentionHFGptOss(AttentionHFLlama):
@@ -74,10 +74,7 @@ class AttentionHFGptOss(AttentionHFLlama):
 
 
 class GptOssMoeGate(nn.Module):
-    def __init__(
-        self,
-        params,
-    ):
+    def __init__(self, params):
         super().__init__()
         self.dim = params.dim
         self.topk = params.num_experts_per_tok
@@ -85,19 +82,10 @@ class GptOssMoeGate(nn.Module):
         self.weight = nn.Parameter(torch.empty((params.num_experts, self.dim)))
         self.bias = nn.Parameter(torch.empty(params.num_experts))
 
-    def moe_gate(
-        self,
-        scores,
-        topk,
-    ):
-        original_score = scores
+    def moe_gate(self, scores, topk):
         topk_values, topk_ids = torch.topk(scores, topk, dim=-1)
         topk_values = topk_values.softmax(dim=-1, dtype=topk_values.dtype)
-        topk_weights = torch.zeros_like(original_score).scatter_(
-            1, topk_ids, topk_values
-        )
-
-        return topk_ids, topk_weights
+        return topk_ids, topk_values
 
     def forward(self, x):
         if x.shape[0] == 0:
@@ -107,16 +95,13 @@ class GptOssMoeGate(nn.Module):
                 device=self.weight.device,
             ), torch.empty((0, self.topk), dtype=torch.int32, device=self.weight.device)
         scores = linear(x, self.weight, self.bias)
-        indices, weights = self.moe_gate(
-            scores,
-            self.topk,
-        )
+        indices, weights = self.moe_gate(scores, self.topk)
 
         return weights.type_as(x), indices.to(torch.int32)
 
 
 # TODO: Quantization Registry
-class GptOssMoeExperts(NormalMoeExperts):
+class GptOssMoeExperts(QuantizedMoeExpertsBase):
     def __init__(
         self,
         ############################################
@@ -211,51 +196,41 @@ class GptOssMoeExperts(NormalMoeExperts):
         )
 
     @override
-    def forward(
-        self,
-        x: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.Tensor,
-        tokens_per_expert: Optional[torch.Tensor] = None,
-        inplace: bool = False,
-        impl: str = "auto",
-    ):
-
-        shape = x.size()
-
-        y = self.forward_torch(x, weights, indices)
-
-        return y.view(shape)
-
-    def forward_torch(
-        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+    def forward_act_fn_unmerged(
+        self, gate_out: torch.Tensor, up_out: torch.Tensor
     ) -> torch.Tensor:
+        gate_out = gate_out.clamp(min=None, max=self.limit)
+        up_out = up_out.clamp(min=-self.limit, max=self.limit)
+        glu = gate_out * torch.sigmoid(gate_out * self.alpha)
+        return (up_out + 1) * glu
 
-        num_experts = weights.shape[1]
-        x = x.repeat(num_experts, 1)
-        x = x.view(num_experts, -1, self.dim)
-        gate = (
-            torch.bmm(x, self.gate_proj_weight.transpose(1, 2))
-            + self.gate_proj_bias[..., None, :]
+    @override
+    def forward_act_fn_merged(self, gate_up_out: torch.Tensor) -> torch.Tensor:
+        dim = gate_up_out.shape[-1]
+        assert dim % 2 == 0
+        gate_out = gate_up_out[..., : dim // 2]
+        up_out = gate_up_out[..., dim // 2 :]
+        return self.forward_act_fn_unmerged(gate_out, up_out)
+
+    @override
+    def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear(x, self.gate_up_proj_weight[i], bias=self.gate_up_proj_bias[i])
+
+    @override
+    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear(x, self.gate_proj_weight[i], bias=self.gate_proj_bias[i])
+
+    @override
+    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear(x, self.up_proj_weight[i], bias=self.up_proj_bias[i])
+
+    @override
+    def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear(
+            x,
+            self.down_proj_weight[i],
+            bias=self.down_proj_bias[i] if self.down_proj_bias is not None else None,
         )
-        up = (
-            torch.bmm(x, self.up_proj_weight.transpose(1, 2))
-            + self.up_proj_bias[..., None, :]
-        )
-
-        gate = gate.clamp(min=None, max=self.limit)
-        up = up.clamp(min=-self.limit, max=self.limit)
-
-        glu = gate * torch.sigmoid(gate * self.alpha)
-
-        y = torch.bmm(((up + 1) * glu), self.down_proj_weight.transpose(1, 2))
-        if get_tp_group().rank_in_group == 0:
-            y = y + self.down_proj_bias[..., None, :]
-
-        y = y * weights.transpose(0, 1).view(num_experts, -1)[..., None]
-        y = y.sum(dim=0)
-
-        return y
 
 
 class ParallelMoeBlockGptOss(ParallelMoeBlock):

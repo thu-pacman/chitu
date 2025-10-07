@@ -34,7 +34,10 @@ from chitu.native_layout import (
     Packed4BitWeightAlongK,
     Packed4BitWeightNPUNative,
 )
-from chitu.moe.batched_routed_activation import IndexedBatchedRoutedActivation
+from chitu.moe.batched_routed_activation import (
+    BatchedRoutedActivation,
+    IndexedBatchedRoutedActivation,
+)
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
@@ -550,54 +553,51 @@ class Blockfp4MoeExpertsPackKStride64(
     @override
     def forward(
         self,
-        x: torch.Tensor,
+        routed_x: BatchedRoutedActivation,
         weights: torch.Tensor,
-        indices: torch.Tensor,
-        tokens_per_expert: Optional[torch.Tensor] = None,
         inplace: bool = False,
         impl: str = "auto",
     ) -> torch.Tensor:
         if has_triton and self.merge_gate_up:
-            shape = x.size()
-            x = x.view(-1, self.dim)
-
             raise_to_16 = (
                 parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
                 != 1
             )
 
-            final_indices = indices
-            final_weights = weights
             if self.fuse_shared_experts:
-                indice_shape = indices.shape
-                final_indices = torch.empty(
-                    (indice_shape[0], indice_shape[1] + 1),
-                    dtype=indices.dtype,
-                    device=indices.device,
-                )
+                if isinstance(routed_x, IndexedBatchedRoutedActivation):
+                    x, indices = routed_x.activation, routed_x.token_to_expert_indices
+                    indice_shape = indices.shape
+                    final_indices = torch.empty(
+                        (indice_shape[0], indice_shape[1] + 1),
+                        dtype=indices.dtype,
+                        device=indices.device,
+                    )
 
-                final_weights = torch.empty(
-                    (weights.shape[0], weights.shape[1] + 1),
-                    dtype=weights.dtype,
-                    device=weights.device,
-                )
+                    final_weights = torch.empty(
+                        (weights.shape[0], weights.shape[1] + 1),
+                        dtype=weights.dtype,
+                        device=weights.device,
+                    )
 
-                chitu_backend.cuda_add_shared_experts(
-                    final_weights,
-                    final_indices,
-                    weights,
-                    indices,
-                    self.n_routed_experts,
-                    self.n_shared_experts,
-                )
-                del weights, indices
+                    chitu_backend.cuda_add_shared_experts(
+                        final_weights,
+                        final_indices,
+                        weights,
+                        indices,
+                        self.n_routed_experts,
+                        self.n_shared_experts,
+                    )
+                    weights, indices = final_weights, final_indices
+                    routed_x = IndexedBatchedRoutedActivation(x, indices)
+                else:
+                    raise NotImplementedError()
 
-            y = fused_experts(
-                hidden_states=x,
+            return fused_experts(
+                routed_x,
                 w1=self.get_native_layout_gate_up_proj_weight().layout_tensor,
                 w2=self.get_native_layout_down_proj_weight().layout_tensor,
-                topk_weights=final_weights,
-                topk_ids=final_indices,
+                topk_weights=weights,
                 inplace=inplace,
                 use_fp4_w4a8=True,
                 w1_scale=self.gate_up_proj_weight_scale,
@@ -610,12 +610,8 @@ class Blockfp4MoeExpertsPackKStride64(
                 impl=impl,
             )
 
-            return y.view(shape)
-
         else:
-            return super().forward(
-                x, weights, indices, tokens_per_expert, inplace=inplace, impl=impl
-            )
+            return super().forward(routed_x, weights, inplace=inplace, impl=impl)
 
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
@@ -682,31 +678,23 @@ class Blockfp4MoeExpertsPackNPUNative(
     @override
     def forward(
         self,
-        x: torch.Tensor,
+        routed_x: BatchedRoutedActivation,
         weights: torch.Tensor,
-        indices: torch.Tensor,
-        tokens_per_expert: Optional[torch.Tensor] = None,
         inplace: bool = False,
         impl: str = "auto",
     ) -> torch.Tensor:
         if self.merge_gate_up:
-            shape = x.size()
-            y = fused_experts_npu(
-                hidden_states=IndexedBatchedRoutedActivation(
-                    x.view(-1, self.dim), indices
-                ),
+            return fused_experts_npu(
+                routed_x,
                 w1=self.gate_up_proj_weight,
                 w2=self.down_proj_weight,
                 topk_weights=weights,
                 w1_scale=self.gate_up_proj_weight_scale,
                 w2_scale=self.down_proj_weight_scale,
             )
-            return y.view(shape)
 
         else:
-            return super().forward(
-                x, weights, indices, tokens_per_expert, inplace=inplace, impl=impl
-            )
+            return super().forward(routed_x, weights, inplace=inplace, impl=impl)
 
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:

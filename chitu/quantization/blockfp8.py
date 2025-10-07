@@ -25,6 +25,10 @@ from chitu.ops.quant import (
 from chitu.device_type import get_device_name, is_muxi, is_nvidia
 from chitu.utils import try_import_platform_dep, parse_dtype
 from chitu.global_vars import get_global_args
+from chitu.moe.batched_routed_activation import (
+    BatchedRoutedActivation,
+    IndexedBatchedRoutedActivation,
+)
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
@@ -288,10 +292,8 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
     @override
     def forward(
         self,
-        x: torch.Tensor,
+        routed_x: BatchedRoutedActivation,
         weights: torch.Tensor,
-        indices: torch.Tensor,
-        tokens_per_expert: Optional[torch.Tensor] = None,
         inplace: bool = False,
         impl: str = "auto",
     ) -> torch.Tensor:
@@ -333,53 +335,52 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                 )
                 down_proj_scale = None
 
-            final_indices = indices
-            final_weights = weights
             if self.fuse_shared_experts:
-                indice_shape = indices.shape
-                final_indices = torch.empty(
-                    (indice_shape[0], indice_shape[1] + 1),
-                    dtype=indices.dtype,
-                    device=indices.device,
-                )
+                if isinstance(routed_x, IndexedBatchedRoutedActivation):
+                    x, indices = routed_x.activation, routed_x.token_to_expert_indices
+                    indice_shape = indices.shape
+                    final_indices = torch.empty(
+                        (indice_shape[0], indice_shape[1] + 1),
+                        dtype=indices.dtype,
+                        device=indices.device,
+                    )
 
-                final_weights = torch.empty(
-                    (weights.shape[0], weights.shape[1] + 1),
-                    dtype=weights.dtype,
-                    device=weights.device,
-                )
+                    final_weights = torch.empty(
+                        (weights.shape[0], weights.shape[1] + 1),
+                        dtype=weights.dtype,
+                        device=weights.device,
+                    )
 
-                chitu_backend.cuda_add_shared_experts(
-                    final_weights,
-                    final_indices,
-                    weights,
-                    indices,
-                    self.n_routed_experts,
-                    self.n_shared_experts,
-                )
-                del weights, indices
+                    chitu_backend.cuda_add_shared_experts(
+                        final_weights,
+                        final_indices,
+                        weights,
+                        indices,
+                        self.n_routed_experts,
+                        self.n_shared_experts,
+                    )
+                    weights, indices = final_weights, final_indices
+                    routed_x = IndexedBatchedRoutedActivation(x, indices)
+                else:
+                    raise NotImplementedError()
 
             return fused_experts(
-                hidden_states=x,
+                routed_x,
                 w1=gate_up_proj_weight,
                 w2=down_proj_weight,
-                topk_weights=final_weights,
-                topk_ids=final_indices,
+                topk_weights=weights,
                 inplace=inplace,
                 use_fp8_w8a8=use_fp8_w8a8,
                 w1_scale=gate_up_proj_scale,
                 w2_scale=down_proj_scale,
                 block_shape=[128, 128],
-                tokens_per_expert=tokens_per_expert,
                 soft_fp8=fused_soft_fp8,
                 experts_start_idx=self.experts_start_idx,
                 impl=impl,
             )
 
         else:
-            return super().forward(
-                x, weights, indices, tokens_per_expert, inplace=inplace, impl=impl
-            )
+            return super().forward(routed_x, weights, inplace=inplace, impl=impl)
 
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:

@@ -7,6 +7,7 @@ import torch
 from typing import Optional
 
 from chitu.moe.batched_routed_activation import (
+    BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
     IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
     PerExpertDenseBatchedRoutedActivation,
@@ -37,11 +38,10 @@ from chitu.distributed.parallel_state import get_ep_size, get_tp_group
 
 
 def fused_experts_wrapper(
-    hidden_states: torch.Tensor,
+    hidden_states: BatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
     inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
@@ -61,7 +61,6 @@ def fused_experts_wrapper(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
-    tokens_per_expert: Optional[torch.Tensor] = None,
     impl: str = "auto",
 ) -> torch.Tensor:
     """
@@ -76,8 +75,9 @@ def fused_experts_wrapper(
             raise NotImplementedError
 
     if impl == "triton":
+        assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
         return fused_experts(
-            hidden_states=IndexedBatchedRoutedActivation(hidden_states, topk_ids),
+            hidden_states,
             w1=w1,
             w2=w2,
             topk_weights=topk_weights,
@@ -102,14 +102,12 @@ def fused_experts_wrapper(
         )
     elif impl == "ep_group_gemm_masked":
         if w1.dtype == torch.float8_e4m3fn and has_deep_gemm:
+            assert isinstance(hidden_states, PerExpertDenseBatchedRoutedActivation)
             return deepgemm_masked_fused_expert(
-                hidden_states=PerExpertDenseBatchedRoutedActivation(
-                    hidden_states, tokens_per_expert
-                ),
+                hidden_states,
                 w1=w1,
                 w2=w2,
                 topk_weights=topk_weights,
-                topk_ids=topk_ids,
                 inplace=inplace,
                 activation=activation,
                 use_fp8_w8a8=use_fp8_w8a8,
@@ -130,22 +128,18 @@ def fused_experts_wrapper(
                 experts_start_idx=experts_start_idx,
             )
         elif w1.dtype == torch.bfloat16 and has_triton:
-            return triton_batched_experts(
-                hidden_states=PerExpertDenseBatchedRoutedActivation(
-                    hidden_states, tokens_per_expert
-                ),
-                w1=w1,
-                w2=w2,
-            )
+            assert isinstance(hidden_states, PerExpertDenseBatchedRoutedActivation)
+            return triton_batched_experts(hidden_states, w1=w1, w2=w2)
         else:
             raise NotImplementedError
 
     elif impl == "ep_group_gemm_contiguous":
         if w1.dtype == torch.float8_e4m3fn and has_deep_gemm:
+            assert isinstance(
+                hidden_states, IndexedBatchedRoutedActivationWithPaddedPerExpertCnt
+            )
             return deepgemm_contiguous_fused_expert(
-                IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
-                    hidden_states, topk_ids, tokens_per_expert
-                ),
+                hidden_states,
                 w1=w1,
                 w2=w2,
                 topk_weights=topk_weights,
@@ -169,8 +163,9 @@ def fused_experts_wrapper(
                 experts_start_idx=experts_start_idx,
             )
         elif has_triton:
+            assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
             return fused_experts(
-                hidden_states=IndexedBatchedRoutedActivation(hidden_states, topk_ids),
+                hidden_states,
                 w1=w1,
                 w2=w2,
                 topk_weights=topk_weights,
@@ -196,32 +191,35 @@ def fused_experts_wrapper(
         else:
             raise NotImplementedError
     elif impl == "fused_experts_with_communication":
+        assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
         return fused_experts_npu_with_communication(
-            hidden_states=hidden_states,
+            hidden_states=hidden_states.activation,
             w1=w1,
             w1_scale=w1_scale,  # fp32
             w2=w2,
             w2_scale=w2_scale,  # bf16
             topk_weights=topk_weights,
-            topk_ids=topk_ids,
+            topk_ids=hidden_states.token_to_expert_indices,
             experts_start_idx=experts_start_idx,
             use_int8_w8a8=use_int8_w8a8,
         )
     elif impl == "fused_experts_with_a2a_communication":
+        assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
         return fused_experts_npu_with_a2a_communication(
-            hidden_states=hidden_states,
+            hidden_states=hidden_states.activation,
             w1=w1,
             w1_scale=w1_scale,  # fp32
             w2=w2,
             w2_scale=w2_scale,  # bf16
             topk_weights=topk_weights,
-            topk_ids=topk_ids,
+            topk_ids=hidden_states.token_to_expert_indices,
             experts_start_idx=experts_start_idx,
             use_int8_w8a8=use_int8_w8a8,
         )
     elif impl == "torch_npu":
+        assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
         return fused_experts_npu(
-            hidden_states=IndexedBatchedRoutedActivation(hidden_states, topk_ids),
+            hidden_states,
             w1=w1,
             w1_scale=w1_scale,
             w2=w2,

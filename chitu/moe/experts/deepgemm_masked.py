@@ -6,7 +6,10 @@ from typing import Optional
 
 import torch
 
-from chitu.moe.batched_routed_activation import PerExpertDenseBatchedRoutedActivation
+from chitu.moe.batched_routed_activation import (
+    PerExpertDenseBatchedRoutedActivation,
+    PerExpertDenseBatchedRoutedActivationBlockfp8,
+)
 from chitu.ops.quant import blockfp8_act_quant
 from chitu.ops.triton_ops.quant.blockfp8 import (
     silu_and_mul_and_blockfp8_act_quant_with_expert_mask,
@@ -21,7 +24,6 @@ def deepgemm_masked_fused_expert(
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
     inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
@@ -51,9 +53,13 @@ def deepgemm_masked_fused_expert(
     assert w1_zp is None
     assert w2_zp is None
 
-    hidden_states_fp8, a1_scale = blockfp8_act_quant(
-        hidden_states.activation_per_expert
-    )
+    if isinstance(hidden_states, PerExpertDenseBatchedRoutedActivationBlockfp8):
+        hidden_states_fp8 = hidden_states.activation_per_expert
+        a1_scale = hidden_states.activation_scale_per_expert
+    else:
+        hidden_states_fp8, a1_scale = blockfp8_act_quant(
+            hidden_states.activation_per_expert
+        )
 
     M = hidden_states_fp8.shape[1]
     E, N, _ = w1.shape

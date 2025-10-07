@@ -6,6 +6,7 @@ from typing import Optional
 from typing_extensions import override
 import plum
 import torch
+import functools
 
 from chitu.utils import try_import_opt_dep
 from chitu.quantization import (
@@ -21,6 +22,10 @@ from chitu.native_layout import (
     BatchPaddedActivation,
 )
 from chitu.lazy import single_dispatch_lazy_tensor
+from chitu.moe.batched_routed_activation import (
+    BatchedRoutedActivation,
+    IndexedBatchedRoutedActivation,
+)
 
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
@@ -331,8 +336,29 @@ def _(
     return y
 
 
+@functools.singledispatch
 def muxi_fused_experts(
-    hidden_states: torch.Tensor,
+    routed_x: BatchedRoutedActivation,
+    w1: MuxiNativeLayoutGroupWeight,
+    w2: MuxiNativeLayoutGroupWeight,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    inplace: bool = False,
+    use_fp8_w8a8: bool = False,
+    use_int8_w8a16: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+):
+    raise NotImplementedError(f"{type(routed_x)} not supported for muxi_fused_experts")
+
+
+@muxi_fused_experts.register
+def _(
+    routed_x: IndexedBatchedRoutedActivation,
     w1: MuxiNativeLayoutGroupWeight,
     w2: MuxiNativeLayoutGroupWeight,
     topk_weights: torch.Tensor,
@@ -354,6 +380,8 @@ def muxi_fused_experts(
     topk_weights: [B, topk]
     topk_ids: [B, topk]
     """
+
+    hidden_states, indices = routed_x.activation, routed_x.token_to_expert_indices
 
     assert isinstance(w1, MuxiNativeLayoutGroupWeight)
     assert isinstance(w2, MuxiNativeLayoutGroupWeight)
@@ -504,20 +532,23 @@ class NormalMoeExpertsMuxiLayout(
             merge_gate_up=merge_gate_up,
         )
 
-    def forward(self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor):
-        shape = x.size()
-        x = x.view(-1, self.dim)
-        y = muxi_fused_experts(
-            hidden_states=x,
+    @override
+    def forward(
+        self,
+        routed_x: BatchedRoutedActivation,
+        weights: torch.Tensor,
+        inplace: bool = False,
+        impl: str = "auto",
+    ) -> torch.Tensor:
+        return muxi_fused_experts(
+            routed_x,
             w1=self.get_native_layout_gate_up_proj_weight(),
             w2=self.get_native_layout_down_proj_weight(),
             topk_weights=weights,
-            topk_ids=indices,
             inplace=True,
             block_shape=[128, 128],
             soft_fp8=False,
         )
-        return y.view(shape)
 
 
 class Blockfp8MoeExpertsMuxiLayout(
