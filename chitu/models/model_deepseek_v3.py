@@ -803,6 +803,7 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
                 quant_kwargs=quant_kwargs,
             ),
             non_fused_shared_experts=non_fused_shared_experts,
+            checkpoint_prefix=checkpoint_prefix,
         )
 
 

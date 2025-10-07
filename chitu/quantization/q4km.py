@@ -6,6 +6,7 @@ from typing import Optional
 from typing_extensions import override
 import torch
 import ctypes
+import functools
 
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedMoeExpertsBase
@@ -15,6 +16,10 @@ from chitu.hybrid_device import CPUParameter
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import GGMLQuantizationType
 from chitu.utils import try_import_opt_dep
+from chitu.moe.batched_routed_activation import (
+    BatchedRoutedActivation,
+    IndexedBatchedRoutedActivation,
+)
 
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
@@ -225,15 +230,28 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
             self.cpu_infer.sync()
 
     @override
+    @functools.singledispatchmethod
     def forward(
         self,
-        x: torch.Tensor,
+        routed_x: BatchedRoutedActivation,
         weights: torch.Tensor,
-        indices: torch.Tensor,
-        tokens_per_expert: Optional[torch.Tensor] = None,
         inplace: bool = False,
         impl: str = "auto",
     ) -> torch.Tensor:
+        raise NotImplementedError(
+            f"{type(routed_x)} not supported for MoeExpertsDeepSeekV3CPUInfer.forward"
+        )
+
+    @forward.register
+    def _(
+        self,
+        routed_x: IndexedBatchedRoutedActivation,
+        weights: torch.Tensor,
+        inplace: bool = False,
+        impl: str = "auto",
+    ) -> torch.Tensor:
+        x, indices = routed_x.activation, routed_x.token_to_expert_indices
+
         shape = x.size()
         capturing = torch.cuda.is_current_stream_capturing()
 

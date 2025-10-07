@@ -30,6 +30,7 @@ from chitu.distributed.parallel_state import (
     get_ep_size,
 )
 from chitu.moe import get_moe_impl
+from chitu.moe.batched_routed_activation import IndexedBatchedRoutedActivation
 from chitu.utils import (
     compute_layer_dist_in_pipe,
     is_layer,
@@ -40,6 +41,7 @@ from chitu.quantization import (
     QuantizationRegistry,
     QuantizedMoeExpertsBase,
     get_quant_from_checkpoint_prefix,
+    get_quant_kwargs_from_checkpoint_prefix,
     get_backend_from_checkpoint_prefix,
 )
 from chitu.hybrid_device import CPUParameter
@@ -894,6 +896,8 @@ class ParallelMoeBlock(nn.Module):
         gate: MoeGate,
         experts: QuantizedMoeExpertsBase,
         non_fused_shared_experts: Optional[nn.Module] = None,
+        *,
+        checkpoint_prefix: str,
     ):
         super().__init__()
         self.gate = gate
@@ -905,6 +909,8 @@ class ParallelMoeBlock(nn.Module):
 
         self.moe_impl = get_moe_impl()
         self.is_tp_mode = get_tp_size() > 1
+
+        self.checkpoint_prefix = checkpoint_prefix
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -920,6 +926,7 @@ class ParallelMoeBlock(nn.Module):
         x = x.view(-1, x.shape[-1])
 
         weights, indices = self.gate(x)
+        routed_x = IndexedBatchedRoutedActivation(x, indices)
 
         shared_y = None
         x_in_use_simultenously = False
@@ -933,18 +940,20 @@ class ParallelMoeBlock(nn.Module):
         tokens_per_expert = None
         if self.moe_impl is not None:
             experts_impl = self.moe_impl.get_experts_impl()
-            x, indices, weights, tokens_per_expert = self.moe_impl.token_permutation(
-                x, indices, weights
+            routed_x, weights = self.moe_impl.token_permutation(
+                routed_x,
+                weights,
+                may_fuse_quant=get_quant_from_checkpoint_prefix(
+                    f"{self.checkpoint_prefix}.experts"
+                ),
+                may_fuse_quant_kwargs=get_quant_kwargs_from_checkpoint_prefix(
+                    f"{self.checkpoint_prefix}.experts"
+                ),
             )
             x_in_use_simultenously = False
 
         y = self.experts(
-            x,
-            weights,
-            indices,
-            tokens_per_expert,
-            inplace=not x_in_use_simultenously,
-            impl=experts_impl,
+            routed_x, weights, inplace=not x_in_use_simultenously, impl=experts_impl
         )
 
         # Fuse allreduce to improve performance in TP mode

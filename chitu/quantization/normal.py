@@ -4,9 +4,10 @@
 
 from typing import Optional
 from typing_extensions import override
-
+import functools
 import torch
 import ctypes
+
 from chitu.tensor_parallel import (
     get_tp_size,
 )
@@ -35,6 +36,10 @@ from chitu.native_layout import (
     ACL_FORMAT_FRACTAL_NZ,
 )
 from chitu.custom_gguf import GGMLQuantizationType, get_ggml_quant_type
+from chitu.moe.batched_routed_activation import (
+    BatchedRoutedActivation,
+    IndexedBatchedRoutedActivation,
+)
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -178,56 +183,53 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
     @override
     def forward(
         self,
-        x: torch.Tensor,
+        routed_x: BatchedRoutedActivation,
         weights: torch.Tensor,
-        indices: torch.Tensor,
-        tokens_per_expert: Optional[torch.Tensor] = None,
         inplace: bool = False,
         impl: str = "auto",
-    ):
+    ) -> torch.Tensor:
         if self.merge_gate_up and (has_triton or has_torch_npu):
-            final_indices = indices
-            final_weights = weights
             if self.fuse_shared_experts:
-                indice_shape = indices.shape
-                finale_indices = torch.empty(
-                    (indice_shape[0], indice_shape[1] + 1),
-                    dtype=indices.dtype,
-                    device=indices.device,
-                )
+                if isinstance(routed_x, IndexedBatchedRoutedActivation):
+                    x, indices = routed_x.activation, routed_x.token_to_expert_indices
+                    indice_shape = indices.shape
+                    final_indices = torch.empty(
+                        (indice_shape[0], indice_shape[1] + 1),
+                        dtype=indices.dtype,
+                        device=indices.device,
+                    )
 
-                final_weights = torch.empty(
-                    (weights.shape[0], weights.shape[1] + 1),
-                    dtype=weights.dtype,
-                    device=weights.device,
-                )
+                    final_weights = torch.empty(
+                        (weights.shape[0], weights.shape[1] + 1),
+                        dtype=weights.dtype,
+                        device=weights.device,
+                    )
 
-                chitu_backend.cuda_add_shared_experts(
-                    final_weights,
-                    finale_indices,
-                    weights,
-                    indices,
-                    self.n_routed_experts,
-                    self.n_shared_experts,
-                )
-                del weights, indices
+                    chitu_backend.cuda_add_shared_experts(
+                        final_weights,
+                        final_indices,
+                        weights,
+                        indices,
+                        self.n_routed_experts,
+                        self.n_shared_experts,
+                    )
+                    weights, indices = final_weights, final_indices
+                    routed_x = IndexedBatchedRoutedActivation(x, indices)
+                else:
+                    raise NotImplementedError()
 
             return fused_experts(
-                hidden_states=x,
+                routed_x,
                 w1=self.gate_up_proj_weight,
                 w2=self.down_proj_weight,
-                topk_weights=final_weights,
-                topk_ids=final_indices,
+                topk_weights=weights,
                 inplace=inplace,
-                tokens_per_expert=tokens_per_expert,
                 experts_start_idx=self.experts_start_idx,
                 impl=impl,
             )
 
         else:
-            return super().forward(
-                x, weights, indices, tokens_per_expert, inplace=inplace, impl=impl
-            )
+            return super().forward(routed_x, weights, inplace=inplace, impl=impl)
 
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
@@ -579,20 +581,40 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
             self.cpu_infer.submit(self.moe.warm_up())
             self.cpu_infer.sync()
 
+    @override
+    @functools.singledispatchmethod
     def forward(
-        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+        self,
+        routed_x: BatchedRoutedActivation,
+        weights: torch.Tensor,
+        inplace: bool = False,
+        impl: str = "auto",
     ) -> torch.Tensor:
         """
         Forward pass for the MoE module.
 
         Args:
-            x (torch.Tensor): Input tensor.
+            x (torch.Tensor): Input BatchedRoutedActivation.
             weights (torch.Tensor): Routing weights from the gate.
-            indices (torch.Tensor): Indices of the selected experts.
 
         Returns:
             torch.Tensor: Output tensor.
         """
+
+        raise NotImplementedError(
+            f"{type(routed_x)} not supported for NormalMoeExpertsCPUInfer.forward"
+        )
+
+    @forward.register
+    def _(
+        self,
+        routed_x: IndexedBatchedRoutedActivation,
+        weights: torch.Tensor,
+        inplace: bool = False,
+        impl: str = "auto",
+    ) -> torch.Tensor:
+        x, indices = routed_x.activation, routed_x.token_to_expert_indices
+
         shape = x.size()
         capturing = torch.cuda.is_current_stream_capturing()
 

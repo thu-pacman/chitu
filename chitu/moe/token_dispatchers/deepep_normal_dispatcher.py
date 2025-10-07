@@ -2,23 +2,28 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# Modified from DeepSeek's DeepEP project
-# https://github.com/deepseek-ai/DeepEP
-
 from logging import getLogger
 from typing import Optional
+from typing_extensions import override
+import functools
 
 import torch
 
 from chitu.distributed.parallel_state import get_ep_group
 from chitu.utils import try_import_opt_dep
-
-deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
-
-from .base import MoETokenDispatcher
+from chitu.moe.token_dispatchers.base import MoETokenDispatcher
+from chitu.moe.batched_routed_activation import (
+    BatchedRoutedActivation,
+    IndexedBatchedRoutedActivation,
+    IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
+    IndexedBatchedRoutedActivationBlockfp8,
+    IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
+)
 
 # replace the buffer setting with DeepEP to concurrently enbale ll mode and normal mode, need more test to verify.
-from .buffercontroller import DeepEPBuffer
+from chitu.moe.token_dispatchers.buffercontroller import DeepEPBuffer
+
+deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 
 logger = getLogger(__name__)
 
@@ -29,7 +34,6 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         self,
         num_experts: int,
         hidden: int,
-        deepep_use_fp8: bool = False,
         profile: bool = False,
         mode: str = "deepep-normal",
     ):
@@ -44,6 +48,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         deep_ep.Buffer.set_num_sms(24)
         assert self.num_experts % self.group.size() == 0
 
+    @override
     def prepare(self, num_tokens):
         # NOTES: you may also replace `get_*_config` with your auto-tuned results via all the tests
 
@@ -52,31 +57,102 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         )  # FIXME 256 is hard code
         DeepEPBuffer.set_dispatch_mode_as_normal()
 
-    def token_permutation(self, tokens, topk_ids, topk_weights, layer_id: int = 0):
-        topk_ids = topk_ids.to(torch.int64)
-        topk_weights = topk_weights.to(torch.float32)
+    @override
+    @functools.singledispatchmethod
+    def token_permutation(
+        self,
+        x: BatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
+        layer_id: Optional[int] = None,
+    ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
+        raise NotImplementedError(
+            f"{type(x)} not supported for MoENormalTokenDispatcher.token_permutation"
+        )
+
+    @token_permutation.register
+    def _(
+        self,
+        x: IndexedBatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
+        layer_id: Optional[int] = None,
+    ) -> tuple[
+        IndexedBatchedRoutedActivationWithPaddedPerExpertCnt, Optional[torch.Tensor]
+    ]:
         (
-            recv_hidden_states,
+            recv_activation,
             recv_topk_idx,
             recv_topk_weights,
             num_recv_tokens_per_expert_list,
             handle,
             event,
-        ) = self.dispatch_forward(tokens, topk_ids, topk_weights)
-
-        self.dispatch_ctx = (handle, recv_topk_idx, recv_topk_weights)
-        recv_topk_idx = recv_topk_idx.to(torch.int32)
-        return (
-            recv_hidden_states,
-            recv_topk_idx,
-            recv_topk_weights,
-            torch.tensor(
-                num_recv_tokens_per_expert_list,
-                dtype=torch.int32,
-                device=recv_topk_idx.device,
-            ),
+        ) = self.dispatch_forward(
+            x.activation,
+            x.token_to_expert_indices.to(torch.int64),
+            topk_weights.to(torch.float32),
         )
 
+        self.dispatch_ctx = (handle, recv_topk_idx, recv_topk_weights)
+        return (
+            IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
+                recv_activation,
+                recv_topk_idx.to(torch.int32),
+                torch.tensor(
+                    num_recv_tokens_per_expert_list,
+                    dtype=torch.int32,
+                    device=recv_topk_idx.device,
+                ),
+            ),
+            recv_topk_weights,
+        )
+
+    @token_permutation.register
+    def _(
+        self,
+        x: IndexedBatchedRoutedActivationBlockfp8,
+        topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
+        layer_id: Optional[int] = None,
+    ) -> tuple[
+        IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
+        Optional[torch.Tensor],
+    ]:
+        (
+            (recv_activation, recv_activation_scale),
+            recv_topk_idx,
+            recv_topk_weights,
+            num_recv_tokens_per_expert_list,
+            handle,
+            event,
+        ) = self.dispatch_forward(
+            (x.activation, x.activation_scale),
+            x.token_to_expert_indices.to(torch.int64),
+            topk_weights.to(torch.float32),
+        )
+
+        self.dispatch_ctx = (handle, recv_topk_idx, recv_topk_weights)
+        return (
+            IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
+                activation=recv_activation,
+                activation_scale=recv_activation_scale,
+                token_to_expert_indices=recv_topk_idx.to(torch.int32),
+                n_tokens_per_expert_padded=torch.tensor(
+                    num_recv_tokens_per_expert_list,
+                    dtype=torch.int32,
+                    device=recv_topk_idx.device,
+                ),
+            ),
+            recv_topk_weights,
+        )
+
+    @override
     def token_unpermutation(
         self, expert_outputs, previous_event: Optional["deep_ep.EventOverlap"] = None
     ):
@@ -86,6 +162,12 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         )
         return combined_x
 
+    # SPDX-SnippetBegin
+    # SPDX-License-Identifier: MIT
+    # SPDX-SnippetCopyrightText: 2025 DeepSeek
+    # SDPX—SnippetName: dispatch_forward from DeepEP README
+    #
+    # From https://github.com/deepseek-ai/DeepEP/blob/main/README.md
     def dispatch_forward(
         self,
         hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -144,6 +226,14 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             event,
         )
 
+    # SPDX-SnippetEnd
+
+    # SPDX-SnippetBegin
+    # SPDX-License-Identifier: MIT
+    # SPDX-SnippetCopyrightText: 2025 DeepSeek
+    # SDPX—SnippetName: combine_forward from DeepEP README
+    #
+    # From https://github.com/deepseek-ai/DeepEP/blob/main/README.md
     def combine_forward(
         self,
         hidden_states: torch.Tensor,
@@ -165,6 +255,8 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         )
 
         return combined_x, event
+
+    # SPDX-SnippetEnd
 
     def dump_and_reset_profile(self):
         if self.profile:

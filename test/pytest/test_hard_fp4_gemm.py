@@ -7,12 +7,13 @@
 # https://github.com/vllm-project/vllm/blob/a7b8788d2c2fae6bf52c128916de19e85f2b0a25/tests/kernels/quantization/nvfp4_utils.py
 # https://github.com/vllm-project/vllm/blob/a7b8788d2c2fae6bf52c128916de19e85f2b0a25/tests/kernels/quantization/test_nvfp4_scaled_mm.py
 # licensed under Apache 2.0.
+
 from chitu.device_type import is_blackwell
 import pytest
 import torch
 
 from chitu import ops
-from chitu.ops.quant.blockfp4 import cutlass_scaled_fp4_mm
+from chitu.ops.quant.blockfp4.matmul import cutlass_scaled_fp4_mm
 
 kE2M1ToFloat = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32

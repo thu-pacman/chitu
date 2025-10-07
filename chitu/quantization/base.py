@@ -3,10 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import Optional
+import functools
 import torch
 
 from chitu.ops import silu_and_mul
 from chitu.distributed.parallel_state import get_ep_group
+from chitu.moe.batched_routed_activation import (
+    BatchedRoutedActivation,
+    IndexedBatchedRoutedActivation,
+)
 
 
 class QuantizedLinearBase(torch.nn.Module):
@@ -99,6 +104,28 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
 
         raise NotImplementedError()
 
+    def forward_act_fn_unmerged(
+        self, gate_out: torch.Tensor, up_out: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute a single expert's activation function only if there is NO merge_gate_up.
+
+        Override this method to support `self.forward_iterative`. You can safely ignore
+        this method if you only do fused forward for all experts altogether.
+        """
+
+        return torch.nn.functional.silu(gate_out) * up_out
+
+    def forward_act_fn_merged(self, gate_up_out: torch.Tensor) -> torch.Tensor:
+        """
+        Compute a single expert's activation function only if there is merge_gate_up.
+
+        Override this method to support `self.forward_iterative`. You can safely ignore
+        this method if you only do fused forward for all experts altogether.
+        """
+
+        return silu_and_mul(gate_up_out)
+
     def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
         """
         Compute the i-th expert's down_proj layer only.
@@ -109,8 +136,9 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
 
         raise NotImplementedError()
 
+    @functools.singledispatchmethod
     def forward_iterative(
-        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+        self, routed_x: BatchedRoutedActivation, weights: torch.Tensor
     ) -> torch.Tensor:
         """
         Sequantially iterate through each expert and compute the output.
@@ -118,6 +146,16 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         This is a fallback method in case there is no fused forward implementation.
         This method requires the `forward_ith_expert_*` methods to be implemented.
         """
+
+        raise NotImplementedError(
+            f"{type(routed_x)} not supported for QuantizedMoeExpertsBase.forward_iterative"
+        )
+
+    @forward_iterative.register
+    def _(
+        self, routed_x: IndexedBatchedRoutedActivation, weights: torch.Tensor
+    ) -> torch.Tensor:
+        x, indices = routed_x.activation, routed_x.token_to_expert_indices
 
         shape = x.size()
         y = torch.zeros_like(x)
@@ -137,40 +175,24 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
 
         assert len(xs) == self.group_size
         if self.merge_gate_up:
-            gate_up_proj_outs = []
+            act = []
             for i, xsi in enumerate(xs):
                 out = None
                 if xsi is not None:
-                    out = self.forward_ith_expert_gate_up(i, xsi)
-                gate_up_proj_outs.append(out)
-            act = [
-                (
-                    silu_and_mul(gate_up_proj_out)
-                    if gate_up_proj_out is not None
-                    else None
-                )
-                for gate_up_proj_out in gate_up_proj_outs
-            ]
+                    out = self.forward_act_fn_merged(
+                        self.forward_ith_expert_gate_up(i, xsi)
+                    )
+                act.append(out)
         else:
-            gate_proj_outs = []
-            up_proj_outs = []
+            act = []
             for i, xsi in enumerate(xs):
-                gate_proj_out = None
-                up_proj_out = None
+                out = None
                 if xsi is not None:
-                    gate_proj_out = self.forward_ith_expert_gate(i, xsi)
-                    up_proj_out = self.forward_ith_expert_up(i, xsi)
-                gate_proj_outs.append(gate_proj_out)
-                up_proj_outs.append(up_proj_out)
-
-            act = [
-                (
-                    torch.nn.functional.silu(gate_proj_out) * up_proj_out
-                    if gate_proj_out is not None and up_proj_out is not None
-                    else None
-                )
-                for gate_proj_out, up_proj_out in zip(gate_proj_outs, up_proj_outs)
-            ]
+                    out = self.forward_act_fn_unmerged(
+                        self.forward_ith_expert_gate(i, xsi),
+                        self.forward_ith_expert_up(i, xsi),
+                    )
+                act.append(out)
 
         down_proj_outs = []
         for i, acti in enumerate(act):
@@ -197,10 +219,8 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        routed_x: BatchedRoutedActivation,
         weights: torch.Tensor,
-        indices: torch.Tensor,
-        tokens_per_expert: Optional[torch.Tensor] = None,
         inplace: bool = False,
         impl: str = "auto",
     ):
@@ -208,16 +228,15 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         Forward pass for the MoE module.
 
         Args:
-            x (torch.Tensor): Input tensor.
+            routed_x (torch.Tensor): Input BatchedRoutedActivation.
             weights (torch.Tensor): Routing weights from the gate.
-            indices (torch.Tensor): Indices of the selected experts.
             inplace (bool): If true, `x` may be modified in-place.
 
         Returns:
             torch.Tensor: Output tensor.
         """
 
-        return self.forward_iterative(x, weights, indices)
+        return self.forward_iterative(routed_x, weights)
 
 
 class QuantizedAbsorbGemmBase(torch.nn.Module):
