@@ -41,8 +41,7 @@ else:
     ext_modules = operators.get_extensions()
 
 cython_unsafe_files = (
-    glob.glob("chitu/ops/triton_ops/*.py")  # Triton kernels inside
-    + glob.glob("chitu/ops/triton_ops/**/*.py")  # Triton kernels inside
+    glob.glob("chitu/ops/triton_ops/**/*.py", recursive=True)  # Triton kernels inside
     + glob.glob("chitu/moe/experts/*.py")  # Triton kernels inside
     + [
         "chitu/moe/batched_routed_activation.py",  # plum inside

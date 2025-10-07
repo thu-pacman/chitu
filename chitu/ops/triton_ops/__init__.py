@@ -14,7 +14,7 @@ from chitu.ops.triton_ops.quant import (
     blockfp8_einsum_shc_hdc_shd_triton,
     w8a8_gemm_per_token_per_channel_triton,
     w4a8_gemm_per_token_per_channel_asymm_triton,
-    blockfp8_gemm_triton_default,
+    blockfp8_gemm_triton,
     soft_fp8_blockfp8_gemm_triton,
     soft_fp4_raise_to_fp8_blockfp4_gemm_triton,
     soft_fp4_raise_to_bf16_blockfp4_gemm_triton,

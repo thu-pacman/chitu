@@ -11,7 +11,7 @@ from chitu.moe.batched_routed_activation import (
     PerExpertDenseBatchedRoutedActivationBlockfp8,
 )
 from chitu.ops.quant import blockfp8_act_quant
-from chitu.ops.triton_ops.quant.blockfp8 import (
+from chitu.ops.triton_ops.quant.blockfp8.convert import (
     silu_and_mul_and_blockfp8_act_quant_with_expert_mask,
 )
 from chitu.utils import try_import_opt_dep

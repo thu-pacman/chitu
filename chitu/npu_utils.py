@@ -232,7 +232,6 @@ def fused_experts_npu_with_communication(
     global_bs_for_distpatch_combine = (
         ceil_div(get_global_args().infer.max_reqs, ep_size) * ep_size
     )
-    act_dtype = hidden_states.dtype
 
     (
         expand_x,

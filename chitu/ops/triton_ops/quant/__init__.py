@@ -4,7 +4,7 @@
 
 from chitu.ops.triton_ops.quant.blockfp8 import (
     blockfp8_einsum_shc_hdc_shd_triton,
-    blockfp8_gemm_triton_default,
+    blockfp8_gemm_triton,
     soft_fp8_blockfp8_gemm_triton,
     blockfp8_weight_dequant_triton,
     soft_fp8_blockfp8_weight_dequant_triton,
