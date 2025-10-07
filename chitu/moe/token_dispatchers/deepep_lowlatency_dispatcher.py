@@ -11,7 +11,7 @@ import math
 import torch
 
 from chitu.distributed.parallel_state import get_ep_group
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_opt_dep, parse_dtype
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
@@ -19,6 +19,8 @@ from chitu.moe.batched_routed_activation import (
     PerExpertDenseBatchedRoutedActivation,
     PerExpertDenseBatchedRoutedActivationBlockfp8,
 )
+from chitu.global_vars import get_global_args
+from chitu.device_type import is_blackwell
 
 # replace the buffer setting with DeepEP to concurrently enbale ll mode and normal mode, need more test to verify.
 from chitu.moe.token_dispatchers.buffercontroller import DeepEPBuffer
@@ -38,7 +40,6 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         self,
         num_experts: int,
         hidden: int,
-        deepep_use_fp8: bool = False,
         profile: bool = False,
         mode: str = "deepep-ll",
     ):
@@ -47,7 +48,6 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         self.ep_rank = get_ep_group().rank_in_group
         self.group = get_ep_group().gpu_group
         self.hidden = hidden
-        self.use_fp8 = deepep_use_fp8
         self.mode = mode
 
         # NOTES: for the best performance, the QP number **must** be equal to the number of the local experts
@@ -117,6 +117,9 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         self,
         x: BatchedRoutedActivation,
         topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
     ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
         raise NotImplementedError(
@@ -128,15 +131,30 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         self,
         x: IndexedBatchedRoutedActivation,
         topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
     ) -> tuple[PerExpertDenseBatchedRoutedActivation, Optional[torch.Tensor]]:
+        dispatch_use_fp8 = False
+        if (
+            may_fuse_quant == "blockfp8"
+            and may_fuse_quant_kwargs.get("block_size", 128) == 128
+            and parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
+            <= 1
+        ):
+            dispatch_use_fp8 = True
+        if may_fuse_quant == "blockfp4" and not is_blackwell():
+            # FIXME: Add fp4 option to infer.raise_lower_bit_float_to and use it here
+            dispatch_use_fp8 = True
+
         topk_ids = x.token_to_expert_indices.to(torch.int64)
         recv_activation, recv_expert_count, deepep_handle, event, hook = (
             self.deepep_token_dispatch(
                 x.activation,
                 topk_ids,
                 return_recv_hook=True,
-                dispatch_use_fp8=self.use_fp8,
+                dispatch_use_fp8=dispatch_use_fp8,
                 cumulative_local_expert_recv_stats=(
                     self.cumulative_local_expert_recv_stats[layer_id]
                     if layer_id is not None
@@ -150,7 +168,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         # Currently, we should call permutation + unpermutation contiguously.
         self.dispatcher_ctx = (deepep_handle, topk_ids, topk_weights)
 
-        if not self.use_fp8:
+        if not dispatch_use_fp8:
             return (
                 PerExpertDenseBatchedRoutedActivation(
                     activation_per_expert=recv_activation,

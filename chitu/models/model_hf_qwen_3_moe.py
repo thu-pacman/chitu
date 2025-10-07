@@ -87,11 +87,12 @@ class ParallelMoeBlockQwen3(ParallelMoeBlock):
             gate=Qwen3MoeGate(args, op_impl),
             experts=Qwen3MoeExperts(
                 args,
-                checkpoint_prefix,
+                f"{checkpoint_prefix}.experts",
                 base_moe_experts_class,
                 quant_kwargs,
             ),
             non_fused_shared_experts=None,
+            checkpoint_prefix=checkpoint_prefix,
         )
 
 

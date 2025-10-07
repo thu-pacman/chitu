@@ -78,6 +78,7 @@ def linear_block_fp4(
     """
 
     if is_blackwell():
+        # FIXME: Add fp4 option to infer.raise_lower_bit_float_to and use it here
         assert weight.k_stride == 1
         assert x.shape[-1] == weight.layout_tensor.shape[-1] * 2
         y = blockfp4_gemm(

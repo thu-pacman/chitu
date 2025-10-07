@@ -43,7 +43,6 @@ infer:
   moe:
     prefill_token_dispatcher: auto # one of: auto, tp, allgather, deepep-nl
     decode_token_dispatcher: auto # one of: auto, tp, allgather, deepep-ll
-    deepep_use_fp8: False # whether to use fp8 for deepep
 request:
   prompt_tokens_len: -1 # use for perf test in single_req_test.py, -1 means use real requests.
   max_new_tokens: 128

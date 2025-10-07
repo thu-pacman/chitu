@@ -255,10 +255,11 @@ class ParallelMoeBlockGptOss(ParallelMoeBlock):
                 n_shared_experts=0,
                 n_activated_experts=0,
                 fuse_shared_experts=False,
-                checkpoint_prefix=f"{checkpoint_prefix}.moe",
+                checkpoint_prefix=f"{checkpoint_prefix}.experts",
                 merge_gate_up=False,
             ),
             non_fused_shared_experts=None,
+            checkpoint_prefix=checkpoint_prefix,
         )
 
 

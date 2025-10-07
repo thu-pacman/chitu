@@ -34,7 +34,6 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         self,
         num_experts: int,
         hidden: int,
-        deepep_use_fp8: bool = False,
         profile: bool = False,
         mode: str = "deepep-normal",
     ):
@@ -64,6 +63,9 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         self,
         x: BatchedRoutedActivation,
         topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
     ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
         raise NotImplementedError(
@@ -75,6 +77,9 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         self,
         x: IndexedBatchedRoutedActivation,
         topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
     ) -> tuple[
         IndexedBatchedRoutedActivationWithPaddedPerExpertCnt, Optional[torch.Tensor]
@@ -111,6 +116,9 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         self,
         x: IndexedBatchedRoutedActivationBlockfp8,
         topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
     ) -> tuple[
         IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,

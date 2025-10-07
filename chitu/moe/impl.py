@@ -61,7 +61,6 @@ class MoEImpl:
 
         self.prefill_experts_impl = "auto"
         self.decode_experts_impl = "auto"
-        self.use_fp8 = args.infer.moe.deepep_use_fp8
         self.prefill_token_dispatcher_impl = args.infer.moe.prefill_token_dispatcher
         self.decode_token_dispatcher_impl = args.infer.moe.decode_token_dispatcher
         self.use_cuda_graph = args.infer.use_cuda_graph
@@ -124,9 +123,7 @@ class MoEImpl:
             self.decode_token_dispatcher = MoETPTokenDispatcher()
         elif self.decode_token_dispatcher_impl == "deepep-ll":
             self.decode_token_dispatcher = MoELowLatencyTokenDispatcher(
-                self.num_experts,
-                self.hidden_dim,
-                deepep_use_fp8=self.use_fp8,
+                self.num_experts, self.hidden_dim
             )
             self.decode_experts_impl = "ep_group_gemm_masked"
         elif self.decode_token_dispatcher_impl == "empty":

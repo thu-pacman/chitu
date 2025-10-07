@@ -25,12 +25,25 @@ class MoETokenDispatcher(ABC):
         self,
         x: BatchedRoutedActivation,
         topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
     ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
         """
-        Returns a tuple of:
-        - dispatched BatchedRoutedActivation
-        - optional dispatched topk weights
+        Dispatches tokens to different EP ranks
+
+        Args:
+            x: Input BatchedRoutedActivation
+            topk_weights: Routing weight of selected experts
+            may_fuse_quant: A quantization method. The implementation may fuse activation
+                quantization during communication, but it's not guaranteed.
+            may_fuse_quant_kwargs: Keyword arguments for the quantization method.
+            layer_id: Layer id. Only for profiling purposes.
+
+        Returns:
+            0: dispatched BatchedRoutedActivation
+            1: optional dispatched topk weights
         """
         raise NotImplementedError("Dispatch function not implemented.")
 
@@ -49,6 +62,9 @@ class MoEEmptyTokenDispatcher(MoETokenDispatcher):
         self,
         x: BatchedRoutedActivation,
         topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
     ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
         return x, topk_weights

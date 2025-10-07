@@ -47,8 +47,6 @@ ADDITIONAL_ARGS=(
     infer.mla_absorb=absorb-without-precomp
     infer.moe.prefill_token_dispatcher=auto
     infer.moe.decode_token_dispatcher=auto
-    infer.moe.deepep_use_fp8=True
-
 )
 bash "$SRUN_PATH" "$NODE" "$NUM_GPU_PER_NODE" \
     "$BENCHMARK_PATH" \

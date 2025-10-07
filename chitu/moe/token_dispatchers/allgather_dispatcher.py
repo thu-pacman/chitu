@@ -45,6 +45,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         self,
         x: BatchedRoutedActivation,
         topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
     ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
         raise NotImplementedError(
@@ -56,6 +59,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         self,
         x: IndexedBatchedRoutedActivation,
         topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
     ) -> tuple[IndexedBatchedRoutedActivation, Optional[torch.Tensor]]:
         func = self.ep_group.all_gatherv_into_tensor_with_cum_size
