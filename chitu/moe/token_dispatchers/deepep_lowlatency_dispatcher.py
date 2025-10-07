@@ -2,9 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# Modified from DeepSeek's DeepEP project
-# https://github.com/deepseek-ai/DeepEP
-
 from logging import getLogger
 
 import torch
@@ -142,6 +139,12 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         )
         return outputs
 
+    # SPDX-SnippetBegin
+    # SPDX-License-Identifier: MIT
+    # SPDX-SnippetCopyrightText: 2025 DeepSeek
+    # SDPX—SnippetName: low_latency_dispatch from DeepEP README
+    #
+    # From https://github.com/deepseek-ai/DeepEP/blob/main/README.md
     def deepep_token_dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -171,6 +174,14 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         # Later, you can use our GEMM library to do the computation with this specific format
         return recv_hidden_states, recv_expert_count, handle, event, hook
 
+    # SPDX-SnippetEnd
+
+    # SPDX-SnippetBegin
+    # SPDX-License-Identifier: MIT
+    # SPDX-SnippetCopyrightText: 2025 DeepSeek
+    # SDPX—SnippetName: low_latency_combine from DeepEP README
+    #
+    # From https://github.com/deepseek-ai/DeepEP/blob/main/README.md
     def deepep_token_combine(
         self,
         hidden_states: torch.Tensor,
@@ -201,3 +212,5 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
 
         # NOTES: the same behavior as described in the dispatch kernel
         return combined_hidden_states, event, hook
+
+    # SPDX-SnippetEnd

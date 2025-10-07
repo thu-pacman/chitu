@@ -16,6 +16,12 @@ class DeepEPBuffer:
     _num_experts: Optional[int] = None
     _dispatch_mode = None
 
+    # SPDX-SnippetBegin
+    # SPDX-License-Identifier: MIT
+    # SPDX-SnippetCopyrightText: 2025 DeepSeek
+    # SDPX—SnippetName: get_buffer from DeepEP README
+    #
+    # From https://github.com/deepseek-ai/DeepEP/blob/main/README.md
     @classmethod
     def get_deepep_buffer(
         cls,
@@ -79,6 +85,8 @@ class DeepEPBuffer:
             allow_mnnvl=True,
         )
         return cls._buffer
+
+    # SPDX-SnippetEnd
 
     @classmethod
     def clean_buffer(cls):

@@ -2,9 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# Modified from DeepSeek's DeepEP project
-# https://github.com/deepseek-ai/DeepEP
-
 from logging import getLogger
 from typing import Optional
 
@@ -86,6 +83,12 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         )
         return combined_x
 
+    # SPDX-SnippetBegin
+    # SPDX-License-Identifier: MIT
+    # SPDX-SnippetCopyrightText: 2025 DeepSeek
+    # SDPX—SnippetName: dispatch_forward from DeepEP README
+    #
+    # From https://github.com/deepseek-ai/DeepEP/blob/main/README.md
     def dispatch_forward(
         self,
         hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -144,6 +147,14 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             event,
         )
 
+    # SPDX-SnippetEnd
+
+    # SPDX-SnippetBegin
+    # SPDX-License-Identifier: MIT
+    # SPDX-SnippetCopyrightText: 2025 DeepSeek
+    # SDPX—SnippetName: combine_forward from DeepEP README
+    #
+    # From https://github.com/deepseek-ai/DeepEP/blob/main/README.md
     def combine_forward(
         self,
         hidden_states: torch.Tensor,
@@ -165,6 +176,8 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         )
 
         return combined_x, event
+
+    # SPDX-SnippetEnd
 
     def dump_and_reset_profile(self):
         if self.profile:
