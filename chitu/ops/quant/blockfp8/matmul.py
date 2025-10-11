@@ -17,12 +17,16 @@ triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
 
 if has_triton:
     from chitu.ops.triton_ops import (
         blockfp8_gemm_triton,
         soft_fp8_blockfp8_gemm_triton,
     )
+if has_marlin:
+    from chitu_backend import gptq_marlin_gemm
 
 
 def blockfp8_gemm(
@@ -146,3 +150,48 @@ def soft_fp8_blockfp8_gemm_npu(
     if flag:
         output = output.unsqueeze(1)
     return output
+
+
+def get_marlin_workspace(
+    device: torch.device, max_blocks_per_sm: int = 1
+) -> torch.Tensor:
+    num_sm = torch.cuda.get_device_properties(device).multi_processor_count
+    return torch.zeros(
+        num_sm * max_blocks_per_sm, dtype=torch.int, device=device, requires_grad=False
+    )
+
+
+@single_dispatch_lazy_tensor
+def soft_fp8_blockfp8_gemm_marlin(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    assert has_marlin == True, "Current Device doesn't support marlin gemm"
+    w = weight.layout_tensor
+    s = scale.layout_tensor
+    n, k = weight.plain_shape
+    workspace = get_marlin_workspace(x.device)
+    # torch.distributed.breakpoint()
+    output = gptq_marlin_gemm(
+        x,
+        None,
+        w,
+        None,
+        s,
+        None,
+        None,
+        None,
+        None,
+        workspace,
+        2814749767172868,
+        x.shape[0],
+        w.shape[1] // 4,
+        x.shape[1],
+        True,
+        True,
+        True,
+        False,
+        True,
+    )
+    return output[:, : -(n % 128)] if n % 128 != 0 else output

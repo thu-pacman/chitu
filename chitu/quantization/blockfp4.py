@@ -245,6 +245,7 @@ class Blockfp4LinearBase(QuantizedLinearBase):
             self.register_parameter("bias", None)
 
 
+@QuantizationRegistry.register_linear("blockfp4", when=lambda: is_nvidia())
 class Blockfp4LinearPackKStride64(
     enable_native_layout_weight("weight", Packed4BitWeightAlongK, k_stride=64),
     Blockfp4LinearBase,
@@ -265,6 +266,9 @@ class Blockfp4LinearPackKStride64(
         )
 
 
+@QuantizationRegistry.register_linear(
+    "blockfp4", when=lambda: is_blackwell(), priority=1
+)
 class Blockfp4LinearPackKStride1(
     enable_native_layout_weight("weight", Packed4BitWeightAlongK, k_stride=1),
     Blockfp4LinearBase,
@@ -302,6 +306,9 @@ class Blockfp4LinearPackKStride1(
         )
 
 
+@QuantizationRegistry.register_linear(
+    "blockfp4", when=lambda: has_torch_npu, priority=2
+)
 class Blockfp4LinearPackNPUNative(
     enable_native_layout_weight("weight", Packed4BitWeightNPUNative),
     Blockfp4LinearBase,
@@ -532,6 +539,7 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
             )
 
 
+@QuantizationRegistry.register_moe_experts("blockfp4", when=lambda: is_nvidia())
 class Blockfp4MoeExpertsPackKStride64(
     enable_native_layout_weight(
         "gate_up_proj_weight", Packed4BitWeightAlongK, allow_missing=True, k_stride=64
@@ -659,6 +667,11 @@ class Blockfp4MoeExpertsPackKStride64(
         )
 
 
+@QuantizationRegistry.register_moe_experts(
+    "blockfp4",
+    when=lambda: has_torch_npu,
+    priority=2,
+)
 class Blockfp4MoeExpertsPackNPUNative(
     enable_native_layout_weight(
         "gate_up_proj_weight", Packed4BitWeightNPUNative, allow_missing=True
@@ -727,19 +740,4 @@ class Blockfp4MoeExpertsPackNPUNative(
             x,
             self.get_native_layout_down_proj_weight()[i],
             self.down_proj_weight_scale[i],
-        )
-
-
-if has_torch_npu:
-    QuantizationRegistry.register_linear("blockfp4", Blockfp4LinearPackNPUNative)
-    QuantizationRegistry.register_moe_experts(
-        "blockfp4", Blockfp4MoeExpertsPackNPUNative
-    )
-else:
-    if is_blackwell():
-        QuantizationRegistry.register_linear("blockfp4", Blockfp4LinearPackKStride1)
-    else:
-        QuantizationRegistry.register_linear("blockfp4", Blockfp4LinearPackKStride64)
-        QuantizationRegistry.register_moe_experts(
-            "blockfp4", Blockfp4MoeExpertsPackKStride64
         )

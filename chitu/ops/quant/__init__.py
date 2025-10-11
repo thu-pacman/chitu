@@ -12,6 +12,7 @@ from chitu.ops.quant.blockfp8 import (
     soft_fp8_blockfp8_weight_dequant,
     blockfp8_act_quant,
     silu_and_mul_and_blockfp8_act_quant,
+    soft_fp8_blockfp8_gemm_marlin,
     blockfp8_index_score_dense_dsv32,
     blockfp8_index_score_ragged_q_dense_k_dsv32,
     blockfp8_index_score_ragged_q_paged_k_dsv32,

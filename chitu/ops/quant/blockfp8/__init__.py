@@ -9,7 +9,11 @@ from chitu.ops.quant.blockfp8.convert import (
     blockfp8_act_quant,
     silu_and_mul_and_blockfp8_act_quant,
 )
-from chitu.ops.quant.blockfp8.matmul import blockfp8_gemm, soft_fp8_blockfp8_gemm
+from chitu.ops.quant.blockfp8.matmul import (
+    blockfp8_gemm,
+    soft_fp8_blockfp8_gemm,
+    soft_fp8_blockfp8_gemm_marlin,
+)
 from chitu.ops.quant.blockfp8.absorb_gemm import blockfp8_einsum_shc_hdc_shd
 from chitu.ops.quant.blockfp8.index_score import (
     blockfp8_index_score_dense_dsv32,

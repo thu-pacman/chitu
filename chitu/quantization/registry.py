@@ -123,7 +123,16 @@ class QuantizationRegistry:
             raise ValueError(
                 f"Unknown quantization method in `method`: {method}, `backend`: {backend_type}"
             )
-        impl: Type = backend_impls[method]
+
+        priority = -1
+        impl: Type = None
+        for impl_, when_, priority_ in backend_impls[method]:
+            if when_() and priority_ > priority:
+                impl, priority = impl_, priority_
+        if impl is None:
+            raise ValueError(
+                f"No available implementation for quantization method: {method}, backend: {backend_type}"
+            )
 
         for key in quant_kwargs:
             if key not in backend_impls:
@@ -306,6 +315,8 @@ class QuantizationRegistry:
         name: Optional[str],
         implementation: Optional[Type[QuantizedLinearBase]] = None,
         backend_type: str = "default",
+        when=lambda: True,
+        priority: int = 0,
     ) -> Callable | Type[QuantizedLinearBase]:
         """
         Register a new quantization Linear layer.
@@ -317,11 +328,21 @@ class QuantizationRegistry:
         """
         if implementation is None:
             return functools.partial(
-                cls.register_linear, name, backend_type=backend_type
+                cls.register_linear,
+                name,
+                backend_type=backend_type,
+                when=when,
+                priority=priority,
             )
         if backend_type not in cls._linear_registry:
             cls._linear_registry[backend_type] = {}
-        cls._linear_registry[backend_type][name] = implementation
+
+        if name not in cls._linear_registry[backend_type]:
+            cls._linear_registry[backend_type][name] = []
+        cls._linear_registry[backend_type][name].append(
+            (implementation, when, priority)
+        )
+
         return implementation
 
     @classmethod
@@ -330,6 +351,8 @@ class QuantizationRegistry:
         name: Optional[str],
         implementation: Optional[Type[QuantizedMoeExpertsBase]] = None,
         backend_type: str = "default",
+        when=lambda: True,
+        priority: int = 0,
     ) -> Callable | Type[QuantizedMoeExpertsBase]:
         """
         Register a new MoeExperts layer.
@@ -341,11 +364,20 @@ class QuantizationRegistry:
         """
         if implementation is None:
             return functools.partial(
-                cls.register_moe_experts, name, backend_type=backend_type
+                cls.register_moe_experts,
+                name,
+                backend_type=backend_type,
+                when=when,
+                priority=priority,
             )
         if backend_type not in cls._moe_experts_registry:
             cls._moe_experts_registry[backend_type] = {}
-        cls._moe_experts_registry[backend_type][name] = implementation
+        if name not in cls._moe_experts_registry[backend_type]:
+            cls._moe_experts_registry[backend_type][name] = []
+        cls._moe_experts_registry[backend_type][name].append(
+            (implementation, when, priority)
+        )
+
         return implementation
 
     @classmethod
@@ -354,6 +386,8 @@ class QuantizationRegistry:
         name: Optional[str],
         implementation: Optional[Type[QuantizedAbsorbGemmBase]] = None,
         backend_type: str = "default",
+        when=lambda: True,
+        priority: int = 0,
     ) -> Callable | Type[QuantizedAbsorbGemmBase]:
         """
         Register a new quantization AbsorbGemm layer.
@@ -365,9 +399,19 @@ class QuantizationRegistry:
         """
         if implementation is None:
             return functools.partial(
-                cls.register_absorb_gemm, name, backend_type=backend_type
+                cls.register_absorb_gemm,
+                name,
+                backend_type=backend_type,
+                when=when,
+                priority=priority,
             )
         if backend_type not in cls._absorb_gemm_registry:
             cls._absorb_gemm_registry[backend_type] = {}
-        cls._absorb_gemm_registry[backend_type][name] = implementation
+
+        if name not in cls._absorb_gemm_registry[backend_type]:
+            cls._absorb_gemm_registry[backend_type][name] = []
+        cls._absorb_gemm_registry[backend_type][name].append(
+            (implementation, when, priority)
+        )
+
         return implementation
