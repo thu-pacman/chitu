@@ -10,6 +10,29 @@ from torch.utils.cpp_extension import CUDAExtension
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 
+def generate_files():
+    files_path = [
+        os.path.join(this_dir, "cuda/marlin/marlin_gemm/generate_kernel.py"),
+        os.path.join(this_dir, "cuda/marlin/marlin_group_gemm/generate_kernel.py"),
+    ]
+    import subprocess
+
+    for file in files_path:
+        subprocess.run(["python", file])
+
+
+def remove_files():
+    files_path = [
+        os.path.join(this_dir, "cuda/marlin/marlin_gemm/bf16_kernel.cu"),
+        os.path.join(this_dir, "cuda/marlin/marlin_group_gemm/bf16_kernel_moe.cu"),
+        os.path.join(this_dir, "cuda/marlin/marlin_gemm/fp16_kernel.cu"),
+        os.path.join(this_dir, "cuda/marlin/marlin_group_gemm/fp16_kernel_moe.cu"),
+    ]
+    for file in files_path:
+        if os.path.exists(file):
+            os.remove(file)
+
+
 def get_extensions():
     cxx_extra_args = []
     nvcc_extra_args = []
@@ -24,6 +47,7 @@ def get_extensions():
         nvcc_extra_args.append("-D_GLIBCXX_USE_CXX11_ABI=0")
 
     enable_nvfp4 = os.environ.get("ENABLE_NVFP4", "0") == "1"
+    enable_marlin = os.environ.get("CHITU_MUXI_BUILD", "0") == "0"
 
     if enable_nvfp4:
         cutlass_path = os.path.join(this_dir, "../third_party/cutlass")
@@ -39,6 +63,17 @@ def get_extensions():
         extra_sources += [
             os.path.join(this_dir, "cuda/hard_fp4/nvfp4_scaled_mm_kernels.cu"),
             os.path.join(this_dir, "cuda/hard_fp4/nvfp4_quant_kernels.cu"),
+        ]
+
+    if enable_marlin:
+        generate_files()
+        extra_sources += [
+            os.path.join(this_dir, "cuda/marlin/marlin_gemm/gptq_marlin.cu"),
+            os.path.join(this_dir, "cuda/marlin/marlin_gemm/bf16_kernel.cu"),
+            os.path.join(this_dir, "cuda/marlin/marlin_gemm/fp16_kernel.cu"),
+            os.path.join(this_dir, "cuda/marlin/marlin_group_gemm/ops.cu"),
+            os.path.join(this_dir, "cuda/marlin/marlin_group_gemm/bf16_kernel_moe.cu"),
+            os.path.join(this_dir, "cuda/marlin/marlin_group_gemm/fp16_kernel_moe.cu"),
         ]
 
     return [

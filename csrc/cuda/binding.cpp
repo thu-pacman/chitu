@@ -13,6 +13,8 @@
 #include "gemm/w4a8_per_group_gemm_cuda.h"
 #include "hard_fp4/nvfp4_quant_entry.h"
 #include "hard_fp4/nvfp4_scaled_mm_entry.h"
+#include "marlin/marlin_gemm/gptq_marlin.h"
+#include "marlin/marlin_group_gemm/ops.h"
 #include "moe/moe_kernel.h"
 #include "norm/rms_norm.h"
 #include "response_append/response_append.h"
@@ -40,6 +42,12 @@ void init_compute(py::module &m) {
     m.def("cuda_response_append", &response_append, "");
     m.def("w4a8_per_group_gemm_forward_cuda", &w4a8_per_group_gemm_forward_cuda,
           "");
+#if !defined(CHITU_MUXI_BUILD) ||                                              \
+    (defined(CHITU_MUXI_BUILD) && !CHITU_MUXI_BUILD)
+    m.def("gptq_marlin_gemm", &gptq_marlin_gemm, "VLLM Marlin GEMM");
+    m.def("moe_wna16_marlin_gemm", &moe_wna16_marlin_gemm,
+          "VLLM Marlin Group GEMM");
+#endif
 #if defined ENABLE_NVFP4 && ENABLE_NVFP4
     m.def("cuda_nvfp4_scaled_mm", &cutlass_scaled_fp4_mm, "");
     m.def("cuda_scaled_fp4_quant", &scaled_fp4_quant, "");

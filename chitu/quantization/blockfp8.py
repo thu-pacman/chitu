@@ -21,10 +21,16 @@ from chitu.ops.quant import (
     soft_fp8_blockfp8_weight_dequant,
     blockfp8_act_quant,
     blockfp8_einsum_shc_hdc_shd,
+    soft_fp8_blockfp8_gemm_marlin,
 )
 from chitu.device_type import get_device_name, is_muxi, is_nvidia
 from chitu.utils import try_import_platform_dep, parse_dtype
 from chitu.global_vars import get_global_args
+from chitu.native_layout import (
+    enable_native_layout_weight,
+    MarlinNativeLayoutWeight,
+    MarlinNativeLayoutScale,
+)
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
@@ -34,6 +40,8 @@ chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
 if has_triton and torch.cuda.is_available():
     from chitu.moe.experts import fused_experts
+
+has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
 
 logger = getLogger(__name__)
 
@@ -159,6 +167,25 @@ class Blockfp8Linear(QuantizedLinearBase):
     def forward(self, x) -> torch.Tensor:
         return linear_block_fp8(
             x, self.weight, self.scale, self.bias, block_size=self.block_size
+        )
+
+
+@QuantizationRegistry.register_linear(
+    "blockfp8",
+    when=lambda: has_marlin
+    and parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize > 1,
+    priority=1,
+)
+class Blockfp8LinearMarlinLayout(
+    enable_native_layout_weight("weight", MarlinNativeLayoutWeight),
+    enable_native_layout_weight("scale", MarlinNativeLayoutScale),
+    Blockfp8Linear,
+):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return soft_fp8_blockfp8_gemm_marlin(
+            x,
+            self.get_native_layout_weight(),
+            self.get_native_layout_scale(),
         )
 
 
