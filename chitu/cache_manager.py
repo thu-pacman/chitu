@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Sequence, Optional, Callable, Dict
+from typing import Sequence, Optional, Callable, Dict, Iterable, List
 from typing_extensions import override
 from dataclasses import dataclass
 from logging import getLogger
@@ -16,6 +16,107 @@ from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
 from chitu.utils import ceil_div
 
 logger = getLogger(__name__)
+
+
+class GlobalLocalMap:
+    """
+    A mapping between global indices (0..N) and local offsets for one instance.
+
+    Supports two modes:
+      1. range mode: [begin_idx, end_idx)
+      2. list mode: arbitrary list of global indices (may be non-contiguous)
+    """
+
+    __slots__ = ("_mode", "_begin", "_end", "_list", "_map")
+
+    def __init__(
+        self,
+        begin_idx: Optional[int] = None,
+        end_idx: Optional[int] = None,
+        idx_list: Optional[Iterable[int]] = None,
+    ):
+        # Validate mode selection
+        if idx_list is not None and (begin_idx is not None or end_idx is not None):
+            raise ValueError("Cannot provide both range and idx_list.")
+
+        if idx_list is not None:
+            # list mode
+            self._mode = "list"
+            lst: List[int] = list(idx_list)
+            if len(lst) != len(set(lst)):
+                raise ValueError("Duplicate global indices in idx_list.")
+            self._list = lst
+            self._map = {g: i for i, g in enumerate(lst)}  # global -> local
+            self._begin = None
+            self._end = None
+
+        elif begin_idx is not None and end_idx is not None:
+            # range mode
+            if not (0 <= begin_idx <= end_idx):
+                raise ValueError(
+                    "Invalid range: must satisfy 0 <= begin_idx <= end_idx."
+                )
+            self._mode = "range"
+            self._begin = int(begin_idx)
+            self._end = int(end_idx)
+            self._list = None
+            self._map = None
+        else:
+            raise ValueError("Must provide either [begin_idx, end_idx) or idx_list.")
+
+    @classmethod
+    def from_range(cls, begin_idx: int, end_idx: int) -> "GlobalLocalMap":
+        return cls(begin_idx=begin_idx, end_idx=end_idx)
+
+    @classmethod
+    def from_list(cls, idx_list: Iterable[int]) -> "GlobalLocalMap":
+        return cls(idx_list=idx_list)
+
+    def to_local(self, global_idx: int) -> int:
+        """
+        Convert a global index to its local offset (0-based).
+        Raises KeyError if the global index does not belong to this instance.
+        """
+        if self._mode == "range":
+            if self._begin <= global_idx < self._end:
+                return global_idx - self._begin
+            raise KeyError(
+                f"global idx {global_idx} not in range [{self._begin}, {self._end})"
+            )
+        else:
+            try:
+                return self._map[global_idx]  # type: ignore[index]
+            except KeyError:
+                raise KeyError(f"global idx {global_idx} not in list")
+
+    def size(self) -> int:
+        """Return number of local elements."""
+        if self._mode == "range":
+            return self._end - self._begin  # type: ignore[operator]
+        else:
+            return len(self._list)  # type: ignore[arg-type]
+
+    def __len__(self) -> int:
+        return self.size()
+
+    def __contains__(self, global_idx: int) -> bool:
+        if self._mode == "range":
+            return self._begin <= global_idx < self._end  # type: ignore[operator]
+        else:
+            return global_idx in self._map  # type: ignore[union-attr]
+
+    def to_global(self, local_offset: int) -> int:
+        """
+        Reverse lookup: convert a local offset back to its global index.
+        Raises IndexError if out of bounds.
+        """
+        if not (0 <= local_offset < self.size()):
+            raise IndexError("local offset out of range")
+
+        if self._mode == "range":
+            return self._begin + local_offset  # type: ignore[operator]
+        else:
+            return self._list[local_offset]  # type: ignore[index]
 
 
 class KVCacheAccessor:
@@ -48,8 +149,7 @@ class DenseKVCacheAccessor(KVCacheAccessor):
 class KVCacheManagerBase:
     def __init__(
         self,
-        begin_layer_id,
-        end_layer_id,
+        layer_id_map: GlobalLocalMap,
         *,
         num_hot_req: int,
         max_seq_len: int,
@@ -68,14 +168,13 @@ class KVCacheManagerBase:
         Base class for KV cache managers
 
         Note for KV cache shapes:
-        - You can either set `k_shae_per_sample` and `v_shape_per_sample`, or `n_local_kv_heads` and `head_dim`.
+        - You can either set `k_shape_per_sample` and `v_shape_per_sample`, or `n_local_kv_heads` and `head_dim`.
         - Otherwise, you can set `kv_shape_per_sample`, which means a holistic shape for both K and V, which
           internally uses only K and disables V.
         """
 
-        self.begin_layer_id = begin_layer_id
-        self.end_layer_id = end_layer_id
-        self.num_layers = end_layer_id - begin_layer_id
+        self.layer_id_map = layer_id_map
+        self.num_layers = layer_id_map.size()
 
         self.num_hot_req = num_hot_req
         self.max_seq_len = max_seq_len
@@ -230,8 +329,7 @@ class KVCacheManagerBase:
 class PagedKVCacheManager(KVCacheManagerBase):
     def __init__(
         self,
-        begin_layer_id: int,
-        end_layer_id: int,
+        layer_id_map: GlobalLocalMap,
         *,
         num_hot_req: int,
         max_seq_len: int,
@@ -259,8 +357,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         """
 
         super().__init__(
-            begin_layer_id,
-            end_layer_id,
+            layer_id_map,
             num_hot_req=num_hot_req,
             max_seq_len=max_seq_len,
             k_shape_per_sample=k_shape_per_sample,
@@ -515,19 +612,20 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
     @override
     def get_accessor(self, layer_id: int) -> PagedKVCacheAccessor:
+        local_layer_id = self.layer_id_map.to_local(layer_id)
         ret_k = (
-            self.paged_k_cache[layer_id - self.begin_layer_id]
+            self.paged_k_cache[local_layer_id]
             if self.paged_k_cache is not None
             else None
         )
         ret_v = (
-            self.paged_v_cache[layer_id - self.begin_layer_id]
+            self.paged_v_cache[local_layer_id]
             if self.paged_v_cache is not None
             else None
         )
         if self.additional_paged_cache is not None:
             ret_add = {
-                key: cache[layer_id - self.begin_layer_id]
+                key: cache[local_layer_id]
                 for key, cache in self.additional_paged_cache.items()
             }
         else:
@@ -622,8 +720,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
 class DenseKVCacheManager(KVCacheManagerBase):
     def __init__(
         self,
-        begin_layer_id,
-        end_layer_id,
+        layer_id_map: GlobalLocalMap,
         *,
         num_hot_req: int,
         max_seq_len: int,
@@ -644,8 +741,7 @@ class DenseKVCacheManager(KVCacheManagerBase):
         """
 
         super().__init__(
-            begin_layer_id,
-            end_layer_id,
+            layer_id_map,
             num_hot_req=num_hot_req,
             max_seq_len=max_seq_len,
             k_shape_per_sample=k_shape_per_sample,
@@ -778,13 +874,14 @@ class DenseKVCacheManager(KVCacheManagerBase):
 
     @override
     def get_accessor(self, layer_id: int) -> DenseKVCacheAccessor:
+        local_layer_id = self.layer_id_map.to_local(layer_id)
         ret_k = (
-            self.k_prepared_cache[layer_id - self.begin_layer_id]
+            self.k_prepared_cache[local_layer_id]
             if self.k_prepared_cache is not None
             else None
         )
         ret_v = (
-            self.v_prepared_cache[layer_id - self.begin_layer_id]
+            self.v_prepared_cache[local_layer_id]
             if self.v_prepared_cache is not None
             else None
         )
