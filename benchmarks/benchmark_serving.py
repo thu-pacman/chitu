@@ -157,7 +157,7 @@ class BenchmarkServing:
                     f"{self.base_url}/v1/chat/completions",
                     headers={"Content-Type": "application/json"},
                     json=payload,
-                    timeout=300,
+                    timeout=1000,
                 ) as response:
                     if response.status == 200:
                         first_chunk_received = False
@@ -237,7 +237,7 @@ class BenchmarkServing:
                 f"{self.base_url}/v1/chat/completions",
                 headers={"Content-Type": "application/json"},
                 json=payload,
-                timeout=60,
+                timeout=1000,
             )
 
             if response.status_code != 200:

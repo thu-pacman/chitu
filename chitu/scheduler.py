@@ -323,7 +323,8 @@ class Scheduler:
                 for task_id in decode_task_ids
                 if task_needs_new_block(TaskPool.pool[task_id].req.request_id)
             )
-            num_need_blocks = min(num_need_blocks, self.prefill_num_tasks)
+            if num_need_blocks > self.decode_num_tasks:
+                return False
             num_free_blocks = Backend.cache_manager.num_free_blocks
             if num_free_blocks >= num_need_blocks:
                 return True
@@ -332,6 +333,7 @@ class Scheduler:
             )
             return False
 
+        evicted_tasks = []
         while not has_enough_block():
             if len(decode_task_ids) == 1:
                 prefix_len = TaskPool.pool[decode_task_ids[0]].prefix_tokens_len
@@ -340,6 +342,12 @@ class Scheduler:
                 )
             need_evict_task_id = decode_task_ids.pop()
             self.evict_decode_task(need_evict_task_id)
+            evicted_tasks.append(need_evict_task_id)
+
+        if len(evicted_tasks) > 0:
+            logger.warning(
+                f"KV cache capacity reached limit, forcing eviction of {len(evicted_tasks)} decode tasks, this may impact throughput and latency. To prevent performance degradation, consider increasing max_reqs or num_blocks."
+            )
 
         return decode_task_ids
 

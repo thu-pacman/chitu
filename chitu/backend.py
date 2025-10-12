@@ -12,7 +12,7 @@ from enum import Enum
 from glob import glob
 from logging import getLogger
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Deque, Optional
+from typing import TYPE_CHECKING, Callable, Deque, Optional, Iterable
 import torch
 import torch.distributed as dist
 from safetensors.torch import safe_open
@@ -27,7 +27,7 @@ from chitu.attn_backend import (
     NpuAttnBackend,
     HybridAttnBackend,
 )
-from chitu.cache_manager import DenseKVCacheManager, PagedKVCacheManager
+from chitu.cache_manager import DenseKVCacheManager, PagedKVCacheManager, GlobalLocalMap
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
 from chitu.distributed.parallel_state import get_pp_group, initialize_parallel_groups
@@ -256,7 +256,7 @@ class Backend:
             return ChatFormat(Backend.tokenizer)
 
     @staticmethod
-    def _init_cache_manager(args):
+    def _init_cache_manager(args, layer_filter_fn=lambda x: x, num_blocks: int = None):
         """
         Initialize the appropriate KV cache manager based on configuration.
 
@@ -287,6 +287,9 @@ class Backend:
             local_begin_layer_id = 0
             local_end_layer_id = args.models.n_layers
 
+        local_layers = layer_filter_fn(range(local_begin_layer_id, local_end_layer_id))
+        layer_id_map = GlobalLocalMap.from_list(local_layers)
+
         # Configure KV cache parameters based on model type
         kv_cache_kvargs = Backend._get_kv_cache_params(args)
 
@@ -297,20 +300,18 @@ class Backend:
                 block_size = 128
 
             return PagedKVCacheManager(
-                local_begin_layer_id,
-                local_end_layer_id,
+                layer_id_map,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
                 // args.infer.dp_size,
                 block_size=block_size,
-                num_blocks=args.infer.num_blocks,
+                num_blocks=args.infer.num_blocks if num_blocks is None else num_blocks,
                 device=local_rank,
                 **kv_cache_kvargs,
             )
         elif args.infer.cache_type == "skew":
             return DenseKVCacheManager(
-                local_begin_layer_id,
-                local_end_layer_id,
+                layer_id_map,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
                 // args.infer.dp_size,
@@ -321,7 +322,9 @@ class Backend:
             raise ValueError(f"Unknown cache type {args.infer.cache_type}")
 
     @staticmethod
-    def _init_linear_attn_cache_manager(args):
+    def _init_linear_attn_cache_manager(
+        args, layer_filter_fn=lambda x: x, num_blocks: int = None
+    ):
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         if args.infer.op_impl == "cpu":
             local_rank = "cpu"
@@ -343,23 +346,27 @@ class Backend:
             local_begin_layer_id = 0
             local_end_layer_id = args.models.n_layers
 
+        local_layers = layer_filter_fn(range(local_begin_layer_id, local_end_layer_id))
+        layer_id_map = GlobalLocalMap.from_list(local_layers)
+
         additional_cache_shape_dict = Backend._get_linear_attn_cache_params(args)
 
         return PagedKVCacheManager(
-            local_begin_layer_id,
-            local_end_layer_id,
+            layer_id_map,
             max_seq_len=args.infer.max_seq_len,
             num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
             // args.infer.dp_size,
             block_size=1,
-            num_blocks=args.infer.num_blocks,
+            num_blocks=args.infer.num_blocks if num_blocks is None else num_blocks,
             device=local_rank,
             additional_cache_shape_dict=additional_cache_shape_dict,
             lazy_mode=True,
         )
 
     @staticmethod
-    def _init_indexer_cache_manager(args):
+    def _init_indexer_cache_manager(
+        args, layer_filter_fn=lambda x: x, num_blocks: int = None
+    ):
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         if args.infer.op_impl == "cpu":
             local_rank = "cpu"
@@ -379,6 +386,9 @@ class Backend:
         else:
             local_begin_layer_id = 0
             local_end_layer_id = args.models.n_layers
+
+        local_layers = layer_filter_fn(range(local_begin_layer_id, local_end_layer_id))
+        layer_id_map = GlobalLocalMap.from_list(local_layers)
 
         # Shapes for indexer caches
         index_head_dim = getattr(args.models, "index_head_dim", None)
@@ -412,8 +422,7 @@ class Backend:
         )
 
         return PagedKVCacheManager(
-            local_begin_layer_id,
-            local_end_layer_id,
+            layer_id_map,
             max_seq_len=args.infer.max_seq_len,
             num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
             // args.infer.dp_size,
@@ -837,18 +846,48 @@ class Backend:
         Backend.formatter = Backend._init_formatter(args)
 
         # Initialize cache manager
-        Backend.cache_manager = Backend._init_cache_manager(args)
-        Backend.cache_type = args.infer.cache_type
-
         if args.models.type == "hf-qwen3-next":
-            Backend.linear_attn_cache_manager = Backend._init_linear_attn_cache_manager(
-                args
+
+            def is_full_attention(layer_id):
+                return (layer_id + 1) % args.models.full_attention_interval == 0
+
+            def filter_full_attn_layer(layers: Iterable[int]):
+                return [idx for idx in layers if is_full_attention(idx)]
+
+            def filter_linear_attn_layer(layers: Iterable[int]):
+                return [idx for idx in layers if not is_full_attention(idx)]
+
+            num_full_attn_blocks = (
+                args.infer.num_blocks
+                if args.models.num_full_attention_blocks == -1
+                else args.models.num_full_attention_blocks
             )
-        # Initialize indexer cache manager (paged additional caches), following linear attention pattern
-        if getattr(args.models, "type", "") == "deepseek-v3" and getattr(
+            num_linear_attn_blocks = (
+                args.infer.num_blocks
+                if args.models.num_linear_attention_blocks == -1
+                else args.models.num_linear_attention_blocks
+            )
+
+            Backend.cache_type = args.infer.cache_type
+            Backend.cache_manager = Backend._init_cache_manager(
+                args,
+                layer_filter_fn=filter_full_attn_layer,
+                num_blocks=num_full_attn_blocks,
+            )
+            Backend.linear_attn_cache_manager = Backend._init_linear_attn_cache_manager(
+                args,
+                layer_filter_fn=filter_linear_attn_layer,
+                num_blocks=num_linear_attn_blocks,
+            )
+        elif getattr(args.models, "type", "") == "deepseek-v3" and getattr(
             args.models, "index_head_dim", None
         ):
+            Backend.cache_type = args.infer.cache_type
+            Backend.cache_manager = Backend._init_cache_manager(args)
             Backend.indexer_cache_manager = Backend._init_indexer_cache_manager(args)
+        else:
+            Backend.cache_manager = Backend._init_cache_manager(args)
+            Backend.cache_type = args.infer.cache_type
 
         # Initialize attention backend
         attn_backend = Backend._init_attention_backend(args)

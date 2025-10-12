@@ -151,6 +151,10 @@ def _auto_set_num_blocks_after_warmup(args):
         Backend.cache_manager.realloc(new_num_block)
         if torch.distributed.get_rank() == 0:
             Backend.scheduler.reset_kvcache_block_threshold()
+    else:
+        logger.info(
+            f"skip auto set num blocks after warmup because {args.infer.num_blocks=}"
+        )
 
 
 def _warmup_via_taskpool(args):

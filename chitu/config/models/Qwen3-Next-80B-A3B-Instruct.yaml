@@ -29,3 +29,5 @@ linear_n_v_heads: 32
 bos_token_id: 151643
 eos_token_id: 151645
 full_attention_interval: 4
+num_full_attention_blocks: -1 # kv cache blocks for full attention layers, could override num_blocks
+num_linear_attention_blocks: -1 # kv cache blocks for linear attention layers, could override num_blocks
