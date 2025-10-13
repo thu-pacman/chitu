@@ -44,3 +44,4 @@ from chitu.quantization.blockfp4 import (
     Blockfp4MoeExpertsPackNPUNative,
 )
 from chitu.quantization.q4km import MoeExpertsDeepSeekV3CPUInfer
+from chitu.quantization.hygon_utils import InXOutLinear
