@@ -289,7 +289,7 @@ class Transformer(nn.Module):
         ret = ["weight"]
         if quant == "blockfp8" or quant == "q4km":
             ret += ["scale"]
-        elif quant == "blockfp4":
+        elif quant == "blockfp4" or quant == "blockfp4_merged":
             ret += ["weight_scale", "weight_scale_2", "input_scale"]
         elif quant == "w4a8_per_token_per_channel_asymm":
             ret += ["qweight"]
@@ -477,13 +477,17 @@ class Transformer(nn.Module):
         return partial_checkpoint
 
     def process_state_dict_for_blockfp4_before_chunk(self, state_dict):
+
+        # TODO: move it into utils
+        BLOCKFP4_VARIANTS = ("blockfp4", "blockfp4_merged")
+
         state_dict_keys = list(state_dict.keys())
         for key in state_dict_keys:
             value = state_dict[key]
             quant = get_quant_from_checkpoint_prefix(
                 key, self.params.quant_config.rules
             )
-            if quant == "blockfp4" and (
+            if quant in BLOCKFP4_VARIANTS and (
                 key.endswith(".weight_scale_2") or key.endswith(".input_scale")
             ):
                 state_dict[key] = value.view(1, 1)
@@ -870,11 +874,10 @@ class MoeGate(nn.Module):
             self.topk_groups,
             self.e_score_correction_bias,
             self.score_func,
+            self.norm_prob,
         )
-        if self.norm_prob:
-            weights /= weights.sum(dim=-1, keepdim=True)
-
-        weights *= self.route_scale
+        if self.route_scale != 1:
+            weights *= self.route_scale
         return weights.type_as(x), indices.to(torch.int32)
 
 

@@ -614,6 +614,10 @@ def invoke_fused_moe_kernel(
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
+    # TODO: only for merged models
+    # if gate & up shares the weight scale 2, then w1w3 should be false
+    if B_scale2 is not None:
+        is_w1w3 = B_scale2.flatten().shape[0] >= 2 * B.shape[0]
     if use_fp4_w4a8:
         fused_moe_kernel_soft_fp4[grid](
             A,

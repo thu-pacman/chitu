@@ -57,6 +57,7 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> tuple[Any, bool]:
         "deep_gemm",
         "deep_ep",  # [TODO] add installation support
         "cpu",
+        "hard_fp4_kernels",
         "scipy",
         "fast_hadamard_transform",
     }

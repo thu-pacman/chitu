@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+quant: 
+- model: '.'
+  rules:
+    - regex : '\.gate_proj$'
+      type : blockfp4_merged
+    - regex : '\.gate$'
+      type : blockfp8
+      kwargs:
+        block_size : 128
+    - regex : '^layers\.'
+      type : blockfp4_merged

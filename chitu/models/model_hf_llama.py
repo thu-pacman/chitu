@@ -438,21 +438,34 @@ class TransformerHFLlama(Transformer):
     def _process_state_dict_for_splitting_qkv(self, checkpoint: Mapping[str, Any]):
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
-            if k.endswith(".qkv_proj.weight"):
-                prefix = k[: -len("qkv_proj.weight")]
-                assert prefix + "q_proj.weight" not in checkpoint
-                assert prefix + "k_proj.weight" not in checkpoint
-                assert prefix + "v_proj.weight" not in checkpoint
+            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            if any(
+                k.endswith(f".qkv_proj.{tensor_name}")
+                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant)
+            ):
+                tensor_name = k.split(".")[-1]
+                prefix = k[: -len(f"qkv_proj.{tensor_name}")]
+                assert prefix + f"q_proj.{tensor_name}" not in checkpoint
+                assert prefix + f"k_proj.{tensor_name}" not in checkpoint
+                assert prefix + f"v_proj.{tensor_name}" not in checkpoint
                 qkv_weight = checkpoint.pop(k)
+                if len(qkv_weight.shape) < 1 or qkv_weight.shape[0] == 1:
+                    checkpoint[k] = qkv_weight
+                    continue
                 n_heads = self.params.n_heads
                 n_kv_heads = (
                     self.params.n_heads
                     if self.params.n_kv_heads is None
                     else self.params.n_kv_heads
                 )
-                head_dim = self.params.dim // n_heads
+                # head_dim = self.params.dim // n_heads
                 # maybe fix?
-                # head_dim = (self.params.head_dim if hasattr(self.params, "head_dim") else self.params.dim // n_heads)
+                head_dim = (
+                    self.params.head_dim
+                    if hasattr(self.params, "head_dim")
+                    else self.params.dim // n_heads
+                )
 
                 q_weight, k_weight, v_weight = qkv_weight.split(
                     [
@@ -462,37 +475,9 @@ class TransformerHFLlama(Transformer):
                     ],
                     dim=0,
                 )
-                checkpoint[prefix + "q_proj.weight"] = q_weight
-                checkpoint[prefix + "k_proj.weight"] = k_weight
-                checkpoint[prefix + "v_proj.weight"] = v_weight
-            elif k.endswith(".qkv_proj.bias"):
-                prefix = k[: -len("qkv_proj.bias")]
-                assert prefix + "q_proj.bias" not in checkpoint
-                assert prefix + "k_proj.bias" not in checkpoint
-                assert prefix + "v_proj.bias" not in checkpoint
-                qkv_bias = checkpoint.pop(k)
-                n_heads = self.params.n_heads
-                n_kv_heads = (
-                    self.params.n_heads
-                    if self.params.n_kv_heads is None
-                    else self.params.n_kv_heads
-                )
-
-                head_dim = self.params.dim // n_heads
-                # maybe fix?
-                # head_dim = (self.params.head_dim if hasattr(self.params, "head_dim") else self.params.dim // n_heads)
-
-                q_bias, k_bias, v_bias = qkv_bias.split(
-                    [
-                        n_heads * head_dim,
-                        n_kv_heads * head_dim,
-                        n_kv_heads * head_dim,
-                    ],
-                    dim=0,
-                )
-                checkpoint[prefix + "q_proj.bias"] = q_bias
-                checkpoint[prefix + "k_proj.bias"] = k_bias
-                checkpoint[prefix + "v_proj.bias"] = v_bias
+                checkpoint[prefix + f"q_proj.{tensor_name}"] = q_weight
+                checkpoint[prefix + f"k_proj.{tensor_name}"] = k_weight
+                checkpoint[prefix + f"v_proj.{tensor_name}"] = v_weight
             else:
                 continue
         return checkpoint
@@ -500,22 +485,23 @@ class TransformerHFLlama(Transformer):
     def _process_state_dict_for_splitting_gate_up(self, checkpoint: Mapping[str, Any]):
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
-            if k.endswith(".gate_up_proj.weight"):
-                prefix = k[: -len("gate_up_proj.weight")]
-                assert prefix + "gate_proj.weight" not in checkpoint
-                assert prefix + "up_proj.weight" not in checkpoint
+            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            if any(
+                k.endswith(f".gate_up_proj.{tensor_name}")
+                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant)
+            ):
+                tensor_name = k.split(".")[-1]
+                prefix = k[: -len(f"gate_up_proj.{tensor_name}")]
+                assert prefix + f"gate_proj.{tensor_name}" not in checkpoint
+                assert prefix + f"up_proj.{tensor_name}" not in checkpoint
                 gate_up_weight = checkpoint.pop(k)
+                if len(gate_up_weight.shape) < 1 or gate_up_weight.shape[0] == 1:
+                    checkpoint[k] = gate_up_weight
+                    continue
                 gate_weight, up_weight = torch.chunk(gate_up_weight, 2, dim=0)
-                checkpoint[prefix + "gate_proj.weight"] = gate_weight
-                checkpoint[prefix + "up_proj.weight"] = up_weight
-            elif k.endswith(".gate_up_proj.bias"):
-                prefix = k[: -len("gate_up_proj.bias")]
-                assert prefix + "gate_proj.bias" not in checkpoint
-                assert prefix + "up_proj.bias" not in checkpoint
-                gate_up_bias = checkpoint.pop(k)
-                gate_bias, up_bias = torch.chunk(gate_up_bias, 2, dim=0)
-                checkpoint[prefix + "gate_proj.bias"] = gate_bias
-                checkpoint[prefix + "up_proj.bias"] = up_bias
+                checkpoint[prefix + f"gate_proj.{tensor_name}"] = gate_weight
+                checkpoint[prefix + f"up_proj.{tensor_name}"] = up_weight
             else:
                 continue
         return checkpoint

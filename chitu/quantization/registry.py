@@ -39,6 +39,7 @@ class QuantizationRegistry:
     ] = {}
 
     _allowed_quant_for_merge_gate_up: list = [
+        "blockfp4_merged",
         "blockfp8",
         "autoawq",
         "simple_w8a8",
@@ -47,6 +48,7 @@ class QuantizationRegistry:
         None,
     ]
     _allowed_quant_for_merge_qkv: list = [
+        "blockfp4_merged",
         "blockfp8",
         "autoawq",
         "simple_w8a8",
@@ -134,10 +136,10 @@ class QuantizationRegistry:
                 f"No available implementation for quantization method: {method}, backend: {backend_type}"
             )
 
-        for key in quant_kwargs:
-            if key not in backend_impls:
+        if method in quant_kwargs:
+            if method not in backend_impls:
                 raise ValueError(
-                    f"Unknown quantization method in `quant_kwargs`: {key}"
+                    f"Unknown quantization method in `quant_kwargs`: {method}"
                 )
 
         if method in quant_kwargs:
