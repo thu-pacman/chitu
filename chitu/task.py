@@ -710,7 +710,7 @@ class PackedTasksBase:
             has_outputs=has_outputs,
         )
 
-    def serialize(self, device, payload_type=SerializedPackedTasksPayloadType.NoneType):
+    def serialize(self, device):
         payload_type = self.payload_type
         assert (
             PackedTasksBase.configured
@@ -724,7 +724,9 @@ class PackedTasksBase:
             return ret.to(device)
 
         encoded_ids = torch.tensor(
-            [req_encode(self.task_type, tid) for tid in self.task_ids], device="cpu"
+            [req_encode(self.task_type, tid) for tid in self.task_ids],
+            dtype=ret.dtype,
+            device="cpu",
         )
         ret[torch.arange(2, 2 + self.num_tasks, device="cpu")] = encoded_ids
 
@@ -789,6 +791,7 @@ class PackedTasks(PackedTasksBase):
                 self.task_type = TaskType.EmptyDecode
             else:
                 assert False
+            self.payload_type = SerializedPackedTasksPayloadType(self.task_type.value)
             return
 
         # metadata

@@ -51,3 +51,9 @@ def is_blackwell():
     BLACKWELL_DEVICE_PATTERNS = ["5090", "B200", "B100"]
     device_name = get_device_name()
     return any(pattern in device_name for pattern in BLACKWELL_DEVICE_PATTERNS)
+
+
+def is_hygon():
+    HYGON_DEVICE_PATTERNS = ["BW"]
+    device_name = get_device_name()
+    return any(pattern in device_name for pattern in HYGON_DEVICE_PATTERNS)

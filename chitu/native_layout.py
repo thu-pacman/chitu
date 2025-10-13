@@ -826,7 +826,6 @@ class MarlinNativeLayoutWeight(NativeLayoutTensor):
                 .contiguous()
             )
             new_weight = b16_repack.view(b16_repack.shape[0], -1).view(torch.uint32)
-            # torch.distributed.breakpoint()
             return cls(
                 [n, k],
                 new_weight,
@@ -899,3 +898,19 @@ class MarlinNativeLayoutGroupWeight(NativeLayoutTensor):
             raise TypeError(
                 f"Cannot convert from {type(tensor)} to MarlinNativeLayoutGroupWeight"
             )
+
+
+@dataclass
+class InXOutWeight(NativeLayoutTensor):
+    @classmethod
+    @override
+    def convert_from(cls, tensor: torch.Tensor) -> "InXOutWeight":
+
+        if isinstance(tensor, torch.Tensor):
+            tensor = tensor.t().contiguous()
+            return cls(
+                tensor.shape,
+                tensor,
+            )
+        else:
+            raise TypeError(f"Cannot convert from {type(tensor)} to InXOutWeight")
