@@ -143,6 +143,7 @@ def test_nvfp4_gemm(
 
     rounded_m = round_up(m, 128)
     rounded_n = round_up(n, 128)
+    rounded_k = round_up(k, 256)
     a_dtype = pad_tensor_to_size(a_dtype, rounded_m)
     b_dtype = pad_tensor_to_size(b_dtype, rounded_n)
 
@@ -169,8 +170,34 @@ def test_nvfp4_gemm(
         block_size,
         device,
     )
-    out = cutlass_scaled_fp4_mm(
-        a_fp4, a_scale_interleaved, b_fp4, b_scale_interleaved, alpha, dtype
+    out_1 = cutlass_scaled_fp4_mm(
+        a_fp4,
+        a_scale_interleaved,
+        b_fp4,
+        b_scale_interleaved,
+        alpha,
+        dtype,
+        batch_size_threshold=0,
+    )
+    a_padded = a_dtype.new_zeros((rounded_m, rounded_k))
+    a_padded[:m, :k] = a_dtype[:m, :k]
+    b_padded = b_dtype.new_zeros((rounded_n, rounded_k))
+    b_padded[:n, :k] = b_dtype[:n, :k]
+    a_padded_fp4, a_padded_scale = ops.blockfp4_act_quant(a_padded, a_global_scale)
+    b_padded_fp4, b_padded_scale = ops.blockfp4_act_quant(b_padded, b_global_scale)
+    out_2 = cutlass_scaled_fp4_mm(
+        a_padded_fp4,
+        convert_swizzled_to_linear(a_padded_scale, rounded_m, rounded_k, 16),
+        b_padded_fp4,
+        b_padded_scale,
+        alpha,
+        dtype,
+        batch_size_threshold=1e20,
     )
 
-    torch.testing.assert_close(out, expected_out.to(dtype=dtype), atol=2e-1, rtol=1e-1)
+    torch.testing.assert_close(
+        out_1, expected_out.to(dtype=dtype), atol=2e-1, rtol=1e-1
+    )
+    torch.testing.assert_close(
+        out_2, expected_out.to(dtype=dtype), atol=2e-1, rtol=1e-1
+    )

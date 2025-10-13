@@ -13,6 +13,9 @@ from chitu.utils import try_import_platform_dep, try_import_opt_dep
 
 triton, has_triton = try_import_platform_dep("triton")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+hard_fp4_kernels, has_hard_fp4_kernels = try_import_opt_dep(
+    "hard_fp4_kernels", "hard_fp4_kernels"
+)
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 if has_triton:
@@ -222,15 +225,25 @@ def cutlass_scaled_fp4_mm(
     weight_scale: torch.Tensor,
     alpha,
     out_dtype: torch.dtype,
+    batch_size_threshold=128,
 ) -> torch.Tensor:
     # reference: https://github.com/vllm-project/vllm/blob/a7b8788d2c2fae6bf52c128916de19e85f2b0a25/vllm/_custom_ops.py#L663
 
     assert x.ndim == 2 and weight.ndim == 2
     if not isinstance(alpha, torch.Tensor):
         alpha = torch.tensor(alpha, dtype=torch.float32, device=x.device)
-    m, n = x.shape[0], weight.shape[0]
+    m, n, k = x.shape[0], weight.shape[0], x.shape[1] * 2
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
-    chitu_backend.cuda_nvfp4_scaled_mm(out, x, weight, x_scale, weight_scale, alpha)
+    cuda_nvfp4_scaled_mm_kernel = (
+        (
+            hard_fp4_kernels.cuda_nvfp4_scaled_mm_decode
+            if m <= batch_size_threshold and k % 256 == 0
+            else hard_fp4_kernels.cuda_nvfp4_scaled_mm
+        )
+        if has_hard_fp4_kernels
+        else chitu_backend.cuda_nvfp4_scaled_mm
+    )
+    cuda_nvfp4_scaled_mm_kernel(out, x, weight, x_scale, weight_scale, alpha)
     return out
 
 
@@ -238,7 +251,7 @@ def cutlass_scaled_fp4_mm(
 
 
 @single_dispatch_lazy_tensor
-def blockfp4_gemm(
+def blockfp4_gemm_chitu_backend(
     x: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -246,7 +259,6 @@ def blockfp4_gemm(
     alpha: torch.Tensor,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    assert is_blackwell()
     original_shape = x.shape
     original_lines = x.numel() // x.shape[-1]
 
@@ -267,6 +279,74 @@ def blockfp4_gemm(
 
     y = cutlass_scaled_fp4_mm(
         x, x_scale, weight, weight_scale.view(torch.float8_e4m3fn), alpha, out_dtype
+    )[:original_lines]
+    y = y.view(*original_shape[:-1], -1)
+    return y
+
+
+@single_dispatch_lazy_tensor
+def blockfp4_act_quant_gemm(
+    input: torch.Tensor, weight_scale_2: torch.Tensor, swizzled: bool = True
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert input.ndim >= 1, f"input.ndim needs to be >= 1, but got {input.ndim}."
+    assert input.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ), f"input.dtype needs to be fp16 or bf16 but got {input.dtype}."
+    input_shape = input.size()
+    input = input.view((-1, input_shape[-1]))
+    m, n = input.shape
+    # output size is n / 2(fp4 2 8bit)
+    # output scale size is (n / 16(block)) / 4(fp8 2 32bit)
+    rounded_m = (m + 127) // 128 * 128 if swizzled else m
+    rounded_n = (n + 63) // 64 * 4
+    output = torch.empty((m, n // 2), device=input.device, dtype=torch.uint8)
+    output_scale = torch.empty(
+        (rounded_m, rounded_n // 4), device=input.device, dtype=torch.int32
+    )
+    alpha = torch.empty_like(weight_scale_2)
+    quant_kernel = hard_fp4_kernels.cuda_scaled_fp4_quant_with_alpha
+    quant_kernel(output, input, output_scale, alpha, weight_scale_2, swizzled=swizzled)
+    return output, output_scale.view(torch.float8_e4m3fn), alpha
+
+
+@single_dispatch_lazy_tensor
+def blockfp4_gemm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    batch_size_threshold: int = 128,
+) -> torch.Tensor:
+    assert is_blackwell()
+    if not has_hard_fp4_kernels:
+        return blockfp4_gemm_chitu_backend(
+            x, weight, weight_scale, weight_scale_2, alpha, out_dtype
+        )
+    original_shape = x.shape
+    original_lines = x.numel() // x.shape[-1]
+
+    if x.ndim > 2:
+        x = x.view(-1, x.shape[-1])
+    # fp4_scaled_mm kernel requires the first dimension of the input matrix to be a multiple of 128
+    # x = pad_tensor_to_size(x, rounded_m)
+    if x.shape[0] <= batch_size_threshold:
+        x, x_scale, _alpha = blockfp4_act_quant_gemm(x, weight_scale_2, swizzled=False)
+    else:
+        x, x_scale, _alpha = blockfp4_act_quant_gemm(x, weight_scale_2, swizzled=True)
+    if alpha is None:
+        alpha = _alpha
+
+    y = cutlass_scaled_fp4_mm(
+        x,
+        x_scale,
+        weight,
+        weight_scale.view(torch.float8_e4m3fn),
+        alpha,
+        out_dtype,
+        batch_size_threshold,
     )[:original_lines]
     y = y.view(*original_shape[:-1], -1)
     return y

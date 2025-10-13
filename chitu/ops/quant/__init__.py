@@ -28,7 +28,6 @@ from chitu.ops.quant.blockfp4 import (
     pack_every_two_fp4_e2m1_in_uint8_to_one_uint8,
     to_fp4_e2m1_in_uint8,
     fp4_fake_quant,
-    convert_linear_to_swizzled,
 )
 from chitu.ops.quant.w8a8_per_token_per_channel import (
     w8a8_gemm_per_token_per_channel,

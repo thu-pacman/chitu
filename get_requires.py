@@ -20,7 +20,7 @@ install_requires = [
     #    torch back to the official version, please use `-c` on `pip`.
     "torch",
     "torchvision",
-    "transformers[torch]",
+    "transformers[torch]<4.57.0",
     "safetensors",
     "fire",
     "tiktoken>=0.7.0",  # Required by glm4
@@ -95,6 +95,10 @@ extras_require = {
     "deep_ep": [
         "deep_ep @ file://localhost" + os.path.join(setup_dir, "third_party/DeepEP"),
     ],  # export NVSHMEM_DIR=/path/to/installed/nvshmem
+    "hard_fp4_kernels": [
+        "hard_fp4_kernels @ file://localhost"
+        + os.path.join(setup_dir, "third_party/hard_fp4_kernels"),
+    ],
     "scipy": ["scipy"],
     "fast_hadamard_transform": [
         "fast-hadamard-transform @ file://localhost"

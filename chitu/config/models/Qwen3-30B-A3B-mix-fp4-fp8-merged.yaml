@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - Qwen3-30B-A3B
+  - quant_config: mix-fp4-fp8-merged
+  - _self_ # Config in this file overrides configs in defaults
+
+
+name: Qwen3-30B-A3B-mix-fp4-fp8
+source: "(This is an internal quantized model, only for testing purpose)" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.

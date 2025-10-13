@@ -630,7 +630,7 @@ class Backend:
         Returns:
             Initialized model architecture
         """
-        if args.models.type == "deepseek-v3":
+        if args.models.type in ["deepseek-v3", "hf-qwen-3-moe"]:
             QuantizationRegistry._allowed_quant_for_merge_gate_up.append("blockfp4")
 
         model_parallel_size = args.infer.tp_size
@@ -754,7 +754,10 @@ class Backend:
                 if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
                     if quant == "blockfp8" and checkpoint[k].element_size() == 1:
                         checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
-                if quant == "blockfp4" and checkpoint[k].element_size() == 1:
+                if (
+                    quant in ("blockfp4", "blockfp4_merged")
+                    and checkpoint[k].element_size() == 1
+                ):
                     checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
             model.load_state_dict_parallel(
                 checkpoint,

@@ -85,10 +85,13 @@ FROM dependency_installer AS wheel_builder
 WORKDIR /workspace/chitu
 COPY . .
 
+RUN cd /workspace/chitu/third_party/hard_fp4_kernels && python setup.py bdist_wheel
+RUN cd /workspace/chitu && python setup.py bdist_wheel
 # build wheel of chitu
 RUN ./script/build_for_dist.sh "${enable_cython}"
 
 # verify the wheel was created
+RUN cp third_party/hard_fp4_kernels/dist/*.whl /tmp/
 RUN cp dist/*.whl /tmp/
 RUN ls -al /tmp/
 

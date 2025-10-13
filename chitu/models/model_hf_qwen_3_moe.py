@@ -79,9 +79,11 @@ class ParallelMoeBlockQwen3(ParallelMoeBlock):
         base_moe_experts_class: Optional[type] = None,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
     ):
-
+        quant_kwargs = {"blockfp4": {}, "blockfp4_merged": {}}
         if hasattr(args, "no_input_scale"):
-            quant_kwargs = {"blockfp4": {"no_input_scale": args.no_input_scale}}
+            quant_kwargs["blockfp4"]["no_input_scale"] = args.no_input_scale
+            quant_kwargs["blockfp4_merged"]["no_input_scale"] = args.no_input_scale
+        quant_kwargs["blockfp4_merged"]["merged_global_scale"] = True
 
         super().__init__(
             gate=Qwen3MoeGate(args, op_impl),

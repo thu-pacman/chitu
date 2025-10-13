@@ -43,7 +43,6 @@ from chitu.ops.quant import (
     blockfp4_gemm,
     blockfp4_act_quant,
     mixq_gemm,
-    convert_linear_to_swizzled,
     blockfp8_index_score_dense_dsv32,
     blockfp8_index_score_ragged_q_dense_k_dsv32,
     blockfp8_index_score_ragged_q_paged_k_dsv32,

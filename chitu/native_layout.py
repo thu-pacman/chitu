@@ -725,6 +725,77 @@ class SqueezeLastSingleton(NativeLayoutTensor):
 
 
 @dataclass
+class LinearScaleToSwizzled(NativeLayoutTensor):
+    """
+    Convert the linear scale (of fp4 quantization) layout to swizzled scale layout.
+    Padding the tensor from [..., m, k] to [..., round_up(m, 128), k]
+
+    The linear layout is (..., m / 128, 4, 32, k / 4, 4)
+    The swizzled layout is (..., m / 128, k / 4, 32, 4, 4)
+    """
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(cls, tensor: torch.Tensor) -> "LinearScaleToSwizzled":
+        shape = tensor.shape
+        m, k = shape[-2], shape[-1]
+        # padding
+        if m % 128 != 0:
+            padded_m = (m + 128 - 1) // 128 * 128
+            shape = (*shape[:-2], padded_m, k)
+            new_tensor = torch.zeros(shape, dtype=tensor.dtype, device=tensor.device)
+            new_tensor[..., :m, :k] = tensor
+            tensor = new_tensor
+            m = padded_m
+        # transform
+        tensor = (
+            tensor.reshape((-1, m // 128, 4, 32, k // 4, 4))
+            .permute(0, 1, 4, 3, 2, 5)
+            .reshape(shape)
+        )
+        return cls(plain_shape=tensor.shape, layout_tensor=tensor)
+
+    @override
+    def convert_to_plain(self) -> torch.Tensor:
+        return self.layout_tensor
+
+
+@dataclass
+class SwizzledScaleToLinear(NativeLayoutTensor):
+    """
+    Convert the swizzled scale (of fp4 quantization) layout to linear scale layout.
+    Input tensor should be [..., m = 128 * t, k]
+
+    The swizzled layout is (..., m / 128, k / 4, 32, 4, 4)
+    The linear layout is (..., m / 128, 4, 32, k / 4, 4)
+    """
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(
+        cls, tensor: torch.Tensor, m: int = 0, k: int = 0
+    ) -> "SwizzledScaleToLinear":
+        shape = tensor.shape
+        shape_m, shape_k = shape[-2], shape[-1]
+        m = m or shape_m
+        k = k or shape_k
+        # transform
+        tensor = (
+            tensor.reshape((-1, shape_m // 128, shape_k // 4, 32, 4, 4))
+            .permute(0, 1, 4, 3, 2, 5)
+            .reshape(shape)[..., :m, :k]
+            .contiguous()
+        )
+        return cls(plain_shape=tensor.shape, layout_tensor=tensor)
+
+    @override
+    def convert_to_plain(self) -> torch.Tensor:
+        return self.layout_tensor
+
+
+@dataclass
 class MarlinNativeLayoutWeight(NativeLayoutTensor):
     @classmethod
     @override

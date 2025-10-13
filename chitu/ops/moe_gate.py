@@ -22,6 +22,9 @@ muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
 )
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
+hard_fp4_kernels, has_hard_fp4_kernels = try_import_opt_dep(
+    "hard_fp4_kernels", "hard_fp4_kernels"
+)
 
 
 def moe_gate(
@@ -31,6 +34,7 @@ def moe_gate(
     topk_group: int,
     e_score_correction_bias: Optional[torch.Tensor],
     score_func: str,
+    norm_prob: bool = False,
     impl: str = "auto",
 ):
     """
@@ -46,6 +50,7 @@ def moe_gate(
         e_score_correction_bias (torch.Tensor): Bias added after normalization (softmax/sigmoid)
             and before selecting.
         score_func (str): "softmax" or "sigmoid"
+        norm_prob (bool): True if the output weight need to be normalized. Default False.
 
     Returns:
         [0] (torch.Tensor): indices. indices[i, j] is the index of the j-th selected expert
@@ -70,6 +75,13 @@ def moe_gate(
             impl = "muxi"
         elif get_global_args().infer.op_impl == "cpu":
             impl = "cpu"
+        elif (
+            has_hard_fp4_kernels
+            and scores.shape[-1] <= 256
+            and is_power_of_two(scores.shape[-1])
+            and score_func in ["softmax"]
+        ):
+            impl = "blackwell"
         elif (
             has_chitu_backend
             and scores.shape[-1] <= 256
@@ -103,6 +115,7 @@ def moe_gate(
             topk_group,
             e_score_correction_bias,
             score_func,
+            norm_prob,
         )
     elif impl == "cuda":
         return moe_gate_cuda(
@@ -112,6 +125,7 @@ def moe_gate(
             topk_group,
             e_score_correction_bias,
             score_func,
+            norm_prob,
         )
     elif impl == "muxi":
         return moe_gate_muxi(
@@ -125,6 +139,7 @@ def moe_gate(
                 else e_score_correction_bias.type_as(scores)
             ),
             score_func=score_func,
+            norm_prob=norm_prob,
         )
     elif impl == "cpu":
         return moe_gate_cpu(
@@ -134,6 +149,7 @@ def moe_gate(
             topk_group,
             e_score_correction_bias,
             score_func,
+            norm_prob,
         )
     elif impl == "npu":
         return moe_gate_npu(
@@ -143,13 +159,30 @@ def moe_gate(
             topk_group,
             e_score_correction_bias,
             score_func,
+            norm_prob,
+        )
+    elif impl == "blackwell":
+        return moe_gate_blackwell(
+            scores,
+            topk,
+            num_expert_group,
+            topk_group,
+            e_score_correction_bias,
+            score_func,
+            norm_prob,
         )
     else:
         raise ValueError(f"Unsupported implementation of moe_gate: {impl}")
 
 
 def moe_gate_torch(
-    scores, topk, num_expert_group, topk_group, e_score_correction_bias, score_func: str
+    scores,
+    topk,
+    num_expert_group,
+    topk_group,
+    e_score_correction_bias,
+    score_func: str,
+    norm_prob=False,
 ):
     B = scores.shape[0]
     if score_func == "softmax":
@@ -174,11 +207,19 @@ def moe_gate_torch(
         scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
     indices = torch.topk(scores, topk, dim=-1).indices
     weights = original_scores.gather(1, indices)
+    if norm_prob:
+        weights /= weights.sum(dim=-1, keepdim=True)
     return indices, weights
 
 
 def moe_gate_cuda(
-    scores, topk, num_expert_group, topk_group, e_score_correction_bias, score_func: str
+    scores,
+    topk,
+    num_expert_group,
+    topk_group,
+    e_score_correction_bias,
+    score_func: str,
+    norm_prob=False,
 ):
     if score_func == "softmax":
         # This branch is originally from from SGLang, licensed under Apache 2.0.
@@ -211,6 +252,8 @@ def moe_gate_cuda(
             token_expert_indices,
             scores.float(),
         )
+        if norm_prob:
+            topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
         return topk_ids, topk_weights
 
     elif score_func == "sigmoid":
@@ -231,6 +274,10 @@ def moe_gate_cuda(
             topk,
             e_score_correction_bias,
         )
+        if norm_prob:
+            selected_experts_weights /= selected_experts_weights.sum(
+                dim=-1, keepdim=True
+            )
         return expertsIds, selected_experts_weights
 
     else:
@@ -244,6 +291,7 @@ def moe_gate_muxi(
     topk_group: int = 0,
     e_score_correction_bias: Optional[torch.Tensor] = None,
     score_func: str = "softmax",
+    norm_prob: bool = False,
 ):
     assert (
         score_func == "softmax" or score_func == "sigmoid"
@@ -281,6 +329,8 @@ def moe_gate_muxi(
         topk,
         e_score_correction_bias,
     )
+    if norm_prob:
+        selected_experts_weights /= selected_experts_weights.sum(dim=-1, keepdim=True)
 
     return expertsIds, selected_experts_weights
 
@@ -292,6 +342,7 @@ def moe_gate_cpu(
     topk_group,
     e_score_correction_bias=None,
     score_func="softmax",
+    norm_prob: bool = False,
 ):
     if scores.device.type != "cpu":
         raise ValueError(
@@ -347,6 +398,8 @@ def moe_gate_cpu(
         )
     )
     cpu_infer.sync()
+    if norm_prob:
+        weights /= weights.sum(dim=-1, keepdim=True)
 
     return indices, weights
 
@@ -358,6 +411,7 @@ def moe_gate_npu(
     topk_group,
     e_score_correction_bias=None,
     score_func="softmax",
+    norm_prob: bool = False,
 ):
     B = scores.shape[0]
     if score_func == "softmax":
@@ -388,4 +442,33 @@ def moe_gate_npu(
             routed_scaling_factor=1.0,
             eps=1e-20,
         )
+    if norm_prob:
+        weights /= weights.sum(dim=-1, keepdim=True)
+    return indices, weights
+
+
+def moe_gate_blackwell(
+    scores,
+    topk,
+    num_expert_group,
+    topk_group,
+    e_score_correction_bias=None,
+    score_func="softmax",
+    norm_prob: bool = False,
+):
+    num_tokens = scores.shape[0]
+    indices = torch.empty((num_tokens, topk), dtype=torch.int32, device=scores.device)
+    weights = torch.empty((num_tokens, topk), dtype=scores.dtype, device=scores.device)
+    if score_func == "softmax":
+        hard_fp4_kernels.cuda_nvfp4_moe_gate_softmax(
+            num_expert_group,
+            topk_group,
+            norm_prob,
+            indices,
+            weights,
+            scores,
+            e_score_correction_bias,
+        )
+    else:
+        raise ValueError(f"Unsupported score function: {score_func}")
     return indices, weights
