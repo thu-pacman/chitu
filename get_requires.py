@@ -44,6 +44,7 @@ extras_require = {
         "bitsandbytes",
         "autoawq-kernels==0.0.8",
         "autoawq[kernels]",
+        "transformers<=4.56.2",  # <=4.56.2 is required by autoawq-kernels==0.0.8. Feel free to remove this line after upgrading autoawq-kernels. Don't move this restriction out of `quant`.
         "gptqmodel>=2.2.0,<4.2.5",
         "tokenizers>=0.20.3",
     ],
