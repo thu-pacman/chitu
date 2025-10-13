@@ -50,8 +50,25 @@ class CommGroup:
         return self.rank_list[(rank_in_group - 1) % group_size]
 
     @property
+    def is_first_rank(self):
+        """
+        Return True if the caller is the first rank in the group
+
+        E.g, in DP 2 TP 2 case, there are 2 TP groups: [0, 1] and [2, 3]. This
+        function for the TP CommGroup returns True for caller in rank 0 and 2,
+        and returns False for caller in rank 1 and 3.
+        """
+        return self.global_rank == self.rank_list[0]
+
+    @property
     def is_last_rank(self):
-        """Return True if the caller is the last rank in the group"""
+        """
+        Return True if the caller is the last rank in the group
+
+        E.g, in DP 2 TP 2 case, there are 2 TP groups: [0, 1] and [2, 3]. This
+        function for the TP CommGroup returns True for caller in rank 1 and 3,
+        and returns False for caller in rank 0 and 2.
+        """
         return self.global_rank == self.rank_list[-1]
 
     def __str__(self):

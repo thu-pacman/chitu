@@ -73,22 +73,53 @@ class BatchResult:
 
 
 class TasksDispatcher(ABC):
-    def __init__(self):
-        pass
+    """
+    Communication interface for a parallelism
 
-    # dispatch metadata from previous worker and send to next
+    General workflow:
+    1. `Executor` calls `dispatch_metadata` of this interface to let all corresponding
+        ranks know the task meta data.
+    2. `Executor` calls `recv_payload` of this interface to let all corresponding ranks
+        know their input tensor.
+    3. `Executor` computes the model on every corresponding rank.
+    4. `Exectuor` calls `send_payload` of this interface to collect the output tensor
+        from every corresponding rank.
+
+    When combining multiple parallelism, generally we want a fused dispatcher dedicatedly
+    designed for this combined parallelism in order for higher performance. But if we don't
+    have such a fused dispatcher, we should chain multiple dispatchers. When chaining
+    dispatchers, we should take care of the order of dispatchers, and the dispatcher will
+    have an additional filter.
+
+    Example of calling `dispatch_metadata` on combined PP dispatcher with TP dispatcher:
+    1. `Executor` calls PP dispatcher, only on TP main ranks.
+    2. `Executor` calls TP disptchers, on all ranks.
+
+    In this example, during initialization, `Executor` should initialize the TP dispatcher
+    first, and initialize the PP dispatcher next only on filtered ranks. During execution,
+    `Executor` should call `dispatch_metadata` on the PP dispatcher first, and then call
+    `dispatch_metadata` on the TP dispatcher.
+    """
+
     @abstractmethod
     def dispatch_metadata(self, *args, **kwargs):
+        """
+        Let all corresponding ranks know the task meta data
+        """
         raise NotImplementedError()
 
-    # recv payload from previous worker
     @abstractmethod
     def recv_payload(self, *args, **kwargs) -> torch.Tensor:
+        """
+        Let all corresponding ranks know their input tensor.
+        """
         raise NotImplementedError()
 
-    # send payload to next worker
     @abstractmethod
     def send_payload(self, *args, **kwargs):
+        """
+        Collect the output tensor from every corresponding rank.
+        """
         raise NotImplementedError()
 
 
@@ -99,10 +130,8 @@ class PipeDispatcher(TasksDispatcher):
         self.rank = self.pp_group.global_rank
         self.local_rank = self.pp_group.local_rank
 
-        self.is_main_rank = 0 in self.pp_group.rank_list
-
-        self.is_first_stage = self.rank == self.pp_group.rank_list[0]
-        self.is_last_stage = self.rank == self.pp_group.rank_list[-1]
+        self.is_first_stage = self.pp_group.is_first_rank
+        self.is_last_stage = self.pp_group.is_last_rank
 
         self.next_rank = self.pp_group.next_rank
         self.prev_rank = self.pp_group.prev_rank
@@ -112,15 +141,12 @@ class PipeDispatcher(TasksDispatcher):
         self.prev_pair_group = get_pp_pair_group(self.rank, self.prev_rank)
 
     def dispatch_metadata(
-        self,
-        tasks: Optional[PackedTasksBase],
-        payload_type: Optional[SerializedPackedTasksPayloadType] = None,
+        self, tasks: Optional[PackedTasksBase]
     ) -> Optional[tuple[SerializedPackedTasksPayloadType, PackedTasksBase]]:
         # recv task from previous stage
         if self.is_first_stage:
             task_tensor = tasks.serialize(
-                payload_type=payload_type,
-                device="cpu" if Backend.use_gloo else self.local_rank,
+                device="cpu" if Backend.use_gloo else self.local_rank
             )
             payload_type = tasks.payload_type
         else:
@@ -180,17 +206,14 @@ class TensorDispatcher(TasksDispatcher):
         self.cpu_group = self.tp_group.cpu_group
 
         self.tp_main_rank = self.tp_group.rank_list[0]
-        self.is_main_rank = self.rank == self.tp_group.rank_list[0]  # not use?
+        self.is_main_rank = self.tp_group.is_first_rank
 
     def dispatch_metadata(
-        self,
-        tasks: Optional[PackedTasksBase],
-        payload_type: Optional[SerializedPackedTasksPayloadType] = None,
+        self, tasks: Optional[PackedTasksBase]
     ) -> tuple[SerializedPackedTasksPayloadType, PackedTasksBase]:
         if self.is_main_rank:
             task_tensor = tasks.serialize(
-                payload_type=payload_type,
-                device="cpu" if Backend.use_gloo else self.local_rank,
+                device="cpu" if Backend.use_gloo else self.local_rank
             )
             payload_type = tasks.payload_type
         else:
@@ -221,7 +244,7 @@ class ExpertDataDispatcher(TasksDispatcher):
     def __init__(self):
         self.dp_group = get_dp_group()
         self.dp_main_rank = self.dp_group.rank_list[0]
-        self.is_main_rank = self.dp_group.global_rank == self.dp_main_rank
+        self.is_main_rank = self.dp_group.is_first_rank
         self.rank_in_group = self.dp_group.rank_in_group
         self.device = torch.cuda.current_device()
         self.group_size = self.dp_group.group_size
@@ -279,11 +302,11 @@ class ExpertDataDispatcher(TasksDispatcher):
             tasks = PackedTasksBase(
                 num_tasks=0,
                 task_type=TaskType.EmptyPrefill,
-                payload_type=SerializedPackedTasksPayloadType.EmptyPrefill,  # seems unused
+                payload_type=SerializedPackedTasksPayloadType.EmptyPrefill,  # Must be consistent with task_type
             )
         return tasks
 
-    def dispatch_metadata(self, tasks, payload):
+    def dispatch_metadata(self, tasks):
         if self.is_main_rank:
             local_tasks = tasks
             if DPTaskCollector.has_available_tasks():
@@ -336,7 +359,7 @@ class ExpertDataDispatcher(TasksDispatcher):
                     tasks = PackedTasksBase(
                         num_tokens=0,
                         task_type=TaskType.EmptyDecode,
-                        payload_type=payload_type,  # seems unused
+                        payload_type=SerializedPackedTasksPayloadType.EmptyDecode,  # Must be consistent with task_type
                     )
             elif payload_type == SerializedPackedTasksPayloadType.EndTask:
                 task_ids = msgpack.unpackb(msgs[1])
@@ -418,7 +441,7 @@ class ExpertDataDispatcher(TasksDispatcher):
         return token_list
 
     def send_payload(self, payload: torch.Tensor):
-        return payload
+        pass
 
     def recv_payload(self, payload: torch.Tensor | list[torch.Tensor]):
         return payload
@@ -440,50 +463,60 @@ class Executor:
         self.tp_size = args.infer.tp_size
         self.dp_size = args.infer.dp_size
         self.pipe_dispatcher = None
+        self.dp_dispatcher = None
         self.task_dispatchers = []
         self.tp_group = None
-        if self.pp_size > 1:
-            self.pipe_dispatcher = PipeDispatcher()
-            if self.pipe_dispatcher.is_main_rank:
-                self.task_dispatchers.append(self.pipe_dispatcher)
-        if self.tp_size > 1:
-            self.task_dispatchers.append(TensorDispatcher())
-            self.tp_group = get_tp_group()
 
-        if self.pipe_dispatcher and not self.pipe_dispatcher.is_first_stage:
+        rank_filter = True
+        if rank_filter and self.tp_size > 1:
+            self._prepend_dispatcher(TensorDispatcher())
+            self.tp_group = get_tp_group()
+            rank_filter = rank_filter and get_tp_group().is_first_rank
+        if rank_filter and self.pp_size > 1:
+            self.pipe_dispatcher = PipeDispatcher()
+            self._prepend_dispatcher(self.pipe_dispatcher)
+            rank_filter = rank_filter and get_pp_group().is_first_rank
+        if rank_filter and self.dp_size > 1:
+            if self.pp_size > 1:
+                raise NotImplementedError("DP+PP is not implemented yet")
+            self.dp_dispatcher = ExpertDataDispatcher()
+            self._prepend_dispatcher(self.dp_dispatcher)
+
+        if self.pp_size > 1 and not get_pp_group().is_first_rank:
             self.get_payload_shape = lambda num_tokens: [num_tokens, args.models.dim]
             self.get_payload_dtype = lambda: torch.get_default_dtype()
         else:
             self.get_payload_shape = lambda num_tokens: [num_tokens]
             self.get_payload_dtype = lambda: torch.int64
 
+        # use for empty step
         if self.dp_size > 1:
-            assert not self.task_dispatchers, "Not support DP with other dispatchers"
-            self.dp_dispatcher = ExpertDataDispatcher()
-            self.task_dispatchers.append(self.dp_dispatcher)
-            # use for empty step
-            self.dim = args.models.dim
-            self.vocab_size = args.models.vocab_size
             self.use_cuda_graph = args.infer.use_cuda_graph
             self.n_dense_layers = (
                 args.models.n_dense_layers
                 if hasattr(args.models, "n_dense_layers")
                 else 0
             )
-            dummy_input_shape = [1, self.dim] if is_ascend() else [0, self.dim]
+            dummy_input_shape = (
+                [1, args.models.dim] if is_ascend() else [0, args.models.dim]
+            )
             self.dummy_input = torch.empty(
                 dummy_input_shape,
                 dtype=torch.get_default_dtype(),
                 device=self.local_rank,
             )
             self.dummy_logits = torch.empty(
-                [0, self.vocab_size], dtype=torch.float32, device=self.local_rank
+                [0, args.models.vocab_size], dtype=torch.float32, device=self.local_rank
             )
             self.empty_decode_step_graph = None
+
         self.moe_impl = get_moe_impl()
         # Hooks for token streaming and KV transfer. Defaults keep existing behavior.
         self._token_sink: TokenSink = LocalTokenSink()
         self._kv_hook: KVTransferHook = NoopKVTransferHook()
+
+    def _prepend_dispatcher(self, dispatcher: TasksDispatcher):
+        self.task_dispatchers.insert(0, dispatcher)
 
     # Hook setters for external injection
     def set_token_sink(self, sink: TokenSink):
@@ -586,7 +619,7 @@ class Executor:
         # 1. propagate tasks and handle special payload type
         payload_type = tasks.payload_type if tasks is not None else None
         for dispatcher in self.task_dispatchers:
-            payload_type, tasks = dispatcher.dispatch_metadata(tasks, payload_type)
+            payload_type, tasks = dispatcher.dispatch_metadata(tasks)
 
         if payload_type == SerializedPackedTasksPayloadType.TerminateBackend:
             Backend.state = BackendState.Terminated
@@ -625,7 +658,10 @@ class Executor:
 
         # 3. handle ongoing task
         if self.dp_size > 1:
-            return self.dp_dispatcher.epilogue(tasks, out)
+            if self.dp_dispatcher is not None:
+                return self.dp_dispatcher.epilogue(tasks, out)
+            else:
+                return None
         elif self.rank == 0:
             if tasks.task_type == TaskType.Prefill:
                 for task in tasks.tasks:
@@ -887,7 +923,7 @@ class Executor:
         num_tokens = tasks.num_tasks
 
         # prepare payload tensor
-        if self.rank == 0 or self.dp_size > 1:
+        if self.rank == 0 or self.dp_size > 1 and self.dp_dispatcher is not None:
             payload = self._prepare_new_tokens_for_decode(tasks)  # tensor
         else:
             payload = torch.empty(
@@ -938,9 +974,9 @@ class Executor:
             layer.mlp(payload)
 
         for dispatcher in self.task_dispatchers:
-            payload = dispatcher.send_payload(self.dummy_logits)
+            dispatcher.send_payload(self.dummy_logits)
 
-        return payload
+        return self.dummy_logits
 
     def empty_decode_step(self):
         """
@@ -967,9 +1003,9 @@ class Executor:
             empty_mlp()
 
         for dispatcher in self.task_dispatchers:
-            payload = dispatcher.send_payload(self.dummy_logits)
+            dispatcher.send_payload(self.dummy_logits)
 
-        return payload
+        return self.dummy_logits
 
     def _recv_logits(self, tasks: PackedTasks):
         logits = torch.empty(
