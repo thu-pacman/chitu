@@ -392,6 +392,9 @@ class Task:
         )
         TaskLoad.increase(self.prefix_length)
 
+        # Scheduler group
+        self.sched_group_id = None
+
     def need_remove(self):
         if self.waiting:
             return False

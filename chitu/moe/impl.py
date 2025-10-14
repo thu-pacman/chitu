@@ -9,7 +9,6 @@ from chitu.utils import try_import_opt_dep, try_import_and_setup_torch_npu
 from chitu.moe.token_dispatchers import (
     MoETokenDispatcher,
     MoEEmptyTokenDispatcher,
-    MoETPTokenDispatcher,
     MoEAllGatherTokenDispatcher,
 )
 
@@ -43,10 +42,7 @@ class MoEImpl:
     """MoEImpl is a base class for MoE implementation."""
 
     def __init__(self, args) -> None:
-        self.args = args
-        self.ep_size = args.infer.ep_size
         self.tp_size = args.infer.tp_size
-        self.dp_size = args.infer.dp_size
         self.hidden_dim = args.models.dim
 
         self.num_experts = getattr(args.models, "n_routed_experts", None) or getattr(
@@ -63,7 +59,6 @@ class MoEImpl:
         self.decode_experts_impl = "auto"
         self.prefill_token_dispatcher_impl = args.infer.moe.prefill_token_dispatcher
         self.decode_token_dispatcher_impl = args.infer.moe.decode_token_dispatcher
-        self.use_cuda_graph = args.infer.use_cuda_graph
 
         self._init_token_dispatcher()
         self._init_experts_impl()
@@ -71,34 +66,25 @@ class MoEImpl:
     def _init_token_dispatcher(self):
         # impl selection
         if self.prefill_token_dispatcher_impl == "auto":
-            if self.tp_size > 1:
-                self.prefill_token_dispatcher_impl = "tp"
-            elif has_deep_ep:
+            if has_deep_ep:
                 self.prefill_token_dispatcher_impl = "deepep-nl"
-            elif has_torch_npu:
+            elif has_torch_npu and self.tp_size == 1:
                 self.prefill_token_dispatcher_impl = "empty"
             else:
                 self.prefill_token_dispatcher_impl = "allgather"
 
         if self.decode_token_dispatcher_impl == "auto":
-            if self.tp_size > 1:
-                self.decode_token_dispatcher_impl = "tp"
-            elif has_deep_ep:
+            if has_deep_ep:
                 self.decode_token_dispatcher_impl = "deepep-ll"
             elif (
-                has_torch_npu
+                has_torch_npu and self.tp_size == 1
             ):  # use empty for npu_fused_experts_with_communication kernel
                 self.decode_token_dispatcher_impl = "empty"
             else:
                 self.decode_token_dispatcher_impl = "allgather"
-                assert (
-                    not self.use_cuda_graph
-                ), "allgather is not supported with cuda graph"
 
         # impl initialization
-        if self.prefill_token_dispatcher_impl == "tp":
-            self.prefill_token_dispatcher = MoETPTokenDispatcher()
-        elif self.prefill_token_dispatcher_impl == "deepep-nl":
+        if self.prefill_token_dispatcher_impl == "deepep-nl":
             self.prefill_token_dispatcher = MoENormalTokenDispatcher(
                 self.num_experts,
                 self.hidden_dim,
@@ -119,9 +105,7 @@ class MoEImpl:
                 f"Invalid prefill token dispatcher: {self.prefill_token_dispatcher_impl}"
             )
 
-        if self.decode_token_dispatcher_impl == "tp":
-            self.decode_token_dispatcher = MoETPTokenDispatcher()
-        elif self.decode_token_dispatcher_impl == "deepep-ll":
+        if self.decode_token_dispatcher_impl == "deepep-ll":
             self.decode_token_dispatcher = MoELowLatencyTokenDispatcher(
                 self.num_experts, self.hidden_dim
             )

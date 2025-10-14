@@ -6,6 +6,7 @@ import time
 from logging import getLogger
 from typing import Optional
 from typing_extensions import override
+from collections import deque, defaultdict
 
 from chitu.task import TaskPool, TaskType, DPTaskCollector
 from chitu.global_vars import get_slot_handle, get_global_args
@@ -35,7 +36,7 @@ class Scheduler:
             else:
                 prefill_num_tasks = args.pp_config.prefill_num_tasks
             if args.pp_config.enforce_decode_num_tasks_max:
-                decode_num_tasks = infer_args.max_reqs
+                decode_num_tasks = ceil_div(infer_args.max_reqs, infer_args.pp_size)
             else:
                 decode_num_tasks = args.pp_config.decode_num_tasks
         else:
@@ -46,6 +47,7 @@ class Scheduler:
             prefill_num_tasks,
             decode_num_tasks,
             Scheduler._normalize_scheduler_type(args.type.lower()),
+            num_scheduler_groups=infer_args.pp_size,
             original_scheduler_type=args.type.lower(),
             prefill_chunk_size=infer_args.prefill_chunk_size,
         )
@@ -76,6 +78,7 @@ class Scheduler:
         prefill_num_tasks: int,
         decode_num_tasks: int,
         scheduler_type: str,
+        num_scheduler_groups: int,
         original_scheduler_type: str = None,
         prefill_chunk_size: Optional[int] = None,
     ):
@@ -109,6 +112,14 @@ class Scheduler:
         self.prefill_num_tasks = prefill_num_tasks
         self.decode_num_tasks = decode_num_tasks
         self.prefill_chunk_size = prefill_chunk_size
+        self.num_scheduler_groups = num_scheduler_groups
+        self.free_sgroups = deque(
+            range(num_scheduler_groups)
+        )  # scheduler group doesn't have any waiting task.
+        self.used_sgroups = set()  # scheduler group has waiting tasks.
+        self.sgroup_waiting_cnt = defaultdict(
+            int
+        )  # {sched_group_id: waiting_tasks_count}.
 
         # strict-only gating derived from original type string
         self.strict_allowed_task_type = self._extract_strict_task_type(
@@ -165,6 +176,10 @@ class Scheduler:
             logger.debug("TaskPool is empty, returning empty task list.")
             return []
 
+        if not self.free_sgroups:
+            logger.debug("No available scheduler group, returning empty task list.")
+            return []
+
         self.scheduling_ts = time.perf_counter_ns()
         # collect ready task ids
         task_ids = list(
@@ -213,9 +228,14 @@ class Scheduler:
         if filter_task_type == TaskType.Decode:
             task_ids = self._schedule_decode_tasks(task_ids)[: self.decode_num_tasks]
 
+        sgroup_id = self.free_sgroups.popleft()
+        self.used_sgroups.add(sgroup_id)
+        self.sgroup_waiting_cnt[sgroup_id] = len(task_ids)
+
         # postprocess
         for task_id in task_ids:
             TaskPool.pool[task_id].sched_ts = self.scheduling_ts
+            TaskPool.pool[task_id].sched_group_id = sgroup_id
 
         logger.debug(f"Selected task_ids:")
         for task_id in task_ids:
@@ -231,6 +251,10 @@ class Scheduler:
                     )
             else:
                 logger.debug(f"- {task_id}: Decode")
+        if task_ids:
+            logger.info(
+                f"Scheduled {len(task_ids)} {filter_task_type.name.lower()} tasks"
+            )
 
         return task_ids
 
@@ -368,11 +392,17 @@ class Scheduler:
             payload_type=SerializedPackedTasksPayloadType.EndTask,
         )
         Backend.executor.step(tasks)
+        logger.warning(
+            f"Evicted task {task_id} due to insufficient KV cache",
+            extra={
+                "task_id": task_id,
+                "event": "scheduler_task_evicted",
+                "kvcache_block_threshold": self.kvcache_block_threshold,
+                "total_blocks": Backend.cache_manager.get_num_blocks(),
+            },
+        )
         task.task_type = TaskType.Prefill
         self.kvcache_block_threshold = max(1, self.kvcache_block_threshold // 2)
-        logger.debug(
-            f"Temporarily evicting task({task_id}), reducing kvcache_block_threshold to {self.kvcache_block_threshold}, while the number of total blocks is {Backend.cache_manager.get_num_blocks()}"
-        )
 
     @staticmethod
     def _extract_strict_task_type(scheduler_type: str):
@@ -422,6 +452,19 @@ class Scheduler:
         task_ids = list(set(task_ids))
         self.reorder_tasks_for_batching(task_ids)
         for task_id in task_ids:
+
+            # Update scheduler group status.
+            if (
+                not TaskPool.pool[task_id].waiting
+                and TaskPool.pool[task_id].sched_group_id is not None
+            ):
+                sgroup_id = TaskPool.pool[task_id].sched_group_id
+                self.sgroup_waiting_cnt[sgroup_id] -= 1
+                TaskPool.pool[task_id].sched_group_id = None
+                if self.sgroup_waiting_cnt[sgroup_id] == 0:
+                    self.used_sgroups.remove(sgroup_id)
+                    self.free_sgroups.append(sgroup_id)
+
             if TaskPool.pool[task_id].need_remove():
                 if TaskPool.pool[task_id].task_type == TaskType.Decode:
                     removed_task_ids.append(task_id)
@@ -434,6 +477,15 @@ class Scheduler:
                     )
                 TaskPool.remove(task_id)
 
+        if removed_task_ids:
+            logger.info(
+                f"Completed {len(removed_task_ids)} tasks",
+                extra={
+                    "event": "scheduler_task_completed",
+                    "completed_tasks": len(removed_task_ids),
+                },
+            )
+
         return removed_task_ids
 
     def is_done(self):
@@ -443,7 +495,9 @@ class Scheduler:
 class SkewPipelineScheduler(Scheduler):
 
     def __init__(self, max_reqs: int):
-        super().__init__(max_reqs, max_reqs, "prefill_first")
+        super().__init__(
+            max_reqs, max_reqs, "prefill_first", get_global_args().infer.pp_size
+        )
         self.max_reqs = max_reqs
         self.slot_handle = get_slot_handle()
         self.decode_slots = [[] for _ in range(self.slot_handle.num_slots)]

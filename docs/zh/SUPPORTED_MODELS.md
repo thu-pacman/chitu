@@ -82,12 +82,22 @@
   用法: 启动赤兔时追加 `models=Qwen2-72B-Instruct` 启动参数
 - Qwen2-7B-Instruct
   用法: 启动赤兔时追加 `models=Qwen2-7B-Instruct` 启动参数
+- Qwen2.5-0.5B
+  用法: 启动赤兔时追加 `models=Qwen2.5-0.5B` 启动参数
+- Qwen2.5-0.5B-Instruct
+  用法: 启动赤兔时追加 `models=Qwen2.5-0.5B-Instruct` 启动参数
+- Qwen2.5-1.5B
+  用法: 启动赤兔时追加 `models=Qwen2.5-1.5B` 启动参数
+- Qwen2.5-1.5B-Instruct
+  用法: 启动赤兔时追加 `models=Qwen2.5-1.5B-Instruct` 启动参数
 - Qwen2.5-32B
   用法: 启动赤兔时追加 `models=Qwen2.5-32B` 启动参数
 - Qwen2.5-32B-Instruct
   用法: 启动赤兔时追加 `models=Qwen2.5-32B-Instruct` 启动参数
 - Qwen2.5-3B
   用法: 启动赤兔时追加 `models=Qwen2.5-3B` 启动参数
+- Qwen2.5-3B-Instruct
+  用法: 启动赤兔时追加 `models=Qwen2.5-3B-Instruct` 启动参数
 - Qwen2.5-3B-Mix
   用法: 启动赤兔时追加 `models=Qwen2.5-3B-Mix` 启动参数
 - Qwen2.5-72B-Instruct-ascend-int8

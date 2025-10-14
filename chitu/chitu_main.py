@@ -8,7 +8,6 @@ import operator
 import os
 from logging import getLogger
 import psutil
-import importlib.util
 
 import torch
 import torch.distributed
@@ -35,13 +34,19 @@ from chitu.task import (
     MockFixedLengthedUserRequest,
     DPTaskCollector,
 )
-from chitu.utils import gen_req_id, try_import_opt_dep, try_import_and_setup_torch_npu
+from chitu.utils import (
+    gen_req_id,
+    try_import_opt_dep,
+    try_import_and_setup_torch_npu,
+    ceil_div,
+)
 from chitu.schemas.utils import ModelConfigResolver
-from chitu.utils import ceil_div
+from chitu.logging_utils import setup_chitu_logging
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 
 
 logger = getLogger(__name__)
@@ -52,26 +57,11 @@ def init_logger(logging_level=logging.INFO):
     base_logger = getLogger(base_name)
     base_logger.setLevel(logging_level)
 
-    def add_rank_to_msg(record):
-        if torch.distributed.is_initialized():
-            record.msg = f"[Rank {torch.distributed.get_rank()}] {record.msg}"
-        return True
-
-    def add_filter_to_all_parent_handlers(cur_logger):
-        for handler in cur_logger.handlers:
-            handler.addFilter(add_rank_to_msg)
-        if cur_logger.parent:
-            add_filter_to_all_parent_handlers(cur_logger.parent)
-
-    # If there is no handlers, create a new handler to hold the filter. If not (very likely
-    # because we launch from Hydra, and Hydra setup the root logger), a new handler will only
-    # duplicate the logs. In this case, we should add the filter to all the existing handlers.
-    if base_logger.hasHandlers():  # Including handlers from the parents
-        add_filter_to_all_parent_handlers(base_logger)
-    else:
+    if not base_logger.hasHandlers():
         handler = logging.StreamHandler()
-        handler.addFilter(add_rank_to_msg)
         base_logger.addHandler(handler)
+
+    setup_chitu_logging()
 
 
 def init_cache_static():
@@ -419,7 +409,6 @@ def chitu_init(args, logging_level=None):
         )
 
     if args.infer.use_cuda_graph == "auto":
-        spec = importlib.util.find_spec("deep_ep")
         if args.models.name in [
             "Mixtral-8x7B-Instruct-v0.1",
             "Qwen3-30B-A3B-mix-fp4-fp8",
@@ -427,7 +416,7 @@ def chitu_init(args, logging_level=None):
             "DeepSeek-V3.2-Exp",
         ]:
             args.infer.use_cuda_graph = False
-        elif args.infer.dp_size > 1 and spec is None:
+        elif args.infer.dp_size > 1 and (args.infer.tp_size > 1 or not has_deep_ep):
             args.infer.use_cuda_graph = False
         elif args.infer.attn_type == "ref":
             args.infer.use_cuda_graph = False
