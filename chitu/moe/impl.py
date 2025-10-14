@@ -42,9 +42,7 @@ class MoEImpl:
     """MoEImpl is a base class for MoE implementation."""
 
     def __init__(self, args) -> None:
-        self.ep_size = args.infer.ep_size
         self.tp_size = args.infer.tp_size
-        self.dp_size = args.infer.dp_size
         self.hidden_dim = args.models.dim
 
         self.num_experts = getattr(args.models, "n_routed_experts", None) or getattr(
@@ -68,22 +66,18 @@ class MoEImpl:
     def _init_token_dispatcher(self):
         # impl selection
         if self.prefill_token_dispatcher_impl == "auto":
-            if self.tp_size > 1:
-                self.prefill_token_dispatcher_impl = "allgather"
-            elif has_deep_ep:
+            if has_deep_ep:
                 self.prefill_token_dispatcher_impl = "deepep-nl"
-            elif has_torch_npu:
+            elif has_torch_npu and self.tp_size == 1:
                 self.prefill_token_dispatcher_impl = "empty"
             else:
                 self.prefill_token_dispatcher_impl = "allgather"
 
         if self.decode_token_dispatcher_impl == "auto":
-            if self.tp_size > 1:
-                self.decode_token_dispatcher_impl = "allgather"
-            elif has_deep_ep:
+            if has_deep_ep:
                 self.decode_token_dispatcher_impl = "deepep-ll"
             elif (
-                has_torch_npu
+                has_torch_npu and self.tp_size == 1
             ):  # use empty for npu_fused_experts_with_communication kernel
                 self.decode_token_dispatcher_impl = "empty"
             else:

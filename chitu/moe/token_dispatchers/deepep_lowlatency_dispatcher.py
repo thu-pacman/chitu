@@ -10,7 +10,7 @@ import math
 
 import torch
 
-from chitu.distributed.parallel_state import get_ep_group
+from chitu.distributed.parallel_state import get_ep_group, get_tp_size, get_tp_group
 from chitu.utils import try_import_opt_dep, parse_dtype
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
 from chitu.moe.batched_routed_activation import (
@@ -136,6 +136,8 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
     ) -> tuple[PerExpertDenseBatchedRoutedActivation, Optional[torch.Tensor]]:
+        dp_local_bs = topk_weights.shape[0]
+
         dispatch_use_fp8 = False
         if (
             may_fuse_quant == "blockfp8"
@@ -166,7 +168,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
 
         # TODO(zms): A more flexible context management.
         # Currently, we should call permutation + unpermutation contiguously.
-        self.dispatcher_ctx = (deepep_handle, topk_ids, topk_weights)
+        self.dispatcher_ctx = (deepep_handle, topk_ids, topk_weights, dp_local_bs)
 
         if not dispatch_use_fp8:
             return (
@@ -189,10 +191,10 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
 
     @override
     def token_unpermutation(self, expert_outputs):
-        handle, topk_ids, topk_weights = self.dispatcher_ctx
+        handle, topk_ids, topk_weights, dp_local_bs = self.dispatcher_ctx
         # Now we disable any type of overlap.
         outputs, _, _ = self.deepep_token_combine(
-            expert_outputs, topk_ids, topk_weights, handle
+            expert_outputs, topk_ids, topk_weights, handle, dp_local_bs
         )
         return outputs
 
@@ -211,6 +213,10 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
+        if get_tp_size() > 1 and not get_tp_group().is_first_rank:
+            # Don't dispatch from this rank. It's the same as TP rank 0.
+            topk_idx = torch.full_like(topk_idx, -1)
+
         assert not (async_finish and return_recv_hook)
         # Do MoE dispatch, compatible with CUDA graph (but you may restore some buffer status once you replay)
         recv_hidden_states, recv_expert_count, handle, event, hook = (
@@ -245,13 +251,15 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         handle: tuple,
+        dp_local_bs: int,
         zero_copy: bool = False,
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
+        dtype = hidden_states.dtype
+        device = hidden_states.device
+
         assert not (async_finish and return_recv_hook)
-        if topk_weights.dtype != torch.float32:
-            topk_weights = topk_weights.to(torch.float32)
         if zero_copy:
             self._buffer.get_next_low_latency_combine_buffer(handle)[
                 :, :, :
@@ -260,12 +268,30 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         combined_hidden_states, event, hook = self._buffer.low_latency_combine(
             hidden_states,
             topk_idx,
-            topk_weights,
+            topk_weights.to(torch.float32),
             handle,
             zero_copy=zero_copy,
             async_finish=async_finish,
             return_recv_hook=return_recv_hook,
         )
+        if get_tp_size() == 1 or get_tp_group().is_first_rank:
+            assert tuple(combined_hidden_states.shape) == (
+                dp_local_bs,
+                self.hidden,
+            ), f"combined_hidden_states.shape ({combined_hidden_states.shape}) should be ({dp_local_bs}, {self.hidden})"
+            assert combined_hidden_states.dtype == dtype
+            assert combined_hidden_states.device == device
+        else:
+            combined_hidden_states = torch.empty(
+                (dp_local_bs, self.hidden), dtype=dtype, device=device
+            )
+
+        if get_tp_size() > 1:
+            torch.distributed.broadcast(
+                combined_hidden_states,
+                src=get_tp_group().rank_list[0],
+                group=get_tp_group().gpu_group,
+            )
 
         # NOTES: the same behavior as described in the dispatch kernel
         return combined_hidden_states, event, hook
