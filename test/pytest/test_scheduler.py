@@ -70,7 +70,9 @@ class MockTokenizer:
 
 def test_chunked_prefill():
     set_global_args(
-        OmegaConf.create({"infer": {"max_seq_len": 32768, "op_impl": "torch"}}),
+        OmegaConf.create(
+            {"infer": {"max_seq_len": 32768, "op_impl": "torch", "cache_type": "paged"}}
+        ),
         need_ensure=False,
     )
     TaskPool.reset()
@@ -83,7 +85,7 @@ def test_chunked_prefill():
         task = Task(f"{req.request_id}", req)
         TaskPool.add(task)
 
-    scheduler = Scheduler(4, 4, "prefill_first", prefill_chunk_size=4096)
+    scheduler = Scheduler(4, 4, "prefill_first", 1, prefill_chunk_size=4096)
 
     # Prefill:
 
@@ -94,6 +96,7 @@ def test_chunked_prefill():
     for task_id in batch1_ids:
         TaskPool.pool[task_id].consume_req_tokens()
 
+    scheduler.update(batch1_ids)
     # Remaining: [0, 0, 1904, 4000]
 
     batch2_ids = scheduler.schedule()
@@ -101,6 +104,7 @@ def test_chunked_prefill():
     for task_id in batch2_ids:
         TaskPool.pool[task_id].consume_req_tokens()
 
+    scheduler.update(batch2_ids)
     # Remaining: [0, 0, 0, 1808]
 
     batch3_ids = scheduler.schedule()
@@ -108,6 +112,7 @@ def test_chunked_prefill():
     for task_id in batch3_ids:
         TaskPool.pool[task_id].consume_req_tokens()
 
+    scheduler.update(batch3_ids)
     # Remaining: [0, 0, 0, 0]
 
     # Decode:
@@ -118,7 +123,9 @@ def test_chunked_prefill():
 
 def test_priority_prefill_first():
     set_global_args(
-        OmegaConf.create({"infer": {"max_seq_len": 1024, "op_impl": "torch"}}),
+        OmegaConf.create(
+            {"infer": {"max_seq_len": 1024, "op_impl": "torch", "cache_type": "paged"}}
+        ),
         need_ensure=False,
     )
     TaskPool.reset()
@@ -145,25 +152,29 @@ def test_priority_prefill_first():
     TaskPool.add(tasks[4])
     TaskPool.add(tasks[6])
 
-    scheduler = Scheduler(4, 2, "prefill_first")
+    scheduler = Scheduler(4, 2, "prefill_first", 1)
 
     batch1_ids = scheduler.schedule()
     assert sorted(batch1_ids) == sorted(["req_7", "req_1", "req_3", "req_8"])
+    scheduler.update(batch1_ids)
     for task_id in batch1_ids:
         TaskPool.remove(task_id)
 
     batch2_ids = scheduler.schedule()
     assert sorted(batch2_ids) == sorted(["req_0", "req_4"])
+    scheduler.update(batch2_ids)
     for task_id in batch2_ids:
         TaskPool.remove(task_id)
 
     batch3_ids = scheduler.schedule()
     assert sorted(batch3_ids) == sorted(["req_2", "req_5"])
+    scheduler.update(batch3_ids)
     for task_id in batch3_ids:
         TaskPool.remove(task_id)
 
     batch4_ids = scheduler.schedule()
     assert sorted(batch4_ids) == sorted(["req_6"])
+    scheduler.update(batch4_ids)
     for task_id in batch4_ids:
         TaskPool.remove(task_id)
 
@@ -173,7 +184,9 @@ def test_priority_prefill_first():
 
 def test_priority_fcfs():
     set_global_args(
-        OmegaConf.create({"infer": {"max_seq_len": 1024, "op_impl": "torch"}}),
+        OmegaConf.create(
+            {"infer": {"max_seq_len": 1024, "op_impl": "torch", "cache_type": "paged"}}
+        ),
         need_ensure=False,
     )
     TaskPool.reset()
@@ -200,20 +213,23 @@ def test_priority_fcfs():
     TaskPool.add(tasks[4])
     TaskPool.add(tasks[6])
 
-    scheduler = Scheduler(4, 4, "fcfs")
+    scheduler = Scheduler(4, 4, "fcfs", 1)
 
     batch1_ids = scheduler.schedule()
     assert sorted(batch1_ids) == sorted(["req_0", "req_1", "req_2", "req_3"])
+    scheduler.update(batch1_ids)
     for task_id in batch1_ids:
         TaskPool.remove(task_id)
 
     batch2_ids = scheduler.schedule()
     assert sorted(batch2_ids) == sorted(["req_4", "req_5"])
+    scheduler.update(batch2_ids)
     for task_id in batch2_ids:
         TaskPool.remove(task_id)
 
     batch3_ids = scheduler.schedule()
     assert sorted(batch3_ids) == sorted(["req_6", "req_7", "req_8"])
+    scheduler.update(batch3_ids)
     for task_id in batch3_ids:
         TaskPool.remove(task_id)
 
@@ -223,7 +239,9 @@ def test_priority_fcfs():
 
 def test_priority_request_preset_over_prefill_first():
     set_global_args(
-        OmegaConf.create({"infer": {"max_seq_len": 1024, "op_impl": "torch"}}),
+        OmegaConf.create(
+            {"infer": {"max_seq_len": 1024, "op_impl": "torch", "cache_type": "paged"}}
+        ),
         need_ensure=False,
     )
     TaskPool.reset()
@@ -250,25 +268,29 @@ def test_priority_request_preset_over_prefill_first():
     TaskPool.add(tasks[4])
     TaskPool.add(tasks[6])
 
-    scheduler = Scheduler(4, 2, "request_preset,prefill_first")
+    scheduler = Scheduler(4, 2, "request_preset,prefill_first", 1)
 
     batch1_ids = scheduler.schedule()
     assert sorted(batch1_ids) == sorted(["req_7", "req_3", "req_0", "req_4"])
+    scheduler.update(batch1_ids)
     for task_id in batch1_ids:
         TaskPool.remove(task_id)
 
     batch2_ids = scheduler.schedule()
     assert sorted(batch2_ids) == sorted(["req_2", "req_6"])
+    scheduler.update(batch2_ids)
     for task_id in batch2_ids:
         TaskPool.remove(task_id)
 
     batch3_ids = scheduler.schedule()
     assert sorted(batch3_ids) == sorted(["req_1", "req_8"])
+    scheduler.update(batch3_ids)
     for task_id in batch3_ids:
         TaskPool.remove(task_id)
 
     batch4_ids = scheduler.schedule()
     assert sorted(batch4_ids) == sorted(["req_5"])
+    scheduler.update(batch4_ids)
     for task_id in batch4_ids:
         TaskPool.remove(task_id)
 
@@ -279,7 +301,9 @@ def test_priority_request_preset_over_prefill_first():
 def test_single_prompt_seq_bigger_than_scheduler_capacity():
     """test when single prompt length is bigger than scheduler capacity, which equals NUM_BLOCKS*BLOCK_SIZE"""
     set_global_args(
-        OmegaConf.create({"infer": {"max_seq_len": 2048, "op_impl": "torch"}}),
+        OmegaConf.create(
+            {"infer": {"max_seq_len": 2048, "op_impl": "torch", "cache_type": "paged"}}
+        ),
         need_ensure=False,
     )
     TaskPool.reset()
@@ -298,7 +322,7 @@ def test_single_prompt_seq_bigger_than_scheduler_capacity():
     task = Task(f"{req.request_id}", req)
     TaskPool.add(task)
 
-    scheduler = Scheduler(4, 2, "request_preset,prefill_first")
+    scheduler = Scheduler(4, 2, "request_preset,prefill_first", 1)
     with pytest.raises(Exception) as exc_info:
         scheduler.schedule()
     assert "KV_cache capacity is insufficient to support prefilling" in str(exc_info)
@@ -311,7 +335,9 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
     is bigger than scheduler capacity(NUM_BLOCKS*BLOCK_SIZE).
     """
     set_global_args(
-        OmegaConf.create({"infer": {"max_seq_len": 1024, "op_impl": "torch"}}),
+        OmegaConf.create(
+            {"infer": {"max_seq_len": 1024, "op_impl": "torch", "cache_type": "paged"}}
+        ),
         need_ensure=False,
     )
     TaskPool.reset()
@@ -330,10 +356,11 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
     task = Task(f"{req.request_id}", req)
     TaskPool.add(task)
 
-    scheduler = Scheduler(4, 2, "prefill_first")
+    scheduler = Scheduler(4, 2, "prefill_first", 1)
     task_ids = scheduler.schedule()
     Backend.cache_manager.prepare_cache_prefill(task_ids[0])
     task._prefix_tokens.append(1)
+    scheduler.update(task_ids)
 
     task.consume_req_tokens()
     for step in range(DIFF - 1):
@@ -343,6 +370,7 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
         ]
         Backend.cache_manager.prepare_cache_decode(task_ids[0])
         task._prefix_tokens.append(1)
+        scheduler.update(task_ids)
 
     with pytest.raises(Exception) as exc_info:
         scheduler.schedule()
@@ -355,7 +383,14 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
 def test_evict_decode_task():
     set_global_args(
         OmegaConf.create(
-            {"infer": {"max_seq_len": 5123, "cache_type": "paged", "op_impl": "torch"}}
+            {
+                "infer": {
+                    "max_seq_len": 5123,
+                    "cache_type": "paged",
+                    "op_impl": "torch",
+                    "cache_type": "paged",
+                }
+            }
         ),
         need_ensure=False,
     )
@@ -389,7 +424,7 @@ def test_evict_decode_task():
     # evict low priority tasks(req_8,req_9) when cache manager has no more blocks for decoding
     req_8_prefix_tokens = tasks[-2].prefix_tokens
     req_9_prefix_tokens = tasks[-1].prefix_tokens
-    scheduler = Scheduler(4, DECODE_NUM_TASKS, "prefill_first,fcfs")
+    scheduler = Scheduler(4, DECODE_NUM_TASKS, "prefill_first,fcfs", 1)
     assert scheduler.kvcache_block_threshold == Backend.cache_manager.get_num_blocks()
     task_ids = scheduler.schedule()
     assert (
@@ -398,6 +433,7 @@ def test_evict_decode_task():
     )
     assert tasks[-1].task_type == TaskType.Prefill
     assert tasks[-2].task_type == TaskType.Prefill
+    scheduler.update(task_ids)
 
     # evicted tasks will not be rescheduled in the short term due to the congestion control
     task_ids = scheduler.schedule()
@@ -407,6 +443,7 @@ def test_evict_decode_task():
         "req_2",
         "req_3",
     ]  # req_8 or req_9 will not be rescheduled before other decoding tasks release kv cache blocks
+    scheduler.update(task_ids)
 
     # after two tasks finished decoding, reschedule req_8,req_9 / or one task finished decoding ,reschedule req_8
     for i in range(3):
