@@ -8,7 +8,6 @@ import operator
 import os
 from logging import getLogger
 import psutil
-import importlib.util
 
 import torch
 import torch.distributed
@@ -42,6 +41,7 @@ from chitu.utils import ceil_div
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 
 
 logger = getLogger(__name__)
@@ -419,7 +419,6 @@ def chitu_init(args, logging_level=None):
         )
 
     if args.infer.use_cuda_graph == "auto":
-        spec = importlib.util.find_spec("deep_ep")
         if args.models.name in [
             "Mixtral-8x7B-Instruct-v0.1",
             "Qwen3-30B-A3B-mix-fp4-fp8",
@@ -427,7 +426,7 @@ def chitu_init(args, logging_level=None):
             "DeepSeek-V3.2-Exp",
         ]:
             args.infer.use_cuda_graph = False
-        elif args.infer.dp_size > 1 and spec is None:
+        elif args.infer.dp_size > 1 and (args.infer.tp_size > 1 or not has_deep_ep):
             args.infer.use_cuda_graph = False
         elif args.infer.attn_type == "ref":
             args.infer.use_cuda_graph = False

@@ -157,25 +157,28 @@ def initialize_ep_group(ep_size: int, rank: int, local_rank: int, world_size: in
     global _EP_GROUP
     assert _EP_GROUP is None
 
+    assert world_size % ep_size == 0
+    num_EP_GROUPs = world_size // ep_size
+
     dp_size = get_dp_size()
     tp_size = get_tp_size()
 
     if ep_size > 1:
-        assert not (
-            tp_size > 1 and dp_size > 1
-        ), "EP does not support enabling both DP and TP at the same time"
-        if tp_size > 1:
+        if tp_size > 1 and dp_size == 1:
             global _TP_GROUP
             assert _TP_GROUP is not None, "tp should be initialized before ep"
             assert tp_size == ep_size, "tp_size != ep_size"
             _EP_GROUP = _TP_GROUP
-        elif dp_size > 1:
+        elif dp_size > 1 and tp_size == 1:
             global _DP_GROUP
             assert _DP_GROUP is not None, "dp should be initialized before ep"
             assert dp_size == ep_size, "dp_size != ep_size"
             _EP_GROUP = _DP_GROUP
         else:
-            assert False, "ep mode not supported."
+            rank_list = []
+            for i in range(num_EP_GROUPs):
+                rank_list.append(list(range(i * ep_size, (i + 1) * ep_size)))
+            _EP_GROUP = CommGroup(rank_list, rank, local_rank)
     else:
         _EP_GROUP = CommGroup([[idx] for idx in range(world_size)], rank, local_rank)
 
