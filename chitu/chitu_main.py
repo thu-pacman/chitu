@@ -34,9 +34,14 @@ from chitu.task import (
     MockFixedLengthedUserRequest,
     DPTaskCollector,
 )
-from chitu.utils import gen_req_id, try_import_opt_dep, try_import_and_setup_torch_npu
+from chitu.utils import (
+    gen_req_id,
+    try_import_opt_dep,
+    try_import_and_setup_torch_npu,
+    ceil_div,
+)
 from chitu.schemas.utils import ModelConfigResolver
-from chitu.utils import ceil_div
+from chitu.logging_utils import setup_chitu_logging
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
@@ -52,26 +57,11 @@ def init_logger(logging_level=logging.INFO):
     base_logger = getLogger(base_name)
     base_logger.setLevel(logging_level)
 
-    def add_rank_to_msg(record):
-        if torch.distributed.is_initialized():
-            record.msg = f"[Rank {torch.distributed.get_rank()}] {record.msg}"
-        return True
-
-    def add_filter_to_all_parent_handlers(cur_logger):
-        for handler in cur_logger.handlers:
-            handler.addFilter(add_rank_to_msg)
-        if cur_logger.parent:
-            add_filter_to_all_parent_handlers(cur_logger.parent)
-
-    # If there is no handlers, create a new handler to hold the filter. If not (very likely
-    # because we launch from Hydra, and Hydra setup the root logger), a new handler will only
-    # duplicate the logs. In this case, we should add the filter to all the existing handlers.
-    if base_logger.hasHandlers():  # Including handlers from the parents
-        add_filter_to_all_parent_handlers(base_logger)
-    else:
+    if not base_logger.hasHandlers():
         handler = logging.StreamHandler()
-        handler.addFilter(add_rank_to_msg)
         base_logger.addHandler(handler)
+
+    setup_chitu_logging()
 
 
 def init_cache_static():

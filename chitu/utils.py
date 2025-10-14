@@ -365,7 +365,6 @@ class DataSaver:
                     "fp4" if get_global_args().infer.npu_fusion_fp4 else "bf16"
                 )
                 # 添加推理步骤信息
-                # print(f"args_names: {args_names}")
                 save_data["inference_info"] = {
                     "machine_id": self.machine_id,
                     "card_id": self.card_id,

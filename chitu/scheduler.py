@@ -251,6 +251,10 @@ class Scheduler:
                     )
             else:
                 logger.debug(f"- {task_id}: Decode")
+        if task_ids:
+            logger.info(
+                f"Scheduled {len(task_ids)} {filter_task_type.name.lower()} tasks"
+            )
 
         return task_ids
 
@@ -388,11 +392,17 @@ class Scheduler:
             payload_type=SerializedPackedTasksPayloadType.EndTask,
         )
         Backend.executor.step(tasks)
+        logger.warning(
+            f"Evicted task {task_id} due to insufficient KV cache",
+            extra={
+                "task_id": task_id,
+                "event": "scheduler_task_evicted",
+                "kvcache_block_threshold": self.kvcache_block_threshold,
+                "total_blocks": Backend.cache_manager.get_num_blocks(),
+            },
+        )
         task.task_type = TaskType.Prefill
         self.kvcache_block_threshold = max(1, self.kvcache_block_threshold // 2)
-        logger.debug(
-            f"Temporarily evicting task({task_id}), reducing kvcache_block_threshold to {self.kvcache_block_threshold}, while the number of total blocks is {Backend.cache_manager.get_num_blocks()}"
-        )
 
     @staticmethod
     def _extract_strict_task_type(scheduler_type: str):
@@ -466,6 +476,15 @@ class Scheduler:
                         f"Task({task_id}) finished decoding, increasing kvcache_block_threshold to {self.kvcache_block_threshold}, while the number of total blocks is {num_total_blocks}"
                     )
                 TaskPool.remove(task_id)
+
+        if removed_task_ids:
+            logger.info(
+                f"Completed {len(removed_task_ids)} tasks",
+                extra={
+                    "event": "scheduler_task_completed",
+                    "completed_tasks": len(removed_task_ids),
+                },
+            )
 
         return removed_task_ids
 
