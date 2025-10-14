@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: Qwen2.5-0.5B
+type: hf-llama
+source: "https://huggingface.co/Qwen/Qwen2.5-0.5B" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+tokenizer_type: "hf" # one of: hf, tiktoken
+dim: 896
+n_layers: 24
+n_heads: 14
+n_kv_heads: 2
+vocab_size: 151936
+intermediate_dim: 4864
+norm_eps: 1e-06
+rope_theta: 1000000.0
+tie_word_embeddings: True
