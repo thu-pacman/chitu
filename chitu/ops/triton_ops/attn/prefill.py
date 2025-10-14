@@ -157,9 +157,9 @@ def _fwd_kernel(
             & (mask_for_load_v[None, :]),
             other=0.0,
         )
-        p = p.to(v.dtype)
         if IS_CAUSAL:
             p = tl.where(blk_causal_mask[:, None], p, 0)
+        p = p.to(v.dtype)
         acc += tl.dot(p, v)
 
         # update m_i and l_i

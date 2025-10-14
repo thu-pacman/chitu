@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from chitu.device_type import is_muxi
 from chitu.attn_backend import AttnBackend, NpuAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.cache_manager import PagedKVCacheManager, DenseKVCacheManager
@@ -934,10 +935,14 @@ class ParallelMoeBlock(nn.Module):
         shared_y = None
         x_in_use_simultenously = False
         if self.shared_experts is not None:
-            self.shared_experts_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self.shared_experts_stream):
+            if not is_muxi():
+                self.shared_experts_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.shared_experts_stream):
+                    shared_y = self.shared_experts(x)
+                    x_in_use_simultenously = True
+            else:
                 shared_y = self.shared_experts(x)
-                x_in_use_simultenously = True
+                x_in_use_simultenously = False
 
         experts_impl = "auto"
         tokens_per_expert = None
@@ -962,7 +967,8 @@ class ParallelMoeBlock(nn.Module):
         # Fuse allreduce to improve performance in TP mode
         if self.is_tp_mode:
             if shared_y is not None:
-                torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
+                if not is_muxi():
+                    torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
                 y += shared_y
             if not self.moe_impl:
                 torch.distributed.all_reduce(y, group=get_tp_group().gpu_group)
@@ -971,7 +977,8 @@ class ParallelMoeBlock(nn.Module):
             y = self.moe_impl.token_unpermutation(y)
 
         if shared_y is not None and not self.is_tp_mode:
-            torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
+            if not is_muxi():
+                torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
             y += shared_y
 
         return y.view(shape)

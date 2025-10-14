@@ -388,7 +388,6 @@ def _(
 
     micro_batchsize = 16
 
-    assert inplace == True, "Only inplace is supported for now"
     assert topk_weights.shape == topk_ids.shape
     # assert topk_weights.shape[0] % 16 == 0
 
@@ -597,6 +596,7 @@ class Blockfp8MoeExpertsMuxiLayout(
         indices: torch.Tensor,
         tokens_per_expert: Optional[torch.Tensor] = None,
         impl: str = "auto",
+        inplace: bool = False,
     ) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
@@ -606,7 +606,7 @@ class Blockfp8MoeExpertsMuxiLayout(
             w2=self.get_native_layout_down_proj_weight(),
             topk_weights=weights,
             topk_ids=indices,
-            inplace=True,
+            inplace=inplace,
             w1_scale=self.gate_up_proj_scale,
             w2_scale=self.down_proj_scale,
             block_shape=[128, 128],

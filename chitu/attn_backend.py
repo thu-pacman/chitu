@@ -1907,29 +1907,39 @@ class FlashMLABackend(TritonAttnBackend):
             get_page_ids=kv_cache.get_page_ids,
             get_offs_in_page=kv_cache.get_offs_in_page,
         )
-
-        output, _ = flash_mla.flash_mla_with_kvcache(
-            q_nope_pe,
-            kv_cache.k.unsqueeze(2),
-            kv_cache.block_table,
-            seq_len_delta.new.lens_tensor_device,
-            512,  # dv
-            self.metadata.get(),
-            self.num_splits.get(),
-            causal=(
-                True if topk_indices is None else False
-            ),  # flash_mla requires "causal must be `false` if sparse attention is enabled"
-            softmax_scale=softmax_scale,
-            indices=(
-                topk_indices.view(
-                    seq_len_delta.batch_size, 1, topk_indices.shape[-1]
-                ).to(
-                    torch.int32
-                )  # TODO: Convert in advance (but topk outputs int64 and RefAttnBackend requires int64)
-                if topk_indices is not None
-                else None
-            ),
+        indices = (
+            topk_indices.view(seq_len_delta.batch_size, 1, topk_indices.shape[-1]).to(
+                torch.int32
+            )
+            if topk_indices is not None
+            else None
         )
+        if indices is not None:
+            output, _ = flash_mla.flash_mla_with_kvcache(
+                q_nope_pe,
+                kv_cache.k.unsqueeze(2),
+                kv_cache.block_table,
+                seq_len_delta.new.lens_tensor_device,
+                512,  # dv
+                self.metadata.get(),
+                self.num_splits.get(),
+                indices=indices,
+                causal=(True if topk_indices is None else False),
+                softmax_scale=softmax_scale,
+            )
+        else:
+            # Don't pass `indices` here because it requires some new versions of FlashMLA
+            output, _ = flash_mla.flash_mla_with_kvcache(
+                q_nope_pe,
+                kv_cache.k.unsqueeze(2),
+                kv_cache.block_table,
+                seq_len_delta.new.lens_tensor_device,
+                512,  # dv
+                self.metadata.get(),
+                self.num_splits.get(),
+                causal=(True if topk_indices is None else False),
+                softmax_scale=softmax_scale,
+            )
         return output.view(bsz, output.shape[-2], output.shape[-1])
 
 
