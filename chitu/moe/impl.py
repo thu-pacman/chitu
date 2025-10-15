@@ -11,6 +11,7 @@ from chitu.moe.token_dispatchers import (
     MoEEmptyTokenDispatcher,
     MoEAllGatherTokenDispatcher,
 )
+from chitu.device_type import is_ascend_910b
 
 deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -43,6 +44,7 @@ class MoEImpl:
 
     def __init__(self, args) -> None:
         self.tp_size = args.infer.tp_size
+        self.dp_size = args.infer.dp_size
         self.hidden_dim = args.models.dim
 
         self.num_experts = getattr(args.models, "n_routed_experts", None) or getattr(
@@ -66,20 +68,28 @@ class MoEImpl:
     def _init_token_dispatcher(self):
         # impl selection
         if self.prefill_token_dispatcher_impl == "auto":
-            if has_deep_ep:
+            if self.dp_size > 1 and has_deep_ep:
                 self.prefill_token_dispatcher_impl = "deepep-nl"
-            elif has_torch_npu and self.tp_size == 1:
-                self.prefill_token_dispatcher_impl = "empty"
+            elif self.dp_size > 1 and has_torch_npu:
+                self.prefill_token_dispatcher_impl = (
+                    "fused_experts_with_a2a_communication"
+                )
             else:
                 self.prefill_token_dispatcher_impl = "allgather"
 
         if self.decode_token_dispatcher_impl == "auto":
-            if has_deep_ep:
+            if self.dp_size > 1 and has_deep_ep:
                 self.decode_token_dispatcher_impl = "deepep-ll"
             elif (
-                has_torch_npu and self.tp_size == 1
-            ):  # use empty for npu_fused_experts_with_communication kernel
-                self.decode_token_dispatcher_impl = "empty"
+                self.dp_size > 1
+                and has_torch_npu
+                and not (is_ascend_910b() and self.tp_size > 1)
+            ):
+                self.decode_token_dispatcher_impl = "fused_experts_with_communication"
+            elif self.dp_size > 1 and has_torch_npu:
+                self.decode_token_dispatcher_impl = (
+                    "fused_experts_with_a2a_communication"
+                )
             else:
                 self.decode_token_dispatcher_impl = "allgather"
 
@@ -95,7 +105,9 @@ class MoEImpl:
                 ),
             )
             self.prefill_experts_impl = "ep_group_gemm_contiguous"
-        elif self.prefill_token_dispatcher_impl == "empty":
+        elif (
+            self.prefill_token_dispatcher_impl == "fused_experts_with_a2a_communication"
+        ):
             self.prefill_token_dispatcher = MoEEmptyTokenDispatcher()
             self.prefill_experts_impl = "fused_experts_with_a2a_communication"
         elif self.prefill_token_dispatcher_impl == "allgather":
@@ -110,7 +122,12 @@ class MoEImpl:
                 self.num_experts, self.hidden_dim
             )
             self.decode_experts_impl = "ep_group_gemm_masked"
-        elif self.decode_token_dispatcher_impl == "empty":
+        elif (
+            self.decode_token_dispatcher_impl == "fused_experts_with_a2a_communication"
+        ):
+            self.decode_token_dispatcher = MoEEmptyTokenDispatcher()
+            self.decode_experts_impl = "fused_experts_with_a2a_communication"
+        elif self.decode_token_dispatcher_impl == "fused_experts_with_communication":
             self.decode_token_dispatcher = MoEEmptyTokenDispatcher()
             self.decode_experts_impl = "fused_experts_with_communication"
         elif self.decode_token_dispatcher_impl == "allgather":
