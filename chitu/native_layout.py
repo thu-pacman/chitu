@@ -12,6 +12,7 @@ import torch
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+hygon_mixq_kernels, has_hygon = try_import_platform_dep("sugon_mixQ4_kernels")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
@@ -653,6 +654,71 @@ class PartialColumnOddEvenSeparatedTensor(NativeLayoutTensor):
         )
         ret[..., self.begin_idx : self.end_idx] = separated_part
         return ret
+
+
+@dataclass
+class HygonMixQIntTileTensor(NativeLayoutTensor):
+    """
+    Hygon tiled layout for mixQ integer weights (e.g., W4/W8).
+
+    This class only wraps the forward conversion:
+      plain torch.Tensor -> hygon native tiled layout (int path).
+    """
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(cls, tensor: torch.Tensor):
+        assert has_hygon, "Hygon/Sugon kernels are unavailable."
+        assert hasattr(
+            hygon_mixq_kernels, "native_layout_of_weights_tile_int"
+        ), "Kernel 'native_layout_of_weights_tile_int' not found."
+        layout_tensor = hygon_mixq_kernels.native_layout_of_weights_tile_int(
+            tensor.contiguous()
+        )
+        return cls(plain_shape=tensor.shape, layout_tensor=layout_tensor)
+
+    @override
+    def convert_to_plain(self):
+        raise NotImplementedError(
+            "No inverse kernel for int tile layout (expected 'plain_layout_of_weights_tile_int')."
+        )
+
+
+@dataclass
+class HygonMixQFp16TileTensor(NativeLayoutTensor):
+    """
+    Hygon tiled layout for mixQ FP16 weights.
+    """
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(
+        cls,
+        tensor: torch.Tensor,
+        *,
+        perm_index=None,
+    ):
+        assert has_hygon, "Hygon/Sugon kernels are unavailable."
+        assert hasattr(
+            hygon_mixq_kernels, "native_layout_of_weights_tile_fp16"
+        ), "Kernel 'native_layout_of_weights_tile_fp16' not found."
+
+        src = tensor.contiguous()
+        if perm_index is not None:
+            if perm_index.dtype != torch.long:
+                perm_index = perm_index.to(dtype=torch.long)
+            src = torch.index_select(src, dim=1, index=perm_index)
+
+        layout_tensor = hygon_mixq_kernels.native_layout_of_weights_tile_fp16(src)
+        return cls(plain_shape=tensor.shape, layout_tensor=layout_tensor)
+
+    @override
+    def convert_to_plain(self):
+        raise NotImplementedError(
+            "No inverse kernel for fp16 tile layout (expected 'plain_layout_of_weights_tile_fp16')."
+        )
 
 
 @dataclass

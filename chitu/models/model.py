@@ -538,6 +538,42 @@ class Transformer(nn.Module):
                 state_dict[k] = param
         return state_dict
 
+    def process_state_dict_for_hygon_mixq_index_select(self, state_dict):
+        hygon_mixq_kernels, has_hygon = try_import_platform_dep("sugon_mixQ4_kernels")
+        if not has_hygon:
+            return state_dict
+
+        TILE = 512
+        state_dict_keys = list(state_dict.keys())
+
+        for k in state_dict_keys:
+            # Only care about mixq quantized tensors
+            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            if quant != "mixq":
+                continue
+
+            if not k.endswith(".fp_idx"):
+                continue
+
+            # Pop the original fp_idx tensor, derive its prefix
+            fp_idx = state_dict.pop(k)
+            if "." in k:
+                prefix, _name = k.rsplit(".", 1)
+            else:
+                prefix = ""
+
+            # Sort indices then group them
+            sorted_idx = torch.sort(fp_idx).values
+            outliers_idx_grouped, outliers_idx_start = (
+                hygon_mixq_kernels.group_outliers(sorted_idx, TILE)
+            )
+
+            state_dict[f"{prefix}.outliers_idx_grouped"] = outliers_idx_grouped
+            state_dict[f"{prefix}.outliers_idx_start"] = outliers_idx_start
+            state_dict[f"{prefix}.fp_idx"] = fp_idx
+
+        return state_dict
+
     def process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
         return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
 
@@ -598,6 +634,7 @@ class Transformer(nn.Module):
             state_dict = self.process_state_dict_for_merging_gate_up(state_dict)
             state_dict = self.process_state_dict_for_merging_experts(state_dict)
             state_dict = self.process_state_dict_for_blockfp4_after_chunk(state_dict)
+            state_dict = self.process_state_dict_for_hygon_mixq_index_select(state_dict)
 
         # Check inconsistent dtype
         keep_dtype_in_checkpoint = get_global_args().keep_dtype_in_checkpoint
