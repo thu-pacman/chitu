@@ -184,7 +184,13 @@ async def create_chat_completion(
         else:
             try:
                 full_response = await response.full_generator()
-                return JSONResponse(full_response.model_dump())
+                response_dict = full_response.model_dump()
+                response_dict.update(
+                    {
+                        "model": args.models.name,
+                    }
+                )
+                return JSONResponse(response_dict)
             except Exception as e:
                 raise HTTPException(status_code=400, detail=str(e))
     except ValueError:
