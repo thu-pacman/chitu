@@ -62,6 +62,10 @@ extras_require = {
         "cinfer_ascendc @ file://localhost"
         + os.path.join(setup_dir, "third_party/ascend-kernel"),
     ],
+    "sugon_mixq4_kernels": [
+        "sugon_mixq4_kernels @ file://localhost"
+        + os.path.join(setup_dir, "third_party/sugon_mixq4_kernels"),
+    ],
     ##########################################################################
     # Really third-party kernels
     "flash_attn": [

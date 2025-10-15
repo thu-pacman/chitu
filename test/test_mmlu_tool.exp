@@ -34,7 +34,11 @@ set world_size_arg [expr {$tp_size_arg * $pp_size_arg}]
 # Execute the check_npus.sh script to get NPU information
 set check_output [exec bash -c "source script/check_npus.sh 2>/dev/null"]
 
-exec pip install evalscope -i https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null
+exec pip install evalscope==1.0.2 -i https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null
+
+set version_output [exec sh -c {pip list | grep -i evalscope}]
+puts "EvalScope version: $version_output"
+
 
 # Initialize variables
 set USE_NPU 0
@@ -61,26 +65,29 @@ if {$USE_NPU == 1} {
 }
 
 # Launch the server
-spawn torchrun --nproc_per_node $world_size_arg -m chitu \
-    models=$model_arg \
-    models.ckpt_dir=$model_dir_arg \
-    infer.cache_type=paged \
-    $ATNN_TYPE_ARG \
-    infer.max_reqs=$eval_batch_size_arg \
-    infer.max_seq_len=1200 \
-    infer.tp_size=$tp_size_arg \
-    infer.pp_size=$pp_size_arg \
-    infer.use_cuda_graph=True
+set cmd "torchrun --nproc_per_node $world_size_arg -m chitu \
+  models=$model_arg \
+  serve.port=21002 \
+  models.ckpt_dir=$model_dir_arg \
+  infer.cache_type=paged \
+  infer.max_reqs=$eval_batch_size_arg \
+  infer.max_seq_len=8192 \
+  $ATNN_TYPE_ARG \
+  infer.tp_size=$tp_size_arg \
+  infer.pp_size=$pp_size_arg \
+  infer.use_cuda_graph=True \
+  request.max_new_tokens=4096 \
+  2>&1 | tee ./chitu_server.log"
 
-set pid [exp_pid]
-puts "Launching server, pid is $pid"
+exec /bin/bash -c $cmd &
+puts "Server started. Waiting 120 seconds for warm-up..."
 
-# Wait for the server to start
-expect -timeout -1 "Uvicorn running on"
+after 120000;
+
 puts "Starting MMLU evaluation..."
 
 set datasets_json "\[\"mmlu\"\]"
-set config_json "\{\"model\":\"$model_arg\", \"datasets\":$datasets_json,\"api_url\":\"http://localhost:21002/v1\", \"eval_type\":\"service\", \"eval_batch_size\":$eval_batch_size_arg\}"
+set config_json "\{\"model\":\"$model_arg\", \"datasets\":$datasets_json,\"limit\":30,\"api_url\":\"http://localhost:21002/v1/chat/completions\",\"ignore_errors\":true, \"eval_type\":\"openai_api\", \"eval_batch_size\":$eval_batch_size_arg\}"
 
 spawn python test/test_mmlu.py --config $config_json
 
@@ -88,4 +95,5 @@ expect -timeout -1 "Finished evaluation"
 
 puts "Evaluation completed. Terminating server..."
 puts "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-exec kill $pid
+exec pkill -f "torchrun.*-m chitu" 2>/dev/null
+after 3000;

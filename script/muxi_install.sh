@@ -54,7 +54,7 @@ else
     pip install \
         -i https://pypi.tuna.tsinghua.edu.cn/simple \
         .${OPTIONAL_DEPS_SPECIFIER} \
-        -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "flash-mla" | grep -v "flash_mla")
+        -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "flash-mla" | grep -v "flash_mla" | grep -v "pyzmq")
         rm -rf build chitu.egg-info
 
     # Remove the source code. We only need to run the installed package. Keep testings and scripts.

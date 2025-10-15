@@ -91,7 +91,11 @@ def silu_and_mul(x, impl="auto"):
             impl = "torch"
         elif has_torch_npu:
             impl = "torch_npu"
-        elif is_muxi() and x.shape.numel() // x.shape[-1] > 1024:
+        elif (
+            is_muxi()
+            and not isinstance(x, Vector)
+            and x.shape.numel() // x.shape[-1] > 1024
+        ):
             # triton implementation fails for large amount of tokens on Muxi.
             # This happens on prefill stage for large input lengths. (FIXME)
             impl = "torch"

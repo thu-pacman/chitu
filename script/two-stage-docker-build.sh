@@ -34,7 +34,7 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
 if [ "${dockerfile}" = "ascend.Dockerfile" ] || [ "${dockerfile}" = "ascend.a3.Dockerfile" ]; then
     install_script="./script/ascend_install.sh"
-elif [ "${dockerfile}" = "muxi.Dockerfile" ]; then
+elif [ "${dockerfile}" = "muxi.Dockerfile" ] || [ "${dockerfile}" = "hygon.Dockerfile" ]; then
     install_script="./script/muxi_install.sh"
 else
     echo "Unknown dockerfile: ${dockerfile}"

@@ -251,10 +251,6 @@ class Scheduler:
                     )
             else:
                 logger.debug(f"- {task_id}: Decode")
-        if task_ids:
-            logger.info(
-                f"Scheduled {len(task_ids)} {filter_task_type.name.lower()} tasks"
-            )
 
         return task_ids
 
