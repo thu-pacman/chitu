@@ -30,6 +30,8 @@ import asyncio
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 RESULT_FILE = "benchmark_results.jsonl"
+CI_PIPELINE_SOURCE = os.environ.get("CI_PIPELINE_SOURCE", "web")
+TIMEOUT = 300 if CI_PIPELINE_SOURCE == "schedule" else 1000
 
 
 @dataclass
@@ -157,7 +159,7 @@ class BenchmarkServing:
                     f"{self.base_url}/v1/chat/completions",
                     headers={"Content-Type": "application/json"},
                     json=payload,
-                    timeout=1000,
+                    timeout=TIMEOUT,
                 ) as response:
                     if response.status == 200:
                         first_chunk_received = False
@@ -237,7 +239,7 @@ class BenchmarkServing:
                 f"{self.base_url}/v1/chat/completions",
                 headers={"Content-Type": "application/json"},
                 json=payload,
-                timeout=1000,
+                timeout=TIMEOUT,
             )
 
             if response.status_code != 200:
