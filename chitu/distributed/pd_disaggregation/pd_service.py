@@ -8,6 +8,7 @@ Integrates PD components into cinfer scheduler service
 """
 
 import asyncio
+import time
 import logging
 from typing import Optional
 import os
@@ -16,6 +17,7 @@ import msgpack
 import zmq
 import zmq.asyncio
 
+from chitu.backend import Backend
 from chitu.distributed.parallel_state import get_tp_group
 from chitu.distributed.pd_disaggregation.pd_scheduler import (
     PDScheduler,
@@ -100,12 +102,8 @@ class PDSchedulerService:
 
     def _determine_tp_main_rank(self) -> bool:
         """Return True if current rank is TP main rank or TP is not initialized."""
-        try:
-            tp_group = get_tp_group()
-            return tp_group.global_rank == tp_group.rank_list[0]
-        except Exception:
-            # If TP is not initialized (tp_size==1), treat current as main
-            return True
+        tp_group = get_tp_group()
+        return tp_group.global_rank == tp_group.rank_list[0]
 
     def _init_scheduler(self):
         """Initialize the appropriate scheduler"""
@@ -158,15 +156,10 @@ class PDSchedulerService:
             await self._init_sockets()
 
             # Set cache manager for KVManager so that PD path can access KV buffers
-            try:
-                from chitu.backend import Backend
-
-                if self.scheduler is not None and hasattr(
-                    self.scheduler, "set_cache_manager"
-                ):
-                    self.scheduler.set_cache_manager(Backend.cache_manager)
-            except Exception as e:
-                logger.warning(f"failed to set cache manager for pd scheduler: {e}")
+            if self.scheduler is not None and hasattr(
+                self.scheduler, "set_cache_manager"
+            ):
+                self.scheduler.set_cache_manager(Backend.cache_manager)
 
             # Initialize DP token manager for streaming tokens back to Router
             # Only needed for Decode-only or Unified mode. Prefill-only does NOT send tokens.
@@ -207,14 +200,17 @@ class PDSchedulerService:
                     logger.warning(f"failed to init dp token manager: {e}")
             else:
                 logger.info("prefill-only mode: skip initializing token manager")
-                # Inject prefill-side KV hook
+                # Inject prefill-side KV hook only on TP main rank to avoid duplicate sends
                 try:
                     from chitu.backend import Backend as _Backend
-                    from chitu.hooks import MooncakeKVTransferHook
+                    from chitu.hooks import MooncakeKVTransferHook, NoopKVTransferHook
 
-                    kv_hook = MooncakeKVTransferHook(
-                        getattr(self.scheduler, "kv_manager", None), "prefill"
-                    )
+                    if self.is_tp_main_rank:
+                        kv_hook = MooncakeKVTransferHook(
+                            getattr(self.scheduler, "kv_manager", None), "prefill"
+                        )
+                    else:
+                        kv_hook = NoopKVTransferHook()
                     _Backend.executor.set_kv_hook(kv_hook)
                 except Exception as _e:
                     import traceback
@@ -431,13 +427,10 @@ class PDSchedulerService:
             logger.warning(f"decode warmup encountered error: {e}")
         finally:
             # Restore PD hooks after warmup
-            try:
-                if prev_hook is not None:
-                    Backend.executor.set_kv_hook(prev_hook)
-                if prev_sink is not None:
-                    Backend.executor.set_token_sink(prev_sink)
-            except Exception:
-                pass
+            if prev_hook is not None:
+                Backend.executor.set_kv_hook(prev_hook)
+            if prev_sink is not None:
+                Backend.executor.set_token_sink(prev_sink)
 
     async def _request_handler(self):
         """Handle incoming requests"""
@@ -483,6 +476,9 @@ class PDSchedulerService:
 
     def _collect_stats(self) -> dict:
         """Collect scheduler statistics"""
+        # Use event loop time if present; fallback to wall clock
+        last_update_ts = get_server_event_loop().time()
+
         stats = {
             "scheduler_id": self.rank,
             "scheduler_type": self.pd_mode.value,
@@ -490,7 +486,7 @@ class PDSchedulerService:
             "waiting_requests": 0,  # TODO: implement
             "pending_tokens": 0,  # TODO: implement
             "throughput_tokens_per_sec": 0.0,  # TODO: implement
-            "last_update_time": get_server_event_loop().time(),
+            "last_update_time": last_update_ts,
             "heartbeat": True,
         }
 

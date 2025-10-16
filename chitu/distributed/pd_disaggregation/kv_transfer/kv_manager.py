@@ -199,20 +199,31 @@ class KVManager:
         """Initialize Prefill mode"""
         logger.info("initializing kv manager in prefill mode")
 
+        # Only TP main rank should expose ZMQ service and drive transfer worker.
+        # Otherwise, Decode may register to a non-main Prefill endpoint, while
+        # the KVHook/worker live on the main rank, causing transfer_infos miss.
+        from chitu.distributed.parallel_state import get_tp_group
+
+        is_tp_main_rank = get_tp_group().is_first_rank
         # Prefill mode state
         self.decode_kv_args_table: dict[str, KVArgsRegisterInfo] = {}
         self.transfer_infos: dict[UUID, TransferInfo] = {}
 
-        # Start communication thread
-        self.start_prefill_thread()
+        if is_tp_main_rank:
+            # Start communication thread
+            self.start_prefill_thread()
 
-        # Register to coordination service if available
-        if self.pd_coordination_service:
-            # In cinfer, we use coordination service instead of bootstrap server
-            logger.info("using pd coordination service for prefill registration")
+            # Register to coordination service if available
+            if self.pd_coordination_service:
+                # In cinfer, we use coordination service instead of bootstrap server
+                logger.info("using pd coordination service for prefill registration")
+            else:
+                # Fallback to original bootstrap registration
+                self._register_to_bootstrap()
         else:
-            # Fallback to original bootstrap registration
-            self._register_to_bootstrap()
+            logger.info(
+                "prefill-only: TP non-main rank, skip ZMQ thread and bootstrap registration"
+            )
 
         # Transfer queue and worker
         self.transfer_queue: FastQueue = FastQueue()
@@ -220,11 +231,12 @@ class KVManager:
         transfer_thread_pool_size = min(max(4, int(0.75 * cpu_count) // 8), 12)
         self.executor = concurrent.futures.ThreadPoolExecutor(transfer_thread_pool_size)
 
-        threading.Thread(
-            target=self.transfer_worker,
-            args=(self.transfer_queue, self.executor),
-            daemon=True,
-        ).start()
+        if is_tp_main_rank:
+            threading.Thread(
+                target=self.transfer_worker,
+                args=(self.transfer_queue, self.executor),
+                daemon=True,
+            ).start()
 
     def _init_decode_mode(self):
         """Initialize Decode mode"""
@@ -364,15 +376,25 @@ class KVManager:
                     # parse int if possible; fallback to enum name parsing
                     try:
                         status_enum = KVPoll(int(status_str))
+                        status_val = status_enum.value
                     except Exception:
-                        status_enum = (
-                            KVPoll.Success
-                            if "Success" in status_str
-                            else KVPoll.Waiting
-                        )
-                    self.request_status[bootstrap_room] = status_enum
-                    logger.debug(
-                        f"received status update for room {bootstrap_room}: {status_enum}"
+                        if "Success" in status_str:
+                            status_val = KVPoll.Success.value
+                            status_enum = KVPoll.Success
+                        elif status_str.isdigit():
+                            status_val = int(status_str)
+                            try:
+                                status_enum = KVPoll(status_val)
+                            except Exception:
+                                status_enum = KVPoll.Waiting
+                        else:
+                            status_val = KVPoll.Waiting.value
+                            status_enum = KVPoll.Waiting
+
+                    # Persist as numeric to match waiting loop, but log enum for readability
+                    self.request_status[bootstrap_room] = status_val
+                    logger.info(
+                        f"received status update for room {bootstrap_room}: {status_enum} (raw={status_str})"
                     )
                 except Exception as e:
                     import traceback
@@ -516,11 +538,11 @@ class KVManager:
                                 remote_ip=req.endpoint,
                                 remote_port=req.dst_port,
                                 room=req.room,
-                                status=KVPoll.Success,
+                                status=KVPoll.Success.value,
                             )
 
                             # Update status
-                            self.request_status[kv_chunk.room] = KVPoll.Success
+                            self.request_status[kv_chunk.room] = KVPoll.Success.value
 
                             # Cleanup
                             if hasattr(self.cache_manager, "remove_task"):
@@ -628,14 +650,6 @@ class KVManager:
                     status_payload = str(status.value)
                 elif isinstance(status, int):
                     status_payload = str(status)
-                elif isinstance(status, str):
-                    status_payload = (
-                        "1"
-                        if "Success" in status
-                        else (status if status.isdigit() else "0")
-                    )
-                else:
-                    status_payload = "0"
                 socket.send_multipart([room.bytes, status_payload.encode("ascii")])
             finally:
                 socket.close()
@@ -834,7 +848,9 @@ class KVManager:
         resend_interval = 0.5
         while unfinished and (time.time() - start_wait) < timeout_s:
             done = [
-                r for r in unfinished if self.request_status.get(r) == KVPoll.Success
+                r
+                for r in unfinished
+                if self.request_status.get(r) == KVPoll.Success.value
             ]
             for r in done:
                 unfinished.remove(r)
