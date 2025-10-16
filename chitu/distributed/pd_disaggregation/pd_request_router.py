@@ -407,6 +407,8 @@ class PDRequestRouter(RequestRouter):
                 # True  -> allow generation beyond EOS (i.e., don't stop at EOS)
                 # False -> stop at EOS
                 "ignore_eos": not ignore_eos,
+                # Also include stop_with_eos explicitly to avoid default being misread downstream
+                "stop_with_eos": ignore_eos,
                 "chat_template_kwargs": chat_template_kwargs,
             }
         except Exception:

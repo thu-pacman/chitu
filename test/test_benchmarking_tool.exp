@@ -5,7 +5,8 @@ set model_arg "Qwen3-32B"
 set model_dir_arg "/data/nfs/Qwen3-32B"
 set tp_size_arg 2
 set cache_type_arg "paged"
-set batch_sizes_arg "1 2 4 8 16 32"
+set max_reqs_arg 64
+set batch_sizes_arg ""
 set send_notification 1
 if {[info exists env(FEISHU_BOT_URL)]} {
     set webhook_url_arg $env(FEISHU_BOT_URL)
@@ -29,6 +30,9 @@ if {[llength $argv] > 0} {
         } elseif {$arg eq "--cache-type"} {
             incr i
             set cache_type_arg [lindex $argv $i]
+        } elseif {$arg eq "--benchmark-max-batch-size"} {
+            incr i
+            set max_reqs_arg [lindex $argv $i]
         } elseif {$arg eq "--benchmark-batch-sizes"} {
             incr i
             set batch_sizes_arg [lindex $argv $i]
@@ -75,7 +79,7 @@ if {$USE_NPU == 1} {
 
 # Configure model-specific parameters
 set extra_args ""
-set MAX_REQS 128
+set MAX_REQS $max_reqs_arg
 
 # Special handling for DeepSeek-R1 models
 if {[string first "DeepSeek-R1" $model_arg] != -1} {
@@ -86,14 +90,16 @@ if {[string first "DeepSeek-R1" $model_arg] != -1} {
         append extra_args " infer.npu_fusion_fp4=True"
         append extra_args " infer.raise_lower_bit_float_to=bfloat16"
         append extra_args " keep_dtype_in_checkpoint=True"
-        set MAX_REQS 8
     }
 }
 
 puts "Model extra args: $extra_args"
+set MASTER_PORT [expr {int(rand() * 1000) + 51000}]
+set SERVE_PORT [expr {int(rand() * 1000) + 21003}]
+set extra_args {*}$extra_args
 
 # Launch the server
-spawn torchrun --nproc_per_node $tp_size_arg -m chitu \
+spawn sh -c "torchrun --nproc_per_node $tp_size_arg --master_port $MASTER_PORT -m chitu \
     models=$model_arg \
     models.ckpt_dir=$model_dir_arg \
     infer.cache_type=$cache_type_arg \
@@ -102,10 +108,21 @@ spawn torchrun --nproc_per_node $tp_size_arg -m chitu \
     infer.max_seq_len=1200 \
     infer.tp_size=$tp_size_arg \
     infer.use_cuda_graph=True \
-    {*}$extra_args
+    serve.port=$SERVE_PORT \
+    $extra_args | tee /data/nfs/daily_benchmark_debug/logfile.txt"
 
 set pid [exp_pid]
 puts "Launching server, pid is $pid"
+
+# Time limit
+after 1800000 {
+    puts "Reaching the time limit: $pid, killing..."
+    if {[catch {exec kill -9 $pid} err]} {
+        puts "Error: $err"
+    } else {
+        puts "Service(PID: $pid) killed"
+    }
+}
 
 # Wait for the server to start
 expect -timeout -1 "Uvicorn running on"
@@ -127,7 +144,16 @@ append benchmark_formated_records [format $column_format "------------" "-------
 append benchmark_formated_records "\n\n"
 
 # Loop over batch sizes
-set batch_sizes [split $batch_sizes_arg " "]
+if {$batch_sizes_arg eq ""} {
+    set bs 1
+    set batch_sizes [list]
+    while {$bs <= $MAX_REQS} {
+        lappend batch_sizes $bs
+        set bs [expr {$bs * 2}]
+    }
+} else {
+    set batch_sizes [split $batch_sizes_arg " "]
+}
 foreach bs $batch_sizes {
     puts "Starting test with batch size = $bs..."
 
@@ -140,7 +166,7 @@ foreach bs $batch_sizes {
             --warmup 1 \
             --input-len 128 \
             --output-len 1024 \
-            --base-url http://127.0.0.1:21002 2>@1]
+            --base-url http://127.0.0.1:$SERVE_PORT 2>@1]
     } err]} {
         puts "Benchmark failed for batch size $bs: $err"
         set duration "N/A"
@@ -149,6 +175,7 @@ foreach bs $batch_sizes {
         set mean_tpot "N/A"
         set mean_ttft "N/A"
     } else {
+        puts $output
         # Extract metrics
         set duration [exec echo $output | grep "Benchmark duration" | awk {{print $NF}} 2>/dev/null]
         set output_throughput [exec echo $output | grep "Output token throughput" | awk {{print $NF}} 2>/dev/null]
@@ -167,6 +194,7 @@ foreach bs $batch_sizes {
     # Append formatted record
     append benchmark_formated_records [format $column_format $bs $duration $output_throughput $mean_ttft $mean_tpot $total_throughput]
     append benchmark_formated_records "\n"
+    sleep 1
 }
 # Print table
 puts "==================== BENCHMARK SUMMARY ===================="

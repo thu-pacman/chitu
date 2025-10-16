@@ -30,9 +30,7 @@ ENV TZ=Etc/UTC
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# NOTE: Always apt update before apt install to avoid out-dated docker cache
-RUN if [ "${enable_test}" = "true" ]; then \
-    printf '%s\n' \
+RUN printf '%s\n' \
       "deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy main restricted universe multiverse" \
       "deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy-updates main restricted universe multiverse" \
       "deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy-backports main restricted universe multiverse" \
@@ -41,10 +39,21 @@ RUN if [ "${enable_test}" = "true" ]; then \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates; \
     update-ca-certificates; \
-    sed -i 's|http://mirrors.tuna.tsinghua.edu.cn|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list; \
+    sed -i 's|http://mirrors.tuna.tsinghua.edu.cn|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
+
+# NOTE: Always apt update before apt install to avoid out-dated docker cache
+# NOTE: g++-11 a downgrading of g++, which is required by compiling muxi_layout_kernels. This is
+#       because mxcc can't compile C++20 when g++ is too new.
+RUN apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends g++-11; \
+    rm -rf /var/lib/apt/lists/*
+RUN if [ "${enable_test}" = "true" ]; then \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends expect vim tmux telnet htop lsof strace iputils-ping curl; \
     rm -rf /var/lib/apt/lists/*; \
+fi
+
+RUN if [ "${enable_test}" = "true" ]; then \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp; \
 fi
 

@@ -770,7 +770,7 @@ class Executor:
         # 1) propagate tasks across TP
         tensor_dispatcher = TensorDispatcher()
         payload_type = tasks.payload_type
-        payload_type, tasks = tensor_dispatcher.dispatch_metadata(tasks, payload_type)
+        payload_type, tasks = tensor_dispatcher.dispatch_metadata(tasks)
 
         # 2) prepare cache
         Backend.cache_manager.prepare_cache_prefill(

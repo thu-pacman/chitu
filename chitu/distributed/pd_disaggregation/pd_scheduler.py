@@ -54,7 +54,12 @@ class PDScheduler(Scheduler):
     ):
         # Filter out PD-specific scheduler types before passing to parent
         filtered_scheduler_type = self._filter_scheduler_type(scheduler_type)
-        super().__init__(prefill_num_tasks, decode_num_tasks, filtered_scheduler_type)
+        super().__init__(
+            prefill_num_tasks,
+            decode_num_tasks,
+            filtered_scheduler_type,
+            get_global_args().infer.pp_size,
+        )
 
         self.pd_mode = pd_mode
         self.scheduler_id = scheduler_id
@@ -342,15 +347,15 @@ class PDScheduler(Scheduler):
 
         # From dict payload
         if isinstance(request, dict):
-            if request.get("ignore_eos"):
+            if request.get("ignore_eos") is True:
                 stop_with_eos = False
-            elif not request.get("stop_with_eos"):
+            elif request.get("stop_with_eos") is False:
                 stop_with_eos = False
         else:
             # From object payloads
-            if getattr(request, "ignore_eos", False):
+            if getattr(request, "ignore_eos", False) is True:
                 stop_with_eos = False
-            elif not getattr(request, "stop_with_eos", True):
+            elif getattr(request, "stop_with_eos", None) is False:
                 stop_with_eos = False
 
         task = Task(
@@ -465,6 +470,12 @@ class PDScheduler(Scheduler):
             # Fallback to direct add if wrapper not present
             task.req.add_data(next_token)
 
+        # Early stop on EOS right after first token if needed
+        if task.stop_with_eos and task.next_token in Backend.tokenizer.stop_tokens:
+            task.req.finish_reason = "stop"
+            logger.info(f"decode completed for task: {task.task_id}")
+            return
+
         max_new = task.req.max_new_tokens
         req_id = task.req.request_id
 
@@ -478,6 +489,9 @@ class PDScheduler(Scheduler):
                 task.req.add_data(next_token)
 
             # Cache finalize is handled inside decode_step_tp_only
+            if task.stop_with_eos and task.next_token in Backend.tokenizer.stop_tokens:
+                task.req.finish_reason = "stop"
+                break
 
         logger.info(f"decode completed for task: {task.task_id}")
 
