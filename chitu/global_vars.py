@@ -156,8 +156,8 @@ def get_debug():
 
 def _set_slot_handle(max_reqs, pp_size, cache_type):
     global _GLOBAL_SLOT_HANDLE
-    _ensure_var_is_not_initialized(_GLOBAL_SLOT_HANDLE, "slot_handle")
-    if cache_type == "skew" and pp_size > 1:
+    # _ensure_var_is_not_initialized(_GLOBAL_SLOT_HANDLE, "slot_handle")
+    if cache_type == "skew":
         _GLOBAL_SLOT_HANDLE = SlotHandle(max_reqs, pp_size)
 
 

@@ -28,7 +28,11 @@ class Scheduler:
             return DPFifoScheduler(infer_args.max_reqs)
 
         if get_slot_handle():
-            return SkewPipelineScheduler(infer_args.max_reqs)
+            return SkewScheduler(
+                infer_args.max_reqs,
+                args.type.lower(),
+                infer_args.prefill_chunk_size,
+            )
 
         if infer_args.pp_size > 1:
             if args.pp_config.prefill_num_tasks_divided_by_pp:
@@ -117,9 +121,7 @@ class Scheduler:
             range(num_scheduler_groups)
         )  # scheduler group doesn't have any waiting task.
         self.used_sgroups = set()  # scheduler group has waiting tasks.
-        self.sgroup_waiting_cnt = defaultdict(
-            int
-        )  # {sched_group_id: waiting_tasks_count}.
+        self.sgroup_waiting_tasks = defaultdict(set)  # {sched_group_id: waiting_tasks}.
 
         # strict-only gating derived from original type string
         self.strict_allowed_task_type = self._extract_strict_task_type(
@@ -228,9 +230,10 @@ class Scheduler:
         if filter_task_type == TaskType.Decode:
             task_ids = self._schedule_decode_tasks(task_ids)[: self.decode_num_tasks]
 
+        # Allocate sgroup for for task_ids
         sgroup_id = self.free_sgroups.popleft()
         self.used_sgroups.add(sgroup_id)
-        self.sgroup_waiting_cnt[sgroup_id] = len(task_ids)
+        self.sgroup_waiting_tasks[sgroup_id] = set(task_ids)
 
         # postprocess
         for task_id in task_ids:
@@ -305,22 +308,24 @@ class Scheduler:
             )
 
         if self.prefill_chunk_size is not None:
-            prefill_tokens = 0
-            for i in range(len(prefill_task_ids)):
-                task = TaskPool.pool[prefill_task_ids[i]]
-                task_remaining_tokens = (
-                    task.prefix_tokens_len - task.consumed_req_tokens
-                )
-                task_prefill_chunk_size = min(
-                    task_remaining_tokens, self.prefill_chunk_size - prefill_tokens
-                )
-                task.set_prefill_chunk_size_for_one_step(task_prefill_chunk_size)
-                prefill_tokens += task_prefill_chunk_size
-                if prefill_tokens >= self.prefill_chunk_size:
-                    prefill_task_ids = prefill_task_ids[: i + 1]
-                    break
+            num_chunk_prefill_tasks = self._chunk_prefill_tasks_count(prefill_task_ids)
+            prefill_task_ids = prefill_task_ids[:num_chunk_prefill_tasks]
 
         return prefill_task_ids[:num_tasks]
+
+    def _chunk_prefill_tasks_count(self, prefill_task_ids: list[str]) -> int:
+        prefill_tokens = 0
+        for i in range(len(prefill_task_ids)):
+            task = TaskPool.pool[prefill_task_ids[i]]
+            task_remaining_tokens = task.prefix_tokens_len - task.consumed_req_tokens
+            task_prefill_chunk_size = min(
+                task_remaining_tokens, self.prefill_chunk_size - prefill_tokens
+            )
+            task.set_prefill_chunk_size_for_one_step(task_prefill_chunk_size)
+            prefill_tokens += task_prefill_chunk_size
+            if prefill_tokens >= self.prefill_chunk_size:
+                return i + 1
+        return i + 1
 
     def _schedule_decode_tasks(self, task_ids: list[str]) -> list[str]:
         """Decode tasks scheduling, evicting the last prioriety decode task when these is no more block
@@ -449,17 +454,14 @@ class Scheduler:
         self.reorder_tasks_for_batching(task_ids)
         for task_id in task_ids:
 
-            # Update scheduler group status.
+            # Update Task's sched_group_id and  sgroup_waiting_cnt
             if (
                 not TaskPool.pool[task_id].waiting
                 and TaskPool.pool[task_id].sched_group_id is not None
             ):
                 sgroup_id = TaskPool.pool[task_id].sched_group_id
-                self.sgroup_waiting_cnt[sgroup_id] -= 1
-                TaskPool.pool[task_id].sched_group_id = None
-                if self.sgroup_waiting_cnt[sgroup_id] == 0:
-                    self.used_sgroups.remove(sgroup_id)
-                    self.free_sgroups.append(sgroup_id)
+                self.sgroup_waiting_tasks[sgroup_id].remove(task_id)
+                # TaskPool.pool[task_id].sched_group_id = None
 
             if TaskPool.pool[task_id].need_remove():
                 if TaskPool.pool[task_id].task_type == TaskType.Decode:
@@ -472,6 +474,13 @@ class Scheduler:
                         f"Task({task_id}) finished decoding, increasing kvcache_block_threshold to {self.kvcache_block_threshold}, while the number of total blocks is {num_total_blocks}"
                     )
                 TaskPool.remove(task_id)
+
+        # Update used_sgroups and free_sgroups according to sgroup status
+        if not isinstance(self, DPFifoScheduler):
+            for sgroup_id in list(self.used_sgroups):
+                if len(self.sgroup_waiting_tasks[sgroup_id]) == 0:
+                    self.used_sgroups.remove(sgroup_id)
+                    self.free_sgroups.append(sgroup_id)
 
         if removed_task_ids:
             logger.info(
@@ -488,57 +497,143 @@ class Scheduler:
         return len(TaskPool.pool) == 0
 
 
-class SkewPipelineScheduler(Scheduler):
+class SkewScheduler(Scheduler):
 
-    def __init__(self, max_reqs: int):
+    def __init__(
+        self,
+        max_reqs: int,
+        original_scheduler_type: str,
+        prefill_chunk_size: Optional[int] = None,
+    ):
         super().__init__(
-            max_reqs, max_reqs, "prefill_first", get_global_args().infer.pp_size
+            ceil_div(max_reqs, get_slot_handle().num_slots),  # prefill_num_tasks
+            ceil_div(max_reqs, get_slot_handle().num_slots),  # decode_num_tasks
+            Scheduler._normalize_scheduler_type(original_scheduler_type),
+            num_scheduler_groups=get_slot_handle().num_slots,
+            original_scheduler_type=original_scheduler_type,
+            prefill_chunk_size=prefill_chunk_size,
         )
-        self.max_reqs = max_reqs
         self.slot_handle = get_slot_handle()
-        self.decode_slots = [[] for _ in range(self.slot_handle.num_slots)]
-        self.slot_id = 0
+        self.sgroup_list = [[] for _ in range(self.slot_handle.num_slots)]
+        self.sgroup_waiting_tasks = defaultdict(set)  # {slot_group_id: waiting_tasks}
+        self.free_sgroups = deque(
+            range(self.slot_handle.num_slots)
+        )  # free slot_group doesn't have any waiting tasks
+        self.used_sgroups = set()  # used slot_group has one or more waiting task.
 
     @override
     def schedule(self) -> list[str]:
-        # search unwaiting prefill tasks
-        prefill_task_ids = list(
-            filter(
-                lambda x: TaskPool.pool[x].task_type == TaskType.Prefill
-                and not TaskPool.pool[x].waiting,
-                TaskPool.id_list,
-            )
+
+        # no available slot group
+        if not self.free_sgroups:
+            logger.debug("No available slot group, returning empty task list.")
+            return []
+
+        if TaskPool.is_empty():
+            logger.debug("TaskPool is empty, returning empty task list.")
+            return []
+
+        # collect ready task ids
+        task_ids = list(
+            filter(lambda x: not TaskPool.pool[x].waiting, TaskPool.id_list)
         )
 
-        # find slot_group with one or more empty slots
-        local_idx = -1
-        num_tasks = 0
-        for idx, slots in enumerate(self.decode_slots):
-            slot_group_capacity = self.slot_handle.get_slot_size(idx)
-            if len(slots) < slot_group_capacity:
-                local_idx = idx
-                num_tasks = slot_group_capacity - len(slots)
-                break
+        # enforce strict-only gating if enabled
+        if getattr(self, "strict_allowed_task_type", None) is not None:
+            task_ids = [
+                tid
+                for tid in task_ids
+                if TaskPool.pool[tid].task_type == self.strict_allowed_task_type
+            ]
+            if len(task_ids) == 0:
+                logger.debug(
+                    "Strict-only gating active and no allowed tasks available."
+                )
+                return []
+        if len(task_ids) == 0:
+            logger.debug("All tasks are waiting, returning empty task list.")
+            return []
 
-        ret_task_ids = []
-        if local_idx != -1 and num_tasks > 0 and prefill_task_ids:
-            # add prefill tasks into selected slot_group: local_idx
-            ret_task_ids = prefill_task_ids[:num_tasks]
-            self.decode_slots[local_idx].extend(ret_task_ids)
-            self.slot_handle.set_slot_idx(local_idx)
+        # Prepare to schedule the earlist released free slot group
+        sgroup_id = self.free_sgroups.popleft()
+        sgroup_capacity = self.slot_handle.get_slot_size(sgroup_id)
+        sgroup = self.sgroup_list[sgroup_id]
+        self.used_sgroups.add(sgroup_id)
+        self.slot_handle.set_slot_idx(
+            sgroup_id
+        )  # To inform kvcache the current dealing sgroup_id
 
-        # totally separate prefilling and decoding stages
-        if not ret_task_ids:
-            for idx, slot_ids in enumerate(self.decode_slots):
-                if slot_ids and all(
-                    not TaskPool.pool[slot_id].waiting for slot_id in slot_ids
-                ):
-                    decode_task_ids = slot_ids[: self.max_reqs]
-                    ret_task_ids.extend(decode_task_ids)
-                    self.slot_handle.set_slot_idx(idx)
-                    break
+        # When slot_group's lenght smaller than it's capacity, fill new tasks into it.
+        if len(sgroup) < sgroup_capacity:
 
+            # Only sort tasks outside the slot_group
+            task_ids = list(
+                filter(
+                    lambda x: TaskPool.pool[x].sched_group_id is None,
+                    task_ids,
+                )
+            )
+            task_ids.sort(
+                key=lambda x: self.scorer(TaskPool.pool[x]),
+                reverse=True,  # Largest first
+            )  # list.sort is a stable sort
+
+            if sgroup:
+                # Tasks already exists in slot_group
+                filter_task_type = TaskPool.pool[sgroup[-1]].task_type
+            elif task_ids:
+                # There are no tasks in slot_group, but are tasks outside the slot_group
+                filter_task_type = TaskPool.pool[task_ids[0]].task_type
+            else:
+                logger.debug(
+                    "All tasks are allocated into other slot groups, return empty task list."
+                )
+                return []
+
+            task_ids = list(
+                filter(
+                    lambda task_id: TaskPool.pool[task_id].task_type
+                    == filter_task_type,
+                    task_ids,
+                )
+            )
+            sgroup_remaining_capacity = sgroup_capacity - len(sgroup)
+            sgroup.extend(task_ids[:sgroup_remaining_capacity])
+
+        for task_id in sgroup:
+            TaskPool.pool[task_id].sched_group_id = sgroup_id
+
+        # When chunk_prefill enable, task type in a slot group may be like: [Decode, ... Decode, Prefill, ... Prefill]
+        start_pos = 0
+        if (
+            self.prefill_chunk_size is not None
+            and TaskPool.pool[sgroup[-1]].task_type == TaskType.Prefill
+        ):
+            start_pos = self.find_prefill_task_start_pos_sgroup(sgroup)
+        ret_task_ids = sgroup[start_pos:]
+
+        # Apply chunk prefill
+        if (
+            TaskPool.pool[sgroup[-1]].task_type == TaskType.Prefill
+            and self.prefill_chunk_size is not None
+        ):
+            num_tasks = self._chunk_prefill_tasks_count(ret_task_ids)
+            ret_task_ids = ret_task_ids[:num_tasks]
+
+        self.sgroup_waiting_tasks[sgroup_id] = set(ret_task_ids)
         return ret_task_ids
+
+    def find_prefill_task_start_pos_sgroup(self, sgroup):
+        n = len(sgroup)
+        left, right = 0, n  # [left,right)
+        while left < right:
+            mid = (left + right) // 2
+            task = TaskPool.pool[sgroup[mid]]
+            if task.task_type == TaskType.Prefill:
+                right = mid
+            else:
+                left = mid + 1
+        return right
 
     @override
     def reorder_tasks_for_batching(self, task_ids):
@@ -547,12 +642,10 @@ class SkewPipelineScheduler(Scheduler):
             for task_id in task_ids:
                 if TaskPool.pool[task_id].need_remove():
                     if TaskPool.pool[task_id].task_type == TaskType.Decode:
-                        for lst in self.decode_slots:
-                            if task_id in lst:
-                                index = lst.index(task_id)
-                                lst[index] = lst[-1]
-                                lst.pop()
-                                break
+                        sgroup = self.sgroup_list[TaskPool.pool[task_id].sched_group_id]
+                        index = sgroup.index(task_id)
+                        sgroup[index] = sgroup[-1]
+                        sgroup.pop()
 
 
 class DPFifoScheduler(Scheduler):  # used for expert_data_parallel
