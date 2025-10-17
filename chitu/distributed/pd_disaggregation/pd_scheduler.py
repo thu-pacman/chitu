@@ -462,6 +462,7 @@ class PDScheduler(Scheduler):
             next_token = torch.argmax(prefill_logits_local.view(-1)).item()
         else:
             raise ValueError("no logits available for decode")
+        assert isinstance(next_token, int)
 
         # Use Task API so DP wrapper can stream token back to Router
         try:
@@ -483,6 +484,7 @@ class PDScheduler(Scheduler):
             # Decode one step via TP-only executor path
             step_logits = Backend.executor.decode_step_tp_only([req_id], [next_token])
             next_token = torch.argmax(step_logits.view(-1)).item()
+            assert isinstance(next_token, int)
             try:
                 task.update_response_sync(next_token)
             except Exception:

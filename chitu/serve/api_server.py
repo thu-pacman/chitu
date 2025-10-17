@@ -239,7 +239,7 @@ async def get_chitu_load_status():
 
 
 @app.post("/ping")
-async def get_chitu_status():
+async def get_chitu_ping():
     return {"message": "Connection succeeded"}
 
 
@@ -252,7 +252,7 @@ async def health():
 
 
 async def process_dp_chat_completion(
-    request: ChatRequest, http_header: Annotated[HttpHeader, Header()] = None
+    request: ChatRequest, http_header: Annotated[HttpHeader, Header()]
 ):
     """Process chat completion request using DP mode"""
     global dp_service_started

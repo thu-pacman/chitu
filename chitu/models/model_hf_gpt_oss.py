@@ -349,7 +349,7 @@ class TransformerHFGptOss(TransformerHFLlama):
     @override
     def load_state_dict_parallel(
         self,
-        state_dict: Mapping[str, Any],
+        state_dict: dict[str, Any],
         *args,
         skip_preprocess: bool = False,
         replace=True,
@@ -381,7 +381,7 @@ class TransformerHFGptOss(TransformerHFLlama):
             state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )
 
-    def gpt_oss_force_splitting_gate_up(self, checkpoint: Mapping[str, Any]):
+    def gpt_oss_force_splitting_gate_up(self, checkpoint: dict[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
             if k.endswith(".gate_up_proj"):
@@ -407,7 +407,7 @@ class TransformerHFGptOss(TransformerHFLlama):
                 new_checkpoint[k] = checkpoint[k]
         return new_checkpoint
 
-    def _process_state_dict_for_splitting_experts(self, checkpoint: Mapping[str, Any]):
+    def _process_state_dict_for_splitting_experts(self, checkpoint: dict[str, Any]):
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -430,12 +430,12 @@ class TransformerHFGptOss(TransformerHFLlama):
         return new_checkpoint
 
     @override
-    def process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
+    def process_state_dict_for_merging_gate_up(self, checkpoint: dict[str, Any]):
         # TODO: skip merging gate up here, probably need merging in cuda implement
         return checkpoint
 
     @override
-    def process_state_dict_for_merging_experts(self, checkpoint: Mapping[str, Any]):
+    def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
         """
         if not TP, already merged, no tensors modified, just change name
         """

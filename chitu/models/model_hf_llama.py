@@ -4,7 +4,7 @@
 
 import math
 from logging import getLogger
-from typing import Any, Mapping
+from typing import Any
 from typing_extensions import override
 
 import torch
@@ -435,7 +435,7 @@ class TransformerHFLlama(Transformer):
     def _get_layer_i_prefixes(self, i: int) -> list[str]:
         return [f"layers.{i}."]
 
-    def _process_state_dict_for_splitting_qkv(self, checkpoint: Mapping[str, Any]):
+    def _process_state_dict_for_splitting_qkv(self, checkpoint: dict[str, Any]):
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -482,7 +482,7 @@ class TransformerHFLlama(Transformer):
                 continue
         return checkpoint
 
-    def _process_state_dict_for_splitting_gate_up(self, checkpoint: Mapping[str, Any]):
+    def _process_state_dict_for_splitting_gate_up(self, checkpoint: dict[str, Any]):
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -507,7 +507,7 @@ class TransformerHFLlama(Transformer):
         return checkpoint
 
     @override
-    def process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
+    def process_state_dict_for_merging_qkv(self, checkpoint: dict[str, Any]):
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -581,7 +581,7 @@ class TransformerHFLlama(Transformer):
         return checkpoint
 
     @override
-    def process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
+    def process_state_dict_for_merging_gate_up(self, checkpoint: dict[str, Any]):
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -640,8 +640,8 @@ class TransformerHFLlama(Transformer):
         return checkpoint
 
     def _process_state_dict_for_repeat_kv_head(
-        self, checkpoint: Mapping[str, Any], repeats: int
-    ) -> Mapping[str, Any]:
+        self, checkpoint: dict[str, Any], repeats: int
+    ) -> dict[str, Any]:
         """Repeat each kv_head weight [repeats] times, adapt to the situation where tp_size>n_kv_heads
         Args:
             checkpoint: state_dict after applying self._process_state_dict_for_splitting_qkv if not skip_preprocess
@@ -665,7 +665,7 @@ class TransformerHFLlama(Transformer):
 
     def load_state_dict_parallel(
         self,
-        state_dict: Mapping[str, Any],
+        state_dict: dict[str, Any],
         *args,
         skip_preprocess: bool = False,
         **kwargs,

@@ -955,7 +955,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
 
     def load_state_dict_parallel(
         self,
-        state_dict: Mapping[str, Any],
+        state_dict: dict[str, Any],
         *args,
         skip_preprocess: bool = False,
         **kwargs,

@@ -945,7 +945,7 @@ class TransformerDeepSeekV3(Transformer):
         return [f"layers.{i}."]
 
     @override
-    def process_state_dict_for_merging_experts(self, checkpoint: Mapping[str, Any]):
+    def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
         fuse_shared_experts = get_global_args().infer.fuse_shared_experts
 
         checkpoint_keys = list(checkpoint.keys())
@@ -980,7 +980,7 @@ class TransformerDeepSeekV3(Transformer):
         return checkpoint
 
     def _process_state_dict_for_absorption_without_precomputation(
-        self, checkpoint: Mapping[str, Any]
+        self, checkpoint: dict[str, Any]
     ):
         model_parallel_size = get_tp_size()
         n_local_heads = self.params.n_heads // model_parallel_size
@@ -1054,7 +1054,7 @@ class TransformerDeepSeekV3(Transformer):
 
         return checkpoint
 
-    def _process_state_dict_for_absorption(self, checkpoint: Mapping[str, Any]):
+    def _process_state_dict_for_absorption(self, checkpoint: dict[str, Any]):
         model_parallel_size = get_tp_size()
         n_local_heads = self.params.n_heads // model_parallel_size
 
@@ -1341,7 +1341,7 @@ class TransformerDeepSeekV3(Transformer):
         return checkpoint
 
     @override
-    def process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
+    def process_state_dict_for_merging_qkv(self, checkpoint: dict[str, Any]):
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -1398,7 +1398,7 @@ class TransformerDeepSeekV3(Transformer):
         return checkpoint
 
     @override
-    def process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
+    def process_state_dict_for_merging_gate_up(self, checkpoint: dict[str, Any]):
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -1459,7 +1459,7 @@ class TransformerDeepSeekV3(Transformer):
     @override
     def load_state_dict_parallel(
         self,
-        state_dict: Mapping[str, Any],
+        state_dict: dict[str, Any],
         *args,
         skip_preprocess: bool = False,
         replace=True,
@@ -1480,7 +1480,7 @@ class TransformerDeepSeekV3(Transformer):
     @override
     def load_state_dict(
         self,
-        state_dict: Mapping[str, Any],
+        state_dict: dict[str, Any],
         *args,
         skip_preprocess: bool = False,
         **kwargs,

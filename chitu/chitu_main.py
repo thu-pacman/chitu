@@ -576,7 +576,7 @@ def chitu_run():
         chitu_run_normal()
 
 
-async def start_enhanced_scheduler_service(rank: int, dp_config: dict, args):
+async def start_enhanced_scheduler_service(rank: int, dp_config, args):
     # only main rank of dp group start enhanced scheduler service
     dp_id = args.dp_config.dp_id
     if rank != 0:
