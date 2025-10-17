@@ -25,7 +25,7 @@ ENV TZ=Etc/UTC
 
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 
-RUN apt update -y && apt install -y git gcc-10 g++-10 libnuma-dev
+RUN apt update -y && apt install -y git gcc-10 g++-10 libnuma-dev wget
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -78,6 +78,12 @@ RUN --mount=type=bind,source=./third_party,target=./third_party,readwrite \
     --mount=type=bind,source=./csrc/cpuinfer,target=./csrc/cpuinfer,readwrite \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec")
 
+RUN mkdir -p /workspace/chitu/lib/nvshmem && \
+    cd /tmp && \
+    wget https://chitu.tos-cn-beijing.volces.com/deps/libnvshmem-linux-x86_64-3.4.5_cuda12-archive.tar.xz && \
+    tar -xvf libnvshmem-linux-x86_64-3.4.5_cuda12-archive.tar.xz -C /workspace/chitu/lib/nvshmem --strip-components=1 && \
+    rm libnvshmem-linux-x86_64-3.4.5_cuda12-archive.tar.xz
+
 #####################################
 # Wheel build Stage
 #
@@ -115,3 +121,5 @@ COPY ./benchmarks ./benchmarks
 # worse, so we don't use them.
 ENV NCCL_GRAPH_MIXING_SUPPORT=0
 ENV NCCL_GRAPH_REGISTER=0
+
+ENV NVSHMEM_DIR=/workspace/chitu/lib/nvshmem
