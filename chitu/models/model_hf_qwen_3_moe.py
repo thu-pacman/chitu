@@ -79,7 +79,11 @@ class ParallelMoeBlockQwen3(ParallelMoeBlock):
         base_moe_experts_class: Optional[type] = None,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
     ):
-        quant_kwargs = {"blockfp4": {}, "blockfp4_merged": {}}
+        quant_kwargs = dict(quant_kwargs)
+        if "blockfp4" not in quant_kwargs:
+            quant_kwargs["blockfp4"] = {}
+        if "blockfp4_merged" not in quant_kwargs:
+            quant_kwargs["blockfp4_merged"] = {}
         if hasattr(args, "no_input_scale"):
             quant_kwargs["blockfp4"]["no_input_scale"] = args.no_input_scale
             quant_kwargs["blockfp4_merged"]["no_input_scale"] = args.no_input_scale
@@ -169,7 +173,7 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
         )
 
     @override
-    def process_state_dict_for_merging_experts(self, checkpoint: Mapping[str, Any]):
+    def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
         """
         重构专家权重结构的函数
         参数格式示例：

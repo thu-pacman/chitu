@@ -334,7 +334,7 @@ class Transformer(nn.Module):
 
     def _chunk_checkpoint_for_pipeline_parallel(
         self,
-        checkpoint,
+        checkpoint: dict[str, Any],
         num_layers: int,
         rank: int,
         world_size: int,
@@ -369,7 +369,7 @@ class Transformer(nn.Module):
 
     def _chunk_checkpoint_for_tensor_parallel(
         self,
-        checkpoint,
+        checkpoint: dict[str, Any],
         rank: int,
         world_size: int,
     ):
@@ -477,8 +477,7 @@ class Transformer(nn.Module):
 
         return partial_checkpoint
 
-    def process_state_dict_for_blockfp4_before_chunk(self, state_dict):
-
+    def process_state_dict_for_blockfp4_before_chunk(self, state_dict: dict[str, Any]):
         # TODO: move it into utils
         BLOCKFP4_VARIANTS = ("blockfp4", "blockfp4_merged")
 
@@ -521,7 +520,7 @@ class Transformer(nn.Module):
         param.data = param.data.transpose(-2, -1).contiguous().transpose(-2, -1)
         return param
 
-    def process_state_dict_for_blockfp4_after_chunk(self, state_dict):
+    def process_state_dict_for_blockfp4_after_chunk(self, state_dict: dict[str, Any]):
         state_dict_keys = list(state_dict.keys())
         for k in state_dict_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -538,7 +537,9 @@ class Transformer(nn.Module):
                 state_dict[k] = param
         return state_dict
 
-    def process_state_dict_for_hygon_mixq_index_select(self, state_dict):
+    def process_state_dict_for_hygon_mixq_index_select(
+        self, state_dict: dict[str, Any]
+    ):
         hygon_mixq_kernels, has_hygon = try_import_platform_dep("sugon_mixQ4_kernels")
         if not has_hygon:
             return state_dict
@@ -574,18 +575,18 @@ class Transformer(nn.Module):
 
         return state_dict
 
-    def process_state_dict_for_merging_qkv(self, checkpoint: Mapping[str, Any]):
+    def process_state_dict_for_merging_qkv(self, checkpoint: dict[str, Any]):
         return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
 
-    def process_state_dict_for_merging_gate_up(self, checkpoint: Mapping[str, Any]):
+    def process_state_dict_for_merging_gate_up(self, checkpoint: dict[str, Any]):
         return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
 
-    def process_state_dict_for_merging_experts(self, checkpoint: Mapping[str, Any]):
+    def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
         return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
 
     def load_state_dict_parallel(
         self,
-        state_dict: Mapping[str, Any],
+        state_dict: dict[str, Any],
         *args,
         skip_preprocess: bool = False,
         **kwargs,
@@ -624,7 +625,7 @@ class Transformer(nn.Module):
 
     def load_state_dict(
         self,
-        state_dict: Mapping[str, Any],
+        state_dict: dict[str, Any],
         *args,
         skip_preprocess: bool = False,
         **kwargs,

@@ -131,7 +131,7 @@ class PatchMerger(nn.Module):
 
         self.mlp = self._build_mlp(op_impl, checkpoint_prefix)
 
-    def _build_mlp(self, op_impl: str, checkpoint_prefix: str) -> nn.ModuleList:
+    def _build_mlp(self, op_impl: str, checkpoint_prefix: str) -> nn.Sequential:
         mlp = []
 
         mlp.append(
@@ -549,8 +549,8 @@ class TransformerQwen2VL(TransformerHFLlama):
 
     def get_visual_features(
         self,
-        pixel_values: torch.FloatTensor,
-        grid_thw: Optional[torch.LongTensor] = None,
+        pixel_values: torch.Tensor,
+        grid_thw: Optional[torch.Tensor] = None,
         visual_type: str = "image",
     ):
         visual_embeds = self.visual(pixel_values, grid_thw=grid_thw)
@@ -560,10 +560,10 @@ class TransformerQwen2VL(TransformerHFLlama):
 
     def get_placeholder_mask(
         self,
-        input_ids: torch.LongTensor,
-        inputs_embeds: torch.FloatTensor,
-        image_features: torch.FloatTensor = None,
-        video_features: torch.FloatTensor = None,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        image_features: torch.Tensor = None,
+        video_features: torch.Tensor = None,
     ):
         """
         Obtains multimodal placeholdr mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
@@ -607,20 +607,21 @@ class TransformerQwen2VL(TransformerHFLlama):
     def _pre_layers(
         self,
         input_ids,
+        *,
         pixel_values: Optional[torch.Tensor] = None,
         grid_thw: Optional[torch.Tensor] = None,
-        pixel_values_videos: Optional[torch.FloatTensor] = None,
-        video_grid_thw: Optional[torch.LongTensor] = None,
-    ) -> Optional[torch.Tensor]:
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
-            pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+            pixel_values (floating-point `torch.Tensor` of shape `(batch_size, num_channels, image_size, image_size)`):
                 The tensors corresponding to the input images.
-            grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+            grid_thw (integer `torch.Tensor` of shape `(num_images, 3)`, *optional*):
                 The temporal, height and width of feature shape of each image in LLM.
-            pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+            pixel_values_videos (floating-point `torch.Tensor` of shape `(batch_size, num_channels, image_size, image_size)`):
                 The tensors corresponding to the input videos.
-            video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+            video_grid_thw (integer `torch.Tensor` of shape `(num_videos, 3)`, *optional*):
                 The temporal, height and width of feature shape of each video in LLM.
         """
 

@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-from typing import Any, Mapping
+from typing import Any
 
 import torch
 from torch import nn
@@ -156,7 +156,7 @@ class TransformerHFMixtral(TransformerHFLlama):
 
     def load_state_dict_parallel(
         self,
-        state_dict: Mapping[str, Any],
+        state_dict: dict[str, Any],
         *args,
         skip_preprocess: bool = False,
         **kwargs,

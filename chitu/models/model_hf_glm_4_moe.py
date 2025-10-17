@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Mapping, Any, Optional
+from typing import Any, Optional, Type
 from typing_extensions import override
 import re
 import functools
@@ -25,7 +25,7 @@ from chitu.models.model_hf_qwen2_vl import (
 from chitu.models.model_deepseek_v3 import MLPDeepSeekV3, ParallelMoeBlockDeepSeekV3
 from chitu.models.registry import ModelType, register_model
 from chitu.global_vars import get_global_args
-from chitu.quantization import get_quant_from_checkpoint_prefix
+from chitu.quantization import get_quant_from_checkpoint_prefix, QuantizedMoeExpertsBase
 from chitu.muxi_utils import (
     NormalMoeExpertsMuxiLayout,
     Blockfp8MoeExpertsMuxiLayout,
@@ -219,7 +219,7 @@ class Glm4vVisionTransformer(VisionTransformer):
         self.post_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
-        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor
+        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs
     ) -> torch.Tensor:
         """
         Args:
@@ -260,6 +260,7 @@ class Glm4vVisionTransformer(VisionTransformer):
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 position_embeddings=position_embeddings,
+                **kwargs,
             )
 
         hidden_states = self.post_layernorm(hidden_states)
@@ -291,7 +292,7 @@ class TransformerBlockHFGlm4Moe(TransformerBlockHFLlama):
         mlp_type=ParallelMoeBlockDeepSeekV3,
         checkpoint_prefix="",
     ):
-        base_moe_experts_class = None
+        base_moe_experts_class: Optional[Type[QuantizedMoeExpertsBase]] = None
         if op_impl == "muxi_custom_kernel":
             quant = get_quant_from_checkpoint_prefix(
                 f"{checkpoint_prefix}.mlp", args.quant_config.rules
@@ -360,8 +361,8 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
     @override
     def get_visual_features(
         self,
-        pixel_values: torch.FloatTensor,
-        grid_thw: Optional[torch.LongTensor] = None,
+        pixel_values: torch.Tensor,
+        grid_thw: Optional[torch.Tensor] = None,
         visual_type: str = "image",
     ):
         if visual_type == "image":
@@ -381,7 +382,7 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
             assert False
 
     @override
-    def process_state_dict_for_merging_experts(self, checkpoint: Mapping[str, Any]):
+    def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
         fuse_shared_experts = get_global_args().infer.fuse_shared_experts
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
@@ -415,7 +416,7 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
     @override
     def load_state_dict_parallel(
         self,
-        state_dict: Mapping[str, Any],
+        state_dict: dict[str, Any],
         *args,
         skip_preprocess: bool = False,
         replace=True,

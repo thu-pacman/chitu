@@ -479,15 +479,12 @@ def get_local_ip() -> str:
         s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
     except Exception:
-        pass
-
-    try:
         hostname = socket.gethostname()
         ip = socket.gethostbyname(hostname)
         if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
             return ip
-    except Exception:
-        pass
+
+    raise RuntimeError("Cannot get local ip")
 
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()

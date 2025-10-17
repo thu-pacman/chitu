@@ -214,12 +214,10 @@ class BatchedSeqLen:
         else:  # Fallback
             x = torch.empty(self.total_len, device=self.device, dtype=torch.int32)
             for i in range(self.batch_size):
-                x[
-                    self.prefix_lens_tensor_device[i] : self.prefix_lens_tensor_device[
-                        i + 1
-                    ]
-                ] = torch.arange(
-                    self.lens_tensor_device[i], device=self.device, dtype=torch.int32
+                x[self.prefix_lens_list[i] : self.prefix_lens_list[i + 1]] = (
+                    torch.arange(
+                        self.lens_list[i], device=self.device, dtype=torch.int32
+                    )
                 )
 
         return x
