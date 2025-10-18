@@ -7,6 +7,7 @@ from chitu.global_vars import set_global_args, _set_slot_handle, get_global_args
 from chitu.backend import Backend
 import pytest
 from chitu.task_type import TaskType
+from chitu.utils import ceil_div
 
 
 class MockExecutor:
@@ -14,15 +15,19 @@ class MockExecutor:
         pass
 
     def step(self, tasks):
-        for rid in tasks.req_ids:
-            Backend.cache_manager.finalize_cache_all_decode(rid)
+        task_ids = [
+            task_id
+            for task_id in tasks.task_ids
+            if task_id in Backend.cache_manager.block_table
+        ]
+        Backend.cache_manager.finalize_cache_all_decode(task_ids)
 
 
 class MockCacheManager:
     def __init__(self, num_blocks, block_size):
         self.num_blocks = num_blocks
         self.block_size = block_size
-        self._num_used_blocks = 0
+        self.block_table = {}
 
     def get_block_size(self):
         """Return the number of tokens that a block can accommodate"""
@@ -35,32 +40,37 @@ class MockCacheManager:
     @property
     def num_free_blocks(self):
         """Return number of free blocks"""
-        return self.num_blocks - self._num_used_blocks
+        return self.num_blocks - self.num_used_blocks
 
     @property
     def num_used_blocks(self):
         """Renturn number of blocks that has reserved for reqs to use."""
-        return self._num_used_blocks
+        return sum(self.block_table.values())
 
-    def prepare_cache_prefill(self, task_id):
-        prefill_len = TaskPool.pool[task_id].prefix_tokens_len
-        needed_blocks = (prefill_len + self.block_size - 1) // self.block_size
-        self._num_used_blocks += needed_blocks
+    def prepare_cache_prefill(self, task_ids):
+        for task_id in task_ids:
+            prefill_len = TaskPool.pool[task_id].prefix_tokens_len
+            needed_blocks = (prefill_len + self.block_size - 1) // self.block_size
+            if task_id not in self.block_table:
+                self.block_table[task_id] = 0
+            self.block_table[task_id] += needed_blocks
 
-    def is_block_full_for_req(self, task_id):
-        prefix_len_old = TaskPool.pool[task_id].prefix_tokens_len
-        if prefix_len_old % self.block_size == 0:
-            return True
-        return False
+    def num_additional_blocks_req_need(self, task_id, target_seq_len):
+        if task_id in self.block_table:
+            return max(
+                0, ceil_div(target_seq_len, self.block_size) - self.block_table[task_id]
+            )
+        return max(0, ceil_div(target_seq_len, self.block_size))
 
-    def prepare_cache_decode(self, task_id):
-        if self.is_block_full_for_req(task_id):
-            self._num_used_blocks += 1
+    def prepare_cache_decode(self, task_ids):
+        for task_id in task_ids:
+            prefix_len = TaskPool.pool[task_id].prefix_tokens_len
+            needed_blocks = self.num_additional_blocks_req_need(task_id, prefix_len)
+            self.block_table[task_id] += needed_blocks
 
-    def finalize_cache_all_decode(self, task_id):
-        prefix_len = TaskPool.pool[task_id].prefix_tokens_len
-        release_blocks = (prefix_len + self.block_size - 1) // self.block_size
-        self._num_used_blocks -= release_blocks
+    def finalize_cache_all_decode(self, task_ids):
+        for task_id in task_ids:
+            self.block_table.pop(task_id)
 
 
 class MockTokenizer:
@@ -76,7 +86,8 @@ def test_chunked_prefill():
         need_ensure=False,
     )
     TaskPool.reset()
-    Backend.cache_manager = MockCacheManager(num_blocks=10000, block_size=512)
+    Backend.cache_manager = MockCacheManager(num_blocks=10000, block_size=5120)
+    Backend.executor = MockExecutor()
 
     for i in range(4):
         req = MockFixedLengthedUserRequest(
@@ -541,24 +552,28 @@ def test_priority_request_preset_over_prefill_first():
 
     scheduler = Scheduler(4, 2, "request_preset,prefill_first", 1)
 
+    # ['req_7', 'req_2':Decode, 'req_1', 'req_5':Decode, 'req_3', 'req_8', 'req_0', 'req_4', 'req_6':Decode]
     batch1_ids = scheduler.schedule()
     assert sorted(batch1_ids) == sorted(["req_7", "req_3", "req_0", "req_4"])
     scheduler.update(batch1_ids)
     for task_id in batch1_ids:
         TaskPool.remove(task_id)
 
+    # TaskPool: ['req_2':Decode, 'req_1', 'req_5':Decode, 'req_8', 'req_6':Decode]
     batch2_ids = scheduler.schedule()
     assert sorted(batch2_ids) == sorted(["req_2", "req_6"])
     scheduler.update(batch2_ids)
     for task_id in batch2_ids:
         TaskPool.remove(task_id)
 
+    # TaskPool: ['req_1', 'req_5':Decode, 'req_8']
     batch3_ids = scheduler.schedule()
     assert sorted(batch3_ids) == sorted(["req_1", "req_8"])
     scheduler.update(batch3_ids)
     for task_id in batch3_ids:
         TaskPool.remove(task_id)
 
+    # TaskPool: ['req_5':Decode]
     batch4_ids = scheduler.schedule()
     assert sorted(batch4_ids) == sorted(["req_5"])
     scheduler.update(batch4_ids)
@@ -720,17 +735,17 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
 
     scheduler = Scheduler(4, 2, "prefill_first", 1)
     task_ids = scheduler.schedule()
-    Backend.cache_manager.prepare_cache_prefill(task_ids[0])
+    Backend.cache_manager.prepare_cache_prefill(task_ids)
     task._prefix_tokens.append(1)
     scheduler.update(task_ids)
 
     task.consume_req_tokens()
-    for step in range(DIFF - 1):
+    for step in range(DIFF):
         task_ids = scheduler.schedule()
         assert task_ids == [
             "req_0",
         ]
-        Backend.cache_manager.prepare_cache_decode(task_ids[0])
+        Backend.cache_manager.prepare_cache_decode(task_ids)
         task._prefix_tokens.append(1)
         scheduler.update(task_ids)
 
@@ -758,7 +773,7 @@ def test_evict_decode_task():
     )
     TaskPool.reset()
 
-    NUM_BLOCKS = 10
+    NUM_BLOCKS = 4
     BLOCK_SIZE = 512
     DECODE_NUM_TASKS = 4
 
@@ -768,60 +783,68 @@ def test_evict_decode_task():
     )  # kv_cache capacity = 5120
     Backend.tokenizer = MockTokenizer()
     tasks = []
+    task_ids = []
     assert len(TaskPool.pool) == 0
 
-    # add 10 decoding tasks into TaskPool, allocate kv_cache for them according to their prefix length
+    # add 4 decoding tasks into TaskPool, allocate kv_cache for them according to their prefix length
     for i in range(NUM_BLOCKS):
         req = MockFixedLengthedUserRequest(
-            input_len=BLOCK_SIZE - 1 if i >= 2 else BLOCK_SIZE,
+            input_len=BLOCK_SIZE,
             request_id=f"req_{i}",
             enable_reasoning=False,
         )
         task = Task(f"{req.request_id}", req)
         tasks.append(task)
-        TaskPool.add(task)  # pool: [req_0,req_1,...,req_9]
-        Backend.cache_manager.prepare_cache_prefill(task.task_id)
+        task_ids.append(task.task_id)
+        TaskPool.add(task)  # pool: ['req_0', 'req_1', 'req_2', 'req_3']
         task.consume_req_tokens()
+        task._prefix_tokens.append(1)
+    Backend.cache_manager.prepare_cache_prefill(task_ids)
 
-    # evict low priority tasks(req_8,req_9) when cache manager has no more blocks for decoding
-    req_8_prefix_tokens = tasks[-2].prefix_tokens
-    req_9_prefix_tokens = tasks[-1].prefix_tokens
+    # TaskPool: ['req_0', 'req_1', 'req_2', 'req_3']
+    # num_free_blocks: 0
+    # evict low priority tasks('req_2', 'req_3') when cache manager has no more blocks for decoding
+    req_2_prefix_tokens = tasks[-2].prefix_tokens
+    req_3_prefix_tokens = tasks[-1].prefix_tokens
     scheduler = Scheduler(4, DECODE_NUM_TASKS, "prefill_first,fcfs", 1)
     assert scheduler.kvcache_block_threshold == Backend.cache_manager.get_num_blocks()
     task_ids = scheduler.schedule()
+    Backend.cache_manager.prepare_cache_decode(task_ids)
+    scheduler.update(task_ids)
     assert (
         scheduler.kvcache_block_threshold
         == (Backend.cache_manager.get_num_blocks() // 2) // 2
     )
     assert tasks[-1].task_type == TaskType.Prefill
     assert tasks[-2].task_type == TaskType.Prefill
-    scheduler.update(task_ids)
 
+    # TaskPool: ['req_0', 'req_1', 'req_2':Prefill, 'req_3':Prefill]
+    # num_free_blocks: 0
     # evicted tasks will not be rescheduled in the short term due to the congestion control
     task_ids = scheduler.schedule()
     assert task_ids == [
         "req_0",
         "req_1",
-        "req_2",
-        "req_3",
-    ]  # req_8 or req_9 will not be rescheduled before other decoding tasks release kv cache blocks
+    ]  # req_2 or req_3 will not be rescheduled before other decoding tasks release kv cache blocks
 
     # after two tasks finished decoding, reschedule req_8,req_9 / or one task finished decoding ,reschedule req_8
-    for i in range(3):
+    for i in range(2):
         task = TaskPool.pool[f"req_{i}"]
         task.next_token = 2
         task.num_new_tokens = 1
-        Backend.cache_manager.finalize_cache_all_decode(f"req_{i}")
     task_ids = [task.task_id for task in tasks]
     removed_task_ids = scheduler.update(task_ids)
-    assert len(removed_task_ids) == 3
-    assert len(TaskPool.pool) == 7
+    Backend.cache_manager.finalize_cache_all_decode(removed_task_ids)
+    assert len(removed_task_ids) == 2
+    assert len(TaskPool.pool) == 2
     assert scheduler.kvcache_block_threshold == Backend.cache_manager.get_num_blocks()
 
+    # TaskPool: ['req_2':Prefill, 'req_3':Prefill]
+    # num_free_blocks: 4
     task_ids = scheduler.schedule()
     assert len(task_ids) == 2
-    assert TaskPool.pool[task_ids[-1]].prefix_tokens == req_9_prefix_tokens
-    assert TaskPool.pool[task_ids[-2]].prefix_tokens == req_8_prefix_tokens
+    assert TaskPool.pool[task_ids[-1]].prefix_tokens == req_2_prefix_tokens
+    assert TaskPool.pool[task_ids[-2]].prefix_tokens == req_3_prefix_tokens
 
 
 def test_scheduler_group():
@@ -923,7 +946,6 @@ def test_scheduler_group():
     # TaskPool: TaskPool: ['req_0', 'req_4', 'req_6']
     # free_sgroups: deque([1, 0]), used_sgroups: set()
     # sgroup_0 release earlier than sgroup_1, so it will be scheduled earlier than sgroup_1
-    print(f"TaskPool: {TaskPool.id_list}")
     batch4_ids = scheduler.schedule()
     assert batch4_ids == ["req_0", "req_4"]
     for task_id in batch4_ids:
