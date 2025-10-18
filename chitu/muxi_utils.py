@@ -342,7 +342,6 @@ def muxi_fused_experts(
     w1: MuxiNativeLayoutGroupWeight,
     w2: MuxiNativeLayoutGroupWeight,
     topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
     inplace: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -362,7 +361,6 @@ def _(
     w1: MuxiNativeLayoutGroupWeight,
     w2: MuxiNativeLayoutGroupWeight,
     topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
     inplace: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -381,7 +379,7 @@ def _(
     topk_ids: [B, topk]
     """
 
-    hidden_states, indices = routed_x.activation, routed_x.token_to_expert_indices
+    hidden_states, topk_ids = routed_x.activation, routed_x.token_to_expert_indices
 
     assert isinstance(w1, MuxiNativeLayoutGroupWeight)
     assert isinstance(w2, MuxiNativeLayoutGroupWeight)
@@ -402,8 +400,11 @@ def _(
 
     topK = topk_weights.size(1)
     max_num_tokens_padded = (topK * B) + e1 * (micro_batchsize - 1)
-    sorted_token_ids = torch.empty(
-        max_num_tokens_padded, dtype=torch.int32, device="cuda"
+    sorted_token_ids = torch.full(
+        (max_num_tokens_padded,),
+        fill_value=(B * topK),
+        dtype=torch.int32,
+        device="cuda",
     )
     cumsum_buffer = torch.empty(e1 + 1, dtype=torch.int32, device="cuda")
     padded_num_experts = torch.empty(1, dtype=torch.int32, device="cuda")
@@ -418,8 +419,8 @@ def _(
     if soft_fp8:
         assert w1_scale is not None and w2_scale is not None
         muxi_layout_kernels.fused_experts_compute(
-            w1.layout_tensor,
-            w2.layout_tensor,
+            w1.layout_tensor.view(e1, m1, k1),
+            w2.layout_tensor.view(e2, m2, k2),
             hidden_states,
             B,
             e1,
@@ -439,8 +440,8 @@ def _(
         )
     else:
         muxi_layout_kernels.fused_experts_compute(
-            w1.layout_tensor,
-            w2.layout_tensor,
+            w1.layout_tensor.view(e1, m1, k1),
+            w2.layout_tensor.view(e2, m2, k2),
             hidden_states,
             B,
             e1,
@@ -591,25 +592,20 @@ class Blockfp8MoeExpertsMuxiLayout(
 
     def forward(
         self,
-        x: torch.Tensor,
+        routed_x: BatchedRoutedActivation,
         weights: torch.Tensor,
-        indices: torch.Tensor,
         tokens_per_expert: Optional[torch.Tensor] = None,
         impl: str = "auto",
         inplace: bool = False,
     ) -> torch.Tensor:
-        shape = x.size()
-        x = x.view(-1, self.dim)
-        y = muxi_fused_experts(
-            hidden_states=x,
+        return muxi_fused_experts(
+            routed_x,
             w1=self.get_native_layout_gate_up_proj_weight(),
             w2=self.get_native_layout_down_proj_weight(),
             topk_weights=weights,
-            topk_ids=indices,
             inplace=inplace,
             w1_scale=self.gate_up_proj_scale,
             w2_scale=self.down_proj_scale,
             block_shape=[128, 128],
             soft_fp8=True,
         )
-        return y.view(shape)
