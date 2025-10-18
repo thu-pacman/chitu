@@ -383,14 +383,13 @@ class Task:
         self.sched_ts = self.arrv_ts
         self.priority = priority
         self.sched_score = 0
-        self.prefix_length = len(self._prefix_tokens)
         self.max_output_tokens = 1024  # TODO: replace hardcode by parameter
         self.sched_ddl = (
             time.perf_counter_ns()
-            + self.prefix_length * 1000 * 1000
+            + self.prefix_tokens_len * 1000 * 1000
             + self.max_output_tokens * 1000 * 1000
         )
-        TaskLoad.increase(self.prefix_length)
+        TaskLoad.increase(self.prefix_tokens_len)
 
         # Scheduler group
         self.sched_group_id = None
@@ -423,7 +422,6 @@ class Task:
             self.next_token = self.req._test_standard_tokens[self.num_new_tokens].item()
         self._prefix_tokens.append(token)
         self.num_new_tokens += 1
-        self.prefix_length += 1  # not use
 
     def wait(self, handle):
         self.waiting = True
@@ -442,7 +440,7 @@ class Task:
 
     @property
     def prefix_tokens_len(self):
-        return len(self.prefix_tokens)
+        return len(self._prefix_tokens)
 
     def set_prefill_chunk_size_for_one_step(self, prefill_chunk_size: int):
         """
@@ -451,18 +449,21 @@ class Task:
 
         self.prefill_chunk_size = prefill_chunk_size
 
-    def next_req_tokens(self):
+    @property
+    def next_req_tokens_len(self):
         if (
             self.prefill_chunk_size is None
             or self.consumed_req_tokens + self.prefill_chunk_size
             >= self.prefix_tokens_len
         ):
-            return self.prefix_tokens[self.consumed_req_tokens :]
-        else:
-            return self.prefix_tokens[
-                self.consumed_req_tokens : self.consumed_req_tokens
-                + self.prefill_chunk_size
-            ]
+            return self.prefix_tokens_len - self.consumed_req_tokens
+        return self.prefill_chunk_size
+
+    def next_req_tokens(self):
+        return self.prefix_tokens[
+            self.consumed_req_tokens : self.consumed_req_tokens
+            + self.next_req_tokens_len
+        ]
 
     def consume_req_tokens(self):
         if (
@@ -568,7 +569,7 @@ class TaskPool:
             cls.pool[task_id].req.completed.set()
             cls.pool[task_id].req.completion_time = time.monotonic()
             cls.pool[task_id].req.save_trace_to_json()
-            TaskLoad.reduce(cls.pool[task_id].prefix_length)
+            TaskLoad.reduce(cls.pool[task_id].prefix_tokens_len)
         if PackedTasksBase.response_list_manager is not None:
             PackedTasksBase.response_list_manager.remove_list(
                 cls.pool[task_id].response

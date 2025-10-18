@@ -97,7 +97,7 @@ class Scheduler:
             - "stride": Each task has a priority value P, and a score S (starts from 0), at scheduling point,
               update the scores: S += P * elapsed_time. Select the tasks with top scores and reset their
               scores back to 0.
-            - "deadline": Each task has a deadline time `DDL = request_arrival_time + prefix_length * alpha +
+            - "deadline": Each task has a deadline time `DDL = request_arrival_time + prefix_tokens_len * alpha +
               max_output_tokens * beta`. Select the tasks with nearest DDL. Alpha and beta are arbitary value,
               defaults to 1ms.
             - "prefix_align": Batch tasks with similar input lengths togather.
@@ -149,7 +149,7 @@ class Scheduler:
             elif st == "deadline":
                 self.scorers.append(lambda task: -task.sched_ddl)
             elif st == "prefix_align":
-                self.scorers.append(lambda task: -task.prefix_length)
+                self.scorers.append(lambda task: -task.prefix_tokens_len)
             else:
                 raise NotImplementedError(f"Scheduler type {st} not implemented")
 
@@ -270,46 +270,38 @@ class Scheduler:
                 task_ids,
             )
         )
+
+        # Apply chunk prefill
+        if self.prefill_chunk_size is not None:
+            num_chunk_prefill_tasks = self._chunk_prefill_tasks_count(prefill_task_ids)
+            prefill_task_ids = prefill_task_ids[:num_chunk_prefill_tasks]
+
+        # Check KVCacheManager's capacity
+        num_need_blocks = 0
+        num_additional_blocks_task_need = (
+            Backend.cache_manager.num_additional_blocks_req_need
+        )
+        num_used_blocks = Backend.cache_manager.num_used_blocks
         num_tasks = 0
-        block_size = Backend.cache_manager.get_block_size()
-        num_used_block = Backend.cache_manager.num_used_blocks
-        num_needed_block = 0
-        num_total_tokens = 0
-
-        def has_enough_block(num_tasks):
-            nonlocal num_needed_block, num_total_tokens
-            if num_tasks >= len(prefill_task_ids):
-                return False
-            task = TaskPool.pool[prefill_task_ids[num_tasks]]
-            if task.consumed_req_tokens == 0:
-                """Only tasks that are not allocated kv blocks before need new blocks"""
-                prefix_token_len = task.prefix_tokens_len
-                num_total_tokens += prefix_token_len
-                num_needed_block += ceil_div(prefix_token_len, block_size)
-
-            if (
-                num_total_tokens
-                > get_global_args().infer.max_seq_len * self.prefill_num_tasks
-            ):
-                return False
-            return num_needed_block + num_used_block <= self.kvcache_block_threshold
-
-        while has_enough_block(num_tasks):
+        for task_id in prefill_task_ids:
+            task = TaskPool.pool[task_id]
+            target_seq_len = task.consumed_req_tokens + len(task.next_req_tokens())
+            num_need_blocks += num_additional_blocks_task_need(
+                task.req.request_id, target_seq_len
+            )
+            if num_used_blocks + num_need_blocks > self.kvcache_block_threshold:
+                break
             num_tasks += 1
 
         if (
             num_tasks == 0
             and self.kvcache_block_threshold == Backend.cache_manager.get_num_blocks()
-            and num_used_block == 0
+            and num_used_blocks == 0
         ):
             prefix_len = TaskPool.pool[prefill_task_ids[0]].prefix_tokens_len
             raise RuntimeError(
                 f"KV_cache capacity is insufficient to support prefilling (batch_size=1, prefix_len={prefix_len})"
             )
-
-        if self.prefill_chunk_size is not None:
-            num_chunk_prefill_tasks = self._chunk_prefill_tasks_count(prefill_task_ids)
-            prefill_task_ids = prefill_task_ids[:num_chunk_prefill_tasks]
 
         return prefill_task_ids[:num_tasks]
 
@@ -340,16 +332,19 @@ class Scheduler:
                 task_ids,
             )
         )
-        task_needs_new_block = Backend.cache_manager.is_block_full_for_req
+
+        # Check KVCacheManager's capacity
+        num_additional_blocks_task_need = (
+            Backend.cache_manager.num_additional_blocks_req_need
+        )
 
         def has_enough_block():
-            num_need_blocks = sum(
-                1
-                for task_id in decode_task_ids
-                if task_needs_new_block(TaskPool.pool[task_id].req.request_id)
-            )
-            if num_need_blocks > self.decode_num_tasks:
-                return False
+            num_need_blocks = 0
+            for task_id in decode_task_ids:
+                task = TaskPool.pool[task_id]
+                num_need_blocks += num_additional_blocks_task_need(
+                    task.req.request_id, task.prefix_tokens_len
+                )
             num_free_blocks = Backend.cache_manager.num_free_blocks
             if num_free_blocks >= num_need_blocks:
                 return True
@@ -382,6 +377,8 @@ class Scheduler:
             task_id: the task_id that need to be evicted
         """
         task = TaskPool.pool[task_id]
+
+        # Remove kvcache of this task
         task.next_token = -1
         task.waiting = False
         task.handle = None
@@ -402,7 +399,14 @@ class Scheduler:
                 "total_blocks": Backend.cache_manager.get_num_blocks(),
             },
         )
+
+        # Restore the task's status to before prefill
         task.task_type = TaskType.Prefill
+        task.prefill_chunk_size = None
+        task.consumed_req_tokens = 0
+        task.sched_group_id = None
+
+        # For congestion control
         self.kvcache_block_threshold = max(1, self.kvcache_block_threshold // 2)
 
     @staticmethod
@@ -467,9 +471,7 @@ class Scheduler:
                 if TaskPool.pool[task_id].task_type == TaskType.Decode:
                     removed_task_ids.append(task_id)
                     num_total_blocks = Backend.cache_manager.get_num_blocks()
-                    self.kvcache_block_threshold = min(
-                        num_total_blocks, self.kvcache_block_threshold * 2
-                    )
+                    self.kvcache_block_threshold = num_total_blocks
                     logger.debug(
                         f"Task({task_id}) finished decoding, increasing kvcache_block_threshold to {self.kvcache_block_threshold}, while the number of total blocks is {num_total_blocks}"
                     )
