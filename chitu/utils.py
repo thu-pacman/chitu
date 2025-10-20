@@ -509,8 +509,9 @@ def top_k_top_p_min_p_sampling_from_logits(
         ), f"top_ks.shape[0]={top_ks.shape[0]} didn't match logits.shape[0]={logits.shape[0]}"
         top_ps = top_ps.to(torch.float)
         top_ks = top_ks.to(torch.int32)
-        logits = torch_npu.npu_top_k_top_p(logits, top_ps, top_ks)
-        sampled_index = multinomial(logits, num_samples=1, impl="sync-free").view(-1)
+        probs = torch.softmax(logits, dim=-1)
+        probs = torch_npu.npu_top_k_top_p(probs, top_ps, top_ks)
+        sampled_index = multinomial(probs, num_samples=1, impl="sync-free").view(-1)
         return sampled_index
 
     # SPDX-SnippetBegin
