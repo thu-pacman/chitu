@@ -31,7 +31,10 @@ def mla_prologue_normal(
     freqs_cis: BatchedFreqsCis,
     q_a_layernorm_eps: float,
     kv_a_layernorm_eps: float,
+    dequant_scale_x: torch.Tensor | None = None,
+    dequant_scale_q_a_proj: torch.Tensor | None = None,
     dequant_scale_q_b_proj: torch.Tensor | None = None,
+    dequant_scale_kv_a_proj_with_mqa: torch.Tensor | None = None,
     smooth_scales: torch.Tensor | None = None,
     impl: str = "auto",
 ) -> tuple[
@@ -46,7 +49,7 @@ def mla_prologue_normal(
         # - chitu/ops/mla_prologue.py
         if (
             has_torch_npu
-            and x.dtype == torch.bfloat16
+            and (x.dtype == torch.bfloat16 or x.dtype == torch.int8)
             and x.shape[-1] == 7168
             and q_a_layernorm_weight.shape[0] == 1536
             and kv_b_proj_absorb_1_weight.shape[0] in [8, 16, 32, 64, 128]
@@ -84,7 +87,10 @@ def mla_prologue_normal(
             freqs_cis=freqs_cis,
             q_a_layernorm_eps=q_a_layernorm_eps,
             kv_a_layernorm_eps=kv_a_layernorm_eps,
+            dequant_scale_x=dequant_scale_x,
+            dequant_scale_q_a_proj=dequant_scale_q_a_proj,
             dequant_scale_q_b_proj=dequant_scale_q_b_proj,
+            dequant_scale_kv_a_proj_with_mqa=dequant_scale_kv_a_proj_with_mqa,
             smooth_scales=smooth_scales,
         )
     elif impl == "torch":
@@ -174,7 +180,12 @@ def mla_prologue_normal_torch_npu(
     freqs_cis: BatchedFreqsCis,  # a.k.a. rope_sin, rope_cos
     q_a_layernorm_eps: float,  # a.k.a. rmsnorm_epsilon_cq
     kv_a_layernorm_eps: float,  # a.k.a. rmsnorm_epsilon_ckv
-    dequant_scale_q_b_proj: torch.Tensor | None = None,
+    dequant_scale_x: torch.Tensor | None = None,  # a.k.a. dequant_scale_x
+    dequant_scale_q_a_proj: torch.Tensor | None = None,  # a.k.a. dequant_scale_w_dq
+    dequant_scale_q_b_proj: torch.Tensor | None = None,  # a.k.a. dequant_scale_w_uq_qr
+    dequant_scale_kv_a_proj_with_mqa: (
+        torch.Tensor | None
+    ) = None,  # a.k.a. dequant_scale_w_dkv_kr
     smooth_scales: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor, ColumnOddEvenSeparatedTensor, PartialColumnOddEvenSeparatedTensor
@@ -193,7 +204,12 @@ def mla_prologue_normal_torch_npu(
     fake_block_size = 16
     fake_n_blocks = ceil_div(bs_seq, fake_block_size)
     k_lora = torch.empty(
-        fake_n_blocks, fake_block_size, 1, kv_lora_rank, device=x.device, dtype=x.dtype
+        fake_n_blocks,
+        fake_block_size,
+        1,
+        kv_lora_rank,
+        device=x.device,
+        dtype=torch.bfloat16,
     )
     k_pe = torch.empty(
         fake_n_blocks,
@@ -201,7 +217,7 @@ def mla_prologue_normal_torch_npu(
         1,
         qk_rope_head_dim,
         device=x.device,
-        dtype=x.dtype,
+        dtype=torch.bfloat16,
     )
 
     q_nope, q_pe, k_lora, k_pe, _ = torch_npu.npu_mla_prolog_v2(
@@ -217,10 +233,23 @@ def mla_prologue_normal_torch_npu(
         cache_index=torch.arange(bs_seq, device=x.device, dtype=torch.int64),
         kv_cache=k_lora,
         kr_cache=k_pe,
+        dequant_scale_x=(
+            None if dequant_scale_x is None else dequant_scale_x.unsqueeze(-1)
+        ),
+        dequant_scale_w_dq=(
+            None
+            if dequant_scale_q_a_proj is None
+            else dequant_scale_q_a_proj.unsqueeze(0)
+        ),
         dequant_scale_w_uq_qr=(
             None
             if dequant_scale_q_b_proj is None
             else dequant_scale_q_b_proj.unsqueeze(0)
+        ),
+        dequant_scale_w_dkv_kr=(
+            None
+            if dequant_scale_kv_a_proj_with_mqa is None
+            else dequant_scale_kv_a_proj_with_mqa.unsqueeze(0)
         ),
         smooth_scales_cq=smooth_scales,  # None
         rmsnorm_epsilon_cq=q_a_layernorm_eps,

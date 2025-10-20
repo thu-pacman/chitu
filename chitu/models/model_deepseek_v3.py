@@ -60,7 +60,11 @@ from chitu.ops import (
     hadamard_transform,
 )
 import torch.distributed as dist
-from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
+from chitu.quantization import (
+    QuantizationRegistry,
+    get_quant_from_checkpoint_prefix,
+    get_layer_id_from_checkpoint_prefix,
+)
 from chitu.quantization.normal import (
     NormalLinear,
     NormalAbsorbGemmPermuted021,
@@ -74,6 +78,7 @@ from chitu.tensor_parallel import (
 )
 from chitu.distributed.parallel_state import get_tp_size, get_ep_size
 from chitu.utils import parse_dtype, try_import_and_setup_torch_npu
+from chitu.lazy import eval_lazy
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
@@ -255,7 +260,7 @@ class AttentionDeepSeekV3(Attention):
         quant = get_quant_from_checkpoint_prefix(
             checkpoint_prefix, args.quant_config.rules
         )
-        mla_prologue_int8 = (
+        self.mla_prologue_int8_partial = (
             get_quant_from_checkpoint_prefix(
                 checkpoint_prefix + ".kv_b_proj", args.quant_config.rules
             )
@@ -273,10 +278,27 @@ class AttentionDeepSeekV3(Attention):
             )
             == "ascend_w8a8_dynamic"
         )
-        self.merge_qkv = (
-            QuantizationRegistry.allowed_merge_qkv(checkpoint_prefix)
-            if not mla_prologue_int8
-            else False
+        self.mla_prologue_int8_full = (
+            get_quant_from_checkpoint_prefix(
+                checkpoint_prefix + ".kv_b_proj", args.quant_config.rules
+            )
+            is None
+            and get_quant_from_checkpoint_prefix(
+                checkpoint_prefix + ".q_a_proj", args.quant_config.rules
+            )
+            == "ascend_w8a8_dynamic"
+            and get_quant_from_checkpoint_prefix(
+                checkpoint_prefix + ".kv_a_proj_with_mqa", args.quant_config.rules
+            )
+            == "ascend_w8a8_dynamic"
+            and get_quant_from_checkpoint_prefix(
+                checkpoint_prefix + ".q_b_proj", args.quant_config.rules
+            )
+            == "ascend_w8a8_dynamic"
+        )
+        self.merge_qkv = QuantizationRegistry.allowed_merge_qkv(
+            checkpoint_prefix,
+            self.mla_prologue_int8_partial or self.mla_prologue_int8_full,
         )
 
         self.dim = args.dim
@@ -302,7 +324,11 @@ class AttentionDeepSeekV3(Attention):
         # - chitu/ops/mla_prologue.py
         self.can_use_mla_prologue_normal_torch_npu = (
             has_torch_npu
-            and (quant is None or mla_prologue_int8)
+            and (
+                quant is None
+                or self.mla_prologue_int8_partial
+                or self.mla_prologue_int8_full
+            )
             and self.index_topk is None
             and self.mla_absorb == "absorb-without-precomp"
             and not self.merge_qkv
@@ -334,6 +360,7 @@ class AttentionDeepSeekV3(Attention):
                 base_linear_class=(
                     NormalLinearNpuFractalZn
                     if self.can_use_mla_prologue_normal_torch_npu
+                    and not self.mla_prologue_int8_full
                     else None
                 ),
             )  # FIXME: Run this layer with muxi_layout_kernels
@@ -345,6 +372,7 @@ class AttentionDeepSeekV3(Attention):
                 base_linear_class=(
                     NormalLinearNpuFractalZn
                     if self.can_use_mla_prologue_normal_torch_npu
+                    and not self.mla_prologue_int8_full
                     else None
                 ),
             )  # FIXME: Run this layer with muxi_layout_kernels
@@ -368,7 +396,10 @@ class AttentionDeepSeekV3(Attention):
             base_linear_class=(
                 NormalLinearNpuFractalZn
                 if (
-                    self.can_use_mla_prologue_normal_torch_npu and not mla_prologue_int8
+                    self.can_use_mla_prologue_normal_torch_npu
+                    and not (
+                        self.mla_prologue_int8_partial or self.mla_prologue_int8_full
+                    )
                 )
                 else get_linear_layout_contig_y(
                     op_impl,
@@ -444,22 +475,46 @@ class AttentionDeepSeekV3(Attention):
 
     def _run_linear(self, x, freqs_cis: BatchedFreqsCis):
         if self.can_use_mla_prologue_normal_torch_npu:
-            q, k, v = mla_prologue_normal(
-                x,
-                self.q_a_proj.get_native_layout_weight(),
-                self.q_b_proj.get_native_layout_weight(),
-                self.kv_b_proj_absorb_1.get_native_layout_weight(),
-                self.kv_a_proj_with_mqa.get_native_layout_weight(),
-                self.q_a_layernorm.weight,
-                self.kv_a_layernorm.weight,
-                freqs_cis,
-                self.q_a_layernorm.eps,
-                self.kv_a_layernorm.eps,
-                dequant_scale_q_b_proj=getattr(self.q_b_proj, "weight_scale", None),
-                smooth_scales=None,
-                impl="torch_npu",
-            )
-            return q, k, v, None
+            if self.mla_prologue_int8_full:
+                x_int8, scale_w_x = torch_npu.npu_dynamic_quant(x.view(-1, x.shape[-1]))
+                q, k, v = mla_prologue_normal(
+                    x_int8,
+                    self.q_a_proj.get_native_layout_weight(),
+                    self.q_b_proj.get_native_layout_weight(),
+                    self.kv_b_proj_absorb_1.get_native_layout_weight(),
+                    self.kv_a_proj_with_mqa.get_native_layout_weight(),
+                    self.q_a_layernorm.weight,
+                    self.kv_a_layernorm.weight,
+                    freqs_cis,
+                    self.q_a_layernorm.eps,
+                    self.kv_a_layernorm.eps,
+                    dequant_scale_x=scale_w_x,
+                    dequant_scale_q_a_proj=getattr(self.q_a_proj, "weight_scale", None),
+                    dequant_scale_q_b_proj=getattr(self.q_b_proj, "weight_scale", None),
+                    dequant_scale_kv_a_proj_with_mqa=getattr(
+                        self.kv_a_proj_with_mqa, "weight_scale", None
+                    ),
+                    smooth_scales=None,
+                    impl="torch_npu",
+                )
+                return q, k, v, None
+            else:
+                q, k, v = mla_prologue_normal(
+                    x,
+                    self.q_a_proj.get_native_layout_weight(),
+                    self.q_b_proj.get_native_layout_weight(),
+                    self.kv_b_proj_absorb_1.get_native_layout_weight(),
+                    self.kv_a_proj_with_mqa.get_native_layout_weight(),
+                    self.q_a_layernorm.weight,
+                    self.kv_a_layernorm.weight,
+                    freqs_cis,
+                    self.q_a_layernorm.eps,
+                    self.kv_a_layernorm.eps,
+                    dequant_scale_q_b_proj=getattr(self.q_b_proj, "weight_scale", None),
+                    smooth_scales=None,
+                    impl="torch_npu",
+                )
+                return q, k, v, None
 
         bs_seq, _ = x.size()
         assert self.q_lora_rank > 0
@@ -693,7 +748,7 @@ class MLPDeepSeekV3(nn.Module):
         """
         if self.merge_gate_up:
             gate_up_proj_out = self.gate_up_proj(x)
-            return self.down_proj(silu_and_mul(gate_up_proj_out))
+            return self.down_proj(eval_lazy(silu_and_mul(gate_up_proj_out)))
         else:
             gate_proj_out = self.gate_proj(x)
             up_proj_out = self.up_proj(x)
@@ -1345,7 +1400,20 @@ class TransformerDeepSeekV3(Transformer):
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-            if not QuantizationRegistry.allowed_merge_qkv(k):
+            layer_id = get_layer_id_from_checkpoint_prefix(
+                k, self.params.quant_config.rules
+            )
+            if not QuantizationRegistry.allowed_merge_qkv(
+                k,
+                (
+                    (
+                        self.layers[layer_id].self_attn.mla_prologue_int8_partial
+                        or self.layers[layer_id].self_attn.mla_prologue_int8_full
+                    )
+                    if layer_id > -1
+                    else False
+                ),
+            ):
                 continue
             # Cat dim 0
             elif any(
