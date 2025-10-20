@@ -427,8 +427,6 @@ def chitu_init(args, logging_level=None):
             and str(args.models).find("'backend': 'cpuinfer'") != -1
         ):
             args.infer.use_cuda_graph = False
-        elif args.models is not None and str(args.models).find("'type': 'mixq'") != -1:
-            args.infer.use_cuda_graph = False
         elif (
             args.infer.attn_type == "npu"
             and args.infer.cache_type == "paged"
