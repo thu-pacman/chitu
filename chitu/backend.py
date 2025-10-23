@@ -700,6 +700,7 @@ class Backend:
         else:
             quant_config = getattr(args.models, "quant_config", None)
             quant_name = getattr(quant_config, "name", None)
+            quant_type = getattr(quant_config, "type", None)
             if args.models.type == "llama":
                 checkpoints = sorted(Path(args.models.ckpt_dir).glob("*.pth"))
                 assert (
@@ -707,10 +708,11 @@ class Backend:
                 ), f"no checkpoint files found in {args.models.ckpt_dir}"
                 ckpt_path = checkpoints[0]
                 checkpoint = torch.load(ckpt_path, map_location="cpu")
-            elif (
-                args.models.name == "Llama-3-8B-QServe"
-                or args.models.name == "Llama-3-8B-QServe-g128"
-            ):
+            elif quant_type in [
+                "w4a8_per_token_per_group_asymm",
+                "w4a8_per_token_per_channel_asymm",
+                "w4_g128_symm_a8",
+            ]:
                 checkpoint = torch.load(
                     os.path.join(args.models.ckpt_dir, "pytorch_model.bin"),
                     map_location="cpu",

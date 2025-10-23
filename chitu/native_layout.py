@@ -13,6 +13,7 @@ from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 hygon_mixq_kernels, has_hygon = try_import_platform_dep("sugon_mixQ4_kernels")
+hygon_w4a8_kernels, has_hygon_w4a8 = try_import_platform_dep("sugon_w4a8_kernels")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
@@ -654,6 +655,64 @@ class PartialColumnOddEvenSeparatedTensor(NativeLayoutTensor):
         )
         ret[..., self.begin_idx : self.end_idx] = separated_part
         return ret
+
+
+@dataclass
+class HygonW4A8Int4TileTensor(NativeLayoutTensor):
+    """
+    Hygon tiled layout for w4a8 kernels w4 weight on BW.
+
+    This class only wraps the forward conversion:
+      Packed4BitWeightQServe torch.Tensor -> hygon native tiled layout.
+    """
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(cls, tensor: torch.Tensor):
+        assert has_hygon_w4a8, "Hygon/Sugon w4a8 kernels are unavailable."
+        assert hasattr(
+            hygon_w4a8_kernels, "native_layout_of_weights_tile_int4"
+        ), "Kernel 'native_layout_of_weights_tile_int4' not found."
+        layout_tensor = hygon_w4a8_kernels.native_layout_of_weights_tile_int4(
+            tensor.contiguous()
+        )
+        return cls(plain_shape=tensor.shape, layout_tensor=layout_tensor)
+
+    @override
+    def convert_to_plain(self):
+        raise NotImplementedError(
+            "No inverse kernel for int tile layout (expected 'plain_layout_of_weights_tile_int')."
+        )
+
+
+@dataclass
+class HygonW4A8Int8TileTensor(NativeLayoutTensor):
+    """
+    Hygon tiled layout for w4a8 kernels i8 group scale on BW.
+
+    This class only wraps the forward conversion:
+      Packed4BitWeightQServe torch.Tensor -> hygon native tiled layout.
+    """
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(cls, tensor: torch.Tensor):
+        assert has_hygon_w4a8, "Hygon/Sugon w4a8 kernels are unavailable."
+        assert hasattr(
+            hygon_w4a8_kernels, "native_layout_of_scale_tile_i8"
+        ), "Kernel 'native_layout_of_scale_tile_i8' not found."
+        layout_tensor = hygon_w4a8_kernels.native_layout_of_scale_tile_i8(
+            tensor.T.contiguous()
+        )
+        return cls(plain_shape=tensor.shape, layout_tensor=layout_tensor)
+
+    @override
+    def convert_to_plain(self):
+        raise NotImplementedError(
+            "No inverse kernel for int tile layout (expected 'plain_layout_of_weights_tile_int')."
+        )
 
 
 @dataclass

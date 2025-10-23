@@ -120,6 +120,8 @@
   用法: 启动赤兔时追加 `models=Qwen3-14B` 启动参数
 - Qwen3-14B-FP8
   用法: 启动赤兔时追加 `models=Qwen3-14B-FP8` 启动参数
+- Qwen3-14B-QServe-g128
+  用法: 启动赤兔时追加 `models=Qwen3-14B-QServe-g128` 启动参数
 - Qwen3-14B-ascend-int8
   用法: 启动赤兔时追加 `models=Qwen3-14B-ascend-int8` 启动参数
 - Qwen3-14B-fp4
@@ -128,6 +130,8 @@
   用法: 启动赤兔时追加 `models=Qwen3-14B-mixq-mix` 启动参数
 - Qwen3-14B-mixq-w8a8
   用法: 启动赤兔时追加 `models=Qwen3-14B-mixq-w8a8` 启动参数
+- Qwen3-14B-w4-g128-symm-a8
+  用法: 启动赤兔时追加 `models=Qwen3-14B-w4-g128-symm-a8` 启动参数
 - Qwen3-235B-A22B
   用法: 启动赤兔时追加 `models=Qwen3-235B-A22B` 启动参数
 - Qwen3-235B-A22B-ascend-int8
@@ -148,12 +152,16 @@
   用法: 启动赤兔时追加 `models=Qwen3-32B` 启动参数
 - Qwen3-32B-FP8
   用法: 启动赤兔时追加 `models=Qwen3-32B-FP8` 启动参数
+- Qwen3-32B-QServe-w4a8-g128
+  用法: 启动赤兔时追加 `models=Qwen3-32B-QServe-w4a8-g128` 启动参数
 - Qwen3-32B-ascend-int8
   用法: 启动赤兔时追加 `models=Qwen3-32B-ascend-int8` 启动参数
 - Qwen3-32B-fp4
   用法: 启动赤兔时追加 `models=Qwen3-32B-fp4` 启动参数
 - Qwen3-32B-fp4-merged
   用法: 启动赤兔时追加 `models=Qwen3-32B-fp4-merged` 启动参数
+- Qwen3-32B-w4-g128-symm-a8
+  用法: 启动赤兔时追加 `models=Qwen3-32B-w4-g128-symm-a8` 启动参数
 - Qwen3-4B
   用法: 启动赤兔时追加 `models=Qwen3-4B` 启动参数
 - Qwen3-4B-fp4

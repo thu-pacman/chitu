@@ -31,6 +31,9 @@ from chitu.quantization.w4a8_per_token_per_channel_asymm import (
 from chitu.quantization.w4a8_per_token_per_group_asymm import (
     W4A8PerTokenPerGroupAsymmLinear,
 )
+from chitu.quantization.w4_g128_symm_a8_symm import (
+    HygonW4G128SymmA8Linear,
+)
 from chitu.quantization.ascend_w8a8 import (
     AscendW8A8Linear,
     AscendW8A8DynamicLinear,
