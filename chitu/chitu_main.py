@@ -41,6 +41,8 @@ from chitu.utils import (
     ceil_div,
 )
 from chitu.schemas.utils import ModelConfigResolver
+from chitu.utils import ceil_div
+from chitu.distributed.parallel_state import get_dp_group
 from chitu.logging_utils import setup_chitu_logging
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
@@ -203,26 +205,114 @@ def _warmup_via_taskpool(args):
         logger.info(f"Added {num_warmup_reqs} warmup requests to TaskPool")
         Backend.scheduler.start_warmup()
 
-    num_required_prefill_schedules = ceil_div(
-        ceil_div(warmup_seq_len * num_warmup_reqs, prefill_chunk_size),
-        args.infer.dp_size,
-    )  # The number of times the prefill tasks needs to be scheduled to be completed
+    # Prefill phase
+    # In DP chunk prefill, each schedule processes approximately `prefill_chunk_size` tokens across the whole DP group.
+    # Due to per-rank budget constraints and uneven task distribution, some tokens may be left unprocessed.
+    # Example: DP2, chunk=16, max_reqs=5 (创建 5 个 warmup 任务), 每任务 3 tokens
+    #   - Budget: Rank0=8, Rank1=8 (chunk_size 均分给各 rank)
+    #   - Tasks: Rank0 分到 3 个任务 (round robin), Rank1 分到 2 个任务
+    #   - Actual: Rank0 处理 8 tokens (3+3+2, task4 剩 1 token), Rank1 处理 6 tokens (3+3)
+    #   - Result: 需要 2 轮迭代来处理完所有 15 tokens
+    total_tokens = warmup_seq_len * num_warmup_reqs
 
-    # prefill
-    for _ in range(num_required_prefill_schedules):
+    # Calculate required iterations considering DP task distribution
+    if get_global_args().infer.dp_size > 1:
+        # In DP mode, tasks are distributed via round-robin, and each rank has limited budget
+        # Worst case: most tasks go to one rank, requiring more iterations
+        # Example:
+        # dp_size = 2 prefill_chunk_size = 16
+        # per_rank_budget = 16 // 2 = 8
+        # max_tasks_per_rank = ceil_div(5, 2) = 3  # round-robin 最多分到 3 个任务
+        # max_tokens_per_rank = 3 × 3 = 9
+        # num_required = ceil_div(9, 8) = 2
+        dp_size = get_global_args().infer.dp_size
+        per_rank_budget = prefill_chunk_size // dp_size
+        max_tasks_per_rank = ceil_div(num_warmup_reqs, dp_size)
+        max_tokens_per_rank = max_tasks_per_rank * warmup_seq_len
+        # Iterations needed for the busiest rank (usually rank 0)
+        num_required_prefill_schedules = ceil_div(max_tokens_per_rank, per_rank_budget)
+    else:
+        num_required_prefill_schedules = ceil_div(total_tokens, prefill_chunk_size)
+
+    logger.info(
+        f"Warmup: total_tokens={total_tokens}, chunk_size={prefill_chunk_size}, "
+        f"prefill_iters={num_required_prefill_schedules}"
+    )
+
+    # All ranks must execute the same number of iterations for DP synchronization
+    for i in range(num_required_prefill_schedules):
         chitu_run()
 
+        if rank == 0:
+            prefill_remaining = sum(
+                1
+                for task in TaskPool.pool.values()
+                if task.task_type == TaskType.Prefill
+            )
+            if prefill_remaining > 0:
+                logger.debug(
+                    f"Warmup prefill iteration {i+1}: remaining={prefill_remaining}"
+                )
+
+    # Verify all tasks completed prefill
     if rank == 0:
+        prefill_remaining = sum(
+            1 for task in TaskPool.pool.values() if task.task_type == TaskType.Prefill
+        )
+
+        if prefill_remaining > 0:
+            logger.error(
+                f"Warmup failed: {prefill_remaining} tasks still in prefill after "
+                f"{num_required_prefill_schedules} iterations."
+            )
+            # Log details about remaining tasks for debugging
+            for task_id, task in TaskPool.pool.items():
+                if task.task_type == TaskType.Prefill:
+                    logger.error(
+                        f"  Stuck task: {task_id}, consumed={task.consumed_req_tokens}/"
+                        f"{task.prefix_tokens_len}, cache_owner={getattr(task, 'cache_owner', None)}"
+                    )
+
+        # Verify final state
         assert (
             len(TaskPool.pool) == num_warmup_reqs
-        ), "Tasks should still be there after prefill"
+        ), f"Expected {num_warmup_reqs} tasks after prefill, found {len(TaskPool.pool)}"
+        assert (
+            prefill_remaining == 0
+        ), f"Expected all tasks in Decode phase, but {prefill_remaining} tasks still in Prefill"
 
-    # decode
+        # End warmup prefill phase before starting decode phase
+        Backend.scheduler.end_warmup()
+
+    # Decode phase: DP 场景需要特殊处理
+    if get_global_args().infer.dp_size > 1 and num_required_prefill_schedules > 1:
+        # 因为num_required_prefill_schedules > 1的时候会出现 prefill iteration不一致的情况，所以需要同步一下，否则会卡死
+        # Example: DP2, TP2, max_reqs=5, prefill_chunk_size=16, num_required_prefill_schedules=2
+        get_dp_group().barrier()
     chitu_run()
 
     if rank == 0:
+        remaining_tasks = len(TaskPool.pool)
+        if remaining_tasks > 0:
+            logger.warning(
+                f"Warmup incomplete: {remaining_tasks} tasks remaining. "
+                f"This may indicate incorrect iteration count calculation. "
+                f"Cleaning up now, but please verify warmup parameters."
+            )
+            leftover_ids = list(TaskPool.pool.keys())
+            for tid in leftover_ids:
+                task = TaskPool.pool[tid]
+                logger.warning(
+                    f"Leftover task: {tid}, type={task.task_type.name}, "
+                    f"consumed={task.consumed_req_tokens}/{task.prefix_tokens_len}"
+                )
+            remove_kvcache_all_device(leftover_ids)
+            for tid in leftover_ids:
+                if tid in TaskPool.pool:
+                    TaskPool.remove(tid)
+
+    if rank == 0:
         assert len(TaskPool.pool) == 0, "TaskPool should be empty after warmup"
-        Backend.scheduler.end_warmup()
 
     # An extra run is needed to receive "finalize KV cache" message from rank 0
     if rank > 0:
@@ -365,11 +455,6 @@ def chitu_init(args, logging_level=None):
         args.infer.prefill_chunk_size = args.infer.max_reqs * args.infer.max_seq_len
 
     if args.infer.prefill_chunk_size is not None:
-        if args.infer.dp_size > 1:
-            logger.warning(
-                "Disabling infer.prefill_chunk_size because it is not compatible with DP yet"
-            )
-            args.infer.prefill_chunk_size = None
         if args.infer.pp_size > 1 and args.infer.cache_type == "skew":
             logger.warning(
                 "Disabling infer.prefill_chunk_size because it is not compatible with PP+skew yet"
@@ -488,6 +573,12 @@ def chitu_run_normal():
         )
 
         tokens = Backend.executor.step(tasks)
+        num_tokens = (
+            0
+            if tokens is None
+            else (int(tokens.numel()) if hasattr(tokens, "numel") else len(tokens))
+        )
+        logger.debug(f"[run] executor.step returned tokens={num_tokens}")
 
         # postprocess
         if len(Backend.last_batch_results) > 0 and Backend.args.infer.dp_size <= 1:
@@ -498,6 +589,9 @@ def chitu_run_normal():
         if DPTaskCollector.has_available_tasks():
             tasks = DPTaskCollector.get_total_packedtasks()
             task_ids = tasks.task_ids
+            logger.debug(
+                f"[run] DPTaskCollector total_packed num_tasks={tasks.num_tasks} output_tasks={len(tasks.output_tasks)}"
+            )
             curr_batch_result = BatchResult(
                 num_tasks=tasks.num_tasks,
                 tasks=tasks.output_tasks,
@@ -507,10 +601,11 @@ def chitu_run_normal():
                 token_idxs=tasks.token_idxs.cpu() if tasks.return_logprobs else None,
             )
             DPTaskCollector.clear()
+            # if not call postprocess_async_part, tokens will stay in BatchResult, no response text output will be generated
+            Backend.executor.postprocess_async_part(curr_batch_result)
         else:
             curr_batch_result = Backend.executor.postprocess_sync_part(tasks, tokens)
-
-        Backend.last_batch_results.append(curr_batch_result)
+            Backend.last_batch_results.append(curr_batch_result)
         removed_decode_task_ids = Backend.scheduler.update(task_ids)
         remove_kvcache_all_device(removed_decode_task_ids)
     elif len(Backend.last_batch_results) > 0:

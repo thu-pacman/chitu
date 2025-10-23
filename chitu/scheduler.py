@@ -457,6 +457,7 @@ class Scheduler:
         task_ids = list(set(task_ids))
         self.reorder_tasks_for_batching(task_ids)
         for task_id in task_ids:
+            task = TaskPool.pool[task_id]
 
             # Update Task's sched_group_id and  sgroup_waiting_cnt
             if (
@@ -467,8 +468,8 @@ class Scheduler:
                 self.sgroup_waiting_tasks[sgroup_id].remove(task_id)
                 # TaskPool.pool[task_id].sched_group_id = None
 
-            if TaskPool.pool[task_id].need_remove():
-                if TaskPool.pool[task_id].task_type == TaskType.Decode:
+            if task.need_remove():
+                if task.task_type == TaskType.Decode:
                     removed_task_ids.append(task_id)
                     num_total_blocks = Backend.cache_manager.get_num_blocks()
                     self.kvcache_block_threshold = num_total_blocks
@@ -476,6 +477,9 @@ class Scheduler:
                         f"Task({task_id}) finished decoding, increasing kvcache_block_threshold to {self.kvcache_block_threshold}, while the number of total blocks is {num_total_blocks}"
                     )
                 TaskPool.remove(task_id)
+
+        if removed_task_ids:
+            logger.debug(f"[scheduler.update] removed_decode_tasks={removed_task_ids}")
 
         # Update used_sgroups and free_sgroups according to sgroup status
         if not isinstance(self, DPFifoScheduler):
@@ -663,7 +667,22 @@ class DPFifoScheduler(Scheduler):  # used for expert_data_parallel
 
     def schedule(self) -> list[list[str]]:
         self.have_task = False
-
+        # entry diagnostics
+        num_prefill = sum(
+            1
+            for _id in TaskPool.pool
+            if TaskPool.pool[_id].task_type == TaskType.Prefill
+            and not TaskPool.pool[_id].waiting
+        )
+        num_decode = sum(
+            1
+            for _id in TaskPool.pool
+            if TaskPool.pool[_id].task_type == TaskType.Decode
+            and not TaskPool.pool[_id].waiting
+        )
+        logger.debug(
+            f"[dpfifo.enter] prefill_ready={num_prefill} decode_ready={num_decode} pool_size={len(TaskPool.pool)}"
+        )
         prefill_task_ids = filter(
             lambda x: TaskPool.pool[x].task_type == TaskType.Prefill
             and not TaskPool.pool[x].waiting,
@@ -674,48 +693,148 @@ class DPFifoScheduler(Scheduler):  # used for expert_data_parallel
             key=lambda x: TaskPool.pool[x].req.start_time,
             reverse=False,
         )
-        prefill_task_ids = list(prefill_task_ids)[
-            : self.max_num_tasks_per_dp * self.dp_size
-        ]
+        prefill_task_ids = list(prefill_task_ids)
+
+        # During warmup prefill, select each task at most once per warmup epoch to match expected scheduling count
+        # However, if a task was selected but didn't complete prefill (due to budget constraints),
+        # it must be allowed to be scheduled again
+        if self.is_warmup_stage:
+            limited_ids = []
+            for tid in prefill_task_ids:
+                task = TaskPool.pool[tid]
+                # Allow task if: 1) never seen, OR 2) seen but not finished prefill
+                is_seen = getattr(task, "_warmup_prefill_seen", False)
+                has_remaining = task.consumed_req_tokens < task.prefix_tokens_len
+
+                if not is_seen or has_remaining:
+                    limited_ids.append(tid)
+                    if not is_seen:
+                        task._warmup_prefill_seen = True
+                if len(limited_ids) >= self.max_num_tasks_per_dp * self.dp_size:
+                    break
+            prefill_task_ids = limited_ids
+        else:
+            prefill_task_ids = prefill_task_ids[
+                : self.max_num_tasks_per_dp * self.dp_size
+            ]
 
         if len(prefill_task_ids) > 0:
             task_lists = [[] for _ in range(self.dp_size)]
             for i, task_id in enumerate(prefill_task_ids):
                 task = TaskPool.pool[task_id]
-                task.cache_owner = i % self.dp_size
-                task_lists[i % self.dp_size].append(task_id)
+                # 固定 cache_owner：第一次出现按轮转分配，其后沿用，避免跨 rank 迁移导致重复占用 KV blocks
+                owner = getattr(task, "cache_owner", None)
+                if owner is None:
+                    owner = i % self.dp_size
+                    task.cache_owner = owner
+                task_lists[owner].append(task_id)
+
+            # per-rank chunk prefill slicing if enabled
+            prefill_chunk_size = get_global_args().infer.prefill_chunk_size
+            if prefill_chunk_size is not None and prefill_chunk_size > 0:
+                base = prefill_chunk_size // self.dp_size
+                rem = prefill_chunk_size % self.dp_size
+                logger.debug(
+                    f"[dpfifo.prefill] dp_size={self.dp_size} chunk={prefill_chunk_size} base={base} rem={rem} prefill_candidates={[len(x) for x in task_lists]}"
+                )
+                for r in range(self.dp_size):
+                    budget = base + (rem if r == 0 else 0)
+                    if budget <= 0:
+                        task_lists[r] = []
+                        continue
+                    assigned = 0
+                    new_list = []
+                    for tid in task_lists[r]:
+                        task = TaskPool.pool[tid]
+                        remaining = task.prefix_tokens_len - task.consumed_req_tokens
+                        if remaining <= 0:
+                            continue
+                        take = min(remaining, max(0, budget - assigned))
+                        if take <= 0:
+                            break
+                        task.set_prefill_chunk_size_for_one_step(take)
+                        new_list.append(tid)
+                        assigned += take
+                        if assigned >= budget:
+                            break
+
+                    logger.debug(
+                        f"[dpfifo.prefill] rank={r} budget={budget} assigned={assigned} selected={len(new_list)} ids={new_list}"
+                    )
+                    task_lists[r] = new_list
 
             # make sure tasks do not exceed max_num_tasks_per_dp
             for i in range(self.dp_size):
                 if len(task_lists[i]) > self.max_num_tasks_per_dp:
                     task_lists[i] = task_lists[i][: self.max_num_tasks_per_dp]
-            self.have_task = True
-        else:
-            # no prefill tasks
-            decode_task_ids = filter(
-                lambda x: TaskPool.pool[x].task_type == TaskType.Decode
-                and not TaskPool.pool[x].waiting,
-                TaskPool.pool.keys(),
+            self.have_task = any(len(lst) > 0 for lst in task_lists)
+            logger.debug(
+                f"[dpfifo.prefill] selected per-rank sizes={[len(x) for x in task_lists]} have_task={self.have_task}"
             )
 
-            decode_task_ids = list(decode_task_ids)
+            # Fallback: prefill candidates存在，但本轮chunk切完后为空，尝试直接调度 decode 任务，避免空步导致卡住
+            # But during warmup stage, we should NOT schedule decode during prefill phase
+            if not self.have_task and not self.is_warmup_stage:
+                decode_task_ids = [
+                    tid
+                    for tid in TaskPool.pool.keys()
+                    if TaskPool.pool[tid].task_type == TaskType.Decode
+                    and not TaskPool.pool[tid].waiting
+                ]
+                task_lists = [[] for _ in range(self.dp_size)]
+                for tid in decode_task_ids:
+                    task = TaskPool.pool[tid]
+                    owner = getattr(task, "cache_owner", 0) % self.dp_size
+                    task_lists[owner].append(tid)
 
-            # For decode tasks, we need to make sure they are sent to their cache owner
-            task_lists = [[] for _ in range(self.dp_size)]
-            if len(decode_task_ids) > 0:
-                self.have_task = True
+                # 截断到每 rank 上限
+                for i in range(self.dp_size):
+                    if len(task_lists[i]) > self.max_num_tasks_per_dp:
+                        task_lists[i] = task_lists[i][: self.max_num_tasks_per_dp]
 
-            for task_id in decode_task_ids:
-                task = TaskPool.pool[task_id]
-                task_lists[task.cache_owner].append(task_id)
+                self.have_task = any(len(lst) > 0 for lst in task_lists)
 
-            # make sure tasks do not exceed max_num_tasks_per_dp
-            for i in range(self.dp_size):
-                if len(task_lists[i]) > self.max_num_tasks_per_dp:
-                    task_lists[i] = task_lists[i][: self.max_num_tasks_per_dp]
+                logger.debug(
+                    f"[dpfifo.fallback_decode] decode_per_rank={[len(x) for x in task_lists]} have_task={self.have_task}"
+                )
+        else:
+            # no prefill tasks - schedule decode tasks
+            # During warmup stage, skip decode scheduling during prefill phase
+            if self.is_warmup_stage:
+                logger.debug(f"[dpfifo.decode] skip decode during warmup prefill phase")
+                task_lists = [[] for _ in range(self.dp_size)]
+            else:
+                decode_task_ids = filter(
+                    lambda x: TaskPool.pool[x].task_type == TaskType.Decode
+                    and not TaskPool.pool[x].waiting,
+                    TaskPool.pool.keys(),
+                )
+
+                decode_task_ids = list(decode_task_ids)
+                logger.debug(
+                    f"[dpfifo.decode] decode_candidates={len(decode_task_ids)}"
+                )
+
+                # For decode tasks, we need to make sure they are sent to their cache owner
+                task_lists = [[] for _ in range(self.dp_size)]
+                if len(decode_task_ids) > 0:
+                    self.have_task = True
+
+                for task_id in decode_task_ids:
+                    task = TaskPool.pool[task_id]
+                    task_lists[task.cache_owner].append(task_id)
+
+                # make sure tasks do not exceed max_num_tasks_per_dp
+                for i in range(self.dp_size):
+                    if len(task_lists[i]) > self.max_num_tasks_per_dp:
+                        task_lists[i] = task_lists[i][: self.max_num_tasks_per_dp]
 
         if self.have_task:
             DPTaskCollector.prepare_dp_tasks(task_lists)
+            logger.debug(
+                f"[dpfifo.return] have_task=True per-rank={[len(x) for x in task_lists]}"
+            )
             return task_lists
         else:
+            logger.debug("[dpfifo.return] have_task=False")
             return []

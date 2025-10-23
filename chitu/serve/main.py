@@ -8,6 +8,7 @@ This allows the serve package to be executed as a module: python -m chitu.serve
 """
 
 import logging
+from logging import getLogger
 from threading import Thread
 
 import hydra

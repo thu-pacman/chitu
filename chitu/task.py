@@ -329,9 +329,12 @@ class MockFixedLengthedUserRequest(UserRequest):
 @dataclass
 class MsgPackableTask:
     task_id: str
-    tokens: list[str]
+    tokens: list[int]
     params: SampleParams
     req: Optional[UserRequest] = None
+    # DP chunk prefill: carry progress and current-step chunk size
+    consumed_req_tokens: int = 0
+    prefill_chunk_size: Optional[int] = None
 
 
 class Task:
@@ -394,6 +397,9 @@ class Task:
         # Scheduler group
         self.sched_group_id = None
 
+        # Warmup bookkeeping: ensure each task participates in at most one prefill schedule per warmup
+        self._warmup_prefill_seen = False
+
     def need_remove(self):
         if self.waiting:
             return False
@@ -411,16 +417,34 @@ class Task:
         return False
 
     def update_response_sync(self, token: int):
-        # TODO: modify if generate more than one token at a time
-        assert token is not None
+        """
+        Update task state with a generated token (for Decode phase).
+
+        This method:
+        1. Records the generated token
+        2. Appends it to the prefix (for next iteration input)
+        3. Increments generation counter
+
+        Usage: Call this during Decode phase after sampling a token.
+
+        Args:
+            token: The generated token ID
+        """
+        assert token is not None, "Token cannot be None"
         self.next_token = token
+
         if (
-            self.req is not None  # TODO check if needed
-            and (self.req._test_standard_tokens is not None)
-            and (self.num_new_tokens < len(self.req._test_standard_tokens))
+            self.req is not None
+            and self.req._test_standard_tokens is not None
+            and self.num_new_tokens < len(self.req._test_standard_tokens)
         ):
             self.next_token = self.req._test_standard_tokens[self.num_new_tokens].item()
-        self._prefix_tokens.append(token)
+
+        # 如果在 Prefill 阶段 append, prefix_tokens_len 会不断增长
+        # 导致consume_req_tokens中的判断条件永远不满足
+        # 任务永远停留在 Prefill 状态
+        if self.task_type == TaskType.Decode:
+            self._prefix_tokens.append(token)
         self.num_new_tokens += 1
 
     def wait(self, handle):
@@ -444,9 +468,20 @@ class Task:
 
     def set_prefill_chunk_size_for_one_step(self, prefill_chunk_size: int):
         """
-        Set prefill_chunk_size. Only effective for the following step. Will be reset by consume_req_tokens
-        """
+        Set the chunk size for the next prefill iteration.
 
+        This determines how many tokens to process in the next prefill forward pass.
+        The value is automatically reset to None after consume_req_tokens() is called.
+
+        Args:
+            prefill_chunk_size: Number of tokens to process in next iteration
+
+        Example:
+            task.set_prefill_chunk_size_for_one_step(128)
+            tokens = task.next_req_tokens()  # Returns 128 tokens
+            # ... run model ...
+            task.consume_req_tokens()  # Resets chunk size to None
+        """
         self.prefill_chunk_size = prefill_chunk_size
 
     @property
@@ -460,25 +495,76 @@ class Task:
         return self.prefill_chunk_size
 
     def next_req_tokens(self):
+        """
+        Get the tokens to process in the next prefill iteration.
+
+        Returns:
+            - If chunk size is set: Returns the next chunk of tokens
+            - If chunk size is None or would complete prefill: Returns all remaining tokens
+
+        Example:
+            # With 1000 total tokens, 500 already consumed, chunk size 128:
+            tokens = task.next_req_tokens()  # Returns tokens[500:628] (128 tokens)
+
+            # With 1000 total tokens, 950 already consumed, chunk size 128:
+            tokens = task.next_req_tokens()  # Returns tokens[950:1000] (50 tokens, completes prefill)
+        """
+
+        return self.prefix_tokens[
+            self.consumed_req_tokens : self.consumed_req_tokens
+            + self.next_req_tokens_len
+        ]
+
+    def next_req_tokens(self):
         return self.prefix_tokens[
             self.consumed_req_tokens : self.consumed_req_tokens
             + self.next_req_tokens_len
         ]
 
     def consume_req_tokens(self):
+        """
+        Advance prefill progress after processing tokens.
+
+        This method:
+        1. Updates consumed_req_tokens counter
+        2. Transitions to Decode phase if prefill is complete
+        3. Resets prefill_chunk_size to None for next iteration
+
+        State Transitions:
+            - If prefill incomplete: consumed_req_tokens += chunk_size, stays in Prefill
+            - If prefill complete: consumed_req_tokens = total, transitions to Decode
+
+        Example:
+            # Start: consumed=0, total=1000, chunk=128
+            task.consume_req_tokens()
+            # After: consumed=128, still in Prefill
+
+            # ... several iterations ...
+
+            # Last iteration: consumed=896, total=1000, chunk=128
+            task.consume_req_tokens()
+            # After: consumed=1000, transitioned to Decode
+        """
         if (
             self.prefill_chunk_size is None
             or self.consumed_req_tokens + self.prefill_chunk_size
             >= self.prefix_tokens_len
         ):
+            # Complete prefill and transition to decode
             self.consumed_req_tokens = self.prefix_tokens_len
             self.task_type = TaskType.Decode
-            # compatible with dp mode
+
             if self.req is not None:
                 self.req.prefill_end_time = time.monotonic()
+
+            logger.debug(
+                f"[task.consume] task={self.task_id} prefill->decode "
+                f"consumed={self.consumed_req_tokens}/{self.prefix_tokens_len}"
+            )
         else:
             self.consumed_req_tokens += self.prefill_chunk_size
 
+        # Reset chunk size for next iteration
         self.prefill_chunk_size = None
 
     def has_output(self):
@@ -496,6 +582,8 @@ class Task:
             task_id=self.task_id,
             tokens=self._prefix_tokens,
             params=self.params,
+            consumed_req_tokens=self.consumed_req_tokens,
+            prefill_chunk_size=self.prefill_chunk_size,
         )
 
 
