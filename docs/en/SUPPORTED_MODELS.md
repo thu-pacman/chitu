@@ -120,6 +120,8 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=Qwen3-14B` command line argument when starting Chitu
 - Qwen3-14B-FP8
   Usage: Append `models=Qwen3-14B-FP8` command line argument when starting Chitu
+- Qwen3-14B-QServe-g128
+  Usage: Append `models=Qwen3-14B-QServe-g128` command line argument when starting Chitu
 - Qwen3-14B-ascend-int8
   Usage: Append `models=Qwen3-14B-ascend-int8` command line argument when starting Chitu
 - Qwen3-14B-fp4
@@ -128,6 +130,8 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=Qwen3-14B-mixq-mix` command line argument when starting Chitu
 - Qwen3-14B-mixq-w8a8
   Usage: Append `models=Qwen3-14B-mixq-w8a8` command line argument when starting Chitu
+- Qwen3-14B-w4-g128-symm-a8
+  Usage: Append `models=Qwen3-14B-w4-g128-symm-a8` command line argument when starting Chitu
 - Qwen3-235B-A22B
   Usage: Append `models=Qwen3-235B-A22B` command line argument when starting Chitu
 - Qwen3-235B-A22B-ascend-int8
@@ -148,12 +152,16 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=Qwen3-32B` command line argument when starting Chitu
 - Qwen3-32B-FP8
   Usage: Append `models=Qwen3-32B-FP8` command line argument when starting Chitu
+- Qwen3-32B-QServe-w4a8-g128
+  Usage: Append `models=Qwen3-32B-QServe-w4a8-g128` command line argument when starting Chitu
 - Qwen3-32B-ascend-int8
   Usage: Append `models=Qwen3-32B-ascend-int8` command line argument when starting Chitu
 - Qwen3-32B-fp4
   Usage: Append `models=Qwen3-32B-fp4` command line argument when starting Chitu
 - Qwen3-32B-fp4-merged
   Usage: Append `models=Qwen3-32B-fp4-merged` command line argument when starting Chitu
+- Qwen3-32B-w4-g128-symm-a8
+  Usage: Append `models=Qwen3-32B-w4-g128-symm-a8` command line argument when starting Chitu
 - Qwen3-4B
   Usage: Append `models=Qwen3-4B` command line argument when starting Chitu
 - Qwen3-4B-fp4

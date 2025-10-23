@@ -2,14 +2,15 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# Llama-3-8B-QServe-g128 is a quantization of Meta-Llama-3-8B-Instruct
+# Qwen3-32B-w4a8-g128 is a quantization of Qwen3-32B
 defaults:
-  - Meta-Llama-3-8B-Instruct
-  - quant_config: w4a8_per_token_per_group_asymm
+  - Qwen3-32B
+  - quant_config: w4_g128_symm_a8
   - _self_ # Config in this file overrides configs in defaults
 
 # Access info
-name: Llama-3-8B-QServe-g128
-source: "https://huggingface.co/mit-han-lab/Llama-3-8B-QServe-g128" # Just for displaying. No automatic download.
+name: Qwen3-32B-w4-g128-symm-a8
+source: "(This is an internal quantized model, only for testing purpose)" # Just for displaying. No automatic download.
 ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
 tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+

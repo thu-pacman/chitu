@@ -21,6 +21,7 @@ from chitu.task import (
     PackedTasks,
     PackedTasksBase,
     SerializedPackedTasksPayloadType,
+    BatchResult,
     Task,
     TaskLoad,
     TaskType,
@@ -54,22 +55,6 @@ class OngoingRequests:
     waiting_task: PackedTasks
     handle: torch.distributed.distributed_c10d.Work
     logits: torch.Tensor
-
-
-@dataclass
-class BatchResult:
-    """
-    param of postprocess_async_part, returned by postprocess_sync_part.
-    stored in CPU.
-    """
-
-    num_tasks: int
-    tasks: list[Task]
-
-    next_tokens: list[int]
-    return_logprobs: bool = False
-    logprobs: Optional[torch.Tensor] = None
-    token_idxs: Optional[torch.Tensor] = None
 
 
 class TasksDispatcher(ABC):
@@ -290,21 +275,32 @@ class ExpertDataDispatcher(TasksDispatcher):
         tasks_data = msgpack.unpackb(data, raw=False)
 
         task_ids = []
-        for task_data in tasks_data:
-            sample_params = SampleParams(**task_data["params"])
-            task_data["params"] = sample_params
-            task = Task(**task_data)
-            task_ids.append(task.task_id)
-            TaskPool.add(task)
+        for td in tasks_data:
+            params = SampleParams(**td["params"])
+            tid = td["task_id"]
+            tokens = td["tokens"]
+            consumed = td.get("consumed_req_tokens", 0)
+            chunk = td.get("prefill_chunk_size", None)
+
+            if tid in TaskPool.pool:
+                task = TaskPool.pool[tid]
+            else:
+                task = Task(task_id=tid, req=None, params=params, tokens=tokens)
+                TaskPool.add(task)
+
+            task.consumed_req_tokens = consumed
+            if chunk is not None:
+                task.set_prefill_chunk_size_for_one_step(int(chunk))
+
+            task_ids.append(tid)
         if len(task_ids) > 0:
-            tasks = PackedTasks(task_ids)
+            return PackedTasks(task_ids)
         else:
-            tasks = PackedTasksBase(
+            return PackedTasksBase(
                 num_tasks=0,
                 task_type=TaskType.EmptyPrefill,
-                payload_type=SerializedPackedTasksPayloadType.EmptyPrefill,  # Must be consistent with task_type
+                payload_type=SerializedPackedTasksPayloadType.EmptyPrefill,
             )
-        return tasks
 
     def dispatch_metadata(self, tasks):
         if self.is_main_rank:
@@ -341,6 +337,28 @@ class ExpertDataDispatcher(TasksDispatcher):
             return payload_type, local_tasks
 
         else:  # other dp ranks
+            # Bounded wait for incoming metadata to avoid missing the dispatch window (especially in DP warmup).
+            poller = zmq.Poller()
+            poller.register(self.socket, zmq.POLLIN)
+
+            dp_size = get_dp_group().group_size if get_dp_group() is not None else 1
+            total_wait_ms = min(200 * dp_size, 1500)
+            step_ms = 5
+            waited = 0
+            events = {}
+            while waited < total_wait_ms:
+                events = dict(poller.poll(timeout=step_ms))
+                if self.socket in events:
+                    break
+                waited += step_ms
+            if self.socket not in events:
+                # Return a heartbeat payload to let upper layer progress without blocking
+                tasks = PackedTasksBase(
+                    num_tasks=0,
+                    payload_type=SerializedPackedTasksPayloadType.Heartbeat,
+                )
+                return SerializedPackedTasksPayloadType.Heartbeat, tasks
+
             msgs = self.socket.recv_multipart()
             payload_type = SerializedPackedTasksPayloadType[msgs[0].decode()]
             if payload_type in [
@@ -399,21 +417,41 @@ class ExpertDataDispatcher(TasksDispatcher):
         else:
             tokens = Backend.executor.sample(logits, tasks)
         # collect tokens
-        task_ids_list = DPTaskCollector.get_task_ids_list()
+        # Phase 1: all-gather each rank's actual send count to avoid mismatch
+        local_count = torch.tensor(
+            [int(tokens.numel())], dtype=torch.int64, device=self.device
+        )
+        counts = torch.empty(self.group_size, dtype=torch.int64, device=self.device)
+        torch.distributed.all_gather_into_tensor(
+            counts, local_count, group=self.dp_group.gpu_group
+        )
+
         if self.is_main_rank:
+            expected_sizes = counts.tolist()
             gather_list = [
                 torch.empty(
-                    (len(task_ids),),
+                    (expected_sizes[i],),
                     device=self.device,
                     dtype=tokens.dtype,
                 )
-                for task_ids in task_ids_list
+                for i in range(self.group_size)
             ]
         else:
             gather_list = None
-        self.dp_group.gather_v(
-            tensor=tokens, gather_list=gather_list, dst=self.dp_main_rank
+
+        logger.debug(
+            f"[epilogue] rank_in_group={self.rank_in_group} is_main={self.is_main_rank} send_numel={int(tokens.numel())}"
         )
+        # Fast path: if no rank is expected to produce token this step, skip gather to reduce overhead
+        if not self.is_main_rank:
+            skip_gather = tokens.numel() == 0
+        else:
+            skip_gather = int(counts.sum().item()) == 0
+
+        if not skip_gather:
+            self.dp_group.gather_v(
+                tensor=tokens, gather_list=gather_list, dst=self.dp_main_rank
+            )
 
         if tokens.numel() == 0 and not self.is_main_rank:
             return
@@ -431,12 +469,26 @@ class ExpertDataDispatcher(TasksDispatcher):
         else:
             token_list = tokens.cpu().tolist()
 
-        for it, task in enumerate(
-            tasks.tasks
-        ):  # On DP rank 0, handle all tasks; on other ranks, handle only local tasks
-            task.update_response_sync(token_list[it])
-            if task.task_type == TaskType.Prefill:
+        logger.debug(
+            f"[epilogue] main={self.is_main_rank} task_type={tasks.task_type.name} total_tokens={len(token_list)} output_tasks={len(tasks.output_tasks)} all_tasks={len(tasks.tasks)}"
+        )
+
+        # Update responses: in Prefill, only set next_token without mutating prefix.
+        # In Decode, append token to response/prefix as usual.
+        for it, task in enumerate(tasks.output_tasks):
+            logger.debug(
+                f"[update_response] task={task.task_id} type={task.task_type.name} token={token_list[it]}"
+            )
+            task.update_response_no_sync(token_list[it])
+
+        # Advance prefill progress for all tasks scheduled this step
+        if tasks.task_type == TaskType.Prefill:
+            for task in tasks.tasks:
+                before = task.consumed_req_tokens
                 task.consume_req_tokens()
+                logger.debug(
+                    f"[consume_prefill] task={task.task_id} consumed {before}->{task.consumed_req_tokens} len={task.prefix_tokens_len} has_output={task.has_output()}"
+                )
 
         return token_list
 
@@ -706,6 +758,11 @@ class Executor:
 
         num_tokens = tasks.num_tokens
 
+        if self.rank == 0 and self.dp_size <= 1 and self.pp_size <= 1:
+            tasks.batch_sync()
+        if self.rank == 0 and self.dp_size <= 1:
+            tasks.batch_update_status()
+
         if (
             self.rank == 0 and num_tokens > 0
         ) or self.dp_size > 1:  # check if num_toekns needs to be validated
@@ -922,6 +979,11 @@ class Executor:
 
         num_tokens = tasks.num_tasks
 
+        if self.rank == 0 and self.dp_size <= 1 and self.pp_size <= 1:
+            tasks.batch_sync()
+        if self.rank == 0 and self.dp_size <= 1:
+            tasks.batch_update_status()
+
         # prepare payload tensor
         if self.rank == 0 or self.dp_size > 1 and self.dp_dispatcher is not None:
             payload = self._prepare_new_tokens_for_decode(tasks)  # tensor
@@ -1065,7 +1127,9 @@ class Executor:
 
         return tokens
 
-    def postprocess_sync_part(self, tasks: PackedTasks, logits: torch.Tensor):
+    def postprocess_sync_part(
+        self, tasks: PackedTasks, logits: torch.Tensor, keep_device=False
+    ):
         # --- dependent on logits ---
         logits = logits.view(-1, logits.shape[-1]).contiguous()
         assert (
@@ -1080,19 +1144,30 @@ class Executor:
             # Support non-pp mode
             tasks.logprobs = logprobs
             tasks.token_idxs = token_idxs
+            # store in tasks
+            if not keep_device:
+                logprobs = logprobs.cpu()
+                token_idxs = token_idxs.cpu()
+            batch_logprobs = logprobs.split(1, dim=0)
+            batch_token_idxs = token_idxs.split(1, dim=0)
+            for idx, task in enumerate(tasks.output_tasks):
+                task.logprobs = batch_logprobs[idx]
+                task.token_idxs = batch_token_idxs[idx]
 
         # --- dependent on tokens ---
         if tasks.should_apply_frequency_penalty:
             response_append(tasks, tokens, impl="auto")
 
         if tokens.numel() == 1:
-            token_list = [int(tokens.item())]
+            token_list = [tokens if keep_device else int(tokens.item())]
         else:
-            token_list = tokens.cpu().tolist()
+            token_list = (
+                list(tokens.view(-1).split(1)) if keep_device else tokens.cpu().tolist()
+            )
 
         # ---dependent on tokens_cpu ---
         for it, task in enumerate(tasks.output_tasks):
-            task.update_response_sync(token_list[it])
+            task.update_response_no_sync(token_list[it])
 
         # test
         if tasks._test_flag:
@@ -1102,15 +1177,9 @@ class Executor:
 
         if self.dp_size > 1:
             return token_list
-        else:
-            return BatchResult(
-                num_tasks=tasks.num_tasks,
-                tasks=tasks.output_tasks,
-                next_tokens=token_list,
-                return_logprobs=tasks.return_logprobs,
-                logprobs=logprobs.cpu() if tasks.return_logprobs else None,
-                token_idxs=token_idxs.cpu() if tasks.return_logprobs else None,
-            )
+        elif not keep_device:
+            # only return BatchResult if everything is on CPU
+            return tasks.get_batch_result()
 
     def postprocess_async_part(self, batch_result: BatchResult) -> None:
         next_token_list: list[int] = []
@@ -1133,5 +1202,7 @@ class Executor:
             )
         else:
             self._token_sink.emit_batch(batch_result.tasks, next_token_list)
+        for task in batch_result.tasks:
+            task.can_stop()
 
         TaskLoad.increase(batch_result.num_tasks)

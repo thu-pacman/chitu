@@ -169,15 +169,59 @@ class CommGroup:
         gather_list: Optional[list[torch.Tensor]] = None,
         dst: int = 0,
     ):
+        """
+        Variable-length gather operation across ranks.
+
+        Gathers tensors of different sizes from each rank to a destination rank.
+        Properly handles cases where some ranks have empty tensors.
+
+        Use Cases:
+        ----------
+        1. DP Chunk Prefill: Different ranks may process different numbers of tokens.
+           Example: In DP4 with chunk_size=130:
+                    Rank 0: 34 tokens (32 base + 2 remainder)
+                    Rank 1-3: 32 tokens each
+
+        2. Uneven task distribution: Some ranks may have no tasks.
+           Example: Rank 0: [1, 2], Rank 1: [3], Rank 2: [], Rank 3: [4]
+
+        Empty Tensor Handling:
+        ---------------------
+        - A rank can send an empty tensor (numel=0), indicating no data
+        - The destination rank must pre-allocate gather_list with correct sizes
+        - Empty sends/receives are skipped to avoid PyTorch communication errors
+
+        Args:
+            tensor: Tensor to send from this rank (can be empty with numel=0)
+            gather_list: Pre-allocated receive buffers on destination rank only.
+                        Must have length equal to group size. Can be None on non-dst ranks.
+            dst: Destination rank (global rank)
+
+        Example:
+        --------
+        >>> # Rank 0 sends 2 elements, Rank 1 sends 1, Rank 2 sends 0, Rank 3 sends 1
+        >>> if rank == 0:
+        >>>     gather_list = [torch.empty(2), torch.empty(1), torch.empty(0), torch.empty(1)]
+        >>> else:
+        >>>     gather_list = None
+        >>> comm_group.gather_v(my_tensor, gather_list, dst=0)
+        >>> # Result on rank 0: gather_list contains [[1,2], [3], [], [4]]
+        """
         if self.global_rank == dst:
-            assert gather_list is not None
+            assert (
+                gather_list is not None
+            ), "gather_list must not be None on destination rank"
             for idx, recv_tensor in enumerate(gather_list):
-                if self.rank_list[idx] == self.global_rank:
-                    recv_tensor.copy_(tensor)
+                src_rank = self.rank_list[idx]
+                if src_rank == self.global_rank:
+                    if recv_tensor.numel() > 0 and tensor.numel() > 0:
+                        recv_tensor.copy_(tensor)
                 else:
-                    torch.distributed.recv(recv_tensor, src=self.rank_list[idx])
+                    if recv_tensor.numel() > 0:
+                        torch.distributed.recv(recv_tensor, src=src_rank)
         else:
-            torch.distributed.send(tensor, dst=dst)
+            if tensor.numel() > 0:
+                torch.distributed.send(tensor, dst=dst)
 
     def destroy(self):
         torch.distributed.destroy_process_group(self.gpu_group)

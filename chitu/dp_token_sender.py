@@ -295,9 +295,9 @@ class DPTaskWrapper:
     def __init__(self, original_task: Task, token_sender: DPTokenSender):
         self.original_task = original_task
         self.token_sender = token_sender
-        self._original_update_response_sync = original_task.update_response_sync
+        self._original_update_response_sync = original_task.update_response_no_sync
 
-        original_task.update_response_sync = self._dp_update_response_sync
+        original_task.update_response_no_sync = self._dp_update_response_sync
 
     def _dp_update_response_sync(self, token: int):
         """Override update_response_sync to also send token to Router (sync enqueue, keep order)"""

@@ -39,4 +39,7 @@ from chitu.ops.quant.w4a8_per_token_per_channel import (
 from chitu.ops.quant.w4a8_per_token_per_group import (
     w4a8_gemm_per_token_per_group_asymm,
 )
+from chitu.ops.quant.w4_g128_symm_a8 import (
+    w4_g128_symm_a8_symm,
+)
 from chitu.ops.quant.mixq import mixq_gemm
