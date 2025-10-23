@@ -6,7 +6,7 @@ from chitu.scheduler import Scheduler, SkewScheduler
 from chitu.global_vars import set_global_args, _set_slot_handle, get_global_args
 from chitu.backend import Backend
 import pytest
-from chitu.task_type import TaskType
+from chitu.task_type import TaskType, TaskDecodeType
 from chitu.utils import ceil_div
 
 
@@ -341,6 +341,7 @@ def test_priority_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
     scheduler.update(batch1_ids)
 
     # slot_groups: [[]], free_sgroup: deque([0])
@@ -351,6 +352,7 @@ def test_priority_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
     scheduler.update(batch2_ids)
 
     # slot_group: [[]], free_sgroups: deque([0])
@@ -363,6 +365,7 @@ def test_priority_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
     scheduler.update(batch3_ids)
 
     # slot_group: [[]], free_sgroups: deque([0])
@@ -484,6 +487,7 @@ def test_priority_fcfs_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
     scheduler.update(batch1_ids)
 
     # slot_group: [[]], free_sgroup: deque([0])
@@ -495,6 +499,7 @@ def test_priority_fcfs_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
     scheduler.update(batch2_ids)
 
     # slot_group: [[]], free_sgroup: deque([0])
@@ -511,6 +516,7 @@ def test_priority_fcfs_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
     scheduler.update(batch3_ids)
 
     # slot_group: [[]], free_sgroup: deque([0])
@@ -645,6 +651,7 @@ def test_priority_request_preset_over_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
     scheduler.update(batch1_ids)
 
     # TaskPool: ['req_2', 'req_1', 'req_5', 'req_8', 'req_6']
@@ -656,6 +663,7 @@ def test_priority_request_preset_over_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
     scheduler.update(batch2_ids)
 
     # TaskPool: ['req_1', 'req_8']
@@ -667,6 +675,7 @@ def test_priority_request_preset_over_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
     scheduler.update(batch3_ids)
 
     # TaskPool: []
@@ -832,6 +841,7 @@ def test_evict_decode_task():
         task = TaskPool.pool[f"req_{i}"]
         task.next_token = 2
         task.num_new_tokens = 1
+        task._decode_status = TaskDecodeType.Stopped
     task_ids = [task.task_id for task in tasks]
     removed_task_ids = scheduler.update(task_ids)
     Backend.cache_manager.finalize_cache_all_decode(removed_task_ids)
@@ -933,6 +943,7 @@ def test_scheduler_group():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
     scheduler.update(batch3_ids)
 
     # Set all tasks in scheduler_group_1 are unwait, release scheduler_group_1
@@ -941,6 +952,7 @@ def test_scheduler_group():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
     scheduler.update(batch2_ids)
 
     # TaskPool: TaskPool: ['req_0', 'req_4', 'req_6']
@@ -963,6 +975,7 @@ def test_scheduler_group():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
     scheduler.update(batch5_ids, batch4_ids)
 
     # TaskPool: []
@@ -1070,6 +1083,7 @@ def test_slot_group_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
     scheduler.update(batch3_ids)
 
     # Set all tasks in scheduler_group_1 are unwait, release scheduler_group_1
@@ -1078,6 +1092,7 @@ def test_slot_group_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
     scheduler.update(batch2_ids)
 
     # TaskPool: TaskPool: ['req_0', 'req_4', 'req_6']
@@ -1100,6 +1115,7 @@ def test_slot_group_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
     scheduler.update(batch5_ids, batch4_ids)
 
     # TaskPool: []

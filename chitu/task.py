@@ -9,17 +9,18 @@ import threading
 import time
 import weakref
 import functools
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from logging import getLogger
 from pathlib import Path
-from typing import Any, ClassVar, Optional, Mapping
+from typing import Any, ClassVar, Optional, Mapping, Union, Deque
 from typing_extensions import override
 
 import torch
 
-from chitu.task_type import TaskType
+from chitu.task_type import TaskType, TaskDecodeType
 from chitu.async_response import AsyncDataStream
 from chitu.backend import Backend
 from chitu.device_list import DeviceList, StaticDeviceListManager
@@ -355,6 +356,7 @@ class Task:
         self.stop_with_eos = stop_with_eos
         self.params = params if params is not None else req.params
         self._prefix_tokens = tokens if tokens is not None else req.prompt_tokens
+        self._decode_status = TaskDecodeType.Normal
 
         # Request
         self.req = req
@@ -370,6 +372,12 @@ class Task:
             self.response = DeviceList([], dtype=torch.long, device="cuda")
         self.num_new_tokens: int = 0
         self.next_token: int = -1  # Only effective when num_new_tokens > 0
+        self.record_next_token: Union[int, torch.Tensor, None] = None
+        self.sync_new_token: bool = True
+
+        self.return_logprobs = getattr(req, "logprobs", False)
+        self.logprobs = None
+        self.token_idxs = None
 
         self.pixel_values = getattr(req, "pixel_values", None)
         self.grid_thw = getattr(req, "grid_thw", None)
@@ -400,9 +408,28 @@ class Task:
         # Warmup bookkeeping: ensure each task participates in at most one prefill schedule per warmup
         self._warmup_prefill_seen = False
 
+    @property
+    def decode_status(self):
+        return TaskDecodeType.Waiting if self.waiting else self._decode_status
+
     def need_remove(self):
+        return self.decode_status == TaskDecodeType.Stopped
+
+    def no_model_run(self):
+        return self.decode_status != TaskDecodeType.Normal
+
+    def has_last_token(self):
+        return self.decode_status == TaskDecodeType.WillStopLength
+
+    def can_stop(self):
+        if self._decode_status in (TaskDecodeType.StopEOS, TaskDecodeType.StopLength):
+            self._decode_status = TaskDecodeType.Stopped
+
+    def update_decode_status(self):
         if self.waiting:
-            return False
+            return TaskDecodeType.Waiting
+        if self._decode_status == TaskDecodeType.Stopped:
+            return TaskDecodeType.Stopped
 
         if (
             self.stop_with_eos
@@ -410,25 +437,35 @@ class Task:
             and self.next_token in Backend.tokenizer.stop_tokens
         ):
             self.req.finish_reason = "stop"
-            return True
-        if self.num_new_tokens >= self.req.max_new_tokens:
+            self._decode_status = TaskDecodeType.StopEOS
+        elif self.num_new_tokens >= self.req.max_new_tokens:
             self.req.finish_reason = "length"
-            return True
-        return False
+            self._decode_status = TaskDecodeType.StopLength
+        elif self.num_new_tokens == self.req.max_new_tokens - 1:
+            self._decode_status = TaskDecodeType.WillStopLength
+        return self._decode_status
 
-    def update_response_sync(self, token: int):
+    def update_response_no_sync(self, token: Union[int, torch.Tensor]):
         """
         Update task state with a generated token (for Decode phase).
 
+        This method will NOT synchronize token to CPU if the new token is a tensor.
+
+        This method will NOT append the new token to the prefix.
+
+        If needed, use update_prefix to sync the new token and append it to prefix.
+
         This method:
         1. Records the generated token
-        2. Appends it to the prefix (for next iteration input)
-        3. Increments generation counter
+        2. Increments generation counter
 
         Usage: Call this during Decode phase after sampling a token.
 
         Args:
             token: The generated token ID
+
+        TODO: Fix _test_standard_tokens not None with batch_size > 1
+        TODO: _test_standard_tokens does not support DP > 1
         """
         assert token is not None, "Token cannot be None"
         self.next_token = token
@@ -438,14 +475,36 @@ class Task:
             and self.req._test_standard_tokens is not None
             and self.num_new_tokens < len(self.req._test_standard_tokens)
         ):
+            self.record_next_token = token
             self.next_token = self.req._test_standard_tokens[self.num_new_tokens].item()
 
+        self.num_new_tokens += 1
+        self.sync_new_token = False
+
+    def update_prefix(self):
+        """
+        Update prefix tokens by the next_token and synchronize the next_token to CPU if necessary
+        """
         # 如果在 Prefill 阶段 append, prefix_tokens_len 会不断增长
         # 导致consume_req_tokens中的判断条件永远不满足
         # 任务永远停留在 Prefill 状态
-        if self.task_type == TaskType.Decode:
-            self._prefix_tokens.append(token)
-        self.num_new_tokens += 1
+        if not isinstance(self.next_token, int):
+            self.next_token = int(self.next_token.cpu().item())
+        if self.next_token == -1 and self.record_next_token is None:
+            return
+        if self.record_next_token is not None:
+            if not isinstance(self.record_next_token, int):
+                self.record_next_token = int(self.record_next_token.cpu().item())
+            if self.task_type == TaskType.Decode:
+                self._prefix_tokens.append(self.record_next_token)
+            self.record_next_token = None
+        elif self.task_type == TaskType.Decode:
+            self._prefix_tokens.append(self.next_token)
+        self.sync_new_token = True
+
+    def update_response_sync(self, token: Union[int, torch.Tensor]):
+        self.update_response_no_sync(token)
+        self.update_prefix()
 
     def wait(self, handle):
         self.waiting = True
@@ -464,7 +523,12 @@ class Task:
 
     @property
     def prefix_tokens_len(self):
-        return len(self._prefix_tokens)
+        # if not sync, compute the prefix tokens length after sync
+        return (
+            len(self._prefix_tokens)
+            if self.sync_new_token or self.task_type == TaskType.Prefill
+            else len(self._prefix_tokens) + 1
+        )
 
     def set_prefill_chunk_size_for_one_step(self, prefill_chunk_size: int):
         """
@@ -568,6 +632,9 @@ class Task:
         self.prefill_chunk_size = None
 
     def has_output(self):
+        # The last step has no output
+        if self.decode_status == TaskDecodeType.Stopped:
+            return False
         return (
             self.task_type == TaskType.Prefill
             and (
@@ -576,6 +643,9 @@ class Task:
                 >= self.prefix_tokens_len
             )
         ) or self.task_type == TaskType.Decode
+
+    def has_next_token(self):
+        return self.next_token >= 0
 
     def get_msgpackable_task(self) -> MsgPackableTask:
         return MsgPackableTask(
@@ -613,6 +683,26 @@ def req_decode(id_num: int):
         return hex(id_num)[2:], TaskType.Prefill
     else:
         return hex(-id_num)[2:], TaskType.Decode
+
+
+@dataclass
+class BatchResult:
+    """
+    param of postprocess_async_part, returned by postprocess_sync_part.
+    stored in CPU, synchronized from GPU by batch_sync.
+    """
+
+    num_tasks: int = 0
+    tasks: list[Task] = field(default_factory=list)
+
+    next_tokens: list[int] = field(default_factory=list)
+    return_logprobs: bool = False
+    logprobs: Optional[torch.Tensor] = None
+    token_idxs: Optional[torch.Tensor] = None
+
+    @property
+    def task_ids(self):
+        return [task.task_id for task in self.tasks]
 
 
 class TaskPool:
@@ -866,11 +956,16 @@ class PackedTasksBase:
 
 
 class PackedTasks(PackedTasksBase):
-    def __init__(self, task_ids: list[str], rank="cuda"):
+    def __init__(
+        self, task_ids: list[str], output_task_ids: list[str] = [], rank="cuda"
+    ):
         super().__init__()
 
         self.tasks: list[Task] = [TaskPool.pool[tid] for tid in task_ids]
+        output_only_tasks: list[Task] = [TaskPool.pool[tid] for tid in output_task_ids]
         self.output_tasks = [task for task in self.tasks if task.has_output()]
+        self.all_tasks = self.tasks + output_only_tasks
+        self.all_output_tasks = self.output_tasks + output_only_tasks
         self.should_apply_frequency_penalty = any(
             task.params.frequency_penalty > 0 for task in self.output_tasks
         )
@@ -927,17 +1022,18 @@ class PackedTasks(PackedTasksBase):
         # sample related
         self.is_all_greedy = all(task.params.top_k <= 1 for task in self.output_tasks)
         self.temperatures = torch.tensor(
-            [task.params.temperature for task in self.output_tasks]
+            [task.params.temperature for task in self.output_tasks], pin_memory=True
         ).to(device=self.rank, non_blocking=True)
         self.top_ps = torch.tensor(
-            [task.params.top_p for task in self.output_tasks]
+            [task.params.top_p for task in self.output_tasks], pin_memory=True
         ).to(device=self.rank, non_blocking=True)
         self.top_ks = torch.tensor(
-            [task.params.top_k for task in self.output_tasks]
+            [task.params.top_k for task in self.output_tasks], pin_memory=True
         ).to(device=self.rank, non_blocking=True)
         self.frequency_penalties = torch.tensor(
             [task.params.frequency_penalty for task in self.output_tasks],
             dtype=torch.float32,
+            pin_memory=True,
         ).to(device=self.rank, non_blocking=True)
 
         # logprobs
@@ -984,6 +1080,59 @@ class PackedTasks(PackedTasksBase):
         # test only
         # self._test_flag = self.tasks[0].req._test_flag
         self._test_flag = getattr(self.tasks[0].req, "_test_flag", False)
+
+    def get_batch_result(self, tasks: list[Task] = None) -> BatchResult:
+        if not tasks:
+            tasks = [task for task in self.all_output_tasks if task.has_next_token()]
+        return BatchResult(
+            num_tasks=len(tasks),
+            tasks=tasks,
+            next_tokens=[task.next_token for task in tasks],
+            return_logprobs=self.return_logprobs,
+            logprobs=(
+                torch.stack([task.logprobs for task in tasks]).squeeze(1)
+                if self.return_logprobs
+                else None
+            ),
+            token_idxs=(
+                torch.stack([task.token_idxs for task in tasks]).squeeze(1)
+                if self.return_logprobs
+                else None
+            ),
+        )
+
+    def batch_update_status(self):
+        for task in self.all_tasks:
+            task.update_prefix()
+            task.update_decode_status()
+        if self.all_output_tasks:
+            Backend.last_batch_results.append(self.get_batch_result())
+
+    def batch_sync(self):
+        """
+        Synchronize tensors of all tasks to CPU.
+        Including next_token, logprobs and token_idxs.
+        Then add them to last_batch_result.
+        """
+        if len(self.all_tasks) == 0:
+            return
+        if not isinstance(self.all_tasks[0].next_token, int):
+            if self.return_logprobs:
+                logprobs_batch = [task.logprobs for task in self.all_output_tasks]
+                logprobs_batch = torch.stack(logprobs_batch).cpu()
+                token_idxs_batch = [task.token_idxs for task in self.all_output_tasks]
+                token_idxs_batch = torch.stack(token_idxs_batch).cpu()
+                for logprobs, token_idxs, task in zip(
+                    logprobs_batch, token_idxs_batch, self.all_output_tasks
+                ):
+                    task.logprobs = logprobs
+                    task.token_idxs = token_idxs
+            next_token_batch = [task.next_token for task in self.all_tasks]
+            next_token_batch = torch.stack(next_token_batch).view(-1).cpu().tolist()
+            if not isinstance(next_token_batch, list):
+                next_token_batch = [next_token_batch]
+            for next_token, task in zip(next_token_batch, self.all_tasks):
+                task.next_token = next_token
 
 
 class DPTaskCollector:

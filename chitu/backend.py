@@ -50,8 +50,9 @@ from chitu.utils import (
 from chitu.moe import init_moe_impl
 
 if TYPE_CHECKING:
-    from chitu.executor import BatchResult, Executor, OngoingRequests
+    from chitu.executor import Executor, OngoingRequests
     from chitu.scheduler import Scheduler
+    from chitu.task import BatchResult
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
