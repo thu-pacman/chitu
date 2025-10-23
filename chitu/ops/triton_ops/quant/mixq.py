@@ -201,7 +201,7 @@ def quant_int8_and_process_outliers(a: torch.Tensor, fp_idx: torch.Tensor):
 
     fp_mask = torch.zeros(K, dtype=torch.uint8, device=device)
     if n_fp > 0:
-        fp_mask[fp_idx.long()] = 1
+        fp_mask.index_fill_(0, fp_idx.to(torch.long), 1)
 
     a_q_i8 = torch.empty_like(a2d, dtype=torch.int8)
     a_scale = torch.empty((M,), dtype=torch.float32, device=device)
@@ -438,7 +438,7 @@ def quant_int4_and_process_outliers(a: torch.Tensor, fp_idx: torch.Tensor):
 
     fp_mask = torch.zeros(K, dtype=torch.uint8, device=device)
     if n_fp > 0:
-        fp_mask[fp_idx.long()] = 1
+        fp_mask.index_fill_(0, fp_idx.to(torch.long), 1)
 
     K_packed = (K + 1) // 2
     a_q_p4 = torch.empty((M, K_packed), dtype=torch.uint8, device=device)

@@ -96,7 +96,6 @@ if {[string first "DeepSeek-R1" $model_arg] != -1} {
 puts "Model extra args: $extra_args"
 set MASTER_PORT [expr {int(rand() * 1000) + 51000}]
 set SERVE_PORT [expr {int(rand() * 1000) + 21003}]
-set extra_args {*}$extra_args
 
 # Launch the server
 spawn sh -c "torchrun --nproc_per_node $tp_size_arg --master_port $MASTER_PORT -m chitu \

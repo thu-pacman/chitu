@@ -66,7 +66,7 @@ class QuantizationRegistry:
         return quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
 
     @classmethod
-    def allowed_merge_qkv(cls, checkpoint):
+    def allowed_merge_qkv(cls, checkpoint, can_use_mla_prologue_int8: bool = False):
         quant = get_quant_from_checkpoint_prefix(checkpoint)
 
         backend = get_backend_from_checkpoint_prefix(checkpoint)
@@ -82,7 +82,7 @@ class QuantizationRegistry:
         args = get_global_args()
         if (
             has_torch_npu
-            and quant is None
+            and (quant is None or can_use_mla_prologue_int8)
             and args.models.type == "deepseek-v3"
             and getattr(args.models, "index_topk", None) is None
             and args.infer.mla_absorb == "absorb-without-precomp"
