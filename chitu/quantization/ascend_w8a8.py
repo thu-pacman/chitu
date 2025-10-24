@@ -247,6 +247,7 @@ class AscendW8A8DynamicMoeExperts(
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
+        layer_id: int,
     ):
         """
         Initializes the MoE module.
@@ -263,6 +264,7 @@ class AscendW8A8DynamicMoeExperts(
             fuse_shared_experts,
             checkpoint_prefix,
             merge_gate_up,
+            layer_id,
         )
 
         gate_up_proj_in_features = dim

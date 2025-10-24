@@ -714,6 +714,7 @@ class ParallelMoeBlockQwen3Next(ParallelMoeBlock):
         checkpoint_prefix: str,
         base_moe_experts_class: Optional[type] = None,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+        layer_id: int = 0,
     ):
         super().__init__(
             gate=Qwen3MoeGate(args, op_impl),
@@ -722,10 +723,12 @@ class ParallelMoeBlockQwen3Next(ParallelMoeBlock):
                 f"{checkpoint_prefix}.experts",
                 base_moe_experts_class,
                 quant_kwargs,
+                layer_id=layer_id,
             ),
             non_fused_shared_experts=SharedExpertGateAndBodyQwen3Next(
                 args, op_impl=op_impl, checkpoint_prefix=checkpoint_prefix
             ),
+            layer_id=layer_id,
             checkpoint_prefix=checkpoint_prefix,
         )
 
@@ -768,6 +771,7 @@ class TransformerBlockHFQwen3Next(TransformerBlock):
         self.mlp = mlp_type(
             args,
             op_impl=op_impl,
+            layer_id=layer_id,
             checkpoint_prefix=f"{checkpoint_prefix}.mlp",
         )
         self.input_layernorm = Qwen3NextRMSNorm(args.dim, eps=args.norm_eps)

@@ -268,6 +268,7 @@ class Transformer(nn.Module):
         remainder = n_routed_experts % self.ep_size
         self.experts_start_idx = self.ep_group.rank_in_group * n_local_experts
         self.experts_end_idx = self.experts_start_idx + n_local_experts
+        self.moe_impl = get_moe_impl()
         if self.ep_group.is_last_rank:
             self.experts_end_idx += remainder
 
@@ -597,14 +598,24 @@ class Transformer(nn.Module):
     ):
         if not skip_preprocess:
             state_dict = self.process_state_dict_for_blockfp4_before_chunk(state_dict)
-
             # handle ep param
             if self.ep_size > 1:
+                local_experts = [
+                    self.moe_impl.load_balancer[layer_id].get_local_experts(
+                        self.moe_impl.ep_rank
+                    )
+                    for layer_id in self.moe_impl.moe_layer_id_list
+                ]
                 state_dict_keys = list(state_dict.keys())
+
                 for key in state_dict_keys:
+                    key_split = key.split(".")
+                    if key_split[0] != "layers":
+                        continue
+                    layer_id = int(key_split[1])
                     if (".experts." in key) and all(
-                        f".experts.{x}." not in key
-                        for x in range(self.experts_start_idx, self.experts_end_idx)
+                        f"{layer_id}.mlp.experts.{x}." not in key
+                        for x in local_experts[layer_id - self.moe_impl.n_dense_layers]
                     ):
                         state_dict.pop(key, None)
 
@@ -942,6 +953,7 @@ class ParallelMoeBlock(nn.Module):
         gate: MoeGate,
         experts: QuantizedMoeExpertsBase,
         non_fused_shared_experts: Optional[nn.Module] = None,
+        layer_id: int = 0,
         *,
         checkpoint_prefix: str,
     ):
@@ -955,8 +967,14 @@ class ParallelMoeBlock(nn.Module):
 
         self.moe_impl = get_moe_impl()
         self.is_tp_mode = get_tp_size() > 1
+        if self.moe_impl is not None:
+            self.expert_mapping = self.moe_impl.get_expert_mapping(layer_id=layer_id)
+        else:
+            self.expert_mapping = None
 
         self.checkpoint_prefix = checkpoint_prefix
+        self.layer_id = layer_id
+        self.experts_stats = torch.zeros(self.experts.n_routed_experts, device="cuda")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -972,8 +990,10 @@ class ParallelMoeBlock(nn.Module):
         x = x.view(-1, x.shape[-1])
 
         weights, indices = self.gate(x)
+        indices = (
+            self.expert_mapping[indices] if self.expert_mapping is not None else indices
+        )
         routed_x = IndexedBatchedRoutedActivation(x, indices)
-
         shared_y = None
         x_in_use_simultenously = False
         if self.shared_experts is not None:

@@ -53,6 +53,7 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
+        layer_id: int,
         *,
         ############################################
         # Parameters specific to this quantization
@@ -73,6 +74,7 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
             fuse_shared_experts,
             checkpoint_prefix,
             merge_gate_up,
+            layer_id=layer_id,
         )
 
         self.rank = self.ep_group.rank_in_group

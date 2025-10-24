@@ -26,6 +26,7 @@ class SparseMoeBlockHFMixtral(nn.Module):
         top_k: int,
         op_impl: str,
         checkpoint_prefix: str,
+        layer_id: int,
     ):
         super().__init__()
         self.num_experts = num_experts

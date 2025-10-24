@@ -133,6 +133,7 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
+        layer_id: int,
         *,
         ############################################
         # Parameters specific to this quantization
@@ -147,6 +148,7 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
             fuse_shared_experts,
             checkpoint_prefix,
             merge_gate_up,
+            layer_id,
         )
 
         if not self.merge_gate_up:

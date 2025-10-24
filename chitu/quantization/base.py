@@ -8,6 +8,7 @@ import torch
 
 from chitu.ops import silu_and_mul
 from chitu.distributed.parallel_state import get_ep_group
+from chitu.moe import get_moe_impl
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
@@ -41,6 +42,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
+        layer_id: int,
     ):
         super().__init__()
 
@@ -56,9 +58,6 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         self.ep_group = get_ep_group()
         moe_rank = self.ep_group.rank_in_group
         moe_world_size = self.ep_group.group_size
-        assert (
-            n_routed_experts % moe_world_size == 0
-        ), f"Number of experts must be divisible by moe world size (world_size={moe_world_size})"
         self.n_fused_shared_experts = (
             n_shared_experts if self.fuse_shared_experts else 0
         )
@@ -69,10 +68,15 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         if self.ep_group.is_last_rank:
             self.experts_end_idx += remainder
-
+        self.moe_impl = get_moe_impl()
         self.group_size = (
             self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts
         )
+        if self.moe_impl is not None:
+            num_local_slots = self.moe_impl.load_balancer[
+                layer_id
+            ].get_num_local_slots()
+            self.group_size = num_local_slots
 
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
         """

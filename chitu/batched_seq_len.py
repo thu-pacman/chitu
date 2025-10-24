@@ -201,24 +201,24 @@ class BatchedSeqLen:
         enable_flag_name="cache_position_ids_tensor_device",
     )
     def position_ids_tensor_device(self) -> torch.Tensor:
-        if not torch.any(self.lens_tensor_device == 0):
-            x = torch.ones(self.total_len, device=self.device, dtype=torch.int32)
-            # Example: x = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        # Example: lens = [3, 5, 2], total_len = 10
 
-            x[self.prefix_lens_tensor_device[1:-1]] = 1 - self.lens_tensor_device[:-1]
-            # Example: x = [ 1,  1,  1, -2,  1,  1,  1,  1, -4,  1]
+        # Create global positions
+        positions = torch.arange(self.total_len, device=self.device, dtype=torch.int32)
+        # Example: positions = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
-            x = torch.cumsum(x, dim=0, dtype=torch.int32) - 1
-            # Example: x = [0, 1, 2, 0, 1, 2, 3, 4, 0, 1]
+        # Get sequence IDs for each position
+        seq_ids = self.seq_ids_tensor_device
+        # Example: seq_ids = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2]
 
-        else:  # Fallback
-            x = torch.empty(self.total_len, device=self.device, dtype=torch.int32)
-            for i in range(self.batch_size):
-                x[self.prefix_lens_list[i] : self.prefix_lens_list[i + 1]] = (
-                    torch.arange(
-                        self.lens_list[i], device=self.device, dtype=torch.int32
-                    )
-                )
+        # Get prefix lengths for each position's sequence
+        # Use index_select instead of indexing
+        prefix_lens = torch.index_select(self.prefix_lens_tensor_device, 0, seq_ids)
+        # Example: prefix_lens = [0, 0, 0, 3, 3, 3, 3, 3, 8, 8]
+
+        # Calculate relative position within each sequence
+        x = positions - prefix_lens
+        # Example: x = [0, 1, 2, 0, 1, 2, 3, 4, 0, 1]
 
         return x
 
@@ -228,13 +228,15 @@ class BatchedSeqLen:
         enable_flag_name="cache_seq_ids_tensor_device",
     )
     def seq_ids_tensor_device(self) -> torch.Tensor:
-        # Example: lens = [3, 5, 2]
+        # Example: lens = [3, 5, 2], prefix_lens = [0, 3, 8, 10]
 
-        ret = torch.repeat_interleave(
-            torch.arange(self.batch_size, dtype=torch.int32, device=self.device),
-            self.lens_tensor_device,
-            dim=0,
-        )
+        # Use searchsorted to find which sequence each position belongs to
+        positions = torch.arange(self.total_len, device=self.device, dtype=torch.int32)
+
+        # searchsorted returns int64 by default, so  cast to int32
+        ret = torch.searchsorted(
+            self.prefix_lens_tensor_device[1:], positions, right=True
+        ).to(torch.int32)
         # Example: ret = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2]
 
         return ret
@@ -446,20 +448,30 @@ class BatchedSeqLenDelta:
         prefix_delta_lens = torch.cumsum(delta_lens, dim=0, dtype=torch.int32)
         # Example: prefix_delta_lens = [3, 8, 10]
 
-        x = torch.ones(
-            self.new.total_len - self.old.total_len,
-            device=self.old.device,
-            dtype=torch.int32,
+        delta_total_len = self.new.total_len - self.old.total_len
+        positions = torch.arange(
+            delta_total_len, device=self.old.device, dtype=torch.int32
         )
-        # Example: x = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        # Example: positions = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
-        x[0] = self.old.lens_tensor_device[0] + 1
-        x[prefix_delta_lens[:-1]] = (
-            self.old.lens_tensor_device[1:] - self.new.lens_tensor_device[:-1] + 1
+        seq_ids = torch.searchsorted(prefix_delta_lens, positions, right=True).to(
+            torch.int32
         )
-        # Example: x = [11, 1, 1, 8, 1, 1, 1, 1, 6, 1]
+        # Example: seq_ids = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2]
 
-        x = torch.cumsum(x, dim=0, dtype=torch.int32) - 1
+        old_lens = torch.index_select(self.old.lens_tensor_device, 0, seq_ids)
+        # Example: old_lens = [10, 10, 10, 20, 20, 20, 20, 20, 30, 30]
+
+        prefix_with_zero = torch.cat(
+            [
+                torch.zeros(1, device=self.old.device, dtype=torch.int32),
+                prefix_delta_lens[:-1],
+            ]
+        )
+        prefix_deltas = torch.index_select(prefix_with_zero, 0, seq_ids)
+        # Example: prefix_deltas = [0, 0, 0, 3, 3, 3, 3, 3, 8, 8]
+
+        x = old_lens + (positions - prefix_deltas)
         # Example: x = [10, 11, 12, 20, 21, 22, 23, 24, 30, 31]
 
         return x
