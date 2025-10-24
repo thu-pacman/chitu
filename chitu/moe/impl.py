@@ -13,6 +13,14 @@ from chitu.moe.token_dispatchers import (
 )
 from chitu.device_type import is_ascend_910b
 
+import torch
+from .load_balancer import (
+    MoELargeScaleNaiveLoadBalancer,
+    MoENaiveLoadBalancer,
+)
+from chitu.distributed.parallel_state import get_ep_group
+
+
 deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
@@ -45,7 +53,9 @@ class MoEImpl:
     def __init__(self, args) -> None:
         self.tp_size = args.infer.tp_size
         self.dp_size = args.infer.dp_size
+        self.ep_size = args.infer.ep_size
         self.hidden_dim = args.models.dim
+        self.ep_rank = get_ep_group().rank_in_group
 
         self.num_experts = getattr(args.models, "n_routed_experts", None) or getattr(
             args.models, "num_experts", None
@@ -61,9 +71,25 @@ class MoEImpl:
         self.decode_experts_impl = "auto"
         self.prefill_token_dispatcher_impl = args.infer.moe.prefill_token_dispatcher
         self.decode_token_dispatcher_impl = args.infer.moe.decode_token_dispatcher
+        self.use_cuda_graph = args.infer.use_cuda_graph
+        self.n_layers = args.models.n_layers
+        self.n_dense_layers = (
+            args.models.n_dense_layers if hasattr(args.models, "n_dense_layers") else 0
+        )
+        self.moe_layer_id_list = [x for x in range(self.n_dense_layers, self.n_layers)]
+        # self.n_global_experts_slots = args.model.n_global_experts_slots
+        self.n_global_experts_slots = (
+            (self.num_experts + self.ep_size - 1) // self.ep_size
+        ) * self.ep_size
 
         self._init_token_dispatcher()
         self._init_experts_impl()
+        expert_stats_path = (
+            args.infer.expert_stats_path
+            if hasattr(args.infer, "expert_stats_path")
+            else None
+        )
+        self._init_load_balancer(expert_stats_path)
 
     def _init_token_dispatcher(self):
         # impl selection
@@ -166,3 +192,32 @@ class MoEImpl:
 
     def token_unpermutation(self, *args, **kwargs):
         return self._get_current_token_dispatcher().token_unpermutation(*args, **kwargs)
+
+    def _load_expert_stats(self, file_path):
+        expert_stats = torch.load(file_path)
+        assert expert_stats.shape == (self.n_layers, self.num_experts)
+        return expert_stats
+
+    def _init_load_balancer(self, expert_stats_path: str = None):
+        if expert_stats_path is not None:
+            expert_stats = self._load_expert_stats(expert_stats_path)
+        else:
+            expert_stats = [None for _ in range(self.n_layers)]
+
+        self.load_balancer = {}
+        for layer_id in self.moe_layer_id_list:
+            cur_load_balancer = MoELargeScaleNaiveLoadBalancer(
+                self.num_experts,
+                self.n_global_experts_slots,
+                self.ep_size,
+            )
+            cur_load_balancer.update_expert_mapping(
+                expert_stats=expert_stats[layer_id],
+            )
+            self.load_balancer[layer_id] = cur_load_balancer
+
+    def get_expert_mapping(
+        self,
+        layer_id: int,
+    ):
+        return self.load_balancer[layer_id].get_expert_mapping(self.ep_rank)

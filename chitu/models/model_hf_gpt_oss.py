@@ -114,6 +114,7 @@ class GptOssMoeExperts(QuantizedMoeExpertsBase):
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
+        layer_id: int,
         *,
         ############################################
         # Parameters specific to this quantization
@@ -128,6 +129,7 @@ class GptOssMoeExperts(QuantizedMoeExpertsBase):
             fuse_shared_experts,
             checkpoint_prefix,
             merge_gate_up,
+            layer_id,
         )
         self.alpha = 1.702
         self.limit = 7.0
@@ -241,6 +243,7 @@ class ParallelMoeBlockGptOss(ParallelMoeBlock):
         checkpoint_prefix: str,
         base_moe_experts_class: Optional[type] = None,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+        layer_id: int = 0,
     ):
 
         split_size = get_tp_size() if get_ep_size() == 1 else 1
@@ -257,9 +260,11 @@ class ParallelMoeBlockGptOss(ParallelMoeBlock):
                 fuse_shared_experts=False,
                 checkpoint_prefix=f"{checkpoint_prefix}.experts",
                 merge_gate_up=False,
+                layer_id=layer_id,
             ),
             non_fused_shared_experts=None,
             checkpoint_prefix=checkpoint_prefix,
+            layer_id=layer_id,
         )
 
 

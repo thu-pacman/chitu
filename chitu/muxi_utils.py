@@ -509,6 +509,7 @@ class NormalMoeExpertsMuxiLayout(
         checkpoint_prefix: str,
         merge_gate_up: bool,
         *,
+        layer_id: int,
         ############################################
         # Parameters specific to this quantization
         dtype: Optional[torch.dtype] = None,
@@ -530,6 +531,7 @@ class NormalMoeExpertsMuxiLayout(
             fuse_shared_experts=fuse_shared_experts,
             checkpoint_prefix=checkpoint_prefix,
             merge_gate_up=merge_gate_up,
+            layer_id=layer_id,
         )
 
     @override
@@ -568,6 +570,7 @@ class Blockfp8MoeExpertsMuxiLayout(
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
+        layer_id: int,
         ############################################
         # No parameters specific to this quantization
     ):
@@ -588,6 +591,7 @@ class Blockfp8MoeExpertsMuxiLayout(
             fuse_shared_experts=fuse_shared_experts,
             checkpoint_prefix=checkpoint_prefix,
             merge_gate_up=merge_gate_up,
+            layer_id=layer_id,
         )
 
     def forward(

@@ -4,7 +4,7 @@
 
 defaults:
   - DeepSeek-R1
-  - override quant_config: ds-ascend-int8
+  - override quant_config: ds-ascend-mla-int8
   - _self_ # Config in this file overrides configs in defaults
 name: DeepSeek-R1-ascend-int8
 source: "*" # Just for displaying. No automatic download.

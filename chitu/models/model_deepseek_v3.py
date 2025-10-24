@@ -660,6 +660,7 @@ class MLPDeepSeekV3(nn.Module):
         op_impl: str,
         checkpoint_prefix: str,
         merge_gate_up=None,  # only work when role is "shared_experts"
+        layer_id: int = 0,
     ):
         super().__init__()
         if role == "shared_experts":
@@ -799,6 +800,7 @@ def MoeExpertsDeepSeekV3(
     checkpoint_prefix: str,
     base_moe_experts_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+    layer_id: int = 0,
 ):
     checkpoint_prefix = checkpoint_prefix + ".moe"
     if base_moe_experts_class is None:
@@ -822,6 +824,7 @@ def MoeExpertsDeepSeekV3(
         fuse_shared_experts=get_global_args().infer.fuse_shared_experts,
         checkpoint_prefix=checkpoint_prefix,
         merge_gate_up=merge_gate_up,
+        layer_id=layer_id,
     )
 
 
@@ -833,6 +836,7 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
         checkpoint_prefix: str,
         base_moe_experts_class: Optional[type] = None,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+        layer_id: int = 0,
     ):
         if not get_global_args().infer.fuse_shared_experts:
             merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
@@ -856,8 +860,10 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
                 checkpoint_prefix=checkpoint_prefix,
                 base_moe_experts_class=base_moe_experts_class,
                 quant_kwargs=quant_kwargs,
+                layer_id=layer_id,
             ),
             non_fused_shared_experts=non_fused_shared_experts,
+            layer_id=layer_id,
             checkpoint_prefix=checkpoint_prefix,
         )
 
@@ -915,6 +921,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                     op_impl=op_impl,
                     base_moe_experts_class=base_moe_experts_class,
                     checkpoint_prefix=f"{checkpoint_prefix}.mlp",
+                    layer_id=layer_id,
                 )
             )
         )
@@ -1002,12 +1009,38 @@ class TransformerDeepSeekV3(Transformer):
     @override
     def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
         fuse_shared_experts = get_global_args().infer.fuse_shared_experts
+        n_dense_layers = (
+            self.args.models.n_dense_layers
+            if hasattr(self.args.models, "n_dense_layers")
+            else 0
+        )
+        if self.ep_size > 1:
+            local_experts = [
+                self.moe_impl.load_balancer[layer_id].get_local_experts(
+                    self.moe_impl.ep_rank
+                )
+                for layer_id in self.moe_impl.moe_layer_id_list
+            ]
+            moe_layer_id_list = self.moe_impl.moe_layer_id_list
+        else:
+            local_experts = [
+                list(range(self.experts_start_idx, self.experts_end_idx))
+            ] * (self.args.models.n_layers - n_dense_layers)
+            moe_layer_id_list = [
+                x for x in range(n_dense_layers, self.args.models.n_layers)
+            ]
 
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            key_split = k.split(".")
+            if key_split[0] != "layers":
+                continue
+            layer_id = int(key_split[1])
             if any(
-                k.endswith(f".experts.{self.experts_start_idx}.{w}.{part}")
+                k.endswith(
+                    f"{layer_id}.mlp.experts.{local_experts[layer_id - n_dense_layers][0]}.{w}.{part}"
+                )
                 for w in ["gate_proj", "down_proj", "up_proj", "gate_up_proj"]
                 for part in self._get_2d_out_x_in_tensor_names(quant)
                 + self._get_2d_in_x_out_tensor_names(quant)
@@ -1015,9 +1048,9 @@ class TransformerDeepSeekV3(Transformer):
                 + self._get_1d_out_tensor_names(quant)
             ):
                 w, part = k.split(".")[-2:]
-                prefix = k[: -len(f"experts.{self.experts_start_idx}.{w}.{part}")]
+                prefix = f"layers.{layer_id}.mlp."
                 parts = []
-                for i in range(self.experts_start_idx, self.experts_end_idx):
+                for i in local_experts[layer_id - n_dense_layers]:
                     parts.append(prefix + f"experts.{i}.{w}.{part}")
                 if fuse_shared_experts:
                     parts.append(prefix + f"shared_experts.{w}.{part}")

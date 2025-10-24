@@ -239,6 +239,7 @@ class FeedForwardHFLlama(nn.Module):
         op_impl: str,
         checkpoint_prefix="",
         has_bias: bool = False,
+        layer_id: int = 0,
     ):
         super().__init__()
         self.op_impl = op_impl
@@ -352,6 +353,7 @@ class TransformerBlockHFLlama(TransformerBlock):
             args,
             op_impl=op_impl,
             checkpoint_prefix=f"{checkpoint_prefix}.mlp",
+            layer_id=layer_id,
         )
 
         self.input_layernorm = get_rmsnorm(
