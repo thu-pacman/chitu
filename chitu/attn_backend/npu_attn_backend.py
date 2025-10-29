@@ -21,6 +21,21 @@ from chitu.utils import try_import_and_setup_torch_npu, try_import_opt_dep
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
+core_num_each_platform = {
+    "Ascend910_9361": 40,
+    "Ascend910_9372": 40,
+    "Ascend910_9381": 48,
+    "Ascend910_9382": 48,
+    "Ascend910_9391": 48,
+    "Ascend910_9392": 48,
+    "Ascend910B1": 48,
+    "Ascend910B2C": 48,
+    "Ascend910B2": 48,
+    "Ascend910B3": 40,
+    "Ascend910B4-1": 40,
+    "Ascend910B4": 40,
+}
+
 
 class NpuAttnBackend(RefAttnBackend):
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
@@ -41,13 +56,9 @@ class NpuAttnBackend(RefAttnBackend):
         ):
             self.local_n_kv_heads = 1
         platform = get_device_name()
-        if platform == "Ascend910_9392":
-            self.max_aiv_num = 50
-        elif platform == "Ascend910B2":
-            self.max_aiv_num = 48
-        elif platform == "Ascend910B3" or platform == "Ascend910B4":
-            self.max_aiv_num = 40
-        else:
+        try:
+            self.max_aiv_num = core_num_each_platform[platform]
+        except:
             raise RuntimeError("Unsupported platform: ", platform)
         self.max_seq_len = StaticTensor(max_nelem=1, dtype=torch.int32, device="npu")
         self.first_seq_id_per_core = StaticTensor(
@@ -108,33 +119,38 @@ class NpuAttnBackend(RefAttnBackend):
         ):
             batch = seqlen.shape[0]
             kvNumHeads = self.local_n_kv_heads
-            seqlen_ = (
-                seqlen.reshape(batch, 1).broadcast_to(batch, kvNumHeads).reshape(-1)
-            )
-            seqlen_cumsum = torch.cumsum(seqlen_, 0)
-            tot_seqlen = seq_len_delta.new.total_len * kvNumHeads
-            used_core_num = (
-                self.max_aiv_num
-                if self.max_aiv_num < batch * kvNumHeads
-                else batch * kvNumHeads
-            )
-            seqlen_cumsum_start_per_core = torch.linspace(
-                0, tot_seqlen, used_core_num + 1, device=seqlen_.device
-            )
-            self.first_seq_id_per_core.set(
-                torch.argmax(
-                    (
-                        seqlen_cumsum_start_per_core.view(-1, 1)
-                        < seqlen_cumsum.view(1, -1)
-                    ).to(dtype=torch.int32),
-                    dim=1,
-                ).to(dtype=torch.int32)
-            )
+            if batch * kvNumHeads > self.max_aiv_num:
+                seqlen_ = (
+                    seqlen.reshape(batch, 1).broadcast_to(batch, kvNumHeads).reshape(-1)
+                )
+                seqlen_cumsum = torch.cumsum(seqlen_, 0)
+                tot_seqlen = seq_len_delta.new.total_len * kvNumHeads
+                used_core_num = (
+                    self.max_aiv_num
+                    if self.max_aiv_num < batch * kvNumHeads
+                    else batch * kvNumHeads
+                )
+                seqlen_cumsum_start_per_core = torch.linspace(
+                    0, tot_seqlen, used_core_num + 1, device=seqlen_.device
+                )
+                self.first_seq_id_per_core.set(
+                    torch.argmax(
+                        (
+                            seqlen_cumsum_start_per_core.view(-1, 1)
+                            < seqlen_cumsum.view(1, -1)
+                        ).to(dtype=torch.int32),
+                        dim=1,
+                    ).to(dtype=torch.int32)
+                )
+            else:
+                self.first_seq_id_per_core.set(
+                    torch.empty(0, dtype=torch.int32, device=seqlen.device)
+                )
 
             seqlen_max = seq_len_delta.new.max_len
             self.max_seq_len.set(
                 torch.linspace(
-                    seqlen_max, seqlen_max, 1, dtype=torch.int32, device=seqlen_.device
+                    seqlen_max, seqlen_max, 1, dtype=torch.int32, device=seqlen.device
                 )
             )
 
