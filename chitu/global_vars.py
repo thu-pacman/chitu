@@ -47,6 +47,7 @@ def set_global_variables(global_args=None, debug=False):
         _set_slot_handle(
             global_args.infer.max_reqs,
             global_args.infer.pp_size,
+            global_args.infer.dp_size,
             global_args.infer.cache_type,
         )
 
@@ -154,10 +155,10 @@ def get_debug():
     return _GLOBAL_DEBUG
 
 
-def _set_slot_handle(max_reqs, pp_size, cache_type):
+def _set_slot_handle(max_reqs, pp_size, dp_size, cache_type):
     global _GLOBAL_SLOT_HANDLE
     # _ensure_var_is_not_initialized(_GLOBAL_SLOT_HANDLE, "slot_handle")
-    if cache_type == "skew":
+    if cache_type == "skew" and dp_size <= 1:
         _GLOBAL_SLOT_HANDLE = SlotHandle(max_reqs, pp_size)
 
 

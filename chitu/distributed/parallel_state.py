@@ -113,10 +113,20 @@ def initialize_pp_group(
     assert _PP_GROUP is None
 
     num_pp_groups = world_size // pp_size
+    num_dp_groups = world_size // dp_size
 
     rank_list = []
-    for i in range(num_pp_groups):
-        rank_list.append(list(range(i, world_size, num_pp_groups)))
+    for i in range(dp_size):
+        for j in range(num_pp_groups // dp_size):
+            rank_list.append(
+                list(
+                    range(
+                        i * num_dp_groups + j,
+                        (i + 1) * num_dp_groups,
+                        num_pp_groups // dp_size,
+                    )
+                )
+            )
 
     _PP_GROUP = CommGroup(rank_list, rank, local_rank)
 

@@ -142,6 +142,7 @@ def test_chunked_prefill_skew():
                     "op_impl": "torch",
                     "cache_type": "skew",
                     "pp_size": 2,
+                    "dp_size": 1,
                 }
             }
         ),
@@ -152,6 +153,7 @@ def test_chunked_prefill_skew():
     _set_slot_handle(
         infer_args.max_reqs,
         infer_args.pp_size,
+        infer_args.dp_size,
         infer_args.cache_type,
     )
 
@@ -291,6 +293,7 @@ def test_priority_prefill_first_skew():
                     "op_impl": "torch",
                     "cache_type": "skew",
                     "pp_size": 1,
+                    "dp_size": 1,
                 }
             }
         ),
@@ -301,6 +304,7 @@ def test_priority_prefill_first_skew():
     _set_slot_handle(
         infer_args.max_reqs,
         infer_args.pp_size,
+        infer_args.dp_size,
         infer_args.cache_type,
     )
 
@@ -440,6 +444,7 @@ def test_priority_fcfs_skew():
                     "op_impl": "torch",
                     "cache_type": "skew",
                     "pp_size": 1,
+                    "dp_size": 1,
                 }
             }
         ),
@@ -449,6 +454,7 @@ def test_priority_fcfs_skew():
     _set_slot_handle(
         infer_args.max_reqs,
         infer_args.pp_size,
+        infer_args.dp_size,
         infer_args.cache_type,
     )
 
@@ -600,6 +606,7 @@ def test_priority_request_preset_over_prefill_first_skew():
                     "op_impl": "torch",
                     "cache_type": "skew",
                     "pp_size": 1,
+                    "dp_size": 1,
                 }
             }
         ),
@@ -609,6 +616,7 @@ def test_priority_request_preset_over_prefill_first_skew():
     _set_slot_handle(
         infer_args.max_reqs,
         infer_args.pp_size,
+        infer_args.dp_size,
         infer_args.cache_type,
     )
 
@@ -995,6 +1003,7 @@ def test_slot_group_skew():
                     "op_impl": "torch",
                     "cache_type": "skew",
                     "pp_size": 2,
+                    "dp_size": 1,
                 }
             }
         ),
@@ -1004,6 +1013,7 @@ def test_slot_group_skew():
     _set_slot_handle(
         infer_args.max_reqs,
         infer_args.pp_size,
+        infer_args.dp_size,
         infer_args.cache_type,
     )
 

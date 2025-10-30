@@ -22,6 +22,7 @@ from chitu.global_vars import (
     set_quant_variables,
     set_backend_variables,
 )
+from chitu.ops import response_append
 from chitu.scheduler import Scheduler
 from chitu.task import (
     PackedTasks,
@@ -455,6 +456,11 @@ def chitu_init(args, logging_level=None):
         args.infer.prefill_chunk_size = args.infer.max_reqs * args.infer.max_seq_len
 
     if args.infer.prefill_chunk_size is not None:
+        if args.infer.dp_size > 1 and args.infer.pp_size > 1:
+            logger.warning(
+                "Disabling infer.prefill_chunk_size because it is not compatible with DP+PP yet"
+            )
+            args.infer.prefill_chunk_size = None
         if args.infer.pp_size > 1 and args.infer.cache_type == "skew":
             logger.warning(
                 "Disabling infer.prefill_chunk_size because it is not compatible with PP+skew yet"
@@ -643,6 +649,19 @@ def _update_ongoing_tasks():
     return unwait_tasks, logits_list
 
 
+def _update_ongoing_tasks_dp():
+    unwait_tasks: list[PackedTasks] = []
+    tokens_list: list[torch.Tensor] = []
+    for ogr in Backend.ongoing_reqs:
+        if ogr.handle.is_completed():
+            Backend.ongoing_reqs.remove(ogr)
+            unwait_tasks.append(ogr.waiting_task)
+            tokens_list.append(ogr.logits)
+            for task in ogr.waiting_task.tasks:
+                task.unwait()
+    return unwait_tasks, tokens_list
+
+
 @torch.inference_mode()
 def chitu_run_pp():
     task_ids = Backend.scheduler.schedule()
@@ -682,6 +701,65 @@ def chitu_run_pp():
 
 
 @torch.inference_mode()
+def chitu_run_pp_dp():
+    task_ids = Backend.scheduler.schedule()
+    output_task_ids = Backend.scheduler.schedule_output_tasks()
+    last_batch_result = None
+
+    if output_task_ids and not task_ids:
+        tasks = PackedTasks(output_task_ids)
+        tasks.batch_update_status()
+
+    if task_ids:
+        all_task_ids = (
+            [task_id for task_list in task_ids for task_id in task_list]
+            if type(task_ids[0]) == list
+            else task_ids
+        )
+        all_tasks = PackedTasks(all_task_ids, output_task_ids)
+        all_tasks.batch_update_status()
+        # compute
+        logger.debug(f"Processing {task_ids}")
+        tasks = (
+            PackedTasks(task_ids[0])
+            if type(task_ids[0]) == list
+            else PackedTasks(task_ids)
+        )
+        Backend.executor.step(tasks)
+
+    elif len(Backend.last_batch_results) > 0:
+        # ensure the last batch result is processed
+        last_batch_result = Backend.last_batch_results.popleft()
+        Backend.executor.postprocess_async_part(last_batch_result)
+
+    unwait_batches, tokens = _update_ongoing_tasks_dp()
+    for token, tasks in zip(tokens, unwait_batches):
+        if tasks.should_apply_frequency_penalty:
+            response_append(tasks, tokens, impl="auto")
+
+        if token.numel() == 1:
+            token_list = [int(token.item())]
+        else:
+            token_list = token.cpu().tolist()
+
+        # ---dependent on tokens_cpu ---
+        for it, task in enumerate(tasks.output_tasks):
+            task.update_response_no_sync(token_list[it])
+            task._last_tokens = [token_list[it]]
+
+    curr_task_ids = []
+    if task_ids:
+        curr_task_ids = [
+            task_id for task_id_list in task_ids for task_id in task_id_list
+        ]
+    unwait_task_ids = [t.task_id for batch in unwait_batches for t in batch.tasks]
+    if last_batch_result:
+        curr_task_ids += last_batch_result.task_ids
+    removed_decode_task_ids = Backend.scheduler.update(curr_task_ids, unwait_task_ids)
+    remove_kvcache_all_device(removed_decode_task_ids)
+
+
+@torch.inference_mode()
 def chitu_run():
     rank = torch.distributed.get_rank()
     if rank != 0:
@@ -689,7 +767,10 @@ def chitu_run():
         return
 
     if Backend.args.infer.pp_size > 1:
-        chitu_run_pp()
+        if Backend.args.infer.dp_size <= 1:
+            chitu_run_pp()
+        else:
+            chitu_run_pp_dp()
     else:
         chitu_run_normal()
 

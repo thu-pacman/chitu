@@ -113,6 +113,13 @@ def batched_routed_activation_indexed_to_expert_block_indexed_cuda(
     # routed to a different expert, each occupying one block. For the reset
     # `topk_ids.numel() - num_experts` tokens, every `block_size` tokens contributes
     # to one block
+    if topk_ids.numel() == 0:
+        sorted_ids = torch.zeros(
+            (0, block_size), dtype=torch.int32, device=topk_ids.device
+        )
+        expert_ids = torch.zeros((0,), dtype=torch.int32, device=topk_ids.device)
+        num_block_post_pad = torch.zeros((1), dtype=torch.int32, device=topk_ids.device)
+        return sorted_ids, expert_ids, num_block_post_pad
     max_num_m_blocks = (
         max(num_experts, topk_ids.numel())
         + max(topk_ids.numel() - num_experts, 0) // block_size
