@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import netifaces
 from typing import Optional
 
 import torch
@@ -222,6 +223,46 @@ class CommGroup:
         else:
             if tensor.numel() > 0:
                 torch.distributed.send(tensor, dst=dst)
+
+    def gather_all_rank_ip(self):
+        try:
+            ifaces = netifaces.interfaces()
+            gateways = netifaces.gateways()
+            default_gateway = gateways.get("default", {}).get(netifaces.AF_INET, None)
+
+            if len(ifaces) == 0 or not default_gateway:
+                logger.warning(
+                    "Network interface or default gateway not found, using localhost instead."
+                )
+                local_ip = "localhost"
+            else:
+                _, main_nic_name = default_gateway
+                for iface in ifaces:
+                    if iface == main_nic_name:
+                        iface_addrs = netifaces.ifaddresses(iface).get(
+                            netifaces.AF_INET, []
+                        )
+                        if iface_addrs:
+                            local_ip = iface_addrs[0]["addr"]
+                            break
+                else:
+                    logger.warning(
+                        "Default gateway not matched, using localhost instead."
+                    )
+                    local_ip = "localhost"
+        except Exception as e:
+            logger.warning(f"Failed to get network info: {e}, using localhost instead.")
+            local_ip = "localhost"
+
+        ip_list = [None] * self.group_size
+        torch.distributed.all_gather_object(ip_list, local_ip, self.cpu_group)
+
+        if "localhost" in ip_list:
+            assert all(
+                ip == "localhost" for ip in ip_list
+            ), "Not all ranks are on localhost, maybe caused by network configuration error."
+
+        return ip_list
 
     def destroy(self):
         torch.distributed.destroy_process_group(self.gpu_group)

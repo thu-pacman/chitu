@@ -11,7 +11,7 @@ from collections import deque, defaultdict
 from chitu.task import TaskPool, TaskType, DPTaskCollector
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.utils import ceil_div
-from chitu.distributed.parallel_state import get_dp_group
+from chitu.distributed.parallel_state import get_dp_group, get_pp_group
 from chitu.backend import Backend
 from chitu.task import (
     PackedTasksBase,
@@ -490,7 +490,7 @@ class Scheduler:
         task_ids = cur_task_ids + unwait_task_ids
         task_ids = list(set(task_ids))
         self.reorder_tasks_for_batching(task_ids)
-        if update_sgroup:
+        if update_sgroup and not isinstance(self, DPFifoScheduler):
             self.update_sgroup(task_ids)
         for task_id in task_ids:
             task = TaskPool.pool[task_id]
@@ -692,8 +692,10 @@ class DPFifoScheduler(Scheduler):  # used for expert_data_parallel
         # max num tasks per dp instance
         self.max_num_tasks_per_dp = max_num_tasks
         self.dp_size = get_dp_group().group_size
+        self.pp_size = get_pp_group().group_size
         self.have_task = None
         self.kvcache_block_threshold = 0
+        self.is_warmup_stage = False
 
     def schedule(self) -> list[list[str]]:
         self.have_task = False

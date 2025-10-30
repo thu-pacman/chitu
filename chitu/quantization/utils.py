@@ -81,6 +81,7 @@ def get_layer_id_from_checkpoint_prefix(checkpoint_prefix: str, rules={}) -> int
                     layer_id = int(match.group(1))
                     if layer_id in layers:
                         return layer_id
+            return 0
     return -1
 
 

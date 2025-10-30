@@ -30,7 +30,11 @@ from chitu.attn_backend import (
 from chitu.cache_manager import DenseKVCacheManager, PagedKVCacheManager, GlobalLocalMap
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
-from chitu.distributed.parallel_state import get_pp_group, initialize_parallel_groups
+from chitu.distributed.parallel_state import (
+    get_world_group,
+    get_pp_group,
+    initialize_parallel_groups,
+)
 from chitu.hybrid_device import CPUParameter
 from chitu.models.registry import ModelType, get_model_class
 from chitu.quantization import (
@@ -160,9 +164,16 @@ class Backend:
             dp_size=non_expert_data_parallel_size,
             ep_size=expert_parallel_size,
         )
+        Backend.ip_list = get_world_group().gather_all_rank_ip()
 
-        Backend.pp_stage = global_rank // model_parallel_size
-        Backend.pp_end_stage = (world_size - 1) // model_parallel_size
+        Backend.pp_stage = (
+            global_rank
+            % (world_size // non_expert_data_parallel_size)
+            // model_parallel_size
+        )
+        Backend.pp_end_stage = (
+            world_size // non_expert_data_parallel_size - 1
+        ) // model_parallel_size
         Backend.pp_main_rank = (
             global_rank // model_parallel_size
         ) * model_parallel_size

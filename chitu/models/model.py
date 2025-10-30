@@ -29,6 +29,7 @@ from chitu.distributed.parallel_state import (
     get_tp_size,
     get_ep_group,
     get_ep_size,
+    get_dp_size,
 )
 from chitu.moe import get_moe_impl
 from chitu.moe.batched_routed_activation import IndexedBatchedRoutedActivation
@@ -218,11 +219,14 @@ class Transformer(nn.Module):
 
         self.tp_size = model_parallel_size
         self.pp_size = pipeline_parallel_size
+        self.dp_size = get_dp_size()
         self.ep_group = get_ep_group()
         self.ep_size = self.ep_group.group_size
-        self.pp_stage = self.rank // self.model_parallel_size
+        self.pp_stage = (
+            self.rank % (self.world_size // self.dp_size) // self.model_parallel_size
+        )
         self.pp_main_rank = (self.rank // model_parallel_size) * model_parallel_size
-        self.pp_end_stage = (self.world_size - 1) // model_parallel_size
+        self.pp_end_stage = (self.world_size // self.dp_size - 1) // model_parallel_size
 
         self.params = params
         self.vocab_size = params.vocab_size

@@ -4,18 +4,19 @@
 
 import asyncio
 import json
+import msgpack
 import os
 import threading
 import time
 import weakref
 import functools
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum
 from logging import getLogger
 from pathlib import Path
-from typing import Any, ClassVar, Optional, Mapping, Union, Deque
+from typing import Any, ClassVar, Deque, Optional, Mapping, Union
 from typing_extensions import override
 
 import torch
@@ -356,6 +357,7 @@ class Task:
         self.stop_with_eos = stop_with_eos
         self.params = params if params is not None else req.params
         self._prefix_tokens = tokens if tokens is not None else req.prompt_tokens
+        self._last_tokens = []
         self._decode_status = TaskDecodeType.Normal
 
         # Request
@@ -1135,6 +1137,43 @@ class PackedTasks(PackedTasksBase):
                 task.next_token = next_token
 
 
+def serialize_tasks(tasks: list[Task]) -> bytes:
+    tasks_data = [asdict(task) for task in tasks]
+    return msgpack.packb(tasks_data, use_bin_type=True)
+
+
+def deserialize_prefill_tasks(data: bytes) -> PackedTasks:
+    tasks_data = msgpack.unpackb(data, raw=False)
+
+    task_ids = []
+    for td in tasks_data:
+        params = SampleParams(**td["params"])
+        tid = td["task_id"]
+        tokens = td["tokens"]
+        consumed = td.get("consumed_req_tokens", 0)
+        chunk = td.get("prefill_chunk_size", None)
+
+        if tid in TaskPool.pool:
+            task = TaskPool.pool[tid]
+        else:
+            task = Task(task_id=tid, req=None, params=params, tokens=tokens)
+            TaskPool.add(task)
+
+        task.consumed_req_tokens = consumed
+        if chunk is not None:
+            task.set_prefill_chunk_size_for_one_step(int(chunk))
+
+        task_ids.append(tid)
+    if len(task_ids) > 0:
+        return PackedTasks(task_ids)
+    else:
+        return PackedTasksBase(
+            num_tasks=0,
+            task_type=TaskType.EmptyPrefill,
+            payload_type=SerializedPackedTasksPayloadType.EmptyPrefill,
+        )
+
+
 class DPTaskCollector:
     """
     # Used to aggregate all tasks into a PackedTasks object during DP parallelism, making it convenient for unified response processing of multiple requests later.
@@ -1145,6 +1184,18 @@ class DPTaskCollector:
 
     _total_packedtasks: PackedTasks = None
     _task_ids_list: list[list[str]] = []
+    _collect_rank_list = []
+
+    @staticmethod
+    def init_collect_rank_list():
+        dp_size = get_global_args().infer.dp_size
+        tp_size = get_global_args().infer.tp_size
+        world_size = torch.distributed.get_world_size()
+
+        for i in range(dp_size):
+            DPTaskCollector._collect_rank_list.append(
+                (i + 1) * world_size // dp_size - tp_size
+            )
 
     @staticmethod
     def prepare_dp_tasks(task_ids_list: list[list[str]]):

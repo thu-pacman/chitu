@@ -35,6 +35,7 @@ install_requires = [
     "pyzmq>=27.0.0",
     "msgpack",
     "plum-dispatch",
+    "netifaces",
 ]
 
 
