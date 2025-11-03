@@ -1251,6 +1251,7 @@ class DPTaskCollector:
 
     @staticmethod
     def remove_ongoing():
+        assert len(DPTaskCollector._ongoing_packedtasks) > 0
         DPTaskCollector._ongoing_batch_task_ids.popleft()
         DPTaskCollector._ongoing_num_tasks.popleft()
         return DPTaskCollector._ongoing_packedtasks.popleft()
@@ -1259,6 +1260,9 @@ class DPTaskCollector:
     def update_ongoing(
         dp_src: int, update_tasks: PackedTasks, update_tokens: torch.Tensor
     ):
+        if update_tasks.num_tasks == 0:
+            return
+        assert len(DPTaskCollector._ongoing_num_tasks) > 0
         assert DPTaskCollector._ongoing_num_tasks[0] >= update_tasks.num_tasks
         assert set(update_tasks.task_ids).issubset(
             DPTaskCollector._ongoing_batch_task_ids[0]
@@ -1268,6 +1272,8 @@ class DPTaskCollector:
 
     @staticmethod
     def batch_finished():
+        if len(DPTaskCollector._ongoing_num_tasks) == 0:
+            return False
         return DPTaskCollector._ongoing_num_tasks[0] == 0
 
     @staticmethod
