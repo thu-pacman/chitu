@@ -655,10 +655,18 @@ def _update_ongoing_tasks_dp():
     for ogr in Backend.ongoing_reqs:
         if ogr.handle.is_completed():
             Backend.ongoing_reqs.remove(ogr)
-            unwait_tasks.append(ogr.waiting_task)
-            tokens_list.append(ogr.logits)
-            for task in ogr.waiting_task.tasks:
-                task.unwait()
+            update_tasks = ogr.waiting_task
+            update_tokens = ogr.logits
+            dp_src = ogr.dp_src
+            DPTaskCollector.update_ongoing(dp_src, update_tasks, update_tokens)
+            if DPTaskCollector.batch_finished():
+                batch_packedtasks = DPTaskCollector.remove_ongoing()
+                unwait_tasks.append(batch_packedtasks)
+                tokens = DPTaskCollector.get_collected_tokens_tensor()
+                tokens_list.append(tokens)
+                DPTaskCollector.reset_collect_tokens()
+                for task in batch_packedtasks.tasks:
+                    task.unwait()
     return unwait_tasks, tokens_list
 
 
