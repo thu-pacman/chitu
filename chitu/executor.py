@@ -38,7 +38,7 @@ from chitu.distributed.parallel_state import (
     get_pp_pair_group,
     get_dp_group,
     get_dp_size,
-    get_ep_size,
+    get_world_group,
 )
 from chitu.moe import get_moe_impl
 from chitu.hooks import TokenSink, LocalTokenSink, KVTransferHook, NoopKVTransferHook
@@ -61,6 +61,7 @@ class OngoingRequests:
     waiting_task: PackedTasks
     handle: torch.distributed.distributed_c10d.Work
     logits: torch.Tensor
+    dp_src: int = 0
 
 
 class TasksDispatcher(ABC):
@@ -360,6 +361,7 @@ class ExpertDataDispatcher(TasksDispatcher):
         self.device = torch.cuda.current_device()
         self.group_size = self.dp_group.group_size
         self.pp_size = get_pp_group().group_size
+        self.num_nodes_per_dp = get_world_group().group_size // self.group_size
 
         self.init_zmq()
 
@@ -612,10 +614,13 @@ class ExpertDataDispatcher(TasksDispatcher):
                 )
                 curr_packed_tasks = PackedTasks(task_ids)
                 Backend.ongoing_reqs.append(
-                    OngoingRequests(curr_packed_tasks, handle, tokens)
+                    OngoingRequests(
+                        curr_packed_tasks, handle, tokens, rank // self.num_nodes_per_dp
+                    )
                 )
                 for task in curr_packed_tasks.tasks:
                     task.wait(handle)
+            DPTaskCollector.add_new_ongoing()
 
         if self.is_main_rank:
             tasks = DPTaskCollector.get_total_packedtasks()
@@ -653,6 +658,7 @@ class Executor:
         self.tp_group = None
         self.pp_stage = self.rank % (self.tp_size * self.pp_size) // self.tp_size
         DPTaskCollector.init_collect_rank_list()
+        DPTaskCollector.reset_collect_tokens()
 
         rank_filter = True
         if rank_filter and self.tp_size > 1:

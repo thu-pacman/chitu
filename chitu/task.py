@@ -25,6 +25,7 @@ from chitu.task_type import TaskType, TaskDecodeType
 from chitu.async_response import AsyncDataStream
 from chitu.backend import Backend
 from chitu.device_list import DeviceList, StaticDeviceListManager
+from chitu.distributed.parallel_state import get_dp_size
 from chitu.global_vars import get_slot_handle, get_global_args
 
 logger = getLogger(__name__)
@@ -1185,6 +1186,10 @@ class DPTaskCollector:
     _total_packedtasks: PackedTasks = None
     _task_ids_list: list[list[str]] = []
     _collect_rank_list = []
+    _ongoing_num_tasks = deque()
+    _ongoing_batch_task_ids = deque()
+    _ongoing_packedtasks = deque()
+    _collected_tokens = None
 
     @staticmethod
     def init_collect_rank_list():
@@ -1231,3 +1236,51 @@ class DPTaskCollector:
     def clear():
         DPTaskCollector._total_packedtasks = None
         DPTaskCollector._task_ids_list = []
+
+    @staticmethod
+    def add_new_ongoing():
+        DPTaskCollector._ongoing_batch_task_ids.append(
+            set(DPTaskCollector.get_total_task_ids())
+        )
+        DPTaskCollector._ongoing_num_tasks.append(
+            DPTaskCollector.get_total_packedtasks().num_tasks
+        )
+        DPTaskCollector._ongoing_packedtasks.append(
+            DPTaskCollector.get_total_packedtasks()
+        )
+
+    @staticmethod
+    def remove_ongoing():
+        assert len(DPTaskCollector._ongoing_packedtasks) > 0
+        DPTaskCollector._ongoing_batch_task_ids.popleft()
+        DPTaskCollector._ongoing_num_tasks.popleft()
+        return DPTaskCollector._ongoing_packedtasks.popleft()
+
+    @staticmethod
+    def update_ongoing(
+        dp_src: int, update_tasks: PackedTasks, update_tokens: torch.Tensor
+    ):
+        if update_tasks.num_tasks == 0:
+            return
+        assert len(DPTaskCollector._ongoing_num_tasks) > 0
+        assert DPTaskCollector._ongoing_num_tasks[0] >= update_tasks.num_tasks
+        assert set(update_tasks.task_ids).issubset(
+            DPTaskCollector._ongoing_batch_task_ids[0]
+        )
+        DPTaskCollector._ongoing_num_tasks[0] -= update_tasks.num_tasks
+        DPTaskCollector._collected_tokens[dp_src] = update_tokens
+
+    @staticmethod
+    def batch_finished():
+        if len(DPTaskCollector._ongoing_num_tasks) == 0:
+            return False
+        return DPTaskCollector._ongoing_num_tasks[0] == 0
+
+    @staticmethod
+    def reset_collect_tokens():
+        DPTaskCollector._collected_tokens = [None] * get_dp_size()
+
+    @staticmethod
+    def get_collected_tokens_tensor():
+        collect_tokens = [t for t in DPTaskCollector._collected_tokens if t is not None]
+        return torch.concat(collect_tokens)
