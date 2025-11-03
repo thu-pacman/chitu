@@ -1018,12 +1018,12 @@ def _(
         hidden_states.block_to_token_x_topk_indices.shape[-1] == config["BLOCK_SIZE_M"]
     )
 
-    intermediate_cache1 = torch.empty(
+    intermediate_cache1 = torch.zeros(
         (M, top_k_num, N),
         device=hidden_states.activation.device,
         dtype=hidden_states.activation.dtype,
     )
-    intermediate_cache3 = torch.empty(
+    intermediate_cache3 = torch.zeros(
         (M, top_k_num, w2.shape[1]),
         device=hidden_states.activation.device,
         dtype=hidden_states.activation.dtype,

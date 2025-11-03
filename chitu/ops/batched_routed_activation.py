@@ -107,8 +107,6 @@ def batched_routed_activation_indexed_to_expert_block_indexed_cuda(
     block_size: int,
     num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if parallel_groups_initialized() and get_ep_size() > 1:
-        num_experts += 1
     # The case of max_num_m_blocks: Suppose the first `num_experts` tokens each
     # routed to a different expert, each occupying one block. For the reset
     # `topk_ids.numel() - num_experts` tokens, every `block_size` tokens contributes
