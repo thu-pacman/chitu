@@ -25,7 +25,10 @@ class Scheduler:
     @staticmethod
     def build(args, infer_args):
         if get_dp_group().group_size > 1:
-            return DPFifoScheduler(infer_args.max_reqs)
+            num_tasks_per_rank = ceil_div(
+                infer_args.max_reqs, get_dp_group().group_size
+            )
+            return DPFifoScheduler(num_tasks_per_rank)
 
         if get_slot_handle():
             return SkewScheduler(

@@ -45,12 +45,15 @@ __global__ void
 count_and_sort_expert_tokens_kernel(const scalar_t *__restrict__ topk_ids,
                                     int32_t *__restrict__ sorted_token_ids,
                                     int32_t *__restrict__ cumsum_buffer,
-                                    size_t numel) {
+                                    size_t numel, int32_t num_experts) {
     const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     const size_t stride = blockDim.x * gridDim.x;
 
     for (size_t i = tid; i < numel; i += stride) {
         int32_t expert_id = topk_ids[i];
+        if (expert_id < 0 || expert_id >= num_experts) {
+            continue;
+        }
         int32_t rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
         sorted_token_ids[rank_post_pad] = i;
     }
@@ -80,6 +83,9 @@ batched_routed_activation_indexed_to_expert_block_indexed_kernel(
 
     for (int i = tid; i < numel; i += blockDim.x) {
         int expert_id = topk_ids[i];
+        if (expert_id < 0 || expert_id >= num_experts) {
+            continue;
+        }
         int warp_idx = expert_id / experts_per_warp;
         int expert_offset = expert_id % experts_per_warp;
         atomicAdd(&shared_counts[warp_idx * experts_per_warp + expert_offset],
@@ -184,7 +190,8 @@ void batched_routed_activation_indexed_to_expert_block_indexed(
             sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(
                 topk_ids.data_ptr<scalar_t>(),
                 sorted_token_ids.data_ptr<int32_t>(),
-                cumsum_buffer.data_ptr<int32_t>(), topk_ids.numel());
+                cumsum_buffer.data_ptr<int32_t>(), topk_ids.numel(),
+                static_cast<int32_t>(num_experts));
         });
 }
 
