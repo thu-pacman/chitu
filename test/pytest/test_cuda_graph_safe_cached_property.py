@@ -142,3 +142,69 @@ def test_cache_in_graph_reuse_out_of_graph():
     y4 = a.y
     assert y4.item() == 16
     assert a.out_of_graph_invoke_cnt == 2  # unchanged
+
+
+class B:
+    def __init__(self, length):
+        self.out_of_graph_invoke_cnt = 0
+        self.length = length
+        self._y_static_tensor = StaticTensor(
+            max_nelem=100, dtype=torch.int32, device="cuda"
+        )
+        self._y_up_to_date = False
+
+    def upd(self, length):
+        self.length = length
+        self._y_up_to_date = False
+
+    @cuda_graph_safe_cached_property("_y_static_tensor", "_y_up_to_date")
+    def y(self):
+        self.out_of_graph_invoke_cnt += 1
+        return torch.full((self.length,), self.length, device="cuda", dtype=torch.int32)
+
+
+def test_cache_in_graph_reuse_out_of_graph_dynamic_shape():
+    b = B(3)
+
+    @make_dispatched_graphed_callables(
+        args_max_nelem=[],
+        kwargs_max_nelem={},
+        output_max_nelem_callback=lambda key, sample_nelem: 100,
+    )
+    def f():
+        y1 = b.y
+        return y1
+
+    y1 = f(key=3)
+    assert y1.shape == (3,)
+    assert torch.all(y1 == 3)
+    assert b.out_of_graph_invoke_cnt == 2  # 1 warmup (uncached) + 1 capture (cached)
+
+    y2 = b.y
+    assert y2.shape == (3,)
+    assert torch.all(y2 == 3)
+    assert b.out_of_graph_invoke_cnt == 2  # unchanged
+
+    b.upd(4)
+
+    y3 = f(key=4)
+    assert y3.shape == (4,)
+    assert torch.all(y3 == 4)
+    assert b.out_of_graph_invoke_cnt == 4  # 1 warmup (uncached) + 1 capture (cached)
+
+    y4 = b.y
+    assert y4.shape == (4,)
+    assert torch.all(y4 == 4)
+    assert b.out_of_graph_invoke_cnt == 4  # unchanged
+
+    b.upd(3)  # Back to 3
+
+    y5 = f(key=3)
+    assert y5.shape == (3,)
+    assert torch.all(y5 == 3)
+    assert b.out_of_graph_invoke_cnt == 4  # unchanged
+
+    y6 = b.y
+    assert y6.shape == (3,)
+    assert torch.all(y6 == 3)
+    assert b.out_of_graph_invoke_cnt == 4  # unchanged
