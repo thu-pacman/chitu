@@ -5,12 +5,20 @@
 from typing import Optional
 import torch
 
-from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
+from chitu.utils import (
+    try_import_platform_dep,
+    try_import_opt_dep,
+    try_import_and_setup_torch_npu,
+    ceil_div,
+)
 from chitu.distributed.parallel_state import get_ep_size, parallel_groups_initialized
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
+    "muxi_layout_kernels", "muxi_layout_kernels"
+)
 
 if has_triton and torch.cuda.is_available():
     from chitu.ops.triton_ops import (
@@ -73,7 +81,13 @@ def batched_routed_activation_indexed_to_expert_block_indexed(
     # SPDX-SnippetEnd
 
     if impl == "auto":
-        if has_chitu_backend:
+        if (
+            has_muxi_layout_kernels
+            and num_experts in [8, 16, 32, 64, 128, 256]
+            and block_size in [16]
+        ):
+            impl = "muxi"
+        elif has_chitu_backend:
             impl = "cuda"
         elif has_triton:
             impl = "triton"
@@ -88,6 +102,10 @@ def batched_routed_activation_indexed_to_expert_block_indexed(
         )
     elif impl == "triton":
         return batched_routed_activation_indexed_to_expert_block_indexed_triton(
+            topk_ids, block_size, num_experts
+        )
+    elif impl == "muxi":
+        return batched_routed_activation_indexed_to_expert_block_indexed_muxi(
             topk_ids, block_size, num_experts
         )
     else:
@@ -154,6 +172,38 @@ def batched_routed_activation_indexed_to_expert_block_indexed_cuda(
 
 
 # SPDX-SnippetEnd
+
+
+def batched_routed_activation_indexed_to_expert_block_indexed_muxi(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bs, topk = topk_ids.shape
+    max_num_tokens_padded = (topk * bs) + num_experts * (block_size - 1)
+    max_num_blocks_padded = ceil_div(max_num_tokens_padded, block_size)
+    sorted_token_ids = torch.full(
+        (max_num_blocks_padded, block_size),
+        fill_value=bs * topk,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    cumsum_buffer = torch.empty(num_experts + 1, dtype=torch.int32, device="cuda")
+    padded_num_experts = torch.empty(1, dtype=torch.int32, device="cuda")
+    experts_ids = torch.empty(max_num_blocks_padded, dtype=torch.int32, device="cuda")
+
+    muxi_layout_kernels.batched_routed_activation_indexed_to_expert_block_indexed(
+        bs,
+        num_experts,
+        topk,
+        block_size,
+        topk_ids,
+        sorted_token_ids,
+        cumsum_buffer,
+        padded_num_experts,
+        experts_ids,
+    )
+    return sorted_token_ids, experts_ids, padded_num_experts
 
 
 def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(

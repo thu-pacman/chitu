@@ -8,6 +8,7 @@ from chitu.ops import (
 )
 from chitu.utils import (
     try_import_platform_dep,
+    try_import_opt_dep,
     try_import_and_setup_torch_npu,
     ceil_div,
 )
@@ -16,14 +17,17 @@ from chitu.device_type import has_native_fp8
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
+    "muxi_layout_kernels", "muxi_layout_kernels"
+)
 
 
 @pytest.mark.parametrize("num_experts", [256])
-@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize("block_size", [16, 64])
 @pytest.mark.parametrize("num_tokens", [64, 4096])
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("distribution", ["imbalance", "uniform"])
-@pytest.mark.parametrize("impl", ["triton", "cuda"])
+@pytest.mark.parametrize("impl", ["triton", "cuda", "muxi"])
 def test_batched_routed_activation_indexed_to_expert_block_indexed(
     num_experts, block_size, num_tokens, topk, distribution, impl
 ):
@@ -31,6 +35,11 @@ def test_batched_routed_activation_indexed_to_expert_block_indexed(
         pytest.skip("triton is missing")
     if impl == "cuda" and not has_chitu_backend:
         pytest.skip("chitu_backend is missing")
+    if impl == "muxi":
+        if not has_muxi_layout_kernels:
+            pytest.skip("muxi_layout_kernels is missing")
+        if block_size != 16:
+            pytest.skip("muxi only supports block_size=16")
 
     if distribution == "imbalance":
         token_to_expert_indices = torch.arange(
@@ -177,7 +186,7 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("distribution", ["imbalance", "uniform"])
 @pytest.mark.parametrize("impl", ["torch_npu"])
-def test_batched_routed_activation_indexed_to_expert_block_indexed(
+def test_batched_routed_activation_indexed_to_concat_permuted(
     num_experts, block_size, num_tokens, hidden_size, topk, distribution, impl
 ):
     if impl == "torch_npu" and not has_torch_npu:
