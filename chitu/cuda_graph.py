@@ -252,13 +252,18 @@ def cuda_graph_safe_cached_property(
                 assert isinstance(static_tensor, StaticTensor)
                 assert isinstance(getattr(self, up_to_date_flag_name), bool)
                 if not getattr(self, up_to_date_flag_name):
-                    static_tensor.set(fn(self, *args, **kwargs))
+                    tensor = fn(self, *args, **kwargs)
+                    shape = tuple(tensor.shape)
+                    static_tensor.set(tensor)
                     if not is_warming_up_before_cuda_graph_capture():
                         setattr(self, up_to_date_flag_name, True)
                     if torch.cuda.is_current_stream_capturing():
-                        add_post_hook_for_currently_capturing_graph_object(
-                            lambda: setattr(self, up_to_date_flag_name, True)
-                        )
+
+                        def post_hook():
+                            setattr(self, up_to_date_flag_name, True)
+                            getattr(self, static_tensor_name).set_shape(shape)
+
+                        add_post_hook_for_currently_capturing_graph_object(post_hook)
                 return static_tensor.get()
             else:
                 return fn(self, *args, **kwargs)

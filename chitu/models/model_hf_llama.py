@@ -764,6 +764,10 @@ class TransformerHFLlama(Transformer):
                 has_bias=False,
                 checkpoint_prefix=f"lm_head",
             )
+        elif not getattr(self, "embed_tokens", None):
+            self.embed_tokens = VocabParallelEmbedding(
+                num_embeddings=self.params.vocab_size, embedding_dim=self.params.dim
+            )
 
     def _pre_layers(self, h, **args):
         return self.embed_tokens(h)
