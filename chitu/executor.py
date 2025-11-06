@@ -1187,12 +1187,12 @@ class Executor:
         """
 
         for dispatcher in self.task_dispatchers:
-            payload = dispatcher.recv_payload(self.dummy_input)
+            payload = dispatcher.recv_payload(self.dummy_logits)
 
         for it, layer in enumerate(Backend.model.layers):
             if it < self.n_dense_layers:
                 continue
-            layer.mlp(payload)
+            layer.mlp(self.dummy_input)
 
         for dispatcher in self.task_dispatchers:
             dispatcher.send_payload(self.dummy_logits)
@@ -1212,7 +1212,7 @@ class Executor:
                 layer.mlp(self.dummy_input)
 
         for dispatcher in self.task_dispatchers:
-            payload = dispatcher.recv_payload(self.dummy_input)
+            payload = dispatcher.recv_payload(self.dummy_logits)
 
         if self.use_cuda_graph:
             if self.empty_decode_step_graph is None:

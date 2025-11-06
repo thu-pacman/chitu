@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from omegaconf import MISSING
 
@@ -45,7 +45,7 @@ class InferConfig:
     bind_process_to_cpu: str = MISSING
     bind_thread_to_cpu: str = MISSING
     memory_utilization: float = MISSING
-    prefill_chunk_size: Optional[int] = MISSING
+    prefill_chunk_size: Union[int, str, None] = MISSING
     expert_stats_path: Optional[str] = None
 
     @dataclass

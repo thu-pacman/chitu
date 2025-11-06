@@ -443,6 +443,10 @@ def chitu_init(args, logging_level=None):
         )
         args.float_16bit_variant = args.dtype
 
+    # prefill_chunk_size default value: 4096 * dp_size
+    if args.infer.prefill_chunk_size == "auto":
+        args.infer.prefill_chunk_size = 4096 * args.infer.dp_size
+
     if (
         args.infer.prefill_chunk_size is not None
         and args.infer.prefill_chunk_size > args.infer.max_reqs * args.infer.max_seq_len
@@ -506,7 +510,11 @@ def chitu_init(args, logging_level=None):
             "Qwen3-Next-80B-A3B-Instruct",
         ]:
             args.infer.use_cuda_graph = False
-        elif args.infer.dp_size > 1 and (args.infer.tp_size > 1 or not has_deep_ep):
+        elif (
+            args.infer.ep_size > 1
+            and args.infer.dp_size > 1
+            and (args.infer.tp_size > 1 or not has_deep_ep)
+        ):
             args.infer.use_cuda_graph = False
         elif args.infer.attn_type == "ref":
             args.infer.use_cuda_graph = False
