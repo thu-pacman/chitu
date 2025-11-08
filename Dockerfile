@@ -29,7 +29,7 @@ RUN apt update -y && apt install -y git gcc-10 g++-10 libnuma-dev wget
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
+    pip install -U "pip<25.3" -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
 RUN if [ "${enable_test}" = "true" ]; then \

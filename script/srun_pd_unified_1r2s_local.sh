@@ -99,7 +99,7 @@ srun $SRUN_PARTITION_ARG \
             --config-name=serve_config \
             models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} \
             infer.tp_size=1 infer.pp_size=1 \
-            infer.cache_type=paged infer.do_load=True \
+            infer.cache_type=paged \
             infer.max_seq_len=2048 infer.max_reqs=128 \
             infer.use_cuda_graph=True \
             request.max_new_tokens=1024 \
@@ -118,7 +118,7 @@ srun $SRUN_PARTITION_ARG \
             --config-name=serve_config \
             models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} \
             infer.tp_size=1 infer.pp_size=1 \
-            infer.cache_type=paged infer.do_load=True \
+            infer.cache_type=paged \
             infer.max_seq_len=2048 infer.max_reqs=128 \
             infer.use_cuda_graph=True \
             request.max_new_tokens=1024 \

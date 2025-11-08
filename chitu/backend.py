@@ -609,7 +609,7 @@ class Backend:
         Returns:
             Fully set up model
         """
-        if args.infer.do_load:
+        if not args.debug.skip_model_load:
             # Build the model. Don't allocate memory yet.
             with torch.device("meta"):
                 model = Backend._build_model_architecture(args, attn_backend)

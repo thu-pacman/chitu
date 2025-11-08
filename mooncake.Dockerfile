@@ -30,7 +30,7 @@ RUN apt update -y && apt install -y git gcc-10 g++-10 libnuma-dev
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
+    pip install -U "pip<25.3" -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
 RUN if [ "${enable_test}" = "true" ]; then \
@@ -77,7 +77,7 @@ COPY --from=dependency_resolver /tmp/requirements.txt /tmp/requirements.txt
 # compile at install time, and the compile results are environment dependent.
 RUN --mount=type=bind,source=./third_party,target=./third_party,readwrite \
     --mount=type=bind,source=./csrc/cpuinfer,target=./csrc/cpuinfer,readwrite \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec")
+    pip install --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec")
 
 #####################################
 # Wheel build Stage

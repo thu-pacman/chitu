@@ -47,7 +47,6 @@ start_dp_group() {
             infer.tp_size=1 \
             infer.pp_size=1 \
             infer.cache_type=paged \
-            infer.do_load=True \
             infer.max_seq_len=2048 \
             infer.max_reqs=128 \
             request.max_new_tokens=1200 \

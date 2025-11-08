@@ -125,19 +125,19 @@ srun $SRUN_PARTITION_ARG \
             export PD_MASTER_ADDR=\$ROUTER_IP
             CUDA_VISIBLE_DEVICES=0 \$RUNNER_CMD torchrun --nproc_per_node=1 --master_port=29501 -m chitu \
                 --config-name=pd_disagg_2p3d_multi_node models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} \
-                infer.tp_size=1 infer.pp_size=1 infer.cache_type=paged infer.do_load=True infer.max_seq_len=2048 infer.max_reqs=128 request.max_new_tokens=1200 \
+                infer.tp_size=1 infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=2048 infer.max_reqs=128 request.max_new_tokens=1200 \
                 dp_config.enabled=True dp_config.router.is_router=False dp_config.router.host=\$ROUTER_IP dp_config.scheduler_base_host=0.0.0.0 dp_config.scheduler_base_port=$((29630 + 0)) dp_config.dp_id=2 \
                 scheduler.type=\"decode_only\" infer.use_cuda_graph=True > \"$LOG_DIR/decode1.log\" 2>&1 &
             D1_PID=\$!
             CUDA_VISIBLE_DEVICES=1 \$RUNNER_CMD torchrun --nproc_per_node=1 --master_port=29502 -m chitu \
                 --config-name=pd_disagg_2p3d_multi_node models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} \
-                infer.tp_size=1 infer.pp_size=1 infer.cache_type=paged infer.do_load=True infer.max_seq_len=2048 infer.max_reqs=128 request.max_new_tokens=1200 \
+                infer.tp_size=1 infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=2048 infer.max_reqs=128 request.max_new_tokens=1200 \
                 dp_config.enabled=True dp_config.router.is_router=False dp_config.router.host=\$ROUTER_IP dp_config.scheduler_base_host=0.0.0.0 dp_config.scheduler_base_port=$((29630 + 1)) dp_config.dp_id=3 \
                 scheduler.type=\"decode_only\" infer.use_cuda_graph=True > \"$LOG_DIR/decode2.log\" 2>&1 &
             D2_PID=\$!
             CUDA_VISIBLE_DEVICES=2 \$RUNNER_CMD torchrun --nproc_per_node=1 --master_port=29503 -m chitu \
                 --config-name=pd_disagg_2p3d_multi_node models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} \
-                infer.tp_size=1 infer.pp_size=1 infer.cache_type=paged infer.do_load=True infer.max_seq_len=2048 infer.max_reqs=128 request.max_new_tokens=1200 \
+                infer.tp_size=1 infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=2048 infer.max_reqs=128 request.max_new_tokens=1200 \
                 dp_config.enabled=True dp_config.router.is_router=False dp_config.router.host=\$ROUTER_IP dp_config.scheduler_base_host=0.0.0.0 dp_config.scheduler_base_port=$((29630 + 2)) dp_config.dp_id=4 \
                 scheduler.type=\"decode_only\" infer.use_cuda_graph=True > \"$LOG_DIR/decode3.log\" 2>&1 &
             D3_PID=\$!
@@ -170,13 +170,13 @@ srun $SRUN_PARTITION_ARG \
             echo '=== 启动 Prefill1/2 (节点1) ==='
             CUDA_VISIBLE_DEVICES=0,1 \$RUNNER_CMD torchrun --nproc_per_node=2 --master_port=29510 -m chitu \
                 --config-name=pd_disagg_2p3d_multi_node models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} \
-                infer.tp_size=2 infer.pp_size=1 infer.cache_type=paged infer.do_load=True infer.max_seq_len=2048 infer.max_reqs=128 request.max_new_tokens=1200 \
+                infer.tp_size=2 infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=2048 infer.max_reqs=128 request.max_new_tokens=1200 \
                 dp_config.enabled=True dp_config.router.is_router=False dp_config.router.host=\$ROUTER_IP dp_config.scheduler_base_host=0.0.0.0 dp_config.scheduler_base_port=$((29620 + 0)) dp_config.dp_id=0 \
                 scheduler.type=\"prefill_only\" infer.use_cuda_graph=True > \"$LOG_DIR/prefill1.log\" 2>&1 &
             P1_PID=\$!
             CUDA_VISIBLE_DEVICES=2,3 \$RUNNER_CMD torchrun --nproc_per_node=2 --master_port=29511 -m chitu \
                 --config-name=pd_disagg_2p3d_multi_node models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} \
-                infer.tp_size=2 infer.pp_size=1 infer.cache_type=paged infer.do_load=True infer.max_seq_len=2048 infer.max_reqs=128 request.max_new_tokens=1200 \
+                infer.tp_size=2 infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=2048 infer.max_reqs=128 request.max_new_tokens=1200 \
                 dp_config.enabled=True dp_config.router.is_router=False dp_config.router.host=\$ROUTER_IP dp_config.scheduler_base_host=0.0.0.0 dp_config.scheduler_base_port=$((29620 + 1)) dp_config.dp_id=1 \
                 scheduler.type=\"prefill_only\" infer.use_cuda_graph=True > \"$LOG_DIR/prefill2.log\" 2>&1 &
             P2_PID=\$!

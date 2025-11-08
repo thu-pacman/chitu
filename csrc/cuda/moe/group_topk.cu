@@ -46,8 +46,8 @@ template <typename T, typename BIAS_T, int VPT, int NUM_EXPERTS, int BLOCK_SIZE,
 __global__ void __launch_bounds__(BLOCK_SIZE)
     fused_sigmoid_topk_kernel(const T *input, const int batchSize,
                               const int n_groups, const int topK_groups,
-                              int *expertsIds, T *selectedExpertsWeights,
-                              const BIAS_T *bias) {
+                              int topInGroup, int *expertsIds,
+                              T *selectedExpertsWeights, const BIAS_T *bias) {
     static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
     static constexpr int ELTS_PER_LDG_BIAS = BYTES_PER_LDG / sizeof(BIAS_T);
     static constexpr int ELTS_PER_ROW = NUM_EXPERTS;
@@ -128,7 +128,6 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     // ===== try to support the grouped experts for deepseek. =====
     // ===== First, find the experts_group max (or sum max 2 with bias) for
     // group score. =====
-    int topInGroup = (bias == nullptr) ? 1 : 2;
     const int experts_per_group = NUM_EXPERTS / n_groups;
     const int experts_group_id = threadIdInGroup * VPT / experts_per_group;
     int start_thread_for_group = experts_group_id * (experts_per_group / VPT);
@@ -312,9 +311,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 template <typename T, typename BIAS_T, int EXPERTS>
 void fused_gate_dispatcher(const T *input, const int score_fun,
                            const int batchSize, const int n_groups,
-                           const int topK_groups, int *expertsIds,
-                           T *selectedExpertsWeights, const int topK,
-                           const BIAS_T *bias, cudaStream_t stream) {
+                           const int topK_groups, int topInGroup,
+                           int *expertsIds, T *selectedExpertsWeights,
+                           const int topK, const BIAS_T *bias,
+                           cudaStream_t stream) {
     static constexpr int BLOCK_SIZE = 256;
     static constexpr int BYTES_PER_LDG = 16;
 
@@ -333,9 +333,9 @@ void fused_gate_dispatcher(const T *input, const int score_fun,
 #define LAUNCH_FUSED_TOPK(TOPK)                                                \
     fused_sigmoid_topk_kernel<T, BIAS_T, VPT, EXPERTS, BLOCK_SIZE,             \
                               BYTES_PER_LDG, TOPK>                             \
-        <<<numBlocks, block_dim, 0, stream>>>(input, batchSize, n_groups,      \
-                                              topK_groups, expertsIds,         \
-                                              selectedExpertsWeights, bias);
+        <<<numBlocks, block_dim, 0, stream>>>(                                 \
+            input, batchSize, n_groups, topK_groups, topInGroup, expertsIds,   \
+            selectedExpertsWeights, bias);
     switch (topK) {
     case 8:
         LAUNCH_FUSED_TOPK(8);
@@ -349,15 +349,16 @@ void fused_gate_dispatcher(const T *input, const int score_fun,
 
 #define LAUNCH_GATE(NUM_EXPERTS)                                               \
     fused_gate_dispatcher<T, BIAS_T, NUM_EXPERTS>(                             \
-        input, score_fun, batchSize, n_groups, topK_groups, expertsIds,        \
-        selectedExpertsWeights, topK, bias, stream)
+        input, score_fun, batchSize, n_groups, topK_groups, topInGroup,        \
+        expertsIds, selectedExpertsWeights, topK, bias, stream)
 
 template <typename T, typename BIAS_T>
 void fused_gate_launcher(const T *input, int score_fun, const int batchSize,
                          const int n_groups, const int topK_groups,
-                         int *expertsIds, T *selectedExpertsWeights,
-                         const int topK, const int numExperts,
-                         const BIAS_T *bias, cudaStream_t stream) {
+                         int topInGroup, int *expertsIds,
+                         T *selectedExpertsWeights, const int topK,
+                         const int numExperts, const BIAS_T *bias,
+                         cudaStream_t stream) {
     switch (numExperts) {
     case 256:
         LAUNCH_GATE(256);
@@ -393,11 +394,14 @@ void fused_gate_launcher(const T *input, int score_fun, const int batchSize,
 }
 
 template <typename T, typename BIAS_T>
-void fused_gate_launcher_wrapper(
-    const torch::Tensor &input, int score_fun, const int batchSize,
-    const int n_groups, const int topK_groups, torch::Tensor &expertsIds,
-    torch::Tensor &selectedExpertsWeights, const int topK, const int numExperts,
-    c10::optional<torch::Tensor> bias, cudaStream_t stream) {
+void fused_gate_launcher_wrapper(const torch::Tensor &input, int score_fun,
+                                 const int batchSize, const int n_groups,
+                                 const int topK_groups, int topInGroup,
+                                 torch::Tensor &expertsIds,
+                                 torch::Tensor &selectedExpertsWeights,
+                                 const int topK, const int numExperts,
+                                 c10::optional<torch::Tensor> bias,
+                                 cudaStream_t stream) {
     T *input_ptr = reinterpret_cast<T *>(input.data_ptr());
     int *expertsIds_ptr = reinterpret_cast<int *>(expertsIds.data_ptr());
     T *selectedExpertsWeights_ptr =
@@ -405,13 +409,15 @@ void fused_gate_launcher_wrapper(
     BIAS_T *bias_ptr = bias.has_value()
                            ? reinterpret_cast<BIAS_T *>(bias.value().data_ptr())
                            : nullptr;
-    fused_gate_launcher<T, BIAS_T>(
-        input_ptr, score_fun, batchSize, n_groups, topK_groups, expertsIds_ptr,
-        selectedExpertsWeights_ptr, topK, numExperts, bias_ptr, stream);
+    fused_gate_launcher<T, BIAS_T>(input_ptr, score_fun, batchSize, n_groups,
+                                   topK_groups, topInGroup, expertsIds_ptr,
+                                   selectedExpertsWeights_ptr, topK, numExperts,
+                                   bias_ptr, stream);
 }
 
 void route_gate(torch::Tensor &linear_output, int score_fun, int batchSize,
-                int n_groups, int topK_groups, torch::Tensor &expertsIds,
+                int n_groups, int topK_groups, int topInGroup,
+                torch::Tensor &expertsIds,
                 torch::Tensor &selectedExpertsWeights, int topK,
                 c10::optional<torch::Tensor> bias) {
     int seq_length = linear_output.size(0);
@@ -445,20 +451,20 @@ void route_gate(torch::Tensor &linear_output, int score_fun, int batchSize,
             if (bias.value().scalar_type() == at::ScalarType::Float) {
                 fused_gate_launcher_wrapper<kernel_t, float>(
                     linear_output, score_fun, batchSize, n_groups, topK_groups,
-                    expertsIds, selectedExpertsWeights, topK, num_experts, bias,
-                    stream);
+                    topInGroup, expertsIds, selectedExpertsWeights, topK,
+                    num_experts, bias, stream);
             } else {
                 using bias_t = typename map_to_cuda_type<input_t>::type;
                 fused_gate_launcher_wrapper<kernel_t, bias_t>(
                     linear_output, score_fun, batchSize, n_groups, topK_groups,
-                    expertsIds, selectedExpertsWeights, topK, num_experts, bias,
-                    stream);
+                    topInGroup, expertsIds, selectedExpertsWeights, topK,
+                    num_experts, bias, stream);
             }
         } else {
             fused_gate_launcher_wrapper<kernel_t, kernel_t>(
                 linear_output, score_fun, batchSize, n_groups, topK_groups,
-                expertsIds, selectedExpertsWeights, topK, num_experts, bias,
-                stream);
+                topInGroup, expertsIds, selectedExpertsWeights, topK,
+                num_experts, bias, stream);
         }
     });
 }

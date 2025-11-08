@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from omegaconf import MISSING
 
@@ -27,7 +27,7 @@ class InferConfig:
     pp_size: int = MISSING
     dp_size: int = MISSING
     ep_size: int = MISSING
-    do_load: bool = MISSING
+    do_load: bool = MISSING  # Legacy parameter. To be removed in the future.
     seed: float = MISSING
     max_seq_len: int = MISSING
     cache_type: str = MISSING
@@ -45,7 +45,7 @@ class InferConfig:
     bind_process_to_cpu: str = MISSING
     bind_thread_to_cpu: str = MISSING
     memory_utilization: float = MISSING
-    prefill_chunk_size: Optional[int] = MISSING
+    prefill_chunk_size: Union[int, str, None] = MISSING
     expert_stats_path: Optional[str] = None
 
     @dataclass
@@ -152,6 +152,12 @@ class DpConfig:
     router: RouterConfig = MISSING
 
 
+@dataclass
+class DebugConfig:
+    skip_model_load: bool = MISSING
+    force_moe_balance: bool = MISSING
+
+
 class StaticConfig:
     def __init__(self, config_obj):
         if hasattr(config_obj, "__dataclass_fields__"):
@@ -249,6 +255,7 @@ class ServeConfig:
     request: RequestConfig = field(default_factory=RequestConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     dp_config: DpConfig = field(default_factory=DpConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
     quant: Optional[str] = MISSING
     dtype: Optional[str] = MISSING  # Legacy parameter. To be removed in the future.
     float_16bit_variant: str = MISSING
