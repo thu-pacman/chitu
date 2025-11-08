@@ -29,6 +29,7 @@ class Qwen3MoeGate(MoeGate):
             topk=params.num_experts_per_tok,
             n_groups=1,
             topk_groups=1,
+            topk_as_topk_group_criteria=None,
             score_func="softmax",
             route_scale=1,
             n_experts=params.num_experts,

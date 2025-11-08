@@ -784,6 +784,7 @@ class GateDeepSeekV3(MoeGate):
             topk=args.n_activated_experts,
             n_groups=args.n_expert_groups,
             topk_groups=args.n_limited_groups,
+            topk_as_topk_group_criteria=2,
             score_func=args.score_func,
             route_scale=args.route_scale,
             n_experts=args.n_routed_experts,

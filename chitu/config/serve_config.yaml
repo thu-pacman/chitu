@@ -21,7 +21,7 @@ infer:
   pp_size: 1
   dp_size: 1
   ep_size: 1
-  do_load: True # set it to False for debug purpose
+  do_load: True # Legacy parameter. To be removed in the future.
   seed: 0
   max_seq_len: 10240 # length of prefill + decode
   cache_type: skew # one of: skew, paged
@@ -105,6 +105,9 @@ dp_config:
       - host: 0.0.0.0
         port: 29630
         scheduling_strategy: "immediate"
+debug:
+  skip_model_load: False
+  force_moe_balance: False
 quant: null
 dtype: null # Legacy parameter. To be removed in the future.
 float_16bit_variant: bfloat16 # one of: bfloat16, float16. This sets the default_dtype of torch

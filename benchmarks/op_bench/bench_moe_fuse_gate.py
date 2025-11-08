@@ -20,15 +20,28 @@ from chitu.ops import moe_gate
         plot_name="moe_fused_gate-performance",
         args={
             "dtype": torch.bfloat16,
-            "params": (256, 8, 4, 8),
+            "num_experts": 256,
+            "num_expert_group": 8,
+            "topk_group": 4,
+            "topk_as_topk_group_criteria": 2,
+            "topk": 8,
             "has_bias": True,
             "bias_is_float32": True,
         },
     )
 )
-def benchmark(seq_length, dtype, params, has_bias, bias_is_float32, provider):
-    num_experts, num_expert_group, topk_group, topk = params
-
+def benchmark(
+    seq_length,
+    dtype,
+    num_experts,
+    num_expert_group,
+    topk_group,
+    topk_as_topk_group_criteria,
+    topk,
+    has_bias,
+    bias_is_float32,
+    provider,
+):
     torch.manual_seed(seq_length)
     device = torch.device("cuda")
     scores = torch.rand((seq_length, num_experts)).to(dtype).to(device)
@@ -47,6 +60,7 @@ def benchmark(seq_length, dtype, params, has_bias, bias_is_float32, provider):
             topk,
             num_expert_group=num_expert_group,
             topk_group=topk_group,
+            topk_as_topk_group_criteria=topk_as_topk_group_criteria,
             e_score_correction_bias=bias,
             score_func="sigmoid",
             impl=provider,

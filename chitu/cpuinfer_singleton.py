@@ -13,7 +13,7 @@ _cpu_infer_instance = None
 _lock = threading.Lock()
 
 
-def get_cpu_infer(bind_thread_to_cpu: Optional[bool] = None):
+def get_cpu_infer(bind_thread_to_cpu: Optional[str] = None):
     global _cpu_infer_instance
     if _cpu_infer_instance is None:
         with _lock:

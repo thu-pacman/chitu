@@ -73,7 +73,7 @@ export PD_MASTER_ADDR=$ROUTER_IP
 echo '=== 启动 Decode1/2（TP=1，共 2 张 NPU） ==='
 ASCEND_RT_VISIBLE_DEVICES=$DECODE1_DEV torchrun --nproc_per_node=1 --master_port=29501 -m chitu \
   --config-name=pd_disagg_2p3d_multi_node models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} \
-  infer.tp_size=1 infer.pp_size=1 infer.cache_type=paged infer.do_load=True infer.max_seq_len=1200 infer.max_reqs=32 request.max_new_tokens=1200 \
+  infer.tp_size=1 infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=1200 infer.max_reqs=32 request.max_new_tokens=1200 \
   infer.npu_fusion_fp4=True \
   infer.raise_lower_bit_float_to=bfloat16 \
   dp_config.enabled=True dp_config.router.is_router=False dp_config.router.host=$ROUTER_IP dp_config.scheduler_base_host=0.0.0.0 dp_config.scheduler_base_port=29630 dp_config.dp_id=1 \
@@ -82,7 +82,7 @@ D1_PID=$!
 
 ASCEND_RT_VISIBLE_DEVICES=$DECODE2_DEV torchrun --nproc_per_node=1 --master_port=29502 -m chitu \
   --config-name=pd_disagg_2p3d_multi_node models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} \
-  infer.tp_size=1 infer.pp_size=1 infer.cache_type=paged infer.do_load=True infer.max_seq_len=1200 infer.max_reqs=32 request.max_new_tokens=1200 \
+  infer.tp_size=1 infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=1200 infer.max_reqs=32 request.max_new_tokens=1200 \
   infer.npu_fusion_fp4=True \
   infer.raise_lower_bit_float_to=bfloat16 \
   dp_config.enabled=True dp_config.router.is_router=False dp_config.router.host=$ROUTER_IP dp_config.scheduler_base_host=0.0.0.0 dp_config.scheduler_base_port=29631 dp_config.dp_id=2 \
@@ -92,7 +92,7 @@ D2_PID=$!
 echo '=== 启动 Prefill1（TP=1，共 1 张 NPU） ==='
 ASCEND_RT_VISIBLE_DEVICES=$PREFILL_DEV torchrun --nproc_per_node=1 --master_port=29510 -m chitu \
   --config-name=pd_disagg_2p3d_multi_node models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} \
-  infer.tp_size=1 infer.pp_size=1 infer.cache_type=paged infer.do_load=True infer.max_seq_len=1200 infer.max_reqs=32 request.max_new_tokens=1200 \
+  infer.tp_size=1 infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=1200 infer.max_reqs=32 request.max_new_tokens=1200 \
   infer.npu_fusion_fp4=True \
   infer.raise_lower_bit_float_to=bfloat16 \
   dp_config.enabled=True dp_config.router.is_router=False dp_config.router.host=$ROUTER_IP dp_config.scheduler_base_host=0.0.0.0 dp_config.scheduler_base_port=29620 dp_config.dp_id=0 \

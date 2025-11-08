@@ -30,8 +30,10 @@ hard_fp4_kernels, has_hard_fp4_kernels = try_import_opt_dep(
 def moe_gate(
     scores: torch.Tensor,
     topk: int,
+    *,
     num_expert_group: int,
     topk_group: int,
+    topk_as_topk_group_criteria: Optional[int],
     e_score_correction_bias: Optional[torch.Tensor],
     score_func: str,
     norm_prob: bool = False,
@@ -47,6 +49,8 @@ def moe_gate(
             there is no expert grouping.
         topk_group (int): The number of selected expert groups before selecting individual
             experts. Set to 1 if there is no expert grouping.
+        topk_as_topk_group_criteria (int): Select this number of experts per group, as the criteria
+            to select `topk_group` groups.
         e_score_correction_bias (torch.Tensor): Bias added after normalization (softmax/sigmoid)
             and before selecting.
         score_func (str): "softmax" or "sigmoid"
@@ -88,22 +92,15 @@ def moe_gate(
             and is_power_of_two(scores.shape[-1])
         ):
             impl = "cuda"
-        elif has_torch_npu and (
-            (
-                scores.shape[-1] == 256
-                and topk >= 1
-                and topk <= 32
-                and e_score_correction_bias is not None
-                and topk_group == 4
-                and num_expert_group == 8
-            )
-            or (
-                score_func == "softmax"
-                and e_score_correction_bias is None
-                and num_expert_group == 1
-            )
+        elif has_torch_npu and scores.shape[-1] in [256, 384] and norm_prob:
+            impl = "npu_moe_gating_top_k"
+        elif (
+            has_torch_npu
+            and score_func == "softmax"
+            and e_score_correction_bias is None
+            and num_expert_group == 1
         ):
-            impl = "npu"
+            impl = "npu_moe_gating_top_k_softmax"
         else:
             impl = "torch"
 
@@ -111,21 +108,23 @@ def moe_gate(
         return moe_gate_torch(
             scores,
             topk,
-            num_expert_group,
-            topk_group,
-            e_score_correction_bias,
-            score_func,
-            norm_prob,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            topk_as_topk_group_criteria=topk_as_topk_group_criteria,
+            e_score_correction_bias=e_score_correction_bias,
+            score_func=score_func,
+            norm_prob=norm_prob,
         )
     elif impl == "cuda":
         return moe_gate_cuda(
             scores,
             topk,
-            num_expert_group,
-            topk_group,
-            e_score_correction_bias,
-            score_func,
-            norm_prob,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            topk_as_topk_group_criteria=topk_as_topk_group_criteria,
+            e_score_correction_bias=e_score_correction_bias,
+            score_func=score_func,
+            norm_prob=norm_prob,
         )
     elif impl == "muxi":
         return moe_gate_muxi(
@@ -133,6 +132,7 @@ def moe_gate(
             topk,
             num_expert_group=num_expert_group,
             topk_group=topk_group,
+            topk_as_topk_group_criteria=topk_as_topk_group_criteria,
             e_score_correction_bias=(
                 None
                 if e_score_correction_bias is None
@@ -145,31 +145,45 @@ def moe_gate(
         return moe_gate_cpu(
             scores,
             topk,
-            num_expert_group,
-            topk_group,
-            e_score_correction_bias,
-            score_func,
-            norm_prob,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            topk_as_topk_group_criteria=topk_as_topk_group_criteria,
+            e_score_correction_bias=e_score_correction_bias,
+            score_func=score_func,
+            norm_prob=norm_prob,
         )
-    elif impl == "npu":
-        return moe_gate_npu(
+    elif impl == "npu_moe_gating_top_k":
+        return moe_gate_npu_moe_gating_top_k(
             scores,
             topk,
-            num_expert_group,
-            topk_group,
-            e_score_correction_bias,
-            score_func,
-            norm_prob,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            topk_as_topk_group_criteria=topk_as_topk_group_criteria,
+            e_score_correction_bias=e_score_correction_bias,
+            score_func=score_func,
+            norm_prob=norm_prob,
+        )
+    elif impl == "npu_moe_gating_top_k_softmax":
+        return moe_gate_npu_moe_gating_top_k_softmax(
+            scores,
+            topk,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            topk_as_topk_group_criteria=topk_as_topk_group_criteria,
+            e_score_correction_bias=e_score_correction_bias,
+            score_func=score_func,
+            norm_prob=norm_prob,
         )
     elif impl == "blackwell":
         return moe_gate_blackwell(
             scores,
             topk,
-            num_expert_group,
-            topk_group,
-            e_score_correction_bias,
-            score_func,
-            norm_prob,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            topk_as_topk_group_criteria=topk_as_topk_group_criteria,
+            e_score_correction_bias=e_score_correction_bias,
+            score_func=score_func,
+            norm_prob=norm_prob,
         )
     else:
         raise ValueError(f"Unsupported implementation of moe_gate: {impl}")
@@ -180,13 +194,15 @@ def moe_gate_torch(
     topk,
     num_expert_group,
     topk_group,
+    topk_as_topk_group_criteria,
     e_score_correction_bias,
     score_func: str,
     norm_prob=False,
 ):
     B = scores.shape[0]
     if score_func == "softmax":
-        scores = scores.softmax(dim=-1, dtype=torch.float32)
+        dtype = scores.dtype
+        scores = scores.softmax(dim=-1, dtype=torch.float32).to(dtype)
     elif score_func == "sigmoid":
         scores = scores.sigmoid()
     else:
@@ -196,10 +212,12 @@ def moe_gate_torch(
         scores = scores + e_score_correction_bias
     if num_expert_group > 1:
         scores = scores.view(B, num_expert_group, -1)
-        if e_score_correction_bias is None:
+        if topk_as_topk_group_criteria == 1:
             group_scores = scores.amax(dim=-1)
         else:
-            group_scores = scores.topk(2, dim=-1).values.sum(dim=-1)
+            group_scores = scores.topk(topk_as_topk_group_criteria, dim=-1).values.sum(
+                dim=-1
+            )
         indices = group_scores.topk(topk_group, dim=-1).indices
         mask = scores.new_ones(B, num_expert_group, dtype=bool).scatter_(
             1, indices, False
@@ -217,6 +235,7 @@ def moe_gate_cuda(
     topk,
     num_expert_group,
     topk_group,
+    topk_as_topk_group_criteria,
     e_score_correction_bias,
     score_func: str,
     norm_prob=False,
@@ -246,12 +265,14 @@ def moe_gate_cuda(
             M, topk, dtype=torch.int32, device=scores.device
         )
 
+        dtype = scores.dtype
         chitu_backend.cuda_topk_softmax(
             topk_weights,
             topk_ids,
             token_expert_indices,
             scores.float(),
         )
+        topk_weights = topk_weights.to(dtype)
         if norm_prob:
             topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
         return topk_ids, topk_weights
@@ -269,6 +290,7 @@ def moe_gate_cuda(
             B,
             num_expert_group,
             topk_group,
+            -1 if num_expert_group == 1 else topk_as_topk_group_criteria,
             expertsIds,
             selected_experts_weights,
             topk,
@@ -287,8 +309,9 @@ def moe_gate_cuda(
 def moe_gate_muxi(
     gating_output: torch.Tensor,
     topk: int,
-    num_expert_group: int = 0,
-    topk_group: int = 0,
+    num_expert_group: int,
+    topk_group: int,
+    topk_as_topk_group_criteria: Optional[int],
     e_score_correction_bias: Optional[torch.Tensor] = None,
     score_func: str = "softmax",
     norm_prob: bool = False,
@@ -301,6 +324,11 @@ def moe_gate_muxi(
         num_expert_group = 1
     if topk_group is None:
         topk_group = 1
+    if topk_group > 1:
+        # TODO: Pass `topk_as_topk_group_criteria` to the kernel
+        assert (
+            e_score_correction_bias is None and topk_as_topk_group_criteria == 1
+        ) or (e_score_correction_bias is not None and topk_as_topk_group_criteria == 2)
 
     B, _ = gating_output.shape
 
@@ -340,6 +368,7 @@ def moe_gate_cpu(
     topk,
     num_expert_group,
     topk_group,
+    topk_as_topk_group_criteria,
     e_score_correction_bias=None,
     score_func="softmax",
     norm_prob: bool = False,
@@ -351,6 +380,12 @@ def moe_gate_cpu(
 
     if score_func not in ["softmax", "sigmoid"]:
         raise ValueError(f"Unsupported score function: {score_func}")
+
+    if topk_group > 1:
+        # TODO: Pass `topk_as_topk_group_criteria` to the kernel
+        assert (
+            e_score_correction_bias is None and topk_as_topk_group_criteria == 1
+        ) or (e_score_correction_bias is not None and topk_as_topk_group_criteria == 2)
 
     if not scores.is_contiguous():
         scores = scores.contiguous()
@@ -404,44 +439,79 @@ def moe_gate_cpu(
     return indices, weights
 
 
-def moe_gate_npu(
+def moe_gate_npu_moe_gating_top_k(
     scores,
     topk,
     num_expert_group,
     topk_group,
+    topk_as_topk_group_criteria,
     e_score_correction_bias=None,
     score_func="softmax",
     norm_prob: bool = False,
 ):
-    B = scores.shape[0]
+    assert norm_prob
+    dtype = scores.dtype
+
     if score_func == "softmax":
         norm_type = 0
     elif score_func == "sigmoid":
         norm_type = 1
     else:
         raise ValueError(f"Unsupported score function: {score_func}")
-    if e_score_correction_bias is None:
-        # TODO: there are no examples in ci that e_score_correction_bias is None
-        # npu_moe_gating_top_k need bias is not None
-        weights, indices, row_idx = torch_npu.npu_moe_gating_top_k_softmax(
-            scores, k=topk
-        )
+
+    if topk_group > 1:
+        if topk_as_topk_group_criteria == 1:
+            group_select_mode = 0
+        elif topk_as_topk_group_criteria == 2:
+            group_select_mode = 1
+        else:
+            raise ValueError(
+                f"Unsupported topk_as_topk_group_criteria: {topk_as_topk_group_criteria}"
+            )
     else:
+        group_select_mode = 0  # Any value is OK
+
+    if e_score_correction_bias is None and score_func == "sigmoid":
+        # Work around the error "The DDR address of the MTE instruction is out of range"
+        e_score_correction_bias = torch.zeros(
+            scores.shape[-1], dtype=scores.dtype, device=scores.device
+        )
+
+    if e_score_correction_bias is not None:
         # if e_score_correction_bias is not none, then score is bf16, e_score_correction_bias is fp32, we need transform scores to fp32,
         scores = scores.to(e_score_correction_bias.dtype)
-        weights, indices, out_npu = torch_npu.npu_moe_gating_top_k(
-            scores,
-            topk,
-            bias=e_score_correction_bias,
-            k_group=topk_group,
-            group_count=num_expert_group,
-            group_select_mode=1,
-            renorm=0,
-            norm_type=norm_type,
-            out_flag=False,
-            routed_scaling_factor=1.0,
-            eps=1e-20,
-        )
+
+    weights, indices, _ = torch_npu.npu_moe_gating_top_k(
+        scores,
+        topk,
+        bias=e_score_correction_bias,
+        k_group=topk_group,
+        group_count=num_expert_group,
+        group_select_mode=group_select_mode,
+        renorm=0,  # 0 means to do renorm (not 1!), and it only supports 0!
+        norm_type=norm_type,
+        out_flag=False,
+        routed_scaling_factor=1.0,
+        eps=1e-20,
+    )
+    weights = weights.to(dtype)
+    return indices, weights
+
+
+def moe_gate_npu_moe_gating_top_k_softmax(
+    scores,
+    topk,
+    num_expert_group,
+    topk_group,
+    topk_as_topk_group_criteria,
+    e_score_correction_bias=None,
+    score_func="softmax",
+    norm_prob: bool = False,
+):
+    assert score_func == "softmax"
+    assert e_score_correction_bias is None
+    assert num_expert_group == 1
+    weights, indices, row_idx = torch_npu.npu_moe_gating_top_k_softmax(scores, k=topk)
     if norm_prob:
         weights /= weights.sum(dim=-1, keepdim=True)
     return indices, weights
@@ -452,10 +522,17 @@ def moe_gate_blackwell(
     topk,
     num_expert_group,
     topk_group,
+    topk_as_topk_group_criteria,
     e_score_correction_bias=None,
     score_func="softmax",
     norm_prob: bool = False,
 ):
+    if topk_group > 1:
+        # TODO: Pass `topk_as_topk_group_criteria` to the kernel
+        assert (
+            e_score_correction_bias is None and topk_as_topk_group_criteria == 1
+        ) or (e_score_correction_bias is not None and topk_as_topk_group_criteria == 2)
+
     num_tokens = scores.shape[0]
     indices = torch.empty((num_tokens, topk), dtype=torch.int32, device=scores.device)
     weights = torch.empty((num_tokens, topk), dtype=scores.dtype, device=scores.device)

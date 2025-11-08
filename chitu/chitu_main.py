@@ -442,6 +442,11 @@ def chitu_init(args, logging_level=None):
             "Argument `dtype` is deprecated. Use `float_16bit_variant` instead."
         )
         args.float_16bit_variant = args.dtype
+    if hasattr(args.infer, "do_load") and not args.infer.do_load:
+        logger.warning(
+            "Argument `infer.do_load=False` is deprecated. Use `debug.skip_model_load=True` instead."
+        )
+        args.debug.skip_model_load = True
 
     # prefill_chunk_size default value: 4096 * dp_size
     if args.infer.prefill_chunk_size == "auto":

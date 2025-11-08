@@ -15,7 +15,7 @@ def test_type_validation():
         omega_config.serve.port = "invalid_port_string"
 
     with pytest.raises(Exception):
-        omega_config.infer.do_load = "not_a_boolean"
+        omega_config.debug.skip_model_load = "not_a_boolean"
 
     with pytest.raises(Exception):
         omega_config.infer.seed = "not_a_float"

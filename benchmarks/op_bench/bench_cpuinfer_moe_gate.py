@@ -6,17 +6,17 @@ import torch
 import triton
 
 from chitu.utils import try_import_opt_dep
-from chitu.ops.moe_gate import moe_gate_torch
+from chitu.ops.moe_gate import moe_gate
 
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
 
-def cpuinfer_moe_gate(qlen, scores, correction_bias, CPUInfer, moe_gate, topk):
+def cpuinfer_moe_gate(qlen, scores, correction_bias, CPUInfer, cpu_moe_gate, topk):
     indices = torch.zeros((qlen, topk), dtype=torch.int64).contiguous()
     weights = torch.zeros((qlen, topk), dtype=torch.bfloat16).contiguous()
 
     CPUInfer.submit(
-        moe_gate.forward(
+        cpu_moe_gate.forward(
             qlen,
             scores.data_ptr(),
             correction_bias.data_ptr() if correction_bias is not None else 0,
@@ -41,6 +41,8 @@ def cpuinfer_moe_gate(qlen, scores, correction_bias, CPUInfer, moe_gate, topk):
         plot_name="moe-gate-performance",
         args={
             "num_expert_groups": 2,
+            "topk_group": 1,
+            "topk_as_topk_group_criteria": 2,
             "topk": 2,
             "qlen": 32,
             "score_func": "softmax",
@@ -51,6 +53,8 @@ def cpuinfer_moe_gate(qlen, scores, correction_bias, CPUInfer, moe_gate, topk):
 def benchmark(
     num_experts,
     num_expert_groups,
+    topk_group,
+    topk_as_topk_group_criteria,
     topk,
     qlen,
     score_func,
@@ -63,7 +67,6 @@ def benchmark(
     if num_experts % num_expert_groups != 0:
         return float("nan")
 
-    topk_group = 1
     group_max_len = 1024
     hidden_type = 30
 
@@ -75,8 +78,15 @@ def benchmark(
 
     if provider == "torch":
         ms = triton.testing.do_bench(
-            lambda: moe_gate_torch(
-                scores, topk, num_expert_groups, topk_group, correction_bias, score_func
+            lambda: moe_gate(
+                scores,
+                topk,
+                num_expert_group=num_expert_groups,
+                topk_group=topk_group,
+                topk_as_topk_group_criteria=topk_as_topk_group_criteria,
+                e_score_correction_bias=correction_bias,
+                score_func=score_func,
+                impl="torch",
             )
         )
     elif provider == "cpuinfer":
@@ -91,14 +101,14 @@ def benchmark(
             use_correction_bias,
             hidden_type,
         )
-        moe_gate = cpuinfer.moe_gate.MoEGate(config)
+        cpu_moe_gate = cpuinfer.moe_gate.MoEGate(config)
 
-        CPUInfer.submit(moe_gate.warm_up())
+        CPUInfer.submit(cpu_moe_gate.warm_up())
         CPUInfer.sync()
 
         ms = triton.testing.do_bench(
             lambda: cpuinfer_moe_gate(
-                qlen, scores, correction_bias, CPUInfer, moe_gate, topk
+                qlen, scores, correction_bias, CPUInfer, cpu_moe_gate, topk
             )
         )
     else:

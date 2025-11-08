@@ -29,6 +29,7 @@ from chitu.distributed.parallel_state import (
     get_tp_size,
     get_ep_group,
     get_ep_size,
+    get_dp_group,
     get_dp_size,
 )
 from chitu.moe import get_moe_impl
@@ -38,6 +39,7 @@ from chitu.utils import (
     is_layer,
     try_import_platform_dep,
     try_import_opt_dep,
+    ceil_div,
 )
 from chitu.quantization import (
     QuantizationRegistry,
@@ -883,8 +885,10 @@ class MoeGate(nn.Module):
         op_impl,
         dim,
         topk,
+        *,
         n_groups,
         topk_groups,
+        topk_as_topk_group_criteria,
         score_func,
         route_scale,
         n_experts,
@@ -901,12 +905,33 @@ class MoeGate(nn.Module):
         self.topk = topk
         self.n_groups = n_groups
         self.topk_groups = topk_groups
+        self.topk_as_topk_group_criteria = topk_as_topk_group_criteria
         self.score_func = score_func
         self.route_scale = route_scale
+        self.n_experts = n_experts
         self.weight = nn.Parameter(torch.empty((n_experts, self.dim)))
         self.bias = bias
         self.e_score_correction_bias = e_score_correction_bias
         self.norm_prob = norm_prob
+
+        if get_global_args().debug.force_moe_balance:
+            self._debug_force_moe_balance_mask_cache = (
+                self._debug_gen_force_moe_balance_mask(
+                    ceil_div(get_global_args().infer.max_reqs, get_dp_size())
+                )
+            )
+
+    def _debug_gen_force_moe_balance_mask(self, bs):
+        # Strategy: For token i, pick ((i to i + topk) % n_experts)-th expert.
+        # Note that the picked experts should have contiguous ids, so it is compatible
+        # with expert grouping.
+        mask = torch.ones((bs, self.n_experts), dtype=torch.bool, device="cuda")
+        for k in range(self.topk):
+            r = torch.arange(bs, device=mask.device)
+            mask[r, (bs * get_dp_group().rank_in_group + r + k) % self.n_experts] = (
+                False
+            )
+        return mask
 
     def forward(self, x):
         """
@@ -925,14 +950,27 @@ class MoeGate(nn.Module):
                 device=self.weight.device,
             ), torch.empty((0, self.topk), dtype=torch.int32, device=self.weight.device)
         scores = F.linear(x, self.weight, self.bias)
+
+        e_score_correction_bias = self.e_score_correction_bias
+        if get_global_args().debug.force_moe_balance:
+            if x.shape[0] <= self._debug_force_moe_balance_mask_cache.shape[0]:
+                # decode
+                mask = self._debug_force_moe_balance_mask_cache[: x.shape[0]]
+            else:
+                # prefill
+                mask = self._debug_gen_force_moe_balance_mask(x.shape[0])
+            scores.masked_fill_(mask, float("-inf"))
+            e_score_correction_bias = None
+
         indices, weights = moe_gate(
             scores,
             self.topk,
-            self.n_groups,
-            self.topk_groups,
-            self.e_score_correction_bias,
-            self.score_func,
-            self.norm_prob,
+            num_expert_group=self.n_groups,
+            topk_group=self.topk_groups,
+            topk_as_topk_group_criteria=self.topk_as_topk_group_criteria,
+            e_score_correction_bias=e_score_correction_bias,
+            score_func=self.score_func,
+            norm_prob=self.norm_prob,
         )
         if self.route_scale != 1:
             weights *= self.route_scale
