@@ -68,7 +68,7 @@ class FlashMLABackend(TritonAttnBackend):
         q_nope_pe = q_nope_pe.view(bsz, 1, q_nope_pe.shape[-2], q_nope_pe.shape[-1])
 
         append_to_paged_kv_cache(
-            kv_cache.k,
+            kv_cache.kv["kv_lora_k_pe"],
             kv_cache.block_table,
             kv,
             seq_len_delta.old.lens_tensor_device,
@@ -85,7 +85,7 @@ class FlashMLABackend(TritonAttnBackend):
         if indices is not None:
             output, _ = flash_mla.flash_mla_with_kvcache(
                 q_nope_pe,
-                kv_cache.k.unsqueeze(2),
+                kv_cache.kv["kv_lora_k_pe"].unsqueeze(2),
                 kv_cache.block_table,
                 seq_len_delta.new.lens_tensor_device,
                 512,  # dv
@@ -99,7 +99,7 @@ class FlashMLABackend(TritonAttnBackend):
             # Don't pass `indices` here because it requires some new versions of FlashMLA
             output, _ = flash_mla.flash_mla_with_kvcache(
                 q_nope_pe,
-                kv_cache.k.unsqueeze(2),
+                kv_cache.kv["kv_lora_k_pe"].unsqueeze(2),
                 kv_cache.block_table,
                 seq_len_delta.new.lens_tensor_device,
                 512,  # dv

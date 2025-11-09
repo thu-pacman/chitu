@@ -194,7 +194,7 @@ def benchmark_mla_decode_paged_kv(
             lambda: attn.mla_decode_paged_kv(
                 q_nope,
                 q_pe,
-                PagedKVCacheAccessor(page_table, kv_cache, None),
+                PagedKVCacheAccessor(page_table, {"kv_lora_k_pe": kv_cache}),
                 this_kv,
                 seq_len_delta=seq_len_delta,
             )
@@ -213,7 +213,7 @@ def benchmark_mla_decode_paged_kv(
             lambda: flashinfer_backend.mla_decode_paged_kv(
                 q_nope,
                 q_pe,
-                PagedKVCacheAccessor(page_table, kv_cache, None),
+                PagedKVCacheAccessor(page_table, {"kv_lora_k_pe": kv_cache}),
                 this_kv,
                 seq_len_delta,
             )

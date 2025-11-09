@@ -582,26 +582,28 @@ class AttnBackend(abc.ABC):
 
         else:
             if isinstance(kv_cache, DenseKVCacheAccessor):
-                k_cache = kv_cache.k.view(
-                    kv_cache.k.shape[0],
-                    kv_cache.k.shape[1],
+                k_cache = kv_cache.kv["kv_lora_k_pe"].view(
+                    kv_cache.kv["kv_lora_k_pe"].shape[0],
+                    kv_cache.kv["kv_lora_k_pe"].shape[1],
                     1,  # head
                     kv_lora_rank + qk_rope_head_dim,  # hidden
                 )
                 assert k_cache.shape[-1] == kv_lora_rank + qk_rope_head_dim
                 v_cache = k_cache[..., :kv_lora_rank]
-                kv_cache = DenseKVCacheAccessor(k_cache, v_cache)
+                kv_cache = DenseKVCacheAccessor({"k": k_cache, "v": v_cache})
 
             elif isinstance(kv_cache, PagedKVCacheAccessor):
-                k_cache = kv_cache.k.view(
-                    kv_cache.k.shape[0],
-                    kv_cache.k.shape[1],
+                k_cache = kv_cache.kv["kv_lora_k_pe"].view(
+                    kv_cache.kv["kv_lora_k_pe"].shape[0],
+                    kv_cache.kv["kv_lora_k_pe"].shape[1],
                     1,  # head
                     kv_lora_rank + qk_rope_head_dim,  # hidden
                 )
                 assert k_cache.shape[-1] == kv_lora_rank + qk_rope_head_dim
                 v_cache = k_cache[..., :kv_lora_rank]
-                kv_cache = PagedKVCacheAccessor(kv_cache.block_table, k_cache, v_cache)
+                kv_cache = PagedKVCacheAccessor(
+                    kv_cache.block_table, {"k": k_cache, "v": v_cache}
+                )
 
             else:
                 raise NotImplementedError()
@@ -660,16 +662,15 @@ class AttnBackend(abc.ABC):
         # -> prefill_ragged_qkvo
         # because it incurs redundant KV cache copying.
 
-        assert kv_cache.k is not None
         append_to_dense_kv_cache(
-            kv_cache.k,
+            kv_cache.kv["kv_lora_k_pe"],
             kv.contiguous(),
             seq_len_delta.delta_position_ids_tensor_device,
             seq_len_delta.delta_seq_ids_tensor_device,
         )
         if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefill
             kv = read_from_dense_kv_cache(
-                kv_cache.k,
+                kv_cache.kv["kv_lora_k_pe"],
                 seq_len_delta.new.position_ids_tensor_device,
                 seq_len_delta.new.seq_ids_tensor_device,
             )
@@ -706,9 +707,8 @@ class AttnBackend(abc.ABC):
         # -> prefill_ragged_qkvo
         # because it incurs redundant KV cache copying.
 
-        assert kv_cache.k is not None
         append_to_paged_kv_cache(
-            kv_cache.k,
+            kv_cache.kv["kv_lora_k_pe"],
             kv_cache.block_table,
             kv.contiguous(),
             seq_len_delta.delta_position_ids_tensor_device,
@@ -718,7 +718,7 @@ class AttnBackend(abc.ABC):
         )
         if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefilling
             kv = read_from_paged_kv_cache(
-                kv_cache.k,
+                kv_cache.kv["kv_lora_k_pe"],
                 kv_cache.block_table,
                 seq_len_delta.new.position_ids_tensor_device,
                 seq_len_delta.new.seq_ids_tensor_device,

@@ -164,7 +164,7 @@ class Backend:
             dp_size=non_expert_data_parallel_size,
             ep_size=expert_parallel_size,
         )
-        Backend.ip_list = get_world_group().gather_all_rank_ip()
+        Backend.ip_port_list = get_world_group().gather_all_rank_ip_port()
 
         Backend.pp_stage = (
             global_rank
@@ -361,17 +361,15 @@ class Backend:
         local_layers = layer_filter_fn(range(local_begin_layer_id, local_end_layer_id))
         layer_id_map = GlobalLocalMap.from_list(local_layers)
 
-        additional_cache_shape_dict = Backend._get_linear_attn_cache_params(args)
-
         return PagedKVCacheManager(
             layer_id_map,
             max_seq_len=args.infer.max_seq_len,
             num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
             // args.infer.dp_size,
+            shape_per_token_dict=Backend._get_linear_attn_cache_params(args),
             block_size=1,
             num_blocks=args.infer.num_blocks if num_blocks is None else num_blocks,
             device=local_rank,
-            additional_cache_shape_dict=additional_cache_shape_dict,
             lazy_mode=True,
         )
 
@@ -410,11 +408,11 @@ class Backend:
             )
             return None
 
-        additional_cache_shape_dict = {
+        shape_per_token_dict = {
             "indexer_k": (int(index_head_dim),),
             "indexer_ks": (int(index_head_dim) // 128,),
         }
-        additional_cache_dtype_dict = {
+        dtype_dict = {
             "indexer_k": torch.float8_e4m3fn,
             "indexer_ks": torch.float32,
         }
@@ -438,11 +436,11 @@ class Backend:
             max_seq_len=args.infer.max_seq_len,
             num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
             // args.infer.dp_size,
+            shape_per_token_dict=shape_per_token_dict,
+            dtype_dict=dtype_dict,
             block_size=block_size,
             num_blocks=num_blocks,
             device=local_rank,
-            additional_cache_shape_dict=additional_cache_shape_dict,
-            additional_cache_dtype_dict=additional_cache_dtype_dict,
             lazy_mode=False,
         )
 
@@ -463,15 +461,19 @@ class Backend:
 
         if args.models.type == "deepseek-v3":
             if args.infer.mla_absorb in ["absorb", "absorb-without-precomp"]:
-                kv_cache_kvargs["kv_shape_per_sample"] = (
-                    args.models.kv_lora_rank + args.models.qk_rope_head_dim,
-                )
+                kv_cache_kvargs["shape_per_token_dict"] = {
+                    "kv_lora_k_pe": (
+                        args.models.kv_lora_rank + args.models.qk_rope_head_dim,
+                    )
+                }
             elif args.infer.mla_absorb == "none":
                 n_local_heads = args.models.n_heads // model_parallel_size
                 k_head_dim = args.models.qk_nope_head_dim + args.models.qk_rope_head_dim
                 v_head_dim = args.models.v_head_dim
-                kv_cache_kvargs["k_shape_per_sample"] = (n_local_heads, k_head_dim)
-                kv_cache_kvargs["v_shape_per_sample"] = (n_local_heads, v_head_dim)
+                kv_cache_kvargs["shape_per_token_dict"] = {
+                    "k": (n_local_heads, k_head_dim),
+                    "v": (n_local_heads, v_head_dim),
+                }
             else:
                 raise NotImplementedError(
                     f"Unsupported mla_absorb {args.infer.mla_absorb}"

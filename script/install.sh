@@ -44,11 +44,13 @@ fi
 # 5. Don't set constraint on `flash-mla`, because it uses build time stamp in the version string.
 if [ "${enable_editable_install}" == "true" ]; then
     pip install \
+        --no-build-isolation \
         -i https://pypi.tuna.tsinghua.edu.cn/simple \
         -e .${OPTIONAL_DEPS_SPECIFIER} \
         -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "flash-mla" | grep -v "flash_mla")
 else
     pip install \
+        --no-build-isolation \
         -i https://pypi.tuna.tsinghua.edu.cn/simple \
         .${OPTIONAL_DEPS_SPECIFIER} \
         -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "flash-mla" | grep -v "flash_mla")

@@ -90,15 +90,14 @@ def get_additional_block_num(cache_manager, memory_utilization=0.98):
     def tuple_product(t):
         return functools.reduce(operator.mul, t, 1)
 
-    block_mem = (
-        2
-        * cache_manager.block_size
-        * tuple_product(cache_manager.k_shape_per_sample)
-        * cache_manager.num_layers
-    )
-    block_mem *= (1 if cache_manager.k_shape_per_sample is not None else 0) + (
-        1 if cache_manager.v_shape_per_sample is not None else 0
-    )
+    block_mem = 0
+    for key in cache_manager.shape_per_token_dict:
+        block_mem += (
+            cache_manager.dtype_dict[key].itemsize
+            * cache_manager.block_size
+            * tuple_product(cache_manager.shape_per_token_dict[key])
+            * cache_manager.num_layers
+        )
 
     if get_global_args().infer.op_impl == "cpu":
         process = psutil.Process(os.getpid())

@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import netifaces
-from typing import Optional
+import socket
+from typing import Optional, List, Tuple
 
 import torch
 from logging import getLogger
@@ -224,16 +225,20 @@ class CommGroup:
             if tensor.numel() > 0:
                 torch.distributed.send(tensor, dst=dst)
 
-    def gather_all_rank_ip(self):
+    def gather_all_rank_ip_port(self) -> List[Tuple[str, int, int]]:
+        """
+        Find IP and two free TCP ports of each rank. The two ports are for DP and PP, respectively.
+
+        Returns:
+            List[Tuple[str, int, int]]: List of tuples of the form (IP, DP_port, PP_port)
+        """
+
         try:
             ifaces = netifaces.interfaces()
             gateways = netifaces.gateways()
             default_gateway = gateways.get("default", {}).get(netifaces.AF_INET, None)
 
             if len(ifaces) == 0 or not default_gateway:
-                logger.warning(
-                    "Network interface or default gateway not found, using localhost instead."
-                )
                 local_ip = "localhost"
             else:
                 _, main_nic_name = default_gateway
@@ -246,23 +251,53 @@ class CommGroup:
                             local_ip = iface_addrs[0]["addr"]
                             break
                 else:
-                    logger.warning(
-                        "Default gateway not matched, using localhost instead."
-                    )
                     local_ip = "localhost"
         except Exception as e:
-            logger.warning(f"Failed to get network info: {e}, using localhost instead.")
             local_ip = "localhost"
+
+        local_ip_fail_reason = None
+        if local_ip == "localhost":
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.connect(("8.8.8.8", 80))
+                    local_ip = s.getsockname()[0]
+            except Exception as e:
+                local_ip_fail_reason = e
+                logger.warning(
+                    "Fail to retrieve local ip, using localhost instead, which may cause an error."
+                )
 
         ip_list = [None] * self.group_size
         torch.distributed.all_gather_object(ip_list, local_ip, self.cpu_group)
 
-        if "localhost" in ip_list:
-            assert all(
-                ip == "localhost" for ip in ip_list
-            ), "Not all ranks are on localhost, maybe caused by network configuration error."
+        if "localhost" in ip_list and not all(ip == "localhost" for ip in ip_list):
+            raise RuntimeError(
+                "Some ranks uses localhost as IP but some does not. To establish the communication, "
+                "either of the following should be true: 1) all ranks use their own out-going IP, "
+                "2) if all ranks are in a single server, all ranks use localhost as IP."
+            ) from local_ip_fail_reason
 
-        return ip_list
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_dp:
+                s_dp.bind((local_ip, 0))  # Bind to any free port
+                local_port_dp = s_dp.getsockname()[1]
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_pp:
+                    s_pp.bind((local_ip, 0))  # Bind to any free port
+                    local_port_pp = s_pp.getsockname()[1]
+        except Exception as e:
+            raise RuntimeError(f"Cannot bind to a free port on {local_ip}.") from e
+
+        port_dp_list = [None] * self.group_size
+        torch.distributed.all_gather_object(port_dp_list, local_port_dp, self.cpu_group)
+
+        port_pp_list = [None] * self.group_size
+        torch.distributed.all_gather_object(port_pp_list, local_port_pp, self.cpu_group)
+
+        logger.info(
+            f"ZMQ IP: {local_ip}, DP port: {local_port_dp}, PP port: {local_port_pp}"
+        )
+
+        return list(zip(ip_list, port_dp_list, port_pp_list))
 
     def destroy(self):
         torch.distributed.destroy_process_group(self.gpu_group)

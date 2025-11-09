@@ -400,13 +400,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         cache_accessor = self.cache.get_accessor(self.layer_id)
         if use_precomputed_states:
             conv_state = read_from_paged_kv_cache(
-                cache_accessor.add["conv_state"],
+                cache_accessor.kv["conv_state"],
                 cache_accessor.block_table,
                 torch.zeros((bs,), dtype=torch.int32, device=x.device),
                 self.cache.seq_len_delta.delta_seq_ids_tensor_device,
             )
             recurrent_state = read_from_paged_kv_cache(
-                cache_accessor.add["recurrent_state"],
+                cache_accessor.kv["recurrent_state"],
                 cache_accessor.block_table,
                 torch.zeros((bs,), dtype=torch.int32, device=x.device),
                 self.cache.seq_len_delta.delta_seq_ids_tensor_device,
@@ -507,7 +507,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
 
         append_to_paged_kv_cache(
-            cache_accessor.add["conv_state"],
+            cache_accessor.kv["conv_state"],
             cache_accessor.block_table,
             conv_state.contiguous(),
             torch.zeros((bs,), dtype=torch.int32, device=x.device),
@@ -515,7 +515,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             impl="torch",
         )
         append_to_paged_kv_cache(
-            cache_accessor.add["recurrent_state"],
+            cache_accessor.kv["recurrent_state"],
             cache_accessor.block_table,
             last_recurrent_state.to(x.dtype).contiguous(),
             torch.zeros((bs,), dtype=torch.int32, device=x.device),

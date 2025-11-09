@@ -185,7 +185,7 @@ class Indexer(torch.nn.Module):
 
         if isinstance(cache_accessor, PagedKVCacheAccessor):
             append_to_paged_kv_cache(
-                cache_accessor.add["indexer_k"],
+                cache_accessor.kv["indexer_k"],
                 cache_accessor.block_table,
                 k_fp8,
                 delta_pos_ids,
@@ -194,7 +194,7 @@ class Indexer(torch.nn.Module):
                 get_offs_in_page=cache_accessor.get_offs_in_page,
             )
             append_to_paged_kv_cache(
-                cache_accessor.add["indexer_ks"],
+                cache_accessor.kv["indexer_ks"],
                 cache_accessor.block_table,
                 k_scale,
                 delta_pos_ids,
@@ -205,8 +205,8 @@ class Indexer(torch.nn.Module):
             index_score = blockfp8_index_score_ragged_q_paged_k_dsv32(
                 q_fp8,
                 q_scale,
-                cache_accessor.add["indexer_k"],
-                cache_accessor.add["indexer_ks"],
+                cache_accessor.kv["indexer_k"],
+                cache_accessor.kv["indexer_ks"],
                 seq_len_delta=seq_len_delta,
                 k_page_table=cache_accessor.block_table,
                 static_max_n=get_global_args().infer.max_seq_len,
@@ -214,16 +214,16 @@ class Indexer(torch.nn.Module):
             )
         elif isinstance(cache_accessor, DenseKVCacheAccessor):
             append_to_dense_kv_cache(
-                cache_accessor.add["indexer_k"], k_fp8, delta_pos_ids, delta_seq_ids
+                cache_accessor.kv["indexer_k"], k_fp8, delta_pos_ids, delta_seq_ids
             )
             append_to_dense_kv_cache(
-                cache_accessor.add["indexer_ks"], k_scale, delta_pos_ids, delta_seq_ids
+                cache_accessor.kv["indexer_ks"], k_scale, delta_pos_ids, delta_seq_ids
             )
             index_score = blockfp8_index_score_ragged_q_dense_k_dsv32(
                 q_fp8,
                 q_scale,
-                cache_accessor.add["indexer_k"],
-                cache_accessor.add["indexer_ks"],
+                cache_accessor.kv["indexer_k"],
+                cache_accessor.kv["indexer_ks"],
                 seq_len_delta=seq_len_delta,
                 causal=is_causal,
             )
