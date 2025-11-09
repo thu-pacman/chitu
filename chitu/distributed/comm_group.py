@@ -231,9 +231,6 @@ class CommGroup:
             default_gateway = gateways.get("default", {}).get(netifaces.AF_INET, None)
 
             if len(ifaces) == 0 or not default_gateway:
-                logger.warning(
-                    "Network interface or default gateway not found, using localhost instead."
-                )
                 local_ip = "localhost"
             else:
                 _, main_nic_name = default_gateway
@@ -246,13 +243,22 @@ class CommGroup:
                             local_ip = iface_addrs[0]["addr"]
                             break
                 else:
-                    logger.warning(
-                        "Default gateway not matched, using localhost instead."
-                    )
                     local_ip = "localhost"
         except Exception as e:
-            logger.warning(f"Failed to get network info: {e}, using localhost instead.")
             local_ip = "localhost"
+
+        if local_ip == "localhost":
+            try:
+                import socket
+
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+            except Exception as e:
+                logger.warning(
+                    "Fail to retrieve local ip, using localhost instead, which may cause an error."
+                )
 
         ip_list = [None] * self.group_size
         torch.distributed.all_gather_object(ip_list, local_ip, self.cpu_group)
