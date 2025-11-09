@@ -199,7 +199,9 @@ class TritonAttnBackend(RefAttnBackend):
         assert q_pe.shape[1] == local_n_heads
         _, _, qk_rope_head_dim = q_pe.shape
 
-        append_to_dense_kv_cache(kv_cache.k, kv, seq_len_delta.old.lens_tensor_device)
+        append_to_dense_kv_cache(
+            kv_cache.kv["kv_lora_k_pe"], kv, seq_len_delta.old.lens_tensor_device
+        )
 
         o = torch.zeros(
             B,
@@ -232,8 +234,8 @@ class TritonAttnBackend(RefAttnBackend):
             device=q_nope.device,
         )
 
-        assert kv_cache.k.ndim == 3  # (batch_size, seq_len, dim)
-        kv_c_and_k_pe_cache = kv_cache.k
+        assert kv_cache.kv["kv_lora_k_pe"].ndim == 3  # (batch_size, seq_len, dim)
+        kv_c_and_k_pe_cache = kv_cache.kv["kv_lora_k_pe"]
         k_pe_cache = kv_c_and_k_pe_cache[..., kv_lora_rank:]
         kv_c_cache = kv_c_and_k_pe_cache[..., :kv_lora_rank]
 
@@ -279,7 +281,7 @@ class TritonAttnBackend(RefAttnBackend):
         _, _, qk_rope_head_dim = q_pe.shape
 
         append_to_paged_kv_cache(
-            kv_cache.k,
+            kv_cache.kv["kv_lora_k_pe"],
             kv_cache.block_table,
             kv,
             seq_len_delta.old.lens_tensor_device,
@@ -318,8 +320,8 @@ class TritonAttnBackend(RefAttnBackend):
             device=q_nope.device,
         )
 
-        assert kv_cache.k.ndim == 3  # (num_blocks, block_size, dim)
-        kv_c_and_k_pe_cache = kv_cache.k
+        assert kv_cache.kv["kv_lora_k_pe"].ndim == 3  # (num_blocks, block_size, dim)
+        kv_c_and_k_pe_cache = kv_cache.kv["kv_lora_k_pe"]
         k_pe_cache = kv_c_and_k_pe_cache[..., kv_lora_rank:]
         kv_c_cache = kv_c_and_k_pe_cache[..., :kv_lora_rank]
         PAGE_SIZE = kv_c_and_k_pe_cache.size(1)

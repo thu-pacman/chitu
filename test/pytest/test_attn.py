@@ -268,7 +268,7 @@ def test_mla_prefill_ragged_qo_paged_kv(
     out = attn_backend.mla_prefill_ragged_qo_paged_kv(
         q_nope,
         q_pe,
-        PagedKVCacheAccessor(page_table, kv_cache_1, None),
+        PagedKVCacheAccessor(page_table, {"kv_lora_k_pe": kv_cache_1}),
         this_kv,
         seq_len_delta,
         causal=True,
@@ -279,7 +279,7 @@ def test_mla_prefill_ragged_qo_paged_kv(
     ref_out = ref_backend.mla_prefill_ragged_qo_paged_kv(
         q_nope,
         q_pe,
-        PagedKVCacheAccessor(page_table, kv_cache_2, None),
+        PagedKVCacheAccessor(page_table, {"kv_lora_k_pe": kv_cache_2}),
         this_kv,
         seq_len_delta,
         causal=True,
@@ -393,7 +393,7 @@ def test_mla_decode_dense_kv(
     y = attn.mla_decode_dense_kv(
         q_nope,
         q_pe,
-        DenseKVCacheAccessor(kv_cache, None),
+        DenseKVCacheAccessor({"kv_lora_k_pe": kv_cache}),
         this_kv,
         seq_len_delta=seq_len_delta,
         topk_indices=topk_indices,
@@ -401,7 +401,7 @@ def test_mla_decode_dense_kv(
     y_ref = attn_ref.mla_decode_dense_kv(
         q_nope,
         q_pe,
-        DenseKVCacheAccessor(kv_cache, None),
+        DenseKVCacheAccessor({"kv_lora_k_pe": kv_cache}),
         this_kv,
         seq_len_delta=seq_len_delta,
         topk_indices=topk_indices,
@@ -528,7 +528,7 @@ def test_mla_decode_paged_kv(
     y = attn.mla_decode_paged_kv(
         q_nope,
         q_pe,
-        PagedKVCacheAccessor(page_table, kv_cache, None),
+        PagedKVCacheAccessor(page_table, {"kv_lora_k_pe": kv_cache}),
         this_kv,
         seq_len_delta=seq_len_delta,
         topk_indices=topk_indices,
@@ -536,7 +536,7 @@ def test_mla_decode_paged_kv(
     y_ref = attn_ref.mla_decode_paged_kv(
         q_nope,
         q_pe,
-        PagedKVCacheAccessor(page_table, kv_cache, None),
+        PagedKVCacheAccessor(page_table, {"kv_lora_k_pe": kv_cache}),
         this_kv,
         seq_len_delta=seq_len_delta,
         topk_indices=topk_indices,
@@ -772,7 +772,7 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
     v_cache1 = v_cache.clone()
     out = attn_backend.decode_dense_kv(
         q,
-        DenseKVCacheAccessor(k_cache1, v_cache1),
+        DenseKVCacheAccessor({"k": k_cache1, "v": v_cache1}),
         k,
         v,
         seq_len_delta=seq_len_delta,
@@ -787,7 +787,7 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
     v_cache2 = v_cache.clone()
     ref_out = ref_backend.decode_dense_kv(
         q,
-        DenseKVCacheAccessor(k_cache2, v_cache2),
+        DenseKVCacheAccessor({"k": k_cache2, "v": v_cache2}),
         k,
         v,
         seq_len_delta=seq_len_delta,
@@ -886,7 +886,7 @@ def test_decode_paged_kv(
     )
     out = attn_backend.decode_paged_kv(
         q,
-        PagedKVCacheAccessor(block_table, k_cache1, v_cache1),
+        PagedKVCacheAccessor(block_table, {"k": k_cache1, "v": v_cache1}),
         k,
         v,
         seq_len_delta=seq_len_delta,
@@ -901,7 +901,7 @@ def test_decode_paged_kv(
     v_cache2 = v_cache.clone()
     ref_out = ref_backend.decode_paged_kv(
         q,
-        PagedKVCacheAccessor(block_table, k_cache2, v_cache2),
+        PagedKVCacheAccessor(block_table, {"k": k_cache2, "v": v_cache2}),
         k,
         v,
         seq_len_delta=seq_len_delta,

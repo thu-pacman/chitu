@@ -236,7 +236,7 @@ class FlashInferBackend(TritonAttnBackend):
         assert q_pe.shape[1] == local_n_heads
         _, _, self.qk_rope_head_dim = q_pe.shape
         append_to_paged_kv_cache(
-            kv_cache.k,
+            kv_cache.kv["kv_lora_k_pe"],
             kv_cache.block_table,
             kv,
             seq_len_delta.old.lens_tensor_device,
@@ -247,8 +247,8 @@ class FlashInferBackend(TritonAttnBackend):
         return self.mla_decode_wrapper.run(
             q_nope,
             q_pe,
-            kv_cache.k[..., : self.kv_lora_rank],
-            kv_cache.k[..., self.kv_lora_rank :],
+            kv_cache.kv["kv_lora_k_pe"][..., : self.kv_lora_rank],
+            kv_cache.kv["kv_lora_k_pe"][..., self.kv_lora_rank :],
             return_lse=False,
         ).view(seq_len_delta.batch_size, self.local_n_heads, -1)
 
@@ -271,9 +271,9 @@ class FlashInferBackend(TritonAttnBackend):
         assert q_pe.shape[0] == bs_seq
         assert q_pe.shape[1] == local_n_heads
         _, _, self.qk_rope_head_dim = q_pe.shape
-        block_size = kv_cache.k.shape[1]
+        block_size = kv_cache.kv["kv_lora_k_pe"].shape[1]
         append_to_paged_kv_cache(
-            kv_cache.k,
+            kv_cache.kv["kv_lora_k_pe"],
             kv_cache.block_table,
             kv,
             seq_len_delta.delta_position_ids_tensor_device,
@@ -316,8 +316,8 @@ class FlashInferBackend(TritonAttnBackend):
         out = self.mla_prefill_wrapper.run(
             q_nope,
             q_pe,
-            kv_cache.k[..., : self.kv_lora_rank],
-            kv_cache.k[..., self.kv_lora_rank :],
+            kv_cache.kv["kv_lora_k_pe"][..., : self.kv_lora_rank],
+            kv_cache.kv["kv_lora_k_pe"][..., self.kv_lora_rank :],
             return_lse=False,
         )
         return out

@@ -444,13 +444,17 @@ class NpuAttnBackend(RefAttnBackend):
 
         block_size = kv_cache.k.shape[1]
 
-        kv_cache.k = kv_cache.k.view(
-            kv_cache.k.shape[0] * kv_cache.k.shape[1], -1
-        ).unsqueeze(1)
+        kv_cache.kv["k"] = (
+            kv_cache.kv["k"]
+            .view(kv_cache.k.shape[0] * kv_cache.k.shape[1], -1)
+            .unsqueeze(1)
+        )
 
-        kv_cache.v = kv_cache.v.view(
-            kv_cache.v.shape[0] * kv_cache.v.shape[1], -1
-        ).unsqueeze(1)
+        kv_cache.kv["v"] = (
+            kv_cache.kv["v"]
+            .view(kv_cache.v.shape[0] * kv_cache.v.shape[1], -1)
+            .unsqueeze(1)
+        )
 
         output = torch.empty_like(q)
         lse = torch.empty(1, dtype=q.dtype, device="npu")
@@ -493,7 +497,7 @@ class NpuAttnBackend(RefAttnBackend):
             softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
 
         append_to_paged_kv_cache(
-            kv_cache.k,
+            kv_cache.kv["kv_lora_k_pe"],
             kv_cache.block_table,
             kv,
             seq_len_delta.old.lens_tensor_device,
@@ -502,7 +506,7 @@ class NpuAttnBackend(RefAttnBackend):
         )
         # kv_cache[indices, positions] = kv.squeeze(1) if kv.ndim == 3 and kv.shape[1] == 1 else kv
 
-        # torch_npu._npu_reshape_and_cache_siso(key=kv_cache.k,
+        # torch_npu._npu_reshape_and_cache_siso(key=kv_cache.kv["kv_lora_k_pe"],
         #                                       key_cache=key_cache,
         #                                       slot_indices=slots)
         attn_output = torch.zeros(
@@ -512,7 +516,7 @@ class NpuAttnBackend(RefAttnBackend):
         )
         torch_npu._npu_paged_attention_mla(
             query=query,
-            key_cache=kv_cache.k.unsqueeze(2),
+            key_cache=kv_cache.kv["kv_lora_k_pe"].unsqueeze(2),
             num_kv_heads=1,
             num_heads=local_n_heads,
             scale_value=softmax_scale,
