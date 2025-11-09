@@ -164,7 +164,7 @@ class Backend:
             dp_size=non_expert_data_parallel_size,
             ep_size=expert_parallel_size,
         )
-        Backend.ip_list = get_world_group().gather_all_rank_ip()
+        Backend.ip_port_list = get_world_group().gather_all_rank_ip_port()
 
         Backend.pp_stage = (
             global_rank

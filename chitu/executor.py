@@ -141,15 +141,15 @@ class PipeDispatcher(TasksDispatcher):
     def init_zmq(self):
         self.ctx = zmq.Context.instance()
         if not self.is_last_stage:
-            self.send_addr = Backend.ip_list[self.rank]
-            self.send_port = 26121 + self.rank
+            self.send_addr, _, self.send_port = Backend.ip_port_list[self.rank]
             self.send_url = f"tcp://{self.send_addr}:{self.send_port}"
             self.send_socket = self.ctx.socket(zmq.PUSH)
             self.send_socket.bind(self.send_url)
 
         if not self.is_first_stage:
-            self.recv_addr = Backend.ip_list[self.rank - self.tp_size]
-            self.recv_port = 26121 + self.rank - self.tp_size
+            self.recv_addr, _, self.recv_port = Backend.ip_port_list[
+                self.rank - self.tp_size
+            ]
             self.recv_url = f"tcp://{self.recv_addr}:{self.recv_port}"
             self.recv_socket = self.ctx.socket(zmq.PULL)
             self.recv_socket.connect(self.recv_url)
@@ -367,8 +367,7 @@ class ExpertDataDispatcher(TasksDispatcher):
 
     def init_zmq(self):
         self.ctx = zmq.Context.instance()
-        self.master_addr = Backend.ip_list[0]
-        self.master_port = 26120  # hard-coded here
+        self.master_addr, self.master_port, _ = Backend.ip_port_list[0]
         self.url = f"tcp://{self.master_addr}:{self.master_port}"
 
         if self.is_main_rank:
