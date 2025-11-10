@@ -51,7 +51,7 @@ from chitu.ops import (
     fp4_fake_quant,
     pack_every_two_fp4_e2m1_in_uint8_to_one_uint8,
     to_fp4_e2m1_in_uint8,
-    mla_prologue_normal,
+    mla_prologue,
     blockfp8_act_quant,
     blockfp8_index_score_ragged_q_paged_k_dsv32,
     blockfp8_index_score_ragged_q_dense_k_dsv32,
@@ -322,7 +322,7 @@ class AttentionDeepSeekV3(Attention):
         # - chitu/models/model_deepseek_v3.py
         # - chitu/quantization/registry.py
         # - chitu/ops/mla_prologue.py
-        self.can_use_mla_prologue_normal_torch_npu = (
+        self.can_use_mla_prologue_torch_npu = (
             has_torch_npu
             and (
                 quant is None
@@ -359,7 +359,7 @@ class AttentionDeepSeekV3(Attention):
                 checkpoint_prefix=f"{checkpoint_prefix}.q_a_proj",
                 base_linear_class=(
                     NormalLinearNpuFractalZn
-                    if self.can_use_mla_prologue_normal_torch_npu
+                    if self.can_use_mla_prologue_torch_npu
                     and not self.mla_prologue_int8_full
                     else None
                 ),
@@ -371,7 +371,7 @@ class AttentionDeepSeekV3(Attention):
                 checkpoint_prefix=f"{checkpoint_prefix}.kv_a_proj_with_mqa",
                 base_linear_class=(
                     NormalLinearNpuFractalZn
-                    if self.can_use_mla_prologue_normal_torch_npu
+                    if self.can_use_mla_prologue_torch_npu
                     and not self.mla_prologue_int8_full
                     else None
                 ),
@@ -396,7 +396,7 @@ class AttentionDeepSeekV3(Attention):
             base_linear_class=(
                 NormalLinearNpuFractalZn
                 if (
-                    self.can_use_mla_prologue_normal_torch_npu
+                    self.can_use_mla_prologue_torch_npu
                     and not (
                         self.mla_prologue_int8_partial or self.mla_prologue_int8_full
                     )
@@ -436,7 +436,7 @@ class AttentionDeepSeekV3(Attention):
                 self.kv_lora_rank,
                 base_class=(
                     NormalAbsorbGemmPermuted021
-                    if self.can_use_mla_prologue_normal_torch_npu
+                    if self.can_use_mla_prologue_torch_npu
                     else None
                 ),
                 quant_kwargs={"blockfp8": {"block_size": block_size}},
@@ -474,10 +474,10 @@ class AttentionDeepSeekV3(Attention):
             )
 
     def _run_linear(self, x, freqs_cis: BatchedFreqsCis):
-        if self.can_use_mla_prologue_normal_torch_npu:
+        if self.can_use_mla_prologue_torch_npu:
             if self.mla_prologue_int8_full:
                 x_int8, scale_w_x = torch_npu.npu_dynamic_quant(x.view(-1, x.shape[-1]))
-                q, k, v = mla_prologue_normal(
+                q_nope, q_pe, kv = mla_prologue(
                     x_int8,
                     self.q_a_proj.get_native_layout_weight(),
                     self.q_b_proj.get_native_layout_weight(),
@@ -497,9 +497,9 @@ class AttentionDeepSeekV3(Attention):
                     smooth_scales=None,
                     impl="torch_npu",
                 )
-                return q, k, v, None
+                return q_nope, q_pe, kv, None
             else:
-                q, k, v = mla_prologue_normal(
+                q_nope, q_pe, kv = mla_prologue(
                     x,
                     self.q_a_proj.get_native_layout_weight(),
                     self.q_b_proj.get_native_layout_weight(),
@@ -514,7 +514,7 @@ class AttentionDeepSeekV3(Attention):
                     smooth_scales=None,
                     impl="torch_npu",
                 )
-                return q, k, v, None
+                return q_nope, q_pe, kv, None
 
         bs_seq, _ = x.size()
         assert self.q_lora_rank > 0

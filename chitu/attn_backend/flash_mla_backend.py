@@ -86,8 +86,8 @@ class FlashMLABackend(TritonAttnBackend):
             # TODO: Support `warning_once` in the logger and use it here
             logger.warning(
                 '"kv_lora"-and-"k_pe"-separated KV cache is insuffcient for '
-                "FlashMLABackend.mla_decode_paged_kv from MLA to MQA, due to an additional `torch.cat` "
-                'operation. It is recommended to use "kv_lora_k_pe"-holistic KV cache instead.'
+                "FlashMLABackend.mla_decode_paged_kv, due to an additional `torch.cat` operation. "
+                'It is recommended to use "kv_lora_k_pe"-holistic KV cache instead.'
             )
             append_to_paged_kv_cache(
                 kv_cache.kv["kv_lora"],

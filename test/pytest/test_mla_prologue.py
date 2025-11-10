@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.ops import mla_prologue_normal
+from chitu.ops import mla_prologue
 from chitu.native_layout import NativeLayoutTensor, PermutedTensor, NpuFractalZnTensor
 from chitu.utils import try_import_and_setup_torch_npu
 
@@ -31,7 +31,7 @@ def check_close(x, y):
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.skipif(not has_torch_npu, reason="torch_npu not available")
-def test_mla_prologue_normal_torch_npu(
+def test_mla_prologue_torch_npu(
     bs_seq: int,
     dim: int,
     q_lora_rank: int,
@@ -74,7 +74,7 @@ def test_mla_prologue_normal_torch_npu(
     q_a_layernorm_eps = 1.0e-5
     kv_a_layernorm_eps = 1.0e-5
 
-    q_nope, q_pe, kv = mla_prologue_normal(
+    q_nope, q_pe, kv = mla_prologue(
         x=x,
         q_a_proj_weight=q_a_proj_weight_zn,
         q_b_proj_weight=q_b_proj_weight_zn,
@@ -87,7 +87,7 @@ def test_mla_prologue_normal_torch_npu(
         kv_a_layernorm_eps=kv_a_layernorm_eps,
         impl="torch_npu",
     )
-    q_nope_ref, q_pe_ref, kv_ref = mla_prologue_normal(
+    q_nope_ref, q_pe_ref, kv_ref = mla_prologue(
         x=x,
         q_a_proj_weight=q_a_proj_weight,
         q_b_proj_weight=q_b_proj_weight,
@@ -119,7 +119,7 @@ def test_mla_prologue_normal_torch_npu(
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.skipif(not has_torch_npu, reason="torch_npu not available")
-def test_mla_prologue_normal_torch_npu_int8_weight_q_b_proj(
+def test_mla_prologue_torch_npu_int8_weight_q_b_proj(
     bs_seq: int,
     dim: int,
     q_lora_rank: int,
@@ -161,7 +161,7 @@ def test_mla_prologue_normal_torch_npu_int8_weight_q_b_proj(
     q_a_layernorm_eps = 1.0e-5
     kv_a_layernorm_eps = 1.0e-5
 
-    q_nope_ref, q_pe_ref, kv_ref = mla_prologue_normal(
+    q_nope_ref, q_pe_ref, kv_ref = mla_prologue(
         x=x,
         q_a_proj_weight=q_a_proj_weight,
         q_b_proj_weight=q_b_proj_weight,
@@ -188,7 +188,7 @@ def test_mla_prologue_normal_torch_npu_int8_weight_q_b_proj(
     out_dim = q_b_proj_weight.shape[0]
     dequant_scale_q_b_proj = scale_w.to(torch.float32).to(x.device)
 
-    q_nope_i8, q_pe_i8, kv_i8 = mla_prologue_normal(
+    q_nope_i8, q_pe_i8, kv_i8 = mla_prologue(
         x=x,
         q_a_proj_weight=q_a_proj_weight_zn_bf16,
         q_b_proj_weight=q_b_proj_weight_zn_int8,
@@ -219,7 +219,7 @@ def test_mla_prologue_normal_torch_npu_int8_weight_q_b_proj(
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.skipif(not has_torch_npu, reason="torch_npu not available")
-def test_mla_prologue_normal_torch_npu_int8(
+def test_mla_prologue_torch_npu_int8(
     bs_seq: int,
     dim: int,
     q_lora_rank: int,
@@ -261,7 +261,7 @@ def test_mla_prologue_normal_torch_npu_int8(
     q_a_layernorm_eps = 1.0e-5
     kv_a_layernorm_eps = 1.0e-5
 
-    q_nope_ref, q_pe_ref, kv_ref = mla_prologue_normal(
+    q_nope_ref, q_pe_ref, kv_ref = mla_prologue(
         x=x,
         q_a_proj_weight=q_a_proj_weight,
         q_b_proj_weight=q_b_proj_weight,
@@ -298,7 +298,7 @@ def test_mla_prologue_normal_torch_npu_int8(
     dequant_scale_q_b_proj = scale_w_q_b.to(torch.float32).to(x.device)
     dequant_scale_kv_a = scale_w_kv_a.to(torch.float32).to(x.device)
 
-    q_nope_i8, q_pe_i8, kv_i8 = mla_prologue_normal(
+    q_nope_i8, q_pe_i8, kv_i8 = mla_prologue(
         x=x_int8,
         q_a_proj_weight=q_a_proj_weight_zn_int8,
         q_b_proj_weight=q_b_proj_weight_zn_int8,
