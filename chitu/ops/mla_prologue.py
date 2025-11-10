@@ -20,7 +20,7 @@ from chitu.utils import ceil_div, try_import_and_setup_torch_npu
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
-def mla_prologue_normal(
+def mla_prologue(
     x: torch.Tensor,
     q_a_proj_weight: torch.Tensor | NativeLayoutTensor,
     q_b_proj_weight: torch.Tensor | NativeLayoutTensor,
@@ -72,11 +72,11 @@ def mla_prologue_normal(
             impl = "torch"
         else:
             raise NotImplementedError(
-                "No supported implementation found for mla_prologue_normal"
+                "No supported implementation found for mla_prologue"
             )
 
     if impl == "torch_npu":
-        return mla_prologue_normal_torch_npu(
+        return mla_prologue_torch_npu(
             x=x,
             q_a_proj_weight=q_a_proj_weight,
             q_b_proj_weight=q_b_proj_weight,
@@ -94,7 +94,7 @@ def mla_prologue_normal(
             smooth_scales=smooth_scales,
         )
     elif impl == "torch":
-        return mla_prologue_normal_torch(
+        return mla_prologue_torch(
             x=x,
             q_a_proj_weight=q_a_proj_weight,
             q_b_proj_weight=q_b_proj_weight,
@@ -107,10 +107,10 @@ def mla_prologue_normal(
             kv_a_layernorm_eps=kv_a_layernorm_eps,
         )
     else:
-        raise ValueError(f"Invalid mla_prologue_normal implementation: {impl}")
+        raise ValueError(f"Invalid mla_prologue implementation: {impl}")
 
 
-def mla_prologue_normal_torch(
+def mla_prologue_torch(
     x: torch.Tensor,
     q_a_proj_weight: torch.Tensor,
     q_b_proj_weight: torch.Tensor,
@@ -169,7 +169,7 @@ def mla_prologue_normal_torch(
     return q_nope, q_pe, kv
 
 
-def mla_prologue_normal_torch_npu(
+def mla_prologue_torch_npu(
     x: torch.Tensor,
     q_a_proj_weight: NpuFractalZnTensor,  # a.k.a. weight_dq
     q_b_proj_weight: NpuFractalZnTensor,  # a.k.a. weight_uq_qr

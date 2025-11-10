@@ -47,7 +47,7 @@ from chitu.ops.quant import (
     blockfp8_index_score_ragged_q_dense_k_dsv32,
     blockfp8_index_score_ragged_q_paged_k_dsv32,
 )
-from chitu.ops.mla_prologue import mla_prologue_normal
+from chitu.ops.mla_prologue import mla_prologue
 from chitu.ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_expert_block_indexed,
     batched_routed_activation_indexed_to_expert_block_permuted_blockfp8,

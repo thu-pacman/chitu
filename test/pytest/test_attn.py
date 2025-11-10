@@ -168,6 +168,7 @@ def test_mla_prefill_ragged_qkvo(
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
 @pytest.mark.parametrize("is_increment", [False, True])
+@pytest.mark.parametrize("use_separated_kv_lora_k_pe", [False, True])
 @pytest.mark.parametrize("impl", ["triton", "flashinfer", "npu"])
 def test_mla_prefill_ragged_qo_paged_kv(
     bs,
@@ -176,6 +177,7 @@ def test_mla_prefill_ragged_qo_paged_kv(
     qk_rope_head_dim,
     qk_nope_head_dim,
     is_increment,
+    use_separated_kv_lora_k_pe,
     impl,
 ):
     if impl == "triton" and not has_triton:
@@ -264,11 +266,22 @@ def test_mla_prefill_ragged_qo_paged_kv(
     )
     page_table = torch.arange(num_pages, device="cuda").to(torch.int32).view(bs, -1)
 
-    kv_cache_1 = kv_cache.clone()
+    if use_separated_kv_lora_k_pe:
+        kv_cache_dict_1 = {
+            "kv_lora": kv_cache[..., :kv_lora_rank].clone(),
+            "k_pe": kv_cache[..., kv_lora_rank:].clone(),
+        }
+        kv_cache_dict_2 = {
+            "kv_lora": kv_cache[..., :kv_lora_rank].clone(),
+            "k_pe": kv_cache[..., kv_lora_rank:].clone(),
+        }
+    else:
+        kv_cache_dict_1 = {"kv_lora_k_pe": kv_cache.clone()}
+        kv_cache_dict_2 = {"kv_lora_k_pe": kv_cache.clone()}
     out = attn_backend.mla_prefill_ragged_qo_paged_kv(
         q_nope,
         q_pe,
-        PagedKVCacheAccessor(page_table, {"kv_lora_k_pe": kv_cache_1}),
+        PagedKVCacheAccessor(page_table, kv_cache_dict_1),
         this_kv,
         seq_len_delta,
         causal=True,
@@ -279,7 +292,7 @@ def test_mla_prefill_ragged_qo_paged_kv(
     ref_out = ref_backend.mla_prefill_ragged_qo_paged_kv(
         q_nope,
         q_pe,
-        PagedKVCacheAccessor(page_table, {"kv_lora_k_pe": kv_cache_2}),
+        PagedKVCacheAccessor(page_table, kv_cache_dict_2),
         this_kv,
         seq_len_delta,
         causal=True,
@@ -295,6 +308,7 @@ def test_mla_prefill_ragged_qo_paged_kv(
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
 @pytest.mark.parametrize("topk", [None, 128])
+@pytest.mark.parametrize("use_separated_kv_lora_k_pe", [False, True])
 @pytest.mark.parametrize("impl", ["triton", "npu"])
 def test_mla_decode_dense_kv(
     bs,
@@ -303,6 +317,7 @@ def test_mla_decode_dense_kv(
     qk_rope_head_dim,
     qk_nope_head_dim,
     topk,
+    use_separated_kv_lora_k_pe,
     impl,
 ):
     if impl == "triton":
@@ -390,10 +405,22 @@ def test_mla_decode_dense_kv(
 
     attn.prepare_metadata_for_decode(seq_len_delta, None, 0)
 
+    if use_separated_kv_lora_k_pe:
+        kv_cache_dict_1 = {
+            "kv_lora": kv_cache[..., :kv_lora_rank].clone(),
+            "k_pe": kv_cache[..., kv_lora_rank:].clone(),
+        }
+        kv_cache_dict_2 = {
+            "kv_lora": kv_cache[..., :kv_lora_rank].clone(),
+            "k_pe": kv_cache[..., kv_lora_rank:].clone(),
+        }
+    else:
+        kv_cache_dict_1 = {"kv_lora_k_pe": kv_cache.clone()}
+        kv_cache_dict_2 = {"kv_lora_k_pe": kv_cache.clone()}
     y = attn.mla_decode_dense_kv(
         q_nope,
         q_pe,
-        DenseKVCacheAccessor({"kv_lora_k_pe": kv_cache}),
+        DenseKVCacheAccessor(kv_cache_dict_1),
         this_kv,
         seq_len_delta=seq_len_delta,
         topk_indices=topk_indices,
@@ -401,7 +428,7 @@ def test_mla_decode_dense_kv(
     y_ref = attn_ref.mla_decode_dense_kv(
         q_nope,
         q_pe,
-        DenseKVCacheAccessor({"kv_lora_k_pe": kv_cache}),
+        DenseKVCacheAccessor(kv_cache_dict_2),
         this_kv,
         seq_len_delta=seq_len_delta,
         topk_indices=topk_indices,
@@ -417,6 +444,7 @@ def test_mla_decode_dense_kv(
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
 @pytest.mark.parametrize("page_size", [256])
 @pytest.mark.parametrize("topk", [None, 128])
+@pytest.mark.parametrize("use_separated_kv_lora_k_pe", [False, True])
 @pytest.mark.parametrize("impl", ["triton", "flashinfer", "npu"])
 def test_mla_decode_paged_kv(
     bs,
@@ -426,6 +454,7 @@ def test_mla_decode_paged_kv(
     qk_nope_head_dim,
     page_size,
     topk,
+    use_separated_kv_lora_k_pe,
     impl,
 ):
     if impl == "triton":
@@ -525,10 +554,22 @@ def test_mla_decode_paged_kv(
 
     attn.prepare_metadata_for_decode(seq_len_delta, page_table, page_size)
 
+    if use_separated_kv_lora_k_pe:
+        kv_cache_dict_1 = {
+            "kv_lora": kv_cache[..., :kv_lora_rank].clone(),
+            "k_pe": kv_cache[..., kv_lora_rank:].clone(),
+        }
+        kv_cache_dict_2 = {
+            "kv_lora": kv_cache[..., :kv_lora_rank].clone(),
+            "k_pe": kv_cache[..., kv_lora_rank:].clone(),
+        }
+    else:
+        kv_cache_dict_1 = {"kv_lora_k_pe": kv_cache.clone()}
+        kv_cache_dict_2 = {"kv_lora_k_pe": kv_cache.clone()}
     y = attn.mla_decode_paged_kv(
         q_nope,
         q_pe,
-        PagedKVCacheAccessor(page_table, {"kv_lora_k_pe": kv_cache}),
+        PagedKVCacheAccessor(page_table, kv_cache_dict_1),
         this_kv,
         seq_len_delta=seq_len_delta,
         topk_indices=topk_indices,
@@ -536,7 +577,7 @@ def test_mla_decode_paged_kv(
     y_ref = attn_ref.mla_decode_paged_kv(
         q_nope,
         q_pe,
-        PagedKVCacheAccessor(page_table, {"kv_lora_k_pe": kv_cache}),
+        PagedKVCacheAccessor(page_table, kv_cache_dict_2),
         this_kv,
         seq_len_delta=seq_len_delta,
         topk_indices=topk_indices,

@@ -235,21 +235,45 @@ class FlashInferBackend(TritonAttnBackend):
         assert q_pe.shape[0] == B
         assert q_pe.shape[1] == local_n_heads
         _, _, self.qk_rope_head_dim = q_pe.shape
-        append_to_paged_kv_cache(
-            kv_cache.kv["kv_lora_k_pe"],
-            kv_cache.block_table,
-            kv,
-            seq_len_delta.old.lens_tensor_device,
-            get_page_ids=kv_cache.get_page_ids,
-            get_offs_in_page=kv_cache.get_offs_in_page,
-        )
+
+        if "kv_lora_k_pe" in kv_cache.kv:
+            append_to_paged_kv_cache(
+                kv_cache.kv["kv_lora_k_pe"],
+                kv_cache.block_table,
+                kv,
+                seq_len_delta.old.lens_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+            kv_lora = kv_cache.kv["kv_lora_k_pe"][..., : self.kv_lora_rank]
+            k_pe = kv_cache.kv["kv_lora_k_pe"][..., self.kv_lora_rank :]
+        elif "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv:
+            append_to_paged_kv_cache(
+                kv_cache.kv["kv_lora"],
+                kv_cache.block_table,
+                kv[..., : self.kv_lora_rank],
+                seq_len_delta.old.lens_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+            append_to_paged_kv_cache(
+                kv_cache.kv["k_pe"],
+                kv_cache.block_table,
+                kv[..., self.kv_lora_rank :],
+                seq_len_delta.old.lens_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+            kv_lora = kv_cache.kv["kv_lora"]
+            k_pe = kv_cache.kv["k_pe"]
+        else:
+            raise ValueError(
+                f'For MLA, the KV cache should either have a "kv_lora_k_pe" tensor '
+                f'or both "kv_lora" and "k_pe" tensors, but we got {list(kv_cache.kv.keys())}'
+            )
 
         return self.mla_decode_wrapper.run(
-            q_nope,
-            q_pe,
-            kv_cache.kv["kv_lora_k_pe"][..., : self.kv_lora_rank],
-            kv_cache.kv["kv_lora_k_pe"][..., self.kv_lora_rank :],
-            return_lse=False,
+            q_nope, q_pe, kv_lora, k_pe, return_lse=False
         ).view(seq_len_delta.batch_size, self.local_n_heads, -1)
 
     @override
@@ -271,16 +295,47 @@ class FlashInferBackend(TritonAttnBackend):
         assert q_pe.shape[0] == bs_seq
         assert q_pe.shape[1] == local_n_heads
         _, _, self.qk_rope_head_dim = q_pe.shape
-        block_size = kv_cache.kv["kv_lora_k_pe"].shape[1]
-        append_to_paged_kv_cache(
-            kv_cache.kv["kv_lora_k_pe"],
-            kv_cache.block_table,
-            kv,
-            seq_len_delta.delta_position_ids_tensor_device,
-            seq_len_delta.delta_seq_ids_tensor_device,
-            get_page_ids=kv_cache.get_page_ids,
-            get_offs_in_page=kv_cache.get_offs_in_page,
-        )
+
+        if "kv_lora_k_pe" in kv_cache.kv:
+            block_size = kv_cache.kv["kv_lora_k_pe"].shape[1]
+            append_to_paged_kv_cache(
+                kv_cache.kv["kv_lora_k_pe"],
+                kv_cache.block_table,
+                kv,
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+            kv_lora = kv_cache.kv["kv_lora_k_pe"][..., : self.kv_lora_rank]
+            k_pe = kv_cache.kv["kv_lora_k_pe"][..., self.kv_lora_rank :]
+        elif "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv:
+            block_size = kv_cache.kv["kv_lora"].shape[1]
+            append_to_paged_kv_cache(
+                kv_cache.kv["kv_lora"],
+                kv_cache.block_table,
+                kv[..., : self.kv_lora_rank],
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+            append_to_paged_kv_cache(
+                kv_cache.kv["k_pe"],
+                kv_cache.block_table,
+                kv[..., self.kv_lora_rank :],
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+            kv_lora = kv_cache.kv["kv_lora"]
+            k_pe = kv_cache.kv["k_pe"]
+        else:
+            raise ValueError(
+                f'For MLA, the KV cache should either have a "kv_lora_k_pe" tensor '
+                f'or both "kv_lora" and "k_pe" tensors, but we got {list(kv_cache.kv.keys())}'
+            )
 
         q_indptr = seq_len_delta.delta_prefix_lens_tensor_device
         kv_indptr_list = []
@@ -314,11 +369,7 @@ class FlashInferBackend(TritonAttnBackend):
         )
 
         out = self.mla_prefill_wrapper.run(
-            q_nope,
-            q_pe,
-            kv_cache.kv["kv_lora_k_pe"][..., : self.kv_lora_rank],
-            kv_cache.kv["kv_lora_k_pe"][..., self.kv_lora_rank :],
-            return_lse=False,
+            q_nope, q_pe, kv_lora, k_pe, return_lse=False
         )
         return out
 

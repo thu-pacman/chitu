@@ -96,7 +96,7 @@ class QuantizationRegistry:
             and args.models.qk_nope_head_dim == 128
             and args.models.qk_rope_head_dim == 64
         ):
-            return False  # Not merging, so we can use mla_prologue_normal(impl=torch_npu), which is even better
+            return False  # Not merging, so we can use mla_prologue(impl=torch_npu), which is even better
 
         return quant in QuantizationRegistry._allowed_quant_for_merge_qkv
 
