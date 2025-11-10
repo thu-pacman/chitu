@@ -268,7 +268,12 @@ class Backend:
             return ChatFormat(Backend.tokenizer)
 
     @staticmethod
-    def _init_cache_manager(args, layer_filter_fn=lambda x: x, num_blocks: int = None):
+    def _init_cache_manager(
+        args,
+        attn_backend_type,
+        layer_filter_fn=lambda x: x,
+        num_blocks: int = None,
+    ):
         """
         Initialize the appropriate KV cache manager based on configuration.
 
@@ -303,7 +308,7 @@ class Backend:
         layer_id_map = GlobalLocalMap.from_list(local_layers)
 
         # Configure KV cache parameters based on model type
-        kv_cache_kvargs = Backend._get_kv_cache_params(args)
+        kv_cache_kvargs = Backend._get_kv_cache_params(args, attn_backend_type)
 
         # Create appropriate cache manager
         if args.infer.cache_type == "paged":
@@ -445,7 +450,7 @@ class Backend:
         )
 
     @staticmethod
-    def _get_kv_cache_params(args):
+    def _get_kv_cache_params(args, attn_backend_type):
         """
         Calculate the KV cache parameters based on model type and configuration.
 
@@ -461,11 +466,21 @@ class Backend:
 
         if args.models.type == "deepseek-v3":
             if args.infer.mla_absorb in ["absorb", "absorb-without-precomp"]:
-                kv_cache_kvargs["shape_per_token_dict"] = {
-                    "kv_lora_k_pe": (
-                        args.models.kv_lora_rank + args.models.qk_rope_head_dim,
-                    )
-                }
+                use_separated_kv_lora_k_pe = attn_backend_type in [
+                    FlashInferBackend,
+                    TritonAttnBackend,
+                ]
+                if use_separated_kv_lora_k_pe:
+                    kv_cache_kvargs["shape_per_token_dict"] = {
+                        "kv_lora": (args.models.kv_lora_rank,),
+                        "k_pe": (args.models.qk_rope_head_dim,),
+                    }
+                else:
+                    kv_cache_kvargs["shape_per_token_dict"] = {
+                        "kv_lora_k_pe": (
+                            args.models.kv_lora_rank + args.models.qk_rope_head_dim,
+                        )
+                    }
             elif args.infer.mla_absorb == "none":
                 n_local_heads = args.models.n_heads // model_parallel_size
                 k_head_dim = args.models.qk_nope_head_dim + args.models.qk_rope_head_dim
@@ -521,42 +536,41 @@ class Backend:
     #     return Qwen3LinearAttnCacheManager()
 
     @staticmethod
-    def _init_attention_backend(args):
-        """
-        Initialize the appropriate attention backend based on configuration.
-
-        Arguments:
-            args: Configuration with attention settings
-
-        Returns:
-            Initialized attention backend
-        """
+    def _get_attention_backend_type(args):
         if args.infer.attn_type == "auto":
             if is_ascend():
-                return NpuAttnBackend()
+                return NpuAttnBackend
             elif args.infer.op_impl == "cpu":
-                return RefAttnBackend()
+                return RefAttnBackend
             elif "deepseek-v3" in args.models.type:
-                return FlashMLABackend()
+                return FlashMLABackend
             else:
-                return HybridAttnBackend()
+                return HybridAttnBackend
         elif args.infer.attn_type == "cpu":
-            return RefAttnBackend()
+            return RefAttnBackend
         elif args.infer.attn_type == "flash_attn":
-            return FlashAttnBackend()
+            return FlashAttnBackend
         elif args.infer.attn_type == "flash_mla":
-            return FlashMLABackend()
+            return FlashMLABackend
         elif args.infer.attn_type == "flash_infer":
-            assert isinstance(Backend.cache_manager, PagedKVCacheManager)
-            return FlashInferBackend(Backend.cache_manager.get_max_num_blocks())
+            return FlashInferBackend
         elif args.infer.attn_type == "triton":
-            return TritonAttnBackend()
+            return TritonAttnBackend
         elif args.infer.attn_type == "npu":
-            return NpuAttnBackend()
+            return NpuAttnBackend
         elif args.infer.attn_type == "ref":
-            return RefAttnBackend()
+            return RefAttnBackend
         else:
             raise ValueError(f"Unknown attn type {args.infer.attn_type}")
+
+    @staticmethod
+    def _init_attention_backend(attn_backend_type):
+        # Yes, use `type` instead of `isinstance` here, because `AttnBackend`s inherit each other
+        if attn_backend_type is FlashInferBackend:
+            assert isinstance(Backend.cache_manager, PagedKVCacheManager)
+            return attn_backend_type(Backend.cache_manager.get_max_num_blocks())
+        else:
+            return attn_backend_type()
 
     @staticmethod
     def _move_one_module_to_device(
@@ -864,6 +878,8 @@ class Backend:
         Backend.processor = Backend._init_processor(args)
         Backend.formatter = Backend._init_formatter(args)
 
+        attn_backend_type = Backend._get_attention_backend_type(args)
+
         # Initialize cache manager
         if args.models.type == "hf-qwen3-next":
 
@@ -890,6 +906,7 @@ class Backend:
             Backend.cache_type = args.infer.cache_type
             Backend.cache_manager = Backend._init_cache_manager(
                 args,
+                attn_backend_type,
                 layer_filter_fn=filter_full_attn_layer,
                 num_blocks=num_full_attn_blocks,
             )
@@ -902,14 +919,14 @@ class Backend:
             args.models, "index_head_dim", None
         ):
             Backend.cache_type = args.infer.cache_type
-            Backend.cache_manager = Backend._init_cache_manager(args)
+            Backend.cache_manager = Backend._init_cache_manager(args, attn_backend_type)
             Backend.indexer_cache_manager = Backend._init_indexer_cache_manager(args)
         else:
-            Backend.cache_manager = Backend._init_cache_manager(args)
+            Backend.cache_manager = Backend._init_cache_manager(args, attn_backend_type)
             Backend.cache_type = args.infer.cache_type
 
         # Initialize attention backend
-        attn_backend = Backend._init_attention_backend(args)
+        attn_backend = Backend._init_attention_backend(attn_backend_type)
 
         Backend._build_and_setup_model(args, attn_backend)
 

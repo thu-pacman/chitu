@@ -6,6 +6,7 @@ from typing import Optional
 import abc
 import functools
 import packaging.version
+from logging import getLogger
 
 import torch
 
@@ -29,6 +30,9 @@ from chitu.ops import (
 from chitu.utils import try_import_platform_dep
 
 triton, has_triton = try_import_platform_dep("triton")
+
+
+logger = getLogger(__name__)
 
 
 class AttnBackend(abc.ABC):
@@ -581,30 +585,47 @@ class AttnBackend(abc.ABC):
             )
 
         else:
-            if isinstance(kv_cache, DenseKVCacheAccessor):
+            if "kv_lora_k_pe" in kv_cache.kv:
                 k_cache = kv_cache.kv["kv_lora_k_pe"].view(
                     kv_cache.kv["kv_lora_k_pe"].shape[0],
                     kv_cache.kv["kv_lora_k_pe"].shape[1],
                     1,  # head
                     kv_lora_rank + qk_rope_head_dim,  # hidden
                 )
-                assert k_cache.shape[-1] == kv_lora_rank + qk_rope_head_dim
                 v_cache = k_cache[..., :kv_lora_rank]
-                kv_cache = DenseKVCacheAccessor({"k": k_cache, "v": v_cache})
+            elif "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv:
+                # TODO: Support `warning_once` in the logger and use it here
+                logger.warning(
+                    '"kv_lora"-and-"k_pe"-separated KV cache is insuffcient when falling back '
+                    "from MLA to MQA, due to an additional `torch.cat` operation. It is recommended "
+                    'to use "kv_lora_k_pe"-holistic KV cache instead.'
+                )
+                kv_lora_cache = kv_cache.kv["kv_lora"].view(
+                    kv_cache.kv["kv_lora"].shape[0],
+                    kv_cache.kv["kv_lora"].shape[1],
+                    1,  # head
+                    kv_lora_rank,  # hidden
+                )
+                k_pe = kv_cache.kv["k_pe"].view(
+                    kv_cache.kv["k_pe"].shape[0],
+                    kv_cache.kv["k_pe"].shape[1],
+                    1,  # head
+                    qk_rope_head_dim,  # hidden
+                )
+                k_cache = torch.cat([kv_lora_cache, k_pe], dim=-1)
+                v_cache = kv_lora_cache
+            else:
+                raise ValueError(
+                    f'For MLA, the KV cache should either have a "kv_lora_k_pe" tensor '
+                    f'or both "kv_lora" and "k_pe" tensors, but we got {list(kv_cache.kv.keys())}'
+                )
 
+            if isinstance(kv_cache, DenseKVCacheAccessor):
+                kv_cache = DenseKVCacheAccessor({"k": k_cache, "v": v_cache})
             elif isinstance(kv_cache, PagedKVCacheAccessor):
-                k_cache = kv_cache.kv["kv_lora_k_pe"].view(
-                    kv_cache.kv["kv_lora_k_pe"].shape[0],
-                    kv_cache.kv["kv_lora_k_pe"].shape[1],
-                    1,  # head
-                    kv_lora_rank + qk_rope_head_dim,  # hidden
-                )
-                assert k_cache.shape[-1] == kv_lora_rank + qk_rope_head_dim
-                v_cache = k_cache[..., :kv_lora_rank]
                 kv_cache = PagedKVCacheAccessor(
                     kv_cache.block_table, {"k": k_cache, "v": v_cache}
                 )
-
             else:
                 raise NotImplementedError()
 
@@ -662,17 +683,54 @@ class AttnBackend(abc.ABC):
         # -> prefill_ragged_qkvo
         # because it incurs redundant KV cache copying.
 
-        append_to_dense_kv_cache(
-            kv_cache.kv["kv_lora_k_pe"],
-            kv.contiguous(),
-            seq_len_delta.delta_position_ids_tensor_device,
-            seq_len_delta.delta_seq_ids_tensor_device,
-        )
-        if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefill
-            kv = read_from_dense_kv_cache(
+        kv_lora_rank = q_nope.shape[-1]
+
+        if "kv_lora_k_pe" in kv_cache.kv:
+            append_to_dense_kv_cache(
                 kv_cache.kv["kv_lora_k_pe"],
-                seq_len_delta.new.position_ids_tensor_device,
-                seq_len_delta.new.seq_ids_tensor_device,
+                kv,
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+            )
+            if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefill
+                kv = read_from_dense_kv_cache(
+                    kv_cache.kv["kv_lora_k_pe"],
+                    seq_len_delta.new.position_ids_tensor_device,
+                    seq_len_delta.new.seq_ids_tensor_device,
+                )
+        elif "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv:
+            append_to_dense_kv_cache(
+                kv_cache.kv["kv_lora"],
+                kv[..., :kv_lora_rank],
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+            )
+            append_to_dense_kv_cache(
+                kv_cache.kv["k_pe"],
+                kv[..., kv_lora_rank:],
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+            )
+            if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefill
+                kv = torch.cat(
+                    [
+                        read_from_dense_kv_cache(
+                            kv_cache.kv["kv_lora"],
+                            seq_len_delta.new.position_ids_tensor_device,
+                            seq_len_delta.new.seq_ids_tensor_device,
+                        ),
+                        read_from_dense_kv_cache(
+                            kv_cache.kv["k_pe"],
+                            seq_len_delta.new.position_ids_tensor_device,
+                            seq_len_delta.new.seq_ids_tensor_device,
+                        ),
+                    ],
+                    dim=-1,
+                )
+        else:
+            raise ValueError(
+                f'For MLA, the KV cache should either have a "kv_lora_k_pe" tensor '
+                f'or both "kv_lora" and "k_pe" tensors, but we got {list(kv_cache.kv.keys())}'
             )
 
         return self.mla_prefill_ragged_qkvo(
@@ -707,21 +765,66 @@ class AttnBackend(abc.ABC):
         # -> prefill_ragged_qkvo
         # because it incurs redundant KV cache copying.
 
-        append_to_paged_kv_cache(
-            kv_cache.kv["kv_lora_k_pe"],
-            kv_cache.block_table,
-            kv.contiguous(),
-            seq_len_delta.delta_position_ids_tensor_device,
-            seq_len_delta.delta_seq_ids_tensor_device,
-            get_page_ids=kv_cache.get_page_ids,
-            get_offs_in_page=kv_cache.get_offs_in_page,
-        )
-        if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefilling
-            kv = read_from_paged_kv_cache(
+        kv_lora_rank = q_nope.shape[-1]
+
+        if "kv_lora_k_pe" in kv_cache.kv:
+            append_to_paged_kv_cache(
                 kv_cache.kv["kv_lora_k_pe"],
                 kv_cache.block_table,
-                seq_len_delta.new.position_ids_tensor_device,
-                seq_len_delta.new.seq_ids_tensor_device,
+                kv,
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+            if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefilling
+                kv = read_from_paged_kv_cache(
+                    kv_cache.kv["kv_lora_k_pe"],
+                    kv_cache.block_table,
+                    seq_len_delta.new.position_ids_tensor_device,
+                    seq_len_delta.new.seq_ids_tensor_device,
+                )
+        elif "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv:
+            append_to_paged_kv_cache(
+                kv_cache.kv["kv_lora"],
+                kv_cache.block_table,
+                kv[..., :kv_lora_rank],
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+            append_to_paged_kv_cache(
+                kv_cache.kv["k_pe"],
+                kv_cache.block_table,
+                kv[..., kv_lora_rank:],
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+            if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefilling
+                kv = torch.cat(
+                    [
+                        read_from_paged_kv_cache(
+                            kv_cache.kv["kv_lora"],
+                            kv_cache.block_table,
+                            seq_len_delta.new.position_ids_tensor_device,
+                            seq_len_delta.new.seq_ids_tensor_device,
+                        ),
+                        read_from_paged_kv_cache(
+                            kv_cache.kv["k_pe"],
+                            kv_cache.block_table,
+                            seq_len_delta.new.position_ids_tensor_device,
+                            seq_len_delta.new.seq_ids_tensor_device,
+                        ),
+                    ],
+                    dim=-1,
+                )
+        else:
+            raise ValueError(
+                f'For MLA, the KV cache should either have a "kv_lora_k_pe" tensor '
+                f'or both "kv_lora" and "k_pe" tensors, but we got {list(kv_cache.kv.keys())}'
             )
 
         return self.mla_prefill_ragged_qkvo(

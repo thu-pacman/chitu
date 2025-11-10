@@ -199,9 +199,33 @@ class TritonAttnBackend(RefAttnBackend):
         assert q_pe.shape[1] == local_n_heads
         _, _, qk_rope_head_dim = q_pe.shape
 
-        append_to_dense_kv_cache(
-            kv_cache.kv["kv_lora_k_pe"], kv, seq_len_delta.old.lens_tensor_device
-        )
+        if "kv_lora_k_pe" in kv_cache.kv:
+            append_to_dense_kv_cache(
+                kv_cache.kv["kv_lora_k_pe"], kv, seq_len_delta.old.lens_tensor_device
+            )
+            assert kv_cache.kv["kv_lora_k_pe"].ndim == 3  # (batch_size, seq_len, dim)
+            k_pe_cache = kv_cache.kv["kv_lora_k_pe"][..., kv_lora_rank:]
+            kv_c_cache = kv_cache.kv["kv_lora_k_pe"][..., :kv_lora_rank]
+        elif "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv:
+            append_to_dense_kv_cache(
+                kv_cache.kv["kv_lora"],
+                kv[..., :kv_lora_rank],
+                seq_len_delta.old.lens_tensor_device,
+            )
+            append_to_dense_kv_cache(
+                kv_cache.kv["k_pe"],
+                kv[..., kv_lora_rank:],
+                seq_len_delta.old.lens_tensor_device,
+            )
+            assert kv_cache.kv["kv_lora"].ndim == 3  # (batch_size, seq_len, dim)
+            assert kv_cache.kv["k_pe"].ndim == 3  # (batch_size, seq_len, dim)
+            k_pe_cache = kv_cache.kv["k_pe"]
+            kv_c_cache = kv_cache.kv["kv_lora"]
+        else:
+            raise ValueError(
+                f'For MLA, the KV cache should either have a "kv_lora_k_pe" tensor '
+                f'or both "kv_lora" and "k_pe" tensors, but we got {list(kv_cache.kv.keys())}'
+            )
 
         o = torch.zeros(
             B,
@@ -233,11 +257,6 @@ class TritonAttnBackend(RefAttnBackend):
             dtype=torch.float32,
             device=q_nope.device,
         )
-
-        assert kv_cache.kv["kv_lora_k_pe"].ndim == 3  # (batch_size, seq_len, dim)
-        kv_c_and_k_pe_cache = kv_cache.kv["kv_lora_k_pe"]
-        k_pe_cache = kv_c_and_k_pe_cache[..., kv_lora_rank:]
-        kv_c_cache = kv_c_and_k_pe_cache[..., :kv_lora_rank]
 
         if softmax_scale is None:
             assert self.qk_nope_head_dim is not None
@@ -280,14 +299,48 @@ class TritonAttnBackend(RefAttnBackend):
         assert q_pe.shape[1] == local_n_heads
         _, _, qk_rope_head_dim = q_pe.shape
 
-        append_to_paged_kv_cache(
-            kv_cache.kv["kv_lora_k_pe"],
-            kv_cache.block_table,
-            kv,
-            seq_len_delta.old.lens_tensor_device,
-            get_page_ids=kv_cache.get_page_ids,
-            get_offs_in_page=kv_cache.get_offs_in_page,
-        )
+        if "kv_lora_k_pe" in kv_cache.kv:
+            append_to_paged_kv_cache(
+                kv_cache.kv["kv_lora_k_pe"],
+                kv_cache.block_table,
+                kv,
+                seq_len_delta.old.lens_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+            assert (
+                kv_cache.kv["kv_lora_k_pe"].ndim == 3
+            )  # (num_blocks, block_size, dim)
+            k_pe_cache = kv_cache.kv["kv_lora_k_pe"][..., kv_lora_rank:]
+            kv_c_cache = kv_cache.kv["kv_lora_k_pe"][..., :kv_lora_rank]
+            PAGE_SIZE = kv_cache.kv["kv_lora_k_pe"].size(1)
+        elif "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv:
+            append_to_paged_kv_cache(
+                kv_cache.kv["kv_lora"],
+                kv_cache.block_table,
+                kv[..., :kv_lora_rank],
+                seq_len_delta.old.lens_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+            append_to_paged_kv_cache(
+                kv_cache.kv["k_pe"],
+                kv_cache.block_table,
+                kv[..., kv_lora_rank:],
+                seq_len_delta.old.lens_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+            assert kv_cache.kv["kv_lora"].ndim == 3  # (num_blocks, block_size, dim)
+            assert kv_cache.kv["k_pe"].ndim == 3  # (num_blocks, block_size, dim)
+            k_pe_cache = kv_cache.kv["k_pe"]
+            kv_c_cache = kv_cache.kv["kv_lora"]
+            PAGE_SIZE = kv_cache.kv["kv_lora"].size(1)
+        else:
+            raise ValueError(
+                f'For MLA, the KV cache should either have a "kv_lora_k_pe" tensor '
+                f'or both "kv_lora" and "k_pe" tensors, but we got {list(kv_cache.kv.keys())}'
+            )
 
         o = torch.zeros(
             B,
@@ -319,12 +372,6 @@ class TritonAttnBackend(RefAttnBackend):
             dtype=torch.float32,
             device=q_nope.device,
         )
-
-        assert kv_cache.kv["kv_lora_k_pe"].ndim == 3  # (num_blocks, block_size, dim)
-        kv_c_and_k_pe_cache = kv_cache.kv["kv_lora_k_pe"]
-        k_pe_cache = kv_c_and_k_pe_cache[..., kv_lora_rank:]
-        kv_c_cache = kv_c_and_k_pe_cache[..., :kv_lora_rank]
-        PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
 
         if softmax_scale is None:
             assert self.qk_nope_head_dim is not None

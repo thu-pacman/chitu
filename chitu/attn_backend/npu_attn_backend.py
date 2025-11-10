@@ -5,6 +5,7 @@
 from typing import Optional
 from typing_extensions import override
 import math
+from logging import getLogger
 
 import einops
 import torch
@@ -35,6 +36,9 @@ core_num_each_platform = {
     "Ascend910B4-1": 40,
     "Ascend910B4": 40,
 }
+
+
+logger = getLogger(__name__)
 
 
 class NpuAttnBackend(RefAttnBackend):
@@ -496,14 +500,48 @@ class NpuAttnBackend(RefAttnBackend):
             assert self.qk_nope_head_dim is not None
             softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
 
-        append_to_paged_kv_cache(
-            kv_cache.kv["kv_lora_k_pe"],
-            kv_cache.block_table,
-            kv,
-            seq_len_delta.old.lens_tensor_device,
-            get_page_ids=kv_cache.get_page_ids,
-            get_offs_in_page=kv_cache.get_offs_in_page,
-        )
+        if "kv_lora_k_pe" in kv_cache.kv:
+            append_to_paged_kv_cache(
+                kv_cache.kv["kv_lora_k_pe"],
+                kv_cache.block_table,
+                kv,
+                seq_len_delta.old.lens_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+            kv_lora_k_pe = kv_cache.kv["kv_lora_k_pe"]
+        elif "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv:
+            # TODO: Support `warning_once` in the logger and use it here
+            logger.warning(
+                '"kv_lora"-and-"k_pe"-separated KV cache is insuffcient for '
+                "NpuAttnBackend.mla_decode_paged_kv from MLA to MQA, due to an additional `torch.cat` "
+                'operation. It is recommended to use "kv_lora_k_pe"-holistic KV cache instead.'
+            )
+            append_to_paged_kv_cache(
+                kv_cache.kv["kv_lora"],
+                kv_cache.block_table,
+                kv[..., :kv_lora_rank],
+                seq_len_delta.old.lens_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+            append_to_paged_kv_cache(
+                kv_cache.kv["k_pe"],
+                kv_cache.block_table,
+                kv[..., kv_lora_rank:],
+                seq_len_delta.old.lens_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+            kv_lora_k_pe = torch.cat(
+                [kv_cache.kv["kv_lora"], kv_cache.kv["k_pe"]], dim=-1
+            )
+        else:
+            raise ValueError(
+                f'For MLA, the KV cache should either have a "kv_lora_k_pe" tensor '
+                f'or both "kv_lora" and "k_pe" tensors, but we got {list(kv_cache.kv.keys())}'
+            )
+
         # kv_cache[indices, positions] = kv.squeeze(1) if kv.ndim == 3 and kv.shape[1] == 1 else kv
 
         # torch_npu._npu_reshape_and_cache_siso(key=kv_cache.kv["kv_lora_k_pe"],
@@ -516,7 +554,7 @@ class NpuAttnBackend(RefAttnBackend):
         )
         torch_npu._npu_paged_attention_mla(
             query=query,
-            key_cache=kv_cache.kv["kv_lora_k_pe"].unsqueeze(2),
+            key_cache=kv_lora_k_pe.unsqueeze(2),
             num_kv_heads=1,
             num_heads=local_n_heads,
             scale_value=softmax_scale,
