@@ -22,7 +22,6 @@ from chitu.global_vars import (
     set_quant_variables,
     set_backend_variables,
 )
-from chitu.ops import response_append
 from chitu.scheduler import Scheduler
 from chitu.task import (
     PackedTasks,
@@ -754,9 +753,6 @@ def chitu_run_pp_dp():
 
     unwait_batches, tokens = _update_ongoing_tasks_dp()
     for token, tasks in zip(tokens, unwait_batches):
-        if tasks.should_apply_frequency_penalty:
-            response_append(tasks, tokens, impl="auto")
-
         if token.numel() == 1:
             token_list = [int(token.item())]
         else:

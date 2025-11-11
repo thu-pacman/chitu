@@ -556,10 +556,6 @@ class ExpertDataDispatcher(TasksDispatcher):
         if tokens.numel() == 0 and not self.is_main_rank:
             return
 
-        # update local response
-        if tasks.should_apply_frequency_penalty:
-            response_append(tasks, tokens, impl="auto")
-
         if self.is_main_rank:
             tasks = DPTaskCollector.get_total_packedtasks()
             tokens = torch.cat(gather_list, dim=0)
@@ -820,8 +816,6 @@ class Executor:
             last_tokens_tensor = torch.tensor(
                 last_tokens, dtype=torch.int64, device=self.local_rank
             )
-            if tasks.should_apply_frequency_penalty:
-                response_append(tasks, last_tokens_tensor, impl="auto")
             for task in tasks.output_tasks:
                 if len(task._last_tokens) > 0:
                     task.update_response_no_sync(task._last_tokens[0])
@@ -1244,44 +1238,50 @@ class Executor:
             task.wait(handle)
 
     def sample(self, logits: torch.Tensor, tasks: PackedTasks):
-        # logits is [num_tasks, vocab_size]
-
-        # preprocess: apply frequency penalty
-        if tasks.should_apply_frequency_penalty:
-            logits_index_list = []
-            response_list = []
-            response_len_list = []
-            for it, task in enumerate(tasks.output_tasks):
-                if (
-                    task.req.params.frequency_penalty > 0
-                    and task.task_type == TaskType.Decode
-                    and len(task.response) > 0
-                ):
-                    logits_index_list.append(it)
-                    response_list.append(task.response)
-                    response_len_list.append(len(task.response))
-            logits_index_list = DeviceList(
-                logits_index_list, dtype=torch.int64, device=logits.device
-            )
-            response_len_list = DeviceList(
-                response_len_list, dtype=torch.int64, device=logits.device
-            )
-            apply_frequency_penalty(
-                logits,
-                logits_index_list,
-                response_list,
-                response_len_list,
-                tasks.frequency_penalties,
-                impl="auto",
-            )
+        logits = logits.view(-1, logits.shape[-1]).contiguous()
+        assert (
+            len(tasks.output_tasks) == logits.shape[0]
+        ), f"logits has shape {logits.shape}, but there are {len(tasks.output_tasks)} output_tasks"
+        # logits is now [num_tasks, vocab_size]
 
         if tasks.is_all_greedy:
             tokens = torch.argmax(logits, dim=-1)
         else:
+            if tasks.should_apply_frequency_penalty:
+                logits_index_list = []
+                response_list = []
+                response_len_list = []
+                for it, task in enumerate(tasks.output_tasks):
+                    if (
+                        task.params.frequency_penalty > 0
+                        and task.task_type == TaskType.Decode
+                        and len(task.response) > 0
+                    ):
+                        logits_index_list.append(it)
+                        response_list.append(task.response)
+                        response_len_list.append(len(task.response))
+                logits_index_list = DeviceList(
+                    logits_index_list, dtype=torch.int64, device=logits.device
+                )
+                response_len_list = DeviceList(
+                    response_len_list, dtype=torch.int64, device=logits.device
+                )
+                apply_frequency_penalty(
+                    logits,
+                    logits_index_list,
+                    response_list,
+                    response_len_list,
+                    tasks.frequency_penalties,
+                    impl="auto",
+                )
+
             logits = logits / tasks.temperatures.view(-1, 1)
             tokens = top_k_top_p_min_p_sampling_from_logits(
                 logits, tasks.top_ks, tasks.top_ps
             )
+
+            if tasks.should_apply_frequency_penalty:
+                response_append(tasks, tokens)
 
         return tokens
 
@@ -1313,9 +1313,6 @@ class Executor:
                 task.token_idxs = batch_token_idxs[idx]
 
         # --- dependent on tokens ---
-        if tasks.should_apply_frequency_penalty:
-            response_append(tasks, tokens, impl="auto")
-
         if tokens.numel() == 1:
             token_list = [tokens if keep_device else int(tokens.item())]
         else:
