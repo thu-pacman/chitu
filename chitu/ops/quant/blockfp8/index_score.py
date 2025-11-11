@@ -69,8 +69,9 @@ def blockfp8_index_score_dense_dsv32_torch(
     output = logits_sum * k_s.view(b, 1, n)  # bmn
 
     if causal:
-        # NOTE: No need to set to -inf, because index score >= 0
-        output *= torch.ones(m, n, dtype=output.dtype, device=output.device).tril_()
+        # Mask future positions to -inf so topk won't select them
+        causal_mask = torch.ones(m, n, dtype=torch.bool, device=output.device).tril_()
+        output = output.masked_fill(~causal_mask, float("-inf"))
 
     return output.to(torch.get_default_dtype())
 
@@ -115,14 +116,16 @@ def blockfp8_index_score_ragged_q_dense_k_dsv32_torch(
     k_seq_ids = seq_len_delta.new.seq_ids_tensor_device
     k_pos_ids = seq_len_delta.new.position_ids_tensor_device
 
-    b, _, _ = k.shape
-    m = seq_len_delta.new.max_len
+    b, n, _ = k.shape
+    # Graph-safety: use static m equal to K length (typically static_max_n)
+    m = n
 
     q_dense = torch.zeros(b, m, *q.shape[1:], dtype=q.dtype, device=q.device)
     q_s_dense = torch.zeros(b, m, *q_s.shape[1:], dtype=q_s.dtype, device=q_s.device)
     q_dense[q_seq_ids, q_pos_ids] = q
     q_s_dense[q_seq_ids, q_pos_ids] = q_s
 
+    # Keep only valid K positions; others remain zero and will be masked to -inf later
     k_filtered = torch.zeros_like(k)
     k_s_filtered = torch.zeros_like(k_s)
     k_filtered[k_seq_ids, k_pos_ids] = k[k_seq_ids, k_pos_ids]
@@ -131,6 +134,12 @@ def blockfp8_index_score_ragged_q_dense_k_dsv32_torch(
     score_dense = blockfp8_index_score_dense_dsv32(
         q_dense, q_s_dense, k_filtered, k_s_filtered, causal=causal
     )
+
+    # Prevent selecting invalid (not-yet-written) K positions under topk
+    valid_mask = torch.zeros(b, n, dtype=torch.bool, device=k.device)
+    valid_mask[k_seq_ids, k_pos_ids] = True
+    score_dense = score_dense.masked_fill(~valid_mask.unsqueeze(1), float("-inf"))
+
     return score_dense[q_seq_ids, q_pos_ids]
 
 

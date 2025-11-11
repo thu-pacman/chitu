@@ -212,8 +212,10 @@ class BatchedSeqLen:
         # Example: seq_ids = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2]
 
         # Get prefix lengths for each position's sequence
-        # Use index_select instead of indexing
-        prefix_lens = torch.index_select(self.prefix_lens_tensor_device, 0, seq_ids)
+        # NOTE: index_select requires Long indices on CUDA; cast to long for indexing only
+        prefix_lens = torch.index_select(
+            self.prefix_lens_tensor_device, 0, seq_ids.to(torch.long)
+        )
         # Example: prefix_lens = [0, 0, 0, 3, 3, 3, 3, 3, 8, 8]
 
         # Calculate relative position within each sequence
@@ -459,7 +461,10 @@ class BatchedSeqLenDelta:
         )
         # Example: seq_ids = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2]
 
-        old_lens = torch.index_select(self.old.lens_tensor_device, 0, seq_ids)
+        # NOTE: index_select requires Long indices on CUDA; cast to long for indexing only
+        old_lens = torch.index_select(
+            self.old.lens_tensor_device, 0, seq_ids.to(torch.long)
+        )
         # Example: old_lens = [10, 10, 10, 20, 20, 20, 20, 20, 30, 30]
 
         prefix_with_zero = torch.cat(
@@ -468,7 +473,7 @@ class BatchedSeqLenDelta:
                 prefix_delta_lens[:-1],
             ]
         )
-        prefix_deltas = torch.index_select(prefix_with_zero, 0, seq_ids)
+        prefix_deltas = torch.index_select(prefix_with_zero, 0, seq_ids.to(torch.long))
         # Example: prefix_deltas = [0, 0, 0, 3, 3, 3, 3, 3, 8, 8]
 
         x = old_lens + (positions - prefix_deltas)
