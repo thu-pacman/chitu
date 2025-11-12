@@ -121,7 +121,9 @@ class Indexer(torch.nn.Module):
         self.n_heads: int = args.index_n_heads
         self.head_dim: int = args.index_head_dim
         self.rope_head_dim: int = args.qk_rope_head_dim
-        self.index_topk: int = args.index_topk
+        # Adjust index_topk not exceed max_seq_len max_seq_len to avoid out-of-range errors
+        max_seq_len = get_global_args().infer.max_seq_len
+        self.index_topk: int = min(args.index_topk, max_seq_len)
         self.q_lora_rank: int = args.q_lora_rank
         self.wq_b = LocalLinear(
             self.q_lora_rank,
@@ -230,9 +232,10 @@ class Indexer(torch.nn.Module):
         else:
             raise NotImplementedError()
 
-        _, topk_indices = index_score.topk(
-            min(self.index_topk, seq_len_delta.new.max_len), dim=-1
-        )  # shape: [bs_seq_q, topk(seq_k)]. May select some out-of-range items as -inf, which is fine
+        # Ensure k does not exceed the actual size of index_score
+        k = min(self.index_topk, index_score.size(-1))
+        _, topk_indices = index_score.topk(k, dim=-1)
+        # shape: [bs_seq_q, k]. May select some out-of-range items as -inf, which is fine
         return topk_indices
 
     def _rotate_activation(self, x: torch.Tensor) -> torch.Tensor:

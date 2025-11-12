@@ -43,9 +43,10 @@ infer:
   moe:
     prefill_token_dispatcher: auto # one of: auto, tp, allgather, deepep-nl
     decode_token_dispatcher: auto # one of: auto, tp, allgather, deepep-ll
-request:
-  prompt_tokens_len: -1 # use for perf test in single_req_test.py, -1 means use real requests.
+request: # for testing in single_req_test.py, NOT affecting the real serving
+  prompt_tokens_len: -1 # use for performance testing, -1 means use real requests.
   max_new_tokens: 128
+  frequency_penalty: 0.0
 scheduler:
   type: "request_preset,prefill_first"  # Ordered comma separated list of scheduler types among: "fcfs", "request_preset",
                                         # "prefill_first", "stride", "deadline", "prefix_align"

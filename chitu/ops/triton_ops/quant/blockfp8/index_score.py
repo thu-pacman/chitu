@@ -108,8 +108,10 @@ def blockfp8_index_score_dense_dsv32_triton(
     b, m, h, d = q.shape
     n = k.shape[1]
 
-    # Initialize output tensor
-    o = torch.zeros((b, m, n), dtype=torch.get_default_dtype(), device="cuda")
+    # Initialize output tensor to -inf so unwritten positions won't be selected by topk
+    o = torch.full(
+        (b, m, n), float("-inf"), dtype=torch.get_default_dtype(), device="cuda"
+    )
 
     # Kernel configuration
     BLOCK_N = 128
@@ -249,7 +251,9 @@ def blockfp8_index_score_ragged_q_dense_k_dsv32_triton(
     n = k.shape[1]
 
     # Initialize output tensor
-    o = torch.zeros((bm, n), dtype=torch.get_default_dtype(), device="cuda")
+    o = torch.full(
+        (bm, n), float("-inf"), dtype=torch.get_default_dtype(), device="cuda"
+    )
 
     # Kernel configuration
     BLOCK_N = 128
@@ -401,7 +405,9 @@ def blockfp8_index_score_ragged_q_paged_k_dsv32_triton(
     n = static_max_n
 
     # Initialize output tensor
-    o = torch.zeros((bm, n), dtype=torch.get_default_dtype(), device="cuda")
+    o = torch.full(
+        (bm, n), float("-inf"), dtype=torch.get_default_dtype(), device="cuda"
+    )
 
     # Kernel configuration
     BLOCK_N = min(page_size, 128)

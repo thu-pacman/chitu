@@ -50,7 +50,7 @@ def gen_debug_req_id(len=8):
     return req_id
 
 
-def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens):
+def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens, frequency_penalty):
     from chitu.backend import Backend
 
     def generate_prompt(token_length, tkn):
@@ -65,12 +65,17 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens):
     reqs: list[UserRequest] = []
     for i in range(num_reqs):
         msg = generate_prompt(prompt_len - 1, Backend.tokenizer)
-        req = UserRequest(msg, f"{gen_req_id()}", max_new_tokens=max_new_tokens)
+        req = UserRequest(
+            msg,
+            f"{gen_req_id()}",
+            max_new_tokens=max_new_tokens,
+            frequency_penalty=frequency_penalty,
+        )
         reqs.append(req)
     return reqs
 
 
-def gen_reqs_real(num_reqs, max_new_tokens, is_vl=False):
+def gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
     reqs: list[UserRequest] = []
     for i in range(num_reqs):
         if is_vl:
@@ -78,6 +83,7 @@ def gen_reqs_real(num_reqs, max_new_tokens, is_vl=False):
                 msgs_vl[i % len(msgs_vl)],
                 f"{gen_req_id()}",
                 max_new_tokens=max_new_tokens,
+                frequency_penalty=frequency_penalty,
                 temperature=1,
             )
         else:
@@ -85,20 +91,24 @@ def gen_reqs_real(num_reqs, max_new_tokens, is_vl=False):
                 msgs[i % len(msgs)],
                 f"{gen_req_id()}",
                 max_new_tokens=max_new_tokens,
+                frequency_penalty=frequency_penalty,
                 temperature=1,
             )
         reqs.append(req)
     return reqs
 
 
-def gen_reqs(num_reqs, max_new_tokens, is_vl=False):
+def gen_reqs(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
     global local_args
     if local_args.request.prompt_tokens_len > 0:
         return gen_reqs_fake(
-            num_reqs, local_args.request.prompt_tokens_len, max_new_tokens
+            num_reqs,
+            local_args.request.prompt_tokens_len,
+            max_new_tokens,
+            frequency_penalty,
         )
     else:
-        return gen_reqs_real(num_reqs, max_new_tokens, is_vl)
+        return gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty, is_vl)
 
 
 def run_pipe_or_tensor_parallelism(args, timers):
@@ -111,6 +121,7 @@ def run_pipe_or_tensor_parallelism(args, timers):
             reqs = gen_reqs(
                 num_reqs=args.infer.max_reqs,
                 max_new_tokens=args.request.max_new_tokens,
+                frequency_penalty=args.request.frequency_penalty,
                 is_vl=hasattr(args.models, "vision_config"),
             )
             for req in reqs:
@@ -150,6 +161,7 @@ def run_normal(args, timers):
         reqs = gen_reqs(
             num_reqs=args.infer.max_reqs,
             max_new_tokens=args.request.max_new_tokens,
+            frequency_penalty=args.request.frequency_penalty,
             is_vl=hasattr(args.models, "vision_config"),
         )
         for req in reqs:

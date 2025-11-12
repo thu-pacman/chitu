@@ -60,6 +60,7 @@ class InferConfig:
 class RequestConfig:
     prompt_tokens_len: int = MISSING
     max_new_tokens: int = MISSING
+    frequency_penalty: float = MISSING
 
 
 @dataclass
