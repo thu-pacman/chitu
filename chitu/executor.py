@@ -282,6 +282,10 @@ class PipeDispatcher(TasksDispatcher):
         if self.dp_size > 1 and self.is_last_stage:
             self.epilogue_dp(tasks, payload)
         else:
+            # Skip sending if payload is empty (no output tokens in chunked prefill)
+            if self.is_last_stage and payload.shape[0] == 0:
+                return
+
             # logits / hidden payload
             torch.distributed.isend(
                 tensor=payload.contiguous(),  # contiguous() is necessary for NCCL
@@ -1222,8 +1226,17 @@ class Executor:
         return self.dummy_logits
 
     def _recv_logits(self, tasks: PackedTasks):
+        num_output = (
+            sum(tasks.has_outputs)
+            if hasattr(tasks, "has_outputs")
+            else len(tasks.output_tasks)
+        )
+        # Skip receiving if no output tokens (e.g., intermediate chunk in chunked prefill)
+        if num_output == 0:
+            return
+
         logits = torch.empty(
-            [len(tasks.output_tasks), Backend.model.vocab_size],
+            [num_output, Backend.model.vocab_size],
             device=self.local_rank,
             dtype=torch.float,
         )
