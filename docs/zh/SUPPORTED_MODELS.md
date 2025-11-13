@@ -160,6 +160,8 @@
   用法: 启动赤兔时追加 `models=Qwen3-32B-fp4` 启动参数
 - Qwen3-32B-fp4-merged
   用法: 启动赤兔时追加 `models=Qwen3-32B-fp4-merged` 启动参数
+- Qwen3-32B-mixq-mix
+  用法: 启动赤兔时追加 `models=Qwen3-32B-mixq-mix` 启动参数
 - Qwen3-32B-w4-g128-symm-a8
   用法: 启动赤兔时追加 `models=Qwen3-32B-w4-g128-symm-a8` 启动参数
 - Qwen3-4B

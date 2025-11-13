@@ -7,7 +7,6 @@ from typing_extensions import override
 import math
 from logging import getLogger
 
-import einops
 import torch
 
 from chitu.attn_backend.ref_attn_backend import RefAttnBackend
@@ -196,16 +195,10 @@ class NpuAttnBackend(RefAttnBackend):
                 ],
                 dim=-1,
             )
-            repeated_k = einops.repeat(
-                k, "b h d -> b (h g) d", g=q.shape[1] // k.shape[1]
-            )
-            repeated_v = einops.repeat(
-                added_v, "b h d -> b (h g) d", g=q.shape[1] // added_v.shape[1]
-            )
             return torch_npu.npu_fusion_attention(
                 q,
-                repeated_k,
-                repeated_v,
+                k,
+                added_v,
                 head_num,
                 pse=None,
                 atten_mask=atten_mask_npu,
