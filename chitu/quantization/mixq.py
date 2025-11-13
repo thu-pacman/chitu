@@ -73,7 +73,7 @@ class MixQLinear(QuantizedLinearBase):
             torch.zeros((self.fp_features_num), dtype=torch.int32), requires_grad=False
         )
         self.weight_scale = torch.nn.Parameter(
-            torch.ones([self.out_features], dtype=torch.get_default_dtype()),
+            torch.ones([self.out_features], dtype=torch.float32),
             requires_grad=False,
         )
         if has_bias:
@@ -95,8 +95,7 @@ class MixQLinear(QuantizedLinearBase):
             self.weight_scale,
             self.fp_weight,
             self.fp_features_num,
-            self.fp_idx if not self.use_hygon else self.outliers_idx_grouped,
-            None if not self.use_hygon else self.outliers_idx_start,
+            self.fp_idx,
             self.w_bits,
             self.a_bits,
             impl="hygon" if self.use_hygon else "triton",
@@ -107,15 +106,15 @@ class MixQLinear(QuantizedLinearBase):
 
 
 class HygonMixQLinear(
-    enable_native_layout_weight("weight", HygonMixQIntTileTensor),
+    enable_native_layout_weight(
+        "weight",
+        HygonMixQIntTileTensor,
+        weight_bits=lambda m: m.w_bits,
+    ),
     enable_native_layout_weight(
         "fp_weight",
         HygonMixQFp16TileTensor,
         allow_missing=True,
-        perm_index=lambda m: m.find_indices(
-            m.fp_idx,
-            m.outliers_idx_grouped[:-1],
-        ),
     ),
     MixQLinear,
 ):
@@ -151,21 +150,6 @@ class HygonMixQLinear(
             torch.zeros((self.process_block_size + 1,), dtype=torch.int32),
             requires_grad=False,
         )
-
-        def _prune_fp_idx(module, incompatible_keys):
-            if hasattr(module, "fp_idx"):
-                delattr(module, "fp_idx")
-
-        self.register_load_state_dict_post_hook(_prune_fp_idx)
-
-    def find_indices(self, A, B):
-        indices = torch.full_like(B, -1, dtype=torch.long)
-        for i, b in enumerate(B):
-            mask = A == b
-            if mask.any():
-                indices[i] = torch.where(mask)[0][0]
-
-        return indices
 
 
 if has_hygon:

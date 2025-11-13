@@ -727,7 +727,9 @@ class HygonMixQIntTileTensor(NativeLayoutTensor):
     @classmethod
     @override
     @plum.dispatch
-    def convert_from(cls, tensor: torch.Tensor):
+    def convert_from(
+        cls, tensor: torch.Tensor, *, weight_bits: int
+    ):  # weights_bits for debug more easy
         assert has_hygon, "Hygon/Sugon kernels are unavailable."
         assert hasattr(
             hygon_mixq_kernels, "native_layout_of_weights_tile_int"
@@ -765,11 +767,8 @@ class HygonMixQFp16TileTensor(NativeLayoutTensor):
         ), "Kernel 'native_layout_of_weights_tile_fp16' not found."
 
         src = tensor.contiguous()
-        if perm_index is not None:
-            if perm_index.dtype != torch.long:
-                perm_index = perm_index.to(dtype=torch.long)
-            src = torch.index_select(src, dim=1, index=perm_index)
-
+        if tensor.numel() == 0:
+            return cls(plain_shape=tensor.shape, layout_tensor=tensor)
         layout_tensor = hygon_mixq_kernels.native_layout_of_weights_tile_fp16(src)
         return cls(plain_shape=tensor.shape, layout_tensor=layout_tensor)
 
