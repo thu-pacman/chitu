@@ -56,15 +56,20 @@ logger = getLogger(__name__)
 
 
 def init_logger(logging_level=logging.INFO):
+    setup_chitu_logging()
+
     base_name = __name__.split(".")[0]
     base_logger = getLogger(base_name)
     base_logger.setLevel(logging_level)
 
-    if not base_logger.hasHandlers():
-        handler = logging.StreamHandler()
-        base_logger.addHandler(handler)
+    if base_logger.handlers:
+        for handler in base_logger.handlers[:]:
+            base_logger.removeHandler(handler)
 
-    setup_chitu_logging()
+    root_logger = getLogger()
+    if root_logger.handlers:
+        for handler in root_logger.handlers:
+            base_logger.addHandler(handler)
 
 
 def init_cache_static():
