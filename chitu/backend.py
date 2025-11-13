@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Deque, Optional, Iterable
 import torch
 import torch.distributed as dist
+import torch.distributed.distributed_c10d as c10d
 from safetensors.torch import safe_open
 from tqdm import tqdm
 from chitu.attn_backend import (
@@ -933,6 +934,9 @@ class Backend:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         logger.info(
             f"rank {local_rank} Backend initialized with CUDA mem at {torch.cuda.memory_allocated()/1024**3:.2f} GB"
+        )
+        logger.info(
+            f"Using {len(c10d._pg_map)} communication gruops. If this number is too high, there may be too much memory reserved for underlying communication libraries."
         )
         return Backend
 

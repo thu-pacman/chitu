@@ -4,29 +4,74 @@
 
 import netifaces
 import socket
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Sequence, Any
 
 import torch
 from logging import getLogger
 
 logger = getLogger(__name__)
 
+_torch_group_dedup_dict_device: dict[tuple[tuple[int, ...], ...], list[Any]] = {}
+_torch_group_dedup_dict_host: dict[tuple[tuple[int, ...], ...], list[Any]] = {}
+
+
+class SingletonGroupPlaceholder:
+    pass
+
+
+def new_torch_group_dedup(
+    rank_lists: Sequence[Sequence[int]], is_device: bool
+) -> list[Any]:
+    """
+    Allocate torch.distributed groups uniquely, so as to reduce reserved
+    for communication backends
+    """
+
+    rank_tuples = tuple(tuple(rank_list) for rank_list in rank_lists)
+    if is_device:
+        if len(rank_lists) == 1:
+            return [torch.distributed.group.WORLD]
+        elif rank_tuples in _torch_group_dedup_dict_device:
+            groups = _torch_group_dedup_dict_device[rank_tuples]
+        else:
+            groups = [
+                (
+                    SingletonGroupPlaceholder()
+                    if len(rank_list) == 1
+                    else torch.distributed.new_group(rank_list)
+                )
+                for rank_list in rank_lists
+            ]
+            _torch_group_dedup_dict_device[rank_tuples] = groups
+    else:
+        if rank_tuples in _torch_group_dedup_dict_host:
+            groups = _torch_group_dedup_dict_host[rank_tuples]
+        else:
+            groups = [
+                (
+                    SingletonGroupPlaceholder()
+                    if len(rank_list) == 1
+                    else torch.distributed.new_group(rank_list, backend="gloo")
+                )
+                for rank_list in rank_lists
+            ]
+            _torch_group_dedup_dict_host[rank_tuples] = groups
+    return groups
+
 
 class CommGroup:
-    def __init__(self, rank_lists: list[list[int]], global_rank: int, local_rank: int):
+    def __init__(
+        self, rank_lists: Sequence[Sequence[int]], global_rank: int, local_rank: int
+    ):
         self.global_rank = global_rank
         self.local_rank = local_rank
 
         self.device = torch.device(f"cuda:{local_rank}")
 
-        cpu_groups = []
-        gpu_groups = []
+        gpu_groups = new_torch_group_dedup(rank_lists, is_device=True)
+        cpu_groups = new_torch_group_dedup(rank_lists, is_device=False)
         contains_this_rank = []
         for rank_list in rank_lists:
-            gpu_group = torch.distributed.new_group(rank_list)
-            cpu_group = torch.distributed.new_group(rank_list, backend="gloo")
-            cpu_groups.append(cpu_group)
-            gpu_groups.append(gpu_group)
             contains_this_rank.append(global_rank in rank_list)
 
         assert contains_this_rank.count(True) == 1
@@ -232,6 +277,9 @@ class CommGroup:
         Returns:
             List[Tuple[str, int, int]]: List of tuples of the form (IP, DP_port, PP_port)
         """
+
+        if self.group_size == 1:
+            return [("localhost", 0, 0)]
 
         try:
             ifaces = netifaces.interfaces()
