@@ -738,7 +738,6 @@ class TaskPool:
     @classmethod
     def remove(cls, task_id: str):
         assert task_id in cls.pool, "Task not found in pool"
-        logger.debug(f"finish {task_id}. cuda memory: {torch.cuda.memory_allocated()}")
         if (
             cls.pool[task_id].task_type == TaskType.Decode
             and cls.pool[task_id].req is not None
@@ -749,7 +748,6 @@ class TaskPool:
             cls.pool[task_id].req.async_stream.send_stop_signal()
             cls.pool[task_id].req.completed.set()
             cls.pool[task_id].req.completion_time = time.monotonic()
-            cls.pool[task_id].req.save_trace_to_json()
             TaskLoad.reduce(cls.pool[task_id].prefix_tokens_len)
         if PackedTasksBase.response_list_manager is not None:
             PackedTasksBase.response_list_manager.remove_list(
