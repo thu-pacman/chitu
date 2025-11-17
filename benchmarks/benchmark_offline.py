@@ -102,9 +102,9 @@ class ShareGPTDataset:
 
 
 def random_requests(args, num_reqs):
-    vocab_size = args.model.vocab_size
-    prompt_len = args.bench.prompt_len
-    max_new_tokens = args.bench.max_new_tokens
+    vocab_size = args.models.vocab_size
+    prompt_len = args.benchmark.input_len
+    max_new_tokens = args.benchmark.output_len
 
     reqs = []
     for _ in range(num_reqs):
@@ -154,7 +154,7 @@ def run_benchmark(args, timers, is_main_rank, rank):
         profiler_dir = os.path.join(profiler_dir, f"profiler_{time_str}")
         os.makedirs(profiler_dir, exist_ok=True)
         profiler = try_get_profiler(
-            profiler_dir, warmup=1, active=1, repeat=0, with_stack=with_stack
+            profiler_dir, warmup=1, active=1, repeat=1, with_stack=with_stack
         )
         profiler.start()
 
@@ -199,7 +199,7 @@ def run_benchmark(args, timers, is_main_rank, rank):
 
 def adjust_benchmark_args(args):
     if args.benchmark.profile_dir is not None:
-        args.benchmark.output_len = 5  # only decode 10 tokens for profiling
+        args.benchmark.output_len = 5  # only decode 5 tokens for profiling
         num_reqs_list = args.benchmark.num_reqs_list
         if len(num_reqs_list) > 1:
             args.benchmark.num_reqs_list = num_reqs_list[-1:]

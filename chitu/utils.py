@@ -572,7 +572,7 @@ def try_get_profiler(
     wait: int = 0,
     warmup: int = 0,
     active: int = 1000,
-    repeat: int = 0,
+    repeat: int = 1,
     with_stack: bool = False,
 ):
     if has_torch_npu:
@@ -581,5 +581,23 @@ def try_get_profiler(
         return try_get_npu_profiler(
             profiler_dir, wait, warmup, active, repeat, with_stack
         )
-    else:  # TODO add nvidia profiler
-        raise NotImplementedError("Not supported yet")
+    else:
+        return torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=wait, warmup=warmup, active=active, repeat=repeat
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                dir_name=profiler_dir,
+                worker_name=f"rank_{torch.distributed.get_rank()}",
+                use_gzip=True,
+            ),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=with_stack,
+            with_modules=False,
+            with_flops=False,
+        )
