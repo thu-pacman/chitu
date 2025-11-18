@@ -29,25 +29,27 @@ from diffusers.models.attention_processor import (
     AttnAddedKVProcessor,
     AttnProcessor,
 )
-from diffusers.models.embeddings import (
-    GaussianFourierProjection,
-    ImageHintTimeEmbedding,
-    ImageProjection,
-    ImageTimeEmbedding,
-    PositionNet,
-    TextImageProjection,
-    TextImageTimeEmbedding,
-    TextTimeEmbedding,
-    TimestepEmbedding,
-    Timesteps,
-)
+
+# from diffusers.models.embeddings import (
+#     GaussianFourierProjection,
+#     ImageHintTimeEmbedding,
+#     ImageProjection,
+#     ImageTimeEmbedding,
+#     PositionNet,
+#     TextImageProjection,
+#     TextImageTimeEmbedding,
+#     TextTimeEmbedding,
+#     TimestepEmbedding,
+#     Timesteps,
+# )
 from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.unet_2d_blocks import (
-    UNetMidBlock2DCrossAttn,
-    UNetMidBlock2DSimpleCrossAttn,
-    get_down_block,
-    get_up_block,
-)
+
+# from diffusers.models.unet_2d_blocks import (
+#     UNetMidBlock2DCrossAttn,
+#     UNetMidBlock2DSimpleCrossAttn,
+#     get_down_block,
+#     get_up_block,
+# )
 from diffusers.models.unet_2d_condition import (
     UNet2DConditionModel,
     UNet2DConditionOutput,
@@ -299,9 +301,9 @@ def run_body(
             # For t2i-adapter CrossAttnDownBlock2D
             additional_residuals = {}
             if is_adapter and len(down_block_additional_residuals) > 0:
-                additional_residuals[
-                    "additional_residuals"
-                ] = down_block_additional_residuals.pop(0)
+                additional_residuals["additional_residuals"] = (
+                    down_block_additional_residuals.pop(0)
+                )
 
             sample, res_samples = downsample_block(
                 hidden_states=sample,
@@ -435,22 +437,29 @@ def build_unet_input(b=2, h=32, w=32, *, name: str):
         raise RuntimeError(f"Unknown model name {name}")
 
 
-def build_unet(name: str, dtype=torch.float16):
-    with torch.device("cpu"):
-        if name == "sdxl":
-            model = UNet2DConditionModel.from_pretrained(
-                "stabilityai/stable-diffusion-xl-base-1.0",
-                subfolder="unet",
-                variant="fp16",
-            )
-        elif name == "sd15":
-            model = UNet2DConditionModel.from_pretrained(
-                "runwayml/stable-diffusion-v1-5",
-                torch_dtype=torch.float16,
-                subfolder="unet",
-                variant="fp16",
-            )
-        else:
-            raise RuntimeError(f"Unknown model name {name}")
+def build_unet(name: str, dtype=torch.float16, pretained_weight=True):
+    if pretained_weight:
+        with torch.device("cpu"):
+            if name == "sdxl":
+                model = UNet2DConditionModel.from_pretrained(
+                    "stabilityai/stable-diffusion-xl-base-1.0",
+                    subfolder="unet",
+                    variant="fp16",
+                )
+            elif name == "sd15":
+                model = UNet2DConditionModel.from_pretrained(
+                    "runwayml/stable-diffusion-v1-5",
+                    torch_dtype=torch.float16,
+                    subfolder="unet",
+                    variant="fp16",
+                )
+            else:
+                raise RuntimeError(f"Unknown model name {name}")
+    else:
+        # config =  AutoConfig.from_pretrained('..config.json', local_files_only=True)
+        model = UNet2DConditionModel.from_config(
+            pretrained_model_name_or_path="/home/zly/.cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/blobs/c8714c90f0e2409156da42781954416cb7df36af"
+        )
+
     model = model.eval().cuda().type(dtype)
     return model

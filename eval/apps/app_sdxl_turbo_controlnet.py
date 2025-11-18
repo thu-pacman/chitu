@@ -244,11 +244,11 @@ def infer(
 def run(mode: str, model_name: str, shapes, batches) -> float:
     image = load_image(
         # "/home/zly/Works/uniserving/exp/diffusers/weights/EasternGraySquirrel_GAm.jpg"
-        "/home/zly/Works/uniserving/exp/diffusers/weights/eastern-gray-squirrel-closeup.jpg"
+        "/home/wucz/Katz/assets/demo_image_depth.png"
     )
     lora_path = [
         # None,
-        "/home/zly/Works/uniserving/exp/weight/lora-sdxl_turbo-the_Vidiot_Teletext_Style.safetensors",
+        "/home/wucz/models/weights/sd_xl_turbo_lora_v1.safetensors",
     ]
     image = np.array(image)
     image = cv2.Canny(image, 100, 200)
@@ -385,8 +385,8 @@ if __name__ == "__main__":
     torch.backends.cudnn.allow_tf32 = True
     # for mode in ["debug", "torch", "sfast", "ours"]:
     # for mode in ["sfast", "ours"]:
-    # for mode in ["ours"]:
-    for mode in ["sfast"]:
+    # for mode in []:
+    for mode in ["sfast","ours"]:
         # for shapes in [[[256, 256]], [[512, 512]], [[1024, 1024]]]:
         for shapes in [[[512, 512]]]:
             # for batches in [[1]]:

@@ -2,7 +2,7 @@ import pytest
 import torch
 import torchperf
 import uniserve
-from diffusers.models.transformer_2d import BasicTransformerBlock, Transformer2DModel
+from diffusers.models.transformers.transformer_2d import BasicTransformerBlock, Transformer2DModel
 from uniserve.models import RaggedTransformerBlock_nhwc
 
 

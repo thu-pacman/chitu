@@ -762,9 +762,11 @@ def parse_args():
 
 def download_image(url):
     original_image = (
-        lambda image_url_or_path: load_image(image_url_or_path)
-        if urlparse(image_url_or_path).scheme
-        else PIL.Image.open(image_url_or_path).convert("RGB")
+        lambda image_url_or_path: (
+            load_image(image_url_or_path)
+            if urlparse(image_url_or_path).scheme
+            else PIL.Image.open(image_url_or_path).convert("RGB")
+        )
     )(url)
     return original_image
 
@@ -855,9 +857,11 @@ def main():
         variant="fp16",
     )
     unet = UNetSpatioTemporalConditionControlNetModel.from_pretrained(
-        args.pretrained_model_name_or_path
-        if args.pretrain_unet is None
-        else args.pretrain_unet,
+        (
+            args.pretrained_model_name_or_path
+            if args.pretrain_unet is None
+            else args.pretrain_unet
+        ),
         subfolder="unet",
         low_cpu_mem_usage=True,
         variant="fp16",

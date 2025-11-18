@@ -1,7 +1,7 @@
 [project]
 name = "uniserve"
 version = "0.0.1"
-dependencies = []
+dependencies = ["fire"]
 
 [tool.setuptools]
 packages = ["uniserve"]

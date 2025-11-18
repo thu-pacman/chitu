@@ -222,7 +222,7 @@ def analyze(fn: str):
 if __name__ == "__main__":
     args = parser.parse_args()
     data = []
-    models = [args.model] # if args.model != "all" else ["sd15", "sdxl"]
+    models = [args.model]  # if args.model != "all" else ["sd15", "sdxl"]
     compiles = [args.compile]
     batches = [1, 2, 4, 8, 16]
     shapes = [

@@ -19,7 +19,7 @@ import torchperf
 from torchperf.utils import shapes_to_tensors, tensors_to_shapes
 from diffusers import DiffusionPipeline, StableDiffusionXLPipeline
 from diffusers import UNet2DConditionModel
-from diffusers.models.transformer_2d import BasicTransformerBlock, Transformer2DModel
+from diffusers.models.transformers.transformer_2d import BasicTransformerBlock, Transformer2DModel
 from diffusers.models.resnet import (
     ResnetBlock2D,
     LoRACompatibleConv,

@@ -6,3 +6,4 @@ from .rag import (
 )
 
 from .debugger import Debugger
+from .consistency import ConsistencyProp
