@@ -64,6 +64,7 @@ from chitu.quantization import (
     QuantizationRegistry,
     get_quant_from_checkpoint_prefix,
     get_layer_id_from_checkpoint_prefix,
+    get_quant_kwargs_from_checkpoint_prefix,
 )
 from chitu.quantization.normal import (
     NormalLinear,
@@ -76,10 +77,20 @@ from chitu.tensor_parallel import (
     RowParallelLinear,
     VocabParallelEmbedding,
 )
+from chitu.moe.batched_routed_activation import IndexedBatchedRoutedActivation
 from chitu.distributed.parallel_state import get_tp_size, get_ep_size
 from chitu.utils import parse_dtype, try_import_and_setup_torch_npu
 from chitu.lazy import eval_lazy
+from chitu.device_type import is_muxi
+from chitu.distributed.parallel_state import (
+    get_tp_group,
+    get_tp_size,
+    get_ep_size,
+)
+from chitu.batched_seq_len import BatchedSeqLenDeltaView
 
+from chitu.task import  TaskType
+#from chitu.two_batch_overlap import model_forward_tbo
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 logger = getLogger(__name__)
@@ -579,10 +590,26 @@ class AttentionDeepSeekV3(Attention):
             raise NotImplementedError(
                 f"MLA absorb mode {self.mla_absorb} not supported"
             )
-
-    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
+    def prepare_decoding_attn_tbo(self,seq_len_delta:BatchedSeqLenDelta):
+            block_table = self.cache.get_gpu_block_table()
+            block_size = self.cache.get_block_size()
+            self.attn_backend.prepare_metadata_for_decode(
+                seq_len_delta,
+                block_table,
+                block_size,
+            )        
+    
+    def op_core(self, state):
+        #如何传递一个正确的seq_len_delta
+        seq_len_delta = BatchedSeqLenDeltaView(self.cache.seq_len_delta, state.tbo_subbatch_index, state.tbo_split_seq_index, state.tbo_split_token_index)
+        if seq_len_delta.is_classic_decoding and state.layer_id == get_global_args().models.n_dense_layers:
+            self.prepare_decoding_attn_tbo(seq_len_delta)
+        state.hidden_states_after_attn = self.forward(x=state.pop("hidden_states_after_layernorm"), freqs_cis=state.freqs_cis, seq_len_delta=seq_len_delta)
+        
+    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, seq_len_delta:Optional[BatchedSeqLenDelta] = None):
         bs_seq, _ = x.size()
-
+        if seq_len_delta == None:
+            seq_len_delta = self.cache.seq_len_delta
         if self.mla_absorb == "none":
             q, k, v, qr = self._run_linear(x, freqs_cis)
             if self.index_topk is not None:
@@ -590,7 +617,7 @@ class AttentionDeepSeekV3(Attention):
                 topk_indices = self.indexer(
                     x,
                     qr,
-                    self.cache.seq_len_delta,
+                    seq_len_delta,
                     freqs_cis,
                     is_causal=True,
                     cache_accessor=self.indexer_cache.get_accessor(self.layer_id),
@@ -602,7 +629,7 @@ class AttentionDeepSeekV3(Attention):
                 self.cache.get_accessor(self.layer_id),
                 k,
                 v,
-                seq_len_delta=self.cache.seq_len_delta,
+                seq_len_delta=seq_len_delta,
                 causal=True,
                 softmax_scale=self.softmax_scale,
             )
@@ -614,7 +641,7 @@ class AttentionDeepSeekV3(Attention):
                 topk_indices = self.indexer(
                     x,
                     qr,
-                    self.cache.seq_len_delta,
+                    seq_len_delta,
                     freqs_cis,
                     is_causal=True,
                     cache_accessor=self.indexer_cache.get_accessor(self.layer_id),
@@ -626,7 +653,7 @@ class AttentionDeepSeekV3(Attention):
                 q_pe,
                 self.cache.get_accessor(self.layer_id),
                 kv,
-                seq_len_delta=self.cache.seq_len_delta,
+                seq_len_delta=seq_len_delta,
                 causal=True,
                 softmax_scale=self.softmax_scale,
                 topk_indices=topk_indices,
@@ -639,7 +666,9 @@ class AttentionDeepSeekV3(Attention):
             raise NotImplementedError(
                 f"MLA absorb mode {self.mla_absorb} not supported"
             )
-
+ 
+        
+            
         return self.o_proj(x.flatten(-2)).view(bs_seq, -1)
 
 
@@ -867,8 +896,91 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
             layer_id=layer_id,
             checkpoint_prefix=checkpoint_prefix,
         )
+        
+    def op_prepare(self, state):
+        #self.forward_prepare(state.pop("hidden_states_after_post_attention_layernorm"))
+        x = state.pop("hidden_states_after_post_attention_layernorm")
+        x = x.view(-1, x.shape[-1])
+        
+        weights, indices = self.gate(x)
+        indices = (
+            self.expert_mapping[indices] if self.expert_mapping is not None else indices
+        )
+        routed_x = IndexedBatchedRoutedActivation(x, indices)
+        x_in_use_simultenously = False
+        if self.shared_experts is not None:
+            if not is_muxi():
+                self.shared_experts_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.shared_experts_stream):
+                    shared_y = self.shared_experts(x)
+                    x_in_use_simultenously = True
+            else:
+                shared_y = self.shared_experts(x)
+                x_in_use_simultenously = False
 
+        experts_impl = "auto"
+        state.update(
+            dict(
+                shape=x.shape,
+                weights=weights,
+                routed_x=routed_x,
+                x_in_use_simultenously=x_in_use_simultenously,
+                shared_y=shared_y,
+                experts_impl=experts_impl,
+            )
+        )
+    def op_dispatch(self, state):
+        experts_impl = state.pop("experts_impl")
+        routed_x =  state.pop("routed_x")
+        weights = state.pop("weights")
 
+        x_in_use_simultenously = state.pop("x_in_use_simultenously")
+        if self.moe_impl is not None:
+            experts_impl = self.moe_impl.get_experts_impl()
+            routed_x, weights = self.moe_impl.token_permutation(
+                routed_x,
+                weights,
+                tbo_subbatch_index = state.tbo_subbatch_index,
+                may_fuse_quant=get_quant_from_checkpoint_prefix(
+                    f"{self.checkpoint_prefix}.experts"
+                ),
+                may_fuse_quant_kwargs=get_quant_kwargs_from_checkpoint_prefix(
+                    f"{self.checkpoint_prefix}.experts"
+                ),
+            )
+            x_in_use_simultenously = False
+            state.update(
+                dict(
+                    weights=weights,
+                    routed_x= routed_x,
+                    x_in_use_simultenously=x_in_use_simultenously,
+                    experts_impl = experts_impl,
+                )
+            )
+    def op_experts(self, state):
+        y = self.experts(
+            state.pop("routed_x"), state.pop("weights"), inplace=not state.pop("x_in_use_simultenously"), impl=state.pop("experts_impl")
+        )
+        state.y = y
+        
+    def op_combine(self, state):
+        shared_y = state.pop("shared_y")
+        y = state.pop("y")
+        if self.is_tp_mode:
+            if shared_y is not None:
+                if not is_muxi():
+                    torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
+                y += shared_y
+            if not self.moe_impl:
+                torch.distributed.all_reduce(y, group=get_tp_group().gpu_group)
+
+        if self.moe_impl is not None:
+            y = self.moe_impl.token_unpermutation(y, tbo_subbatch_index = state.tbo_subbatch_index)
+        if shared_y is not None and not self.is_tp_mode:
+            if not is_muxi():
+                torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
+            y += shared_y
+        state.hidden_states_after_mlp =  y.view(state.pop("shape")) 
 class TransformerBlockDeepSeekV3(TransformerBlock):
     def __init__(
         self,
@@ -942,7 +1054,62 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                 else None
             ),
         )
-
+    
+    def op_input_layernorm(
+        self,
+        state,
+        freqs_cis: BatchedFreqsCis,
+        hidden_states: torch.Tensor,
+        tbo_split_seq_index:int,
+        tbo_split_token_index: int,
+        tbo_subbatch_index: int,
+        layer_id:int
+    ):
+        state.residual = hidden_states
+        state.hidden_states_after_layernorm = self.input_layernorm(hidden_states, compute_dtype=hidden_states.dtype)
+        state.update(
+            dict(
+                freqs_cis=freqs_cis,
+                tbo_split_seq_index = tbo_split_seq_index,
+                tbo_split_token_index=tbo_split_token_index,
+                tbo_subbatch_index=tbo_subbatch_index,
+                layer_id=layer_id,
+            )
+        )
+        
+    def op_res_after_atten(self, state):
+        state.hidden_states_after_atten_res = state.pop("hidden_states_after_attn") + state.residual
+        state.pop("residual")
+        state.residual = state.hidden_states_after_atten_res
+    
+    def op_post_attention_layernorm(self, state):
+        
+        state.hidden_states_after_post_attention_layernorm = self.post_attention_layernorm(
+            state.hidden_states_after_atten_res, compute_dtype=state.pop("hidden_states_after_atten_res").dtype
+        )
+        
+    def op_res_after_mlp(self, state):
+        hidden_states = state.pop("hidden_states_after_mlp") + state.pop("residual")
+        output = dict(
+            freqs_cis=state.freqs_cis,
+            hidden_states=hidden_states,
+            tbo_split_seq_index=state.tbo_split_seq_index,
+            tbo_split_token_index=state.tbo_split_token_index,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+            layer_id=state.layer_id + 1,
+        )
+        state.clear(
+            expect_keys={
+                "freqs_cis",
+                "tbo_split_token_index",
+                "tbo_split_seq_index",
+                "tbo_subbatch_index",
+                "layer_id",
+            }
+        )
+        return output
+        
+        
     def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
         x = x + self.self_attn(
             self.input_layernorm(x, compute_dtype=x.dtype), freqs_cis
@@ -965,7 +1132,7 @@ class TransformerDeepSeekV3(Transformer):
         op_impl: str,
         mla_absorb: str,
         indexer_cache: Optional[KVCacheManagerBase] = None,
-    ):
+    ):  
         self.mla_absorb = mla_absorb
         self.indexer_cache = indexer_cache
         super().__init__(
@@ -1006,7 +1173,67 @@ class TransformerDeepSeekV3(Transformer):
     @override
     def _get_layer_i_prefixes(self, i: int) -> list[str]:
         return [f"layers.{i}."]
-
+    
+    @override
+    @torch.inference_mode()
+    def prefill_no_pipeline(
+        self, tokens, output_token_offsets: torch.Tensor, **args
+    ) -> torch.Tensor:
+        self.n_dense_layers = get_global_args().models.n_dense_layers
+        freqs_cis = self.prepare_freqs_cis()
+        h = self._pre_layers(tokens, **args)
+        normal_start_layer = 0
+        normal_end_layer = len(self.layers) 
+        end_layer = len(self.layers) 
+        if args['can_run_tbo']:
+            if (
+                self.n_dense_layers > normal_start_layer
+                and self.n_dense_layers < normal_end_layer
+            ):
+                normal_end_layer = self.n_dense_layers
+            elif self.n_dense_layers < normal_start_layer:
+                normal_end_layer = normal_start_layer = 0
+        for i in range(normal_start_layer, normal_end_layer):
+            layer= self.layers[i]
+            h = layer(h, freqs_cis)
+        if normal_end_layer != end_layer:
+            from chitu.two_batch_overlap import model_forward_tbo
+            h = model_forward_tbo(self.layers[normal_end_layer : end_layer],
+                                  freqs_cis, h, args['tbo_split_token_index'], 
+                                  args['tbo_split_seq_index'], TaskType.Prefill)
+        h = h[output_token_offsets]
+        h = self._post_layers(h)
+        h = h.float()
+        return h
+        
+    @override
+    @torch.inference_mode()
+    def decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis,**args):
+        h = self._pre_layers(tokens)
+        normal_start_layer = 0
+        normal_end_layer = len(self.layers) 
+        end_layer = len(self.layers) 
+        if args['can_run_tbo']:
+            if (
+                self.n_dense_layers > normal_start_layer
+                and self.n_dense_layers < normal_end_layer
+            ):
+                normal_end_layer = self.n_dense_layers
+            elif self.n_dense_layers < normal_start_layer:
+                 normal_end_layer = normal_start_layer = 0
+        for i in range(normal_start_layer, normal_end_layer):
+            layer= self.layers[i]
+            h = layer(h, freqs_cis)
+        if normal_end_layer !=end_layer:
+            from chitu.two_batch_overlap import model_forward_tbo
+            
+            h = model_forward_tbo(self.layers[normal_end_layer : end_layer],
+                                  freqs_cis, h, args['tbo_split_token_index'], 
+                                  args['tbo_split_seq_index'], TaskType.Decode)
+        h = self._post_layers(h)
+        h = h.float()
+        return h
+    
     @override
     def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
         fuse_shared_experts = get_global_args().infer.fuse_shared_experts

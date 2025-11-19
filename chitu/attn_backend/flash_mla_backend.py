@@ -77,7 +77,8 @@ class FlashMLABackend(TritonAttnBackend):
                 kv_cache.kv["kv_lora_k_pe"],
                 kv_cache.block_table,
                 kv,
-                seq_len_delta.old.lens_tensor_device,
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
                 get_page_ids=kv_cache.get_page_ids,
                 get_offs_in_page=kv_cache.get_offs_in_page,
             )
@@ -93,7 +94,8 @@ class FlashMLABackend(TritonAttnBackend):
                 kv_cache.kv["kv_lora"],
                 kv_cache.block_table,
                 kv[..., :kv_lora_rank],
-                seq_len_delta.old.lens_tensor_device,
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
                 get_page_ids=kv_cache.get_page_ids,
                 get_offs_in_page=kv_cache.get_offs_in_page,
             )
@@ -101,7 +103,8 @@ class FlashMLABackend(TritonAttnBackend):
                 kv_cache.kv["k_pe"],
                 kv_cache.block_table,
                 kv[..., kv_lora_rank:],
-                seq_len_delta.old.lens_tensor_device,
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
                 get_page_ids=kv_cache.get_page_ids,
                 get_offs_in_page=kv_cache.get_offs_in_page,
             )
@@ -121,6 +124,9 @@ class FlashMLABackend(TritonAttnBackend):
             if topk_indices is not None
             else None
         )
+        seq_slice = seq_len_delta.seq_slice  
+        block_table_view = kv_cache.block_table[seq_slice]
+        
         if indices is not None:
             output, _ = flash_mla.flash_mla_with_kvcache(
                 q_nope_pe,
@@ -139,7 +145,7 @@ class FlashMLABackend(TritonAttnBackend):
             output, _ = flash_mla.flash_mla_with_kvcache(
                 q_nope_pe,
                 kv_lora_k_pe.unsqueeze(2),
-                kv_cache.block_table,
+                block_table_view,
                 seq_len_delta.new.lens_tensor_device,
                 512,  # dv
                 self.metadata.get(),

@@ -46,7 +46,7 @@ from chitu.utils import top_k_top_p_min_p_sampling_from_logits
 from chitu.ops import apply_frequency_penalty, response_append
 from chitu.device_list import DeviceList
 from chitu.device_type import is_ascend
-
+from chitu.two_batch_overlap import TboPackedTasksPreparer
 logger = getLogger(__name__)
 
 # Although tags are not fully supported in the NCCL backend, they are helpful to understand the code
@@ -939,8 +939,8 @@ class Executor:
         # payload recv
         for dispatcher in self.task_dispatchers:
             payload = dispatcher.recv_payload(payload)
-
         self.timers("prefill").start()
+        TboPackedTasksPreparer.prepare(tasks)
         out = Backend.model.prefill(
             payload,
             self._get_output_token_offsets(tasks),
@@ -950,6 +950,9 @@ class Executor:
             grid_thw=self.vision_tensor_broadcast(
                 getattr(tasks, "grid_thw", None), 2, torch.int64, stack=False
             ),
+            can_run_tbo = tasks.can_run_tbo,
+            tbo_split_seq_index = tasks.tbo_split_seq_index,
+            tbo_split_token_index  = tasks.tbo_split_token_index
         )
         self.timers("prefill").stop()
 
@@ -1121,7 +1124,9 @@ class Executor:
         return out
 
     def decode_step(self, tasks: PackedTasksBase):
+        #logger.info(f"decode type of tasks:{type(tasks)}")
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
+        
         if get_global_args().models.type == "hf-qwen3-next":
             Backend.linear_attn_cache_manager.prepare_cache_decode(tasks.req_ids)
         if (
@@ -1155,9 +1160,13 @@ class Executor:
         # payload recv
         for dispatcher in self.task_dispatchers:
             payload = dispatcher.recv_payload(payload)
-
+        TboPackedTasksPreparer.prepare(tasks)
         self.timers("decode").start()
-        out = Backend.model.decode(payload, len(tasks.req_ids))
+        out = Backend.model.decode(payload, 
+                                   len(tasks.req_ids),
+                                   can_run_tbo = tasks.can_run_tbo ,
+                                tbo_split_seq_index = tasks.tbo_split_seq_index,
+            tbo_split_token_index  = tasks.tbo_split_token_index)
         self.timers("decode").stop()
         # check output shape
 
@@ -1184,7 +1193,6 @@ class Executor:
         This function is used to skip the attention computation and execute only the MoE logic
         during Expert parallelism.
         """
-
         for dispatcher in self.task_dispatchers:
             payload = dispatcher.recv_payload(self.dummy_logits)
 

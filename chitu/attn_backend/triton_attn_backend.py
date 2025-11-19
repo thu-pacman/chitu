@@ -304,7 +304,8 @@ class TritonAttnBackend(RefAttnBackend):
                 kv_cache.kv["kv_lora_k_pe"],
                 kv_cache.block_table,
                 kv,
-                seq_len_delta.old.lens_tensor_device,
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
                 get_page_ids=kv_cache.get_page_ids,
                 get_offs_in_page=kv_cache.get_offs_in_page,
             )
@@ -319,7 +320,8 @@ class TritonAttnBackend(RefAttnBackend):
                 kv_cache.kv["kv_lora"],
                 kv_cache.block_table,
                 kv[..., :kv_lora_rank],
-                seq_len_delta.old.lens_tensor_device,
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
                 get_page_ids=kv_cache.get_page_ids,
                 get_offs_in_page=kv_cache.get_offs_in_page,
             )
@@ -327,7 +329,8 @@ class TritonAttnBackend(RefAttnBackend):
                 kv_cache.kv["k_pe"],
                 kv_cache.block_table,
                 kv[..., kv_lora_rank:],
-                seq_len_delta.old.lens_tensor_device,
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
                 get_page_ids=kv_cache.get_page_ids,
                 get_offs_in_page=kv_cache.get_offs_in_page,
             )
@@ -527,7 +530,8 @@ class TritonAttnBackend(RefAttnBackend):
                 kv_cache.k,
                 kv_cache.block_table,
                 k.contiguous(),
-                seq_len_delta.old.lens_tensor_device,
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
                 get_page_ids=kv_cache.get_page_ids,
                 get_offs_in_page=kv_cache.get_offs_in_page,
             )
@@ -535,7 +539,8 @@ class TritonAttnBackend(RefAttnBackend):
                 kv_cache.v,
                 kv_cache.block_table,
                 v.contiguous(),
-                seq_len_delta.old.lens_tensor_device,
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
                 get_page_ids=kv_cache.get_page_ids,
                 get_offs_in_page=kv_cache.get_offs_in_page,
             )

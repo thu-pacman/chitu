@@ -94,7 +94,10 @@ outputs/*
 test/outputs/*
 dumps/*
 log/*
-
+script/benchmark_logs/*
+script/outputs/*
+csrc/cuda/marlin/*.cu
+script/log/*
 # Vim
 .*.swp
 

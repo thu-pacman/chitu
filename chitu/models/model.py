@@ -818,7 +818,7 @@ class Transformer(nn.Module):
         )
 
     @torch.inference_mode()
-    def decode(self, tokens, batch_size):
+    def decode(self, tokens, batch_size, **args):
         if isinstance(self.cache, DenseKVCacheManager):
             key = (batch_size, self.cache.get_start_and_end_idx()[0])
         elif isinstance(self.cache, PagedKVCacheManager):
@@ -872,7 +872,7 @@ class Transformer(nn.Module):
                 if self.pipeline_exec:
                     return self.decode_pipeline(tokens, freqs_cis)
                 else:
-                    return self.decode_no_pipeline(tokens, freqs_cis)
+                    return self.decode_no_pipeline(tokens, freqs_cis, **args)
 
             self.do_decode_callable = do_decode
 

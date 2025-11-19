@@ -87,7 +87,7 @@ def append_to_dense_kv_cache_triton(
     num_tokens = this_kv.shape[0]
     assert delta_position_ids.shape[0] == num_tokens
     if delta_seq_ids is not None:
-        assert delta_seq_ids.shape[0] == num_tokens
+        assert delta_seq_ids.shape[0] == num_tokens, f"num_tokens: {num_tokens}, delta_position_ids.shape: {delta_position_ids.shape}"
 
     tot_len_of_other_dims = this_kv.numel() // num_tokens
     assert (

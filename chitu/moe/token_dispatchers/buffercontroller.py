@@ -87,7 +87,10 @@ class DeepEPBuffer:
         return cls._buffer
 
     # SPDX-SnippetEnd
-
+    @classmethod
+    def get_buffer_num_sms(cls):
+        return cls._buffer.num_sms
+    
     @classmethod
     def clean_buffer(cls):
         if not cls._buffer.low_latency_mode:

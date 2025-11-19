@@ -5,7 +5,7 @@
 from dataclasses import dataclass
 import functools
 import torch
-
+from typing import Union
 
 @dataclass
 class BatchedFreqsCis:
@@ -19,7 +19,6 @@ class BatchedFreqsCis:
 
     cos: torch.Tensor
     sin: torch.Tensor
-
     @functools.cached_property
     def separatedly_doubled_cos(self):
         return torch.cat([self.cos, self.cos], dim=-1)
@@ -35,3 +34,8 @@ class BatchedFreqsCis:
     @functools.cached_property
     def interleavedly_doubled_sin(self):
         return torch.stack([self.sin, self.sin], dim=-1).flatten(-2)
+    
+    def __getitem__(self, index: Union[int, slice, torch.Tensor]) -> 'BatchedFreqsCis':
+        sliced_cos = self.cos[index]
+        sliced_sin = self.sin[index]
+        return BatchedFreqsCis(cos=sliced_cos, sin=sliced_sin)

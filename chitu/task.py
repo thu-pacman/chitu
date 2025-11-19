@@ -1011,7 +1011,11 @@ class PackedTasks(PackedTasksBase):
                 self.grid_thw.append(task.grid_thw)
 
         self.payload_type = SerializedPackedTasksPayloadType(self.task_type.value)
-
+        self.tbo_split_seq_index = None
+        self.tbo_parent_token_range = None
+        self.tbo_children = None
+        self.can_run_tbo = False
+        self.tbo_split_token_index = None
         # additional modifications are required when adapting to MTP or Hybrid.
         # also need to be handle in deserialize
         self.num_tokens = (

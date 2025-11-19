@@ -10,7 +10,9 @@ import torch
 from chitu.static_tensor import StaticTensor
 from chitu.cuda_graph import cuda_graph_safe_cached_property
 from chitu.utils import invalidate_cached_property
-
+import logging
+from logging import getLogger
+logger = getLogger(__name__)
 
 class BatchedSeqLen:
     """
@@ -199,7 +201,7 @@ class BatchedSeqLen:
         static_tensor_name="_position_ids_static_tensor_device",
         up_to_date_flag_name="_position_ids_tensor_device_up_to_date",
         enable_flag_name="cache_position_ids_tensor_device",
-    )
+    )  
     def position_ids_tensor_device(self) -> torch.Tensor:
         # Example: lens = [3, 5, 2], total_len = 10
 
@@ -252,6 +254,70 @@ class BatchedSeqLen:
     @functools.cached_property
     def total_len(self) -> int:
         return int(self.lens_tensor_cpu.sum())
+
+
+class BatchedSeqLenView(BatchedSeqLen):
+    def __init__(
+        self,parent: BatchedSeqLen, token_slice: slice, seq_slice:slice
+    ) -> None:
+        self.parent = parent
+        self.token_slice = token_slice
+        self.seq_slice = seq_slice
+        self.lens_list = parent.lens_list[self.seq_slice]
+        self.device = parent.device
+        self.lens_static_tensor_device = StaticTensor(
+            torch.tensor(self.lens_list, device=self.device, dtype=torch.int32),
+            max_nelem=len(self.lens_list),
+        )
+    def __getattribute__(self, name):
+        try:
+            return object.__getattribute__(self, name)
+        except AttributeError:
+            parent = object.__getattribute__(self, '_parent')
+            return getattr(parent, name)
+
+    @functools.cached_property
+    def lens_tensor_cpu(self) -> torch.Tensor:
+        return torch.tensor(self.lens_list, device="cpu", dtype=torch.int32)
+    
+    @property
+    def lens_tensor_device(self) -> torch.Tensor:
+        return self.lens_static_tensor_device.get()
+
+    @functools.cached_property
+    def prefix_lens_list(self) -> list[int]:
+        return list(itertools.accumulate(self.lens_list, initial=0))
+
+    @property
+    def prefix_lens_tensor_device(self) -> torch.Tensor:
+        return torch.cat(
+            [
+                torch.zeros((1,), device=self.device, dtype=torch.int32),
+                torch.cumsum(self.lens_tensor_device, dim=0, dtype=torch.int32),
+            ],
+            dim=0,
+        )
+
+    @property
+    def position_ids_tensor_device(self) -> torch.Tensor:
+        return self.parent.position_ids_tensor_device[self.token_slice]
+
+    @property
+    def seq_ids_tensor_device(self) -> torch.Tensor:
+        return self.parent.seq_ids_tensor_device[self.token_slice]
+
+    @functools.cached_property
+    def batch_size(self) -> int:
+        return len(self.lens_list)
+
+    @functools.cached_property
+    def max_len(self) -> int:
+        return int(self.lens_tensor_cpu.max())
+
+    @functools.cached_property
+    def total_len(self) -> int:
+        return int(self.lens_tensor_cpu.sum())
+
 
 
 class BatchedSeqLenDelta:
@@ -313,7 +379,8 @@ class BatchedSeqLenDelta:
         cache_delta_seq_ids_tensor_device: bool = True,
     ):
         self.device = device
-
+        self.seq_slice = slice(None) 
+        self.token_slice = slice(None) 
         self.old = BatchedSeqLen(
             old_len_list,
             device=device,
@@ -490,3 +557,100 @@ class BatchedSeqLenDelta:
             return torch.arange(self.batch_size, device=self.device, dtype=torch.int32)
         else:
             return self._delta.seq_ids_tensor_device
+
+class BatchedSeqLenDeltaView(BatchedSeqLenDelta):
+    def __init__(self, parent: BatchedSeqLenDelta, tbo_subbatch_index: int, tbo_split_seq_index: int, tbo_split_token_index: int):
+        self.parent = parent
+        self.tbo_subbatch_index = tbo_subbatch_index
+        self.tbo_split_seq_index = tbo_split_seq_index
+        self.tbo_split_token_index = tbo_split_token_index
+        
+        if tbo_subbatch_index == 0:
+            self.token_slice = slice(0, tbo_split_token_index)
+            self.seq_slice = slice(0, tbo_split_seq_index)
+        else:    
+            self.token_slice = slice(tbo_split_token_index, None)
+            self.seq_slice = slice(tbo_split_seq_index, None)
+        
+        self.device = self.parent.device
+        self.old = BatchedSeqLenView(self.parent.old, self.token_slice, self.seq_slice)
+        self.new = BatchedSeqLenView(self.parent.new, self.token_slice, self.seq_slice)
+        self._delta = BatchedSeqLenView(self.parent._delta, self.token_slice, self.seq_slice)
+        
+        self.is_classic_decoding = self.parent.is_classic_decoding
+
+    def __getattribute__(self, name):
+        try:
+            return object.__getattribute__(self, name)
+        except AttributeError:
+            parent = object.__getattribute__(self, '_parent')
+            return getattr(parent, name)
+
+
+    @property
+    def batch_size(self):
+        ret = self.old.batch_size
+        assert self.new.batch_size == ret
+        return ret
+
+    @property
+    def delta_total_len(self):
+        if self.is_classic_decoding:
+            return self.batch_size
+        else:
+            return self._delta.total_len
+
+    @property
+    def delta_max_len(self):
+        if self.is_classic_decoding:
+            return 1
+        else:
+            return self._delta.max_len
+    #如何设计来正确访问 kv cache
+    @property
+    def delta_lens_list(self):
+        if self.is_classic_decoding:
+            return [1] * self.batch_size
+        else:
+            return self._delta.lens_list
+
+    @property
+    def delta_lens_tensor_device(self):
+        if self.is_classic_decoding:
+            return torch.ones(self.batch_size, device=self.device, dtype=torch.int32)
+        else:
+            return self._delta.lens_tensor_device
+    @property
+    def delta_prefix_lens_list(self):
+        return self.parent.delta_prefix_lens_list[self.seq_slice]
+        if self.is_classic_decoding:
+            return list(range(self.batch_size + 1))
+        else:
+            return self._delta.prefix_lens_list
+
+    @property
+    def delta_prefix_lens_tensor_device(self):
+        if self.is_classic_decoding:
+            return torch.arange(
+                self.batch_size + 1, device=self.device, dtype=torch.int32
+            )
+        else:
+            return self._delta.prefix_lens_tensor_device
+
+
+    @property
+    def _delta_position_ids_tensor_device_impl(self):
+        return self.parent._delta_position_ids_tensor_device_impl[self.token_slice]
+    
+    @property
+    def delta_position_ids_tensor_device(self):
+        # NOTE: delta_position_ids is NOT _delta.position_ids
+        if self.is_classic_decoding:
+            return self.old.lens_tensor_device
+        else:
+            return self._delta_position_ids_tensor_device_impl
+
+
+    @property
+    def delta_seq_ids_tensor_device(self):
+        return self.parent.delta_seq_ids_tensor_device[self.token_slice]

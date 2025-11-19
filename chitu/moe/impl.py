@@ -93,6 +93,7 @@ class MoEImpl:
 
     def _init_token_dispatcher(self):
         # impl selection
+        from chitu.two_batch_overlap import MaybeTboDeepEPDispatcher
         if self.prefill_token_dispatcher_impl == "auto":
             if self.dp_size > 1 and has_deep_ep:
                 self.prefill_token_dispatcher_impl = "deepep-nl"
@@ -121,7 +122,7 @@ class MoEImpl:
 
         # impl initialization
         if self.prefill_token_dispatcher_impl == "deepep-nl":
-            self.prefill_token_dispatcher = MoENormalTokenDispatcher(
+            self.prefill_token_dispatcher = MaybeTboDeepEPDispatcher(
                 self.num_experts,
                 self.hidden_dim,
                 mode=(
@@ -129,6 +130,7 @@ class MoEImpl:
                     if self.decode_token_dispatcher_impl == "deepep-ll"
                     else "deepep-normal"
                 ),
+                deepep_dispatcher_type = "normal",
             )
             self.prefill_experts_impl = "ep_group_gemm_contiguous"
         elif (
@@ -144,8 +146,9 @@ class MoEImpl:
             )
 
         if self.decode_token_dispatcher_impl == "deepep-ll":
-            self.decode_token_dispatcher = MoELowLatencyTokenDispatcher(
-                self.num_experts, self.hidden_dim
+            self.decode_token_dispatcher = MaybeTboDeepEPDispatcher(
+                self.num_experts, self.hidden_dim,
+                deepep_dispatcher_type = "low_latency",
             )
             self.decode_experts_impl = "ep_group_gemm_masked"
         elif (
@@ -221,3 +224,10 @@ class MoEImpl:
         layer_id: int,
     ):
         return self.load_balancer[layer_id].get_expert_mapping(self.ep_rank)
+    
+    def is_deepep_enabled(self):
+        assert self.task_type is not None, "self.task_type is None"
+        if self.task_type in [TaskType.Prefill, TaskType.EmptyPrefill]:
+            return self.prefill_token_dispatcher_impl.startswith("deep")
+        elif self.task_type in [TaskType.Decode, TaskType.EmptyDecode]:
+            return self.decode_token_dispatcher_impl.startswith("deep")

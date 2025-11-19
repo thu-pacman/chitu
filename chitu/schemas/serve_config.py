@@ -47,7 +47,7 @@ class InferConfig:
     memory_utilization: float = MISSING
     prefill_chunk_size: Union[int, str, None] = MISSING
     expert_stats_path: Optional[str] = None
-
+    enable_two_batch_overlap: bool = MISSING
     @dataclass
     class MoEConfig:
         prefill_token_dispatcher: str = MISSING
