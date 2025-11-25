@@ -76,7 +76,7 @@ COPY --from=dependency_resolver /tmp/requirements.txt /tmp/requirements.txt
 # compile at install time, and the compile results are environment dependent.
 RUN --mount=type=bind,source=./third_party,target=./third_party,readwrite \
     --mount=type=bind,source=./csrc/cpuinfer,target=./csrc/cpuinfer,readwrite \
-    pip install --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec")
+    pip install --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "numpy" | grep -v "transformers" | grep -v "pytest")
 
 RUN mkdir -p /workspace/chitu/lib/nvshmem && \
     cd /tmp && \
@@ -110,7 +110,7 @@ FROM dependency_installer AS build
 
 COPY --from=wheel_builder /tmp/ /tmp/
 
-RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple /tmp/*.whl -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "flash-mla" | grep -v "flash_mla")
+RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple /tmp/*.whl -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "flash-mla" | grep -v "flash_mla" | grep -v "numpy" | grep -v "transformers" | grep -v "pytest")
 
 RUN rm -rf /tmp/*
 COPY ./test ./test
