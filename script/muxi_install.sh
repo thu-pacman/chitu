@@ -50,13 +50,13 @@ if [ "${enable_editable_install}" == "true" ]; then
         --no-build-isolation \
         -i https://pypi.tuna.tsinghua.edu.cn/simple \
         -e .${OPTIONAL_DEPS_SPECIFIER} \
-        -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "flash-mla" | grep -v "flash_mla")
+        -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "flash-mla" | grep -v "flash_mla" | grep -v "transformers" | grep -v "huggingface-hub" | grep -v "huggingface_hub" | grep -v "tokenizers")
 else
     pip install \
         --no-build-isolation \
         -i https://pypi.tuna.tsinghua.edu.cn/simple \
         .${OPTIONAL_DEPS_SPECIFIER} \
-        -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "flash-mla" | grep -v "flash_mla" | grep -v "pyzmq")
+        -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "flash-mla" | grep -v "flash_mla" | grep -v "pyzmq" | grep -v "transformers" | grep -v "huggingface-hub" | grep -v "huggingface_hub" | grep -v "tokenizers")
         rm -rf build chitu.egg-info
 
     # Remove the source code. We only need to run the installed package. Keep testings and scripts.
