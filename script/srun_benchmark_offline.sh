@@ -43,7 +43,7 @@ NODE=$(( (TP * PP * DP + 7) / 8 ))
 NUM_GPU_PER_NODE=$(( (TP * PP * DP) / NODE ))
 
 ADDITIONAL_ARGS=(
-    infer.use_cuda_graph=False
+    infer.use_cuda_graph=True
     infer.mla_absorb=absorb-without-precomp
     infer.moe.prefill_token_dispatcher=deepep-nl
     infer.moe.decode_token_dispatcher=deepep-ll

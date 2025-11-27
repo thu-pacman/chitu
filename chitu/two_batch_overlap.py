@@ -255,6 +255,12 @@ class TboPackedTasksPreparer:
             tbo_split_seq_index = 0
         
         can_run_tbo =  enable_deepep_moe and enable_two_batch_overlap and tbo_split_seq_index is not None
+        if enable_two_batch_overlap and not can_run_tbo:
+            if not enable_deepep_moe:
+                raise ValueError("TBO requires DeepEP to be enabled")
+            elif tbo_split_seq_index is None:
+                raise ValueError("TBO requires tbo_split_seq_index to be set")
+            
         if can_run_tbo:
             packed.tbo_split_seq_index = tbo_split_seq_index
             packed.can_run_tbo  = True
@@ -446,19 +452,10 @@ def _model_forward_filter_inputs(
     task_type: TaskType,
     tbo_subbatch_index: int,
 ) -> Dict:
-    
-    if task_type == TaskType.Prefill:
-        if tbo_split_seq_index == 0:
-            input_slice = slice(0, tbo_split_token_index) 
-        else:
-            input_slice = slice(tbo_split_token_index, None) 
-    elif task_type == TaskType.Decode:
-        if tbo_split_seq_index == 0:
-            input_slice = slice(0, tbo_split_token_index)
-        else:
-            input_slice = slice(tbo_split_token_index, None)
+    if tbo_subbatch_index == 0:
+        input_slice = slice(0, tbo_split_token_index) 
     else:
-        raise ValueError(f"Unsupported task type: {task_type}")
+        input_slice = slice(tbo_split_token_index, None) 
     
     # 返回过滤后的输入
     return {

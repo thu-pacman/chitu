@@ -9,7 +9,7 @@ from logging import getLogger
 import torch
 
 from chitu.attn_backend.triton_attn_backend import TritonAttnBackend
-from chitu.batched_seq_len import BatchedSeqLenDelta
+from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
 from chitu.static_tensor import StaticTensor
 from chitu.cache_manager import PagedKVCacheAccessor
 from chitu.ops import append_to_paged_kv_cache
@@ -30,6 +30,8 @@ class FlashMLABackend(TritonAttnBackend):
         self.local_n_heads = self.args.models.n_heads // self.args.infer.tp_size
         self.metadata = None
         self.num_splits = None
+        self.two_batch_metadata = None
+        self.two_batch_num_splits = None
 
     def prepare_metadata_for_decode(
         self,
@@ -37,6 +39,8 @@ class FlashMLABackend(TritonAttnBackend):
         block_table,
         block_size,
         softmax_scale=None,
+        two_batch_seq_len_delta: Optional[list[BatchedSeqLenDelta]] = None,
+        enable_two_batch_metadata: bool = False,
     ):
         max_batch_size = self.args.infer.max_reqs
         metadata, num_splits = flash_mla.get_mla_metadata(
@@ -54,6 +58,36 @@ class FlashMLABackend(TritonAttnBackend):
             )  # `num_splits`'s shape is always (batch_size + 1,)
         else:
             self.num_splits.set(num_splits)
+
+        if enable_two_batch_metadata and two_batch_seq_len_delta is not None:
+            two_batch_metadata_list = []
+            two_batch_num_splits_list = []
+
+            for i in range(2):
+                metadata_i, num_splits_i = flash_mla.get_mla_metadata(
+                    two_batch_seq_len_delta[i].new.lens_tensor_device,
+                    self.mtp_size * self.local_n_heads // self.kv_heads,
+                    self.kv_heads,
+                )
+                two_batch_metadata_list.append(metadata_i)
+                two_batch_num_splits_list.append(num_splits_i)
+
+            if self.two_batch_metadata is None:
+                self.two_batch_metadata = [
+                    StaticTensor(meta) for meta in two_batch_metadata_list
+                ]
+            else:
+                for i, meta in enumerate(two_batch_metadata_list):
+                    self.two_batch_metadata[i].set(meta)
+
+            if self.two_batch_num_splits is None:
+                self.two_batch_num_splits = [
+                    StaticTensor(num_split, max_nelem=(max_batch_size + 1) // 2 + 1)
+                    for num_split in two_batch_num_splits_list
+                ]
+            else:
+                for i, num_split in enumerate(two_batch_num_splits_list):
+                    self.two_batch_num_splits[i].set(num_split)
 
     @override
     def mla_decode_paged_kv(
@@ -124,9 +158,9 @@ class FlashMLABackend(TritonAttnBackend):
             if topk_indices is not None
             else None
         )
-        seq_slice = seq_len_delta.seq_slice  
+        seq_slice = seq_len_delta.seq_slice
         block_table_view = kv_cache.block_table[seq_slice]
-        
+
         if indices is not None:
             output, _ = flash_mla.flash_mla_with_kvcache(
                 q_nope_pe,
@@ -142,15 +176,28 @@ class FlashMLABackend(TritonAttnBackend):
             )
         else:
             # Don't pass `indices` here because it requires some new versions of FlashMLA
-            output, _ = flash_mla.flash_mla_with_kvcache(
-                q_nope_pe,
-                kv_lora_k_pe.unsqueeze(2),
-                block_table_view,
-                seq_len_delta.new.lens_tensor_device,
-                512,  # dv
-                self.metadata.get(),
-                self.num_splits.get(),
-                causal=(True if topk_indices is None else False),
-                softmax_scale=softmax_scale,
-            )
+            if seq_len_delta.tbo_subbatch_index is None:
+                output, _ = flash_mla.flash_mla_with_kvcache(
+                    q_nope_pe,
+                    kv_lora_k_pe.unsqueeze(2),
+                    block_table_view,
+                    seq_len_delta.new.lens_tensor_device,
+                    512,  # dv
+                    self.metadata.get(),
+                    self.num_splits.get(),
+                    causal=(True if topk_indices is None else False),
+                    softmax_scale=softmax_scale,
+                )
+            else:
+                output, _ = flash_mla.flash_mla_with_kvcache(
+                    q_nope_pe,
+                    kv_lora_k_pe.unsqueeze(2),
+                    block_table_view,
+                    seq_len_delta.new.lens_tensor_device,
+                    512,  # dv
+                    self.two_batch_metadata[seq_len_delta.tbo_subbatch_index].get(),
+                    self.two_batch_num_splits[seq_len_delta.tbo_subbatch_index].get(),
+                    causal=(True if topk_indices is None else False),
+                    softmax_scale=softmax_scale,
+                )
         return output.view(bsz, output.shape[-2], output.shape[-1])

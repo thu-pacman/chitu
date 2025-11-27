@@ -13,7 +13,11 @@ import functools
 from chitu.cuda_graph import cuda_graph_safe_cached_property
 from chitu.global_vars import get_slot_handle, get_timers, get_global_args
 from chitu.static_tensor import StaticTensor
-from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
+from chitu.batched_seq_len import (
+    BatchedSeqLen,
+    BatchedSeqLenDelta,
+    BatchedSeqLenDeltaView,
+)
 from chitu.utils import ceil_div
 
 logger = getLogger(__name__)
@@ -241,12 +245,39 @@ class KVCacheManagerBase:
             cache_delta_position_ids_tensor_device=True,
             cache_delta_seq_ids_tensor_device=True,
         )
-
+        if get_global_args().infer.enable_two_batch_overlap:
+            self.max_two_batch_size = (num_hot_req + 1) // 2
+            self.max_two_batch_total_delta_len = max(
+                (
+                    prefill_chunk_size
+                    if prefill_chunk_size is not None
+                    else self.max_two_batch_size * max_seq_len
+                ),  # prefill
+                self.max_two_batch_size,  # decode
+            )
+            self.two_batch_seq_len_delta = [
+                BatchedSeqLenDeltaView(
+                    parent=self.seq_len_delta,
+                    tbo_subbatch_index=i,
+                    tbo_split_seq_index=self.max_two_batch_size,
+                    tbo_split_token_index=max_seq_len * self.max_two_batch_size,
+                    max_batch_size=self.max_two_batch_size,
+                    max_total_len=max_seq_len * self.max_two_batch_size,
+                    max_total_delta_len=self.max_two_batch_total_delta_len,
+                )
+                for i in range(2)
+            ]
         self.curr_req_ids: Optional[list[str]] = None
 
         self.timers = get_timers()
 
-    def prepare_cache_prefill(self, req_ids: list[str], delta_seq_len: list[int]):
+    def prepare_cache_prefill(
+        self,
+        req_ids: list[str],
+        delta_seq_len: list[int],
+        tbo_split_seq_index: Optional[int] = None,
+        tbo_split_token_index: Optional[int] = None,
+    ):
         self.curr_req_ids = req_ids
 
         prev_seq_len = BatchedSeqLen(
@@ -267,6 +298,11 @@ class KVCacheManagerBase:
             cache_seq_ids_tensor_device=False,
         )
         self.seq_len_delta.copy_from(prev_seq_len, next_seq_len)
+        if get_global_args().infer.enable_two_batch_overlap:
+            for i in range(2):
+                self.two_batch_seq_len_delta[i].copy_from(
+                    self.seq_len_delta, tbo_split_seq_index, tbo_split_token_index
+                )
 
         for req_id, seq_len in zip(req_ids, next_seq_len.lens_list):
             self.req_id_to_seq_len[req_id] = seq_len
@@ -274,13 +310,23 @@ class KVCacheManagerBase:
     def finalize_cache_all_prefill(self):
         self.curr_req_ids = None
 
-    def prepare_cache_decode(self, req_ids: list[str]):
+    def prepare_cache_decode(
+        self,
+        req_ids: list[str],
+        tbo_split_seq_index: Optional[int] = None,
+        tbo_split_token_index: Optional[int] = None,
+    ):
         self.curr_req_ids = req_ids
 
         self.seq_len_delta.copy_from_list(
             [self.req_id_to_seq_len[req_id] for req_id in req_ids],
             [self.req_id_to_seq_len[req_id] + 1 for req_id in req_ids],
         )
+        if get_global_args().infer.enable_two_batch_overlap:
+            for i in range(2):
+                self.two_batch_seq_len_delta[i].copy_from_list(
+                    self.seq_len_delta, tbo_split_seq_index, tbo_split_token_index
+                )
 
         for req_id in req_ids:
             self.req_id_to_seq_len[req_id] += 1
@@ -491,8 +537,16 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self._offs_in_page_up_to_date = False
 
     @override
-    def prepare_cache_prefill(self, req_ids: list[str], delta_seq_len: list[int]):
-        super().prepare_cache_prefill(req_ids, delta_seq_len)
+    def prepare_cache_prefill(
+        self,
+        req_ids: list[str],
+        delta_seq_len: list[int],
+        tbo_split_seq_index: Optional[int] = None,
+        tbo_split_token_index: Optional[int] = None,
+    ):
+        super().prepare_cache_prefill(
+            req_ids, delta_seq_len, tbo_split_seq_index, tbo_split_token_index
+        )
 
         for req_id, new_seq_len in zip(req_ids, self.seq_len_delta.new.lens_list):
             if req_id not in self.block_table:
@@ -528,10 +582,17 @@ class PagedKVCacheManager(KVCacheManagerBase):
         return max(0, ceil_div(target_seq_len, self.block_size))
 
     @override
-    def prepare_cache_decode(self, req_ids: list[str]):
+    def prepare_cache_decode(
+        self,
+        req_ids: list[str],
+        tbo_split_seq_index: Optional[int] = None,
+        tbo_split_token_index: Optional[int] = None,
+    ):
         # Prepare enough block table for next decoding. When decoding, AttnBackend will fill new kv into
         # paged kv cache in place.
-        super().prepare_cache_decode(req_ids)
+        super().prepare_cache_decode(
+            req_ids, tbo_split_seq_index, tbo_split_token_index
+        )
         if not self.lazy_mode:
             for i, req_id in enumerate(req_ids):
                 num_additional_blocks = self.num_additional_blocks_req_need(
@@ -712,14 +773,22 @@ class DenseKVCacheManager(KVCacheManagerBase):
         return start_idx, end_idx
 
     @override
-    def prepare_cache_prefill(self, req_ids: list[str], delta_seq_len: list[int]):
-        super().prepare_cache_prefill(req_ids, delta_seq_len)
+    def prepare_cache_prefill(
+        self,
+        req_ids: list[str],
+        delta_seq_len: list[int],
+        tbo_split_seq_index: Optional[int] = None,
+        tbo_split_token_index: Optional[int] = None,
+    ):
+        super().prepare_cache_prefill(
+            req_ids, delta_seq_len, tbo_split_seq_index, tbo_split_token_index
+        )
 
         # get start_idx and end_idx of current slot_group
         start_idx, end_idx = self.get_start_and_end_idx()
 
         # Only allocate slots in current slot_group
-        slot_id = start_idx
+        slot_id = start_idxpython
         for it, req_id in enumerate(req_ids):
             if req_id not in self.req2slot:
                 allocated = False
@@ -738,9 +807,16 @@ class DenseKVCacheManager(KVCacheManagerBase):
         self._prepare_cache(req_ids, start_pos)
 
     @override
-    def prepare_cache_decode(self, req_ids: list[str]):
+    def prepare_cache_decode(
+        self,
+        req_ids: list[str],
+        tbo_split_seq_index: Optional[int] = None,
+        tbo_split_token_index: Optional[int] = None,
+    ):
         self.timers("cache_prepare").start()
-        super().prepare_cache_decode(req_ids)
+        super().prepare_cache_decode(
+            req_ids, tbo_split_seq_index, tbo_split_token_index
+        )
         start_pos = self.get_start_and_end_idx()[0]
         self._prepare_cache(req_ids, start_pos)
         self.timers("cache_prepare").stop()

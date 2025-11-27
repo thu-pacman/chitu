@@ -590,20 +590,9 @@ class AttentionDeepSeekV3(Attention):
             raise NotImplementedError(
                 f"MLA absorb mode {self.mla_absorb} not supported"
             )
-    def prepare_decoding_attn_tbo(self,seq_len_delta:BatchedSeqLenDelta):
-            block_table = self.cache.get_gpu_block_table()
-            block_size = self.cache.get_block_size()
-            self.attn_backend.prepare_metadata_for_decode(
-                seq_len_delta,
-                block_table,
-                block_size,
-            )        
     
     def op_core(self, state):
-        #如何传递一个正确的seq_len_delta
-        seq_len_delta = BatchedSeqLenDeltaView(self.cache.seq_len_delta, state.tbo_subbatch_index, state.tbo_split_seq_index, state.tbo_split_token_index)
-        if seq_len_delta.is_classic_decoding and state.layer_id == get_global_args().models.n_dense_layers:
-            self.prepare_decoding_attn_tbo(seq_len_delta)
+        seq_len_delta = self.cache.two_batch_seq_len_delta[state.tbo_subbatch_index]
         state.hidden_states_after_attn = self.forward(x=state.pop("hidden_states_after_layernorm"), freqs_cis=state.freqs_cis, seq_len_delta=seq_len_delta)
         
     def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, seq_len_delta:Optional[BatchedSeqLenDelta] = None):
@@ -910,10 +899,8 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
         x_in_use_simultenously = False
         if self.shared_experts is not None:
             if not is_muxi():
-                self.shared_experts_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self.shared_experts_stream):
-                    shared_y = self.shared_experts(x)
-                    x_in_use_simultenously = True
+                shared_y = self.shared_experts(x)
+                x_in_use_simultenously = True
             else:
                 shared_y = self.shared_experts(x)
                 x_in_use_simultenously = False
@@ -921,11 +908,11 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
         experts_impl = "auto"
         state.update(
             dict(
+                shared_y=shared_y,
                 shape=x.shape,
                 weights=weights,
                 routed_x=routed_x,
                 x_in_use_simultenously=x_in_use_simultenously,
-                shared_y=shared_y,
                 experts_impl=experts_impl,
             )
         )
@@ -963,22 +950,21 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
         )
         state.y = y
         
+        
     def op_combine(self, state):
         shared_y = state.pop("shared_y")
         y = state.pop("y")
         if self.is_tp_mode:
-            if shared_y is not None:
-                if not is_muxi():
-                    torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
-                y += shared_y
+            #if shared_y is not None:
+                #if not is_muxi():
+                   
+            y += shared_y
             if not self.moe_impl:
                 torch.distributed.all_reduce(y, group=get_tp_group().gpu_group)
 
         if self.moe_impl is not None:
             y = self.moe_impl.token_unpermutation(y, tbo_subbatch_index = state.tbo_subbatch_index)
         if shared_y is not None and not self.is_tp_mode:
-            if not is_muxi():
-                torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
             y += shared_y
         state.hidden_states_after_mlp =  y.view(state.pop("shape")) 
 class TransformerBlockDeepSeekV3(TransformerBlock):
@@ -1917,6 +1903,8 @@ class TransformerDeepSeekV3(Transformer):
             block_table,
             block_size,
             softmax_scale=compute_softmax_scale_deepseek_v3(self.params),
+            two_batch_seq_len_delta=self.cache.two_batch_seq_len_delta,
+            enable_two_batch_metadata=get_global_args().infer.enable_two_batch_overlap
         )
 
 

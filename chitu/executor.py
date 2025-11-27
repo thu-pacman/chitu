@@ -899,8 +899,12 @@ class Executor:
             )
 
     def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
+        TboPackedTasksPreparer.prepare(tasks)
         Backend.cache_manager.prepare_cache_prefill(
-            tasks.req_ids, [len(t) for t in tasks.tokens]
+            tasks.req_ids,
+            [len(t) for t in tasks.tokens],
+            tasks.tbo_split_seq_index,
+            tasks.tbo_split_token_index,
         )
         if get_global_args().models.type == "hf-qwen3-next":
             Backend.linear_attn_cache_manager.prepare_cache_prefill(
@@ -940,7 +944,7 @@ class Executor:
         for dispatcher in self.task_dispatchers:
             payload = dispatcher.recv_payload(payload)
         self.timers("prefill").start()
-        TboPackedTasksPreparer.prepare(tasks)
+
         out = Backend.model.prefill(
             payload,
             self._get_output_token_offsets(tasks),
@@ -950,9 +954,9 @@ class Executor:
             grid_thw=self.vision_tensor_broadcast(
                 getattr(tasks, "grid_thw", None), 2, torch.int64, stack=False
             ),
-            can_run_tbo = tasks.can_run_tbo,
-            tbo_split_seq_index = tasks.tbo_split_seq_index,
-            tbo_split_token_index  = tasks.tbo_split_token_index
+            can_run_tbo=tasks.can_run_tbo,
+            tbo_split_seq_index=tasks.tbo_split_seq_index,
+            tbo_split_token_index=tasks.tbo_split_token_index,
         )
         self.timers("prefill").stop()
 
@@ -1124,9 +1128,13 @@ class Executor:
         return out
 
     def decode_step(self, tasks: PackedTasksBase):
-        #logger.info(f"decode type of tasks:{type(tasks)}")
-        Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
-        
+        # logger.info(f"decode type of tasks:{type(tasks)}")
+        # 这个做的事情是更新一下，所以我应该每次运行的时候也更新一下
+        TboPackedTasksPreparer.prepare(tasks)
+        Backend.cache_manager.prepare_cache_decode(
+            tasks.req_ids, tasks.tbo_split_seq_index, tasks.tbo_split_token_index
+        )
+
         if get_global_args().models.type == "hf-qwen3-next":
             Backend.linear_attn_cache_manager.prepare_cache_decode(tasks.req_ids)
         if (
@@ -1160,13 +1168,15 @@ class Executor:
         # payload recv
         for dispatcher in self.task_dispatchers:
             payload = dispatcher.recv_payload(payload)
-        TboPackedTasksPreparer.prepare(tasks)
+
         self.timers("decode").start()
-        out = Backend.model.decode(payload, 
-                                   len(tasks.req_ids),
-                                   can_run_tbo = tasks.can_run_tbo ,
-                                tbo_split_seq_index = tasks.tbo_split_seq_index,
-            tbo_split_token_index  = tasks.tbo_split_token_index)
+        out = Backend.model.decode(
+            payload,
+            len(tasks.req_ids),
+            can_run_tbo=tasks.can_run_tbo,
+            tbo_split_seq_index=tasks.tbo_split_seq_index,
+            tbo_split_token_index=tasks.tbo_split_token_index,
+        )
         self.timers("decode").stop()
         # check output shape
 
