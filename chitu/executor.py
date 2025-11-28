@@ -46,6 +46,7 @@ from chitu.utils import top_k_top_p_min_p_sampling_from_logits
 from chitu.ops import apply_frequency_penalty, response_append
 from chitu.device_list import DeviceList
 from chitu.device_type import is_ascend
+from chitu.logging_utils import tps_monitor
 
 logger = getLogger(__name__)
 
@@ -1118,6 +1119,7 @@ class Executor:
             Backend.indexer_cache_manager.finalize_cache_single_decode(req_ids)
         return out
 
+    @tps_monitor(enabled=False, interval_sec=1.0, only_local_rank0=True)
     def decode_step(self, tasks: PackedTasksBase):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
         if get_global_args().models.type == "hf-qwen3-next":
