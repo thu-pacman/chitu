@@ -699,6 +699,7 @@ class DPFifoScheduler(Scheduler):  # used for expert_data_parallel
         self.have_task = None
         self.kvcache_block_threshold = 0
         self.is_warmup_stage = False
+        self._rr_owner_cursor = 0
 
     def schedule(self) -> list[list[str]]:
         self.have_task = False
@@ -755,15 +756,47 @@ class DPFifoScheduler(Scheduler):  # used for expert_data_parallel
             ]
 
         if len(prefill_task_ids) > 0:
+            # 计算各 DP rank 当前占用（持有 KV 槽的请求），并据此得到剩余可分配槽位
+            occupied = [0 for _ in range(self.dp_size)]
+            for tid, t in TaskPool.pool.items():
+                owner = getattr(t, "cache_owner", None)
+                if (
+                    owner is not None
+                    and 0 <= owner < self.dp_size
+                    and not t.need_remove()
+                ):
+                    occupied[owner] += 1
+            free_slots = [
+                max(0, self.max_num_tasks_per_dp - occupied[r])
+                for r in range(self.dp_size)
+            ]
+
+            def next_rank_with_free_slot():
+                # 选择仍有空闲槽位的 rank；若无可用，返回 None
+                for _ in range(self.dp_size):
+                    r = self._rr_owner_cursor
+                    self._rr_owner_cursor = (self._rr_owner_cursor + 1) % self.dp_size
+                    if free_slots[r] > 0:
+                        return r
+                return None
+
             task_lists = [[] for _ in range(self.dp_size)]
-            for i, task_id in enumerate(prefill_task_ids):
+            for task_id in prefill_task_ids:
                 task = TaskPool.pool[task_id]
-                # 固定 cache_owner：第一次出现按轮转分配，其后沿用，避免跨 rank 迁移导致重复占用 KV blocks
                 owner = getattr(task, "cache_owner", None)
                 if owner is None:
-                    owner = i % self.dp_size
-                    task.cache_owner = owner
-                task_lists[owner].append(task_id)
+                    # 仅当该 rank 仍有空闲槽位时才为“首次出现”的请求分配 owner
+                    r = next_rank_with_free_slot()
+                    if r is None:
+                        # 所有 rank 均已满，跳过本轮对该新请求的调度，等待后续有槽释放
+                        continue
+                    task.cache_owner = r
+                    free_slots[r] -= 1
+                    task_lists[r].append(task_id)
+                else:
+                    # 已有 owner 的请求不会新增占用，允许继续在原 rank 调度
+                    if 0 <= owner < self.dp_size:
+                        task_lists[owner].append(task_id)
 
             # per-rank chunk prefill slicing if enabled
             prefill_chunk_size = get_global_args().infer.prefill_chunk_size

@@ -7,6 +7,7 @@ import itertools
 import functools
 import os
 import time
+import re
 from collections import deque
 from enum import Enum
 from glob import glob
@@ -833,7 +834,7 @@ class Backend:
                 return False
             if args.models.name == "GLM-4.5-Air" and "model.layers.46" in k:
                 return False
-            if args.models.name == "GLM-4.5" and "model.layers.92" in k:
+            if args.models.name in ["GLM-4.5", "GLM-4.6"] and "model.layers.92" in k:
                 return False
             if args.models.name == "QwQ-32B-fp4" and (
                 k.endswith(".k_scale") or k.endswith(".v_scale")
@@ -848,6 +849,9 @@ class Backend:
             ] and (k.endswith(".weight_scale") or k.endswith(".weight_offset")):
                 return False
             if getattr(args.models, "tie_word_embeddings", False) and "lm_head." in k:
+                return False
+            match = re.search(r"model\.layers\.(\d+)\.", k)
+            if match and int(match.group(1)) >= args.models.n_layers:
                 return False
             return True
 
@@ -958,12 +962,19 @@ def load_state_dict(
         path = os.path.join(hf_ckpt_path, f"model.rank{rank}.safetensors")
 
     state_dict = {}
+    ignored_params = []
     for file_path in tqdm(glob(path)):
         with safe_open(file_path, framework="pt", device="cpu") as f:
             for name in f.keys():
                 if filter_key is None or filter_key(name):
                     param: torch.Tensor = f.get_tensor(name)
                     state_dict[name] = param
+                else:
+                    ignored_params.append(name)
+
+    if ignored_params:
+        logger.warning(f"Ignored {len(ignored_params)} params: {ignored_params}")
+
     return state_dict
 
 
