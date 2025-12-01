@@ -171,7 +171,7 @@ class Indexer(torch.nn.Module):
             freqs_cis,
             q_rotary_end=self.rope_head_dim,
             k_rotary_end=self.rope_head_dim,
-            rotary_type="interleaved",
+            rotary_type="separated",
         )
 
         q = self._rotate_activation(q)
