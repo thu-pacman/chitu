@@ -833,7 +833,7 @@ class Backend:
                 return False
             if args.models.name == "GLM-4.5-Air" and "model.layers.46" in k:
                 return False
-            if args.models.name == "GLM-4.5" and "model.layers.92" in k:
+            if args.models.name in ["GLM-4.5", "GLM-4.6"] and "model.layers.92" in k:
                 return False
             if args.models.name == "QwQ-32B-fp4" and (
                 k.endswith(".k_scale") or k.endswith(".v_scale")
