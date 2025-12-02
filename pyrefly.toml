@@ -1,0 +1,3 @@
+project-includes = ["**/*.py*"]
+project-excludes = ["third_party/*", "**/test/**"]
+ignore-missing-imports = ["*"]
