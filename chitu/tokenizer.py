@@ -81,6 +81,7 @@ class Tokenizer:
                 is requried by some models.
         """
         self.force_full_seq_decode = force_full_seq_decode
+        self.decode_cache: dict[int, str] = {}
 
         assert os.path.isfile(model_path), model_path
 
@@ -230,8 +231,19 @@ class Tokenizer:
             str: The decoded string.
         """
         # Typecast is safe here. Tiktoken doesn't do anything list-related with the sequence.
-        if len(t) == 1 and t[0] in self.stop_tokens:
-            return ""
+        # Single token decode with cache optimization
+        if len(t) == 1 and not self.force_full_seq_decode:
+            token_id = t[0]
+            if token_id in self.stop_tokens:
+                return ""
+
+            if token_id in self.decode_cache:
+                return self.decode_cache[token_id]
+
+            text = self.model.decode(cast(list[int], t))
+            self.decode_cache[token_id] = text
+            return text
+
         return self.model.decode(cast(list[int], t))
 
     @staticmethod
@@ -307,6 +319,7 @@ class TokenizerHF:
         force_full_seq_decode: bool = False,
     ):
         self.force_full_seq_decode = force_full_seq_decode
+        self.decode_cache: dict[tuple[int, bool], str] = {}
         self.model = AutoTokenizer.from_pretrained(
             path, trust_remote_code=trust_remote_code
         )
@@ -345,7 +358,17 @@ class TokenizerHF:
         return t
 
     def decode(self, t: Sequence[int], skip_special_tokens=True) -> str:
-        return self.model.decode(t, skip_special_tokens=True)
+        if len(t) == 1 and not self.force_full_seq_decode:
+            token_id = t[0]
+            key = (token_id, skip_special_tokens)
+            if key in self.decode_cache:
+                return self.decode_cache[key]
+
+            text = self.model.decode(t, skip_special_tokens=skip_special_tokens)
+            self.decode_cache[key] = text
+            return text
+
+        return self.model.decode(t, skip_special_tokens=skip_special_tokens)
 
 
 def normalize_dialog(dialog):

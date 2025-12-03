@@ -258,7 +258,7 @@ class Transformer(nn.Module):
 
         self.do_decode_callable = None
         self.args = get_global_args()
-        self.max_batch_size = self.args.infer.max_reqs
+        self.max_batch_size_per_dp = ceil_div(self.args.infer.max_reqs, get_dp_size())
         self.model_type = self.args.models.type
         self.use_cuda_graph = self.args.infer.use_cuda_graph
 
@@ -859,11 +859,13 @@ class Transformer(nn.Module):
                 )
 
             @make_dispatched_graphed_callables(
-                args_max_nelem=(tokens.numel() // batch_size * self.max_batch_size,),
+                args_max_nelem=(
+                    tokens.numel() // batch_size * self.max_batch_size_per_dp,
+                ),
                 kwargs_max_nelem={},
                 output_max_nelem_callback=lambda key, n: n
                 // key[0]
-                * self.max_batch_size,
+                * self.max_batch_size_per_dp,
                 before_replay_callback=before_replay_callback,
                 enable=current_cuda_graph_enabled,
             )

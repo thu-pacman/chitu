@@ -52,15 +52,27 @@ def get_ep_group() -> CommGroup:
 
 
 def get_tp_size() -> int:
-    return get_global_var("_TP_GROUP").group_size
+    """return 1 if TP not initialized"""
+    global _TP_GROUP
+    if _TP_GROUP is None:
+        return 1
+    return _TP_GROUP.group_size
 
 
 def get_dp_size() -> int:
-    return get_global_var("_DP_GROUP").group_size
+    """return 1 if DP not initialized"""
+    global _DP_GROUP
+    if _DP_GROUP is None:
+        return 1
+    return _DP_GROUP.group_size
 
 
 def get_ep_size() -> int:
-    return get_global_var("_EP_GROUP").group_size
+    """return 1 if EP not initialized"""
+    global _EP_GROUP
+    if _EP_GROUP is None:
+        return 1
+    return _EP_GROUP.group_size
 
 
 def get_pp_pair_group(
