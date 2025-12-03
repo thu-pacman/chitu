@@ -29,8 +29,7 @@ class LLMInt8Linear(QuantizedLinearBase):
         has_fp16_weights: bool = False,
         threshold: float = 6.0,
     ):
-
-        super().__init__()
+        super().__init__(in_features, out_features, has_bias)
 
         bnb_module = bnb.nn.Linear8bitLt(
             in_features,

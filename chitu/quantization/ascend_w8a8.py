@@ -53,10 +53,8 @@ class AscendW8A8Linear(
         # Parameters specific to this quantization
         is_rpl: bool = False,
     ):
-        super().__init__()
+        super().__init__(in_features, out_features, has_bias)
 
-        self.in_features = in_features
-        self.out_features = out_features
         self.weight = torch.nn.Parameter(
             torch.zeros(
                 self.out_features,

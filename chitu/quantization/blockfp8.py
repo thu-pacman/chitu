@@ -116,7 +116,7 @@ class Blockfp8Linear(QuantizedLinearBase):
         bias_dtype=None,
         block_size=128,
     ):
-        super().__init__()
+        super().__init__(in_features, out_features, has_bias)
 
         # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
         # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
@@ -127,8 +127,6 @@ class Blockfp8Linear(QuantizedLinearBase):
             dtype = torch.float8_e4m3fn
         assert dtype.itemsize == 1
 
-        self.in_features = in_features
-        self.out_features = out_features
         self.block_size = block_size
 
         self.register_parameter(

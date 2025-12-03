@@ -25,11 +25,8 @@ class W8A8Linear(QuantizedLinearBase):
         ############################################
         # No parameters specific to this quantization
     ):
+        super().__init__(in_features, out_features, has_bias)
 
-        super().__init__()
-
-        self.in_features = in_features
-        self.out_features = out_features
         self.weight = torch.nn.Parameter(
             torch.zeros(
                 self.out_features,

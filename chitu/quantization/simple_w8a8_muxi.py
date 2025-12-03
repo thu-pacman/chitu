@@ -24,11 +24,8 @@ class W8A8MuxiLinear(QuantizedLinearBase):
         ############################################
         # No parameters specific to this quantization
     ):
+        super().__init__(in_features, out_features, has_bias)
 
-        super().__init__()
-
-        self.in_features = in_features
-        self.out_features = out_features
         self.register_parameter(
             "weight",
             torch.nn.Parameter(

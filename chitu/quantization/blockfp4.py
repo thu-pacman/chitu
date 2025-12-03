@@ -176,13 +176,11 @@ class Blockfp4LinearBase(QuantizedLinearBase):
         act_block_size: int = 128,
         no_input_scale: bool = False,
     ):
-        super().__init__()
+        super().__init__(in_features, out_features, has_bias)
 
         if block_shape_2 is None:
             block_shape_2 = (in_features, out_features)
 
-        self.in_features = in_features
-        self.out_features = out_features
         self.act_block_size = act_block_size
 
         # In the checkpoint, self.weight is in Packed4BitWeightAlongK layout with

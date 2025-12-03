@@ -642,6 +642,10 @@ class Backend:
         # Move model to appropriate device
         if args.infer.op_impl != "cpu":
             model.apply(Backend._move_one_module_to_device)
+
+        if torch.distributed.get_rank() == 0:
+            logger.info(f"Model structure: \n{model}")
+
         Backend.model = model
         Backend.args = args
 
