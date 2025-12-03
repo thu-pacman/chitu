@@ -13,7 +13,8 @@ from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.cache_manager import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.static_tensor import StaticTensor
 from chitu.ops import append_to_paged_kv_cache
-from chitu.utils import try_import_opt_dep, pad_tensor
+from chitu.utils import try_import_opt_dep, pad_tensor, ceil_div
+from chitu.distributed.parallel_state import get_dp_size
 
 flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
 
@@ -33,23 +34,23 @@ class FlashInferBackend(TritonAttnBackend):
         # - For KV, we need to convert `block_table` to CSR format.
         # These buffers must be allocated when initializing
         # `flashinfer.mla.BatchMLAPagedAttentionWrapper` when cuda graph is enabled
-        max_batch_size = self.args.infer.max_reqs
+        max_batch_size_per_dp = ceil_div(self.args.infer.max_reqs, get_dp_size())
         self.head_dim = (
             self.args.models.head_dim
             if hasattr(self.args.models, "head_dim")
             else self.args.models.dim // self.args.models.n_heads
         )
         self.q_indptr = StaticTensor(
-            torch.empty(max_batch_size + 1, dtype=torch.int32, device="cuda")
+            torch.empty(max_batch_size_per_dp + 1, dtype=torch.int32, device="cuda")
         )
         self.kv_indptr = StaticTensor(
-            torch.empty(max_batch_size + 1, dtype=torch.int32, device="cuda")
+            torch.empty(max_batch_size_per_dp + 1, dtype=torch.int32, device="cuda")
         )
         self.kv_indices = StaticTensor(
             torch.empty(tot_num_blocks, dtype=torch.int32, device="cuda")
         )
         self.seqlens = StaticTensor(
-            torch.empty(max_batch_size, dtype=torch.int32, device="cuda")
+            torch.empty(max_batch_size_per_dp, dtype=torch.int32, device="cuda")
         )
 
         self.prefill_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
@@ -64,12 +65,12 @@ class FlashInferBackend(TritonAttnBackend):
 
         if self.is_paged == True:
             self.last_page_len = torch.zeros(
-                max_batch_size, dtype=torch.int32, device="cuda"
+                max_batch_size_per_dp, dtype=torch.int32, device="cuda"
             )
             self.record_pre_page_len = torch.zeros(
-                max_batch_size, dtype=torch.int32, device="cuda"
+                max_batch_size_per_dp, dtype=torch.int32, device="cuda"
             )
-            for bs in range(1, max_batch_size + 1):
+            for bs in range(1, max_batch_size_per_dp + 1):
                 self.decode_wrapper[bs] = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                     self.decode_wrapper_workspace_buffer,
                     "NHD",

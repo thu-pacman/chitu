@@ -13,7 +13,8 @@ from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.static_tensor import StaticTensor
 from chitu.cache_manager import PagedKVCacheAccessor
 from chitu.ops import append_to_paged_kv_cache
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_opt_dep, ceil_div
+from chitu.distributed.parallel_state import get_dp_size
 
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
 
@@ -38,7 +39,7 @@ class FlashMLABackend(TritonAttnBackend):
         block_size,
         softmax_scale=None,
     ):
-        max_batch_size = self.args.infer.max_reqs
+        max_batch_size_per_dp = ceil_div(self.args.infer.max_reqs, get_dp_size())
         metadata, num_splits = flash_mla.get_mla_metadata(
             seq_len_delta.new.lens_tensor_device,
             self.mtp_size * self.local_n_heads // self.kv_heads,
@@ -50,7 +51,7 @@ class FlashMLABackend(TritonAttnBackend):
             self.metadata.set(metadata)
         if self.num_splits is None:
             self.num_splits = StaticTensor(
-                num_splits, max_nelem=max_batch_size + 1
+                num_splits, max_nelem=max_batch_size_per_dp + 1
             )  # `num_splits`'s shape is always (batch_size + 1,)
         else:
             self.num_splits.set(num_splits)
