@@ -955,7 +955,6 @@ class Executor:
                 getattr(tasks, "grid_thw", None), 2, torch.int64, stack=False
             ),
             can_run_tbo=tasks.can_run_tbo,
-            tbo_split_seq_index=tasks.tbo_split_seq_index,
             tbo_split_token_index=tasks.tbo_split_token_index,
         )
         self.timers("prefill").stop()
@@ -1174,7 +1173,6 @@ class Executor:
             payload,
             len(tasks.req_ids),
             can_run_tbo=tasks.can_run_tbo,
-            tbo_split_seq_index=tasks.tbo_split_seq_index,
             tbo_split_token_index=tasks.tbo_split_token_index,
         )
         self.timers("decode").stop()

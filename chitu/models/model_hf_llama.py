@@ -4,7 +4,7 @@
 
 import math
 from logging import getLogger
-from typing import Any
+from typing import Any, Optional
 from typing_extensions import override
 
 import torch
@@ -230,7 +230,36 @@ class AttentionHFLlama(Attention):
             causal=True,
         ).view(bs_seq, -1)
         return self._run_output_linear(output).reshape(x.shape)
+        
+    def op_prepare(self,state):
+            x=state.pop("hidden_states_after_input_layernorm")
+            xq, xk, xv = self._run_linear(x)
 
+            bs_seq = xq.numel() // xq.shape[-1]
+            xq = xq.view(bs_seq, self.n_local_heads, self.head_dim).contiguous()
+            xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
+            xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
+
+            if hasattr(self, "q_norm"):
+                xq = self.q_norm(xq)
+            if hasattr(self, "k_norm"):
+                xk = self.k_norm(xk)
+
+            xq, xk = apply_rotary_pos_emb(xq, xk, state.freqs_cis, rotary_type=self.rotary_type)
+            state.attn_intermediate_state = (xq, xk, xv)
+
+    def op_core(self,state):
+        xq, xk, xv = state.pop("attn_intermediate_state")
+
+        output = self.attn_backend(
+            xq,
+            self.cache.get_accessor(self.layer_id),
+            xk,
+            xv,
+            seq_len_delta=self.cache.two_batch_seq_len_delta[state.tbo_subbatch_index],
+            causal=True,
+        ).view(xq.shape[0], -1)
+        state.hidden_states_after_attn = self._run_output_linear(output)
 
 class FeedForwardHFLlama(nn.Module):
     def __init__(

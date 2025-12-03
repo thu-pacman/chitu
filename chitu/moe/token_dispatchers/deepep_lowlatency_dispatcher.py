@@ -49,7 +49,9 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         self.group = get_ep_group().gpu_group
         self.hidden = hidden
         self.mode = mode
-
+        self.tbo_dispatch_use_fp8 = True if get_global_args().models.type == "deepseek-v3" else False
+        self.tbo_async_finish = False 
+        self.tbo_return_recv_hook = True
         # NOTES: for the best performance, the QP number **must** be equal to the number of the local experts
         assert self.num_experts % self.group.size() == 0
         self.num_local_experts = self.num_experts // self.group.size()
@@ -151,7 +153,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
             dispatch_use_fp8 = True
 
         topk_ids = x.token_to_expert_indices.to(torch.int64)
-        recv_activation, recv_expert_count, deepep_handle, event, hook = (
+        recv_activation, recv_expert_count, deepep_handle, event, hook, _= (
             self.deepep_token_dispatch(
                 x.activation,
                 topk_ids,
@@ -235,7 +237,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         # it is useful for double-batch overlapping, but **without any SM occupation**
         # If you don't want to overlap, please set `return_recv_hook=False`
         # Later, you can use our GEMM library to do the computation with this specific format
-        return recv_hidden_states, recv_expert_count, handle, event, hook
+        return recv_hidden_states, recv_expert_count, handle, event, hook, topk_idx
 
     # SPDX-SnippetEnd
 
@@ -297,3 +299,79 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         return combined_hidden_states, event, hook
 
     # SPDX-SnippetEnd
+    
+    # For TBO overlap, we need split dispatch/combine into two stages
+    def dispatch_a(
+        self,
+        x: IndexedBatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+    ):
+        topk_idx = x.token_to_expert_indices.to(torch.int64)
+        topk_weights = topk_weights.to(torch.float32)
+        (recv_hidden_states, recv_expert_count, self.handle, event, hook, topk_idx)=self.deepep_token_dispatch(
+            x.activation,
+            topk_idx.to(dtype=deep_ep.topk_idx_t),
+            dispatch_use_fp8=self.tbo_dispatch_use_fp8,
+            cumulative_local_expert_recv_stats=None,
+            async_finish=self.tbo_async_finish,
+            return_recv_hook=self.tbo_return_recv_hook,
+        )
+        self._tbo_ctx = (topk_idx, topk_weights)
+        self._dispatch_intermediate_state = (recv_hidden_states, recv_expert_count, hook)
+        return event
+    
+    def dispatch_b(
+        self,
+        previous_event: Optional["deep_ep.EventOverlap"] = None,
+    ):
+        recv_activation, recv_expert_count, hook = self._dispatch_intermediate_state
+        del self._dispatch_intermediate_state
+        hook() if self.tbo_return_recv_hook else previous_event.current_stream_wait()
+ 
+        if not self.tbo_dispatch_use_fp8:
+            return (
+                PerExpertDenseBatchedRoutedActivation(
+                    activation_per_expert=recv_activation,
+                    n_tokens_per_expert=recv_expert_count,
+                ),
+                None,
+                previous_event,
+            )
+        else:
+            recv_activation, recv_activation_scale = recv_activation
+            return (
+                PerExpertDenseBatchedRoutedActivationBlockfp8(
+                    activation_per_expert=recv_activation,
+                    activation_scale_per_expert=recv_activation_scale,
+                    n_tokens_per_expert=recv_expert_count,
+                ),
+                None,
+                previous_event,
+            )
+        
+    def combine_a(
+        self,
+        hidden_states: torch.Tensor,
+    ):
+        topk_idx, topk_weights = self._tbo_ctx
+        del self._tbo_ctx
+        combined_hidden_states, event, hook = self._buffer.low_latency_combine(
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            self.handle,
+            async_finish=self.tbo_async_finish,
+            return_recv_hook=self.tbo_return_recv_hook,
+        )
+        self.handle = None
+        self._combine_intermediate_state = (hook, combined_hidden_states)
+        return event
+    
+    def combine_b(
+        self,
+        previous_event: Optional["deep_ep.EventOverlap"] = None,
+    ):
+        hook, combined_hidden_states = self._combine_intermediate_state
+        del self._combine_intermediate_state
+        hook() if self.tbo_return_recv_hook else previous_event.current_stream_wait()
+        return combined_hidden_states, previous_event

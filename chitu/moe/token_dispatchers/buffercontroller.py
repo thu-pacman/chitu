@@ -71,7 +71,7 @@ class DeepEPBuffer:
             # according to deepep readme, hard code here.
             num_qps_per_rank = 12
         elif deepep_mode in ["deepep-ll", "auto"]:
-            num_qps_per_rank = max(24, num_experts // group.size())
+            num_qps_per_rank = max(deep_ep.Buffer.num_sms, num_experts // group.size())
         else:
             raise NotImplementedError
 

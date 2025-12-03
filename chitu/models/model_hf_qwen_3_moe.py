@@ -4,6 +4,7 @@
 
 from typing import Optional, Mapping, Any
 from typing_extensions import override
+from logging import getLogger
 import re
 import functools
 import torch
@@ -15,6 +16,13 @@ from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiL
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
 from chitu.distributed.parallel_state import get_tp_size, get_ep_size
 from chitu.models.registry import ModelType, register_model
+from chitu.models.model_hf_llama import AttentionHFLlama, get_rms_norm_impl
+from chitu.global_vars import get_global_args
+from chitu.batched_freqs_cis import BatchedFreqsCis
+from chitu.task import TaskType
+
+logger = getLogger(__name__)
+
 
 
 class Qwen3MoeGate(MoeGate):
@@ -107,6 +115,11 @@ class ParallelMoeBlockQwen3(ParallelMoeBlock):
             checkpoint_prefix=checkpoint_prefix,
         )
 
+    def op_output(
+        self,
+        state,
+    ):
+        pass
 
 class TransformerBlockHFQwen3Moe(TransformerBlockHFLlama):
     def __init__(
@@ -148,7 +161,32 @@ class TransformerBlockHFQwen3Moe(TransformerBlockHFLlama):
             checkpoint_prefix=checkpoint_prefix,
         )
 
-
+    def op_input_layernorm(
+            self,
+            state,
+            freqs_cis: BatchedFreqsCis,
+            hidden_states: torch.Tensor,
+            tbo_subbatch_index: int,
+            previous_event: Optional[torch.Tensor] = None,
+        ):
+            state.hidden_states_after_input_layernorm = self.input_layernorm(hidden_states,impl=get_rms_norm_impl())
+            state.update(
+                dict(
+                    freqs_cis=freqs_cis,
+                    tbo_subbatch_index=tbo_subbatch_index,
+                    residual=hidden_states,
+                )
+            )
+            if previous_event is not None:
+                state.previous_event = previous_event
+    
+    def op_post_attention_layernorm(self,state):
+        hidden_states = state.pop("hidden_states_after_attn") + state.pop("residual")
+        state.residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states,impl=get_rms_norm_impl())
+        state.hidden_states_after_layernorm = hidden_states
+        
+    
 @register_model(ModelType.HF_QWEN_3_MOE)
 class TransformerHFQwen3Moe(TransformerHFLlama):
     def __init__(
@@ -178,6 +216,66 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
             **kvargs,
         )
 
+    @override
+    @torch.inference_mode()
+    def prefill_no_pipeline(
+        self, tokens, output_token_offsets: torch.Tensor, **args
+    ) -> torch.Tensor:
+        self.n_dense_layers = 0
+        freqs_cis = self.prepare_freqs_cis()
+        h = self._pre_layers(tokens, **args)
+        normal_start_layer = 0
+        normal_end_layer = len(self.layers) 
+        end_layer = len(self.layers) 
+        if args['can_run_tbo']:
+            if (
+                self.n_dense_layers > normal_start_layer
+                and self.n_dense_layers < normal_end_layer
+            ):
+                normal_end_layer = self.n_dense_layers
+            elif self.n_dense_layers < normal_start_layer:
+                normal_end_layer = normal_start_layer = 0
+        for i in range(normal_start_layer, normal_end_layer):
+            layer= self.layers[i]
+            h = layer(h, freqs_cis)
+        if normal_end_layer != end_layer:
+            from chitu.two_batch_overlap import model_forward_tbo
+            h = model_forward_tbo(self.layers[normal_end_layer : end_layer],
+                                  freqs_cis, h, args['tbo_split_token_index'], 
+                                  TaskType.Prefill)
+        h = h[output_token_offsets]
+        h = self._post_layers(h)
+        h = h.float()
+        return h
+        
+    @override
+    @torch.inference_mode()
+    def decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis,**args):
+        h = self._pre_layers(tokens)
+        normal_start_layer = 0
+        normal_end_layer = len(self.layers) 
+        end_layer = len(self.layers) 
+        if args['can_run_tbo']:
+            if (
+                self.n_dense_layers > normal_start_layer
+                and self.n_dense_layers < normal_end_layer
+            ):
+                normal_end_layer = self.n_dense_layers
+            elif self.n_dense_layers < normal_start_layer:
+                 normal_end_layer = normal_start_layer = 0
+        for i in range(normal_start_layer, normal_end_layer):
+            layer= self.layers[i]
+            h = layer(h, freqs_cis)
+        if normal_end_layer !=end_layer:
+            from chitu.two_batch_overlap import model_forward_tbo
+            
+            h = model_forward_tbo(self.layers[normal_end_layer : end_layer],
+                                  freqs_cis, h, args['tbo_split_token_index'], 
+                                  TaskType.Decode)
+        h = self._post_layers(h)
+        h = h.float()
+        return h
+    
     @override
     def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
         """

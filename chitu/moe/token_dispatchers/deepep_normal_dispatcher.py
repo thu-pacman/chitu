@@ -46,6 +46,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         # Set the number of SMs to use
         # NOTES: this is a static variable, so it will be shared by all the instances of the class
         deep_ep.Buffer.set_num_sms(24)
+        self.tbo_async_finish = True  # whether to async finish the TBO ops
         assert self.num_experts % self.group.size() == 0
 
     @override
@@ -235,7 +236,55 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             handle,
             event,
         )
+    #for TBO overlap, we need split dispatch into two stages
+    def dispatch_a(
+        self,
+        x: IndexedBatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+    ):
+        
+        hidden_states = x.activation
+        topk_idx = x.token_to_expert_indices.to(dtype=deep_ep.topk_idx_t)
+        topk_weights = topk_weights.to(dtype=torch.float32)
+        self._dispatch_intermediate_state = (hidden_states, topk_idx, topk_weights)
 
+        previous_event = self._buffer.capture() if self.tbo_async_finish else None
+        return previous_event
+    
+    def dispatch_b(
+        self,
+        previous_event: Optional["deep_ep.EventOverlap"] = None,
+    ):
+        hidden_states, topk_idx, topk_weights = self._dispatch_intermediate_state
+        del self._dispatch_intermediate_state
+        (
+            recv_x,
+            recv_topk_idx,
+            recv_topk_weights,
+            num_recv_tokens_per_expert_list,
+            self.handle,
+            event,
+        ) = self.dispatch_forward(
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            self.tbo_async_finish,
+            previous_event,
+        )
+        event.current_stream_wait() if self.tbo_async_finish else ()
+        return (
+            IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
+                recv_x,
+                recv_topk_idx.to(torch.int32),
+                torch.tensor(
+                    num_recv_tokens_per_expert_list,
+                    dtype=torch.int32,
+                    device=recv_topk_idx.device,
+                ),
+            ),
+            recv_topk_weights,
+            event,
+        )
     # SPDX-SnippetEnd
 
     # SPDX-SnippetBegin
@@ -285,8 +334,34 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
 
         return combined_x, event
 
-    # SPDX-SnippetEnd
+    
+    #for TBO overlap, we need split combine into two stages
+    def combine_a(
+        self,
+        hidden_states: torch.Tensor,
+    ):
+        previous_event = self._buffer.capture() if self.tbo_async_finish else None
+        self._combine_intermediate_state = hidden_states
+        return previous_event
 
+
+    def combine_b(
+        self,
+        previous_event: Optional["deep_ep.EventOverlap"] = None,
+    ):
+        hidden_states = self._combine_intermediate_state
+        del self._combine_intermediate_state
+        combined_x, _, event = self._buffer.combine(
+            hidden_states,
+            self.handle,
+            async_finish=self.tbo_async_finish,
+            previous_event=previous_event,
+            allocate_on_comm_stream=previous_event is not None,
+        )
+        event.current_stream_wait() if self.tbo_async_finish else ()
+        return combined_x, event
+    
+    # SPDX-SnippetEnd  
     def dump_and_reset_profile(self):
         if self.profile:
             logger.warning("Normal dispatcher cannot profile yet.")

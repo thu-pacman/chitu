@@ -189,6 +189,14 @@ class TransformerBlock(nn.Module):
     def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
         raise NotImplementedError
 
+    def op_res_after_mlp(self,state):
+        hidden_states = state.pop("hidden_states") + state.pop("residual")
+        output = dict(
+            hidden_states=hidden_states,
+            freqs_cis=state.pop("freqs_cis"),
+            tbo_subbatch_index=state.pop("tbo_subbatch_index"),
+        )
+        return output
 
 class Transformer(nn.Module):
     def __init__(
@@ -1087,6 +1095,103 @@ class ParallelMoeBlock(nn.Module):
 
         return y.view(shape)
 
+    def op_gate_and_select_experts(
+        self,
+        state,
+    ):
+        x = state.hidden_states_after_layernorm
+        x = x.view(-1, x.shape[-1])
+        weights, indices = self.gate(x)
+        indices = (
+            self.expert_mapping[indices] if self.expert_mapping is not None else indices
+        )
+        state.update(
+            dict(
+                tbo_subbatch_index=state.tbo_subbatch_index,
+                freqs_cis=state.freqs_cis,
+                routed_x=IndexedBatchedRoutedActivation(x, indices),
+                topk_weights=weights,
+            )
+        )    
+        if self.shared_experts is not None:
+            state.shared_experts_input = x 
+
+    def op_shared_experts(
+        self,
+        state,
+    ):
+        ## we don't use sbo strategy here
+        if self.shared_experts is not None:
+            state.shared_experts_output = self.shared_experts(state.pop("shared_experts_input"))
+        else:
+            state.shared_experts_output = None
+
+    def op_experts(
+        self,
+        state,
+    ):
+        assert self.moe_impl is not None
+        state.hidden_states = self.experts(
+            state.pop("routed_x"),
+            state.pop("topk_weights"),
+            inplace=True,
+            impl=self.moe_impl.get_experts_impl(),
+        )
+        # previous_event, hidden_states
+
+    def op_output(
+        self,
+        state,
+    ):
+        if (shared_output:= state.pop("shared_experts_output")) is not None:
+            state.hidden_states += shared_output
+        
+    def op_dispatch_a(
+        self,
+        state,
+    ):
+        assert self.moe_impl is not None
+        state.previous_event = self.moe_impl.dispatch_a(
+            state.pop("routed_x"),
+            state.pop("topk_weights"),
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+        # previous_event
+
+    def op_dispatch_b(
+        self,
+        state,
+    ):
+        assert self.moe_impl is not None
+        (
+            state.routed_x,
+            state.topk_weights,
+            state.previous_event,
+        ) = self.moe_impl.dispatch_b(
+            state.pop("previous_event"),
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+        # routed_x, topk_weights, previous_event
+
+    def op_combine_a(self,state):
+        assert self.moe_impl is not None
+        state.previous_event = self.moe_impl.combine_a(
+            state.hidden_states,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+        # previous_event, hidden_states
+    
+    def op_combine_b(
+        self,
+        state,
+    ):
+        # may directly call combine_b after dispatch_b
+        assert self.moe_impl is not None
+        state.hidden_states,state.previous_event = self.moe_impl.combine_b(
+            state.pop("previous_event"),
+            tbo_subbatch_index=state.tbo_subbatch_index
+        )
+    
 
 def get_linear_layout_native_y(
     op_impl: str,

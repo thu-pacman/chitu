@@ -158,14 +158,12 @@ class FlashMLABackend(TritonAttnBackend):
             if topk_indices is not None
             else None
         )
-        seq_slice = seq_len_delta.seq_slice
-        block_table_view = kv_cache.block_table[seq_slice]
 
         if indices is not None:
             output, _ = flash_mla.flash_mla_with_kvcache(
                 q_nope_pe,
                 kv_lora_k_pe.unsqueeze(2),
-                kv_cache.block_table,
+                kv_cache.block_table[seq_len_delta.seq_slice],
                 seq_len_delta.new.lens_tensor_device,
                 512,  # dv
                 self.metadata.get(),
@@ -180,7 +178,7 @@ class FlashMLABackend(TritonAttnBackend):
                 output, _ = flash_mla.flash_mla_with_kvcache(
                     q_nope_pe,
                     kv_lora_k_pe.unsqueeze(2),
-                    block_table_view,
+                    kv_cache.block_table[seq_len_delta.seq_slice],
                     seq_len_delta.new.lens_tensor_device,
                     512,  # dv
                     self.metadata.get(),
@@ -192,7 +190,7 @@ class FlashMLABackend(TritonAttnBackend):
                 output, _ = flash_mla.flash_mla_with_kvcache(
                     q_nope_pe,
                     kv_lora_k_pe.unsqueeze(2),
-                    block_table_view,
+                    kv_cache.block_table[seq_len_delta.seq_slice],
                     seq_len_delta.new.lens_tensor_device,
                     512,  # dv
                     self.two_batch_metadata[seq_len_delta.tbo_subbatch_index].get(),

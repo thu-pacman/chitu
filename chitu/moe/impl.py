@@ -130,7 +130,7 @@ class MoEImpl:
                     if self.decode_token_dispatcher_impl == "deepep-ll"
                     else "deepep-normal"
                 ),
-                deepep_dispatcher_type = "normal",
+                deepep_dispatcher_base_class = MoENormalTokenDispatcher,
             )
             self.prefill_experts_impl = "ep_group_gemm_contiguous"
         elif (
@@ -148,7 +148,7 @@ class MoEImpl:
         if self.decode_token_dispatcher_impl == "deepep-ll":
             self.decode_token_dispatcher = MaybeTboDeepEPDispatcher(
                 self.num_experts, self.hidden_dim,
-                deepep_dispatcher_type = "low_latency",
+                deepep_dispatcher_base_class = MoELowLatencyTokenDispatcher,
             )
             self.decode_experts_impl = "ep_group_gemm_masked"
         elif (
@@ -228,6 +228,18 @@ class MoEImpl:
     def is_deepep_enabled(self):
         assert self.task_type is not None, "self.task_type is None"
         if self.task_type in [TaskType.Prefill, TaskType.EmptyPrefill]:
-            return self.prefill_token_dispatcher_impl.startswith("deep")
+            return "deepep" in self.prefill_token_dispatcher_impl
         elif self.task_type in [TaskType.Decode, TaskType.EmptyDecode]:
-            return self.decode_token_dispatcher_impl.startswith("deep")
+            return "deepep" in self.decode_token_dispatcher_impl
+        
+    def dispatch_a(self,*args, **kwargs):
+        return self._get_current_token_dispatcher().dispatch_a(*args, **kwargs)
+    
+    def dispatch_b(self,*args, **kwargs):
+        return self._get_current_token_dispatcher().dispatch_b(*args, **kwargs)
+    
+    def combine_a(self,*args, **kwargs):
+        return self._get_current_token_dispatcher().combine_a(*args, **kwargs)
+    
+    def combine_b(self,*args, **kwargs):
+        return self._get_current_token_dispatcher().combine_b(*args, **kwargs)

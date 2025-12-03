@@ -10,7 +10,7 @@ import einops
 import torch
 
 from chitu.attn_backend.ref_attn_backend import RefAttnBackend
-from chitu.batched_seq_len import BatchedSeqLenDelta
+from chitu.batched_seq_len import BatchedSeqLenDelta,BatchedSeqLenDeltaView
 from chitu.cache_manager import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.device_type import is_muxi
 from chitu.ops import append_to_dense_kv_cache, append_to_paged_kv_cache
@@ -386,7 +386,7 @@ class TritonAttnBackend(RefAttnBackend):
             kv_c_cache,
             k_pe_cache,
             o,
-            kv_cache.block_table,
+            kv_cache.block_table[seq_len_delta.seq_slice],
             seq_len_delta.new.lens_tensor_device,
             attn_logits,
             num_kv_splits,
@@ -583,7 +583,7 @@ class TritonAttnBackend(RefAttnBackend):
             kv_cache.k,
             kv_cache.v,
             output.view(-1, output.shape[-2], output.shape[-1]),
-            kv_cache.block_table,
+            kv_cache.block_table[seq_len_delta.seq_slice],
             seqlens,
             attn_logits,
             num_kv_splits,

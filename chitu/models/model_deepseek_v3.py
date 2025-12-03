@@ -590,11 +590,61 @@ class AttentionDeepSeekV3(Attention):
             raise NotImplementedError(
                 f"MLA absorb mode {self.mla_absorb} not supported"
             )
-    
+            
+    def op_prepare(self, state):
+        # FIXME(TR) currently we don't support indexer with TBO
+        assert self.index_topk is None
+        x = state.pop("hidden_states_after_layernorm")
+        freqs_cis = state.freqs_cis
+        bs_seq, _ = x.size()
+
+        if self.mla_absorb == "none":
+            q, k, v, qr = self._run_linear(x, freqs_cis)
+            state.attn_intermediate_state = (bs_seq, q, k, v)
+        elif self.mla_absorb in ["absorb-without-precomp", "absorb"]:
+            q_nope, q_pe, kv, qr = self._run_linear(x, freqs_cis)
+            state.attn_intermediate_state = (bs_seq, q_nope, q_pe, kv)
+        else:
+            raise NotImplementedError(
+                f"MLA absorb mode {self.mla_absorb} not supported"
+            )
+            
     def op_core(self, state):
-        seq_len_delta = self.cache.two_batch_seq_len_delta[state.tbo_subbatch_index]
-        state.hidden_states_after_attn = self.forward(x=state.pop("hidden_states_after_layernorm"), freqs_cis=state.freqs_cis, seq_len_delta=seq_len_delta)
-        
+        # FIXME(TR) currently we don't support indexer with TBO
+        assert self.index_topk is None    
+        if self.mla_absorb == "none":
+            bs_seq, q, k, v = state.pop("attn_intermediate_state")
+            x = self.attn_backend(
+                q,
+                self.cache.get_accessor(self.layer_id),
+                k,
+                v,
+                seq_len_delta=self.cache.two_batch_seq_len_delta[state.tbo_subbatch_index],
+                causal=True,
+                softmax_scale=self.softmax_scale,
+            )
+        elif self.mla_absorb in ["absorb-without-precomp", "absorb"]:
+            bs_seq, q_nope, q_pe, kv = state.pop("attn_intermediate_state")
+            x = self.attn_backend.mla(
+                q_nope,
+                q_pe,
+                self.cache.get_accessor(self.layer_id),
+                kv,
+                seq_len_delta=self.cache.two_batch_seq_len_delta[state.tbo_subbatch_index],
+                causal=True,
+                softmax_scale=self.softmax_scale,
+                topk_indices=None,
+            )
+
+            if self.mla_absorb == "absorb-without-precomp":
+                x = self.kv_b_proj_absorb_2(x)
+        else:
+            raise NotImplementedError(
+                f"MLA absorb mode {self.mla_absorb} not supported"
+            )
+        state.hidden_states_after_attn = self.o_proj(x.flatten(-2)).view(bs_seq, -1)
+
+
     def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, seq_len_delta:Optional[BatchedSeqLenDelta] = None):
         bs_seq, _ = x.size()
         if seq_len_delta == None:
@@ -886,87 +936,6 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
             checkpoint_prefix=checkpoint_prefix,
         )
         
-    def op_prepare(self, state):
-        #self.forward_prepare(state.pop("hidden_states_after_post_attention_layernorm"))
-        x = state.pop("hidden_states_after_post_attention_layernorm")
-        x = x.view(-1, x.shape[-1])
-        
-        weights, indices = self.gate(x)
-        indices = (
-            self.expert_mapping[indices] if self.expert_mapping is not None else indices
-        )
-        routed_x = IndexedBatchedRoutedActivation(x, indices)
-        x_in_use_simultenously = False
-        if self.shared_experts is not None:
-            if not is_muxi():
-                shared_y = self.shared_experts(x)
-                x_in_use_simultenously = True
-            else:
-                shared_y = self.shared_experts(x)
-                x_in_use_simultenously = False
-
-        experts_impl = "auto"
-        state.update(
-            dict(
-                shared_y=shared_y,
-                shape=x.shape,
-                weights=weights,
-                routed_x=routed_x,
-                x_in_use_simultenously=x_in_use_simultenously,
-                experts_impl=experts_impl,
-            )
-        )
-    def op_dispatch(self, state):
-        experts_impl = state.pop("experts_impl")
-        routed_x =  state.pop("routed_x")
-        weights = state.pop("weights")
-
-        x_in_use_simultenously = state.pop("x_in_use_simultenously")
-        if self.moe_impl is not None:
-            experts_impl = self.moe_impl.get_experts_impl()
-            routed_x, weights = self.moe_impl.token_permutation(
-                routed_x,
-                weights,
-                tbo_subbatch_index = state.tbo_subbatch_index,
-                may_fuse_quant=get_quant_from_checkpoint_prefix(
-                    f"{self.checkpoint_prefix}.experts"
-                ),
-                may_fuse_quant_kwargs=get_quant_kwargs_from_checkpoint_prefix(
-                    f"{self.checkpoint_prefix}.experts"
-                ),
-            )
-            x_in_use_simultenously = False
-            state.update(
-                dict(
-                    weights=weights,
-                    routed_x= routed_x,
-                    x_in_use_simultenously=x_in_use_simultenously,
-                    experts_impl = experts_impl,
-                )
-            )
-    def op_experts(self, state):
-        y = self.experts(
-            state.pop("routed_x"), state.pop("weights"), inplace=not state.pop("x_in_use_simultenously"), impl=state.pop("experts_impl")
-        )
-        state.y = y
-        
-        
-    def op_combine(self, state):
-        shared_y = state.pop("shared_y")
-        y = state.pop("y")
-        if self.is_tp_mode:
-            #if shared_y is not None:
-                #if not is_muxi():
-                   
-            y += shared_y
-            if not self.moe_impl:
-                torch.distributed.all_reduce(y, group=get_tp_group().gpu_group)
-
-        if self.moe_impl is not None:
-            y = self.moe_impl.token_unpermutation(y, tbo_subbatch_index = state.tbo_subbatch_index)
-        if shared_y is not None and not self.is_tp_mode:
-            y += shared_y
-        state.hidden_states_after_mlp =  y.view(state.pop("shape")) 
 class TransformerBlockDeepSeekV3(TransformerBlock):
     def __init__(
         self,
@@ -1046,54 +1015,27 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         state,
         freqs_cis: BatchedFreqsCis,
         hidden_states: torch.Tensor,
-        tbo_split_seq_index:int,
-        tbo_split_token_index: int,
         tbo_subbatch_index: int,
-        layer_id:int
     ):
         state.residual = hidden_states
         state.hidden_states_after_layernorm = self.input_layernorm(hidden_states, compute_dtype=hidden_states.dtype)
         state.update(
             dict(
                 freqs_cis=freqs_cis,
-                tbo_split_seq_index = tbo_split_seq_index,
-                tbo_split_token_index=tbo_split_token_index,
                 tbo_subbatch_index=tbo_subbatch_index,
-                layer_id=layer_id,
             )
         )
         
-    def op_res_after_atten(self, state):
-        state.hidden_states_after_atten_res = state.pop("hidden_states_after_attn") + state.residual
-        state.pop("residual")
-        state.residual = state.hidden_states_after_atten_res
-    
     def op_post_attention_layernorm(self, state):
+        hidden_states = state.pop("hidden_states_after_attn") + state.pop("residual")
+        state.residual = hidden_states
+        hidden_states = self.post_attention_layernorm(
+                hidden_states, compute_dtype=hidden_states.dtype
+            )
+        state.hidden_states_after_layernorm = hidden_states
+
         
-        state.hidden_states_after_post_attention_layernorm = self.post_attention_layernorm(
-            state.hidden_states_after_atten_res, compute_dtype=state.pop("hidden_states_after_atten_res").dtype
-        )
-        
-    def op_res_after_mlp(self, state):
-        hidden_states = state.pop("hidden_states_after_mlp") + state.pop("residual")
-        output = dict(
-            freqs_cis=state.freqs_cis,
-            hidden_states=hidden_states,
-            tbo_split_seq_index=state.tbo_split_seq_index,
-            tbo_split_token_index=state.tbo_split_token_index,
-            tbo_subbatch_index=state.tbo_subbatch_index,
-            layer_id=state.layer_id + 1,
-        )
-        state.clear(
-            expect_keys={
-                "freqs_cis",
-                "tbo_split_token_index",
-                "tbo_split_seq_index",
-                "tbo_subbatch_index",
-                "layer_id",
-            }
-        )
-        return output
+
         
         
     def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
@@ -1186,7 +1128,7 @@ class TransformerDeepSeekV3(Transformer):
             from chitu.two_batch_overlap import model_forward_tbo
             h = model_forward_tbo(self.layers[normal_end_layer : end_layer],
                                   freqs_cis, h, args['tbo_split_token_index'], 
-                                  args['tbo_split_seq_index'], TaskType.Prefill)
+                                TaskType.Prefill)
         h = h[output_token_offsets]
         h = self._post_layers(h)
         h = h.float()
@@ -1215,7 +1157,7 @@ class TransformerDeepSeekV3(Transformer):
             
             h = model_forward_tbo(self.layers[normal_end_layer : end_layer],
                                   freqs_cis, h, args['tbo_split_token_index'], 
-                                  args['tbo_split_seq_index'], TaskType.Decode)
+                                TaskType.Decode)
         h = self._post_layers(h)
         h = h.float()
         return h
