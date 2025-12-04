@@ -6,6 +6,7 @@ import itertools
 import os
 from logging import getLogger
 from typing import Any, Mapping, Optional
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +28,7 @@ from chitu.ops import apply_rotary_pos_emb, rms_norm, moe_gate
 from chitu.distributed.parallel_state import (
     get_tp_group,
     get_tp_size,
+    get_etp_size,
     get_ep_group,
     get_ep_size,
     get_dp_group,
@@ -1006,11 +1008,11 @@ class ParallelMoeBlock(nn.Module):
         self.experts = experts
         self.shared_experts = non_fused_shared_experts
 
-        if self.shared_experts is not None:
+        self.shared_experts_stream = None
+        if self.shared_experts is not None and not is_muxi():
             self.shared_experts_stream = torch.cuda.Stream()
 
         self.moe_impl = get_moe_impl()
-        self.is_tp_mode = get_tp_size() > 1
         if self.moe_impl is not None:
             self.expert_mapping = self.moe_impl.get_expert_mapping(layer_id=layer_id)
         else:
@@ -1041,19 +1043,18 @@ class ParallelMoeBlock(nn.Module):
         shared_y = None
         x_in_use_simultenously = False
         if self.shared_experts is not None:
-            if not is_muxi():
+            ctx = nullcontext()
+            if self.shared_experts_stream is not None:
                 self.shared_experts_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self.shared_experts_stream):
-                    shared_y = self.shared_experts(x)
-                    x_in_use_simultenously = True
-            else:
+                ctx = torch.cuda.stream(self.shared_experts_stream)
+                x_in_use_simultenously = True
+            with ctx:
                 shared_y = self.shared_experts(x)
-                x_in_use_simultenously = False
 
         experts_impl = "auto"
-        tokens_per_expert = None
         if self.moe_impl is not None:
             experts_impl = self.moe_impl.get_experts_impl()
+            routed_x_old = routed_x
             routed_x, weights = self.moe_impl.token_permutation(
                 routed_x,
                 weights,
@@ -1064,27 +1065,36 @@ class ParallelMoeBlock(nn.Module):
                     f"{self.checkpoint_prefix}.experts"
                 ),
             )
-            x_in_use_simultenously = False
+            x_in_use_simultenously = x_in_use_simultenously and (
+                routed_x_old is routed_x
+            )
 
         y = self.experts(
             routed_x, weights, inplace=not x_in_use_simultenously, impl=experts_impl
         )
 
-        # Fuse allreduce to improve performance in TP mode
-        if self.is_tp_mode:
-            if shared_y is not None:
-                if not is_muxi():
+        if shared_y is not None and get_tp_size() > 1:
+            # we need to reduce shared_y on tp group, if this group equals the group reduce y later, we can merge them together
+            if self.moe_impl:
+                y_reduce_rank_list = self.moe_impl.unpermutation_reduce_rank_list()
+            else:
+                y_reduce_rank_list = get_tp_group().rank_list
+            if get_tp_group().rank_list == y_reduce_rank_list:
+                if self.shared_experts_stream:
                     torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
                 y += shared_y
-            if not self.moe_impl:
-                torch.distributed.all_reduce(y, group=get_tp_group().gpu_group)
+                shared_y = None
 
-        if self.moe_impl is not None:
+        if self.moe_impl:
             y = self.moe_impl.token_unpermutation(y)
+        elif get_tp_size() > 1:
+            get_tp_group().all_reduce(y)
 
-        if shared_y is not None and not self.is_tp_mode:
-            if not is_muxi():
+        if shared_y is not None:
+            if self.shared_experts_stream:
                 torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
+            if get_tp_size() > 1:
+                get_tp_group().all_reduce(shared_y)
             y += shared_y
 
         return y.view(shape)

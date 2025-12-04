@@ -59,6 +59,18 @@ def get_tp_size() -> int:
     return _TP_GROUP.group_size
 
 
+def get_etp_size() -> int:
+    if get_ep_size() == 1:
+        return get_tp_size()
+    return 1
+
+
+def get_etp_group() -> CommGroup:
+    if get_ep_size() == 1:
+        return get_tp_group()
+    raise NotImplementedError
+
+
 def get_dp_size() -> int:
     """return 1 if DP not initialized"""
     global _DP_GROUP

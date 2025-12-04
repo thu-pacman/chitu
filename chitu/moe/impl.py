@@ -194,6 +194,12 @@ class MoEImpl:
     def token_unpermutation(self, *args, **kwargs):
         return self._get_current_token_dispatcher().token_unpermutation(*args, **kwargs)
 
+    def unpermutation_reduce_rank_list(self):
+        dispatcher = self._get_current_token_dispatcher()
+        if isinstance(dispatcher, MoEAllGatherTokenDispatcher):
+            return get_ep_group().rank_list
+        return None
+
     def _load_expert_stats(self, file_path):
         expert_stats = torch.load(file_path)
         assert expert_stats.shape == (self.n_layers, self.num_experts)

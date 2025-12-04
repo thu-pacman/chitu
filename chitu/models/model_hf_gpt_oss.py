@@ -11,7 +11,7 @@ from typing_extensions import override
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.distributed.parallel_state import get_tp_size, get_ep_size, get_tp_group
+from chitu.distributed.parallel_state import get_etp_size, get_etp_group
 from chitu.models.model import ParallelMoeBlock
 from chitu.models.model_hf_llama import (
     AttentionHFLlama,
@@ -193,7 +193,7 @@ class GptOssMoeExperts(QuantizedMoeExpertsBase):
                 ),
                 requires_grad=False,
             )
-            if get_tp_group().rank_in_group == 0
+            if get_etp_group().rank_in_group == 0
             else None
         )
 
@@ -246,14 +246,13 @@ class ParallelMoeBlockGptOss(ParallelMoeBlock):
         layer_id: int = 0,
     ):
 
-        split_size = get_tp_size() if get_ep_size() == 1 else 1
-        assert args.moe_intermediate_dim % split_size == 0
+        assert args.moe_intermediate_dim % get_etp_size() == 0
 
         super().__init__(
             gate=GptOssMoeGate(args),
             experts=GptOssMoeExperts(
                 dim=args.dim,
-                moe_inter_dim=args.moe_intermediate_dim // split_size,
+                moe_inter_dim=args.moe_intermediate_dim // get_etp_size(),
                 n_routed_experts=args.num_experts,
                 n_shared_experts=0,
                 n_activated_experts=0,
