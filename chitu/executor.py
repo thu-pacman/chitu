@@ -377,28 +377,22 @@ class ExpertDataDispatcher(TasksDispatcher):
 
         if self.is_main_rank:
             self.socket = self.ctx.socket(zmq.ROUTER)
+            self.socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
             self.socket.bind(self.url)
+            for _ in range(1, self.group_size):
+                msgs = self.socket.recv_multipart()
+                logger.info(f"zmq client {msgs[0].decode()} connected")
+                self.socket.send_multipart(msgs)
         else:
             self.socket = self.ctx.socket(zmq.DEALER)
             self.socket.setsockopt(zmq.IDENTITY, f"{self.rank_in_group}".encode())
-            self._connect_sync()
+            self.socket.connect(self.url)
+            self.socket.send(b"connect")
+            self.socket.recv_multipart()
+            logger.info(f"zmq server connected")
 
         # wait for all ranks to finish binding
         self.dp_group.barrier()
-
-    def _connect_sync(self):
-        """
-        Establish a ZMQ connection to the master and perform synchronization confirmation.
-        This method attempts to connect to the master's ROUTER socket and waits for a confirmation event indicating the connection is established.
-        If no event is received within the specified timeout, a connection timeout exception is raised.
-        """
-        self.socket.connect(self.url)
-        poller = zmq.Poller()
-        poller.register(self.socket, zmq.POLLOUT)
-        timeout = 10000  # 10s timeout
-        events = dict(poller.poll(timeout))
-        if self.socket not in events:
-            raise RuntimeError(f"rank {self.rank}: connect timeout ({timeout}ms)")
 
     def dispatch_metadata(self, tasks):
         if self.is_main_rank:
@@ -439,28 +433,6 @@ class ExpertDataDispatcher(TasksDispatcher):
             return payload_type, local_tasks
 
         else:  # other dp ranks
-            # Bounded wait for incoming metadata to avoid missing the dispatch window (especially in DP warmup).
-            poller = zmq.Poller()
-            poller.register(self.socket, zmq.POLLIN)
-
-            dp_size = get_dp_group().group_size if get_dp_group() is not None else 1
-            total_wait_ms = min(200 * dp_size, 1500)
-            step_ms = 5
-            waited = 0
-            events = {}
-            while waited < total_wait_ms:
-                events = dict(poller.poll(timeout=step_ms))
-                if self.socket in events:
-                    break
-                waited += step_ms
-            if self.socket not in events:
-                # Return a heartbeat payload to let upper layer progress without blocking
-                tasks = PackedTasksBase(
-                    num_tasks=0,
-                    payload_type=SerializedPackedTasksPayloadType.Heartbeat,
-                )
-                return SerializedPackedTasksPayloadType.Heartbeat, tasks
-
             msgs = self.socket.recv_multipart()
             payload_type = SerializedPackedTasksPayloadType[msgs[0].decode()]
             if payload_type in [
@@ -510,6 +482,18 @@ class ExpertDataDispatcher(TasksDispatcher):
                 raise ValueError(f"Unknown payload type: {payload_type}")
             return payload_type, tasks
 
+    def collect_token(self, token_list: list[int]):
+        if self.is_main_rank:
+            all_tokens = [[] for _ in range(self.group_size)]
+            for _ in range(1, self.group_size):
+                msgs = self.socket.recv_multipart()
+                rank_in_group = int(msgs[0].decode())  # zmq identity prepend by ROUTER
+                all_tokens[rank_in_group] = msgpack.unpackb(msgs[1])
+            return sum(all_tokens, token_list)
+        else:
+            self.socket.send_multipart([msgpack.packb(token_list)])
+            return token_list
+
     def epilogue(self, tasks: PackedTasks, logits: torch.Tensor):
         # collect all tokens to DP rank0, and update response
         if len(Backend.last_batch_results) > 0:
@@ -518,57 +502,14 @@ class ExpertDataDispatcher(TasksDispatcher):
             )
         # sampling
         if logits.numel() == 0:  # empty task skip sampling and update response
-            tokens = torch.empty(0, device=self.device, dtype=torch.int64)
+            token_list = []
         else:
-            tokens = Backend.executor.sample(logits, tasks)
-        # collect tokens
-        # Phase 1: all-gather each rank's actual send count to avoid mismatch
-        local_count = torch.tensor(
-            [int(tokens.numel())], dtype=torch.int64, device=self.device
-        )
-        counts = torch.empty(self.group_size, dtype=torch.int64, device=self.device)
-        torch.distributed.all_gather_into_tensor(
-            counts, local_count, group=self.dp_group.gpu_group
-        )
-
-        if self.is_main_rank:
-            expected_sizes = counts.tolist()
-            gather_list = [
-                torch.empty(
-                    (expected_sizes[i],),
-                    device=self.device,
-                    dtype=tokens.dtype,
-                )
-                for i in range(self.group_size)
-            ]
-        else:
-            gather_list = None
-
-        logger.debug(
-            f"[epilogue] rank_in_group={self.rank_in_group} is_main={self.is_main_rank} send_numel={int(tokens.numel())}"
-        )
-        # Fast path: if no rank is expected to produce token this step, skip gather to reduce overhead
-        if not self.is_main_rank:
-            skip_gather = tokens.numel() == 0
-        else:
-            skip_gather = int(counts.sum().item()) == 0
-
-        if not skip_gather:
-            self.dp_group.gather_v(
-                tensor=tokens, gather_list=gather_list, dst=self.dp_main_rank
-            )
-
-        if tokens.numel() == 0 and not self.is_main_rank:
-            return
-
+            token_list = Backend.executor.sample(logits, tasks).cpu().tolist()
+        token_list = self.collect_token(token_list)
         if self.is_main_rank:
             tasks = DPTaskCollector.get_total_packedtasks()
-            tokens = torch.cat(gather_list, dim=0)
-
-        if tokens.numel() == 1:
-            token_list = [int(tokens.item())]
-        else:
-            token_list = tokens.cpu().tolist()
+        elif len(token_list) == 0:
+            return
 
         logger.debug(
             f"[epilogue] main={self.is_main_rank} task_type={tasks.task_type.name} total_tokens={len(token_list)} output_tasks={len(tasks.output_tasks)} all_tasks={len(tasks.tasks)}"

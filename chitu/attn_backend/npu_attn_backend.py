@@ -67,6 +67,11 @@ class NpuAttnBackend(RefAttnBackend):
         self.first_seq_id_per_core = StaticTensor(
             max_nelem=self.max_aiv_num + 1, dtype=torch.int32, device="npu"
         )
+        max_batch_size = self.args.infer.max_reqs
+        max_seq_len = self.args.infer.max_seq_len
+        self.decode_casual_attn_mask = StaticTensor(
+            max_nelem=max_batch_size * 8 * max_seq_len, dtype=torch.bool, device="npu"
+        )
 
     @classmethod
     def should_use_attn_from_cinfer_ascendc(cls, model_type, batch_size):
@@ -121,17 +126,20 @@ class NpuAttnBackend(RefAttnBackend):
             self.args.models.type, seqlen.shape[0]
         ):
             batch = seqlen.shape[0]
-            kvNumHeads = self.local_n_kv_heads
-            if batch * kvNumHeads > self.max_aiv_num:
+            self.batch_size = batch
+            kv_num_heads = self.local_n_kv_heads
+            if batch * kv_num_heads > self.max_aiv_num:
                 seqlen_ = (
-                    seqlen.reshape(batch, 1).broadcast_to(batch, kvNumHeads).reshape(-1)
+                    seqlen.reshape(batch, 1)
+                    .broadcast_to(batch, kv_num_heads)
+                    .reshape(-1)
                 )
                 seqlen_cumsum = torch.cumsum(seqlen_, 0)
-                tot_seqlen = seq_len_delta.new.total_len * kvNumHeads
+                tot_seqlen = seq_len_delta.new.total_len * kv_num_heads
                 used_core_num = (
                     self.max_aiv_num
-                    if self.max_aiv_num < batch * kvNumHeads
-                    else batch * kvNumHeads
+                    if self.max_aiv_num < batch * kv_num_heads
+                    else batch * kv_num_heads
                 )
                 seqlen_cumsum_start_per_core = torch.linspace(
                     0, tot_seqlen, used_core_num + 1, device=seqlen_.device
@@ -156,6 +164,30 @@ class NpuAttnBackend(RefAttnBackend):
                     seqlen_max, seqlen_max, 1, dtype=torch.int32, device=seqlen.device
                 )
             )
+
+            q_len = seq_len_delta.delta_max_len
+            assert q_len > 0
+
+            q_max_len = q_len
+            k_max_len = self.args.infer.max_seq_len
+
+            if q_len > 1:
+                k_lens = seq_len_delta.new.lens_tensor_device
+                # 断言检查（可选，开发阶段保留）
+                assert torch.all(
+                    k_lens > q_len
+                ), "All k_lens must be greater than q_len"
+                # 向量化计算
+                diagonals = k_lens - q_len + 1  # [batch]
+                # 广播计算 mask
+                row_idx = torch.arange(q_max_len, device=seqlen.device)[None, :, None]
+                col_idx = torch.arange(k_max_len, device=seqlen.device)[None, None, :]
+                casual_attn_mask = (col_idx - row_idx) >= diagonals[:, None, None]
+                self.decode_casual_attn_mask.set(casual_attn_mask)
+            else:
+                self.decode_casual_attn_mask.set(
+                    torch.empty(0, dtype=torch.bool, device=seqlen.device)
+                )
 
     @override
     def prefill_ragged_qkvo(
@@ -333,43 +365,50 @@ class NpuAttnBackend(RefAttnBackend):
         if softmax_scale is None:
             softmax_scale = float(1 / math.sqrt(q.shape[-1]))
 
-        # Legacy shape change. TODO: Remve this
-        q = q.unsqueeze(1)
-        k = k.unsqueeze(1) if k is not None else None
-        v = v.unsqueeze(1) if v is not None else None
-
         # update kv cache
         append_to_dense_kv_cache(
             kv_cache.k,
             k,
-            seq_len_delta.old.lens_tensor_device,
+            seq_len_delta.delta_position_ids_tensor_device,
+            seq_len_delta.delta_seq_ids_tensor_device,
             impl="torch" if self.args.models.type == "deepseek-v3" else "torch_npu",
         )
         append_to_dense_kv_cache(
             kv_cache.v,
             v,
-            seq_len_delta.old.lens_tensor_device,
+            seq_len_delta.delta_position_ids_tensor_device,
+            seq_len_delta.delta_seq_ids_tensor_device,
             impl="torch" if self.args.models.type == "deepseek-v3" else "torch_npu",
         )
 
         if self.should_use_attn_from_cinfer_ascendc(self.args.models.type, q.shape[0]):
             output = torch.empty(
-                (q.shape[0], 1, q.shape[2], kv_cache.v.shape[-1]),
+                (q.shape[0], q.shape[1], kv_cache.v.shape[-1]),
                 dtype=q.dtype,
                 device=q.device,
             )
 
+            kv_cache_k = kv_cache.k.contiguous().view(
+                -1, kv_cache.k.shape[-2], kv_cache.k.shape[-1]
+            )
+
+            kv_cache_v = kv_cache.v.contiguous().view(
+                -1, kv_cache.v.shape[-2], kv_cache.v.shape[-1]
+            )
+
             cinfer_ascendc.incre_flash_attention(
                 q.contiguous(),
-                kv_cache.k.contiguous(),
-                kv_cache.v.contiguous(),
+                kv_cache_k,
+                kv_cache_v,
                 seq_len_delta.new.lens_tensor_device,
                 self.max_seq_len.get(),
                 self.first_seq_id_per_core.get(),
+                self.decode_casual_attn_mask.get(),
                 output,
+                self.batch_size,
                 self.local_n_heads,
                 softmax_scale,
-                "BSND",
+                "TND",
                 self.local_n_kv_heads,
             )
 
@@ -378,9 +417,13 @@ class NpuAttnBackend(RefAttnBackend):
             lse = torch.empty(1, dtype=q.dtype, device="npu")
             torch_npu.npu_fused_infer_attention_score.out(
                 q.contiguous(),
-                kv_cache.k.contiguous(),
-                kv_cache.v.contiguous(),
-                input_layout="BSND",
+                kv_cache.k.contiguous().view(
+                    -1, kv_cache.k.shape[-2], kv_cache.k.shape[-1]
+                ),
+                kv_cache.v.contiguous().view(
+                    -1, kv_cache.v.shape[-2], kv_cache.v.shape[-1]
+                ),
+                input_layout="TND",
                 actual_seq_lengths_kv=seq_len_delta.new.lens_list,
                 scale=softmax_scale,
                 num_heads=self.local_n_heads,
@@ -388,7 +431,7 @@ class NpuAttnBackend(RefAttnBackend):
                 out=[output, lse],
             )
 
-        return output.squeeze(1)
+        return output
 
     @override
     def decode_paged_kv(

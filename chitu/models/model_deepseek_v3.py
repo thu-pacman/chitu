@@ -76,7 +76,7 @@ from chitu.tensor_parallel import (
     RowParallelLinear,
     VocabParallelEmbedding,
 )
-from chitu.distributed.parallel_state import get_tp_size, get_ep_size
+from chitu.distributed.parallel_state import get_tp_size, get_etp_size
 from chitu.utils import parse_dtype, try_import_and_setup_torch_npu
 from chitu.lazy import eval_lazy
 
@@ -817,11 +817,10 @@ def MoeExpertsDeepSeekV3(
 
     merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(checkpoint_prefix)
 
-    split_size = get_tp_size() if get_ep_size() == 1 else 1
-    assert args.moe_inter_dim % split_size == 0
+    assert args.moe_inter_dim % get_etp_size() == 0
     return base_moe_experts_class(
         dim=args.dim,
-        moe_inter_dim=args.moe_inter_dim // split_size,
+        moe_inter_dim=args.moe_inter_dim // get_etp_size(),
         n_routed_experts=args.n_routed_experts,
         n_shared_experts=args.n_shared_experts,
         n_activated_experts=args.n_activated_experts,

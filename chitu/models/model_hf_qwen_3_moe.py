@@ -13,7 +13,7 @@ from chitu.models.model import MoeGate, ParallelMoeBlock
 from chitu.models.model_hf_llama import TransformerBlockHFLlama, TransformerHFLlama
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
-from chitu.distributed.parallel_state import get_tp_size, get_ep_size
+from chitu.distributed.parallel_state import get_etp_size
 from chitu.models.registry import ModelType, register_model
 
 
@@ -57,12 +57,11 @@ def Qwen3MoeExperts(
     quant = get_quant_from_checkpoint_prefix(checkpoint_prefix, args.quant_config.rules)
     merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
 
-    split_size = get_tp_size() if get_ep_size() == 1 else 1
-    assert args.moe_intermediate_dim % split_size == 0
+    assert args.moe_intermediate_dim % get_etp_size() == 0
 
     return base_moe_experts_class(
         dim=args.dim,
-        moe_inter_dim=args.moe_intermediate_dim // split_size,
+        moe_inter_dim=args.moe_intermediate_dim // get_etp_size(),
         n_routed_experts=args.num_experts,
         n_shared_experts=0,
         n_activated_experts=0,
