@@ -77,10 +77,11 @@ class MoEImpl:
             args.models.n_dense_layers if hasattr(args.models, "n_dense_layers") else 0
         )
         self.moe_layer_id_list = [x for x in range(self.n_dense_layers, self.n_layers)]
-        # self.n_global_experts_slots = args.model.n_global_experts_slots
         self.n_global_experts_slots = (
-            (self.num_experts + self.ep_size - 1) // self.ep_size
-        ) * self.ep_size
+            ((self.num_experts + self.ep_size - 1) // self.ep_size) * self.ep_size
+            if args.infer.num_experts_slots is None
+            else args.infer.num_experts_slots
+        )
 
         self._init_token_dispatcher()
         self._init_experts_impl()
@@ -122,7 +123,7 @@ class MoEImpl:
         # impl initialization
         if self.prefill_token_dispatcher_impl == "deepep-nl":
             self.prefill_token_dispatcher = MoENormalTokenDispatcher(
-                self.num_experts,
+                self.n_global_experts_slots,
                 self.hidden_dim,
                 mode=(
                     "auto"
@@ -145,7 +146,7 @@ class MoEImpl:
 
         if self.decode_token_dispatcher_impl == "deepep-ll":
             self.decode_token_dispatcher = MoELowLatencyTokenDispatcher(
-                self.num_experts, self.hidden_dim
+                self.n_global_experts_slots, self.hidden_dim
             )
             self.decode_experts_impl = "ep_group_gemm_masked"
         elif (

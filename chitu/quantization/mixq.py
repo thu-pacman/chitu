@@ -34,7 +34,7 @@ class MixQLinear(QuantizedLinearBase):
         # Only used on Hygon path; ignored otherwise
         process_block_size: int = 512,
     ):
-        super().__init__()
+        super().__init__(in_features, out_features, has_bias)
         assert fp_features_num % 128 == 0, "fp_features_num must be divisible by 128"
         assert w_bits in (4, 8), "w_bits must be either 4 or 8"
 
@@ -46,8 +46,6 @@ class MixQLinear(QuantizedLinearBase):
             ), "For int4 packing, quantized features must be even"
             quantized_in_features //= 2
 
-        self.in_features = in_features
-        self.out_features = out_features
         self.w_bits = w_bits
         self.a_bits = a_bits
         self.fp_features_num = fp_features_num

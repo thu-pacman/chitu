@@ -31,10 +31,8 @@ class W4A8PerTokenPerGroupAsymmLinear(
         group_size: int = 128,
     ):
 
-        super().__init__()
+        super().__init__(in_features, out_features, has_bias)
 
-        self.in_features = in_features
-        self.out_features = out_features
         self.group_size = group_size
 
         assert self.in_features % 2 == 0, "in_features must be even for int4 packing"

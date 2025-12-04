@@ -31,38 +31,13 @@ if {[llength $argv] > 0} {
 
 set world_size_arg [expr {$tp_size_arg * $pp_size_arg}]
 
-# Execute the check_npus.sh script to get NPU information
-set check_output [exec bash -c "source script/check_npus.sh 2>/dev/null"]
-
 exec pip install evalscope==1.0.2 -i https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null
 
 set version_output [exec sh -c {pip list | grep -i evalscope}]
 puts "EvalScope version: $version_output"
 
 
-# Initialize variables
-set USE_NPU 0
-set NPU_TYPE ""
-
-# Parse the output to get USE_NPU and NPU_TYPE
-foreach line [split $check_output "\n"] {
-    if {[string match "USE_NPU=*" $line]} {
-        set USE_NPU [string range $line 8 end]
-    }
-    if {[string match "NPU_TYPE=*" $line]} {
-        set NPU_TYPE [string range $line 9 end]
-    }
-}
-
-puts "USE_NPU = $USE_NPU"
-if {$USE_NPU == 1} {
-    puts "NPU_TYPE = $NPU_TYPE"
-}
-
 set ATNN_TYPE_ARG "infer.attn_type=flash_attn"
-if {$USE_NPU == 1} {
-    set ATNN_TYPE_ARG "infer.attn_type=npu"
-}
 
 # Launch the server
 set cmd "torchrun --nproc_per_node $world_size_arg -m chitu \

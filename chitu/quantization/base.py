@@ -22,7 +22,20 @@ class QuantizedLinearBase(torch.nn.Module):
     Defines the interface that all quantized linear implementations must follow.
     """
 
-    pass
+    def __init__(self, in_features: int, out_features: int, has_bias: bool = True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.has_bias = has_bias
+
+    def __repr__(self):
+        inheritance_order = []
+        for cls in self.__class__.__mro__:
+            if cls is torch.nn.Module:
+                break
+            inheritance_order.append(cls.__name__)
+        inheritance_order_str = " <- ".join(inheritance_order)
+        return f"{inheritance_order_str}(in_features={self.in_features}, out_features={self.out_features}, has_bias={self.has_bias})"
 
 
 class QuantizedMoeExpertsBase(torch.nn.Module):
@@ -76,7 +89,17 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
             num_local_slots = self.moe_impl.load_balancer[
                 layer_id
             ].get_num_local_slots()
+            self.experts_start_idx = moe_rank * num_local_slots
             self.group_size = num_local_slots
+
+    def __repr__(self):
+        inheritance_order = []
+        for cls in self.__class__.__mro__:
+            if cls is torch.nn.Module:
+                break
+            inheritance_order.append(cls.__name__)
+        inheritance_order_str = " <- ".join(inheritance_order)
+        return f"{inheritance_order_str}(dim={self.dim}, moe_inter_dim={self.moe_inter_dim}, n_routed_experts={self.n_routed_experts}, n_shared_experts={self.n_shared_experts}, n_activated_experts={self.n_activated_experts})"
 
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
         """

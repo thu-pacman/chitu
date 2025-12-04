@@ -290,7 +290,7 @@ def _warmup_via_taskpool(args):
         Backend.scheduler.end_warmup()
 
     # Decode phase: DP 场景需要特殊处理
-    if get_global_args().infer.dp_size > 1 and num_required_prefill_schedules > 1:
+    if get_global_args().infer.dp_size > 1:
         # 因为num_required_prefill_schedules > 1的时候会出现 prefill iteration不一致的情况，所以需要同步一下，否则会卡死
         # Example: DP2, TP2, max_reqs=5, prefill_chunk_size=16, num_required_prefill_schedules=2
         get_dp_group().barrier()

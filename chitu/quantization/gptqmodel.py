@@ -147,14 +147,11 @@ class GPTQLinear(QuantizedLinearBase):
         ############################################
         # No parameters specific to this quantization
     ):
-        super().__init__()
+        super().__init__(in_features, out_features, has_bias)
         self.pack_dtype_bits = 32
         self.bits = 8
         self.pack_factor = self.pack_dtype_bits // self.bits
         self.group_size = 128
-
-        self.in_features = in_features
-        self.out_features = out_features
 
         self.qweight = torch.nn.Parameter(
             torch.empty(

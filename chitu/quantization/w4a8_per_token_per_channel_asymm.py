@@ -33,10 +33,7 @@ class W4A8PerTokenPerChannelAsymmLinear(
         # No parameters specific to this quantization
     ):
 
-        super().__init__()
-
-        self.in_features = in_features
-        self.out_features = out_features
+        super().__init__(in_features, out_features, has_bias)
 
         # In the checkpoint, self.qweight is in Packed4BitWeightQServe layout. Here we
         # mark the layout via `self._qweight_layout_class` and `self._qweight_plain_shape`,

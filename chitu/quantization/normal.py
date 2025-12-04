@@ -77,11 +77,7 @@ class NormalLinear(QuantizedLinearBase):
             bias_dtype: The desired data type of the bias. Defaults to `dtype`.
         """
 
-        super().__init__()
-
-        # These attributes are unused, but keep them compatible with nn.Linear
-        self.in_features = in_features
-        self.out_features = out_features
+        super().__init__(in_features, out_features, has_bias)
 
         self.weight = torch.nn.Parameter(
             torch.empty(self.out_features, in_features, dtype=dtype),
@@ -323,9 +319,7 @@ class NormLinearCPUInfer(QuantizedLinearBase):
         dtype=None,
         bias_dtype=None,
     ):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
+        super().__init__(in_features, out_features, has_bias)
         self.stride = 64
         self.group_max_len = 1024
         if torch.distributed.get_rank() == 0:

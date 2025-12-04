@@ -25,7 +25,7 @@ class AutoAWQLinear(QuantizedLinearBase):
         ############################################
         # No parameters specific to this quantization
     ):
-        super().__init__()
+        super().__init__(in_features, out_features, has_bias)
         from awq.modules.linear import WQLinear_GEMM
 
         wqlinear = WQLinear_GEMM(
