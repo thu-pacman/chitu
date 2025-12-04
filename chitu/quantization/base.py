@@ -89,6 +89,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
             num_local_slots = self.moe_impl.load_balancer[
                 layer_id
             ].get_num_local_slots()
+            self.experts_start_idx = moe_rank * num_local_slots
             self.group_size = num_local_slots
 
     def __repr__(self):

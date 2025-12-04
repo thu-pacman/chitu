@@ -37,13 +37,14 @@ def gen_mapping_from_instance_idx(
         for ep_rank in range(ep_size):
             expert_mapping_list[ep_rank][e] = instance_idx[e][groups[ep_rank]]
 
-    for ep_rank in range(ep_size):
-        mapping = torch.zeros(num_experts, dtype=torch.int32)
-        for e in range(num_experts):
-            mapping[e] = expert_mapping_list[ep_rank][e]
-        if is_cuda:
-            mapping = mapping.to(torch.cuda.current_device())
-        expert_mapping_list[ep_rank] = mapping
+    expert_mapping_list = [
+        torch.tensor(
+            expert_mapping_list[ep_rank],
+            device=torch.cuda.current_device(),
+            dtype=torch.int32,
+        )
+        for ep_rank in range(ep_size)
+    ]
 
     return expert_mapping_list
 
@@ -67,7 +68,7 @@ class MoELargeScaleNaiveLoadBalancer(MoELoadBalancer):
     def generate_expert_mapping(
         self,
         expert_stats: Optional[torch.Tensor] = None,
-        eplb: bool = True,
+        eplb: bool = False,
     ):
         self.num_local_slots = self.num_slots // self.ep_size
 
@@ -153,13 +154,15 @@ class MoELargeScaleNaiveLoadBalancer(MoELoadBalancer):
                 "num_local_slots must be set before greedy assignment. Call generate_expert_mapping()."
             )
         assert expert_stats.shape == (self.num_experts,)
-        instance_counter = [1 for _ in range(self.num_experts)]
+        instance_counter = [1] * self.num_experts
         remain_slots = self.num_slots - self.num_experts
         expert_slots_map = [i for i in range(self.num_experts)]
         expert_slot_load = [expert_stats[i] for i in range(self.num_experts)]
         for _ in range(remain_slots):
-            expert_id = int(torch.argmax(expert_stats / instance_counter))
+            expert_id = torch.argmax(expert_stats)
             instance_counter[expert_id] += 1
+            cnt = instance_counter[expert_id]
+            expert_stats[expert_id] = expert_stats[expert_id] * cnt / (cnt + 1)
             expert_slots_map.append(expert_id)
             expert_slot_load.append(expert_stats[expert_id])
         expert_slot_load = [

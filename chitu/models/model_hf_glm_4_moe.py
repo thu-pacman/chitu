@@ -397,14 +397,10 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
                 )
                 for layer_id in self.moe_impl.moe_layer_id_list
             ]
-            moe_layer_id_list = self.moe_impl.moe_layer_id_list
         else:
             local_experts = [
                 list(range(self.experts_start_idx, self.experts_end_idx))
             ] * (self.args.models.n_layers - n_dense_layers)
-            moe_layer_id_list = [
-                x for x in range(n_dense_layers, self.args.models.n_layers)
-            ]
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
