@@ -711,6 +711,7 @@ class BatchResult:
 class TaskPool:
     pool: dict[str, Task] = {}
     id_list: list[str] = []
+    pending_queue: deque[Task] = Deque()
 
     def __bool__(self):
         return len(self.pool) > 0
@@ -734,6 +735,15 @@ class TaskPool:
         cls.pool[task.task_id] = task
         cls.id_list.append(task.task_id)
         return True
+
+    @classmethod
+    def enqueue(cls, task: Task):
+        cls.pending_queue.append(task)
+
+    @classmethod
+    def add_all_queued(cls):
+        while cls.pending_queue:
+            cls.add(cls.pending_queue.popleft())
 
     @classmethod
     def remove(cls, task_id: str):
