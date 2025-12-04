@@ -103,7 +103,9 @@ def append_to_dense_kv_cache(
             kv_cache, this_kv, delta_position_ids, delta_seq_ids
         )
     elif impl == "torch_npu" and has_torch_npu:
-        torch_npu.scatter_update_(kv_cache, delta_position_ids, this_kv, 1)
+        append_to_dense_kv_cache_torch_npu(
+            kv_cache, this_kv, delta_position_ids, delta_seq_ids
+        )
 
 
 def append_to_paged_kv_cache_torch(
@@ -166,6 +168,30 @@ def append_to_dense_kv_cache_torch(
     kv_cache[delta_seq_ids, delta_position_ids] = this_kv.view(
         this_kv.shape[0], *kv_cache.shape[2:]
     )
+
+
+def append_to_dense_kv_cache_torch_npu(
+    kv_cache: torch.Tensor,  # (batch_size, seq_len, other contiguous dims...)
+    this_kv: torch.Tensor,  # (num_tokens, other contiguous dims...)
+    delta_position_ids: torch.Tensor,  # (num_tokens,)
+    delta_seq_ids: Optional[torch.Tensor] = None,  # (num_tokens,)
+):
+    if this_kv.shape[0] == kv_cache.shape[0]:
+        torch_npu.scatter_update_(kv_cache, delta_position_ids, this_kv.unsqueeze(1), 1)
+    else:
+        if delta_seq_ids is None:
+            raise ValueError(
+                f"batch_size ({kv_cache.shape[0]}) must be equal to num_tokens "
+                f"({delta_position_ids.shape[0]}) if ignoring delta_seq_ids"
+            )
+        absolute_position_ids = delta_position_ids + delta_seq_ids * kv_cache.shape[1]
+        indices = (
+            absolute_position_ids
+            - torch.arange(this_kv.shape[0], dtype=torch.int32, device=this_kv.device)
+        ) * this_kv.shape[1]
+        torch_npu.scatter_update_(
+            kv_cache.view(-1, *kv_cache.shape[2:]), indices, this_kv, 1
+        )
 
 
 def read_from_paged_kv_cache(
