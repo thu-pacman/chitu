@@ -74,7 +74,14 @@ class CommGroup:
         for rank_list in rank_lists:
             contains_this_rank.append(global_rank in rank_list)
 
-        assert contains_this_rank.count(True) == 1
+        if contains_this_rank.count(True) == 0:
+            raise ValueError(
+                "Although undocumented, torch.distributed requires every rank to be in "
+                "rank_lists. If some of the ranks do not participate in the communicatoin, "
+                "please put them in dummy sub-groups."
+            )
+        if contains_this_rank.count(True) > 1:
+            raise ValueError("One rank can not participate in multiple sub-groups.")
         this_rank_idx = contains_this_rank.index(True)
         self.cpu_group = cpu_groups[this_rank_idx]
         self.gpu_group = gpu_groups[this_rank_idx]
@@ -134,6 +141,14 @@ class CommGroup:
         op: torch.distributed.ReduceOp.RedOpType = torch.distributed.ReduceOp.SUM,
     ):
         torch.distributed.all_reduce(tensor, group=self.gpu_group, op=op)
+
+    def reduce(
+        self,
+        tensor: torch.Tensor,
+        dst: int,
+        op: torch.distributed.ReduceOp.RedOpType = torch.distributed.ReduceOp.SUM,
+    ):
+        torch.distributed.reduce(tensor, dst=dst, group=self.gpu_group, op=op)
 
     def broadcast(self, tensor: torch.Tensor, src: int = 0):
         torch.distributed.broadcast(tensor, src=src, group=self.gpu_group)

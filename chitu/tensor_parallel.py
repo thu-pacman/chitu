@@ -15,6 +15,7 @@ from logging import getLogger
 from chitu.quantization import QuantizationRegistry
 from chitu.device_type import is_ascend
 from chitu.distributed.parallel_state import get_tp_group, get_tp_size
+from chitu.distributed.comm_group import CommGroup
 from chitu.ops.quant import linear
 
 logger = getLogger(__name__)
@@ -98,6 +99,7 @@ def ColumnParallelLinear(
     out_features: int,
     has_bias: bool = True,
     gather_output: bool = True,
+    tp_group: Optional[CommGroup] = None,
     *,
     checkpoint_prefix: str,
     base_linear_class: Optional[type] = None,
@@ -126,6 +128,7 @@ def ColumnParallelLinear(
         out_features=out_features,
         has_bias=has_bias,
         gather_output=gather_output,
+        tp_group=tp_group,
     )
 
 
@@ -160,6 +163,7 @@ def RowParallelLinear(
     has_bias: bool = True,
     input_is_parallel: bool = False,
     reduce_output: bool = True,
+    tp_group: Optional[CommGroup] = None,
     *,
     checkpoint_prefix: str,
     base_linear_class: Optional[type] = None,
@@ -188,6 +192,7 @@ def RowParallelLinear(
         has_bias=has_bias,
         input_is_parallel=input_is_parallel,
         reduce_output=reduce_output,
+        tp_group=tp_group,
     )
 
 
@@ -198,6 +203,7 @@ class ColumnParallelLinearMixIn:
         out_features: int,
         has_bias: bool = True,
         gather_output: bool = True,
+        tp_group: Optional[CommGroup] = None,
     ):
         """
         Ouput-dimension-parallelized linear layer
@@ -207,10 +213,12 @@ class ColumnParallelLinearMixIn:
             out_features: size of each output sample
             has_bias: If set to True, the layer will have a bias.
             gather_output: If set to True, an all-gather operation is performed on the output tensor.
+            tp_group: The tensor parallel communication group, defaults to get from get_tp_group.
         """
 
-        tp_group = get_tp_group().gpu_group
-        tp_size = get_tp_size()
+        if tp_group is None:
+            tp_group = get_tp_group()
+        tp_size = tp_group.group_size
 
         assert out_features % tp_size == 0, "out_features must be divisible by tp_size"
         local_out_features = out_features // tp_size
@@ -234,12 +242,10 @@ class ColumnParallelLinearMixIn:
         y = super().forward(x)
         if self.gather_output and self.tp_size > 1:
             y_transposed = y.permute(-1, *range(y.dim() - 1)).contiguous()
-            shape = list(y_transposed.shape)
-            shape[0] *= self.tp_size
-            y_gathered = y.new_empty(shape)
-            torch.distributed.all_gather_into_tensor(
-                y_gathered, y_transposed, group=self.tp_group
+            y_gathered = y.new_empty(
+                y_transposed.shape[0] * self.tp_size, *y_transposed.shape[1:]
             )
+            self.tp_group.all_gather_into_tensor(y_gathered, y_transposed)
             y = y_gathered.permute(*range(1, y.dim()), 0)
         return y
 
@@ -252,6 +258,7 @@ class RowParallelLinearMixIn:
         has_bias: bool = True,
         input_is_parallel: bool = False,
         reduce_output: bool = True,
+        tp_group: Optional[CommGroup] = None,
     ):
         """
         Input-dimension-parallelized linear layer
@@ -262,11 +269,13 @@ class RowParallelLinearMixIn:
             has_bias: If set to True, the layer will have a bias.
             input_is_parallel: If set to True, the input tensor is already parallelized.
             reduce_output: If set to True, an all-reduce operation is performed on the output tensor.
+            tp_group: The tensor parallel communication group, defaults to get from get_tp_group.
         """
 
-        tp_group = get_tp_group().gpu_group
-        rank = get_tp_group().rank_in_group
-        tp_size = get_tp_size()
+        if tp_group is None:
+            tp_group = get_tp_group()
+        rank = tp_group.rank_in_group
+        tp_size = tp_group.group_size
 
         assert in_features % tp_size == 0, "in_features must be divisible by tp_size"
         local_in_features = in_features // tp_size
@@ -300,9 +309,9 @@ class RowParallelLinearMixIn:
 
         if self.reduce_output and self.tp_size > 1:
             if dst == -1:
-                torch.distributed.all_reduce(y, group=self.tp_group)
+                self.tp_group.all_reduce(y, op=torch.distributed.ReduceOp.SUM)
             else:
-                torch.distributed.reduce(y, dst=dst, op=torch.distributed.ReduceOp.SUM)
+                self.tp_group.reduce(y, dst=dst, op=torch.distributed.ReduceOp.SUM)
 
         return y
 

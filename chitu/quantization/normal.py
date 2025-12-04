@@ -8,9 +8,6 @@ import functools
 import torch
 import ctypes
 
-from chitu.tensor_parallel import (
-    get_tp_size,
-)
 from chitu.quantization.base import (
     QuantizedLinearBase,
     QuantizedMoeExpertsBase,
@@ -430,6 +427,9 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
             args (ModelArgs): Model arguments containing MoE parameters.
         """
         super().__init__()
+
+        from chitu.tensor_parallel import get_tp_size
+
         self.merge_gate_up = merge_gate_up
         self.moe_inter_dim = moe_inter_dim * get_tp_size()
         self.ep_group = get_ep_group()
