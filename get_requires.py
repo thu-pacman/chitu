@@ -89,6 +89,9 @@ extras_require = {
             # !=0.2.6: https://github.com/flashinfer-ai/flashinfer/issues/1139
         ),
     ],
+    "flash_linear_attention": [
+        "flash-linear-attention",
+    ],
     "flash_mla": [
         "flash_mla @ file://localhost"
         + os.path.join(setup_dir, "third_party/FlashMLA"),

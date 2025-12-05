@@ -18,6 +18,10 @@ from chitu.ops.moe_sum import (
     moe_sum_expert_block_permuted,
     moe_sum_expert_concat_permuted,
 )
+from chitu.ops.linear_attn import (
+    chunk_gated_delta_rule,
+    recurrent_gated_delta_rule,
+)
 from chitu.ops.quant import (
     linear,
     blockfp8_einsum_shc_hdc_shd,

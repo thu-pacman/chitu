@@ -347,11 +347,13 @@ class PagedKVCacheManager(KVCacheManagerBase):
             device=device,
         )
 
-        self.max_blocks_per_req = ceil_div(max_seq_len, block_size)
+        self.max_blocks_per_req = 1 if lazy_mode else ceil_div(max_seq_len, block_size)
         self.max_num_blocks = self.max_blocks_per_req * num_hot_req
         if num_blocks == -1:  # Being warmed-up
             # Should be consistent with `_warmup_via_taskpool` in `chitu_main.py`
-            if get_global_args().infer.prefill_chunk_size is not None:
+            if get_global_args().infer.prefill_chunk_size is None or lazy_mode:
+                self.num_blocks = num_hot_req
+            else:
                 self.num_blocks = (
                     ceil_div(
                         get_global_args().infer.prefill_chunk_size // num_hot_req + 1,
@@ -359,8 +361,6 @@ class PagedKVCacheManager(KVCacheManagerBase):
                     )
                     * num_hot_req
                 )
-            else:
-                self.num_blocks = num_hot_req
         else:
             self.num_blocks = num_blocks
 
