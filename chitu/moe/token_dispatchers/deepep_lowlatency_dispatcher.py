@@ -66,15 +66,17 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         if self.profile:
             self.cumulative_local_expert_recv_stats = [
                 torch.zeros((self.num_local_experts,), dtype=torch.int, device="cuda")
-                for _ in range(61)
+                for _ in range(get_global_args().models.n_layers)
             ]
         else:
-            self.cumulative_local_expert_recv_stats = [None for _ in range(61)]
+            self.cumulative_local_expert_recv_stats = [
+                None for _ in range(get_global_args().models.n_layers)
+            ]
 
     def dump_and_reset_profile(self):
         if self.profile:
             # TODO(zms): remove moe layer range hard coding
-            for layer_id in range(3, 61):
+            for layer_id in range(3, get_global_args().models.n_layers):
                 expert_stats = torch.zeros(
                     (self.num_experts,), dtype=torch.int, device="cuda"
                 )

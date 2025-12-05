@@ -176,7 +176,7 @@ async def create_chat_completion(
             stop_with_eos=stop_with_eos,
             priority=get_priority_from_api_key(api_key),
         )
-        TaskPool.add(task)
+        TaskPool.enqueue(task)
         if stream:
             return StreamingResponse(
                 response.stream_generator(), media_type="text/event-stream"

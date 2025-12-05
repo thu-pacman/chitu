@@ -36,6 +36,7 @@ async def process_queue():
         asyncio.create_task(heartbeat_timer(60))
     global min_batch_size
     while True:
+        TaskPool.add_all_queued()
         if (len(TaskPool.pool) >= min_batch_size) or rank != 0:
             min_batch_size = 1
             chitu_run()

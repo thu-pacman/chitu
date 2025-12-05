@@ -99,6 +99,7 @@ extras_require = {
     ],
     "deep_ep": [
         "deep_ep @ file://localhost" + os.path.join(setup_dir, "third_party/DeepEP"),
+        "nvidia-nvshmem-cu12",
     ],  # export NVSHMEM_DIR=/path/to/installed/nvshmem
     "hard_fp4_kernels": [
         "hard_fp4_kernels @ file://localhost"
