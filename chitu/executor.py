@@ -369,6 +369,7 @@ class ExpertDataDispatcher(TasksDispatcher):
         self.num_nodes_per_dp = get_world_group().group_size // self.group_size
 
         self.init_zmq()
+        self.mtp_size = get_global_args().infer.mtp_size
 
     def init_zmq(self):
         self.ctx = zmq.Context.instance()
@@ -593,6 +594,8 @@ class Executor:
         self.pp_size = args.infer.pp_size
         self.tp_size = args.infer.tp_size
         self.dp_size = args.infer.dp_size
+        self.dim_ = args.models.dim
+        self.mtp_size = args.infer.mtp_size
         self.pipe_dispatcher = None
         self.dp_dispatcher = None
         self.task_dispatchers = []
@@ -670,6 +673,9 @@ class Executor:
             device=self.local_rank,
             dtype=torch.long,
         )
+
+    def _prepare_lhs_for_decode(self, tasks: PackedTasks):
+        return torch.cat([task._last_hidden_states for task in tasks.tasks], dim=0)
 
     def vision_tensor_broadcast(
         self,
@@ -1086,16 +1092,29 @@ class Executor:
         # prepare payload tensor
         if self.rank == 0 or self.dp_size > 1 and self.dp_dispatcher is not None:
             payload = self._prepare_new_tokens_for_decode(tasks)  # tensor
+            if self.mtp_size > 1:
+                payload_lhs = self._prepare_lhs_for_decode(tasks)
         else:
             payload = torch.empty(
                 self.get_payload_shape(num_tokens),
                 dtype=self.get_payload_dtype(),
                 device=self.local_rank,
             )
+            if self.mtp_size > 1:
+                payload_lhs = torch.empty(
+                    [num_tokens, self.dim_],
+                    dtype=torch.get_default_dtype(),
+                    device=self.local_rank,
+                )
 
         # payload recv
         for dispatcher in self.task_dispatchers:
             payload = dispatcher.recv_payload(payload)
+            if self.mtp_size > 1:
+                payload_lhs = dispatcher.recv_payload(payload_lhs)
+
+        if self.mtp_size > 1:
+            Backend.model.mtp_last_hidden_states_static.set(payload_lhs)
 
         self.timers("decode").start()
         out = Backend.model.decode(payload, len(tasks.req_ids))
@@ -1278,7 +1297,25 @@ class Executor:
 
         # ---dependent on tokens_cpu ---
         for it, task in enumerate(tasks.output_tasks):
-            task.update_response_no_sync(token_list[it])
+            if not self.mtp_size > 1:
+                task.update_response_no_sync(token_list[it])
+            else:
+                task.update_response_no_sync(
+                    token_list[it],
+                    (
+                        1
+                        if not Backend.model.token_offset_list
+                        else Backend.model.token_offset_list[it]
+                    ),
+                )
+                task.mtp_token_list = (
+                    []
+                    if not Backend.model.mtp_token_list
+                    else Backend.model.mtp_token_list[it]
+                )
+                task._last_hidden_states = (
+                    Backend.model.last_hidden_states_4_postprocess[it : it + 1, :]
+                )
             task._last_tokens = [token_list[it]]
 
         # test
@@ -1297,8 +1334,10 @@ class Executor:
         next_token_list: list[int] = []
         logprobs_list: list[list[float]] = []
         token_idxs_list: list[list[int]] = []
+        mtp_token_list: list[list[int]] = []
         for it, task in enumerate(batch_result.tasks):
             next_token_list.append(batch_result.next_tokens[it])
+            mtp_token_list.append(batch_result.mtp_token_list[it])
         if batch_result.return_logprobs:
             for it, task in enumerate(batch_result.tasks):
                 logprobs, token_idxs = (
@@ -1313,7 +1352,12 @@ class Executor:
                 batch_result.tasks, next_token_list, logprobs_list, token_idxs_list
             )
         else:
-            self._token_sink.emit_batch(batch_result.tasks, next_token_list)
+            if self.mtp_size > 1:
+                self._token_sink.emit_batch(
+                    batch_result.tasks, next_token_list, mtp_token_list=mtp_token_list
+                )
+            else:
+                self._token_sink.emit_batch(batch_result.tasks, next_token_list)
         for task in batch_result.tasks:
             task.can_stop()
 

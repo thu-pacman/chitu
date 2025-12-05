@@ -246,6 +246,20 @@ class KVCacheManagerBase:
 
         self.timers = get_timers()
 
+        self.mtp_size = get_global_args().infer.mtp_size
+        if self.mtp_size > 1:
+            self.mtp_seq_len_delta = BatchedSeqLenDelta(
+                device=self.device,
+                max_batch_size=num_hot_req,
+                max_total_len=self.max_total_len,
+                max_total_delta_len=self.max_total_delta_len,
+                cache_prefix_lens_tensor_device=True,
+                cache_position_ids_tensor_device=True,
+                cache_seq_ids_tensor_device=True,
+                cache_delta_position_ids_tensor_device=True,
+                cache_delta_seq_ids_tensor_device=True,
+            )
+
     def prepare_cache_prefill(self, req_ids: list[str], delta_seq_len: list[int]):
         self.curr_req_ids = req_ids
 
@@ -267,6 +281,8 @@ class KVCacheManagerBase:
             cache_seq_ids_tensor_device=False,
         )
         self.seq_len_delta.copy_from(prev_seq_len, next_seq_len)
+        if self.mtp_size > 1:
+            self.mtp_seq_len_delta.copy_from(prev_seq_len, next_seq_len)
 
         for req_id, seq_len in zip(req_ids, next_seq_len.lens_list):
             self.req_id_to_seq_len[req_id] = seq_len
@@ -279,11 +295,29 @@ class KVCacheManagerBase:
 
         self.seq_len_delta.copy_from_list(
             [self.req_id_to_seq_len[req_id] for req_id in req_ids],
-            [self.req_id_to_seq_len[req_id] + 1 for req_id in req_ids],
+            [self.req_id_to_seq_len[req_id] + self.mtp_size for req_id in req_ids],
         )
 
         for req_id in req_ids:
-            self.req_id_to_seq_len[req_id] += 1
+            self.req_id_to_seq_len[req_id] += self.mtp_size
+
+    def update_mtp_cache_decode(self, mtp_offset: list[int]):
+        req_ids = self.curr_req_ids
+        for req_id, off_set in zip(req_ids, mtp_offset):
+            self.req_id_to_seq_len[req_id] += off_set - self.mtp_size
+
+    def prepare_mtp_cache_decode(self, mtp_offset: int):
+        req_ids = self.curr_req_ids
+        self.mtp_seq_len_delta.copy_from_list(
+            [
+                self.req_id_to_seq_len[req_id] - self.mtp_size + mtp_offset
+                for req_id in req_ids
+            ],
+            [
+                self.req_id_to_seq_len[req_id] - self.mtp_size + mtp_offset + 1
+                for req_id in req_ids
+            ],
+        )
 
     def get_block_size(self):
         """Return the number of tokens that a block can accommodate"""
@@ -465,11 +499,24 @@ class PagedKVCacheManager(KVCacheManagerBase):
             self.seq_len_delta.delta_position_ids_tensor_device // self.block_size,
         ]
 
+    @cuda_graph_safe_cached_property("_page_ids_static_tensor", "_page_ids_up_to_date")
+    def page_ids_mtp(self):
+        return self.gpu_block_table.get()[
+            self.mtp_seq_len_delta.delta_seq_ids_tensor_device,
+            self.mtp_seq_len_delta.delta_position_ids_tensor_device // self.block_size,
+        ]
+
     @cuda_graph_safe_cached_property(
         "_offs_in_page_static_tensor", "_offs_in_page_up_to_date"
     )
     def offs_in_page(self):
         return self.seq_len_delta.delta_position_ids_tensor_device % self.block_size
+
+    @cuda_graph_safe_cached_property(
+        "_offs_in_page_static_tensor", "_offs_in_page_up_to_date"
+    )
+    def offs_in_page_mtp(self):
+        return self.mtp_seq_len_delta.delta_position_ids_tensor_device % self.block_size
 
     def _upd_gpu_block_table(self, req_ids: list[str]):
         if get_global_args().infer.use_cuda_graph:
@@ -487,6 +534,10 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.gpu_block_table.set_shape(cpu_block_table_tensor.shape)
         self.gpu_block_table.get().copy_(cpu_block_table_tensor, non_blocking=True)
 
+        self._page_ids_up_to_date = False
+        self._offs_in_page_up_to_date = False
+
+    def update_page_offs(self):
         self._page_ids_up_to_date = False
         self._offs_in_page_up_to_date = False
 
@@ -557,17 +608,27 @@ class PagedKVCacheManager(KVCacheManagerBase):
         return self.gpu_block_table.get()
 
     @override
-    def get_accessor(self, layer_id: int) -> PagedKVCacheAccessor:
+    def get_accessor(self, layer_id: int, is_mtp: bool = False) -> PagedKVCacheAccessor:
         local_layer_id = self.layer_id_map.to_local(layer_id)
         ret_kv = {
             key: cache[local_layer_id] for key, cache in self.paged_kv_cache.items()
         }
-        return PagedKVCacheAccessor(
-            self.get_gpu_block_table(),
-            ret_kv,
-            lambda: self.page_ids,
-            lambda: self.offs_in_page,
-        )
+
+        if is_mtp:
+            return PagedKVCacheAccessor(
+                self.get_gpu_block_table(),
+                ret_kv,
+                lambda: self.page_ids_mtp,
+                lambda: self.offs_in_page_mtp,
+            )
+
+        else:
+            return PagedKVCacheAccessor(
+                self.get_gpu_block_table(),
+                ret_kv,
+                lambda: self.page_ids,
+                lambda: self.offs_in_page,
+            )
 
     def free_req_cache_blocks(self, req_id: str):
         self.timers("free_req_cache_blocks").start()
@@ -675,6 +736,9 @@ class DenseKVCacheManager(KVCacheManagerBase):
 
         self.slot_handle = get_slot_handle()
 
+    def update_page_offs(self):
+        pass
+
     @override
     def get_block_size(self):
         """Return the number of tokens that a block can accommodate"""
@@ -755,7 +819,7 @@ class DenseKVCacheManager(KVCacheManagerBase):
             ]
 
     @override
-    def get_accessor(self, layer_id: int) -> DenseKVCacheAccessor:
+    def get_accessor(self, layer_id: int, is_mtp: bool = False) -> PagedKVCacheAccessor:
         local_layer_id = self.layer_id_map.to_local(layer_id)
         ret_kv = {
             key: cache[local_layer_id] for key, cache in self.prepared_cache.items()

@@ -220,7 +220,12 @@ class UserRequest:
         top_token_idx=None,
         *,
         notify_server: bool = True,
+        value_list: list[int] = [],
     ):
+        for i in value_list:
+            self.async_stream.add_data(
+                i, top_logprobs, top_token_idx, notify_server=notify_server
+            )
         self.async_stream.add_data(
             value, top_logprobs, top_token_idx, notify_server=notify_server
         )
@@ -375,6 +380,7 @@ class Task:
             self.response = DeviceList([], dtype=torch.long, device="cuda")
         self.num_new_tokens: int = 0
         self.next_token: int = -1  # Only effective when num_new_tokens > 0
+        self.mtp_token_list: list[int] = []
         self.record_next_token: Union[int, torch.Tensor, None] = None
         self.sync_new_token: bool = True
 
@@ -398,6 +404,7 @@ class Task:
         self.priority = priority
         self.sched_score = 0
         self.max_output_tokens = 1024  # TODO: replace hardcode by parameter
+        self._last_hidden_states = None
         self.sched_ddl = (
             time.perf_counter_ns()
             + self.prefix_tokens_len * 1000 * 1000
@@ -448,7 +455,9 @@ class Task:
             self._decode_status = TaskDecodeType.WillStopLength
         return self._decode_status
 
-    def update_response_no_sync(self, token: Union[int, torch.Tensor]):
+    def update_response_no_sync(
+        self, token: Union[int, torch.Tensor], token_offset: int = 1
+    ):
         """
         Update task state with a generated token (for Decode phase).
 
@@ -481,7 +490,7 @@ class Task:
             self.record_next_token = token
             self.next_token = self.req._test_standard_tokens[self.num_new_tokens].item()
 
-        self.num_new_tokens += 1
+        self.num_new_tokens += token_offset
         self.sync_new_token = False
 
     def update_prefix(self):
@@ -702,6 +711,7 @@ class BatchResult:
     return_logprobs: bool = False
     logprobs: Optional[torch.Tensor] = None
     token_idxs: Optional[torch.Tensor] = None
+    mtp_token_list: Optional[list[list[int]]] = None
 
     @property
     def task_ids(self):
@@ -1110,6 +1120,7 @@ class PackedTasks(PackedTasksBase):
                 if self.return_logprobs
                 else None
             ),
+            mtp_token_list=[task.mtp_token_list for task in tasks],
         )
 
     def batch_update_status(self):

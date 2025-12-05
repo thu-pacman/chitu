@@ -55,6 +55,7 @@ class InferConfig:
         decode_token_dispatcher: str = MISSING
 
     moe: MoEConfig = MISSING
+    mtp_size: int = MISSING
 
 
 @dataclass

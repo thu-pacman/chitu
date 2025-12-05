@@ -57,10 +57,17 @@ class LocalTokenSink:
         token_list: list[int],
         logprobs_list: Optional[list[list[float]]] = None,
         token_idxs_list: Optional[list[list[int]]] = None,
+        mtp_token_list: Optional[list[list[int]]] = None,
     ) -> None:
         if logprobs_list is None or token_idxs_list is None:
-            for task, token in zip(task_list, token_list):
-                task.req.add_data(token, notify_server=False)
+            if mtp_token_list is None:
+                for task, token in zip(task_list, token_list):
+                    task.req.add_data(token, notify_server=False)
+            else:
+                for task, token, value_list in zip(
+                    task_list, token_list, mtp_token_list
+                ):
+                    task.req.add_data(token, notify_server=False, value_list=value_list)
         else:
             for task, token, logprobs, token_idxs in zip(
                 task_list, token_list, logprobs_list, token_idxs_list
