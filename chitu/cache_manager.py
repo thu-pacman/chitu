@@ -551,7 +551,8 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
             # Allocate blocks for the request
             if self.lazy_mode:
-                self.block_table[req_id].append(self.get_free_block())
+                if len(self.block_table[req_id]) == 0:
+                    self.block_table[req_id].append(self.get_free_block())
             else:
                 needs_blocks = self.num_additional_blocks_req_need(req_id, new_seq_len)
                 self.block_table[req_id].extend(
