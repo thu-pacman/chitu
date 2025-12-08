@@ -834,7 +834,17 @@ class Backend:
         """
 
         def key_filter(k: str) -> bool:
-            if args.models.type == "deepseek-v3" and "model.layers.61" in k:
+            if (
+                is_ascend()
+                and args.models.type == "deepseek-v3"
+                and k.endswith(".weight_offset")
+            ):
+                return False
+            if (
+                args.models.type == "deepseek-v3"
+                and "model.layers.61" in k
+                and args.infer.mtp_size == 1
+            ):
                 return False
             if args.models.name == "GLM-4.5-Air" and "model.layers.46" in k:
                 return False

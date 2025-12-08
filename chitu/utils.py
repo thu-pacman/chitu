@@ -53,6 +53,7 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> tuple[Any, bool]:
         "ascend_kernels",
         "flash_attn",
         "flashinfer",
+        "fla",
         "flash_mla",
         "deep_gemm",
         "deep_ep",  # [TODO] add installation support

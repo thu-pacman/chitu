@@ -34,9 +34,13 @@ ENV PIP_NO_CACHE_DIR=1
 RUN pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
+# NOTE: Test dependencies include:
+# - pytest is for test/pytest (for all platforms).
+# - aiohttp is for service tests (for all platforms).
+# - matplotlib is for benchmarks/op_bench (for platforms with triton).
 RUN if [ "${enable_test}" = "true" ]; then \
     apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping curl && \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp; \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp matplotlib; \
 fi
 
 

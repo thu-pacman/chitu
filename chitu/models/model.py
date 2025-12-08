@@ -51,6 +51,7 @@ from chitu.quantization import (
     get_backend_from_checkpoint_prefix,
 )
 from chitu.hybrid_device import CPUParameter
+from chitu.static_tensor import StaticTensor
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
@@ -248,6 +249,8 @@ class Transformer(nn.Module):
             self.local_begin_layer_id = 0
             self.local_end_layer_id = self.global_n_layers
 
+        self.mtp_size = get_global_args().infer.mtp_size
+
         if not self.pipeline_exec or self.pp_stage == 0:
             self._init_pre_layers()
         self._init_layers(cache, attn_backend=attn_backend, op_impl=op_impl)
@@ -279,6 +282,22 @@ class Transformer(nn.Module):
         self.moe_impl = get_moe_impl()
         if self.ep_group.is_last_rank:
             self.experts_end_idx += remainder
+
+        if self.mtp_size > 1:
+            self.token_offset_list = None
+            self.mtp_token_list = None
+            self.prefill_main_last_hidden_states = None
+            self.last_hidden_states_4_postprocess = None
+            self.main_last_hidden_states_static = StaticTensor(
+                max_nelem=self.max_batch_size_per_dp * self.params.dim * self.mtp_size,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            self.mtp_last_hidden_states_static = StaticTensor(
+                max_nelem=self.max_batch_size_per_dp * self.params.dim,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
 
     def _get_tensor_column_parallel_layer_names(self) -> list[str]:
         raise NotImplementedError
@@ -704,8 +723,17 @@ class Transformer(nn.Module):
     def _pre_layers(self, h, **args):
         raise NotImplementedError
 
+    def _pre_layers_mtp(self, h, **args):
+        raise NotImplementedError
+
     def _post_layers(self, h):
         """NOTE: _post_layers is assumed to be a token-wise computation"""
+        raise NotImplementedError
+
+    def _get_prefill_previous_hidden_states(self, h):
+        raise NotImplementedError
+
+    def _post_layers_mtp(self, h):
         raise NotImplementedError
 
     def precompute_freqs_cis(self, max_position_embeddings, device):
@@ -737,15 +765,41 @@ class Transformer(nn.Module):
             ],
         )
 
+    def prepare_freqs_cis_mtp(self) -> BatchedFreqsCis:
+        return BatchedFreqsCis(
+            self.freqs_cis_real[
+                self.cache.mtp_seq_len_delta.delta_position_ids_tensor_device
+            ],
+            self.freqs_cis_imag[
+                self.cache.mtp_seq_len_delta.delta_position_ids_tensor_device
+            ],
+        )
+
     @torch.inference_mode()
     def prefill_no_pipeline(
         self, tokens, output_token_offsets: torch.Tensor, **args
     ) -> torch.Tensor:
         freqs_cis = self.prepare_freqs_cis()
         h = self._pre_layers(tokens, **args)
-        for it, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis)
-
+        if self.mtp_size > 1:
+            self.token_offset_list = None
+            self.mtp_token_list = None
+            for it, layer in enumerate(self.layers[0:-1]):
+                h = layer(h, freqs_cis, False)
+            prefill_previous_hidden_states = self._get_prefill_previous_hidden_states(h)
+            h_mtp = self._pre_layers_mtp(tokens, **args)
+            h_mtp[
+                self.cache.mtp_seq_len_delta.delta_position_ids_tensor_device == 0
+            ] = 0
+            h_mtp = self.layers[-1](
+                h_mtp, freqs_cis, prefill_previous_hidden_states, False
+            )
+            self.last_hidden_states_4_postprocess = (
+                self.prefill_main_last_hidden_states[output_token_offsets]
+            )
+        else:
+            for it, layer in enumerate(self.layers):
+                h = layer(h, freqs_cis)
         # Exec post layers AFTER cutting the last token off
         h = h[output_token_offsets]
         h = self._post_layers(h)
@@ -755,11 +809,76 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
         h = self._pre_layers(tokens)
-        for it, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis)
+        if not self.mtp_size > 1:
+            for it, layer in enumerate(self.layers):
+                h = layer(h, freqs_cis)
+        else:
+            for it, layer in enumerate(self.layers[0:-1]):
+                h = layer(h, freqs_cis, False)
+            lhs_ = self.norm(h, compute_dtype=h.dtype)
+            self.main_last_hidden_states_static.set(lhs_)
         h = self._post_layers(h)
         h = h.float()
         return h
+
+    @torch.inference_mode()
+    def mtp_decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
+        h = self._pre_layers_mtp(tokens)
+        h = self.layers[-1](
+            h, freqs_cis, self.mtp_last_hidden_states_static.get(), True
+        )
+        self.mtp_last_hidden_states_static.set(h)
+        h = self._post_layers_mtp(h)
+        h = h.float()
+        return h
+
+    @torch.inference_mode()
+    def mtp_decode_no_pipeline_total(self, tokens, func, key, func_mtp, key_mtp):
+        token_list = []
+        token_list.append(tokens)
+        for i in range(0, self.mtp_size):
+            self.cache.prepare_mtp_cache_decode(i)
+            self.cache.update_page_offs()
+            self.prepare_decoding_attn_mtp()
+            h = func_mtp(key_mtp, tokens)
+            tokens = torch.argmax(h, dim=-1)
+            token_list.append(tokens)
+        self.cache.update_page_offs()
+        tokens_proposal = torch.stack(token_list[:-1], dim=1).view(-1)
+        if self.use_cuda_graph:
+            self.prepare_decoding_attn()
+        else:
+            self.attn_backend.prepare_metadata_for_prefill(self.cache.seq_len_delta)
+        h = func(key, tokens_proposal)
+        tokens_proposal = tokens_proposal.view(-1, self.mtp_size)
+        tokens_verify = torch.argmax(h, dim=-1).view(-1, self.mtp_size)
+        h = h.view(-1, self.mtp_size, h.shape[-1])
+        mlh_ = self.main_last_hidden_states_static.get()
+        mtp_last_hidden_states = mlh_.view(-1, self.mtp_size, mlh_.shape[-1])
+        matches = tokens_proposal[:, 1:] == tokens_verify[:, :-1]
+
+        all_accept = matches.all(dim=1)
+        first_mismatch_idx = torch.argmax((~matches).int(), dim=1)
+        accept_idx = torch.where(
+            all_accept,
+            torch.full_like(first_mismatch_idx, self.mtp_size - 1),
+            first_mismatch_idx,
+        )
+
+        batch_indices = torch.arange(tokens_proposal.shape[0], device=h.device)
+        h_selected = h[batch_indices, accept_idx]
+        mtp_selected = mtp_last_hidden_states[batch_indices, accept_idx]
+        token_offset = (accept_idx + 1).tolist()
+        tokens_proposal_accepted = [
+            tokens_proposal[i, 1 : accept_idx[i] + 1].tolist()
+            for i in range(tokens_proposal.size(0))
+        ]
+
+        self.cache.update_mtp_cache_decode(token_offset)
+        self.token_offset_list = token_offset
+        self.mtp_token_list = tokens_proposal_accepted
+        self.last_hidden_states_4_postprocess = mtp_selected
+        return h_selected
 
     @torch.inference_mode()
     def prefill_pipeline(
@@ -819,6 +938,15 @@ class Transformer(nn.Module):
             block_size,
         )
 
+    def prepare_decoding_attn_mtp(self):
+        block_table = self.cache.get_gpu_block_table()
+        block_size = self.cache.get_block_size()
+        self.attn_backend.prepare_metadata_for_decode(
+            self.cache.mtp_seq_len_delta,
+            block_table,
+            block_size,
+        )
+
     @torch.inference_mode()
     def decode(self, tokens, batch_size):
         if isinstance(self.cache, DenseKVCacheManager):
@@ -828,7 +956,8 @@ class Transformer(nn.Module):
         else:
             assert False
 
-        self.prepare_decoding_attn()
+        if not self.mtp_size > 1:
+            self.prepare_decoding_attn()
 
         infer_args = get_global_args().infer
         current_cuda_graph_enabled = self.use_cuda_graph and (
@@ -862,7 +991,10 @@ class Transformer(nn.Module):
 
             @make_dispatched_graphed_callables(
                 args_max_nelem=(
-                    tokens.numel() // batch_size * self.max_batch_size_per_dp,
+                    self.mtp_size
+                    * tokens.numel()
+                    // batch_size
+                    * self.max_batch_size_per_dp,
                 ),
                 kwargs_max_nelem={},
                 output_max_nelem_callback=lambda key, n: n
@@ -880,7 +1012,35 @@ class Transformer(nn.Module):
 
             self.do_decode_callable = do_decode
 
-        return self.do_decode_callable(key, tokens)
+            if self.mtp_size > 1:
+
+                @make_dispatched_graphed_callables(
+                    args_max_nelem=(
+                        tokens.numel() // batch_size * self.max_batch_size_per_dp,
+                    ),
+                    kwargs_max_nelem={},
+                    output_max_nelem_callback=lambda key, n: n
+                    // key[0]
+                    * self.max_batch_size_per_dp,
+                    before_replay_callback=before_replay_callback,
+                    enable=current_cuda_graph_enabled,
+                )
+                def do_decode_mtp(tokens):
+                    freqs_cis = self.prepare_freqs_cis_mtp()
+                    return self.mtp_decode_no_pipeline(tokens, freqs_cis)
+
+                self.do_decode_callable_mtp = do_decode_mtp
+
+        if self.mtp_size > 1:
+            return self.mtp_decode_no_pipeline_total(
+                tokens,
+                self.do_decode_callable,
+                key + ("main",),
+                self.do_decode_callable_mtp,
+                key + ("mtp",),
+            )
+        else:
+            return self.do_decode_callable(key, tokens)
 
 
 class MoeGate(nn.Module):

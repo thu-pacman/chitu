@@ -583,7 +583,9 @@ class AttentionDeepSeekV3(Attention):
                 f"MLA absorb mode {self.mla_absorb} not supported"
             )
 
-    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
+    def forward(
+        self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
+    ):
         bs_seq, _ = x.size()
 
         if self.mla_absorb == "none":
@@ -624,12 +626,18 @@ class AttentionDeepSeekV3(Attention):
                 )
             else:
                 topk_indices = None
+
+            if is_mtp:
+                seq_len_delta = self.cache.mtp_seq_len_delta
+            else:
+                seq_len_delta = self.cache.seq_len_delta
+
             x = self.attn_backend.mla(
                 q_nope,
                 q_pe,
-                self.cache.get_accessor(self.layer_id),
+                self.cache.get_accessor(self.layer_id, is_mtp),
                 kv,
-                seq_len_delta=self.cache.seq_len_delta,
+                seq_len_delta=seq_len_delta,
                 causal=True,
                 softmax_scale=self.softmax_scale,
                 topk_indices=topk_indices,
@@ -644,6 +652,31 @@ class AttentionDeepSeekV3(Attention):
             )
 
         return self.o_proj(x.flatten(-2)).view(bs_seq, -1)
+
+
+class SharedHead(nn.Module):
+    def __init__(
+        self,
+        args,
+    ) -> None:
+        super().__init__()
+
+        self.norm = RMSNorm(
+            args.dim,
+            dtype=(
+                parse_dtype(args.rms_norm_dtype)
+                if hasattr(args, "rms_norm_dtype")
+                else None
+            ),
+        )
+
+        self.head = ColumnParallelLinear(
+            args.dim,
+            args.vocab_size,
+            has_bias=False,
+            gather_output=True,
+            checkpoint_prefix="mtp.head",
+        )
 
 
 class MLPDeepSeekV3(nn.Module):
@@ -945,11 +978,73 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             ),
         )
 
-    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
+    def forward(
+        self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
+    ):
         x = x + self.self_attn(
-            self.input_layernorm(x, compute_dtype=x.dtype), freqs_cis
+            self.input_layernorm(x, compute_dtype=x.dtype), freqs_cis, is_mtp
         )
         x = x + self.mlp(self.post_attention_layernorm(x, compute_dtype=x.dtype))
+        return x
+
+
+class TransformerBlockDeepSeekV3MPT(TransformerBlockDeepSeekV3):
+    def __init__(
+        self,
+        layer_id: int,
+        args,
+        cache,
+        attn_backend,
+        op_impl,
+        mla_absorb,
+        checkpoint_prefix="",
+        indexer_cache: Optional[KVCacheManagerBase] = None,
+    ):
+        super().__init__(
+            layer_id,
+            args,
+            cache,
+            attn_backend=attn_backend,
+            op_impl=op_impl,
+            mla_absorb=mla_absorb,
+            checkpoint_prefix=checkpoint_prefix,
+            indexer_cache=indexer_cache,
+        )
+
+        self.enorm = RMSNorm(
+            args.dim,
+            dtype=(
+                parse_dtype(args.rms_norm_dtype)
+                if hasattr(args, "rms_norm_dtype")
+                else None
+            ),
+        )
+
+        self.hnorm = RMSNorm(
+            args.dim,
+            dtype=(
+                parse_dtype(args.rms_norm_dtype)
+                if hasattr(args, "rms_norm_dtype")
+                else None
+            ),
+        )
+
+        self.eh_proj = torch.nn.Linear(args.dim * 2, args.dim, bias=False)
+        self.shared_head = SharedHead(args)
+        self.embed_tokens = VocabParallelEmbedding(args.vocab_size, args.dim)
+
+    @override
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
+        previous_hidden_states: torch.Tensor,
+        is_mtp: bool = False,
+    ):
+        inputs_embeds = self.enorm(x)
+        previous_hidden_states = self.hnorm(previous_hidden_states)
+        x = self.eh_proj(torch.cat([inputs_embeds, previous_hidden_states], dim=-1))
+        x = super().forward(x, freqs_cis, is_mtp)
         return x
 
 
@@ -983,7 +1078,7 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def _get_tensor_column_parallel_layer_names(self) -> list[str]:
-        return [
+        tensor_column_parallel_list = [
             "embed_tokens",
             "q_b_proj",
             "kv_b_proj",
@@ -992,6 +1087,9 @@ class TransformerDeepSeekV3(Transformer):
             "gate_up_proj",
             "lm_head",
         ]
+        if self.mtp_size > 1:
+            tensor_column_parallel_list.append("layers.61.shared_head.head")
+        return tensor_column_parallel_list
 
     @override
     def _get_tensor_row_parallel_layer_names(self) -> list[str]:
@@ -1611,12 +1709,31 @@ class TransformerDeepSeekV3(Transformer):
         import resource
 
         memory_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
+        local_end_layer_id = (
+            self.local_end_layer_id - 1
+            if self.mtp_size > 1
+            else self.local_end_layer_id
+        )
+        for layer_id in range(self.local_begin_layer_id, local_end_layer_id):
             logger.debug(
                 f"initing layer : {layer_id}  cpu memory usage: {memory_usage / 1024**2} GB  gpu memory usage : RANK : {torch.cuda.current_device()} {torch.cuda.memory_allocated()/(1024**3)} GB"
             )
             self.layers.append(
                 TransformerBlockDeepSeekV3(
+                    layer_id,
+                    self.params,
+                    cache,
+                    attn_backend,
+                    self.op_impl,
+                    mla_absorb=self.mla_absorb,
+                    checkpoint_prefix=f"layers.{layer_id}",
+                    indexer_cache=self.indexer_cache,
+                )
+            )
+        if self.mtp_size > 1:
+            layer_id = 61
+            self.layers.append(
+                TransformerBlockDeepSeekV3MPT(
                     layer_id,
                     self.params,
                     cache,
@@ -1651,10 +1768,26 @@ class TransformerDeepSeekV3(Transformer):
         return self.embed_tokens(h)
 
     @override
+    def _pre_layers_mtp(self, h, **args):
+        h = self.layers[-1].embed_tokens(h)
+        return h
+
+    @override
     def _post_layers(self, h):
         """NOTE: _post_layers is assumed to be a token-wise computation"""
         h = self.norm(h, compute_dtype=h.dtype)
         h = self.lm_head(h)
+        return h
+
+    @override
+    def _get_prefill_previous_hidden_states(self, h):
+        self.prefill_main_last_hidden_states = self.norm(h, compute_dtype=h.dtype)
+        return torch.roll(self.prefill_main_last_hidden_states, shifts=1, dims=0)
+
+    @override
+    def _post_layers_mtp(self, h):
+        h = self.layers[-1].shared_head.norm(h, compute_dtype=h.dtype)
+        h = self.layers[-1].shared_head.head(h)
         return h
 
     @override

@@ -365,7 +365,9 @@ def fused_experts_npu_with_communication(
 
     global_num_experts = n_local_experts * ep_size
     global_bs_for_distpatch_combine = (
-        ceil_div(get_global_args().infer.max_reqs, ep_size) * ep_size
+        ceil_div(get_global_args().infer.max_reqs, ep_size)
+        * ep_size
+        * get_global_args().infer.mtp_size
     )
 
     (
