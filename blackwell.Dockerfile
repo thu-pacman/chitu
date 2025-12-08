@@ -31,9 +31,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
+# NOTE: Test dependencies include:
+# - pytest is for test/pytest (for all platforms).
+# - aiohttp is for service tests (for all platforms).
+# - matplotlib is for benchmarks/op_bench (for platforms with triton).
 RUN if [ "${enable_test}" = "true" ]; then \
     apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping curl && \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp; \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp matplotlib; \
 fi
 
 # Always install build time dependencies. Some dependencies may fail to build
@@ -107,7 +111,7 @@ COPY --from=wheel_builder /tmp/ /tmp/
 
 # Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
 # compile at install time, and the compile results are environment dependent.
-RUN bash -c "pip install -i https://pypi.tuna.tsinghua.edu.cn/simple /tmp/*.whl -c <(pip list --format freeze | grep -v 'pillow' | grep -v 'fsspec' | grep -v 'flash-mla' | grep -v 'flash_mla')"
+RUN bash -c "pip install -i https://pypi.tuna.tsinghua.edu.cn/simple /tmp/*.whl -c <(pip list --format freeze | grep -v -e 'pillow' -e 'fsspec' -e 'flash-mla' -e 'flash_mla')"
 
 COPY ./flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl /tmp/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
 RUN pip install /tmp/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl

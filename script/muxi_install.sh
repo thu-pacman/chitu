@@ -35,7 +35,7 @@ else
 fi
 
 # Dependency install stage
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt -c <(pip list --format freeze)
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt -c <(pip list --format freeze | grep -v "setuptools")
 
 # NOTE:
 # 1. Always add `-c` to avoid breaking compatiblity with installed packages.
@@ -50,7 +50,7 @@ if [ "${enable_editable_install}" == "true" ]; then
         --no-build-isolation \
         -i https://pypi.tuna.tsinghua.edu.cn/simple \
         -e .${OPTIONAL_DEPS_SPECIFIER} \
-        -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "flash-mla" | grep -v "flash_mla" | grep -v "transformers" | grep -v "huggingface-hub" | grep -v "huggingface_hub" | grep -v "tokenizers")
+        -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "transformers" -e "huggingface-hub" -e "huggingface_hub" -e "tokenizers")
 else
     pip install \
         --no-build-isolation \

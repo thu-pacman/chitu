@@ -47,13 +47,13 @@ if [ "${enable_editable_install}" == "true" ]; then
         --no-build-isolation \
         -i https://pypi.tuna.tsinghua.edu.cn/simple \
         -e .${OPTIONAL_DEPS_SPECIFIER} \
-        -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "flash-mla" | grep -v "flash_mla")
+        -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla")
 else
     pip install \
         --no-build-isolation \
         -i https://pypi.tuna.tsinghua.edu.cn/simple \
         .${OPTIONAL_DEPS_SPECIFIER} \
-        -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "flash-mla" | grep -v "flash_mla")
+        -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla")
 
     # Remove the source code. We only need to run the installed package. Keep testings and scripts.
     #

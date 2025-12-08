@@ -26,23 +26,27 @@ ENV TZ=Etc/UTC
 
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 
-RUN apt update -y && apt install -y git gcc-10 g++-10 libnuma-dev
+RUN apt update -y && apt install -y git gcc-10 g++-10 libnuma-dev libibverbs1 ibverbs-providers libibverbs-dev rdma-core
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -U "pip<25.3" -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
+# NOTE: Test dependencies include:
+# - pytest is for test/pytest (for all platforms).
+# - aiohttp is for service tests (for all platforms).
+# - matplotlib is for benchmarks/op_bench (for platforms with triton).
 RUN if [ "${enable_test}" = "true" ]; then \
     apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping curl && \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp; \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp matplotlib; \
 fi
 
 # Always install build time dependencies. Some dependencies may fail to build
 # if some build time dependencies are missing.
 COPY ./requirements-build.txt /tmp/requirements-build.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements-build.txt -c <(pip list --format freeze)
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements-build.txt -c <(pip list --format freeze | grep -v "setuptools")
 
 ENV FLASH_MLA_DISABLE_SM100=1
 
@@ -77,7 +81,8 @@ COPY --from=dependency_resolver /tmp/requirements.txt /tmp/requirements.txt
 # compile at install time, and the compile results are environment dependent.
 RUN --mount=type=bind,source=./third_party,target=./third_party,readwrite \
     --mount=type=bind,source=./csrc/cpuinfer,target=./csrc/cpuinfer,readwrite \
-    pip install --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt -c <(pip list --format freeze | grep -v "pillow" | grep -v "fsspec" | grep -v "numpy" | grep -v "transformers")
+    pip install --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt \
+        -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "pytest")
 
 #####################################
 # Wheel build Stage
@@ -107,7 +112,7 @@ COPY --from=wheel_builder /tmp/ /tmp/
 
 # Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
 # compile at install time, and the compile results are environment dependent.
-RUN bash -c "pip install -i https://pypi.tuna.tsinghua.edu.cn/simple /tmp/*.whl -c <(pip list --format freeze | grep -v 'pillow' | grep -v 'fsspec' | grep -v 'flash-mla' | grep -v 'flash_mla' | grep -v 'numpy' | grep -v 'transformers')"
+RUN bash -c "pip install -i https://pypi.tuna.tsinghua.edu.cn/simple /tmp/*.whl -c <(pip list --format freeze | grep -v -e 'pillow' -e 'fsspec' -e 'flash-mla' -e 'flash_mla' -e 'numpy' -e 'transformers' -e 'pytest')"
 
 RUN rm -rf /tmp/*
 COPY ./test ./test
