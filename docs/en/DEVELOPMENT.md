@@ -90,6 +90,12 @@ git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
 pip install -r requirements-build.txt
 ```
 
+If you include `deep_ep` in optional dependencies, please also run:
+
+```bash
+pip install -r requirements-build-deep_ep-cu12.txt
+```
+
 #### 3. Install PyTorch
 
 On NVIDIA platforms, you can install latest PyTorch:
@@ -161,7 +167,7 @@ Currently supported optional dependencies are:
 - `flashinfer`: Support `infer.attn_type=flash_infer`.
 - `flash_mla`: Support `infer.attn_type=flash_mla`.
 - `deep_gemm`: Support using DeepGEMM for fp8 inference.
-- `deep_ep`: Support using DeepEP for MoE communication (requiring NVSHMEM installed on your system, and setting `NVSHMEM_DIR=/path/to/installed/nvshmem` environment variable).
+- `deep_ep`: Support using DeepEP for MoE communication (requiring NVSHMEM installed on your system **before** installing chitu. NVSHMEM is included in `requirements-build-deep_ep-cu12.txt`).
 - `cpu`: Support hybrid CPU+GPU inference.
 - `muxi_layout_kernels`: Additional kernels for running on MetaX GPUs with `infer.op_impl=muxi_custom_kernel`, optimized for small batches.
 - `scipy`: Optional dependency for indexer in DeepSeek-V3.2-Exp.
