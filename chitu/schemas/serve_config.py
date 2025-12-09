@@ -48,6 +48,7 @@ class InferConfig:
     prefill_chunk_size: Union[int, str, None] = MISSING
     experts_stats_path: Optional[str] = None
     num_experts_slots: Optional[int] = None
+    has_schedule_overlap: bool = False
 
     @dataclass
     class MoEConfig:
