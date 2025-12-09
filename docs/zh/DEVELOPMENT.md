@@ -273,13 +273,45 @@ torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_t
 可以使用以下脚本命令运行：
 
 ```bash
-./script/srun_multi_node.sh <num_nodes> <num_gpus_per_node> [your command after torchrun]...
+./script/srun_multi_node.sh <num_nodes> <num_gpus_per_node> [[additional srun args]... --] [your command after torchrun]...
 ```
 
-示例：
+示例 1（使用默认 srun 参数）：
 
 ```bash
-./script/srun_multi_node.sh 2 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
+./script/srun_multi_node.sh 2 8 test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+示例 2（与 node 0 交互）：
+
+```bash
+./script/srun_multi_node.sh 2 8 --pty -- test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+### 使用 slurm 在多个节点上的 Apptainer 容器内运行
+
+可以使用以下脚本命令运行：
+
+```bash
+./script/srun_apptainer_multi_node.sh <num_nodes> <num_gpus_per_node> [[additional srun args]... --] [extra apptainer args]... <sif_file> torchrun [your command after torchrun]...
+```
+
+示例 1（使用默认 srun 参数）：
+
+```bash
+./script/srun_apptainer_multi_node.sh 2 8 -B /path/to/models:/path/to/models /path/to/image.sif torchrun test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+示例 2（与 node 0 交互）：
+
+```bash
+./script/srun_apptainer_multi_node.sh 2 8 --pty -- -B /path/to/models:/path/to/models /path/to/image.sif torchrun test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+示例 3（将 chitu 代码挂载到容器中）：
+
+```bash
+./script/srun_apptainer_multi_node.sh 2 8 -B .:/workspace/chitu -B /path/to/models:/path/to/models --env PYTHONPATH=/workspace/chitu /path/to/image.sif torchrun test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
 ```
 
 ### 基于 SSH 连接的多节点运行
