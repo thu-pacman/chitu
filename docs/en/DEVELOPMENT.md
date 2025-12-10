@@ -90,6 +90,12 @@ git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
 pip install -r requirements-build.txt
 ```
 
+If you include `deep_ep` in optional dependencies, please also run:
+
+```bash
+pip install -r requirements-build-deep_ep-cu12.txt
+```
+
 #### 3. Install PyTorch
 
 On NVIDIA platforms, you can install latest PyTorch:
@@ -161,7 +167,7 @@ Currently supported optional dependencies are:
 - `flashinfer`: Support `infer.attn_type=flash_infer`.
 - `flash_mla`: Support `infer.attn_type=flash_mla`.
 - `deep_gemm`: Support using DeepGEMM for fp8 inference.
-- `deep_ep`: Support using DeepEP for MoE communication (requiring NVSHMEM installed on your system, and setting `NVSHMEM_DIR=/path/to/installed/nvshmem` environment variable).
+- `deep_ep`: Support using DeepEP for MoE communication (requiring NVSHMEM installed on your system **before** installing chitu. NVSHMEM is included in `requirements-build-deep_ep-cu12.txt`).
 - `cpu`: Support hybrid CPU+GPU inference.
 - `muxi_layout_kernels`: Additional kernels for running on MetaX GPUs with `infer.op_impl=muxi_custom_kernel`, optimized for small batches.
 - `scipy`: Optional dependency for indexer in DeepSeek-V3.2-Exp.
@@ -261,13 +267,45 @@ torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_t
 You can use the following script:
 
 ```bash
-./script/srun_multi_node.sh <num_nodes> <num_gpus_per_node> [your command after torchrun]...
+./script/srun_multi_node.sh <num_nodes> <num_gpus_per_node> [[additional srun args]... --] [your command after torchrun]...
 ```
 
-Example:
+Example 1 (with default srun arguments):
 
 ```bash
-./script/srun_multi_node.sh 2 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
+./script/srun_multi_node.sh 2 8 test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+Example 2 (interactive with node 0):
+
+```bash
+./script/srun_multi_node.sh 2 8 --pty -- test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+### Multi-Node Parallelism with Slurm and Apptainer
+
+You can use the following script:
+
+```bash
+./script/srun_apptainer_multi_node.sh <num_nodes> <num_gpus_per_node> [[additional srun args]... --] [extra apptainer args]... <sif_file> torchrun [your command after torchrun]...
+```
+
+Example 1 (with default arguments):
+
+```bash
+./script/srun_apptainer_multi_node.sh 2 8 -B /path/to/models:/path/to/models /path/to/image.sif torchrun test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+Example 2 (interactive with node 0):
+
+```bash
+./script/srun_apptainer_multi_node.sh 2 8 --pty -- -B /path/to/models:/path/to/models /path/to/image.sif torchrun test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+Example 3 (mount chitu code to the container):
+
+```bash
+./script/srun_apptainer_multi_node.sh 2 8 -B .:/workspace/chitu -B /path/to/models:/path/to/models --env PYTHONPATH=/workspace/chitu /path/to/image.sif torchrun test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
 ```
 
 ### Multi-Node Parallelism with Direct SSH Connection

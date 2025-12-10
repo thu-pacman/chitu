@@ -10,12 +10,11 @@ class TaskType(Enum):
     Decode = 2
     EmptyPrefill = 3
     EmptyDecode = 4
+    Special = 10
 
 
 class TaskDecodeType(Enum):
     Waiting = -1
     Normal = 0
     Stopped = 1
-    StopEOS = 2
-    StopLength = 3
     WillStopLength = 10

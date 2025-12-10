@@ -190,7 +190,7 @@ class Scheduler:
         task_ids = list(
             filter(
                 lambda x: not TaskPool.pool[x].waiting
-                and not TaskPool.pool[x].no_model_run(),
+                and not TaskPool.pool[x].need_remove(),
                 TaskPool.id_list,
             )
         )
@@ -349,9 +349,10 @@ class Scheduler:
             num_need_blocks = 0
             for task_id in decode_task_ids:
                 task = TaskPool.pool[task_id]
-                num_need_blocks += num_additional_blocks_task_need(
-                    task.req.request_id, task.prefix_tokens_len
-                )
+                if task.has_model_run():
+                    num_need_blocks += num_additional_blocks_task_need(
+                        task.req.request_id, task.prefix_tokens_len
+                    )
             num_free_blocks = Backend.cache_manager.num_free_blocks
             if num_free_blocks >= num_need_blocks:
                 return True
@@ -377,19 +378,6 @@ class Scheduler:
             )
 
         return decode_task_ids
-
-    def schedule_output_tasks(self, task_ids: Optional[list[str]] = None) -> list[str]:
-        if task_ids is None:
-            task_ids = TaskPool.id_list
-        output_task_ids = list(
-            filter(
-                lambda task_id: TaskPool.pool[task_id].has_last_token(),
-                task_ids,
-            )
-        )
-        # the async postprocess can exceed the limit of batch size
-        # to avoid scheduling a task twice, synchronize to CPU and update decode status is necessary after schedule_output_tasks
-        return output_task_ids
 
     def evict_decode_task(self, task_id: str):
         """Evicting kv cache in kv_cache manager of the given task_id, restore task state to its pre-prefilling state
@@ -471,30 +459,21 @@ class Scheduler:
                                 )
                                 break
 
-    def update_sgroup(self, running_task_ids):
-        running_task_ids = list(set(running_task_ids))
-        for task_id in running_task_ids:
-            # Update Task's sched_group_id and  sgroup_waiting_cnt
-            if (
-                not TaskPool.pool[task_id].waiting
-                and TaskPool.pool[task_id].sched_group_id is not None
-            ):
-                sgroup_id = TaskPool.pool[task_id].sched_group_id
-                self.sgroup_waiting_tasks[sgroup_id].remove(task_id)
-                # TaskPool.pool[task_id].sched_group_id = None
-
-    def update(
-        self,
-        cur_task_ids: list[str],
-        unwait_task_ids: list[str] = [],
-        update_sgroup=True,
-    ):
+    def update(self, cur_task_ids: list[str], unwait_task_ids: list[str] = []):
         removed_task_ids = []
         task_ids = cur_task_ids + unwait_task_ids
         task_ids = list(set(task_ids))
         self.reorder_tasks_for_batching(task_ids)
-        if update_sgroup and not isinstance(self, DPFifoScheduler):
-            self.update_sgroup(task_ids)
+        if not isinstance(self, DPFifoScheduler):
+            for task_id in task_ids:
+                # Update Task's sched_group_id and  sgroup_waiting_cnt
+                if (
+                    not TaskPool.pool[task_id].waiting
+                    and TaskPool.pool[task_id].sched_group_id is not None
+                ):
+                    sgroup_id = TaskPool.pool[task_id].sched_group_id
+                    self.sgroup_waiting_tasks[sgroup_id].remove(task_id)
+                    # TaskPool.pool[task_id].sched_group_id = None
         for task_id in task_ids:
             task = TaskPool.pool[task_id]
             if task.need_remove():
@@ -572,7 +551,7 @@ class SkewScheduler(Scheduler):
         task_ids = list(
             filter(
                 lambda x: not TaskPool.pool[x].waiting
-                and not TaskPool.pool[x].no_model_run(),
+                and not TaskPool.pool[x].need_remove(),
                 TaskPool.id_list,
             )
         )
@@ -715,7 +694,7 @@ class DPFifoScheduler(Scheduler):  # used for expert_data_parallel
             for _id in TaskPool.pool
             if TaskPool.pool[_id].task_type == TaskType.Decode
             and not TaskPool.pool[_id].waiting
-            and not TaskPool.pool[_id].no_model_run()
+            and not TaskPool.pool[_id].need_remove()
         )
         logger.debug(
             f"[dpfifo.enter] prefill_ready={num_prefill} decode_ready={num_decode} pool_size={len(TaskPool.pool)}"
@@ -849,7 +828,7 @@ class DPFifoScheduler(Scheduler):  # used for expert_data_parallel
                     for tid in TaskPool.pool.keys()
                     if TaskPool.pool[tid].task_type == TaskType.Decode
                     and not TaskPool.pool[tid].waiting
-                    and not TaskPool.pool[tid].no_model_run()
+                    and not TaskPool.pool[tid].need_remove()
                 ]
                 task_lists = [[] for _ in range(self.dp_size)]
                 for tid in decode_task_ids:
@@ -877,7 +856,7 @@ class DPFifoScheduler(Scheduler):  # used for expert_data_parallel
                 decode_task_ids = filter(
                     lambda x: TaskPool.pool[x].task_type == TaskType.Decode
                     and not TaskPool.pool[x].waiting
-                    and not TaskPool.pool[x].no_model_run(),
+                    and not TaskPool.pool[x].need_remove(),
                     TaskPool.pool.keys(),
                 )
 
@@ -905,7 +884,7 @@ class DPFifoScheduler(Scheduler):  # used for expert_data_parallel
             logger.debug(
                 f"[dpfifo.return] have_task=True per-rank={[len(x) for x in task_lists]}"
             )
-            return task_lists
+            return task_lists[0]
         else:
             logger.debug("[dpfifo.return] have_task=False")
             return []

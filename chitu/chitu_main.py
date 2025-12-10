@@ -201,7 +201,7 @@ def _warmup_via_taskpool(args):
             req = MockFixedLengthedUserRequest(
                 warmup_seq_len,
                 f"{gen_req_id()}",
-                max_new_tokens=2,  # 1 prefill + 1 decode
+                max_new_tokens=1 + get_global_args().infer.mtp_size,
                 temperature=0.7,
                 top_k=1,
             )
@@ -296,8 +296,12 @@ def _warmup_via_taskpool(args):
         get_dp_group().barrier()
     chitu_run()
 
-    # async postprocess (rank0) & finalize KV cache (all ranks)
-    chitu_run()
+    if args.infer.has_schedule_overlap:
+        chitu_run()
+
+    # endtask
+    if rank > 0:
+        chitu_run()
 
     if rank == 0:
         remaining_tasks = len(TaskPool.pool)
@@ -486,6 +490,10 @@ def chitu_init(args, logging_level=None):
             )
             args.infer.prefill_chunk_size = None
 
+    args.infer.has_schedule_overlap = (
+        args.infer.dp_size <= 1 and args.infer.pp_size <= 1
+    )
+
     # Bind process to CPU NUMA
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
@@ -581,7 +589,7 @@ def remove_kvcache_all_device(remove_task_ids):
         num_tasks=len(remove_task_ids),
         task_ids=remove_task_ids,
         req_ids=remove_task_ids,
-        task_type=TaskType.Decode,
+        task_type=TaskType.Special,
         payload_type=SerializedPackedTasksPayloadType.EndTask,
     )
     Backend.executor.step(tasks)
@@ -590,24 +598,11 @@ def remove_kvcache_all_device(remove_task_ids):
 @torch.inference_mode()
 def chitu_run_normal():
     task_ids = Backend.scheduler.schedule()
-    output_task_ids = Backend.scheduler.schedule_output_tasks()
 
-    if task_ids:
-        if Backend.args.infer.dp_size > 1:
-            all_task_ids = (
-                [task_id for task_list in task_ids for task_id in task_list]
-                if type(task_ids[0]) == list
-                else task_ids
-            )
-            all_tasks = PackedTasks(all_task_ids, output_task_ids)
-            all_tasks.batch_update_status()
+    if task_ids or DPTaskCollector.has_available_tasks():
         # compute
         logger.debug(f"Processing {task_ids}")
-        tasks = (
-            PackedTasks(task_ids[0], output_task_ids)
-            if type(task_ids[0]) == list
-            else PackedTasks(task_ids, output_task_ids)
-        )
+        tasks = PackedTasks(task_ids)
 
         tokens = Backend.executor.step(tasks)
         num_tokens = (
@@ -624,8 +619,9 @@ def chitu_run_normal():
         if last_batch_results:
             Backend.executor.postprocess_async_part(last_batch_results)
 
-        if DPTaskCollector.has_available_tasks():
+        if Backend.args.infer.dp_size > 1:
             tasks = DPTaskCollector.get_total_packedtasks()
+            tasks.batch_update_status()
             task_ids = tasks.task_ids
             logger.debug(
                 f"[run] DPTaskCollector total_packed num_tasks={tasks.num_tasks} output_tasks={len(tasks.output_tasks)}"
@@ -637,153 +633,39 @@ def chitu_run_normal():
                 tokens,
                 keep_device=(Backend.args.infer.dp_size <= 1 or True),
             )
-        Backend.scheduler.update_sgroup(task_ids)
         # tasks from the model-running tasks (task_ids) which will not run anymore
-        removed_decode_task_ids = [
-            task_id for task_id in task_ids if TaskPool.pool[task_id].no_model_run()
-        ]
-        Backend.scheduler.update(
-            (last_batch_results.task_ids if last_batch_results else []) + task_ids,
-            update_sgroup=False,
-        )
+        removed_decode_task_ids = Backend.scheduler.update(task_ids)
         remove_kvcache_all_device(removed_decode_task_ids)
-    elif output_task_ids or len(Backend.last_batch_results) > 0:
-        if output_task_ids:
-            tasks = PackedTasks(output_task_ids)
-            if Backend.args.infer.dp_size <= 1:
-                tasks.batch_sync()
-            tasks.batch_update_status()
+    elif len(Backend.last_batch_results) > 0:
         # ensure the last batch result is processed
         last_batch_results = Backend.last_batch_results.popleft()
         Backend.executor.postprocess_async_part(last_batch_results)
-        Backend.scheduler.update(last_batch_results.task_ids, update_sgroup=False)
-
-
-def _update_ongoing_tasks():
-    unwait_tasks: list[PackedTasks] = []
-    logits_list: list[torch.Tensor] = []
-    for ogr in Backend.ongoing_reqs:
-        if ogr.handle.is_completed():
-            Backend.ongoing_reqs.remove(ogr)
-            unwait_tasks.append(ogr.waiting_task)
-            logits_list.append(ogr.logits.view(-1, ogr.logits.shape[-1]))
-            for task in ogr.waiting_task.tasks:
-                task.unwait()
-    return unwait_tasks, logits_list
-
-
-def _update_ongoing_tasks_dp():
-    unwait_tasks: list[PackedTasks] = []
-    tokens_list: list[torch.Tensor] = []
-    for ogr in Backend.ongoing_reqs:
-        if ogr.handle.is_completed():
-            Backend.ongoing_reqs.remove(ogr)
-            update_tasks = ogr.waiting_task
-            update_tokens = ogr.logits
-            dp_src = ogr.dp_src
-            DPTaskCollector.update_ongoing(dp_src, update_tasks, update_tokens)
-            if DPTaskCollector.batch_finished():
-                batch_packedtasks = DPTaskCollector.remove_ongoing()
-                unwait_tasks.append(batch_packedtasks)
-                tokens = DPTaskCollector.get_collected_tokens_tensor()
-                tokens_list.append(tokens)
-                DPTaskCollector.reset_collect_tokens()
-                for task in batch_packedtasks.tasks:
-                    task.unwait()
-    return unwait_tasks, tokens_list
 
 
 @torch.inference_mode()
 def chitu_run_pp():
     task_ids = Backend.scheduler.schedule()
-    output_task_ids = Backend.scheduler.schedule_output_tasks()
 
-    if output_task_ids:
-        tasks = PackedTasks(output_task_ids)
-        tasks.batch_update_status()
-
-    if task_ids:
+    if task_ids or DPTaskCollector.has_available_tasks():
         # compute
         logger.debug(f"Processing {task_ids}")
         tasks = PackedTasks(task_ids)
         Backend.executor.step(tasks)
 
     # postprocess async part
-    last_batch_results = None
     if len(Backend.last_batch_results) > 0:
         last_batch_results = Backend.last_batch_results.popleft()
         Backend.executor.postprocess_async_part(last_batch_results)
 
     # postprocess sync part
-    unwait_batches, logits = _update_ongoing_tasks()
-    for idx, batch in enumerate(unwait_batches):
-        Backend.executor.postprocess_sync_part(batch, logits[idx], keep_device=False)
-    unwait_task_ids = [t.task_id for batch in unwait_batches for t in batch.tasks]
-    Backend.scheduler.update_sgroup(task_ids + unwait_task_ids)
-    removed_decode_task_ids = [
-        task_id for task_id in unwait_task_ids if TaskPool.pool[task_id].no_model_run()
-    ]
-    Backend.scheduler.update(
-        task_ids + (last_batch_results.task_ids if last_batch_results else []),
-        unwait_task_ids,
-        update_sgroup=False,
-    )
-    remove_kvcache_all_device(removed_decode_task_ids)
-
-
-@torch.inference_mode()
-def chitu_run_pp_dp():
-    task_ids = Backend.scheduler.schedule()
-    output_task_ids = Backend.scheduler.schedule_output_tasks()
-    last_batch_result = None
-
-    if output_task_ids and not task_ids:
-        tasks = PackedTasks(output_task_ids)
-        tasks.batch_update_status()
-
-    if task_ids:
-        all_task_ids = (
-            [task_id for task_list in task_ids for task_id in task_list]
-            if type(task_ids[0]) == list
-            else task_ids
-        )
-        all_tasks = PackedTasks(all_task_ids, output_task_ids)
-        all_tasks.batch_update_status()
-        # compute
-        logger.debug(f"Processing {task_ids}")
-        tasks = (
-            PackedTasks(task_ids[0])
-            if type(task_ids[0]) == list
-            else PackedTasks(task_ids)
-        )
-        Backend.executor.step(tasks)
-
-    elif len(Backend.last_batch_results) > 0:
-        # ensure the last batch result is processed
-        last_batch_result = Backend.last_batch_results.popleft()
-        Backend.executor.postprocess_async_part(last_batch_result)
-
-    unwait_batches, tokens = _update_ongoing_tasks_dp()
-    for token, tasks in zip(tokens, unwait_batches):
-        if token.numel() == 1:
-            token_list = [int(token.item())]
+    if Backend.args.infer.dp_size > 1:
+        if DPTaskCollector.has_available_tasks():
+            task_ids = DPTaskCollector.get_total_packedtasks().task_ids
+            DPTaskCollector.clear()
         else:
-            token_list = token.cpu().tolist()
-
-        # ---dependent on tokens_cpu ---
-        for it, task in enumerate(tasks.output_tasks):
-            task.update_response_no_sync(token_list[it])
-            task._last_tokens = [token_list[it]]
-
-    curr_task_ids = []
-    if task_ids:
-        curr_task_ids = [
-            task_id for task_id_list in task_ids for task_id in task_id_list
-        ]
-    unwait_task_ids = [t.task_id for batch in unwait_batches for t in batch.tasks]
-    if last_batch_result:
-        curr_task_ids += last_batch_result.task_ids
-    removed_decode_task_ids = Backend.scheduler.update(curr_task_ids, unwait_task_ids)
+            task_ids = []
+    unwait_task_ids = Backend.executor._process_ongoing_tasks()
+    removed_decode_task_ids = Backend.scheduler.update(task_ids, unwait_task_ids)
     remove_kvcache_all_device(removed_decode_task_ids)
 
 
@@ -795,10 +677,7 @@ def chitu_run():
         return
 
     if Backend.args.infer.pp_size > 1:
-        if Backend.args.infer.dp_size <= 1:
-            chitu_run_pp()
-        else:
-            chitu_run_pp_dp()
+        chitu_run_pp()
     else:
         chitu_run_normal()
 

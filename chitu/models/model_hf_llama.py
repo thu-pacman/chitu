@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import re
 from logging import getLogger
 from typing import Any
 from typing_extensions import override
@@ -658,7 +659,7 @@ class TransformerHFLlama(Transformer):
         )
 
         for k in checkpoint.keys():
-            if k.endswith(".k_proj.weight") or k.endswith(".v_proj.weight"):
+            if re.match(r".*\.[kv]_proj\.weight(_scale)?$", k):
                 dim = checkpoint[k].shape[-1]
                 checkpoint[k] = checkpoint[k].view([-1, head_dim, dim])
                 checkpoint[k] = checkpoint[k].repeat_interleave(repeats, dim=0)

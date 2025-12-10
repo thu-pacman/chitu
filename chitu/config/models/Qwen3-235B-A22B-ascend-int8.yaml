@@ -5,7 +5,7 @@
 # Qwen3-235B-A22B-fp8 is a quantization of Qwen3-235B-A22B
 defaults:
   - Qwen3-235B-A22B
-  - quant_config: qwen-moe-ascend-int8
+  - quant_config: qwen-ascend-int8
   - _self_ # Config in this file overrides configs in defaults
 
 # Access info

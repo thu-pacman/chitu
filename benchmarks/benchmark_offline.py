@@ -168,7 +168,7 @@ def run_benchmark(args, timers, is_main_rank, rank):
             t_start = time.perf_counter()
             while not chitu_is_terminated():
                 chitu_run()
-                if is_main_rank and len(TaskPool.pool) == 0:
+                if is_main_rank and TaskPool.all_finished():
                     break
             t_end = time.perf_counter()
 

@@ -43,8 +43,12 @@ fi
 # Always install build time dependencies. Some dependencies may fail to build
 # if some build time dependencies are missing.
 COPY ./requirements-build.txt /tmp/requirements-build.txt
+COPY ./requirements-build-deep_ep-cu12.txt /tmp/requirements-build-deep_ep-cu12.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements-build.txt
+RUN if [[ "${optional_deps}" == *"deep_ep"* ]]; then \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements-build-deep_ep-cu12.txt; \
+fi
 
 
 #####################################

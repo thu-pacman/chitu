@@ -67,7 +67,7 @@ class LocalTokenSink:
                 for task, token, value_list in zip(
                     task_list, token_list, mtp_token_list
                 ):
-                    task.req.add_data(token, notify_server=False, value_list=value_list)
+                    task.req.add_data(value_list + [token], notify_server=False)
         else:
             for task, token, logprobs, token_idxs in zip(
                 task_list, token_list, logprobs_list, token_idxs_list

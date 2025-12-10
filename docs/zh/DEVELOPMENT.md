@@ -91,6 +91,12 @@ git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
 pip install -r requirements-build.txt
 ```
 
+如果你选择的可选依赖中包含 `deep_ep`，还需要运行:
+
+```bash
+pip install -r requirements-build-deep_ep-cu12.txt
+```
+
 #### 3. 安装 PyTorch
 
 在英伟达平台，可以安装最新 PyTorch：
@@ -165,7 +171,7 @@ TORCH_CUDA_ARCH_LIST=9.0 pip install --no-build-isolation ".[flash_mla]"
 - `flashinfer`: 用于支持 `infer.attn_type=flash_infer`。
 - `flash_mla`: 用于支持 `infer.attn_type=flash_mla`。
 - `deep_gemm`: 用于支持使用 DeepGEMM 进行 fp8 推理。
-- `deep_ep`: 用于支持使用 DeepEP 进行 MoE 通信（需要先在系统中安装 NVSHMEM，并设置 `NVSHMEM_DIR=/path/to/installed/nvshmem` 环境变量）
+- `deep_ep`: 用于支持使用 DeepEP 进行 MoE 通信（需要在**安装赤兔前**先在系统中安装 NVSHMEM，NVSHMEM 已经包含在 `requirements-build-deep_ep-cu12.txt` 中）
 - `cpu`: 用于支持 CPU+GPU 混合推理。
 - `muxi_layout_kernels`: 用于支持在沐曦 GPU 上使用 `infer.op_impl=muxi_custom_kernel` 模式，在小 batch 场景性能更优。
 - `scipy`: 用于支持 DeepSeek-V3.2-Exp 中的 indexer 的可选依赖。
@@ -267,13 +273,45 @@ torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_t
 可以使用以下脚本命令运行：
 
 ```bash
-./script/srun_multi_node.sh <num_nodes> <num_gpus_per_node> [your command after torchrun]...
+./script/srun_multi_node.sh <num_nodes> <num_gpus_per_node> [[additional srun args]... --] [your command after torchrun]...
 ```
 
-示例：
+示例 1（使用默认 srun 参数）：
 
 ```bash
-./script/srun_multi_node.sh 2 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
+./script/srun_multi_node.sh 2 8 test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+示例 2（与 node 0 交互）：
+
+```bash
+./script/srun_multi_node.sh 2 8 --pty -- test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+### 使用 slurm 在多个节点上的 Apptainer 容器内运行
+
+可以使用以下脚本命令运行：
+
+```bash
+./script/srun_apptainer_multi_node.sh <num_nodes> <num_gpus_per_node> [[additional srun args]... --] [extra apptainer args]... <sif_file> torchrun [your command after torchrun]...
+```
+
+示例 1（使用默认 srun 参数）：
+
+```bash
+./script/srun_apptainer_multi_node.sh 2 8 -B /path/to/models:/path/to/models /path/to/image.sif torchrun test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+示例 2（与 node 0 交互）：
+
+```bash
+./script/srun_apptainer_multi_node.sh 2 8 --pty -- -B /path/to/models:/path/to/models /path/to/image.sif torchrun test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+示例 3（将 chitu 代码挂载到容器中）：
+
+```bash
+./script/srun_apptainer_multi_node.sh 2 8 -B .:/workspace/chitu -B /path/to/models:/path/to/models --env PYTHONPATH=/workspace/chitu /path/to/image.sif torchrun test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
 ```
 
 ### 基于 SSH 连接的多节点运行

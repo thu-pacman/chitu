@@ -189,7 +189,7 @@ def run_pipe_or_tensor_parallelism(args, timers, history_result):
         timers("overall").start()
         while not chitu_is_terminated():
             chitu_run()
-            if rank == 0 and len(TaskPool.pool) == 0:
+            if rank == 0 and TaskPool.all_finished():
                 break  # Rank 0 can temperarily leave to do other things
         timers("overall").stop()
         t_end = time.time()
