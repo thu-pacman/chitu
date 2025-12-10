@@ -31,6 +31,7 @@ from chitu.quantization import (
     get_quant_from_checkpoint_prefix,
     get_quant_kwargs_from_checkpoint_prefix,
 )
+from chitu.utils import is_layer
 from chitu.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -426,6 +427,9 @@ class TransformerHFLlama(Transformer):
     def _get_tensor_row_parallel_layer_names(self) -> list[str]:
         return ["down_proj", "o_proj"]
 
+    def _get_tensor_parallel_repeat_kv_head_layer_names(self) -> list[str]:
+        return ["k_proj", "v_proj"]
+
     def _get_pre_layer_prefixes(self) -> list[str]:
         return ["embed_tokens."]
 
@@ -652,18 +656,35 @@ class TransformerHFLlama(Transformer):
         Returns:
             checkpoint: [checkpoint] after after repeating each kv_head weight [repeats] times.
         """
-        head_dim = (
-            self.params.head_dim
-            if hasattr(self.params, "head_dim")
-            else self.params.dim // self.params.n_heads
-        )
+        n_kv_heads = self.params.n_kv_heads
+        repeat_kv_head_names = self._get_tensor_parallel_repeat_kv_head_layer_names()
 
-        for k in checkpoint.keys():
-            if re.match(r".*\.[kv]_proj\.weight(_scale)?$", k):
-                dim = checkpoint[k].shape[-1]
-                checkpoint[k] = checkpoint[k].view([-1, head_dim, dim])
-                checkpoint[k] = checkpoint[k].repeat_interleave(repeats, dim=0)
-                checkpoint[k] = checkpoint[k].view([-1, dim])
+        for name, param in checkpoint.items():
+            quant = get_quant_from_checkpoint_prefix(name)
+            if any(is_layer(s, name) for s in repeat_kv_head_names):
+                if name.split(".")[-1] in self._get_1d_out_tensor_names(quant):
+                    assert (
+                        param.dim() == 1
+                    ), f"{name} is expected to be 1D, but got {param.dim()}D"
+                    param = param.view([n_kv_heads, -1])
+                    param = param.repeat_interleave(repeats, dim=0)
+                    checkpoint[name] = param.view(-1)
+                elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names(quant):
+                    assert (
+                        param.dim() == 2
+                    ), f"{name} is expected to be 2D, but got {param.dim()}D"
+                    dim = param.shape[1]
+                    param = param.view([n_kv_heads, -1, dim])
+                    param = param.repeat_interleave(repeats, dim=0)
+                    checkpoint[name] = param.view([-1, dim])
+                elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names(quant):
+                    assert (
+                        param.dim() == 2
+                    ), f"{name} is expected to be 2D, but got {param.dim()}D"
+                    dim = param.shape[0]
+                    param = param.view([dim, n_kv_heads, -1])
+                    param = param.repeat_interleave(repeats, dim=1)
+                    checkpoint[name] = param.view([dim, -1])
         return checkpoint
 
     def load_state_dict_parallel(

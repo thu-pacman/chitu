@@ -166,8 +166,18 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
         )
 
-        self.in_proj_qkvz = nn.Linear(self.dim, self.local_qkvz_dim, bias=False)
-        self.in_proj_ba = nn.Linear(self.dim, self.local_ba_dim, bias=False)
+        self.in_proj_qkvz = LocalLinear(
+            self.dim,
+            self.local_qkvz_dim,
+            has_bias=False,
+            checkpoint_prefix=f"{checkpoint_prefix}.in_proj_qkvz",
+        )
+        self.in_proj_ba = LocalLinear(
+            self.dim,
+            self.local_ba_dim,
+            has_bias=False,
+            checkpoint_prefix=f"{checkpoint_prefix}.in_proj_ba",
+        )
 
         self.impl = args.linear_attention_impl
         self.norm = Qwen3NextRMSNormGated(
@@ -175,8 +185,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             args.norm_eps,
         )
 
-        self.out_proj = nn.Linear(
-            self.n_local_v_heads * self.head_dim, self.dim, bias=False
+        self.out_proj = LocalLinear(
+            self.n_local_v_heads * self.head_dim,
+            self.dim,
+            has_bias=False,
+            checkpoint_prefix=f"{checkpoint_prefix}.out_proj",
         )
 
     def fix_qkv_ordering(
@@ -720,6 +733,25 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                 checkpoint[prefix + "attn_gate.weight"] = gate.reshape(
                     self.params.n_heads * self.params.head_dim, -1
                 )
+            if self.params.quant_config["type"] == "blockfp8" and k.endswith(
+                ".q_proj.weight_scale_inv"
+            ):
+                prefix = k[: -len("q_proj.weight_scale_inv")]
+                q_scale = checkpoint[k]
+                q_scale, gate = torch.chunk(
+                    q_scale.view(
+                        self.params.n_heads, self.params.head_dim * 2 // 128, -1
+                    ),
+                    2,
+                    dim=1,
+                )
+                checkpoint[k] = q_scale.reshape(
+                    self.params.n_heads * self.params.head_dim // 128, -1
+                )
+                checkpoint[prefix + "attn_gate.weight_scale_inv"] = gate.reshape(
+                    self.params.n_heads * self.params.head_dim // 128, -1
+                )
+
         return checkpoint
 
     def qwen_next_chunk_checkpoint_for_tensor_parallel_direct(
@@ -733,6 +765,9 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
         row_parallel_names = [
             ".out_proj.weight",
         ]
+        if self.params.quant_config["type"] == "blockfp8":
+            col_parallel_names.append(".attn_gate.weight_scale_inv")
+            row_parallel_names.append(".out_proj.weight_scale_inv")
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             if any(k.endswith(name) for name in col_parallel_names):
@@ -769,6 +804,19 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                 * self.params.linear_head_dim,
             ],
         }
+        if self.params.quant_config["type"] == "blockfp8":
+            col_parallel_split_args[".in_proj_qkvz.weight_scale_inv"] = [
+                self.params.linear_head_dim // 128,
+                self.params.linear_head_dim // 128,
+                self.params.linear_n_v_heads
+                // self.params.linear_n_qk_heads
+                * self.params.linear_head_dim
+                // 128,
+                self.params.linear_n_v_heads
+                // self.params.linear_n_qk_heads
+                * self.params.linear_head_dim
+                // 128,
+            ]
         reshape_size = (
             self.params.linear_n_qk_heads,
             -1,
@@ -788,6 +836,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                     else:
                         # reshape -> split -> split -> merge -> reshape
                         other_dim = checkpoint[k].shape[1:]
+                        original_dim = checkpoint[k].shape[-1]
                         curr_reshape_size = reshape_size + other_dim
                         splitted = (
                             checkpoint[k]
@@ -798,7 +847,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                             torch.chunk(x, world_size, dim=0)[rank] for x in splitted
                         ]
                         checkpoint[k] = torch.cat(tensor_parallel_splitted, dim=1)
-                        checkpoint[k] = checkpoint[k].reshape(-1, self.params.dim)
+                        checkpoint[k] = checkpoint[k].reshape(-1, original_dim)
         return checkpoint
 
     def load_state_dict_parallel(
