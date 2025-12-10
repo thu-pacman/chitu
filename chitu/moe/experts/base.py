@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
-
+from logging import getLogger
 from typing import Optional
 
 from chitu.moe.batched_routed_activation import (
@@ -36,6 +36,8 @@ if has_deep_gemm:
     from .deepgemm_contiguous import deepgemm_contiguous_fused_expert
 from chitu.distributed.parallel_state import get_ep_size, get_tp_group
 
+logger = getLogger(__name__)
+
 
 def fused_experts_wrapper(
     hidden_states: BatchedRoutedActivation,
@@ -61,6 +63,7 @@ def fused_experts_wrapper(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
+    layer_id: int = 0,
     impl: str = "auto",
 ) -> torch.Tensor:
     """
@@ -73,7 +76,6 @@ def fused_experts_wrapper(
             impl = "torch_npu"
         else:
             raise NotImplementedError
-
     if impl == "triton":
         assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
         return fused_experts(
@@ -202,6 +204,7 @@ def fused_experts_wrapper(
             topk_ids=hidden_states.token_to_expert_indices,
             experts_start_idx=experts_start_idx,
             use_int8_w8a8=use_int8_w8a8,
+            layer_id=layer_id,
         )
     elif impl == "fused_experts_with_a2a_communication":
         assert isinstance(hidden_states, IndexedBatchedRoutedActivation)

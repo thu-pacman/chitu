@@ -67,6 +67,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         self.fuse_shared_experts = fuse_shared_experts
         self.checkpoint_prefix = checkpoint_prefix
         self.merge_gate_up = merge_gate_up
+        self.layer_id = layer_id
 
         self.ep_group = get_ep_group()
         moe_rank = self.ep_group.rank_in_group

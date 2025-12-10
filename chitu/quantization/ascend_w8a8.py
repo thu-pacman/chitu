@@ -316,6 +316,7 @@ class AscendW8A8DynamicMoeExperts(
                 topk_weights=weights,
                 use_int8_w8a8=True,
                 impl=impl,
+                layer_id=self.layer_id,
                 experts_start_idx=self.experts_start_idx,
             )
 

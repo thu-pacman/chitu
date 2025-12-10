@@ -11,6 +11,7 @@ import math
 import torch
 
 from chitu.distributed.parallel_state import get_ep_group, get_tp_size, get_tp_group
+from chitu.moe.load_balancer import get_moe_load_planner
 from chitu.utils import try_import_opt_dep, parse_dtype
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
 from chitu.moe.batched_routed_activation import (
@@ -171,6 +172,11 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         # TODO(zms): A more flexible context management.
         # Currently, we should call permutation + unpermutation contiguously.
         self.dispatcher_ctx = (deepep_handle, topk_ids, topk_weights, dp_local_bs)
+        planner = get_moe_load_planner()
+        if planner is not None:
+            planner.record_global_slot_activations(
+                layer_id=layer_id, local_slot_stats=recv_expert_count
+            )
 
         if not dispatch_use_fp8:
             return (

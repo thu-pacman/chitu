@@ -8,6 +8,7 @@ from logging import getLogger
 from typing import Any, Mapping, Optional
 from contextlib import nullcontext
 
+from chitu.task_type import TaskType
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -52,6 +53,8 @@ from chitu.quantization import (
 )
 from chitu.hybrid_device import CPUParameter
 from chitu.static_tensor import StaticTensor
+
+from chitu.moe.load_balancer import get_moe_load_planner
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
@@ -1152,6 +1155,7 @@ class ParallelMoeBlock(nn.Module):
         gate (MoeGate): The gating layer.
         experts (QuantizedMoeExpertsBase): The layer containing routed experts + fused shared experts
         non_fused_shared_experts (Optional[nn.Module]): Optional layer for shared experts if not fused.
+        layer_id (int): The layer id of this MoE block.
     """
 
     def __init__(
@@ -1180,7 +1184,14 @@ class ParallelMoeBlock(nn.Module):
 
         self.checkpoint_prefix = checkpoint_prefix
         self.layer_id = layer_id
+
+        from chitu.backend import Backend
+
+        if self.layer_id is not None:
+            Backend.register_moe_layer_experts(self.layer_id, self.experts)
+        self.layer_id = layer_id
         self.experts_stats = torch.zeros(self.experts.n_routed_experts, device="cuda")
+        self.is_dynamic = get_global_args().infer.moe_lb_trigger > 0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -1196,10 +1207,25 @@ class ParallelMoeBlock(nn.Module):
         x = x.view(-1, x.shape[-1])
 
         weights, indices = self.gate(x)
-        indices = (
-            self.expert_mapping[indices] if self.expert_mapping is not None else indices
-        )
-        routed_x = IndexedBatchedRoutedActivation(x, indices)
+        rerouted_indices = None
+
+        planner = get_moe_load_planner()
+        if planner is not None:
+            _rank_idx, _slot_idx, global_slot_idx = planner.route_expert_ids(
+                self.layer_id, indices
+            )
+            rerouted_indices = global_slot_idx.to(
+                dtype=indices.dtype, device=indices.device
+            ).contiguous()
+        elif self.expert_mapping is not None and planner is None:
+            rerouted_indices = self.expert_mapping[indices].contiguous()
+        else:
+            rerouted_indices = None
+        if rerouted_indices is None:
+            rerouted_indices = indices
+
+        routed_x = IndexedBatchedRoutedActivation(x, rerouted_indices)
+
         shared_y = None
         x_in_use_simultenously = False
         if self.shared_experts is not None:
@@ -1224,6 +1250,7 @@ class ParallelMoeBlock(nn.Module):
                 may_fuse_quant_kwargs=get_quant_kwargs_from_checkpoint_prefix(
                     f"{self.checkpoint_prefix}.experts"
                 ),
+                layer_id=self.layer_id,
             )
             x_in_use_simultenously = x_in_use_simultenously and (
                 routed_x_old is routed_x

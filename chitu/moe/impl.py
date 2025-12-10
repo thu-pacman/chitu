@@ -20,6 +20,11 @@ from .load_balancer import (
 )
 from chitu.distributed.parallel_state import get_ep_group
 
+from .load_balancer import init_moe_load_balancer, get_moe_load_planner
+from .load_balancer import (
+    register_moe_weight_accessor,
+)
+import torch
 
 deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -77,12 +82,13 @@ class MoEImpl:
             args.models.n_dense_layers if hasattr(args.models, "n_dense_layers") else 0
         )
         self.moe_layer_id_list = [x for x in range(self.n_dense_layers, self.n_layers)]
-        self.n_global_experts_slots = (
+
+        n_global_experts_slots = (
             ((self.num_experts + self.ep_size - 1) // self.ep_size) * self.ep_size
             if args.infer.num_experts_slots is None
             else args.infer.num_experts_slots
         )
-
+        self.n_global_experts_slots = n_global_experts_slots
         self._init_token_dispatcher()
         self._init_experts_impl()
         expert_stats_path = (
@@ -91,6 +97,32 @@ class MoEImpl:
             else None
         )
         self._init_load_balancer(expert_stats_path)
+        try:
+            num_layers = getattr(args.models, "n_layers", None) or getattr(
+                args.models, "num_hidden_layers", None
+            )
+            if num_layers is not None and self.num_experts > 1:
+                init_moe_load_balancer(
+                    num_layers=int(num_layers),
+                    num_experts=int(self.num_experts),
+                    slot_nums=n_global_experts_slots,
+                    enable=True,
+                )
+                try:
+                    from chitu.backend import Backend
+
+                    accessor = None
+                    if hasattr(Backend, "get_moe_weight_accessor"):
+                        accessor = Backend.get_moe_weight_accessor()
+                    elif hasattr(Backend, "moe_weight_accessor"):
+                        accessor = getattr(Backend, "moe_weight_accessor", None)
+                    if accessor is not None:
+                        register_moe_weight_accessor(accessor)
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"Failed to initialize MoE load balancer: {e}")
+            pass
 
     def _init_token_dispatcher(self):
         # impl selection

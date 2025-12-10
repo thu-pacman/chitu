@@ -43,13 +43,19 @@ from chitu.distributed.parallel_state import (
 )
 from chitu.moe import get_moe_impl
 from chitu.hooks import TokenSink, LocalTokenSink, KVTransferHook, NoopKVTransferHook
-from chitu.utils import top_k_top_p_min_p_sampling_from_logits
+from chitu.utils import (
+    top_k_top_p_min_p_sampling_from_logits,
+    try_import_and_setup_torch_npu,
+)
 from chitu.ops import apply_frequency_penalty, response_append
 from chitu.device_list import DeviceList
-from chitu.device_type import is_ascend
+from chitu.device_type import is_ascend, is_ascend_910b
+from chitu.distributed.comm_group import CommGroup
+from chitu.moe.load_balancer import get_moe_load_planner  # added
 from chitu.logging_utils import tps_monitor
 
 logger = getLogger(__name__)
+_, has_torch_npu = try_import_and_setup_torch_npu()
 
 # Although tags are not fully supported in the NCCL backend, they are helpful to understand the code
 TASK_TENSOR_TAG = 1
@@ -697,6 +703,13 @@ class Executor:
         self._token_sink: TokenSink = LocalTokenSink()
         self._kv_hook: KVTransferHook = NoopKVTransferHook()
 
+        # ---- Load balancer concurrent scheduling ----
+        # Planner runs on a background thread; we only trigger and (optionally) sync here.
+        self._lb_planner = get_moe_load_planner()
+        self._lb_enabled = self._lb_planner is not None
+        self._lb_every = args.infer.moe_lb_trigger
+        self._lb_step = 0
+
     def _prepend_dispatcher(self, dispatcher: TasksDispatcher):
         self.task_dispatchers.insert(0, dispatcher)
 
@@ -713,6 +726,32 @@ class Executor:
 
     def get_kv_hook(self) -> KVTransferHook:
         return self._kv_hook
+
+    def _lb_trigger(self) -> None:
+        # 如果sysnc没有成功，不要开启下一步的trigger
+        if not self._lb_enabled:
+            return
+        try:
+            if self._lb_every > 0 and (self._lb_step % self._lb_every == 0):
+                self._lb_planner.aggregate_expert_stats_for_current_batch()
+                self._lb_planner.generate_actions_and_order()
+
+        except Exception as e:
+            logger.warning(
+                f"Executor LB trigger failed at step {self._lb_step} on rank {self.rank}: {e}"
+            )
+            pass
+
+    def _lb_sync(self) -> None:
+        if not self._lb_enabled:
+            return
+        try:
+            self._lb_planner.commit_ready_layers()
+        except Exception as e:
+            logger.warning(
+                f"Executor LB sync failed at step {self._lb_step} on rank {self.rank}: {e}"
+            )
+            pass
 
     def _prepare_new_tokens_for_decode(self, tasks: PackedTasks):
         return torch.tensor(
@@ -835,7 +874,11 @@ class Executor:
         if self.moe_impl is not None:
             self.moe_impl.prepare(tasks.task_type, tasks.num_tokens)
 
-        # 2. prefill/decode step
+        # logger.info(f"Executor step: {self._lb_step}")
+
+        if tasks.task_type not in [TaskType.EmptyPrefill, TaskType.Prefill]:
+            self._lb_trigger()
+
         if tasks.task_type == TaskType.Prefill:
             out = self.prefill_step(tasks)
         elif tasks.task_type == TaskType.Decode:
@@ -845,7 +888,11 @@ class Executor:
         elif tasks.task_type == TaskType.EmptyDecode:
             out = self.empty_decode_step(tasks)
         else:
-            raise NotImplementedError  # Hybrid task not implemented
+            raise NotImplementedError
+
+        if tasks.task_type not in [TaskType.EmptyPrefill, TaskType.Prefill]:
+            self._lb_sync()
+        self._lb_step += 1
 
         # 3. handle ongoing task
         if self.dp_size > 1:
