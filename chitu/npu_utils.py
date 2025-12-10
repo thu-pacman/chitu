@@ -6,6 +6,7 @@ import logging
 import functools
 import torch
 import torch_npu
+import os
 import torch.distributed as dist
 from torch_npu.contrib import transfer_to_npu
 
@@ -26,6 +27,7 @@ from chitu.moe.batched_routed_activation import (
     ConcatPermutedBatchedRoutedActivation,
 )
 from chitu.moe.batched_expert_result import ConcatPermutedBatchedExpertResult
+from chitu.moe.load_balancer import get_moe_load_planner
 
 
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
@@ -329,6 +331,7 @@ def fused_experts_npu_with_communication(
     w2_scale=None,
     experts_start_idx=0,
     use_int8_w8a8=False,
+    layer_id: int = 0,
     **kwargs,
 ):
     n_local_experts = w1.shape[0]
@@ -395,7 +398,12 @@ def fused_experts_npu_with_communication(
 
     group_list = expert_token_nums.to(torch.int64)
     w1 = w1.transpose(1, 2) if not use_int8_w8a8 else w1
-
+    is_dynamic = get_global_args().infer.moe_lb_trigger > 0
+    planner = get_moe_load_planner()
+    if is_dynamic and planner is not None:
+        planner.record_global_slot_activations(
+            layer_id=layer_id, local_slot_stats=group_list
+        )
     if use_int8_w8a8:
         dynamic_scales = dynamic_scales.to(torch.float32).contiguous()
 

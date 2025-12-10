@@ -22,6 +22,7 @@ from chitu.global_vars import (
     set_quant_variables,
     set_backend_variables,
 )
+from chitu.moe.load_balancer import get_moe_load_planner
 from chitu.scheduler import Scheduler
 from chitu.task import (
     PackedTasks,
@@ -145,7 +146,8 @@ def _auto_set_num_blocks_after_warmup(args):
             new_num_block = new_num_block_tensor.item()
 
         get_global_args().infer.num_blocks = new_num_block
-        Backend.cache_manager.realloc(new_num_block)
+        if new_num_block > 0:
+            Backend.cache_manager.realloc(new_num_block)
         if torch.distributed.get_rank() == 0:
             Backend.scheduler.reset_kvcache_block_threshold()
     else:
@@ -176,6 +178,11 @@ def _warmup_via_taskpool(args):
         return
 
     rank = torch.distributed.get_rank()
+
+    # Turn ON MoE planner warmup mode on all ranks
+    planner = get_moe_load_planner()
+    if planner is not None:
+        planner.set_warmup_mode(True)
 
     logger.info("Starting inference system warmup...")
 
@@ -244,7 +251,6 @@ def _warmup_via_taskpool(args):
         f"prefill_iters={num_required_prefill_schedules}"
     )
 
-    # All ranks must execute the same number of iterations for DP synchronization
     for i in range(num_required_prefill_schedules):
         chitu_run()
 
@@ -327,6 +333,10 @@ def _warmup_via_taskpool(args):
         assert len(TaskPool.pool) == 0, "TaskPool should be empty after warmup"
 
     logger.info("Inference system warmup completed")
+
+    planner = get_moe_load_planner()
+    if planner is not None:
+        planner.set_warmup_mode(False)
 
 
 def _warmup_backend_direct(args, decode_steps: int = 2):

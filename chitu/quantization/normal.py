@@ -221,6 +221,7 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
                 inplace=inplace,
                 experts_start_idx=self.experts_start_idx,
                 impl=impl,
+                layer_id=self.layer_id,
             )
 
         else:

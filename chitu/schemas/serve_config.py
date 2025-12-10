@@ -48,6 +48,8 @@ class InferConfig:
     prefill_chunk_size: Union[int, str, None] = MISSING
     experts_stats_path: Optional[str] = None
     num_experts_slots: Optional[int] = None
+    moe_lb_trigger: int = -1
+    moe_lb_threshold: float = 3.0
     has_schedule_overlap: bool = False
 
     @dataclass

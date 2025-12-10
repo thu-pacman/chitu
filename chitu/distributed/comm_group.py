@@ -11,6 +11,7 @@ from logging import getLogger
 
 logger = getLogger(__name__)
 
+
 _torch_group_dedup_dict_device: dict[tuple[tuple[int, ...], ...], list[Any]] = {}
 _torch_group_dedup_dict_host: dict[tuple[tuple[int, ...], ...], list[Any]] = {}
 
@@ -20,7 +21,7 @@ class SingletonGroupPlaceholder:
 
 
 def new_torch_group_dedup(
-    rank_lists: Sequence[Sequence[int]], is_device: bool
+    rank_lists: Sequence[Sequence[int]], is_device: bool, dup_allowed: bool = False
 ) -> list[Any]:
     """
     Allocate torch.distributed groups uniquely, so as to reduce reserved
@@ -31,7 +32,7 @@ def new_torch_group_dedup(
     if is_device:
         if len(rank_lists) == 1:
             return [torch.distributed.group.WORLD]
-        elif rank_tuples in _torch_group_dedup_dict_device:
+        elif dup_allowed and rank_tuples in _torch_group_dedup_dict_device:
             groups = _torch_group_dedup_dict_device[rank_tuples]
         else:
             groups = [
@@ -42,7 +43,8 @@ def new_torch_group_dedup(
                 )
                 for rank_list in rank_lists
             ]
-            _torch_group_dedup_dict_device[rank_tuples] = groups
+            if dup_allowed is False:
+                _torch_group_dedup_dict_device[rank_tuples] = groups
     else:
         if rank_tuples in _torch_group_dedup_dict_host:
             groups = _torch_group_dedup_dict_host[rank_tuples]
@@ -61,15 +63,23 @@ def new_torch_group_dedup(
 
 class CommGroup:
     def __init__(
-        self, rank_lists: Sequence[Sequence[int]], global_rank: int, local_rank: int
+        self,
+        rank_lists: Sequence[Sequence[int]],
+        global_rank: int,
+        local_rank: int,
+        dup_allowed: bool = False,
     ):
         self.global_rank = global_rank
         self.local_rank = local_rank
 
         self.device = torch.device(f"cuda:{local_rank}")
 
-        gpu_groups = new_torch_group_dedup(rank_lists, is_device=True)
-        cpu_groups = new_torch_group_dedup(rank_lists, is_device=False)
+        gpu_groups = new_torch_group_dedup(
+            rank_lists, is_device=True, dup_allowed=dup_allowed
+        )
+        cpu_groups = new_torch_group_dedup(
+            rank_lists, is_device=False, dup_allowed=dup_allowed
+        )
         contains_this_rank = []
         for rank_list in rank_lists:
             contains_this_rank.append(global_rank in rank_list)
@@ -92,6 +102,7 @@ class CommGroup:
         self.rank_list = rank_lists[this_rank_idx]
         self.rank_in_group = self.rank_list.index(global_rank)
         self.group_size = len(self.rank_list)
+        self.moe_comm_group = None
 
     @property
     def next_rank(self):

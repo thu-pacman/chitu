@@ -41,6 +41,7 @@ from chitu.hybrid_device import CPUParameter
 from chitu.models.registry import ModelType, get_model_class
 from chitu.quantization import (
     QuantizationRegistry,
+    QuantizedMoeExpertsBase,
     get_quant_from_checkpoint_prefix,
     utils,
 )
@@ -100,6 +101,115 @@ class Backend:
     state = BackendState.Running
     last_batch_results: Deque["BatchResult"] = deque()
     indexer_cache_manager = None
+
+    # ---- MoE load balancer optional weight accessor ----
+    # Provide a place to install a weight accessor from model/engine.
+    moe_weight_accessor = None  # set via set_moe_weight_accessor()
+    _moe_experts_by_layer: dict[int, object] = {}
+
+    @staticmethod
+    def get_moe_weight_accessor():
+        """Return the registered MoE ExpertParamAccessor (if any)."""
+        return Backend.moe_weight_accessor
+
+    @staticmethod
+    def set_moe_weight_accessor(accessor) -> None:
+        """Install a MoE weight accessor and immediately register with the planner.
+
+        Call this after the model is built and expert parameters are accessible.
+        Safe to call multiple times; later calls overwrite the previous accessor.
+        """
+        Backend.moe_weight_accessor = accessor
+        if accessor is None:
+            return
+        try:
+            # Local import to avoid circular deps at module import time
+            from chitu.moe.load_balancer import register_moe_weight_accessor
+
+            register_moe_weight_accessor(accessor)
+            logger.info("Backend: MoE weight accessor installed and registered")
+        except Exception as e:
+            logger.warning(f"Backend: failed to register MoE weight accessor: {e}")
+
+    @staticmethod
+    def register_moe_layer_experts(
+        layer_id: int, experts_module: QuantizedMoeExpertsBase
+    ) -> None:
+        """Register the experts module for a specific layer and auto-wire accessor."""
+        Backend._moe_experts_by_layer[int(layer_id)] = experts_module
+        # Build and register accessor lazily on first registration
+        if Backend.moe_weight_accessor is None:
+            try:
+                # Lazy import to avoid circular deps at import time
+                from chitu.moe.load_balancer import ExpertParamAccessor
+                import torch
+
+                class _ModelExpertsAccessor(ExpertParamAccessor):  # type: ignore
+                    def _copy_in(
+                        self, dst_tensor: torch.Tensor, src: torch.Tensor, slot: int
+                    ):
+                        dst_tensor.data[slot].copy_(
+                            src.to(dtype=dst_tensor.dtype, device=dst_tensor.device)
+                        )
+
+                    def get_params(self, layer_id: int, slot: int):
+                        mod = Backend._moe_experts_by_layer.get(int(layer_id))
+                        if mod is None:
+                            raise RuntimeError(
+                                f"No experts module registered for layer {layer_id}"
+                            )
+                        out = {}
+                        for name, param in mod.named_parameters():
+                            if not isinstance(param, torch.Tensor):
+                                continue
+                            if param.dim() == 0:
+                                continue
+                            try:
+                                value = param[slot]
+                            except Exception:
+                                continue
+                            key = name
+                            out[key] = value
+
+                        if not out:
+                            raise NotImplementedError(
+                                "Cannot infer expert param tensors from named_parameters; "
+                                "please implement get_expert_params/set_expert_params on experts module"
+                            )
+                        return out
+
+                    def set_params(self, layer_id: int, slot: int, params):
+                        mod = Backend._moe_experts_by_layer.get(int(layer_id))
+                        if mod is None:
+                            raise RuntimeError(
+                                f"No experts module registered for layer {layer_id}"
+                            )
+
+                        # Generic write-back: iterate all module parameters and match by name
+                        for name, param in mod.named_parameters():
+                            if name not in params:
+                                continue
+                            src = params[name]
+                            if not isinstance(param, torch.Tensor):
+                                continue
+                            if param.dim() == 0:
+                                continue
+                            try:
+                                # write into the target expert slot in-place
+                                self._copy_in(param, src, slot)
+                            except Exception:
+                                # Shape mismatch or non-expert tensor; skip
+                                continue
+
+                accessor = _ModelExpertsAccessor()
+                Backend.set_moe_weight_accessor(accessor)
+                logger.info(
+                    "Backend: auto-built ModelExpertsAccessor and registered to planner"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Backend: failed to build/register ModelExpertsAccessor: {e}"
+                )
 
     @staticmethod
     def build_model(args, cache, *extra_args, **extra_kwargs):
@@ -649,8 +759,61 @@ class Backend:
         Backend.model = model
         Backend.args = args
 
+        # Try to auto-register a MoE weight accessor provided by the model/experts
+        try:
+            Backend._auto_register_moe_weight_accessor_if_available()
+        except Exception:
+            pass
+
         gc.collect()
         torch.cuda.empty_cache()
+
+    @staticmethod
+    def _auto_register_moe_weight_accessor_if_available() -> None:
+        """Auto-detect a MoE ExpertParamAccessor from the model and register it.
+
+        Search order:
+        1) model.get_moe_weight_accessor()
+        2) model.moe_weight_accessor
+        3) first layer's mlp.experts exposing get_moe_weight_accessor()/moe_weight_accessor
+        If found, call Backend.set_moe_weight_accessor(accessor).
+        """
+        # Only meaningful when EP is enabled
+        try:
+            ep_size = int(getattr(Backend.args.infer, "ep_size", 1))
+        except Exception:
+            ep_size = 1
+        if ep_size <= 1:
+            return
+        model = Backend.model
+        if model is None:
+            return
+        accessor = None
+        # model-level hook
+        if hasattr(model, "get_moe_weight_accessor") and callable(
+            getattr(model, "get_moe_weight_accessor")
+        ):
+            accessor = model.get_moe_weight_accessor()
+        elif hasattr(model, "moe_weight_accessor"):
+            accessor = getattr(model, "moe_weight_accessor")
+        # layer-level hook (common: model.layers[i].mlp.experts)
+        if (
+            accessor is None
+            and hasattr(model, "layers")
+            and len(getattr(model, "layers")) > 0
+        ):
+            layer0 = model.layers[0]
+            mlp = getattr(layer0, "mlp", None)
+            experts = getattr(mlp, "experts", None) if mlp is not None else None
+            if experts is not None:
+                if hasattr(experts, "get_moe_weight_accessor") and callable(
+                    getattr(experts, "get_moe_weight_accessor")
+                ):
+                    accessor = experts.get_moe_weight_accessor()
+                elif hasattr(experts, "moe_weight_accessor"):
+                    accessor = getattr(experts, "moe_weight_accessor")
+        if accessor is not None:
+            Backend.set_moe_weight_accessor(accessor)
 
     @staticmethod
     def _build_model_architecture(args, attn_backend):
@@ -948,6 +1111,14 @@ class Backend:
         attn_backend = Backend._init_attention_backend(attn_backend_type)
 
         Backend._build_and_setup_model(args, attn_backend)
+
+        # After model/expert modules are fully built and registered, optionally run MoE P2P self-test
+        try:
+            from chitu.moe.load_balancer import warmup_for_moe_schema
+
+            warmup_for_moe_schema()
+        except Exception as _e:
+            logger.debug(f"Skip/failed running warmup for MoE schema: {_e}")
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         logger.info(

@@ -11,6 +11,7 @@ from logging import getLogger
 
 from chitu.distributed.comm_group import CommGroup
 from chitu.device_type import is_ascend
+from chitu.global_vars import get_global_args
 
 logger = getLogger(__name__)
 
@@ -190,6 +191,7 @@ def initialize_dp_group(
 def initialize_ep_group(ep_size: int, rank: int, local_rank: int, world_size: int):
     global _EP_GROUP
     assert _EP_GROUP is None
+    dup_allowed = is_ascend()
 
     dp_size = get_dp_size()
     tp_size = get_tp_size()
@@ -212,9 +214,14 @@ def initialize_ep_group(ep_size: int, rank: int, local_rank: int, world_size: in
                 rank_list.append(
                     pp_rank_list[pp_stage][i * ep_size : (i + 1) * ep_size]
                 )
-        _EP_GROUP = CommGroup(rank_list, rank, local_rank)
+        _EP_GROUP = CommGroup(rank_list, rank, local_rank, dup_allowed=dup_allowed)
     else:
-        _EP_GROUP = CommGroup([[idx] for idx in range(world_size)], rank, local_rank)
+        _EP_GROUP = CommGroup(
+            [[idx] for idx in range(world_size)],
+            rank,
+            local_rank,
+            dup_allowed=dup_allowed,
+        )
 
 
 def initialize_parallel_groups(
