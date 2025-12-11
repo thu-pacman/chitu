@@ -46,6 +46,8 @@ from chitu.schemas.utils import ModelConfigResolver
 from chitu.utils import ceil_div
 from chitu.distributed.parallel_state import get_dp_group
 from chitu.logging_utils import setup_chitu_logging
+from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
+from chitu.metrics.throughput_monitor import start_throughput_monitor
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
@@ -523,7 +525,7 @@ def chitu_init(args, logging_level=None):
             )
             args.infer.bind_process_to_cpu = "none"
         elif numa.get_max_node() + 1 < local_world_size:
-            logger.info("Disable NUMA binding due to insufficient NUMA nodes.")
+            logger.debug("Disable NUMA binding due to insufficient NUMA nodes.")
             args.infer.bind_process_to_cpu = "none"
         else:
             args.infer.bind_process_to_cpu = "numa"
@@ -589,6 +591,28 @@ def chitu_init(args, logging_level=None):
     Backend.executor = executor
     PackedTasks.configure(max_num_tasks=args.infer.max_reqs)
     logger.info("Chitu has been initialized")
+
+    metrics_config = args.metrics
+
+    # Determine if this rank should start throughput monitor
+    # Only rank 0 monitors (it has all TaskPool data)
+    should_start_monitor = rank == 0
+
+    # Only rank 0 starts the Prometheus server to avoid port conflicts
+    collector = PrometheusMetricsCollector.get_instance(
+        port=metrics_config.port, start_server=(rank == 0)
+    )
+
+    if rank == 0:
+        logger.info(f"Metrics server started on port {metrics_config.port}")
+
+    # Ranks with dp_dispatcher start throughput monitor for independent logging
+    if should_start_monitor:
+        start_throughput_monitor(
+            collector,
+            log_interval=metrics_config.log_interval,
+            collect_interval=metrics_config.collect_interval,
+        )
 
 
 def remove_kvcache_all_device(remove_task_ids):

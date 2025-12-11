@@ -107,6 +107,10 @@ dp_config:
       - host: 0.0.0.0
         port: 29630
         scheduling_strategy: "immediate"
+metrics:
+  port: 9097
+  log_interval: 10.0
+  collect_interval: 20.0
 debug:
   skip_model_load: False
   force_moe_balance: False

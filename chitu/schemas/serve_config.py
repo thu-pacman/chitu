@@ -159,6 +159,15 @@ class DpConfig:
 
 
 @dataclass
+class MetricsConfig:
+    """Metrics collection configuration"""
+
+    port: int = 9097
+    log_interval: float = 10.0
+    collect_interval: float = 1.0
+
+
+@dataclass
 class DebugConfig:
     skip_model_load: bool = MISSING
     force_moe_balance: bool = MISSING
@@ -261,6 +270,7 @@ class ServeConfig:
     request: RequestConfig = field(default_factory=RequestConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     dp_config: DpConfig = field(default_factory=DpConfig)
+    metrics: MetricsConfig = field(default_factory=MetricsConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     quant: Optional[str] = MISSING
     dtype: Optional[str] = MISSING  # Legacy parameter. To be removed in the future.

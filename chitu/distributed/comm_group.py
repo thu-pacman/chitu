@@ -293,7 +293,7 @@ class CommGroup:
         port_pp_list = [None] * self.group_size
         torch.distributed.all_gather_object(port_pp_list, local_port_pp, self.cpu_group)
 
-        logger.info(
+        logger.debug(
             f"ZMQ IP: {local_ip}, DP port: {local_port_dp}, PP port: {local_port_pp}"
         )
 
