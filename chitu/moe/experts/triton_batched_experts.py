@@ -516,12 +516,12 @@ def triton_batched_experts(
 
     E, M, _ = hidden_states.activation_per_expert.shape
     N = w1.shape[1]
-    intermediate_cache1 = torch.zeros(
+    intermediate_cache1 = torch.empty(
         (E, M, N),
         dtype=hidden_states.activation_per_expert.dtype,
         device=hidden_states.activation_per_expert.device,
     )
-    output = torch.zeros_like(hidden_states.activation_per_expert)
+    output = torch.empty_like(hidden_states.activation_per_expert)
     config = {
         "BLOCK_SIZE_M": 64,
         "BLOCK_SIZE_N": 64,
