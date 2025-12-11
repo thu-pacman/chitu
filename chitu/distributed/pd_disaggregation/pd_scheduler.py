@@ -22,6 +22,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
     KVManager,
     DisaggregationMode,
 )
+from chitu.backend import Backend
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
 )
@@ -105,42 +106,34 @@ class PDScheduler(Scheduler):
             logger.info("scheduler running in unified mode, skipping pd components")
             return
 
-        try:
-            # Create metadata buffers
-            buffer_size = max(self.prefill_num_tasks, self.decode_num_tasks) * 2
-            self.metadata_buffers = MetadataBuffers(buffer_size)
+        # Create metadata buffers
+        buffer_size = max(self.prefill_num_tasks, self.decode_num_tasks) * 2
+        self.metadata_buffers = MetadataBuffers(buffer_size)
 
-            # Determine disaggregation mode
-            if self.pd_mode == PDSchedulerMode.PREFILL_ONLY:
-                disaggregation_mode = DisaggregationMode.PREFILL
-            elif self.pd_mode == PDSchedulerMode.DECODE_ONLY:
-                disaggregation_mode = DisaggregationMode.DECODE
-            else:
-                raise ValueError(f"unsupported pd mode: {self.pd_mode}")
+        # Determine disaggregation mode
+        if self.pd_mode == PDSchedulerMode.PREFILL_ONLY:
+            disaggregation_mode = DisaggregationMode.PREFILL
+        elif self.pd_mode == PDSchedulerMode.DECODE_ONLY:
+            disaggregation_mode = DisaggregationMode.DECODE
+        else:
+            raise ValueError(f"unsupported pd mode: {self.pd_mode}")
 
-            # Create KV manager
-            # Note: cache_manager will be set later in the initialization process
-            self.kv_manager = KVManager(
-                cache_manager=None,  # Will be set later
-                metadata_buffers=self.metadata_buffers,
-                disaggregation_mode=disaggregation_mode,
-            )
+        # Create KV manager
+        # Note: cache_manager will be set later in the initialization process
+        self.kv_manager = KVManager(
+            cache_manager=None,  # Will be set later
+            metadata_buffers=self.metadata_buffers,
+            disaggregation_mode=disaggregation_mode,
+        )
 
-            logger.info(f"initialized pd components for {self.pd_mode.value} mode")
-
-        except Exception as e:
-            logger.error(f"failed to initialize pd components: {e}")
-            raise
+        logger.info(f"initialized pd components for {self.pd_mode.value} mode")
 
     def set_cache_manager(self, cache_manager):
         """Set cache manager after initialization"""
         if self.kv_manager is not None:
             self.kv_manager.cache_manager = cache_manager
             # Re-register buffers with the actual cache manager (now safe)
-            try:
-                self.kv_manager.register_buffer_to_engine()
-            except Exception as e:
-                logger.error(f"failed to register buffers to transfer engine: {e}")
+            self.kv_manager.register_buffer_to_engine()
             logger.info("cache manager set for kv manager")
 
     def set_token_manager(self, token_manager):
@@ -182,21 +175,14 @@ class PDScheduler(Scheduler):
 
         logger.info(f"processing prefill request: {request_id}")
 
-        try:
-            # Create task from request
-            task = self._create_task_from_request(original_request, TaskType.Prefill)
+        # Create task from request
+        task = self._create_task_from_request(original_request, TaskType.Prefill)
 
-            # Execute prefill (simplified). KV + logits sending is handled by KV hook.
-            _ = await self._execute_prefill(task)
-            logger.info(
-                f"prefill completed for request: {request_id}; kv transfer will be handled by hook"
-            )
-
-        except Exception as e:
-            import traceback
-
-            traceback.print_exc()
-            logger.error(f"failed to process prefill request {request_id}: {e}")
+        # Execute prefill (simplified). KV + logits sending is handled by KV hook.
+        _ = await self._execute_prefill(task)
+        logger.info(
+            f"prefill completed for request: {request_id}; kv transfer will be handled by hook"
+        )
 
     async def _process_decode_request(self, request_data: dict[str, Any]):
         """Process Decode-only request"""
@@ -208,40 +194,28 @@ class PDScheduler(Scheduler):
             f"processing decode request: {request_id} from prefill scheduler {prefill_scheduler_id}"
         )
 
-        try:
-            # Store decode request info
-            decode_info = {
-                "request_id": request_id,
-                "original_request": original_request,
-                "prefill_scheduler_id": prefill_scheduler_id,
-                "status": PDRequestStatus.PENDING,
-                "created_time": time.time(),
-            }
-            self.pending_decode_requests[request_id] = decode_info
+        # Store decode request info
+        decode_info = {
+            "request_id": request_id,
+            "original_request": original_request,
+            "prefill_scheduler_id": prefill_scheduler_id,
+            "status": PDRequestStatus.PENDING,
+            "created_time": time.time(),
+        }
+        self.pending_decode_requests[request_id] = decode_info
 
-            # 告知 KVManager 该请求应当绑定到的 Prefill engine_rank（与 Router 的 prefill_scheduler_id 对应）
-            try:
-                if (
-                    self.kv_manager is not None
-                    and hasattr(self.kv_manager, "set_prefill_target_engine_rank")
-                    and prefill_scheduler_id is not None
-                ):
-                    self.kv_manager.set_prefill_target_engine_rank(
-                        request_id, int(prefill_scheduler_id)
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"failed to set prefill target engine rank for {request_id}: {e}"
-                )
+        # 告知 KVManager 该请求应当绑定到的 Prefill engine_rank（与 Router 的 prefill_scheduler_id 对应）
+        if (
+            self.kv_manager is not None
+            and hasattr(self.kv_manager, "set_prefill_target_engine_rank")
+            and prefill_scheduler_id is not None
+        ):
+            self.kv_manager.set_prefill_target_engine_rank(
+                request_id, int(prefill_scheduler_id)
+            )
 
-            # Start waiting for KV cache
-            asyncio.create_task(self._wait_for_kv_cache(request_id))
-
-        except Exception as e:
-            import traceback
-
-            traceback.print_exc()
-            logger.error(f"failed to process decode request {request_id}: {e}")
+        # Start waiting for KV cache
+        asyncio.create_task(self._wait_for_kv_cache(request_id))
 
     async def _wait_for_kv_cache(self, request_id: str):
         """Wait for KV cache and start decode"""
@@ -250,41 +224,34 @@ class PDScheduler(Scheduler):
             logger.error(f"decode info not found for request: {request_id}")
             return
 
-        try:
-            logger.info(f"waiting for kv cache for request: {request_id}")
+        logger.info(f"waiting for kv cache for request: {request_id}")
 
-            # Wait for KV cache through KV manager (fake prefill)
-            if self.kv_manager:
-                first_token_logits = self.kv_manager.recv_kv_cache_and_insert(
-                    request_ids=[request_id],
-                    cache_manager=self.kv_manager.cache_manager,
-                )
+        # Wait for KV cache through KV manager (fake prefill)
+        if self.kv_manager:
+            first_token_logits = self.kv_manager.recv_kv_cache_and_insert(
+                request_ids=[request_id],
+                cache_manager=self.kv_manager.cache_manager,
+            )
 
-                logger.info(f"received kv cache for request: {request_id}")
+            logger.info(f"received kv cache for request: {request_id}")
 
-                # Update status
-                decode_info["status"] = PDRequestStatus.DECODE_RUNNING
-                decode_info["decode_start_time"] = time.time()
+            # Update status
+            decode_info["status"] = PDRequestStatus.DECODE_RUNNING
+            decode_info["decode_start_time"] = time.time()
 
-                # Create task for decode
-                task = self._create_task_from_request(
-                    decode_info["original_request"], TaskType.Decode
-                )
+            # Create task for decode
+            task = self._create_task_from_request(
+                decode_info["original_request"], TaskType.Decode
+            )
 
-                # Execute decode with received first token
-                await self._execute_decode(task, first_token_logits)
+            # Execute decode with received first token
+            await self._execute_decode(task, first_token_logits)
 
-                # Update status
-                decode_info["status"] = PDRequestStatus.COMPLETED
-                decode_info["decode_complete_time"] = time.time()
+            # Update status
+            decode_info["status"] = PDRequestStatus.COMPLETED
+            decode_info["decode_complete_time"] = time.time()
 
-                logger.info(f"completed decode for request: {request_id}")
-
-        except Exception as e:
-            logger.error(f"failed to wait for kv cache for request {request_id}: {e}")
-            if decode_info:
-                decode_info["status"] = PDRequestStatus.FAILED
-                decode_info["error_message"] = str(e)
+            logger.info(f"completed decode for request: {request_id}")
 
     async def _process_regular_request(self, request_data: dict[str, Any]):
         """Process regular request (traditional mode)"""
@@ -365,13 +332,10 @@ class PDScheduler(Scheduler):
             stop_with_eos=stop_with_eos,
         )
         # Wrap task to enable streaming tokens to Router if token_manager is available
-        try:
-            if self.token_manager is not None:
-                from chitu.dp_token_sender import DPTaskWrapper  # type: ignore
+        if self.token_manager is not None:
+            from chitu.dp_token_sender import DPTaskWrapper  # type: ignore
 
-                task = self.token_manager.wrap_task(task)
-        except Exception as e:
-            logger.warning(f"failed to wrap task with token manager: {e}")
+            task = self.token_manager.wrap_task(task)
         if task_type == TaskType.Decode:
             task.consume_req_tokens()
         return task
@@ -394,17 +358,14 @@ class PDScheduler(Scheduler):
         logger.info(f"executing prefill for task: {task.task_id}")
 
         # Ensure PackedTasksBase configured
-        try:
-            from chitu.task import PackedTasks as _PT
-            from chitu.task import PackedTasksBase as _PTB
+        from chitu.task import PackedTasks as _PT
+        from chitu.task import PackedTasksBase as _PTB
 
-            if not _PTB.configured:
-                args = get_global_args()
-                from chitu.task import PackedTasks as __PT
+        if not _PTB.configured:
+            args = get_global_args()
+            from chitu.task import PackedTasks as __PT
 
-                __PT.configure(max_num_tasks=args.infer.max_reqs)
-        except Exception:
-            pass
+            __PT.configure(max_num_tasks=args.infer.max_reqs)
 
         # Build a PackedTasksBase with one task (avoid TaskPool dependency)
         tokens = task.prefix_tokens
@@ -427,34 +388,25 @@ class PDScheduler(Scheduler):
 
     async def _execute_decode(self, task: Task, first_token_logits: torch.Tensor):
         """Execute real decode from first-token logits"""
-        from chitu.backend import Backend
-        import torch
 
         logger.info(f"executing decode for task: {task.task_id}")
 
         tokens = task.prefix_tokens
         req_id = task.req.request_id
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        try:
-            Backend.cache_manager.prepare_cache_prefill([req_id], [len(tokens)])
-            payload_prefill = torch.tensor(
-                tokens, device=torch.device(local_rank), dtype=torch.int64
-            )
-            output_token_offsets = torch.tensor(
-                [payload_prefill.size(0) - 1],
-                dtype=torch.int32,
-                device=payload_prefill.device,
-            )
-            prefill_logits_local = Backend.model.prefill(
-                payload_prefill, output_token_offsets
-            )
-            Backend.cache_manager.finalize_cache_all_prefill()
-        except Exception as e:
-            import traceback
-
-            traceback.print_exc()
-            logger.warning(f"fake prefill on decode failed or skipped: {e}")
-            prefill_logits_local = None
+        Backend.cache_manager.prepare_cache_prefill([req_id], [len(tokens)])
+        payload_prefill = torch.tensor(
+            tokens, device=torch.device(local_rank), dtype=torch.int64
+        )
+        output_token_offsets = torch.tensor(
+            [payload_prefill.size(0) - 1],
+            dtype=torch.int32,
+            device=payload_prefill.device,
+        )
+        prefill_logits_local = Backend.model.prefill(
+            payload_prefill, output_token_offsets
+        )
+        Backend.cache_manager.finalize_cache_all_prefill()
 
         if first_token_logits is not None and first_token_logits.numel() > 0:
             next_token = torch.argmax(first_token_logits.view(-1)).item()
@@ -465,15 +417,16 @@ class PDScheduler(Scheduler):
         assert isinstance(next_token, int)
 
         # Use Task API so DP wrapper can stream token back to Router
-        try:
-            task.update_response_sync(next_token)
-        except Exception:
-            # Fallback to direct add if wrapper not present
-            task.req.add_data(next_token)
+        # Standard Task has update_response_no_sync, which is monkey-patched by DP wrapper if active
+        task.update_response_no_sync(next_token)
 
         # Early stop on EOS right after first token if needed
         if task.stop_with_eos and task.next_token in Backend.tokenizer.stop_tokens:
             task.req.finish_reason = "stop"
+            if hasattr(task, "token_sender"):
+                task.token_sender.send_finish(
+                    task.req.request_id, task.req.finish_reason
+                )
             logger.info(f"decode completed for task: {task.task_id}")
             return
 
@@ -485,15 +438,18 @@ class PDScheduler(Scheduler):
             step_logits = Backend.executor.decode_step_tp_only([req_id], [next_token])
             next_token = torch.argmax(step_logits.view(-1)).item()
             assert isinstance(next_token, int)
-            try:
-                task.update_response_sync(next_token)
-            except Exception:
-                task.req.add_data(next_token)
+            task.update_response_no_sync(next_token)
 
             # Cache finalize is handled inside decode_step_tp_only
             if task.stop_with_eos and task.next_token in Backend.tokenizer.stop_tokens:
                 task.req.finish_reason = "stop"
                 break
+
+        if not task.req.finish_reason:
+            task.req.finish_reason = "length"
+
+        if hasattr(task, "token_sender"):
+            task.token_sender.send_finish(task.req.request_id, task.req.finish_reason)
 
         logger.info(f"decode completed for task: {task.task_id}")
 
