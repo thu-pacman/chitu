@@ -1009,11 +1009,19 @@ class Backend:
                 and args.infer.mtp_size == 1
             ):
                 return False
-            if args.models.name == "GLM-4.5-Air" and "model.layers.46" in k:
+            if (
+                args.models.name == "GLM-4.5-Air"
+                and "model.layers.46" in k
+                and args.infer.mtp_size == 1
+            ):
                 return False
-            if args.models.name in ["GLM-4.5", "GLM-4.6"] and "model.layers.92" in k:
+            if (
+                args.models.name in ["GLM-4.5", "GLM-4.6"]
+                and "model.layers.92" in k
+                and args.infer.mtp_size == 1
+            ):
                 return False
-            if args.models.name == "QwQ-32B-fp4" and (
+            if args.models.quant_config.type == "blockfp4" and (
                 k.endswith(".k_scale") or k.endswith(".v_scale")
             ):
                 return False
