@@ -78,26 +78,53 @@ class ShareGPTDataset:
         max_new_tokens: int,
     ) -> list:
         reqs: list = []
-        for entry in self.data:
-            if len(reqs) >= num_requests:
-                break
+        n = len(self.data)
+        if n == 0:
+            raise ValueError("dataset is empty after filtering.")
+
+        idx = 0
+        passes = 0
+        collected_at_last_pass = (
+            -1
+        )  # progress guard for the case of zero eligible entries
+
+        # Allow wrap-around (duplicate sampling) until reaching num_requests,
+        # with a guard: if a full pass yields no additional eligible samples, stop early.
+        while len(reqs) < num_requests:
+            entry = self.data[idx]
             prompt = entry["conversations"][0]["value"]
 
             prompt_ids = tokenizer(
                 prompt, max_length=input_len, truncation=True, add_special_tokens=False
             ).input_ids
 
-            if len(prompt_ids) < input_len:
-                continue
-
-            reqs.append(
-                UserRequest(
-                    message=None,
-                    request_id=gen_sequential_id(),
-                    tokens=prompt_ids,
-                    max_new_tokens=max_new_tokens,
+            if len(prompt_ids) >= input_len:
+                reqs.append(
+                    UserRequest(
+                        message=None,
+                        request_id=gen_sequential_id(),
+                        tokens=prompt_ids,
+                        max_new_tokens=max_new_tokens,
+                    )
                 )
-            )
+
+            idx += 1
+            if idx == n:
+                # Completed one pass; if no progress, we cannot satisfy the request count.
+                passes += 1
+                if len(reqs) == collected_at_last_pass:
+                    logger.warning(
+                        f"ShareGPTDataset: only sampled {len(reqs)} requests (requested {num_requests}); "
+                        f"not enough entries meeting input_len={input_len}. Consider using dataset='random' "
+                        f"or reducing input_len."
+                    )
+                    break
+                collected_at_last_pass = len(reqs)
+                # Deterministic reshuffle per pass to provide variety while keeping reproducibility
+                random.seed(self.random_seed + passes)
+                random.shuffle(self.data)
+                idx = 0
+
         return reqs
 
 
