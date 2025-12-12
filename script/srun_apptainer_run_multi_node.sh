@@ -89,6 +89,7 @@ apptainer run \
     --nv \
     --contain \
     --cwd /workspace/chitu \
+    --cleanenv \
     --env NCCL_GRAPH_MIXING_SUPPORT=0 \
     --env NCCL_GRAPH_REGISTER=0 \
     "${APPTAINER_ARGS[@]}" \
