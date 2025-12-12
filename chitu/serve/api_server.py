@@ -193,8 +193,11 @@ async def create_chat_completion(
                 return JSONResponse(response_dict)
             except Exception as e:
                 raise HTTPException(status_code=400, detail=str(e))
-    except ValueError:
-        del req, response
+    except ValueError as e:
+        if "req" in locals():
+            del req
+        if "response" in locals():
+            del response
         raise HTTPException(
             status_code=400, detail="prompt length is greater than max_seqs_len"
         )

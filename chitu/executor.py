@@ -10,6 +10,8 @@ from logging import getLogger
 from typing import Optional
 from abc import ABC, abstractmethod
 
+from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
+
 
 import numpy as np
 import torch
@@ -52,7 +54,6 @@ from chitu.device_list import DeviceList
 from chitu.device_type import is_ascend, is_ascend_910b
 from chitu.distributed.comm_group import CommGroup
 from chitu.moe.load_balancer import get_moe_load_planner  # added
-from chitu.logging_utils import tps_monitor
 
 logger = getLogger(__name__)
 _, has_torch_npu = try_import_and_setup_torch_npu()
@@ -710,6 +711,36 @@ class Executor:
         self._lb_every = args.infer.moe_lb_trigger
         self._lb_step = 0
 
+    def _should_record_metrics(
+        self, num_tokens: int = 0, is_prefill: bool = False
+    ) -> bool:
+        """Determine if current rank should record metrics.
+
+        In non-DP mode: only rank 0 records metrics.
+        In DP mode: all ranks that process tasks record metrics (each dp rank processes different tasks).
+
+        Args:
+            num_tokens: Number of tokens being processed (0 means no tasks)
+            is_prefill: Whether this is a prefill step (affects which ranks process tasks in PP mode)
+        """
+        # Must have tasks to process
+        if num_tokens == 0:
+            return False
+
+        # In non-DP mode, only rank 0 records metrics
+        if self.dp_size <= 1:
+            return self.rank == 0
+
+        # In DP mode, all ranks that process tasks should record metrics
+        # For prefill: ranks with pp_stage == 0 process tasks
+        # For decode: ranks with dp_dispatcher process tasks
+        if is_prefill:
+            # In prefill, only pp_stage == 0 ranks process tasks
+            return self.pp_stage == 0
+        else:
+            # In decode, ranks with dp_dispatcher process tasks
+            return self.dp_dispatcher is not None
+
     def _prepend_dispatcher(self, dispatcher: TasksDispatcher):
         self.task_dispatchers.insert(0, dispatcher)
 
@@ -1008,6 +1039,12 @@ class Executor:
         )
         self.timers("prefill").stop()
 
+        # Collect prompt tokens metrics
+        # In DP mode: all dp ranks record their local tokens (distinguished by dp_id)
+        # In non-DP mode: only rank 0 records metrics
+        if self._should_record_metrics(num_tokens, is_prefill=True):
+            PrometheusMetricsCollector.inc_prompts(num_tokens, self)
+
         # Notify KV transfer hook after prefill completes.
         try:
             output_req_ids = [
@@ -1175,7 +1212,6 @@ class Executor:
             Backend.indexer_cache_manager.finalize_cache_single_decode(req_ids)
         return out
 
-    @tps_monitor(enabled=False, interval_sec=1.0, only_local_rank0=True)
     def decode_step(self, tasks: PackedTasksBase):
         Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
         if get_global_args().models.type == "hf-qwen3-next":
@@ -1223,7 +1259,12 @@ class Executor:
         self.timers("decode").start()
         out = Backend.model.decode(payload, len(tasks.req_ids))
         self.timers("decode").stop()
-        # check output shape
+
+        # Collect metrics for Prometheus
+        # In DP mode: all dp ranks record their local tokens (distinguished by dp_id)
+        # In non-DP mode: only rank 0 records metrics
+        if self._should_record_metrics(tasks.num_tasks, is_prefill=False):
+            PrometheusMetricsCollector.inc_tokens(tasks.num_tasks, self)
 
         # payload send
         for dispatcher in self.task_dispatchers:

@@ -94,15 +94,12 @@ class DPTokenSender:
                     data = self._send_queue.get()
                     if data is None:
                         break
-                    # 优先非阻塞发送，失败时短暂退避重试，再退化阻塞
+                    # Attempt non-blocking send first, fallback to blocking
                     try:
                         self.socket.send(data, flags=zmq.DONTWAIT)
-                    except Exception:
-                        time.sleep(0.0005)
-                        try:
-                            self.socket.send(data, flags=zmq.DONTWAIT)
-                        except Exception:
-                            self.socket.send(data, flags=0)
+                    except zmq.Again:
+                        # Socket full, use blocking send
+                        self.socket.send(data, flags=0)
                 except Exception as e:
                     logger.error(f"DPTokenSender sender thread error: {e}")
                     time.sleep(0.01)
@@ -119,143 +116,106 @@ class DPTokenSender:
         task=None,  # Add task parameter to get prompt_len
     ):
         """Send a single token to the Router"""
-        try:
-            from chitu.backend import Backend
+        from chitu.backend import Backend
 
-            # Check if this is the first token and get prompt_len
-            is_first_token = request_id not in getattr(self, "_first_token_sent", set())
-            if not hasattr(self, "_first_token_sent"):
-                self._first_token_sent = set()
+        # Check if this is the first token and get prompt_len
+        is_first_token = request_id not in getattr(self, "_first_token_sent", set())
+        if not hasattr(self, "_first_token_sent"):
+            self._first_token_sent = set()
 
-            if is_first_token:
-                self._first_token_sent.add(request_id)
+        if is_first_token:
+            self._first_token_sent.add(request_id)
 
+        logger.debug(
+            f"DP Token Sender: [request {request_id}] prepare to send token {token}, is_first_token={is_first_token}"
+        )
+
+        # Decode token to text
+        text = ""
+        if Backend.tokenizer is not None:
+            text = Backend.tokenizer.decode([token])
             logger.debug(
-                f"DP Token Sender: [request {request_id}] prepare to send token {token}, is_first_token={is_first_token}"
+                f"DP Token Sender: [request {request_id}] decode token {token} -> '{text}'"
+            )
+        else:
+            logger.warning(
+                f"DP Token Sender: [request {request_id}] tokenizer not available, cannot decode token {token}"
+            )
+            text = f"[TOKEN_{token}]"
+
+        # Decode top_tokens (if present)
+        top_tokens_text = None
+        if top_token_idx is not None and Backend.tokenizer is not None:
+            top_tokens_text = [Backend.tokenizer.decode([idx]) for idx in top_token_idx]
+            logger.info(
+                f"DP Token Sender: [request {request_id}] decode top_tokens {top_token_idx} -> {top_tokens_text}"
             )
 
-            # Decode token to text
-            text = ""
-            if Backend.tokenizer is not None:
-                try:
-                    text = Backend.tokenizer.decode([token])
-                    logger.debug(
-                        f"DP Token Sender: [request {request_id}] decode token {token} -> '{text}'"
-                    )
-                except Exception as decode_error:
-                    logger.error(
-                        f"DP Token Sender: [request {request_id}] token decode failed: {decode_error}"
-                    )
-                    text = f"[DECODE_ERROR_{token}]"
-            else:
-                logger.warning(
-                    f"DP Token Sender: [request {request_id}] tokenizer not available, cannot decode token {token}"
-                )
-                text = f"[TOKEN_{token}]"
+        data = {
+            "type": "token",
+            "request_id": request_id,
+            "text": text,
+            "original_token_id": token,
+            "scheduler_id": self.dp_group_id,
+            "timestamp": time.time(),
+        }
 
-            # Decode top_tokens (if present)
-            top_tokens_text = None
-            if top_token_idx is not None and Backend.tokenizer is not None:
-                try:
-                    top_tokens_text = [
-                        Backend.tokenizer.decode([idx]) for idx in top_token_idx
-                    ]
-                    logger.info(
-                        f"DP Token Sender: [request {request_id}] decode top_tokens {top_token_idx} -> {top_tokens_text}"
-                    )
-                except Exception as decode_error:
-                    logger.error(
-                        f"DP Token Sender: [request {request_id}] top_tokens decode failed: {decode_error}"
-                    )
-                    top_tokens_text = [f"[DECODE_ERROR_{idx}]" for idx in top_token_idx]
-
-            data = {
-                "type": "token",
-                "request_id": request_id,
-                "text": text,
-                "original_token_id": token,
-                "scheduler_id": self.dp_group_id,
-                "timestamp": time.time(),
-            }
-
-            # If first token and task provided, include prompt_len info
-            if (
-                is_first_token
-                and task is not None
-                and hasattr(task, "req")
-                and hasattr(task.req, "prompt_len")
-            ):
-                data["prompt_len"] = task.req.prompt_len
-                logger.info(
-                    f"DP Token Sender: [request {request_id}] first token, prompt_len={task.req.prompt_len}, token={token}"
-                )
-
-            if top_logprobs is not None:
-                data["top_logprobs"] = top_logprobs
-            if top_tokens_text is not None:
-                data["top_tokens_text"] = top_tokens_text
-
-            self._send_data(data)
-
-        except Exception as e:
-            logger.error(
-                f"DP Token Sender: [request {request_id}] send token failed: {e}"
+        # If first token and task provided, include prompt_len info
+        if (
+            is_first_token
+            and task is not None
+            and hasattr(task, "req")
+            and hasattr(task.req, "prompt_len")
+        ):
+            data["prompt_len"] = task.req.prompt_len
+            logger.info(
+                f"DP Token Sender: [request {request_id}] first token, prompt_len={task.req.prompt_len}, token={token}"
             )
-            import traceback
 
-            logger.error(
-                f"DP Token Sender: [request {request_id}] send token failed details: {traceback.format_exc()}"
-            )
+        if top_logprobs is not None:
+            data["top_logprobs"] = top_logprobs
+        if top_tokens_text is not None:
+            data["top_tokens_text"] = top_tokens_text
+
+        self._send_data(data)
 
     def send_finish(self, request_id: str, finish_reason: str = "stop"):
         """Send request finish signal"""
-        try:
-            data = {
-                "type": "finish",
-                "request_id": request_id,
-                "finish_reason": finish_reason,
-                "scheduler_id": self.dp_group_id,
-                "timestamp": time.time(),
-            }
+        data = {
+            "type": "finish",
+            "request_id": request_id,
+            "finish_reason": finish_reason,
+            "scheduler_id": self.dp_group_id,
+            "timestamp": time.time(),
+        }
 
-            self._send_data(data)
+        self._send_data(data)
 
-            if request_id in self.request_token_cache:
-                del self.request_token_cache[request_id]
+        if request_id in self.request_token_cache:
+            del self.request_token_cache[request_id]
 
-            last_decoded_len_key = f"_last_decoded_len_{request_id}"
-            if hasattr(self, last_decoded_len_key):
-                delattr(self, last_decoded_len_key)
-
-        except Exception as e:
-            logger.error(
-                f"DP Token Sender: [request {request_id}] send finish signal failed: {e}"
-            )
+        last_decoded_len_key = f"_last_decoded_len_{request_id}"
+        if hasattr(self, last_decoded_len_key):
+            delattr(self, last_decoded_len_key)
 
     def send_error(self, request_id: str, error_message: str):
         """Send error signal"""
-        try:
-            data = {
-                "type": "error",
-                "request_id": request_id,
-                "error": error_message,
-                "scheduler_id": self.dp_group_id,
-                "timestamp": time.time(),
-            }
+        data = {
+            "type": "error",
+            "request_id": request_id,
+            "error": error_message,
+            "scheduler_id": self.dp_group_id,
+            "timestamp": time.time(),
+        }
 
-            self._send_data(data)
+        self._send_data(data)
 
-            if request_id in self.request_token_cache:
-                del self.request_token_cache[request_id]
+        if request_id in self.request_token_cache:
+            del self.request_token_cache[request_id]
 
-            last_decoded_len_key = f"_last_decoded_len_{request_id}"
-            if hasattr(self, last_decoded_len_key):
-                delattr(self, last_decoded_len_key)
-
-        except Exception as e:
-            logger.error(
-                f"DP Token Sender: [request {request_id}] send error signal failed: {e}"
-            )
+        last_decoded_len_key = f"_last_decoded_len_{request_id}"
+        if hasattr(self, last_decoded_len_key):
+            delattr(self, last_decoded_len_key)
 
     def _send_data(self, data: dict[str, Any]):
         """Send data to Router (enqueue; background thread will send)"""
@@ -266,23 +226,17 @@ class DPTokenSender:
             self._send_queue.put(packed_data, block=False)
         except queue.Full:
             logger.warning("DP Token Sender: send queue is full, dropping token")
-        except Exception as e:
-            logger.error(f"DP Token Sender: data send failed: {e}")
 
     def close(self):
         """Close connection"""
-        try:
-            if hasattr(self, "_send_queue"):
-                self._send_queue.put(None)
-            if hasattr(self, "_sender_thread"):
-                self._sender_thread.join(timeout=1)
-        except Exception:
-            pass
+        if hasattr(self, "_send_queue"):
+            self._send_queue.put(None)
+        if hasattr(self, "_sender_thread") and self._sender_thread.is_alive():
+            self._sender_thread.join(timeout=1)
+
         if self.socket:
-            try:
-                self.socket.close(0)
-            except Exception:
-                pass
+            self.socket.close(0)
+
         # do not term the shared context
         self.request_token_cache.clear()
         self._started = False
@@ -302,43 +256,33 @@ class DPTaskWrapper:
     def _dp_update_response_sync(self, token: int):
         """Override update_response_sync to also send token to Router (sync enqueue, keep order)"""
         self._original_update_response_sync(token)
-        try:
-            # Enqueue in order to keep relative order with finish
-            self._send_token_to_router(token)
-        except Exception as e:
-            logger.error(f"[DPTaskWrapper] Failed to send token: {e}")
+        # Enqueue in order to keep relative order with finish
+        self._send_token_to_router(token)
 
     def _send_token_to_router(self, token: int):
         """Synchronously enqueue current token to Router sending queue (lightweight, keep order)"""
-        try:
-            request_id = self.original_task.req.request_id
-            top_logprobs = None
-            top_token_idx = None
+        request_id = self.original_task.req.request_id
+        top_logprobs = None
+        top_token_idx = None
 
-            self.token_sender.send_token(
+        self.token_sender.send_token(
+            request_id=request_id,
+            token=token,
+            top_logprobs=top_logprobs,
+            top_token_idx=top_token_idx,
+            task=self.original_task,  # Pass task for prompt_len info
+        )
+
+        logger.debug(
+            f"[DPTaskWrapper] Token sent successfully: {request_id} -> {token}"
+        )
+
+        if self.original_task.need_remove():
+            self.token_sender.send_finish(
                 request_id=request_id,
-                token=token,
-                top_logprobs=top_logprobs,
-                top_token_idx=top_token_idx,
-                task=self.original_task,  # Pass task for prompt_len info
+                finish_reason=self.original_task.req.finish_reason or "stop",
             )
-
-            logger.debug(
-                f"[DPTaskWrapper] Token sent successfully: {request_id} -> {token}"
-            )
-
-            if self.original_task.need_remove():
-                self.token_sender.send_finish(
-                    request_id=request_id,
-                    finish_reason=self.original_task.req.finish_reason or "stop",
-                )
-                logger.debug(f"[DPTaskWrapper] Finish signal sent: {request_id}")
-
-        except Exception as e:
-            logger.error(f"[DPTaskWrapper] Error during token sending: {e}")
-            import traceback
-
-            logger.error(f"[DPTaskWrapper] Error details: {traceback.format_exc()}")
+            logger.debug(f"[DPTaskWrapper] Finish signal sent: {request_id}")
 
     def __getattr__(self, name):
         """Delegate other attributes to the original task"""

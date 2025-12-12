@@ -36,6 +36,7 @@ install_requires = [
     "msgpack",
     "plum-dispatch",
     "netifaces",
+    "prometheus-client>=0.19.0",
 ]
 
 

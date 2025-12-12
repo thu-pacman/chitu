@@ -43,7 +43,7 @@ def main(args: ServeConfig):
 
     else:
         # chitu_init will handle setting global args
-        chitu_init(args, logging_level=logging.WARNING)
+        chitu_init(args)
         torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
         rank = torch.distributed.get_rank()
 

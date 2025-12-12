@@ -149,7 +149,7 @@ class KVManager:
             else None
         )
         ib_device = pd_config.ib_device if pd_config else None
-        bootstrap_port = pd_config.bootstrap_port if pd_config else 8080
+        bootstrap_port = pd_config.bootstrap_port if pd_config else 29888
 
         # Initialize transfer engine
         self.transfer_engine = MooncakeTransferEngine(
@@ -190,9 +190,11 @@ class KVManager:
         if isinstance(value, UUID):
             return value
         s = str(value)
+        # Attempt to parse as standard UUID hex string
         try:
             return UUID(s)
-        except Exception:
+        except ValueError:
+            # Fallback to deterministic UUID generation for non-UUID strings
             return uuid5(NAMESPACE_DNS, s)
 
     def _init_prefill_mode(self):
@@ -251,36 +253,39 @@ class KVManager:
 
         # Discover and register decode endpoint to all prefill instances (idempotent)
         def _bg_register_all():
-            try:
-                ranks = self._discover_prefill_engine_ranks()
-                for er in ranks:
-                    if er in self._decode_registered_remote_set:
-                        continue
-                    info = self._get_bootstrap_info(engine_rank=er)
-                    if info is None:
-                        continue
-                    endpoint = f"tcp://{info['rank_ip']}:{info['rank_port']}"
-                    ctrl_room = UUID(int=0)
-                    session_id = self.get_session_id().encode("ascii")
-                    packed_kv_ptrs = self._pack_ptrs(getattr(self, "kv_data_ptrs", []))
-                    packed_aux_ptr = struct.pack("Q", getattr(self, "aux_data_ptr", 0))
-                    self._send_zmq_to_prefill(
-                        endpoint,
-                        [
-                            ctrl_room.bytes,
-                            self.local_ip.encode("ascii"),
-                            str(self.rank_port).encode("ascii"),
-                            session_id,
-                            packed_kv_ptrs,
-                            packed_aux_ptr,
-                        ],
-                    )
-                    self._decode_registered_remote_set.add(er)
-                    logger.info(
-                        f"decode endpoint registered to prefill via bootstrap (engine_rank={er})"
-                    )
-            except Exception as e:
-                logger.warning(f"prefill discovery/register failed: {e}")
+            # Wait for cache manager and buffer registration to complete
+            # We check both kv_data_ptrs and aux_data_ptr to be safe
+            while not hasattr(self, "aux_data_ptr") or self.aux_data_ptr == 0:
+                logger.info("Waiting for aux_data_ptr to be registered")
+                time.sleep(0.1)
+
+            ranks = self._discover_prefill_engine_ranks()
+            for er in ranks:
+                if er in self._decode_registered_remote_set:
+                    continue
+                info = self._get_bootstrap_info(engine_rank=er)
+                if info is None:
+                    continue
+                endpoint = f"tcp://{info['rank_ip']}:{info['rank_port']}"
+                ctrl_room = UUID(int=0)
+                session_id = self.get_session_id().encode("ascii")
+                packed_kv_ptrs = self._pack_ptrs(getattr(self, "kv_data_ptrs", []))
+                packed_aux_ptr = struct.pack("Q", getattr(self, "aux_data_ptr", 0))
+                self._send_zmq_to_prefill(
+                    endpoint,
+                    [
+                        ctrl_room.bytes,
+                        self.local_ip.encode("ascii"),
+                        str(self.rank_port).encode("ascii"),
+                        session_id,
+                        packed_kv_ptrs,
+                        packed_aux_ptr,
+                    ],
+                )
+                self._decode_registered_remote_set.add(er)
+                logger.info(
+                    f"decode endpoint registered to prefill via bootstrap (engine_rank={er})"
+                )
 
         threading.Thread(target=_bg_register_all, daemon=True).start()
 
@@ -300,6 +305,12 @@ class KVManager:
             self.kv_data_ptrs = kv_data_ptrs
             self.kv_data_lens = kv_data_lens
             self.kv_item_lens = kv_item_lens
+
+            # Check for invalid pointers
+            if any(p == 0 for p in self.kv_data_ptrs):
+                logger.error(
+                    f"CRITICAL: Found 0 in kv_data_ptrs! ptrs={self.kv_data_ptrs}"
+                )
 
             # Idempotent registration: avoid duplicate/overlapped regions
             newly_registered = 0
@@ -335,28 +346,33 @@ class KVManager:
         self.server_socket.bind(f"tcp://{self.local_ip}:{self.rank_port}")
 
         def bootstrap_thread():
+            logger.info(f"starting zmq listener on port {self.rank_port}")
             while True:
                 try:
-                    waiting_req_bytes = self.server_socket.recv_multipart()
-                    room = UUID(bytes=waiting_req_bytes[0])
-                    mooncake_session_id = waiting_req_bytes[3].decode("ascii")
+                    if self.server_socket.poll(timeout=100):
+                        waiting_req_bytes = self.server_socket.recv_multipart()
+                        room = UUID(bytes=waiting_req_bytes[0])
+                        mooncake_session_id = waiting_req_bytes[3].decode("ascii")
 
-                    if room == UUID(int=0):
-                        # Decode rank register KV address
-                        self.decode_kv_args_table[mooncake_session_id] = (
-                            KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                        )
-                        logger.debug(
-                            f"registered decode kv args for session {mooncake_session_id}"
-                        )
-                    else:
-                        # Transfer request
-                        self.transfer_infos[room] = TransferInfo.from_zmq(
-                            waiting_req_bytes
-                        )
-                        logger.debug(f"received transfer request for room {room}")
+                        if room == UUID(int=0):
+                            logger.info(
+                                f"received Decode KV registration via ZMQ for session {mooncake_session_id}"
+                            )
+                            # Decode rank register KV address
+                            self.decode_kv_args_table[mooncake_session_id] = (
+                                KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                            )
+                        else:
+                            logger.info(
+                                f"received TransferInfo via ZMQ for room {room}, session {mooncake_session_id}"
+                            )
+                            # Transfer request for specific room
+                            self.transfer_infos[room] = TransferInfo.from_zmq(
+                                waiting_req_bytes
+                            )
                 except Exception as e:
-                    logger.error(f"error in prefill bootstrap thread: {e}")
+                    logger.error(f"error in bootstrap thread: {e}")
+                    time.sleep(0.1)
 
         threading.Thread(target=bootstrap_thread, daemon=True).start()
         logger.info(f"started prefill communication thread on port {self.rank_port}")
@@ -377,15 +393,16 @@ class KVManager:
                     try:
                         status_enum = KVPoll(int(status_str))
                         status_val = status_enum.value
-                    except Exception:
+                    except ValueError:
                         if "Success" in status_str:
                             status_val = KVPoll.Success.value
                             status_enum = KVPoll.Success
                         elif status_str.isdigit():
                             status_val = int(status_str)
+                            # Try to convert to enum, otherwise default to Waiting
                             try:
                                 status_enum = KVPoll(status_val)
-                            except Exception:
+                            except ValueError:
                                 status_enum = KVPoll.Waiting
                         else:
                             status_val = KVPoll.Waiting.value
@@ -397,9 +414,6 @@ class KVManager:
                         f"received status update for room {bootstrap_room}: {status_enum} (raw={status_str})"
                     )
                 except Exception as e:
-                    import traceback
-
-                    traceback.print_exc()
                     logger.error(f"error in decode thread: {e}")
 
         threading.Thread(target=decode_thread, daemon=True).start()
@@ -414,20 +428,14 @@ class KVManager:
         url = (
             f"http://{ip_address}:{self.bootstrap_port}/route?engine_rank={engine_rank}"
         )
-        try:
-            resp = requests.get(url, timeout=2)
-            if resp.status_code == 200:
-                return resp.json()
-            else:
-                # NOTE: 404 可能是 Prefill 尚未注册，属瞬态，可忽略
-                # 因为 P 和 D 的启动顺序是随机的，所以 P 可能先启动，D 后启动
-                if resp.status_code != 404:
-                    logger.warning(
-                        f"bootstrap GET failed: {resp.status_code} {resp.text}"
-                    )
-                return None
-        except Exception as e:
-            logger.debug(f"bootstrap GET error: {e}")
+        resp = requests.get(url, timeout=2)
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            # NOTE: 404 可能是 Prefill 尚未注册，属瞬态，可忽略
+            # 因为 P 和 D 的启动顺序是随机的，所以 P 可能先启动，D 后启动
+            if resp.status_code != 404:
+                logger.warning(f"bootstrap GET failed: {resp.status_code} {resp.text}")
             return None
 
     def _discover_prefill_engine_ranks(self, max_probe: int = 64) -> list[int]:
@@ -484,82 +492,86 @@ class KVManager:
             "engine_rank": int(self.dp_id),
         }
 
-        try:
-            response = requests.put(url, json=payload, timeout=5)
-            if response.status_code == 200:
-                logger.info("prefill successfully registered to bootstrap server")
-            else:
-                logger.error(
-                    f"failed to register to bootstrap server: {response.status_code}, {response.text}"
-                )
-        except Exception as e:
-            logger.error(f"failed to register to bootstrap server: {e}")
+        response = requests.put(url, json=payload, timeout=5)
+        if response.status_code == 200:
+            logger.info("prefill successfully registered to bootstrap server")
+        else:
+            logger.error(
+                f"failed to register to bootstrap server: {response.status_code}, {response.text}"
+            )
 
     def transfer_worker(
         self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
     ):
         """Transfer worker thread"""
+        logger.info("Transfer worker thread started")
         while True:
-            try:
-                kv_chunk: TransferKVChunk = queue.get()
+            kv_chunk: TransferKVChunk = queue.get()
 
-                # Check if decode instance is ready
-                req = self.transfer_infos.get(kv_chunk.room)
-                if req is not None:
-                    # Send KV cache
-                    ret = self.send_kvcache(
+            # Check if decode instance is ready
+            req = self.transfer_infos.get(kv_chunk.room)
+            if req is not None:
+                logger.info(f"Worker processing chunk for room {kv_chunk.room}")
+                # Send KV cache
+                ret = self.send_kvcache(
+                    mooncake_session_id=req.mooncake_session_id,
+                    prefill_kv_indices=kv_chunk.prefill_kv_indices,
+                    dst_kv_ptrs=self.decode_kv_args_table[
+                        req.mooncake_session_id
+                    ].dst_kv_ptrs,
+                    dst_kv_indices=req.dst_kv_indices,
+                    executor=executor,
+                )
+
+                if ret == 0:
+                    logger.info(f"finished kv cache transfer for {kv_chunk.room}")
+
+                    # Send auxiliary data (first token logits)
+                    ret = self.send_aux(
                         mooncake_session_id=req.mooncake_session_id,
-                        prefill_kv_indices=kv_chunk.prefill_kv_indices,
-                        dst_kv_ptrs=self.decode_kv_args_table[
+                        prefill_aux_index=kv_chunk.prefill_aux_index,
+                        dst_aux_ptr=self.decode_kv_args_table[
                             req.mooncake_session_id
-                        ].dst_kv_ptrs,
-                        dst_kv_indices=req.dst_kv_indices,
-                        executor=executor,
+                        ].dst_aux_ptr,
+                        dst_aux_index=req.dst_aux_index,
                     )
 
                     if ret == 0:
-                        logger.info(f"finished kv cache transfer for {kv_chunk.room}")
+                        logger.info(f"finished aux transfer for {kv_chunk.room}")
 
-                        # Send auxiliary data (first token logits)
-                        ret = self.send_aux(
-                            mooncake_session_id=req.mooncake_session_id,
-                            prefill_aux_index=kv_chunk.prefill_aux_index,
-                            dst_aux_ptr=self.decode_kv_args_table[
-                                req.mooncake_session_id
-                            ].dst_aux_ptr,
-                            dst_aux_index=req.dst_aux_index,
+                        # Notify decode instance
+                        self.sync_status_to_decode_endpoint(
+                            remote_ip=req.endpoint,
+                            remote_port=req.dst_port,
+                            room=req.room,
+                            status=KVPoll.Success.value,
                         )
 
-                        if ret == 0:
-                            logger.info(f"finished aux transfer for {kv_chunk.room}")
+                        # Update status
+                        self.request_status[kv_chunk.room] = KVPoll.Success.value
 
-                            # Notify decode instance
-                            self.sync_status_to_decode_endpoint(
-                                remote_ip=req.endpoint,
-                                remote_port=req.dst_port,
-                                room=req.room,
-                                status=KVPoll.Success.value,
-                            )
-
-                            # Update status
-                            self.request_status[kv_chunk.room] = KVPoll.Success.value
-
-                            # Cleanup
-                            if hasattr(self.cache_manager, "remove_task"):
-                                self.cache_manager.remove_task(kv_chunk.room)
-                            self.transfer_infos.pop(kv_chunk.room, None)
-                            self.metadata_buffers.free([kv_chunk.room])
-                        else:
-                            logger.error(f"aux transfer failed for {kv_chunk.room}")
+                        # Cleanup
+                        if hasattr(self.cache_manager, "remove_task"):
+                            self.cache_manager.remove_task(kv_chunk.room)
+                        self.transfer_infos.pop(kv_chunk.room, None)
+                        self.metadata_buffers.free([kv_chunk.room])
                     else:
-                        logger.error(f"kv cache transfer failed for {kv_chunk.room}")
+                        logger.error(f"aux transfer failed for {kv_chunk.room}")
                 else:
-                    # Decode instance not ready, put back to queue
-                    queue.put(kv_chunk)
-                    time.sleep(0.01)  # Small delay to avoid busy waiting
+                    logger.error(f"kv cache transfer failed for {kv_chunk.room}")
+            else:
+                # Decode instance not ready, put back to queue
+                # 定时日志
+                if not hasattr(self, "_last_wait_log_time") or (
+                    time.time() - self._last_wait_log_time > 5.0
+                ):
+                    logger.info(
+                        f"Worker waiting for TransferInfo for room {kv_chunk.room}. Available rooms: {[r.hex for r in self.transfer_infos.keys()]}"
+                    )
+                    self._last_wait_log_time = time.time()
 
-            except Exception as e:
-                logger.error(f"error in transfer worker: {e}")
+                queue.put(kv_chunk)
+                time.sleep(0.01)  # Small delay to avoid busy waiting
 
     def send_kvcache(
         self,
@@ -595,10 +607,21 @@ class KVManager:
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
 
+                # DEBUG: Check for zero addresses which might cause 'address 0' error
+                if dst_ptr == 0:
+                    logger.error(
+                        f"Mooncake CRITICAL: dst_ptr is 0! src_ptr={src_ptr} dst_kv_ptrs={dst_kv_ptrs}"
+                    )
+                    # return -1 # Fail fast? Or let it crash to see error in Mooncake?
+
+                # logger.info(
+                #     f"Mooncake calling transfer_sync: session={mooncake_session_id}, src={src_addr}, dst={dst_addr}, len={length}"
+                # )
                 status = self.transfer_engine.transfer_sync(
                     mooncake_session_id, src_addr, dst_addr, length
                 )
                 if status != 0:
+                    logger.error(f"Mooncake transfer_sync failed with status {status}")
                     return status
             return 0
 
@@ -626,6 +649,13 @@ class KVManager:
         dst_aux_index: int,
     ):
         """Send auxiliary data (first token logits)"""
+        # Validata dst_aux_ptr
+        if dst_aux_ptr == 0:
+            logger.error(
+                f"Mooncake CRITICAL: dst_aux_ptr is 0! session={mooncake_session_id} dst_index={dst_aux_index}"
+            )
+            return -1
+
         prefill_aux_addr = self.aux_data_ptr + prefill_aux_index * self.aux_item_len
         dst_aux_addr = dst_aux_ptr + dst_aux_index * self.aux_item_len
 
@@ -641,24 +671,27 @@ class KVManager:
         self, remote_ip: str, remote_port: int, room: UUID, status: int
     ):
         """Sync status to decode endpoint"""
+        socket = self.zmq_ctx.socket(zmq.PUSH)
         try:
-            socket = self.zmq_ctx.socket(zmq.PUSH)
-            try:
-                socket.connect(f"tcp://{remote_ip}:{remote_port}")
-                # Normalize status to numeric ascii
-                if isinstance(status, KVPoll):
-                    status_payload = str(status.value)
-                elif isinstance(status, int):
-                    status_payload = str(status)
-                socket.send_multipart([room.bytes, status_payload.encode("ascii")])
-            finally:
-                socket.close()
-        except Exception as e:
-            logger.error(f"failed to sync status to decode endpoint: {e}")
+            socket.connect(f"tcp://{remote_ip}:{remote_port}")
+            # Normalize status to numeric ascii
+            if isinstance(status, KVPoll):
+                status_payload = str(status.value)
+            elif isinstance(status, int):
+                status_payload = str(status)
+            socket.send_multipart([room.bytes, status_payload.encode("ascii")])
+        finally:
+            socket.close()
 
     def get_session_id(self):
         """Get transfer engine session ID"""
         return self.transfer_engine.get_session_id()
+
+    def add_transfer_request(
+        self, room: UUID, kv_indices: npt.NDArray[np.int32], aux_index: int
+    ):
+        """Add transfer request to queue"""
+        self.transfer_queue.put(TransferKVChunk(room, kv_indices, aux_index))
 
     # =========================
     # Public helper (Decode side)
@@ -667,16 +700,11 @@ class KVManager:
         """Bind a request to a specific prefill engine_rank.
         Called by Decode Scheduler based on Router's prefill_scheduler_id.
         """
-        try:
-            room = self._to_uuid(request_id)
-            self.prefill_target_rank_by_room[room] = int(engine_rank)
-            logger.info(
-                f"bind prefill target engine_rank for room={room} -> {int(engine_rank)}"
-            )
-        except Exception as e:
-            logger.warning(
-                f"set_prefill_target_engine_rank failed for {request_id}: {e}"
-            )
+        room = self._to_uuid(request_id)
+        self.prefill_target_rank_by_room[room] = int(engine_rank)
+        logger.info(
+            f"bind prefill target engine_rank for room={room} -> {int(engine_rank)}"
+        )
 
     def send_kv_cache(
         self, logits: torch.Tensor, request_ids: list[str], cache_manager
@@ -687,45 +715,25 @@ class KVManager:
             return
 
         for index, request_id in enumerate(request_ids):
-            try:
-                # Convert request_id to stable UUID
-                room = self._to_uuid(request_id)
+            # Convert request_id to stable UUID
+            room = self._to_uuid(request_id)
 
-                # Allocate metadata buffer
-                aux_index = self.metadata_buffers.allocate(room, logits[index])
+            # Allocate metadata buffer
+            aux_index = self.metadata_buffers.allocate(room, logits[index])
 
-                # Get KV indices from cache manager
-                if hasattr(cache_manager, "get_page_indices"):
-                    kv_indices = np.asarray(
-                        cache_manager.get_page_indices(room), dtype=np.int32
-                    )
-                else:
-                    logger.warning(
-                        f"cache manager does not support get_page_indices for {request_id}"
-                    )
-                    kv_indices = np.array([], dtype=np.int32)
+            # Get KV indices from cache manager
+            if hasattr(cache_manager, "get_page_indices"):
+                kv_indices = np.asarray(
+                    cache_manager.get_page_indices(room), dtype=np.int32
+                )
+            else:
+                logger.warning(
+                    f"cache manager does not support get_page_indices for {request_id}"
+                )
+                kv_indices = np.array([], dtype=np.int32)
 
-                # Add transfer request to queue
-                self.add_transfer_request(room, kv_indices, aux_index)
-
-            except Exception as e:
-                import traceback
-
-                traceback.print_exc()
-                logger.error(f"failed to send kv cache for request {request_id}: {e}")
-
-    def add_transfer_request(
-        self, room: UUID, kv_indices: npt.NDArray[np.int32], aux_index: int
-    ):
-        """Add transfer request to queue"""
-        self.request_status[room] = KVPoll.Waiting
-        self.transfer_queue.put(
-            TransferKVChunk(
-                room=room,
-                prefill_kv_indices=kv_indices,
-                prefill_aux_index=aux_index,
-            )
-        )
+            # Add transfer request to queue
+            self.add_transfer_request(room, kv_indices, aux_index)
 
     def recv_kv_cache_and_insert(
         self, request_ids: list[str], cache_manager
@@ -748,26 +756,21 @@ class KVManager:
             session_id = self.get_session_id().encode("ascii")
             packed_kv_ptrs = self._pack_ptrs(getattr(self, "kv_data_ptrs", []))
             packed_aux_ptr = struct.pack("Q", getattr(self, "aux_data_ptr", 0))
-            try:
-                self._send_zmq_to_prefill(
-                    endpoint,
-                    [
-                        ctrl_room.bytes,
-                        self.local_ip.encode("ascii"),
-                        str(self.rank_port).encode("ascii"),
-                        session_id,
-                        packed_kv_ptrs,
-                        packed_aux_ptr,
-                    ],
-                )
-                self._decode_registered_remote_set.add(engine_rank)
-                logger.info(
-                    f"decode endpoint registered to prefill via bootstrap (engine_rank={engine_rank})"
-                )
-            except Exception as e:
-                logger.error(
-                    f"failed to register decode endpoint to prefill (engine_rank={engine_rank}): {e}"
-                )
+            self._send_zmq_to_prefill(
+                endpoint,
+                [
+                    ctrl_room.bytes,
+                    self.local_ip.encode("ascii"),
+                    str(self.rank_port).encode("ascii"),
+                    session_id,
+                    packed_kv_ptrs,
+                    packed_aux_ptr,
+                ],
+            )
+            self._decode_registered_remote_set.add(engine_rank)
+            logger.info(
+                f"decode endpoint registered to prefill via bootstrap (engine_rank={engine_rank})"
+            )
 
         # Allocate aux buffer slots to receive logits and pre-reserve dst kv indices
         aux_indices = []
@@ -781,69 +784,61 @@ class KVManager:
 
             # Heuristic: reserve up to max blocks per request for destination indices
             dst_indices_np = np.array([], dtype=np.int32)
-            try:
-                if hasattr(cache_manager, "get_max_blocks_per_req") and hasattr(
-                    cache_manager, "reserve_blocks_for_transfer"
-                ):
-                    max_blocks = int(cache_manager.get_max_blocks_per_req())
-                    # We do not know exact prompt blocks yet; reserve max to ensure contiguous space
-                    dst_indices = cache_manager.reserve_blocks_for_transfer(
-                        room.hex, max_blocks
-                    )
-                    dst_indices_np = np.asarray(dst_indices, dtype=np.int32)
-                else:
-                    logger.warning(
-                        "cache manager missing reserve APIs; cannot pre-reserve dst_kv_indices"
-                    )
-            except Exception as e:
-                logger.error(f"failed to reserve dst blocks for {room}: {e}")
+            if hasattr(cache_manager, "get_max_blocks_per_req") and hasattr(
+                cache_manager, "reserve_blocks_for_transfer"
+            ):
+                max_blocks = int(cache_manager.get_max_blocks_per_req())
+                # We do not know exact prompt blocks yet; reserve max to ensure contiguous space
+                dst_indices = cache_manager.reserve_blocks_for_transfer(
+                    room.hex, max_blocks
+                )
+                dst_indices_np = np.asarray(dst_indices, dtype=np.int32)
+            else:
+                logger.warning(
+                    "cache manager missing reserve APIs; cannot pre-reserve dst_kv_indices"
+                )
 
             # Send per-request TransferInfo to prefill so it can start RDMA immediately
-            try:
-                # Prefer explicit binding, but also broadcast to discovered ranks for robustness
-                preferred = self.prefill_target_rank_by_room.get(room, None)
-                target_ranks = []
-                if preferred is not None:
-                    target_ranks.append(int(preferred))
-                if discovered:
-                    target_ranks.extend(
-                        [er for er in discovered if er not in target_ranks]
-                    )
-                if not target_ranks:
-                    target_ranks = [0]
+            # Prefer explicit binding, but also broadcast to discovered ranks for robustness
+            preferred = self.prefill_target_rank_by_room.get(room, None)
+            target_ranks = []
+            if preferred is not None:
+                target_ranks.append(int(preferred))
+            if discovered:
+                target_ranks.extend([er for er in discovered if er not in target_ranks])
+            if not target_ranks:
+                target_ranks = [0]
 
-                session_id = self.get_session_id().encode("ascii")
-                parts = [
-                    room.bytes,
-                    self.local_ip.encode("ascii"),
-                    str(self.rank_port).encode("ascii"),
-                    session_id,
-                    dst_indices_np.tobytes(),
-                    str(int(aux_index)).encode("ascii"),
-                ]
-                sent_any = False
-                for er in target_ranks:
-                    info = self._get_bootstrap_info(engine_rank=er)
-                    if info is None:
-                        continue
-                    endpoint = f"tcp://{info['rank_ip']}:{info['rank_port']}"
-                    self._send_zmq_to_prefill(endpoint, parts)
-                    sent_any = True
-                    logger.debug(
-                        f"posted transfer request to prefill(er={er}) for room {room}, dst_blocks={len(dst_indices_np)} aux_index={aux_index}"
-                    )
-                if not sent_any:
-                    logger.warning(
-                        "bootstrap info missing; cannot send per-request TransferInfo to any prefill"
-                    )
-            except Exception as e:
-                logger.error(f"failed to post transfer info for {room}: {e}")
+            session_id = self.get_session_id().encode("ascii")
+            parts = [
+                room.bytes,
+                self.local_ip.encode("ascii"),
+                str(self.rank_port).encode("ascii"),
+                session_id,
+                dst_indices_np.tobytes(),
+                str(int(aux_index)).encode("ascii"),
+            ]
+            sent_any = False
+            for er in target_ranks:
+                info = self._get_bootstrap_info(engine_rank=er)
+                if info is None:
+                    continue
+                endpoint = f"tcp://{info['rank_ip']}:{info['rank_port']}"
+                self._send_zmq_to_prefill(endpoint, parts)
+                sent_any = True
+                logger.debug(
+                    f"posted transfer request to prefill(er={er}) for room {room}, dst_blocks={len(dst_indices_np)} aux_index={aux_index}"
+                )
+            if not sent_any:
+                logger.warning(
+                    "bootstrap info missing; cannot send per-request TransferInfo to any prefill"
+                )
 
         # Wait for transfers to complete (status updated by sender via ZMQ)
         unfinished = set(room_ids)
         # 增加超时与重试，避免丢包或时序问题导致的假超时
         start_wait = time.time()
-        timeout_s = 10.0
+        timeout_s = 20.0
         last_resend_ts = 0.0
         resend_interval = 0.5
         while unfinished and (time.time() - start_wait) < timeout_s:
@@ -858,43 +853,34 @@ class KVManager:
             now = time.time()
             if unfinished and (now - last_resend_ts) >= resend_interval:
                 # Re-broadcast TransferInfo to all discovered prefill ranks for robustness
-                try:
-                    discovered = self._discover_prefill_engine_ranks()
-                    for idx, room in enumerate(room_ids):
-                        if room not in unfinished:
-                            continue
-                        aux_index = aux_indices[idx]
-                        # we don't know exact dst indices; use reserved (may be empty)
-                        try:
-                            dst_indices = (
-                                self.cache_manager.block_table.get(room.hex, [])
-                                if hasattr(self.cache_manager, "block_table")
-                                else []
-                            )
-                            dst_indices_np = np.asarray(dst_indices, dtype=np.int32)
-                        except Exception:
-                            dst_indices_np = np.array([], dtype=np.int32)
+                discovered = self._discover_prefill_engine_ranks()
+                for idx, room in enumerate(room_ids):
+                    if room not in unfinished:
+                        continue
+                    aux_index = aux_indices[idx]
+                    # we don't know exact dst indices; use reserved (may be empty)
+                    dst_indices = (
+                        self.cache_manager.block_table.get(room.hex, [])
+                        if hasattr(self.cache_manager, "block_table")
+                        else []
+                    )
+                    dst_indices_np = np.asarray(dst_indices, dtype=np.int32)
 
-                        session_id = self.get_session_id().encode("ascii")
-                        parts = [
-                            room.bytes,
-                            self.local_ip.encode("ascii"),
-                            str(self.rank_port).encode("ascii"),
-                            session_id,
-                            dst_indices_np.tobytes(),
-                            str(int(aux_index)).encode("ascii"),
-                        ]
-                        for er in discovered:
-                            info = self._get_bootstrap_info(engine_rank=er)
-                            if info is None:
-                                continue
-                            endpoint = f"tcp://{info['rank_ip']}:{info['rank_port']}"
-                            try:
-                                self._send_zmq_to_prefill(endpoint, parts)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+                    session_id = self.get_session_id().encode("ascii")
+                    parts = [
+                        room.bytes,
+                        self.local_ip.encode("ascii"),
+                        str(self.rank_port).encode("ascii"),
+                        session_id,
+                        dst_indices_np.tobytes(),
+                        str(int(aux_index)).encode("ascii"),
+                    ]
+                    for er in discovered:
+                        info = self._get_bootstrap_info(engine_rank=er)
+                        if info is None:
+                            continue
+                        endpoint = f"tcp://{info['rank_ip']}:{info['rank_port']}"
+                        self._send_zmq_to_prefill(endpoint, parts)
                 last_resend_ts = now
 
             if unfinished:
@@ -918,15 +904,12 @@ class KVManager:
                 else []
             )
             if page_indices and hasattr(cache_manager, "insert_kv_cache_from_transfer"):
-                try:
-                    prefix_length = int(len(page_indices)) * int(
-                        getattr(cache_manager, "block_size", 1)
-                    )
-                    cache_manager.insert_kv_cache_from_transfer(
-                        rid, page_indices, prefix_length
-                    )
-                except Exception as e:
-                    logger.error(f"failed to insert kv cache for {rid}: {e}")
+                prefix_length = int(len(page_indices)) * int(
+                    getattr(cache_manager, "block_size", 1)
+                )
+                cache_manager.insert_kv_cache_from_transfer(
+                    rid, page_indices, prefix_length
+                )
 
         # Free aux buffer slots
         self.metadata_buffers.free(room_ids)

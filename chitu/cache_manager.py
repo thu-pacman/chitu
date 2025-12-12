@@ -659,6 +659,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         kv_data_lens = []
         kv_item_lens = []
         for key in self.paged_kv_cache:
+            logger.info(f"Getting contiguous buffer info for key: {key}")
             item_len = (
                 int(self.block_size)
                 * functools.reduce(

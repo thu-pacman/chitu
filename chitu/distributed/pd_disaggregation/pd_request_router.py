@@ -187,27 +187,24 @@ class PDRequestRouter(RequestRouter):
 
     async def _start_bootstrap_server_if_needed(self):
         """Start Mooncake Bootstrap HTTP server on Router if configured"""
-        try:
-            if (
-                hasattr(self.config, "pd_disaggregation")
-                and getattr(
-                    self.config.pd_disaggregation, "kv_transfer_backend", "mooncake"
+        if (
+            hasattr(self.config, "pd_disaggregation")
+            and getattr(
+                self.config.pd_disaggregation, "kv_transfer_backend", "mooncake"
+            )
+            == "mooncake"
+        ):
+            bootstrap_port = getattr(
+                self.config.pd_disaggregation, "bootstrap_port", 29888
+            )
+            # Start only once
+            if self.bootstrap_server is None:
+                logger.info(
+                    f"starting mooncake bootstrap server on port {bootstrap_port}"
                 )
-                == "mooncake"
-            ):
-                bootstrap_port = getattr(
-                    self.config.pd_disaggregation, "bootstrap_port", 8080
-                )
-                # Start only once
-                if self.bootstrap_server is None:
-                    logger.info(
-                        f"starting mooncake bootstrap server on port {bootstrap_port}"
-                    )
-                    self.bootstrap_server = MooncakeBootstrapServer(bootstrap_port)
-                    self.bootstrap_server.start_in_background()
-                    logger.info("mooncake bootstrap server started")
-        except Exception as e:
-            logger.error(f"failed to start mooncake bootstrap server: {e}")
+                self.bootstrap_server = MooncakeBootstrapServer(bootstrap_port)
+                self.bootstrap_server.start_in_background()
+                logger.info("mooncake bootstrap server started")
 
     async def add_request(self, request):
         """Add request to router"""
@@ -300,152 +297,121 @@ class PDRequestRouter(RequestRouter):
         logger.info("starting pd request processor")
 
         while True:
-            try:
-                if self.pending_requests:
-                    pd_request = self.pending_requests.popleft()
+            if self.pending_requests:
+                pd_request = self.pending_requests.popleft()
 
-                    if isinstance(pd_request, PendingPDRequest):
-                        await self._process_pd_request(pd_request)
-                    else:
-                        # Backward compatibility for original request type
-                        await self._process_regular_request(pd_request)
+                if isinstance(pd_request, PendingPDRequest):
+                    await self._process_pd_request(pd_request)
+                else:
+                    # Backward compatibility for original request type
+                    await self._process_regular_request(pd_request)
 
-                await asyncio.sleep(0.01)  # 10ms polling interval
-
-            except Exception as e:
-                logger.error(f"pd request processor error: {e}")
-                await asyncio.sleep(0.1)
+            await asyncio.sleep(0.01)  # 10ms polling interval
 
     async def _process_pd_request(self, pd_request: PendingPDRequest):
         """Process PD disaggregation request"""
-        try:
-            # Update status
-            pd_request.status = PDRequestStatus.DISPATCHED
-            pd_request.prefill_start_time = time.time()
+        # Update status
+        pd_request.status = PDRequestStatus.DISPATCHED
+        pd_request.prefill_start_time = time.time()
 
-            # Prepare request data
-            serializable_request = self._serialize_original_request(
-                pd_request.original_request
-            )
-            request_data = {
-                "request_id": pd_request.request_id,
-                "request": serializable_request,
-                "type": "pd_request",
-            }
+        # Prepare request data
+        serializable_request = self._serialize_original_request(
+            pd_request.original_request
+        )
+        request_data = {
+            "request_id": pd_request.request_id,
+            "request": serializable_request,
+            "type": "pd_request",
+        }
 
-            # Dual dispatch: send to both Prefill and Decode simultaneously
-            await asyncio.gather(
-                self._send_to_prefill_scheduler(
-                    pd_request.prefill_scheduler_id, request_data
-                ),
-                self._send_to_decode_scheduler(
-                    pd_request.decode_scheduler_id,
-                    request_data,
-                    pd_request.prefill_scheduler_id,
-                ),
-            )
+        # Dual dispatch: send to both Prefill and Decode simultaneously
+        await asyncio.gather(
+            self._send_to_prefill_scheduler(
+                pd_request.prefill_scheduler_id, request_data
+            ),
+            self._send_to_decode_scheduler(
+                pd_request.decode_scheduler_id,
+                request_data,
+                pd_request.prefill_scheduler_id,
+            ),
+        )
 
-            logger.debug(
-                f"pd disaggregation request dispatched: {pd_request.request_id}"
-            )
-
-        except Exception as e:
-            logger.error(f"failed to process pd request: {e}")
-            pd_request.status = PDRequestStatus.FAILED
-            pd_request.error_message = str(e)
+        logger.debug(f"pd disaggregation request dispatched: {pd_request.request_id}")
 
     def _serialize_original_request(self, req) -> dict:
         """Convert RouterRequest/ChatRequest/dict to a msgpack-serializable dict"""
-        try:
-            # dict-like
-            if isinstance(req, dict):
-                return req
-            # pydantic-like
-            if hasattr(req, "model_dump"):
-                return req.model_dump()
-            # RouterRequest object from chitu.task
-            # Extract common fields safely
-            request_id = getattr(
-                req, "request_id", getattr(req, "conversation_id", str(time.time()))
-            )
-            messages = getattr(req, "message", getattr(req, "messages", []))
-            messages = self._serialize_messages(messages)
-            max_new_tokens = getattr(
-                req, "max_new_tokens", getattr(req, "max_tokens", 100)
-            )
-            logprobs = getattr(req, "logprobs", False)
-            top_logprobs = getattr(req, "top_logprobs", None)
-            temperature = getattr(
-                getattr(req, "params", None),
-                "temperature",
-                getattr(req, "temperature", 1.0),
-            )
-            top_p = getattr(
-                getattr(req, "params", None), "top_p", getattr(req, "top_p", 0.9)
-            )
-            top_k = getattr(
-                getattr(req, "params", None), "top_k", getattr(req, "top_k", 50)
-            )
-            frequency_penalty = getattr(
-                getattr(req, "params", None),
-                "frequency_penalty",
-                getattr(req, "frequency_penalty", 0.0),
-            )
-            ignore_eos = getattr(req, "stop_with_eos", True)
-            chat_template_kwargs = getattr(req, "chat_template_kwargs", {})
-            return {
-                "conversation_id": request_id,
-                "messages": messages,
-                "max_new_tokens": max_new_tokens,
-                "logprobs": logprobs,
-                "top_logprobs": top_logprobs,
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "frequency_penalty": frequency_penalty,
-                # For PD path, align naming with downstream: use explicit ignore_eos flag
-                # True  -> allow generation beyond EOS (i.e., don't stop at EOS)
-                # False -> stop at EOS
-                "ignore_eos": not ignore_eos,
-                # Also include stop_with_eos explicitly to avoid default being misread downstream
-                "stop_with_eos": ignore_eos,
-                "chat_template_kwargs": chat_template_kwargs,
-            }
-        except Exception:
-            # last resort: empty minimal payload
-            return {
-                "conversation_id": str(time.time()),
-                "messages": [],
-                "max_new_tokens": 100,
-                "temperature": 1.0,
-                "top_p": 0.9,
-                "top_k": 50,
-                "frequency_penalty": 0.0,
-            }
+        # dict-like
+        if isinstance(req, dict):
+            return req
+        # pydantic-like
+        if hasattr(req, "model_dump"):
+            return req.model_dump()
+        # RouterRequest object from chitu.task
+        # Extract common fields safely
+        request_id = getattr(
+            req, "request_id", getattr(req, "conversation_id", str(time.time()))
+        )
+        messages = getattr(req, "message", getattr(req, "messages", []))
+        messages = self._serialize_messages(messages)
+        max_new_tokens = getattr(req, "max_new_tokens", getattr(req, "max_tokens", 100))
+        logprobs = getattr(req, "logprobs", False)
+        top_logprobs = getattr(req, "top_logprobs", None)
+        temperature = getattr(
+            getattr(req, "params", None),
+            "temperature",
+            getattr(req, "temperature", 1.0),
+        )
+        top_p = getattr(
+            getattr(req, "params", None), "top_p", getattr(req, "top_p", 0.9)
+        )
+        top_k = getattr(
+            getattr(req, "params", None), "top_k", getattr(req, "top_k", 50)
+        )
+        frequency_penalty = getattr(
+            getattr(req, "params", None),
+            "frequency_penalty",
+            getattr(req, "frequency_penalty", 0.0),
+        )
+        ignore_eos = getattr(req, "stop_with_eos", True)
+        chat_template_kwargs = getattr(req, "chat_template_kwargs", {})
+        return {
+            "conversation_id": request_id,
+            "messages": messages,
+            "max_new_tokens": max_new_tokens,
+            "logprobs": logprobs,
+            "top_logprobs": top_logprobs,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "frequency_penalty": frequency_penalty,
+            # For PD path, align naming with downstream: use explicit ignore_eos flag
+            # True  -> allow generation beyond EOS (i.e., don't stop at EOS)
+            # False -> stop at EOS
+            "ignore_eos": not ignore_eos,
+            # Also include stop_with_eos explicitly to avoid default being misread downstream
+            "stop_with_eos": ignore_eos,
+            "chat_template_kwargs": chat_template_kwargs,
+        }
 
     def _serialize_messages(self, messages) -> list:
         """Convert list of Message/BaseModel/dict to list of plain dicts"""
         serial = []
         if messages is None:
             return serial
-        try:
-            for m in messages:
-                # pydantic BaseModel
-                if hasattr(m, "model_dump"):
-                    d = m.model_dump()
-                    serial.append({"role": d.get("role"), "content": d.get("content")})
-                    continue
-                # dict
-                if isinstance(m, dict):
-                    serial.append({"role": m.get("role"), "content": m.get("content")})
-                    continue
-                # generic object with attributes
-                role = getattr(m, "role", None)
-                content = getattr(m, "content", None)
-                serial.append({"role": role, "content": content})
-        except Exception:
-            # fallback to empty list on any error
-            return []
+        for m in messages:
+            # pydantic BaseModel
+            if hasattr(m, "model_dump"):
+                d = m.model_dump()
+                serial.append({"role": d.get("role"), "content": d.get("content")})
+                continue
+            # dict
+            if isinstance(m, dict):
+                serial.append({"role": m.get("role"), "content": m.get("content")})
+                continue
+            # generic object with attributes
+            role = getattr(m, "role", None)
+            content = getattr(m, "content", None)
+            serial.append({"role": role, "content": content})
         return serial
 
     async def _send_to_prefill_scheduler(self, scheduler_id: int, request_data: dict):
@@ -484,11 +450,8 @@ class PDRequestRouter(RequestRouter):
     async def _process_regular_request(self, request):
         """Process regular request (compatibility mode)"""
         # Use parent logic
-        try:
-            scheduler_id = self.load_balancer.select_scheduler()
-            await self._send_request(scheduler_id, request)
-        except Exception as e:
-            logger.error(f"failed to process regular request: {e}")
+        scheduler_id = self.load_balancer.select_scheduler()
+        await self._send_request(scheduler_id, request)
 
     async def _pd_coordination_task(self):
         """PD coordination task"""
@@ -503,14 +466,9 @@ class PDRequestRouter(RequestRouter):
         # - Collect statistics
 
         while True:
-            try:
-                # Check request status periodically
-                await self._check_pd_request_status()
-                await asyncio.sleep(1.0)  # Check every second
-
-            except Exception as e:
-                logger.error(f"pd coordination task error: {e}")
-                await asyncio.sleep(1.0)
+            # Check request status periodically
+            await self._check_pd_request_status()
+            await asyncio.sleep(1.0)  # Check every second
 
     async def _check_pd_request_status(self):
         """Check PD request status"""

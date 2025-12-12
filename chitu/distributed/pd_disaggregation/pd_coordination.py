@@ -56,28 +56,22 @@ class PDCoordinationService:
         """Start coordination service"""
         logger.info("starting pd coordination service...")
 
-        try:
-            # Create sockets
-            self.coordination_socket = self.context.socket(zmq.PULL)
-            self.coordination_socket.bind(f"tcp://*:{self.coordination_port}")
+        # Create sockets
+        self.coordination_socket = self.context.socket(zmq.PULL)
+        self.coordination_socket.bind(f"tcp://*:{self.coordination_port}")
 
-            self.metadata_socket = self.context.socket(zmq.REP)
-            self.metadata_socket.bind(f"tcp://*:{self.metadata_sync_port}")
+        self.metadata_socket = self.context.socket(zmq.REP)
+        self.metadata_socket.bind(f"tcp://*:{self.metadata_sync_port}")
 
-            self.running = True
+        self.running = True
 
-            # Start async tasks
-            self.coordination_task = asyncio.create_task(self._coordination_handler())
-            self.metadata_task = asyncio.create_task(self._metadata_sync_handler())
+        # Start async tasks
+        self.coordination_task = asyncio.create_task(self._coordination_handler())
+        self.metadata_task = asyncio.create_task(self._metadata_sync_handler())
 
-            logger.info(
-                f"pd coordination service started, coordination port: {self.coordination_port}, metadata port: {self.metadata_sync_port}"
-            )
-
-        except Exception as e:
-            logger.error(f"failed to start pd coordination service: {e}")
-            await self.stop()
-            raise
+        logger.info(
+            f"pd coordination service started, coordination port: {self.coordination_port}, metadata port: {self.metadata_sync_port}"
+        )
 
     async def stop(self):
         """Stop coordination service"""
@@ -248,22 +242,16 @@ class PDCoordinationService:
 
     async def _process_coordination_message(self, message: PDCoordinationMessage):
         """Process coordination message"""
-        try:
-            if message.message_type == "prefill_complete":
-                await self.handle_prefill_complete(
-                    message.request_id, message.sender_id, message.payload
-                )
-            elif message.message_type == "kv_transfer_complete":
-                await self.handle_kv_transfer_complete(message.request_id)
-            elif message.message_type == "decode_complete":
-                await self.handle_decode_complete(message.request_id)
-            else:
-                logger.warning(
-                    f"unknown coordination message type: {message.message_type}"
-                )
-
-        except Exception as e:
-            logger.error(f"failed to process coordination message: {e}")
+        if message.message_type == "prefill_complete":
+            await self.handle_prefill_complete(
+                message.request_id, message.sender_id, message.payload
+            )
+        elif message.message_type == "kv_transfer_complete":
+            await self.handle_kv_transfer_complete(message.request_id)
+        elif message.message_type == "decode_complete":
+            await self.handle_decode_complete(message.request_id)
+        else:
+            logger.warning(f"unknown coordination message type: {message.message_type}")
 
     async def _process_metadata_request(self, request_data: dict) -> dict:
         """Process metadata request"""

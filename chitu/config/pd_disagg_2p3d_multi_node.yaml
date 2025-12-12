@@ -34,7 +34,7 @@ dp_config:
       metadata_sync_port: 29801
       kv_transfer_backend: "mooncake"
       ib_device: "mlx5_0"
-      bootstrap_port: 8080
+      bootstrap_port: 29888
 
       kv_transfer:
         buffer_size: 2048

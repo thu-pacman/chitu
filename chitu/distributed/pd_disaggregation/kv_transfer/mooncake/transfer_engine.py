@@ -7,6 +7,8 @@ import logging
 import asyncio
 import threading
 import os
+from aiohttp import web
+from mooncake.engine import TransferEngine
 from chitu.device_type import is_ascend
 
 logger = logging.getLogger(__name__)
@@ -18,60 +20,50 @@ class MooncakeTransferEngine:
     def __init__(self, hostname: str, ib_device: Optional[str] = None):
         self.hostname = hostname
         self.ib_device = ib_device
-        self.mock_mode = False
+        # Check MOONCAKE_MOCK_MODE env var
+        self.mock_mode = os.environ.get("MOONCAKE_MOCK_MODE", "0") == "1"
+        self.protocol = os.environ.get("MOONCAKE_PROTOCOL", "rdma")
 
-        try:
-            from mooncake.engine import TransferEngine
+        self.engine = TransferEngine()
 
-            self.engine = TransferEngine()
+        if is_ascend():
+            # Build Ascend-compliant local_server_name: ip:port:npu_<phy_id>
+            phy_id_str = os.environ.get("ASCEND_PHY_ID")
+            if phy_id_str is None:
+                # Fallback: first device from ASCEND_RT_VISIBLE_DEVICES
+                visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
+                phy_id_str = visible.split(",")[0].strip() if visible else "-1"
+            try:
+                phy_id = int(phy_id_str)
+            except Exception:
+                phy_id = -1
 
-            if is_ascend():
-                # Build Ascend-compliant local_server_name: ip:port:npu_<phy_id>
-                phy_id_str = os.environ.get("ASCEND_PHY_ID")
-                if phy_id_str is None:
-                    # Fallback: first device from ASCEND_RT_VISIBLE_DEVICES
-                    visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
-                    phy_id_str = visible.split(",")[0].strip() if visible else "-1"
-                try:
-                    phy_id = int(phy_id_str)
-                except Exception:
-                    phy_id = -1
-
-                # Choose a deterministic unique port per card
-                if phy_id >= 0:
-                    local_port = 10000 + phy_id
-                else:
-                    local_port = 12000 + (os.getpid() % 1000)
-
-                local_server_name = f"{self.hostname}:{local_port}:npu_{phy_id}"
-                self.initialize(
-                    hostname=local_server_name,
-                    device_name=self.ib_device,
-                    protocol="hccl",
-                    metadata_server="P2PHANDSHAKE",
-                )
+            # Choose a deterministic unique port per card
+            if phy_id >= 0:
+                local_port = 10000 + phy_id
             else:
-                # Non-Ascend: keep original behavior (RDMA with default hostname)
-                self.initialize(
-                    hostname=self.hostname,
-                    device_name=self.ib_device,
-                    protocol="rdma",
-                    metadata_server="P2PHANDSHAKE",
-                )
+                local_port = 12000 + (os.getpid() % 1000)
 
-            self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
-            logger.info("mooncake transfer engine initialized successfully")
+            local_server_name = f"{self.hostname}:{local_port}:npu_{phy_id}"
+            self.initialize(
+                hostname=local_server_name,
+                device_name=self.ib_device,
+                protocol="hccl",
+                metadata_server="P2PHANDSHAKE",
+            )
+        else:
+            # Non-Ascend: keep original behavior (RDMA with default hostname)
+            # If protocol is forced to something else (e.g. tcp) via env var, use it.
 
-        except ImportError as e:
-            logger.warning(f"mooncake not available, using mock mode: {e}")
-            self.mock_mode = True
-            self.engine = None
-            self.session_id = f"{self.hostname}:29999"  # Mock port
-        except Exception as e:
-            logger.warning(f"mooncake initialization failed, using mock mode: {e}")
-            self.mock_mode = True
-            self.engine = None
-            self.session_id = f"{self.hostname}:29999"  # Mock port
+            self.initialize(
+                hostname=self.hostname,
+                device_name=self.ib_device,
+                protocol=self.protocol,
+                metadata_server="P2PHANDSHAKE",
+            )
+
+        self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
+        logger.info("mooncake transfer engine initialized successfully")
 
     def register(self, ptr, length):
         """Register memory for RDMA transfer"""
@@ -79,6 +71,9 @@ class MooncakeTransferEngine:
             logger.debug(f"mock: register memory ptr={ptr}, length={length}")
             return  # Success in mock mode
 
+        logger.info(
+            f"Mooncake attempting to register memory: length={length/1024/1024:.2f} MB"
+        )
         ret_value = self.engine.register_memory(ptr, length)
         if ret_value != 0:
             logger.error("mooncake memory registration failed")
@@ -129,12 +124,9 @@ class MooncakeTransferEngine:
             )
             return 0  # Success in mock mode
 
-        try:
-            ret = self.engine.transfer_sync_write(
-                session_id, buffer, peer_buffer_address, length
-            )
-        except Exception as e:
-            ret = -1
+        ret = self.engine.transfer_sync_write(
+            session_id, buffer, peer_buffer_address, length
+        )
 
         # Currently we assume some failures should be accepted
         if ret < 0:
@@ -166,15 +158,7 @@ class MooncakeBootstrapServer:
         self._runner = None
         self._lock = threading.Lock()
 
-        # lazy import aiohttp
-        try:
-            from aiohttp import web  # noqa: F401
-        except Exception as e:
-            logger.error(f"aiohttp not available for MooncakeBootstrapServer: {e}")
-            raise
-
     def _setup_routes(self, app):
-        from aiohttp import web
 
         async def handle_health(request):
             return web.Response(text="OK", status=200)
@@ -216,26 +200,18 @@ class MooncakeBootstrapServer:
         app.router.add_route("*", "/route", handle_route)
 
     def _run_server(self):
-        from aiohttp import web
 
-        try:
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-            app = web.Application()
-            self._setup_routes(app)
-            self._runner = web.AppRunner(app)
-            self._loop.run_until_complete(self._runner.setup())
-            site = web.TCPSite(self._runner, port=self.port)
-            self._loop.run_until_complete(site.start())
-            logger.info(f"Mooncake Bootstrap HTTP server started on port {self.port}")
-            self._loop.run_forever()
-        except Exception as e:
-            logger.error(f"Bootstrap server error: {e}")
-        finally:
-            if self._runner is not None:
-                self._loop.run_until_complete(self._runner.cleanup())
-            if self._loop is not None:
-                self._loop.close()
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+
+        app = web.Application()
+        self._setup_routes(app)
+        self._runner = web.AppRunner(app)
+        self._loop.run_until_complete(self._runner.setup())
+        site = web.TCPSite(self._runner, port=self.port)
+        self._loop.run_until_complete(site.start())
+        logger.info(f"Mooncake Bootstrap HTTP server started on port {self.port}")
+        self._loop.run_forever()
 
     def start_in_background(self):
         t = threading.Thread(target=self._run_server, daemon=True)

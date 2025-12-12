@@ -53,7 +53,7 @@ class ChituFormatter(logging.Formatter):
             record.context = ""
 
         record.msg = original_msg
-
+        record.args = None
         return super().format(record)
 
 
@@ -109,49 +109,3 @@ def configure_chitu_logging():
 
 def setup_chitu_logging():
     configure_chitu_logging()
-
-
-def tps_monitor(
-    enabled=True, interval_sec=1.0, reset_interval=5.0, only_local_rank0=True
-):
-    """
-    Decorator to monitor and log tokens-per-second (TPS) throughput during generation.
-
-    Args:
-        interval_sec (float): The interval (in seconds) at which to log TPS statistics. Default is 1.0.
-        reset_interval (float): The interval (in seconds) after which the TPS statistics are reset. Default is 5.0.
-        only_local_rank0 (bool): If True, TPS is only logged on local rank 0; otherwise, all ranks log TPS. Default is True.
-    """
-
-    state = {"last_ts": time.monotonic(), "tokens": 0}
-    logger = logging.getLogger(__name__)
-
-    def decorator(fn):
-
-        @wraps(fn)
-        def wrapped(self, tasks, *args, **kwargs):
-            result = fn(self, tasks, *args, **kwargs)
-            if (not enabled) or (
-                only_local_rank0 and getattr(self, "local_rank", 0) != 0
-            ):
-                return result
-            tokens = getattr(tasks, "num_tokens", 0)
-            num_tasks = getattr(tasks, "num_tasks", 0)
-            now = time.monotonic()
-            state["tokens"] += tokens
-            elapsed = now - state["last_ts"]
-            if elapsed >= reset_interval:
-                state["tokens"] = tokens
-                state["last_ts"] = now
-            elif elapsed >= interval_sec:
-                tps = state["tokens"] / elapsed if elapsed > 0 else 0.0
-                logger.info(
-                    f"Avg generation throughput: {tps:.2f} tokens/s, Running: {num_tasks} reqs"
-                )
-                state["tokens"] = 0
-                state["last_ts"] = now
-            return result
-
-        return wrapped
-
-    return decorator
