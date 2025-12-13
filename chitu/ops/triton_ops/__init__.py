@@ -3,7 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from chitu.ops.triton_ops.rotary import apply_rotary_pos_emb_triton
-from chitu.ops.triton_ops.activation import silu_and_mul_triton
+from chitu.ops.triton_ops.activation import (
+    silu_and_mul_triton,
+    silu_and_mul_triton_with_expert_mask,
+)
 from chitu.ops.triton_ops.sampling import apply_frequency_penalty_triton
 from chitu.ops.triton_ops.kv_cache import (
     append_to_paged_kv_cache_triton,

@@ -21,7 +21,10 @@ cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 if has_triton and torch.cuda.is_available():
-    from chitu.ops.triton_ops import silu_and_mul_triton
+    from chitu.ops.triton_ops import (
+        silu_and_mul_triton,
+        silu_and_mul_triton_with_expert_mask,
+    )
 
 
 def silu_and_mul_torch(x: torch.Tensor):
@@ -83,7 +86,11 @@ def silu_and_mul_cpu(x: torch.Tensor):
 
 
 @make_lazy_op
-def silu_and_mul(x, impl="auto"):
+def silu_and_mul(
+    x: torch.Tensor,
+    expert_n_tokens: torch.Tensor = None,
+    impl="auto",
+):
     import chitu.muxi_utils as muxi_utils
 
     if impl == "auto":
@@ -103,6 +110,12 @@ def silu_and_mul(x, impl="auto"):
             impl = "cpu"
         else:
             impl = "triton"
+    if expert_n_tokens is not None:
+        if impl == "triton" and has_triton:
+            return silu_and_mul_triton_with_expert_mask(x, expert_n_tokens)
+        raise NotImplementedError(
+            f"silu_and_mul(expert_n_tokens!=None) only supports triton for now, got impl={impl}"
+        )
 
     if impl == "triton" and has_triton:
         return silu_and_mul_triton(x)
