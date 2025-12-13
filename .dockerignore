@@ -1,6 +1,9 @@
 # No git history
 **/.git
 
+# No CI scripts
+**/.gitlab-ci.yml
+
 # Byte-compiled / optimized / DLL files
 **/__pycache__/
 **/*.py[cod]
