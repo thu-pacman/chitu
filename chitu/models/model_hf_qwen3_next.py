@@ -11,6 +11,7 @@ from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.distributed.parallel_state import get_tp_group, get_tp_size
 from chitu.models.model import (
+    RMSNorm,
     TransformerBlock,
     ParallelMoeBlock,
     get_linear_layout_native_y,
@@ -73,28 +74,14 @@ def extract_and_merge(x, seq_len_list):
     return torch.cat(result, dim=0)
 
 
-# SPDX-SnippetBegin
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-SnippetCopyrightText: 2025 HuggingFace
-# SDPX—SnippetName: Qwen3NextRMSNorm from transformers
-class Qwen3NextRMSNorm(nn.Module):
+class Qwen3NextRMSNorm(RMSNorm):
     def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim))
+        super().__init__(dim, eps)
 
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        def _preprocess_weight(module, incompatible_keys):
+            module.weight.data = (1.0 + module.weight).to(torch.float32)
 
-    def forward(self, x):
-        output = self._norm(x.float())
-        # Llama does x.to(float16) * w whilst Qwen3Next is (x * w).to(float16)
-        # See https://github.com/huggingface/transformers/pull/29402
-        output = output * (1.0 + self.weight.float())
-        return output.type_as(x)
-
-
-# SPDX-SnippetEnd
+        self.register_load_state_dict_post_hook(_preprocess_weight)
 
 
 # SPDX-SnippetBegin
