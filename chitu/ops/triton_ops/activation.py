@@ -98,3 +98,96 @@ def silu_and_mul_kernel(output_ptr, x_ptr, output_n_cols, BLOCK_SIZE: tl.constex
     result = silu_part1 * part2
     output = output_ptr + row_idx * output_n_cols + offsets
     tl.store(output, result, mask=(offsets < output_n_cols))
+
+
+@triton.jit
+def silu_and_mul_with_expert_mask_kernel(
+    x_ptr,
+    y_ptr,
+    masked_m_ptr,
+    H: tl.constexpr,
+    M: tl.constexpr,
+    stride_x0,
+    stride_x1,
+    stride_y0,
+    stride_y1,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    # grid = (ceil_div(H, BLOCK_N), TOKEN_WORKERS_PER_EXPERT, E)
+    pid_h = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    pid_e = tl.program_id(2)
+
+    token_workers = tl.num_programs(1)
+
+    m = tl.load(masked_m_ptr + pid_e).to(tl.int32)
+    m = tl.minimum(m, tl.full([], M, tl.int32))
+
+    offs_h = pid_h * BLOCK_N + tl.arange(0, BLOCK_N)
+    h_mask = offs_h < H
+
+    stride_x0 = tl.cast(stride_x0, tl.int64)
+    stride_x1 = tl.cast(stride_x1, tl.int64)
+    stride_y0 = tl.cast(stride_y0, tl.int64)
+    stride_y1 = tl.cast(stride_y1, tl.int64)
+
+    # base pointers for this expert + hidden-block
+    x_eh = x_ptr + pid_e * stride_x0 + offs_h
+    y_eh = y_ptr + pid_e * stride_y0 + offs_h
+
+    for t in tl.range(pid_w, m, token_workers, num_stages=NUM_STAGES):
+        # gate: x[..., :H], up: x[..., H:2H]
+        gate = tl.load(x_eh + t * stride_x1, mask=h_mask, other=0).to(tl.float32)
+        up = tl.load(x_eh + t * stride_x1 + H, mask=h_mask, other=0).to(tl.float32)
+
+        # SiLU(gate) = gate * sigmoid(gate)
+        sig = 1.0 / (1.0 + tl.exp(-gate))
+        gate = gate * sig
+
+        out = (up * gate).to(y_ptr.dtype.element_ty)
+        tl.store(y_eh + t * stride_y1, out, mask=h_mask)
+
+
+def silu_and_mul_triton_with_expert_mask(
+    x: torch.Tensor,
+    masked_m: torch.Tensor,
+) -> torch.Tensor:
+    assert isinstance(x, torch.Tensor)
+    assert x.is_contiguous(), "Input must be contiguous"
+    assert x.ndim == 3
+    assert x.shape[0] == masked_m.shape[0]
+    assert x.shape[-1] % 2 == 0
+
+    E, M, twoH = x.shape
+    H = twoH // 2
+
+    y = torch.empty((E, M, H), device=x.device, dtype=x.dtype)
+    if y.device.type == "meta" or y.numel() == 0:
+        return y
+
+    masked_m = masked_m.to(device=x.device, dtype=torch.int32).contiguous()
+
+    TOKEN_WORKERS_PER_EXPERT = 64 if E < 4 else 32
+
+    BLOCK_N = 128
+    NUM_STAGES = 6
+    num_warps = 4
+
+    grid = (triton.cdiv(H, BLOCK_N), TOKEN_WORKERS_PER_EXPERT, E)
+
+    silu_and_mul_with_expert_mask_kernel[grid](
+        x,
+        y,
+        masked_m,
+        H=H,
+        M=M,
+        stride_x0=x.stride(0),
+        stride_x1=x.stride(1),
+        stride_y0=y.stride(0),
+        stride_y1=y.stride(1),
+        BLOCK_N=BLOCK_N,
+        NUM_STAGES=NUM_STAGES,
+        num_warps=num_warps,
+    )
+    return y

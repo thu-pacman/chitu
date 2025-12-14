@@ -2,6 +2,9 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
+from logging import getLogger
+
 import torch
 
 from chitu.utils import (
@@ -20,8 +23,15 @@ triton, has_triton = try_import_platform_dep("triton")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
+
+logger = getLogger(__name__)
+
+
 if has_triton and torch.cuda.is_available():
-    from chitu.ops.triton_ops import silu_and_mul_triton
+    from chitu.ops.triton_ops import (
+        silu_and_mul_triton,
+        silu_and_mul_triton_with_expert_mask,
+    )
 
 
 def silu_and_mul_torch(x: torch.Tensor):
@@ -83,7 +93,11 @@ def silu_and_mul_cpu(x: torch.Tensor):
 
 
 @make_lazy_op
-def silu_and_mul(x, impl="auto"):
+def silu_and_mul(
+    x: torch.Tensor,
+    expert_n_tokens: Optional[torch.Tensor] = None,
+    impl="auto",
+):
     import chitu.muxi_utils as muxi_utils
 
     if impl == "auto":
@@ -105,10 +119,33 @@ def silu_and_mul(x, impl="auto"):
             impl = "triton"
 
     if impl == "triton" and has_triton:
-        return silu_and_mul_triton(x)
+        if expert_n_tokens is not None:
+            return silu_and_mul_triton_with_expert_mask(x, expert_n_tokens)
+        else:
+            return silu_and_mul_triton(x)
     elif impl == "torch_npu":
+        if expert_n_tokens is not None:
+            # TODO: Use warning_once if we have implemented it
+            logger.warning(
+                "silu_and_mul(impl=torch_npu) does not support expert_n_tokens, "
+                "falling back to computing the whole tensor"
+            )
         return torch_npu.npu_swiglu(x)
     elif impl == "cpu":
+        if expert_n_tokens is not None:
+            # TODO: Use warning_once if we have implemented it
+            logger.warning(
+                "silu_and_mul(impl=cpu) does not support expert_n_tokens, "
+                "falling back to computing the whole tensor"
+            )
         return silu_and_mul_cpu(x)
-    else:
+    elif impl == "torch":
+        if expert_n_tokens is not None:
+            # TODO: Use warning_once if we have implemented it
+            logger.warning(
+                "silu_and_mul(impl=torch) does not support expert_n_tokens, "
+                "falling back to computing the whole tensor"
+            )
         return silu_and_mul_torch(x)
+    else:
+        raise ValueError(f"Unsupported implementation of silu_and_mul: {impl}")

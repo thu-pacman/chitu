@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from chitu.ops import silu_and_mul
+from chitu.ops.triton_ops.activation import silu_and_mul_triton_with_expert_mask
 from chitu.moe.batched_routed_activation import PerExpertDenseBatchedRoutedActivation
 
 
@@ -543,11 +544,11 @@ def triton_batched_experts(
         per_act_token_quant=False,
         block_shape=None,
     )
-    intermediate_cache2 = (
-        silu_and_mul(intermediate_cache1.view(-1, N), impl="triton")
-        .evaluate()
-        .view(E, M, N // 2)
-    )
+    intermediate_cache2 = silu_and_mul(
+        intermediate_cache1,
+        expert_n_tokens=hidden_states.n_tokens_per_expert,
+        impl="triton",
+    ).evaluate()
 
     invoke_moe_batched_triton_kernel(
         A=intermediate_cache2,

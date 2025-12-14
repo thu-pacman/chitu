@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
+
 import torch
 
 from chitu.utils import try_import_platform_dep
@@ -123,12 +125,18 @@ def blockfp8_act_quant(
 
 
 def silu_and_mul_and_blockfp8_act_quant(
-    x: torch.Tensor, block_size: int = 128, impl: str = "auto"
+    x: torch.Tensor,
+    *,
+    expert_n_tokens: Optional[torch.Tensor] = None,
+    block_size: int = 128,
+    impl: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if impl == "auto":
         impl = "triton"
 
     if impl == "triton" and has_triton:
-        return silu_and_mul_and_blockfp8_act_quant_triton(x, block_size)
+        return silu_and_mul_and_blockfp8_act_quant_triton(
+            x, expert_n_tokens=expert_n_tokens, block_size=block_size
+        )
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")

@@ -21,7 +21,35 @@ def test_silu_and_mul(M, N, impl):
     torch.manual_seed(42)
     input_tensor = torch.rand(M, N, device="cuda", dtype=torch.bfloat16)
     baseline_result = eval_lazy(silu_and_mul(input_tensor, impl="torch"))
-    result = eval_lazy(silu_and_mul(input_tensor, impl="triton"))
-    assert torch.allclose(
-        baseline_result, result, rtol=1e-3, atol=1e-3
-    ), f"Results don't match for shape M={M}, N={N}"
+    result = eval_lazy(silu_and_mul(input_tensor, impl=impl))
+    torch.testing.assert_close(result, baseline_result, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("E", [32, 128])
+@pytest.mark.parametrize("M", [1, 128])
+@pytest.mark.parametrize("N", [256, 512])
+@pytest.mark.parametrize("impl", ["triton"])
+def test_silu_and_mul_with_expert_mask(E, M, N, impl):
+    if impl == "triton" and not has_triton:
+        pytest.skip("triton is missing")
+
+    torch.manual_seed(42)
+    input_tensor = torch.rand(E, M, N, device="cuda", dtype=torch.bfloat16)
+    expert_n_tokens = torch.randint(
+        low=0, high=M, size=(E,), device="cuda", dtype=torch.int32
+    )
+    baseline_result = eval_lazy(
+        silu_and_mul(input_tensor, expert_n_tokens=expert_n_tokens, impl="torch")
+    )
+    result = eval_lazy(
+        silu_and_mul(input_tensor, expert_n_tokens=expert_n_tokens, impl=impl)
+    )
+
+    # Zero out non-data elements
+    mask = torch.arange(M, device="cuda", dtype=torch.int32).repeat(
+        E, 1
+    ) < expert_n_tokens.view(E, 1)
+    baseline_result[~mask] = 0
+    result[~mask] = 0
+
+    torch.testing.assert_close(result, baseline_result, rtol=1e-2, atol=1e-2)

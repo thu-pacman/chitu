@@ -88,6 +88,7 @@ echo CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES
 apptainer run \
     --nv \
     --contain \
+    --writable-tmpfs \
     --cwd /workspace/chitu \
     --cleanenv \
     --env NCCL_GRAPH_MIXING_SUPPORT=0 \
