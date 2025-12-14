@@ -10,10 +10,7 @@ from chitu.moe.batched_routed_activation import (
     PerExpertDenseBatchedRoutedActivation,
     PerExpertDenseBatchedRoutedActivationBlockfp8,
 )
-from chitu.ops.quant import blockfp8_act_quant
-from chitu.ops.triton_ops.quant.blockfp8.convert import (
-    silu_and_mul_and_blockfp8_act_quant_with_expert_mask,
-)
+from chitu.ops.quant import blockfp8_act_quant, silu_and_mul_and_blockfp8_act_quant
 from chitu.utils import try_import_opt_dep
 
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
@@ -81,35 +78,11 @@ def deepgemm_masked_fused_expert(
         hidden_states.n_tokens_per_expert,
         M,
     )
-
-    qintermediate_cache2 = torch.empty(
-        (
-            intermediate_cache1.shape[0],
-            intermediate_cache1.shape[1],
-            intermediate_cache1.shape[2] // 2,
-        ),
-        device=intermediate_cache1.device,
-        dtype=torch.float8_e4m3fn,
-    )
-    scale_block_size = 128
-    a2q_scale = torch.empty(
-        (
-            intermediate_cache1.shape[0],
-            intermediate_cache1.shape[1],
-            intermediate_cache1.shape[2] // 2 // scale_block_size,
-        ),
-        device=intermediate_cache1.device,
-        dtype=torch.float32,
-    )
-
-    silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
+    qintermediate_cache2, a2q_scale = silu_and_mul_and_blockfp8_act_quant(
         intermediate_cache1,
-        qintermediate_cache2,
-        a2q_scale,
-        scale_block_size,
-        hidden_states.n_tokens_per_expert,
+        expert_n_tokens=hidden_states.n_tokens_per_expert,
+        block_size=128,
     )
-
     deep_gemm.m_grouped_fp8_gemm_nt_masked(
         (qintermediate_cache2, a2q_scale),
         (w2, w2_scale),

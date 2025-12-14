@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import struct
+from typing import Optional
 
 import torch
 import triton
@@ -47,7 +48,9 @@ def blockfp8_act_quant_triton(
 @blockfp8_act_quant_triton.register
 def _(x: silu_and_mul.lazy_tensor_type(), block_size: int = 128):
     return silu_and_mul_and_blockfp8_act_quant_triton(
-        x.kwargs["x"], block_size=block_size
+        x.kwargs["x"],
+        expert_n_tokens=x.kwargs["expert_n_tokens"],
+        block_size=block_size,
     )
 
 
@@ -77,8 +80,27 @@ def blockfp8_act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
 
 @auto_retry_triton_compilation
 def silu_and_mul_and_blockfp8_act_quant_triton(
-    x: torch.Tensor, block_size: int = 128
+    x: torch.Tensor,
+    *,
+    expert_n_tokens: Optional[torch.Tensor] = None,
+    block_size: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if expert_n_tokens is not None:
+        assert x.shape[-1] % (2 * block_size) == 0
+        output = torch.empty(
+            *x.shape[:-1], x.shape[-1] // 2, dtype=torch.float8_e4m3fn, device=x.device
+        )
+        output_scale = torch.empty(
+            *x.shape[:-1],
+            x.shape[-1] // 2 // block_size,
+            dtype=torch.float32,
+            device=x.device,
+        )
+        silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
+            x, output, output_scale, block_size, expert_n_tokens
+        )
+        return output, output_scale
+
     assert x.is_contiguous(), "Input tensor must be contiguous"
     assert (
         x.size(-1) % (2 * block_size) == 0

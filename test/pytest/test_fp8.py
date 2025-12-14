@@ -1,5 +1,6 @@
 import torch
 import pytest
+from omegaconf import OmegaConf
 
 from chitu.ops import (
     silu_and_mul,
@@ -17,6 +18,7 @@ from chitu.device_type import has_native_fp8
 from chitu.lazy import eval_lazy
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.utils import try_import_platform_dep, ceil_div
+from chitu.global_vars import set_global_args
 
 triton, has_triton = try_import_platform_dep("triton")
 
@@ -44,16 +46,68 @@ def init_b_and_b_s(dim, block_size):
     reason="This test requires the GPU to have native FP8 support",
 )
 def test_silu_and_mul_and_blockfp8_act_quant(dtype: torch.dtype):
+    set_global_args(
+        OmegaConf.create({"infer": {"op_impl": "torch"}}), need_ensure=False
+    )
     torch.set_default_dtype(dtype)
     dim = 256
     block_size = 128
     assert dim % block_size == 0, "dim must be divisible by block_size"
     a = torch.randn(dim, dim * 2, dtype=dtype, device="cuda")
 
-    a_fp8, a_s = silu_and_mul_and_blockfp8_act_quant(a, block_size)
-    a_fp8_ref, a_s_ref = blockfp8_act_quant(eval_lazy(silu_and_mul(a)), block_size)
+    a_fp8, a_s = silu_and_mul_and_blockfp8_act_quant(a, block_size=block_size)
+    a_fp8_ref, a_s_ref = blockfp8_act_quant(
+        eval_lazy(silu_and_mul(a)), block_size=block_size
+    )
 
     assert torch.allclose(a_fp8.float(), a_fp8_ref.float(), atol=0.15, rtol=0.15)
+    assert torch.allclose(a_s.float(), a_s_ref.float(), atol=0.15, rtol=0.15)
+
+
+@pytest.mark.parametrize("E", [128])
+@pytest.mark.parametrize("M", [32])
+@pytest.mark.parametrize("N", [1024])
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(
+    not has_native_fp8(),
+    reason="This test requires the GPU to have native FP8 support",
+)
+def test_silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
+    E, M, N, block_size, dtype: torch.dtype
+):
+    set_global_args(
+        OmegaConf.create({"infer": {"op_impl": "torch"}}), need_ensure=False
+    )
+    torch.set_default_dtype(dtype)
+    assert N % (2 * block_size) == 0
+    a = torch.rand(E, M, N, device="cuda", dtype=torch.bfloat16)
+    expert_n_tokens = torch.randint(
+        low=0, high=M, size=(E,), device="cuda", dtype=torch.int32
+    )
+
+    a_fp8, a_s = silu_and_mul_and_blockfp8_act_quant(
+        a, expert_n_tokens=expert_n_tokens, block_size=block_size
+    )
+    a_fp8_ref, a_s_ref = blockfp8_act_quant(
+        eval_lazy(silu_and_mul(a, expert_n_tokens=expert_n_tokens)),
+        block_size=block_size,
+    )
+
+    # fp8 does not support masked_fill, so cast them to bf16 to check
+    a_out = a_fp8.to(torch.bfloat16)
+    a_out_ref = a_fp8_ref.to(torch.bfloat16)
+
+    # Zero out non-data elements
+    mask = torch.arange(M, device="cuda", dtype=torch.int32).repeat(
+        E, 1
+    ) < expert_n_tokens.view(E, 1)
+    a_out[~mask] = 0
+    a_out_ref[~mask] = 0
+    a_s[~mask] = 0
+    a_s_ref[~mask] = 0
+
+    assert torch.allclose(a_out.float(), a_out_ref.float(), atol=0.15, rtol=0.15)
     assert torch.allclose(a_s.float(), a_s_ref.float(), atol=0.15, rtol=0.15)
 
 
