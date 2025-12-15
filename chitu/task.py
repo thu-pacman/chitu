@@ -539,6 +539,8 @@ class Task:
                 self._prefix_tokens.append(self.record_next_token)
             self.record_next_token = None
         elif self.task_type == TaskType.Decode:
+            if Backend.executor.mtp_size > 1:
+                self._prefix_tokens.extend(self.mtp_token_list)
             self._prefix_tokens.append(self.next_token)
         self.sync_new_token = True
 

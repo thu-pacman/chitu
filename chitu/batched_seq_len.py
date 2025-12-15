@@ -357,6 +357,7 @@ class BatchedSeqLenDelta:
             self._delta_position_ids_static_tensor_device = StaticTensor(
                 max_nelem=max_total_delta_len, dtype=torch.int32, device=device
             )
+        self.is_decode_stage = False
 
     def copy_from_list(self, old_len_list: list[int], new_len_list: list[int]):
         self.old.copy_from_list(old_len_list)
