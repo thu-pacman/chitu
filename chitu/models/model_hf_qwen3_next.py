@@ -25,10 +25,10 @@ from chitu.models.model_hf_qwen_3_moe import (
 )
 from chitu.models.registry import ModelType, register_model
 from chitu.ops import (
-    append_to_paged_kv_cache,
+    update_singleton_paged_kv_cache,
+    read_from_singleton_paged_kv_cache,
     apply_rotary_pos_emb,
     chunk_gated_delta_rule,
-    read_from_paged_kv_cache,
     recurrent_gated_delta_rule,
     silu_and_mul,
 )
@@ -236,17 +236,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         cache_accessor = self.cache.get_accessor(self.layer_id)
         if use_precomputed_states:
-            conv_state = read_from_paged_kv_cache(
-                cache_accessor.kv["conv_state"],
-                cache_accessor.block_table,
-                torch.zeros((bs,), dtype=torch.int32, device=x.device),
-                self.cache.seq_len_delta.delta_seq_ids_tensor_device,
+            conv_state = read_from_singleton_paged_kv_cache(
+                cache_accessor.kv["conv_state"], cache_accessor.block_table
             )
-            recurrent_state = read_from_paged_kv_cache(
-                cache_accessor.kv["recurrent_state"],
-                cache_accessor.block_table,
-                torch.zeros((bs,), dtype=torch.int32, device=x.device),
-                self.cache.seq_len_delta.delta_seq_ids_tensor_device,
+            recurrent_state = read_from_singleton_paged_kv_cache(
+                cache_accessor.kv["recurrent_state"], cache_accessor.block_table
             )
 
         qkvz = self.in_proj_qkvz(x)
@@ -350,21 +344,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 impl=self.impl,
             )
 
-        append_to_paged_kv_cache(
-            cache_accessor.kv["conv_state"],
-            cache_accessor.block_table,
-            conv_state.contiguous(),
-            torch.zeros((bs,), dtype=torch.int32, device=x.device),
-            torch.arange((bs), dtype=torch.int32, device=x.device),
-            impl="torch",
+        update_singleton_paged_kv_cache(
+            cache_accessor.kv["conv_state"], cache_accessor.block_table, conv_state
         )
-        append_to_paged_kv_cache(
+        update_singleton_paged_kv_cache(
             cache_accessor.kv["recurrent_state"],
             cache_accessor.block_table,
-            last_recurrent_state.to(x.dtype).contiguous(),
-            torch.zeros((bs,), dtype=torch.int32, device=x.device),
-            torch.arange((bs), dtype=torch.int32, device=x.device),
-            impl="torch",
+            last_recurrent_state.to(x.dtype),
         )
         self.last_conv_state = conv_state.contiguous()
         self.last_recurrent_state = last_recurrent_state.to(x.dtype).contiguous()
