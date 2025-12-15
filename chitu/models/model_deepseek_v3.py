@@ -87,7 +87,6 @@ from chitu.distributed.parallel_state import (
     get_tp_size,
     get_ep_size,
 )
-from chitu.batched_seq_len import BatchedSeqLenDeltaView
 
 from chitu.task import  TaskType
 #from chitu.two_batch_overlap import model_forward_tbo
@@ -616,7 +615,7 @@ class AttentionDeepSeekV3(Attention):
             bs_seq, q, k, v = state.pop("attn_intermediate_state")
             x = self.attn_backend(
                 q,
-                self.cache.get_accessor(self.layer_id),
+                self.cache.get_accessor(self.layer_id, state.tbo_subbatch_index),
                 k,
                 v,
                 seq_len_delta=self.cache.two_batch_seq_len_delta[state.tbo_subbatch_index],
@@ -628,7 +627,7 @@ class AttentionDeepSeekV3(Attention):
             x = self.attn_backend.mla(
                 q_nope,
                 q_pe,
-                self.cache.get_accessor(self.layer_id),
+                self.cache.get_accessor(self.layer_id, state.tbo_subbatch_index),
                 kv,
                 seq_len_delta=self.cache.two_batch_seq_len_delta[state.tbo_subbatch_index],
                 causal=True,
@@ -1845,7 +1844,7 @@ class TransformerDeepSeekV3(Transformer):
             block_table,
             block_size,
             softmax_scale=compute_softmax_scale_deepseek_v3(self.params),
-            two_batch_seq_len_delta=self.cache.two_batch_seq_len_delta,
+            two_batch_seq_len_delta=self.cache.two_batch_seq_len_delta if get_global_args().infer.enable_two_batch_overlap else None,
             enable_two_batch_metadata=get_global_args().infer.enable_two_batch_overlap
         )
 

@@ -138,11 +138,25 @@ class TboPackedTasksPreparer:
             )
         else:
             tbo_split_seq_index = 0
+            
+        can_run_tbo = all([
+            enable_deepep_moe,
+            enable_two_batch_overlap,
+            tbo_split_seq_index is not None,
+            tbo_split_seq_index > 0,
+            # FIXME(yyq): TBO currently only supports specific attention backends and cache types
+            # TODO: Expand TBO compatibility to more attention implementations
+            get_global_args().infer.attn_type in {"flash_mla", "triton"},
+            get_global_args().infer.cache_type == "paged"
+        ])
         
-        can_run_tbo =  enable_deepep_moe and enable_two_batch_overlap and tbo_split_seq_index is not None
         if enable_two_batch_overlap and not can_run_tbo:
             if not enable_deepep_moe:
                 raise ValueError("TBO requires DeepEP to be enabled")
+            elif not get_global_args().infer.attn_type in {"flash_mla", "triton"}:
+                raise ValueError("TBO requires attention_type to be flash_mla or triton")
+            elif not get_global_args().infer.cache_type == "paged":
+                raise ValueError("TBO requires cache_type paged")
             elif tbo_split_seq_index is None:
                 raise ValueError("TBO requires tbo_split_seq_index to be set")
             

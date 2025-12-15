@@ -13,11 +13,11 @@ import random
 from typing import Any
 import socket
 import site
-
+from functools import partial
 import torch
 import importlib
 import importlib.resources
-from chitu.device_type import is_ascend
+from chitu.device_type import is_ascend, is_nvidia
 
 from chitu.global_vars import get_global_args
 
@@ -566,7 +566,6 @@ def invalidate_cached_property(obj, name):
     except AttributeError:
         pass
 
-
 def try_get_profiler(
     profiler_dir: str,
     wait: int = 0,
@@ -581,5 +580,45 @@ def try_get_profiler(
         return try_get_npu_profiler(
             profiler_dir, wait, warmup, active, repeat, with_stack
         )
-    else:  # TODO add nvidia profiler
+    elif is_nvidia():
+        return torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                schedule=torch.profiler.schedule(
+                    wait=wait,
+                    warmup=warmup,
+                    active=active,
+                    repeat=repeat,
+                ),
+                on_trace_ready=partial(trace_handler, profiler_dir=profiler_dir),
+                with_stack=with_stack,
+            )
+    else:  
         raise NotImplementedError("Not supported yet")
+
+def trace_handler(prof,profiler_dir):
+    rank = torch.distributed.get_rank()
+
+    # print trace kernel time table to .table files
+    # TODO: make it an environment variable
+    # assert get_global_args().profile.enable
+
+    table_path = f"{profiler_dir}/profile_{rank}.table"
+    trace_path = f"{profiler_dir}/profile_{rank}.json"
+
+    logger.warning(f"Saving profile table to {table_path}")
+    with open(table_path, "w") as f:
+        f.write(
+            prof.key_averages().table(
+                sort_by="self_cuda_time_total",
+                max_name_column_width=60,
+                max_src_column_width=20,
+                row_limit=-1,
+            )
+        )
+
+    # print trace json logs to .json files
+    logger.warning(f"Saving profile trace to {trace_path}")
+    prof.export_chrome_trace(trace_path)

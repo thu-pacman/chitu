@@ -16,7 +16,6 @@ from chitu.static_tensor import StaticTensor
 from chitu.batched_seq_len import (
     BatchedSeqLen,
     BatchedSeqLenDelta,
-    BatchedSeqLenDeltaView,
 )
 from chitu.utils import ceil_div
 
@@ -246,7 +245,10 @@ class KVCacheManagerBase:
             cache_delta_seq_ids_tensor_device=True,
         )
         if get_global_args().infer.enable_two_batch_overlap:
+            self.tbo_split_seq_index = None
             self.max_two_batch_size = (num_hot_req + 1) // 2
+            self.max_two_batch_total_len = self.max_two_batch_size * max_seq_len
+            # prefill_chunk_size is for each microbatch
             self.max_two_batch_total_delta_len = max(
                 (
                     prefill_chunk_size
@@ -256,14 +258,17 @@ class KVCacheManagerBase:
                 self.max_two_batch_size,  # decode
             )
             self.two_batch_seq_len_delta = [
-                BatchedSeqLenDeltaView(
-                    parent=self.seq_len_delta,
+                BatchedSeqLenDelta(
+                    device=self.device,
                     tbo_subbatch_index=i,
-                    tbo_split_seq_index=self.max_two_batch_size,
-                    tbo_split_token_index=max_seq_len * self.max_two_batch_size,
                     max_batch_size=self.max_two_batch_size,
-                    max_total_len=max_seq_len * self.max_two_batch_size,
+                    max_total_len=self.max_two_batch_total_len,
                     max_total_delta_len=self.max_two_batch_total_delta_len,
+                    cache_prefix_lens_tensor_device=True,
+                    cache_position_ids_tensor_device=True,
+                    cache_seq_ids_tensor_device=True,
+                    cache_delta_position_ids_tensor_device=True,
+                    cache_delta_seq_ids_tensor_device=True,
                 )
                 for i in range(2)
             ]
@@ -298,10 +303,28 @@ class KVCacheManagerBase:
             cache_seq_ids_tensor_device=False,
         )
         self.seq_len_delta.copy_from(prev_seq_len, next_seq_len)
-        if get_global_args().infer.enable_two_batch_overlap:
+        if get_global_args().infer.enable_two_batch_overlap and tbo_split_seq_index is not None:
+            self.tbo_split_seq_index = tbo_split_seq_index
             for i in range(2):
+                input_slice = slice(0,tbo_split_seq_index) if i == 0 else slice(tbo_split_seq_index,None)
                 self.two_batch_seq_len_delta[i].copy_from(
-                    self.seq_len_delta, tbo_split_seq_index, tbo_split_token_index
+                    BatchedSeqLen(
+                        [self.req_id_to_seq_len.get(req_id, 0) for req_id in req_ids[input_slice]],
+                        device=self.device,
+                        cache_prefix_lens_tensor_device=False,
+                        cache_position_ids_tensor_device=False,
+                        cache_seq_ids_tensor_device=False,
+                    ),
+                    BatchedSeqLen(
+                        [
+                            self.req_id_to_seq_len.get(req_id, 0) + d
+                            for req_id, d in zip(req_ids[input_slice], delta_seq_len[input_slice])
+                        ],
+                        device=self.device,
+                        cache_prefix_lens_tensor_device=False,
+                        cache_position_ids_tensor_device=False,
+                        cache_seq_ids_tensor_device=False,
+                    ),
                 )
 
         for req_id, seq_len in zip(req_ids, next_seq_len.lens_list):
@@ -309,6 +332,7 @@ class KVCacheManagerBase:
 
     def finalize_cache_all_prefill(self):
         self.curr_req_ids = None
+        self.tbo_split_seq_index = None
 
     def prepare_cache_decode(
         self,
@@ -322,10 +346,13 @@ class KVCacheManagerBase:
             [self.req_id_to_seq_len[req_id] for req_id in req_ids],
             [self.req_id_to_seq_len[req_id] + 1 for req_id in req_ids],
         )
-        if get_global_args().infer.enable_two_batch_overlap:
+        if get_global_args().infer.enable_two_batch_overlap and tbo_split_seq_index is not None:
+            self.tbo_split_seq_index = tbo_split_seq_index
             for i in range(2):
+                input_slice = slice(0,tbo_split_seq_index) if i == 0 else slice(tbo_split_seq_index,None)
                 self.two_batch_seq_len_delta[i].copy_from_list(
-                    self.seq_len_delta, tbo_split_seq_index, tbo_split_token_index
+                    [self.req_id_to_seq_len[req_id] for req_id in req_ids[input_slice]],
+                    [self.req_id_to_seq_len[req_id] + 1 for req_id in req_ids[input_slice]],
                 )
 
         for req_id in req_ids:
@@ -353,11 +380,12 @@ class KVCacheManagerBase:
         """Renturn number of blocks that has reserved for reqs to use."""
         raise NotImplementedError()
 
-    def get_accessor(self, layer_id: int) -> KVCacheAccessor:
+    def get_accessor(self, layer_id: int, tbo_subbatch_index:Optional[int] = None) -> KVCacheAccessor:
         raise NotImplementedError()
 
     def finalize_cache_single_decode(self, req_ids: list[str]):
         self.curr_req_ids = None
+        self.tbo_split_seq_index = None
 
     def finalize_cache_all_decode(self, req_id: str):
         del self.req_id_to_seq_len[req_id]
@@ -618,13 +646,17 @@ class PagedKVCacheManager(KVCacheManagerBase):
         return self.gpu_block_table.get()
 
     @override
-    def get_accessor(self, layer_id: int) -> PagedKVCacheAccessor:
+    def get_accessor(self, layer_id: int, tbo_subbatch_index:Optional[int] = None) -> PagedKVCacheAccessor:
         local_layer_id = self.layer_id_map.to_local(layer_id)
         ret_kv = {
             key: cache[local_layer_id] for key, cache in self.paged_kv_cache.items()
         }
+        if tbo_subbatch_index is None:
+            block_slice = slice(None)
+        else:
+            block_slice = slice(0, self.tbo_split_seq_index) if tbo_subbatch_index==0 else slice(self.tbo_split_seq_index, None)
         return PagedKVCacheAccessor(
-            self.get_gpu_block_table(),
+            self.get_gpu_block_table()[block_slice],
             ret_kv,
             lambda: self.page_ids,
             lambda: self.offs_in_page,
@@ -777,18 +809,16 @@ class DenseKVCacheManager(KVCacheManagerBase):
         self,
         req_ids: list[str],
         delta_seq_len: list[int],
-        tbo_split_seq_index: Optional[int] = None,
-        tbo_split_token_index: Optional[int] = None,
     ):
         super().prepare_cache_prefill(
-            req_ids, delta_seq_len, tbo_split_seq_index, tbo_split_token_index
+            req_ids, delta_seq_len
         )
 
         # get start_idx and end_idx of current slot_group
         start_idx, end_idx = self.get_start_and_end_idx()
 
         # Only allocate slots in current slot_group
-        slot_id = start_idxpython
+        slot_id = start_idx
         for it, req_id in enumerate(req_ids):
             if req_id not in self.req2slot:
                 allocated = False
@@ -810,12 +840,11 @@ class DenseKVCacheManager(KVCacheManagerBase):
     def prepare_cache_decode(
         self,
         req_ids: list[str],
-        tbo_split_seq_index: Optional[int] = None,
-        tbo_split_token_index: Optional[int] = None,
+        
     ):
         self.timers("cache_prepare").start()
         super().prepare_cache_decode(
-            req_ids, tbo_split_seq_index, tbo_split_token_index
+            req_ids
         )
         start_pos = self.get_start_and_end_idx()[0]
         self._prepare_cache(req_ids, start_pos)

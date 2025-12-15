@@ -9,7 +9,7 @@ from logging import getLogger
 import torch
 
 from chitu.attn_backend.triton_attn_backend import TritonAttnBackend
-from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
+from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.static_tensor import StaticTensor
 from chitu.cache_manager import PagedKVCacheAccessor
 from chitu.ops import append_to_paged_kv_cache
@@ -163,7 +163,7 @@ class FlashMLABackend(TritonAttnBackend):
             output, _ = flash_mla.flash_mla_with_kvcache(
                 q_nope_pe,
                 kv_lora_k_pe.unsqueeze(2),
-                kv_cache.block_table[seq_len_delta.seq_slice],
+                kv_cache.block_table,
                 seq_len_delta.new.lens_tensor_device,
                 512,  # dv
                 self.metadata.get(),
@@ -178,7 +178,7 @@ class FlashMLABackend(TritonAttnBackend):
                 output, _ = flash_mla.flash_mla_with_kvcache(
                     q_nope_pe,
                     kv_lora_k_pe.unsqueeze(2),
-                    kv_cache.block_table[seq_len_delta.seq_slice],
+                    kv_cache.block_table,
                     seq_len_delta.new.lens_tensor_device,
                     512,  # dv
                     self.metadata.get(),
@@ -190,7 +190,7 @@ class FlashMLABackend(TritonAttnBackend):
                 output, _ = flash_mla.flash_mla_with_kvcache(
                     q_nope_pe,
                     kv_lora_k_pe.unsqueeze(2),
-                    kv_cache.block_table[seq_len_delta.seq_slice],
+                    kv_cache.block_table,
                     seq_len_delta.new.lens_tensor_device,
                     512,  # dv
                     self.two_batch_metadata[seq_len_delta.tbo_subbatch_index].get(),

@@ -253,7 +253,7 @@ class AttentionHFLlama(Attention):
 
         output = self.attn_backend(
             xq,
-            self.cache.get_accessor(self.layer_id),
+            self.cache.get_accessor(self.layer_id, state.tbo_subbatch_index),
             xk,
             xv,
             seq_len_delta=self.cache.two_batch_seq_len_delta[state.tbo_subbatch_index],
