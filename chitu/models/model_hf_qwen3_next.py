@@ -31,35 +31,10 @@ from chitu.ops import (
     chunk_gated_delta_rule,
     recurrent_gated_delta_rule,
     silu_and_mul,
+    causal_conv1d_update,
 )
 from chitu.quantization import QuantizationRegistry
 from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear, LocalLinear
-
-
-# SPDX-SnippetBegin
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-SnippetCopyrightText: 2025 HuggingFace
-# SDPX—SnippetName: torch_causal_conv1d_update from transformers
-def torch_causal_conv1d_update(
-    hidden_states,
-    conv_state,
-    weight,
-    bias=None,
-):
-    _, hidden_size, seq_len = hidden_states.shape
-    state_len = conv_state.shape[-1]
-
-    hidden_states_new = torch.cat([conv_state, hidden_states], dim=-1).to(weight.dtype)
-    conv_state = hidden_states_new[:, :, -state_len:]
-    out = F.conv1d(
-        hidden_states_new, weight.unsqueeze(1), bias, padding=0, groups=hidden_size
-    )
-    out = F.silu(out[:, :, -seq_len:])
-    out = out.to(hidden_states.dtype)
-    return out, conv_state
-
-
-# SPDX-SnippetEnd
 
 
 def extract_and_merge(x, seq_len_list):
@@ -142,7 +117,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             groups=self.local_conv_dim,
             padding=self.conv_kernel_size - 1,
         )
-        self.causal_conv1d_update = torch_causal_conv1d_update
 
         self.dt_bias = nn.Parameter(
             torch.ones(self.n_v_heads // model_parallel_size),
@@ -253,12 +227,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         if use_precomputed_states:
             qkv = qkv.view((qkv.size(0), -1, 1))
-            qkv, conv_state = self.causal_conv1d_update(
-                qkv,
-                conv_state,
-                self.conv1d.weight.squeeze(1),
-                self.conv1d.bias,
-            )
+            qkv, conv_state = causal_conv1d_update(qkv, conv_state, self.conv1d.weight)
         else:
             padded_qkv = torch.zeros(
                 (bs, max_curr_seq_len, self.local_conv_dim),

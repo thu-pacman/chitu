@@ -60,3 +60,4 @@ from chitu.ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_concat_permuted,
 )
 from chitu.ops.hadamard import hadamard_transform
+from chitu.ops.causal_conv import causal_conv1d_update
