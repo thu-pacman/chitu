@@ -531,17 +531,41 @@ class ExpertDataDispatcher(TasksDispatcher):
                 raise ValueError(f"Unknown payload type: {payload_type}")
             return payload_type, tasks
 
-    def collect_token(self, tasks: PackedTasksBase, token_list: list[int]):
+    def collect_token(
+        self,
+        tasks: PackedTasksBase,
+        token_list: list[int],
+        mtp_token_list: Optional[list[list[int]]] = None,
+    ):
         if self.is_main_rank:
             all_tokens = [[] for _ in range(self.group_size)]
+            if self.mtp_size > 1:
+                all_tokens_mtp = [[] for _ in range(self.group_size)]
             for _ in range(1, self.group_size):
                 msgs = self.socket.recv_multipart()
                 rank_in_group = int(msgs[0].decode())  # zmq identity prepend by ROUTER
                 all_tokens[rank_in_group] = msgpack.unpackb(msgs[1])
-            return DPTaskCollector.get_total_packedtasks(), sum(all_tokens, token_list)
+                if self.mtp_size > 1:
+                    all_tokens_mtp[rank_in_group] = msgpack.unpackb(msgs[2])
+            if not self.mtp_size > 1:
+                return DPTaskCollector.get_total_packedtasks(), sum(
+                    all_tokens, token_list
+                )
+            else:
+                return (
+                    DPTaskCollector.get_total_packedtasks(),
+                    sum(all_tokens, token_list),
+                    sum(all_tokens_mtp, mtp_token_list),
+                )
         else:
-            self.socket.send_multipart([msgpack.packb(token_list)])
-            return tasks, token_list
+            if not self.mtp_size > 1:
+                self.socket.send_multipart([msgpack.packb(token_list)])
+                return tasks, token_list
+            else:
+                self.socket.send_multipart(
+                    [msgpack.packb(token_list), msgpack.packb(mtp_token_list)]
+                )
+                return tasks, token_list, mtp_token_list
 
     def epilogue(self, tasks: PackedTasksBase, logits: torch.Tensor):
         # collect all tokens to DP rank0, and update response
@@ -552,9 +576,27 @@ class ExpertDataDispatcher(TasksDispatcher):
         # sampling
         if logits.numel() > 0:  # empty task skip sampling and update response
             token_list = Backend.executor.sample(logits, tasks).view(-1).cpu().tolist()
+            if self.mtp_size > 1:
+                mtp_token_list = (
+                    [[] for _ in token_list]
+                    if not Backend.model.mtp_token_list
+                    else Backend.model.mtp_token_list
+                )
         else:
             token_list = []
-        tasks, token_list = self.collect_token(tasks, token_list)
+            if self.mtp_size > 1:
+                mtp_token_list = []
+
+        if self.mtp_size > 1:
+            task_mtp = tasks
+
+        if not self.mtp_size > 1:
+            tasks, token_list = self.collect_token(tasks, token_list)
+        else:
+            tasks, token_list, mtp_token_list = self.collect_token(
+                tasks, token_list, mtp_token_list
+            )
+
         if len(token_list) == 0 and not self.is_main_rank:
             return
 
@@ -568,7 +610,19 @@ class ExpertDataDispatcher(TasksDispatcher):
             logger.debug(
                 f"[update_response] task={task.task_id} type={task.task_type.name} token={token_list[it]}"
             )
-            task.update_response_no_sync(token_list[it])
+            if not self.mtp_size > 1:
+                task.update_response_no_sync(token_list[it])
+            else:
+                task.update_response_no_sync(
+                    token_list[it], len(mtp_token_list[it]) + 1
+                )
+                task.mtp_token_list = mtp_token_list[it]
+
+        if self.mtp_size > 1:
+            for it, task in enumerate(task_mtp.output_tasks):
+                task._last_hidden_states = (
+                    Backend.model.last_hidden_states_4_postprocess[it : it + 1, :]
+                )
 
         # Advance prefill progress for all tasks scheduled this step
         if tasks.task_type == TaskType.Prefill:
@@ -684,6 +738,7 @@ class Executor:
             args.models.n_dense_layers if hasattr(args.models, "n_dense_layers") else 0
         )
         self.empty_decode_step_graph = None
+        self.empty_decode_step_graph_mtp = None
         dummy_input_shape = (
             [1, args.models.dim] if is_ascend() else [0, args.models.dim]
         )
@@ -1315,19 +1370,42 @@ class Executor:
 
         if self.ep_size > 1:
 
+            def empty_mlp_mtp():
+                layer_mpt = Backend.model.layers[-1]
+                layer_mpt.mlp(self.dummy_input)
+
             def empty_mlp():
-                for it, layer in enumerate(Backend.model.layers):
+                layer_main = (
+                    Backend.model.layers[0:-1]
+                    if self.mtp_size > 1
+                    else Backend.model.layers
+                )
+                for it, layer in enumerate(layer_main):
                     if it < self.n_dense_layers:
                         continue
                     layer.mlp(self.dummy_input)
 
             if self.use_cuda_graph:
+                if self.empty_decode_step_graph_mtp is None and self.mtp_size > 1:
+                    self.empty_decode_step_graph_mtp = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(self.empty_decode_step_graph_mtp):
+                        empty_mlp_mtp()
+
                 if self.empty_decode_step_graph is None:
                     self.empty_decode_step_graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(self.empty_decode_step_graph):
                         empty_mlp()
+
+                if self.mtp_size > 1:
+                    for i in range(0, self.mtp_size):
+                        self.empty_decode_step_graph_mtp.replay()
+
                 self.empty_decode_step_graph.replay()
             else:
+                if self.mtp_size > 1:
+                    for i in range(0, self.mtp_size):
+                        empty_mlp_mtp()
+
                 empty_mlp()
 
         for dispatcher in self.task_dispatchers:
