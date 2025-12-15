@@ -28,6 +28,7 @@ from chitu.ops import (
     read_from_paged_kv_cache,
 )
 from chitu.utils import try_import_platform_dep
+from chitu.device_type import is_ascend
 
 triton, has_triton = try_import_platform_dep("triton")
 
@@ -176,7 +177,10 @@ class AttnBackend(abc.ABC):
         if not isinstance(kv, torch.Tensor):
             raise NotImplementedError(f"Unsupported type {type(kv)} for kv")
 
-        if seq_len_delta.is_classic_decoding:
+        if seq_len_delta.is_classic_decoding or (
+            seq_len_delta.is_decode_stage
+            and (is_ascend() or self.args.infer.attn_type == "flash_mla")
+        ):
             return self.mla_decode(
                 q_nope,
                 q_pe,

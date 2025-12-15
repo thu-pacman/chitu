@@ -17,7 +17,10 @@ from chitu.device_type import is_muxi
 from chitu.attn_backend import AttnBackend, NpuAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.cache_manager import PagedKVCacheManager, DenseKVCacheManager
-from chitu.cuda_graph import make_dispatched_graphed_callables
+from chitu.cuda_graph import (
+    make_dispatched_graphed_callables,
+    cuda_graph_safe_cached_property,
+)
 from chitu.device_type import is_ascend
 from chitu.global_vars import get_global_args, get_timers
 from chitu.muxi_utils import (
@@ -301,6 +304,8 @@ class Transformer(nn.Module):
                 dtype=torch.bfloat16,
                 device=self.device,
             )
+            self.main_last_hidden_states_up_to_date = False
+            self.lhs_ = None
 
     def _get_tensor_column_parallel_layer_names(self) -> list[str]:
         raise NotImplementedError
@@ -778,6 +783,12 @@ class Transformer(nn.Module):
             ],
         )
 
+    @cuda_graph_safe_cached_property(
+        "main_last_hidden_states_static", "main_last_hidden_states_up_to_date"
+    )
+    def set_main_last_hidden_states_static(self):
+        return self.lhs_
+
     @torch.inference_mode()
     def prefill_no_pipeline(
         self, tokens, output_token_offsets: torch.Tensor, **args
@@ -785,6 +796,7 @@ class Transformer(nn.Module):
         freqs_cis = self.prepare_freqs_cis()
         h = self._pre_layers(tokens, **args)
         if self.mtp_size > 1:
+            self.cache.seq_len_delta.is_decode_stage = False
             self.token_offset_list = None
             self.mtp_token_list = None
             for it, layer in enumerate(self.layers[0:-1]):
@@ -818,8 +830,8 @@ class Transformer(nn.Module):
         else:
             for it, layer in enumerate(self.layers[0:-1]):
                 h = layer(h, freqs_cis, False)
-            lhs_ = self.norm(h, compute_dtype=h.dtype)
-            self.main_last_hidden_states_static.set(lhs_)
+            self.lhs_ = self.norm(h, compute_dtype=h.dtype)
+            self.set_main_last_hidden_states_static
         h = self._post_layers(h)
         h = h.float()
         return h
@@ -849,7 +861,9 @@ class Transformer(nn.Module):
         self.cache.update_page_offs()
         tokens_proposal = torch.stack(token_list[:-1], dim=1).view(-1)
         if self.use_cuda_graph:
+            self.cache.seq_len_delta.is_decode_stage = True
             self.prepare_decoding_attn()
+            self.main_last_hidden_states_up_to_date = False
         else:
             self.attn_backend.prepare_metadata_for_prefill(self.cache.seq_len_delta)
         h = func(key, tokens_proposal)
@@ -858,6 +872,7 @@ class Transformer(nn.Module):
         h = h.view(-1, self.mtp_size, h.shape[-1])
         mlh_ = self.main_last_hidden_states_static.get()
         mtp_last_hidden_states = mlh_.view(-1, self.mtp_size, mlh_.shape[-1])
+        assert h.shape[0] == mtp_last_hidden_states.shape[0]
         matches = tokens_proposal[:, 1:] == tokens_verify[:, :-1]
 
         all_accept = matches.all(dim=1)

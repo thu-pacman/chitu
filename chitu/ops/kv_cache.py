@@ -45,17 +45,17 @@ def append_to_paged_kv_cache(
     """
 
     if impl == "auto":
-        if get_global_args().infer.op_impl == "cpu":
-            impl = "cpu"
-        elif has_triton:
+        if has_triton and get_global_args().infer.op_impl != "cpu":
             impl = "triton"
         else:
             impl = "torch"
-    if impl == "triton" and has_triton:
+
+    if impl == "triton":
+        assert has_triton
         append_to_paged_kv_cache_triton(
             kv_cache, page_table, this_kv, delta_position_ids, delta_seq_ids
         )
-    else:
+    elif impl == "torch":
         append_to_paged_kv_cache_torch(
             kv_cache,
             page_table,
@@ -65,6 +65,32 @@ def append_to_paged_kv_cache(
             get_page_ids,
             get_offs_in_page,
         )
+    else:
+        raise ValueError(f"Unknown implementation: {impl}")
+
+
+def update_singleton_paged_kv_cache(
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    this_kv: torch.Tensor,
+    impl: str = "auto",
+):
+    """
+    Update singleton paged K/V cache.
+
+    Args:
+        kv_cache: (num_pages, 1, other contiguous dims...). Data of the paged K/V cache.
+        page_table: (batch_size, 1). Page table of the paged K/V cache.
+        this_kv: (num_tokens, other contiguous dims...). New K/V value.
+    """
+
+    if impl == "auto":
+        impl = "torch"
+
+    if impl == "torch":
+        update_singleton_paged_kv_cache_torch(kv_cache, page_table, this_kv)
+    else:
+        raise ValueError(f"Unknown implementation: {impl}")
 
 
 def append_to_dense_kv_cache(
@@ -94,7 +120,9 @@ def append_to_dense_kv_cache(
             impl = "triton"
         else:
             impl = "torch"
-    if impl == "triton" and has_triton:
+
+    if impl == "triton":
+        assert has_triton
         append_to_dense_kv_cache_triton(
             kv_cache, this_kv, delta_position_ids, delta_seq_ids
         )
@@ -102,10 +130,13 @@ def append_to_dense_kv_cache(
         append_to_dense_kv_cache_torch(
             kv_cache, this_kv, delta_position_ids, delta_seq_ids
         )
-    elif impl == "torch_npu" and has_torch_npu:
+    elif impl == "torch_npu":
+        assert has_torch_npu
         append_to_dense_kv_cache_torch_npu(
             kv_cache, this_kv, delta_position_ids, delta_seq_ids
         )
+    else:
+        raise ValueError(f"Unknown implementation: {impl}")
 
 
 def append_to_paged_kv_cache_torch(
@@ -144,6 +175,20 @@ def append_to_paged_kv_cache_torch(
 
     kv_cache[page_ids, offs_in_page] = this_kv.view(
         this_kv.shape[0], *kv_cache.shape[2:]
+    )
+
+
+def update_singleton_paged_kv_cache_torch(
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    this_kv: torch.Tensor,
+):
+    # Page size is always 1
+    assert kv_cache.shape[1] == 1
+    assert page_table.shape[1] == 1
+
+    kv_cache[page_table.squeeze(1)] = this_kv.view(
+        this_kv.shape[0], 1, *kv_cache.shape[2:]
     )
 
 
@@ -226,6 +271,26 @@ def read_from_paged_kv_cache(
         raise NotImplementedError(f"Unsupported implementation: {impl}")
 
 
+def read_from_singleton_paged_kv_cache(
+    kv_cache: torch.Tensor, page_table: torch.Tensor, impl: str = "auto"
+) -> torch.Tensor:
+    """
+    Read from singleton paged K/V cache.
+
+    Args:
+        kv_cache: (num_pages, page_size, other contiguous dims...). Data of the paged K/V cache.
+        page_table: (batch_size, num_pages_per_sample). Page table of the paged K/V cache.
+    """
+
+    if impl == "auto":
+        impl = "torch"
+
+    if impl == "torch":
+        return read_from_singleton_paged_kv_cache_torch(kv_cache, page_table)
+    else:
+        raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
 def read_from_dense_kv_cache(
     kv_cache: torch.Tensor,
     position_ids: torch.Tensor,
@@ -267,6 +332,12 @@ def read_from_paged_kv_cache_torch(
         page_table[seq_ids, position_ids // kv_cache.shape[1]],
         position_ids % kv_cache.shape[1],
     ]
+
+
+def read_from_singleton_paged_kv_cache_torch(
+    kv_cache: torch.Tensor, page_table: torch.Tensor
+) -> torch.Tensor:
+    return kv_cache[page_table.squeeze(1)].squeeze(1)
 
 
 def read_from_dense_kv_cache_torch(

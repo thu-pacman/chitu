@@ -368,7 +368,6 @@ class PagedKVCacheManager(KVCacheManagerBase):
         device="cuda",
         block_size: int = 512,  # must be a multiple of 256 for FlashAttention
         num_blocks: int = -1,
-        lazy_mode=False,
     ):
         super().__init__(
             layer_id_map,
@@ -381,11 +380,11 @@ class PagedKVCacheManager(KVCacheManagerBase):
             device=device,
         )
 
-        self.max_blocks_per_req = 1 if lazy_mode else ceil_div(max_seq_len, block_size)
+        self.max_blocks_per_req = ceil_div(max_seq_len, block_size)
         self.max_num_blocks = self.max_blocks_per_req * num_hot_req
         if num_blocks == -1:  # Being warmed-up
             # Should be consistent with `_warmup_via_taskpool` in `chitu_main.py`
-            if get_global_args().infer.prefill_chunk_size is None or lazy_mode:
+            if get_global_args().infer.prefill_chunk_size is None:
                 self.num_blocks = num_hot_req
             else:
                 self.num_blocks = (
@@ -407,7 +406,8 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.free_blocks = deque(range(self.num_blocks))
         self.paged_kv_cache: dict[str, torch.Tensor] = {}
         logger.info(
-            f"Allocating KV cache to {self.num_blocks} blocks, each of size {self.block_size}"
+            f"Allocating KV cache of {','.join(self.shape_per_token_dict.keys())} with "
+            f"{self.num_blocks} blocks, each of size {self.block_size}"
         )
 
         for key in self.shape_per_token_dict:
@@ -426,7 +426,6 @@ class PagedKVCacheManager(KVCacheManagerBase):
         )
         self._page_ids_up_to_date = False
         self._offs_in_page_up_to_date = False
-        self.lazy_mode = lazy_mode
 
     def get_max_blocks_per_req(self) -> int:
         """Return the maximum number of blocks a single request can occupy."""
@@ -550,14 +549,10 @@ class PagedKVCacheManager(KVCacheManagerBase):
                 self.block_table[req_id] = []
 
             # Allocate blocks for the request
-            if self.lazy_mode:
-                if len(self.block_table[req_id]) == 0:
-                    self.block_table[req_id].append(self.get_free_block())
-            else:
-                needs_blocks = self.num_additional_blocks_req_need(req_id, new_seq_len)
-                self.block_table[req_id].extend(
-                    [self.get_free_block() for _ in range(needs_blocks)]
-                )
+            needs_blocks = self.num_additional_blocks_req_need(req_id, new_seq_len)
+            self.block_table[req_id].extend(
+                [self.get_free_block() for _ in range(needs_blocks)]
+            )
         self._upd_gpu_block_table(req_ids)
 
     def num_additional_blocks_req_need(self, req_id: str, target_seq_len: int) -> int:
@@ -584,14 +579,13 @@ class PagedKVCacheManager(KVCacheManagerBase):
         # Prepare enough block table for next decoding. When decoding, AttnBackend will fill new kv into
         # paged kv cache in place.
         super().prepare_cache_decode(req_ids)
-        if not self.lazy_mode:
-            for i, req_id in enumerate(req_ids):
-                num_additional_blocks = self.num_additional_blocks_req_need(
-                    req_id, self.req_id_to_seq_len[req_id]
-                )
-                self.block_table[req_id].extend(
-                    [self.get_free_block() for _ in range(num_additional_blocks)]
-                )
+        for i, req_id in enumerate(req_ids):
+            num_additional_blocks = self.num_additional_blocks_req_need(
+                req_id, self.req_id_to_seq_len[req_id]
+            )
+            self.block_table[req_id].extend(
+                [self.get_free_block() for _ in range(num_additional_blocks)]
+            )
         self._upd_gpu_block_table(req_ids)
 
     def get_free_block(self):
@@ -691,6 +685,69 @@ class PagedKVCacheManager(KVCacheManagerBase):
             assert 0 <= int(idx) < self.num_blocks, f"invalid page index: {idx}"
         self.block_table[req_id] = list(int(x) for x in page_indices)
         self.req_id_to_seq_len[req_id] = int(prefix_length)
+
+
+class SingletonPagedKVCacheManager(PagedKVCacheManager):
+    """
+    1-token-per-request specialization of PagedKVCacheManager
+
+    For linear attention or RNN states, instead of transformer states.
+    """
+
+    def __init__(
+        self,
+        layer_id_map: GlobalLocalMap,
+        *,
+        num_hot_req: int,
+        shape_per_token_dict: Optional[dict[str, torch.Size | Sequence[int]]] = None,
+        dtype_dict: Optional[dict[str, torch.dtype]] = None,
+        n_local_kv_heads: Optional[int] = None,
+        head_dim: Optional[int] = None,
+        device="cuda",
+    ):
+        super().__init__(
+            layer_id_map,
+            num_hot_req=num_hot_req,
+            max_seq_len=1,
+            shape_per_token_dict=shape_per_token_dict,
+            dtype_dict=dtype_dict,
+            n_local_kv_heads=n_local_kv_heads,
+            head_dim=head_dim,
+            device=device,
+            block_size=1,
+            num_blocks=num_hot_req,
+        )
+
+    @override
+    def num_additional_blocks_req_need(self, req_id: str, target_seq_len: int) -> int:
+        if req_id in self.block_table and len(self.block_table[req_id]) > 0:
+            return 0
+        else:
+            return 1
+
+    @override
+    @cuda_graph_safe_cached_property("_page_ids_static_tensor", "_page_ids_up_to_date")
+    def page_ids(self):
+        return self.gpu_block_table.get().squeeze(1)
+
+    @override
+    @cuda_graph_safe_cached_property("_page_ids_static_tensor", "_page_ids_up_to_date")
+    def page_ids_mtp(self):
+        return self.gpu_block_table.get().squeeze(1)
+
+    @override
+    @cuda_graph_safe_cached_property(
+        "_offs_in_page_static_tensor", "_offs_in_page_up_to_date"
+    )
+    def offs_in_page(self):
+        return torch.zeros_like(self.seq_len_delta.delta_lens_tensor_device)
+
+    @override
+    @cuda_graph_safe_cached_property(
+        "_offs_in_page_static_tensor", "_offs_in_page_up_to_date"
+    )
+    def offs_in_page_mtp(self):
+        return torch.zeros_like(self.mtp_seq_len_delta.delta_lens_tensor_device)
 
 
 class DenseKVCacheManager(KVCacheManagerBase):

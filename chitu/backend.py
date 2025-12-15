@@ -29,7 +29,12 @@ from chitu.attn_backend import (
     NpuAttnBackend,
     HybridAttnBackend,
 )
-from chitu.cache_manager import DenseKVCacheManager, PagedKVCacheManager, GlobalLocalMap
+from chitu.cache_manager import (
+    DenseKVCacheManager,
+    PagedKVCacheManager,
+    SingletonPagedKVCacheManager,
+    GlobalLocalMap,
+)
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
 from chitu.distributed.parallel_state import (
@@ -478,16 +483,12 @@ class Backend:
         local_layers = layer_filter_fn(range(local_begin_layer_id, local_end_layer_id))
         layer_id_map = GlobalLocalMap.from_list(local_layers)
 
-        return PagedKVCacheManager(
+        return SingletonPagedKVCacheManager(
             layer_id_map,
-            max_seq_len=args.infer.max_seq_len,
             num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
             // args.infer.dp_size,
             shape_per_token_dict=Backend._get_linear_attn_cache_params(args),
-            block_size=1,
-            num_blocks=args.infer.num_blocks if num_blocks is None else num_blocks,
             device=local_rank,
-            lazy_mode=True,
         )
 
     @staticmethod
@@ -558,7 +559,6 @@ class Backend:
             block_size=block_size,
             num_blocks=num_blocks,
             device=local_rank,
-            lazy_mode=False,
         )
 
     @staticmethod
