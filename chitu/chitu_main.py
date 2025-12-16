@@ -58,12 +58,11 @@ deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 logger = getLogger(__name__)
 
 
-def init_logger(logging_level=logging.INFO):
+def init_logger():
     setup_chitu_logging()
 
     base_name = __name__.split(".")[0]
     base_logger = getLogger(base_name)
-    base_logger.setLevel(logging_level)
 
     if base_logger.handlers:
         for handler in base_logger.handlers[:]:
@@ -436,7 +435,7 @@ def check_checkpoint_path(args):
         args.models.processor_path = args.models.ckpt_dir
 
 
-def chitu_init(args, logging_level=None):
+def chitu_init(args):
     debug = os.getenv("CHITU_DEBUG", "0") == "1"
 
     if (
@@ -453,9 +452,7 @@ def chitu_init(args, logging_level=None):
     ):
         args.models.n_layers += 1
 
-    if logging_level is None:
-        logging_level = logging.DEBUG if debug else logging.INFO
-    init_logger(logging_level)
+    init_logger()
 
     # Deal with legacy arguments
     if hasattr(args.infer, "soft_fp8") and args.infer.soft_fp8:

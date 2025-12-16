@@ -1224,15 +1224,14 @@ class ParallelMoeBlock(nn.Module):
         weights, indices = self.gate(x)
         rerouted_indices = None
 
-        planner = get_moe_load_planner()
-        if planner is not None:
-            _rank_idx, _slot_idx, global_slot_idx = planner.route_expert_ids(
-                self.layer_id, indices
-            )
-            rerouted_indices = global_slot_idx.to(
-                dtype=indices.dtype, device=indices.device
-            ).contiguous()
-        elif self.expert_mapping is not None and planner is None:
+        if self.is_dynamic:
+            planner = get_moe_load_planner()
+            if planner is not None:
+                global_slot_idx = planner.route_expert_ids(self.layer_id, indices)
+                rerouted_indices = global_slot_idx.to(
+                    dtype=indices.dtype, device=indices.device
+                ).contiguous()
+        elif self.expert_mapping is not None:
             rerouted_indices = self.expert_mapping[indices].contiguous()
         else:
             rerouted_indices = None

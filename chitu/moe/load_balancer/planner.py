@@ -104,14 +104,14 @@ class MoELoadPlanner:
         self._cached_warmup_stats: Dict[int, torch.Tensor] = {}
         self._dirty_layers: set[int] = set()
         self.inv_mappings = torch.zeros(
-            (self.num_layers, self.num_experts, 2),
+            (self.num_layers, self.num_experts, 1),
             dtype=torch.int32,
             device=self._stats_device,
         )
         self._mapping_dev = torch.empty(
             (self.num_layers, self._ep_size, self._local_slot_capacity),
             dtype=torch.int64,
-            device=self._stats_device,
+            device="cpu",
         )
         self.local_slot_expert_stats = torch.zeros(
             (self.num_layers, self._local_slot_capacity),
@@ -122,10 +122,18 @@ class MoELoadPlanner:
             e: [[] for _layer in range(self.num_layers)]
             for e in range(self.num_experts)
         }
+        self.redundant_slots: torch.Tensor = torch.zeros(
+            (self.num_layers, self.global_slot_nums - self.num_experts),
+            dtype=torch.int32,
+            device="cpu",
+        )
         self.lock_stats = False
         # per-layer pending migration ops and planned actions
         self._pending_migration: Dict = {}
         self._init_default_mapping()
+
+        self.layer_ratios = {layer_id: [] for layer_id in range(self.num_layers)}
+        self.record_ratios = False
 
     def set_warmup_mode(self, enabled: bool) -> None:
         """Enable or disable warmup mode.
@@ -193,21 +201,14 @@ class MoELoadPlanner:
             torch.stack(self._mapping[layer_id], dim=0).clone().to(self._stats_device)
         )
 
-    def route_expert_ids(
-        self, layer_id: int, expert_ids: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Map global expert ids to (rank, slot) using pre-built inverse mapping."""
+    def route_expert_ids(self, layer_id: int, expert_ids: torch.Tensor) -> torch.Tensor:
+        """Map global expert ids to (rank, local_slot) using pre-built inverse mapping."""
         inv = self.inv_mappings[layer_id]
         assert (
             inv.shape[0] == self.num_experts
         ), f"inverse mapping is not available for layer {layer_id}"
-        idx = expert_ids.contiguous().view(-1).to(dtype=torch.int32)
-        ranks = inv[idx, 0].contiguous().view_as(expert_ids)
-        slots = inv[idx, 1].contiguous().view_as(expert_ids)
-        ranks_on_in = ranks.to(self._stats_device)
-        slots_on_in = slots.to(self._stats_device)
-        global_slots = ranks_on_in * int(self._local_slot_capacity) + slots_on_in
-        return ranks_on_in, slots_on_in, global_slots
+        gathered = inv[expert_ids]
+        return gathered.view_as(expert_ids).contiguous()
 
     def record_local_activation(
         self, layer_id: int, global_counts: torch.Tensor
@@ -274,12 +275,9 @@ class MoELoadPlanner:
             return
         self.lock_stats = True
 
-        for layer_id in range(self.num_layers):
-            self._stats_tensor[layer_id][
-                self._ep_rank
-                * self._local_slot_capacity : (self._ep_rank + 1)
-                * self._local_slot_capacity
-            ] += self.local_slot_expert_stats[layer_id]
+        start = self._ep_rank * self._local_slot_capacity
+        end = (self._ep_rank + 1) * self._local_slot_capacity
+        self._stats_tensor[:, start:end] += self.local_slot_expert_stats
 
         reduce_buf = self._stats_tensor.clone()
         dist.all_reduce(reduce_buf, op=dist.ReduceOp.SUM)
@@ -295,26 +293,57 @@ class MoELoadPlanner:
 
         if not self.enable or self._in_warmup:
             return
-
-        per_layer_actions: Dict[int, List[AdjustmentAction]] = {}
-        flat_actions = []
-        try:
-            totals_device = self._stats_tensor.sum(
-                dim=1
-            )  # [num_layers] on stats_device
-            totals_cpu = totals_device.to("cpu")  # single sync
-        except Exception:
-            totals_cpu = None
+        flat_actions: List[AdjustmentAction] = []
+        cpu_stats = self._stats_tensor.to(device="cpu")
+        totals = cpu_stats.sum(dim=1)
+        loads_all = cpu_stats.view(
+            self.num_layers, self._ep_size, self._local_slot_capacity
+        ).sum(dim=2)
+        mapping_dev = self._mapping_dev
+        redundant_slots = self.redundant_slots
+        involved_layers = 0
         for lid in range(self.num_layers):
-            total_l = int(totals_cpu[lid].item()) if totals_cpu is not None else None
-            acts = self._plan_layer(lid, total=total_l)
-            per_layer_actions[lid] = acts
+            total_l = totals[lid]
+            temp_counts_l = cpu_stats[lid].clone()
+            loads_l = loads_all[lid].clone()
+            if self.num_experts == self.global_slot_nums:
+                acts = self._plan_layer(
+                    lid,
+                    total_l,
+                )
+            else:
+                acts = self._plan_layer_replace_cpu(
+                    lid,
+                    total_l,
+                    loads_l,
+                    temp_counts_l,
+                    mapping_dev[lid],
+                    redundant_slots[lid],
+                )
             flat_actions.extend(acts)
+            if len(acts) > 0:
+                involved_layers += 1
+
+        # 将layer ratio保存为json
+        if self._ep_rank == 0 and self.record_ratios:
+            import json, os
+
+            file_path = os.path.join(
+                "/home/liurq/lingke/logs/stats", "layer_ratios_dlb.json"
+            )
+            saved_layer_ratios = [
+                {"layer": i, "ratio": self.layer_ratios[i]}
+                for i, ratio in enumerate(self.layer_ratios)
+            ]
+            with open(file_path, "w") as f:
+                json.dump(saved_layer_ratios, f, indent=4)
+            logger.info(f"MoELoadPlanner: saved layer ratios to {file_path}")
 
         if not flat_actions or self._action_executor is None:
-            logger.warning(
-                f"MoELoadPlanner: no actions planned on Rank {self._ep_rank}; skip migration this window"
-            )
+            if self._ep_rank == 0:
+                logger.info(
+                    f"MoELoadPlanner: no actions planned, thus skip migration in this window"
+                )
             self.reset_stats()
             self.lock_stats = False
             return
@@ -326,7 +355,7 @@ class MoELoadPlanner:
             self.lock_stats = False
             if self._ep_rank == 0:
                 logger.info(
-                    f"MoELoadPlanner: launched migration with {len(flat_actions)} actions."
+                    f"MoELoadPlanner: launched migration with {len(flat_actions)} actions in {involved_layers} layers"
                 )
         except Exception as e:
             logger.exception(f"MoELoadPlanner: launching migration failed: {e}")
@@ -338,7 +367,6 @@ class MoELoadPlanner:
         works = self._pending_migration.get("works", [])
         local_ready = True
         for req in works:
-            # 这里有坑
             if not getattr(req, "is_completed", lambda: True)():
                 local_ready = False
                 break
@@ -346,7 +374,7 @@ class MoELoadPlanner:
         if local_ready:
             mask += 1
         dist.all_reduce(mask, op=dist.ReduceOp.MIN)
-        ready_global = int(mask[0].item()) == 1
+        ready_global = mask[0] == 1
 
         return ready_global
 
@@ -358,9 +386,6 @@ class MoELoadPlanner:
         """
         if not self.enable or self._in_warmup or len(self._pending_migration) == 0:
             return
-        ready_global = self._check_layer()
-        if not ready_global:
-            return
         final = self._pending_migration.get("finalize")
         if final is not None:
             try:
@@ -369,7 +394,10 @@ class MoELoadPlanner:
             except Exception as e:
                 logger.warning(f"finalize failed for rank {self._ep_rank}: {e}")
         all_actions = self._pending_migration.get("actions", [])
-        self.apply_actions(all_actions)
+        if self.num_experts == self.global_slot_nums:
+            self.apply_actions(all_actions)
+        else:
+            self.apply_actions_replace(all_actions)
         self._pending_migration = {}
 
     def apply_actions(self, actions: List[AdjustmentAction]) -> None:
@@ -387,26 +415,26 @@ class MoELoadPlanner:
         for act in actions:
             if act.exchange:
                 layer_map = self._mapping[act.layer_id]
+                sender_global_id = (
+                    act.from_rank * self._local_slot_capacity + act.from_slot
+                )
+                receiver_global_id = (
+                    act.to_rank * self._local_slot_capacity + act.to_slot
+                )
                 layer_map[act.to_rank][act.to_slot] = act.from_expert_id
                 layer_map[act.from_rank][act.from_slot] = act.to_expert_id
                 # update mapping dev
                 self._mapping_dev[act.layer_id].copy_(
-                    torch.stack(self._mapping[act.layer_id], dim=0).to(
-                        self._stats_device
-                    )
+                    torch.stack(self._mapping[act.layer_id], dim=0)
                 )
                 # update inverse mapping
                 invmapping_layer = self.inv_mappings[act.layer_id]
-                orig_from_rank = invmapping_layer[act.from_expert_id, 0].item()
-                orig_from_slot = invmapping_layer[act.from_expert_id, 1].item()
-                orig_to_rank = invmapping_layer[act.to_expert_id, 0].item()
-                orig_to_slot = invmapping_layer[act.to_expert_id, 1].item()
-                if orig_from_rank == act.from_rank and orig_from_slot == act.from_slot:
-                    invmapping_layer[act.from_expert_id, 0] = act.to_rank
-                    invmapping_layer[act.from_expert_id, 1] = act.to_slot
-                if orig_to_rank == act.to_rank and orig_to_slot == act.to_slot:
-                    invmapping_layer[act.to_expert_id, 0] = act.from_rank
-                    invmapping_layer[act.to_expert_id, 1] = act.from_slot
+                orig_from_global_id = invmapping_layer[act.from_expert_id, 0].item()
+                orig_to_global_id = invmapping_layer[act.to_expert_id, 0].item()
+                if orig_from_global_id == sender_global_id:
+                    invmapping_layer[act.from_expert_id, 0] = receiver_global_id
+                if orig_to_global_id == receiver_global_id:
+                    invmapping_layer[act.to_expert_id, 0] = sender_global_id
                 self.inv_mappings[act.layer_id] = invmapping_layer
                 # update expert slots
                 slots = self.expert_slots[act.from_expert_id][act.layer_id]
@@ -425,43 +453,66 @@ class MoELoadPlanner:
                 ]
                 slots.append((act.from_rank, act.from_slot))
                 self.expert_slots[act.to_expert_id][act.layer_id] = slots
-            else:
-                layer_map = self._mapping[act.layer_id]
-                layer_map[act.to_rank][act.to_slot] = act.from_expert_id
-                # update mapping dev
-                self._mapping_dev[act.layer_id].copy_(
-                    torch.stack(self._mapping[act.layer_id], dim=0).to(
-                        self._stats_device
-                    )
+
+    def apply_actions_replace(self, actions: List[AdjustmentAction]) -> None:
+        """Apply actions to in-memory mapping only (does not move weights).
+
+        Args:
+            actions: List of actions to apply.
+
+        Behavior:
+            - Updates per-layer mapping so that subsequent routing follows new placement.
+            - Invalidates cached inverse maps so future routing rebuilds from fresh mapping.
+        """
+        if not actions:
+            return
+        for act in actions:
+            sender_global_id = act.from_rank * self._local_slot_capacity + act.from_slot
+            receiver_global_id = act.to_rank * self._local_slot_capacity + act.to_slot
+            layer_map = self._mapping[act.layer_id]
+            layer_map[act.to_rank][act.to_slot] = act.from_expert_id
+            # update mapping dev
+            self._mapping_dev[act.layer_id].copy_(
+                torch.stack(self._mapping[act.layer_id], dim=0)
+            )
+            invmapping_layer = self.inv_mappings[act.layer_id]
+            orig_from_global_id = invmapping_layer[act.from_expert_id, 0].item()
+            orig_to_global_id = invmapping_layer[act.to_expert_id, 0].item()
+            # remove (r, s) from expert slots and then update inverse mapping for every rank
+            slots = self.expert_slots[act.to_expert_id][act.layer_id]
+            slots = [
+                t for t in slots if not (t[0] == act.to_rank and t[1] == act.to_slot)
+            ]
+            if orig_to_global_id == receiver_global_id:
+                idx = self._ep_rank % len(slots)
+                r_sel, s_sel = slots[idx]
+                invmapping_layer[act.to_expert_id, 0] = int(
+                    r_sel
+                ) * self._local_slot_capacity + int(s_sel)
+            self.expert_slots[act.to_expert_id][act.layer_id] = slots
+            # add (r, s) to expert slots and then update inverse mapping, split token volume, half goes to (to_rank, to_slot), half remains on (from_rank, from_slot)
+            slots = self.expert_slots[act.from_expert_id][act.layer_id]
+            slots.append((act.from_rank, act.from_slot))
+            if orig_from_global_id == sender_global_id:
+                if self._ep_rank % 2 == 0:
+                    r_sel, s_sel = act.to_rank, act.to_slot
+                    invmapping_layer[act.from_expert_id, 0] = int(
+                        r_sel
+                    ) * self._local_slot_capacity + int(s_sel)
+            self.expert_slots[act.from_expert_id][act.layer_id] = slots
+            self.inv_mappings[act.layer_id] = invmapping_layer
+            # finally update redundant_slots
+            # Map (to_rank, to_slot) to global slot index and then to redundant index
+            global_slot = act.to_rank * self._local_slot_capacity + act.to_slot
+            change_idx = global_slot - self.num_experts
+            if change_idx < 0 or change_idx >= (
+                self.global_slot_nums - self.num_experts
+            ):
+                logger.error(
+                    f"MoELoadPlanner: invalid change_idx {change_idx} (global_slot={global_slot}) for layer {act.layer_id}"
                 )
-                invmapping_layer = self.inv_mappings[act.layer_id]
-                orig_from_rank = invmapping_layer[act.from_expert_id, 0].item()
-                orig_from_slot = invmapping_layer[act.from_expert_id, 1].item()
-                orig_to_rank = invmapping_layer[act.to_expert_id, 0].item()
-                orig_to_slot = invmapping_layer[act.to_expert_id, 1].item()
-                # remove (r, s) from expert slots and then update inverse mapping for every rank
-                slots = self.expert_slots[act.to_expert_id][act.layer_id]
-                slots = [
-                    t
-                    for t in slots
-                    if not (t[0] == act.to_rank and t[1] == act.to_slot)
-                ]
-                if orig_to_rank == act.to_rank and orig_to_slot == act.to_slot:
-                    idx = self._ep_rank % len(slots)
-                    r_sel, s_sel = slots[idx]
-                    invmapping_layer[act.to_expert_id, 0] = int(r_sel)
-                    invmapping_layer[act.to_expert_id, 1] = int(s_sel)
-                self.expert_slots[act.to_expert_id][act.layer_id] = slots
-                # add (r, s) to expert slots and then update inverse mapping, split token volume, half goes to (to_rank, to_slot), half remains on (from_rank, from_slot)
-                slots = self.expert_slots[act.from_expert_id][act.layer_id]
-                slots.append((act.from_rank, act.from_slot))
-                if orig_from_rank == act.from_rank and orig_from_slot == act.from_slot:
-                    if self._ep_rank % 2 == 0:
-                        r_sel, s_sel = act.from_rank, act.from_slot
-                        invmapping_layer[act.from_expert_id, 0] = int(r_sel)
-                        invmapping_layer[act.from_expert_id, 1] = int(s_sel)
-                self.expert_slots[act.from_expert_id][act.layer_id] = slots
-                self.inv_mappings[act.layer_id] = invmapping_layer
+                return
+            self.redundant_slots[act.layer_id, change_idx] = act.from_expert_id
 
     def _init_default_mapping(self) -> None:
         """Initialize per-layer default mapping and stats; also build inverse mappings."""
@@ -510,8 +561,7 @@ class MoELoadPlanner:
                 chosen_rank = self._ep_rank
                 idx = chosen_rank % k
                 r_sel, s_sel = slots[idx]
-                inv_layer[e, 0] = int(r_sel)
-                inv_layer[e, 1] = int(s_sel)
+                inv_layer[e, 0] = int(r_sel) * self._local_slot_capacity + int(s_sel)
 
     def _plan_layer(self, layer_id: int, total: int) -> List[AdjustmentAction]:
         # TODO: 后面考虑使用多种方法，用子类继承重写
@@ -565,5 +615,87 @@ class MoELoadPlanner:
                     f" donor_rank={donor}, slot_id={donor_slot}  (load:{donor_load_val}),"
                     f" receiver_rank={receiver}, slot_id={receiver_slot} (load: {receiver_load_val}),"
                 )
+
+        return actions
+
+    def _plan_layer_replace_cpu(
+        self,
+        layer_id: int,
+        total: torch.Tensor,
+        loads: torch.Tensor,
+        slot_count: torch.Tensor,
+        mapping_dev: torch.Tensor,
+        redundant_slots: torch.Tensor,
+        max_moves: int = 3,
+    ) -> List[AdjustmentAction]:
+        """Pure-CPU version of _plan_layer_replace"""
+        if isinstance(total, torch.Tensor):
+            if total.item() == 0:
+                return []
+            mean_load = total.item() / float(self._ep_size)
+        else:
+            if total == 0:
+                return []
+            mean_load = total / float(self._ep_size)
+
+        loads_cpu = loads
+        slot_count_cpu = slot_count
+        mapping_dev_cpu = mapping_dev
+        redundant_slots_cpu = redundant_slots
+
+        actions: List[AdjustmentAction] = []
+
+        for _r in range(max_moves):
+            # 找最忙 rank
+            donor_load_val, donor_idx = torch.max(loads_cpu, dim=0)
+            donor_r = int(donor_idx.item())
+            ratio = float(donor_load_val.item()) / float(mean_load)
+            if _r == 0:
+                if self.record_ratios:
+                    self.layer_ratios[layer_id].append(ratio)
+            if ratio < self.planner_threshold:
+                break
+
+            # 在冗余槽中找最闲 slot
+            receiver_slot_vals, receiver_slot_idx = torch.min(
+                slot_count_cpu[self.num_experts :], dim=0
+            )
+
+            receiver_slot_idx = receiver_slot_idx.to(dtype=torch.int64)
+            to_expert_id = int(
+                redundant_slots_cpu[int(receiver_slot_idx.item())].item()
+            )
+            receiver_global_slot = int(receiver_slot_idx.item()) + self.num_experts
+            receiver_r = receiver_global_slot // self._local_slot_capacity
+            receiver_s = receiver_global_slot % self._local_slot_capacity
+
+            if donor_r == receiver_r:
+                continue
+
+            donor_ids = mapping_dev_cpu[donor_r]
+            donor_start = donor_r * self._local_slot_capacity
+            donor_end = (donor_r + 1) * self._local_slot_capacity
+            donor_counts = slot_count_cpu[donor_start:donor_end]
+
+            donor_s = int(torch.argmax(donor_counts).item())
+            donor_slot_load = donor_counts[donor_s]
+
+            action = MoveExpertAction(
+                layer_id=layer_id,
+                from_expert_id=int(donor_ids[donor_s].item()),
+                to_expert_id=to_expert_id,
+                from_rank=donor_r,
+                to_rank=receiver_r,
+                from_slot=donor_s,
+                to_slot=receiver_s,
+                exchange=False,
+            )
+            actions.append(action)
+
+            reduce_load = donor_slot_load // 2
+            loads_cpu[donor_r] -= reduce_load
+            slot_count_cpu[donor_r * self._local_slot_capacity + donor_s] -= reduce_load
+            loads_cpu[receiver_r] += reduce_load - receiver_slot_vals
+            slot_count_cpu[receiver_global_slot] += reduce_load - receiver_slot_vals
 
         return actions

@@ -246,7 +246,7 @@ def main(args: ServeConfig):
 
     adjust_benchmark_args(args)
 
-    chitu_init(args, logging_level=logging.INFO)
+    chitu_init(args)
     torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 
     timers = get_timers()

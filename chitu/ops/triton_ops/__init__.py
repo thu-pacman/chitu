@@ -47,3 +47,4 @@ from chitu.ops.triton_ops.attn import (
     mla_decode_dense_kv_triton,
     mla_decode_topk_ragged_qkvo_triton,
 )
+from chitu.ops.triton_ops.norm_gate import rms_norm_gate_triton

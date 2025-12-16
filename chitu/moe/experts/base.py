@@ -10,6 +10,7 @@ from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
     IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
+    IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
     PerExpertDenseBatchedRoutedActivation,
 )
 from chitu.utils import (
@@ -138,7 +139,11 @@ def fused_experts_wrapper(
     elif impl == "ep_group_gemm_contiguous":
         if w1.dtype == torch.float8_e4m3fn and has_deep_gemm:
             assert isinstance(
-                hidden_states, IndexedBatchedRoutedActivationWithPaddedPerExpertCnt
+                hidden_states,
+                (
+                    IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
+                    IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
+                ),
             )
             return deepgemm_contiguous_fused_expert(
                 hidden_states,

@@ -7,10 +7,12 @@ from typing import Optional
 from typing_extensions import override
 import functools
 
+from chitu.device_type import is_blackwell
+from chitu.global_vars import get_global_args
 import torch
 
 from chitu.distributed.parallel_state import get_ep_group, get_tp_size, get_tp_group
-from chitu.utils import try_import_opt_dep
+from chitu.utils import parse_dtype, try_import_opt_dep
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
@@ -84,6 +86,33 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
     ) -> tuple[
         IndexedBatchedRoutedActivationWithPaddedPerExpertCnt, Optional[torch.Tensor]
     ]:
+
+        dispatch_use_fp8 = False
+        if (
+            may_fuse_quant == "blockfp8"
+            and may_fuse_quant_kwargs.get("block_size", 128) == 128
+            and parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
+            <= 1
+        ):
+            dispatch_use_fp8 = True
+        if may_fuse_quant == "blockfp4" and not is_blackwell():
+            dispatch_use_fp8 = True
+        if dispatch_use_fp8:
+            from chitu.ops.quant.blockfp8 import blockfp8_act_quant
+
+            hidden_states_fp8, scale = blockfp8_act_quant(x.activation, block_size=128)
+            return self.token_permutation(
+                IndexedBatchedRoutedActivationBlockfp8(
+                    activation=hidden_states_fp8,
+                    token_to_expert_indices=x.token_to_expert_indices,
+                    activation_scale=scale,
+                ),
+                topk_weights,
+                may_fuse_quant=may_fuse_quant,
+                may_fuse_quant_kwargs=may_fuse_quant_kwargs,
+                layer_id=layer_id,
+            )
+
         dp_local_bs = topk_weights.shape[0]
         (
             recv_activation,
