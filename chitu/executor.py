@@ -960,11 +960,6 @@ class Executor:
         if self.moe_impl is not None:
             self.moe_impl.prepare(tasks.task_type, tasks.num_tokens)
 
-        # logger.info(f"Executor step: {self._lb_step}")
-
-        if tasks.task_type not in [TaskType.EmptyPrefill, TaskType.Prefill]:
-            self._lb_trigger()
-
         if tasks.task_type == TaskType.Prefill:
             out = self.prefill_step(tasks)
         elif tasks.task_type == TaskType.Decode:
@@ -976,6 +971,8 @@ class Executor:
         else:
             raise NotImplementedError
 
+        if tasks.task_type not in [TaskType.EmptyPrefill, TaskType.Prefill]:
+            self._lb_trigger()
         if tasks.task_type not in [TaskType.EmptyPrefill, TaskType.Prefill]:
             self._lb_sync()
         self._lb_step += 1
