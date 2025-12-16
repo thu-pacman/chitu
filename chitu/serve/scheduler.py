@@ -34,7 +34,7 @@ def init_dp_scheduler(args, rank):
 
     logger.info(f"[SCHEDULER] Starting DP Enhanced Scheduler, world_size={world_size}")
 
-    chitu_init(args, logging_level=logging.INFO)
+    chitu_init(args)
     torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 
     # Router process will skip warmup in unified

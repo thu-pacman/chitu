@@ -719,7 +719,7 @@ def init_dp_router(args):
     from chitu.chitu_main import init_logger
     from chitu.global_vars import set_global_args
 
-    init_logger(logging.INFO)
+    init_logger()
     set_global_args(args)
 
     # Router only needs basic args, no Backend initialization required

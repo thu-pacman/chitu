@@ -574,3 +574,22 @@ The benchmark follows the following assumption, and you should keep them consist
 - The output length of each request is fixed to the value you set, even if the answer has ended, which means EOS (end of sequence) is ignored.
 - Default sampling parameters are used. See `class UserRequest` in `chitu/task.py` for default values.
 - There is no caching between requests.
+
+## Environment Variables
+
+Install time:
+
+| Name                       | Possible Values              | Description                                            |
+| -------------------------- | ---------------------------- | ------------------------------------------------------ |
+| `CHITU_WITH_CYTHON`        | `0`, `1`                     | Compile Python sources with Cython.                    |
+| `CHITU_ASCEND_BUILD`       | `0`, `1`                     | Build for Ascend.                                      |
+| `CHITU_HYGON_BUILD`        | `0`, `1`                     | Build for Hygon.                                       |
+| `CHITU_MUXI_BUILD`         | `0`, `1`                     | Build for Muxi (MetaX).                                |
+| `CHITU_SETUP_JOBS`         | Integer                      | Number of processes for compiling.                     |
+
+Runtime:
+
+| Name                       | Possible Values              | Description                                            |
+| -------------------------- | ---------------------------- | ------------------------------------------------------ |
+| `CHITU_LOGGING_LEVEL`      | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` | Logging level.                      |
+| `CHITU_DEBUG`              | `0`, `1`                     | Debug mode. Currently this flag enables some timers.   |
