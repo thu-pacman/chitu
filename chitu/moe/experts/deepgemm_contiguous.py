@@ -212,7 +212,7 @@ def _(
         out = torch.empty(
             topk_weights.shape[0],
             K,
-            device=hidden_states.activation.device,
+            device=hidden_states.blocked_activation.device,
             dtype=torch.bfloat16,
         )
 
