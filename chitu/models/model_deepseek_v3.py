@@ -1112,7 +1112,7 @@ class TransformerDeepSeekV3(Transformer):
         normal_start_layer = 0
         normal_end_layer = len(self.layers) 
         end_layer = len(self.layers) 
-        if args['can_run_tbo']:
+        if args['enable_tbo']:
             if (
                 self.n_dense_layers > normal_start_layer
                 and self.n_dense_layers < normal_end_layer
@@ -1140,7 +1140,7 @@ class TransformerDeepSeekV3(Transformer):
         normal_start_layer = 0
         normal_end_layer = len(self.layers) 
         end_layer = len(self.layers) 
-        if args['can_run_tbo']:
+        if args['enable_tbo']:
             if (
                 self.n_dense_layers > normal_start_layer
                 and self.n_dense_layers < normal_end_layer

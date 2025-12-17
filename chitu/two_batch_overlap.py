@@ -139,7 +139,7 @@ class TboPackedTasksPreparer:
         else:
             tbo_split_seq_index = 0
             
-        can_run_tbo = all([
+        enable_tbo = all([
             enable_deepep_moe,
             enable_two_batch_overlap,
             tbo_split_seq_index is not None,
@@ -150,7 +150,7 @@ class TboPackedTasksPreparer:
             get_global_args().infer.cache_type == "paged"
         ])
         
-        if enable_two_batch_overlap and not can_run_tbo:
+        if enable_two_batch_overlap and not enable_tbo:
             msg = ""
             if not enable_deepep_moe:
                 msg += "TBO requires DeepEP to be enabled\n"
@@ -164,13 +164,13 @@ class TboPackedTasksPreparer:
                 msg += "TBO requires tbo_split_seq_index > 0"
             raise ValueError(msg)
             
-        if can_run_tbo:
+        if enable_tbo:
             packed.tbo_split_seq_index = tbo_split_seq_index
-            packed.can_run_tbo  = True
+            packed.enable_tbo = True
             cls.prepare_raw(packed)
         else:
             packed.tbo_split_seq_index = 0
-            packed.can_run_tbo  = False
+            packed.enable_tbo = False
             return
 
     @classmethod

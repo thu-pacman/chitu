@@ -954,7 +954,7 @@ class Executor:
             grid_thw=self.vision_tensor_broadcast(
                 getattr(tasks, "grid_thw", None), 2, torch.int64, stack=False
             ),
-            can_run_tbo=tasks.can_run_tbo,
+            enable_tbo=tasks.enable_tbo,
             tbo_split_token_index=tasks.tbo_split_token_index,
         )
         self.timers("prefill").stop()
@@ -1172,7 +1172,7 @@ class Executor:
         out = Backend.model.decode(
             payload,
             len(tasks.req_ids),
-            can_run_tbo=tasks.can_run_tbo,
+            enable_tbo=tasks.enable_tbo,
             tbo_split_token_index=tasks.tbo_split_token_index,
         )
         self.timers("decode").stop()
