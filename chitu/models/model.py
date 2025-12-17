@@ -866,6 +866,11 @@ class Transformer(nn.Module):
             self.prepare_decoding_attn()
         else:
             self.attn_backend.prepare_metadata_for_prefill(self.cache.seq_len_delta)
+            if (
+                self.moe_impl is not None
+                and self.moe_impl.decode_token_dispatcher_impl == "allgather"
+            ):
+                self.moe_impl.prepare(TaskType.Decode, tokens_proposal.shape[0])
         h = func(key, tokens_proposal)
         tokens_proposal = tokens_proposal.view(-1, self.mtp_size)
         tokens_verify = torch.argmax(h, dim=-1).view(-1, self.mtp_size)

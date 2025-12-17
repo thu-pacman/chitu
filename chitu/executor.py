@@ -1321,6 +1321,13 @@ class Executor:
                     for i in range(0, self.mtp_size):
                         empty_mlp_mtp()
 
+                if (
+                    self.mtp_size > 1
+                    and self.moe_impl is not None
+                    and self.moe_impl.decode_token_dispatcher_impl == "allgather"
+                ):
+                    self.moe_impl.prepare(TaskType.Decode, self.dummy_input.shape[0])
+
                 empty_mlp()
 
         for dispatcher in self.task_dispatchers:
