@@ -35,6 +35,7 @@ from chitu.task import (
     UserRequest,
     MockFixedLengthedUserRequest,
     DPTaskCollector,
+    PPTaskCollector,
 )
 from chitu.utils import (
     gen_req_id,
@@ -303,7 +304,7 @@ def _warmup_via_taskpool(args):
         get_dp_group().barrier()
     chitu_run()
 
-    if args.infer.has_schedule_overlap:
+    if args.infer.schedule_overlap:
         chitu_run()
 
     # endtask
@@ -499,10 +500,6 @@ def chitu_init(args):
             )
             args.infer.prefill_chunk_size = None
 
-    args.infer.has_schedule_overlap = (
-        args.infer.dp_size <= 1 and args.infer.pp_size <= 1
-    )
-
     # Bind process to CPU NUMA
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
@@ -566,6 +563,13 @@ def chitu_init(args):
         else:
             args.infer.use_cuda_graph = True
 
+    # pp and mtp does not support schedule overlap
+    if args.infer.schedule_overlap == "auto":
+        if args.infer.pp_size > 1:
+            args.infer.schedule_overlap = False
+        else:
+            args.infer.schedule_overlap = True
+
     # Check checkpoint exists
     check_checkpoint_path(args)
 
@@ -627,54 +631,7 @@ def remove_kvcache_all_device(remove_task_ids):
 
 
 @torch.inference_mode()
-def chitu_run_normal():
-    task_ids = Backend.scheduler.schedule()
-
-    if task_ids or DPTaskCollector.has_available_tasks():
-        # compute
-        logger.debug(f"Processing {task_ids}")
-        tasks = PackedTasks(task_ids)
-
-        tokens = Backend.executor.step(tasks)
-        num_tokens = (
-            0
-            if tokens is None
-            else (int(tokens.numel()) if hasattr(tokens, "numel") else len(tokens))
-        )
-        logger.debug(f"[run] executor.step returned tokens={num_tokens}")
-
-        # postprocess
-        last_batch_results = None
-        if len(Backend.last_batch_results) > 0 and Backend.args.infer.dp_size <= 1:
-            last_batch_results = Backend.last_batch_results.popleft()
-        if last_batch_results:
-            Backend.executor.postprocess_async_part(last_batch_results)
-
-        if Backend.args.infer.dp_size > 1:
-            tasks = DPTaskCollector.get_total_packedtasks()
-            tasks.batch_update_status()
-            task_ids = tasks.task_ids
-            logger.debug(
-                f"[run] DPTaskCollector total_packed num_tasks={tasks.num_tasks} output_tasks={len(tasks.output_tasks)}"
-            )
-            DPTaskCollector.clear()
-        else:
-            Backend.executor.postprocess_sync_part(
-                tasks,
-                tokens,
-                keep_device=(Backend.args.infer.dp_size <= 1 or True),
-            )
-        # tasks from the model-running tasks (task_ids) which will not run anymore
-        removed_decode_task_ids = Backend.scheduler.update(task_ids)
-        remove_kvcache_all_device(removed_decode_task_ids)
-    elif len(Backend.last_batch_results) > 0:
-        # ensure the last batch result is processed
-        last_batch_results = Backend.last_batch_results.popleft()
-        Backend.executor.postprocess_async_part(last_batch_results)
-
-
-@torch.inference_mode()
-def chitu_run_pp():
+def chitu_run_main_rank():
     task_ids = Backend.scheduler.schedule()
 
     if task_ids or DPTaskCollector.has_available_tasks():
@@ -682,20 +639,24 @@ def chitu_run_pp():
         logger.debug(f"Processing {task_ids}")
         tasks = PackedTasks(task_ids)
         Backend.executor.step(tasks)
+    else:
+        Backend.executor.empty_step()
 
-    # postprocess async part
-    if len(Backend.last_batch_results) > 0:
-        last_batch_results = Backend.last_batch_results.popleft()
-        Backend.executor.postprocess_async_part(last_batch_results)
-
-    # postprocess sync part
     if Backend.args.infer.dp_size > 1:
         if DPTaskCollector.has_available_tasks():
-            task_ids = DPTaskCollector.get_total_packedtasks().task_ids
+            tasks = DPTaskCollector.get_total_packedtasks()
+            task_ids = tasks.task_ids
+            logger.debug(
+                f"[run] DPTaskCollector total_packed num_tasks={tasks.num_tasks} output_tasks={len(tasks.output_tasks)}"
+            )
             DPTaskCollector.clear()
         else:
             task_ids = []
-    unwait_task_ids = Backend.executor._process_ongoing_tasks()
+    unwait_task_ids = []
+    if Backend.args.infer.pp_size > 1:
+        unwait_task_ids = PPTaskCollector.unwait_task_ids()
+        PPTaskCollector.clear()
+    # tasks from the model-running tasks (task_ids) which will not run anymore
     removed_decode_task_ids = Backend.scheduler.update(task_ids, unwait_task_ids)
     remove_kvcache_all_device(removed_decode_task_ids)
 
@@ -706,11 +667,7 @@ def chitu_run():
     if rank != 0:
         Backend.executor.step(None)
         return
-
-    if Backend.args.infer.pp_size > 1:
-        chitu_run_pp()
-    else:
-        chitu_run_normal()
+    chitu_run_main_rank()
 
 
 async def start_enhanced_scheduler_service(rank: int, dp_config, args):
@@ -815,8 +772,8 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
                 stats = {
                     "scheduler_id": dp_config.dp_id,
                     "running_requests": (
-                        len(Backend.ongoing_reqs)
-                        if hasattr(Backend, "ongoing_reqs")
+                        len(PPTaskCollector._ongoing_reqs)
+                        if hasattr(PPTaskCollector, "_ongoing_reqs")
                         else 0
                     ),
                     "waiting_requests": (

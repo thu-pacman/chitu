@@ -392,7 +392,9 @@ class Task:
             self.response = DeviceList([], dtype=torch.long, device="cuda")
         self.num_new_tokens: int = 0
         self.next_token: int = -1  # Only effective when num_new_tokens > 0
+        self.num_new_tokens_single_step: int = 1
         self.mtp_token_list: list[int] = []
+        self.generated_result: Optional[torch.Tensor] = None
         self.record_next_token: Union[int, torch.Tensor, None] = None
         self.sync_new_token: bool = True
 
@@ -433,7 +435,7 @@ class Task:
 
         has_schedule_overlap = (
             getattr(Backend.args, "infer", False)
-            and Backend.args.infer.has_schedule_overlap
+            and Backend.args.infer.schedule_overlap
         )
         self.has_model_run = (
             self._has_model_run_schedule_overlap
@@ -477,9 +479,7 @@ class Task:
             self._decode_status = TaskDecodeType.WillStopLength
         return self._decode_status
 
-    def update_response_no_sync(
-        self, token: Union[int, torch.Tensor], token_offset: int = 1
-    ):
+    def update_response_no_sync(self, token: Union[int, torch.Tensor]):
         """
         Update task state with a generated token (for Decode phase).
 
@@ -514,9 +514,9 @@ class Task:
             self.record_next_token = token
             self.next_token = self.req._test_standard_tokens[self.num_new_tokens].item()
 
-        self.num_new_tokens += token_offset
+        self.num_new_tokens += self.num_new_tokens_single_step
         if self.req is not None:
-            self.req.num_remain_tokens += token_offset
+            self.req.num_remain_tokens += self.num_new_tokens_single_step
         self.sync_new_token = False
 
     def update_prefix(self):
@@ -732,7 +732,7 @@ def req_decode(id_num: int):
 @dataclass
 class BatchResult:
     """
-    param of postprocess_async_part, returned by postprocess_sync_part.
+    param of postprocess_async_part,
     stored in CPU, synchronized from GPU by batch_sync.
     """
 
@@ -1032,10 +1032,19 @@ class PackedTasksBase:
 
 
 class PackedTasks(PackedTasksBase):
-    def __init__(self, task_ids: list[str], rank="cuda"):
+    def __init__(
+        self,
+        task_ids: list[str],
+        rank="cuda",
+        empty_task_type: Optional[TaskType] = None,
+        tasks: Optional[list[Task]] = None,
+    ):
         super().__init__()
 
         self.tasks: list[Task] = [TaskPool.pool[tid] for tid in task_ids]
+        if tasks is not None:
+            task_ids = [task.task_id for task in tasks]
+            self.tasks = tasks
         self.output_tasks = [task for task in self.tasks if task.has_output()]
         self.should_apply_frequency_penalty = any(
             task.params.frequency_penalty > 0 for task in self.output_tasks
@@ -1044,15 +1053,17 @@ class PackedTasks(PackedTasksBase):
             getattr(task.req, "logprobs", False) for task in self.output_tasks
         )
 
-        if not task_ids:  # only dp rank0 use this method to create empty packedtasks
+        if not task_ids:  # empty PackedTasks, only dp/dp+pp use this method
             self._test_flag = False  # dp no single_req_compare
-            task_type = DPTaskCollector.get_current_task_type()
-            if task_type == TaskType.Prefill:
+            self.task_type = (
+                empty_task_type
+                if empty_task_type is not None
+                else DPTaskCollector.get_current_task_type()
+            )
+            if self.task_type == TaskType.Prefill:
                 self.task_type = TaskType.EmptyPrefill
-            elif task_type == TaskType.Decode:
+            elif self.task_type == TaskType.Decode:
                 self.task_type = TaskType.EmptyDecode
-            else:
-                assert False
             self.payload_type = SerializedPackedTasksPayloadType(self.task_type.value)
             return
 
@@ -1112,6 +1123,11 @@ class PackedTasks(PackedTasksBase):
             pin_memory=True,
         ).to(device=self.rank, non_blocking=True)
 
+        # user request related
+        self.generated_result: Optional[torch.Tensor] = None
+        self.logprobs: Optional[torch.Tensor] = None
+        self.token_idxs: Optional[torch.Tensor] = None
+
         if self.should_apply_frequency_penalty:
             if PackedTasksBase.response_list_manager is None:
                 if args.infer.op_impl == "cpu":
@@ -1161,7 +1177,7 @@ class PackedTasks(PackedTasksBase):
         self.tasks = []
         self.output_tasks = []
         for it, task in enumerate(all_tasks):
-            if Backend.args.infer.has_schedule_overlap:
+            if Backend.args.infer.schedule_overlap:
                 # use cached status
                 if self.has_model_run[it]:
                     self.tasks.append(task)
@@ -1197,51 +1213,75 @@ class PackedTasks(PackedTasksBase):
             if self.task_type == TaskType.Decode:
                 self.task_type = TaskType.EmptyDecode
 
-    def get_result_shape(self) -> tuple[int, int]:
-        result_length_per_task = Backend.executor.mtp_size + (
-            Backend.model.vocab_size * 2 if self.return_logprobs else 0
+    def get_result_len(self) -> int:
+        result_length_per_task = (
+            Backend.executor.mtp_size
+            + Backend.model.vocab_size
+            * ((2 if self.return_logprobs else 0) + (1 if self._test_flag else 0))
         )
-        return (len(self.output_tasks), result_length_per_task)
+        return result_length_per_task
 
     def pack_result(
         self,
         tokens: torch.Tensor,
         logprobs: Optional[torch.Tensor] = None,
         token_idxs: Optional[torch.Tensor] = None,
+        logits: Optional[torch.Tensor] = None,
     ):
-        tokens = tokens.to(dtype=torch.int32).view(len(self.output_tasks), -1)
-        if logprobs is None:
-            return tokens
-        logprobs = logprobs.view(dtype=torch.int32)
-        token_idxs = token_idxs.to(dtype=torch.int32)
-        return torch.cat((tokens, logprobs, token_idxs), dim=-1)
+        """
+        Result format: [num_tasks, result_length] = num_tasks x (tokens, logprobs, token_idxs, logits)
+        """
+        results = tokens.to(dtype=torch.int32).view(len(self.output_tasks), -1)
+        if self.return_logprobs:
+            logprobs = logprobs.view(dtype=torch.int32)
+            token_idxs = token_idxs.to(dtype=torch.int32)
+            results = torch.cat((results, logprobs, token_idxs), dim=-1)
+        if self._test_flag:
+            logits = logits.view(dtype=torch.int32)
+            results = torch.cat((results, logits), dim=-1)
+        return results
 
-    def unpack_result(
-        self, result: torch.Tensor
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    def unpack_result(self, result: torch.Tensor) -> tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        if not self.return_logprobs and not self._test_flag:
+            return result.view(-1).to(dtype=torch.int64), None, None, None
         result = result.view(len(self.output_tasks), -1)
-        if not self.return_logprobs:
-            result = result.to(dtype=torch.int64)
-            return (result, None, None)
-        tokens, logprobs, token_ids = result.split(
-            (1, Backend.model.vocab_size, Backend.model.vocab_size)
+        len_logprobs, len_token_idxs, len_logits = 0, 0, 0
+        if self.return_logprobs:
+            len_logprobs = Backend.model.vocab_size
+            len_token_idxs = Backend.model.vocab_size
+        if self._test_flag:
+            len_logits = Backend.model.vocab_size
+        tokens, logprobs, token_idxs, logits = result.split(
+            (1, len_logprobs, len_token_idxs, len_logits), dim=-1
         )
-        tokens = tokens.to(dtype=torch.int64)
-        logprobs = logprobs.view(dtype=torch.float)
-        token_ids = token_ids.to(dtype=torch.int64)
-        return (tokens, logprobs, token_ids)
+        tokens = tokens.view(-1).to(dtype=torch.int64)
+        if self.return_logprobs:
+            logprobs = logprobs.view(dtype=torch.float)
+            token_idxs = token_idxs.to(dtype=torch.int64)
+        else:
+            logprobs, token_idxs = None, None
+        if self._test_flag:
+            logits = logits.view(dtype=torch.float)
+        else:
+            logits = None
+        return tokens, logprobs, token_idxs, logits
 
     def get_batch_result(self, tasks: list[Task] = None) -> BatchResult:
         if not tasks:
             tasks = [task for task in self.tasks if task.has_next_token()]
         if not self.return_logprobs:
             logprobs, token_idxs = None, None
-        elif Backend.args.infer.has_schedule_overlap:
+        elif Backend.args.infer.schedule_overlap:
             logprobs = torch.stack([task.logprobs for task in tasks]).squeeze(1)
             token_idxs = torch.stack([task.token_idxs for task in tasks]).squeeze(1)
         else:
-            logprobs = getattr(self, "logprobs", None)
-            token_idxs = getattr(self, "token_idxs", None)
+            logprobs = self.logprobs
+            token_idxs = self.token_idxs
         return BatchResult(
             num_tasks=len(tasks),
             tasks=tasks,
@@ -1251,6 +1291,29 @@ class PackedTasks(PackedTasksBase):
             token_idxs=token_idxs,
             mtp_token_list=[task.mtp_token_list for task in tasks],
         )
+
+    def update_task_by_result(self, result: Union[list[int], torch.Tensor]):
+        if len(self.output_tasks) == 0:
+            return
+        if not isinstance(result, list):
+            tokens, logprobs, token_idxs, logits = self.unpack_result(result)
+            tokens = tokens.tolist()
+        else:
+            tokens = result
+            logprobs, token_idxs, logits = None, None, None
+        for it, task in enumerate(self.output_tasks):
+            task.update_response_no_sync(tokens[it])
+        if torch.distributed.get_rank() > 0:
+            return
+        if self._test_flag:
+            for it, task in enumerate(self.output_tasks):
+                task.req._test_add_logit(logits[it])
+                task.req._test_add_token(tokens[it])
+        if self.return_logprobs:
+            self.logprobs = logprobs.cpu()
+            self.token_idxs = token_idxs.cpu()
+        self.batch_sync()
+        self.batch_update_status()
 
     def batch_update_status(self):
         for task in self.tasks:
@@ -1318,11 +1381,15 @@ def deserialize_prefill_tasks(data: bytes) -> PackedTasks:
     if len(task_ids) > 0:
         return PackedTasks(task_ids)
     else:
-        return PackedTasksBase(
-            num_tasks=0,
-            task_type=TaskType.EmptyPrefill,
-            payload_type=SerializedPackedTasksPayloadType.EmptyPrefill,
-        )
+        return PackedTasks([], empty_task_type=TaskType.EmptyPrefill)
+
+
+@dataclass
+class OngoingRequests:
+    waiting_task: PackedTasks
+    handle: torch.distributed.distributed_c10d.Work
+    results: torch.Tensor
+    dp_src: int = 0
 
 
 class DPTaskCollector:
@@ -1434,3 +1501,75 @@ class DPTaskCollector:
     def get_collected_tokens_tensor():
         collect_tokens = [t for t in DPTaskCollector._collected_tokens if t is not None]
         return torch.concat(collect_tokens, dim=0)
+
+
+class PPTaskCollector:
+    """
+    Used to wait ongoing tasks in pipe parallelism
+
+    """
+
+    _ongoing_reqs: list[OngoingRequests] = []
+    _unwait_tasks: list[PackedTasks] = []
+
+    @staticmethod
+    def num_ongoing_reqs():
+        return len(PPTaskCollector._ongoing_reqs)
+
+    @staticmethod
+    def reset():
+        PPTaskCollector._ongoing_reqs = []
+        PPTaskCollector._unwait_tasks = []
+
+    @staticmethod
+    def clear():
+        PPTaskCollector._unwait_tasks = []
+
+    @staticmethod
+    def unwait_task_ids():
+        return [
+            task_id
+            for tasks in PPTaskCollector._unwait_tasks
+            for task_id in tasks.task_ids
+        ]
+
+    @staticmethod
+    def add_new_ongoing(
+        tasks: PackedTasks,
+        handle: torch.distributed.distributed_c10d.Work,
+        results: torch.Tensor,
+        dp_src: int = 0,
+    ):
+        PPTaskCollector._ongoing_reqs.append(
+            OngoingRequests(tasks, handle, results, dp_src)
+        )
+        for task in tasks.tasks:
+            task.wait(handle)
+
+    @staticmethod
+    def update_ongoing():
+        for ogr in PPTaskCollector._ongoing_reqs:
+            if ogr.handle.is_completed():
+                PPTaskCollector._ongoing_reqs.remove(ogr)
+                update_tasks = ogr.waiting_task
+                update_results = ogr.results
+                if Backend.args.infer.dp_size <= 1:
+                    PPTaskCollector._unwait_tasks.append(update_tasks)
+                    update_tasks.generated_result = update_results.view(
+                        -1, update_results.shape[-1]
+                    )
+                    for task in ogr.waiting_task.tasks:
+                        task.unwait()
+                else:
+                    dp_src = ogr.dp_src
+                    DPTaskCollector.update_ongoing(dp_src, update_tasks, update_results)
+                    if DPTaskCollector.batch_finished():
+                        batch_packedtasks = DPTaskCollector.remove_ongoing()
+                        batch_packedtasks.generated_result = (
+                            DPTaskCollector.get_collected_tokens_tensor()
+                        )
+                        PPTaskCollector._unwait_tasks.append(batch_packedtasks)
+                        DPTaskCollector.reset_collect_tokens()
+                        for task in batch_packedtasks.tasks:
+                            task.unwait()
+        return PPTaskCollector._unwait_tasks
