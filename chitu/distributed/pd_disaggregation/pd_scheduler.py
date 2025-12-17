@@ -417,8 +417,8 @@ class PDScheduler(Scheduler):
         assert isinstance(next_token, int)
 
         # Use Task API so DP wrapper can stream token back to Router
-        # Standard Task has update_response_no_sync, which is monkey-patched by DP wrapper if active
-        task.update_response_no_sync(next_token)
+        # Standard Task has update_response_sync, which is monkey-patched by DP wrapper if active
+        task.update_response_sync(next_token)
 
         # Early stop on EOS right after first token if needed
         if task.stop_with_eos and task.next_token in Backend.tokenizer.stop_tokens:

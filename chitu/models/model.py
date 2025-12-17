@@ -859,13 +859,18 @@ class Transformer(nn.Module):
             tokens = torch.argmax(h, dim=-1)
             token_list.append(tokens)
         self.cache.update_page_offs()
+        self.main_last_hidden_states_up_to_date = False
         tokens_proposal = torch.stack(token_list[:-1], dim=1).view(-1)
         if self.use_cuda_graph:
             self.cache.seq_len_delta.is_decode_stage = True
             self.prepare_decoding_attn()
-            self.main_last_hidden_states_up_to_date = False
         else:
             self.attn_backend.prepare_metadata_for_prefill(self.cache.seq_len_delta)
+            if (
+                self.moe_impl is not None
+                and self.moe_impl.decode_token_dispatcher_impl == "allgather"
+            ):
+                self.moe_impl.prepare(TaskType.Decode, tokens_proposal.shape[0])
         h = func(key, tokens_proposal)
         tokens_proposal = tokens_proposal.view(-1, self.mtp_size)
         tokens_verify = torch.argmax(h, dim=-1).view(-1, self.mtp_size)

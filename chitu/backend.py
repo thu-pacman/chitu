@@ -62,7 +62,7 @@ from chitu.utils import (
 from chitu.moe import init_moe_impl
 
 if TYPE_CHECKING:
-    from chitu.executor import Executor, OngoingRequests
+    from chitu.executor import Executor
     from chitu.scheduler import Scheduler
     from chitu.task import BatchResult
 
@@ -102,7 +102,6 @@ class Backend:
     executor: Optional["Executor"] = None
 
     # mutable
-    ongoing_reqs: list["OngoingRequests"] = []
     state = BackendState.Running
     last_batch_results: Deque["BatchResult"] = deque()
     indexer_cache_manager = None
