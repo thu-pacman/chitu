@@ -5,7 +5,6 @@
 from omegaconf import OmegaConf
 
 import torch
-import triton
 
 from chitu.attn_backend import TritonAttnBackend, FlashInferBackend
 from chitu.cache_manager import PagedKVCacheAccessor
@@ -13,11 +12,18 @@ from chitu.global_vars import set_global_args
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.utils import try_import_opt_dep
 
+from benchmarks.op_bench.bench_util import (
+    Benchmark,
+    do_bench,
+    get_default_device,
+    perf_report,
+)
+
 flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+@perf_report(
+    Benchmark(
         x_names=["bs"],
         x_vals=[1, 8, 16, 32],
         line_arg="provider",
@@ -33,6 +39,7 @@ def benchmark_prefill_ragged_qkvo(
     num_local_heads, qk_head_dim, v_head_dim, bs, provider
 ):
     torch.set_default_dtype(torch.float16)
+    device = get_default_device()
     set_global_args(
         OmegaConf.create(
             {
@@ -56,7 +63,7 @@ def benchmark_prefill_ragged_qkvo(
     seq_len_delta = BatchedSeqLenDelta(
         old_seq_len_list,
         new_seq_len_list,
-        device="cuda",
+        device=device,
         cache_prefix_lens_tensor_device=False,
         cache_position_ids_tensor_device=False,
         cache_seq_ids_tensor_device=False,
@@ -69,19 +76,19 @@ def benchmark_prefill_ragged_qkvo(
         num_local_heads,
         qk_head_dim,
         dtype=torch.bfloat16,
-    ).to("cuda")
+    ).to(device)
     k = torch.randn(
         seq_len_delta.new.total_len, 1, qk_head_dim, dtype=torch.bfloat16
-    ).to("cuda")
+    ).to(device)
     v = torch.randn(
         seq_len_delta.new.total_len, 1, v_head_dim, dtype=torch.bfloat16
-    ).to("cuda")
+    ).to(device)
 
     softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
     is_causal = True
     if provider == "triton":
         attn_backend = TritonAttnBackend(qk_nope_head_dim=qk_head_dim)
-        ms = triton.testing.do_bench(
+        ms = do_bench(
             lambda: attn_backend.prefill_ragged_qkvo(
                 q,
                 k,
@@ -95,7 +102,7 @@ def benchmark_prefill_ragged_qkvo(
         )
     elif provider == "flashinfer":
         flashinfer_backend = FlashInferBackend(tot_num_blocks=51, qk_nope_head_dim=None)
-        ms = triton.testing.do_bench(
+        ms = do_bench(
             lambda: flashinfer_backend.prefill_ragged_qkvo(
                 q,
                 k,
@@ -112,8 +119,8 @@ def benchmark_prefill_ragged_qkvo(
     return ms * 1000
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+@perf_report(
+    Benchmark(
         x_names=["bs"],
         x_vals=[1, 16, 128],
         line_arg="provider",
@@ -141,6 +148,7 @@ def benchmark_mla_decode_paged_kv(
     provider,
 ):
     torch.set_default_dtype(torch.float16)
+    device = get_default_device()
     set_global_args(
         OmegaConf.create(
             {
@@ -166,16 +174,16 @@ def benchmark_mla_decode_paged_kv(
     )
 
     max_num_pages = bs * 16
-    q_nope = torch.randn(bs, n_heads, kv_lora_rank, device="cuda")
-    q_pe = torch.randn(bs, n_heads, qk_rope_head_dim, device="cuda")
+    q_nope = torch.randn(bs, n_heads, kv_lora_rank, device=device)
+    q_pe = torch.randn(bs, n_heads, qk_rope_head_dim, device=device)
     kv_cache = torch.randn(
-        max_num_pages, page_size, kv_lora_rank + qk_rope_head_dim, device="cuda"
+        max_num_pages, page_size, kv_lora_rank + qk_rope_head_dim, device=device
     )
-    this_kv = torch.randn(bs, 1, 1, kv_lora_rank + qk_rope_head_dim, device="cuda")
+    this_kv = torch.randn(bs, 1, 1, kv_lora_rank + qk_rope_head_dim, device=device)
     seq_len_delta = BatchedSeqLenDelta(
         [prev_seq_len_int for _ in range(bs)],
         [prev_seq_len_int + 1 for _ in range(bs)],
-        device="cuda",
+        device=device,
         cache_prefix_lens_tensor_device=False,
         cache_position_ids_tensor_device=False,
         cache_seq_ids_tensor_device=False,
@@ -190,7 +198,7 @@ def benchmark_mla_decode_paged_kv(
 
     attn = TritonAttnBackend(qk_nope_head_dim=128)
     if provider == "triton":
-        ms = triton.testing.do_bench(
+        ms = do_bench(
             lambda: attn.mla_decode_paged_kv(
                 q_nope,
                 q_pe,
@@ -209,7 +217,7 @@ def benchmark_mla_decode_paged_kv(
             page_size,
             None,
         )
-        ms = triton.testing.do_bench(
+        ms = do_bench(
             lambda: flashinfer_backend.mla_decode_paged_kv(
                 q_nope,
                 q_pe,

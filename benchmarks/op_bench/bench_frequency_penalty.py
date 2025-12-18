@@ -3,14 +3,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
-import triton
 
 from chitu.device_list import DeviceList
 from chitu.ops import apply_frequency_penalty
 
+from benchmarks.op_bench.bench_util import (
+    Benchmark,
+    do_bench,
+    get_default_device,
+    perf_report,
+)
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+
+@perf_report(
+    Benchmark(
         x_names=["batch_size"],
         x_vals=[1, 16, 128, 256, 512, 1024],
         line_arg="provider",
@@ -23,22 +29,23 @@ from chitu.ops import apply_frequency_penalty
     )
 )
 def bench_frequency_penalty(batch_size, vocab_size, response_len, provider):
-    logits = torch.randn((batch_size, vocab_size), dtype=torch.float, device="cuda")
+    device = get_default_device()
+    logits = torch.randn((batch_size, vocab_size), dtype=torch.float, device=device)
 
     logits_index = DeviceList(
-        [i for i in range(batch_size)], dtype=torch.long, device="cuda"
+        [i for i in range(batch_size)], dtype=torch.long, device=device
     )
 
     response = [i for i in range(response_len)]
-    response_list = [DeviceList(response, dtype=torch.long, device="cuda")] * batch_size
+    response_list = [DeviceList(response, dtype=torch.long, device=device)] * batch_size
     frequency_penalty = torch.tensor(
-        [0.1] * batch_size, dtype=torch.float32, device="cuda"
+        [0.1] * batch_size, dtype=torch.float32, device=device
     )
     response_len_list = DeviceList(
-        [response_len] * batch_size, dtype=torch.long, device="cuda"
+        [response_len] * batch_size, dtype=torch.long, device=device
     )
 
-    ms = triton.testing.do_bench(
+    ms = do_bench(
         lambda: apply_frequency_penalty(
             logits,
             logits_index,

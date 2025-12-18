@@ -3,13 +3,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
-import triton
 
 from chitu.ops import moe_sum_per_token
 
+from benchmarks.op_bench.bench_util import (
+    Benchmark,
+    do_bench,
+    get_default_device,
+    perf_report,
+)
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+
+@perf_report(
+    Benchmark(
         x_names=["N"],
         x_vals=[256, 512, 1024],
         line_arg="provider",
@@ -18,15 +24,16 @@ from chitu.ops import moe_sum_per_token
         styles=[("blue", "-"), ("green", "-")],
         ylabel="us",
         plot_name="moe_sum_per_token-performance",
-        args={"compute_dtype": torch.bfloat16},
+        args={"compute_dtype": torch.bfloat16, "M": 1},
     )
 )
 def benchmark(M, N, compute_dtype, provider):
     topk = 8
-    input_tensor = torch.rand(M, topk, N, device="cuda", dtype=compute_dtype)
-    topk_weights = torch.rand(M, topk, device="cuda", dtype=compute_dtype)
-    output_tensor = torch.zeros(M, N, device="cuda", dtype=compute_dtype)
-    ms = triton.testing.do_bench(
+    device = get_default_device()
+    input_tensor = torch.rand(M, topk, N, device=device, dtype=compute_dtype)
+    topk_weights = torch.rand(M, topk, device=device, dtype=compute_dtype)
+    output_tensor = torch.zeros(M, N, device=device, dtype=compute_dtype)
+    ms = do_bench(
         lambda: moe_sum_per_token(
             input_tensor, topk_weights, out=output_tensor, impl=provider
         )

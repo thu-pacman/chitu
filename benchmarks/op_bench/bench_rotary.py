@@ -4,14 +4,20 @@
 
 import math
 import torch
-import triton
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.ops import apply_rotary_pos_emb
 
+from benchmarks.op_bench.bench_util import (
+    Benchmark,
+    do_bench,
+    get_default_device,
+    perf_report,
+)
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+
+@perf_report(
+    Benchmark(
         x_names=["batch_size"],
         x_vals=[1, 16, 128, 256, 512, 1024],
         line_arg="provider",
@@ -25,12 +31,13 @@ from chitu.ops import apply_rotary_pos_emb
 )
 def benchmark(batch_size, n_local_heads, head_dim, provider, rotary_type="interleaved"):
     torch.set_default_dtype(torch.float16)
-    q = torch.randn(batch_size, n_local_heads, head_dim, device="cuda")
-    k = torch.randn(batch_size, head_dim, device="cuda")
+    device = get_default_device()
+    q = torch.randn(batch_size, n_local_heads, head_dim, device=device)
+    k = torch.randn(batch_size, head_dim, device=device)
 
     complex_freqs = torch.polar(
-        torch.ones(batch_size, head_dim // 2, device="cuda", dtype=torch.float32),
-        torch.rand(batch_size, head_dim // 2, device="cuda", dtype=torch.float32)
+        torch.ones(batch_size, head_dim // 2, device=device, dtype=torch.float32),
+        torch.rand(batch_size, head_dim // 2, device=device, dtype=torch.float32)
         * 2
         * math.pi,
     )
@@ -38,7 +45,7 @@ def benchmark(batch_size, n_local_heads, head_dim, provider, rotary_type="interl
         complex_freqs.real.contiguous(), complex_freqs.imag.contiguous()
     )
 
-    ms = triton.testing.do_bench(
+    ms = do_bench(
         lambda: apply_rotary_pos_emb(
             q, k, freqs_cis, rotary_type=rotary_type, impl=provider
         )

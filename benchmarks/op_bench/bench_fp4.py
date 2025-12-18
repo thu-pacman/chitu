@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
-import triton
 
 from chitu.native_layout import Packed4BitWeightAlongK
 from chitu.ops import (
@@ -16,15 +15,23 @@ from chitu.ops import (
     from_fp4_e2m1_in_uint8,
 )
 
+from benchmarks.op_bench.bench_util import (
+    Benchmark,
+    do_bench,
+    get_default_device,
+    perf_report,
+)
+
 
 def init_weight_and_scales(dim, block_size):
     assert dim % block_size == 0
+    device = get_default_device()
     b = torch.randn(
         dim,
         dim // block_size,
         block_size,
         dtype=torch.float32,
-        device="cuda",
+        device=device,
     )
 
     # Following nvfp4 quantization.
@@ -59,8 +66,8 @@ def do_dequant_a(a_fp8, a_s, dim, act_block_size):
     ).view(dim, dim)
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+@perf_report(
+    Benchmark(
         x_names=["bs", "dim"],
         x_vals=[
             (1, 1024),
@@ -83,18 +90,18 @@ def do_dequant_a(a_fp8, a_s, dim, act_block_size):
 def benchmark_fp4_raise_to_bf16_gemm(bs, dim, default_dtype, block_size, provider):
     torch.manual_seed(42)
     torch.set_default_dtype(default_dtype)
-    device = torch.device("cuda")
+    device = get_default_device()
     a = torch.randn(bs, dim, dtype=default_dtype, device=device)
     b, b_s, b_s_2 = init_weight_and_scales(dim, block_size)
 
     if provider == "torch_bf16":
         dequant_b = do_dequant_b(b, b_s, b_s_2, dim, block_size).to(default_dtype)
-        ms = triton.testing.do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
+        ms = do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
     elif provider == "triton_fp4_raise_to_bf16":
         preprocessed_b = Packed4BitWeightAlongK.convert_from(
             Packed4BitWeightAlongK((dim, dim), b), k_stride=64
         )
-        ms = triton.testing.do_bench(
+        ms = do_bench(
             lambda: soft_fp4_raise_to_bf16_blockfp4_gemm(a, preprocessed_b, b_s, b_s_2)
         )
     else:
@@ -102,8 +109,8 @@ def benchmark_fp4_raise_to_bf16_gemm(bs, dim, default_dtype, block_size, provide
     return ms * 1000
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+@perf_report(
+    Benchmark(
         x_names=["bs", "dim"],
         x_vals=[
             (1, 1024),
@@ -129,19 +136,19 @@ def benchmark_fp4_raise_to_fp8_gemm(
 ):
     torch.manual_seed(42)
     torch.set_default_dtype(default_dtype)
-    device = torch.device("cuda")
+    device = get_default_device()
     a = torch.randn(bs, dim, dtype=default_dtype, device=device)
     b, b_s, b_s_2 = init_weight_and_scales(dim, block_size)
 
     if provider == "torch_bf16":
         dequant_b = do_dequant_b(b, b_s, b_s_2, dim, block_size).to(default_dtype)
-        ms = triton.testing.do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
+        ms = do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
     elif provider == "triton_fp4_raise_to_fp8":
         a_fp8, a_s = blockfp8_act_quant(a, act_block_size)
         preprocessed_b = Packed4BitWeightAlongK.convert_from(
             Packed4BitWeightAlongK((dim, dim), b), k_stride=64
         )
-        ms = triton.testing.do_bench(
+        ms = do_bench(
             lambda: soft_fp4_raise_to_fp8_blockfp4_gemm(
                 a_fp8, a_s, preprocessed_b, b_s, b_s_2, act_block_size=act_block_size
             )

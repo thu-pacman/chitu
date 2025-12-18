@@ -3,10 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
-import triton
 
 from chitu.utils import try_import_opt_dep
 from chitu.ops.activation import silu_and_mul_torch
+
+from benchmarks.op_bench.bench_util import Benchmark, do_bench, perf_report
 
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
@@ -27,8 +28,8 @@ def cpuinfer_silu_and_mul(input_tensor, CPUInfer, silu_and_mul):
     return output_tensor
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+@perf_report(
+    Benchmark(
         x_names=["input_size"],
         x_vals=[512, 1024, 2048, 4096, 8192],
         line_arg="provider",
@@ -52,7 +53,7 @@ def benchmark(input_size, qlen, compute_dtype, provider):
     )
 
     if provider == "torch":
-        ms = triton.testing.do_bench(lambda: silu_and_mul_torch(input_tensor))
+        ms = do_bench(lambda: silu_and_mul_torch(input_tensor))
     elif provider == "cpuinfer":
         CPUInfer = cpuinfer.CPUInfer("physical_core")
         config = cpuinfer.silu_and_mul.SiluAndMulConfig(
@@ -62,7 +63,7 @@ def benchmark(input_size, qlen, compute_dtype, provider):
         )
         silu_and_mul = cpuinfer.silu_and_mul.SiluAndMul(config)
 
-        ms = triton.testing.do_bench(
+        ms = do_bench(
             lambda: cpuinfer_silu_and_mul(input_tensor, CPUInfer, silu_and_mul)
         )
     else:

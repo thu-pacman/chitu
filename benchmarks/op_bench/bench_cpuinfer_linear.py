@@ -3,9 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
-import triton
 
 from chitu.utils import try_import_opt_dep
+
+from benchmarks.op_bench.bench_util import Benchmark, do_bench, perf_report
 
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
@@ -24,8 +25,8 @@ def cpuinfer_linear(input_tensor, weight, output_tensor, CPUInfer, linear):
     return output_tensor
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+@perf_report(
+    Benchmark(
         x_names=["output_size"],
         x_vals=[4096, 8192, 25600],
         line_arg="provider",
@@ -54,7 +55,7 @@ def benchmark(input_size, output_size, qlen, compute_dtype, provider):
     output_tensor = torch.empty((qlen, output_size), dtype=compute_dtype).contiguous()
 
     if provider == "torch":
-        ms = triton.testing.do_bench(lambda: torch_linear(input_tensor, proj))
+        ms = do_bench(lambda: torch_linear(input_tensor, proj))
     elif provider == "cpuinfer":
         if not has_cpuinfer:
             return float("nan")
@@ -71,7 +72,7 @@ def benchmark(input_size, output_size, qlen, compute_dtype, provider):
         linear = cpuinfer.linear.Linear(config)
         CPUInfer = cpuinfer.CPUInfer("physical_core")
 
-        ms = triton.testing.do_bench(
+        ms = do_bench(
             lambda: cpuinfer_linear(input_tensor, proj, output_tensor, CPUInfer, linear)
         )
     else:

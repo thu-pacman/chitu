@@ -3,10 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
-import triton
 
 from chitu.utils import try_import_opt_dep
 from chitu.ops.moe_gate import moe_gate
+
+from benchmarks.op_bench.bench_util import Benchmark, do_bench, perf_report
 
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
@@ -29,8 +30,8 @@ def cpuinfer_moe_gate(qlen, scores, correction_bias, CPUInfer, cpu_moe_gate, top
     return indices, weights
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+@perf_report(
+    Benchmark(
         x_names=["num_experts"],
         x_vals=[8, 16, 32, 64],
         line_arg="provider",
@@ -77,7 +78,7 @@ def benchmark(
         correction_bias = torch.randn((num_experts,), dtype=torch.bfloat16).contiguous()
 
     if provider == "torch":
-        ms = triton.testing.do_bench(
+        ms = do_bench(
             lambda: moe_gate(
                 scores,
                 topk,
@@ -106,7 +107,7 @@ def benchmark(
         CPUInfer.submit(cpu_moe_gate.warm_up())
         CPUInfer.sync()
 
-        ms = triton.testing.do_bench(
+        ms = do_bench(
             lambda: cpuinfer_moe_gate(
                 qlen, scores, correction_bias, CPUInfer, cpu_moe_gate, topk
             )
