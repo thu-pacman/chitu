@@ -3,19 +3,25 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
-import triton
 
 from chitu.ops import moe_gate
 
+from benchmarks.op_bench.bench_util import (
+    Benchmark,
+    do_bench,
+    get_default_device,
+    perf_report,
+)
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+
+@perf_report(
+    Benchmark(
         x_names=["seq_length"],
         x_vals=[1, 16, 128, 256, 512, 1024],
         line_arg="provider",
-        line_vals=["torch", "cuda"],
-        line_names=["Torch", "CUDA"],
-        styles=[("blue", "-"), ("green", "-")],
+        line_vals=["torch"],
+        line_names=["Torch"],
+        styles=[("blue", "-")],
         ylabel="us",
         plot_name="moe_fused_gate-performance",
         args={
@@ -43,7 +49,7 @@ def benchmark(
     provider,
 ):
     torch.manual_seed(seq_length)
-    device = torch.device("cuda")
+    device = get_default_device()
     scores = torch.rand((seq_length, num_experts)).to(dtype).to(device)
     if has_bias:
         bias = (
@@ -54,7 +60,7 @@ def benchmark(
     else:
         bias = None
 
-    ms = triton.testing.do_bench(
+    ms = do_bench(
         lambda: moe_gate(
             scores,
             topk,
@@ -63,7 +69,7 @@ def benchmark(
             topk_as_topk_group_criteria=topk_as_topk_group_criteria,
             e_score_correction_bias=bias,
             score_func="sigmoid",
-            impl=provider,
+            impl="torch",
         )
     )
     return ms * 1000

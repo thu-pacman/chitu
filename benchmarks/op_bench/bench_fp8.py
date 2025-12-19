@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
-import triton
 
 from chitu.ops import (
     blockfp8_act_quant,
@@ -13,16 +12,24 @@ from chitu.ops import (
     soft_fp8_blockfp8_gemm,
 )
 
+from benchmarks.op_bench.bench_util import (
+    Benchmark,
+    do_bench,
+    get_default_device,
+    perf_report,
+)
+
 
 def init_b_and_b_s(dim, block_size):
     assert dim % block_size == 0
+    device = get_default_device()
     b = torch.randn(
         dim // block_size,
         block_size,
         dim // block_size,
         block_size,
         dtype=torch.float32,
-        device="cuda",
+        device=device,
     )
     b_s = b.amax(dim=1, keepdim=True).amax(dim=3, keepdim=True)
     b /= b_s
@@ -31,8 +38,8 @@ def init_b_and_b_s(dim, block_size):
     )
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+@perf_report(
+    Benchmark(
         x_names=["bs", "dim"],
         x_vals=[
             (1, 1024),
@@ -55,23 +62,23 @@ def init_b_and_b_s(dim, block_size):
 def benchmark_fp8_gemm(bs, dim, dtype, block_size, provider):
     torch.manual_seed(42)
     torch.set_default_dtype(dtype)
-    device = torch.device("cuda")
+    device = get_default_device()
     a = torch.randn(bs, dim, dtype=dtype, device=device)
     b, b_s = init_b_and_b_s(dim, block_size)
 
     if provider == "torch_bf16":
         dequant_b = blockfp8_weight_dequant(b, b_s)
-        ms = triton.testing.do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
+        ms = do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
     elif provider == "triton_fp8":
         a_fp8, a_s = blockfp8_act_quant(a, block_size)
-        ms = triton.testing.do_bench(lambda: blockfp8_gemm(a_fp8, a_s, b, b_s))
+        ms = do_bench(lambda: blockfp8_gemm(a_fp8, a_s, b, b_s))
     else:
         assert False, f"Unknown provider: {provider}"
     return ms * 1000
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+@perf_report(
+    Benchmark(
         x_names=["bs", "dim"],
         x_vals=[
             (1, 1024),
@@ -94,22 +101,22 @@ def benchmark_fp8_gemm(bs, dim, dtype, block_size, provider):
 def benchmark_soft_fp8_gemm(bs, dim, dtype, block_size, provider):
     torch.manual_seed(42)
     torch.set_default_dtype(dtype)
-    device = torch.device("cuda")
+    device = get_default_device()
     a = torch.randn(bs, dim, dtype=dtype, device=device)
     b, b_s = init_b_and_b_s(dim, block_size)
 
     if provider == "torch_bf16":
         dequant_b = soft_fp8_blockfp8_weight_dequant(b, b_s)
-        ms = triton.testing.do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
+        ms = do_bench(lambda: torch.nn.functional.linear(a, dequant_b))
     elif provider == "triton_soft_fp8":
-        ms = triton.testing.do_bench(lambda: soft_fp8_blockfp8_gemm(a, b, b_s))
+        ms = do_bench(lambda: soft_fp8_blockfp8_gemm(a, b, b_s))
     else:
         assert False, f"Unknown provider: {provider}"
     return ms * 1000
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+@perf_report(
+    Benchmark(
         x_names=["dim"],
         x_vals=[128, 256, 512, 1024],
         line_arg="provider",
@@ -129,12 +136,12 @@ def benchmark_soft_fp8_dequant(dim, dtype, block_size, provider):
     torch.set_default_dtype(dtype)
     b, b_s = init_b_and_b_s(dim, block_size)
 
-    ms = triton.testing.do_bench(lambda: soft_fp8_blockfp8_weight_dequant(b, b_s))
+    ms = do_bench(lambda: soft_fp8_blockfp8_weight_dequant(b, b_s))
     return ms * 1000
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+@perf_report(
+    Benchmark(
         x_names=["dim"],
         x_vals=[128, 256, 512, 1024],
         line_arg="provider",
@@ -154,7 +161,7 @@ def benchmark_fp8_dequant(dim, dtype, block_size, provider):
     torch.set_default_dtype(dtype)
     b, b_s = init_b_and_b_s(dim, block_size)
 
-    ms = triton.testing.do_bench(lambda: blockfp8_weight_dequant(b, b_s))
+    ms = do_bench(lambda: blockfp8_weight_dequant(b, b_s))
     return ms * 1000
 
 
