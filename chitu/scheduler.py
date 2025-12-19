@@ -395,7 +395,7 @@ class Scheduler:
             num_tasks=1,
             task_ids=[task_id],
             req_ids=[task.req.request_id],
-            task_type=TaskType.Decode,
+            task_type=TaskType.Special,
             payload_type=SerializedPackedTasksPayloadType.EndTask,
         )
         Backend.executor.step(tasks)

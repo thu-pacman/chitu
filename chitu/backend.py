@@ -435,8 +435,7 @@ class Backend:
             return PagedKVCacheManager(
                 layer_id_map,
                 max_seq_len=args.infer.max_seq_len,
-                num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
-                // args.infer.dp_size,
+                num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
                 block_size=block_size,
                 num_blocks=args.infer.num_blocks if num_blocks is None else num_blocks,
                 device=local_rank,
@@ -446,8 +445,7 @@ class Backend:
             return DenseKVCacheManager(
                 layer_id_map,
                 max_seq_len=args.infer.max_seq_len,
-                num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
-                // args.infer.dp_size,
+                num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
                 device=local_rank,
                 **kv_cache_kvargs,
             )
@@ -484,8 +482,7 @@ class Backend:
 
         return SingletonPagedKVCacheManager(
             layer_id_map,
-            num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
-            // args.infer.dp_size,
+            num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
             shape_per_token_dict=Backend._get_linear_attn_cache_params(args),
             device=local_rank,
         )

@@ -186,12 +186,13 @@ class PipeDispatcher(TasksDispatcher):
             ]:
                 task_ids = msgpack.unpackb(msgs[1])
                 if len(task_ids) > 0:
-                    tasks = PackedTasks(task_ids)
+                    task_list = [TaskPool.pool[task_id] for task_id in task_ids]
                     decode_status_list = msgpack.unpackb(msgs[2])
-                    for it, task in enumerate(tasks.tasks):
+                    for it, task in enumerate(task_list):
                         task._decode_status = TaskDecodeType(
                             value=decode_status_list[it]
                         )
+                    tasks = PackedTasks([], tasks=task_list)
                     slot_handle = get_slot_handle()
                     if slot_handle:
                         slot_idx = msgpack.unpackb(msgs[3])

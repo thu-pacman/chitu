@@ -16,7 +16,7 @@ from datetime import datetime
 from enum import Enum
 from logging import getLogger
 from pathlib import Path
-from typing import Any, ClassVar, Deque, Optional, Mapping, Union
+from typing import Any, ClassVar, Deque, Optional, Mapping, Union, Callable
 from typing_extensions import override
 
 import torch
@@ -437,9 +437,12 @@ class Task:
             getattr(Backend.args, "infer", False)
             and Backend.args.infer.schedule_overlap
         )
-        self.has_model_run = (
+        has_pp = (
+            getattr(Backend.args, "infer", False) and Backend.args.infer.pp_size > 1
+        )
+        self.has_model_run: Callable[[], bool] = (
             self._has_model_run_schedule_overlap
-            if has_schedule_overlap
+            if has_schedule_overlap and not has_pp
             else self._has_model_run
         )
 

@@ -44,7 +44,6 @@ from chitu.utils import (
     ceil_div,
 )
 from chitu.schemas.utils import ModelConfigResolver
-from chitu.utils import ceil_div
 from chitu.distributed.parallel_state import get_dp_group
 from chitu.logging_utils import setup_chitu_logging
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
@@ -390,11 +389,9 @@ def warmup_engine(args):
                 "Auto infer.num_blocks (infer.num_blocks=-1) relies on warming-up to calculate the number of "
                 "blocks, but this is not supported when PP is enabled. A safe but inefficient value is used."
             )
-            new_num_block = (
-                args.infer.max_reqs
-                * args.infer.max_seq_len
-                // Backend.cache_manager.block_size
-            )
+            new_num_block = ceil_div(
+                args.infer.max_reqs, args.infer.dp_size
+            ) * ceil_div(args.infer.max_seq_len, Backend.cache_manager.block_size)
             get_global_args().infer.num_blocks = new_num_block
             Backend.cache_manager.realloc(new_num_block)
             if torch.distributed.get_rank() == 0:
