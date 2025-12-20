@@ -1413,13 +1413,16 @@ class DPTaskCollector:
 
     @staticmethod
     def init_collect_rank_list():
-        dp_size = get_global_args().infer.dp_size
         tp_size = get_global_args().infer.tp_size
+        dp_size = get_global_args().infer.dp_size
+        pp_size = get_global_args().infer.pp_size
         world_size = torch.distributed.get_world_size()
 
         for i in range(dp_size):
+            # The rank of the first TP group, of the last PP group,
+            # for each DP group.
             DPTaskCollector._collect_rank_list.append(
-                (i + 1) * world_size // dp_size - tp_size
+                (pp_size - 1) * (world_size // pp_size) + i * tp_size
             )
 
     @staticmethod

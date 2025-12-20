@@ -87,10 +87,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.layer_id = layer_id
         self.cache = cache
 
-        model_parallel_size = get_tp_size()
+        tensor_parallel_size = get_tp_size()
 
-        self.n_local_v_heads = self.n_v_heads // model_parallel_size
-        self.n_local_qk_heads = self.n_qk_heads // model_parallel_size
+        self.n_local_v_heads = self.n_v_heads // tensor_parallel_size
+        self.n_local_qk_heads = self.n_qk_heads // tensor_parallel_size
 
         self.local_conv_dim = (
             self.n_local_qk_heads * 2 + self.n_local_v_heads
@@ -110,11 +110,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         )
 
         self.dt_bias = nn.Parameter(
-            torch.ones(self.n_v_heads // model_parallel_size),
+            torch.ones(self.n_v_heads // tensor_parallel_size),
         )
         self.A_log = nn.Parameter(
             torch.empty(
-                self.n_v_heads // model_parallel_size,
+                self.n_v_heads // tensor_parallel_size,
             )
         )
 
@@ -386,7 +386,7 @@ class MLPQwen3Next(nn.Module):
         )
 
         # Do a parallel + fused linear projection, while ensuring outputs from gate_proj and up_proj are contiguous in memory.
-        # Therefore, the projected shape is [model_parallel_size, 2 * params.intermediate_dim]
+        # Therefore, the projected shape is [tensor_parallel_size, 2 * params.intermediate_dim]
 
         gate_up_proj_linear = get_linear_layout_native_y(
             op_impl,
@@ -561,7 +561,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
-        model_parallel_size: int,
+        tensor_parallel_size: int,
         attn_backend: AttnBackend,
         rotary_type: str = "separated-half",
         layer_type: type = TransformerBlockHFQwen3Next,
@@ -584,7 +584,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
             cache,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
-            model_parallel_size=model_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
             attn_backend=attn_backend,
             rotary_type=rotary_type,
             layer_type=layer_type,

@@ -3,15 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import itertools
 import zmq
 import msgpack
 from dataclasses import dataclass
 from logging import getLogger
 from typing import Optional
 from abc import ABC, abstractmethod
-
-from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
-
 
 import numpy as np
 import torch
@@ -55,6 +53,7 @@ from chitu.device_list import DeviceList
 from chitu.device_type import is_ascend, is_ascend_910b
 from chitu.distributed.comm_group import CommGroup
 from chitu.moe.load_balancer import get_moe_load_planner  # added
+from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 
 logger = getLogger(__name__)
 _, has_torch_npu = try_import_and_setup_torch_npu()
@@ -134,7 +133,6 @@ class PipeDispatcher(TasksDispatcher):
         self.prev_pair_group = get_pp_pair_group(self.rank, self.prev_rank)
 
         self.dp_size = get_dp_size()
-        self.tp_size = get_tp_size()
         self.num_nodes_per_dp = (
             get_world_group().group_size // get_dp_group().group_size
         )
@@ -151,9 +149,7 @@ class PipeDispatcher(TasksDispatcher):
             self.send_socket.bind(self.send_url)
 
         if not self.is_first_stage:
-            self.recv_addr, _, self.recv_port = Backend.ip_port_list[
-                self.rank - self.tp_size
-            ]
+            self.recv_addr, _, self.recv_port = Backend.ip_port_list[self.prev_rank]
             self.recv_url = f"tcp://{self.recv_addr}:{self.recv_port}"
             self.recv_socket = self.ctx.socket(zmq.PULL)
             self.recv_socket.connect(self.recv_url)
@@ -326,7 +322,9 @@ class PipeDispatcher(TasksDispatcher):
             all_tasks = tasks
             tasks_list = [tasks]
             collect_rank_list = [self.prev_rank]
-        for rank, curr_packed_tasks in zip(collect_rank_list, tasks_list):
+        for i, rank, curr_packed_tasks in zip(
+            itertools.count(), collect_rank_list, tasks_list
+        ):
             if curr_packed_tasks is None or len(curr_packed_tasks.output_tasks) == 0:
                 continue
             results = torch.empty(
@@ -341,10 +339,7 @@ class PipeDispatcher(TasksDispatcher):
                 group=None if self.dp_size > 1 else self.prev_pair_group,
             )
             PPTaskCollector.add_new_ongoing(
-                curr_packed_tasks,
-                handle,
-                results,
-                rank // self.num_nodes_per_dp if self.dp_size > 1 else 0,
+                curr_packed_tasks, handle, results, dp_src=i
             )
         if self.dp_size > 1:
             DPTaskCollector.add_new_ongoing()
@@ -593,7 +588,7 @@ class Executor:
         self.dp_dispatcher = None
         self.task_dispatchers = []
         self.tp_group = None
-        self.pp_stage = self.rank % (self.tp_size * self.pp_size) // self.tp_size
+        self.pp_stage = get_pp_group().rank_in_group
         self.is_sample_stage = (
             self.pp_size <= 1 or self.pp_stage + 1 == self.pp_size
         ) and self.rank % self.tp_size == 0

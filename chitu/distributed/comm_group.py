@@ -21,7 +21,7 @@ class SingletonGroupPlaceholder:
 
 
 def new_torch_group_dedup(
-    rank_lists: Sequence[Sequence[int]], is_device: bool, dup_allowed: bool = False
+    rank_lists: Sequence[Sequence[int]], is_device: bool, force_no_dedup: bool = False
 ) -> list[Any]:
     """
     Allocate torch.distributed groups uniquely, so as to reduce reserved
@@ -32,7 +32,7 @@ def new_torch_group_dedup(
     if is_device:
         if len(rank_lists) == 1:
             return [torch.distributed.group.WORLD]
-        elif dup_allowed and rank_tuples in _torch_group_dedup_dict_device:
+        elif force_no_dedup and rank_tuples in _torch_group_dedup_dict_device:
             groups = _torch_group_dedup_dict_device[rank_tuples]
         else:
             groups = [
@@ -43,7 +43,7 @@ def new_torch_group_dedup(
                 )
                 for rank_list in rank_lists
             ]
-            if dup_allowed is False:
+            if force_no_dedup is False:
                 _torch_group_dedup_dict_device[rank_tuples] = groups
     else:
         if rank_tuples in _torch_group_dedup_dict_host:
@@ -67,7 +67,7 @@ class CommGroup:
         rank_lists: Sequence[Sequence[int]],
         global_rank: int,
         local_rank: int,
-        dup_allowed: bool = False,
+        force_no_dedup: bool = False,
     ):
         self.global_rank = global_rank
         self.local_rank = local_rank
@@ -75,10 +75,10 @@ class CommGroup:
         self.device = torch.device(f"cuda:{local_rank}")
 
         gpu_groups = new_torch_group_dedup(
-            rank_lists, is_device=True, dup_allowed=dup_allowed
+            rank_lists, is_device=True, force_no_dedup=force_no_dedup
         )
         cpu_groups = new_torch_group_dedup(
-            rank_lists, is_device=False, dup_allowed=dup_allowed
+            rank_lists, is_device=False, force_no_dedup=force_no_dedup
         )
         contains_this_rank = []
         for rank_list in rank_lists:

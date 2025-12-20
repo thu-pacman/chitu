@@ -24,9 +24,9 @@ class AttentionLlama(Attention):
     def __init__(self, args, layer_id, cache, attn_backend, checkpoint_prefix):
         super().__init__(layer_id, cache, attn_backend)
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        model_parallel_size = get_tp_size()
-        self.n_local_heads = args.n_heads // model_parallel_size
-        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        tensor_parallel_size = get_tp_size()
+        self.n_local_heads = args.n_heads // tensor_parallel_size
+        self.n_local_kv_heads = self.n_kv_heads // tensor_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
@@ -75,7 +75,7 @@ class TransformerLlama(Transformer):
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
-        model_parallel_size: int,
+        tensor_parallel_size: int,
         attn_backend: AttnBackend,
         op_impl: str,
         merge_qkv_gate_up: bool = False,
@@ -86,7 +86,7 @@ class TransformerLlama(Transformer):
             cache,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
-            model_parallel_size=model_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
             attn_backend=attn_backend,
             op_impl=op_impl,
             **kvargs,

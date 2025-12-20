@@ -37,6 +37,8 @@ from chitu.distributed.parallel_state import (
     get_ep_size,
     get_dp_group,
     get_dp_size,
+    get_pp_group,
+    get_pp_size,
 )
 from chitu.moe import get_moe_impl
 from chitu.moe.batched_routed_activation import IndexedBatchedRoutedActivation
@@ -207,7 +209,7 @@ class Transformer(nn.Module):
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
-        model_parallel_size: int,
+        tensor_parallel_size: int,
         attn_backend: AttnBackend,
         op_impl: str,
         **kvargs,
@@ -224,20 +226,18 @@ class Transformer(nn.Module):
         self.device = torch.device(self.local_rank)
 
         self.pipeline_parallel_size = pipeline_parallel_size
-        self.model_parallel_size = model_parallel_size
+        self.tensor_parallel_size = tensor_parallel_size
         self.pipeline_exec = pipeline_parallel_size > 1
-        self.tensor_exec = model_parallel_size > 1
+        self.tensor_exec = tensor_parallel_size > 1
 
-        self.tp_size = model_parallel_size
+        self.tp_size = tensor_parallel_size
         self.pp_size = pipeline_parallel_size
         self.dp_size = get_dp_size()
         self.ep_group = get_ep_group()
         self.ep_size = self.ep_group.group_size
-        self.pp_stage = (
-            self.rank % (self.world_size // self.dp_size) // self.model_parallel_size
-        )
-        self.pp_main_rank = (self.rank // model_parallel_size) * model_parallel_size
-        self.pp_end_stage = (self.world_size // self.dp_size - 1) // model_parallel_size
+        self.pp_stage = get_pp_group().rank_in_group
+        self.pp_main_rank = (self.rank // tensor_parallel_size) * tensor_parallel_size
+        self.pp_end_stage = get_pp_size() - 1
 
         self.params = params
         self.vocab_size = params.vocab_size
@@ -377,12 +377,12 @@ class Transformer(nn.Module):
         checkpoint: dict[str, Any],
         num_layers: int,
         rank: int,
-        world_size: int,
+        pp_size: int,
     ):
         keys = checkpoint.keys()
         partial_checkpoint = {}
 
-        num_layers_of_each_rank = compute_layer_dist_in_pipe(num_layers, world_size)
+        num_layers_of_each_rank = compute_layer_dist_in_pipe(num_layers, pp_size)
         first_layer_id_of_each_rank = list(
             itertools.accumulate([0] + num_layers_of_each_rank)
         )
@@ -411,7 +411,7 @@ class Transformer(nn.Module):
         self,
         checkpoint: dict[str, Any],
         rank: int,
-        world_size: int,
+        tp_size: int,
     ):
         partial_checkpoint = {}
 
@@ -436,8 +436,11 @@ class Transformer(nn.Module):
                     if param.shape[0] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        assert param.shape[0] % world_size == 0
-                        chunks = torch.chunk(param, world_size, dim=0)
+                        if param.shape[0] % tp_size != 0:
+                            raise RuntimeError(
+                                f"Tensor {name}'s first dim {param.shape[0]} should be divisible by tp_size {tp_size}"
+                            )
+                        chunks = torch.chunk(param, tp_size, dim=0)
                         partial_checkpoint[name] = chunks[rank]
                 elif name.split(".")[-1] in self._get_1d_in_tensor_names(quant):
                     assert (
@@ -452,8 +455,11 @@ class Transformer(nn.Module):
                     if param.shape[0] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        assert param.shape[0] % world_size == 0
-                        chunks = torch.chunk(param, world_size, dim=0)
+                        if param.shape[0] % tp_size != 0:
+                            raise RuntimeError(
+                                f"Tensor {name}'s first dim {param.shape[0]} should be divisible by tp_size {tp_size}"
+                            )
+                        chunks = torch.chunk(param, tp_size, dim=0)
                         partial_checkpoint[name] = chunks[rank]
                 elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names(quant):
                     assert (
@@ -462,8 +468,11 @@ class Transformer(nn.Module):
                     if param.shape[1] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        assert param.shape[1] % world_size == 0
-                        chunks = torch.chunk(param, world_size, dim=1)
+                        if param.shape[1] % tp_size != 0:
+                            raise RuntimeError(
+                                f"Tensor {name}'s second dim {param.shape[1]} should be divisible by tp_size {tp_size}"
+                            )
+                        chunks = torch.chunk(param, tp_size, dim=1)
                         partial_checkpoint[name] = chunks[rank]
                 else:
                     # FIXME: Support quant=llmint8 for TP
@@ -477,8 +486,11 @@ class Transformer(nn.Module):
                     if param.shape[0] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        assert param.shape[0] % world_size == 0
-                        chunks = torch.chunk(param, world_size, dim=0)
+                        if param.shape[0] % tp_size != 0:
+                            raise RuntimeError(
+                                f"Tensor {name}'s first dim {param.shape[0]} should be divisible by tp_size {tp_size}"
+                            )
+                        chunks = torch.chunk(param, tp_size, dim=0)
                         partial_checkpoint[name] = chunks[rank]
                 elif name.split(".")[-1] in self._get_1d_out_tensor_names(quant):
                     assert (
@@ -495,8 +507,11 @@ class Transformer(nn.Module):
                     if param.shape[1] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        assert param.shape[1] % world_size == 0
-                        chunks = torch.chunk(param, world_size, dim=1)
+                        if param.shape[1] % tp_size != 0:
+                            raise RuntimeError(
+                                f"Tensor {name}'s second dim {param.shape[1]} should be divisible by tp_size {tp_size}"
+                            )
+                        chunks = torch.chunk(param, tp_size, dim=1)
                         partial_checkpoint[name] = chunks[rank]
                 elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names(quant):
                     assert (
@@ -505,8 +520,8 @@ class Transformer(nn.Module):
                     if param.shape[0] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        assert param.shape[0] % world_size == 0
-                        chunks = torch.chunk(param, world_size, dim=0)
+                        assert param.shape[0] % tp_size == 0
+                        chunks = torch.chunk(param, tp_size, dim=0)
                         partial_checkpoint[name] = chunks[rank]
                 else:
                     # FIXME: Support quant=llmint8 for TP

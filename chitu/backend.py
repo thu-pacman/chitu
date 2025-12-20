@@ -259,40 +259,66 @@ class Backend:
         if Backend.use_gloo:
             Backend.group_gloo = torch.distributed.new_group(backend="gloo")
 
-        model_parallel_size = args.infer.tp_size
+        tensor_parallel_size = args.infer.tp_size
         pipeline_parallel_size = args.infer.pp_size
-
         non_expert_data_parallel_size = args.infer.dp_size
         expert_parallel_size = args.infer.ep_size
+        assert (
+            tensor_parallel_size * non_expert_data_parallel_size % expert_parallel_size
+            == 0
+        )
+        expert_tensor_parallel_size = (
+            tensor_parallel_size * non_expert_data_parallel_size // expert_parallel_size
+        )
+
         global_rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
 
-        assert (
+        if (
             world_size
-            == model_parallel_size
-            * pipeline_parallel_size
+            != tensor_parallel_size
             * non_expert_data_parallel_size
-        ), f"World size not match: {world_size} != {model_parallel_size} * {pipeline_parallel_size} * {non_expert_data_parallel_size}"
+            * pipeline_parallel_size
+        ):
+            raise ValueError(
+                f"Inconsistent parallelism: world_size({world_size}) should be equal to "
+                f"tensor_parallel_size({tensor_parallel_size}) "
+                f"* non_expert_data_parallel_size({non_expert_data_parallel_size}) "
+                f"* pipeline_parallel_size({pipeline_parallel_size}) "
+            )
+        if (
+            world_size
+            != expert_tensor_parallel_size
+            * expert_parallel_size
+            * pipeline_parallel_size
+        ):
+            raise ValueError(
+                f"Inconsistent parallelism: world_size({world_size}) should be equal to "
+                f"expert_tensor_parallel_size({expert_tensor_parallel_size}) "
+                f"* expert_parallel_size({expert_parallel_size}) "
+                f"* pipeline_parallel_size({pipeline_parallel_size}) "
+            )
 
         initialize_parallel_groups(
-            tp_size=model_parallel_size,
-            pp_size=pipeline_parallel_size,
+            tp_size=tensor_parallel_size,
             dp_size=non_expert_data_parallel_size,
+            etp_size=expert_tensor_parallel_size,
             ep_size=expert_parallel_size,
+            pp_size=pipeline_parallel_size,
         )
         Backend.ip_port_list = get_world_group().gather_all_rank_ip_port()
 
         Backend.pp_stage = (
             global_rank
             % (world_size // non_expert_data_parallel_size)
-            // model_parallel_size
+            // tensor_parallel_size
         )
         Backend.pp_end_stage = (
             world_size // non_expert_data_parallel_size - 1
-        ) // model_parallel_size
+        ) // tensor_parallel_size
         Backend.pp_main_rank = (
-            global_rank // model_parallel_size
-        ) * model_parallel_size
+            global_rank // tensor_parallel_size
+        ) * tensor_parallel_size
 
     @staticmethod
     def _setup_environment(args):
@@ -568,7 +594,7 @@ class Backend:
         Returns:
             Dictionary of parameters for KV cache initialization
         """
-        model_parallel_size = args.infer.tp_size
+        tensor_parallel_size = args.infer.tp_size
 
         kv_cache_kvargs = {}
 
@@ -590,7 +616,7 @@ class Backend:
                         )
                     }
             elif args.infer.mla_absorb == "none":
-                n_local_heads = args.models.n_heads // model_parallel_size
+                n_local_heads = args.models.n_heads // tensor_parallel_size
                 k_head_dim = args.models.qk_nope_head_dim + args.models.qk_rope_head_dim
                 v_head_dim = args.models.v_head_dim
                 kv_cache_kvargs["shape_per_token_dict"] = {
@@ -608,8 +634,8 @@ class Backend:
                 else args.models.n_heads
             )
             n_local_kv_heads = (
-                n_kv_heads // model_parallel_size
-                if n_kv_heads > model_parallel_size
+                n_kv_heads // tensor_parallel_size
+                if n_kv_heads > tensor_parallel_size
                 else 1
             )  # Compatible with tp_size>n_kv_heads
             head_dim = (
@@ -624,15 +650,15 @@ class Backend:
 
     @staticmethod
     def _get_linear_attn_cache_params(args):
-        model_parallel_size = args.infer.tp_size
+        tensor_parallel_size = args.infer.tp_size
 
         n_v_heads = args.models.linear_n_v_heads
         n_qk_heads = args.models.linear_n_qk_heads
         head_dim = args.models.linear_head_dim
         conv_kernel_size = args.models.linear_conv_kernel_dim
 
-        n_local_v_heads = n_v_heads // model_parallel_size
-        local_conv_dim = (n_qk_heads * 2 + n_v_heads) * head_dim // model_parallel_size
+        n_local_v_heads = n_v_heads // tensor_parallel_size
+        local_conv_dim = (n_qk_heads * 2 + n_v_heads) * head_dim // tensor_parallel_size
 
         return {
             "conv_state": (local_conv_dim, conv_kernel_size),
@@ -826,7 +852,7 @@ class Backend:
         if args.models.type in ["deepseek-v3", "hf-qwen-3-moe"]:
             QuantizationRegistry._allowed_quant_for_merge_gate_up.append("blockfp4")
 
-        model_parallel_size = args.infer.tp_size
+        tensor_parallel_size = args.infer.tp_size
         pipeline_parallel_size = args.infer.pp_size
 
         if args.models.type == "hf-qwen3-next":
@@ -835,7 +861,7 @@ class Backend:
                 Backend.cache_manager,
                 max_position_embeddings=args.infer.max_seq_len,
                 pipeline_parallel_size=pipeline_parallel_size,
-                model_parallel_size=model_parallel_size,
+                tensor_parallel_size=tensor_parallel_size,
                 attn_backend=attn_backend,
                 op_impl=args.infer.op_impl,
                 mla_absorb=args.infer.mla_absorb,
@@ -850,7 +876,7 @@ class Backend:
                 Backend.cache_manager,
                 max_position_embeddings=args.infer.max_seq_len,
                 pipeline_parallel_size=pipeline_parallel_size,
-                model_parallel_size=model_parallel_size,
+                tensor_parallel_size=tensor_parallel_size,
                 attn_backend=attn_backend,
                 op_impl=args.infer.op_impl,
                 mla_absorb=args.infer.mla_absorb,
@@ -862,7 +888,7 @@ class Backend:
                 Backend.cache_manager,
                 max_position_embeddings=args.infer.max_seq_len,
                 pipeline_parallel_size=pipeline_parallel_size,
-                model_parallel_size=model_parallel_size,
+                tensor_parallel_size=tensor_parallel_size,
                 attn_backend=attn_backend,
                 op_impl=args.infer.op_impl,
                 mla_absorb=args.infer.mla_absorb,
