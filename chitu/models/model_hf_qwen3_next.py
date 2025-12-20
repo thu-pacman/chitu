@@ -32,22 +32,11 @@ from chitu.ops import (
     recurrent_gated_delta_rule,
     silu_and_mul,
     causal_conv1d_update,
+    causal_conv1d_prefill,
 )
 from chitu.quantization import QuantizationRegistry
 from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear, LocalLinear
 from chitu.ops import rms_norm_gate
-
-
-def extract_and_merge(x, seq_len_list):
-    n = x.size(0)
-    result = []
-    for i in range(n):
-        if seq_len_list[i] == 0:
-            continue
-        extracted = x[i, -seq_len_list[i] :]
-        result.append(extracted)
-
-    return torch.cat(result, dim=0)
 
 
 class Qwen3NextRMSNorm(RMSNorm):
@@ -98,10 +87,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.layer_id = layer_id
         self.cache = cache
 
-        model_parallel_size = get_tp_size()
+        tensor_parallel_size = get_tp_size()
 
-        self.n_local_v_heads = self.n_v_heads // model_parallel_size
-        self.n_local_qk_heads = self.n_qk_heads // model_parallel_size
+        self.n_local_v_heads = self.n_v_heads // tensor_parallel_size
+        self.n_local_qk_heads = self.n_qk_heads // tensor_parallel_size
 
         self.local_conv_dim = (
             self.n_local_qk_heads * 2 + self.n_local_v_heads
@@ -121,11 +110,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         )
 
         self.dt_bias = nn.Parameter(
-            torch.ones(self.n_v_heads // model_parallel_size),
+            torch.ones(self.n_v_heads // tensor_parallel_size),
         )
         self.A_log = nn.Parameter(
             torch.empty(
-                self.n_v_heads // model_parallel_size,
+                self.n_v_heads // tensor_parallel_size,
             )
         )
 
@@ -206,9 +195,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     ):
         seq_len_delta = self.cache.seq_len_delta
         use_precomputed_states = seq_len_delta.is_classic_decoding
-        seq_len_list = seq_len_delta.new.lens_list.copy()
-        max_curr_seq_len = max(seq_len_list)
-        bs = len(seq_len_list)
+        seq_len_list = seq_len_delta.new.lens_list
 
         cache_accessor = self.cache.get_accessor(self.layer_id)
         if use_precomputed_states:
@@ -228,31 +215,20 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         qkv = torch.cat((q, k, v), dim=-1)
 
         if use_precomputed_states:
-            qkv = qkv.view((qkv.size(0), -1, 1))
             qkv, conv_state = causal_conv1d_update(qkv, conv_state, self.conv1d.weight)
+            # qkv: (bsz, hidden_size), conv_state: (bsz, hidden_size, state_len)
         else:
-            padded_qkv = torch.zeros(
-                (bs, max_curr_seq_len, self.local_conv_dim),
-                dtype=x.dtype,
-                device=x.device,
+            assert (
+                sum(seq_len_list) == qkv.shape[0]
+            ), f"seq_len unequal: {sum(seq_len_list)} vs {qkv.shape[0]} , Detail: {seq_len_list} vs {qkv.shape}"
+            qkv, conv_state = causal_conv1d_prefill(
+                qkv,
+                self.conv1d.weight,
+                seq_len_delta.new.prefix_lens_tensor_device,
+                int(self.conv1d.padding[0]),
             )
+            # qkv: (total_len, hidden_size), conv_state: (total_len, hidden_size, state_len)
 
-            start_idx = 0
-            for i in range(bs):
-                seq_len_list[i] = min(seq_len_list[i], qkv.shape[0] - start_idx)
-                if seq_len_list[i] == 0:
-                    continue
-                padded_qkv[i][-seq_len_list[i] :] = qkv[
-                    start_idx : start_idx + seq_len_list[i]
-                ]
-                start_idx += seq_len_list[i]
-            padded_qkv = padded_qkv.transpose(1, 2)
-            conv_state = F.pad(
-                padded_qkv, (self.conv_kernel_size - padded_qkv.shape[-1], 0)
-            )
-            qkv = F.silu(self.conv1d(padded_qkv)[:, :, :max_curr_seq_len])
-
-        qkv = qkv.transpose(1, 2)
         q, k, v = torch.split(
             qkv,
             [
@@ -264,51 +240,40 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         )
 
         q, k, v = map(
-            lambda h: h.reshape(h.size(0), h.size(1), -1, self.head_dim), (q, k, v)
-        )
+            lambda h: h.reshape(h.size(0), -1, self.head_dim), (q, k, v)
+        )  # (total_len, n_heads, head_dim)
 
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        q = q.repeat_interleave(self.n_v_heads // self.n_qk_heads, dim=2)
-        k = k.repeat_interleave(self.n_v_heads // self.n_qk_heads, dim=2)
+        q = q.repeat_interleave(
+            self.n_v_heads // self.n_qk_heads, dim=1
+        )  # (total_len, n_v_heads, head_dim)
+        k = k.repeat_interleave(
+            self.n_v_heads // self.n_qk_heads, dim=1
+        )  # (total_len, n_v_heads, head_dim)
         if not use_precomputed_states:
-            padded_g = torch.zeros(
-                (bs, max_curr_seq_len, g.size(-1)), dtype=x.dtype, device=x.device
-            )
-            padded_beta = torch.zeros(
-                (bs, max_curr_seq_len, beta.size(-1)), dtype=x.dtype, device=x.device
-            )
-            start_idx = 0
-            for i in range(bs):
-                if seq_len_list[i] == 0:
-                    continue
-                padded_g[i][-seq_len_list[i] :] = g[
-                    start_idx : start_idx + seq_len_list[i]
-                ]
-                padded_beta[i][-seq_len_list[i] :] = beta[
-                    start_idx : start_idx + seq_len_list[i]
-                ]
-                start_idx += seq_len_list[i]
+            prefix_lens = seq_len_delta.new.prefix_lens_tensor_device
+
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-                q,
-                k,
-                v,
-                g=padded_g,
-                beta=padded_beta,
+                q.unsqueeze(0),
+                k.unsqueeze(0),
+                v.unsqueeze(0),
+                g=g.unsqueeze(0),
+                beta=beta.unsqueeze(0),
                 initial_state=None,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
+                cu_seqlens=prefix_lens,
+                seq_len_list=seq_len_list,
                 impl=self.impl,
             )
         else:
-            g = g.view(g.size(0), 1, -1)
-            beta = beta.view(beta.size(0), 1, -1)
             core_attn_out, last_recurrent_state = recurrent_gated_delta_rule(
-                q,
-                k,
-                v,
-                g=g,
-                beta=beta,
+                q.unsqueeze(1),
+                k.unsqueeze(1),
+                v.unsqueeze(1),
+                g=g.unsqueeze(1),
+                beta=beta.unsqueeze(1),
                 initial_state=recurrent_state,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
@@ -327,10 +292,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.last_recurrent_state = last_recurrent_state.to(x.dtype).contiguous()
 
         z_shape_og = z.shape
-        core_attn_out = extract_and_merge(core_attn_out, seq_len_list)
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = self.norm(core_attn_out.squeeze(0), z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], -1)
 
@@ -422,7 +386,7 @@ class MLPQwen3Next(nn.Module):
         )
 
         # Do a parallel + fused linear projection, while ensuring outputs from gate_proj and up_proj are contiguous in memory.
-        # Therefore, the projected shape is [model_parallel_size, 2 * params.intermediate_dim]
+        # Therefore, the projected shape is [tensor_parallel_size, 2 * params.intermediate_dim]
 
         gate_up_proj_linear = get_linear_layout_native_y(
             op_impl,
@@ -597,7 +561,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
-        model_parallel_size: int,
+        tensor_parallel_size: int,
         attn_backend: AttnBackend,
         rotary_type: str = "separated-half",
         layer_type: type = TransformerBlockHFQwen3Next,
@@ -620,7 +584,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
             cache,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
-            model_parallel_size=model_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
             attn_backend=attn_backend,
             rotary_type=rotary_type,
             layer_type=layer_type,

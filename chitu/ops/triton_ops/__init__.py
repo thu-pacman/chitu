@@ -48,3 +48,7 @@ from chitu.ops.triton_ops.attn import (
     mla_decode_topk_ragged_qkvo_triton,
 )
 from chitu.ops.triton_ops.norm_gate import rms_norm_gate_triton
+from chitu.ops.triton_ops.causal_conv import (
+    causal_conv1d_update_triton,
+    causal_conv1d_prefill_triton,
+)

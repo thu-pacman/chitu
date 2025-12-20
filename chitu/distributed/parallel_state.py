@@ -19,9 +19,10 @@ _PARALLEL_GROUPS_INITIALIZED = False
 
 _WORLD_GROUP: Optional[CommGroup] = None
 _TP_GROUP: Optional[CommGroup] = None
-_PP_GROUP: Optional[CommGroup] = None
 _DP_GROUP: Optional[CommGroup] = None
+_ETP_GROUP: Optional[CommGroup] = None
 _EP_GROUP: Optional[CommGroup] = None
+_PP_GROUP: Optional[CommGroup] = None
 
 _PP_PAIR_GROUP_DICT: dict[tuple[int, int], Any] = {}  # Compatible with NPU platforms
 
@@ -40,16 +41,20 @@ def get_tp_group() -> CommGroup:
     return get_global_var("_TP_GROUP")
 
 
-def get_pp_group() -> CommGroup:
-    return get_global_var("_PP_GROUP")
-
-
 def get_dp_group() -> CommGroup:
     return get_global_var("_DP_GROUP")
 
 
+def get_etp_group() -> CommGroup:
+    return get_global_var("_ETP_GROUP")
+
+
 def get_ep_group() -> CommGroup:
     return get_global_var("_EP_GROUP")
+
+
+def get_pp_group() -> CommGroup:
+    return get_global_var("_PP_GROUP")
 
 
 def get_tp_size() -> int:
@@ -60,18 +65,6 @@ def get_tp_size() -> int:
     return _TP_GROUP.group_size
 
 
-def get_etp_size() -> int:
-    if get_ep_size() == 1:
-        return get_tp_size()
-    return 1
-
-
-def get_etp_group() -> CommGroup:
-    if get_ep_size() == 1:
-        return get_tp_group()
-    raise NotImplementedError
-
-
 def get_dp_size() -> int:
     """return 1 if DP not initialized"""
     global _DP_GROUP
@@ -80,12 +73,97 @@ def get_dp_size() -> int:
     return _DP_GROUP.group_size
 
 
+def get_etp_size() -> int:
+    """return 1 if ETP not initialized"""
+    global _ETP_GROUP
+    if _ETP_GROUP is None:
+        return 1
+    return _ETP_GROUP.group_size
+
+
 def get_ep_size() -> int:
     """return 1 if EP not initialized"""
     global _EP_GROUP
     if _EP_GROUP is None:
         return 1
     return _EP_GROUP.group_size
+
+
+def get_pp_size() -> int:
+    """return 1 if PP not initialized"""
+    global _PP_GROUP
+    if _PP_GROUP is None:
+        return 1
+    return _PP_GROUP.group_size
+
+
+# Order of parallelism (from near to far):
+# - Dense: TP -> DP -> PP
+# - MoE: ETP -> EP -> PP
+#
+# Please note that DP communicates nearer ranks than PP, this is for converting
+# DP attention to EP MoE. If want to parallelize the whole model with DP without
+# conversion to EP, please launch multiple instances, following the instructions
+# in `chitu/distributed/pd_disaggregation/README.md`.
+
+
+def _get_first_level_rank_lists(first_level_size: int, world_size: int):
+    assert world_size % first_level_size == 0
+    return [
+        list(range(i * first_level_size, (i + 1) * first_level_size))
+        for i in range(world_size // first_level_size)
+    ]
+
+
+def _get_second_level_rank_lists(
+    first_level_size: int, second_level_size: int, world_size: int
+):
+    assert world_size % (first_level_size * second_level_size) == 0
+    rank_lists = []
+    for i in range(world_size // (first_level_size * second_level_size)):
+        for j in range(first_level_size):
+            rank_lists.append(
+                list(
+                    range(
+                        i * first_level_size * second_level_size + j,
+                        (i + 1) * first_level_size * second_level_size + j,
+                        first_level_size,
+                    )
+                )
+            )
+    return rank_lists
+
+
+def _get_last_level_rank_lists(last_level_size: int, world_size: int):
+    assert world_size % last_level_size == 0
+    return [
+        list(range(i, i + world_size, world_size // last_level_size))
+        for i in range(world_size // last_level_size)
+    ]
+
+
+def get_tp_rank_lists(*, tp_size: int, world_size: int):
+    return _get_first_level_rank_lists(first_level_size=tp_size, world_size=world_size)
+
+
+def get_dp_rank_lists(*, tp_size: int, dp_size: int, world_size: int):
+    return _get_second_level_rank_lists(
+        first_level_size=tp_size, second_level_size=dp_size, world_size=world_size
+    )
+
+
+def get_etp_rank_lists(*, etp_size: int, world_size: int):
+    return _get_first_level_rank_lists(first_level_size=etp_size, world_size=world_size)
+
+
+def get_ep_rank_lists(*, etp_size: int, ep_size: int, world_size: int):
+    return _get_second_level_rank_lists(
+        first_level_size=etp_size, second_level_size=ep_size, world_size=world_size
+    )
+
+
+def get_pp_rank_lists(*, pp_size: int, world_size: int):
+    return _get_last_level_rank_lists(last_level_size=pp_size, world_size=world_size)
 
 
 def get_pp_pair_group(
@@ -103,63 +181,40 @@ def initialize_world_group(rank: int, local_rank: int, world_size: int):
     assert _WORLD_GROUP is None
 
     _WORLD_GROUP = CommGroup([list(range(world_size))], rank, local_rank)
-    # logger.info(f"world group: {_WORLD_GROUP}")
 
 
 def initialize_tp_group(
-    tp_size: int,
-    pp_size: int,
-    dp_size: int,
     rank: int,
     local_rank: int,
+    *,
+    tp_size: int,
     world_size: int,
 ):
     global _TP_GROUP
     assert _TP_GROUP is None
-
-    num_tp_groups = world_size // tp_size
-
-    rank_list = []
-    for i in range(num_tp_groups):
-        rank_list.append(list(range(i * tp_size, (i + 1) * tp_size)))
-
-    _TP_GROUP = CommGroup(rank_list, rank, local_rank)
+    _TP_GROUP = CommGroup(
+        get_tp_rank_lists(tp_size=tp_size, world_size=world_size), rank, local_rank
+    )
 
 
 def initialize_pp_group(
-    tp_size: int,
-    pp_size: int,
-    dp_size: int,
     rank: int,
     local_rank: int,
+    *,
+    pp_size: int,
     world_size: int,
 ):
     global _PP_GROUP
     assert _PP_GROUP is None
 
-    num_pp_groups = world_size // pp_size
-    num_dp_groups = world_size // dp_size
-
-    rank_list = []
-    for i in range(dp_size):
-        for j in range(num_pp_groups // dp_size):
-            rank_list.append(
-                list(
-                    range(
-                        i * num_dp_groups + j,
-                        (i + 1) * num_dp_groups,
-                        num_pp_groups // dp_size,
-                    )
-                )
-            )
-
-    _PP_GROUP = CommGroup(rank_list, rank, local_rank)
+    pp_rank_lists = get_pp_rank_lists(pp_size=pp_size, world_size=world_size)
+    _PP_GROUP = CommGroup(pp_rank_lists, rank, local_rank)
 
     if is_ascend():
         assert len(_PP_PAIR_GROUP_DICT) == 0
         if pp_size < 2:
             return
-        ranks = [i * tp_size for i in range(pp_size)]
+        ranks = pp_rank_lists[0]
         for i in range(pp_size):
             next_i = (i + 1) % pp_size
             rank_pair = [ranks[i], ranks[next_i]]
@@ -169,63 +224,51 @@ def initialize_pp_group(
 
 
 def initialize_dp_group(
-    tp_size: int,
-    pp_size: int,
-    dp_size: int,
     rank: int,
     local_rank: int,
+    *,
+    tp_size: int,
+    dp_size: int,
     world_size: int,
 ):
     global _DP_GROUP
     assert _DP_GROUP is None
-
-    num_DP_GROUPs = world_size // dp_size
-
-    rank_list = []
-    for i in range(num_DP_GROUPs):
-        rank_list.append(list(range(i, world_size, num_DP_GROUPs)))
-
-    _DP_GROUP = CommGroup(rank_list, rank, local_rank)
+    _DP_GROUP = CommGroup(
+        get_dp_rank_lists(tp_size=tp_size, dp_size=dp_size, world_size=world_size),
+        rank,
+        local_rank,
+    )
 
 
-def initialize_ep_group(ep_size: int, rank: int, local_rank: int, world_size: int):
+def initialize_etp_group(
+    rank: int,
+    local_rank: int,
+    *,
+    etp_size: int,
+    world_size: int,
+):
+    global _ETP_GROUP
+    assert _ETP_GROUP is None
+    _ETP_GROUP = CommGroup(
+        get_etp_rank_lists(etp_size=etp_size, world_size=world_size), rank, local_rank
+    )
+
+
+def initialize_ep_group(
+    rank: int, local_rank: int, *, etp_size: int, ep_size: int, world_size: int
+):
     global _EP_GROUP
     assert _EP_GROUP is None
-    dup_allowed = is_ascend()
-
-    dp_size = get_dp_size()
-    tp_size = get_tp_size()
-    pp_size = get_pp_group().group_size
-
-    assert (dp_size * tp_size) % ep_size == 0
-    num_EP_GROUPs = world_size // ep_size
-
-    if ep_size > 1:
-        if pp_size == 1:
-            pp_rank_list = [list(range(world_size))]
-        else:
-            pp_rank_list = [[] for _ in range(pp_size)]
-            for i in range(world_size):
-                pp_stage = i % (world_size // dp_size) // tp_size
-                pp_rank_list[pp_stage].append(i)
-        rank_list = []
-        for pp_stage in range(pp_size):
-            for i in range(num_EP_GROUPs // pp_size):
-                rank_list.append(
-                    pp_rank_list[pp_stage][i * ep_size : (i + 1) * ep_size]
-                )
-        _EP_GROUP = CommGroup(rank_list, rank, local_rank, dup_allowed=dup_allowed)
-    else:
-        _EP_GROUP = CommGroup(
-            [[idx] for idx in range(world_size)],
-            rank,
-            local_rank,
-            dup_allowed=dup_allowed,
-        )
+    _EP_GROUP = CommGroup(
+        get_ep_rank_lists(etp_size=etp_size, ep_size=ep_size, world_size=world_size),
+        rank,
+        local_rank,
+        force_no_dedup=is_ascend(),
+    )
 
 
 def initialize_parallel_groups(
-    tp_size: int, pp_size: int, dp_size: int = 1, ep_size: int = 1
+    *, tp_size: int, dp_size: int = 1, etp_size: int = 1, ep_size: int = 1, pp_size: int
 ):
     global _PARALLEL_GROUPS_INITIALIZED
     assert not _PARALLEL_GROUPS_INITIALIZED
@@ -237,10 +280,15 @@ def initialize_parallel_groups(
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = torch.distributed.get_world_size()
     initialize_world_group(rank, local_rank, world_size)
-    initialize_tp_group(tp_size, pp_size, dp_size, rank, local_rank, world_size)
-    initialize_pp_group(tp_size, pp_size, dp_size, rank, local_rank, world_size)
-    initialize_dp_group(tp_size, pp_size, dp_size, rank, local_rank, world_size)
-    initialize_ep_group(ep_size, rank, local_rank, world_size)
+    initialize_tp_group(rank, local_rank, tp_size=tp_size, world_size=world_size)
+    initialize_dp_group(
+        rank, local_rank, tp_size=tp_size, dp_size=dp_size, world_size=world_size
+    )
+    initialize_etp_group(rank, local_rank, etp_size=etp_size, world_size=world_size)
+    initialize_ep_group(
+        rank, local_rank, etp_size=etp_size, ep_size=ep_size, world_size=world_size
+    )
+    initialize_pp_group(rank, local_rank, pp_size=pp_size, world_size=world_size)
 
     _PARALLEL_GROUPS_INITIALIZED = True
 

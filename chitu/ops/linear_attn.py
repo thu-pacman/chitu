@@ -126,6 +126,18 @@ def torch_chunk_gated_delta_rule(
 # SPDX-SnippetEnd
 
 
+def extract_and_merge(x, seq_len_list):
+    n = x.size(0)
+    result = []
+    for i in range(n):
+        if seq_len_list[i] == 0:
+            continue
+        extracted = x[i, -seq_len_list[i] :]
+        result.append(extracted)
+
+    return torch.cat(result, dim=0)
+
+
 # SPDX-SnippetBegin
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-SnippetCopyrightText: 2025 HuggingFace
@@ -198,6 +210,8 @@ def chunk_gated_delta_rule(
     initial_state=None,
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
+    cu_seqlens=None,
+    seq_len_list=None,
     impl="auto",
 ):
     if impl == "auto":
@@ -207,6 +221,7 @@ def chunk_gated_delta_rule(
             impl = "torch"
 
     if impl == "fla":
+        assert cu_seqlens is not None
         return fla_chunk_gated_delta_rule(
             query,
             key,
@@ -216,18 +231,78 @@ def chunk_gated_delta_rule(
             initial_state=initial_state,
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=cu_seqlens,
         )
     else:
-        return torch_chunk_gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
+        assert seq_len_list is not None
+
+        max_curr_seq_len = max(seq_len_list)
+        bs = len(seq_len_list)
+        padded_q = torch.zeros(
+            (
+                bs,
+                max_curr_seq_len,
+            )
+            + query.shape[-2:],
+            dtype=query.dtype,
+            device=query.device,
+        )
+        padded_k = torch.zeros(
+            (
+                bs,
+                max_curr_seq_len,
+            )
+            + key.shape[-2:],
+            dtype=key.dtype,
+            device=key.device,
+        )
+        padded_v = torch.zeros(
+            (
+                bs,
+                max_curr_seq_len,
+            )
+            + value.shape[-2:],
+            dtype=value.dtype,
+            device=value.device,
+        )
+        padded_g = torch.zeros(
+            (bs, max_curr_seq_len, g.size(-1)), dtype=g.dtype, device=g.device
+        )
+        padded_beta = torch.zeros(
+            (bs, max_curr_seq_len, beta.size(-1)), dtype=beta.dtype, device=beta.device
+        )
+
+        start_idx = 0
+        for i in range(bs):
+            padded_q[i][-seq_len_list[i] :] = query[0][
+                start_idx : start_idx + seq_len_list[i]
+            ]
+            padded_k[i][-seq_len_list[i] :] = key[0][
+                start_idx : start_idx + seq_len_list[i]
+            ]
+            padded_v[i][-seq_len_list[i] :] = value[0][
+                start_idx : start_idx + seq_len_list[i]
+            ]
+            padded_g[i][-seq_len_list[i] :] = g[0][
+                start_idx : start_idx + seq_len_list[i]
+            ]
+            padded_beta[i][-seq_len_list[i] :] = beta[0][
+                start_idx : start_idx + seq_len_list[i]
+            ]
+            start_idx += seq_len_list[i]
+
+        core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
+            padded_q,
+            padded_k,
+            padded_v,
+            g=padded_g,
+            beta=padded_beta,
             initial_state=initial_state,
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
+
+        return extract_and_merge(core_attn_out, seq_len_list), last_recurrent_state
 
 
 def recurrent_gated_delta_rule(

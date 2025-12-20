@@ -319,7 +319,7 @@ class TransformerHFGptOss(TransformerHFLlama):
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
-        model_parallel_size: int,
+        tensor_parallel_size: int,
         attn_backend: AttnBackend,
         rotary_type: str = "separated",
         layer_type: type = TransformerBlockHFGptOss,
@@ -331,7 +331,7 @@ class TransformerHFGptOss(TransformerHFLlama):
             cache,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
-            model_parallel_size=model_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
             attn_backend=attn_backend,
             rotary_type=rotary_type,
             layer_type=layer_type,
@@ -377,7 +377,7 @@ class TransformerHFGptOss(TransformerHFLlama):
 
             state_dict = self.gpt_oss_force_splitting_gate_up(state_dict)
 
-            if self.model_parallel_size > 1:
+            if self.tensor_parallel_size > 1:
                 # split experts to fit TP
                 state_dict = self._process_state_dict_for_splitting_experts(state_dict)
 

@@ -60,5 +60,5 @@ from chitu.ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_concat_permuted,
 )
 from chitu.ops.hadamard import hadamard_transform
+from chitu.ops.causal_conv import causal_conv1d_update, causal_conv1d_prefill
 from chitu.ops.norm_gate import rms_norm_gate
-from chitu.ops.causal_conv import causal_conv1d_update
