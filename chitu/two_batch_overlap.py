@@ -20,7 +20,6 @@ from contextlib import nullcontext
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 
 
-
 logger = logging.getLogger(__name__)
 from chitu.moe import get_moe_impl
 
@@ -174,7 +173,7 @@ class TboPackedTasksPreparer:
             return
 
     @classmethod
-    def prepare_raw(cls, packed: PackedTasks,):
+    def prepare_raw(cls, packed: PackedTasks):
         """将一个 PackedTasks 拆成两个子 PackedTasks"""
         split_token_index = cls._compute_split_token_index(packed)
         
@@ -193,7 +192,7 @@ class TboPackedTasksPreparer:
             start_seq_index=packed.tbo_split_seq_index,
             end_seq_index=packed.num_tasks,
         )
-        packed.tbo_split_token_index  = split_token_index
+        packed.tbo_split_token_index = split_token_index
         packed.tbo_children = [child_a, child_b]
        
     @classmethod
@@ -204,7 +203,6 @@ class TboPackedTasksPreparer:
         end_token_index: int,
         start_seq_index: int,
         end_seq_index: int,
-       
     ) -> PackedTasks:
         """
         根据 token 范围过滤出新的 PackedTasks。
@@ -215,7 +213,6 @@ class TboPackedTasksPreparer:
         new_packed.tbo_parent_token_range=(start_token_index, end_token_index),
         new_packed.tbo_children=None,
         return new_packed
-
  
     @classmethod
     def _compute_split_token_index(cls, packed: PackedTasks):
@@ -228,8 +225,6 @@ class TboPackedTasksPreparer:
             prefill_seq_lens=[len(task_tokens) for task_tokens in packed.tokens],
             token_num_per_seq=token_num_per_seq,
         )
-
-
 
 
 def model_forward_tbo(
@@ -266,15 +261,11 @@ def model_forward_tbo(
     return _model_forward_tbo_merge_outputs(*outputs_arr)
 
 
-
 def _model_forward_tbo_split_inputs(
     freqs_cis: BatchedFreqsCis,
     hidden_states: torch.Tensor,
     tbo_split_token_index: int, 
-
 ) -> List[Dict]:
-    
-
     inputs_arr = _model_forward_tbo_split_inputs_raw(
         freqs_cis,
         hidden_states,
@@ -311,6 +302,7 @@ def _model_forward_tbo_split_inputs_raw(
         for tbo_subbatch_index in range(2)
     ]
 
+
 def _model_forward_filter_inputs(
     freqs_cis: BatchedFreqsCis,
     hidden_states: torch.Tensor,
@@ -340,7 +332,6 @@ def _model_forward_tbo_merge_outputs(output_a, output_b):
     return _handle_key("hidden_states")
 
 
-
 class MaybeTboDeepEPDispatcher:
     def __init__(self, *args, **kwargs):
         num_inner_dispatchers = 2 if get_global_args().infer.enable_two_batch_overlap else 1
@@ -354,24 +345,11 @@ class MaybeTboDeepEPDispatcher:
             dispatcher.prepare(*args, **kwargs)
     
     def _execute(self, name: str, *args, tbo_subbatch_index: Optional[int] = None, **kwargs):
-        
         inner_obj = self._inners[tbo_subbatch_index or 0]
+        assert hasattr(inner_obj, name), f"DeepEP Dispatcher does not have function {name=}"
         return getattr(inner_obj, name)(*args, **kwargs)
     
-    def token_permutation(self, *args, **kwargs):
-        return self._execute("token_permutation", *args,**kwargs)
-    
-    def token_unpermutation(self, *args, **kwargs):
-        return self._execute("token_unpermutation",*args,**kwargs)
-    
-    def dispatch_a(self, *args, **kwargs):
-        return self._execute("dispatch_a", *args,**kwargs)
-    
-    def dispatch_b(self, *args, **kwargs):
-        return self._execute("dispatch_b", *args,**kwargs)
-    
-    def combine_a(self, *args, **kwargs):
-        return self._execute("combine_a", *args,**kwargs)
-    
-    def combine_b(self, *args, **kwargs):
-        return self._execute("combine_b", *args,**kwargs)
+    def __getattr__(self, func_name):
+        def call_exec(*args, **kwargs):
+            return self._execute(func_name, *args, **kwargs)
+        return call_exec

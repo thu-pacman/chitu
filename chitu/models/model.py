@@ -11,8 +11,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from chitu.task import TaskType
 from chitu.device_type import is_muxi
 from chitu.attn_backend import AttnBackend, NpuAttnBackend
+from chitu.operations import _StateDict
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.cache_manager import PagedKVCacheManager, DenseKVCacheManager
 from chitu.cuda_graph import make_dispatched_graphed_callables
@@ -189,7 +191,7 @@ class TransformerBlock(nn.Module):
     def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
         raise NotImplementedError
 
-    def op_res_after_mlp(self,state):
+    def op_res_after_mlp(self, state: _StateDict):
         hidden_states = state.pop("hidden_states") + state.pop("residual")
         output = dict(
             hidden_states=hidden_states,
@@ -745,12 +747,32 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def prefill_no_pipeline(
-        self, tokens, output_token_offsets: torch.Tensor, **args
+        self, tokens, output_token_offsets: torch.Tensor, **kwargs
     ) -> torch.Tensor:
         freqs_cis = self.prepare_freqs_cis()
-        h = self._pre_layers(tokens, **args)
-        for it, layer in enumerate(self.layers):
+        h = self._pre_layers(tokens, **kwargs)
+        normal_start_layer = 0
+        normal_end_layer = len(self.layers)
+        end_layer = len(self.layers)
+        if kwargs['enable_tbo']:
+            n_dense_layers = getattr(get_global_args().models, "n_dense_layers", 0)
+            if (
+                n_dense_layers > normal_start_layer
+                and n_dense_layers < normal_end_layer
+            ):
+                normal_end_layer = n_dense_layers
+            elif n_dense_layers < normal_start_layer:
+                normal_end_layer = normal_start_layer = 0
+
+        for i in range(normal_start_layer, normal_end_layer):
+            layer= self.layers[i]
             h = layer(h, freqs_cis)
+
+        if normal_end_layer < end_layer:
+            from chitu.two_batch_overlap import model_forward_tbo
+            h = model_forward_tbo(self.layers[normal_end_layer : end_layer],
+                                  freqs_cis, h, kwargs['tbo_split_token_index'],
+                                  TaskType.Prefill)
 
         # Exec post layers AFTER cutting the last token off
         h = h[output_token_offsets]
@@ -759,10 +781,31 @@ class Transformer(nn.Module):
         return h
 
     @torch.inference_mode()
-    def decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
+    def decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis, **kwargs):
         h = self._pre_layers(tokens)
-        for it, layer in enumerate(self.layers):
+        normal_start_layer = 0
+        normal_end_layer = len(self.layers)
+        end_layer = len(self.layers)
+        if kwargs['enable_tbo']:
+            n_dense_layers = getattr(get_global_args().models, "n_dense_layers", 0)
+            if (
+                n_dense_layers > normal_start_layer
+                and n_dense_layers < normal_end_layer
+            ):
+                normal_end_layer = n_dense_layers
+            elif n_dense_layers < normal_start_layer:
+                 normal_end_layer = normal_start_layer = 0
+
+        for i in range(normal_start_layer, normal_end_layer):
+            layer= self.layers[i]
             h = layer(h, freqs_cis)
+
+        if normal_end_layer < end_layer:
+            from chitu.two_batch_overlap import model_forward_tbo
+            h = model_forward_tbo(self.layers[normal_end_layer : end_layer],
+                                  freqs_cis, h, kwargs['tbo_split_token_index'],
+                                  TaskType.Decode)
+
         h = self._post_layers(h)
         h = h.float()
         return h
@@ -1095,10 +1138,7 @@ class ParallelMoeBlock(nn.Module):
 
         return y.view(shape)
 
-    def op_gate_and_select_experts(
-        self,
-        state,
-    ):
+    def op_gate_and_select_experts(self, state: _StateDict):
         x = state.hidden_states_after_layernorm
         x = x.view(-1, x.shape[-1])
         weights, indices = self.gate(x)
@@ -1116,20 +1156,14 @@ class ParallelMoeBlock(nn.Module):
         if self.shared_experts is not None:
             state.shared_experts_input = x 
 
-    def op_shared_experts(
-        self,
-        state,
-    ):
+    def op_shared_experts(self, state: _StateDict):
         ## we don't use sbo strategy here
         if self.shared_experts is not None:
             state.shared_experts_output = self.shared_experts(state.pop("shared_experts_input"))
         else:
             state.shared_experts_output = None
 
-    def op_experts(
-        self,
-        state,
-    ):
+    def op_experts(self, state: _StateDict):
         assert self.moe_impl is not None
         state.hidden_states = self.experts(
             state.pop("routed_x"),
@@ -1139,17 +1173,11 @@ class ParallelMoeBlock(nn.Module):
         )
         # previous_event, hidden_states
 
-    def op_output(
-        self,
-        state,
-    ):
+    def op_output(self, state: _StateDict):
         if (shared_output:= state.pop("shared_experts_output")) is not None:
             state.hidden_states += shared_output
         
-    def op_dispatch_a(
-        self,
-        state,
-    ):
+    def op_dispatch_a(self, state: _StateDict):
         assert self.moe_impl is not None
         state.previous_event = self.moe_impl.dispatch_a(
             state.pop("routed_x"),
@@ -1158,10 +1186,7 @@ class ParallelMoeBlock(nn.Module):
         )
         # previous_event
 
-    def op_dispatch_b(
-        self,
-        state,
-    ):
+    def op_dispatch_b(self, state: _StateDict):
         assert self.moe_impl is not None
         (
             state.routed_x,
@@ -1173,7 +1198,7 @@ class ParallelMoeBlock(nn.Module):
         )
         # routed_x, topk_weights, previous_event
 
-    def op_combine_a(self,state):
+    def op_combine_a(self, state: _StateDict):
         assert self.moe_impl is not None
         state.previous_event = self.moe_impl.combine_a(
             state.hidden_states,
@@ -1181,10 +1206,7 @@ class ParallelMoeBlock(nn.Module):
         )
         # previous_event, hidden_states
     
-    def op_combine_b(
-        self,
-        state,
-    ):
+    def op_combine_b(self, state: _StateDict):
         # may directly call combine_b after dispatch_b
         assert self.moe_impl is not None
         state.hidden_states,state.previous_event = self.moe_impl.combine_b(

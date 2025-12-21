@@ -10,8 +10,6 @@ from logging import getLogger
 logger = getLogger(__name__)
 
 
-
-
 _ENABLE_PROFILE = bool(int(os.environ.get("SGLANG_OPERATIONS_ENABLE_PROFILE", "0")))
 
 if _ENABLE_PROFILE:
@@ -33,8 +31,6 @@ def execute_overlapped_operations(
     operations_arr: Sequence,
     delta_stages: Sequence[int],
 ) -> Sequence:
-    
-    
     # Make it explicit for clarity; if we need multi-batch overlap, this can be generalized
     inputs_a, inputs_b = inputs_arr
     operations_a, operations_b = operations_arr
@@ -42,27 +38,21 @@ def execute_overlapped_operations(
     assert delta_stage_a == 0
     delta_stage = delta_stage_b
 
-    
-
     stages_a = _convert_operations_to_stages(operations_a)
     stages_b = _convert_operations_to_stages(operations_b)
     executor_a = _StageExecutor("A", stages_a, inputs=inputs_a)
     executor_b = _StageExecutor("B", stages_b, inputs=inputs_b)
 
-    
     for i in range(delta_stage):
         executor_a.next()
-
 
     remaining_stages = executor_a.num_stages - delta_stage
    
     for i in range(remaining_stages):
         executor_a.next()
-        
         executor_b.next()
 
     for i in range(delta_stage):
-       
         executor_b.next()
 
     assert executor_a.done and executor_b.done
@@ -94,7 +84,6 @@ class _StageExecutor:
         # Log stage names for better debugging
         for i, stage in enumerate(stages):
             stage_ops = [op.debug_name for op in stage]
-          
 
     def next(self):
         assert not self.done
@@ -102,10 +91,8 @@ class _StageExecutor:
         stage = self._stages[self._index]
         stage_ops = [op.debug_name for op in stage]
 
-
         with _annotate_region(debug_name=f"{self._debug_name}{self._index}"):
             for op_idx, op in enumerate(stage):
-               
                 with _annotate_region(debug_name=op.debug_name):
                     try:
                         self._stage_output = op.fn(
@@ -114,14 +101,11 @@ class _StageExecutor:
                                 self._stage_output if self._stage_output is not None else {}
                             ),
                         )
-                       
                     except Exception as e:
-                        
                         raise
 
         self._index += 1
         
-
     @property
     def output(self):
         assert self.done

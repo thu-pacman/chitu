@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from chitu.attn_backend import AttnBackend
+from chitu.operations import _StateDict
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.global_vars import get_global_args
 from chitu.models.model import (
@@ -231,7 +232,7 @@ class AttentionHFLlama(Attention):
         ).view(bs_seq, -1)
         return self._run_output_linear(output).reshape(x.shape)
         
-    def op_prepare(self,state):
+    def op_prepare(self, state: _StateDict):
             x=state.pop("hidden_states_after_input_layernorm")
             xq, xk, xv = self._run_linear(x)
 
@@ -248,7 +249,7 @@ class AttentionHFLlama(Attention):
             xq, xk = apply_rotary_pos_emb(xq, xk, state.freqs_cis, rotary_type=self.rotary_type)
             state.attn_intermediate_state = (xq, xk, xv)
 
-    def op_core(self,state):
+    def op_core(self, state: _StateDict):
         xq, xk, xv = state.pop("attn_intermediate_state")
 
         output = self.attn_backend(

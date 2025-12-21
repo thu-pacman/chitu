@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from chitu.attn_backend import AttnBackend
+from chitu.operations import _StateDict
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.cache_manager import (
@@ -59,12 +60,10 @@ from chitu.ops import (
     append_to_dense_kv_cache,
     hadamard_transform,
 )
-import torch.distributed as dist
 from chitu.quantization import (
     QuantizationRegistry,
     get_quant_from_checkpoint_prefix,
     get_layer_id_from_checkpoint_prefix,
-    get_quant_kwargs_from_checkpoint_prefix,
 )
 from chitu.quantization.normal import (
     NormalLinear,
@@ -77,7 +76,6 @@ from chitu.tensor_parallel import (
     RowParallelLinear,
     VocabParallelEmbedding,
 )
-from chitu.moe.batched_routed_activation import IndexedBatchedRoutedActivation
 from chitu.distributed.parallel_state import get_tp_size, get_ep_size
 from chitu.utils import parse_dtype, try_import_and_setup_torch_npu
 from chitu.lazy import eval_lazy
@@ -88,8 +86,6 @@ from chitu.distributed.parallel_state import (
     get_ep_size,
 )
 
-from chitu.task import  TaskType
-#from chitu.two_batch_overlap import model_forward_tbo
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 logger = getLogger(__name__)
@@ -590,7 +586,7 @@ class AttentionDeepSeekV3(Attention):
                 f"MLA absorb mode {self.mla_absorb} not supported"
             )
             
-    def op_prepare(self, state):
+    def op_prepare(self, state: _StateDict):
         # FIXME(TR) currently we don't support indexer with TBO
         assert self.index_topk is None
         x = state.pop("hidden_states_after_layernorm")
@@ -608,7 +604,7 @@ class AttentionDeepSeekV3(Attention):
                 f"MLA absorb mode {self.mla_absorb} not supported"
             )
             
-    def op_core(self, state):
+    def op_core(self, state: _StateDict):
         # FIXME(TR) currently we don't support indexer with TBO
         assert self.index_topk is None    
         if self.mla_absorb == "none":
@@ -1011,7 +1007,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
     
     def op_input_layernorm(
         self,
-        state,
+        state: _StateDict,
         freqs_cis: BatchedFreqsCis,
         hidden_states: torch.Tensor,
         tbo_subbatch_index: int,
@@ -1025,7 +1021,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             )
         )
         
-    def op_post_attention_layernorm(self, state):
+    def op_post_attention_layernorm(self, state: _StateDict):
         hidden_states = state.pop("hidden_states_after_attn") + state.pop("residual")
         state.residual = hidden_states
         hidden_states = self.post_attention_layernorm(
@@ -1033,10 +1029,6 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             )
         state.hidden_states_after_layernorm = hidden_states
 
-        
-
-        
-        
     def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
         x = x + self.self_attn(
             self.input_layernorm(x, compute_dtype=x.dtype), freqs_cis
@@ -1100,66 +1092,6 @@ class TransformerDeepSeekV3(Transformer):
     @override
     def _get_layer_i_prefixes(self, i: int) -> list[str]:
         return [f"layers.{i}."]
-    
-    @override
-    @torch.inference_mode()
-    def prefill_no_pipeline(
-        self, tokens, output_token_offsets: torch.Tensor, **args
-    ) -> torch.Tensor:
-        self.n_dense_layers = get_global_args().models.n_dense_layers
-        freqs_cis = self.prepare_freqs_cis()
-        h = self._pre_layers(tokens, **args)
-        normal_start_layer = 0
-        normal_end_layer = len(self.layers) 
-        end_layer = len(self.layers) 
-        if args['enable_tbo']:
-            if (
-                self.n_dense_layers > normal_start_layer
-                and self.n_dense_layers < normal_end_layer
-            ):
-                normal_end_layer = self.n_dense_layers
-            elif self.n_dense_layers < normal_start_layer:
-                normal_end_layer = normal_start_layer = 0
-        for i in range(normal_start_layer, normal_end_layer):
-            layer= self.layers[i]
-            h = layer(h, freqs_cis)
-        if normal_end_layer != end_layer:
-            from chitu.two_batch_overlap import model_forward_tbo
-            h = model_forward_tbo(self.layers[normal_end_layer : end_layer],
-                                  freqs_cis, h, args['tbo_split_token_index'], 
-                                TaskType.Prefill)
-        h = h[output_token_offsets]
-        h = self._post_layers(h)
-        h = h.float()
-        return h
-        
-    @override
-    @torch.inference_mode()
-    def decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis,**args):
-        h = self._pre_layers(tokens)
-        normal_start_layer = 0
-        normal_end_layer = len(self.layers) 
-        end_layer = len(self.layers) 
-        if args['enable_tbo']:
-            if (
-                self.n_dense_layers > normal_start_layer
-                and self.n_dense_layers < normal_end_layer
-            ):
-                normal_end_layer = self.n_dense_layers
-            elif self.n_dense_layers < normal_start_layer:
-                 normal_end_layer = normal_start_layer = 0
-        for i in range(normal_start_layer, normal_end_layer):
-            layer= self.layers[i]
-            h = layer(h, freqs_cis)
-        if normal_end_layer !=end_layer:
-            from chitu.two_batch_overlap import model_forward_tbo
-            
-            h = model_forward_tbo(self.layers[normal_end_layer : end_layer],
-                                  freqs_cis, h, args['tbo_split_token_index'], 
-                                TaskType.Decode)
-        h = self._post_layers(h)
-        h = h.float()
-        return h
     
     @override
     def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
