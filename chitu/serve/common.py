@@ -39,7 +39,9 @@ async def process_queue():
         TaskPool.add_all_queued()
         if (len(TaskPool.pool) >= min_batch_size) or rank != 0:
             min_batch_size = 1
-            chitu_run()
+            status = chitu_run()
+            if status == SerializedPackedTasksPayloadType.NoneType:
+                await asyncio.sleep(0.01)
         elif len(Backend.last_batch_results) > 0:
             Backend.executor.postprocess_async_part(
                 Backend.last_batch_results.popleft()

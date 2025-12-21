@@ -809,7 +809,9 @@ class Executor:
 
         return tensor
 
-    def step(self, tasks: Optional[PackedTasksBase]) -> torch.Tensor:
+    def step(
+        self, tasks: Optional[PackedTasksBase]
+    ) -> SerializedPackedTasksPayloadType:
         # 1. propagate tasks and handle special payload type
         payload_type = tasks.payload_type if tasks is not None else None
         for dispatcher in self.task_dispatchers:
@@ -821,7 +823,7 @@ class Executor:
             payload_type == SerializedPackedTasksPayloadType.Heartbeat
             or Backend.state == BackendState.Terminated
         ):
-            return None
+            return payload_type
         if payload_type == SerializedPackedTasksPayloadType.EndTask:
             # Delete item from KV cache
             for rid in tasks.req_ids:
@@ -833,7 +835,7 @@ class Executor:
                     and get_global_args().models.type == "deepseek-v3"
                 ):
                     Backend.indexer_cache_manager.finalize_cache_all_decode(rid)
-            return None
+            return payload_type
 
         # synchronize
         if self.has_schedule_overlap and tasks.task_type in (
@@ -922,9 +924,9 @@ class Executor:
             for task, result in zip(tasks.output_tasks, results_list):
                 task.generated_result = result
 
-        return
+        return payload_type
 
-    def empty_step(self):
+    def empty_step(self) -> SerializedPackedTasksPayloadType:
         if len(Backend.last_batch_results) > 0:
             self.postprocess_async_part(Backend.last_batch_results.popleft())
         if (
@@ -938,6 +940,7 @@ class Executor:
                 tasks.generated_result = None
                 for task in tasks.output_tasks:
                     task.generated_result = None
+        return SerializedPackedTasksPayloadType.NoneType
 
     def _get_output_token_offsets(self, tasks: PackedTasksBase) -> torch.Tensor:
         if tasks.task_type == TaskType.Prefill:
