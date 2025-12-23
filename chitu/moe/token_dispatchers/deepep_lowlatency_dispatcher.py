@@ -300,7 +300,9 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
 
     # SPDX-SnippetEnd
     
-    # For TBO overlap, we need split dispatch/combine into two stages
+    # For TBO overlap, we need split low_latency dispatch/combine into two stages
+    # Low_latency dispatch/combine stage A executess the asynchronous communication.
+    # Low_latency dispatch/combine stage B waits for the completion (via hook) and processes the results.
     def dispatch_a(
         self,
         x: IndexedBatchedRoutedActivation,

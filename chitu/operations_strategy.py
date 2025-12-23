@@ -11,7 +11,14 @@ from chitu.operations import Operation
 
 logger = getLogger(__name__)
 
-
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-SnippetCopyrightText: 2025 SGLang Team
+# SPDX-SnippetName: OperationsStrategy
+#
+# This implementation of the OperationsStrategy for two batch overlap is originally from SGLang, 
+# (https://github.com/sgl-project/sglang/commit/0d4778802576cb81add26aa4c8787a589e0d0076),
+# licensed under Apache 2.0.
 @dataclass
 class OperationsStrategy:
     operations: List[Operation]
@@ -148,3 +155,6 @@ def _compute_moe_layer_operations_strategy_tbo(
         )
     else:
         raise NotImplementedError(f"Unsupported {forward_mode=}")
+
+
+# SPDX-SnippetEnd

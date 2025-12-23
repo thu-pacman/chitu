@@ -26,8 +26,8 @@ MODEL_PATH=${MODEL_PATH:-"/data/nfs/DeepSeek-R1"}
 ITERS=${ITERS:-3}
 MAX_NUM_REQS=${MAX_NUM_REQS:-128}
 NUM_REQS_LIST=${NUM_REQS_LIST:-"[128]"}
-INPUT_LEN=${INPUT_LEN:-32}
-OUTPUT_LEN=${OUTPUT_LEN:-32}
+INPUT_LEN=${INPUT_LEN:-128}
+OUTPUT_LEN=${OUTPUT_LEN:-128}
 STOP_WITH_EOS=${STOP_WITH_EOS:-False}
 DATASET=${DATASET:-"sharegpt"}
 DATASET_PATH=${DATASET_PATH:-"/data/nfs/ShareGPT_V3_unfiltered_cleaned_split.json"}
@@ -45,8 +45,8 @@ NUM_GPU_PER_NODE=$(( (TP * PP * DP) / NODE ))
 ADDITIONAL_ARGS=(
     infer.use_cuda_graph=True
     infer.mla_absorb=absorb-without-precomp
-    infer.moe.prefill_token_dispatcher=deepep-nl
-    infer.moe.decode_token_dispatcher=deepep-ll
+    infer.moe.prefill_token_dispatcher=auto
+    infer.moe.decode_token_dispatcher=auto
 )
 bash "$SRUN_PATH" "$NODE" "$NUM_GPU_PER_NODE" \
     "$BENCHMARK_PATH" \

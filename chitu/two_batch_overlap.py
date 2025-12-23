@@ -36,7 +36,7 @@ def get_token_num_per_seq(
         return None
 
 
-# TODO: may smartly disable TBO when batch size is too small b/c it will slow down
+
 def compute_split_seq_index(
     task_type: TaskType,
     num_tokens: int,
@@ -97,7 +97,7 @@ def compute_split_token_index(
         raise NotImplementedError
 
 
-##这一部分的逻辑可以优化
+
 class TboPackedTasksPreparer:
     @classmethod
     def prepare(cls, packed: PackedTasks):
@@ -152,7 +152,6 @@ class TboPackedTasksPreparer:
 
     @classmethod
     def prepare_raw(cls, packed: PackedTasks):
-        """将一个 PackedTasks 拆成两个子 PackedTasks"""
         split_token_index = cls._compute_split_token_index(packed)
         
         child_a = cls.filter_packedtasks(
@@ -182,10 +181,6 @@ class TboPackedTasksPreparer:
         start_seq_index: int,
         end_seq_index: int,
     ) -> PackedTasks:
-        """
-        根据 token 范围过滤出新的 PackedTasks。
-        对应 filter_batch 的功能。
-        """
         new_tasks_ids = packed.task_ids[start_seq_index:end_seq_index]
         new_packed = PackedTasks(new_tasks_ids)
         new_packed.tbo_parent_token_range=(start_token_index, end_token_index),

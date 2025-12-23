@@ -10,12 +10,14 @@ from logging import getLogger
 logger = getLogger(__name__)
 
 
-_ENABLE_PROFILE = bool(int(os.environ.get("SGLANG_OPERATIONS_ENABLE_PROFILE", "0")))
-
-if _ENABLE_PROFILE:
-    import nvtx
-
-
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-SnippetCopyrightText: 2025 SGLang Team
+# SPDX-SnippetName: two batch overlap operations
+#
+# This implementation of the two batch overlap operations is originally from SGLang, 
+# (https://github.com/sgl-project/sglang/commit/0d4778802576cb81add26aa4c8787a589e0d0076),
+# licensed under Apache 2.0.
 def execute_operations(inputs, operations):
     stages = _convert_operations_to_stages(operations)
     executor = _StageExecutor("primary", stages, inputs=inputs)
@@ -201,3 +203,6 @@ def _decorate_operation(operation: Operation, debug_name_prefix: str):
         + getattr(operation, "__name__", "unknown").replace("op_", ""),
         fn=operation,
     )
+
+
+# SPDX-SnippetEnd
