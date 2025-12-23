@@ -24,40 +24,47 @@ logger = getLogger(__name__)
 
 class Scheduler:
     @staticmethod
-    def build(args, infer_args):
-        if get_dp_group().group_size > 1:
-            num_tasks_per_rank = ceil_div(
-                infer_args.max_reqs, get_dp_group().group_size
+    def build(args, infer_args, *, dp_rank: int):
+        max_reqs_per_dp = infer_args.max_reqs // infer_args.dp_size + int(
+            dp_rank < infer_args.max_reqs % infer_args.dp_size
+        )
+        if infer_args.prefill_chunk_size is not None:
+            prefill_chunk_size_per_dp: Optional[int] = (
+                infer_args.prefill_chunk_size // infer_args.dp_size
+                + int(dp_rank < infer_args.prefill_chunk_size % infer_args.dp_size)
             )
-            return DPFifoScheduler(num_tasks_per_rank)
+        else:
+            prefill_chunk_size_per_dp: Optional[int] = None
 
         if get_slot_handle():
             return SkewScheduler(
-                infer_args.max_reqs,
-                args.type.lower(),
-                infer_args.prefill_chunk_size,
+                max_reqs_per_dp,
+                dp_rank=dp_rank,
+                original_scheduler_type=args.type.lower(),
+                prefill_chunk_size=prefill_chunk_size_per_dp,
             )
 
         if infer_args.pp_size > 1:
             if args.pp_config.prefill_num_tasks_divided_by_pp:
-                prefill_num_tasks = ceil_div(infer_args.max_reqs, infer_args.pp_size)
+                prefill_num_tasks = ceil_div(max_reqs_per_dp, infer_args.pp_size)
             else:
                 prefill_num_tasks = args.pp_config.prefill_num_tasks
             if args.pp_config.enforce_decode_num_tasks_max:
-                decode_num_tasks = ceil_div(infer_args.max_reqs, infer_args.pp_size)
+                decode_num_tasks = ceil_div(max_reqs_per_dp, infer_args.pp_size)
             else:
                 decode_num_tasks = args.pp_config.decode_num_tasks
         else:
-            prefill_num_tasks = infer_args.max_reqs
-            decode_num_tasks = infer_args.max_reqs
+            prefill_num_tasks = max_reqs_per_dp
+            decode_num_tasks = max_reqs_per_dp
 
         return Scheduler(
             prefill_num_tasks,
             decode_num_tasks,
             Scheduler._normalize_scheduler_type(args.type.lower()),
             num_scheduler_groups=infer_args.pp_size,
+            dp_rank=dp_rank,
             original_scheduler_type=args.type.lower(),
-            prefill_chunk_size=infer_args.prefill_chunk_size,
+            prefill_chunk_size=prefill_chunk_size_per_dp,
         )
 
     @staticmethod
@@ -86,7 +93,9 @@ class Scheduler:
         prefill_num_tasks: int,
         decode_num_tasks: int,
         scheduler_type: str,
+        *,
         num_scheduler_groups: int,
+        dp_rank: int = 0,
         original_scheduler_type: str = None,
         prefill_chunk_size: Optional[int] = None,
     ):
@@ -112,6 +121,9 @@ class Scheduler:
             scheduler_type (str): The type of scheduling algorithm to use. Can be a single string, e.g,
                 "prefill_first", or a comma-separated string of multiple types for multi-key priority, e.g.,
                 "request_preset,prefill_first".
+            dp_rank: In case of DP, one Scheduler is dedicated for each rank, and `dp_rank` is the rank id.
+                Only tasks assigned to this DP rank or not assigned with a DP rank will be scheduled by this
+                Scheduler instance.
         """
 
         super().__init__()
@@ -126,9 +138,10 @@ class Scheduler:
         )  # scheduler group doesn't have any waiting task.
         self.used_sgroups = set()  # scheduler group has waiting tasks.
         self.sgroup_waiting_tasks = defaultdict(set)  # {sched_group_id: waiting_tasks}.
+        self.dp_rank = dp_rank
 
         # strict-only gating derived from original type string
-        self.strict_allowed_task_type = self._extract_strict_task_type(
+        self.strict_allowed_task_type: set[TaskType] = self._extract_strict_task_type(
             original_scheduler_type
             if original_scheduler_type is not None
             else scheduler_type
@@ -177,7 +190,10 @@ class Scheduler:
             return (fn(task),)
         return tuple(fn(task) for fn in self.scorers)
 
-    def schedule(self) -> list[str]:
+    def schedule(
+        self,
+        strict_allowed_task_type: set[TaskType] = {TaskType.Prefill, TaskType.Decode},
+    ) -> list[str]:
         if TaskPool.is_empty():
             logger.debug("TaskPool is empty, returning empty task list.")
             return []
@@ -187,29 +203,33 @@ class Scheduler:
             return []
 
         self.scheduling_ts = time.perf_counter_ns()
+
         # collect ready task ids
+        has_correct_dp_rank = (
+            lambda task: task.dp_rank is None or self.dp_rank == task.dp_rank
+        )
         task_ids = list(
             filter(
-                lambda x: not TaskPool.pool[x].waiting
+                lambda x: has_correct_dp_rank(TaskPool.pool[x])
+                and not TaskPool.pool[x].waiting
                 and not TaskPool.pool[x].need_remove(),
                 TaskPool.id_list,
             )
         )
 
         # enforce strict-only gating if enabled
-        if getattr(self, "strict_allowed_task_type", None) is not None:
-            task_ids = [
-                tid
-                for tid in task_ids
-                if TaskPool.pool[tid].task_type == self.strict_allowed_task_type
-            ]
-            if len(task_ids) == 0:
-                logger.debug(
-                    "Strict-only gating active and no allowed tasks available."
-                )
-                return []
+        strict_allowed_task_type = strict_allowed_task_type.intersection(
+            self.strict_allowed_task_type
+        )
+        if len(strict_allowed_task_type) == 0:
+            raise RuntimeError("No task type is allowed for this scheduling")
+        task_ids = [
+            tid
+            for tid in task_ids
+            if TaskPool.pool[tid].task_type in strict_allowed_task_type
+        ]
         if len(task_ids) == 0:
-            logger.debug("All tasks are waiting, returning empty task list.")
+            logger.debug("No avaliable tasks, returning empty task list.")
             return []
 
         task_ids.sort(
@@ -247,6 +267,7 @@ class Scheduler:
         for task_id in task_ids:
             TaskPool.pool[task_id].sched_ts = self.scheduling_ts
             TaskPool.pool[task_id].sched_group_id = sgroup_id
+            TaskPool.pool[task_id].dp_rank = self.dp_rank
 
         logger.debug(f"Selected task_ids:")
         for task_id in task_ids:
@@ -347,6 +368,11 @@ class Scheduler:
         )
 
         def has_enough_block():
+            # Eviction for DP rank > 0 is not supported yet, because we need a way
+            # to access the page table on another rank. (TODO)
+            if self.dp_rank > 0:
+                return True
+
             num_need_blocks = 0
             for task_id in decode_task_ids:
                 task = TaskPool.pool[task_id]
@@ -417,12 +443,13 @@ class Scheduler:
         task.prefill_chunk_size = None
         task.consumed_req_tokens = 0
         task.sched_group_id = None
+        task.dp_rank = None
 
         # For congestion control
         self.kvcache_block_threshold = max(1, self.kvcache_block_threshold // 2)
 
     @staticmethod
-    def _extract_strict_task_type(scheduler_type: str):
+    def _extract_strict_task_type(scheduler_type: str) -> set[TaskType]:
         """Return TaskType when strict-only is requested, otherwise None.
 
         Recognized tokens:
@@ -431,15 +458,15 @@ class Scheduler:
         If both appear, no strict gating will be applied.
         """
         if not scheduler_type:
-            return None
+            return {TaskType.Prefill, TaskType.Decode}
         parts = [p.strip().lower() for p in scheduler_type.split(",") if p.strip()]
         has_prefill_only = any(p == "prefill_only" for p in parts)
         has_decode_only = any(p == "decode_only" for p in parts)
         if has_prefill_only and not has_decode_only:
-            return TaskType.Prefill
+            return {TaskType.Prefill}
         if has_decode_only and not has_prefill_only:
-            return TaskType.Decode
-        return None
+            return {TaskType.Decode}
+        return {TaskType.Prefill, TaskType.Decode}
 
     def reorder_tasks_for_batching(self, task_ids):
         args = get_global_args()
@@ -468,16 +495,14 @@ class Scheduler:
         task_ids = cur_task_ids + unwait_task_ids
         task_ids = list(set(task_ids))
         self.reorder_tasks_for_batching(task_ids)
-        if not isinstance(self, DPFifoScheduler):
-            for task_id in task_ids:
-                # Update Task's sched_group_id and  sgroup_waiting_cnt
-                if (
-                    not TaskPool.pool[task_id].waiting
-                    and TaskPool.pool[task_id].sched_group_id is not None
-                ):
-                    sgroup_id = TaskPool.pool[task_id].sched_group_id
-                    self.sgroup_waiting_tasks[sgroup_id].remove(task_id)
-                    # TaskPool.pool[task_id].sched_group_id = None
+        for task_id in task_ids:
+            # Update Task's sched_group_id and sgroup_waiting_cnt
+            if (
+                not TaskPool.pool[task_id].waiting
+                and TaskPool.pool[task_id].sched_group_id is not None
+            ):
+                sgroup_id = TaskPool.pool[task_id].sched_group_id
+                self.sgroup_waiting_tasks[sgroup_id].remove(task_id)
         for task_id in task_ids:
             task = TaskPool.pool[task_id]
             if task.need_remove():
@@ -494,11 +519,10 @@ class Scheduler:
             logger.debug(f"[scheduler.update] removed_decode_tasks={removed_task_ids}")
 
         # Update used_sgroups and free_sgroups according to sgroup status
-        if not isinstance(self, DPFifoScheduler):
-            for sgroup_id in list(self.used_sgroups):
-                if len(self.sgroup_waiting_tasks[sgroup_id]) == 0:
-                    self.used_sgroups.remove(sgroup_id)
-                    self.free_sgroups.append(sgroup_id)
+        for sgroup_id in list(self.used_sgroups):
+            if len(self.sgroup_waiting_tasks[sgroup_id]) == 0:
+                self.used_sgroups.remove(sgroup_id)
+                self.free_sgroups.append(sgroup_id)
 
         if removed_task_ids:
             logger.info(
@@ -520,6 +544,8 @@ class SkewScheduler(Scheduler):
     def __init__(
         self,
         max_reqs: int,
+        *,
+        dp_rank: int = 0,
         original_scheduler_type: str,
         prefill_chunk_size: Optional[int] = None,
     ):
@@ -527,6 +553,7 @@ class SkewScheduler(Scheduler):
             ceil_div(max_reqs, get_slot_handle().num_slots),  # prefill_num_tasks
             ceil_div(max_reqs, get_slot_handle().num_slots),  # decode_num_tasks
             Scheduler._normalize_scheduler_type(original_scheduler_type),
+            dp_rank=dp_rank,
             num_scheduler_groups=get_slot_handle().num_slots,
             original_scheduler_type=original_scheduler_type,
             prefill_chunk_size=prefill_chunk_size,
@@ -540,8 +567,10 @@ class SkewScheduler(Scheduler):
         self.used_sgroups = set()  # used slot_group has one or more waiting task.
 
     @override
-    def schedule(self) -> list[str]:
-
+    def schedule(
+        self,
+        strict_allowed_task_type: set[TaskType] = {TaskType.Prefill, TaskType.Decode},
+    ) -> list[str]:
         # no available slot group
         if not self.free_sgroups:
             logger.debug("No available slot group, returning empty task list.")
@@ -561,19 +590,18 @@ class SkewScheduler(Scheduler):
         )
 
         # enforce strict-only gating if enabled
-        if getattr(self, "strict_allowed_task_type", None) is not None:
-            task_ids = [
-                tid
-                for tid in task_ids
-                if TaskPool.pool[tid].task_type == self.strict_allowed_task_type
-            ]
-            if len(task_ids) == 0:
-                logger.debug(
-                    "Strict-only gating active and no allowed tasks available."
-                )
-                return []
+        strict_allowed_task_type = strict_allowed_task_type.intersection(
+            self.strict_allowed_task_type
+        )
+        if len(strict_allowed_task_type) == 0:
+            raise RuntimeError("No task type is allowed for this scheduling")
+        task_ids = [
+            tid
+            for tid in task_ids
+            if TaskPool.pool[tid].task_type in strict_allowed_task_type
+        ]
         if len(task_ids) == 0:
-            logger.debug("All tasks are waiting, returning empty task list.")
+            logger.debug("No available tasks, returning empty task list.")
             return []
 
         # Prepare to schedule the earlist released free slot group
@@ -643,6 +671,10 @@ class SkewScheduler(Scheduler):
             ret_task_ids = ret_task_ids[:num_tasks]
 
         self.sgroup_waiting_tasks[sgroup_id] = set(ret_task_ids)
+
+        for task_id in sgroup:
+            TaskPool.pool[task_id].dp_rank = self.dp_rank
+
         return ret_task_ids
 
     def find_prefill_task_start_pos_sgroup(self, sgroup):
@@ -668,227 +700,3 @@ class SkewScheduler(Scheduler):
                         index = sgroup.index(task_id)
                         sgroup[index] = sgroup[-1]
                         sgroup.pop()
-
-
-class DPFifoScheduler(Scheduler):  # used for expert_data_parallel
-    def __init__(
-        self,
-        max_num_tasks: int,
-    ):
-        # max num tasks per dp instance
-        self.max_num_tasks_per_dp = max_num_tasks
-        self.dp_size = get_dp_group().group_size
-        self.pp_size = get_pp_group().group_size
-        self.have_task = None
-        self.kvcache_block_threshold = 0
-        self.is_warmup_stage = False
-        self._rr_owner_cursor = 0
-
-    def schedule(self) -> list[list[str]]:
-        self.have_task = False
-        # entry diagnostics
-        num_prefill = sum(
-            1
-            for _id in TaskPool.pool
-            if TaskPool.pool[_id].task_type == TaskType.Prefill
-            and not TaskPool.pool[_id].waiting
-        )
-        num_decode = sum(
-            1
-            for _id in TaskPool.pool
-            if TaskPool.pool[_id].task_type == TaskType.Decode
-            and not TaskPool.pool[_id].waiting
-            and not TaskPool.pool[_id].need_remove()
-        )
-        logger.debug(
-            f"[dpfifo.enter] prefill_ready={num_prefill} decode_ready={num_decode} pool_size={len(TaskPool.pool)}"
-        )
-        prefill_task_ids = filter(
-            lambda x: TaskPool.pool[x].task_type == TaskType.Prefill
-            and not TaskPool.pool[x].waiting,
-            TaskPool.pool.keys(),
-        )
-        prefill_task_ids = sorted(
-            prefill_task_ids,
-            key=lambda x: TaskPool.pool[x].req.start_time,
-            reverse=False,
-        )
-        prefill_task_ids = list(prefill_task_ids)
-
-        # During warmup prefill, select each task at most once per warmup epoch to match expected scheduling count
-        # However, if a task was selected but didn't complete prefill (due to budget constraints),
-        # it must be allowed to be scheduled again
-        if self.is_warmup_stage:
-            limited_ids = []
-            for tid in prefill_task_ids:
-                task = TaskPool.pool[tid]
-                # Allow task if: 1) never seen, OR 2) seen but not finished prefill
-                is_seen = getattr(task, "_warmup_prefill_seen", False)
-                has_remaining = task.consumed_req_tokens < task.prefix_tokens_len
-
-                if not is_seen or has_remaining:
-                    limited_ids.append(tid)
-                    if not is_seen:
-                        task._warmup_prefill_seen = True
-                if len(limited_ids) >= self.max_num_tasks_per_dp * self.dp_size:
-                    break
-            prefill_task_ids = limited_ids
-        else:
-            prefill_task_ids = prefill_task_ids[
-                : self.max_num_tasks_per_dp * self.dp_size
-            ]
-
-        if len(prefill_task_ids) > 0:
-            # 计算各 DP rank 当前占用（持有 KV 槽的请求），并据此得到剩余可分配槽位
-            occupied = [0 for _ in range(self.dp_size)]
-            for tid, t in TaskPool.pool.items():
-                owner = getattr(t, "cache_owner", None)
-                if (
-                    owner is not None
-                    and 0 <= owner < self.dp_size
-                    and not t.need_remove()
-                ):
-                    occupied[owner] += 1
-            free_slots = [
-                max(0, self.max_num_tasks_per_dp - occupied[r])
-                for r in range(self.dp_size)
-            ]
-
-            def next_rank_with_free_slot():
-                # 选择仍有空闲槽位的 rank；若无可用，返回 None
-                for _ in range(self.dp_size):
-                    r = self._rr_owner_cursor
-                    self._rr_owner_cursor = (self._rr_owner_cursor + 1) % self.dp_size
-                    if free_slots[r] > 0:
-                        return r
-                return None
-
-            task_lists = [[] for _ in range(self.dp_size)]
-            for task_id in prefill_task_ids:
-                task = TaskPool.pool[task_id]
-                owner = getattr(task, "cache_owner", None)
-                if owner is None:
-                    # 仅当该 rank 仍有空闲槽位时才为“首次出现”的请求分配 owner
-                    r = next_rank_with_free_slot()
-                    if r is None:
-                        # 所有 rank 均已满，跳过本轮对该新请求的调度，等待后续有槽释放
-                        continue
-                    task.cache_owner = r
-                    free_slots[r] -= 1
-                    task_lists[r].append(task_id)
-                else:
-                    # 已有 owner 的请求不会新增占用，允许继续在原 rank 调度
-                    if 0 <= owner < self.dp_size:
-                        task_lists[owner].append(task_id)
-
-            # per-rank chunk prefill slicing if enabled
-            prefill_chunk_size = get_global_args().infer.prefill_chunk_size
-            if prefill_chunk_size is not None and prefill_chunk_size > 0:
-                base = prefill_chunk_size // self.dp_size
-                rem = prefill_chunk_size % self.dp_size
-                logger.debug(
-                    f"[dpfifo.prefill] dp_size={self.dp_size} chunk={prefill_chunk_size} base={base} rem={rem} prefill_candidates={[len(x) for x in task_lists]}"
-                )
-                for r in range(self.dp_size):
-                    budget = base + (rem if r == 0 else 0)
-                    if budget <= 0:
-                        task_lists[r] = []
-                        continue
-                    assigned = 0
-                    new_list = []
-                    for tid in task_lists[r]:
-                        task = TaskPool.pool[tid]
-                        remaining = task.prefix_tokens_len - task.consumed_req_tokens
-                        if remaining <= 0:
-                            continue
-                        take = min(remaining, max(0, budget - assigned))
-                        if take <= 0:
-                            break
-                        task.set_prefill_chunk_size_for_one_step(take)
-                        new_list.append(tid)
-                        assigned += take
-                        if assigned >= budget:
-                            break
-
-                    logger.debug(
-                        f"[dpfifo.prefill] rank={r} budget={budget} assigned={assigned} selected={len(new_list)} ids={new_list}"
-                    )
-                    task_lists[r] = new_list
-
-            # make sure tasks do not exceed max_num_tasks_per_dp
-            for i in range(self.dp_size):
-                if len(task_lists[i]) > self.max_num_tasks_per_dp:
-                    task_lists[i] = task_lists[i][: self.max_num_tasks_per_dp]
-            self.have_task = any(len(lst) > 0 for lst in task_lists)
-            logger.debug(
-                f"[dpfifo.prefill] selected per-rank sizes={[len(x) for x in task_lists]} have_task={self.have_task}"
-            )
-
-            # Fallback: prefill candidates存在，但本轮chunk切完后为空，尝试直接调度 decode 任务，避免空步导致卡住
-            # But during warmup stage, we should NOT schedule decode during prefill phase
-            if not self.have_task and not self.is_warmup_stage:
-                decode_task_ids = [
-                    tid
-                    for tid in TaskPool.pool.keys()
-                    if TaskPool.pool[tid].task_type == TaskType.Decode
-                    and not TaskPool.pool[tid].waiting
-                    and not TaskPool.pool[tid].need_remove()
-                ]
-                task_lists = [[] for _ in range(self.dp_size)]
-                for tid in decode_task_ids:
-                    task = TaskPool.pool[tid]
-                    owner = getattr(task, "cache_owner", 0) % self.dp_size
-                    task_lists[owner].append(tid)
-
-                # 截断到每 rank 上限
-                for i in range(self.dp_size):
-                    if len(task_lists[i]) > self.max_num_tasks_per_dp:
-                        task_lists[i] = task_lists[i][: self.max_num_tasks_per_dp]
-
-                self.have_task = any(len(lst) > 0 for lst in task_lists)
-
-                logger.debug(
-                    f"[dpfifo.fallback_decode] decode_per_rank={[len(x) for x in task_lists]} have_task={self.have_task}"
-                )
-        else:
-            # no prefill tasks - schedule decode tasks
-            # During warmup stage, skip decode scheduling during prefill phase
-            if self.is_warmup_stage:
-                logger.debug(f"[dpfifo.decode] skip decode during warmup prefill phase")
-                task_lists = [[] for _ in range(self.dp_size)]
-            else:
-                decode_task_ids = filter(
-                    lambda x: TaskPool.pool[x].task_type == TaskType.Decode
-                    and not TaskPool.pool[x].waiting
-                    and not TaskPool.pool[x].need_remove(),
-                    TaskPool.pool.keys(),
-                )
-
-                decode_task_ids = list(decode_task_ids)
-                logger.debug(
-                    f"[dpfifo.decode] decode_candidates={len(decode_task_ids)}"
-                )
-
-                # For decode tasks, we need to make sure they are sent to their cache owner
-                task_lists = [[] for _ in range(self.dp_size)]
-                if len(decode_task_ids) > 0:
-                    self.have_task = True
-
-                for task_id in decode_task_ids:
-                    task = TaskPool.pool[task_id]
-                    task_lists[task.cache_owner].append(task_id)
-
-                # make sure tasks do not exceed max_num_tasks_per_dp
-                for i in range(self.dp_size):
-                    if len(task_lists[i]) > self.max_num_tasks_per_dp:
-                        task_lists[i] = task_lists[i][: self.max_num_tasks_per_dp]
-
-        if self.have_task:
-            DPTaskCollector.prepare_dp_tasks(task_lists)
-            logger.debug(
-                f"[dpfifo.return] have_task=True per-rank={[len(x) for x in task_lists]}"
-            )
-            return task_lists[0]
-        else:
-            logger.debug("[dpfifo.return] have_task=False")
-            return []

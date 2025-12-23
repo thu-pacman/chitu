@@ -195,16 +195,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     ):
         seq_len_delta = self.cache.seq_len_delta
         use_precomputed_states = seq_len_delta.is_classic_decoding
-        seq_len_list = seq_len_delta.new.lens_list
 
         cache_accessor = self.cache.get_accessor(self.layer_id)
-        if use_precomputed_states:
-            conv_state = read_from_singleton_paged_kv_cache(
-                cache_accessor.kv["conv_state"], cache_accessor.block_table
-            )
-            recurrent_state = read_from_singleton_paged_kv_cache(
-                cache_accessor.kv["recurrent_state"], cache_accessor.block_table
-            )
+        conv_state = read_from_singleton_paged_kv_cache(
+            cache_accessor.kv["conv_state"], cache_accessor.block_table
+        )
+        recurrent_state = read_from_singleton_paged_kv_cache(
+            cache_accessor.kv["recurrent_state"], cache_accessor.block_table
+        )
 
         qkvz = self.in_proj_qkvz(x)
         ba = self.in_proj_ba(x)
@@ -219,13 +217,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             # qkv: (bsz, hidden_size), conv_state: (bsz, hidden_size, state_len)
         else:
             assert (
-                sum(seq_len_list) == qkv.shape[0]
-            ), f"seq_len unequal: {sum(seq_len_list)} vs {qkv.shape[0]} , Detail: {seq_len_list} vs {qkv.shape}"
+                seq_len_delta.delta_prefix_lens_tensor_device[-1].item() == qkv.shape[0]
+            ), f"layer[{self.layer_id}] seq_len unequal: {seq_len_delta.delta_prefix_lens_tensor_device[-1].item()} vs {qkv.shape[0]} , Detail: {seq_len_delta.delta_prefix_lens_tensor_device} vs {qkv.shape}"
             qkv, conv_state = causal_conv1d_prefill(
                 qkv,
+                conv_state,
                 self.conv1d.weight,
-                seq_len_delta.new.prefix_lens_tensor_device,
-                int(self.conv1d.padding[0]),
+                seq_len_delta.delta_prefix_lens_tensor_device,
             )
             # qkv: (total_len, hidden_size), conv_state: (total_len, hidden_size, state_len)
 
@@ -252,19 +250,17 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             self.n_v_heads // self.n_qk_heads, dim=1
         )  # (total_len, n_v_heads, head_dim)
         if not use_precomputed_states:
-            prefix_lens = seq_len_delta.new.prefix_lens_tensor_device
-
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 q.unsqueeze(0),
                 k.unsqueeze(0),
                 v.unsqueeze(0),
                 g=g.unsqueeze(0),
                 beta=beta.unsqueeze(0),
-                initial_state=None,
+                initial_state=recurrent_state,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens=prefix_lens,
-                seq_len_list=seq_len_list,
+                cu_seqlens=seq_len_delta.delta_prefix_lens_tensor_device,
+                seq_len_list=seq_len_delta.delta_lens_list,
                 impl=self.impl,
             )
         else:

@@ -375,6 +375,7 @@ class Task:
         self.task_type = TaskType.Prefill  # New Task object is always a prefill task
         self.stop_with_eos = stop_with_eos
         self.params = params if params is not None else req.params
+        self.dp_rank: Optional[int] = None
         self._prefix_tokens = tokens if tokens is not None else req.prompt_tokens
         self._decode_status = TaskDecodeType.Normal
 

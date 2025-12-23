@@ -93,9 +93,9 @@ def causal_conv1d_update_ref(
 
 def causal_conv1d_prefill(
     inputs: torch.Tensor,
+    conv_state: torch.Tensor,
     weight: torch.Tensor,
     prefix_lens: torch.Tensor,
-    padding: int,
     impl: str = "auto",
 ):
     """
@@ -103,7 +103,6 @@ def causal_conv1d_prefill(
         inputs: (total_len, hidden_size)
         weight: (hidden_size, 1 conv_kernel_size)
         prefix_lens: (bsz,), prefix lengths of this inputs
-        padding: convolution padding
         impl: optional, triton,ref
     Return:
         outputs: (total_len, hidden_size)
@@ -115,25 +114,26 @@ def causal_conv1d_prefill(
         else:
             impl = "ref"
     if impl == "ref":
-        return causal_conv1d_prefill_ref(inputs, weight, prefix_lens, padding)
+        return causal_conv1d_prefill_ref(inputs, conv_state, weight, prefix_lens)
     elif impl == "triton":
-        return causal_conv1d_prefill_triton(inputs, weight, prefix_lens, padding)
+        return causal_conv1d_prefill_triton(inputs, conv_state, weight, prefix_lens)
     else:
         assert ValueError(f"Unsupported causal_conv1d_prefill impl: {impl}")
 
 
 def causal_conv1d_prefill_ref(
     inputs: torch.Tensor,
+    conv_state: torch.Tensor,
     weight: torch.Tensor,
     prefix_lens: torch.Tensor,
-    padding: int,
 ):
     total_len, hidden_size = inputs.shape
     conv_kernel_size = weight.shape[2]
     bsz = prefix_lens.shape[0] - 1
 
     outputs = []  # list[tensor(actual_len, hidden_size)]
-    conv_states = []
+
+    new_conv_state = []  # list[tensor(bsz,hidden_size,conv_kernel_size)]
 
     for idx in range(bsz):
         actual_len = prefix_lens[idx + 1] - prefix_lens[idx]
@@ -141,14 +141,17 @@ def causal_conv1d_prefill_ref(
             prefix_lens[idx] : prefix_lens[idx + 1]
         ]  # (actual_len, hidden_size)
         chunk = chunk.transpose(0, 1).unsqueeze(0)  # (1, hidden_size, actual_len)
-        conv_states.append(F.pad(chunk, (conv_kernel_size - chunk.shape[-1], 0)))
+
+        chunk = torch.cat([conv_state[idx, :, -3:].unsqueeze(0), chunk], dim=-1)
+        new_conv_state.append(chunk[:, :, -conv_kernel_size:])
+
         chunk = F.silu(
-            F.conv1d(chunk, weight, padding=padding, groups=hidden_size)[
-                :, :, :actual_len
-            ]
+            F.conv1d(chunk, weight, padding=0, groups=hidden_size)[:, :, :actual_len]
         )
         outputs.append(chunk.squeeze(0).transpose(0, 1))
 
     outputs = torch.cat(outputs, dim=0)  # (total_len,hidden_size)
-    conv_states = torch.cat(conv_states, dim=0)  # (bsz,hidden_size,conv_kernel_size)
-    return outputs, conv_states
+    new_conv_state = torch.cat(
+        new_conv_state, dim=0
+    )  # (bsz,hidden_size,conv_kernel_size)
+    return outputs, new_conv_state
