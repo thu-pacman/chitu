@@ -233,21 +233,21 @@ class AttentionHFLlama(Attention):
         return self._run_output_linear(output).reshape(x.shape)
         
     def op_prepare(self, state: _StateDict):
-            x=state.pop("hidden_states_after_input_layernorm")
-            xq, xk, xv = self._run_linear(x)
+        x=state.pop("hidden_states_after_input_layernorm")
+        xq, xk, xv = self._run_linear(x)
 
-            bs_seq = xq.numel() // xq.shape[-1]
-            xq = xq.view(bs_seq, self.n_local_heads, self.head_dim).contiguous()
-            xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
-            xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
+        bs_seq = xq.numel() // xq.shape[-1]
+        xq = xq.view(bs_seq, self.n_local_heads, self.head_dim).contiguous()
+        xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
+        xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
 
-            if hasattr(self, "q_norm"):
-                xq = self.q_norm(xq)
-            if hasattr(self, "k_norm"):
-                xk = self.k_norm(xk)
+        if hasattr(self, "q_norm"):
+            xq = self.q_norm(xq)
+        if hasattr(self, "k_norm"):
+            xk = self.k_norm(xk)
 
-            xq, xk = apply_rotary_pos_emb(xq, xk, state.freqs_cis, rotary_type=self.rotary_type)
-            state.attn_intermediate_state = (xq, xk, xv)
+        xq, xk = apply_rotary_pos_emb(xq, xk, state.freqs_cis, rotary_type=self.rotary_type)
+        state.attn_intermediate_state = (xq, xk, xv)
 
     def op_core(self, state: _StateDict):
         xq, xk, xv = state.pop("attn_intermediate_state")

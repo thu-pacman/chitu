@@ -246,24 +246,24 @@ class KVCacheManagerBase:
         )
         if get_global_args().infer.enable_two_batch_overlap:
             self.tbo_split_seq_index = None
-            self.max_two_batch_size = (num_hot_req + 1) // 2
-            self.max_two_batch_total_len = self.max_two_batch_size * max_seq_len
+            self.max_subbatch_size = (num_hot_req + 1) // 2
+            self.max_subbatch_total_len = self.max_subbatch_size * max_seq_len
             # prefill_chunk_size is for each microbatch
-            self.max_two_batch_total_delta_len = max(
+            self.max_subbatch_total_delta_len = max(
                 (
                     prefill_chunk_size
                     if prefill_chunk_size is not None
-                    else self.max_two_batch_size * max_seq_len
+                    else self.max_subbatch_size * max_seq_len
                 ),  # prefill
-                self.max_two_batch_size,  # decode
+                self.max_subbatch_size,  # decode
             )
             self.two_batch_seq_len_delta = [
                 BatchedSeqLenDelta(
                     device=self.device,
                     tbo_subbatch_index=i,
-                    max_batch_size=self.max_two_batch_size,
-                    max_total_len=self.max_two_batch_total_len,
-                    max_total_delta_len=self.max_two_batch_total_delta_len,
+                    max_batch_size=self.max_subbatch_size,
+                    max_total_len=self.max_subbatch_total_len,
+                    max_total_delta_len=self.max_subbatch_total_delta_len,
                     cache_prefix_lens_tensor_device=True,
                     cache_position_ids_tensor_device=True,
                     cache_seq_ids_tensor_device=True,
@@ -303,7 +303,7 @@ class KVCacheManagerBase:
             cache_seq_ids_tensor_device=False,
         )
         self.seq_len_delta.copy_from(prev_seq_len, next_seq_len)
-        if get_global_args().infer.enable_two_batch_overlap and tbo_split_seq_index is not None:
+        if get_global_args().infer.enable_two_batch_overlap:
             self.tbo_split_seq_index = tbo_split_seq_index
             for i in range(2):
                 input_slice = slice(0,tbo_split_seq_index) if i == 0 else slice(tbo_split_seq_index,None)
@@ -805,14 +805,8 @@ class DenseKVCacheManager(KVCacheManagerBase):
         return start_idx, end_idx
 
     @override
-    def prepare_cache_prefill(
-        self,
-        req_ids: list[str],
-        delta_seq_len: list[int],
-    ):
-        super().prepare_cache_prefill(
-            req_ids, delta_seq_len
-        )
+    def prepare_cache_prefill(self, req_ids: list[str], delta_seq_len: list[int]):
+        super().prepare_cache_prefill(req_ids, delta_seq_len)
 
         # get start_idx and end_idx of current slot_group
         start_idx, end_idx = self.get_start_and_end_idx()
@@ -837,15 +831,9 @@ class DenseKVCacheManager(KVCacheManagerBase):
         self._prepare_cache(req_ids, start_pos)
 
     @override
-    def prepare_cache_decode(
-        self,
-        req_ids: list[str],
-        
-    ):
+    def prepare_cache_decode(self, req_ids: list[str]):
         self.timers("cache_prepare").start()
-        super().prepare_cache_decode(
-            req_ids
-        )
+        super().prepare_cache_decode(req_ids)
         start_pos = self.get_start_and_end_idx()[0]
         self._prepare_cache(req_ids, start_pos)
         self.timers("cache_prepare").stop()

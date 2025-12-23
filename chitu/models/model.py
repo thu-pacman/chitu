@@ -709,7 +709,7 @@ class Transformer(nn.Module):
     def _init_post_layers(self):
         raise NotImplementedError
 
-    def _pre_layers(self, h, **args):
+    def _pre_layers(self, h, **kwargs):
         raise NotImplementedError
 
     def _post_layers(self, h):
@@ -812,13 +812,13 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def prefill_pipeline(
-        self, tokens, output_token_offsets: torch.Tensor, **args
+        self, tokens, output_token_offsets: torch.Tensor, **kwargs
     ) -> torch.Tensor:
         freqs_cis = self.prepare_freqs_cis()
 
         # start of model
         if self.pp_stage == 0:
-            h = self._pre_layers(tokens, **args)
+            h = self._pre_layers(tokens, **kwargs)
         else:
             h = tokens
 
@@ -851,13 +851,13 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def prefill(
-        self, tokens, output_token_offsets: torch.Tensor, **args
+        self, tokens, output_token_offsets: torch.Tensor, **kwargs
     ) -> torch.Tensor:
         self.attn_backend.prepare_metadata_for_prefill(self.cache.seq_len_delta)
         if self.pipeline_exec:
-            return self.prefill_pipeline(tokens, output_token_offsets, **args)
+            return self.prefill_pipeline(tokens, output_token_offsets, **kwargs)
         else:
-            return self.prefill_no_pipeline(tokens, output_token_offsets, **args)
+            return self.prefill_no_pipeline(tokens, output_token_offsets, **kwargs)
 
     def prepare_decoding_attn(self):
         block_table = self.cache.get_gpu_block_table()
@@ -869,7 +869,7 @@ class Transformer(nn.Module):
         )
 
     @torch.inference_mode()
-    def decode(self, tokens, batch_size, **args):
+    def decode(self, tokens, batch_size, **kwargs):
         if isinstance(self.cache, DenseKVCacheManager):
             key = (batch_size, self.cache.get_start_and_end_idx()[0])
         elif isinstance(self.cache, PagedKVCacheManager):
@@ -923,7 +923,7 @@ class Transformer(nn.Module):
                 if self.pipeline_exec:
                     return self.decode_pipeline(tokens, freqs_cis)
                 else:
-                    return self.decode_no_pipeline(tokens, freqs_cis, **args)
+                    return self.decode_no_pipeline(tokens, freqs_cis, **kwargs)
 
             self.do_decode_callable = do_decode
 

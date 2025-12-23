@@ -10,10 +10,6 @@ import torch
 from chitu.static_tensor import StaticTensor
 from chitu.cuda_graph import cuda_graph_safe_cached_property
 from chitu.utils import invalidate_cached_property
-import logging
-from logging import getLogger
-
-logger = getLogger(__name__)
 
 
 class BatchedSeqLen:
@@ -256,7 +252,6 @@ class BatchedSeqLen:
     @functools.cached_property
     def total_len(self) -> int:
         return int(self.lens_tensor_cpu.sum())
-
 
 
 class BatchedSeqLenDelta:

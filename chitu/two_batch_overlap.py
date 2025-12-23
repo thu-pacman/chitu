@@ -56,30 +56,8 @@ def compute_split_seq_index(
         raise NotImplementedError()
 
 
-def _is_two_chunk_split_enabled(prefill_lens: Sequence[int]) -> bool:
-    return False
-
-
 def _split_prefill_seqs(arr: Sequence[int]) -> int:
-    if _is_two_chunk_split_enabled(arr):
-        return _split_array_by_cum_less_than_half(arr)
-
     return _split_array_by_balanced_sum(arr)
-
-
-def _split_array_by_cum_less_than_half(arr: Sequence[int]) -> int:
-    left_sum = 0
-    overall_sum = sum(arr)
-    half_sum = overall_sum // 2
-    chosen_index = 0
-
-    for i in range(len(arr)):
-        left_sum += arr[i]
-        if left_sum > half_sum:
-            chosen_index = i
-            break
-
-    return chosen_index
 
 
 def _split_array_by_balanced_sum(arr: Sequence[int]) -> int:
