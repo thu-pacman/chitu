@@ -98,7 +98,7 @@ class Backend:
     pp_main_rank = None
 
     # components
-    scheduler: Optional["Scheduler"] = None
+    schedulers: Optional[list["Scheduler"]] = None  # One per each DP rank
     executor: Optional["Executor"] = None
 
     # mutable

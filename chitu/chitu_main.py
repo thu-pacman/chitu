@@ -8,6 +8,7 @@ import operator
 import os
 from logging import getLogger
 import psutil
+import traceback
 
 import torch
 import torch.distributed
@@ -150,7 +151,8 @@ def _auto_set_num_blocks_after_warmup(args):
         if new_num_block > 0:
             Backend.cache_manager.realloc(new_num_block)
         if torch.distributed.get_rank() == 0:
-            Backend.scheduler.reset_kvcache_block_threshold()
+            for scheduler in Backend.schedulers:
+                scheduler.reset_kvcache_block_threshold()
     else:
         logger.info(
             f"skip auto set num blocks after warmup because {args.infer.num_blocks=}"
@@ -196,7 +198,8 @@ def _warmup_via_taskpool(args):
             task = Task(f"{req.request_id}", req, stop_with_eos=False)
             TaskPool.add(task)
         logger.info(f"Added {num_warmup_reqs} warmup requests to TaskPool")
-        Backend.scheduler.start_warmup()
+        for scheduler in Backend.schedulers:
+            scheduler.start_warmup()
 
     # Prefill phase
     # In DP chunk prefill, each schedule processes approximately `prefill_chunk_size` tokens across the whole DP group.
@@ -259,7 +262,8 @@ def _warmup_via_taskpool(args):
             len(TaskPool.pool) == num_warmup_reqs
         ), f"Expected {num_warmup_reqs} tasks after prefill, found {len(TaskPool.pool)}"
         # End warmup prefill phase before starting decode phase
-        Backend.scheduler.end_warmup()
+        for scheduler in Backend.schedulers:
+            scheduler.end_warmup()
 
         decode_iter = 0
         while not TaskPool.all_finished():
@@ -347,7 +351,8 @@ def warmup_engine(args):
     #         get_global_args().infer.num_blocks = new_num_block
     #         Backend.cache_manager.realloc(new_num_block)
     #         if torch.distributed.get_rank() == 0:
-    #             Backend.scheduler.reset_kvcache_block_threshold()
+    #             for scheduler in Backend.schedulers:
+    #                 scheduler.reset_kvcache_block_threshold()
     #     return
 
     # PD→direct，非PD→taskpool
@@ -438,11 +443,6 @@ def chitu_init(args):
         args.infer.prefill_chunk_size = args.infer.max_reqs * args.infer.max_seq_len
 
     if args.infer.prefill_chunk_size is not None:
-        if args.infer.dp_size > 1 and args.infer.pp_size > 1:
-            logger.warning(
-                "Disabling infer.prefill_chunk_size because it is not compatible with DP+PP yet"
-            )
-            args.infer.prefill_chunk_size = None
         if args.infer.pp_size > 1 and args.infer.cache_type == "skew":
             logger.warning(
                 "Disabling infer.prefill_chunk_size because it is not compatible with PP+skew yet"
@@ -535,8 +535,10 @@ def chitu_init(args):
     Backend.build(args)
     rank = torch.distributed.get_rank()
     if rank == 0:
-        scheduler = Scheduler.build(args.scheduler, args.infer)
-        Backend.scheduler = scheduler
+        Backend.schedulers = [
+            Scheduler.build(args.scheduler, args.infer, dp_rank=i)
+            for i in range(args.infer.dp_size)
+        ]
     executor = Executor.build(args)
     Backend.executor = executor
     PackedTasks.configure(max_num_tasks=args.infer.max_reqs)
@@ -581,7 +583,26 @@ def remove_kvcache_all_device(remove_task_ids):
 
 @torch.inference_mode()
 def chitu_run_main_rank():
-    task_ids = Backend.scheduler.schedule()
+    if Backend.args.infer.dp_size == 1:
+        assert len(Backend.schedulers) == 1
+        task_ids = Backend.schedulers[0].schedule()
+    else:
+        task_ids_list = []
+        strict_allowed_task_type = {TaskType.Prefill, TaskType.Decode}
+        for scheduler in Backend.schedulers:
+            task_ids = scheduler.schedule(
+                strict_allowed_task_type=strict_allowed_task_type
+            )
+            if len(task_ids) > 0:
+                strict_allowed_task_type = strict_allowed_task_type.intersection(
+                    {TaskPool.pool[task_ids[0]].task_type}
+                )
+            task_ids_list.append(task_ids)
+        if any((len(task_ids) > 0 for task_ids in task_ids_list)):
+            DPTaskCollector.prepare_dp_tasks(task_ids_list)
+            task_ids = task_ids_list[0]
+        else:
+            task_ids = []
 
     if task_ids or DPTaskCollector.has_available_tasks():
         # compute
@@ -605,18 +626,50 @@ def chitu_run_main_rank():
     if Backend.args.infer.pp_size > 1:
         unwait_task_ids = PPTaskCollector.unwait_task_ids()
         PPTaskCollector.clear()
+
+    # Collect tasks by DP rank. All tasks that have run shoule have dp_rank.
+    task_ids_per_dp = []
+    unwait_task_ids_per_dp = []
+    assert not any(
+        filter(lambda task_id: TaskPool.pool[task_id].dp_rank is None, task_ids_per_dp)
+    )
+    assert not any(
+        filter(
+            lambda task_id: TaskPool.pool[task_id].dp_rank is None,
+            unwait_task_ids_per_dp,
+        )
+    )
+    for i in range(Backend.args.infer.dp_size):
+        is_this_rank = lambda task_id: TaskPool.pool[task_id].dp_rank == i
+        task_ids_per_dp.append(list(filter(is_this_rank, task_ids)))
+        unwait_task_ids_per_dp.append(list(filter(is_this_rank, unwait_task_ids)))
+
     # tasks from the model-running tasks (task_ids) which will not run anymore
-    removed_decode_task_ids = Backend.scheduler.update(task_ids, unwait_task_ids)
+    removed_decode_task_ids = []
+    for i in range(Backend.args.infer.dp_size):
+        dp_local_removed_decode_task_ids = Backend.schedulers[i].update(
+            task_ids_per_dp[i], unwait_task_ids_per_dp[i]
+        )
+        removed_decode_task_ids += dp_local_removed_decode_task_ids
     remove_kvcache_all_device(removed_decode_task_ids)
     return backend_payload_type
 
 
 @torch.inference_mode()
 def chitu_run():
-    rank = torch.distributed.get_rank()
-    if rank != 0:
-        return Backend.executor.step(None)
-    return chitu_run_main_rank()
+    try:
+        rank = torch.distributed.get_rank()
+        if rank != 0:
+            return Backend.executor.step(None)
+        return chitu_run_main_rank()
+    except Exception as e:
+        # Prepend rank ID before the message
+        msg = "\n".join(
+            [f"[Rank {rank}] {line}" for line in traceback.format_exc().split("\n")]
+        )
+        raise Exception(
+            msg
+        ) from None  # `msg` already contains traceback, so raise from None
 
 
 async def start_enhanced_scheduler_service(rank: int, dp_config, args):
@@ -675,8 +728,6 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
             f"[Enhanced Scheduler {dp_id}] DP Token Manager failed to start: {e}"
         )
         # print stack trace
-        import traceback
-
         logger.error(
             f"[Enhanced Scheduler {dp_id}] DP Token Manager failed to start: {traceback.format_exc()}"
         )
@@ -826,8 +877,6 @@ async def process_scheduler_request(rank: int, request_data: dict):
 
     except Exception as e:
         logger.error(f"[Enhanced Scheduler {dp_id}] Failed to process request: {e}")
-        import traceback
-
         logger.error(
             f"[Enhanced Scheduler {dp_id}] Error details: {traceback.format_exc()}"
         )
