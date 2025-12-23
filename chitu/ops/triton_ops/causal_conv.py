@@ -132,8 +132,6 @@ def causal_conv1d_update_triton(
         this_hidden_states: [bsz, hidden_size]
         old_hidden_states: [bsz, hidden_size, state_len]
         weight: [hidden_size, 1, state_len]
-        inplace: True -> reuse old_hidden_states for new_hidden_states
-                 False -> allocate new tensor
     Returns:
         out: [bsz, hidden_size]
         new_hidden_states: [bsz, hidden_size, state_len]
@@ -217,24 +215,27 @@ def causal_conv1d_update_triton(
 @triton.jit
 def causal_conv1d_prefill_kernel(
     inputs_ptr,
+    old_state_ptr,
     weight_ptr,
     prefix_lens,
     outputs_ptr,
-    conv_states_ptr,
+    new_state_ptr,
     total_len,
     hidden_size,
     conv_kernel_size,
     bs,
-    padding,
     stride_in_l,
     stride_in_h,
     stride_w_h,
     stride_w_k,
     stride_out_l,
     stride_out_h,
-    stride_cs_b,
-    stride_cs_h,
-    stride_cs_k,
+    stride_ocs_b,
+    stride_ocs_h,
+    stride_ocs_k,
+    stride_ncs_b,
+    stride_ncs_h,
+    stride_ncs_k,
     BLOCK_H: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
@@ -257,12 +258,32 @@ def causal_conv1d_prefill_kernel(
         acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
 
         for k in range(conv_kernel_size):
-            inp_pos = pos - padding + k  # Input position
+            inp_pos = pos - conv_kernel_size + 1 + k  # Input position
 
             if inp_pos >= 0 and inp_pos < seq_len:
                 # Load input
                 inp_idx = seq_start + inp_pos
                 inp_ptrs = inputs_ptr + inp_idx * stride_in_l + h_offs * stride_in_h
+                inp_vals = tl.load(inp_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+
+                # Load weight
+                weight_ptrs = weight_ptr + h_offs * stride_w_h + k * stride_w_k
+                weight_vals = tl.load(weight_ptrs, mask=h_mask, other=0.0).to(
+                    tl.float32
+                )
+
+                # Accumulate
+                acc += inp_vals * weight_vals
+
+            elif inp_pos < 0:
+                # Load padding(old conv state)
+                inp_idx = conv_kernel_size + inp_pos
+                inp_ptrs = (
+                    old_state_ptr
+                    + pid_b * stride_ocs_b
+                    + h_offs * stride_ocs_h
+                    + inp_idx * stride_ocs_k
+                )
                 inp_vals = tl.load(inp_ptrs, mask=h_mask, other=0.0).to(tl.float32)
 
                 # Load weight
@@ -293,32 +314,38 @@ def causal_conv1d_prefill_kernel(
             inp_ptrs = inputs_ptr + inp_idx * stride_in_l + h_offs * stride_in_h
             state_vals = tl.load(inp_ptrs, mask=h_mask, other=0.0)
         else:
-            # Padding
-            state_vals = tl.zeros((BLOCK_H,), dtype=input_dtype)
+            ocs_ptrs = (
+                old_state_ptr
+                + pid_b * stride_ocs_b
+                + h_offs * stride_ocs_h
+                + (conv_kernel_size + inp_pos) * stride_ocs_k
+            )
+            state_vals = tl.load(ocs_ptrs, mask=h_mask, other=0.0)
 
         # Store conv state
-        cs_ptrs = (
-            conv_states_ptr
-            + pid_b * stride_cs_b
-            + h_offs * stride_cs_h
-            + k * stride_cs_k
+        ncs_ptrs = (
+            new_state_ptr
+            + pid_b * stride_ncs_b
+            + h_offs * stride_ncs_h
+            + k * stride_ncs_k
         )
-        tl.store(cs_ptrs, state_vals, mask=h_mask)
+        tl.store(ncs_ptrs, state_vals, mask=h_mask)
 
 
 def causal_conv1d_prefill_triton(
     inputs: torch.Tensor,
+    conv_state: torch.Tensor,
     weight: torch.Tensor,
     prefix_lens: torch.Tensor,
-    padding: int,
 ):
     total_len, hidden_size = inputs.shape
     conv_kernel_size = weight.shape[2]
     bsz = prefix_lens.shape[0] - 1
+    assert conv_state.shape == (bsz, hidden_size, conv_kernel_size)
 
     # Allocate outputs
     outputs = torch.empty_like(inputs)
-    conv_states = torch.zeros(
+    new_conv_state = torch.zeros(
         bsz, hidden_size, conv_kernel_size, dtype=inputs.dtype, device=inputs.device
     )
 
@@ -328,32 +355,36 @@ def causal_conv1d_prefill_triton(
     stride_in_l, stride_in_h = inputs.stride()
     stride_w_h, stride_w_k = weight_2d.stride()
     stride_out_l, stride_out_h = outputs.stride()
-    stride_conv_b, stride_conv_h, stride_conv_k = conv_states.stride()
+    stride_new_state_b, stride_new_state_h, stride_new_state_k = new_conv_state.stride()
+    stride_old_state_b, stride_old_state_h, stride_old_state_k = conv_state.stride()
 
     BLOCK_H = 256
     grid = (bsz, triton.cdiv(hidden_size, BLOCK_H))
 
     causal_conv1d_prefill_kernel[grid](
         inputs,
+        conv_state,
         weight_2d,
         prefix_lens,
         outputs,
-        conv_states,
+        new_conv_state,
         total_len,
         hidden_size,
         conv_kernel_size,
         bsz,
-        padding,
         stride_in_l,
         stride_in_h,
         stride_w_h,
         stride_w_k,
         stride_out_l,
         stride_out_h,
-        stride_conv_b,
-        stride_conv_h,
-        stride_conv_k,
+        stride_old_state_b,
+        stride_old_state_h,
+        stride_old_state_k,
+        stride_new_state_b,
+        stride_new_state_h,
+        stride_new_state_k,
         BLOCK_H,
     )
 
-    return outputs, conv_states
+    return outputs, new_conv_state

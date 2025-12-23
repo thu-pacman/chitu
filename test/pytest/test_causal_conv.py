@@ -38,6 +38,7 @@ def test_causal_conv1d_update(batch_size, hidden_size, state_len, impl):
     "prefix_lens",
     [
         torch.tensor([0, 4, 1024, 2048, 4096], device="cuda"),
+        torch.tensor([0, 2, 5], device="cuda"),
     ],
 )
 @pytest.mark.parametrize("impl", ["triton"])
@@ -48,13 +49,7 @@ def test_causal_conv1d_update(batch_size, hidden_size, state_len, impl):
         4,
     ],
 )
-@pytest.mark.parametrize(
-    "padding",
-    [
-        3,
-    ],
-)
-def test_causal_conv1d_prefill(prefix_lens, hidden_size, state_len, padding, impl):
+def test_causal_conv1d_prefill(prefix_lens, hidden_size, state_len, impl):
     if impl == "triton" and not has_triton:
         pytest.skip("triton is missing")
     torch.set_default_dtype(torch.bfloat16)
@@ -62,12 +57,13 @@ def test_causal_conv1d_prefill(prefix_lens, hidden_size, state_len, padding, imp
     total_len = prefix_lens[-1].item()
 
     inputs = torch.randn([total_len, hidden_size], device="cuda")
+    conv_state = torch.randn([batch_size, hidden_size, state_len], device="cuda")
     weight = torch.randn([hidden_size, 1, state_len], device="cuda")
     output, new_hidden_state = causal_conv1d_prefill(
-        inputs, weight, prefix_lens, padding=padding, impl=impl
+        inputs, conv_state, weight, prefix_lens, impl=impl
     )
     output_ref, new_hidden_state_ref = causal_conv1d_prefill(
-        inputs, weight, prefix_lens, padding=padding, impl="ref"
+        inputs, conv_state, weight, prefix_lens, impl="ref"
     )
     torch.testing.assert_close(output, output_ref, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(

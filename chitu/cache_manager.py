@@ -726,6 +726,19 @@ class SingletonPagedKVCacheManager(PagedKVCacheManager):
             return 1
 
     @override
+    def get_free_block(self):
+        self.timers("get_free_block").start()
+        if len(self.free_blocks) == 0:
+            raise Exception(
+                f"No more free blocks: cache manager has total {self.get_num_blocks()} blocks, {self.num_used_blocks} blocks has been used."
+            )
+        idx = self.free_blocks.popleft()
+        for key in self.paged_kv_cache:
+            self.paged_kv_cache[key][:, idx] = 0
+        self.timers("get_free_block").stop()
+        return idx
+
+    @override
     @cuda_graph_safe_cached_property("_page_ids_static_tensor", "_page_ids_up_to_date")
     def page_ids(self):
         return self.gpu_block_table.get().squeeze(1)

@@ -147,7 +147,9 @@ def run_pipe_or_tensor_parallelism(args, timers):
             )
 
             for i, req in enumerate(reqs):
-                logger.info(f"Response in rank {rank}: reqs[{i}].output={req.output}")
+                logger.info(
+                    f"Response in rank {rank}: reqs[{i}].output={req.output},reqs[{i}].input={req.message}"
+                )
 
             timers.log()
         chitu_terminate()
