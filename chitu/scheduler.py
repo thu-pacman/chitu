@@ -415,6 +415,7 @@ class Scheduler:
 
         # Remove kvcache of this task
         task.next_token = -1
+        task.evicting = True
         task.waiting = False
         task.handle = None
         tasks = PackedTasksBase(

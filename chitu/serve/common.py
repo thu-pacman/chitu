@@ -15,7 +15,12 @@ import torch.distributed
 
 from chitu.backend import Backend
 from chitu.chitu_main import chitu_run
-from chitu.task import TaskPool, PackedTasksBase, SerializedPackedTasksPayloadType
+from chitu.task import (
+    TaskPool,
+    PackedTasksBase,
+    SerializedPackedTasksPayloadType,
+    TaskCollector,
+)
 
 logger = getLogger(__name__)
 
@@ -42,10 +47,8 @@ async def process_queue():
             status = chitu_run()
             if status == SerializedPackedTasksPayloadType.NoneType:
                 await asyncio.sleep(0.01)
-        elif len(Backend.last_batch_results) > 0:
-            Backend.executor.postprocess_async_part(
-                Backend.last_batch_results.popleft()
-            )
+        elif TaskCollector.has_batch_results():
+            TaskCollector.process_last_batch_results()
         else:
             await asyncio.sleep(0.01)
 

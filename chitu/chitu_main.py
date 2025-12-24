@@ -35,6 +35,7 @@ from chitu.task import (
     TaskType,
     UserRequest,
     MockFixedLengthedUserRequest,
+    TaskCollector,
     DPTaskCollector,
     PPTaskCollector,
 )
