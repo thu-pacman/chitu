@@ -1510,6 +1510,8 @@ class DPTaskCollector:
         DPTaskCollector._ongoing_packedtasks.append(
             DPTaskCollector.get_total_packedtasks()
         )
+        for collector in DPTaskCollector._collected_tokens:
+            collector.append(None)
 
     @staticmethod
     def remove_ongoing():
@@ -1528,12 +1530,11 @@ class DPTaskCollector:
         for it, ongoing_batch in enumerate(DPTaskCollector._ongoing_batch_task_ids):
             if DPTaskCollector._ongoing_num_tasks[it] >= update_tasks.num_tasks:
                 if set(update_tasks.task_ids).issubset(ongoing_batch):
-                    DPTaskCollector._ongoing_num_tasks[0] -= update_tasks.num_tasks
-                    DPTaskCollector._collected_tokens[dp_src].append(update_tokens)
+                    DPTaskCollector._ongoing_num_tasks[it] -= update_tasks.num_tasks
+                    ongoing_batch -= set(update_tasks.task_ids)
+                    DPTaskCollector._collected_tokens[dp_src][it] = update_tokens
                     return
-        assert set(update_tasks.task_ids).issubset(
-            DPTaskCollector._ongoing_batch_task_ids[0]
-        )
+        assert False, "Received tasks are not found in ongoing task list."
 
     @staticmethod
     def batch_finished():
@@ -1547,9 +1548,8 @@ class DPTaskCollector:
 
     @staticmethod
     def get_collected_tokens_tensor():
-        collect_tokens = [
-            t.popleft() for t in DPTaskCollector._collected_tokens if len(t) > 0
-        ]
+        collect_tokens = [t.popleft() for t in DPTaskCollector._collected_tokens]
+        collect_tokens = [t for t in collect_tokens if t is not None]
         return torch.concat(collect_tokens, dim=0)
 
 
