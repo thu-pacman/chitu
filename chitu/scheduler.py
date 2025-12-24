@@ -229,7 +229,8 @@ class Scheduler:
             if TaskPool.pool[tid].task_type in strict_allowed_task_type
         ]
         if len(task_ids) == 0:
-            logger.debug("No avaliable tasks, returning empty task list.")
+            # No avaliable tasks, returning empty task list.
+            # This is in a busy loop waiting for tasks, so don't print logs here.
             return []
 
         task_ids.sort(
@@ -415,6 +416,7 @@ class Scheduler:
 
         # Remove kvcache of this task
         task.next_token = -1
+        task.evicting = True
         task.waiting = False
         task.handle = None
         tasks = PackedTasksBase(

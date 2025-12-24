@@ -35,6 +35,7 @@ from chitu.task import (
     TaskType,
     UserRequest,
     MockFixedLengthedUserRequest,
+    TaskCollector,
     DPTaskCollector,
     PPTaskCollector,
 )
@@ -127,6 +128,10 @@ def get_additional_block_num(cache_manager, memory_utilization=0.98):
     if non_torch_allocations > 0:
         peak_memory += non_torch_allocations
     additional_kv_cache_memory = total_memory * memory_utilization - peak_memory
+    logger.debug(
+        f"{additional_kv_cache_memory} bytes of memory available on this rank for additional KV "
+        f"cache after warming-up."
+    )
 
     num_blocks = int(additional_kv_cache_memory) // block_mem
     return max(0, num_blocks)
@@ -518,6 +523,11 @@ def chitu_init(args):
             args.infer.schedule_overlap = False
         else:
             args.infer.schedule_overlap = True
+
+    if args.infer.dp_size > args.infer.max_reqs:
+        raise ValueError(
+            f"infer.dp_size ({args.infer.dp_size}) cannot be greater than infer.max_reqs ({args.infer.max_reqs})"
+        )
 
     # Check checkpoint exists
     check_checkpoint_path(args)

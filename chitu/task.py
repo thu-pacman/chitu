@@ -398,6 +398,7 @@ class Task:
         self.generated_result: Optional[torch.Tensor] = None
         self.record_next_token: Union[int, torch.Tensor, None] = None
         self.sync_new_token: bool = True
+        self.evicting = False
 
         self.return_logprobs = getattr(req, "logprobs", False)
         self.logprobs = None
@@ -536,17 +537,19 @@ class Task:
             self.next_token = int(self.next_token.cpu().item())
         if self.next_token == -1 and self.record_next_token is None:
             return
+        has_update = self.task_type == TaskType.Decode or self.evicting
         if self.record_next_token is not None:
             if not isinstance(self.record_next_token, int):
                 self.record_next_token = int(self.record_next_token.cpu().item())
-            if self.task_type == TaskType.Decode:
+            if has_update:
                 self._prefix_tokens.append(self.record_next_token)
             self.record_next_token = None
-        elif self.task_type == TaskType.Decode:
+        elif has_update:
             if Backend.executor.mtp_size > 1:
                 self._prefix_tokens.extend(self.mtp_token_list)
             self._prefix_tokens.append(self.next_token)
         self.sync_new_token = True
+        self.evicting = False
 
     def update_response_sync(self, token: Union[int, torch.Tensor]):
         self.update_response_no_sync(token)
@@ -679,7 +682,7 @@ class Task:
 
     def has_output(self):
         # The last step has no output
-        if self.decode_status == TaskDecodeType.Stopped:
+        if not self.has_model_run():
             return False
         return (
             self.task_type == TaskType.Prefill
@@ -776,7 +779,11 @@ class TaskPool:
 
     @classmethod
     def all_finished(cls):
-        return len(cls.pool) == 0 and len(Backend.last_batch_results) == 0
+        return (
+            len(cls.pool) == 0
+            and not TaskCollector.has_batch_results()
+            and not PPTaskCollector.has_ongoing_reqs()
+        )
 
     @classmethod
     def add(cls, task: Task):
@@ -1057,6 +1064,11 @@ class PackedTasks(PackedTasksBase):
             getattr(task.req, "logprobs", False) for task in self.output_tasks
         )
 
+        # user request related
+        self.generated_result: Optional[torch.Tensor] = None
+        self.logprobs: Optional[torch.Tensor] = None
+        self.token_idxs: Optional[torch.Tensor] = None
+
         if not task_ids:  # empty PackedTasks, only dp/dp+pp use this method
             self._test_flag = False  # dp no single_req_compare
             self.task_type = (
@@ -1126,11 +1138,6 @@ class PackedTasks(PackedTasksBase):
             dtype=torch.float32,
             pin_memory=True,
         ).to(device=self.rank, non_blocking=True)
-
-        # user request related
-        self.generated_result: Optional[torch.Tensor] = None
-        self.logprobs: Optional[torch.Tensor] = None
-        self.token_idxs: Optional[torch.Tensor] = None
 
         if self.should_apply_frequency_penalty:
             if PackedTasksBase.response_list_manager is None:
@@ -1275,30 +1282,37 @@ class PackedTasks(PackedTasksBase):
             logits = None
         return tokens, logprobs, token_idxs, logits
 
-    def get_batch_result(self, tasks: list[Task] = None) -> BatchResult:
-        if not tasks:
-            tasks = [task for task in self.tasks if task.has_next_token()]
+    def get_batch_result(
+        self, tasks: Optional[list[Task]] = None, tokens: Optional[list[int]] = None
+    ) -> BatchResult:
+        if tasks is None:
+            tasks = [task for task in self.output_tasks if task.has_next_token()]
+        if tokens is None:
+            tokens = [task.next_token for task in tasks]
         if not self.return_logprobs:
             logprobs, token_idxs = None, None
-        elif Backend.args.infer.schedule_overlap:
-            logprobs = torch.stack([task.logprobs for task in tasks]).squeeze(1)
-            token_idxs = torch.stack([task.token_idxs for task in tasks]).squeeze(1)
         else:
             logprobs = self.logprobs
             token_idxs = self.token_idxs
+        if get_global_args().infer.mtp_size <= 1:
+            mtp_token_list = None
+        else:
+            mtp_token_list = [task.mtp_token_list for task in tasks]
         return BatchResult(
             num_tasks=len(tasks),
             tasks=tasks,
-            next_tokens=[task.next_token for task in tasks],
+            next_tokens=tokens,
             return_logprobs=self.return_logprobs,
             logprobs=logprobs,
             token_idxs=token_idxs,
-            mtp_token_list=[task.mtp_token_list for task in tasks],
+            mtp_token_list=mtp_token_list,
         )
 
     def update_task_by_result(self, result: Union[list[int], torch.Tensor]):
         if len(self.output_tasks) == 0:
             return
+        if isinstance(result, torch.Tensor):
+            assert result.device == torch.device("cpu")
         if not isinstance(result, list):
             tokens, logprobs, token_idxs, logits = self.unpack_result(result)
             tokens = tokens.tolist()
@@ -1306,7 +1320,7 @@ class PackedTasks(PackedTasksBase):
             tokens = result
             logprobs, token_idxs, logits = None, None, None
         for it, task in enumerate(self.output_tasks):
-            task.update_response_no_sync(tokens[it])
+            task.update_response_sync(tokens[it])
         if torch.distributed.get_rank() > 0:
             return
         if self._test_flag:
@@ -1316,41 +1330,11 @@ class PackedTasks(PackedTasksBase):
         if self.return_logprobs:
             self.logprobs = logprobs.cpu()
             self.token_idxs = token_idxs.cpu()
-        self.batch_sync()
-        self.batch_update_status()
+        TaskCollector.append_to_last_batch_results(self.get_batch_result(tokens=tokens))
 
     def batch_update_status(self):
         for task in self.tasks:
-            task.update_prefix()
             task.update_decode_status()
-        if len(self.tasks) > 0:
-            Backend.last_batch_results.append(self.get_batch_result())
-
-    def batch_sync(self):
-        """
-        Synchronize tensors of all tasks to CPU.
-        Including next_token, logprobs and token_idxs.
-        Then add them to last_batch_result.
-        """
-        if len(self.tasks) == 0:
-            return
-        if not isinstance(self.tasks[0].next_token, int):
-            if self.return_logprobs:
-                logprobs_batch = [task.logprobs for task in self.output_tasks]
-                logprobs_batch = torch.stack(logprobs_batch).cpu()
-                token_idxs_batch = [task.token_idxs for task in self.output_tasks]
-                token_idxs_batch = torch.stack(token_idxs_batch).cpu()
-                for logprobs, token_idxs, task in zip(
-                    logprobs_batch, token_idxs_batch, self.output_tasks
-                ):
-                    task.logprobs = logprobs
-                    task.token_idxs = token_idxs
-            next_token_batch = [task.next_token for task in self.tasks]
-            next_token_batch = torch.stack(next_token_batch).view(-1).cpu().tolist()
-            if not isinstance(next_token_batch, list):
-                next_token_batch = [next_token_batch]
-            for next_token, task in zip(next_token_batch, self.tasks):
-                task.next_token = next_token
 
 
 def serialize_tasks(tasks: list[Task]) -> bytes:
@@ -1396,15 +1380,69 @@ class OngoingRequests:
     dp_src: int = 0
 
 
-class DPTaskCollector:
+class TaskCollector:
     """
-    # Used to aggregate all tasks into a PackedTasks object during DP parallelism, making it convenient for unified response processing of multiple requests later.
-    # - After obtaining task_ids in DPScheduler, call prepare_dp_tasks to pack the tasks and set task_ids_list.
-    # - DataDispatcher obtains the task_ids corresponding to each rank through DPTaskCollector; during prefill, serialized task data is sent, and during decode, only task_ids are sent.
-    # - In chitu_main, responses are processed based on total_packedtasks.
+    Used to handle global tasks lists / queues
+    - Store all tasks of the last step, which should be synchronize in current step.
+    - Collect all BatchResult for user requests
     """
 
-    _total_packedtasks: PackedTasks = None
+    _generated_tasks: list[PackedTasks] = []
+    _last_batch_results: Deque[BatchResult] = deque()
+
+    # generated_tasks
+    @staticmethod
+    def append_to_generated_tasks(tasks: Union[PackedTasks, list[PackedTasks]]):
+        if not isinstance(tasks, list):
+            tasks = [tasks]
+        TaskCollector._generated_tasks.extend(tasks)
+
+    @staticmethod
+    def get_generated_tasks() -> Optional[PackedTasks]:
+        if len(TaskCollector._generated_tasks) == 0:
+            return PackedTasks([], empty_task_type=TaskType.Special)
+        return TaskCollector._generated_tasks[0]
+
+    @staticmethod
+    def sync_generated_tasks_results():
+        for tasks in TaskCollector._generated_tasks:
+            if tasks.generated_result is not None:
+                tasks.generated_result = tasks.generated_result.cpu()
+
+    @staticmethod
+    def update_generated_tasks():
+        for tasks in TaskCollector._generated_tasks:
+            if tasks.generated_result is not None:
+                tasks.update_task_by_result(tasks.generated_result)
+                tasks.generated_result = None
+        TaskCollector._generated_tasks = []
+
+    # last_batch_results
+    @staticmethod
+    def has_batch_results():
+        return len(TaskCollector._last_batch_results) > 0
+
+    @staticmethod
+    def append_to_last_batch_results(result: BatchResult):
+        TaskCollector._last_batch_results.append(result)
+
+    @staticmethod
+    def process_last_batch_results():
+        if TaskCollector.has_batch_results():
+            Backend.executor.postprocess_async_part(
+                TaskCollector._last_batch_results.popleft()
+            )
+
+
+class DPTaskCollector:
+    """
+    Used to aggregate all tasks into a PackedTasks object during DP parallelism, making it convenient for unified response processing of multiple requests later.
+    - After obtaining task_ids in DPScheduler, call prepare_dp_tasks to pack the tasks and set task_ids_list.
+    - DataDispatcher obtains the task_ids corresponding to each rank through DPTaskCollector; during prefill, serialized task data is sent, and during decode, only task_ids are sent.
+    - In chitu_main, responses are processed based on total_packedtasks.
+    """
+
+    _total_packedtasks: Optional[PackedTasks] = None
     _task_ids_list: list[list[str]] = []
     _collect_rank_list = []
     _ongoing_num_tasks = deque()
@@ -1472,6 +1510,8 @@ class DPTaskCollector:
         DPTaskCollector._ongoing_packedtasks.append(
             DPTaskCollector.get_total_packedtasks()
         )
+        for collector in DPTaskCollector._collected_tokens:
+            collector.append(None)
 
     @staticmethod
     def remove_ongoing():
@@ -1487,12 +1527,14 @@ class DPTaskCollector:
         if update_tasks.num_tasks == 0:
             return
         assert len(DPTaskCollector._ongoing_num_tasks) > 0
-        assert DPTaskCollector._ongoing_num_tasks[0] >= update_tasks.num_tasks
-        assert set(update_tasks.task_ids).issubset(
-            DPTaskCollector._ongoing_batch_task_ids[0]
-        )
-        DPTaskCollector._ongoing_num_tasks[0] -= update_tasks.num_tasks
-        DPTaskCollector._collected_tokens[dp_src] = update_tokens
+        for it, ongoing_batch in enumerate(DPTaskCollector._ongoing_batch_task_ids):
+            if DPTaskCollector._ongoing_num_tasks[it] >= update_tasks.num_tasks:
+                if set(update_tasks.task_ids).issubset(ongoing_batch):
+                    DPTaskCollector._ongoing_num_tasks[it] -= update_tasks.num_tasks
+                    ongoing_batch -= set(update_tasks.task_ids)
+                    DPTaskCollector._collected_tokens[dp_src][it] = update_tokens
+                    return
+        assert False, "Received tasks are not found in ongoing task list."
 
     @staticmethod
     def batch_finished():
@@ -1502,26 +1544,26 @@ class DPTaskCollector:
 
     @staticmethod
     def reset_collect_tokens():
-        DPTaskCollector._collected_tokens = [None] * get_dp_size()
+        DPTaskCollector._collected_tokens = [deque() for i in range(get_dp_size())]
 
     @staticmethod
     def get_collected_tokens_tensor():
-        collect_tokens = [t for t in DPTaskCollector._collected_tokens if t is not None]
+        collect_tokens = [t.popleft() for t in DPTaskCollector._collected_tokens]
+        collect_tokens = [t for t in collect_tokens if t is not None]
         return torch.concat(collect_tokens, dim=0)
 
 
 class PPTaskCollector:
     """
     Used to wait ongoing tasks in pipe parallelism
-
     """
 
     _ongoing_reqs: list[OngoingRequests] = []
     _unwait_tasks: list[PackedTasks] = []
 
     @staticmethod
-    def num_ongoing_reqs():
-        return len(PPTaskCollector._ongoing_reqs)
+    def has_ongoing_reqs():
+        return len(PPTaskCollector._ongoing_reqs) > 0
 
     @staticmethod
     def reset():
@@ -1564,7 +1606,7 @@ class PPTaskCollector:
                     PPTaskCollector._unwait_tasks.append(update_tasks)
                     update_tasks.generated_result = update_results.view(
                         -1, update_results.shape[-1]
-                    )
+                    ).cpu()
                     for task in ogr.waiting_task.tasks:
                         task.unwait()
                 else:
@@ -1573,10 +1615,9 @@ class PPTaskCollector:
                     if DPTaskCollector.batch_finished():
                         batch_packedtasks = DPTaskCollector.remove_ongoing()
                         batch_packedtasks.generated_result = (
-                            DPTaskCollector.get_collected_tokens_tensor()
+                            DPTaskCollector.get_collected_tokens_tensor().cpu()
                         )
                         PPTaskCollector._unwait_tasks.append(batch_packedtasks)
-                        DPTaskCollector.reset_collect_tokens()
                         for task in batch_packedtasks.tasks:
                             task.unwait()
         return PPTaskCollector._unwait_tasks

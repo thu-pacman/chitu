@@ -28,6 +28,7 @@ from chitu.task import (
     TaskDecodeType,
     SampleParams,
     TaskPool,
+    TaskCollector,
     DPTaskCollector,
     PPTaskCollector,
     serialize_tasks,
@@ -450,9 +451,11 @@ class ExpertDataDispatcher(TasksDispatcher):
                         msgs.append(tasks_msg)
                     elif current_task_type == TaskType.Decode:
                         msgs.append(msgpack.packb(task_ids))
-                        last_tokens_list = [
-                            TaskPool.pool[tid].next_token for tid in task_ids
-                        ]
+                        last_tokens_list = (
+                            [TaskPool.pool[tid].next_token for tid in task_ids]
+                            if self.pp_size > 1
+                            else None
+                        )
                         decode_status_list = [
                             TaskPool.pool[tid]._decode_status.value for tid in task_ids
                         ]
@@ -539,13 +542,13 @@ class ExpertDataDispatcher(TasksDispatcher):
                     all_tokens_mtp[rank_in_group] = msgpack.unpackb(msgs[2])
             if not self.mtp_size > 1:
                 return (
-                    DPTaskCollector.get_total_packedtasks(),
+                    TaskCollector.get_generated_tasks(),
                     sum(all_tokens, token_list),
                     None,
                 )
             else:
                 return (
-                    DPTaskCollector.get_total_packedtasks(),
+                    TaskCollector.get_generated_tasks(),
                     sum(all_tokens, token_list),
                     sum(all_tokens_mtp, mtp_token_list),
                 )
@@ -838,22 +841,9 @@ class Executor:
             return payload_type
 
         # synchronize
-        if self.has_schedule_overlap and tasks.task_type in (
-            TaskType.Decode,
-            TaskType.EmptyDecode,
-        ):
-            if self.rank == 0 or self.dp_dispatcher:
-                if self.pp_size <= 1 and tasks.task_type == TaskType.Decode:
-                    tasks.generated_result = torch.cat(
-                        [
-                            task.generated_result
-                            for task in tasks.tasks
-                            if task.generated_result is not None
-                        ],
-                        dim=0,
-                    ).cpu()
-                self.postprocess_sync_part(tasks)
-            tasks.update_by_decode_status()
+        if self.has_schedule_overlap and (self.rank == 0 or self.dp_dispatcher):
+            self.postprocess_sync_part(tasks)
+        tasks.update_by_decode_status()
 
         if self.moe_impl is not None:
             self.moe_impl.prepare(tasks.task_type, tasks.num_tokens)
@@ -885,6 +875,7 @@ class Executor:
             if update_tasks.task_type == TaskType.Prefill:
                 for task in update_tasks.tasks:
                     task.consume_req_tokens()
+                    task.sync_new_token = False
             elif update_tasks.task_type == TaskType.Decode and self.rank == 0:
                 for task in update_tasks.tasks:
                     task.sync_new_token = False
@@ -904,42 +895,36 @@ class Executor:
                 tokens, logprobs, token_idxs, out
             )
 
-        # async postprocess
-        if len(Backend.last_batch_results) > 0:
-            Backend.executor.postprocess_async_part(
-                Backend.last_batch_results.popleft()
+        if self.pp_size <= 1 and (self.rank == 0 or self.dp_dispatcher):
+            all_tasks = (
+                tasks
+                if self.rank > 0 or not self.dp_dispatcher
+                else DPTaskCollector.get_total_packedtasks()
             )
+            if len(all_tasks.output_tasks) == 0:
+                all_tasks = PackedTasks([], empty_task_type=all_tasks.task_type)
+            elif self.rank == 0 and self.dp_dispatcher:
+                all_tasks.generated_result = tasks.generated_result
+            TaskCollector.append_to_generated_tasks(all_tasks)
+        # async postprocess
+        TaskCollector.process_last_batch_results()
 
-        # 4. postprocess, sync or store
+        # 4. sync postprocess
         self.postprocess_before_sync(tasks)
         if not self.has_schedule_overlap:
             if self.dp_dispatcher or self.rank == 0:
                 self.postprocess_sync_part(tasks)
-        elif (
-            self.pp_size <= 1
-            and (self.rank == 0 or self.dp_dispatcher)
-            and len(tasks.output_tasks) > 0
-        ):
-            results_list = tasks.generated_result.split(1, dim=0)
-            for task, result in zip(tasks.output_tasks, results_list):
-                task.generated_result = result
 
         return payload_type
 
     def empty_step(self) -> SerializedPackedTasksPayloadType:
-        if len(Backend.last_batch_results) > 0:
-            self.postprocess_async_part(Backend.last_batch_results.popleft())
-        if (
-            self.pp_size > 1
-            and self.rank == 0
-            and PPTaskCollector.num_ongoing_reqs() > 0
-        ):
+        TaskCollector.process_last_batch_results()
+        if self.pp_size > 1 and self.rank == 0 and PPTaskCollector.has_ongoing_reqs():
             tasks_list = PPTaskCollector.update_ongoing()
+            TaskCollector.append_to_generated_tasks(tasks_list)
+            TaskCollector.update_generated_tasks()
             for tasks in tasks_list:
-                tasks.update_task_by_result(tasks.generated_result)
-                tasks.generated_result = None
-                for task in tasks.output_tasks:
-                    task.generated_result = None
+                tasks.batch_update_status()
         return SerializedPackedTasksPayloadType.NoneType
 
     def _get_output_token_offsets(self, tasks: PackedTasksBase) -> torch.Tensor:
@@ -1426,33 +1411,41 @@ class Executor:
         if self.pp_size > 1:
             if self.rank == 0:
                 tasks_list = PPTaskCollector.update_ongoing()
+                TaskCollector.append_to_generated_tasks(tasks_list)
         elif self.rank == 0 or self.dp_dispatcher:
+            TaskCollector.sync_generated_tasks_results()
             if self.dp_dispatcher:
-                if getattr(tasks, "generated_result", None) is not None:
+                collect_tasks = TaskCollector.get_generated_tasks()
+                if collect_tasks.generated_result is not None:
                     token_list = (
-                        tasks.generated_result.to(dtype=torch.int64).view(-1).tolist()
+                        collect_tasks.generated_result.to(dtype=torch.int64)
+                        .view(-1)
+                        .tolist()
                     )
                 else:
                     token_list = []
                 mtp_token_list = (
-                    [task.mtp_token_list for task in tasks.output_tasks]
+                    [task.mtp_token_list for task in collect_tasks.output_tasks]
                     if self.mtp_size > 1
                     else None
                 )
-                tasks, token_list, mtp_token_list = self.dp_dispatcher.collect_token(
-                    tasks, token_list, mtp_token_list
+                collect_tasks, token_list, mtp_token_list = (
+                    self.dp_dispatcher.collect_token(
+                        collect_tasks, token_list, mtp_token_list
+                    )
                 )
-                tasks.generated_result = token_list
+                collect_tasks.generated_result = token_list
                 if self.mtp_size > 1:
-                    for it, task in enumerate(tasks.output_tasks):
+                    for it, task in enumerate(collect_tasks.output_tasks):
                         task.num_new_tokens_single_step = len(mtp_token_list[it]) + 1
                         task.mtp_token_list = mtp_token_list[it]
-            tasks_list = [tasks]
-        for tasks in tasks_list:
-            tasks.update_task_by_result(tasks.generated_result)
-            tasks.generated_result = None
-            for task in tasks.output_tasks:
-                task.generated_result = None
+                tasks_list = [collect_tasks]
+            else:
+                tasks_list = [tasks]
+        TaskCollector.update_generated_tasks()
+        if self.rank == 0:
+            for update_tasks in tasks_list:
+                update_tasks.batch_update_status()
 
     def postprocess_async_part(self, batch_result: BatchResult) -> None:
         """
@@ -1465,10 +1458,11 @@ class Executor:
         next_token_list: list[int] = []
         logprobs_list: list[list[float]] = []
         token_idxs_list: list[list[int]] = []
-        mtp_token_list: list[list[int]] = []
+        mtp_token_list: Optional[list[list[int]]] = None if self.mtp_size <= 1 else []
         for it, task in enumerate(batch_result.tasks):
             next_token_list.append(batch_result.next_tokens[it])
-            mtp_token_list.append(batch_result.mtp_token_list[it])
+            if self.mtp_size > 1:
+                mtp_token_list.append(batch_result.mtp_token_list[it])
         if batch_result.return_logprobs:
             for it, task in enumerate(batch_result.tasks):
                 logprobs, token_idxs = (

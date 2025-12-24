@@ -449,6 +449,12 @@ class PagedKVCacheManager(KVCacheManagerBase):
         return reserved
 
     def realloc(self, num_blocks):
+        logger.info(
+            f"The GPU memory supports at most {num_blocks} KV blocks. According to the current "
+            f"infer.max_reqs({get_global_args().infer.max_reqs}) and infer.max_seq_len"
+            f"({get_global_args().infer.max_seq_len}) setting, no more than {self.max_num_blocks} "
+            f"KV blocks is needed."
+        )
         self.num_blocks = min(num_blocks, self.max_num_blocks)
         logger.info(
             f"Reallocating KV cache to {self.num_blocks} blocks, each of size {self.block_size}"
