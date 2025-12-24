@@ -202,58 +202,61 @@ def _(
     assert w1_zp is None
     assert w2_zp is None
 
-    E, N, K = w1.shape
-    n_tokens_padded = (
-        hidden_states.blocked_activation.shape[0]
-        * hidden_states.blocked_activation.shape[1]
+    blocked_activation = hidden_states.blocked_activation
+    blocked_activation_scale = hidden_states.blocked_activation_scale
+    block_to_expert_indices = hidden_states.block_to_expert_indices
+    token_comma_topk_to_block_x_item_indices = (
+        hidden_states.token_comma_topk_to_block_x_item_indices
     )
+    del hidden_states
 
-    if out is None:
-        out = torch.empty(
-            topk_weights.shape[0],
-            K,
-            device=hidden_states.blocked_activation.device,
-            dtype=torch.bfloat16,
-        )
+    device = blocked_activation.device
+
+    E, N, K = w1.shape
+    n_tokens_padded = blocked_activation.shape[0] * blocked_activation.shape[1]
 
     intermediate_cache1 = torch.empty(
-        (n_tokens_padded, N),
-        device=hidden_states.blocked_activation.device,
-        dtype=torch.bfloat16,
+        (n_tokens_padded, N), device=device, dtype=torch.bfloat16
     )
     deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
         (
-            hidden_states.blocked_activation.view(
-                n_tokens_padded, hidden_states.blocked_activation.shape[-1]
-            ),
+            blocked_activation.view(n_tokens_padded, blocked_activation.shape[-1]),
             tma_align_input_scale(
-                hidden_states.blocked_activation_scale.view(
-                    n_tokens_padded, hidden_states.blocked_activation_scale.shape[-1]
+                blocked_activation_scale.view(
+                    n_tokens_padded, blocked_activation_scale.shape[-1]
                 )
             ),
         ),
         (w1, w1_scale),
         intermediate_cache1,
-        hidden_states.block_to_expert_indices.flatten(),
+        block_to_expert_indices.flatten(),
     )
+    del blocked_activation
+    del blocked_activation_scale
 
     intermediate_cache2 = silu_and_mul(intermediate_cache1.view(-1, N), impl="triton")
+    del intermediate_cache1
 
-    qintermediate_cache2, a2q_scale = blockfp8_act_quant(
-        x=intermediate_cache2,
-    )
+    qintermediate_cache2, a2q_scale = blockfp8_act_quant(x=intermediate_cache2)
+    del intermediate_cache2
+
     intermediate_cache3 = torch.empty(
-        (n_tokens_padded, K),
-        device=hidden_states.blocked_activation.device,
-        dtype=torch.bfloat16,
+        (n_tokens_padded, K), device=device, dtype=torch.bfloat16
     )
     deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
         (qintermediate_cache2, a2q_scale),
         (w2, w2_scale),
         intermediate_cache3,
-        hidden_states.block_to_expert_indices.flatten(),
+        block_to_expert_indices.flatten(),
     )
+    del qintermediate_cache2
+    del a2q_scale
 
-    return ExpertBlockPermutedBatchedExpertResult(
-        intermediate_cache3, hidden_states.token_comma_topk_to_block_x_item_indices
-    ).weighted_sum(topk_weights, out=out)
+    expert_result = ExpertBlockPermutedBatchedExpertResult(
+        intermediate_cache3, token_comma_topk_to_block_x_item_indices
+    )
+    del intermediate_cache3
+
+    if out is None:
+        out = torch.empty(topk_weights.shape[0], K, device=device, dtype=torch.bfloat16)
+    return expert_result.weighted_sum(topk_weights, out=out)
