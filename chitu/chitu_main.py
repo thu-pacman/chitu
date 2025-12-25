@@ -46,7 +46,7 @@ from chitu.utils import (
     ceil_div,
 )
 from chitu.schemas.utils import ModelConfigResolver
-from chitu.distributed.parallel_state import get_dp_group
+from chitu.distributed.parallel_state import get_pp_group
 from chitu.logging_utils import setup_chitu_logging
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 from chitu.metrics.throughput_monitor import start_throughput_monitor
@@ -300,35 +300,61 @@ def _warmup_via_taskpool(args):
         planner.set_warmup_mode(False)
 
 
-def _warmup_backend_direct(args, decode_steps: int = 2):
+def _warmup_backend_direct(args, local_max_bs=1, decode_steps=2, bs_descend=0):
     logger.info("Starting local backend warmup (direct)...")
     init_cache_static()
-    # Minimal request
-    req_id = "__warmup__"
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    tokens = torch.tensor([1], device=torch.device(local_rank), dtype=torch.int64)
-    # Prefill
-    from chitu.batched_seq_len import BatchedSeqLen
 
-    Backend.cache_manager.prepare_cache_prefill([req_id], [1])
-    # output_token_offsets 需要指向每个序列的最后一个 token 下标
-    output_token_offsets = torch.tensor(
-        [tokens.size(0) - 1], dtype=torch.int32, device=tokens.device
+    req_ids = [f"__warmup_{i}__" for i in range(local_max_bs)]
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    is_pp_first_rank = get_pp_group() is None or get_pp_group().is_first_rank
+    if is_pp_first_rank:
+        tokens = torch.randint(
+            1,
+            args.models.vocab_size,
+            size=(local_max_bs,),
+            device=torch.device(local_rank),
+            dtype=torch.int64,
+        )
+    else:
+        tokens = torch.randn(
+            local_max_bs,
+            args.models.dim,
+            device=torch.device(local_rank),
+            dtype=torch.get_default_dtype(),
+        )
+    seq_len_list = [1] * local_max_bs
+    # Prefill
+    Backend.cache_manager.prepare_cache_prefill(req_ids, seq_len_list)
+    output_token_offsets = torch.arange(
+        local_max_bs, dtype=torch.int32, device=tokens.device
     )
     _ = Backend.model.prefill(tokens, output_token_offsets)
     Backend.cache_manager.finalize_cache_all_prefill()
     # Decode steps
-    for _ in range(max(1, decode_steps)):
-        Backend.cache_manager.prepare_cache_decode([req_id])
-        # decode 期望 tokens 为 1D [batch], 否则 embedding 输出为 3D 导致后续形状不匹配
-        step_token = torch.tensor(
-            [0], device=torch.device(local_rank), dtype=torch.int64
-        )
-        batch_size = step_token.size(0)  # = 1
-        _ = Backend.model.decode(step_token, batch_size)
-        Backend.cache_manager.finalize_cache_single_decode([req_id])
+    for i in range(max(1, decode_steps)):
+        curr_bs = local_max_bs - i * bs_descend
+        curr_req_ids = req_ids[:curr_bs]
+        Backend.cache_manager.prepare_cache_decode(curr_req_ids)
+        if is_pp_first_rank:
+            step_token = torch.randint(
+                1,
+                args.models.vocab_size,
+                size=(curr_bs,),
+                device=torch.device(local_rank),
+                dtype=torch.int64,
+            )
+        else:
+            step_token = torch.randn(
+                curr_bs,
+                args.models.dim,
+                device=torch.device(local_rank),
+                dtype=torch.get_default_dtype(),
+            )
+        _ = Backend.model.decode(step_token, curr_bs)
+        Backend.cache_manager.finalize_cache_single_decode(curr_req_ids)
     # Clean KV for this request
-    Backend.cache_manager.finalize_cache_all_decode(req_id)
+    for req_id in req_ids:
+        Backend.cache_manager.finalize_cache_all_decode(req_id)
     logger.info("Local backend warmup (direct) completed")
 
 
@@ -376,6 +402,14 @@ def warmup_engine(args):
     else:
         _warmup_backend_direct(args, decode_steps=2)
     _auto_set_num_blocks_after_warmup(args)
+    if runner == "taskpool" and args.infer.full_warmup:
+        if args.infer.dp_size > 1:
+            local_max_bs = ceil_div(args.infer.max_reqs, args.infer.dp_size)
+        else:
+            local_max_bs = ceil_div(args.infer.max_reqs, args.infer.pp_size)
+        _warmup_backend_direct(
+            args, local_max_bs=local_max_bs, decode_steps=local_max_bs, bs_descend=1
+        )
 
 
 def check_checkpoint_path(args):
@@ -523,6 +557,12 @@ def chitu_init(args):
             args.infer.schedule_overlap = False
         else:
             args.infer.schedule_overlap = True
+
+    if args.infer.full_warmup == "auto":
+        if args.infer.pp_size > 1 and args.infer.use_cuda_graph:
+            args.infer.full_warmup = True
+        else:
+            args.infer.full_warmup = False
 
     if args.infer.dp_size > args.infer.max_reqs:
         raise ValueError(

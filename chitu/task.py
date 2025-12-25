@@ -1187,22 +1187,18 @@ class PackedTasks(PackedTasksBase):
         all_tasks = self.tasks
         self.tasks = []
         self.output_tasks = []
+        has_outputs = []
+        # always use cached status
         for it, task in enumerate(all_tasks):
-            if Backend.args.infer.schedule_overlap:
-                # use cached status
-                if self.has_model_run[it]:
-                    self.tasks.append(task)
-                    if self.has_outputs[it]:
-                        self.output_tasks.append(task)
-            else:
-                if not task.need_remove():
-                    self.tasks.append(task)
-                    if task.has_output():
-                        self.output_tasks.append(task)
+            if self.has_model_run[it]:
+                self.tasks.append(task)
+                has_outputs.append(self.has_outputs[it])
+                if self.has_outputs[it]:
+                    self.output_tasks.append(task)
         self.req_ids = [task.task_id for task in self.tasks]
         self.num_tasks = len(self.req_ids)
         self.has_model_run = [True] * self.num_tasks
-        self.has_outputs = [task.has_output() for task in self.tasks]
+        self.has_outputs = has_outputs
         self.temperatures = torch.tensor(
             [task.params.temperature for task in self.output_tasks]
         ).to(device=self.rank)

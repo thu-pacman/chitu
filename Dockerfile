@@ -1,6 +1,6 @@
 #####################################
 # Base Image Stage
-FROM pytorch/pytorch:2.7.0-cuda12.6-cudnn9-devel AS base
+FROM pytorch/pytorch:2.8.0-cuda12.9-cudnn9-devel AS base
 
 SHELL ["/bin/bash", "-c"]
 
