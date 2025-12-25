@@ -258,7 +258,7 @@ if os.environ.get("CI_TESTS", "false") == "true":
     ]
 
 
-@triton.autotune(configs=_fwd_grouped_kernel_stage1_configs, key=[])
+@triton.autotune(configs=_fwd_grouped_kernel_stage1_configs, key=["batch"])
 @triton.jit
 def _fwd_grouped_kernel_stage1(
     Q,
@@ -278,6 +278,7 @@ def _fwd_grouped_kernel_stage1(
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
+    batch: tl.constexpr,
     kv_group_num: tl.constexpr,
     q_head_num: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -475,6 +476,7 @@ def _decode_grouped_att_m_fwd(
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
+        batch=batch,
         kv_group_num=kv_group_num,
         q_head_num=head_num,
         BLOCK_DMODEL=BLOCK_DMODEL,
@@ -693,7 +695,9 @@ triton_skew_decode_configs = [
 ]
 
 
-@triton.autotune(configs=triton_skew_decode_configs, key=["num_heads_q", "head_dim"])
+@triton.autotune(
+    configs=triton_skew_decode_configs, key=["batch_size", "num_heads_q", "head_dim"]
+)
 @triton.jit
 def triton_skew_decode_kernel(
     q_ptr,
