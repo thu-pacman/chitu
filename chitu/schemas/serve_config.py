@@ -47,6 +47,7 @@ class InferConfig:
     memory_utilization: float = MISSING
     prefill_chunk_size: Union[int, str, None] = MISSING
     schedule_overlap: bool | str = MISSING
+    full_warmup: bool | str = MISSING
     experts_stats_path: Optional[str] = None
     num_experts_slots: Optional[int] = None
     moe_lb_trigger: int = -1
