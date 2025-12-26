@@ -244,22 +244,85 @@ See the full list in [Supported Models](SUPPORTED_MODELS.md).
 torchrun --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 models=DeepSeek-R1 models.ckpt_dir=/data/DeepSeek-R1 infer.pp_size=1 infer.tp_size=8
 ```
 
-### Tensor Parallelism (TP)
+### Parallelism
+
+Chitu supports multiple parallelizing strategies.
+
+For ordinary models, TP (Tensor Parallelism), PP (Pipeline Parallelism) and multi-instance deployment are supported, as shown in the following figure:
+
+<img src="../assets/parallelism-non-moe.png" width="70%">
+
+For MoE models, attention blocks and MoE blocks have be applied with different parallelisms:
+
+- TP (Tensor Parallelism) and DP (Data Parallelism) are supported for attention blocks.
+- ETP (Expert Tensor Parallelism), EP (Expert Parallelism) and (statically or dynamically) copying experts to slots are supported for MoE blocks.
+- PP (Pipeline Parallelism) and multi-instance deployment are supported on top of parallelism for attention and MoE blocks.
+
+This is shown in the following figure:
+
+<img src="../assets/parallelism-moe.png" width="70%">
+
+Chitu makes parallelism with higher communication demands use nearer devices:
+
+- In case of ordinary models or attention blocks in MoE models, a TP group consists of nearest devices, than a DP group, and PP group consists of most far away devices. In terms of a distributed mesh, the mesh shape is PP * DP * TP. Please note that DP designed for parallelizing attention blocks in MoE models, so DP is in between PP and TP, instead of outer than PP. To scale a non-MoE model by copying weight, please utilize multi-instance deployment instead of DP described here.
+- In case of MoE blocks in MoE models, a ETP group consists of nearest devices, than a EP group, and PP group consists of most far away devices. In terms of a distributed mesh, the mesh shape is PP * EP * ETP. A MoE block can also be scaled by copying its weight, which can be done via expert slots. Which is similar to DP, but with more flexibility.
+
+TP, DP, EP and/or PP can be used by passing `tp_size`, `dp_size`, `ep_size` and/or `pp_size` arguments. ETP size is always `tp_size * dp_size // ep_size`.
+
+Example arguments for TP:
 
 ```bash
 torchrun --nproc_per_node 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.tp_size=2
 ```
 
-### Pipeline Parallelism (PP)
+Example arguments for PP:
 
 ```bash
 torchrun --nproc_per_node 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.pp_size=2
 ```
 
-### Hybrid Parallelism (TP+PP)
+Example arguments for hybrid TP+PP:
 
 ```bash
 torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=8 models=DeepSeek-R1 models.ckpt_dir=/data/DeepSeek-R1
+```
+
+Please refer to [here](../../chitu\distributed\pd_disaggregation/README.md) for multi-instance deployment.
+
+For PP, there are additional arguments for micro batching:
+
+| Parameter                         | Default | Description                                                  |
+| :-------------------------------- | :------ | :----------------------------------------------------------- |
+| `prefill_num_tasks_divided_by_pp` | `True`  | When `pp_size > 1`, setting this to `True` means `prefill_num_tasks = cur_req_size / pp_size` |
+| `prefill_num_tasks`               | `8`     | Takes effect only when `prefill_num_tasks_divided_by_pp` is `False`. Specifies the max number of concurrent tasks in the prefill stage |
+| `enforce_decode_num_tasks_max`    | `True`  | When `pp_size > 1`, setting this to True means `decode_num_tasks = cur_req_size` |
+| `decode_num_tasks`                | `8`     | Takes effect only when `enforce_decode_num_tasks_max` is `False`. Specifies the max number of concurrent tasks in the decoding stage |
+
+Usage Example
+
+```
+# Adjust micro batch size by configuring scheduler.pp_config
+
+torchrun --nnodes 1 \
+    --nproc_per_node 8 \
+    --master_port=22525 \
+    -m chitu \
+    serve.port=21002 \
+    infer.cache_type=paged \
+    infer.pp_size=2 \
+    infer.tp_size=4 \
+    models=DeepSeek-R1 \
+    models.ckpt_dir=/data/DeepSeek-R1 \
+    infer.mla_absorb=absorb-without-precomp \
+    infer.raise_lower_bit_float_to=bfloat16 \
+    infer.max_reqs=1 \
+    scheduler.pp_config.prefill_num_tasks_divided_by_pp=False \
+    scheduler.pp_config.prefill_num_tasks=8 \
+    scheduler.pp_config.enforce_decode_num_tasks_max=True \
+    scheduler.pp_config.decode_num_tasks=8 \
+    infer.max_seq_len=4096 \
+    request.max_new_tokens=100 \
+    infer.use_cuda_graph=True
 ```
 
 ### Multi-Node Parallelism with Slurm
@@ -516,41 +579,6 @@ Additional HTTP headers:
 | Name                         | Description                                                  |
 | ---------------------------- | ------------------------------------------------------------ |
 | `Authorization`              | Format: `Bearer <api_key>`. If `<api_key>` is in `serve.api_keys`, the request will be prioritized. See the `serve.api_keys` configuration when starting the service for details. |
-
-## Additional Configuration for Micro Batch Size
-
-|Parameter                        |Default |Description|
-|:--------------------------------|:-------|:---|
-|`prefill_num_tasks_divided_by_pp`| `True` | When `pp_size > 1`, setting this to `True` means `prefill_num_tasks = cur_req_size / pp_size` |
-|`prefill_num_tasks`              | `8`    | Takes effect only when `prefill_num_tasks_divided_by_pp` is `False`. Specifies the max number of concurrent tasks in the prefill stage |
-|`enforce_decode_num_tasks_max`   | `True` | When `pp_size > 1`, setting this to True means `decode_num_tasks = cur_req_size` |
-|`decode_num_tasks`               | `8`    | Takes effect only when `enforce_decode_num_tasks_max` is `False`. Specifies the max number of concurrent tasks in the decoding stage |
-
-Usage Example
-```
-# Adjust micro batch size by configuring scheduler.pp_config
-
-torchrun --nnodes 1 \
-    --nproc_per_node 8 \
-    --master_port=22525 \
-    -m chitu \
-    serve.port=21002 \
-    infer.cache_type=paged \
-    infer.pp_size=2 \
-    infer.tp_size=4 \
-    models=DeepSeek-R1 \
-    models.ckpt_dir=/data/DeepSeek-R1 \
-    infer.mla_absorb=absorb-without-precomp \
-    infer.raise_lower_bit_float_to=bfloat16 \
-    infer.max_reqs=1 \
-    scheduler.pp_config.prefill_num_tasks_divided_by_pp=False \
-    scheduler.pp_config.prefill_num_tasks=8 \
-    scheduler.pp_config.enforce_decode_num_tasks_max=True \
-    scheduler.pp_config.decode_num_tasks=8 \
-    infer.max_seq_len=4096 \
-    request.max_new_tokens=100 \
-    infer.use_cuda_graph=True
-```
 
 ## Performance Benchmarking
 
