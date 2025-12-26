@@ -122,11 +122,11 @@ class NpuAttnBackend(RefAttnBackend):
         softmax_scale=None,
     ):
         seqlen = seq_len_delta.new.lens_tensor_device
+        batch = seqlen.shape[0]
+        self.batch_size = batch
         if self.should_use_attn_from_cinfer_ascendc(
             self.args.models.type, seqlen.shape[0]
         ):
-            batch = seqlen.shape[0]
-            self.batch_size = batch
             kv_num_heads = self.local_n_kv_heads
             if batch * kv_num_heads > self.max_aiv_num:
                 seqlen_ = (
@@ -413,17 +413,16 @@ class NpuAttnBackend(RefAttnBackend):
             )
 
         else:
+            q = q.view(
+                self.batch_size, q.shape[0] // self.batch_size, *q.shape[1:]
+            ).contiguous()
             output = torch.empty_like(q)
             lse = torch.empty(1, dtype=q.dtype, device="npu")
             torch_npu.npu_fused_infer_attention_score.out(
-                q.contiguous(),
-                kv_cache.k.contiguous().view(
-                    -1, kv_cache.k.shape[-2], kv_cache.k.shape[-1]
-                ),
-                kv_cache.v.contiguous().view(
-                    -1, kv_cache.v.shape[-2], kv_cache.v.shape[-1]
-                ),
-                input_layout="TND",
+                q,
+                kv_cache.k.contiguous(),
+                kv_cache.v.contiguous(),
+                input_layout="BSND",
                 actual_seq_lengths_kv=seq_len_delta.new.lens_list,
                 scale=softmax_scale,
                 num_heads=self.local_n_heads,
