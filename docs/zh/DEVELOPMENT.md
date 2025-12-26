@@ -250,22 +250,85 @@ python3 script/generate_supported_models_docs.py --print
 torchrun --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 models=DeepSeek-R1 models.ckpt_dir=/data/DeepSeek-R1 infer.pp_size=1 infer.tp_size=8
 ```
 
-### 张量并行 (TP)
+### 并行
+
+赤兔支持多种并行策略。
+
+对于一般模型，赤兔支持 TP（张量并行）、PP（流水线并行）以及多实例部署，如下图所示：
+
+<img src="../assets/parallelism-non-moe.png" width="70%">
+
+对于 MoE 模型，模型中的 attention 块和 MoE 块可以通过不同方式并行：
+
+- Attention 块可通过 TP（张量并行）和 DP（数据并行）进行并行。
+- MoE 块可通过 ETP（专家张量并行）、EP（专家并行）以及（静态或动态）将专家复制到专家槽位进行并行。
+- 在 attention 块和 MoE 块之上，还可以进一步通过 PP（流水线并行）以及多实例部署进行并行。
+
+如下图所示：
+
+<img src="../assets/parallelism-moe.png" width="70%">
+
+赤兔会让通信量大的并行方式优先在更近的设备之间通信：
+
+- 对于一般模型或 MoE 模型中的 attention 块，TP 组由最近的设备组成，DP 组由次近的设备组成，PP 组由最远的设备组成。若以分布式网格的方式描述，网格的形状是 PP * DP * TP。请注意赤兔中的 DP 是用于 MoE 中的 attention 块的，所以 DP 在网格中位于 PP 和 TP 之间，而非 PP 之外。若要通过复制权重的方式扩展非 MoE 模型的并行性，请使用多实例部署而非 DP。
+- 对于 MoE 模型中的 MoE 块，ETP 组由最近的设备组成，EP 组由次近的设备组成，PP 组由最远的设备组成。若以分布式网格的方式描述，网格的形状是 PP * EP * ETP。MoE 块还可以通过将专家复制到专家槽位的方式来扩展并行性。这种方式类似 DP，但更加灵活。
+
+TP、DP、EP 和/或 PP 可通过传入 `tp_size`、`dp_size`、`ep_size` 和/或 `pp_size` 参数开启。ETP 的并行度始终等于 `tp_size * dp_size // ep_size`。
+
+TP 样例参数：
 
 ```bash
 torchrun --nproc_per_node 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.tp_size=2
 ```
 
-### 流水线并行 (PP)
+PP 样例参数：
 
 ```bash
 torchrun --nproc_per_node 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.pp_size=2
 ```
 
-### 混合并行 (TP+PP)
+TP+PP 混合的样例参数：
 
 ```bash
 torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=8 models=DeepSeek-R1 models.ckpt_dir=/data/DeepSeek-R1
+```
+
+关于多实例部署，请参阅[此文档](../../chitu\distributed\pd_disaggregation/README.md)。
+
+对于 PP，还可以进一步控制 micro batch：
+
+| 参数                              | 默认值 | 说明                                                         |
+| :-------------------------------- | :----- | :----------------------------------------------------------- |
+| `prefill_num_tasks_divided_by_pp` | `True` | 当 `pp_size > 1`，设置为 `True` 时，`prefill_num_tasks = cur_req_size / pp_size` |
+| `prefill_num_tasks`               | `8`    | 当 `prefill_num_tasks_divided_by_pp` 为 `False` 时，通过指定当前值来设置 Prefill 阶段最大并发任务数 |
+| `enforce_decode_num_tasks_max`    | `True` | 当 `pp_size > 1`，设置为 `True` 时，`decode_num_tasks = cur_req_size` |
+| `decode_num_tasks`                | `8`    | 当 `enforce_decode_num_tasks_max` 为 `False` 时，通过指定当前值来设置 Decode 阶段最大并发任务数。 |
+
+具体使用：
+
+```
+# 通过设置 scheduler.pp_config 相关参数调整 micro batch size
+
+torchrun --nnodes 1 \
+    --nproc_per_node 8 \
+    --master_port=22525 \
+    -m chitu \
+    serve.port=21002 \
+    infer.cache_type=paged \
+    infer.pp_size=2 \
+    infer.tp_size=4 \
+    models=DeepSeek-R1 \
+    models.ckpt_dir=/data/DeepSeek-R1 \
+    infer.mla_absorb=absorb-without-precomp \
+    infer.raise_lower_bit_float_to=bfloat16 \
+    infer.max_reqs=1 \
+    scheduler.pp_config.prefill_num_tasks_divided_by_pp=False \
+    scheduler.pp_config.prefill_num_tasks=8 \
+    scheduler.pp_config.enforce_decode_num_tasks_max=True \
+    scheduler.pp_config.decode_num_tasks=8 \
+    infer.max_seq_len=4096 \
+    request.max_new_tokens=100 \
+    infer.use_cuda_graph=True
 ```
 
 ### 使用 slurm 在多个节点上运行
@@ -516,41 +579,6 @@ curl localhost:21002/v1/chat/completions \
 | 名称                         | 含义                                                         |
 | ---------------------------- | ------------------------------------------------------------ |
 | `Authorization`              | 格式：`Bearer <api_key>`。若 `<api_key>` 在 `serve.api_keys` 启动设置项中，该请求将被优先处理。详见服务启动时的 `serve.api_keys` 配置。 |
-
-## 与 micro batchsize 相关的更多配置
-
-|参数                             |默认值  |说明|
-|:--------------------------------|:-------|:---|
-|`prefill_num_tasks_divided_by_pp`| `True` | 当 `pp_size > 1`，设置为 `True` 时，`prefill_num_tasks = cur_req_size / pp_size` |
-|`prefill_num_tasks`              | `8`    | 当 `prefill_num_tasks_divided_by_pp` 为 `False` 时，通过指定当前值来设置 Prefill 阶段最大并发任务数 |
-|`enforce_decode_num_tasks_max`   | `True` | 当 `pp_size > 1`，设置为 `True` 时，`decode_num_tasks = cur_req_size` |
-|`decode_num_tasks`               | `8`    | 当 `enforce_decode_num_tasks_max` 为 `False` 时，通过指定当前值来设置 Decode 阶段最大并发任务数。 |
-
-具体使用：
-```
-# 通过设置 scheduler.pp_config 相关参数调整 micro batch size
-
-torchrun --nnodes 1 \
-    --nproc_per_node 8 \
-    --master_port=22525 \
-    -m chitu \
-    serve.port=21002 \
-    infer.cache_type=paged \
-    infer.pp_size=2 \
-    infer.tp_size=4 \
-    models=DeepSeek-R1 \
-    models.ckpt_dir=/data/DeepSeek-R1 \
-    infer.mla_absorb=absorb-without-precomp \
-    infer.raise_lower_bit_float_to=bfloat16 \
-    infer.max_reqs=1 \
-    scheduler.pp_config.prefill_num_tasks_divided_by_pp=False \
-    scheduler.pp_config.prefill_num_tasks=8 \
-    scheduler.pp_config.enforce_decode_num_tasks_max=True \
-    scheduler.pp_config.decode_num_tasks=8 \
-    infer.max_seq_len=4096 \
-    request.max_new_tokens=100 \
-    infer.use_cuda_graph=True
-```
 
 ## 性能测试
 
