@@ -24,7 +24,7 @@
     url = https://github.com/QingCheng-AI/ascend-kernel.git
 [submodule "third_party/DeepEP"]
     path = third_party/DeepEP
-    url = https://github.com/deepseek-ai/DeepEP.git
+    url = https://github.com/QingCheng-AI/DeepEP.git
 [submodule "third_party/fast-hadamard-transform"]
     path = third_party/fast-hadamard-transform
     url = https://github.com/Dao-AILab/fast-hadamard-transform.git
