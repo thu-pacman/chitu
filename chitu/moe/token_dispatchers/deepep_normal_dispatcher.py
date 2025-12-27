@@ -55,8 +55,8 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         # NOTES: you may also replace `get_*_config` with your auto-tuned results via all the tests
 
         self._buffer = DeepEPBuffer.get_deepep_buffer(
-            self.group, self.hidden, 2, self.mode, 256, self.num_experts
-        )  # FIXME 256 is hard code
+            self.group, self.hidden, 2, self.mode, self.num_experts
+        )
         DeepEPBuffer.set_dispatch_mode_as_normal()
 
     @override

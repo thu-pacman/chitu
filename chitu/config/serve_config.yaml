@@ -31,7 +31,7 @@ infer:
   raise_lower_bit_float_to: float8_e4m3fn # choose one hardware-support dtype to compute lower-bit float 
   soft_fp8: false # Legacy parameter. To be removed in the future.
   fuse_shared_experts: False # whether to fuse shared experts
-  max_reqs: 8
+  max_reqs: 8 # Global max batch size across DP ranks
   pp_layer_partition: null # The number of layers for each pipeline stage, e.g., [10, 12, 12, 10].
   use_cuda_graph: auto # one of: auto, True, False
   num_blocks: -1 # a positive interger or -1 for auto num blocks calculation
@@ -39,7 +39,7 @@ infer:
   bind_thread_to_cpu: physical_core # one of: physical_core, logical_core
   npu_fusion_fp4: False #  for npu fp4 fusion group_gemm mode
   memory_utilization: 0.98 # GPU memory utilization for each GPU, e.g., 0.98 means 98% of GPU memory will be used.
-  prefill_chunk_size: auto # auto or integer or null
+  prefill_chunk_size: auto # auto or integer or null. Global prefill chunk size across DP ranks
   moe:
     prefill_token_dispatcher: auto # one of: auto, tp, allgather, deepep-nl
     decode_token_dispatcher: auto # one of: auto, tp, allgather, deepep-ll

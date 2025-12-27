@@ -4,7 +4,10 @@
 
 import torch.distributed as dist
 from typing import Optional
-from chitu.utils import try_import_opt_dep
+
+from chitu.utils import try_import_opt_dep, ceil_div
+from chitu.global_vars import get_global_args
+from chitu.distributed.parallel_state import get_dp_size
 
 deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 
@@ -12,7 +15,7 @@ deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 class DeepEPBuffer:
     _buffer = None
     _hidden_size: Optional[int] = None
-    _num_max_dispatch_tokens_per_rank: Optional[int] = None
+    _lowlatency_num_max_dispatch_tokens_per_rank: Optional[int] = None
     _num_experts: Optional[int] = None
     _dispatch_mode = None
 
@@ -29,14 +32,17 @@ class DeepEPBuffer:
         hidden_size: int,
         param_bytes: int,
         deepep_mode="deepep-normal",
-        num_max_dispatch_tokens_per_rank: int = None,
         num_experts: int = None,
     ):
         if cls._buffer is not None:
             return cls._buffer
 
+        max_bs_per_dp_rank = ceil_div(get_global_args().infer.max_reqs, get_dp_size())
+
         cls._hidden_size = hidden_size
-        cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
+        cls._lowlatency_num_max_dispatch_tokens_per_rank = (
+            ceil_div(max_bs_per_dp_rank, 256) * 256
+        )
         cls._num_experts = num_experts
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
@@ -55,11 +61,11 @@ class DeepEPBuffer:
                     num_rdma_bytes,
                 )
         if deepep_mode in ["auto", "deepep-ll"]:
-            assert num_max_dispatch_tokens_per_rank is not None
+            assert cls._lowlatency_num_max_dispatch_tokens_per_rank is not None
             assert num_experts is not None and num_experts % group.size() == 0
             num_rdma_bytes = max(
                 deep_ep.Buffer.get_low_latency_rdma_size_hint(
-                    num_max_dispatch_tokens_per_rank,
+                    cls._lowlatency_num_max_dispatch_tokens_per_rank,
                     hidden_size,
                     group.size(),
                     num_experts,
@@ -93,7 +99,7 @@ class DeepEPBuffer:
         if not cls._buffer.low_latency_mode:
             return
         cls._buffer.clean_low_latency_buffer(
-            cls._num_max_dispatch_tokens_per_rank,
+            cls._lowlatency_num_max_dispatch_tokens_per_rank,
             cls._hidden_size,
             cls._num_experts,
         )

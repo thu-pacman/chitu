@@ -31,10 +31,6 @@ deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 logger = getLogger(__name__)
 
 
-def lcm(a, b):
-    return abs(a * b) // math.gcd(a, b)
-
-
 class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
 
     def __init__(
@@ -90,29 +86,14 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
 
     @override
     def prepare(self, num_tokens):
-        self.prepare_deepep_buffer(num_tokens)
+        self.prepare_deepep_buffer()
         self.prepare_decode_profile()
 
-    def prepare_deepep_buffer(self, num_tokens):
-        # NOTES from DeepEP: the low-latency mode will consume much more space than the normal mode
-        # So we recommend that `num_max_dispatch_tokens_per_rank` (the actual batch size in the decoding engine) should be less than 256
-
-        ep_size = self.group.size()
-        min_tokens = ep_size * num_tokens
-        base_lcm = lcm(ep_size, 256)
-        num_max_dispatch_tokens_per_rank = base_lcm
-        while num_max_dispatch_tokens_per_rank < min_tokens:
-            num_max_dispatch_tokens_per_rank += base_lcm
-        num_tokens_per_rank = num_max_dispatch_tokens_per_rank // self.group.size()
-
-        # hard code here
-        num_tokens_per_rank = 256
+    def prepare_deepep_buffer(self):
         DeepEPBuffer.set_dispatch_mode_as_low_latency()
         self._buffer = DeepEPBuffer.get_deepep_buffer(
-            self.group, self.hidden, 2, self.mode, num_tokens_per_rank, self.num_experts
+            self.group, self.hidden, 2, self.mode, self.num_experts
         )
-
-        self.num_max_dispatch_tokens_per_rank = num_tokens_per_rank
 
     @override
     @functools.singledispatchmethod
@@ -231,7 +212,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
             self._buffer.low_latency_dispatch(
                 hidden_states,
                 topk_idx,
-                self.num_max_dispatch_tokens_per_rank,
+                DeepEPBuffer._lowlatency_num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=dispatch_use_fp8,
                 cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,

@@ -220,12 +220,17 @@ class KVCacheManagerBase:
 
         self.req_id_to_seq_len: dict[str, int] = {}
 
-        prefill_chunk_size = get_global_args().infer.prefill_chunk_size
+        prefill_chunk_size_global = get_global_args().infer.prefill_chunk_size
+        prefill_chunk_size_per_dp = (
+            ceil_div(prefill_chunk_size_global, get_global_args().infer.dp_size)
+            if prefill_chunk_size_global is not None
+            else None
+        )
         self.max_total_len = num_hot_req * max_seq_len
         self.max_total_delta_len = max(
             (
-                prefill_chunk_size
-                if prefill_chunk_size is not None
+                prefill_chunk_size_per_dp
+                if prefill_chunk_size_per_dp is not None
                 else num_hot_req * max_seq_len
             ),  # prefill
             num_hot_req,  # decode
