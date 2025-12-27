@@ -27,13 +27,14 @@ from .load_balancer import (
 import torch
 
 deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
+deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 if has_deep_ep:
     from .token_dispatchers import MoELowLatencyTokenDispatcher
     from .token_dispatchers import MoENormalTokenDispatcher
 
-MOE_IMPL_INSTANCE: Optional["MoEImpl"] = None
+MOE_IMPL_INSTANCE: Optional["MoEImplBase"] = None
 
 
 def init_moe_impl(args) -> None:
@@ -42,20 +43,47 @@ def init_moe_impl(args) -> None:
     assert MOE_IMPL_INSTANCE is None, "moe impl already initialized"
 
     if args.infer.ep_size > 1:
-        MOE_IMPL_INSTANCE = MoEImpl(args)
+        MOE_IMPL_INSTANCE = MoEImplEP(args)
     else:
-        MOE_IMPL_INSTANCE = None
+        MOE_IMPL_INSTANCE = MoEImplNoEP(args)
 
 
-def get_moe_impl() -> Optional["MoEImpl"]:
+def get_moe_impl() -> Optional["MoEImplBase"]:
     """Get MoEImpl instance."""
     return MOE_IMPL_INSTANCE
 
 
-class MoEImpl:
-    """MoEImpl is a base class for MoE implementation."""
+class MoEImplBase:
+    def __init__(self, args) -> None:
+        self.task_type: Optional[TaskType] = None
+        self.impl_map: dict[TaskType, str] = {}
+        self.load_balancer = {}
+
+    def prepare(self, task_type: TaskType, num_tokens: int) -> None:
+        self.task_type = task_type
+
+    def get_expert_mapping(self, layer_id: int):
+        raise NotImplementedError()
+
+    def token_permutation(self, *args, **kwargs):
+        raise NotImplementedError()
+
+    def token_unpermutation(self, *args, **kwargs):
+        raise NotImplementedError()
+
+    def unpermutation_reduce_rank_list(self):
+        raise NotImplementedError()
+
+    def get_experts_impl(self) -> str:
+        return self.impl_map[self.task_type]
+
+
+class MoEImplEP(MoEImplBase):
+    """MoEImplNoEP is a MoE implementation with EP."""
 
     def __init__(self, args) -> None:
+        super().__init__(args)
+
         self.tp_size = args.infer.tp_size
         self.dp_size = args.infer.dp_size
         self.ep_size = args.infer.ep_size
@@ -213,11 +241,8 @@ class MoEImpl:
             TaskType.EmptyDecode: self.decode_experts_impl,
         }
 
-    def get_experts_impl(self) -> str:
-        return self.impl_map[self.task_type]
-
     def prepare(self, task_type: TaskType, num_tokens: int) -> None:
-        self.task_type = task_type
+        super().prepare(task_type, num_tokens)
         self._get_current_token_dispatcher().prepare(num_tokens)
 
     def token_permutation(self, *args, **kwargs):
@@ -260,3 +285,29 @@ class MoEImpl:
         layer_id: int,
     ):
         return self.load_balancer[layer_id].get_expert_mapping(self.ep_rank)
+
+
+class MoEImplNoEP(MoEImplBase):
+    """MoEImplNoEP is a MoE implementation without EP."""
+
+    def __init__(self, args) -> None:
+        super().__init__(args)
+
+        self.ep_size = args.infer.ep_size
+
+        if has_deep_gemm:
+            self.impl_map = {
+                TaskType.Prefill: "group_gemm_contiguous",
+                TaskType.EmptyPrefill: "group_gemm_contiguous",
+                TaskType.Decode: "auto",
+                TaskType.EmptyDecode: "auto",
+                # TaskType.Decode: "group_gemm_masked",
+                # TaskType.EmptyDecode: "group_gemm_masked",
+            }
+        else:
+            self.impl_map = {
+                TaskType.Prefill: "auto",
+                TaskType.EmptyPrefill: "auto",
+                TaskType.Decode: "auto",
+                TaskType.EmptyDecode: "auto",
+            }

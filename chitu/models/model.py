@@ -883,6 +883,7 @@ class Transformer(nn.Module):
             self.attn_backend.prepare_metadata_for_prefill(self.cache.seq_len_delta)
             if (
                 self.moe_impl is not None
+                and self.moe_impl.ep_size > 1
                 and self.moe_impl.decode_token_dispatcher_impl == "allgather"
             ):
                 self.moe_impl.prepare(TaskType.Decode, tokens_proposal.shape[0])
@@ -1212,7 +1213,7 @@ class ParallelMoeBlock(nn.Module):
             self.shared_experts_stream = torch.cuda.Stream()
 
         self.moe_impl = get_moe_impl()
-        if self.moe_impl is not None:
+        if self.moe_impl is not None and self.moe_impl.ep_size > 1:
             self.expert_mapping = self.moe_impl.get_expert_mapping(layer_id=layer_id)
         else:
             self.expert_mapping = None
@@ -1239,6 +1240,7 @@ class ParallelMoeBlock(nn.Module):
             torch.Tensor: Output tensor after expert routing and computation.
         """
         shape = x.shape  # [TODO] unify decode hidden states shape
+        # logger.info(f"hidden staetes shape in MoE block: {shape}")
         x = x.view(-1, x.shape[-1])
 
         weights, indices = self.gate(x)
@@ -1272,7 +1274,7 @@ class ParallelMoeBlock(nn.Module):
                 shared_y = self.shared_experts(x)
 
         experts_impl = "auto"
-        if self.moe_impl is not None:
+        if self.moe_impl is not None and self.moe_impl.ep_size > 1:
             experts_impl = self.moe_impl.get_experts_impl()
             routed_x_old = routed_x
             routed_x, weights = self.moe_impl.token_permutation(
@@ -1289,6 +1291,8 @@ class ParallelMoeBlock(nn.Module):
             x_in_use_simultenously = x_in_use_simultenously and (
                 routed_x_old is routed_x
             )
+        elif self.moe_impl is not None and self.moe_impl.ep_size == 1:
+            experts_impl = self.moe_impl.get_experts_impl()
 
         y = self.experts(
             routed_x, weights, inplace=not x_in_use_simultenously, impl=experts_impl
@@ -1296,7 +1300,7 @@ class ParallelMoeBlock(nn.Module):
 
         if shared_y is not None and get_tp_size() > 1:
             # we need to reduce shared_y on tp group, if this group equals the group reduce y later, we can merge them together
-            if self.moe_impl:
+            if self.moe_impl and self.moe_impl.ep_size > 1:
                 y_reduce_rank_list = self.moe_impl.unpermutation_reduce_rank_list()
             else:
                 y_reduce_rank_list = get_tp_group().rank_list
@@ -1306,7 +1310,7 @@ class ParallelMoeBlock(nn.Module):
                 y += shared_y
                 shared_y = None
 
-        if self.moe_impl:
+        if self.moe_impl and self.moe_impl.ep_size > 1:
             y = self.moe_impl.token_unpermutation(y)
         elif get_tp_size() > 1:
             get_tp_group().all_reduce(y)
@@ -1317,7 +1321,6 @@ class ParallelMoeBlock(nn.Module):
             if get_tp_size() > 1:
                 get_tp_group().all_reduce(shared_y)
             y += shared_y
-
         return y.view(shape)
 
 

@@ -1308,6 +1308,7 @@ class Executor:
                 if (
                     self.mtp_size > 1
                     and self.moe_impl is not None
+                    and self.moe_impl.ep_size > 1
                     and self.moe_impl.decode_token_dispatcher_impl == "allgather"
                 ):
                     self.moe_impl.prepare(TaskType.Decode, self.dummy_input.shape[0])

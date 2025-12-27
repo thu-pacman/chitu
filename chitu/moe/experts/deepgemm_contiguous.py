@@ -8,15 +8,21 @@ from typing import Optional
 
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
+    ExpertBlockPermutedBatchedRoutedActivationBlock,
+    IndexedBatchedRoutedActivation,
     IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
     IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
     ExpertBlockPermutedBatchedRoutedActivationBlockfp8,
 )
-from chitu.moe.batched_expert_result import ExpertBlockPermutedBatchedExpertResult
+from chitu.moe.batched_expert_result import (
+    ExpertBlockPermutedBatchedExpertResult,
+    PerTokenBatchedExpertResult,
+)
 from chitu.ops import silu_and_mul
 from chitu.ops.quant import blockfp8_act_quant
 from chitu.ops.triton_ops.quant_gemm import tma_align_input_scale
 from chitu.utils import try_import_opt_dep
+from chitu.lazy import eval_lazy
 
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 
@@ -79,16 +85,12 @@ def _(
     if out is None and inplace:
         out = hidden_states.activation
 
-    quant_hidden_states, hidden_states_scale = blockfp8_act_quant(
-        hidden_states.activation
+    new_hidden_states = ExpertBlockPermutedBatchedRoutedActivationBlock.convert_from(
+        hidden_states, block_size=128
     )
+    del hidden_states
     return deepgemm_contiguous_fused_expert(
-        IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
-            activation=quant_hidden_states,
-            activation_scale=hidden_states_scale,
-            token_to_expert_indices=hidden_states.token_to_expert_indices,
-            n_tokens_per_expert_padded=hidden_states.n_tokens_per_expert_padded,
-        ),
+        new_hidden_states,
         w1=w1,
         w2=w2,
         topk_weights=topk_weights,
@@ -111,6 +113,81 @@ def _(
         soft_fp8=soft_fp8,
         out=out,
     )
+
+
+@deepgemm_contiguous_fused_expert.register
+def _(
+    hidden_states: ExpertBlockPermutedBatchedRoutedActivationBlock,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    inplace: bool = False,
+    activation: str = "silu",
+    use_fp8_w8a8: bool = False,
+    use_fp4_w4a8: bool = False,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    global_num_experts: int = -1,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_scale_2: Optional[torch.Tensor] = None,
+    w2_scale_2: Optional[torch.Tensor] = None,
+    w1_zp: Optional[torch.Tensor] = None,
+    w2_zp: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    experts_start_idx: int = 0,
+    out: Optional[torch.Tensor] = None,
+):
+
+    blocked_activation = hidden_states.blocked_activation
+    block_to_expert_indices = hidden_states.block_to_expert_indices
+    token_comma_topk_to_block_x_item_indices = (
+        hidden_states.token_comma_topk_to_block_x_item_indices
+    )
+    del hidden_states
+
+    device = blocked_activation.device
+
+    E, N, K = w1.shape
+    n_tokens_padded = blocked_activation.shape[0] * blocked_activation.shape[1]
+
+    intermediate_cache1 = torch.empty(
+        (n_tokens_padded, N), device=device, dtype=torch.bfloat16
+    )
+
+    deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+        blocked_activation.view(n_tokens_padded, blocked_activation.shape[-1]),
+        w1,
+        intermediate_cache1,
+        block_to_expert_indices.flatten(),
+    )
+    del blocked_activation
+
+    intermediate_cache2 = silu_and_mul(x=intermediate_cache1.view(-1, N), impl="triton")
+    del intermediate_cache1
+    intermediate_cache2 = eval_lazy(intermediate_cache2)
+
+    intermediate_cache3 = torch.empty(
+        (n_tokens_padded, K), device=device, dtype=torch.bfloat16
+    )
+    deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+        intermediate_cache2,
+        w2,
+        intermediate_cache3,
+        block_to_expert_indices.flatten(),
+    )
+    del intermediate_cache2, block_to_expert_indices
+    results = ExpertBlockPermutedBatchedExpertResult(
+        intermediate_cache3, token_comma_topk_to_block_x_item_indices
+    )
+    del intermediate_cache3, token_comma_topk_to_block_x_item_indices
+
+    if out is None:
+        out = torch.empty(topk_weights.shape[0], K, device=device, dtype=torch.bfloat16)
+    return results.weighted_sum(topk_weights, out=out)
 
 
 @deepgemm_contiguous_fused_expert.register
@@ -139,10 +216,14 @@ def _(
     experts_start_idx: int = 0,
     out: Optional[torch.Tensor] = None,
 ):
-    return deepgemm_contiguous_fused_expert(
+    temp_hidden_states = (
         ExpertBlockPermutedBatchedRoutedActivationBlockfp8.convert_from(
             hidden_states, block_size=128
-        ),
+        )
+    )
+    del hidden_states
+    return deepgemm_contiguous_fused_expert(
+        temp_hidden_states,
         w1=w1,
         w2=w2,
         topk_weights=topk_weights,
@@ -260,3 +341,99 @@ def _(
     if out is None:
         out = torch.empty(topk_weights.shape[0], K, device=device, dtype=torch.bfloat16)
     return expert_result.weighted_sum(topk_weights, out=out)
+
+
+@deepgemm_contiguous_fused_expert.register
+def _(
+    hidden_states: IndexedBatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    inplace: bool = False,
+    activation: str = "silu",
+    use_fp8_w8a8: bool = False,
+    use_fp4_w4a8: bool = False,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    global_num_experts: int = -1,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_scale_2: Optional[torch.Tensor] = None,
+    w2_scale_2: Optional[torch.Tensor] = None,
+    w1_zp: Optional[torch.Tensor] = None,
+    w2_zp: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    experts_start_idx: int = 0,
+    out: Optional[torch.Tensor] = None,
+):
+
+    assert not use_fp4_w4a8
+    assert not use_int8_w8a16
+    assert not use_int4_w4a16
+
+    token_to_expert = hidden_states.token_to_expert_indices  # [B, topk]
+    block_size = 128
+
+    n_experts = w1.shape[0]
+    token_cnt_per_expert = torch.zeros(
+        n_experts,
+        device=token_to_expert.device,
+        dtype=torch.int32,
+    )
+    flat_expert = token_to_expert.view(-1)
+    ones = torch.ones_like(flat_expert, dtype=torch.int32)
+    token_cnt_per_expert.index_add_(0, flat_expert, ones)
+    n_tokens_per_expert_padded = (
+        (token_cnt_per_expert + block_size - 1) // block_size * block_size
+    )
+    del token_cnt_per_expert, flat_expert, ones
+    padded_hidden_states = None
+
+    if use_fp8_w8a8:
+        hidden_states_fp8, scale = blockfp8_act_quant(
+            hidden_states.activation, block_size=128
+        )
+        padded_hidden_states = (
+            IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
+                activation=hidden_states_fp8,
+                activation_scale=scale,
+                token_to_expert_indices=hidden_states.token_to_expert_indices,
+                n_tokens_per_expert_padded=n_tokens_per_expert_padded,
+            )
+        )
+    else:
+        padded_hidden_states = IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
+            activation=hidden_states.activation,
+            token_to_expert_indices=hidden_states.token_to_expert_indices,
+            n_tokens_per_expert_padded=n_tokens_per_expert_padded,
+        )
+    del hidden_states
+
+    return deepgemm_contiguous_fused_expert(
+        padded_hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        inplace=inplace,
+        activation=activation,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_fp4_w4a8=use_fp4_w4a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        global_num_experts=n_experts,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_scale_2=w1_scale_2,
+        w2_scale_2=w2_scale_2,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        block_shape=block_shape,
+        soft_fp8=soft_fp8,
+        experts_start_idx=experts_start_idx,
+        out=out,
+    )

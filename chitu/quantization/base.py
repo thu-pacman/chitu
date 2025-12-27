@@ -86,7 +86,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         self.group_size = (
             self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts
         )
-        if self.moe_impl is not None:
+        if self.moe_impl is not None and self.moe_impl.ep_size > 1:
             num_local_slots = self.moe_impl.load_balancer[
                 layer_id
             ].get_num_local_slots()

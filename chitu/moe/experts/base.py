@@ -77,7 +77,84 @@ def fused_experts_wrapper(
             impl = "torch_npu"
         else:
             raise NotImplementedError
-    if impl == "triton":
+    if impl == "group_gemm_contiguous":
+        if w1.dtype == torch.float8_e4m3fn:
+            return deepgemm_contiguous_fused_expert(
+                hidden_states,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                inplace=inplace,
+                activation=activation,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_fp4_w4a8=use_fp4_w4a8,
+                use_int8_w8a16=use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
+                global_num_experts=global_num_experts,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                w1_scale_2=w1_scale_2,
+                w2_scale_2=w2_scale_2,
+                w1_zp=w1_zp,
+                w2_zp=w2_zp,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                block_shape=block_shape,
+                soft_fp8=soft_fp8,
+                experts_start_idx=experts_start_idx,
+            )
+        else:
+            assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
+            return fused_experts(
+                hidden_states,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                inplace=inplace,
+                activation=activation,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_fp4_w4a8=use_fp4_w4a8,
+                use_int8_w8a16=use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
+                global_num_experts=global_num_experts,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                w1_scale_2=w1_scale_2,
+                w2_scale_2=w2_scale_2,
+                w1_zp=w1_zp,
+                w2_zp=w2_zp,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                block_shape=block_shape,
+                soft_fp8=soft_fp8,
+                experts_start_idx=experts_start_idx,  # compatible with the local expert idx format returned by deepep-normal
+            )
+    elif impl == "group_gemm_masked":
+        return deepgemm_masked_fused_expert(
+            hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            inplace=inplace,
+            activation=activation,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_fp4_w4a8=use_fp4_w4a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            global_num_experts=global_num_experts,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_scale_2=w1_scale_2,
+            w2_scale_2=w2_scale_2,
+            w1_zp=w1_zp,
+            w2_zp=w2_zp,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            block_shape=block_shape,
+            soft_fp8=soft_fp8,
+            experts_start_idx=experts_start_idx,
+        )
+    elif impl == "triton":
         assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
         return fused_experts(
             hidden_states,

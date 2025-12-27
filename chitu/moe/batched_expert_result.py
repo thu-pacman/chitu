@@ -104,3 +104,55 @@ class ConcatPermutedBatchedExpertResult(BatchedExpertResult):
             topk_weights,
             out=out,
         )
+
+
+@dataclass
+class PerExpertDenseBatchedExpertResult(BatchedExpertResult):
+    """Result of `IndexedBatchedRoutedActivation` when using DeepGEMM masked expert.
+
+    This variant assumes that activations have already been densely packed per expert
+    and that we also know, for every (token, topk) pair, the corresponding position
+    in that expert's activation buffer.
+    """
+
+    activation_per_expert: (
+        torch.Tensor
+    )  # [n_experts, max_n_tokens_per_expert, hidden_size]
+    token_to_expert_indices: torch.Tensor  # [batch_size, topk]
+    token_pos_in_expert: torch.Tensor  # [batch_size, topk]
+
+    @override
+    def weighted_sum(
+        self, topk_weights: torch.Tensor, *, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Gather expert outputs back to per-token layout and apply top-k weights.
+
+        Args:
+            topk_weights: [batch_size, topk]
+            out: optional preallocated output [batch_size, hidden_size]
+        """
+        batch_size, topk = topk_weights.shape
+        assert self.token_to_expert_indices.shape == (batch_size, topk)
+        assert self.token_pos_in_expert.shape == (batch_size, topk)
+
+        n_experts, max_n_tokens_per_expert, hidden_size = (
+            self.activation_per_expert.shape
+        )
+
+        # Flatten (token, topk) to a single dimension to perform a single gather
+        flat_expert_ids = self.token_to_expert_indices.view(-1)  # [B * topk]
+        flat_positions = self.token_pos_in_expert.view(-1)  # [B * topk]
+
+        # Build indices for advanced indexing: [B * topk, hidden_size]
+        gather_indices_expert = flat_expert_ids
+        gather_indices_token = flat_positions
+
+        # Advanced indexing to get [B * topk, H]
+        gathered_flat = self.activation_per_expert[
+            gather_indices_expert,
+            gather_indices_token,
+        ]  # [B * topk, H]
+
+        gathered = gathered_flat.view(batch_size, topk, hidden_size)
+
+        return moe_sum_per_token(gathered, topk_weights, out=out)
