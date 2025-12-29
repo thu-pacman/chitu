@@ -325,6 +325,15 @@ def _warmup_backend_direct(args, local_max_bs=1, decode_steps=2, bs_descend=0):
     seq_len_list = [1] * local_max_bs
     # Prefill
     Backend.cache_manager.prepare_cache_prefill(req_ids, seq_len_list)
+
+    if get_global_args().models.type == "hf-qwen3-next":
+        Backend.linear_attn_cache_manager.prepare_cache_prefill(req_ids, seq_len_list)
+    if (
+        getattr(Backend, "indexer_cache_manager", None) is not None
+        and get_global_args().models.type == "deepseek-v3"
+    ):
+        Backend.indexer_cache_manager.prepare_cache_prefill(req_ids, seq_len_list)
+
     output_token_offsets = torch.arange(
         local_max_bs, dtype=torch.int32, device=tokens.device
     )
@@ -335,6 +344,14 @@ def _warmup_backend_direct(args, local_max_bs=1, decode_steps=2, bs_descend=0):
         curr_bs = local_max_bs - i * bs_descend
         curr_req_ids = req_ids[:curr_bs]
         Backend.cache_manager.prepare_cache_decode(curr_req_ids)
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.prepare_cache_decode(curr_req_ids)
+        if (
+            getattr(Backend, "indexer_cache_manager", None) is not None
+            and get_global_args().models.type == "deepseek-v3"
+        ):
+            Backend.indexer_cache_manager.prepare_cache_decode(curr_req_ids)
+
         if is_pp_first_rank:
             step_token = torch.randint(
                 1,
@@ -352,9 +369,23 @@ def _warmup_backend_direct(args, local_max_bs=1, decode_steps=2, bs_descend=0):
             )
         _ = Backend.model.decode(step_token, curr_bs)
         Backend.cache_manager.finalize_cache_single_decode(curr_req_ids)
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.finalize_cache_single_decode(curr_req_ids)
+        if (
+            getattr(Backend, "indexer_cache_manager", None) is not None
+            and get_global_args().models.type == "deepseek-v3"
+        ):
+            Backend.indexer_cache_manager.finalize_cache_single_decode(curr_req_ids)
     # Clean KV for this request
     for req_id in req_ids:
         Backend.cache_manager.finalize_cache_all_decode(req_id)
+        if get_global_args().models.type == "hf-qwen3-next":
+            Backend.linear_attn_cache_manager.finalize_cache_all_decode(req_id)
+        if (
+            getattr(Backend, "indexer_cache_manager", None) is not None
+            and get_global_args().models.type == "deepseek-v3"
+        ):
+            Backend.indexer_cache_manager.finalize_cache_all_decode(req_id)
     logger.info("Local backend warmup (direct) completed")
 
 

@@ -144,7 +144,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             checkpoint_prefix=f"{checkpoint_prefix}.out_proj",
         )
 
-    def fix_qkv_ordering(
+    def fix_qkvz_ba_ordering(
         self,
         mixed_qkvz,
         mixed_ba,
@@ -152,42 +152,28 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         """
         Derives `q`, `k` and `v` tensors from `mixed_qkvzba`.
         """
-        new_tensor_shape_qkvz = mixed_qkvz.size()[:-1] + (
-            self.n_local_qk_heads,
-            (self.head_dim * 2 + self.head_dim * 2 * self.n_v_heads // self.n_qk_heads),
-        )
-        new_tensor_shape_ba = mixed_qkvz.size()[:-1] + (
-            self.n_local_qk_heads,
-            2 * self.n_v_heads // self.n_qk_heads,
-        )
-
-        mixed_qkvz = mixed_qkvz.view(*new_tensor_shape_qkvz)
-        mixed_ba = mixed_ba.view(*new_tensor_shape_ba)
-
         split_arg_list_qkvz = [
-            self.head_dim,
-            self.head_dim,
-            (self.n_v_heads // self.n_qk_heads * self.head_dim),
-            (self.n_v_heads // self.n_qk_heads * self.head_dim),
+            self.head_dim
+            * self.n_local_qk_heads
+            * (2 + self.n_v_heads // self.n_qk_heads),
+            self.head_dim * self.n_local_qk_heads * (self.n_v_heads // self.n_qk_heads),
         ]
         split_arg_list_ba = [
-            self.n_v_heads // self.n_qk_heads,
-            self.n_v_heads // self.n_qk_heads,
+            self.n_local_qk_heads * self.n_v_heads // self.n_qk_heads,
+            self.n_local_qk_heads * self.n_v_heads // self.n_qk_heads,
         ]
 
-        # [b, sq, ng, (hn + hn + np/ng * hn + np/ng + np/ng)]
-        # --> [b, sq, ng, hn], [b, sq, ng, hn], [b, sq, ng, np/ng * hn],
-        #  [b, sq, ng, np/ng * hn], [b, sq, ng, np/ng], [b, sq, ng, np/ng]
-        (q, k, v, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=-1)
+        # [bsz/total_len, qkv_local_dim], [bsz/total_len, z_local_dim]
+        (qkv, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=-1)
+
+        # [bsz/total_len, self.n_local_v_heads], [bsz/total_len, self.n_local_v_heads]
         (b, a) = torch.split(mixed_ba, split_arg_list_ba, dim=-1)
 
-        # [b, sq, ng, np/ng * hn] -> [b, sq, np, hn]
-        v = v.reshape(v.size(0), -1, self.head_dim)
-        z = z.reshape(z.size(0), -1, self.head_dim)
-        b = b.reshape(b.size(0), self.n_local_v_heads)
-        a = a.reshape(a.size(0), self.n_local_v_heads)
+        z = z.reshape(
+            z.size(0), -1, self.head_dim
+        )  # [bsz/total_len, n_local_v_heads ,head_dim]
 
-        return q, k, v, z, b, a
+        return qkv, z, b, a
 
     def forward(
         self,
@@ -207,18 +193,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         qkvz = self.in_proj_qkvz(x)
         ba = self.in_proj_ba(x)
 
-        q, k, v, z, b, a = self.fix_qkv_ordering(qkvz, ba)
-        q, k, v = map(lambda h: h.reshape(h.size(0), -1), (q, k, v))
-
-        qkv = torch.cat((q, k, v), dim=-1)
+        qkv, z, b, a = self.fix_qkvz_ba_ordering(qkvz, ba)
 
         if use_precomputed_states:
             qkv, conv_state = causal_conv1d_update(qkv, conv_state, self.conv1d.weight)
             # qkv: (bsz, hidden_size), conv_state: (bsz, hidden_size, state_len)
         else:
-            assert (
-                seq_len_delta.delta_prefix_lens_tensor_device[-1].item() == qkv.shape[0]
-            ), f"layer[{self.layer_id}] seq_len unequal: {seq_len_delta.delta_prefix_lens_tensor_device[-1].item()} vs {qkv.shape[0]} , Detail: {seq_len_delta.delta_prefix_lens_tensor_device} vs {qkv.shape}"
             qkv, conv_state = causal_conv1d_prefill(
                 qkv,
                 conv_state,
@@ -242,14 +222,16 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         )  # (total_len, n_heads, head_dim)
 
         beta = b.sigmoid()
+
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        q = q.repeat_interleave(
-            self.n_v_heads // self.n_qk_heads, dim=1
-        )  # (total_len, n_v_heads, head_dim)
-        k = k.repeat_interleave(
-            self.n_v_heads // self.n_qk_heads, dim=1
-        )  # (total_len, n_v_heads, head_dim)
+
         if not use_precomputed_states:
+            q = q.repeat_interleave(
+                self.n_v_heads // self.n_qk_heads, dim=1
+            )  # (total_len, n_v_heads, head_dim)
+            k = k.repeat_interleave(
+                self.n_v_heads // self.n_qk_heads, dim=1
+            )  # (total_len, n_v_heads, head_dim)
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 q.unsqueeze(0),
                 k.unsqueeze(0),
@@ -684,7 +666,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                 checkpoint[k] = chunks[rank]
         return checkpoint
 
-    def qwen_next_chunk_checkpoint_for_tensor_parallel_splitting_merging(
+    def chunk_checkpoint_for_tp_splitting_merging_and_reorder_qkvz_ba(
         self, checkpoint, rank, world_size
     ):
         col_parallel_split_args = {
@@ -738,7 +720,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                         ]
                         checkpoint[k] = torch.cat(tensor_parallel_splitted, dim=0)
                     else:
-                        # reshape -> split -> split -> merge -> reshape
+                        # reshape -> split -> split -> reshape -> merge
                         other_dim = checkpoint[k].shape[1:]
                         original_dim = checkpoint[k].shape[-1]
                         curr_reshape_size = reshape_size + other_dim
@@ -750,8 +732,23 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                         tensor_parallel_splitted = [
                             torch.chunk(x, world_size, dim=0)[rank] for x in splitted
                         ]
-                        checkpoint[k] = torch.cat(tensor_parallel_splitted, dim=1)
-                        checkpoint[k] = checkpoint[k].reshape(-1, original_dim)
+                        # [
+                        #   [n_local_q_head,128,2048],
+                        #   [n_local_k_head,128,2048],
+                        #   [n_local_v_head,128,2048],
+                        #   [n_local_z_head,128,2048],
+                        # ]
+                        tensor_parallel_splitted = [
+                            chunk.reshape(-1, original_dim)
+                            for chunk in tensor_parallel_splitted
+                        ]
+                        # [
+                        #   [n_local_q_head*128,2048],
+                        #   [n_local_k_head*128,2048],
+                        #   [n_local_v_head*128,2048],
+                        #   [n_local_z_head*128,2048],
+                        # ]
+                        checkpoint[k] = torch.cat(tensor_parallel_splitted, dim=0)
         return checkpoint
 
     def load_state_dict_parallel(
@@ -767,9 +764,11 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                 state_dict = self.qwen_next_chunk_checkpoint_for_tensor_parallel_direct(
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )
-                state_dict = self.qwen_next_chunk_checkpoint_for_tensor_parallel_splitting_merging(
+            state_dict = (
+                self.chunk_checkpoint_for_tp_splitting_merging_and_reorder_qkvz_ba(
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )
+            )
             state_dict_keys = list(state_dict.keys())
             for k in state_dict_keys:
                 if k.startswith("mtp."):
