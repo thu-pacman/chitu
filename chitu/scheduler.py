@@ -211,8 +211,7 @@ class Scheduler:
         task_ids = list(
             filter(
                 lambda x: has_correct_dp_rank(TaskPool.pool[x])
-                and not TaskPool.pool[x].waiting
-                and not TaskPool.pool[x].need_remove(),
+                and TaskPool.pool[x].can_schedule(),
                 TaskPool.id_list,
             )
         )
@@ -500,11 +499,13 @@ class Scheduler:
         for task_id in task_ids:
             # Update Task's sched_group_id and sgroup_waiting_cnt
             if (
-                not TaskPool.pool[task_id].waiting
+                TaskPool.pool[task_id].finish_last_step()
                 and TaskPool.pool[task_id].sched_group_id is not None
             ):
                 sgroup_id = TaskPool.pool[task_id].sched_group_id
                 self.sgroup_waiting_tasks[sgroup_id].remove(task_id)
+                if not isinstance(self, SkewScheduler):
+                    TaskPool.pool[task_id].sched_group_id = None
         for task_id in task_ids:
             task = TaskPool.pool[task_id]
             if task.need_remove():
@@ -585,8 +586,7 @@ class SkewScheduler(Scheduler):
         # collect ready task ids
         task_ids = list(
             filter(
-                lambda x: not TaskPool.pool[x].waiting
-                and not TaskPool.pool[x].need_remove(),
+                lambda x: TaskPool.pool[x].can_schedule(),
                 TaskPool.id_list,
             )
         )

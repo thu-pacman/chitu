@@ -584,7 +584,7 @@ def chitu_init(args):
 
     # pp and mtp does not support schedule overlap
     if args.infer.schedule_overlap == "auto":
-        if args.infer.pp_size > 1:
+        if args.infer.pp_size > 1 and args.infer.dp_size > 1:
             args.infer.schedule_overlap = False
         else:
             args.infer.schedule_overlap = True

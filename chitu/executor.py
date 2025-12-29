@@ -328,6 +328,8 @@ class PipeDispatcher(TasksDispatcher):
         ):
             if curr_packed_tasks is None or len(curr_packed_tasks.output_tasks) == 0:
                 continue
+            for task in curr_packed_tasks.tasks:
+                task.wait_steps = get_global_args().infer.pp_size - 1
             results = torch.empty(
                 (len(curr_packed_tasks.output_tasks), all_tasks.get_result_len()),
                 device=self.local_rank,
@@ -875,8 +877,7 @@ class Executor:
             if update_tasks.task_type == TaskType.Prefill:
                 for task in update_tasks.tasks:
                     task.consume_req_tokens()
-                    task.sync_new_token = False
-            elif update_tasks.task_type == TaskType.Decode and self.rank == 0:
+            if self.rank == 0:
                 for task in update_tasks.tasks:
                     task.sync_new_token = False
         # *pp rank0 irecv
@@ -1411,7 +1412,14 @@ class Executor:
         tasks_list = []
         if self.pp_size > 1:
             if self.rank == 0:
-                tasks_list = PPTaskCollector.update_ongoing()
+                if self.has_schedule_overlap:
+                    # set has_model_run to False will disable waiting step update and disable schedule overlap for PP
+                    # TODO: dp+pp does not support overlap
+                    tasks_list = PPTaskCollector.update_ongoing(
+                        waiting_tasks=tasks, has_model_run=self.dp_size <= 1
+                    )
+                else:
+                    tasks_list = PPTaskCollector.update_ongoing()
                 TaskCollector.append_to_generated_tasks(tasks_list)
         elif self.rank == 0 or self.dp_dispatcher:
             TaskCollector.sync_generated_tasks_results()

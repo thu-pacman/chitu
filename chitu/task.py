@@ -414,6 +414,7 @@ class Task:
         # Data parallelism and tensor parallelism do not need this, because they only call scheduler after finishing a task
         self.waiting = False
         self.handle = None  # The Case 1 waiting task's communication handle
+        self.wait_steps = 0
 
         # Scheduling priority
         self.arrv_ts = time.perf_counter_ns()
@@ -445,7 +446,7 @@ class Task:
         self.has_model_run: Callable[[], bool] = (
             self._has_model_run_schedule_overlap
             if has_schedule_overlap and not has_pp
-            else self._has_model_run
+            else self.running
         )
 
     @property
@@ -455,11 +456,20 @@ class Task:
     def need_remove(self):
         return self.decode_status == TaskDecodeType.Stopped
 
-    def _has_model_run(self):
+    def running(self):
         return self._decode_status != TaskDecodeType.Stopped
 
     def _has_model_run_schedule_overlap(self):
         return self._decode_status == TaskDecodeType.Normal
+
+    def finish_last_step(self):
+        """
+        return True if force wait (wait until complete) will not spend too much time
+        """
+        return not self.waiting or self.wait_steps == 0
+
+    def can_schedule(self):
+        return self.running() and self.finish_last_step()
 
     def update_decode_status(self):
         if self.waiting:
@@ -555,9 +565,10 @@ class Task:
         self.update_response_no_sync(token)
         self.update_prefix()
 
-    def wait(self, handle):
+    def wait(self, handle, wait_steps: int = -1):
         self.waiting = True
         self.handle = handle
+        self.wait_steps = wait_steps
 
     def unwait(self):
         logger.debug(f"unwait {self.task_id}")
@@ -1555,7 +1566,7 @@ class PPTaskCollector:
     """
 
     _ongoing_reqs: list[OngoingRequests] = []
-    _unwait_tasks: list[PackedTasks] = []
+    _unwait_task_ids: list[str] = []
 
     @staticmethod
     def has_ongoing_reqs():
@@ -1564,19 +1575,15 @@ class PPTaskCollector:
     @staticmethod
     def reset():
         PPTaskCollector._ongoing_reqs = []
-        PPTaskCollector._unwait_tasks = []
+        PPTaskCollector._unwait_task_ids = []
 
     @staticmethod
     def clear():
-        PPTaskCollector._unwait_tasks = []
+        PPTaskCollector._unwait_task_ids = []
 
     @staticmethod
     def unwait_task_ids():
-        return [
-            task_id
-            for tasks in PPTaskCollector._unwait_tasks
-            for task_id in tasks.task_ids
-        ]
+        return PPTaskCollector._unwait_task_ids
 
     @staticmethod
     def add_new_ongoing(
@@ -1592,28 +1599,55 @@ class PPTaskCollector:
             task.wait(handle)
 
     @staticmethod
-    def update_ongoing():
-        for ogr in PPTaskCollector._ongoing_reqs:
-            if ogr.handle.is_completed():
-                PPTaskCollector._ongoing_reqs.remove(ogr)
-                update_tasks = ogr.waiting_task
-                update_results = ogr.results
-                if Backend.args.infer.dp_size <= 1:
-                    PPTaskCollector._unwait_tasks.append(update_tasks)
-                    update_tasks.generated_result = update_results.view(
-                        -1, update_results.shape[-1]
-                    ).cpu()
-                    for task in ogr.waiting_task.tasks:
-                        task.unwait()
-                else:
-                    dp_src = ogr.dp_src
-                    DPTaskCollector.update_ongoing(dp_src, update_tasks, update_results)
-                    if DPTaskCollector.batch_finished():
-                        batch_packedtasks = DPTaskCollector.remove_ongoing()
-                        batch_packedtasks.generated_result = (
-                            DPTaskCollector.get_collected_tokens_tensor().cpu()
-                        )
-                        PPTaskCollector._unwait_tasks.append(batch_packedtasks)
-                        for task in batch_packedtasks.tasks:
+    def update_ongoing(
+        waiting_tasks: Optional[PackedTasks] = None, has_model_run: bool = False
+    ):
+        """
+        Update ongoing requests until all tasks in waiting_tasks are completed
+
+        If has_model_run is True, all waiting tasks will reduce their waiting count by 1
+        """
+        tasks_list = []
+        while True:
+            for ogr in PPTaskCollector._ongoing_reqs:
+                if ogr.handle.is_completed():
+                    PPTaskCollector._ongoing_reqs.remove(ogr)
+                    update_tasks = ogr.waiting_task
+                    update_results = ogr.results
+                    if Backend.args.infer.dp_size <= 1:
+                        tasks_list.append(update_tasks)
+                        PPTaskCollector._unwait_task_ids.extend(update_tasks.task_ids)
+                        update_tasks.generated_result = update_results.view(
+                            -1, update_results.shape[-1]
+                        ).cpu()
+                        for task in ogr.waiting_task.tasks:
                             task.unwait()
-        return PPTaskCollector._unwait_tasks
+                    else:
+                        dp_src = ogr.dp_src
+                        DPTaskCollector.update_ongoing(
+                            dp_src, update_tasks, update_results
+                        )
+                        if DPTaskCollector.batch_finished():
+                            batch_packedtasks = DPTaskCollector.remove_ongoing()
+                            batch_packedtasks.generated_result = (
+                                DPTaskCollector.get_collected_tokens_tensor().cpu()
+                            )
+                            tasks_list.append(batch_packedtasks)
+                            PPTaskCollector._unwait_task_ids.extend(
+                                batch_packedtasks.task_ids
+                            )
+                            for task in batch_packedtasks.tasks:
+                                task.unwait()
+            if waiting_tasks is None or all(
+                not task.waiting for task in waiting_tasks.tasks
+            ):
+                break
+
+        if has_model_run:
+            for ogr in PPTaskCollector._ongoing_reqs:
+                for task in ogr.waiting_task.tasks:
+                    if task.wait_steps > 0:
+                        task.wait_steps -= 1
+                    if task.wait_steps == 0:
+                        PPTaskCollector._unwait_task_ids.append(task.task_id)
+        return tasks_list
