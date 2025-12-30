@@ -350,7 +350,8 @@ class Scheduler:
             task = TaskPool.pool[prefill_task_ids[i]]
             task_remaining_tokens = task.prefix_tokens_len - task.consumed_req_tokens
             if (
-                task_remaining_tokens > self.prefill_chunk_size
+                self.num_scheduler_groups == 1
+                or task_remaining_tokens > self.prefill_chunk_size
                 or total_prefill_tokens_len_to_schedule
                 >= self.num_scheduler_groups * self.prefill_chunk_size
             ):
