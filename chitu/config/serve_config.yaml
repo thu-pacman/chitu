@@ -54,10 +54,12 @@ scheduler:
   type: "request_preset,prefill_first"  # Ordered comma separated list of scheduler types among: "fcfs", "request_preset",
                                         # "prefill_first", "stride", "deadline", "prefix_align"
   pp_config:
-    prefill_num_tasks_divided_by_pp: True
-    prefill_num_tasks: null
-    enforce_decode_num_tasks_max: True
-    decode_num_tasks: null
+    pp_micro_batch_size_prefill: auto # one of: auto, max or exact number
+    pp_micro_batch_size_decode: auto # one of: auto, max or exact number
+    prefill_num_tasks_divided_by_pp: True # Legacy parameter. To be removed in the future.
+    prefill_num_tasks: null # Legacy parameter. To be removed in the future.
+    enforce_decode_num_tasks_max: True # Legacy parameter. To be removed in the future.
+    decode_num_tasks: null # Legacy parameter. To be removed in the future.
 dp_config:
   enabled: False
   scheduler_base_host: 0.0.0.0

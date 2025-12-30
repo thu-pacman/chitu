@@ -9,6 +9,7 @@ import os
 from logging import getLogger
 import psutil
 import traceback
+from tqdm import tqdm
 
 import torch
 import torch.distributed
@@ -19,6 +20,7 @@ from chitu.device_type import is_nvidia
 from chitu.executor import Executor
 from chitu.global_vars import (
     get_global_args,
+    get_slot_handle,
     set_global_variables,
     set_quant_variables,
     set_backend_variables,
@@ -301,7 +303,9 @@ def _warmup_via_taskpool(args):
 
 
 def _warmup_backend_direct(args, local_max_bs=1, decode_steps=2, bs_descend=0):
-    logger.info("Starting local backend warmup (direct)...")
+    logger.info(
+        f"Starting local backend warmup (direct) with local max batch size {local_max_bs}..."
+    )
     init_cache_static()
 
     req_ids = [f"__warmup_{i}__" for i in range(local_max_bs)]
@@ -340,7 +344,9 @@ def _warmup_backend_direct(args, local_max_bs=1, decode_steps=2, bs_descend=0):
     _ = Backend.model.prefill(tokens, output_token_offsets)
     Backend.cache_manager.finalize_cache_all_prefill()
     # Decode steps
-    for i in range(max(1, decode_steps)):
+    for i in tqdm(
+        range(max(1, decode_steps)), desc="finished warmup decode iterations"
+    ):
         curr_bs = local_max_bs - i * bs_descend
         curr_req_ids = req_ids[:curr_bs]
         Backend.cache_manager.prepare_cache_decode(curr_req_ids)
@@ -433,11 +439,19 @@ def warmup_engine(args):
     else:
         _warmup_backend_direct(args, decode_steps=2)
     _auto_set_num_blocks_after_warmup(args)
+
     if runner == "taskpool" and args.infer.full_warmup:
-        if args.infer.dp_size > 1:
-            local_max_bs = ceil_div(args.infer.max_reqs, args.infer.dp_size)
+        max_reqs_per_dp = ceil_div(args.infer.max_reqs, args.infer.dp_size)
+        if args.infer.pp_size > 1:
+            if (
+                args.scheduler.pp_config.pp_micro_batch_size_decode == "max"
+                or get_slot_handle()
+            ):
+                local_max_bs = ceil_div(max_reqs_per_dp, args.infer.pp_size)
+            else:
+                local_max_bs = args.scheduler.pp_config.pp_micro_batch_size_decode
         else:
-            local_max_bs = ceil_div(args.infer.max_reqs, args.infer.pp_size)
+            local_max_bs = max_reqs_per_dp
         _warmup_backend_direct(
             args, local_max_bs=local_max_bs, decode_steps=local_max_bs, bs_descend=1
         )
@@ -495,6 +509,34 @@ def chitu_init(args):
             "Argument `infer.do_load=False` is deprecated. Use `debug.skip_model_load=True` instead."
         )
         args.debug.skip_model_load = True
+    if (
+        hasattr(args.scheduler.pp_config, "prefill_num_tasks_divided_by_pp")
+        and not args.scheduler.pp_config.prefill_num_tasks_divided_by_pp
+    ):
+        logger.warning(
+            "Argument `scheduler.pp_config.prefill_num_tasks_divided_by_pp=False` is deprecated. Use `scheduler.pp_config.pp_micro_batch_size_prefill=<num>` instead."
+        )
+        assert (
+            hasattr(args.scheduler.pp_config, "prefill_num_tasks")
+            and args.scheduler.pp_config.prefill_num_tasks
+        )
+        args.scheduler.pp_config.pp_micro_batch_size_prefill = (
+            args.scheduler.pp_config.prefill_num_tasks
+        )
+    if (
+        hasattr(args.scheduler.pp_config, "enforce_decode_num_tasks_max")
+        and not args.scheduler.pp_config.enforce_decode_num_tasks_max
+    ):
+        logger.warning(
+            "Argument `scheduler.pp_config.enforce_decode_num_tasks_max=False` is deprecated. Use `scheduler.pp_config.pp_micro_batch_size_decode=<num>` instead."
+        )
+        assert (
+            hasattr(args.scheduler.pp_config, "decode_num_tasks")
+            and args.scheduler.pp_config.decode_num_tasks
+        )
+        args.scheduler.pp_config.pp_micro_batch_size_decode = (
+            args.scheduler.pp_config.decode_num_tasks
+        )
 
     # prefill_chunk_size default value: 4096 * dp_size
     if args.infer.prefill_chunk_size == "auto":
@@ -594,6 +636,12 @@ def chitu_init(args):
             args.infer.full_warmup = True
         else:
             args.infer.full_warmup = False
+
+    if args.scheduler.pp_config.pp_micro_batch_size_prefill == "auto":
+        args.scheduler.pp_config.pp_micro_batch_size_prefill = "max"
+
+    if args.scheduler.pp_config.pp_micro_batch_size_decode == "auto":
+        args.scheduler.pp_config.pp_micro_batch_size_decode = "max"
 
     if args.infer.dp_size > args.infer.max_reqs:
         raise ValueError(

@@ -299,10 +299,8 @@ torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_t
 
 | 参数                              | 默认值 | 说明                                                         |
 | :-------------------------------- | :----- | :----------------------------------------------------------- |
-| `prefill_num_tasks_divided_by_pp` | `True` | 当 `pp_size > 1`，设置为 `True` 时，`prefill_num_tasks = cur_req_size / pp_size` |
-| `prefill_num_tasks`               | `8`    | 当 `prefill_num_tasks_divided_by_pp` 为 `False` 时，通过指定当前值来设置 Prefill 阶段最大并发任务数 |
-| `enforce_decode_num_tasks_max`    | `True` | 当 `pp_size > 1`，设置为 `True` 时，`decode_num_tasks = cur_req_size` |
-| `decode_num_tasks`                | `8`    | 当 `enforce_decode_num_tasks_max` 为 `False` 时，通过指定当前值来设置 Decode 阶段最大并发任务数。 |
+| `pp_micro_batch_size_prefill`     | `auto` | 当 `pp_size > 1` 且 `cache_type` 为 `paged` 时生效。设置为 `max` 时，限制最大 `prefill micro batch size` 为 `max_reqs_per_dp / pp_size`；设置为具体数字时，限制为该数字；设置为 `auto` 时，自动采用 `max` 策略。 |
+| `pp_micro_batch_size_decode`      | `auto` | 当 `pp_size > 1` 且 `cache_type` 为 `paged` 时生效。设置为 `max` 时，限制最大 `decode micro batch size` 为 `max_reqs_per_dp / pp_size`；设置为具体数字时，限制为该数字；设置为 `auto` 时，自动采用 `max` 策略。 |
 
 具体使用：
 
@@ -322,10 +320,8 @@ torchrun --nnodes 1 \
     infer.mla_absorb=absorb-without-precomp \
     infer.raise_lower_bit_float_to=bfloat16 \
     infer.max_reqs=1 \
-    scheduler.pp_config.prefill_num_tasks_divided_by_pp=False \
-    scheduler.pp_config.prefill_num_tasks=8 \
-    scheduler.pp_config.enforce_decode_num_tasks_max=True \
-    scheduler.pp_config.decode_num_tasks=8 \
+    scheduler.pp_config.pp_micro_batch_size_prefill=8 \
+    scheduler.pp_config.pp_micro_batch_size_decode=auto \
     infer.max_seq_len=4096 \
     request.max_new_tokens=100 \
     infer.use_cuda_graph=True
