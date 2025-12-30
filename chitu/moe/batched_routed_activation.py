@@ -11,6 +11,7 @@ from chitu.ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_expert_block_indexed,
     batched_routed_activation_indexed_to_expert_block_permuted_blockfp8,
     batched_routed_activation_indexed_to_concat_permuted,
+    batched_routed_activation_indexed_to_expert_block_permuted,
 )
 
 
@@ -131,6 +132,48 @@ class ExpertBlockPermutedBatchedRoutedActivation(BatchedRoutedActivation):
     # As requried by DeepGEMM, `block_to_expert_indices` is a 2-D tensor, where values
     # are repeated inside a block
     block_to_expert_indices: torch.Tensor  # [n_blocks, block_size]
+
+
+@dataclass
+class ExpertBlockPermutedBatchedRoutedActivationBlock(
+    ExpertBlockPermutedBatchedRoutedActivation
+):
+    """BF16 ExpertBlockPermuted variant.
+
+    Same layout as ExpertBlockPermutedBatchedRoutedActivationBlockfp8 but
+    without quantization scales. All tensors are expected to be bf16.
+    """
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(
+        cls,
+        old: IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
+        *,
+        block_size: int,
+    ) -> "ExpertBlockPermutedBatchedRoutedActivationBlock":
+        # print(f"Before conversion: old activation shape is {old.activation.shape}")
+        (
+            blocked_activation,
+            token_comma_topk_to_block_x_item_indices,
+            block_to_expert_indices,
+        ) = batched_routed_activation_indexed_to_expert_block_permuted(
+            old.activation,
+            old.token_to_expert_indices,
+            n_tokens_padded=old.n_tokens_per_expert_padded.sum().item(),
+            n_tokens_per_expert_padded=old.n_tokens_per_expert_padded,
+            block_size=block_size,
+        )
+
+        # Ensure bf16 dtype
+        blocked_activation = blocked_activation.to(torch.bfloat16)
+
+        return cls(
+            blocked_activation=blocked_activation,
+            token_comma_topk_to_block_x_item_indices=token_comma_topk_to_block_x_item_indices,
+            block_to_expert_indices=block_to_expert_indices,
+        )
 
 
 @dataclass

@@ -45,14 +45,16 @@ class Scheduler:
             )
 
         if infer_args.pp_size > 1:
-            if args.pp_config.prefill_num_tasks_divided_by_pp:
+            if args.pp_config.pp_micro_batch_size_prefill == "max":
                 prefill_num_tasks = ceil_div(max_reqs_per_dp, infer_args.pp_size)
             else:
-                prefill_num_tasks = args.pp_config.prefill_num_tasks
-            if args.pp_config.enforce_decode_num_tasks_max:
+                assert args.pp_config.pp_micro_batch_size_prefill.isdigit()
+                prefill_num_tasks = int(args.pp_config.pp_micro_batch_size_prefill)
+            if args.pp_config.pp_micro_batch_size_decode == "max":
                 decode_num_tasks = ceil_div(max_reqs_per_dp, infer_args.pp_size)
             else:
-                decode_num_tasks = args.pp_config.decode_num_tasks
+                assert args.pp_config.pp_micro_batch_size_decode.isdigit()
+                decode_num_tasks = int(args.pp_config.pp_micro_batch_size_decode)
         else:
             prefill_num_tasks = max_reqs_per_dp
             decode_num_tasks = max_reqs_per_dp
@@ -211,8 +213,7 @@ class Scheduler:
         task_ids = list(
             filter(
                 lambda x: has_correct_dp_rank(TaskPool.pool[x])
-                and not TaskPool.pool[x].waiting
-                and not TaskPool.pool[x].need_remove(),
+                and TaskPool.pool[x].can_schedule(),
                 TaskPool.id_list,
             )
         )
@@ -337,16 +338,35 @@ class Scheduler:
 
     def _chunk_prefill_tasks_count(self, prefill_task_ids: list[str]) -> int:
         prefill_tokens = 0
+        total_prefill_tokens_len_to_schedule = 0
+
+        for i in range(len(prefill_task_ids)):
+            total_prefill_tokens_len_to_schedule += (
+                TaskPool.pool[prefill_task_ids[i]].prefix_tokens_len
+                - TaskPool.pool[prefill_task_ids[i]].consumed_req_tokens
+            )
+
         for i in range(len(prefill_task_ids)):
             task = TaskPool.pool[prefill_task_ids[i]]
             task_remaining_tokens = task.prefix_tokens_len - task.consumed_req_tokens
-            task_prefill_chunk_size = min(
-                task_remaining_tokens, self.prefill_chunk_size - prefill_tokens
-            )
-            task.set_prefill_chunk_size_for_one_step(task_prefill_chunk_size)
-            prefill_tokens += task_prefill_chunk_size
-            if prefill_tokens >= self.prefill_chunk_size:
-                return i + 1
+            if (
+                task_remaining_tokens > self.prefill_chunk_size
+                or total_prefill_tokens_len_to_schedule
+                >= self.num_scheduler_groups * self.prefill_chunk_size
+            ):
+                task_prefill_chunk_size = min(
+                    task_remaining_tokens, self.prefill_chunk_size - prefill_tokens
+                )
+                task.set_prefill_chunk_size_for_one_step(task_prefill_chunk_size)
+                prefill_tokens += task_prefill_chunk_size
+                if prefill_tokens >= self.prefill_chunk_size:
+                    return i + 1
+            else:
+                if prefill_tokens + task_remaining_tokens > self.prefill_chunk_size:
+                    return i
+                task_prefill_chunk_size = task_remaining_tokens
+                task.set_prefill_chunk_size_for_one_step(task_prefill_chunk_size)
+                prefill_tokens += task_prefill_chunk_size
         return i + 1
 
     def _schedule_decode_tasks(self, task_ids: list[str]) -> list[str]:
@@ -500,11 +520,13 @@ class Scheduler:
         for task_id in task_ids:
             # Update Task's sched_group_id and sgroup_waiting_cnt
             if (
-                not TaskPool.pool[task_id].waiting
+                TaskPool.pool[task_id].finish_last_step()
                 and TaskPool.pool[task_id].sched_group_id is not None
             ):
                 sgroup_id = TaskPool.pool[task_id].sched_group_id
                 self.sgroup_waiting_tasks[sgroup_id].remove(task_id)
+                if not isinstance(self, SkewScheduler):
+                    TaskPool.pool[task_id].sched_group_id = None
         for task_id in task_ids:
             task = TaskPool.pool[task_id]
             if task.need_remove():
@@ -585,8 +607,7 @@ class SkewScheduler(Scheduler):
         # collect ready task ids
         task_ids = list(
             filter(
-                lambda x: not TaskPool.pool[x].waiting
-                and not TaskPool.pool[x].need_remove(),
+                lambda x: TaskPool.pool[x].can_schedule(),
                 TaskPool.id_list,
             )
         )

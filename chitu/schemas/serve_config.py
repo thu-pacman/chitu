@@ -73,10 +73,20 @@ class RequestConfig:
 class SchedulerConfig:
     @dataclass
     class PpConfig:
-        prefill_num_tasks_divided_by_pp: bool = MISSING
-        prefill_num_tasks: Optional[int] = MISSING
-        enforce_decode_num_tasks_max: bool = MISSING
-        decode_num_tasks: Optional[int] = MISSING
+        pp_micro_batch_size_prefill: str = MISSING
+        pp_micro_batch_size_decode: str = MISSING
+        prefill_num_tasks_divided_by_pp: bool = (
+            MISSING  # Legacy parameter. To be removed in the future.
+        )
+        prefill_num_tasks: Optional[int] = (
+            MISSING  # Legacy parameter. To be removed in the future.
+        )
+        enforce_decode_num_tasks_max: bool = (
+            MISSING  # Legacy parameter. To be removed in the future.
+        )
+        decode_num_tasks: Optional[int] = (
+            MISSING  # Legacy parameter. To be removed in the future.
+        )
 
     pp_config: PpConfig = MISSING
     type: str = MISSING

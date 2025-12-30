@@ -37,6 +37,7 @@ from chitu.ops.triton_ops.moe_sum import (
 )
 from chitu.ops.triton_ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_expert_block_indexed_triton,
+    batched_routed_activation_indexed_to_expert_block_permute_triton,
     batched_routed_activation_indexed_to_expert_block_permuted_blockfp8_triton,
 )
 from chitu.ops.triton_ops.attn import (

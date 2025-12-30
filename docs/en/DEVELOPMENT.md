@@ -293,10 +293,8 @@ For PP, there are additional arguments for micro batching:
 
 | Parameter                         | Default | Description                                                  |
 | :-------------------------------- | :------ | :----------------------------------------------------------- |
-| `prefill_num_tasks_divided_by_pp` | `True`  | When `pp_size > 1`, setting this to `True` means `prefill_num_tasks = cur_req_size / pp_size` |
-| `prefill_num_tasks`               | `8`     | Takes effect only when `prefill_num_tasks_divided_by_pp` is `False`. Specifies the max number of concurrent tasks in the prefill stage |
-| `enforce_decode_num_tasks_max`    | `True`  | When `pp_size > 1`, setting this to True means `decode_num_tasks = cur_req_size` |
-| `decode_num_tasks`                | `8`     | Takes effect only when `enforce_decode_num_tasks_max` is `False`. Specifies the max number of concurrent tasks in the decoding stage |
+| `pp_micro_batch_size_prefill`     | `auto`  | Takes effect only when `pp_size > 1` and `cache_type` is `paged`. Setting this to `max` means the maximum value of `prefill micro batch size` is limited to `max_reqs_per_dp / pp_size`, setting this to a number means it is limited to the number, setting this to `auto` to use `max` strategy. |
+| `pp_micro_batch_size_decode`      | `auto`  | Takes effect only when `pp_size > 1` and `cache_type` is `paged`. Setting this to `max` means the maximum value of `decode micro batch size` is limited to `max_reqs_per_dp / pp_size`, setting this to a number means it is limited to the number, setting this to `auto` to use `max` strategy.  |
 
 Usage Example
 
@@ -316,10 +314,8 @@ torchrun --nnodes 1 \
     infer.mla_absorb=absorb-without-precomp \
     infer.raise_lower_bit_float_to=bfloat16 \
     infer.max_reqs=1 \
-    scheduler.pp_config.prefill_num_tasks_divided_by_pp=False \
-    scheduler.pp_config.prefill_num_tasks=8 \
-    scheduler.pp_config.enforce_decode_num_tasks_max=True \
-    scheduler.pp_config.decode_num_tasks=8 \
+    scheduler.pp_config.pp_micro_batch_size_prefill=8 \
+    scheduler.pp_config.pp_micro_batch_size_decode=auto \
     infer.max_seq_len=4096 \
     request.max_new_tokens=100 \
     infer.use_cuda_graph=True

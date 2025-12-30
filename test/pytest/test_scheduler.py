@@ -194,7 +194,7 @@ def test_chunked_prefill_skew():
     # Slot groups: [["req_0", "req_1", "req_2", 'req_3'],[]], free_sgroup: [0, 1]
     # Task length remaining: [0, 0, 1904, 4000]
     batch2_ids = scheduler.schedule()
-    assert sorted(batch2_ids) == sorted(["req_2", "req_3"])
+    assert sorted(batch2_ids) == sorted(["req_2"])
     for task_id in batch2_ids:
         TaskPool.pool[task_id].consume_req_tokens()
     scheduler.update(batch2_ids)
@@ -1147,3 +1147,56 @@ def test_slot_group_skew():
     assert len(empty_ids) == 0
     assert len(scheduler.free_sgroups) == 2
     assert len(scheduler.used_sgroups) == 0
+
+
+def test_pp_chunked_prefill():
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_seq_len": 1024,
+                    "op_impl": "torch",
+                    "cache_type": "paged",
+                }
+            }
+        ),
+        need_ensure=False,
+    )
+    TaskPool.reset()
+    Backend.cache_manager = MockCacheManager(num_blocks=10000, block_size=5120)
+    Backend.executor = MockExecutor()
+
+    for i in range(4):
+        req = MockFixedLengthedUserRequest(
+            input_len=192, request_id=f"req_{i}", enable_reasoning=False
+        )
+        task = Task(f"{req.request_id}", req)
+        TaskPool.add(task)
+
+    for i in range(4):
+        req = MockFixedLengthedUserRequest(
+            input_len=96, request_id=f"req_{i + 4}", enable_reasoning=False
+        )
+        task = Task(f"{req.request_id}", req)
+        TaskPool.add(task)
+
+    scheduler = Scheduler(
+        12, 12, "prefill_first", num_scheduler_groups=4, prefill_chunk_size=200
+    )
+
+    expected_batch_ids_list = [
+        ["req_0", "req_1"],
+        ["req_1", "req_2"],
+        ["req_2"],
+        ["req_3"],
+        ["req_4", "req_5"],
+        ["req_6", "req_7"],
+    ]
+
+    for i in range(len(expected_batch_ids_list)):
+        batch_ids = scheduler.schedule()
+        assert batch_ids == expected_batch_ids_list[i]
+        for task_id in batch_ids:
+            TaskPool.pool[task_id].consume_req_tokens()
+
+        scheduler.update(batch_ids)

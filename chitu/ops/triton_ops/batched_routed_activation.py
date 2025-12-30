@@ -411,3 +411,70 @@ def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8_triton(
         token_comma_topk_to_block_x_item_indices,
         block_to_expert_indices.view(n_blocks, block_size),
     )
+
+
+def batched_routed_activation_indexed_to_expert_block_permute_triton(
+    activation: torch.Tensor,
+    token_to_expert_indices: torch.Tensor,
+    *,
+    block_size: int,
+    n_tokens_padded: int,
+    n_tokens_per_expert_padded: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert n_tokens_padded % block_size == 0
+    n_blocks = n_tokens_padded // block_size
+
+    expert_start_loc = torch.empty_like(n_tokens_per_expert_padded)
+
+    blocked_activation = torch.empty(
+        n_tokens_padded,
+        *activation.shape[1:],
+        dtype=activation.dtype,
+        device=activation.device,
+    )
+
+    BLOCK_D = 128
+    hidden_size = activation.shape[1]
+    scale_hidden = max(hidden_size // BLOCK_D, 1)
+
+    recv_x_scale = torch.ones(
+        activation.shape[0],
+        scale_hidden,
+        dtype=activation.dtype,
+        device=activation.device,
+    )
+    output_tensor_scale = torch.empty(
+        n_tokens_padded,
+        scale_hidden,
+        dtype=activation.dtype,
+        device=activation.device,
+    )
+
+    block_to_expert_indices = torch.empty(
+        n_tokens_padded, device=activation.device, dtype=torch.int32
+    )
+    token_comma_topk_to_block_x_item_indices = token_to_expert_indices.clone()
+
+    BLOCK_E = 128
+    max_n_blocks = n_tokens_padded // BLOCK_E + 1
+    m_indices = torch.empty(
+        max_n_blocks * BLOCK_E, device=activation.device, dtype=torch.int32
+    )
+
+    ep_scatter(
+        activation,  # recv_x
+        recv_x_scale,  # recv_x_scale (dummy)
+        token_to_expert_indices,  # recv_topk
+        n_tokens_per_expert_padded,  # num_recv_tokens_per_expert
+        expert_start_loc,
+        blocked_activation,  # output_tensor
+        output_tensor_scale,  # output_tensor_scale (dummy)
+        m_indices,
+        token_comma_topk_to_block_x_item_indices,
+    )
+
+    return (
+        blocked_activation.view(n_blocks, block_size, *activation.shape[1:]),
+        token_comma_topk_to_block_x_item_indices,
+        block_to_expert_indices.view(n_blocks, block_size),
+    )
