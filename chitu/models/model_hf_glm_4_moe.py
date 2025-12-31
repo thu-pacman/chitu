@@ -32,6 +32,7 @@ from chitu.muxi_utils import (
     Blockfp8MoeExpertsMuxiLayout,
 )
 from chitu.tensor_parallel import ColumnParallelLinear
+from chitu.distributed.partition import compute_expert_dist_in_ep
 
 
 class Glm4vVisionEmbeddings(nn.Module):
@@ -385,22 +386,13 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
     @override
     def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
         fuse_shared_experts = get_global_args().infer.fuse_shared_experts
-        n_dense_layers = (
-            self.args.models.n_dense_layers
-            if hasattr(self.args.models, "n_dense_layers")
-            else 0
-        )
-        if self.ep_size > 1:
-            local_experts = [
-                self.moe_impl.load_balancer[layer_id].get_local_experts(
-                    self.moe_impl.ep_rank
-                )
-                for layer_id in self.moe_impl.moe_layer_id_list
-            ]
-        else:
-            local_experts = [
-                list(range(self.experts_start_idx, self.experts_end_idx))
-            ] * (self.args.models.n_layers - n_dense_layers)
+        n_dense_layers = self.args.models.n_dense_layers
+        local_experts = compute_expert_dist_in_ep(
+            self.args.models.n_layers - self.args.models.n_dense_layers,
+            self.ep_size,
+            self.args.models.n_routed_experts,
+            self.moe_impl,
+        )[self.ep_group.rank_in_group]
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)

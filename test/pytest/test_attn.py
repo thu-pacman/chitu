@@ -52,6 +52,7 @@ def test_mla_prefill_ragged_qkvo(
     is_increment,
     topk,
     impl,
+    record_benchmark,
 ):
     if impl == "triton" and not has_triton:
         pytest.skip("triton is missing")
@@ -141,14 +142,18 @@ def test_mla_prefill_ragged_qkvo(
         seq_len_delta.new.total_len, 1, kv_lora_rank + qk_rope_head_dim, device="cuda"
     )
 
-    out = attn_backend.mla_prefill_ragged_qkvo(
-        q_nope,
-        q_pe,
-        kv,
-        seq_len_delta,
-        causal=True,
-        softmax_scale=softmax_scale,
-        topk_indices=topk_indices,
+    out = record_benchmark.run(
+        lambda: attn_backend.mla_prefill_ragged_qkvo(
+            q_nope,
+            q_pe,
+            kv,
+            seq_len_delta,
+            causal=True,
+            softmax_scale=softmax_scale,
+            topk_indices=topk_indices,
+        ),
+        x_val=bs,
+        impl=impl,
     )
     ref_out = ref_backend.mla_prefill_ragged_qkvo(
         q_nope,
@@ -180,6 +185,7 @@ def test_mla_prefill_ragged_qo_paged_kv(
     is_increment,
     use_separated_kv_lora_k_pe,
     impl,
+    record_benchmark,
 ):
     if impl == "triton" and not has_triton:
         pytest.skip("triton is missing")
@@ -303,6 +309,8 @@ def test_mla_prefill_ragged_qo_paged_kv(
 
     assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
 
+    # this test is complex, not add record benchmark now
+
 
 @pytest.mark.parametrize("bs", [1, 64])
 @pytest.mark.parametrize("local_n_heads", [16])
@@ -321,6 +329,7 @@ def test_mla_decode_dense_kv(
     topk,
     use_separated_kv_lora_k_pe,
     impl,
+    record_benchmark,
 ):
     if impl == "triton":
         if not has_triton:
@@ -420,13 +429,18 @@ def test_mla_decode_dense_kv(
     else:
         kv_cache_dict_1 = {"kv_lora_k_pe": kv_cache.clone()}
         kv_cache_dict_2 = {"kv_lora_k_pe": kv_cache.clone()}
-    y = attn.mla_decode_dense_kv(
-        q_nope,
-        q_pe,
-        DenseKVCacheAccessor(kv_cache_dict_1),
-        this_kv,
-        seq_len_delta=seq_len_delta,
-        topk_indices=topk_indices,
+
+    y = record_benchmark.run(
+        lambda: attn.mla_decode_dense_kv(
+            q_nope,
+            q_pe,
+            DenseKVCacheAccessor(kv_cache_dict_1),
+            this_kv,
+            seq_len_delta=seq_len_delta,
+            topk_indices=topk_indices,
+        ),
+        bs=bs,
+        impl=impl,
     )
     y_ref = attn_ref.mla_decode_dense_kv(
         q_nope,
@@ -459,6 +473,7 @@ def test_mla_decode_paged_kv(
     topk,
     use_separated_kv_lora_k_pe,
     impl,
+    record_benchmark,
 ):
     if impl == "triton":
         if not has_triton:
@@ -570,13 +585,17 @@ def test_mla_decode_paged_kv(
     else:
         kv_cache_dict_1 = {"kv_lora_k_pe": kv_cache.clone()}
         kv_cache_dict_2 = {"kv_lora_k_pe": kv_cache.clone()}
-    y = attn.mla_decode_paged_kv(
-        q_nope,
-        q_pe,
-        PagedKVCacheAccessor(page_table, kv_cache_dict_1),
-        this_kv,
-        seq_len_delta=seq_len_delta,
-        topk_indices=topk_indices,
+    y = record_benchmark.run(
+        lambda: attn.mla_decode_paged_kv(
+            q_nope,
+            q_pe,
+            PagedKVCacheAccessor(page_table, kv_cache_dict_1),
+            this_kv,
+            seq_len_delta=seq_len_delta,
+            topk_indices=topk_indices,
+        ),
+        bs=bs,
+        impl=impl,
     )
     y_ref = attn_ref.mla_decode_paged_kv(
         q_nope,
@@ -602,7 +621,14 @@ def test_mla_decode_paged_kv(
 @pytest.mark.parametrize("is_increment", [False, True])
 @pytest.mark.parametrize("impl", ["triton", "flash_attn", "flashinfer", "npu"])
 def test_prefill_ragged_qkvo(
-    bs, n_heads, n_kv_heads, qk_head_dim, v_head_dim, is_increment, impl
+    bs,
+    n_heads,
+    n_kv_heads,
+    qk_head_dim,
+    v_head_dim,
+    is_increment,
+    impl,
+    record_benchmark,
 ):
     if impl == "triton" and not has_triton:
         pytest.skip("triton is missing")
@@ -681,15 +707,19 @@ def test_prefill_ragged_qkvo(
     k = torch.randn((seq_len_delta.new.total_len, n_kv_heads, qk_head_dim)).cuda()
     v = torch.randn((seq_len_delta.new.total_len, n_kv_heads, v_head_dim)).cuda()
 
-    out = attn_backend.prefill_ragged_qkvo(
-        q,
-        k,
-        v,
-        seq_len_delta,
-        causal=True,
-        window_size=(-1, -1),
-        softcap=0.0,
-        softmax_scale=0.1352337788608801,
+    out = record_benchmark.run(
+        lambda: attn_backend.prefill_ragged_qkvo(
+            q,
+            k,
+            v,
+            seq_len_delta,
+            causal=True,
+            window_size=(-1, -1),
+            softcap=0.0,
+            softmax_scale=0.1352337788608801,
+        ),
+        bs=bs,
+        impl=impl,
     )
     ref_out = ref_backend.prefill_ragged_qkvo(
         q,
@@ -715,7 +745,9 @@ def test_prefill_ragged_qkvo(
 @pytest.mark.parametrize("n_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [256])
 @pytest.mark.parametrize("impl", ["triton", "flash_attn", "flashinfer", "npu"])
-def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl):
+def test_decode_dense_kv(
+    prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl, record_benchmark
+):
     if impl == "triton" and (
         not has_triton
         or packaging.version.parse(triton.__version__)
@@ -817,15 +849,20 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
 
     k_cache1 = k_cache.clone()
     v_cache1 = v_cache.clone()
-    out = attn_backend.decode_dense_kv(
-        q,
-        DenseKVCacheAccessor({"k": k_cache1, "v": v_cache1}),
-        k,
-        v,
-        seq_len_delta=seq_len_delta,
-        window_size=(-1, -1),
-        softcap=0.0,
-        softmax_scale=None,
+
+    out = record_benchmark.run(
+        lambda: attn_backend.decode_dense_kv(
+            q,
+            DenseKVCacheAccessor({"k": k_cache1, "v": v_cache1}),
+            k,
+            v,
+            seq_len_delta=seq_len_delta,
+            window_size=(-1, -1),
+            softcap=0.0,
+            softmax_scale=None,
+        ),
+        head_dim=head_dim,
+        impl=impl,
     )
     if impl == "npu":
         out = out.squeeze(1)
@@ -853,7 +890,13 @@ def test_decode_dense_kv(prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl)
 @pytest.mark.parametrize("softmax_scale", [None, 0.13])
 @pytest.mark.parametrize("impl", ["triton", "flash_attn", "flashinfer", "npu"])
 def test_decode_paged_kv(
-    prev_seq_len_list, n_heads, n_kv_heads, head_dim, softmax_scale, impl
+    prev_seq_len_list,
+    n_heads,
+    n_kv_heads,
+    head_dim,
+    softmax_scale,
+    impl,
+    record_benchmark,
 ):
     if impl == "triton" and not has_triton:
         pytest.skip("triton is missing")
@@ -932,15 +975,19 @@ def test_decode_paged_kv(
     attn_backend.prepare_metadata_for_decode(
         seq_len_delta, block_table, block_size, softmax_scale=softmax_scale
     )
-    out = attn_backend.decode_paged_kv(
-        q,
-        PagedKVCacheAccessor(block_table, {"k": k_cache1, "v": v_cache1}),
-        k,
-        v,
-        seq_len_delta=seq_len_delta,
-        window_size=(-1, -1),
-        softcap=0.0,
-        softmax_scale=softmax_scale,
+    out = record_benchmark.run(
+        lambda: attn_backend.decode_paged_kv(
+            q,
+            PagedKVCacheAccessor(block_table, {"k": k_cache1, "v": v_cache1}),
+            k,
+            v,
+            seq_len_delta=seq_len_delta,
+            window_size=(-1, -1),
+            softcap=0.0,
+            softmax_scale=softmax_scale,
+        ),
+        head_dim=head_dim,
+        impl=impl,
     )
     if impl == "npu":
         out = out.view(out.shape[0], n_heads, head_dim)

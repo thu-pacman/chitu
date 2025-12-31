@@ -45,6 +45,7 @@ def test_moe_gate(
     qlen,
     score_func,
     use_correction_bias,
+    record_benchmark,
 ):
     if num_experts % num_expert_groups != 0:
         pytest.skip("num_experts must be divisible by num_expert_groups")
@@ -73,8 +74,12 @@ def test_moe_gate(
     if use_correction_bias:
         correction_bias = torch.randn((num_experts,), dtype=torch.bfloat16).contiguous()
 
-    cpuinfer_indices, cpuinfer_weights = cpuinfer_moe_gate(
-        qlen, scores, correction_bias, CPUInfer, cpu_moe_gate, topk
+    cpuinfer_indices, cpuinfer_weights = record_benchmark.run(
+        lambda: cpuinfer_moe_gate(
+            qlen, scores, correction_bias, CPUInfer, cpu_moe_gate, topk
+        ),
+        num_experts=num_experts,
+        impl="cpuinfer",
     )
 
     torch_indices, torch_weights = moe_gate(
@@ -87,11 +92,6 @@ def test_moe_gate(
         score_func=score_func,
         impl="torch",
     )
-
-    print("cpuinfer_indices", cpuinfer_indices)
-    print("torch_indices", torch_indices)
-    print("cpuinfer_weights", cpuinfer_weights)
-    print("torch_weights", torch_weights)
 
     expert_match = torch.all(
         torch.sort(cpuinfer_indices, dim=1).values

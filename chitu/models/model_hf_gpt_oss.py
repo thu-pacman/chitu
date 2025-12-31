@@ -12,6 +12,7 @@ from typing_extensions import override
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.distributed.parallel_state import get_etp_size, get_etp_group
+from chitu.distributed.partition import compute_expert_dist_in_ep
 from chitu.models.model import ParallelMoeBlock
 from chitu.models.model_hf_llama import (
     AttentionHFLlama,
@@ -23,6 +24,7 @@ from chitu.models.registry import ModelType, register_model
 from chitu.ops import linear
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.quantization import get_quant_from_checkpoint_prefix, QuantizedMoeExpertsBase
+from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
 from chitu.moe.batched_routed_activation import BatchedRoutedActivation
 
 
@@ -108,7 +110,8 @@ class GptOssMoeExperts(QuantizedMoeExpertsBase):
         # Common parameters for all quantizations
         dim: int,
         moe_inter_dim: int,
-        n_routed_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
         n_shared_experts: int,
         n_activated_experts: int,
         fuse_shared_experts: bool,
@@ -123,7 +126,8 @@ class GptOssMoeExperts(QuantizedMoeExpertsBase):
         super().__init__(
             dim,
             moe_inter_dim,
-            n_routed_experts,
+            experts_start_idx,
+            experts_end_idx,
             n_shared_experts,
             n_activated_experts,
             fuse_shared_experts,
@@ -240,20 +244,31 @@ class ParallelMoeBlockGptOss(ParallelMoeBlock):
         self,
         args,
         op_impl: str,
-        checkpoint_prefix: str,
         base_moe_experts_class: Optional[type] = None,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
         layer_id: int = 0,
+        moe_impl: Optional[MoEImplBase] = None,
+        *,
+        checkpoint_prefix: str,
     ):
+        if moe_impl is None:
+            moe_impl = get_moe_impl()
 
+        if isinstance(moe_impl, MoEImplEP):
+            num_local_slots = moe_impl.load_balancer[layer_id].get_num_local_slots()
+            experts_start_idx = moe_impl.ep_rank * num_local_slots
+            experts_end_idx = experts_start_idx + num_local_slots
+        else:
+            experts_start_idx = 0
+            experts_end_idx = args.num_experts
         assert args.moe_intermediate_dim % get_etp_size() == 0
-
         super().__init__(
             gate=GptOssMoeGate(args),
             experts=GptOssMoeExperts(
                 dim=args.dim,
                 moe_inter_dim=args.moe_intermediate_dim // get_etp_size(),
-                n_routed_experts=args.num_experts,
+                experts_start_idx=experts_start_idx,
+                experts_end_idx=experts_end_idx,
                 n_shared_experts=0,
                 n_activated_experts=0,
                 fuse_shared_experts=False,
@@ -262,8 +277,9 @@ class ParallelMoeBlockGptOss(ParallelMoeBlock):
                 layer_id=layer_id,
             ),
             non_fused_shared_experts=None,
-            checkpoint_prefix=checkpoint_prefix,
             layer_id=layer_id,
+            moe_impl=moe_impl,
+            checkpoint_prefix=checkpoint_prefix,
         )
 
 
@@ -412,6 +428,12 @@ class TransformerHFGptOss(TransformerHFLlama):
         return new_checkpoint
 
     def _process_state_dict_for_splitting_experts(self, checkpoint: dict[str, Any]):
+        local_experts = compute_expert_dist_in_ep(
+            self.args.models.n_layers,
+            self.ep_size,
+            self.args.models.num_experts,
+            self.moe_impl,
+        )[self.ep_group.rank_in_group]
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -425,7 +447,10 @@ class TransformerHFGptOss(TransformerHFLlama):
             ):
                 w, part = k.split(".")[-2:]
                 prefix = k[: -len(f"experts.{w}.{part}")]
-                for i in range(self.experts_start_idx, self.experts_end_idx):
+                key_split = k.split(".")
+                assert key_split[0] == "layers"
+                layer_id = int(key_split[1])
+                for i in local_experts[layer_id]:
                     new_checkpoint[prefix + f"experts.{i}.{w}.{part}"] = checkpoint[k][
                         i
                     ]
@@ -443,11 +468,22 @@ class TransformerHFGptOss(TransformerHFLlama):
         """
         if not TP, already merged, no tensors modified, just change name
         """
+        local_experts = compute_expert_dist_in_ep(
+            self.args.models.n_layers,
+            self.ep_size,
+            self.args.models.num_experts,
+            self.moe_impl,
+        )[self.ep_group.rank_in_group]
         new_checkpoint = {}
         for k in checkpoint.keys():
+            key_split = k.split(".")
+            if key_split[0] != "layers":
+                new_checkpoint[k] = checkpoint[k]
+                continue
+            layer_id = int(key_split[1])
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             if any(
-                k.endswith(f".experts.{self.experts_start_idx}.{w}.{part}")
+                k.endswith(f".experts.{local_experts[layer_id][0]}.{w}.{part}")
                 for w in ["gate_proj", "down_proj", "up_proj", "gate_up_proj"]
                 for part in self._get_2d_out_x_in_tensor_names(quant)
                 + self._get_2d_in_x_out_tensor_names(quant)
@@ -455,9 +491,9 @@ class TransformerHFGptOss(TransformerHFLlama):
                 + self._get_1d_out_tensor_names(quant)
             ):
                 w, part = k.split(".")[-2:]
-                prefix = k[: -len(f"experts.{self.experts_start_idx}.{w}.{part}")]
+                prefix = k[: -len(f"experts.{local_experts[layer_id][0]}.{w}.{part}")]
                 parts = []
-                for i in range(self.experts_start_idx, self.experts_end_idx):
+                for i in local_experts[layer_id]:
                     parts.append(checkpoint[prefix + f"experts.{i}.{w}.{part}"])
                 new_checkpoint[prefix + f"experts.{w}_{part}"] = torch.stack(
                     parts, dim=0

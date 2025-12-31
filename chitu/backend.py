@@ -42,6 +42,7 @@ from chitu.distributed.parallel_state import (
     get_pp_group,
     initialize_parallel_groups,
 )
+from chitu.distributed.partition import compute_layer_dist_in_pp
 from chitu.hybrid_device import CPUParameter
 from chitu.models.registry import ModelType, get_model_class
 from chitu.quantization import (
@@ -51,12 +52,7 @@ from chitu.quantization import (
     utils,
 )
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF, Processor
-from chitu.utils import (
-    compute_layer_dist_in_pipe,
-    parse_dtype,
-    try_import_opt_dep,
-    ceil_div,
-)
+from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div
 
 # from chitu.distributed.moe_token_dispatcher import init_token_dispatcher
 from chitu.moe import init_moe_impl
@@ -432,7 +428,7 @@ class Backend:
         # Determine layer distribution for pipeline parallelism
         if pipeline_parallel_size > 1:
             pipe_stage = get_pp_group().rank_in_group
-            num_layers_of_each_rank = compute_layer_dist_in_pipe(
+            num_layers_of_each_rank = compute_layer_dist_in_pp(
                 args.models.n_layers, pipeline_parallel_size
             )
             first_layer_id_of_each_rank = list(
@@ -489,7 +485,7 @@ class Backend:
         # Determine layer distribution for pipeline parallelism
         if pipeline_parallel_size > 1:
             pipe_stage = get_pp_group().rank_in_group
-            num_layers_of_each_rank = compute_layer_dist_in_pipe(
+            num_layers_of_each_rank = compute_layer_dist_in_pp(
                 args.models.n_layers, pipeline_parallel_size
             )
             first_layer_id_of_each_rank = list(
@@ -523,7 +519,7 @@ class Backend:
 
         if pipeline_parallel_size > 1:
             pipe_stage = get_pp_group().rank_in_group
-            num_layers_of_each_rank = compute_layer_dist_in_pipe(
+            num_layers_of_each_rank = compute_layer_dist_in_pp(
                 args.models.n_layers, pipeline_parallel_size
             )
             first_layer_id_of_each_rank = list(

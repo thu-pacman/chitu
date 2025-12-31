@@ -23,7 +23,6 @@ from chitu.utils import (
     try_import_opt_dep,
     try_import_and_setup_torch_npu,
 )
-from chitu.distributed.parallel_state import get_ep_group
 from chitu.static_tensor import StaticTensor
 from chitu.native_layout import (
     enable_native_layout_weight,
@@ -120,7 +119,8 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
         # Common parameters for all quantizations
         dim: int,
         moe_inter_dim: int,
-        n_routed_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
         n_shared_experts: int,
         n_activated_experts: int,
         fuse_shared_experts: bool,
@@ -135,7 +135,8 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
         super().__init__(
             dim,
             moe_inter_dim,
-            n_routed_experts,
+            experts_start_idx,
+            experts_end_idx,
             n_shared_experts,
             n_activated_experts,
             fuse_shared_experts,
@@ -414,7 +415,8 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
         self,
         dim: int,
         moe_inter_dim: int,
-        n_routed_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
         n_shared_experts: int,
         n_activated_experts: int,
         fuse_shared_experts: bool,
@@ -433,30 +435,16 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
 
         self.merge_gate_up = merge_gate_up
         self.moe_inter_dim = moe_inter_dim * get_tp_size()
-        self.ep_group = get_ep_group()
         self.dim = dim
         self.fuse_shared_experts = fuse_shared_experts
-        moe_rank = self.ep_group.rank_in_group
-        moe_world_size = self.ep_group.group_size
         self.max_batch_size = get_global_args().infer.max_reqs
-        assert (
-            moe_world_size == 1
-        ), f"moe_world_size must be 1 for this configuration, but got {moe_world_size}"
-        assert (
-            n_routed_experts % moe_world_size == 0
-        ), f"Number of experts must be divisible by world size (world_size={moe_world_size})"
         self.n_shared_experts = n_shared_experts
         self.n_fused_shared_experts = (
             n_shared_experts if self.fuse_shared_experts else 0
         )
-        self.n_routed_experts = n_routed_experts
-        self.n_local_experts = n_routed_experts // moe_world_size
+        self.n_routed_experts = self.experts_end_idx - self.experts_start_idx
         self.n_activated_experts = n_activated_experts
-        self.experts_start_idx = moe_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.group_size = (
-            self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts
-        )
+        self.group_size = self.n_routed_experts + self.n_fused_shared_experts
         self.checkpoint_prefix = checkpoint_prefix
 
         if torch.distributed.get_rank() == 0:

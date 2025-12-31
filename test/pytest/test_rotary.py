@@ -38,6 +38,7 @@ def test_apply_rotary_pos_emb(
     qk_dtype,
     freqs_dtype,
     impl,
+    record_benchmark,
 ):
     if impl == "triton":
         if not has_triton:
@@ -90,8 +91,12 @@ def test_apply_rotary_pos_emb(
         complex_freqs.imag.contiguous().to(freqs_dtype),
     )
 
-    out_q, out_k = apply_rotary_pos_emb(
-        q, k, freqs_cis, rotary_type=rotary_type, impl=impl
+    out_q, out_k = record_benchmark.run(
+        lambda: apply_rotary_pos_emb(
+            q, k, freqs_cis, rotary_type=rotary_type, impl=impl
+        ),
+        batch_size=batch_size,
+        impl=impl,
     )
     out_q_torch, out_k_torch = apply_rotary_pos_emb(
         q, k, freqs_cis, rotary_type=rotary_type, impl="torch"
@@ -136,6 +141,7 @@ def test_apply_rotary_pos_emb_in_place(
     qk_dtype,
     freqs_dtype,
     impl,
+    record_benchmark,
 ):
     if impl == "triton":
         if not has_triton:
@@ -201,13 +207,21 @@ def test_apply_rotary_pos_emb_in_place(
         out_q = q_clone
         out_k = k_clone
 
-    apply_rotary_pos_emb(
-        q_clone,
-        k_clone,
-        freqs_cis,
-        rotary_type=rotary_type,
-        q_out=out_q,
-        k_out=out_k,
+    def do_rotary_inplace():
+        apply_rotary_pos_emb(
+            q_clone,
+            k_clone,
+            freqs_cis,
+            rotary_type=rotary_type,
+            q_out=out_q,
+            k_out=out_k,
+            impl=impl,
+        )
+        return out_q, out_k
+
+    out_q, out_k = record_benchmark.run(
+        do_rotary_inplace,
+        batch_size=batch_size,
         impl=impl,
     )
     out_q_torch, out_k_torch = apply_rotary_pos_emb(

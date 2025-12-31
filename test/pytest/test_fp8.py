@@ -45,7 +45,7 @@ def init_b_and_b_s(dim, block_size):
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
-def test_silu_and_mul_and_blockfp8_act_quant(dtype: torch.dtype):
+def test_silu_and_mul_and_blockfp8_act_quant(dtype: torch.dtype, record_benchmark):
     set_global_args(
         OmegaConf.create({"infer": {"op_impl": "torch"}}), need_ensure=False
     )
@@ -55,7 +55,11 @@ def test_silu_and_mul_and_blockfp8_act_quant(dtype: torch.dtype):
     assert dim % block_size == 0, "dim must be divisible by block_size"
     a = torch.randn(dim, dim * 2, dtype=dtype, device="cuda")
 
-    a_fp8, a_s = silu_and_mul_and_blockfp8_act_quant(a, block_size=block_size)
+    a_fp8, a_s = record_benchmark.run(
+        lambda: silu_and_mul_and_blockfp8_act_quant(a, block_size=block_size),
+        dim=dim,
+        impl="fused",
+    )
     a_fp8_ref, a_s_ref = blockfp8_act_quant(
         eval_lazy(silu_and_mul(a)), block_size=block_size
     )
@@ -74,7 +78,7 @@ def test_silu_and_mul_and_blockfp8_act_quant(dtype: torch.dtype):
     reason="This test requires the GPU to have native FP8 support",
 )
 def test_silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
-    E, M, N, block_size, dtype: torch.dtype
+    E, M, N, block_size, dtype: torch.dtype, record_benchmark
 ):
     set_global_args(
         OmegaConf.create({"infer": {"op_impl": "torch"}}), need_ensure=False
@@ -86,8 +90,12 @@ def test_silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
         low=0, high=M, size=(E,), device="cuda", dtype=torch.int32
     )
 
-    a_fp8, a_s = silu_and_mul_and_blockfp8_act_quant(
-        a, expert_n_tokens=expert_n_tokens, block_size=block_size
+    a_fp8, a_s = record_benchmark.run(
+        lambda: silu_and_mul_and_blockfp8_act_quant(
+            a, expert_n_tokens=expert_n_tokens, block_size=block_size
+        ),
+        N=N,
+        impl="fused",
     )
     a_fp8_ref, a_s_ref = blockfp8_act_quant(
         eval_lazy(silu_and_mul(a, expert_n_tokens=expert_n_tokens)),
@@ -111,21 +119,26 @@ def test_silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
     assert torch.allclose(a_s.float(), a_s_ref.float(), atol=0.15, rtol=0.15)
 
 
+@pytest.mark.parametrize("dim", [256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
-def test_dequanted_gemm_is_close_to_fp8_gemm(dtype: torch.dtype):
+def test_dequanted_gemm_is_close_to_fp8_gemm(dim, dtype: torch.dtype, record_benchmark):
     torch.set_default_dtype(dtype)
-    dim = 256
     block_size = 128
     assert dim % block_size == 0, "dim must be divisible by block_size"
     a = torch.randn(dim, dim, dtype=dtype, device="cuda")
     b, b_s = init_b_and_b_s(dim, block_size)
 
     a_fp8, a_s = blockfp8_act_quant(a, block_size)
-    std_y = blockfp8_gemm(a_fp8, a_s, b, b_s)
+
+    std_y = record_benchmark.run(
+        lambda: blockfp8_gemm(a_fp8, a_s, b, b_s),
+        dim=dim,
+        impl="fp8_gemm",
+    )
 
     # Dequant from `a_fp8` and `a_s` instead of directly using `a` in dequanted implementation,
     # so the numerical difference is controlled inside the kernels
@@ -149,33 +162,44 @@ def test_dequanted_gemm_is_close_to_fp8_gemm(dtype: torch.dtype):
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
-def test_soft_fp8_dequant_is_close_to_dequant(dtype: torch.dtype):
+def test_soft_fp8_dequant_is_close_to_dequant(dtype: torch.dtype, record_benchmark):
     torch.set_default_dtype(dtype)
     dim = 256
     block_size = 128
     b, b_s = init_b_and_b_s(dim, block_size)
 
-    dequant_b = soft_fp8_blockfp8_weight_dequant(b, b_s)
+    dequant_b = record_benchmark.run(
+        lambda: soft_fp8_blockfp8_weight_dequant(b, b_s),
+        dim=dim,
+        impl="soft_fp8_dequant",
+    )
     soft_dequant_b = soft_fp8_blockfp8_weight_dequant(b, b_s)
 
     assert torch.allclose(dequant_b, soft_dequant_b, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("dim", [256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
-def test_soft_fp8_gemm_is_close_to_dequanted_gemm(dtype: torch.dtype):
+def test_soft_fp8_gemm_is_close_to_dequanted_gemm(
+    dim, dtype: torch.dtype, record_benchmark
+):
     torch.set_default_dtype(dtype)
-    dim = 256
     block_size = 128
     a = torch.randn(dim, dim, dtype=dtype, device="cuda")
     b, b_s = init_b_and_b_s(dim, block_size)
 
     dequant_b = soft_fp8_blockfp8_weight_dequant(b, b_s)
     std_y = torch.nn.functional.linear(a, dequant_b)
-    y = soft_fp8_blockfp8_gemm(a, b, b_s)
+
+    y = record_benchmark.run(
+        lambda: soft_fp8_blockfp8_gemm(a, b, b_s),
+        dim=dim,
+        impl="soft_fp8_gemm",
+    )
 
     assert torch.allclose(std_y, y, atol=1e-2, rtol=1e-2)
 
@@ -192,15 +216,21 @@ def test_soft_fp8_gemm_is_close_to_dequanted_gemm(dtype: torch.dtype):
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
-def test_blockfp8_index_score_dense_dsv32(b, m, n, h, d, block_size, causal, impl):
+def test_blockfp8_index_score_dense_dsv32(
+    b, m, n, h, d, block_size, causal, impl, record_benchmark
+):
     q_bf16 = torch.randn(b, m, h, d, dtype=torch.bfloat16, device="cuda")
     q_fp8, q_s = blockfp8_act_quant(q_bf16, block_size)
 
     k_bf16 = torch.randn(b, n, d, dtype=torch.bfloat16, device="cuda")
     k_fp8, k_s = blockfp8_act_quant(k_bf16, block_size)
 
-    output = blockfp8_index_score_dense_dsv32(
-        q_fp8, q_s, k_fp8, k_s, causal=causal, impl=impl
+    output = record_benchmark.run(
+        lambda: blockfp8_index_score_dense_dsv32(
+            q_fp8, q_s, k_fp8, k_s, causal=causal, impl=impl
+        ),
+        m=m,
+        impl=impl,
     )
     output_ref = blockfp8_index_score_dense_dsv32(
         q_fp8, q_s, k_fp8, k_s, causal=causal, impl="torch"
@@ -219,7 +249,9 @@ def test_blockfp8_index_score_dense_dsv32(b, m, n, h, d, block_size, causal, imp
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
-def test_blockfp8_index_score_ragged_q_dense_k_dsv32(b, h, d, block_size, causal, impl):
+def test_blockfp8_index_score_ragged_q_dense_k_dsv32(
+    b, h, d, block_size, causal, impl, record_benchmark
+):
     old_seq_len_list = [torch.randint(1, 2047, (1,)).item() for _ in range(b)]
     new_seq_len_list = [torch.randint(2048, 4096, (1,)).item() for _ in range(b)]
     seq_len_delta = BatchedSeqLenDelta(
@@ -243,8 +275,12 @@ def test_blockfp8_index_score_ragged_q_dense_k_dsv32(b, h, d, block_size, causal
     )
     k_fp8, k_s = blockfp8_act_quant(k_bf16, block_size)
 
-    output = blockfp8_index_score_ragged_q_dense_k_dsv32(
-        q_fp8, q_s, k_fp8, k_s, seq_len_delta, causal=causal, impl=impl
+    output = record_benchmark.run(
+        lambda: blockfp8_index_score_ragged_q_dense_k_dsv32(
+            q_fp8, q_s, k_fp8, k_s, seq_len_delta, causal=causal, impl=impl
+        ),
+        b=b,
+        impl=impl,
     )
     output_ref = blockfp8_index_score_ragged_q_dense_k_dsv32(
         q_fp8, q_s, k_fp8, k_s, seq_len_delta, causal=causal, impl="torch"
@@ -265,7 +301,7 @@ def test_blockfp8_index_score_ragged_q_dense_k_dsv32(b, h, d, block_size, causal
     reason="This test requires the GPU to have native FP8 support",
 )
 def test_blockfp8_index_score_ragged_q_paged_k_dsv32(
-    b, h, d, block_size, page_size, causal, impl
+    b, h, d, block_size, page_size, causal, impl, record_benchmark
 ):
     old_seq_len_list = [torch.randint(1, 2047, (1,)).item() for _ in range(b)]
     new_seq_len_list = [torch.randint(2048, 4096, (1,)).item() for _ in range(b)]
@@ -295,15 +331,19 @@ def test_blockfp8_index_score_ragged_q_paged_k_dsv32(
         b, page_cnt_per_sample
     )
 
-    output = blockfp8_index_score_ragged_q_paged_k_dsv32(
-        q_fp8,
-        q_s,
-        k_fp8,
-        k_s,
-        seq_len_delta,
-        page_table,
-        static_max_n=4096,
-        causal=causal,
+    output = record_benchmark.run(
+        lambda: blockfp8_index_score_ragged_q_paged_k_dsv32(
+            q_fp8,
+            q_s,
+            k_fp8,
+            k_s,
+            seq_len_delta,
+            page_table,
+            static_max_n=4096,
+            causal=causal,
+            impl=impl,
+        ),
+        b=b,
         impl=impl,
     )
     output_ref = blockfp8_index_score_ragged_q_paged_k_dsv32(

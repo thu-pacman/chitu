@@ -12,7 +12,7 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 @pytest.mark.parametrize("M", [32, 64, 128])
 @pytest.mark.parametrize("N", [256, 512, 1024, 18944])
 @pytest.mark.parametrize("impl", ["triton", "torch_npu"])
-def test_silu_and_mul(M, N, impl):
+def test_silu_and_mul(M, N, impl, record_benchmark):
     if impl == "triton" and not has_triton:
         pytest.skip("triton is missing")
     if impl == "torch_npu" and not has_torch_npu:
@@ -21,7 +21,12 @@ def test_silu_and_mul(M, N, impl):
     torch.manual_seed(42)
     input_tensor = torch.rand(M, N, device="cuda", dtype=torch.bfloat16)
     baseline_result = eval_lazy(silu_and_mul(input_tensor, impl="torch"))
-    result = eval_lazy(silu_and_mul(input_tensor, impl=impl))
+
+    result = record_benchmark.run(
+        lambda: eval_lazy(silu_and_mul(input_tensor, impl=impl)),
+        N=N,
+        impl=impl,
+    )
     torch.testing.assert_close(result, baseline_result, rtol=1e-2, atol=1e-2)
 
 
@@ -29,7 +34,7 @@ def test_silu_and_mul(M, N, impl):
 @pytest.mark.parametrize("M", [1, 128])
 @pytest.mark.parametrize("N", [256, 512])
 @pytest.mark.parametrize("impl", ["triton"])
-def test_silu_and_mul_with_expert_mask(E, M, N, impl):
+def test_silu_and_mul_with_expert_mask(E, M, N, impl, record_benchmark):
     if impl == "triton" and not has_triton:
         pytest.skip("triton is missing")
 
@@ -41,8 +46,13 @@ def test_silu_and_mul_with_expert_mask(E, M, N, impl):
     baseline_result = eval_lazy(
         silu_and_mul(input_tensor, expert_n_tokens=expert_n_tokens, impl="torch")
     )
-    result = eval_lazy(
-        silu_and_mul(input_tensor, expert_n_tokens=expert_n_tokens, impl=impl)
+
+    result = record_benchmark.run(
+        lambda: eval_lazy(
+            silu_and_mul(input_tensor, expert_n_tokens=expert_n_tokens, impl=impl)
+        ),
+        N=N,
+        impl=impl,
     )
 
     # Zero out non-data elements

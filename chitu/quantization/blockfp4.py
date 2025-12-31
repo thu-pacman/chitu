@@ -344,7 +344,8 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
         # Common parameters for all quantizations
         dim: int,
         moe_inter_dim: int,
-        n_routed_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
         n_shared_experts: int,
         n_activated_experts: int,
         fuse_shared_experts: bool,
@@ -365,7 +366,8 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
         super().__init__(
             dim,
             moe_inter_dim,
-            n_routed_experts,
+            experts_start_idx,
+            experts_end_idx,
             n_shared_experts,
             n_activated_experts,
             fuse_shared_experts,

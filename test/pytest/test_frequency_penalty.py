@@ -13,7 +13,9 @@ chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 @pytest.mark.parametrize("vocab_size", [151936, 129280])
 @pytest.mark.parametrize("response_len", [128, 1024])
 @pytest.mark.parametrize("impl", ["cuda", "triton"])
-def test_frequency_penalty(batch_size, vocab_size, response_len, impl):
+def test_frequency_penalty(
+    batch_size, vocab_size, response_len, impl, record_benchmark
+):
     if impl == "triton" and not has_triton:
         pytest.skip("Triton is not installed")
     if impl == "cuda" and not has_chitu_backend:
@@ -44,12 +46,17 @@ def test_frequency_penalty(batch_size, vocab_size, response_len, impl):
         frequency_penalty,
         impl="torch",
     )
-    apply_frequency_penalty(
-        logits_test,
-        logits_index,
-        response_list,
-        response_len_list,
-        frequency_penalty,
+
+    record_benchmark.run(
+        lambda: apply_frequency_penalty(
+            logits_test,
+            logits_index,
+            response_list,
+            response_len_list,
+            frequency_penalty,
+            impl=impl,
+        ),
+        batch_size=batch_size,
         impl=impl,
     )
 
