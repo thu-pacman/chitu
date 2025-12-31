@@ -77,8 +77,10 @@ from chitu.tensor_parallel import (
     VocabParallelEmbedding,
 )
 from chitu.distributed.parallel_state import get_tp_size, get_etp_size
+from chitu.distributed.partition import compute_expert_dist_in_ep
 from chitu.utils import parse_dtype, try_import_and_setup_torch_npu
 from chitu.lazy import eval_lazy
+from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
@@ -834,6 +836,8 @@ class GateDeepSeekV3(MoeGate):
 
 def MoeExpertsDeepSeekV3(
     args,
+    experts_start_idx: int,
+    experts_end_idx: int,
     checkpoint_prefix: str,
     base_moe_experts_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
@@ -854,7 +858,8 @@ def MoeExpertsDeepSeekV3(
     return base_moe_experts_class(
         dim=args.dim,
         moe_inter_dim=args.moe_inter_dim // get_etp_size(),
-        n_routed_experts=args.n_routed_experts,
+        experts_start_idx=experts_start_idx,
+        experts_end_idx=experts_end_idx,
         n_shared_experts=args.n_shared_experts,
         n_activated_experts=args.n_activated_experts,
         fuse_shared_experts=get_global_args().infer.fuse_shared_experts,
@@ -869,11 +874,16 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
         self,
         args,
         op_impl: str,
-        checkpoint_prefix: str,
         base_moe_experts_class: Optional[type] = None,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
         layer_id: int = 0,
+        moe_impl: Optional[MoEImplBase] = None,
+        *,
+        checkpoint_prefix: str,
     ):
+        if moe_impl is None:
+            moe_impl = get_moe_impl()
+
         if not get_global_args().infer.fuse_shared_experts:
             merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
                 checkpoint_prefix
@@ -889,10 +899,19 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
         else:
             non_fused_shared_experts = None
 
+        if isinstance(moe_impl, MoEImplEP):
+            num_local_slots = moe_impl.load_balancer[layer_id].get_num_local_slots()
+            experts_start_idx = moe_impl.ep_rank * num_local_slots
+            experts_end_idx = experts_start_idx + num_local_slots
+        else:
+            experts_start_idx = 0
+            experts_end_idx = args.n_routed_experts
         super().__init__(
             gate=GateDeepSeekV3(args, op_impl=op_impl),
             experts=MoeExpertsDeepSeekV3(
                 args,
+                experts_start_idx=experts_start_idx,
+                experts_end_idx=experts_end_idx,
                 checkpoint_prefix=checkpoint_prefix,
                 base_moe_experts_class=base_moe_experts_class,
                 quant_kwargs=quant_kwargs,
@@ -900,6 +919,7 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
             ),
             non_fused_shared_experts=non_fused_shared_experts,
             layer_id=layer_id,
+            moe_impl=moe_impl,
             checkpoint_prefix=checkpoint_prefix,
         )
 
@@ -1110,22 +1130,13 @@ class TransformerDeepSeekV3(Transformer):
     @override
     def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
         fuse_shared_experts = get_global_args().infer.fuse_shared_experts
-        n_dense_layers = (
-            self.args.models.n_dense_layers
-            if hasattr(self.args.models, "n_dense_layers")
-            else 0
-        )
-        if self.ep_size > 1:
-            local_experts = [
-                self.moe_impl.load_balancer[layer_id].get_local_experts(
-                    self.moe_impl.ep_rank
-                )
-                for layer_id in self.moe_impl.moe_layer_id_list
-            ]
-        else:
-            local_experts = [
-                list(range(self.experts_start_idx, self.experts_end_idx))
-            ] * (self.args.models.n_layers - n_dense_layers)
+        n_dense_layers = self.args.models.n_dense_layers
+        local_experts = compute_expert_dist_in_ep(
+            self.args.models.n_layers - self.args.models.n_dense_layers,
+            self.ep_size,
+            self.args.models.n_routed_experts,
+            self.moe_impl,
+        )[self.ep_group.rank_in_group]
 
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:

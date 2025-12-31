@@ -2,4 +2,4 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .impl import init_moe_impl, get_moe_impl
+from .impl import init_moe_impl, get_moe_impl, MoEImplBase, MoEImplEP, MoEImplNoEP

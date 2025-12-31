@@ -502,7 +502,8 @@ class NormalMoeExpertsMuxiLayout(
         # Common parameters for all quantizations
         dim: int,
         moe_inter_dim: int,
-        n_routed_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
         n_shared_experts: int,
         n_activated_experts: int,
         fuse_shared_experts: bool,
@@ -525,7 +526,8 @@ class NormalMoeExpertsMuxiLayout(
         super().__init__(
             dim=dim,
             moe_inter_dim=moe_inter_dim,
-            n_routed_experts=n_routed_experts,
+            experts_start_idx=experts_start_idx,
+            experts_end_idx=experts_end_idx,
             n_shared_experts=n_shared_experts,
             n_activated_experts=n_activated_experts,
             fuse_shared_experts=fuse_shared_experts,
@@ -564,7 +566,8 @@ class Blockfp8MoeExpertsMuxiLayout(
         # Common parameters for all quantizations
         dim: int,
         moe_inter_dim: int,
-        n_routed_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
         n_shared_experts: int,
         n_activated_experts: int,
         fuse_shared_experts: bool,
@@ -585,7 +588,8 @@ class Blockfp8MoeExpertsMuxiLayout(
         super().__init__(
             dim=dim,
             moe_inter_dim=moe_inter_dim,
-            n_routed_experts=n_routed_experts,
+            experts_start_idx=experts_start_idx,
+            experts_end_idx=experts_end_idx,
             n_shared_experts=n_shared_experts,
             n_activated_experts=n_activated_experts,
             fuse_shared_experts=fuse_shared_experts,

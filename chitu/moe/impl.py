@@ -48,7 +48,7 @@ def init_moe_impl(args) -> None:
         MOE_IMPL_INSTANCE = MoEImplNoEP(args)
 
 
-def get_moe_impl() -> Optional["MoEImplBase"]:
+def get_moe_impl() -> "MoEImplBase":
     """Get MoEImpl instance."""
     return MOE_IMPL_INSTANCE
 

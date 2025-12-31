@@ -40,15 +40,11 @@ from chitu.distributed.parallel_state import (
     get_pp_group,
     get_pp_size,
 )
-from chitu.moe import get_moe_impl
+from chitu.distributed.partition import compute_layer_dist_in_pp
+from chitu.moe import get_moe_impl, MoEImplBase
 from chitu.moe.batched_routed_activation import IndexedBatchedRoutedActivation
-from chitu.utils import (
-    compute_layer_dist_in_pipe,
-    is_layer,
-    try_import_platform_dep,
-    try_import_opt_dep,
-    ceil_div,
-)
+from chitu.moe.load_balancer import get_moe_load_planner
+from chitu.utils import is_layer, try_import_platform_dep, try_import_opt_dep, ceil_div
 from chitu.quantization import (
     QuantizationRegistry,
     QuantizedMoeExpertsBase,
@@ -58,8 +54,6 @@ from chitu.quantization import (
 )
 from chitu.hybrid_device import CPUParameter
 from chitu.static_tensor import StaticTensor
-
-from chitu.moe.load_balancer import get_moe_load_planner
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
@@ -243,7 +237,7 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.global_n_layers = params.n_layers
         if self.pipeline_exec:
-            num_layers_of_each_rank = compute_layer_dist_in_pipe(
+            num_layers_of_each_rank = compute_layer_dist_in_pp(
                 self.global_n_layers, self.pipeline_parallel_size
             )
             first_layer_id_of_each_rank = list(
@@ -273,21 +267,7 @@ class Transformer(nn.Module):
         self.model_type = self.args.models.type
         self.use_cuda_graph = self.args.infer.use_cuda_graph
 
-        if hasattr(self.params, "n_routed_experts"):
-            n_routed_experts = self.params.n_routed_experts
-        elif hasattr(self.params, "num_experts"):
-            n_routed_experts = self.params.num_experts
-        else:
-            n_routed_experts = 0
-
-        # if self.ep_size > 1:
-        n_local_experts = n_routed_experts // self.ep_size
-        remainder = n_routed_experts % self.ep_size
-        self.experts_start_idx = self.ep_group.rank_in_group * n_local_experts
-        self.experts_end_idx = self.experts_start_idx + n_local_experts
         self.moe_impl = get_moe_impl()
-        if self.ep_group.is_last_rank:
-            self.experts_end_idx += remainder
 
         if self.mtp_size > 1:
             self.token_offset_list = None
@@ -382,7 +362,7 @@ class Transformer(nn.Module):
         keys = checkpoint.keys()
         partial_checkpoint = {}
 
-        num_layers_of_each_rank = compute_layer_dist_in_pipe(num_layers, pp_size)
+        num_layers_of_each_rank = compute_layer_dist_in_pp(num_layers, pp_size)
         first_layer_id_of_each_rank = list(
             itertools.accumulate([0] + num_layers_of_each_rank)
         )
@@ -1200,10 +1180,15 @@ class ParallelMoeBlock(nn.Module):
         experts: QuantizedMoeExpertsBase,
         non_fused_shared_experts: Optional[nn.Module] = None,
         layer_id: int = 0,
+        moe_impl: Optional[MoEImplBase] = None,
         *,
         checkpoint_prefix: str,
     ):
         super().__init__()
+
+        if moe_impl is None:
+            moe_impl = get_moe_impl()
+
         self.gate = gate
         self.experts = experts
         self.shared_experts = non_fused_shared_experts
@@ -1212,7 +1197,7 @@ class ParallelMoeBlock(nn.Module):
         if self.shared_experts is not None and not is_muxi():
             self.shared_experts_stream = torch.cuda.Stream()
 
-        self.moe_impl = get_moe_impl()
+        self.moe_impl = moe_impl
         if self.moe_impl is not None and self.moe_impl.ep_size > 1:
             self.expert_mapping = self.moe_impl.get_expert_mapping(layer_id=layer_id)
         else:
@@ -1226,7 +1211,6 @@ class ParallelMoeBlock(nn.Module):
         if self.layer_id is not None:
             Backend.register_moe_layer_experts(self.layer_id, self.experts)
         self.layer_id = layer_id
-        self.experts_stats = torch.zeros(self.experts.n_routed_experts, device="cuda")
         self.is_dynamic = get_global_args().infer.moe_lb_trigger > 0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

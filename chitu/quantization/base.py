@@ -7,8 +7,6 @@ import functools
 import torch
 
 from chitu.ops import silu_and_mul
-from chitu.distributed.parallel_state import get_ep_group
-from chitu.moe import get_moe_impl
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
@@ -49,7 +47,8 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         self,
         dim: int,
         moe_inter_dim: int,
-        n_routed_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
         n_shared_experts: int,
         n_activated_experts: int,
         fuse_shared_experts: bool,
@@ -61,7 +60,8 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
 
         self.dim = dim
         self.moe_inter_dim = moe_inter_dim
-        self.n_routed_experts = n_routed_experts
+        self.experts_start_idx = experts_start_idx
+        self.experts_end_idx = experts_end_idx
         self.n_shared_experts = n_shared_experts
         self.n_activated_experts = n_activated_experts
         self.fuse_shared_experts = fuse_shared_experts
@@ -69,29 +69,11 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         self.merge_gate_up = merge_gate_up
         self.layer_id = layer_id
 
-        self.ep_group = get_ep_group()
-        moe_rank = self.ep_group.rank_in_group
-        moe_world_size = self.ep_group.group_size
         self.n_fused_shared_experts = (
             n_shared_experts if self.fuse_shared_experts else 0
         )
-
-        self.n_local_experts = n_routed_experts // moe_world_size
-        remainder = n_routed_experts % moe_world_size
-        self.experts_start_idx = moe_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        if self.ep_group.is_last_rank:
-            self.experts_end_idx += remainder
-        self.moe_impl = get_moe_impl()
-        self.group_size = (
-            self.experts_end_idx - self.experts_start_idx + self.n_fused_shared_experts
-        )
-        if self.moe_impl is not None and self.moe_impl.ep_size > 1:
-            num_local_slots = self.moe_impl.load_balancer[
-                layer_id
-            ].get_num_local_slots()
-            self.experts_start_idx = moe_rank * num_local_slots
-            self.group_size = num_local_slots
+        self.n_routed_experts = self.experts_end_idx - self.experts_start_idx
+        self.group_size = self.n_routed_experts + self.n_fused_shared_experts
 
     def __repr__(self):
         inheritance_order = []
@@ -100,7 +82,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
                 break
             inheritance_order.append(cls.__name__)
         inheritance_order_str = " <- ".join(inheritance_order)
-        return f"{inheritance_order_str}(dim={self.dim}, moe_inter_dim={self.moe_inter_dim}, n_routed_experts={self.n_routed_experts}, n_shared_experts={self.n_shared_experts}, n_activated_experts={self.n_activated_experts})"
+        return f"{inheritance_order_str}(dim={self.dim}, moe_inter_dim={self.moe_inter_dim}, experts_start_idx={self.experts_start_idx}, experts_end_idx={self.experts_end_idx}, n_shared_experts={self.n_shared_experts}, n_activated_experts={self.n_activated_experts})"
 
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
         """

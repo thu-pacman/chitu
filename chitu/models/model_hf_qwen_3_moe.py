@@ -14,7 +14,9 @@ from chitu.models.model_hf_llama import TransformerBlockHFLlama, TransformerHFLl
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
 from chitu.distributed.parallel_state import get_etp_size
+from chitu.distributed.partition import compute_expert_dist_in_ep
 from chitu.models.registry import ModelType, register_model
+from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
 
 
 class Qwen3MoeGate(MoeGate):
@@ -41,10 +43,13 @@ class Qwen3MoeGate(MoeGate):
 
 def Qwen3MoeExperts(
     args,
-    checkpoint_prefix: str,
+    experts_start_idx: int,
+    experts_end_idx: int,
     base_moe_experts_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
     layer_id: int = 0,
+    *,
+    checkpoint_prefix: str,
 ):
     if base_moe_experts_class is None:
         base_moe_experts_class = (
@@ -58,11 +63,11 @@ def Qwen3MoeExperts(
     merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
 
     assert args.moe_intermediate_dim % get_etp_size() == 0
-
     return base_moe_experts_class(
         dim=args.dim,
         moe_inter_dim=args.moe_intermediate_dim // get_etp_size(),
-        n_routed_experts=args.num_experts,
+        experts_start_idx=experts_start_idx,
+        experts_end_idx=experts_end_idx,
         n_shared_experts=0,
         n_activated_experts=0,
         fuse_shared_experts=False,
@@ -77,11 +82,16 @@ class ParallelMoeBlockQwen3(ParallelMoeBlock):
         self,
         args,
         op_impl: str,
-        checkpoint_prefix: str,
         base_moe_experts_class: Optional[type] = None,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
         layer_id: int = 0,
+        moe_impl: Optional[MoEImplBase] = None,
+        *,
+        checkpoint_prefix: str,
     ):
+        if moe_impl is None:
+            moe_impl = get_moe_impl()
+
         quant_kwargs = dict(quant_kwargs)
         if "blockfp4" not in quant_kwargs:
             quant_kwargs["blockfp4"] = {}
@@ -92,17 +102,27 @@ class ParallelMoeBlockQwen3(ParallelMoeBlock):
             quant_kwargs["blockfp4_merged"]["no_input_scale"] = args.no_input_scale
         quant_kwargs["blockfp4_merged"]["merged_global_scale"] = True
 
+        if isinstance(moe_impl, MoEImplEP):
+            num_local_slots = moe_impl.load_balancer[layer_id].get_num_local_slots()
+            experts_start_idx = moe_impl.ep_rank * num_local_slots
+            experts_end_idx = experts_start_idx + num_local_slots
+        else:
+            experts_start_idx = 0
+            experts_end_idx = args.num_experts
         super().__init__(
             gate=Qwen3MoeGate(args, op_impl),
             experts=Qwen3MoeExperts(
                 args,
-                f"{checkpoint_prefix}.experts",
+                experts_start_idx,
+                experts_end_idx,
                 base_moe_experts_class,
                 quant_kwargs,
                 layer_id=layer_id,
+                checkpoint_prefix=f"{checkpoint_prefix}.experts",
             ),
             non_fused_shared_experts=None,
             layer_id=layer_id,
+            moe_impl=moe_impl,
             checkpoint_prefix=checkpoint_prefix,
         )
 
@@ -186,22 +206,12 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
         输出键：'layers.3.mlp.experts.gate_proj.part_name' (合并所有该层的专家权重)
         """
 
-        n_dense_layers = (
-            self.args.models.n_dense_layers
-            if hasattr(self.args.models, "n_dense_layers")
-            else 0
-        )
-        if self.ep_size > 1:
-            local_experts = [
-                self.moe_impl.load_balancer[layer_id].get_local_experts(
-                    self.moe_impl.ep_rank
-                )
-                for layer_id in self.moe_impl.moe_layer_id_list
-            ]
-        else:
-            local_experts = [
-                list(range(self.experts_start_idx, self.experts_end_idx))
-            ] * (self.args.models.n_layers - n_dense_layers)
+        local_experts = compute_expert_dist_in_ep(
+            self.args.models.n_layers,
+            self.ep_size,
+            self.args.models.num_experts,
+            self.moe_impl,
+        )[self.ep_group.rank_in_group]
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -211,7 +221,7 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
             layer_id = int(key_split[1])
             if any(
                 k.endswith(
-                    f"{layer_id}.mlp.experts.{local_experts[layer_id - n_dense_layers][0]}.{w}.{part}"
+                    f"{layer_id}.mlp.experts.{local_experts[layer_id][0]}.{w}.{part}"
                 )
                 for w in ["gate_proj", "down_proj", "up_proj", "gate_up_proj"]
                 for part in self._get_2d_out_x_in_tensor_names(quant)
@@ -222,7 +232,7 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
                 w, part = k.split(".")[-2:]
                 prefix = f"layers.{layer_id}.mlp."
                 parts = []
-                for i in local_experts[layer_id - n_dense_layers]:
+                for i in local_experts[layer_id]:
                     parts.append(prefix + f"experts.{i}.{w}.{part}")
                 checkpoint[prefix + f"experts.{w}_{part}"] = torch.stack(
                     [checkpoint.pop(key) for key in parts], dim=0

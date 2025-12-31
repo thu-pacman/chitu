@@ -37,6 +37,7 @@ from chitu.ops import (
 from chitu.quantization import QuantizationRegistry
 from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear, LocalLinear
 from chitu.ops import rms_norm_gate
+from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
 
 
 class Qwen3NextRMSNorm(RMSNorm):
@@ -454,24 +455,39 @@ class ParallelMoeBlockQwen3Next(ParallelMoeBlock):
         self,
         args,
         op_impl: str,
-        checkpoint_prefix: str,
         base_moe_experts_class: Optional[type] = None,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
         layer_id: int = 0,
+        moe_impl: Optional[MoEImplBase] = None,
+        *,
+        checkpoint_prefix: str,
     ):
+        if moe_impl is None:
+            moe_impl = get_moe_impl()
+
+        if isinstance(moe_impl, MoEImplEP):
+            num_local_slots = moe_impl.load_balancer[layer_id].get_num_local_slots()
+            experts_start_idx = moe_impl.ep_rank * num_local_slots
+            experts_end_idx = experts_start_idx + num_local_slots
+        else:
+            experts_start_idx = 0
+            experts_end_idx = args.num_experts
         super().__init__(
             gate=Qwen3MoeGate(args, op_impl),
             experts=Qwen3MoeExperts(
                 args,
-                f"{checkpoint_prefix}.experts",
+                experts_start_idx,
+                experts_end_idx,
                 base_moe_experts_class,
                 quant_kwargs,
                 layer_id=layer_id,
+                checkpoint_prefix=f"{checkpoint_prefix}.experts",
             ),
             non_fused_shared_experts=SharedExpertGateAndBodyQwen3Next(
                 args, op_impl=op_impl, checkpoint_prefix=checkpoint_prefix
             ),
             layer_id=layer_id,
+            moe_impl=moe_impl,
             checkpoint_prefix=checkpoint_prefix,
         )
 

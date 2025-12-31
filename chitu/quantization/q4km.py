@@ -47,7 +47,8 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
         # Common parameters for all quantizations
         dim: int,
         moe_inter_dim: int,
-        n_routed_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
         n_shared_experts: int,
         n_activated_experts: int,
         fuse_shared_experts: bool,
@@ -68,7 +69,8 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
         super().__init__(
             dim,
             moe_inter_dim,
-            n_routed_experts,
+            experts_start_idx,
+            experts_end_idx,
             n_shared_experts,
             n_activated_experts,
             fuse_shared_experts,
@@ -77,13 +79,46 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
             layer_id=layer_id,
         )
 
-        self.rank = self.ep_group.rank_in_group
         self.max_batch_size = get_global_args().infer.max_reqs
-        self.n_local_experts = n_routed_experts
 
-        if self.rank == 0:
-
-            self.gguf_gate_proj = CPUParameter(
+        self.gguf_gate_proj = CPUParameter(
+            torch.empty(
+                int(256 * 2048 * 7168 / 256 * 144),
+                dtype=torch.uint8,
+                device="cpu",
+            ),
+            requires_grad=False,
+        )
+        with torch.device("cpu"):
+            # The value matters. Don't put onto "meta" device.
+            self.gate_type = CPUParameter(
+                torch.tensor(
+                    (12),
+                    dtype=torch.int,
+                    device="cpu",
+                ),
+                requires_grad=False,
+            )
+        self.gguf_up_proj = CPUParameter(
+            torch.empty(
+                int(256 * 2048 * 7168 / 256 * 144),
+                dtype=torch.uint8,
+                device="cpu",
+            ),
+            requires_grad=False,
+        )
+        with torch.device("cpu"):
+            # The value matters. Don't put onto "meta" device.
+            self.up_type = CPUParameter(
+                torch.tensor(
+                    (12),
+                    dtype=torch.int,
+                    device="cpu",
+                ),
+                requires_grad=False,
+            )
+        if ggml_type == "q4k":
+            self.gguf_down_proj = CPUParameter(
                 torch.empty(
                     int(256 * 2048 * 7168 / 256 * 144),
                     dtype=torch.uint8,
@@ -93,7 +128,7 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
             )
             with torch.device("cpu"):
                 # The value matters. Don't put onto "meta" device.
-                self.gate_type = CPUParameter(
+                self.down_type = CPUParameter(
                     torch.tensor(
                         (12),
                         dtype=torch.int,
@@ -101,9 +136,10 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
                     ),
                     requires_grad=False,
                 )
-            self.gguf_up_proj = CPUParameter(
+        elif ggml_type == "q6k":
+            self.gguf_down_proj = CPUParameter(
                 torch.empty(
-                    int(256 * 2048 * 7168 / 256 * 144),
+                    int(256 * 2048 * 7168 / 256 * 210),
                     dtype=torch.uint8,
                     device="cpu",
                 ),
@@ -111,125 +147,86 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
             )
             with torch.device("cpu"):
                 # The value matters. Don't put onto "meta" device.
-                self.up_type = CPUParameter(
+                self.down_type = CPUParameter(
                     torch.tensor(
-                        (12),
+                        (14),
                         dtype=torch.int,
                         device="cpu",
                     ),
                     requires_grad=False,
                 )
-            if ggml_type == "q4k":
-                self.gguf_down_proj = CPUParameter(
-                    torch.empty(
-                        int(256 * 2048 * 7168 / 256 * 144),
-                        dtype=torch.uint8,
-                        device="cpu",
-                    ),
-                    requires_grad=False,
-                )
-                with torch.device("cpu"):
-                    # The value matters. Don't put onto "meta" device.
-                    self.down_type = CPUParameter(
-                        torch.tensor(
-                            (12),
-                            dtype=torch.int,
-                            device="cpu",
-                        ),
-                        requires_grad=False,
-                    )
-            elif ggml_type == "q6k":
-                self.gguf_down_proj = CPUParameter(
-                    torch.empty(
-                        int(256 * 2048 * 7168 / 256 * 210),
-                        dtype=torch.uint8,
-                        device="cpu",
-                    ),
-                    requires_grad=False,
-                )
-                with torch.device("cpu"):
-                    # The value matters. Don't put onto "meta" device.
-                    self.down_type = CPUParameter(
-                        torch.tensor(
-                            (14),
-                            dtype=torch.int,
-                            device="cpu",
-                        ),
-                        requires_grad=False,
-                    )
-            else:
-                raise ValueError("ggml quantization type unimplemented !")
+        else:
+            raise ValueError("ggml quantization type unimplemented !")
 
-            self.input_tensor_cpu = StaticTensor(
-                max_nelem=self.max_batch_size * self.dim,
-                device="cpu",
-                pin_memory=True,
-                dtype=torch.bfloat16,
-            )
-            self.weights_cpu = StaticTensor(
-                max_nelem=self.max_batch_size * self.n_activated_experts,
-                device="cpu",
-                pin_memory=True,
-                dtype=torch.float32,
-            )
-            self.indices_cpu = StaticTensor(
-                max_nelem=self.max_batch_size * self.n_activated_experts,
-                device="cpu",
-                pin_memory=True,
-                dtype=torch.int64,
-            )
-            self.output_cpu = StaticTensor(
-                max_nelem=self.max_batch_size * self.dim,
-                device="cpu",
-                pin_memory=True,
-                dtype=torch.bfloat16,
-            )
-            self.output_gpu = StaticTensor(
-                max_nelem=self.max_batch_size * self.dim,
-                device="cuda",
-                dtype=torch.bfloat16,
-            )
+        self.input_tensor_cpu = StaticTensor(
+            max_nelem=self.max_batch_size * self.dim,
+            device="cpu",
+            pin_memory=True,
+            dtype=torch.bfloat16,
+        )
+        self.weights_cpu = StaticTensor(
+            max_nelem=self.max_batch_size * self.n_activated_experts,
+            device="cpu",
+            pin_memory=True,
+            dtype=torch.float32,
+        )
+        self.indices_cpu = StaticTensor(
+            max_nelem=self.max_batch_size * self.n_activated_experts,
+            device="cpu",
+            pin_memory=True,
+            dtype=torch.int64,
+        )
+        self.output_cpu = StaticTensor(
+            max_nelem=self.max_batch_size * self.dim,
+            device="cpu",
+            pin_memory=True,
+            dtype=torch.bfloat16,
+        )
+        self.output_gpu = StaticTensor(
+            max_nelem=self.max_batch_size * self.dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
 
-            self.cpu_infer = get_cpu_infer()
+        self.cpu_infer = get_cpu_infer()
 
     def warm_up(self):
-        if self.rank == 0:
-            # Initialize after __init__ because `data_ptr` may be modified during weight loading
-            gate_ptr = ctypes.addressof(
-                ctypes.cast(
-                    self.gguf_gate_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
-                ).contents
-            )
-            up_ptr = ctypes.addressof(
-                ctypes.cast(
-                    self.gguf_up_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
-                ).contents
-            )
-            down_ptr = ctypes.addressof(
-                ctypes.cast(
-                    self.gguf_down_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
-                ).contents
-            )
-            self.moe_config = cpuinfer.moe.MOEConfig(
-                self.n_routed_experts,
-                self.n_activated_experts,
-                self.dim,
-                self.moe_inter_dim,
-                64,
-                10,
-                1024,
-                gate_ptr,
-                up_ptr,
-                down_ptr,
-                self.gate_type.item(),
-                self.up_type.item(),
-                self.down_type.item(),
-                GGMLQuantizationType.BF16,
-            )
-            self.moe = cpuinfer.moe.MOE(self.moe_config)
+        # Initialize after __init__ because `data_ptr` may be modified during weight loading
+        gate_ptr = ctypes.addressof(
+            ctypes.cast(
+                self.gguf_gate_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+            ).contents
+        )
+        up_ptr = ctypes.addressof(
+            ctypes.cast(
+                self.gguf_up_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+            ).contents
+        )
+        down_ptr = ctypes.addressof(
+            ctypes.cast(
+                self.gguf_down_proj.data_ptr(), ctypes.POINTER(ctypes.c_uint64)
+            ).contents
+        )
+        self.moe_config = cpuinfer.moe.MOEConfig(
+            self.n_routed_experts,
+            self.n_activated_experts,
+            self.dim,
+            self.moe_inter_dim,
+            64,
+            10,
+            1024,
+            gate_ptr,
+            up_ptr,
+            down_ptr,
+            self.gate_type.item(),
+            self.up_type.item(),
+            self.down_type.item(),
+            GGMLQuantizationType.BF16,
+        )
+        self.moe = cpuinfer.moe.MOE(self.moe_config)
 
-            self.cpu_infer.submit(self.moe.warm_up())
-            self.cpu_infer.sync()
+        self.cpu_infer.submit(self.moe.warm_up())
+        self.cpu_infer.sync()
 
     @override
     @functools.singledispatchmethod
@@ -257,56 +254,52 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
         shape = x.size()
         capturing = torch.cuda.is_current_stream_capturing()
 
-        if self.rank == 0:
-            indices = indices.contiguous().to(torch.int64)
-            weights = weights.contiguous().to(torch.float32)
-            if not capturing:
-                input_tensor = x.contiguous().cpu()
-                indices = indices.cpu()
-                weights = weights.cpu()
-                output = torch.empty_like(input_tensor).contiguous().pin_memory()
-                self.cpu_infer.submit(
-                    self.moe.forward(
-                        indices.size(0),
-                        indices.size(1),
-                        indices.data_ptr(),
-                        weights.data_ptr(),
-                        input_tensor.data_ptr(),
-                        output.data_ptr(),
-                    )
+        indices = indices.contiguous().to(torch.int64)
+        weights = weights.contiguous().to(torch.float32)
+        if not capturing:
+            input_tensor = x.contiguous().cpu()
+            indices = indices.cpu()
+            weights = weights.cpu()
+            output = torch.empty_like(input_tensor).contiguous().pin_memory()
+            self.cpu_infer.submit(
+                self.moe.forward(
+                    indices.size(0),
+                    indices.size(1),
+                    indices.data_ptr(),
+                    weights.data_ptr(),
+                    input_tensor.data_ptr(),
+                    output.data_ptr(),
                 )
-            else:
-                self.input_tensor_cpu.set_shape(x.shape)
-                self.indices_cpu.set_shape(indices.shape)
-                self.weights_cpu.set_shape(weights.shape)
-                self.output_cpu.set_shape(x.shape)
-                self.output_gpu.set_shape(x.shape)
-                self.input_tensor_cpu.get().copy_(x, non_blocking=True)
-                self.indices_cpu.get().copy_(indices, non_blocking=True)
-                self.weights_cpu.get().copy_(weights, non_blocking=True)
-                self.cpu_infer.submit_with_cuda_stream(
-                    torch.cuda.current_stream().cuda_stream,
-                    self.moe.forward(
-                        indices.size(0),
-                        indices.size(1),
-                        self.indices_cpu.get().data_ptr(),
-                        self.weights_cpu.get().data_ptr(),
-                        self.input_tensor_cpu.get().data_ptr(),
-                        self.output_cpu.get().data_ptr(),
-                    ),
-                )
-
-        if self.rank == 0:
-            if not capturing:
-                self.cpu_infer.sync()
-                y = output.to(x.device, non_blocking=True).view(shape)
-            else:
-                self.cpu_infer.sync_with_cuda_stream(
-                    torch.cuda.current_stream().cuda_stream
-                )
-                self.output_gpu.get().copy_(self.output_cpu.get(), non_blocking=True)
-                y = self.output_gpu.get()
+            )
         else:
-            y = torch.zeros_like(x)
+            self.input_tensor_cpu.set_shape(x.shape)
+            self.indices_cpu.set_shape(indices.shape)
+            self.weights_cpu.set_shape(weights.shape)
+            self.output_cpu.set_shape(x.shape)
+            self.output_gpu.set_shape(x.shape)
+            self.input_tensor_cpu.get().copy_(x, non_blocking=True)
+            self.indices_cpu.get().copy_(indices, non_blocking=True)
+            self.weights_cpu.get().copy_(weights, non_blocking=True)
+            self.cpu_infer.submit_with_cuda_stream(
+                torch.cuda.current_stream().cuda_stream,
+                self.moe.forward(
+                    indices.size(0),
+                    indices.size(1),
+                    self.indices_cpu.get().data_ptr(),
+                    self.weights_cpu.get().data_ptr(),
+                    self.input_tensor_cpu.get().data_ptr(),
+                    self.output_cpu.get().data_ptr(),
+                ),
+            )
+
+        if not capturing:
+            self.cpu_infer.sync()
+            y = output.to(x.device, non_blocking=True).view(shape)
+        else:
+            self.cpu_infer.sync_with_cuda_stream(
+                torch.cuda.current_stream().cuda_stream
+            )
+            self.output_gpu.get().copy_(self.output_cpu.get(), non_blocking=True)
+            y = self.output_gpu.get()
 
         return y.view(shape)
