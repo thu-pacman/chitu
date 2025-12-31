@@ -28,7 +28,7 @@ def cpuinfer_silu_and_mul(input_tensor, CPUInfer, silu_and_mul):
 @pytest.mark.parametrize("input_size", [512, 1024, 8192])
 @pytest.mark.parametrize("qlen", [1, 16, 30])
 @pytest.mark.parametrize("compute_dtype", [torch.float32, torch.bfloat16])
-def test_silu_and_mul(input_size, qlen, compute_dtype):
+def test_silu_and_mul(input_size, qlen, compute_dtype, record_benchmark):
     group_max_len = 1024
     hidden_type = 30
     if compute_dtype == torch.float32:
@@ -47,7 +47,11 @@ def test_silu_and_mul(input_size, qlen, compute_dtype):
         torch.randn((qlen, input_size), dtype=compute_dtype).contiguous() / 100
     )
 
-    cpuinfer_output = cpuinfer_silu_and_mul(input_tensor, CPUInfer, silu_and_mul)
+    cpuinfer_output = record_benchmark.run(
+        lambda: cpuinfer_silu_and_mul(input_tensor, CPUInfer, silu_and_mul),
+        input_size=input_size,
+        impl="cpuinfer",
+    )
 
     torch_output = silu_and_mul_torch(input_tensor)
 

@@ -22,7 +22,7 @@ def cpuinfer_rms_norm(input_tensor, output_tensor, CPUInfer, rmsnorm):
 @pytest.mark.parametrize("input_size", [512, 1024, 4096])
 @pytest.mark.parametrize("qlen", [1, 10, 32])
 @pytest.mark.parametrize("compute_dtype", [torch.bfloat16])
-def test_rmsnorm(input_size, qlen, compute_dtype):
+def test_rmsnorm(input_size, qlen, compute_dtype, record_benchmark):
     group_max_len = 1024
     weight_type = 30
     hidden_type = 30
@@ -45,7 +45,11 @@ def test_rmsnorm(input_size, qlen, compute_dtype):
     input_tensor = torch.randn((qlen, input_size), dtype=compute_dtype).contiguous()
     cpuinfer_output = torch.empty((qlen, input_size), dtype=compute_dtype).contiguous()
 
-    cpuinfer_rms_norm(input_tensor, cpuinfer_output, CPUInfer, rmsnorm)
+    cpuinfer_output = record_benchmark.run(
+        lambda: cpuinfer_rms_norm(input_tensor, cpuinfer_output, CPUInfer, rmsnorm),
+        input_size=input_size,
+        impl="cpuinfer",
+    )
 
     torch_output = rms_norm_torch(
         input_tensor, weight, compute_dtype=torch.float32, eps=eps

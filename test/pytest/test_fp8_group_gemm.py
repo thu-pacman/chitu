@@ -24,7 +24,7 @@ def check_close(x, y):
 @pytest.mark.parametrize("soft_fp8", [False, True])
 @pytest.mark.skipif(not has_triton, reason="triton is not available")
 def test_blockfp8_einsum_shc_hdc_shd(
-    n_heads, batch_size, in_feats, out_feats, compute_dtype, soft_fp8
+    n_heads, batch_size, in_feats, out_feats, compute_dtype, soft_fp8, record_benchmark
 ):
     set_global_args(OmegaConf.create({"infer": {"soft_fp8": False}}), need_ensure=False)
     torch.set_default_dtype(compute_dtype)
@@ -48,7 +48,13 @@ def test_blockfp8_einsum_shc_hdc_shd(
     torch_out = blockfp8_einsum_shc_hdc_shd(
         q_nope, weight, scale, soft_fp8=soft_fp8, impl="torch"
     )
-    triton_out = blockfp8_einsum_shc_hdc_shd(
-        q_nope, weight, scale, soft_fp8=soft_fp8, impl="triton"
+
+    # Method B: combine correctness test and benchmark
+    triton_out = record_benchmark.run(
+        lambda: blockfp8_einsum_shc_hdc_shd(
+            q_nope, weight, scale, soft_fp8=soft_fp8, impl="triton"
+        ),
+        in_feats=in_feats,
+        impl="triton",
     )
     assert check_close(torch_out, triton_out)

@@ -26,7 +26,7 @@ def cpuinfer_linear(input_tensor, weight, output_tensor, CPUInfer, linear):
 @pytest.mark.parametrize("output_size", [4096, 25600])
 @pytest.mark.parametrize("qlen", [1, 8])
 @pytest.mark.parametrize("compute_dtype", [torch.bfloat16])
-def test_cpu_linear(input_size, output_size, qlen, compute_dtype):
+def test_cpu_linear(input_size, output_size, qlen, compute_dtype, record_benchmark):
     stride = 64
     group_max_len = 1024
     proj_type = 30
@@ -55,7 +55,12 @@ def test_cpu_linear(input_size, output_size, qlen, compute_dtype):
     )
     cpuinfer_output = torch.empty((qlen, output_size), dtype=compute_dtype).contiguous()
 
-    cpuinfer_linear(input_tensor, proj, cpuinfer_output, CPUInfer, linear)
+    cpuinfer_output = record_benchmark.run(
+        lambda: cpuinfer_linear(input_tensor, proj, cpuinfer_output, CPUInfer, linear),
+        x_val=f"{input_size}x{output_size}",
+        x_name="input_x_output",
+        impl="cpuinfer",
+    )
 
     torch_output = torch_linear(input_tensor, proj)
 

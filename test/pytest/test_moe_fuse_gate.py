@@ -48,6 +48,7 @@ def test_moe_fused_gate(
     bias_is_float32,
     norm_prob,
     impl,
+    record_benchmark,
 ):
     if impl == "cuda" and not has_chitu_backend:
         pytest.skip("chitu_backend is not available, skipping CUDA tests")
@@ -100,15 +101,19 @@ def test_moe_fused_gate(
     else:
         bias = None
 
-    indices, weights = moe_gate(
-        scores,
-        topk,
-        num_expert_group=num_expert_group,
-        topk_group=topk_group,
-        topk_as_topk_group_criteria=topk_as_topk_group_criteria,
-        e_score_correction_bias=bias,
-        score_func=score_func,
-        norm_prob=norm_prob,
+    indices, weights = record_benchmark.run(
+        lambda: moe_gate(
+            scores,
+            topk,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            topk_as_topk_group_criteria=topk_as_topk_group_criteria,
+            e_score_correction_bias=bias,
+            score_func=score_func,
+            norm_prob=norm_prob,
+            impl=impl,
+        ),
+        seq_length=seq_length,
         impl=impl,
     )
     indices_ref, weights_ref = moe_gate(

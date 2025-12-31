@@ -32,6 +32,7 @@ def test_chunk_gated_delta_rule(
     seq_len,
     linear_head_dim,
     linear_n_v_heads,
+    record_benchmark,
 ):
     if not has_fla:
         pytest.skip("fla is missing")
@@ -45,15 +46,19 @@ def test_chunk_gated_delta_rule(
     g = g * (torch.rand_like(g))
     beta = torch.randn(bs, seq_len, linear_n_v_heads, device="cuda").sigmoid()
 
-    fla_out, _ = fla_chunk_gated_delta_rule(
-        q,
-        k,
-        v,
-        g=g,
-        beta=beta,
-        initial_state=None,
-        output_final_state=True,
-        use_qk_l2norm_in_kernel=True,
+    fla_out, _ = record_benchmark.run(
+        lambda: fla_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        ),
+        seq_len=seq_len,
+        impl="fla",
     )
     torch_out, _ = torch_chunk_gated_delta_rule(
         q,
@@ -75,6 +80,7 @@ def test_recurrent_gated_delta_rule(
     bs,
     linear_head_dim,
     linear_n_v_heads,
+    record_benchmark,
 ):
     if not has_fla:
         pytest.skip("fla is missing")
@@ -91,15 +97,19 @@ def test_recurrent_gated_delta_rule(
         bs, linear_n_v_heads, linear_head_dim, linear_head_dim, device="cuda"
     )
 
-    fla_out, _ = fla_fused_recurrent_gated_delta_rule(
-        q,
-        k,
-        v,
-        g=g,
-        beta=beta,
-        initial_state=initial_state,
-        output_final_state=True,
-        use_qk_l2norm_in_kernel=True,
+    fla_out, _ = record_benchmark.run(
+        lambda: fla_fused_recurrent_gated_delta_rule(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        ),
+        bs=bs,
+        impl="fla",
     )
     torch_out, _ = torch_recurrent_gated_delta_rule(
         q,

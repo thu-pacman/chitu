@@ -23,7 +23,9 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 @pytest.mark.parametrize("head_dim", [256, 1024])
 @pytest.mark.parametrize("impl", ["cuda", "triton", "torch", "torch_npu"])
 @torch.inference_mode()
-def test_rms_norm(default_dtype, weight_dtype, compute_dtype, dim, head_dim, impl):
+def test_rms_norm(
+    default_dtype, weight_dtype, compute_dtype, dim, head_dim, impl, record_benchmark
+):
     if impl == "torch" and not hasattr(torch.nn.functional, "rms_norm"):
         pytest.skip("The torch version does not support RMSNorm")
     if impl == "triton" and not has_triton:
@@ -38,7 +40,12 @@ def test_rms_norm(default_dtype, weight_dtype, compute_dtype, dim, head_dim, imp
     weight = torch.randn(dim, dtype=weight_dtype).cuda()
     R = RMSNorm(dim, eps=1e-5, dtype=weight_dtype).cuda()
     R.weight.copy_(weight)
-    y = R(x, compute_dtype=compute_dtype, impl=impl)
+
+    y = record_benchmark.run(
+        lambda: R(x, compute_dtype=compute_dtype, impl=impl),
+        dim=dim,
+        impl=impl,
+    )
     y_ref = R(x, compute_dtype=compute_dtype, impl="ref")
     if default_dtype == torch.bfloat16:
         assert torch.allclose(y, y_ref, rtol=1e-2, atol=1e-2)
@@ -49,11 +56,9 @@ def test_rms_norm(default_dtype, weight_dtype, compute_dtype, dim, head_dim, imp
 @pytest.mark.parametrize("compute_dtype", [torch.float32])
 @pytest.mark.parametrize("dim", [64, 1536, 512, 7168])
 @pytest.mark.parametrize("head_dim", [256])
-@pytest.mark.parametrize(
-    "impl", ["cuda", "torch", "torch_npu", "ref"]
-)  # Also test "ref"'s in-place with itself's out-of-place
+@pytest.mark.parametrize("impl", ["cuda", "torch", "torch_npu", "ref"])
 @torch.inference_mode()
-def test_rms_norm_in_place(compute_dtype, dim, head_dim, impl):
+def test_rms_norm_in_place(compute_dtype, dim, head_dim, impl, record_benchmark):
     if impl == "torch" and not hasattr(torch.nn.functional, "rms_norm"):
         pytest.skip("The torch version does not support RMSNorm")
     if impl == "triton" and not has_triton:
@@ -68,7 +73,15 @@ def test_rms_norm_in_place(compute_dtype, dim, head_dim, impl):
     weight = torch.randn(dim)
     R = RMSNorm(dim, eps=1e-5).cuda()
     R.weight.copy_(weight)
-    y = x.clone()
-    R(y, compute_dtype=compute_dtype, out=y, impl=impl)
+
+    def bench_impl(impl_name):
+        out = x.clone()
+        return R(out, compute_dtype=compute_dtype, out=out, impl=impl_name)
+
+    y = record_benchmark.run(
+        lambda: bench_impl(impl),
+        dim=dim,
+        impl=impl,
+    )
     y_ref = R(x, compute_dtype=compute_dtype, impl="ref")
     assert torch.allclose(y, y_ref, rtol=1e-3, atol=1e-3)

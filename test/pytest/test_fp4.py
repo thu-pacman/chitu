@@ -60,6 +60,7 @@ def do_dequant_a(a_fp8, a_s, dim, act_block_size):
     ).view(dim, dim)
 
 
+@pytest.mark.parametrize("dim", [256])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
@@ -69,10 +70,9 @@ def do_dequant_a(a_fp8, a_s, dim, act_block_size):
     or packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"),
     reason="This test requires Triton version >= 3.2.0",
 )
-def test_fp4_raise_to_bf16_gemm_is_close_to_dequanted_gemm():
+def test_fp4_raise_to_bf16_gemm_is_close_to_dequanted_gemm(dim, record_benchmark):
     default_dtype = torch.bfloat16
     torch.set_default_dtype(default_dtype)
-    dim = 256
     block_size = 16
     a = torch.randn(dim, dim, dtype=default_dtype, device="cuda")
     b, b_s, b_s_2 = init_weight_and_scales(dim, block_size)
@@ -86,11 +86,17 @@ def test_fp4_raise_to_bf16_gemm_is_close_to_dequanted_gemm():
         Packed4BitWeightAlongK((dim, dim), b),
         k_stride=64,
     )
-    y = soft_fp4_raise_to_bf16_blockfp4_gemm(a, preprocessed_b, b_s, b_s_2)
+
+    y = record_benchmark.run(
+        lambda: soft_fp4_raise_to_bf16_blockfp4_gemm(a, preprocessed_b, b_s, b_s_2),
+        dim=dim,
+        impl="fp4_bf16_gemm",
+    )
 
     assert torch.allclose(std_y, y, atol=0.1, rtol=0.1)
 
 
+@pytest.mark.parametrize("dim", [256])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
@@ -104,10 +110,9 @@ def test_fp4_raise_to_bf16_gemm_is_close_to_dequanted_gemm():
     or packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"),
     reason="This test requires Triton version >= 3.2.0",
 )
-def test_fp4_raise_to_fp8_gemm_is_close_to_dequanted_gemm():
+def test_fp4_raise_to_fp8_gemm_is_close_to_dequanted_gemm(dim, record_benchmark):
     default_dtype = torch.bfloat16
     torch.set_default_dtype(default_dtype)
-    dim = 256
     block_size = 16
     act_block_size = 128
     a = torch.randn(dim, dim, dtype=default_dtype, device="cuda")
@@ -127,8 +132,13 @@ def test_fp4_raise_to_fp8_gemm_is_close_to_dequanted_gemm():
     preprocessed_b = Packed4BitWeightAlongK.convert_from(
         Packed4BitWeightAlongK((dim, dim), b), k_stride=64
     )
-    y = soft_fp4_raise_to_fp8_blockfp4_gemm(
-        a_fp8, a_s, preprocessed_b, b_s, b_s_2, act_block_size=act_block_size
+
+    y = record_benchmark.run(
+        lambda: soft_fp4_raise_to_fp8_blockfp4_gemm(
+            a_fp8, a_s, preprocessed_b, b_s, b_s_2, act_block_size=act_block_size
+        ),
+        dim=dim,
+        impl="fp4_fp8_gemm",
     )
 
     assert torch.allclose(std_y, y, atol=0.1, rtol=0.1)
