@@ -8,7 +8,6 @@ Contains the Enhanced Scheduler service logic for DP mode.
 """
 
 import asyncio
-import logging
 from logging import getLogger
 import threading
 

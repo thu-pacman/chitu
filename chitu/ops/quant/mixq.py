@@ -35,7 +35,7 @@ def mixq_gemm(
         elif has_hygon:
             impl = "hygon"
         else:
-            NotImplementedError(f"Unsupported implementation: {impl}")
+            raise NotImplementedError(f"Unsupported implementation: {impl}")
 
     if impl == "hygon" and has_hygon:
         assert outliers_idx.is_cuda
@@ -59,13 +59,13 @@ def mixq_gemm(
                 )
 
         else:
-            NotImplementedError(f"Unsupported bits num: w{w_bits}a{a_bits}")
+            raise NotImplementedError(f"Unsupported bits num: w{w_bits}a{a_bits}")
     elif impl == "triton" and has_triton:
         if (w_bits, a_bits) == (4, 4):
             return mixq_w4a4_gemm_triton(a, b.T, b_s, b_fp.T, outliers_idx)
         elif (w_bits, a_bits) == (8, 8):
             return mixq_w8a8_gemm_triton(a, b.T, b_s, b_fp.T, outliers_idx)
         else:
-            NotImplementedError(f"Unsupported bits num: w{w_bits}a{a_bits}")
+            raise NotImplementedError(f"Unsupported bits num: w{w_bits}a{a_bits}")
     else:
-        NotImplementedError(f"Unsupported implementation: {impl}")
+        raise NotImplementedError(f"Unsupported implementation: {impl}")

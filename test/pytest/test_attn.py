@@ -291,7 +291,6 @@ def test_mla_prefill_ragged_qo_paged_kv(
         softmax_scale=softmax_scale,
     )
 
-    kv_cache_2 = kv_cache.clone()
     ref_out = ref_backend.mla_prefill_ragged_qo_paged_kv(
         q_nope,
         q_pe,

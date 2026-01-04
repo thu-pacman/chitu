@@ -787,14 +787,7 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
 def test_evict_decode_task():
     set_global_args(
         OmegaConf.create(
-            {
-                "infer": {
-                    "max_seq_len": 5123,
-                    "cache_type": "paged",
-                    "op_impl": "torch",
-                    "cache_type": "paged",
-                }
-            }
+            {"infer": {"max_seq_len": 5123, "cache_type": "paged", "op_impl": "torch"}}
         ),
         need_ensure=False,
     )

@@ -8,10 +8,9 @@ from typing import Optional
 from typing_extensions import override
 from collections import deque, defaultdict
 
-from chitu.task import TaskPool, TaskType, DPTaskCollector
+from chitu.task import TaskPool, TaskType
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.utils import ceil_div
-from chitu.distributed.parallel_state import get_dp_group, get_pp_group
 from chitu.backend import Backend
 from chitu.task import (
     PackedTasksBase,

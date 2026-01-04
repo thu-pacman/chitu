@@ -5,7 +5,7 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Mapping, Optional
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis

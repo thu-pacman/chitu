@@ -25,7 +25,6 @@ from chitu.ops import linear
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.quantization import get_quant_from_checkpoint_prefix, QuantizedMoeExpertsBase
 from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
-from chitu.moe.batched_routed_activation import BatchedRoutedActivation
 
 
 class AttentionHFGptOss(AttentionHFLlama):

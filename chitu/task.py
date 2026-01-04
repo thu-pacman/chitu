@@ -639,12 +639,6 @@ class Task:
             + self.next_req_tokens_len
         ]
 
-    def next_req_tokens(self):
-        return self.prefix_tokens[
-            self.consumed_req_tokens : self.consumed_req_tokens
-            + self.next_req_tokens_len
-        ]
-
     def consume_req_tokens(self):
         """
         Advance prefill progress after processing tokens.
@@ -1038,7 +1032,6 @@ class PackedTasksBase:
             num_tasks = 0
             task_ids = []
             req_ids = []
-            num_tokens = 0
             for it, has_model_run in enumerate(self.has_model_run):
                 if has_model_run:
                     num_tasks += 1

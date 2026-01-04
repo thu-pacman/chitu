@@ -56,7 +56,7 @@ import sys
 import math
 import atexit
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional
 
 import pytest
 

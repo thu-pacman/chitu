@@ -10,8 +10,6 @@ from chitu.ops.quant import a8_per_token_act_quant, w4_g128_symm_a8_symm
 
 from chitu.native_layout import (
     enable_native_layout_weight,
-    Packed4BitWeightAlongK,
-    Packed4BitWeightQServe,
     HygonW4A8Int4TileTensor,
     HygonW4A8Int8TileTensor,
 )

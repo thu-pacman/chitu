@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-import re
 from logging import getLogger
 from typing import Any
 from typing_extensions import override

@@ -4,9 +4,8 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from logging import getLogger
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.distributed as dist

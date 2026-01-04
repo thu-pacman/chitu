@@ -50,7 +50,6 @@ def causal_conv1d_update_torch(
     this_hidden_states = this_hidden_states.unsqueeze(-1)
     assert weight.shape[1] == 1
     _, hidden_size, _ = this_hidden_states.shape
-    state_len = old_hidden_states.shape[-1]
 
     new_hidden_states = torch.cat(
         [old_hidden_states[..., 1:], this_hidden_states], dim=-1

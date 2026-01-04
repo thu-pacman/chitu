@@ -6,7 +6,6 @@ import os
 import itertools
 import zmq
 import msgpack
-from dataclasses import dataclass
 from logging import getLogger
 from typing import Optional
 from abc import ABC, abstractmethod
@@ -22,11 +21,9 @@ from chitu.task import (
     PackedTasksBase,
     SerializedPackedTasksPayloadType,
     BatchResult,
-    Task,
     TaskLoad,
     TaskType,
     TaskDecodeType,
-    SampleParams,
     TaskPool,
     TaskCollector,
     DPTaskCollector,
@@ -51,8 +48,7 @@ from chitu.utils import (
 )
 from chitu.ops import apply_frequency_penalty, response_append
 from chitu.device_list import DeviceList
-from chitu.device_type import is_ascend, is_ascend_910b
-from chitu.distributed.comm_group import CommGroup
+from chitu.device_type import is_ascend
 from chitu.moe.load_balancer import get_moe_load_planner  # added
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 
@@ -1031,7 +1027,6 @@ class Executor:
         """
         # 1) propagate tasks across TP
         tensor_dispatcher = TensorDispatcher()
-        payload_type = tasks.payload_type
         payload_type, tasks = tensor_dispatcher.dispatch_metadata(tasks)
 
         # 2) prepare cache

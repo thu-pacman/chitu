@@ -11,7 +11,6 @@ from logging import getLogger
 
 from chitu.distributed.comm_group import CommGroup
 from chitu.device_type import is_ascend
-from chitu.global_vars import get_global_args
 
 logger = getLogger(__name__)
 

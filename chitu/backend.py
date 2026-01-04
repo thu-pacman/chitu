@@ -13,7 +13,7 @@ from enum import Enum
 from glob import glob
 from logging import getLogger
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Deque, Optional, Iterable
+from typing import TYPE_CHECKING, Callable, Optional, Iterable
 import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d

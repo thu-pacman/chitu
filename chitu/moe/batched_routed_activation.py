@@ -135,13 +135,14 @@ class ExpertBlockPermutedBatchedRoutedActivation(BatchedRoutedActivation):
 
 
 @dataclass
-class ExpertBlockPermutedBatchedRoutedActivationBlock(
+class ExpertBlockPermutedBatchedRoutedActivationNormal(
     ExpertBlockPermutedBatchedRoutedActivation
 ):
-    """BF16 ExpertBlockPermuted variant.
+    """
+    ExpertBlockPermuted variant without quantization
 
     Same layout as ExpertBlockPermutedBatchedRoutedActivationBlockfp8 but
-    without quantization scales. All tensors are expected to be bf16.
+    without quantization scales. All tensors are expected to be 16-bit.
     """
 
     @classmethod
@@ -152,8 +153,7 @@ class ExpertBlockPermutedBatchedRoutedActivationBlock(
         old: IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
         *,
         block_size: int,
-    ) -> "ExpertBlockPermutedBatchedRoutedActivationBlock":
-        # print(f"Before conversion: old activation shape is {old.activation.shape}")
+    ) -> "ExpertBlockPermutedBatchedRoutedActivationNormal":
         (
             blocked_activation,
             token_comma_topk_to_block_x_item_indices,
@@ -166,9 +166,7 @@ class ExpertBlockPermutedBatchedRoutedActivationBlock(
             block_size=block_size,
         )
 
-        # Ensure bf16 dtype
-        blocked_activation = blocked_activation.to(torch.bfloat16)
-
+        assert blocked_activation.dtype == torch.get_default_dtype()
         return cls(
             blocked_activation=blocked_activation,
             token_comma_topk_to_block_x_item_indices=token_comma_topk_to_block_x_item_indices,

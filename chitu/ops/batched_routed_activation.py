@@ -2,7 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
 import torch
 
 from chitu.utils import (
@@ -11,7 +10,6 @@ from chitu.utils import (
     try_import_and_setup_torch_npu,
     ceil_div,
 )
-from chitu.distributed.parallel_state import get_ep_size, parallel_groups_initialized
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
@@ -291,8 +289,6 @@ def batched_routed_activation_indexed_to_expert_block_permuted(
         [2]: block_to_expert_indices       [n_blocks, block_size]
     """
     if has_triton:
-        # Create a fake scale tensor so we can reuse the fp8 Triton path.
-        hidden_size = activation.shape[-1]
         # Match fp8 layout: [n_tokens, hidden // quant_block_size]. We choose
         (
             blocked_activation,

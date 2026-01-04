@@ -178,7 +178,6 @@ def test_mla_prologue_torch_npu_int8_weight_q_b_proj(
 
     q_b_proj_weight_zn_int8 = NpuFractalZnTensor.convert_from(q_b_int8)
 
-    out_dim = q_b_proj_weight.shape[0]
     dequant_scale_q_b_proj = scale_w.to(torch.float32).to(x.device)
 
     q_nope_i8, q_pe_i8, kv_i8 = mla_prologue(
@@ -285,7 +284,6 @@ def test_mla_prologue_torch_npu_int8(
         kv_a_proj_with_mqa_weight_int8
     )
 
-    out_dim = q_b_proj_weight.shape[0]
     dequant_scale_x = scale_w_x.to(torch.float32).to(x.device)
     dequant_scale_q_a = scale_w_q_a.to(torch.float32).to(x.device)
     dequant_scale_q_b_proj = scale_w_q_b.to(torch.float32).to(x.device)

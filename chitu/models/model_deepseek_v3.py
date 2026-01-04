@@ -59,7 +59,6 @@ from chitu.ops import (
     append_to_dense_kv_cache,
     hadamard_transform,
 )
-import torch.distributed as dist
 from chitu.quantization import (
     QuantizationRegistry,
     get_quant_from_checkpoint_prefix,
@@ -162,9 +161,6 @@ class Indexer(torch.nn.Module):
         assert x.ndim == 2
         q = self.wq_b(qr)
         q = einops.rearrange(q, "s (h d) -> s h d", d=self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
-        )
         k = self.wk(x)
         k = self.k_norm(k)
         q, k, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
@@ -184,8 +180,6 @@ class Indexer(torch.nn.Module):
 
         delta_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
         delta_pos_ids = seq_len_delta.delta_position_ids_tensor_device
-        new_seq_ids = seq_len_delta.new.seq_ids_tensor_device
-        new_pos_ids = seq_len_delta.new.position_ids_tensor_device
 
         if isinstance(cache_accessor, PagedKVCacheAccessor):
             append_to_paged_kv_cache(
