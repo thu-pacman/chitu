@@ -221,6 +221,9 @@ def append_to_dense_kv_cache_torch_npu(
     delta_position_ids: torch.Tensor,  # (num_tokens,)
     delta_seq_ids: Optional[torch.Tensor] = None,  # (num_tokens,)
 ):
+    if this_kv.numel() == 0:
+        return
+
     if this_kv.shape[0] == kv_cache.shape[0]:
         torch_npu.scatter_update_(kv_cache, delta_position_ids, this_kv.unsqueeze(1), 1)
     else:

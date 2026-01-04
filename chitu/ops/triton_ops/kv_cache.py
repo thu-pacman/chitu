@@ -24,6 +24,8 @@ def append_to_paged_kv_cache_triton(
             f"batch_size ({page_table.shape[0]}) must be equal to num_tokens "
             f"({delta_position_ids.shape[0]}) if ignoring delta_seq_ids"
         )
+    if this_kv.numel() == 0:
+        return
 
     kv_cache = kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], -1)
     this_kv = this_kv.view(this_kv.shape[0], -1)
@@ -78,6 +80,8 @@ def append_to_dense_kv_cache_triton(
             f"batch_size ({kv_cache.shape[0]}) must be equal to num_tokens "
             f"({delta_position_ids.shape[0]}) if ignoring delta_seq_ids"
         )
+    if this_kv.numel() == 0:
+        return
 
     kv_cache = kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], -1)
     this_kv = this_kv.view(this_kv.shape[0], -1)

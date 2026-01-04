@@ -18,7 +18,7 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 @pytest.mark.parametrize(
     "seq_length",
-    [1, 16, 128, 256, 512, 1024],
+    [0, 1, 16, 128, 256, 512, 1024],
 )
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 @pytest.mark.parametrize(
@@ -139,30 +139,36 @@ def test_moe_fused_gate(
             tolerate_ratio = 0.1
     else:
         tolerate_ratio = 0.01
-    assert (
-        len(
-            torch.nonzero(
-                indices.sort()[0].to(torch.int64)
-                != indices_ref.sort()[0].to(torch.int64)
-            )
-        )
-        / indices.nelement()
-        < tolerate_ratio
-    )
-    if dtype == torch.bfloat16 or dtype == torch.float16:
+
+    assert indices.shape == indices_ref.shape
+    assert weights.shape == weights_ref.shape
+
+    if indices_ref.numel() > 0:
         assert (
             len(
                 torch.nonzero(
-                    ~torch.isclose(
-                        weights.sort()[0],
-                        weights_ref.sort()[0],
-                        rtol=1e-2,
-                        atol=1e-2,
-                    )
+                    indices.sort()[0].to(torch.int64)
+                    != indices_ref.sort()[0].to(torch.int64)
                 )
             )
-            / weights.nelement()
+            / indices.nelement()
             < tolerate_ratio
         )
-    else:
-        assert False, "not implemented for type besides bfloat16, float16"
+    if weights_ref.numel() > 0:
+        if dtype == torch.bfloat16 or dtype == torch.float16:
+            assert (
+                len(
+                    torch.nonzero(
+                        ~torch.isclose(
+                            weights.sort()[0],
+                            weights_ref.sort()[0],
+                            rtol=1e-2,
+                            atol=1e-2,
+                        )
+                    )
+                )
+                / weights.nelement()
+                < tolerate_ratio
+            )
+        else:
+            assert False, "not implemented for type besides bfloat16, float16"

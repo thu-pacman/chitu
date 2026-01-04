@@ -7,7 +7,7 @@ triton, has_triton = try_import_platform_dep("triton")
 from chitu.ops import causal_conv1d_update, causal_conv1d_prefill
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("batch_size", [0, 1, 4])
 @pytest.mark.parametrize("hidden_size", [2048, 4096])
 @pytest.mark.parametrize("state_len", [4])
 @pytest.mark.parametrize("impl", ["torch", "triton"])
@@ -37,8 +37,9 @@ def test_causal_conv1d_update(batch_size, hidden_size, state_len, impl):
 @pytest.mark.parametrize(
     "prefix_lens",
     [
-        torch.tensor([0, 4, 1024, 2048, 4096], device="cuda"),
+        torch.tensor([0], device="cuda"),
         torch.tensor([0, 2, 5], device="cuda"),
+        torch.tensor([0, 4, 1024, 2048, 4096], device="cuda"),
     ],
 )
 @pytest.mark.parametrize("impl", ["triton"])

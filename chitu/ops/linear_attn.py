@@ -14,9 +14,9 @@ else:
     fla, has_fla = try_import_opt_dep("fla", "fla")
 
 if has_fla:
-    from fla.ops import chunk_gated_delta_rule as fla_chunk_gated_delta_rule
+    from fla.ops import chunk_gated_delta_rule as chunk_gated_delta_rule_fla
     from fla.ops import (
-        fused_recurrent_gated_delta_rule as fla_fused_recurrent_gated_delta_rule,
+        fused_recurrent_gated_delta_rule as fused_recurrent_gated_delta_rule_fla,
     )
 
 
@@ -24,7 +24,7 @@ if has_fla:
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-SnippetCopyrightText: 2025 HuggingFace
 # SDPX—SnippetName: torch_chunk_gated_delta_rule from transformers
-def torch_chunk_gated_delta_rule(
+def chunk_gated_delta_rule_torch_dense(
     query,
     key,
     value,
@@ -51,6 +51,30 @@ def torch_chunk_gated_delta_rule(
 
     batch_size, sequence_length, num_heads, k_head_dim = key.shape
     v_head_dim = value.shape[-1]
+
+    if batch_size == 0:
+        core_attn_out = torch.empty(
+            batch_size,
+            num_heads,
+            sequence_length,
+            k_head_dim,
+            dtype=value.dtype,
+            device=value.device,
+        )
+        last_recurrent_state = (
+            torch.empty(
+                batch_size,
+                sequence_length,
+                k_head_dim,
+                v_head_dim,
+                dtype=value.dtype,
+                device=value.device,
+            )
+            if output_final_state
+            else None
+        )
+        return core_attn_out, last_recurrent_state
+
     pad_size = (chunk_size - num_heads % chunk_size) % chunk_size
     query = F.pad(query, (0, 0, 0, pad_size))
     key = F.pad(key, (0, 0, 0, pad_size))
@@ -138,11 +162,92 @@ def extract_and_merge(x, seq_len_list):
     return torch.cat(result, dim=0)
 
 
+def chunk_gated_delta_rule_torch(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+    cu_seqlens=None,
+    seq_len_list=None,
+):
+    assert seq_len_list is not None
+
+    max_curr_seq_len = max(seq_len_list)
+    bs = len(seq_len_list)
+    padded_q = torch.zeros(
+        (
+            bs,
+            max_curr_seq_len,
+        )
+        + query.shape[-2:],
+        dtype=query.dtype,
+        device=query.device,
+    )
+    padded_k = torch.zeros(
+        (
+            bs,
+            max_curr_seq_len,
+        )
+        + key.shape[-2:],
+        dtype=key.dtype,
+        device=key.device,
+    )
+    padded_v = torch.zeros(
+        (
+            bs,
+            max_curr_seq_len,
+        )
+        + value.shape[-2:],
+        dtype=value.dtype,
+        device=value.device,
+    )
+    padded_g = torch.zeros(
+        (bs, max_curr_seq_len, g.size(-1)), dtype=g.dtype, device=g.device
+    )
+    padded_beta = torch.zeros(
+        (bs, max_curr_seq_len, beta.size(-1)), dtype=beta.dtype, device=beta.device
+    )
+
+    start_idx = 0
+    for i in range(bs):
+        padded_q[i][-seq_len_list[i] :] = query[0][
+            start_idx : start_idx + seq_len_list[i]
+        ]
+        padded_k[i][-seq_len_list[i] :] = key[0][
+            start_idx : start_idx + seq_len_list[i]
+        ]
+        padded_v[i][-seq_len_list[i] :] = value[0][
+            start_idx : start_idx + seq_len_list[i]
+        ]
+        padded_g[i][-seq_len_list[i] :] = g[0][start_idx : start_idx + seq_len_list[i]]
+        padded_beta[i][-seq_len_list[i] :] = beta[0][
+            start_idx : start_idx + seq_len_list[i]
+        ]
+        start_idx += seq_len_list[i]
+
+    core_attn_out, last_recurrent_state = chunk_gated_delta_rule_torch_dense(
+        padded_q,
+        padded_k,
+        padded_v,
+        g=padded_g,
+        beta=padded_beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+
+    return extract_and_merge(core_attn_out, seq_len_list), last_recurrent_state
+
+
 # SPDX-SnippetBegin
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-SnippetCopyrightText: 2025 HuggingFace
 # SDPX—SnippetName: torch_recurrent_gated_delta_rule from transformers
-def torch_recurrent_gated_delta_rule(
+def recurrent_gated_delta_rule_torch(
     query,
     key,
     value,
@@ -222,7 +327,7 @@ def chunk_gated_delta_rule(
 
     if impl == "fla":
         assert cu_seqlens is not None
-        return fla_chunk_gated_delta_rule(
+        return chunk_gated_delta_rule_fla(
             query,
             key,
             value,
@@ -233,76 +338,21 @@ def chunk_gated_delta_rule(
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             cu_seqlens=cu_seqlens,
         )
-    else:
-        assert seq_len_list is not None
-
-        max_curr_seq_len = max(seq_len_list)
-        bs = len(seq_len_list)
-        padded_q = torch.zeros(
-            (
-                bs,
-                max_curr_seq_len,
-            )
-            + query.shape[-2:],
-            dtype=query.dtype,
-            device=query.device,
-        )
-        padded_k = torch.zeros(
-            (
-                bs,
-                max_curr_seq_len,
-            )
-            + key.shape[-2:],
-            dtype=key.dtype,
-            device=key.device,
-        )
-        padded_v = torch.zeros(
-            (
-                bs,
-                max_curr_seq_len,
-            )
-            + value.shape[-2:],
-            dtype=value.dtype,
-            device=value.device,
-        )
-        padded_g = torch.zeros(
-            (bs, max_curr_seq_len, g.size(-1)), dtype=g.dtype, device=g.device
-        )
-        padded_beta = torch.zeros(
-            (bs, max_curr_seq_len, beta.size(-1)), dtype=beta.dtype, device=beta.device
-        )
-
-        start_idx = 0
-        for i in range(bs):
-            padded_q[i][-seq_len_list[i] :] = query[0][
-                start_idx : start_idx + seq_len_list[i]
-            ]
-            padded_k[i][-seq_len_list[i] :] = key[0][
-                start_idx : start_idx + seq_len_list[i]
-            ]
-            padded_v[i][-seq_len_list[i] :] = value[0][
-                start_idx : start_idx + seq_len_list[i]
-            ]
-            padded_g[i][-seq_len_list[i] :] = g[0][
-                start_idx : start_idx + seq_len_list[i]
-            ]
-            padded_beta[i][-seq_len_list[i] :] = beta[0][
-                start_idx : start_idx + seq_len_list[i]
-            ]
-            start_idx += seq_len_list[i]
-
-        core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
-            padded_q,
-            padded_k,
-            padded_v,
-            g=padded_g,
-            beta=padded_beta,
+    elif impl == "torch":
+        return chunk_gated_delta_rule_torch(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
             initial_state=initial_state,
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=cu_seqlens,
+            seq_len_list=seq_len_list,
         )
-
-        return extract_and_merge(core_attn_out, seq_len_list), last_recurrent_state
+    else:
+        raise ValueError(f"Unknown implementation: {impl}")
 
 
 def recurrent_gated_delta_rule(
@@ -323,7 +373,18 @@ def recurrent_gated_delta_rule(
             impl = "torch"
 
     if impl == "fla":
-        return fla_fused_recurrent_gated_delta_rule(
+        return fused_recurrent_gated_delta_rule_fla(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+    elif impl == "torch":
+        return recurrent_gated_delta_rule_torch(
             query,
             key,
             value,
@@ -334,13 +395,4 @@ def recurrent_gated_delta_rule(
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
     else:
-        return torch_recurrent_gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        )
+        raise ValueError(f"Unknown implementation: {impl}")

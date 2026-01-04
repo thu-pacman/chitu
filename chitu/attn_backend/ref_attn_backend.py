@@ -255,8 +255,8 @@ class RefAttnBackend(AttnBackend):
         )
         output = torch.empty(
             (seq_len_delta.delta_total_len,) + output_batch.shape[2:],
-            dtype=output_batch[0].dtype,
-            device=output_batch[0].device,
+            dtype=output_batch.dtype,
+            device=output_batch.device,
         )
         for i in range(seq_len_delta.batch_size):
             output[

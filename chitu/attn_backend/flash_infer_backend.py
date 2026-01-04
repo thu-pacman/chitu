@@ -117,6 +117,9 @@ class FlashInferBackend(TritonAttnBackend):
         softcap=0.0,
     ):
         batch_size = seq_len_delta.batch_size
+        if batch_size == 0:
+            return
+
         self.q_indptr.set(torch.arange(0, batch_size + 1).cuda().to(torch.int32))
         kv_indptr_list = []
         kv_indices_list = []
@@ -211,6 +214,15 @@ class FlashInferBackend(TritonAttnBackend):
         assert q_pe.shape[1] == local_n_heads
         _, _, self.qk_rope_head_dim = q_pe.shape
 
+        if B == 0:
+            return torch.empty(
+                0,
+                self.local_n_heads,
+                self.kv_lora_rank,
+                device=q_nope.device,
+                dtype=q_nope.dtype,
+            )
+
         if "kv_lora_k_pe" in kv_cache.kv:
             append_to_paged_kv_cache(
                 kv_cache.kv["kv_lora_k_pe"],
@@ -270,6 +282,13 @@ class FlashInferBackend(TritonAttnBackend):
         assert q_pe.shape[0] == bs_seq
         assert q_pe.shape[1] == local_n_heads
         _, _, self.qk_rope_head_dim = q_pe.shape
+
+        if bs_seq == 0:
+            return torch.empty(
+                (0, self.local_n_heads, self.kv_lora_rank),
+                device=q_nope.device,
+                dtype=q_nope.dtype,
+            )
 
         if "kv_lora_k_pe" in kv_cache.kv:
             block_size = kv_cache.kv["kv_lora_k_pe"].shape[1]
@@ -365,6 +384,11 @@ class FlashInferBackend(TritonAttnBackend):
         if topk_indices is not None:
             raise NotImplementedError()
 
+        if seq_len_delta.batch_size == 0:
+            return torch.empty(
+                0, q.shape[1], v.shape[-1], device=q.device, dtype=q.dtype
+            )
+
         assert not self.is_mla
         num_qo_heads = q.shape[-2]
         num_kv_heads = k.shape[-2]
@@ -439,6 +463,12 @@ class FlashInferBackend(TritonAttnBackend):
 
         batch_size = q.shape[0]
         block_size = kv_cache.k.shape[1]
+
+        if batch_size == 0:
+            return torch.empty(
+                0, q.shape[1], kv_cache.v.shape[-1], device=q.device, dtype=q.dtype
+            )
+
         # append kv to cache
         if k is not None:
             assert v is not None

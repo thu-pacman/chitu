@@ -275,7 +275,7 @@ class TritonAttnBackend(RefAttnBackend):
             topk_indices,
         )
 
-        return o.view(B, local_n_heads, -1)
+        return o.view(B, local_n_heads, kv_lora_rank)
 
     @override
     def mla_decode_paged_kv(
@@ -392,7 +392,7 @@ class TritonAttnBackend(RefAttnBackend):
             topk_indices,
         )
 
-        return o.view(B, local_n_heads, -1)
+        return o.view(B, local_n_heads, kv_lora_rank)
 
     @override
     def decode_dense_kv(

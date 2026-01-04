@@ -20,11 +20,11 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 )
 @pytest.mark.parametrize("compute_dtype", [torch.float32])
 @pytest.mark.parametrize("dim", [64, 1024])
-@pytest.mark.parametrize("head_dim", [256, 1024])
+@pytest.mark.parametrize("bs", [0, 256, 1024])
 @pytest.mark.parametrize("impl", ["cuda", "triton", "torch", "torch_npu"])
 @torch.inference_mode()
 def test_rms_norm(
-    default_dtype, weight_dtype, compute_dtype, dim, head_dim, impl, record_benchmark
+    default_dtype, weight_dtype, compute_dtype, dim, bs, impl, record_benchmark
 ):
     if impl == "torch" and not hasattr(torch.nn.functional, "rms_norm"):
         pytest.skip("The torch version does not support RMSNorm")
@@ -36,7 +36,7 @@ def test_rms_norm(
         pytest.skip("torch_npu is missing")
 
     torch.set_default_dtype(default_dtype)
-    x = torch.rand(head_dim, dim).cuda()
+    x = torch.rand(bs, dim).cuda()
     weight = torch.randn(dim, dtype=weight_dtype).cuda()
     R = RMSNorm(dim, eps=1e-5, dtype=weight_dtype).cuda()
     R.weight.copy_(weight)
@@ -55,10 +55,10 @@ def test_rms_norm(
 
 @pytest.mark.parametrize("compute_dtype", [torch.float32])
 @pytest.mark.parametrize("dim", [64, 1536, 512, 7168])
-@pytest.mark.parametrize("head_dim", [256])
+@pytest.mark.parametrize("bs", [0, 256])
 @pytest.mark.parametrize("impl", ["cuda", "torch", "torch_npu", "ref"])
 @torch.inference_mode()
-def test_rms_norm_in_place(compute_dtype, dim, head_dim, impl, record_benchmark):
+def test_rms_norm_in_place(compute_dtype, dim, bs, impl, record_benchmark):
     if impl == "torch" and not hasattr(torch.nn.functional, "rms_norm"):
         pytest.skip("The torch version does not support RMSNorm")
     if impl == "triton" and not has_triton:
@@ -69,7 +69,7 @@ def test_rms_norm_in_place(compute_dtype, dim, head_dim, impl, record_benchmark)
         pytest.skip("torch_npu is missing")
 
     torch.set_default_dtype(torch.float16)
-    x = torch.rand(head_dim, dim).cuda()
+    x = torch.rand(bs, dim).cuda()
     weight = torch.randn(dim)
     R = RMSNorm(dim, eps=1e-5).cuda()
     R.weight.copy_(weight)

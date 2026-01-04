@@ -111,6 +111,8 @@ def rms_norm_cuda(
     eps,
     compute_dtype: torch.dtype,
 ):
+    if x.numel() == 0:
+        return x
     # Currently, this kernel always raise to float32 to compute
     x_shape = x.shape
     x = x.view(-1, x.shape[-1])
@@ -128,6 +130,8 @@ def rms_norm_muxi(
     eps,
     compute_dtype: torch.dtype,
 ):
+    if x.numel() == 0:
+        return x
     # Currently, this kernel always raise to float32 to compute
     assert eps == 1e-6
     assert x.dtype == torch.float16

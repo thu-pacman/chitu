@@ -206,6 +206,11 @@ class NpuAttnBackend(RefAttnBackend):
         if topk_indices is not None:
             raise NotImplementedError()
 
+        if q.numel() == 0:
+            return torch.empty(
+                0, q.shape[1], v.shape[-1], device=q.device, dtype=q.dtype
+            )
+
         if softmax_scale is None:
             softmax_scale = float(1 / math.sqrt(q.shape[-1]))
 
@@ -366,32 +371,35 @@ class NpuAttnBackend(RefAttnBackend):
             softmax_scale = float(1 / math.sqrt(q.shape[-1]))
 
         # update kv cache
-        append_to_dense_kv_cache(
-            kv_cache.k,
-            k,
-            seq_len_delta.delta_position_ids_tensor_device,
-            seq_len_delta.delta_seq_ids_tensor_device,
-            impl="torch" if self.args.models.type == "deepseek-v3" else "torch_npu",
-        )
-        append_to_dense_kv_cache(
-            kv_cache.v,
-            v,
-            seq_len_delta.delta_position_ids_tensor_device,
-            seq_len_delta.delta_seq_ids_tensor_device,
-            impl="torch" if self.args.models.type == "deepseek-v3" else "torch_npu",
-        )
-
-        if self.should_use_attn_from_cinfer_ascendc(self.args.models.type, q.shape[0]):
-            output = torch.empty(
-                (q.shape[0], q.shape[1], kv_cache.v.shape[-1]),
-                dtype=q.dtype,
-                device=q.device,
+        if k is not None:
+            append_to_dense_kv_cache(
+                kv_cache.k,
+                k,
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+                impl="torch" if self.args.models.type == "deepseek-v3" else "torch_npu",
+            )
+        if v is not None:
+            append_to_dense_kv_cache(
+                kv_cache.v,
+                v,
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+                impl="torch" if self.args.models.type == "deepseek-v3" else "torch_npu",
             )
 
+        output = torch.empty(
+            (q.shape[0], q.shape[1], kv_cache.v.shape[-1]),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        if q.numel() == 0:
+            return output
+
+        if self.should_use_attn_from_cinfer_ascendc(self.args.models.type, q.shape[0]):
             kv_cache_k = kv_cache.k.contiguous().view(
                 -1, kv_cache.k.shape[-2], kv_cache.k.shape[-1]
             )
-
             kv_cache_v = kv_cache.v.contiguous().view(
                 -1, kv_cache.v.shape[-2], kv_cache.v.shape[-1]
             )
@@ -416,7 +424,6 @@ class NpuAttnBackend(RefAttnBackend):
             q = q.view(
                 self.batch_size, q.shape[0] // self.batch_size, *q.shape[1:]
             ).contiguous()
-            output = torch.empty_like(q)
             lse = torch.empty(1, dtype=q.dtype, device="npu")
             torch_npu.npu_fused_infer_attention_score.out(
                 q,
@@ -450,36 +457,34 @@ class NpuAttnBackend(RefAttnBackend):
         if topk_indices is not None:
             raise NotImplementedError()
 
+        # update kv_cache
+        if k is not None:
+            append_to_paged_kv_cache(
+                kv_cache.k,
+                kv_cache.block_table,
+                k,
+                seq_len_delta.old.lens_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+        if v is not None:
+            append_to_paged_kv_cache(
+                kv_cache.v,
+                kv_cache.block_table,
+                v,
+                seq_len_delta.old.lens_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+            )
+
         if softmax_scale is None:
             softmax_scale = float(1 / math.sqrt(q.shape[-1]))
 
         # Legacy shape change. TODO: Remve this
         q = q.unsqueeze(1)
-        k = k.unsqueeze(1) if k is not None else None
-        v = v.unsqueeze(1) if v is not None else None
 
         # [BSND] -> [BSH]
-        q = q.view(q.shape[0], q.shape[1], -1).contiguous()
-        k = k.view(k.shape[0], k.shape[1], -1).contiguous()
-        v = v.view(v.shape[0], v.shape[1], -1).contiguous()
-
-        # update kv_cache
-        append_to_paged_kv_cache(
-            kv_cache.k,
-            kv_cache.block_table,
-            k,
-            seq_len_delta.old.lens_tensor_device,
-            get_page_ids=kv_cache.get_page_ids,
-            get_offs_in_page=kv_cache.get_offs_in_page,
-        )
-        append_to_paged_kv_cache(
-            kv_cache.v,
-            kv_cache.block_table,
-            v,
-            seq_len_delta.old.lens_tensor_device,
-            get_page_ids=kv_cache.get_page_ids,
-            get_offs_in_page=kv_cache.get_offs_in_page,
-        )
+        q = q.view(q.shape[0], q.shape[1], q.shape[2] * q.shape[3]).contiguous()
 
         block_size = kv_cache.k.shape[1]
 
@@ -488,7 +493,6 @@ class NpuAttnBackend(RefAttnBackend):
             .view(kv_cache.k.shape[0] * kv_cache.k.shape[1], -1)
             .unsqueeze(1)
         )
-
         kv_cache.kv["v"] = (
             kv_cache.kv["v"]
             .view(kv_cache.v.shape[0] * kv_cache.v.shape[1], -1)
@@ -529,6 +533,15 @@ class NpuAttnBackend(RefAttnBackend):
 
         bsz, local_n_heads, kv_lora_rank = q_nope.shape
         _, _, qk_rope_head_dim = q_pe.shape
+
+        attn_output = torch.zeros(
+            [bsz, local_n_heads, kv_lora_rank],
+            dtype=q_nope.dtype,
+            device=q_nope.device,
+        )
+        if bsz == 0:
+            return attn_output
+
         query = torch.cat([q_nope, q_pe], dim=-1).view(bsz, q_nope.shape[-2], -1)
 
         if softmax_scale is None:
@@ -582,11 +595,6 @@ class NpuAttnBackend(RefAttnBackend):
         # torch_npu._npu_reshape_and_cache_siso(key=kv_cache.kv["kv_lora_k_pe"],
         #                                       key_cache=key_cache,
         #                                       slot_indices=slots)
-        attn_output = torch.zeros(
-            [bsz, local_n_heads, kv_lora_rank],
-            dtype=query.dtype,
-            device=query.device,
-        )
         torch_npu._npu_paged_attention_mla(
             query=query,
             key_cache=kv_lora_k_pe.unsqueeze(2),

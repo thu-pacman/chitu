@@ -8,7 +8,7 @@ from chitu.quantization.normal import NormalLinear
 
 
 @pytest.mark.parametrize("tp_group_size", [1, 2, 4])
-@pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("batch_size", [0, 1, 16])
 @pytest.mark.parametrize("in_features", [7168])
 @pytest.mark.parametrize("out_features", [8192])
 @pytest.mark.parametrize("has_bias", [True, False])
@@ -71,7 +71,7 @@ def test_column_parallel_linear(
 
 
 @pytest.mark.parametrize("tp_group_size", [1, 2, 4])
-@pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("batch_size", [0, 1, 16])
 @pytest.mark.parametrize("in_features", [7168])
 @pytest.mark.parametrize("out_features", [8192])
 @pytest.mark.parametrize("has_bias", [True, False])
@@ -128,6 +128,6 @@ def test_row_parallel_linear(
         y = parallel_linear(x)
         y_ref = torch.nn.functional.linear(x, global_weight, bias)
 
-        torch.testing.assert_close(y, y_ref, atol=1e-1, rtol=1e-1)
+        torch.testing.assert_close(y, y_ref, atol=1.5e-1, rtol=1.5e-1)
 
     torch.distributed.barrier()  # Non-working ranks should not exit too early

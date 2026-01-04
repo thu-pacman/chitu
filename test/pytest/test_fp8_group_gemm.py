@@ -11,6 +11,8 @@ triton, has_triton = try_import_platform_dep("triton")
 
 
 def check_close(x, y):
+    if x.numel() == 0:
+        return x.shape == y.shape
     x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
@@ -18,7 +20,7 @@ def check_close(x, y):
     return diff < 0.001
 
 
-@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("batch_size", [0, 1, 2])
 @pytest.mark.parametrize("n_heads,in_feats,out_feats", [(16, 128, 512), (16, 512, 128)])
 @pytest.mark.parametrize("compute_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("soft_fp8", [False, True])

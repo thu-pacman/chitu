@@ -9,7 +9,7 @@ triton, has_triton = try_import_platform_dep("triton")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 
 
-@pytest.mark.parametrize("batch_size", [1, 128])
+@pytest.mark.parametrize("batch_size", [0, 1, 128])
 @pytest.mark.parametrize("vocab_size", [151936, 129280])
 @pytest.mark.parametrize("response_len", [128, 1024])
 @pytest.mark.parametrize("impl", ["cuda", "triton"])

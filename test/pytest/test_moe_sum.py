@@ -12,7 +12,7 @@ triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
-@pytest.mark.parametrize("M", [32, 64, 128])
+@pytest.mark.parametrize("M", [0, 32, 64, 128])
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("N", [256, 512, 1024])
 @pytest.mark.parametrize("compute_dtype", [torch.float16])
@@ -37,7 +37,7 @@ def test_moe_sum_per_token(M, topk, N, compute_dtype, record_benchmark):
     assert torch.allclose(test_output, ref_output, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.parametrize("M", [32, 64, 128])
+@pytest.mark.parametrize("M", [0, 32, 64, 128])
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("N", [1024, 2048])
 @pytest.mark.parametrize("n_blocks", [32])
@@ -85,7 +85,7 @@ def test_moe_sum_expert_block_permuted(
     assert torch.allclose(test_output, ref_output, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.parametrize("M", [32, 64, 128])
+@pytest.mark.parametrize("M", [0, 32, 64, 128])
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("N", [256, 512, 1024])
 @pytest.mark.parametrize("compute_dtype", [torch.float16])

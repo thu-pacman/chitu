@@ -13,14 +13,15 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
 @pytest.mark.parametrize(
-    "rotary_type,batch_size,n_local_heads,head_dim",
+    "rotary_type,n_local_heads,head_dim",
     [
-        ("separated", 16, 64, 256),
-        ("interleaved", 64, 128, 64),
-        ("separated-half", 16, 32, 128),
-        ("interleaved-half", 16, 32, 128),
+        ("separated", 64, 256),
+        ("interleaved", 128, 64),
+        ("separated-half", 32, 128),
+        ("interleaved-half", 32, 128),
     ],
 )
+@pytest.mark.parametrize("batch_size", [0, 16, 64])
 @pytest.mark.parametrize("is_mqa", [False, True])
 @pytest.mark.parametrize(
     "impl", ["cuda", "triton", "torch_npu", "torch_npu_with_output_layout"]
@@ -116,14 +117,15 @@ def test_apply_rotary_pos_emb(
 
 
 @pytest.mark.parametrize(
-    "rotary_type,batch_size,n_local_heads,head_dim",
+    "rotary_type,n_local_heads,head_dim",
     [
-        ("separated", 16, 64, 256),
-        ("interleaved", 64, 128, 64),
-        ("separated-half", 16, 32, 128),
-        ("interleaved-half", 16, 32, 128),
+        ("separated", 64, 256),
+        ("interleaved", 128, 64),
+        ("separated-half", 32, 128),
+        ("interleaved-half", 32, 128),
     ],
 )
+@pytest.mark.parametrize("batch_size", [0, 16, 64])
 @pytest.mark.parametrize("is_mqa", [False, True])
 @pytest.mark.parametrize(
     "qk_dtype,freqs_dtype",

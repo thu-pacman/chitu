@@ -249,7 +249,10 @@ class BatchedSeqLen:
 
     @functools.cached_property
     def max_len(self) -> int:
-        return int(self.lens_tensor_cpu.max())
+        if len(self.lens_list) > 0:
+            return int(self.lens_tensor_cpu.max())
+        else:
+            return 0
 
     @functools.cached_property
     def total_len(self) -> int:

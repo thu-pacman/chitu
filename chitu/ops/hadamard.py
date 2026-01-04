@@ -59,4 +59,6 @@ def hadamard_transform_scipy(x: torch.Tensor, scale: float) -> torch.Tensor:
 def hadamard_transform_fast_hadamard_transform(
     x: torch.Tensor, scale: float
 ) -> torch.Tensor:
+    if x.numel() == 0:
+        return x
     return fast_hadamard_transform.hadamard_transform(x, scale=scale)

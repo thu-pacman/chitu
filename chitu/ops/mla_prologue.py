@@ -143,8 +143,8 @@ def mla_prologue_torch(
         q_b_proj_weight,
     )
 
-    q = q.view(bs_seq, n_heads, -1)
-    kv = kv.view(bs_seq, 1, -1)
+    q = q.view(bs_seq, n_heads, q.shape[-1] // n_heads)
+    kv = kv.view(bs_seq, 1, kv.shape[-1])
 
     q, kv, q_nope, q_pe, _, kv_lora, k_pe, _ = apply_rotary_pos_emb_partial(
         q,

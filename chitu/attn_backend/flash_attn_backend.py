@@ -37,6 +37,11 @@ class FlashAttnBackend(AttnBackend):
         if topk_indices is not None:
             raise NotImplementedError()
 
+        if q.numel() == 0:
+            return torch.empty(
+                0, q.shape[1], v.shape[-1], device=q.device, dtype=q.dtype
+            )
+
         # These are arguments only accpeted by new enough flash_attn,
         # so don't pass them if they are set to default values
         extra_kvargs = {}
@@ -75,6 +80,11 @@ class FlashAttnBackend(AttnBackend):
         if topk_indices is not None:
             raise NotImplementedError()
 
+        if q.numel() == 0:
+            return torch.empty(
+                0, q.shape[1], kv_cache.v.shape[-1], device=q.device, dtype=q.dtype
+            )
+
         # These are arguments only accpeted by new enough flash_attn,
         # so don't pass them if they are set to default values
         extra_kvargs = {}
@@ -111,6 +121,11 @@ class FlashAttnBackend(AttnBackend):
     ):
         if topk_indices is not None:
             raise NotImplementedError()
+
+        if q.numel() == 0:
+            return torch.empty(
+                0, q.shape[1], kv_cache.v.shape[-1], device=q.device, dtype=q.dtype
+            )
 
         # These are arguments only accpeted by new enough flash_attn,
         # so don't pass them if they are set to default values

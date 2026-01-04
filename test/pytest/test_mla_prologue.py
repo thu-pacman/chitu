@@ -16,6 +16,8 @@ def _to_plain(t):
 
 
 def check_close(x, y):
+    if x.numel() == 0:
+        return x.shape == y.shape
     x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
@@ -23,7 +25,7 @@ def check_close(x, y):
     return diff < 0.001
 
 
-@pytest.mark.parametrize("bs_seq", [8])
+@pytest.mark.parametrize("bs_seq", [0, 8])
 @pytest.mark.parametrize("dim", [7168])
 @pytest.mark.parametrize("q_lora_rank", [1536])
 @pytest.mark.parametrize("kv_lora_rank", [512])
@@ -111,7 +113,7 @@ def test_mla_prologue_torch_npu(
     assert check_close(kv, kv_ref)
 
 
-@pytest.mark.parametrize("bs_seq", [8])
+@pytest.mark.parametrize("bs_seq", [0, 8])
 @pytest.mark.parametrize("dim", [7168])
 @pytest.mark.parametrize("q_lora_rank", [1536])
 @pytest.mark.parametrize("kv_lora_rank", [512])
@@ -211,7 +213,7 @@ def test_mla_prologue_torch_npu_int8_weight_q_b_proj(
     assert check_close(kv_i8, kv_ref)
 
 
-@pytest.mark.parametrize("bs_seq", [8])
+@pytest.mark.parametrize("bs_seq", [0, 8])
 @pytest.mark.parametrize("dim", [7168])
 @pytest.mark.parametrize("q_lora_rank", [1536])
 @pytest.mark.parametrize("kv_lora_rank", [512])

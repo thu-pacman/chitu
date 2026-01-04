@@ -131,10 +131,22 @@ def causal_conv1d_prefill_ref(
     conv_kernel_size = weight.shape[2]
     bsz = prefix_lens.shape[0] - 1
 
+    if bsz == 0:
+        return (
+            torch.empty(
+                total_len, hidden_size, device=inputs.device, dtype=inputs.dtype
+            ),
+            torch.empty(
+                bsz,
+                hidden_size,
+                conv_kernel_size,
+                device=inputs.device,
+                dtype=inputs.dtype,
+            ),
+        )
+
     outputs = []  # list[tensor(actual_len, hidden_size)]
-
     new_conv_state = []  # list[tensor(bsz,hidden_size,conv_kernel_size)]
-
     for idx in range(bsz):
         actual_len = prefix_lens[idx + 1] - prefix_lens[idx]
         chunk = inputs[
