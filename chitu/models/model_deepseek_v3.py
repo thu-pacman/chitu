@@ -836,6 +836,7 @@ class GateDeepSeekV3(MoeGate):
 
 def MoeExpertsDeepSeekV3(
     args,
+    global_n_experts: int,
     experts_start_idx: int,
     experts_end_idx: int,
     checkpoint_prefix: str,
@@ -858,6 +859,7 @@ def MoeExpertsDeepSeekV3(
     return base_moe_experts_class(
         dim=args.dim,
         moe_inter_dim=args.moe_inter_dim // get_etp_size(),
+        global_n_experts=global_n_experts,
         experts_start_idx=experts_start_idx,
         experts_end_idx=experts_end_idx,
         n_shared_experts=args.n_shared_experts,
@@ -901,7 +903,7 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
 
         if isinstance(moe_impl, MoEImplEP):
             num_local_slots = moe_impl.load_balancer[layer_id].get_num_local_slots()
-            experts_start_idx = moe_impl.ep_rank * num_local_slots
+            experts_start_idx = moe_impl.ep_group.rank_in_group * num_local_slots
             experts_end_idx = experts_start_idx + num_local_slots
         else:
             experts_start_idx = 0
@@ -910,6 +912,7 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
             gate=GateDeepSeekV3(args, op_impl=op_impl),
             experts=MoeExpertsDeepSeekV3(
                 args,
+                global_n_experts=args.n_routed_experts,
                 experts_start_idx=experts_start_idx,
                 experts_end_idx=experts_end_idx,
                 checkpoint_prefix=checkpoint_prefix,

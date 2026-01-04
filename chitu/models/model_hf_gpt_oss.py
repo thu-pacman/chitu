@@ -110,6 +110,7 @@ class GptOssMoeExperts(QuantizedMoeExpertsBase):
         # Common parameters for all quantizations
         dim: int,
         moe_inter_dim: int,
+        global_n_experts: int,
         experts_start_idx: int,
         experts_end_idx: int,
         n_shared_experts: int,
@@ -126,6 +127,7 @@ class GptOssMoeExperts(QuantizedMoeExpertsBase):
         super().__init__(
             dim,
             moe_inter_dim,
+            global_n_experts,
             experts_start_idx,
             experts_end_idx,
             n_shared_experts,
@@ -256,7 +258,7 @@ class ParallelMoeBlockGptOss(ParallelMoeBlock):
 
         if isinstance(moe_impl, MoEImplEP):
             num_local_slots = moe_impl.load_balancer[layer_id].get_num_local_slots()
-            experts_start_idx = moe_impl.ep_rank * num_local_slots
+            experts_start_idx = moe_impl.ep_group.rank_in_group * num_local_slots
             experts_end_idx = experts_start_idx + num_local_slots
         else:
             experts_start_idx = 0
@@ -267,6 +269,7 @@ class ParallelMoeBlockGptOss(ParallelMoeBlock):
             experts=GptOssMoeExperts(
                 dim=args.dim,
                 moe_inter_dim=args.moe_intermediate_dim // get_etp_size(),
+                global_n_experts=args.num_experts,
                 experts_start_idx=experts_start_idx,
                 experts_end_idx=experts_end_idx,
                 n_shared_experts=0,

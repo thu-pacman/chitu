@@ -5,19 +5,19 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass
 from logging import getLogger
 from typing import Dict, Iterable, List, Optional
 
 import torch
 import torch.distributed as dist
+
 from chitu.device_type import is_ascend
 from chitu.utils import try_import_and_setup_torch_npu
+from chitu.distributed.comm_group import CommGroup
+from chitu.moe.load_balancer.planner import AdjustmentAction, MoveExpertAction
 
 _, has_torch_npu = try_import_and_setup_torch_npu()
 
-from chitu.distributed.parallel_state import get_ep_group
-from .planner import AdjustmentAction, MoveExpertAction
 
 logger = getLogger(__name__)
 
@@ -65,17 +65,13 @@ class InMemoryParamAccessor(ExpertParamAccessor):
         self._store[(layer_id, slot)] = params
 
 
-@dataclass
 class WeightMigrationExecutor:
-    accessor: ExpertParamAccessor
+    def __init__(self, *, accessor: ExpertParamAccessor, ep_group: CommGroup) -> None:
+        self.accessor = accessor
+        self.group = ep_group
 
-    def __post_init__(self) -> None:
-        self.group = get_ep_group()
         self.rank = self.group.global_rank
-        self.world_rank_list = getattr(self.group, "rank_list", None)
-        self.pg = getattr(self.group, "gpu_group", None)
-        if self.world_rank_list is None:
-            raise RuntimeError("EP group must expose rank_list for p2p send/recv")
+        self.world_rank_list = self.group.rank_list
         self.device_id: Optional[int] = None
         if torch.cuda.is_available():
             self.device_id = torch.cuda.current_device()

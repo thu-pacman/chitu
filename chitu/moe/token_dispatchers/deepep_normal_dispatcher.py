@@ -11,8 +11,8 @@ from chitu.device_type import is_blackwell
 from chitu.global_vars import get_global_args
 import torch
 
-from chitu.distributed.parallel_state import get_ep_group, get_tp_size, get_tp_group
 from chitu.utils import parse_dtype, try_import_opt_dep
+from chitu.distributed.comm_group import CommGroup
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
@@ -38,24 +38,28 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         hidden: int,
         profile: bool = False,
         mode: str = "deepep-normal",
+        *,
+        tp_group: CommGroup,
+        dp_group: CommGroup,
+        ep_group: CommGroup,
     ):
+        super().__init__(tp_group=tp_group, dp_group=dp_group, ep_group=ep_group)
         self.num_experts = num_experts
         self._buffer = None
-        self.group = get_ep_group().gpu_group
         self.hidden = hidden
         self.profile = profile
         self.mode = mode
         # Set the number of SMs to use
         # NOTES: this is a static variable, so it will be shared by all the instances of the class
         deep_ep.Buffer.set_num_sms(24)
-        assert self.num_experts % self.group.size() == 0
+        assert self.num_experts % self.ep_group.group_size == 0
 
     @override
     def prepare(self, num_tokens):
         # NOTES: you may also replace `get_*_config` with your auto-tuned results via all the tests
 
         self._buffer = DeepEPBuffer.get_deepep_buffer(
-            self.group, self.hidden, 2, self.mode, self.num_experts
+            self.ep_group.gpu_group, self.hidden, 2, self.mode, self.num_experts
         )
         DeepEPBuffer.set_dispatch_mode_as_normal()
 
@@ -211,7 +215,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         async_finish: bool = False,
         previous_event: Optional["deep_ep.EventOverlap"] = None,
     ):
-        if get_tp_size() > 1 and not get_tp_group().is_first_rank:
+        if self.tp_group.group_size > 1 and not self.tp_group.is_first_rank:
             # Don't dispatch from this rank. It's the same as TP rank 0.
             topk_idx = torch.full_like(topk_idx, -1)
 
@@ -293,7 +297,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             previous_event=previous_event,
             allocate_on_comm_stream=previous_event is not None,
         )
-        if get_tp_size() == 1 or get_tp_group().is_first_rank:
+        if self.tp_group.group_size == 1 or self.tp_group.is_first_rank:
             assert tuple(combined_x.shape) == (
                 dp_local_bs,
                 self.hidden,
@@ -305,11 +309,11 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
                 (dp_local_bs, self.hidden), dtype=dtype, device=device
             )
 
-        if get_tp_size() > 1:
+        if self.tp_group.group_size > 1:
             torch.distributed.broadcast(
                 combined_x,
-                src=get_tp_group().rank_list[0],
-                group=get_tp_group().gpu_group,
+                src=self.tp_group.rank_list[0],
+                group=self.tp_group.gpu_group,
             )
 
         return combined_x, event

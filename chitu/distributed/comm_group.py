@@ -32,7 +32,7 @@ def new_torch_group_dedup(
     if is_device:
         if len(rank_lists) == 1:
             return [torch.distributed.group.WORLD]
-        elif force_no_dedup and rank_tuples in _torch_group_dedup_dict_device:
+        elif not force_no_dedup and rank_tuples in _torch_group_dedup_dict_device:
             groups = _torch_group_dedup_dict_device[rank_tuples]
         else:
             groups = [
@@ -43,10 +43,10 @@ def new_torch_group_dedup(
                 )
                 for rank_list in rank_lists
             ]
-            if force_no_dedup is False:
+            if not force_no_dedup:
                 _torch_group_dedup_dict_device[rank_tuples] = groups
     else:
-        if rank_tuples in _torch_group_dedup_dict_host:
+        if not force_no_dedup and rank_tuples in _torch_group_dedup_dict_host:
             groups = _torch_group_dedup_dict_host[rank_tuples]
         else:
             groups = [
@@ -57,7 +57,8 @@ def new_torch_group_dedup(
                 )
                 for rank_list in rank_lists
             ]
-            _torch_group_dedup_dict_host[rank_tuples] = groups
+            if not force_no_dedup:
+                _torch_group_dedup_dict_host[rank_tuples] = groups
     return groups
 
 

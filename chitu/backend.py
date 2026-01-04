@@ -40,6 +40,7 @@ from chitu.device_type import is_ascend, is_muxi
 from chitu.distributed.parallel_state import (
     get_world_group,
     get_pp_group,
+    get_ep_group,
     initialize_parallel_groups,
 )
 from chitu.distributed.partition import compute_layer_dist_in_pp
@@ -124,7 +125,7 @@ class Backend:
             # Local import to avoid circular deps at module import time
             from chitu.moe.load_balancer import register_moe_weight_accessor
 
-            register_moe_weight_accessor(accessor)
+            register_moe_weight_accessor(accessor, get_ep_group())
             logger.info("Backend: MoE weight accessor installed and registered")
         except Exception as e:
             logger.warning(f"Backend: failed to register MoE weight accessor: {e}")

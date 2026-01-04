@@ -13,9 +13,17 @@ from typing_extensions import override
 import torch
 
 from chitu.moe.batched_routed_activation import BatchedRoutedActivation
+from chitu.distributed.comm_group import CommGroup
 
 
 class MoETokenDispatcher(ABC):
+    def __init__(
+        self, *, tp_group: CommGroup, dp_group: CommGroup, ep_group: CommGroup
+    ):
+        self.tp_group = tp_group
+        self.dp_group = dp_group
+        self.ep_group = ep_group
+
     @abstractmethod
     def prepare(self, num_tokens):
         raise NotImplementedError("prepare function not implemented.")
@@ -53,6 +61,11 @@ class MoETokenDispatcher(ABC):
 
 
 class MoEEmptyTokenDispatcher(MoETokenDispatcher):
+    def __init__(
+        self, *, tp_group: CommGroup, dp_group: CommGroup, ep_group: CommGroup
+    ):
+        super().__init__(tp_group=tp_group, dp_group=dp_group, ep_group=ep_group)
+
     @override
     def prepare(self, num_tokens):
         pass

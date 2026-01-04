@@ -130,4 +130,6 @@ def test_row_parallel_linear(
 
         torch.testing.assert_close(y, y_ref, atol=1.5e-1, rtol=1.5e-1)
 
-    torch.distributed.barrier()  # Non-working ranks should not exit too early
+    torch.distributed.barrier(
+        device_ids=[torch.cuda.current_device()]
+    )  # Non-working ranks should not exit too early
