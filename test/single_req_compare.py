@@ -5,6 +5,7 @@ import os
 import random
 import logging
 from logging import getLogger
+from pathlib import Path
 
 from chitu.task import UserRequest, TaskPool, Task
 from chitu.chitu_main import (
@@ -28,6 +29,7 @@ def save_result(data_list, filename="data.json"):
 
 def load_result(filename="data.json"):
     try:
+        filename = Path(filename)
         data_list = torch.load(filename)
         return data_list
     except FileNotFoundError:
