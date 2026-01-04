@@ -18,7 +18,7 @@ triton, has_triton = try_import_platform_dep("triton")
 )
 @pytest.mark.parametrize("compute_dtype", [torch.float32])
 @pytest.mark.parametrize("dim", [64, 1024])
-@pytest.mark.parametrize("bsz", [256, 1024])
+@pytest.mark.parametrize("bsz", [0, 256, 1024])
 @pytest.mark.parametrize("impl", ["triton", "torch"])
 @torch.inference_mode()
 def test_rms_norm_gate(bsz, dim, impl, default_dtype, compute_dtype, weight_dtype):
@@ -54,7 +54,7 @@ def test_rms_norm_gate(bsz, dim, impl, default_dtype, compute_dtype, weight_dtyp
 )
 @pytest.mark.parametrize("compute_dtype", [torch.float32])
 @pytest.mark.parametrize("dim", [64, 1024])
-@pytest.mark.parametrize("bsz", [256, 1024])
+@pytest.mark.parametrize("bsz", [0, 256, 1024])
 @pytest.mark.parametrize("impl", ["triton", "torch"])
 @torch.inference_mode()
 def test_rms_norm_gate_inplace(

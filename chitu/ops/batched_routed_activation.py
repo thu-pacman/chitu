@@ -181,6 +181,13 @@ def batched_routed_activation_indexed_to_expert_block_indexed_muxi(
     num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs, topk = topk_ids.shape
+    if bs == 0:
+        sorted_ids = torch.zeros(
+            (0, block_size), dtype=torch.int32, device=topk_ids.device
+        )
+        expert_ids = torch.zeros((0,), dtype=torch.int32, device=topk_ids.device)
+        num_block_post_pad = torch.zeros((1), dtype=torch.int32, device=topk_ids.device)
+        return sorted_ids, expert_ids, num_block_post_pad
     max_num_tokens_padded = (topk * bs) + num_experts * (block_size - 1)
     max_num_blocks_padded = ceil_div(max_num_tokens_padded, block_size)
     sorted_token_ids = torch.full(
@@ -354,6 +361,19 @@ def batched_routed_activation_indexed_to_concat_permuted_torch_npu(
     n_experts: int,
 ):
     n_tokens, top_k = token_to_expert_indices.shape
+
+    if n_tokens == 0:
+        return (
+            torch.empty(
+                0,
+                activation.shape[-1],
+                dtype=activation.dtype,
+                device=activation.device,
+            ),
+            torch.empty(0, top_k, dtype=torch.int32, device=activation.device),
+            torch.zeros(n_experts, dtype=torch.int32, device=activation.device),
+        )
+
     concat_activation, concat_to_token_indices, n_tokens_per_expert, _ = (
         torch_npu.npu_moe_init_routing_v2(
             activation,

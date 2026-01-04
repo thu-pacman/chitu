@@ -10,8 +10,7 @@ import math
 
 import torch
 
-from chitu.distributed.parallel_state import get_ep_group, get_tp_size, get_tp_group
-from chitu.moe.load_balancer import get_moe_load_planner
+from chitu.distributed.comm_group import CommGroup
 from chitu.utils import try_import_opt_dep, parse_dtype
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
 from chitu.moe.batched_routed_activation import (
@@ -20,6 +19,7 @@ from chitu.moe.batched_routed_activation import (
     PerExpertDenseBatchedRoutedActivation,
     PerExpertDenseBatchedRoutedActivationBlockfp8,
 )
+from chitu.moe.load_balancer import get_moe_load_planner
 from chitu.global_vars import get_global_args
 from chitu.device_type import is_blackwell
 
@@ -39,17 +39,20 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         hidden: int,
         profile: bool = False,
         mode: str = "deepep-ll",
+        *,
+        tp_group: CommGroup,
+        dp_group: CommGroup,
+        ep_group: CommGroup,
     ):
+        super().__init__(tp_group=tp_group, dp_group=dp_group, ep_group=ep_group)
         self.num_experts = num_experts
         self._buffer = None
-        self.ep_rank = get_ep_group().rank_in_group
-        self.group = get_ep_group().gpu_group
         self.hidden = hidden
         self.mode = mode
 
         # NOTES: for the best performance, the QP number **must** be equal to the number of the local experts
-        assert self.num_experts % self.group.size() == 0
-        self.num_local_experts = self.num_experts // self.group.size()
+        assert self.num_experts % self.ep_group.group_size == 0
+        self.num_local_experts = self.num_experts // self.ep_group.group_size
 
         self.profile = profile
         self.prepare_profile = False
@@ -77,11 +80,11 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                 expert_stats = torch.zeros(
                     (self.num_experts,), dtype=torch.int, device="cuda"
                 )
-                get_ep_group().all_gather_into_tensor(
+                self.ep_group.all_gather_into_tensor(
                     expert_stats, self.cumulative_local_expert_recv_stats[layer_id]
                 )
                 self.cumulative_local_expert_recv_stats[layer_id].zero_()
-                if self.ep_rank == 0:
+                if self.ep_group.rank_in_group == 0:
                     logger.warning(f"{layer_id=} {expert_stats=}")
 
     @override
@@ -92,7 +95,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
     def prepare_deepep_buffer(self):
         DeepEPBuffer.set_dispatch_mode_as_low_latency()
         self._buffer = DeepEPBuffer.get_deepep_buffer(
-            self.group, self.hidden, 2, self.mode, self.num_experts
+            self.ep_group.gpu_group, self.hidden, 2, self.mode, self.num_experts
         )
 
     @override
@@ -202,7 +205,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
-        if get_tp_size() > 1 and not get_tp_group().is_first_rank:
+        if self.tp_group.group_size > 1 and not self.tp_group.is_first_rank:
             # Don't dispatch from this rank. It's the same as TP rank 0.
             topk_idx = torch.full_like(topk_idx, -1)
 
@@ -263,7 +266,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
             async_finish=async_finish,
             return_recv_hook=return_recv_hook,
         )
-        if get_tp_size() == 1 or get_tp_group().is_first_rank:
+        if self.tp_group.group_size == 1 or self.tp_group.is_first_rank:
             assert tuple(combined_hidden_states.shape) == (
                 dp_local_bs,
                 self.hidden,
@@ -275,11 +278,11 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                 (dp_local_bs, self.hidden), dtype=dtype, device=device
             )
 
-        if get_tp_size() > 1:
+        if self.tp_group.group_size > 1:
             torch.distributed.broadcast(
                 combined_hidden_states,
-                src=get_tp_group().rank_list[0],
-                group=get_tp_group().gpu_group,
+                src=self.tp_group.rank_list[0],
+                group=self.tp_group.gpu_group,
             )
 
         # NOTES: the same behavior as described in the dispatch kernel

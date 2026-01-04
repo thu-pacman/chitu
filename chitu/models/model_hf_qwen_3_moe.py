@@ -43,6 +43,7 @@ class Qwen3MoeGate(MoeGate):
 
 def Qwen3MoeExperts(
     args,
+    global_n_experts: int,
     experts_start_idx: int,
     experts_end_idx: int,
     base_moe_experts_class: Optional[type] = None,
@@ -66,6 +67,7 @@ def Qwen3MoeExperts(
     return base_moe_experts_class(
         dim=args.dim,
         moe_inter_dim=args.moe_intermediate_dim // get_etp_size(),
+        global_n_experts=global_n_experts,
         experts_start_idx=experts_start_idx,
         experts_end_idx=experts_end_idx,
         n_shared_experts=0,
@@ -104,7 +106,7 @@ class ParallelMoeBlockQwen3(ParallelMoeBlock):
 
         if isinstance(moe_impl, MoEImplEP):
             num_local_slots = moe_impl.load_balancer[layer_id].get_num_local_slots()
-            experts_start_idx = moe_impl.ep_rank * num_local_slots
+            experts_start_idx = moe_impl.ep_group.rank_in_group * num_local_slots
             experts_end_idx = experts_start_idx + num_local_slots
         else:
             experts_start_idx = 0
@@ -113,6 +115,7 @@ class ParallelMoeBlockQwen3(ParallelMoeBlock):
             gate=Qwen3MoeGate(args, op_impl),
             experts=Qwen3MoeExperts(
                 args,
+                args.num_experts,
                 experts_start_idx,
                 experts_end_idx,
                 base_moe_experts_class,

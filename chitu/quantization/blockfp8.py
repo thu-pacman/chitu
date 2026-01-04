@@ -199,6 +199,7 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         # Common parameters for all quantizations
         dim: int,
         moe_inter_dim: int,
+        global_n_experts: int,
         experts_start_idx: int,
         experts_end_idx: int,
         n_shared_experts: int,
@@ -219,6 +220,7 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         super().__init__(
             dim,
             moe_inter_dim,
+            global_n_experts,
             experts_start_idx,
             experts_end_idx,
             n_shared_experts,
@@ -404,6 +406,7 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                 w2_scale=down_proj_scale,
                 block_shape=[128, 128],
                 soft_fp8=fused_soft_fp8,
+                global_num_experts=self.global_n_experts,
                 experts_start_idx=self.experts_start_idx,
                 impl=impl,
             )

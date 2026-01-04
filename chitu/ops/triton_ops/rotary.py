@@ -48,6 +48,11 @@ def apply_rotary_pos_emb_triton_out_of_place(
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
 
+    if q.numel() == 0 or k.numel() == 0:
+        assert q.numel() == 0
+        assert k.numel() == 0
+        return q_out, k_out
+
     q_shape = q.shape
     k_shape = k.shape
 

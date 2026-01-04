@@ -9,7 +9,7 @@ triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
-@pytest.mark.parametrize("M", [32, 64, 128])
+@pytest.mark.parametrize("M", [0, 32, 64, 128])
 @pytest.mark.parametrize("N", [256, 512, 1024, 18944])
 @pytest.mark.parametrize("impl", ["triton", "torch_npu"])
 def test_silu_and_mul(M, N, impl, record_benchmark):

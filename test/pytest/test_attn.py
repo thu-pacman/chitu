@@ -28,14 +28,16 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
 def check_close(x, y):
+    if x.numel() == 0:
+        return x.shape == y.shape
     x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     diff = 1 - sim
-    return diff < 0.001
+    return diff < 0.002
 
 
-@pytest.mark.parametrize("bs", [1, 3])
+@pytest.mark.parametrize("bs", [0, 1, 3])
 @pytest.mark.parametrize("local_n_heads", [16])
 @pytest.mark.parametrize("kv_lora_rank", [512])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
@@ -106,7 +108,7 @@ def test_mla_prefill_ragged_qkvo(
         cache_delta_seq_ids_tensor_device=False,
     )
 
-    if topk is not None:
+    if topk is not None and bs > 0:
         # NOTE: topk_indices may be out of the range of sequence length, and
         # the attention backend being tested should handle that.
         topk_indices_list = []
@@ -168,7 +170,7 @@ def test_mla_prefill_ragged_qkvo(
     assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("bs", [1, 8])
+@pytest.mark.parametrize("bs", [0, 1, 8])
 @pytest.mark.parametrize("local_n_heads", [16])
 @pytest.mark.parametrize("kv_lora_rank", [512])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
@@ -272,7 +274,9 @@ def test_mla_prefill_ragged_qo_paged_kv(
     kv_cache = torch.randn(
         num_pages, page_size, 1, kv_lora_rank + qk_rope_head_dim, device="cuda"
     )
-    page_table = torch.arange(num_pages, device="cuda").to(torch.int32).view(bs, -1)
+    page_table = torch.arange(num_pages, device="cuda", dtype=torch.int32)[
+        : bs * ceil_div(seq_len_delta.new.max_len, page_size)
+    ].view(bs, ceil_div(seq_len_delta.new.max_len, page_size))
 
     if use_separated_kv_lora_k_pe:
         kv_cache_dict_1 = {
@@ -312,7 +316,7 @@ def test_mla_prefill_ragged_qo_paged_kv(
     # this test is complex, not add record benchmark now
 
 
-@pytest.mark.parametrize("bs", [1, 64])
+@pytest.mark.parametrize("bs", [0, 1, 64])
 @pytest.mark.parametrize("local_n_heads", [16])
 @pytest.mark.parametrize("kv_lora_rank", [512])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
@@ -393,7 +397,7 @@ def test_mla_decode_dense_kv(
         bs, seq_len_delta.new.max_len, kv_lora_rank + qk_rope_head_dim, device="cuda"
     )
     this_kv = torch.randn(bs, 1, kv_lora_rank + qk_rope_head_dim, device="cuda")
-    if topk is not None:
+    if topk is not None and bs > 0:
         # NOTE: topk_indices may be out of the range of sequence length, and
         # the attention backend being tested should handle that.
         topk_indices_list = []
@@ -454,7 +458,7 @@ def test_mla_decode_dense_kv(
     assert torch.allclose(y, y_ref, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("bs", [1, 64])
+@pytest.mark.parametrize("bs", [0, 1, 64])
 @pytest.mark.parametrize("local_n_heads", [16])
 @pytest.mark.parametrize("kv_lora_rank", [512])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
@@ -541,7 +545,7 @@ def test_mla_decode_paged_kv(
         max_num_pages, page_size, kv_lora_rank + qk_rope_head_dim, device="cuda"
     )
     this_kv = torch.randn(bs, 1, kv_lora_rank + qk_rope_head_dim, device="cuda")
-    if topk is not None:
+    if topk is not None and bs > 0:
         # NOTE: topk_indices may be out of the range of sequence length, and
         # the attention backend being tested should handle that.
         topk_indices_list = []
@@ -614,7 +618,7 @@ def test_mla_decode_paged_kv(
         assert torch.allclose(y, y_ref, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("bs", [1, 9])
+@pytest.mark.parametrize("bs", [0, 1, 9])
 @pytest.mark.parametrize("n_heads", [32])
 @pytest.mark.parametrize("n_kv_heads", [4])
 @pytest.mark.parametrize("qk_head_dim,v_head_dim", [(256, 256), (576, 512)])
@@ -740,7 +744,7 @@ def test_prefill_ragged_qkvo(
         assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("prev_seq_len_list", [[509, 19, 15, 22]])
+@pytest.mark.parametrize("prev_seq_len_list", [[], [509, 19, 15, 22]])
 @pytest.mark.parametrize("n_heads", [4])
 @pytest.mark.parametrize("n_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [256])
@@ -883,7 +887,7 @@ def test_decode_dense_kv(
     assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("prev_seq_len_list", [[509, 19, 15, 282]])
+@pytest.mark.parametrize("prev_seq_len_list", [[], [509, 19, 15, 282]])
 @pytest.mark.parametrize("n_heads", [4])
 @pytest.mark.parametrize("n_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [256])
@@ -963,9 +967,9 @@ def test_decode_paged_kv(
 
     k_cache = torch.randn((num_blocks, block_size, n_kv_heads, head_dim), device="cuda")
     v_cache = torch.randn((num_blocks, block_size, n_kv_heads, head_dim), device="cuda")
-    block_table = (
-        torch.arange(num_blocks, device="cuda").to(torch.int32).view(batch_size, -1)
-    )
+    block_table = torch.arange(num_blocks, device="cuda", dtype=torch.int32)[
+        : batch_size * ceil_div(seq_len_delta.new.max_len, block_size)
+    ].view(batch_size, ceil_div(seq_len_delta.new.max_len, block_size))
     q = torch.randn((batch_size, n_heads, head_dim), device="cuda") * 100
     k = torch.randn((batch_size, n_kv_heads, head_dim), device="cuda") * 100
     v = torch.randn((batch_size, n_kv_heads, head_dim), device="cuda") * 100

@@ -4,27 +4,24 @@
 
 from typing import Optional
 
+import torch
+
 from chitu.task_type import TaskType
-from chitu.utils import try_import_opt_dep, try_import_and_setup_torch_npu
+from chitu.utils import try_import_opt_dep, try_import_and_setup_torch_npu, ceil_div
 from chitu.moe.token_dispatchers import (
     MoETokenDispatcher,
     MoEEmptyTokenDispatcher,
     MoEAllGatherTokenDispatcher,
 )
-from chitu.device_type import is_ascend_910b
-
-import torch
-from .load_balancer import (
+from chitu.moe.load_balancer import (
     MoELargeScaleNaiveLoadBalancer,
     MoENaiveLoadBalancer,
-)
-from chitu.distributed.parallel_state import get_ep_group
-
-from .load_balancer import init_moe_load_balancer, get_moe_load_planner
-from .load_balancer import (
+    init_moe_load_balancer,
     register_moe_weight_accessor,
 )
-import torch
+from chitu.device_type import is_ascend_910b
+from chitu.distributed.parallel_state import get_tp_group, get_dp_group, get_ep_group
+from chitu.distributed.comm_group import CommGroup
 
 deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
@@ -33,6 +30,7 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 if has_deep_ep:
     from .token_dispatchers import MoELowLatencyTokenDispatcher
     from .token_dispatchers import MoENormalTokenDispatcher
+
 
 MOE_IMPL_INSTANCE: Optional["MoEImplBase"] = None
 
@@ -43,18 +41,70 @@ def init_moe_impl(args) -> None:
     assert MOE_IMPL_INSTANCE is None, "moe impl already initialized"
 
     if args.infer.ep_size > 1:
-        MOE_IMPL_INSTANCE = MoEImplEP(args)
+        n_experts = getattr(args.models, "n_routed_experts", None) or getattr(
+            args.models, "num_experts", None
+        )
+        if n_experts is None:
+            raise ValueError(
+                "n_routed_experts or num_experts must be specified in model args"
+            )
+        n_layers = getattr(args.models, "n_layers", None) or getattr(
+            args.models, "num_hidden_layers", None
+        )
+        if n_layers is None:
+            raise ValueError(
+                "n_layers or num_hidden_layers must be specified in model args"
+            )
+        MOE_IMPL_INSTANCE = MoEImplEP(
+            n_layers=n_layers,
+            n_dense_layers=(
+                args.models.n_dense_layers
+                if hasattr(args.models, "n_dense_layers")
+                else 0
+            ),
+            hidden_dim=args.models.dim,
+            n_experts=n_experts,
+            n_global_experts_slots=args.infer.num_experts_slots,
+            prefill_token_dispatcher_impl=args.infer.moe.prefill_token_dispatcher,
+            decode_token_dispatcher_impl=args.infer.moe.decode_token_dispatcher,
+            use_cuda_graph=args.infer.use_cuda_graph,
+            expert_stats_path=getattr(args.infer, "expert_stats_path", None),
+            moe_lb_trigger=args.infer.moe_lb_trigger,
+            moe_lb_threshold=args.infer.moe_lb_threshold,
+        )
     else:
-        MOE_IMPL_INSTANCE = MoEImplNoEP(args)
+        MOE_IMPL_INSTANCE = MoEImplNoEP()
 
 
 def get_moe_impl() -> "MoEImplBase":
-    """Get MoEImpl instance."""
+    """Get singleton MoEImpl instance."""
+    assert (
+        MOE_IMPL_INSTANCE is not None
+    ), "moe impl should have been already initialized"
     return MOE_IMPL_INSTANCE
 
 
 class MoEImplBase:
-    def __init__(self, args) -> None:
+    def __init__(
+        self,
+        *,
+        tp_group: Optional[CommGroup] = None,
+        dp_group: Optional[CommGroup] = None,
+        ep_group: Optional[CommGroup] = None,
+    ):
+        if tp_group is None:
+            tp_group = get_tp_group()
+        self.tp_group = tp_group
+        self.tp_size = tp_group.group_size
+        if dp_group is None:
+            dp_group = get_dp_group()
+        self.dp_group = dp_group
+        self.dp_size = dp_group.group_size
+        if ep_group is None:
+            ep_group = get_ep_group()
+        self.ep_group = ep_group
+        self.ep_size = ep_group.group_size
+
         self.task_type: Optional[TaskType] = None
         self.impl_map: dict[TaskType, str] = {}
         self.load_balancer = {}
@@ -81,76 +131,71 @@ class MoEImplBase:
 class MoEImplEP(MoEImplBase):
     """MoEImplNoEP is a MoE implementation with EP."""
 
-    def __init__(self, args) -> None:
-        super().__init__(args)
+    def __init__(
+        self,
+        *,
+        n_layers: int,
+        n_dense_layers: int,
+        hidden_dim: int,
+        n_experts: int,
+        tp_group: Optional[CommGroup] = None,
+        dp_group: Optional[CommGroup] = None,
+        ep_group: Optional[CommGroup] = None,
+        n_global_experts_slots: Optional[int] = None,
+        prefill_token_dispatcher_impl: str = "auto",
+        decode_token_dispatcher_impl: str = "auto",
+        use_cuda_graph: bool = True,
+        expert_stats_path: Optional[str] = None,
+        moe_lb_trigger: int = -1,
+        moe_lb_threshold: float = 3.0,
+    ):
+        super().__init__(tp_group=tp_group, dp_group=dp_group, ep_group=ep_group)
 
-        self.tp_size = args.infer.tp_size
-        self.dp_size = args.infer.dp_size
-        self.ep_size = args.infer.ep_size
-        self.hidden_dim = args.models.dim
-        self.ep_rank = get_ep_group().rank_in_group
-
-        self.num_experts = getattr(args.models, "n_routed_experts", None) or getattr(
-            args.models, "num_experts", None
-        )
-        if self.num_experts is None:
-            raise ValueError(
-                "n_routed_experts or num_experts must be specified in model args"
-            )
+        self.n_layers = n_layers
+        self.n_dense_layers = n_dense_layers
+        self.hidden_dim = hidden_dim
+        self.n_experts = n_experts
 
         self.task_type: Optional[TaskType] = None
 
         self.prefill_experts_impl = "auto"
         self.decode_experts_impl = "auto"
-        self.prefill_token_dispatcher_impl = args.infer.moe.prefill_token_dispatcher
-        self.decode_token_dispatcher_impl = args.infer.moe.decode_token_dispatcher
-        self.use_cuda_graph = args.infer.use_cuda_graph
-        self.n_layers = args.models.n_layers
-        self.n_dense_layers = (
-            args.models.n_dense_layers if hasattr(args.models, "n_dense_layers") else 0
-        )
+        self.prefill_token_dispatcher_impl = prefill_token_dispatcher_impl
+        self.decode_token_dispatcher_impl = decode_token_dispatcher_impl
+        self.use_cuda_graph = use_cuda_graph
         self.moe_layer_id_list = [x for x in range(self.n_dense_layers, self.n_layers)]
 
-        n_global_experts_slots = (
-            ((self.num_experts + self.ep_size - 1) // self.ep_size) * self.ep_size
-            if args.infer.num_experts_slots is None
-            else args.infer.num_experts_slots
-        )
+        if n_global_experts_slots is None:
+            n_global_experts_slots = (
+                ceil_div(self.n_experts, self.ep_size) * self.ep_size
+            )
         self.n_global_experts_slots = n_global_experts_slots
         self._init_token_dispatcher()
         self._init_experts_impl()
-        expert_stats_path = (
-            args.infer.expert_stats_path
-            if hasattr(args.infer, "expert_stats_path")
-            else None
-        )
         self._init_load_balancer(expert_stats_path)
-        try:
-            num_layers = getattr(args.models, "n_layers", None) or getattr(
-                args.models, "num_hidden_layers", None
-            )
-            if num_layers is not None and self.num_experts > 1:
-                init_moe_load_balancer(
-                    num_layers=int(num_layers),
-                    num_experts=int(self.num_experts),
-                    slot_nums=n_global_experts_slots,
-                    enable=True,
-                )
-                try:
-                    from chitu.backend import Backend
 
-                    accessor = None
-                    if hasattr(Backend, "get_moe_weight_accessor"):
-                        accessor = Backend.get_moe_weight_accessor()
-                    elif hasattr(Backend, "moe_weight_accessor"):
-                        accessor = getattr(Backend, "moe_weight_accessor", None)
-                    if accessor is not None:
-                        register_moe_weight_accessor(accessor)
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"Failed to initialize MoE load balancer: {e}")
-            pass
+        if self.n_experts > 1:
+            init_moe_load_balancer(
+                ep_group=self.ep_group,
+                num_layers=n_layers,
+                num_experts=self.n_experts,
+                slot_nums=n_global_experts_slots,
+                enable=True,
+                moe_lb_trigger=moe_lb_trigger,
+                moe_lb_threshold=moe_lb_threshold,
+            )
+            try:
+                from chitu.backend import Backend
+
+                accessor = None
+                if hasattr(Backend, "get_moe_weight_accessor"):
+                    accessor = Backend.get_moe_weight_accessor()
+                elif hasattr(Backend, "moe_weight_accessor"):
+                    accessor = getattr(Backend, "moe_weight_accessor", None)
+                if accessor is not None:
+                    register_moe_weight_accessor(accessor, self.ep_group)
+            except Exception:
+                pass
 
     def _init_token_dispatcher(self):
         # impl selection
@@ -190,15 +235,22 @@ class MoEImplEP(MoEImplBase):
                     if self.decode_token_dispatcher_impl == "deepep-ll"
                     else "deepep-normal"
                 ),
+                tp_group=self.tp_group,
+                dp_group=self.dp_group,
+                ep_group=self.ep_group,
             )
             self.prefill_experts_impl = "ep_group_gemm_contiguous"
         elif (
             self.prefill_token_dispatcher_impl == "fused_experts_with_a2a_communication"
         ):
-            self.prefill_token_dispatcher = MoEEmptyTokenDispatcher()
+            self.prefill_token_dispatcher = MoEEmptyTokenDispatcher(
+                tp_group=self.tp_group, dp_group=self.dp_group, ep_group=self.ep_group
+            )
             self.prefill_experts_impl = "fused_experts_with_a2a_communication"
         elif self.prefill_token_dispatcher_impl == "allgather":
-            self.prefill_token_dispatcher = MoEAllGatherTokenDispatcher()
+            self.prefill_token_dispatcher = MoEAllGatherTokenDispatcher(
+                tp_group=self.tp_group, dp_group=self.dp_group, ep_group=self.ep_group
+            )
         else:
             raise ValueError(
                 f"Invalid prefill token dispatcher: {self.prefill_token_dispatcher_impl}"
@@ -206,19 +258,29 @@ class MoEImplEP(MoEImplBase):
 
         if self.decode_token_dispatcher_impl == "deepep-ll":
             self.decode_token_dispatcher = MoELowLatencyTokenDispatcher(
-                self.n_global_experts_slots, self.hidden_dim
+                self.n_global_experts_slots,
+                self.hidden_dim,
+                tp_group=self.tp_group,
+                dp_group=self.dp_group,
+                ep_group=self.ep_group,
             )
             self.decode_experts_impl = "ep_group_gemm_masked"
         elif (
             self.decode_token_dispatcher_impl == "fused_experts_with_a2a_communication"
         ):
-            self.decode_token_dispatcher = MoEEmptyTokenDispatcher()
+            self.decode_token_dispatcher = MoEEmptyTokenDispatcher(
+                tp_group=self.tp_group, dp_group=self.dp_group, ep_group=self.ep_group
+            )
             self.decode_experts_impl = "fused_experts_with_a2a_communication"
         elif self.decode_token_dispatcher_impl == "fused_experts_with_communication":
-            self.decode_token_dispatcher = MoEEmptyTokenDispatcher()
+            self.decode_token_dispatcher = MoEEmptyTokenDispatcher(
+                tp_group=self.tp_group, dp_group=self.dp_group, ep_group=self.ep_group
+            )
             self.decode_experts_impl = "fused_experts_with_communication"
         elif self.decode_token_dispatcher_impl == "allgather":
-            self.decode_token_dispatcher = MoEAllGatherTokenDispatcher()
+            self.decode_token_dispatcher = MoEAllGatherTokenDispatcher(
+                tp_group=self.tp_group, dp_group=self.dp_group, ep_group=self.ep_group
+            )
         else:
             raise ValueError(
                 f"Invalid decode token dispatcher: {self.decode_token_dispatcher_impl}"
@@ -254,15 +316,15 @@ class MoEImplEP(MoEImplBase):
     def unpermutation_reduce_rank_list(self):
         dispatcher = self._get_current_token_dispatcher()
         if isinstance(dispatcher, MoEAllGatherTokenDispatcher):
-            return get_ep_group().rank_list
+            return self.ep_group.rank_list
         return None
 
     def _load_expert_stats(self, file_path):
         expert_stats = torch.load(file_path)
-        assert expert_stats.shape == (self.n_layers, self.num_experts)
+        assert expert_stats.shape == (self.n_layers, self.n_experts)
         return expert_stats
 
-    def _init_load_balancer(self, expert_stats_path: str = None):
+    def _init_load_balancer(self, expert_stats_path: Optional[str] = None):
         if expert_stats_path is not None:
             expert_stats = self._load_expert_stats(expert_stats_path)
         else:
@@ -271,7 +333,7 @@ class MoEImplEP(MoEImplBase):
         self.load_balancer = {}
         for layer_id in self.moe_layer_id_list:
             cur_load_balancer = MoELargeScaleNaiveLoadBalancer(
-                self.num_experts,
+                self.n_experts,
                 self.n_global_experts_slots,
                 self.ep_size,
             )
@@ -280,20 +342,25 @@ class MoEImplEP(MoEImplBase):
             )
             self.load_balancer[layer_id] = cur_load_balancer
 
-    def get_expert_mapping(
-        self,
-        layer_id: int,
-    ):
-        return self.load_balancer[layer_id].get_expert_mapping(self.ep_rank)
+    def get_expert_mapping(self, layer_id: int):
+        return self.load_balancer[layer_id].get_expert_mapping(
+            self.ep_group.rank_in_group
+        )
 
 
 class MoEImplNoEP(MoEImplBase):
     """MoEImplNoEP is a MoE implementation without EP."""
 
-    def __init__(self, args) -> None:
-        super().__init__(args)
+    def __init__(
+        self,
+        *,
+        tp_group: Optional[CommGroup] = None,
+        dp_group: Optional[CommGroup] = None,
+        ep_group: Optional[CommGroup] = None,
+    ):
+        super().__init__(tp_group=tp_group, dp_group=dp_group, ep_group=ep_group)
 
-        self.ep_size = args.infer.ep_size
+        assert self.ep_size == 1
 
         if has_deep_gemm:
             self.impl_map = {

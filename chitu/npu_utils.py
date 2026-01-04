@@ -480,12 +480,14 @@ def fused_experts_npu(
     topk_weights: torch.Tensor,
     w1_scale=None,
     w2_scale=None,
+    *,
+    global_num_experts: int,
     experts_start_idx: int = 0,
     use_int8_w8a8=False,
 ):
-    if get_ep_size() > 1:
+    n_local_experts = w1.shape[0]
+    if n_local_experts < global_num_experts:
         assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
-        n_local_experts = w1.shape[0]
         new_token_to_expert_indices = (
             hidden_states.token_to_expert_indices - experts_start_idx
         )
@@ -577,6 +579,14 @@ def _(
     ]
 
     concat_activation = hidden_states.concat_activation
+
+    if concat_activation.numel() == 0:
+        return torch.empty(
+            0,
+            concat_activation.shape[-1],
+            dtype=concat_activation.dtype,
+            device=concat_activation.device,
+        )
 
     if use_int8_w8a8:
         concat_activation, dynamic_scale = torch_npu.npu_dynamic_quant(

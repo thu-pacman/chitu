@@ -344,6 +344,7 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
         # Common parameters for all quantizations
         dim: int,
         moe_inter_dim: int,
+        global_n_experts: int,
         experts_start_idx: int,
         experts_end_idx: int,
         n_shared_experts: int,
@@ -366,6 +367,7 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
         super().__init__(
             dim,
             moe_inter_dim,
+            global_n_experts,
             experts_start_idx,
             experts_end_idx,
             n_shared_experts,
@@ -817,6 +819,7 @@ class Blockfp4MoeExpertsPackKStride64(
                 w2_scale_2=self.down_proj_weight_scale_2,
                 block_shape=[128, 128],
                 soft_fp8=raise_to_16,
+                global_num_experts=self.global_n_experts,
                 experts_start_idx=self.experts_start_idx,
                 impl=impl,
             )
@@ -907,6 +910,7 @@ class Blockfp4MoeExpertsPackNPUNative(
                 topk_weights=weights,
                 w1_scale=self.gate_up_proj_weight_scale,
                 w2_scale=self.down_proj_weight_scale,
+                global_num_experts=self.global_n_experts,
             )
 
         else:

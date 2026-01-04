@@ -47,6 +47,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         self,
         dim: int,
         moe_inter_dim: int,
+        global_n_experts: int,
         experts_start_idx: int,
         experts_end_idx: int,
         n_shared_experts: int,
@@ -60,6 +61,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
 
         self.dim = dim
         self.moe_inter_dim = moe_inter_dim
+        self.global_n_experts = global_n_experts
         self.experts_start_idx = experts_start_idx
         self.experts_end_idx = experts_end_idx
         self.n_shared_experts = n_shared_experts
@@ -82,7 +84,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
                 break
             inheritance_order.append(cls.__name__)
         inheritance_order_str = " <- ".join(inheritance_order)
-        return f"{inheritance_order_str}(dim={self.dim}, moe_inter_dim={self.moe_inter_dim}, experts_start_idx={self.experts_start_idx}, experts_end_idx={self.experts_end_idx}, n_shared_experts={self.n_shared_experts}, n_activated_experts={self.n_activated_experts})"
+        return f"{inheritance_order_str}(dim={self.dim}, moe_inter_dim={self.moe_inter_dim}, global_n_experts={self.global_n_experts}, n_shared_experts={self.n_shared_experts}, n_activated_experts={self.n_activated_experts})"
 
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
         """
@@ -169,14 +171,16 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
 
         shape = x.size()
         y = torch.zeros_like(x)
-        counts = torch.bincount(
-            indices.flatten(), minlength=self.n_routed_experts
-        ).tolist()
+        activated_expert_ids = {
+            i
+            for i, cnt in enumerate(torch.bincount(indices.flatten()).tolist())
+            if cnt > 0
+        }
 
         xs = []
         for i in range(self.experts_start_idx, self.experts_end_idx):
             this_x = None
-            if counts[i]:
+            if i in activated_expert_ids:
                 idx, top = torch.where(indices == i)
                 this_x = x[idx]
             xs.append(this_x)
@@ -212,7 +216,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
             down_proj_outs.append(down_proj_out)
 
         for i in range(self.experts_start_idx, self.experts_end_idx):
-            if counts[i]:
+            if i in activated_expert_ids:
                 idx, top = torch.where(indices == i)
                 y[idx] += (
                     down_proj_outs[i - self.experts_start_idx] * weights[idx, top, None]

@@ -10,7 +10,7 @@ fast_hadamard_transform, has_fast_hadamard_transform = try_import_opt_dep(
 )
 
 
-@pytest.mark.parametrize("bs", [8])
+@pytest.mark.parametrize("bs", [0, 8])
 @pytest.mark.parametrize("dim", [192])
 @pytest.mark.skipif(
     not has_scipy or not has_fast_hadamard_transform,

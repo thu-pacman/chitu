@@ -3,15 +3,18 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from .base import MoELoadBalancer
-from .large_scale_balancer import MoELargeScaleNaiveLoadBalancer
-from .naive_balancer import MoENaiveLoadBalancer
-from .executor import ExpertParamAccessor, WeightMigrationExecutor
-
 from typing import Optional
 from logging import getLogger
 
-from .planner import MoELoadPlanner
+from chitu.moe.load_balancer.base import MoELoadBalancer
+from chitu.moe.load_balancer.large_scale_balancer import MoELargeScaleNaiveLoadBalancer
+from chitu.moe.load_balancer.naive_balancer import MoENaiveLoadBalancer
+from chitu.moe.load_balancer.executor import (
+    ExpertParamAccessor,
+    WeightMigrationExecutor,
+)
+from chitu.moe.load_balancer.planner import MoELoadPlanner
+from chitu.distributed.comm_group import CommGroup
 
 logger = getLogger(__name__)
 
@@ -21,17 +24,27 @@ _EXECUTOR = None  # type: ignore[var-annotated]
 
 
 def init_moe_load_balancer(
-    *, num_layers: int, num_experts: int, slot_nums: int, enable: bool = True
+    *,
+    ep_group: CommGroup,
+    num_layers: int,
+    num_experts: int,
+    slot_nums: int,
+    enable: bool = True,
+    moe_lb_trigger: int,
+    moe_lb_threshold: float,
 ) -> None:
     """Initialize the MoE load balancer as global singleton."""
     global _PLANNER
     if _PLANNER is not None:
         return
     _PLANNER = MoELoadPlanner(
+        ep_group=ep_group,
         num_layers=num_layers,
         num_experts=num_experts,
         slot_nums=slot_nums,
         enable=enable,
+        moe_lb_trigger=moe_lb_trigger,
+        moe_lb_threshold=moe_lb_threshold,
     )
     logger.info(
         f"MoE load balancer initialized: num_layers={num_layers}, num_experts={num_experts}, slot_nums={slot_nums}"
@@ -46,7 +59,7 @@ def get_moe_load_planner() -> Optional[MoELoadPlanner]:
     return _PLANNER
 
 
-def register_moe_weight_accessor(accessor) -> None:
+def register_moe_weight_accessor(accessor, ep_group: CommGroup) -> None:
     """Register a weight accessor and enable weight migration during planning.
 
     If the planner is initialized, this installs a WeightMigrationExecutor so that
@@ -66,13 +79,8 @@ def register_moe_weight_accessor(accessor) -> None:
             "register_moe_weight_accessor called before planner init; deferring has no effect"
         )
         return
-    if WeightMigrationExecutor is None:
-        logger.warning(
-            "WeightMigrationExecutor not available; cannot register accessor"
-        )
-        return
     try:
-        executor = WeightMigrationExecutor(accessor=accessor)
+        executor = WeightMigrationExecutor(accessor=accessor, ep_group=ep_group)
         planner.register_action_executor(executor)
         _EXECUTOR = executor
         logger.info(

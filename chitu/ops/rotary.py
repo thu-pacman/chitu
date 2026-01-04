@@ -64,6 +64,11 @@ def apply_rotary_pos_emb_cuda(
     rotary_type: str = "separated",
     impl: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if q.numel() == 0 or k.numel() == 0:
+        assert q.numel() == 0
+        assert k.numel() == 0
+        return (q_out if q_out is not None else q), (k_out if k_out is not None else k)
+
     if rotary_type == "interleaved":
         q_shape = q.shape
         k_shape = k.shape

@@ -47,6 +47,7 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
         # Common parameters for all quantizations
         dim: int,
         moe_inter_dim: int,
+        global_n_experts: int,
         experts_start_idx: int,
         experts_end_idx: int,
         n_shared_experts: int,
@@ -69,6 +70,7 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
         super().__init__(
             dim,
             moe_inter_dim,
+            global_n_experts,
             experts_start_idx,
             experts_end_idx,
             n_shared_experts,

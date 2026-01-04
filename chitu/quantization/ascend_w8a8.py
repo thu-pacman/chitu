@@ -237,6 +237,7 @@ class AscendW8A8DynamicMoeExperts(
         # Common parameters for all quantizations
         dim: int,
         moe_inter_dim: int,
+        global_n_experts: int,
         experts_start_idx: int,
         experts_end_idx: int,
         n_shared_experts: int,
@@ -255,6 +256,7 @@ class AscendW8A8DynamicMoeExperts(
         super().__init__(
             dim,
             moe_inter_dim,
+            global_n_experts,
             experts_start_idx,
             experts_end_idx,
             n_shared_experts,
@@ -319,6 +321,7 @@ class AscendW8A8DynamicMoeExperts(
                 use_int8_w8a8=True,
                 impl=impl,
                 layer_id=self.layer_id,
+                global_num_experts=self.global_n_experts,
                 experts_start_idx=self.experts_start_idx,
             )
 

@@ -31,7 +31,6 @@ if torch.cuda.is_available():
     )
     from chitu.ops.triton_ops.utils import to_triton_dtype
 from chitu.lazy import single_dispatch_lazy_tensor
-from chitu.distributed.parallel_state import get_ep_size
 
 logger = getLogger(__name__)
 
@@ -778,13 +777,14 @@ def fused_experts(
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
+    *,
     inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_fp4_w4a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
-    global_num_experts: int = -1,
+    global_num_experts: int,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_scale_2: Optional[torch.Tensor] = None,
@@ -797,9 +797,9 @@ def fused_experts(
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> torch.Tensor:
-    if get_ep_size() > 1:
+    n_local_experts = w1.shape[0]
+    if n_local_experts < global_num_experts:
         assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
-        n_local_experts = w1.shape[0]
         new_token_to_expert_indices = (
             hidden_states.token_to_expert_indices - experts_start_idx
         )
@@ -822,7 +822,6 @@ def fused_experts(
         use_fp4_w4a8,
         use_int8_w8a16,
         use_int4_w4a16,
-        global_num_experts,
         w1_scale,
         w2_scale,
         w1_scale_2,
@@ -848,7 +847,6 @@ def fused_experts_impl(
     use_fp4_w4a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
-    global_num_experts: int = -1,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_scale2: Optional[torch.Tensor] = None,
@@ -875,7 +873,6 @@ def _(
     use_fp4_w4a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
-    global_num_experts: int = -1,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_scale2: Optional[torch.Tensor] = None,
@@ -893,8 +890,6 @@ def _(
 
     M, _ = hidden_states.activation.shape
     E, N, _ = w1.shape
-    if global_num_experts == -1:
-        global_num_experts = E
     top_k_num = topk_weights.shape[1]
     config_dtype = get_config_dtype_str(
         use_fp8_w8a8=use_fp8_w8a8,
@@ -914,9 +909,7 @@ def _(
 
     return fused_experts_impl(
         ExpertBlockIndexedBatchedRoutedActivation.convert_from(
-            hidden_states,
-            n_experts=global_num_experts,
-            block_size=config["BLOCK_SIZE_M"],
+            hidden_states, n_experts=E, block_size=config["BLOCK_SIZE_M"]
         ),
         w1=w1,
         w2=w2,
@@ -927,7 +920,6 @@ def _(
         use_fp4_w4a8=use_fp4_w4a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
-        global_num_experts=global_num_experts,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         w1_scale2=w1_scale2,
@@ -953,7 +945,6 @@ def _(
     use_fp4_w4a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
-    global_num_experts: int = -1,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_scale2: Optional[torch.Tensor] = None,
@@ -988,8 +979,6 @@ def _(
 
     M, _ = hidden_states.activation.shape
     E, N, _ = w1.shape
-    if global_num_experts == -1:
-        global_num_experts = E
     top_k_num = topk_weights.shape[1]
 
     if M > 32768:

@@ -24,7 +24,7 @@ muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
 
 @pytest.mark.parametrize("num_experts", [256])
 @pytest.mark.parametrize("block_size", [16, 64])
-@pytest.mark.parametrize("num_tokens", [64, 4096])
+@pytest.mark.parametrize("num_tokens", [0, 64, 4096])
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("distribution", ["imbalance", "uniform"])
 @pytest.mark.parametrize("impl", ["triton", "cuda", "muxi"])
@@ -90,7 +90,7 @@ def test_batched_routed_activation_indexed_to_expert_block_indexed(
 
 @pytest.mark.parametrize("num_experts", [256])
 @pytest.mark.parametrize("block_size", [128])
-@pytest.mark.parametrize("num_tokens", [64, 4096])
+@pytest.mark.parametrize("num_tokens", [0, 64, 4096])
 @pytest.mark.parametrize("hidden_size", [7168])
 @pytest.mark.parametrize("quant_block_size", [128])
 @pytest.mark.parametrize("topk", [8])
@@ -181,7 +181,7 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
 
 @pytest.mark.parametrize("num_experts", [256])
 @pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("num_tokens", [64, 4096])
+@pytest.mark.parametrize("num_tokens", [0, 64, 4096])
 @pytest.mark.parametrize("hidden_size", [7168])
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("distribution", ["imbalance", "uniform"])

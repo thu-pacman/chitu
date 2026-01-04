@@ -40,23 +40,27 @@ def init_b_and_b_s(dim, block_size):
     )
 
 
+@pytest.mark.parametrize("bs", [0, 1, 256])
+@pytest.mark.parametrize("dim", [256])
+@pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
-def test_silu_and_mul_and_blockfp8_act_quant(dtype: torch.dtype, record_benchmark):
+def test_silu_and_mul_and_blockfp8_act_quant(
+    bs, dim, block_size, dtype: torch.dtype, record_benchmark
+):
     set_global_args(
         OmegaConf.create({"infer": {"op_impl": "torch"}}), need_ensure=False
     )
     torch.set_default_dtype(dtype)
-    dim = 256
-    block_size = 128
     assert dim % block_size == 0, "dim must be divisible by block_size"
-    a = torch.randn(dim, dim * 2, dtype=dtype, device="cuda")
+    a = torch.randn(bs, dim * 2, dtype=dtype, device="cuda")
 
     a_fp8, a_s = record_benchmark.run(
         lambda: silu_and_mul_and_blockfp8_act_quant(a, block_size=block_size),
+        bs=bs,
         dim=dim,
         impl="fused",
     )
@@ -119,23 +123,27 @@ def test_silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
     assert torch.allclose(a_s.float(), a_s_ref.float(), atol=0.15, rtol=0.15)
 
 
+@pytest.mark.parametrize("bs", [0, 1, 256])
 @pytest.mark.parametrize("dim", [256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
-def test_dequanted_gemm_is_close_to_fp8_gemm(dim, dtype: torch.dtype, record_benchmark):
+def test_dequanted_gemm_is_close_to_fp8_gemm(
+    bs, dim, dtype: torch.dtype, record_benchmark
+):
     torch.set_default_dtype(dtype)
     block_size = 128
     assert dim % block_size == 0, "dim must be divisible by block_size"
-    a = torch.randn(dim, dim, dtype=dtype, device="cuda")
+    a = torch.randn(bs, dim, dtype=dtype, device="cuda")
     b, b_s = init_b_and_b_s(dim, block_size)
 
     a_fp8, a_s = blockfp8_act_quant(a, block_size)
 
     std_y = record_benchmark.run(
         lambda: blockfp8_gemm(a_fp8, a_s, b, b_s),
+        bs=bs,
         dim=dim,
         impl="fp8_gemm",
     )
@@ -144,11 +152,11 @@ def test_dequanted_gemm_is_close_to_fp8_gemm(dim, dtype: torch.dtype, record_ben
     # so the numerical difference is controlled inside the kernels
     dequant_a = (
         (
-            a_fp8.to(a_s.dtype).view(dim, dim // block_size, block_size)
-            * a_s.view(dim, dim // block_size, 1)
+            a_fp8.to(a_s.dtype).view(bs, dim // block_size, block_size)
+            * a_s.view(bs, dim // block_size, 1)
         )
         .to(dtype)
-        .view(dim, dim)
+        .view(bs, dim)
     )
 
     dequant_b = blockfp8_weight_dequant(b, b_s)
@@ -178,18 +186,19 @@ def test_soft_fp8_dequant_is_close_to_dequant(dtype: torch.dtype, record_benchma
     assert torch.allclose(dequant_b, soft_dequant_b, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("bs", [0, 1, 256])
 @pytest.mark.parametrize("dim", [256])
+@pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
 def test_soft_fp8_gemm_is_close_to_dequanted_gemm(
-    dim, dtype: torch.dtype, record_benchmark
+    bs, dim, block_size, dtype: torch.dtype, record_benchmark
 ):
     torch.set_default_dtype(dtype)
-    block_size = 128
-    a = torch.randn(dim, dim, dtype=dtype, device="cuda")
+    a = torch.randn(bs, dim, dtype=dtype, device="cuda")
     b, b_s = init_b_and_b_s(dim, block_size)
 
     dequant_b = soft_fp8_blockfp8_weight_dequant(b, b_s)
@@ -197,6 +206,7 @@ def test_soft_fp8_gemm_is_close_to_dequanted_gemm(
 
     y = record_benchmark.run(
         lambda: soft_fp8_blockfp8_gemm(a, b, b_s),
+        bs=bs,
         dim=dim,
         impl="soft_fp8_gemm",
     )
@@ -204,7 +214,7 @@ def test_soft_fp8_gemm_is_close_to_dequanted_gemm(
     assert torch.allclose(std_y, y, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("b", [1, 2])
+@pytest.mark.parametrize("b", [0, 1, 2])
 @pytest.mark.parametrize("m", [1, 4000])
 @pytest.mark.parametrize("n", [1, 5000])
 @pytest.mark.parametrize("h", [64])
@@ -239,7 +249,7 @@ def test_blockfp8_index_score_dense_dsv32(
     assert torch.allclose(output, output_ref, atol=0.15, rtol=0.15)
 
 
-@pytest.mark.parametrize("b", [1, 2])
+@pytest.mark.parametrize("b", [0, 1, 2])
 @pytest.mark.parametrize("h", [64])
 @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize("block_size", [128])
@@ -289,7 +299,7 @@ def test_blockfp8_index_score_ragged_q_dense_k_dsv32(
     assert torch.allclose(output, output_ref, atol=0.15, rtol=0.15)
 
 
-@pytest.mark.parametrize("b", [1, 2])
+@pytest.mark.parametrize("b", [0, 1, 2])
 @pytest.mark.parametrize("h", [64])
 @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize("block_size", [128])

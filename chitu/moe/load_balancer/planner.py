@@ -11,17 +11,15 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+
 from chitu.utils import try_import_and_setup_torch_npu
-
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-import torch.nn.functional as F
-
-from chitu.distributed.parallel_state import get_ep_group, get_ep_size
+from chitu.distributed.comm_group import CommGroup
 from chitu.moe.load_balancer.utils import (
     argmax_exclude_negative,
     argmin_exclude_negative,
 )
-from chitu.global_vars import get_global_args
+
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 logger = getLogger(__name__)
 
@@ -58,22 +56,25 @@ class MoELoadPlanner:
     def __init__(
         self,
         *,
+        ep_group: CommGroup,
         num_layers: int,
         num_experts: int,
         slot_nums: int,
         enable: bool = True,
+        moe_lb_trigger: int,
+        moe_lb_threshold: float,
     ) -> None:
         """Initialize the MoE load planner instance."""
         self.enable = enable
         self.num_layers = num_layers
         self.num_experts = num_experts
         self.global_slot_nums = slot_nums
-        self.planner_threshold = get_global_args().infer.moe_lb_threshold
-        self.is_dynamic = get_global_args().infer.moe_lb_trigger > 0
 
-        ep_group = get_ep_group()
+        self.planner_threshold = moe_lb_threshold
+        self.is_dynamic = moe_lb_trigger > 0
+
         self._ep_group = ep_group
-        self._ep_size = get_ep_size()
+        self._ep_size = ep_group.group_size
         self._ep_rank = ep_group.rank_in_group
         assert (
             self.global_slot_nums % self._ep_size == 0

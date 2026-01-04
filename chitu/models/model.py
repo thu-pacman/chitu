@@ -632,7 +632,7 @@ class Transformer(nn.Module):
             if self.ep_size > 1:
                 local_experts = [
                     self.moe_impl.load_balancer[layer_id].get_local_experts(
-                        self.moe_impl.ep_rank
+                        self.moe_impl.ep_group.rank_in_group
                     )
                     for layer_id in self.moe_impl.moe_layer_id_list
                 ]
@@ -1078,6 +1078,7 @@ class MoeGate(nn.Module):
         bias,
         e_score_correction_bias,
         norm_prob,
+        _debug_force_moe_balance: Optional[bool] = None,
     ):
         """
         Initializes the Gate module.
@@ -1097,7 +1098,10 @@ class MoeGate(nn.Module):
         self.e_score_correction_bias = e_score_correction_bias
         self.norm_prob = norm_prob
 
-        if get_global_args().debug.force_moe_balance:
+        if _debug_force_moe_balance is None:
+            _debug_force_moe_balance = get_global_args().debug.force_moe_balance
+        self._debug_force_moe_balance = _debug_force_moe_balance
+        if self._debug_force_moe_balance:
             self._debug_force_moe_balance_mask_cache = (
                 self._debug_gen_force_moe_balance_mask(
                     ceil_div(get_global_args().infer.max_reqs, get_dp_size())
@@ -1135,7 +1139,7 @@ class MoeGate(nn.Module):
         scores = F.linear(x, self.weight, self.bias)
 
         e_score_correction_bias = self.e_score_correction_bias
-        if get_global_args().debug.force_moe_balance:
+        if self._debug_force_moe_balance:
             if x.shape[0] <= self._debug_force_moe_balance_mask_cache.shape[0]:
                 # decode
                 mask = self._debug_force_moe_balance_mask_cache[: x.shape[0]]
@@ -1172,6 +1176,8 @@ class ParallelMoeBlock(nn.Module):
         experts (QuantizedMoeExpertsBase): The layer containing routed experts + fused shared experts
         non_fused_shared_experts (Optional[nn.Module]): Optional layer for shared experts if not fused.
         layer_id (int): The layer id of this MoE block.
+        enable_dynamic_load_balance: If True, enable dynamic load balancing. If None, the value will
+            be read from global args.
     """
 
     def __init__(
@@ -1182,6 +1188,7 @@ class ParallelMoeBlock(nn.Module):
         layer_id: int = 0,
         moe_impl: Optional[MoEImplBase] = None,
         *,
+        enable_dynamic_load_balance: Optional[bool] = None,
         checkpoint_prefix: str,
     ):
         super().__init__()
@@ -1211,7 +1218,10 @@ class ParallelMoeBlock(nn.Module):
         if self.layer_id is not None:
             Backend.register_moe_layer_experts(self.layer_id, self.experts)
         self.layer_id = layer_id
-        self.is_dynamic = get_global_args().infer.moe_lb_trigger > 0
+
+        if enable_dynamic_load_balance is None:
+            enable_dynamic_load_balance = get_global_args().infer.moe_lb_trigger > 0
+        self.enable_dynamic_load_balance = enable_dynamic_load_balance
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -1230,7 +1240,7 @@ class ParallelMoeBlock(nn.Module):
         weights, indices = self.gate(x)
         rerouted_indices = None
 
-        if self.is_dynamic:
+        if self.enable_dynamic_load_balance:
             planner = get_moe_load_planner()
             if planner is not None:
                 global_slot_idx = planner.route_expert_ids(self.layer_id, indices)
@@ -1258,7 +1268,7 @@ class ParallelMoeBlock(nn.Module):
                 shared_y = self.shared_experts(x)
 
         experts_impl = "auto"
-        if self.moe_impl is not None and self.moe_impl.ep_size > 1:
+        if self.moe_impl.ep_size > 1:
             experts_impl = self.moe_impl.get_experts_impl()
             routed_x_old = routed_x
             routed_x, weights = self.moe_impl.token_permutation(
@@ -1275,35 +1285,35 @@ class ParallelMoeBlock(nn.Module):
             x_in_use_simultenously = x_in_use_simultenously and (
                 routed_x_old is routed_x
             )
-        elif self.moe_impl is not None and self.moe_impl.ep_size == 1:
+        elif self.moe_impl.ep_size == 1:
             experts_impl = self.moe_impl.get_experts_impl()
 
         y = self.experts(
             routed_x, weights, inplace=not x_in_use_simultenously, impl=experts_impl
         )
 
-        if shared_y is not None and get_tp_size() > 1:
+        if shared_y is not None and self.moe_impl.tp_size > 1:
             # we need to reduce shared_y on tp group, if this group equals the group reduce y later, we can merge them together
             if self.moe_impl and self.moe_impl.ep_size > 1:
                 y_reduce_rank_list = self.moe_impl.unpermutation_reduce_rank_list()
             else:
-                y_reduce_rank_list = get_tp_group().rank_list
-            if get_tp_group().rank_list == y_reduce_rank_list:
+                y_reduce_rank_list = self.moe_impl.tp_group.rank_list
+            if self.moe_impl.tp_group.rank_list == y_reduce_rank_list:
                 if self.shared_experts_stream:
                     torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
                 y += shared_y
                 shared_y = None
 
-        if self.moe_impl and self.moe_impl.ep_size > 1:
+        if self.moe_impl.ep_size > 1:
             y = self.moe_impl.token_unpermutation(y)
-        elif get_tp_size() > 1:
-            get_tp_group().all_reduce(y)
+        elif self.moe_impl.tp_size > 1:
+            self.moe_impl.tp_group.all_reduce(y)
 
         if shared_y is not None:
             if self.shared_experts_stream:
                 torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
-            if get_tp_size() > 1:
-                get_tp_group().all_reduce(shared_y)
+            if self.moe_impl.tp_size > 1:
+                self.moe_impl.tp_group.all_reduce(shared_y)
             y += shared_y
         return y.view(shape)
 
