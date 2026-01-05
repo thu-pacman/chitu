@@ -1,10 +1,11 @@
 import pytest
 import torch
-from chitu.utils import try_import_platform_dep
-
-triton, has_triton = try_import_platform_dep("triton")
 
 from chitu.ops import causal_conv1d_update, causal_conv1d_prefill
+from chitu.utils import try_import_platform_dep
+from chitu.testing import assert_close
+
+triton, has_triton = try_import_platform_dep("triton")
 
 
 @pytest.mark.parametrize("batch_size", [0, 1, 4])
@@ -28,10 +29,8 @@ def test_causal_conv1d_update(batch_size, hidden_size, state_len, impl):
     output_ref, new_hidden_state_ref = causal_conv1d_update(
         this_hidden_state, old_hidden_state, weight, impl="ref"
     )
-    torch.testing.assert_close(output, output_ref, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(
-        new_hidden_state, new_hidden_state_ref, atol=1e-2, rtol=1e-2
-    )
+    assert_close(output, output_ref, atol=1e-2, rtol=1e-2)
+    assert_close(new_hidden_state, new_hidden_state_ref, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize(
@@ -66,7 +65,5 @@ def test_causal_conv1d_prefill(prefix_lens, hidden_size, state_len, impl):
     output_ref, new_hidden_state_ref = causal_conv1d_prefill(
         inputs, conv_state, weight, prefix_lens, impl="ref"
     )
-    torch.testing.assert_close(output, output_ref, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(
-        new_hidden_state, new_hidden_state_ref, atol=1e-2, rtol=1e-2
-    )
+    assert_close(output, output_ref, atol=1e-2, rtol=1e-2)
+    assert_close(new_hidden_state, new_hidden_state_ref, atol=1e-2, rtol=1e-2)

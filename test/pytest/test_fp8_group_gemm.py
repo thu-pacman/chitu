@@ -6,18 +6,9 @@ from chitu.ops import blockfp8_einsum_shc_hdc_shd
 from chitu.global_vars import set_global_args
 from chitu.device_type import is_nvidia
 from chitu.utils import try_import_platform_dep
+from chitu.testing import assert_close
 
 triton, has_triton = try_import_platform_dep("triton")
-
-
-def check_close(x, y):
-    if x.numel() == 0:
-        return x.shape == y.shape
-    x, y = x.double(), y.double()
-    denominator = (x * x + y * y).sum()
-    sim = 2 * (x * y).sum() / denominator
-    diff = 1 - sim
-    return diff < 0.001
 
 
 @pytest.mark.parametrize("batch_size", [0, 1, 2])
@@ -59,4 +50,4 @@ def test_blockfp8_einsum_shc_hdc_shd(
         in_feats=in_feats,
         impl="triton",
     )
-    assert check_close(torch_out, triton_out)
+    assert_close(torch_out, triton_out, cos_sim_tol=0.001)

@@ -5,6 +5,7 @@ import torch
 from chitu.distributed.comm_group import CommGroup
 from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from chitu.quantization.normal import NormalLinear
+from chitu.testing import assert_close
 
 
 @pytest.mark.parametrize("tp_group_size", [1, 2, 4])
@@ -65,7 +66,7 @@ def test_column_parallel_linear(
         y = parallel_linear(x)
         y_ref = torch.nn.functional.linear(x, global_weight, global_bias)
 
-        torch.testing.assert_close(y, y_ref, atol=1e-2, rtol=1e-2)
+        assert_close(y, y_ref, atol=1e-2, rtol=1e-2)
 
     torch.distributed.barrier()  # Non-working ranks should not exit too early
 
@@ -128,7 +129,7 @@ def test_row_parallel_linear(
         y = parallel_linear(x)
         y_ref = torch.nn.functional.linear(x, global_weight, bias)
 
-        torch.testing.assert_close(y, y_ref, atol=1.5e-1, rtol=1.5e-1)
+        assert_close(y, y_ref, atol=1.5e-1, rtol=1.5e-1)
 
     torch.distributed.barrier(
         device_ids=[torch.cuda.current_device()]

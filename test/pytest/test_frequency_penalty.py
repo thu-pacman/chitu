@@ -4,6 +4,7 @@ import pytest
 from chitu.device_list import DeviceList
 from chitu.ops import apply_frequency_penalty
 from chitu.utils import try_import_platform_dep
+from chitu.testing import assert_close
 
 triton, has_triton = try_import_platform_dep("triton")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
@@ -60,4 +61,4 @@ def test_frequency_penalty(
         impl=impl,
     )
 
-    assert torch.allclose(logits_test, logits_ref, atol=1e-2, rtol=1e-2)
+    assert_close(logits_test, logits_ref, atol=1e-2, rtol=1e-2)

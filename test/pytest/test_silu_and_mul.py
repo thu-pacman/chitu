@@ -4,6 +4,7 @@ import torch
 from chitu.ops import silu_and_mul
 from chitu.lazy import eval_lazy
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
+from chitu.testing import assert_close
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -27,7 +28,7 @@ def test_silu_and_mul(M, N, impl, record_benchmark):
         N=N,
         impl=impl,
     )
-    torch.testing.assert_close(result, baseline_result, rtol=1e-2, atol=1e-2)
+    assert_close(result, baseline_result, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("E", [32, 128])
@@ -62,4 +63,4 @@ def test_silu_and_mul_with_expert_mask(E, M, N, impl, record_benchmark):
     baseline_result[~mask] = 0
     result[~mask] = 0
 
-    torch.testing.assert_close(result, baseline_result, rtol=1e-2, atol=1e-2)
+    assert_close(result, baseline_result, rtol=1e-2, atol=1e-2)

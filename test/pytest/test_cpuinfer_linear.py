@@ -2,6 +2,7 @@ import torch
 import pytest
 
 from chitu.utils import try_import_platform_dep, try_import_opt_dep
+from chitu.testing import assert_close
 
 triton, has_triton = try_import_platform_dep("triton")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
@@ -64,4 +65,4 @@ def test_cpu_linear(input_size, output_size, qlen, compute_dtype, record_benchma
 
     torch_output = torch_linear(input_tensor, proj)
 
-    assert torch.allclose(cpuinfer_output, torch_output, rtol=1e-2, atol=1e-2)
+    assert_close(cpuinfer_output, torch_output, rtol=1e-2, atol=1e-2)

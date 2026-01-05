@@ -7,6 +7,7 @@ from chitu.ops import (
     moe_sum_expert_concat_permuted,
 )
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
+from chitu.testing import assert_close
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -34,7 +35,7 @@ def test_moe_sum_per_token(M, topk, N, compute_dtype, record_benchmark):
         impl="triton",
     )
 
-    assert torch.allclose(test_output, ref_output, rtol=1e-2, atol=1e-2)
+    assert_close(test_output, ref_output, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("M", [0, 32, 64, 128])
@@ -82,7 +83,7 @@ def test_moe_sum_expert_block_permuted(
         impl="triton",
     )
 
-    assert torch.allclose(test_output, ref_output, rtol=1e-2, atol=1e-2)
+    assert_close(test_output, ref_output, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("M", [0, 32, 64, 128])
@@ -120,4 +121,4 @@ def test_moe_sum_expert_concat_permuted(M, topk, N, compute_dtype, record_benchm
         impl="torch_npu",
     )
 
-    assert torch.allclose(test_output, ref_output, rtol=1e-2, atol=1e-2)
+    assert_close(test_output, ref_output, rtol=1e-2, atol=1e-2)

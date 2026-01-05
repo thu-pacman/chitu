@@ -14,6 +14,7 @@ import torch
 
 from chitu import ops
 from chitu.ops.quant.blockfp4.matmul import cutlass_scaled_fp4_mm
+from chitu.testing import assert_close
 
 kE2M1ToFloat = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
@@ -195,9 +196,5 @@ def test_nvfp4_gemm(
         batch_size_threshold=1e20,
     )
 
-    torch.testing.assert_close(
-        out_1, expected_out.to(dtype=dtype), atol=2e-1, rtol=1e-1
-    )
-    torch.testing.assert_close(
-        out_2, expected_out.to(dtype=dtype), atol=2e-1, rtol=1e-1
-    )
+    assert_close(out_1, expected_out.to(dtype=dtype), atol=2e-1, rtol=1e-1)
+    assert_close(out_2, expected_out.to(dtype=dtype), atol=2e-1, rtol=1e-1)

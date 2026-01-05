@@ -368,7 +368,7 @@ class BenchmarkRecorder:
                 x_val=N,
                 impl="triton",
             )
-            assert torch.allclose(out, ref_out)
+            chitu.testing.assert_close(out, ref_out)
 
         Args:
             fn: Callable to benchmark and get result from.

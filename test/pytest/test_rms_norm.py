@@ -3,6 +3,7 @@ import pytest
 
 from chitu.models.model import RMSNorm
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
+from chitu.testing import assert_close
 
 triton, has_triton = try_import_platform_dep("triton")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
@@ -48,9 +49,9 @@ def test_rms_norm(
     )
     y_ref = R(x, compute_dtype=compute_dtype, impl="ref")
     if default_dtype == torch.bfloat16:
-        assert torch.allclose(y, y_ref, rtol=1e-2, atol=1e-2)
+        assert_close(y, y_ref, rtol=1e-2, atol=1e-2)
     else:
-        assert torch.allclose(y, y_ref, rtol=1e-3, atol=1e-3)
+        assert_close(y, y_ref, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("compute_dtype", [torch.float32])
@@ -84,4 +85,4 @@ def test_rms_norm_in_place(compute_dtype, dim, bs, impl, record_benchmark):
         impl=impl,
     )
     y_ref = R(x, compute_dtype=compute_dtype, impl="ref")
-    assert torch.allclose(y, y_ref, rtol=1e-3, atol=1e-3)
+    assert_close(y, y_ref, rtol=1e-3, atol=1e-3)

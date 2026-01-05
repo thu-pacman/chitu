@@ -16,16 +16,7 @@ from chitu.distributed.parallel_state import (
 from chitu.task_type import TaskType
 from chitu.moe import MoEImplEP, MoEImplNoEP
 from chitu.global_vars import set_global_args
-
-
-def check_close(x, y):
-    if x.numel() == 0:
-        return x.shape == y.shape
-    x, y = x.double(), y.double()
-    denominator = (x * x + y * y).sum()
-    sim = 2 * (x * y).sum() / denominator
-    diff = 1 - sim
-    return diff < 0.002
+from chitu.testing import assert_close
 
 
 @pytest.mark.parametrize(
@@ -289,7 +280,7 @@ def test_parallel_moe_block(
         y = parallel_moe_block(x)
         ref_y = ref_moe_block(ref_x)
 
-        assert check_close(y, ref_y)
+        assert_close(y, ref_y, cos_sim_tol=0.002)
 
     torch.distributed.barrier(
         device_ids=[torch.cuda.current_device()]

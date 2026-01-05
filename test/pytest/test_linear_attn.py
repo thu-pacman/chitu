@@ -7,9 +7,8 @@ from chitu.ops.linear_attn import (
     chunk_gated_delta_rule_torch_dense,
     recurrent_gated_delta_rule_torch,
 )
-from chitu.utils import (
-    try_import_opt_dep,
-)
+from chitu.utils import try_import_opt_dep
+from chitu.testing import assert_close
 
 if is_muxi():
     has_fla = False
@@ -70,7 +69,7 @@ def test_chunk_gated_delta_rule(
         output_final_state=True,
         use_qk_l2norm_in_kernel=True,
     )
-    assert torch.allclose(torch_out, fla_out, atol=1e-2, rtol=1e-2)
+    assert_close(torch_out, fla_out, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("bs", [0, 1, 8])
@@ -121,4 +120,4 @@ def test_recurrent_gated_delta_rule(
         output_final_state=True,
         use_qk_l2norm_in_kernel=True,
     )
-    assert torch.allclose(torch_out, fla_out, atol=1e-2, rtol=1e-2)
+    assert_close(torch_out, fla_out, atol=1e-2, rtol=1e-2)

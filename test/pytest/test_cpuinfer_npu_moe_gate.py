@@ -3,6 +3,7 @@ import pytest
 
 from chitu.utils import try_import_platform_dep, try_import_opt_dep
 from chitu.ops.moe_gate import moe_gate
+from chitu.testing import assert_close
 
 triton, has_triton = try_import_platform_dep("triton")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
@@ -93,17 +94,14 @@ def test_moe_gate(
         impl="torch",
     )
 
-    expert_match = torch.all(
+    assert torch.all(
         torch.sort(cpuinfer_indices, dim=1).values
         == torch.sort(torch_indices, dim=1).values
-    )
+    ), "CPU and PyTorch implementations selected different experts"
 
-    weights_match = torch.allclose(
+    assert_close(
         cpuinfer_weights.to(torch.float32),
         torch_weights.to(torch.float32),
         rtol=1e-2,
         atol=1e-2,
     )
-
-    assert expert_match, "CPU and PyTorch implementations selected different experts"
-    assert weights_match, "CPU and PyTorch weights don't match"
