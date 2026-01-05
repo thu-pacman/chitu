@@ -161,7 +161,7 @@ def batched_routed_activation_indexed_to_expert_block_indexed_triton(
     # `topk_ids.numel() - num_experts` tokens, every `block_size` tokens contributes
     # to one block
     max_num_m_blocks = (
-        max(num_experts, topk_ids.numel())
+        min(num_experts, topk_ids.numel())
         + max(topk_ids.numel() - num_experts, 0) // block_size
     )
     sorted_ids = torch.empty(

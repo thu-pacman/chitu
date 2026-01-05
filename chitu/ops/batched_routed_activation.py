@@ -136,7 +136,7 @@ def batched_routed_activation_indexed_to_expert_block_indexed_cuda(
         num_block_post_pad = torch.zeros((1), dtype=torch.int32, device=topk_ids.device)
         return sorted_ids, expert_ids, num_block_post_pad
     max_num_m_blocks = (
-        max(num_experts, topk_ids.numel())
+        min(num_experts, topk_ids.numel())
         + max(topk_ids.numel() - num_experts, 0) // block_size
     )
     sorted_ids = torch.empty(
