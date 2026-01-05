@@ -8,14 +8,15 @@ from typing import Optional
 from typing_extensions import override
 from collections import deque, defaultdict
 
-from chitu.task import TaskPool, TaskType
-from chitu.global_vars import get_slot_handle, get_global_args
-from chitu.utils import ceil_div
-from chitu.backend import Backend
 from chitu.task import (
+    TaskPool,
+    TaskType,
     PackedTasksBase,
     SerializedPackedTasksPayloadType,
 )
+from chitu.global_vars import get_global_args, SlotHandle
+from chitu.utils import ceil_div
+from chitu.backend import Backend
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 
 logger = getLogger(__name__)
@@ -35,7 +36,7 @@ class Scheduler:
         else:
             prefill_chunk_size_per_dp: Optional[int] = None
 
-        if get_slot_handle():
+        if infer_args.cache_type == "skew":
             return SkewScheduler(
                 max_reqs_per_dp,
                 dp_rank=dp_rank,
@@ -491,26 +492,7 @@ class Scheduler:
         return {TaskType.Prefill, TaskType.Decode}
 
     def reorder_tasks_for_batching(self, task_ids):
-        args = get_global_args()
-        if args.infer.cache_type == "skew":
-            for task_id in task_ids:
-                if TaskPool.pool[task_id].need_remove():
-                    if TaskPool.pool[task_id].task_type == TaskType.Decode:
-                        remove_index = TaskPool.id_list.index(task_id)
-                        for decode_id in reversed(TaskPool.id_list):
-                            if (
-                                TaskPool.pool[decode_id].task_type == TaskType.Decode
-                                and decode_id != task_id
-                            ):
-                                decode_index = TaskPool.id_list.index(decode_id)
-                                (
-                                    TaskPool.id_list[remove_index],
-                                    TaskPool.id_list[decode_index],
-                                ) = (
-                                    TaskPool.id_list[decode_index],
-                                    TaskPool.id_list[remove_index],
-                                )
-                                break
+        pass
 
     def update(self, cur_task_ids: list[str], unwait_task_ids: list[str] = []):
         removed_task_ids = []
@@ -573,16 +555,17 @@ class SkewScheduler(Scheduler):
         original_scheduler_type: str,
         prefill_chunk_size: Optional[int] = None,
     ):
+        args = get_global_args()
+        self.slot_handle = SlotHandle(max_reqs, args.infer.pp_size)
         super().__init__(
-            ceil_div(max_reqs, get_slot_handle().num_slots),  # prefill_num_tasks
-            ceil_div(max_reqs, get_slot_handle().num_slots),  # decode_num_tasks
+            ceil_div(max_reqs, self.slot_handle.num_slots),  # prefill_num_tasks
+            ceil_div(max_reqs, self.slot_handle.num_slots),  # decode_num_tasks
             Scheduler._normalize_scheduler_type(original_scheduler_type),
             dp_rank=dp_rank,
-            num_scheduler_groups=get_slot_handle().num_slots,
+            num_scheduler_groups=self.slot_handle.num_slots,
             original_scheduler_type=original_scheduler_type,
             prefill_chunk_size=prefill_chunk_size,
         )
-        self.slot_handle = get_slot_handle()
         self.sgroup_list = [[] for _ in range(self.slot_handle.num_slots)]
         self.sgroup_waiting_tasks = defaultdict(set)  # {slot_group_id: waiting_tasks}
         self.free_sgroups = deque(
@@ -605,9 +588,13 @@ class SkewScheduler(Scheduler):
             return []
 
         # collect ready task ids
+        has_correct_dp_rank = (
+            lambda task: task.dp_rank is None or self.dp_rank == task.dp_rank
+        )
         task_ids = list(
             filter(
-                lambda x: TaskPool.pool[x].can_schedule(),
+                lambda x: has_correct_dp_rank(TaskPool.pool[x])
+                and TaskPool.pool[x].can_schedule(),
                 TaskPool.id_list,
             )
         )
@@ -632,9 +619,6 @@ class SkewScheduler(Scheduler):
         sgroup_capacity = self.slot_handle.get_slot_size(sgroup_id)
         sgroup = self.sgroup_list[sgroup_id]
         self.used_sgroups.add(sgroup_id)
-        self.slot_handle.set_slot_idx(
-            sgroup_id
-        )  # To inform kvcache the current dealing sgroup_id
 
         # When slot_group's lenght smaller than it's capacity, fill new tasks into it.
         if len(sgroup) < sgroup_capacity:
@@ -663,13 +647,18 @@ class SkewScheduler(Scheduler):
                 )
                 return []
 
+            num_tasks = (
+                self.prefill_num_tasks
+                if filter_task_type == TaskType.Prefill
+                else self.decode_num_tasks
+            )
             task_ids = list(
                 filter(
                     lambda task_id: TaskPool.pool[task_id].task_type
                     == filter_task_type,
                     task_ids,
                 )
-            )
+            )[:num_tasks]
             sgroup_remaining_capacity = sgroup_capacity - len(sgroup)
             sgroup.extend(task_ids[:sgroup_remaining_capacity])
 
@@ -714,12 +703,10 @@ class SkewScheduler(Scheduler):
 
     @override
     def reorder_tasks_for_batching(self, task_ids):
-        args = get_global_args()
-        if args.infer.cache_type == "skew":
-            for task_id in task_ids:
-                if TaskPool.pool[task_id].need_remove():
-                    if TaskPool.pool[task_id].task_type == TaskType.Decode:
-                        sgroup = self.sgroup_list[TaskPool.pool[task_id].sched_group_id]
-                        index = sgroup.index(task_id)
-                        sgroup[index] = sgroup[-1]
-                        sgroup.pop()
+        for task_id in task_ids:
+            if TaskPool.pool[task_id].need_remove():
+                if TaskPool.pool[task_id].task_type == TaskType.Decode:
+                    sgroup = self.sgroup_list[TaskPool.pool[task_id].sched_group_id]
+                    index = sgroup.index(task_id)
+                    sgroup[index] = sgroup[-1]
+                    sgroup.pop()

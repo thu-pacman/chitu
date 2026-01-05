@@ -41,6 +41,7 @@ from chitu.distributed.parallel_state import (
     get_world_group,
     get_pp_group,
     get_ep_group,
+    get_dp_group,
     initialize_parallel_groups,
 )
 from chitu.distributed.partition import compute_layer_dist_in_pp
@@ -57,6 +58,7 @@ from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div
 
 # from chitu.distributed.moe_token_dispatcher import init_token_dispatcher
 from chitu.moe import init_moe_impl
+from chitu.global_vars import set_slot_handle
 
 if TYPE_CHECKING:
     from chitu.executor import Executor
@@ -1074,6 +1076,14 @@ class Backend:
         """
         # Initialize distributed environment
         Backend._init_distributed(args)
+
+        # Dense KVCache and PP related
+        if args.infer.cache_type == "skew":
+            dp_rank = get_dp_group().rank_in_group
+            max_reqs_per_dp = args.infer.max_reqs // args.infer.dp_size + int(
+                dp_rank < args.infer.max_reqs % args.infer.dp_size
+            )
+            set_slot_handle(max_reqs_per_dp, args.infer.pp_size)
 
         init_moe_impl(args)
 

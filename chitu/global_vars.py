@@ -43,13 +43,6 @@ def set_global_variables(global_args=None, debug=False):
     _set_debug(debug)
     set_global_args(global_args)
     _set_timers()
-    if global_args is not None:
-        _set_slot_handle(
-            global_args.infer.max_reqs,
-            global_args.infer.pp_size,
-            global_args.infer.dp_size,
-            global_args.infer.cache_type,
-        )
 
 
 def expand_layers(spec):
@@ -155,11 +148,10 @@ def get_debug():
     return _GLOBAL_DEBUG
 
 
-def _set_slot_handle(max_reqs, pp_size, dp_size, cache_type):
+def set_slot_handle(max_reqs, pp_size):
     global _GLOBAL_SLOT_HANDLE
     # _ensure_var_is_not_initialized(_GLOBAL_SLOT_HANDLE, "slot_handle")
-    if cache_type == "skew" and dp_size <= 1:
-        _GLOBAL_SLOT_HANDLE = SlotHandle(max_reqs, pp_size)
+    _GLOBAL_SLOT_HANDLE = SlotHandle(max_reqs, pp_size)
 
 
 def _set_tensorboard_writer(args):
