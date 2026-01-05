@@ -3,7 +3,7 @@ from omegaconf import OmegaConf
 
 from chitu.task import Task, TaskPool, MockFixedLengthedUserRequest
 from chitu.scheduler import Scheduler, SkewScheduler
-from chitu.global_vars import set_global_args, _set_slot_handle, get_global_args
+from chitu.global_vars import set_global_args, set_slot_handle, get_global_args
 from chitu.backend import Backend
 import pytest
 from chitu.task_type import TaskType, TaskDecodeType
@@ -152,11 +152,9 @@ def test_chunked_prefill_skew():
     )
 
     infer_args = get_global_args().infer
-    _set_slot_handle(
+    set_slot_handle(
         infer_args.max_reqs,
         infer_args.pp_size,
-        infer_args.dp_size,
-        infer_args.cache_type,
     )
 
     TaskPool.reset()
@@ -305,11 +303,9 @@ def test_priority_prefill_first_skew():
     )
 
     infer_args = get_global_args().infer
-    _set_slot_handle(
+    set_slot_handle(
         infer_args.max_reqs,
         infer_args.pp_size,
-        infer_args.dp_size,
-        infer_args.cache_type,
     )
 
     TaskPool.reset()
@@ -457,11 +453,9 @@ def test_priority_fcfs_skew():
         need_ensure=False,
     )
     infer_args = get_global_args().infer
-    _set_slot_handle(
+    set_slot_handle(
         infer_args.max_reqs,
         infer_args.pp_size,
-        infer_args.dp_size,
-        infer_args.cache_type,
     )
 
     TaskPool.reset()
@@ -621,11 +615,9 @@ def test_priority_request_preset_over_prefill_first_skew():
         need_ensure=False,
     )
     infer_args = get_global_args().infer
-    _set_slot_handle(
+    set_slot_handle(
         infer_args.max_reqs,
         infer_args.pp_size,
-        infer_args.dp_size,
-        infer_args.cache_type,
     )
 
     TaskPool.reset()
@@ -787,14 +779,7 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
 def test_evict_decode_task():
     set_global_args(
         OmegaConf.create(
-            {
-                "infer": {
-                    "max_seq_len": 5123,
-                    "cache_type": "paged",
-                    "op_impl": "torch",
-                    "cache_type": "paged",
-                }
-            }
+            {"infer": {"max_seq_len": 5123, "cache_type": "paged", "op_impl": "torch"}}
         ),
         need_ensure=False,
     )
@@ -1022,11 +1007,9 @@ def test_slot_group_skew():
         need_ensure=False,
     )
     infer_args = get_global_args().infer
-    _set_slot_handle(
+    set_slot_handle(
         infer_args.max_reqs,
         infer_args.pp_size,
-        infer_args.dp_size,
-        infer_args.cache_type,
     )
 
     TaskPool.reset()

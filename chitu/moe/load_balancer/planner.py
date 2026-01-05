@@ -594,9 +594,7 @@ class MoELoadPlanner:
             donor_counts = temp_counts.index_select(0, donor_ids)
             receiver_counts = temp_counts.index_select(0, receiver_ids)
             donor_slot = int(argmax_exclude_negative(donor_counts).item())
-            donor_slot_load = donor_counts[donor_slot]
             receiver_slot = int(argmin_exclude_negative(receiver_counts).item())
-            receiver_slot_load = receiver_counts[receiver_slot]
 
             action = MoveExpertAction(
                 layer_id=layer_id,

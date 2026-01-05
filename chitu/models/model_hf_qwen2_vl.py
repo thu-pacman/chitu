@@ -23,15 +23,8 @@ from chitu.models.model_hf_llama import (
     get_linear_layout_contig_y,
 )
 from chitu.models.registry import ModelType, register_model
-from chitu.ops import apply_rotary_pos_emb, silu_and_mul
-from chitu.quantization import QuantizationRegistry
-from chitu.tensor_parallel import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    LocalLinear,
-    VocabParallelEmbedding,
-)
-from chitu.distributed.parallel_state import get_tp_size, get_tp_group
+from chitu.ops import apply_rotary_pos_emb
+from chitu.tensor_parallel import ColumnParallelLinear, LocalLinear
 from chitu.utils import try_import_opt_dep
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")

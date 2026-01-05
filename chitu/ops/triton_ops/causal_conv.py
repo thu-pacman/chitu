@@ -5,7 +5,6 @@
 import torch
 import triton
 import triton.language as tl
-from chitu.ops.triton_ops.utils import to_triton_dtype
 
 
 @triton.jit

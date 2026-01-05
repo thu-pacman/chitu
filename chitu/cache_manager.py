@@ -917,32 +917,19 @@ class DenseKVCacheManager(KVCacheManagerBase):
         if slot_id is None:  # not in the hot slot
             return
 
-        if self.slot_handle:
-            # get end_idx in req_id slot
-            end_idx = 0
-            slot_end_idx = self.slot_handle.slot_end_idx
-            for idx in slot_end_idx:
-                if slot_id < idx:
-                    end_idx = idx
-                    break
-            assert end_idx > slot_id, "get the wrong id in skewkvcache"
-            slot_last_id = None
-            for idx in range(end_idx - 1, slot_id, -1):
-                if not self.slot_availability[idx]:
-                    slot_last_id = idx
-                    break
-        else:
-            slot_last_id = next(
-                (
-                    i
-                    for i in range(slot_id + 1, self.num_hot_req)
-                    if (
-                        not self.slot_availability[i]
-                        and (i + 1 >= self.num_hot_req or self.slot_availability[i + 1])
-                    )
-                ),
-                None,
-            )
+        # get end_idx in req_id slot
+        end_idx = 0
+        slot_end_idx = self.slot_handle.slot_end_idx
+        for idx in slot_end_idx:
+            if slot_id < idx:
+                end_idx = idx
+                break
+        assert end_idx > slot_id, "get the wrong id in skewkvcache"
+        slot_last_id = None
+        for idx in range(end_idx - 1, slot_id, -1):
+            if not self.slot_availability[idx]:
+                slot_last_id = idx
+                break
 
         if slot_last_id is not None:
             for key in self.kv_buffer:

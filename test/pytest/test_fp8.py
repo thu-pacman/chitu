@@ -19,6 +19,7 @@ from chitu.lazy import eval_lazy
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.utils import try_import_platform_dep, ceil_div
 from chitu.global_vars import set_global_args
+from chitu.testing import assert_close
 
 triton, has_triton = try_import_platform_dep("triton")
 
@@ -68,8 +69,8 @@ def test_silu_and_mul_and_blockfp8_act_quant(
         eval_lazy(silu_and_mul(a)), block_size=block_size
     )
 
-    assert torch.allclose(a_fp8.float(), a_fp8_ref.float(), atol=0.15, rtol=0.15)
-    assert torch.allclose(a_s.float(), a_s_ref.float(), atol=0.15, rtol=0.15)
+    assert_close(a_fp8.float(), a_fp8_ref.float(), atol=0.15, rtol=0.15)
+    assert_close(a_s.float(), a_s_ref.float(), atol=0.15, rtol=0.15)
 
 
 @pytest.mark.parametrize("E", [128])
@@ -119,8 +120,8 @@ def test_silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
     a_s[~mask] = 0
     a_s_ref[~mask] = 0
 
-    assert torch.allclose(a_out.float(), a_out_ref.float(), atol=0.15, rtol=0.15)
-    assert torch.allclose(a_s.float(), a_s_ref.float(), atol=0.15, rtol=0.15)
+    assert_close(a_out.float(), a_out_ref.float(), atol=0.15, rtol=0.15)
+    assert_close(a_s.float(), a_s_ref.float(), atol=0.15, rtol=0.15)
 
 
 @pytest.mark.parametrize("bs", [0, 1, 256])
@@ -162,7 +163,7 @@ def test_dequanted_gemm_is_close_to_fp8_gemm(
     dequant_b = blockfp8_weight_dequant(b, b_s)
     y = torch.nn.functional.linear(dequant_a, dequant_b)
 
-    assert torch.allclose(std_y, y, atol=0.15, rtol=0.15)
+    assert_close(std_y, y, atol=0.15, rtol=0.15)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -183,7 +184,7 @@ def test_soft_fp8_dequant_is_close_to_dequant(dtype: torch.dtype, record_benchma
     )
     soft_dequant_b = soft_fp8_blockfp8_weight_dequant(b, b_s)
 
-    assert torch.allclose(dequant_b, soft_dequant_b, atol=1e-2, rtol=1e-2)
+    assert_close(dequant_b, soft_dequant_b, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("bs", [0, 1, 256])
@@ -211,7 +212,7 @@ def test_soft_fp8_gemm_is_close_to_dequanted_gemm(
         impl="soft_fp8_gemm",
     )
 
-    assert torch.allclose(std_y, y, atol=1e-2, rtol=1e-2)
+    assert_close(std_y, y, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("b", [0, 1, 2])
@@ -246,7 +247,7 @@ def test_blockfp8_index_score_dense_dsv32(
         q_fp8, q_s, k_fp8, k_s, causal=causal, impl="torch"
     )
 
-    assert torch.allclose(output, output_ref, atol=0.15, rtol=0.15)
+    assert_close(output, output_ref, atol=0.15, rtol=0.15)
 
 
 @pytest.mark.parametrize("b", [0, 1, 2])
@@ -296,7 +297,7 @@ def test_blockfp8_index_score_ragged_q_dense_k_dsv32(
         q_fp8, q_s, k_fp8, k_s, seq_len_delta, causal=causal, impl="torch"
     )
 
-    assert torch.allclose(output, output_ref, atol=0.15, rtol=0.15)
+    assert_close(output, output_ref, atol=0.15, rtol=0.15)
 
 
 @pytest.mark.parametrize("b", [0, 1, 2])
@@ -368,4 +369,4 @@ def test_blockfp8_index_score_ragged_q_paged_k_dsv32(
         impl="torch",
     )
 
-    assert torch.allclose(output, output_ref, atol=0.15, rtol=0.15)
+    assert_close(output, output_ref, atol=0.15, rtol=0.15)

@@ -12,7 +12,6 @@ import torch
 import triton
 import triton.language as tl
 
-from chitu.device_type import is_muxi, is_nvidia
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,

@@ -33,7 +33,7 @@ void init_compute(py::module &m) {
     m.def("cuda_route_gate", &route_gate, "");
     m.def("cuda_rotary_pos_emb_llama", &rotary_pos_emb_llama, "q"_a, "k"_a,
           "freqs_cis_cos"_a, "freqs_cis_sin"_a, "q_out"_a = std::nullopt,
-          "k_out"_a = std::nullopt, "");
+          "k_out"_a = std::nullopt, "rotary_type"_a = "interleaved", "");
     m.def("cuda_rms_norm", &rms_norm, "x"_a, "w"_a, "eps"_a,
           "out"_a = std::nullopt, "");
     m.def("weight_layout_change", &weight_layout_change, "");

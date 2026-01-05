@@ -20,21 +20,12 @@ from chitu.utils import (
 )
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.device_type import is_muxi
+from chitu.testing import assert_close
 
 triton, has_triton = try_import_platform_dep("triton")
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-
-
-def check_close(x, y):
-    if x.numel() == 0:
-        return x.shape == y.shape
-    x, y = x.double(), y.double()
-    denominator = (x * x + y * y).sum()
-    sim = 2 * (x * y).sum() / denominator
-    diff = 1 - sim
-    return diff < 0.002
 
 
 @pytest.mark.parametrize("bs", [0, 1, 3])
@@ -167,7 +158,7 @@ def test_mla_prefill_ragged_qkvo(
         topk_indices=topk_indices,
     )
 
-    assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
+    assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("bs", [0, 1, 8])
@@ -300,7 +291,6 @@ def test_mla_prefill_ragged_qo_paged_kv(
         softmax_scale=softmax_scale,
     )
 
-    kv_cache_2 = kv_cache.clone()
     ref_out = ref_backend.mla_prefill_ragged_qo_paged_kv(
         q_nope,
         q_pe,
@@ -311,7 +301,7 @@ def test_mla_prefill_ragged_qo_paged_kv(
         softmax_scale=softmax_scale,
     )
 
-    assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
+    assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
 
     # this test is complex, not add record benchmark now
 
@@ -455,7 +445,7 @@ def test_mla_decode_dense_kv(
         topk_indices=topk_indices,
     )
 
-    assert torch.allclose(y, y_ref, atol=1e-2, rtol=1e-2)
+    assert_close(y, y_ref, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("bs", [0, 1, 64])
@@ -610,12 +600,12 @@ def test_mla_decode_paged_kv(
         topk_indices=topk_indices,
     )
 
+    cos_sim_tol = 0.0
     if impl == "npu":
         # Results of impl="npu" is not stable. You may find a small number of items have
         # a large error after multiple runs.
-        assert check_close(y, y_ref)  # TODO: Does it make sense?
-    else:
-        assert torch.allclose(y, y_ref, atol=1e-2, rtol=1e-2)
+        cos_sim_tol = 0.002  # TODO: Does it make sense?
+    assert_close(y, y_ref, atol=1e-2, rtol=1e-2, cos_sim_tol=cos_sim_tol)
 
 
 @pytest.mark.parametrize("bs", [0, 1, 9])
@@ -736,12 +726,12 @@ def test_prefill_ragged_qkvo(
         softmax_scale=0.1352337788608801,
     )
 
+    cos_sim_tol = 0.0
     if impl == "npu":
         # Results of impl="npu" is not stable. You may find a small number of items have
         # a large error after multiple runs.
-        assert check_close(out, ref_out)  # TODO: Does it make sense?
-    else:
-        assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
+        cos_sim_tol = 0.002  # TODO: Does it make sense?
+    assert_close(out, ref_out, atol=1e-2, rtol=1e-2, cos_sim_tol=cos_sim_tol)
 
 
 @pytest.mark.parametrize("prev_seq_len_list", [[], [509, 19, 15, 22]])
@@ -884,7 +874,7 @@ def test_decode_dense_kv(
         softmax_scale=None,
     )
 
-    assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
+    assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("prev_seq_len_list", [[], [509, 19, 15, 282]])
@@ -1009,4 +999,4 @@ def test_decode_paged_kv(
         softmax_scale=softmax_scale,
     )
 
-    assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
+    assert_close(out, ref_out, atol=1e-2, rtol=1e-2)

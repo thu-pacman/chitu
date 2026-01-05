@@ -8,7 +8,6 @@ Integrates PD components into cinfer scheduler service
 """
 
 import asyncio
-import time
 import logging
 from typing import Optional
 import os

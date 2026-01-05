@@ -6,7 +6,6 @@ import logging
 import functools
 import torch
 import torch_npu
-import os
 import torch.distributed as dist
 from torch_npu.contrib import transfer_to_npu
 
@@ -229,7 +228,6 @@ def fused_experts_npu_with_a2a_communication(
     )
 
     if use_int8_w8a8:
-        counts = torch.empty_like(tokens_per_local_expert)
         counts = tokens_per_local_expert.to(torch.int64)
 
     group_list = tokens_per_local_expert.to(torch.int64)
@@ -674,7 +672,6 @@ def try_get_npu_profiler(
 ):
 
     try:
-        import os
         import torch_npu
     except ImportError:
         raise ImportError("torch_npu is not installed")

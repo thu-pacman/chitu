@@ -3,6 +3,7 @@ import pytest
 
 from chitu.ops import hadamard_transform
 from chitu.utils import try_import_opt_dep
+from chitu.testing import assert_close
 
 scipy, has_scipy = try_import_opt_dep("scipy", "scipy")
 fast_hadamard_transform, has_fast_hadamard_transform = try_import_opt_dep(
@@ -21,4 +22,4 @@ def test_hadamard_transform(bs, dim):
     scale = dim**-0.5
     y = hadamard_transform(x, scale, impl="fast_hadamard_transform")
     y_ref = hadamard_transform(x, scale, impl="scipy")
-    assert torch.allclose(y, y_ref, rtol=1e-2, atol=1e-2)
+    assert_close(y, y_ref, rtol=1e-2, atol=1e-2)

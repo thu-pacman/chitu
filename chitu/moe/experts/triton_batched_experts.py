@@ -9,7 +9,6 @@ import triton
 import triton.language as tl
 
 from chitu.ops import silu_and_mul
-from chitu.ops.triton_ops.activation import silu_and_mul_triton_with_expert_mask
 from chitu.moe.batched_routed_activation import PerExpertDenseBatchedRoutedActivation
 
 

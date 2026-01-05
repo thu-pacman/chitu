@@ -14,6 +14,7 @@ from chitu.ops import (
 )
 from chitu.device_type import has_native_fp8, is_hopper
 from chitu.utils import try_import_platform_dep
+from chitu.testing import assert_close
 
 triton, has_triton = try_import_platform_dep("triton")
 
@@ -93,7 +94,7 @@ def test_fp4_raise_to_bf16_gemm_is_close_to_dequanted_gemm(dim, record_benchmark
         impl="fp4_bf16_gemm",
     )
 
-    assert torch.allclose(std_y, y, atol=0.1, rtol=0.1)
+    assert_close(std_y, y, atol=0.1, rtol=0.1)
 
 
 @pytest.mark.parametrize("dim", [256])
@@ -141,4 +142,4 @@ def test_fp4_raise_to_fp8_gemm_is_close_to_dequanted_gemm(dim, record_benchmark)
         impl="fp4_fp8_gemm",
     )
 
-    assert torch.allclose(std_y, y, atol=0.1, rtol=0.1)
+    assert_close(std_y, y, atol=0.1, rtol=0.1)

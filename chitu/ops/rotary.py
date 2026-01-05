@@ -69,45 +69,45 @@ def apply_rotary_pos_emb_cuda(
         assert k.numel() == 0
         return (q_out if q_out is not None else q), (k_out if k_out is not None else k)
 
-    if rotary_type == "interleaved":
-        q_shape = q.shape
-        k_shape = k.shape
+    q_shape = q.shape
+    k_shape = k.shape
 
-        if q.dim() == 4:
-            q = q.view(-1, q_shape[-2], q_shape[-1])
-            if q_out is not None:
-                q_out = q_out.view(-1, q_shape[-2], q_shape[-1])
-        elif q.dim() == 3:
-            pass
-        elif q.dim() == 2:
-            q = q.view(-1, 1, q_shape[-1])
-            if q_out is not None:
-                q_out = q_out.view(-1, 1, q_shape[-1])
-        else:
-            assert False
-        if k.dim() == 4:
-            k = k.view(-1, k_shape[-2], k_shape[-1])
-            if k_out is not None:
-                k_out = k_out.view(-1, k_shape[-2], k_shape[-1])
-        elif k.dim() == 3:
-            pass
-        elif k.dim() == 2:
-            k = k.view(-1, 1, k_shape[-1])
-            if k_out is not None:
-                k_out = k_out.view(-1, 1, k_shape[-1])
-        else:
-            assert False
-
-        q_out, k_out = chitu_backend.cuda_rotary_pos_emb_llama(
-            q, k, freqs_cis.cos, freqs_cis.sin, q_out=q_out, k_out=k_out
-        )
-
-        return q_out.view(q_shape), k_out.view(k_shape)
-
+    if q.dim() == 4:
+        q = q.view(-1, q_shape[-2], q_shape[-1])
+        if q_out is not None:
+            q_out = q_out.view(-1, q_shape[-2], q_shape[-1])
+    elif q.dim() == 3:
+        pass
+    elif q.dim() == 2:
+        q = q.view(-1, 1, q_shape[-1])
+        if q_out is not None:
+            q_out = q_out.view(-1, 1, q_shape[-1])
     else:
-        raise NotImplementedError(
-            f"Unsupported rotary type: {rotary_type} for CUDA implementation"
-        )
+        assert False
+    if k.dim() == 4:
+        k = k.view(-1, k_shape[-2], k_shape[-1])
+        if k_out is not None:
+            k_out = k_out.view(-1, k_shape[-2], k_shape[-1])
+    elif k.dim() == 3:
+        pass
+    elif k.dim() == 2:
+        k = k.view(-1, 1, k_shape[-1])
+        if k_out is not None:
+            k_out = k_out.view(-1, 1, k_shape[-1])
+    else:
+        assert False
+
+    q_out, k_out = chitu_backend.cuda_rotary_pos_emb_llama(
+        q,
+        k,
+        freqs_cis.cos,
+        freqs_cis.sin,
+        q_out=q_out,
+        k_out=k_out,
+        rotary_type=rotary_type,
+    )
+
+    return q_out.view(q_shape), k_out.view(k_shape)
 
 
 def apply_rotary_pos_emb_torch(
@@ -399,7 +399,6 @@ def apply_rotary_pos_emb(
         [0]: Rotated query
         [1]: Rotated key
     """
-
     assert q.dtype == k.dtype
     assert freqs_cis.cos.dtype == freqs_cis.sin.dtype
 
@@ -435,7 +434,7 @@ def apply_rotary_pos_emb(
             )
         ) and has_triton:
             impl = "triton"
-        elif rotary_type == "interleaved" and has_chitu_backend:
+        elif has_chitu_backend:
             impl = "cuda"
         elif has_torch_npu:
             if (

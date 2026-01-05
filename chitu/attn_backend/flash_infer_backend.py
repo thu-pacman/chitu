@@ -4,7 +4,6 @@
 
 from typing import Optional
 from typing_extensions import override
-import bisect
 
 import torch
 
@@ -462,8 +461,6 @@ class FlashInferBackend(TritonAttnBackend):
             raise NotImplementedError()
 
         batch_size = q.shape[0]
-        block_size = kv_cache.k.shape[1]
-
         if batch_size == 0:
             return torch.empty(
                 0, q.shape[1], kv_cache.v.shape[-1], device=q.device, dtype=q.dtype

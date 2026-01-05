@@ -60,10 +60,55 @@ __global__ void rotary_pos_emb_llama_kernel(
 }
 
 template <typename T, typename U>
+__global__ void rotary_pos_emb_separated_kernel(
+    const T *q, const T *k, const U *__restrict__ freqs_cis_cos,
+    const U *__restrict__ freqs_cis_sin, T *q_out, T *k_out, size_t batch_size,
+    size_t q_n_heads, size_t k_n_heads, size_t n_hidden, size_t q_batch_stride,
+    size_t k_batch_stride, size_t q_head_stride, size_t k_head_stride,
+    size_t cos_sin_stride) {
+    // NOTE: No restrict pointers because `q` may be alias to `q_out` and `k`
+    // may be alias to `k_out`
+
+    const size_t tid = threadIdx.x;
+    // This block calculate q[i, j]
+    size_t i = blockIdx.x;
+    size_t j = blockIdx.y;
+
+    size_t half_dim = n_hidden / 2;
+    // Each thread calculates the values of two adjacent positions at once
+    for (size_t t = tid; t < half_dim; t += blockDim.x) {
+        size_t cos_sin_idx = i * cos_sin_stride + t;
+
+        float c = to_scalar<float>(freqs_cis_cos[cos_sin_idx]);
+        float s = to_scalar<float>(freqs_cis_sin[cos_sin_idx]);
+
+        if (j < q_n_heads) {
+            size_t q_offset = i * q_batch_stride + j * q_head_stride;
+            size_t q1_idx = q_offset + t;
+            size_t q2_idx = q1_idx + half_dim;
+            float q1 = to_scalar<float>(q[q1_idx]);
+            float q2 = to_scalar<float>(q[q2_idx]);
+            q_out[q1_idx] = to_scalar<T>(q1 * c - q2 * s);
+            q_out[q2_idx] = to_scalar<T>(q2 * c + q1 * s);
+        }
+
+        if (j < k_n_heads) {
+            size_t k_offset = i * k_batch_stride + j * k_head_stride;
+            size_t k1_idx = k_offset + t;
+            size_t k2_idx = k1_idx + half_dim;
+            float k1 = to_scalar<float>(k[k1_idx]);
+            float k2 = to_scalar<float>(k[k2_idx]);
+            k_out[k1_idx] = to_scalar<T>(k1 * c - k2 * s);
+            k_out[k2_idx] = to_scalar<T>(k2 * c + k1 * s);
+        }
+    }
+}
+
+template <typename T, typename U>
 void rotary_pos_emb_llama_impl(torch::Tensor q, torch::Tensor k,
                                torch::Tensor freqs_cis_cos,
                                torch::Tensor freqs_cis_sin, torch::Tensor q_out,
-                               torch::Tensor k_out) {
+                               torch::Tensor k_out, std::string rotary_type) {
     ASSERTWITH(q.dim() == 3, "Tensor q should be 3D");
     ASSERTWITH(k.dim() == 3, "Tensor q should be 3D");
     ASSERTWITH(freqs_cis_cos.dim() == 2, "Tensor freqs_cis_cos should be 2D");
@@ -109,27 +154,52 @@ void rotary_pos_emb_llama_impl(torch::Tensor q, torch::Tensor k,
     dim3 block_dim(thread_per_block);
     size_t shared_mem_size = 0;
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    rotary_pos_emb_llama_kernel<<<grid_dim, block_dim, shared_mem_size,
-                                  stream>>>(
-        reinterpret_cast<typename map_to_cuda_type<T>::type *>(q.data_ptr<T>()),
-        reinterpret_cast<typename map_to_cuda_type<T>::type *>(k.data_ptr<T>()),
-        reinterpret_cast<typename map_to_cuda_type<U>::type *>(
-            freqs_cis_cos.data_ptr<U>()),
-        reinterpret_cast<typename map_to_cuda_type<U>::type *>(
-            freqs_cis_sin.data_ptr<U>()),
-        reinterpret_cast<typename map_to_cuda_type<T>::type *>(
-            q_out.data_ptr<T>()),
-        reinterpret_cast<typename map_to_cuda_type<T>::type *>(
-            k_out.data_ptr<T>()),
-        q_shape[0], q_shape[1], k_shape[1], q_shape[2], q.stride(0),
-        k.stride(0), q.stride(1), k.stride(1), freqs_cis_cos.stride(0));
+
+    if (rotary_type == "separated") {
+        rotary_pos_emb_separated_kernel<<<grid_dim, block_dim, shared_mem_size,
+                                          stream>>>(
+            reinterpret_cast<typename map_to_cuda_type<T>::type *>(
+                q.data_ptr<T>()),
+            reinterpret_cast<typename map_to_cuda_type<T>::type *>(
+                k.data_ptr<T>()),
+            reinterpret_cast<typename map_to_cuda_type<U>::type *>(
+                freqs_cis_cos.data_ptr<U>()),
+            reinterpret_cast<typename map_to_cuda_type<U>::type *>(
+                freqs_cis_sin.data_ptr<U>()),
+            reinterpret_cast<typename map_to_cuda_type<T>::type *>(
+                q_out.data_ptr<T>()),
+            reinterpret_cast<typename map_to_cuda_type<T>::type *>(
+                k_out.data_ptr<T>()),
+            q_shape[0], q_shape[1], k_shape[1], q_shape[2], q.stride(0),
+            k.stride(0), q.stride(1), k.stride(1), freqs_cis_cos.stride(0));
+    } else if (rotary_type == "interleaved") {
+        rotary_pos_emb_llama_kernel<<<grid_dim, block_dim, shared_mem_size,
+                                      stream>>>(
+            reinterpret_cast<typename map_to_cuda_type<T>::type *>(
+                q.data_ptr<T>()),
+            reinterpret_cast<typename map_to_cuda_type<T>::type *>(
+                k.data_ptr<T>()),
+            reinterpret_cast<typename map_to_cuda_type<U>::type *>(
+                freqs_cis_cos.data_ptr<U>()),
+            reinterpret_cast<typename map_to_cuda_type<U>::type *>(
+                freqs_cis_sin.data_ptr<U>()),
+            reinterpret_cast<typename map_to_cuda_type<T>::type *>(
+                q_out.data_ptr<T>()),
+            reinterpret_cast<typename map_to_cuda_type<T>::type *>(
+                k_out.data_ptr<T>()),
+            q_shape[0], q_shape[1], k_shape[1], q_shape[2], q.stride(0),
+            k.stride(0), q.stride(1), k.stride(1), freqs_cis_cos.stride(0));
+    } else {
+        ASSERTWITH(false,
+                   "Unsupported rotary_type: " + rotary_type +
+                       ". Only 'separated' and 'interleaved' are supported.");
+    }
 }
 
-std::tuple<torch::Tensor, torch::Tensor>
-rotary_pos_emb_llama(torch::Tensor q, torch::Tensor k,
-                     torch::Tensor freqs_cis_cos, torch::Tensor freqs_cis_sin,
-                     std::optional<torch::Tensor> q_out,
-                     std::optional<torch::Tensor> k_out) {
+std::tuple<torch::Tensor, torch::Tensor> rotary_pos_emb_llama(
+    torch::Tensor q, torch::Tensor k, torch::Tensor freqs_cis_cos,
+    torch::Tensor freqs_cis_sin, std::optional<torch::Tensor> q_out,
+    std::optional<torch::Tensor> k_out, std::string rotary_type) {
     if (!q_out.has_value()) {
         q_out = torch::empty_like(q);
     }
@@ -164,7 +234,8 @@ rotary_pos_emb_llama(torch::Tensor q, torch::Tensor k,
             freqs_cis_cos.scalar_type(), "rotary_pos_emb_llama_kernel", [&] {
                 using U = scalar_t;
                 rotary_pos_emb_llama_impl<T, U>(q, k, freqs_cis_cos,
-                                                freqs_cis_sin, *q_out, *k_out);
+                                                freqs_cis_sin, *q_out, *k_out,
+                                                rotary_type);
             });
     });
 

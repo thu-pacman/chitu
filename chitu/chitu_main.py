@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-import logging
 import operator
 import os
 from logging import getLogger
@@ -31,13 +30,11 @@ from chitu.task import (
     PackedTasks,
     PackedTasksBase,
     SerializedPackedTasksPayloadType,
-    BatchResult,
     Task,
     TaskPool,
     TaskType,
     UserRequest,
     MockFixedLengthedUserRequest,
-    TaskCollector,
     DPTaskCollector,
     PPTaskCollector,
 )

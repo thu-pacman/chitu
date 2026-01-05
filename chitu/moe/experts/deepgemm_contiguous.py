@@ -8,16 +8,13 @@ from typing import Optional
 
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
-    ExpertBlockPermutedBatchedRoutedActivationBlock,
+    ExpertBlockPermutedBatchedRoutedActivationNormal,
     IndexedBatchedRoutedActivation,
     IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
     IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
     ExpertBlockPermutedBatchedRoutedActivationBlockfp8,
 )
-from chitu.moe.batched_expert_result import (
-    ExpertBlockPermutedBatchedExpertResult,
-    PerTokenBatchedExpertResult,
-)
+from chitu.moe.batched_expert_result import ExpertBlockPermutedBatchedExpertResult
 from chitu.ops import silu_and_mul
 from chitu.ops.quant import blockfp8_act_quant
 from chitu.ops.triton_ops.quant_gemm import tma_align_input_scale
@@ -85,7 +82,7 @@ def _(
     if out is None and inplace:
         out = hidden_states.activation
 
-    new_hidden_states = ExpertBlockPermutedBatchedRoutedActivationBlock.convert_from(
+    new_hidden_states = ExpertBlockPermutedBatchedRoutedActivationNormal.convert_from(
         hidden_states, block_size=128
     )
     del hidden_states
@@ -117,7 +114,7 @@ def _(
 
 @deepgemm_contiguous_fused_expert.register
 def _(
-    hidden_states: ExpertBlockPermutedBatchedRoutedActivationBlock,
+    hidden_states: ExpertBlockPermutedBatchedRoutedActivationNormal,
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_weights: torch.Tensor,

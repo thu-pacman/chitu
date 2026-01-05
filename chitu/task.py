@@ -356,6 +356,8 @@ class MsgPackableTask:
     # output related
     return_logprobs: bool = False
     _test_flag: bool = False
+    # PP schedule related
+    sched_group_id: Optional[int] = None
 
 
 class Task:
@@ -639,12 +641,6 @@ class Task:
             + self.next_req_tokens_len
         ]
 
-    def next_req_tokens(self):
-        return self.prefix_tokens[
-            self.consumed_req_tokens : self.consumed_req_tokens
-            + self.next_req_tokens_len
-        ]
-
     def consume_req_tokens(self):
         """
         Advance prefill progress after processing tokens.
@@ -716,6 +712,7 @@ class Task:
             prefill_chunk_size=self.prefill_chunk_size,
             return_logprobs=self.return_logprobs,
             _test_flag=self._test_flag,
+            sched_group_id=self.sched_group_id,
         )
 
 
@@ -1038,7 +1035,6 @@ class PackedTasksBase:
             num_tasks = 0
             task_ids = []
             req_ids = []
-            num_tokens = 0
             for it, has_model_run in enumerate(self.has_model_run):
                 if has_model_run:
                     num_tasks += 1
@@ -1149,6 +1145,13 @@ class PackedTasks(PackedTasksBase):
             dtype=torch.float32,
             pin_memory=True,
         ).to(device=self.rank, non_blocking=True)
+
+        slot_handle = get_slot_handle()
+        sched_group_id = self.tasks[0].sched_group_id
+        if slot_handle and sched_group_id is not None:
+            slot_handle.set_slot_idx(
+                sched_group_id
+            )  # To inform kvcache the current dealing sgroup_id
 
         if self.should_apply_frequency_penalty:
             if PackedTasksBase.response_list_manager is None:
@@ -1366,6 +1369,7 @@ def deserialize_prefill_tasks(data: bytes) -> PackedTasks:
             task = Task(task_id=tid, req=None, params=params, tokens=tokens)
             task.return_logprobs = td.get("return_logprobs", False)
             task._test_flag = td.get("_test_flag", False)
+            task.sched_group_id = td.get("sched_group_id", None)
             TaskPool.add(task)
 
         task.consumed_req_tokens = consumed

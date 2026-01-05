@@ -3,6 +3,7 @@ import pytest
 
 from chitu.models.model_hf_qwen3_next import Qwen3NextRMSNormGated
 from chitu.utils import try_import_platform_dep
+from chitu.testing import assert_close
 
 triton, has_triton = try_import_platform_dep("triton")
 
@@ -38,9 +39,9 @@ def test_rms_norm_gate(bsz, dim, impl, default_dtype, compute_dtype, weight_dtyp
     y = NormGate(x.clone(), gate.clone(), compute_dtype=compute_dtype, impl=impl)
 
     if default_dtype == torch.bfloat16 or default_dtype == torch.float16:
-        assert torch.allclose(y_ref, y, rtol=1e-2, atol=1e-2)
+        assert_close(y_ref, y, rtol=1e-2, atol=1e-2)
     else:
-        assert torch.allclose(y_ref, y, rtol=1e-3, atol=1e-3)
+        assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize(
@@ -77,6 +78,6 @@ def test_rms_norm_gate_inplace(
     NormGate(x.clone(), gate.clone(), out=y, compute_dtype=compute_dtype, impl=impl)
 
     if default_dtype == torch.bfloat16 or default_dtype == torch.float16:
-        assert torch.allclose(y_ref, y, rtol=1e-2, atol=1e-2)
+        assert_close(y_ref, y, rtol=1e-2, atol=1e-2)
     else:
-        assert torch.allclose(y_ref, y, rtol=1e-3, atol=1e-3)
+        assert_close(y_ref, y, rtol=1e-3, atol=1e-3)

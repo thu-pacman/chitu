@@ -6,6 +6,7 @@ from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.ops import apply_rotary_pos_emb
 from chitu.native_layout import NativeLayoutTensor, ColumnOddEvenSeparatedTensor
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
+from chitu.testing import assert_close
 
 triton, has_triton = try_import_platform_dep("triton")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
@@ -48,11 +49,8 @@ def test_apply_rotary_pos_emb(
             triton.language, "interleave"
         ):
             pytest.skip("This op require Triton to support tl.interleave")
-    if impl == "cuda":
-        if not has_chitu_backend:
-            pytest.skip("chitu_backend is not available, skipping CUDA tests")
-        if rotary_type in ["separated", "separated-half", "interleaved-half"]:
-            pytest.skip("This op is not implemented in CUDA yet")
+    if impl == "cuda" and not has_chitu_backend:
+        pytest.skip("chitu_backend is not available, skipping CUDA tests")
     if impl in ["torch_npu", "torch_npu_with_output_layout"] and not has_torch_npu:
         pytest.skip("torch_npu is missing")
     if impl == "torch_npu_with_output_layout":
@@ -112,8 +110,8 @@ def test_apply_rotary_pos_emb(
     # Use rtol and atol for more precise comparison
     rtol = 5e-3
     atol = 5e-3
-    assert torch.all(torch.isclose(out_q, out_q_torch, rtol=rtol, atol=atol))
-    assert torch.all(torch.isclose(out_k, out_k_torch, rtol=rtol, atol=atol))
+    assert_close(out_q, out_q_torch, rtol=rtol, atol=atol)
+    assert_close(out_k, out_k_torch, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize(
@@ -152,11 +150,8 @@ def test_apply_rotary_pos_emb_in_place(
             triton.language, "interleave"
         ):
             pytest.skip("This op require Triton to support tl.interleave")
-    if impl == "cuda":
-        if not has_chitu_backend:
-            pytest.skip("chitu_backend is not available, skipping CUDA tests")
-        if rotary_type in ["separated", "separated-half", "interleaved-half"]:
-            pytest.skip("This op is not implemented in CUDA yet")
+    if impl == "cuda" and not has_chitu_backend:
+        pytest.skip("chitu_backend is not available, skipping CUDA tests")
     if impl in ["torch_npu", "torch_npu_with_output_layout"] and not has_torch_npu:
         pytest.skip("torch_npu is missing")
     if impl == "torch_npu_with_output_layout":
@@ -239,5 +234,5 @@ def test_apply_rotary_pos_emb_in_place(
     # Use rtol and atol for more precise comparison
     rtol = 5e-3
     atol = 5e-3
-    assert torch.all(torch.isclose(out_q, out_q_torch, rtol=rtol, atol=atol))
-    assert torch.all(torch.isclose(out_k, out_k_torch, rtol=rtol, atol=atol))
+    assert_close(out_q, out_q_torch, rtol=rtol, atol=atol)
+    assert_close(out_k, out_k_torch, rtol=rtol, atol=atol)

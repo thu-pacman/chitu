@@ -56,7 +56,7 @@ import sys
 import math
 import atexit
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional
 
 import pytest
 
@@ -368,7 +368,7 @@ class BenchmarkRecorder:
                 x_val=N,
                 impl="triton",
             )
-            assert torch.allclose(out, ref_out)
+            chitu.testing.assert_close(out, ref_out)
 
         Args:
             fn: Callable to benchmark and get result from.
