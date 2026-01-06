@@ -21,7 +21,7 @@ muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
 if has_triton and torch.cuda.is_available():
     from chitu.ops.triton_ops import (
         batched_routed_activation_indexed_to_expert_block_indexed_triton,
-        batched_routed_activation_indexed_to_expert_block_permute_triton,
+        batched_routed_activation_indexed_to_expert_block_permuted_triton,
         batched_routed_activation_indexed_to_expert_block_permuted_blockfp8_triton,
     )
 
@@ -275,41 +275,48 @@ def batched_routed_activation_indexed_to_expert_block_permuted(
     n_tokens_per_expert_padded: torch.Tensor,
     impl: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """BF16 version of indexed -> expert-block-permuted.
+    """
+    16-bit version of indexed -> expert-block-permuted.
 
     This mirrors the layout transformation of
     `batched_routed_activation_indexed_to_expert_block_permuted_blockfp8` but
-    without using real quantization scales. It reuses the Triton kernel by
-    passing a dummy activation_scale tensor and then discarding the produced
-    scale output.
+    without using real quantization scales.
 
     Returns:
-        [0]: blocked_activation            (bf16) [n_blocks, block_size, hidden]
+        [0]: blocked_activation            (16-bit) [n_blocks, block_size, hidden]
         [1]: token_comma_topk_to_block_x_item_indices
         [2]: block_to_expert_indices       [n_blocks, block_size]
     """
-    if has_triton:
-        # Match fp8 layout: [n_tokens, hidden // quant_block_size]. We choose
+
+    if impl == "auto":
+        if has_triton:
+            impl = "triton"
+        else:
+            raise NotImplementedError(
+                "No available implementation found for "
+                "batched_routed_activation_indexed_to_expert_block_permuted"
+            )
+
+    if impl == "triton":
         (
             blocked_activation,
             token_comma_topk_to_block_x_item_indices,
             block_to_expert_indices,
-        ) = batched_routed_activation_indexed_to_expert_block_permute_triton(
+        ) = batched_routed_activation_indexed_to_expert_block_permuted_triton(
             activation,
             token_to_expert_indices,
             block_size=block_size,
             n_tokens_padded=n_tokens_padded,
             n_tokens_per_expert_padded=n_tokens_per_expert_padded,
         )
-        # Ensure bf16 output
-        blocked_activation = blocked_activation.to(torch.bfloat16)
+        assert blocked_activation.dtype == torch.get_default_dtype()
         return (
             blocked_activation,
             token_comma_topk_to_block_x_item_indices,
             block_to_expert_indices,
         )
     else:
-        raise NotImplementedError(f"Unsupported implementation since no triton.")
+        raise NotImplementedError(f"Unsupported implementation: {impl}")
 
 
 def batched_routed_activation_indexed_to_concat_permuted(

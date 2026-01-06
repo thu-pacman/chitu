@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -210,16 +212,26 @@ def _fwd_kernel_ep_scatter_1(
 ):
     cur_expert = tl.program_id(0)
 
-    offset_cumsum = tl.arange(0, BLOCK_EXPERT_NUM)
-    tokens_per_expert = tl.load(
-        num_recv_tokens_per_expert + offset_cumsum,
-        mask=offset_cumsum < num_experts,
+    expert_offset = tl.arange(0, BLOCK_EXPERT_NUM)
+
+    if cur_expert == 0:
+        # Only the first threadblock computes `expert_start_loc`
+        tokens_per_expert = tl.load(
+            num_recv_tokens_per_expert + expert_offset,
+            mask=expert_offset < num_experts,
+            other=0,
+        )
+        cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
+        tl.store(
+            expert_start_loc + expert_offset, cumsum, mask=expert_offset < num_experts
+        )
+
+    tokens_per_expert_before_cur = tl.load(
+        num_recv_tokens_per_expert + expert_offset,
+        mask=expert_offset < cur_expert,
         other=0,
     )
-    cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
-    tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
-
-    cur_expert_start = tl.load(expert_start_loc + cur_expert)
+    cur_expert_start = tl.sum(tokens_per_expert_before_cur)
     cur_expert_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
 
     m_indices_start_ptr = m_indices + cur_expert_start
@@ -259,6 +271,7 @@ def _fwd_kernel_ep_scatter_2(
     HIDDEN_SIZE_PAD: tl.constexpr,
     SCALE_HIDDEN_SIZE: tl.constexpr,
     SCALE_HIDDEN_SIZE_PAD: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
 ):
     start_token_id = tl.program_id(0)
     grid_num = tl.num_programs(0)
@@ -266,14 +279,17 @@ def _fwd_kernel_ep_scatter_2(
     offset_in = tl.arange(0, HIDDEN_SIZE_PAD)
     mask = offset_in < HIDDEN_SIZE
 
-    offset_in_s = tl.arange(0, SCALE_HIDDEN_SIZE_PAD)
-    mask_s = offset_in_s < SCALE_HIDDEN_SIZE
+    if HAS_SCALE:
+        offset_in_s = tl.arange(0, SCALE_HIDDEN_SIZE_PAD)
+        mask_s = offset_in_s < SCALE_HIDDEN_SIZE
 
     for token_id in range(start_token_id, total_token_num, grid_num):
         to_copy = tl.load(recv_x + token_id * recv_x_stride0 + offset_in, mask=mask)
-        to_copy_s = tl.load(
-            recv_x_scale + token_id * recv_x_scale_stride0 + offset_in_s, mask=mask_s
-        )
+        if HAS_SCALE:
+            to_copy_s = tl.load(
+                recv_x_scale + token_id * recv_x_scale_stride0 + offset_in_s,
+                mask=mask_s,
+            )
 
         for topk_index in tl.range(0, topk_num, 1, num_stages=4):
             expert_id = tl.load(recv_topk + token_id * recv_topk_stride0 + topk_index)
@@ -286,22 +302,26 @@ def _fwd_kernel_ep_scatter_2(
                 output_tensor_ptr = (
                     output_tensor + dest_token_index * output_tensor_stride0
                 )
-                output_tensor_scale_ptr = (
-                    output_tensor_scale + dest_token_index * output_tensor_scale_stride0
-                )
                 tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
-                tl.store(output_tensor_scale_ptr + offset_in_s, to_copy_s, mask=mask_s)
+                if HAS_SCALE:
+                    output_tensor_scale_ptr = (
+                        output_tensor_scale
+                        + dest_token_index * output_tensor_scale_stride0
+                    )
+                    tl.store(
+                        output_tensor_scale_ptr + offset_in_s, to_copy_s, mask=mask_s
+                    )
 
 
 @torch.no_grad()
 def ep_scatter(
     recv_x: torch.Tensor,
-    recv_x_scale: torch.Tensor,
+    recv_x_scale: Optional[torch.Tensor],
     recv_topk: torch.Tensor,
     num_recv_tokens_per_expert: torch.Tensor,
     expert_start_loc: torch.Tensor,
     output_tensor: torch.Tensor,
-    output_tensor_scale: torch.Tensor,
+    output_tensor_scale: Optional[torch.Tensor],
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
 ):
@@ -310,11 +330,16 @@ def ep_scatter(
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
     hidden_size = recv_x.shape[1]
-    # grid = (triton.cdiv(hidden_size, BLOCK_D), num_experts)
-    grid = num_experts
 
     assert m_indices.shape[0] % BLOCK_E == 0
 
+    if recv_x_scale is not None:
+        assert output_tensor_scale is not None
+        has_scale = True
+    else:
+        has_scale = False
+
+    grid = num_experts
     _fwd_kernel_ep_scatter_1[(grid,)](
         num_recv_tokens_per_expert,
         expert_start_loc,
@@ -326,7 +351,6 @@ def ep_scatter(
     )
 
     grid = min(recv_topk.shape[0], 1024 * 8)
-
     _fwd_kernel_ep_scatter_2[(grid,)](
         recv_topk.shape[0],
         expert_start_loc,
@@ -334,8 +358,8 @@ def ep_scatter(
         recv_x.stride(0),
         recv_x.stride(1),
         recv_x_scale,
-        recv_x_scale.stride(0),
-        recv_x_scale.stride(1),
+        recv_x_scale.stride(0) if recv_x_scale is not None else 0,
+        recv_x_scale.stride(1) if recv_x_scale is not None else 0,
         recv_topk,
         recv_topk.stride(0),
         recv_topk.stride(1),
@@ -343,8 +367,8 @@ def ep_scatter(
         output_tensor.stride(0),
         output_tensor.stride(1),
         output_tensor_scale,
-        output_tensor_scale.stride(0),
-        output_tensor_scale.stride(1),
+        output_tensor_scale.stride(0) if output_tensor_scale is not None else 0,
+        output_tensor_scale.stride(1) if output_tensor_scale is not None else 0,
         output_index,
         output_index.stride(0),
         output_index.stride(1),
@@ -354,6 +378,7 @@ def ep_scatter(
         HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
         SCALE_HIDDEN_SIZE=hidden_size // BLOCK_D,
         SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size // BLOCK_D),
+        HAS_SCALE=has_scale,
     )
     return
 
@@ -411,7 +436,7 @@ def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8_triton(
     )
 
 
-def batched_routed_activation_indexed_to_expert_block_permute_triton(
+def batched_routed_activation_indexed_to_expert_block_permuted_triton(
     activation: torch.Tensor,
     token_to_expert_indices: torch.Tensor,
     *,
@@ -423,54 +448,27 @@ def batched_routed_activation_indexed_to_expert_block_permute_triton(
     n_blocks = n_tokens_padded // block_size
 
     expert_start_loc = torch.empty_like(n_tokens_per_expert_padded)
-
     blocked_activation = torch.empty(
         n_tokens_padded,
         *activation.shape[1:],
         dtype=activation.dtype,
         device=activation.device,
     )
-
-    BLOCK_D = 128
-    hidden_size = activation.shape[1]
-    scale_hidden = max(hidden_size // BLOCK_D, 1)
-
-    recv_x_scale = torch.ones(
-        activation.shape[0],
-        scale_hidden,
-        dtype=activation.dtype,
-        device=activation.device,
-    )
-    output_tensor_scale = torch.empty(
-        n_tokens_padded,
-        scale_hidden,
-        dtype=activation.dtype,
-        device=activation.device,
-    )
-
     block_to_expert_indices = torch.empty(
         n_tokens_padded, device=activation.device, dtype=torch.int32
     )
     token_comma_topk_to_block_x_item_indices = token_to_expert_indices.clone()
-
-    BLOCK_E = 128
-    max_n_blocks = n_tokens_padded // BLOCK_E + 1
-    m_indices = torch.empty(
-        max_n_blocks * BLOCK_E, device=activation.device, dtype=torch.int32
-    )
-
     ep_scatter(
-        activation,  # recv_x
-        recv_x_scale,  # recv_x_scale (dummy)
-        token_to_expert_indices,  # recv_topk
-        n_tokens_per_expert_padded,  # num_recv_tokens_per_expert
+        activation,
+        None,  # no activation_scale
+        token_to_expert_indices,
+        n_tokens_per_expert_padded,
         expert_start_loc,
-        blocked_activation,  # output_tensor
-        output_tensor_scale,  # output_tensor_scale (dummy)
-        m_indices,
+        blocked_activation,
+        None,  # no blocked_activation_scale
+        block_to_expert_indices,
         token_comma_topk_to_block_x_item_indices,
     )
-
     return (
         blocked_activation.view(n_blocks, block_size, *activation.shape[1:]),
         token_comma_topk_to_block_x_item_indices,

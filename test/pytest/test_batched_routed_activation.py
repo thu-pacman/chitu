@@ -3,6 +3,7 @@ import pytest
 
 from chitu.ops import (
     batched_routed_activation_indexed_to_expert_block_indexed,
+    batched_routed_activation_indexed_to_expert_block_permuted,
     batched_routed_activation_indexed_to_expert_block_permuted_blockfp8,
     batched_routed_activation_indexed_to_concat_permuted,
 )
@@ -176,6 +177,84 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
             assert torch.all(
                 activation_scale[token_id]
                 == blocked_activation_scale[permuted_block_id, permtued_id_in_block]
+            )
+
+
+@pytest.mark.parametrize("num_experts", [256])
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("num_tokens", [0, 64, 4096])
+@pytest.mark.parametrize("hidden_size", [7168])
+@pytest.mark.parametrize("quant_block_size", [128])
+@pytest.mark.parametrize("topk", [8])
+@pytest.mark.parametrize("distribution", ["imbalance", "uniform"])
+@pytest.mark.parametrize("impl", ["triton"])
+def test_batched_routed_activation_indexed_to_expert_block_permuted(
+    num_experts,
+    block_size,
+    num_tokens,
+    hidden_size,
+    quant_block_size,
+    topk,
+    distribution,
+    impl,
+):
+    if impl == "triton" and not has_triton:
+        pytest.skip("triton is missing")
+
+    torch.set_default_dtype(torch.bfloat16)
+
+    assert hidden_size % quant_block_size == 0
+    activation = torch.rand(
+        (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+    ).to(torch.bfloat16)
+
+    if distribution == "imbalance":
+        token_to_expert_indices = torch.arange(
+            topk, dtype=torch.int32, device="cuda:0"
+        ).repeat(num_tokens, 1)
+    elif distribution == "uniform":
+        token_to_expert_indices = torch.randint(
+            0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda:0"
+        )
+
+    n_tokens_per_expert_list = [0] * num_experts
+    for i in range(token_to_expert_indices.shape[0]):
+        for j in range(token_to_expert_indices.shape[1]):
+            assert token_to_expert_indices[i, j] >= 0
+            assert token_to_expert_indices[i, j] < num_experts
+            n_tokens_per_expert_list[token_to_expert_indices[i, j]] += 1
+    n_tokens_per_expert_padded_list = [
+        ceil_div(n, block_size) * block_size for n in n_tokens_per_expert_list
+    ]
+    n_tokens_padded = sum(n_tokens_per_expert_padded_list)
+    n_tokens_per_expert_padded = torch.tensor(
+        n_tokens_per_expert_padded_list, dtype=torch.int32, device="cuda"
+    )
+
+    (
+        blocked_activation,
+        token_comma_topk_to_block_x_item_indices,
+        block_to_expert_indices,
+    ) = batched_routed_activation_indexed_to_expert_block_permuted(
+        activation,
+        token_to_expert_indices,
+        block_size=block_size,
+        n_tokens_padded=n_tokens_padded,
+        n_tokens_per_expert_padded=n_tokens_per_expert_padded,
+    )
+
+    for token_id in range(token_to_expert_indices.shape[0]):
+        for selected_expert_id in range(token_to_expert_indices.shape[1]):
+            expert_id = token_to_expert_indices[token_id, selected_expert_id]
+            permuted_row_id = token_comma_topk_to_block_x_item_indices[
+                token_id, selected_expert_id
+            ]
+            permuted_block_id = permuted_row_id // block_size
+            permtued_id_in_block = permuted_row_id % block_size
+            assert torch.all(block_to_expert_indices[permuted_block_id] == expert_id)
+            assert torch.all(
+                activation[token_id]
+                == blocked_activation[permuted_block_id, permtued_id_in_block]
             )
 
 

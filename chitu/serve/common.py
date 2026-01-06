@@ -7,7 +7,6 @@ Common service functions for Chitu serve module.
 """
 
 import asyncio
-import logging
 from logging import getLogger
 
 import torch
