@@ -4,6 +4,10 @@
 # No CI scripts
 **/.gitlab-ci.yml
 
+# Dockerfile is not needed inside the images
+**/Dockerfile
+**/*.Dockerfile
+
 # Byte-compiled / optimized / DLL files
 **/__pycache__/
 **/*.py[cod]
