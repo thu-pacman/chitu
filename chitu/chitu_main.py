@@ -78,7 +78,7 @@ def init_logger():
 def init_cache_static():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(0)
+        torch.cuda.reset_peak_memory_stats()
 
 
 def get_additional_block_num(cache_manager, memory_utilization=0.98):
@@ -114,14 +114,17 @@ def get_additional_block_num(cache_manager, memory_utilization=0.98):
         )
         num_blocks = int(additional_memory) // block_mem
         return max(0, num_blocks)
-
+    current_device = torch.cuda.current_device()
     torch.cuda.synchronize()  # Wait for all kernels to finish before we can get peak memory usage
-    _, total_memory = torch.cuda.mem_get_info(0)
-    peak_memory = torch.cuda.memory_stats(0)["allocated_bytes.all.peak"]
+    _, total_memory = torch.cuda.mem_get_info(current_device)
+    peak_memory = torch.cuda.memory_stats(current_device)["allocated_bytes.all.peak"]
     torch.cuda.empty_cache()
-    torch_allocated_bytes = torch.cuda.memory_stats(0)["allocated_bytes.all.current"]
+    torch_allocated_bytes = torch.cuda.memory_stats(current_device)[
+        "allocated_bytes.all.current"
+    ]
     total_allocated_bytes = (
-        torch.cuda.mem_get_info(0)[1] - torch.cuda.mem_get_info(0)[0]
+        torch.cuda.mem_get_info(current_device)[1]
+        - torch.cuda.mem_get_info(current_device)[0]
     )
     non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
     if non_torch_allocations > 0:
