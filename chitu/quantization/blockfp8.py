@@ -210,6 +210,7 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         layer_id: int,
         ############################################
         # No parameters specific to this quantization
+        block_size: int = 128,
     ):
         """
         Initializes the MoE module.
@@ -241,7 +242,6 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         assert dtype.itemsize == 1
 
         gate_up_proj_in_features = dim
-        block_size = 128
 
         if self.merge_gate_up:
             self.gate_up_proj_weight = torch.nn.Parameter(
