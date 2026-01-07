@@ -24,6 +24,7 @@ from chitu.device_type import is_blackwell
 
 # replace the buffer setting with DeepEP to concurrently enbale ll mode and normal mode, need more test to verify.
 from chitu.moe.token_dispatchers.buffercontroller import DeepEPBuffer
+import os
 
 deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 
@@ -45,6 +46,9 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
     ):
         super().__init__(tp_group=tp_group, dp_group=dp_group, ep_group=ep_group)
         self.num_experts = num_experts
+        os.environ["DEEPEP_DISABLE_LL_DISPATCH_OPT"] = (
+            "0" if self.ep_group.group_size % 8 == 0 else "1"
+        )
         self._buffer = None
         self.hidden = hidden
         self.mode = mode
