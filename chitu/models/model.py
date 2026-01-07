@@ -1299,12 +1299,13 @@ class ParallelMoeBlock(nn.Module):
             enable_dynamic_load_balance = get_global_args().infer.moe_lb_trigger > 0
         self.enable_dynamic_load_balance = enable_dynamic_load_balance
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, inplace: bool = True) -> torch.Tensor:
         """
         Forward pass for the MoE block.
 
         Args:
             x (torch.Tensor): Input tensor.
+            inplace (bool): If True, this function may touch `x`.
 
         Returns:
             torch.Tensor: Output tensor after expert routing and computation.
@@ -1365,7 +1366,10 @@ class ParallelMoeBlock(nn.Module):
             experts_impl = self.moe_impl.get_experts_impl()
 
         y = self.experts(
-            routed_x, weights, inplace=not x_in_use_simultenously, impl=experts_impl
+            routed_x,
+            weights,
+            inplace=inplace and not x_in_use_simultenously,
+            impl=experts_impl,
         )
 
         if shared_y is not None and self.moe_impl.tp_size > 1:
