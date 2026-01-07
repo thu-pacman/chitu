@@ -190,6 +190,10 @@
   用法: 启动赤兔时追加 `models=Qwen3-Next-80B-A3B-Instruct` 启动参数
 - Qwen3-Next-80B-A3B-Instruct-FP8
   用法: 启动赤兔时追加 `models=Qwen3-Next-80B-A3B-Instruct-FP8` 启动参数
+- Qwen3-VL-235B-A22B-Instruct
+  用法: 启动赤兔时追加 `models=Qwen3-VL-235B-A22B-Instruct` 启动参数
+- Qwen3-VL-8B-Instruct
+  用法: 启动赤兔时追加 `models=Qwen3-VL-8B-Instruct` 启动参数
 - Seed-OSS-36B-Instruct
   用法: 启动赤兔时追加 `models=Seed-OSS-36B-Instruct` 启动参数
 - glm-4-9b-chat
