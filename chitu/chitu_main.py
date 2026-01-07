@@ -716,20 +716,18 @@ def chitu_run_main_rank():
         assert len(Backend.schedulers) == 1
         task_ids = Backend.schedulers[0].schedule()
     else:
-        task_ids_list = []
-        strict_allowed_task_type = {TaskType.Prefill, TaskType.Decode}
-        for scheduler in Backend.schedulers:
-            task_ids = scheduler.schedule(
-                strict_allowed_task_type=strict_allowed_task_type
-            )
-            if len(task_ids) > 0:
-                strict_allowed_task_type = strict_allowed_task_type.intersection(
-                    {TaskPool.pool[task_ids[0]].task_type}
+        strict_allowed_task_type_list = [{TaskType.Prefill}, {TaskType.Decode}]
+        for strict_allowed_task_type in strict_allowed_task_type_list:
+            task_ids_list = []
+            for scheduler in Backend.schedulers:
+                task_ids = scheduler.schedule(
+                    strict_allowed_task_type=strict_allowed_task_type
                 )
-            task_ids_list.append(task_ids)
-        if any((len(task_ids) > 0 for task_ids in task_ids_list)):
-            DPTaskCollector.prepare_dp_tasks(task_ids_list)
-            task_ids = task_ids_list[0]
+                task_ids_list.append(task_ids)
+            if any((len(task_ids) > 0 for task_ids in task_ids_list)):
+                DPTaskCollector.prepare_dp_tasks(task_ids_list)
+                task_ids = task_ids_list[0]
+                break
         else:
             task_ids = []
 
