@@ -117,8 +117,6 @@ COPY --from=wheel_builder /tmp/ /tmp/
 # compile at install time, and the compile results are environment dependent.
 RUN bash -c "pip install -i https://pypi.tuna.tsinghua.edu.cn/simple /tmp/*.whl -c <(pip list --format freeze | grep -v -e 'pillow' -e 'fsspec' -e 'flash-mla' -e 'flash_mla')"
 
-COPY ./flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl /tmp/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
-RUN pip install /tmp/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
 RUN pip install triton==3.4.0 -i https://pypi.tuna.tsinghua.edu.cn/simple
 RUN rm -rf /tmp/*
 COPY ./test ./test

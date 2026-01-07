@@ -7,7 +7,7 @@ import torch
 
 from chitu.utils import try_import_and_setup_torch_npu
 from chitu.quantization.base import QuantizedLinearBase, QuantizedMoeExpertsBase
-from chitu.distributed.parallel_state import get_tp_group, get_ep_size
+from chitu.distributed.parallel_state import get_tp_group
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.native_layout import (
     enable_native_layout_weight,
@@ -265,8 +265,6 @@ class AscendW8A8DynamicMoeExperts(
             merge_gate_up,
             layer_id,
         )
-
-        gate_up_proj_in_features = dim
 
         if self.merge_gate_up:
             self.gate_up_proj_weight = torch.nn.Parameter(

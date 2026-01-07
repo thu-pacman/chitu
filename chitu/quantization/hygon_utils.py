@@ -24,11 +24,7 @@ def hygon_native_linear(
     return torch.matmul(x, w)
 
 
-@QuantizationRegistry.register_linear(
-    None,
-    when=lambda: is_hygon(),
-    priority=1,
-)
+@QuantizationRegistry.register_linear(None, when=is_hygon, priority=1)
 class InXOutLinear(
     enable_native_layout_weight("weight", InXOutWeight),
     NormalLinear,

@@ -8,12 +8,6 @@ from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase
 from chitu.ops.quant import w4a8_gemm_per_token_per_group_asymm, a8_per_token_act_quant
 
-from chitu.native_layout import (
-    enable_native_layout_weight,
-    Packed4BitWeightAlongK,
-    Packed4BitWeightQServe,
-)
-
 
 @QuantizationRegistry.register_linear("w4a8_per_token_per_group_asymm")
 class W4A8PerTokenPerGroupAsymmLinear(
