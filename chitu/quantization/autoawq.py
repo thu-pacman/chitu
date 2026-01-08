@@ -9,6 +9,28 @@ from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase
 
 
+def _patch_transformers_activations_for_awq() -> None:
+    """
+    Compat patch for AWQ with newer transformers.
+
+    Newer `transformers` removed `PytorchGELUTanh`, but AWQ still imports it:
+        from transformers.activations import ... PytorchGELUTanh ...
+
+    Reference / upstream context:
+    - https://github.com/huggingface/transformers/issues/41447
+    This workaround is expected to be officially addressed in transformers 5.0.0.
+    """
+    import transformers.activations as activations
+
+    if hasattr(activations, "PytorchGELUTanh"):
+        return
+
+    if hasattr(activations, "GELUTanh"):
+        # Use setattr to avoid static checkers complaining about dynamic attribute creation.
+        setattr(activations, "PytorchGELUTanh", activations.GELUTanh)
+        return
+
+
 @QuantizationRegistry.register_linear("autoawq")
 class AutoAWQLinear(QuantizedLinearBase):
     """
@@ -26,6 +48,7 @@ class AutoAWQLinear(QuantizedLinearBase):
         # No parameters specific to this quantization
     ):
         super().__init__(in_features, out_features, has_bias)
+        _patch_transformers_activations_for_awq()
         from awq.modules.linear import WQLinear_GEMM
 
         wqlinear = WQLinear_GEMM(
@@ -52,6 +75,7 @@ class AutoAWQLinear(QuantizedLinearBase):
         self.out_features = wqlinear.out_features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _patch_transformers_activations_for_awq()
         from awq.modules.linear.gemm import WQLinearMMFunction
 
         x = eval_lazy(x)

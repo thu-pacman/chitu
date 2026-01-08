@@ -142,7 +142,6 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
     n_tokens_per_expert_padded_list = [
         ceil_div(n, block_size) * block_size for n in n_tokens_per_expert_list
     ]
-    n_tokens_padded = sum(n_tokens_per_expert_padded_list)
     n_tokens_per_expert_padded = torch.tensor(
         n_tokens_per_expert_padded_list, dtype=torch.int32, device="cuda"
     )
@@ -157,7 +156,7 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
         activation_scale,
         token_to_expert_indices,
         block_size=block_size,
-        n_tokens_padded=n_tokens_padded,
+        num_experts=num_experts,
         n_tokens_per_expert_padded=n_tokens_per_expert_padded,
     )
 
@@ -226,7 +225,6 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted(
     n_tokens_per_expert_padded_list = [
         ceil_div(n, block_size) * block_size for n in n_tokens_per_expert_list
     ]
-    n_tokens_padded = sum(n_tokens_per_expert_padded_list)
     n_tokens_per_expert_padded = torch.tensor(
         n_tokens_per_expert_padded_list, dtype=torch.int32, device="cuda"
     )
@@ -239,7 +237,7 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted(
         activation,
         token_to_expert_indices,
         block_size=block_size,
-        n_tokens_padded=n_tokens_padded,
+        num_experts=num_experts,
         n_tokens_per_expert_padded=n_tokens_per_expert_padded,
     )
 

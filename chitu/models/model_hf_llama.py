@@ -8,6 +8,7 @@ from typing import Any
 from typing_extensions import override
 
 import torch
+from typing import Any
 import torch.nn.functional as F
 from torch import nn
 
@@ -395,6 +396,7 @@ class TransformerHFLlama(Transformer):
         layer_type: type = TransformerBlockHFLlama,
         **kvargs,
     ):
+        self.rotary_emb: Any = None
         self.rotary_type = rotary_type
         self.layer_type = layer_type
         super().__init__(

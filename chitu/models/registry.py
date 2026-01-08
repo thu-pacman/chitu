@@ -12,6 +12,8 @@ class ModelType(str, Enum):
     HF_LLAMA = "hf-llama"
     HF_QWEN_3_MOE = "hf-qwen-3-moe"
     HF_QWEN2_VL = "hf-qwen2-vl"
+    HF_QWEN3_VL = "hf-qwen3-vl"
+    HF_QWEN3_VL_MOE = "hf-qwen3-vl-moe"
     HF_GLM_Z1 = "hf-glm-z1"
     HF_GLM_4_MOE = "hf-glm-4-moe"
     HF_GPT_OSS = "hf-gpt-oss"

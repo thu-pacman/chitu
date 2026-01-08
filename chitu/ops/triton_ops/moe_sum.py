@@ -177,6 +177,9 @@ def moe_sum_expert_block_permuted_triton(
     *,
     out: Optional[torch.Tensor] = None,
 ):
+    if x.numel() == 0:
+        return torch.empty(0, x.shape[-1], device=x.device, dtype=x.dtype)
+
     x = x.view(-1, x.shape[-1])
 
     num_tokens, topk = topk_weights.shape

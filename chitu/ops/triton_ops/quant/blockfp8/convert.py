@@ -40,8 +40,16 @@ def blockfp8_act_quant_triton(
     ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
+
+    if x.numel() >= 2147483648:
+        INDEX_DTYPE = tl.int64
+    else:
+        INDEX_DTYPE = tl.int32
+
     grid = lambda meta: (triton.cdiv(x.numel(), meta["BLOCK_SIZE"]),)
-    blockfp8_act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
+    blockfp8_act_quant_kernel[grid](
+        x, y, s, BLOCK_SIZE=block_size, INDEX_DTYPE=INDEX_DTYPE
+    )
     return y, s
 
 
@@ -55,7 +63,9 @@ def _(x: silu_and_mul.lazy_tensor_type(), block_size: int = 128):
 
 
 @triton.jit
-def blockfp8_act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
+def blockfp8_act_quant_kernel(
+    x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr, INDEX_DTYPE: tl.constexpr
+):
     """
     Quantizes the input tensor `x_ptr` and stores the result in `y_ptr` and the scaling factor in `s_ptr`.
 
@@ -69,7 +79,7 @@ def blockfp8_act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
         None
     """
     pid = tl.program_id(axis=0)
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs = tl.cast(pid, INDEX_DTYPE) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     x = tl.load(x_ptr + offs).to(tl.float32)
     s = tl.maximum(tl.max(tl.abs(x)), 1e-10) / 448.0
     y = x / s
@@ -114,31 +124,42 @@ def silu_and_mul_and_blockfp8_act_quant_triton(
         dtype=torch.float32,
         device=x.device,
     )
+
+    if x.numel() >= 2147483648:
+        INDEX_DTYPE = tl.int64
+    else:
+        INDEX_DTYPE = tl.int32
+
     grid = lambda meta: (triton.cdiv(y.numel(), meta["BLOCK_SIZE"]),)
     silu_and_mul_and_blockfp8_act_quant_kernel[grid](
-        x, y, s, HIDDEN_DIM=y.size(-1), BLOCK_SIZE=block_size
+        x, y, s, HIDDEN_DIM=y.size(-1), BLOCK_SIZE=block_size, INDEX_DTYPE=INDEX_DTYPE
     )
     return y, s
 
 
 @triton.jit
 def silu_and_mul_and_blockfp8_act_quant_kernel(
-    x_ptr, y_ptr, s_ptr, HIDDEN_DIM: tl.constexpr, BLOCK_SIZE: tl.constexpr
+    x_ptr,
+    y_ptr,
+    s_ptr,
+    HIDDEN_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    INDEX_DTYPE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     dim_id = pid // (HIDDEN_DIM // BLOCK_SIZE)
     blk_id_in_dim = pid % (HIDDEN_DIM // BLOCK_SIZE)
     x1_offs = (
-        (dim_id * 2) * HIDDEN_DIM
-        + blk_id_in_dim * BLOCK_SIZE
+        tl.cast(dim_id * 2, INDEX_DTYPE) * HIDDEN_DIM
+        + tl.cast(blk_id_in_dim, INDEX_DTYPE) * BLOCK_SIZE
         + tl.arange(0, BLOCK_SIZE)
     )
     x2_offs = (
-        (dim_id * 2 + 1) * HIDDEN_DIM
-        + blk_id_in_dim * BLOCK_SIZE
+        tl.cast(dim_id * 2 + 1, INDEX_DTYPE) * HIDDEN_DIM
+        + tl.cast(blk_id_in_dim, INDEX_DTYPE) * BLOCK_SIZE
         + tl.arange(0, BLOCK_SIZE)
     )
-    y_offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    y_offs = tl.cast(pid, INDEX_DTYPE) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     x1 = tl.load(x_ptr + x1_offs).to(tl.float32)
     x2 = tl.load(x_ptr + x2_offs).to(tl.float32)
 

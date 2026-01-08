@@ -249,7 +249,8 @@ class Transformer(nn.Module):
             self.local_begin_layer_id = 0
             self.local_end_layer_id = self.global_n_layers
 
-        self.mtp_size = get_global_args().infer.mtp_size
+        # `get_global_args()` can be a Hydra/OmegaConf object; force to plain int for type checkers.
+        self.mtp_size = int(getattr(get_global_args().infer, "mtp_size", 1))
 
         if not self.pipeline_exec or self.pp_stage == 0:
             self._init_pre_layers()
@@ -413,14 +414,14 @@ class Transformer(nn.Module):
                     assert (
                         param.dim() == 1
                     ), f"{name} is expected to be 1D, but got {param.dim()}D"
-                    if param.shape[0] == 1:  # Broadcast
+                    if param.shape[-1] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        if param.shape[0] % tp_size != 0:
+                        if param.shape[-1] % tp_size != 0:
                             raise RuntimeError(
-                                f"Tensor {name}'s first dim {param.shape[0]} should be divisible by tp_size {tp_size}"
+                                f"Tensor {name}'s last dim {param.shape[-1]} should be divisible by tp_size {tp_size}"
                             )
-                        chunks = torch.chunk(param, tp_size, dim=0)
+                        chunks = torch.chunk(param, tp_size, dim=-1)
                         partial_checkpoint[name] = chunks[rank]
                 elif name.split(".")[-1] in self._get_1d_in_tensor_names(quant):
                     assert (
@@ -430,29 +431,29 @@ class Transformer(nn.Module):
                         partial_checkpoint[name] = param
                 elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names(quant):
                     assert (
-                        param.dim() == 2
-                    ), f"{name} is expected to be 2D, but got {param.dim()}D"
-                    if param.shape[0] == 1:  # Broadcast
+                        param.dim() >= 2
+                    ), f"{name} is expected to be >=2D, but got {param.dim()}D"
+                    if param.shape[-2] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        if param.shape[0] % tp_size != 0:
+                        if param.shape[-2] % tp_size != 0:
                             raise RuntimeError(
-                                f"Tensor {name}'s first dim {param.shape[0]} should be divisible by tp_size {tp_size}"
+                                f"Tensor {name}'s out dim {param.shape[-2]} should be divisible by tp_size {tp_size}"
                             )
-                        chunks = torch.chunk(param, tp_size, dim=0)
+                        chunks = torch.chunk(param, tp_size, dim=-2)
                         partial_checkpoint[name] = chunks[rank]
                 elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names(quant):
                     assert (
-                        param.dim() == 2
-                    ), f"{name} is expected to be 2D, but got {param.dim()}D"
-                    if param.shape[1] == 1:  # Broadcast
+                        param.dim() >= 2
+                    ), f"{name} is expected to be >=2D, but got {param.dim()}D"
+                    if param.shape[-1] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        if param.shape[1] % tp_size != 0:
+                        if param.shape[-1] % tp_size != 0:
                             raise RuntimeError(
-                                f"Tensor {name}'s second dim {param.shape[1]} should be divisible by tp_size {tp_size}"
+                                f"Tensor {name}'s out dim {param.shape[-1]} should be divisible by tp_size {tp_size}"
                             )
-                        chunks = torch.chunk(param, tp_size, dim=1)
+                        chunks = torch.chunk(param, tp_size, dim=-1)
                         partial_checkpoint[name] = chunks[rank]
                 else:
                     # FIXME: Support quant=llmint8 for TP
@@ -463,14 +464,14 @@ class Transformer(nn.Module):
                     assert (
                         param.dim() == 1
                     ), f"{name} is expected to be 1D, but got {param.dim()}D"
-                    if param.shape[0] == 1:  # Broadcast
+                    if param.shape[-1] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        if param.shape[0] % tp_size != 0:
+                        if param.shape[-1] % tp_size != 0:
                             raise RuntimeError(
-                                f"Tensor {name}'s first dim {param.shape[0]} should be divisible by tp_size {tp_size}"
+                                f"Tensor {name}'s last dim {param.shape[-1]} should be divisible by tp_size {tp_size}"
                             )
-                        chunks = torch.chunk(param, tp_size, dim=0)
+                        chunks = torch.chunk(param, tp_size, dim=-1)
                         partial_checkpoint[name] = chunks[rank]
                 elif name.split(".")[-1] in self._get_1d_out_tensor_names(quant):
                     assert (
@@ -482,26 +483,26 @@ class Transformer(nn.Module):
                     partial_checkpoint[name] = param
                 elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names(quant):
                     assert (
-                        param.dim() == 2
-                    ), f"{name} is expected to be 2D, but got {param.dim()}D"
-                    if param.shape[1] == 1:  # Broadcast
+                        param.dim() >= 2
+                    ), f"{name} is expected to be >=2D, but got {param.dim()}D"
+                    if param.shape[-1] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        if param.shape[1] % tp_size != 0:
+                        if param.shape[-1] % tp_size != 0:
                             raise RuntimeError(
-                                f"Tensor {name}'s second dim {param.shape[1]} should be divisible by tp_size {tp_size}"
+                                f"Tensor {name}'s in dim {param.shape[-1]} should be divisible by tp_size {tp_size}"
                             )
-                        chunks = torch.chunk(param, tp_size, dim=1)
+                        chunks = torch.chunk(param, tp_size, dim=-1)
                         partial_checkpoint[name] = chunks[rank]
                 elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names(quant):
                     assert (
-                        param.dim() == 2
-                    ), f"{name} is expected to be 2D, but got {param.dim()}D"
-                    if param.shape[0] == 1:  # Broadcast
+                        param.dim() >= 2
+                    ), f"{name} is expected to be >=2D, but got {param.dim()}D"
+                    if param.shape[-2] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        assert param.shape[0] % tp_size == 0
-                        chunks = torch.chunk(param, tp_size, dim=0)
+                        assert param.shape[-2] % tp_size == 0
+                        chunks = torch.chunk(param, tp_size, dim=-2)
                         partial_checkpoint[name] = chunks[rank]
                 else:
                     # FIXME: Support quant=llmint8 for TP
@@ -843,14 +844,23 @@ class Transformer(nn.Module):
         return h
 
     @torch.inference_mode()
-    def mtp_decode_no_pipeline_total(self, tokens, func, key, func_mtp, key_mtp):
+    def mtp_decode_no_pipeline_total(
+        self,
+        tokens,
+        func,
+        key,
+        func_mtp,
+        key_mtp,
+        extra_inputs: tuple[torch.Tensor, ...] = (),
+        extra_inputs_mtp: tuple[torch.Tensor, ...] = (),
+    ):
         token_list = []
         token_list.append(tokens)
         for i in range(0, self.mtp_size):
             self.cache.prepare_mtp_cache_decode(i)
             self.cache.update_page_offs()
             self.prepare_decoding_attn_mtp()
-            h = func_mtp(key_mtp, tokens)
+            h = func_mtp(key_mtp, tokens, *extra_inputs_mtp)
             tokens = torch.argmax(h, dim=-1)
             token_list.append(tokens)
         self.cache.update_page_offs()
@@ -867,7 +877,7 @@ class Transformer(nn.Module):
                 and self.moe_impl.decode_token_dispatcher_impl == "allgather"
             ):
                 self.moe_impl.prepare(TaskType.Decode, tokens_proposal.shape[0])
-        h = func(key, tokens_proposal)
+        h = func(key, tokens_proposal, *extra_inputs)
         tokens_proposal = tokens_proposal.view(-1, self.mtp_size)
         tokens_verify = torch.argmax(h, dim=-1).view(-1, self.mtp_size)
         h = h.view(-1, self.mtp_size, h.shape[-1])
@@ -966,6 +976,56 @@ class Transformer(nn.Module):
             block_size,
         )
 
+    def _decode_graph_extra_inputs(
+        self, tokens: torch.Tensor, batch_size: int
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[int, ...]]:
+        """
+        Optional extra tensor inputs for CUDA-graphed decode.
+
+        Why this exists:
+        - In CUDA graph replay, Python-side logic in `prepare_freqs_cis()` is NOT re-executed.
+        - If a model needs per-step dynamic values (e.g. per-request RoPE deltas) to affect freqs,
+          it must be provided as a tensor argument to the graphed callable so StaticTensor can update it.
+
+        Returns:
+            (extra_inputs, extra_inputs_max_nelem)
+            - extra_inputs: tuple of tensors passed to the graphed callable after `tokens`
+            - extra_inputs_max_nelem: matching tuple of maximum nelem for StaticTensor allocation
+        """
+        return (), ()
+
+    def _decode_graph_extra_inputs_mtp(
+        self, tokens: torch.Tensor, batch_size: int
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[int, ...]]:
+        """
+        Optional extra tensor inputs for CUDA-graphed MTP decode.
+
+        Same motivation as `_decode_graph_extra_inputs()`, but for the MTP decode callable.
+        """
+        return (), ()
+
+    def _prepare_freqs_cis_for_decode(
+        self, *extra_inputs: torch.Tensor
+    ) -> BatchedFreqsCis:
+        """
+        Build freqs_cis for decode inside the CUDA-graphed callable.
+
+        Default behavior: ignore extra inputs and defer to `prepare_freqs_cis()`.
+        Models may override this to incorporate extra tensor inputs (e.g. RoPE deltas).
+        """
+        return self.prepare_freqs_cis()
+
+    def _prepare_freqs_cis_for_decode_mtp(
+        self, *extra_inputs: torch.Tensor
+    ) -> BatchedFreqsCis:
+        """
+        Build freqs_cis for MTP decode inside the CUDA-graphed callable.
+
+        Default behavior: ignore extra inputs and defer to `prepare_freqs_cis_mtp()`.
+        Models may override this to incorporate extra tensor inputs (e.g. RoPE deltas).
+        """
+        return self.prepare_freqs_cis_mtp()
+
     @torch.inference_mode()
     def decode(self, tokens, batch_size):
         if isinstance(self.cache, DenseKVCacheManager):
@@ -989,6 +1049,16 @@ class Transformer(nn.Module):
         ):
             self.do_decode_callable = None
         self._last_cuda_graph_enabled = current_cuda_graph_enabled
+
+        extra_inputs, extra_inputs_max_nelem = self._decode_graph_extra_inputs(
+            tokens, batch_size
+        )
+        if self.mtp_size > 1:
+            extra_inputs_mtp, extra_inputs_mtp_max_nelem = (
+                self._decode_graph_extra_inputs_mtp(tokens, batch_size)
+            )
+        else:
+            extra_inputs_mtp, extra_inputs_mtp_max_nelem = (), ()
 
         if self.do_decode_callable is None:
 
@@ -1014,6 +1084,7 @@ class Transformer(nn.Module):
                     * tokens.numel()
                     // batch_size
                     * self.max_batch_size_per_dp,
+                    *extra_inputs_max_nelem,
                 ),
                 kwargs_max_nelem={},
                 output_max_nelem_callback=lambda key, n: n
@@ -1022,8 +1093,8 @@ class Transformer(nn.Module):
                 before_replay_callback=before_replay_callback,
                 enable=current_cuda_graph_enabled,
             )
-            def do_decode(tokens):
-                freqs_cis = self.prepare_freqs_cis()
+            def do_decode(tokens, *extra_inputs):
+                freqs_cis = self._prepare_freqs_cis_for_decode(*extra_inputs)
                 if self.pipeline_exec:
                     return self.decode_pipeline(tokens, freqs_cis)
                 else:
@@ -1036,6 +1107,7 @@ class Transformer(nn.Module):
                 @make_dispatched_graphed_callables(
                     args_max_nelem=(
                         tokens.numel() // batch_size * self.max_batch_size_per_dp,
+                        *extra_inputs_mtp_max_nelem,
                     ),
                     kwargs_max_nelem={},
                     output_max_nelem_callback=lambda key, n: n
@@ -1044,8 +1116,10 @@ class Transformer(nn.Module):
                     before_replay_callback=before_replay_callback,
                     enable=current_cuda_graph_enabled,
                 )
-                def do_decode_mtp(tokens):
-                    freqs_cis = self.prepare_freqs_cis_mtp()
+                def do_decode_mtp(tokens, *extra_inputs_mtp):
+                    freqs_cis = self._prepare_freqs_cis_for_decode_mtp(
+                        *extra_inputs_mtp
+                    )
                     return self.mtp_decode_no_pipeline(tokens, freqs_cis)
 
                 self.do_decode_callable_mtp = do_decode_mtp
@@ -1057,9 +1131,11 @@ class Transformer(nn.Module):
                 key + ("main",),
                 self.do_decode_callable_mtp,
                 key + ("mtp",),
+                extra_inputs,
+                extra_inputs_mtp,
             )
         else:
-            return self.do_decode_callable(key, tokens)
+            return self.do_decode_callable(key, tokens, *extra_inputs)
 
 
 class MoeGate(nn.Module):
@@ -1223,12 +1299,13 @@ class ParallelMoeBlock(nn.Module):
             enable_dynamic_load_balance = get_global_args().infer.moe_lb_trigger > 0
         self.enable_dynamic_load_balance = enable_dynamic_load_balance
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, inplace: bool = True) -> torch.Tensor:
         """
         Forward pass for the MoE block.
 
         Args:
             x (torch.Tensor): Input tensor.
+            inplace (bool): If True, this function may touch `x`.
 
         Returns:
             torch.Tensor: Output tensor after expert routing and computation.
@@ -1289,7 +1366,10 @@ class ParallelMoeBlock(nn.Module):
             experts_impl = self.moe_impl.get_experts_impl()
 
         y = self.experts(
-            routed_x, weights, inplace=not x_in_use_simultenously, impl=experts_impl
+            routed_x,
+            weights,
+            inplace=inplace and not x_in_use_simultenously,
+            impl=experts_impl,
         )
 
         if shared_y is not None and self.moe_impl.tp_size > 1:

@@ -41,8 +41,7 @@ def init_b_and_b_s(dim, block_size):
     )
 
 
-@pytest.mark.parametrize("bs", [0, 1, 256])
-@pytest.mark.parametrize("dim", [256])
+@pytest.mark.parametrize("bs,dim", [[0, 256], [1, 256], [256, 256], [409472, 6144]])
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(
@@ -52,6 +51,12 @@ def init_b_and_b_s(dim, block_size):
 def test_silu_and_mul_and_blockfp8_act_quant(
     bs, dim, block_size, dtype: torch.dtype, record_benchmark
 ):
+    if (
+        torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+        < bs * dim * dtype.itemsize * 20
+    ):
+        pytest.skip("No enough device memory on this platform")
+
     set_global_args(
         OmegaConf.create({"infer": {"op_impl": "torch"}}), need_ensure=False
     )

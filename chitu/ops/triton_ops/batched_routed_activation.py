@@ -207,6 +207,7 @@ def _fwd_kernel_ep_scatter_1(
     expert_start_loc,
     m_indices,
     num_experts: tl.constexpr,
+    N_INDICES: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_EXPERT_NUM: tl.constexpr,
 ):
@@ -232,16 +233,18 @@ def _fwd_kernel_ep_scatter_1(
         other=0,
     )
     cur_expert_start = tl.sum(tokens_per_expert_before_cur)
-    cur_expert_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
+    if cur_expert < num_experts:
+        cur_expert_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
+        expert_id_to_write = cur_expert
+    else:
+        cur_expert_token_num = N_INDICES - cur_expert_start
+        expert_id_to_write = -1
 
     m_indices_start_ptr = m_indices + cur_expert_start
     off_expert = tl.arange(0, BLOCK_E)
 
     for start_m in tl.range(0, cur_expert_token_num, BLOCK_E, num_stages=4):
-        tl.store(
-            m_indices_start_ptr + start_m + off_expert,
-            cur_expert,
-        )
+        tl.store(m_indices_start_ptr + start_m + off_expert, expert_id_to_write)
 
 
 @triton.jit
@@ -339,13 +342,16 @@ def ep_scatter(
     else:
         has_scale = False
 
-    grid = num_experts
+    # One threadblock for each expert to fill their own parts of `m_indices`.
+    # An additional threadblock to fill -1 to invalid blocks.
+    grid = num_experts + 1
     _fwd_kernel_ep_scatter_1[(grid,)](
         num_recv_tokens_per_expert,
         expert_start_loc,
         m_indices,
         num_experts=num_experts,
         num_warps=num_warps,
+        N_INDICES=m_indices.shape[0],
         BLOCK_E=BLOCK_E,
         BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
     )
@@ -380,7 +386,6 @@ def ep_scatter(
         SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size // BLOCK_D),
         HAS_SCALE=has_scale,
     )
-    return
 
 
 # SPDX-SnippetEnd
@@ -392,11 +397,40 @@ def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8_triton(
     token_to_expert_indices: torch.Tensor,
     *,
     block_size: int,
-    n_tokens_padded: int,
+    num_experts: int,
     n_tokens_per_expert_padded: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert n_tokens_padded % block_size == 0
-    n_blocks = n_tokens_padded // block_size
+    # Find the largest possible n_blocks: Suppose the first `num_experts` tokens each
+    # routed to a different expert, each occupying one block. For the reset
+    # `topk_ids.numel() - num_experts` tokens, every `block_size` tokens contributes
+    # to one block
+    n_blocks = (
+        min(num_experts, token_to_expert_indices.numel())
+        + max(token_to_expert_indices.numel() - num_experts, 0) // block_size
+    )
+    n_tokens_padded = n_blocks * block_size
+
+    if n_blocks == 0:
+        return (
+            torch.empty(
+                n_blocks,
+                block_size,
+                *activation.shape[1:],
+                device=activation.device,
+                dtype=activation.dtype,
+            ),
+            torch.empty(
+                n_blocks,
+                block_size,
+                *activation_scale.shape[1:],
+                device=activation_scale.device,
+                dtype=activation_scale.dtype,
+            ),
+            torch.empty(n_tokens_padded, device=activation.device, dtype=torch.int32),
+            torch.empty(
+                n_blocks, block_size, device=activation.device, dtype=torch.int32
+            ),
+        )
 
     expert_start_loc = torch.empty_like(n_tokens_per_expert_padded)
     blocked_activation = torch.empty(
@@ -441,11 +475,33 @@ def batched_routed_activation_indexed_to_expert_block_permuted_triton(
     token_to_expert_indices: torch.Tensor,
     *,
     block_size: int,
-    n_tokens_padded: int,
+    num_experts: int,
     n_tokens_per_expert_padded: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert n_tokens_padded % block_size == 0
-    n_blocks = n_tokens_padded // block_size
+    # Find the largest possible n_blocks: Suppose the first `num_experts` tokens each
+    # routed to a different expert, each occupying one block. For the reset
+    # `topk_ids.numel() - num_experts` tokens, every `block_size` tokens contributes
+    # to one block
+    n_blocks = (
+        min(num_experts, token_to_expert_indices.numel())
+        + max(token_to_expert_indices.numel() - num_experts, 0) // block_size
+    )
+    n_tokens_padded = n_blocks * block_size
+
+    if n_blocks == 0:
+        return (
+            torch.empty(
+                n_blocks,
+                block_size,
+                *activation.shape[1:],
+                device=activation.device,
+                dtype=activation.dtype,
+            ),
+            torch.empty(n_tokens_padded, device=activation.device, dtype=torch.int32),
+            torch.empty(
+                n_blocks, block_size, device=activation.device, dtype=torch.int32
+            ),
+        )
 
     expert_start_loc = torch.empty_like(n_tokens_per_expert_padded)
     blocked_activation = torch.empty(

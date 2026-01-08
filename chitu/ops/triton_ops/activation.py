@@ -63,12 +63,18 @@ def silu_and_mul_triton(x):
 
     # SPDX-SnippetEnd
 
+    if x.numel() >= 2147483648:
+        INDEX_DTYPE = tl.int64
+    else:
+        INDEX_DTYPE = tl.int32
+
     BLOCK_SIZE, _ = calculate_settings(n_cols // 2)
     silu_and_mul_kernel[(n_rows,)](
         output,
         x,
         n_cols // 2,
         BLOCK_SIZE=BLOCK_SIZE,
+        INDEX_DTYPE=INDEX_DTYPE,
     )
     return output
 
@@ -84,9 +90,15 @@ silu_and_mul_configs = [
 
 @triton.autotune(configs=silu_and_mul_configs, key=["output_n_cols"])
 @triton.jit
-def silu_and_mul_kernel(output_ptr, x_ptr, output_n_cols, BLOCK_SIZE: tl.constexpr):
+def silu_and_mul_kernel(
+    output_ptr,
+    x_ptr,
+    output_n_cols,
+    BLOCK_SIZE: tl.constexpr,
+    INDEX_DTYPE: tl.constexpr,
+):
     row_idx = tl.program_id(0)
-    row_start_ptr = x_ptr + row_idx * output_n_cols * 2
+    row_start_ptr = x_ptr + tl.cast(row_idx, INDEX_DTYPE) * output_n_cols * 2
     offsets = tl.arange(0, BLOCK_SIZE)
     part1 = tl.load(row_start_ptr + offsets, mask=(offsets < output_n_cols), other=0)
     part2 = tl.load(
@@ -96,7 +108,7 @@ def silu_and_mul_kernel(output_ptr, x_ptr, output_n_cols, BLOCK_SIZE: tl.constex
     silu_part1_fp32 = part1_fp32 / (1 + tl.exp(-1 * part1_fp32))
     silu_part1 = silu_part1_fp32.to(part1.dtype)
     result = silu_part1 * part2
-    output = output_ptr + row_idx * output_n_cols + offsets
+    output = output_ptr + tl.cast(row_idx, INDEX_DTYPE) * output_n_cols + offsets
     tl.store(output, result, mask=(offsets < output_n_cols))
 
 

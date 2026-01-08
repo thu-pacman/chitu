@@ -727,6 +727,12 @@ class Backend:
                         ).contiguous()
                     else:
                         param.data = param.data.cuda(non_blocking=non_blocking)
+                        if (
+                            Backend.args.models.type
+                            in ("hf-qwen3-vl", "hf-qwen3-vl-moe")
+                            and not param.data.is_contiguous()
+                        ):
+                            param.data = param.data.contiguous()
         for key in m._buffers:
             buffer = m._buffers[key]
             if buffer is not None:
@@ -743,6 +749,14 @@ class Backend:
                     ).contiguous()
                 else:
                     m._buffers[key] = buffer.cuda(non_blocking=non_blocking)
+                    if Backend.args.models.type in (
+                        "hf-qwen3-vl",
+                        "hf-qwen3-vl-moe",
+                    ) and (
+                        (buf_cuda := m._buffers[key]) is not None
+                        and not buf_cuda.is_contiguous()
+                    ):
+                        m._buffers[key] = m._buffers[key].contiguous()
 
     @staticmethod
     def _build_and_setup_model(args, attn_backend):
@@ -756,6 +770,8 @@ class Backend:
         Returns:
             Fully set up model
         """
+        Backend.args = args
+
         if not args.debug.skip_model_load:
             # Build the model. Don't allocate memory yet.
             with torch.device("meta"):
@@ -940,6 +956,8 @@ class Backend:
             elif args.models.type in {
                 "hf-llama",
                 "hf-qwen-3-moe",
+                "hf-qwen3-vl",
+                "hf-qwen3-vl-moe",
                 "hf-glm-z1",
                 "hf-glm-4-moe",
                 "hf-gpt-oss",

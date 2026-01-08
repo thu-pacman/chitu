@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: Qwen3-VL-8B-Instruct
+type: hf-qwen3-vl
+source: "https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct"
+tokenizer_type: "hf"
+ckpt_dir: null
+tokenizer_path: null
+processor_path: null
+
+dim: 4096
+n_heads: 32
+n_kv_heads: 8
+n_layers: 36
+intermediate_dim: 12288
+vocab_size: 151936
+norm_eps: 1e-6
+max_position_embeddings: 262144
+rope_theta: 5000000
+
+qkv_has_bias: false
+o_has_bias: false
+head_dim: 128
+use_qk_norm: true
+
+rope_scaling:
+  rope_type: mrope
+  mrope_section: [24, 20, 20]
+  mrope_interleaved: true
+
+vision_config:
+  depth: 27
+  hidden_act: "gelu_pytorch_tanh"
+  hidden_size: 1152
+  intermediate_size: 4304
+  num_heads: 16
+  in_channels: 3
+  out_hidden_size: 4096
+  patch_size: 16
+  spatial_merge_size: 2
+  temporal_patch_size: 2
+  num_position_embeddings: 2304
+  deepstack_visual_indexes: [8, 16, 24]
+  vision_start_token_id: 151652
+  image_token_id: 151655
+  video_token_id: 151656
+  vision_end_token_id: 151653
+
+
