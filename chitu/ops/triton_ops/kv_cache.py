@@ -18,6 +18,7 @@ def append_to_paged_kv_cache_triton(
     this_kv: torch.Tensor,  # (num_tokens, other contiguous dims...)
     delta_position_ids: torch.Tensor,  # (num_tokens,)
     delta_seq_ids: Optional[torch.Tensor] = None,  # (num_tokens,)
+    use_i64_offsets: bool = False,
 ):
     if delta_seq_ids is None and page_table.shape[0] != delta_position_ids.shape[0]:
         raise ValueError(
@@ -50,6 +51,10 @@ def append_to_paged_kv_cache_triton(
     )
 
     block_size = 512  # GPU block size, not page size
+    if use_i64_offsets:
+        INDEX_DTYPE = tl.int64
+    else:
+        INDEX_DTYPE = tl.int32
     grid = (num_tokens, triton.cdiv(tot_len_of_other_dims, block_size))
     append_to_paged_kv_cache_kernel[grid](
         kv_cache_ptr=kv_cache,
@@ -65,6 +70,7 @@ def append_to_paged_kv_cache_triton(
         THIS_KV_STRIDE0=this_kv.stride(0),
         BLOCK_SIZE=block_size,
         HAS_DELTA_SEQ_IDS=delta_seq_ids is not None,
+        INDEX_DTYPE=INDEX_DTYPE,
     )
 
 
@@ -130,22 +136,23 @@ def append_to_paged_kv_cache_kernel(
     THIS_KV_STRIDE0: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,  # GPU block size, not page size
     HAS_DELTA_SEQ_IDS: tl.constexpr,
+    INDEX_DTYPE: tl.constexpr,
 ):
-    token_id = tl.program_id(axis=0)
+    token_id = tl.program_id(axis=0).to(INDEX_DTYPE)
     dim_id_0 = tl.program_id(axis=1)
     dim_id_1 = tl.arange(0, BLOCK_SIZE)
-    dim_id = dim_id_0 * BLOCK_SIZE + dim_id_1
+    dim_id = (dim_id_0 * BLOCK_SIZE + dim_id_1).to(INDEX_DTYPE)
     dim_mask = dim_id < TOT_LEN_OF_OTHER_DIMS
 
-    seqlen = tl.load(delta_position_ids_ptr + token_id)
+    seqlen = tl.load(delta_position_ids_ptr + token_id).to(INDEX_DTYPE)
 
     if HAS_DELTA_SEQ_IDS:
-        batch_id = tl.load(delta_seq_ids_ptr + token_id)
+        batch_id = tl.load(delta_seq_ids_ptr + token_id).to(INDEX_DTYPE)
     else:
         batch_id = token_id
 
     page_table_offset = batch_id * NUM_PAGES_PER_SAMPLE + seqlen // PAGE_SIZE
-    page_id = tl.load(page_table_ptr + page_table_offset)
+    page_id = tl.load(page_table_ptr + page_table_offset).to(INDEX_DTYPE)
 
     kv_cache_offset = (
         page_id * KV_CACHE_STRIDE0 + (seqlen % PAGE_SIZE) * KV_CACHE_STRIDE1 + dim_id

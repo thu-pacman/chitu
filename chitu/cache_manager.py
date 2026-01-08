@@ -137,6 +137,7 @@ class PagedKVCacheAccessor(KVCacheAccessor):
     kv: dict[str, torch.Tensor]
     get_page_ids: Optional[Callable[[], torch.Tensor]] = None
     get_offs_in_page: Optional[Callable[[], torch.Tensor]] = None
+    use_i64_offsets: bool = False
 
     @property
     def k(self):  # Legacy interface
@@ -430,6 +431,21 @@ class PagedKVCacheManager(KVCacheManagerBase):
         )
         self._page_ids_up_to_date = False
         self._offs_in_page_up_to_date = False
+        self.use_i64_offsets = self.needs_i64_kv_offsets()
+
+    def needs_i64_kv_offsets(self) -> bool:
+        for _, t in self.paged_kv_cache.items():
+            kv = t[0].view(
+                t.shape[1], t.shape[2], -1
+            )  # (num_blocks, block_size, other_dims_flat)
+            max_kv_off = (
+                (kv.shape[0] - 1) * kv.stride(0)
+                + (kv.shape[1] - 1) * kv.stride(1)
+                + (kv.shape[2] - 1) * kv.stride(2)
+            )
+            if max_kv_off > (1 << 31) - 1:
+                return True
+        return False
 
     def get_max_blocks_per_req(self) -> int:
         """Return the maximum number of blocks a single request can occupy."""
@@ -474,6 +490,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
                 dtype=self.dtype_dict[key],
                 device=self.device,
             )
+        self.use_i64_offsets = self.needs_i64_kv_offsets()
 
     @override
     def get_block_size(self):
@@ -626,6 +643,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
                 ret_kv,
                 lambda: self.page_ids_mtp,
                 lambda: self.offs_in_page_mtp,
+                self.use_i64_offsets,
             )
 
         else:
@@ -634,6 +652,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
                 ret_kv,
                 lambda: self.page_ids,
                 lambda: self.offs_in_page,
+                self.use_i64_offsets,
             )
 
     def free_req_cache_blocks(self, req_id: str):
@@ -902,7 +921,7 @@ class DenseKVCacheManager(KVCacheManagerBase):
             ]
 
     @override
-    def get_accessor(self, layer_id: int, is_mtp: bool = False) -> PagedKVCacheAccessor:
+    def get_accessor(self, layer_id: int, is_mtp: bool = False) -> DenseKVCacheAccessor:
         local_layer_id = self.layer_id_map.to_local(layer_id)
         ret_kv = {
             key: cache[local_layer_id] for key, cache in self.prepared_cache.items()

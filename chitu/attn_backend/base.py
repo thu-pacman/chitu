@@ -424,6 +424,7 @@ class AttnBackend(abc.ABC):
                 seq_len_delta.delta_seq_ids_tensor_device,
                 get_page_ids=kv_cache.get_page_ids,
                 get_offs_in_page=kv_cache.get_offs_in_page,
+                use_i64_offsets=kv_cache.use_i64_offsets,
             )
             if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefilling
                 k = read_from_paged_kv_cache(
@@ -442,6 +443,7 @@ class AttnBackend(abc.ABC):
                 seq_len_delta.delta_seq_ids_tensor_device,
                 get_page_ids=kv_cache.get_page_ids,
                 get_offs_in_page=kv_cache.get_offs_in_page,
+                use_i64_offsets=kv_cache.use_i64_offsets,
             )
             if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefilling
                 v = read_from_paged_kv_cache(
