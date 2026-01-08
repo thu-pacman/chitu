@@ -454,13 +454,18 @@ class Backend:
             block_size = 64 if args.infer.mla_absorb != "none" else 256
             if args.infer.attn_type == "npu":
                 block_size = 128
-
+            if args.infer.cache_dtype == "float8_e4m3fn":
+                dtype_dict = {"k": torch.float8_e4m3fn, "v": torch.float8_e4m3fn}
+            else:
+                dtype_dict = None
+            logger.info(f"PagedKVCache dtype: {args.infer.cache_dtype}")
             return PagedKVCacheManager(
                 layer_id_map,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
                 block_size=block_size,
                 num_blocks=args.infer.num_blocks if num_blocks is None else num_blocks,
+                dtype_dict=dtype_dict,
                 device=local_rank,
                 **kv_cache_kvargs,
             )

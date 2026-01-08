@@ -17,6 +17,45 @@ from chitu.ops.triton_ops.utils import (
 )
 
 
+@triton.jit
+def quant_fp8_e4m3fn_per_tensor(x_ptr, y_ptr, s_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m, other=0.0).to(tl.float32)
+    s = tl.load(s_ptr).to(tl.float32)
+    y = x / s
+    y = tl.maximum(tl.minimum(y, 448.0), -448.0)
+    tl.store(y_ptr + offs, y.to(y_ptr.dtype.element_ty), mask=m)
+
+
+@single_dispatch_lazy_tensor
+@auto_retry_triton_compilation
+def fp8_e4m3fn_quant_per_tensor_triton(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    BLOCK: int = 2048,
+) -> torch.Tensor:
+    """
+    Args:
+      x: tensor to be quantized (fp16/bf16/fp32).
+      scale: float32 tensor with shape [1]. Defines the per-tensor scale `s`.
+
+    Returns:
+      y: tensor with dtype torch.float8_e4m3fn and same shape as x.
+    """
+    assert x.is_cuda
+    assert scale.is_cuda and scale.dtype == torch.float32 and scale.numel() == 1
+    x_flatten = x.contiguous().view(-1)
+    n = x_flatten.numel()
+    y = torch.empty(n, device=x.device, dtype=torch.float8_e4m3fn)
+    quant_fp8_e4m3fn_per_tensor[(triton.cdiv(n, BLOCK),)](
+        x_flatten, y, scale, n, BLOCK=BLOCK
+    )
+    return y.view_as(x)
+
+
 @single_dispatch_lazy_tensor
 @auto_retry_triton_compilation
 def blockfp8_act_quant_triton(

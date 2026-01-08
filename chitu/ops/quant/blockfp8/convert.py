@@ -16,6 +16,7 @@ if has_triton:
         soft_fp8_blockfp8_weight_dequant_triton,
         blockfp8_act_quant_triton,
         silu_and_mul_and_blockfp8_act_quant_triton,
+        fp8_e4m3fn_quant_per_tensor_triton,
     )
 
 
@@ -120,6 +121,17 @@ def blockfp8_act_quant(
 
     if impl == "triton" and has_triton:
         return blockfp8_act_quant_triton(x, block_size)
+    else:
+        raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
+def fp8_e4m3fn_quant_per_tensor(
+    x: torch.Tensor, scale: torch.Tensor, impl: str = "auto"
+) -> torch.Tensor:
+    if impl == "auto":
+        impl = "triton"
+    if impl == "triton" and has_triton:
+        return fp8_e4m3fn_quant_per_tensor_triton(x, scale)
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
 

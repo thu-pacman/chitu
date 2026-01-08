@@ -31,6 +31,7 @@ class InferConfig:
     seed: float = MISSING
     max_seq_len: int = MISSING
     cache_type: str = MISSING
+    cache_dtype: str = MISSING
     attn_type: str = MISSING
     op_impl: str = MISSING
     mla_absorb: Optional[str] = MISSING

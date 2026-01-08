@@ -5,6 +5,41 @@
 """Shared task statistics utilities for metrics collection."""
 
 
+def _count_unassigned_waiting_in_pool() -> int:
+    """Unscheduled + untouched prefill tasks in TaskPool."""
+    from chitu.task import TaskPool, TaskType
+
+    return sum(
+        1
+        for task in TaskPool.pool.values()
+        if task.task_type == TaskType.Prefill
+        and task.consumed_req_tokens == 0
+        and getattr(task, "dp_rank", None) is None
+    )
+
+
+def _count_pending_queue() -> int:
+    """Queued-but-not-yet-added tasks (if TaskPool supports pending_queue)."""
+    from chitu.task import TaskPool
+
+    return len(getattr(TaskPool, "pending_queue", []))
+
+
+def count_router_load() -> tuple[int, int]:
+    """
+    Router load for one Enhanced Scheduler process: (running_requests, waiting_requests).
+    """
+    try:
+        from chitu.task import TaskPool
+
+        waiting_in_pool = _count_unassigned_waiting_in_pool()
+        waiting = waiting_in_pool + _count_pending_queue()
+        running = max(0, len(TaskPool.pool) - waiting_in_pool)
+        return int(running), int(waiting)
+    except Exception:
+        return 0, 0
+
+
 def count_tasks_for_dp_rank(dp_id: int) -> tuple[int, int]:
     """
     Count running and waiting tasks for a specific DP rank.
@@ -22,19 +57,13 @@ def count_tasks_for_dp_rank(dp_id: int) -> tuple[int, int]:
         running = sum(
             1
             for task in TaskPool.pool.values()
-            if getattr(task, "cache_owner", None) == dp_id
+            if getattr(task, "dp_rank", None) == dp_id
         )
 
         # Waiting tasks (unassigned) only counted on DP 0
         waiting = 0
         if dp_id == 0:
-            waiting = sum(
-                1
-                for task in TaskPool.pool.values()
-                if task.task_type == TaskType.Prefill
-                and task.consumed_req_tokens == 0
-                and getattr(task, "cache_owner", None) is None
-            )
+            waiting = _count_unassigned_waiting_in_pool()
 
         return running, waiting
     except Exception:

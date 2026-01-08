@@ -10,6 +10,7 @@ from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     ExpertBlockPermutedBatchedRoutedActivationNormal,
     IndexedBatchedRoutedActivation,
+    IndexedBatchedRoutedActivationBlockfp8,
     IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
     IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
     ExpertBlockPermutedBatchedRoutedActivationBlockfp8,
@@ -83,7 +84,7 @@ def _(
         out = hidden_states.activation
 
     new_hidden_states = ExpertBlockPermutedBatchedRoutedActivationNormal.convert_from(
-        hidden_states, block_size=128
+        hidden_states, block_size=128, num_experts=w1.shape[0]
     )
     del hidden_states
     return deepgemm_contiguous_fused_expert(
@@ -371,46 +372,33 @@ def _(
     assert not use_int8_w8a16
     assert not use_int4_w4a16
 
-    token_to_expert = hidden_states.token_to_expert_indices  # [B, topk]
-    block_size = 128
-
+    pad_block_size = 128
+    quant_block_size = 128
     n_experts = w1.shape[0]
-    token_cnt_per_expert = torch.zeros(
-        n_experts,
-        device=token_to_expert.device,
-        dtype=torch.int32,
-    )
-    flat_expert = token_to_expert.view(-1)
-    ones = torch.ones_like(flat_expert, dtype=torch.int32)
-    token_cnt_per_expert.index_add_(0, flat_expert, ones)
-    n_tokens_per_expert_padded = (
-        (token_cnt_per_expert + block_size - 1) // block_size * block_size
-    )
-    del token_cnt_per_expert, flat_expert, ones
-    padded_hidden_states = None
 
     if use_fp8_w8a8:
         hidden_states_fp8, scale = blockfp8_act_quant(
-            hidden_states.activation, block_size=128
+            hidden_states.activation, block_size=quant_block_size
         )
-        padded_hidden_states = (
-            IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
-                activation=hidden_states_fp8,
-                activation_scale=scale,
-                token_to_expert_indices=hidden_states.token_to_expert_indices,
-                n_tokens_per_expert_padded=n_tokens_per_expert_padded,
+        hidden_states = IndexedBatchedRoutedActivationBlockfp8(
+            activation=hidden_states_fp8,
+            activation_scale=scale,
+            token_to_expert_indices=hidden_states.token_to_expert_indices,
+        )
+        hidden_states = (
+            IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt.convert_from(
+                hidden_states, pad_block_size=pad_block_size, n_experts=n_experts
             )
         )
     else:
-        padded_hidden_states = IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
-            activation=hidden_states.activation,
-            token_to_expert_indices=hidden_states.token_to_expert_indices,
-            n_tokens_per_expert_padded=n_tokens_per_expert_padded,
+        hidden_states = (
+            IndexedBatchedRoutedActivationWithPaddedPerExpertCnt.convert_from(
+                hidden_states, pad_block_size=pad_block_size, n_experts=n_experts
+            )
         )
-    del hidden_states
 
     return deepgemm_contiguous_fused_expert(
-        padded_hidden_states,
+        hidden_states,
         w1=w1,
         w2=w2,
         topk_weights=topk_weights,

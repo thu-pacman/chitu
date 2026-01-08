@@ -67,6 +67,34 @@ class IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
     """
 
     n_tokens_per_expert_padded: torch.Tensor
+    pad_block_size: int
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(
+        cls, old: IndexedBatchedRoutedActivation, *, n_experts: int, pad_block_size: int
+    ) -> "IndexedBatchedRoutedActivationWithPaddedPerExpertCnt":
+        token_cnt_per_expert = torch.zeros(
+            n_experts, device=old.token_to_expert_indices.device, dtype=torch.int32
+        )
+        expert_ids = old.token_to_expert_indices.view(-1)
+        token_cnt_per_expert.index_add_(
+            0, expert_ids, torch.ones_like(expert_ids, dtype=torch.int32)
+        )
+        del expert_ids
+        n_tokens_per_expert_padded = (
+            (token_cnt_per_expert + pad_block_size - 1)
+            // pad_block_size
+            * pad_block_size
+        )
+        del token_cnt_per_expert
+        return IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
+            activation=old.activation,
+            token_to_expert_indices=old.token_to_expert_indices,
+            n_tokens_per_expert_padded=n_tokens_per_expert_padded,
+            pad_block_size=pad_block_size,
+        )
 
 
 @dataclass
@@ -79,6 +107,39 @@ class IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
     """
 
     n_tokens_per_expert_padded: torch.Tensor
+    pad_block_size: int
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(
+        cls,
+        old: IndexedBatchedRoutedActivationBlockfp8,
+        *,
+        n_experts: int,
+        pad_block_size: int,
+    ) -> "IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt":
+        token_cnt_per_expert = torch.zeros(
+            n_experts, device=old.token_to_expert_indices.device, dtype=torch.int32
+        )
+        expert_ids = old.token_to_expert_indices.view(-1)
+        token_cnt_per_expert.index_add_(
+            0, expert_ids, torch.ones_like(expert_ids, dtype=torch.int32)
+        )
+        del expert_ids
+        n_tokens_per_expert_padded = (
+            (token_cnt_per_expert + pad_block_size - 1)
+            // pad_block_size
+            * pad_block_size
+        )
+        del token_cnt_per_expert
+        return IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
+            activation=old.activation,
+            activation_scale=old.activation_scale,
+            token_to_expert_indices=old.token_to_expert_indices,
+            n_tokens_per_expert_padded=n_tokens_per_expert_padded,
+            pad_block_size=pad_block_size,
+        )
 
 
 @dataclass
@@ -122,7 +183,9 @@ class ExpertBlockPermutedBatchedRoutedActivation(BatchedRoutedActivation):
 
     Each block maps to only a single expert, but may map to multiple tokens.
 
-    There may be empty blocks or unfulled blocks, padded with -1 in `block_to_expert_indices`.
+    If a token does not choose an expert, `token_comma_topk_to_block_x_item_indices`
+    contains -1. There may also be empty blocks or unfulled blocks, padded with -1 in
+    `block_to_expert_indices`.
     """
 
     blocked_activation: torch.Tensor  # [n_blocks, block_size, hidden_size]

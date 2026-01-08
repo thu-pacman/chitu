@@ -101,8 +101,16 @@ def moe_sum_expert_block_permuted_torch(
     token_comma_topk_to_block_x_item_indices: torch.Tensor,
     topk_weights: torch.Tensor,
 ):
+    batch_size, topk = token_comma_topk_to_block_x_item_indices.shape
+    hidden = x.shape[-1]
     return (
-        x.view(-1, x.shape[-1])[token_comma_topk_to_block_x_item_indices]
+        torch.where(
+            token_comma_topk_to_block_x_item_indices.view(batch_size, topk, 1) >= 0,
+            x.view(-1, hidden)[
+                torch.clamp(token_comma_topk_to_block_x_item_indices, min=0)
+            ],
+            torch.zeros(batch_size, topk, hidden, device=x.device, dtype=x.dtype),
+        )
         * topk_weights.unsqueeze(-1)
     ).sum(dim=1)
 

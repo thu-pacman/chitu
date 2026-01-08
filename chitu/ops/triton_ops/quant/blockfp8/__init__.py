@@ -7,6 +7,7 @@ from chitu.ops.triton_ops.quant.blockfp8.convert import (
     soft_fp8_blockfp8_weight_dequant_triton,
     blockfp8_act_quant_triton,
     silu_and_mul_and_blockfp8_act_quant_triton,
+    fp8_e4m3fn_quant_per_tensor_triton,
 )
 from chitu.ops.triton_ops.quant.blockfp8.matmul import (
     blockfp8_gemm_triton,

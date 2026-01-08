@@ -52,6 +52,7 @@ from chitu.ops.quant import (
     blockfp8_index_score_dense_dsv32,
     blockfp8_index_score_ragged_q_dense_k_dsv32,
     blockfp8_index_score_ragged_q_paged_k_dsv32,
+    fp8_e4m3fn_quant_per_tensor,
 )
 from chitu.ops.mla_prologue import mla_prologue
 from chitu.ops.batched_routed_activation import (

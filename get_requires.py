@@ -71,14 +71,14 @@ extras_require = {
     ##########################################################################
     # Really third-party kernels
     "flash_attn": [
-        (
-            "flash-attn<2.8.0"
-            if packaging.version.parse(torch.__version__)
-            < packaging.version.parse("2.7.0")
-            else "flash-attn"
-        ),
+        "flash_attn @ file://localhost"
+        + os.path.join(setup_dir, "third_party/flash-attention"),
         # Although `flash-attn` is available in PyPI, don't make it a required
         # dependency, because its installation runs forever on some platforms.
+    ],
+    "flash_attn_interface": [
+        "flash_attn_3 @ file://localhost"
+        + os.path.join(setup_dir, "third_party/flash-attention/hopper"),
     ],
     # TODO: Upgrade to latest flashInfer version and resolve environment compatibility issues
     "flashinfer": [

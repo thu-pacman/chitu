@@ -26,6 +26,7 @@ def append_to_paged_kv_cache(
     delta_seq_ids: Optional[torch.Tensor] = None,
     get_page_ids: Optional[Callable[[], torch.Tensor]] = None,
     get_offs_in_page: Optional[Callable[[], torch.Tensor]] = None,
+    use_i64_offsets: bool = False,
     impl: str = "auto",
 ):
     """
@@ -53,7 +54,12 @@ def append_to_paged_kv_cache(
     if impl == "triton":
         assert has_triton
         append_to_paged_kv_cache_triton(
-            kv_cache, page_table, this_kv, delta_position_ids, delta_seq_ids
+            kv_cache,
+            page_table,
+            this_kv,
+            delta_position_ids,
+            delta_seq_ids,
+            use_i64_offsets,
         )
     elif impl == "torch":
         append_to_paged_kv_cache_torch(

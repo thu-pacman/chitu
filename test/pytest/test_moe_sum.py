@@ -43,10 +43,11 @@ def test_moe_sum_per_token(M, topk, N, compute_dtype, record_benchmark):
 @pytest.mark.parametrize("N", [1024, 2048])
 @pytest.mark.parametrize("n_blocks", [32])
 @pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("invalid_rate", [0, 0.3])
 @pytest.mark.parametrize("compute_dtype", [torch.float16])
 @pytest.mark.skipif(not has_triton, reason="triton is not available")
 def test_moe_sum_expert_block_permuted(
-    M, topk, N, n_blocks, block_size, compute_dtype, record_benchmark
+    M, topk, N, n_blocks, block_size, invalid_rate, compute_dtype, record_benchmark
 ):
     input_tensor = torch.rand(
         n_blocks, block_size, N, device="cuda", dtype=compute_dtype
@@ -58,6 +59,13 @@ def test_moe_sum_expert_block_permuted(
         dtype=torch.int32,
         device="cuda",
     )
+    if invalid_rate > 0:
+        token_comma_topk_to_block_x_item_indices[
+            torch.rand_like(
+                token_comma_topk_to_block_x_item_indices, dtype=torch.float32
+            )
+            < invalid_rate
+        ] = -1
     topk_weights = torch.rand(M, topk, device="cuda", dtype=compute_dtype)
 
     ref_output = torch.zeros(M, N, device="cuda", dtype=compute_dtype)
