@@ -83,7 +83,7 @@ def _(
         out = hidden_states.activation
 
     new_hidden_states = ExpertBlockPermutedBatchedRoutedActivationNormal.convert_from(
-        hidden_states, block_size=128
+        hidden_states, block_size=128, num_experts=w1.shape[0]
     )
     del hidden_states
     return deepgemm_contiguous_fused_expert(
