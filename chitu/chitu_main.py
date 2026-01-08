@@ -896,18 +896,14 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
                 elapsed = current_time - start_time
                 throughput = processed_requests / elapsed
 
+                # Router load stats for this scheduler process.
+                from chitu.metrics.task_stats import count_router_load
+
+                running_requests, waiting_requests = count_router_load()
                 stats = {
                     "scheduler_id": dp_config.dp_id,
-                    "running_requests": (
-                        len(PPTaskCollector._ongoing_reqs)
-                        if hasattr(PPTaskCollector, "_ongoing_reqs")
-                        else 0
-                    ),
-                    "waiting_requests": (
-                        len(getattr(Backend.scheduler, "waiting_queue", []))
-                        if hasattr(Backend, "scheduler") and Backend.scheduler
-                        else 0
-                    ),
+                    "running_requests": int(running_requests),
+                    "waiting_requests": int(waiting_requests),
                     "pending_tokens": 0,  # TODO: calculate pending tokens
                     "throughput_tokens_per_sec": throughput,
                     "last_update_time": current_time,
