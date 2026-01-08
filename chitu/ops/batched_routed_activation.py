@@ -218,7 +218,7 @@ def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
     token_to_expert_indices: torch.Tensor,
     *,
     block_size: int,
-    n_tokens_padded: int,
+    num_experts: int,
     n_tokens_per_expert_padded: torch.Tensor,
     impl: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -258,7 +258,7 @@ def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
                 activation_scale,
                 token_to_expert_indices,
                 block_size=block_size,
-                n_tokens_padded=n_tokens_padded,
+                num_experts=num_experts,
                 n_tokens_per_expert_padded=n_tokens_per_expert_padded,
             )
         )
@@ -271,7 +271,7 @@ def batched_routed_activation_indexed_to_expert_block_permuted(
     token_to_expert_indices: torch.Tensor,
     *,
     block_size: int,
-    n_tokens_padded: int,
+    num_experts: int,
     n_tokens_per_expert_padded: torch.Tensor,
     impl: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -306,7 +306,7 @@ def batched_routed_activation_indexed_to_expert_block_permuted(
             activation,
             token_to_expert_indices,
             block_size=block_size,
-            n_tokens_padded=n_tokens_padded,
+            num_experts=num_experts,
             n_tokens_per_expert_padded=n_tokens_per_expert_padded,
         )
         assert blocked_activation.dtype == torch.get_default_dtype()

@@ -121,6 +121,8 @@ class ExpertBlockPermutedBatchedRoutedActivation(BatchedRoutedActivation):
     permuted activation and tokens, and between the permuted activation and experts.
 
     Each block maps to only a single expert, but may map to multiple tokens.
+
+    There may be empty blocks or unfulled blocks, padded with -1 in `block_to_expert_indices`.
     """
 
     blocked_activation: torch.Tensor  # [n_blocks, block_size, hidden_size]
@@ -153,6 +155,7 @@ class ExpertBlockPermutedBatchedRoutedActivationNormal(
         old: IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
         *,
         block_size: int,
+        num_experts: int,
     ) -> "ExpertBlockPermutedBatchedRoutedActivationNormal":
         (
             blocked_activation,
@@ -161,9 +164,9 @@ class ExpertBlockPermutedBatchedRoutedActivationNormal(
         ) = batched_routed_activation_indexed_to_expert_block_permuted(
             old.activation,
             old.token_to_expert_indices,
-            n_tokens_padded=old.n_tokens_per_expert_padded.sum().item(),
             n_tokens_per_expert_padded=old.n_tokens_per_expert_padded,
             block_size=block_size,
+            num_experts=num_experts,
         )
 
         assert blocked_activation.dtype == torch.get_default_dtype()
@@ -190,6 +193,7 @@ class ExpertBlockPermutedBatchedRoutedActivationBlockfp8(
         old: IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
         *,
         block_size: int,
+        num_experts: int,
     ) -> "ExpertBlockPermutedBatchedRoutedActivationBlockfp8":
         (
             blocked_activation,
@@ -200,9 +204,9 @@ class ExpertBlockPermutedBatchedRoutedActivationBlockfp8(
             old.activation,
             old.activation_scale,
             old.token_to_expert_indices,
-            n_tokens_padded=old.n_tokens_per_expert_padded.sum().item(),
             n_tokens_per_expert_padded=old.n_tokens_per_expert_padded,
             block_size=block_size,
+            num_experts=num_experts,
         )
         return cls(
             blocked_activation=blocked_activation,
