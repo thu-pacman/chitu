@@ -141,6 +141,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
                     dtype=torch.int32,
                     device=recv_topk_idx.device,
                 ),
+                pad_block_size=128,
             ),
             recv_topk_weights,
         )
@@ -183,6 +184,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
                     dtype=torch.int32,
                     device=recv_topk_idx.device,
                 ),
+                pad_block_size=128,
             ),
             recv_topk_weights,
         )
