@@ -384,7 +384,6 @@ class PagedKVCacheManager(KVCacheManagerBase):
             head_dim=head_dim,
             device=device,
         )
-
         self.max_blocks_per_req = ceil_div(max_seq_len, block_size)
         self.max_num_blocks = self.max_blocks_per_req * num_hot_req
         if num_blocks == -1:  # Being warmed-up
@@ -472,6 +471,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
             self.paged_kv_cache[key] = torch.zeros(
                 (self.num_layers, self.num_blocks, self.block_size)
                 + tuple(self.shape_per_token_dict[key]),
+                dtype=self.dtype_dict[key],
                 device=self.device,
             )
 

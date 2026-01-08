@@ -9,6 +9,7 @@ ARG optional_deps='flash_attn,flash_mla,flashinfer'
 ARG build_jobs=''
 ARG enable_cython='true'
 ARG enable_test='false'
+ARG FLASH_ATTENTION_FORCE_BUILD="TRUE"
 
 RUN if [ "${enable_cython}" != "true" ] && [ "${enable_cython}" != "false" ]; then \
     echo "ARG enable_cython must either be 'true' or 'false'"; \

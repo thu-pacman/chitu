@@ -8,6 +8,7 @@ from chitu.ops.quant.blockfp8.convert import (
     soft_fp8_blockfp8_weight_dequant,
     blockfp8_act_quant,
     silu_and_mul_and_blockfp8_act_quant,
+    fp8_e4m3fn_quant_per_tensor,
 )
 from chitu.ops.quant.blockfp8.matmul import (
     blockfp8_gemm,

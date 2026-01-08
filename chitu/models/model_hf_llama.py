@@ -25,7 +25,7 @@ from chitu.models.model import (
     get_rmsnorm,
 )
 from chitu.models.registry import ModelType, register_model
-from chitu.ops import apply_rotary_pos_emb, silu_and_mul
+from chitu.ops import apply_rotary_pos_emb, silu_and_mul, fp8_e4m3fn_quant_per_tensor
 from chitu.quantization import (
     QuantizationRegistry,
     get_quant_from_checkpoint_prefix,
@@ -117,6 +117,7 @@ class AttentionHFLlama(Attention):
 
         qkv_has_bias = args.qkv_has_bias if hasattr(args, "qkv_has_bias") else True
         o_has_bias = args.o_has_bias if hasattr(args, "o_has_bias") else False
+        self.use_fp8_kvcache = get_global_args().infer.cache_dtype == "float8_e4m3fn"
 
         if hasattr(args, "no_input_scale"):
             quant_kwargs = {"blockfp4": {"no_input_scale": args.no_input_scale}}
@@ -183,6 +184,22 @@ class AttentionHFLlama(Attention):
             self.q_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
 
+        if self.use_fp8_kvcache:
+            self.k_scale = torch.nn.Parameter(
+                torch.ones(
+                    1,
+                    dtype=torch.float32,
+                    requires_grad=False,
+                )
+            )
+            self.v_scale = torch.nn.Parameter(
+                torch.ones(
+                    1,
+                    dtype=torch.float32,
+                    requires_grad=False,
+                )
+            )
+
     def _run_linear(self, x):
         if self.merge_qkv:
             qkv = self.qkv_proj(x)
@@ -199,6 +216,25 @@ class AttentionHFLlama(Attention):
             k = self.k_proj(x)
             v = self.v_proj(x)
         return q, k, v
+
+    def _maybe_fp8_kvcache_quant(self, xq, xk, xv):
+        if not self.use_fp8_kvcache:
+            return xq, xk, xv, {}
+
+        q_scale = (xq.abs().amax() / 448).to(torch.float32)
+
+        xq = fp8_e4m3fn_quant_per_tensor(xq, q_scale)
+        xk = fp8_e4m3fn_quant_per_tensor(xk, self.k_scale)
+        xv = fp8_e4m3fn_quant_per_tensor(xv, self.v_scale)
+
+        B = self.cache.seq_len_delta.batch_size
+        H = self.n_local_kv_heads
+        descales = {
+            "q_descale": q_scale.view(1, 1).expand(B, H),
+            "k_descale": self.k_scale.view(1, 1).expand(B, H),
+            "v_descale": self.v_scale.view(1, 1).expand(B, H),
+        }
+        return xq, xk, xv, descales
 
     def _run_output_linear(self, x):
         return self.o_proj(x)
@@ -223,6 +259,8 @@ class AttentionHFLlama(Attention):
 
         xq, xk = apply_rotary_pos_emb(xq, xk, freqs_cis, rotary_type=self.rotary_type)
 
+        xq, xk, xv, descales = self._maybe_fp8_kvcache_quant(xq, xk, xv)
+
         output = self.attn_backend(
             xq,
             self.cache.get_accessor(self.layer_id),
@@ -230,6 +268,7 @@ class AttentionHFLlama(Attention):
             xv,
             seq_len_delta=self.cache.seq_len_delta,
             causal=True,
+            **descales,
         ).view(bs_seq, -1)
         return self._run_output_linear(output).reshape(x.shape)
 
@@ -720,6 +759,7 @@ class TransformerHFLlama(Transformer):
 
                 def map_blockfp8_key(k):
                     k = k.replace(".weight_scale_inv", ".scale")
+                    k = k.replace(".weight_scale", ".scale")
                     return k
 
                 state_dict = {map_blockfp8_key(k): v for k, v in state_dict.items()}

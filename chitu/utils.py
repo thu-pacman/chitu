@@ -61,6 +61,7 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> tuple[Any, bool]:
         "hard_fp4_kernels",
         "scipy",
         "fast_hadamard_transform",
+        "flash_attn_interface",
     }
     assert (
         opt_dep_name in opt_deps

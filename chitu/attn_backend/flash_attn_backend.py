@@ -13,12 +13,21 @@ from chitu.cache_manager import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.utils import try_import_opt_dep
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
+flash_attn3, has_flash_attn3 = try_import_opt_dep(
+    "flash_attn_interface", "flash_attn_interface"
+)
 
 
 class FlashAttnBackend(AttnBackend):
-    # TODO: change to FlashAttention-3 for Hopper GPUs
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
+        self._fa = None
+        self._use_fa3 = False
+        if has_flash_attn3:
+            self._fa = flash_attn3
+            self._use_fa3 = True
+        elif has_flash_attn:
+            self._fa = flash_attn
 
     @override
     def prefill_ragged_qkvo(
@@ -27,6 +36,9 @@ class FlashAttnBackend(AttnBackend):
         k,
         v,
         seq_len_delta: BatchedSeqLenDelta,
+        q_descale: torch.Tensor = None,
+        k_descale: torch.Tensor = None,
+        v_descale: torch.Tensor = None,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -48,19 +60,25 @@ class FlashAttnBackend(AttnBackend):
         if softcap != 0.0:
             extra_kvargs["softcap"] = softcap
 
-        return flash_attn.flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            seq_len_delta.delta_prefix_lens_tensor_device,
-            seq_len_delta.new.prefix_lens_tensor_device,
-            seq_len_delta.delta_max_len,
-            seq_len_delta.new.max_len,
+        kwargs = dict(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=seq_len_delta.delta_prefix_lens_tensor_device,
+            cu_seqlens_k=seq_len_delta.new.prefix_lens_tensor_device,
+            max_seqlen_q=seq_len_delta.delta_max_len,
+            max_seqlen_k=seq_len_delta.new.max_len,
             causal=causal,
             window_size=window_size,
             softmax_scale=softmax_scale,
             **extra_kvargs,
         )
+        if self._use_fa3:
+            kwargs["q_descale"] = q_descale
+            kwargs["k_descale"] = k_descale
+            kwargs["v_descale"] = v_descale
+
+        return self._fa.flash_attn_varlen_func(**kwargs)
 
     @override
     def decode_dense_kv(
@@ -91,7 +109,7 @@ class FlashAttnBackend(AttnBackend):
         if softcap != 0.0:
             extra_kvargs["softcap"] = softcap
 
-        return flash_attn.flash_attn_with_kvcache(
+        return self._fa.flash_attn_with_kvcache(
             q.unsqueeze(1),
             kv_cache.k,
             kv_cache.v,
@@ -112,6 +130,9 @@ class FlashAttnBackend(AttnBackend):
         k=None,
         v=None,
         *,
+        q_descale: torch.Tensor = None,
+        k_descale: torch.Tensor = None,
+        v_descale: torch.Tensor = None,
         seq_len_delta: BatchedSeqLenDelta,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -133,16 +154,24 @@ class FlashAttnBackend(AttnBackend):
         if softcap != 0.0:
             extra_kvargs["softcap"] = softcap
 
-        return flash_attn.flash_attn_with_kvcache(
-            q.unsqueeze(1),
-            kv_cache.k,
-            kv_cache.v,
+        kwargs = dict(
+            q=q.unsqueeze(1),
+            k_cache=kv_cache.k,
+            v_cache=kv_cache.v,
             k=k.unsqueeze(1) if k is not None else None,
             v=v.unsqueeze(1) if v is not None else None,
             cache_seqlens=seq_len_delta.old.lens_tensor_device,
-            block_table=kv_cache.block_table,
             causal=True,
             window_size=window_size,
             softmax_scale=softmax_scale,
             **extra_kvargs,
-        ).squeeze(1)
+        )
+        if self._use_fa3:
+            kwargs["page_table"] = kv_cache.block_table
+            kwargs["q_descale"] = q_descale
+            kwargs["k_descale"] = k_descale
+            kwargs["v_descale"] = v_descale
+        else:
+            kwargs["block_table"] = kv_cache.block_table
+
+        return self._fa.flash_attn_with_kvcache(**kwargs).squeeze(1)
