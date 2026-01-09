@@ -60,6 +60,7 @@ class Scheduler:
             decode_num_tasks = max_reqs_per_dp
 
         return Scheduler(
+            max_reqs_per_dp,
             prefill_num_tasks,
             decode_num_tasks,
             Scheduler._normalize_scheduler_type(args.type.lower()),
@@ -92,6 +93,7 @@ class Scheduler:
 
     def __init__(
         self,
+        max_runing_tasks: int,
         prefill_num_tasks: int,
         decode_num_tasks: int,
         scheduler_type: str,
@@ -131,6 +133,7 @@ class Scheduler:
         super().__init__()
         assert prefill_num_tasks > 0, "prefill_num_tasks must be greater than 0"
         assert decode_num_tasks > 0, "decode_num_tasks must be greater than 0"
+        self.max_runing_tasks = max_runing_tasks
         self.prefill_num_tasks = prefill_num_tasks
         self.decode_num_tasks = decode_num_tasks
         self.prefill_chunk_size = prefill_chunk_size
@@ -207,16 +210,24 @@ class Scheduler:
         self.scheduling_ts = time.perf_counter_ns()
 
         # collect ready task ids
-        has_correct_dp_rank = (
-            lambda task: task.dp_rank is None or self.dp_rank == task.dp_rank
+        n_running = sum(
+            1
+            for task_id in TaskPool.id_list
+            if TaskPool.pool[task_id].dp_rank == self.dp_rank
         )
-        task_ids = list(
-            filter(
-                lambda x: has_correct_dp_rank(TaskPool.pool[x])
-                and TaskPool.pool[x].can_schedule(),
-                TaskPool.id_list,
-            )
-        )
+        task_ids: list[str] = []
+        for task_id in TaskPool.id_list:
+            task = TaskPool.pool[task_id]
+            if (
+                task.dp_rank is None
+                or self.dp_rank == task.dp_rank
+                and task.can_schedule()
+            ):
+                if n_running == self.max_runing_tasks and task.dp_rank is None:
+                    continue
+                if task.dp_rank is None:
+                    n_running += 1
+                task_ids.append(task_id)
 
         # enforce strict-only gating if enabled
         strict_allowed_task_type = strict_allowed_task_type.intersection(
@@ -577,6 +588,7 @@ class SkewScheduler(Scheduler):
         args = get_global_args()
         self.slot_handle = SlotHandle(max_reqs, args.infer.pp_size)
         super().__init__(
+            max_reqs,
             ceil_div(max_reqs, self.slot_handle.num_slots),  # prefill_num_tasks
             ceil_div(max_reqs, self.slot_handle.num_slots),  # decode_num_tasks
             Scheduler._normalize_scheduler_type(original_scheduler_type),

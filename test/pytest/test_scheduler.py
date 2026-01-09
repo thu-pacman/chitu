@@ -104,7 +104,7 @@ def test_chunked_prefill():
         TaskPool.add(task)
 
     scheduler = Scheduler(
-        4, 4, "prefill_first", num_scheduler_groups=1, prefill_chunk_size=4096
+        100, 4, 4, "prefill_first", num_scheduler_groups=1, prefill_chunk_size=4096
     )
 
     # Prefill:
@@ -270,7 +270,7 @@ def test_priority_prefill_first():
     TaskPool.add(tasks[4])
     TaskPool.add(tasks[6])
 
-    scheduler = Scheduler(4, 2, "prefill_first", num_scheduler_groups=1)
+    scheduler = Scheduler(100, 4, 2, "prefill_first", num_scheduler_groups=1)
 
     batch1_ids = scheduler.schedule()
     assert sorted(batch1_ids) == sorted(["req_7", "req_1", "req_3", "req_8"])
@@ -434,7 +434,7 @@ def test_priority_fcfs():
     TaskPool.add(tasks[4])
     TaskPool.add(tasks[6])
 
-    scheduler = Scheduler(4, 4, "fcfs", num_scheduler_groups=1)
+    scheduler = Scheduler(100, 4, 4, "fcfs", num_scheduler_groups=1)
 
     batch1_ids = scheduler.schedule()
     assert sorted(batch1_ids) == sorted(["req_0", "req_1", "req_2", "req_3"])
@@ -505,7 +505,6 @@ def test_priority_fcfs_skew():
     TaskPool.add(tasks[4])
     TaskPool.add(tasks[6])
 
-    # scheduler = Scheduler(4, 4, "fcfs", 1)
     scheduler = SkewScheduler(
         infer_args.max_reqs, original_scheduler_type="fcfs", prefill_chunk_size=None
     )
@@ -595,7 +594,9 @@ def test_priority_request_preset_over_prefill_first():
     TaskPool.add(tasks[4])
     TaskPool.add(tasks[6])
 
-    scheduler = Scheduler(4, 2, "request_preset,prefill_first", num_scheduler_groups=1)
+    scheduler = Scheduler(
+        100, 4, 2, "request_preset,prefill_first", num_scheduler_groups=1
+    )
 
     # ['req_7', 'req_2':Decode, 'req_1', 'req_5':Decode, 'req_3', 'req_8', 'req_0', 'req_4', 'req_6':Decode]
     batch1_ids = scheduler.schedule()
@@ -676,7 +677,6 @@ def test_priority_request_preset_over_prefill_first_skew():
     TaskPool.add(tasks[4])
     TaskPool.add(tasks[6])
 
-    # scheduler = Scheduler(4, 2, "request_preset,prefill_first", 1) x
     # skewScheduler's prefill_mbs == decode_mbs == 4
     scheduler = SkewScheduler(
         infer_args.max_reqs,
@@ -726,6 +726,68 @@ def test_priority_request_preset_over_prefill_first_skew():
     assert len(batch4_ids) == 0
 
 
+def test_max_running_tasks():
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_seq_len": 1024,
+                    "op_impl": "torch",
+                    "cache_type": "paged",
+                    "schedule_overlap": True,
+                }
+            }
+        ),
+        need_ensure=False,
+    )
+    TaskPool.reset()
+    Backend.cache_manager = MockCacheManager(num_blocks=10, block_size=512)
+
+    tasks = []
+    for i in range(9):
+        req = MockFixedLengthedUserRequest(
+            input_len=10, request_id=f"req_{i}", enable_reasoning=False
+        )
+        task = Task(f"{req.request_id}", req)
+        tasks.append(task)
+
+    TaskPool.add(tasks[0])
+    TaskPool.add(tasks[1])
+    TaskPool.add(tasks[2])
+    TaskPool.add(tasks[3])
+    TaskPool.add(tasks[4])
+    TaskPool.add(tasks[5])
+    TaskPool.add(tasks[6])
+    TaskPool.add(tasks[7])
+    TaskPool.add(tasks[8])
+
+    scheduler = Scheduler(4, 4, 4, "prefill_first", num_scheduler_groups=1)
+
+    batch1_ids = scheduler.schedule()
+    assert sorted(batch1_ids) == sorted(["req_0", "req_1", "req_2", "req_3"])
+    scheduler.update(batch1_ids)
+
+    # Now req_[1-3] are decoding
+    tasks[1].consume_req_tokens()
+    tasks[2].consume_req_tokens()
+    tasks[3].consume_req_tokens()
+
+    # No to schedule req_[4-8] although they are prefill (higher priority),
+    # because reaching max_running_tasks=4
+    batch2_ids = scheduler.schedule()
+    assert sorted(batch2_ids) == sorted(["req_0"])
+    scheduler.update(batch2_ids)
+
+    # Now req_[0-3] are decoding
+    tasks[0].consume_req_tokens()
+
+    # No to schedule req_[0,4-8] although they are prefill (higher priority),
+    # because reaching max_running_tasks=4
+    batch3_ids = scheduler.schedule()
+    assert sorted(batch3_ids) == sorted(["req_0", "req_1", "req_2", "req_3"])
+    scheduler.update(batch3_ids)
+
+
 def test_single_prompt_seq_bigger_than_scheduler_capacity():
     """test when single prompt length is bigger than scheduler capacity, which equals NUM_BLOCKS*BLOCK_SIZE"""
     set_global_args(
@@ -757,7 +819,9 @@ def test_single_prompt_seq_bigger_than_scheduler_capacity():
     task = Task(f"{req.request_id}", req)
     TaskPool.add(task)
 
-    scheduler = Scheduler(4, 2, "request_preset,prefill_first", num_scheduler_groups=1)
+    scheduler = Scheduler(
+        100, 4, 2, "request_preset,prefill_first", num_scheduler_groups=1
+    )
     with pytest.raises(Exception) as exc_info:
         scheduler.schedule()
     assert "KV_cache capacity is insufficient to support prefilling" in str(exc_info)
@@ -798,7 +862,7 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
     task = Task(f"{req.request_id}", req)
     TaskPool.add(task)
 
-    scheduler = Scheduler(4, 2, "prefill_first", num_scheduler_groups=1)
+    scheduler = Scheduler(100, 4, 2, "prefill_first", num_scheduler_groups=1)
     task_ids = scheduler.schedule()
     Backend.cache_manager.prepare_cache_prefill(task_ids)
     task._prefix_tokens.append(1)
@@ -872,7 +936,7 @@ def test_evict_decode_task():
     req_2_prefix_tokens = tasks[-2].prefix_tokens
     req_3_prefix_tokens = tasks[-1].prefix_tokens
     scheduler = Scheduler(
-        4, DECODE_NUM_TASKS, "prefill_first,fcfs", num_scheduler_groups=1
+        100, 4, DECODE_NUM_TASKS, "prefill_first,fcfs", num_scheduler_groups=1
     )
     assert scheduler.kvcache_block_threshold == Backend.cache_manager.get_num_blocks()
     task_ids = scheduler.schedule()
@@ -953,7 +1017,7 @@ def test_scheduler_group():
     TaskPool.add(tasks[1])
     TaskPool.add(tasks[5])
 
-    scheduler = Scheduler(4, 2, "prefill_first", num_scheduler_groups=2)
+    scheduler = Scheduler(100, 4, 2, "prefill_first", num_scheduler_groups=2)
 
     # TaskPool: ['req_7', 'req_2', 'req_1', 'req_5']
     # free_sgroups: deque([0, 1]), used_sgroups: set()
@@ -1220,7 +1284,7 @@ def test_pp_chunked_prefill():
         TaskPool.add(task)
 
     scheduler = Scheduler(
-        12, 12, "prefill_first", num_scheduler_groups=4, prefill_chunk_size=200
+        100, 12, 12, "prefill_first", num_scheduler_groups=4, prefill_chunk_size=200
     )
 
     expected_batch_ids_list = [
