@@ -36,6 +36,18 @@ class BatchedRoutedActivation:
 
         raise NotImplementedError()
 
+    def get_chunks_no_larger_than(
+        self, topk_weights: torch.Tensor, max_n_tokens: int
+    ) -> list[tuple["BatchedRoutedActivation", torch.Tensor]]:
+        """
+        Split the BatchedRoutedActivation into multiple BatchedRoutedActivations, each
+        of which contains no more than `max_n_tokens` tokens, including padded tokens.
+
+        Returns a list of (BatchedRoutedActivation chunk, topk_weights chunk) pairs.
+        """
+
+        raise NotImplementedError()
+
 
 @dataclass
 class IndexedBatchedRoutedActivation(BatchedRoutedActivation):
@@ -51,10 +63,37 @@ class IndexedBatchedRoutedActivation(BatchedRoutedActivation):
     activation: torch.Tensor  # [batch_size, hidden_size]
     token_to_expert_indices: torch.Tensor  # [batch_size, topk]
 
+    @override
+    def get_chunks_no_larger_than(
+        self, topk_weights: torch.Tensor, max_n_tokens: int
+    ) -> list[tuple["IndexedBatchedRoutedActivation", torch.Tensor]]:
+        return [
+            (IndexedBatchedRoutedActivation(a, t), w)
+            for a, t, w in zip(
+                torch.split(self.activation, max_n_tokens),
+                torch.split(self.token_to_expert_indices, max_n_tokens),
+                torch.split(topk_weights, max_n_tokens),
+            )
+        ]
+
 
 @dataclass
 class IndexedBatchedRoutedActivationBlockfp8(IndexedBatchedRoutedActivation):
     activation_scale: torch.Tensor  # [batch_size, hidden_size // quant_block_size]
+
+    @override
+    def get_chunks_no_larger_than(
+        self, topk_weights: torch.Tensor, max_n_tokens: int
+    ) -> list[tuple["IndexedBatchedRoutedActivationBlockfp8", torch.Tensor]]:
+        return [
+            (IndexedBatchedRoutedActivationBlockfp8(a, t, s), w)
+            for a, t, s, w in zip(
+                torch.split(self.activation, max_n_tokens),
+                torch.split(self.token_to_expert_indices, max_n_tokens),
+                torch.split(self.activation_scale, max_n_tokens),
+                torch.split(topk_weights, max_n_tokens),
+            )
+        ]
 
 
 @dataclass
@@ -79,6 +118,7 @@ class IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
             n_experts, device=old.token_to_expert_indices.device, dtype=torch.int32
         )
         expert_ids = old.token_to_expert_indices.view(-1)
+        expert_ids = expert_ids[(expert_ids >= 0) & (expert_ids < n_experts)]
         token_cnt_per_expert.index_add_(
             0, expert_ids, torch.ones_like(expert_ids, dtype=torch.int32)
         )
@@ -123,6 +163,7 @@ class IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
             n_experts, device=old.token_to_expert_indices.device, dtype=torch.int32
         )
         expert_ids = old.token_to_expert_indices.view(-1)
+        expert_ids = expert_ids[(expert_ids >= 0) & (expert_ids < n_experts)]
         token_cnt_per_expert.index_add_(
             0, expert_ids, torch.ones_like(expert_ids, dtype=torch.int32)
         )

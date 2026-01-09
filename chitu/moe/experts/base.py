@@ -9,6 +9,7 @@ from typing import Optional
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
+    IndexedBatchedRoutedActivationBlockfp8,
     IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
     IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
     PerExpertDenseBatchedRoutedActivation,
@@ -216,6 +217,16 @@ def fused_experts_wrapper(
 
     elif impl == "ep_group_gemm_contiguous":
         if w1.dtype == torch.float8_e4m3fn and has_deep_gemm:
+            if isinstance(hidden_states, IndexedBatchedRoutedActivationBlockfp8):
+                hidden_states = IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt.convert_from(
+                    hidden_states, n_experts=w1.shape[0], pad_block_size=128
+                )
+            elif isinstance(hidden_states, IndexedBatchedRoutedActivation):
+                hidden_states = (
+                    IndexedBatchedRoutedActivationWithPaddedPerExpertCnt.convert_from(
+                        hidden_states, n_experts=w1.shape[0], pad_block_size=128
+                    )
+                )
             assert isinstance(
                 hidden_states,
                 (

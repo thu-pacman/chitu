@@ -42,6 +42,7 @@ infer:
   memory_utilization: 0.98 # GPU memory utilization for each GPU, e.g., 0.98 means 98% of GPU memory will be used.
   prefill_chunk_size: auto # auto or integer or null. Global prefill chunk size across DP ranks
   moe:
+    prefill_memory_tolerance: 2.0 # In case of EP inbalance, the largest activation tensor will occupy no more than O(prefill_chunk_size / ep_size * prefill_memory_tolerance) memory
     prefill_token_dispatcher: auto # one of: auto, tp, allgather, deepep-nl
     decode_token_dispatcher: auto # one of: auto, tp, allgather, deepep-ll
   mtp_size: 1 # if mtp_size==1, the mtp function is turned off; the mtp function will only be enabled when mtp_size>1.
