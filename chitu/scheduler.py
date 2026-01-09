@@ -308,18 +308,36 @@ class Scheduler:
             prefill_task_ids = prefill_task_ids[:num_chunk_prefill_tasks]
 
         # Check KVCacheManager's capacity
+        #
+        # NOTE: Please directly compute number of blocks here instead of getting from
+        # `Backend.cache_manager`, because here we may be scheduling for another rank.
+        num_used_blocks = 0
+        for task_id in TaskPool.pool.keys():
+            task = TaskPool.pool[task_id]
+            if task.dp_rank == self.dp_rank:
+                cur_blocks = ceil_div(
+                    task.kv_cache_len_used_in_completed_steps,
+                    Backend.cache_manager.get_block_size(),
+                )
+                num_used_blocks += cur_blocks
         num_need_blocks = 0
-        num_additional_blocks_task_need = (
-            Backend.cache_manager.num_additional_blocks_req_need
-        )
-        num_used_blocks = Backend.cache_manager.num_used_blocks
         num_tasks = 0
         for task_id in prefill_task_ids:
             task = TaskPool.pool[task_id]
             target_seq_len = task.consumed_req_tokens + len(task.next_req_tokens())
-            num_need_blocks += num_additional_blocks_task_need(
-                task.req.request_id, target_seq_len
+            assert (
+                task.kv_cache_len_used_in_completed_steps
+                <= task.kv_cache_len_used_in_completed_steps_and_next_step
             )
+            cur_blocks = ceil_div(
+                task.kv_cache_len_used_in_completed_steps,
+                Backend.cache_manager.get_block_size(),
+            )
+            target_blocks = ceil_div(
+                task.kv_cache_len_used_in_completed_steps_and_next_step,
+                Backend.cache_manager.get_block_size(),
+            )
+            num_need_blocks += target_blocks - cur_blocks
             if num_used_blocks + num_need_blocks > self.kvcache_block_threshold:
                 break
             num_tasks += 1
@@ -384,29 +402,30 @@ class Scheduler:
             )
         )
 
-        # Check KVCacheManager's capacity
-        num_additional_blocks_task_need = (
-            Backend.cache_manager.num_additional_blocks_req_need
-        )
-
         def has_enough_block():
-            # Eviction for DP rank > 0 is not supported yet, because we need a way
-            # to access the page table on another rank. (TODO)
-            if self.dp_rank > 0:
-                return True
-
+            # NOTE: Please directly compute number of blocks here instead of getting from
+            # `Backend.cache_manager`, because here we may be scheduling for another rank.
             num_need_blocks = 0
-            for task_id in decode_task_ids:
+            for task_id in TaskPool.pool.keys():
                 task = TaskPool.pool[task_id]
-                if task.has_model_run():
-                    num_need_blocks += num_additional_blocks_task_need(
-                        task.req.request_id, task.prefix_tokens_len
-                    )
-            num_free_blocks = Backend.cache_manager.num_free_blocks
-            if num_free_blocks >= num_need_blocks:
+                assert (
+                    task.kv_cache_len_used_in_completed_steps
+                    <= task.kv_cache_len_used_in_completed_steps_and_next_step
+                )
+                if task_id in decode_task_ids:
+                    seq_len = task.kv_cache_len_used_in_completed_steps_and_next_step
+                elif task.dp_rank == self.dp_rank:
+                    seq_len = task.kv_cache_len_used_in_completed_steps
+                else:
+                    seq_len = 0
+                num_need_blocks += ceil_div(
+                    seq_len, Backend.cache_manager.get_block_size()
+                )
+            if num_need_blocks <= Backend.cache_manager.get_num_blocks():
                 return True
             logger.debug(
-                f"Cache manager has no more free blocks to support current decoding tasks: need {num_need_blocks} free blocks, cache manager has {num_free_blocks} free blocks"
+                f"Cache manager has no more free blocks to support current decoding tasks: "
+                f"need {num_need_blocks} blocks in total, but only {Backend.cache_manager.get_num_blocks()} blocks in total."
             )
             return False
 
@@ -423,7 +442,7 @@ class Scheduler:
 
         if len(evicted_tasks) > 0:
             logger.warning(
-                f"KV cache capacity reached limit, forcing eviction of {len(evicted_tasks)} decode tasks, this may impact throughput and latency. To prevent performance degradation, consider increasing max_reqs or num_blocks."
+                f"KV cache capacity reached limit, forcing eviction of {len(evicted_tasks)} decode tasks, this may impact throughput and latency. To prevent performance degradation, consider decreasing max_reqs or increasing or num_blocks."
             )
 
         return decode_task_ids

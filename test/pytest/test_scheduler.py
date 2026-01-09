@@ -773,7 +773,7 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
         OmegaConf.create(
             {
                 "infer": {
-                    "max_seq_len": 1024,
+                    "max_seq_len": 1024000,  # Larger than kv_cache capacity
                     "op_impl": "torch",
                     "cache_type": "paged",
                     "schedule_overlap": True,

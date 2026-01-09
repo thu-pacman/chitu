@@ -718,6 +718,26 @@ class Task:
             sched_group_id=self.sched_group_id,
         )
 
+    @property
+    def kv_cache_len_used_in_completed_steps(self):
+        if self.task_type == TaskType.Prefill:
+            return self.consumed_req_tokens
+        elif self.task_type == TaskType.Decode:
+            return len(self._prefix_tokens) - (
+                self.num_new_tokens_single_step if self.sync_new_token else 0
+            )
+        else:
+            assert False
+
+    @property
+    def kv_cache_len_used_in_completed_steps_and_next_step(self):
+        if self.task_type == TaskType.Prefill:
+            return self.consumed_req_tokens + self.next_req_tokens_len
+        elif self.task_type == TaskType.Decode:
+            return min(self.prefix_tokens_len, get_global_args().infer.max_seq_len)
+        else:
+            assert False
+
 
 def taskid2reqid(task_id):
     return TaskPool.pool[task_id].req.request_id
