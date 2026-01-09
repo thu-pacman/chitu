@@ -707,9 +707,12 @@ class Task:
         return self.next_token >= 0
 
     def get_msgpackable_task(self) -> MsgPackableTask:
+        is_first_prefill = (
+            self.task_type == TaskType.Prefill and self.consumed_req_tokens == 0
+        )
         return MsgPackableTask(
             task_id=self.task_id,
-            tokens=self._prefix_tokens,
+            tokens=self._prefix_tokens if is_first_prefill else [],
             params=self.params,
             consumed_req_tokens=self.consumed_req_tokens,
             prefill_chunk_size=self.prefill_chunk_size,
@@ -1376,8 +1379,16 @@ class PackedTasks(PackedTasksBase):
             task.update_decode_status()
 
 
+def asdict_light(obj):
+    data = {k: getattr(obj, k) for k in type(obj).__dataclass_fields__}
+    if type(obj) == MsgPackableTask:
+        data["params"] = asdict_light(data["params"])
+        # data["tokens"] = data["tokens"].tobytes() # when token is numpy
+    return data
+
+
 def serialize_tasks(tasks: list[Task]) -> bytes:
-    tasks_data = [asdict(task) for task in tasks]
+    tasks_data = [asdict_light(task) for task in tasks]
     return msgpack.packb(tasks_data, use_bin_type=True)
 
 
