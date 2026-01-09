@@ -187,7 +187,8 @@ class UserRequest:
         self.finish_reason = None
         self.max_new_tokens = max_new_tokens
         self.num_output_tokens = 0
-        self.num_remain_tokens = 0
+        self.will_finish = False
+        self.finished = False
 
         # test information related
         self._test_flag = False
@@ -223,6 +224,8 @@ class UserRequest:
         *,
         notify_server: bool = True,
     ):
+        if self.finished:
+            return
         if not isinstance(value, list):
             value = [value]
         for i in value:
@@ -232,14 +235,16 @@ class UserRequest:
             logger.debug(f"add data: {i}")
 
         self.num_output_tokens += len(value)
-        self.num_remain_tokens -= len(value)
-        if self.finish_reason is not None and self.num_remain_tokens == 0:
-            # close stream
-            self.output = repr("".join(self.async_stream.seqs))
-            self.async_stream.send_stop_signal()
-            self.completed.set()
-            self.completion_time = time.monotonic()
-            TaskLoad.reduce(len(self.prompt_tokens) + self.num_output_tokens)
+        if self.will_finish:
+            self.finished = True
+
+    def finish(self):
+        self.finished = True
+        self.output = repr("".join(self.async_stream.seqs))
+        self.async_stream.send_stop_signal()
+        self.completed.set()
+        self.completion_time = time.monotonic()
+        TaskLoad.reduce(len(self.prompt_tokens) + self.num_output_tokens)
 
     def notify_server_data_added_from_server_thread(self):
         self.async_stream.notify_server_from_server_thread()
@@ -532,8 +537,6 @@ class Task:
             self.next_token = self.req._test_standard_tokens[self.num_new_tokens].item()
 
         self.num_new_tokens += self.num_new_tokens_single_step
-        if self.req is not None:
-            self.req.num_remain_tokens += self.num_new_tokens_single_step
         self.sync_new_token = False
 
     def update_prefix(self):
@@ -813,6 +816,12 @@ class TaskPool:
     @classmethod
     def remove(cls, task_id: str):
         assert task_id in cls.pool, "Task not found in pool"
+        # stop requests
+        if isinstance(cls.pool[task_id].req, UserRequest):
+            if get_global_args().infer.schedule_overlap:
+                cls.pool[task_id].req.finish()
+            else:
+                cls.pool[task_id].req.will_finish = True
         if PackedTasksBase.response_list_manager is not None:
             PackedTasksBase.response_list_manager.remove_list(
                 cls.pool[task_id].response
@@ -1439,7 +1448,7 @@ class TaskCollector:
 
     @staticmethod
     def process_last_batch_results():
-        if TaskCollector.has_batch_results():
+        while TaskCollector.has_batch_results():
             Backend.executor.postprocess_async_part(
                 TaskCollector._last_batch_results.popleft()
             )

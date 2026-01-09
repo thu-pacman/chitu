@@ -81,7 +81,14 @@ class MockTokenizer:
 def test_chunked_prefill():
     set_global_args(
         OmegaConf.create(
-            {"infer": {"max_seq_len": 32768, "op_impl": "torch", "cache_type": "paged"}}
+            {
+                "infer": {
+                    "max_seq_len": 32768,
+                    "op_impl": "torch",
+                    "cache_type": "paged",
+                    "schedule_overlap": True,
+                }
+            }
         ),
         need_ensure=False,
     )
@@ -145,6 +152,7 @@ def test_chunked_prefill_skew():
                     "cache_type": "skew",
                     "pp_size": 2,
                     "dp_size": 1,
+                    "schedule_overlap": True,
                 }
             }
         ),
@@ -227,7 +235,14 @@ def test_chunked_prefill_skew():
 def test_priority_prefill_first():
     set_global_args(
         OmegaConf.create(
-            {"infer": {"max_seq_len": 1024, "op_impl": "torch", "cache_type": "paged"}}
+            {
+                "infer": {
+                    "max_seq_len": 1024,
+                    "op_impl": "torch",
+                    "cache_type": "paged",
+                    "schedule_overlap": True,
+                }
+            }
         ),
         need_ensure=False,
     )
@@ -296,6 +311,7 @@ def test_priority_prefill_first_skew():
                     "cache_type": "skew",
                     "pp_size": 1,
                     "dp_size": 1,
+                    "schedule_overlap": True,
                 }
             }
         ),
@@ -383,7 +399,14 @@ def test_priority_prefill_first_skew():
 def test_priority_fcfs():
     set_global_args(
         OmegaConf.create(
-            {"infer": {"max_seq_len": 1024, "op_impl": "torch", "cache_type": "paged"}}
+            {
+                "infer": {
+                    "max_seq_len": 1024,
+                    "op_impl": "torch",
+                    "cache_type": "paged",
+                    "schedule_overlap": True,
+                }
+            }
         ),
         need_ensure=False,
     )
@@ -447,6 +470,7 @@ def test_priority_fcfs_skew():
                     "cache_type": "skew",
                     "pp_size": 1,
                     "dp_size": 1,
+                    "schedule_overlap": True,
                 }
             }
         ),
@@ -536,7 +560,14 @@ def test_priority_fcfs_skew():
 def test_priority_request_preset_over_prefill_first():
     set_global_args(
         OmegaConf.create(
-            {"infer": {"max_seq_len": 1024, "op_impl": "torch", "cache_type": "paged"}}
+            {
+                "infer": {
+                    "max_seq_len": 1024,
+                    "op_impl": "torch",
+                    "cache_type": "paged",
+                    "schedule_overlap": True,
+                }
+            }
         ),
         need_ensure=False,
     )
@@ -609,6 +640,7 @@ def test_priority_request_preset_over_prefill_first_skew():
                     "cache_type": "skew",
                     "pp_size": 1,
                     "dp_size": 1,
+                    "schedule_overlap": True,
                 }
             }
         ),
@@ -698,7 +730,14 @@ def test_single_prompt_seq_bigger_than_scheduler_capacity():
     """test when single prompt length is bigger than scheduler capacity, which equals NUM_BLOCKS*BLOCK_SIZE"""
     set_global_args(
         OmegaConf.create(
-            {"infer": {"max_seq_len": 2048, "op_impl": "torch", "cache_type": "paged"}}
+            {
+                "infer": {
+                    "max_seq_len": 2048,
+                    "op_impl": "torch",
+                    "cache_type": "paged",
+                    "schedule_overlap": True,
+                }
+            }
         ),
         need_ensure=False,
     )
@@ -732,7 +771,14 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
     """
     set_global_args(
         OmegaConf.create(
-            {"infer": {"max_seq_len": 1024, "op_impl": "torch", "cache_type": "paged"}}
+            {
+                "infer": {
+                    "max_seq_len": 1024,
+                    "op_impl": "torch",
+                    "cache_type": "paged",
+                    "schedule_overlap": True,
+                }
+            }
         ),
         need_ensure=False,
     )
@@ -779,7 +825,14 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
 def test_evict_decode_task():
     set_global_args(
         OmegaConf.create(
-            {"infer": {"max_seq_len": 5123, "cache_type": "paged", "op_impl": "torch"}}
+            {
+                "infer": {
+                    "max_seq_len": 5123,
+                    "cache_type": "paged",
+                    "op_impl": "torch",
+                    "schedule_overlap": True,
+                }
+            }
         ),
         need_ensure=False,
     )
@@ -871,6 +924,7 @@ def test_scheduler_group():
                     "op_impl": "torch",
                     "cache_type": "paged",
                     "pp_size": 2,
+                    "schedule_overlap": True,
                 }
             }
         ),
@@ -1001,6 +1055,7 @@ def test_slot_group_skew():
                     "cache_type": "skew",
                     "pp_size": 2,
                     "dp_size": 1,
+                    "schedule_overlap": True,
                 }
             }
         ),
@@ -1140,6 +1195,7 @@ def test_pp_chunked_prefill():
                     "max_seq_len": 1024,
                     "op_impl": "torch",
                     "cache_type": "paged",
+                    "schedule_overlap": True,
                 }
             }
         ),
