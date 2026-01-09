@@ -56,6 +56,7 @@ class InferConfig:
 
     @dataclass
     class MoEConfig:
+        prefill_memory_tolerance: float = MISSING
         prefill_token_dispatcher: str = MISSING
         decode_token_dispatcher: str = MISSING
 

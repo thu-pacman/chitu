@@ -73,6 +73,9 @@ class LocalTokenSink:
                 task_list, token_list, logprobs_list, token_idxs_list
             ):
                 task.req.add_data(token, logprobs, token_idxs, notify_server=False)
+        for task in task_list:
+            if task.need_remove():
+                task.req.finish()
 
         def notify_all_response_in_batch():
             for task in task_list:

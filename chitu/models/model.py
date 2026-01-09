@@ -1265,6 +1265,7 @@ class ParallelMoeBlock(nn.Module):
         moe_impl: Optional[MoEImplBase] = None,
         *,
         enable_dynamic_load_balance: Optional[bool] = None,
+        prefill_memory_tolerance: Optional[float] = None,
         checkpoint_prefix: str,
     ):
         super().__init__()
@@ -1299,6 +1300,12 @@ class ParallelMoeBlock(nn.Module):
             enable_dynamic_load_balance = get_global_args().infer.moe_lb_trigger > 0
         self.enable_dynamic_load_balance = enable_dynamic_load_balance
 
+        if prefill_memory_tolerance is None:
+            prefill_memory_tolerance = (
+                get_global_args().infer.moe.prefill_memory_tolerance
+            )
+        self.prefill_memory_tolerance = prefill_memory_tolerance
+
     def forward(self, x: torch.Tensor, inplace: bool = True) -> torch.Tensor:
         """
         Forward pass for the MoE block.
@@ -1311,8 +1318,8 @@ class ParallelMoeBlock(nn.Module):
             torch.Tensor: Output tensor after expert routing and computation.
         """
         shape = x.shape  # [TODO] unify decode hidden states shape
-        # logger.info(f"hidden staetes shape in MoE block: {shape}")
-        x = x.view(-1, x.shape[-1])
+        hidden_size = x.shape[-1]
+        x = x.view(-1, hidden_size)
 
         weights, indices = self.gate(x)
         rerouted_indices = None
@@ -1365,12 +1372,48 @@ class ParallelMoeBlock(nn.Module):
         elif self.moe_impl.ep_size == 1:
             experts_impl = self.moe_impl.get_experts_impl()
 
-        y = self.experts(
-            routed_x,
-            weights,
-            inplace=inplace and not x_in_use_simultenously,
-            impl=experts_impl,
-        )
+        if (
+            self.moe_impl.task_type == TaskType.Prefill
+            and self.moe_impl.ep_size > 1
+            and self.prefill_memory_tolerance < self.moe_impl.ep_size
+            and get_global_args().infer.prefill_chunk_size is not None
+        ):
+            max_n_tokens_per_chunk = int(
+                get_global_args().infer.prefill_chunk_size
+                / self.moe_impl.ep_size
+                * self.prefill_memory_tolerance
+            )
+            try:
+                chunks = routed_x.get_chunks_no_larger_than(
+                    weights, max_n_tokens_per_chunk
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Unable to chunk {type(routed_x)}: {e}. Ignoring `prefill_memory_tolerance`."
+                )
+                chunks = [(routed_x, weights)]
+        else:
+            chunks = [(routed_x, weights)]
+
+        y_list = []
+        for routed_x_item, weights_item in chunks:
+            y_list.append(
+                self.experts(
+                    routed_x_item,
+                    weights_item,
+                    inplace=inplace and not x_in_use_simultenously,
+                    impl=experts_impl,
+                )
+            )
+        assert len(y_list) > 0
+        if len(y_list) == 1:
+            y = y_list[0]
+        else:
+            for y_item in y_list:
+                assert (
+                    y_item.ndim == 2 and y_item.shape[-1] == hidden_size
+                ), "Only (token,hidden_size)-shaped chunk output can be joined"
+            y = torch.cat(y_list, dim=0)
 
         if shared_y is not None and self.moe_impl.tp_size > 1:
             # we need to reduce shared_y on tp group, if this group equals the group reduce y later, we can merge them together

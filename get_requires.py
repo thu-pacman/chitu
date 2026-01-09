@@ -20,7 +20,7 @@ install_requires = [
     #    torch back to the official version, please use `-c` on `pip`.
     "torch",
     "torchvision",
-    "transformers[torch]>=4.49.0,<=4.57.3",  # >=4.49.0 required by gptqmodel when quant enabled
+    "transformers[torch]>=4.57.3",  # >=4.57.3 required by qwen3-vl-235b
     "safetensors",
     "fire",
     "tiktoken>=0.7.0",  # Required by glm4
@@ -46,7 +46,6 @@ extras_require = {
         "bitsandbytes",
         "autoawq-kernels==0.0.9",
         "autoawq[kernels]",
-        "transformers>=4.49.0,<=4.57.3",  # >=4.49.0 required by gptqmodel 2.2.0
         "gptqmodel>=2.2.0,<4.0.0",  # <4.0.0: gptqmodel 4.x requires torch>=2.7.1 and numpy>=2.2.6, incompatible with base image torch==2.7.0
         "tokenizers>=0.20.3",
     ],

@@ -192,6 +192,7 @@ def test_parallel_moe_block(
             layer_id=0,
             moe_impl=moe_impl,
             enable_dynamic_load_balance=False,
+            prefill_memory_tolerance=float("inf"),
             checkpoint_prefix="ffn",
         )
         state_dict = {
@@ -268,6 +269,7 @@ def test_parallel_moe_block(
             layer_id=0,
             moe_impl=ref_moe_impl,
             enable_dynamic_load_balance=False,
+            prefill_memory_tolerance=float("inf"),
             checkpoint_prefix="ffn",
         )
         ref_state_dict = {
@@ -498,6 +500,7 @@ def test_parallel_moe_block_blockfp8(
             layer_id=0,
             moe_impl=moe_impl,
             enable_dynamic_load_balance=False,
+            prefill_memory_tolerance=float("inf"),
             checkpoint_prefix="ffn",
         )
         state_dict = {
@@ -605,6 +608,7 @@ def test_parallel_moe_block_blockfp8(
             layer_id=0,
             moe_impl=ref_moe_impl,
             enable_dynamic_load_balance=False,
+            prefill_memory_tolerance=float("inf"),
             checkpoint_prefix="ffn",
         )
         ref_state_dict = {
