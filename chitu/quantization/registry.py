@@ -15,6 +15,7 @@ from chitu.quantization.base import (
 )
 from chitu.quantization.utils import (
     get_quant_from_checkpoint_prefix,
+    get_quant_kwargs_from_checkpoint_prefix,
     get_backend_from_checkpoint_prefix,
 )
 from chitu.distributed.parallel_state import get_tp_size
@@ -234,44 +235,20 @@ class QuantizationRegistry:
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
         checkpoint_prefix="",
     ) -> Type:
-        args = get_global_args()
-        quant_cfg = getattr(args.models, "quant_config", None)
-        if quant_cfg is None:
-            return cls._get_quantized_class(class_type, None, quant_kwargs=quant_kwargs)
-
-        rules = getattr(quant_cfg, "rules", [])
-        backend_type = get_backend_from_checkpoint_prefix(checkpoint_prefix)
-        for rule in rules:
-            pattern = rule.get("regex")
-            if not pattern or not re.search(pattern, checkpoint_prefix):
-                continue
-
-            layers = rule.get("layers")
-            if layers:
-                match = re.search(r"layers\.(\d+)\.", checkpoint_prefix)
-                if match:
-                    layer_id = int(match.group(1))
-                    if layer_id not in layers:
-                        continue
-
-            method = getattr(rule, "type", None)
-            if not method:
-                method = quant_cfg.type
-            rule_kwargs = rule.get("kwargs", {})
-            method_kwargs = quant_kwargs.get(method, {})
-            merged_kwargs = {**rule_kwargs, **method_kwargs}
-            return cls._get_quantized_class(
-                class_type,
-                method,
-                quant_kwargs={method: merged_kwargs},
-                backend_type=backend_type,
-            )
-
+        method = get_quant_from_checkpoint_prefix(checkpoint_prefix)
+        kwargs_of_method_from_user = quant_kwargs.get(method, {})
+        kwargs_of_method_from_rules = get_quant_kwargs_from_checkpoint_prefix(
+            checkpoint_prefix
+        )
+        joined_kwargs_of_method = {
+            **kwargs_of_method_from_rules,
+            **kwargs_of_method_from_user,
+        }
         return cls._get_quantized_class(
             class_type,
-            None,
-            quant_kwargs=quant_kwargs,
-            backend_type=backend_type,
+            method,
+            quant_kwargs={method: joined_kwargs_of_method},
+            backend_type=get_backend_from_checkpoint_prefix(checkpoint_prefix),
         )
 
     @classmethod

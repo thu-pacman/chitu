@@ -75,11 +75,11 @@ def get_hcomm_info(rank, comm_group):
 
 
 def _fused_experts_npu_tp_split(
-    input: torch.Tensor, n_local_experts=-1, is_expert_ids=False
+    input: torch.Tensor, n_local_experts=-1, is_expert_ids=False, is_zero_batch_ok=False
 ):
     rank_in_group = get_tp_group().rank_in_group
     output = torch.tensor_split(input, get_tp_size())[rank_in_group]
-    if output.shape[0] > 0:
+    if output.shape[0] > 0 or is_zero_batch_ok:
         return output
 
     # zero batch size is not allowed, so we need to returns a dummy tensor
@@ -128,8 +128,10 @@ def fused_experts_npu_with_a2a_communication(
     if get_tp_size() > 1:
         # split inputs from tp group into ep rank
         origin_bs = hidden_states.shape[0]
-        hidden_states = _fused_experts_npu_tp_split(hidden_states)
-        topk_weights = _fused_experts_npu_tp_split(topk_weights)
+        hidden_states = _fused_experts_npu_tp_split(
+            hidden_states, is_zero_batch_ok=True
+        )
+        topk_weights = _fused_experts_npu_tp_split(topk_weights, is_zero_batch_ok=True)
         topk_ids = _fused_experts_npu_tp_split(
             topk_ids, n_local_experts, is_expert_ids=True
         )
@@ -144,24 +146,43 @@ def fused_experts_npu_with_a2a_communication(
     max_num_deployed_expert = n_local_experts * ep_size
 
     if get_etp_size() == 1 or get_etp_group().is_first_rank:
-        (
-            expanded_x,
-            expanded_row_idx,
-            n_tokens_per_expert_local_dp_rank,
-            pertoken_scale,
-        ) = torch_npu.npu_moe_init_routing_v2(
-            hidden_states,
-            expert_idx=topk_ids,
-            scale=None,
-            expert_num=max_num_deployed_expert,
-            active_expert_range=[0, max_num_deployed_expert],
-            expert_tokens_num_type=1,
-            expert_tokens_num_flag=True,
-            active_num=topk_ids.numel(),
-            drop_pad_mode=0,
-            row_idx_type=0,
-            quant_mode=1 if use_int8_w8a8 else -1,
-        )
+        if not hidden_states.shape[0] == 0:
+            (
+                expanded_x,
+                expanded_row_idx,
+                n_tokens_per_expert_local_dp_rank,
+                pertoken_scale,
+            ) = torch_npu.npu_moe_init_routing_v2(
+                hidden_states,
+                expert_idx=topk_ids,
+                scale=None,
+                expert_num=max_num_deployed_expert,
+                active_expert_range=[0, max_num_deployed_expert],
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                active_num=topk_ids.numel(),
+                drop_pad_mode=0,
+                row_idx_type=0,
+                quant_mode=1 if use_int8_w8a8 else -1,
+            )
+        else:
+            expanded_x = torch.empty(
+                0,
+                hidden_dim,
+                device=hidden_states.device,
+                dtype=torch.int8 if use_int8_w8a8 else hidden_states.dtype,
+            )
+            expanded_row_idx = torch.empty(
+                0, device=hidden_states.device, dtype=torch.int32
+            )
+            n_tokens_per_expert_local_dp_rank = torch.zeros(
+                max_num_deployed_expert, device=hidden_states.device, dtype=torch.int64
+            )
+            if use_int8_w8a8:
+                pertoken_scale = torch.empty(
+                    0, device=hidden_states.device, dtype=torch.float32
+                )
+
         assert tuple(expanded_x.shape) == (bs * topk, hidden_dim)
         assert tuple(expanded_row_idx.shape) == (bs * topk,)
         assert expanded_row_idx.dtype == torch.int32
@@ -332,6 +353,7 @@ def fused_experts_npu_with_communication(
     layer_id: int = 0,
     **kwargs,
 ):
+    origin_bs = hidden_states.shape[0]
     n_local_experts = w1.shape[0]
     rank = torch.distributed.get_rank()
 
@@ -348,9 +370,8 @@ def fused_experts_npu_with_communication(
 
     if get_etp_size() > 1:
         raise NotImplementedError
-    if get_tp_size() > 1:
+    if get_tp_size() > 1 or origin_bs == 0:
         # split inputs from tp group into ep rank
-        origin_bs = hidden_states.shape[0]
         hidden_states = _fused_experts_npu_tp_split(hidden_states)
         topk_weights = _fused_experts_npu_tp_split(topk_weights)
         topk_ids = _fused_experts_npu_tp_split(
@@ -466,8 +487,18 @@ def fused_experts_npu_with_communication(
         comm_quant_mode=2 if use_int8_w8a8 else 0,
     )
 
+    if origin_bs == 0:
+        hidden_states = torch.empty(
+            0,
+            hidden_states.shape[1],
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        return hidden_states
+
     if get_tp_size() > 1:
         hidden_states = _fused_experts_npu_tp_all_gather(hidden_states, origin_bs)
+
     return hidden_states
 
 

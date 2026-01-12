@@ -13,6 +13,7 @@ def get_quant_kwargs_from_checkpoint_prefix(
     if not rules:
         rules = get_global_args().models.quant_config.rules
 
+    checkpoint_prefix = f".{checkpoint_prefix}."  # compitable with prefix.{name}.suffix and prefix.{name} and {name}.suffix
     for rule in rules:
         pattern = rule.get("regex")
         if not pattern:
@@ -37,6 +38,7 @@ def get_quant_kwargs_from_checkpoint_prefix(
 def get_quant_from_checkpoint_prefix(checkpoint_prefix: str, rules={}) -> Optional[str]:
     if not rules:
         rules = get_global_args().models.quant_config.rules
+    checkpoint_prefix = f".{checkpoint_prefix}."  # compitable with prefix.{name}.suffix and prefix.{name} and {name}.suffix
     for rule in rules:
         pattern = rule.get("regex")
         if pattern and re.search(pattern, checkpoint_prefix):
@@ -54,6 +56,7 @@ def get_quant_from_checkpoint_prefix(checkpoint_prefix: str, rules={}) -> Option
 def get_backend_from_checkpoint_prefix(checkpoint_prefix: str, rules={}) -> str:
     if not rules:
         rules = get_global_args().models.backend_config.rules
+    checkpoint_prefix = f".{checkpoint_prefix}."  # compitable with prefix.{name}.suffix and prefix.{name} and {name}.suffix
     for rule in rules:
         pattern = rule.get("regex")
         if pattern and re.search(pattern, checkpoint_prefix):
@@ -71,6 +74,7 @@ def get_backend_from_checkpoint_prefix(checkpoint_prefix: str, rules={}) -> str:
 def get_layer_id_from_checkpoint_prefix(checkpoint_prefix: str, rules={}) -> int:
     if not rules:
         rules = get_global_args().models.quant_config.rules
+    checkpoint_prefix = f".{checkpoint_prefix}."  # compitable with prefix.{name}.suffix and prefix.{name} and {name}.suffix
     for rule in rules:
         pattern = rule.get("regex")
         if pattern and re.search(pattern, checkpoint_prefix):

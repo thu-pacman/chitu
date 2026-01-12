@@ -7,6 +7,7 @@ import operator
 import os
 from logging import getLogger
 import psutil
+import random
 import traceback
 from tqdm import tqdm
 
@@ -716,14 +717,19 @@ def chitu_run_main_rank():
         assert len(Backend.schedulers) == 1
         task_ids = Backend.schedulers[0].schedule()
     else:
+        # Make new-coming tasks go to a random DP rank to improve load balance.
+        # This is achieved by randomly shuffle the scheduler list.
+        id_and_scheduler_list = list(enumerate(Backend.schedulers))
+        random.shuffle(id_and_scheduler_list)
+
         strict_allowed_task_type_list = [{TaskType.Prefill}, {TaskType.Decode}]
         for strict_allowed_task_type in strict_allowed_task_type_list:
-            task_ids_list = []
-            for scheduler in Backend.schedulers:
+            task_ids_list = [None] * len(id_and_scheduler_list)
+            for i, scheduler in id_and_scheduler_list:
                 task_ids = scheduler.schedule(
                     strict_allowed_task_type=strict_allowed_task_type
                 )
-                task_ids_list.append(task_ids)
+                task_ids_list[i] = task_ids
             if any((len(task_ids) > 0 for task_ids in task_ids_list)):
                 DPTaskCollector.prepare_dp_tasks(task_ids_list)
                 task_ids = task_ids_list[0]
