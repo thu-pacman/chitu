@@ -288,6 +288,19 @@ class Transformer(nn.Module):
             self.main_last_hidden_states_up_to_date = False
             self.lhs_ = None
 
+        dummy_input_shape = [0, self.params.dim]
+        self.dummy_input = torch.empty(
+            dummy_input_shape,
+            dtype=torch.get_default_dtype(),
+            device=self.local_rank,
+        )
+
+        self.graph_dummy_output = torch.empty(
+            [1],
+            dtype=torch.get_default_dtype(),
+            device=self.local_rank,
+        )
+
     def _get_tensor_column_parallel_layer_names(self) -> list[str]:
         raise NotImplementedError
 
@@ -949,9 +962,48 @@ class Transformer(nn.Module):
         return h
 
     @torch.inference_mode()
+    def empty_prefill(self) -> torch.Tensor:
+        if self.ep_size > 1:
+            for it, layer in enumerate(self.layers):
+                if it < self.moe_impl.n_dense_layers:
+                    continue
+                layer.mlp(self.dummy_input)
+        return None
+
+    @torch.inference_mode()
+    def empty_decode(self):
+        layer_main = self.layers[0:-1] if self.mtp_size > 1 else self.layers
+        for it, layer in enumerate(layer_main):
+            if it < self.moe_impl.n_dense_layers:
+                continue
+            layer.mlp(self.dummy_input)
+        return self.graph_dummy_output
+
+    @torch.inference_mode()
+    def empty_mtp_decode(self):
+        self.layers[-1].mlp(self.dummy_input)
+        return self.graph_dummy_output
+
+    @torch.inference_mode()
+    def empty_mtp_decode_total(self, func, key, func_mtp, key_mtp):
+        for i in range(0, self.mtp_size):
+            func_mtp(key_mtp)
+
+        if (
+            self.moe_impl is not None
+            and self.moe_impl.decode_token_dispatcher_impl == "allgather"
+        ):
+            self.moe_impl.prepare(TaskType.Decode, self.dummy_input.shape[0])
+
+        return func(key)
+
+    @torch.inference_mode()
     def prefill(
         self, tokens, output_token_offsets: torch.Tensor, **args
     ) -> torch.Tensor:
+        if tokens.shape[0] == 0:
+            return self.empty_prefill()
+
         self.attn_backend.prepare_metadata_for_prefill(self.cache.seq_len_delta)
         if self.pipeline_exec:
             return self.prefill_pipeline(tokens, output_token_offsets, **args)
@@ -1027,7 +1079,7 @@ class Transformer(nn.Module):
         return self.prepare_freqs_cis_mtp()
 
     @torch.inference_mode()
-    def decode(self, tokens, batch_size):
+    def decode(self, tokens, batch_size, is_empty_step: bool = False):
         if isinstance(self.cache, DenseKVCacheManager):
             key = (batch_size, self.cache.get_start_and_end_idx()[0])
         elif isinstance(self.cache, PagedKVCacheManager):
@@ -1035,7 +1087,7 @@ class Transformer(nn.Module):
         else:
             assert False
 
-        if not self.mtp_size > 1:
+        if not self.mtp_size > 1 and not is_empty_step:
             self.prepare_decoding_attn()
 
         infer_args = get_global_args().infer
@@ -1124,18 +1176,59 @@ class Transformer(nn.Module):
 
                 self.do_decode_callable_mtp = do_decode_mtp
 
-        if self.mtp_size > 1:
-            return self.mtp_decode_no_pipeline_total(
-                tokens,
-                self.do_decode_callable,
-                key + ("main",),
-                self.do_decode_callable_mtp,
-                key + ("mtp",),
-                extra_inputs,
-                extra_inputs_mtp,
-            )
+            if self.ep_size > 1:
+
+                @make_dispatched_graphed_callables(
+                    args_max_nelem=(),
+                    kwargs_max_nelem={},
+                    output_max_nelem_callback=lambda key, n: 1,
+                    before_replay_callback=None,
+                    enable=current_cuda_graph_enabled,
+                )
+                def do_empty_decode():
+                    return self.empty_decode()
+
+                self.do_empty_decode_callable = do_empty_decode
+
+                if self.mtp_size > 1:
+
+                    @make_dispatched_graphed_callables(
+                        args_max_nelem=(),
+                        kwargs_max_nelem={},
+                        output_max_nelem_callback=lambda key, n: 1,
+                        before_replay_callback=None,
+                        enable=current_cuda_graph_enabled,
+                    )
+                    def do_empty_decode_mtp():
+                        return self.empty_mtp_decode()
+
+                    self.do_empty_decode_callable_mtp = do_empty_decode_mtp
+
+        if not is_empty_step:
+            if self.mtp_size > 1:
+                return self.mtp_decode_no_pipeline_total(
+                    tokens,
+                    self.do_decode_callable,
+                    key + ("main",),
+                    self.do_decode_callable_mtp,
+                    key + ("mtp",),
+                    extra_inputs,
+                    extra_inputs_mtp,
+                )
+            else:
+                return self.do_decode_callable(key, tokens, *extra_inputs)
         else:
-            return self.do_decode_callable(key, tokens, *extra_inputs)
+            if not self.ep_size > 1:
+                return None
+            if self.mtp_size > 1:
+                return self.empty_mtp_decode_total(
+                    self.do_empty_decode_callable,
+                    (1,) + ("empty_main",),
+                    self.do_empty_decode_callable_mtp,
+                    (1,) + ("empty_mtp",),
+                )
+            else:
+                return self.do_empty_decode_callable((1,) + ("empty",))
 
 
 class MoeGate(nn.Module):

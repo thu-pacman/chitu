@@ -133,6 +133,11 @@ class AscendW8A8Linear(
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
 
+        if x.shape[0] == 0:
+            return torch.empty(
+                [0, self.out_features], dtype=torch.get_default_dtype(), device=x.device
+            )
+
         self._maybe_build_quant_params()
 
         if x.dtype != torch.int8:
@@ -203,6 +208,8 @@ class AscendW8A8DynamicLinear(
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[0] == 0:
+            return torch.empty([0, self.out_features], dtype=x.dtype, device=x.device)
         output_dtype = x.dtype
         quantized_x, dynamic_scale = torch_npu.npu_dynamic_quant(
             x.view(-1, self.in_features)

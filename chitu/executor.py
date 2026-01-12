@@ -624,14 +624,6 @@ class Executor:
         )
         self.empty_decode_step_graph = None
         self.empty_decode_step_graph_mtp = None
-        dummy_input_shape = (
-            [1, args.models.dim] if is_ascend() else [0, args.models.dim]
-        )
-        self.dummy_input = torch.empty(
-            dummy_input_shape,
-            dtype=torch.get_default_dtype(),
-            device=self.local_rank,
-        )
         self.dummy_logits = torch.empty(
             [0, args.models.vocab_size], dtype=torch.float32, device=self.local_rank
         )
@@ -844,16 +836,20 @@ class Executor:
         tasks.update_by_decode_status()
 
         if self.moe_impl is not None:
-            self.moe_impl.prepare(tasks.task_type, tasks.num_tokens)
+            tasks_num_tokens = (
+                tasks.num_tokens * self.mtp_size
+                if (
+                    self.moe_impl.ep_size > 1
+                    and self.moe_impl.decode_token_dispatcher_impl == "deepep-ll"
+                )
+                else tasks.num_tokens
+            )
+            self.moe_impl.prepare(tasks.task_type, tasks_num_tokens)
 
-        if tasks.task_type == TaskType.Prefill:
-            out = self.prefill_step(tasks)
-        elif tasks.task_type == TaskType.Decode:
-            out = self.decode_step(tasks)
-        elif tasks.task_type == TaskType.EmptyPrefill:
-            out = self.empty_prefill_step(tasks)
-        elif tasks.task_type == TaskType.EmptyDecode:
-            out = self.empty_decode_step(tasks)
+        if tasks.task_type in [TaskType.Prefill, TaskType.EmptyPrefill]:
+            out = self.prefill_step(tasks, tasks.task_type == TaskType.EmptyPrefill)
+        elif tasks.task_type in [TaskType.Decode, TaskType.EmptyDecode]:
+            out = self.decode_step(tasks, tasks.task_type == TaskType.EmptyDecode)
         else:
             raise NotImplementedError
 
@@ -940,42 +936,48 @@ class Executor:
                 tasks.num_tasks, dtype=torch.int32, device=self.local_rank
             )
 
-    def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
-        Backend.cache_manager.prepare_cache_prefill(
-            tasks.req_ids, [len(t) for t in tasks.tokens]
-        )
-        if get_global_args().models.type == "hf-qwen3-next":
-            Backend.linear_attn_cache_manager.prepare_cache_prefill(
+    def prefill_step(
+        self, tasks: PackedTasksBase, is_empty_step: bool = False
+    ) -> torch.Tensor:
+        if not is_empty_step:
+            Backend.cache_manager.prepare_cache_prefill(
                 tasks.req_ids, [len(t) for t in tasks.tokens]
             )
-        if (
-            getattr(Backend, "indexer_cache_manager", None) is not None
-            and get_global_args().models.type == "deepseek-v3"
-        ):
-            Backend.indexer_cache_manager.prepare_cache_prefill(
-                tasks.req_ids, [len(t) for t in tasks.tokens]
-            )
+            if get_global_args().models.type == "hf-qwen3-next":
+                Backend.linear_attn_cache_manager.prepare_cache_prefill(
+                    tasks.req_ids, [len(t) for t in tasks.tokens]
+                )
+            if (
+                getattr(Backend, "indexer_cache_manager", None) is not None
+                and get_global_args().models.type == "deepseek-v3"
+            ):
+                Backend.indexer_cache_manager.prepare_cache_prefill(
+                    tasks.req_ids, [len(t) for t in tasks.tokens]
+                )
 
-        num_tokens = tasks.num_tokens
+            num_tokens = tasks.num_tokens
 
-        if (self.rank == 0 and num_tokens > 0) or (
-            self.dp_size > 1 and self.pp_stage == 0
-        ):  # check if num_toekns needs to be validated
-            payload = (
-                torch.from_numpy(np.concatenate(tasks.tokens))
-                .to(self.local_rank)
-                .to(torch.int64)
-            )
+            if (self.rank == 0 and num_tokens > 0) or (
+                self.dp_size > 1 and self.pp_stage == 0
+            ):  # check if num_toekns needs to be validated
+                payload = (
+                    torch.from_numpy(np.concatenate(tasks.tokens))
+                    .to(self.local_rank)
+                    .to(torch.int64)
+                )
+            else:
+                payload = torch.empty(
+                    self.get_payload_shape(num_tokens),
+                    dtype=self.get_payload_dtype(),
+                    device=self.local_rank,
+                )
+
+            # payload recv
+            for dispatcher in self.task_dispatchers:
+                payload = dispatcher.recv_payload(payload)
         else:
-            payload = torch.empty(
-                self.get_payload_shape(num_tokens),
-                dtype=self.get_payload_dtype(),
-                device=self.local_rank,
-            )
-
-        # payload recv
-        for dispatcher in self.task_dispatchers:
-            payload = dispatcher.recv_payload(payload)
+            for dispatcher in self.task_dispatchers:
+                payload = dispatcher.recv_payload(self.dummy_logits)
 
         self.timers("prefill").start()
         out = Backend.model.prefill(
@@ -990,34 +992,42 @@ class Executor:
         )
         self.timers("prefill").stop()
 
-        # Collect prompt tokens metrics
-        # In DP mode: all dp ranks record their local tokens (distinguished by dp_id)
-        # In non-DP mode: only rank 0 records metrics
-        if self._should_record_metrics(num_tokens, is_prefill=True):
-            PrometheusMetricsCollector.inc_prompts(num_tokens, self)
+        if not is_empty_step:
+            # Collect prompt tokens metrics
+            # In DP mode: all dp ranks record their local tokens (distinguished by dp_id)
+            # In non-DP mode: only rank 0 records metrics
+            if self._should_record_metrics(num_tokens, is_prefill=True):
+                PrometheusMetricsCollector.inc_prompts(num_tokens, self)
 
-        # Notify KV transfer hook after prefill completes.
-        try:
-            output_req_ids = [
-                tasks.req_ids[i] for i in range(tasks.num_tasks) if tasks.has_outputs[i]
-            ]
-            self._kv_hook.on_prefill_done(output_req_ids, out)
-        except Exception:
-            pass
+            # Notify KV transfer hook after prefill completes.
+            try:
+                output_req_ids = [
+                    tasks.req_ids[i]
+                    for i in range(tasks.num_tasks)
+                    if tasks.has_outputs[i]
+                ]
+                self._kv_hook.on_prefill_done(output_req_ids, out)
+            except Exception:
+                pass
 
-        # payload send
-        for dispatcher in self.task_dispatchers:
-            dispatcher.send_payload(out, tasks)
+            # payload send
+            for dispatcher in self.task_dispatchers:
+                dispatcher.send_payload(out, tasks)
 
-        Backend.cache_manager.finalize_cache_all_prefill()  # like reset metadata
-        if get_global_args().models.type == "hf-qwen3-next":
-            Backend.linear_attn_cache_manager.finalize_cache_all_prefill()
-        if (
-            getattr(Backend, "indexer_cache_manager", None) is not None
-            and get_global_args().models.type == "deepseek-v3"
-        ):
-            Backend.indexer_cache_manager.finalize_cache_all_prefill()
-        return out
+            Backend.cache_manager.finalize_cache_all_prefill()  # like reset metadata
+            if get_global_args().models.type == "hf-qwen3-next":
+                Backend.linear_attn_cache_manager.finalize_cache_all_prefill()
+            if (
+                getattr(Backend, "indexer_cache_manager", None) is not None
+                and get_global_args().models.type == "deepseek-v3"
+            ):
+                Backend.indexer_cache_manager.finalize_cache_all_prefill()
+            return out
+        else:
+            for dispatcher in self.task_dispatchers:
+                dispatcher.send_payload(self.dummy_logits, tasks=tasks)
+
+            return self.dummy_output
 
     def prefill_step_tp_only(self, tasks: PackedTasksBase) -> torch.Tensor:
         """
@@ -1162,159 +1172,104 @@ class Executor:
             Backend.indexer_cache_manager.finalize_cache_single_decode(req_ids)
         return out
 
-    def decode_step(self, tasks: PackedTasksBase):
-        Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
-        if get_global_args().models.type == "hf-qwen3-next":
-            Backend.linear_attn_cache_manager.prepare_cache_decode(tasks.req_ids)
-        if (
-            getattr(Backend, "indexer_cache_manager", None) is not None
-            and get_global_args().models.type == "deepseek-v3"
-        ):
-            Backend.indexer_cache_manager.prepare_cache_decode(tasks.req_ids)
-        # Ensure KV cache is present for PD decode-only before running decode.
-        try:
-            self._kv_hook.before_decode_step(tasks.req_ids)
-        except Exception:
-            pass
+    def decode_step(self, tasks: PackedTasksBase, is_empty_step: bool = False):
+        if not is_empty_step:
+            Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
+            if get_global_args().models.type == "hf-qwen3-next":
+                Backend.linear_attn_cache_manager.prepare_cache_decode(tasks.req_ids)
+            if (
+                getattr(Backend, "indexer_cache_manager", None) is not None
+                and get_global_args().models.type == "deepseek-v3"
+            ):
+                Backend.indexer_cache_manager.prepare_cache_decode(tasks.req_ids)
+            # Ensure KV cache is present for PD decode-only before running decode.
+            try:
+                self._kv_hook.before_decode_step(tasks.req_ids)
+            except Exception:
+                pass
 
-        num_tokens = tasks.num_tasks
+            num_tokens = tasks.num_tasks
 
-        # prepare payload tensor
-        if self.rank == 0 or self.dp_size > 1 and self.dp_dispatcher is not None:
-            payload = self._prepare_new_tokens_for_decode(tasks)  # tensor
+            # prepare payload tensor
+            if self.rank == 0 or self.dp_size > 1 and self.dp_dispatcher is not None:
+                payload = self._prepare_new_tokens_for_decode(tasks)  # tensor
+                if self.mtp_size > 1:
+                    payload_lhs = self._prepare_lhs_for_decode(tasks)
+            else:
+                payload = torch.empty(
+                    self.get_payload_shape(num_tokens),
+                    dtype=self.get_payload_dtype(),
+                    device=self.local_rank,
+                )
+                if self.mtp_size > 1:
+                    payload_lhs = torch.empty(
+                        [num_tokens, self.dim_],
+                        dtype=torch.get_default_dtype(),
+                        device=self.local_rank,
+                    )
+
+            # payload recv
+            for dispatcher in self.task_dispatchers:
+                payload = dispatcher.recv_payload(payload)
+                if self.mtp_size > 1:
+                    payload_lhs = dispatcher.recv_payload(payload_lhs)
+
             if self.mtp_size > 1:
-                payload_lhs = self._prepare_lhs_for_decode(tasks)
+                Backend.model.mtp_last_hidden_states_static.set(payload_lhs)
+
         else:
-            payload = torch.empty(
-                self.get_payload_shape(num_tokens),
-                dtype=self.get_payload_dtype(),
-                device=self.local_rank,
-            )
-            if self.mtp_size > 1:
-                payload_lhs = torch.empty(
-                    [num_tokens, self.dim_],
-                    dtype=torch.get_default_dtype(),
+            if self.rank == 0 or self.dp_size > 1 and self.dp_dispatcher is not None:
+                payload = torch.tensor(
+                    [0],
+                    device=self.local_rank,
+                    dtype=torch.long,
+                )
+            else:
+                payload = torch.empty(
+                    self.get_payload_shape(1),
+                    dtype=self.get_payload_dtype(),
                     device=self.local_rank,
                 )
 
-        # payload recv
-        for dispatcher in self.task_dispatchers:
-            payload = dispatcher.recv_payload(payload)
-            if self.mtp_size > 1:
-                payload_lhs = dispatcher.recv_payload(payload_lhs)
+            for dispatcher in self.task_dispatchers:
+                dispatcher.recv_payload(self.dummy_logits)
 
-        if self.mtp_size > 1:
-            Backend.model.mtp_last_hidden_states_static.set(payload_lhs)
-
+        payload_bs = len(tasks.req_ids) if not is_empty_step else 1
         self.timers("decode").start()
-        out = Backend.model.decode(payload, len(tasks.req_ids))
+        out = Backend.model.decode(payload, payload_bs, is_empty_step)
         self.timers("decode").stop()
 
-        # Collect metrics for Prometheus
-        # In DP mode: all dp ranks record their local tokens (distinguished by dp_id)
-        # In non-DP mode: only rank 0 records metrics
-        if self._should_record_metrics(tasks.num_tasks, is_prefill=False):
-            PrometheusMetricsCollector.inc_tokens(tasks.num_tasks, self)
+        if not is_empty_step:
+            # Collect metrics for Prometheus
+            # In DP mode: all dp ranks record their local tokens (distinguished by dp_id)
+            # In non-DP mode: only rank 0 records metrics
+            if self._should_record_metrics(tasks.num_tasks, is_prefill=False):
+                PrometheusMetricsCollector.inc_tokens(tasks.num_tasks, self)
 
-        # payload send
-        for dispatcher in self.task_dispatchers:
-            dispatcher.send_payload(out, tasks)
+            # payload send
+            for dispatcher in self.task_dispatchers:
+                dispatcher.send_payload(out, tasks)
 
-        Backend.cache_manager.finalize_cache_single_decode(
-            tasks.req_ids
-        )  # update seq_len and reset block table
-        if get_global_args().models.type == "hf-qwen3-next":
-            Backend.linear_attn_cache_manager.finalize_cache_single_decode(
+            Backend.cache_manager.finalize_cache_single_decode(
                 tasks.req_ids
-            )
-        if (
-            getattr(Backend, "indexer_cache_manager", None) is not None
-            and get_global_args().models.type == "deepseek-v3"
-        ):
-            Backend.indexer_cache_manager.finalize_cache_single_decode(tasks.req_ids)
-        return out
-
-    def empty_prefill_step(self, tasks: Optional[PackedTasksBase] = None):
-        """
-        This function is used to skip the attention computation and execute only the MoE logic
-        during Expert parallelism.
-        """
-
-        for dispatcher in self.task_dispatchers:
-            payload = dispatcher.recv_payload(self.dummy_logits)
-
-        if self.ep_size > 1:
-            for it, layer in enumerate(Backend.model.layers):
-                if it < self.n_dense_layers:
-                    continue
-                layer.mlp(self.dummy_input)
-
-        for dispatcher in self.task_dispatchers:
-            dispatcher.send_payload(self.dummy_logits, tasks=tasks)
-
-        return self.dummy_output
-
-    def empty_decode_step(self, tasks: Optional[PackedTasksBase] = None):
-        """
-        This function is used to skip the attention computation and execute only the MoE logic
-        during Expert parallelism.
-        """
-
-        for dispatcher in self.task_dispatchers:
-            payload = dispatcher.recv_payload(self.dummy_logits)
-
-        if self.ep_size > 1:
-
-            def empty_mlp_mtp():
-                layer_mpt = Backend.model.layers[-1]
-                layer_mpt.mlp(self.dummy_input)
-
-            def empty_mlp():
-                layer_main = (
-                    Backend.model.layers[0:-1]
-                    if self.mtp_size > 1
-                    else Backend.model.layers
+            )  # update seq_len and reset block table
+            if get_global_args().models.type == "hf-qwen3-next":
+                Backend.linear_attn_cache_manager.finalize_cache_single_decode(
+                    tasks.req_ids
                 )
-                for it, layer in enumerate(layer_main):
-                    if it < self.n_dense_layers:
-                        continue
-                    layer.mlp(self.dummy_input)
+            if (
+                getattr(Backend, "indexer_cache_manager", None) is not None
+                and get_global_args().models.type == "deepseek-v3"
+            ):
+                Backend.indexer_cache_manager.finalize_cache_single_decode(
+                    tasks.req_ids
+                )
+            return out
+        else:
+            for dispatcher in self.task_dispatchers:
+                dispatcher.send_payload(self.dummy_logits, tasks=tasks)
 
-            if self.use_cuda_graph:
-                if self.empty_decode_step_graph_mtp is None and self.mtp_size > 1:
-                    self.empty_decode_step_graph_mtp = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(self.empty_decode_step_graph_mtp):
-                        empty_mlp_mtp()
-
-                if self.empty_decode_step_graph is None:
-                    self.empty_decode_step_graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(self.empty_decode_step_graph):
-                        empty_mlp()
-
-                if self.mtp_size > 1:
-                    for i in range(0, self.mtp_size):
-                        self.empty_decode_step_graph_mtp.replay()
-
-                self.empty_decode_step_graph.replay()
-            else:
-                if self.mtp_size > 1:
-                    for i in range(0, self.mtp_size):
-                        empty_mlp_mtp()
-
-                if (
-                    self.mtp_size > 1
-                    and self.moe_impl is not None
-                    and self.moe_impl.ep_size > 1
-                    and self.moe_impl.decode_token_dispatcher_impl == "allgather"
-                ):
-                    self.moe_impl.prepare(TaskType.Decode, self.dummy_input.shape[0])
-
-                empty_mlp()
-
-        for dispatcher in self.task_dispatchers:
-            dispatcher.send_payload(self.dummy_logits, tasks=tasks)
-
-        return self.dummy_output
+            return self.dummy_output
 
     def sample(self, logits: torch.Tensor, tasks: PackedTasks):
         """
