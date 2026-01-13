@@ -85,6 +85,22 @@ RDVZ_ID=chitu
 echo prepare torchrun on node $(hostname) 
 echo SLURM_STEP_GPUS: $SLURM_STEP_GPUS
 echo CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES
+
+# 自动检测并配置 InfiniBand
+SCRIPT_DIR=$(dirname "$THIS_SCRIPT")
+if [ -f "$SCRIPT_DIR/detect_ib_config.sh" ]; then
+    source "$SCRIPT_DIR/detect_ib_config.sh"
+    auto_configure_ib
+fi
+
+# 构建 IB 相关的环境变量参数
+IB_ENV_ARGS=()
+[ -n "$NCCL_IB_HCA" ] && IB_ENV_ARGS+=("-e" "NCCL_IB_HCA=$NCCL_IB_HCA")
+[ -n "$NVSHMEM_HCA_LIST" ] && IB_ENV_ARGS+=("-e" "NVSHMEM_HCA_LIST=$NVSHMEM_HCA_LIST")
+[ -n "$GLOO_SOCKET_IFNAME" ] && IB_ENV_ARGS+=("-e" "GLOO_SOCKET_IFNAME=$GLOO_SOCKET_IFNAME")
+[ -n "$NCCL_SOCKET_IFNAME" ] && IB_ENV_ARGS+=("-e" "NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME")
+[ -n "$NVSHMEM_IB_DEVICE" ] && IB_ENV_ARGS+=("-e" "NVSHMEM_IB_DEVICE=$NVSHMEM_IB_DEVICE")
+
 docker run \
     --gpus=all \
     --privileged \
@@ -92,6 +108,7 @@ docker run \
     --network host \
     -e NCCL_GRAPH_MIXING_SUPPORT=0 \
     -e NCCL_GRAPH_REGISTER=0 \
+    "${IB_ENV_ARGS[@]}" \
     "${DOCKER_ARGS[@]}" \
     torchrun \
         --nnodes $SLURM_NNODES \

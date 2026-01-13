@@ -85,6 +85,29 @@ RDVZ_ID=chitu
 echo prepare torchrun on node $(hostname) 
 echo SLURM_STEP_GPUS: $SLURM_STEP_GPUS
 echo CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES
+
+# 自动检测并配置 InfiniBand
+SCRIPT_DIR=$(dirname "$THIS_SCRIPT")
+if [ -f "$SCRIPT_DIR/detect_ib_config.sh" ]; then
+    source "$SCRIPT_DIR/detect_ib_config.sh"
+    auto_configure_ib
+fi
+
+# 构建 IB 相关的环境变量参数
+IB_ENV_ARGS=()
+[ -n "$NCCL_IB_HCA" ] && IB_ENV_ARGS+=("--env" "NCCL_IB_HCA=$NCCL_IB_HCA")
+[ -n "$NVSHMEM_HCA_LIST" ] && IB_ENV_ARGS+=("--env" "NVSHMEM_HCA_LIST=$NVSHMEM_HCA_LIST")
+[ -n "$GLOO_SOCKET_IFNAME" ] && IB_ENV_ARGS+=("--env" "GLOO_SOCKET_IFNAME=$GLOO_SOCKET_IFNAME")
+[ -n "$NCCL_SOCKET_IFNAME" ] && IB_ENV_ARGS+=("--env" "NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME")
+[ -n "$NVSHMEM_IB_DEVICE" ] && IB_ENV_ARGS+=("--env" "NVSHMEM_IB_DEVICE=$NVSHMEM_IB_DEVICE")
+
+# 检查是否需要挂载 /dev/infiniband
+IB_MOUNT_ARGS=()
+if [ -d "/dev/infiniband" ]; then
+    IB_MOUNT_ARGS+=("-B" "/dev/infiniband:/dev/infiniband")
+    echo "检测到 /dev/infiniband，将自动挂载到容器" >&2
+fi
+
 apptainer run \
     --nv \
     --contain \
@@ -93,6 +116,8 @@ apptainer run \
     --cleanenv \
     --env NCCL_GRAPH_MIXING_SUPPORT=0 \
     --env NCCL_GRAPH_REGISTER=0 \
+    "${IB_MOUNT_ARGS[@]}" \
+    "${IB_ENV_ARGS[@]}" \
     "${APPTAINER_ARGS[@]}" \
     torchrun \
         --nnodes $SLURM_NNODES \
