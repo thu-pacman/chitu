@@ -406,6 +406,7 @@ class Task:
         self.record_next_token: Union[int, torch.Tensor, None] = None
         self.sync_new_token: bool = True
         self.evicting = False
+        self.finished_decode = False
 
         self.return_logprobs = getattr(req, "logprobs", False)
         self.logprobs = None
@@ -447,12 +448,9 @@ class Task:
             getattr(Backend.args, "infer", False)
             and Backend.args.infer.schedule_overlap
         )
-        has_pp = (
-            getattr(Backend.args, "infer", False) and Backend.args.infer.pp_size > 1
-        )
         self.has_model_run: Callable[[], bool] = (
             self._has_model_run_schedule_overlap
-            if has_schedule_overlap and not has_pp
+            if has_schedule_overlap
             else self.running
         )
 
@@ -479,8 +477,6 @@ class Task:
         return self.running() and self.finish_last_step()
 
     def update_decode_status(self):
-        if self.waiting:
-            return TaskDecodeType.Waiting
         if self._decode_status == TaskDecodeType.Stopped:
             return TaskDecodeType.Stopped
 
@@ -499,6 +495,8 @@ class Task:
             >= self.req.max_new_tokens - get_global_args().infer.mtp_size
         ):
             self._decode_status = TaskDecodeType.WillStopLength
+        if self.waiting:
+            return TaskDecodeType.Waiting
         return self._decode_status
 
     def update_response_no_sync(self, token: Union[int, torch.Tensor]):
@@ -692,7 +690,7 @@ class Task:
 
     def has_output(self):
         # The last step has no output
-        if not self.has_model_run():
+        if not self.running():
             return False
         return (
             self.task_type == TaskType.Prefill
@@ -765,9 +763,9 @@ def req_decode(id_num: int):
     # NOTE: here only return the hex part, the prefix info is lost in decoding
     # this is acceptable, because decoding is mainly used for internal processing
     if id_num > 0:
-        return hex(id_num)[2:], TaskType.Prefill
+        return f"{hex(id_num)[2:]:>08}", TaskType.Prefill
     else:
-        return hex(-id_num)[2:], TaskType.Decode
+        return f"{hex(-id_num)[2:]:>08}", TaskType.Decode
 
 
 @dataclass
@@ -864,7 +862,8 @@ class SerializedPackedTasksPayloadType(Enum):
     TerminateBackend = 5
     EndTask = 6
     Heartbeat = 7
-    NoneType = 8
+    Remove = 8
+    NoneType = -1
 
 
 def is_empty_payload(payload_type: SerializedPackedTasksPayloadType):
@@ -1073,6 +1072,7 @@ class PackedTasksBase:
                     task_ids.append(self.task_ids[it])
                     req_ids.append(self.req_ids[it])
             self.num_tasks = num_tasks
+            # num_tokens(input token) = num_tasks when decode
             self.num_tokens = num_tasks
             self.task_ids = task_ids
             self.req_ids = req_ids
@@ -1135,7 +1135,8 @@ class PackedTasks(PackedTasksBase):
         self.reqs = [task.req for task in self.tasks]
 
         self.task_type = self.tasks[0].task_type
-        assert all(task.task_type == self.task_type for task in self.tasks)
+        # TODO: reformat PackedTasks for better support of DP+PP
+        # assert all(task.task_type == self.task_type for task in self.tasks)
 
         if self.task_type == TaskType.Prefill:
             self.tokens = [task.next_req_tokens() for task in self.tasks]
@@ -1241,6 +1242,7 @@ class PackedTasks(PackedTasksBase):
                 has_outputs.append(self.has_outputs[it])
                 if self.has_outputs[it]:
                     self.output_tasks.append(task)
+        self.task_ids = [task.task_id for task in self.tasks]
         self.req_ids = [task.task_id for task in self.tasks]
         self.num_tasks = len(self.req_ids)
         self.has_model_run = [True] * self.num_tasks
@@ -1551,25 +1553,25 @@ class DPTaskCollector:
         DPTaskCollector._task_ids_list = []
 
     @staticmethod
-    def add_new_ongoing():
-        DPTaskCollector._ongoing_batch_task_ids.append(
-            set(DPTaskCollector.get_total_task_ids())
-        )
-        DPTaskCollector._ongoing_num_tasks.append(
-            DPTaskCollector.get_total_packedtasks().num_tasks
-        )
-        DPTaskCollector._ongoing_packedtasks.append(
-            DPTaskCollector.get_total_packedtasks()
-        )
+    def add_new_ongoing(tasks: PackedTasks):
+        task_ids = tasks.task_ids
+        DPTaskCollector._ongoing_batch_task_ids.append(set(task_ids))
+        DPTaskCollector._ongoing_num_tasks.append(len(task_ids))
+        DPTaskCollector._ongoing_packedtasks.append(tasks)
         for collector in DPTaskCollector._collected_tokens:
             collector.append(None)
 
     @staticmethod
     def remove_ongoing():
         assert len(DPTaskCollector._ongoing_packedtasks) > 0
-        DPTaskCollector._ongoing_batch_task_ids.popleft()
-        DPTaskCollector._ongoing_num_tasks.popleft()
-        return DPTaskCollector._ongoing_packedtasks.popleft()
+        finished_idx = DPTaskCollector._ongoing_num_tasks.index(0)
+        if finished_idx > len(DPTaskCollector._ongoing_packedtasks):
+            return None
+        finished_tasks = DPTaskCollector._ongoing_packedtasks[finished_idx]
+        del DPTaskCollector._ongoing_num_tasks[finished_idx]
+        del DPTaskCollector._ongoing_batch_task_ids[finished_idx]
+        del DPTaskCollector._ongoing_packedtasks[finished_idx]
+        return finished_tasks
 
     @staticmethod
     def update_ongoing(
@@ -1591,7 +1593,7 @@ class DPTaskCollector:
     def batch_finished():
         if len(DPTaskCollector._ongoing_num_tasks) == 0:
             return False
-        return DPTaskCollector._ongoing_num_tasks[0] == 0
+        return any(num_tasks == 0 for num_tasks in DPTaskCollector._ongoing_num_tasks)
 
     @staticmethod
     def reset_collect_tokens():
@@ -1635,12 +1637,13 @@ class PPTaskCollector:
         handle: torch.distributed.distributed_c10d.Work,
         results: torch.Tensor,
         dp_src: int = 0,
+        wait_steps: int = -1,
     ):
         PPTaskCollector._ongoing_reqs.append(
             OngoingRequests(tasks, handle, results, dp_src)
         )
         for task in tasks.tasks:
-            task.wait(handle)
+            task.wait(handle, wait_steps=wait_steps)
 
     @staticmethod
     def update_ongoing(
@@ -1653,7 +1656,8 @@ class PPTaskCollector:
         """
         tasks_list = []
         while True:
-            for ogr in PPTaskCollector._ongoing_reqs:
+            ogr_list = PPTaskCollector._ongoing_reqs.copy()
+            for ogr in ogr_list:
                 if ogr.handle.is_completed():
                     PPTaskCollector._ongoing_reqs.remove(ogr)
                     update_tasks = ogr.waiting_task
@@ -1694,4 +1698,5 @@ class PPTaskCollector:
                         task.wait_steps -= 1
                     if task.wait_steps == 0:
                         PPTaskCollector._unwait_task_ids.append(task.task_id)
+        TaskCollector.append_to_generated_tasks(tasks_list)
         return tasks_list

@@ -9,10 +9,12 @@ from typing_extensions import override
 from collections import deque, defaultdict
 
 from chitu.task import (
+    PackedTasks,
     TaskPool,
     TaskType,
     PackedTasksBase,
     SerializedPackedTasksPayloadType,
+    PPTaskCollector,
 )
 from chitu.global_vars import get_global_args, SlotHandle
 from chitu.utils import ceil_div
@@ -177,6 +179,7 @@ class Scheduler:
 
         self.kvcache_block_threshold = Backend.cache_manager.get_num_blocks()
         self.is_warmup_stage = False
+        self.has_schedule_overlap = get_global_args().infer.schedule_overlap
 
     def reset_kvcache_block_threshold(self):
         self.kvcache_block_threshold = Backend.cache_manager.get_num_blocks()
@@ -419,6 +422,8 @@ class Scheduler:
             num_need_blocks = 0
             for task_id in TaskPool.pool.keys():
                 task = TaskPool.pool[task_id]
+                if task.finished_decode:
+                    continue
                 assert (
                     task.kv_cache_len_used_in_completed_steps
                     <= task.kv_cache_len_used_in_completed_steps_and_next_step
@@ -464,11 +469,12 @@ class Scheduler:
             task_id: the task_id that need to be evicted
         """
         task = TaskPool.pool[task_id]
+        if task.finished_decode:
+            return
 
         # Remove kvcache of this task
         task.next_token = -1
         task.evicting = True
-        task.waiting = False
         task.handle = None
         tasks = PackedTasksBase(
             num_tasks=1,
@@ -478,6 +484,7 @@ class Scheduler:
             payload_type=SerializedPackedTasksPayloadType.EndTask,
         )
         Backend.executor.step(tasks)
+        PPTaskCollector.update_ongoing(PackedTasks([task_id]))
         logger.warning(
             f"Evicted task {task_id} due to insufficient KV cache",
             extra={
@@ -526,6 +533,7 @@ class Scheduler:
 
     def update(self, cur_task_ids: list[str], unwait_task_ids: list[str] = []):
         removed_task_ids = []
+        removed_kvcache_task_ids = []
         task_ids = cur_task_ids + unwait_task_ids
         task_ids = list(set(task_ids))
         self.reorder_tasks_for_batching(task_ids)
@@ -536,19 +544,31 @@ class Scheduler:
                 and TaskPool.pool[task_id].sched_group_id is not None
             ):
                 sgroup_id = TaskPool.pool[task_id].sched_group_id
-                self.sgroup_waiting_tasks[sgroup_id].remove(task_id)
+                if task_id in self.sgroup_waiting_tasks[sgroup_id]:
+                    self.sgroup_waiting_tasks[sgroup_id].remove(task_id)
                 if not isinstance(self, SkewScheduler):
                     TaskPool.pool[task_id].sched_group_id = None
+            if isinstance(self, SkewScheduler) and not TaskPool.pool[task_id].running():
+                TaskPool.pool[task_id].sched_group_id = None
         for task_id in task_ids:
             task = TaskPool.pool[task_id]
+            if (
+                not task.finished_decode
+                and task.task_type == TaskType.Decode
+                and (
+                    (not self.has_schedule_overlap and task.need_remove())
+                    or (self.has_schedule_overlap and not task.has_model_run())
+                )
+            ):
+                task.finished_decode = True
+                removed_kvcache_task_ids.append(task_id)
+                num_total_blocks = Backend.cache_manager.get_num_blocks()
+                self.kvcache_block_threshold = num_total_blocks
+                logger.debug(
+                    f"Task({task_id}) finished decoding, increasing kvcache_block_threshold to {self.kvcache_block_threshold}, while the number of total blocks is {num_total_blocks}"
+                )
             if task.need_remove():
-                if task.task_type == TaskType.Decode:
-                    removed_task_ids.append(task_id)
-                    num_total_blocks = Backend.cache_manager.get_num_blocks()
-                    self.kvcache_block_threshold = num_total_blocks
-                    logger.debug(
-                        f"Task({task_id}) finished decoding, increasing kvcache_block_threshold to {self.kvcache_block_threshold}, while the number of total blocks is {num_total_blocks}"
-                    )
+                removed_task_ids.append(task_id)
                 TaskPool.remove(task_id)
 
         if removed_task_ids:
@@ -569,7 +589,7 @@ class Scheduler:
                 },
             )
 
-        return removed_task_ids
+        return removed_task_ids, removed_kvcache_task_ids
 
     def is_done(self):
         return len(TaskPool.pool) == 0
@@ -735,9 +755,14 @@ class SkewScheduler(Scheduler):
     @override
     def reorder_tasks_for_batching(self, task_ids):
         for task_id in task_ids:
-            if TaskPool.pool[task_id].need_remove():
-                if TaskPool.pool[task_id].task_type == TaskType.Decode:
-                    sgroup = self.sgroup_list[TaskPool.pool[task_id].sched_group_id]
-                    index = sgroup.index(task_id)
-                    sgroup[index] = sgroup[-1]
-                    sgroup.pop()
+            if (
+                not TaskPool.pool[task_id].running()
+                and TaskPool.pool[task_id].sched_group_id is not None
+            ):
+                sgroup_id = TaskPool.pool[task_id].sched_group_id
+                if task_id in self.sgroup_waiting_tasks[sgroup_id]:
+                    self.sgroup_waiting_tasks[sgroup_id].remove(task_id)
+                sgroup = self.sgroup_list[sgroup_id]
+                index = sgroup.index(task_id)
+                sgroup[index] = sgroup[-1]
+                sgroup.pop()

@@ -10,7 +10,7 @@ class TaskType(Enum):
     Decode = 2
     EmptyPrefill = 3
     EmptyDecode = 4
-    Special = 8
+    Special = -1
 
 
 class TaskDecodeType(Enum):
