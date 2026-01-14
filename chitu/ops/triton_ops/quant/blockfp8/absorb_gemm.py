@@ -15,6 +15,7 @@ from chitu.ops.triton_ops.utils import (
     auto_retry_triton_compilation,
     auto_tuning_logger,
     SIGNED_INT32_0x87F00000,
+    autotune_compat,
 )
 
 
@@ -110,8 +111,10 @@ blockfp8_einsum_shc_hdc_shd_configs = [
 ]
 
 
-@triton.autotune(
-    configs=blockfp8_einsum_shc_hdc_shd_configs, key=["N", "K", "fp8_to_fp32_scale"]
+@autotune_compat(
+    configs=blockfp8_einsum_shc_hdc_shd_configs,
+    key=["N", "K", "fp8_to_fp32_scale"],
+    cache_results=True,
 )
 @triton.jit
 def blockfp8_einsum_shc_hdc_shd_kernel(

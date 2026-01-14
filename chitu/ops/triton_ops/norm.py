@@ -8,7 +8,11 @@ import torch
 import triton
 import triton.language as tl
 
-from chitu.ops.triton_ops.utils import auto_retry_triton_compilation, to_triton_dtype
+from chitu.ops.triton_ops.utils import (
+    auto_retry_triton_compilation,
+    to_triton_dtype,
+    autotune_compat,
+)
 from chitu.device_type import is_muxi
 from chitu.ops.utils import compatible_with_inplace
 
@@ -89,8 +93,9 @@ if os.environ.get("CI_TESTS", "false") == "true":
     ]
 
 
-@triton.autotune(
-    configs=rms_norm_configs, key=["Y_row_stride", "X_row_stride", "compute_dtype"]
+@autotune_compat(
+    configs=rms_norm_configs,
+    key=["Y_row_stride", "X_row_stride", "compute_dtype"],
 )
 @triton.jit
 def rms_norm_kernel(

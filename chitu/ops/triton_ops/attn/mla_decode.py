@@ -14,6 +14,7 @@
 import torch
 import triton
 import triton.language as tl
+from chitu.ops.triton_ops.utils import autotune_compat
 
 
 @triton.jit
@@ -33,7 +34,7 @@ _mla_attn_kernel_configs = [
 ]
 
 
-@triton.autotune(configs=_mla_attn_kernel_configs, key=[])
+@autotune_compat(configs=_mla_attn_kernel_configs, key=[], cache_results=True)
 @triton.jit
 def _mla_attn_kernel(
     Q_nope,
@@ -236,7 +237,7 @@ def _mla_attn(
     )
 
 
-@triton.autotune(configs=_mla_attn_kernel_configs, key=[])
+@autotune_compat(configs=_mla_attn_kernel_configs, key=[], cache_results=True)
 @triton.jit
 def _mla_attn_non_paged_kernel(
     Q_nope,
@@ -624,7 +625,7 @@ def mla_decode_dense_kv_triton(
 # SPDX-SnippetEnd
 
 
-@triton.autotune(configs=_mla_attn_kernel_configs, key=[])
+@autotune_compat(configs=_mla_attn_kernel_configs, key=[], cache_results=True)
 @triton.jit
 def _mla_decode_topk_ragged_qkvo_kernel(
     Q_nope,

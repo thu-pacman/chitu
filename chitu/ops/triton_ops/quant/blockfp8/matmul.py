@@ -16,6 +16,7 @@ from chitu.ops.triton_ops.utils import (
     to_triton_dtype,
     auto_tuning_logger,
     SIGNED_INT32_0x87F00000,
+    autotune_compat,
 )
 
 
@@ -121,7 +122,7 @@ blockfp8_gemm_configs = [
 ]
 
 
-@triton.autotune(configs=blockfp8_gemm_configs, key=["N", "K"])
+@autotune_compat(configs=blockfp8_gemm_configs, key=["N", "K"], cache_results=True)
 @triton.jit
 def blockfp8_gemm_kernel(
     a_ptr,
@@ -207,7 +208,9 @@ soft_fp8_blockfp8_gemm_configs = [
 ]
 
 
-@triton.autotune(configs=soft_fp8_blockfp8_gemm_configs, key=["N", "K"])
+@autotune_compat(
+    configs=soft_fp8_blockfp8_gemm_configs, key=["N", "K"], cache_results=True
+)
 @triton.jit
 def soft_fp8_blockfp8_gemm_kernel(
     A,

@@ -28,7 +28,7 @@ if torch.cuda.is_available():
         SIGNED_INT16_0x87F0,
         SIGNED_INT8_0x9C,
     )
-    from chitu.ops.triton_ops.utils import to_triton_dtype
+    from chitu.ops.triton_ops.utils import to_triton_dtype, autotune_compat
 from chitu.lazy import single_dispatch_lazy_tensor
 
 logger = getLogger(__name__)

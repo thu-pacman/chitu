@@ -17,6 +17,7 @@ from chitu.ops.triton_ops.utils import (
     SIGNED_INT8_0x9C,
     SIGNED_INT16_0x81C0,
     SIGNED_INT16_0x87F0,
+    autotune_compat,
 )
 from chitu.lazy import single_dispatch_lazy_tensor
 
@@ -175,7 +176,7 @@ blockfp4_gemm_configs = [
 ]
 
 
-@triton.autotune(configs=blockfp4_gemm_configs, key=["N", "K"])
+@autotune_compat(configs=blockfp4_gemm_configs, key=["N", "K"], cache_results=True)
 @triton.jit
 def soft_fp4_raise_to_fp8_blockfp4_gemm_kernel(
     a_ptr,
@@ -292,7 +293,9 @@ soft_fp4_blockfp4_gemm_configs = [
 ]
 
 
-@triton.autotune(configs=soft_fp4_blockfp4_gemm_configs, key=["N", "K"])
+@autotune_compat(
+    configs=soft_fp4_blockfp4_gemm_configs, key=["N", "K"], cache_results=True
+)
 @triton.jit
 def soft_fp4_raise_to_bf16_blockfp4_gemm_kernel(
     a_ptr,

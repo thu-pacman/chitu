@@ -12,6 +12,7 @@ from chitu.ops.triton_ops.quant.w8a8_per_token_per_channel import (
 from chitu.ops.triton_ops.quant.w4a4_per_token_per_channel import (
     w4a4_gemm_per_token_per_channel_triton,
 )
+from chitu.ops.triton_ops.utils import autotune_compat
 
 
 @triton.jit
@@ -44,7 +45,9 @@ int8_per_token_quant_configs = [
 ]
 
 
-@triton.autotune(configs=int8_per_token_quant_configs, key=["M", "K"])
+@autotune_compat(
+    configs=int8_per_token_quant_configs, key=["M", "K"], cache_results=True
+)
 @triton.jit
 def int8_per_token_quant_with_outliers_kernel(
     A_ptr,
@@ -254,7 +257,9 @@ int4_per_token_quant_configs = [
 ]
 
 
-@triton.autotune(configs=int4_per_token_quant_configs, key=["M", "K"])
+@autotune_compat(
+    configs=int4_per_token_quant_configs, key=["M", "K"], cache_results=True
+)
 @triton.jit
 def int4_per_token_quant_pack_with_outliers_kernel(
     A_ptr,
