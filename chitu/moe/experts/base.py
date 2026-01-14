@@ -129,7 +129,7 @@ def fused_experts_wrapper(
                 a2_scale=a2_scale,
                 block_shape=block_shape,
                 soft_fp8=soft_fp8,
-                experts_start_idx=experts_start_idx,  # compatible with the local expert idx format returned by deepep-normal
+                experts_start_idx=experts_start_idx,
             )
     elif impl == "group_gemm_masked":
         return deepgemm_masked_fused_expert(
@@ -180,7 +180,7 @@ def fused_experts_wrapper(
             a2_scale=a2_scale,
             block_shape=block_shape,
             soft_fp8=soft_fp8,
-            experts_start_idx=experts_start_idx,  # compatible with the local expert idx format returned by deepep-normal
+            experts_start_idx=experts_start_idx,
         )
     elif impl == "ep_group_gemm_masked":
         if w1.dtype == torch.float8_e4m3fn and has_deep_gemm:
@@ -282,7 +282,7 @@ def fused_experts_wrapper(
                 a2_scale=a2_scale,
                 block_shape=block_shape,
                 soft_fp8=soft_fp8,
-                experts_start_idx=0,  # compatible with the local expert idx format returned by deepep-normal
+                experts_start_idx=experts_start_idx,
             )
         else:
             raise NotImplementedError

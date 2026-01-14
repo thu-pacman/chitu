@@ -166,18 +166,25 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
     def _(
         self, routed_x: IndexedBatchedRoutedActivation, weights: torch.Tensor
     ) -> torch.Tensor:
+        routed_x = routed_x.as_local_expert_ids(
+            self.experts_start_idx, self.experts_end_idx
+        )
+
         x, indices = routed_x.activation, routed_x.token_to_expert_indices
 
-        shape = x.size()
-        y = torch.zeros_like(x)
+        flattened_indices = indices.flatten()
+        in_range_indices = flattened_indices[
+            (flattened_indices >= 0)
+            & (flattened_indices < self.experts_end_idx - self.experts_start_idx)
+        ]
         activated_expert_ids = {
             i
-            for i, cnt in enumerate(torch.bincount(indices.flatten()).tolist())
+            for i, cnt in enumerate(torch.bincount(in_range_indices).tolist())
             if cnt > 0
         }
 
         xs = []
-        for i in range(self.experts_start_idx, self.experts_end_idx):
+        for i in range(self.experts_end_idx - self.experts_start_idx):
             this_x = None
             if i in activated_expert_ids:
                 idx, top = torch.where(indices == i)
@@ -214,12 +221,11 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
                 down_proj_out = self.forward_ith_expert_down(i, acti)
             down_proj_outs.append(down_proj_out)
 
-        for i in range(self.experts_start_idx, self.experts_end_idx):
+        y = torch.zeros_like(x)
+        for i in range(self.experts_end_idx - self.experts_start_idx):
             if i in activated_expert_ids:
                 idx, top = torch.where(indices == i)
-                y[idx] += (
-                    down_proj_outs[i - self.experts_start_idx] * weights[idx, top, None]
-                )
+                y[idx] += down_proj_outs[i] * weights[idx, top, None]
         if self.fuse_shared_experts:
             for i in range(
                 self.experts_end_idx - self.experts_start_idx,
@@ -228,7 +234,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
                 + self.n_fused_shared_experts,
             ):
                 y += down_proj_outs[i]
-        return y.view(shape)
+        return y
 
     def forward(
         self,

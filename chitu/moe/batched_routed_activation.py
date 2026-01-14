@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from typing_extensions import override
+import dataclasses
 from dataclasses import dataclass
 import plum
 import torch
@@ -15,6 +16,7 @@ from chitu.ops.batched_routed_activation import (
 )
 
 
+@dataclass
 class BatchedRoutedActivation:
     """
     Base class for a batch of activation routed to different experts.
@@ -22,6 +24,20 @@ class BatchedRoutedActivation:
     A subclass should implement tensors that expresses the activation, and which token
     in the batch is routed to which expert.
     """
+
+    # This marks all following properties must be set via kwargs, so that they won't
+    # appear before the first argument of the sub-classes.
+    _: dataclasses.KW_ONLY
+
+    # The following properties marks whether expert IDs in any of the tensors in the
+    # object means global IDs or EP-local IDs.
+    #
+    # When a BatchedRoutedActivation is first created after a MoE gate, the IDs are
+    # ususally global. In non-EP cases, they are also local. Before expert computing,
+    # the IDs may or may not be converted into local ones via `as_local_expert_ids`.
+    # Once global IDs are converted to local IDs, it's impossible to go back, because
+    # remote expert IDs may be lost.
+    expert_ids_are_local: bool
 
     @classmethod
     def convert_from(
@@ -48,12 +64,28 @@ class BatchedRoutedActivation:
 
         raise NotImplementedError()
 
+    def as_local_expert_ids(
+        self, experts_start_idx: int, experts_end_idx: int
+    ) -> "BatchedRoutedActivation":
+        """
+        Convert expert IDs to local IDs. Return self if already local.
+        """
+
+        if self.expert_ids_are_local:
+            return self
+        else:
+            raise NotImplementedError(
+                f"`as_local_expert_ids` is not implemented yet for {type(self)}"
+            )
+
 
 @dataclass
 class IndexedBatchedRoutedActivation(BatchedRoutedActivation):
     """
     Activation stored in a dense batch, with indices expressing the relation between
     tokens and experts.
+
+    `token_to_expert_indices` may contain out-of-range expert IDs for invalid experts.
 
     NOTE: Currently there are only indices pointing from tokens to experts. If you
     further need (reversed) indices pointing from experts to tokens, added here as a
@@ -68,13 +100,34 @@ class IndexedBatchedRoutedActivation(BatchedRoutedActivation):
         self, topk_weights: torch.Tensor, max_n_tokens: int
     ) -> list[tuple["IndexedBatchedRoutedActivation", torch.Tensor]]:
         return [
-            (IndexedBatchedRoutedActivation(a, t), w)
+            (
+                IndexedBatchedRoutedActivation(
+                    a, t, expert_ids_are_local=self.expert_ids_are_local
+                ),
+                w,
+            )
             for a, t, w in zip(
                 torch.split(self.activation, max_n_tokens),
                 torch.split(self.token_to_expert_indices, max_n_tokens),
                 torch.split(topk_weights, max_n_tokens),
             )
         ]
+
+    @override
+    def as_local_expert_ids(
+        self, experts_start_idx: int, experts_end_idx: int
+    ) -> "IndexedBatchedRoutedActivation":
+        if self.expert_ids_are_local:
+            return self
+        local_token_to_expert_indices = self.token_to_expert_indices - experts_start_idx
+        local_token_to_expert_indices[
+            (self.token_to_expert_indices < experts_start_idx)
+            | (self.token_to_expert_indices >= experts_end_idx)
+        ] = (experts_end_idx - experts_start_idx)
+        kvs = dataclasses.asdict(self)  # `asdict` keeps fields from subclasses
+        kvs["token_to_expert_indices"] = local_token_to_expert_indices
+        kvs["expert_ids_are_local"] = True
+        return type(self)(**kvs)
 
 
 @dataclass
@@ -86,7 +139,12 @@ class IndexedBatchedRoutedActivationBlockfp8(IndexedBatchedRoutedActivation):
         self, topk_weights: torch.Tensor, max_n_tokens: int
     ) -> list[tuple["IndexedBatchedRoutedActivationBlockfp8", torch.Tensor]]:
         return [
-            (IndexedBatchedRoutedActivationBlockfp8(a, t, s), w)
+            (
+                IndexedBatchedRoutedActivationBlockfp8(
+                    a, t, s, expert_ids_are_local=self.expert_ids_are_local
+                ),
+                w,
+            )
             for a, t, s, w in zip(
                 torch.split(self.activation, max_n_tokens),
                 torch.split(self.token_to_expert_indices, max_n_tokens),
@@ -134,6 +192,7 @@ class IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
             token_to_expert_indices=old.token_to_expert_indices,
             n_tokens_per_expert_padded=n_tokens_per_expert_padded,
             pad_block_size=pad_block_size,
+            expert_ids_are_local=old.expert_ids_are_local,
         )
 
 
@@ -180,6 +239,7 @@ class IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
             token_to_expert_indices=old.token_to_expert_indices,
             n_tokens_per_expert_padded=n_tokens_per_expert_padded,
             pad_block_size=pad_block_size,
+            expert_ids_are_local=old.expert_ids_are_local,
         )
 
 
@@ -211,9 +271,28 @@ class ExpertBlockIndexedBatchedRoutedActivation(BatchedRoutedActivation):
         return cls(
             old.activation,
             *batched_routed_activation_indexed_to_expert_block_indexed(
-                old.token_to_expert_indices, block_size, n_experts
+                old.token_to_expert_indices,
+                block_size,
+                n_experts,
             ),
+            expert_ids_are_local=old.expert_ids_are_local,
         )
+
+    @override
+    def as_local_expert_ids(
+        self, experts_start_idx: int, experts_end_idx: int
+    ) -> "ExpertBlockIndexedBatchedRoutedActivation":
+        if self.expert_ids_are_local:
+            return self
+        local_block_to_expert_indices = self.block_to_expert_indices - experts_start_idx
+        local_block_to_expert_indices[
+            (self.block_to_expert_indices < experts_start_idx)
+            | (self.block_to_expert_indices >= experts_end_idx)
+        ] = (experts_end_idx - experts_start_idx)
+        kvs = dataclasses.asdict(self)  # `asdict` keeps fields from subclasses
+        kvs["block_to_expert_indices"] = local_block_to_expert_indices
+        kvs["expert_ids_are_local"] = True
+        return type(self)(**kvs)
 
 
 @dataclass
@@ -238,6 +317,22 @@ class ExpertBlockPermutedBatchedRoutedActivation(BatchedRoutedActivation):
     # As requried by DeepGEMM, `block_to_expert_indices` is a 2-D tensor, where values
     # are repeated inside a block
     block_to_expert_indices: torch.Tensor  # [n_blocks, block_size]
+
+    @override
+    def as_local_expert_ids(
+        self, experts_start_idx: int, experts_end_idx: int
+    ) -> "ExpertBlockPermutedBatchedRoutedActivation":
+        if self.expert_ids_are_local:
+            return self
+        local_block_to_expert_indices = self.block_to_expert_indices - experts_start_idx
+        local_block_to_expert_indices[
+            (self.block_to_expert_indices < experts_start_idx)
+            | (self.block_to_expert_indices >= experts_end_idx)
+        ] = -1
+        kvs = dataclasses.asdict(self)  # `asdict` keeps fields from subclasses
+        kvs["block_to_expert_indices"] = local_block_to_expert_indices
+        kvs["expert_ids_are_local"] = True
+        return type(self)(**kvs)
 
 
 @dataclass
@@ -278,6 +373,7 @@ class ExpertBlockPermutedBatchedRoutedActivationNormal(
             blocked_activation=blocked_activation,
             token_comma_topk_to_block_x_item_indices=token_comma_topk_to_block_x_item_indices,
             block_to_expert_indices=block_to_expert_indices,
+            expert_ids_are_local=old.expert_ids_are_local,
         )
 
 
@@ -317,6 +413,7 @@ class ExpertBlockPermutedBatchedRoutedActivationBlockfp8(
             blocked_activation_scale=blocked_activation_scale,
             token_comma_topk_to_block_x_item_indices=token_comma_topk_to_block_x_item_indices,
             block_to_expert_indices=block_to_expert_indices,
+            expert_ids_are_local=old.expert_ids_are_local,
         )
 
 
@@ -370,5 +467,6 @@ class ConcatPermutedBatchedRoutedActivation(BatchedRoutedActivation):
         return cls(
             *batched_routed_activation_indexed_to_concat_permuted(
                 old.activation, old.token_to_expert_indices, n_experts=n_experts
-            )
+            ),
+            expert_ids_are_local=old.expert_ids_are_local,
         )

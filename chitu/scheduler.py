@@ -19,6 +19,7 @@ from chitu.task import (
 from chitu.global_vars import get_global_args, SlotHandle
 from chitu.utils import ceil_div
 from chitu.backend import Backend
+from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 
 logger = getLogger(__name__)
@@ -27,9 +28,9 @@ logger = getLogger(__name__)
 class Scheduler:
     @staticmethod
     def build(args, infer_args, *, dp_rank: int):
-        max_reqs_per_dp = infer_args.max_reqs // infer_args.dp_size + int(
-            dp_rank < infer_args.max_reqs % infer_args.dp_size
-        )
+        max_reqs_per_dp = compute_local_batch_size_dist_in_dp(
+            infer_args.max_reqs, infer_args.dp_size
+        )[dp_rank]
         if infer_args.prefill_chunk_size is not None:
             prefill_chunk_size_per_dp: Optional[int] = (
                 infer_args.prefill_chunk_size // infer_args.dp_size

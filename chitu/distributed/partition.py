@@ -8,6 +8,15 @@ from chitu.moe.impl import MoEImplBase, MoEImplEP
 from chitu.global_vars import get_global_args
 
 
+def compute_local_batch_size_dist_in_dp(
+    global_batch_size: int, dp_size: int
+) -> list[int]:
+    return [
+        global_batch_size // dp_size + int(i < global_batch_size % dp_size)
+        for i in range(dp_size)
+    ]
+
+
 def compute_layer_dist_in_pp(num_layers: int, pp_size: int):
     args = get_global_args()
     if args.infer.pp_layer_partition is not None:

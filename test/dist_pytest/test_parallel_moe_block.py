@@ -1,5 +1,6 @@
 import os
 import pytest
+import itertools
 from omegaconf import OmegaConf
 
 import torch
@@ -13,10 +14,12 @@ from chitu.distributed.parallel_state import (
     get_etp_rank_lists,
     get_ep_rank_lists,
 )
+from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 from chitu.device_type import has_native_fp8
 from chitu.task_type import TaskType
 from chitu.moe import MoEImplEP, MoEImplNoEP
 from chitu.global_vars import set_global_args
+from chitu.utils import ceil_div
 from chitu.testing import assert_close
 
 
@@ -28,7 +31,7 @@ from chitu.testing import assert_close
         [2, 1, 1, 2],  # TP2 + EP2
         # TODO: Enable the following:
         # [1, 2, 1, 2],  # DP2 + EP2
-        # [2, 2, 1, 4],  # TP2 + DP2 + EP4
+        # [2, 2, 1, 4],  # TP2 * DP2 + EP4
     ],
 )
 @pytest.mark.parametrize("batch_size", [0, 1, 16])
@@ -140,7 +143,7 @@ def test_parallel_moe_block(
         [[r] for r in range(torch.distributed.get_world_size())], rank, local_rank
     )
 
-    if rank < tp_size:
+    if rank < test_world_size:
         experts_start_idx = ep_group.rank_in_group * n_experts // ep_size
         experts_end_idx = (ep_group.rank_in_group + 1) * n_experts // ep_size
         if ep_size > 1:
@@ -148,6 +151,9 @@ def test_parallel_moe_block(
                 n_layers=1,
                 n_dense_layers=0,
                 hidden_dim=hidden_dim,
+                max_bs_per_dp_rank=(
+                    ceil_div(batch_size, dp_size) if task_type == TaskType.Decode else 1
+                ),
                 n_experts=n_experts,
                 use_cuda_graph=False,
                 tp_group=tp_group,
@@ -280,10 +286,16 @@ def test_parallel_moe_block(
         }
         ref_moe_block.load_state_dict(ref_state_dict, strict=True, assign=True)
 
-        y = parallel_moe_block(x)
+        local_bs_list = compute_local_batch_size_dist_in_dp(x.shape[0], dp_size)
+        cumulative_local_bs_list = list(itertools.accumulate(local_bs_list, initial=0))
+        dp_token_start = cumulative_local_bs_list[dp_group.rank_in_group]
+        dp_token_end = cumulative_local_bs_list[dp_group.rank_in_group + 1]
+        local_x = x[dp_token_start:dp_token_end]
+        local_y = parallel_moe_block(local_x)
         ref_y = ref_moe_block(ref_x)
+        ref_local_y = ref_y[dp_token_start:dp_token_end]
 
-        assert_close(y, ref_y, cos_sim_tol=0.002)
+        assert_close(local_y, ref_local_y, cos_sim_tol=0.002)
 
     torch.distributed.barrier(
         device_ids=[torch.cuda.current_device()]
@@ -298,7 +310,7 @@ def test_parallel_moe_block(
         [2, 1, 1, 2],  # TP2 + EP2
         # TODO: Enable the following:
         # [1, 2, 1, 2],  # DP2 + EP2
-        # [2, 2, 1, 4],  # TP2 + DP2 + EP4
+        # [2, 2, 1, 4],  # TP2 * DP2 + EP4
     ],
 )
 @pytest.mark.parametrize("batch_size", [0, 1, 16])
@@ -447,7 +459,7 @@ def test_parallel_moe_block_blockfp8(
         [[r] for r in range(torch.distributed.get_world_size())], rank, local_rank
     )
 
-    if rank < tp_size:
+    if rank < test_world_size:
         experts_start_idx = ep_group.rank_in_group * n_experts // ep_size
         experts_end_idx = (ep_group.rank_in_group + 1) * n_experts // ep_size
         if ep_size > 1:
@@ -455,6 +467,9 @@ def test_parallel_moe_block_blockfp8(
                 n_layers=1,
                 n_dense_layers=0,
                 hidden_dim=hidden_dim,
+                max_bs_per_dp_rank=(
+                    ceil_div(batch_size, dp_size) if task_type == TaskType.Decode else 1
+                ),
                 n_experts=n_experts,
                 use_cuda_graph=False,
                 tp_group=tp_group,
@@ -622,10 +637,16 @@ def test_parallel_moe_block_blockfp8(
         }
         ref_moe_block.load_state_dict(ref_state_dict, strict=True, assign=True)
 
-        y = parallel_moe_block(x)
+        local_bs_list = compute_local_batch_size_dist_in_dp(x.shape[0], dp_size)
+        cumulative_local_bs_list = list(itertools.accumulate(local_bs_list, initial=0))
+        dp_token_start = cumulative_local_bs_list[dp_group.rank_in_group]
+        dp_token_end = cumulative_local_bs_list[dp_group.rank_in_group + 1]
+        local_x = x[dp_token_start:dp_token_end]
+        local_y = parallel_moe_block(local_x)
         ref_y = ref_moe_block(ref_x)
+        ref_local_y = ref_y[dp_token_start:dp_token_end]
 
-        assert_close(y, ref_y, cos_sim_tol=0.002)
+        assert_close(local_y, ref_local_y, cos_sim_tol=0.002)
 
     torch.distributed.barrier(
         device_ids=[torch.cuda.current_device()]

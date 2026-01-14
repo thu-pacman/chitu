@@ -391,7 +391,9 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                         self.n_shared_experts,
                     )
                     weights, indices = final_weights, final_indices
-                    routed_x = IndexedBatchedRoutedActivation(x, indices)
+                    routed_x = IndexedBatchedRoutedActivation(
+                        x, indices, expert_ids_are_local=routed_x.expert_ids_are_local
+                    )
                 else:
                     raise NotImplementedError()
 

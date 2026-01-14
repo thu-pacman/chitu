@@ -6,8 +6,6 @@ import torch.distributed as dist
 from typing import Optional
 
 from chitu.utils import try_import_opt_dep, ceil_div
-from chitu.global_vars import get_global_args
-from chitu.distributed.parallel_state import get_dp_size
 
 deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 
@@ -30,14 +28,13 @@ class DeepEPBuffer:
         cls,
         group: dist.ProcessGroup,
         hidden_size: int,
+        max_bs_per_dp_rank: int,
         param_bytes: int,
         deepep_mode="deepep-normal",
         num_experts: int = None,
     ):
         if cls._buffer is not None:
             return cls._buffer
-
-        max_bs_per_dp_rank = ceil_div(get_global_args().infer.max_reqs, get_dp_size())
 
         cls._hidden_size = hidden_size
         cls._lowlatency_num_max_dispatch_tokens_per_rank = (

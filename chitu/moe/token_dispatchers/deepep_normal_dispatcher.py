@@ -36,6 +36,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         self,
         num_experts: int,
         hidden: int,
+        max_bs_per_dp_rank: int,
         profile: bool = False,
         mode: str = "deepep-normal",
         *,
@@ -47,6 +48,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         self.num_experts = num_experts
         self._buffer = None
         self.hidden = hidden
+        self.max_bs_per_dp_rank = max_bs_per_dp_rank
         self.profile = profile
         self.mode = mode
         # Set the number of SMs to use
@@ -59,7 +61,12 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         # NOTES: you may also replace `get_*_config` with your auto-tuned results via all the tests
 
         self._buffer = DeepEPBuffer.get_deepep_buffer(
-            self.ep_group.gpu_group, self.hidden, 2, self.mode, self.num_experts
+            self.ep_group.gpu_group,
+            self.hidden,
+            self.max_bs_per_dp_rank,
+            2,
+            self.mode,
+            self.num_experts,
         )
         DeepEPBuffer.set_dispatch_mode_as_normal()
 
@@ -110,6 +117,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
                     activation=hidden_states_fp8,
                     token_to_expert_indices=x.token_to_expert_indices,
                     activation_scale=scale,
+                    expert_ids_are_local=True,
                 ),
                 topk_weights,
                 may_fuse_quant=may_fuse_quant,
@@ -142,6 +150,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
                     device=recv_topk_idx.device,
                 ),
                 pad_block_size=128,
+                expert_ids_are_local=True,
             ),
             recv_topk_weights,
         )
@@ -185,6 +194,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
                     device=recv_topk_idx.device,
                 ),
                 pad_block_size=128,
+                expert_ids_are_local=True,
             ),
             recv_topk_weights,
         )

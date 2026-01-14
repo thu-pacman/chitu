@@ -797,21 +797,10 @@ def fused_experts(
     experts_start_idx: int = 0,
 ) -> torch.Tensor:
     n_local_experts = w1.shape[0]
-    if n_local_experts < global_num_experts:
-        assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
-        new_token_to_expert_indices = (
-            hidden_states.token_to_expert_indices - experts_start_idx
-        )
-        mask = (new_token_to_expert_indices < 0) | (
-            new_token_to_expert_indices >= n_local_experts
-        )
-        new_token_to_expert_indices[mask] = n_local_experts
-        hidden_states = IndexedBatchedRoutedActivation(
-            hidden_states.activation, new_token_to_expert_indices
-        )
-
     return fused_experts_impl(
-        hidden_states,
+        hidden_states.as_local_expert_ids(
+            experts_start_idx, experts_start_idx + n_local_experts
+        ),
         w1,
         w2,
         topk_weights,

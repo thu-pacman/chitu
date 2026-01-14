@@ -84,6 +84,10 @@ def _(
 
         n_experts = get_global_args().infer.num_experts_slots
 
+    hidden_states = hidden_states.as_local_expert_ids(
+        experts_start_idx, experts_start_idx + w1.shape[0]
+    )
+
     token_to_expert = hidden_states.token_to_expert_indices  # [B, topk]
 
     token_cnt_per_expert = torch.zeros(
@@ -163,6 +167,7 @@ def _(
     densed_hidden_states = PerExpertDenseBatchedRoutedActivation(
         activation_per_expert=activation_per_expert,
         n_tokens_per_expert=token_cnt_per_expert,
+        expert_ids_are_local=hidden_states.expert_ids_are_local,
     )
 
     del (
@@ -258,6 +263,10 @@ def _(
     assert w2_zp is None
     assert not use_int8_w8a16
     assert not use_int4_w4a16
+
+    hidden_states = hidden_states.as_local_expert_ids(
+        experts_start_idx, experts_start_idx + w1.shape[0]
+    )
 
     if not use_fp8_w8a8:
         assert isinstance(hidden_states, PerExpertDenseBatchedRoutedActivationBlockfp8)

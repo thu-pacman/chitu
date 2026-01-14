@@ -1431,7 +1431,9 @@ class ParallelMoeBlock(nn.Module):
         if rerouted_indices is None:
             rerouted_indices = indices
 
-        routed_x = IndexedBatchedRoutedActivation(x, rerouted_indices)
+        routed_x = IndexedBatchedRoutedActivation(
+            x, rerouted_indices, expert_ids_are_local=self.moe_impl.ep_size == 1
+        )
 
         shared_y = None
         x_in_use_simultenously = False
