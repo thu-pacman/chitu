@@ -78,12 +78,20 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         if self.dp_group.group_size == 1:
             return x, topk_weights
         else:
-            func = self.dp_group.all_gatherv_into_tensor_with_cum_size
-            global_activation, _ = func(x.activation, self.cum_num_tokens)
-            global_topk_ids, _ = func(x.token_to_expert_indices, self.cum_num_tokens)
-            global_topk_weights, _ = func(topk_weights, self.cum_num_tokens)
+            global_activation = self.dp_group.all_gatherv_into_tensor(
+                x.activation, cumulative_input_size_per_rank=self.cum_num_tokens
+            )
+            global_topk_ids = self.dp_group.all_gatherv_into_tensor(
+                x.token_to_expert_indices,
+                cumulative_input_size_per_rank=self.cum_num_tokens,
+            )
+            global_topk_weights = self.dp_group.all_gatherv_into_tensor(
+                topk_weights, cumulative_input_size_per_rank=self.cum_num_tokens
+            )
             return (
-                IndexedBatchedRoutedActivation(global_activation, global_topk_ids),
+                IndexedBatchedRoutedActivation(
+                    global_activation, global_topk_ids, expert_ids_are_local=False
+                ),
                 global_topk_weights,
             )
 

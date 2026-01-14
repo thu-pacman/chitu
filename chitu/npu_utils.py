@@ -515,7 +515,8 @@ def fused_experts_npu(
     use_int8_w8a8=False,
 ):
     n_local_experts = w1.shape[0]
-    if n_local_experts < global_num_experts:
+    if not hidden_states.expert_ids_are_local:
+        # TODO: Use `hidden_states.as_local_expert_ids`
         assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
         new_token_to_expert_indices = (
             hidden_states.token_to_expert_indices - experts_start_idx
@@ -527,7 +528,9 @@ def fused_experts_npu(
         topk_weights *= ~mask
         new_token_to_expert_indices *= ~mask
         hidden_states = IndexedBatchedRoutedActivation(
-            hidden_states.activation, new_token_to_expert_indices
+            hidden_states.activation,
+            new_token_to_expert_indices,
+            expert_ids_are_local=True,
         )
 
     return fused_experts_npu_impl(

@@ -37,6 +37,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         self,
         num_experts: int,
         hidden: int,
+        max_bs_per_dp_rank: int,
         profile: bool = False,
         mode: str = "deepep-ll",
         *,
@@ -51,6 +52,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         )
         self._buffer = None
         self.hidden = hidden
+        self.max_bs_per_dp_rank = max_bs_per_dp_rank
         self.mode = mode
 
         # NOTES: for the best performance, the QP number **must** be equal to the number of the local experts
@@ -98,7 +100,12 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
     def prepare_deepep_buffer(self):
         DeepEPBuffer.set_dispatch_mode_as_low_latency()
         self._buffer = DeepEPBuffer.get_deepep_buffer(
-            self.ep_group.gpu_group, self.hidden, 2, self.mode, self.num_experts
+            self.ep_group.gpu_group,
+            self.hidden,
+            self.max_bs_per_dp_rank,
+            2,
+            self.mode,
+            self.num_experts,
         )
 
     @override
@@ -170,6 +177,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                 PerExpertDenseBatchedRoutedActivation(
                     activation_per_expert=recv_activation,
                     n_tokens_per_expert=recv_expert_count,
+                    expert_ids_are_local=True,
                 ),
                 None,
             )
@@ -180,6 +188,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                     activation_per_expert=recv_activation,
                     activation_scale_per_expert=recv_activation_scale,
                     n_tokens_per_expert=recv_expert_count,
+                    expert_ids_are_local=True,
                 ),
                 None,
             )

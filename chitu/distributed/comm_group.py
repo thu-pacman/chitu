@@ -190,38 +190,51 @@ class CommGroup:
 
     # use for token dispatcher
 
-    def all_gatherv_into_tensor_with_cum_size(
+    def all_gatherv_into_tensor(
         self,
         input: torch.Tensor,
-        cum_size: list[int],
-    ) -> tuple[torch.Tensor, list[int] | torch.Size]:
+        *,
+        input_size_per_rank: Optional[list[int] | torch.Tensor] = None,
+        cumulative_input_size_per_rank: Optional[list[int] | torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if cumulative_input_size_per_rank is not None:
+            if input_size_per_rank is not None:
+                raise ValueError(
+                    "Only one of input_size_per_rank and cumulative_input_size_per_rank can be set."
+                )
+            if len(cumulative_input_size_per_rank) != self.group_size + 1:
+                raise ValueError(
+                    f"cumulative_input_size_per_rank should have group_size + 1 ({self.group_size + 1}) elements."
+                )
+            input_size_per_rank = [
+                cumulative_input_size_per_rank[i + 1]
+                - cumulative_input_size_per_rank[i]
+                for i in range(self.group_size)
+            ]
+        if input_size_per_rank is None:
+            raise ValueError(
+                "At least one of input_size_per_rank and cumulative_input_size_per_rank should be set."
+            )
+
         # For allgather v, we cannot assign output tensor beforehand
         # because we don't known the output shape.
-        world_size = self.group_size
-        # Bypass the function if we are using only 1 GPU.
-        if world_size == 1:
-            return input, input.size()
 
-        all_input_size_list_cpu = cum_size
-        per_input_size = []
-        for i in range(world_size):
-            per_input_size.append(
-                all_input_size_list_cpu[i + 1] - all_input_size_list_cpu[i]
-            )
+        # Bypass the function if we are using only 1 GPU.
+        if self.group_size == 1:
+            return input
 
         output_tensor_list = [
             torch.empty(
-                (per_input_size[i], input.size(-1)),
+                (input_size_per_rank[i], input.size(-1)),
                 dtype=input.dtype,
                 device=input.device,
             )
-            for i in range(world_size)
+            for i in range(self.group_size)
         ]
-        # logger.info(f"before all_gather, input_shape: {input.shape}, output_shape: {[tensor.shape for tensor in output_tensor_list]}")
 
         torch.distributed.all_gather(output_tensor_list, input, group=self.gpu_group)
 
-        return torch.cat(output_tensor_list, dim=0), per_input_size
+        return torch.cat(output_tensor_list, dim=0)
 
     def gather_all_rank_ip_port(self) -> List[Tuple[str, int, int]]:
         """

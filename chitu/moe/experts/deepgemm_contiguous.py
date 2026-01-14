@@ -83,6 +83,9 @@ def _(
     if out is None and inplace:
         out = hidden_states.activation
 
+    hidden_states = hidden_states.as_local_expert_ids(
+        experts_start_idx, experts_start_idx + w1.shape[0]
+    )
     new_hidden_states = ExpertBlockPermutedBatchedRoutedActivationNormal.convert_from(
         hidden_states, block_size=128, num_experts=w1.shape[0]
     )
@@ -109,6 +112,7 @@ def _(
         a2_scale=a2_scale,
         block_shape=block_shape,
         soft_fp8=soft_fp8,
+        experts_start_idx=experts_start_idx,
         out=out,
     )
 
@@ -139,6 +143,9 @@ def _(
     experts_start_idx: int = 0,
     out: Optional[torch.Tensor] = None,
 ):
+    hidden_states = hidden_states.as_local_expert_ids(
+        experts_start_idx, experts_start_idx + w1.shape[0]
+    )
 
     blocked_activation = hidden_states.blocked_activation
     block_to_expert_indices = hidden_states.block_to_expert_indices
@@ -214,6 +221,9 @@ def _(
     experts_start_idx: int = 0,
     out: Optional[torch.Tensor] = None,
 ):
+    hidden_states = hidden_states.as_local_expert_ids(
+        experts_start_idx, experts_start_idx + w1.shape[0]
+    )
     temp_hidden_states = (
         ExpertBlockPermutedBatchedRoutedActivationBlockfp8.convert_from(
             hidden_states, block_size=128, num_experts=w1.shape[0]
@@ -242,6 +252,7 @@ def _(
         a2_scale=a2_scale,
         block_shape=block_shape,
         soft_fp8=soft_fp8,
+        experts_start_idx=experts_start_idx,
         out=out,
     )
 
@@ -272,6 +283,10 @@ def _(
     experts_start_idx: int = 0,
     out: Optional[torch.Tensor] = None,
 ):
+    hidden_states = hidden_states.as_local_expert_ids(
+        experts_start_idx, experts_start_idx + w1.shape[0]
+    )
+
     assert use_fp8_w8a8
     assert block_shape is not None
     assert not use_int8_w8a16
@@ -384,6 +399,7 @@ def _(
             activation=hidden_states_fp8,
             activation_scale=scale,
             token_to_expert_indices=hidden_states.token_to_expert_indices,
+            expert_ids_are_local=hidden_states.expert_ids_are_local,
         )
         hidden_states = (
             IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt.convert_from(

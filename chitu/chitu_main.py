@@ -627,10 +627,7 @@ def chitu_init(args):
 
     # pp and mtp does not support schedule overlap
     if args.infer.schedule_overlap == "auto":
-        if args.infer.pp_size > 1 and args.infer.dp_size > 1:
-            args.infer.schedule_overlap = False
-        else:
-            args.infer.schedule_overlap = True
+        args.infer.schedule_overlap = True
 
     if args.infer.full_warmup == "auto":
         if args.infer.pp_size > 1 and args.infer.use_cuda_graph:
@@ -711,6 +708,20 @@ def remove_kvcache_all_device(remove_task_ids):
     Backend.executor.step(tasks)
 
 
+def remove_taskpool_all_device(remove_task_ids):
+    if len(remove_task_ids) == 0:
+        return
+    # Since we are removing, any task type is fine
+    tasks = PackedTasksBase(
+        num_tasks=len(remove_task_ids),
+        task_ids=remove_task_ids,
+        req_ids=remove_task_ids,
+        task_type=TaskType.Special,
+        payload_type=SerializedPackedTasksPayloadType.Remove,
+    )
+    Backend.executor.step(tasks)
+
+
 @torch.inference_mode()
 def chitu_run_main_rank():
     if Backend.args.infer.dp_size == 1:
@@ -748,7 +759,8 @@ def chitu_run_main_rank():
     if Backend.args.infer.dp_size > 1:
         if DPTaskCollector.has_available_tasks():
             tasks = DPTaskCollector.get_total_packedtasks()
-            task_ids = tasks.task_ids
+            task_ids_list = DPTaskCollector.get_task_ids_list()
+            task_ids = [task_id for task_ids in task_ids_list for task_id in task_ids]
             logger.debug(
                 f"[run] DPTaskCollector total_packed num_tasks={tasks.num_tasks} output_tasks={len(tasks.output_tasks)}"
             )
@@ -779,12 +791,15 @@ def chitu_run_main_rank():
 
     # tasks from the model-running tasks (task_ids) which will not run anymore
     removed_decode_task_ids = []
+    removed_kvcache_task_ids = []
     for i in range(Backend.args.infer.dp_size):
-        dp_local_removed_decode_task_ids = Backend.schedulers[i].update(
-            task_ids_per_dp[i], unwait_task_ids_per_dp[i]
+        dp_local_removed_decode_task_ids, dp_local_removed_kvcache_task_ids = (
+            Backend.schedulers[i].update(task_ids_per_dp[i], unwait_task_ids_per_dp[i])
         )
         removed_decode_task_ids += dp_local_removed_decode_task_ids
-    remove_kvcache_all_device(removed_decode_task_ids)
+        removed_kvcache_task_ids += dp_local_removed_kvcache_task_ids
+    remove_kvcache_all_device(removed_kvcache_task_ids)
+    remove_taskpool_all_device(removed_decode_task_ids)
     return backend_payload_type
 
 

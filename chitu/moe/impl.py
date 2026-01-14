@@ -63,6 +63,7 @@ def init_moe_impl(args) -> None:
                 else 0
             ),
             hidden_dim=args.models.dim,
+            max_bs_per_dp_rank=ceil_div(args.infer.max_reqs, args.infer.dp_size),
             n_experts=n_experts,
             n_global_experts_slots=args.infer.num_experts_slots,
             prefill_token_dispatcher_impl=args.infer.moe.prefill_token_dispatcher,
@@ -137,6 +138,7 @@ class MoEImplEP(MoEImplBase):
         n_layers: int,
         n_dense_layers: int,
         hidden_dim: int,
+        max_bs_per_dp_rank: int,
         n_experts: int,
         tp_group: Optional[CommGroup] = None,
         dp_group: Optional[CommGroup] = None,
@@ -155,6 +157,7 @@ class MoEImplEP(MoEImplBase):
         self.n_dense_layers = n_dense_layers
         self.hidden_dim = hidden_dim
         self.n_experts = n_experts
+        self.max_bs_per_dp_rank = max_bs_per_dp_rank
 
         self.task_type: Optional[TaskType] = None
 
@@ -230,6 +233,7 @@ class MoEImplEP(MoEImplBase):
             self.prefill_token_dispatcher = MoENormalTokenDispatcher(
                 self.n_global_experts_slots,
                 self.hidden_dim,
+                self.max_bs_per_dp_rank,
                 mode=(
                     "auto"
                     if self.decode_token_dispatcher_impl == "deepep-ll"
@@ -260,6 +264,7 @@ class MoEImplEP(MoEImplBase):
             self.decode_token_dispatcher = MoELowLatencyTokenDispatcher(
                 self.n_global_experts_slots,
                 self.hidden_dim,
+                self.max_bs_per_dp_rank,
                 tp_group=self.tp_group,
                 dp_group=self.dp_group,
                 ep_group=self.ep_group,

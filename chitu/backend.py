@@ -44,7 +44,10 @@ from chitu.distributed.parallel_state import (
     get_dp_group,
     initialize_parallel_groups,
 )
-from chitu.distributed.partition import compute_layer_dist_in_pp
+from chitu.distributed.partition import (
+    compute_local_batch_size_dist_in_dp,
+    compute_layer_dist_in_pp,
+)
 from chitu.hybrid_device import CPUParameter
 from chitu.models.registry import ModelType, get_model_class
 from chitu.quantization import (
@@ -1102,10 +1105,9 @@ class Backend:
 
         # Dense KVCache and PP related
         if args.infer.cache_type == "skew":
-            dp_rank = get_dp_group().rank_in_group
-            max_reqs_per_dp = args.infer.max_reqs // args.infer.dp_size + int(
-                dp_rank < args.infer.max_reqs % args.infer.dp_size
-            )
+            max_reqs_per_dp = compute_local_batch_size_dist_in_dp(
+                args.infer.max_reqs, args.infer.dp_size
+            )[get_dp_group().rank_in_group]
             set_slot_handle(max_reqs_per_dp, args.infer.pp_size)
 
         init_moe_impl(args)
