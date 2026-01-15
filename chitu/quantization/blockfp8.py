@@ -366,37 +366,6 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                 )
                 down_proj_scale = None
 
-            if self.fuse_shared_experts:
-                if isinstance(routed_x, IndexedBatchedRoutedActivation):
-                    x, indices = routed_x.activation, routed_x.token_to_expert_indices
-                    indice_shape = indices.shape
-                    final_indices = torch.empty(
-                        (indice_shape[0], indice_shape[1] + 1),
-                        dtype=indices.dtype,
-                        device=indices.device,
-                    )
-
-                    final_weights = torch.empty(
-                        (weights.shape[0], weights.shape[1] + 1),
-                        dtype=weights.dtype,
-                        device=weights.device,
-                    )
-
-                    chitu_backend.cuda_add_shared_experts(
-                        final_weights,
-                        final_indices,
-                        weights,
-                        indices,
-                        self.n_routed_experts,
-                        self.n_shared_experts,
-                    )
-                    weights, indices = final_weights, final_indices
-                    routed_x = IndexedBatchedRoutedActivation(
-                        x, indices, expert_ids_are_local=routed_x.expert_ids_are_local
-                    )
-                else:
-                    raise NotImplementedError()
-
             return fused_experts(
                 routed_x,
                 w1=gate_up_proj_weight,

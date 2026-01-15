@@ -38,6 +38,7 @@ class Qwen3MoeGate(MoeGate):
             bias=None,
             e_score_correction_bias=None,
             norm_prob=params.norm_topk_prob,
+            n_fused_shared_experts=0,
         )
 
 

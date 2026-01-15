@@ -825,6 +825,11 @@ class GateDeepSeekV3(MoeGate):
                 torch.empty(args.n_routed_experts, dtype=torch.float32)
             ),
             norm_prob=args.norm_topk_prob,
+            n_fused_shared_experts=(
+                args.n_shared_experts
+                if get_global_args().infer.fuse_shared_experts
+                else 0
+            ),
         )
 
 

@@ -1247,6 +1247,7 @@ class MoeGate(nn.Module):
         bias,
         e_score_correction_bias,
         norm_prob,
+        n_fused_shared_experts: int,
         _debug_force_moe_balance: Optional[bool] = None,
     ):
         """
@@ -1266,6 +1267,7 @@ class MoeGate(nn.Module):
         self.bias = bias
         self.e_score_correction_bias = e_score_correction_bias
         self.norm_prob = norm_prob
+        self.n_fused_shared_experts = n_fused_shared_experts
 
         if _debug_force_moe_balance is None:
             _debug_force_moe_balance = get_global_args().debug.force_moe_balance
@@ -1330,7 +1332,34 @@ class MoeGate(nn.Module):
         )
         if self.route_scale != 1:
             weights *= self.route_scale
-        return weights.type_as(x), indices.to(torch.int32)
+        weights = weights.type_as(x)
+        indices = indices.to(torch.int32)
+
+        if self.n_fused_shared_experts > 0:
+            indice_shape = indices.shape
+            final_indices = torch.empty(
+                (indice_shape[0], indice_shape[1] + 1),
+                dtype=indices.dtype,
+                device=indices.device,
+            )
+
+            final_weights = torch.empty(
+                (weights.shape[0], weights.shape[1] + 1),
+                dtype=weights.dtype,
+                device=weights.device,
+            )
+
+            chitu_backend.cuda_add_shared_experts(
+                final_weights,
+                final_indices,
+                weights,
+                indices,
+                self.n_experts,
+                self.n_fused_shared_experts,
+            )
+            weights, indices = final_weights, final_indices
+
+        return weights, indices
 
 
 class ParallelMoeBlock(nn.Module):

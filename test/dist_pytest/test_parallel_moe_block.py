@@ -179,6 +179,7 @@ def test_parallel_moe_block(
                 bias=None,
                 e_score_correction_bias=None,
                 norm_prob=True,
+                n_fused_shared_experts=0,
                 _debug_force_moe_balance=False,
             ),
             NormalMoeExperts(
@@ -256,6 +257,7 @@ def test_parallel_moe_block(
                 bias=None,
                 e_score_correction_bias=None,
                 norm_prob=True,
+                n_fused_shared_experts=0,
                 _debug_force_moe_balance=False,
             ),
             NormalMoeExperts(
@@ -495,6 +497,7 @@ def test_parallel_moe_block_blockfp8(
                 bias=None,
                 e_score_correction_bias=None,
                 norm_prob=True,
+                n_fused_shared_experts=0,
                 _debug_force_moe_balance=False,
             ),
             Blockfp8MoeExperts(
@@ -603,6 +606,7 @@ def test_parallel_moe_block_blockfp8(
                 bias=None,
                 e_score_correction_bias=None,
                 norm_prob=True,
+                n_fused_shared_experts=0,
                 _debug_force_moe_balance=False,
             ),
             Blockfp8MoeExperts(

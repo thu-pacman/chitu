@@ -40,7 +40,6 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivation,
 )
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 hard_fp4_kernels, has_hard_fp4_kernels = try_import_opt_dep(
     "hard_fp4_kernels", "hard_fp4_kernels"
 )
@@ -654,31 +653,6 @@ class Blockfp4MoeExpertsPackKStride1(
         shape = x.size()
         x = x.view(-1, self.dim)
 
-        final_indices = indices
-        final_weights = weights
-        if self.fuse_shared_experts:
-            indice_shape = indices.shape
-            final_indices = torch.empty(
-                (indice_shape[0], indice_shape[1] + 1),
-                dtype=indices.dtype,
-                device=indices.device,
-            )
-
-            final_weights = torch.empty(
-                (weights.shape[0], weights.shape[1] + 1),
-                dtype=weights.dtype,
-                device=weights.device,
-            )
-
-            chitu_backend.cuda_add_shared_experts(
-                final_weights,
-                final_indices,
-                weights,
-                indices,
-                self.n_routed_experts,
-                self.n_shared_experts,
-            )
-            del weights, indices
         if impl == "auto":
             if not self.merge_gate_up or (
                 not has_hard_fp4_kernels and not self.fuse_shared_experts
@@ -687,9 +661,9 @@ class Blockfp4MoeExpertsPackKStride1(
             else:
                 impl = "cuda"
         if impl == "cuda":
-            y = self.forward_cuda(x, final_weights, final_indices, inplace=inplace)
+            y = self.forward_cuda(x, weights, indices, inplace=inplace)
         elif impl == "iterative":
-            y = self.forward_iterative(x, final_indices, final_weights, inplace=inplace)
+            y = self.forward_iterative(x, indices, weights, inplace=inplace)
 
         return y.reshape(shape)
 
@@ -772,38 +746,6 @@ class Blockfp4MoeExpertsPackKStride64(
                 parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
                 != 1
             )
-
-            if self.fuse_shared_experts:
-                if isinstance(routed_x, IndexedBatchedRoutedActivation):
-                    x, indices = routed_x.activation, routed_x.token_to_expert_indices
-                    indice_shape = indices.shape
-                    final_indices = torch.empty(
-                        (indice_shape[0], indice_shape[1] + 1),
-                        dtype=indices.dtype,
-                        device=indices.device,
-                    )
-
-                    final_weights = torch.empty(
-                        (weights.shape[0], weights.shape[1] + 1),
-                        dtype=weights.dtype,
-                        device=weights.device,
-                    )
-
-                    chitu_backend.cuda_add_shared_experts(
-                        final_weights,
-                        final_indices,
-                        weights,
-                        indices,
-                        self.n_routed_experts,
-                        self.n_shared_experts,
-                    )
-                    weights, indices = final_weights, final_indices
-                    routed_x = IndexedBatchedRoutedActivation(
-                        x, indices, expert_ids_are_local=routed_x.expert_ids_are_local
-                    )
-                else:
-                    raise NotImplementedError()
-
             return fused_experts(
                 routed_x,
                 w1=self.get_native_layout_gate_up_proj_weight().layout_tensor,
