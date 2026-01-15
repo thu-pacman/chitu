@@ -68,6 +68,14 @@ class ChatRequest(BaseModel):
     chat_template_kwargs: Mapping[str, Any] = {}
 
 
+class TokenizeRequest(BaseModel):
+    prompt: str
+
+
+class DetokenizeRequest(BaseModel):
+    tokens: list[int]
+
+
 def get_priority_from_api_key(api_key: str) -> int:
     args = get_global_args()
     for item in args.serve.api_keys:
@@ -249,6 +257,46 @@ async def get_chitu_ping():
 @app.post("/health")
 async def health():
     pass  # TODO Check the inference service
+
+
+@app.post("/tokenize")
+async def tokenize(raw_request: Request):
+    try:
+        data = await raw_request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400, detail="Invalid JSON body. Expecting JSON payload."
+        )
+
+    try:
+        request = TokenizeRequest.model_validate(data)
+    except ValidationError as e:
+        # Keep consistency with FastAPI default behavior for body validation errors
+        raise HTTPException(status_code=422, detail=e.errors())
+
+    tokens = Backend.tokenizer.model.encode(request.prompt, add_special_tokens=False)
+
+    return {"tokens": tokens}
+
+
+@app.post("/detokenize")
+async def detokenize(raw_request: Request):
+    try:
+        data = await raw_request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400, detail="Invalid JSON body. Expecting JSON payload."
+        )
+
+    try:
+        request = DetokenizeRequest.model_validate(data)
+    except ValidationError as e:
+        # Keep consistency with FastAPI default behavior for body validation errors
+        raise HTTPException(status_code=422, detail=e.errors())
+
+    prompt = Backend.tokenizer.model.decode(request.tokens, skip_special_tokens=True)
+
+    return {"prompt": prompt}
 
 
 # ====== DP Processing Functions ======
