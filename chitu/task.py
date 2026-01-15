@@ -27,6 +27,8 @@ from chitu.backend import Backend
 from chitu.device_list import DeviceList, StaticDeviceListManager
 from chitu.distributed.parallel_state import get_dp_size
 from chitu.global_vars import get_slot_handle, get_global_args
+from chitu.tool_call.types import ToolChoice, ToolCallParams
+from chitu.constraint_decode import ConstraintDecodeTask
 
 logger = getLogger(__name__)
 
@@ -167,6 +169,9 @@ class UserRequest:
         frequency_penalty=0.0,
         chat_template_kwargs: Mapping[str, Any] = {},
         enable_reasoning: bool = True,
+        tools: list[dict] = [],
+        tool_choice: ToolChoice = "auto",
+        parallel_tool_calls: bool = True,
     ):
         # input related
         self.message = message
@@ -179,6 +184,22 @@ class UserRequest:
             frequency_penalty=frequency_penalty,
         )
         self.chat_template_kwargs = chat_template_kwargs
+        # constraint decoding related
+        self.tools = tools
+        self.grammar = None
+        self.grammar_str = ""
+        if tools:
+            self.chat_template_kwargs["tools"] = tools
+            self.grammar, self.grammar_str = (
+                Backend.constraint_decode_manager.generate_grammar(
+                    ToolCallParams(
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        parallel_tool_calls=parallel_tool_calls,
+                        enable_reasoning=enable_reasoning,
+                    )
+                )
+            )
 
         # response related
         self.output = ""
@@ -286,7 +307,7 @@ class UserRequest:
             file.write(trace_str + "\n")
 
     @functools.cached_property
-    def prompt_tokens(self):
+    def prompt_tokens(self) -> list[int]:
         """
         Prompt tokens.
         """
@@ -352,9 +373,10 @@ class MockFixedLengthedUserRequest(UserRequest):
 @dataclass
 class MsgPackableTask:
     task_id: str
-    tokens: list[int]
+    prefix_tokens: list[int]
+    prompt_len: int
     params: SampleParams
-    req: Optional[UserRequest] = None
+    grammar_str: str = ""
     # DP chunk prefill: carry progress and current-step chunk size
     consumed_req_tokens: int = 0
     prefill_chunk_size: Optional[int] = None
@@ -365,13 +387,15 @@ class MsgPackableTask:
     sched_group_id: Optional[int] = None
 
 
-class Task:
+class Task(ConstraintDecodeTask):
     def __init__(
         self,
         task_id: str,
         req: UserRequest,
         params: SampleParams = None,
-        tokens=None,
+        prefix_tokens=None,
+        prompt_len=None,
+        grammar_str: str = "",
         priority: int = 1,
         stop_with_eos: bool = True,
     ):
@@ -383,11 +407,25 @@ class Task:
         self.stop_with_eos = stop_with_eos
         self.params = params if params is not None else req.params
         self.dp_rank: Optional[int] = None
-        self._prefix_tokens = tokens if tokens is not None else req.prompt_tokens
+        self.prefix_tokens = (
+            prefix_tokens if prefix_tokens is not None else req.prompt_tokens
+        )
+        self.prompt_len = (
+            prompt_len if prompt_len is not None else len(self.prefix_tokens)
+        )
         self._decode_status = TaskDecodeType.Normal
 
         # Request
         self.req = req
+        if req:
+            self.grammar_str = req.grammar_str
+            self.grammar = req.grammar
+        else:
+            self.grammar_str = grammar_str
+            self.grammar = Backend.constraint_decode_manager.deserialize_grammar(
+                grammar_str
+            )
+
         self.prefill_chunk_size: Optional[int] = (
             None  # Dynamic in Task, but adds up to be no higher than a static bound in PackedTasks
         )
@@ -555,12 +593,12 @@ class Task:
             if not isinstance(self.record_next_token, int):
                 self.record_next_token = int(self.record_next_token.cpu().item())
             if has_update:
-                self._prefix_tokens.append(self.record_next_token)
+                self.prefix_tokens.append(self.record_next_token)
             self.record_next_token = None
         elif has_update:
             if Backend.executor.mtp_size > 1:
-                self._prefix_tokens.extend(self.mtp_token_list)
-            self._prefix_tokens.append(self.next_token)
+                self.prefix_tokens.extend(self.mtp_token_list)
+            self.prefix_tokens.append(self.next_token)
         self.sync_new_token = True
         self.evicting = False
 
@@ -581,16 +619,12 @@ class Task:
         self.wait_logit = None
 
     @property
-    def prefix_tokens(self):
-        return self._prefix_tokens
-
-    @property
     def prefix_tokens_len(self):
         # if not sync, compute the prefix tokens length after sync
         return (
-            len(self._prefix_tokens)
+            len(self.prefix_tokens)
             if self.sync_new_token or self.task_type == TaskType.Prefill
-            else len(self._prefix_tokens) + Backend.executor.mtp_size
+            else len(self.prefix_tokens) + Backend.executor.mtp_size
         )
 
     def set_prefill_chunk_size_for_one_step(self, prefill_chunk_size: int):
@@ -710,7 +744,9 @@ class Task:
         )
         return MsgPackableTask(
             task_id=self.task_id,
-            tokens=self._prefix_tokens if is_first_prefill else [],
+            prefix_tokens=self.prefix_tokens if is_first_prefill else [],
+            prompt_len=self.prompt_len,
+            grammar_str=self.grammar_str if is_first_prefill else "",
             params=self.params,
             consumed_req_tokens=self.consumed_req_tokens,
             prefill_chunk_size=self.prefill_chunk_size,
@@ -724,7 +760,7 @@ class Task:
         if self.task_type == TaskType.Prefill:
             return self.consumed_req_tokens
         elif self.task_type == TaskType.Decode:
-            return len(self._prefix_tokens) - (
+            return len(self.prefix_tokens) - (
                 self.num_new_tokens_single_step if self.sync_new_token else 0
             )
         else:
@@ -1401,14 +1437,23 @@ def deserialize_prefill_tasks(data: bytes) -> PackedTasks:
     for td in tasks_data:
         params = SampleParams(**td["params"])
         tid = td["task_id"]
-        tokens = td["tokens"]
+        prefix_tokens = td["prefix_tokens"]
         consumed = td.get("consumed_req_tokens", 0)
         chunk = td.get("prefill_chunk_size", None)
+        grammar_str = td.get("grammar_str", "")
+        prompt_len = td.get("prompt_len", 0)
 
         if tid in TaskPool.pool:
             task = TaskPool.pool[tid]
         else:
-            task = Task(task_id=tid, req=None, params=params, tokens=tokens)
+            task = Task(
+                task_id=tid,
+                req=None,
+                params=params,
+                prefix_tokens=prefix_tokens,
+                grammar_str=grammar_str,
+                prompt_len=prompt_len,
+            )
             task.return_logprobs = td.get("return_logprobs", False)
             task._test_flag = td.get("_test_flag", False)
             task.sched_group_id = td.get("sched_group_id", None)

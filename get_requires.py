@@ -37,6 +37,8 @@ install_requires = [
     "plum-dispatch",
     "netifaces",
     "prometheus-client>=0.19.0",
+    "xgrammar",
+    "openai",
 ]
 
 

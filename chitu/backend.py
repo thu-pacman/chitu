@@ -57,6 +57,7 @@ from chitu.quantization import (
     utils,
 )
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF, Processor
+from chitu.constraint_decode import ConstraintDecodeManager
 from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div
 
 # from chitu.distributed.moe_token_dispatcher import init_token_dispatcher
@@ -1119,6 +1120,9 @@ class Backend:
         Backend.tokenizer = Backend._init_tokenizer(args)
         Backend.processor = Backend._init_processor(args)
         Backend.formatter = Backend._init_formatter(args)
+        Backend.constraint_decode_manager = ConstraintDecodeManager(
+            Backend.tokenizer.model, args.models.vocab_size
+        )
 
         attn_backend_type = Backend._get_attention_backend_type(args)
 

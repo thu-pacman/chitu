@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from chitu.backend import Backend
 from chitu.tokenizer import Tokenizer, TokenizerHF
 from chitu.serve.event_loop import get_server_event_loop
+from chitu.tool_call import get_parser_cls, ChoiceDelta
 
 logger = getLogger(__name__)
 
@@ -100,9 +101,10 @@ class AsyncDataStream:
     def reasoning_handle(self, value: int):
         if not self.is_reasoning and self.tokens_len == 0 and value == self.rs_token_id:
             self.is_reasoning = True
-        if self.is_reasoning and value == self.re_token_id:
+        if self.is_reasoning:
+            if value == self.re_token_id:
+                self.is_reasoning = False
             self.reasoning_len = len(self.seqs) + 1
-            self.is_reasoning = False
 
     def is_reasoning_content(self):
         return self.is_reasoning or self.index - 1 < self.reasoning_len
@@ -133,7 +135,11 @@ class AsyncDataStream:
                         top_logprobs = None
                         top_tokens = None
                     self.index += 1
-                    return result, top_logprobs, top_tokens
+                    return (
+                        result,
+                        self.is_reasoning_content(),
+                        (top_logprobs, top_tokens),
+                    )
             self.data_event.clear()
             await self.data_event.wait()
 
@@ -142,18 +148,25 @@ class AsyncResponse:
     def __init__(self, req):
         self.req = req
         self.id = req.request_id
-        self.async_stream = req.async_stream
+        self.async_stream: AsyncDataStream = req.async_stream
+        self.tool_parser = get_parser_cls()() if req.tools else None
 
     def stream_generator(self):
+        if self.tool_parser:
+            stream = self.tool_parser.parse_stream(self.async_stream)
+        else:
+            stream = self.async_stream
+
         async def stream_response():
             try:
-                async for data, top_logprobs, top_tokens in self.async_stream:
+                async for data, is_reasoning, (top_logprobs, top_tokens) in stream:
                     if data:
-                        delta = {}
-                        if self.async_stream.is_reasoning_content():
-                            delta["reasoning_content"] = f"{data}"
+                        if isinstance(data, ChoiceDelta):
+                            delta = data
+                        elif is_reasoning:
+                            delta = dict(reasoning_content=data)
                         else:
-                            delta["content"] = f"{data}"
+                            delta = dict(content=data)
                         if self.req.logprobs:
                             logprobs = {"content": []}
                             logprobs["content"].append(
@@ -234,7 +247,12 @@ class AsyncResponse:
 
         if r_len:
             message["reasoning_content"] = "".join(text[:r_len])
-        message["content"] = "".join(text[r_len:])
+
+        content = "".join(text[r_len:])
+        if self.tool_parser:
+            content, tools = self.tool_parser.parse_string(content)
+            message["tool_calls"] = tools
+        message["content"] = content
 
         if self.req.logprobs:
             logprobs = {"content": []}

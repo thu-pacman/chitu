@@ -865,7 +865,7 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
     scheduler = Scheduler(100, 4, 2, "prefill_first", num_scheduler_groups=1)
     task_ids = scheduler.schedule()
     Backend.cache_manager.prepare_cache_prefill(task_ids)
-    task._prefix_tokens.append(1)
+    task.prefix_tokens.append(1)
     scheduler.update(task_ids)
 
     task.consume_req_tokens()
@@ -875,7 +875,7 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
             "req_0",
         ]
         Backend.cache_manager.prepare_cache_decode(task_ids)
-        task._prefix_tokens.append(1)
+        task.prefix_tokens.append(1)
         scheduler.update(task_ids)
 
     with pytest.raises(Exception) as exc_info:
@@ -927,7 +927,7 @@ def test_evict_decode_task():
         task_ids.append(task.task_id)
         TaskPool.add(task)  # pool: ['req_0', 'req_1', 'req_2', 'req_3']
         task.consume_req_tokens()
-        task._prefix_tokens.append(1)
+        task.prefix_tokens.append(1)
     Backend.cache_manager.prepare_cache_prefill(task_ids)
 
     # TaskPool: ['req_0', 'req_1', 'req_2', 'req_3']

@@ -28,6 +28,7 @@ from chitu.task import Task, TaskLoad, TaskPool, UserRequest
 from chitu.utils import gen_req_id
 from chitu.serve.event_loop import start_server_in_new_event_loop
 from chitu.serve.common import set_min_batch_size
+from chitu.tool_call.types import ToolChoice
 
 logger = getLogger(__name__)
 
@@ -50,11 +51,15 @@ class HttpHeader(BaseModel):
 class Message(BaseModel):
     role: str = "user"
     content: str | list[str | dict] = "hello, who are you"
+    tool_call_id: str | None = None  # useless, at least for qwen3
 
 
 class ChatRequest(BaseModel):
     conversation_id: str = Field(default_factory=gen_req_id)
     messages: list[Message]
+    tools: list[dict] = []
+    tool_choice: ToolChoice = "auto"
+    parallel_tool_calls: bool = True
     logprobs: bool = False
     top_logprobs: Optional[int] = None
     max_tokens: Optional[int] = None
@@ -85,6 +90,21 @@ def get_priority_from_api_key(api_key: str) -> int:
 
 
 # ====== Standard HTTP Endpoints ======
+
+
+@app.get("/v1/models")
+async def list_models():
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": get_global_args().models.name,
+                "object": "model",
+                "created": 0,
+                "owned_by": "organization-owner",
+            }
+        ],
+    }
 
 
 @app.post("/v1/chat/completions")
@@ -176,6 +196,9 @@ async def create_chat_completion(
             top_k=top_k,
             frequency_penalty=freq_pen,
             chat_template_kwargs=chat_template_kwargs,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            parallel_tool_calls=request.parallel_tool_calls,
         )
         response = AsyncResponse(req)
         task = Task(
