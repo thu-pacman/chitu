@@ -19,6 +19,11 @@ class ServeAddrConfig:
     host: str = MISSING
     port: int = MISSING
     api_keys: list[ApiKey] = MISSING
+    # Optional: map external model names (e.g. Anthropic) to the currently loaded internal model name.
+    # Example:
+    #   model_aliases:
+    #     claude-3-5-sonnet-latest: DeepSeek-V3.1
+    model_aliases: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

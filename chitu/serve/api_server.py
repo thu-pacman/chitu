@@ -29,6 +29,7 @@ from chitu.utils import gen_req_id
 from chitu.serve.event_loop import start_server_in_new_event_loop
 from chitu.serve.common import set_min_batch_size
 from chitu.tool_call.types import ToolChoice
+from chitu.serve.anthropic_api import create_router as create_anthropic_router
 
 logger = getLogger(__name__)
 
@@ -41,11 +42,6 @@ dp_service_started = False
 
 # Create FastAPI app
 app = FastAPI()  # Unified API
-
-
-class HttpHeader(BaseModel):
-    # Format: "Bearer <api_key>". If `<api_key>` is in `serve.api_keys`, the request will be prioritized
-    Authorization: Optional[str] = None
 
 
 class Message(BaseModel):
@@ -89,6 +85,15 @@ def get_priority_from_api_key(api_key: str) -> int:
     return 1
 
 
+# Include Anthropic-compatible API routes (keep api_server.py thin)
+app.include_router(
+    create_anthropic_router(
+        get_server_status=lambda: server_status,
+        get_dp_service_started=lambda: dp_service_started,
+        priority_for_api_key=get_priority_from_api_key,
+    )
+)
+
 # ====== Standard HTTP Endpoints ======
 
 
@@ -109,7 +114,8 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(
-    raw_request: Request, http_header: Annotated[HttpHeader, Header()]
+    raw_request: Request,
+    authorization: Annotated[Optional[str], Header(alias="Authorization")] = None,
 ):
     global server_status
 
@@ -135,19 +141,16 @@ async def create_chat_completion(
     # Check if DP mode is enabled and use appropriate processing
     if get_global_args().dp_config.enabled:
         logger.debug(f"[HTTP] Using DP mode for request: {request.conversation_id}")
-        return await process_dp_chat_completion(request, http_header)
+        return await process_dp_chat_completion(request)
 
-    headers = http_header.dict()
-    authorization_body = headers.pop("Authorization")
-    if authorization_body is not None:
-        if not authorization_body.startswith("Bearer "):
+    api_key = ""
+    if authorization is not None:
+        if not authorization.startswith("Bearer "):
             raise HTTPException(
                 status_code=400,
                 detail="Authorization header must start with 'Bearer'",
             )
-        api_key = authorization_body[len("Bearer ") :]
-    else:
-        api_key = ""
+        api_key = authorization[len("Bearer ") :]
 
     params = request.dict()
     req_id = gen_req_id()
@@ -325,9 +328,7 @@ async def detokenize(raw_request: Request):
 # ====== DP Processing Functions ======
 
 
-async def process_dp_chat_completion(
-    request: ChatRequest, http_header: Annotated[HttpHeader, Header()]
-):
+async def process_dp_chat_completion(request: ChatRequest):
     """Process chat completion request using DP mode"""
     global dp_service_started
 
