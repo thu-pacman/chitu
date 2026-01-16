@@ -49,7 +49,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
     @override
     @functools.singledispatchmethod
-    def token_permutation(
+    def enter_moe(
         self,
         x: BatchedRoutedActivation,
         topk_weights: torch.Tensor,
@@ -62,10 +62,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             return x, topk_weights
         else:
             raise NotImplementedError(
-                f"{type(x)} not supported for MoEAllGatherTokenDispatcher.token_permutation"
+                f"{type(x)} not supported for MoEAllGatherTokenDispatcher.enter_moe"
             )
 
-    @token_permutation.register
+    @enter_moe.register
     def _(
         self,
         x: IndexedBatchedRoutedActivation,
@@ -96,12 +96,18 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             )
 
     @override
-    def token_unpermutation(self, expert_outputs: torch.Tensor):
-        self.ep_group.all_reduce(expert_outputs)
+    def exit_moe_prefer_before_local_sum(self) -> bool:
+        return False
+
+    @override
+    def exit_moe_after_local_sum(self, local_sum_result: torch.Tensor) -> torch.Tensor:
+        # NOTE: This function do in-place operation on input.
+        # TODO: For safety, add an `inplace: bool` parameter.
+        self.ep_group.all_reduce(local_sum_result)
         if self.dp_group.group_size > 1:
-            expert_outputs = expert_outputs[
+            local_sum_result = local_sum_result[
                 self.cum_num_tokens[self.dp_group.rank_in_group] : self.cum_num_tokens[
                     self.dp_group.rank_in_group + 1
                 ]
             ]
-        return expert_outputs
+        return local_sum_result

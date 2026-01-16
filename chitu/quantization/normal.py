@@ -32,16 +32,19 @@ from chitu.native_layout import (
     ACL_FORMAT_FRACTAL_NZ,
 )
 from chitu.custom_gguf import GGMLQuantizationType, get_ggml_quant_type
+from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
+)
+from chitu.moe.experts import (
+    fused_experts_no_sum_wrapper,
+    fused_experts_and_sum_wrapper,
 )
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
-if has_triton or has_torch_npu:
-    from chitu.moe.experts import fused_experts
 
 
 @QuantizationRegistry.register_linear(None)
@@ -178,6 +181,23 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
         )
 
     @override
+    def forward_no_sum(
+        self, routed_x: BatchedRoutedActivation, impl="auto"
+    ) -> BatchedExpertResult:
+        if self.merge_gate_up and (has_triton or has_torch_npu):
+            return fused_experts_no_sum_wrapper(
+                routed_x,
+                w1=self.gate_up_proj_weight,
+                w2=self.down_proj_weight,
+                global_num_experts=self.global_n_experts,
+                experts_start_idx=self.experts_start_idx,
+                impl=impl,
+                layer_id=self.layer_id,
+            )
+        else:
+            return super().forward_no_sum(routed_x, impl=impl)
+
+    @override
     def forward(
         self,
         routed_x: BatchedRoutedActivation,
@@ -186,7 +206,7 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
         impl: str = "auto",
     ) -> torch.Tensor:
         if self.merge_gate_up and (has_triton or has_torch_npu):
-            return fused_experts(
+            return fused_experts_and_sum_wrapper(
                 routed_x,
                 w1=self.gate_up_proj_weight,
                 w2=self.down_proj_weight,

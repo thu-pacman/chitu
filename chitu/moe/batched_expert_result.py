@@ -28,7 +28,7 @@ class BatchedExpertResult:
     """
 
     def weighted_sum(
-        self, topk_weights: torch.Tensor, *, out: Optional[torch.Tensor]
+        self, topk_weights: torch.Tensor, *, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Sum with expert weight.
@@ -107,17 +107,32 @@ class ConcatPermutedBatchedExpertResult(BatchedExpertResult):
 
 
 @dataclass
-class PerExpertDenseBatchedExpertResult(BatchedExpertResult):
-    """Result of `IndexedBatchedRoutedActivation` when using DeepGEMM masked expert.
+class PerExpertDenseBatchedExpertResultMinimal(BatchedExpertResult):
+    """
+    Result DeepGEMM masked expert (minimal variant).
 
-    This variant assumes that activations have already been densely packed per expert
-    and that we also know, for every (token, topk) pair, the corresponding position
-    in that expert's activation buffer.
+    In this subclass, activations have already been densely packed per expert.
+
+    Please note that this "minimal" variant does NOT contain necessary indices
+    for local summation. It is dedicated for summing inside DeepEP. In order
+    for full functionality, please use `PerExpertDenseBatchedExpertResult`.
     """
 
     activation_per_expert: (
         torch.Tensor
     )  # [n_experts, max_n_tokens_per_expert, hidden_size]
+
+
+@dataclass
+class PerExpertDenseBatchedExpertResult(PerExpertDenseBatchedExpertResultMinimal):
+    """
+    Result DeepGEMM masked expert (full variant).
+
+    Compared to `PerExpertDenseBatchedExpertResultMinimal`, this variant also contains
+    information describing, for every (token, topk) pair, the corresponding position
+    in that expert's activation buffer.
+    """
+
     token_to_expert_indices: torch.Tensor  # [batch_size, topk]
     token_pos_in_expert: torch.Tensor  # [batch_size, topk]
 

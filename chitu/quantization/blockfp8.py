@@ -31,15 +31,18 @@ from chitu.native_layout import (
     MarlinNativeLayoutWeight,
     MarlinNativeLayoutScale,
 )
+from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
 )
+from chitu.moe.experts import (
+    fused_experts_no_sum_wrapper,
+    fused_experts_and_sum_wrapper,
+)
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
-if has_triton and torch.cuda.is_available():
-    from chitu.moe.experts import fused_experts
 
 has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
 
@@ -321,6 +324,65 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         )
 
     @override
+    def forward_no_sum(
+        self, routed_x: BatchedRoutedActivation, impl: str = "auto"
+    ) -> BatchedExpertResult:
+        if has_triton and self.merge_gate_up:
+            fused_soft_fp8 = False
+            use_fp8_w8a8 = False
+            if (
+                parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
+                == 1
+                or is_nvidia()
+                or is_muxi()
+            ):
+                fused_soft_fp8 = (
+                    parse_dtype(
+                        get_global_args().infer.raise_lower_bit_float_to
+                    ).itemsize
+                    != 1
+                )
+                gate_up_proj_weight = self.gate_up_proj_weight
+                gate_up_proj_scale = self.gate_up_proj_scale
+                down_proj_weight = self.down_proj_weight
+                down_proj_scale = self.down_proj_scale
+                use_fp8_w8a8 = True
+            else:
+                logger.warning(
+                    f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
+                )
+                block_size = 128
+                gate_up_proj_weight = soft_fp8_blockfp8_weight_dequant(
+                    self.gate_up_proj_weight,
+                    self.gate_up_proj_scale,
+                    block_size,
+                )
+                gate_up_proj_scale = None
+                down_proj_weight = soft_fp8_blockfp8_weight_dequant(
+                    self.down_proj_weight,
+                    self.down_proj_scale,
+                    block_size,
+                )
+                down_proj_scale = None
+
+            return fused_experts_no_sum_wrapper(
+                routed_x,
+                w1=gate_up_proj_weight,
+                w2=down_proj_weight,
+                use_fp8_w8a8=use_fp8_w8a8,
+                w1_scale=gate_up_proj_scale,
+                w2_scale=down_proj_scale,
+                block_shape=[128, 128],
+                soft_fp8=fused_soft_fp8,
+                global_num_experts=self.global_n_experts,
+                experts_start_idx=self.experts_start_idx,
+                impl=impl,
+            )
+
+        else:
+            return super().forward_no_sum(routed_x, impl=impl)
+
+    @override
     def forward(
         self,
         routed_x: BatchedRoutedActivation,
@@ -366,7 +428,7 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                 )
                 down_proj_scale = None
 
-            return fused_experts(
+            return fused_experts_and_sum_wrapper(
                 routed_x,
                 w1=gate_up_proj_weight,
                 w2=down_proj_weight,

@@ -47,6 +47,8 @@ def moe_sum_per_token_triton(
 
     if out is None:
         out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    assert out.shape == (M, N)
+    assert out.dtype == x.dtype
 
     assert x.is_contiguous()
     assert topk_weights.is_contiguous()
@@ -187,6 +189,8 @@ def moe_sum_expert_block_permuted_triton(
 
     if out is None:
         out = torch.empty(num_tokens, hidden_size, dtype=x.dtype, device=x.device)
+    assert out.shape == (num_tokens, hidden_size)
+    assert out.dtype == x.dtype
 
     BLOCK_D = 1024  # No longer needed (FIXME)
     num_warps = 2

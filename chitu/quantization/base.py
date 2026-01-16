@@ -6,6 +6,10 @@ import functools
 import torch
 
 from chitu.ops import silu_and_mul
+from chitu.moe.batched_expert_result import (
+    BatchedExpertResult,
+    PerTokenBatchedExpertResult,
+)
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
@@ -89,7 +93,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         """
         Compute the i-th expert's merged gate_up_proj layer only.
 
-        Override this method to support `self.forward_iterative`. You can safely ignore
+        Override this method to support `self.forward_no_sum_iterative`. You can safely ignore
         this method if you only do fused forward for all experts altogether.
         """
 
@@ -99,7 +103,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         """
         Compute the i-th expert's separated gate_proj layer only.
 
-        Override this method to support `self.forward_iterative`. You can safely ignore
+        Override this method to support `self.forward_no_sum_iterative`. You can safely ignore
         this method if you only do fused forward for all experts altogether.
         """
 
@@ -109,7 +113,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         """
         Compute the i-th expert's separated up_proj layer only.
 
-        Override this method to support `self.forward_iterative`. You can safely ignore
+        Override this method to support `self.forward_no_sum_iterative`. You can safely ignore
         this method if you only do fused forward for all experts altogether.
         """
 
@@ -121,7 +125,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         """
         Compute a single expert's activation function only if there is NO merge_gate_up.
 
-        Override this method to support `self.forward_iterative`. You can safely ignore
+        Override this method to support `self.forward_no_sum_iterative`. You can safely ignore
         this method if you only do fused forward for all experts altogether.
         """
 
@@ -131,7 +135,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         """
         Compute a single expert's activation function only if there is merge_gate_up.
 
-        Override this method to support `self.forward_iterative`. You can safely ignore
+        Override this method to support `self.forward_no_sum_iterative`. You can safely ignore
         this method if you only do fused forward for all experts altogether.
         """
 
@@ -141,16 +145,16 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         """
         Compute the i-th expert's down_proj layer only.
 
-        Override this method to support `self.forward_iterative`. You can safely ignore
+        Override this method to support `self.forward_no_sum_iterative`. You can safely ignore
         this method if you only do fused forward for all experts altogether.
         """
 
         raise NotImplementedError()
 
     @functools.singledispatchmethod
-    def forward_iterative(
-        self, routed_x: BatchedRoutedActivation, weights: torch.Tensor
-    ) -> torch.Tensor:
+    def forward_no_sum_iterative(
+        self, routed_x: BatchedRoutedActivation
+    ) -> BatchedExpertResult:
         """
         Sequantially iterate through each expert and compute the output.
 
@@ -159,13 +163,11 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         """
 
         raise NotImplementedError(
-            f"{type(routed_x)} not supported for QuantizedMoeExpertsBase.forward_iterative"
+            f"{type(routed_x)} not supported for QuantizedMoeExpertsBase.forward_no_sum_iterative"
         )
 
-    @forward_iterative.register
-    def _(
-        self, routed_x: IndexedBatchedRoutedActivation, weights: torch.Tensor
-    ) -> torch.Tensor:
+    @forward_no_sum_iterative.register
+    def _(self, routed_x: IndexedBatchedRoutedActivation) -> BatchedExpertResult:
         routed_x = routed_x.as_local_expert_ids(
             self.experts_start_idx, self.experts_end_idx
         )
@@ -221,20 +223,32 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
                 down_proj_out = self.forward_ith_expert_down(i, acti)
             down_proj_outs.append(down_proj_out)
 
-        y = torch.zeros_like(x)
+        y = torch.zeros(
+            indices.shape[0],
+            indices.shape[1],
+            x.shape[-1],
+            device=x.device,
+            dtype=x.dtype,
+        )
         for i in range(self.experts_end_idx - self.experts_start_idx):
             if i in activated_expert_ids:
                 idx, top = torch.where(indices == i)
-                y[idx] += down_proj_outs[i] * weights[idx, top, None]
+                y[idx, top] = down_proj_outs[i]
         if self.fuse_shared_experts:
-            for i in range(
-                self.experts_end_idx - self.experts_start_idx,
-                self.experts_end_idx
-                - self.experts_start_idx
-                + self.n_fused_shared_experts,
-            ):
-                y += down_proj_outs[i]
-        return y
+            for i in range(self.n_fused_shared_experts):
+                y[:, self.experts_end_idx - self.experts_start_idx + i] = (
+                    down_proj_outs[i]
+                )
+        return PerTokenBatchedExpertResult(y)
+
+    def forward_no_sum(
+        self, routed_x: BatchedRoutedActivation, impl="auto"
+    ) -> BatchedExpertResult:
+        """
+        Compute all experts but without summing across multiple experts for each token.
+        """
+
+        return self.forward_no_sum_iterative(routed_x)
 
     def forward(
         self,
@@ -242,7 +256,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         weights: torch.Tensor,
         inplace: bool = False,
         impl: str = "auto",
-    ):
+    ) -> torch.Tensor:
         """
         Forward pass for the MoE module.
 
@@ -252,10 +266,19 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
             inplace (bool): If true, `x` may be modified in-place.
 
         Returns:
-            torch.Tensor: Output tensor.
+             BatchedExpertResult: Output tensor (without local sum).
         """
 
-        return self.forward_iterative(routed_x, weights)
+        y = self.forward_no_sum_iterative(routed_x)
+        if (
+            inplace
+            and isinstance(routed_x, IndexedBatchedRoutedActivation)
+            and routed_x.activation.dtype == torch.get_default_dtype()
+        ):
+            out = routed_x.activation
+        else:
+            out = None
+        return y.weighted_sum(weights, out=out)
 
 
 class QuantizedAbsorbGemmBase(torch.nn.Module):

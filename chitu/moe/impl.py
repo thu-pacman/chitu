@@ -116,13 +116,19 @@ class MoEImplBase:
     def get_expert_mapping(self, layer_id: int):
         raise NotImplementedError()
 
-    def token_permutation(self, *args, **kwargs):
+    def enter_moe(self, *args, **kwargs):
         raise NotImplementedError()
 
-    def token_unpermutation(self, *args, **kwargs):
+    def exit_moe_prefer_before_local_sum(self) -> bool:
         raise NotImplementedError()
 
-    def unpermutation_reduce_rank_list(self):
+    def exit_moe_before_local_sum(self, *args, **kwargs):
+        raise NotImplementedError()
+
+    def exit_moe_after_local_sum(self, *args, **kwargs):
+        raise NotImplementedError()
+
+    def exit_moe_reduce_rank_list(self):
         raise NotImplementedError()
 
     def get_experts_impl(self) -> str:
@@ -166,7 +172,7 @@ class MoEImplEP(MoEImplBase):
         self.prefill_token_dispatcher_impl = prefill_token_dispatcher_impl
         self.decode_token_dispatcher_impl = decode_token_dispatcher_impl
         self.use_cuda_graph = use_cuda_graph
-        self.moe_layer_id_list = [x for x in range(self.n_dense_layers, self.n_layers)]
+        self.moe_layer_id_list = list(range(self.n_dense_layers, self.n_layers))
 
         if n_global_experts_slots is None:
             n_global_experts_slots = (
@@ -268,6 +274,7 @@ class MoEImplEP(MoEImplBase):
                 tp_group=self.tp_group,
                 dp_group=self.dp_group,
                 ep_group=self.ep_group,
+                moe_layer_id_list=self.moe_layer_id_list,
             )
             self.decode_experts_impl = "ep_group_gemm_masked"
         elif (
@@ -312,13 +319,23 @@ class MoEImplEP(MoEImplBase):
         super().prepare(task_type, num_tokens)
         self._get_current_token_dispatcher().prepare(num_tokens)
 
-    def token_permutation(self, *args, **kwargs):
-        return self._get_current_token_dispatcher().token_permutation(*args, **kwargs)
+    def enter_moe(self, *args, **kwargs):
+        return self._get_current_token_dispatcher().enter_moe(*args, **kwargs)
 
-    def token_unpermutation(self, *args, **kwargs):
-        return self._get_current_token_dispatcher().token_unpermutation(*args, **kwargs)
+    def exit_moe_prefer_before_local_sum(self) -> bool:
+        return self._get_current_token_dispatcher().exit_moe_prefer_before_local_sum()
 
-    def unpermutation_reduce_rank_list(self):
+    def exit_moe_before_local_sum(self, *args, **kwargs):
+        return self._get_current_token_dispatcher().exit_moe_before_local_sum(
+            *args, **kwargs
+        )
+
+    def exit_moe_after_local_sum(self, *args, **kwargs):
+        return self._get_current_token_dispatcher().exit_moe_after_local_sum(
+            *args, **kwargs
+        )
+
+    def exit_moe_reduce_rank_list(self):
         dispatcher = self._get_current_token_dispatcher()
         if isinstance(dispatcher, MoEAllGatherTokenDispatcher):
             return self.ep_group.rank_list
