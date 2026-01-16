@@ -6,12 +6,17 @@ from logging import getLogger
 from typing import Optional
 from typing_extensions import override
 import functools
+import os
 
 import torch
 
 from chitu.distributed.comm_group import CommGroup
 from chitu.utils import try_import_opt_dep, parse_dtype
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
+from chitu.moe.batched_expert_result import (
+    BatchedExpertResult,
+    PerExpertDenseBatchedExpertResultMinimal,
+)
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
@@ -24,7 +29,6 @@ from chitu.device_type import is_blackwell
 
 # replace the buffer setting with DeepEP to concurrently enbale ll mode and normal mode, need more test to verify.
 from chitu.moe.token_dispatchers.buffercontroller import DeepEPBuffer
-import os
 
 deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 
@@ -44,6 +48,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         tp_group: CommGroup,
         dp_group: CommGroup,
         ep_group: CommGroup,
+        moe_layer_id_list: list[int],
     ):
         super().__init__(tp_group=tp_group, dp_group=dp_group, ep_group=ep_group)
         self.num_experts = num_experts
@@ -62,26 +67,27 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         self.profile = profile
         self.prepare_profile = False
 
+        self.moe_layer_id_list = moe_layer_id_list
+
     def prepare_decode_profile(self):
         if self.prepare_profile:
             return
         self.prepare_profile = True
 
-        # TODO(zms): remove num_layers hard coding
+        # layer_id -> stat
+        self.cumulative_local_expert_recv_stats: dict[int, torch.Tensor] = {}
         if self.profile:
-            self.cumulative_local_expert_recv_stats = [
-                torch.zeros((self.num_local_experts,), dtype=torch.int, device="cuda")
-                for _ in range(get_global_args().models.n_layers)
-            ]
-        else:
-            self.cumulative_local_expert_recv_stats = [
-                None for _ in range(get_global_args().models.n_layers)
-            ]
+            self.cumulative_local_expert_recv_stats = {
+                i: torch.zeros(
+                    (self.num_local_experts,), dtype=torch.int, device="cuda"
+                )
+                for i in self.moe_layer_id_list
+            }
 
     def dump_and_reset_profile(self):
         if self.profile:
             # TODO(zms): remove moe layer range hard coding
-            for layer_id in range(3, get_global_args().models.n_layers):
+            for layer_id in self.moe_layer_id_list:
                 expert_stats = torch.zeros(
                     (self.num_experts,), dtype=torch.int, device="cuda"
                 )
@@ -90,7 +96,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                 )
                 self.cumulative_local_expert_recv_stats[layer_id].zero_()
                 if self.ep_group.rank_in_group == 0:
-                    logger.warning(f"{layer_id=} {expert_stats=}")
+                    logger.info(f"{layer_id=} {expert_stats=}")
 
     @override
     def prepare(self, num_tokens):
@@ -110,7 +116,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
 
     @override
     @functools.singledispatchmethod
-    def token_permutation(
+    def enter_moe(
         self,
         x: BatchedRoutedActivation,
         topk_weights: torch.Tensor,
@@ -120,10 +126,10 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         layer_id: Optional[int] = None,
     ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
         raise NotImplementedError(
-            f"{type(x)} not supported for MoELowLatencyTokenDispatcher.token_permutation"
+            f"{type(x)} not supported for MoELowLatencyTokenDispatcher.enter_moe"
         )
 
-    @token_permutation.register
+    @enter_moe.register
     def _(
         self,
         x: IndexedBatchedRoutedActivation,
@@ -155,9 +161,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                 return_recv_hook=True,
                 dispatch_use_fp8=dispatch_use_fp8,
                 cumulative_local_expert_recv_stats=(
-                    self.cumulative_local_expert_recv_stats[layer_id]
-                    if layer_id is not None
-                    else None
+                    self.cumulative_local_expert_recv_stats.get(layer_id, None)
                 ),
             )
         )
@@ -194,11 +198,30 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
             )
 
     @override
-    def token_unpermutation(self, expert_outputs):
+    def exit_moe_prefer_before_local_sum(self) -> bool:
+        return True
+
+    @override
+    @functools.singledispatchmethod
+    def exit_moe_before_local_sum(
+        self, expert_result: BatchedExpertResult
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            f"{type(expert_result)} not supported for MoELowLatencyTokenDispatcher.exit_moe_before_local_sum"
+        )
+
+    @exit_moe_before_local_sum.register
+    def _(
+        self, expert_result: PerExpertDenseBatchedExpertResultMinimal
+    ) -> torch.Tensor:
         handle, topk_ids, topk_weights, dp_local_bs = self.dispatcher_ctx
         # Now we disable any type of overlap.
         outputs, _, _ = self.deepep_token_combine(
-            expert_outputs, topk_ids, topk_weights, handle, dp_local_bs
+            expert_result.activation_per_expert,
+            topk_ids,
+            topk_weights,
+            handle,
+            dp_local_bs,
         )
         return outputs
 

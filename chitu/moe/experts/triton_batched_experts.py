@@ -10,6 +10,7 @@ import triton.language as tl
 
 from chitu.ops import silu_and_mul
 from chitu.moe.batched_routed_activation import PerExpertDenseBatchedRoutedActivation
+from chitu.moe.batched_expert_result import PerExpertDenseBatchedExpertResultMinimal
 
 
 # SPDX-SnippetBegin
@@ -500,7 +501,7 @@ def triton_batched_experts(
     hidden_states: PerExpertDenseBatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-) -> torch.Tensor:
+) -> PerExpertDenseBatchedExpertResultMinimal:
     """
     Simplified version of batched fused experts only support bfloat16 inputs and parameters
     """
@@ -565,14 +566,14 @@ def triton_batched_experts(
         per_act_token_quant=False,
         block_shape=None,
     )
-    return output
+    return PerExpertDenseBatchedExpertResultMinimal(output)
 
 
 def triton_batched_experts_ref(
     hidden_states: PerExpertDenseBatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-) -> torch.Tensor:
+) -> PerExpertDenseBatchedExpertResultMinimal:
     assert (
         hidden_states.activation_per_expert.dim() == 3
     ), "hidden_states.activation_per_expert is not a three-dimensional tensor"
@@ -604,4 +605,4 @@ def triton_batched_experts_ref(
         output[i][: hidden_states.n_tokens_per_expert[i]] = torch.matmul(
             intermediate_output2[i][: hidden_states.n_tokens_per_expert[i]], w2[i].T
         )
-    return output
+    return PerExpertDenseBatchedExpertResultMinimal(output)

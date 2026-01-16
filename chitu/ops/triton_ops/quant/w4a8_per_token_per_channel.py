@@ -9,7 +9,11 @@ import triton
 import triton.language as tl
 from triton import Config
 
-from chitu.ops.triton_ops.utils import auto_retry_triton_compilation, auto_tuning_logger
+from chitu.ops.triton_ops.utils import (
+    auto_retry_triton_compilation,
+    auto_tuning_logger,
+    autotune_compat,
+)
 from chitu.native_layout import Packed4BitWeightAlongK
 
 
@@ -63,7 +67,11 @@ w4a8_gemm_per_token_per_channel_asymm_configs = [
 ]
 
 
-@triton.autotune(configs=w4a8_gemm_per_token_per_channel_asymm_configs, key=["N", "K"])
+@autotune_compat(
+    configs=w4a8_gemm_per_token_per_channel_asymm_configs,
+    key=["N", "K"],
+    cache_results=True,
+)
 @triton.jit
 def w4a8_gemm_per_token_per_channel_asymm_kernel(
     a_ptr,

@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 
 from chitu.native_layout import Vector
-from chitu.ops.triton_ops.utils import auto_retry_triton_compilation
+from chitu.ops.triton_ops.utils import auto_retry_triton_compilation, autotune_compat
 from chitu.device_type import is_muxi
 
 
@@ -88,7 +88,9 @@ silu_and_mul_configs = [
 ]
 
 
-@triton.autotune(configs=silu_and_mul_configs, key=["output_n_cols"])
+@autotune_compat(
+    configs=silu_and_mul_configs, key=["output_n_cols"], cache_results=True
+)
 @triton.jit
 def silu_and_mul_kernel(
     output_ptr,

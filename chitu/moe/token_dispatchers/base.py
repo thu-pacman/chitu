@@ -12,11 +12,22 @@ from typing_extensions import override
 
 import torch
 
+from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import BatchedRoutedActivation
 from chitu.distributed.comm_group import CommGroup
 
 
 class MoETokenDispatcher(ABC):
+    """
+    Base class for MoE <--> Non-MoE communication.
+
+    Non-MoE modules may be parallelized via DP or TP, while MoE modules may be
+    parallelized via EP or ETP. This function is responsible for communicating
+    activations according to these parallelisms.
+
+    Subclasses of this class implements for different communication backends.
+    """
+
     def __init__(
         self, *, tp_group: CommGroup, dp_group: CommGroup, ep_group: CommGroup
     ):
@@ -26,10 +37,10 @@ class MoETokenDispatcher(ABC):
 
     @abstractmethod
     def prepare(self, num_tokens):
-        raise NotImplementedError("prepare function not implemented.")
+        raise NotImplementedError(f"prepare is not implemented for {type(self)}")
 
     @abstractmethod
-    def token_permutation(
+    def enter_moe(
         self,
         x: BatchedRoutedActivation,
         topk_weights: torch.Tensor,
@@ -39,7 +50,8 @@ class MoETokenDispatcher(ABC):
         layer_id: Optional[int] = None,
     ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
         """
-        Dispatches tokens to different EP ranks
+        Communicate in order to exit non-MoE modules and enter MoE modules (typically
+        in the same layer).
 
         Args:
             x: Input BatchedRoutedActivation
@@ -53,11 +65,60 @@ class MoETokenDispatcher(ABC):
             0: dispatched BatchedRoutedActivation
             1: optional dispatched topk weights
         """
-        raise NotImplementedError("Dispatch function not implemented.")
+        raise NotImplementedError(f"enter_moe is not implemented for {type(self)}")
 
     @abstractmethod
-    def token_unpermutation(self, expert_outputs: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Combine function not implemented.")
+    def exit_moe_prefer_before_local_sum(self) -> bool:
+        """
+        Whether it's perferred to use `exit_moe_before_local_sum` or `exit_moe_after_local_sum`.
+
+        If this function returns True, `exit_moe_before_local_sum` must be implemented,
+        and is preferred over `exit_moe_after_local_sum`, while `exit_moe_after_local_sum`
+        may or may not be implemented.
+
+        If this function returns False, `exit_moe_after_local_sum` must be implemented,
+        and is preferred over `exit_moe_before_local_sum`, while `exit_moe_before_local_sum`
+        may or may not be implemented.
+        """
+
+        raise NotImplementedError(
+            f"exit_moe_prefer_before_local_sum is not implemented for {type(self)}"
+        )
+
+    # No @abstractmethod: Either `exit_moe_before_local_sum` or `exit_moe_after_local_sum` can
+    # be left unimplemented.
+    def exit_moe_before_local_sum(
+        self, expert_result: BatchedExpertResult
+    ) -> torch.Tensor:
+        """
+        Communicate in order to exit non-MoE modules (typically in layer i)
+        and enter MoE modules (typically in layer i+1).
+
+        This function does all of the MoE summation inside the communication. E.g.,
+        if a token selects 4 experts distributed in 2 EP ranks, this function will
+        sum the 4 partial results together. Callers should NOT sum locally.
+        """
+
+        raise NotImplementedError(
+            f"exit_moe_before_local_sum is not implemented for {type(self)}"
+        )
+
+    # No @abstractmethod: Either `exit_moe_before_local_sum` or `exit_moe_after_local_sum` can
+    # be left unimplemented.
+    def exit_moe_after_local_sum(self, local_sum_result: torch.Tensor) -> torch.Tensor:
+        """
+        Communicate in order to exit non-MoE modules (typically in layer i)
+        and enter MoE modules (typically in layer i+1).
+
+        This function only does remote summation instead of local summation. E.g.,
+        if a token selects 4 experts distributed in 2 EP ranks, callers is responsible
+        for summing 4 partial results to 2 before calling this function, and then
+        this function will sum the 2 new partial results together as the final result.
+        """
+
+        raise NotImplementedError(
+            f"exit_moe_after_local_sum is not implemented for {type(self)}"
+        )
 
 
 class MoEEmptyTokenDispatcher(MoETokenDispatcher):
@@ -71,7 +132,7 @@ class MoEEmptyTokenDispatcher(MoETokenDispatcher):
         pass
 
     @override
-    def token_permutation(
+    def enter_moe(
         self,
         x: BatchedRoutedActivation,
         topk_weights: torch.Tensor,
@@ -83,5 +144,9 @@ class MoEEmptyTokenDispatcher(MoETokenDispatcher):
         return x, topk_weights
 
     @override
-    def token_unpermutation(self, expert_outputs: torch.Tensor) -> torch.Tensor:
-        return expert_outputs
+    def exit_moe_prefer_before_local_sum(self) -> bool:
+        return False
+
+    @override
+    def exit_moe_after_local_sum(self, local_sum_result: torch.Tensor) -> torch.Tensor:
+        return local_sum_result

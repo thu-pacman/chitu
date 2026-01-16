@@ -9,6 +9,8 @@ from logging import getLogger
 
 import torch
 import triton.language as tl
+import triton
+import inspect
 
 logger = getLogger(__name__)
 
@@ -22,6 +24,9 @@ SIGNED_INT32_0x87F00000 = tl.constexpr(0x87F00000 - 0x100000000)
 SIGNED_INT16_0x81C0 = tl.constexpr(0x81C0 - 0x10000)
 SIGNED_INT16_0x87F0 = tl.constexpr(0x87F0 - 0x10000)
 SIGNED_INT8_0x9C = tl.constexpr(0x9C - 0x100)
+
+_autotune_sig = inspect.signature(triton.autotune)
+_support_cache_results = "cache_results" in _autotune_sig.parameters
 
 
 def to_triton_dtype(dtype: torch.dtype):
@@ -83,3 +88,18 @@ def auto_tuning_logger(args, *, name: str, **kwargs):
         f"Tuning {name}. Trying: "
         + ", ".join([f"{key}={kwargs[key]}" for key in kwargs])
     )
+
+
+def autotune_compat(*, configs, key, cache_results=False):
+    if _support_cache_results:
+        return triton.autotune(
+            configs=configs,
+            key=key,
+            cache_results=cache_results,
+        )
+    else:
+        # Make triton autotune compatible with the muxi platform.
+        return triton.autotune(
+            configs=configs,
+            key=key,
+        )

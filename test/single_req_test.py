@@ -40,6 +40,37 @@ msgs_vl = [
         }
     ]
 ]
+
+USE_TOOLS = False
+msg_tools = [
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": f"hows the weather in {loc}? use the tool to get it",
+            }
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather information",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                    },
+                },
+            }
+        ],
+        "tool_choice": "required",
+        "max_tokens": 1024,
+    }
+    for loc in ["beijing", "shanghai", "guangzhou", "shenzhen"]
+]
+
+
 counter = 1
 
 
@@ -78,7 +109,17 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens, frequency_penalty):
 def gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
     reqs: list[UserRequest] = []
     for i in range(num_reqs):
-        if is_vl:
+        if USE_TOOLS:
+            msg_tool = msg_tools[i % len(msg_tools)]
+            req = UserRequest(
+                msg_tool["messages"],
+                f"{gen_req_id()}",
+                max_new_tokens=max_new_tokens,
+                frequency_penalty=frequency_penalty,
+                temperature=1,
+                tools=msg_tool["tools"],
+            )
+        elif is_vl:
             req = UserRequest(
                 msgs_vl[i % len(msgs_vl)],
                 f"{gen_req_id()}",

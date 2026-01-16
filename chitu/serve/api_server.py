@@ -28,6 +28,8 @@ from chitu.task import Task, TaskLoad, TaskPool, UserRequest
 from chitu.utils import gen_req_id
 from chitu.serve.event_loop import start_server_in_new_event_loop
 from chitu.serve.common import set_min_batch_size
+from chitu.tool_call.types import ToolChoice
+from chitu.serve.anthropic_api import create_router as create_anthropic_router
 
 logger = getLogger(__name__)
 
@@ -42,19 +44,18 @@ dp_service_started = False
 app = FastAPI()  # Unified API
 
 
-class HttpHeader(BaseModel):
-    # Format: "Bearer <api_key>". If `<api_key>` is in `serve.api_keys`, the request will be prioritized
-    Authorization: Optional[str] = None
-
-
 class Message(BaseModel):
     role: str = "user"
     content: str | list[str | dict] = "hello, who are you"
+    tool_call_id: str | None = None  # useless, at least for qwen3
 
 
 class ChatRequest(BaseModel):
     conversation_id: str = Field(default_factory=gen_req_id)
     messages: list[Message]
+    tools: list[dict] = []
+    tool_choice: ToolChoice = "auto"
+    parallel_tool_calls: bool = True
     logprobs: bool = False
     top_logprobs: Optional[int] = None
     max_tokens: Optional[int] = None
@@ -68,6 +69,14 @@ class ChatRequest(BaseModel):
     chat_template_kwargs: Mapping[str, Any] = {}
 
 
+class TokenizeRequest(BaseModel):
+    prompt: str
+
+
+class DetokenizeRequest(BaseModel):
+    tokens: list[int]
+
+
 def get_priority_from_api_key(api_key: str) -> int:
     args = get_global_args()
     for item in args.serve.api_keys:
@@ -76,12 +85,37 @@ def get_priority_from_api_key(api_key: str) -> int:
     return 1
 
 
+# Include Anthropic-compatible API routes (keep api_server.py thin)
+app.include_router(
+    create_anthropic_router(
+        get_server_status=lambda: server_status,
+        get_dp_service_started=lambda: dp_service_started,
+        priority_for_api_key=get_priority_from_api_key,
+    )
+)
+
 # ====== Standard HTTP Endpoints ======
+
+
+@app.get("/v1/models")
+async def list_models():
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": get_global_args().models.name,
+                "object": "model",
+                "created": 0,
+                "owned_by": "organization-owner",
+            }
+        ],
+    }
 
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(
-    raw_request: Request, http_header: Annotated[HttpHeader, Header()]
+    raw_request: Request,
+    authorization: Annotated[Optional[str], Header(alias="Authorization")] = None,
 ):
     global server_status
 
@@ -107,19 +141,16 @@ async def create_chat_completion(
     # Check if DP mode is enabled and use appropriate processing
     if get_global_args().dp_config.enabled:
         logger.debug(f"[HTTP] Using DP mode for request: {request.conversation_id}")
-        return await process_dp_chat_completion(request, http_header)
+        return await process_dp_chat_completion(request)
 
-    headers = http_header.dict()
-    authorization_body = headers.pop("Authorization")
-    if authorization_body is not None:
-        if not authorization_body.startswith("Bearer "):
+    api_key = ""
+    if authorization is not None:
+        if not authorization.startswith("Bearer "):
             raise HTTPException(
                 status_code=400,
                 detail="Authorization header must start with 'Bearer'",
             )
-        api_key = authorization_body[len("Bearer ") :]
-    else:
-        api_key = ""
+        api_key = authorization[len("Bearer ") :]
 
     params = request.dict()
     req_id = gen_req_id()
@@ -168,6 +199,9 @@ async def create_chat_completion(
             top_k=top_k,
             frequency_penalty=freq_pen,
             chat_template_kwargs=chat_template_kwargs,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            parallel_tool_calls=request.parallel_tool_calls,
         )
         response = AsyncResponse(req)
         task = Task(
@@ -251,12 +285,50 @@ async def health():
     pass  # TODO Check the inference service
 
 
+@app.post("/tokenize")
+async def tokenize(raw_request: Request):
+    try:
+        data = await raw_request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400, detail="Invalid JSON body. Expecting JSON payload."
+        )
+
+    try:
+        request = TokenizeRequest.model_validate(data)
+    except ValidationError as e:
+        # Keep consistency with FastAPI default behavior for body validation errors
+        raise HTTPException(status_code=422, detail=e.errors())
+
+    tokens = Backend.tokenizer.model.encode(request.prompt, add_special_tokens=False)
+
+    return {"tokens": tokens}
+
+
+@app.post("/detokenize")
+async def detokenize(raw_request: Request):
+    try:
+        data = await raw_request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400, detail="Invalid JSON body. Expecting JSON payload."
+        )
+
+    try:
+        request = DetokenizeRequest.model_validate(data)
+    except ValidationError as e:
+        # Keep consistency with FastAPI default behavior for body validation errors
+        raise HTTPException(status_code=422, detail=e.errors())
+
+    prompt = Backend.tokenizer.model.decode(request.tokens, skip_special_tokens=True)
+
+    return {"prompt": prompt}
+
+
 # ====== DP Processing Functions ======
 
 
-async def process_dp_chat_completion(
-    request: ChatRequest, http_header: Annotated[HttpHeader, Header()]
-):
+async def process_dp_chat_completion(request: ChatRequest):
     """Process chat completion request using DP mode"""
     global dp_service_started
 

@@ -6,6 +6,7 @@ import torch
 from logging import getLogger
 from typing import Optional
 
+from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
@@ -41,12 +42,10 @@ from chitu.distributed.parallel_state import get_ep_size, get_tp_group
 logger = getLogger(__name__)
 
 
-def fused_experts_wrapper(
+def fused_experts_no_sum_wrapper(
     hidden_states: BatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     *,
     use_fp8_w8a8: bool = False,
@@ -68,15 +67,10 @@ def fused_experts_wrapper(
     experts_start_idx: int = 0,
     layer_id: int = 0,
     impl: str = "auto",
-) -> torch.Tensor:
-    """
-    impl: auto, triton, torch_npu, muxi?
-    """
+) -> BatchedExpertResult:
     if impl == "auto":
         if has_triton:
             impl = "triton"
-        elif has_torch_npu:
-            impl = "torch_npu"
         else:
             raise NotImplementedError
     if impl == "group_gemm_contiguous":
@@ -85,8 +79,6 @@ def fused_experts_wrapper(
                 hidden_states,
                 w1=w1,
                 w2=w2,
-                topk_weights=topk_weights,
-                inplace=inplace,
                 activation=activation,
                 use_fp8_w8a8=use_fp8_w8a8,
                 use_fp4_w4a8=use_fp4_w4a8,
@@ -111,8 +103,6 @@ def fused_experts_wrapper(
                 hidden_states,
                 w1=w1,
                 w2=w2,
-                topk_weights=topk_weights,
-                inplace=inplace,
                 activation=activation,
                 use_fp8_w8a8=use_fp8_w8a8,
                 use_fp4_w4a8=use_fp4_w4a8,
@@ -136,8 +126,6 @@ def fused_experts_wrapper(
             hidden_states,
             w1=w1,
             w2=w2,
-            topk_weights=topk_weights,
-            inplace=inplace,
             activation=activation,
             use_fp8_w8a8=use_fp8_w8a8,
             use_fp4_w4a8=use_fp4_w4a8,
@@ -162,8 +150,6 @@ def fused_experts_wrapper(
             hidden_states,
             w1=w1,
             w2=w2,
-            topk_weights=topk_weights,
-            inplace=inplace,
             activation=activation,
             use_fp8_w8a8=use_fp8_w8a8,
             use_fp4_w4a8=use_fp4_w4a8,
@@ -189,8 +175,6 @@ def fused_experts_wrapper(
                 hidden_states,
                 w1=w1,
                 w2=w2,
-                topk_weights=topk_weights,
-                inplace=inplace,
                 activation=activation,
                 use_fp8_w8a8=use_fp8_w8a8,
                 use_fp4_w4a8=use_fp4_w4a8,
@@ -238,8 +222,6 @@ def fused_experts_wrapper(
                 hidden_states,
                 w1=w1,
                 w2=w2,
-                topk_weights=topk_weights,
-                inplace=inplace,
                 activation=activation,
                 use_fp8_w8a8=use_fp8_w8a8,
                 use_fp4_w4a8=use_fp4_w4a8,
@@ -264,8 +246,6 @@ def fused_experts_wrapper(
                 hidden_states,
                 w1=w1,
                 w2=w2,
-                topk_weights=topk_weights,
-                inplace=inplace,
                 activation=activation,
                 use_fp8_w8a8=use_fp8_w8a8,
                 use_fp4_w4a8=use_fp4_w4a8,
@@ -286,7 +266,53 @@ def fused_experts_wrapper(
             )
         else:
             raise NotImplementedError
-    elif impl == "fused_experts_with_communication":
+    else:
+        raise NotImplementedError
+
+
+def fused_experts_and_sum_wrapper(
+    hidden_states: BatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    inplace: bool = False,
+    activation: str = "silu",
+    *,
+    use_fp8_w8a8: bool = False,
+    use_fp4_w4a8: bool = False,
+    use_mxfp4_w4a8: bool = False,
+    use_int8_w8a8: bool = False,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    global_num_experts: int,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_scale_2: Optional[torch.Tensor] = None,
+    w2_scale_2: Optional[torch.Tensor] = None,
+    w1_zp: Optional[torch.Tensor] = None,
+    w2_zp: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    experts_start_idx: int = 0,
+    layer_id: int = 0,
+    impl: str = "auto",
+) -> torch.Tensor:
+    if impl == "auto":
+        if has_triton:
+            impl = "triton"
+        elif has_torch_npu:
+            impl = "torch_npu"
+        elif has_flashinfer:
+            impl = "flashinfer"
+        elif has_hygon_w4a8:
+            impl = "hygon"
+        elif has_metax_soft_fp4:
+            impl = "metax"
+        else:
+            raise NotImplementedError
+    if impl == "fused_experts_with_communication":
         assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
         return fused_experts_npu_with_communication(
             hidden_states=hidden_states.activation,
@@ -327,4 +353,38 @@ def fused_experts_wrapper(
             use_int8_w8a8=use_int8_w8a8,
         )
     else:
-        raise NotImplementedError
+        y = fused_experts_no_sum_wrapper(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            activation=activation,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_fp4_w4a8=use_fp4_w4a8,
+            use_mxfp4_w4a8=use_mxfp4_w4a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            global_num_experts=global_num_experts,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_scale_2=w1_scale_2,
+            w2_scale_2=w2_scale_2,
+            w1_zp=w1_zp,
+            w2_zp=w2_zp,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            block_shape=block_shape,
+            soft_fp8=soft_fp8,
+            experts_start_idx=experts_start_idx,
+            layer_id=layer_id,
+            impl=impl,
+        )
+        if (
+            inplace
+            and isinstance(hidden_states, IndexedBatchedRoutedActivation)
+            and hidden_states.activation.dtype == torch.get_default_dtype()
+        ):
+            out = hidden_states.activation
+        else:
+            out = None
+        return y.weighted_sum(topk_weights, out=out)

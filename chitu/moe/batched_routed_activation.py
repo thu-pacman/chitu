@@ -261,6 +261,7 @@ class ExpertBlockIndexedBatchedRoutedActivation(BatchedRoutedActivation):
     block_to_token_x_topk_indices: torch.Tensor  # [max_n_blocks, block_size]
     block_to_expert_indices: torch.Tensor  # [max_n_blocks]
     n_blocks_scalar_tensor: torch.Tensor  # Scalar
+    topk: int
 
     @classmethod
     @override
@@ -275,6 +276,7 @@ class ExpertBlockIndexedBatchedRoutedActivation(BatchedRoutedActivation):
                 block_size,
                 n_experts,
             ),
+            topk=old.token_to_expert_indices.shape[-1],
             expert_ids_are_local=old.expert_ids_are_local,
         )
 

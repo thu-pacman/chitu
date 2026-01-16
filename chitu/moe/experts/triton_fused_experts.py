@@ -17,7 +17,10 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivation,
     ExpertBlockIndexedBatchedRoutedActivation,
 )
-from chitu.moe.batched_expert_result import PerTokenBatchedExpertResult
+from chitu.moe.batched_expert_result import (
+    BatchedExpertResult,
+    PerTokenBatchedExpertResult,
+)
 from chitu.ops.activation import silu_and_mul
 from chitu.ops.quant import blockfp8_act_quant
 
@@ -28,7 +31,7 @@ if torch.cuda.is_available():
         SIGNED_INT16_0x87F0,
         SIGNED_INT8_0x9C,
     )
-    from chitu.ops.triton_ops.utils import to_triton_dtype
+    from chitu.ops.triton_ops.utils import to_triton_dtype, autotune_compat
 from chitu.lazy import single_dispatch_lazy_tensor
 
 logger = getLogger(__name__)
@@ -697,7 +700,6 @@ def get_default_config(
     E: int,
     N: int,
     K: int,
-    topk: int,
     dtype: Optional[str],
     is_marlin: bool,
     block_shape: Optional[list[int]] = None,
@@ -734,7 +736,6 @@ def get_default_config(
 def try_get_optimal_moe_config(
     w1_shape: tuple[int, ...],
     w2_shape: tuple[int, ...],
-    top_k: int,
     dtype: Optional[str],
     M: int,
     is_marlin: bool = False,
@@ -743,9 +744,7 @@ def try_get_optimal_moe_config(
     # First try to load optimal config from the file
     E, _, N = w2_shape
 
-    config = get_default_config(
-        M, E, N, w1_shape[2], top_k, dtype, is_marlin, block_shape
-    )
+    config = get_default_config(M, E, N, w1_shape[2], dtype, is_marlin, block_shape)
     return config
 
 
@@ -775,9 +774,7 @@ def fused_experts(
     hidden_states: BatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
     *,
-    inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_fp4_w4a8: bool = False,
@@ -795,7 +792,7 @@ def fused_experts(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
-) -> torch.Tensor:
+) -> BatchedExpertResult:
     n_local_experts = w1.shape[0]
     return fused_experts_impl(
         hidden_states.as_local_expert_ids(
@@ -803,8 +800,6 @@ def fused_experts(
         ),
         w1,
         w2,
-        topk_weights,
-        inplace,
         activation,
         use_fp8_w8a8,
         use_fp4_w4a8,
@@ -828,8 +823,6 @@ def fused_experts_impl(
     hidden_states: BatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_fp4_w4a8: bool = False,
@@ -845,7 +838,7 @@ def fused_experts_impl(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
-):
+) -> BatchedExpertResult:
     raise ValueError(f"Unsupported hidden_states type: {type(hidden_states)}")
 
 
@@ -854,8 +847,6 @@ def _(
     hidden_states: IndexedBatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_fp4_w4a8: bool = False,
@@ -871,14 +862,9 @@ def _(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
-):
-    assert (
-        topk_weights.shape == hidden_states.token_to_expert_indices.shape
-    ), "topk shape mismatch"
-
+) -> BatchedExpertResult:
     M, _ = hidden_states.activation.shape
     E, N, _ = w1.shape
-    top_k_num = topk_weights.shape[1]
     config_dtype = get_config_dtype_str(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
@@ -887,12 +873,7 @@ def _(
         dtype=hidden_states.activation.dtype,
     )
     config = try_get_optimal_moe_config(
-        w1.shape,
-        w2.shape,
-        top_k_num,
-        config_dtype,
-        M,
-        block_shape=block_shape,
+        w1.shape, w2.shape, config_dtype, M, block_shape=block_shape
     )
 
     return fused_experts_impl(
@@ -901,8 +882,6 @@ def _(
         ),
         w1=w1,
         w2=w2,
-        topk_weights=topk_weights,
-        inplace=inplace,
         activation=activation,
         use_fp8_w8a8=use_fp8_w8a8,
         use_fp4_w4a8=use_fp4_w4a8,
@@ -926,8 +905,6 @@ def _(
     hidden_states: ExpertBlockIndexedBatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_fp4_w4a8: bool = False,
@@ -943,7 +920,7 @@ def _(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
-):
+) -> PerTokenBatchedExpertResult:
     # Check constraints.
     if use_int4_w4a16:
         assert (
@@ -967,13 +944,13 @@ def _(
 
     M, _ = hidden_states.activation.shape
     E, N, _ = w1.shape
-    top_k_num = topk_weights.shape[1]
 
     if M > 32768:
         logger.warning(
             f"fused_experts_impl is not intended for a batch containing more than 32768 "
             f"tokens (batch_size * seq_len), but got {M} tokens. Please set "
-            f"infer.prefill_chunk_size to reduce the token number during prefilling."
+            f"`infer.prefill_chunk_size` or `infer.moe.prefill_memory_tolerance` to "
+            f"reduce the token number during prefilling."
         )
 
     config_dtype = get_config_dtype_str(
@@ -984,34 +961,24 @@ def _(
         dtype=hidden_states.activation.dtype,
     )
     config = try_get_optimal_moe_config(
-        w1.shape,
-        w2.shape,
-        top_k_num,
-        config_dtype,
-        M,
-        block_shape=block_shape,
+        w1.shape, w2.shape, config_dtype, M, block_shape=block_shape
     )
     assert (
         hidden_states.block_to_token_x_topk_indices.shape[-1] == config["BLOCK_SIZE_M"]
     )
 
     intermediate_cache1 = torch.zeros(
-        (M, top_k_num, N),
+        (M, hidden_states.topk, N),
         device=hidden_states.activation.device,
         dtype=hidden_states.activation.dtype,
     )
     intermediate_cache3 = torch.zeros(
-        (M, top_k_num, w2.shape[1]),
+        (M, hidden_states.topk, w2.shape[1]),
         device=hidden_states.activation.device,
         dtype=hidden_states.activation.dtype,
     )
 
     compute_type = to_triton_dtype(hidden_states.activation.dtype)
-
-    if inplace:
-        out_hidden_states = hidden_states.activation
-    else:
-        out_hidden_states = torch.empty_like(hidden_states.activation)
 
     if (use_fp8_w8a8 or use_fp4_w4a8) and not soft_fp8:
         block_n, block_k = block_shape
@@ -1031,8 +998,8 @@ def _(
         hidden_states.block_to_token_x_topk_indices.flatten(),
         hidden_states.block_to_expert_indices,
         hidden_states.n_blocks_scalar_tensor,
-        topk_weights.numel(),
-        top_k_num,
+        hidden_states.activation.shape[0] * hidden_states.topk,
+        hidden_states.topk,
         config,
         compute_type=compute_type,
         use_fp8_w8a8=use_fp8_w8a8,
@@ -1063,7 +1030,7 @@ def _(
         hidden_states.block_to_token_x_topk_indices.flatten(),
         hidden_states.block_to_expert_indices,
         hidden_states.n_blocks_scalar_tensor,
-        topk_weights.numel(),
+        hidden_states.activation.shape[0] * hidden_states.topk,
         1,
         config,
         compute_type=compute_type,
@@ -1077,7 +1044,7 @@ def _(
 
     return PerTokenBatchedExpertResult(
         intermediate_cache3.view(*intermediate_cache3.shape)
-    ).weighted_sum(topk_weights, out=out_hidden_states)
+    )
 
 
 # SPDX-SnippetEnd

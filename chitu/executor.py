@@ -869,6 +869,7 @@ class Executor:
         ):
             return payload_type
         if payload_type == SerializedPackedTasksPayloadType.EndTask:
+            Backend.constraint_decode_manager.end_tasks(tasks.req_ids)
             # Delete item from KV cache
             for rid in tasks.req_ids:
                 Backend.cache_manager.finalize_cache_all_decode(rid)
@@ -1345,6 +1346,8 @@ class Executor:
             len(tasks.output_tasks) == logits.shape[0]
         ), f"logits has shape {logits.shape}, but there are {len(tasks.output_tasks)} output_tasks"
         # logits is now [num_tasks, vocab_size]
+
+        Backend.constraint_decode_manager.apply_grammars(logits, tasks.output_tasks)
 
         if tasks.is_all_greedy:
             tokens = torch.argmax(logits, dim=-1)

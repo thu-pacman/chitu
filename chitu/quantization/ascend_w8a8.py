@@ -15,12 +15,14 @@ from chitu.native_layout import (
     Repeat1ToLength,
     SqueezeLastSingleton,
 )
+from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import BatchedRoutedActivation
+from chitu.moe.experts import (
+    fused_experts_no_sum_wrapper,
+    fused_experts_and_sum_wrapper,
+)
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-if has_torch_npu:
-    from chitu.npu_utils import fused_experts_npu
-    from chitu.moe.experts import fused_experts
 
 
 @QuantizationRegistry.register_linear("ascend_w8a8")
@@ -307,6 +309,27 @@ class AscendW8A8DynamicMoeExperts(
         )
 
     @override
+    def forward_no_sum(
+        self, routed_x: BatchedRoutedActivation, impl: str = "npu"
+    ) -> BatchedExpertResult:
+        if self.merge_gate_up:
+            return fused_experts_no_sum_wrapper(
+                routed_x,
+                w1=self.gate_up_proj_weight,
+                w1_scale=self.gate_up_proj_weight_scale,  # fp32
+                w2=self.down_proj_weight,
+                w2_scale=self.down_proj_weight_scale,  # bf16
+                use_int8_w8a8=True,
+                impl=impl,
+                layer_id=self.layer_id,
+                global_num_experts=self.global_n_experts,
+                experts_start_idx=self.experts_start_idx,
+            )
+
+        else:
+            return super().forward_no_sum(routed_x, impl=impl)
+
+    @override
     def forward(
         self,
         routed_x: BatchedRoutedActivation,
@@ -315,7 +338,7 @@ class AscendW8A8DynamicMoeExperts(
         impl: str = "npu",
     ) -> torch.Tensor:
         if self.merge_gate_up:
-            return fused_experts(
+            return fused_experts_and_sum_wrapper(
                 routed_x,
                 w1=self.gate_up_proj_weight,
                 w1_scale=self.gate_up_proj_weight_scale,  # fp32

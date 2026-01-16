@@ -6,7 +6,7 @@ import torch
 from typing import Optional
 import triton
 import triton.language as tl
-from chitu.ops.triton_ops.utils import to_triton_dtype
+from chitu.ops.triton_ops.utils import to_triton_dtype, autotune_compat
 import os
 from chitu.device_type import is_muxi
 
@@ -91,7 +91,7 @@ if os.environ.get("CI_TESTS", "false") == "true":
     ]
 
 
-@triton.autotune(
+@autotune_compat(
     configs=rms_norm_configs,
     key=[
         "Y_row_stride",

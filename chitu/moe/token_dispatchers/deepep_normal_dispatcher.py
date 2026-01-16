@@ -72,7 +72,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
 
     @override
     @functools.singledispatchmethod
-    def token_permutation(
+    def enter_moe(
         self,
         x: BatchedRoutedActivation,
         topk_weights: torch.Tensor,
@@ -82,10 +82,10 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         layer_id: Optional[int] = None,
     ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
         raise NotImplementedError(
-            f"{type(x)} not supported for MoENormalTokenDispatcher.token_permutation"
+            f"{type(x)} not supported for MoENormalTokenDispatcher.enter_moe"
         )
 
-    @token_permutation.register
+    @enter_moe.register
     def _(
         self,
         x: IndexedBatchedRoutedActivation,
@@ -112,7 +112,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             from chitu.ops.quant.blockfp8 import blockfp8_act_quant
 
             hidden_states_fp8, scale = blockfp8_act_quant(x.activation, block_size=128)
-            return self.token_permutation(
+            return self.enter_moe(
                 IndexedBatchedRoutedActivationBlockfp8(
                     activation=hidden_states_fp8,
                     token_to_expert_indices=x.token_to_expert_indices,
@@ -155,7 +155,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             recv_topk_weights,
         )
 
-    @token_permutation.register
+    @enter_moe.register
     def _(
         self,
         x: IndexedBatchedRoutedActivationBlockfp8,
@@ -200,17 +200,18 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         )
 
     @override
-    def token_unpermutation(
-        self, expert_outputs, previous_event: Optional["deep_ep.EventOverlap"] = None
+    def exit_moe_prefer_before_local_sum(self) -> bool:
+        return False
+
+    @override
+    def exit_moe_after_local_sum(
+        self, local_sum_result, previous_event: Optional["deep_ep.EventOverlap"] = None
     ):
         handle, topk_ids, topk_weights, dp_local_bs = self.dispatch_ctx
         combined_x, event = self.combine_forward(
-            expert_outputs,
-            topk_weights,
-            handle,
-            dp_local_bs,
-            previous_event=previous_event,
+            local_sum_result, topk_weights, handle, dp_local_bs
         )
+        # TODO: may set `previous_event`,
         return combined_x
 
     # SPDX-SnippetBegin

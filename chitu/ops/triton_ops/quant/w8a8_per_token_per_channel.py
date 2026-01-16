@@ -9,7 +9,11 @@ import triton
 import triton.language as tl
 from triton import Config
 
-from chitu.ops.triton_ops.utils import auto_retry_triton_compilation, auto_tuning_logger
+from chitu.ops.triton_ops.utils import (
+    auto_retry_triton_compilation,
+    auto_tuning_logger,
+    autotune_compat,
+)
 
 
 @auto_retry_triton_compilation
@@ -66,7 +70,9 @@ w8a8_gemm_per_token_per_channel_configs = [
 ]
 
 
-@triton.autotune(configs=w8a8_gemm_per_token_per_channel_configs, key=["N", "K"])
+@autotune_compat(
+    configs=w8a8_gemm_per_token_per_channel_configs, key=["N", "K"], cache_results=True
+)
 @triton.jit
 def w8a8_gemm_per_token_per_channel_kernel(
     a_ptr,

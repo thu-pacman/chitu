@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from chitu.device_type import is_muxi
+from chitu.ops.triton_ops.utils import autotune_compat
 
 # SPDX-SnippetBegin
 # SPDX-License-Identifier: Apache-2.0
@@ -258,7 +259,9 @@ if os.environ.get("CI_TESTS", "false") == "true":
     ]
 
 
-@triton.autotune(configs=_fwd_grouped_kernel_stage1_configs, key=["batch"])
+@autotune_compat(
+    configs=_fwd_grouped_kernel_stage1_configs, key=["batch"], cache_results=True
+)
 @triton.jit
 def _fwd_grouped_kernel_stage1(
     Q,
@@ -695,8 +698,10 @@ triton_skew_decode_configs = [
 ]
 
 
-@triton.autotune(
-    configs=triton_skew_decode_configs, key=["batch_size", "num_heads_q", "head_dim"]
+@autotune_compat(
+    configs=triton_skew_decode_configs,
+    key=["batch_size", "num_heads_q", "head_dim"],
+    cache_results=True,
 )
 @triton.jit
 def triton_skew_decode_kernel(

@@ -32,17 +32,19 @@ from chitu.native_layout import (
     ACL_FORMAT_FRACTAL_NZ,
 )
 from chitu.custom_gguf import GGMLQuantizationType, get_ggml_quant_type
+from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
 )
+from chitu.moe.experts import (
+    fused_experts_no_sum_wrapper,
+    fused_experts_and_sum_wrapper,
+)
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
-if has_triton or has_torch_npu:
-    from chitu.moe.experts import fused_experts
 
 
 @QuantizationRegistry.register_linear(None)
@@ -179,6 +181,23 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
         )
 
     @override
+    def forward_no_sum(
+        self, routed_x: BatchedRoutedActivation, impl="auto"
+    ) -> BatchedExpertResult:
+        if self.merge_gate_up and (has_triton or has_torch_npu):
+            return fused_experts_no_sum_wrapper(
+                routed_x,
+                w1=self.gate_up_proj_weight,
+                w2=self.down_proj_weight,
+                global_num_experts=self.global_n_experts,
+                experts_start_idx=self.experts_start_idx,
+                impl=impl,
+                layer_id=self.layer_id,
+            )
+        else:
+            return super().forward_no_sum(routed_x, impl=impl)
+
+    @override
     def forward(
         self,
         routed_x: BatchedRoutedActivation,
@@ -187,38 +206,7 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
         impl: str = "auto",
     ) -> torch.Tensor:
         if self.merge_gate_up and (has_triton or has_torch_npu):
-            if self.fuse_shared_experts:
-                if isinstance(routed_x, IndexedBatchedRoutedActivation):
-                    x, indices = routed_x.activation, routed_x.token_to_expert_indices
-                    indice_shape = indices.shape
-                    final_indices = torch.empty(
-                        (indice_shape[0], indice_shape[1] + 1),
-                        dtype=indices.dtype,
-                        device=indices.device,
-                    )
-
-                    final_weights = torch.empty(
-                        (weights.shape[0], weights.shape[1] + 1),
-                        dtype=weights.dtype,
-                        device=weights.device,
-                    )
-
-                    chitu_backend.cuda_add_shared_experts(
-                        final_weights,
-                        final_indices,
-                        weights,
-                        indices,
-                        self.n_routed_experts,
-                        self.n_shared_experts,
-                    )
-                    weights, indices = final_weights, final_indices
-                    routed_x = IndexedBatchedRoutedActivation(
-                        x, indices, expert_ids_are_local=routed_x.expert_ids_are_local
-                    )
-                else:
-                    raise NotImplementedError()
-
-            return fused_experts(
+            return fused_experts_and_sum_wrapper(
                 routed_x,
                 w1=self.gate_up_proj_weight,
                 w2=self.down_proj_weight,

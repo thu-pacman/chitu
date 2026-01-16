@@ -25,7 +25,10 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivation,
     ConcatPermutedBatchedRoutedActivation,
 )
-from chitu.moe.batched_expert_result import ConcatPermutedBatchedExpertResult
+from chitu.moe.batched_expert_result import (
+    BatchedExpertResult,
+    ConcatPermutedBatchedExpertResult,
+)
 from chitu.moe.load_balancer import get_moe_load_planner
 
 
@@ -537,11 +540,10 @@ def fused_experts_npu(
         hidden_states,
         w1=w1,
         w2=w2,
-        topk_weights=topk_weights,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         use_int8_w8a8=use_int8_w8a8,
-    )
+    ).weighted_sum(topk_weights)
 
 
 @functools.singledispatch
@@ -549,11 +551,10 @@ def fused_experts_npu_impl(
     hidden_states: BatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
     w1_scale=None,
     w2_scale=None,
     use_int8_w8a8=False,
-):
+) -> BatchedExpertResult:
     raise ValueError(f"Unsupported hidden_states type: {type(hidden_states)}")
 
 
@@ -562,22 +563,16 @@ def _(
     hidden_states: IndexedBatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
     w1_scale=None,
     w2_scale=None,
     use_int8_w8a8=False,
-):
-    assert (
-        topk_weights.shape == hidden_states.token_to_expert_indices.shape
-    ), "topk shape mismatch"
-
+) -> BatchedExpertResult:
     return fused_experts_npu_impl(
         ConcatPermutedBatchedRoutedActivation.convert_from(
             hidden_states, n_experts=w1.shape[0]
         ),
         w1=w1,
         w2=w2,
-        topk_weights=topk_weights,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         use_int8_w8a8=use_int8_w8a8,
@@ -589,11 +584,10 @@ def _(
     hidden_states: ConcatPermutedBatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
     w1_scale=None,
     w2_scale=None,
     use_int8_w8a8=False,
-):
+) -> ConcatPermutedBatchedExpertResult:
     # Check constraints.
     if not get_global_args().infer.npu_fusion_fp4 and not use_int8_w8a8:
         assert (
@@ -613,11 +607,14 @@ def _(
     concat_activation = hidden_states.concat_activation
 
     if concat_activation.numel() == 0:
-        return torch.empty(
-            0,
-            concat_activation.shape[-1],
-            dtype=concat_activation.dtype,
-            device=concat_activation.device,
+        return ConcatPermutedBatchedExpertResult(
+            torch.empty(
+                0,
+                concat_activation.shape[-1],
+                dtype=concat_activation.dtype,
+                device=concat_activation.device,
+            ),
+            hidden_states.token_comma_topk_to_concat_indices,
         )
 
     if use_int8_w8a8:
@@ -693,7 +690,7 @@ def _(
 
     return ConcatPermutedBatchedExpertResult(
         down_out_list, hidden_states.token_comma_topk_to_concat_indices
-    ).weighted_sum(topk_weights)
+    )
 
 
 def try_get_npu_profiler(
@@ -704,12 +701,6 @@ def try_get_npu_profiler(
     repeat: int = 0,
     with_stack: bool = False,
 ):
-
-    try:
-        import torch_npu
-    except ImportError:
-        raise ImportError("torch_npu is not installed")
-
     experimental_config = torch_npu.profiler._ExperimentalConfig(
         export_type=torch_npu.profiler.ExportType.Text,
         profiler_level=torch_npu.profiler.ProfilerLevel.Level0,

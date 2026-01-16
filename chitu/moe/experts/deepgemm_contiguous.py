@@ -15,7 +15,10 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
     ExpertBlockPermutedBatchedRoutedActivationBlockfp8,
 )
-from chitu.moe.batched_expert_result import ExpertBlockPermutedBatchedExpertResult
+from chitu.moe.batched_expert_result import (
+    BatchedExpertResult,
+    ExpertBlockPermutedBatchedExpertResult,
+)
 from chitu.ops import silu_and_mul
 from chitu.ops.quant import blockfp8_act_quant
 from chitu.ops.triton_ops.quant_gemm import tma_align_input_scale
@@ -30,8 +33,6 @@ def deepgemm_contiguous_fused_expert(
     hidden_states: BatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_fp4_w4a8: bool = False,
@@ -49,8 +50,7 @@ def deepgemm_contiguous_fused_expert(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
-    out: Optional[torch.Tensor] = None,
-):
+) -> BatchedExpertResult:
     raise ValueError(f"Unsupported hidden_states type: {type(hidden_states)}")
 
 
@@ -59,8 +59,6 @@ def _(
     hidden_states: IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_fp4_w4a8: bool = False,
@@ -78,11 +76,7 @@ def _(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
-    out: Optional[torch.Tensor] = None,
-):
-    if out is None and inplace:
-        out = hidden_states.activation
-
+) -> BatchedExpertResult:
     hidden_states = hidden_states.as_local_expert_ids(
         experts_start_idx, experts_start_idx + w1.shape[0]
     )
@@ -94,8 +88,6 @@ def _(
         new_hidden_states,
         w1=w1,
         w2=w2,
-        topk_weights=topk_weights,
-        inplace=inplace,
         activation=activation,
         use_fp8_w8a8=use_fp8_w8a8,
         use_fp4_w4a8=use_fp4_w4a8,
@@ -113,7 +105,6 @@ def _(
         block_shape=block_shape,
         soft_fp8=soft_fp8,
         experts_start_idx=experts_start_idx,
-        out=out,
     )
 
 
@@ -122,8 +113,6 @@ def _(
     hidden_states: ExpertBlockPermutedBatchedRoutedActivationNormal,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_fp4_w4a8: bool = False,
@@ -141,8 +130,7 @@ def _(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
-    out: Optional[torch.Tensor] = None,
-):
+) -> ExpertBlockPermutedBatchedExpertResult:
     hidden_states = hidden_states.as_local_expert_ids(
         experts_start_idx, experts_start_idx + w1.shape[0]
     )
@@ -185,14 +173,9 @@ def _(
         block_to_expert_indices.flatten(),
     )
     del intermediate_cache2, block_to_expert_indices
-    results = ExpertBlockPermutedBatchedExpertResult(
+    return ExpertBlockPermutedBatchedExpertResult(
         intermediate_cache3, token_comma_topk_to_block_x_item_indices
     )
-    del intermediate_cache3, token_comma_topk_to_block_x_item_indices
-
-    if out is None:
-        out = torch.empty(topk_weights.shape[0], K, device=device, dtype=torch.bfloat16)
-    return results.weighted_sum(topk_weights, out=out)
 
 
 @deepgemm_contiguous_fused_expert.register
@@ -200,8 +183,6 @@ def _(
     hidden_states: IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_fp4_w4a8: bool = False,
@@ -219,8 +200,7 @@ def _(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
-    out: Optional[torch.Tensor] = None,
-):
+) -> BatchedExpertResult:
     hidden_states = hidden_states.as_local_expert_ids(
         experts_start_idx, experts_start_idx + w1.shape[0]
     )
@@ -234,8 +214,6 @@ def _(
         temp_hidden_states,
         w1=w1,
         w2=w2,
-        topk_weights=topk_weights,
-        inplace=inplace,
         activation=activation,
         use_fp8_w8a8=use_fp8_w8a8,
         use_fp4_w4a8=use_fp4_w4a8,
@@ -253,7 +231,6 @@ def _(
         block_shape=block_shape,
         soft_fp8=soft_fp8,
         experts_start_idx=experts_start_idx,
-        out=out,
     )
 
 
@@ -262,8 +239,6 @@ def _(
     hidden_states: ExpertBlockPermutedBatchedRoutedActivationBlockfp8,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_fp4_w4a8: bool = False,
@@ -281,8 +256,7 @@ def _(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
-    out: Optional[torch.Tensor] = None,
-):
+) -> ExpertBlockPermutedBatchedExpertResult:
     hidden_states = hidden_states.as_local_expert_ids(
         experts_start_idx, experts_start_idx + w1.shape[0]
     )
@@ -346,14 +320,9 @@ def _(
     del qintermediate_cache2
     del a2q_scale
 
-    expert_result = ExpertBlockPermutedBatchedExpertResult(
+    return ExpertBlockPermutedBatchedExpertResult(
         intermediate_cache3, token_comma_topk_to_block_x_item_indices
     )
-    del intermediate_cache3
-
-    if out is None:
-        out = torch.empty(topk_weights.shape[0], K, device=device, dtype=torch.bfloat16)
-    return expert_result.weighted_sum(topk_weights, out=out)
 
 
 @deepgemm_contiguous_fused_expert.register
@@ -361,8 +330,6 @@ def _(
     hidden_states: IndexedBatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_fp4_w4a8: bool = False,
@@ -380,8 +347,7 @@ def _(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
-    out: Optional[torch.Tensor] = None,
-):
+) -> BatchedExpertResult:
 
     assert not use_fp4_w4a8
     assert not use_int8_w8a16
@@ -417,8 +383,6 @@ def _(
         hidden_states,
         w1=w1,
         w2=w2,
-        topk_weights=topk_weights,
-        inplace=inplace,
         activation=activation,
         use_fp8_w8a8=use_fp8_w8a8,
         use_fp4_w4a8=use_fp4_w4a8,
@@ -436,5 +400,4 @@ def _(
         block_shape=block_shape,
         soft_fp8=soft_fp8,
         experts_start_idx=experts_start_idx,
-        out=out,
     )

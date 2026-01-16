@@ -13,7 +13,11 @@ from chitu.moe.batched_routed_activation import (
     PerExpertDenseBatchedRoutedActivation,
     PerExpertDenseBatchedRoutedActivationBlockfp8,
 )
-from chitu.moe.batched_expert_result import PerExpertDenseBatchedExpertResult
+from chitu.moe.batched_expert_result import (
+    BatchedExpertResult,
+    PerExpertDenseBatchedExpertResultMinimal,
+    PerExpertDenseBatchedExpertResult,
+)
 from chitu.ops.quant import blockfp8_act_quant, silu_and_mul_and_blockfp8_act_quant
 from chitu.utils import try_import_opt_dep
 from chitu.ops import silu_and_mul
@@ -26,8 +30,6 @@ def deepgemm_masked_fused_expert(
     hidden_states: BatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_fp4_w4a8: bool = False,
@@ -45,7 +47,7 @@ def deepgemm_masked_fused_expert(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
-):
+) -> BatchedExpertResult:
     raise NotImplementedError(
         f"deepgemm_masked_fused_expert not implemented for type {type(hidden_states)}"
     )
@@ -56,8 +58,6 @@ def _(
     hidden_states: IndexedBatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_fp4_w4a8: bool = False,
@@ -75,7 +75,7 @@ def _(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
-):
+) -> PerExpertDenseBatchedExpertResult:
     # first compute the n_tokens_per_expert (Tensor) based on token_to_expert_indices
     if global_num_experts > 0:
         n_experts = global_num_experts
@@ -190,12 +190,10 @@ def _(
         hidden_states,
     )
 
-    intermediate_cache3 = deepgemm_masked_fused_expert(
+    activation_per_expert = deepgemm_masked_fused_expert(
         densed_hidden_states,
         w1=w1,
         w2=w2,
-        topk_weights=topk_weights,
-        inplace=inplace,
         activation=activation,
         use_fp8_w8a8=use_fp8_w8a8,
         use_fp4_w4a8=use_fp4_w4a8,
@@ -213,22 +211,13 @@ def _(
         block_shape=block_shape,
         soft_fp8=soft_fp8,
         experts_start_idx=experts_start_idx,
-    )
-
-    batch_size = topk_weights.shape[0]
-    _, _, K = intermediate_cache3.shape
-    out = torch.empty(
-        batch_size,
-        K,
-        device=intermediate_cache3.device,
-        dtype=intermediate_cache3.dtype,
-    )
+    ).activation_per_expert
 
     return PerExpertDenseBatchedExpertResult(
-        activation_per_expert=intermediate_cache3,
+        activation_per_expert=activation_per_expert,
         token_to_expert_indices=token_to_expert,
         token_pos_in_expert=token_pos_in_expert,
-    ).weighted_sum(topk_weights, out=out)
+    )
 
 
 @deepgemm_masked_fused_expert.register
@@ -236,8 +225,6 @@ def _(
     hidden_states: PerExpertDenseBatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_fp4_w4a8: bool = False,
@@ -255,7 +242,7 @@ def _(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
-):
+) -> PerExpertDenseBatchedExpertResultMinimal:
     # dtype check
     assert activation == "silu"
     assert not soft_fp8
@@ -305,7 +292,7 @@ def _(
             M,
         )
 
-        return intermediate_cache3
+        return PerExpertDenseBatchedExpertResultMinimal(intermediate_cache3)
 
     assert use_fp8_w8a8
     assert block_shape is not None
@@ -317,19 +304,13 @@ def _(
             hidden_states.activation_per_expert
         )
 
-    M = hidden_states_fp8.shape[1]
-    E, N, _ = w1.shape
+    device = hidden_states_fp8.device
+    E, M, K = hidden_states_fp8.shape
+    E2, N, K2 = w1.shape
+    assert E == E2
+    assert K == K2
 
-    intermediate_cache1 = torch.empty(
-        (E, M, N), device=hidden_states_fp8.device, dtype=torch.bfloat16
-    )
-
-    intermediate_cache3 = torch.empty(
-        hidden_states_fp8.shape,
-        device=hidden_states_fp8.device,
-        dtype=torch.bfloat16,
-    )
-
+    intermediate_cache1 = torch.empty((E, M, N), device=device, dtype=torch.bfloat16)
     deep_gemm.m_grouped_fp8_gemm_nt_masked(
         (hidden_states_fp8, a1_scale),
         (w1, w1_scale),
@@ -337,11 +318,17 @@ def _(
         hidden_states.n_tokens_per_expert,
         M,
     )
+    del hidden_states_fp8
+    del a1_scale
+
     qintermediate_cache2, a2q_scale = silu_and_mul_and_blockfp8_act_quant(
         intermediate_cache1,
         expert_n_tokens=hidden_states.n_tokens_per_expert,
         block_size=128,
     )
+    del intermediate_cache1
+
+    intermediate_cache3 = torch.empty((E, M, K), device=device, dtype=torch.bfloat16)
     deep_gemm.m_grouped_fp8_gemm_nt_masked(
         (qintermediate_cache2, a2q_scale),
         (w2, w2_scale),
@@ -350,4 +337,4 @@ def _(
         M,
     )
 
-    return intermediate_cache3
+    return PerExpertDenseBatchedExpertResultMinimal(intermediate_cache3)

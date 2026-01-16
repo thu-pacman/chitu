@@ -5,6 +5,7 @@
 import torch
 import triton
 import triton.language as tl
+from chitu.ops.triton_ops.utils import autotune_compat
 
 
 @triton.jit
@@ -33,8 +34,10 @@ w4a4_gemm_per_token_per_channel_gemm_configs = [
 ]
 
 
-@triton.autotune(
-    configs=w4a4_gemm_per_token_per_channel_gemm_configs, key=["M", "N", "K"]
+@autotune_compat(
+    configs=w4a4_gemm_per_token_per_channel_gemm_configs,
+    key=["M", "N", "K"],
+    cache_results=True,
 )
 @triton.jit
 def w4a4_gemm_per_token_per_channel_gemm_kernel(
