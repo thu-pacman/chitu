@@ -26,6 +26,7 @@ from chitu.ops.linear_attn import (
 )
 from chitu.ops.quant import (
     linear,
+    fp4_rtn,
     blockfp8_einsum_shc_hdc_shd,
     w8a8_gemm_per_token_per_channel,
     a8_per_token_act_quant,

@@ -4,6 +4,7 @@ import pytest
 
 from chitu.native_layout import Packed4BitWeightAlongK
 from chitu.ops import (
+    fp4_rtn,
     soft_fp4_raise_to_fp8_blockfp4_gemm,
     soft_fp4_raise_to_bf16_blockfp4_gemm,
     blockfp8_act_quant,
@@ -36,7 +37,7 @@ def init_weight_and_scales(dim, block_size):
     b = b / (b_s * b_s_2)
 
     b = pack_every_two_fp4_e2m1_in_uint8_to_one_uint8(
-        to_fp4_e2m1_in_uint8(b.view(dim, dim))
+        to_fp4_e2m1_in_uint8(fp4_rtn(b.view(dim, dim)))
     )
     b_s = b_s.view(dim, dim // block_size).to(torch.float8_e4m3fn)
     b_s_2 = b_s_2.view(1, 1).to(torch.float32)
@@ -142,4 +143,4 @@ def test_fp4_raise_to_fp8_gemm_is_close_to_dequanted_gemm(dim, record_benchmark)
         impl="fp4_fp8_gemm",
     )
 
-    assert_close(std_y, y, atol=0.1, rtol=0.1)
+    assert_close(std_y, y, cos_sim_tol=0.001)

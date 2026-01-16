@@ -19,6 +19,7 @@ from chitu.ops.quant.blockfp8 import (
     fp8_e4m3fn_quant_per_tensor,
 )
 from chitu.ops.quant.blockfp4 import (
+    fp4_rtn,
     soft_fp4_raise_to_fp8_blockfp4_gemm,
     soft_fp4_raise_to_bf16_blockfp4_gemm,
     soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm,

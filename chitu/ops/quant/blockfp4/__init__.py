@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from chitu.ops.quant.blockfp4.convert import (
+    fp4_rtn,
     blockfp4_act_quant,
     unpack_every_uint8_to_two_fp4_e2m1_in_uint8,
     from_fp4_e2m1_in_uint8,
