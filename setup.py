@@ -91,8 +91,16 @@ class SkipBuildPy(build_py):
 
 my_build_py = build_py
 if os.environ.get("CHITU_WITH_CYTHON", "0") != "0":
-    ext_modules += cythonize(create_cython_extensions("chitu"))
+    nthreads = os.environ.get("CHITU_SETUP_JOBS", 0)
+    if nthreads:
+        nthreads = int(nthreads)
+    else:
+        nthreads = 0
+    ext_modules += cythonize(create_cython_extensions("chitu"), nthreads=nthreads)
     my_build_py = SkipBuildPy
+
+if os.environ.get("CHITU_SETUP_JOBS") is not None:
+    os.environ["MAX_JOBS"] = os.environ.get("CHITU_SETUP_JOBS")  # type: ignore
 
 # The information here can also be placed in setup.cfg - better separation of
 # logic and declaration, and simpler if you include description/version in a file.

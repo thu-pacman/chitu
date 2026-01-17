@@ -3,10 +3,13 @@ FROM image.sourcefind.cn:5000/dcu/admin/base/pytorch:2.4.1-ubuntu22.04-dtk25.04-
 SHELL ["/bin/bash", "-c"]
 
 ARG optional_deps=''
-ARG build_jobs=''
+ARG chitu_setup_jobs=''
 ARG enable_editable_install='false'
 ARG enable_cython='true'
 ARG enable_test='false'
+
+ENV CHITU_SETUP_JOBS=$chitu_setup_jobs
+ENV MAX_JOBS=$CHITU_SETUP_JOBS
 
 RUN if [ "${enable_editable_install}" != "true" ] && [ "${enable_editable_install}" != "false" ]; then \
     echo "ARG enable_editable_install must either be 'true' or 'false'"; \
