@@ -66,38 +66,110 @@ def set_quant_variables(global_args=None):
     models = global_args.get("models", {})
     model_name = models.get("name")
     assert isinstance(model_name, str)
-
     model_name = model_name.lower()
-    if models.get("quant_config", None) is None:
-        OmegaConf.set_struct(models, False)
-        models["quant_config"] = {"rules": [], "type": None}
-        OmegaConf.set_struct(models, True)
+
+    def _ensure_quant_config_struct():
+        """Ensure models.quant_config exists and has kv_cache sub-struct."""
+        if models.get("quant_config", None) is None:
+            OmegaConf.set_struct(models, False)
+            models["quant_config"] = {
+                "rules": [],
+                "type": None,
+                "kv_cache": {"rules": [], "type": None},
+            }
+            OmegaConf.set_struct(models, True)
+            return True
+
+        if models.quant_config.get("kv_cache", None) is None:
+            OmegaConf.set_struct(models.quant_config, False)
+            models.quant_config["kv_cache"] = {"rules": [], "type": None}
+            OmegaConf.set_struct(models.quant_config, True)
+
+        return False
+
+    def _get_kv_cache_existing():
+        """Read existing kv_cache config (for fallback)."""
+        old_kv = models.quant_config.get("kv_cache", None)
+        if old_kv is None:
+            return None, []
+        kv_type = (
+            old_kv.get("type", None)
+            if isinstance(old_kv, dict)
+            else getattr(old_kv, "type", None)
+        )
+        kv_rules = (
+            old_kv.get("rules", [])
+            if isinstance(old_kv, dict)
+            else getattr(old_kv, "rules", [])
+        )
+        return kv_type, kv_rules
+
+    def _normalize_rules(rules, default_type):
+        """
+        Fill rule.type, expand rule.layers if present.
+        Return (normalized_rules, resolved_default_type).
+        """
+        out = []
+        if rules and not default_type:
+            default_type = rules[0].get("type", None)
+
+        for rule in rules:
+            rule_type = rule.get("type", None) or default_type
+            OmegaConf.set_struct(rule, False)
+            rule.type = rule_type
+            if "layers" in rule:
+                rule.layers = expand_layers(rule.get("layers", []))
+            OmegaConf.set_struct(rule, True)
+            out.append(rule)
+
+        return out, default_type
+
+    def _match_entry(quant_list, key):
+        """
+        Find first config entry matching model_name for given key.
+        key: "model" or "kv_cache"
+        """
+        for cfg in quant_list:
+            pattern = cfg.get(key, "")
+            if pattern and re.match(pattern, model_name):
+                return cfg
+        return None
+
+    # Ensure quant_config exists + has kv_cache
+    created_default = _ensure_quant_config_struct()
+    if created_default:
         return
 
-    quant_config = {"rules": [], "type": models.quant_config.get("type", None)}
+    # Prepare output quant_config skeleton (keep old kv_cache as fallback)
+    old_kv_type, old_kv_rules = _get_kv_cache_existing()
+    quant_config = {
+        "rules": [],
+        "type": models.quant_config.get("type", None),
+        "kv_cache": {"rules": [], "type": old_kv_type},
+    }
+
     quant_list = models.quant_config.get("quant", [])
 
-    for config in quant_list:
-        pattern = config.get("model", "")
-        if pattern != "":
-            if re.match(pattern, model_name):
-                rules = config.get("rules", [])
-                quant_config["rules"] = []
-                if rules and not quant_config["type"]:
-                    first_rule = rules[0]
-                    quant_config["type"] = first_rule.get("type")
-                for index, rule in enumerate(rules):
-                    rule_type = rule.get("type", None)
-                    if not rule_type:
-                        rule_type = quant_config["type"]
-                    layers = expand_layers(rule.get("layers", []))
-                    OmegaConf.set_struct(rule, False)
-                    rule.type = rule_type
-                    rule.layers = layers
-                    OmegaConf.set_struct(rule, True)
-                    quant_config["rules"].append(rule)
-                models.quant_config = quant_config
-                return
+    # Resolve model rules
+    model_cfg = _match_entry(quant_list, "model")
+    if model_cfg is not None:
+        rules = model_cfg.get("rules", [])
+        quant_config["rules"], quant_config["type"] = _normalize_rules(
+            rules, quant_config["type"]
+        )
+
+    # Resolve kv_cache rules
+    kv_cfg = _match_entry(quant_list, "kv_cache")
+    if kv_cfg is not None:
+        rules = kv_cfg.get("rules", [])
+        quant_config["kv_cache"]["rules"], quant_config["kv_cache"]["type"] = (
+            _normalize_rules(rules, quant_config["kv_cache"]["type"])
+        )
+    else:
+        # fallback: keep existing kv_cache rules if present
+        if old_kv_rules:
+            quant_config["kv_cache"]["rules"] = old_kv_rules
+
     models.quant_config = quant_config
 
 

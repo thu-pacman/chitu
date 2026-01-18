@@ -230,6 +230,13 @@ class AttnBackend(abc.ABC):
         sinks=None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
+        descales = {}
+        if all(t.dtype is torch.float8_e4m3fn for t in (q, k, v)):
+            descales = dict(
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
         if isinstance(kv_cache, DenseKVCacheAccessor):
             return self.prefill_ragged_qo_dense_kv(
                 q,
@@ -243,15 +250,9 @@ class AttnBackend(abc.ABC):
                 softmax_scale=softmax_scale,
                 sinks=sinks,
                 topk_indices=topk_indices,
+                **descales,
             )
         elif isinstance(kv_cache, PagedKVCacheAccessor):
-            descales = {}
-            if all(t.dtype is torch.float8_e4m3fn for t in (q, k, v)):
-                descales = dict(
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                )
             return self.prefill_ragged_qo_paged_kv(
                 q,
                 kv_cache,
@@ -286,6 +287,13 @@ class AttnBackend(abc.ABC):
         sinks=None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
+        descales = {}
+        if all(t.dtype is torch.float8_e4m3fn for t in (q, k, v)):
+            descales = dict(
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
         if isinstance(kv_cache, DenseKVCacheAccessor):
             return self.decode_dense_kv(
                 q,
@@ -298,15 +306,9 @@ class AttnBackend(abc.ABC):
                 softmax_scale=softmax_scale,
                 sinks=sinks,
                 topk_indices=topk_indices,
+                **descales,
             )
         elif isinstance(kv_cache, PagedKVCacheAccessor):
-            descales = {}
-            if all(t.dtype is torch.float8_e4m3fn for t in (q, k, v)):
-                descales = dict(
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                )
             return self.decode_paged_kv(
                 q,
                 kv_cache,
@@ -346,6 +348,9 @@ class AttnBackend(abc.ABC):
         k,
         v,
         *,
+        q_descale: torch.Tensor = None,
+        k_descale: torch.Tensor = None,
+        v_descale: torch.Tensor = None,
         seq_len_delta: BatchedSeqLenDelta,
         causal: bool = False,
         window_size=(-1, -1),  # -1 means infinite context window
@@ -382,6 +387,21 @@ class AttnBackend(abc.ABC):
                     seq_len_delta.new.position_ids_tensor_device,
                     seq_len_delta.new.seq_ids_tensor_device,
                 )
+        descales = {}
+        if any(s is not None for s in (q_descale, k_descale, v_descale)):
+            if not all(s is not None for s in (q_descale, k_descale, v_descale)):
+                raise ValueError(
+                    "Partial descales: q/k/v_descale must be all set or all None."
+                )
+            if not all(
+                t is not None and t.dtype is torch.float8_e4m3fn for t in (q, k, v)
+            ):
+                raise ValueError(
+                    "Descales provided but q/k/v are not all float8_e4m3fn."
+                )
+            descales = dict(
+                q_descale=q_descale, k_descale=k_descale, v_descale=v_descale
+            )
 
         return self.prefill_ragged_qkvo(
             q,
@@ -394,6 +414,7 @@ class AttnBackend(abc.ABC):
             softmax_scale=softmax_scale,
             sinks=sinks,
             topk_indices=topk_indices,
+            **descales,
         )
 
     def prefill_ragged_qo_paged_kv(

@@ -12,6 +12,7 @@ from chitu.ops.kv_cache import (
     read_from_paged_kv_cache,
     read_from_singleton_paged_kv_cache,
     read_from_dense_kv_cache,
+    fp8_pertensor_kvcache_quant,
 )
 from chitu.ops.norm import rms_norm
 from chitu.ops.moe_gate import moe_gate

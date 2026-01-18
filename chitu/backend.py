@@ -452,24 +452,20 @@ class Backend:
 
         # Configure KV cache parameters based on model type
         kv_cache_kvargs = Backend._get_kv_cache_params(args, attn_backend_type)
-
+        logger.info(
+            f"{args.infer.cache_type} cache dtype_dict: {kv_cache_kvargs.get('dtype_dict', None)}"
+        )
         # Create appropriate cache manager
         if args.infer.cache_type == "paged":
             block_size = 64 if args.infer.mla_absorb != "none" else 256
             if args.infer.attn_type == "npu":
                 block_size = 128
-            if args.infer.cache_dtype == "float8_e4m3fn":
-                dtype_dict = {"k": torch.float8_e4m3fn, "v": torch.float8_e4m3fn}
-            else:
-                dtype_dict = None
-            logger.info(f"PagedKVCache dtype: {args.infer.cache_dtype}")
             return PagedKVCacheManager(
                 layer_id_map,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
                 block_size=block_size,
                 num_blocks=args.infer.num_blocks if num_blocks is None else num_blocks,
-                dtype_dict=dtype_dict,
                 device=local_rank,
                 **kv_cache_kvargs,
             )
@@ -652,6 +648,64 @@ class Backend:
             kv_cache_kvargs["n_local_kv_heads"] = n_local_kv_heads
             kv_cache_kvargs["head_dim"] = head_dim
 
+        # kv cache dtype/quant config
+        kv_keys = (
+            list(kv_cache_kvargs["shape_per_token_dict"].keys())
+            if "shape_per_token_dict" in kv_cache_kvargs
+            else ["k", "v"]
+        )
+
+        quant_cfg = getattr(args.models, "quant_config", None)
+        kv_cache_cfg = (
+            getattr(quant_cfg, "kv_cache", None) if quant_cfg is not None else None
+        )
+        quant_type = (
+            getattr(kv_cache_cfg, "type", None) if kv_cache_cfg is not None else None
+        )
+
+        if kv_cache_cfg is None or quant_type is None:
+            return kv_cache_kvargs
+
+        kv_cache_rules = getattr(kv_cache_cfg, "rules", None) or []
+
+        # map kv_cache quant type to torch dtype
+        quant_type_to_dtype = {
+            "fp8_pertensor": torch.float8_e4m3fn,
+        }
+
+        dtype_dict = {}
+
+        if kv_cache_rules:
+            for key in kv_keys:
+                matched = False
+                for rule in kv_cache_rules:
+                    pattern = getattr(rule, "regex", None)
+                    rtype = getattr(rule, "type", None) or quant_type
+                    if pattern and re.search(pattern, key):
+                        if rtype not in quant_type_to_dtype:
+                            raise NotImplementedError(
+                                f"Unsupported kv_cache quant type: {rtype}"
+                            )
+                        dtype_dict[key] = quant_type_to_dtype[rtype]
+                        matched = True
+                        break
+
+                if not matched:
+                    raise ValueError(
+                        f"kv_cache quant rules did not match key '{key}'. "
+                        f"Available keys: {kv_keys}. "
+                        f"Please add a rule for it."
+                    )
+        else:
+            if quant_type not in quant_type_to_dtype:
+                raise NotImplementedError(
+                    f"Unsupported kv_cache quant type: {quant_type}"
+                )
+            dtype = quant_type_to_dtype[quant_type]
+            dtype_dict = {k: dtype for k in kv_keys}
+
+        kv_cache_kvargs["dtype_dict"] = dtype_dict
+        kv_cache_kvargs["quant_type"] = quant_type
         return kv_cache_kvargs
 
     @staticmethod
