@@ -6,6 +6,7 @@ from typing import Sequence, Optional, Callable, Iterable
 from typing_extensions import override
 from dataclasses import dataclass
 from logging import getLogger
+from enum import Enum
 import torch
 from collections import deque
 import functools
@@ -15,6 +16,7 @@ from chitu.global_vars import get_slot_handle, get_timers, get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
 from chitu.utils import ceil_div
+from chitu.ops import fp8_pertensor_kvcache_quant
 
 logger = getLogger(__name__)
 
@@ -161,6 +163,16 @@ class DenseKVCacheAccessor(KVCacheAccessor):
         return self.kv["v"]
 
 
+class KVCacheQuantType(Enum):
+    # Add KV Cache quant here
+    NONE = "None"
+    FP8_PERTENSOR = "fp8_pertensor"
+
+    @property
+    def needs_kv_scales(self) -> bool:
+        return self in {KVCacheQuantType.FP8_PERTENSOR}
+
+
 class KVCacheManagerBase:
     def __init__(
         self,
@@ -172,6 +184,7 @@ class KVCacheManagerBase:
         dtype_dict: Optional[dict[str, torch.dtype]] = None,
         n_local_kv_heads: Optional[int] = None,
         head_dim: Optional[int] = None,
+        quant_type: str = None,
         device="cuda",
     ):
         """
@@ -195,6 +208,8 @@ class KVCacheManagerBase:
 
         self.num_hot_req = num_hot_req
         self.max_seq_len = max_seq_len
+
+        self.quant_type = KVCacheQuantType(str(quant_type))
 
         self.device = torch.device(device)
 
@@ -265,6 +280,30 @@ class KVCacheManagerBase:
                 cache_delta_position_ids_tensor_device=True,
                 cache_delta_seq_ids_tensor_device=True,
             )
+
+    def kvcache_quant(
+        self,
+        q: torch.Tensor = None,
+        k: torch.Tensor = None,
+        v: torch.Tensor = None,
+        q_scale: torch.Tensor = None,
+        k_scale: torch.Tensor = None,
+        v_scale: torch.Tensor = None,
+        n_local_kv_heads: int = None,
+    ):
+        if self.quant_type is KVCacheQuantType.FP8_PERTENSOR:
+            assert q_scale is None and n_local_kv_heads is not None
+            return fp8_pertensor_kvcache_quant(
+                q,
+                k,
+                v,
+                k_scale,
+                v_scale,
+                self.seq_len_delta.batch_size,
+                n_local_kv_heads,
+            )
+        elif self.quant_type is KVCacheQuantType.NONE:
+            return q, k, v, {}
 
     def prepare_cache_prefill(self, req_ids: list[str], delta_seq_len: list[int]):
         self.curr_req_ids = req_ids
@@ -371,6 +410,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         dtype_dict: Optional[dict[str, torch.dtype]] = None,
         n_local_kv_heads: Optional[int] = None,
         head_dim: Optional[int] = None,
+        quant_type: str = None,
         device="cuda",
         block_size: int = 512,  # must be a multiple of 256 for FlashAttention
         num_blocks: int = -1,
@@ -383,6 +423,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
             dtype_dict=dtype_dict,
             n_local_kv_heads=n_local_kv_heads,
             head_dim=head_dim,
+            quant_type=quant_type,
             device=device,
         )
         self.max_blocks_per_req = ceil_div(max_seq_len, block_size)
@@ -804,6 +845,7 @@ class DenseKVCacheManager(KVCacheManagerBase):
         dtype_dict: Optional[dict[str, torch.dtype]] = None,
         n_local_kv_heads: Optional[int] = None,
         head_dim: Optional[int] = None,
+        quant_type: str = None,
         device="cuda",
     ):
         super().__init__(
@@ -814,6 +856,7 @@ class DenseKVCacheManager(KVCacheManagerBase):
             dtype_dict=dtype_dict,
             n_local_kv_heads=n_local_kv_heads,
             head_dim=head_dim,
+            quant_type=quant_type,
             device=device,
         )
 

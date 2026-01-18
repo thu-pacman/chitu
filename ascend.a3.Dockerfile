@@ -3,9 +3,12 @@
 FROM quay.io/ascend/cann:8.3.rc1.alpha001-a3-ubuntu22.04-py3.11 AS base
 
 ARG optional_deps=''
-ARG build_jobs=''
+ARG chitu_setup_jobs=''
 ARG enable_cython='true'
 ARG enable_test='false'
+
+ENV CHITU_SETUP_JOBS=$chitu_setup_jobs
+ENV MAX_JOBS=$CHITU_SETUP_JOBS
 
 RUN if [ "${enable_cython}" != "true" ] && [ "${enable_cython}" != "false" ]; then \
     echo "ARG enable_cython must either be 'true' or 'false'"; \

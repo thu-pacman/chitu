@@ -41,7 +41,6 @@ class ConstraintDecodeManager:
             self.tokenizer_info = TokenizerInfo.from_huggingface(
                 tokenizer, vocab_size=vocab_size
             )
-            raise Exception("mock failure")
             self.grammar_compiler = GrammarCompiler(self.tokenizer_info)
             self.batch_matcher = BatchGrammarMatcher()
             self.states: dict[str, MatcherState] = {}

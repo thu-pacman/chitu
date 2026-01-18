@@ -4,9 +4,12 @@ FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel AS base
 
 ARG torch_cuda_arch_list='12.0+PTX'
 ARG optional_deps=''
-ARG build_jobs=''
+ARG chitu_setup_jobs=''
 ARG enable_cython='true'
 ARG enable_test='false'
+
+ENV CHITU_SETUP_JOBS=$chitu_setup_jobs
+ENV MAX_JOBS=$CHITU_SETUP_JOBS
 
 RUN if [ "${enable_cython}" != "true" ] && [ "${enable_cython}" != "false" ]; then \
     echo "ARG enable_cython must either be 'true' or 'false'"; \
@@ -89,6 +92,8 @@ RUN --mount=type=bind,source=./third_party,target=./third_party,readwrite \
 #
 # This stage build wheel file of chitu.
 FROM dependency_installer AS wheel_builder
+
+ARG enable_cython
 
 WORKDIR /workspace/chitu
 COPY . .

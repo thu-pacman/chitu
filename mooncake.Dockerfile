@@ -7,9 +7,12 @@ SHELL ["/bin/bash", "-c"]
 
 ARG torch_cuda_arch_list='7.0 7.5 8.0 8.6 8.9 9.0+PTX'
 ARG optional_deps='flash_attn,flash_mla,flashinfer'
-ARG build_jobs=''
+ARG chitu_setup_jobs=''
 ARG enable_cython='true'
 ARG enable_test='false'
+
+ENV CHITU_SETUP_JOBS=$chitu_setup_jobs
+ENV MAX_JOBS=$CHITU_SETUP_JOBS
 
 RUN if [ "${enable_cython}" != "true" ] && [ "${enable_cython}" != "false" ]; then \
     echo "ARG enable_cython must either be 'true' or 'false'"; \
@@ -96,6 +99,8 @@ RUN --mount=type=bind,source=./third_party,target=./third_party,readwrite \
 # This stage build wheel file of chitu.
 FROM dependency_installer AS wheel_builder
 
+ARG enable_cython
+
 WORKDIR /workspace/chitu
 COPY . .
 
@@ -129,5 +134,3 @@ COPY ./benchmarks ./benchmarks
 # worse, so we don't use them.
 ENV NCCL_GRAPH_MIXING_SUPPORT=0
 ENV NCCL_GRAPH_REGISTER=0
-
-

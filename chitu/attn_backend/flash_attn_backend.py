@@ -88,6 +88,9 @@ class FlashAttnBackend(AttnBackend):
         k=None,
         v=None,
         *,
+        q_descale: torch.Tensor = None,
+        k_descale: torch.Tensor = None,
+        v_descale: torch.Tensor = None,
         seq_len_delta: BatchedSeqLenDelta,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -108,6 +111,11 @@ class FlashAttnBackend(AttnBackend):
         extra_kvargs = {}
         if softcap != 0.0:
             extra_kvargs["softcap"] = softcap
+
+        if self._use_fa3:
+            extra_kvargs["q_descale"] = q_descale
+            extra_kvargs["k_descale"] = k_descale
+            extra_kvargs["v_descale"] = v_descale
 
         return self._fa.flash_attn_with_kvcache(
             q.unsqueeze(1),

@@ -13,17 +13,18 @@
 set -ex
 
 if [ $# -ne 4 ]; then
-    echo "Usage: $0 <optional_deps> <build_jobs> <enable_editable_install> <enable_cython>"
+    echo "Usage: $0 <optional_deps> <chitu_setup_jobs> <enable_editable_install> <enable_cython>"
     exit 1
 fi
 
 optional_deps=$1
-build_jobs=$2
+chitu_setup_jobs=$2
 enable_editable_install=$3
 enable_cython=$4
 
-if [ -n "${build_jobs}" ]; then
-    export MAX_JOBS=${build_jobs}
+if [ -n "${chitu_setup_jobs}" ]; then
+    export MAX_JOBS=${chitu_setup_jobs}
+    export CHITU_SETUP_JOBS=$MAX_JOBS
 fi
 if [ "${enable_cython}" == "true" ]; then
     export CHITU_WITH_CYTHON=1

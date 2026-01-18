@@ -3,9 +3,12 @@ FROM maca-pytorch:3.0.0.4-torch2.6-py310-ubuntu24.04-amd64 AS base
 SHELL ["/bin/bash", "-c"]
 
 ARG optional_deps=''
-ARG build_jobs=''
+ARG chitu_setup_jobs=''
 ARG enable_cython='true'
 ARG enable_test='false'
+
+ENV CHITU_SETUP_JOBS=$chitu_setup_jobs
+ENV MAX_JOBS=$CHITU_SETUP_JOBS
 
 # The base image uses Conda as the Python environment. We need to activate it
 # For `docker build` stage, the most straightforward way is to use `bash --login -c` as the shell
