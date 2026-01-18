@@ -105,7 +105,7 @@ IB_ENV_ARGS=()
 IB_MOUNT_ARGS=()
 if [ -d "/dev/infiniband" ]; then
     IB_MOUNT_ARGS+=("-B" "/dev/infiniband:/dev/infiniband")
-    echo "检测到 /dev/infiniband，将自动挂载到容器" >&2
+    echo "Adding /dev/infiniband to mounts" >&2
 fi
 
 apptainer run \

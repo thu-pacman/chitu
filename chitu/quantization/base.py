@@ -9,10 +9,12 @@ from chitu.ops import silu_and_mul
 from chitu.moe.batched_expert_result import (
     BatchedExpertResult,
     PerTokenBatchedExpertResult,
+    PerExpertDenseBatchedExpertResultMinimal,
 )
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
+    PerExpertDenseBatchedRoutedActivation,
 )
 
 
@@ -167,7 +169,9 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         )
 
     @forward_no_sum_iterative.register
-    def _(self, routed_x: IndexedBatchedRoutedActivation) -> BatchedExpertResult:
+    def _(
+        self, routed_x: IndexedBatchedRoutedActivation
+    ) -> PerTokenBatchedExpertResult:
         routed_x = routed_x.as_local_expert_ids(
             self.experts_start_idx, self.experts_end_idx
         )
@@ -240,6 +244,51 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
                     down_proj_outs[i]
                 )
         return PerTokenBatchedExpertResult(y)
+
+    @forward_no_sum_iterative.register
+    def _(
+        self, routed_x: PerExpertDenseBatchedRoutedActivation
+    ) -> PerExpertDenseBatchedExpertResultMinimal:
+        routed_x = routed_x.as_local_expert_ids(
+            self.experts_start_idx, self.experts_end_idx
+        )
+
+        n_tokens_per_expert_cpu = routed_x.n_tokens_per_expert.cpu()
+        xs = []
+        for i in range(self.group_size):
+            this_x = None
+            if n_tokens_per_expert_cpu[i] > 0:
+                this_x = routed_x.activation_per_expert[i, : n_tokens_per_expert_cpu[i]]
+            xs.append(this_x)
+
+        if self.merge_gate_up:
+            act = []
+            for i, xsi in enumerate(xs):
+                out = None
+                if xsi is not None:
+                    out = self.forward_act_fn_merged(
+                        self.forward_ith_expert_gate_up(i, xsi)
+                    )
+                act.append(out)
+        else:
+            act = []
+            for i, xsi in enumerate(xs):
+                out = None
+                if xsi is not None:
+                    out = self.forward_act_fn_unmerged(
+                        self.forward_ith_expert_gate(i, xsi),
+                        self.forward_ith_expert_up(i, xsi),
+                    )
+                act.append(out)
+
+        y = torch.empty_like(routed_x.activation_per_expert)
+        for i, acti in enumerate(act):
+            if acti is not None:
+                y[i, : n_tokens_per_expert_cpu[i]] = self.forward_ith_expert_down(
+                    i, acti
+                )
+
+        return PerExpertDenseBatchedExpertResultMinimal(y)
 
     def forward_no_sum(
         self, routed_x: BatchedRoutedActivation, impl="auto"

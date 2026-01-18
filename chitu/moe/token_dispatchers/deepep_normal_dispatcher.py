@@ -60,7 +60,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
     def prepare(self, num_tokens):
         # NOTES: you may also replace `get_*_config` with your auto-tuned results via all the tests
 
-        self._buffer = DeepEPBuffer.get_deepep_buffer(
+        self._buffer = DeepEPBuffer.get_and_cache_deepep_buffer(
             self.ep_group.gpu_group,
             self.hidden,
             self.max_bs_per_dp_rank,
