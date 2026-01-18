@@ -8,6 +8,7 @@
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include "allreduce/custom_all_reduce.h"
 #include "dequant/ops.h"
 #include "frequency_penalty/frequency_penalty.h"
 #include "gemm/w4a8_per_group_gemm_cuda.h"
@@ -40,6 +41,27 @@ void init_compute(py::module &m) {
     m.def("cuda_topk_softmax", &topk_softmax, "");
     m.def("cuda_frequency_penalty", &applyFrequencyPenalty, "");
     m.def("cuda_response_append", &response_append, "");
+    m.def("init_custom_ar", &init_custom_ar, "Initialize custom all-reduce",
+          "ipc_pointers"_a, "rank_data"_a, "rank"_a, "full_nvlink"_a);
+    m.def("all_reduce", &all_reduce, "Perform all-reduce operation", "handle"_a,
+          "input"_a, "output"_a, "reg_buffer"_a, "reg_buffer_size"_a);
+    m.def("dispose", &dispose, "Dispose custom all-reduce instance",
+          "handle"_a);
+    m.def("meta_size", &meta_size, "Get metadata size");
+    m.def("register_buffer", &register_buffer, "Register buffer for all-reduce",
+          "handle"_a, "buffer_pointers"_a);
+    m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta,
+          "Get graph buffer IPC metadata", "handle"_a);
+    m.def("register_graph_buffers", &register_graph_buffers,
+          "Register graph buffers for all-reduce", "handle"_a, "handles"_a,
+          "offsets"_a);
+    m.def("allocate_shared_buffer_and_handle",
+          &allocate_shared_buffer_and_handle,
+          "Allocate shared buffer and get handle", "size"_a);
+    m.def("open_mem_handle", &open_mem_handle, "Open memory handle",
+          "mem_handle"_a);
+    m.def("free_shared_buffer", &free_shared_buffer, "Free shared buffer",
+          "buffer"_a);
     m.def("w4a8_per_group_gemm_forward_cuda", &w4a8_per_group_gemm_forward_cuda,
           "");
 #if !defined(CHITU_MUXI_BUILD) ||                                              \

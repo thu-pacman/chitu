@@ -309,9 +309,9 @@ class RowParallelLinearMixIn:
 
         if self.reduce_output and self.tp_size > 1:
             if dst == -1:
-                self.tp_group.all_reduce(y, op=torch.distributed.ReduceOp.SUM)
+                self.tp_group.all_reduce(y)
             else:
-                self.tp_group.reduce(y, dst=dst, op=torch.distributed.ReduceOp.SUM)
+                self.tp_group.reduce(y, dst=dst)
 
         return y
 

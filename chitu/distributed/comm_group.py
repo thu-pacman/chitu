@@ -7,10 +7,12 @@ import socket
 from typing import Optional, List, Tuple, Sequence, Any
 
 import torch
+import torch.distributed
 from logging import getLogger
 
-logger = getLogger(__name__)
+from chitu.distributed.custom_ar_chitu import create_chitu_custom_allreduce
 
+logger = getLogger(__name__)
 
 _torch_group_dedup_dict_device: dict[tuple[tuple[int, ...], ...], list[Any]] = {}
 _torch_group_dedup_dict_host: dict[tuple[tuple[int, ...], ...], list[Any]] = {}
@@ -68,10 +70,20 @@ class CommGroup:
         rank_lists: Sequence[Sequence[int]],
         global_rank: int,
         local_rank: int,
+        enable_custom_allreduce: bool = True,
+        fully_connected: bool = True,
+        custom_allreduce_max_size: int = 8 * 1024 * 1024,  # 8MB default
         force_no_dedup: bool = False,
     ):
         self.global_rank = global_rank
         self.local_rank = local_rank
+        self.cpu_group = None
+        self.gpu_group = None
+        self.rank_in_group = None
+        self.group_size = None
+        self.rank_list = None
+        self.fully_connected = fully_connected
+        self.custom_allreduce_max_size = custom_allreduce_max_size
 
         self.device = torch.device(f"cuda:{local_rank}")
 
@@ -96,14 +108,53 @@ class CommGroup:
         this_rank_idx = contains_this_rank.index(True)
         self.cpu_group = cpu_groups[this_rank_idx]
         self.gpu_group = gpu_groups[this_rank_idx]
+
         if type(self.gpu_group) != SingletonGroupPlaceholder:
             # fix random graph capture stuck on cm384, in tp2
             # we need to do a world barrier before dp group barrier in init_zmq
             self.barrier()
+
         self.rank_list = rank_lists[this_rank_idx]
         self.rank_in_group = self.rank_list.index(global_rank)
         self.group_size = len(self.rank_list)
         self.moe_comm_group = None
+
+        self.custom_ar_manager = None
+        self._enable_custom_allreduce = enable_custom_allreduce
+
+        if self._enable_custom_allreduce:
+            _ = self.get_custom_ar_manager
+
+    @property
+    def get_custom_ar_manager(self):
+        if self.custom_ar_manager is None and self._enable_custom_allreduce:
+            if type(self.cpu_group) == SingletonGroupPlaceholder:
+                logger.info(
+                    "Skipping custom allreduce creation: cpu_group is a singleton placeholder "
+                    "(group size is 1)."
+                )
+                self._enable_custom_allreduce = False
+                self.custom_ar_manager = None
+                return None
+
+            try:
+                self.custom_ar_manager = create_chitu_custom_allreduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                    max_size=self.custom_allreduce_max_size,
+                    symm_mem_enabled=False,
+                )
+                if self.custom_ar_manager is None or self.custom_ar_manager.disabled:
+                    logger.warning(
+                        "Custom AllReduce initialized but returned None or is disabled."
+                    )
+                    self._enable_custom_allreduce = False
+                    self.custom_ar_manager = None
+            except Exception as e:
+                logger.warning(f"Failed to create ChituCustomAllreduce: {e}")
+                self.custom_ar_manager = None
+                self._enable_custom_allreduce = False
+        return self.custom_ar_manager
 
     @property
     def next_rank(self):
@@ -142,7 +193,12 @@ class CommGroup:
         return self.global_rank == self.rank_list[-1]
 
     def __str__(self):
-        return f"{self.__class__.__name__}(group_size={self.group_size}, rank_in_group={self.rank_in_group}, rank_list={self.rank_list})"
+        return (
+            f"{self.__class__.__name__}("
+            f"group_size={self.group_size}, "
+            f"rank_in_group={self.rank_in_group}, "
+            f"rank_list={self.rank_list}, "
+        )
 
     def barrier(self):
         torch.distributed.barrier(group=self.gpu_group, device_ids=[self.local_rank])
@@ -150,17 +206,34 @@ class CommGroup:
     def all_reduce(
         self,
         tensor: torch.Tensor,
-        op: torch.distributed.ReduceOp.RedOpType = torch.distributed.ReduceOp.SUM,
     ):
-        torch.distributed.all_reduce(tensor, group=self.gpu_group, op=op)
+        ca_comm = self.get_custom_ar_manager
+        use_custom = False
+
+        if ca_comm and not ca_comm.disabled:
+            try:
+                if ca_comm.should_custom_ar(tensor):
+                    ca_comm.custom_all_reduce(tensor)
+
+                    use_custom = True
+            except Exception as e:
+                logger.warning(
+                    f"Custom AllReduce failed, falling back to NCCL forever: {e}"
+                )
+                self._enable_custom_allreduce = False
+                self.custom_ar_manager = None
+                use_custom = False
+
+        # Fallback to standard NCCL
+        if not use_custom:
+            torch.distributed.all_reduce(tensor, group=self.gpu_group)
 
     def reduce(
         self,
         tensor: torch.Tensor,
         dst: int,
-        op: torch.distributed.ReduceOp.RedOpType = torch.distributed.ReduceOp.SUM,
     ):
-        torch.distributed.reduce(tensor, dst=dst, group=self.gpu_group, op=op)
+        torch.distributed.reduce(tensor, dst=dst, group=self.gpu_group)
 
     def broadcast(self, tensor: torch.Tensor, src: int = 0):
         torch.distributed.broadcast(tensor, src=src, group=self.gpu_group)
@@ -243,7 +316,6 @@ class CommGroup:
         Returns:
             List[Tuple[str, int, int]]: List of tuples of the form (IP, DP_port, PP_port)
         """
-
         if self.group_size == 1:
             return [("localhost", 0, 0)]
 
@@ -283,7 +355,6 @@ class CommGroup:
 
         ip_list = [None] * self.group_size
         torch.distributed.all_gather_object(ip_list, local_ip, self.cpu_group)
-
         if "localhost" in ip_list and not all(ip == "localhost" for ip in ip_list):
             raise RuntimeError(
                 "Some ranks uses localhost as IP but some does not. To establish the communication, "
@@ -310,9 +381,18 @@ class CommGroup:
         logger.debug(
             f"ZMQ IP: {local_ip}, DP port: {local_port_dp}, PP port: {local_port_pp}"
         )
-
         return list(zip(ip_list, port_dp_list, port_pp_list))
 
     def destroy(self):
-        torch.distributed.destroy_process_group(self.gpu_group)
-        torch.distributed.destroy_process_group(self.cpu_group)
+        if self.gpu_group and type(self.gpu_group) != SingletonGroupPlaceholder:
+            torch.distributed.destroy_process_group(self.gpu_group)
+
+        if self.cpu_group and type(self.cpu_group) != SingletonGroupPlaceholder:
+            torch.distributed.destroy_process_group(self.cpu_group)
+
+        if self.custom_ar_manager is not None:
+            try:
+                self.custom_ar_manager.close()
+            except Exception as e:
+                logger.warning(f"Error closing custom_ar_manager: {e}")
+            self.custom_ar_manager = None

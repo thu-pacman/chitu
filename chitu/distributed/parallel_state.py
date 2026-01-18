@@ -192,8 +192,12 @@ def initialize_tp_group(
     global _TP_GROUP
     assert _TP_GROUP is None
     _TP_GROUP = CommGroup(
-        get_tp_rank_lists(tp_size=tp_size, world_size=world_size), rank, local_rank
+        get_tp_rank_lists(tp_size=tp_size, world_size=world_size),
+        rank,
+        local_rank,
+        enable_custom_allreduce=True,
     )
+    logger.info(f"tp group: {_TP_GROUP}")
 
 
 def initialize_pp_group(

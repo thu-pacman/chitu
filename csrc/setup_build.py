@@ -46,8 +46,12 @@ def get_extensions():
         cxx_extra_args.append("-D_GLIBCXX_USE_CXX11_ABI=0")
         nvcc_extra_args.append("-D_GLIBCXX_USE_CXX11_ABI=0")
 
+    muxi_build = os.environ.get("CHITU_MUXI_BUILD", "0").strip()
+    ascend_build = os.environ.get("CHITU_ASCEND_BUILD", "0").strip()
+
     enable_nvfp4 = os.environ.get("ENABLE_NVFP4", "0") == "1"
-    enable_marlin = os.environ.get("CHITU_MUXI_BUILD", "0") == "0"
+    enable_marlin = muxi_build == "0"
+    enable_custom_all_reduce = (muxi_build == "0") and (ascend_build == "0")
 
     if enable_nvfp4:
         cutlass_path = os.path.join(this_dir, "../third_party/cutlass")
@@ -76,6 +80,11 @@ def get_extensions():
             os.path.join(this_dir, "cuda/marlin/marlin_group_gemm/fp16_kernel_moe.cu"),
         ]
 
+    if enable_custom_all_reduce:
+        extra_sources += [
+            os.path.join(this_dir, "cuda/allreduce/vllm_custom_all_reduce.cu"),
+        ]
+
     return [
         CUDAExtension(
             name="chitu_backend",
@@ -98,12 +107,14 @@ def get_extensions():
                 "cxx": ["-std=c++17"] + cxx_extra_args,
                 "nvcc": ["-std=c++17"] + nvcc_extra_args,
             },
+            extra_link_args=["-lcuda"],
             define_macros=[
                 ("CHITU_MUXI_BUILD", os.environ.get("CHITU_MUXI_BUILD", "0")),
             ],
             include_dirs=[
                 os.path.join(this_dir, "../third_party/spdlog/include"),
                 os.path.join(this_dir, "cuda/common"),
+                os.path.join(this_dir, "cuda/allreduce"),
             ]
             + extra_include_dirs,
         )
