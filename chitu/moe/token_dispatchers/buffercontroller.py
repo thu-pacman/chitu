@@ -24,7 +24,7 @@ class DeepEPBuffer:
     #
     # From https://github.com/deepseek-ai/DeepEP/blob/main/README.md
     @classmethod
-    def get_deepep_buffer(
+    def get_and_cache_deepep_buffer(
         cls,
         group: dist.ProcessGroup,
         hidden_size: int,
@@ -33,6 +33,16 @@ class DeepEPBuffer:
         deepep_mode="deepep-normal",
         num_experts: int = None,
     ):
+        """
+        Get and cache DeepEP buffer.
+
+        Intialize a DeepEP buffer if there is no cache, otherwise return the cached buffer.
+        If you want a different buffer, for example when your arguments change, please first
+        call `destroy_cached_buffer` and then call `get_and_cache_deepep_buffer` again.
+        Ranks calling `destroy_cached_buffer` should be consistent with ranks calling
+        `get_and_cache_deepep_buffer` for the buffer being destroyed.
+        """
+
         if cls._buffer is not None:
             return cls._buffer
 
@@ -44,7 +54,7 @@ class DeepEPBuffer:
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode in ["auto", "deepep-normal"]:
-            hidden_bytes = hidden_size * 2
+            hidden_bytes = hidden_size * param_bytes
             for config in (
                 deep_ep.Buffer.get_dispatch_config(group.size()),
                 deep_ep.Buffer.get_combine_config(group.size()),
@@ -92,8 +102,22 @@ class DeepEPBuffer:
     # SPDX-SnippetEnd
 
     @classmethod
+    def destroy_cached_buffer(cls):
+        """
+        Destroy DeepEP buffer cached by `get_and_cache_deepep_buffer`.
+
+        This function must be called when you want to re-initialize a new DeepEP buffer
+        when your arguments change.
+
+        Ranks calling `destroy_cached_buffer` should be consistent with ranks calling
+        `get_and_cache_deepep_buffer` for the buffer being destroyed.
+        """
+
+        cls._buffer = None
+
+    @classmethod
     def clean_buffer(cls):
-        if not cls._buffer.low_latency_mode:
+        if cls._buffer is None or not cls._buffer.low_latency_mode:
             return
         cls._buffer.clean_low_latency_buffer(
             cls._lowlatency_num_max_dispatch_tokens_per_rank,

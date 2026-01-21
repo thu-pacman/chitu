@@ -42,7 +42,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # - matplotlib is for benchmarks/op_bench (for platforms with triton).
 RUN if [ "${enable_test}" = "true" ]; then \
     apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping curl && \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp matplotlib; \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp lark-oapi matplotlib; \
 fi
 
 # Always install build time dependencies. Some dependencies may fail to build

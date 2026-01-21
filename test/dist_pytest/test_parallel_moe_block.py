@@ -15,9 +15,10 @@ from chitu.distributed.parallel_state import (
     get_ep_rank_lists,
 )
 from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
-from chitu.device_type import has_native_fp8
+from chitu.device_type import has_native_fp8, is_ascend
 from chitu.task_type import TaskType
 from chitu.moe import MoEImplEP, MoEImplNoEP
+from chitu.moe.token_dispatchers.buffercontroller import DeepEPBuffer
 from chitu.global_vars import set_global_args
 from chitu.utils import ceil_div
 from chitu.testing import assert_close
@@ -29,9 +30,8 @@ from chitu.testing import assert_close
         [1, 1, 1, 1],  # Serial
         [2, 1, 2, 1],  # TP2 + ETP2
         [2, 1, 1, 2],  # TP2 + EP2
-        # TODO: Enable the following:
-        # [1, 2, 1, 2],  # DP2 + EP2
-        # [2, 2, 1, 4],  # TP2 * DP2 + EP4
+        [1, 2, 1, 2],  # DP2 + EP2
+        [2, 2, 1, 4],  # TP2 * DP2 + EP4
     ],
 )
 @pytest.mark.parametrize("batch_size", [0, 1, 16])
@@ -58,6 +58,9 @@ def test_parallel_moe_block(
     task_type,
     dtype,
 ):
+    if is_ascend() and dp_size > 1 and ep_size > 1:
+        pytest.skip("Unit test of DP+EP is not implemented yet on Ascend")
+
     set_global_args(
         OmegaConf.create(
             {
@@ -298,6 +301,8 @@ def test_parallel_moe_block(
         ref_local_y = ref_y[dp_token_start:dp_token_end]
 
         assert_close(local_y, ref_local_y, cos_sim_tol=0.002)
+
+        DeepEPBuffer.destroy_cached_buffer()
 
     torch.distributed.barrier(
         device_ids=[torch.cuda.current_device()]
@@ -651,6 +656,8 @@ def test_parallel_moe_block_blockfp8(
         ref_local_y = ref_y[dp_token_start:dp_token_end]
 
         assert_close(local_y, ref_local_y, cos_sim_tol=0.002)
+
+        DeepEPBuffer.destroy_cached_buffer()
 
     torch.distributed.barrier(
         device_ids=[torch.cuda.current_device()]

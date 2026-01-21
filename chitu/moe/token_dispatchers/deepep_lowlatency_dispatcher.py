@@ -105,7 +105,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
 
     def prepare_deepep_buffer(self):
         DeepEPBuffer.set_dispatch_mode_as_low_latency()
-        self._buffer = DeepEPBuffer.get_deepep_buffer(
+        self._buffer = DeepEPBuffer.get_and_cache_deepep_buffer(
             self.ep_group.gpu_group,
             self.hidden,
             self.max_bs_per_dp_rank,
