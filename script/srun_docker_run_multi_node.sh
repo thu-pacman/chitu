@@ -27,14 +27,6 @@ NUM_GPUS=$2
 CPUS_PER_GPU=24
 MEM_PER_GPU=242144
 
-# 计算总的CPU和内存
-if [ -z "${NUM_CPUS}" ]; then
-    NUM_CPUS=$((NUM_GPUS * ${CPUS_PER_GPU}))
-fi
-if [ -z "${NUM_MEMS}" ]; then
-    NUM_MEMS=$((NUM_GPUS * ${MEM_PER_GPU}))
-fi
-
 THIS_SCRIPT=$(realpath $0)
 
 if [[ "$3" != "--node" ]]; then
@@ -56,7 +48,27 @@ if [[ "$3" != "--node" ]]; then
         DOCKER_AND_TORCHRUN_ARGS=("${SRUN_AND_DOCKER_AND_TORCHRUN_ARGS[@]:$DELIMITER_1_POS+1}")
     fi
 
-    PARAMS="--job-name $JOB_NAME --nodes $NODES --ntasks-per-node $NTASKS_PER_NODE --cpus-per-task $NUM_CPUS --mem $NUM_MEMS --gres=gpu:$NUM_GPUS ${SRUN_ARGS[@]}"
+    # 计算总的CPU和内存
+    MAX_CPUS=$(sinfo --noheader -o "%c" | grep -oE "[0-9]+")
+    MAX_MEM=$(sinfo --noheader -o "%m" | grep -oE "[0-9]+")
+    if [ -z "${NUM_CPUS}" ]; then
+        NUM_CPUS=$((NUM_GPUS * ${CPUS_PER_GPU}))
+        NUM_CPUS=$((NUM_CPUS < MAX_CPUS ? NUM_CPUS : MAX_CPUS))
+    fi
+    if [ -z "${NUM_MEMS}" ]; then
+        NUM_MEMS=$((NUM_GPUS * ${MEM_PER_GPU}))
+        NUM_MEMS=$((NUM_MEMS < MAX_MEM ? NUM_MEMS : MAX_MEM))
+    fi
+
+    PARAMS="--job-name $JOB_NAME --nodes $NODES --ntasks-per-node $NTASKS_PER_NODE --cpus-per-task $NUM_CPUS --mem $NUM_MEMS"
+    if sinfo --noheader -o "%G" | grep -q "gpu:"; then
+        echo "Detected GRES gpu in Slurm, allocating resources with --gres=gpu:$NUM_GPUS"
+        PARAMS="$PARAMS --gres=gpu:$NUM_GPUS"
+    else
+        echo "No supported GRES detected in Slurm, allocating nodes exclusively"
+        PARAMS="$PARAMS --exclusive"
+    fi
+    PARAMS="$PARAMS ${SRUN_ARGS[@]}"
     exec srun $PARAMS $THIS_SCRIPT $1 $2 --node "${DOCKER_AND_TORCHRUN_ARGS[@]}"
 fi
 
@@ -99,23 +111,45 @@ IB_ENV_ARGS=()
 [ -n "$NVSHMEM_HCA_LIST" ] && IB_ENV_ARGS+=("-e" "NVSHMEM_HCA_LIST=$NVSHMEM_HCA_LIST")
 [ -n "$GLOO_SOCKET_IFNAME" ] && IB_ENV_ARGS+=("-e" "GLOO_SOCKET_IFNAME=$GLOO_SOCKET_IFNAME")
 [ -n "$NCCL_SOCKET_IFNAME" ] && IB_ENV_ARGS+=("-e" "NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME")
+[ -n "$HCCL_SOCKET_IFNAME" ] && IB_ENV_ARGS+=("-e" "HCCL_SOCKET_IFNAME=$HCCL_SOCKET_IFNAME")
 [ -n "$NVSHMEM_IB_DEVICE" ] && IB_ENV_ARGS+=("-e" "NVSHMEM_IB_DEVICE=$NVSHMEM_IB_DEVICE")
 
-docker run \
-    --gpus=all \
-    --privileged \
-    --shm-size=1g \
-    --network host \
-    -e NCCL_GRAPH_MIXING_SUPPORT=0 \
-    -e NCCL_GRAPH_REGISTER=0 \
-    "${IB_ENV_ARGS[@]}" \
-    "${DOCKER_ARGS[@]}" \
-    torchrun \
-        --nnodes $SLURM_NNODES \
-        --nproc-per-node $SLURM_GPUS_ON_NODE \
-        --master_addr $MASTER_ADDR \
-        --master_port $MASTER_PORT \
-        --rdzv-endpoint $MASTER_ADDR:$RDVZ_PORT \
-        --rdzv-backend=c10d \
-        --rdzv-id $RDVZ_ID \
-        "${TORCHRUN_ARGS[@]}"
+DOCKER_RUN_CMD="docker run --network host"
+if which nvidia-smi >/dev/null 2>&1; then
+    DOCKER_RUN_CMD="${DOCKER_RUN_CMD} \
+        --gpus=all \
+        --privileged \
+        --shm-size=1g \
+        -e NCCL_GRAPH_MIXING_SUPPORT=0 \
+        -e NCCL_GRAPH_REGISTER=0 "
+elif which npu-smi >/dev/null 2>&1; then
+    DOCKER_RUN_CMD="${DOCKER_RUN_CMD} \
+        --privileged \
+        --device /dev/devmm_svm \
+        --device /dev/hisi_hdc \
+        -v /usr/local/dcmi:/usr/local/dcmi \
+        -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+        -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+        -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+        -v /etc/ascend_install.info:/etc/ascend_install.info"
+    # Mount files including /dev/davinci{integer} and /dev/davinci_manager
+    for dev in /dev/davinci*; do
+        DOCKER_RUN_CMD="${DOCKER_RUN_CMD} -v $dev:$dev"
+    done
+else
+    echo "No supported type of devices detected"
+    exit -1
+fi
+
+FULL_CMD="${DOCKER_RUN_CMD} ${IB_ENV_ARGS[@]} ${DOCKER_ARGS[@]} torchrun \
+    --nnodes $SLURM_NNODES \
+    --nproc-per-node $NUM_GPUS \
+    --master_addr $MASTER_ADDR \
+    --master_port $MASTER_PORT \
+    --rdzv-endpoint $MASTER_ADDR:$RDVZ_PORT \
+    --rdzv-backend=c10d \
+    --rdzv-id $RDVZ_ID \
+    ${TORCHRUN_ARGS[@]}"
+
+echo "Executing command: $FULL_CMD"
+exec $FULL_CMD

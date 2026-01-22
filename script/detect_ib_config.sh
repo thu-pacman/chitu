@@ -112,10 +112,12 @@ auto_configure_ib() {
     if [ $? -eq 0 ] && [ -n "$ib_iface" ]; then
         export GLOO_SOCKET_IFNAME="$ib_iface"
         export NCCL_SOCKET_IFNAME="$ib_iface"
+        export HCCL_SOCKET_IFNAME="$ib_iface"
         export NVSHMEM_IB_DEVICE="$ib_iface"
         echo "Detected IB network interface: $ib_iface" >&2
         echo "Set GLOO_SOCKET_IFNAME=$ib_iface" >&2
         echo "Set NCCL_SOCKET_IFNAME=$ib_iface" >&2
+        echo "Set HCCL_SOCKET_IFNAME=$ib_iface" >&2
         echo "Set NVSHMEM_IB_DEVICE=$ib_iface" >&2
     fi
 
