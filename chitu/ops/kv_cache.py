@@ -105,6 +105,7 @@ def append_to_dense_kv_cache(
     this_kv: torch.Tensor,
     delta_position_ids: torch.Tensor,
     delta_seq_ids: Optional[torch.Tensor] = None,
+    use_i64_offsets: bool = False,
     impl: str = "auto",
 ):
     """
@@ -131,7 +132,7 @@ def append_to_dense_kv_cache(
     if impl == "triton":
         assert has_triton
         append_to_dense_kv_cache_triton(
-            kv_cache, this_kv, delta_position_ids, delta_seq_ids
+            kv_cache, this_kv, delta_position_ids, delta_seq_ids, use_i64_offsets
         )
     elif impl == "torch":
         append_to_dense_kv_cache_torch(
@@ -228,6 +229,11 @@ def append_to_dense_kv_cache_torch_npu(
     delta_position_ids: torch.Tensor,  # (num_tokens,)
     delta_seq_ids: Optional[torch.Tensor] = None,  # (num_tokens,)
 ):
+    if delta_seq_ids is None and kv_cache.shape[0] != delta_position_ids.shape[0]:
+        raise ValueError(
+            f"batch_size ({kv_cache.shape[0]}) must be equal to num_tokens "
+            f"({delta_position_ids.shape[0]}) if ignoring delta_seq_ids"
+        )
     if this_kv.numel() == 0:
         return
 

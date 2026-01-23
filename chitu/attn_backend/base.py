@@ -366,6 +366,7 @@ class AttnBackend(abc.ABC):
                 k.contiguous(),
                 seq_len_delta.delta_position_ids_tensor_device,
                 seq_len_delta.delta_seq_ids_tensor_device,
+                kv_cache.use_i64_offsets,
             )
             if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefill
                 k = read_from_dense_kv_cache(
@@ -380,6 +381,7 @@ class AttnBackend(abc.ABC):
                 v.contiguous(),
                 seq_len_delta.delta_position_ids_tensor_device,
                 seq_len_delta.delta_seq_ids_tensor_device,
+                kv_cache.use_i64_offsets,
             )
             if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefill
                 v = read_from_dense_kv_cache(
