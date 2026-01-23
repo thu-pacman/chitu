@@ -422,9 +422,20 @@ class Task(ConstraintDecodeTask):
             self.grammar = req.grammar
         else:
             self.grammar_str = grammar_str
-            self.grammar = Backend.constraint_decode_manager.deserialize_grammar(
-                grammar_str
-            )
+            # Only deserialize grammar if grammar_str is not empty
+            # This allows creating Task without Backend being fully initialized (e.g., in tests)
+            if grammar_str:
+                constraint_decode_manager = getattr(
+                    Backend, "constraint_decode_manager", None
+                )
+                if constraint_decode_manager is not None:
+                    self.grammar = constraint_decode_manager.deserialize_grammar(
+                        grammar_str
+                    )
+                else:
+                    self.grammar = None
+            else:
+                self.grammar = None
 
         self.prefill_chunk_size: Optional[int] = (
             None  # Dynamic in Task, but adds up to be no higher than a static bound in PackedTasks
@@ -432,7 +443,9 @@ class Task(ConstraintDecodeTask):
         self.consumed_req_tokens = 0
 
         # Response
-        if get_global_args().infer.op_impl == "cpu":
+        # Use getattr for safe access in test environments where infer config may be incomplete
+        op_impl = getattr(get_global_args().infer, "op_impl", None)
+        if op_impl == "cpu":
             self.response = DeviceList([], dtype=torch.long, device="cpu")
         else:
             self.response = DeviceList([], dtype=torch.long, device="cuda")
@@ -897,15 +910,13 @@ class SerializedPackedTasksPayloadType(Enum):
     EmptyDecode = 4
     TerminateBackend = 5
     EndTask = 6
-    Heartbeat = 7
-    Remove = 8
+    Remove = 7
     NoneType = -1
 
 
 def is_empty_payload(payload_type: SerializedPackedTasksPayloadType):
     return payload_type in [
         SerializedPackedTasksPayloadType.TerminateBackend,
-        SerializedPackedTasksPayloadType.Heartbeat,
         SerializedPackedTasksPayloadType.EmptyPrefill,
         SerializedPackedTasksPayloadType.EmptyDecode,
     ]
@@ -923,13 +934,11 @@ def is_normal_payload(payload_type: SerializedPackedTasksPayloadType):
 @dataclass
 class PackedTasksBase:
     """
-    Serializable part of PackedTasks
+    Base class for PackedTasks with serializable fields.
 
-    Serialization format:
-
-    ```
-    | payload type | task type | slot id | task_id * max_num_tasks | lens * max_num_tasks | has_output * max_num_tasks |
-    ```
+    Used for:
+    - TP metadata dispatch (via MetadataSerializer)
+    - PP/DP metadata dispatch (via MetadataSerializer)
     """
 
     # Class variables (please mark them with ClassVar)
@@ -955,147 +964,6 @@ class PackedTasksBase:
         assert not PackedTasksBase.configured, "PackedTasksBase cannot be reconfigured"
         PackedTasksBase.configured = True
         PackedTasksBase.max_num_tasks = max_num_tasks
-
-    @classmethod
-    def deserialize(cls, task_tensor):
-        assert (
-            cls.configured
-        ), "PackedTasksBase must be configured before deserialization"
-
-        if not Backend.use_gloo:
-            task_tensor = task_tensor.cpu()
-        payload_type = SerializedPackedTasksPayloadType(task_tensor[0].item())
-
-        num_tokens = 0
-        num_tasks = 0
-        task_ids = []
-        req_ids = []
-        task_type = None
-        tokens = []
-        has_outputs = []
-        has_model_run = []
-
-        if is_normal_payload(payload_type):
-            task_type = TaskType(payload_type.value)
-        else:
-            task_type = None
-
-        if not is_empty_payload(payload_type):
-            decoded_ids = []
-            decoded_types = []
-            lens = []
-            for it in range(cls.max_num_tasks):
-                task_id = task_tensor[2 + it].item()
-                if task_id == 0:
-                    break
-                decoded_id, decoded_type = req_decode(task_id)
-                decoded_ids.append(decoded_id)
-                decoded_types.append(decoded_type)
-                if decoded_type == TaskType.Prefill:
-                    lens.append(int(task_tensor[2 + cls.max_num_tasks + it]))
-                    has_outputs.append(
-                        task_tensor[2 + 2 * cls.max_num_tasks + it].bool().item()
-                    )
-                elif decoded_type == TaskType.Decode:
-                    has_model_run.append(
-                        task_tensor[2 + cls.max_num_tasks + it].bool().item()
-                    )
-            task_ids = decoded_ids
-            req_ids = task_ids
-            num_tasks = len(task_ids)
-            if num_tasks > 0:
-                # TODO: need to change task type classification when adding hybrid task
-                if task_type == TaskType.Prefill:
-                    tokens = [([0] * lens[it]) for it in range(len(lens))]
-
-            num_tokens = (
-                sum(len(it) for it in tokens)
-                if task_type == TaskType.Prefill
-                else num_tasks
-            )
-
-            slot_handle = get_slot_handle()
-            if slot_handle:
-                slot_handle.set_slot_idx(task_tensor[1].item())
-
-        return payload_type, cls(
-            num_tasks=num_tasks,
-            task_ids=task_ids,
-            req_ids=req_ids,
-            task_type=task_type,
-            tokens=tokens,
-            num_tokens=num_tokens,
-            payload_type=payload_type,
-            has_outputs=has_outputs,
-            has_model_run=has_model_run,
-        )
-
-    def serialize(self, device):
-        payload_type = self.payload_type
-        assert (
-            PackedTasksBase.configured
-        ), "PackedTasksBase must be configured before serialization"
-
-        ret = PackedTasksBase.empty_serialization(device="cpu")
-        ret[0] = payload_type.value
-
-        # special payload
-        if is_empty_payload(payload_type):
-            return ret.to(device)
-
-        encoded_ids = torch.tensor(
-            [req_encode(self.task_type, tid) for tid in self.task_ids],
-            dtype=ret.dtype,
-            device="cpu",
-        )
-        ret[torch.arange(2, 2 + self.num_tasks, device="cpu")] = encoded_ids
-
-        if self.task_type == TaskType.Prefill:
-            token_lengths = torch.tensor(
-                [len(tokens) for tokens in self.tokens],
-                device="cpu",
-            )
-            offset = 2 + PackedTasksBase.max_num_tasks
-            ret[torch.arange(offset, offset + self.num_tasks, device="cpu")] = (
-                token_lengths
-            )
-            offset = 2 + 2 * PackedTasksBase.max_num_tasks
-            ret[torch.arange(offset, offset + self.num_tasks, device="cpu")] = (
-                torch.tensor(self.has_outputs, device="cpu", dtype=torch.int64)
-            )
-        elif self.task_type == TaskType.Decode:
-            offset = 2 + PackedTasksBase.max_num_tasks
-            ret[torch.arange(offset, offset + self.num_tasks, device="cpu")] = (
-                torch.tensor(self.has_model_run, device="cpu", dtype=torch.int64)
-            )
-
-        slot_handle = get_slot_handle()
-        if slot_handle:
-            ret[1] = slot_handle.get_slot_idx()
-
-        return ret.to(device)
-
-    @classmethod
-    def serialize_special(cls, payload_type: SerializedPackedTasksPayloadType, device):
-        assert (
-            cls.configured
-        ), "PackedTasksBase must be configured before serialize_special"
-
-        ret = cls.empty_serialization(device=device)
-        ret[0] = payload_type.value
-        return ret
-
-    @classmethod
-    def empty_serialization(cls, device):
-        assert (
-            cls.configured
-        ), "PackedTasksBase must be configured before empty_serialization"
-
-        # TODO: We should use torch.empty instead, but we now assume there is a `0`
-        # indicating the end of tasks
-        return torch.zeros(
-            (2 + cls.max_num_tasks * 3,), dtype=torch.int64, device=device
-        )
 
     def update_by_decode_status(self):
         if self.task_type == TaskType.Decode:
@@ -1161,7 +1029,8 @@ class PackedTasks(PackedTasksBase):
         # metadata
         self.rank = rank
         args = get_global_args()
-        if args.infer.op_impl == "cpu":
+        # Use getattr for safe access in test environments where infer config may be incomplete
+        if getattr(args.infer, "op_impl", None) == "cpu":
             self.rank = "cpu"
         self.task_ids = task_ids
         self.num_tasks = len(task_ids)
@@ -1224,7 +1093,8 @@ class PackedTasks(PackedTasksBase):
 
         if self.should_apply_frequency_penalty:
             if PackedTasksBase.response_list_manager is None:
-                if args.infer.op_impl == "cpu":
+                # Use getattr for safe access in test environments where infer config may be incomplete
+                if getattr(args.infer, "op_impl", None) == "cpu":
                     PackedTasksBase.response_list_manager = StaticDeviceListManager(
                         max_num_rows=args.infer.max_reqs,
                         max_num_cols=args.infer.max_seq_len,

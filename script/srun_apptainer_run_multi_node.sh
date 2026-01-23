@@ -27,14 +27,6 @@ NUM_GPUS=$2
 CPUS_PER_GPU=24
 MEM_PER_GPU=242144
 
-# 计算总的CPU和内存
-if [ -z "${NUM_CPUS}" ]; then
-    NUM_CPUS=$((NUM_GPUS * ${CPUS_PER_GPU}))
-fi
-if [ -z "${NUM_MEMS}" ]; then
-    NUM_MEMS=$((NUM_GPUS * ${MEM_PER_GPU}))
-fi
-
 THIS_SCRIPT=$(realpath $0)
 
 if [[ "$3" != "--node" ]]; then
@@ -56,7 +48,27 @@ if [[ "$3" != "--node" ]]; then
         APPTAINER_AND_TORCHRUN_ARGS=("${SRUN_AND_APPTAINER_AND_TORCHRUN_ARGS[@]:$DELIMITER_1_POS+1}")
     fi
 
-    PARAMS="--job-name $JOB_NAME --nodes $NODES --ntasks-per-node $NTASKS_PER_NODE --cpus-per-task $NUM_CPUS --mem $NUM_MEMS --gres=gpu:$NUM_GPUS ${SRUN_ARGS[@]}"
+    # 计算总的CPU和内存
+    MAX_CPUS=$(sinfo --noheader -o "%c" | grep -oE "[0-9]+")
+    MAX_MEM=$(sinfo --noheader -o "%m" | grep -oE "[0-9]+")
+    if [ -z "${NUM_CPUS}" ]; then
+        NUM_CPUS=$((NUM_GPUS * ${CPUS_PER_GPU}))
+        NUM_CPUS=$((NUM_CPUS < MAX_CPUS ? NUM_CPUS : MAX_CPUS))
+    fi
+    if [ -z "${NUM_MEMS}" ]; then
+        NUM_MEMS=$((NUM_GPUS * ${MEM_PER_GPU}))
+        NUM_MEMS=$((NUM_MEMS < MAX_MEM ? NUM_MEMS : MAX_MEM))
+    fi
+
+    PARAMS="--job-name $JOB_NAME --nodes $NODES --ntasks-per-node $NTASKS_PER_NODE --cpus-per-task $NUM_CPUS --mem $NUM_MEMS"
+    if sinfo --noheader -o "%G" | grep -q "gpu:"; then
+        echo "Detected GRES gpu in Slurm, allocating resources with --gres=gpu:$NUM_GPUS"
+        PARAMS="$PARAMS --gres=gpu:$NUM_GPUS"
+    else
+        echo "No supported GRES detected in Slurm, allocating nodes exclusively"
+        PARAMS="$PARAMS --exclusive"
+    fi
+    PARAMS="$PARAMS ${SRUN_ARGS[@]}"
     exec srun $PARAMS $THIS_SCRIPT $1 $2 --node "${APPTAINER_AND_TORCHRUN_ARGS[@]}"
 fi
 
@@ -99,6 +111,7 @@ IB_ENV_ARGS=()
 [ -n "$NVSHMEM_HCA_LIST" ] && IB_ENV_ARGS+=("--env" "NVSHMEM_HCA_LIST=$NVSHMEM_HCA_LIST")
 [ -n "$GLOO_SOCKET_IFNAME" ] && IB_ENV_ARGS+=("--env" "GLOO_SOCKET_IFNAME=$GLOO_SOCKET_IFNAME")
 [ -n "$NCCL_SOCKET_IFNAME" ] && IB_ENV_ARGS+=("--env" "NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME")
+[ -n "$HCCL_SOCKET_IFNAME" ] && IB_ENV_ARGS+=("--env" "HCCL_SOCKET_IFNAME=$HCCL_SOCKET_IFNAME")
 [ -n "$NVSHMEM_IB_DEVICE" ] && IB_ENV_ARGS+=("--env" "NVSHMEM_IB_DEVICE=$NVSHMEM_IB_DEVICE")
 
 # 检查是否需要挂载 /dev/infiniband

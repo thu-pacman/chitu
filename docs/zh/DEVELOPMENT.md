@@ -538,7 +538,7 @@ torchrun --nnodes 1 \
     request.max_new_tokens=100 \
     infer.use_cuda_graph=True
 
-# 测试服务
+# 使用 OpenAI 兼容接口测试（Chat Completions）
 curl localhost:21002/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -547,6 +547,23 @@ curl localhost:21002/v1/chat/completions \
         "role": "system",
         "content": "You are a helpful assistant."
       },
+      {
+        "role": "user",
+        "content": "What is machine learning?"
+      }
+    ]
+  }'
+```
+
+```bash
+# 使用 Anthropic 兼容接口测试（Messages API）
+curl localhost:21002/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: example_key" \
+  -d '{
+    "model": "DeepSeek-R1",
+    "max_tokens": 128,
+    "messages": [
       {
         "role": "user",
         "content": "What is machine learning?"

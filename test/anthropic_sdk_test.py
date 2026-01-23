@@ -11,9 +11,20 @@ import argparse
 import os
 import sys
 import time
+from threading import Thread
 from typing import Any, Optional
+import urllib.request
+from urllib.error import HTTPError
 
+import hydra
+import torch
 from anthropic import Anthropic  # type: ignore
+
+from chitu.chitu_main import chitu_init, warmup_engine
+from chitu.schemas import ServeConfig
+from chitu.serve.api_server import start_uvicorn
+from chitu.serve.common import start_worker
+from chitu.utils import get_config_dir_path
 
 TEST_CASES: list[dict[str, Any]] = [
     {
@@ -197,6 +208,75 @@ def _run_case(
         return False, f"---------- {name}: FAIL ({dt:.3f}s): {e} ----------"
 
 
+def _run_sdk_tests(*, base_url: str, model: str, api_key: str, max_tokens: int) -> int:
+    client = Anthropic(api_key=api_key, base_url=base_url)
+    ok = True
+    for case in TEST_CASES:
+        passed, line = _run_case(client, model=model, max_tokens=max_tokens, case=case)
+        print(line)
+        ok = ok and passed
+    return 0 if ok else 1
+
+
+def _wait_http_ready(host: str, port: int, timeout: float) -> None:
+    url = f"http://{host}:{port}/ping"
+    deadline = time.time() + timeout
+    last_err = None
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(url, method="POST")
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                if resp.status == 200:
+                    return
+        except HTTPError as e:
+            last_err = e
+        except Exception as e:
+            last_err = e
+            time.sleep(0.5)
+    raise RuntimeError(f"HTTP server not ready: {last_err}")
+
+
+@hydra.main(
+    version_base=None,
+    config_path=os.getenv("CONFIG_PATH", get_config_dir_path()),
+    config_name=os.getenv("CONFIG_NAME", "serve_config"),
+)
+def hydra_main(args: ServeConfig):
+    chitu_init(args)
+    torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+    warmup_engine(args)
+
+    import chitu.serve.api_server as api_server
+
+    api_server.server_status = True
+    worker_thread = Thread(target=start_worker, daemon=True)
+    worker_thread.start()
+
+    rank = torch.distributed.get_rank()
+    if rank == 0:
+        uvicorn_thread = Thread(target=start_uvicorn, args=(args,), daemon=True)
+        uvicorn_thread.start()
+
+        host = os.getenv("CHITU_BASE_HOST", "127.0.0.1")
+        timeout = float(os.getenv("CHITU_ANTHROPIC_TIMEOUT", "60"))
+        _wait_http_ready(host, args.serve.port, timeout)
+
+        base_url = os.getenv("CHITU_BASE_URL", f"http://{host}:{args.serve.port}")
+        api_key = os.getenv("ANTHROPIC_API_KEY", "test-api-key")
+        model = os.getenv("ANTHROPIC_MODEL", args.models.name)
+        max_tokens = int(os.getenv("MAX_TOKENS", "1024"))
+        exit_code = _run_sdk_tests(
+            base_url=base_url,
+            model=model,
+            api_key=api_key,
+            max_tokens=max_tokens,
+        )
+        if exit_code != 0:
+            raise SystemExit(exit_code)
+
+    torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Anthropic SDK integration smoke test")
     ap.add_argument(
@@ -226,18 +306,16 @@ def main() -> int:
         print(str(e), file=sys.stderr)
         return 2
 
-    client = Anthropic(api_key=api_key, base_url=base_url)
-
-    ok = True
-    for case in TEST_CASES:
-        passed, line = _run_case(
-            client, model=model, max_tokens=args.max_tokens, case=case
-        )
-        print(line)
-        ok = ok and passed
-
-    return 0 if ok else 1
+    return _run_sdk_tests(
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        max_tokens=args.max_tokens,
+    )
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if os.getenv("CHITU_START_SERVER", "false").lower() == "true":
+        hydra_main()
+    else:
+        raise SystemExit(main())

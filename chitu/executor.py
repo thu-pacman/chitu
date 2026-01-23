@@ -28,10 +28,9 @@ from chitu.task import (
     TaskCollector,
     DPTaskCollector,
     PPTaskCollector,
-    serialize_tasks,
-    deserialize_prefill_tasks,
     is_normal_payload,
 )
+from chitu.metadata_serializer import MetadataSerializer
 from chitu.distributed.parallel_state import (
     get_tp_group,
     get_tp_size,
@@ -91,6 +90,131 @@ class TasksDispatcher(ABC):
     `dispatch_metadata` on the TP dispatcher.
     """
 
+    # ip_port_list 中的端口索引
+    # (IP, TP_port, DP_port, PP_port) - 系统启动时动态分配的空闲端口
+    PORT_INDEX = {"TP": 1, "DP": 2, "PP": 3}
+
+    def _is_same_node_with_rank(self, other_rank: int) -> bool:
+        """判断当前 rank 与另一个 rank 是否在同一节点
+
+        通过 Backend.ip_port_list 中的 IP 地址判断
+
+        Args:
+            other_rank: 目标 rank 的全局 rank
+
+        Returns:
+            True: 同一节点，应使用 ipc://
+            False: 不同节点，应使用 tcp://
+        """
+        my_ip = Backend.ip_port_list[self.rank][0]
+        other_ip = Backend.ip_port_list[other_rank][0]
+        return my_ip == other_ip
+
+    def _get_zmq_urls(
+        self, rank: int, group_name: str, ipc_suffix: str = ""
+    ) -> tuple[str, str]:
+        """获取 ZMQ 的 IPC 和 TCP URL
+
+        端口使用系统启动时动态分配的空闲端口：
+        - DP: ip_port_list[rank][1] (DP_port)
+        - PP: ip_port_list[rank][2] (PP_port)
+        - TP: 只用 IPC，不需要 TCP 端口
+
+        Args:
+            rank: 目标 rank
+            group_name: dispatcher 类型 ("TP", "DP", "PP")
+            ipc_suffix: IPC 路径的额外后缀（用于 PP 的点对点连接）
+
+        Returns:
+            (ipc_url, tcp_url)
+        """
+        ipc_path = f"/tmp/chitu_{group_name}_{rank}{ipc_suffix}.ipc"
+        ipc_url = f"ipc://{ipc_path}"
+        ip_port_info = Backend.ip_port_list[rank]
+        tcp_addr = ip_port_info[0]
+        # 使用动态分配的端口：DP用[1]，PP用[2]，TP不需要TCP
+        port_idx = self.PORT_INDEX.get(group_name, 1)
+        tcp_port = ip_port_info[port_idx]
+        tcp_url = f"tcp://{tcp_addr}:{tcp_port}"
+        return ipc_url, tcp_url
+
+    def _handle_special_payload(
+        self, payload_type: SerializedPackedTasksPayloadType, task_ids: list
+    ) -> PackedTasksBase:
+        """处理特殊 payload（EndTask/Remove/TerminateBackend）的公共逻辑"""
+        if payload_type == SerializedPackedTasksPayloadType.TerminateBackend:
+            return PackedTasksBase(num_tasks=0, payload_type=payload_type)
+
+        if payload_type == SerializedPackedTasksPayloadType.Remove:
+            for tid in task_ids:
+                if tid in TaskPool.pool:
+                    TaskPool.remove(tid)
+
+        self.metadata_serializer.clear_tasks(task_ids)
+        return PackedTasksBase(
+            num_tasks=len(task_ids),
+            task_ids=task_ids,
+            req_ids=task_ids,
+            task_type=TaskType.Special,
+            payload_type=payload_type,
+        )
+
+    def _init_zmq_router_dealer(
+        self,
+        group,
+        main_rank: int,
+        is_main_rank: bool,
+        rank_in_group: int,
+        group_name: str = "",
+    ):
+        """统一的 ZMQ ROUTER/DEALER 初始化
+
+        ROUTER 同时 bind ipc 和 tcp，每个 DEALER 独立判断连接方式：
+        - 同节点：ipc://（共享内存，更快）
+        - 跨节点：tcp://（网络）
+
+        Args:
+            group: 通信组
+            main_rank: 主 rank 的全局 rank
+            is_main_rank: 当前 rank 是否为主 rank
+            rank_in_group: 当前 rank 在组内的编号
+            group_name: 组名称（用于日志和路径区分）
+        """
+        self.ctx = zmq.Context.instance()
+
+        ipc_url, tcp_url = self._get_zmq_urls(main_rank, group_name)
+        ipc_path = ipc_url.replace("ipc://", "")
+
+        if is_main_rank:
+            self.socket = self.ctx.socket(zmq.ROUTER)
+            self.socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
+
+            if os.path.exists(ipc_path):
+                os.remove(ipc_path)
+            self.socket.bind(ipc_url)
+            self.socket.bind(tcp_url)
+            logger.info(f"{group_name} ROUTER bind: {ipc_url} + {tcp_url}")
+
+            for _ in range(1, group.group_size):
+                msgs = self.socket.recv_multipart()
+                logger.info(f"{group_name} zmq client {msgs[0].decode()} connected")
+                self.socket.send_multipart(msgs)
+        else:
+            self.socket = self.ctx.socket(zmq.DEALER)
+            self.socket.setsockopt(zmq.IDENTITY, f"{rank_in_group}".encode())
+
+            # 每个连接独立判断：同节点用 ipc，跨节点用 tcp
+            use_ipc = self._is_same_node_with_rank(main_rank)
+            url = ipc_url if use_ipc else tcp_url
+
+            self.socket.connect(url)
+            self.socket.send(b"connect")
+            self.socket.recv_multipart()
+            logger.info(f"{group_name} DEALER connected: {url}")
+
+        group.barrier()
+        logger.info(f"{group_name}Dispatcher: ZMQ initialized, size={group.group_size}")
+
     @abstractmethod
     def dispatch_metadata(self, *args, **kwargs):
         """
@@ -114,6 +238,12 @@ class TasksDispatcher(ABC):
 
 
 class PipeDispatcher(TasksDispatcher):
+    """PP (Pipeline Parallelism) Dispatcher
+
+    使用 ZMQ PUSH/PULL 模式（点对点，单向流水线传输）
+    协议选择：自动根据相邻 stages 是否同节点选择 ipc:// 或 tcp://
+    """
+
     def __init__(self):
         super().__init__()
         self.pp_group = get_pp_group()
@@ -136,21 +266,63 @@ class PipeDispatcher(TasksDispatcher):
         )
         self.device = torch.cuda.current_device()
 
-        self.init_zmq()
+        # TP Main Rank 标记
+        self.is_tp_main_rank = get_tp_group().is_first_rank
 
-    def init_zmq(self):
+        # PP 使用 PUSH/PULL 模式（仅在 TP Main Rank 上初始化）
+        self._init_zmq_push_pull()
+
+        # 初始化统一的 metadata serializer
+        self.metadata_serializer = MetadataSerializer()
+
+    def _init_zmq_push_pull(self):
+        """初始化 ZMQ 通信（PUSH/PULL 模式，用于 PP 流水线）
+
+        PP 使用点对点的 PUSH/PULL（与 TP/DP 的 ROUTER/DEALER 不同）：
+        - Stage N PUSH bind → Stage N+1 PULL connect
+        - 每个连接独立判断使用 ipc:// 或 tcp://
+
+        注意：Metadata 通信仅在 TP Main Ranks 之间进行
+        """
+        if not self.is_tp_main_rank:
+            return
+
         self.ctx = zmq.Context.instance()
+
         if not self.is_last_stage:
-            self.send_addr, _, self.send_port = Backend.ip_port_list[self.rank]
-            self.send_url = f"tcp://{self.send_addr}:{self.send_port}"
+            # 使用统一的 URL 生成逻辑（带后缀区分不同连接）
+            use_ipc = self._is_same_node_with_rank(self.next_rank)
+            ipc_url, tcp_url = self._get_zmq_urls(
+                self.rank, "PP", f"_to_{self.next_rank}"
+            )
+            self.send_url = ipc_url if use_ipc else tcp_url
+
+            # 清理旧 ipc 文件
+            if use_ipc:
+                ipc_path = ipc_url.replace("ipc://", "")
+                if os.path.exists(ipc_path):
+                    os.remove(ipc_path)
+
             self.send_socket = self.ctx.socket(zmq.PUSH)
             self.send_socket.bind(self.send_url)
+            logger.info(
+                f"PP stage {self.rank} → {self.next_rank}: "
+                f"{'ipc://' if use_ipc else 'tcp://'}"
+            )
 
         if not self.is_first_stage:
-            self.recv_addr, _, self.recv_port = Backend.ip_port_list[self.prev_rank]
-            self.recv_url = f"tcp://{self.recv_addr}:{self.recv_port}"
+            use_ipc = self._is_same_node_with_rank(self.prev_rank)
+            ipc_url, tcp_url = self._get_zmq_urls(
+                self.prev_rank, "PP", f"_to_{self.rank}"
+            )
+            self.recv_url = ipc_url if use_ipc else tcp_url
+
             self.recv_socket = self.ctx.socket(zmq.PULL)
             self.recv_socket.connect(self.recv_url)
+            logger.info(
+                f"PP stage {self.prev_rank} → {self.rank}: "
+                f"{'ipc://' if use_ipc else 'tcp://'}"
+            )
 
         self.pp_group.barrier()
 
@@ -159,107 +331,84 @@ class PipeDispatcher(TasksDispatcher):
     ) -> Optional[
         tuple[SerializedPackedTasksPayloadType, PackedTasks | PackedTasksBase]
     ]:
+        """统一的 metadata dispatch（使用 msgpack + ZMQ tcp://）"""
+
+        # 非 TP Main Rank 不参与 PP Metadata 通信
+        if not self.is_tp_main_rank:
+            if tasks is not None:
+                return tasks.payload_type, tasks
+            return None
+
         # recv task from previous stage
         if self.is_first_stage:
             payload_type = tasks.payload_type
         else:
             msgs = self.recv_socket.recv_multipart()
-            payload_type = SerializedPackedTasksPayloadType[msgs[0].decode()]
+            payload_type_name = msgs[0].decode()
+            payload_type = SerializedPackedTasksPayloadType[payload_type_name]
+
+            # 使用统一的序列化器处理 Prefill 和 Decode
             if payload_type in [
                 SerializedPackedTasksPayloadType.Prefill,
                 SerializedPackedTasksPayloadType.EmptyPrefill,
-            ]:
-                tasks = deserialize_prefill_tasks(msgs[1])
-                slot_handle = get_slot_handle()
-                if slot_handle:
-                    slot_idx = msgpack.unpackb(msgs[2])
-                    slot_handle.set_slot_idx(slot_idx)
-            elif payload_type in [
                 SerializedPackedTasksPayloadType.Decode,
                 SerializedPackedTasksPayloadType.EmptyDecode,
             ]:
-                task_ids = msgpack.unpackb(msgs[1])
-                if len(task_ids) > 0:
-                    task_list = [TaskPool.pool[task_id] for task_id in task_ids]
-                    decode_status_list = msgpack.unpackb(msgs[2])
-                    for it, task in enumerate(task_list):
-                        task._decode_status = TaskDecodeType(
-                            value=decode_status_list[it]
-                        )
-                    tasks = PackedTasks([], tasks=task_list)
-                    slot_handle = get_slot_handle()
-                    if slot_handle:
-                        slot_idx = msgpack.unpackb(msgs[3])
-                        slot_handle.set_slot_idx(slot_idx)
-                else:
-                    tasks = PackedTasks([], empty_task_type=TaskType.EmptyDecode)
+                # 使用统一接口反序列化
+                is_prefill = payload_type in [
+                    SerializedPackedTasksPayloadType.Prefill,
+                    SerializedPackedTasksPayloadType.EmptyPrefill,
+                ]
+                _, tasks, slot_idx = self.metadata_serializer.deserialize_metadata(
+                    msgs[1], require_task_creation=is_prefill
+                )
+
+                # 设置 slot_idx
+                slot_handle = get_slot_handle()
+                if slot_handle and slot_idx is not None:
+                    slot_handle.set_slot_idx(slot_idx)
+
             elif payload_type in (
                 SerializedPackedTasksPayloadType.EndTask,
                 SerializedPackedTasksPayloadType.Remove,
+                SerializedPackedTasksPayloadType.TerminateBackend,
             ):
-                task_ids = msgpack.unpackb(msgs[1])
-                if payload_type == SerializedPackedTasksPayloadType.Remove:
-                    for tid in task_ids:
-                        if tid in TaskPool.pool:
-                            TaskPool.remove(tid)
-                tasks = PackedTasksBase(
-                    num_tasks=len(task_ids),
-                    task_ids=task_ids,
-                    req_ids=task_ids,
-                    task_type=TaskType.Special,
-                    payload_type=payload_type,
-                )
+                task_ids = msgpack.unpackb(msgs[1]) if len(msgs) > 1 else []
+                tasks = self._handle_special_payload(payload_type, task_ids)
                 slot_handle = get_slot_handle()
-                if slot_handle:
-                    slot_idx = msgpack.unpackb(msgs[2])
-                    slot_handle.set_slot_idx(slot_idx)
-            elif payload_type == SerializedPackedTasksPayloadType.Heartbeat:
-                tasks = PackedTasksBase(
-                    num_tasks=0,
-                    payload_type=SerializedPackedTasksPayloadType.Heartbeat,
-                )
-            elif payload_type == SerializedPackedTasksPayloadType.TerminateBackend:
-                tasks = PackedTasksBase(
-                    num_tasks=0,
-                    payload_type=SerializedPackedTasksPayloadType.TerminateBackend,
-                )
+                if slot_handle and len(msgs) > 2:
+                    slot_handle.set_slot_idx(msgpack.unpackb(msgs[2]))
             else:
                 raise ValueError(f"Unknown payload type: {payload_type}")
 
-        if not self.is_last_stage:
+        # send task to next stage
+        if not self.is_last_stage and tasks is not None:
             if payload_type in [
                 SerializedPackedTasksPayloadType.Prefill,
                 SerializedPackedTasksPayloadType.EmptyPrefill,
                 SerializedPackedTasksPayloadType.Decode,
                 SerializedPackedTasksPayloadType.EmptyDecode,
             ]:
-                current_task_type = tasks.task_type
-                msgs = [
-                    current_task_type.name.encode(),
-                ]
-                if current_task_type == TaskType.Prefill:
-                    task_list = tasks.tasks
-                    msgpackable_tasks = [
-                        task.get_msgpackable_task() for task in task_list
-                    ]
-                    tasks_msg = serialize_tasks(msgpackable_tasks)
-                    msgs.append(tasks_msg)
-                elif current_task_type == TaskType.Decode:
-                    task_list = tasks.tasks
-                    task_ids = [task.task_id for task in task_list]
-                    decode_status_list = [
-                        task._decode_status.value for task in task_list
-                    ]
-                    msgs.append(msgpack.packb(task_ids))
-                    msgs.append(msgpack.packb(decode_status_list))
-                else:
-                    msgs.append(msgpack.packb([]))
+                # 使用优化的配置进行序列化
                 slot_handle = get_slot_handle()
-                if slot_handle:
-                    slot_msg = msgpack.packb(slot_handle.get_slot_idx())
-                    msgs.append(slot_msg)
+                slot_idx = slot_handle.get_slot_idx() if slot_handle else None
+
+                # 根据任务类型和进度选择最优配置
+                # 让 MetadataSerializer._auto_select_config_with_dedup 自动选择：
+                # - Prefill: 检查 consumed_req_tokens，首包用 full，后续用 incremental
+                # - Decode: 对已知任务使用精简配置（去重优化）
+                config = None
+
+                tasks_msg = self.metadata_serializer.serialize_metadata(
+                    tasks, config=config, slot_idx=slot_idx
+                )
+
+                # 发送消息：[payload_type, serialized_tasks]
+                msgs = [payload_type.name.encode(), tasks_msg]
                 self.send_socket.send_multipart(msgs)
+
             else:
+                # 处理特殊 payload (EndTask, TerminateBackend, etc.)
                 msgs = [payload_type.name.encode()]
                 if payload_type in (
                     SerializedPackedTasksPayloadType.EndTask,
@@ -271,6 +420,7 @@ class PipeDispatcher(TasksDispatcher):
                         slot_msg = msgpack.packb(slot_handle.get_slot_idx())
                         msgs.append(slot_msg)
                 self.send_socket.send_multipart(msgs)
+
         return tasks.payload_type, tasks
 
     def recv_payload(self, payload: torch.Tensor) -> torch.Tensor:
@@ -379,11 +529,15 @@ class PipeDispatcher(TasksDispatcher):
 
 
 class TensorDispatcher(TasksDispatcher):
+    """TP (Tensor Parallelism) Dispatcher"""
+
     def __init__(self):
         super().__init__()
         self.tp_group = get_tp_group()
         self.rank = self.tp_group.global_rank
         self.local_rank = self.tp_group.local_rank
+        self.rank_in_group = self.tp_group.rank_in_group
+        self.group_size = self.tp_group.group_size
 
         self.gpu_group = self.tp_group.gpu_group
         self.cpu_group = self.tp_group.cpu_group
@@ -391,27 +545,110 @@ class TensorDispatcher(TasksDispatcher):
         self.tp_main_rank = self.tp_group.rank_list[0]
         self.is_main_rank = self.tp_group.is_first_rank
 
+        # 初始化统一的 metadata serializer
+        self.metadata_serializer = MetadataSerializer()
+
+        # 使用统一的 ZMQ 初始化（自动选择 ipc:// 或 tcp://）
+        assert self.rank_in_group is not None and self.group_size is not None
+        self._init_zmq_router_dealer(
+            group=self.tp_group,
+            main_rank=self.tp_main_rank,
+            is_main_rank=self.is_main_rank,
+            rank_in_group=self.rank_in_group,
+            group_name="TP",
+        )
+
     def dispatch_metadata(
         self, tasks: Optional[PackedTasksBase]
     ) -> tuple[SerializedPackedTasksPayloadType, PackedTasksBase]:
+        """统一的 metadata dispatch（使用 msgpack + ZMQ ipc://）"""
+
         if self.is_main_rank:
-            task_tensor = tasks.serialize(
-                device="cpu" if Backend.use_gloo else self.local_rank
-            )
             payload_type = tasks.payload_type
-        else:
-            task_tensor = PackedTasksBase.empty_serialization(
-                device="cpu" if Backend.use_gloo else self.local_rank
+
+            # 检查是否是特殊 payload（非 Prefill/Decode）
+            is_normal_payload = payload_type in (
+                SerializedPackedTasksPayloadType.Prefill,
+                SerializedPackedTasksPayloadType.EmptyPrefill,
+                SerializedPackedTasksPayloadType.Decode,
+                SerializedPackedTasksPayloadType.EmptyDecode,
             )
 
-        torch.distributed.broadcast(
-            tensor=task_tensor,
-            src=self.tp_main_rank,
-            group=self.cpu_group if Backend.use_gloo else self.gpu_group,
-        )
-        if not self.is_main_rank:
-            payload_type, tasks = PackedTasksBase.deserialize(task_tensor)
-        return payload_type, tasks
+            if not is_normal_payload:
+                # 特殊 payload：直接发送 payload_type 和 task_ids
+                # TP 场景：所有 ranks 共享 slot_handle，不需要传输 slot_idx
+                for rank_in_group in range(1, self.group_size):
+                    msgs = [f"{rank_in_group}".encode(), payload_type.name.encode()]
+                    if (
+                        payload_type
+                        in (
+                            SerializedPackedTasksPayloadType.EndTask,
+                            SerializedPackedTasksPayloadType.Remove,
+                        )
+                        and tasks is not None
+                    ):
+                        msgs.append(msgpack.packb(tasks.task_ids))
+                    self.socket.send_multipart(msgs)
+                return payload_type, tasks
+
+            # 正常的 Prefill/Decode payload
+            slot_handle = get_slot_handle()
+            slot_idx = slot_handle.get_slot_idx() if slot_handle else None
+
+            # TP：使用 msgpack 序列化 PackedTasksBase 基础字段
+            # 去重优化：如果 task_ids 与上次相同，只传变化的字段
+            tasks_msg = self.metadata_serializer.serialize_metadata(
+                tasks, slot_idx=slot_idx, output_format="packed_tasks_base"
+            )
+
+            # 发送给所有 worker ranks
+            for rank_in_group in range(1, self.group_size):
+                msgs = [
+                    f"{rank_in_group}".encode(),
+                    tasks.payload_type.name.encode(),
+                    tasks_msg,
+                ]
+                self.socket.send_multipart(msgs)
+
+            return tasks.payload_type, tasks
+
+        else:
+            # 非主 rank：接收消息
+            msgs = self.socket.recv_multipart()
+            payload_type = SerializedPackedTasksPayloadType[msgs[0].decode()]
+
+            # 处理正常 payload
+            if payload_type in [
+                SerializedPackedTasksPayloadType.Prefill,
+                SerializedPackedTasksPayloadType.EmptyPrefill,
+                SerializedPackedTasksPayloadType.Decode,
+                SerializedPackedTasksPayloadType.EmptyDecode,
+            ]:
+                payload_type, tasks, slot_idx = (
+                    self.metadata_serializer.deserialize_metadata(
+                        msgs[1],
+                        require_task_creation=False,
+                        output_format="packed_tasks_base",
+                    )
+                )
+
+                # 设置 slot_idx
+                slot_handle = get_slot_handle()
+                if slot_handle and slot_idx is not None:
+                    slot_handle.set_slot_idx(slot_idx)
+
+            # 处理特殊 payload
+            elif payload_type in (
+                SerializedPackedTasksPayloadType.EndTask,
+                SerializedPackedTasksPayloadType.Remove,
+                SerializedPackedTasksPayloadType.TerminateBackend,
+            ):
+                task_ids = msgpack.unpackb(msgs[1]) if len(msgs) > 1 else []
+                tasks = self._handle_special_payload(payload_type, task_ids)
+            else:
+                raise ValueError(f"Unknown payload type: {payload_type}")
+
+            return payload_type, tasks
 
     def recv_payload(self, payload: torch.Tensor) -> torch.Tensor:
         torch.distributed.broadcast(
@@ -424,8 +661,11 @@ class TensorDispatcher(TasksDispatcher):
 
 
 class ExpertDataDispatcher(TasksDispatcher):
+    """DP (Data Parallelism) Dispatcher"""
+
     def __init__(self):
         self.dp_group = get_dp_group()
+        self.rank = self.dp_group.global_rank
         self.dp_main_rank = self.dp_group.rank_list[0]
         self.is_main_rank = self.dp_group.is_first_rank
         self.rank_in_group = self.dp_group.rank_in_group
@@ -433,68 +673,73 @@ class ExpertDataDispatcher(TasksDispatcher):
         self.group_size = self.dp_group.group_size
         self.pp_size = get_pp_group().group_size
 
-        self.init_zmq()
+        # 使用统一的 ZMQ 初始化（自动选择 ipc:// 或 tcp://）
+        assert self.rank_in_group is not None and self.group_size is not None
+        self._init_zmq_router_dealer(
+            group=self.dp_group,
+            main_rank=self.dp_main_rank,
+            is_main_rank=self.is_main_rank,
+            rank_in_group=self.rank_in_group,
+            group_name="DP",
+        )
+
         self.mtp_size = get_global_args().infer.mtp_size
 
-    def init_zmq(self):
-        self.ctx = zmq.Context.instance()
-        self.master_addr, self.master_port, _ = Backend.ip_port_list[0]
-        self.url = f"tcp://{self.master_addr}:{self.master_port}"
-
-        if self.is_main_rank:
-            self.socket = self.ctx.socket(zmq.ROUTER)
-            self.socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
-            self.socket.bind(self.url)
-            for _ in range(1, self.group_size):
-                msgs = self.socket.recv_multipart()
-                logger.info(f"zmq client {msgs[0].decode()} connected")
-                self.socket.send_multipart(msgs)
-        else:
-            self.socket = self.ctx.socket(zmq.DEALER)
-            self.socket.setsockopt(zmq.IDENTITY, f"{self.rank_in_group}".encode())
-            self.socket.connect(self.url)
-            self.socket.send(b"connect")
-            self.socket.recv_multipart()
-            logger.info(f"zmq server connected")
-
-        # wait for all ranks to finish binding
-        self.dp_group.barrier()
+        # 初始化统一的 metadata serializer
+        self.metadata_serializer = MetadataSerializer()
 
     def dispatch_metadata(self, tasks):
+        """统一的 metadata dispatch（使用 msgpack + ZMQ）"""
+
         if self.is_main_rank:
             local_tasks = tasks
             if DPTaskCollector.has_available_tasks():
-                current_task_type = (
-                    DPTaskCollector.get_current_task_type()
-                )  # prefill/decode; if prefill, send msgpack-serialized tasks
+                current_task_type = DPTaskCollector.get_current_task_type()
                 task_ids_list = DPTaskCollector.get_task_ids_list()
+
                 for rank_in_group in range(1, self.group_size):
                     task_ids = task_ids_list[rank_in_group]
+
+                    # 构建该 rank 的 PackedTasks
+                    if len(task_ids) > 0:
+                        task_list = [TaskPool.pool[tid] for tid in task_ids]
+                        rank_tasks = PackedTasks([], tasks=task_list)
+                    else:
+                        if current_task_type == TaskType.Prefill:
+                            rank_tasks = PackedTasks(
+                                [], empty_task_type=TaskType.EmptyPrefill
+                            )
+                        else:
+                            rank_tasks = PackedTasks(
+                                [], empty_task_type=TaskType.EmptyDecode
+                            )
+
+                    # 让 MetadataSerializer 自动选择配置（支持去重优化）
+                    # DP+PP Decode 场景需要传 last_tokens（PP 后续 stage 需要）
+                    force_last_tokens = (
+                        current_task_type == TaskType.Decode
+                        and self.pp_size is not None
+                        and self.pp_size > 1
+                    )
+
+                    # 使用统一接口序列化
+                    tasks_msg = self.metadata_serializer.serialize_metadata(
+                        rank_tasks,
+                        config=None,
+                        slot_idx=None,
+                        force_include_last_tokens=force_last_tokens,
+                    )
+
+                    # 发送消息：[rank_id, payload_type, serialized_tasks]
                     msgs = [
                         f"{rank_in_group}".encode(),
-                        current_task_type.name.encode(),
+                        rank_tasks.payload_type.name.encode(),
+                        tasks_msg,
                     ]
-                    if current_task_type == TaskType.Prefill:
-                        tasks = [
-                            TaskPool.pool[tid].get_msgpackable_task()
-                            for tid in task_ids
-                        ]
-                        tasks_msg = serialize_tasks(tasks)
-                        msgs.append(tasks_msg)
-                    elif current_task_type == TaskType.Decode:
-                        msgs.append(msgpack.packb(task_ids))
-                        last_tokens_list = (
-                            [TaskPool.pool[tid].next_token for tid in task_ids]
-                            if self.pp_size > 1
-                            else None
-                        )
-                        decode_status_list = [
-                            TaskPool.pool[tid]._decode_status.value for tid in task_ids
-                        ]
-                        msgs.append(msgpack.packb(last_tokens_list))
-                        msgs.append(msgpack.packb(decode_status_list))
                     self.socket.send_multipart(msgs)
+
                 return local_tasks.payload_type, local_tasks
+
             else:  # send special payload
                 payload_type = tasks.payload_type
                 for rank_in_group in range(1, self.group_size):
@@ -505,62 +750,37 @@ class ExpertDataDispatcher(TasksDispatcher):
                     ):
                         msgs.append(msgpack.packb(tasks.task_ids))
                     self.socket.send_multipart(msgs)
-            return payload_type, local_tasks
+                return payload_type, local_tasks
 
         else:  # other dp ranks
             msgs = self.socket.recv_multipart()
             payload_type = SerializedPackedTasksPayloadType[msgs[0].decode()]
+
+            # 使用统一的序列化器处理 Prefill 和 Decode
             if payload_type in [
                 SerializedPackedTasksPayloadType.Prefill,
                 SerializedPackedTasksPayloadType.EmptyPrefill,
-            ]:
-                tasks = deserialize_prefill_tasks(msgs[1])
-            elif payload_type in [
                 SerializedPackedTasksPayloadType.Decode,
                 SerializedPackedTasksPayloadType.EmptyDecode,
             ]:
-                task_ids = msgpack.unpackb(msgs[1])
-                if len(task_ids) > 0:
-                    task_list = [TaskPool.pool[task_id] for task_id in task_ids]
-                    last_tokens_list = msgpack.unpackb(msgs[2])
-                    decode_status_list = msgpack.unpackb(msgs[3])
-                    for it, task in enumerate(task_list):
-                        if self.pp_size > 1:
-                            task.update_response_no_sync(last_tokens_list[it])
-                        task._decode_status = TaskDecodeType(
-                            value=decode_status_list[it]
-                        )
-                    tasks = PackedTasks([], tasks=task_list)
-                else:
-                    tasks = PackedTasks([], empty_task_type=TaskType.Decode)
+                is_prefill = payload_type in [
+                    SerializedPackedTasksPayloadType.Prefill,
+                    SerializedPackedTasksPayloadType.EmptyPrefill,
+                ]
+                _, tasks, _ = self.metadata_serializer.deserialize_metadata(
+                    msgs[1], require_task_creation=is_prefill
+                )
+
             elif payload_type in (
                 SerializedPackedTasksPayloadType.EndTask,
                 SerializedPackedTasksPayloadType.Remove,
+                SerializedPackedTasksPayloadType.TerminateBackend,
             ):
-                task_ids = msgpack.unpackb(msgs[1])
-                if payload_type == SerializedPackedTasksPayloadType.Remove:
-                    for tid in task_ids:
-                        if tid in TaskPool.pool:
-                            TaskPool.remove(tid)
-                tasks = PackedTasksBase(
-                    num_tasks=len(task_ids),
-                    task_ids=task_ids,
-                    req_ids=task_ids,
-                    task_type=TaskType.Special,
-                    payload_type=payload_type,
-                )
-            elif payload_type == SerializedPackedTasksPayloadType.Heartbeat:
-                tasks = PackedTasksBase(
-                    num_tasks=0,
-                    payload_type=SerializedPackedTasksPayloadType.Heartbeat,
-                )
-            elif payload_type == SerializedPackedTasksPayloadType.TerminateBackend:
-                tasks = PackedTasksBase(
-                    num_tasks=0,
-                    payload_type=SerializedPackedTasksPayloadType.TerminateBackend,
-                )
+                task_ids = msgpack.unpackb(msgs[1]) if len(msgs) > 1 else []
+                tasks = self._handle_special_payload(payload_type, task_ids)
             else:
                 raise ValueError(f"Unknown payload type: {payload_type}")
+
             return payload_type, tasks
 
     def collect_token(
@@ -863,8 +1083,7 @@ class Executor:
         if payload_type == SerializedPackedTasksPayloadType.TerminateBackend:
             Backend.state = BackendState.Terminated
         if (
-            payload_type == SerializedPackedTasksPayloadType.Heartbeat
-            or payload_type == SerializedPackedTasksPayloadType.Remove
+            payload_type == SerializedPackedTasksPayloadType.Remove
             or Backend.state == BackendState.Terminated
         ):
             return payload_type

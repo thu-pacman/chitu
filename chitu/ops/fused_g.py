@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import torch
+import torch.nn.functional as F
+
+from chitu.utils import try_import_platform_dep
+
+triton, has_triton = try_import_platform_dep("triton")
+
+if has_triton:
+    from chitu.ops.triton_ops import fused_g_triton
+
+
+def fused_g(
+    a: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    impl: str = "auto",
+):
+    """
+    Implementation of: g = -exp(A_log) * softplus(a + dt_bias)
+
+    Args:
+        a: tensor of shape [batch_size, d_inner]
+        A_log: tensor of shape [d_inner]
+        dt_bias: tensor of shape [d_inner]
+
+    Returns:
+        g: tensor of shape [batch_size, d_inner]
+    """
+
+    if impl == "auto":
+        if has_triton:
+            impl = "triton"
+        else:
+            impl = "torch"
+
+    if impl == "triton":
+        return fused_g_triton(a, A_log, dt_bias)
+    elif impl == "torch":
+        return -A_log.float().exp() * F.softplus(a.float() + dt_bias)
+    else:
+        raise NotImplementedError(f"Unsupported implementation: {impl}")

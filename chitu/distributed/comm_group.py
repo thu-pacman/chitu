@@ -309,15 +309,15 @@ class CommGroup:
 
         return torch.cat(output_tensor_list, dim=0)
 
-    def gather_all_rank_ip_port(self) -> List[Tuple[str, int, int]]:
+    def gather_all_rank_ip_port(self) -> List[Tuple[str, int, int, int]]:
         """
-        Find IP and two free TCP ports of each rank. The two ports are for DP and PP, respectively.
+        Find IP and three free TCP ports of each rank for TP, DP, PP respectively.
 
         Returns:
-            List[Tuple[str, int, int]]: List of tuples of the form (IP, DP_port, PP_port)
+            List[Tuple[str, int, int, int]]: List of tuples of the form (IP, TP_port, DP_port, PP_port)
         """
         if self.group_size == 1:
-            return [("localhost", 0, 0)]
+            return [("localhost", 0, 0, 0)]
 
         try:
             ifaces = netifaces.interfaces()
@@ -362,15 +362,22 @@ class CommGroup:
                 "2) if all ranks are in a single server, all ranks use localhost as IP."
             ) from local_ip_fail_reason
 
+        # 为 TP, DP, PP 各分配一个空闲端口
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_dp:
-                s_dp.bind((local_ip, 0))  # Bind to any free port
-                local_port_dp = s_dp.getsockname()[1]
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_pp:
-                    s_pp.bind((local_ip, 0))  # Bind to any free port
-                    local_port_pp = s_pp.getsockname()[1]
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_tp:
+                s_tp.bind((local_ip, 0))
+                local_port_tp = s_tp.getsockname()[1]
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_dp:
+                    s_dp.bind((local_ip, 0))
+                    local_port_dp = s_dp.getsockname()[1]
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_pp:
+                        s_pp.bind((local_ip, 0))
+                        local_port_pp = s_pp.getsockname()[1]
         except Exception as e:
-            raise RuntimeError(f"Cannot bind to a free port on {local_ip}.") from e
+            raise RuntimeError(f"Cannot bind to free ports on {local_ip}.") from e
+
+        port_tp_list = [None] * self.group_size
+        torch.distributed.all_gather_object(port_tp_list, local_port_tp, self.cpu_group)
 
         port_dp_list = [None] * self.group_size
         torch.distributed.all_gather_object(port_dp_list, local_port_dp, self.cpu_group)
@@ -379,9 +386,9 @@ class CommGroup:
         torch.distributed.all_gather_object(port_pp_list, local_port_pp, self.cpu_group)
 
         logger.debug(
-            f"ZMQ IP: {local_ip}, DP port: {local_port_dp}, PP port: {local_port_pp}"
+            f"ZMQ IP: {local_ip}, TP port: {local_port_tp}, DP port: {local_port_dp}, PP port: {local_port_pp}"
         )
-        return list(zip(ip_list, port_dp_list, port_pp_list))
+        return list(zip(ip_list, port_tp_list, port_dp_list, port_pp_list))
 
     def destroy(self):
         if self.gpu_group and type(self.gpu_group) != SingletonGroupPlaceholder:

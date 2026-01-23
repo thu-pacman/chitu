@@ -153,6 +153,7 @@ class PagedKVCacheAccessor(KVCacheAccessor):
 @dataclass
 class DenseKVCacheAccessor(KVCacheAccessor):
     kv: dict[str, torch.Tensor]  # shape: [num_req, max_seqlen + 1, shape_per_token...]
+    use_i64_offsets: bool = False
 
     @property
     def k(self):  # Legacy interface
@@ -880,6 +881,21 @@ class DenseKVCacheManager(KVCacheManagerBase):
         self.prepared_cache: dict[str, torch.Tensor] = {}
 
         self.slot_handle = get_slot_handle()
+        self.use_i64_offsets = self.needs_i64_kv_offsets()
+
+    def needs_i64_kv_offsets(self) -> bool:
+        for _, t in self.kv_buffer.items():
+            kv_cache = t[0]
+            kv = kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], -1)
+
+            max_kv_off = (
+                (kv.shape[0] - 1) * kv.stride(0)
+                + (kv.shape[1] - 1) * kv.stride(1)
+                + (kv.shape[2] - 1) * kv.stride(2)
+            )
+            if max_kv_off > (1 << 31) - 1:
+                return True
+        return False
 
     def update_page_offs(self):
         pass
@@ -969,7 +985,7 @@ class DenseKVCacheManager(KVCacheManagerBase):
         ret_kv = {
             key: cache[local_layer_id] for key, cache in self.prepared_cache.items()
         }
-        return DenseKVCacheAccessor(ret_kv)
+        return DenseKVCacheAccessor(ret_kv, self.use_i64_offsets)
 
     @override
     def finalize_cache_all_decode(self, req_id: str):

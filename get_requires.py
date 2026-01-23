@@ -39,6 +39,7 @@ install_requires = [
     "prometheus-client>=0.19.0",
     "xgrammar==0.1.29",
     "openai",
+    "anthropic",
 ]
 
 

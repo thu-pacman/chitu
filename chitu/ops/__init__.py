@@ -13,6 +13,7 @@ from chitu.ops.kv_cache import (
     read_from_singleton_paged_kv_cache,
     read_from_dense_kv_cache,
     fp8_pertensor_kvcache_quant,
+    append_to_paged_kv_cache_torch,
 )
 from chitu.ops.norm import rms_norm
 from chitu.ops.moe_gate import moe_gate
@@ -66,3 +67,4 @@ from chitu.ops.batched_routed_activation import (
 from chitu.ops.hadamard import hadamard_transform
 from chitu.ops.causal_conv import causal_conv1d_update, causal_conv1d_prefill
 from chitu.ops.norm_gate import rms_norm_gate
+from chitu.ops.fused_g import fused_g

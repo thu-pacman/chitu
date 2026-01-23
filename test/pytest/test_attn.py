@@ -8,6 +8,7 @@ from chitu.attn_backend import (
     TritonAttnBackend,
     FlashAttnBackend,
     FlashInferBackend,
+    FlashMLABackend,
     NpuAttnBackend,
 )
 from chitu.cache_manager import PagedKVCacheAccessor, DenseKVCacheAccessor
@@ -25,17 +26,18 @@ from chitu.testing import assert_close
 triton, has_triton = try_import_platform_dep("triton")
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
+flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
 @pytest.mark.parametrize("bs", [0, 1, 3])
-@pytest.mark.parametrize("local_n_heads", [16])
+@pytest.mark.parametrize("local_n_heads", [16, 128])
 @pytest.mark.parametrize("kv_lora_rank", [512])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
 @pytest.mark.parametrize("is_increment", [False, True])
 @pytest.mark.parametrize("topk", [None, 128])
-@pytest.mark.parametrize("impl", ["triton", "npu"])
+@pytest.mark.parametrize("impl", ["triton", "npu", "flash_mla"])
 def test_mla_prefill_ragged_qkvo(
     bs,
     local_n_heads,
@@ -54,8 +56,26 @@ def test_mla_prefill_ragged_qkvo(
             pytest.skip("torch_npu is missing")
         if topk is not None:
             pytest.skip("torch_npu does not support topk")
+    if impl == "flash_mla":
+        if not torch.cuda.is_available() or not has_flash_mla:
+            pytest.skip("flash_mla is missing")
+        if local_n_heads % 64 != 0:
+            pytest.skip("flash_mla only supports h_q % 64 (sm90) | 128 (sm100) == 0")
+        if topk is None:
+            pytest.skip("flash_mla prefill only supports sparse attention for now")
 
-    torch.set_default_dtype(torch.float16)
+        _, total_memory = torch.cuda.mem_get_info()
+        total_memory = total_memory / (1024**3)
+        if local_n_heads == 128 and total_memory < 80:
+            pytest.skip("Skip testing h_q=128 on devices with not enough memory")
+    else:  # only test h_q=128 for flash_mla
+        if local_n_heads == 128:
+            pytest.skip(f"Skip testing h_q=128 with {impl} attn backend")
+
+    if impl == "flash_mla":
+        torch.set_default_dtype(torch.bfloat16)
+    else:
+        torch.set_default_dtype(torch.float16)
     set_global_args(
         OmegaConf.create(
             {
@@ -119,6 +139,10 @@ def test_mla_prefill_ragged_qkvo(
     elif impl == "npu":
         attn_backend = NpuAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
         attn_backend.prepare_metadata_for_prefill(seq_len_delta)
+    elif impl == "flash_mla":
+        attn_backend = FlashMLABackend(
+            qk_nope_head_dim=qk_nope_head_dim, index_topk=topk
+        )
     else:
         raise NotImplementedError()
     ref_backend = RefAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
@@ -449,14 +473,14 @@ def test_mla_decode_dense_kv(
 
 
 @pytest.mark.parametrize("bs", [0, 1, 64])
-@pytest.mark.parametrize("local_n_heads", [16])
+@pytest.mark.parametrize("local_n_heads", [16, 128])
 @pytest.mark.parametrize("kv_lora_rank", [512])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
-@pytest.mark.parametrize("page_size", [256])
+@pytest.mark.parametrize("page_size", [64, 256])
 @pytest.mark.parametrize("topk", [None, 128])
 @pytest.mark.parametrize("use_separated_kv_lora_k_pe", [False, True])
-@pytest.mark.parametrize("impl", ["triton", "flashinfer", "npu"])
+@pytest.mark.parametrize("impl", ["triton", "flashinfer", "npu", "flash_mla"])
 def test_mla_decode_paged_kv(
     bs,
     local_n_heads,
@@ -487,8 +511,26 @@ def test_mla_decode_paged_kv(
             pytest.skip("torch_npu is missing")
         if topk is not None:
             pytest.skip("torch_npu does not support topk")
+    if impl == "flash_mla":
+        if not torch.cuda.is_available() or not has_flash_mla:
+            pytest.skip("flash_mla is missing")
+        if local_n_heads % 64 != 0:
+            pytest.skip("flash_mla only supports h_q % 64 (sm90) | 128 (sm100) == 0")
+        if topk is None:
+            pytest.skip("flash_mla only supports dense attention for now")
 
-    torch.set_default_dtype(torch.float16)
+        _, total_memory = torch.cuda.mem_get_info()
+        total_memory = total_memory / (1024**3)
+        if local_n_heads == 128 and total_memory < 80:
+            pytest.skip("Skip testing h_q=128 on devices with not enough memory")
+    else:  # only test h_q=128 for flash_mla
+        if local_n_heads == 128:
+            pytest.skip(f"Skip testing h_q=128 with {impl} attn backend")
+
+    if impl == "flash_mla":
+        torch.set_default_dtype(torch.bfloat16)
+    else:
+        torch.set_default_dtype(torch.float16)
     set_global_args(
         OmegaConf.create(
             {
@@ -561,6 +603,8 @@ def test_mla_decode_paged_kv(
         )
     elif impl == "npu":
         attn = NpuAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+    elif impl == "flash_mla":
+        attn = FlashMLABackend(qk_nope_head_dim=qk_nope_head_dim, index_topk=topk)
     else:
         raise NotImplementedError()
     attn_ref = RefAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
