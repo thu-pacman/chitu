@@ -197,10 +197,13 @@ class ChituCustomAllreduce:
         from chitu.cuda_graph import add_post_hook_for_currently_capturing_graph_object
 
         if torch.cuda.is_current_stream_capturing():
+            has_run = [False]
 
             def post_hook():
-                if not self.disabled and self._ptr != 0:
-                    self.register_graph_buffers()
+                if not has_run[0]:
+                    if not self.disabled and self._ptr != 0:
+                        self.register_graph_buffers()
+                    has_run[0] = True
 
             add_post_hook_for_currently_capturing_graph_object(post_hook)
             self._IS_CAPTURING = True
@@ -211,14 +214,9 @@ class ChituCustomAllreduce:
 
         handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
 
-        all_data = [[None, None] for _ in range(self.world_size)]
-        all_data[self.rank] = [handle, offset]
-
-        ranks = sorted(dist.get_process_group_ranks(group=self.group))
-        for i, rank_id in enumerate(ranks):
-            dist.broadcast_object_list(
-                all_data[i], src=rank_id, group=self.group, device="cpu"
-            )
+        local_data = [handle, offset]
+        all_data = [None for _ in range(self.world_size)]
+        dist.all_gather_object(all_data, local_data, group=self.group)
 
         handles = [d[0] for d in all_data]
         offsets = [d[1] for d in all_data]
