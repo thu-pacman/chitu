@@ -38,6 +38,7 @@ from chitu.quantization import QuantizationRegistry
 from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear, LocalLinear
 from chitu.ops import rms_norm_gate
 from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
+from chitu.ops import fused_g
 
 
 class Qwen3NextRMSNorm(RMSNorm):
@@ -224,7 +225,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         beta = b.sigmoid()
 
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        g = fused_g(a, self.A_log, self.dt_bias)
 
         if not use_precomputed_states:
             q = q.repeat_interleave(

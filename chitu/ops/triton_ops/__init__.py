@@ -54,3 +54,4 @@ from chitu.ops.triton_ops.causal_conv import (
     causal_conv1d_update_triton,
     causal_conv1d_prefill_triton,
 )
+from chitu.ops.triton_ops.fused_g import fused_g_triton
