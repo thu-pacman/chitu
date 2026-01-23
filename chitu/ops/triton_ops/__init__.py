@@ -48,6 +48,8 @@ from chitu.ops.triton_ops.attn import (
     mla_decode_paged_kv_triton,
     mla_decode_dense_kv_triton,
     mla_decode_topk_ragged_qkvo_triton,
+    convert_req_index_to_global_paged_index_triton,
+    quantize_k_cache_triton,
 )
 from chitu.ops.triton_ops.norm_gate import rms_norm_gate_triton
 from chitu.ops.triton_ops.causal_conv import (
