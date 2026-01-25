@@ -13,7 +13,10 @@ import torch.distributed as dist
 from chitu.device_type import is_ascend
 from chitu.utils import try_import_and_setup_torch_npu
 from chitu.distributed.comm_group import CommGroup
-from chitu.moe.load_balancer.planner import AdjustmentAction, MoveExpertAction
+from chitu.moe.load_balancer.base_dynamic_planner import (
+    AdjustmentAction,
+    MoveExpertAction,
+)
 
 _, has_torch_npu = try_import_and_setup_torch_npu()
 
