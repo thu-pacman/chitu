@@ -47,10 +47,13 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         *,
         tp_group: CommGroup,
         dp_group: CommGroup,
+        etp_group: CommGroup,
         ep_group: CommGroup,
         moe_layer_id_list: list[int],
     ):
-        super().__init__(tp_group=tp_group, dp_group=dp_group, ep_group=ep_group)
+        super().__init__(
+            tp_group=tp_group, dp_group=dp_group, etp_group=etp_group, ep_group=ep_group
+        )
         self.num_experts = num_experts
         os.environ["DEEPEP_DISABLE_LL_DISPATCH_OPT"] = (
             "0" if self.ep_group.group_size % 8 == 0 else "1"

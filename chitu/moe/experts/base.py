@@ -14,6 +14,7 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
     IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
     PerExpertDenseBatchedRoutedActivation,
+    ConcatPermutedBatchedRoutedActivationMinimal,
 )
 from chitu.utils import (
     try_import_opt_dep,
@@ -28,8 +29,8 @@ deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 if has_torch_npu:
     from chitu.npu_utils import (
         fused_experts_npu,
-        fused_experts_npu_with_communication,
-        fused_experts_npu_with_a2a_communication,
+        fused_experts_npu_for_distribute_communication,
+        fused_experts_npu_for_a2a_communication,
     )
 if has_triton:
     from .triton_fused_experts import fused_experts
@@ -266,6 +267,29 @@ def fused_experts_no_sum_wrapper(
             )
         else:
             raise NotImplementedError
+    elif impl == "fused_experts_for_a2a_communication":
+        assert isinstance(hidden_states, ConcatPermutedBatchedRoutedActivationMinimal)
+        return fused_experts_npu_for_a2a_communication(
+            hidden_states,
+            w1=w1,
+            w1_scale=w1_scale,  # fp32
+            w2=w2,
+            w2_scale=w2_scale,  # bf16
+            experts_start_idx=experts_start_idx,
+            use_int8_w8a8=use_int8_w8a8,
+        )
+    elif impl == "fused_experts_for_distribute_communication":
+        assert isinstance(hidden_states, ConcatPermutedBatchedRoutedActivationMinimal)
+        return fused_experts_npu_for_distribute_communication(
+            hidden_states,
+            w1=w1,
+            w1_scale=w1_scale,  # fp32
+            w2=w2,
+            w2_scale=w2_scale,  # bf16
+            experts_start_idx=experts_start_idx,
+            use_int8_w8a8=use_int8_w8a8,
+            layer_id=layer_id,
+        )
     else:
         raise NotImplementedError
 
@@ -312,34 +336,8 @@ def fused_experts_and_sum_wrapper(
             impl = "metax"
         else:
             raise NotImplementedError
-    if impl == "fused_experts_with_communication":
-        assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
-        return fused_experts_npu_with_communication(
-            hidden_states=hidden_states.activation,
-            w1=w1,
-            w1_scale=w1_scale,  # fp32
-            w2=w2,
-            w2_scale=w2_scale,  # bf16
-            topk_weights=topk_weights,
-            topk_ids=hidden_states.token_to_expert_indices,
-            experts_start_idx=experts_start_idx,
-            use_int8_w8a8=use_int8_w8a8,
-            layer_id=layer_id,
-        )
-    elif impl == "fused_experts_with_a2a_communication":
-        assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
-        return fused_experts_npu_with_a2a_communication(
-            hidden_states=hidden_states.activation,
-            w1=w1,
-            w1_scale=w1_scale,  # fp32
-            w2=w2,
-            w2_scale=w2_scale,  # bf16
-            topk_weights=topk_weights,
-            topk_ids=hidden_states.token_to_expert_indices,
-            experts_start_idx=experts_start_idx,
-            use_int8_w8a8=use_int8_w8a8,
-        )
-    elif impl == "torch_npu":
+
+    if impl == "torch_npu":
         assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
         return fused_experts_npu(
             hidden_states,

@@ -15,7 +15,7 @@ from chitu.distributed.parallel_state import (
     get_ep_rank_lists,
 )
 from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
-from chitu.device_type import has_native_fp8, is_ascend
+from chitu.device_type import has_native_fp8, is_ascend_910b
 from chitu.task_type import TaskType
 from chitu.moe import MoEImplEP, MoEImplNoEP
 from chitu.moe.token_dispatchers.buffercontroller import DeepEPBuffer
@@ -58,8 +58,8 @@ def test_parallel_moe_block(
     task_type,
     dtype,
 ):
-    if is_ascend() and dp_size > 1 and ep_size > 1:
-        pytest.skip("Unit test of DP+EP is not implemented yet on Ascend")
+    if is_ascend_910b() and dp_size > 1 and ep_size > 1 and ep_size % 16 != 0:
+        pytest.skip("DP+EP on Ascend 910B requires ep_size % 16 == 0")
 
     set_global_args(
         OmegaConf.create(
@@ -161,11 +161,15 @@ def test_parallel_moe_block(
                 use_cuda_graph=False,
                 tp_group=tp_group,
                 dp_group=dp_group,
+                etp_group=etp_group,
                 ep_group=ep_group,
             )
         else:
             moe_impl = MoEImplNoEP(
-                tp_group=tp_group, dp_group=dp_group, ep_group=ep_group
+                tp_group=tp_group,
+                dp_group=dp_group,
+                etp_group=etp_group,
+                ep_group=ep_group,
             )
         moe_impl.prepare(task_type, batch_size)
         parallel_moe_block = ParallelMoeBlock(
@@ -243,7 +247,10 @@ def test_parallel_moe_block(
         parallel_moe_block.load_state_dict(state_dict, strict=True, assign=True)
 
         ref_moe_impl = MoEImplNoEP(
-            tp_group=singleton_group, dp_group=singleton_group, ep_group=singleton_group
+            tp_group=singleton_group,
+            dp_group=singleton_group,
+            etp_group=etp_group,
+            ep_group=singleton_group,
         )
         ref_moe_impl.prepare(task_type, batch_size)
         ref_moe_block = ParallelMoeBlock(
@@ -481,11 +488,15 @@ def test_parallel_moe_block_blockfp8(
                 use_cuda_graph=False,
                 tp_group=tp_group,
                 dp_group=dp_group,
+                etp_group=etp_group,
                 ep_group=ep_group,
             )
         else:
             moe_impl = MoEImplNoEP(
-                tp_group=tp_group, dp_group=dp_group, ep_group=ep_group
+                tp_group=tp_group,
+                dp_group=dp_group,
+                etp_group=etp_group,
+                ep_group=ep_group,
             )
         moe_impl.prepare(task_type, batch_size)
         parallel_moe_block = ParallelMoeBlock(
@@ -594,7 +605,10 @@ def test_parallel_moe_block_blockfp8(
         parallel_moe_block.load_state_dict(state_dict, strict=True, assign=True)
 
         ref_moe_impl = MoEImplNoEP(
-            tp_group=singleton_group, dp_group=singleton_group, ep_group=singleton_group
+            tp_group=singleton_group,
+            dp_group=singleton_group,
+            etp_group=etp_group,
+            ep_group=singleton_group,
         )
         ref_moe_impl.prepare(task_type, batch_size)
         ref_moe_block = ParallelMoeBlock(

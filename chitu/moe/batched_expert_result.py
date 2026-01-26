@@ -84,12 +84,20 @@ class ExpertBlockPermutedBatchedExpertResult(BatchedExpertResult):
 
 
 @dataclass
-class ConcatPermutedBatchedExpertResult(BatchedExpertResult):
+class ConcatPermutedBatchedExpertResultMinimal(BatchedExpertResult):
+    """
+    Result of `ConcatPermutedBatchedRoutedActivationMinimal`
+    """
+
+    concat_activation: torch.Tensor  # [batch_size * topk, hidden_size]
+
+
+@dataclass
+class ConcatPermutedBatchedExpertResult(ConcatPermutedBatchedExpertResultMinimal):
     """
     Result of `ConcatPermutedBatchedRoutedActivation`
     """
 
-    concat_activation: torch.Tensor  # [batch_size * topk, hidden_size]
     token_comma_topk_to_concat_indices: (
         torch.Tensor
     )  # [batch_size, topk] -> batch_size * topk

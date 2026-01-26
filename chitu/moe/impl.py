@@ -10,8 +10,9 @@ from chitu.task_type import TaskType
 from chitu.utils import try_import_opt_dep, try_import_and_setup_torch_npu, ceil_div
 from chitu.moe.token_dispatchers import (
     MoETokenDispatcher,
-    MoEEmptyTokenDispatcher,
     MoEAllGatherTokenDispatcher,
+    MoENpuAllToAllTokenDispatcher,
+    MoENpuDistributeTokenDispatcher,
 )
 from chitu.moe.load_balancer import (
     MoELargeScaleNaiveLoadBalancer,
@@ -20,7 +21,12 @@ from chitu.moe.load_balancer import (
     register_moe_weight_accessor,
 )
 from chitu.device_type import is_ascend_910b
-from chitu.distributed.parallel_state import get_tp_group, get_dp_group, get_ep_group
+from chitu.distributed.parallel_state import (
+    get_tp_group,
+    get_dp_group,
+    get_etp_group,
+    get_ep_group,
+)
 from chitu.distributed.comm_group import CommGroup
 
 deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
@@ -91,6 +97,7 @@ class MoEImplBase:
         *,
         tp_group: Optional[CommGroup] = None,
         dp_group: Optional[CommGroup] = None,
+        etp_group: Optional[CommGroup] = None,
         ep_group: Optional[CommGroup] = None,
     ):
         if tp_group is None:
@@ -101,6 +108,10 @@ class MoEImplBase:
             dp_group = get_dp_group()
         self.dp_group = dp_group
         self.dp_size = dp_group.group_size
+        if etp_group is None:
+            etp_group = get_etp_group()
+        self.etp_group = etp_group
+        self.etp_size = etp_group.group_size
         if ep_group is None:
             ep_group = get_ep_group()
         self.ep_group = ep_group
@@ -148,6 +159,7 @@ class MoEImplEP(MoEImplBase):
         n_experts: int,
         tp_group: Optional[CommGroup] = None,
         dp_group: Optional[CommGroup] = None,
+        etp_group: Optional[CommGroup] = None,
         ep_group: Optional[CommGroup] = None,
         n_global_experts_slots: Optional[int] = None,
         prefill_token_dispatcher_impl: str = "auto",
@@ -157,7 +169,9 @@ class MoEImplEP(MoEImplBase):
         moe_lb_trigger: int = -1,
         moe_lb_threshold: float = 3.0,
     ):
-        super().__init__(tp_group=tp_group, dp_group=dp_group, ep_group=ep_group)
+        super().__init__(
+            tp_group=tp_group, dp_group=dp_group, etp_group=etp_group, ep_group=ep_group
+        )
 
         self.n_layers = n_layers
         self.n_dense_layers = n_dense_layers
@@ -212,9 +226,7 @@ class MoEImplEP(MoEImplBase):
             if self.dp_size > 1 and has_deep_ep:
                 self.prefill_token_dispatcher_impl = "deepep-nl"
             elif self.dp_size > 1 and has_torch_npu:
-                self.prefill_token_dispatcher_impl = (
-                    "fused_experts_with_a2a_communication"
-                )
+                self.prefill_token_dispatcher_impl = "npu_all_to_all"
             else:
                 self.prefill_token_dispatcher_impl = "allgather"
 
@@ -226,11 +238,11 @@ class MoEImplEP(MoEImplBase):
                 and has_torch_npu
                 and not (is_ascend_910b() and self.tp_size > 1)
             ):
-                self.decode_token_dispatcher_impl = "fused_experts_with_communication"
-            elif self.dp_size > 1 and has_torch_npu:
                 self.decode_token_dispatcher_impl = (
-                    "fused_experts_with_a2a_communication"
+                    "fused_experts_for_distribute_communication"
                 )
+            elif self.dp_size > 1 and has_torch_npu:
+                self.decode_token_dispatcher_impl = "npu_all_to_all"
             else:
                 self.decode_token_dispatcher_impl = "allgather"
 
@@ -247,19 +259,25 @@ class MoEImplEP(MoEImplBase):
                 ),
                 tp_group=self.tp_group,
                 dp_group=self.dp_group,
+                etp_group=self.etp_group,
                 ep_group=self.ep_group,
             )
             self.prefill_experts_impl = "ep_group_gemm_contiguous"
-        elif (
-            self.prefill_token_dispatcher_impl == "fused_experts_with_a2a_communication"
-        ):
-            self.prefill_token_dispatcher = MoEEmptyTokenDispatcher(
-                tp_group=self.tp_group, dp_group=self.dp_group, ep_group=self.ep_group
+        elif self.prefill_token_dispatcher_impl == "npu_all_to_all":
+            self.prefill_token_dispatcher = MoENpuAllToAllTokenDispatcher(
+                self.n_global_experts_slots,
+                tp_group=self.tp_group,
+                dp_group=self.dp_group,
+                etp_group=self.etp_group,
+                ep_group=self.ep_group,
             )
-            self.prefill_experts_impl = "fused_experts_with_a2a_communication"
+            self.prefill_experts_impl = "fused_experts_for_a2a_communication"
         elif self.prefill_token_dispatcher_impl == "allgather":
             self.prefill_token_dispatcher = MoEAllGatherTokenDispatcher(
-                tp_group=self.tp_group, dp_group=self.dp_group, ep_group=self.ep_group
+                tp_group=self.tp_group,
+                dp_group=self.dp_group,
+                etp_group=self.etp_group,
+                ep_group=self.ep_group,
             )
         else:
             raise ValueError(
@@ -273,25 +291,38 @@ class MoEImplEP(MoEImplBase):
                 self.max_bs_per_dp_rank,
                 tp_group=self.tp_group,
                 dp_group=self.dp_group,
+                etp_group=self.etp_group,
                 ep_group=self.ep_group,
                 moe_layer_id_list=self.moe_layer_id_list,
             )
             self.decode_experts_impl = "ep_group_gemm_masked"
+        elif self.decode_token_dispatcher_impl == "npu_all_to_all":
+            self.decode_token_dispatcher = MoENpuAllToAllTokenDispatcher(
+                self.n_global_experts_slots,
+                tp_group=self.tp_group,
+                dp_group=self.dp_group,
+                etp_group=self.etp_group,
+                ep_group=self.ep_group,
+            )
+            self.decode_experts_impl = "fused_experts_for_a2a_communication"
         elif (
-            self.decode_token_dispatcher_impl == "fused_experts_with_a2a_communication"
+            self.decode_token_dispatcher_impl
+            == "fused_experts_for_distribute_communication"
         ):
-            self.decode_token_dispatcher = MoEEmptyTokenDispatcher(
-                tp_group=self.tp_group, dp_group=self.dp_group, ep_group=self.ep_group
+            self.decode_token_dispatcher = MoENpuDistributeTokenDispatcher(
+                self.n_global_experts_slots,
+                tp_group=self.tp_group,
+                dp_group=self.dp_group,
+                etp_group=self.etp_group,
+                ep_group=self.ep_group,
             )
-            self.decode_experts_impl = "fused_experts_with_a2a_communication"
-        elif self.decode_token_dispatcher_impl == "fused_experts_with_communication":
-            self.decode_token_dispatcher = MoEEmptyTokenDispatcher(
-                tp_group=self.tp_group, dp_group=self.dp_group, ep_group=self.ep_group
-            )
-            self.decode_experts_impl = "fused_experts_with_communication"
+            self.decode_experts_impl = "fused_experts_for_distribute_communication"
         elif self.decode_token_dispatcher_impl == "allgather":
             self.decode_token_dispatcher = MoEAllGatherTokenDispatcher(
-                tp_group=self.tp_group, dp_group=self.dp_group, ep_group=self.ep_group
+                tp_group=self.tp_group,
+                dp_group=self.dp_group,
+                etp_group=self.etp_group,
+                ep_group=self.ep_group,
             )
         else:
             raise ValueError(
@@ -378,9 +409,12 @@ class MoEImplNoEP(MoEImplBase):
         *,
         tp_group: Optional[CommGroup] = None,
         dp_group: Optional[CommGroup] = None,
+        etp_group: Optional[CommGroup] = None,
         ep_group: Optional[CommGroup] = None,
     ):
-        super().__init__(tp_group=tp_group, dp_group=dp_group, ep_group=ep_group)
+        super().__init__(
+            tp_group=tp_group, dp_group=dp_group, etp_group=etp_group, ep_group=ep_group
+        )
 
         assert self.ep_size == 1
 

@@ -42,9 +42,12 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         *,
         tp_group: CommGroup,
         dp_group: CommGroup,
+        etp_group: CommGroup,
         ep_group: CommGroup,
     ):
-        super().__init__(tp_group=tp_group, dp_group=dp_group, ep_group=ep_group)
+        super().__init__(
+            tp_group=tp_group, dp_group=dp_group, etp_group=etp_group, ep_group=ep_group
+        )
         self.num_experts = num_experts
         self._buffer = None
         self.hidden = hidden
