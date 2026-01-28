@@ -13,11 +13,12 @@ logger_engine = logging.getLogger("engine")
 sys.stdout.reconfigure(line_buffering=True)
 
 
-ENABLE_CONCURRENT = True
+MAX_CONCURRENT = 32
 MAX_RETRY = 10
 CHOICE_FUNC_NAME = "get_temperature"
 CHOICE_FUNC = {"type": "function", "function": {"name": CHOICE_FUNC_NAME}}
 LAUNCH_TIMEOUT = 300
+REQ_TIMEOUT = 300
 
 # nums: describe number of tools called in each round. list of set of int, list represents chat rounds, set represents called tools
 CASES = [
@@ -239,17 +240,20 @@ async def test(
 async def test_all(ready: asyncio.Event, port: int):
     await asyncio.wait_for(ready.wait(), LAUNCH_TIMEOUT)
     logger.info("test begin")
-    client = AsyncOpenAI(base_url=f"http://localhost:{port}/v1", api_key="dummy")
+    client = AsyncOpenAI(
+        base_url=f"http://localhost:{port}/v1", api_key="dummy", timeout=REQ_TIMEOUT
+    )
     model = (await client.models.list()).data[0].id
 
-    coroutines = [test(client, model, idx, **case) for idx, case in enumerate(CASES)]
-    if ENABLE_CONCURRENT:
-        dones, _ = await asyncio.wait([asyncio.Task(co) for co in coroutines])
-        dones = sorted(list(task.result() for task in dones))
-    else:
-        dones = [await co for co in coroutines]
-        dones = sorted(dones)
+    sem = asyncio.Semaphore(MAX_CONCURRENT)
 
+    async def test_limited(idx, case):
+        async with sem:
+            return await test(client, model, idx, **case)
+
+    coroutines = [test_limited(idx, case) for idx, case in enumerate(CASES)]
+    dones, _ = await asyncio.wait([asyncio.Task(co) for co in coroutines])
+    dones = sorted(list(task.result() for task in dones))
     logger.info("all test done")
 
     all_success = True
@@ -275,7 +279,11 @@ async def launch_engine(ready: asyncio.Event):
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            *sys.argv[1:], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env
+            *sys.argv[1:],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            limit=64 * 2**20,
         )
         asyncio.get_event_loop().add_signal_handler(signal.SIGTERM, proc.terminate)
         while not proc.stdout.at_eof():

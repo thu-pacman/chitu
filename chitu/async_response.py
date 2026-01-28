@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from chitu.backend import Backend
 from chitu.tokenizer import Tokenizer, TokenizerHF
 from chitu.serve.event_loop import get_server_event_loop
-from chitu.tool_call import get_parser_cls, ChoiceDelta
+from chitu.tool_call import ChoiceDelta
 
 logger = getLogger(__name__)
 
@@ -38,9 +38,9 @@ class AsyncDataStream:
         self.top_tokens_list = []
         self.enable_reasoning = enable_reasoning
 
+        self.is_reasoning = False
+        self.reasoning_len = 0
         if enable_reasoning:
-            self.is_reasoning = False
-            self.reasoning_len = 0
             if isinstance(self.tokenizer, (Tokenizer, TokenizerHF)):
                 try:
                     self.rs_token_id, self.re_token_id = self.tokenizer.encode(
@@ -149,7 +149,7 @@ class AsyncResponse:
         self.req = req
         self.id = req.request_id
         self.async_stream: AsyncDataStream = req.async_stream
-        self.tool_parser = get_parser_cls()() if req.tools else None
+        self.tool_parser = Backend.tool_parser() if req.tools else None
 
     def stream_generator(self):
         if self.tool_parser:

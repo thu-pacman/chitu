@@ -27,7 +27,7 @@ from chitu.backend import Backend
 from chitu.device_list import DeviceList, StaticDeviceListManager
 from chitu.distributed.parallel_state import get_dp_size
 from chitu.global_vars import get_slot_handle, get_global_args
-from chitu.tool_call.types import ToolChoice, ToolCallParams
+from chitu.tool_call import ToolChoice, ToolCallParams
 from chitu.constraint_decode import ConstraintDecodeTask
 
 logger = getLogger(__name__)
@@ -190,15 +190,16 @@ class UserRequest:
         self.grammar_str = ""
         if tools:
             self.chat_template_kwargs["tools"] = tools
-            self.grammar, self.grammar_str = (
-                Backend.constraint_decode_manager.generate_grammar(
-                    ToolCallParams(
-                        tools=tools,
-                        tool_choice=tool_choice,
-                        parallel_tool_calls=parallel_tool_calls,
-                        enable_reasoning=enable_reasoning,
-                    )
+            grammar = Backend.tool_parser.build_grammar(
+                ToolCallParams(
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    parallel_tool_calls=parallel_tool_calls,
+                    enable_reasoning=enable_reasoning,
                 )
+            )
+            self.grammar, self.grammar_str = (
+                Backend.constraint_decode_manager.compile_grammar(grammar)
             )
 
         # response related

@@ -9,13 +9,18 @@ from typing import Any, AsyncGenerator
 from .types import ToolCallParams, ChoiceToolCall, ChoiceDelta
 
 
-class BaseToolCallParser(ABC):
+class AbstractToolParser(ABC):
+    @classmethod
+    @abstractmethod
+    def patch_chat_template(cls, template: str) -> str:
+        raise NotImplementedError
+
     @classmethod
     @abstractmethod
     def build_grammar(
         cls,
         params: ToolCallParams,
-    ) -> Grammar:
+    ) -> Grammar | None:
         raise NotImplementedError
 
     @classmethod

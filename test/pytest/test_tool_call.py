@@ -1,7 +1,7 @@
 from collections import defaultdict
 import random, xgrammar
 
-from chitu.tool_call.simple_parser import Automaton, regex_reject_tags
+from chitu.tool_call.simple_parser import Automaton
 from chitu.constraint_decode import apply_bitmask
 import torch
 from chitu.utils import try_import_and_setup_torch_npu
@@ -31,15 +31,17 @@ def test_automaton():
 
 
 def test_regex_reject_tags():
-    vocab = list("<0123>")
-    tags = ["<01>", "<002>"]
+    tags = ["<｜01｜>", "<｜002｜>"]
+    vocab = sorted(list(set("".join(tags))))
     tokenizer_info = xgrammar.TokenizerInfo(vocab, stop_token_ids=len(vocab))
-    regex = regex_reject_tags(tags)
-    grammar = xgrammar.Grammar.from_regex(regex)
+    format = xgrammar.structural_tag.AnyTextFormat(excludes=tags)
+    grammar = xgrammar.Grammar.from_structural_tag(
+        xgrammar.StructuralTag(format=format)
+    )
     grammar_compiler = xgrammar.GrammarCompiler(tokenizer_info)
     compiled_grammar = grammar_compiler.compile_grammar(grammar)
     for _ in range(10000):
-        seq = "".join(random.choices(vocab, k=random.randint(1, 10)))
+        seq = "".join(random.choices(vocab, k=random.randint(1, 12)))
         std = all(t not in seq for t in tags)
         ans = xgrammar.GrammarMatcher(compiled_grammar).accept_string(seq)
         assert std == ans

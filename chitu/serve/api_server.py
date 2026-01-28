@@ -28,7 +28,7 @@ from chitu.task import Task, TaskLoad, TaskPool, UserRequest
 from chitu.utils import gen_req_id
 from chitu.serve.event_loop import start_server_in_new_event_loop
 from chitu.serve.common import set_min_batch_size
-from chitu.tool_call.types import ToolChoice
+from chitu.tool_call import ToolChoice
 from chitu.serve.anthropic_api import create_router as create_anthropic_router
 
 logger = getLogger(__name__)
@@ -133,7 +133,7 @@ async def create_chat_completion(
         )
 
     try:
-        request = ChatRequest.model_validate(data)
+        request: ChatRequest = ChatRequest.model_validate(data)
     except ValidationError as e:
         # Keep consistency with FastAPI default behavior for body validation errors
         raise HTTPException(status_code=422, detail=e.errors())
@@ -202,6 +202,7 @@ async def create_chat_completion(
             tools=request.tools,
             tool_choice=request.tool_choice,
             parallel_tool_calls=request.parallel_tool_calls,
+            # enable_reasoning=False, # FIXME: DS-V31T tool call must use without thinking
         )
         response = AsyncResponse(req)
         task = Task(

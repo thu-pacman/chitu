@@ -26,10 +26,14 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=DeepSeek-R1-int8-ascend` command line argument when starting Chitu
 - DeepSeek-V3
   Usage: Append `models=DeepSeek-V3` command line argument when starting Chitu
+- DeepSeek-V3-int8-ascend
+  Usage: Append `models=DeepSeek-V3-int8-ascend` command line argument when starting Chitu
 - DeepSeek-V3.1
   Usage: Append `models=DeepSeek-V3.1` command line argument when starting Chitu
 - DeepSeek-V3.1-Terminus
   Usage: Append `models=DeepSeek-V3.1-Terminus` command line argument when starting Chitu
+- DeepSeek-V3.1-Terminus-int8-ascend
+  Usage: Append `models=DeepSeek-V3.1-Terminus-int8-ascend` command line argument when starting Chitu
 - DeepSeek-V3.2-Exp
   Usage: Append `models=DeepSeek-V3.2-Exp` command line argument when starting Chitu
 - GLM-4-32B-0414

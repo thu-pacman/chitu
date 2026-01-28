@@ -2,15 +2,16 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import xgrammar
 from xgrammar import (
+    apply_token_bitmask_inplace,
+    allocate_token_bitmask,
+    Grammar,
     CompiledGrammar,
     GrammarMatcher,
     TokenizerInfo,
     GrammarCompiler,
     BatchGrammarMatcher,
 )
-from chitu.tool_call import ToolCallParams, get_parser_cls
 from chitu.device_type import is_ascend, is_muxi
 import torch
 import logging
@@ -48,14 +49,11 @@ class ConstraintDecodeManager:
         except:
             logger.exception("constraint decode initialized failed")
 
-    def generate_grammar(
-        self,
-        params: ToolCallParams,
+    def compile_grammar(
+        self, grammar: Grammar | None
     ) -> tuple[CompiledGrammar | None, str]:
-        if not self.enabled:
+        if grammar is None or not self.enabled:
             return None, ""
-        parser_cls = get_parser_cls()
-        grammar = parser_cls.build_grammar(params)
         compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
         grammar_str = compiled_grammar.serialize_json()
         return compiled_grammar, grammar_str
@@ -71,11 +69,11 @@ class ConstraintDecodeManager:
         matchers, indices = self._get_matchers(tasks)
         if len(matchers) == 0:
             return
-        bitmask = xgrammar.allocate_token_bitmask(
+        bitmask = allocate_token_bitmask(
             logits.shape[0], self.tokenizer_info.vocab_size
         )
         self.batch_matcher.batch_fill_next_token_bitmask(matchers, bitmask, indices)
-        apply_bitmask(logits, bitmask.to(logits.device), indices)
+        apply_bitmask(logits, bitmask.to(logits.device, non_blocking=True), indices)
 
     def _get_matchers(
         self, tasks: list[ConstraintDecodeTask]
@@ -128,4 +126,4 @@ def apply_bitmask_torch(
 def apply_bitmask(logits: torch.Tensor, bitmask: torch.Tensor, indices: list[int]):
     if is_ascend() or is_muxi():
         return apply_bitmask_torch(logits, bitmask, indices)
-    return xgrammar.apply_token_bitmask_inplace(logits, bitmask, indices=indices)
+    return apply_token_bitmask_inplace(logits, bitmask, indices=indices)
