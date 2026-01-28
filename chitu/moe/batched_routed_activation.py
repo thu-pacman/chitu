@@ -441,24 +441,40 @@ class PerExpertDenseBatchedRoutedActivationBlockfp8(
 
 
 @dataclass
-class ConcatPermutedBatchedRoutedActivation(BatchedRoutedActivation):
+class ConcatPermutedBatchedRoutedActivationMinimal(BatchedRoutedActivation):
     """
     Activations are permuted for each experts and then concatenated, with indices
-    expressing the relation between the permuted activation and tokens, and between
-    the permuted activation and experts.
-
-    Each (token, topk) pair maps to one row in the permuted activation, expressed by
-    `token_comma_topk_to_concat_indices`.
+    expressing the relation between the permuted activation and experts.
 
     Each contiguous segment of `n_tokens_per_expert` rows in the concatenated activation
     maps to an expert.
+
+    Please note that this "minimal" variant does NOT contain necessary indices
+    for local summation after expert computation. It is dedicated for summing inside EP
+    communication operators. In order for full functionality, please use
+    `ConcatPermutedBatchedRoutedActivation`.
     """
 
     concat_activation: torch.Tensor  # [batch_size * topk, hidden_size]
+    n_tokens_per_expert: torch.Tensor  # [n_experts]
+
+
+@dataclass
+class ConcatPermutedBatchedRoutedActivation(
+    ConcatPermutedBatchedRoutedActivationMinimal
+):
+    """
+    Full variant of `ConcatPermutedBatchedRoutedActivationMinimal`.
+
+    Compared to `ConcatPermutedBatchedRoutedActivationMinimal`, this variant also contains
+    indices expressing the relation between the permuted activation and tokens. Each
+    (token, topk) pair maps to one row in the permuted activation, expressed by
+    `token_comma_topk_to_concat_indices`.
+    """
+
     token_comma_topk_to_concat_indices: (
         torch.Tensor
     )  # [batch_size, topk] -> batch_size * topk
-    n_tokens_per_expert: torch.Tensor  # [n_experts]
 
     @classmethod
     @override
@@ -466,9 +482,21 @@ class ConcatPermutedBatchedRoutedActivation(BatchedRoutedActivation):
     def convert_from(
         cls, old: IndexedBatchedRoutedActivation, *, n_experts: int
     ) -> "ConcatPermutedBatchedRoutedActivation":
-        return cls(
-            *batched_routed_activation_indexed_to_concat_permuted(
+        concat_activation, token_x_topk_to_concat_indices, n_tokens_per_expert = (
+            batched_routed_activation_indexed_to_concat_permuted(
                 old.activation, old.token_to_expert_indices, n_experts=n_experts
-            ),
+            )
+        )
+        return cls(
+            concat_activation=concat_activation,
+            token_comma_topk_to_concat_indices=token_x_topk_to_concat_indices,
+            n_tokens_per_expert=n_tokens_per_expert,
             expert_ids_are_local=old.expert_ids_are_local,
         )
+
+
+@dataclass
+class ConcatPermutedBatchedRoutedActivationMinimalAscendInt8(
+    ConcatPermutedBatchedRoutedActivationMinimal
+):
+    concat_activation_scale: torch.Tensor  # [batch_size * topk]

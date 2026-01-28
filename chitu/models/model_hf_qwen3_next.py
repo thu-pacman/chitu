@@ -482,7 +482,6 @@ class ParallelMoeBlockQwen3Next(ParallelMoeBlock):
                 experts_end_idx,
                 base_moe_experts_class,
                 quant_kwargs,
-                layer_id=layer_id,
                 checkpoint_prefix=f"{checkpoint_prefix}.experts",
             ),
             non_fused_shared_experts=SharedExpertGateAndBodyQwen3Next(

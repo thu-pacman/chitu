@@ -13,12 +13,18 @@ from chitu.moe.load_balancer.executor import (
     ExpertParamAccessor,
     WeightMigrationExecutor,
 )
-from chitu.moe.load_balancer.planner import MoELoadPlanner
+from chitu.moe.load_balancer.base_dynamic_planner import (
+    BaseMoELoadPlanner,
+)
+from chitu.moe.load_balancer.dynamic_planner_impl import (
+    MoELoadPlannerSwap,
+    MoELoadPlannerReplace,
+)
 from chitu.distributed.comm_group import CommGroup
 
 logger = getLogger(__name__)
 
-_PLANNER: Optional[MoELoadPlanner] = None
+_PLANNER: Optional[BaseMoELoadPlanner] = None
 
 _EXECUTOR = None  # type: ignore[var-annotated]
 
@@ -37,15 +43,26 @@ def init_moe_load_balancer(
     global _PLANNER
     if _PLANNER is not None:
         return
-    _PLANNER = MoELoadPlanner(
-        ep_group=ep_group,
-        num_layers=num_layers,
-        num_experts=num_experts,
-        slot_nums=slot_nums,
-        enable=enable,
-        moe_lb_trigger=moe_lb_trigger,
-        moe_lb_threshold=moe_lb_threshold,
-    )
+    if num_experts < slot_nums:
+        _PLANNER = MoELoadPlannerReplace(
+            ep_group=ep_group,
+            num_layers=num_layers,
+            num_experts=num_experts,
+            slot_nums=slot_nums,
+            enable=enable,
+            moe_lb_trigger=moe_lb_trigger,
+            moe_lb_threshold=moe_lb_threshold,
+        )
+    else:
+        _PLANNER = MoELoadPlannerSwap(
+            ep_group=ep_group,
+            num_layers=num_layers,
+            num_experts=num_experts,
+            slot_nums=slot_nums,
+            enable=enable,
+            moe_lb_trigger=moe_lb_trigger,
+            moe_lb_threshold=moe_lb_threshold,
+        )
     logger.info(
         f"MoE load balancer initialized: num_layers={num_layers}, num_experts={num_experts}, slot_nums={slot_nums}"
     )
@@ -54,7 +71,7 @@ def init_moe_load_balancer(
 essential_getter_warning_logged = False
 
 
-def get_moe_load_planner() -> Optional[MoELoadPlanner]:
+def get_moe_load_planner() -> Optional[BaseMoELoadPlanner]:
     """Get the global MoE load balancer instance."""
     return _PLANNER
 

@@ -24,9 +24,16 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     """
 
     def __init__(
-        self, *, tp_group: CommGroup, dp_group: CommGroup, ep_group: CommGroup
+        self,
+        *,
+        tp_group: CommGroup,
+        dp_group: CommGroup,
+        etp_group: CommGroup,
+        ep_group: CommGroup,
     ):
-        super().__init__(tp_group=tp_group, dp_group=dp_group, ep_group=ep_group)
+        super().__init__(
+            tp_group=tp_group, dp_group=dp_group, etp_group=etp_group, ep_group=ep_group
+        )
         # set in prepare
         # its a cpu list now
         self.cum_num_tokens = None

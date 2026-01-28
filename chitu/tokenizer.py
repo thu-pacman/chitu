@@ -430,7 +430,10 @@ class ChatFormatHF:
         if hasattr(self.tokenizer.model, "apply_chat_template"):
             chat_template_kwargs = chat_template_kwargs or {}
             return self.tokenizer.model.apply_chat_template(
-                dialog, add_generation_prompt=True, **chat_template_kwargs
+                dialog,
+                add_generation_prompt=True,
+                return_dict=False,
+                **chat_template_kwargs,
             )
 
         else:

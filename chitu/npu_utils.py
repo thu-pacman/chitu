@@ -5,12 +5,13 @@
 import logging
 import functools
 import torch
-import torch_npu
-import torch.distributed as dist
-from torch_npu.contrib import transfer_to_npu
 
 from chitu.global_vars import get_global_args
-from chitu.utils import try_import_opt_dep, ceil_div, next_power_of_two
+from chitu.utils import (
+    try_import_opt_dep,
+    try_import_and_setup_torch_npu,
+    next_power_of_two,
+)
 from chitu.distributed.parallel_state import (
     get_ep_size,
     get_ep_group,
@@ -24,14 +25,20 @@ from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
     ConcatPermutedBatchedRoutedActivation,
+    ConcatPermutedBatchedRoutedActivationMinimal,
 )
 from chitu.moe.batched_expert_result import (
     BatchedExpertResult,
     ConcatPermutedBatchedExpertResult,
+    ConcatPermutedBatchedExpertResultMinimal,
 )
-from chitu.moe.load_balancer import get_moe_load_planner
+from chitu.native_layout import (
+    NativeLayoutTensor,
+    NpuFractalZnTensor,
+    Packed4BitWeightNPUNativeMXFP4,
+)
 
-
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 logger = logging.getLogger(__name__)
@@ -77,7 +84,7 @@ def get_hcomm_info(rank, comm_group):
     return hcomm_info
 
 
-def _fused_experts_npu_tp_split(
+def fused_experts_npu_tp_split(
     input: torch.Tensor, n_local_experts=-1, is_expert_ids=False, is_zero_batch_ok=False
 ):
     rank_in_group = get_tp_group().rank_in_group
@@ -97,7 +104,7 @@ def _fused_experts_npu_tp_split(
     return torch.arange(st, ed, dtype=output.dtype, device=output.device).view(1, -1)
 
 
-def _fused_experts_npu_tp_all_gather(input: torch.Tensor, origin_bs: int):
+def fused_experts_npu_tp_all_gather(input: torch.Tensor, origin_bs: int):
     output = input.new_empty((origin_bs,) + input.shape[1:])
     tensor_list = list(torch.tensor_split(output, get_tp_size()))
     rank_in_group = get_tp_group().rank_in_group
@@ -107,157 +114,35 @@ def _fused_experts_npu_tp_all_gather(input: torch.Tensor, origin_bs: int):
     return output
 
 
-def fused_experts_npu_with_a2a_communication(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    top_k: int = 8,
+def fused_experts_npu_for_ep(
+    x: ConcatPermutedBatchedRoutedActivationMinimal,
+    w1: torch.Tensor | NativeLayoutTensor,
+    w2: torch.Tensor | NativeLayoutTensor,
     w1_scale=None,
     w2_scale=None,
     experts_start_idx=0,
-    max_bs: int = 0,
     use_int8_w8a8=False,
-    **kwargs,
-):
-    """
-    hidden_states / w1 / w2 / topk_weights / topk_ids / experts_start_idx
-    """
-    n_local_experts = w1.shape[0]
-
-    if get_etp_size() > 1:
-        raise NotImplementedError
-    if get_tp_size() > 1:
-        # split inputs from tp group into ep rank
-        origin_bs = hidden_states.shape[0]
-        hidden_states = _fused_experts_npu_tp_split(
-            hidden_states, is_zero_batch_ok=True
-        )
-        topk_weights = _fused_experts_npu_tp_split(topk_weights, is_zero_batch_ok=True)
-        topk_ids = _fused_experts_npu_tp_split(
-            topk_ids, n_local_experts, is_expert_ids=True
-        )
-
-    bs, hidden_dim = hidden_states.shape
-    _, topk = topk_weights.shape
-    assert (
-        hidden_states.dtype == topk_weights.dtype
-    ), "hidden_states and topk_weights must have the same dtype"
-    topk_ids = topk_ids.int()
-    ep_size = get_ep_size()
-    max_num_deployed_expert = n_local_experts * ep_size
-
-    if get_etp_size() == 1 or get_etp_group().is_first_rank:
-        if not hidden_states.shape[0] == 0:
-            (
-                expanded_x,
-                expanded_row_idx,
-                n_tokens_per_expert_local_dp_rank,
-                pertoken_scale,
-            ) = torch_npu.npu_moe_init_routing_v2(
-                hidden_states,
-                expert_idx=topk_ids,
-                scale=None,
-                expert_num=max_num_deployed_expert,
-                active_expert_range=[0, max_num_deployed_expert],
-                expert_tokens_num_type=1,
-                expert_tokens_num_flag=True,
-                active_num=topk_ids.numel(),
-                drop_pad_mode=0,
-                row_idx_type=0,
-                quant_mode=1 if use_int8_w8a8 else -1,
-            )
-        else:
-            expanded_x = torch.empty(
-                0,
-                hidden_dim,
-                device=hidden_states.device,
-                dtype=torch.int8 if use_int8_w8a8 else hidden_states.dtype,
-            )
-            expanded_row_idx = torch.empty(
-                0, device=hidden_states.device, dtype=torch.int32
-            )
-            n_tokens_per_expert_local_dp_rank = torch.zeros(
-                max_num_deployed_expert, device=hidden_states.device, dtype=torch.int64
-            )
-            if use_int8_w8a8:
-                pertoken_scale = torch.empty(
-                    0, device=hidden_states.device, dtype=torch.float32
-                )
-
-        assert tuple(expanded_x.shape) == (bs * topk, hidden_dim)
-        assert tuple(expanded_row_idx.shape) == (bs * topk,)
-        assert expanded_row_idx.dtype == torch.int32
-        assert tuple(n_tokens_per_expert_local_dp_rank.shape) == (
-            max_num_deployed_expert,
-        )
-        assert n_tokens_per_expert_local_dp_rank.dtype == torch.int64
-        if use_int8_w8a8:
-            assert tuple(pertoken_scale.shape) == (bs * topk,)
-            assert pertoken_scale.dtype == torch.float32
+) -> ConcatPermutedBatchedExpertResultMinimal:
+    if isinstance(w1, torch.Tensor):
+        w1 = w1.transpose(1, 2)
+    elif isinstance(w1, NpuFractalZnTensor):
+        w1 = w1.layout_tensor
     else:
-        raise NotImplementedError
-        # expanded_x = torch.empty(
-        #     0,
-        #     hidden_dim,
-        #     device=hidden_states.device,
-        #     dtype=torch.int8 if use_int8_w8a8 else hidden_states.dtype,
-        # )
-        # expanded_row_idx = torch.empty(
-        #     0, device=hidden_states.device, dtype=torch.int32
-        # )
-        # n_tokens_per_expert_local_dp_rank = torch.zeros(
-        #     max_num_deployed_expert, device=hidden_states.device, dtype=torch.int64
-        # )
-        # if use_int8_w8a8:
-        #     pertoken_scale = torch.empty(
-        #         0, device=hidden_states.device, dtype=torch.float32
-        #     )
+        raise NotImplementedError(f"Unsupported type of `w1`: {type(w1)}")
+    if isinstance(w2, torch.Tensor):
+        w2 = w2.transpose(1, 2)
+    elif isinstance(w2, NpuFractalZnTensor):
+        w2 = w2.layout_tensor
+    else:
+        raise NotImplementedError(f"Unsupported type of `w2`: {type(w2)}")
 
-    n_tokens_per_expert_local_ep_rank = n_tokens_per_expert_local_dp_rank.new_empty(
-        n_tokens_per_expert_local_dp_rank.shape[0]
-    )
-    dist.all_to_all_single(
-        n_tokens_per_expert_local_ep_rank, n_tokens_per_expert_local_dp_rank
-    )  # (total_experts,) --> (total_ranks * n_routed_experts_per_rank)
-    combine_tokens = torch.stack(
-        [n_tokens_per_expert_local_ep_rank, n_tokens_per_expert_local_dp_rank], dim=0
-    )
+    n_local_experts = w1.shape[0]
+    x = x.as_local_expert_ids(experts_start_idx, experts_start_idx + n_local_experts)
 
-    combine_tokens = combine_tokens.view(2, ep_size, -1).sum(2)
-    all_tokens = combine_tokens[0].sum()
-    combine_tokens_cpu = combine_tokens.cpu().tolist()
-    # alltoall input splits, the total number of tokens routed from the current rank to other ranks
-    input_splits = combine_tokens_cpu[1]
-    # alltoall output splits, the number of tokens each rank receives from other cards
-    output_splits = combine_tokens_cpu[0]
-    # alltoall output, unfolded into one dimension, the size is the sum of the number of tokens routed from other cards to the current rank.
-    gathered_tokens = expanded_x.new_empty(all_tokens.item(), expanded_x.shape[1])
-    dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits)
-    if use_int8_w8a8:
-        gathered_scales = pertoken_scale.new_empty(all_tokens.item(), 1)
-        dist.all_to_all_single(
-            gathered_scales, pertoken_scale, output_splits, input_splits
-        )
-    (
-        hidden_states,
-        permute_per_token_scales,
-        gathered_idxs_unsort,
-        tokens_per_local_expert,
-    ) = torch_npu.npu_moe_re_routing(
-        gathered_tokens,
-        n_tokens_per_expert_local_ep_rank.view(ep_size, -1),
-        per_token_scales=None if not use_int8_w8a8 else gathered_scales,
-    )
+    group_list = x.n_tokens_per_expert.to(torch.int64)
 
-    if use_int8_w8a8:
-        counts = tokens_per_local_expert.to(torch.int64)
-
-    group_list = tokens_per_local_expert.to(torch.int64)
-    w1 = w1.transpose(1, 2) if not use_int8_w8a8 else w1
     hidden_states = torch_npu.npu_grouped_matmul(
-        [hidden_states],
+        [x.concat_activation],
         [w1],
         group_list=group_list,
         split_item=3,
@@ -271,181 +156,7 @@ def fused_experts_npu_with_a2a_communication(
         hidden_states, gate_up_out_scale = torch_npu.npu_dequant_swiglu_quant(
             x=hidden_states,
             weight_scale=w1_scale_fp32,
-            activation_scale=permute_per_token_scales,
-            bias=None,
-            quant_scale=None,
-            quant_offset=None,
-            group_index=counts,  # Only support group_list_type=1, so use expert counts
-            activate_left=True,
-            quant_mode=1,
-        )
-    else:
-        hidden_states = torch_npu.npu_swiglu(hidden_states)
-
-    # gmm2: down
-    w2 = w2.transpose(1, 2) if not use_int8_w8a8 else w2
-    hidden_states = torch_npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[w2],
-        scale=[w2_scale.contiguous()] if use_int8_w8a8 else None,
-        per_token_scale=[gate_up_out_scale] if use_int8_w8a8 else None,
-        split_item=3,
-        group_list_type=1,
-        group_type=0,
-        group_list=group_list,
-        output_dtype=(
-            w2_scale.dtype if use_int8_w8a8 else None
-        ),  # make sure the output dtype is bf16
-    )[0]
-
-    hidden_states = torch.index_select(
-        hidden_states,
-        0,
-        gathered_idxs_unsort.to(torch.float32).argsort().to(torch.int32),
-    )
-
-    gathered_tokens = hidden_states.new_empty(*expanded_x.shape)
-
-    dist.all_to_all_single(gathered_tokens, hidden_states, input_splits, output_splits)
-
-    if get_etp_size() == 1 or get_etp_group().is_first_rank:
-        final_hidden_states = torch_npu.npu_moe_finalize_routing(
-            gathered_tokens,
-            skip1=None,
-            skip2=None,
-            bias=None,
-            scales=topk_weights.to(gathered_tokens.dtype),
-            expanded_src_to_dst_row=expanded_row_idx,
-            export_for_source_row=None,
-            drop_pad_mode=2,
-        )
-        assert tuple(final_hidden_states.shape) == (bs, hidden_dim)
-        assert final_hidden_states.dtype == hidden_states.dtype
-    else:
-        raise NotImplementedError
-        # final_hidden_states = torch.empty(
-        #     bs, hidden_dim, dtype=hidden_states.dtype, device=hidden_states.device
-        # )
-
-    if get_etp_size() > 1:
-        raise NotImplementedError
-        # torch.distributed.broadcast(
-        #     final_hidden_states,
-        #     src=get_tp_group().rank_list[0],
-        #     group=get_tp_group().gpu_group,
-        # )
-
-    if get_tp_size() > 1:
-        final_hidden_states = _fused_experts_npu_tp_all_gather(
-            final_hidden_states, origin_bs
-        )
-    return final_hidden_states
-
-
-def fused_experts_npu_with_communication(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    top_k: int = 8,
-    w1_scale=None,
-    w2_scale=None,
-    experts_start_idx=0,
-    use_int8_w8a8=False,
-    layer_id: int = 0,
-    **kwargs,
-):
-    origin_bs = hidden_states.shape[0]
-    n_local_experts = w1.shape[0]
-    rank = torch.distributed.get_rank()
-
-    if is_ascend_910b():
-        if get_ep_size() % 16 != 0:
-            raise NotImplementedError(
-                "torch_npu.npu_moe_distribute_dispatch_v2 has an additional limit of ep_size % 16 == 0 on 910B devices"
-            )
-
-    ep_size = get_ep_size()
-    ep_hcomm_info = get_hcomm_info(rank, get_ep_group().gpu_group)
-    ep_rank = get_ep_group().rank_in_group
-    etp_size = get_etp_size()
-
-    if get_etp_size() > 1:
-        raise NotImplementedError
-    if get_tp_size() > 1 or origin_bs == 0:
-        # split inputs from tp group into ep rank
-        hidden_states = _fused_experts_npu_tp_split(hidden_states)
-        topk_weights = _fused_experts_npu_tp_split(topk_weights)
-        topk_ids = _fused_experts_npu_tp_split(
-            topk_ids, n_local_experts, is_expert_ids=True
-        )
-
-    if etp_size > 1:
-        tp_hcomm_info = get_hcomm_info(rank, get_tp_group().gpu_group)
-        tp_rank = get_tp_group().rank_in_group
-    else:
-        tp_hcomm_info = ""
-        tp_rank = 0
-
-    global_num_experts = n_local_experts * ep_size
-    global_bs_for_distpatch_combine = (
-        ceil_div(get_global_args().infer.max_reqs, ep_size)
-        * ep_size
-        * get_global_args().infer.mtp_size
-    )
-
-    (
-        expand_x,
-        dynamic_scales,
-        expand_idx,
-        expert_token_nums,
-        ep_recv_counts,
-        tp_recv_counts,
-        expand_scales,
-    ) = torch_npu.npu_moe_distribute_dispatch_v2(
-        x=hidden_states,
-        expert_ids=topk_ids,
-        group_ep=ep_hcomm_info,
-        ep_world_size=ep_size,
-        ep_rank_id=ep_rank,
-        group_tp=tp_hcomm_info,
-        tp_world_size=etp_size,
-        tp_rank_id=tp_rank,
-        shared_expert_rank_num=0,
-        moe_expert_num=global_num_experts,
-        quant_mode=0 if not use_int8_w8a8 else 2,
-        global_bs=global_bs_for_distpatch_combine,
-    )
-
-    group_list = expert_token_nums.to(torch.int64)
-    w1 = w1.transpose(1, 2) if not use_int8_w8a8 else w1
-    is_dynamic = get_global_args().infer.moe_lb_trigger > 0
-    planner = get_moe_load_planner()
-    if is_dynamic and planner is not None:
-        planner.record_global_slot_activations(
-            layer_id=layer_id, local_slot_stats=group_list
-        )
-    if use_int8_w8a8:
-        dynamic_scales = dynamic_scales.to(torch.float32).contiguous()
-
-    hidden_states = torch_npu.npu_grouped_matmul(
-        [expand_x],
-        [w1],
-        bias=None,
-        group_list=group_list,
-        split_item=3,
-        group_type=0,
-        group_list_type=1,
-        output_dtype=(torch.int32 if use_int8_w8a8 else None),
-    )[0]
-
-    if use_int8_w8a8:
-        w1_scale_fp32 = w1_scale.to(torch.float32).contiguous()
-        hidden_states, gate_up_out_scale = torch_npu.npu_dequant_swiglu_quant(
-            x=hidden_states,
-            weight_scale=w1_scale_fp32,
-            activation_scale=dynamic_scales,
+            activation_scale=x.concat_activation_scale.to(torch.float32).contiguous(),
             bias=None,
             quant_scale=None,
             quant_offset=None,
@@ -456,7 +167,6 @@ def fused_experts_npu_with_communication(
     else:
         hidden_states = torch_npu.npu_swiglu(hidden_states)
 
-    w2 = w2.transpose(1, 2) if not use_int8_w8a8 else w2
     hidden_states = torch_npu.npu_grouped_matmul(
         x=[hidden_states],
         weight=[w2],
@@ -471,44 +181,13 @@ def fused_experts_npu_with_communication(
         ),  # make sure the output dtype is bf16
     )[0]
 
-    hidden_states = torch_npu.npu_moe_distribute_combine_v2(
-        expand_x=hidden_states,
-        expert_ids=topk_ids,
-        assist_info_for_combine=expand_idx,
-        ep_send_counts=ep_recv_counts,
-        expert_scales=topk_weights.to(torch.float),
-        tp_send_counts=tp_recv_counts,
-        expand_scales=expand_scales,
-        group_ep=ep_hcomm_info,
-        ep_world_size=ep_size,
-        ep_rank_id=ep_rank,
-        group_tp=tp_hcomm_info,
-        tp_world_size=etp_size,
-        tp_rank_id=tp_rank,
-        moe_expert_num=global_num_experts,
-        global_bs=global_bs_for_distpatch_combine,
-        comm_quant_mode=2 if use_int8_w8a8 else 0,
-    )
-
-    if origin_bs == 0:
-        hidden_states = torch.empty(
-            0,
-            hidden_states.shape[1],
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        return hidden_states
-
-    if get_tp_size() > 1:
-        hidden_states = _fused_experts_npu_tp_all_gather(hidden_states, origin_bs)
-
-    return hidden_states
+    return ConcatPermutedBatchedExpertResultMinimal(hidden_states)
 
 
 def fused_experts_npu(
     hidden_states: BatchedRoutedActivation,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
+    w1: torch.Tensor | NativeLayoutTensor,
+    w2: torch.Tensor | NativeLayoutTensor,
     topk_weights: torch.Tensor,
     w1_scale=None,
     w2_scale=None,
@@ -517,7 +196,7 @@ def fused_experts_npu(
     experts_start_idx: int = 0,
     use_int8_w8a8=False,
 ):
-    n_local_experts = w1.shape[0]
+    n_local_experts = w1.shape[0] if isinstance(w1, torch.Tensor) else w1.plain_shape[0]
     if not hidden_states.expert_ids_are_local:
         # TODO: Use `hidden_states.as_local_expert_ids`
         assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
@@ -549,8 +228,8 @@ def fused_experts_npu(
 @functools.singledispatch
 def fused_experts_npu_impl(
     hidden_states: BatchedRoutedActivation,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
+    w1: torch.Tensor | NativeLayoutTensor,
+    w2: torch.Tensor | NativeLayoutTensor,
     w1_scale=None,
     w2_scale=None,
     use_int8_w8a8=False,
@@ -561,15 +240,18 @@ def fused_experts_npu_impl(
 @fused_experts_npu_impl.register
 def _(
     hidden_states: IndexedBatchedRoutedActivation,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
+    w1: torch.Tensor | NativeLayoutTensor,
+    w2: torch.Tensor | NativeLayoutTensor,
     w1_scale=None,
     w2_scale=None,
     use_int8_w8a8=False,
 ) -> BatchedExpertResult:
     return fused_experts_npu_impl(
         ConcatPermutedBatchedRoutedActivation.convert_from(
-            hidden_states, n_experts=w1.shape[0]
+            hidden_states,
+            n_experts=(
+                w1.shape[0] if isinstance(w1, torch.Tensor) else w1.plain_shape[0]
+            ),
         ),
         w1=w1,
         w2=w2,
@@ -582,8 +264,8 @@ def _(
 @fused_experts_npu_impl.register
 def _(
     hidden_states: ConcatPermutedBatchedRoutedActivation,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
+    w1: torch.Tensor | NativeLayoutTensor,
+    w2: torch.Tensor | NativeLayoutTensor,
     w1_scale=None,
     w2_scale=None,
     use_int8_w8a8=False,
@@ -608,13 +290,13 @@ def _(
 
     if concat_activation.numel() == 0:
         return ConcatPermutedBatchedExpertResult(
-            torch.empty(
+            concat_activation=torch.empty(
                 0,
                 concat_activation.shape[-1],
                 dtype=concat_activation.dtype,
                 device=concat_activation.device,
             ),
-            hidden_states.token_comma_topk_to_concat_indices,
+            token_comma_topk_to_concat_indices=hidden_states.token_comma_topk_to_concat_indices,
         )
 
     if use_int8_w8a8:
@@ -634,7 +316,12 @@ def _(
             ),  # FIXME: Do cumsum inside the kernel
         )
     else:
-        w1 = w1.transpose(1, 2) if not use_int8_w8a8 else w1
+        if isinstance(w1, torch.Tensor):
+            w1 = w1.transpose(1, 2)
+        elif isinstance(w1, NpuFractalZnTensor):
+            w1 = w1.layout_tensor
+        else:
+            raise NotImplementedError(f"Unsupported type of `w1`: {type(w1)}")
         gate_up_out = torch_npu.npu_grouped_matmul(
             x=[concat_activation],
             weight=[w1],
@@ -673,7 +360,12 @@ def _(
             ),  # FIXME: Do cumsum inside the kernel
         )
     else:
-        w2 = w2.transpose(1, 2) if not use_int8_w8a8 else w2
+        if isinstance(w2, torch.Tensor):
+            w2 = w2.transpose(1, 2)
+        elif isinstance(w2, NpuFractalZnTensor):
+            w2 = w2.layout_tensor
+        else:
+            raise NotImplementedError(f"Unsupported type of `w2`: {type(w2)}")
         down_out_list = torch_npu.npu_grouped_matmul(
             x=[gate_up_out],
             weight=[w2],
@@ -689,7 +381,8 @@ def _(
         )[0]
 
     return ConcatPermutedBatchedExpertResult(
-        down_out_list, hidden_states.token_comma_topk_to_concat_indices
+        concat_activation=down_out_list,
+        token_comma_topk_to_concat_indices=hidden_states.token_comma_topk_to_concat_indices,
     )
 
 

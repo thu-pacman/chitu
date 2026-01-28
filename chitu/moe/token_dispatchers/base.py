@@ -29,10 +29,16 @@ class MoETokenDispatcher(ABC):
     """
 
     def __init__(
-        self, *, tp_group: CommGroup, dp_group: CommGroup, ep_group: CommGroup
+        self,
+        *,
+        tp_group: CommGroup,
+        dp_group: CommGroup,
+        etp_group: CommGroup,
+        ep_group: CommGroup,
     ):
         self.tp_group = tp_group
         self.dp_group = dp_group
+        self.etp_group = etp_group
         self.ep_group = ep_group
 
     @abstractmethod
@@ -119,34 +125,3 @@ class MoETokenDispatcher(ABC):
         raise NotImplementedError(
             f"exit_moe_after_local_sum is not implemented for {type(self)}"
         )
-
-
-class MoEEmptyTokenDispatcher(MoETokenDispatcher):
-    def __init__(
-        self, *, tp_group: CommGroup, dp_group: CommGroup, ep_group: CommGroup
-    ):
-        super().__init__(tp_group=tp_group, dp_group=dp_group, ep_group=ep_group)
-
-    @override
-    def prepare(self, num_tokens):
-        pass
-
-    @override
-    def enter_moe(
-        self,
-        x: BatchedRoutedActivation,
-        topk_weights: torch.Tensor,
-        *,
-        may_fuse_quant: Optional[str] = None,
-        may_fuse_quant_kwargs: dict = {},
-        layer_id: Optional[int] = None,
-    ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
-        return x, topk_weights
-
-    @override
-    def exit_moe_prefer_before_local_sum(self) -> bool:
-        return False
-
-    @override
-    def exit_moe_after_local_sum(self, local_sum_result: torch.Tensor) -> torch.Tensor:
-        return local_sum_result
