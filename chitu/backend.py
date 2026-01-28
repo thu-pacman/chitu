@@ -98,6 +98,8 @@ class Backend:
     pp_stage = None
     pp_end_stage = None
     pp_main_rank = None
+    # Unique session ID for IPC paths (to prevent conflicts on shared /tmp)
+    ipc_session_id: str = ""
 
     # components
     schedulers: Optional[list["Scheduler"]] = None  # One per each DP rank
@@ -307,7 +309,9 @@ class Backend:
             ep_size=expert_parallel_size,
             pp_size=pipeline_parallel_size,
         )
-        Backend.ip_port_list = get_world_group().gather_all_rank_ip_port()
+        world_group = get_world_group()
+        Backend.ip_port_list = world_group.gather_all_rank_ip_port()
+        Backend.ipc_session_id = world_group.generate_ipc_session_id()
 
         Backend.pp_stage = (
             global_rank
