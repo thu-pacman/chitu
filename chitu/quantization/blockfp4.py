@@ -350,7 +350,6 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
-        layer_id: int,
         ############################################
         # No parameters specific to this quantization
         no_input_scale: bool = False,
@@ -373,7 +372,6 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
             fuse_shared_experts,
             checkpoint_prefix,
             merge_gate_up,
-            layer_id,
         )
 
         quant_scale_stride = 16

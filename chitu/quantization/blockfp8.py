@@ -210,7 +210,6 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
-        layer_id: int,
         ############################################
         # No parameters specific to this quantization
         block_size: int = 128,
@@ -232,7 +231,6 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
             fuse_shared_experts,
             checkpoint_prefix,
             merge_gate_up,
-            layer_id,
         )
 
         # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.

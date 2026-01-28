@@ -20,6 +20,7 @@ from chitu.moe.batched_routed_activation import (
     ConcatPermutedBatchedRoutedActivationMinimalAscendInt8,
 )
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
+from chitu.moe.load_balancer import get_moe_load_planner
 from chitu.npu_utils import (
     fused_experts_npu_tp_split,
     fused_experts_npu_tp_all_gather,
@@ -138,6 +139,12 @@ class MoENpuDistributeTokenDispatcher(MoETokenDispatcher):
             global_bs=global_bs_for_distpatch_combine,
         )
 
+        if get_global_args().infer.moe_lb_trigger > 0:
+            if (planner := get_moe_load_planner()) is not None:
+                planner.record_global_slot_activations(
+                    layer_id=layer_id, local_slot_stats=expert_token_nums
+                )
+
         self.topk_ids = topk_ids
         self.topk_weights = topk_weights
         self.expand_idx = expand_idx
@@ -201,7 +208,6 @@ class MoENpuDistributeTokenDispatcher(MoETokenDispatcher):
             tp_rank_id=self.etp_group.rank_in_group,
             moe_expert_num=self.num_global_experts,
             global_bs=self.global_bs_for_distpatch_combine,
-            # comm_quant_mode=2 if use_int8_w8a8 else 0, # ??? FIXME
         )
 
         if self.origin_bs == 0:

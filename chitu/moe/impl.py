@@ -238,9 +238,7 @@ class MoEImplEP(MoEImplBase):
                 and has_torch_npu
                 and not (is_ascend_910b() and self.tp_size > 1)
             ):
-                self.decode_token_dispatcher_impl = (
-                    "fused_experts_for_distribute_communication"
-                )
+                self.decode_token_dispatcher_impl = "npu_distribute"
             elif self.dp_size > 1 and has_torch_npu:
                 self.decode_token_dispatcher_impl = "npu_all_to_all"
             else:
@@ -271,7 +269,7 @@ class MoEImplEP(MoEImplBase):
                 etp_group=self.etp_group,
                 ep_group=self.ep_group,
             )
-            self.prefill_experts_impl = "fused_experts_for_a2a_communication"
+            self.prefill_experts_impl = "fused_experts_for_ep"
         elif self.prefill_token_dispatcher_impl == "allgather":
             self.prefill_token_dispatcher = MoEAllGatherTokenDispatcher(
                 tp_group=self.tp_group,
@@ -304,11 +302,8 @@ class MoEImplEP(MoEImplBase):
                 etp_group=self.etp_group,
                 ep_group=self.ep_group,
             )
-            self.decode_experts_impl = "fused_experts_for_a2a_communication"
-        elif (
-            self.decode_token_dispatcher_impl
-            == "fused_experts_for_distribute_communication"
-        ):
+            self.decode_experts_impl = "fused_experts_for_ep"
+        elif self.decode_token_dispatcher_impl == "npu_distribute":
             self.decode_token_dispatcher = MoENpuDistributeTokenDispatcher(
                 self.n_global_experts_slots,
                 tp_group=self.tp_group,
@@ -316,7 +311,7 @@ class MoEImplEP(MoEImplBase):
                 etp_group=self.etp_group,
                 ep_group=self.ep_group,
             )
-            self.decode_experts_impl = "fused_experts_for_distribute_communication"
+            self.decode_experts_impl = "fused_experts_for_ep"
         elif self.decode_token_dispatcher_impl == "allgather":
             self.decode_token_dispatcher = MoEAllGatherTokenDispatcher(
                 tp_group=self.tp_group,

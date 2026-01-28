@@ -49,7 +49,6 @@ def Qwen3MoeExperts(
     experts_end_idx: int,
     base_moe_experts_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-    layer_id: int = 0,
     *,
     checkpoint_prefix: str,
 ):
@@ -76,7 +75,6 @@ def Qwen3MoeExperts(
         fuse_shared_experts=False,
         checkpoint_prefix=f"{checkpoint_prefix}.moe",
         merge_gate_up=merge_gate_up,
-        layer_id=layer_id,
     )
 
 
@@ -121,7 +119,6 @@ class ParallelMoeBlockQwen3(ParallelMoeBlock):
                 experts_end_idx,
                 base_moe_experts_class,
                 quant_kwargs,
-                layer_id=layer_id,
                 checkpoint_prefix=f"{checkpoint_prefix}.experts",
             ),
             non_fused_shared_experts=None,

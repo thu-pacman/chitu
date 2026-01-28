@@ -841,7 +841,6 @@ def MoeExpertsDeepSeekV3(
     checkpoint_prefix: str,
     base_moe_experts_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-    layer_id: int = 0,
 ):
     checkpoint_prefix = checkpoint_prefix + ".moe"
     if base_moe_experts_class is None:
@@ -866,7 +865,6 @@ def MoeExpertsDeepSeekV3(
         fuse_shared_experts=get_global_args().infer.fuse_shared_experts,
         checkpoint_prefix=checkpoint_prefix,
         merge_gate_up=merge_gate_up,
-        layer_id=layer_id,
     )
 
 
@@ -917,7 +915,6 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
                 checkpoint_prefix=checkpoint_prefix,
                 base_moe_experts_class=base_moe_experts_class,
                 quant_kwargs=quant_kwargs,
-                layer_id=layer_id,
             ),
             non_fused_shared_experts=non_fused_shared_experts,
             layer_id=layer_id,

@@ -1567,7 +1567,6 @@ class ParallelMoeBlockQwen3VLMoe(ParallelMoeBlock):
             fuse_shared_experts=False,
             checkpoint_prefix=f"{checkpoint_prefix}.experts.moe",
             merge_gate_up=True,
-            layer_id=layer_id,
             dtype=torch.get_default_dtype(),
         )
         super().__init__(

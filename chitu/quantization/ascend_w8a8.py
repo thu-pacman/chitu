@@ -253,7 +253,6 @@ class AscendW8A8DynamicMoeExperts(
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
         merge_gate_up: bool,
-        layer_id: int,
     ):
         """
         Initializes the MoE module.
@@ -272,7 +271,6 @@ class AscendW8A8DynamicMoeExperts(
             fuse_shared_experts,
             checkpoint_prefix,
             merge_gate_up,
-            layer_id,
         )
 
         if self.merge_gate_up:
@@ -315,13 +313,12 @@ class AscendW8A8DynamicMoeExperts(
         if self.merge_gate_up:
             return fused_experts_no_sum_wrapper(
                 routed_x,
-                w1=self.gate_up_proj_weight,
+                w1=self.get_native_layout_gate_up_proj_weight(),
                 w1_scale=self.gate_up_proj_weight_scale,  # fp32
-                w2=self.down_proj_weight,
+                w2=self.get_native_layout_down_proj_weight(),
                 w2_scale=self.down_proj_weight_scale,  # bf16
                 use_int8_w8a8=True,
                 impl=impl,
-                layer_id=self.layer_id,
                 global_num_experts=self.global_n_experts,
                 experts_start_idx=self.experts_start_idx,
             )
@@ -340,14 +337,13 @@ class AscendW8A8DynamicMoeExperts(
         if self.merge_gate_up:
             return fused_experts_and_sum_wrapper(
                 routed_x,
-                w1=self.gate_up_proj_weight,
+                w1=self.get_native_layout_gate_up_proj_weight(),
                 w1_scale=self.gate_up_proj_weight_scale,  # fp32
-                w2=self.down_proj_weight,
+                w2=self.get_native_layout_down_proj_weight(),
                 w2_scale=self.down_proj_weight_scale,  # bf16
                 topk_weights=weights,
                 use_int8_w8a8=True,
                 impl=impl,
-                layer_id=self.layer_id,
                 global_num_experts=self.global_n_experts,
                 experts_start_idx=self.experts_start_idx,
             )
