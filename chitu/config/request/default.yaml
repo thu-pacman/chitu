@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+prompt_tokens_len: -1 # use for performance testing, -1 means use real requests.
+max_new_tokens: 128
+frequency_penalty: 0.0
