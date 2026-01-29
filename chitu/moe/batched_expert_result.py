@@ -101,6 +101,7 @@ class ConcatPermutedBatchedExpertResult(ConcatPermutedBatchedExpertResultMinimal
     token_comma_topk_to_concat_indices: (
         torch.Tensor
     )  # [batch_size, topk] -> batch_size * topk
+    indices_maybe_invalid: bool = True
 
     @override
     def weighted_sum(
@@ -110,6 +111,7 @@ class ConcatPermutedBatchedExpertResult(ConcatPermutedBatchedExpertResultMinimal
             self.concat_activation,
             self.token_comma_topk_to_concat_indices,
             topk_weights,
+            indices_maybe_invalid=self.indices_maybe_invalid,
             out=out,
         )
 

@@ -28,7 +28,7 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 
 if has_torch_npu:
-    from chitu.npu_utils import fused_experts_npu, fused_experts_npu_for_ep
+    from chitu.npu_utils import fused_experts_no_sum_npu, fused_experts_npu_for_ep
 if has_triton:
     from .triton_fused_experts import fused_experts
     from .triton_batched_experts import triton_batched_experts
@@ -68,6 +68,8 @@ def fused_experts_no_sum_wrapper(
     if impl == "auto":
         if has_triton:
             impl = "triton"
+        elif has_torch_npu:
+            impl = "torch_npu"
         else:
             raise NotImplementedError
     if impl == "group_gemm_contiguous":
@@ -263,6 +265,18 @@ def fused_experts_no_sum_wrapper(
             )
         else:
             raise NotImplementedError
+    elif impl == "torch_npu":
+        assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
+        return fused_experts_no_sum_npu(
+            hidden_states,
+            w1=w1,
+            w1_scale=w1_scale,
+            w2=w2,
+            w2_scale=w2_scale,
+            global_num_experts=global_num_experts,
+            experts_start_idx=experts_start_idx,
+            use_int8_w8a8=use_int8_w8a8,
+        )
     elif impl == "fused_experts_for_ep":
         assert isinstance(hidden_states, ConcatPermutedBatchedRoutedActivationMinimal)
         return fused_experts_npu_for_ep(
@@ -320,20 +334,7 @@ def fused_experts_and_sum_wrapper(
         else:
             raise NotImplementedError
 
-    if impl == "torch_npu":
-        assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
-        return fused_experts_npu(
-            hidden_states,
-            w1=w1,
-            w1_scale=w1_scale,
-            w2=w2,
-            w2_scale=w2_scale,
-            topk_weights=topk_weights,
-            global_num_experts=global_num_experts,
-            experts_start_idx=experts_start_idx,
-            use_int8_w8a8=use_int8_w8a8,
-        )
-    else:
+    if True:
         y = fused_experts_no_sum_wrapper(
             hidden_states=hidden_states,
             w1=w1,

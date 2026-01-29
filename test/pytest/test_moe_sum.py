@@ -97,13 +97,21 @@ def test_moe_sum_expert_block_permuted(
 @pytest.mark.parametrize("M", [0, 32, 64, 128])
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("N", [256, 512, 1024])
+@pytest.mark.parametrize("invalid_rate", [0, 0.3])
 @pytest.mark.parametrize("compute_dtype", [torch.float16])
 @pytest.mark.skipif(not has_torch_npu, reason="torch_npu is not available")
-def test_moe_sum_expert_concat_permuted(M, topk, N, compute_dtype, record_benchmark):
+def test_moe_sum_expert_concat_permuted(
+    M, topk, N, invalid_rate, compute_dtype, record_benchmark
+):
     input_tensor = torch.rand(M * topk, N, device="cuda", dtype=compute_dtype)
     token_comma_topk_to_concat_indices = torch.randperm(
         M * topk, dtype=torch.int32, device="cuda"
     ).view(M, topk)
+    if invalid_rate > 0:
+        token_comma_topk_to_concat_indices[
+            torch.rand_like(token_comma_topk_to_concat_indices, dtype=torch.float32)
+            < invalid_rate
+        ] = -1
     topk_weights = torch.rand(M, topk, device="cuda", dtype=compute_dtype)
 
     ref_output = torch.zeros(M, N, device="cuda", dtype=compute_dtype)
@@ -111,6 +119,7 @@ def test_moe_sum_expert_concat_permuted(M, topk, N, compute_dtype, record_benchm
         input_tensor,
         token_comma_topk_to_concat_indices,
         topk_weights,
+        indices_maybe_invalid=(invalid_rate > 0),
         out=ref_output,
         impl="torch",
     )
@@ -122,6 +131,7 @@ def test_moe_sum_expert_concat_permuted(M, topk, N, compute_dtype, record_benchm
             input_tensor,
             token_comma_topk_to_concat_indices,
             topk_weights,
+            indices_maybe_invalid=(invalid_rate > 0),
             out=test_output,
             impl="torch_npu",
         ),

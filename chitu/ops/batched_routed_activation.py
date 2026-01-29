@@ -324,6 +324,8 @@ def batched_routed_activation_indexed_to_concat_permuted(
     token_to_expert_indices: torch.Tensor,
     *,
     n_experts: int,
+    experts_start_idx: int,
+    experts_end_idx: int,
     impl: str = "auto",
 ):
     """
@@ -351,7 +353,11 @@ def batched_routed_activation_indexed_to_concat_permuted(
 
     if impl == "torch_npu":
         return batched_routed_activation_indexed_to_concat_permuted_torch_npu(
-            activation, token_to_expert_indices, n_experts=n_experts
+            activation,
+            token_to_expert_indices,
+            n_experts=n_experts,
+            experts_start_idx=experts_start_idx,
+            experts_end_idx=experts_end_idx,
         )
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
@@ -362,6 +368,8 @@ def batched_routed_activation_indexed_to_concat_permuted_torch_npu(
     token_to_expert_indices: torch.Tensor,
     *,
     n_experts: int,
+    experts_start_idx: int,
+    experts_end_idx: int,
 ):
     n_tokens, top_k = token_to_expert_indices.shape
 
@@ -374,10 +382,14 @@ def batched_routed_activation_indexed_to_concat_permuted_torch_npu(
                 device=activation.device,
             ),
             torch.empty(0, top_k, dtype=torch.int32, device=activation.device),
-            torch.zeros(n_experts, dtype=torch.int32, device=activation.device),
+            torch.zeros(
+                experts_end_idx - experts_start_idx,
+                dtype=torch.int32,
+                device=activation.device,
+            ),
         )
 
-    concat_activation, concat_to_token_indices, n_tokens_per_expert, _ = (
+    concat_activation, token_x_topk_to_concat_indices, n_tokens_per_expert, _ = (
         torch_npu.npu_moe_init_routing_v2(
             activation,
             token_to_expert_indices,
@@ -386,12 +398,12 @@ def batched_routed_activation_indexed_to_concat_permuted_torch_npu(
             expert_tokens_num_type=1,  # 0: output cumsum(n_tokens_per_expert); 1: output n_tokens_per_expert
             expert_tokens_num_flag=True,  # False: don't output n_tokens_per_expert; True: output n_tokens_per_expert
             quant_mode=-1,  # -1: No quant, but may permute quant sacles; 0: Static quant; 1: Dynamic quant
-            active_expert_range=[0, n_experts],  # TODO: narrow this range for EP
+            active_expert_range=[experts_start_idx, experts_end_idx],
             row_idx_type=0,  # 0: output (token,topk)->concat indices; 1: output concat->(token,topk) indices
         )
     )
     return (
         concat_activation,
-        concat_to_token_indices.view(n_tokens, top_k),
+        token_x_topk_to_concat_indices.view(n_tokens, top_k),
         n_tokens_per_expert,
     )

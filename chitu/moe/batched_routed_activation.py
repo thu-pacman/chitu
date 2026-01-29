@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
 from typing_extensions import override
 import dataclasses
 from dataclasses import dataclass
@@ -470,6 +471,14 @@ class ConcatPermutedBatchedRoutedActivation(
     indices expressing the relation between the permuted activation and tokens. Each
     (token, topk) pair maps to one row in the permuted activation, expressed by
     `token_comma_topk_to_concat_indices`.
+
+    `token_comma_topk_to_concat_indices` may contain -1 for invalid expert ID. This is not
+    documented in `torch_npu.npu_moe_init_routing_v2`, but ensured in
+    `test/pytest/test_batched_routed_activation.py::::test_batched_routed_activation_indexed_to_concat_permuted`.
+
+    `ConcatPermutedBatchedRoutedActivation` only supports local expert IDs. Therefore,
+    when converting from another `BatchedRoutedActivation` with `expert_ids_are_local`
+    set to False, `experts_start_idx` and `experts_end_idx` must be provided.
     """
 
     token_comma_topk_to_concat_indices: (
@@ -480,18 +489,40 @@ class ConcatPermutedBatchedRoutedActivation(
     @override
     @plum.dispatch
     def convert_from(
-        cls, old: IndexedBatchedRoutedActivation, *, n_experts: int
+        cls,
+        old: IndexedBatchedRoutedActivation,
+        *,
+        n_experts: int,
+        experts_start_idx: Optional[int] = None,
+        experts_end_idx: Optional[int] = None,
     ) -> "ConcatPermutedBatchedRoutedActivation":
+        if old.expert_ids_are_local:
+            experts_start_idx = 0
+            experts_end_idx = n_experts
+        else:
+            if experts_start_idx is None:
+                raise ValueError(
+                    "experts_start_idx must be provided when expert_ids_are_local is False"
+                )
+            if experts_end_idx is None:
+                raise ValueError(
+                    "experts_end_idx must be provided when expert_ids_are_local is False"
+                )
+
         concat_activation, token_x_topk_to_concat_indices, n_tokens_per_expert = (
             batched_routed_activation_indexed_to_concat_permuted(
-                old.activation, old.token_to_expert_indices, n_experts=n_experts
+                old.activation,
+                old.token_to_expert_indices,
+                n_experts=n_experts,
+                experts_start_idx=experts_start_idx,
+                experts_end_idx=experts_end_idx,
             )
         )
         return cls(
             concat_activation=concat_activation,
             token_comma_topk_to_concat_indices=token_x_topk_to_concat_indices,
             n_tokens_per_expert=n_tokens_per_expert,
-            expert_ids_are_local=old.expert_ids_are_local,
+            expert_ids_are_local=True,  # Always True
         )
 
 
