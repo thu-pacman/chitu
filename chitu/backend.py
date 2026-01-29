@@ -57,6 +57,7 @@ from chitu.quantization import (
     utils,
 )
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF, Processor
+from chitu.tool_call import get_tool_parser
 from chitu.constraint_decode import ConstraintDecodeManager
 from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div
 
@@ -98,6 +99,8 @@ class Backend:
     pp_stage = None
     pp_end_stage = None
     pp_main_rank = None
+    # Unique session ID for IPC paths (to prevent conflicts on shared /tmp)
+    ipc_session_id: str = ""
 
     # components
     schedulers: Optional[list["Scheduler"]] = None  # One per each DP rank
@@ -307,7 +310,9 @@ class Backend:
             ep_size=expert_parallel_size,
             pp_size=pipeline_parallel_size,
         )
-        Backend.ip_port_list = get_world_group().gather_all_rank_ip_port()
+        world_group = get_world_group()
+        Backend.ip_port_list = world_group.gather_all_rank_ip_port()
+        Backend.ipc_session_id = world_group.generate_ipc_session_id()
 
         Backend.pp_stage = (
             global_rank
@@ -1177,6 +1182,21 @@ class Backend:
         Backend.constraint_decode_manager = ConstraintDecodeManager(
             Backend.tokenizer.model, args.models.vocab_size
         )
+
+        # Initialize tool parser
+        tool_parser_config = getattr(args.models, "tool_parser", "MISSING")
+        Backend.tool_parser = get_tool_parser(tool_parser_config)
+        logger.info(
+            f"using tool parser {Backend.tool_parser} from config {repr(tool_parser_config)}"
+        )
+        try:
+            Backend.tokenizer.model.chat_template = (
+                Backend.tool_parser.patch_chat_template(
+                    Backend.tokenizer.model.chat_template
+                )
+            )
+        except:
+            logger.exception(f"patch chat template failed, tool call may be incorrect!")
 
         attn_backend_type = Backend._get_attention_backend_type(args)
 

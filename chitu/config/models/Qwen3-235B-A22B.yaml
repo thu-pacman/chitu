@@ -23,3 +23,4 @@ rope_theta: 1000000.0
 qkv_has_bias: False
 head_dim: 128
 use_qk_norm: True
+tool_parser: Qwen3ToolParser

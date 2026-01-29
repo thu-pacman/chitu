@@ -429,6 +429,7 @@ class ChatFormatHF:
 
         if hasattr(self.tokenizer.model, "apply_chat_template"):
             chat_template_kwargs = chat_template_kwargs or {}
+            # Explicitly request list[int] output (transformers 5.0+ defaults may changed)
             return self.tokenizer.model.apply_chat_template(
                 dialog,
                 add_generation_prompt=True,

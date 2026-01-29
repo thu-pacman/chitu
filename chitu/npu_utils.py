@@ -184,90 +184,64 @@ def fused_experts_npu_for_ep(
     return ConcatPermutedBatchedExpertResultMinimal(hidden_states)
 
 
-def fused_experts_npu(
+@functools.singledispatch
+def fused_experts_no_sum_npu(
     hidden_states: BatchedRoutedActivation,
     w1: torch.Tensor | NativeLayoutTensor,
     w2: torch.Tensor | NativeLayoutTensor,
-    topk_weights: torch.Tensor,
     w1_scale=None,
     w2_scale=None,
     *,
     global_num_experts: int,
     experts_start_idx: int = 0,
     use_int8_w8a8=False,
-):
-    n_local_experts = w1.shape[0] if isinstance(w1, torch.Tensor) else w1.plain_shape[0]
-    if not hidden_states.expert_ids_are_local:
-        # TODO: Use `hidden_states.as_local_expert_ids`
-        assert isinstance(hidden_states, IndexedBatchedRoutedActivation)
-        new_token_to_expert_indices = (
-            hidden_states.token_to_expert_indices - experts_start_idx
-        )
-        mask = (new_token_to_expert_indices < 0) | (
-            new_token_to_expert_indices >= n_local_experts
-        )
-        # see https://www.hiascend.com/document/detail/zh/Pytorch/60RC3/ptmoddevg/trainingmigrguide/performance_tuning_0033.html
-        topk_weights *= ~mask
-        new_token_to_expert_indices *= ~mask
-        hidden_states = IndexedBatchedRoutedActivation(
-            hidden_states.activation,
-            new_token_to_expert_indices,
-            expert_ids_are_local=True,
-        )
-
-    return fused_experts_npu_impl(
-        hidden_states,
-        w1=w1,
-        w2=w2,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        use_int8_w8a8=use_int8_w8a8,
-    ).weighted_sum(topk_weights)
-
-
-@functools.singledispatch
-def fused_experts_npu_impl(
-    hidden_states: BatchedRoutedActivation,
-    w1: torch.Tensor | NativeLayoutTensor,
-    w2: torch.Tensor | NativeLayoutTensor,
-    w1_scale=None,
-    w2_scale=None,
-    use_int8_w8a8=False,
 ) -> BatchedExpertResult:
     raise ValueError(f"Unsupported hidden_states type: {type(hidden_states)}")
 
 
-@fused_experts_npu_impl.register
+@fused_experts_no_sum_npu.register
 def _(
     hidden_states: IndexedBatchedRoutedActivation,
     w1: torch.Tensor | NativeLayoutTensor,
     w2: torch.Tensor | NativeLayoutTensor,
     w1_scale=None,
     w2_scale=None,
+    *,
+    global_num_experts: int,
+    experts_start_idx: int = 0,
     use_int8_w8a8=False,
 ) -> BatchedExpertResult:
-    return fused_experts_npu_impl(
+    n_local_experts = w1.shape[0] if isinstance(w1, torch.Tensor) else w1.plain_shape[0]
+    expert_result = fused_experts_no_sum_npu(
         ConcatPermutedBatchedRoutedActivation.convert_from(
             hidden_states,
-            n_experts=(
-                w1.shape[0] if isinstance(w1, torch.Tensor) else w1.plain_shape[0]
-            ),
+            n_experts=global_num_experts,
+            experts_start_idx=experts_start_idx,
+            experts_end_idx=experts_start_idx + n_local_experts,
         ),
         w1=w1,
         w2=w2,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
+        global_num_experts=global_num_experts,
+        experts_start_idx=experts_start_idx,
         use_int8_w8a8=use_int8_w8a8,
     )
+    if hidden_states.expert_ids_are_local:
+        expert_result.indices_maybe_invalid = False
+    return expert_result
 
 
-@fused_experts_npu_impl.register
+@fused_experts_no_sum_npu.register
 def _(
     hidden_states: ConcatPermutedBatchedRoutedActivation,
     w1: torch.Tensor | NativeLayoutTensor,
     w2: torch.Tensor | NativeLayoutTensor,
     w1_scale=None,
     w2_scale=None,
+    *,
+    global_num_experts: int,
+    experts_start_idx: int = 0,
     use_int8_w8a8=False,
 ) -> ConcatPermutedBatchedExpertResult:
     # Check constraints.

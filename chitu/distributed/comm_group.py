@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import netifaces
+import os
 import socket
 from typing import Optional, List, Tuple, Sequence, Any
 
@@ -389,6 +390,26 @@ class CommGroup:
             f"ZMQ IP: {local_ip}, TP port: {local_port_tp}, DP port: {local_port_dp}, PP port: {local_port_pp}"
         )
         return list(zip(ip_list, port_tp_list, port_dp_list, port_pp_list))
+
+    def generate_ipc_session_id(self) -> str:
+        """
+        Generate a unique IPC session ID based on MASTER_PORT.
+
+        torchrun always sets MASTER_PORT with a random available port,
+        making it unique per launch on the same machine.
+
+        Returns:
+            str: Session ID (e.g., "29500")
+
+        Raises:
+            RuntimeError: If MASTER_PORT is not set (not launched via torchrun)
+        """
+        master_port = os.environ.get("MASTER_PORT")
+        if not master_port:
+            raise RuntimeError(
+                "MASTER_PORT not set. Please launch with torchrun or set MASTER_PORT manually."
+            )
+        return master_port
 
     def destroy(self):
         if self.gpu_group and type(self.gpu_group) != SingletonGroupPlaceholder:

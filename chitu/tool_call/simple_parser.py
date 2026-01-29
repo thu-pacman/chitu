@@ -16,7 +16,7 @@ from xgrammar.structural_tag import (
     AnyTextFormat,
     SequenceFormat,
 )
-from .base_parser import BaseToolCallParser
+from .abstract_parser import AbstractToolParser
 from .types import (
     ChoiceDelta,
     ChoiceDeltaToolCall,
@@ -31,15 +31,15 @@ from logging import getLogger
 logger = getLogger(__name__)
 
 
-class SimpleParser(BaseToolCallParser):
-    reasoning_begin_tag: str
-    reasoning_end_tag: str
+class SimpleParser(AbstractToolParser):
     tool_begin_tag: str
     tool_template: str
     tool_end_tag: str
     tools_begin_tag: str = ""
     tools_template: str = "{tool}{tool}"
     tools_end_tag: str = ""
+    reasoning_begin_tag: str = ""
+    reasoning_end_tag: str = ""
 
     def __init__(self):
         self.automaton = Automaton(self.rules, self.rules_regex)
@@ -63,6 +63,12 @@ class SimpleParser(BaseToolCallParser):
         cls.tools_begin, cls.tool_separator, cls.tools_end = cls.tools_template.split(
             "{tool}"
         )
+        if cls.tools_begin or cls.tools_end:
+            raise NotImplementedError  # not supported yet
+
+        cls.starting_tags = [cls.tool_begin_tag]
+        if cls.tools_begin_tag:
+            cls.starting_tags.append(cls.tools_begin_tag)
 
     @classmethod
     def _build_regex(cls):
@@ -82,19 +88,17 @@ class SimpleParser(BaseToolCallParser):
             re.DOTALL,
         )
 
-        tags = [cls.tool_begin_tag]
-        if cls.tools_begin_tag:
-            tags.append(cls.tools_begin_tag)
-        cls.any_string_no_tool_regex = regex_reject_tags(tags)
-
     @classmethod
     def _build_rules(cls):
         rules: defaultdict[str, dict[str, str]] = defaultdict(dict)
 
         def build_tool_rule(init: str):
-            rules[init][cls.tool_begin_tag] = "tool"
-            rules["tool"][cls.tool_begin] = "name"
-            rules["tool"][cls.tool_end_tag] = init
+            if cls.tool_begin:
+                rules[init][cls.tool_begin_tag] = "tool"
+                rules["tool"][cls.tool_begin] = "name"
+                rules["tool"][cls.tool_end_tag] = init
+            else:
+                rules[init][cls.tool_begin_tag] = "name"
             rules["name"][cls.tool_mid] = "arguments"
             rules["name"][cls.tool_end_tag] = init
             rules["arguments"][f"{cls.tool_end}{cls.tool_end_tag}"] = init
@@ -117,7 +121,9 @@ class SimpleParser(BaseToolCallParser):
         params: ToolCallParams,
     ) -> Grammar:
         if params.tool_choice == "none":
-            return Grammar.from_regex(cls.any_string_no_tool_regex)
+            format = AnyTextFormat(excludes=cls.starting_tags)
+            grammar = Grammar.from_structural_tag(StructuralTag(format=format))
+            return grammar
         if isinstance(params.tool_choice, ToolChoiceNamedTool):
             at_least_one = True
             stop_after_first = True
@@ -145,14 +151,14 @@ class SimpleParser(BaseToolCallParser):
 
         if cls.tools_begin_tag:
             tools_tag = TagFormat(
-                begin=cls.tools_begin,
+                begin=cls.tools_begin_tag,
                 content=TagsWithSeparatorFormat(
                     tags=tool_tags,
                     separator=cls.tool_separator,
                     at_least_one=at_least_one,
                     stop_after_first=stop_after_first,
                 ),
-                end=cls.tools_end,
+                end=cls.tools_end_tag,
             )
             format = TriggeredTagsFormat(
                 triggers=[cls.tools_begin_tag],
@@ -164,12 +170,11 @@ class SimpleParser(BaseToolCallParser):
             format = TriggeredTagsFormat(
                 triggers=[cls.tool_begin_tag],
                 tags=tool_tags,
-                separator=cls.tool_separator,
                 at_least_one=at_least_one,
                 stop_after_first=stop_after_first,
             )
 
-        if at_least_one and params.enable_reasoning:
+        if at_least_one and params.enable_reasoning and cls.reasoning_end_tag:
             reasoning_format = TagFormat(
                 begin=cls.reasoning_begin_tag,
                 content=AnyTextFormat(),
@@ -292,26 +297,3 @@ class Automaton:
             rule_regex = rf"^(.*?)(?:{r_prefixs}|({keys}).*)?$"
             rules_regex[state] = re.compile(rule_regex, re.DOTALL)
         return rules_regex
-
-
-def regex_reject_tags(tags: list[str]):
-    """returns a regex accept any string except that contains predefined tags"""
-    assert all(tag[0] == "<" for tag in tags)
-    assert all(tag.count("<") == 1 for tag in tags)
-    tags = [tag[1:] for tag in tags]
-    prefix_charset = defaultdict(set)
-    for tag in tags:
-        for i in range(len(tag)):
-            prefix_charset[tag[:i]].add(tag[i])
-    prefix_chars = {
-        k: "[^" + "".join(sorted(v | {"<"})) + "]" for k, v in prefix_charset.items()
-    }
-    r_tag_no_last = "|".join(re.escape(k) for k in prefix_chars if k)
-    r_tag = "|".join(re.escape(k) + v for k, v in prefix_chars.items())
-
-    r_before_tag = "[^<]"
-    r_tag_begin = "(<+)"
-    r_tag_no_last = f"({r_tag_no_last})"
-    r_tag = f"({r_tag})"
-    r_junk = f"{r_before_tag}*({r_tag_begin}{r_tag_no_last}?)*"
-    return f"^({r_junk}{r_tag_begin}{r_tag})*{r_junk}{r_tag_begin}?$"

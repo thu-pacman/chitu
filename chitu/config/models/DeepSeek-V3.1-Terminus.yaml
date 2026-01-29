@@ -13,3 +13,4 @@ source: "https://huggingface.co/deepseek-ai/DeepSeek-V3.1-Terminus" # Just for d
 ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
 tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
 tokenizer_type: "hf" # one of: hf, tiktoken
+tool_parser: DeepSeekV31ToolParser

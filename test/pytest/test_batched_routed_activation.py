@@ -256,7 +256,9 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted(
             )
 
 
-@pytest.mark.parametrize("num_experts", [256])
+@pytest.mark.parametrize(
+    "num_experts,experts_start_idx,experts_end_idx", [(256, 0, 256), (256, 64, 128)]
+)
 @pytest.mark.parametrize("block_size", [64])
 @pytest.mark.parametrize("num_tokens", [0, 64, 4096])
 @pytest.mark.parametrize("hidden_size", [7168])
@@ -264,7 +266,15 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted(
 @pytest.mark.parametrize("distribution", ["imbalance", "uniform"])
 @pytest.mark.parametrize("impl", ["torch_npu"])
 def test_batched_routed_activation_indexed_to_concat_permuted(
-    num_experts, block_size, num_tokens, hidden_size, topk, distribution, impl
+    num_experts,
+    experts_start_idx,
+    experts_end_idx,
+    block_size,
+    num_tokens,
+    hidden_size,
+    topk,
+    distribution,
+    impl,
 ):
     if impl == "torch_npu" and not has_torch_npu:
         pytest.skip("torch_npu is missing")
@@ -287,18 +297,20 @@ def test_batched_routed_activation_indexed_to_concat_permuted(
             activation=activation,
             token_to_expert_indices=token_to_expert_indices,
             n_experts=num_experts,
+            experts_start_idx=experts_start_idx,
+            experts_end_idx=experts_end_idx,
             impl=impl,
         )
     )
 
     assert tuple(concat_activation.shape) == (num_tokens * topk, hidden_size)
     assert tuple(token_comma_topk_to_concat_indices.shape) == (num_tokens, topk)
-    assert tuple(n_tokens_per_expert.shape) == (num_experts,)
+    assert tuple(n_tokens_per_expert.shape) == (experts_end_idx - experts_start_idx,)
     start_row = 0
     end_row = 0
-    for i in range(num_experts):
+    for i in range(experts_start_idx, experts_end_idx):
         start_row = end_row
-        end_row += n_tokens_per_expert[i]
+        end_row += n_tokens_per_expert[i - experts_start_idx]
         for j in range(start_row, end_row):
             assert j >= 0
             assert j < num_tokens * topk
@@ -307,3 +319,8 @@ def test_batched_routed_activation_indexed_to_concat_permuted(
             token_id, topk_id = ori_indices[0]
             assert token_to_expert_indices[token_id, topk_id] == i
             assert torch.all(activation[token_id] == concat_activation[j])
+    for token_id in range(num_tokens):
+        for topk_id in range(topk):
+            expert_id = token_to_expert_indices[token_id, topk_id]
+            if expert_id < experts_start_idx or expert_id >= experts_end_idx:
+                assert token_comma_topk_to_concat_indices[token_id, topk_id] == -1

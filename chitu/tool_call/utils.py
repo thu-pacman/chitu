@@ -2,10 +2,16 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .base_parser import BaseToolCallParser
-from .qwen3_parser import Qwen3ToolCallParser
+from .abstract_parser import AbstractToolParser
+from .dummy_parser import DummyToolParser
+
+_registere_parsers: dict[str, type[AbstractToolParser]] = {}
 
 
-def get_parser_cls() -> type[BaseToolCallParser]:
-    # TODO: support more types
-    return Qwen3ToolCallParser
+def register(cls: type[AbstractToolParser]):
+    _registere_parsers[cls.__name__] = cls
+    return cls
+
+
+def get_tool_parser(name: str) -> type[AbstractToolParser]:
+    return _registere_parsers.get(name, DummyToolParser)

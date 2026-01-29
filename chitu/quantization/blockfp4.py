@@ -51,7 +51,7 @@ hard_fp4_kernels, has_hard_fp4_kernels = try_import_opt_dep(
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 if has_torch_npu:
-    from chitu.npu_utils import fused_experts_npu
+    from chitu.npu_utils import fused_experts_no_sum_npu
 
 
 logger = getLogger(__name__)
@@ -864,26 +864,21 @@ class Blockfp4MoeExpertsPackNPUNative(
     """
 
     @override
-    def forward(
-        self,
-        routed_x: BatchedRoutedActivation,
-        weights: torch.Tensor,
-        inplace: bool = False,
-        impl: str = "auto",
-    ) -> torch.Tensor:
+    def forward_no_sum(
+        self, routed_x: BatchedRoutedActivation, impl="auto"
+    ) -> BatchedExpertResult:
         if self.merge_gate_up:
-            return fused_experts_npu(
+            return fused_experts_no_sum_npu(
                 routed_x,
                 w1=self.gate_up_proj_weight,
                 w2=self.down_proj_weight,
-                topk_weights=weights,
                 w1_scale=self.gate_up_proj_weight_scale,
                 w2_scale=self.down_proj_weight_scale,
                 global_num_experts=self.global_n_experts,
             )
 
         else:
-            return super().forward(routed_x, weights, inplace=inplace, impl=impl)
+            return super().forward_no_sum(routed_x, impl=impl)
 
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:

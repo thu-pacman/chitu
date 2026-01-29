@@ -316,7 +316,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
              BatchedExpertResult: Output tensor (without local sum).
         """
 
-        y = self.forward_no_sum_iterative(routed_x)
+        y = self.forward_no_sum(routed_x)
         if (
             inplace
             and isinstance(routed_x, IndexedBatchedRoutedActivation)

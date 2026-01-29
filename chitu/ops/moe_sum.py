@@ -120,6 +120,8 @@ def moe_sum_expert_concat_permuted(
     token_comma_topk_to_concat_indices: torch.Tensor,
     topk_weights: torch.Tensor,
     *,
+    indices_maybe_invalid: bool = True,
+    inplace: bool = True,
     out: Optional[torch.Tensor] = None,
     impl: str = "auto",
 ):
@@ -130,6 +132,9 @@ def moe_sum_expert_concat_permuted(
         x: [batch_size * topk, hidden_size]. Input activatoin.
         token_comma_topk_to_concat_indices: [batch_size, topk] -> batch_size * topk.
         topk_weights: [batch_size, topk]. Weight for each expert.
+        indices_maybe_invalid: If true, the `token_comma_topk_to_concat_indices` may
+            contain -1 as invalid indices.
+        inplace: If true, the inputs may be touched.
         out: Optional inplace output.
 
     Returns:
@@ -144,11 +149,21 @@ def moe_sum_expert_concat_permuted(
 
     if impl == "torch_npu":
         return moe_sum_expert_concat_permuted_torch_npu(
-            x, token_comma_topk_to_concat_indices, topk_weights, out=out
+            x,
+            token_comma_topk_to_concat_indices,
+            topk_weights,
+            indices_maybe_invalid=indices_maybe_invalid,
+            inplace=inplace,
+            out=out,
         )
     elif impl == "torch":
         return moe_sum_expert_concat_permuted_torch(
-            x, token_comma_topk_to_concat_indices, topk_weights, out=out
+            x,
+            token_comma_topk_to_concat_indices,
+            topk_weights,
+            indices_maybe_invalid=indices_maybe_invalid,
+            inplace=inplace,
+            out=out,
         )
     else:
         raise ValueError(f"Unknown implementation: {impl}")
@@ -159,10 +174,21 @@ def moe_sum_expert_concat_permuted_torch(
     x: torch.Tensor,
     token_comma_topk_to_concat_indices: torch.Tensor,
     topk_weights: torch.Tensor,
+    *,
+    indices_maybe_invalid: bool = True,
+    inplace: bool = True,
 ):
-    return (x[token_comma_topk_to_concat_indices] * topk_weights.unsqueeze(-1)).sum(
-        dim=1
-    )
+    batch_size, topk = token_comma_topk_to_concat_indices.shape
+    hidden = x.shape[-1]
+    if indices_maybe_invalid:
+        token_comma_topk_hidden = torch.where(
+            token_comma_topk_to_concat_indices.view(batch_size, topk, 1) >= 0,
+            x[torch.clamp(token_comma_topk_to_concat_indices, min=0)],
+            torch.zeros(batch_size, topk, hidden, device=x.device, dtype=x.dtype),
+        )
+    else:
+        token_comma_topk_hidden = x[token_comma_topk_to_concat_indices]
+    return (token_comma_topk_hidden * topk_weights.unsqueeze(-1)).sum(dim=1)
 
 
 @compatible_with_inplace
@@ -170,7 +196,21 @@ def moe_sum_expert_concat_permuted_torch_npu(
     x: torch.Tensor,
     token_comma_topk_to_concat_indices: torch.Tensor,
     topk_weights: torch.Tensor,
+    *,
+    indices_maybe_invalid: bool = True,
+    inplace: bool = True,
 ):
+    if indices_maybe_invalid:
+        mask = token_comma_topk_to_concat_indices >= 0
+        # About `* mask`: see https://www.hiascend.com/document/detail/zh/Pytorch/60RC3/ptmoddevg/trainingmigrguide/performance_tuning_0033.html
+        if inplace:
+            topk_weights *= mask
+            token_comma_topk_to_concat_indices *= mask
+        else:
+            topk_weights = topk_weights * mask
+            token_comma_topk_to_concat_indices = (
+                token_comma_topk_to_concat_indices * mask
+            )
     return torch_npu.npu_moe_finalize_routing(
         x,
         skip1=None,

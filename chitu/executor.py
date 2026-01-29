@@ -48,7 +48,6 @@ from chitu.utils import (
 )
 from chitu.ops import apply_frequency_penalty, response_append
 from chitu.device_list import DeviceList
-from chitu.device_type import is_ascend
 from chitu.moe.load_balancer import get_moe_load_planner  # added
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 
@@ -128,11 +127,12 @@ class TasksDispatcher(ABC):
         Returns:
             (ipc_url, tcp_url)
         """
-        ipc_path = f"/tmp/chitu_{group_name}_{rank}{ipc_suffix}.ipc"
-        ipc_url = f"ipc://{ipc_path}"
+        session_id = Backend.ipc_session_id
+        # Use abstract unix socket (@ prefix): no file created, auto-cleanup on exit
+        ipc_url = f"ipc://@chitu_{session_id}_{group_name}_{rank}{ipc_suffix}"
         ip_port_info = Backend.ip_port_list[rank]
         tcp_addr = ip_port_info[0]
-        # 使用动态分配的端口：DP用[1]，PP用[2]，TP不需要TCP
+        # 使用动态分配的端口：DP用[1]，PP用[2]
         port_idx = self.PORT_INDEX.get(group_name, 1)
         tcp_port = ip_port_info[port_idx]
         tcp_url = f"tcp://{tcp_addr}:{tcp_port}"
@@ -183,14 +183,11 @@ class TasksDispatcher(ABC):
         self.ctx = zmq.Context.instance()
 
         ipc_url, tcp_url = self._get_zmq_urls(main_rank, group_name)
-        ipc_path = ipc_url.replace("ipc://", "")
 
         if is_main_rank:
             self.socket = self.ctx.socket(zmq.ROUTER)
             self.socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
 
-            if os.path.exists(ipc_path):
-                os.remove(ipc_path)
             self.socket.bind(ipc_url)
             self.socket.bind(tcp_url)
             logger.info(f"{group_name} ROUTER bind: {ipc_url} + {tcp_url}")
@@ -296,12 +293,6 @@ class PipeDispatcher(TasksDispatcher):
                 self.rank, "PP", f"_to_{self.next_rank}"
             )
             self.send_url = ipc_url if use_ipc else tcp_url
-
-            # 清理旧 ipc 文件
-            if use_ipc:
-                ipc_path = ipc_url.replace("ipc://", "")
-                if os.path.exists(ipc_path):
-                    os.remove(ipc_path)
 
             self.send_socket = self.ctx.socket(zmq.PUSH)
             self.send_socket.bind(self.send_url)
