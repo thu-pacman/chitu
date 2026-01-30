@@ -396,7 +396,7 @@ class TransformerHFGptOss(TransformerHFLlama):
                 # split experts to fit TP
                 state_dict = self._process_state_dict_for_splitting_experts(state_dict)
 
-        super().load_state_dict_parallel(
+        return super().load_state_dict_parallel(
             state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )
 

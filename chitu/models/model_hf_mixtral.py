@@ -173,6 +173,6 @@ class TransformerHFMixtral(TransformerHFLlama):
 
             state_dict = {map_mixtral_key(k): v for k, v in state_dict.items()}
 
-        super().load_state_dict_parallel(
+        return super().load_state_dict_parallel(
             state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )

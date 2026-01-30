@@ -1127,6 +1127,19 @@ class TransformerDeepSeekV3(Transformer):
         return [f"layers.{i}."]
 
     @override
+    def _get_non_layer_prefix_mappings(self) -> list[tuple[str, str]]:
+        prefix_mappings = []
+        if self.pp_stage == 0:
+            prefix_mappings.extend([("model.embed_tokens.", "embed_tokens.")])
+        if self.pp_stage == self.pp_end_stage:
+            prefix_mappings.extend([("model.norm.", "norm."), ("lm_head.", "lm_head.")])
+        return prefix_mappings
+
+    @override
+    def _get_layer_i_prefix_mapping(self, i: int) -> tuple[str, str]:
+        return (f"model.layers.{i}.", f"layers.{i}.")
+
+    @override
     def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
         fuse_shared_experts = get_global_args().infer.fuse_shared_experts
         n_dense_layers = self.args.models.n_dense_layers
@@ -1681,18 +1694,18 @@ class TransformerDeepSeekV3(Transformer):
                     name = k
                     name = name.replace(".weight_scale_inv", ".scale")
                     state_dict[name] = value
-        super().load_state_dict_parallel(
+        return super().load_state_dict_parallel(
             state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )
 
     @override
-    def load_state_dict(
+    def load_state_dict_with_preprocess(
         self,
         state_dict: dict[str, Any],
         *args,
         skip_preprocess: bool = False,
         **kwargs,
-    ):
+    ) -> dict[str, Any] | None:
         if not skip_preprocess:
             if self.mla_absorb == "absorb":
                 state_dict = self._process_state_dict_for_absorption(state_dict)
@@ -1703,7 +1716,7 @@ class TransformerDeepSeekV3(Transformer):
                     )
                 )
 
-        super().load_state_dict(
+        return super().load_state_dict_with_preprocess(
             state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )
 

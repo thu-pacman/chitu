@@ -430,34 +430,6 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
         return checkpoint
 
     @override
-    def load_state_dict_parallel(
-        self,
-        state_dict: dict[str, Any],
-        *args,
-        skip_preprocess: bool = False,
-        replace=True,
-        **kwargs,
-    ):
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            new_key = k
-            if k.startswith("language_model."):
-                new_key = k[len("language_model.") :]
-            new_state_dict[new_key] = v
-        state_dict = new_state_dict
-
-        if not skip_preprocess and replace:
-            state_dict_keys = list(state_dict.keys())
-            for k in state_dict_keys:
-                value = state_dict.pop(k)
-                name = k
-                state_dict[name] = value
-
-        super().load_state_dict_parallel(
-            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
-        )
-
-    @override
     def _get_tensor_column_parallel_layer_names(self) -> list[str]:
         return [
             "qkv_proj",
@@ -476,3 +448,33 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
     @override
     def _get_tensor_row_parallel_layer_names(self) -> list[str]:
         return ["down_proj", "o_proj"]
+
+    @override
+    def _get_non_layer_prefix_mappings(self) -> list[tuple[str, str]]:
+        if self.config:  # Has vision_config
+            prefix_mappings = []
+            if self.pp_stage == 0:
+                prefix_mappings.extend(
+                    [("model.language_model.embed_tokens.", "embed_tokens.")]
+                )
+            if self.pp_stage == self.pp_end_stage:
+                prefix_mappings.extend(
+                    [("model.language_model.norm.", "norm."), ("lm_head.", "lm_head.")]
+                )
+            prefix_mappings.extend([("model.visual.", "visual.")])
+        else:
+            prefix_mappings = []
+            if self.pp_stage == 0:
+                prefix_mappings.extend([("model.embed_tokens.", "embed_tokens.")])
+            if self.pp_stage == self.pp_end_stage:
+                prefix_mappings.extend(
+                    [("model.norm.", "norm."), ("lm_head.", "lm_head.")]
+                )
+        return prefix_mappings
+
+    @override
+    def _get_layer_i_prefix_mapping(self, i: int) -> tuple[str, str]:
+        if self.config:  # Has vision_config
+            return (f"model.language_model.layers.{i}.", f"layers.{i}.")
+        else:
+            return (f"model.layers.{i}.", f"layers.{i}.")

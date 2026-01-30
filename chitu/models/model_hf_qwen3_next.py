@@ -797,6 +797,6 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                 new_k = new_k.replace(".shared_expert.", ".shared_experts.body.")
                 new_k = new_k.replace(".shared_expert_gate.", ".shared_experts.gate.")
                 state_dict[new_k] = v
-        super().load_state_dict_parallel(
+        return super().load_state_dict_parallel(
             state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )

@@ -316,6 +316,12 @@ class Transformer(nn.Module):
     def _get_layer_i_prefixes(self, i: int) -> list[str]:
         raise NotImplementedError
 
+    def _get_non_layer_prefix_mappings(self) -> list[tuple[str, str]]:
+        raise NotImplementedError
+
+    def _get_layer_i_prefix_mapping(self, i: int) -> tuple[str, str]:
+        raise NotImplementedError
+
     def _get_2d_out_x_in_tensor_names(self, quant) -> list[str]:
         ret = ["weight"]
         if quant == "blockfp8" or quant == "q4km":
@@ -365,6 +371,36 @@ class Transformer(nn.Module):
         elif quant == "ascend_w8a8":
             ret += ["input_scale", "input_offset", "quant_bias", "deq_scale"]
         return ret
+
+    def _get_module_by_prefix(self, prefix: str) -> nn.Module | None:
+        prefix = prefix[:-1] if prefix.endswith(".") else prefix
+        module = self
+        for part in prefix.split("."):
+            if part.isdigit():
+                module = module[int(part)]
+            else:
+                module = getattr(module, part, None)
+        return module
+
+    def load_state_dict_by_prefix(
+        self, state_dict: dict[str, Any], prefix: str, skip_preprocess: bool = False
+    ) -> nn.Module:
+        state_dict = self.load_state_dict_parallel(
+            state_dict,
+            strict=True,
+            assign=True,
+            skip_preprocess=skip_preprocess,
+            enable_layerwise=True,
+        )
+        module_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith(prefix):
+                module_state_dict[key[len(prefix) :]] = value
+        state_dict = module_state_dict
+        module = self._get_module_by_prefix(prefix)
+        assert module is not None, f"Module {prefix} not found"
+        module.load_state_dict(state_dict, strict=True, assign=True)
+        return module
 
     def _chunk_checkpoint_for_pipeline_parallel(
         self,
@@ -663,7 +699,7 @@ class Transformer(nn.Module):
                     ):
                         state_dict.pop(key, None)
 
-            if self.pipeline_exec:
+            if self.pipeline_exec and not kwargs.get("enable_layerwise", False):
                 state_dict = self._chunk_checkpoint_for_pipeline_parallel(
                     state_dict, self.global_n_layers, self.pp_stage, self.pp_size
                 )
@@ -678,17 +714,17 @@ class Transformer(nn.Module):
         #   GiB allocated memory). Disabling torch allocator with `PYTORCH_NO_CUDA_MEMORY_CACHING=1`
         #   works but may lead to too much performance degradation.
 
-        self.load_state_dict(
+        return self.load_state_dict_with_preprocess(
             state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
         )
 
-    def load_state_dict(
+    def load_state_dict_with_preprocess(
         self,
         state_dict: dict[str, Any],
         *args,
         skip_preprocess: bool = False,
         **kwargs,
-    ):
+    ) -> dict[str, Any] | None:
         if not skip_preprocess:
             state_dict = self.process_state_dict_for_merging_qkv(state_dict)
             state_dict = self.process_state_dict_for_merging_gate_up(state_dict)
@@ -725,6 +761,9 @@ class Transformer(nn.Module):
                 # `super().load_state_dict`:
                 # See https://github.com/pytorch/pytorch/pull/121157.
                 state_dict[k] = torch.nn.Parameter(state_dict[k], requires_grad=False)
+
+        if kwargs.pop("enable_layerwise", False):
+            return state_dict
 
         super().load_state_dict(state_dict, *args, **kwargs)
 
