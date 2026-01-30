@@ -341,15 +341,10 @@ class PipeDispatcher(TasksDispatcher):
             # 使用统一的序列化器处理 Prefill 和 Decode
             if payload_type in [
                 SerializedPackedTasksPayloadType.Prefill,
-                SerializedPackedTasksPayloadType.EmptyPrefill,
                 SerializedPackedTasksPayloadType.Decode,
-                SerializedPackedTasksPayloadType.EmptyDecode,
             ]:
                 # 使用统一接口反序列化
-                is_prefill = payload_type in [
-                    SerializedPackedTasksPayloadType.Prefill,
-                    SerializedPackedTasksPayloadType.EmptyPrefill,
-                ]
+                is_prefill = payload_type == SerializedPackedTasksPayloadType.Prefill
                 _, tasks, slot_idx = self.metadata_serializer.deserialize_metadata(
                     msgs[1], require_task_creation=is_prefill
                 )
@@ -376,9 +371,7 @@ class PipeDispatcher(TasksDispatcher):
         if not self.is_last_stage and tasks is not None:
             if payload_type in [
                 SerializedPackedTasksPayloadType.Prefill,
-                SerializedPackedTasksPayloadType.EmptyPrefill,
                 SerializedPackedTasksPayloadType.Decode,
-                SerializedPackedTasksPayloadType.EmptyDecode,
             ]:
                 # 使用优化的配置进行序列化
                 slot_handle = get_slot_handle()
@@ -560,9 +553,7 @@ class TensorDispatcher(TasksDispatcher):
             # 检查是否是特殊 payload（非 Prefill/Decode）
             is_normal_payload = payload_type in (
                 SerializedPackedTasksPayloadType.Prefill,
-                SerializedPackedTasksPayloadType.EmptyPrefill,
                 SerializedPackedTasksPayloadType.Decode,
-                SerializedPackedTasksPayloadType.EmptyDecode,
             )
 
             if not is_normal_payload:
@@ -611,9 +602,7 @@ class TensorDispatcher(TasksDispatcher):
             # 处理正常 payload
             if payload_type in [
                 SerializedPackedTasksPayloadType.Prefill,
-                SerializedPackedTasksPayloadType.EmptyPrefill,
                 SerializedPackedTasksPayloadType.Decode,
-                SerializedPackedTasksPayloadType.EmptyDecode,
             ]:
                 payload_type, tasks, slot_idx = (
                     self.metadata_serializer.deserialize_metadata(
@@ -696,14 +685,7 @@ class ExpertDataDispatcher(TasksDispatcher):
                         task_list = [TaskPool.pool[tid] for tid in task_ids]
                         rank_tasks = PackedTasks([], tasks=task_list)
                     else:
-                        if current_task_type == TaskType.Prefill:
-                            rank_tasks = PackedTasks(
-                                [], empty_task_type=TaskType.EmptyPrefill
-                            )
-                        else:
-                            rank_tasks = PackedTasks(
-                                [], empty_task_type=TaskType.EmptyDecode
-                            )
+                        rank_tasks = PackedTasks([], task_type=current_task_type)
 
                     # 让 MetadataSerializer 自动选择配置（支持去重优化）
                     # DP+PP Decode 场景需要传 last_tokens（PP 后续 stage 需要）
@@ -750,14 +732,9 @@ class ExpertDataDispatcher(TasksDispatcher):
             # 使用统一的序列化器处理 Prefill 和 Decode
             if payload_type in [
                 SerializedPackedTasksPayloadType.Prefill,
-                SerializedPackedTasksPayloadType.EmptyPrefill,
                 SerializedPackedTasksPayloadType.Decode,
-                SerializedPackedTasksPayloadType.EmptyDecode,
             ]:
-                is_prefill = payload_type in [
-                    SerializedPackedTasksPayloadType.Prefill,
-                    SerializedPackedTasksPayloadType.EmptyPrefill,
-                ]
+                is_prefill = payload_type == SerializedPackedTasksPayloadType.Prefill
                 _, tasks, _ = self.metadata_serializer.deserialize_metadata(
                     msgs[1], require_task_creation=is_prefill
                 )
@@ -1090,6 +1067,7 @@ class Executor:
                     and get_global_args().models.type == "deepseek-v3"
                 ):
                     Backend.indexer_cache_manager.finalize_cache_all_decode(rid)
+            PrometheusMetricsCollector.update_kvcache_usage()
             return payload_type
 
         # synchronize
@@ -1110,16 +1088,15 @@ class Executor:
             )
             self.moe_impl.prepare(tasks.task_type, tasks_num_tokens)
 
-        if tasks.task_type in [TaskType.Prefill, TaskType.EmptyPrefill]:
-            out = self.prefill_step(tasks, tasks.task_type == TaskType.EmptyPrefill)
-        elif tasks.task_type in [TaskType.Decode, TaskType.EmptyDecode]:
-            out = self.decode_step(tasks, tasks.task_type == TaskType.EmptyDecode)
+        if tasks.task_type == TaskType.Prefill:
+            out = self.prefill_step(tasks)
+        elif tasks.task_type == TaskType.Decode:
+            out = self.decode_step(tasks)
         else:
             raise NotImplementedError
 
-        if tasks.task_type not in [TaskType.EmptyPrefill, TaskType.Prefill]:
+        if tasks.task_type == TaskType.Decode:
             self._lb_trigger()
-        if tasks.task_type not in [TaskType.EmptyPrefill, TaskType.Prefill]:
             self._lb_sync()
         self._lb_step += 1
 
@@ -1167,7 +1144,7 @@ class Executor:
                 else DPTaskCollector.get_total_packedtasks()
             )
             if len(all_tasks.output_tasks) == 0:
-                all_tasks = PackedTasks([], empty_task_type=all_tasks.task_type)
+                all_tasks = PackedTasks([], task_type=all_tasks.task_type)
             elif self.rank == 0 and self.dp_dispatcher:
                 all_tasks.generated_result = tasks.generated_result
             TaskCollector.append_to_generated_tasks(all_tasks)
@@ -1208,13 +1185,13 @@ class Executor:
                 tasks.num_tasks, dtype=torch.int32, device=self.local_rank
             )
 
-    def prefill_step(
-        self, tasks: PackedTasksBase, is_empty_step: bool = False
-    ) -> torch.Tensor:
+    def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
+        is_empty_step = tasks.num_tasks == 0
         if not is_empty_step:
             Backend.cache_manager.prepare_cache_prefill(
                 tasks.req_ids, [len(t) for t in tasks.tokens]
             )
+            PrometheusMetricsCollector.update_kvcache_usage()
             if get_global_args().models.type == "hf-qwen3-next":
                 Backend.linear_attn_cache_manager.prepare_cache_prefill(
                     tasks.req_ids, [len(t) for t in tasks.tokens]
@@ -1268,8 +1245,9 @@ class Executor:
             # Collect prompt tokens metrics
             # In DP mode: all dp ranks record their local tokens (distinguished by dp_id)
             # In non-DP mode: only rank 0 records metrics
-            if self._should_record_metrics(num_tokens, is_prefill=True):
-                PrometheusMetricsCollector.inc_prompts(num_tokens, self)
+            # if self._should_record_metrics(num_tokens, is_prefill=True):
+            #     PrometheusMetricsCollector.inc_prompt_tokens(num_tokens)
+            PrometheusMetricsCollector.inc_prompt_tokens(num_tokens)
 
             # Notify KV transfer hook after prefill completes.
             try:
@@ -1315,6 +1293,7 @@ class Executor:
         Backend.cache_manager.prepare_cache_prefill(
             tasks.req_ids, [len(t) for t in tasks.tokens]
         )
+        PrometheusMetricsCollector.update_kvcache_usage()
         if get_global_args().models.type == "hf-qwen3-next":
             Backend.linear_attn_cache_manager.prepare_cache_prefill(
                 tasks.req_ids, [len(t) for t in tasks.tokens]
@@ -1397,6 +1376,7 @@ class Executor:
         """
         # 1) prepare cache and seq lens
         Backend.cache_manager.prepare_cache_decode(req_ids)
+        PrometheusMetricsCollector.update_kvcache_usage()
         if get_global_args().models.type == "hf-qwen3-next":
             Backend.linear_attn_cache_manager.prepare_cache_decode(req_ids)
         if (
@@ -1444,9 +1424,11 @@ class Executor:
             Backend.indexer_cache_manager.finalize_cache_single_decode(req_ids)
         return out
 
-    def decode_step(self, tasks: PackedTasksBase, is_empty_step: bool = False):
+    def decode_step(self, tasks: PackedTasksBase):
+        is_empty_step = tasks.num_tasks == 0
         if not is_empty_step:
             Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
+            PrometheusMetricsCollector.update_kvcache_usage()
             if get_global_args().models.type == "hf-qwen3-next":
                 Backend.linear_attn_cache_manager.prepare_cache_decode(tasks.req_ids)
             if (
@@ -1506,17 +1488,18 @@ class Executor:
             for dispatcher in self.task_dispatchers:
                 dispatcher.recv_payload(self.dummy_logits)
 
-        payload_bs = len(tasks.req_ids) if not is_empty_step else 1
+        payload_bs = tasks.num_tasks
         self.timers("decode").start()
-        out = Backend.model.decode(payload, payload_bs, is_empty_step)
+        out = Backend.model.decode(payload, payload_bs)
         self.timers("decode").stop()
 
         if not is_empty_step:
             # Collect metrics for Prometheus
             # In DP mode: all dp ranks record their local tokens (distinguished by dp_id)
             # In non-DP mode: only rank 0 records metrics
-            if self._should_record_metrics(tasks.num_tasks, is_prefill=False):
-                PrometheusMetricsCollector.inc_tokens(tasks.num_tasks, self)
+            # if self._should_record_metrics(tasks.num_tasks, is_prefill=False):
+            #     PrometheusMetricsCollector.inc_generated_tokens(tasks.num_tasks)
+            PrometheusMetricsCollector.inc_generated_tokens(tasks.num_tasks)
 
             # payload send
             for dispatcher in self.task_dispatchers:

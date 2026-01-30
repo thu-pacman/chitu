@@ -5,6 +5,7 @@
 import netifaces
 import os
 import socket
+import contextlib
 from typing import Optional, List, Tuple, Sequence, Any
 
 import torch
@@ -365,15 +366,24 @@ class CommGroup:
 
         # 为 TP, DP, PP 各分配一个空闲端口
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_tp:
+            with contextlib.ExitStack() as stack:
+                s_tp = stack.enter_context(
+                    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                )
                 s_tp.bind((local_ip, 0))
                 local_port_tp = s_tp.getsockname()[1]
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_dp:
-                    s_dp.bind((local_ip, 0))
-                    local_port_dp = s_dp.getsockname()[1]
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_pp:
-                        s_pp.bind((local_ip, 0))
-                        local_port_pp = s_pp.getsockname()[1]
+
+                s_dp = stack.enter_context(
+                    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                )
+                s_dp.bind((local_ip, 0))
+                local_port_dp = s_dp.getsockname()[1]
+
+                s_pp = stack.enter_context(
+                    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                )
+                s_pp.bind((local_ip, 0))
+                local_port_pp = s_pp.getsockname()[1]
         except Exception as e:
             raise RuntimeError(f"Cannot bind to free ports on {local_ip}.") from e
 

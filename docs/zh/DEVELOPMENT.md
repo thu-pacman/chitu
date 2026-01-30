@@ -176,6 +176,7 @@ TORCH_CUDA_ARCH_LIST=9.0 pip install --no-build-isolation ".[flash_mla]"
 - `muxi_layout_kernels`: 用于支持在沐曦 GPU 上使用 `infer.op_impl=muxi_custom_kernel` 模式，在小 batch 场景性能更优。
 - `scipy`: 用于支持 DeepSeek-V3.2-Exp 中的 indexer 的可选依赖。
 - `fast_hadamard_transform`: 用于支持 DeepSeek-V3.2-Exp 中的 indexer 的可选依赖。
+- `numa`: 用于支持 NUMA 绑定。
 
 如果需要用于开发，建议加上 `-e` 选项启用 editable install，如
 
@@ -214,7 +215,7 @@ TORCH_CUDA_ARCH_LIST=9.0 CHITU_WITH_CYTHON=1 pip install --no-build-isolation .
 
 **如果您与他人共享测试环境，请合理使用作业管理工具进行资源分配，避免资源冲突。**
 
-默认的配置文件为 `chitu/config/serve_config.yaml` 。您可以使用命令行参数覆盖相关的参数设置（参考 [Hydra 文档](https://hydra.cc/docs/advanced/override_grammar/basic/)），也可以使用环境变量 `CONFIG_NAME=<your_config_file.yaml>` 另行指定配置文件。需要提醒的是，`chitu/config/models/` 目录中的 yaml 文件并非完整的配置文件，切勿直接将 `CONFIG_NAME` 指向它们。
+默认的配置文件为 [`chitu/config/serve_config.yaml`](../../chitu/config/serve_config.yaml) 。此文件中包含了赤兔所使用的所有运行时配置项的定义。您可以使用命令行参数覆盖相关的参数设置（参考 [Hydra 文档](https://hydra.cc/docs/advanced/override_grammar/basic/)），也可以使用环境变量 `CONFIG_PATH=<path/to/config/directory>` 及 `CONFIG_NAME=<your_config_file.yaml>` 另行指定配置文件。需要提醒的是，`chitu/config/models/` 目录中的 yaml 文件并非完整的配置文件，切勿直接将 `CONFIG_NAME` 指向它们。
 
 ### 示例：运行 DeepSeek-R1
 
@@ -293,7 +294,7 @@ TP+PP 混合的样例参数：
 torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=8 models=DeepSeek-R1 models.ckpt_dir=/data/DeepSeek-R1
 ```
 
-关于多实例部署，请参阅[此文档](../../chitu\distributed\pd_disaggregation/README.md)。
+关于多实例部署，请参阅[此文档](../../chitu/distributed/pd_disaggregation/README.md)。
 
 对于 PP，还可以进一步控制 micro batch：
 

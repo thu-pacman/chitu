@@ -124,7 +124,6 @@ def get_extensions():
 def get_extras_require():
     return {
         "cpu": [
-            "numa",
             "cpuinfer @ file://localhost"
             + os.path.abspath(os.path.join(this_dir, "cpuinfer")),
         ],

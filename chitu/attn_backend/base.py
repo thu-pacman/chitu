@@ -674,8 +674,7 @@ class AttnBackend(abc.ABC):
                 )
                 v_cache = k_cache[..., :kv_lora_rank]
             elif "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv:
-                # TODO: Support `warning_once` in the logger and use it here
-                logger.warning(
+                logger.warning_once(
                     '"kv_lora"-and-"k_pe"-separated KV cache is insuffcient when falling back '
                     "from MLA to MQA, due to an additional `torch.cat` operation. It is recommended "
                     'to use "kv_lora_k_pe"-holistic KV cache instead.'

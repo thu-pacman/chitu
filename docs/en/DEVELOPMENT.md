@@ -172,6 +172,7 @@ Currently supported optional dependencies are:
 - `muxi_layout_kernels`: Additional kernels for running on MetaX GPUs with `infer.op_impl=muxi_custom_kernel`, optimized for small batches.
 - `scipy`: Optional dependency for indexer in DeepSeek-V3.2-Exp.
 - `fast_hadamard_transform`: Optional dependency for indexer in DeepSeek-V3.2-Exp.
+- `numa`: Support NUMA binding.
 
 Append `-e` to `pip install` for editable install. Example:
 
@@ -208,7 +209,7 @@ Optionally, you can also copy `test/` directories to your desired location to ru
 
 ## Running and Testing without Starting a Service
 
-The following command run with settings in `chitu/config/serve_config.yaml`. You may override them with command line arguments (See [Hydra documents](https://hydra.cc/docs/advanced/override_grammar/basic/) for details）. You may also override the entire config file with environment variable `CONFIG_NAME=<your_config_file.yaml>`.
+The following command run with settings in [`chitu/config/serve_config.yaml`](../../chitu/config/serve_config.yaml). Definitions of all runtime config fields of chitu can be checked in this file. You may override them with command line arguments (See [Hydra documents](https://hydra.cc/docs/advanced/override_grammar/basic/) for details). You may also override the entire config file with environment variable `CONFIG_PATH=<path/to/config/directory>` and `CONFIG_NAME=<your_config_file.yaml>`.
 
 ### Example: Running DeepSeek-R1
 
@@ -287,7 +288,7 @@ Example arguments for hybrid TP+PP:
 torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=8 models=DeepSeek-R1 models.ckpt_dir=/data/DeepSeek-R1
 ```
 
-Please refer to [here](../../chitu\distributed\pd_disaggregation/README.md) for multi-instance deployment.
+Please refer to [here](../../chitu/distributed/pd_disaggregation/README.md) for multi-instance deployment.
 
 For PP, there are additional arguments for micro batching:
 

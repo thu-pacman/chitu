@@ -470,6 +470,21 @@ class TransformerHFLlama(Transformer):
     def _get_layer_i_prefixes(self, i: int) -> list[str]:
         return [f"layers.{i}."]
 
+    @override
+    def _get_non_layer_prefix_mappings(self) -> list[tuple[str, str]]:
+        prefix_mappings = []
+        if self.pp_stage == 0:
+            prefix_mappings.extend([("model.embed_tokens.", "embed_tokens.")])
+        if self.pp_stage == self.pp_end_stage:
+            prefix_mappings.extend([("model.norm.", "norm.")])
+            if not getattr(self.params, "tie_word_embeddings", False):
+                prefix_mappings.extend([("lm_head.", "lm_head.")])
+        return prefix_mappings
+
+    @override
+    def _get_layer_i_prefix_mapping(self, i: int) -> tuple[str, str]:
+        return (f"model.layers.{i}.", f"layers.{i}.")
+
     def _process_state_dict_for_splitting_qkv(self, checkpoint: dict[str, Any]):
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
@@ -715,34 +730,15 @@ class TransformerHFLlama(Transformer):
                     checkpoint[name] = param.view([dim, -1])
         return checkpoint
 
-    def load_state_dict_parallel(
+    def preprocess_state_dict_parallel(
         self,
         state_dict: dict[str, Any],
-        *args,
+        *,
         skip_preprocess: bool = False,
-        **kwargs,
-    ):
+        is_layerwise: bool = False,
+        replace: bool = True,
+    ) -> dict[str, Any]:
         if not skip_preprocess:
-            if self.params.name.startswith("glm") and self.params.type == "hf-llama":
-                # Classic GLM-4 (instead of GLM-4-0414) has non-standard key names because they use "custom code"
-                # in model files instead of using code in transformers' repo.
-
-                def map_glm_key(k):
-                    k = k.replace(
-                        "transformer.embedding.word_embeddings.", "embed_tokens."
-                    )
-                    k = k.replace("transformer.encoder.layers.", "layers.")
-                    k = k.replace(".self_attention.", ".self_attn.")
-                    k = k.replace(".query_key_value.", ".qkv_proj.")
-                    k = k.replace(".dense.", ".o_proj.")
-                    k = k.replace(".dense_h_to_4h.", ".gate_up_proj.")
-                    k = k.replace(".dense_4h_to_h.", ".down_proj.")
-                    k = k.replace("transformer.encoder.final_layernorm.", "norm.")
-                    k = k.replace("transformer.output_layer.", "lm_head.")
-                    return k
-
-                del state_dict["transformer.rotary_pos_emb.inv_freq"]
-                state_dict = {map_glm_key(k): v for k, v in state_dict.items()}
             if self.params.quant_config["type"] == "blockfp8":
 
                 def map_blockfp8_key(k):
@@ -776,8 +772,11 @@ class TransformerHFLlama(Transformer):
                 state_dict, n_kv_head_multiplier
             )
 
-        super().load_state_dict_parallel(
-            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
+        return super().preprocess_state_dict_parallel(
+            state_dict,
+            skip_preprocess=skip_preprocess,
+            is_layerwise=is_layerwise,
+            replace=replace,
         )
 
     def _init_pre_layers(self):

@@ -42,12 +42,11 @@ class AsyncDataStream:
         self.reasoning_len = 0
         if enable_reasoning:
             if isinstance(self.tokenizer, (Tokenizer, TokenizerHF)):
-                try:
-                    self.rs_token_id, self.re_token_id = self.tokenizer.encode(
-                        "<think></think>", bos=False, eos=False
-                    )
-                except ValueError:
-                    logger.info(
+                encoded = self.tokenizer.encode("<think></think>", bos=False, eos=False)
+                if len(encoded) == 2:
+                    self.rs_token_id, self.re_token_id = encoded
+                else:
+                    logger.info_once(
                         "Cannot obtain reasoning token ids from tokenizer. "
                         "Falling back to using config."
                     )

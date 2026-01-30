@@ -8,6 +8,7 @@ import os
 from logging import getLogger
 import psutil
 import random
+import re
 import traceback
 from tqdm import tqdm
 
@@ -44,12 +45,17 @@ from chitu.utils import (
     try_import_opt_dep,
     try_import_and_setup_torch_npu,
     ceil_div,
+    gather_str_to_dst_rank,
 )
 from chitu.schemas.utils import ModelConfigResolver
-from chitu.distributed.parallel_state import get_pp_group
+from chitu.distributed.parallel_state import get_pp_group, get_world_group
 from chitu.logging_utils import setup_chitu_logging
-from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
-from chitu.metrics.throughput_monitor import start_throughput_monitor
+from chitu.metrics import (
+    PrometheusMetricsCollector,
+    start_prometheus_server_and_metrics_monitor,
+    stop_metrics_monitor,
+)
+from chitu.distributed.comm_group import SingletonGroupPlaceholder
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
@@ -330,6 +336,7 @@ def _warmup_backend_direct(args, local_max_bs=1, decode_steps=2, bs_descend=0):
     seq_len_list = [1] * local_max_bs
     # Prefill
     Backend.cache_manager.prepare_cache_prefill(req_ids, seq_len_list)
+    PrometheusMetricsCollector.update_kvcache_usage()
 
     if get_global_args().models.type == "hf-qwen3-next":
         Backend.linear_attn_cache_manager.prepare_cache_prefill(req_ids, seq_len_list)
@@ -351,6 +358,7 @@ def _warmup_backend_direct(args, local_max_bs=1, decode_steps=2, bs_descend=0):
         curr_bs = local_max_bs - i * bs_descend
         curr_req_ids = req_ids[:curr_bs]
         Backend.cache_manager.prepare_cache_decode(curr_req_ids)
+        PrometheusMetricsCollector.update_kvcache_usage()
         if get_global_args().models.type == "hf-qwen3-next":
             Backend.linear_attn_cache_manager.prepare_cache_decode(curr_req_ids)
         if (
@@ -393,6 +401,7 @@ def _warmup_backend_direct(args, local_max_bs=1, decode_steps=2, bs_descend=0):
             and get_global_args().models.type == "deepseek-v3"
         ):
             Backend.indexer_cache_manager.finalize_cache_all_decode(req_id)
+    PrometheusMetricsCollector.update_kvcache_usage()
     logger.info("Local backend warmup (direct) completed")
 
 
@@ -473,6 +482,17 @@ def check_checkpoint_path(args):
             f"Using {args.models.ckpt_dir} as the path to processor. If the processor has a different path, please set in command line by adding `models.processor_path=<path>`"
         )
         args.models.processor_path = args.models.ckpt_dir
+
+
+def _has_cpu_layer(args) -> bool:
+    if (backend_config := args.models.get("backend_config")) is not None:
+        for config in backend_config.get("backend", []):
+            if (pattern := config.get("model")) is not None:
+                if re.match(pattern, args.models.name.lower()):
+                    for rule in config.rules:
+                        if rule.get("backend") == "cpuinfer":
+                            return True
+    return False
 
 
 def chitu_init(args):
@@ -562,17 +582,11 @@ def chitu_init(args):
             )
             args.infer.prefill_chunk_size = None
 
-    # Bind process to CPU NUMA
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+    # Auto setting for binding process to CPU NUMA
     if args.infer.bind_process_to_cpu == "auto":
-        if not has_cpuinfer and not has_numa:
-            args.infer.bind_process_to_cpu = "none"
-        elif not has_numa:
+        if not has_numa:
             logger.warning(
-                "'cpuinfer' is found but 'numa' is mising. Disabling NUMA binding. "
-                "For better CPU inference performance, please refer to README.md and "
-                "install the full '[cpu]' optional dependency."
+                "Optional dependency '[numa]' is mising. Disabling NUMA binding."
             )
             args.infer.bind_process_to_cpu = "none"
         elif not numa.available():
@@ -580,19 +594,17 @@ def chitu_init(args):
                 "NUMA is not support on this OS or hardware platform. Disabling NUMA binding."
             )
             args.infer.bind_process_to_cpu = "none"
-        elif numa.get_max_node() + 1 < local_world_size:
-            logger.debug("Disable NUMA binding due to insufficient NUMA nodes.")
-            args.infer.bind_process_to_cpu = "none"
+        elif _has_cpu_layer(args):
+            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+            if numa.get_max_node() + 1 < local_world_size:
+                logger.warning(
+                    "Disable NUMA binding due to insufficient NUMA nodes. Is is an inefficient setting of CPU inference."
+                )
+                args.infer.bind_process_to_cpu = "none"
+            else:
+                args.infer.bind_process_to_cpu = "one_numa_per_rank"
         else:
-            args.infer.bind_process_to_cpu = "numa"
-    if args.infer.bind_process_to_cpu == "numa":
-        numa.bind({local_rank})
-    elif args.infer.bind_process_to_cpu == "none":
-        pass
-    else:
-        raise ValueError(
-            f"Unsupported infer.bind_process_to_cpu={args.infer.bind_process_to_cpu}"
-        )
+            args.infer.bind_process_to_cpu = "numa_near_device"
 
     if args.infer.use_cuda_graph == "auto":
         if args.models.name in [
@@ -657,6 +669,7 @@ def chitu_init(args):
     set_quant_variables(args)
     set_backend_variables(args)
     set_global_variables(args, debug=debug)
+    logger.debug(f"Auto setting configs done. Full configs are: {args}")
 
     args = get_global_args()
     Backend.build(args)
@@ -671,27 +684,27 @@ def chitu_init(args):
     PackedTasks.configure(max_num_tasks=args.infer.max_reqs)
     logger.info("Chitu has been initialized")
 
-    metrics_config = args.metrics
+    collector = PrometheusMetricsCollector.get_instance(is_create=True)
 
+    collector_addrs = [collector.addr]
+    if type(get_world_group().gpu_group) != SingletonGroupPlaceholder:
+        try:
+            collector_addrs = gather_str_to_dst_rank(
+                collector.addr, dst=0, group=get_world_group().gpu_group
+            )
+        except Exception as e:
+            logger.error(
+                f"An error occurred while gathering collector addresses to rank 0. Prometheus will monitor metrics only on rank 0: {e}"
+            )
+
+    logger.debug(f"collector_addrs:{collector_addrs}")
+
+    # Ranks with dp_dispatcher start throughput monitor for independent logging
     # Determine if this rank should start throughput monitor
     # Only rank 0 monitors (it has all TaskPool data)
     should_start_monitor = rank == 0
-
-    # Only rank 0 starts the Prometheus server to avoid port conflicts
-    collector = PrometheusMetricsCollector.get_instance(
-        port=metrics_config.port, start_server=(rank == 0)
-    )
-
-    if rank == 0:
-        logger.info(f"Metrics server started on port {metrics_config.port}")
-
-    # Ranks with dp_dispatcher start throughput monitor for independent logging
     if should_start_monitor:
-        start_throughput_monitor(
-            collector,
-            log_interval=metrics_config.log_interval,
-            collect_interval=metrics_config.collect_interval,
-        )
+        start_prometheus_server_and_metrics_monitor(collector_addrs)
 
 
 def remove_kvcache_all_device(remove_task_ids):
@@ -1038,6 +1051,8 @@ def chitu_terminate():
             payload_type=SerializedPackedTasksPayloadType.TerminateBackend,
         )
         Backend.executor.step(terminated_task)
+    stop_metrics_monitor()
+    PrometheusMetricsCollector.stop_instance()
 
 
 def chitu_is_terminated():

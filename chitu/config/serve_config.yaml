@@ -2,65 +2,279 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+# `defaults` are other config files or scripts included into this config file. See
+# https://hydra.cc/docs/tutorials/basic/your_first_app/defaults/ for details.
 defaults:
+  # Config validating scripts. Only for chitu developers.
   - hydra/callbacks: 
     - serve_config_rules
-  - models: Qwen2-7B-Instruct # References chitu/config/models/Qwen2-7B-Instruct.yaml
+
+  # Include model configs into this file. Please set it to the model you want to run.
+  # In this `Qwen2-7B-Instruct` example, it includes `chitu/config/models/Qwen2-7B-Instruct.yaml`
+  # into this file.
+  #
+  # IMPORTANT: Typically, you need to set this field.
+  - models: Qwen2-7B-Instruct
+
+  # Type checks for this config file. Only for chitu developers.
   - serve_config_schema
+
+  # Sub-configs for `benchmarks/benchmark_offline.sh`. Ignored for serving.
   - benchmark: default
+
+  # Sub-configs for `test/single_req_test.py` and `test/single_req_compare.py`. Ignored for serving.
+  - request: default
+
+  # Indicates that values in this file has higher priority than values in other files.
+  # Don't touch if you are not sure.
   - _self_
 
+# Configs for how chitu responses to HTTP requests.
 serve:
+  # HTTP service IP. Set this according to your network.
   host: 0.0.0.0
+
+  # HTTP service port. Set this according to your network.
   port: 21002
-  api_keys: # If the request has a api_key field found in this dict, the request will be prioritized.
+
+  # If the request has a api_key field found in this dict, the request will be prioritized
+  # according to the `priority` field. The higher the value of the field, the higher the
+  # priority. Ordinary request has a priority of 1.
+  api_keys: 
     - key: example_key
-      priority: -1 # The higher the value, the higher the priority. Ordinary request has a priority of 1.
+      priority: -1 
+
+# Configs for how chitu do the LLM inference computation.
 infer:
+  # Hard batch size limit, WITHOUT considering memory limit. This value is the global (total)
+  # value across DP ranks. If the number of concurrent requests exceeds this value, some
+  # of the requests will wait.
+  #
+  # IMPORTANT: Typically, you need to set this field.
+  max_reqs: 8
+
+  # Hard sequence length limit of a single request, WITHOUT considering memory limit. This
+  # is the maximum number of input and output tokens in total.
+  #
+  # IMPORTANT: Typically, you need to set this field.
+  max_seq_len: 10240
+
+  # Data structure for KV cache. Set it to "page" for paged KV cache 
+  #
+  # Acceptable values:
+  # - "skew": For better performance when the memory is sufficient. This is a legacy name for
+  #   dense KV cache.
+  # - "paged": To better handling requests with different lengths.
+  #
+  # IMPORTANT: Typically, you need to set this field.
+  cache_type: skew
+
+  # Number of Tensor Parallel ranks for non-MoE models or non-MoE modules in MoE models.
+  # See `docs/en/DEVELOPMENT.md#parallelism` for details.
   tp_size: 1
+
+  # Number of Pipeline Parallel ranks for non-MoE models or non-MoE modules in MoE models.
+  # See `docs/en/DEVELOPMENT.md#parallelism` for details.
   pp_size: 1
+
+  # Number of Data Parallel ranks for non-MoE models or non-MoE modules in MoE models.
+  # See `docs/en/DEVELOPMENT.md#parallelism` for details.
   dp_size: 1
+
+  # Number of Expert Parallel ranks for MoE modules in MoE models. See
+  # `docs/en/DEVELOPMENT.md#parallelism` for details.
   ep_size: 1
-  do_load: True # Legacy parameter. To be removed in the future.
+
+  # Random seed
   seed: 0
-  max_seq_len: 10240 # length of prefill + decode
-  cache_type: skew # one of: skew, paged
-  attn_type: auto # one of: auto, flash_attn, flash_mla, flash_infer, triton, npu, ref
-  op_impl: torch # one of: torch, muxi_custom_kernel
-  mla_absorb: "none" # one of: none, absorb-without-precomp, absorb
-  raise_lower_bit_float_to: float8_e4m3fn # choose one hardware-support dtype to compute lower-bit float 
-  soft_fp8: false # Legacy parameter. To be removed in the future.
-  fuse_shared_experts: False # whether to fuse shared experts
-  max_reqs: 8 # Global max batch size across DP ranks
-  pp_layer_partition: null # The number of layers for each pipeline stage, e.g., [10, 12, 12, 10].
-  use_cuda_graph: auto # one of: auto, True, False
-  num_blocks: -1 # a positive interger or -1 for auto num blocks calculation
-  bind_process_to_cpu: auto # one of: auto, none, numa
-  bind_thread_to_cpu: physical_core # one of: physical_core, logical_core
+
+  # Attention backend.
+  #
+  # Acceptable values:
+  # - "auto": Automatically choose a good backend.
+  # - "flash_attn": Use flash_attn. This requires installing chitu with `chitu[flash_attn]`
+  #   for extra dependency.
+  # - "flash_mla": Use flash_mla. This requires installing chitu with `chitu[flash_mla]`
+  #   for extra dependency.
+  # - "flash_infer": Use flashinfer. This requires installing chitu with `chitu[flashinfer]`
+  #   for extra dependency.
+  # - "triton": Use chitu's built-in triton backend. This requires running on a platform
+  #   supporting Triton.
+  # - "npu": Use operators dedicated for Ascend NPUs.
+  # - "ref": Use chitu's built-in reference backend. This is backend has full support for
+  #   different types of attention, but it is very slow and consumes much memory.
+  attn_type: auto
+
+  # Currently this option is only for enabling/disabling muxi_custom_kernel.
+  #
+  # Acceptable values:
+  # - "torch": Ordinary implementation.
+  # - "muxi_custom_kernel": Use additional kernels for running on MetaX GPUs, optimized for
+  #   small batches. This requires installing chitu with `chitu[muxi_custom_kernel]` for
+  #   extra dependency.
+  op_impl: torch
+
+  # Absorption mode for MLA. This field is ignored when the model does not contain MLA.
+  # 
+  # Acceptable values:
+  # - "none": No absorption. This is an optimization for lower FLOP counts, which matches the
+  #   typical need for prefilling.
+  # - "absorb-without-precomp": exchange some matrices in the order of multiplication. This is
+  #   an optimization for smaller memory footprint and lower memory occupancy for KV cache,
+  #   which matches the typical need for decoding.
+  # - "absorb": exchange some matrices in the order of multiplication, and precompute all the
+  #   multiplications that can be computed before inference. This is an optimization for fewer
+  #   operator counts, which may be useful for low-latency + low-concurrency cases.
+  mla_absorb: "none"
+
+  # The hardware-supported data type used for software implementation for lower-bit data types
+  # that are not supported by the hardware. For example, when you want to run a float8_e4m3fn
+  # typed model with GPUs only supporting bfloat16 instructions, set this field to bfloat16.
+  raise_lower_bit_float_to: float8_e4m3fn
+
+  # Whether to fuse shared experts and routed experts into the same operators. This field is
+  # ignored for non-MoE models, or for MoE models with no shared experts.
+  #
+  # Acceptable values: True, False
+  fuse_shared_experts: False
+
+  # If not null, override the automatic layer partitioning for Pipeline Parallelism.
+  #
+  # Acceptable values: null or a list of integers, e.g., [10, 12, 12, 10].
+  pp_layer_partition: null
+
+  # Whether to use CUDA graph or equivalent technologies on non-CUDA platforms.
+  #
+  # Acceptable values:
+  # - "auto": Decide automatically.
+  # - True: Use CUDA graph.
+  # - False: Do not use CUDA graph.
+  use_cuda_graph: auto
+
+  # Device memory utilization rate for automatic page allocation for paged KV cache.
+  #
+  # Acceptable values: 0.0 to 1.0, e.g., 0.98 means 98% of GPU memory will be used.
+  memory_utilization: 0.98
+
+  # If not -1, override the automatic page allocation for paged KV cache, and disables the
+  # `memory_utilization` field.
+  #
+  # Acceptable values: -1 or a positive integer.
+  num_blocks: -1
+
+  # Prefill chunk size. A higher value will increase prefilling throughput, but also increase
+  # memory usage for intermediate tensors.
+  #
+  # Acceptable values:
+  # - "auto": Decide automatically.
+  # - null: Disable prefill chunking.
+  # - a positive integer: The global (total) prefill chunk size across DP ranks.
+  prefill_chunk_size: auto
+
+  # Number of total tokens generated by the main model and then MTP layers in a single step,
+  # which means 1 token is generated by the main model and (mtp_size - 1) tokens are generated
+  # by MTP layers. Setting to 1 means disabling MTP. This field is ignored when the model does
+  # not support MTP.
+  #
+  # This value needs to be tuned. If it is too low, the MTP layers are under-utilized. If it is
+  # too high, there may be too much tokens that cannot pass the validation and then be dropped.
+  #
+  # Acceptable values: A positive integer.
+  mtp_size: 1
+
+  # Whether to overlap scheduling with tensor computation. We recommand to keep this feature
+  # on whenever supported.
+  #
+  # Acceptable values:
+  # - "auto": Decide automatically.
+  # - True: Enable overlapping.
+  # - False: Disable overlapping.
+  schedule_overlap: auto
+
+  # If True, try to fully warmup each operator before launching the service. It will take more
+  # time before the service is ready, but useful for reduce the performance loss for the first
+  # several requests.
+  #
+  # Acceptable values:
+  # - "auto": Decide automatically.
+  # - True: Fully warmup.
+  # - False: Skip full warmup.
+  full_warmup: auto
+
+  # Whether and how to bind the currenct process to a CPU. If binding, it requires installing
+  # chitu with `chitu[numa]` for extra dependency.
+  #
+  # Acceptable values:
+  # - "auto": Decide automatically.
+  # - "none": Do not bind.
+  # - "one_numa_per_rank": Bind each rank to a different NUMA node. This is helpful for CPU
+  #   inference, where each rank is responsible for computing on a dedicated NUMA.
+  # - "numa_near_device": Bind each rank to a NUMA node that is closest to the device this
+  #   rank is responsible for. This is helpful for reducing CPU-GPU synchronizing latency.
+  bind_process_to_cpu: auto
+
+  # How to bind threads to CPU cores for CPU inference. This field is ignored when CPUs are not
+  # used for computing.
+  #
+  # Acceptable values:
+  # - "physical_core": Bind each thread to a physical core.
+  # - "logical_core": Bind each thread to a logical core.
+  bind_thread_to_cpu: physical_core
+
   npu_fusion_fp4: False #  for npu fp4 fusion group_gemm mode
-  memory_utilization: 0.98 # GPU memory utilization for each GPU, e.g., 0.98 means 98% of GPU memory will be used.
-  prefill_chunk_size: auto # auto or integer or null. Global prefill chunk size across DP ranks
   moe:
     prefill_memory_tolerance: 2.0 # In case of EP inbalance, the largest activation tensor will occupy no more than O(prefill_chunk_size / ep_size * prefill_memory_tolerance) memory
     prefill_token_dispatcher: auto # one of: auto, tp, allgather, deepep-nl
     decode_token_dispatcher: auto # one of: auto, tp, allgather, deepep-ll
-  mtp_size: 1 # if mtp_size==1, the mtp function is turned off; the mtp function will only be enabled when mtp_size>1.
-  schedule_overlap: auto # True, False or auto
-  full_warmup: auto # True, False or auto
-request: # for testing in single_req_test.py, NOT affecting the real serving
-  prompt_tokens_len: -1 # use for performance testing, -1 means use real requests.
-  max_new_tokens: 128
-  frequency_penalty: 0.0
+
+  # The followings are legacy parameters. They are to be removed in the future.
+  do_load: True
+  soft_fp8: false
+
+# Configs for how chitu schedules multiple requests.
 scheduler:
-  type: "request_preset,prefill_first"  # Ordered comma separated list of scheduler types among: "fcfs", "request_preset",
-                                        # "prefill_first", "stride", "deadline", "prefix_align"
+  # Priority strategy. This field accepts an ordered comma separated list of stratigies. Requests
+  # are first sorted by the leading strategy, and then by the next, and so on.
+  #
+  # Acceptable values: An ordered comma separated list of scheduler types among:
+  # - "fcfs": First come, first serve.
+  # - "request_preset": Use priorities bound to API keys, set by `serve.api_keys`.
+  # - "prefill_first": Priorities prefill first, then decode.
+  # - "stride": Each task has a priority value P, and a score S (starts from 0), at scheduling point,
+  #   update the scores: S += P * elapsed_time. Select the tasks with top scores and reset their
+  #   scores back to 0.
+  # - "deadline": Each task has a deadline time `DDL = request_arrival_time + prefix_tokens_len * alpha +
+  #   max_output_tokens * beta`. Select the tasks with nearest DDL. Alpha and beta are arbitary value,
+  #   defaults to 1ms.
+  # - "prefix_align": Batch tasks with similar input lengths togather.
+  type: "request_preset,prefill_first"
+
+  # Configs how to schedule for micro batches use for Pipeline Parallelism. Ignore when `pp_size == 1`.
   pp_config:
-    pp_micro_batch_size_prefill: auto # one of: auto, max or exact number
-    pp_micro_batch_size_decode: auto # one of: auto, max or exact number
-    prefill_num_tasks_divided_by_pp: True # Legacy parameter. To be removed in the future.
-    prefill_num_tasks: null # Legacy parameter. To be removed in the future.
-    enforce_decode_num_tasks_max: True # Legacy parameter. To be removed in the future.
-    decode_num_tasks: null # Legacy parameter. To be removed in the future.
+    # Micro batching strategy for prefilling. This field has effect only when `pp_size > 1` and `cache_type`
+    # is `paged`.
+    #
+    # Acceptable values:
+    # - "max": The maximum value of `prefill micro batch size` is limited to `max_reqs_per_dp / pp_size`.
+    # - An integer: The maximum value of `prefill micro batch size` is limited to the value.
+    # - "auto": Currently this means "max".
+    pp_micro_batch_size_prefill: auto
+
+    # Micro batching strategy for decoding. This field has effect only when `pp_size > 1` and `cache_type`
+    # is `paged`.
+    #
+    # Acceptable values:
+    # - "max": The maximum value of `decode micro batch size` is limited to `max_reqs_per_dp / pp_size`.
+    # - An integer: The maximum value of `decode micro batch size` is limited to the number.
+    # - "auto": Currently this means "max".
+    pp_micro_batch_size_decode: auto
+
+    # The followings are legacy parameters. They are to be removed in the future.
+    prefill_num_tasks_divided_by_pp: True
+    prefill_num_tasks: null
+    enforce_decode_num_tasks_max: True
+    decode_num_tasks: null
+
 dp_config:
   enabled: False
   scheduler_base_host: 0.0.0.0
@@ -112,17 +326,44 @@ dp_config:
       - host: 0.0.0.0
         port: 29630
         scheduling_strategy: "immediate"
+
+# Configs how chitu is monitored and logged.
 metrics:
-  port: 9097
-  log_interval: 10.0
-  collect_interval: 20.0
+  prometheus_listening_port: 9090 # Access prometheus server at this port
+  prometheus_config_file: "prometheus.yml" # prometheus configuration path, which is a yml file
+  prometheus_data_dir: "prometheus_data" # prometheus data stoarge path, which is a folder
+  prometheus_scrape_interval: 1 # prometheus server scrapes PrometheusMetricsCollectors every ${prometheus_scrape_interval} seconds.
+  log_interval: 10
 debug:
   skip_model_load: False
   force_moe_balance: False
-quant: null
-dtype: null # Legacy parameter. To be removed in the future.
-float_16bit_variant: bfloat16 # one of: bfloat16, float16. This sets the default_dtype of torch
-use_float32_rotary: False # If True, use float32 for RoPE. Otherwise, use the same dtype as `float_16bit_variant`.
-                          # float32 may be helpful if the context length is very long.
+
+# The data type for 16-bit floating point data type. This field is orthogonal to quantization.
+#
+# Acceptable values:
+# - "bfloat16": Wider range, less precision. There may be accuracy loss for small (<= ~7B) models.
+# - "float16": Narrower range, higher precision. But some models will result in NaN.
+float_16bit_variant: bfloat16
+
+# Data type for RoPE (rotary positional encoding). Setting to float32 may be helpful if the
+# context length is very long.
+#
+# Acceptable values:
+# - True: Use float32 for RoPE.
+# - False: Use the same dtype as `float_16bit_variant`.
+use_float32_rotary: False
+
+# What to do if the data type mismatches between the model definition (the code) and the checkpoint
+# (the model file on disk). Whatever is this field, you will receive a warning when the data type
+# mismatches.
+#
+# Acceptable values:
+# - True: Use the data type in the checkpoint.
+# - False: Use the data type in the model definition.
 keep_dtype_in_checkpoint: False
+
 skip_preprocess: False
+quant: null
+
+# The followings are legacy parameters. They are to be removed in the future.
+dtype: null

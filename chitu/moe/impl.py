@@ -326,9 +326,9 @@ class MoEImplEP(MoEImplBase):
 
     def _get_current_token_dispatcher(self) -> MoETokenDispatcher:
         assert self.task_type is not None
-        if self.task_type in [TaskType.Prefill, TaskType.EmptyPrefill]:
+        if self.task_type == TaskType.Prefill:
             return self.prefill_token_dispatcher
-        elif self.task_type in [TaskType.Decode, TaskType.EmptyDecode]:
+        elif self.task_type == TaskType.Decode:
             return self.decode_token_dispatcher
         else:
             raise ValueError(f"Invalid task type: {self.task_type}")
@@ -336,9 +336,7 @@ class MoEImplEP(MoEImplBase):
     def _init_experts_impl(self):
         self.impl_map = {
             TaskType.Prefill: self.prefill_experts_impl,
-            TaskType.EmptyPrefill: self.prefill_experts_impl,
             TaskType.Decode: self.decode_experts_impl,
-            TaskType.EmptyDecode: self.decode_experts_impl,
         }
 
     def prepare(self, task_type: TaskType, num_tokens: int) -> None:
@@ -416,16 +414,10 @@ class MoEImplNoEP(MoEImplBase):
         if has_deep_gemm:
             self.impl_map = {
                 TaskType.Prefill: "group_gemm_contiguous",
-                TaskType.EmptyPrefill: "group_gemm_contiguous",
                 TaskType.Decode: "auto",
-                TaskType.EmptyDecode: "auto",
-                # TaskType.Decode: "group_gemm_masked",
-                # TaskType.EmptyDecode: "group_gemm_masked",
             }
         else:
             self.impl_map = {
                 TaskType.Prefill: "auto",
-                TaskType.EmptyPrefill: "auto",
                 TaskType.Decode: "auto",
-                TaskType.EmptyDecode: "auto",
             }

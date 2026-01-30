@@ -19,6 +19,7 @@ import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 from safetensors.torch import safe_open
 from tqdm import tqdm
+
 from chitu.attn_backend import (
     FlashAttnBackend,
     FlashInferBackend,
@@ -60,16 +61,14 @@ from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF, Pr
 from chitu.tool_call import get_tool_parser
 from chitu.constraint_decode import ConstraintDecodeManager
 from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div
-
-# from chitu.distributed.moe_token_dispatcher import init_token_dispatcher
 from chitu.moe import init_moe_impl
 from chitu.global_vars import set_slot_handle
+from chitu.numa_utils import bind_process_to_numa
 
 if TYPE_CHECKING:
     from chitu.executor import Executor
     from chitu.scheduler import Scheduler
 
-numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
 
@@ -153,6 +152,7 @@ class Backend:
                 import torch
 
                 class _ModelExpertsAccessor(ExpertParamAccessor):  # type: ignore
+
                     def _copy_in(
                         self, dst_tensor: torch.Tensor, src: torch.Tensor, slot: int
                     ):
@@ -262,6 +262,8 @@ class Backend:
                 torch.distributed.init_process_group("nccl")
         if Backend.use_gloo:
             Backend.group_gloo = torch.distributed.new_group(backend="gloo")
+
+        bind_process_to_numa(args.infer.bind_process_to_cpu)
 
         tensor_parallel_size = args.infer.tp_size
         pipeline_parallel_size = args.infer.pp_size
@@ -775,6 +777,9 @@ class Backend:
     def _move_one_module_to_device(
         m: torch.nn.Module, non_blocking: bool = True, ignore_not_loaded: bool = False
     ):
+        if Backend.args.infer.op_impl == "cpu":
+            return
+
         # NOTE: m._parameters contains parameters in this module (non-recursive),
         # while m.parameters() returns all parameters in this module and its submodules
         # (recursive).
@@ -853,14 +858,12 @@ class Backend:
             model = Backend._build_model_architecture(args, attn_backend)
 
         # Move model to appropriate device
-        if args.infer.op_impl != "cpu":
-            model.apply(Backend._move_one_module_to_device)
+        model.apply(Backend._move_one_module_to_device)
 
         if torch.distributed.get_rank() == 0:
             logger.debug(f"Model structure: \n{model}")
 
         Backend.model = model
-        Backend.args = args
 
         # Try to auto-register a MoE weight accessor provided by the model/experts
         try:
@@ -978,6 +981,41 @@ class Backend:
         return model
 
     @staticmethod
+    def _handle_quantized_weights_casting(checkpoint, args):
+        # For the FP8 variants of Qwen (Qwen3-30B-A3B-fp8 and Qwen3-235B-A22B-fp8), some checkpoint parameters
+        # are stored in full precision (FP32) by default, but at runtime they’re also cast to BF16
+        if args.models.name in ["Qwen3-30B-A3B-fp8", "Qwen3-235B-A22B-fp8"]:
+            for k in checkpoint.keys():
+                if (
+                    checkpoint[k].dtype == torch.float32
+                    and "scale" not in k
+                    and "layernorm" not in k
+                    and "norm" not in k
+                ):
+                    checkpoint[k] = checkpoint[k].to(torch.get_default_dtype())
+        # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
+        # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
+        for k in checkpoint.keys():
+            quant = get_quant_from_checkpoint_prefix(k, args.models.quant_config.rules)
+            if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
+                if quant == "blockfp8" and checkpoint[k].element_size() == 1:
+                    checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
+            if (
+                quant in ("blockfp4", "blockfp4_merged")
+                and checkpoint[k].element_size() == 1
+            ):
+                checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
+
+        return checkpoint
+
+    @staticmethod
+    def _support_layerwise_loading():
+        if is_ascend():
+            return False
+        else:
+            return True
+
+    @staticmethod
     def _load_checkpoint(model, args):
         """
         Load model parameters from checkpoint files.
@@ -1034,35 +1072,19 @@ class Backend:
                 "hf-qwen2-vl",
                 "hf-qwen3-next",
             }:
-                checkpoint = Backend._load_hf_checkpoint(model, args)
+                if Backend._support_layerwise_loading():
+                    checkpoint = Backend._load_hf_checkpoint_layerwise(model, args)
+                    logger.info(
+                        f"Checkpoint loaded in {time.time() - start_time:.2f} seconds"
+                    )
+                    return
+                else:
+                    checkpoint = Backend._load_hf_checkpoint(model, args)
             else:
                 raise NotImplementedError(f"Unsupported model type {args.models.type}")
 
-            # For the FP8 variants of Qwen (Qwen3-30B-A3B-fp8 and Qwen3-235B-A22B-fp8), some checkpoint parameters
-            # are stored in full precision (FP32) by default, but at runtime they’re also cast to BF16
-            if args.models.name in ["Qwen3-30B-A3B-fp8", "Qwen3-235B-A22B-fp8"]:
-                for k in checkpoint.keys():
-                    if (
-                        checkpoint[k].dtype == torch.float32
-                        and "scale" not in k
-                        and "layernorm" not in k
-                        and "norm" not in k
-                    ):
-                        checkpoint[k] = checkpoint[k].to(torch.get_default_dtype())
-            # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
-            # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
-            for k in checkpoint.keys():
-                quant = get_quant_from_checkpoint_prefix(
-                    k, args.models.quant_config.rules
-                )
-                if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
-                    if quant == "blockfp8" and checkpoint[k].element_size() == 1:
-                        checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
-                if (
-                    quant in ("blockfp4", "blockfp4_merged")
-                    and checkpoint[k].element_size() == 1
-                ):
-                    checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
+            checkpoint = Backend._handle_quantized_weights_casting(checkpoint, args)
+
             model.load_state_dict_parallel(
                 checkpoint,
                 strict=True,
@@ -1090,16 +1112,7 @@ class Backend:
         }
 
     @staticmethod
-    def _load_hf_checkpoint(model, args):
-        """
-        Load checkpoint for Hugging Face model types.
-
-        Arguments:
-            args: Configuration with checkpoint settings
-
-        Returns:
-            Loaded checkpoint dictionary
-        """
+    def _build_hf_key_filter(args):
 
         def key_filter(k: str) -> bool:
             if (
@@ -1145,12 +1158,114 @@ class Backend:
                 return False
             return True
 
+        return key_filter
+
+    @staticmethod
+    def _load_hf_checkpoint_layerwise(model, args):
+
+        key_filter = Backend._build_hf_key_filter(args)
+
+        def _map_key(
+            k: str,
+            checkpoint_prefix: str,
+            model_prefix: str,
+            layer_prefix: str | None,
+            local_layer_prefix: str | None,
+        ) -> str:
+            if checkpoint_prefix != model_prefix and k.startswith(checkpoint_prefix):
+                k = f"{model_prefix}{k[len(checkpoint_prefix):]}"
+
+            if layer_prefix and local_layer_prefix and k.startswith(layer_prefix):
+                k = f"{local_layer_prefix}{k[len(layer_prefix):]}"
+            return k
+
+        def _load_and_apply(
+            checkpoint_prefix: str,
+            model_prefix: str,
+            layer_prefix: str | None = None,
+            local_layer_prefix: str | None = None,
+        ):
+            if args.skip_preprocess:
+                checkpoint_prefix = model_prefix
+
+            state_dict = load_state_dict(
+                args.models.ckpt_dir,
+                skip_preprocess=args.skip_preprocess,
+                filter_key=key_filter,
+                prefix=checkpoint_prefix,
+            )
+            assert state_dict, f"No state dict found for prefix {checkpoint_prefix}"
+
+            mapped = {}
+            for k, v in state_dict.items():
+                mapped[
+                    _map_key(
+                        k,
+                        checkpoint_prefix,
+                        model_prefix,
+                        layer_prefix,
+                        local_layer_prefix,
+                    )
+                ] = v
+            state_dict = mapped
+
+            state_dict = Backend._handle_quantized_weights_casting(state_dict, args)
+            target_prefix = local_layer_prefix or model_prefix
+            module = model.load_state_dict_by_prefix(
+                state_dict, target_prefix, args.skip_preprocess
+            )
+            module.apply(Backend._move_one_module_to_device)
+            del state_dict
+
+        # Load non-layer weights
+        for checkpoint_prefix, model_prefix in model._get_non_layer_prefix_mappings():
+            _load_and_apply(checkpoint_prefix, model_prefix)
+
+        # Load transformer layers
+        is_print_rank = int(os.environ.get("LOCAL_RANK", 0)) == 0
+        for global_layer_id in tqdm(
+            range(model.local_begin_layer_id, model.local_end_layer_id),
+            disable=not is_print_rank,
+            desc="Model layer-wise loading",
+            leave=False,
+        ):
+            checkpoint_prefix, model_prefix = model._get_layer_i_prefix_mapping(
+                global_layer_id
+            )
+            local_layer_id = global_layer_id - model.local_begin_layer_id
+
+            layer_prefix = f"layers.{global_layer_id}."
+            local_layer_prefix = f"layers.{local_layer_id}."
+            _load_and_apply(
+                checkpoint_prefix,
+                model_prefix,
+                layer_prefix=layer_prefix,
+                local_layer_prefix=local_layer_prefix,
+            )
+
+        torch.cuda.empty_cache()
+
+    @staticmethod
+    def _load_hf_checkpoint(model, args):
+        """
+        Load checkpoint for Hugging Face model types.
+
+        Arguments:
+            args: Configuration with checkpoint settings
+
+        Returns:
+            Loaded checkpoint dictionary
+        """
+
+        key_filter = Backend._build_hf_key_filter(args)
+
         params = load_state_dict(
             args.models.ckpt_dir,
             skip_preprocess=args.skip_preprocess,
             filter_key=key_filter,
         )
-        return Backend._remove_prefix(params, "model.")
+        params = Backend._remove_prefix(params, "model.")
+        return Backend._remove_prefix(params, "language_model.")
 
     @staticmethod
     def build(args):
@@ -1276,7 +1391,11 @@ class Backend:
 
 
 def load_state_dict(
-    hf_ckpt_path, *, skip_preprocess=False, filter_key: Callable[[str], bool] = None
+    hf_ckpt_path,
+    *,
+    skip_preprocess=False,
+    filter_key: Callable[[str], bool] = None,
+    prefix: str = "",
 ):
     if not skip_preprocess:
         path = os.path.join(hf_ckpt_path, "*.safetensors")
@@ -1286,9 +1405,11 @@ def load_state_dict(
 
     state_dict = {}
     ignored_params = []
-    for file_path in tqdm(glob(path)):
+    for file_path in glob(path):
         with safe_open(file_path, framework="pt", device="cpu") as f:
             for name in f.keys():
+                if prefix and not name.startswith(prefix):
+                    continue
                 if filter_key is None or filter_key(name):
                     param: torch.Tensor = f.get_tensor(name)
                     state_dict[name] = param

@@ -1026,45 +1026,6 @@ class TransformerQwen3VL(TransformerHFLlama):
         return BatchedFreqsCis(cos, sin)
 
     # -----------------------------
-    # Checkpoint mapping
-    # -----------------------------
-
-    @override
-    def load_state_dict_parallel(
-        self,
-        state_dict: dict[str, Any],
-        *args,
-        skip_preprocess: bool = False,
-        **kwargs,
-    ):
-        # Strip language_model prefix; KEEP visual weights for multimodal Qwen3-VL.
-        new_state_dict: dict[str, Any] = {}
-        for k, v in state_dict.items():
-            if k.startswith("model.language_model."):
-                new_state_dict[k[len("model.language_model.") :]] = v
-                continue
-            if k.startswith("language_model."):
-                new_state_dict[k[len("language_model.") :]] = v
-                continue
-            if k.startswith("model.visual."):
-                new_state_dict[k[len("model.") :]] = v
-                continue
-            if k.startswith("visual."):
-                new_state_dict[k] = v
-                continue
-            if k.startswith("model."):
-                new_state_dict[k[len("model.") :]] = v
-                continue
-            new_state_dict[k] = v
-
-        # Keep checkpoint preprocessing enabled so that:
-        # - TP chunking works (avoids shape mismatch when tp_size>1)
-        # - QKV / gate_up can be merged by the base Llama adapter logic
-        super().load_state_dict_parallel(  # type: ignore[misc]
-            new_state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
-        )
-
-    # -----------------------------
     # Vision helpers
     # -----------------------------
 
@@ -1519,6 +1480,24 @@ class TransformerQwen3VL(TransformerHFLlama):
         self._deepstack_visual_embeds = None
         self._visual_pos_mask = None
         return h
+
+    @override
+    def _get_non_layer_prefix_mappings(self) -> list[tuple[str, str]]:
+        prefix_mappings = []
+        if self.pp_stage == 0:
+            prefix_mappings.extend(
+                [("model.language_model.embed_tokens.", "embed_tokens.")]
+            )
+        if self.pp_stage == self.pp_end_stage:
+            prefix_mappings.extend([("model.language_model.norm.", "norm.")])
+            if not getattr(self.params, "tie_word_embeddings", False):
+                prefix_mappings.append(("lm_head.", "lm_head."))
+        prefix_mappings.extend([("model.visual.", "visual.")])
+        return prefix_mappings
+
+    @override
+    def _get_layer_i_prefix_mapping(self, i: int) -> tuple[str, str]:
+        return (f"model.language_model.layers.{i}.", f"layers.{i}.")
 
 
 #
@@ -2515,32 +2494,14 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
         return BatchedFreqsCis(cos, sin)
 
     @override
-    def load_state_dict_parallel(
+    def preprocess_state_dict_parallel(
         self,
         state_dict: dict[str, Any],
-        *args,
+        *,
         skip_preprocess: bool = False,
-        **kwargs,
-    ):
-        new_state_dict: dict[str, Any] = {}
-        for k, v in state_dict.items():
-            if k.startswith("model.language_model."):
-                new_state_dict[k[len("model.language_model.") :]] = v
-                continue
-            if k.startswith("language_model."):
-                new_state_dict[k[len("language_model.") :]] = v
-                continue
-            if k.startswith("model.visual."):
-                new_state_dict[k[len("model.") :]] = v
-                continue
-            if k.startswith("visual."):
-                new_state_dict[k] = v
-                continue
-            if k.startswith("model."):
-                new_state_dict[k[len("model.") :]] = v
-                continue
-            new_state_dict[k] = v
-        state_dict = new_state_dict
+        is_layerwise: bool = False,
+        replace: bool = True,
+    ) -> dict[str, Any]:
         state_dict = self.process_state_dict_for_merging_experts(state_dict)
         if not skip_preprocess and self.tensor_parallel_size > 1:
             # IMPORTANT: split merged gate_up back to gate+up before TP sharding,
@@ -2548,8 +2509,11 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
             # can decide whether to merge them back.
             state_dict = self._process_state_dict_for_splitting_moe_gate_up(state_dict)
 
-        super().load_state_dict_parallel(  # type: ignore[misc]
-            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
+        return super().preprocess_state_dict_parallel(  # type: ignore[misc]
+            state_dict,
+            skip_preprocess=skip_preprocess,
+            is_layerwise=is_layerwise,
+            replace=replace,
         )
 
     @override
@@ -2577,3 +2541,21 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
                 new_ckpt
             )
         )
+
+    @override
+    def _get_non_layer_prefix_mappings(self) -> list[tuple[str, str]]:
+        prefix_pairs = []
+        if self.pp_stage == 0:
+            prefix_pairs.extend(
+                [("model.language_model.embed_tokens.", "embed_tokens.")]
+            )
+        if self.pp_stage == self.pp_end_stage:
+            prefix_pairs.extend([("model.language_model.norm.", "norm.")])
+            if not getattr(self.params, "tie_word_embeddings", False):
+                prefix_pairs.extend([("lm_head.", "lm_head.")])
+        prefix_pairs.extend([("model.visual.", "visual.")])
+        return prefix_pairs
+
+    @override
+    def _get_layer_i_prefix_mapping(self, i: int) -> tuple[str, str]:
+        return (f"model.language_model.layers.{i}.", f"layers.{i}.")

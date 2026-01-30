@@ -9,6 +9,7 @@ This allows the serve package to be executed as a module: python -m chitu.serve
 
 from logging import getLogger
 from threading import Thread
+import os
 
 import hydra
 import torch
@@ -22,7 +23,9 @@ from chitu.utils import get_config_dir_path
 
 
 @hydra.main(
-    version_base=None, config_path=get_config_dir_path(), config_name="serve_config"
+    version_base=None,
+    config_path=os.getenv("CONFIG_PATH", get_config_dir_path()),
+    config_name=os.getenv("CONFIG_NAME", "serve_config"),
 )
 def main(args: ServeConfig):
     """Main entry point for serve module"""

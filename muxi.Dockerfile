@@ -48,11 +48,11 @@ RUN printf '%s\n' \
 # NOTE: g++-11 a downgrading of g++, which is required by compiling muxi_layout_kernels. This is
 #       because mxcc can't compile C++20 when g++ is too new.
 RUN apt-get update; \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends g++-11; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends g++-11 curl; \
     rm -rf /var/lib/apt/lists/*
 RUN if [ "${enable_test}" = "true" ]; then \
     apt-get update; \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends expect vim tmux telnet htop lsof strace iputils-ping curl; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends expect vim tmux telnet htop lsof strace iputils-ping; \
     rm -rf /var/lib/apt/lists/*; \
 fi
 
@@ -68,6 +68,29 @@ WORKDIR /workspace/chitu
 COPY ./test ./test
 COPY ./script ./script
 COPY ./benchmarks ./benchmarks
+
+# Download prometheus
+RUN mkdir -p /workspace/prometheus && \
+    # 根据框架下载prometheus
+    case "$(uname -m)" in \
+        x86_64|amd64) \
+            URL="https://github.com/prometheus/prometheus/releases/download/v3.9.1/prometheus-3.9.1.linux-amd64.tar.gz" \
+            ;; \
+        aarch64|arm64) \
+            URL="https://github.com/prometheus/prometheus/releases/download/v3.9.1/prometheus-3.9.1.linux-arm64.tar.gz" \
+            ;; \
+        *) \
+            echo "不支持的架构: $(uname -m)" && exit 1 \
+            ;; \
+    esac && \
+    echo "下载地址: $URL" && \
+    curl -L --retry 3 --retry-delay 5 -o /workspace/prometheus.tar.gz "$URL" && \
+    tar -xzvf /workspace/prometheus.tar.gz --strip-components=1 -C /workspace/prometheus && \
+    rm -f /workspace/prometheus.tar.gz && \
+    cp /workspace/prometheus/prometheus /usr/local/bin && \
+    cp /workspace/prometheus/promtool /usr/local/bin/ && \
+    rm -rf /workspace/prometheus && \
+    prometheus --version
 
 ENV CHITU_MUXI_BUILD=1
 

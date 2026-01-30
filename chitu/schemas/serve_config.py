@@ -8,6 +8,33 @@ from typing import Any, Optional, Union
 from omegaconf import MISSING
 
 
+######################################################################################
+# The following are legacy configs. They might be removed at any time in the future.
+
+
+@dataclass
+class InferConfigLegacy:
+    do_load: bool = MISSING
+    soft_fp8: bool = MISSING
+
+
+@dataclass
+class PpConfigLegacy:
+    prefill_num_tasks_divided_by_pp: bool = MISSING
+    prefill_num_tasks: Optional[int] = MISSING
+    enforce_decode_num_tasks_max: bool = MISSING
+    decode_num_tasks: Optional[int] = MISSING
+
+
+@dataclass
+class ServeConfigLegacy:
+    dtype: Optional[str] = MISSING
+
+
+######################################################################################
+# The following are active configs in use.
+
+
 @dataclass
 class ApiKey:
     key: str = MISSING
@@ -27,12 +54,11 @@ class ServeAddrConfig:
 
 
 @dataclass
-class InferConfig:
+class InferConfig(InferConfigLegacy):
     tp_size: int = MISSING
     pp_size: int = MISSING
     dp_size: int = MISSING
     ep_size: int = MISSING
-    do_load: bool = MISSING  # Legacy parameter. To be removed in the future.
     seed: float = MISSING
     max_seq_len: int = MISSING
     cache_type: str = MISSING
@@ -40,7 +66,6 @@ class InferConfig:
     op_impl: str = MISSING
     mla_absorb: Optional[str] = MISSING
     raise_lower_bit_float_to: str = MISSING
-    soft_fp8: bool = MISSING  # Legacy parameter. To be removed in the future.
     fuse_shared_experts: bool = MISSING
     max_reqs: int = MISSING
     pp_layer_partition: Optional[list[int]] = MISSING
@@ -76,24 +101,13 @@ class RequestConfig:
 
 
 @dataclass
-class SchedulerConfig:
-    @dataclass
-    class PpConfig:
-        pp_micro_batch_size_prefill: str = MISSING
-        pp_micro_batch_size_decode: str = MISSING
-        prefill_num_tasks_divided_by_pp: bool = (
-            MISSING  # Legacy parameter. To be removed in the future.
-        )
-        prefill_num_tasks: Optional[int] = (
-            MISSING  # Legacy parameter. To be removed in the future.
-        )
-        enforce_decode_num_tasks_max: bool = (
-            MISSING  # Legacy parameter. To be removed in the future.
-        )
-        decode_num_tasks: Optional[int] = (
-            MISSING  # Legacy parameter. To be removed in the future.
-        )
+class PpConfig(PpConfigLegacy):
+    pp_micro_batch_size_prefill: str = MISSING
+    pp_micro_batch_size_decode: str = MISSING
 
+
+@dataclass
+class SchedulerConfig:
     pp_config: PpConfig = MISSING
     type: str = MISSING
 
@@ -179,9 +193,11 @@ class DpConfig:
 class MetricsConfig:
     """Metrics collection configuration"""
 
-    port: int = 9097
-    log_interval: float = 10.0
-    collect_interval: float = 1.0
+    prometheus_listening_port: int = 9090
+    prometheus_config_file: str = "prometheus.yml"
+    prometheus_data_dir: str = "prometheus_data"
+    prometheus_scrape_interval: int = 1
+    log_interval: int = 10
 
 
 @dataclass
@@ -279,7 +295,7 @@ class StaticConfig:
 
 
 @dataclass
-class ServeConfig:
+class ServeConfig(ServeConfigLegacy):
     serve: ServeAddrConfig = field(default_factory=ServeAddrConfig)
     models: Any = MISSING
     benchmark: Any = MISSING
@@ -290,7 +306,6 @@ class ServeConfig:
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     quant: Optional[str] = MISSING
-    dtype: Optional[str] = MISSING  # Legacy parameter. To be removed in the future.
     float_16bit_variant: str = MISSING
     use_float32_rotary: bool = MISSING
     keep_dtype_in_checkpoint: bool = MISSING

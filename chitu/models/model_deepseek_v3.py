@@ -1127,6 +1127,19 @@ class TransformerDeepSeekV3(Transformer):
         return [f"layers.{i}."]
 
     @override
+    def _get_non_layer_prefix_mappings(self) -> list[tuple[str, str]]:
+        prefix_mappings = []
+        if self.pp_stage == 0:
+            prefix_mappings.extend([("model.embed_tokens.", "embed_tokens.")])
+        if self.pp_stage == self.pp_end_stage:
+            prefix_mappings.extend([("model.norm.", "norm."), ("lm_head.", "lm_head.")])
+        return prefix_mappings
+
+    @override
+    def _get_layer_i_prefix_mapping(self, i: int) -> tuple[str, str]:
+        return (f"model.layers.{i}.", f"layers.{i}.")
+
+    @override
     def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
         fuse_shared_experts = get_global_args().infer.fuse_shared_experts
         n_dense_layers = self.args.models.n_dense_layers
@@ -1665,14 +1678,14 @@ class TransformerDeepSeekV3(Transformer):
         return checkpoint
 
     @override
-    def load_state_dict_parallel(
+    def preprocess_state_dict_parallel(
         self,
         state_dict: dict[str, Any],
-        *args,
+        *,
         skip_preprocess: bool = False,
-        replace=True,
-        **kwargs,
-    ):
+        is_layerwise: bool = False,
+        replace: bool = True,
+    ) -> dict[str, Any]:
         if not skip_preprocess and replace:
             state_dict_keys = list(state_dict.keys())
             for k in state_dict_keys:
@@ -1681,18 +1694,17 @@ class TransformerDeepSeekV3(Transformer):
                     name = k
                     name = name.replace(".weight_scale_inv", ".scale")
                     state_dict[name] = value
-        super().load_state_dict_parallel(
-            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
+        return super().preprocess_state_dict_parallel(
+            state_dict,
+            skip_preprocess=skip_preprocess,
+            is_layerwise=is_layerwise,
+            replace=replace,
         )
 
     @override
-    def load_state_dict(
-        self,
-        state_dict: dict[str, Any],
-        *args,
-        skip_preprocess: bool = False,
-        **kwargs,
-    ):
+    def preprocess_state_dict(
+        self, state_dict: dict[str, Any], *, skip_preprocess: bool = False
+    ) -> dict[str, Any] | None:
         if not skip_preprocess:
             if self.mla_absorb == "absorb":
                 state_dict = self._process_state_dict_for_absorption(state_dict)
@@ -1702,9 +1714,8 @@ class TransformerDeepSeekV3(Transformer):
                         state_dict
                     )
                 )
-
-        super().load_state_dict(
-            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
+        return super().preprocess_state_dict(
+            state_dict, skip_preprocess=skip_preprocess
         )
 
     @override

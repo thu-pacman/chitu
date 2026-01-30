@@ -316,6 +316,12 @@ class Transformer(nn.Module):
     def _get_layer_i_prefixes(self, i: int) -> list[str]:
         raise NotImplementedError
 
+    def _get_non_layer_prefix_mappings(self) -> list[tuple[str, str]]:
+        raise NotImplementedError
+
+    def _get_layer_i_prefix_mapping(self, i: int) -> tuple[str, str]:
+        raise NotImplementedError
+
     def _get_2d_out_x_in_tensor_names(self, quant) -> list[str]:
         ret = ["weight"]
         if quant == "blockfp8" or quant == "q4km":
@@ -365,6 +371,32 @@ class Transformer(nn.Module):
         elif quant == "ascend_w8a8":
             ret += ["input_scale", "input_offset", "quant_bias", "deq_scale"]
         return ret
+
+    def _get_module_by_prefix(self, prefix: str) -> nn.Module | None:
+        prefix = prefix[:-1] if prefix.endswith(".") else prefix
+        module = self
+        for part in prefix.split("."):
+            if part.isdigit():
+                module = module[int(part)]
+            else:
+                module = getattr(module, part, None)
+        return module
+
+    def load_state_dict_by_prefix(
+        self, state_dict: dict[str, Any], prefix: str, skip_preprocess: bool = False
+    ) -> nn.Module:
+        state_dict = self.preprocess_state_dict_parallel(
+            state_dict, skip_preprocess=skip_preprocess, is_layerwise=True
+        )
+        module_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith(prefix):
+                module_state_dict[key[len(prefix) :]] = value
+        state_dict = module_state_dict
+        module = self._get_module_by_prefix(prefix)
+        assert module is not None, f"Module {prefix} not found"
+        module.load_state_dict(state_dict, strict=True, assign=True)
+        return module
 
     def _chunk_checkpoint_for_pipeline_parallel(
         self,
@@ -633,13 +665,14 @@ class Transformer(nn.Module):
     def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
         return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
 
-    def load_state_dict_parallel(
+    def preprocess_state_dict_parallel(
         self,
         state_dict: dict[str, Any],
-        *args,
+        *,
         skip_preprocess: bool = False,
-        **kwargs,
-    ):
+        is_layerwise: bool = False,
+        replace: bool = True,
+    ) -> dict[str, Any]:
         if not skip_preprocess:
             state_dict = self.process_state_dict_for_blockfp4_before_chunk(state_dict)
             # handle ep param
@@ -663,7 +696,7 @@ class Transformer(nn.Module):
                     ):
                         state_dict.pop(key, None)
 
-            if self.pipeline_exec:
+            if self.pipeline_exec and not is_layerwise:
                 state_dict = self._chunk_checkpoint_for_pipeline_parallel(
                     state_dict, self.global_n_layers, self.pp_stage, self.pp_size
                 )
@@ -672,23 +705,17 @@ class Transformer(nn.Module):
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )
 
+        return self.preprocess_state_dict(state_dict, skip_preprocess=skip_preprocess)
+
+    def preprocess_state_dict(
+        self, state_dict: dict[str, Any], *, skip_preprocess: bool = False
+    ) -> dict[str, Any]:
         # TODO: Move `state_dict` to GPU and preprocess on GPU if there is no `CPUParameter`s
         # Problems:
         # - Processing on GPU laeds to sever memory fragmentation (13.44 GiB fragements in 94.93
         #   GiB allocated memory). Disabling torch allocator with `PYTORCH_NO_CUDA_MEMORY_CACHING=1`
         #   works but may lead to too much performance degradation.
 
-        self.load_state_dict(
-            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
-        )
-
-    def load_state_dict(
-        self,
-        state_dict: dict[str, Any],
-        *args,
-        skip_preprocess: bool = False,
-        **kwargs,
-    ):
         if not skip_preprocess:
             state_dict = self.process_state_dict_for_merging_qkv(state_dict)
             state_dict = self.process_state_dict_for_merging_gate_up(state_dict)
@@ -726,6 +753,19 @@ class Transformer(nn.Module):
                 # See https://github.com/pytorch/pytorch/pull/121157.
                 state_dict[k] = torch.nn.Parameter(state_dict[k], requires_grad=False)
 
+        return state_dict
+
+    def load_state_dict_parallel(
+        self,
+        state_dict: dict[str, Any],
+        *args,
+        skip_preprocess: bool = False,
+        replace: bool = True,
+        **kwargs,
+    ):
+        state_dict = self.preprocess_state_dict_parallel(
+            state_dict, skip_preprocess=skip_preprocess, replace=replace
+        )
         super().load_state_dict(state_dict, *args, **kwargs)
 
     def _init_pre_layers(self):
@@ -1079,7 +1119,8 @@ class Transformer(nn.Module):
         return self.prepare_freqs_cis_mtp()
 
     @torch.inference_mode()
-    def decode(self, tokens, batch_size, is_empty_step: bool = False):
+    def decode(self, tokens, batch_size):
+
         if isinstance(self.cache, DenseKVCacheManager):
             key = (batch_size, self.cache.get_start_and_end_idx()[0])
         elif isinstance(self.cache, PagedKVCacheManager):
@@ -1087,7 +1128,7 @@ class Transformer(nn.Module):
         else:
             assert False
 
-        if not self.mtp_size > 1 and not is_empty_step:
+        if batch_size != 0 and not self.mtp_size > 1:
             self.prepare_decoding_attn()
 
         infer_args = get_global_args().infer
@@ -1132,10 +1173,14 @@ class Transformer(nn.Module):
 
             @make_dispatched_graphed_callables(
                 args_max_nelem=(
-                    self.mtp_size
-                    * tokens.numel()
-                    // batch_size
-                    * self.max_batch_size_per_dp,
+                    (
+                        self.mtp_size
+                        * tokens.numel()
+                        // batch_size
+                        * self.max_batch_size_per_dp
+                        if batch_size > 0
+                        else 0
+                    ),
                     *extra_inputs_max_nelem,
                 ),
                 kwargs_max_nelem={},
@@ -1158,7 +1203,11 @@ class Transformer(nn.Module):
 
                 @make_dispatched_graphed_callables(
                     args_max_nelem=(
-                        tokens.numel() // batch_size * self.max_batch_size_per_dp,
+                        (
+                            tokens.numel() // batch_size * self.max_batch_size_per_dp
+                            if batch_size > 0
+                            else 0
+                        ),
                         *extra_inputs_mtp_max_nelem,
                     ),
                     kwargs_max_nelem={},
@@ -1204,7 +1253,8 @@ class Transformer(nn.Module):
 
                     self.do_empty_decode_callable_mtp = do_empty_decode_mtp
 
-        if not is_empty_step:
+        if batch_size != 0:
+
             if self.mtp_size > 1:
                 return self.mtp_decode_no_pipeline_total(
                     tokens,

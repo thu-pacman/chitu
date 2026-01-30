@@ -80,9 +80,14 @@ class ServeConfigRules(Callback):
             )
 
         bind_process_to_cpu = config.infer.bind_process_to_cpu
-        if bind_process_to_cpu not in {"auto", "none", "numa"}:
+        if bind_process_to_cpu not in {
+            "auto",
+            "none",
+            "one_numa_per_rank",
+            "numa_near_device",
+        }:
             self._exit_with_error(
-                f"bind_process_to_cpu must be one of [auto, none, numa], got {bind_process_to_cpu}"
+                f"bind_process_to_cpu must be one of [auto, none, one_numa_per_rank numa_near_device], got {bind_process_to_cpu}"
             )
 
         bind_thread_to_cpu = config.infer.bind_thread_to_cpu

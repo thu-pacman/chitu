@@ -283,8 +283,7 @@ class FlashMLABackend(TritonAttnBackend):
             )
             kv_lora_k_pe = kv_cache.kv["kv_lora_k_pe"]
         elif "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv:
-            # TODO: Support `warning_once` in the logger and use it here
-            logger.warning(
+            logger.warning_once(
                 '"kv_lora"-and-"k_pe"-separated KV cache is insuffcient for '
                 "FlashMLABackend.mla_decode_paged_kv, due to an additional `torch.cat` operation. "
                 'It is recommended to use "kv_lora_k_pe"-holistic KV cache instead.'
