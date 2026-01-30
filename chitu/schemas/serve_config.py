@@ -193,9 +193,11 @@ class DpConfig:
 class MetricsConfig:
     """Metrics collection configuration"""
 
-    port: int = 9097
-    log_interval: float = 10.0
-    collect_interval: float = 1.0
+    prometheus_listening_port: int = 9090
+    prometheus_config_file: str = "prometheus.yml"
+    prometheus_data_dir: str = "prometheus_data"
+    prometheus_scrape_interval: int = 1
+    log_interval: int = 10
 
 
 @dataclass

@@ -29,7 +29,7 @@ ENV TZ=Etc/UTC
 
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 
-RUN apt update -y && apt install -y git gcc-10 g++-10 libnuma-dev libibverbs1 ibverbs-providers libibverbs-dev rdma-core
+RUN apt update -y && apt install -y git gcc-10 g++-10 libnuma-dev libibverbs1 ibverbs-providers libibverbs-dev rdma-core curl
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -41,7 +41,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # - aiohttp is for service tests (for all platforms).
 # - matplotlib is for benchmarks/op_bench (for platforms with triton).
 RUN if [ "${enable_test}" = "true" ]; then \
-    apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping curl && \
+    apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping && \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp lark-oapi matplotlib; \
 fi
 
@@ -128,6 +128,29 @@ RUN rm -rf /tmp/*
 COPY ./test ./test
 COPY ./script ./script
 COPY ./benchmarks ./benchmarks
+
+# Download prometheus
+RUN mkdir -p /workspace/prometheus && \
+    # 根据框架下载prometheus
+    case "$(uname -m)" in \
+        x86_64|amd64) \
+            URL="https://github.com/prometheus/prometheus/releases/download/v3.9.1/prometheus-3.9.1.linux-amd64.tar.gz" \
+            ;; \
+        aarch64|arm64) \
+            URL="https://github.com/prometheus/prometheus/releases/download/v3.9.1/prometheus-3.9.1.linux-arm64.tar.gz" \
+            ;; \
+        *) \
+            echo "不支持的架构: $(uname -m)" && exit 1 \
+            ;; \
+    esac && \
+    echo "下载地址: $URL" && \
+    curl -L --retry 3 --retry-delay 5 -o /workspace/prometheus.tar.gz "$URL" && \
+    tar -xzvf /workspace/prometheus.tar.gz --strip-components=1 -C /workspace/prometheus && \
+    rm -f /workspace/prometheus.tar.gz && \
+    cp /workspace/prometheus/prometheus /usr/local/bin && \
+    cp /workspace/prometheus/promtool /usr/local/bin/ && \
+    rm -rf /workspace/prometheus && \
+    prometheus --version
 
 # These are optimization flags for NCCL, but according to our tests, they only make things
 # worse, so we don't use them.

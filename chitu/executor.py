@@ -1090,6 +1090,7 @@ class Executor:
                     and get_global_args().models.type == "deepseek-v3"
                 ):
                     Backend.indexer_cache_manager.finalize_cache_all_decode(rid)
+            PrometheusMetricsCollector.update_kvcache_usage()
             return payload_type
 
         # synchronize
@@ -1215,6 +1216,7 @@ class Executor:
             Backend.cache_manager.prepare_cache_prefill(
                 tasks.req_ids, [len(t) for t in tasks.tokens]
             )
+            PrometheusMetricsCollector.update_kvcache_usage()
             if get_global_args().models.type == "hf-qwen3-next":
                 Backend.linear_attn_cache_manager.prepare_cache_prefill(
                     tasks.req_ids, [len(t) for t in tasks.tokens]
@@ -1268,8 +1270,9 @@ class Executor:
             # Collect prompt tokens metrics
             # In DP mode: all dp ranks record their local tokens (distinguished by dp_id)
             # In non-DP mode: only rank 0 records metrics
-            if self._should_record_metrics(num_tokens, is_prefill=True):
-                PrometheusMetricsCollector.inc_prompts(num_tokens, self)
+            # if self._should_record_metrics(num_tokens, is_prefill=True):
+            #     PrometheusMetricsCollector.inc_prompt_tokens(num_tokens)
+            PrometheusMetricsCollector.inc_prompt_tokens(num_tokens)
 
             # Notify KV transfer hook after prefill completes.
             try:
@@ -1315,6 +1318,7 @@ class Executor:
         Backend.cache_manager.prepare_cache_prefill(
             tasks.req_ids, [len(t) for t in tasks.tokens]
         )
+        PrometheusMetricsCollector.update_kvcache_usage()
         if get_global_args().models.type == "hf-qwen3-next":
             Backend.linear_attn_cache_manager.prepare_cache_prefill(
                 tasks.req_ids, [len(t) for t in tasks.tokens]
@@ -1397,6 +1401,7 @@ class Executor:
         """
         # 1) prepare cache and seq lens
         Backend.cache_manager.prepare_cache_decode(req_ids)
+        PrometheusMetricsCollector.update_kvcache_usage()
         if get_global_args().models.type == "hf-qwen3-next":
             Backend.linear_attn_cache_manager.prepare_cache_decode(req_ids)
         if (
@@ -1447,6 +1452,7 @@ class Executor:
     def decode_step(self, tasks: PackedTasksBase, is_empty_step: bool = False):
         if not is_empty_step:
             Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
+            PrometheusMetricsCollector.update_kvcache_usage()
             if get_global_args().models.type == "hf-qwen3-next":
                 Backend.linear_attn_cache_manager.prepare_cache_decode(tasks.req_ids)
             if (
@@ -1515,8 +1521,9 @@ class Executor:
             # Collect metrics for Prometheus
             # In DP mode: all dp ranks record their local tokens (distinguished by dp_id)
             # In non-DP mode: only rank 0 records metrics
-            if self._should_record_metrics(tasks.num_tasks, is_prefill=False):
-                PrometheusMetricsCollector.inc_tokens(tasks.num_tasks, self)
+            # if self._should_record_metrics(tasks.num_tasks, is_prefill=False):
+            #     PrometheusMetricsCollector.inc_generated_tokens(tasks.num_tasks)
+            PrometheusMetricsCollector.inc_generated_tokens(tasks.num_tasks)
 
             # payload send
             for dispatcher in self.task_dispatchers:

@@ -311,12 +311,11 @@ dp_config:
 
 # Configs how chitu is monitored and logged.
 metrics:
-  port: 9097
-  log_interval: 10.0
-  collect_interval: 20.0
-
-# Configs only for debugging and analysis. Chitu may output incorrect results when these feilds
-# are enabled. Please only set them when you know what you are doing.
+  prometheus_listening_port: 9090 # Access prometheus server at this port
+  prometheus_config_file: "prometheus.yml" # prometheus configuration path, which is a yml file
+  prometheus_data_dir: "prometheus_data" # prometheus data stoarge path, which is a folder
+  prometheus_scrape_interval: 1 # prometheus server scrapes PrometheusMetricsCollectors every ${prometheus_scrape_interval} seconds.
+  log_interval: 10
 debug:
   skip_model_load: False
   force_moe_balance: False

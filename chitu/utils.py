@@ -18,8 +18,10 @@ import torch
 import importlib
 import importlib.resources
 from chitu.device_type import is_ascend
-
+import torch.distributed as dist
+from torch.distributed import get_rank, get_world_size
 from chitu.global_vars import get_global_args
+from typing import Optional
 
 logger = getLogger(__name__)
 
@@ -454,17 +456,26 @@ def get_free_port():
             return s.getsockname()[1]
 
 
+def is_port_available(port: int):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", port))
+            return True
+    except:
+        return False
+
+
 def get_local_ip() -> str:
     # try ipv4
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        hostname = socket.gethostname()
-        ip = socket.gethostbyname(hostname)
-        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
-            return ip
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+            return s.getsockname()[0]
+        except Exception:
+            hostname = socket.gethostname()
+            ip = socket.gethostbyname(hostname)
+            if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+                return ip
 
     raise RuntimeError("Cannot get local ip")
 
@@ -583,3 +594,37 @@ def try_get_profiler(
             with_modules=False,
             with_flops=False,
         )
+
+
+def gather_str_to_dst_rank(strings: str, dst: int, group=None) -> Optional[list]:
+    """
+    将所有rank的string字符串收集到dst rank
+
+    :param strings: 当前rank的字符串
+    :type strings: str
+    :param group: 通信组
+    :type dst: int
+    :param dst: 目标rank
+    :type dst: int
+    :return: 仅在rank0返回所有rank的字符串列表，其他rank返回空列表
+    :rtype: list
+    """
+    group_size = dist.get_world_size(group=group)
+    rank = dist.get_rank(group=group)
+
+    gather_list = []
+
+    # Use broadcast instead of gather to avoid NCCL issues
+    # 使用dist.gather在5090卡上会报错
+    for src_rank in range(group_size):
+        if rank == src_rank:
+            data = [strings]
+        else:
+            data = [None]
+
+        dist.broadcast_object_list(data, src=src_rank, group=group)
+
+        if rank == dst:
+            gather_list.append(data[0])
+
+    return gather_list if rank == dst else None
