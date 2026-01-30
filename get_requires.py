@@ -116,5 +116,6 @@ extras_require = {
         "fast-hadamard-transform @ file://localhost"
         + os.path.join(setup_dir, "third_party/fast-hadamard-transform")
     ],
+    "numa": ["numa"],
     **operators.get_extras_require(),
 }

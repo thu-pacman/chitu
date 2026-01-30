@@ -8,6 +8,7 @@ import os
 from logging import getLogger
 import psutil
 import random
+import re
 import traceback
 from tqdm import tqdm
 
@@ -483,6 +484,17 @@ def check_checkpoint_path(args):
         args.models.processor_path = args.models.ckpt_dir
 
 
+def _has_cpu_layer(args) -> bool:
+    if (backend_config := args.models.get("backend_config")) is not None:
+        for config in backend_config.get("backend", []):
+            if (pattern := config.get("model")) is not None:
+                if re.match(pattern, args.models.name.lower()):
+                    for rule in config.rules:
+                        if rule.get("backend") == "cpuinfer":
+                            return True
+    return False
+
+
 def chitu_init(args):
     debug = os.getenv("CHITU_DEBUG", "0") == "1"
 
@@ -570,17 +582,11 @@ def chitu_init(args):
             )
             args.infer.prefill_chunk_size = None
 
-    # Bind process to CPU NUMA
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+    # Auto setting for binding process to CPU NUMA
     if args.infer.bind_process_to_cpu == "auto":
-        if not has_cpuinfer and not has_numa:
-            args.infer.bind_process_to_cpu = "none"
-        elif not has_numa:
+        if not has_numa:
             logger.warning(
-                "'cpuinfer' is found but 'numa' is mising. Disabling NUMA binding. "
-                "For better CPU inference performance, please refer to README.md and "
-                "install the full '[cpu]' optional dependency."
+                "Optional dependency '[numa]' is mising. Disabling NUMA binding."
             )
             args.infer.bind_process_to_cpu = "none"
         elif not numa.available():
@@ -588,19 +594,17 @@ def chitu_init(args):
                 "NUMA is not support on this OS or hardware platform. Disabling NUMA binding."
             )
             args.infer.bind_process_to_cpu = "none"
-        elif numa.get_max_node() + 1 < local_world_size:
-            logger.debug("Disable NUMA binding due to insufficient NUMA nodes.")
-            args.infer.bind_process_to_cpu = "none"
+        elif _has_cpu_layer(args):
+            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+            if numa.get_max_node() + 1 < local_world_size:
+                logger.warning(
+                    "Disable NUMA binding due to insufficient NUMA nodes. Is is an inefficient setting of CPU inference."
+                )
+                args.infer.bind_process_to_cpu = "none"
+            else:
+                args.infer.bind_process_to_cpu = "one_numa_per_rank"
         else:
-            args.infer.bind_process_to_cpu = "numa"
-    if args.infer.bind_process_to_cpu == "numa":
-        numa.bind({local_rank})
-    elif args.infer.bind_process_to_cpu == "none":
-        pass
-    else:
-        raise ValueError(
-            f"Unsupported infer.bind_process_to_cpu={args.infer.bind_process_to_cpu}"
-        )
+            args.infer.bind_process_to_cpu = "numa_near_device"
 
     if args.infer.use_cuda_graph == "auto":
         if args.models.name in [
@@ -665,6 +669,7 @@ def chitu_init(args):
     set_quant_variables(args)
     set_backend_variables(args)
     set_global_variables(args, debug=debug)
+    logger.debug(f"Auto setting configs done. Full configs are: {args}")
 
     args = get_global_args()
     Backend.build(args)

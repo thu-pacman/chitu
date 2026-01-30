@@ -172,6 +172,7 @@ Currently supported optional dependencies are:
 - `muxi_layout_kernels`: Additional kernels for running on MetaX GPUs with `infer.op_impl=muxi_custom_kernel`, optimized for small batches.
 - `scipy`: Optional dependency for indexer in DeepSeek-V3.2-Exp.
 - `fast_hadamard_transform`: Optional dependency for indexer in DeepSeek-V3.2-Exp.
+- `numa`: Support NUMA binding.
 
 Append `-e` to `pip install` for editable install. Example:
 

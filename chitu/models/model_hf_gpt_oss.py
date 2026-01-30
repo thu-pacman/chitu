@@ -366,14 +366,14 @@ class TransformerHFGptOss(TransformerHFLlama):
 
     # TODO: use memory optimized implement
     @override
-    def load_state_dict_parallel(
+    def preprocess_state_dict_parallel(
         self,
         state_dict: dict[str, Any],
-        *args,
+        *,
         skip_preprocess: bool = False,
-        replace=True,
-        **kwargs,
-    ):
+        is_layerwise: bool = False,
+        replace: bool = True,
+    ) -> dict[str, Any]:
         if not skip_preprocess and replace:
             if self.params.name.endswith("-BF16") and self.params.type == "hf-gpt-oss":
 
@@ -396,8 +396,11 @@ class TransformerHFGptOss(TransformerHFLlama):
                 # split experts to fit TP
                 state_dict = self._process_state_dict_for_splitting_experts(state_dict)
 
-        return super().load_state_dict_parallel(
-            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
+        return super().preprocess_state_dict_parallel(
+            state_dict,
+            skip_preprocess=skip_preprocess,
+            is_layerwise=is_layerwise,
+            replace=replace,
         )
 
     def gpt_oss_force_splitting_gate_up(self, checkpoint: dict[str, Any]):

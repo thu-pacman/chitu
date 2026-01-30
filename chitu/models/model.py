@@ -385,12 +385,8 @@ class Transformer(nn.Module):
     def load_state_dict_by_prefix(
         self, state_dict: dict[str, Any], prefix: str, skip_preprocess: bool = False
     ) -> nn.Module:
-        state_dict = self.load_state_dict_parallel(
-            state_dict,
-            strict=True,
-            assign=True,
-            skip_preprocess=skip_preprocess,
-            enable_layerwise=True,
+        state_dict = self.preprocess_state_dict_parallel(
+            state_dict, skip_preprocess=skip_preprocess, is_layerwise=True
         )
         module_state_dict = {}
         for key, value in state_dict.items():
@@ -669,13 +665,14 @@ class Transformer(nn.Module):
     def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
         return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
 
-    def load_state_dict_parallel(
+    def preprocess_state_dict_parallel(
         self,
         state_dict: dict[str, Any],
-        *args,
+        *,
         skip_preprocess: bool = False,
-        **kwargs,
-    ):
+        is_layerwise: bool = False,
+        replace: bool = True,
+    ) -> dict[str, Any]:
         if not skip_preprocess:
             state_dict = self.process_state_dict_for_blockfp4_before_chunk(state_dict)
             # handle ep param
@@ -699,7 +696,7 @@ class Transformer(nn.Module):
                     ):
                         state_dict.pop(key, None)
 
-            if self.pipeline_exec and not kwargs.get("enable_layerwise", False):
+            if self.pipeline_exec and not is_layerwise:
                 state_dict = self._chunk_checkpoint_for_pipeline_parallel(
                     state_dict, self.global_n_layers, self.pp_stage, self.pp_size
                 )
@@ -708,23 +705,17 @@ class Transformer(nn.Module):
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )
 
+        return self.preprocess_state_dict(state_dict, skip_preprocess=skip_preprocess)
+
+    def preprocess_state_dict(
+        self, state_dict: dict[str, Any], *, skip_preprocess: bool = False
+    ) -> dict[str, Any]:
         # TODO: Move `state_dict` to GPU and preprocess on GPU if there is no `CPUParameter`s
         # Problems:
         # - Processing on GPU laeds to sever memory fragmentation (13.44 GiB fragements in 94.93
         #   GiB allocated memory). Disabling torch allocator with `PYTORCH_NO_CUDA_MEMORY_CACHING=1`
         #   works but may lead to too much performance degradation.
 
-        return self.load_state_dict_with_preprocess(
-            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
-        )
-
-    def load_state_dict_with_preprocess(
-        self,
-        state_dict: dict[str, Any],
-        *args,
-        skip_preprocess: bool = False,
-        **kwargs,
-    ) -> dict[str, Any] | None:
         if not skip_preprocess:
             state_dict = self.process_state_dict_for_merging_qkv(state_dict)
             state_dict = self.process_state_dict_for_merging_gate_up(state_dict)
@@ -762,9 +753,19 @@ class Transformer(nn.Module):
                 # See https://github.com/pytorch/pytorch/pull/121157.
                 state_dict[k] = torch.nn.Parameter(state_dict[k], requires_grad=False)
 
-        if kwargs.pop("enable_layerwise", False):
-            return state_dict
+        return state_dict
 
+    def load_state_dict_parallel(
+        self,
+        state_dict: dict[str, Any],
+        *args,
+        skip_preprocess: bool = False,
+        replace: bool = True,
+        **kwargs,
+    ):
+        state_dict = self.preprocess_state_dict_parallel(
+            state_dict, skip_preprocess=skip_preprocess, replace=replace
+        )
         super().load_state_dict(state_dict, *args, **kwargs)
 
     def _init_pre_layers(self):

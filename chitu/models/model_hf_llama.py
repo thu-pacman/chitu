@@ -730,13 +730,14 @@ class TransformerHFLlama(Transformer):
                     checkpoint[name] = param.view([dim, -1])
         return checkpoint
 
-    def load_state_dict_parallel(
+    def preprocess_state_dict_parallel(
         self,
         state_dict: dict[str, Any],
-        *args,
+        *,
         skip_preprocess: bool = False,
-        **kwargs,
-    ):
+        is_layerwise: bool = False,
+        replace: bool = True,
+    ) -> dict[str, Any]:
         if not skip_preprocess:
             if self.params.quant_config["type"] == "blockfp8":
 
@@ -771,8 +772,11 @@ class TransformerHFLlama(Transformer):
                 state_dict, n_kv_head_multiplier
             )
 
-        return super().load_state_dict_parallel(
-            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
+        return super().preprocess_state_dict_parallel(
+            state_dict,
+            skip_preprocess=skip_preprocess,
+            is_layerwise=is_layerwise,
+            replace=replace,
         )
 
     def _init_pre_layers(self):

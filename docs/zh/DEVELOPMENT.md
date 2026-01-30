@@ -176,6 +176,7 @@ TORCH_CUDA_ARCH_LIST=9.0 pip install --no-build-isolation ".[flash_mla]"
 - `muxi_layout_kernels`: 用于支持在沐曦 GPU 上使用 `infer.op_impl=muxi_custom_kernel` 模式，在小 batch 场景性能更优。
 - `scipy`: 用于支持 DeepSeek-V3.2-Exp 中的 indexer 的可选依赖。
 - `fast_hadamard_transform`: 用于支持 DeepSeek-V3.2-Exp 中的 indexer 的可选依赖。
+- `numa`: 用于支持 NUMA 绑定。
 
 如果需要用于开发，建议加上 `-e` 选项启用 editable install，如
 

@@ -201,8 +201,26 @@ infer:
   # - False: Skip full warmup.
   full_warmup: auto
 
-  bind_process_to_cpu: auto # one of: auto, none, numa
-  bind_thread_to_cpu: physical_core # one of: physical_core, logical_core
+  # Whether and how to bind the currenct process to a CPU. If binding, it requires installing
+  # chitu with `chitu[numa]` for extra dependency.
+  #
+  # Acceptable values:
+  # - "auto": Decide automatically.
+  # - "none": Do not bind.
+  # - "one_numa_per_rank": Bind each rank to a different NUMA node. This is helpful for CPU
+  #   inference, where each rank is responsible for computing on a dedicated NUMA.
+  # - "numa_near_device": Bind each rank to a NUMA node that is closest to the device this
+  #   rank is responsible for. This is helpful for reducing CPU-GPU synchronizing latency.
+  bind_process_to_cpu: auto
+
+  # How to bind threads to CPU cores for CPU inference. This field is ignored when CPUs are not
+  # used for computing.
+  #
+  # Acceptable values:
+  # - "physical_core": Bind each thread to a physical core.
+  # - "logical_core": Bind each thread to a logical core.
+  bind_thread_to_cpu: physical_core
+
   npu_fusion_fp4: False #  for npu fp4 fusion group_gemm mode
   moe:
     prefill_memory_tolerance: 2.0 # In case of EP inbalance, the largest activation tensor will occupy no more than O(prefill_chunk_size / ep_size * prefill_memory_tolerance) memory

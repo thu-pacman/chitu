@@ -768,13 +768,14 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                         checkpoint[k] = torch.cat(tensor_parallel_splitted, dim=0)
         return checkpoint
 
-    def load_state_dict_parallel(
+    def preprocess_state_dict_parallel(
         self,
         state_dict: dict[str, Any],
-        *args,
+        *,
         skip_preprocess: bool = False,
-        **kwargs,
-    ):
+        is_layerwise: bool = False,
+        replace: bool = True,
+    ) -> dict[str, Any]:
         if not skip_preprocess:
             state_dict = self.process_state_dict_for_splitting_q_gate(state_dict)
             if self.tensor_exec:
@@ -797,6 +798,9 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                 new_k = new_k.replace(".shared_expert.", ".shared_experts.body.")
                 new_k = new_k.replace(".shared_expert_gate.", ".shared_experts.gate.")
                 state_dict[new_k] = v
-        return super().load_state_dict_parallel(
-            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
+        return super().preprocess_state_dict_parallel(
+            state_dict,
+            skip_preprocess=skip_preprocess,
+            is_layerwise=is_layerwise,
+            replace=replace,
         )

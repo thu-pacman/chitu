@@ -19,6 +19,7 @@ import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 from safetensors.torch import safe_open
 from tqdm import tqdm
+
 from chitu.attn_backend import (
     FlashAttnBackend,
     FlashInferBackend,
@@ -59,22 +60,15 @@ from chitu.quantization import (
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF, Processor
 from chitu.tool_call import get_tool_parser
 from chitu.constraint_decode import ConstraintDecodeManager
-from chitu.utils import (
-    parse_dtype,
-    try_import_opt_dep,
-    ceil_div,
-    try_import_and_setup_torch_npu,
-)
-
-# from chitu.distributed.moe_token_dispatcher import init_token_dispatcher
+from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div
 from chitu.moe import init_moe_impl
 from chitu.global_vars import set_slot_handle
+from chitu.numa_utils import bind_process_to_numa
 
 if TYPE_CHECKING:
     from chitu.executor import Executor
     from chitu.scheduler import Scheduler
 
-numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
 
@@ -268,6 +262,8 @@ class Backend:
                 torch.distributed.init_process_group("nccl")
         if Backend.use_gloo:
             Backend.group_gloo = torch.distributed.new_group(backend="gloo")
+
+        bind_process_to_numa(args.infer.bind_process_to_cpu)
 
         tensor_parallel_size = args.infer.tp_size
         pipeline_parallel_size = args.infer.pp_size

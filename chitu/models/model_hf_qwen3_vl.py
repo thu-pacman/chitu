@@ -2494,13 +2494,14 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
         return BatchedFreqsCis(cos, sin)
 
     @override
-    def load_state_dict_parallel(
+    def preprocess_state_dict_parallel(
         self,
         state_dict: dict[str, Any],
-        *args,
+        *,
         skip_preprocess: bool = False,
-        **kwargs,
-    ):
+        is_layerwise: bool = False,
+        replace: bool = True,
+    ) -> dict[str, Any]:
         state_dict = self.process_state_dict_for_merging_experts(state_dict)
         if not skip_preprocess and self.tensor_parallel_size > 1:
             # IMPORTANT: split merged gate_up back to gate+up before TP sharding,
@@ -2508,8 +2509,11 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
             # can decide whether to merge them back.
             state_dict = self._process_state_dict_for_splitting_moe_gate_up(state_dict)
 
-        return super().load_state_dict_parallel(  # type: ignore[misc]
-            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
+        return super().preprocess_state_dict_parallel(  # type: ignore[misc]
+            state_dict,
+            skip_preprocess=skip_preprocess,
+            is_layerwise=is_layerwise,
+            replace=replace,
         )
 
     @override
