@@ -549,13 +549,7 @@ class MetadataSerializer:
 
         # 处理空任务
         if not tasks_data:
-            if task_type in [TaskType.Prefill, TaskType.EmptyPrefill]:
-                empty_type = TaskType.EmptyPrefill
-            elif task_type in [TaskType.Decode, TaskType.EmptyDecode]:
-                empty_type = TaskType.EmptyDecode
-            else:
-                empty_type = None
-            return payload_type, PackedTasks([], empty_task_type=empty_type), slot_idx
+            return payload_type, PackedTasks([], task_type=task_type), slot_idx
 
         # 重建或更新 Task 对象
         task_list = []

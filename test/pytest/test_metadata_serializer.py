@@ -249,9 +249,9 @@ class TestTPDispatch:
             num_tasks=0,
             task_ids=[],
             req_ids=[],
-            task_type=TaskType.EmptyPrefill,
+            task_type=TaskType.Prefill,
             tokens=[],
-            payload_type=SerializedPackedTasksPayloadType.EmptyPrefill,
+            payload_type=SerializedPackedTasksPayloadType.Prefill,
             num_tokens=0,
             has_outputs=[],
             has_model_run=[],
@@ -273,7 +273,7 @@ class TestTPDispatch:
             impl="tp_empty_prefill",
         )
 
-        assert payload_type == SerializedPackedTasksPayloadType.EmptyPrefill
+        assert payload_type == SerializedPackedTasksPayloadType.Prefill
         assert out.num_tasks == 0
 
     def test_empty_decode(self, configured_packed_tasks_base, record_benchmark):
@@ -289,9 +289,9 @@ class TestTPDispatch:
             num_tasks=0,
             task_ids=[],
             req_ids=[],
-            task_type=TaskType.EmptyDecode,
+            task_type=TaskType.Decode,
             tokens=[],
-            payload_type=SerializedPackedTasksPayloadType.EmptyDecode,
+            payload_type=SerializedPackedTasksPayloadType.Decode,
             num_tokens=0,
             has_outputs=[],
             has_model_run=[],
@@ -313,7 +313,7 @@ class TestTPDispatch:
             impl="tp_empty_decode",
         )
 
-        assert payload_type == SerializedPackedTasksPayloadType.EmptyDecode
+        assert payload_type == SerializedPackedTasksPayloadType.Decode
         assert out.num_tasks == 0
 
     def test_slot_idx_preserved(self, configured_packed_tasks_base, record_benchmark):
@@ -616,7 +616,7 @@ class TestEmptyTasksDispatch:
         from chitu.task import PackedTasks, TaskType
 
         serializer = MetadataSerializer()
-        empty = PackedTasks([], empty_task_type=TaskType.EmptyPrefill)
+        empty = PackedTasks([], task_type=TaskType.Prefill)
         config = MetadataConfig.for_prefill_full()
 
         def roundtrip():
@@ -629,7 +629,7 @@ class TestEmptyTasksDispatch:
             impl="pp_empty_prefill",
         )
 
-        assert out.task_type == TaskType.EmptyPrefill
+        assert out.task_type == TaskType.Prefill
 
     def test_empty_decode_roundtrip(self, record_benchmark):
         """PP/DP Empty Decode should be handled correctly"""
@@ -637,7 +637,7 @@ class TestEmptyTasksDispatch:
         from chitu.task import PackedTasks, TaskType
 
         serializer = MetadataSerializer()
-        empty = PackedTasks([], empty_task_type=TaskType.EmptyDecode)
+        empty = PackedTasks([], task_type=TaskType.Decode)
         config = MetadataConfig.for_decode_minimal()
 
         def roundtrip():
@@ -650,7 +650,7 @@ class TestEmptyTasksDispatch:
             impl="pp_empty_decode",
         )
 
-        assert out.task_type == TaskType.EmptyDecode
+        assert out.task_type == TaskType.Decode
 
 
 # ============================================================================

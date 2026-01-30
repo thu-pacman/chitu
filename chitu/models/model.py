@@ -1119,7 +1119,8 @@ class Transformer(nn.Module):
         return self.prepare_freqs_cis_mtp()
 
     @torch.inference_mode()
-    def decode(self, tokens, batch_size, is_empty_step: bool = False):
+    def decode(self, tokens, batch_size):
+
         if isinstance(self.cache, DenseKVCacheManager):
             key = (batch_size, self.cache.get_start_and_end_idx()[0])
         elif isinstance(self.cache, PagedKVCacheManager):
@@ -1127,7 +1128,7 @@ class Transformer(nn.Module):
         else:
             assert False
 
-        if not self.mtp_size > 1 and not is_empty_step:
+        if batch_size != 0 and not self.mtp_size > 1:
             self.prepare_decoding_attn()
 
         infer_args = get_global_args().infer
@@ -1172,10 +1173,14 @@ class Transformer(nn.Module):
 
             @make_dispatched_graphed_callables(
                 args_max_nelem=(
-                    self.mtp_size
-                    * tokens.numel()
-                    // batch_size
-                    * self.max_batch_size_per_dp,
+                    (
+                        self.mtp_size
+                        * tokens.numel()
+                        // batch_size
+                        * self.max_batch_size_per_dp
+                        if batch_size > 0
+                        else 0
+                    ),
                     *extra_inputs_max_nelem,
                 ),
                 kwargs_max_nelem={},
@@ -1198,7 +1203,11 @@ class Transformer(nn.Module):
 
                 @make_dispatched_graphed_callables(
                     args_max_nelem=(
-                        tokens.numel() // batch_size * self.max_batch_size_per_dp,
+                        (
+                            tokens.numel() // batch_size * self.max_batch_size_per_dp
+                            if batch_size > 0
+                            else 0
+                        ),
                         *extra_inputs_mtp_max_nelem,
                     ),
                     kwargs_max_nelem={},
@@ -1244,7 +1253,8 @@ class Transformer(nn.Module):
 
                     self.do_empty_decode_callable_mtp = do_empty_decode_mtp
 
-        if not is_empty_step:
+        if batch_size != 0:
+
             if self.mtp_size > 1:
                 return self.mtp_decode_no_pipeline_total(
                     tokens,
