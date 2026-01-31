@@ -535,7 +535,10 @@ class Task(ConstraintDecodeTask):
         if (
             self.stop_with_eos
             and self.num_new_tokens > 0
-            and self.next_token in Backend.tokenizer.stop_tokens
+            and (
+                self.next_token in Backend.tokenizer.stop_tokens
+                or (set(self.mtp_token_list) & Backend.tokenizer.stop_tokens)
+            )
         ):
             self.req.finish_reason = "stop"
             self._decode_status = TaskDecodeType.Stopped
