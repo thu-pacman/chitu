@@ -12,8 +12,15 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from chitu.backend import Backend
 from chitu.global_vars import get_global_args
 from chitu.task import Task, TaskPool, UserRequest
+from chitu.tool_call import get_tool_parser
+from chitu.tool_call.types import (
+    ChoiceToolCall,
+    ToolChoiceNamedTool,
+    ToolChoiceFunction,
+)
 from chitu.utils import gen_req_id
 
 
@@ -52,6 +59,24 @@ class AnthropicMessagesRequest(BaseModel):
     tool_choice: Optional[dict | str] = None
 
 
+class AnthropicCompletionRequest(BaseModel):
+    """
+    Minimal subset of Anthropic Text Completions API (legacy) for code completion.
+    Supports optional suffix for fill-in-the-middle when tokenizer provides FIM tokens.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    model: Optional[str] = None
+    prompt: str
+    suffix: Optional[str] = None
+    max_tokens_to_sample: int
+    stream: bool = False
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    stop_sequences: Optional[list[str]] = None
+
+
 def anthropic_error(status_code: int, error_type: str, message: str):
     return JSONResponse(
         status_code=status_code,
@@ -67,6 +92,10 @@ def anthropic_error(status_code: int, error_type: str, message: str):
 
 def _sse_event(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _sse_data(data: dict) -> str:
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def parse_api_key_from_headers(
@@ -122,6 +151,8 @@ def anthropic_content_to_text(content: str | list[str | dict]) -> str:
         t = item.get("type")
         if t == "text":
             parts.append(str(item.get("text", "")))
+        elif t == "thinking":
+            parts.append(str(item.get("thinking", "")))
         else:
             raise ValueError(f"Unsupported content block type: {t}")
     return "".join(parts)
@@ -161,6 +192,157 @@ def apply_stop_sequences_weak(text: str, stop_sequences: Optional[list[str]]):
     return text[:earliest_pos], "stop_sequence", earliest_seq
 
 
+def normalize_anthropic_tools(tools: Optional[list[dict]]) -> list[dict]:
+    if not tools:
+        return []
+    normalized: list[dict] = []
+    for tool in tools:
+        if "function" in tool:
+            normalized.append(tool)
+            continue
+        name = tool.get("name", "")
+        if not name:
+            raise ValueError("Tool name is required")
+        schema = tool.get("input_schema") or tool.get("parameters") or {}
+        normalized.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.get("description", ""),
+                    "parameters": schema,
+                },
+            }
+        )
+    return normalized
+
+
+def map_anthropic_tool_choice(tool_choice: Optional[dict | str]):
+    if tool_choice is None:
+        return "auto"
+    if isinstance(tool_choice, str):
+        if tool_choice == "none":
+            return "none"
+        if tool_choice in {"any", "required"}:
+            return "required"
+        return "auto"
+    t = tool_choice.get("type")
+    if t in {"none", "auto"}:
+        return t
+    if t == "any":
+        return "required"
+    if t == "tool":
+        name = tool_choice.get("name")
+        if not name:
+            raise ValueError("tool_choice.name is required when type='tool'")
+        return ToolChoiceNamedTool(
+            function=ToolChoiceFunction(name=name), type="function"
+        )
+    return "auto"
+
+
+def format_tool_call_text(name: str, arguments: str) -> str:
+    parser_cls = get_active_tool_parser()
+    if all(
+        hasattr(parser_cls, attr)
+        for attr in ("tool_template", "tool_begin_tag", "tool_end_tag")
+    ):
+        tool_template = parser_cls.tool_template.replace("{name}", name).replace(
+            "{arguments}", arguments
+        )
+        return f"{parser_cls.tool_begin_tag}{tool_template}{parser_cls.tool_end_tag}"
+    return f'{{"name": "{name}", "arguments": {arguments}}}'
+
+
+def tool_calls_to_anthropic_blocks(tool_calls: list[ChoiceToolCall]) -> list[dict]:
+    blocks: list[dict] = []
+    for tool_call in tool_calls:
+        fn = tool_call.function
+        args = fn.arguments or ""
+        try:
+            input_obj = json.loads(args) if args else {}
+        except Exception:
+            input_obj = {"_raw": args}
+        blocks.append(
+            {
+                "type": "tool_use",
+                "id": tool_call.id,
+                "name": fn.name,
+                "input": input_obj,
+            }
+        )
+    return blocks
+
+
+def anthropic_message_to_internal(message: AnthropicMessage) -> list[dict]:
+    if isinstance(message.content, str):
+        return [{"role": message.role, "content": message.content}]
+
+    results: list[dict] = []
+    text_parts: list[str] = []
+
+    def flush_text():
+        if text_parts:
+            results.append({"role": message.role, "content": "".join(text_parts)})
+            text_parts.clear()
+
+    for item in message.content:
+        if isinstance(item, str):
+            text_parts.append(item)
+            continue
+        if not isinstance(item, dict):
+            raise ValueError("Invalid content block type")
+        t = item.get("type")
+        if t == "text":
+            text_parts.append(str(item.get("text", "")))
+            continue
+        if t == "thinking":
+            text_parts.append(str(item.get("thinking", "")))
+            continue
+        if t == "tool_use":
+            name = str(item.get("name", ""))
+            input_obj = item.get("input", {})
+            arguments = json.dumps(input_obj, ensure_ascii=False)
+            text_parts.append(format_tool_call_text(name, arguments))
+            continue
+        if t == "tool_result":
+            flush_text()
+            tool_use_id = item.get("tool_use_id") or item.get("tool_call_id")
+            content = item.get("content", "")
+            tool_text = anthropic_content_to_text(content)
+            results.append(
+                {"role": "tool", "tool_call_id": tool_use_id, "content": tool_text}
+            )
+            continue
+        raise ValueError(f"Unsupported content block type: {t}")
+
+    flush_text()
+    return results
+
+
+def get_active_tool_parser():
+    return getattr(Backend, "tool_parser", None) or get_tool_parser("MISSING")
+
+
+def build_tool_use_block(
+    tool_call_id: Optional[str], name: str, input_obj: dict
+) -> dict:
+    return {
+        "type": "tool_use",
+        "id": tool_call_id,
+        "name": name,
+        "input": input_obj,
+    }
+
+
+def build_tool_use_delta(index: int, partial_json: str) -> dict:
+    return {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "input_json_delta", "partial_json": partial_json},
+    }
+
+
 async def collect_reasoning_and_text(async_stream) -> tuple[str, str]:
     chunks: list[str] = []
     async for data, _top_logprobs, _top_tokens in async_stream:
@@ -176,6 +358,41 @@ def map_finish_reason_to_stop_reason(finish_reason: Optional[str]) -> str:
     if finish_reason == "length":
         return "max_tokens"
     return "end_turn"
+
+
+def map_finish_reason_to_completion_stop_reason(finish_reason: Optional[str]) -> str:
+    if finish_reason == "length":
+        return "max_tokens"
+    return "stop_sequence"
+
+
+def _token_exists(tokenizer, token: str) -> bool:
+    try:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+    except Exception:
+        return False
+    if token_id is None:
+        return False
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if unk_id is not None and token_id == unk_id:
+        return False
+    return True
+
+
+def build_fim_prompt(prefix: str, suffix: str) -> str:
+    tokenizer = Backend.tokenizer.model
+    token_sets = [
+        ("<fim_prefix>", "<fim_suffix>", "<fim_middle>"),
+        ("<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>"),
+    ]
+    for pre, suf, mid in token_sets:
+        if (
+            _token_exists(tokenizer, pre)
+            and _token_exists(tokenizer, suf)
+            and _token_exists(tokenizer, mid)
+        ):
+            return f"{pre}{prefix}{suf}{suffix}{mid}"
+    raise ValueError("Tokenizer does not support FIM tokens for suffix completion.")
 
 
 async def anthropic_stream_from_async_stream(*, req_obj, response_model: str):
@@ -206,18 +423,18 @@ async def anthropic_stream_from_async_stream(*, req_obj, response_model: str):
         },
     )
 
+    tool_parser_cls = get_active_tool_parser()
+    tool_parser = tool_parser_cls() if getattr(req_obj, "tools", None) else None
+    stream = tool_parser.parse_stream(async_stream) if tool_parser else async_stream
+
     block_index = -1
     current_block_type: Optional[str] = None  # "thinking" | "text"
+    tool_call_buffers: dict[int, dict[str, str | None]] = {}
+    saw_text = False
 
-    async for data, _top_logprobs, _top_tokens in async_stream:
-        if not data:
-            continue
-        is_thinking = bool(
-            getattr(async_stream, "enable_reasoning", False)
-            and async_stream.is_reasoning_content()
-        )
+    async def _emit_text_delta(text: str, is_thinking: bool):
+        nonlocal block_index, current_block_type
         new_type = "thinking" if is_thinking else "text"
-
         if current_block_type is None:
             block_index = 0
             current_block_type = new_type
@@ -256,9 +473,9 @@ async def anthropic_stream_from_async_stream(*, req_obj, response_model: str):
             )
 
         delta = (
-            {"type": "thinking_delta", "thinking": data}
+            {"type": "thinking_delta", "thinking": text}
             if current_block_type == "thinking"
-            else {"type": "text_delta", "text": data}
+            else {"type": "text_delta", "text": text}
         )
         yield _sse_event(
             "content_block_delta",
@@ -269,15 +486,83 @@ async def anthropic_stream_from_async_stream(*, req_obj, response_model: str):
             },
         )
 
+    if tool_parser:
+        async for data, _is_reasoning, _extra in stream:
+            if not data:
+                continue
+            if data.reasoning_content:
+                async for event in _emit_text_delta(data.reasoning_content, True):
+                    yield event
+            if data.content:
+                saw_text = True
+                async for event in _emit_text_delta(data.content, False):
+                    yield event
+            if data.tool_calls:
+                for tool_call in data.tool_calls:
+                    buf = tool_call_buffers.setdefault(
+                        tool_call.index,
+                        {"id": tool_call.id, "name": "", "arguments": ""},
+                    )
+                    if tool_call.id:
+                        buf["id"] = tool_call.id
+                    if tool_call.function.name:
+                        buf["name"] += tool_call.function.name
+                    if tool_call.function.arguments:
+                        buf["arguments"] += tool_call.function.arguments
+    else:
+        async for data, _top_logprobs, _top_tokens in stream:
+            if not data:
+                continue
+            is_thinking = bool(
+                getattr(async_stream, "enable_reasoning", False)
+                and async_stream.is_reasoning_content()
+            )
+            async for event in _emit_text_delta(data, is_thinking):
+                yield event
+
     if current_block_type is not None:
         yield _sse_event(
             "content_block_stop",
             {"type": "content_block_stop", "index": block_index},
         )
 
+    if tool_call_buffers:
+        next_index = block_index + 1
+        for tool_index in sorted(tool_call_buffers):
+            buf = tool_call_buffers[tool_index]
+            args = buf.get("arguments") or ""
+            try:
+                input_obj = json.loads(args) if args else {}
+            except Exception:
+                input_obj = {"_raw": args}
+            content_block = build_tool_use_block(
+                buf.get("id"), buf.get("name") or "", input_obj
+            )
+            yield _sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": next_index,
+                    "content_block": content_block,
+                },
+            )
+            if args:
+                yield _sse_event(
+                    "content_block_delta",
+                    build_tool_use_delta(next_index, args),
+                )
+            yield _sse_event(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": next_index},
+            )
+            next_index += 1
+            block_index = next_index - 1
+
     stop_reason = map_finish_reason_to_stop_reason(
         getattr(req_obj, "finish_reason", None)
     )
+    if tool_call_buffers and not saw_text and stop_reason == "end_turn":
+        stop_reason = "tool_use"
     yield _sse_event(
         "message_delta",
         {
@@ -292,6 +577,37 @@ async def anthropic_stream_from_async_stream(*, req_obj, response_model: str):
         },
     )
     yield _sse_event("message_stop", {"type": "message_stop"})
+
+
+async def anthropic_completion_stream_from_async_stream(
+    *, req_obj, response_model: str
+):
+    async_stream = req_obj.async_stream
+    async for data, _top_logprobs, _top_tokens in async_stream:
+        if not data:
+            continue
+        yield _sse_data(
+            {
+                "type": "completion",
+                "completion": data,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "model": response_model,
+            }
+        )
+
+    stop_reason = map_finish_reason_to_completion_stop_reason(
+        getattr(req_obj, "finish_reason", None)
+    )
+    yield _sse_data(
+        {
+            "type": "completion",
+            "completion": "",
+            "stop_reason": stop_reason,
+            "stop_sequence": None,
+            "model": response_model,
+        }
+    )
 
 
 async def handle_messages_request(
@@ -323,11 +639,17 @@ async def handle_messages_request(
     except ValidationError as e:
         return anthropic_error(422, "invalid_request_error", json.dumps(e.errors()))
 
-    if request.tools is not None or request.tool_choice is not None:
+    try:
+        tools = normalize_anthropic_tools(request.tools)
+        tool_choice = map_anthropic_tool_choice(request.tool_choice)
+    except ValueError as e:
+        return anthropic_error(400, "invalid_request_error", str(e))
+
+    if dp_enabled and tools:
         return anthropic_error(
             400,
             "invalid_request_error",
-            "tools/tool_choice are not supported by this server yet.",
+            "tools are not supported in DP mode yet.",
         )
 
     try:
@@ -349,9 +671,7 @@ async def handle_messages_request(
                 {"role": "system", "content": anthropic_content_to_text(request.system)}
             )
         for m in request.messages:
-            internal_messages.append(
-                {"role": m.role, "content": anthropic_content_to_text(m.content)}
-            )
+            internal_messages.extend(anthropic_message_to_internal(m))
     except ValueError as e:
         return anthropic_error(400, "invalid_request_error", str(e))
 
@@ -453,6 +773,9 @@ async def handle_messages_request(
             top_k=top_k,
             frequency_penalty=frequency_penalty,
             chat_template_kwargs=chat_template_kwargs,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=True,
         )
     except ValueError:
         return anthropic_error(
@@ -484,10 +807,19 @@ async def handle_messages_request(
     stop_reason = stop_reason_override or map_finish_reason_to_stop_reason(
         getattr(user_req, "finish_reason", None)
     )
+    tool_calls = []
+    if tools:
+        parser_cls = get_active_tool_parser()
+        parser = parser_cls()
+        output_text, tool_calls = parser.parse_string(output_text)
+
     content_blocks: list[dict] = []
     if reasoning_text:
         content_blocks.append({"type": "thinking", "thinking": reasoning_text})
-    content_blocks.append({"type": "text", "text": output_text})
+    if output_text:
+        content_blocks.append({"type": "text", "text": output_text})
+    if tool_calls:
+        content_blocks.extend(tool_calls_to_anthropic_blocks(tool_calls))
     return JSONResponse(
         {
             "id": f"msg_{user_req.request_id}",
@@ -503,6 +835,129 @@ async def handle_messages_request(
                     getattr(user_req.async_stream, "tokens_len", 0) or 0
                 ),
             },
+        }
+    )
+
+
+async def handle_completion_request(
+    *,
+    raw_request: Request,
+    authorization: Optional[str],
+    x_api_key: Optional[str],
+    server_status: bool,
+    dp_enabled: bool,
+    dp_service_started: bool,
+    dp_register_and_submit: Callable[[Any], Awaitable[Any]],
+    priority_for_api_key: Callable[[str], int],
+):
+    """
+    Main entry for `/v1/complete` route (legacy completions / code infill).
+    """
+    if not server_status:
+        return anthropic_error(503, "service_unavailable", "Service is not started")
+
+    try:
+        data = await raw_request.json()
+    except Exception:
+        return anthropic_error(
+            400, "invalid_request_error", "Invalid JSON body. Expecting JSON payload."
+        )
+
+    try:
+        request = AnthropicCompletionRequest.model_validate(data)
+    except ValidationError as e:
+        return anthropic_error(422, "invalid_request_error", json.dumps(e.errors()))
+
+    if dp_enabled:
+        return anthropic_error(
+            400,
+            "invalid_request_error",
+            "Completion endpoint is not supported in DP mode yet.",
+        )
+
+    try:
+        response_model = resolve_requested_model_or_error(request.model)
+    except ValueError as e:
+        return anthropic_error(404, "not_found_error", str(e))
+
+    try:
+        api_key = parse_api_key_from_headers(authorization, x_api_key)
+    except HTTPException as e:
+        return anthropic_error(400, "invalid_request_error", str(e.detail))
+
+    args = get_global_args()
+    prompt_text = request.prompt or ""
+    if request.suffix:
+        try:
+            prompt_text = build_fim_prompt(prompt_text, request.suffix)
+        except ValueError as e:
+            return anthropic_error(400, "invalid_request_error", str(e))
+
+    try:
+        prompt_tokens = Backend.tokenizer.model.encode(
+            prompt_text, add_special_tokens=False
+        )
+    except Exception as e:
+        return anthropic_error(400, "invalid_request_error", f"Tokenize error: {e}")
+
+    max_new_tokens = request.max_tokens_to_sample or args.request.max_new_tokens
+    temperature = request.temperature if request.temperature is not None else 0.8
+    top_p = request.top_p if request.top_p is not None else 0.9
+    top_k = request.top_k if request.top_k is not None else 50
+    frequency_penalty = 0.0
+
+    req_id = gen_req_id()
+    try:
+        user_req = UserRequest(
+            message=[],
+            request_id=req_id,
+            tokens=prompt_tokens,
+            logprobs=False,
+            top_logprobs=None,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            frequency_penalty=frequency_penalty,
+            enable_reasoning=False,
+        )
+    except ValueError:
+        return anthropic_error(
+            400, "invalid_request_error", "prompt length is greater than max_seq_len"
+        )
+
+    task = Task(
+        user_req.request_id,
+        user_req,
+        stop_with_eos=True,
+        priority=priority_for_api_key(api_key),
+    )
+    TaskPool.enqueue(task)
+
+    if request.stream:
+        return StreamingResponse(
+            anthropic_completion_stream_from_async_stream(
+                req_obj=user_req, response_model=response_model
+            ),
+            media_type="text/event-stream",
+        )
+
+    _reasoning_text, output_text = await collect_reasoning_and_text(
+        user_req.async_stream
+    )
+    output_text, stop_reason_override, stop_sequence = apply_stop_sequences_weak(
+        output_text, request.stop_sequences
+    )
+    stop_reason = stop_reason_override or map_finish_reason_to_completion_stop_reason(
+        getattr(user_req, "finish_reason", None)
+    )
+    return JSONResponse(
+        {
+            "type": "completion",
+            "completion": output_text,
+            "stop_reason": stop_reason,
+            "stop_sequence": stop_sequence,
+            "model": response_model,
         }
     )
 
@@ -546,6 +1001,23 @@ def create_router(
         x_api_key: Annotated[Optional[str], Header(alias="x-api-key")] = None,
     ):
         return await handle_messages_request(
+            raw_request=raw_request,
+            authorization=authorization,
+            x_api_key=x_api_key,
+            server_status=get_server_status(),
+            dp_enabled=get_global_args().dp_config.enabled,
+            dp_service_started=get_dp_service_started(),
+            dp_register_and_submit=_dp_register_and_submit,
+            priority_for_api_key=priority_for_api_key,
+        )
+
+    @router.post("/v1/complete")
+    async def v1_complete(
+        raw_request: Request,
+        authorization: Annotated[Optional[str], Header(alias="Authorization")] = None,
+        x_api_key: Annotated[Optional[str], Header(alias="x-api-key")] = None,
+    ):
+        return await handle_completion_request(
             raw_request=raw_request,
             authorization=authorization,
             x_api_key=x_api_key,

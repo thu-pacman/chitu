@@ -4,11 +4,12 @@
 
 import inspect
 import logging
-import os
 from typing import Any, Dict, Set, Tuple
 from contextvars import ContextVar
 from contextlib import contextmanager
 from logging.config import dictConfig
+
+from chitu.utils import get_chitu_env
 
 try:
     import torch.distributed as dist
@@ -60,7 +61,7 @@ class ChituLogger(logging.Logger):
 # Set ChituLogger as the default logger class
 logging.setLoggerClass(ChituLogger)
 
-CHITU_LOGGING_LEVEL = os.getenv("CHITU_LOGGING_LEVEL", "INFO")
+CHITU_LOGGING_LEVEL = get_chitu_env("CHITU_LOGGING_LEVEL", "INFO")
 
 _FORMAT = (
     f"%(levelname)s %(asctime)s "

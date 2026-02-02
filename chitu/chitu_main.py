@@ -46,6 +46,7 @@ from chitu.utils import (
     try_import_and_setup_torch_npu,
     ceil_div,
     gather_str_to_dst_rank,
+    get_chitu_env,
 )
 from chitu.schemas.utils import ModelConfigResolver
 from chitu.distributed.parallel_state import get_pp_group, get_world_group
@@ -496,7 +497,7 @@ def _has_cpu_layer(args) -> bool:
 
 
 def chitu_init(args):
-    debug = os.getenv("CHITU_DEBUG", "0") == "1"
+    debug = get_chitu_env("CHITU_DEBUG", "0") == "1"
 
     if (
         is_nvidia()

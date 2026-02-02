@@ -10,18 +10,19 @@ import os
 import re
 from pathlib import Path
 import random
-from typing import Any
+from typing import Optional, Sequence, Any
 import socket
 import site
-
-import torch
 import importlib
 import importlib.resources
-from chitu.device_type import is_ascend
+
+import torch
 import torch.distributed as dist
 from torch.distributed import get_rank, get_world_size
+
+from chitu.device_type import is_ascend
 from chitu.global_vars import get_global_args
-from typing import Optional
+
 
 logger = getLogger(__name__)
 
@@ -145,6 +146,26 @@ def try_import_and_setup_torch_npu():
         _torch_npu_has_set_up = True
 
     return torch_npu, has_torch_npu
+
+
+def get_chitu_env(
+    name: str, default: Optional[str] = None, *, legacy_names: Sequence[str] = []
+) -> Optional[str]:
+    assert name.startswith(
+        "CHITU_"
+    ), f"To chitu developers: Please always use CHITU_ prefix for chitu-specific environment variables."
+
+    if name in os.environ:
+        return os.environ[name]
+
+    for legacy_name in legacy_names:
+        if legacy_name in os.environ:
+            logger.warning(
+                f"Environment variable {legacy_name} is recognized byt deprecated. Please Use {name} instead."
+            )
+            return os.environ[legacy_name]
+
+    return default
 
 
 _regex_special_chars = set(".^$*+?{}[]|()")
