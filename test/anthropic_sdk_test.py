@@ -24,7 +24,7 @@ from chitu.chitu_main import chitu_init, warmup_engine
 from chitu.schemas import ServeConfig
 from chitu.serve.api_server import start_uvicorn
 from chitu.serve.common import start_worker
-from chitu.utils import get_config_dir_path
+from chitu.utils import get_config_dir_path, get_chitu_env
 
 TEST_CASES: list[dict[str, Any]] = [
     {
@@ -238,8 +238,12 @@ def _wait_http_ready(host: str, port: int, timeout: float) -> None:
 
 @hydra.main(
     version_base=None,
-    config_path=os.getenv("CONFIG_PATH", get_config_dir_path()),
-    config_name=os.getenv("CONFIG_NAME", "serve_config"),
+    config_path=get_chitu_env(
+        "CHITU_CONFIG_PATH", get_config_dir_path(), legacy_names=["CONFIG_PATH"]
+    ),
+    config_name=get_chitu_env(
+        "CHITU_CONFIG_NAME", "serve_config", legacy_names=["CONFIG_NAME"]
+    ),
 )
 def hydra_main(args: ServeConfig):
     chitu_init(args)

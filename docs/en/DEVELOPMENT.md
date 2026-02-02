@@ -209,7 +209,7 @@ Optionally, you can also copy `test/` directories to your desired location to ru
 
 ## Running and Testing without Starting a Service
 
-The following command run with settings in [`chitu/config/serve_config.yaml`](../../chitu/config/serve_config.yaml). Definitions of all runtime config fields of chitu can be checked in this file. You may override them with command line arguments (See [Hydra documents](https://hydra.cc/docs/advanced/override_grammar/basic/) for details). You may also override the entire config file with environment variable `CONFIG_PATH=<path/to/config/directory>` and `CONFIG_NAME=<your_config_file.yaml>`.
+The following command run with settings in [`chitu/config/serve_config.yaml`](../../chitu/config/serve_config.yaml). Definitions of all runtime config fields of chitu can be checked in this file. You may override them with command line arguments (See [Hydra documents](https://hydra.cc/docs/advanced/override_grammar/basic/) for details). You may also override the entire config file with environment variable `CHITU_CONFIG_PATH=<path/to/config/directory>` and `CHITU_CONFIG_NAME=<your_config_file.yaml>`. The overriding config directory should contain all the config files directly or indirectly nested, including model config files.
 
 ### Example: Running DeepSeek-R1
 
@@ -453,7 +453,7 @@ Usage:
 First, run this script to preprocess and save the model:
 
 ```bash
-PREPROCESS_AND_SAVE_DIR=<target_directory> [CONFIG_NAME=<config_file>] torchrun <torchrun_arguments> script/preprocess_and_save.py [your_additional_overrides_to_config]
+CHITU_PREPROCESS_AND_SAVE_DIR=<target_directory> torchrun <torchrun_arguments> script/preprocess_and_save.py [your_additional_overrides_to_config]
 ```
 
 Next, override the model path in your normal run:
@@ -465,15 +465,8 @@ Next, override the model path in your normal run:
 Example usage for TP partitioning:
 
 ```bash
-PREPROCESS_AND_SAVE_DIR=<target_directory> torchrun <torchrun_arguments> script/preprocess_and_save.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> infer.tp_size=2
+CHITU_PREPROCESS_AND_SAVE_DIR=<target_directory> torchrun <torchrun_arguments> script/preprocess_and_save.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> infer.tp_size=2
 torchrun <torchrun_arguments> test/single_req_test.py infer.tp_size=2 models.ckpt_dir=<target_directory> models.tokenizer_path=<target_directory> skip_preprocess=True
-```
-
-Example usage for quantization (currently different from the general usage):
-
-```bash
-PREPROCESS_AND_SAVE_DIR=<target_directory> [CONFIG_NAME=<config_file>] torchrun <torchrun_arguments> script/preprocess_and_save.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> quant_on_load=True
-[CONFIG_NAME=<config_file>] torchrun <torchrun_arguments> test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> quant_ckpt_dir=<target_directory>
 ```
 
 ### CPU+GPU Hybrid Deployment
@@ -634,3 +627,6 @@ Runtime:
 | -------------------------- | ---------------------------- | ------------------------------------------------------ |
 | `CHITU_LOGGING_LEVEL`      | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` | Logging level.                      |
 | `CHITU_DEBUG`              | `0`, `1`                     | Debug mode. Currently this flag enables some timers.   |
+| `CHITU_CONFIG_PATH`        | Path to a directory          | Override the config directory.                         |
+| `CHITU_CONFIG_NAME`        | Config file name w/o .yml    | Override the entry config file name.                   |
+| `CHITU_PREPROCESS_AND_SAVE_DIR` | Path to a directory     | Output directory for `script/preprocess_and_save.py`   |

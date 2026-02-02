@@ -362,7 +362,11 @@ use_float32_rotary: False
 # - False: Use the data type in the model definition.
 keep_dtype_in_checkpoint: False
 
+# When using `script/preprocess_and_save.py` to preprocess a model's state dict, the preprocessed
+# file can be loaded via setting this field to True. This is useful if the running node has constrained
+# file system size. See `docs/en/DEVELOPMENT.md` for details.
 skip_preprocess: False
+
 quant: null
 
 # The followings are legacy parameters. They are to be removed in the future.
