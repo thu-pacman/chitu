@@ -2,7 +2,7 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 import os
 
-os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0"
+os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0 9.0"
 
 if False:  # Debug
     extra_compile_args = {

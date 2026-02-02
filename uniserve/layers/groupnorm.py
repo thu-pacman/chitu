@@ -128,6 +128,7 @@ class RaggedNhwcGroupNorm(nn.Module):
         self.eps = shadow_norm.eps
 
     def forward(self, input, idx1d_cum_cuda, idx_cpu):
+        print(input.shape, idx1d_cum_cuda, idx_cpu)
         return torch.ops.uniserve.ragged_nhwc_groupnorm(
             input,
             idx1d_cum_cuda,

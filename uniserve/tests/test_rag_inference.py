@@ -19,12 +19,14 @@ import torchperf
 from torchperf.utils import shapes_to_tensors, tensors_to_shapes
 from diffusers import DiffusionPipeline, StableDiffusionXLPipeline
 from diffusers import UNet2DConditionModel
-from diffusers.models.transformers.transformer_2d import BasicTransformerBlock, Transformer2DModel
+from diffusers.models.transformers.transformer_2d import (
+    BasicTransformerBlock,
+    Transformer2DModel,
+)
 from diffusers.models.resnet import (
     ResnetBlock2D,
-    LoRACompatibleConv,
-    LoRACompatibleLinear,
 )
+from diffusers.models.lora import LoRACompatibleConv, LoRACompatibleLinear
 import uniserve
 from uniserve.transform import (
     regular_and_rag_shape_inference_with_fx_inputs,
@@ -39,11 +41,13 @@ from uniserve.utils import (
 )
 from uniserve.models.unet_2d_condition import build_unet, build_unet_input
 import types
-
+from uniserve.core.decomposer import Decomposer
 
 dtype = torch.float16
 torch.set_default_device("cuda")
 torch.set_default_dtype(dtype)
+
+torch._dynamo.config.inline_inbuilt_nn_modules = False
 
 
 def get_output_ragged_shape(gm: torch.fx.GraphModule) -> RaggedShape:
@@ -112,6 +116,7 @@ def get_fx_graph_and_inputs_with_dynamo(
     # mark dynamic dimensions
     # for i, d in ragged_dims:
     #     torch._dynamo.mark_dynamic(args[i], d)
+
     assert isinstance(ragged_dims, dict)
     for t, dims in ragged_dims.items():
         for dim in dims:
@@ -566,7 +571,12 @@ def test_ragged_unet_body(save_model=False, model_name="sdxl"):
     gm, fx_args = get_fx_graph_and_inputs_with_dynamo(
         unet_body, args, kwargs, ragged_dims
     )
-
+    gm, fx_args = Decomposer().init_params(gm, fx_args)
+    for i, arg in enumerate(fx_args):
+        if hasattr(arg, "shape"):
+            print(f"fx_args[{i}] shape: {arg.shape}")
+        else:
+            print(f"fx_args[{i}] type: {type(arg)} (no shape attribute)")
     regular_and_rag_shape_inference_with_fx_inputs(gm, fx_args, ragged_dims)
     rshape = get_output_ragged_shape(gm)
     assert rshape.shape == [2, 4, RaggedDim(), RaggedDim()]
@@ -582,6 +592,8 @@ def test_ragged_unet_body(save_model=False, model_name="sdxl"):
         folder = f"{model_name}_unet_body_transformed"
         print(f"== Save model to {folder}")
         transformed_gm.to_folder(folder, folder)
+        # INSERT_YOUR_CODE
+        gm.to_folder(f"{folder}_original", f"{folder}_original")
         return
 
     env0, env1 = run_and_get_intemediate_results(
@@ -609,4 +621,5 @@ if __name__ == "__main__":
     #     test_rag_inference_naive_model_reshape()
     #     test_rag_inference_unet()
     #     test_rag_transformation_naive_model()
-    test_ragged_unet_body(save_model=True, model_name="sdxl")
+    # test_ragged_unet_body(save_model=True, model_name="sdxl")
+    test_ragged_unet_body(save_model=True, model_name="sd15")

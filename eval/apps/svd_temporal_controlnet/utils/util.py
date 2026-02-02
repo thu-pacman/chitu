@@ -83,7 +83,9 @@ def next_step(
         sample - beta_prod_t**0.5 * model_output
     ) / alpha_prod_t**0.5
     next_sample_direction = (1 - alpha_prod_t_next) ** 0.5 * model_output
-    next_sample = alpha_prod_t_next**0.5 * next_original_sample + next_sample_direction
+    next_sample = (
+        alpha_prod_t_next**0.5 * next_original_sample + next_sample_direction
+    )
     return next_sample
 
 

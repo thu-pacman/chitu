@@ -50,7 +50,7 @@ from diffusers.models.modeling_utils import ModelMixin
 #     get_down_block,
 #     get_up_block,
 # )
-from diffusers.models.unet_2d_condition import (
+from diffusers.models.unets.unet_2d_condition import (
     UNet2DConditionModel,
     UNet2DConditionOutput,
 )
@@ -277,11 +277,11 @@ def run_body(
         gligen_args = cross_attention_kwargs.pop("gligen")
         cross_attention_kwargs["gligen"] = {"objs": self.position_net(**gligen_args)}
     # 3. down
-    lora_scale = (
-        cross_attention_kwargs.get("scale", 1.0)
-        if cross_attention_kwargs is not None
-        else 1.0
-    )
+    # lora_scale = (
+    #     cross_attention_kwargs.get("scale", 1.0)
+    #     if cross_attention_kwargs is not None
+    #     else 1.0
+    # )
 
     is_controlnet = (
         mid_block_additional_residual is not None
@@ -301,9 +301,9 @@ def run_body(
             # For t2i-adapter CrossAttnDownBlock2D
             additional_residuals = {}
             if is_adapter and len(down_block_additional_residuals) > 0:
-                additional_residuals["additional_residuals"] = (
-                    down_block_additional_residuals.pop(0)
-                )
+                additional_residuals[
+                    "additional_residuals"
+                ] = down_block_additional_residuals.pop(0)
 
             sample, res_samples = downsample_block(
                 hidden_states=sample,
@@ -315,9 +315,7 @@ def run_body(
                 **additional_residuals,
             )
         else:
-            sample, res_samples = downsample_block(
-                hidden_states=sample, temb=emb, scale=lora_scale
-            )
+            sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
 
             if is_adapter and len(down_block_additional_residuals) > 0:
                 sample += down_block_additional_residuals.pop(0)
@@ -392,7 +390,6 @@ def run_body(
                 temb=emb,
                 res_hidden_states_tuple=res_samples,
                 upsample_size=upsample_size,
-                scale=lora_scale,
             )
 
     # 6. post-process

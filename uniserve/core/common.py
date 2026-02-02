@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import torch
 from torchperf.utils import shapes_to_tensors, tensors_to_shapes
 import logging
+from uniserve.transform.consistency import Condition
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,6 +24,43 @@ Fingerprint = int
 class FakeTensor:
     shape: tuple[int]
     fingerprint: int
+
+
+@dataclass
+class dNode:
+    name: str
+    belongs_to: str
+    merge_to: str
+    condition: Condition
+    node: torch.fx.Node
+
+
+@dataclass
+class dGraph:
+    name: str
+    graph: torch.fx.Graph
+    num_nodes: int
+
+    def __init__(self, name: str, condition: Condition):
+        self.name = name
+        self.num_nodes = 0
+        self.graph = torch.fx.Graph()
+
+    def __repr__(self):
+        ret = f"dGraph("
+        ret += f"Name: {self.name}\n"
+        ret += f"Graph: {self.graph}\n"
+        ret += f"Num Nodes: {self.num_nodes}\n"
+        return ret + ")"
+
+    def __getitem__(self, name):
+        return self.graph.nodes[name]
+
+    def insert_node_before(self, node: torch.fx.Node, new_node: torch.fx.Node):
+        pass
+
+    def insert_node_after(self, node: torch.fx.Node, new_node: torch.fx.Node):
+        pass
 
 
 @dataclass

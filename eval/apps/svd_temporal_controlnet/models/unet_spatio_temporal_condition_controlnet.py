@@ -14,7 +14,7 @@ from diffusers.models.attention_processor import (
 )
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.unet_3d_blocks import (
+from diffusers.models.unets.unet_3d_blocks import (
     UNetMidBlockSpatioTemporal,
     get_down_block,
     get_up_block,

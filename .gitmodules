@@ -7,3 +7,8 @@
 [submodule "third_party/uniserve-stable-fast"]
 	path = third_party/uniserve-stable-fast
 	url = git@github.com:zhengly123/uniserve-stable-fast.git
+[submodule "third_party/HunyuanImage-2.1"]
+	path = third_party/HunyuanImage-2.1
+	url = git@github.com:shch-y/HunyuanImage-2.1.git
+
+

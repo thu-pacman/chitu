@@ -54,7 +54,7 @@ torch::Tensor addB_jr_rr_cuda_forward_kernel(torch::Tensor A,
     const dim3 grid((A.numel() + block_size - 1) / block_size);
     // AT_DISPATCH_HALF(
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-        A.type(), "add_r_b_cuda_forward", ([&] {
+        A.scalar_type(), "add_r_b_cuda_forward", ([&] {
             add_r_b_kernel<scalar_t>
                 <<<grid, block_size, 0, at::cuda::getCurrentCUDAStream()>>>(
                     A.data_ptr<scalar_t>(), n, idx_cuda.data_ptr<itype>(),

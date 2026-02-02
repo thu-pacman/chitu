@@ -2,6 +2,15 @@
 # %load_ext autoreload
 # %autoreload 2
 import os
+import faulthandler, signal
+
+faulthandler.enable()
+faulthandler.register(signal.SIGINT)  # Ctrl+C 输出栈
+# faulthandler.dump_traceback_later(5, repeat=True)   # 每 5 秒打印一次（查死锁必备）
+faulthandler.register(signal.SIGUSR1)  # kill -SIGUSR1 输出栈
+
+print("faulthandler fully enabled")
+
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 
@@ -13,6 +22,7 @@ import torch.nn.functional as F
 import torchperf
 import uniserve
 from uniserve.transform.consistency import ConsistencyProp, Condition
+from uniserve.core import Decomposer
 import sympy
 from uniserve.models.unet_2d_condition import build_unet, build_unet_input
 from copy import deepcopy
@@ -90,14 +100,18 @@ def get_fx_graph_and_inputs_with_dynamo(
         for arg in args:
             mark_batch_as_dynamic(arg)
         recursive_apply(kwargs, mark_batch_as_dynamic)
-
     gm, fx_args = torchperf.torch_dynamo.get_dynamo_graph_modules_and_args(
         model, args, kwargs, full_graph, dynamic=dynamic
     )
+    print(f"===================graph captured {len(gm)} times =====================")
     gm, fx_args = gm[0], fx_args[0]
     gm.graph.print_tabular()
-    if save_svg:
-        torchperf.torch_dynamo.draw_simple_graph(gm, "unet_bhw_dynamic.svg")
+    print(
+        f"=======================completed drawing.============================================"
+    )
+
+    # if save_svg:
+    #     torchperf.torch_dynamo.draw_simple_graph(gm, "unet_bhw_dynamic.svg")
     return gm, fx_args
 
 
@@ -276,16 +290,16 @@ def test_consistency_propogation(save_model=False, model_name="sdxl", load_model
     recursive_apply(kwargs, lambda t: t.to("cuda"))
     gm: torch.fx.GraphModule
     gm, fx_args = get_fx_graph_and_inputs_with_dynamo(unet, args, kwargs)
+
     # gm, fx_args = get_fx_graph_and_inputs_with_dynamo(unet, args, kwargs, full_graph=False)
     # g = passes.graph_drawer.FxGraphDrawer(gm, "unet_graph")
     # with open("a.svg","wb") as f:
     #     f.write(g.get_dot_graph().create_svg())
     # torchperf.torch_dynamo.plot_graph_module(gm,"nameless")
-    # print("=======================completed drawing.============================================")
 
-    print(f"{torchperf.utils.tensors_to_shapes(args)=}")
-    print(f"{torchperf.utils.tensors_to_shapes(kwargs)=}")
-    print(f"{torchperf.utils.tensors_to_shapes(fx_args)=}")
+    # print(f"{torchperf.utils.tensors_to_shapes(args)=}")
+    # print(f"{torchperf.utils.tensors_to_shapes(kwargs)=}")
+    # print(f"{torchperf.utils.tensors_to_shapes(fx_args)=}")
 
     # exit()
     ShapeProp(gm).propagate(*fx_args)
@@ -306,29 +320,70 @@ def test_consistency_propogation(save_model=False, model_name="sdxl", load_model
     # ]
 
     # consturct input condition
-    input_conditions = [
-        Condition([sympy.symbols(f"b{i}")] + [False] * (fx_args[i].dim() - 1))
-        # for i in range(len(fx_args))
-        for i in range(6)
-    ]
-    for _ in range(10 - 1):  # controlnet
-        input_conditions.append(deepcopy(input_conditions[-1]))
-    # print(f"{(input_conditions[0] & input_conditions[1])=}")
-    print(f"{input_conditions=}")
+    # Due to torch 2.9 export all weights as placeholder.
+    # We need to construct input conditions according to it is parameters or real inputs.
+    # input_conditions = [
+    #     Condition([sympy.symbols(f"b{i}")] + [False] * (fx_args[i].dim() - 1))
+    #     # for i in range(len(fx_args))
+    #     for i in range(6)
+    # ]
+    # for _ in range(10 - 1):  # controlnet
+    #     input_conditions.append(deepcopy(input_conditions[-1]))
+    # print(f"{(input_conditions[0] & input_conditions[1])=}x")
+    # print(f"{input_conditions=}")
     prop = ConsistencyProp(gm)
-    prop.propagate(*input_conditions)
-    print("Consistency result:", *prop.env.items(), sep="\n")
+    prop.propagate(*fx_args)
+    # print("Consistency result:", *prop.env.items(), sep="\n")
+    decomposer = Decomposer(threshold=55)
+    gm = decomposer.init_params(gm, fx_args)
+    gm, tag_list = decomposer.notify_graph(prop, gm)
 
-    dgraphs = {}
-    for k, v in prop.env.items():
-        key = repr(v)
-        if key not in dgraphs:
-            dgraphs[key] = []
-        dgraphs[key].append(k)
-    print("=" * 10)
-    print(*dgraphs.items(), sep="\n")
-    print("=" * 10)
-    print(*[(k, len(v)) for k, v in dgraphs.items()], sep="\n")
+    decomposer.split_build_dGraph(gm, tag_list)
+    # INSERT_YOUR_CODE
+    # 为每个condition分配一种颜色，并做node name到颜色的映射
+    # import hashlib
+    print(f"begin to assign color to nodes")
+
+    def condition_to_color(cond):
+        # 只看condition的第一维
+        import hashlib
+
+        if (
+            hasattr(cond, "shape")
+            and isinstance(cond.shape, (list, tuple))
+            and len(cond.shape) > 0
+        ):
+            s = str(cond.shape[0])
+        else:
+            s = str(cond)
+        h = hashlib.md5(s.encode()).hexdigest()
+        color = f"#{h[:6]}"
+        return color
+
+    # node_name: color dict
+
+    for node in gm.graph.nodes:
+        if node.tag is not None:
+            # belongs_to 作为条件输入
+            node.color = condition_to_color(node.tag)
+        else:
+            node.color = "#bbbbbb"  # 默认为灰色
+
+    # print("Node name to color dict:")
+
+    print(f"begin to draw graph")
+    # torchperf.torch_dynamo.draw_simple_graph(gm, "unet_fx_graph.svg")
+    print(f"end to draw graph")
+    # dgraphs = {}
+    # for k, v in prop.env.items():
+    #     key = repr(v)
+    #     if key not in dgraphs:
+    #         dgraphs[key] = []
+    #     dgraphs[key].append(k)
+    # print("=" * 10)
+    # print(*dgraphs.items(), sep="\n")
+    # print("=" * 10)
+    # print(*[(k, len(v)) for k, v in dgraphs.items()], sep="\n")
 
     if False:  # plot symbolic redundancy
         torchperf.torch_dynamo.draw_simple_graph(

@@ -19,7 +19,6 @@ from torch import nn
 from torch.nn import functional as F
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.loaders import FromOriginalControlnetMixin
 from diffusers.utils import BaseOutput, logging
 from diffusers.models.attention_processor import (
     ADDED_KV_ATTENTION_PROCESSORS,
@@ -36,7 +35,7 @@ from diffusers.models.embeddings import (
     Timesteps,
 )
 from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.unet_3d_blocks import (
+from diffusers.models.unets.unet_3d_blocks import (
     get_down_block,
     get_up_block,
     UNetMidBlockSpatioTemporal,
@@ -132,7 +131,7 @@ class ControlNetConditioningEmbeddingSVD(nn.Module):
         return embedding
 
 
-class ControlNetSDVModel(ModelMixin, ConfigMixin, FromOriginalControlnetMixin):
+class ControlNetSDVModel(ModelMixin, ConfigMixin):
     r"""
     A conditional Spatio-Temporal UNet model that takes a noisy video frames, conditional state, and a timestep and returns a sample
     shaped output.

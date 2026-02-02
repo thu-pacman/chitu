@@ -103,9 +103,10 @@ class ConsistencyProp:
         self.val = {}
 
     def propagate(self, *args):
-        for v in args:
-            assert isinstance(v, (Condition)), f"{v} has type {v.__class__}"
-        args_iter = iter(args)
+        # for v in args:
+        # assert isinstance(v, (Condition)), f"{v} has type {v.__class__}"
+        # args_iter = iter(args)
+        ids_count = 0
 
         def load_arg(a):
             return torch.fx.graph.map_arg(a, lambda n: self.env[n.name])
@@ -124,29 +125,76 @@ class ConsistencyProp:
                 attr_itr = getattr(attr_itr, atom)
             return attr_itr
 
-        argsv_iter = iter(
-            [
-                torch.randn(2, 4, 32, 32),
-                torch.tensor(1),
-                torch.randn(2, 77, 2048),
-                torch.randn(2, 1280),
-                torch.randn(2, 6),
-            ]
-            + [torch.randn(1) for _ in range(10)]
-        )  # example tensor to verified the validation of the unet
+        # argsv_iter = iter(
+        #     [
+        #         torch.randn(2, 4, 32, 32),
+        #         torch.tensor(1),
+        #         torch.randn(2, 77, 2048),
+        #         torch.randn(2, 1280),
+        #         torch.randn(2, 6),
+        #     ]
+        #     + [torch.randn(1) for _ in range(10)]
+        # )  # example tensor to verified the validation of the unet
         for node in self.graph.nodes:
             args = load_arg(node.args)
             args_val = load_val(node.args)
             kwargs = load_arg(node.kwargs)
             kwargs_val = load_val(node.kwargs)
 
-            if node.op == "placeholder":
-                result = next(args_iter)
-                val = next(argsv_iter)
-            elif node.op == "get_attr":
+            if node.op == "get_attr":
                 val = fetch_attr(node.target)
                 result = Condition([False] * val.dim()) if torch.is_tensor(val) else val
+            elif node.op == "placeholder":
+                if "tensor_meta" in node.meta:
+                    tensor_meta = node.meta["tensor_meta"]
+                    shape = (
+                        tensor_meta.shape
+                        if hasattr(tensor_meta, "shape")
+                        else tensor_meta
+                    )
+                    if "parameters" not in node.name:
+                        # automatically generate input condition symbols
+                        result = Condition(
+                            [sympy.symbols(f"b{ids_count}")]
+                            + [False] * (len(shape) - 1)
+                        )
+                        print(f"assign {node.name} to condition {result}")
+                        if "residuals" not in node.name:
+                            ids_count += 1
+                    else:
+                        result = Condition([False] * len(shape))
+                    val = torch.zeros(
+                        shape,
+                        dtype=(
+                            tensor_meta.dtype
+                            if hasattr(tensor_meta, "dtype")
+                            else torch.float32
+                        ),
+                    )
+                elif hasattr(node, "target") and isinstance(node.target, str):
+                    try:
+                        val = fetch_attr(node.target)
+                        result = (
+                            Condition([False] * val.dim())
+                            if torch.is_tensor(val)
+                            else val
+                        )
+                    except (RuntimeError, AttributeError):
+                        raise RuntimeError(
+                            f"Cannot determine shape for placeholder node {node.name}. "
+                            f"Node has no tensor_meta and fetch_attr failed for target: {node.target}"
+                        )
+                else:
+                    raise RuntimeError(
+                        f"Cannot determine shape for placeholder node {node.name}. "
+                        f"Node has no tensor_meta and no target attribute. "
+                        f"Consider running ShapeProp before calling propagate."
+                    )
             elif node.op == "call_function":
+                if node.name == "_log_api_usage_once":
+                    self.env[node.name] = Condition([False])
+                    self.val[node.name] = torch.zeros(0)
+                    continue
                 val = node.target(*args_val, **kwargs_val)
                 if node.target in [operator.add, operator.mul, operator.truediv]:
                     a = args[0]
@@ -170,6 +218,9 @@ class ConsistencyProp:
                     torch.cos,
                     F.interpolate,
                     F.gelu,
+                    F.group_norm,
+                    F.layer_norm,
+                    F.dropout,
                 ]:
                     result = args[0]
                 elif node.target in [torch.cat, torch.concat]:
@@ -194,22 +245,31 @@ class ConsistencyProp:
                         result = Condition(temp_list)
                         if node.name == "getitem":  # HACK for the first getitem
                             result = args[0]
-                elif node.target in [F.relu]:
+                elif node.target in [F.relu, F.silu]:
                     result = args[0]
                 elif node.target in [torch.arange]:
                     result = Condition([False])
                 else:
                     assert (
                         False
-                    ), f"Unsupported call function node {node}. {args=} {kwargs=} {node.args=} {node.kwargs=}"
+                    ), f"Unsupported call function node {node.target}. {args=} {kwargs=} {node.args=} {node.kwargs=}"
             elif node.op == "call_method":
                 val = getattr(torch.Tensor, node.target)(*args_val, **kwargs_val)
                 if node.target in ["to", "float", "contiguous"]:
                     result = args[0]
                 elif node.target in ["expand", "chunk"]:  # need speical opt
                     result = args[0]
+                    # TODO chunk result is tuple, should add new expressions.
                 elif node.target in ["flatten"]:
                     result = Condition([args[0][0]])
+                elif node.target in ["mul", "add", "div"]:
+                    a = args[0]
+                    b = args[1]
+                    if isinstance(args[0], (float, int)):
+                        a = Condition([True] * 1)
+                    if isinstance(args[1], (float, int)):
+                        b = Condition([True] * 1)
+                    result = a & b
                 elif node.target in ["transpose"]:
                     # result = args[0]
                     print(args)
@@ -240,32 +300,44 @@ class ConsistencyProp:
             elif node.op == "call_module":
                 val = self.modules[node.target](*args_val, **kwargs_val)
                 ops_consist = ["norm", "dropout", "act"]
+
                 for strs in ops_consist:
-                    pattern = re.compile(rf".*{strs}*.")
+                    pattern = re.compile(rf".*{strs}.*")
                     if pattern.match(node.target.__str__()):
                         result = args[0]
                         break
                 else:
                     if isinstance(self.modules[node.target], torch.nn.Linear):
+                        # print("prop linear")
                         result = Condition(args[0][:-1] + [False])
                     elif isinstance(self.modules[node.target], torch.nn.Conv2d):
+                        # print("prop conv2d")
                         assert len(args[0]) == 4
                         result = Condition([args[0][0]] + [False] * 3)
-                    elif re.compile(rf".*{'sub'}*.").match(node.target.__str__()):
+                    elif re.compile(rf".*sub.*").match(node.target.__str__()):
+                        # print("prop sub")
                         result = args[0]
-                    elif re.compile(rf".*{'ff'}*.").match(node.target.__str__()):
+                    elif re.compile(rf".*ff.*").match(node.target.__str__()):
+                        # print("prop ff")
                         result = args[0]
-                    elif re.compile(rf".*{'transformer'}*.").match(
+                    elif re.compile(rf".*transformer.*").match(
                         node.target.__str__()
                     ):  # not quite sure
-                        print(node.target.__str__())
+                        # print("prop transformer")
                         result = args[0] & kwargs["encoder_hidden_states"]
                     else:
                         assert (
                             False
                         ), f"Unsupported call module node {node.target.__str__()}, {args=} {kwargs=} {node.args=} {node.kwargs=} {val.shape=} "
             print(
-                f"{node.target}: {result=} {args=} {kwargs=} {node.args=} {node.kwargs=}"
+                (
+                    f"{{{node.name}: {node.target.__str__()}}}: {result=} {args=} {kwargs=} {node.args=} {node.kwargs=} "
+                    + (
+                        f"val.shape={val.shape}"
+                        if hasattr(val, "shape")
+                        else f"val(all_items)={val}"
+                    )
+                )
             )
             self.env[node.name] = result
             self.val[node.name] = val

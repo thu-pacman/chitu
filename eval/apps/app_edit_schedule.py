@@ -1,7 +1,8 @@
 import logging
 import os
 
-os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "0"
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import pytest
 import torch
@@ -25,7 +26,7 @@ from diffusers import (
 )
 from diffusers import StableDiffusionControlNetPipeline
 from diffusers.utils import load_image
-from eval.apps.sdxl_control.uniserve_pipeline_controlnet_sd_xl import (
+from sdxl_control.uniserve_pipeline_controlnet_sd_xl import (
     UniserveSdxlControlUNet2DConditionModel,
     UniserveStableDiffusionXLControlNetPipeline,
 )
@@ -230,6 +231,7 @@ def build_case_edit_input(photo_id=0, lora_id=0, set_fingerprint: bool = True):
     lora_path = [
         # None,
         "/home/wucz/models/weights/sd_xl_turbo_lora_v1.safetensors",
+        "zac/Turbo_Lora",
     ]
     if canny_image_cache is None:
         # image = load_image(photo_paths[photo_id])
@@ -264,12 +266,12 @@ def add_sdxl_controlnet_lora_engine(
 ):
     image = load_image(
         # "/home/zly/Works/uniserving/exp/diffusers/weights/EasternGraySquirrel_GAm.jpg"
-        # "/home/wucz/Katz/assets/demo_image_depth.png"
-        "/home/shchy/repo/diffusor/assets/demo_image_depth.png",
+        "/home/shchy/repo/diffusor/assets/demo_image_depth.png"
     )
     lora_path = [
         # None,
-        "/home/wucz/models/weights/sd_xl_turbo_lora_v1.safetensors",
+        # "/home/wcz112/models/weights/sd_xl_turbo_lora_v1.safetensors",
+        "zac/Turbo_Lora"
     ]
     image = np.array(image)
     image = cv2.Canny(image, 100, 200)
@@ -302,7 +304,7 @@ def add_sdxl_controlnet_lora_engine(
         )
         pipe.vae.config.force_upcast = False  # Use fp16 VAE
         pipe.safety_checker = None
-        pipe.load_lora_weights(lora_path[0])
+        # pipe.load_lora_weights(lora_path[0])
         pipe.to("cuda")
 
         if enable_sfast:
@@ -835,4 +837,4 @@ if __name__ == "__main__":
     # tesst_case_edit_controlnet_async(nTasks)
     import fire
 
-    fire.Fire(test_case_edit_controlnet_async)
+    fire.Fire(test_case_edit_controlnet_async(nRequestsInWindow=16))

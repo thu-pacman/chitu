@@ -1,6 +1,7 @@
 import os
 
-os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "0"
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import torch
 from itertools import product
 import time
@@ -197,6 +198,8 @@ def cached_controlnet(
     )
 
     result = f2()
+    pre_time = torchperf.cuda_timeit_ms(f1, 2, 4)
+    print(f"Pre time: {pre_time} ms")
     ret_time = torchperf.cuda_timeit_ms(f2, 2, 4)
     # torchperf.torch_profile_it("output_f1", f1)
     # torchperf.torch_profile_it(
@@ -244,11 +247,12 @@ def infer(
 def run(mode: str, model_name: str, shapes, batches) -> float:
     image = load_image(
         # "/home/zly/Works/uniserving/exp/diffusers/weights/EasternGraySquirrel_GAm.jpg"
+        # "/home/ppopp26_ae/Difflow/demo_image_depth.png"
         "/home/wucz/Katz/assets/demo_image_depth.png"
     )
     lora_path = [
         # None,
-        "/home/wucz/models/weights/sd_xl_turbo_lora_v1.safetensors",
+        "/home/wcz112/models/sd_xl_turbo_lora_v1.safetensors",
     ]
     image = np.array(image)
     image = cv2.Canny(image, 100, 200)
@@ -334,17 +338,36 @@ def run(mode: str, model_name: str, shapes, batches) -> float:
 
         print("Run tensorrt compile")
         torch._dynamo.config.cache_size_limit = 102400
+
+        # 加速编译的选项：
+        # - workspace_size: 减少工作区大小可以加速编译（默认可能很大，如1GB+）
+        # - min_block_size: 最小块大小，较小的值可以加快编译但可能降低性能
+        # 注意：某些选项可能不是所有 torch_tensorrt 版本都支持，如果报错可以注释掉
+        trt_options = {
+            "truncate_long_and_double": True,
+            "precision": torch.half,
+            # 以下选项可以加速编译，但可能略微降低运行时性能
+            "workspace_size": 1 << 28,  # 256MB，减少以加速编译（默认可能1GB+）
+            "min_block_size": 7,  # 最小块大小，可以调整以平衡编译速度和性能
+        }
+
+        # 如果使用动态形状，可以设置 dynamic=True
+        # 注意：动态形状会增加编译时间，但可以支持不同尺寸的输入
+        # 设置为 False 可以加快编译速度，但只能使用固定形状
+        use_dynamic = True  # 设置为 False 以禁用动态形状，加快编译
+
+        print(f"TensorRT compile options: {trt_options}, dynamic={use_dynamic}")
         pipe.unet = torch.compile(
             pipe.unet,
             backend="torch_tensorrt",
-            dynamic=False,
-            options={"truncate_long_and_double": True, "precision": torch.half},
+            dynamic=use_dynamic,
+            options=trt_options,
         )
         pipe.controlnet = torch.compile(
             pipe.controlnet,
             backend="torch_tensorrt",
-            dynamic=False,
-            options={"truncate_long_and_double": True, "precision": torch.half},
+            dynamic=use_dynamic,
+            options=trt_options,
         )
         ret_time = infer(
             pipe,
@@ -386,7 +409,7 @@ if __name__ == "__main__":
     # for mode in ["debug", "torch", "sfast", "ours"]:
     # for mode in ["sfast", "ours"]:
     # for mode in []:
-    for mode in ["sfast","ours"]:
+    for mode in ["sfast", "ours"]:
         # for shapes in [[[256, 256]], [[512, 512]], [[1024, 1024]]]:
         for shapes in [[[512, 512]]]:
             # for batches in [[1]]:

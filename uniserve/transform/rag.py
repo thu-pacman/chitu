@@ -10,7 +10,7 @@ import uniserve.layers as unn
 import uniserve.models as umodel
 
 from diffusers.models.resnet import ResnetBlock2D
-from diffusers.models.transformer_2d import (
+from diffusers.models.transformers.transformer_2d import (
     Transformer2DModel,
     BasicTransformerBlock,
 )
@@ -83,14 +83,22 @@ def set_info(node: Node, attr: RaggedShape):
 
 def check_args_have_ragged(args=None, kwargs=None):
     def fn(v):
-        t = get_info(v).isRagged() if isinstance(v, Node) else False
-        return t
+        result = False
+        if isinstance(v, Node):
+            t = get_info(v)
+            if isinstance(t, list):
+                for item in t:
+                    result = result | item.isRagged()
+            else:
+                result = result | t.isRagged()
+        return result
 
     return reduce_any((args, kwargs), fn)
 
 
 def get_concrete_shape(node: Node):
-    return node.meta["tensor_meta"].shape
+    tensor_meta = node.meta["tensor_meta"]
+    return tensor_meta.shape
 
 
 def get_concrete_output_shape(node: Node, i):
@@ -112,6 +120,7 @@ class RagProp(torch.fx.Interpreter):
         assert not hasattr(self, "ragged_shape")
         # Assumptions: ragged dims will not be reordered
         # ragged_shape[i] = [length of 1st ragged dim, 2nd ragged dim, ..., i-th ragged dim]
+        # record compressed shape of each ragged dim for each level of compression
         self.ragged_shape: list[list[int]] = [[], [], []]
 
         n_ragged = len(ragged_shape.get_ragged_dims())
@@ -145,8 +154,10 @@ class RagProp(torch.fx.Interpreter):
         return result
 
     def run_node(self, n: Node):
+        args, kwargs = self.fetch_args_kwargs_from_env(n)
+        if n.name == "_log_api_usage_once":
+            return None
         with self._set_current_node(n):
-            # args, kwargs = self.fetch_args_kwargs_from_env(n)
             assert isinstance(n.args, tuple)
             assert isinstance(n.kwargs, dict)
             if (
@@ -155,6 +166,7 @@ class RagProp(torch.fx.Interpreter):
                 or n.target
                 in ["output"]  # output nodes have a tuple of nodes as output
                 or n.op in ["placeholder"]
+                or n.target == "chunk"
             ):
                 result = getattr(self, n.op)(n, n.target, n.args, n.kwargs)
             else:
@@ -162,9 +174,14 @@ class RagProp(torch.fx.Interpreter):
             assert isinstance(result, (RaggedShape, list))
             # amend by concrete shapes
             if isinstance(result, RaggedShape):
-                if not result.is_shape and not (
-                    n.op == "placeholder"
-                    and n.name.startswith("s")  # is dynamic shape placeholder
+                if (
+                    not result.is_shape
+                    and not (
+                        n.op == "placeholder"
+                        and n.name.startswith("s")  # is dynamic shape placeholder
+                    )
+                    and not (n.op == "call_function" and n.target == torch.sym_sum)
+                    and "tensor_meta" in n.meta
                 ):
                     concrete_shape = get_concrete_shape(n)
                     result = self.amend_ragged_shape_by_concrete_shape(
@@ -185,9 +202,10 @@ class RagProp(torch.fx.Interpreter):
 
     def placeholder(self, node: Node, target, args: tuple, kwargs: dict):
         t = RaggedShape(shape=next(self.args_iter), is_shape=False)
-        if t.isRagged():
+        if t.isRagged() and len(t.shape) > 1:
             self.init_input_ragged_shape(t, get_concrete_shape(node))
-            print(f"{self.ragged_shape=}")
+        elif node.name.startswith("s"):
+            t.is_shape = True
         return t
 
     def call_function(self, node: Node, target, args: tuple, kwargs: dict):
@@ -206,12 +224,22 @@ class RagProp(torch.fx.Interpreter):
             torch._C._VariableFunctions.concat,
         ]:
             # TODO: realize concat
+            # exit()
             result = deepcopy(get_info(node.args[0][0]))
+        elif node.target in [torch.sym_sum]:
+            result = deepcopy(get_info(node.args[0][1]))
+        elif node.target == operator.mul:
+            if isinstance(node.args[0], Node):
+                result = deepcopy(get_info(node.args[0]))
+            else:
+                result = deepcopy(get_info(node.args[1]))
         else:
             attr = deepcopy(get_info(node.args[0]))
             if node.target == operator.getitem:
-                # call_function  getitem_120  <built-in function getitem> (size_27, 3)                                                                                                                                                           {}
-                if attr.is_shape:
+                # call_function  getitem_120  <built-in function getitem> (size_27, 3)
+                if isinstance(attr, list):
+                    result = attr[node.args[1]]
+                elif attr.is_shape:
                     result = RaggedShape(
                         shape=[attr.shape[node.args[1]]], is_shape=True
                     )
@@ -222,7 +250,7 @@ class RagProp(torch.fx.Interpreter):
         return result
 
     def call_method(self, node: Node, target, args: tuple, kwargs: dict):
-        if node.target == "reshape":
+        if node.target == "reshape" or node.target == "view":
             # call_method reshape_21 reshape (linear_21, 2, getitem_119, getitem_120, 640)
             result = []
             for v in node.args[1:]:
@@ -231,9 +259,22 @@ class RagProp(torch.fx.Interpreter):
                     assert d.is_shape == True
                     assert len(d.shape) == 1
                     result.append(d.shape[0])
+                elif v == -1:
+                    result.append(RaggedDim())
                 else:
                     result.append(v)
             result = RaggedShape(result)
+        elif node.target == "transpose":
+            attr = get_info(node.args[0])
+            dim0 = node.args[1]
+            dim1 = node.args[2]
+            new_shape = list(attr.shape)
+            new_shape[dim0], new_shape[dim1] = new_shape[dim1], new_shape[dim0]
+            result = RaggedShape(
+                new_shape,
+                is_shape=attr.is_shape,
+                rag_division_ratio=attr.rag_division_ratio,
+            )
         elif node.target == "permute":
             # call_method permute_4 permute (l__self___down_blocks_2_attentions_0_norm, 0, 2, 3, 1)
             attr = get_info(node.args[0])
@@ -245,12 +286,40 @@ class RagProp(torch.fx.Interpreter):
             result = RaggedShape(
                 shape=list(attr.shape[index[i]] for i in range(attr.dim()))
             )
-        elif node.target == "size":
+        elif node.target == "chunk":
+            # 根据 args，result为chunk以后的结构，kwargs里面有被切分的dim为度
+            # args[0]是被chunk的tensor/meta, args[1]是chunk数, kwargs["dim"]为在哪个维度分割
+            input_ragged = deepcopy(get_info(node.args[0]))
+            num_chunks = node.args[1]
+            dim = kwargs.get("dim", -1)  # 默认为-1，如果未指定
+            if dim < 0:
+                dim += len(input_ragged.shape)
+            # 计算chunk后每一份的shape
+            out = []
+            shape = list(input_ragged.shape)
+            chunk_size = (shape[dim] + num_chunks - 1) // num_chunks  # 类似torch.chunk行为
+            for i in range(num_chunks):
+                start = i * chunk_size
+                end = min(start + chunk_size, shape[dim])
+                new_shape = shape.copy()
+                new_shape[dim] = end - start if end > start else 0
+                out.append(
+                    RaggedShape(
+                        new_shape,
+                        is_shape=input_ragged.is_shape,
+                        rag_division_ratio=input_ragged.rag_division_ratio,
+                    )
+                )
+            result = out
+        elif node.target == "size" or node.target == "add":
             # call_method  size_29 size (add_11,)
             result = deepcopy(get_info(node.args[0]))
-            result.is_shape = True
+            # result.is_shape = True
         else:
-            assert not check_args_have_ragged(node.args[1:], node.kwargs)
+            assert (
+                not check_args_have_ragged(node.args[1:], node.kwargs)
+                or node.target == "mul"
+            )
             result = deepcopy(get_info(node.args[0]))
         return result
 
@@ -338,14 +407,25 @@ def regular_and_rag_shape_inference_with_fx_inputs(
     ragged_dims: dict[torch.Tensor, list[int]],
 ):
     assert isinstance(ragged_dims, dict)
-    fx_shape_inference(gm, fx_inputs)
-
+    fx_concrete = []
+    for item in fx_inputs:
+        if isinstance(item, torch.SymInt):
+            fx_concrete.append(int(item))
+        else:
+            fx_concrete.append(item)
+    fx_shape_inference(gm, fx_concrete)
+    # exit()
     # Rag inference: create `num_ragged_dims` new empty shapes for dynamic shape
     shapes = [list(t.shape) if torch.is_tensor(t) else list() for t in fx_inputs]
     for i, tensor in enumerate(fx_inputs):
         if torch.is_tensor(tensor) and tensor in ragged_dims:
             for dim in ragged_dims[tensor]:
                 shapes[i][dim] = RaggedDim()
+        if isinstance(tensor, torch.SymInt):
+            shapes[i].append(RaggedDim())
+    # print("Ragged shape inference shapes:")
+    # for idx, s in enumerate(shapes):
+    #     print(f"  input {idx}: shape={s}")
     rag_inference(gm, shapes)
 
 
@@ -359,6 +439,8 @@ def regular_and_rag_shape_inference_with_fx_inputs(
 class RagTransformer(torch.fx.Transformer):
     def __init__(self, module):
         super().__init__(module)
+        # 禁用垃圾回收，保留所有节点的 proxy 以便后续访问
+        self.garbage_collect_values = False
         # initialize index proxies
         self.indices = {}  # (name, divisor) : proxy
         for dims in [1, 2]:
@@ -417,7 +499,12 @@ class RagTransformer(torch.fx.Transformer):
             if isinstance(rshape, RaggedShape):
                 if rshape.is_shape:  # shape operations are static
                     return None
-                elif check_args_have_ragged(n.args, n.kwargs) or rshape.isRagged():
+                elif (
+                    check_args_have_ragged(n.args, n.kwargs)
+                    or rshape.isRagged()
+                    or n.target == "view"
+                    or n.target == "transpose"
+                ):
                     return getattr(self, n.op)(n, n.target, args, kwargs)
             # Output or Non-rag operations
             return getattr(super(), n.op)(n.target, args, kwargs)
@@ -451,12 +538,93 @@ class RagTransformer(torch.fx.Transformer):
             )
             x = torch.ops.uniserve.ragged_nchw_to_nhwc(x, out_shape[1], out_index)
             return x
+        elif target == torch.nn.functional.scaled_dot_product_attention:
+            q, k, v = args[:3]
+            # q = self.env[n.args[0].args[0]]
+            # k = self.env[n.args[1].args[0]]
+            # v = self.env[n.args[2].args[0]]
+            q_info = get_info(n.args[0])
+            k_info = get_info(n.args[1])
+            v_info = get_info(n.args[2])
+
+            q_view_node = n.args[0].args[0]
+            view_args = q_view_node.args[1:]
+            num_heads = view_args[2]
+            head_dim = view_args[3]
+            hidden_dim = num_heads * head_dim
+            print(f"{num_heads=} {head_dim=} {hidden_dim=}")
+            # 使用 reshape 而不是 view，因为 transpose 跳过后 tensor 可能不连续
+            q = q.reshape(-1, num_heads, head_dim)
+            k = k.reshape(-1, num_heads, head_dim)
+            v = v.reshape(-1, num_heads, head_dim)
+            # print(f"{self.env[n.args[0].args[0]]=} {self.env[n.args[1].args[0]]=} {self.env[n.args[2].args[0]]=}")
+            # print(f"{get_info(n.args[0].args[0])=} {get_info(n.args[1].args[0])=} {get_info(n.args[2].args[0])=}")
+            print(f"{n.name} qkv_info: {q_info}, {k_info}, {v_info}")
+
+            cu_seqlen_q = self.get_index(  # sequence cum index cuda
+                1,
+                get_info(n.args[0]).rag_division_ratio,
+                "cuda",
+                cumulative=True,
+            )
+            cu_seqlen_k = self.indices[
+                ("prompt_cum_idx1d_cuda", 1)
+            ]  # prompt cum index cuda
+            # Calculate max_len as integer
+            divisor = get_info(n.args[0]).rag_division_ratio
+            max_len = 128 * 128 // (divisor**2)
+            # return torch.ops.uniserve.flashattn_varlen_fwd(
+            #     q, k, v, cu_seqlen_q, cu_seqlen_q,
+            # )
+            is_self_attention = (
+                q_info.isRagged() and k_info.isRagged() and v_info.isRagged()
+            )
+            print(f"{n.name} is_self_attention: {is_self_attention}")
+            if is_self_attention:
+                tensor_out = torch.ops.uniserve.flashattn_varlen_fwd(
+                    q,
+                    k,
+                    v,
+                    cu_seqlen_q,
+                    cu_seqlen_q,
+                    max_len,
+                    max_len,
+                )
+                return tensor_out.reshape(-1, hidden_dim)
+            else:
+                tensor_out = torch.ops.uniserve.flashattn_varlen_fwd(
+                    q,
+                    k,
+                    v,
+                    cu_seqlen_q,
+                    cu_seqlen_k,
+                    max_len,
+                    77,
+                )
+                return tensor_out.reshape(-1, hidden_dim)
+        else:
+            print(f"Non-replaced call_function: {target}")
         return super().call_function(target, args, kwargs)
 
     def call_method(self, n: Node, target, args, kwargs):
-        if target in ["permute", "reshape"]:
+        if target in ["permute", "reshape", "transpose", "view"]:
             tensor, *args_tail = args
             return tensor
+        if target in ["add"]:
+            # print(f"{n.name} add args  {n.args[0].name}:{get_info(n.args[0])}, {n.args[1].name}:{get_info(n.args[1])}")
+            args0_is_ragged = get_info(n.args[0]).isRagged()
+            args1_is_ragged = get_info(n.args[1]).isRagged()
+            # print(f"{args0_is_ragged=} {args1_is_ragged=} {args0_is_ragged ^ args1_is_ragged=}")
+            if args0_is_ragged and not args1_is_ragged:
+                print(
+                    "add two different ragged type tensors, use addB_jr_rr to replace."
+                )
+                divisor_in = get_info(n.args[0]).rag_division_ratio
+                b_tensor = self.env[n.args[1].args[0]]
+                print(f"{get_info(n.args[1].args[0])=}")
+                return torch.ops.uniserve.addB_jr_rr(
+                    args[0], self.get_index(2, divisor_in, "cuda"), b_tensor
+                )
         return super().call_method(target, args, kwargs)
 
     def add_module(self, old_target, new_mod):

@@ -2,10 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from diffusers.models.transformer_2d import (
-    Transformer2DModel,
-    BasicTransformerBlock,
-)
+from diffusers.models import Transformer2DModel
 from .transformer_block import RaggedTransformerBlock_nhwc
 import uniserve
 import uniserve.layers as unn

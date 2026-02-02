@@ -1,6 +1,8 @@
 import os
 
-os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "0"
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 import torch
 import datetime
 import numpy as np
@@ -8,6 +10,9 @@ from PIL import Image
 from svd_temporal_controlnet.pipeline.pipeline_stable_video_diffusion_controlnet import (
     StableVideoDiffusionPipelineControlNet,
 )
+
+# from diffusers import StableVideoDiffusionPipeline
+# from diffusers import StableVideoDiffusionPipelineControlNet
 from svd_temporal_controlnet.pipeline.uniserve_pipeline_stable_video_diffusion_controlnet import (
     UniserveStableVideoDiffusionPipelineControlNet,
 )
@@ -337,6 +342,7 @@ def svd_perf(pipe, start_end_lists, opt=False, *, n_steps=25, n_frames=14):
             pipe.clear_cache()
         for item in start_end_list:
             if opt == False:
+                pipe: StableVideoDiffusionPipelineControlNet
                 ret.append(
                     pipe(
                         validation_image,
@@ -350,6 +356,7 @@ def svd_perf(pipe, start_end_lists, opt=False, *, n_steps=25, n_frames=14):
                     )
                 )
             else:
+                pipe: UniserveStableVideoDiffusionPipelineControlNet
                 ret.append(
                     pipe(
                         validation_image,
@@ -427,7 +434,8 @@ def run_pipeline(n_steps, cached: bool, save_gif: bool = False):
 
 
 if __name__ == "__main__":
-    cached = False  # False is baseline, True is optimized
+    cached = True  # False is baseline, True is optimized
+    save_gif = True
     torch.set_grad_enabled(False)
     args = {
         "pretrained_model_name_or_path": "stabilityai/stable-video-diffusion-img2vid",
@@ -462,7 +470,7 @@ if __name__ == "__main__":
     ]
     # start_end_points = [[[0, 25]]]
 
-    run_pipeline(n_steps=n_steps, cached=cached, save_gif=False)
+    run_pipeline(n_steps=n_steps, cached=cached, save_gif=save_gif)
 
     # Inference and saving loop
     # f0 = lambda: pipeline(

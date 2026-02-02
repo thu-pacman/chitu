@@ -1,13 +1,118 @@
 [project]
 name = "uniserve"
 version = "0.0.1"
-dependencies = ["fire"]
+dependencies = [
+    "uniserve-stable-fast",
+    "uniserve_cuda",
+    "torchperf",
+    "fire",
+    "numpy",
+    "prettytable",
+    "diffusers",
+    "torchvision",
+    "torch==2.9.0",
+    # 2.8.3
+    "transformers",
+    "huggingface-hub",
+    "pandas>=2.3.3",
+    "pytest>=9.0.1",
+    "opencv-python>=4.11.0.86",
+    "accelerate>=1.12.0",
+    "xformers>=0.0.20",
+    "triton>=2.1.0",
+    "setuptools",
+    "wheel",
+    # "flash-attn",
+]
+requires-python = "==3.12.*"
 
 [tool.setuptools]
-packages = ["uniserve"]
+packages = ["uniserve","eval"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
 
 [tool.pytest.ini_options]
 markers = [
     "slow: slow tests (deselect with '-m \"not slow\"')",
     "serial",
+]
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[tool.uv.sources]
+hunyuanimage-2-1 = { workspace = true }
+torchperf = { workspace = true }
+uniserve-stable-fast = { workspace = true }
+uniserve_cuda = { workspace = true }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+flash_attn = { path = "../flash-attention" }
+
+
+[tool.uv.workspace]
+members = [
+    "third_party/*",
+    "uniserve/kernels",
+]
+# exclude = ["third_party/uniserve-stable-fast"]
+
+
+[tool.uv.extra-build-dependencies]
+uniserve-stable-fast = ["torch==2.9.0"]
+uniserve_cuda = ["torch==2.9.0"]
+flash-attn = ["torch==2.9.0"]
+
+[tool.uv.extra-build-variables]
+uniserve-stable-fast = { TORCH_CUDA_ARCH_LIST = "8.0 9.0" }
+flash-attn = { FLASH_ATTN_CUDA_ARCHS = "80 90" ,FLASH_ATTENTION_FORCE_BUILD = "TRUE"}
+
+[[tool.uv.dependency-metadata]]
+name = "flash-attn"
+requires-dist = ["torch", "einops"]
+
+
+[dependency-groups]
+dev = [
+  {include-group = 'flash'},
+  {include-group = 'tp'},
+# uv 
+]
+flash = ["flash-attn"]
+tp = ["torchperf"]
+
+[tool.uv]
+config-settings = { editable_mode = "compat" }
+
+
+[project.optional-dependencies]
+hyi = [
+    "hunyuanimage-2-1"
 ]

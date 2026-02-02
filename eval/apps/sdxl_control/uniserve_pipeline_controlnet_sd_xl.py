@@ -93,6 +93,7 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
             watermark output images. If not defined, it defaults to `True` if the package is installed; otherwise no
             watermarker is used.
     """
+
     model_cpu_offload_seq = "text_encoder->text_encoder_2->unet->vae"  # leave controlnet out on purpose because it iterates with unet
 
     def __init__(
@@ -328,9 +329,6 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
             negative_prompt_embeds,
             pooled_prompt_embeds,
             negative_pooled_prompt_embeds,
-            controlnet_conditioning_scale,
-            control_guidance_start,
-            control_guidance_end,
         )
 
         # 2. Define call parameters
@@ -739,7 +737,7 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
             #     added_cond_kwargs=controlnet_added_cond_kwargs,
             #     return_dict=False,
             # )
-            if True: # ours
+            if True:  # ours
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     control_model_input[:1,],
                     t,
@@ -753,7 +751,7 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
                     },
                     return_dict=False,
                 )
-            else: # ControlNet x batch size
+            else:  # ControlNet x batch size
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     control_model_input,
                     t,
@@ -787,7 +785,7 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
             #     sep="\n",
             # )
 
-            if True: # ours
+            if True:  # ours
                 n_batches = len(control_model_input)
                 noise_pred = []
                 for i in range(n_batches):
@@ -815,9 +813,9 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
                 # predict the noise residual
                 for i in range(n_batches):
                     noise_pred_i = self.unet(
-                        latent_model_input[i:i+1],
+                        latent_model_input[i : i + 1],
                         t,
-                        encoder_hidden_states=prompt_embeds[i:i+1],
+                        encoder_hidden_states=prompt_embeds[i : i + 1],
                         timestep_cond=None,
                         cross_attention_kwargs=self.cross_attention_kwargs,
                         # down_block_additional_residuals=down_block_res_samples,
@@ -826,7 +824,9 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
                             v[i : i + 1] for v in down_block_res_samples
                         ],
                         mid_block_additional_residual=mid_block_res_sample[i : i + 1],
-                        added_cond_kwargs={k:v[i:i+1] for k, v in added_cond_kwargs.items()},
+                        added_cond_kwargs={
+                            k: v[i : i + 1] for k, v in added_cond_kwargs.items()
+                        },
                         return_dict=False,
                     )[0]
                     # print(f'{noise_pred_i.shape=}')
@@ -974,14 +974,20 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
         # with self.progress_bar(total=num_inference_steps) as progress_bar:
         for i, t in enumerate(timesteps):
             # expand the latents if we are doing classifier free guidance
-            latent_model_input = (torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents)
+            latent_model_input = (
+                torch.cat([latents] * 2)
+                if self.do_classifier_free_guidance
+                else latents
+            )
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
             # controlnet(s) inference
             if False:  # guess_mode and do_classifier_free_guidance:
                 # Infer ControlNet only for the conditional batch.
                 control_model_input = latents
-                control_model_input = self.scheduler.scale_model_input(control_model_input, t)
+                control_model_input = self.scheduler.scale_model_input(
+                    control_model_input, t
+                )
                 controlnet_prompt_embeds = prompt_embeds.chunk(2)[1]
                 controlnet_added_cond_kwargs = {
                     "text_embeds": add_text_embeds.chunk(2)[1],
@@ -993,7 +999,10 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
                 controlnet_added_cond_kwargs = added_cond_kwargs
 
             if isinstance(controlnet_keep[i], list):
-                cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
+                cond_scale = [
+                    c * s
+                    for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])
+                ]
             else:
                 controlnet_cond_scale = controlnet_conditioning_scale
                 if isinstance(controlnet_cond_scale, list):
@@ -1011,7 +1020,7 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
             #     added_cond_kwargs=controlnet_added_cond_kwargs,
             #     return_dict=False,
             # )
-            if True: # ours
+            if True:  # ours
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     control_model_input,
                     t,
@@ -1026,7 +1035,6 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
                     return_dict=False,
                 )
         return down_block_res_samples, mid_block_res_sample, control_model_input
- 
 
     @torch.no_grad()
     def run_2_2_unet_part2(
@@ -1057,7 +1065,7 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
         # width=None,
     ):
         for _i, _t in enumerate(self.scheduler.timesteps):
-            if True: # ours
+            if True:  # ours
                 n_batches = len(control_model_input)
                 noise_pred = []
                 for i in range(n_batches):
@@ -1085,9 +1093,9 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
                 # predict the noise residual
                 for i in range(n_batches):
                     noise_pred_i = self.unet(
-                        latent_model_input[i:i+1],
+                        latent_model_input[i : i + 1],
                         t,
-                        encoder_hidden_states=prompt_embeds[i:i+1],
+                        encoder_hidden_states=prompt_embeds[i : i + 1],
                         timestep_cond=None,
                         cross_attention_kwargs=self.cross_attention_kwargs,
                         # down_block_additional_residuals=down_block_res_samples,
@@ -1096,7 +1104,9 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
                             v[i : i + 1] for v in down_block_res_samples
                         ],
                         mid_block_additional_residual=mid_block_res_sample[i : i + 1],
-                        added_cond_kwargs={k:v[i:i+1] for k, v in added_cond_kwargs.items()},
+                        added_cond_kwargs={
+                            k: v[i : i + 1] for k, v in added_cond_kwargs.items()
+                        },
                         return_dict=False,
                     )[0]
                     # print(f'{noise_pred_i.shape=}')
@@ -1112,7 +1122,7 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
 
             # compute the previous noisy sample x_t -> x_t-1
             # self.scheduler._init_step_index()
-            self.scheduler._step_index =  0
+            self.scheduler._step_index = 0
             latents = self.scheduler.step(
                 noise_pred, _t, latents, **extra_step_kwargs, return_dict=False
             )[0]
@@ -1128,17 +1138,25 @@ class UniserveStableDiffusionXLControlNetPipeline(StableDiffusionXLControlNetPip
         # manually for max memory savings
         if self.vae.dtype == torch.float16 and self.vae.config.force_upcast:
             self.upcast_vae()
-            latents = latents.to(next(iter(self.vae.post_quant_conv.parameters())).dtype)
+            latents = latents.to(
+                next(iter(self.vae.post_quant_conv.parameters())).dtype
+            )
 
         if not output_type == "latent":
             # make sure the VAE is in float32 mode, as it overflows in float16
-            needs_upcasting = (self.vae.dtype == torch.float16 and self.vae.config.force_upcast)
+            needs_upcasting = (
+                self.vae.dtype == torch.float16 and self.vae.config.force_upcast
+            )
 
             if needs_upcasting:
                 self.upcast_vae()
-                latents = latents.to(next(iter(self.vae.post_quant_conv.parameters())).dtype)
+                latents = latents.to(
+                    next(iter(self.vae.post_quant_conv.parameters())).dtype
+                )
 
-            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+            image = self.vae.decode(
+                latents / self.vae.config.scaling_factor, return_dict=False
+            )[0]
 
             # cast back to fp16 if needed
             if needs_upcasting:

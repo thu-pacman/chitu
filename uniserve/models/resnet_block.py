@@ -85,7 +85,7 @@ class RaggedResnetBlock2D_nhwc(nn.Module):
         )
 
         temb = self.nonlinearity(temb)
-        temb = self.time_emb_proj(temb, scale)  # [n, 1280]
+        temb = self.time_emb_proj(temb)  # [n, 1280]
 
         x = torch.ops.uniserve.addB_jr_rr(x, idx_cuda, temb)
         x = self.norm_act_conv(

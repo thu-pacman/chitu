@@ -35,7 +35,6 @@ from diffusers.models.embeddings import (
     ImageHintTimeEmbedding,
     ImageProjection,
     ImageTimeEmbedding,
-    PositionNet,
     TextImageProjection,
     TextImageTimeEmbedding,
     TextTimeEmbedding,
@@ -43,13 +42,13 @@ from diffusers.models.embeddings import (
     Timesteps,
 )
 from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.unet_2d_blocks import (
+from diffusers.models.unets.unet_2d_blocks import (
     UNetMidBlock2DCrossAttn,
     UNetMidBlock2DSimpleCrossAttn,
     get_down_block,
     get_up_block,
 )
-from diffusers.models.unet_2d_condition import UNet2DConditionModel
+from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
