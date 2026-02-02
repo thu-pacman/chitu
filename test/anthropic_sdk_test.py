@@ -8,6 +8,7 @@ Env (overridable by flags): CHITU_BASE_URL, ANTHROPIC_API_KEY, ANTHROPIC_MODEL, 
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -42,6 +43,21 @@ TEST_CASES: list[dict[str, Any]] = [
             "thinking": {"type": "enabled", "budget_tokens": 1024},
             "messages": [{"role": "user", "content": "宫保鸡丁怎么做?"}],
         },
+    },
+]
+
+COMPLETION_TEST_CASES: list[dict[str, Any]] = [
+    {
+        "name": "completion_basic",
+        "stream": False,
+        "prompt": "def add(a, b):\n    ",
+        "suffix": "\n\nprint(add(1, 2))\n",
+    },
+    {
+        "name": "completion_stream",
+        "stream": True,
+        "prompt": "def greet(name):\n    ",
+        "suffix": '\n\nprint(greet("world"))\n',
     },
 ]
 
@@ -215,7 +231,90 @@ def _run_sdk_tests(*, base_url: str, model: str, api_key: str, max_tokens: int) 
         passed, line = _run_case(client, model=model, max_tokens=max_tokens, case=case)
         print(line)
         ok = ok and passed
+    for case in COMPLETION_TEST_CASES:
+        passed, line = _run_completion_case(
+            base_url=base_url,
+            model=model,
+            api_key=api_key,
+            max_tokens=max_tokens,
+            case=case,
+        )
+        print(line)
+        ok = ok and passed
     return 0 if ok else 1
+
+
+def _run_completion_case(
+    *,
+    base_url: str,
+    model: str,
+    api_key: str,
+    max_tokens: int,
+    case: dict[str, Any],
+) -> tuple[bool, str]:
+    t0 = time.perf_counter()
+    name = case["name"]
+    stream = bool(case.get("stream"))
+    prompt = case.get("prompt", "")
+    suffix = case.get("suffix", None)
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "max_tokens_to_sample": max_tokens,
+        "stream": stream,
+    }
+    if suffix:
+        payload["suffix"] = suffix
+
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/v1/complete",
+            method="POST",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            if not stream:
+                body = resp.read().decode("utf-8")
+                data = json.loads(body)
+                completion = data.get("completion", "")
+                if not completion:
+                    raise RuntimeError("empty completion")
+                sys.stdout.write("[COMPLETION]\n" + completion + "\n")
+                sys.stdout.flush()
+            else:
+                completion_parts: list[str] = []
+                saw_output = False
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = json.loads(line[len("data:") :].strip())
+                    chunk = data.get("completion", "")
+                    if chunk:
+                        if not saw_output:
+                            sys.stdout.write("[COMPLETION]\n")
+                            saw_output = True
+                        sys.stdout.write(chunk)
+                        sys.stdout.flush()
+                        completion_parts.append(chunk)
+                    if data.get("stop_reason"):
+                        break
+                if not "".join(completion_parts).strip():
+                    raise RuntimeError("empty completion")
+                if saw_output:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+
+        dt = time.perf_counter() - t0
+        return True, f"---------- {name}: PASS ({dt:.3f}s) ----------"
+    except Exception as e:
+        dt = time.perf_counter() - t0
+        return False, f"---------- {name}: FAIL ({dt:.3f}s): {e} ----------"
 
 
 def _wait_http_ready(host: str, port: int, timeout: float) -> None:

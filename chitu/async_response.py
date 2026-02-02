@@ -37,6 +37,8 @@ class AsyncDataStream:
         self.top_logprobs_list = []
         self.top_tokens_list = []
         self.enable_reasoning = enable_reasoning
+        self.is_reasoning = False
+        self.reasoning_len = 0
 
         self.is_reasoning = False
         self.reasoning_len = 0
@@ -106,6 +108,8 @@ class AsyncDataStream:
             self.reasoning_len = len(self.seqs) + 1
 
     def is_reasoning_content(self):
+        if not self.enable_reasoning:
+            return False
         return self.is_reasoning or self.index - 1 < self.reasoning_len
 
     def notify_server_from_server_thread(self):
