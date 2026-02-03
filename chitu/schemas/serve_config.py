@@ -68,6 +68,7 @@ class InferConfig(InferConfigLegacy):
     raise_lower_bit_float_to: str = MISSING
     fuse_shared_experts: bool = MISSING
     max_reqs: int = MISSING
+    device_ids: Optional[list[int]] = MISSING
     pp_layer_partition: Optional[list[int]] = MISSING
     use_cuda_graph: bool | str = MISSING
     npu_fusion_fp4: bool = MISSING

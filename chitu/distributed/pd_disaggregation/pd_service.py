@@ -330,8 +330,7 @@ class PDSchedulerService:
 
         # Build a tiny fake request context
         req_id = f"pd-warmup-{os.getpid()}"
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        device = torch.device(local_rank)
+        device = torch.device("cuda")
 
         # Disable PD hooks during warmup (keep it direct/local)
         try:

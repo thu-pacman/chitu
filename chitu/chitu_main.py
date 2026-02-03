@@ -317,21 +317,20 @@ def _warmup_backend_direct(args, local_max_bs=1, decode_steps=2, bs_descend=0):
     init_cache_static()
 
     req_ids = [f"__warmup_{i}__" for i in range(local_max_bs)]
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     is_pp_first_rank = get_pp_group() is None or get_pp_group().is_first_rank
     if is_pp_first_rank:
         tokens = torch.randint(
             1,
             args.models.vocab_size,
             size=(local_max_bs,),
-            device=torch.device(local_rank),
+            device="cuda",
             dtype=torch.int64,
         )
     else:
         tokens = torch.randn(
             local_max_bs,
             args.models.dim,
-            device=torch.device(local_rank),
+            device="cuda",
             dtype=torch.get_default_dtype(),
         )
     seq_len_list = [1] * local_max_bs
@@ -373,14 +372,14 @@ def _warmup_backend_direct(args, local_max_bs=1, decode_steps=2, bs_descend=0):
                 1,
                 args.models.vocab_size,
                 size=(curr_bs,),
-                device=torch.device(local_rank),
+                device="cuda",
                 dtype=torch.int64,
             )
         else:
             step_token = torch.randn(
                 curr_bs,
                 args.models.dim,
-                device=torch.device(local_rank),
+                device="cuda",
                 dtype=torch.get_default_dtype(),
             )
         _ = Backend.model.decode(step_token, curr_bs)
@@ -498,6 +497,8 @@ def _has_cpu_layer(args) -> bool:
 
 def chitu_init(args):
     debug = get_chitu_env("CHITU_DEBUG", "0") == "1"
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
 
     if (
         is_nvidia()
@@ -515,6 +516,7 @@ def chitu_init(args):
 
     init_logger()
 
+    ###################################################################
     # Deal with legacy arguments
     if hasattr(args.infer, "soft_fp8") and args.infer.soft_fp8:
         logger.warning(
@@ -560,6 +562,16 @@ def chitu_init(args):
             args.scheduler.pp_config.decode_num_tasks
         )
 
+    ###################################################################
+    # Deal with automatic arguments
+
+    if args.infer.device_ids is None:
+        args.infer.device_ids = [i % local_world_size for i in range(world_size)]
+    if len(args.infer.device_ids) != world_size:
+        raise ValueError(
+            f"len(infer.device_ids) ({len(args.infer.device_ids)}) must be equalt to world_size ({world_size})"
+        )
+
     # prefill_chunk_size default value: 4096 * dp_size
     if args.infer.prefill_chunk_size == "auto":
         args.infer.prefill_chunk_size = 4096 * args.infer.dp_size
@@ -596,7 +608,6 @@ def chitu_init(args):
             )
             args.infer.bind_process_to_cpu = "none"
         elif _has_cpu_layer(args):
-            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
             if numa.get_max_node() + 1 < local_world_size:
                 logger.warning(
                     "Disable NUMA binding due to insufficient NUMA nodes. Is is an inefficient setting of CPU inference."
@@ -671,6 +682,9 @@ def chitu_init(args):
     set_backend_variables(args)
     set_global_variables(args, debug=debug)
     logger.debug(f"Auto setting configs done. Full configs are: {args}")
+
+    ###################################################################
+    # Initialize backend
 
     args = get_global_args()
     Backend.build(args)

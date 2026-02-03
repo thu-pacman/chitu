@@ -138,12 +138,12 @@ def test_parallel_moe_block(
         ep_rank_lists += [
             list(range(test_world_size, torch.distributed.get_world_size()))
         ]
-    tp_group = CommGroup(tp_rank_lists, rank, local_rank)
-    dp_group = CommGroup(dp_rank_lists, rank, local_rank)
-    etp_group = CommGroup(etp_rank_lists, rank, local_rank)
-    ep_group = CommGroup(ep_rank_lists, rank, local_rank)
+    tp_group = CommGroup(tp_rank_lists, rank)
+    dp_group = CommGroup(dp_rank_lists, rank)
+    etp_group = CommGroup(etp_rank_lists, rank)
+    ep_group = CommGroup(ep_rank_lists, rank)
     singleton_group = CommGroup(
-        [[r] for r in range(torch.distributed.get_world_size())], rank, local_rank
+        [[r] for r in range(torch.distributed.get_world_size())], rank
     )
 
     if rank < test_world_size:
@@ -463,12 +463,12 @@ def test_parallel_moe_block_blockfp8(
         ep_rank_lists += [
             list(range(test_world_size, torch.distributed.get_world_size()))
         ]
-    tp_group = CommGroup(tp_rank_lists, rank, local_rank)
-    dp_group = CommGroup(dp_rank_lists, rank, local_rank)
-    etp_group = CommGroup(etp_rank_lists, rank, local_rank)
-    ep_group = CommGroup(ep_rank_lists, rank, local_rank)
+    tp_group = CommGroup(tp_rank_lists, rank)
+    dp_group = CommGroup(dp_rank_lists, rank)
+    etp_group = CommGroup(etp_rank_lists, rank)
+    ep_group = CommGroup(ep_rank_lists, rank)
     singleton_group = CommGroup(
-        [[r] for r in range(torch.distributed.get_world_size())], rank, local_rank
+        [[r] for r in range(torch.distributed.get_world_size())], rank
     )
 
     if rank < test_world_size:

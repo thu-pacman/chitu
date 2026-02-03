@@ -138,6 +138,14 @@ infer:
   # Acceptable values: True, False
   fuse_shared_experts: False
 
+  # If not null, override device IDs assgiend to each rank.
+  #
+  # Acceptable values:
+  # - null: Each rank is assigned with the local-rank-id-th device.
+  # - a list of integers: E.g, [2, 1, 3] means device 2, 1, 3 are assigned to ranks 0, 1, 2,
+  #   respectively.
+  device_ids: null
+
   # If not null, override the automatic layer partitioning for Pipeline Parallelism.
   #
   # Acceptable values: null or a list of integers, e.g., [10, 12, 12, 10].

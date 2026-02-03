@@ -89,6 +89,9 @@ class TasksDispatcher(ABC):
     `dispatch_metadata` on the TP dispatcher.
     """
 
+    def __init__(self, device):
+        self.device = device
+
     # ip_port_list 中的端口索引
     # (IP, TP_port, DP_port, PP_port) - 系统启动时动态分配的空闲端口
     PORT_INDEX = {"TP": 1, "DP": 2, "PP": 3}
@@ -241,11 +244,10 @@ class PipeDispatcher(TasksDispatcher):
     协议选择：自动根据相邻 stages 是否同节点选择 ipc:// 或 tcp://
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, device):
+        super().__init__(device)
         self.pp_group = get_pp_group()
         self.rank = self.pp_group.global_rank
-        self.local_rank = self.pp_group.local_rank
 
         self.is_first_stage = self.pp_group.is_first_rank
         self.is_last_stage = self.pp_group.is_last_rank
@@ -261,7 +263,6 @@ class PipeDispatcher(TasksDispatcher):
         self.num_nodes_per_dp = (
             get_world_group().group_size // get_dp_group().group_size
         )
-        self.device = torch.cuda.current_device()
 
         # TP Main Rank 标记
         self.is_tp_main_rank = get_tp_group().is_first_rank
@@ -425,9 +426,7 @@ class PipeDispatcher(TasksDispatcher):
             # chunk prefill
             if payload.numel() == 0:
                 results = torch.empty(
-                    (0, tasks.get_result_len()),
-                    device=self.local_rank,
-                    dtype=torch.int32,
+                    (0, tasks.get_result_len()), device=self.device, dtype=torch.int32
                 )
             else:
                 tokens = Backend.executor.sample(payload, tasks)
@@ -492,7 +491,7 @@ class PipeDispatcher(TasksDispatcher):
             num_output_tasks = len(curr_packed_tasks.output_tasks)
             results = torch.empty(
                 (num_output_tasks, all_tasks.get_result_len()),
-                device=self.local_rank,
+                device=self.device,
                 dtype=torch.int32,
             )
             handle = torch.distributed.irecv(
@@ -515,11 +514,11 @@ class PipeDispatcher(TasksDispatcher):
 class TensorDispatcher(TasksDispatcher):
     """TP (Tensor Parallelism) Dispatcher"""
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, device):
+        super().__init__(device)
+
         self.tp_group = get_tp_group()
         self.rank = self.tp_group.global_rank
-        self.local_rank = self.tp_group.local_rank
         self.rank_in_group = self.tp_group.rank_in_group
         self.group_size = self.tp_group.group_size
 
@@ -643,13 +642,14 @@ class TensorDispatcher(TasksDispatcher):
 class ExpertDataDispatcher(TasksDispatcher):
     """DP (Data Parallelism) Dispatcher"""
 
-    def __init__(self):
+    def __init__(self, device):
+        super().__init__(device)
+
         self.dp_group = get_dp_group()
         self.rank = self.dp_group.global_rank
         self.dp_main_rank = self.dp_group.rank_list[0]
         self.is_main_rank = self.dp_group.is_first_rank
         self.rank_in_group = self.dp_group.rank_in_group
-        self.device = torch.cuda.current_device()
         self.group_size = self.dp_group.group_size
         self.pp_size = get_pp_group().group_size
 
@@ -802,9 +802,7 @@ class Executor:
     def __init__(self, args):
         self.timers = get_timers()
         self.rank = torch.distributed.get_rank()
-        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        if args.infer.op_impl == "cpu":
-            self.local_rank = "cpu"
+        self.device = torch.device("cpu" if args.infer.op_impl == "cpu" else "cuda")
         self.pp_size = args.infer.pp_size
         self.tp_size = args.infer.tp_size
         self.dp_size = args.infer.dp_size
@@ -825,15 +823,15 @@ class Executor:
 
         rank_filter = True
         if rank_filter and self.tp_size > 1:
-            self._prepend_dispatcher(TensorDispatcher())
+            self._prepend_dispatcher(TensorDispatcher(self.device))
             self.tp_group = get_tp_group()
             rank_filter = rank_filter and get_tp_group().is_first_rank
         if rank_filter and self.pp_size > 1:
-            self.pipe_dispatcher = PipeDispatcher()
+            self.pipe_dispatcher = PipeDispatcher(self.device)
             self._prepend_dispatcher(self.pipe_dispatcher)
             rank_filter = rank_filter and get_pp_group().is_first_rank
         if rank_filter and self.dp_size > 1:
-            self.dp_dispatcher = ExpertDataDispatcher()
+            self.dp_dispatcher = ExpertDataDispatcher(self.device)
             self._prepend_dispatcher(self.dp_dispatcher)
 
         if self.pp_size > 1 and not get_pp_group().is_first_rank:
@@ -851,10 +849,10 @@ class Executor:
         self.empty_decode_step_graph = None
         self.empty_decode_step_graph_mtp = None
         self.dummy_logits = torch.empty(
-            [0, args.models.vocab_size], dtype=torch.float32, device=self.local_rank
+            [0, args.models.vocab_size], dtype=torch.float32, device=self.device
         )
         self.dummy_output = torch.empty(
-            [0, args.models.vocab_size], dtype=torch.float32, device=self.local_rank
+            [0, args.models.vocab_size], dtype=torch.float32, device=self.device
         )
 
         self.moe_impl = get_moe_impl()
@@ -945,7 +943,7 @@ class Executor:
     def _prepare_new_tokens_for_decode(self, tasks: PackedTasks):
         return torch.tensor(
             [task.next_token for task in tasks.tasks],
-            device=self.local_rank,
+            device=self.device,
             dtype=torch.long,
         )
 
@@ -973,9 +971,9 @@ class Executor:
             if tensor == None or len(tensor) == 0:
                 return None
             if stack:
-                return torch.stack(tensor).to(dtype=dtype, device=self.local_rank)
+                return torch.stack(tensor).to(dtype=dtype, device=self.device)
             else:
-                return torch.cat(tensor, dim=0).to(dtype=dtype, device=self.local_rank)
+                return torch.cat(tensor, dim=0).to(dtype=dtype, device=self.device)
 
         tp_group = self.tp_group
 
@@ -988,9 +986,9 @@ class Executor:
                 )
                 else 0
             )
-            flag = torch.tensor([has_tensor], dtype=torch.int32, device=self.local_rank)
+            flag = torch.tensor([has_tensor], dtype=torch.int32, device=self.device)
         else:
-            flag = torch.zeros(1, dtype=torch.int32, device=self.local_rank)
+            flag = torch.zeros(1, dtype=torch.int32, device=self.device)
 
         torch.distributed.broadcast(
             flag, src=tp_group.rank_list[0], group=tp_group.gpu_group
@@ -1004,13 +1002,13 @@ class Executor:
                 tensor = torch.stack(tensor)
             else:
                 tensor = torch.cat(tensor, dim=0)
-            tensor = tensor.to(dtype=dtype).to(self.local_rank)
+            tensor = tensor.to(dtype=dtype).to(self.device)
             shape_tensor = torch.tensor(
-                tensor.shape, dtype=torch.int64, device=self.local_rank
+                tensor.shape, dtype=torch.int64, device=self.device
             )
         else:
             shape_tensor = torch.zeros(
-                expected_ndim, dtype=torch.int64, device=self.local_rank
+                expected_ndim, dtype=torch.int64, device=self.device
             )
 
         torch.distributed.broadcast(
@@ -1019,7 +1017,7 @@ class Executor:
 
         if tp_group.rank_in_group != 0:
             tensor = torch.empty(
-                tuple(shape_tensor.tolist()), dtype=dtype, device=self.local_rank
+                tuple(shape_tensor.tolist()), dtype=dtype, device=self.device
             )
 
         torch.distributed.broadcast(
@@ -1178,12 +1176,10 @@ class Executor:
                 if tasks.has_outputs[i]:
                     output_token_offsets.append(cnt - 1)
             return torch.tensor(
-                output_token_offsets, dtype=torch.int32, device=self.local_rank
+                output_token_offsets, dtype=torch.int32, device=self.device
             )
         else:
-            return torch.arange(
-                tasks.num_tasks, dtype=torch.int32, device=self.local_rank
-            )
+            return torch.arange(tasks.num_tasks, dtype=torch.int32, device=self.device)
 
     def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         is_empty_step = tasks.num_tasks == 0
@@ -1211,14 +1207,14 @@ class Executor:
             ):  # check if num_toekns needs to be validated
                 payload = (
                     torch.from_numpy(np.concatenate(tasks.tokens))
-                    .to(self.local_rank)
+                    .to(self.device)
                     .to(torch.int64)
                 )
             else:
                 payload = torch.empty(
                     self.get_payload_shape(num_tokens),
                     dtype=self.get_payload_dtype(),
-                    device=self.local_rank,
+                    device=self.device,
                 )
 
             # payload recv
@@ -1286,7 +1282,7 @@ class Executor:
         - Does NOT send/recv hidden/logits across pipeline stages
         """
         # 1) propagate tasks across TP
-        tensor_dispatcher = TensorDispatcher()
+        tensor_dispatcher = TensorDispatcher(self.device)
         payload_type, tasks = tensor_dispatcher.dispatch_metadata(tasks)
 
         # 2) prepare cache
@@ -1313,14 +1309,14 @@ class Executor:
         if is_tp_main_rank and num_tokens > 0:
             payload = (
                 torch.from_numpy(np.concatenate(tasks.tokens))
-                .to(self.local_rank)
+                .to(self.device)
                 .to(torch.int64)
             )
         else:
             payload = torch.empty(
                 self.get_payload_shape(num_tokens),
                 dtype=self.get_payload_dtype(),
-                device=self.local_rank,
+                device=self.device,
             )
 
         # 4) broadcast payload to all TP ranks
@@ -1394,18 +1390,16 @@ class Executor:
         tp_group = get_tp_group()
         is_tp_main_rank = tp_group.global_rank == tp_group.rank_list[0]
         if is_tp_main_rank and num_tokens > 0:
-            payload = torch.tensor(
-                next_tokens, device=self.local_rank, dtype=torch.int64
-            )
+            payload = torch.tensor(next_tokens, device=self.device, dtype=torch.int64)
         else:
             payload = torch.empty(
                 self.get_payload_shape(num_tokens),
                 dtype=self.get_payload_dtype(),
-                device=self.local_rank,
+                device=self.device,
             )
 
         # 3) broadcast payload to all TP ranks
-        tensor_dispatcher = TensorDispatcher()
+        tensor_dispatcher = TensorDispatcher(self.device)
         payload = tensor_dispatcher.recv_payload(payload)
 
         # 4) run decode and ensure shape [B, vocab]
@@ -1453,13 +1447,13 @@ class Executor:
                 payload = torch.empty(
                     self.get_payload_shape(num_tokens),
                     dtype=self.get_payload_dtype(),
-                    device=self.local_rank,
+                    device=self.device,
                 )
                 if self.mtp_size > 1:
                     payload_lhs = torch.empty(
                         [num_tokens, self.dim_],
                         dtype=torch.get_default_dtype(),
-                        device=self.local_rank,
+                        device=self.device,
                     )
 
             # payload recv
@@ -1473,16 +1467,12 @@ class Executor:
 
         else:
             if self.rank == 0 or self.dp_size > 1 and self.dp_dispatcher is not None:
-                payload = torch.tensor(
-                    [0],
-                    device=self.local_rank,
-                    dtype=torch.long,
-                )
+                payload = torch.tensor([0], device=self.device, dtype=torch.long)
             else:
                 payload = torch.empty(
                     self.get_payload_shape(1),
                     dtype=self.get_payload_dtype(),
-                    device=self.local_rank,
+                    device=self.device,
                 )
 
             for dispatcher in self.task_dispatchers:

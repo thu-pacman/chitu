@@ -213,11 +213,10 @@ class Transformer(nn.Module):
         self.attn_backend = attn_backend
         self.op_impl = op_impl
         self.rank = torch.distributed.get_rank()
-        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        if get_global_args().infer.op_impl == "cpu":
-            self.local_rank = "cpu"
         self.world_size = torch.distributed.get_world_size()
-        self.device = torch.device(self.local_rank)
+        self.device = torch.device(
+            "cpu" if get_global_args().infer.op_impl == "cpu" else "cuda"
+        )
 
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
@@ -292,13 +291,13 @@ class Transformer(nn.Module):
         self.dummy_input = torch.empty(
             dummy_input_shape,
             dtype=torch.get_default_dtype(),
-            device=self.local_rank,
+            device=self.device,
         )
 
         self.graph_dummy_output = torch.empty(
             [1],
             dtype=torch.get_default_dtype(),
-            device=self.local_rank,
+            device=self.device,
         )
 
     def _get_tensor_column_parallel_layer_names(self) -> list[str]:
