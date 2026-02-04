@@ -14,6 +14,7 @@ from chitu.backend import Backend
 from chitu.tokenizer import Tokenizer, TokenizerHF
 from chitu.serve.event_loop import get_server_event_loop
 from chitu.tool_call import ChoiceDelta
+from chitu.reasoning.utils import get_initial_reasoning_state
 
 logger = getLogger(__name__)
 
@@ -38,16 +39,15 @@ class AsyncDataStream:
         self.top_tokens_list = []
         self.enable_reasoning = enable_reasoning
 
-        self.is_reasoning = False
+        self.is_reasoning = get_initial_reasoning_state() if enable_reasoning else False
         self.reasoning_len = 0
         if enable_reasoning:
             if isinstance(self.tokenizer, (Tokenizer, TokenizerHF)):
-                try:
-                    self.rs_token_id, self.re_token_id = self.tokenizer.encode(
-                        "<think></think>", bos=False, eos=False
-                    )
-                except ValueError:
-                    logger.info(
+                encoded = self.tokenizer.encode("<think></think>", bos=False, eos=False)
+                if len(encoded) == 2:
+                    self.rs_token_id, self.re_token_id = encoded
+                else:
+                    logger.info_once(
                         "Cannot obtain reasoning token ids from tokenizer. "
                         "Falling back to using config."
                     )
@@ -107,6 +107,8 @@ class AsyncDataStream:
             self.reasoning_len = len(self.seqs) + 1
 
     def is_reasoning_content(self):
+        if not self.enable_reasoning:
+            return False
         return self.is_reasoning or self.index - 1 < self.reasoning_len
 
     def notify_server_from_server_thread(self):

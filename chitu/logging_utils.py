@@ -2,12 +2,14 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import inspect
 import logging
-import os
-from typing import Any, Dict
+from typing import Any, Dict, Set, Tuple
 from contextvars import ContextVar
 from contextlib import contextmanager
 from logging.config import dictConfig
+
+from chitu.utils import get_chitu_env
 
 try:
     import torch.distributed as dist
@@ -19,7 +21,47 @@ except ImportError:
 
 _log_context: ContextVar[Dict[str, Any]] = ContextVar("chitu_log_context", default={})
 
-CHITU_LOGGING_LEVEL = os.getenv("CHITU_LOGGING_LEVEL", "INFO")
+_logged_once_messages: Set[Tuple[str, int, str]] = set()  # (filename, lineno, msg)
+
+
+class ChituLogger(logging.Logger):
+    """Custom logger with *_once methods that log a message only the first time."""
+
+    def debug_once(self, msg: str, *args, **kwargs):
+        f = inspect.currentframe().f_back
+        if (f.f_code.co_filename, f.f_lineno, msg) not in _logged_once_messages:
+            _logged_once_messages.add((f.f_code.co_filename, f.f_lineno, msg))
+            self.debug(msg, *args, stacklevel=2, **kwargs)
+
+    def info_once(self, msg: str, *args, **kwargs):
+        f = inspect.currentframe().f_back
+        if (f.f_code.co_filename, f.f_lineno, msg) not in _logged_once_messages:
+            _logged_once_messages.add((f.f_code.co_filename, f.f_lineno, msg))
+            self.info(msg, *args, stacklevel=2, **kwargs)
+
+    def warning_once(self, msg: str, *args, **kwargs):
+        f = inspect.currentframe().f_back
+        if (f.f_code.co_filename, f.f_lineno, msg) not in _logged_once_messages:
+            _logged_once_messages.add((f.f_code.co_filename, f.f_lineno, msg))
+            self.warning(msg, *args, stacklevel=2, **kwargs)
+
+    def error_once(self, msg: str, *args, **kwargs):
+        f = inspect.currentframe().f_back
+        if (f.f_code.co_filename, f.f_lineno, msg) not in _logged_once_messages:
+            _logged_once_messages.add((f.f_code.co_filename, f.f_lineno, msg))
+            self.error(msg, *args, stacklevel=2, **kwargs)
+
+    def critical_once(self, msg: str, *args, **kwargs):
+        f = inspect.currentframe().f_back
+        if (f.f_code.co_filename, f.f_lineno, msg) not in _logged_once_messages:
+            _logged_once_messages.add((f.f_code.co_filename, f.f_lineno, msg))
+            self.critical(msg, *args, stacklevel=2, **kwargs)
+
+
+# Set ChituLogger as the default logger class
+logging.setLoggerClass(ChituLogger)
+
+CHITU_LOGGING_LEVEL = get_chitu_env("CHITU_LOGGING_LEVEL", "INFO")
 
 _FORMAT = (
     f"%(levelname)s %(asctime)s "

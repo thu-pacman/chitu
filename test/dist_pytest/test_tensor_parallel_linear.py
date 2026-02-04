@@ -46,7 +46,7 @@ def test_column_parallel_linear(
     if tp_group_size < torch.distributed.get_world_size():
         # Dummy sub-group for non-participating ranks
         rank_lists += [list(range(tp_group_size, torch.distributed.get_world_size()))]
-    tp_group = CommGroup(rank_lists, rank, local_rank)
+    tp_group = CommGroup(rank_lists, rank)
 
     if rank < tp_group_size:
         parallel_linear = ColumnParallelLinear(
@@ -109,7 +109,7 @@ def test_row_parallel_linear(
     if tp_group_size < torch.distributed.get_world_size():
         # Dummy sub-group for non-participating ranks
         rank_lists += [list(range(tp_group_size, torch.distributed.get_world_size()))]
-    tp_group = CommGroup(rank_lists, rank, local_rank)
+    tp_group = CommGroup(rank_lists, rank)
 
     if rank < tp_group_size:
         parallel_linear = RowParallelLinear(

@@ -393,11 +393,8 @@ class PDScheduler(Scheduler):
 
         tokens = task.prefix_tokens
         req_id = task.req.request_id
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
         Backend.cache_manager.prepare_cache_prefill([req_id], [len(tokens)])
-        payload_prefill = torch.tensor(
-            tokens, device=torch.device(local_rank), dtype=torch.int64
-        )
+        payload_prefill = torch.tensor(tokens, device="cuda", dtype=torch.int64)
         output_token_offsets = torch.tensor(
             [payload_prefill.size(0) - 1],
             dtype=torch.int32,

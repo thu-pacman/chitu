@@ -30,7 +30,7 @@ from chitu.chitu_main import (
 )
 from chitu.global_vars import get_timers
 from chitu.schemas import ServeConfig
-from chitu.utils import get_config_dir_path, try_get_profiler
+from chitu.utils import get_config_dir_path, try_get_profiler, get_chitu_env
 
 logger = getLogger(__name__)
 
@@ -237,8 +237,12 @@ def adjust_benchmark_args(args):
 
 @hydra.main(
     version_base=None,
-    config_path=os.getenv("CONFIG_PATH", get_config_dir_path()),
-    config_name=os.getenv("CONFIG_NAME", "serve_config"),
+    config_path=get_chitu_env(
+        "CHITU_CONFIG_PATH", get_config_dir_path(), legacy_names=["CONFIG_PATH"]
+    ),
+    config_name=get_chitu_env(
+        "CHITU_CONFIG_NAME", "serve_config", legacy_names=["CONFIG_NAME"]
+    ),
 )
 def main(args: ServeConfig):
     logger.setLevel(logging.DEBUG)

@@ -19,6 +19,7 @@ import os
 import sys
 import time
 import json
+import random
 import argparse
 import traceback
 import numpy as np
@@ -38,7 +39,7 @@ except:
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 RESULT_FILE = "benchmark_results.jsonl"
 CI_PIPELINE_SOURCE = os.environ.get("CI_PIPELINE_SOURCE", "web")
-TIMEOUT = 300 if CI_PIPELINE_SOURCE == "schedule" else 1000
+TIMEOUT = 300 if CI_PIPELINE_SOURCE == "schedule" else 10000
 
 
 @dataclass
@@ -191,10 +192,6 @@ class BenchmarkServing:
 
             self.tokenize = self.remote_tokenize
             self.detokenize = self.remote_detokenize
-
-        self.example = "This is a test message for benchmark serving "
-        if self.config.dataset == "repeat":
-            self.single_len = len(self.tokenize(self.example))
 
         if self.config.dataset == "sharegpt":
             assert (
@@ -349,16 +346,25 @@ class BenchmarkServing:
 
     # TODO: support hf dataset
     def _get_test_messages(self):
-        if self.config.dataset == "repeat":
-            """Get test messages based on configuration."""
-            # Generate message based on input length
-            repeat = self.config.input_length // self.single_len
-            remain = self.config.input_length % self.single_len
-
-            test_content = self.example * repeat
-            for tok in self.example.strip().split()[:remain]:
-                test_content += tok + " "
-
+        if self.config.dataset == "random":
+            """
+            Get test messages based on configuration.
+            Generate message based on input length,
+            ensure decoded-then-encoded prompt length matches the target token length.
+            For example, for GPT2Tokenizer:
+            [6880, 6881] -> ['Ġcalls', 'here'] ->
+            [1650, 939, 486] -> ['Ġcall', 'sh', 'ere']
+            """
+            test_content = self.detokenize(
+                self.tokenize(
+                    self.detokenize(
+                        [
+                            random.randint(100, 10000)
+                            for _ in range(self.config.input_length)
+                        ]
+                    )
+                )[: self.config.input_length]
+            )
             return [{"role": "user", "content": test_content.strip()}]
         elif self.config.dataset == "sharegpt":
             content = self.dataset.sample_single_content(
@@ -366,7 +372,7 @@ class BenchmarkServing:
             )
             return [{"role": "user", "content": content}]
         else:
-            raise Exception("args.dataset only supports repeat or sharegpt")
+            raise Exception("args.dataset only supports random or sharegpt")
 
     async def run_async(self):
         tasks: list[asyncio.Task] = []
@@ -627,7 +633,7 @@ def main():
     parser.add_argument("--metric-percentiles", type=str, default="99")
     parser.add_argument("--percentile-metrics", type=str, default="ttft,tpot,itl")
     parser.add_argument("--append-result", action="store_true")
-    parser.add_argument("--dataset", default="repeat", choices=["repeat", "sharegpt"])
+    parser.add_argument("--dataset", default="random", choices=["random", "sharegpt"])
     parser.add_argument("--dataset-path")
     parser.add_argument("--tokenizer-path")
     parser.add_argument("--request-interval", type=float, default=0.0)

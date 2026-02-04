@@ -50,6 +50,8 @@ docker build \
     -f "${dockerfile}" \
     --build-arg optional_deps="${optional_deps}" \
     --build-arg enable_cython="${enable_cython}" \
+    --secret id=tos_id,env=TOS_ID \
+    --secret id=tos_key,env=TOS_KEY \
     --build-arg enable_test="${enable_test}" \
     -t ${image_name}:${image_version}-stage0 \
     .

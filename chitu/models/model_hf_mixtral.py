@@ -155,13 +155,14 @@ class TransformerHFMixtral(TransformerHFLlama):
             "gate",  # MoE gate
         ]
 
-    def load_state_dict_parallel(
+    def preprocess_state_dict_parallel(
         self,
         state_dict: dict[str, Any],
-        *args,
+        *,
         skip_preprocess: bool = False,
-        **kwargs,
-    ):
+        is_layerwise: bool = False,
+        replace: bool = True,
+    ) -> dict[str, Any]:
         if not skip_preprocess:
 
             def map_mixtral_key(k):
@@ -173,6 +174,9 @@ class TransformerHFMixtral(TransformerHFLlama):
 
             state_dict = {map_mixtral_key(k): v for k, v in state_dict.items()}
 
-        super().load_state_dict_parallel(
-            state_dict, *args, skip_preprocess=skip_preprocess, **kwargs
+        return super().preprocess_state_dict_parallel(
+            state_dict,
+            skip_preprocess=skip_preprocess,
+            is_layerwise=is_layerwise,
+            replace=replace,
         )

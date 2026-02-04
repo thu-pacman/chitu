@@ -8,8 +8,6 @@ from enum import Enum
 class TaskType(Enum):
     Prefill = 1
     Decode = 2
-    EmptyPrefill = 3
-    EmptyDecode = 4
     Special = -1
 
 

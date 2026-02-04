@@ -5,6 +5,7 @@
 from typing import Optional
 from logging import getLogger
 
+import chitu.logging_utils
 import torch
 
 from chitu.utils import (
@@ -125,24 +126,21 @@ def silu_and_mul(
             return silu_and_mul_triton(x)
     elif impl == "torch_npu":
         if expert_n_tokens is not None:
-            # TODO: Use warning_once if we have implemented it
-            logger.warning(
+            logger.warning_once(
                 "silu_and_mul(impl=torch_npu) does not support expert_n_tokens, "
                 "falling back to computing the whole tensor"
             )
         return torch_npu.npu_swiglu(x)
     elif impl == "cpu":
         if expert_n_tokens is not None:
-            # TODO: Use warning_once if we have implemented it
-            logger.warning(
+            logger.warning_once(
                 "silu_and_mul(impl=cpu) does not support expert_n_tokens, "
                 "falling back to computing the whole tensor"
             )
         return silu_and_mul_cpu(x)
     elif impl == "torch":
         if expert_n_tokens is not None:
-            # TODO: Use warning_once if we have implemented it
-            logger.warning(
+            logger.warning_once(
                 "silu_and_mul(impl=torch) does not support expert_n_tokens, "
                 "falling back to computing the whole tensor"
             )

@@ -176,6 +176,7 @@ TORCH_CUDA_ARCH_LIST=9.0 pip install --no-build-isolation ".[flash_mla]"
 - `muxi_layout_kernels`: 用于支持在沐曦 GPU 上使用 `infer.op_impl=muxi_custom_kernel` 模式，在小 batch 场景性能更优。
 - `scipy`: 用于支持 DeepSeek-V3.2-Exp 中的 indexer 的可选依赖。
 - `fast_hadamard_transform`: 用于支持 DeepSeek-V3.2-Exp 中的 indexer 的可选依赖。
+- `numa`: 用于支持 NUMA 绑定。
 
 如果需要用于开发，建议加上 `-e` 选项启用 editable install，如
 
@@ -214,7 +215,7 @@ TORCH_CUDA_ARCH_LIST=9.0 CHITU_WITH_CYTHON=1 pip install --no-build-isolation .
 
 **如果您与他人共享测试环境，请合理使用作业管理工具进行资源分配，避免资源冲突。**
 
-默认的配置文件为 `chitu/config/serve_config.yaml` 。您可以使用命令行参数覆盖相关的参数设置（参考 [Hydra 文档](https://hydra.cc/docs/advanced/override_grammar/basic/)），也可以使用环境变量 `CONFIG_NAME=<your_config_file.yaml>` 另行指定配置文件。需要提醒的是，`chitu/config/models/` 目录中的 yaml 文件并非完整的配置文件，切勿直接将 `CONFIG_NAME` 指向它们。
+默认的配置文件为 [`chitu/config/serve_config.yaml`](../../chitu/config/serve_config.yaml) 。此文件中包含了赤兔所使用的所有运行时配置项的定义。您可以使用命令行参数覆盖相关的参数设置（参考 [Hydra 文档](https://hydra.cc/docs/advanced/override_grammar/basic/)），也可以使用环境变量 `CHITU_CONFIG_PATH=<path/to/config/directory>` 及 `CHITU_CONFIG_NAME=<your_config_file.yaml>` 另行指定配置文件。需要提醒的是，`chitu/config/models/` 目录中的 yaml 文件并非完整的配置文件，切勿直接将 `CHITU_CONFIG_NAME` 指向它们。新指定的配置文件目录应该包含所有直接或间接被使用的配置文件，包括模型配置文件。
 
 ### 示例：运行 DeepSeek-R1
 
@@ -293,7 +294,7 @@ TP+PP 混合的样例参数：
 torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=8 models=DeepSeek-R1 models.ckpt_dir=/data/DeepSeek-R1
 ```
 
-关于多实例部署，请参阅[此文档](../../chitu\distributed\pd_disaggregation/README.md)。
+关于多实例部署，请参阅[此文档](../../chitu/distributed/pd_disaggregation/README.md)。
 
 对于 PP，还可以进一步控制 micro batch：
 
@@ -453,7 +454,7 @@ torchrun --nproc_per_node 1 test/single_req_test.py \
 首先，运行此脚本来预处理并保存模型：
 
 ```bash
-PREPROCESS_AND_SAVE_DIR=<target_directory> [CONFIG_NAME=<config_file>] torchrun <torchrun_arguments> script/preprocess_and_save.py [your_additional_overrides_to_config]
+PREPROCESS_AND_SAVE_DIR=<target_directory> torchrun <torchrun_arguments> script/preprocess_and_save.py [your_additional_overrides_to_config]
 ```
 
 接下来，在正常运行中覆盖模型路径：
@@ -467,13 +468,6 @@ TP 分区的示例用法：
 ```bash
 PREPROCESS_AND_SAVE_DIR=<target_directory> torchrun <torchrun_arguments> script/preprocess_and_save.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> infer.tp_size=2
 torchrun <torchrun_arguments> test/single_req_test.py infer.tp_size=2 models.ckpt_dir=<target_directory> models.tokenizer_path=<target_directory> skip_preprocess=True
-```
-
-量化的示例用法（目前与一般用法不同）：
-
-```bash
-PREPROCESS_AND_SAVE_DIR=<target_directory> [CONFIG_NAME=<config_file>] torchrun <torchrun_arguments> script/preprocess_and_save.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> quant_on_load=True
-[CONFIG_NAME=<config_file>] torchrun <torchrun_arguments> test/single_req_test.py models=<模型名称> models.ckpt_dir=<路径/到/检查点> quant_ckpt_dir=<目标目录>
 ```
 
 ### 使用 CPU+GPU 异构混合推理
@@ -634,3 +628,6 @@ python benchmarks/benchmark_serving.py \
 | -------------------------- | ---------------------------- | ------------------------------------------------------ |
 | `CHITU_LOGGING_LEVEL`      | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` | 日志级别。                          |
 | `CHITU_DEBUG`              | `0`, `1`                     | 调试模式。当前仅用于启用一些计时器。                   |
+| `CHITU_CONFIG_PATH`        | 指向配置文件目录的路径       | 覆盖默认的配置文件目录。                               |
+| `CHITU_CONFIG_NAME`        | 不含 .yml 后缀的配置文件名   | 覆盖默认的配置文件名。                                 |
+| `CHITU_PREPROCESS_AND_SAVE_DIR` | 指向目录的路径          | `script/preprocess_and_save.py` 的输出目录。           |

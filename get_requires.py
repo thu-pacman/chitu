@@ -37,6 +37,7 @@ install_requires = [
     "plum-dispatch",
     "netifaces",
     "prometheus-client>=0.19.0",
+    "prometheus-api-client>=0.7.0",
     "xgrammar>=0.1.31",
     "openai",
     "anthropic",
@@ -115,5 +116,6 @@ extras_require = {
         "fast-hadamard-transform @ file://localhost"
         + os.path.join(setup_dir, "third_party/fast-hadamard-transform")
     ],
+    "numa": ["numa"],
     **operators.get_extras_require(),
 }

@@ -731,3 +731,15 @@ class TransformerQwen2VL(TransformerHFLlama):
     @override
     def _get_tensor_row_parallel_layer_names(self) -> list[str]:
         return ["down_proj", "o_proj"]
+
+    @override
+    def _get_non_layer_prefix_mappings(self) -> list[tuple[str, str]]:
+        prefix_mappings = []
+        if self.pp_stage == 0:
+            prefix_mappings.extend([("model.embed_tokens.", "embed_tokens.")])
+        if self.pp_stage == self.pp_end_stage:
+            prefix_mappings.extend([("model.norm.", "norm.")])
+            if not getattr(self.params, "tie_word_embeddings", False):
+                prefix_mappings.extend([("lm_head.", "lm_head.")])
+        prefix_mappings.extend([("visual.", "visual.")])
+        return prefix_mappings

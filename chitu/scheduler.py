@@ -547,9 +547,9 @@ class Scheduler:
                 sgroup_id = TaskPool.pool[task_id].sched_group_id
                 if task_id in self.sgroup_waiting_tasks[sgroup_id]:
                     self.sgroup_waiting_tasks[sgroup_id].remove(task_id)
-                if not isinstance(self, SkewScheduler):
+                if not type(self) == SkewScheduler:
                     TaskPool.pool[task_id].sched_group_id = None
-            if isinstance(self, SkewScheduler) and not TaskPool.pool[task_id].running():
+            if type(self) == SkewScheduler and not TaskPool.pool[task_id].running():
                 TaskPool.pool[task_id].sched_group_id = None
         for task_id in task_ids:
             task = TaskPool.pool[task_id]

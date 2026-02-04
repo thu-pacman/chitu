@@ -535,7 +535,10 @@ class Task(ConstraintDecodeTask):
         if (
             self.stop_with_eos
             and self.num_new_tokens > 0
-            and self.next_token in Backend.tokenizer.stop_tokens
+            and (
+                self.next_token in Backend.tokenizer.stop_tokens
+                or (set(self.mtp_token_list) & Backend.tokenizer.stop_tokens)
+            )
         ):
             self.req.finish_reason = "stop"
             self._decode_status = TaskDecodeType.Stopped
@@ -907,28 +910,20 @@ class TaskPool:
 class SerializedPackedTasksPayloadType(Enum):
     Prefill = 1
     Decode = 2
-    EmptyPrefill = 3
-    EmptyDecode = 4
-    TerminateBackend = 5
-    EndTask = 6
-    Remove = 7
+    TerminateBackend = 3
+    EndTask = 4
+    Remove = 5
     NoneType = -1
 
 
 def is_empty_payload(payload_type: SerializedPackedTasksPayloadType):
-    return payload_type in [
-        SerializedPackedTasksPayloadType.TerminateBackend,
-        SerializedPackedTasksPayloadType.EmptyPrefill,
-        SerializedPackedTasksPayloadType.EmptyDecode,
-    ]
+    return payload_type == SerializedPackedTasksPayloadType.TerminateBackend
 
 
 def is_normal_payload(payload_type: SerializedPackedTasksPayloadType):
     return payload_type in [
         SerializedPackedTasksPayloadType.Prefill,
         SerializedPackedTasksPayloadType.Decode,
-        SerializedPackedTasksPayloadType.EmptyPrefill,
-        SerializedPackedTasksPayloadType.EmptyDecode,
     ]
 
 
@@ -982,8 +977,6 @@ class PackedTasksBase:
             self.task_ids = task_ids
             self.req_ids = req_ids
             self.has_model_run = [True] * num_tasks
-            if num_tasks == 0:
-                self.task_type = TaskType.EmptyDecode
 
 
 class PackedTasks(PackedTasksBase):
@@ -991,7 +984,7 @@ class PackedTasks(PackedTasksBase):
         self,
         task_ids: list[str],
         rank="cuda",
-        empty_task_type: Optional[TaskType] = None,
+        task_type: Optional[TaskType] = None,
         tasks: Optional[list[Task]] = None,
     ):
         super().__init__()
@@ -1016,14 +1009,10 @@ class PackedTasks(PackedTasksBase):
         if not task_ids:  # empty PackedTasks, only dp/dp+pp use this method
             self._test_flag = False  # dp no single_req_compare
             self.task_type = (
-                empty_task_type
-                if empty_task_type is not None
+                task_type
+                if task_type is not None
                 else DPTaskCollector.get_current_task_type()
             )
-            if self.task_type == TaskType.Prefill:
-                self.task_type = TaskType.EmptyPrefill
-            elif self.task_type == TaskType.Decode:
-                self.task_type = TaskType.EmptyDecode
             self.payload_type = SerializedPackedTasksPayloadType(self.task_type.value)
             return
 
@@ -1167,13 +1156,8 @@ class PackedTasks(PackedTasksBase):
             [task.params.frequency_penalty for task in self.output_tasks],
             dtype=torch.float32,
         ).to(device=self.rank)
-        if self.task_type in (TaskType.Decode, TaskType.EmptyDecode):
+        if self.task_type == TaskType.Decode:
             self.num_tokens = self.num_tasks
-        if not self.tasks:
-            if self.task_type == TaskType.Prefill:
-                self.task_type = TaskType.EmptyPrefill
-            if self.task_type == TaskType.Decode:
-                self.task_type = TaskType.EmptyDecode
 
     def get_result_len(self) -> int:
         result_length_per_task = (
@@ -1338,7 +1322,7 @@ def deserialize_prefill_tasks(data: bytes) -> PackedTasks:
     if len(task_ids) > 0:
         return PackedTasks(task_ids)
     else:
-        return PackedTasks([], empty_task_type=TaskType.EmptyPrefill)
+        return PackedTasks([], task_type=TaskType.Prefill)
 
 
 @dataclass
@@ -1369,7 +1353,7 @@ class TaskCollector:
     @staticmethod
     def get_generated_tasks() -> Optional[PackedTasks]:
         if len(TaskCollector._generated_tasks) == 0:
-            return PackedTasks([], empty_task_type=TaskType.Special)
+            return PackedTasks([], task_type=TaskType.Special)
         return TaskCollector._generated_tasks[0]
 
     @staticmethod

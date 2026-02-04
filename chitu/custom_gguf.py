@@ -366,11 +366,10 @@ class GGUFLoader:
         return values
 
     def load_gguf_tensor(
-        self, name: str, device: str = "cpu", target_dtype=None
+        self, name: str, device: torch.device | str = "cpu", target_dtype=None
     ) -> torch.Tensor:
+        device = torch.device(device)
         t = self.tensor_info[name]
-        # if device.lower() == "cpu":
-        #     print(f"loading {name} with CPU")
         if target_dtype is None:
             target_dtype = torch.get_default_dtype()
 
@@ -397,7 +396,7 @@ class GGUFLoader:
             for i in range((num_blocks + blocks_per_iter - 1) // blocks_per_iter):
                 blocks_begin = i * blocks_per_iter
                 blocks_end = min(blocks_begin + blocks_per_iter, num_blocks)
-                if "cuda" in device.lower():
+                if device.type == "cuda":
                     cur_values = GGML_DEQUANTIZE_GPU[ggml_name](
                         data[blocks_begin * block_size : blocks_end * block_size],
                         device,
@@ -414,7 +413,7 @@ class GGUFLoader:
                     cur_values = cur_values.view(torch.bfloat16)
                 values[blocks_begin:blocks_end] = cur_values
         else:
-            if "cuda" in device.lower():
+            if device.type == "cuda":
                 values = GGML_DEQUANTIZE_GPU[ggml_name](data, device)
             else:
                 values = GGML_DEQUANTIZE[ggml_name](data)
@@ -454,7 +453,7 @@ class GGUFLoader:
         data,
         shape,
         ggml_type,
-        device: str = "cpu",
+        device: torch.device | str = "cpu",
         target_dtype=None,
         rank=0,
         world_size=8,
@@ -596,7 +595,7 @@ def dequantize_q2_k(data):
 
 
 def dequantize_q2_k_gpu(
-    data, device: str = "cuda", target_dtype=torch.get_default_dtype()
+    data, device: torch.device | str = "cuda", target_dtype=torch.get_default_dtype()
 ):
     block_size = GGML_BLOCK_SIZES["Q2_K"]
     ele_per_blk = GGML_ELEMENTS_PER_BLOCK["Q2_K"]
@@ -669,7 +668,7 @@ def dequantize_q3_k(data):
 
 
 def dequantize_q3_k_gpu(
-    data, device: str = "cuda", target_dtype=torch.get_default_dtype()
+    data, device: torch.device | str = "cuda", target_dtype=torch.get_default_dtype()
 ):
     block_size = GGML_BLOCK_SIZES["Q3_K"]
     ele_per_blk = GGML_ELEMENTS_PER_BLOCK["Q3_K"]
@@ -717,7 +716,7 @@ def dequantize_q4_k(data):
 
 
 def dequantize_q4_k_gpu(
-    data, device: str = "cuda", target_dtype=torch.get_default_dtype()
+    data, device: torch.device | str = "cuda", target_dtype=torch.get_default_dtype()
 ):
     block_size = GGML_BLOCK_SIZES["Q4_K"]
     ele_per_blk = GGML_ELEMENTS_PER_BLOCK["Q4_K"]
@@ -798,7 +797,7 @@ def dequantize_q5_k(data):
 
 
 def dequantize_q5_k_gpu(
-    data, device: str = "cuda", target_dtype=torch.get_default_dtype()
+    data, device: torch.device | str = "cuda", target_dtype=torch.get_default_dtype()
 ):
     block_size = GGML_BLOCK_SIZES["Q5_K"]
     ele_per_blk = GGML_ELEMENTS_PER_BLOCK["Q5_K"]
@@ -872,7 +871,9 @@ def dequantize_q6_k(data):
 
 # @torch.jit.script
 def dequantize_q6_k_gpu(
-    data: np.ndarray, device: str = "cuda", target_dtype=torch.get_default_dtype()
+    data: np.ndarray,
+    device: torch.device | str = "cuda",
+    target_dtype=torch.get_default_dtype(),
 ):
     block_size = GGML_BLOCK_SIZES["Q6_K"]
     ele_per_blk = GGML_ELEMENTS_PER_BLOCK["Q6_K"]
@@ -936,7 +937,9 @@ def dequantize_iq4_xs(data):
 
 
 def dequantize_iq4_xs_gpu(
-    data: np.ndarray, device: str = "cuda", target_dtype=torch.get_default_dtype()
+    data: np.ndarray,
+    device: torch.device | str = "cuda",
+    target_dtype=torch.get_default_dtype(),
 ):
     block_size = GGML_BLOCK_SIZES["IQ4_XS"]
     ele_per_blk = GGML_ELEMENTS_PER_BLOCK["IQ4_XS"]
@@ -976,7 +979,7 @@ def dequantize_q4_0(data):
 
 
 def dequantize_q4_0_gpu(
-    data, device: str = "cuda", target_dtype=torch.get_default_dtype()
+    data, device: torch.device | str = "cuda", target_dtype=torch.get_default_dtype()
 ):
     raise NotImplementedError()
 
@@ -1013,7 +1016,7 @@ def dequantize_q5_0(data):
 
 
 def dequantize_q5_0_gpu(
-    data, device: str = "cuda", target_dtype=torch.get_default_dtype()
+    data, device: torch.device | str = "cuda", target_dtype=torch.get_default_dtype()
 ):
     raise NotImplementedError()
 
@@ -1033,7 +1036,7 @@ def dequantize_q8_0(data):
 
 
 def dequantize_q8_0_gpu(
-    data, device: str = "cuda", target_dtype=torch.get_default_dtype()
+    data, device: torch.device | str = "cuda", target_dtype=torch.get_default_dtype()
 ):
     # C struct definition
     # https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.h#L43
