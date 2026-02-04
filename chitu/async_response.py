@@ -14,6 +14,7 @@ from chitu.backend import Backend
 from chitu.tokenizer import Tokenizer, TokenizerHF
 from chitu.serve.event_loop import get_server_event_loop
 from chitu.tool_call import ChoiceDelta
+from chitu.reasoning.utils import get_initial_reasoning_state
 
 logger = getLogger(__name__)
 
@@ -37,10 +38,8 @@ class AsyncDataStream:
         self.top_logprobs_list = []
         self.top_tokens_list = []
         self.enable_reasoning = enable_reasoning
-        self.is_reasoning = False
-        self.reasoning_len = 0
 
-        self.is_reasoning = False
+        self.is_reasoning = get_initial_reasoning_state() if enable_reasoning else False
         self.reasoning_len = 0
         if enable_reasoning:
             if isinstance(self.tokenizer, (Tokenizer, TokenizerHF)):
