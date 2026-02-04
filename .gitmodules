@@ -31,3 +31,17 @@
 [submodule "third_party/fast-hadamard-transform"]
     path = third_party/fast-hadamard-transform
     url = https://github.com/Dao-AILab/fast-hadamard-transform.git
+[submodule "exp/dataset/data_civitai/civitai_database"]
+	path = exp/dataset/data_civitai/civitai_database
+	url = git@github.com:zhengly123/civitai_database.git
+[submodule "third_party/torchperf"]
+	path = third_party/torchperf
+	url = git@github.com:zhengly123/torchperf.git
+[submodule "third_party/uniserve-stable-fast"]
+	path = third_party/uniserve-stable-fast
+	url = git@github.com:zhengly123/uniserve-stable-fast.git
+[submodule "third_party/HunyuanImage-2.1"]
+	path = third_party/HunyuanImage-2.1
+	url = git@github.com:shch-y/HunyuanImage-2.1.git
+
+

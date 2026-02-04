@@ -1,0 +1,8 @@
+wheel==0.45.1
+setuptools==65.5.0
+opencv-python
+pandas
+transformers
+diffusers
+xformers==v0.0.33.post2
+sentencepiece

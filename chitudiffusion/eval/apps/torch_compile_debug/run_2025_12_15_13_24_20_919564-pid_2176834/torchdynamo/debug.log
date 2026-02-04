@@ -1,0 +1,4 @@
+Step 1: torchdynamo start tracing forward /home/wucz/miniconda3/lib/python3.10/site-packages/diffusers/models/transformers/hunyuan_transformer_2d.py:427
+Step 1: torchdynamo done tracing forward (RETURN_VALUE)
+Step 2: calling compiler function inductor
+Step 2: done compiler function inductor

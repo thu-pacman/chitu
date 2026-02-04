@@ -1,0 +1,16 @@
+Step 1: torchdynamo start tracing wrapper /home/wucz/miniconda3/lib/python3.10/site-packages/transformers/utils/generic.py:912
+Step 1: torchdynamo done tracing wrapper (RETURN_VALUE)
+Step 2: calling compiler function inductor
+Step 2: done compiler function inductor
+Step 1: torchdynamo start tracing forward /home/wucz/miniconda3/lib/python3.10/site-packages/diffusers/models/unets/unet_2d_condition.py:1039
+Step 1: torchdynamo done tracing forward (RETURN_VALUE)
+Step 2: calling compiler function inductor
+Step 2: done compiler function inductor
+Step 1: torchdynamo start tracing forward /home/wucz/miniconda3/lib/python3.10/site-packages/diffusers/models/unets/unet_2d_condition.py:1039
+Step 1: torchdynamo done tracing forward (RETURN_VALUE)
+Step 2: calling compiler function inductor
+Step 2: done compiler function inductor
+Step 1: torchdynamo start tracing wrapper /home/wucz/miniconda3/lib/python3.10/site-packages/diffusers/utils/accelerate_utils.py:43
+Step 1: torchdynamo done tracing wrapper (RETURN_VALUE)
+Step 2: calling compiler function inductor
+Step 2: done compiler function inductor

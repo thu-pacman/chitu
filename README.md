@@ -16,7 +16,7 @@ Chitu「赤兔」是一个专注于效率、灵活性和可用性的高性能大
 * [2025/04/29] 发布 v0.3.0，新增 FP4 在线转 FP8、BF16 的高效算子实现，支持 DeepSeek-R1 671B 的 [FP4 量化版](https://huggingface.co/nvidia/DeepSeek-R1-FP4)。
 * [2025/04/18] 发布 v0.2.2，新增 CPU+GPU 异构混合推理支持，实现单卡推理 DeepSeek-R1 671B。
 * [2025/03/14] 发布 v0.1.0，支持 DeepSeek-R1 671B，提供 FP8 在线转 BF16 的高效算子实现。
-
+* [2026/02/03] #beta 增加chitudiffusion测试，支持Unet-based Diffusion Model推理。
 ## 简介
 
 赤兔定位于「生产级大模型推理引擎」，充分考虑企业 AI 落地从小规模试验到大规模部署的渐进式需求，专注于提供以下重要特性：
@@ -86,5 +86,6 @@ Chitu「赤兔」是一个专注于效率、灵活性和可用性的高性能大
 - [SGLang](https://github.com/sgl-project/sglang)
 - [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)
 - [vLLM](https://github.com/vllm-project/vllm)
+- [stable-fast](https://github.com/chengzeyi/stable-fast)
 
 我们将持续为开源社区贡献更高效、更灵活、更兼容、更稳定的大模型推理部署解决方案。
