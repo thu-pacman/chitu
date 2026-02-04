@@ -175,16 +175,15 @@ def get_cpu_tp_group() -> Optional[torch.distributed.ProcessGroup]:
     return get_global_var("_TP_GROUP").cpu_group
 
 
-def initialize_world_group(rank: int, local_rank: int, world_size: int):
+def initialize_world_group(rank: int, world_size: int):
     global _WORLD_GROUP
     assert _WORLD_GROUP is None
 
-    _WORLD_GROUP = CommGroup([list(range(world_size))], rank, local_rank)
+    _WORLD_GROUP = CommGroup([list(range(world_size))], rank)
 
 
 def initialize_tp_group(
     rank: int,
-    local_rank: int,
     *,
     tp_size: int,
     world_size: int,
@@ -194,7 +193,6 @@ def initialize_tp_group(
     _TP_GROUP = CommGroup(
         get_tp_rank_lists(tp_size=tp_size, world_size=world_size),
         rank,
-        local_rank,
         enable_custom_allreduce=True,
     )
     logger.info(f"tp group: {_TP_GROUP}")
@@ -202,7 +200,6 @@ def initialize_tp_group(
 
 def initialize_pp_group(
     rank: int,
-    local_rank: int,
     *,
     pp_size: int,
     world_size: int,
@@ -211,7 +208,7 @@ def initialize_pp_group(
     assert _PP_GROUP is None
 
     pp_rank_lists = get_pp_rank_lists(pp_size=pp_size, world_size=world_size)
-    _PP_GROUP = CommGroup(pp_rank_lists, rank, local_rank)
+    _PP_GROUP = CommGroup(pp_rank_lists, rank)
 
     if is_ascend():
         assert len(_PP_PAIR_GROUP_DICT) == 0
@@ -228,7 +225,6 @@ def initialize_pp_group(
 
 def initialize_dp_group(
     rank: int,
-    local_rank: int,
     *,
     tp_size: int,
     dp_size: int,
@@ -237,15 +233,12 @@ def initialize_dp_group(
     global _DP_GROUP
     assert _DP_GROUP is None
     _DP_GROUP = CommGroup(
-        get_dp_rank_lists(tp_size=tp_size, dp_size=dp_size, world_size=world_size),
-        rank,
-        local_rank,
+        get_dp_rank_lists(tp_size=tp_size, dp_size=dp_size, world_size=world_size), rank
     )
 
 
 def initialize_etp_group(
     rank: int,
-    local_rank: int,
     *,
     etp_size: int,
     world_size: int,
@@ -253,19 +246,16 @@ def initialize_etp_group(
     global _ETP_GROUP
     assert _ETP_GROUP is None
     _ETP_GROUP = CommGroup(
-        get_etp_rank_lists(etp_size=etp_size, world_size=world_size), rank, local_rank
+        get_etp_rank_lists(etp_size=etp_size, world_size=world_size), rank
     )
 
 
-def initialize_ep_group(
-    rank: int, local_rank: int, *, etp_size: int, ep_size: int, world_size: int
-):
+def initialize_ep_group(rank: int, *, etp_size: int, ep_size: int, world_size: int):
     global _EP_GROUP
     assert _EP_GROUP is None
     _EP_GROUP = CommGroup(
         get_ep_rank_lists(etp_size=etp_size, ep_size=ep_size, world_size=world_size),
         rank,
-        local_rank,
         force_no_dedup=is_ascend(),
     )
 
@@ -280,18 +270,13 @@ def initialize_parallel_groups(
         f"initialize_parallel_groups: {tp_size=}, {pp_size=}, {dp_size=} {ep_size=}"
     )
     rank = torch.distributed.get_rank()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = torch.distributed.get_world_size()
-    initialize_world_group(rank, local_rank, world_size)
-    initialize_tp_group(rank, local_rank, tp_size=tp_size, world_size=world_size)
-    initialize_dp_group(
-        rank, local_rank, tp_size=tp_size, dp_size=dp_size, world_size=world_size
-    )
-    initialize_etp_group(rank, local_rank, etp_size=etp_size, world_size=world_size)
-    initialize_ep_group(
-        rank, local_rank, etp_size=etp_size, ep_size=ep_size, world_size=world_size
-    )
-    initialize_pp_group(rank, local_rank, pp_size=pp_size, world_size=world_size)
+    initialize_world_group(rank, world_size)
+    initialize_tp_group(rank, tp_size=tp_size, world_size=world_size)
+    initialize_dp_group(rank, tp_size=tp_size, dp_size=dp_size, world_size=world_size)
+    initialize_etp_group(rank, etp_size=etp_size, world_size=world_size)
+    initialize_ep_group(rank, etp_size=etp_size, ep_size=ep_size, world_size=world_size)
+    initialize_pp_group(rank, pp_size=pp_size, world_size=world_size)
 
     _PARALLEL_GROUPS_INITIALIZED = True
 

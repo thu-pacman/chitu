@@ -249,11 +249,12 @@ class Backend:
             logger.info(f"[Router] Router subprocess skip CUDA device binding")
             return
 
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        # Get rank from environment variable because we have not initialize torch.distributed yet
+        rank = int(os.environ.get("RANK", 0))
 
         # Bind process to GPU. Please put it before init_process_group
         if args.infer.op_impl != "cpu":
-            torch.cuda.set_device(local_rank)
+            torch.cuda.set_device(args.infer.device_ids[rank])
 
         if not torch.distributed.is_initialized():
             if args.infer.op_impl == "cpu":
@@ -433,10 +434,8 @@ class Backend:
         Returns:
             Initialized cache manager
         """
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        if args.infer.op_impl == "cpu":
-            local_rank = "cpu"
 
+        device = torch.device("cpu" if args.infer.op_impl == "cpu" else "cuda")
         pipeline_parallel_size = args.infer.pp_size
 
         # Determine layer distribution for pipeline parallelism
@@ -473,7 +472,7 @@ class Backend:
                 num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
                 block_size=block_size,
                 num_blocks=args.infer.num_blocks if num_blocks is None else num_blocks,
-                device=local_rank,
+                device=device,
                 **kv_cache_kvargs,
             )
         elif args.infer.cache_type == "skew":
@@ -481,7 +480,7 @@ class Backend:
                 layer_id_map,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
-                device=local_rank,
+                device=device,
                 **kv_cache_kvargs,
             )
         else:
@@ -491,10 +490,7 @@ class Backend:
     def _init_linear_attn_cache_manager(
         args, layer_filter_fn=lambda x: x, num_blocks: int = None
     ):
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        if args.infer.op_impl == "cpu":
-            local_rank = "cpu"
-
+        device = torch.device("cpu" if args.infer.op_impl == "cpu" else "cuda")
         pipeline_parallel_size = args.infer.pp_size
 
         # Determine layer distribution for pipeline parallelism
@@ -519,17 +515,14 @@ class Backend:
             layer_id_map,
             num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
             shape_per_token_dict=Backend._get_linear_attn_cache_params(args),
-            device=local_rank,
+            device=device,
         )
 
     @staticmethod
     def _init_indexer_cache_manager(
         args, layer_filter_fn=lambda x: x, num_blocks: int = None
     ):
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        if args.infer.op_impl == "cpu":
-            local_rank = "cpu"
-
+        device = torch.device("cpu" if args.infer.op_impl == "cpu" else "cuda")
         pipeline_parallel_size = args.infer.pp_size
 
         if pipeline_parallel_size > 1:
@@ -589,7 +582,7 @@ class Backend:
             dtype_dict=dtype_dict,
             block_size=block_size,
             num_blocks=num_blocks,
-            device=local_rank,
+            device=device,
         )
 
     @staticmethod
@@ -1373,9 +1366,8 @@ class Backend:
         except Exception as _e:
             logger.debug(f"Skip/failed running warmup for MoE schema: {_e}")
 
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
         logger.info(
-            f"rank {local_rank} Backend initialized with CUDA mem at {torch.cuda.memory_allocated()/1024**3:.2f} GB"
+            f"Backend initialized with CUDA mem at {torch.cuda.memory_allocated()/1024**3:.2f} GB"
         )
         logger.info(
             f"Using {len(c10d._pg_map)} communication gruops. If this number is too high, there may be too much memory reserved for underlying communication libraries."
@@ -1546,8 +1538,7 @@ def load_state_dict_deepseek_v3_gguf_mlp_layer(
 ):
     torch.set_num_threads(8)
 
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    device = f"cuda:{local_rank}"
+    device = torch.device("cuda")
     state_dict = {}
 
     state_dict["embed_tokens.weight"] = ds_gguf_loader.load_gguf_tensor(
@@ -1633,7 +1624,7 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if local_rank == 0:
         memory_used()
-    device = f"cuda:{local_rank}"
+    device = torch.device("cuda")
     state_dict = {}
 
     translation_attn = {

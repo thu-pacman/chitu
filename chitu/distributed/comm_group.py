@@ -71,14 +71,12 @@ class CommGroup:
         self,
         rank_lists: Sequence[Sequence[int]],
         global_rank: int,
-        local_rank: int,
         enable_custom_allreduce: bool = True,
         fully_connected: bool = True,
         custom_allreduce_max_size: int = 8 * 1024 * 1024,  # 8MB default
         force_no_dedup: bool = False,
     ):
         self.global_rank = global_rank
-        self.local_rank = local_rank
         self.cpu_group = None
         self.gpu_group = None
         self.rank_in_group = None
@@ -87,7 +85,7 @@ class CommGroup:
         self.fully_connected = fully_connected
         self.custom_allreduce_max_size = custom_allreduce_max_size
 
-        self.device = torch.device(f"cuda:{local_rank}")
+        self.device = torch.device("cuda")
 
         gpu_groups = new_torch_group_dedup(
             rank_lists, is_device=True, force_no_dedup=force_no_dedup
@@ -203,7 +201,9 @@ class CommGroup:
         )
 
     def barrier(self):
-        torch.distributed.barrier(group=self.gpu_group, device_ids=[self.local_rank])
+        torch.distributed.barrier(
+            group=self.gpu_group, device_ids=[torch.cuda.current_device()]
+        )
 
     def all_reduce(
         self,
