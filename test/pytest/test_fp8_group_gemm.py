@@ -33,8 +33,14 @@ def test_blockfp8_einsum_shc_hdc_shd(
         torch.randn((n_heads, out_feats, in_feats), dtype=compute_dtype)
         .to(torch.float8_e4m3fn)
         .cuda()
-        .view(torch.uint8)
     )
+
+    # In order to support PyTorch versions that does not support torch.float8_e4m3fn, soft
+    # FP8 ops always use UINT8 to hold the bits of FP8. This is only applied to soft FP8
+    # case rather than hard FP8. See Backend._handle_quantized_weights_casting for details.
+    if soft_fp8:
+        weight = weight.view(torch.uint8)
+
     scale = torch.randn(
         (n_heads, out_feats // 128, in_feats // 128), dtype=torch.float32, device="cuda"
     )
