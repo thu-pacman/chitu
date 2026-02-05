@@ -196,6 +196,8 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=Qwen3-Coder-480B-A35B-Instruct` command line argument when starting Chitu
 - Qwen3-Coder-480B-A35B-Instruct-fp8
   Usage: Append `models=Qwen3-Coder-480B-A35B-Instruct-fp8` command line argument when starting Chitu
+- Qwen3-Coder-480B-A35B-Instruct-int8
+  Usage: Append `models=Qwen3-Coder-480B-A35B-Instruct-int8` command line argument when starting Chitu
 - Qwen3-Next-80B-A3B-Instruct
   Usage: Append `models=Qwen3-Next-80B-A3B-Instruct` command line argument when starting Chitu
 - Qwen3-Next-80B-A3B-Instruct-FP8

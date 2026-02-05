@@ -196,6 +196,8 @@
   用法: 启动赤兔时追加 `models=Qwen3-Coder-480B-A35B-Instruct` 启动参数
 - Qwen3-Coder-480B-A35B-Instruct-fp8
   用法: 启动赤兔时追加 `models=Qwen3-Coder-480B-A35B-Instruct-fp8` 启动参数
+- Qwen3-Coder-480B-A35B-Instruct-int8
+  用法: 启动赤兔时追加 `models=Qwen3-Coder-480B-A35B-Instruct-int8` 启动参数
 - Qwen3-Next-80B-A3B-Instruct
   用法: 启动赤兔时追加 `models=Qwen3-Next-80B-A3B-Instruct` 启动参数
 - Qwen3-Next-80B-A3B-Instruct-FP8
