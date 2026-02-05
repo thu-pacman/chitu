@@ -5,13 +5,14 @@
 from typing import Optional
 import torch
 
+from chitu.device_type import has_accelerator
 from chitu.ops.utils import compatible_with_inplace
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
-if has_triton and torch.cuda.is_available():
+if has_triton and has_accelerator():
     from chitu.ops.triton_ops import (
         moe_sum_per_token_triton,
         moe_sum_expert_block_permuted_triton,

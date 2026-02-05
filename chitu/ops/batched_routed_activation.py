@@ -4,6 +4,7 @@
 
 import torch
 
+from chitu.device_type import has_accelerator
 from chitu.utils import (
     try_import_platform_dep,
     try_import_opt_dep,
@@ -18,7 +19,7 @@ muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
 )
 
-if has_triton and torch.cuda.is_available():
+if has_triton and has_accelerator():
     from chitu.ops.triton_ops import (
         batched_routed_activation_indexed_to_expert_block_indexed_triton,
         batched_routed_activation_indexed_to_expert_block_permuted_triton,

@@ -258,6 +258,15 @@ if os.environ.get("CI_TESTS", "false") == "true":
         for num_warps in [2, 4, 8, 16]
     ]
 
+# Use fixed config for MUSA to ensure CUDA graph compatibility
+# Autotune can cause issues with CUDA graph capture/replay on MUSA
+if os.environ.get("CHITU_TRITON_FIXED_CONFIG", "0") == "1" or (
+    torch.musa.is_available() if hasattr(torch, "musa") else False
+):
+    _fwd_grouped_kernel_stage1_configs = [
+        _create_triton_config(block_n=16, num_stages=2, num_warps=8)
+    ]
+
 
 @autotune_compat(
     configs=_fwd_grouped_kernel_stage1_configs, key=["batch"], cache_results=True

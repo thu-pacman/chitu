@@ -17,7 +17,7 @@ import torch.distributed
 
 from chitu.backend import Backend, BackendState
 from chitu.cache_manager import PagedKVCacheManager
-from chitu.device_type import is_nvidia
+from chitu.device_type import is_nvidia, has_accelerator
 from chitu.executor import Executor
 from chitu.global_vars import (
     get_global_args,
@@ -84,7 +84,7 @@ def init_logger():
 
 
 def init_cache_static():
-    if torch.cuda.is_available():
+    if has_accelerator():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 

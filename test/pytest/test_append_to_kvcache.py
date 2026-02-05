@@ -5,8 +5,8 @@ import pytest
 import torch
 
 from chitu.testing import assert_close
+from chitu.device_type import has_accelerator
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
-
 from chitu.ops import append_to_dense_kv_cache, append_to_paged_kv_cache
 
 triton, has_triton = try_import_platform_dep("triton")
@@ -364,7 +364,7 @@ def test_dense_append_decode_matches_torch(
 @pytest.mark.parametrize("num_tokens", [8, 64])
 @pytest.mark.parametrize("seq_len", [64, 128])
 @pytest.mark.parametrize("impl", ["triton", "torch_npu"])
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.skipif(not has_accelerator(), reason="Requires CUDA")
 def test_dense_append_with_seqids_matches_torch(
     dtype, tail_shape, batch_size, num_tokens, seq_len, impl, record_benchmark
 ):

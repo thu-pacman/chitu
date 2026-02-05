@@ -4,11 +4,13 @@
 
 import torch
 import torch.nn.functional as F
+
+from chitu.device_type import has_accelerator
 from chitu.utils import try_import_platform_dep
 
 triton, has_triton = try_import_platform_dep("triton")
 
-if has_triton and torch.cuda.is_available():
+if has_triton and has_accelerator():
     from chitu.ops.triton_ops import (
         causal_conv1d_update_triton,
         causal_conv1d_prefill_triton,
