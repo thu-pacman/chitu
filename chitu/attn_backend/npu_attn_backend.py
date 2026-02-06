@@ -73,6 +73,10 @@ class NpuAttnBackend(RefAttnBackend):
             max_nelem=max_batch_size * 8 * max_seq_len, dtype=torch.bool, device="npu"
         )
 
+    @override
+    def decode_op_supports_mtp(self):
+        return True
+
     @classmethod
     def should_use_attn_from_cinfer_ascendc(cls, model_type, batch_size):
         return hasattr(cinfer_ascendc, "incre_flash_attention")

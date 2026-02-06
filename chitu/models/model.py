@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import itertools
+import functools
+import operator
 import os
 from logging import getLogger
 from typing import Any, Mapping, Optional
@@ -1170,22 +1172,27 @@ class Transformer(nn.Module):
                     ]
                 )
 
+            def numel_per_seq(batch_size, x):
+                if batch_size > 0:
+                    return x.numel() // batch_size
+                else:
+                    assert x.shape[0] == 0
+                    return functools.reduce(operator.mul, x.shape[1:], 1)
+
+            tokens_max_nelem = self.max_batch_size_per_dp * numel_per_seq(
+                batch_size, tokens
+            )
+            output_max_nelem_callback = (
+                lambda key, out: numel_per_seq(key[0], out) * self.max_batch_size_per_dp
+            )
+
             @make_dispatched_graphed_callables(
                 args_max_nelem=(
-                    (
-                        self.mtp_size
-                        * tokens.numel()
-                        // batch_size
-                        * self.max_batch_size_per_dp
-                        if batch_size > 0
-                        else 0
-                    ),
+                    self.mtp_size * tokens_max_nelem,
                     *extra_inputs_max_nelem,
                 ),
                 kwargs_max_nelem={},
-                output_max_nelem_callback=lambda key, n: n
-                // key[0]
-                * self.max_batch_size_per_dp,
+                output_max_nelem_callback=output_max_nelem_callback,
                 before_replay_callback=before_replay_callback,
                 enable=current_cuda_graph_enabled,
             )
@@ -1201,18 +1208,9 @@ class Transformer(nn.Module):
             if self.mtp_size > 1:
 
                 @make_dispatched_graphed_callables(
-                    args_max_nelem=(
-                        (
-                            tokens.numel() // batch_size * self.max_batch_size_per_dp
-                            if batch_size > 0
-                            else 0
-                        ),
-                        *extra_inputs_mtp_max_nelem,
-                    ),
+                    args_max_nelem=(tokens_max_nelem, *extra_inputs_mtp_max_nelem),
                     kwargs_max_nelem={},
-                    output_max_nelem_callback=lambda key, n: n
-                    // key[0]
-                    * self.max_batch_size_per_dp,
+                    output_max_nelem_callback=output_max_nelem_callback,
                     before_replay_callback=before_replay_callback,
                     enable=current_cuda_graph_enabled,
                 )

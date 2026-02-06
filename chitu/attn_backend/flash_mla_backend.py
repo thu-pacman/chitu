@@ -58,6 +58,10 @@ class FlashMLABackend(TritonAttnBackend):
 
         self.use_fp8_cache = False  # support in the future
 
+    @override
+    def decode_op_supports_mtp(self):
+        return True
+
     def convert_indices_ragged_torch(
         self,
         topk_indices,

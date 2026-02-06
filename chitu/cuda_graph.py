@@ -30,7 +30,7 @@ def make_dispatched_graphed_callables(
     *,
     args_max_nelem: Sequence[int],
     kwargs_max_nelem: Mapping[str, int],
-    output_max_nelem_callback: Callable[[Any, int], int],
+    output_max_nelem_callback: Callable[[Any, torch.Tensor], int],
     before_replay_callback: Optional[Callable[[Any], None]] = None,
     enable: bool = True,
 ) -> Callable:
@@ -44,8 +44,8 @@ def make_dispatched_graphed_callables(
             in shared static tensors.
         kwargs_max_nelem: The maximum number of elements in the keyword arguments, used to hold inputs
             in shared static tensors.
-        output_max_nelem: A `(key, sample_nelem) -> max_nelem` callback to return the maximum number of
-            elements in the output tensor, used to hold outputs in shared static tensors.
+        output_max_nelem_callback: A `(key, sample_output) -> max_nelem` callback to return the maximum
+            number of elements in the output tensor, used to hold outputs in shared static tensors.
         before_replay_callback: An optional `(graph) -> None` callback function to be called before each
             graph replay. Note that this callback is not invoked before warming-up runs, or before graph
             capturing.
@@ -124,7 +124,7 @@ def make_dispatched_graphed_callables(
                 if output_static_tensor is None:
                     output_static_tensor = StaticTensor(
                         sample_output,
-                        max_nelem=output_max_nelem_callback(key, sample_output.numel()),
+                        max_nelem=output_max_nelem_callback(key, sample_output),
                     )
                 else:
                     output_static_tensor.set(sample_output)

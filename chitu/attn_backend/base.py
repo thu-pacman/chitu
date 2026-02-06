@@ -49,6 +49,9 @@ class AttnBackend(abc.ABC):
             triton.__version__
         ) >= packaging.version.parse("3.2.0")
 
+    def decode_op_supports_mtp(self):
+        return False
+
     def prepare_metadata_for_decode(self, *args, **kwargs):
         pass
 
@@ -187,8 +190,7 @@ class AttnBackend(abc.ABC):
             raise NotImplementedError(f"Unsupported type {type(kv)} for kv")
 
         if seq_len_delta.is_classic_decoding or (
-            seq_len_delta.is_decode_stage
-            and (is_ascend() or self.args.infer.attn_type == "flash_mla")
+            seq_len_delta.is_decode_stage and self.decode_op_supports_mtp()
         ):
             return self.mla_decode(
                 q_nope,
