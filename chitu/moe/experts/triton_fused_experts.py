@@ -23,8 +23,10 @@ from chitu.moe.batched_expert_result import (
 )
 from chitu.ops.activation import silu_and_mul
 from chitu.ops.quant import blockfp8_act_quant
+from chitu.device_type import has_accelerator
+from chitu.lazy import single_dispatch_lazy_tensor
 
-if torch.cuda.is_available():
+if has_accelerator():
     from chitu.ops.triton_ops.utils import (
         SIGNED_INT32_0x87F00000,
         SIGNED_INT16_0x81C0,
@@ -32,7 +34,6 @@ if torch.cuda.is_available():
         SIGNED_INT8_0x9C,
     )
     from chitu.ops.triton_ops.utils import to_triton_dtype, autotune_compat
-from chitu.lazy import single_dispatch_lazy_tensor
 
 logger = getLogger(__name__)
 

@@ -20,7 +20,7 @@ from chitu.utils import (
     try_import_and_setup_torch_npu,
 )
 from chitu.batched_seq_len import BatchedSeqLenDelta
-from chitu.device_type import is_muxi
+from chitu.device_type import is_muxi, has_accelerator
 from chitu.testing import assert_close
 
 triton, has_triton = try_import_platform_dep("triton")
@@ -57,7 +57,7 @@ def test_mla_prefill_ragged_qkvo(
         if topk is not None:
             pytest.skip("torch_npu does not support topk")
     if impl == "flash_mla":
-        if not torch.cuda.is_available() or not has_flash_mla:
+        if not has_accelerator() or not has_flash_mla:
             pytest.skip("flash_mla is missing")
         if local_n_heads % 64 != 0:
             pytest.skip("flash_mla only supports h_q % 64 (sm90) | 128 (sm100) == 0")
@@ -512,7 +512,7 @@ def test_mla_decode_paged_kv(
         if topk is not None:
             pytest.skip("torch_npu does not support topk")
     if impl == "flash_mla":
-        if not torch.cuda.is_available() or not has_flash_mla:
+        if not has_accelerator() or not has_flash_mla:
             pytest.skip("flash_mla is missing")
         if local_n_heads % 64 != 0:
             pytest.skip("flash_mla only supports h_q % 64 (sm90) | 128 (sm100) == 0")

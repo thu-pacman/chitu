@@ -18,19 +18,18 @@ from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.distributed.parallel_state import get_etp_size
 from chitu.global_vars import get_global_args
 from chitu.moe.impl import MoEImplEP, get_moe_impl
+from chitu.models.model import ParallelMoeBlock
+from chitu.models.model_hf_llama import TransformerBlockHFLlama, TransformerHFLlama
 from chitu.models.model_hf_qwen2_vl import (
     VisionAttention as Qwen25VisionAttention,
     VisionRotaryEmbedding as Qwen25VisionRotaryEmbedding,
 )
-from chitu.models.model_hf_llama import TransformerBlockHFLlama, TransformerHFLlama
+from chitu.models.model_hf_qwen_3_moe import Qwen3MoeGate
 from chitu.models.registry import ModelType, register_model
 from chitu.utils import try_import_opt_dep
-
-from chitu.quantization import get_quant_from_checkpoint_prefix
-from chitu.quantization import QuantizationRegistry
-from chitu.models.model import ParallelMoeBlock
+from chitu.quantization import get_quant_from_checkpoint_prefix, QuantizationRegistry
 from chitu.quantization.normal import NormalMoeExperts
-from chitu.models.model_hf_qwen_3_moe import Qwen3MoeGate
+from chitu.device_type import has_accelerator
 
 _flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 
@@ -1097,7 +1096,7 @@ class TransformerQwen3VL(TransformerHFLlama):
         # CUDA Graph capture forbids dynamic-shape ops like `torch.nonzero` (used in multimodal consume).
         # Decode graph capture should never see image/video placeholder tokens, so skip multimodal alignment.
         try:
-            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            if has_accelerator() and torch.cuda.is_current_stream_capturing():
                 return inputs_embeds
         except Exception:
             # Be conservative: if capture state cannot be queried, proceed with normal path.
@@ -1965,7 +1964,7 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
         # CUDA Graph capture forbids dynamic-shape ops like `torch.nonzero` (used in multimodal consume).
         # Decode graph capture should never see image/video placeholder tokens, so skip multimodal alignment.
         try:
-            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            if has_accelerator() and torch.cuda.is_current_stream_capturing():
                 return inputs_embeds
         except Exception:
             pass

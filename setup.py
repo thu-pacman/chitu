@@ -35,6 +35,7 @@ from get_requires import install_requires, extras_require
 if (
     os.environ.get("CHITU_ASCEND_BUILD", "0") == "1"
     or os.environ.get("CHITU_HYGON_BUILD", "0") == "1"
+    or os.environ.get("CHITU_MOORE_BUILD", "0") == "1"
 ):
     ext_modules = []
 else:
@@ -106,7 +107,7 @@ if os.environ.get("CHITU_SETUP_JOBS") is not None:
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="chitu",
-    version="0.5.0",
+    version="0.5.1",
     python_requires=">=3.10",
     install_requires=install_requires,
     extras_require=extras_require,

@@ -15,10 +15,11 @@ from chitu.cache_manager import PagedKVCacheAccessor
 from chitu.ops import append_to_paged_kv_cache
 from chitu.utils import try_import_opt_dep, ceil_div
 from chitu.distributed.parallel_state import get_dp_size
+from chitu.device_type import has_accelerator
 
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
 
-if has_flash_mla and torch.cuda.is_available():
+if has_flash_mla and has_accelerator():
     from chitu.ops.triton_ops import (
         convert_req_index_to_global_paged_index_triton,
     )
@@ -39,7 +40,7 @@ class FlashMLABackend(TritonAttnBackend):
         self.num_splits_for_flashmla = None
         self.mtp_size = getattr(self.args.infer, "mtp_size", 1)
         self.kv_heads = 1
-        assert torch.cuda.is_available(), "FlashMLA backend only supports cuda"
+        assert has_accelerator(), "FlashMLA backend only supports cuda"
         self.required_h_q = 128 if torch.cuda.get_device_capability() == (10, 0) else 64
         self.local_n_heads = self.args.models.n_heads // self.args.infer.tp_size
         self.metadata = None
@@ -56,6 +57,10 @@ class FlashMLABackend(TritonAttnBackend):
         )
 
         self.use_fp8_cache = False  # support in the future
+
+    @override
+    def decode_op_supports_mtp(self):
+        return True
 
     def convert_indices_ragged_torch(
         self,

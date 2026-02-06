@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from chitu.device_type import has_accelerator
 from chitu.utils import (
     try_import_platform_dep,
     try_import_opt_dep,
@@ -18,7 +19,7 @@ from chitu.custom_gguf import get_ggml_quant_type
 from chitu.ops.utils import compatible_with_inplace
 
 triton, has_triton = try_import_platform_dep("triton")
-if has_triton and torch.cuda.is_available():
+if has_triton and has_accelerator():
     from chitu.ops.triton_ops import rms_norm_triton
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")

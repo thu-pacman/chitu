@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 import torch
 import torch.distributed as dist
 
-from chitu.device_type import is_ascend
+from chitu.device_type import is_ascend, has_accelerator
 from chitu.utils import try_import_and_setup_torch_npu
 from chitu.distributed.comm_group import CommGroup
 from chitu.moe.load_balancer.base_dynamic_planner import (
@@ -75,10 +75,10 @@ class WeightMigrationExecutor:
         self.rank = self.group.global_rank
         self.world_rank_list = self.group.rank_list
         self.device_id: Optional[int] = None
-        if torch.cuda.is_available():
+        if has_accelerator():
             self.device_id = torch.cuda.current_device()
         self._mig_stream: Optional[torch.cuda.Stream] = None
-        if torch.cuda.is_available():
+        if has_accelerator():
             self._mig_stream = torch.cuda.Stream(priority=3)
         self._staged: Dict[tuple[int, int], Dict[str, torch.Tensor]] = {}
         self._schema: Optional[Dict[str, object]] = None
@@ -151,18 +151,18 @@ class WeightMigrationExecutor:
           - reuse recv buffers to reduce allocator overhead
         """
         # Pin device (keep existing policy; no non_blocking transfer here)
-        if self.device_id is not None and torch.cuda.is_available():
+        if self.device_id is not None and has_accelerator():
             torch.cuda.set_device(self.device_id)
         if is_ascend() and has_torch_npu:
             device = torch.device(
                 f"npu:{self.device_id}"
-                if torch.cuda.is_available() and self.device_id is not None
+                if has_accelerator() and self.device_id is not None
                 else "cpu"
             )
         else:
             device = torch.device(
                 f"cuda:{self.device_id}"
-                if torch.cuda.is_available() and self.device_id is not None
+                if has_accelerator() and self.device_id is not None
                 else "cpu"
             )
 

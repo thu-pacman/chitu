@@ -75,6 +75,22 @@ docker run -dit \
   <your_image_name> \
   <your_command>
 ```
+
+#### MooreThreads
+
+```
+docker run -dit \
+  --network=host \
+  --privileged \
+  --shm-size=100G \
+  --ulimit memlock=-1 \
+  --env MTHREADS_VISIBLE_DEVICES=all \
+  --pid=host \
+  -v <your_model_path>:<container_model_path> \
+  <your_image_name> \
+  <your_command>
+```
+
 ### Build from Source
 
 #### 1. Get the code
@@ -148,6 +164,16 @@ Note:
 
 ```bash
 CHITU_MUXI_BUILD=1 pip install --no-build-isolation . -c <(pip list --format freeze)
+```
+
+Note:
+
+- The constraints after `-c` enforces chitu to be compatible with all your installed packages, instead of upgrading non-compatible packages. This helps keeping the PyTorch installed in your system untouched. You can exclude some packages from the constraint list if you want to upgrade them.
+
+**For Mooer platforms:**
+
+```bash
+CHITU_MOORE_BUILD=1 pip install --no-build-isolation . -c <(pip list --format freeze)
 ```
 
 Note:
@@ -619,6 +645,7 @@ Install time:
 | `CHITU_ASCEND_BUILD`       | `0`, `1`                     | Build for Ascend.                                      |
 | `CHITU_HYGON_BUILD`        | `0`, `1`                     | Build for Hygon.                                       |
 | `CHITU_MUXI_BUILD`         | `0`, `1`                     | Build for Muxi (MetaX).                                |
+| `CHITU_MOORE_BUILD`        | `0`, `1`                     | Build for MooreThreads.                                |
 | `CHITU_SETUP_JOBS`         | Integer                      | Number of processes for compiling.                     |
 
 Runtime:

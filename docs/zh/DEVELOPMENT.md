@@ -76,6 +76,21 @@ docker run -dit \
   <your_command>
 ```
 
+#### 摩尔线程
+
+```
+docker run -dit \
+  --network=host \
+  --privileged \
+  --shm-size=100G \
+  --ulimit memlock=-1 \
+  --env MTHREADS_VISIBLE_DEVICES=all \
+  --pid=host \
+  -v <your_model_path>:<container_model_path> \
+  <your_image_name> \
+  <your_command>
+```
+
 ### 从源码安装
 
 #### 1. 获取源码
@@ -154,6 +169,17 @@ CHITU_MUXI_BUILD=1 pip install --no-build-isolation . -c <(pip list --format fre
 注：
 
 - 通过 `-c` 指定的 constraint 选项使 pip 强制赤兔与系统中已有的软件包兼容，而不是在不兼容时自动升级依赖软件包。这有助于避免安装过程破坏系统中已有的 PyTorch 版本。如果你确实需要升级某些软件包，可以将这些软件包从 `-c` 指定的列表中移除。
+
+**摩尔平台：**
+
+```
+CHITU_MOORE_BUILD=1 pip install --no-build-isolation . -c <(pip list --format freeze)
+```
+
+注：
+
+- 通过 `-c` 指定的 constraint 选项使 pip 强制赤兔与系统中已有的软件包兼容，而不是在不兼容时自动升级依赖软件包。这有助于避免安装过程破坏系统中已有的 PyTorch 版本。如果你确实需要升级某些软件包，可以将这些软件包从 `-c` 指定的列表中移除。
+
 
 #### 选项
 
@@ -620,6 +646,7 @@ python benchmarks/benchmark_serving.py \
 | `CHITU_ASCEND_BUILD`       | `0`, `1`                     | 面向昇腾构建。                                         |
 | `CHITU_HYGON_BUILD`        | `0`, `1`                     | 面向海光构建。                                         |
 | `CHITU_MUXI_BUILD`         | `0`, `1`                     | 面向沐曦构建。                                         |
+| `CHITU_MOORE_BUILD`        | `0`, `1`                     | 面向摩尔线程构建。                                     |
 | `CHITU_SETUP_JOBS`         | 整数                         | 并行编译的进程数。                                     |
 
 运行时：

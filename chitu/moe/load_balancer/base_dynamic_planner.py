@@ -16,6 +16,7 @@ import torch.distributed as dist
 
 from chitu.utils import try_import_and_setup_torch_npu
 from chitu.distributed.comm_group import CommGroup
+from chitu.device_type import has_accelerator
 
 
 LOCAL_WORLD_SIZE = None
@@ -85,7 +86,7 @@ class BaseMoELoadPlanner(ABC):
 
         self._stats_device = (
             torch.device("cuda", torch.cuda.current_device())
-            if torch.cuda.is_available()
+            if has_accelerator()
             else torch.device("cpu")
         )
 

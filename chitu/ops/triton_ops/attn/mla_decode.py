@@ -454,6 +454,7 @@ def _mla_softmax_reducev_kernel(
     INDEX_TOPK: tl.constexpr,
     HAS_B_SEQ_LEN: tl.constexpr,
     HAS_B_LAST_POS_ID: tl.constexpr,
+    INDEX_DTYPE: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -474,6 +475,7 @@ def _mla_softmax_reducev_kernel(
     e_max = -float("inf")
     acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
 
+    stride_l_b = tl.cast(stride_l_b, INDEX_DTYPE)
     offs_l = cur_batch * stride_l_b + cur_head * stride_l_h + offs_d_ckv
     offs_l_1 = cur_batch * stride_l_b + cur_head * stride_l_h + HEAD_DIM_CKV
 
@@ -525,6 +527,7 @@ def _mla_softmax_reducev(
     b_last_pos_id,
     num_kv_splits,
     topk_indices,
+    INDEX_DTYPE=tl.int32,
 ):
     batch_size, head_num, head_dim_ckv = o.shape[0], o.shape[1], o.shape[2]
     grid = (batch_size, head_num)
@@ -547,6 +550,7 @@ def _mla_softmax_reducev(
         HAS_B_LAST_POS_ID=b_last_pos_id is not None,
         num_warps=4,
         num_stages=2,
+        INDEX_DTYPE=INDEX_DTYPE,
     )
 
 
@@ -654,6 +658,7 @@ def _mla_decode_topk_ragged_qkvo_kernel(
     HEAD_DIM_CKV: tl.constexpr,
     HEAD_DIM_KPE: tl.constexpr,
     INDEX_TOPK: tl.constexpr,
+    INDEX_DTYPE: tl.constexpr,
 ):
     cur_token = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -736,7 +741,7 @@ def _mla_decode_topk_ragged_qkvo_kernel(
 
                 e_sum = e_sum * re_scale + tl.sum(p, 1)
                 e_max = n_e_max
-
+    stride_o_b = tl.cast(stride_o_b, INDEX_DTYPE)
     if any_block_valid:
         offs_o = (
             cur_token * stride_o_b
@@ -766,6 +771,7 @@ def _mla_decode_topk_ragged_qkvo(
     num_kv_splits,
     sm_scale,
     topk_indices,
+    INDEX_DTYPE,
 ):
     n_tokens, head_num = q_nope.shape[0], q_nope.shape[1]
     head_dim_ckv = q_nope.shape[-1]
@@ -804,6 +810,7 @@ def _mla_decode_topk_ragged_qkvo(
         HEAD_DIM_CKV=head_dim_ckv,
         HEAD_DIM_KPE=head_dim_kpe,
         INDEX_TOPK=topk_indices.shape[-1],
+        INDEX_DTYPE=INDEX_DTYPE,
     )
 
 
@@ -827,6 +834,10 @@ def mla_decode_topk_ragged_qkvo_triton(
     topk_indices,
 ):
     assert num_kv_splits == attn_logits.shape[2]
+    if attn_logits.stride()[0] * q_nope.shape[0] > 2147483647:
+        INDEX_DTYPE = tl.int64
+    else:
+        INDEX_DTYPE = tl.int32
     _mla_decode_topk_ragged_qkvo(
         q_nope,
         q_pe,
@@ -839,6 +850,7 @@ def mla_decode_topk_ragged_qkvo_triton(
         num_kv_splits,
         sm_scale,
         topk_indices,
+        INDEX_DTYPE,
     )
     _mla_softmax_reducev(
         attn_logits,
@@ -847,4 +859,5 @@ def mla_decode_topk_ragged_qkvo_triton(
         delta_position_ids,
         num_kv_splits,
         topk_indices,
+        INDEX_DTYPE,
     )

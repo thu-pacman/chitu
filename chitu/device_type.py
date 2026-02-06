@@ -7,11 +7,21 @@ import torch
 _device_name = None
 
 
+def has_accelerator():
+    if torch.cuda.is_available():
+        return True
+    if hasattr(torch, "musa") and torch.musa.is_available():
+        return True
+    return False
+
+
 def get_device_name():
     global _device_name
     if _device_name is None:
         if torch.cuda.is_available():
             _device_name = torch.cuda.get_device_name()
+        elif hasattr(torch, "musa") and torch.musa.is_available():
+            _device_name = torch.musa.get_device_name()
         else:
             _device_name = "CPU"
     return _device_name
@@ -57,3 +67,15 @@ def is_hygon():
     HYGON_DEVICE_PATTERNS = ["BW"]
     device_name = get_device_name()
     return any(pattern in device_name for pattern in HYGON_DEVICE_PATTERNS)
+
+
+def is_moore():
+    MOORE_DEVICE_PATTERNS = ["MTT"]
+    device_name = get_device_name()
+    return any(pattern in device_name for pattern in MOORE_DEVICE_PATTERNS)
+
+
+if hasattr(torch, "musa") and torch.musa.is_available():
+    from chitu.utils import try_import_opt_dep
+
+    torchada, has_torchada = try_import_opt_dep("torchada", "torchada")

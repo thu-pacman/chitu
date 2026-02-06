@@ -5,7 +5,6 @@
 from typing import Optional
 from logging import getLogger
 
-import chitu.logging_utils
 import torch
 
 from chitu.utils import (
@@ -14,7 +13,7 @@ from chitu.utils import (
     try_import_and_setup_torch_npu,
 )
 from chitu.native_layout import Vector
-from chitu.device_type import is_muxi
+from chitu.device_type import is_muxi, has_accelerator
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import get_ggml_quant_type
 from chitu.global_vars import get_global_args
@@ -23,16 +22,14 @@ from chitu.lazy import make_lazy_op
 triton, has_triton = try_import_platform_dep("triton")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-
-
-logger = getLogger(__name__)
-
-
-if has_triton and torch.cuda.is_available():
+if has_triton and has_accelerator():
     from chitu.ops.triton_ops import (
         silu_and_mul_triton,
         silu_and_mul_triton_with_expert_mask,
     )
+
+
+logger = getLogger(__name__)
 
 
 def silu_and_mul_torch(x: torch.Tensor):

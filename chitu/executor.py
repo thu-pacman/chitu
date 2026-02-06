@@ -1467,10 +1467,10 @@ class Executor:
 
         else:
             if self.rank == 0 or self.dp_size > 1 and self.dp_dispatcher is not None:
-                payload = torch.tensor([0], device=self.device, dtype=torch.long)
+                payload = torch.empty(0, device=self.device, dtype=torch.long)
             else:
                 payload = torch.empty(
-                    self.get_payload_shape(1),
+                    self.get_payload_shape(0),
                     dtype=self.get_payload_dtype(),
                     device=self.device,
                 )

@@ -5,13 +5,14 @@
 from typing import Optional, Callable
 import torch
 
+from chitu.device_type import has_accelerator
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 from chitu.global_vars import get_global_args
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
-if has_triton and torch.cuda.is_available():
+if has_triton and has_accelerator():
     from chitu.ops.triton_ops import (
         append_to_paged_kv_cache_triton,
         append_to_dense_kv_cache_triton,

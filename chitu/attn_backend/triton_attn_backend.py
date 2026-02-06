@@ -12,13 +12,13 @@ import torch
 from chitu.attn_backend.ref_attn_backend import RefAttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.cache_manager import PagedKVCacheAccessor, DenseKVCacheAccessor
-from chitu.device_type import is_muxi
+from chitu.device_type import is_muxi, has_accelerator
 from chitu.ops import append_to_dense_kv_cache, append_to_paged_kv_cache
 from chitu.utils import try_import_platform_dep
 
 triton, has_triton = try_import_platform_dep("triton")
 
-if has_triton and torch.cuda.is_available():
+if has_triton and has_accelerator():
     from chitu.ops.triton_ops import (
         prefill_ragged_qkvo_triton,
         decode_paged_kv_triton,
