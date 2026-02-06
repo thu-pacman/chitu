@@ -35,7 +35,6 @@ from chitu.moe.batched_expert_result import (
 from chitu.native_layout import (
     NativeLayoutTensor,
     NpuFractalZnTensor,
-    Packed4BitWeightNPUNativeMXFP4,
 )
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
