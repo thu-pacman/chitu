@@ -432,13 +432,17 @@ class PagedKVCacheManager(KVCacheManagerBase):
         if num_blocks == -1:  # Being warmed-up
             # Should be consistent with `_warmup_via_taskpool` in `chitu_main.py`
             if get_global_args().infer.prefill_chunk_size is None:
+                # Since we warmup with input length = 1, we only need 1 block per request
                 self.num_blocks = num_hot_req
             else:
+                # First get warmup input length per DP
+                local_prefill_chunk_size = ceil_div(
+                    get_global_args().infer.prefill_chunk_size,
+                    get_global_args().infer.dp_size,
+                )
+                # Then compute number of blocks that no block crosses request boundary
                 self.num_blocks = (
-                    ceil_div(
-                        get_global_args().infer.prefill_chunk_size // num_hot_req + 1,
-                        block_size,
-                    )
+                    ceil_div(local_prefill_chunk_size // num_hot_req + 1, block_size)
                     * num_hot_req
                 )
         else:
