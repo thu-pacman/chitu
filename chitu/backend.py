@@ -435,7 +435,9 @@ class Backend:
             Initialized cache manager
         """
 
-        device = torch.device("cpu" if args.infer.op_impl == "cpu" else "cuda")
+        device = torch.device(
+            "cpu" if args.infer.op_impl == "cpu" else torch.cuda.current_device()
+        )
         pipeline_parallel_size = args.infer.pp_size
 
         # Determine layer distribution for pipeline parallelism

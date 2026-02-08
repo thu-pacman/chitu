@@ -52,6 +52,8 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=GLM-4.5V` command line argument when starting Chitu
 - GLM-4.6
   Usage: Append `models=GLM-4.6` command line argument when starting Chitu
+- GLM-4.6V
+  Usage: Append `models=GLM-4.6V` command line argument when starting Chitu
 - GLM-4.7
   Usage: Append `models=GLM-4.7` command line argument when starting Chitu
 - GLM-Z1-32B-0414
@@ -198,6 +200,8 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=Qwen3-Coder-480B-A35B-Instruct-fp8` command line argument when starting Chitu
 - Qwen3-Coder-480B-A35B-Instruct-int8
   Usage: Append `models=Qwen3-Coder-480B-A35B-Instruct-int8` command line argument when starting Chitu
+- Qwen3-Coder-Next
+  Usage: Append `models=Qwen3-Coder-Next` command line argument when starting Chitu
 - Qwen3-Next-80B-A3B-Instruct
   Usage: Append `models=Qwen3-Next-80B-A3B-Instruct` command line argument when starting Chitu
 - Qwen3-Next-80B-A3B-Instruct-FP8
