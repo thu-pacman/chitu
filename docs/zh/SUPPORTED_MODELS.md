@@ -52,6 +52,8 @@
   用法: 启动赤兔时追加 `models=GLM-4.5V` 启动参数
 - GLM-4.6
   用法: 启动赤兔时追加 `models=GLM-4.6` 启动参数
+- GLM-4.6V
+  用法: 启动赤兔时追加 `models=GLM-4.6V` 启动参数
 - GLM-4.7
   用法: 启动赤兔时追加 `models=GLM-4.7` 启动参数
 - GLM-Z1-32B-0414
@@ -198,6 +200,8 @@
   用法: 启动赤兔时追加 `models=Qwen3-Coder-480B-A35B-Instruct-fp8` 启动参数
 - Qwen3-Coder-480B-A35B-Instruct-int8
   用法: 启动赤兔时追加 `models=Qwen3-Coder-480B-A35B-Instruct-int8` 启动参数
+- Qwen3-Coder-Next
+  用法: 启动赤兔时追加 `models=Qwen3-Coder-Next` 启动参数
 - Qwen3-Next-80B-A3B-Instruct
   用法: 启动赤兔时追加 `models=Qwen3-Next-80B-A3B-Instruct` 启动参数
 - Qwen3-Next-80B-A3B-Instruct-FP8

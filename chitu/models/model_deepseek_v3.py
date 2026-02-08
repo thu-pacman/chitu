@@ -609,24 +609,24 @@ class AttentionDeepSeekV3(Attention):
             )
 
         elif self.mla_absorb in ["absorb-without-precomp", "absorb"]:
+            if is_mtp:
+                seq_len_delta = self.cache.mtp_seq_len_delta
+            else:
+                seq_len_delta = self.cache.seq_len_delta
+
             q_nope, q_pe, kv, qr = self._run_linear(x, freqs_cis)
             if self.index_topk is not None:
                 assert self.indexer_cache is not None
                 topk_indices = self.indexer(
                     x,
                     qr,
-                    self.cache.seq_len_delta,
+                    seq_len_delta,
                     freqs_cis,
                     is_causal=True,
                     cache_accessor=self.indexer_cache.get_accessor(self.layer_id),
                 )
             else:
                 topk_indices = None
-
-            if is_mtp:
-                seq_len_delta = self.cache.mtp_seq_len_delta
-            else:
-                seq_len_delta = self.cache.seq_len_delta
 
             x = self.attn_backend.mla(
                 q_nope,
