@@ -4,12 +4,16 @@
 
 from xgrammar import Grammar
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncIterable
 
 from .types import ToolCallParams, ChoiceToolCall, ChoiceDelta
 
 
 class AbstractToolParser(ABC):
+    @abstractmethod
+    def __init__(self, tools):
+        raise NotImplementedError
+
     @classmethod
     @abstractmethod
     def patch_chat_template(cls, template: str) -> str:
@@ -23,13 +27,12 @@ class AbstractToolParser(ABC):
     ) -> Grammar | None:
         raise NotImplementedError
 
-    @classmethod
     @abstractmethod
-    def parse_string(cls, content: str) -> tuple[str, list[ChoiceToolCall]]:
+    def parse_string(self, content: str) -> tuple[str, list[ChoiceToolCall]]:
         raise NotImplementedError
 
     @abstractmethod
-    async def parse_stream(
-        self, stream: AsyncGenerator[tuple[str, bool, Any], None]
-    ) -> AsyncGenerator[tuple[ChoiceDelta, bool, Any], None]:
+    def parse_stream(
+        self, stream: AsyncIterable[str]
+    ) -> AsyncIterable[ChoiceDelta | AsyncIterable[ChoiceDelta]]:
         raise NotImplementedError

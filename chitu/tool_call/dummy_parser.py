@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import AsyncGenerator, Any
+from typing import AsyncIterable, Any
 from .abstract_parser import AbstractToolParser
 from .types import ChoiceDelta
 
@@ -16,15 +16,9 @@ class DummyToolParser(AbstractToolParser):
     def build_grammar(cls, params):
         return None
 
-    @classmethod
-    def parse_string(cls, content: str):
+    def parse_string(self, content: str):
         return content, []
 
-    async def parse_stream(
-        self, stream: AsyncGenerator[tuple[str, bool, Any], None]
-    ) -> AsyncGenerator[tuple[ChoiceDelta, bool, Any], None]:
-        async for content, is_reasoning, extra in stream:
-            if is_reasoning:
-                yield ChoiceDelta(reasoning_content=content), True, extra
-            else:
-                yield ChoiceDelta(content=content), False, extra
+    async def parse_stream(self, stream: AsyncIterable[str]):
+        async for content in stream:
+            yield ChoiceDelta(content=content)

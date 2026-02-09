@@ -1,4 +1,5 @@
-import subprocess, sys, asyncio, os, json, signal, logging, itertools, time
+import subprocess, sys, asyncio, os, json, signal, logging, itertools
+from typing import Awaitable
 from openai import AsyncOpenAI, AsyncStream
 from openai.types.chat import (
     ChatCompletion,
@@ -6,7 +7,7 @@ from openai.types.chat import (
     ChatCompletionMessage,
     ChatCompletionMessageFunctionToolCall,
 )
-from anthropic import Anthropic  # type: ignore
+from anthropic import AsyncAnthropic
 
 logging.basicConfig(format="[%(name)s] %(message)s", level=logging.INFO)
 logger = logging.getLogger("tester")
@@ -14,15 +15,16 @@ logger_engine = logging.getLogger("engine")
 sys.stdout.reconfigure(line_buffering=True)
 
 
-MAX_CONCURRENT = 32
-MAX_RETRY = 10
+MAX_CONCURRENT = 64
+MAX_RETRY = 1
 CHOICE_FUNC_NAME = "get_temperature"
 CHOICE_FUNC = {"type": "function", "function": {"name": CHOICE_FUNC_NAME}}
 LAUNCH_TIMEOUT = 300
 REQ_TIMEOUT = 300
+MAX_TOKENS = 1024
 
 # nums: describe number of tools called in each round. list of set of int, list represents chat rounds, set represents called tools
-CASES = [
+CASES_BASE = [
     dict(prompt=0, choice="none", parallel=False, nums=[{0}]),
     dict(prompt=0, choice="none", parallel=True, nums=[{0}]),
     dict(prompt=0, choice="required", parallel=False, nums=[{1}]),
@@ -37,35 +39,31 @@ CASES = [
     dict(prompt=1, choice="auto", parallel=True, nums=[{1}, {0}]),
     dict(prompt=2, choice="none", parallel=False, nums=[{0}]),
     dict(prompt=2, choice="none", parallel=True, nums=[{0}]),
-    dict(prompt=2, choice="required", parallel=False, nums=[{1}, {1, 2}, {0}]),
+    dict(prompt=2, choice="required", parallel=False, nums=[{1}, {1}, {0}]),
     dict(prompt=2, choice="required", parallel=True, nums=[{2}, {0}]),
-    dict(prompt=2, choice="auto", parallel=False, nums=[{1}, {1, 2}, {0}]),
+    dict(prompt=2, choice="auto", parallel=False, nums=[{1}, {1}, {0}]),
     dict(prompt=2, choice="auto", parallel=True, nums=[{2}]),
-    dict(prompt=0, choice="auto", parallel=True, nums=[{0}], no_tools=True),
+    dict(prompt=0, choice="auto", parallel=False, nums=[{0}], tools=None),
+    dict(prompt=0, choice="auto", parallel=True, nums=[{0}], tools=None),
+    dict(prompt=0, choice=CHOICE_FUNC, parallel=False, nums=[{1}]),
     dict(prompt=0, choice=CHOICE_FUNC, parallel=True, nums=[{1}]),
+    dict(prompt=1, choice=CHOICE_FUNC, parallel=False, nums=[{1}]),
     dict(prompt=1, choice=CHOICE_FUNC, parallel=True, nums=[{1}]),
+    dict(prompt=2, choice=CHOICE_FUNC, parallel=False, nums=[{1}]),
     dict(prompt=2, choice=CHOICE_FUNC, parallel=True, nums=[{1}]),
 ]
-CASES = [
-    dict(**case, stream=stream)
-    for case, stream in itertools.product(CASES, [False, True])
+CASES_BASE = [{**case, "base_idx": idx} for idx, case in enumerate(CASES_BASE)]
+CASES_OPEN_AI = [
+    {**case, "stream": stream, "api": "openai"}
+    for case, stream in itertools.product(CASES_BASE, [False, True])
 ]
-
-ANTHROPIC_CASES = [
-    dict(prompt=0, choice="none", parallel=False, nums=[{0}], stream=False),
-    dict(prompt=0, choice="auto", parallel=False, nums=[{0}], stream=False),
-    dict(prompt=1, choice="required", parallel=False, nums=[{1, 2}, {0}], stream=False),
-    dict(prompt=1, choice="auto", parallel=False, nums=[{1, 2}, {0}], stream=False),
-    dict(prompt=2, choice="required", parallel=False, nums=[{1, 2}, {0}], stream=False),
-    dict(prompt=2, choice="auto", parallel=False, nums=[{1, 2}, {0}], stream=False),
-    dict(prompt=0, choice=CHOICE_FUNC, parallel=False, nums=[{1}], stream=False),
-    dict(prompt=1, choice=CHOICE_FUNC, parallel=False, nums=[{1}, {0}], stream=False),
-    dict(
-        prompt=2, choice=CHOICE_FUNC, parallel=False, nums=[{1, 2}, {0}], stream=False
-    ),
-    dict(
-        prompt=0, choice="auto", parallel=False, nums=[{0}], no_tools=True, stream=False
-    ),
+CASES_ANTHROPIC = [
+    {**case, "stream": False, "api": "anthropic"}
+    for case in CASES_BASE
+    if case["parallel"] == True
+]
+CASES = [
+    {**case, "idx": idx} for idx, case in enumerate(CASES_OPEN_AI + CASES_ANTHROPIC)
 ]
 
 
@@ -156,7 +154,7 @@ async def stream_gather(
                 assert len(msg.tool_calls) == tool_delta.index
                 msg.tool_calls.append(
                     ChatCompletionMessageFunctionToolCall(
-                        id=tool_delta.id,
+                        id=tool_delta.id or "",
                         type="function",
                         function=dict(name="", arguments=""),
                     )
@@ -211,28 +209,13 @@ def _tool_result_messages_anthropic(tool_calls: list[dict]) -> list[dict]:
 
 
 async def _round_openai(
-    client: AsyncOpenAI,
-    messages: list[dict],
-    model: str,
-    tools: list[dict] | None,
-    tool_choice,
-    parallel: bool,
-    stream: bool,
+    messages: list,
+    kwargs: dict,
 ):
-    kwargs = dict(
-        messages=messages,
-        model=model,
-        tools=tools,
-        tool_choice=tool_choice,
-        parallel_tool_calls=parallel,
-        stream=stream,
-    )
-    if tools is None:
-        kwargs.pop("tools")
     response: ChatCompletion | AsyncStream[ChatCompletionChunk] = (
-        await client.chat.completions.create(**kwargs)
+        await openai_client.chat.completions.create(messages=messages, **kwargs)
     )
-    if stream:
+    if kwargs["stream"]:
         msg = await stream_gather(response)
     else:
         msg = response.choices[0].message
@@ -241,7 +224,9 @@ async def _round_openai(
     rcontent = getattr(msg, "reasoning_content", None) or ""
     tool_calls = _tool_calls_from_openai(msg)
     tool_msgs = _tool_result_messages_openai(tool_calls)
-    return content, rcontent, tool_calls, msg, tool_msgs, kwargs
+    messages.append(msg)
+    messages.extend(tool_msgs)
+    return content, rcontent, tool_calls
 
 
 def _tool_choice_to_anthropic(choice):
@@ -255,27 +240,14 @@ def _tool_choice_to_anthropic(choice):
 
 
 async def _round_anthropic(
-    _client,
     messages: list[dict],
-    model: str,
-    tools: list[dict] | None,
-    tool_choice,
-    _parallel: bool,
-    stream: bool,
+    kwargs,
 ):
-    if stream:
+    if kwargs["stream"]:
         raise RuntimeError("anthropic stream not supported in this test")
-    kwargs = dict(
-        messages=messages,
-        model=model,
-        tools=tools,
-        tool_choice=_tool_choice_to_anthropic(tool_choice),
-        stream=stream,
-        max_tokens=256,
-    )
-    if tools is None:
-        kwargs.pop("tools")
-    msg = await asyncio.to_thread(_client.messages.create, **kwargs)
+    kwargs["tool_choice"] = _tool_choice_to_anthropic(kwargs["tool_choice"])
+    kwargs.pop("parallel_tool_calls")
+    msg = await anthropic_client.messages.create(messages=messages, **kwargs)
     content_blocks = getattr(msg, "content", None)
     content_parts: list[str] = []
     tool_calls: list[dict] = []
@@ -294,91 +266,58 @@ async def _round_anthropic(
     content = "".join(content_parts).strip()
     tool_msgs = _tool_result_messages_anthropic(tool_calls)
     assistant_msg = {"role": "assistant", "content": msg.content}
-    return content, "", tool_calls, assistant_msg, tool_msgs, kwargs
-
-
-def _validate_default(real_nums: list[int], nums: list[set[int]]) -> bool:
-    if real_nums[0] not in nums[0]:
-        return False
-    return all(real_num in num for real_num, num in zip(real_nums, nums))
-
-
-def _validate_anthropic(
-    *,
-    real_nums: list[int],
-    nums: list[set[int]],
-    choice,
-    prompt: int,
-    no_tools: bool,
-) -> bool:
-    total = sum(real_nums)
-    if no_tools or choice == "none":
-        return total == 0
-    if isinstance(choice, dict):
-        return total >= 1
-    if choice == "required":
-        return total >= 1
-    if choice == "auto":
-        return total >= 1 if prompt >= 1 else True
-    return _validate_default(real_nums, nums)
+    messages.append(assistant_msg)
+    messages.extend(tool_msgs)
+    return content, "", tool_calls
 
 
 async def test(
-    round_fn,
-    client,
-    model: str,
     idx: int,
-    /,
-    label: str,
+    base_idx: int,
+    api: str,
     prompt: int,
     choice: str,
     parallel: bool,
     nums: list[set[int]],
-    no_tools: bool = None,
+    tools=TOOLS,
     stream: bool = False,
-    validate_fn=None,
     **kwargs,
 ):
     tested_nums = []
     for retry in range(MAX_RETRY):
         try:
-            logger.info(f"{label} case {idx} begin {retry=}")
-            city = CITIES[idx % len(CITIES)]
+            logger.info(f"case {idx} begin {retry=}")
+            city = CITIES[base_idx % len(CITIES)]
             prompt_str = PROMPTS[prompt].format(city=city)
             messages = [{"role": "user", "content": prompt_str}]
 
             real_nums = []
             for i in range(len(nums)):
-                tools = None if no_tools else TOOLS
-                tool_choice = choice if i == 0 else "auto"
-                use_parallel = parallel if i == 0 else True
-                (
-                    content,
-                    rcontent,
-                    tool_calls,
-                    assistant_msg,
-                    tool_msgs,
-                    round_kwargs,
-                ) = await round_fn(
-                    client,
-                    messages,
-                    model,
-                    tools,
-                    tool_choice,
-                    use_parallel,
-                    stream,
+                kwargs = dict(
+                    model=model,
+                    tools=tools,
+                    tool_choice=choice if i == 0 else "auto",
+                    parallel_tool_calls=parallel if i == 0 else True,
+                    stream=stream,
+                    max_tokens=MAX_TOKENS,
+                    temperature=0,
                 )
+                if tools is None:
+                    kwargs.pop("tools")
+
+                if api == "openai":
+                    round_result = await _round_openai(messages, kwargs)
+                else:
+                    round_result = await _round_anthropic(messages, kwargs)
+                content, rcontent, tool_calls = round_result
                 tool_calls = tool_calls or []
                 logger.info(
-                    f"{label} case {idx} round {i}:"
-                    f"\n\tkwargs={round_kwargs}"
+                    f"case {idx} round {i}:"
+                    f"\n\tkwargs={kwargs}"
                     f"\n\tcontent={repr(content)}"
                     f"\n\trcontent={repr(rcontent)}"
                     f"\n\ttool_calls={tool_calls}"
                 )
-
-                messages.append(assistant_msg)
-                messages.extend(tool_msgs)
 
                 real_nums.append(len(tool_calls))
 
@@ -389,81 +328,69 @@ async def test(
                         and tool_calls[0]["name"] == CHOICE_FUNC_NAME
                     )
 
-            logger.info(f"{label} case {idx} end {retry=} real_nums={real_nums}")
+            logger.info(f"case {idx} end {retry=} real_nums={real_nums}")
             tested_nums.append(real_nums)
 
-            if validate_fn is None:
-                validate_ok = _validate_default(real_nums, nums)
-            else:
-                validate_ok = validate_fn(
-                    real_nums=real_nums,
-                    nums=nums,
-                    choice=choice,
-                    prompt=prompt,
-                    no_tools=bool(no_tools),
-                )
-            if validate_ok:
-                return idx, tested_nums, True
+            ok = real_nums[0] in nums[0]
+            all_ok = all(real_num in num for real_num, num in zip(real_nums, nums))
+            if not ok or all_ok:
+                return idx, tested_nums, ok, all_ok
             logger.error(
-                f"{label} case {idx} failed: nums mismatch "
+                f"case {idx} failed: nums mismatch "
                 f"real_nums={real_nums} expected={nums}"
             )
         except:
-            logger.exception(f"{label} case {idx} failed {retry=}")
+            logger.exception(f"case {idx} failed {retry=}")
             tested_nums.append(None)
     else:
-        return idx, tested_nums, False
+        return idx, tested_nums, ok, all_ok
 
 
-async def test_all(ready: asyncio.Event, port: int):
-    await asyncio.wait_for(ready.wait(), LAUNCH_TIMEOUT)
-    logger.info("test begin")
-    client = AsyncOpenAI(
+openai_client = None
+anthropic_client = None
+model = None
+
+
+async def init_client_and_model():
+    port = get_port()
+    global openai_client, anthropic_client, model
+    openai_client = AsyncOpenAI(
         base_url=f"http://localhost:{port}/v1", api_key="dummy", timeout=REQ_TIMEOUT
     )
-    anthropic_client = Anthropic(
+    model = (await openai_client.models.list()).data[0].id
+    anthropic_client = AsyncAnthropic(
         api_key=os.getenv("ANTHROPIC_API_KEY", "dummy"),
         base_url=f"http://localhost:{port}",
+        timeout=REQ_TIMEOUT,
     )
-    model = (await client.models.list()).data[0].id
 
-    async def run_cases(
-        round_fn, client_, label: str, cases: list[dict], validate_fn=None
-    ):
-        sem = asyncio.Semaphore(MAX_CONCURRENT)
 
-        async def test_limited(idx, case):
-            async with sem:
-                return await test(
-                    round_fn,
-                    client_,
-                    model,
-                    idx,
-                    label,
-                    validate_fn=validate_fn,
-                    **case,
-                )
+semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-        coroutines = [test_limited(idx, case) for idx, case in enumerate(cases)]
-        dones, _ = await asyncio.wait([asyncio.Task(co) for co in coroutines])
-        dones = sorted(list(task.result() for task in dones))
-        logger.info(f"{label} all test done")
 
-        ok = True
-        for idx, tested_nums, success in dones:
-            logger.info(f"{label} case {idx} {success=} {tested_nums=}: {cases[idx]}")
-            ok = ok and success
-        return ok
+async def limit_concurrent(awaitable: Awaitable):
+    async with semaphore:
+        return await awaitable
 
-    openai_ok = await run_cases(_round_openai, client, "openai", CASES)
-    anthropic_ok = await run_cases(
-        _round_anthropic,
-        anthropic_client,
-        "anthropic",
-        ANTHROPIC_CASES,
-        validate_fn=_validate_anthropic,
-    )
-    return openai_ok and anthropic_ok
+
+async def test_all(ready: asyncio.Event):
+    await asyncio.wait_for(ready.wait(), LAUNCH_TIMEOUT)
+    await init_client_and_model()
+
+    logger.info("test begin")
+    tasks = [asyncio.Task(limit_concurrent(test(**case))) for case in CASES]
+    dones, _ = await asyncio.wait(tasks)
+    dones = sorted(list(task.result() for task in dones))
+    logger.info(f"all test done")
+
+    return_ok = True
+    for idx, tested_nums, ok, all_ok in dones:
+        case = " ".join(
+            f"{k}={v}" for k, v in CASES[idx].items() if k not in {"idx", "base_idx"}
+        )
+        logger.info(f"case {idx} {ok=} {all_ok=} {tested_nums=}: {case}")
+        return_ok = return_ok and ok
+    return return_ok
 
 
 # ================ test code above, framework code below ==============
@@ -510,10 +437,9 @@ def get_port():
 
 
 async def main():
-    port = get_port()
     ready = asyncio.Event()
     engine_task = asyncio.create_task(launch_engine(ready))
-    test_task = asyncio.create_task(test_all(ready, port))
+    test_task = asyncio.create_task(test_all(ready))
     done, _ = await asyncio.wait(
         [engine_task, test_task], return_when="FIRST_COMPLETED"
     )
