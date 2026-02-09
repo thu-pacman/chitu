@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from chitu.backend import Backend
 from chitu.tokenizer import Tokenizer, TokenizerHF
 from chitu.serve.event_loop import get_server_event_loop
-from chitu.tool_call import ChoiceDelta
+from chitu.tool_call import ChoiceDelta, parse_stream_by_parser
 from chitu.reasoning.utils import get_initial_reasoning_state
 
 logger = getLogger(__name__)
@@ -151,11 +151,11 @@ class AsyncResponse:
         self.req = req
         self.id = req.request_id
         self.async_stream: AsyncDataStream = req.async_stream
-        self.tool_parser = Backend.tool_parser() if req.tools else None
+        self.tool_parser = Backend.tool_parser(req.tools) if req.tools else None
 
     def stream_generator(self):
         if self.tool_parser:
-            stream = self.tool_parser.parse_stream(self.async_stream)
+            stream = parse_stream_by_parser(self.async_stream, self.tool_parser)
         else:
             stream = self.async_stream
 

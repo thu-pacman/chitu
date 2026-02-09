@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from chitu.backend import Backend
 from chitu.global_vars import get_global_args
 from chitu.task import Task, TaskPool, UserRequest
-from chitu.tool_call import get_tool_parser
+from chitu.tool_call import get_tool_parser, parse_stream_by_parser
 from chitu.tool_call.types import (
     ChoiceToolCall,
     ToolChoiceNamedTool,
@@ -424,8 +424,13 @@ async def anthropic_stream_from_async_stream(*, req_obj, response_model: str):
     )
 
     tool_parser_cls = get_active_tool_parser()
-    tool_parser = tool_parser_cls() if getattr(req_obj, "tools", None) else None
-    stream = tool_parser.parse_stream(async_stream) if tool_parser else async_stream
+    tools = getattr(req_obj, "tools", None)
+    tool_parser = tool_parser_cls(tools) if tools else None
+    stream = (
+        parse_stream_by_parser(async_stream, tool_parser)
+        if tool_parser
+        else async_stream
+    )
 
     block_index = -1
     current_block_type: Optional[str] = None  # "thinking" | "text"
@@ -810,7 +815,7 @@ async def handle_messages_request(
     tool_calls = []
     if tools:
         parser_cls = get_active_tool_parser()
-        parser = parser_cls()
+        parser = parser_cls(tools)
         output_text, tool_calls = parser.parse_string(output_text)
 
     content_blocks: list[dict] = []

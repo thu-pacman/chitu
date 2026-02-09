@@ -635,6 +635,8 @@ The benchmark follows the following assumption, and you should keep them consist
 - Default sampling parameters are used. See `class UserRequest` in `chitu/task.py` for default values.
 - There is no caching between requests.
 
+Note that the benchmarking script uses a lot of file handles when `--batch-size` is large, which may be over the limit by `ulimit`. **It is recommended to raise to limit before benchmarking, for example by `ulimit -n 65536`.**
+
 ## Environment Variables
 
 Install time:

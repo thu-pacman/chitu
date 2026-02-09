@@ -636,6 +636,8 @@ python benchmarks/benchmark_serving.py \
 - 会使用默认的采样参数进行推理。默认的采样参数可在 `chitu/task.py` 中的 `class UserRequest` 中查看。
 - 不在请求间进行缓存。
 
+注意当 `--batch-size` 较大时，性能测试工具会占用大量文件描述符，可能超过 `ulimit` 限制。**建议在运行性能测试前提升限制，如 `ulimit -n 65536`。**
+
 ## 环境变量
 
 安装时：

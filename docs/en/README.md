@@ -13,6 +13,8 @@ Chitu is a high-performance large model inference framework focused on efficienc
 > Chitu refers to a famous fast horse in Chinese history.
 
 ## Milestones
+* [2026/02/06] Released v0.5.1, supporting MooreThreads GPUs.
+* [2025/12/12] Released v0.5.0, focusing on improving performance on cluster deplyment scenarios.
 * [2025/08/01] Released v0.4.0, significantly improving performance and stability for all-in-one inference deployment scenarios, supporting Ascend, NVIDIA, Muxi, Hygon, and compatible with DeepSeek, Qwen, GLM, Kimi models.
 * [2025/07/28] Released v0.3.9, first to support Huawei Ascend 910B inference deployment for GLM-4.5 MoE model.
 * [2025/06/12] Released v0.3.5, providing complete native support for Ascend 910B and high-performance inference solutions for Qwen3 series models.

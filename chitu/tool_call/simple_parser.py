@@ -4,8 +4,8 @@
 
 import uuid
 import re
-from collections import deque, defaultdict
-from typing import AsyncGenerator, Any
+from collections import defaultdict
+from typing import AsyncIterable, AsyncGenerator
 from xgrammar import Grammar
 from xgrammar.structural_tag import (
     StructuralTag,
@@ -41,10 +41,10 @@ class SimpleParser(AbstractToolParser):
     reasoning_begin_tag: str = ""
     reasoning_end_tag: str = ""
 
-    def __init__(self):
+    def __init__(self, tools):
         self.automaton = Automaton(self.rules, self.rules_regex)
 
-    def __init_subclass__(cls, **kwargs):
+    def __init_subclass__(cls):
         cls._parse_template()
         cls._build_regex()
         cls._build_rules()
@@ -116,6 +116,14 @@ class SimpleParser(AbstractToolParser):
         cls.rules_regex = Automaton.generate_regex(rules)
 
     @classmethod
+    def build_tool_format(cls, name: str, schema: dict):
+        return TagFormat(
+            begin=f"{cls.tool_begin_tag}{cls.tool_begin}{name}{cls.tool_mid}",
+            content=JSONSchemaFormat(json_schema=schema),
+            end=f"{cls.tool_end}{cls.tool_end_tag}",
+        )
+
+    @classmethod
     def build_grammar(
         cls,
         params: ToolCallParams,
@@ -138,11 +146,7 @@ class SimpleParser(AbstractToolParser):
             for tool in params.tools
         ]
         tool_tags = [
-            TagFormat(
-                begin=f"{cls.tool_begin_tag}{cls.tool_begin}{name}{cls.tool_mid}",
-                content=JSONSchemaFormat(json_schema=schema),
-                end=f"{cls.tool_end}{cls.tool_end_tag}",
-            )
+            cls.build_tool_format(name, schema)
             for name, schema in tool_infos
             if forced_tool is None or forced_tool == name
         ]
@@ -185,23 +189,22 @@ class SimpleParser(AbstractToolParser):
         grammar = Grammar.from_structural_tag(StructuralTag(format=format))
         return grammar
 
-    @classmethod
-    def parse_string(cls, content: str) -> tuple[str, list[ChoiceToolCall]]:
+    def parse_string(self, content: str) -> tuple[str, list[ChoiceToolCall]]:
         tools: list[ChoiceToolCall] = []
         remove_spans: list[tuple[int, int]] = []
         tools_segments: list[str] = []
-        if cls.tools_regex:
-            for match in cls.tools_regex.finditer(content):
+        if self.tools_regex:
+            for match in self.tools_regex.finditer(content):
                 remove_spans.append(match.span())
                 tools_segments.append(match[1])
         else:
             tools_segments = [content]
 
         for tools_segment in tools_segments:
-            for match in cls.tool_regex.finditer(tools_segment):
-                if not cls.tools_regex:
+            for match in self.tool_regex.finditer(tools_segment):
+                if not self.tools_regex:
                     remove_spans.append(match.span())
-                extract_match = cls.tool_extract_regex.fullmatch(match[1])
+                extract_match = self.tool_extract_regex.fullmatch(match[1])
                 if not extract_match:
                     logger.warning(f"tool parser match failed with {repr(match[1])}")
                     continue
@@ -225,15 +228,10 @@ class SimpleParser(AbstractToolParser):
 
         return content, tools
 
-    async def parse_stream(
-        self, stream: AsyncGenerator[tuple[str, bool, Any], None]
-    ) -> AsyncGenerator[tuple[ChoiceDelta, bool, Any], None]:
+    async def parse_stream(self, stream: AsyncIterable[str]):
         index = -1
         old_state = state = "content"
-        async for content, is_reasoning, extra in stream:
-            if is_reasoning:
-                yield ChoiceDelta(reasoning_content=content), True, extra
-                continue
+        async for content in stream:
             content, state = self.automaton.step(content)
             if not content:
                 continue
@@ -246,17 +244,17 @@ class SimpleParser(AbstractToolParser):
                     id_ = str(uuid.uuid4())
 
             if state == "content":
-                yield ChoiceDelta(content=content), False, extra
+                yield ChoiceDelta(content=content)
             elif state in {"name", "arguments"}:
                 function = ChoiceDeltaToolCallFunction()
                 setattr(function, state, content)
                 tool_call = ChoiceDeltaToolCall(index=index, id=id_, function=function)
-                yield ChoiceDelta(tool_calls=[tool_call]), False, extra
+                yield ChoiceDelta(tool_calls=[tool_call])
             else:
-                yield ChoiceDelta(content=""), False, extra
+                yield ChoiceDelta(content="")
 
         if self.automaton.buffer and state == "content":
-            yield ChoiceDelta(content=self.automaton.buffer), False, extra
+            yield ChoiceDelta(content=self.automaton.buffer)
 
 
 class Automaton:
@@ -268,7 +266,12 @@ class Automaton:
     ):
         self.rules = rules
         self.rules_regex = rules_regex
+        self.init_state = init_state
         self.state = init_state
+        self.buffer = ""
+
+    def reset(self):
+        self.state = self.init_state
         self.buffer = ""
 
     def step(self, content: str) -> tuple[str, str]:
@@ -290,6 +293,7 @@ class Automaton:
         for state, keys in rules.items():
             prefixs: set[str] = set()
             for key in keys:
+                assert key, "transfer key must be non-empty"
                 for i in range(1, len(key)):
                     prefixs.add(re.escape(key[:i]))
             r_prefixs = "|".join(sorted(prefixs))

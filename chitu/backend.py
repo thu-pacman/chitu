@@ -1308,6 +1308,21 @@ class Backend:
         except:
             logger.exception(f"patch chat template failed, tool call may be incorrect!")
 
+        # Initialize tool parser
+        tool_parser_config = getattr(args.models, "tool_parser", "MISSING")
+        Backend.tool_parser = get_tool_parser(tool_parser_config)
+        logger.info(
+            f"using tool parser {Backend.tool_parser} from config {repr(tool_parser_config)}"
+        )
+        try:
+            Backend.tokenizer.model.chat_template = (
+                Backend.tool_parser.patch_chat_template(
+                    Backend.tokenizer.model.chat_template
+                )
+            )
+        except:
+            logger.exception(f"patch chat template failed, tool call may be incorrect!")
+
         attn_backend_type = Backend._get_attention_backend_type(args)
 
         # Initialize cache manager
