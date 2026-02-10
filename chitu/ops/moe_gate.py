@@ -89,6 +89,7 @@ def moe_gate(
         elif (
             has_chitu_backend
             and scores.shape[-1] <= 256
+            and topk == 8  # just 8 are supported now in cuda kernel
             and is_power_of_two(scores.shape[-1])
         ):
             impl = "cuda"

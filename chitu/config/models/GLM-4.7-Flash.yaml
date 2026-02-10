@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: GLM-4.7-Flash
+type: deepseek-v3
+source: "https://huggingface.co/zai-org/GLM-4.7-Flash" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+tokenizer_type: "hf" # one of: hf, tiktoken
+vocab_size: 154880
+dim: 2048
+inter_dim: 10240
+moe_inter_dim: 1536
+n_layers: 47
+n_dense_layers: 1
+n_heads: 20
+n_routed_experts: 64
+n_shared_experts: 1
+n_activated_experts: 4
+n_expert_groups: 1
+n_limited_groups: 1
+route_scale: 1.8
+score_func: "sigmoid"
+norm_topk_prob: True
+q_lora_rank: 768
+kv_lora_rank: 512
+qk_nope_head_dim: 192
+qk_rope_head_dim: 64
+v_head_dim: 256
+rope_theta: 1000000.0
+rope_factor: 1
+eos_token_id: [154820, 154827, 154829]

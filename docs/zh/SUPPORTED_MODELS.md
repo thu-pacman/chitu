@@ -56,6 +56,8 @@
   用法: 启动赤兔时追加 `models=GLM-4.6V` 启动参数
 - GLM-4.7
   用法: 启动赤兔时追加 `models=GLM-4.7` 启动参数
+- GLM-4.7-Flash
+  用法: 启动赤兔时追加 `models=GLM-4.7-Flash` 启动参数
 - GLM-Z1-32B-0414
   用法: 启动赤兔时追加 `models=GLM-Z1-32B-0414` 启动参数
 - GLM-Z1-9B-0414
