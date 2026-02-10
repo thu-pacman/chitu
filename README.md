@@ -42,9 +42,11 @@ Chitu「赤兔」是一个专注于效率、灵活性和可用性的高性能大
 请参阅[开发手册](/docs/zh/DEVELOPMENT.md)获取完整的安装使用说明。
 
 对于在单机环境上快速验证的场景，建议使用官方镜像进行部署。目前提供适用于以下平台的镜像：
-* 昇腾：qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-ascend:latest
-* 英伟达：qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-nvidia:latest
-* 沐曦：qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-muxi:latest
+- 英伟达（arch 8.0、8.9）：qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-nvidia_arch_80_89:latest
+- 英伟达（arch 9.0）：qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-nvidia_arch_90:latest
+- 沐曦：qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-muxi:latest
+- 昇腾（A2）：qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-ascend_a2:latest
+- 昇腾（A3）：qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-ascend_a3:latest
 
 ### 查看支持的模型
 
