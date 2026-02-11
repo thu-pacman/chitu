@@ -507,13 +507,6 @@ def chitu_init(args):
     ):
         os.environ["NCCL_NVLS_NCHANNELS"] = "32"
 
-    if (
-        args.models.type == "deepseek-v3"
-        and args.models.n_layers == 61
-        and args.infer.mtp_size > 1
-    ):
-        args.models.n_layers += 1
-
     init_logger()
 
     ###################################################################

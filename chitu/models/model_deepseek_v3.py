@@ -122,6 +122,8 @@ class Indexer(torch.nn.Module):
         self.n_heads: int = args.index_n_heads
         self.head_dim: int = args.index_head_dim
         self.rope_head_dim: int = args.qk_rope_head_dim
+        self.index_rope_layout = getattr(args, "index_rope_layout", "separated")
+
         # Adjust index_topk not exceed max_seq_len max_seq_len to avoid out-of-range errors
         max_seq_len = get_global_args().infer.max_seq_len
         self.index_topk: int = min(args.index_topk, max_seq_len)
@@ -138,7 +140,10 @@ class Indexer(torch.nn.Module):
             has_bias=False,
             checkpoint_prefix=f"{checkpoint_prefix}.wk",
         )
-        self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
+        self.k_norm = LayerNorm(
+            self.head_dim,
+            dtype=parse_dtype(getattr(args, "index_norm_dtype", "float32")),
+        )
         self.weights_proj = LocalLinear(
             self.dim,
             self.n_heads,
@@ -169,7 +174,7 @@ class Indexer(torch.nn.Module):
             freqs_cis,
             q_rotary_end=self.rope_head_dim,
             k_rotary_end=self.rope_head_dim,
-            rotary_type="separated",
+            rotary_type=self.index_rope_layout,
         )
 
         q = self._rotate_activation(q)
@@ -382,6 +387,7 @@ class AttentionDeepSeekV3(Attention):
                 if hasattr(args, "rms_norm_dtype")
                 else None
             ),
+            eps=getattr(args, "rms_norm_eps", 1e-6),
         )
         self.q_b_proj = ColumnParallelLinear(
             self.q_lora_rank,
@@ -414,6 +420,7 @@ class AttentionDeepSeekV3(Attention):
                 if hasattr(args, "rms_norm_dtype")
                 else None
             ),
+            eps=getattr(args, "rms_norm_eps", 1e-6),
         )
 
         if self.mla_absorb == "none":
@@ -651,10 +658,7 @@ class AttentionDeepSeekV3(Attention):
 
 
 class SharedHead(nn.Module):
-    def __init__(
-        self,
-        args,
-    ) -> None:
+    def __init__(self, args) -> None:
         super().__init__()
 
         self.norm = RMSNorm(
@@ -664,15 +668,32 @@ class SharedHead(nn.Module):
                 if hasattr(args, "rms_norm_dtype")
                 else None
             ),
+            eps=getattr(args, "rms_norm_eps", 1e-6),
         )
 
-        self.head = ColumnParallelLinear(
-            args.dim,
-            args.vocab_size,
-            has_bias=False,
-            gather_output=True,
-            checkpoint_prefix="mtp.head",
-        )
+        self.mtp_tie_lm_head = getattr(args, "mtp_tie_lm_head", False)
+        if not self.mtp_tie_lm_head:
+            self.head = ColumnParallelLinear(
+                args.dim,
+                args.vocab_size,
+                has_bias=False,
+                gather_output=True,
+                checkpoint_prefix="mtp.head",
+            )
+        # NOTE: Don't assign `tied_lm_head` tensor here, otherwise
+        # it will be copied
+
+    @override
+    def forward(
+        self, x: torch.Tensor, *, tied_lm_head: Optional[torch.nn.Module] = None
+    ):
+        x = self.norm(x, compute_dtype=x.dtype)
+        if not self.mtp_tie_lm_head:
+            x = self.head(x)
+        else:
+            assert tied_lm_head is not None
+            x = tied_lm_head(x)
+        return x
 
 
 class MLPDeepSeekV3(nn.Module):
@@ -987,6 +1008,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                 if hasattr(args, "rms_norm_dtype")
                 else None
             ),
+            eps=getattr(args, "rms_norm_eps", 1e-6),
         )
         self.post_attention_layernorm = RMSNorm(
             args.dim,
@@ -995,6 +1017,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                 if hasattr(args, "rms_norm_dtype")
                 else None
             ),
+            eps=getattr(args, "rms_norm_eps", 1e-6),
         )
 
     def forward(
@@ -1007,7 +1030,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         return x
 
 
-class TransformerBlockDeepSeekV3MPT(TransformerBlockDeepSeekV3):
+class TransformerBlockDeepSeekV3MTP(TransformerBlockDeepSeekV3):
     def __init__(
         self,
         layer_id: int,
@@ -1016,7 +1039,8 @@ class TransformerBlockDeepSeekV3MPT(TransformerBlockDeepSeekV3):
         attn_backend,
         op_impl,
         mla_absorb,
-        checkpoint_prefix="",
+        *,
+        checkpoint_prefix,
         indexer_cache: Optional[KVCacheManagerBase] = None,
     ):
         super().__init__(
@@ -1037,6 +1061,7 @@ class TransformerBlockDeepSeekV3MPT(TransformerBlockDeepSeekV3):
                 if hasattr(args, "rms_norm_dtype")
                 else None
             ),
+            eps=getattr(args, "rms_norm_eps", 1e-6),
         )
 
         self.hnorm = RMSNorm(
@@ -1046,11 +1071,12 @@ class TransformerBlockDeepSeekV3MPT(TransformerBlockDeepSeekV3):
                 if hasattr(args, "rms_norm_dtype")
                 else None
             ),
+            eps=getattr(args, "rms_norm_eps", 1e-6),
         )
-
         self.eh_proj = torch.nn.Linear(args.dim * 2, args.dim, bias=False)
         self.shared_head = SharedHead(args)
-        self.embed_tokens = VocabParallelEmbedding(args.vocab_size, args.dim)
+        if not getattr(args, "mtp_tie_word_embeddings", False):
+            self.embed_tokens = VocabParallelEmbedding(args.vocab_size, args.dim)
 
     @override
     def forward(
@@ -1106,8 +1132,10 @@ class TransformerDeepSeekV3(Transformer):
             "gate_up_proj",
             "lm_head",
         ]
-        if self.mtp_size > 1:
-            tensor_column_parallel_list.append("layers.61.shared_head.head")
+        if self.mtp_size > 1 and not getattr(self.params, "mtp_tie_lm_head", False):
+            tensor_column_parallel_list.append(
+                f"layers.{self.params.n_layers}.shared_head.head"
+            )
         return tensor_column_parallel_list
 
     @override
@@ -1120,7 +1148,10 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def _get_post_layer_prefixes(self) -> list[str]:
-        return ["lm_head.", "norm."]
+        ret = ["lm_head.", "norm."]
+        if self.mtp_size > 1 and not getattr(self.params, "mtp_tie_lm_head", False):
+            ret += ["embed_tokens."]
+        return ret
 
     @override
     def _get_layer_i_prefixes(self, i: int) -> list[str]:
@@ -1144,7 +1175,7 @@ class TransformerDeepSeekV3(Transformer):
         fuse_shared_experts = get_global_args().infer.fuse_shared_experts
         n_dense_layers = self.args.models.n_dense_layers
         local_experts = compute_expert_dist_in_ep(
-            self.args.models.n_layers - self.args.models.n_dense_layers,
+            self.global_n_layers - n_dense_layers,  # MTP layer included
             self.ep_size,
             self.args.models.n_routed_experts,
             self.moe_impl,
@@ -1730,41 +1761,36 @@ class TransformerDeepSeekV3(Transformer):
         import resource
 
         memory_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        local_end_layer_id = (
-            self.local_end_layer_id - 1
-            if self.mtp_size > 1
-            else self.local_end_layer_id
-        )
-        for layer_id in range(self.local_begin_layer_id, local_end_layer_id):
+        for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
             logger.debug(
                 f"initing layer : {layer_id}  cpu memory usage: {memory_usage / 1024**2} GB  gpu memory usage : RANK : {torch.cuda.current_device()} {torch.cuda.memory_allocated()/(1024**3)} GB"
             )
-            self.layers.append(
-                TransformerBlockDeepSeekV3(
-                    layer_id,
-                    self.params,
-                    cache,
-                    attn_backend,
-                    self.op_impl,
-                    mla_absorb=self.mla_absorb,
-                    checkpoint_prefix=f"layers.{layer_id}",
-                    indexer_cache=self.indexer_cache,
+            if not (self.mtp_size > 1 and layer_id + 1 == self.local_end_layer_id):
+                self.layers.append(
+                    TransformerBlockDeepSeekV3(
+                        layer_id,
+                        self.params,
+                        cache,
+                        attn_backend,
+                        self.op_impl,
+                        mla_absorb=self.mla_absorb,
+                        checkpoint_prefix=f"layers.{layer_id}",
+                        indexer_cache=self.indexer_cache,
+                    )
                 )
-            )
-        if self.mtp_size > 1:
-            layer_id = 61
-            self.layers.append(
-                TransformerBlockDeepSeekV3MPT(
-                    layer_id,
-                    self.params,
-                    cache,
-                    attn_backend,
-                    self.op_impl,
-                    mla_absorb=self.mla_absorb,
-                    checkpoint_prefix=f"layers.{layer_id}",
-                    indexer_cache=self.indexer_cache,
+            else:
+                self.layers.append(
+                    TransformerBlockDeepSeekV3MTP(
+                        layer_id,
+                        self.params,
+                        cache,
+                        attn_backend,
+                        self.op_impl,
+                        mla_absorb=self.mla_absorb,
+                        checkpoint_prefix=f"layers.{layer_id}",
+                        indexer_cache=self.indexer_cache,
+                    )
                 )
-            )
 
     @override
     def _init_post_layers(self):
@@ -1775,6 +1801,7 @@ class TransformerDeepSeekV3(Transformer):
                 if hasattr(self.params, "rms_norm_dtype")
                 else None
             ),
+            eps=getattr(self.params, "rms_norm_eps", 1e-6),
         )
         self.lm_head = ColumnParallelLinear(
             self.params.dim,
@@ -1790,7 +1817,10 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def _pre_layers_mtp(self, h, **args):
-        h = self.layers[-1].embed_tokens(h)
+        if not getattr(self.params, "mtp_tie_word_embeddings", False):
+            h = self.layers[-1].embed_tokens(h)
+        else:
+            h = self.embed_tokens(h)
         return h
 
     @override
@@ -1807,9 +1837,10 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def _post_layers_mtp(self, h):
-        h = self.layers[-1].shared_head.norm(h, compute_dtype=h.dtype)
-        h = self.layers[-1].shared_head.head(h)
-        return h
+        if not getattr(self.params, "mtp_tie_lm_head", False):
+            return self.layers[-1].shared_head(h)
+        else:
+            return self.layers[-1].shared_head(h, tied_lm_head=self.lm_head)
 
     @override
     def precompute_freqs_cis(self, max_position_embeddings: int, device):

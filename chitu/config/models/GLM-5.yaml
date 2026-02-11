@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: GLM-5
+type: deepseek-v3
+source: "https://huggingface.co/zai-org/GLM-5" # Just for displaying. No automatic download.
+ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
+tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+tokenizer_type: "hf" # one of: hf, tiktoken
+vocab_size: "$(config.json:vocab_size)"
+dim: "$(config.json:hidden_size)"
+inter_dim: "$(config.json:intermediate_size)"
+moe_inter_dim: "$(config.json:moe_intermediate_size)"
+n_layers: "$(config.json:num_hidden_layers)"
+n_dense_layers: "$(config.json:first_k_dense_replace)"
+n_heads: "$(config.json:num_attention_heads)"
+n_routed_experts: "$(config.json:n_routed_experts)"
+n_shared_experts: "$(config.json:n_shared_experts)"
+n_activated_experts: "$(config.json:num_experts_per_tok)"
+n_expert_groups: "$(config.json:n_group)"
+n_limited_groups: 1
+route_scale: "$(config.json:routed_scaling_factor)"
+score_func: "$(config.json:scoring_func)"
+norm_topk_prob: "$(config.json:norm_topk_prob)"
+q_lora_rank: "$(config.json:q_lora_rank)"
+kv_lora_rank: "$(config.json:kv_lora_rank)"
+qk_nope_head_dim: "$(config.json:qk_nope_head_dim)"
+qk_rope_head_dim: "$(config.json:qk_rope_head_dim)"
+v_head_dim: "$(config.json:v_head_dim)"
+rope_theta: "$(config.json:rope_theta)"
+rope_factor: 1
+index_head_dim: "$(config.json:index_head_dim)"
+index_n_heads: "$(config.json:index_n_heads)"
+index_topk: "$(config.json:index_topk)"
+index_rope_layout: "interleaved"
+index_norm_dtype: bfloat16
+rms_norm_dtype: bfloat16
+rms_norm_eps: "$(config.json:rms_norm_eps)"
+mtp_tie_word_embeddings: True
+mtp_tie_lm_head: True
+eos_token_id: "$(config.json:eos_token_id)"
+tool_parser: GLM47ToolParser

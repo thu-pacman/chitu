@@ -76,8 +76,14 @@ class LayerNorm(nn.Module):
     def forward(self, x: torch.Tensor, compute_dtype=None):
         if compute_dtype is None:
             compute_dtype = torch.float32
+        else:
+            compute_dtype = self.weight.dtype
         return torch.nn.functional.layer_norm(
-            x.to(compute_dtype), (self.dim,), self.weight, self.bias, self.eps
+            x.to(compute_dtype),
+            (self.dim,),
+            self.weight.to(compute_dtype),
+            self.bias.to(compute_dtype),
+            self.eps,
         ).type_as(x)
 
 
@@ -234,9 +240,12 @@ class Transformer(nn.Module):
         self.pp_main_rank = (self.rank // tensor_parallel_size) * tensor_parallel_size
         self.pp_end_stage = get_pp_size() - 1
 
+        # `get_global_args()` can be a Hydra/OmegaConf object; force to plain int for type checkers.
+        self.mtp_size = int(getattr(get_global_args().infer, "mtp_size", 1))
+
         self.params = params
         self.vocab_size = params.vocab_size
-        self.global_n_layers = params.n_layers
+        self.global_n_layers = params.n_layers + (1 if self.mtp_size > 1 else 0)
         if self.pipeline_exec:
             num_layers_of_each_rank = compute_layer_dist_in_pp(
                 self.global_n_layers, self.pipeline_parallel_size
@@ -249,9 +258,6 @@ class Transformer(nn.Module):
         else:
             self.local_begin_layer_id = 0
             self.local_end_layer_id = self.global_n_layers
-
-        # `get_global_args()` can be a Hydra/OmegaConf object; force to plain int for type checkers.
-        self.mtp_size = int(getattr(get_global_args().infer, "mtp_size", 1))
 
         if not self.pipeline_exec or self.pp_stage == 0:
             self._init_pre_layers()

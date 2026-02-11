@@ -19,7 +19,7 @@ def get_device_name():
     global _device_name
     if _device_name is None:
         if torch.cuda.is_available():
-            _device_name = torch.cuda.get_device_name()
+            _device_name = torch.cuda.get_device_name(0)
         elif hasattr(torch, "musa") and torch.musa.is_available():
             _device_name = torch.musa.get_device_name()
         else:

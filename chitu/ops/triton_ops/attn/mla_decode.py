@@ -57,6 +57,7 @@ def _mla_attn_kernel(
     stride_o_h: tl.constexpr,
     stride_o_s: tl.constexpr,
     stride_topk_indices_bs: tl.constexpr,
+    N_HEADS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_KV_SPLITS: tl.constexpr,
@@ -77,12 +78,14 @@ def _mla_attn_kernel(
 
     offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
     cur_head = cur_head_id * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_mask = cur_head < N_HEADS
     offs_q_nope = (
         cur_batch * stride_q_nope_bs
         + cur_head[:, None] * stride_q_nope_h
         + offs_d_ckv[None, :]
     )
-    q_nope = tl.load(Q_nope + offs_q_nope)
+    q_nope_mask = head_mask[:, None]
+    q_nope = tl.load(Q_nope + offs_q_nope, mask=q_nope_mask)
 
     offs_d_kpe = tl.arange(0, HEAD_DIM_KPE)
     offs_q_pe = (
@@ -90,7 +93,8 @@ def _mla_attn_kernel(
         + cur_head[:, None] * stride_q_pe_h
         + offs_d_kpe[None, :]
     )
-    q_pe = tl.load(Q_pe + offs_q_pe)
+    q_pe_mask = head_mask[:, None]
+    q_pe = tl.load(Q_pe + offs_q_pe, mask=q_pe_mask)
 
     e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
     e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
@@ -173,14 +177,16 @@ def _mla_attn_kernel(
             + split_kv_id * stride_o_s
             + offs_d_ckv[None, :]
         )
-        tl.store(O + offs_o, acc / e_sum[:, None])
+        o_mask = head_mask[:, None]
+        tl.store(O + offs_o, acc / e_sum[:, None], mask=o_mask)
         offs_o_1 = (
             cur_batch * stride_o_b
             + cur_head * stride_o_h
             + split_kv_id * stride_o_s
             + HEAD_DIM_CKV
         )
-        tl.store(O + offs_o_1, e_max + tl.log(e_sum))
+        o_1_mask = head_mask
+        tl.store(O + offs_o_1, e_max + tl.log(e_sum), mask=o_1_mask)
 
 
 def _mla_attn(
@@ -196,17 +202,12 @@ def _mla_attn(
     page_size,
     topk_indices,
 ):
-    batch_size, head_num = q_nope.shape[0], q_nope.shape[1]
+    batch_size, n_heads = q_nope.shape[0], q_nope.shape[1]
     head_dim_ckv = q_nope.shape[-1]
     head_dim_kpe = q_pe.shape[-1]
 
     BLOCK_H = 16
-    grid = (
-        batch_size,
-        triton.cdiv(head_num, BLOCK_H),
-        num_kv_splits,
-    )
-
+    grid = (batch_size, triton.cdiv(n_heads, BLOCK_H), num_kv_splits)
     _mla_attn_kernel[grid](
         q_nope,
         q_pe,
@@ -228,6 +229,7 @@ def _mla_attn(
         attn_logits.stride(1),
         attn_logits.stride(2),
         topk_indices.stride(0) if topk_indices is not None else 0,
+        N_HEADS=n_heads,
         BLOCK_H=BLOCK_H,
         NUM_KV_SPLITS=num_kv_splits,
         PAGE_SIZE=page_size,
@@ -260,6 +262,7 @@ def _mla_attn_non_paged_kernel(
     stride_o_h: tl.constexpr,
     stride_o_s: tl.constexpr,
     stride_topk_indices_bs: tl.constexpr,
+    N_HEADS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_KV_SPLITS: tl.constexpr,
@@ -279,12 +282,14 @@ def _mla_attn_non_paged_kernel(
 
     offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
     cur_head = cur_head_id * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_mask = cur_head < N_HEADS
     offs_q_nope = (
         cur_batch * stride_q_nope_bs
         + cur_head[:, None] * stride_q_nope_h
         + offs_d_ckv[None, :]
     )
-    q_nope = tl.load(Q_nope + offs_q_nope)
+    q_nope_mask = head_mask[:, None]
+    q_nope = tl.load(Q_nope + offs_q_nope, mask=q_nope_mask)
 
     offs_d_kpe = tl.arange(0, HEAD_DIM_KPE)
     offs_q_pe = (
@@ -292,7 +297,8 @@ def _mla_attn_non_paged_kernel(
         + cur_head[:, None] * stride_q_pe_h
         + offs_d_kpe[None, :]
     )
-    q_pe = tl.load(Q_pe + offs_q_pe)
+    q_pe_mask = head_mask[:, None]
+    q_pe = tl.load(Q_pe + offs_q_pe, mask=q_pe_mask)
 
     e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
     e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
@@ -375,14 +381,16 @@ def _mla_attn_non_paged_kernel(
             + split_kv_id * stride_o_s
             + offs_d_ckv[None, :]
         )
-        tl.store(O + offs_o, acc / e_sum[:, None])
+        o_mask = head_mask[:, None]
+        tl.store(O + offs_o, acc / e_sum[:, None], mask=o_mask)
         offs_o_1 = (
             cur_batch * stride_o_b
             + cur_head * stride_o_h
             + split_kv_id * stride_o_s
             + HEAD_DIM_CKV
         )
-        tl.store(O + offs_o_1, e_max + tl.log(e_sum))
+        o_1_mask = head_mask
+        tl.store(O + offs_o_1, e_max + tl.log(e_sum), mask=o_1_mask)
 
 
 def _mla_attn_non_paged(
@@ -396,17 +404,12 @@ def _mla_attn_non_paged(
     sm_scale,
     topk_indices,
 ):
-    batch_size, head_num = q_nope.shape[0], q_nope.shape[1]
+    batch_size, n_heads = q_nope.shape[0], q_nope.shape[1]
     head_dim_ckv = q_nope.shape[-1]
     head_dim_kpe = q_pe.shape[-1]
 
     BLOCK_H = 16
-    grid = (
-        batch_size,
-        triton.cdiv(head_num, BLOCK_H),
-        num_kv_splits,
-    )
-
+    grid = (batch_size, triton.cdiv(n_heads, BLOCK_H), num_kv_splits)
     _mla_attn_non_paged_kernel[grid](
         q_nope,
         q_pe,
@@ -428,6 +431,7 @@ def _mla_attn_non_paged(
         attn_logits.stride(1),
         attn_logits.stride(2),
         topk_indices.stride(0) if topk_indices is not None else 0,
+        N_HEADS=n_heads,
         BLOCK_H=BLOCK_H,
         NUM_KV_SPLITS=num_kv_splits,
         HEAD_DIM_CKV=head_dim_ckv,
