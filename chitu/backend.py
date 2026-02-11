@@ -60,7 +60,7 @@ from chitu.quantization import (
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF, Processor
 from chitu.tool_call import get_tool_parser
 from chitu.constraint_decode import ConstraintDecodeManager
-from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div
+from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div, get_global_args
 from chitu.moe import init_moe_impl
 from chitu.global_vars import set_slot_handle
 from chitu.numa_utils import bind_process_to_numa
@@ -444,10 +444,12 @@ class Backend:
         pipeline_parallel_size = args.infer.pp_size
 
         # Determine layer distribution for pipeline parallelism
+        mtp_size = int(getattr(get_global_args().infer, "mtp_size", 1))
+        total_n_layers = args.models.n_layers + (1 if mtp_size > 1 else 0)
         if pipeline_parallel_size > 1:
             pipe_stage = get_pp_group().rank_in_group
             num_layers_of_each_rank = compute_layer_dist_in_pp(
-                args.models.n_layers, pipeline_parallel_size
+                total_n_layers, pipeline_parallel_size
             )
             first_layer_id_of_each_rank = list(
                 itertools.accumulate([0] + num_layers_of_each_rank)
@@ -456,7 +458,7 @@ class Backend:
             local_end_layer_id = first_layer_id_of_each_rank[pipe_stage + 1]
         else:
             local_begin_layer_id = 0
-            local_end_layer_id = args.models.n_layers
+            local_end_layer_id = total_n_layers
 
         local_layers = layer_filter_fn(range(local_begin_layer_id, local_end_layer_id))
         layer_id_map = GlobalLocalMap.from_list(local_layers)
@@ -499,10 +501,12 @@ class Backend:
         pipeline_parallel_size = args.infer.pp_size
 
         # Determine layer distribution for pipeline parallelism
+        mtp_size = int(getattr(get_global_args().infer, "mtp_size", 1))
+        total_n_layers = args.models.n_layers + (1 if mtp_size > 1 else 0)
         if pipeline_parallel_size > 1:
             pipe_stage = get_pp_group().rank_in_group
             num_layers_of_each_rank = compute_layer_dist_in_pp(
-                args.models.n_layers, pipeline_parallel_size
+                total_n_layers, pipeline_parallel_size
             )
             first_layer_id_of_each_rank = list(
                 itertools.accumulate([0] + num_layers_of_each_rank)
@@ -511,7 +515,7 @@ class Backend:
             local_end_layer_id = first_layer_id_of_each_rank[pipe_stage + 1]
         else:
             local_begin_layer_id = 0
-            local_end_layer_id = args.models.n_layers
+            local_end_layer_id = total_n_layers
 
         local_layers = layer_filter_fn(range(local_begin_layer_id, local_end_layer_id))
         layer_id_map = GlobalLocalMap.from_list(local_layers)
@@ -530,10 +534,12 @@ class Backend:
         device = torch.device("cpu" if args.infer.op_impl == "cpu" else "cuda")
         pipeline_parallel_size = args.infer.pp_size
 
+        mtp_size = int(getattr(get_global_args().infer, "mtp_size", 1))
+        total_n_layers = args.models.n_layers + (1 if mtp_size > 1 else 0)
         if pipeline_parallel_size > 1:
             pipe_stage = get_pp_group().rank_in_group
             num_layers_of_each_rank = compute_layer_dist_in_pp(
-                args.models.n_layers, pipeline_parallel_size
+                total_n_layers, pipeline_parallel_size
             )
             first_layer_id_of_each_rank = list(
                 itertools.accumulate([0] + num_layers_of_each_rank)
@@ -542,7 +548,7 @@ class Backend:
             local_end_layer_id = first_layer_id_of_each_rank[pipe_stage + 1]
         else:
             local_begin_layer_id = 0
-            local_end_layer_id = args.models.n_layers
+            local_end_layer_id = total_n_layers
 
         local_layers = layer_filter_fn(range(local_begin_layer_id, local_end_layer_id))
         layer_id_map = GlobalLocalMap.from_list(local_layers)
@@ -1139,9 +1145,6 @@ class Backend:
                 return False
             if getattr(args.models, "tie_word_embeddings", False) and "lm_head." in k:
                 return False
-            match = re.search(r"model\.layers\.(\d+)\.", k)
-            if match and int(match.group(1)) >= args.models.n_layers:
-                return False
             return True
 
         return key_filter
@@ -1174,12 +1177,17 @@ class Backend:
             if args.skip_preprocess:
                 checkpoint_prefix = model_prefix
 
-            state_dict = load_state_dict(
-                args.models.ckpt_dir,
-                skip_preprocess=args.skip_preprocess,
-                filter_key=key_filter,
-                prefix=checkpoint_prefix,
-            )
+            try:
+                state_dict = load_state_dict(
+                    args.models.ckpt_dir,
+                    skip_preprocess=args.skip_preprocess,
+                    key_filter=key_filter,
+                    prefix=checkpoint_prefix,
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Error loading checkpoint part from files by prefix {checkpoint_prefix}"
+                ) from e
             assert state_dict, f"No state dict found for prefix {checkpoint_prefix}"
 
             mapped = {}
@@ -1195,12 +1203,18 @@ class Backend:
                 ] = v
             state_dict = mapped
 
-            state_dict = Backend._handle_quantized_weights_casting(state_dict, args)
             target_prefix = local_layer_prefix or model_prefix
-            module = model.load_state_dict_by_prefix(
-                state_dict, target_prefix, args.skip_preprocess
-            )
-            module.apply(Backend._move_one_module_to_device)
+            try:
+                state_dict = Backend._handle_quantized_weights_casting(state_dict, args)
+                module = model.load_state_dict_by_prefix(
+                    state_dict, target_prefix, args.skip_preprocess
+                )
+                module.apply(Backend._move_one_module_to_device)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Error loading tensors into model part by prefix {target_prefix}"
+                ) from e
+
             del state_dict
 
         # Load non-layer weights
@@ -1248,7 +1262,7 @@ class Backend:
         params = load_state_dict(
             args.models.ckpt_dir,
             skip_preprocess=args.skip_preprocess,
-            filter_key=key_filter,
+            key_filter=key_filter,
         )
         params = Backend._remove_prefix(params, "model.")
         return Backend._remove_prefix(params, "language_model.")
@@ -1394,7 +1408,7 @@ def load_state_dict(
     hf_ckpt_path,
     *,
     skip_preprocess=False,
-    filter_key: Callable[[str], bool] = None,
+    key_filter: Callable[[str], bool] = None,
     prefix: str = "",
 ):
     if not skip_preprocess:
@@ -1410,14 +1424,16 @@ def load_state_dict(
             for name in f.keys():
                 if prefix and not name.startswith(prefix):
                     continue
-                if filter_key is None or filter_key(name):
+                if key_filter is None or key_filter(name):
                     param: torch.Tensor = f.get_tensor(name)
                     state_dict[name] = param
                 else:
                     ignored_params.append(name)
 
     if ignored_params:
-        logger.warning(f"Ignored {len(ignored_params)} params: {ignored_params}")
+        logger.info(
+            f"Ignored some parameters because related model features are disabled: {ignored_params}"
+        )
 
     return state_dict
 

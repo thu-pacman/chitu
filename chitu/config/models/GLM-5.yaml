@@ -34,7 +34,10 @@ index_head_dim: "$(config.json:index_head_dim)"
 index_n_heads: "$(config.json:index_n_heads)"
 index_topk: "$(config.json:index_topk)"
 index_rope_layout: "interleaved"
+index_norm_dtype: bfloat16
 rms_norm_dtype: bfloat16
 rms_norm_eps: "$(config.json:rms_norm_eps)"
+mtp_tie_word_embeddings: True
+mtp_tie_lm_head: True
 eos_token_id: "$(config.json:eos_token_id)"
 tool_parser: GLM47ToolParser

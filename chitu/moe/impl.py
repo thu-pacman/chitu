@@ -61,6 +61,8 @@ def init_moe_impl(args) -> None:
             raise ValueError(
                 "n_layers or num_hidden_layers must be specified in model args"
             )
+        if int(getattr(args.infer, "mtp_size", 1)) > 1:
+            n_layers += 1
         MOE_IMPL_INSTANCE = MoEImplEP(
             n_layers=n_layers,
             n_dense_layers=(
