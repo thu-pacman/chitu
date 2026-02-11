@@ -1007,7 +1007,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         return x
 
 
-class TransformerBlockDeepSeekV3MPT(TransformerBlockDeepSeekV3):
+class TransformerBlockDeepSeekV3MTP(TransformerBlockDeepSeekV3):
     def __init__(
         self,
         layer_id: int,
@@ -1754,7 +1754,7 @@ class TransformerDeepSeekV3(Transformer):
         if self.mtp_size > 1:
             layer_id = 61
             self.layers.append(
-                TransformerBlockDeepSeekV3MPT(
+                TransformerBlockDeepSeekV3MTP(
                     layer_id,
                     self.params,
                     cache,

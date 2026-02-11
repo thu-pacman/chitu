@@ -331,10 +331,13 @@ def test_mla_prefill_ragged_qo_paged_kv(
 
 
 @pytest.mark.parametrize("bs", [0, 1, 64])
-@pytest.mark.parametrize("local_n_heads", [16])
-@pytest.mark.parametrize("kv_lora_rank", [512])
-@pytest.mark.parametrize("qk_rope_head_dim", [64])
-@pytest.mark.parametrize("qk_nope_head_dim", [128])
+@pytest.mark.parametrize(
+    "local_n_heads,kv_lora_rank,qk_rope_head_dim,qk_nope_head_dim",
+    [
+        (16, 512, 64, 128),  # DeepSeek-V3 TP8
+        (20, 512, 64, 192),  # GLM-4.7-Flash TP1
+    ],
+)
 @pytest.mark.parametrize("topk", [None, 128])
 @pytest.mark.parametrize("use_separated_kv_lora_k_pe", [False, True])
 @pytest.mark.parametrize("impl", ["triton", "npu"])
@@ -473,10 +476,14 @@ def test_mla_decode_dense_kv(
 
 
 @pytest.mark.parametrize("bs", [0, 1, 64])
-@pytest.mark.parametrize("local_n_heads", [16, 128])
-@pytest.mark.parametrize("kv_lora_rank", [512])
-@pytest.mark.parametrize("qk_rope_head_dim", [64])
-@pytest.mark.parametrize("qk_nope_head_dim", [128])
+@pytest.mark.parametrize(
+    "local_n_heads,kv_lora_rank,qk_rope_head_dim,qk_nope_head_dim",
+    [
+        (128, 512, 64, 128),  # DeepSeek-V3 TP1
+        (16, 512, 64, 128),  # DeepSeek-V3 TP8
+        (20, 512, 64, 192),  # GLM-4.7-Flash TP1
+    ],
+)
 @pytest.mark.parametrize("page_size", [64, 256])
 @pytest.mark.parametrize("topk", [None, 128])
 @pytest.mark.parametrize("use_separated_kv_lora_k_pe", [False, True])
@@ -511,6 +518,11 @@ def test_mla_decode_paged_kv(
             pytest.skip("torch_npu is missing")
         if topk is not None:
             pytest.skip("torch_npu does not support topk")
+        if local_n_heads == 20:
+            # FIXME: We don't know whether there are other numbers of heads this function
+            # fails to support, because the internal torch_npu._npu_paged_attention_mla
+            # is undocumented.
+            pytest.skip("torch_npu does not support 20 heads")
     if impl == "flash_mla":
         if not has_accelerator() or not has_flash_mla:
             pytest.skip("flash_mla is missing")
