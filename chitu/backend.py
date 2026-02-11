@@ -358,7 +358,10 @@ class Backend:
         Returns:
             Initialized tokenizer
         """
-        trust_remote_code = args.models.name.startswith("glm-4")
+        model_name_lower = args.models.name.lower()
+        trust_remote_code = model_name_lower.startswith(
+            "glm-4"
+        ) or model_name_lower.startswith("glm-5")
         force_full_seq_decode = (
             args.models.tokenizer_force_full_seq_decode
             if hasattr(args.models, "tokenizer_force_full_seq_decode")
@@ -1117,20 +1120,8 @@ class Backend:
             ):
                 return False
             if (
-                args.models.type == "deepseek-v3"
-                and "model.layers.61" in k
-                and args.infer.mtp_size == 1
-            ):
-                return False
-            if (
-                args.models.name == "GLM-4.5-Air"
-                and "model.layers.46" in k
-                and args.infer.mtp_size == 1
-            ):
-                return False
-            if (
-                args.models.name in ["GLM-4.5", "GLM-4.6"]
-                and "model.layers.92" in k
+                args.models.type in ["deepseek-v3", "hf-glm-4-moe"]
+                and f"model.layers.{args.models.n_layers}" in k
                 and args.infer.mtp_size == 1
             ):
                 return False

@@ -177,7 +177,7 @@ class FlashMLABackend(TritonAttnBackend):
                 kv.view(
                     -1, 1, kv.size(-1)
                 ),  # (s_kv, h_kv, d) for flash_mla_sparse_fwd()
-                topk_indices,
+                topk_indices.to(torch.int32),
                 sm_scale=softmax_scale,
             )
 

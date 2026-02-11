@@ -122,6 +122,8 @@ class Indexer(torch.nn.Module):
         self.n_heads: int = args.index_n_heads
         self.head_dim: int = args.index_head_dim
         self.rope_head_dim: int = args.qk_rope_head_dim
+        self.index_rope_layout = getattr(args, "index_rope_layout", "separated")
+
         # Adjust index_topk not exceed max_seq_len max_seq_len to avoid out-of-range errors
         max_seq_len = get_global_args().infer.max_seq_len
         self.index_topk: int = min(args.index_topk, max_seq_len)
@@ -169,7 +171,7 @@ class Indexer(torch.nn.Module):
             freqs_cis,
             q_rotary_end=self.rope_head_dim,
             k_rotary_end=self.rope_head_dim,
-            rotary_type="separated",
+            rotary_type=self.index_rope_layout,
         )
 
         q = self._rotate_activation(q)
@@ -382,6 +384,7 @@ class AttentionDeepSeekV3(Attention):
                 if hasattr(args, "rms_norm_dtype")
                 else None
             ),
+            eps=getattr(args, "rms_norm_eps", 1e-6),
         )
         self.q_b_proj = ColumnParallelLinear(
             self.q_lora_rank,
@@ -414,6 +417,7 @@ class AttentionDeepSeekV3(Attention):
                 if hasattr(args, "rms_norm_dtype")
                 else None
             ),
+            eps=getattr(args, "rms_norm_eps", 1e-6),
         )
 
         if self.mla_absorb == "none":
@@ -664,6 +668,7 @@ class SharedHead(nn.Module):
                 if hasattr(args, "rms_norm_dtype")
                 else None
             ),
+            eps=getattr(args, "rms_norm_eps", 1e-6),
         )
 
         self.head = ColumnParallelLinear(
@@ -987,6 +992,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                 if hasattr(args, "rms_norm_dtype")
                 else None
             ),
+            eps=getattr(args, "rms_norm_eps", 1e-6),
         )
         self.post_attention_layernorm = RMSNorm(
             args.dim,
@@ -995,6 +1001,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                 if hasattr(args, "rms_norm_dtype")
                 else None
             ),
+            eps=getattr(args, "rms_norm_eps", 1e-6),
         )
 
     def forward(
@@ -1037,6 +1044,7 @@ class TransformerBlockDeepSeekV3MTP(TransformerBlockDeepSeekV3):
                 if hasattr(args, "rms_norm_dtype")
                 else None
             ),
+            eps=getattr(args, "rms_norm_eps", 1e-6),
         )
 
         self.hnorm = RMSNorm(
@@ -1046,6 +1054,7 @@ class TransformerBlockDeepSeekV3MTP(TransformerBlockDeepSeekV3):
                 if hasattr(args, "rms_norm_dtype")
                 else None
             ),
+            eps=getattr(args, "rms_norm_eps", 1e-6),
         )
 
         self.eh_proj = torch.nn.Linear(args.dim * 2, args.dim, bias=False)
@@ -1775,6 +1784,7 @@ class TransformerDeepSeekV3(Transformer):
                 if hasattr(self.params, "rms_norm_dtype")
                 else None
             ),
+            eps=getattr(self.params, "rms_norm_eps", 1e-6),
         )
         self.lm_head = ColumnParallelLinear(
             self.params.dim,

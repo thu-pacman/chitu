@@ -4,6 +4,8 @@
 
 import struct
 from typing import Optional
+import functools
+import operator
 
 import torch
 import triton
@@ -73,21 +75,33 @@ def blockfp8_act_quant_triton(
             - The quantized tensor with dtype `torch.float8_e4m3fn`.
             - A tensor of scaling factors with dtype `torch.float32`.
     """
-    assert x.is_contiguous(), "Input tensor must be contiguous"
+
     assert (
-        x.size(-1) % block_size == 0
+        x.shape[-1] % block_size == 0
     ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
+    y = torch.empty(*x.shape, dtype=torch.float8_e4m3fn, device=x.device)
+    s = torch.empty(
+        *x.shape[:-1], x.shape[-1] // block_size, dtype=torch.float32, device=x.device
+    )
 
     if x.numel() >= 2147483648:
         INDEX_DTYPE = tl.int64
     else:
         INDEX_DTYPE = tl.int32
 
-    grid = lambda meta: (triton.cdiv(x.numel(), meta["BLOCK_SIZE"]),)
+    grid = lambda meta: (
+        functools.reduce(operator.mul, x.shape[:-1], 1),
+        triton.cdiv(x.shape[-1], meta["BLOCK_SIZE"]),
+    )
     blockfp8_act_quant_kernel[grid](
-        x, y, s, BLOCK_SIZE=block_size, INDEX_DTYPE=INDEX_DTYPE
+        x,
+        y,
+        s,
+        stride_x0=x.view(-1, x.shape[-1]).stride(0),
+        stride_y0=y.view(-1, y.shape[-1]).stride(0),
+        hidden_dim=x.shape[-1],
+        BLOCK_SIZE=block_size,
+        INDEX_DTYPE=INDEX_DTYPE,
     )
     return y, s
 
@@ -103,7 +117,14 @@ def _(x: silu_and_mul.lazy_tensor_type(), block_size: int = 128):
 
 @triton.jit
 def blockfp8_act_quant_kernel(
-    x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr, INDEX_DTYPE: tl.constexpr
+    x_ptr,
+    y_ptr,
+    s_ptr,
+    stride_x0,
+    stride_y0,
+    hidden_dim,
+    BLOCK_SIZE: tl.constexpr,
+    INDEX_DTYPE: tl.constexpr,
 ):
     """
     Quantizes the input tensor `x_ptr` and stores the result in `y_ptr` and the scaling factor in `s_ptr`.
@@ -117,14 +138,28 @@ def blockfp8_act_quant_kernel(
     Returns:
         None
     """
-    pid = tl.program_id(axis=0)
-    offs = tl.cast(pid, INDEX_DTYPE) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x = tl.load(x_ptr + offs).to(tl.float32)
+
+    row_id = tl.program_id(axis=0)
+    block_id = tl.program_id(axis=1)
+
+    x_offs = (
+        tl.cast(row_id, INDEX_DTYPE) * stride_x0
+        + tl.cast(block_id, INDEX_DTYPE) * BLOCK_SIZE
+        + tl.arange(0, BLOCK_SIZE)
+    )
+    y_offs = (
+        tl.cast(row_id, INDEX_DTYPE) * stride_y0
+        + tl.cast(block_id, INDEX_DTYPE) * BLOCK_SIZE
+        + tl.arange(0, BLOCK_SIZE)
+    )
+    s_offs = row_id * (hidden_dim // BLOCK_SIZE) + block_id
+
+    x = tl.load(x_ptr + x_offs).to(tl.float32)
     s = tl.maximum(tl.max(tl.abs(x)), 1e-10) / 448.0
     y = x / s
     y = y.to(y_ptr.dtype.element_ty)
-    tl.store(y_ptr + offs, y)
-    tl.store(s_ptr + pid, s)
+    tl.store(y_ptr + y_offs, y)
+    tl.store(s_ptr + s_offs, s)
 
 
 @auto_retry_triton_compilation
