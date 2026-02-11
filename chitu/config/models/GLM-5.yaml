@@ -36,3 +36,5 @@ index_topk: "$(config.json:index_topk)"
 index_rope_layout: "interleaved"
 rms_norm_dtype: bfloat16
 rms_norm_eps: "$(config.json:rms_norm_eps)"
+eos_token_id: "$(config.json:eos_token_id)"
+tool_parser: GLM47ToolParser
