@@ -487,7 +487,7 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
 
 
 @QuantizationRegistry.register_absorb_gemm("blockfp8")
-class NormalAbsorbGemm(QuantizedAbsorbGemmBase):
+class Blockfp8AbsorbGemm(QuantizedAbsorbGemmBase):
     def __init__(
         self,
         ############################################
@@ -517,8 +517,20 @@ class NormalAbsorbGemm(QuantizedAbsorbGemmBase):
             requires_grad=False,
         )
 
-        assert out_features_per_head % block_size == 0
-        assert in_features_per_head % block_size == 0
+        if out_features_per_head % block_size != 0:
+            raise NotImplementedError(
+                f"This model does not support infer.mla_absorb=absorb-without-precomp because otherwise "
+                f"out_features_per_head({out_features_per_head}) of the absorbing group gemm will not be "
+                f"a multiple of block_size({block_size}). Please use infer.mla_absorb=none or "
+                f"infer.mla_absorb=absorb instead."
+            )
+        if in_features_per_head % block_size != 0:
+            raise NotImplementedError(
+                f"This model does not support infer.mla_absorb=absorb-without-precomp because otherwise "
+                f"in_features_per_head({in_features_per_head}) of the absorbing group gemm will not be "
+                f"a multiple of block_size({block_size}). Please use infer.mla_absorb=none or "
+                f"infer.mla_absorb=absorb instead."
+            )
         self.scale = torch.nn.Parameter(
             torch.empty(
                 n_heads,
