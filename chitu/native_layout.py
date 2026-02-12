@@ -102,6 +102,9 @@ class NativeLayoutTensor:
                 f"NativeLayoutTensor.to only support moving to a device, but got {type(device)}"
             )
 
+    def is_contiguous(self):
+        return self.layout_tensor.is_contiguous()
+
 
 def enable_native_layout_weight(
     key: str,

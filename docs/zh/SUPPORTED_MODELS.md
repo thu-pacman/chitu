@@ -150,6 +150,10 @@
   用法: 启动赤兔时追加 `models=Qwen3-14B-w4-g128-symm-a8` 启动参数
 - Qwen3-235B-A22B
   用法: 启动赤兔时追加 `models=Qwen3-235B-A22B` 启动参数
+- Qwen3-235B-A22B-Instruct
+  用法: 启动赤兔时追加 `models=Qwen3-235B-A22B-Instruct` 启动参数
+- Qwen3-235B-A22B-Instruct-ascend-int8
+  用法: 启动赤兔时追加 `models=Qwen3-235B-A22B-Instruct-ascend-int8` 启动参数
 - Qwen3-235B-A22B-ascend-int8
   用法: 启动赤兔时追加 `models=Qwen3-235B-A22B-ascend-int8` 启动参数
 - Qwen3-235B-A22B-fp4

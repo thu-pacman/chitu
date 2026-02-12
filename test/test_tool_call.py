@@ -15,6 +15,7 @@ logger_engine = logging.getLogger("engine")
 sys.stdout.reconfigure(line_buffering=True)
 
 
+API_KEY = "example_key"
 MAX_CONCURRENT = 64
 MAX_RETRY = 1
 CHOICE_FUNC_NAME = "get_temperature"
@@ -284,6 +285,7 @@ async def test(
     **kwargs,
 ):
     tested_nums = []
+    ok = all_ok = False
     for retry in range(MAX_RETRY):
         try:
             logger.info(f"case {idx} begin {retry=}")
@@ -305,6 +307,7 @@ async def test(
                 if tools is None:
                     kwargs.pop("tools")
 
+                old_messages = messages.copy()
                 if api == "openai":
                     round_result = await _round_openai(messages, kwargs)
                 else:
@@ -313,6 +316,7 @@ async def test(
                 tool_calls = tool_calls or []
                 logger.info(
                     f"case {idx} round {i}:"
+                    f"\n\tmessages={old_messages}"
                     f"\n\tkwargs={kwargs}"
                     f"\n\tcontent={repr(content)}"
                     f"\n\trcontent={repr(rcontent)}"
@@ -355,12 +359,12 @@ async def init_client_and_model():
     port = get_port()
     global openai_client, anthropic_client, model
     openai_client = AsyncOpenAI(
-        base_url=f"http://localhost:{port}/v1", api_key="dummy", timeout=REQ_TIMEOUT
+        base_url=f"http://localhost:{port}/v1", api_key=API_KEY, timeout=REQ_TIMEOUT
     )
     model = (await openai_client.models.list()).data[0].id
     anthropic_client = AsyncAnthropic(
-        api_key=os.getenv("ANTHROPIC_API_KEY", "dummy"),
         base_url=f"http://localhost:{port}",
+        api_key=API_KEY,
         timeout=REQ_TIMEOUT,
     )
 

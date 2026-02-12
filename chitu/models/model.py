@@ -1558,7 +1558,7 @@ class ParallelMoeBlock(nn.Module):
                 and self.prefill_memory_tolerance < self.moe_impl.ep_size
                 and get_global_args().infer.prefill_chunk_size is not None
             ):
-                logger.warning(
+                logger.warning_once(
                     "`prefill_memory_tolerance` is not implemented when `exit_moe_prefer_before_local_sum` is True, ignoring."
                 )
 
