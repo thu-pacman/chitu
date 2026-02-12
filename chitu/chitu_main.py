@@ -642,7 +642,6 @@ def chitu_init(args):
         else:
             args.infer.use_cuda_graph = True
 
-    # pp and mtp does not support schedule overlap
     if args.infer.schedule_overlap == "auto":
         args.infer.schedule_overlap = True
 

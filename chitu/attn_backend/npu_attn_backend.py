@@ -546,68 +546,87 @@ class NpuAttnBackend(RefAttnBackend):
         if bsz == 0:
             return attn_output
 
-        query = torch.cat([q_nope, q_pe], dim=-1).view(bsz, q_nope.shape[-2], -1)
-
         if softmax_scale is None:
             assert self.qk_nope_head_dim is not None
             softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
 
-        if "kv_lora_k_pe" in kv_cache.kv:
-            append_to_paged_kv_cache(
-                kv_cache.kv["kv_lora_k_pe"],
-                kv_cache.block_table,
-                kv,
-                seq_len_delta.old.lens_tensor_device,
-                get_page_ids=kv_cache.get_page_ids,
-                get_offs_in_page=kv_cache.get_offs_in_page,
-            )
-            kv_lora_k_pe = kv_cache.kv["kv_lora_k_pe"]
-        elif "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv:
-            logger.warning_once(
-                '"kv_lora"-and-"k_pe"-separated KV cache is insuffcient for '
-                "NpuAttnBackend.mla_decode_paged_kv, due to an additional `torch.cat` operation. "
-                'It is recommended to use "kv_lora_k_pe"-holistic KV cache instead.'
-            )
-            append_to_paged_kv_cache(
-                kv_cache.kv["kv_lora"],
-                kv_cache.block_table,
-                kv[..., :kv_lora_rank],
-                seq_len_delta.old.lens_tensor_device,
-                get_page_ids=kv_cache.get_page_ids,
-                get_offs_in_page=kv_cache.get_offs_in_page,
-            )
-            append_to_paged_kv_cache(
-                kv_cache.kv["k_pe"],
-                kv_cache.block_table,
-                kv[..., kv_lora_rank:],
-                seq_len_delta.old.lens_tensor_device,
-                get_page_ids=kv_cache.get_page_ids,
-                get_offs_in_page=kv_cache.get_offs_in_page,
-            )
-            kv_lora_k_pe = torch.cat(
-                [kv_cache.kv["kv_lora"], kv_cache.kv["k_pe"]], dim=-1
-            )
-        else:
-            raise ValueError(
-                f'For MLA, the KV cache should either have a "kv_lora_k_pe" tensor '
-                f'or both "kv_lora" and "k_pe" tensors, but we got {list(kv_cache.kv.keys())}'
-            )
+        # NOTE: 参考自https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
 
-        # kv_cache[indices, positions] = kv.squeeze(1) if kv.ndim == 3 and kv.shape[1] == 1 else kv
+        # 更新 KV cache，获取分离的 c_kv 和 k_rope cache。
+        # npu_fused_infer_attention_score 需要分离的 query_rope/key_rope
+        # kv_lora 和 k_pe 两个 tensor 需要连续
+        assert "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv, (
+            f"NpuAttnBackend MLA requires KV cache contains 'kv_lora' and 'k_pe', "
+            f"current keys: {list(kv_cache.kv.keys())}"
+        )
+        append_to_paged_kv_cache(
+            kv_cache.kv["kv_lora"],
+            kv_cache.block_table,
+            kv[..., :kv_lora_rank],
+            seq_len_delta.old.lens_tensor_device,
+            get_page_ids=kv_cache.get_page_ids,
+            get_offs_in_page=kv_cache.get_offs_in_page,
+        )
+        append_to_paged_kv_cache(
+            kv_cache.kv["k_pe"],
+            kv_cache.block_table,
+            kv[..., kv_lora_rank:],
+            seq_len_delta.old.lens_tensor_device,
+            get_page_ids=kv_cache.get_page_ids,
+            get_offs_in_page=kv_cache.get_offs_in_page,
+        )
+        c_kv_cache = kv_cache.kv["kv_lora"]
+        k_rope_cache = kv_cache.kv["k_pe"]
+        block_size = c_kv_cache.shape[1]
 
-        # torch_npu._npu_reshape_and_cache_siso(key=kv_cache.kv["kv_lora_k_pe"],
-        #                                       key_cache=key_cache,
-        #                                       slot_indices=slots)
-        torch_npu._npu_paged_attention_mla(
-            query=query,
-            key_cache=kv_lora_k_pe.unsqueeze(2),
-            num_kv_heads=1,
+        # query reshape 为 BSND layout: [bsz, heads, dim] -> [bsz, 1, heads, dim]
+        q_nope = q_nope.unsqueeze(
+            1
+        ).contiguous()  # [bsz, 1, local_n_heads, kv_lora_rank]
+        q_pe = q_pe.unsqueeze(1)  # [bsz, 1, local_n_heads, qk_rope_head_dim]
+
+        actual_seq_lengths_kv = seq_len_delta.new.lens_list
+
+        # MLA 中 value = c_kv_cache（压缩后的 KV），输出维度 = kv_lora_rank。
+        workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+            q_nope,
+            c_kv_cache,
+            c_kv_cache,
+            query_rope=q_pe,
+            key_rope=k_rope_cache,
             num_heads=local_n_heads,
-            scale_value=softmax_scale,
+            num_key_value_heads=self.local_n_kv_heads,
             block_table=kv_cache.block_table,
-            context_lens=seq_len_delta.new.lens_tensor_cpu,
-            mla_vheadsize=kv_lora_rank,
-            out=attn_output,
+            block_size=block_size,
+            input_layout="BSND",
+            scale=softmax_scale,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            antiquant_mode=0,
+            antiquant_scale=None,
+            sparse_mode=0,
         )
 
-        return attn_output
+        output = torch.empty_like(q_nope, dtype=q_nope.dtype, device=q_nope.device)
+        softmax_lse = torch.empty(1, dtype=q_nope.dtype, device=q_nope.device)
+
+        torch_npu.npu_fused_infer_attention_score.out(
+            q_nope,
+            c_kv_cache,
+            c_kv_cache,
+            query_rope=q_pe,
+            key_rope=k_rope_cache,
+            num_heads=local_n_heads,
+            num_key_value_heads=self.local_n_kv_heads,
+            block_table=kv_cache.block_table,
+            block_size=block_size,
+            input_layout="BSND",
+            scale=softmax_scale,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            antiquant_mode=0,
+            antiquant_scale=None,
+            sparse_mode=0,
+            workspace=workspace,
+            out=[output, softmax_lse],
+        )
+
+        return output.view(bsz, local_n_heads, kv_lora_rank)

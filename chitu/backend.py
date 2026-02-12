@@ -613,10 +613,15 @@ class Backend:
 
         if args.models.type == "deepseek-v3":
             if args.infer.mla_absorb in ["absorb", "absorb-without-precomp"]:
+                # NpuAttnBackend 仅在 paged cache 下使用分离 KV cache，
+                # 因为 mla_decode_paged_kv 依赖分离的 kv_lora/k_pe
                 use_separated_kv_lora_k_pe = attn_backend_type in [
                     FlashInferBackend,
                     TritonAttnBackend,
-                ]
+                ] or (
+                    attn_backend_type is NpuAttnBackend
+                    and args.infer.cache_type == "paged"
+                )
                 if use_separated_kv_lora_k_pe:
                     kv_cache_kvargs["shape_per_token_dict"] = {
                         "kv_lora": (args.models.kv_lora_rank,),
