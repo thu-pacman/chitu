@@ -59,10 +59,10 @@ def test_mla_prefill_ragged_qkvo(
     if impl == "flash_mla":
         if not has_accelerator() or not has_flash_mla:
             pytest.skip("flash_mla is missing")
-        if local_n_heads % 64 != 0:
-            pytest.skip("flash_mla only supports h_q % 64 (sm90) | 128 (sm100) == 0")
-        if topk is None:
+        if topk is None:  # skip since default triton fall-back
             pytest.skip("flash_mla prefill only supports sparse attention for now")
+        if not hasattr(flash_mla, "flash_mla_sparse_fwd"):
+            pytest.skip("flash_mla is too old too have `flash_mla_sparse_fwd`")
 
         _, total_memory = torch.cuda.mem_get_info()
         total_memory = total_memory / (1024**3)
@@ -96,6 +96,7 @@ def test_mla_prefill_ragged_qkvo(
                     "qk_nope_head_dim": qk_nope_head_dim,
                     "dim": 7168,
                     "type": None,
+                    "index_topk": topk,
                 },
             }
         ),
@@ -141,7 +142,8 @@ def test_mla_prefill_ragged_qkvo(
         attn_backend.prepare_metadata_for_prefill(seq_len_delta)
     elif impl == "flash_mla":
         attn_backend = FlashMLABackend(
-            qk_nope_head_dim=qk_nope_head_dim, index_topk=topk
+            qk_nope_head_dim=qk_nope_head_dim,
+            index_topk=topk,
         )
     else:
         raise NotImplementedError()
@@ -573,6 +575,7 @@ def test_mla_decode_paged_kv(
                     "qk_nope_head_dim": qk_nope_head_dim,
                     "dim": 7168,
                     "type": model_type,
+                    "index_topk": topk,
                 },
             }
         ),

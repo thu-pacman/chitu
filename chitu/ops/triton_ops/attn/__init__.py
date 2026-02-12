@@ -14,5 +14,6 @@ from chitu.ops.triton_ops.attn.mla_decode import (
 )
 from chitu.ops.triton_ops.attn.flashmla_ops import (
     convert_req_index_to_global_paged_index_triton,
-    quantize_k_cache_triton,
+    quant_pertoken_kvcache_dsa,
+    quant_with_gt_scales,
 )
