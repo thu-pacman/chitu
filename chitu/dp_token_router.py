@@ -8,6 +8,7 @@ Responsible for receiving tokens returned from each DP group and forwarding them
 """
 
 import asyncio
+import os
 import time
 from collections import defaultdict, deque
 from typing import Any
@@ -17,6 +18,7 @@ import msgpack
 import logging
 
 from chitu.async_response import AsyncDataStream, AsyncResponse
+from chitu.backend import Backend
 from chitu.task import UserRequest
 from chitu.dp_request_router import get_request_router
 from chitu.serve.event_loop import get_server_event_loop
@@ -45,6 +47,7 @@ class TokenRouter:
         self._per_dp_tokens: dict[int, int] = defaultdict(
             int
         )  # dp_id -> tokens in window
+        self._cleanup_timeout_s = float(os.getenv("ROUTER_CLEANUP_TIMEOUT_S", "2400"))
 
         logger.info("TokenRouter initialized")
 
@@ -63,8 +66,6 @@ class TokenRouter:
 
     async def _init_sockets(self):
         """Initialize ZMQ sockets (support multi-PULL via ROUTER_DP_SIZE)"""
-        import os
-
         router_host = self.config.router.host
         base_port = int(self.config.router.token_port)
 
@@ -141,8 +142,6 @@ class TokenRouter:
         return response
 
     async def _recv_loop(self, dp_id: int, sock):
-        import os
-
         # 批量排空
         try:
             rcv_batch = max(1, int(os.getenv("ROUTER_RCV_BATCH", "256")))
@@ -234,6 +233,9 @@ class TokenRouter:
                 logger.info(
                     f"Token Router: Updated prompt_len={prompt_len} for request {request_id}"
                 )
+                router = get_request_router()
+                if router is not None and hasattr(router, "record_prompt_len"):
+                    router.record_prompt_len(request_id, prompt_len)
 
             # Safety check 5: text must exist
             if text is None:
@@ -242,10 +244,6 @@ class TokenRouter:
                 )
                 return
 
-            # Add to stream
-            logger.debug(
-                f"Token Router: Adding text '{text}' to request {request_id} stream (original token_id={original_token_id})"
-            )
             context.dp_stream.add_text_data(
                 text, top_logprobs, top_tokens_text, original_token_id
             )
@@ -254,6 +252,9 @@ class TokenRouter:
             dp_id = int(token_data.get("scheduler_id", -1))
             if dp_id >= 0:
                 self._per_dp_tokens[dp_id] += 1
+            router = get_request_router()
+            if router is not None and hasattr(router, "record_generated_token"):
+                router.record_generated_token(request_id, 1)
 
             # first token arrival time
             ctx = self.active_requests.get(request_id)
@@ -325,7 +326,11 @@ class TokenRouter:
                 timeout_requests = []
 
                 for request_id, context in self.active_requests.items():
-                    if current_time - context.created_time > 300:  # 5 minute timeout
+                    if (
+                        self._cleanup_timeout_s > 0
+                        and current_time - context.created_time
+                        > self._cleanup_timeout_s
+                    ):
                         timeout_requests.append(request_id)
 
                 for request_id in timeout_requests:
@@ -387,7 +392,6 @@ class DPAsyncDataStream(AsyncDataStream):
 
             # Use received text directly
             s = text
-            logger.debug(f"DP AsyncStream: Adding text '{s}'")
 
             # Check for invalid characters
             if "\ufffd" in s:
@@ -429,8 +433,6 @@ class DPAsyncDataStream(AsyncDataStream):
 
             # Use Backend.tokenizer for decoding
             try:
-                from chitu.backend import Backend
-
                 if Backend.tokenizer is not None:
                     s = Backend.tokenizer.decode(self.cache_tokens)
 

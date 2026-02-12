@@ -1,105 +1,379 @@
 #!/usr/bin/expect
 
-
 # Show all output
 log_user 1
 exp_internal 0
 set timeout -1
 
-puts "=== PD Disaggregation 2P3D Test (local, no srun) ==="
+proc read_tail {path max_bytes} {
+    if {![file exists $path]} {
+        return ""
+    }
+    set size [file size $path]
+    set fh [open $path r]
+    if {$size > $max_bytes} {
+        seek $fh [expr {$size - $max_bytes}]
+    }
+    set data [read $fh]
+    close $fh
+    return $data
+}
+
+proc file_contains {path needle} {
+    if {![file exists $path]} {
+        return 0
+    }
+    set data [read_tail $path 20000]
+    if {[string first $needle $data] >= 0} {
+        return 1
+    }
+    return 0
+}
+
+proc file_has_error {path} {
+    if {![file exists $path]} {
+        return 0
+    }
+    set data [read_tail $path 20000]
+    if {[regexp {ERROR|Exception|Traceback} $data]} {
+        return 1
+    }
+    return 0
+}
+
+proc glob_contains {pattern needle} {
+    set files [glob -nocomplain $pattern]
+    foreach f $files {
+        if {[file_contains $f $needle]} {
+            return 1
+        }
+    }
+    return 0
+}
+
+proc glob_has_error {pattern} {
+    set files [glob -nocomplain $pattern]
+    foreach f $files {
+        if {[file_has_error $f]} {
+            return 1
+        }
+    }
+    return 0
+}
+
+proc ensure_process_alive {label} {
+    global pd_pid
+    if {[catch {exec kill -0 $pd_pid}]} {
+        puts "ERROR: $label: PD process exited (pid=$pd_pid)"
+        exit 1
+    }
+}
+
+proc wait_for_pattern {label pattern needle timeout_s} {
+    set start [clock seconds]
+    while {1} {
+        ensure_process_alive $label
+        if {[glob_contains $pattern $needle]} {
+            puts "OK: $label ready"
+            return
+        }
+        if {[glob_has_error $pattern]} {
+            puts "ERROR: $label log contains error"
+            exit 1
+        }
+        if {[expr {[clock seconds] - $start}] > $timeout_s} {
+            puts "ERROR: timeout waiting for $label"
+            exit 1
+        }
+        sleep 2
+    }
+}
+
+proc extract_router {path} {
+    if {![file exists $path]} {
+        return ""
+    }
+    set data [read_tail $path 20000]
+    if {[regexp {ROUTER: ([0-9\.]+):([0-9]+)} $data -> ip port]} {
+        return [list $ip $port]
+    }
+    return ""
+}
+
+puts "=== PD Disaggregation CI Test ==="
 puts "Working directory: [pwd]"
 
-# Launch PD 2P3D environment via Slurm (two nodes) in Mooncake container
-puts "=== Launching PD 2P3D environment via Slurm (two nodes) ==="
-spawn bash script/srun_pd_disagg_2p3d_two_nodes.sh
-set pd_pid [exp_pid]
-puts "Local PD environment launched, pid is $pd_pid"
+set model_config "Qwen3-30B-A3B-fp8"
+set model_ckpt_dir "/data/nfs/Qwen3-30B-A3B-FP8/"
+set router_port "21004"
 
-# Prefer ready file to avoid stdout buffering; fallback to non-blocking READY line
-set router_ip ""
-set router_port "21003"
-set router_host ""
-set ready_file "logs/router.ready"
-
-while {1} {
-    if {[file exists $ready_file]} {
-        set fh [open $ready_file r]
-        set line [gets $fh]
-        close $fh
-        if {[regexp {ROUTER_READY host=([^ ]+) ip=([0-9\.]+) port=(\d+)} $line -> host ip port]} {
-            set router_host $host
-            set router_ip   $ip
-            set router_port $port
-            puts "Detected Router Ready on $router_host $router_ip:$router_port (via file)"
-            break
-        }
-    }
-    # Non-blocking stdout fallback (in case ready file not present)
-    expect -timeout 0 {
-        -re {ROUTER_READY host=([^ ]+) ip=([0-9\.]+) port=(\d+)} {
-            set router_host $expect_out(1,string)
-            set router_ip   $expect_out(2,string)
-            set router_port $expect_out(3,string)
-            puts "Detected Router Ready on $router_host $router_ip:$router_port"
-            break
-        }
-        eof {}
-        timeout {}
-    }
-    sleep 1
+# Resolve Apptainer SIF
+if {[info exists env(APPTAINER_IMAGE)] && $env(APPTAINER_IMAGE) ne ""} {
+    set apptainer_image $env(APPTAINER_IMAGE)
+} elseif {[info exists env(CHITU_COMMIT_IMAGE)] && $env(CHITU_COMMIT_IMAGE) ne ""} {
+    set apptainer_image "/data/nfs/docker_images/$env(CHITU_COMMIT_IMAGE).sif"
+} else {
+    puts "ERROR: Please set APPTAINER_IMAGE or CHITU_COMMIT_IMAGE to a valid Mooncake SIF"
+    exit 1
+}
+if {![file exists $apptainer_image]} {
+    puts "ERROR: SIF not found: $apptainer_image"
+    exit 1
 }
 
-# Wait for Prefill/Decode readiness markers instead of fixed sleep
-set decode_ready_file "logs/decode.ready"
-set prefill_ready_file "logs/prefill.ready"
-puts "Waiting for Prefill/Decode readiness..."
+set log_dir "[pwd]/log"
+set env(LOG_DIR) $log_dir
+file mkdir $log_dir
+set srun_out "${log_dir}/srun.out"
+
+set model_tag $model_config
+regsub -all {[^A-Za-z0-9_.-]} $model_tag "_" model_tag
+
+set prefill_spec "tp=2,pp=1,dp=1,ep=1,max_seq_len=5200,max_reqs=128,chunk=65536,full_warmup=False"
+set decode_spec "tp=1,pp=1,dp=4,ep=4,max_seq_len=6144,max_reqs=256,full_warmup=False"
+
+set cmd_parts [list bash script/srun_pd_disagg_base_apptainer.sh \
+    $model_config $model_ckpt_dir $apptainer_image \
+    --nodes 2 --gpus-per-node 8 --router-port $router_port --partition ci \
+    --prefill $prefill_spec \
+    --prefill $prefill_spec \
+    --decode $decode_spec \
+    --bind-code 0 \
+    --common-override dp_config.router.pd_disaggregation.kv_transfer.decode_wait_timeout_s=600 \
+    --common-override dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_max_pending=128 \
+    --common-override dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_token_budget=250000 \
+    --common-override dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_reserved_tokens=1024 \
+    --common-override dp_config.router.pd_disaggregation.kv_transfer.decode_max_running_tasks_per_dp=64]
+set cmd_str [join $cmd_parts " "]
+
+puts "=== Launching PD Disaggregation via srun ==="
+puts "SIF: $apptainer_image"
+puts "Command: $cmd_str"
+spawn bash -lc "set -e; $cmd_str > \"$srun_out\" 2>&1"
+set pd_pid [exp_pid]
+puts "PD environment launched, pid is $pd_pid"
+
+puts "Waiting for srun to start (allocation or router logs)..."
 while {1} {
-    set have_decode [file exists $decode_ready_file]
-    set have_prefill [file exists $prefill_ready_file]
-    if {$have_decode && $have_prefill} {
-        puts "Prefill/Decode ready markers detected."
+    ensure_process_alive "waiting for srun start"
+    set data [read_tail $srun_out 20000]
+    if {[regexp {srun: job .* has been allocated resources} $data]} {
+        puts "srun allocated resources."
         break
     }
-    # Non-blocking check for any error output indicating early failure
-    expect -timeout 0 {
-        -re {ERROR|Exception|Traceback} {
-            puts "Detected error output while waiting for PD readiness." 
-        }
-        eof {}
-        timeout {}
+    if {[extract_router $srun_out] ne ""} {
+        puts "Detected router info before allocation line."
+        break
+    }
+    if {[glob -nocomplain "${log_dir}/router.${model_tag}.log"] ne ""} {
+        puts "Router log exists, continuing."
+        break
+    }
+    if {[glob -nocomplain "${log_dir}/prefill.${model_tag}.p0.node*.log"] ne ""} {
+        puts "Prefill log exists, continuing."
+        break
+    }
+    if {[glob -nocomplain "${log_dir}/decode.${model_tag}.d0.node*.log"] ne ""} {
+        puts "Decode log exists, continuing."
+        break
+    }
+    sleep 2
+}
+
+set router_ip ""
+set router_timeout 600
+set start [clock seconds]
+while {$router_ip eq ""} {
+    ensure_process_alive "waiting for router info"
+    if {[file_has_error $srun_out]} {
+        puts "ERROR: srun output contains error"
+        puts [read_tail $srun_out 4000]
+        exit 1
+    }
+    set info [extract_router $srun_out]
+    if {$info ne ""} {
+        set router_ip [lindex $info 0]
+        set router_port [lindex $info 1]
+        puts "Detected Router: $router_ip:$router_port"
+        break
+    }
+    if {[expr {[clock seconds] - $start}] > $router_timeout} {
+        puts "ERROR: timeout waiting for router info"
+        puts [read_tail $srun_out 4000]
+        exit 1
     }
     sleep 1
 }
 
-# need to wait P/D warmup finish
-sleep 120
+puts "Checking router port..."
+if {[catch {exec nc -z $router_ip $router_port}]} {
+    puts "Router port not open yet, continue waiting for logs..."
+}
 
-# Run verification: PD 2P3D topology via existing script
-puts "=== Verifying PD 2P3D topology ==="
-set verify_cmd "stdbuf -oL -eL python3 test/verify_xpyd_topology.py --router http://$router_ip:$router_port --concurrency 8 --max_tokens 128 --stream"
-puts "Running: $verify_cmd"
-spawn bash -lc $verify_cmd
-set verify_spawn_id $spawn_id
-puts "--- Begin verify output ---"
-# Stream verify output for 120s (adjustable), printing in real-time
-expect -i $verify_spawn_id -timeout 120 {
+set router_log "${log_dir}/router.${model_tag}.log"
+set prefill_p0_glob "${log_dir}/prefill.${model_tag}.p0.node*.log"
+set prefill_p1_glob "${log_dir}/prefill.${model_tag}.p1.node*.log"
+set decode_d0_glob "${log_dir}/decode.${model_tag}.d0.node*.log"
+set router_ready_str "Uvicorn running on http://0.0.0.0:${router_port}"
+set worker_ready_str "Entering PD Worker Loop"
+
+puts "Waiting for Router readiness..."
+wait_for_pattern "Router" $router_log $router_ready_str 1200
+puts "Waiting for Prefill P0 readiness..."
+wait_for_pattern "Prefill P0" $prefill_p0_glob $worker_ready_str 1200
+puts "Waiting for Prefill P1 readiness..."
+wait_for_pattern "Prefill P1" $prefill_p1_glob $worker_ready_str 1200
+puts "Waiting for Decode D0 readiness..."
+wait_for_pattern "Decode D0" $decode_d0_glob $worker_ready_str 1200
+
+set bench_output_dir "[pwd]/benchmark_output_30B_A3B_temp"
+file mkdir $bench_output_dir
+
+set bench_inner_cmd "PY=python; if test -x /opt/conda/bin/python; then PY=/opt/conda/bin/python; fi; \
+    export PYTHONNOUSERSITE=1; \
+    export PYTHONPATH=; \
+    echo \"PYTHON_BIN=\$PY\"; \
+    which \$PY || true; \
+    \$PY -c \"import sys; print('python:', sys.executable); import transformers; print('transformers:', transformers.__version__)\"; \
+    cd /workspace/chitu/benchmarks && \$PY benchmark_serving.py \
+    --batch-size 128 \
+    --model $model_config \
+    --iterations 1 \
+    --input-len 1024 \
+    --output-len 1024 \
+    --warmup 1 \
+    --dataset sharegpt \
+    --dataset-path /data/nfs/ShareGPT_V3_unfiltered_cleaned_split.json \
+    --tokenizer-path /data/nfs/Qwen3-30B-A3B-FP8/ \
+    --output-dir $bench_output_dir/ \
+    --base-url http://$router_ip:$router_port"
+
+set bench_cmd [list apptainer exec --nv -B /data:/data -B /home:/home \
+    $apptainer_image \
+    bash -lc $bench_inner_cmd]
+
+puts "=== Running benchmark ==="
+puts "Command: $bench_cmd"
+spawn {*}$bench_cmd
+set bench_spawn_id $spawn_id
+expect -i $bench_spawn_id -timeout 7200 {
     -re {.+} {
         puts -nonewline -- $expect_out(0,string)
         exp_continue
     }
     eof {
-        puts "\n--- Verify finished ---"
+        puts "\n--- Benchmark finished ---"
     }
     timeout {
-        puts "\n--- Verify output timeout (120s), continuing ---"
+        puts "ERROR: benchmark timeout"
+        exit 1
     }
 }
+set bench_status [wait -i $bench_spawn_id]
+set bench_exit [lindex $bench_status 3]
+if {$bench_exit ne "0"} {
+    puts "ERROR: benchmark failed with exit code $bench_exit"
+    exit 1
+}
 
-# Cleanup
+set json_path "$bench_output_dir/benchmark_results.jsonl"
+if {![file exists $json_path]} {
+    puts "ERROR: benchmark results not found: $json_path"
+    exit 1
+}
+
+set py_code {
+import json
+import sys
+
+path = sys.argv[1]
+print("=== Benchmark generated_texts and errors ===")
+has_error = False
+def handle_obj(obj, prefix=""):
+    global has_error
+    texts = obj.get("generated_texts", [])
+    errors = obj.get("errors", [])
+    for i, t in enumerate(texts):
+        preview = t[:256] + "..." if len(t) > 256 else t
+        print(f"{prefix}generated_texts[{i}]: {preview}")
+    for i, e in enumerate(errors):
+        print(f"{prefix}errors[{i}]: {e}")
+        if e:
+            has_error = True
+
+with open(path, "r", encoding="utf-8") as f:
+    content = f.read().strip()
+
+if not content:
+    print("ERROR: empty benchmark results")
+    sys.exit(1)
+
+parsed_any = False
+try:
+    obj = json.loads(content)
+    parsed_any = True
+    if isinstance(obj, list):
+        for idx, item in enumerate(obj, 1):
+            if isinstance(item, dict):
+                handle_obj(item, prefix=f"[item {idx}] ")
+    elif isinstance(obj, dict):
+        handle_obj(obj)
+    else:
+        print(f"WARN: unexpected json root type: {type(obj)}")
+except json.JSONDecodeError as e:
+    print(f"WARN: failed to parse full json: {e}")
+    print(f"WARN: content head: {content[:200]!r}")
+    print(f"WARN: content tail: {content[-200:]!r}")
+    parsed_any = False
+
+if not parsed_any:
+    for line_no, line in enumerate(content.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            print(f"[line {line_no}] WARN: skip non-json line: {line[:120]}")
+            continue
+        parsed_any = True
+        if isinstance(obj, dict):
+            handle_obj(obj, prefix=f"[line {line_no}] ")
+
+if not parsed_any:
+    print("ERROR: no valid json records found")
+    sys.exit(1)
+if has_error:
+    print("ERROR: non-empty errors found")
+    sys.exit(1)
+}
+
+puts "=== Printing benchmark generated_texts and errors ==="
+set parse_cmd [list python3 -c $py_code $json_path]
+spawn {*}$parse_cmd
+set parse_spawn_id $spawn_id
+expect -i $parse_spawn_id -timeout 7200 {
+    -re {.+} {
+        puts -nonewline -- $expect_out(0,string)
+        exp_continue
+    }
+    eof {
+        puts "\n--- Parse finished ---"
+    }
+    timeout {
+        puts "ERROR: parse timeout"
+        exit 1
+    }
+}
+set parse_status [wait -i $parse_spawn_id]
+set parse_exit [lindex $parse_status 3]
+if {$parse_exit ne "0"} {
+    puts "ERROR: benchmark validation failed"
+    exit 1
+}
+
 puts "Cleaning up PD processes..."
 catch {exec kill -TERM $pd_pid}
 sleep 5
-puts "=== PD Disaggregation 2P3D Test Completed ==="
+puts "=== PD Disaggregation CI Test Completed ==="
 exit 0
-
-

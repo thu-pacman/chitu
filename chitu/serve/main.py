@@ -15,10 +15,12 @@ import hydra
 import torch
 import torch.distributed
 
+import chitu.serve.api_server as api_server
 from chitu.chitu_main import chitu_init, warmup_engine
 from chitu.schemas import ServeConfig
 from chitu.serve.api_server import init_dp_router, start_uvicorn
 from chitu.serve.common import start_worker
+from chitu.serve.scheduler import init_dp_scheduler
 from chitu.utils import get_config_dir_path, get_chitu_env
 
 
@@ -42,8 +44,6 @@ def main(args: ServeConfig):
 
     if dp_config.enabled:
         # Use DP Scheduler module
-        from chitu.serve.scheduler import init_dp_scheduler
-
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         init_dp_scheduler(args, rank)
 
@@ -59,8 +59,6 @@ def main(args: ServeConfig):
             uvicorn_thread.start()
 
         # Set server status at module level
-        import chitu.serve.api_server as api_server
-
         api_server.server_status = True
         start_worker()
 

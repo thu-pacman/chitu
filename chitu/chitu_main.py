@@ -5,6 +5,8 @@
 import functools
 import operator
 import os
+import time
+import traceback
 from logging import getLogger
 import psutil
 import random
@@ -14,6 +16,9 @@ from tqdm import tqdm
 
 import torch
 import torch.distributed
+import zmq
+import zmq.asyncio
+import msgpack
 
 from chitu.backend import Backend, BackendState
 from chitu.cache_manager import PagedKVCacheManager
@@ -57,6 +62,8 @@ from chitu.metrics import (
     stop_metrics_monitor,
 )
 from chitu.distributed.comm_group import SingletonGroupPlaceholder
+
+from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
@@ -310,7 +317,14 @@ def _warmup_via_taskpool(args):
         planner.set_warmup_mode(False)
 
 
-def _warmup_backend_direct(args, local_max_bs=1, decode_steps=2, bs_descend=0):
+def _warmup_backend_direct(
+    args,
+    local_max_bs=1,
+    decode_steps=2,
+    bs_descend=0,
+    *,
+    skip_model_prefill: bool = False,
+):
     logger.info(
         f"Starting local backend warmup (direct) with local max batch size {local_max_bs}..."
     )
@@ -338,6 +352,12 @@ def _warmup_backend_direct(args, local_max_bs=1, decode_steps=2, bs_descend=0):
     Backend.cache_manager.prepare_cache_prefill(req_ids, seq_len_list)
     PrometheusMetricsCollector.update_kvcache_usage()
 
+    # decode_only 下，Decode 不需要跑 prefill；但需要把 cache 的 seq_len
+    # 和 block_table 初始化到可 decode 的状态（否则后续 prepare_cache_decode 会找不到 req_id）
+    # 仅做 cache prepare，避免 prefill 算子在 Decode 进程里被执行，从而触发所谓的“illegal memory access”
+    # bug 记录：不要在 warmup 里用 Backend.moe_impl（Backend没有这个字段）
+    # MoE 的 task_type 需要设置在 moe_impl 上，否则 decode_only
+    # 的 warmup 会在 MoE layer 里因为 task_type=None 触发 KeyError(None)
     if get_global_args().models.type == "hf-qwen3-next":
         Backend.linear_attn_cache_manager.prepare_cache_prefill(req_ids, seq_len_list)
     if (
@@ -349,7 +369,8 @@ def _warmup_backend_direct(args, local_max_bs=1, decode_steps=2, bs_descend=0):
     output_token_offsets = torch.arange(
         local_max_bs, dtype=torch.int32, device=tokens.device
     )
-    _ = Backend.model.prefill(tokens, output_token_offsets)
+    if not skip_model_prefill:
+        Backend.model.prefill(tokens, output_token_offsets)
     Backend.cache_manager.finalize_cache_all_prefill()
     # Decode steps
     for i in tqdm(
@@ -366,6 +387,10 @@ def _warmup_backend_direct(args, local_max_bs=1, decode_steps=2, bs_descend=0):
             and get_global_args().models.type == "deepseek-v3"
         ):
             Backend.indexer_cache_manager.prepare_cache_decode(curr_req_ids)
+
+        # direct warmup 绕过了 executor，因此必须在这里显式设置
+        if hasattr(Backend.model, "moe_impl") and Backend.model.moe_impl is not None:
+            Backend.model.moe_impl.prepare(TaskType.Decode, curr_bs)
 
         if is_pp_first_rank:
             step_token = torch.randint(
@@ -407,11 +432,8 @@ def _warmup_backend_direct(args, local_max_bs=1, decode_steps=2, bs_descend=0):
 
 def warmup_engine(args):
     # Router 进程不做 warmup
-    try:
-        if getattr(args.dp_config.router, "is_router", False):
-            return
-    except Exception:
-        pass
+    if args.dp_config.router.is_router:
+        return
 
     # NOTE: DP+PP每次规划的req数量为max_reqs（纯PP为max_reqs / pp_size），可能导致同时运行的req数量大于max_reqs
     # 如果在运行时遇到问题，请开启下面的跳过与兜底策略（目前暂未发现问题）
@@ -433,24 +455,32 @@ def warmup_engine(args):
     #                 scheduler.reset_kvcache_block_threshold()
     #     return
 
-    # PD→direct，非PD→taskpool
-    pd_enabled = False
-    try:
-        pd_enabled = (
-            hasattr(args.dp_config.router, "pd_disaggregation")
-            and args.dp_config.router.pd_disaggregation.enabled
-        )
-    except Exception:
-        pd_enabled = False
+    # PD分离→direct，非PD→taskpool
+    pd_enabled = args.dp_config.router.pd_disaggregation.enabled
 
     runner = "direct" if pd_enabled else "taskpool"
+    sched_type = str(args.scheduler.type).lower()
+    skip_model_prefill = "decode_only" in sched_type
+    full_warmup = args.infer.full_warmup
+
+    def _log_skip_prefill():
+        if skip_model_prefill:
+            logger.info(
+                "[warmup][direct] decode_only detected, skipping model.prefill in warmup"
+            )
+
     if runner == "taskpool":
         _warmup_via_taskpool(args)
-    else:
-        _warmup_backend_direct(args, decode_steps=2)
-    _auto_set_num_blocks_after_warmup(args)
+    elif not full_warmup:
+        _log_skip_prefill()
+        _warmup_backend_direct(
+            args, decode_steps=2, skip_model_prefill=bool(skip_model_prefill)
+        )
 
-    if runner == "taskpool" and args.infer.full_warmup:
+    if full_warmup:
+        if runner == "direct":
+            logger.info("[warmup] full_warmup enabled, skip base warmup")
+        _log_skip_prefill()
         max_reqs_per_dp = ceil_div(args.infer.max_reqs, args.infer.dp_size)
         if args.infer.pp_size > 1:
             if (
@@ -463,8 +493,14 @@ def warmup_engine(args):
         else:
             local_max_bs = max_reqs_per_dp
         _warmup_backend_direct(
-            args, local_max_bs=local_max_bs, decode_steps=local_max_bs, bs_descend=1
+            args,
+            local_max_bs=local_max_bs,
+            decode_steps=local_max_bs,
+            bs_descend=1,
+            skip_model_prefill=bool(skip_model_prefill),
         )
+
+    _auto_set_num_blocks_after_warmup(args)
 
 
 def check_checkpoint_path(args):
@@ -706,8 +742,6 @@ def chitu_init(args):
 
     logger.debug(f"collector_addrs:{collector_addrs}")
 
-    # Ranks with dp_dispatcher start throughput monitor for independent logging
-    # Determine if this rank should start throughput monitor
     # Only rank 0 monitors (it has all TaskPool data)
     should_start_monitor = rank == 0
     if should_start_monitor:
@@ -763,6 +797,22 @@ def chitu_run_main_rank():
                 task_ids_list[i] = task_ids
             if any((len(task_ids) > 0 for task_ids in task_ids_list)):
                 DPTaskCollector.prepare_dp_tasks(task_ids_list)
+                for task_ids in task_ids_list:
+                    for task_id in task_ids:
+                        task = TaskPool.pool.get(task_id)
+                        if task is None:
+                            continue
+                        if getattr(task, "task_type", None) != TaskType.Decode:
+                            continue
+                        if getattr(task, "pd_sched_wait_end_logged", False):
+                            continue
+                        task.pd_sched_wait_end_logged = True
+                        req_id = getattr(
+                            getattr(task, "req", None), "request_id", task_id
+                        )
+                        logger.debug(
+                            f"[PD_STAGE][decode.sched_wait.end] req_id={req_id}"
+                        )
                 task_ids = task_ids_list[0]
                 break
         else:
@@ -771,6 +821,18 @@ def chitu_run_main_rank():
     if task_ids or DPTaskCollector.has_available_tasks():
         # compute
         logger.debug(f"Processing {task_ids}")
+        if task_ids:
+            for task_id in task_ids:
+                task = TaskPool.pool.get(task_id)
+                if task is None:
+                    continue
+                if getattr(task, "task_type", None) != TaskType.Decode:
+                    continue
+                if getattr(task, "pd_sched_wait_end_logged", False):
+                    continue
+                task.pd_sched_wait_end_logged = True
+                req_id = getattr(getattr(task, "req", None), "request_id", task_id)
+                logger.debug(f"[PD_STAGE][decode.sched_wait.end] req_id={req_id}")
         tasks = PackedTasks(task_ids)
         backend_payload_type = Backend.executor.step(tasks)
     else:
@@ -849,12 +911,6 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
         )
         return
 
-    """Start Enhanced Scheduler service, listen to ZMQ requests"""
-    import zmq
-    import zmq.asyncio
-    import msgpack
-    import time
-
     logger.warning(f"[Enhanced Scheduler {dp_id}] Starting...")
 
     # Initialize ZMQ
@@ -879,8 +935,6 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
 
     # Start DP Token Manager
     try:
-        from chitu.dp_token_sender import start_dp_token_manager
-
         dp_id = get_global_args().dp_config.dp_id
         router_token_address = f"tcp://{dp_config.router.host}:{dp_config.router.token_port}"  # Token Router listen address
 
@@ -892,12 +946,8 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
             f"[Enhanced Scheduler {dp_id}] DP Token Manager started successfully"
         )
     except Exception as e:
-        logger.error(
-            f"[Enhanced Scheduler {dp_id}] DP Token Manager failed to start: {e}"
-        )
-        # print stack trace
-        logger.error(
-            f"[Enhanced Scheduler {dp_id}] DP Token Manager failed to start: {traceback.format_exc()}"
+        logger.exception(
+            f"[Enhanced Scheduler {dp_id}] DP Token Manager failed to start"
         )
         return
 
@@ -1013,8 +1063,6 @@ async def process_scheduler_request(rank: int, request_data: dict):
         task = Task(task_id=request_id, req=user_request, stop_with_eos=stop_with_eos)
 
         try:
-            from chitu.dp_token_sender import get_dp_token_manager
-
             dp_id = get_global_args().dp_config.dp_id
             token_manager = get_dp_token_manager(dp_id)
             # ensure token manager started

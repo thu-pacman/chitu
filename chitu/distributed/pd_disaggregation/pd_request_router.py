@@ -9,6 +9,7 @@ Extends the original RequestRouter to support Prefill-Decode disaggregation
 
 import asyncio
 import logging
+import os
 import time
 from typing import Optional
 
@@ -163,6 +164,8 @@ class PDRequestRouter(RequestRouter):
         # Create sockets to Prefill Schedulers
         for scheduler_id, info in self.prefill_schedulers.items():
             socket = self.context.socket(zmq.PUSH)
+            # Fail immdediately if peer not connected to avoid silent drops.
+            socket.setsockopt(zmq.IMMEDIATE, 1)
             socket.connect(info["address"])
             self.prefill_sockets[scheduler_id] = socket
             logger.info(
@@ -172,6 +175,7 @@ class PDRequestRouter(RequestRouter):
         # Create sockets to Decode Schedulers
         for scheduler_id, info in self.decode_schedulers.items():
             socket = self.context.socket(zmq.PUSH)
+            socket.setsockopt(zmq.IMMEDIATE, 1)
             socket.connect(info["address"])
             self.decode_sockets[scheduler_id] = socket
             logger.info(
@@ -217,6 +221,7 @@ class PDRequestRouter(RequestRouter):
     async def _add_pd_request(self, request):
         """Add PD disaggregation request"""
         request_id = getattr(request, "request_id", str(time.time()))
+        logger.info(f"[PD_STAGE][router.recv.start] req_id={request_id}")
 
         # Select Prefill and Decode Scheduler
         prefill_scheduler_id = self._select_prefill_scheduler()
@@ -225,6 +230,17 @@ class PDRequestRouter(RequestRouter):
         if prefill_scheduler_id is None or decode_scheduler_id is None:
             logger.error("no available prefill or decode scheduler")
             return
+
+        # PD trace: Router selected a P/D pair for this request.
+        messages = getattr(request, "message", getattr(request, "messages", None))
+        msg_count = len(messages) if isinstance(messages, list) else None
+        max_new = getattr(
+            request, "max_new_tokens", getattr(request, "max_tokens", None)
+        )
+        logger.debug(
+            f"[PD_TRACE][router.select_pair] req_id={request_id} prefill_sid={prefill_scheduler_id} "
+            f"decode_sid={decode_scheduler_id} msg_count={msg_count} max_new_tokens={max_new}"
+        )
 
         # Create PD request record
         pd_request = PendingPDRequest(
@@ -249,6 +265,7 @@ class PDRequestRouter(RequestRouter):
 
         # Put request into processing queue
         self.pending_requests.append(pd_request)
+        logger.info(f"[PD_STAGE][router.recv.end] req_id={request_id}")
 
     def _select_prefill_scheduler(self) -> Optional[int]:
         """Select Prefill Scheduler"""
@@ -303,8 +320,7 @@ class PDRequestRouter(RequestRouter):
                 if isinstance(pd_request, PendingPDRequest):
                     await self._process_pd_request(pd_request)
                 else:
-                    # Backward compatibility for original request type
-                    await self._process_regular_request(pd_request)
+                    raise ValueError(f"unexpected request type: {type(pd_request)}")
 
             await asyncio.sleep(0.01)  # 10ms polling interval
 
@@ -325,18 +341,39 @@ class PDRequestRouter(RequestRouter):
         }
 
         # Dual dispatch: send to both Prefill and Decode simultaneously
-        await asyncio.gather(
-            self._send_to_prefill_scheduler(
-                pd_request.prefill_scheduler_id, request_data
-            ),
-            self._send_to_decode_scheduler(
-                pd_request.decode_scheduler_id,
-                request_data,
-                pd_request.prefill_scheduler_id,
-            ),
+        logger.info(
+            f"[PD_STAGE][router.dispatch.start] req_id={pd_request.request_id} "
+            f"prefill_sid={pd_request.prefill_scheduler_id} decode_sid={pd_request.decode_scheduler_id}"
         )
+        logger.debug(
+            f"[PD_TRACE][router.dispatch_start] req_id={pd_request.request_id} "
+            f"prefill_sid={pd_request.prefill_scheduler_id} decode_sid={pd_request.decode_scheduler_id} "
+            f"keys={sorted(list(request_data.keys()))}"
+        )
+        try:
+            await asyncio.gather(
+                self._send_to_prefill_scheduler(
+                    pd_request.prefill_scheduler_id, request_data
+                ),
+                self._send_to_decode_scheduler(
+                    pd_request.decode_scheduler_id,
+                    request_data,
+                    pd_request.prefill_scheduler_id,
+                ),
+            )
+        except Exception as e:
+            logger.error(
+                f"pd request dispatch failed: req_id={pd_request.request_id} err={e}"
+            )
+            pd_request.status = PDRequestStatus.PENDING
+            self.pending_requests.appendleft(pd_request)
+            await asyncio.sleep(0.05)
+            return
+        logger.info(f"[PD_STAGE][router.dispatch.end] req_id={pd_request.request_id}")
 
         logger.debug(f"pd disaggregation request dispatched: {pd_request.request_id}")
+        # Update router performance counters on successful dispatch
+        self.total_requests += 1
 
     def _serialize_original_request(self, req) -> dict:
         """Convert RouterRequest/ChatRequest/dict to a msgpack-serializable dict"""
@@ -425,7 +462,16 @@ class PDRequestRouter(RequestRouter):
         prefill_data["scheduler_id"] = scheduler_id
 
         packed_data = msgpack.packb(prefill_data)
-        await self.prefill_sockets[scheduler_id].send(packed_data)
+        logger.debug(
+            f"[PD_TRACE][router.send_prefill] req_id={prefill_data.get('request_id')} sid={scheduler_id} "
+            f"addr={self.prefill_schedulers.get(scheduler_id, {}).get('address')} packed_bytes={len(packed_data)} "
+            f"fields={sorted(list(prefill_data.keys()))}"
+        )
+        await self._send_with_retry(
+            self.prefill_sockets[scheduler_id],
+            packed_data,
+            f"prefill:{scheduler_id}",
+        )
 
         logger.debug(f"request sent to prefill scheduler {scheduler_id}")
 
@@ -443,15 +489,29 @@ class PDRequestRouter(RequestRouter):
         decode_data["prefill_scheduler_id"] = prefill_scheduler_id
 
         packed_data = msgpack.packb(decode_data)
-        await self.decode_sockets[scheduler_id].send(packed_data)
+        logger.debug(
+            f"[PD_TRACE][router.send_decode] req_id={decode_data.get('request_id')} sid={scheduler_id} "
+            f"addr={self.decode_schedulers.get(scheduler_id, {}).get('address')} prefill_sid={prefill_scheduler_id} "
+            f"packed_bytes={len(packed_data)} fields={sorted(list(decode_data.keys()))}"
+        )
+        await self._send_with_retry(
+            self.decode_sockets[scheduler_id],
+            packed_data,
+            f"decode:{scheduler_id}",
+        )
 
-        logger.debug(f"request sent to decode scheduler {scheduler_id}")
-
-    async def _process_regular_request(self, request):
-        """Process regular request (compatibility mode)"""
-        # Use parent logic
-        scheduler_id = self.load_balancer.select_scheduler()
-        await self._send_request(scheduler_id, request)
+    async def _send_with_retry(self, socket, payload: bytes, label: str):
+        timeout_s = float(os.getenv("PD_ROUTER_SEND_TIMEOUT_S", "5"))
+        retry_s = float(os.getenv("PD_ROUTER_SEND_RETRY_S", "0.05"))
+        start_time = time.time()
+        while True:
+            try:
+                await socket.send(payload, flags=zmq.DONTWAIT)
+                return
+            except zmq.Again:
+                if time.time() - start_time > timeout_s:
+                    raise
+                await asyncio.sleep(retry_s)
 
     async def _pd_coordination_task(self):
         """PD coordination task"""

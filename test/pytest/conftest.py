@@ -51,14 +51,32 @@ Run with more rounds for accurate performance testing:
     pytest test.py --warmup-round=5 --timing-round=20 -s
 """
 
+import asyncio
 import os
 import sys
 import math
 import atexit
+import threading
+import time
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional
 
 import pytest
+import torch
+from omegaconf import OmegaConf
+
+import chitu.global_vars as global_vars
+from chitu.global_vars import set_global_args
+from chitu.utils import get_free_port
+from chitu.distributed.parallel_state import (
+    initialize_parallel_groups,
+    parallel_groups_initialized,
+    destroy_parallel_groups,
+)
+from chitu.distributed.pd_disaggregation.pd_coordination import PDCoordinationService
+from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.transfer_engine import (
+    MooncakeBootstrapServer,
+)
 
 # Add project root to path (required for correct module imports in pytest)
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -492,3 +510,181 @@ def pytest_configure(config):
         "markers",
         "benchmark: mark test as having benchmark capability",
     )
+    config.addinivalue_line(
+        "markers",
+        "pd_unit: PD disaggregation unit tests",
+    )
+    config.addinivalue_line(
+        "markers",
+        "pd_deadlock: PD deadlock reproduction tests",
+    )
+    config.addinivalue_line(
+        "markers",
+        "pd_dist: PD distributed tests",
+    )
+
+
+# ---------------------------------------------------------------------------
+# PD disaggregation fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _set_mooncake_env():
+    # If mooncake is unavailable, fall back to mock.
+    if "MOONCAKE_MOCK_MODE" not in os.environ:
+        try:
+            import mooncake  # noqa: F401
+
+            os.environ["MOONCAKE_MOCK_MODE"] = "0"
+        except Exception:
+            os.environ["MOONCAKE_MOCK_MODE"] = "1"
+    master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("PD_MASTER_ADDR", master_addr)
+    yield
+
+
+@pytest.fixture(scope="session")
+def cuda_available():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for PD KV tests.")
+
+
+@pytest.fixture(scope="session")
+def pd_ports():
+    coordination_port = int(os.environ.get("PD_COORDINATION_PORT", "29800"))
+    metadata_port = int(os.environ.get("PD_METADATA_PORT", "29801"))
+    bootstrap_port = int(os.environ.get("PD_BOOTSTRAP_PORT", "8080"))
+    return {
+        "coordination_port": coordination_port,
+        "metadata_port": metadata_port,
+        "bootstrap_port": bootstrap_port,
+    }
+
+
+@pytest.fixture(scope="session")
+def coordination_service(pd_ports):
+    if os.environ.get("PD_COORDINATION_EXTERNAL", "0") == "1":
+        yield None
+        return
+    service = PDCoordinationService(
+        coordination_port=pd_ports["coordination_port"],
+        metadata_sync_port=pd_ports["metadata_port"],
+    )
+    loop = asyncio.new_event_loop()
+    started = threading.Event()
+
+    def _run():
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(service.start())
+        started.set()
+        loop.run_forever()
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    started.wait(timeout=5)
+    if not started.is_set():
+        raise RuntimeError("failed to start PDCoordinationService")
+    yield service
+
+    fut = asyncio.run_coroutine_threadsafe(service.stop(), loop)
+    fut.result(timeout=5)
+    loop.call_soon_threadsafe(loop.stop)
+    t.join(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def bootstrap_server(pd_ports):
+    if os.environ.get("PD_BOOTSTRAP_EXTERNAL", "0") == "1":
+        yield None
+        return
+    master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("PD_MASTER_ADDR", master_addr)
+    server = MooncakeBootstrapServer(port=pd_ports["bootstrap_port"])
+    server.start_in_background()
+    # Give server a moment to bind.
+    time.sleep(0.2)
+    yield server
+
+
+@pytest.fixture(scope="session")
+def global_args(pd_ports):
+    ib_device = os.environ.get("PD_IB_DEVICE", "mlx5_0")
+    cfg = OmegaConf.create(
+        {
+            "models": {
+                "name": "unit-test",
+                "vocab_size": 128,
+                "n_kv_heads": 2,
+                "head_dim": 8,
+            },
+            "infer": {
+                "tp_size": 1,
+                "pp_size": 1,
+                "dp_size": 1,
+                "ep_size": 1,
+                "mtp_size": 1,
+                "max_seq_len": 512,
+                "max_reqs": 16,
+                "prefill_chunk_size": 128,
+                "use_cuda_graph": False,
+            },
+            "scheduler": {
+                "type": "prefill_only",
+                "pp_config": {
+                    "prefill_num_tasks_divided_by_pp": True,
+                    "prefill_num_tasks": None,
+                    "enforce_decode_num_tasks_max": True,
+                    "decode_num_tasks": None,
+                },
+            },
+            "dp_config": {
+                "dp_id": 0,
+                "router": {
+                    "host": "127.0.0.1",
+                    "pd_disaggregation": {
+                        "enabled": True,
+                        "coordination_port": pd_ports["coordination_port"],
+                        "metadata_sync_port": pd_ports["metadata_port"],
+                        "bootstrap_port": pd_ports["bootstrap_port"],
+                        "ib_device": ib_device,
+                        "kv_transfer": {
+                            "decode_wait_timeout_s": 5.0,
+                            "decode_resend_interval_s": 0.2,
+                        },
+                    },
+                },
+            },
+        }
+    )
+    set_global_args(cfg, need_ensure=False)
+    if global_vars._GLOBAL_TIMERS is None:
+        global_vars._set_timers()
+    return cfg
+
+
+@pytest.fixture(scope="session")
+def init_distributed(global_args):
+    initialized = False
+    if not torch.distributed.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", str(get_free_port()))
+        torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
+        initialized = True
+
+    if not parallel_groups_initialized():
+        initialize_parallel_groups(
+            tp_size=global_args.infer.tp_size,
+            pp_size=global_args.infer.pp_size,
+            dp_size=global_args.infer.dp_size,
+            ep_size=global_args.infer.ep_size,
+            etp_size=1,
+        )
+
+    yield
+
+    if initialized:
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_world_size() > 1 and parallel_groups_initialized():
+                destroy_parallel_groups()
+            torch.distributed.destroy_process_group()

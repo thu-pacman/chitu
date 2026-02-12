@@ -10,7 +10,9 @@ Handles inter-batch data parallel request distribution.
 import asyncio
 import os
 import logging
+import random
 import time
+import traceback
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from chitu.global_vars import get_global_args
@@ -95,8 +97,6 @@ class LoadBalancer:
 
         # Power-of-two-choices among eligible ids (fallbacks handled)
         if algorithm == "power_of_two_choices":
-            import random
-
             if len(eligible_ids) < 2:
                 return eligible_ids[0]
             c1, c2 = random.sample(eligible_ids, 2)
@@ -169,8 +169,6 @@ class LoadBalancer:
 
     def _power_of_two_choices(self) -> int:
         """Power of two choices algorithm for better load distribution."""
-        import random
-
         if len(self.scheduler_stats) < 2:
             logger.warning(
                 f"[POWER_OF_TWO] Statistics insufficient ({len(self.scheduler_stats)}), cannot use power of two choices algorithm"
@@ -236,7 +234,9 @@ class RequestRouter:
 
         # Request queues and routing state
         self.pending_requests = deque()
-        self.request_stats = defaultdict(lambda: {"start_time": 0.0, "tokens": 0})
+        self.request_stats = defaultdict(
+            lambda: {"start_time": 0.0, "prompt_len": None, "generated_tokens": 0}
+        )
 
         # Resolve scheduler addresses from config
         self._scheduler_addresses: list[str] = []
@@ -383,8 +383,6 @@ class RequestRouter:
 
             except Exception as e:
                 # print stack trace
-                import traceback
-
                 logger.error(f"[REQUEST_ROUTER] Request processor exception: {e}")
                 logger.error(f"[REQUEST_ROUTER] Stack trace: {traceback.format_exc()}")
                 await asyncio.sleep(0.1)
@@ -540,10 +538,33 @@ class RequestRouter:
 
         # Update request stats for monitoring
         self.request_stats[request.request_id]["start_time"] = time.time()
+        self.request_stats[request.request_id]["prompt_len"] = None
+        self.request_stats[request.request_id]["generated_tokens"] = 0
 
         logger.debug(
             f"Added request {request.request_id} to queue (queue size: {len(self.pending_requests)})"
         )
+
+    def record_prompt_len(self, request_id: str, prompt_len: int):
+        """Record prompt length once and update total token count."""
+        if prompt_len is None:
+            return
+        prompt_len = int(prompt_len)
+        if prompt_len <= 0:
+            return
+        stats = self.request_stats[request_id]
+        if stats.get("prompt_len") in (None, 0):
+            stats["prompt_len"] = prompt_len
+            self.total_tokens += prompt_len
+
+    def record_generated_token(self, request_id: str, count: int = 1):
+        """Record generated tokens and update total token count."""
+        count = int(count)
+        if count <= 0:
+            return
+        stats = self.request_stats[request_id]
+        stats["generated_tokens"] = stats.get("generated_tokens", 0) + count
+        self.total_tokens += count
 
     def get_performance_stats(self) -> dict:
         """Get current performance statistics."""
@@ -620,8 +641,6 @@ async def start_request_router():
     # If no pre-created instance, create according to original logic (backward compatibility)
     logger.info("Creating new Request Router instance...")
 
-    from chitu.backend import Backend
-
     args = get_global_args()
     dp_config = args.dp_config
 
@@ -633,6 +652,8 @@ async def start_request_router():
 
     if pd_enabled:
         logger.info("Creating PD disaggregation router...")
+        # NOTE: keep local import to avoid circular dependency:
+        # pd_request_router.py imports RequestRouter from this module.
         from chitu.distributed.pd_disaggregation.pd_request_router import (
             PDRequestRouter,
         )

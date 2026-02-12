@@ -41,6 +41,22 @@ class PDCoordinationService:
         )  # request_id -> metadata
         self.prefill_schedulers: dict[int, SchedulerInfo] = {}  # scheduler_id -> info
         self.decode_schedulers: dict[int, SchedulerInfo] = {}  # scheduler_id -> info
+        # Prefill control-plane endpoints per engine_rank (dp_id).
+        # Used by Prefill PP/TP ranks to discover their control rank's ZMQ ports
+        # 之前是 Prefill 启动的时候通过 torch broadcast 告诉其他 Prefill rank main rank 的端口，现在改用 coordination service 来同步
+        self.prefill_ctrl_endpoints: dict[int, dict] = (
+            {}
+        )  # engine_rank -> endpoint dict
+
+        # Decode prepare endpoints (control plane) per (decode_scheduler_id, dp_rank).
+        # Used by Decode scheduler rank0 to send "prepare transfer" commands to the
+        # owner dp_rank without coupling to PP/TP ports.
+        self.decode_prepare_endpoints: dict[tuple[int, int], dict] = {}
+
+        # Decode status endpoints (control plane) per (decode_scheduler_id, dp_rank).
+        # Prefill sends final Success to the owner dp_rank's status endpoint.
+        # Decode scheduler (rank0) may also need to discover dp_rank0 endpoint for status aggregation.
+        self.decode_status_endpoints: dict[tuple[int, int], dict] = {}
 
         # ZMQ related
         self.context = zmq.asyncio.Context()
@@ -256,6 +272,96 @@ class PDCoordinationService:
     async def _process_metadata_request(self, request_data: dict) -> dict:
         """Process metadata request"""
         request_type = request_data.get("type")
+
+        if request_type == "set_prefill_ctrl_endpoint":
+            engine_rank = request_data.get("engine_rank", None)
+            ip = request_data.get("ip", "")
+            port = request_data.get("port", None)
+            internal_port = request_data.get("internal_port", None)
+            broadcast_port = request_data.get("broadcast_port", None)
+            er = int(engine_rank)
+            p = int(port)
+            ipt = str(ip)
+            ipt = ipt.strip()
+            internal_p = int(internal_port) if internal_port is not None else 0
+            broadcast_p = int(broadcast_port) if broadcast_port is not None else 0
+            if not ipt or p <= 0:
+                return {
+                    "status": "error",
+                    "message": f"invalid endpoint: ip={ipt!r} port={p}",
+                }
+            self.prefill_ctrl_endpoints[er] = {
+                "ip": ipt,
+                "port": p,
+                "internal_port": internal_p,
+                "broadcast_port": broadcast_p,
+            }
+            return {"status": "success"}
+
+        if request_type == "get_prefill_ctrl_endpoint":
+            engine_rank = request_data.get("engine_rank", None)
+            er = int(engine_rank)
+            ep = self.prefill_ctrl_endpoints.get(er, None)
+            if not ep:
+                return {
+                    "status": "not_found",
+                    "message": f"prefill ctrl endpoint not found for engine_rank={er}",
+                }
+            return {"status": "success", "endpoint": dict(ep)}
+
+        if request_type == "set_decode_prepare_endpoint":
+            decode_scheduler_id = int(request_data.get("decode_scheduler_id", 0) or 0)
+            dp_rank = int(request_data.get("dp_rank", 0) or 0)
+            ip = str(request_data.get("ip", "") or "").strip()
+            port = int(request_data.get("port", 0) or 0)
+            if not ip or port <= 0:
+                return {
+                    "status": "error",
+                    "message": f"invalid endpoint: ip={ip!r} port={port}",
+                }
+            self.decode_prepare_endpoints[(decode_scheduler_id, dp_rank)] = {
+                "ip": ip,
+                "port": port,
+            }
+            return {"status": "success"}
+
+        if request_type == "get_decode_prepare_endpoint":
+            decode_scheduler_id = int(request_data.get("decode_scheduler_id", 0) or 0)
+            dp_rank = int(request_data.get("dp_rank", 0) or 0)
+            ep = self.decode_prepare_endpoints.get((decode_scheduler_id, dp_rank), None)
+            if not ep:
+                return {
+                    "status": "not_found",
+                    "message": f"decode prepare endpoint not found for decode_scheduler_id={decode_scheduler_id} dp_rank={dp_rank}",
+                }
+            return {"status": "success", "endpoint": dict(ep)}
+
+        if request_type == "set_decode_status_endpoint":
+            decode_scheduler_id = int(request_data.get("decode_scheduler_id", 0) or 0)
+            dp_rank = int(request_data.get("dp_rank", 0) or 0)
+            ip = str(request_data.get("ip", "") or "").strip()
+            port = int(request_data.get("port", 0) or 0)
+            if not ip or port <= 0:
+                return {
+                    "status": "error",
+                    "message": f"invalid endpoint: ip={ip!r} port={port}",
+                }
+            self.decode_status_endpoints[(decode_scheduler_id, dp_rank)] = {
+                "ip": ip,
+                "port": port,
+            }
+            return {"status": "success"}
+
+        if request_type == "get_decode_status_endpoint":
+            decode_scheduler_id = int(request_data.get("decode_scheduler_id", 0) or 0)
+            dp_rank = int(request_data.get("dp_rank", 0) or 0)
+            ep = self.decode_status_endpoints.get((decode_scheduler_id, dp_rank), None)
+            if not ep:
+                return {
+                    "status": "not_found",
+                    "message": f"decode status endpoint not found for decode_scheduler_id={decode_scheduler_id} dp_rank={dp_rank}",
+                }
+            return {"status": "success", "endpoint": dict(ep)}
 
         if request_type == "get_kv_transfer_metadata":
             request_id = request_data.get("request_id")

@@ -58,6 +58,7 @@ from chitu.quantization import (
     utils,
 )
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF, Processor
+from chitu.utils import try_import_opt_dep
 from chitu.tool_call import get_tool_parser
 from chitu.constraint_decode import ConstraintDecodeManager
 from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div, get_global_args
@@ -447,15 +448,12 @@ class Backend:
         mtp_size = int(getattr(get_global_args().infer, "mtp_size", 1))
         total_n_layers = args.models.n_layers + (1 if mtp_size > 1 else 0)
         if pipeline_parallel_size > 1:
-            pipe_stage = get_pp_group().rank_in_group
-            num_layers_of_each_rank = compute_layer_dist_in_pp(
-                total_n_layers, pipeline_parallel_size
+            layer_dist = compute_layer_dist_in_pp(
+                args.models.n_layers, pipeline_parallel_size
             )
-            first_layer_id_of_each_rank = list(
-                itertools.accumulate([0] + num_layers_of_each_rank)
-            )
-            local_begin_layer_id = first_layer_id_of_each_rank[pipe_stage]
-            local_end_layer_id = first_layer_id_of_each_rank[pipe_stage + 1]
+            pp_rank = get_pp_group().rank_in_group
+            local_begin_layer_id = sum(layer_dist[:pp_rank])
+            local_end_layer_id = local_begin_layer_id + layer_dist[pp_rank]
         else:
             local_begin_layer_id = 0
             local_end_layer_id = total_n_layers
@@ -504,15 +502,12 @@ class Backend:
         mtp_size = int(getattr(get_global_args().infer, "mtp_size", 1))
         total_n_layers = args.models.n_layers + (1 if mtp_size > 1 else 0)
         if pipeline_parallel_size > 1:
-            pipe_stage = get_pp_group().rank_in_group
-            num_layers_of_each_rank = compute_layer_dist_in_pp(
-                total_n_layers, pipeline_parallel_size
+            layer_dist = compute_layer_dist_in_pp(
+                args.models.n_layers, pipeline_parallel_size
             )
-            first_layer_id_of_each_rank = list(
-                itertools.accumulate([0] + num_layers_of_each_rank)
-            )
-            local_begin_layer_id = first_layer_id_of_each_rank[pipe_stage]
-            local_end_layer_id = first_layer_id_of_each_rank[pipe_stage + 1]
+            pp_rank = get_pp_group().rank_in_group
+            local_begin_layer_id = sum(layer_dist[:pp_rank])
+            local_end_layer_id = local_begin_layer_id + layer_dist[pp_rank]
         else:
             local_begin_layer_id = 0
             local_end_layer_id = total_n_layers
@@ -537,15 +532,12 @@ class Backend:
         mtp_size = int(getattr(get_global_args().infer, "mtp_size", 1))
         total_n_layers = args.models.n_layers + (1 if mtp_size > 1 else 0)
         if pipeline_parallel_size > 1:
-            pipe_stage = get_pp_group().rank_in_group
-            num_layers_of_each_rank = compute_layer_dist_in_pp(
-                total_n_layers, pipeline_parallel_size
+            layer_dist = compute_layer_dist_in_pp(
+                args.models.n_layers, pipeline_parallel_size
             )
-            first_layer_id_of_each_rank = list(
-                itertools.accumulate([0] + num_layers_of_each_rank)
-            )
-            local_begin_layer_id = first_layer_id_of_each_rank[pipe_stage]
-            local_end_layer_id = first_layer_id_of_each_rank[pipe_stage + 1]
+            pp_rank = get_pp_group().rank_in_group
+            local_begin_layer_id = sum(layer_dist[:pp_rank])
+            local_end_layer_id = local_begin_layer_id + layer_dist[pp_rank]
         else:
             local_begin_layer_id = 0
             local_end_layer_id = total_n_layers

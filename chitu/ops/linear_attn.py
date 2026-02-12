@@ -110,8 +110,10 @@ def chunk_gated_delta_rule_torch_dense(
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
     value = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    # Use device/dtype from `value` directly.
+    # Avoid `torch.zeros(...).to(value)` which creates a CPU tensor then copies to device.
     last_recurrent_state = (
-        torch.zeros(batch_size, sequence_length, k_head_dim, v_head_dim).to(value)
+        value.new_zeros((batch_size, sequence_length, k_head_dim, v_head_dim))
         if initial_state is None
         else initial_state.to(value)
     )
@@ -273,11 +275,14 @@ def recurrent_gated_delta_rule_torch(
     scale = 1 / (query.shape[-1] ** 0.5)
     query = query * scale
 
-    core_attn_out = torch.zeros(batch_size, sequence_length, num_heads, v_head_dim).to(
-        value
+    # NOTE: Use device/dtype from `value` directly.
+    # Avoid `torch.zeros(...).to(value)` which creates a CPU tensor then copies to device.
+    # This is not CUDA-graph friendly and is also slower.
+    core_attn_out = value.new_zeros(
+        (batch_size, sequence_length, num_heads, v_head_dim)
     )
     last_recurrent_state = (
-        torch.zeros(batch_size, sequence_length, k_head_dim, v_head_dim).to(value)
+        value.new_zeros((batch_size, sequence_length, k_head_dim, v_head_dim))
         if initial_state is None
         else initial_state.to(value)
     )

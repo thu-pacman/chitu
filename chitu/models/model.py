@@ -5,8 +5,8 @@
 import itertools
 import functools
 import operator
-import os
 from logging import getLogger
+import os
 from typing import Any, Mapping, Optional
 from contextlib import nullcontext
 
@@ -854,6 +854,8 @@ class Transformer(nn.Module):
         self, tokens, output_token_offsets: torch.Tensor, **args
     ) -> torch.Tensor:
         freqs_cis = self.prepare_freqs_cis()
+        if self.moe_impl is not None:
+            self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
         h = self._pre_layers(tokens, **args)
         if self.mtp_size > 1:
             self.cache.seq_len_delta.is_decode_stage = False
@@ -984,6 +986,10 @@ class Transformer(nn.Module):
             h = self._pre_layers(tokens, **args)
         else:
             h = tokens
+
+        # Ensure MoE impl is primed before layer execution in prefill.
+        if self.moe_impl is not None:
+            self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
 
         # layers
         for it, layer in enumerate(self.layers):
@@ -1239,7 +1245,10 @@ class Transformer(nn.Module):
                     kwargs_max_nelem={},
                     output_max_nelem_callback=lambda key, n: 1,
                     before_replay_callback=None,
-                    enable=current_cuda_graph_enabled,
+                    # empty decode 仅用于 EP sync，没有真实 token
+                    # 在 empty decode 上capture graph 会生成 zero-size buffer，
+                    # 后续非空 replay 会失败，因此关闭graphed，经过测试发现这部分对性能影响很小
+                    enable=False,
                 )
                 def do_empty_decode():
                     return self.empty_decode()
@@ -1253,7 +1262,10 @@ class Transformer(nn.Module):
                         kwargs_max_nelem={},
                         output_max_nelem_callback=lambda key, n: 1,
                         before_replay_callback=None,
-                        enable=current_cuda_graph_enabled,
+                        # empty MTP decode 仅用于 EP sync，没有真实 token
+                        # 在 empty decode 上捕获 CUDA graph 会生成 zero-size buffer，
+                        # 后续非空 replay 会失败，因此保持 non-graphed。
+                        enable=False,
                     )
                     def do_empty_decode_mtp():
                         return self.empty_mtp_decode()

@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import time
+import math
 from logging import getLogger
 from typing import Optional
 from typing_extensions import override
@@ -21,6 +22,7 @@ from chitu.utils import ceil_div
 from chitu.backend import Backend
 from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
+from chitu.distributed.pd_disaggregation.pd_log_utils import pd_verbose_enabled
 
 logger = getLogger(__name__)
 
@@ -181,6 +183,9 @@ class Scheduler:
         self.kvcache_block_threshold = Backend.cache_manager.get_num_blocks()
         self.is_warmup_stage = False
         self.has_schedule_overlap = get_global_args().infer.schedule_overlap
+        self._pd_ready_exec_delays_ms: list[float] = []
+        self._pd_ready_exec_last_log_ts = 0.0
+        self._pd_ready_exec_log_interval_s = 5.0
 
     def reset_kvcache_block_threshold(self):
         self.kvcache_block_threshold = Backend.cache_manager.get_num_blocks()
@@ -238,7 +243,9 @@ class Scheduler:
             self.strict_allowed_task_type
         )
         if len(strict_allowed_task_type) == 0:
-            raise RuntimeError("No task type is allowed for this scheduling")
+            # chitu_main 里面先用 strict_allowed_task_type=Prefill调一次 schedule()，如果拿不到任务，再用 Decode 再调一次
+            # 在PD分离只有decode_only，就会走到这里
+            return []
         task_ids = [
             tid
             for tid in task_ids
@@ -286,6 +293,9 @@ class Scheduler:
             TaskPool.pool[task_id].sched_group_id = sgroup_id
             TaskPool.pool[task_id].dp_rank = self.dp_rank
 
+        self._record_pd_ready_exec_latency(task_ids)
+        self._log_pd_ready_exec_latency()
+
         logger.debug(f"Selected task_ids:")
         for task_id in task_ids:
             task = TaskPool.pool[task_id]
@@ -302,6 +312,46 @@ class Scheduler:
                 logger.debug(f"- {task_id}: Decode")
 
         return task_ids
+
+    def _record_pd_ready_exec_latency(self, task_ids: list[str]) -> None:
+        now = time.perf_counter()
+        for tid in task_ids:
+            task = TaskPool.pool.get(tid)
+            if task is None or task.task_type != TaskType.Decode:
+                continue
+            ready_ts = getattr(task, "pd_ready_ts", None)
+            if ready_ts is None:
+                continue
+            if hasattr(task, "pd_exec_ts"):
+                continue
+            task.pd_exec_ts = now
+            delay_ms = max(0.0, (now - float(ready_ts)) * 1000.0)
+            self._pd_ready_exec_delays_ms.append(delay_ms)
+
+    def _log_pd_ready_exec_latency(self) -> None:
+        now = time.perf_counter()
+        if (now - self._pd_ready_exec_last_log_ts) < self._pd_ready_exec_log_interval_s:
+            return
+        self._pd_ready_exec_last_log_ts = now
+        if not self._pd_ready_exec_delays_ms:
+            return
+        delays = sorted(self._pd_ready_exec_delays_ms)
+        self._pd_ready_exec_delays_ms = []
+        n = len(delays)
+        avg = sum(delays) / n
+
+        def _pct(p: float) -> float:
+            idx = int(math.ceil(p / 100.0 * n) - 1)
+            idx = max(0, min(n - 1, idx))
+            return delays[idx]
+
+        if pd_verbose_enabled():
+            logger.info(
+                "[PD_STATS][decode.ready_to_exec] "
+                f"count={n} avg_ms={avg:.2f} "
+                f"p50_ms={_pct(50):.2f} p90_ms={_pct(90):.2f} "
+                f"p95_ms={_pct(95):.2f} p99_ms={_pct(99):.2f}"
+            )
 
     def _schedule_prefill_tasks(self, task_ids: list[str]) -> list[str]:
         """Prefill tasks scheduling with congestion control

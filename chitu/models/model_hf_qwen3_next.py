@@ -248,6 +248,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 impl=self.impl,
             )
         else:
+            # Decode path: also need to repeat q/k to match v heads
+            q = q.repeat_interleave(
+                self.n_v_heads // self.n_qk_heads, dim=1
+            )  # (total_len, n_v_heads, head_dim)
+            k = k.repeat_interleave(
+                self.n_v_heads // self.n_qk_heads, dim=1
+            )  # (total_len, n_v_heads, head_dim)
             core_attn_out, last_recurrent_state = recurrent_gated_delta_rule(
                 q.unsqueeze(1),
                 k.unsqueeze(1),

@@ -4,28 +4,21 @@
 
 from typing import Optional
 import torch
-from chitu.global_vars import get_global_args
 
 
 class MetadataBuffers:
     """
     Metadata buffers for KV transfer
-    Stores the first token logits that need to be transferred
+    Stores the first token metadata for PD decode
     """
 
     def __init__(self, size: int):
-        # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
-        # Currently we need to transfer the first token logits
-        args = get_global_args()
-        # Check if models config exists
-        if hasattr(args, "models") and hasattr(args.models, "vocab_size"):
-            vocab_size = args.models.vocab_size
-        else:
-            vocab_size = 32000  # Default vocab size
-
-        self.output_tokens = torch.empty(
-            (size, vocab_size),
-            dtype=torch.float32,
+        # RDMA min item size is 64 bytes; keep a fixed small buffer per request.
+        # Slot 0 stores first token id (int32).
+        meta_slots = 16  # 16 * 4B = 64B
+        self.output_tokens = torch.zeros(
+            (size, meta_slots),
+            dtype=torch.int32,
             device=torch.cuda.current_device(),
         )
         self.free_indices = list(range(size))
@@ -38,21 +31,26 @@ class MetadataBuffers:
         item_len = self.output_tokens[0].nbytes
         return ptr, data_len, item_len
 
-    def allocate(self, tid, logits: Optional[torch.Tensor] = None):
+    def allocate(self, tid, first_token: Optional[torch.Tensor | int] = None):
         """Allocate buffer for a task"""
         if len(self.free_indices) == 0:
             raise RuntimeError("no free indices available")
         index = self.free_indices.pop(0)
         self.tid_to_index[tid] = index
-        if logits is not None:
-            # TODO: add shape checking
-            self.output_tokens[index] = logits
+        if first_token is not None:
+            if isinstance(first_token, torch.Tensor):
+                self.output_tokens[index, 0] = first_token.to(
+                    dtype=self.output_tokens.dtype,
+                    device=self.output_tokens.device,
+                )
+            else:
+                self.output_tokens[index, 0] = int(first_token)
         return index
 
     def get(self, index_list):
-        """Get logits by indices"""
+        """Get first token ids by indices"""
         assert isinstance(index_list, list), "index_list must be a list"
-        return self.output_tokens[index_list].clone()
+        return self.output_tokens[index_list, 0].clone()
 
     def free(self, tid_list):
         """Free buffers for tasks"""

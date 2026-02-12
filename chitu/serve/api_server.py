@@ -10,6 +10,7 @@ Provides both standard and DP (Distributed Parallel) mode HTTP endpoints.
 import logging
 import os
 import time
+import traceback
 from logging import getLogger
 from typing import Any, Optional, Mapping, Annotated
 from contextlib import suppress
@@ -23,12 +24,15 @@ from pydantic import BaseModel, Field, ValidationError
 
 from chitu.async_response import AsyncResponse
 from chitu.backend import Backend
-from chitu.chitu_main import chitu_init
-from chitu.global_vars import get_global_args
-from chitu.task import Task, TaskLoad, TaskPool, UserRequest
+from chitu.chitu_main import chitu_init, init_logger
+from chitu.dp_request_router import get_request_router
+from chitu.dp_token_router import get_token_router
+from chitu.global_vars import get_global_args, set_global_args
+from chitu.task import RouterRequest, Task, TaskLoad, TaskPool, UserRequest
 from chitu.utils import gen_req_id
 from chitu.serve.event_loop import start_server_in_new_event_loop
 from chitu.serve.common import set_min_batch_size
+from chitu.serve.router import start_dp_components
 from chitu.tool_call import ToolChoice
 from chitu.serve.anthropic_api import create_router as create_anthropic_router
 
@@ -179,6 +183,9 @@ async def create_chat_completion(
         user_req = UserRequest(
             req.messages,
             req_id,
+            tools=req.tools,
+            tool_choice=req.tool_choice,
+            parallel_tool_calls=req.parallel_tool_calls,
             logprobs=req.logprobs,
             top_logprobs=req.top_logprobs,
             max_new_tokens=max_new_tokens,
@@ -187,9 +194,6 @@ async def create_chat_completion(
             top_k=req.top_k,
             frequency_penalty=req.frequency_penalty,
             chat_template_kwargs=chat_template_kwargs,
-            tools=req.tools,
-            tool_choice=req.tool_choice,
-            parallel_tool_calls=req.parallel_tool_calls,
             enable_reasoning=enable_thinking,
         )
         response = AsyncResponse(user_req)
@@ -287,6 +291,11 @@ async def tokenize(raw_request: Request):
         # Keep consistency with FastAPI default behavior for body validation errors
         raise HTTPException(status_code=422, detail=e.errors())
 
+    if Backend.tokenizer is None:
+        raise HTTPException(
+            status_code=503, detail="Tokenizer not available on this endpoint"
+        )
+
     tokens = Backend.tokenizer.model.encode(request.prompt, add_special_tokens=False)
 
     return {"tokens": tokens}
@@ -306,6 +315,11 @@ async def detokenize(raw_request: Request):
     except ValidationError as e:
         # Keep consistency with FastAPI default behavior for body validation errors
         raise HTTPException(status_code=422, detail=e.errors())
+
+    if Backend.tokenizer is None:
+        raise HTTPException(
+            status_code=503, detail="Tokenizer not available on this endpoint"
+        )
 
     prompt = Backend.tokenizer.model.decode(request.tokens, skip_special_tokens=True)
 
@@ -355,15 +369,13 @@ async def process_dp_chat_completion(request: ChatRequest):
             f"[DP_HTTP] Request parameters parsed: max_tokens={max_new_tokens}, temp={temperature}, stream={stream}"
         )
 
-        # Dynamic import to avoid circular dependencies
-        from chitu.dp_token_router import get_token_router
-        from chitu.dp_request_router import get_request_router
-        from chitu.task import RouterRequest
-
         # Create lightweight router request (no tokenization)
         router_request = RouterRequest(
             message=message,
             request_id=req_id,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            parallel_tool_calls=request.parallel_tool_calls,
             logprobs=logprobs,
             top_logprobs=top_logprobs,
             max_new_tokens=max_new_tokens,
@@ -425,9 +437,6 @@ async def process_dp_chat_completion(request: ChatRequest):
             return JSONResponse(full_response.model_dump())
 
     except Exception as e:
-        # print traceback
-        import traceback
-
         logger.error(
             f"[DP_HTTP] DP request processing failed for {request.conversation_id}: {e}"
         )
@@ -465,8 +474,6 @@ async def get_dp_config():
                     "scheduler_addresses": ["tcp://localhost:29610"],
                 },
             }
-
-        from chitu.dp_request_router import get_request_router
 
         request_router = get_request_router()
         config = {
@@ -521,9 +528,6 @@ async def get_dp_debug_info():
         if dp_enabled and dp_service_started:
             try:
                 # Try to get Router component status
-                from chitu.dp_token_router import get_token_router
-                from chitu.dp_request_router import get_request_router
-
                 token_router = get_token_router()
                 request_router = get_request_router()
 
@@ -560,7 +564,7 @@ async def get_dp_debug_info():
         return debug_info
 
     except Exception as e:
-        return {"error": str(e), "traceback": __import__("traceback").format_exc()}
+        return {"error": str(e), "traceback": traceback.format_exc()}
 
 
 @app.get("/dp/test")
@@ -581,9 +585,6 @@ async def test_dp_system():
 
             # Try to get Router component status
             try:
-                from chitu.dp_token_router import get_token_router
-                from chitu.dp_request_router import get_request_router
-
                 token_router = get_token_router()
                 request_router = get_request_router()
 
@@ -678,8 +679,8 @@ async def start_uvicorn_async(args):
     except Exception as e:
         logger.warning(f"[HTTP] Failed to raise RLIMIT_NOFILE: {e}")
 
-    backlog = int(os.getenv("UVICORN_BACKLOG", "4096"))
-    limit_conc = int(os.getenv("UVICORN_LIMIT_CONCURRENCY", "4096"))
+    backlog = int(os.getenv("UVICORN_BACKLOG", "10240"))
+    limit_conc = int(os.getenv("UVICORN_LIMIT_CONCURRENCY", "10240"))
     keepalive = float(os.getenv("UVICORN_TIMEOUT_KEEP_ALIVE", "2"))
 
     config = uvicorn.Config(
@@ -709,8 +710,6 @@ async def start_router_components_and_serve():
     logger.info("[ROUTER] Starting DP components...")
     try:
         # Start DP components
-        from chitu.serve.router import start_dp_components
-
         await start_dp_components()
         logger.info("[ROUTER] DP components startup completed")
 
@@ -744,8 +743,8 @@ async def start_router_components_and_serve():
             logger.warning(f"[ROUTER] Failed to raise RLIMIT_NOFILE: {e}")
 
         # Configure uvicorn with sane defaults for high-concurrency
-        backlog = int(os.getenv("UVICORN_BACKLOG", "4096"))
-        limit_conc = int(os.getenv("UVICORN_LIMIT_CONCURRENCY", "4096"))
+        backlog = int(os.getenv("UVICORN_BACKLOG", "10240"))
+        limit_conc = int(os.getenv("UVICORN_LIMIT_CONCURRENCY", "10240"))
         keepalive = float(os.getenv("UVICORN_TIMEOUT_KEEP_ALIVE", "2"))
 
         config = uvicorn.Config(
@@ -764,8 +763,6 @@ async def start_router_components_and_serve():
 
     except Exception as e:
         logger.error(f"[ROUTER] DP components and HTTP service startup failed: {e}")
-        import traceback
-
         logger.error(f"[ROUTER] Detailed error: {traceback.format_exc()}")
         raise
 
@@ -781,10 +778,19 @@ def init_dp_router(args):
     init_logger()
     set_global_args(args)
 
-    # Router only needs basic args, no Backend initialization required
-    # Tokenization will be performed in Enhanced Scheduler
-    Backend.args = args  # Set basic args for configuration access
-    logger.info("[ROUTER] Router uses lightweight request handling")
+    Backend.args = args
+
+    tokenizer_path = getattr(args.models, "tokenizer_path", None) or getattr(
+        args.models, "ckpt_dir", None
+    )
+    if tokenizer_path:
+        args.models.tokenizer_path = tokenizer_path
+        Backend.tokenizer = Backend._init_tokenizer(args)
+        logger.info("[ROUTER] Tokenizer initialized successfully")
+    else:
+        logger.info(
+            "[ROUTER] No tokenizer path available, /tokenize endpoint will be unavailable"
+        )
 
     # Check if PD disaggregation is enabled
     pd_enabled = (

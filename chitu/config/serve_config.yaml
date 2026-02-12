@@ -323,6 +323,7 @@ dp_config:
     # PD disaggregation configuration
     pd_disaggregation:
       enabled: False            # whether to enable PD disaggregation
+      log_verbose: False        # enable high-frequency PD logs
     # Prefill Scheduler list
     prefill_schedulers:
       - host: 0.0.0.0
