@@ -610,25 +610,46 @@ class Backend:
         tensor_parallel_size = args.infer.tp_size
 
         kv_cache_kvargs = {}
+        quant_cfg = getattr(args.models, "quant_config", None)
 
         if args.models.type == "deepseek-v3":
+            ds_fp8_quant = (
+                hasattr(quant_cfg, "kv_cache")
+                and getattr(quant_cfg.kv_cache, "type", None) == "fp8_pertoken_dsa"
+            )
             if args.infer.mla_absorb in ["absorb", "absorb-without-precomp"]:
+                # NpuAttnBackend 仅在 paged cache 下使用分离 KV cache，
+                # 因为 mla_decode_paged_kv 依赖分离的 kv_lora/k_pe
                 use_separated_kv_lora_k_pe = attn_backend_type in [
                     FlashInferBackend,
                     TritonAttnBackend,
-                ]
+                ] or (
+                    attn_backend_type is NpuAttnBackend
+                    and args.infer.cache_type == "paged"
+                )
                 if use_separated_kv_lora_k_pe:
                     kv_cache_kvargs["shape_per_token_dict"] = {
                         "kv_lora": (args.models.kv_lora_rank,),
                         "k_pe": (args.models.qk_rope_head_dim,),
                     }
                 else:
-                    kv_cache_kvargs["shape_per_token_dict"] = {
-                        "kv_lora_k_pe": (
-                            args.models.kv_lora_rank + args.models.qk_rope_head_dim,
-                        )
-                    }
+                    if ds_fp8_quant:
+                        kv_cache_kvargs["shape_per_token_dict"] = {
+                            "kv_lora_k_pe": (
+                                # args.models.kv_lora_rank + args.models.kv_lora_rank // 128 * 4 + args.models.qk_rope_head_dim * 2,
+                                656,
+                            )
+                        }
+                    else:
+                        kv_cache_kvargs["shape_per_token_dict"] = {
+                            "kv_lora_k_pe": (
+                                args.models.kv_lora_rank + args.models.qk_rope_head_dim,
+                            )
+                        }
             elif args.infer.mla_absorb == "none":
+                assert (
+                    not ds_fp8_quant
+                ), "mla_absorb=none does not support fp8_pertoken_dsa kv quant"
                 n_local_heads = args.models.n_heads // tensor_parallel_size
                 k_head_dim = args.models.qk_nope_head_dim + args.models.qk_rope_head_dim
                 v_head_dim = args.models.v_head_dim
@@ -666,7 +687,6 @@ class Backend:
             else ["k", "v"]
         )
 
-        quant_cfg = getattr(args.models, "quant_config", None)
         kv_cache_cfg = (
             getattr(quant_cfg, "kv_cache", None) if quant_cfg is not None else None
         )
@@ -682,6 +702,7 @@ class Backend:
         # map kv_cache quant type to torch dtype
         quant_type_to_dtype = {
             "fp8_pertensor": torch.float8_e4m3fn,
+            "fp8_pertoken_dsa": torch.float8_e4m3fn,  # special for DSV32
         }
 
         dtype_dict = {}

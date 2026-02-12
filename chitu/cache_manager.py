@@ -16,7 +16,7 @@ from chitu.global_vars import get_slot_handle, get_timers, get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
 from chitu.utils import ceil_div
-from chitu.ops import fp8_pertensor_kvcache_quant
+from chitu.ops import fp8_pertensor_kvcache_quant, fp8_pertoken_kvcache_quant_dsa
 
 logger = getLogger(__name__)
 
@@ -168,6 +168,7 @@ class KVCacheQuantType(Enum):
     # Add KV Cache quant here
     NONE = "None"
     FP8_PERTENSOR = "fp8_pertensor"
+    FP8_PERTOKEN_DSA = "fp8_pertoken_dsa"
 
     @property
     def needs_kv_scales(self) -> bool:
@@ -282,16 +283,25 @@ class KVCacheManagerBase:
                 cache_delta_seq_ids_tensor_device=True,
             )
 
-    def kvcache_quant(
+    @property
+    def is_quant_kv(self):
+        return self.quant_type is not KVCacheQuantType.NONE
+
+    def kvcache_quant(  # should support various kv quantization patterns
         self,
-        q: torch.Tensor = None,
-        k: torch.Tensor = None,
-        v: torch.Tensor = None,
-        q_scale: torch.Tensor = None,
-        k_scale: torch.Tensor = None,
-        v_scale: torch.Tensor = None,
-        n_local_kv_heads: int = None,
+        q: Optional[torch.Tensor] = None,
+        k: Optional[torch.Tensor] = None,
+        v: Optional[torch.Tensor] = None,
+        q_scale: Optional[torch.Tensor] = None,
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
+        n_local_kv_heads: Optional[int] = None,
+        kv_lora_rank: Optional[int] = None,
     ):
+        # NOTE: Currently KVCacheQuantType.NONE (no quantization) is not handled here,
+        # because this function is not versatile enough to handle different attention
+        # patterns.
+        assert self.quant_type is not KVCacheQuantType.NONE
         if self.quant_type is KVCacheQuantType.FP8_PERTENSOR:
             assert q_scale is None and n_local_kv_heads is not None
             return fp8_pertensor_kvcache_quant(
@@ -303,8 +313,13 @@ class KVCacheManagerBase:
                 self.seq_len_delta.batch_size,
                 n_local_kv_heads,
             )
-        elif self.quant_type is KVCacheQuantType.NONE:
-            return q, k, v, {}
+        elif self.quant_type is KVCacheQuantType.FP8_PERTOKEN_DSA:
+            assert k is not None and kv_lora_rank is not None
+            return fp8_pertoken_kvcache_quant_dsa(k, kv_lora_rank)
+        else:
+            raise NotImplementedError(
+                f"Unsupported kv_cache quant type: {self.quant_type}"
+            )
 
     def prepare_cache_prefill(self, req_ids: list[str], delta_seq_len: list[int]):
         self.curr_req_ids = req_ids
@@ -387,7 +402,7 @@ class KVCacheManagerBase:
         """Renturn number of blocks that has reserved for reqs to use."""
         raise NotImplementedError()
 
-    def get_accessor(self, layer_id: int) -> KVCacheAccessor:
+    def get_accessor(self, layer_id: int, is_mtp: bool = False) -> KVCacheAccessor:
         raise NotImplementedError()
 
     def finalize_cache_single_decode(self, req_ids: list[str]):

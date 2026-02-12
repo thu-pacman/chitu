@@ -17,6 +17,7 @@ if has_triton and has_accelerator():
         append_to_paged_kv_cache_triton,
         append_to_dense_kv_cache_triton,
         fp8_e4m3fn_quant_per_tensor_triton,
+        quant_pertoken_kvcache_dsa,  # only for DSV32 fp8 cache
     )
 
 
@@ -339,19 +340,6 @@ def read_from_dense_kv_cache(
         raise NotImplementedError(f"Unsupported implementation: {impl}")
 
 
-def fp8_pertensor_kvcache_quant(xq, xk, xv, k_scale, v_scale, batch_size, head_num):
-    q_scale = (xq.abs().amax() / 448).to(torch.float32)
-    xq = fp8_e4m3fn_quant_per_tensor_triton(xq, q_scale)
-    xk = fp8_e4m3fn_quant_per_tensor_triton(xk, k_scale)
-    xv = fp8_e4m3fn_quant_per_tensor_triton(xv, v_scale)
-    descales = {
-        "q_descale": q_scale.view(1, 1).expand(batch_size, head_num),
-        "k_descale": k_scale.view(1, 1).expand(batch_size, head_num),
-        "v_descale": v_scale.view(1, 1).expand(batch_size, head_num),
-    }
-    return xq, xk, xv, descales
-
-
 def read_from_paged_kv_cache_torch(
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -374,3 +362,20 @@ def read_from_dense_kv_cache_torch(
     kv_cache: torch.Tensor, position_ids: torch.Tensor, seq_ids: torch.Tensor
 ) -> torch.Tensor:
     return kv_cache[seq_ids, position_ids]
+
+
+def fp8_pertensor_kvcache_quant(xq, xk, xv, k_scale, v_scale, batch_size, head_num):
+    q_scale = (xq.abs().amax() / 448).to(torch.float32)
+    xq = fp8_e4m3fn_quant_per_tensor_triton(xq, q_scale)
+    xk = fp8_e4m3fn_quant_per_tensor_triton(xk, k_scale)
+    xv = fp8_e4m3fn_quant_per_tensor_triton(xv, v_scale)
+    descales = {
+        "q_descale": q_scale.view(1, 1).expand(batch_size, head_num),
+        "k_descale": k_scale.view(1, 1).expand(batch_size, head_num),
+        "v_descale": v_scale.view(1, 1).expand(batch_size, head_num),
+    }
+    return xq, xk, xv, descales
+
+
+def fp8_pertoken_kvcache_quant_dsa(kv_lora_k_pe, kv_lora_rank):
+    return quant_pertoken_kvcache_dsa(kv_lora_k_pe, kv_lora_rank)

@@ -36,6 +36,8 @@
   用法: 启动赤兔时追加 `models=DeepSeek-V3.1-Terminus-int8-ascend` 启动参数
 - DeepSeek-V3.2-Exp
   用法: 启动赤兔时追加 `models=DeepSeek-V3.2-Exp` 启动参数
+- DeepSeek-V3.2-Exp-kv-fp8
+  用法: 启动赤兔时追加 `models=DeepSeek-V3.2-Exp-kv-fp8` 启动参数
 - GLM-4-32B-0414
   用法: 启动赤兔时追加 `models=GLM-4-32B-0414` 启动参数
 - GLM-4-9B-0414
@@ -150,6 +152,10 @@
   用法: 启动赤兔时追加 `models=Qwen3-14B-w4-g128-symm-a8` 启动参数
 - Qwen3-235B-A22B
   用法: 启动赤兔时追加 `models=Qwen3-235B-A22B` 启动参数
+- Qwen3-235B-A22B-Instruct
+  用法: 启动赤兔时追加 `models=Qwen3-235B-A22B-Instruct` 启动参数
+- Qwen3-235B-A22B-Instruct-ascend-int8
+  用法: 启动赤兔时追加 `models=Qwen3-235B-A22B-Instruct-ascend-int8` 启动参数
 - Qwen3-235B-A22B-ascend-int8
   用法: 启动赤兔时追加 `models=Qwen3-235B-A22B-ascend-int8` 启动参数
 - Qwen3-235B-A22B-fp4

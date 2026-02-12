@@ -419,6 +419,7 @@ class MetadataSerializer:
                     and task.consumed_req_tokens == 0
                 ):
                     task_data["tokens"] = list(task.prefix_tokens)
+                    task_data["grammar_str"] = task.grammar_str
                 # 已知任务不传 tokens
 
             if config.include_params:
@@ -623,7 +624,8 @@ class MetadataSerializer:
             frequency_penalty=params_dict.get("frequency_penalty", 0.0),
         )
         tokens = task_data.get("tokens", [])
-        task = Task(task_id=task_id, req=None, params=params, prefix_tokens=tokens)  # type: ignore[arg-type]
+        grammar_str = task_data.get("grammar_str", "")
+        task = Task(task_id=task_id, req=None, params=params, prefix_tokens=tokens, grammar_str=grammar_str)  # type: ignore[arg-type]
         task.return_logprobs = task_data.get("return_logprobs", False)
         task._test_flag = task_data.get("_test_flag", False)
         task.sched_group_id = task_data.get("sched_group_id")

@@ -347,9 +347,10 @@ class BatchedSeqLenDelta:
             cache_seq_ids_tensor_device=cache_delta_seq_ids_tensor_device,
         )
 
-        self.is_classic_decoding = all(x > 0 for x in self.old.lens_list) and all(
-            (x + 1 == y for x, y in zip(self.old.lens_list, self.new.lens_list))
+        self.is_classic_decoding = all(
+            x > 0 and x + 1 == y for x, y in zip(self.old.lens_list, self.new.lens_list)
         )
+        self.is_first_prefill_chunk = self.old.total_len == 0
 
         self.cache_delta_position_ids_tensor_device = (
             cache_delta_position_ids_tensor_device

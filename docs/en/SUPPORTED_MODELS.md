@@ -36,6 +36,8 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=DeepSeek-V3.1-Terminus-int8-ascend` command line argument when starting Chitu
 - DeepSeek-V3.2-Exp
   Usage: Append `models=DeepSeek-V3.2-Exp` command line argument when starting Chitu
+- DeepSeek-V3.2-Exp-kv-fp8
+  Usage: Append `models=DeepSeek-V3.2-Exp-kv-fp8` command line argument when starting Chitu
 - GLM-4-32B-0414
   Usage: Append `models=GLM-4-32B-0414` command line argument when starting Chitu
 - GLM-4-9B-0414
@@ -150,6 +152,10 @@ This page is auto-generated. Data source: `chitu/config/models/*.yaml`. To updat
   Usage: Append `models=Qwen3-14B-w4-g128-symm-a8` command line argument when starting Chitu
 - Qwen3-235B-A22B
   Usage: Append `models=Qwen3-235B-A22B` command line argument when starting Chitu
+- Qwen3-235B-A22B-Instruct
+  Usage: Append `models=Qwen3-235B-A22B-Instruct` command line argument when starting Chitu
+- Qwen3-235B-A22B-Instruct-ascend-int8
+  Usage: Append `models=Qwen3-235B-A22B-Instruct-ascend-int8` command line argument when starting Chitu
 - Qwen3-235B-A22B-ascend-int8
   Usage: Append `models=Qwen3-235B-A22B-ascend-int8` command line argument when starting Chitu
 - Qwen3-235B-A22B-fp4

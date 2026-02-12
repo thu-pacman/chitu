@@ -59,10 +59,10 @@ def test_mla_prefill_ragged_qkvo(
     if impl == "flash_mla":
         if not has_accelerator() or not has_flash_mla:
             pytest.skip("flash_mla is missing")
-        if local_n_heads % 64 != 0:
-            pytest.skip("flash_mla only supports h_q % 64 (sm90) | 128 (sm100) == 0")
-        if topk is None:
+        if topk is None:  # skip since default triton fall-back
             pytest.skip("flash_mla prefill only supports sparse attention for now")
+        if not hasattr(flash_mla, "flash_mla_sparse_fwd"):
+            pytest.skip("flash_mla is too old too have `flash_mla_sparse_fwd`")
 
         _, total_memory = torch.cuda.mem_get_info()
         total_memory = total_memory / (1024**3)
@@ -96,6 +96,7 @@ def test_mla_prefill_ragged_qkvo(
                     "qk_nope_head_dim": qk_nope_head_dim,
                     "dim": 7168,
                     "type": None,
+                    "index_topk": topk,
                 },
             }
         ),
@@ -141,7 +142,8 @@ def test_mla_prefill_ragged_qkvo(
         attn_backend.prepare_metadata_for_prefill(seq_len_delta)
     elif impl == "flash_mla":
         attn_backend = FlashMLABackend(
-            qk_nope_head_dim=qk_nope_head_dim, index_topk=topk
+            qk_nope_head_dim=qk_nope_head_dim,
+            index_topk=topk,
         )
     else:
         raise NotImplementedError()
@@ -484,7 +486,7 @@ def test_mla_decode_dense_kv(
         (20, 512, 64, 192),  # GLM-4.7-Flash TP1
     ],
 )
-@pytest.mark.parametrize("page_size", [64, 256])
+@pytest.mark.parametrize("page_size", [16, 64, 256])
 @pytest.mark.parametrize("topk", [None, 128])
 @pytest.mark.parametrize("use_separated_kv_lora_k_pe", [False, True])
 @pytest.mark.parametrize("impl", ["triton", "flashinfer", "npu", "flash_mla"])
@@ -518,6 +520,13 @@ def test_mla_decode_paged_kv(
             pytest.skip("torch_npu is missing")
         if topk is not None:
             pytest.skip("torch_npu does not support topk")
+        if not use_separated_kv_lora_k_pe:
+            pytest.skip("NpuAttnBackend only supports separated kv_lora/k_pe storage")
+        # NPU MLA 算子 block_size 仅支持 {16, 128}（ND layout）
+        if page_size not in (16, 128):
+            pytest.skip(
+                f"NPU MLA only supports block_size in {{16, 128}}, got {page_size}"
+            )
         if local_n_heads == 20:
             # FIXME: We don't know whether there are other numbers of heads this function
             # fails to support, because the internal torch_npu._npu_paged_attention_mla
@@ -543,6 +552,9 @@ def test_mla_decode_paged_kv(
         torch.set_default_dtype(torch.bfloat16)
     else:
         torch.set_default_dtype(torch.float16)
+    # NPU MLA 算子要求 num_key_value_heads=1，需要设置 type="deepseek-v3"
+    # 确保 NpuAttnBackend.__init__ 中 local_n_kv_heads 为 1
+    model_type = "deepseek-v3" if impl == "npu" else None
     set_global_args(
         OmegaConf.create(
             {
@@ -562,7 +574,8 @@ def test_mla_decode_paged_kv(
                     "qk_rope_head_dim": qk_rope_head_dim,
                     "qk_nope_head_dim": qk_nope_head_dim,
                     "dim": 7168,
-                    "type": None,
+                    "type": model_type,
+                    "index_topk": topk,
                 },
             }
         ),

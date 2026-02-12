@@ -12,6 +12,7 @@ import os
 import time
 from logging import getLogger
 from typing import Any, Optional, Mapping, Annotated
+from contextlib import suppress
 
 import uvicorn
 import resource
@@ -67,6 +68,8 @@ class ChatRequest(BaseModel):
     min_batch_size: int = 1
     stop_with_eos: bool = True
     chat_template_kwargs: Mapping[str, Any] = {}
+    enable_thinking: bool = True
+    extra_body: Mapping[str, Any] = {}
 
 
 class TokenizeRequest(BaseModel):
@@ -82,6 +85,8 @@ def get_priority_from_api_key(api_key: str) -> int:
     for item in args.serve.api_keys:
         if item.key == api_key:
             return item.priority
+    if args.serve.validate_api_key == True:
+        raise HTTPException(status_code=503, detail="Unauthorized api key")
     return 1
 
 
@@ -124,6 +129,16 @@ async def create_chat_completion(
 
     args = get_global_args()
 
+    api_key = ""
+    if authorization is not None:
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(
+                status_code=400,
+                detail="Authorization header must start with 'Bearer'",
+            )
+        api_key = authorization[len("Bearer ") :]
+    task_priority = get_priority_from_api_key(api_key)
+
     # Parse JSON body tolerant to missing/incorrect content-type
     try:
         data = await raw_request.json()
@@ -133,109 +148,80 @@ async def create_chat_completion(
         )
 
     try:
-        request: ChatRequest = ChatRequest.model_validate(data)
+        req: ChatRequest = ChatRequest.model_validate(data)
     except ValidationError as e:
         # Keep consistency with FastAPI default behavior for body validation errors
         raise HTTPException(status_code=422, detail=e.errors())
 
     # Check if DP mode is enabled and use appropriate processing
     if get_global_args().dp_config.enabled:
-        logger.debug(f"[HTTP] Using DP mode for request: {request.conversation_id}")
-        return await process_dp_chat_completion(request)
+        logger.debug(f"[HTTP] Using DP mode for request: {req.conversation_id}")
+        return await process_dp_chat_completion(req)
 
-    api_key = ""
-    if authorization is not None:
-        if not authorization.startswith("Bearer "):
-            raise HTTPException(
-                status_code=400,
-                detail="Authorization header must start with 'Bearer'",
-            )
-        api_key = authorization[len("Bearer ") :]
-
-    params = request.dict()
     req_id = gen_req_id()
-    stream = params.pop("stream", False)
-    message = params.pop("messages")
-    logprobs = params.pop("logprobs")
-    top_logprobs = params.pop("top_logprobs")
-    max_new_tokens = params.pop("max_tokens")
-    if not max_new_tokens:
-        max_new_tokens = args.request.max_new_tokens
-    temp = params.pop("temperature")
-    top_p = params.pop("top_p")
-    top_k = params.pop("top_k")
-    freq_pen = params.pop("frequency_penalty")
-    stop_with_eos = params.pop("stop_with_eos")
-    chat_template_kwargs_unsafe = params.pop("chat_template_kwargs")
-    set_min_batch_size(params.pop("min_batch_size", 1))
+    max_new_tokens = req.max_tokens or args.request.max_new_tokens
+    set_min_batch_size(req.min_batch_size)
+
+    enable_thinking = req.extra_body.get(
+        "enable_thinking",
+        req.chat_template_kwargs.get("enable_thinking", req.enable_thinking),
+    )
 
     # Reconstruct chat_template_kwargs to prevent injection attacks
     chat_template_kwargs = {}
-    if "enable_thinking" in chat_template_kwargs_unsafe:
-        if not isinstance(chat_template_kwargs_unsafe["enable_thinking"], bool):
-            raise HTTPException(
-                status_code=400,
-                detail="enable_thinking must be a boolean value",
-            )
-        if "DeepSeek-V3.1" in get_global_args().models.name:
-            # DeepSeek-V3.1 tokenizer uses `thinking` instead of `enable_thinking`
-            chat_template_kwargs["thinking"] = chat_template_kwargs_unsafe[
-                "enable_thinking"
-            ]
-        else:
-            chat_template_kwargs["enable_thinking"] = chat_template_kwargs_unsafe[
-                "enable_thinking"
-            ]
+    if "DeepSeek-V3.1" in get_global_args().models.name:
+        # DeepSeek-V3.1 tokenizer uses `thinking` instead of `enable_thinking`
+        chat_template_kwargs["thinking"] = enable_thinking
+    else:
+        chat_template_kwargs["enable_thinking"] = enable_thinking
 
     try:
-        req = UserRequest(
-            message,
+        user_req = UserRequest(
+            req.messages,
             req_id,
-            logprobs=logprobs,
-            top_logprobs=top_logprobs,
+            logprobs=req.logprobs,
+            top_logprobs=req.top_logprobs,
             max_new_tokens=max_new_tokens,
-            temperature=temp,
-            top_p=top_p,
-            top_k=top_k,
-            frequency_penalty=freq_pen,
+            temperature=req.temperature,
+            top_p=req.top_p,
+            top_k=req.top_k,
+            frequency_penalty=req.frequency_penalty,
             chat_template_kwargs=chat_template_kwargs,
-            tools=request.tools,
-            tool_choice=request.tool_choice,
-            parallel_tool_calls=request.parallel_tool_calls,
-            # enable_reasoning=False, # FIXME: DS-V31T tool call must use without thinking
+            tools=req.tools,
+            tool_choice=req.tool_choice,
+            parallel_tool_calls=req.parallel_tool_calls,
+            enable_reasoning=enable_thinking,
         )
-        response = AsyncResponse(req)
+        response = AsyncResponse(user_req)
         task = Task(
-            req.request_id,
-            req,
-            stop_with_eos=stop_with_eos,
-            priority=get_priority_from_api_key(api_key),
+            user_req.request_id,
+            user_req,
+            stop_with_eos=req.stop_with_eos,
+            priority=task_priority,
         )
         TaskPool.enqueue(task)
-        if stream:
+        if req.stream:
             return StreamingResponse(
                 response.stream_generator(), media_type="text/event-stream"
             )
         else:
-            try:
-                full_response = await response.full_generator()
-                response_dict = full_response.model_dump()
-                response_dict.update(
-                    {
-                        "model": args.models.name,
-                    }
-                )
-                return JSONResponse(response_dict)
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=str(e))
-    except ValueError as e:
-        if "req" in locals():
-            del req
-        if "response" in locals():
+            full_response = await response.full_generator()
+            response_dict = full_response.model_dump()
+            response_dict.update(
+                {
+                    "model": args.models.name,
+                }
+            )
+            return JSONResponse(response_dict)
+    except HTTPException:
+        raise
+    except:
+        logger.exception("request handle exception")
+        with suppress(Exception):
+            del user_req
+        with suppress(Exception):
             del response
-        raise HTTPException(
-            status_code=400, detail="prompt length is greater than max_seqs_len"
-        )
+        raise HTTPException(status_code=500, detail="internal server error")
 
 
 @app.post("/init")

@@ -18,7 +18,11 @@ from torch import nn
 from chitu.device_type import is_muxi
 from chitu.attn_backend import AttnBackend, NpuAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.cache_manager import PagedKVCacheManager, DenseKVCacheManager
+from chitu.cache_manager import (
+    KVCacheManagerBase,
+    PagedKVCacheManager,
+    DenseKVCacheManager,
+)
 from chitu.cuda_graph import (
     make_dispatched_graphed_callables,
     cuda_graph_safe_cached_property,
@@ -159,7 +163,7 @@ class RMSNormBias(RMSNorm):
 
 
 class Attention(nn.Module):
-    def __init__(self, layer_id, cache, attn_backend):
+    def __init__(self, layer_id, cache: KVCacheManagerBase, attn_backend):
         super().__init__()
         self.layer_id = layer_id
         self.cache = cache
@@ -1558,7 +1562,7 @@ class ParallelMoeBlock(nn.Module):
                 and self.prefill_memory_tolerance < self.moe_impl.ep_size
                 and get_global_args().infer.prefill_chunk_size is not None
             ):
-                logger.warning(
+                logger.warning_once(
                     "`prefill_memory_tolerance` is not implemented when `exit_moe_prefer_before_local_sum` is True, ignoring."
                 )
 

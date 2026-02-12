@@ -38,14 +38,15 @@ class ServeConfigLegacy:
 @dataclass
 class ApiKey:
     key: str = MISSING
-    priority: int = MISSING
+    priority: int = 1
 
 
 @dataclass
 class ServeAddrConfig:
     host: str = MISSING
     port: int = MISSING
-    api_keys: list[ApiKey] = MISSING
+    api_keys: list[ApiKey] = field(default_factory=list)
+    validate_api_key: bool = MISSING
     # Optional: map external model names (e.g. Anthropic) to the currently loaded internal model name.
     # Example:
     #   model_aliases:

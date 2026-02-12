@@ -240,14 +240,18 @@ class AttentionHFLlama(Attention):
         xq, xk = apply_rotary_pos_emb(xq, xk, freqs_cis, rotary_type=self.rotary_type)
 
         # optional kvcache quant
-        xq, xk, xv, descales = self.cache.kvcache_quant(
-            xq,
-            xk,
-            xv,
-            k_scale=self.k_scale if hasattr(self, "k_scale") else None,
-            v_scale=self.v_scale if hasattr(self, "v_scale") else None,
-            n_local_kv_heads=self.n_local_kv_heads,
-        )
+        # NOTE: if self.cache is instance of KVCacheManagerBase, no need to judge
+        if hasattr(self.cache, "is_quant_kv") and self.cache.is_quant_kv:
+            xq, xk, xv, descales = self.cache.kvcache_quant(
+                q=xq,
+                k=xk,
+                v=xv,
+                k_scale=self.k_scale if hasattr(self, "k_scale") else None,
+                v_scale=self.v_scale if hasattr(self, "v_scale") else None,
+                n_local_kv_heads=self.n_local_kv_heads,
+            )
+        else:
+            descales = {}
 
         output = self.attn_backend(
             xq,

@@ -9,9 +9,9 @@ import triton.language as tl
 
 # quantization kernel for bf16 mla kvcache format to fp8 format
 @triton.jit
-def _quantize_k_cache_kernel(
-    k_ptr,  # (N, D), D=d_v+d_pe=512+64=576
-    k_quant_ptr,  # (N, 656), 656=512 (fp8) + 16 (4*f32 scales) + 128 (6*bf16 pe)
+def _quant_pertoken_kvcache_dsa_kernel(
+    k_ptr,  # (N, D), D=d_v+d_pe=512+64=576*bf16
+    k_quant_ptr,  # (N, 656), 656=512 (fp8) + 16 (4*fp32 scales) + 128 (6*bf16 pe)
     N,
     D,
     dv,  # N: n_tokens, D,
@@ -26,26 +26,26 @@ def _quantize_k_cache_kernel(
 
     # mask for valid N
     mask_n = offs_n < N
-    # mask_d = offs_d < dv  # maybe unnecessary for dv=512 and tilesize=128
 
     src_ptrs = k_ptr + offs_n[:, None] * D + offs_d[None, :]
     src_tile = tl.load(src_ptrs, mask=mask_n[:, None], other=0.0)
 
     abs_tile = tl.abs(src_tile)
-    max_ = tl.max(abs_tile, axis=-1).to(tl.float32)
+    max_ = tl.max(abs_tile, axis=-1)
+    # scale = tl.div_rn(max_, 448.0)
     scale = max_ / 448.0
-    # avoid division by zero
-    scale = tl.where(scale == 0.0, 1.0, scale)
-    # tl.device_print("debug", scale)
-    # store float32 scales
+
+    # # avoid division by zero
+    scale = tl.where(scale == 0.0, 1e-5, scale)
+    # # store float32 scales
     scales_offs = dv + pid_d * 4
     scales_ptrs = k_quant_ptr + offs_n * 656 + scales_offs
     tl.store(scales_ptrs.to(tl.pointer_type(tl.float32)), scale, mask=mask_n)
 
-    quant_tile = src_tile / scale[:, None]
+    # quant_tile = tl.div_rn(src_tile.to(tl.float32), scale[:, None])
+    quant_tile = src_tile.to(tl.float32) / scale[:, None]
     quant_tile = tl.clamp(quant_tile, -448.0, 448.0)
 
-    # k_fp8_tile = quant_tile.to(tl.float8e4nv)
     k_fp8_tile = quant_tile.to(k_quant_ptr.dtype.element_ty)
 
     # store quantized fp8 nope part
@@ -54,9 +54,9 @@ def _quantize_k_cache_kernel(
     tl.store(tar_ptrs, k_fp8_tile, mask=mask_n[:, None])
 
 
-def quantize_k_cache_triton(
+def quant_pertoken_kvcache_dsa(
     input_k_cache: torch.Tensor,  # [num_blocks, block_size, 1, d] or [num_blocks, block_size, d] or [N, d]
-    dv: int,  # 512
+    dv: int = 512,
     tile_size: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -71,25 +71,22 @@ def quantize_k_cache_triton(
 
     # Flatten to [N, d]
     orig_shape = input_k_cache.shape
-    # if input_k_cache.ndim == 4:
-    #     assert input_k_cache.shape[2] == 1
-    #     input_k_cache = input_k_cache.squeeze(2)  # [B, L, d] -> [N, d]
-    # elif input_k_cache.ndim == 3:
+    input_k_cache = input_k_cache.contiguous()
     if input_k_cache.ndim > 2:
-        input_k_cache = input_k_cache.view(-1, input_k_cache.shape[-1])
+        input_k_cache = input_k_cache.view(-1, input_k_cache.shape[-1])  # [N, d]
     else:
         assert input_k_cache.ndim == 2
 
-    # print(input_k_cache.shape)
     N, d = input_k_cache.shape
-    assert d >= dv
+    assert d == dv + 64
 
     # Allocate outputs
     quant_output = torch.empty(
         N, 656, dtype=torch.float8_e4m3fn, device=input_k_cache.device
     )
-    quant_output[..., dv + 16 :].copy_(
-        input_k_cache[..., dv:].view(torch.float8_e4m3fn), non_blocking=True
+    # directly copy the rope part
+    quant_output[..., dv + 16 :].view(torch.bfloat16).copy_(
+        input_k_cache[..., dv:], non_blocking=True
     )
 
     # Launch kernel
@@ -98,7 +95,7 @@ def quantize_k_cache_triton(
         dv // tile_size,
     )
 
-    _quantize_k_cache_kernel[grid](
+    _quant_pertoken_kvcache_dsa_kernel[grid](
         input_k_cache,
         quant_output,
         N=N,
@@ -107,8 +104,112 @@ def quantize_k_cache_triton(
         tile_size=tile_size,
         BLOCK_N=128,
     )
+    # the last dim: 576 -> 656
+    return quant_output.view(*orig_shape[:-1], -1)
 
-    return quant_output.view(*orig_shape[:-1], 656)
+
+@triton.jit
+def _quant_pertoken_kvcache_dsa_kernel_with_scales(
+    k_ptr,  # (N, D), D=d_v+d_pe=512+64=576 bf16
+    k_quant_ptr,  # (N, 656), 656=512 (fp8) + 16 (4*fp32 scales) + 128 (6*bf16 pe)
+    scales_ptr,  # (N, 4), pre-compute ground-truch scales
+    N,
+    D,
+    dv,  # N: n_tokens, D,
+    tile_size: tl.constexpr = 128,
+    BLOCK_N: tl.constexpr = 128,
+):
+    pid_n = tl.program_id(axis=0)
+    pid_d = tl.program_id(axis=1)  # 0,1,2,3 for d_v/tile_size=512/128=4
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = pid_d * tile_size + tl.arange(0, tile_size)
+
+    # mask for valid N
+    mask_n = offs_n < N
+
+    src_ptrs = k_ptr + offs_n[:, None] * D + offs_d[None, :]
+    src_tile = tl.load(src_ptrs, mask=mask_n[:, None], other=0.0)
+
+    src_scales_ptrs = scales_ptr + offs_n * 4 + pid_d
+    scale = tl.load(src_scales_ptrs, mask=mask_n, other=1.0)
+
+    scales_offs = dv + pid_d * 4
+    tar_scales_ptrs = k_quant_ptr + offs_n * 656 + scales_offs
+    tl.store(tar_scales_ptrs.to(tl.pointer_type(tl.float32)), scale, mask=mask_n)
+
+    quant_tile = tl.div_rn(src_tile.to(tl.float32), scale[:, None])
+    # quant_tile = tl.clamp(quant_tile, -448.0, 448.0)
+
+    k_fp8_tile = quant_tile.to(k_quant_ptr.dtype.element_ty)
+    # k_fp8_tile = quant_tile.to(tl.float8e4nv)
+
+    # store quantized fp8 nope part
+    nope_offsets = offs_n[:, None] * 656 + offs_d[None, :]
+    tar_ptrs = k_quant_ptr + nope_offsets
+    tl.store(tar_ptrs, k_fp8_tile, mask=mask_n[:, None])
+
+
+def quant_with_gt_scales(
+    input_k_cache: torch.Tensor,  # [num_blocks, block_size, 1, d] or [num_blocks, block_size, d] or [N, d]
+    dv: int = 512,
+    tile_size: int = 128,
+):
+    assert tile_size == 128, "Only tile_size=128 is supported"
+    assert dv % tile_size == 0
+    assert input_k_cache.dtype == torch.bfloat16
+
+    # Flatten to [N, d]
+    orig_shape = input_k_cache.shape
+    input_k_cache = input_k_cache.contiguous()
+    if input_k_cache.ndim > 2:
+        input_k_cache = input_k_cache.view(-1, input_k_cache.shape[-1])  # [N, d]
+    else:
+        assert input_k_cache.ndim == 2
+
+    N, d = input_k_cache.shape
+    assert d == dv + 64
+
+    # Allocate outputs
+    quant_output = torch.empty(
+        N, 656, dtype=torch.float8_e4m3fn, device=input_k_cache.device
+    )
+    # directly copy the rope part
+    quant_output[..., dv + 16 :].view(torch.bfloat16).copy_(
+        input_k_cache[..., dv:], non_blocking=True
+    )
+
+    # Launch kernel
+    grid = lambda META: (
+        triton.cdiv(N, META["BLOCK_N"]),
+        dv // tile_size,
+    )
+    tile_cnt = dv // tile_size
+    scales = torch.empty(N, tile_cnt, dtype=torch.float32, device=input_k_cache.device)
+    for tile_idx in range(tile_cnt):
+        tile_scales = (
+            torch.abs(
+                input_k_cache[..., tile_idx * tile_size : (tile_idx + 1) * tile_size]
+            )
+            .max(dim=-1)
+            .values
+            / 448.0
+        )
+        scales[:, tile_idx] = tile_scales
+    # print("input scales", scales)
+
+    _quant_pertoken_kvcache_dsa_kernel_with_scales[grid](
+        input_k_cache,
+        quant_output,
+        scales,
+        N=N,
+        D=d,
+        dv=dv,
+        tile_size=tile_size,
+        BLOCK_N=128,
+    )
+    # the last dim: 576 -> 656
+    return quant_output.view(*orig_shape[:-1], -1)
 
 
 # SPDX-SnippetBegin

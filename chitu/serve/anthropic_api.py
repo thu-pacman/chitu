@@ -629,6 +629,13 @@ async def handle_messages_request(
     """
     Main entry for `/v1/messages` route. Keeps `api_server.py` thin.
     """
+
+    try:
+        api_key = parse_api_key_from_headers(authorization, x_api_key)
+    except HTTPException as e:
+        return anthropic_error(400, "invalid_request_error", str(e.detail))
+    task_priority = priority_for_api_key(api_key)
+
     if not server_status:
         return anthropic_error(503, "service_unavailable", "Service is not started")
 
@@ -661,11 +668,6 @@ async def handle_messages_request(
         response_model = resolve_requested_model_or_error(request.model)
     except ValueError as e:
         return anthropic_error(404, "not_found_error", str(e))
-
-    try:
-        api_key = parse_api_key_from_headers(authorization, x_api_key)
-    except HTTPException as e:
-        return anthropic_error(400, "invalid_request_error", str(e.detail))
 
     args = get_global_args()
 
@@ -791,7 +793,7 @@ async def handle_messages_request(
         user_req.request_id,
         user_req,
         stop_with_eos=True,
-        priority=priority_for_api_key(api_key),
+        priority=task_priority,
     )
     TaskPool.enqueue(task)
 
@@ -858,6 +860,12 @@ async def handle_completion_request(
     """
     Main entry for `/v1/complete` route (legacy completions / code infill).
     """
+    try:
+        api_key = parse_api_key_from_headers(authorization, x_api_key)
+    except HTTPException as e:
+        return anthropic_error(400, "invalid_request_error", str(e.detail))
+    task_priority = priority_for_api_key(api_key)
+
     if not server_status:
         return anthropic_error(503, "service_unavailable", "Service is not started")
 
@@ -884,11 +892,6 @@ async def handle_completion_request(
         response_model = resolve_requested_model_or_error(request.model)
     except ValueError as e:
         return anthropic_error(404, "not_found_error", str(e))
-
-    try:
-        api_key = parse_api_key_from_headers(authorization, x_api_key)
-    except HTTPException as e:
-        return anthropic_error(400, "invalid_request_error", str(e.detail))
 
     args = get_global_args()
     prompt_text = request.prompt or ""
@@ -935,7 +938,7 @@ async def handle_completion_request(
         user_req.request_id,
         user_req,
         stop_with_eos=True,
-        priority=priority_for_api_key(api_key),
+        priority=task_priority,
     )
     TaskPool.enqueue(task)
 

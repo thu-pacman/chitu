@@ -43,6 +43,7 @@ serve:
   api_keys: 
     - key: example_key
       priority: -1 
+  validate_api_key: false
 
 # Configs for how chitu do the LLM inference computation.
 infer:
