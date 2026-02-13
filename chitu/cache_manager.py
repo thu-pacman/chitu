@@ -522,11 +522,22 @@ class PagedKVCacheManager(KVCacheManagerBase):
         num_blocks = int(num_blocks)
         if num_blocks <= 0:
             return reserved
-        for _ in range(min(num_blocks, len(self.free_blocks))):
+
+        # NOTE:
+        # PD disaggregation relies on destination block_table having enough blocks
+        # to cover prefix_length. Partially reserving blocks will trigger
+        # CUDA device-side asserts when indexing page table by position_ids//block_size.
+        if num_blocks > len(self.free_blocks):
+            raise RuntimeError(
+                f"Not enough free KV blocks for transfer: req_id={req_id} "
+                f"need={num_blocks} free={len(self.free_blocks)} "
+                f"total={self.get_num_blocks()} used={self.num_used_blocks}"
+            )
+
+        for _ in range(num_blocks):
             reserved.append(self.get_free_block())
-        # Record the reservation for this request
-        if reserved:
-            self.block_table[req_id] = list(reserved)
+
+        self.block_table[req_id] = list(reserved)
         return reserved
 
     def realloc(self, num_blocks):
@@ -607,16 +618,24 @@ class PagedKVCacheManager(KVCacheManagerBase):
         return self.mtp_seq_len_delta.delta_position_ids_tensor_device % self.block_size
 
     def _upd_gpu_block_table(self, req_ids: list[str]):
+        block_lists = [list(self.block_table[req_id]) for req_id in req_ids]
+        max_len = max(len(blocks) for blocks in block_lists)
         if get_global_args().infer.use_cuda_graph:
-            max_block_num = self.max_blocks_per_req
+            if max_len > self.max_blocks_per_req:
+                logger.warning(
+                    "block_table length exceeds max_blocks_per_req; "
+                    "decode max_seq_len may be too small. "
+                    f"max_len={max_len} max_blocks_per_req={self.max_blocks_per_req} "
+                    f"max_seq_len={get_global_args().infer.max_seq_len} block_size={self.block_size}"
+                )
+            max_block_num = max(self.max_blocks_per_req, max_len)
         else:
-            max_block_num = max(len(self.block_table[req_id]) for req_id in req_ids)
+            max_block_num = max_len
 
         all_block_ids = [
             # pad the block ids to max_block_num
-            self.block_table[req_id]
-            + [0] * (max_block_num - len(self.block_table[req_id]))
-            for req_id in req_ids
+            blocks + [0] * (max_block_num - len(blocks))
+            for blocks in block_lists
         ]
         cpu_block_table_tensor = torch.tensor(all_block_ids, dtype=torch.int32)
         self.gpu_block_table.set_shape(cpu_block_table_tensor.shape)
@@ -852,6 +871,22 @@ class SingletonPagedKVCacheManager(PagedKVCacheManager):
     )
     def offs_in_page_mtp(self):
         return torch.zeros_like(self.mtp_seq_len_delta.delta_lens_tensor_device)
+
+    # NOTE: get_contiguous_buf_infos is inherited from PagedKVCacheManager.
+    # The implementation is generic and works correctly for singleton cache
+    # (block_size=1, num_blocks=num_hot_req).
+
+    def insert_linear_state_from_transfer(self, req_id: str, page_index: int):
+        """
+        Register transferred linear attention state into block table.
+        For linear attention, each request uses exactly one block.
+        """
+        assert (
+            0 <= int(page_index) < self.num_blocks
+        ), f"invalid page index: {page_index}"
+        self.block_table[req_id] = [int(page_index)]
+        # For singleton cache, seq_len is always 1
+        self.req_id_to_seq_len[req_id] = 1
 
 
 class DenseKVCacheManager(KVCacheManagerBase):

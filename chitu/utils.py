@@ -22,7 +22,10 @@ from torch.distributed import get_rank, get_world_size
 
 from chitu.device_type import is_ascend
 from chitu.global_vars import get_global_args
-
+from chitu.distributed.parallel_state import get_pp_group
+from chitu.import_utils import try_import_platform_dep
+import itertools
+from typing import Optional
 
 logger = getLogger(__name__)
 
@@ -83,37 +86,6 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> tuple[Any, bool]:
                 raise ImportError(
                     f"Optional dependency '{opt_dep_name}' is not installed. "
                     f"Please refer to README.md for installation instructions."
-                ) from self.root_cause
-
-        return ReportErrorWhenUsed(e), False
-
-
-def try_import_platform_dep(pkg_name: str) -> tuple[Any, bool]:
-    """
-    Import a dependency that may not be available on all platforms.
-
-    DO NOT use this functions to import optional dependencies that users can pick. Use `try_import_opt_dep` instead.
-
-    Args:
-        pkg_name (str): The name of the Python package to import.
-
-    Returns:
-        [0]: The imported module if successful, or a dummy object that raises an ImportError.
-        [1]: A boolean indicating whether the import was successful.
-    """
-
-    try:
-        return importlib.import_module(pkg_name), True
-    except ImportError as e:
-
-        class ReportErrorWhenUsed:
-            def __init__(self, e):
-                self.root_cause = e
-
-            def __getattr__(self, item):
-                raise ImportError(
-                    f"Chitu does not support this case because '{pkg_name}' is not present on this platform. "
-                    f"This is likely a bug of Chitu."
                 ) from self.root_cause
 
         return ReportErrorWhenUsed(e), False

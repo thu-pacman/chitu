@@ -8,7 +8,6 @@ import asyncio
 import threading
 import os
 from aiohttp import web
-from mooncake.engine import TransferEngine
 from chitu.device_type import is_ascend
 
 logger = logging.getLogger(__name__)
@@ -24,6 +23,14 @@ class MooncakeTransferEngine:
         self.mock_mode = os.environ.get("MOONCAKE_MOCK_MODE", "0") == "1"
         self.protocol = os.environ.get("MOONCAKE_PROTOCOL", "rdma")
 
+        try:
+            from mooncake.engine import TransferEngine
+        except ImportError as e:
+            raise ImportError(
+                "Please install mooncake by following the instructions at "
+                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
+                "to run Chitu with MooncakeTransferEngine."
+            ) from e
         self.engine = TransferEngine()
 
         if is_ascend():
@@ -33,10 +40,7 @@ class MooncakeTransferEngine:
                 # Fallback: first device from ASCEND_RT_VISIBLE_DEVICES
                 visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
                 phy_id_str = visible.split(",")[0].strip() if visible else "-1"
-            try:
-                phy_id = int(phy_id_str)
-            except Exception:
-                phy_id = -1
+            phy_id = int(phy_id_str)
 
             # Choose a deterministic unique port per card
             if phy_id >= 0:
@@ -172,16 +176,30 @@ class MooncakeBootstrapServer:
                 rank_port = int(data.get("rank_port", 0))
                 engine_rank = int(data.get("engine_rank", -1))
                 if role == "Prefill" and engine_rank >= 0 and rank_ip and rank_port > 0:
+                    # Optional metadata for Decode-side optimization decisions.
+                    tp_size = data.get("tp_size", None)
+                    pp_size = data.get("pp_size", None)
+                    tp_size_v = int(tp_size) if tp_size is not None else None
+                    pp_size_v = int(pp_size) if pp_size is not None else None
                     with self._lock:
-                        self.prefill_port_table[engine_rank] = {
+                        info = {
                             "rank_ip": rank_ip,
                             "rank_port": rank_port,
                         }
+                        if tp_size_v is not None:
+                            info["tp_size"] = tp_size_v
+                        if pp_size_v is not None:
+                            info["pp_size"] = pp_size_v
+                        self.prefill_port_table[engine_rank] = info
                     return web.Response(text="OK", status=200)
+                logger.warning(
+                    "bootstrap PUT /route bad request: payload missing role/ip/port/engine_rank"
+                )
                 return web.Response(text="Bad Request", status=400)
             elif method == "GET":
                 engine_rank = request.query.get("engine_rank")
                 if engine_rank is None:
+                    logger.warning("bootstrap GET /route missing engine_rank")
                     return web.Response(
                         text="Missing inputs for bootstrap server.", status=400
                     )
@@ -192,8 +210,10 @@ class MooncakeBootstrapServer:
                     info = self.prefill_port_table.get(er)
                 if info is not None:
                     return web.json_response(info, status=200)
+                # NOTE: 404 for missing rank is expected during discovery; keep silent
                 return web.Response(text="Bootstrap info not Found", status=404)
             else:
+                logger.warning(f"bootstrap /route method not allowed: {method}")
                 return web.Response(text="Method not allowed", status=405)
 
         app.router.add_get("/health", handle_health)
@@ -206,7 +226,7 @@ class MooncakeBootstrapServer:
 
         app = web.Application()
         self._setup_routes(app)
-        self._runner = web.AppRunner(app)
+        self._runner = web.AppRunner(app, access_log=None)
         self._loop.run_until_complete(self._runner.setup())
         site = web.TCPSite(self._runner, port=self.port)
         self._loop.run_until_complete(site.start())

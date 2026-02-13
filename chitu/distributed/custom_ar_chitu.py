@@ -10,12 +10,31 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from logging import getLogger
-from chitu.utils import try_import_platform_dep
 
-ops, has_chitu_backend = try_import_platform_dep("chitu_backend")
+from chitu.import_utils import try_import_platform_dep
 
-if not has_chitu_backend:
-    pass
+
+ops = None
+has_chitu_backend = False
+custom_ar = False
+_backend_checked = False
+
+
+def _init_backend():
+    global ops, has_chitu_backend, custom_ar, _backend_checked
+    if _backend_checked:
+        return
+    _backend_checked = True
+    ops, has_chitu_backend = try_import_platform_dep("chitu_backend")
+    try:
+        if has_chitu_backend:
+            ops.meta_size()
+            custom_ar = True
+        else:
+            custom_ar = False
+    except Exception:
+        custom_ar = False
+
 
 MiB = 1024 * 1024
 CUSTOM_ALL_REDUCE_MAX_SIZES = {
@@ -34,15 +53,6 @@ CUSTOM_ALL_REDUCE_MAX_SIZES = {
 }
 
 logger = getLogger(__name__)
-
-try:
-    if has_chitu_backend:
-        ops.meta_size()
-        custom_ar = True
-    else:
-        custom_ar = False
-except Exception:
-    custom_ar = False
 
 
 def is_weak_contiguous(inp: torch.Tensor):
@@ -74,6 +84,7 @@ class ChituCustomAllreduce:
         max_size=8192 * 1024,
         symm_mem_enabled=False,
     ) -> None:
+        _init_backend()
         self._IS_CAPTURING = False
         self.disabled = False
         self._ptr = 0
@@ -284,7 +295,9 @@ class ChituCustomAllreduce:
 
             if self._ptr:
                 if ops is not None:
-                    ops.dispose(self._ptr)
+                    dispose_fn = getattr(ops, "dispose", None)
+                    if callable(dispose_fn):
+                        dispose_fn(self._ptr)
                 self._ptr = 0
 
             if hasattr(self, "meta_ptrs"):
@@ -352,9 +365,11 @@ class ChituCustomAllreduce:
         if ops is not None:
             try:
                 if pointers[rank] != 0:
-                    ops.free_shared_buffer(pointers[rank])
+                    free_fn = getattr(ops, "free_shared_buffer", None)
+                    if callable(free_fn):
+                        free_fn(pointers[rank])
                     pointers[rank] = 0
-            except Exception as e:
+            except Exception:
                 pass
 
 

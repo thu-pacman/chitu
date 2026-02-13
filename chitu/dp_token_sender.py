@@ -43,6 +43,7 @@ class DPTokenSender:
 
         self.request_token_cache: dict[str, list[int]] = {}
         self._chars_len: dict[str, int] = {}
+        self._first_token_sent: set[str] = set()
 
     async def start(self):
         """Start token sender (initialize synchronous ZMQ socket and sender thread)"""
@@ -120,16 +121,13 @@ class DPTokenSender:
     ):
         """Send a single token to the Router"""
         # Check if this is the first token and get prompt_len
-        is_first_token = request_id not in getattr(self, "_first_token_sent", set())
-        if not hasattr(self, "_first_token_sent"):
-            self._first_token_sent = set()
-
+        is_first_token = request_id not in self._first_token_sent
         if is_first_token:
             self._first_token_sent.add(request_id)
 
-        logger.debug(
-            f"DP Token Sender: [request {request_id}] prepare to send token {token}, is_first_token={is_first_token}"
-        )
+        # logger.debug(
+        #     f"DP Token Sender: [request {request_id}] prepare to send token {token}, is_first_token={is_first_token}"
+        # )
 
         # Decode token to text
         text = ""
@@ -154,9 +152,9 @@ class DPTokenSender:
                 text = s[self._chars_len[request_id] :]
                 self._chars_len[request_id] = len(s)
 
-            logger.debug(
-                f"DP Token Sender: [request {request_id}] decode token {token} -> '{text}'"
-            )
+            # logger.debug(
+            #     f"DP Token Sender: [request {request_id}] decode token {token} -> '{text}'"
+            # )
         else:
             logger.warning(
                 f"DP Token Sender: [request {request_id}] tokenizer not available, cannot decode token {token}"
@@ -167,9 +165,9 @@ class DPTokenSender:
         top_tokens_text = None
         if top_token_idx is not None and Backend.tokenizer is not None:
             top_tokens_text = [Backend.tokenizer.decode([idx]) for idx in top_token_idx]
-            logger.info(
-                f"DP Token Sender: [request {request_id}] decode top_tokens {top_token_idx} -> {top_tokens_text}"
-            )
+            # logger.info(
+            #     f"DP Token Sender: [request {request_id}] decode top_tokens {top_token_idx} -> {top_tokens_text}"
+            # )
 
         data = {
             "type": "token",
@@ -181,12 +179,7 @@ class DPTokenSender:
         }
 
         # If first token and task provided, include prompt_len info
-        if (
-            is_first_token
-            and task is not None
-            and hasattr(task, "req")
-            and hasattr(task.req, "prompt_len")
-        ):
+        if is_first_token and task is not None and task.req is not None:
             data["prompt_len"] = task.req.prompt_len
             logger.info(
                 f"DP Token Sender: [request {request_id}] first token, prompt_len={task.req.prompt_len}, token={token}"
@@ -204,9 +197,7 @@ class DPTokenSender:
         # Clean up caches for this request
         self.request_token_cache.pop(request_id, None)
         self._chars_len.pop(request_id, None)
-        if hasattr(self, "_first_token_sent"):
-            self._first_token_sent.discard(request_id)
-
+        self._first_token_sent.discard(request_id)
         data = {
             "type": "finish",
             "request_id": request_id,
@@ -222,9 +213,7 @@ class DPTokenSender:
         # Clean up caches for this request
         self.request_token_cache.pop(request_id, None)
         self._chars_len.pop(request_id, None)
-        if hasattr(self, "_first_token_sent"):
-            self._first_token_sent.discard(request_id)
-
+        self._first_token_sent.discard(request_id)
         data = {
             "type": "error",
             "request_id": request_id,
@@ -237,11 +226,11 @@ class DPTokenSender:
 
     def _send_data(self, data: dict[str, Any]):
         """Send data to Router (enqueue; background thread will send)"""
-        try:
-            packed_data = msgpack.packb(data)
-            self._send_queue.put(packed_data, block=False)
-        except queue.Full:
+        packed_data = msgpack.packb(data)
+        if self._send_queue.full():
             logger.warning("DP Token Sender: send queue is full, dropping token")
+            return
+        self._send_queue.put(packed_data)
 
     def close(self):
         """Close connection"""
@@ -276,7 +265,7 @@ class DPTaskWrapper:
         original_task.update_decode_status = self._dp_update_decode_status
 
     def _dp_update_response_sync(self, token: int):
-        """Override update_response_sync to also send token to Router (sync enqueue, keep order)"""
+        """Override update_response_no_sync to also send token to Router"""
         self._original_update_response_sync(token)
         # Enqueue in order to keep relative order with finish
         self._send_token_to_router(token)
@@ -291,6 +280,10 @@ class DPTaskWrapper:
             finish_reason = self.original_task.req.finish_reason or "stop"
             self.token_sender.send_finish(request_id, finish_reason)
             self._finish_sent = True
+            self.original_task.pd_exec_end_logged = True
+            logger.info(
+                f"[PD_STAGE][decode.exec.end] req_id={request_id} finish_reason={finish_reason}"
+            )
             logger.debug(f"[DPTaskWrapper] Finish signal sent: {request_id}")
 
         return result

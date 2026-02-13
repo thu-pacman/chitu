@@ -30,6 +30,7 @@ dp_config:
     # PD 分离配置（协调/元数据同步、RDMA 后端与 Bootstrap）
     pd_disaggregation:
       enabled: True
+      log_verbose: False
       coordination_port: 29800
       metadata_sync_port: 29801
       kv_transfer_backend: "mooncake"
@@ -40,6 +41,10 @@ dp_config:
         buffer_size: 2048
         transfer_timeout: 30.0
         max_concurrent_transfers: 8
+        # Decode-side status wait/retry loop (kv_manager.recv_kv_cache_and_insert)
+        decode_wait_timeout_s: 20.0
+        decode_resend_interval_s: 0.5
+        decode_poll_interval_s: 0.05
 
     # Prefill Scheduler（2 个）
     prefill_schedulers:

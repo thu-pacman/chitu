@@ -2,8 +2,9 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import threading
 import logging
+import os
+import threading
 from typing import Optional
 from chitu.backend import Backend
 from chitu.utils import get_local_ip, get_free_port
@@ -13,6 +14,78 @@ from chitu.distributed.parallel_state import get_dp_group
 import torch
 
 logger = logging.getLogger(__name__)
+
+_pynvml = None
+_pynvml_failed = False
+
+
+def _import_pynvml():
+    global _pynvml, _pynvml_failed
+    if _pynvml_failed:
+        return None
+    if _pynvml is not None:
+        return _pynvml
+    try:
+        import pynvml  # type: ignore
+    except Exception:
+        _pynvml_failed = True
+        return None
+    _pynvml = pynvml
+    return _pynvml
+
+
+def _nvml_handle_for_device(pynvml, device_index: int):
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible_devices:
+        device_tokens = [
+            token.strip() for token in cuda_visible_devices.split(",") if token.strip()
+        ]
+        if device_index < len(device_tokens):
+            token = device_tokens[device_index]
+            if token.startswith(("GPU-", "MIG-")):
+                return pynvml.nvmlDeviceGetHandleByUUID(token)
+            try:
+                return pynvml.nvmlDeviceGetHandleByIndex(int(token))
+            except ValueError:
+                pass
+    return pynvml.nvmlDeviceGetHandleByIndex(device_index)
+
+
+def _get_nvml_memory_bytes(device_index: int, pid: int):
+    pynvml = _import_pynvml()
+    if pynvml is None:
+        return None
+    initialized = False
+    try:
+        pynvml.nvmlInit()
+        initialized = True
+        handle = _nvml_handle_for_device(pynvml, device_index)
+        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        total = int(mem_info.total)
+        used = int(mem_info.used)
+        try:
+            processes = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        except Exception:
+            try:
+                processes = pynvml.nvmlDeviceGetComputeRunningProcesses_v2(handle)
+            except Exception:
+                processes = []
+        for proc in processes:
+            if proc.pid != pid:
+                continue
+            proc_used = getattr(proc, "usedGpuMemory", None)
+            if proc_used is not None and proc_used > 0:
+                used = int(proc_used)
+            break
+        return used, total
+    except Exception:
+        return None
+    finally:
+        if initialized:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
 
 
 class PrometheusMetricsCollector:
@@ -160,7 +233,7 @@ class PrometheusMetricsCollector:
     @classmethod
     def update_kvcache_usage(cls):
         """Update KV cache usage metrics."""
-        if Backend.cache_manager is None:
+        if Backend.cache_managers is None:
             return
 
         cls.update_GPU_usage()
@@ -170,8 +243,8 @@ class PrometheusMetricsCollector:
             return
 
         try:
-            num_blocks = Backend.cache_manager.get_num_blocks()
-            num_used_blocks = Backend.cache_manager.num_used_blocks
+            num_blocks = Backend.cache_managers["main"].get_num_blocks()
+            num_used_blocks = Backend.cache_managers["main"].num_used_blocks
 
             collector.total_blocks.labels(
                 rank=collector.rank, dp_id=collector.dp_id
@@ -187,7 +260,7 @@ class PrometheusMetricsCollector:
                 ).set(usage_ratio)
             else:
                 logger.error(
-                    f"Unexpected {type(Backend.cache_manager).__name__}.num_blocks({num_blocks}), update_kvcache_usage failed. "
+                    f"Unexpected {type(Backend.cache_managers['main']).__name__}.num_blocks({num_blocks}), update_kvcache_usage failed. "
                 )
         except Exception as e:
             logger.error(f"update_kvcache_usage failed: {e}")
@@ -195,7 +268,7 @@ class PrometheusMetricsCollector:
 
     @classmethod
     def update_GPU_usage(cls):
-        if Backend.cache_manager is None:
+        if Backend.cache_managers is None:
             return
 
         collector = cls.get_instance()
@@ -203,19 +276,27 @@ class PrometheusMetricsCollector:
             return
 
         try:
-            device = Backend.cache_manager.device
+            device = Backend.cache_managers["main"].device
             if (not isinstance(device, torch.device)) or (
                 isinstance(device, torch.device) and device.type != "cuda"
             ):
                 return
 
-            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-            torch_allocated = torch.cuda.memory_allocated(device)
+            device_index = device.index
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            mem_info = _get_nvml_memory_bytes(device_index, os.getpid())
+            if mem_info is not None:
+                used_bytes, total_bytes = mem_info
+            else:
+                free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+                used_bytes = total_bytes - free_bytes
+            torch_allocated = torch.cuda.memory_allocated(device_index)
             collector.total_bytes.labels(
                 rank=collector.rank, dp_id=collector.dp_id
             ).set(total_bytes)
             collector.used_bytes.labels(rank=collector.rank, dp_id=collector.dp_id).set(
-                total_bytes - free_bytes
+                used_bytes
             )
             collector.torch_allocated_bytes.labels(
                 rank=collector.rank, dp_id=collector.dp_id

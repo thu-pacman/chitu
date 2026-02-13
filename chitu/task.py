@@ -16,10 +16,11 @@ from datetime import datetime
 from enum import Enum
 from logging import getLogger
 from pathlib import Path
-from typing import Any, ClassVar, Deque, Optional, Mapping, Union, Callable
+from typing import Any, ClassVar, Deque, Optional, Union, Callable, Mapping
 from typing_extensions import override
 
 import torch
+import numpy as np
 
 from chitu.task_type import TaskType, TaskDecodeType
 from chitu.async_response import AsyncDataStream
@@ -80,6 +81,9 @@ class RouterRequest:
         self,
         message,
         request_id,
+        tools: list[dict] = [],
+        tool_choice: ToolChoice = "auto",
+        parallel_tool_calls: bool = True,
         logprobs=False,
         top_logprobs=None,
         max_new_tokens=50,
@@ -93,6 +97,9 @@ class RouterRequest:
         # input related
         self.message = message
         self.request_id = request_id
+        self.tools = tools
+        self.tool_choice = tool_choice
+        self.parallel_tool_calls = parallel_tool_calls
         self.params = SampleParams(
             temperature=temperature,
             top_p=top_p,
@@ -143,6 +150,9 @@ class RouterRequest:
         return UserRequest(
             message=self.message,
             request_id=self.request_id,
+            tools=self.tools,
+            tool_choice=self.tool_choice,
+            parallel_tool_calls=self.parallel_tool_calls,
             logprobs=self.logprobs,
             top_logprobs=self.top_logprobs,
             max_new_tokens=self.max_new_tokens,
@@ -381,6 +391,9 @@ class MsgPackableTask:
     # DP chunk prefill: carry progress and current-step chunk size
     consumed_req_tokens: int = 0
     prefill_chunk_size: Optional[int] = None
+    # PD disaggregation: preferred prefill engine_rank (usually equals Router's prefill_scheduler_id)
+    # Used on decode worker ranks to send TransferInfo only to the correct prefill instance.
+    pd_prefill_engine_rank: Optional[int] = None
     # output related
     return_logprobs: bool = False
     _test_flag: bool = False
@@ -414,6 +427,11 @@ class Task(ConstraintDecodeTask):
         self.prompt_len = (
             prompt_len if prompt_len is not None else len(self.prefix_tokens)
         )
+        # Decode worker 可能只携带 prompt_len 而不携带 prefix_tokens，
+        # 需要用 base_len 还原真实 prefix 长度。
+        self._prefix_tokens_base_len = (
+            self.prompt_len if (self.prefix_tokens == [] and self.prompt_len) else 0
+        )
         self._decode_status = TaskDecodeType.Normal
 
         # Request
@@ -445,7 +463,8 @@ class Task(ConstraintDecodeTask):
 
         # Response
         # Use getattr for safe access in test environments where infer config may be incomplete
-        op_impl = getattr(get_global_args().infer, "op_impl", None)
+        infer_cfg = getattr(get_global_args(), "infer", None)
+        op_impl = getattr(infer_cfg, "op_impl", None) if infer_cfg is not None else None
         if op_impl == "cpu":
             self.response = DeviceList([], dtype=torch.long, device="cpu")
         else:
@@ -529,6 +548,7 @@ class Task(ConstraintDecodeTask):
         return self.running() and self.finish_last_step()
 
     def update_decode_status(self):
+        prev_status = self._decode_status
         if self._decode_status == TaskDecodeType.Stopped:
             return TaskDecodeType.Stopped
 
@@ -550,6 +570,28 @@ class Task(ConstraintDecodeTask):
             >= self.req.max_new_tokens - get_global_args().infer.mtp_size
         ):
             self._decode_status = TaskDecodeType.WillStopLength
+        if (
+            prev_status != TaskDecodeType.Stopped
+            and self._decode_status == TaskDecodeType.Stopped
+            and not self.waiting
+        ):
+            pd_cfg = getattr(
+                getattr(get_global_args(), "dp_config", None), "router", None
+            )
+            pd_cfg = getattr(pd_cfg, "pd_disaggregation", None)
+            if (
+                pd_cfg is not None
+                and bool(getattr(pd_cfg, "enabled", False))
+                and self.task_type == TaskType.Decode
+                and getattr(self, "req", None) is not None
+                and not getattr(self, "pd_exec_end_logged", False)
+            ):
+                self.pd_exec_end_logged = True
+                request_id = self.req.request_id
+                finish_reason = self.req.finish_reason or "stop"
+                logger.info(
+                    f"[PD_STAGE][decode.exec.end] req_id={request_id} finish_reason={finish_reason}"
+                )
         if self.waiting:
             return TaskDecodeType.Waiting
         return self._decode_status
@@ -638,6 +680,12 @@ class Task(ConstraintDecodeTask):
     @property
     def prefix_tokens_len(self):
         # if not sync, compute the prefix tokens length after sync
+        base_len = getattr(self, "_prefix_tokens_base_len", 0)
+        if self.task_type == TaskType.Decode and base_len > 0:
+            total = base_len + len(self.prefix_tokens)
+            if not self.sync_new_token:
+                total += Backend.executor.mtp_size
+            return total
         return (
             len(self.prefix_tokens)
             if self.sync_new_token or self.task_type == TaskType.Prefill
@@ -767,6 +815,7 @@ class Task(ConstraintDecodeTask):
             params=self.params,
             consumed_req_tokens=self.consumed_req_tokens,
             prefill_chunk_size=self.prefill_chunk_size,
+            pd_prefill_engine_rank=getattr(self, "pd_prefill_engine_rank", None),
             return_logprobs=self.return_logprobs,
             _test_flag=self._test_flag,
             sched_group_id=self.sched_group_id,
@@ -813,12 +862,15 @@ def req_encode(task_type: TaskType, task_id: str):
 
 
 def req_decode(id_num: int):
-    # NOTE: here only return the hex part, the prefix info is lost in decoding
-    # this is acceptable, because decoding is mainly used for internal processing
+    # NOTE: Preserve leading zeros for request ids generated by gen_req_id(len=8).
+    # Otherwise ids like "09xxxxxx" will become "9xxxxxx" on non-main ranks, causing
+    # request_id mismatches (KV rooms split, TaskPool KeyError, etc.).
+    abs_num = int(id_num) if id_num >= 0 else int(-id_num)
+    hex_id = format(abs_num, "x").zfill(8)
     if id_num > 0:
-        return f"{hex(id_num)[2:]:>08}", TaskType.Prefill
+        return hex_id, TaskType.Prefill
     else:
-        return f"{hex(-id_num)[2:]:>08}", TaskType.Decode
+        return hex_id, TaskType.Decode
 
 
 @dataclass
@@ -1020,7 +1072,8 @@ class PackedTasks(PackedTasksBase):
         self.rank = rank
         args = get_global_args()
         # Use getattr for safe access in test environments where infer config may be incomplete
-        if getattr(args.infer, "op_impl", None) == "cpu":
+        infer_cfg = getattr(args, "infer", None)
+        if getattr(infer_cfg, "op_impl", None) == "cpu":
             self.rank = "cpu"
         self.task_ids = task_ids
         self.num_tasks = len(task_ids)
@@ -1297,6 +1350,7 @@ def deserialize_prefill_tasks(data: bytes) -> PackedTasks:
         chunk = td.get("prefill_chunk_size", None)
         grammar_str = td.get("grammar_str", "")
         prompt_len = td.get("prompt_len", 0)
+        pd_prefill_engine_rank = td.get("pd_prefill_engine_rank", None)
 
         if tid in TaskPool.pool:
             task = TaskPool.pool[tid]
@@ -1314,9 +1368,20 @@ def deserialize_prefill_tasks(data: bytes) -> PackedTasks:
             task.sched_group_id = td.get("sched_group_id", None)
             TaskPool.add(task)
 
+        # Decode worker 可能只携带 prompt_len 而不携带 prefix_tokens
+        if (
+            getattr(task, "_prefix_tokens_base_len", 0) == 0
+            and task.prefix_tokens == []
+            and prompt_len > 0
+        ):
+            task._prefix_tokens_base_len = prompt_len
+
         task.consumed_req_tokens = consumed
         if chunk is not None:
             task.set_prefill_chunk_size_for_one_step(int(chunk))
+        if pd_prefill_engine_rank is not None:
+            # Carry PD binding to worker ranks (used by KV hook before KV pull).
+            task.pd_prefill_engine_rank = int(pd_prefill_engine_rank)
 
         task_ids.append(tid)
     if len(task_ids) > 0:

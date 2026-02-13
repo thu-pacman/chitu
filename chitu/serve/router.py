@@ -9,11 +9,15 @@ Contains the core distributed parallel router logic without HTTP endpoints.
 
 import asyncio
 import logging
+import traceback
 from logging import getLogger
 
 from chitu.global_vars import get_global_args
 
 logger = getLogger(__name__)
+
+from chitu.dp_token_router import start_token_router
+from chitu.dp_request_router import start_request_router
 
 
 async def start_dp_components():
@@ -24,10 +28,6 @@ async def start_dp_components():
     try:
         logger.info("Starting DP components...")
         logger.debug(f"DP config details: {dp_config}")
-
-        # Dynamic import DP modules to avoid circular dependencies
-        from chitu.dp_token_router import start_token_router
-        from chitu.dp_request_router import start_request_router
 
         # Start Request Router
         logger.info("Starting Request Router...")
@@ -84,8 +84,5 @@ async def start_dp_components():
         )
 
     except Exception as e:
-        logger.error(f"DP components startup failed: {e}")
-        import traceback
-
-        logger.error(f"Detailed error info: {traceback.format_exc()}")
+        logger.exception(f"DP components startup failed: {e}")
         raise

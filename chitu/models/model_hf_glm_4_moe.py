@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
+from chitu.cache_manager import KVCacheManagerBase
 from chitu.models.model import RMSNorm, get_linear_layout_native_y
 from chitu.models.model_hf_llama import TransformerBlockHFLlama
 from chitu.models.model_hf_qwen2_vl import (
@@ -287,7 +288,7 @@ class TransformerBlockHFGlm4Moe(TransformerBlockHFLlama):
         self,
         layer_id: int,
         args,
-        cache,
+        cache_managers: dict[str, KVCacheManagerBase],
         attn_backend,
         op_impl="torch",
         rotary_type="separated-half",
@@ -321,7 +322,7 @@ class TransformerBlockHFGlm4Moe(TransformerBlockHFLlama):
         super().__init__(
             layer_id,
             args,
-            cache,
+            cache_managers,
             attn_backend=attn_backend,
             op_impl=op_impl,
             rotary_type=rotary_type,
@@ -335,7 +336,7 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
     def __init__(
         self,
         params,
-        cache,
+        cache_managers: dict[str, KVCacheManagerBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -348,7 +349,7 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
     ):
         super().__init__(
             params,
-            cache,
+            cache_managers,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             tensor_parallel_size=tensor_parallel_size,

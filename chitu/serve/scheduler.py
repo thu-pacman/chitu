@@ -20,6 +20,11 @@ from chitu.task import TaskPool
 
 logger = getLogger(__name__)
 
+from chitu.distributed.pd_disaggregation.pd_service import (
+    init_pd_scheduler,
+    init_pd_worker,
+)
+
 
 def init_dp_scheduler(args, rank):
     """Initialize DP Enhanced Scheduler"""
@@ -37,26 +42,27 @@ def init_dp_scheduler(args, rank):
     torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 
     # Router process will skip warmup in unified
-    try:
-        warmup_engine(args)
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc()
-        logger.warning(f"[SCHEDULER] unified warmup skipped/failed: {e}")
+    warmup_engine(args)
 
     # Check if PD disaggregation is enabled
-    pd_enabled = (
-        hasattr(args.dp_config.router, "pd_disaggregation")
-        and args.dp_config.router.pd_disaggregation.enabled
+    pd_enabled = args.dp_config.router.pd_disaggregation.enabled
+
+    # Determine actual distributed rank
+    actual_rank = (
+        torch.distributed.get_rank() if torch.distributed.is_initialized() else rank
     )
 
     if pd_enabled:
         logger.info("[SCHEDULER] PD disaggregation enabled, using PD Scheduler")
         # Use PD disaggregation scheduler
-        from chitu.distributed.pd_disaggregation.pd_service import init_pd_scheduler
-
-        init_pd_scheduler(args, rank)
+        if actual_rank == 0:
+            if init_pd_scheduler is None:
+                raise RuntimeError("PD scheduler service not available")
+            init_pd_scheduler(args, actual_rank)
+        else:
+            if init_pd_worker is None:
+                raise RuntimeError("PD worker service not available")
+            init_pd_worker(args, actual_rank)
         return
 
     # Traditional DP scheduler
@@ -64,11 +70,6 @@ def init_dp_scheduler(args, rank):
 
     logger.info(
         f"[WARMUP] Unified warmup done earlier; task pool size: {len(TaskPool.pool)}"
-    )
-
-    # Determine actual distributed rank
-    actual_rank = (
-        torch.distributed.get_rank() if torch.distributed.is_initialized() else rank
     )
 
     # For non-zero ranks (TP peers), block on compute loop in main thread so that

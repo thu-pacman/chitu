@@ -3,9 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import time
 import itertools
 import zmq
 import msgpack
+import weakref
 from logging import getLogger
 from typing import Optional
 from abc import ABC, abstractmethod
@@ -29,6 +31,8 @@ from chitu.task import (
     DPTaskCollector,
     PPTaskCollector,
     is_normal_payload,
+    serialize_tasks,
+    deserialize_prefill_tasks,
 )
 from chitu.metadata_serializer import MetadataSerializer
 from chitu.distributed.parallel_state import (
@@ -50,6 +54,9 @@ from chitu.ops import apply_frequency_penalty, response_append
 from chitu.device_list import DeviceList
 from chitu.moe.load_balancer import get_moe_load_planner  # added
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
+from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
+    DisaggregationMode,
+)
 
 logger = getLogger(__name__)
 _, has_torch_npu = try_import_and_setup_torch_npu()
@@ -89,8 +96,15 @@ class TasksDispatcher(ABC):
     `dispatch_metadata` on the TP dispatcher.
     """
 
-    def __init__(self, device):
+    def __init__(
+        self,
+        device: torch.device | str,
+        get_executor: weakref.ReferenceType["Executor"],
+    ):
         self.device = device
+
+        # No loop reference: Use weak refence to objects not owned by this object
+        self.get_executor = get_executor  # executor owns this object
 
     # ip_port_list 中的端口索引
     # (IP, TP_port, DP_port, PP_port) - 系统启动时动态分配的空闲端口
@@ -244,8 +258,13 @@ class PipeDispatcher(TasksDispatcher):
     协议选择：自动根据相邻 stages 是否同节点选择 ipc:// 或 tcp://
     """
 
-    def __init__(self, device):
-        super().__init__(device)
+    def __init__(
+        self,
+        device: torch.device | str,
+        get_executor: weakref.ReferenceType["Executor"],
+    ):
+        super().__init__(device, get_executor)
+
         self.pp_group = get_pp_group()
         self.rank = self.pp_group.global_rank
 
@@ -421,6 +440,16 @@ class PipeDispatcher(TasksDispatcher):
 
     def send_payload(self, payload: torch.Tensor, tasks: Optional[PackedTasks] = None):
         if self.is_last_stage:
+            # PD Prefill-only:
+            # - Prefill side does not sample tokens in PP send_payload (no sampling round-trip).
+            # - Prefill runs model prefill and KV transfer; first token is sampled in KV hook
+            #   on_prefill_done from prefill outputs and sent as metadata (token id) to Decode.
+            # - Decode only generates remaining tokens.
+            #
+            # Skipping sampling here avoids unnecessary GPU sampling step and result
+            # round-trip to rank0, which would add latency and bandwidth overhead.
+            if getattr(self.get_executor(), "_pd_prefill_only", False):
+                return
             if tasks.num_tasks == 0:
                 return
             # chunk prefill
@@ -429,7 +458,7 @@ class PipeDispatcher(TasksDispatcher):
                     (0, tasks.get_result_len()), device=self.device, dtype=torch.int32
                 )
             else:
-                tokens = Backend.executor.sample(payload, tasks)
+                tokens = self.get_executor().sample(payload, tasks)
                 if tasks.return_logprobs:
                     logprobs = torch.log_softmax(payload, dim=-1)
                     logprobs, token_idxs = logprobs.sort(dim=-1, descending=True)
@@ -514,8 +543,12 @@ class PipeDispatcher(TasksDispatcher):
 class TensorDispatcher(TasksDispatcher):
     """TP (Tensor Parallelism) Dispatcher"""
 
-    def __init__(self, device):
-        super().__init__(device)
+    def __init__(
+        self,
+        device: torch.device | str,
+        get_executor: weakref.ReferenceType["Executor"],
+    ):
+        super().__init__(device, get_executor)
 
         self.tp_group = get_tp_group()
         self.rank = self.tp_group.global_rank
@@ -642,8 +675,12 @@ class TensorDispatcher(TasksDispatcher):
 class ExpertDataDispatcher(TasksDispatcher):
     """DP (Data Parallelism) Dispatcher"""
 
-    def __init__(self, device):
-        super().__init__(device)
+    def __init__(
+        self,
+        device: torch.device | str,
+        get_executor: weakref.ReferenceType["Executor"],
+    ):
+        super().__init__(device, get_executor)
 
         self.dp_group = get_dp_group()
         self.rank = self.dp_group.global_rank
@@ -664,6 +701,11 @@ class ExpertDataDispatcher(TasksDispatcher):
         )
 
         self.mtp_size = get_global_args().infer.mtp_size
+        # Track decode task bootstrap per dp-rank: in PD decode-only there is no local prefill
+        # to populate TaskPool on worker ranks, so we must send MsgPackableTask once.
+        self._decode_bootstrap_sent: list[set[str]] = [
+            set() for _ in range(self.group_size)
+        ]
 
         # 初始化统一的 metadata serializer
         self.metadata_serializer = MetadataSerializer()
@@ -676,7 +718,10 @@ class ExpertDataDispatcher(TasksDispatcher):
             if DPTaskCollector.has_available_tasks():
                 current_task_type = DPTaskCollector.get_current_task_type()
                 task_ids_list = DPTaskCollector.get_task_ids_list()
-
+                # PD decode-only: requests can be enqueued concurrently while a decode step is in progress.
+                # Pull newly-enqueued tasks into TaskPool.pool before we decide which dp ranks need bootstrap.
+                if current_task_type == TaskType.Decode:
+                    TaskPool.add_all_queued()
                 for rank_in_group in range(1, self.group_size):
                     task_ids = task_ids_list[rank_in_group]
 
@@ -709,6 +754,40 @@ class ExpertDataDispatcher(TasksDispatcher):
                         rank_tasks.payload_type.name.encode(),
                         tasks_msg,
                     ]
+                    if current_task_type == TaskType.Prefill:
+                        tasks = [
+                            TaskPool.pool[tid].get_msgpackable_task()
+                            for tid in task_ids
+                        ]
+                        tasks_msg = serialize_tasks(tasks)
+                        msgs.append(tasks_msg)
+                    elif current_task_type == TaskType.Decode:
+                        sent = self._decode_bootstrap_sent[rank_in_group]
+                        msgs.append(msgpack.packb(task_ids))
+                        last_tokens_list = [
+                            TaskPool.pool[tid].next_token for tid in task_ids
+                        ]
+                        decode_status_list = [
+                            TaskPool.pool[tid]._decode_status.value for tid in task_ids
+                        ]
+                        msgs.append(msgpack.packb(last_tokens_list))
+                        msgs.append(msgpack.packb(decode_status_list))
+                        # Decode task meta：首次下发时发送 MsgPackableTask
+                        # 让 worker rank 本地 TaskPool 可以构造 PackedTasks，并在收到 bootstrap 时发送 TransferInfo
+                        need_bootstrap = [tid for tid in task_ids if tid not in sent]
+                        if need_bootstrap:
+                            boot_tasks = [
+                                TaskPool.pool[tid].get_msgpackable_task()
+                                for tid in need_bootstrap
+                                if tid in TaskPool.pool
+                            ]
+                            if boot_tasks:
+                                msgs.append(serialize_tasks(boot_tasks))
+                                sent.update([t.task_id for t in boot_tasks])
+                                logger.debug(
+                                    f"[PD_TRACE][dp.send_decode_bootstrap] to_rank={int(rank_in_group)} scheduled_task_ids_len={len(task_ids)} "
+                                    f"bootstrap_tasks={need_bootstrap} frames={len(msgs)} frame_bytes={[len(m) for m in msgs]}"
+                                )
                     self.socket.send_multipart(msgs)
 
                 return local_tasks.payload_type, local_tasks
@@ -726,19 +805,99 @@ class ExpertDataDispatcher(TasksDispatcher):
                 return payload_type, local_tasks
 
         else:  # other dp ranks
+            logger.debug(f"DP rank {self.rank_in_group} waiting for recv_metadata")
             msgs = self.socket.recv_multipart()
             payload_type = SerializedPackedTasksPayloadType[msgs[0].decode()]
 
-            # 使用统一的序列化器处理 Prefill 和 Decode
-            if payload_type in [
-                SerializedPackedTasksPayloadType.Prefill,
-                SerializedPackedTasksPayloadType.Decode,
-            ]:
-                is_prefill = payload_type == SerializedPackedTasksPayloadType.Prefill
+            if payload_type == SerializedPackedTasksPayloadType.Prefill:
                 _, tasks, _ = self.metadata_serializer.deserialize_metadata(
-                    msgs[1], require_task_creation=is_prefill
+                    msgs[1], require_task_creation=True
                 )
+            elif payload_type == SerializedPackedTasksPayloadType.Decode:
+                # Decode bootstrap frame may be present even when `task_ids` is empty.
+                # This allows worker ranks to prepare TransferInfo early without forcing a decode step.
+                if len(msgs) >= 6:
+                    logger.debug(
+                        f"DP rank {self.rank_in_group} received decode bootstrap"
+                    )
+                    boot_tasks = deserialize_prefill_tasks(msgs[5])
+                    boot_ids = list(getattr(boot_tasks, "task_ids", []) or [])
+                    for tid in boot_ids:
+                        if tid in TaskPool.pool:
+                            TaskPool.pool[tid].task_type = TaskType.Decode
+                            logger.debug(
+                                f"DP rank {self.rank_in_group} updated task type for task {tid} to Decode"
+                            )
+                    # PD decode-only: prepare TransferInfo on worker ranks immediately upon bootstrap.
+                    kv_hook = self.get_executor().get_kv_hook()
+                    kv_manager = getattr(kv_hook, "kv_manager", None)
+                    if (
+                        kv_manager is not None
+                        and getattr(kv_hook, "mode", None) == "decode"
+                        and hasattr(kv_manager, "prepare_kv_transfer")
+                    ):
+                        cache_manager = (
+                            getattr(kv_manager, "cache_manager", None)
+                            or Backend.cache_managers["main"]  # FIXME: other managers
+                        )
+                        if cache_manager is not None and boot_ids:
+                            prefix_lens = []
+                            for rid in boot_ids:
+                                t = TaskPool.pool.get(rid)
+                                prefix_lens.append(
+                                    int(getattr(t, "prefix_tokens_len", 0) or 0)
+                                    if t is not None
+                                    else 0
+                                )
+                                prefill_rank = (
+                                    getattr(t, "pd_prefill_engine_rank", None)
+                                    if t is not None
+                                    else None
+                                )
+                                if prefill_rank is not None and hasattr(
+                                    kv_manager, "set_prefill_target_engine_rank"
+                                ):
+                                    kv_manager.set_prefill_target_engine_rank(
+                                        rid, int(prefill_rank)
+                                    )
+                            kv_manager.prepare_kv_transfer(
+                                request_ids=list(boot_ids),
+                                cache_manager=cache_manager,
+                                prefix_lens=prefix_lens,
+                            )
+                    logger.debug(
+                        f"[PD_TRACE][dp.recv_decode_bootstrap] rank_in_group={int(self.rank_in_group)} "
+                        f"boot_ids_len={len(boot_ids)} frames={len(msgs)} "
+                        f"frame_bytes={[len(m) for m in msgs]}"
+                    )
 
+                if payload_type == SerializedPackedTasksPayloadType.Decode:
+                    _, tasks, _ = self.metadata_serializer.deserialize_metadata(
+                        msgs[1], require_task_creation=False
+                    )
+                    task_ids = msgpack.unpackb(msgs[2]) if len(msgs) > 2 else []
+                    if len(task_ids) > 0:
+                        task_list = [TaskPool.pool[task_id] for task_id in task_ids]
+                        last_tokens_list = (
+                            msgpack.unpackb(msgs[3]) if len(msgs) > 3 else []
+                        )
+                        decode_status_list = (
+                            msgpack.unpackb(msgs[4]) if len(msgs) > 4 else []
+                        )
+                        for it, task in enumerate(task_list):
+                            # Sync next_token from main rank without mutating num_new_tokens/prefix bookkeeping.
+                            # NOTE: For brand new tasks (num_new_tokens==0), next_token may be -1 and is unused.
+                            if it < len(last_tokens_list):
+                                task.next_token = int(last_tokens_list[it])
+                            if it < len(decode_status_list):
+                                task._decode_status = TaskDecodeType(
+                                    value=decode_status_list[it]
+                                )
+                        tasks = PackedTasks([], tasks=task_list)
+                    else:
+                        tasks = PackedTasks([], task_type=TaskType.Decode)
+                else:
+                    tasks = PackedTasks([], task_type=TaskType.Decode)
             elif payload_type in (
                 SerializedPackedTasksPayloadType.EndTask,
                 SerializedPackedTasksPayloadType.Remove,
@@ -750,6 +909,19 @@ class ExpertDataDispatcher(TasksDispatcher):
                 raise ValueError(f"Unknown payload type: {payload_type}")
 
             return payload_type, tasks
+
+    def has_pending_metadata(self) -> bool:
+        """Non-blocking check for incoming metadata on worker ranks.
+
+        This avoids blocking the PD worker loop when no DP messages are ready,
+        allowing KV prepare queue to be drained promptly.
+        """
+        if self.is_main_rank:
+            return True
+        try:
+            return bool(self.socket.poll(timeout=0, flags=zmq.POLLIN))
+        except Exception:
+            return True
 
     def collect_token(
         self,
@@ -818,20 +990,36 @@ class Executor:
             self.pp_size <= 1 or self.pp_stage + 1 == self.pp_size
         ) and self.rank % self.tp_size == 0
         self.has_schedule_overlap = args.infer.schedule_overlap
+        pd_cfg = getattr(getattr(args, "dp_config", None), "router", None)
+        pd_cfg = getattr(pd_cfg, "pd_disaggregation", None)
+        pd_log_verbose = False
+        env_pd_verbose = os.getenv("CHITU_PD_LOG_VERBOSE")
+        if env_pd_verbose is not None:
+            if env_pd_verbose.strip().lower() in ("1", "true", "yes", "y", "on"):
+                pd_log_verbose = True
+            elif env_pd_verbose.strip().lower() in ("0", "false", "no", "n", "off"):
+                pd_log_verbose = False
+        elif pd_cfg is not None:
+            pd_log_verbose = bool(getattr(pd_cfg, "log_verbose", False))
+        self._step_timing_enabled = (
+            os.getenv("CHITU_STEP_TIMING", "0") == "1" or pd_log_verbose
+        )
+        self._step_timing_min_ms = float(os.getenv("CHITU_STEP_TIMING_MIN_MS", "0"))
+        self._decode_first_step_logged: set[str] = set()
         DPTaskCollector.init_collect_rank_list()
         DPTaskCollector.reset_collect_tokens()
 
         rank_filter = True
         if rank_filter and self.tp_size > 1:
-            self._prepend_dispatcher(TensorDispatcher(self.device))
+            self._prepend_dispatcher(TensorDispatcher(self.device, weakref.ref(self)))
             self.tp_group = get_tp_group()
             rank_filter = rank_filter and get_tp_group().is_first_rank
         if rank_filter and self.pp_size > 1:
-            self.pipe_dispatcher = PipeDispatcher(self.device)
+            self.pipe_dispatcher = PipeDispatcher(self.device, weakref.ref(self))
             self._prepend_dispatcher(self.pipe_dispatcher)
             rank_filter = rank_filter and get_pp_group().is_first_rank
         if rank_filter and self.dp_size > 1:
-            self.dp_dispatcher = ExpertDataDispatcher(self.device)
+            self.dp_dispatcher = ExpertDataDispatcher(self.device, weakref.ref(self))
             self._prepend_dispatcher(self.dp_dispatcher)
 
         if self.pp_size > 1 and not get_pp_group().is_first_rank:
@@ -846,8 +1034,6 @@ class Executor:
         self.n_dense_layers = (
             args.models.n_dense_layers if hasattr(args.models, "n_dense_layers") else 0
         )
-        self.empty_decode_step_graph = None
-        self.empty_decode_step_graph_mtp = None
         self.dummy_logits = torch.empty(
             [0, args.models.vocab_size], dtype=torch.float32, device=self.device
         )
@@ -859,6 +1045,24 @@ class Executor:
         # Hooks for token streaming and KV transfer. Defaults keep existing behavior.
         self._token_sink: TokenSink = LocalTokenSink()
         self._kv_hook: KVTransferHook = NoopKVTransferHook()
+
+        # PD disaggregation: Prefill-only mode not sample tokens on the Prefill side.
+        #
+        # In PD Prefill-only, Prefill is responsible for:
+        # - building KV cache for the prompt
+        # - transferring first-token logits to Decode (if PP > 1, last PP stage sends logits)
+        #
+        # Decode is responsible for sampling and subsequent token generation.
+        # If keep PP sampling enabled, last PP stage would sample and send results
+        # back to rank0, adding latency and overhead.
+        pd_cfg = getattr(getattr(args, "dp_config", None), "router", None)
+        pd_cfg = getattr(pd_cfg, "pd_disaggregation", None)
+        sched_type = str(getattr(getattr(args, "scheduler", None), "type", "")).lower()
+        self._pd_prefill_only = bool(
+            pd_cfg is not None
+            and bool(getattr(pd_cfg, "enabled", False))
+            and ("prefill_only" in sched_type)
+        )
 
         # ---- Load balancer concurrent scheduling ----
         # Planner runs on a background thread; we only trigger and (optionally) sync here.
@@ -873,7 +1077,7 @@ class Executor:
         """Determine if current rank should record metrics.
 
         In non-DP mode: only rank 0 records metrics.
-        In DP mode: all ranks that process tasks record metrics (each dp rank processes different tasks).
+        In DP mode: only the DP dispatcher ranks record metrics.
 
         Args:
             num_tokens: Number of tokens being processed (0 means no tasks)
@@ -887,15 +1091,7 @@ class Executor:
         if self.dp_size <= 1:
             return self.rank == 0
 
-        # In DP mode, all ranks that process tasks should record metrics
-        # For prefill: ranks with pp_stage == 0 process tasks
-        # For decode: ranks with dp_dispatcher process tasks
-        if is_prefill:
-            # In prefill, only pp_stage == 0 ranks process tasks
-            return self.pp_stage == 0
-        else:
-            # In decode, ranks with dp_dispatcher process tasks
-            return self.dp_dispatcher is not None
+        return self.dp_dispatcher is not None
 
     def _prepend_dispatcher(self, dispatcher: TasksDispatcher):
         self.task_dispatchers.insert(0, dispatcher)
@@ -1057,14 +1253,8 @@ class Executor:
             Backend.constraint_decode_manager.end_tasks(tasks.req_ids)
             # Delete item from KV cache
             for rid in tasks.req_ids:
-                Backend.cache_manager.finalize_cache_all_decode(rid)
-                if get_global_args().models.type == "hf-qwen3-next":
-                    Backend.linear_attn_cache_manager.finalize_cache_all_decode(rid)
-                if (
-                    getattr(Backend, "indexer_cache_manager", None) is not None
-                    and get_global_args().models.type == "deepseek-v3"
-                ):
-                    Backend.indexer_cache_manager.finalize_cache_all_decode(rid)
+                for mgr in Backend.cache_managers.values():
+                    mgr.finalize_cache_all_decode(rid)
             PrometheusMetricsCollector.update_kvcache_usage()
             return payload_type
 
@@ -1111,8 +1301,9 @@ class Executor:
             if self.rank == 0:
                 for task in update_tasks.tasks:
                     task.sync_new_token = False
-        # *pp rank0 irecv
-        if self.pp_size > 1 and self.rank == 0:
+        # PP rank0 irecv
+        # In PD Prefill-only mode no sampling or collecting pipeline results on rank0.
+        if self.pp_size > 1 and self.rank == 0 and not self._pd_prefill_only:
             self.pipe_dispatcher.recv_results(tasks)
 
         if (
@@ -1184,21 +1375,9 @@ class Executor:
     def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         is_empty_step = tasks.num_tasks == 0
         if not is_empty_step:
-            Backend.cache_manager.prepare_cache_prefill(
-                tasks.req_ids, [len(t) for t in tasks.tokens]
-            )
+            for mgr in Backend.cache_managers.values():
+                mgr.prepare_cache_prefill(tasks.req_ids, [len(t) for t in tasks.tokens])
             PrometheusMetricsCollector.update_kvcache_usage()
-            if get_global_args().models.type == "hf-qwen3-next":
-                Backend.linear_attn_cache_manager.prepare_cache_prefill(
-                    tasks.req_ids, [len(t) for t in tasks.tokens]
-                )
-            if (
-                getattr(Backend, "indexer_cache_manager", None) is not None
-                and get_global_args().models.type == "deepseek-v3"
-            ):
-                Backend.indexer_cache_manager.prepare_cache_prefill(
-                    tasks.req_ids, [len(t) for t in tasks.tokens]
-                )
 
             num_tokens = tasks.num_tokens
 
@@ -1245,29 +1424,22 @@ class Executor:
             #     PrometheusMetricsCollector.inc_prompt_tokens(num_tokens)
             PrometheusMetricsCollector.inc_prompt_tokens(num_tokens)
 
-            # Notify KV transfer hook after prefill completes.
-            try:
-                output_req_ids = [
-                    tasks.req_ids[i]
-                    for i in range(tasks.num_tasks)
-                    if tasks.has_outputs[i]
-                ]
-                self._kv_hook.on_prefill_done(output_req_ids, out)
-            except Exception:
-                pass
-
             # payload send
+            #
+            # NOTE: send hidden states to the next PP stage BEFORE triggering KV transfer.
+            # Otherwise intermediate stages can block in KV transfer collectives, while the last
+            # stage is still waiting for payload from upstream, causing a deadlock.
             for dispatcher in self.task_dispatchers:
                 dispatcher.send_payload(out, tasks)
 
-            Backend.cache_manager.finalize_cache_all_prefill()  # like reset metadata
-            if get_global_args().models.type == "hf-qwen3-next":
-                Backend.linear_attn_cache_manager.finalize_cache_all_prefill()
-            if (
-                getattr(Backend, "indexer_cache_manager", None) is not None
-                and get_global_args().models.type == "deepseek-v3"
-            ):
-                Backend.indexer_cache_manager.finalize_cache_all_prefill()
+            # Notify KV transfer hook after prefill completes.
+            output_req_ids = [
+                tasks.req_ids[i] for i in range(tasks.num_tasks) if tasks.has_outputs[i]
+            ]
+            self._kv_hook.on_prefill_done(output_req_ids, out, tasks)
+
+            for mgr in Backend.cache_managers.values():
+                mgr.finalize_cache_all_prefill()  # like reset metadata
             return out
         else:
             for dispatcher in self.task_dispatchers:
@@ -1282,25 +1454,13 @@ class Executor:
         - Does NOT send/recv hidden/logits across pipeline stages
         """
         # 1) propagate tasks across TP
-        tensor_dispatcher = TensorDispatcher(self.device)
+        tensor_dispatcher = TensorDispatcher(self.device, weakref.ref(self))
         payload_type, tasks = tensor_dispatcher.dispatch_metadata(tasks)
 
         # 2) prepare cache
-        Backend.cache_manager.prepare_cache_prefill(
-            tasks.req_ids, [len(t) for t in tasks.tokens]
-        )
+        for mgr in Backend.cache_managers.values():
+            mgr.prepare_cache_prefill(tasks.req_ids, [len(t) for t in tasks.tokens])
         PrometheusMetricsCollector.update_kvcache_usage()
-        if get_global_args().models.type == "hf-qwen3-next":
-            Backend.linear_attn_cache_manager.prepare_cache_prefill(
-                tasks.req_ids, [len(t) for t in tasks.tokens]
-            )
-        if (
-            getattr(Backend, "indexer_cache_manager", None) is not None
-            and get_global_args().models.type == "deepseek-v3"
-        ):
-            Backend.indexer_cache_manager.prepare_cache_prefill(
-                tasks.req_ids, [len(t) for t in tasks.tokens]
-            )
 
         # 3) prepare payload on TP main rank only
         num_tokens = tasks.num_tokens
@@ -1337,23 +1497,14 @@ class Executor:
         self.timers("prefill").stop()
 
         # Notify KV hook in TP-only path as well.
-        try:
-            output_req_ids = [
-                tasks.req_ids[i] for i in range(tasks.num_tasks) if tasks.has_outputs[i]
-            ]
-            self._kv_hook.on_prefill_done(output_req_ids, out)
-        except Exception:
-            pass
+        output_req_ids = [
+            tasks.req_ids[i] for i in range(tasks.num_tasks) if tasks.has_outputs[i]
+        ]
+        self._kv_hook.on_prefill_done(output_req_ids, out, tasks)
 
         # 6) finalize cache
-        Backend.cache_manager.finalize_cache_all_prefill()
-        if get_global_args().models.type == "hf-qwen3-next":
-            Backend.linear_attn_cache_manager.finalize_cache_all_prefill()
-        if (
-            getattr(Backend, "indexer_cache_manager", None) is not None
-            and get_global_args().models.type == "deepseek-v3"
-        ):
-            Backend.indexer_cache_manager.finalize_cache_all_prefill()
+        for mgr in Backend.cache_managers.values():
+            mgr.finalize_cache_all_prefill()
         # 7) ensure logits are [B, vocab]
         if out.dim() == 1:
             out = out.view(1, -1)
@@ -1370,20 +1521,13 @@ class Executor:
         - Runs one decode step and updates KV cache
         Returns logits with shape [B, vocab]
         """
+        # Ensure KV is present for PD decode-only before updating CacheManager state.
+        self._kv_hook.before_decode_step(req_ids)
+
         # 1) prepare cache and seq lens
-        Backend.cache_manager.prepare_cache_decode(req_ids)
+        for mgr in Backend.cache_managers.values():
+            mgr.prepare_cache_decode(req_ids)
         PrometheusMetricsCollector.update_kvcache_usage()
-        if get_global_args().models.type == "hf-qwen3-next":
-            Backend.linear_attn_cache_manager.prepare_cache_decode(req_ids)
-        if (
-            getattr(Backend, "indexer_cache_manager", None) is not None
-            and get_global_args().models.type == "deepseek-v3"
-        ):
-            Backend.indexer_cache_manager.prepare_cache_decode(req_ids)
-        try:
-            self._kv_hook.before_decode_step(req_ids)
-        except Exception:
-            pass
 
         # 2) build payload on TP main rank only
         num_tokens = len(next_tokens)
@@ -1399,8 +1543,9 @@ class Executor:
             )
 
         # 3) broadcast payload to all TP ranks
-        tensor_dispatcher = TensorDispatcher(self.device)
-        payload = tensor_dispatcher.recv_payload(payload)
+        if self.tp_size > 1:
+            tensor_dispatcher = TensorDispatcher(self.device, weakref.ref(self))
+            payload = tensor_dispatcher.recv_payload(payload)
 
         # 4) run decode and ensure shape [B, vocab]
         self.timers("decode").start()
@@ -1408,33 +1553,19 @@ class Executor:
         self.timers("decode").stop()
 
         # 5) finalize cache for this step
-        Backend.cache_manager.finalize_cache_single_decode(req_ids)
-        if get_global_args().models.type == "hf-qwen3-next":
-            Backend.linear_attn_cache_manager.finalize_cache_single_decode(req_ids)
-        if (
-            getattr(Backend, "indexer_cache_manager", None) is not None
-            and get_global_args().models.type == "deepseek-v3"
-        ):
-            Backend.indexer_cache_manager.finalize_cache_single_decode(req_ids)
+        for mgr in Backend.cache_managers.values():
+            mgr.finalize_cache_single_decode(req_ids)
         return out
 
-    def decode_step(self, tasks: PackedTasksBase):
-        is_empty_step = tasks.num_tasks == 0
+    def decode_step(self, tasks: PackedTasksBase, is_empty_step: bool = False):
+        if tasks.num_tasks == 0:
+            is_empty_step = True
         if not is_empty_step:
-            Backend.cache_manager.prepare_cache_decode(tasks.req_ids)
-            PrometheusMetricsCollector.update_kvcache_usage()
-            if get_global_args().models.type == "hf-qwen3-next":
-                Backend.linear_attn_cache_manager.prepare_cache_decode(tasks.req_ids)
-            if (
-                getattr(Backend, "indexer_cache_manager", None) is not None
-                and get_global_args().models.type == "deepseek-v3"
-            ):
-                Backend.indexer_cache_manager.prepare_cache_decode(tasks.req_ids)
-            # Ensure KV cache is present for PD decode-only before running decode.
-            try:
-                self._kv_hook.before_decode_step(tasks.req_ids)
-            except Exception:
-                pass
+            # Ensure KV cache is present for PD decode-only before updating CacheManager state.
+            self._kv_hook.before_decode_step(tasks.req_ids)
+
+            for mgr in Backend.cache_managers.values():
+                mgr.prepare_cache_decode(tasks.req_ids)
 
             num_tokens = tasks.num_tasks
 
@@ -1478,7 +1609,7 @@ class Executor:
             for dispatcher in self.task_dispatchers:
                 dispatcher.recv_payload(self.dummy_logits)
 
-        payload_bs = tasks.num_tasks
+        payload_bs = len(tasks.req_ids) if not is_empty_step else 0
         self.timers("decode").start()
         out = Backend.model.decode(payload, payload_bs)
         self.timers("decode").stop()
@@ -1487,28 +1618,16 @@ class Executor:
             # Collect metrics for Prometheus
             # In DP mode: all dp ranks record their local tokens (distinguished by dp_id)
             # In non-DP mode: only rank 0 records metrics
-            # if self._should_record_metrics(tasks.num_tasks, is_prefill=False):
-            #     PrometheusMetricsCollector.inc_generated_tokens(tasks.num_tasks)
-            PrometheusMetricsCollector.inc_generated_tokens(tasks.num_tasks)
+            if self._should_record_metrics(tasks.num_tasks, is_prefill=False):
+                PrometheusMetricsCollector.inc_generated_tokens(tasks.num_tasks)
 
             # payload send
             for dispatcher in self.task_dispatchers:
                 dispatcher.send_payload(out, tasks)
 
-            Backend.cache_manager.finalize_cache_single_decode(
-                tasks.req_ids
-            )  # update seq_len and reset block table
-            if get_global_args().models.type == "hf-qwen3-next":
-                Backend.linear_attn_cache_manager.finalize_cache_single_decode(
-                    tasks.req_ids
-                )
-            if (
-                getattr(Backend, "indexer_cache_manager", None) is not None
-                and get_global_args().models.type == "deepseek-v3"
-            ):
-                Backend.indexer_cache_manager.finalize_cache_single_decode(
-                    tasks.req_ids
-                )
+            # update seq_len and reset block table
+            for mgr in Backend.cache_managers.values():
+                mgr.finalize_cache_single_decode(tasks.req_ids)
             return out
         else:
             for dispatcher in self.task_dispatchers:

@@ -6,9 +6,19 @@ import threading
 import time
 from logging import getLogger
 from typing import Optional
+
+from chitu.backend import Backend
 from chitu.metrics import PrometheusServerManager
 from chitu.global_vars import get_global_args
 from chitu.metrics.task_stats import count_tasks
+from chitu.utils import ceil_div
+
+try:
+    from chitu.distributed.pd_disaggregation.pd_scheduler import (
+        get_pd_scheduler_instance,
+    )
+except Exception:  # pragma: no cover - optional PD dependency
+    get_pd_scheduler_instance = None
 
 logger = getLogger(__name__)
 
@@ -65,6 +75,14 @@ class MetricsMonitor:
         while not self._stop_event.is_set():
             time.sleep(self.log_interval)
             try:
+                if (
+                    hasattr(self.manager, "is_running")
+                    and not self.manager.is_running()
+                ):
+                    logger.warning(
+                        "Prometheus server is not running; skip metrics query."
+                    )
+                    continue
                 log_interval = f"{int(self.log_interval)}s"
                 # self.manager.list_all_metrics()
                 prompt_tps = self.manager.query_metric_rate_each_rank(
@@ -136,10 +154,18 @@ class MetricsMonitor:
         all_rank_dp_pairs = {
             key for metric_dict in all_metric_dict for key in metric_dict
         }
+        dp_ids = {int(rank_dp[1]) for rank_dp in all_rank_dp_pairs}
+        dp_size = max(dp_ids) + 1 if dp_ids else 1
+        prealloc_blocks_by_dp = self._get_prealloc_blocks_by_dp(dp_size)
         for rank_dp in all_rank_dp_pairs:
             dp_id = int(rank_dp[1])
             rank = int(rank_dp[0])
             running, waiting = count_tasks(dp_id=dp_id)
+            prealloc_blocks = (
+                prealloc_blocks_by_dp.get(dp_id) if prealloc_blocks_by_dp else None
+            )
+            used_blocks_value = int(used_blocks.get(rank_dp, "-1"))
+            total_blocks_value = int(total_blocks.get(rank_dp, "-1"))
 
             log_msg = self._build_stats_message(
                 prompt_tps=float(prompt_tps.get(rank_dp, "-1")),
@@ -148,8 +174,9 @@ class MetricsMonitor:
                 waiting=waiting,
                 kv_cache_usage=float(kvcache_usage.get(rank_dp, "-1")),
                 eviction_rate=float(eviction_rate.get(rank_dp, "-1")),
-                used_blocks=int(used_blocks.get(rank_dp, "-1")),
-                total_blocks=int(total_blocks.get(rank_dp, "-1")),
+                used_blocks=used_blocks_value,
+                total_blocks=total_blocks_value,
+                prealloc_blocks=prealloc_blocks,
                 total_bytes=float(total_bytes.get(rank_dp, "-1")),
                 used_bytes=float(used_bytes.get(rank_dp, "-1")),
                 torch_allocated_bytes=float(torch_allocated_bytes.get(rank_dp, "-1")),
@@ -166,6 +193,7 @@ class MetricsMonitor:
         eviction_rate,
         used_blocks,
         total_blocks,
+        prealloc_blocks,
         total_bytes,
         used_bytes,
         torch_allocated_bytes,
@@ -178,9 +206,52 @@ class MetricsMonitor:
             f"Waiting: {waiting} reqs",
             f"KV cache usage: {kv_cache_usage*100:.1f}%({used_blocks}/{total_blocks})",
             f"Task evictions: {eviction_rate:.2f}/s",
-            f"GPU mem usage: {used_bytes/(1024**3):.2f} GB / {total_bytes/(1024**3):.2f} GB (torch allocated {torch_allocated_bytes/(1024**3):.2f} GB)",
         ]
+        prealloc_msg = str(int(prealloc_blocks)) if prealloc_blocks is not None else "-"
+        parts.append(f"KV blocks prealloc: {prealloc_msg}")
+        if total_bytes > 0 and used_bytes >= 0:
+            used_gib = used_bytes / 1024**3
+            total_gib = total_bytes / 1024**3
+            if torch_allocated_bytes >= 0:
+                torch_gib = torch_allocated_bytes / 1024**3
+                non_torch_gib = max(used_bytes - torch_allocated_bytes, 0.0) / 1024**3
+                parts.append(
+                    "GPU mem: "
+                    f"{used_gib:.2f}/{total_gib:.2f} GiB "
+                    f"(torch: {torch_gib:.2f} GiB, non-torch: {non_torch_gib:.2f} GiB)"
+                )
+            else:
+                parts.append(f"GPU mem: {used_gib:.2f}/{total_gib:.2f} GiB")
         return ", ".join(parts)
+
+    def _get_prealloc_blocks_by_dp(self, dp_size: int) -> Optional[dict[int, int]]:
+        """Get prealloc KV blocks per DP rank from PD scheduler."""
+        if get_pd_scheduler_instance is None:
+            return None
+        scheduler = get_pd_scheduler_instance()
+        if scheduler is None:
+            return None
+        if Backend.cache_managers["main"] is None:
+            return None
+        if not hasattr(Backend.cache_managers["main"], "get_block_size"):
+            return None
+        block_size = Backend.cache_managers["main"].get_block_size()
+        if block_size <= 0:
+            return None
+        tokens_by_dp = getattr(
+            scheduler, "_decode_prealloc_tokens_inflight_by_dp", None
+        )
+        if not tokens_by_dp:
+            return None
+        prealloc_blocks: dict[int, int] = {}
+        for dp_id in range(dp_size):
+            tokens = 0
+            if dp_id < len(tokens_by_dp):
+                tokens = int(tokens_by_dp[dp_id])
+            prealloc_blocks[dp_id] = (
+                int(ceil_div(tokens, block_size)) if tokens > 0 else 0
+            )
+        return prealloc_blocks
 
 
 _global_monitor: Optional[MetricsMonitor] = None

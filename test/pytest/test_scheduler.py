@@ -18,9 +18,9 @@ class MockExecutor:
         task_ids = [
             task_id
             for task_id in tasks.task_ids
-            if task_id in Backend.cache_manager.block_table
+            if task_id in Backend.cache_managers["main"].block_table
         ]
-        Backend.cache_manager.finalize_cache_all_decode(task_ids)
+        Backend.cache_managers["main"].finalize_cache_all_decode(task_ids)
 
 
 class MockCacheManager:
@@ -93,7 +93,9 @@ def test_chunked_prefill():
         need_ensure=False,
     )
     TaskPool.reset()
-    Backend.cache_manager = MockCacheManager(num_blocks=10000, block_size=5120)
+    Backend.cache_managers = {
+        "main": MockCacheManager(num_blocks=10000, block_size=5120)
+    }
     Backend.executor = MockExecutor()
 
     for i in range(4):
@@ -166,7 +168,9 @@ def test_chunked_prefill_skew():
     )
 
     TaskPool.reset()
-    Backend.cache_manager = MockCacheManager(num_blocks=10000, block_size=512)
+    Backend.cache_managers = {
+        "main": MockCacheManager(num_blocks=10000, block_size=512)
+    }
 
     for i in range(4):
         req = MockFixedLengthedUserRequest(
@@ -247,7 +251,7 @@ def test_priority_prefill_first():
         need_ensure=False,
     )
     TaskPool.reset()
-    Backend.cache_manager = MockCacheManager(num_blocks=10, block_size=512)
+    Backend.cache_managers = {"main": MockCacheManager(num_blocks=10, block_size=512)}
 
     tasks = []
     for i in range(9):
@@ -325,7 +329,7 @@ def test_priority_prefill_first_skew():
     )
 
     TaskPool.reset()
-    Backend.cache_manager = MockCacheManager(num_blocks=10, block_size=512)
+    Backend.cache_managers = {"main": MockCacheManager(num_blocks=10, block_size=512)}
     Backend.tokenizer = MockTokenizer()
 
     tasks = []
@@ -411,7 +415,7 @@ def test_priority_fcfs():
         need_ensure=False,
     )
     TaskPool.reset()
-    Backend.cache_manager = MockCacheManager(num_blocks=10, block_size=512)
+    Backend.cache_managers = {"main": MockCacheManager(num_blocks=10, block_size=512)}
 
     tasks = []
     for i in range(9):
@@ -483,7 +487,7 @@ def test_priority_fcfs_skew():
     )
 
     TaskPool.reset()
-    Backend.cache_manager = MockCacheManager(num_blocks=10, block_size=512)
+    Backend.cache_managers = {"main": MockCacheManager(num_blocks=10, block_size=512)}
     tasks = []
     for i in range(9):
         req = MockFixedLengthedUserRequest(
@@ -571,7 +575,7 @@ def test_priority_request_preset_over_prefill_first():
         need_ensure=False,
     )
     TaskPool.reset()
-    Backend.cache_manager = MockCacheManager(num_blocks=10, block_size=512)
+    Backend.cache_managers = {"main": MockCacheManager(num_blocks=10, block_size=512)}
 
     tasks = []
     for i in range(9):
@@ -654,7 +658,7 @@ def test_priority_request_preset_over_prefill_first_skew():
     )
 
     TaskPool.reset()
-    Backend.cache_manager = MockCacheManager(num_blocks=10, block_size=512)
+    Backend.cache_managers = {"main": MockCacheManager(num_blocks=10, block_size=512)}
 
     tasks = []
     for i in range(9):
@@ -741,7 +745,7 @@ def test_max_running_tasks():
         need_ensure=False,
     )
     TaskPool.reset()
-    Backend.cache_manager = MockCacheManager(num_blocks=10, block_size=512)
+    Backend.cache_managers = {"main": MockCacheManager(num_blocks=10, block_size=512)}
 
     tasks = []
     for i in range(9):
@@ -807,9 +811,9 @@ def test_single_prompt_seq_bigger_than_scheduler_capacity():
 
     NUM_BLOCKS = 2
     BLOCK_SIZE = 512
-    Backend.cache_manager = MockCacheManager(
-        num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE
-    )  # kv_cache capacity = 1024
+    Backend.cache_managers = {
+        "main": MockCacheManager(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE)
+    }  # kv_cache capacity = 1024
 
     req = MockFixedLengthedUserRequest(
         input_len=NUM_BLOCKS * BLOCK_SIZE + 1,
@@ -851,9 +855,9 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
     NUM_BLOCKS = 2
     BLOCK_SIZE = 512
     DIFF = 5
-    Backend.cache_manager = MockCacheManager(
-        num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE
-    )  # kv_cache capacity = 1024
+    Backend.cache_managers = {
+        "main": MockCacheManager(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE)
+    }  # kv_cache capacity = 1024
     req = MockFixedLengthedUserRequest(
         input_len=NUM_BLOCKS * BLOCK_SIZE - DIFF,
         request_id=f"req_0",
@@ -864,17 +868,15 @@ def test_single_decode_prompt_seq_bigger_than_scheduler_capacity():
 
     scheduler = Scheduler(100, 4, 2, "prefill_first", num_scheduler_groups=1)
     task_ids = scheduler.schedule()
-    Backend.cache_manager.prepare_cache_prefill(task_ids)
+    Backend.cache_managers["main"].prepare_cache_prefill(task_ids)
     task.prefix_tokens.append(1)
     scheduler.update(task_ids)
 
     task.consume_req_tokens()
     for step in range(DIFF):
         task_ids = scheduler.schedule()
-        assert task_ids == [
-            "req_0",
-        ]
-        Backend.cache_manager.prepare_cache_decode(task_ids)
+        assert task_ids == ["req_0"]
+        Backend.cache_managers["main"].prepare_cache_decode(task_ids)
         task.prefix_tokens.append(1)
         scheduler.update(task_ids)
 
@@ -907,9 +909,9 @@ def test_evict_decode_task():
     DECODE_NUM_TASKS = 4
 
     Backend.executor = MockExecutor()
-    Backend.cache_manager = MockCacheManager(
-        num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE
-    )  # kv_cache capacity = 5120
+    Backend.cache_managers = {
+        "main": MockCacheManager(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE)
+    }  # kv_cache capacity = 5120
     Backend.tokenizer = MockTokenizer()
     tasks = []
     task_ids = []
@@ -928,7 +930,7 @@ def test_evict_decode_task():
         TaskPool.add(task)  # pool: ['req_0', 'req_1', 'req_2', 'req_3']
         task.consume_req_tokens()
         task.prefix_tokens.append(1)
-    Backend.cache_manager.prepare_cache_prefill(task_ids)
+    Backend.cache_managers["main"].prepare_cache_prefill(task_ids)
 
     # TaskPool: ['req_0', 'req_1', 'req_2', 'req_3']
     # num_free_blocks: 0
@@ -938,13 +940,16 @@ def test_evict_decode_task():
     scheduler = Scheduler(
         100, 4, DECODE_NUM_TASKS, "prefill_first,fcfs", num_scheduler_groups=1
     )
-    assert scheduler.kvcache_block_threshold == Backend.cache_manager.get_num_blocks()
+    assert (
+        scheduler.kvcache_block_threshold
+        == Backend.cache_managers["main"].get_num_blocks()
+    )
     task_ids = scheduler.schedule()
-    Backend.cache_manager.prepare_cache_decode(task_ids)
+    Backend.cache_managers["main"].prepare_cache_decode(task_ids)
     scheduler.update(task_ids)
     assert (
         scheduler.kvcache_block_threshold
-        == (Backend.cache_manager.get_num_blocks() // 2) // 2
+        == (Backend.cache_managers["main"].get_num_blocks() // 2) // 2
     )
     assert tasks[-1].task_type == TaskType.Prefill
     assert tasks[-2].task_type == TaskType.Prefill
@@ -966,10 +971,13 @@ def test_evict_decode_task():
         task._decode_status = TaskDecodeType.Stopped
     task_ids = [task.task_id for task in tasks]
     removed_task_ids, _ = scheduler.update(task_ids)
-    Backend.cache_manager.finalize_cache_all_decode(removed_task_ids)
+    Backend.cache_managers["main"].finalize_cache_all_decode(removed_task_ids)
     assert len(removed_task_ids) == 2
     assert len(TaskPool.pool) == 2
-    assert scheduler.kvcache_block_threshold == Backend.cache_manager.get_num_blocks()
+    assert (
+        scheduler.kvcache_block_threshold
+        == Backend.cache_managers["main"].get_num_blocks()
+    )
 
     # TaskPool: ['req_2':Prefill, 'req_3':Prefill]
     # num_free_blocks: 4
@@ -995,7 +1003,7 @@ def test_scheduler_group():
         need_ensure=False,
     )
     TaskPool.reset()
-    Backend.cache_manager = MockCacheManager(num_blocks=10, block_size=512)
+    Backend.cache_managers = {"main": MockCacheManager(num_blocks=10, block_size=512)}
     Backend.tokenizer = MockTokenizer()
 
     tasks = []
@@ -1132,7 +1140,7 @@ def test_slot_group_skew():
     )
 
     TaskPool.reset()
-    Backend.cache_manager = MockCacheManager(num_blocks=8, block_size=512)
+    Backend.cache_managers = {"main": MockCacheManager(num_blocks=8, block_size=512)}
     Backend.tokenizer = MockTokenizer()
 
     tasks = []
@@ -1266,7 +1274,9 @@ def test_pp_chunked_prefill():
         need_ensure=False,
     )
     TaskPool.reset()
-    Backend.cache_manager = MockCacheManager(num_blocks=10000, block_size=5120)
+    Backend.cache_managers = {
+        "main": MockCacheManager(num_blocks=10000, block_size=5120)
+    }
     Backend.executor = MockExecutor()
 
     for i in range(4):
