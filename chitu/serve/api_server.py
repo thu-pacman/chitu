@@ -33,7 +33,7 @@ from chitu.utils import gen_req_id
 from chitu.serve.event_loop import start_server_in_new_event_loop
 from chitu.serve.common import set_min_batch_size
 from chitu.serve.router import start_dp_components
-from chitu.tool_call import ToolChoice
+from chitu.tool_call import ToolChoice, ChoiceToolCall
 from chitu.serve.anthropic_api import create_router as create_anthropic_router
 
 logger = getLogger(__name__)
@@ -52,6 +52,8 @@ app = FastAPI()  # Unified API
 class Message(BaseModel):
     role: str = "user"
     content: str | list[str | dict] = "hello, who are you"
+    reasoning_content: str | None = None
+    tool_calls: list[ChoiceToolCall] = []
     tool_call_id: str | None = None  # useless, at least for qwen3
 
 
@@ -181,7 +183,7 @@ async def create_chat_completion(
 
     try:
         user_req = UserRequest(
-            req.messages,
+            [msg.model_dump() for msg in req.messages],
             req_id,
             tools=req.tools,
             tool_choice=req.tool_choice,

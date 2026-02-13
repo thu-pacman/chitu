@@ -34,6 +34,8 @@
   用法: 启动赤兔时追加 `models=DeepSeek-V3.1-Terminus` 启动参数
 - DeepSeek-V3.1-Terminus-int8-ascend
   用法: 启动赤兔时追加 `models=DeepSeek-V3.1-Terminus-int8-ascend` 启动参数
+- DeepSeek-V3.2
+  用法: 启动赤兔时追加 `models=DeepSeek-V3.2` 启动参数
 - DeepSeek-V3.2-Exp
   用法: 启动赤兔时追加 `models=DeepSeek-V3.2-Exp` 启动参数
 - DeepSeek-V3.2-Exp-kv-fp8

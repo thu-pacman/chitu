@@ -57,7 +57,14 @@ from chitu.quantization import (
     get_quant_from_checkpoint_prefix,
     utils,
 )
-from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF, Processor
+from chitu.tokenizer import (
+    ChatFormat,
+    ChatFormatHF,
+    ChatFormatHF_dsv32,
+    Tokenizer,
+    TokenizerHF,
+    Processor,
+)
 from chitu.utils import try_import_opt_dep
 from chitu.tool_call import get_tool_parser
 from chitu.constraint_decode import ConstraintDecodeManager
@@ -416,7 +423,11 @@ class Backend:
         Returns:
             Appropriate chat formatter instance
         """
-        if args.models.tokenizer_type == "hf":
+        tokenizer_type = args.models.tokenizer_type
+        chatformat_type = getattr(args.models, "chatformat_type", tokenizer_type)
+        if chatformat_type == "dsv32":
+            return ChatFormatHF_dsv32(Backend.tokenizer, Backend.processor)
+        elif chatformat_type == "hf":
             return ChatFormatHF(Backend.tokenizer, Backend.processor)
         else:
             return ChatFormat(Backend.tokenizer)
