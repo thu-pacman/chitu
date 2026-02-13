@@ -15,6 +15,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
+from chitu.cache_manager import KVCacheManagerBase
 from chitu.distributed.parallel_state import get_etp_size
 from chitu.global_vars import get_global_args
 from chitu.moe.impl import MoEImplEP, get_moe_impl
@@ -464,7 +465,7 @@ class TransformerQwen3VL(TransformerHFLlama):
     def __init__(
         self,
         params,
-        cache,
+        cache_managers: dict[str, KVCacheManagerBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -502,7 +503,7 @@ class TransformerQwen3VL(TransformerHFLlama):
 
         super().__init__(
             params,
-            cache,
+            cache_managers,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             attn_backend=attn_backend,
@@ -536,7 +537,9 @@ class TransformerQwen3VL(TransformerHFLlama):
     def _mm_cache_cleanup(self) -> None:
         """Drop multimodal caches for requests that are no longer active in KV cache."""
         try:
-            active = set(getattr(self.cache, "req_id_to_seq_len", {}).keys())
+            active = set(
+                getattr(self.cache_managers["main"], "req_id_to_seq_len", {}).keys()
+            )
         except Exception:
             return
         if not active:
@@ -622,7 +625,9 @@ class TransformerQwen3VL(TransformerHFLlama):
                 )
 
         # Reset per-request MRoPE state when a request is new in this step (old_len == 0).
-        old_lens = getattr(self.cache.seq_len_delta.old, "lens_list", None)
+        old_lens = getattr(
+            self.cache_managers["main"].seq_len_delta.old, "lens_list", None
+        )
         if old_lens is None or len(old_lens) != bsz:
             # Fallback: do not reset; still produce incremental ids best-effort.
             old_lens = [None] * bsz
@@ -782,7 +787,9 @@ class TransformerQwen3VL(TransformerHFLlama):
         rope_deltas = torch.zeros(
             (bsz, 1), device=input_ids_flat.device, dtype=input_ids_flat.dtype
         )
-        new_lens = getattr(self.cache.seq_len_delta.new, "lens_list", None)
+        new_lens = getattr(
+            self.cache_managers["main"].seq_len_delta.new, "lens_list", None
+        )
         if new_lens is None or len(new_lens) != bsz:
             new_lens = [None] * bsz
         for req_idx, rid in enumerate(curr_req_ids):
@@ -859,17 +866,23 @@ class TransformerQwen3VL(TransformerHFLlama):
         # During multimodal prefill we compute 3-axis (T/H/W) position ids; use them directly.
         if self._last_position_ids is not None:
             pos3 = self._last_position_ids.to(
-                self.cache.seq_len_delta.delta_position_ids_tensor_device.device
+                self.cache_managers[
+                    "main"
+                ].seq_len_delta.delta_position_ids_tensor_device.device
             ).view(3, 1, -1)
         else:
-            pos = self.cache.seq_len_delta.delta_position_ids_tensor_device
+            pos = self.cache_managers[
+                "main"
+            ].seq_len_delta.delta_position_ids_tensor_device
             # RoPE itself only depends on position ids (not tokens). For multimodal MRoPE, the "token index"
             # position ids in `cache.seq_len_delta` are not the final RoPE positions when vision tokens were
             # present in prefill (they are compressed/mapped). We therefore adjust position ids by a cached
             # per-request `rope_delta` so decode continues from the correct RoPE phase.
             # NOTE: decode batch membership can change across steps; use per-req mapping when available.
             if self._rope_delta_by_req:
-                curr_req_ids = getattr(self.cache, "curr_req_ids", None)
+                curr_req_ids = getattr(
+                    self.cache_managers["main"], "curr_req_ids", None
+                )
                 if (
                     curr_req_ids is not None
                     and pos.dim() == 1
@@ -906,9 +919,9 @@ class TransformerQwen3VL(TransformerHFLlama):
     ) -> tuple[tuple[torch.Tensor, ...], tuple[int, ...]]:
         # NOTE: Must always return the same number of extra inputs for a given captured graph.
         # We always pass a rope_delta tensor (zeros if not available) to keep the signature stable.
-        pos = self.cache.seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_managers["main"].seq_len_delta.delta_position_ids_tensor_device
         rope = torch.zeros_like(pos)
-        curr_req_ids = getattr(self.cache, "curr_req_ids", None)
+        curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
         if self._rope_delta_by_req:
             if curr_req_ids is None or len(curr_req_ids) != int(rope.numel()):
                 raise ValueError(
@@ -930,7 +943,7 @@ class TransformerQwen3VL(TransformerHFLlama):
         if len(extra_inputs) < 1:
             raise ValueError("Qwen3-VL decode graph requires rope_delta as extra input")
         rope_delta = extra_inputs[0]
-        pos = self.cache.seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_managers["main"].seq_len_delta.delta_position_ids_tensor_device
         pos = pos + rope_delta.to(device=pos.device, dtype=pos.dtype)
         pos3 = torch.stack([pos, pos, pos], dim=0).view(3, 1, -1)
 
@@ -948,9 +961,11 @@ class TransformerQwen3VL(TransformerHFLlama):
         self, tokens: torch.Tensor, batch_size: int
     ) -> tuple[tuple[torch.Tensor, ...], tuple[int, ...]]:
         # Keep CUDA-graph MTP decode signature stable: always pass a rope_delta tensor (zeros if not available).
-        pos = self.cache.mtp_seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_managers[
+            "main"
+        ].mtp_seq_len_delta.delta_position_ids_tensor_device
         rope = torch.zeros_like(pos)
-        curr_req_ids = getattr(self.cache, "curr_req_ids", None)
+        curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
         if self._rope_delta_by_req:
             if curr_req_ids is None or len(curr_req_ids) != int(rope.numel()):
                 raise ValueError(
@@ -972,7 +987,9 @@ class TransformerQwen3VL(TransformerHFLlama):
                 "Qwen3-VL MTP decode graph requires rope_delta as extra input"
             )
         rope_delta = extra_inputs[0]
-        pos = self.cache.mtp_seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_managers[
+            "main"
+        ].mtp_seq_len_delta.delta_position_ids_tensor_device
         pos = pos + rope_delta.to(device=pos.device, dtype=pos.dtype)
         pos3 = torch.stack([pos, pos, pos], dim=0).view(3, 1, -1)
 
@@ -989,12 +1006,18 @@ class TransformerQwen3VL(TransformerHFLlama):
     def prepare_freqs_cis_mtp(self) -> BatchedFreqsCis:
         if self._last_position_ids is not None:
             pos3 = self._last_position_ids.to(
-                self.cache.mtp_seq_len_delta.delta_position_ids_tensor_device.device
+                self.cache_managers[
+                    "main"
+                ].mtp_seq_len_delta.delta_position_ids_tensor_device.device
             ).view(3, 1, -1)
         else:
-            pos = self.cache.mtp_seq_len_delta.delta_position_ids_tensor_device
+            pos = self.cache_managers[
+                "main"
+            ].mtp_seq_len_delta.delta_position_ids_tensor_device
             if self._rope_delta_by_req:
-                curr_req_ids = getattr(self.cache, "curr_req_ids", None)
+                curr_req_ids = getattr(
+                    self.cache_managers["main"], "curr_req_ids", None
+                )
                 if (
                     curr_req_ids is not None
                     and pos.dim() == 1
@@ -1260,13 +1283,13 @@ class TransformerQwen3VL(TransformerHFLlama):
                 (torch.cat(v, dim=0) if len(v) > 0 else empty) for v in deepstack_chunks
             ]
 
-        curr_req_ids = getattr(self.cache, "curr_req_ids", None)
+        curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
         if curr_req_ids is None:
             curr_req_ids = []
         if len(curr_req_ids) > 0:
-            seq_ids = self.cache.seq_len_delta.delta_seq_ids_tensor_device.to(
-                device=input_ids_flat.device
-            )
+            seq_ids = self.cache_managers[
+                "main"
+            ].seq_len_delta.delta_seq_ids_tensor_device.to(device=input_ids_flat.device)
             if seq_ids.numel() != input_ids_flat.numel():
                 raise ValueError(
                     f"seq_ids length mismatch: seq_ids={seq_ids.numel()} tokens={input_ids_flat.numel()}"
@@ -1404,12 +1427,12 @@ class TransformerQwen3VL(TransformerHFLlama):
         # MRoPE position ids must be prepared before materializing cos/sin for prefill.
         # Chunked prefill can split vision blocks; use incremental chunk-aware MRoPE.
         if grid_thw is not None or video_grid_thw is not None:
-            curr_req_ids = getattr(self.cache, "curr_req_ids", None)
+            curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
             if curr_req_ids is None:
                 raise ValueError("cache.curr_req_ids is required for multimodal MRoPE")
-            seq_ids = self.cache.seq_len_delta.delta_seq_ids_tensor_device.to(
-                device=input_ids_flat.device
-            )
+            seq_ids = self.cache_managers[
+                "main"
+            ].seq_len_delta.delta_seq_ids_tensor_device.to(device=input_ids_flat.device)
             spatial_merge_size = int(self.vision_config.spatial_merge_size)
             pos_flat, rope_deltas = self._get_mrope_position_ids_chunked_flat(
                 input_ids_flat=input_ids_flat,
@@ -1561,7 +1584,7 @@ class TransformerBlockHFQwen3VLMoeText(TransformerBlockHFLlama):
         self,
         layer_id: int,
         args,
-        cache,
+        cache_managers: dict[str, KVCacheManagerBase],
         attn_backend,
         op_impl: str = "torch",
         rotary_type: str = "separated",
@@ -1570,7 +1593,7 @@ class TransformerBlockHFQwen3VLMoeText(TransformerBlockHFLlama):
         super().__init__(
             layer_id,
             args,
-            cache,
+            cache_managers,
             attn_backend=attn_backend,
             op_impl=op_impl,
             rotary_type=rotary_type,
@@ -1722,7 +1745,7 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
     def __init__(
         self,
         params,
-        cache,
+        cache_managers: dict[str, KVCacheManagerBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -1759,7 +1782,7 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
 
         super().__init__(
             params,
-            cache,
+            cache_managers,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             attn_backend=attn_backend,
@@ -1789,7 +1812,9 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
     def _mm_cache_cleanup(self) -> None:
         """Drop multimodal caches for requests that are no longer active in KV cache."""
         try:
-            active = set(getattr(self.cache, "req_id_to_seq_len", {}).keys())
+            active = set(
+                getattr(self.cache_managers["main"], "req_id_to_seq_len", {}).keys()
+            )
         except Exception:
             return
         if not active:
@@ -1974,15 +1999,15 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
         deepstack_image_embeds = None
         deepstack_video_embeds = None
 
-        curr_req_ids = getattr(self.cache, "curr_req_ids", None)
+        curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
         if curr_req_ids is None or len(curr_req_ids) <= 0:
             raise ValueError(
                 "cache.curr_req_ids is required for multimodal prefill (chunked-safe)."
             )
         curr_req_ids = cast(list[str], curr_req_ids)
-        seq_ids = self.cache.seq_len_delta.delta_seq_ids_tensor_device.to(
-            device=input_ids_flat.device
-        )
+        seq_ids = self.cache_managers[
+            "main"
+        ].seq_len_delta.delta_seq_ids_tensor_device.to(device=input_ids_flat.device)
 
         def _mm_prepare_cache(
             *,
@@ -2307,14 +2332,20 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
         # During multimodal prefill we compute 3-axis (T/H/W) position ids; use them directly.
         if self._last_position_ids is not None:
             pos3 = self._last_position_ids.to(
-                self.cache.seq_len_delta.delta_position_ids_tensor_device.device
+                self.cache_managers[
+                    "main"
+                ].seq_len_delta.delta_position_ids_tensor_device.device
             ).view(3, 1, -1)
         else:
-            pos = self.cache.seq_len_delta.delta_position_ids_tensor_device
+            pos = self.cache_managers[
+                "main"
+            ].seq_len_delta.delta_position_ids_tensor_device
             # vLLM parity: apply cached rope_delta for multimodal decode.
             # NOTE: decode batch membership can change across steps; use per-req mapping when available.
             if self._rope_delta_by_req:
-                curr_req_ids = getattr(self.cache, "curr_req_ids", None)
+                curr_req_ids = getattr(
+                    self.cache_managers["main"], "curr_req_ids", None
+                )
                 if (
                     curr_req_ids is not None
                     and pos.dim() == 1
@@ -2355,9 +2386,9 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
         self, tokens: torch.Tensor, batch_size: int
     ) -> tuple[tuple[torch.Tensor, ...], tuple[int, ...]]:
         # Keep CUDA-graph decode signature stable: always pass a rope_delta tensor (zeros if not available).
-        pos = self.cache.seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_managers["main"].seq_len_delta.delta_position_ids_tensor_device
         rope = torch.zeros_like(pos)
-        curr_req_ids = getattr(self.cache, "curr_req_ids", None)
+        curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
         if self._rope_delta_by_req:
             if curr_req_ids is None or len(curr_req_ids) != int(rope.numel()):
                 raise ValueError(
@@ -2380,7 +2411,7 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
                 "Qwen3-VL-MoE decode graph requires rope_delta as extra input"
             )
         rope_delta = extra_inputs[0]
-        pos = self.cache.seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_managers["main"].seq_len_delta.delta_position_ids_tensor_device
         pos = pos + rope_delta.to(device=pos.device, dtype=pos.dtype)
         pos3 = torch.stack([pos, pos, pos], dim=0).view(3, 1, -1)
 
@@ -2404,9 +2435,11 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
         self, tokens: torch.Tensor, batch_size: int
     ) -> tuple[tuple[torch.Tensor, ...], tuple[int, ...]]:
         # Keep CUDA-graph MTP decode signature stable: always pass a rope_delta tensor (zeros if not available).
-        pos = self.cache.mtp_seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_managers[
+            "main"
+        ].mtp_seq_len_delta.delta_position_ids_tensor_device
         rope = torch.zeros_like(pos)
-        curr_req_ids = getattr(self.cache, "curr_req_ids", None)
+        curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
         if self._rope_delta_by_req:
             if curr_req_ids is None or len(curr_req_ids) != int(rope.numel()):
                 raise ValueError(
@@ -2428,7 +2461,9 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
                 "Qwen3-VL-MoE MTP decode graph requires rope_delta as extra input"
             )
         rope_delta = extra_inputs[0]
-        pos = self.cache.mtp_seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_managers[
+            "main"
+        ].mtp_seq_len_delta.delta_position_ids_tensor_device
         pos = pos + rope_delta.to(device=pos.device, dtype=pos.dtype)
         pos3 = torch.stack([pos, pos, pos], dim=0).view(3, 1, -1)
 
@@ -2451,12 +2486,18 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
     def prepare_freqs_cis_mtp(self) -> BatchedFreqsCis:
         if self._last_position_ids is not None:
             pos3 = self._last_position_ids.to(
-                self.cache.mtp_seq_len_delta.delta_position_ids_tensor_device.device
+                self.cache_managers[
+                    "main"
+                ].mtp_seq_len_delta.delta_position_ids_tensor_device.device
             ).view(3, 1, -1)
         else:
-            pos = self.cache.mtp_seq_len_delta.delta_position_ids_tensor_device
+            pos = self.cache_managers[
+                "main"
+            ].mtp_seq_len_delta.delta_position_ids_tensor_device
             if self._rope_delta_by_req:
-                curr_req_ids = getattr(self.cache, "curr_req_ids", None)
+                curr_req_ids = getattr(
+                    self.cache_managers["main"], "curr_req_ids", None
+                )
                 if (
                     curr_req_ids is not None
                     and pos.dim() == 1

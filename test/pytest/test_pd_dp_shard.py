@@ -97,18 +97,20 @@ def test_pd_dp_shard_round_robin():
     )
 
     layer_map = GlobalLocalMap.from_range(0, 2)
-    Backend.cache_manager = PagedKVCacheManager(
-        layer_map,
-        num_hot_req=cfg.infer.max_reqs,
-        max_seq_len=cfg.infer.max_seq_len,
-        shape_per_token_dict={"kv_cache": torch.Size([2, 8])},
-        dtype_dict={"kv_cache": torch.float16},
-        n_local_kv_heads=2,
-        head_dim=8,
-        device="cpu",
-        block_size=16,
-        num_blocks=128,
-    )
+    Backend.cache_managers = {
+        "main": PagedKVCacheManager(
+            layer_map,
+            num_hot_req=cfg.infer.max_reqs,
+            max_seq_len=cfg.infer.max_seq_len,
+            shape_per_token_dict={"kv_cache": torch.Size([2, 8])},
+            dtype_dict={"kv_cache": torch.float16},
+            n_local_kv_heads=2,
+            head_dim=8,
+            device="cpu",
+            block_size=16,
+            num_blocks=128,
+        )
+    }
 
     TaskPool.reset()
 

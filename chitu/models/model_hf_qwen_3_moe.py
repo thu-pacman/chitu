@@ -9,6 +9,7 @@ import functools
 import torch
 
 from chitu.attn_backend import AttnBackend
+from chitu.cache_manager import KVCacheManagerBase
 from chitu.models.model import MoeGate, ParallelMoeBlock
 from chitu.models.model_hf_llama import TransformerBlockHFLlama, TransformerHFLlama
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
@@ -133,7 +134,7 @@ class TransformerBlockHFQwen3Moe(TransformerBlockHFLlama):
         self,
         layer_id: int,
         args,
-        cache,
+        cache_managers: dict[str, KVCacheManagerBase],
         attn_backend,
         op_impl="torch",
         rotary_type="separated",
@@ -157,7 +158,7 @@ class TransformerBlockHFQwen3Moe(TransformerBlockHFLlama):
         super().__init__(
             layer_id,
             args,
-            cache,
+            cache_managers,
             attn_backend=attn_backend,
             op_impl=op_impl,
             rotary_type=rotary_type,
@@ -174,7 +175,7 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
     def __init__(
         self,
         params,
-        cache,
+        cache_managers: dict[str, KVCacheManagerBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -187,7 +188,7 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
     ):
         super().__init__(
             params,
-            cache,
+            cache_managers,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             tensor_parallel_size=tensor_parallel_size,

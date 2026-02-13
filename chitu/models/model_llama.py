@@ -10,6 +10,7 @@ from torch import nn
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
+from chitu.cache_manager import KVCacheManagerBase
 from chitu.models.model import Attention, RMSNorm, Transformer, TransformerBlock
 from chitu.models.registry import ModelType, register_model
 from chitu.tensor_parallel import (
@@ -71,7 +72,7 @@ class TransformerLlama(Transformer):
     def __init__(
         self,
         params,
-        cache,
+        cache_managers: dict[str, KVCacheManagerBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -83,7 +84,7 @@ class TransformerLlama(Transformer):
     ):
         super().__init__(
             params,
-            cache,
+            cache_managers,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             tensor_parallel_size=tensor_parallel_size,
@@ -115,14 +116,16 @@ class TransformerLlama(Transformer):
             self.params.vocab_size, self.params.dim
         )
 
-    def _init_layers(self, cache, attn_backend, op_impl):
+    def _init_layers(
+        self, cache_managers: dict[str, KVCacheManagerBase], attn_backend, op_impl
+    ):
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
             self.layers.append(
                 TransformerBlockLlama(
                     layer_id,
                     self.params,
-                    cache,
+                    cache_managers,
                     attn_backend,
                     self.op_impl,
                     checkpoint_prefix=f"layers.{layer_id}",
@@ -192,11 +195,21 @@ class FeedForwardLlama(nn.Module):
 
 class TransformerBlockLlama(TransformerBlock):
     def __init__(
-        self, layer_id: int, args, cache, attn_backend, op_impl, checkpoint_prefix
+        self,
+        layer_id: int,
+        args,
+        cache_managers: dict[str, KVCacheManagerBase],
+        attn_backend,
+        op_impl,
+        checkpoint_prefix,
     ):
-        super().__init__(layer_id, args, cache, attn_backend, op_impl)
+        super().__init__(layer_id, args, cache_managers, attn_backend, op_impl)
         self.attention = AttentionLlama(
-            args, layer_id, cache, attn_backend, f"{checkpoint_prefix}.attention"
+            args,
+            layer_id,
+            cache_managers["main"],
+            attn_backend,
+            f"{checkpoint_prefix}.attention",
         )
         self.feed_forward = FeedForwardLlama(
             dim=args.dim,

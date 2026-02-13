@@ -231,11 +231,11 @@ class MetricsMonitor:
         scheduler = get_pd_scheduler_instance()
         if scheduler is None:
             return None
-        if Backend.cache_manager is None:
+        if Backend.cache_managers["main"] is None:
             return None
-        if not hasattr(Backend.cache_manager, "get_block_size"):
+        if not hasattr(Backend.cache_managers["main"], "get_block_size"):
             return None
-        block_size = Backend.cache_manager.get_block_size()
+        block_size = Backend.cache_managers["main"].get_block_size()
         if block_size <= 0:
             return None
         tokens_by_dp = getattr(

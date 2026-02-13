@@ -949,26 +949,26 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         self,
         layer_id: int,
         args,
-        cache,
+        cache_managers: dict[str, KVCacheManagerBase],
         attn_backend,
         op_impl,
         mla_absorb,
-        checkpoint_prefix="",
-        indexer_cache: Optional[KVCacheManagerBase] = None,
+        *,
+        checkpoint_prefix,
     ):
         super().__init__(
-            layer_id, args, cache, attn_backend=attn_backend, op_impl=op_impl
+            layer_id, args, cache_managers, attn_backend=attn_backend, op_impl=op_impl
         )
         self.layer_id = layer_id
         self.self_attn = AttentionDeepSeekV3(
             args,
             layer_id,
-            cache,
+            cache_managers["main"],
             attn_backend,
             op_impl=op_impl,
             mla_absorb=mla_absorb,
             checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
-            indexer_cache=indexer_cache,
+            indexer_cache=cache_managers.get("indexer", None),
         )
         base_moe_experts_class = None
         if op_impl == "muxi_custom_kernel":
@@ -1035,23 +1035,21 @@ class TransformerBlockDeepSeekV3MTP(TransformerBlockDeepSeekV3):
         self,
         layer_id: int,
         args,
-        cache,
+        cache_managers: dict[str, KVCacheManagerBase],
         attn_backend,
         op_impl,
         mla_absorb,
         *,
         checkpoint_prefix,
-        indexer_cache: Optional[KVCacheManagerBase] = None,
     ):
         super().__init__(
             layer_id,
             args,
-            cache,
+            cache_managers,
             attn_backend=attn_backend,
             op_impl=op_impl,
             mla_absorb=mla_absorb,
             checkpoint_prefix=checkpoint_prefix,
-            indexer_cache=indexer_cache,
         )
 
         self.enorm = RMSNorm(
@@ -1098,7 +1096,7 @@ class TransformerDeepSeekV3(Transformer):
     def __init__(
         self,
         params,
-        cache,
+        cache_managers: dict[str, KVCacheManagerBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -1106,13 +1104,11 @@ class TransformerDeepSeekV3(Transformer):
         attn_backend: AttnBackend,
         op_impl: str,
         mla_absorb: str,
-        indexer_cache: Optional[KVCacheManagerBase] = None,
     ):
         self.mla_absorb = mla_absorb
-        self.indexer_cache = indexer_cache
         super().__init__(
             params,
-            cache,
+            cache_managers,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             tensor_parallel_size=tensor_parallel_size,
@@ -1756,7 +1752,9 @@ class TransformerDeepSeekV3(Transformer):
         )
 
     @override
-    def _init_layers(self, cache, attn_backend, op_impl):
+    def _init_layers(
+        self, cache_managers: dict[str, KVCacheManagerBase], attn_backend, op_impl
+    ):
         self.layers = torch.nn.ModuleList()
         import resource
 
@@ -1770,12 +1768,11 @@ class TransformerDeepSeekV3(Transformer):
                     TransformerBlockDeepSeekV3(
                         layer_id,
                         self.params,
-                        cache,
+                        cache_managers,
                         attn_backend,
                         self.op_impl,
                         mla_absorb=self.mla_absorb,
                         checkpoint_prefix=f"layers.{layer_id}",
-                        indexer_cache=self.indexer_cache,
                     )
                 )
             else:
@@ -1783,12 +1780,11 @@ class TransformerDeepSeekV3(Transformer):
                     TransformerBlockDeepSeekV3MTP(
                         layer_id,
                         self.params,
-                        cache,
+                        cache_managers,
                         attn_backend,
                         self.op_impl,
                         mla_absorb=self.mla_absorb,
                         checkpoint_prefix=f"layers.{layer_id}",
-                        indexer_cache=self.indexer_cache,
                     )
                 )
 
@@ -1861,17 +1857,17 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def prepare_freqs_cis(self) -> BatchedFreqsCis:
-        index = self.cache.seq_len_delta.delta_position_ids_tensor_device
+        index = self.cache_managers[
+            "main"
+        ].seq_len_delta.delta_position_ids_tensor_device
         return BatchedFreqsCis(self.freqs_cis_real[index], self.freqs_cis_imag[index])
 
     @override
     def prepare_decoding_attn(self):
-        block_table = self.cache.get_gpu_block_table()
-        block_size = self.cache.get_block_size()
         self.attn_backend.prepare_metadata_for_decode(
-            self.cache.seq_len_delta,
-            block_table,
-            block_size,
+            self.cache_managers["main"].seq_len_delta,
+            self.cache_managers["main"].get_gpu_block_table(),
+            self.cache_managers["main"].get_block_size(),
             softmax_scale=compute_softmax_scale_deepseek_v3(self.params),
         )
 

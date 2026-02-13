@@ -9,6 +9,7 @@ from typing import Any, Mapping, Optional
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
+from chitu.cache_manager import KVCacheManagerBase
 from chitu.distributed.parallel_state import get_tp_group, get_tp_size
 from chitu.models.model import (
     RMSNorm,
@@ -33,12 +34,12 @@ from chitu.ops import (
     silu_and_mul,
     causal_conv1d_update,
     causal_conv1d_prefill,
+    rms_norm_gate,
+    fused_g,
 )
 from chitu.quantization import QuantizationRegistry
 from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear, LocalLinear
-from chitu.ops import rms_norm_gate
 from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
-from chitu.ops import fused_g
 
 
 class Qwen3NextRMSNorm(RMSNorm):
@@ -505,30 +506,29 @@ class TransformerBlockHFQwen3Next(TransformerBlock):
         self,
         layer_id: int,
         args,
-        cache,
+        cache_managers: dict[str, KVCacheManagerBase],
         attn_backend,
         op_impl,
         rotary_type="separated-half",
         mlp_type=ParallelMoeBlockQwen3Next,
         checkpoint_prefix="",
         attn_layer_type="linear_attention",
-        linear_attn_cache=None,
     ):
-        super().__init__(layer_id, args, cache, attn_backend, op_impl)
+        super().__init__(layer_id, args, cache_managers, attn_backend, op_impl)
 
         self.attn_layer_type = attn_layer_type
         if self.attn_layer_type == "linear_attention":
             self.linear_attn = Qwen3NextGatedDeltaNet(
                 args,
                 layer_id,
-                linear_attn_cache,
+                cache_managers["linear"],
                 checkpoint_prefix=f"{checkpoint_prefix}.linear_attn",
             )
         elif self.attn_layer_type == "full_attention":
             self.self_attn = AttentionQwen3Next(
                 args,
                 layer_id,
-                cache,
+                cache_managers["main"],
                 attn_backend,
                 rotary_type=rotary_type,
                 op_impl=op_impl,
@@ -559,7 +559,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
     def __init__(
         self,
         params,
-        cache,
+        cache_managers: dict[str, KVCacheManagerBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -568,7 +568,6 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
         rotary_type: str = "separated-half",
         layer_type: type = TransformerBlockHFQwen3Next,
         op_impl: str = "torch",
-        linear_attn_cache=None,
         **kvargs,
     ):
         self.attn_layer_types = [
@@ -579,11 +578,10 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
             )
             for layer_id in range(params.n_layers)
         ]
-        self.linear_attn_cache = linear_attn_cache
 
         super().__init__(
             params,
-            cache,
+            cache_managers,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             tensor_parallel_size=tensor_parallel_size,
@@ -594,20 +592,21 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
             **kvargs,
         )
 
-    def _init_layers(self, cache, attn_backend, op_impl):
+    def _init_layers(
+        self, cache_managers: dict[str, KVCacheManagerBase], attn_backend, op_impl
+    ):
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
             self.layers.append(
                 self.layer_type(
                     layer_id,
                     self.params,
-                    cache,
+                    cache_managers,
                     attn_backend=attn_backend,
                     op_impl=op_impl,
                     rotary_type=self.rotary_type,
                     checkpoint_prefix=f"layers.{layer_id}",
                     attn_layer_type=self.attn_layer_types[layer_id],
-                    linear_attn_cache=self.linear_attn_cache,
                 )
             )
 

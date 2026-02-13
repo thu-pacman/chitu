@@ -233,7 +233,7 @@ class PrometheusMetricsCollector:
     @classmethod
     def update_kvcache_usage(cls):
         """Update KV cache usage metrics."""
-        if Backend.cache_manager is None:
+        if Backend.cache_managers is None:
             return
 
         cls.update_GPU_usage()
@@ -243,8 +243,8 @@ class PrometheusMetricsCollector:
             return
 
         try:
-            num_blocks = Backend.cache_manager.get_num_blocks()
-            num_used_blocks = Backend.cache_manager.num_used_blocks
+            num_blocks = Backend.cache_managers["main"].get_num_blocks()
+            num_used_blocks = Backend.cache_managers["main"].num_used_blocks
 
             collector.total_blocks.labels(
                 rank=collector.rank, dp_id=collector.dp_id
@@ -260,7 +260,7 @@ class PrometheusMetricsCollector:
                 ).set(usage_ratio)
             else:
                 logger.error(
-                    f"Unexpected {type(Backend.cache_manager).__name__}.num_blocks({num_blocks}), update_kvcache_usage failed. "
+                    f"Unexpected {type(Backend.cache_managers['main']).__name__}.num_blocks({num_blocks}), update_kvcache_usage failed. "
                 )
         except Exception as e:
             logger.error(f"update_kvcache_usage failed: {e}")
@@ -268,7 +268,7 @@ class PrometheusMetricsCollector:
 
     @classmethod
     def update_GPU_usage(cls):
-        if Backend.cache_manager is None:
+        if Backend.cache_managers is None:
             return
 
         collector = cls.get_instance()
@@ -276,7 +276,7 @@ class PrometheusMetricsCollector:
             return
 
         try:
-            device = Backend.cache_manager.device
+            device = Backend.cache_managers["main"].device
             if (not isinstance(device, torch.device)) or (
                 isinstance(device, torch.device) and device.type != "cuda"
             ):

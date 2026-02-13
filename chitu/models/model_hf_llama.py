@@ -14,6 +14,7 @@ from torch import nn
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
+from chitu.cache_manager import KVCacheManagerBase
 from chitu.global_vars import get_global_args
 from chitu.models.model import (
     Attention,
@@ -363,7 +364,7 @@ class TransformerBlockHFLlama(TransformerBlock):
         self,
         layer_id: int,
         args,
-        cache,
+        cache_managers: dict[str, KVCacheManagerBase],
         attn_backend,
         op_impl,
         rotary_type="separated",
@@ -371,11 +372,11 @@ class TransformerBlockHFLlama(TransformerBlock):
         checkpoint_prefix="",
         attn_type=AttentionHFLlama,
     ):
-        super().__init__(layer_id, args, cache, attn_backend, op_impl)
+        super().__init__(layer_id, args, cache_managers, attn_backend, op_impl)
         self.self_attn = attn_type(
             args,
             layer_id,
-            cache,
+            cache_managers["main"],
             attn_backend,
             rotary_type=rotary_type,
             op_impl=op_impl,
@@ -416,7 +417,7 @@ class TransformerHFLlama(Transformer):
     def __init__(
         self,
         params,
-        cache,
+        cache_managers: dict[str, KVCacheManagerBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -432,7 +433,7 @@ class TransformerHFLlama(Transformer):
         self.layer_type = layer_type
         super().__init__(
             params,
-            cache,
+            cache_managers,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             tensor_parallel_size=tensor_parallel_size,
@@ -788,14 +789,16 @@ class TransformerHFLlama(Transformer):
             num_embeddings=self.params.vocab_size, embedding_dim=self.params.dim
         )
 
-    def _init_layers(self, cache, attn_backend, op_impl):
+    def _init_layers(
+        self, cache_managers: dict[str, KVCacheManagerBase], attn_backend, op_impl
+    ):
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
             self.layers.append(
                 self.layer_type(
                     layer_id,
                     self.params,
-                    cache,
+                    cache_managers,
                     attn_backend=attn_backend,
                     op_impl=op_impl,
                     rotary_type=self.rotary_type,
@@ -861,10 +864,14 @@ class TransformerHFLlama(Transformer):
     def prepare_freqs_cis(self) -> BatchedFreqsCis:
         return BatchedFreqsCis(
             self.rotary_emb.cos_cached[
-                self.cache.seq_len_delta.delta_position_ids_tensor_device
+                self.cache_managers[
+                    "main"
+                ].seq_len_delta.delta_position_ids_tensor_device
             ],
             self.rotary_emb.sin_cached[
-                self.cache.seq_len_delta.delta_position_ids_tensor_device
+                self.cache_managers[
+                    "main"
+                ].seq_len_delta.delta_position_ids_tensor_device
             ],
         )
 

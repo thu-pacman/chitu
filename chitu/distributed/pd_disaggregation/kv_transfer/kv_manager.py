@@ -512,7 +512,8 @@ class KVManager:
         if not batch:
             return 0
 
-        cache_manager = self.cache_manager or Backend.cache_manager
+        # FIXME: Other managers than "main"
+        cache_manager = self.cache_manager or Backend.cache_managers["main"]
         if cache_manager is None:
             # push back
             with self._pending_prepare_lock:

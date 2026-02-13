@@ -180,7 +180,7 @@ class Scheduler:
             else:
                 raise NotImplementedError(f"Scheduler type {st} not implemented")
 
-        self.kvcache_block_threshold = Backend.cache_manager.get_num_blocks()
+        self.kvcache_block_threshold = Backend.cache_managers["main"].get_num_blocks()
         self.is_warmup_stage = False
         self.has_schedule_overlap = get_global_args().infer.schedule_overlap
         self._pd_ready_exec_delays_ms: list[float] = []
@@ -188,7 +188,7 @@ class Scheduler:
         self._pd_ready_exec_log_interval_s = 5.0
 
     def reset_kvcache_block_threshold(self):
-        self.kvcache_block_threshold = Backend.cache_manager.get_num_blocks()
+        self.kvcache_block_threshold = Backend.cache_managers["main"].get_num_blocks()
 
     def start_warmup(self):
         self.is_warmup_stage = True
@@ -375,14 +375,14 @@ class Scheduler:
         # Check KVCacheManager's capacity
         #
         # NOTE: Please directly compute number of blocks here instead of getting from
-        # `Backend.cache_manager`, because here we may be scheduling for another rank.
+        # `Backend.cache_managers`, because here we may be scheduling for another rank.
         num_used_blocks = 0
         for task_id in TaskPool.pool.keys():
             task = TaskPool.pool[task_id]
             if task.dp_rank == self.dp_rank:
                 cur_blocks = ceil_div(
                     task.kv_cache_len_used_in_completed_steps,
-                    Backend.cache_manager.get_block_size(),
+                    Backend.cache_managers["main"].get_block_size(),
                 )
                 num_used_blocks += cur_blocks
         num_need_blocks = 0
@@ -396,11 +396,11 @@ class Scheduler:
             )
             cur_blocks = ceil_div(
                 task.kv_cache_len_used_in_completed_steps,
-                Backend.cache_manager.get_block_size(),
+                Backend.cache_managers["main"].get_block_size(),
             )
             target_blocks = ceil_div(
                 task.kv_cache_len_used_in_completed_steps_and_next_step,
-                Backend.cache_manager.get_block_size(),
+                Backend.cache_managers["main"].get_block_size(),
             )
             num_need_blocks += target_blocks - cur_blocks
             if num_used_blocks + num_need_blocks > self.kvcache_block_threshold:
@@ -409,7 +409,8 @@ class Scheduler:
 
         if (
             num_tasks == 0
-            and self.kvcache_block_threshold == Backend.cache_manager.get_num_blocks()
+            and self.kvcache_block_threshold
+            == Backend.cache_managers["main"].get_num_blocks()
             and num_used_blocks == 0
         ):
             prefix_len = TaskPool.pool[prefill_task_ids[0]].prefix_tokens_len
@@ -469,7 +470,7 @@ class Scheduler:
 
         def has_enough_block():
             # NOTE: Please directly compute number of blocks here instead of getting from
-            # `Backend.cache_manager`, because here we may be scheduling for another rank.
+            # `Backend.cache_managers`, because here we may be scheduling for another rank.
             num_need_blocks = 0
             for task_id in TaskPool.pool.keys():
                 task = TaskPool.pool[task_id]
@@ -486,13 +487,13 @@ class Scheduler:
                 else:
                     seq_len = 0
                 num_need_blocks += ceil_div(
-                    seq_len, Backend.cache_manager.get_block_size()
+                    seq_len, Backend.cache_managers["main"].get_block_size()
                 )
-            if num_need_blocks <= Backend.cache_manager.get_num_blocks():
+            if num_need_blocks <= Backend.cache_managers["main"].get_num_blocks():
                 return True
             logger.debug(
                 f"Cache manager has no more free blocks to support current decoding tasks: "
-                f"need {num_need_blocks} blocks in total, but only {Backend.cache_manager.get_num_blocks()} blocks in total."
+                f"need {num_need_blocks} blocks in total, but only {Backend.cache_managers['main'].get_num_blocks()} blocks in total."
             )
             return False
 
@@ -542,7 +543,7 @@ class Scheduler:
                 "task_id": task_id,
                 "event": "scheduler_task_evicted",
                 "kvcache_block_threshold": self.kvcache_block_threshold,
-                "total_blocks": Backend.cache_manager.get_num_blocks(),
+                "total_blocks": Backend.cache_managers["main"].get_num_blocks(),
             },
         )
 
@@ -613,7 +614,7 @@ class Scheduler:
             ):
                 task.finished_decode = True
                 removed_kvcache_task_ids.append(task_id)
-                num_total_blocks = Backend.cache_manager.get_num_blocks()
+                num_total_blocks = Backend.cache_managers["main"].get_num_blocks()
                 self.kvcache_block_threshold = num_total_blocks
                 logger.debug(
                     f"Task({task_id}) finished decoding, increasing kvcache_block_threshold to {self.kvcache_block_threshold}, while the number of total blocks is {num_total_blocks}"

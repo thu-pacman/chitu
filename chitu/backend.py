@@ -86,7 +86,7 @@ class Backend:
     # init once
     model = None
     tokenizer = None
-    cache_manager = None
+    cache_managers = None
     formatter = None
     processor = None
     args = None
@@ -108,7 +108,6 @@ class Backend:
 
     # mutable
     state = BackendState.Running
-    indexer_cache_manager = None
 
     # ---- MoE load balancer optional weight accessor ----
     # Provide a place to install a weight accessor from model/engine.
@@ -221,7 +220,7 @@ class Backend:
                 )
 
     @staticmethod
-    def build_model(args, cache, *extra_args, **extra_kwargs):
+    def build_model(args, cache_managers, *extra_args, **extra_kwargs):
         try:
             model_type = ModelType(args.type)
         except ValueError:
@@ -233,7 +232,7 @@ class Backend:
         model_cls = get_model_class(model_type)
         if args.name.startswith("glm"):
             extra_kwargs["rotary_type"] = "interleaved-half"
-        return model_cls(args, cache, *extra_args, **extra_kwargs)
+        return model_cls(args, cache_managers, *extra_args, **extra_kwargs)
 
     # FIXME: When cache type is "skew", gloo backend cannot be used.
     @staticmethod
@@ -785,8 +784,14 @@ class Backend:
     def _init_attention_backend(attn_backend_type):
         # Yes, use `type` instead of `isinstance` here, because `AttnBackend`s inherit each other
         if attn_backend_type is FlashInferBackend:
-            assert isinstance(Backend.cache_manager, PagedKVCacheManager)
-            return attn_backend_type(Backend.cache_manager.get_max_num_blocks())
+            max_num_blocks = 0
+            for mgr in Backend.cache_managers.values():
+                if not isinstance(mgr, PagedKVCacheManager):
+                    raise NotImplementedError(
+                        "`infer.attn_type=flash_infer` is only compatible with `infer.cache_type=paged`"
+                    )
+                max_num_blocks = max(max_num_blocks, mgr.get_max_num_blocks())
+            return attn_backend_type(max_num_blocks)
         else:
             return attn_backend_type()
 
@@ -953,49 +958,16 @@ class Backend:
         if args.models.type in ["deepseek-v3", "hf-qwen-3-moe"]:
             QuantizationRegistry._allowed_quant_for_merge_gate_up.append("blockfp4")
 
-        tensor_parallel_size = args.infer.tp_size
-        pipeline_parallel_size = args.infer.pp_size
-
-        if args.models.type == "hf-qwen3-next":
-            model = Backend.build_model(
-                args.models,
-                Backend.cache_manager,
-                max_position_embeddings=args.infer.max_seq_len,
-                pipeline_parallel_size=pipeline_parallel_size,
-                tensor_parallel_size=tensor_parallel_size,
-                attn_backend=attn_backend,
-                op_impl=args.infer.op_impl,
-                mla_absorb=args.infer.mla_absorb,
-                linear_attn_cache=Backend.linear_attn_cache_manager,
-            )
-        elif (
-            args.models.type == "deepseek-v3"
-            and Backend.indexer_cache_manager is not None
-        ):
-            model = Backend.build_model(
-                args.models,
-                Backend.cache_manager,
-                max_position_embeddings=args.infer.max_seq_len,
-                pipeline_parallel_size=pipeline_parallel_size,
-                tensor_parallel_size=tensor_parallel_size,
-                attn_backend=attn_backend,
-                op_impl=args.infer.op_impl,
-                mla_absorb=args.infer.mla_absorb,
-                indexer_cache=Backend.indexer_cache_manager,
-            )
-        else:
-            model = Backend.build_model(
-                args.models,
-                Backend.cache_manager,
-                max_position_embeddings=args.infer.max_seq_len,
-                pipeline_parallel_size=pipeline_parallel_size,
-                tensor_parallel_size=tensor_parallel_size,
-                attn_backend=attn_backend,
-                op_impl=args.infer.op_impl,
-                mla_absorb=args.infer.mla_absorb,
-            )
-
-        return model
+        return Backend.build_model(
+            args.models,
+            Backend.cache_managers,
+            max_position_embeddings=args.infer.max_seq_len,
+            pipeline_parallel_size=args.infer.pp_size,
+            tensor_parallel_size=args.infer.tp_size,
+            attn_backend=attn_backend,
+            op_impl=args.infer.op_impl,
+            mla_absorb=args.infer.mla_absorb,
+        )
 
     @staticmethod
     def _handle_quantized_weights_casting(checkpoint, args):
@@ -1367,25 +1339,31 @@ class Backend:
             )
 
             Backend.cache_type = args.infer.cache_type
-            Backend.cache_manager = Backend._init_cache_manager(
-                args,
-                attn_backend_type,
-                layer_filter_fn=filter_full_attn_layer,
-                num_blocks=num_full_attn_blocks,
-            )
-            Backend.linear_attn_cache_manager = Backend._init_linear_attn_cache_manager(
-                args,
-                layer_filter_fn=filter_linear_attn_layer,
-                num_blocks=num_linear_attn_blocks,
-            )
+            Backend.cache_managers = {
+                "main": Backend._init_cache_manager(
+                    args,
+                    attn_backend_type,
+                    layer_filter_fn=filter_full_attn_layer,
+                    num_blocks=num_full_attn_blocks,
+                ),
+                "linear": Backend._init_linear_attn_cache_manager(
+                    args,
+                    layer_filter_fn=filter_linear_attn_layer,
+                    num_blocks=num_linear_attn_blocks,
+                ),
+            }
         elif getattr(args.models, "type", "") == "deepseek-v3" and getattr(
             args.models, "index_head_dim", None
         ):
             Backend.cache_type = args.infer.cache_type
-            Backend.cache_manager = Backend._init_cache_manager(args, attn_backend_type)
-            Backend.indexer_cache_manager = Backend._init_indexer_cache_manager(args)
+            Backend.cache_managers = {
+                "main": Backend._init_cache_manager(args, attn_backend_type),
+                "indexer": Backend._init_indexer_cache_manager(args),
+            }
         else:
-            Backend.cache_manager = Backend._init_cache_manager(args, attn_backend_type)
+            Backend.cache_managers = {
+                "main": Backend._init_cache_manager(args, attn_backend_type)
+            }
             Backend.cache_type = args.infer.cache_type
 
         # Initialize attention backend
@@ -1412,7 +1390,7 @@ class Backend:
     @staticmethod
     def stop():
         setattr(Backend, "model", None)
-        setattr(Backend, "cache_manager", None)
+        setattr(Backend, "cache_managers", None)
         gc.collect()
         torch.cuda.empty_cache()
 

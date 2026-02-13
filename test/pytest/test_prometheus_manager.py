@@ -47,7 +47,7 @@ def run_PrometheusServerManager(rank, dp_id, result_queue, stop_event):
         mock_cache_manager = Monkcachemanager(num_blocks=100, num_free_blocks=50)
     else:
         mock_cache_manager = Monkcachemanager(num_blocks=100, num_free_blocks=20)
-    Backend.cache_manager = mock_cache_manager
+    Backend.cache_managers = {"main": mock_cache_manager}
 
     while not stop_event.is_set():
         if dp_id == 0:

@@ -230,7 +230,8 @@ class MooncakeKVTransferHook:
         # Receive KV cache from prefill side and insert into local engine.
         from chitu.backend import Backend  # local import to avoid cycles
 
-        cache_manager = self.kv_manager.cache_manager or Backend.cache_manager
+        # FIXME: Managers other than "main"
+        cache_manager = self.kv_manager.cache_manager or Backend.cache_managers["main"]
         if len(req_ids) == 0:
             return
         # Short-circuit if KV already present for all requests.

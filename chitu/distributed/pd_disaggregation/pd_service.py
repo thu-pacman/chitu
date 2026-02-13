@@ -272,24 +272,16 @@ class PDSchedulerService:
 
         # Set cache manager for KVManager so that PD path can access KV buffers
         if self.scheduler is not None:
-            self.scheduler.set_cache_manager(Backend.cache_manager)
-            # Qwen3-next: also register linear attention cache buffers for RDMA transfer
-            model_type = self.args.models.type
-            has_linear_cache = (
-                hasattr(Backend, "linear_attn_cache_manager")
-                and Backend.linear_attn_cache_manager is not None
-            )
-            logger.info(
-                f"[PD_SERVICE] linear cache check: model_type={model_type}, "
-                f"has_linear_cache={has_linear_cache}"
-            )
-            if model_type == "hf-qwen3-next" and has_linear_cache:
+            self.scheduler.set_cache_manager(Backend.cache_managers["main"])
+            if "linear" in Backend.cache_managers:
                 self.scheduler.set_linear_attn_cache_manager(
-                    Backend.linear_attn_cache_manager
+                    Backend.cache_managers["linear"]
                 )
-                logger.info(
-                    "[PD_SERVICE] linear attention cache manager set for scheduler"
-                )
+            for keys in Backend.cache_managers:
+                if keys not in {"main", "linear"}:
+                    raise NotImplementedError(
+                        f"cache manager {keys} is not supported for PD-disaggregation"
+                    )
 
         # Initialize DP token manager for streaming tokens back to Router
         # Only needed for Decode-only or Unified mode. Prefill-only does NOT send tokens.
@@ -535,7 +527,8 @@ async def start_pd_worker_service(args, rank: int = 0):
         disaggregation_mode=disaggregation_mode,
     )
 
-    kv_manager.cache_manager = Backend.cache_manager
+    # FIXME: Manager other than "main"
+    kv_manager.cache_manager = Backend.cache_managers["main"]
     kv_manager.register_buffer_to_engine()
     # Qwen3-next: register linear attention buffers for RDMA transfer
     model_type = args.models.type

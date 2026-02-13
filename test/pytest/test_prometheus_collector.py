@@ -110,7 +110,7 @@ def test_PrometheusMetricsCollector(rank, dp_id, monkeypatch):
 
     # test update_kvcache_usage
     mock_cache_manager = Monkcachemanager(num_blocks=100, num_free_blocks=50)
-    Backend.cache_manager = mock_cache_manager
+    Backend.cache_managers = {"main": mock_cache_manager}
     PrometheusMetricsCollector.update_kvcache_usage()
     samples = collector.kv_cache_usage.collect()[0].samples
     target_sample = None

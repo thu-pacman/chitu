@@ -155,12 +155,13 @@ def get_additional_block_num(cache_manager, memory_utilization=0.98):
 
 
 def _auto_set_num_blocks_after_warmup(args):
+    # FIXME: other managers than "main"
     if args.infer.cache_type == "paged" and args.infer.num_blocks == -1:
-        assert isinstance(Backend.cache_manager, PagedKVCacheManager)
+        assert isinstance(Backend.cache_managers["main"], PagedKVCacheManager)
         additional_blocks = get_additional_block_num(
-            Backend.cache_manager, args.infer.memory_utilization
+            Backend.cache_managers["main"], args.infer.memory_utilization
         )
-        new_num_block = Backend.cache_manager.num_blocks + additional_blocks
+        new_num_block = Backend.cache_managers["main"].num_blocks + additional_blocks
 
         if torch.distributed.get_world_size() > 1:
             new_num_block_tensor = torch.tensor(new_num_block).cuda()
@@ -171,7 +172,7 @@ def _auto_set_num_blocks_after_warmup(args):
 
         get_global_args().infer.num_blocks = new_num_block
         if new_num_block > 0:
-            Backend.cache_manager.realloc(new_num_block)
+            Backend.cache_managers["main"].realloc(new_num_block)
         if torch.distributed.get_rank() == 0:
             for scheduler in Backend.schedulers:
                 scheduler.reset_kvcache_block_threshold()
@@ -349,44 +350,32 @@ def _warmup_backend_direct(
         )
     seq_len_list = [1] * local_max_bs
     # Prefill
-    Backend.cache_manager.prepare_cache_prefill(req_ids, seq_len_list)
+    for mgr in Backend.cache_managers.values():
+        mgr.prepare_cache_prefill(req_ids, seq_len_list)
     PrometheusMetricsCollector.update_kvcache_usage()
 
     # decode_only 下，Decode 不需要跑 prefill；但需要把 cache 的 seq_len
     # 和 block_table 初始化到可 decode 的状态（否则后续 prepare_cache_decode 会找不到 req_id）
     # 仅做 cache prepare，避免 prefill 算子在 Decode 进程里被执行，从而触发所谓的“illegal memory access”
-    # bug 记录：不要在 warmup 里用 Backend.moe_impl（Backend没有这个字段）
     # MoE 的 task_type 需要设置在 moe_impl 上，否则 decode_only
     # 的 warmup 会在 MoE layer 里因为 task_type=None 触发 KeyError(None)
-    if get_global_args().models.type == "hf-qwen3-next":
-        Backend.linear_attn_cache_manager.prepare_cache_prefill(req_ids, seq_len_list)
-    if (
-        getattr(Backend, "indexer_cache_manager", None) is not None
-        and get_global_args().models.type == "deepseek-v3"
-    ):
-        Backend.indexer_cache_manager.prepare_cache_prefill(req_ids, seq_len_list)
 
     output_token_offsets = torch.arange(
         local_max_bs, dtype=torch.int32, device=tokens.device
     )
     if not skip_model_prefill:
         Backend.model.prefill(tokens, output_token_offsets)
-    Backend.cache_manager.finalize_cache_all_prefill()
+    for mgr in Backend.cache_managers.values():
+        mgr.finalize_cache_all_prefill()
     # Decode steps
     for i in tqdm(
         range(max(1, decode_steps)), desc="finished warmup decode iterations"
     ):
         curr_bs = local_max_bs - i * bs_descend
         curr_req_ids = req_ids[:curr_bs]
-        Backend.cache_manager.prepare_cache_decode(curr_req_ids)
+        for mgr in Backend.cache_managers.values():
+            mgr.prepare_cache_decode(curr_req_ids)
         PrometheusMetricsCollector.update_kvcache_usage()
-        if get_global_args().models.type == "hf-qwen3-next":
-            Backend.linear_attn_cache_manager.prepare_cache_decode(curr_req_ids)
-        if (
-            getattr(Backend, "indexer_cache_manager", None) is not None
-            and get_global_args().models.type == "deepseek-v3"
-        ):
-            Backend.indexer_cache_manager.prepare_cache_decode(curr_req_ids)
 
         # direct warmup 绕过了 executor，因此必须在这里显式设置
         if hasattr(Backend.model, "moe_impl") and Backend.model.moe_impl is not None:
@@ -408,24 +397,12 @@ def _warmup_backend_direct(
                 dtype=torch.get_default_dtype(),
             )
         _ = Backend.model.decode(step_token, curr_bs)
-        Backend.cache_manager.finalize_cache_single_decode(curr_req_ids)
-        if get_global_args().models.type == "hf-qwen3-next":
-            Backend.linear_attn_cache_manager.finalize_cache_single_decode(curr_req_ids)
-        if (
-            getattr(Backend, "indexer_cache_manager", None) is not None
-            and get_global_args().models.type == "deepseek-v3"
-        ):
-            Backend.indexer_cache_manager.finalize_cache_single_decode(curr_req_ids)
+        for mgr in Backend.cache_managers.values():
+            mgr.finalize_cache_single_decode(curr_req_ids)
     # Clean KV for this request
     for req_id in req_ids:
-        Backend.cache_manager.finalize_cache_all_decode(req_id)
-        if get_global_args().models.type == "hf-qwen3-next":
-            Backend.linear_attn_cache_manager.finalize_cache_all_decode(req_id)
-        if (
-            getattr(Backend, "indexer_cache_manager", None) is not None
-            and get_global_args().models.type == "deepseek-v3"
-        ):
-            Backend.indexer_cache_manager.finalize_cache_all_decode(req_id)
+        for mgr in Backend.cache_managers.values():
+            mgr.finalize_cache_all_decode(req_id)
     PrometheusMetricsCollector.update_kvcache_usage()
     logger.info("Local backend warmup (direct) completed")
 
