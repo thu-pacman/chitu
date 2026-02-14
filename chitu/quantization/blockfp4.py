@@ -35,6 +35,7 @@ from chitu.native_layout import (
     Packed4BitWeightNPUNative,
     LinearScaleToSwizzled,
 )
+from chitu.models.registry import ModelType
 from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
@@ -208,7 +209,7 @@ class Blockfp4LinearBase(QuantizedLinearBase):
 
         block_in, block_out = block_shape
         if (
-            get_global_args().models.type == "hf-llama"
+            get_global_args().models.type == ModelType.HF_LLAMA
             and get_global_args().infer.npu_fusion_fp4
         ):
             dtype = torch.bfloat16

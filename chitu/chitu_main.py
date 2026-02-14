@@ -31,6 +31,7 @@ from chitu.global_vars import (
     set_quant_variables,
     set_backend_variables,
 )
+from chitu.models.registry import ModelType
 from chitu.moe.load_balancer import get_moe_load_planner
 from chitu.scheduler import Scheduler
 from chitu.task import (
@@ -62,7 +63,6 @@ from chitu.metrics import (
     stop_metrics_monitor,
 )
 from chitu.distributed.comm_group import SingletonGroupPlaceholder
-
 from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
@@ -649,7 +649,10 @@ def chitu_init(args):
         elif (
             args.infer.attn_type == "npu"
             and args.infer.cache_type == "paged"
-            and (args.models.type is not None and args.models.type == "deepseek-v3")
+            and (
+                args.models.type is not None
+                and args.models.type == ModelType.DEEPSEEK_V3
+            )
         ):
             args.infer.use_cuda_graph = False
         else:

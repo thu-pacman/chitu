@@ -136,10 +136,11 @@ class TransformerBlockHFQwen3Moe(TransformerBlockHFLlama):
         args,
         cache_managers: dict[str, KVCacheManagerBase],
         attn_backend,
+        *,
         op_impl="torch",
         rotary_type="separated",
         mlp_type=ParallelMoeBlockQwen3,
-        checkpoint_prefix="",
+        checkpoint_prefix,
     ):
         base_moe_experts_class = None
         quant = get_quant_from_checkpoint_prefix(

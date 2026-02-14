@@ -254,6 +254,7 @@ class AttentionDeepSeekV3(Attention):
         attn_backend,
         op_impl: str,
         mla_absorb,
+        *,
         checkpoint_prefix: str,
         indexer_cache: Optional[KVCacheManagerBase] = None,
     ):

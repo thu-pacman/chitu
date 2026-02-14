@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import sys
 import inspect
 import logging
 from typing import Any, Dict, Set, Tuple
@@ -70,6 +71,23 @@ _FORMAT = (
 
 _DATE_FORMAT = "%m-%d %H:%M:%S"
 
+_COLORS = [
+    "\033[0;31m",  # Red (ID 0)
+    "\033[0;32m",  # Green (ID 1)
+    "\033[0;33m",  # Yellow (ID 2)
+    "\033[0;34m",  # Blue (ID 3)
+    "\033[0;35m",  # Magenta (ID 4)
+    "\033[0;36m",  # Cyan (ID 5)
+    "\033[1;31m",  # Bright Red/Bold Red (ID 6)
+    "\033[1;32m",  # Bright Green/Bold Green (ID 7)
+    "\033[1;33m",  # Bright Yellow/Bold Yellow (ID 8)
+    "\033[1;34m",  # Bright Blue/Bold Blue (ID 9)
+    "\033[1;35m",  # Bright Magenta/Bold Magenta (ID 10)
+    "\033[1;36m",  # Bright Cyan/Bold Cyan (ID 11)
+    "\033[1;37m",  # Bright White/Bold White (ID 12)
+]
+_RESET = "\033[0m"
+
 
 class ChituFormatter(logging.Formatter):
 
@@ -82,6 +100,8 @@ class ChituFormatter(logging.Formatter):
         if IS_DIST and dist.is_initialized():
             rank = dist.get_rank()
             record.rank = f"[Rank {rank}]"
+            if sys.stdout.isatty() and rank < len(_COLORS):
+                record.rank = _COLORS[rank] + record.rank + _RESET
         else:
             record.rank = ""
 

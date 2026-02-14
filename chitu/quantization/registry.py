@@ -8,6 +8,7 @@ import re
 import torch
 
 from chitu.global_vars import get_global_args
+from chitu.models.registry import ModelType
 from chitu.quantization.base import (
     QuantizedLinearBase,
     QuantizedMoeExpertsBase,
@@ -86,7 +87,7 @@ class QuantizationRegistry:
         if (
             has_torch_npu
             and (quant is None or can_use_mla_prologue_int8)
-            and args.models.type == "deepseek-v3"
+            and args.models.type == ModelType.DEEPSEEK_V3
             and getattr(args.models, "index_topk", None) is None
             and args.infer.mla_absorb == "absorb-without-precomp"
             and torch.get_default_dtype() == torch.bfloat16
