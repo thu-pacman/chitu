@@ -25,7 +25,7 @@ from chitu.models.model_hf_qwen2_vl import (
     VisionAttention as Qwen25VisionAttention,
     VisionRotaryEmbedding as Qwen25VisionRotaryEmbedding,
 )
-from chitu.models.model_hf_qwen_3_moe import Qwen3MoeGate
+from chitu.models.model_hf_qwen_3_moe import TransformerHFQwen3Moe
 from chitu.models.registry import ModelType, register_model
 from chitu.utils import try_import_opt_dep
 from chitu.quantization import get_quant_from_checkpoint_prefix, QuantizationRegistry
@@ -1529,219 +1529,8 @@ class TransformerQwen3VL(TransformerHFLlama):
 #
 
 
-class ParallelMoeBlockQwen3VLMoe(ParallelMoeBlock):
-    def __init__(
-        self,
-        args,
-        op_impl: str,
-        checkpoint_prefix: str,
-        *,
-        layer_id: int = 0,
-        **_: Any,
-    ):
-        # Inline experts construction: keep adapter strict & explicit.
-        quant = get_quant_from_checkpoint_prefix(
-            f"{checkpoint_prefix}.experts", args.quant_config.rules
-        )
-        if quant is not None:
-            raise NotImplementedError(
-                f"Qwen3-VL-MoE adapter currently supports quant=None only, got {quant}"
-            )
-        assert args.moe_intermediate_dim % get_etp_size() == 0
-        moe_impl = get_moe_impl()
-        if isinstance(moe_impl, MoEImplEP):
-            num_local_slots = moe_impl.load_balancer[layer_id].get_num_local_slots()
-            experts_start_idx = int(moe_impl.ep_group.rank_in_group) * num_local_slots
-            experts_end_idx = experts_start_idx + num_local_slots
-        else:
-            experts_start_idx = 0
-            experts_end_idx = args.num_experts
-        experts = NormalMoeExperts(
-            dim=args.dim,
-            moe_inter_dim=args.moe_intermediate_dim // get_etp_size(),
-            # Total number of routed experts in the model (global), used by MoE base classes.
-            global_n_experts=args.num_experts,
-            experts_start_idx=experts_start_idx,
-            experts_end_idx=experts_end_idx,
-            n_shared_experts=0,
-            n_activated_experts=0,
-            fuse_shared_experts=False,
-            checkpoint_prefix=f"{checkpoint_prefix}.experts.moe",
-            merge_gate_up=True,
-            dtype=torch.get_default_dtype(),
-        )
-        super().__init__(
-            gate=Qwen3MoeGate(args, op_impl),
-            experts=experts,
-            non_fused_shared_experts=None,
-            layer_id=layer_id,
-            checkpoint_prefix=checkpoint_prefix,
-        )
-
-
-class TransformerBlockHFQwen3VLMoeText(TransformerBlockHFLlama):
-    def __init__(
-        self,
-        layer_id: int,
-        args,
-        cache_managers: dict[str, KVCacheManagerBase],
-        attn_backend,
-        op_impl: str = "torch",
-        rotary_type: str = "separated",
-        checkpoint_prefix: str = "",
-    ):
-        super().__init__(
-            layer_id,
-            args,
-            cache_managers,
-            attn_backend=attn_backend,
-            op_impl=op_impl,
-            rotary_type=rotary_type,
-            mlp_type=lambda *a, **kw: ParallelMoeBlockQwen3VLMoe(
-                args,
-                op_impl=op_impl,
-                checkpoint_prefix=f"{checkpoint_prefix}.mlp",
-                layer_id=layer_id,
-            ),
-            checkpoint_prefix=checkpoint_prefix,
-        )
-
-
 @register_model(ModelType.HF_QWEN3_VL_MOE)
-class TransformerQwen3VLMoe(TransformerHFLlama):
-    def _get_2d_out_x_in_tensor_names(self, quant) -> list[str]:
-        """
-        Declare additional tensor *leaf names* that follow the out_x_in layout on the last 2 dims.
-
-        For Qwen3/Qwen3-VL MoE experts, the math layout matches `NormalMoeExperts`:
-          - gate_proj_weight / up_proj_weight / gate_up_proj_weight: [experts, out, in]
-          - down_proj_weight: [experts, out, in]
-        so TP sharding should use the generic out_x_in rule (chunk dim=-2 for cpl, dim=-1 for rpl).
-        """
-        base = super()._get_2d_out_x_in_tensor_names(quant)
-        # Keep the model-specific names here (not in the base sharding code) to avoid hardcoding in `model.py`.
-        return base + [
-            "gate_proj_weight",
-            "up_proj_weight",
-            "gate_up_proj_weight",
-            "down_proj_weight",
-        ]
-
-    def _get_2d_in_x_out_tensor_names(self, quant) -> list[str]:
-        """
-        Qwen3/Qwen3-VL MoE experts use flattened parameter names like:
-          - gate_proj_weight / up_proj_weight / gate_up_proj_weight / down_proj_weight
-        instead of the standard `.gate_proj.weight` style.
-
-        To keep TP sharding logic generic (no name special-casing in `model.py`), we extend
-        the "tensor_name" list for this model only, so those flattened names can be matched
-        as regular 2D/3D tensors and sharded on the last two dims.
-        """
-        base = super()._get_2d_in_x_out_tensor_names(quant)
-        # Reuse the base 2D out_x_in tensor name set (weight/scale/...) and generate MoE variants.
-        base_tn = super()._get_2d_out_x_in_tensor_names(quant)
-        extra: list[str] = []
-        for tn in set(base + base_tn):
-            extra.extend(
-                [
-                    f"gate_proj_{tn}",
-                    f"up_proj_{tn}",
-                    f"gate_up_proj_{tn}",
-                    f"down_proj_{tn}",
-                ]
-            )
-        return base + extra
-
-    def _process_state_dict_for_splitting_moe_gate_up(
-        self, checkpoint: dict[str, Any]
-    ) -> dict[str, Any]:
-        """
-        Split merged MoE experts gate_up tensors back into gate/up tensors before TP sharding.
-
-        Qwen3/Qwen3-VL MoE experts checkpoint keys may be:
-          - `...gate_proj_weight`, `...up_proj_weight`
-          - or merged `...gate_up_proj_weight` where gate/up are concatenated on the intermediate
-            (out) dimension.
-
-        The concatenation dimension depends on the tensor layout:
-        - checkpoint in_x_out: [..., dim, 2*moe_inter]  -> split on last dim (-1)
-        - runtime out_x_in:   [..., 2*moe_inter, dim]  -> split on -2
-
-        We split before TP sharding so that subsequent sharding can shard gate and up halves
-        independently (avoids a TP rank receiving only gate or only up).
-        """
-        dim = int(getattr(self.params, "dim"))
-        valid_tn_cache: dict[Any, set[str]] = {}
-
-        def _get_valid_tn(quant: Any) -> set[str]:
-            cached = valid_tn_cache.get(quant, None)
-            if cached is not None:
-                return cached
-            s = set(
-                self._get_2d_out_x_in_tensor_names(quant)
-                + self._get_2d_in_x_out_tensor_names(quant)
-                + self._get_1d_out_tensor_names(quant)
-            )
-            valid_tn_cache[quant] = s
-            return s
-
-        def _infer_split_dim(t: torch.Tensor) -> int | None:
-            """
-            Infer the concat dimension for gate_up tensors.
-
-            Return the dim to split on (either -1 or -2), or None if we cannot infer safely.
-            """
-            if t.dim() < 1:
-                return None
-            if t.dim() == 1:
-                # e.g. bias/scale-like tensors: [2*moe_inter]
-                return -1
-            # 2D/3D expert weights:
-            # - out_x_in: [..., 2*moe_inter, dim] -> split on -2
-            if t.shape[-1] == dim:
-                return -2
-            # - in_x_out: [..., dim, 2*moe_inter] -> split on -1
-            if t.shape[-2] == dim:
-                return -1
-            return None
-
-        keys = list(checkpoint.keys())
-        for k in keys:
-            leaf = k.split(".")[-1]
-            if not leaf.startswith("gate_up_proj_"):
-                continue
-
-            tn = leaf[
-                len("gate_up_proj_") :
-            ]  # e.g. "weight", "bias", "weight_scale_inv"
-            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-            if tn not in _get_valid_tn(quant):
-                continue
-
-            prefix = k[: -len(leaf)]
-            gate_k = prefix + "gate_proj_" + tn
-            up_k = prefix + "up_proj_" + tn
-            if gate_k in checkpoint or up_k in checkpoint:
-                continue
-
-            t = checkpoint.pop(k)
-            if t.dim() < 1 or t.shape[-1] == 1:
-                checkpoint[k] = t
-                continue
-            split_dim = _infer_split_dim(t)
-            if split_dim is None:
-                checkpoint[k] = t
-                continue
-            if t.shape[split_dim] % 2 != 0:
-                checkpoint[k] = t
-                continue
-
-            gate_t, up_t = torch.chunk(t, 2, dim=split_dim)
-            checkpoint[gate_k] = gate_t
-            checkpoint[up_k] = up_t
-
-        return checkpoint
-
+class TransformerQwen3VLMoe(TransformerHFQwen3Moe):
     def __init__(
         self,
         params,
@@ -1788,7 +1577,6 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
             attn_backend=attn_backend,
             op_impl=op_impl,
             rotary_type=rotary_type,
-            layer_type=TransformerBlockHFQwen3VLMoeText,
             **kvargs,
         )
 
@@ -1843,44 +1631,7 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
             ret += ["down_proj_weight"]
         return ret
 
-    @override
-    def process_state_dict_for_merging_gate_up(self, checkpoint: dict[str, Any]):
-        # Qwen3/Qwen3-VL MoE experts may use flattened 3D weights:
-        #   `...experts.gate_proj_weight` + `...experts.up_proj_weight`
-        # -> `...experts.gate_up_proj_weight`
-        #
-        # Keep the style consistent with other preprocessors: only merge when both tensors exist.
-        dim = int(getattr(self.params, "dim"))
-        checkpoint_keys = list(checkpoint.keys())
-        for k in checkpoint_keys:
-            if not k.endswith(".gate_proj_weight"):
-                continue
-            prefix = k[: -len("gate_proj_weight")]
-            up_key = prefix + "up_proj_weight"
-            out_key = prefix + "gate_up_proj_weight"
-            if up_key not in checkpoint:
-                continue
-            if out_key in checkpoint:
-                continue
-            if not QuantizationRegistry.allowed_merge_gate_up(out_key):
-                continue
-
-            gate_w = checkpoint.pop(k)
-            up_w = checkpoint.pop(up_key)
-            # `gate_up_proj_*` is a concatenation of gate and up on the intermediate(out) dim.
-            # Depending on when this preprocessor runs, weights can be:
-            # - checkpoint layout (in_x_out): [..., dim, moe_inter] -> concat on last dim (-1)
-            # - runtime layout (out_x_in):   [..., moe_inter, dim] -> concat on -2
-            cat_dim = gate_w.dim() - 1
-            if gate_w.dim() >= 2 and gate_w.shape[-1] == dim:
-                cat_dim = -2
-            checkpoint[out_key] = torch.cat([gate_w, up_w], dim=cat_dim)
-            del gate_w
-            del up_w
-
-        return super().process_state_dict_for_merging_gate_up(checkpoint)
-
-    def _process_state_dict_for_transposing_moe_expert_weights_from_checkpoint(
+    def _process_state_dict_for_transposing_moe_expert_weights(
         self, checkpoint: dict[str, Any]
     ) -> dict[str, Any]:
         """
@@ -1892,15 +1643,14 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
         dim = int(getattr(self.params, "dim"))
         keys = list(checkpoint.keys())
         for k in keys:
-            leaf = k.split(".")[-1]
-            if leaf not in (
-                "gate_up_proj_weight",
-                "gate_proj_weight",
-                "up_proj_weight",
-                "down_proj_weight",
-            ):
-                continue
             if ".mlp.experts." not in k:
+                continue
+            if k.split(".")[-2] not in (
+                "gate_up_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ):
                 continue
 
             t = checkpoint.get(k, None)
@@ -1908,7 +1658,7 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
                 continue
 
             # gate/up weights: want [..., *, dim] (out_x_in). checkpoint is often [..., dim, *].
-            if leaf != "down_proj_weight":
+            if k.split(".")[-2] != "down_proj":
                 if t.shape[-1] == dim:
                     continue  # already out_x_in
                 if t.shape[-2] == dim:
@@ -2542,12 +2292,11 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
         is_layerwise: bool = False,
         replace: bool = True,
     ) -> dict[str, Any]:
-        state_dict = self.process_state_dict_for_merging_experts(state_dict)
-        if not skip_preprocess and self.tensor_parallel_size > 1:
-            # IMPORTANT: split merged gate_up back to gate+up before TP sharding,
-            # then the base Transformer will shard, and finally `process_state_dict_for_merging_gate_up`
-            # can decide whether to merge them back.
-            state_dict = self._process_state_dict_for_splitting_moe_gate_up(state_dict)
+        if not skip_preprocess:
+            state_dict = self._process_state_dict_for_adding_dot_weight(state_dict)
+            state_dict = self._process_state_dict_for_transposing_moe_expert_weights(
+                state_dict
+            )
 
         return super().preprocess_state_dict_parallel(  # type: ignore[misc]
             state_dict,
@@ -2556,31 +2305,35 @@ class TransformerQwen3VLMoe(TransformerHFLlama):
             replace=replace,
         )
 
+    def _process_state_dict_for_adding_dot_weight(self, checkpoint: dict[str, Any]):
+        """
+        E.g. layers.42.mlp.experts.down_proj -> layers.42.mlp.experts.down_proj.weight
+
+        Although we will finally convert it to "_weight"-form, we first convert to
+        ".weight"-form to be compatible with TP-splitting logic.
+        """
+
+        for k in list(checkpoint.keys()):
+            parts = k.split(".")
+            if parts[-1] in ("gate_up_proj", "down_proj", "gate_proj", "up_proj"):
+                checkpoint[".".join(parts + ["weight"])] = checkpoint.pop(k)
+        return checkpoint
+
     @override
     def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
-        new_ckpt: dict[str, Any] = {}
-        for k, v in checkpoint.items():
-            if k.startswith("layers.") and ".mlp.experts." in k:
-                if k.endswith("_weight"):
-                    new_ckpt[k] = v
-                    continue
-                if not re.search(r"\\.experts\\.\\d+\\.", k):
-                    parts = k.split(".")
-                    if parts[-1] in (
-                        "gate_up_proj",
-                        "down_proj",
-                        "gate_proj",
-                        "up_proj",
-                    ):
-                        name = ".".join(parts[:-1] + [parts[-1] + "_weight"])
-                        new_ckpt[name] = v
-                        continue
-            new_ckpt[k] = v
-        return (
-            self._process_state_dict_for_transposing_moe_expert_weights_from_checkpoint(
-                new_ckpt
-            )
-        )
+        """
+        Qwen3-VL-235B-A22B-Instruct already has merged experts. The only thing we need
+        to do is to convert ".weight"-form to "_weight"-form, so as to be compatible
+        with `super().process_state_dict_for_merging_experts`.
+        """
+
+        for k in list(checkpoint.keys()):
+            parts = k.split(".")
+            if parts[-2] in ("gate_up_proj", "down_proj", "gate_proj", "up_proj"):
+                checkpoint[".".join(parts[:-2] + [parts[-2] + "_" + parts[-1]])] = (
+                    checkpoint.pop(k)
+                )
+        return checkpoint
 
     @override
     def _get_non_layer_prefix_mappings(self) -> list[tuple[str, str]]:
