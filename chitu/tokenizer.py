@@ -447,3 +447,29 @@ class ChatFormatHF:
                 tokens.extend(self.encode_message(message))
             tokens.extend(self.encode_header({"role": "assistant", "content": ""}))
             return tokens
+
+
+from chitu.encoding_dsv32 import encode_messages
+
+
+class ChatFormatHF_dsv32(ChatFormatHF):
+    def __init__(self, tokenizer: TokenizerHF, processor: Processor):
+        super().__init__(tokenizer, processor)
+
+    def encode_dialog_prompt(
+        self,
+        messages: Dialog,
+        chat_template_kwargs: Mapping[str, Any] = {},
+    ):
+        tools = chat_template_kwargs.get("tools", None)
+        if tools:
+            messages = [dict(role="system", tools=tools), *messages]
+        enable_thinking = chat_template_kwargs.get("enable_thinking", True)
+        thinking_mode = "thinking" if enable_thinking else "chat"
+        drop_thinking = messages[-1]["role"] == "user"
+        prompt = encode_messages(
+            messages=messages,
+            thinking_mode=thinking_mode,
+            drop_thinking=drop_thinking,
+        )
+        return self.tokenizer.encode(prompt, bos=False, eos=False)
