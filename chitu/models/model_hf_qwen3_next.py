@@ -167,10 +167,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         ]
 
         # [bsz/total_len, qkv_local_dim], [bsz/total_len, z_local_dim]
-        (qkv, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=-1)
+        qkv, z = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=-1)
 
         # [bsz/total_len, self.n_local_v_heads], [bsz/total_len, self.n_local_v_heads]
-        (b, a) = torch.split(mixed_ba, split_arg_list_ba, dim=-1)
+        b, a = torch.split(mixed_ba, split_arg_list_ba, dim=-1)
 
         z = z.reshape(
             z.size(0), -1, self.head_dim

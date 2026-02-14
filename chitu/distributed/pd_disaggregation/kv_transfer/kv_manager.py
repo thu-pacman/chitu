@@ -1445,7 +1445,7 @@ class KVManager:
             forward_ep = None
             while True:
                 try:
-                    (bootstrap_room, status_bytes) = self.server_socket.recv_multipart()
+                    bootstrap_room, status_bytes = self.server_socket.recv_multipart()
                     bootstrap_room = UUID(bytes=bootstrap_room)
                     status_str = status_bytes.decode("ascii")
                     # parse int if possible; fallback to enum name parsing
