@@ -614,7 +614,7 @@ class Backend:
         kv_cache_kvargs = {}
         quant_cfg = getattr(args.models, "quant_config", None)
 
-        if args.models.type == "deepseek-v3":
+        if args.models.type == ModelType.DEEPSEEK_V3:
             ds_fp8_quant = (
                 hasattr(quant_cfg, "kv_cache")
                 and getattr(quant_cfg.kv_cache, "type", None) == "fp8_pertoken_dsa"
@@ -770,7 +770,7 @@ class Backend:
                 return NpuAttnBackend
             elif args.infer.op_impl == "cpu":
                 return RefAttnBackend
-            elif "deepseek-v3" in args.models.type:
+            elif args.models.type == ModelType.DEEPSEEK_V3:
                 return FlashMLABackend
             else:
                 return HybridAttnBackend
@@ -835,7 +835,7 @@ class Backend:
                         param.data = param.data.cuda(non_blocking=non_blocking)
                         if (
                             Backend.args.models.type
-                            in ("hf-qwen3-vl", "hf-qwen3-vl-moe")
+                            in {ModelType.HF_QWEN3_VL, ModelType.HF_QWEN3_VL_MOE}
                             and not param.data.is_contiguous()
                         ):
                             param.data = param.data.contiguous()
@@ -855,10 +855,10 @@ class Backend:
                     ).contiguous()
                 else:
                     m._buffers[key] = buffer.cuda(non_blocking=non_blocking)
-                    if Backend.args.models.type in (
-                        "hf-qwen3-vl",
-                        "hf-qwen3-vl-moe",
-                    ) and (
+                    if Backend.args.models.type in {
+                        ModelType.HF_QWEN3_VL,
+                        ModelType.HF_QWEN3_VL_MOE,
+                    } and (
                         (buf_cuda := m._buffers[key]) is not None
                         and not buf_cuda.is_contiguous()
                     ):
@@ -966,7 +966,7 @@ class Backend:
         Returns:
             Initialized model architecture
         """
-        if args.models.type in ["deepseek-v3", "hf-qwen-3-moe"]:
+        if args.models.type in [ModelType.DEEPSEEK_V3, ModelType.HF_QWEN_3_MOE]:
             QuantizationRegistry._allowed_quant_for_merge_gate_up.append("blockfp4")
 
         return Backend.build_model(
@@ -1026,10 +1026,14 @@ class Backend:
         """
         start_time = time.time()
 
-        if args.models.type == "deepseek-v3" and args.models.quant_config.type in [
-            "gguf",
-            "q4km",
-        ]:
+        if (
+            args.models.type == ModelType.DEEPSEEK_V3
+            and args.models.quant_config.type
+            in [
+                "gguf",
+                "q4km",
+            ]
+        ):
             logger.info(f"loading gguf file : {args.models.ckpt_dir}")
             ds_gguf_loader = GGUFLoader(args.models.ckpt_dir)
             load_gguf_deepseek_v3_gguf(model, ds_gguf_loader, 10, args)
@@ -1038,7 +1042,7 @@ class Backend:
             quant_config = getattr(args.models, "quant_config", None)
             quant_name = getattr(quant_config, "name", None)
             quant_type = getattr(quant_config, "type", None)
-            if args.models.type == "llama":
+            if args.models.type == ModelType.LLAMA:
                 checkpoints = sorted(Path(args.models.ckpt_dir).glob("*.pth"))
                 assert (
                     len(checkpoints) > 0
@@ -1060,17 +1064,17 @@ class Backend:
                     GGUFLoader(args.models.ckpt_dir), len(model.layers)
                 )
             elif args.models.type in {
-                "hf-llama",
-                "hf-qwen-3-moe",
-                "hf-qwen3-vl",
-                "hf-qwen3-vl-moe",
-                "hf-glm-z1",
-                "hf-glm-4-moe",
-                "hf-gpt-oss",
-                "hf-mixtral",
-                "deepseek-v3",
-                "hf-qwen2-vl",
-                "hf-qwen3-next",
+                ModelType.HF_LLAMA,
+                ModelType.HF_QWEN_3_MOE,
+                ModelType.HF_QWEN3_VL,
+                ModelType.HF_QWEN3_VL_MOE,
+                ModelType.HF_GLM_Z1,
+                ModelType.HF_GLM_4_MOE,
+                ModelType.HF_GPT_OSS,
+                ModelType.HF_MIXTRAL,
+                ModelType.DEEPSEEK_V3,
+                ModelType.HF_QWEN2_VL,
+                ModelType.HF_QWEN3_NEXT,
             }:
                 if Backend._support_layerwise_loading():
                     checkpoint = Backend._load_hf_checkpoint_layerwise(model, args)
@@ -1117,16 +1121,18 @@ class Backend:
         def key_filter(k: str) -> bool:
             if (
                 is_ascend()
-                and args.models.type == "deepseek-v3"
+                and args.models.type == ModelType.DEEPSEEK_V3
                 and k.endswith(".weight_offset")
             ):
                 return False
-            if (
-                args.models.type in ["deepseek-v3", "hf-glm-4-moe"]
-                and f"model.layers.{args.models.n_layers}" in k
-                and args.infer.mtp_size == 1
-            ):
-                return False
+            if args.infer.mtp_size == 1:
+                if (
+                    args.models.type in [ModelType.DEEPSEEK_V3, ModelType.HF_GLM_4_MOE]
+                    and f"model.layers.{args.models.n_layers}" in k
+                ):
+                    return False
+                if args.models.type == ModelType.HF_QWEN3_NEXT and "mtp." in k:
+                    return False
             if args.models.quant_config.type == "blockfp4" and (
                 k.endswith(".k_scale") or k.endswith(".v_scale")
             ):
@@ -1222,7 +1228,8 @@ class Backend:
         for global_layer_id in tqdm(
             range(model.local_begin_layer_id, model.local_end_layer_id),
             disable=not is_print_rank,
-            desc="Model layer-wise loading",
+            desc="Model loading",
+            unit="layer",
             leave=False,
         ):
             checkpoint_prefix, model_prefix = model._get_layer_i_prefix_mapping(
@@ -1327,7 +1334,7 @@ class Backend:
         attn_backend_type = Backend._get_attention_backend_type(args)
 
         # Initialize cache manager
-        if args.models.type == "hf-qwen3-next":
+        if args.models.type == ModelType.HF_QWEN3_NEXT:
 
             def is_full_attention(layer_id):
                 return (layer_id + 1) % args.models.full_attention_interval == 0

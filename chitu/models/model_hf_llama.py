@@ -514,8 +514,6 @@ class TransformerHFLlama(Transformer):
                     if self.params.n_kv_heads is None
                     else self.params.n_kv_heads
                 )
-                # head_dim = self.params.dim // n_heads
-                # maybe fix?
                 head_dim = (
                     self.params.head_dim
                     if hasattr(self.params, "head_dim")

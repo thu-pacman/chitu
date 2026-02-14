@@ -79,7 +79,7 @@ class Qwen3NextRMSNormGated(nn.Module):
 
 
 class Qwen3NextGatedDeltaNet(nn.Module):
-    def __init__(self, args, layer_id, cache, checkpoint_prefix=""):
+    def __init__(self, args, layer_id, cache, *, checkpoint_prefix: str):
         super().__init__()
         self.dim = args.dim
         self.n_v_heads = args.linear_n_v_heads
@@ -91,17 +91,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.cache = cache
 
         tensor_parallel_size = get_tp_size()
-
         self.n_local_v_heads = self.n_v_heads // tensor_parallel_size
         self.n_local_qk_heads = self.n_qk_heads // tensor_parallel_size
 
         self.local_conv_dim = (
             self.n_local_qk_heads * 2 + self.n_local_v_heads
         ) * self.head_dim
-        self.local_qkvz_dim = (
-            self.n_local_qk_heads * 2 + self.n_local_v_heads * 2
-        ) * self.head_dim
-        self.local_ba_dim = self.n_local_v_heads * 2
+        self.qkvz_dim = (self.n_qk_heads * 2 + self.n_v_heads * 2) * self.head_dim
+        self.ba_dim = self.n_v_heads * 2
 
         self.conv1d = nn.Conv1d(
             in_channels=self.local_conv_dim,
@@ -121,37 +118,33 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
         )
 
-        self.in_proj_qkvz = LocalLinear(
+        self.in_proj_qkvz = ColumnParallelLinear(
             self.dim,
-            self.local_qkvz_dim,
+            self.qkvz_dim,
             has_bias=False,
+            gather_output=False,
             checkpoint_prefix=f"{checkpoint_prefix}.in_proj_qkvz",
         )
-        self.in_proj_ba = LocalLinear(
+        self.in_proj_ba = ColumnParallelLinear(
             self.dim,
-            self.local_ba_dim,
+            self.ba_dim,
             has_bias=False,
+            gather_output=False,
             checkpoint_prefix=f"{checkpoint_prefix}.in_proj_ba",
         )
 
         self.impl = args.linear_attention_impl
-        self.norm = Qwen3NextRMSNormGated(
-            self.head_dim,
-            args.norm_eps,
-        )
+        self.norm = Qwen3NextRMSNormGated(self.head_dim, args.norm_eps)
 
-        self.out_proj = LocalLinear(
-            self.n_local_v_heads * self.head_dim,
+        self.out_proj = RowParallelLinear(
+            self.n_v_heads * self.head_dim,
             self.dim,
             has_bias=False,
+            input_is_parallel=True,
             checkpoint_prefix=f"{checkpoint_prefix}.out_proj",
         )
 
-    def fix_qkvz_ba_ordering(
-        self,
-        mixed_qkvz,
-        mixed_ba,
-    ):
+    def fix_qkvz_ba_ordering(self, mixed_qkvz, mixed_ba):
         """
         Derives `q`, `k` and `v` tensors from `mixed_qkvzba`.
         """
@@ -286,10 +279,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], -1)
 
-        output = self.out_proj(core_attn_out)
-        if get_tp_size() > 1:
-            torch.distributed.all_reduce(output, group=get_tp_group().gpu_group)
-        return output
+        return self.out_proj(core_attn_out)
 
 
 class AttentionQwen3Next(AttentionHFLlama):
@@ -592,6 +582,16 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
             **kvargs,
         )
 
+    def _get_tensor_column_parallel_layer_names(self) -> list[str]:
+        ret = super()._get_tensor_column_parallel_layer_names()
+        ret += ["attn_gate"]
+        return ret
+
+    def _get_tensor_row_parallel_layer_names(self) -> list[str]:
+        ret = super()._get_tensor_row_parallel_layer_names()
+        ret += ["out_proj"]
+        return ret
+
     def _init_layers(
         self, cache_managers: dict[str, KVCacheManagerBase], attn_backend, op_impl
     ):
@@ -663,29 +663,14 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
 
         return checkpoint
 
-    def qwen_next_chunk_checkpoint_for_tensor_parallel_direct(
+    def chunk_checkpoint_for_tensor_parallelize_attn_weights(
         self, checkpoint, rank, world_size
     ):
-        col_parallel_names = [
-            ".A_log",
-            ".dt_bias",
-            ".attn_gate.weight",
-        ]
-        row_parallel_names = [
-            ".out_proj.weight",
-        ]
-        if self.params.quant_config["type"] == "blockfp8":
-            col_parallel_names.append(".attn_gate.weight_scale_inv")
-            row_parallel_names.append(".out_proj.weight_scale_inv")
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
-            if any(k.endswith(name) for name in col_parallel_names):
+            if any(k.endswith(name) for name in [".A_log", ".dt_bias"]):
                 assert checkpoint[k].shape[0] % world_size == 0
                 chunks = torch.chunk(checkpoint[k], world_size, dim=0)
-                checkpoint[k] = chunks[rank]
-            if any(k.endswith(name) for name in row_parallel_names):
-                assert checkpoint[k].shape[1] % world_size == 0
-                chunks = torch.chunk(checkpoint[k], world_size, dim=1)
                 checkpoint[k] = chunks[rank]
         return checkpoint
 
@@ -785,7 +770,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
         if not skip_preprocess:
             state_dict = self.process_state_dict_for_splitting_q_gate(state_dict)
             if self.tensor_exec:
-                state_dict = self.qwen_next_chunk_checkpoint_for_tensor_parallel_direct(
+                state_dict = self.chunk_checkpoint_for_tensor_parallelize_attn_weights(
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )
             state_dict = (
@@ -793,12 +778,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )
             )
-            state_dict_keys = list(state_dict.keys())
-            for k in state_dict_keys:
-                if k.startswith("mtp."):
-                    del state_dict[k]
-            state_dict_keys = list(state_dict.keys())
-            for k in state_dict_keys:
+            for k in list(state_dict.keys()):
                 v = state_dict.pop(k)
                 new_k = k
                 new_k = new_k.replace(".shared_expert.", ".shared_experts.body.")
