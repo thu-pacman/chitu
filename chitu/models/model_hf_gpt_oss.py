@@ -461,6 +461,11 @@ class TransformerHFGptOss(TransformerHFLlama):
         return new_checkpoint
 
     @override
+    def process_state_dict_for_splitting_gate_up(self, checkpoint: dict[str, Any]):
+        # Disable super class's function
+        return checkpoint
+
+    @override
     def process_state_dict_for_merging_gate_up(self, checkpoint: dict[str, Any]):
         # TODO: skip merging gate up here, probably need merging in cuda implement
         return checkpoint

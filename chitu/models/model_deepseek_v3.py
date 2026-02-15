@@ -1578,13 +1578,12 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def process_state_dict_for_merging_qkv(self, checkpoint: dict[str, Any]):
-        checkpoint_keys = list(checkpoint.keys())
-        for k in checkpoint_keys:
+        def enable_callback(k: str):
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             layer_id = get_layer_id_from_checkpoint_prefix(
                 k, self.params.quant_config.rules
             )
-            if not QuantizationRegistry.allowed_merge_qkv(
+            return QuantizationRegistry.allowed_merge_qkv(
                 k,
                 (
                     (
@@ -1594,116 +1593,23 @@ class TransformerDeepSeekV3(Transformer):
                     if layer_id > -1
                     else False
                 ),
-            ):
-                continue
-            # Cat dim 0
-            elif any(
-                k.endswith(f".q_a_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
-                + self._get_1d_out_tensor_names(quant)
-            ):
-                tensor_name = k.split(".")[-1]
-                prefix = k[: -len(f".q_a_proj.{tensor_name}")]
-                assert f"{prefix}.kv_a_proj_with_mqa.{tensor_name}" in checkpoint
-                q_weight = checkpoint.pop(f"{prefix}.q_a_proj.{tensor_name}")
-                kv_weight = checkpoint.pop(f"{prefix}.kv_a_proj_with_mqa.{tensor_name}")
-                checkpoint[f"{prefix}.wqkv_a.{tensor_name}"] = torch.cat(
-                    [q_weight, kv_weight], dim=0
-                )
-                del q_weight
-                del kv_weight
-            elif any(
-                k.endswith(f".kv_a_proj_with_mqa.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
-                + self._get_1d_out_tensor_names(quant)
-            ):
-                continue
+            )
 
-            # Cat dim 1
-            elif any(
-                k.endswith(f".q_a_proj.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
-            ):
-                tensor_name = k.split(".")[-1]
-                prefix = k[: -len(f".q_a_proj.{tensor_name}")]
-                assert f"{prefix}.kv_a_proj_with_mqa.{tensor_name}" in checkpoint
-                q_weight = checkpoint.pop(f"{prefix}.q_a_proj.{tensor_name}")
-                kv_weight = checkpoint.pop(f"{prefix}.kv_a_proj_with_mqa.{tensor_name}")
-                checkpoint[f"{prefix}.wqkv_a.{tensor_name}"] = torch.cat(
-                    [q_weight, kv_weight], dim=1
-                )
-                del q_weight
-                del kv_weight
-            elif any(
-                k.endswith(f".kv_a_proj_with_mqa.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
-            ):
-                continue
-
-            # Unchanged tensors
-            else:
-                continue
-
-        return checkpoint
+        return self.process_state_dict_for_merging_tensors(
+            checkpoint,
+            tgt_layer="wqkv_a",
+            src_layers=["q_a_proj", "kv_a_proj_with_mqa"],
+            enable_callback=enable_callback,
+        )
 
     @override
     def process_state_dict_for_merging_gate_up(self, checkpoint: dict[str, Any]):
-        checkpoint_keys = list(checkpoint.keys())
-        for k in checkpoint_keys:
-            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-            if not QuantizationRegistry.allowed_merge_gate_up(k):
-                continue
-            # Cat dim 0
-            elif any(
-                k.endswith(f".gate_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
-                + self._get_1d_out_tensor_names(quant)
-            ):
-                tensor_name = k.split(".")[-1]
-                prefix = k[: -len(f".gate_proj.{tensor_name}")]
-                assert f"{prefix}.up_proj.{tensor_name}" in checkpoint
-                assert f"{prefix}.gate_up_proj.{tensor_name}" not in checkpoint
-                gate_weight = checkpoint.pop(f"{prefix}.gate_proj.{tensor_name}")
-                up_weight = checkpoint.pop(f"{prefix}.up_proj.{tensor_name}")
-                checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = torch.cat(
-                    [gate_weight, up_weight], dim=0
-                )
-                del gate_weight
-                del up_weight
-            elif any(
-                k.endswith(f".up_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
-                + self._get_1d_out_tensor_names(quant)
-            ):
-                continue
-
-            # Cat dim 1
-            elif any(
-                k.endswith(f".gate_proj.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
-            ):
-                tensor_name = k.split(".")[-1]
-                prefix = k[: -len(f".gate_proj.{tensor_name}")]
-                assert f"{prefix}.up_proj.{tensor_name}" in checkpoint
-                assert f"{prefix}.gate_up_proj.{tensor_name}" not in checkpoint
-                gate_weight = checkpoint.pop(f"{prefix}.gate_proj.{tensor_name}")
-                up_weight = checkpoint.pop(f"{prefix}.up_proj.{tensor_name}")
-                checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = torch.cat(
-                    [gate_weight, up_weight], dim=1
-                )
-                del gate_weight
-                del up_weight
-            elif any(
-                k.endswith(f".up_proj.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
-            ):
-                continue
-
-            # Unchanged tensors
-            else:
-                continue
-
-        return checkpoint
+        return self.process_state_dict_for_merging_tensors(
+            checkpoint,
+            tgt_layer="gate_up_proj",
+            src_layers=["gate_proj", "up_proj"],
+            enable_callback=QuantizationRegistry.allowed_merge_gate_up,
+        )
 
     @override
     def preprocess_state_dict_parallel(
