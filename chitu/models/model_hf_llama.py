@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+from collections import OrderedDict
 from logging import getLogger
 from typing import Any
 from typing_extensions import override
@@ -490,216 +491,56 @@ class TransformerHFLlama(Transformer):
     def _get_layer_i_prefix_mapping(self, i: int) -> tuple[str, str]:
         return (f"model.layers.{i}.", f"layers.{i}.")
 
-    def _process_state_dict_for_splitting_qkv(self, checkpoint: dict[str, Any]):
-        checkpoint_keys = list(checkpoint.keys())
-        for k in checkpoint_keys:
-            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-            if any(
-                k.endswith(f".qkv_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
-                + self._get_1d_out_tensor_names(quant)
-            ):
-                tensor_name = k.split(".")[-1]
-                prefix = k[: -len(f"qkv_proj.{tensor_name}")]
-                assert prefix + f"q_proj.{tensor_name}" not in checkpoint
-                assert prefix + f"k_proj.{tensor_name}" not in checkpoint
-                assert prefix + f"v_proj.{tensor_name}" not in checkpoint
-                qkv_weight = checkpoint.pop(k)
-                if len(qkv_weight.shape) < 1 or qkv_weight.shape[0] == 1:
-                    checkpoint[k] = qkv_weight
-                    continue
-                n_heads = self.params.n_heads
-                n_kv_heads = (
-                    self.params.n_heads
-                    if self.params.n_kv_heads is None
-                    else self.params.n_kv_heads
-                )
-                head_dim = (
-                    self.params.head_dim
-                    if hasattr(self.params, "head_dim")
-                    else self.params.dim // n_heads
-                )
+    @override
+    def process_state_dict_for_splitting_qkv(self, checkpoint: dict[str, Any]):
+        n_heads = self.params.n_heads
+        n_kv_heads = (
+            self.params.n_heads
+            if self.params.n_kv_heads is None
+            else self.params.n_kv_heads
+        )
+        head_dim = (
+            self.params.head_dim
+            if hasattr(self.params, "head_dim")
+            else self.params.dim // n_heads
+        )
+        return self.process_state_dict_for_splitting_tensors(
+            checkpoint,
+            "qkv_proj",
+            tgt_layer_to_proportion=OrderedDict(
+                [("q_proj", n_heads), ("k_proj", n_kv_heads), ("v_proj", n_kv_heads)]
+            ),
+        )
 
-                q_weight, k_weight, v_weight = qkv_weight.split(
-                    [
-                        n_heads * head_dim,
-                        n_kv_heads * head_dim,
-                        n_kv_heads * head_dim,
-                    ],
-                    dim=0,
-                )
-                checkpoint[prefix + f"q_proj.{tensor_name}"] = q_weight
-                checkpoint[prefix + f"k_proj.{tensor_name}"] = k_weight
-                checkpoint[prefix + f"v_proj.{tensor_name}"] = v_weight
-            else:
-                continue
-        return checkpoint
-
-    def _process_state_dict_for_splitting_gate_up(self, checkpoint: dict[str, Any]):
-        checkpoint_keys = list(checkpoint.keys())
-        for k in checkpoint_keys:
-            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-
-            _2d_out_x_in_tensor_names = self._get_2d_out_x_in_tensor_names(quant)
-            _2d_in_x_out_tensor_names = self._get_2d_in_x_out_tensor_names(quant)
-            _1d_out_tensor_names = self._get_1d_out_tensor_names(quant)
-            all_tensor_names = (
-                _2d_out_x_in_tensor_names
-                + _2d_in_x_out_tensor_names
-                + _1d_out_tensor_names
-            )
-
-            if any(
-                k.endswith(f".gate_up_proj.{tensor_name}")
-                for tensor_name in all_tensor_names
-            ):
-                tensor_name = k.split(".")[-1]
-                prefix = k[: -len(f"gate_up_proj.{tensor_name}")]
-                assert prefix + f"gate_proj.{tensor_name}" not in checkpoint
-                assert prefix + f"up_proj.{tensor_name}" not in checkpoint
-                gate_up_weight = checkpoint.pop(k)
-                if tensor_name in _2d_out_x_in_tensor_names:
-                    split_dim = -2
-                elif tensor_name in _2d_in_x_out_tensor_names + _1d_out_tensor_names:
-                    split_dim = -1
-                else:
-                    assert False
-                if gate_up_weight.shape[split_dim] == 1:
-                    checkpoint[k] = gate_up_weight
-                    continue
-                gate_weight, up_weight = torch.chunk(gate_up_weight, 2, dim=split_dim)
-                checkpoint[prefix + f"gate_proj.{tensor_name}"] = gate_weight
-                checkpoint[prefix + f"up_proj.{tensor_name}"] = up_weight
-            else:
-                continue
-        return checkpoint
+    @override
+    def process_state_dict_for_splitting_gate_up(self, checkpoint: dict[str, Any]):
+        return self.process_state_dict_for_splitting_tensors(
+            checkpoint,
+            "gate_up_proj",
+            equally_split_tgt_layers=["gate_proj", "up_proj"],
+        )
 
     @override
     def process_state_dict_for_merging_qkv(self, checkpoint: dict[str, Any]):
-        checkpoint_keys = list(checkpoint.keys())
-        for k in checkpoint_keys:
-            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-            if not QuantizationRegistry.allowed_merge_qkv(k):
-                continue
-            # Cat dim 0
-            elif any(
-                k.endswith(f".q_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
-                + self._get_1d_out_tensor_names(quant)
-            ):
-                tensor_name = k.split(".")[-1]
-                prefix = k[: -len(f".q_proj.{tensor_name}")]
-                assert f"{prefix}.k_proj.{tensor_name}" in checkpoint
-                assert f"{prefix}.v_proj.{tensor_name}" in checkpoint
-                q_weight = checkpoint.pop(f"{prefix}.q_proj.{tensor_name}")
-                k_weight = checkpoint.pop(f"{prefix}.k_proj.{tensor_name}")
-                v_weight = checkpoint.pop(f"{prefix}.v_proj.{tensor_name}")
-                # For MixQ quantized models, q/k/v share the same fp_idx
-                merged_weight = (
-                    q_weight
-                    if tensor_name == "fp_idx"
-                    else torch.cat([q_weight, k_weight, v_weight], dim=0)
-                )
-                checkpoint[f"{prefix}.qkv_proj.{tensor_name}"] = merged_weight
-            elif any(
-                k.endswith(f".k_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
-                + self._get_1d_out_tensor_names(quant)
-            ):
-                continue
-            elif any(
-                k.endswith(f".v_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
-                + self._get_1d_out_tensor_names(quant)
-            ):
-                continue
-
-            # Cat dim 1
-            elif any(
-                k.endswith(f".q_proj.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
-            ):
-                tensor_name = k.split(".")[-1]
-                prefix = k[: -len(f".q_proj.{tensor_name}")]
-                assert f"{prefix}.k_proj.{tensor_name}" in checkpoint
-                assert f"{prefix}.v_proj.{tensor_name}" in checkpoint
-                q_weight = checkpoint.pop(f"{prefix}.q_proj.{tensor_name}")
-                k_weight = checkpoint.pop(f"{prefix}.k_proj.{tensor_name}")
-                v_weight = checkpoint.pop(f"{prefix}.v_proj.{tensor_name}")
-                checkpoint[f"{prefix}.qkv_proj.{tensor_name}"] = torch.cat(
-                    [q_weight, k_weight, v_weight], dim=1
-                )
-                del q_weight
-                del k_weight
-                del v_weight
-            elif any(
-                k.endswith(f".k_proj.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
-            ):
-                continue
-            elif any(
-                k.endswith(f".v_proj.{tensor_name}")
-                for tensor_name in self._get_2d_in_x_out_tensor_names(quant)
-            ):
-                continue
-
-            # Unchanged tensors
-            else:
-                continue
-        return checkpoint
+        return self.process_state_dict_for_merging_tensors(
+            checkpoint,
+            tgt_layer="qkv_proj",
+            src_layers=["q_proj", "k_proj", "v_proj"],
+            enable_callback=QuantizationRegistry.allowed_merge_qkv,
+        )
 
     @override
     def process_state_dict_for_merging_gate_up(self, checkpoint: dict[str, Any]):
-        checkpoint_keys = list(checkpoint.keys())
-        for k in checkpoint_keys:
-            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+        return self.process_state_dict_for_merging_tensors(
+            checkpoint,
+            tgt_layer="gate_up_proj",
+            src_layers=["gate_proj", "up_proj"],
+            enable_callback=QuantizationRegistry.allowed_merge_gate_up,
+        )
 
-            _2d_out_x_in_tensor_names = self._get_2d_out_x_in_tensor_names(quant)
-            _2d_in_x_out_tensor_names = self._get_2d_in_x_out_tensor_names(quant)
-            _1d_out_tensor_names = self._get_1d_out_tensor_names(quant)
-            all_tensor_names = (
-                _2d_out_x_in_tensor_names
-                + _2d_in_x_out_tensor_names
-                + _1d_out_tensor_names
-            )
-
-            if not QuantizationRegistry.allowed_merge_gate_up(k):
-                continue
-            elif any(
-                k.endswith(f".gate_proj.{tensor_name}")
-                for tensor_name in all_tensor_names
-            ):
-                tensor_name = k.split(".")[-1]
-                prefix = k[: -len(f".gate_proj.{tensor_name}")]
-                assert f"{prefix}.up_proj.{tensor_name}" in checkpoint
-                assert f"{prefix}.gate_up_proj.{tensor_name}" not in checkpoint
-                gate_weight = checkpoint.pop(f"{prefix}.gate_proj.{tensor_name}")
-                up_weight = checkpoint.pop(f"{prefix}.up_proj.{tensor_name}")
-                if tensor_name in _2d_out_x_in_tensor_names:
-                    cat_dim = -2
-                elif tensor_name in _2d_in_x_out_tensor_names + _1d_out_tensor_names:
-                    cat_dim = -1
-                else:
-                    assert False
-                merged_weight = (
-                    gate_weight
-                    if tensor_name == "fp_idx"
-                    else torch.cat([gate_weight, up_weight], dim=cat_dim)
-                )
-                checkpoint[f"{prefix}.gate_up_proj.{tensor_name}"] = merged_weight
-            elif any(
-                k.endswith(f".up_proj.{tensor_name}")
-                for tensor_name in all_tensor_names
-            ):
-                continue
-
-            # Unchanged tensors
-            else:
-                continue
-        return checkpoint
-
-    def _process_state_dict_for_repeat_kv_head(
-        self, checkpoint: dict[str, Any], repeats: int
+    @override
+    def process_state_dict_for_repeat_kv_head(
+        self, checkpoint: dict[str, Any]
     ) -> dict[str, Any]:
         """Repeat each kv_head weight [repeats] times, adapt to the situation where tp_size>n_kv_heads
         Args:
@@ -708,6 +549,17 @@ class TransformerHFLlama(Transformer):
         Returns:
             checkpoint: [checkpoint] after after repeating each kv_head weight [repeats] times.
         """
+
+        n_kv_heads = (
+            self.params.n_heads
+            if self.params.n_kv_heads is None
+            else self.params.n_kv_heads
+        )
+        repeats = self.tensor_parallel_size // n_kv_heads
+        if repeats <= 1:
+            return checkpoint
+        assert self.tensor_parallel_size % n_kv_heads == 0
+
         n_kv_heads = self.params.n_kv_heads
         repeat_kv_head_names = self._get_tensor_parallel_repeat_kv_head_layer_names()
 
@@ -756,30 +608,6 @@ class TransformerHFLlama(Transformer):
                     return k
 
                 state_dict = {map_blockfp8_key(k): v for k, v in state_dict.items()}
-
-            if self.tensor_parallel_size > 1:
-                # QKV and gate/up layers might already be merged in the checkpoint, but they should be split
-                # for TP. After we process for TP, we merge them back.
-                state_dict = self._process_state_dict_for_splitting_qkv(state_dict)
-                if self.params.type != "hf-gpt-oss":  # We are sure it's not merged
-                    state_dict = self._process_state_dict_for_splitting_gate_up(
-                        state_dict
-                    )
-
-        n_kv_heads = (
-            self.params.n_heads
-            if self.params.n_kv_heads is None
-            else self.params.n_kv_heads
-        )
-        tensor_parallel_size = get_tp_size()
-
-        if (
-            tensor_parallel_size > n_kv_heads
-        ):  # Compatible with tp_size>n_kv_heads, repeat each kv_head weight n_kv_head_multiplier times.
-            n_kv_head_multiplier = tensor_parallel_size // n_kv_heads
-            state_dict = self._process_state_dict_for_repeat_kv_head(
-                state_dict, n_kv_head_multiplier
-            )
 
         return super().preprocess_state_dict_parallel(
             state_dict,

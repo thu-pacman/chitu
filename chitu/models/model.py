@@ -7,14 +7,15 @@ import functools
 import operator
 from logging import getLogger
 import os
-from typing import Any, Mapping, Optional
+from collections import OrderedDict
+from typing import Any, Mapping, Optional, Callable
 from contextlib import nullcontext
 
-from chitu.task_type import TaskType
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from chitu.task_type import TaskType
 from chitu.device_type import is_muxi
 from chitu.attn_backend import AttnBackend, NpuAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
@@ -50,7 +51,13 @@ from chitu.distributed.partition import compute_layer_dist_in_pp
 from chitu.moe import get_moe_impl, MoEImplBase
 from chitu.moe.batched_routed_activation import IndexedBatchedRoutedActivation
 from chitu.moe.load_balancer import get_moe_load_planner
-from chitu.utils import is_layer, try_import_platform_dep, try_import_opt_dep, ceil_div
+from chitu.utils import (
+    is_layer,
+    try_import_platform_dep,
+    try_import_opt_dep,
+    ceil_div,
+    proportion_split,
+)
 from chitu.quantization import (
     QuantizationRegistry,
     QuantizedMoeExpertsBase,
@@ -674,6 +681,197 @@ class Transformer(nn.Module):
 
         return state_dict
 
+    def process_state_dict_for_splitting_tensors(
+        self,
+        checkpoint: dict[str, Any],
+        src_layer: str,
+        *,
+        tgt_layer_to_proportion: Optional[OrderedDict[str, int]] = None,
+        equally_split_tgt_layers: Optional[list[str]] = None,
+        dim_type: str | int = "out",
+    ):
+        """
+        Split tensors in the checkpoint, useful for splitting merged Q/K/V or gate/up.
+
+        All the tensors with named {prefix...}.{src_layer}.{tensor_name} will be split into
+        {prefix...}.{tgt_layer}.{tensor_name}, where `prefix` (e.g. "layer.0") can be any
+        strings joined by ".", `tgt_layer` (e.g. "q_proj") are set by `tgt_layer_to_proportion`
+        or `equally_split_tgt_layers`, `src_layer` (e.g. "qkv_proj") is set by `src_layer`,
+        and `tensor_name` (e.g. "weight") are the tensors in the layers according to the
+        quantization config.
+
+        Args:
+            checkpoint: Checkpoint to process.
+            src_layer: Source layer name.
+            tgt_layer_to_proportion: Map from source layer names to their proportions, if
+                you want to split with proportions. The proportions have no need to be
+                exact sizes (for the sake of blocked quantizations). One of
+                `tgt_layer_to_proportion` and `equally_split_tgt_layers` must be provided.
+            equally_split_tgt_layers: Source layer names, if you want to split with equal
+                sizes. One of `tgt_layer_to_proportion` and `equally_split_tgt_layers` must be
+                provided.
+            dim_type: Can be one of: 1) "in" means the input dimension of a linear layer,
+                which dimension ID follows quantization config; 2) "out" means the output
+                dimension of a linear layer, which dimension ID follows quantization config;
+                3) int means the explicit dimension ID to split.
+        """
+
+        if tgt_layer_to_proportion is None and equally_split_tgt_layers is None:
+            raise ValueError(
+                "Either tgt_layer_to_proportion or equally_split_tgt_layers must be provided."
+            )
+        if tgt_layer_to_proportion is not None and equally_split_tgt_layers is not None:
+            raise ValueError(
+                "Only one of tgt_layer_to_proportion or equally_split_tgt_layers can be provided."
+            )
+
+        if tgt_layer_to_proportion is not None:
+            tgt_layers = list(tgt_layer_to_proportion.keys())
+        elif equally_split_tgt_layers is not None:
+            tgt_layers = equally_split_tgt_layers
+        else:
+            assert False
+
+        checkpoint_keys = list(checkpoint.keys())
+        for k in checkpoint_keys:
+            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+
+            _2d_out_x_in_tensor_names = self._get_2d_out_x_in_tensor_names(quant)
+            _2d_in_x_out_tensor_names = self._get_2d_in_x_out_tensor_names(quant)
+            _1d_out_tensor_names = self._get_1d_out_tensor_names(quant)
+            _1d_in_tensor_names = self._get_1d_in_tensor_names(quant)
+            all_tensor_names = (
+                _2d_out_x_in_tensor_names
+                + _2d_in_x_out_tensor_names
+                + _1d_out_tensor_names
+                + _1d_in_tensor_names
+            )
+
+            if any(
+                k.endswith(f".{src_layer}.{tensor_name}")
+                for tensor_name in all_tensor_names
+            ):
+                tensor_name = k.split(".")[-1]
+
+                if dim_type == "out":
+                    if tensor_name in _2d_in_x_out_tensor_names + _1d_out_tensor_names:
+                        split_dim = -1
+                    elif tensor_name in _2d_out_x_in_tensor_names:
+                        split_dim = -2
+                    else:
+                        continue
+                elif dim_type == "in":
+                    if tensor_name in _2d_out_x_in_tensor_names + _1d_in_tensor_names:
+                        split_dim = -1
+                    elif tensor_name in _2d_in_x_out_tensor_names:
+                        split_dim = -2
+                    else:
+                        continue
+                elif isinstance(dim_type, int):
+                    split_dim = dim_type
+                else:
+                    raise ValueError(f"Invalid dim_type: {dim_type}")
+
+                prefix = k[: -len(f".{src_layer}.{tensor_name}")]
+                for tgt_layer in tgt_layers:
+                    assert f"{prefix}.{tgt_layer}.{tensor_name}" not in checkpoint
+                src_weight = checkpoint.pop(k)
+                if src_weight.shape[split_dim] == 1:
+                    checkpoint[k] = src_weight
+                    continue
+                if tgt_layer_to_proportion is not None:
+                    tgt_weights = proportion_split(
+                        src_weight,
+                        list(tgt_layer_to_proportion.values()),
+                        dim=split_dim,
+                    )
+                else:
+                    tgt_weights = src_weight.chunk(len(tgt_layers), dim=split_dim)
+                for tgt_layer, tgt_weight in zip(tgt_layers, tgt_weights):
+                    checkpoint[f"{prefix}.{tgt_layer}.{tensor_name}"] = tgt_weight
+        return checkpoint
+
+    def process_state_dict_for_merging_tensors(
+        self,
+        checkpoint: dict[str, Any],
+        tgt_layer: str,
+        src_layers: list[str],
+        *,
+        enable_callback: Callable[[str], bool] = lambda _: True,
+        dim_type: str | int = "out",
+    ):
+        """
+        Merge tensors in the checkpoint, useful for merging Q/K/V or gate/up.
+
+        All the tensors with named {prefix...}.{src_layer}.{tensor_name} will be merged into
+        {prefix...}.{tgt_layer}.{tensor_name}, where `prefix` (e.g. "layer.0") can be any
+        strings joined by ".", `src_layer` (e.g. "q_proj") are set by `src_layers`,
+        `tgt_layer` (e.g. "qkv_proj") is set by `tgt_layer`, and `tensor_name` (e.g. "weight")
+        are the tensors in the layers according to the quantization config.
+        """
+
+        checkpoint_keys = list(checkpoint.keys())
+        for k in checkpoint_keys:
+            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+
+            _2d_out_x_in_tensor_names = self._get_2d_out_x_in_tensor_names(quant)
+            _2d_in_x_out_tensor_names = self._get_2d_in_x_out_tensor_names(quant)
+            _1d_out_tensor_names = self._get_1d_out_tensor_names(quant)
+            _1d_in_tensor_names = self._get_1d_in_tensor_names(quant)
+            all_tensor_names = (
+                _2d_out_x_in_tensor_names
+                + _2d_in_x_out_tensor_names
+                + _1d_out_tensor_names
+                + _1d_in_tensor_names
+            )
+
+            if not enable_callback(k):
+                continue
+            elif any(
+                k.endswith(f".{src_layers[0]}.{tensor_name}")
+                for tensor_name in all_tensor_names
+            ):
+                tensor_name = k.split(".")[-1]
+                prefix = k[: -len(f".{src_layers[0]}.{tensor_name}")]
+                src_weights = [
+                    checkpoint.pop(f"{prefix}.{src_layer}.{tensor_name}")
+                    for src_layer in src_layers
+                ]
+
+                if dim_type == "out":
+                    if tensor_name in _2d_in_x_out_tensor_names + _1d_out_tensor_names:
+                        cat_dim = -1
+                    elif tensor_name in _2d_out_x_in_tensor_names:
+                        cat_dim = -2
+                    else:
+                        continue
+                elif dim_type == "in":
+                    if tensor_name in _2d_out_x_in_tensor_names + _1d_in_tensor_names:
+                        cat_dim = -1
+                    elif tensor_name in _2d_in_x_out_tensor_names:
+                        cat_dim = -2
+                    else:
+                        continue
+                elif isinstance(dim_type, int):
+                    cat_dim = dim_type
+                else:
+                    raise ValueError(f"Invalid dim_type: {dim_type}")
+
+                # For MixQ quantized models, all the tensors share the same fp_idx
+                merged_weight = (
+                    src_weights[0]
+                    if tensor_name == "fp_idx"
+                    else torch.cat(src_weights, dim=cat_dim)
+                )
+                checkpoint[f"{prefix}.{tgt_layer}.{tensor_name}"] = merged_weight
+        return checkpoint
+
+    def process_state_dict_for_splitting_qkv(self, checkpoint: dict[str, Any]):
+        return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
+
+    def process_state_dict_for_splitting_gate_up(self, checkpoint: dict[str, Any]):
+        return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
+
     def process_state_dict_for_merging_qkv(self, checkpoint: dict[str, Any]):
         return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
 
@@ -681,6 +879,9 @@ class Transformer(nn.Module):
         return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
 
     def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
+        return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
+
+    def process_state_dict_for_repeat_kv_head(self, checkpoint: dict[str, Any]):
         return checkpoint  # Inherit to preprocess. Leave it empty if not needed.
 
     def preprocess_state_dict_parallel(
@@ -719,6 +920,14 @@ class Transformer(nn.Module):
                     state_dict, self.global_n_layers, self.pp_stage, self.pp_size
                 )
             if self.tensor_exec:
+                # QKV and gate/up layers might already be merged in the checkpoint, but they should be split
+                # for TP. After we process for TP, we merge them back.
+                state_dict = self.process_state_dict_for_splitting_qkv(state_dict)
+                state_dict = self.process_state_dict_for_splitting_gate_up(state_dict)
+
+                # Repeat kv_head weights in case tensor_parallel_size > n_kv_heads
+                state_dict = self.process_state_dict_for_repeat_kv_head(state_dict)
+
                 state_dict = self._chunk_checkpoint_for_tensor_parallel(
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )

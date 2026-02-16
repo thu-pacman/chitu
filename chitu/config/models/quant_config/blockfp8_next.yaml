@@ -17,6 +17,14 @@ quant:
       type : blockfp8
     - regex : '\.in_proj_qkvz'
       type : blockfp8
+    - regex : '\.in_proj_q'
+      type : blockfp8
+    - regex : '\.in_proj_k'
+      type : blockfp8
+    - regex : '\.in_proj_v'
+      type : blockfp8
+    - regex : '\.in_proj_z'
+      type : blockfp8
     - regex : '\.out_proj'
       type : blockfp8
     - regex : '\.self_attn\.'
