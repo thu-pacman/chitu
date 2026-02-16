@@ -4,6 +4,7 @@
 
 from collections import OrderedDict
 from typing import Any, Mapping, Optional
+from typing_extensions import override
 
 import torch
 import torch.nn.functional as F
@@ -587,7 +588,15 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
 
     def _get_tensor_column_parallel_layer_names(self) -> list[str]:
         ret = super()._get_tensor_column_parallel_layer_names()
-        ret += ["attn_gate"]
+        ret += [
+            "attn_gate",
+            "in_proj_q",
+            "in_proj_k",
+            "in_proj_v",
+            "in_proj_z",
+            "in_proj_b",
+            "in_proj_a",
+        ]
         return ret
 
     def _get_tensor_row_parallel_layer_names(self) -> list[str]:
@@ -706,63 +715,68 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
 
         return checkpoint
 
-    def chunk_checkpoint_for_tp_splitting_merging_and_reorder_qkvz_ba(
-        self, checkpoint, rank, world_size
-    ):
+    @override
+    def process_state_dict_for_splitting_qkv(self, checkpoint: dict[str, Any]):
         # in_proj_ba and in_proj_qkvz are concatenated in a very strange layout
         # in the checkpoint, so we manually split them instead of invoking
         # `process_state_dict_for_splitting_tensors`
-        col_parallel_split_args = {
-            "in_proj_ba": [1, 1],
-            "in_proj_qkvz": [
-                self.params.linear_n_qk_heads,
-                self.params.linear_n_qk_heads,
-                self.params.linear_n_v_heads,
-                self.params.linear_n_v_heads,
-            ],
+        split_args = {
+            "in_proj_ba": OrderedDict([("in_proj_b", 1), ("in_proj_a", 1)]),
+            "in_proj_qkvz": OrderedDict(
+                [
+                    ("in_proj_q", self.params.linear_n_qk_heads),
+                    ("in_proj_k", self.params.linear_n_qk_heads),
+                    ("in_proj_v", self.params.linear_n_v_heads),
+                    ("in_proj_z", self.params.linear_n_v_heads),
+                ]
+            ),
         }
-        checkpoint_keys = list(checkpoint.keys())
-        for k in checkpoint_keys:
+        for k in list(checkpoint.keys()):
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             _2d_out_x_in_tensor_names = self._get_2d_out_x_in_tensor_names(quant)
-            for layer_name in col_parallel_split_args.keys():
-                split_arg_list = col_parallel_split_args[layer_name]
+            for layer_name in split_args.keys():
                 if any(
                     k.endswith(f".{layer_name}.{tensor_name}")
                     for tensor_name in _2d_out_x_in_tensor_names
                 ):
                     try:
-                        # reshape -> split -> split -> reshape -> merge
-                        other_dim = checkpoint[k].shape[1:]
-                        original_dim = checkpoint[k].shape[-1]
-                        tensor = checkpoint[k].view(
-                            self.params.linear_n_qk_heads, -1, *other_dim
+                        tensor_name = k.split(".")[-1]
+                        prefix = ".".join(k.split(".")[:-2])
+                        tensor = checkpoint.pop(k)
+                        other_dims = tensor.shape[1:]
+                        tensor = tensor.view(
+                            self.params.linear_n_qk_heads, -1, *other_dims
                         )
-                        splitted = proportion_split(tensor, split_arg_list, dim=1)
-                        tensor_parallel_splitted = [
-                            torch.chunk(x, world_size, dim=0)[rank] for x in splitted
-                        ]
-                        # [
-                        #   [n_local_q_head,128,2048],
-                        #   [n_local_k_head,128,2048],
-                        #   [n_local_v_head,128,2048],
-                        #   [n_local_z_head,128,2048],
-                        # ]
-                        tensor_parallel_splitted = [
-                            chunk.reshape(-1, original_dim)
-                            for chunk in tensor_parallel_splitted
-                        ]
-                        # [
-                        #   [n_local_q_head*128,2048],
-                        #   [n_local_k_head*128,2048],
-                        #   [n_local_v_head*128,2048],
-                        #   [n_local_z_head*128,2048],
-                        # ]
-                        checkpoint[k] = torch.cat(tensor_parallel_splitted, dim=0)
+                        splitted = proportion_split(
+                            tensor, list(split_args[layer_name].values()), dim=1
+                        )
+                        for tgt_layer_name, tgt_tensor in zip(
+                            split_args[layer_name].keys(), splitted
+                        ):
+                            tgt_tensor = tgt_tensor.reshape(-1, *other_dims)
+                            checkpoint[f"{prefix}.{tgt_layer_name}.{tensor_name}"] = (
+                                tgt_tensor
+                            )
                     except Exception as e:
                         raise RuntimeError(f"Error splitting {k}") from e
-        return checkpoint
 
+        return super().process_state_dict_for_splitting_qkv(checkpoint)
+
+    @override
+    def process_state_dict_for_merging_qkv(self, checkpoint: dict[str, Any]):
+        checkpoint = self.process_state_dict_for_merging_tensors(
+            checkpoint,
+            tgt_layer="in_proj_qkvz",
+            src_layers=["in_proj_q", "in_proj_k", "in_proj_v", "in_proj_z"],
+        )
+        checkpoint = self.process_state_dict_for_merging_tensors(
+            checkpoint,
+            tgt_layer="in_proj_ba",
+            src_layers=["in_proj_b", "in_proj_a"],
+        )
+        return super().process_state_dict_for_merging_qkv(checkpoint)
+
+    @override
     def preprocess_state_dict_parallel(
         self,
         state_dict: dict[str, Any],
@@ -783,16 +797,9 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                 new_k = new_k.replace(".shared_expert.", ".shared_experts.body.")
                 new_k = new_k.replace(".shared_expert_gate.", ".shared_experts.gate.")
                 state_dict[new_k] = v
-        state_dict = super().preprocess_state_dict_parallel(
+        return super().preprocess_state_dict_parallel(
             state_dict,
             skip_preprocess=skip_preprocess,
             is_layerwise=is_layerwise,
             replace=replace,
         )
-        if not skip_preprocess:
-            state_dict = (
-                self.chunk_checkpoint_for_tp_splitting_merging_and_reorder_qkvz_ba(
-                    state_dict, self.rank % self.tp_size, self.tp_size
-                )
-            )
-        return state_dict
