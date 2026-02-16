@@ -507,12 +507,8 @@ class TransformerHFLlama(Transformer):
         return self.process_state_dict_for_splitting_tensors(
             checkpoint,
             "qkv_proj",
-            src_layer_to_size=OrderedDict(
-                [
-                    ("q_proj", n_heads * head_dim),
-                    ("k_proj", n_kv_heads * head_dim),
-                    ("v_proj", n_kv_heads * head_dim),
-                ]
+            tgt_layer_to_proportion=OrderedDict(
+                [("q_proj", n_heads), ("k_proj", n_kv_heads), ("v_proj", n_kv_heads)]
             ),
         )
 
@@ -521,7 +517,7 @@ class TransformerHFLlama(Transformer):
         return self.process_state_dict_for_splitting_tensors(
             checkpoint,
             "gate_up_proj",
-            equally_split_src_layers=["gate_proj", "up_proj"],
+            equally_split_tgt_layers=["gate_proj", "up_proj"],
         )
 
     @override

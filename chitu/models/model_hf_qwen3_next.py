@@ -2,10 +2,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from collections import OrderedDict
+from typing import Any, Mapping, Optional
+
 import torch
 import torch.nn.functional as F
 from torch import nn
-from typing import Any, Mapping, Optional
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
@@ -37,9 +39,10 @@ from chitu.ops import (
     rms_norm_gate,
     fused_g,
 )
-from chitu.quantization import QuantizationRegistry
+from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
 from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear, LocalLinear
 from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
+from chitu.utils import proportion_split
 
 
 class Qwen3NextRMSNorm(RMSNorm):
@@ -666,77 +669,76 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
     def chunk_checkpoint_for_tensor_parallelize_attn_weights(
         self, checkpoint, rank, world_size
     ):
-        checkpoint_keys = list(checkpoint.keys())
-        for k in checkpoint_keys:
-            if any(k.endswith(name) for name in [".A_log", ".dt_bias"]):
+        checkpoint = self.process_state_dict_for_splitting_tensors(
+            checkpoint,
+            "conv1d",
+            tgt_layer_to_proportion=OrderedDict(
+                [
+                    ("conv1d_q", self.params.linear_n_qk_heads),
+                    ("conv1d_k", self.params.linear_n_qk_heads),
+                    ("conv1d_v", self.params.linear_n_v_heads),
+                ]
+            ),
+            dim_type=0,
+        )
+
+        for k in list(checkpoint.keys()):
+            if any(
+                k.endswith(name)
+                for name in [
+                    ".A_log",
+                    ".dt_bias",
+                    ".conv1d_q.weight",
+                    ".conv1d_k.weight",
+                    ".conv1d_v.weight",
+                ]
+            ):
                 assert checkpoint[k].shape[0] % world_size == 0
                 chunks = torch.chunk(checkpoint[k], world_size, dim=0)
                 checkpoint[k] = chunks[rank]
+
+        checkpoint = self.process_state_dict_for_merging_tensors(
+            checkpoint,
+            tgt_layer="conv1d",
+            src_layers=["conv1d_q", "conv1d_k", "conv1d_v"],
+            dim_type=0,
+        )
+
         return checkpoint
 
     def chunk_checkpoint_for_tp_splitting_merging_and_reorder_qkvz_ba(
         self, checkpoint, rank, world_size
     ):
+        # in_proj_ba and in_proj_qkvz are concatenated in a very strange layout
+        # in the checkpoint, so we manually split them instead of invoking
+        # `process_state_dict_for_splitting_tensors`
         col_parallel_split_args = {
-            ".conv1d.weight": [
-                self.params.linear_n_qk_heads * self.params.linear_head_dim,
-                self.params.linear_n_qk_heads * self.params.linear_head_dim,
-                self.params.linear_n_v_heads * self.params.linear_head_dim,
-            ],
-            ".in_proj_ba.weight": [
-                self.params.linear_n_v_heads // self.params.linear_n_qk_heads,
-                self.params.linear_n_v_heads // self.params.linear_n_qk_heads,
-            ],
-            ".in_proj_qkvz.weight": [
-                self.params.linear_head_dim,
-                self.params.linear_head_dim,
-                self.params.linear_n_v_heads
-                // self.params.linear_n_qk_heads
-                * self.params.linear_head_dim,
-                self.params.linear_n_v_heads
-                // self.params.linear_n_qk_heads
-                * self.params.linear_head_dim,
+            "in_proj_ba": [1, 1],
+            "in_proj_qkvz": [
+                self.params.linear_n_qk_heads,
+                self.params.linear_n_qk_heads,
+                self.params.linear_n_v_heads,
+                self.params.linear_n_v_heads,
             ],
         }
-        if self.params.quant_config["type"] == "blockfp8":
-            col_parallel_split_args[".in_proj_qkvz.weight_scale_inv"] = [
-                self.params.linear_head_dim // 128,
-                self.params.linear_head_dim // 128,
-                self.params.linear_n_v_heads
-                // self.params.linear_n_qk_heads
-                * self.params.linear_head_dim
-                // 128,
-                self.params.linear_n_v_heads
-                // self.params.linear_n_qk_heads
-                * self.params.linear_head_dim
-                // 128,
-            ]
-        reshape_size = (
-            self.params.linear_n_qk_heads,
-            -1,
-        )
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
-            for name in col_parallel_split_args.keys():
-                if k.endswith(name):
-                    split_arg_list = col_parallel_split_args[name]
-                    if name == ".conv1d.weight":
-                        # split -> split -> merge
-                        splitted = checkpoint[k].split(split_arg_list, dim=0)
-                        tensor_parallel_splitted = [
-                            torch.chunk(x, world_size, dim=0)[rank] for x in splitted
-                        ]
-                        checkpoint[k] = torch.cat(tensor_parallel_splitted, dim=0)
-                    else:
+            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            _2d_out_x_in_tensor_names = self._get_2d_out_x_in_tensor_names(quant)
+            for layer_name in col_parallel_split_args.keys():
+                split_arg_list = col_parallel_split_args[layer_name]
+                if any(
+                    k.endswith(f".{layer_name}.{tensor_name}")
+                    for tensor_name in _2d_out_x_in_tensor_names
+                ):
+                    try:
                         # reshape -> split -> split -> reshape -> merge
                         other_dim = checkpoint[k].shape[1:]
                         original_dim = checkpoint[k].shape[-1]
-                        curr_reshape_size = reshape_size + other_dim
-                        splitted = (
-                            checkpoint[k]
-                            .view(curr_reshape_size)
-                            .split(split_arg_list, dim=1)
+                        tensor = checkpoint[k].view(
+                            self.params.linear_n_qk_heads, -1, *other_dim
                         )
+                        splitted = proportion_split(tensor, split_arg_list, dim=1)
                         tensor_parallel_splitted = [
                             torch.chunk(x, world_size, dim=0)[rank] for x in splitted
                         ]
@@ -757,6 +759,8 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                         #   [n_local_z_head*128,2048],
                         # ]
                         checkpoint[k] = torch.cat(tensor_parallel_splitted, dim=0)
+                    except Exception as e:
+                        raise RuntimeError(f"Error splitting {k}") from e
         return checkpoint
 
     def preprocess_state_dict_parallel(
@@ -773,20 +777,22 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                 state_dict = self.chunk_checkpoint_for_tensor_parallelize_attn_weights(
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )
-            state_dict = (
-                self.chunk_checkpoint_for_tp_splitting_merging_and_reorder_qkvz_ba(
-                    state_dict, self.rank % self.tp_size, self.tp_size
-                )
-            )
             for k in list(state_dict.keys()):
                 v = state_dict.pop(k)
                 new_k = k
                 new_k = new_k.replace(".shared_expert.", ".shared_experts.body.")
                 new_k = new_k.replace(".shared_expert_gate.", ".shared_experts.gate.")
                 state_dict[new_k] = v
-        return super().preprocess_state_dict_parallel(
+        state_dict = super().preprocess_state_dict_parallel(
             state_dict,
             skip_preprocess=skip_preprocess,
             is_layerwise=is_layerwise,
             replace=replace,
         )
+        if not skip_preprocess:
+            state_dict = (
+                self.chunk_checkpoint_for_tp_splitting_merging_and_reorder_qkvz_ba(
+                    state_dict, self.rank % self.tp_size, self.tp_size
+                )
+            )
+        return state_dict

@@ -193,6 +193,41 @@ def next_power_of_two(n: int) -> int:
     return 1 if n == 0 else 2 ** (n - 1).bit_length()
 
 
+def proportion_split(
+    tensor: torch.Tensor, proportion: list[int], dim: int = 0
+) -> tuple[torch.Tensor, ...]:
+    """
+    Similar to torch.split, but do not require a split-size list summing up
+    exactly to the size of the tensor. Instead it splits the tensor proportionally.
+
+    E.g. 1, splitting a dimension of size 10 with proprotion [1, 4] will result in
+    two tensors of the dimension in size 2 and 8.
+
+    E.g. 2, splitting a dimension of size 3 with proprotion [10, 20] will result in
+    two tensors of the dimension in size 1 and 2.
+    """
+
+    tot = sum(proportion)
+    if tot == tensor.shape[dim]:
+        return torch.split(tensor, proportion, dim=dim)
+    elif tot > tensor.shape[dim]:
+        if tot % tensor.shape[dim] != 0:
+            raise ValueError(
+                f"Proportions {proportion} sum up to {tot}, which must be a multiple "
+                f"or a factor of the dimension size {tensor.shape[dim]}"
+            )
+        ratio = tot // tensor.shape[dim]
+        return torch.split(tensor, [p // ratio for p in proportion], dim=dim)
+    else:
+        if tensor.shape[dim] % tot != 0:
+            raise ValueError(
+                f"Proportions {proportion} sum up to {tot}, which must be a multiple "
+                f"or a factor of the dimension size {tensor.shape[dim]}"
+            )
+        ratio = tensor.shape[dim] // tot
+        return torch.split(tensor, [p * ratio for p in proportion], dim=dim)
+
+
 def pad_tensor(x, target_size, dim=0, value=0):
     current_size = x.size(dim)
     assert current_size <= target_size
