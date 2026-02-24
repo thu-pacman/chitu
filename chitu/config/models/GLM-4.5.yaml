@@ -5,8 +5,6 @@
 name: GLM-4.5
 type: hf-glm-4-moe
 source: "https://huggingface.co/zai-org/GLM-4.5" # Just for displaying. No automatic download.
-ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
-tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
 tokenizer_type: "hf" # one of: hf, tiktoken
 dim: 5120
 head_dim: 128

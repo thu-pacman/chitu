@@ -9,8 +9,6 @@ defaults:
 name: DeepSeek-V3.2-Exp
 type: deepseek-v3
 source: "https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp" # Just for displaying. No automatic download.
-ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
-tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
 tokenizer_type: "hf" # one of: hf, tiktoken
 vocab_size: 129280
 dim: 7168

@@ -5,8 +5,6 @@
 name: Qwen3-Coder-480B-A35B-Instruct
 type: hf-qwen-3-moe
 source: "https://huggingface.co/Qwen/Qwen3-Coder-480B-A35B-Instruct" # Just for displaying. No automatic download.
-ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
-tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
 tokenizer_type: "hf" # one of: hf, tiktoken
 dim: 6144
 n_layers: 62

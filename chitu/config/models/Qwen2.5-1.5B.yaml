@@ -5,8 +5,6 @@
 name: Qwen2.5-1.5B
 type: hf-llama
 source: "https://huggingface.co/Qwen/Qwen2.5-1.5B" # Just for displaying. No automatic download.
-ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
-tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
 tokenizer_type: "hf" # one of: hf, tiktoken
 dim: 1536
 n_layers: 28
