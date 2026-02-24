@@ -80,7 +80,11 @@ class StageDoneFrame(IntEnum):
 
 
 class DecodeRegisterFrame(IntEnum):
-    """CtrlMsgType.DECODE_REGISTER 的 multipart 下标定义。"""
+    """CtrlMsgType.DECODE_REGISTER 的 multipart 下标定义。
+
+    Fixed-position protocol: all optional frames use empty bytes (b"") as placeholders
+    when not present, so that later frames keep their fixed indices.
+    """
 
     ROOM = 0
     TYPE = 1
@@ -89,11 +93,17 @@ class DecodeRegisterFrame(IntEnum):
     SESSION_ID = 4
     PACKED_KV_PTRS = 5
     PACKED_AUX_PTR = 6
-    OPTIONAL_0 = 7
+    PACKED_LINEAR_PTRS = 7  # packed linear-attention buffer ptrs, b"" if absent
+    TP_SIZE_ASCII = 8  # decode-side TP size as ASCII, b"" if absent
+    PACKED_INDEXER_PTRS = 9  # packed indexer KV cache buffer ptrs, b"" if absent
 
 
 class TransferInfoFrame(IntEnum):
-    """CtrlMsgType.TRANSFER_INFO 的 multipart 下标定义。"""
+    """CtrlMsgType.TRANSFER_INFO 的 multipart 下标定义。
+
+    Fixed-position protocol: all optional frames use empty bytes (b"") as placeholders
+    when not present, so that later frames keep their fixed indices.
+    """
 
     ROOM = 0
     TYPE = 1
@@ -102,7 +112,8 @@ class TransferInfoFrame(IntEnum):
     SESSION_ID = 4
     DST_KV_INDICES_BYTES = 5
     AUX_INDEX_ASCII = 6
-    OPTIONAL_0 = 7  # optional linear_indices_bytes(int32)
+    LINEAR_INDICES_BYTES = 7  # linear-attention dst indices (int32), b"" if absent
+    INDEXER_INDICES_BYTES = 8  # indexer KV cache dst indices (int32), b"" if absent
 
 
 class DisaggregationMode(Enum):
@@ -139,6 +150,8 @@ class TransferKVChunk:
     transfer_info: Optional["TransferInfo"] = None
     # Optional linear-attention state indices (Qwen3-next hybrid attention)
     prefill_linear_indices: Optional[npt.NDArray[np.int32]] = None
+    # Optional indexer KV cache indices (DeepSeek-V3.2 indexer cache)
+    prefill_indexer_indices: Optional[npt.NDArray[np.int32]] = None
 
 
 @dataclasses.dataclass
@@ -156,12 +169,24 @@ class KVArgsRegisterInfo:
     # Optional: Decode-side TP size (used by Prefill to decide whether TP resharding is needed).
     # Default 1.
     dst_tp_size: int = 1
+    # Optional indexer KV cache buffer ptrs (DeepSeek-V3.2 indexer cache)
+    dst_indexer_ptrs: list[int] = dataclasses.field(default_factory=list)
+
+    @classmethod
+    def _unpack_ptrs_frame(cls, frame: bytes) -> list[int]:
+        """Unpack a packed-pointers frame (each pointer is 8 bytes / uint64)."""
+        if not frame or len(frame) < 8 or len(frame) % 8 != 0:
+            return []
+        return list(struct.unpack(f"{len(frame) // 8}Q", frame))
 
     @classmethod
     def from_zmq(cls, msg: list[bytes]):
-        # 协议（Decode -> Prefill）：
-        #   [room.bytes, b"DECODE_REGISTER", decode_ip, decode_port, session_id,
-        #    packed_kv_ptrs, packed_aux_ptr, (optional extra frames...)]
+        # Fixed-position protocol (Decode -> Prefill):
+        #   [room, b"DECODE_REGISTER", ip, port, session_id,
+        #    packed_kv_ptrs, packed_aux_ptr,
+        #    packed_linear_ptrs | b"",
+        #    tp_size_ascii      | b"",
+        #    packed_indexer_ptrs | b""]
         if (
             len(msg) < int(DecodeRegisterFrame.PACKED_AUX_PTR) + 1
             or msg[int(DecodeRegisterFrame.TYPE)] != CtrlMsgType.DECODE_REGISTER.value
@@ -170,21 +195,24 @@ class KVArgsRegisterInfo:
                 f"invalid DECODE_REGISTER message: parts={len(msg)} "
                 f"tag={msg[int(DecodeRegisterFrame.TYPE)] if len(msg)>int(DecodeRegisterFrame.TYPE) else None}"
             )
+
+        # Fixed-position parsing for optional frames
         dst_linear_ptrs: list[int] = []
         dst_tp_size: int = 1
-        # Protocol may append extra frames:
-        # - packed linear ptrs (bytes length is multiple of 8)
-        # - ascii tp_size (e.g. b"4")
-        if len(msg) > int(DecodeRegisterFrame.OPTIONAL_0):
-            for extra in msg[int(DecodeRegisterFrame.OPTIONAL_0) :]:
-                if not extra:
-                    continue
-                if extra.isdigit():
-                    dst_tp_size = int(extra.decode("ascii"))
-                    continue
-                # packed linear ptrs
-                if len(extra) % 8 == 0:
-                    dst_linear_ptrs = list(struct.unpack(f"{len(extra)//8}Q", extra))
+        dst_indexer_ptrs: list[int] = []
+
+        idx_linear = int(DecodeRegisterFrame.PACKED_LINEAR_PTRS)
+        if len(msg) > idx_linear:
+            dst_linear_ptrs = cls._unpack_ptrs_frame(msg[idx_linear])
+
+        idx_tp = int(DecodeRegisterFrame.TP_SIZE_ASCII)
+        if len(msg) > idx_tp and msg[idx_tp] and msg[idx_tp].isdigit():
+            dst_tp_size = int(msg[idx_tp].decode("ascii"))
+
+        idx_indexer = int(DecodeRegisterFrame.PACKED_INDEXER_PTRS)
+        if len(msg) > idx_indexer:
+            dst_indexer_ptrs = cls._unpack_ptrs_frame(msg[idx_indexer])
+
         return cls(
             room=UUID(bytes=msg[int(DecodeRegisterFrame.ROOM)]),
             endpoint=msg[int(DecodeRegisterFrame.DECODE_IP)].decode("ascii"),
@@ -203,6 +231,7 @@ class KVArgsRegisterInfo:
             )[0],
             dst_linear_ptrs=dst_linear_ptrs,
             dst_tp_size=int(dst_tp_size),
+            dst_indexer_ptrs=dst_indexer_ptrs,
         )
 
 
@@ -218,13 +247,16 @@ class TransferInfo:
     dst_aux_index: int
     # Optional destination indices for linear-attention state transfer
     dst_linear_indices: Optional[npt.NDArray[np.int32]] = None
+    # Optional destination indices for indexer KV cache transfer (DeepSeek-V3.2)
+    dst_indexer_indices: Optional[npt.NDArray[np.int32]] = None
 
     @classmethod
     def from_zmq(cls, msg: list[bytes]):
-        # 协议（Decode -> Prefill）：
-        #   [room.bytes, b"TRANSFER_INFO", decode_ip, decode_port, session_id,
-        #    dst_kv_indices_bytes(int32), aux_index(ascii),
-        #    (optional linear_indices_bytes(int32))]
+        # Fixed-position protocol (Decode -> Prefill):
+        #   [room, b"TRANSFER_INFO", ip, port, session_id,
+        #    dst_kv_indices_bytes, aux_index_ascii,
+        #    linear_indices_bytes | b"",
+        #    indexer_indices_bytes | b""]
         if (
             len(msg) < int(TransferInfoFrame.AUX_INDEX_ASCII) + 1
             or msg[int(TransferInfoFrame.TYPE)] != CtrlMsgType.TRANSFER_INFO.value
@@ -238,10 +270,18 @@ class TransferInfo:
             msg[int(TransferInfoFrame.DST_KV_INDICES_BYTES)], dtype=np.int32
         )
         dst_aux_index = int(msg[int(TransferInfoFrame.AUX_INDEX_ASCII)].decode("ascii"))
+
+        # Fixed-position parsing for optional frames
         dst_linear_indices = None
-        idx_opt0 = int(TransferInfoFrame.OPTIONAL_0)
-        if len(msg) > idx_opt0 and len(msg[idx_opt0]) > 0:
-            dst_linear_indices = np.frombuffer(msg[idx_opt0], dtype=np.int32)
+        idx_linear = int(TransferInfoFrame.LINEAR_INDICES_BYTES)
+        if len(msg) > idx_linear and len(msg[idx_linear]) > 0:
+            dst_linear_indices = np.frombuffer(msg[idx_linear], dtype=np.int32)
+
+        dst_indexer_indices = None
+        idx_indexer = int(TransferInfoFrame.INDEXER_INDICES_BYTES)
+        if len(msg) > idx_indexer and len(msg[idx_indexer]) > 0:
+            dst_indexer_indices = np.frombuffer(msg[idx_indexer], dtype=np.int32)
+
         return cls(
             room=UUID(bytes=msg[int(TransferInfoFrame.ROOM)]),
             endpoint=msg[int(TransferInfoFrame.DECODE_IP)].decode("ascii"),
@@ -250,6 +290,7 @@ class TransferInfo:
             dst_kv_indices=dst_kv_indices,
             dst_aux_index=dst_aux_index,
             dst_linear_indices=dst_linear_indices,
+            dst_indexer_indices=dst_indexer_indices,
         )
 
 
@@ -362,6 +403,12 @@ class KVManager:
         self.linear_data_lens = []
         self.linear_item_lens = []
 
+        # Indexer KV cache manager
+        self.indexer_cache_manager = None
+        self.indexer_data_ptrs = []
+        self.indexer_data_lens = []
+        self.indexer_item_lens = []
+
         # Buffer pointer caching for CUDA-safe operations
         # When True, buffer pointers are valid and can be used without CUDA tensor access
         # Set to False after cache_manager.realloc() to trigger refresh in decode step
@@ -454,7 +501,7 @@ class KVManager:
     def _log_prepare_backpressure(self, request_id: str, reason: str) -> None:
         interval_s = getattr(self, "_prepare_backpressure_log_interval_s", 0.0)
         if interval_s <= 0:
-            logger.info(
+            logger.debug(
                 f"[PD_BACKPRESSURE][prepare] defer req_id={request_id} reason={reason}"
             )
             return
@@ -478,14 +525,14 @@ class KVManager:
                     )
         if should_log:
             if suppressed > 0:
-                logger.info(
+                logger.debug(
                     "[PD_BACKPRESSURE][prepare] defer req_id=%s reason=%s suppressed=%s",
                     request_id,
                     reason,
                     suppressed,
                 )
             else:
-                logger.info(
+                logger.debug(
                     "[PD_BACKPRESSURE][prepare] defer req_id=%s reason=%s",
                     request_id,
                     reason,
@@ -533,7 +580,7 @@ class KVManager:
                     cache_manager=cache_manager,
                     prefix_lens=[prefix_len],
                 )
-                logger.info(f"[PD_STAGE][decode.prealloc.rank.end] req_id={rid}")
+                logger.debug(f"[PD_STAGE][decode.prealloc.rank.end] req_id={rid}")
                 processed += 1
                 self._clear_prepare_backpressure_log_state(rid)
             except KVTransferBackpressure as e:
@@ -589,12 +636,12 @@ class KVManager:
             # Register to coordination service if available
             if self.pd_coordination_service:
                 # In cinfer, we use coordination service instead of bootstrap server
-                logger.info("using pd coordination service for prefill registration")
+                logger.debug("using pd coordination service for prefill registration")
             else:
                 # Fallback to original bootstrap registration
                 self._register_to_bootstrap()
         else:
-            logger.info(
+            logger.debug(
                 "prefill-only: non-control rank, skip ZMQ thread and bootstrap registration"
             )
 
@@ -716,7 +763,7 @@ class KVManager:
                 parts.append(f"{k}=[len={len(v)}]")
             else:
                 parts.append(f"{k}={v}")
-        logger.info(" ".join(parts))
+        logger.debug(" ".join(parts))
 
     def _coordination_req(self, payload: dict, timeout_ms: int = 3000) -> dict:
         """Send a synchronous metadata request to PDCoordinationService (router side)."""
@@ -873,7 +920,7 @@ class KVManager:
             # Wait for cache manager and buffer registration to complete
             # We check both kv_data_ptrs and aux_data_ptr to be safe
             while not hasattr(self, "aux_data_ptr") or self.aux_data_ptr == 0:
-                logger.info("Waiting for aux_data_ptr to be registered")
+                logger.debug("Waiting for aux_data_ptr to be registered")
                 time.sleep(0.1)
             # Qwen3-next hybrid attention: also wait for linear state buffers if enabled
             if getattr(self, "linear_attn_cache_manager", None) is not None:
@@ -882,7 +929,17 @@ class KVManager:
                     not hasattr(self, "linear_data_ptrs")
                     or len(getattr(self, "linear_data_ptrs", [])) == 0
                 ) and (time.time() - wait_start) < 5.0:
-                    logger.info("Waiting for linear_data_ptrs to be registered")
+                    logger.debug("Waiting for linear_data_ptrs to be registered")
+                    time.sleep(0.1)
+
+            # indexer cache: also wait for indexer buffers if enabled
+            if getattr(self, "indexer_cache_manager", None) is not None:
+                wait_start = time.time()
+                while (
+                    not hasattr(self, "indexer_data_ptrs")
+                    or len(getattr(self, "indexer_data_ptrs", [])) == 0
+                ) and (time.time() - wait_start) < 5.0:
+                    logger.debug("Waiting for indexer_data_ptrs to be registered")
                     time.sleep(0.1)
 
             ranks = self._discover_prefill_engine_ranks()
@@ -900,6 +957,10 @@ class KVManager:
                 packed_linear_ptrs = self._pack_ptrs(
                     getattr(self, "linear_data_ptrs", [])
                 )
+                packed_indexer_ptrs = self._pack_ptrs(
+                    getattr(self, "indexer_data_ptrs", [])
+                )
+                _tp_size = int(get_tp_group().group_size)
                 parts = [
                     ctrl_room.bytes,
                     CtrlMsgType.DECODE_REGISTER.value,
@@ -908,17 +969,14 @@ class KVManager:
                     session_id,
                     packed_kv_ptrs,
                     packed_aux_ptr,
+                    # Fixed-position optional frames (b"" as placeholder when absent)
+                    packed_linear_ptrs or b"",
+                    str(int(_tp_size)).encode("ascii") if _tp_size > 1 else b"",
+                    packed_indexer_ptrs or b"",
                 ]
-                # Optional: append linear ptrs when available
-                if packed_linear_ptrs:
-                    parts.append(packed_linear_ptrs)
-                # Append decode tp_size as an optional tail frame, so Prefill can decide
-                # whether TP resharding is needed in send_kvcache.
-                _tp_size = int(get_tp_group().group_size)
-                parts.append(str(int(_tp_size)).encode("ascii"))
                 self._send_zmq_to_prefill(endpoint, parts)
                 self._decode_registered_remote_set.add(er)
-                logger.info(
+                logger.debug(
                     f"decode endpoint registered to prefill via bootstrap (engine_rank={er})"
                 )
 
@@ -934,7 +992,7 @@ class KVManager:
         """
         # Defer if cache manager is not ready
         if self.cache_manager is None:
-            logger.info("cache manager not set yet, skip memory registration")
+            logger.debug("cache manager not set yet, skip memory registration")
             return
 
         # Get KV cache buffer info from cache manager
@@ -954,7 +1012,7 @@ class KVManager:
                 self.kv_item_lens = kv_item_lens
 
                 if ptrs_changed:
-                    logger.info(
+                    logger.debug(
                         f"KV cache buffer pointers changed (likely after realloc): "
                         f"old={len(old_ptrs)} new={len(new_ptrs)} "
                         f"added={len(new_ptrs - old_ptrs)} removed={len(old_ptrs - new_ptrs)}"
@@ -964,7 +1022,7 @@ class KVManager:
                         == DisaggregationMode.DECODE
                     ):
                         self._decode_registered_remote_set.clear()
-                        logger.info(
+                        logger.debug(
                             "decode kv buffer pointers changed; clearing decode->prefill registration cache "
                             "so next prepare_kv_transfer will resend updated pointers"
                         )
@@ -983,7 +1041,7 @@ class KVManager:
                     self._registered_ptrs.add(kv_data_ptr)
                     newly_registered += 1
             if newly_registered > 0:
-                logger.info(
+                logger.debug(
                     f"registered {newly_registered} kv cache buffers to transfer engine"
                 )
         else:
@@ -1009,15 +1067,18 @@ class KVManager:
         self._buffer_ptrs_valid = True
 
     def set_linear_attn_cache_manager(self, linear_cache_manager):
-        """Set linear attention cache manager for Qwen3-next hybrid attention support.
-
-        For models with hybrid attention (e.g., Qwen3-next), both full attention KV cache
-        and linear attention states need to be transferred during PD disaggregation.
-        """
+        """Set linear attention cache manager for Qwen3-next hybrid attention."""
         self.linear_attn_cache_manager = linear_cache_manager
         if linear_cache_manager is not None:
             self.register_linear_attn_buffer_to_engine()
             logger.info("linear attention cache manager set for kv manager")
+
+    def set_indexer_cache_manager(self, indexer_cache_manager):
+        """Set indexer KV cache manager for DeepSeek-V3.2."""
+        self.indexer_cache_manager = indexer_cache_manager
+        if indexer_cache_manager is not None:
+            self.register_indexer_buffer_to_engine()
+            logger.info("indexer cache manager set for kv manager")
 
     def register_linear_attn_buffer_to_engine(self):
         """Register linear attention state buffers (conv_state, recurrent_state) for RDMA transfer.
@@ -1026,7 +1087,7 @@ class KVManager:
         Supports refresh after cache_manager.realloc() which may allocate new memory.
         """
         if self.linear_attn_cache_manager is None:
-            logger.info("linear attention cache manager not set, skip registration")
+            logger.debug("linear attention cache manager not set, skip registration")
             return
 
         if hasattr(self.linear_attn_cache_manager, "get_contiguous_buf_infos"):
@@ -1038,7 +1099,7 @@ class KVManager:
             old_ptrs = set(getattr(self, "linear_data_ptrs", []))
             new_ptrs = set(linear_ptrs)
             if old_ptrs != new_ptrs:
-                logger.info(
+                logger.debug(
                     f"Linear attention buffer pointers changed: "
                     f"old={len(old_ptrs)} new={len(new_ptrs)} "
                     f"added={len(new_ptrs - old_ptrs)}"
@@ -1048,7 +1109,7 @@ class KVManager:
                     == DisaggregationMode.DECODE
                 ):
                     self._decode_registered_remote_set.clear()
-                    logger.info(
+                    logger.debug(
                         "decode linear buffer pointers changed; clearing decode->prefill registration cache "
                         "so next prepare_kv_transfer will resend updated pointers"
                     )
@@ -1063,13 +1124,65 @@ class KVManager:
                     self.transfer_engine.register(ptr, length)
                     self._registered_ptrs.add(ptr)
                     newly_registered += 1
-            logger.info(
+            logger.debug(
                 f"registered {newly_registered} linear attention state buffers to transfer engine"
             )
         else:
             logger.warning(
                 f"linear attention cache manager does not support get_contiguous_buf_infos: "
                 f"{type(self.linear_attn_cache_manager).__name__}"
+            )
+
+    def register_indexer_buffer_to_engine(self):
+        """Register indexer KV cache buffers (DeepSeek-V3.2) for RDMA transfer.
+
+        Supports refresh after cache_manager.realloc() which may allocate new memory.
+        """
+        if self.indexer_cache_manager is None:
+            logger.debug("indexer cache manager not set, skip registration")
+            return
+
+        if hasattr(self.indexer_cache_manager, "get_contiguous_buf_infos"):
+            indexer_ptrs, indexer_lens, indexer_item_lens = (
+                self.indexer_cache_manager.get_contiguous_buf_infos()
+            )
+
+            # Check if buffer pointers have changed (e.g., after realloc)
+            old_ptrs = set(getattr(self, "indexer_data_ptrs", []))
+            new_ptrs = set(indexer_ptrs)
+            if old_ptrs != new_ptrs:
+                logger.debug(
+                    f"Indexer buffer pointers changed: "
+                    f"old={len(old_ptrs)} new={len(new_ptrs)} "
+                    f"added={len(new_ptrs - old_ptrs)}"
+                )
+                if (
+                    getattr(self, "disaggregation_mode", None)
+                    == DisaggregationMode.DECODE
+                ):
+                    self._decode_registered_remote_set.clear()
+                    logger.debug(
+                        "decode indexer buffer pointers changed; clearing decode->prefill registration cache "
+                        "so next prepare_kv_transfer will resend updated pointers"
+                    )
+
+            self.indexer_data_ptrs = indexer_ptrs
+            self.indexer_data_lens = indexer_lens
+            self.indexer_item_lens = indexer_item_lens
+
+            newly_registered = 0
+            for ptr, length in zip(indexer_ptrs, indexer_lens):
+                if ptr not in self._registered_ptrs:
+                    self.transfer_engine.register(ptr, length)
+                    self._registered_ptrs.add(ptr)
+                    newly_registered += 1
+            logger.debug(
+                f"registered {newly_registered} indexer cache buffers to transfer engine"
+            )
+        else:
+            logger.warning(
+                f"indexer cache manager does not support get_contiguous_buf_infos: "
+                f"{type(self.indexer_cache_manager).__name__}"
             )
 
     def start_prefill_thread(self):
@@ -1101,7 +1214,7 @@ class KVManager:
         self._broadcast_pub_socket.bind(f"tcp://*:{self.prefill_ctrl_broadcast_port}")
 
         def bootstrap_thread():
-            logger.info(
+            logger.debug(
                 f"starting prefill ctrl zmq listeners external={self.rank_port} internal={self.internal_rank_port} "
                 f"broadcast_pub={self.prefill_ctrl_broadcast_port}"
             )
@@ -1141,7 +1254,7 @@ class KVManager:
                     for tp in range(int(get_tp_group().group_size)):
                         if (pp, tp) not in st["done_shards"]:
                             missing.append((pp, tp))
-                logger.info(
+                logger.debug(
                     f"[PD_PREFILL_CTRL] room={room} done={done_cnt}/{expected} "
                     f"aux_done={st.get('aux_done', False)} missing={missing[:8]}{'...' if len(missing)>8 else ''}"
                 )
@@ -1166,18 +1279,18 @@ class KVManager:
                     req_id = self._trace_room_to_request_id.get(room)
                     if decode_ip and decode_port > 0:
                         # 看到该日志表示：Prefill 已完成该请求所有 shard 的 KV+aux 传输，发送 Decode Success 信号
-                        logger.info(
+                        logger.debug(
                             f"[PD_PREFILL_CTRL] send_final_success room={room} request_id={req_id} "
                             f"done_shards={done_cnt}/{expected} aux_done=True "
                             f"decode={decode_ip}:{decode_port}"
                         )
                         if pd_trace_enabled():
-                            logger.info(
+                            logger.debug(
                                 "[PD_TRACE][prefill.kv_sent] "
                                 f"req_id={req_id} room={room} decode={decode_ip}:{decode_port}"
                             )
                         if req_id:
-                            logger.info(
+                            logger.debug(
                                 f"[PD_STAGE][prefill.kv_send.end] req_id={req_id}"
                             )
                         # NOTE：同时把 Success 发给 decode dp_rank0（scheduler 所在进程）。
@@ -1214,7 +1327,7 @@ class KVManager:
                                 room=room,
                                 status=KVPoll.Success.value,
                             )
-                        logger.info(
+                        logger.debug(
                             f"[PD_PREFILL_CTRL] room={room} request_id={req_id} "
                             f"all_shards_done={done_cnt}/{expected} aux_done=True "
                             f"kv_aux_sent_to_decode={decode_ip}:{decode_port}"
@@ -1321,7 +1434,7 @@ class KVManager:
                                     "decode_port": t_info.dst_port,
                                 }
                                 # 看到该日志表示：Prefill control rank 已建立该请求的完成跟踪状态。
-                                logger.info(
+                                logger.debug(
                                     f"[PD_PREFILL_CTRL] init_done_state room={room} request_id={req_id} "
                                     f"expected_shards={expected_shards} decode={t_info.endpoint}:{t_info.dst_port} "
                                     f"aux_index={getattr(t_info, 'dst_aux_index', -1)} dst_blocks={getattr(t_info.dst_kv_indices, 'size', 0)}"
@@ -1349,7 +1462,7 @@ class KVManager:
                     time.sleep(0.1)
 
         threading.Thread(target=bootstrap_thread, daemon=True).start()
-        logger.info(
+        logger.debug(
             f"started prefill communication thread external={self.rank_port} internal={self.internal_rank_port}"
         )
 
@@ -1377,7 +1490,7 @@ class KVManager:
         self._broadcast_sub_socket = sock
 
         def _recv_loop():
-            logger.info(
+            logger.debug(
                 f"started prefill broadcast subscriber to {ip}:{int(port)} (topic=PD_FANOUT)"
             )
             while True:
@@ -1470,18 +1583,18 @@ class KVManager:
                     # Persist as numeric to match waiting loop, but log enum for readability
                     self.request_status[bootstrap_room] = status_val
                     if pd_verbose_enabled():
-                        logger.info(
+                        logger.debug(
                             f"received status update for room {bootstrap_room}: {status_enum} (raw={status_str})"
                         )
                     if status_val == int(KVPoll.Success.value):
                         req_id = self._trace_room_to_request_id.get(bootstrap_room)
                         if pd_trace_enabled():
-                            logger.info(
+                            logger.debug(
                                 "[PD_TRACE][decode.kv_ready] "
                                 f"req_id={req_id} room={bootstrap_room}"
                             )
                         if req_id:
-                            logger.info(f"[PD_STAGE][decode.kv_ready] req_id={req_id}")
+                            logger.debug(f"[PD_STAGE][decode.kv_ready] req_id={req_id}")
                     self._trace(
                         "decode_recv_status_update",
                         room=bootstrap_room,
@@ -1647,7 +1760,7 @@ class KVManager:
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
-                logger.info(f"Worker picked up chunk for room {kv_chunk.room}")
+                logger.debug(f"Worker picked up chunk for room {kv_chunk.room}")
 
                 # Prefer synced metadata
                 meta = kv_chunk.transfer_info
@@ -1686,7 +1799,7 @@ class KVManager:
                 )
 
                 if is_meta_valid:
-                    logger.info(
+                    logger.debug(
                         f"Worker processing chunk for room {kv_chunk.room} with meta"
                     )
                     seq_len = kv_chunk.seq_len
@@ -1702,17 +1815,17 @@ class KVManager:
                     )
 
                     if ret == 0:
-                        logger.info(f"finished kv cache transfer for {kv_chunk.room}")
+                        logger.debug(f"finished kv cache transfer for {kv_chunk.room}")
                         req_id = self._trace_room_to_request_id.get(kv_chunk.room)
                         grank = None
                         if torch.distributed.is_initialized():
                             grank = int(torch.distributed.get_rank())
                         if req_id:
-                            logger.info(
+                            logger.debug(
                                 f"[PD_STAGE][prefill.kv_send.rank.end] req_id={req_id} grank={grank}"
                             )
 
-                        # Send linear attention states (Qwen3-next hybrid attention)
+                        # Send linear attention states (Qwen3-next)
                         has_linear = (
                             "dst_linear_ptrs" in meta
                             and "dst_linear_indices" in meta
@@ -1729,12 +1842,39 @@ class KVManager:
                                 executor=executor,
                             )
                             if ret == 0:
-                                logger.info(
+                                logger.debug(
                                     f"finished linear state transfer for {kv_chunk.room}"
                                 )
                             else:
                                 logger.error(
                                     f"linear state transfer failed for {kv_chunk.room}"
+                                )
+                                continue
+
+                        # Send indexer KV cache (DeepSeek-V3.2)
+                        has_indexer = (
+                            "dst_indexer_ptrs" in meta
+                            and "dst_indexer_indices" in meta
+                            and kv_chunk.prefill_indexer_indices is not None
+                            and isinstance(meta.get("dst_indexer_ptrs"), list)
+                            and meta.get("dst_indexer_indices") is not None
+                        )
+                        if has_indexer:
+                            ret = self.send_indexer_kvcache(
+                                mooncake_session_id=meta["session_id"],
+                                prefill_indexer_indices=kv_chunk.prefill_indexer_indices,
+                                dst_indexer_ptrs=meta["dst_indexer_ptrs"],
+                                dst_indexer_indices=meta["dst_indexer_indices"],
+                                executor=executor,
+                                seq_len=seq_len,
+                            )
+                            if ret == 0:
+                                logger.debug(
+                                    f"finished indexer cache transfer for {kv_chunk.room}"
+                                )
+                            else:
+                                logger.error(
+                                    f"indexer cache transfer failed for {kv_chunk.room}"
                                 )
                                 continue
 
@@ -1749,7 +1889,7 @@ class KVManager:
                             )
                             if ret == 0:
                                 aux_done = True
-                                logger.info(
+                                logger.debug(
                                     f"finished aux transfer for {kv_chunk.room}"
                                 )
                                 # Free aux buffer slot for this request.
@@ -1786,7 +1926,7 @@ class KVManager:
                     if not hasattr(self, "_last_wait_log_time") or (
                         time.time() - self._last_wait_log_time > 5.0
                     ):
-                        logger.info(
+                        logger.debug(
                             f"Worker waiting for TransferInfo for room {kv_chunk.room}. Available rooms: {[r.hex for r in self.transfer_infos.keys()]}"
                         )
                         self._last_wait_log_time = time.time()
@@ -1873,6 +2013,7 @@ class KVManager:
                 "dst_aux_index": t_info.dst_aux_index,
                 "decode_tp_size": reg_info.dst_tp_size,
             }
+            # Linear attention fields
             dst_linear_ptrs = reg_info.dst_linear_ptrs
             dst_linear_indices = t_info.dst_linear_indices
             if (
@@ -1883,6 +2024,17 @@ class KVManager:
             ):
                 meta["dst_linear_ptrs"] = dst_linear_ptrs
                 meta["dst_linear_indices"] = dst_linear_indices
+            # Indexer cache fields
+            dst_indexer_ptrs = reg_info.dst_indexer_ptrs
+            dst_indexer_indices = t_info.dst_indexer_indices
+            if (
+                isinstance(dst_indexer_ptrs, list)
+                and len(dst_indexer_ptrs) > 0
+                and dst_indexer_indices is not None
+                and dst_indexer_indices.size > 0
+            ):
+                meta["dst_indexer_ptrs"] = dst_indexer_ptrs
+                meta["dst_indexer_indices"] = dst_indexer_indices
             metas.append(meta)
         return metas
 
@@ -1895,20 +2047,45 @@ class KVManager:
         executor: concurrent.futures.ThreadPoolExecutor,
         seq_len: int,
         decode_tp_size: int = 1,
+        # Override parameters for auxiliary caches (e.g., indexer cache via send_indexer_kvcache)
+        _override_data_ptrs: Optional[list[int]] = None,
+        _override_item_lens: Optional[list[int]] = None,
+        _override_cache_manager=None,
     ):
-        """Send KV cache to decode instance"""
-        if not self.kv_data_ptrs:
+        """Send KV cache to decode instance.
+
+        When _override_* params are provided, uses those instead of self.kv_data_ptrs /
+        self.kv_item_lens / self.cache_manager. This allows reusing the same transfer
+        logic for auxiliary caches (e.g., DeepSeek-V3.2 indexer cache).
+        """
+        effective_data_ptrs = (
+            _override_data_ptrs
+            if _override_data_ptrs is not None
+            else self.kv_data_ptrs
+        )
+        effective_item_lens = (
+            _override_item_lens
+            if _override_item_lens is not None
+            else self.kv_item_lens
+        )
+        effective_cache_manager = (
+            _override_cache_manager
+            if _override_cache_manager is not None
+            else self.cache_manager
+        )
+
+        if not effective_data_ptrs:
             logger.warning("no kv data pointers available, skipping kv cache transfer")
             return 0
 
         prefill_kv_indices = prefill_kv_indices.tolist()
         dst_kv_indices = dst_kv_indices.tolist()
 
-        cache_manager = self.cache_manager
+        cache_manager = effective_cache_manager
         num_prefill_layers = int(getattr(cache_manager, "num_layers", 0))
 
-        # self.kv_data_ptrs: prefill侧的kvcache ptrs: [kptr_1,kptr_2,...kptr_local_n_layers_p,vptr_1,vptr_2,...,vptr_local_n_layers_p]
-        num_prefill_ptrs = len(self.kv_data_ptrs)
+        # effective_data_ptrs: prefill侧的kvcache ptrs: [kptr_1,kptr_2,...kptr_local_n_layers_p,vptr_1,vptr_2,...,vptr_local_n_layers_p]
+        num_prefill_ptrs = len(effective_data_ptrs)
         # 不太可能，直接raise
         if num_prefill_layers <= 0:
             raise ValueError(
@@ -1942,99 +2119,168 @@ class KVManager:
             )
             prefill_begin_layer_id = sum(layer_dist[:pp_rank])
 
+        # Default (main branch behavior): KV layer offset equals prefill stage layer offset.
+        kv_layer_offset = int(prefill_begin_layer_id)
+
+        # Hybrid attention correction: not all layers have KV cache, so remap offset
+        # from total-layer space to KV-cache-layer space.
+        full_attn_interval = int(
+            getattr(get_global_args().models, "full_attention_interval", 0)
+        )
+        if int(pp_sz) > 1 and full_attn_interval > 1:
+            first_kv_global_id = cache_manager.layer_id_map.to_global(0)
+            kv_layer_offset = int(first_kv_global_id // full_attn_interval)
+
         # 此处暂时只兼容prefill_pp>1, decode_pp=1
-        if int(prefill_begin_layer_id) + int(num_prefill_layers) > int(
-            num_decode_layers
-        ):
+        if kv_layer_offset + num_prefill_layers > num_decode_layers:
             raise ValueError(
                 "dst_kv_ptrs too short / pp_layer_partition mismatch: "
                 f"pp_rank={pp_rank} pp_size={pp_sz} stage_layer_offset={prefill_begin_layer_id} "
+                f"kv_layer_offset={kv_layer_offset} "
                 f"num_prefill_layers={num_prefill_layers}, num_decode_layers={num_decode_layers} "
                 f"num_decode_prts={num_decode_ptrs} num_keys={num_keys}"
             )
 
         layers_params = []
         # pptr_idx: idx in self.kv_data_ptrs(prefill side)
+        # Detect MLA cache keys: MLA compressed cache is 4D [num_layers, num_blocks, block_size, compressed_dim],
+        # standard MHA cache is 5D [num_layers, num_blocks, block_size, num_heads, head_dim].
+        _mla_flag_by_key: dict[int, bool] = {}
+        if hasattr(cache_manager, "paged_kv_cache"):
+            for kidx, key in enumerate(cache_manager.paged_kv_cache):
+                _mla_flag_by_key[kidx] = cache_manager.paged_kv_cache[key].ndim == 4
+
         for pptr_idx in range(num_prefill_ptrs):
             key_idx = pptr_idx // num_prefill_layers
             prefill_layer_id = pptr_idx % num_prefill_layers
 
             # Map local layer offset -> destination KV cache layer index.
-            # For PP>1: dst_layer = stage_layer_offset + local_layer (prefix-sum offset)
-            # For PP=1: stage_layer_offset is 0, so dst_layer == local_layer.
-            decode_layer_id = prefill_begin_layer_id + prefill_layer_id
+            # For PP>1: dst_layer = kv_layer_offset + local_layer
+            # For PP=1: kv_layer_offset is 0, so dst_layer == local_layer.
+            decode_layer_id = kv_layer_offset + prefill_layer_id
             dptr_idx = (
                 key_idx * num_decode_layers + decode_layer_id
             )  # dptr_idx: idx in dst_kv_ptrs(decode side)
             decode_layer_base_ptr = dst_kv_ptrs[dptr_idx]
-            prefill_layer_base_ptr = self.kv_data_ptrs[pptr_idx]
-            layers_params.append([prefill_layer_base_ptr, decode_layer_base_ptr])
+            prefill_layer_base_ptr = effective_data_ptrs[pptr_idx]
+            is_mla_cache = _mla_flag_by_key.get(key_idx, False)
+            layers_params.append(
+                (prefill_layer_base_ptr, decode_layer_base_ptr, pptr_idx, is_mla_cache)
+            )
 
-        def process_layer(prefill_layer_base_ptr: int, decode_layer_base_ptr: int):
+        def process_layer(
+            prefill_layer_base_ptr: int,
+            decode_layer_base_ptr: int,
+            layer_pptr_idx: int,
+            is_mla_cache: bool,
+        ):
             # 只支持 prefill_tp > 1 -> decode_tp = 1
             tp_group = get_tp_group()
             prefill_tp_size = tp_group.group_size
             tp_rank = tp_group.rank_in_group
-            num_heads = (
-                get_global_args().models.n_kv_heads
-                if hasattr(get_global_args().models, "n_kv_heads")
-                else get_global_args().models.n_heads
-            )
 
-            # Compatible with tp_size>n_kv_heads
-            # 当tp_size>num_heads时, kv head的排布为: [head_1, head_1, ..., head_2,      head_2, ..., head_n, head_n]
-            #                                        rank_0, rank_1, ..., rank_repeat,         ...,         rank_tp_size
-            repeats = 1
-            if prefill_tp_size > num_heads:
-                repeats = prefill_tp_size // num_heads
-
-            if tp_rank % repeats != 0:
-                # 当tp_size大于num_heads，从rank0到rank_repeats的kv cache是相同的，只需要传rank0的kv cache
-                return 0
-            real_tp_rank = tp_rank // repeats
-            valid_tp_size = min(prefill_tp_size, num_heads)
-
-            block_size = self.cache_manager.get_block_size()
-            real_decode_kv_indices, start_off_in_block, end_off_in_block = (
-                get_tp_splits(
-                    dst_kv_indices, seq_len, block_size, valid_tp_size, real_tp_rank
-                )
-            )
-
-            logger.debug(
-                f"tp_rank:{tp_rank}, real_decode_kv_indices:{real_decode_kv_indices}, start_off_in_block:{start_off_in_block}, end_off_in_block:{end_off_in_block}"
-            )
-            prefill_block_byte_len = self.kv_item_lens[pptr_idx]
-            # decode_block_byte_len = prefill_block_byte_len * valid_tp_size
+            block_size = cache_manager.get_block_size()
+            prefill_block_byte_len = effective_item_lens[layer_pptr_idx]
             prefill_token_byte_len = prefill_block_byte_len // block_size
-            decode_virtual_block_size = block_size * valid_tp_size
 
-            dst_ptr_sections = get_ptr_sections_from_kv_indices(
-                decode_layer_base_ptr,
-                real_decode_kv_indices,
-                start_off_in_block,
-                end_off_in_block,
-                decode_virtual_block_size,
-                prefill_token_byte_len,
-            )
-            src_ptr_sections = get_ptr_sections_from_kv_indices(
-                prefill_layer_base_ptr,
-                prefill_kv_indices,
-                0,
-                seq_len % block_size if seq_len % block_size else block_size,
-                block_size,
-                prefill_token_byte_len,
-            )
+            if is_mla_cache:
+                # MLA not split by heads across TP ranks.
+                # All prefill TP ranks produce identical data.
+                # so split blocks evenly among TP ranks, each rank sends
+                # its portion using the block_size for both
+                # source and destination address computation.
+                total_blocks = len(prefill_kv_indices)
+                blocks_per_rank = (
+                    total_blocks + prefill_tp_size - 1
+                ) // prefill_tp_size
+                rank_start = tp_rank * blocks_per_rank
+                rank_end = min(rank_start + blocks_per_rank, total_blocks)
 
-            # import ctypes
-            # for ptr_sections in src_ptr_sections:
-            #     section_vals = [
-            #         ctypes.cast(cur_ptr, ctypes.POINTER(ctypes.c_int32)).contents.value
-            #         for cur_ptr in range(
-            #             ptr_sections[0], ptr_sections[1], prefill_token_byte_len
-            #         )
-            #     ]
-            #     print(f"{ptr_sections}: {section_vals}")
+                if rank_start >= total_blocks:
+                    return 0  # No work for this TP rank
+
+                rank_prefill_indices = prefill_kv_indices[rank_start:rank_end]
+                rank_dst_indices = dst_kv_indices[rank_start:rank_end]
+
+                # Determine end-offset in the last block of this rank's range.
+                if rank_end == total_blocks:
+                    # This rank owns the last block of the sequence — may be partial.
+                    last_block_end_off = (
+                        seq_len % block_size if seq_len % block_size else block_size
+                    )
+                else:
+                    last_block_end_off = block_size
+
+                logger.debug(
+                    f"[MLA] tp_rank:{tp_rank}, rank_blocks:[{rank_start},{rank_end}), "
+                    f"last_block_end_off:{last_block_end_off}"
+                )
+
+                src_ptr_sections = get_ptr_sections_from_kv_indices(
+                    prefill_layer_base_ptr,
+                    rank_prefill_indices,
+                    0,
+                    last_block_end_off,
+                    block_size,
+                    prefill_token_byte_len,
+                )
+                dst_ptr_sections = get_ptr_sections_from_kv_indices(
+                    decode_layer_base_ptr,
+                    rank_dst_indices,
+                    0,
+                    last_block_end_off,
+                    block_size,
+                    prefill_token_byte_len,
+                )
+            else:
+                # ---- Standard MHA cache (e.g. Qwen3, DeepSeek MLA mla_absorb=none) ----
+                num_heads = (
+                    get_global_args().models.n_kv_heads
+                    if hasattr(get_global_args().models, "n_kv_heads")
+                    else get_global_args().models.n_heads
+                )
+
+                # Compatible with tp_size>n_kv_heads
+                # 当tp_size>num_heads时, kv head的排布为: [head_1, head_1, ..., head_2,      head_2, ..., head_n, head_n]
+                #                                        rank_0, rank_1, ..., rank_repeat,         ...,         rank_tp_size
+                repeats = 1
+                if prefill_tp_size > num_heads:
+                    repeats = prefill_tp_size // num_heads
+
+                if tp_rank % repeats != 0:
+                    # 当tp_size大于num_heads，从rank0到rank_repeats的kv cache是相同的，只需要传rank0的kv cache
+                    return 0
+                real_tp_rank = tp_rank // repeats
+                valid_tp_size = min(prefill_tp_size, num_heads)
+
+                real_decode_kv_indices, start_off_in_block, end_off_in_block = (
+                    get_tp_splits(
+                        dst_kv_indices, seq_len, block_size, valid_tp_size, real_tp_rank
+                    )
+                )
+
+                logger.debug(
+                    f"tp_rank:{tp_rank}, real_decode_kv_indices:{real_decode_kv_indices}, "
+                    f"start_off_in_block:{start_off_in_block}, end_off_in_block:{end_off_in_block}"
+                )
+                decode_virtual_block_size = block_size * valid_tp_size
+
+                dst_ptr_sections = get_ptr_sections_from_kv_indices(
+                    decode_layer_base_ptr,
+                    real_decode_kv_indices,
+                    start_off_in_block,
+                    end_off_in_block,
+                    decode_virtual_block_size,
+                    prefill_token_byte_len,
+                )
+                src_ptr_sections = get_ptr_sections_from_kv_indices(
+                    prefill_layer_base_ptr,
+                    prefill_kv_indices,
+                    0,
+                    seq_len % block_size if seq_len % block_size else block_size,
+                    block_size,
+                    prefill_token_byte_len,
+                )
 
             src_ptr_sections, dst_ptr_sections = align_intervals(
                 src_ptr_sections, dst_ptr_sections
@@ -2057,9 +2303,18 @@ class KVManager:
         # Execute transfers in parallel
         futures = [
             executor.submit(
-                process_layer, prefill_layer_base_ptr, decode_layer_base_ptr
+                process_layer,
+                prefill_layer_base_ptr,
+                decode_layer_base_ptr,
+                layer_pptr_idx,
+                is_mla_cache,
             )
-            for (prefill_layer_base_ptr, decode_layer_base_ptr) in layers_params
+            for (
+                prefill_layer_base_ptr,
+                decode_layer_base_ptr,
+                layer_pptr_idx,
+                is_mla_cache,
+            ) in layers_params
         ]
 
         for future in concurrent.futures.as_completed(futures):
@@ -2071,6 +2326,47 @@ class KVManager:
                 return status
 
         return 0
+
+    def send_indexer_kvcache(
+        self,
+        mooncake_session_id: str,
+        prefill_indexer_indices: npt.NDArray[np.int32],
+        dst_indexer_ptrs: list[int],
+        dst_indexer_indices: npt.NDArray[np.int32],
+        executor: concurrent.futures.ThreadPoolExecutor,
+        seq_len: int,
+    ):
+        """Send indexer KV cache to decode instance (DeepSeek-V3.2).
+
+        Indexer cache is a paged KV cache similar to the main cache but with different
+        block_size and shape. All indexer cache keys are 4D (MLA-like: no head dimension),
+        so we use the MLA block-splitting logic for TP parallelism.
+
+        Uses the dedicated indexer_data_ptrs / indexer_item_lens / indexer_cache_manager.
+        """
+        if not getattr(self, "indexer_data_ptrs", None):
+            logger.warning("indexer data ptrs not available, skipping indexer transfer")
+            return 0
+
+        indexer_cm = self.indexer_cache_manager
+        if indexer_cm is None:
+            logger.warning("indexer cache manager not set, skipping indexer transfer")
+            return 0
+
+        # Delegate to send_kvcache with indexer-specific data
+        return self.send_kvcache(
+            mooncake_session_id=mooncake_session_id,
+            prefill_kv_indices=prefill_indexer_indices,
+            dst_kv_ptrs=dst_indexer_ptrs,
+            dst_kv_indices=dst_indexer_indices,
+            executor=executor,
+            seq_len=seq_len,
+            decode_tp_size=1,
+            # Override: use indexer cache data instead of main cache
+            _override_data_ptrs=self.indexer_data_ptrs,
+            _override_item_lens=self.indexer_item_lens,
+            _override_cache_manager=indexer_cm,
+        )
 
     def send_linear_state(
         self,
@@ -2404,6 +2700,24 @@ class KVManager:
             logger.warning("send_kv_cache called in non-prefill mode")
             return
 
+        # NOTE: After warmup, cache_manager.realloc() allocates new KV
+        # buffers at different addresses.  The source pointers registered with
+        # the local Mooncake engine become stale
+        # RDMA reads from freed GPU
+        # memory cause CUDA_ERROR_ILLEGAL_ADDRESS, refresh once.
+        if not self._warmup_completed:
+            logger.info(
+                "[send_kv_cache] first call after warmup, "
+                "refreshing Mooncake source buffer registration"
+            )
+            self.register_buffer_to_engine(force_refresh=True)
+            if getattr(self, "linear_attn_cache_manager", None) is not None:
+                self.register_linear_attn_buffer_to_engine()
+            if getattr(self, "indexer_cache_manager", None) is not None:
+                self.register_indexer_buffer_to_engine()
+            self._warmup_completed = True
+            self._buffer_ptrs_valid = True
+
         tp_group = get_tp_group()
         pp_group = get_pp_group()
         tp_size = int(tp_group.group_size)
@@ -2416,7 +2730,7 @@ class KVManager:
             f"send_kv_cache ctrl={is_ctrl} pp_stage={pp_stage}/{pp_size} tp_rank={tp_rank}/{tp_size}"
         )
         if pd_trace_enabled():
-            logger.info(
+            logger.debug(
                 f"[PD_TRACE][prefill.send_kv_cache] batch={len(request_ids)} "
                 f"tp_size={tp_size} tp_rank={tp_rank} pp_size={pp_size} pp_stage={pp_stage} "
                 f"first_tokens_shape={list(first_tokens.shape) if isinstance(first_tokens, torch.Tensor) else None}"
@@ -2482,7 +2796,7 @@ class KVManager:
                 raise RuntimeError(f"empty kv_indices for request_id={request_id}")
 
             if pd_trace_enabled():
-                logger.info(
+                logger.debug(
                     f"[PD_TRACE][prefill.enqueue_transfer] req_id={request_id} room={str(room)} "
                     f"kv_indices_len={int(kv_indices.size)} aux_index={int(aux_index)} "
                     f"first_token={int(first_tokens[index]) if should_send_aux else None} "
@@ -2516,9 +2830,37 @@ class KVManager:
                         f"empty linear_indices for request_id={request_id}"
                     )
 
+            # Optional: indexer KV cache indices
+            indexer_indices = None
+            _idx_cond_meta = isinstance(meta, dict) and meta.get("valid", False)
+            _idx_cond_ptrs = _idx_cond_meta and "dst_indexer_ptrs" in meta
+            _idx_cond_indices = _idx_cond_meta and "dst_indexer_indices" in meta
+            _idx_cond_cm = getattr(self, "indexer_cache_manager", None) is not None
+            if _idx_cond_ptrs and _idx_cond_indices and _idx_cond_cm:
+                if not hasattr(self.indexer_cache_manager, "get_page_indices"):
+                    raise RuntimeError(
+                        f"indexer cache manager does not support get_page_indices for {request_id}"
+                    )
+                idx_list = self.indexer_cache_manager.get_page_indices(request_id)
+                if idx_list is None:
+                    raise RuntimeError(
+                        f"indexer get_page_indices returned None for request_id={request_id}"
+                    )
+                indexer_indices = np.asarray(idx_list, dtype=np.int32)
+                if indexer_indices.size == 0:
+                    raise RuntimeError(
+                        f"empty indexer_indices for request_id={request_id}"
+                    )
+
             # Add transfer request to queue with resolved meta
             chunk = TransferKVChunk(
-                room, kv_indices, aux_index, seq_len, meta, linear_indices
+                room,
+                kv_indices,
+                aux_index,
+                seq_len,
+                meta,
+                linear_indices,
+                indexer_indices,
             )
             self._trace(
                 "prefill_enqueue_transfer",
@@ -2531,11 +2873,11 @@ class KVManager:
                     str(meta.get("session_id")) if isinstance(meta, dict) else None
                 ),
             )
-            logger.info(
+            logger.debug(
                 f"Adding transfer chunk for room {room} to queue (valid_meta={meta['valid']})"
             )
             self.transfer_queue.put(chunk)
-            logger.info(f"Added transfer chunk for room {room} to queue")
+            logger.debug(f"Added transfer chunk for room {room} to queue")
 
     def prepare_kv_transfer(
         self,
@@ -2561,11 +2903,30 @@ class KVManager:
             if prefix_lens is None:
                 prefix_lens = [0] * len(request_ids)
 
+            # NOTE: After warmup, cache_manager.realloc() allocates new KV
+            # buffers at different addresses.  The old Mooncake registrations and
+            # the DECODE_REGISTER pointers sent to Prefill become stale.
+            # Force a one-time refresh on the first prepare call after warmup (only once).
+            if not self._warmup_completed:
+                logger.info(
+                    "[prepare_kv_transfer] first call after warmup, "
+                    "refreshing Mooncake buffer registration"
+                )
+                self.register_buffer_to_engine(force_refresh=True)
+                if getattr(self, "linear_attn_cache_manager", None) is not None:
+                    self.register_linear_attn_buffer_to_engine()
+                if getattr(self, "indexer_cache_manager", None) is not None:
+                    self.register_indexer_buffer_to_engine()
+                self._warmup_completed = True
+                self._buffer_ptrs_valid = True
+
             # - 如果 kv_data_ptrs 尚未就绪（如初始化），先刷新一次，再发 TransferInfo
             if not self._buffer_ptrs_valid or not getattr(self, "kv_data_ptrs", None):
                 self.register_buffer_to_engine(force_refresh=True)
                 if getattr(self, "linear_attn_cache_manager", None) is not None:
                     self.register_linear_attn_buffer_to_engine()
+                if getattr(self, "indexer_cache_manager", None) is not None:
+                    self.register_indexer_buffer_to_engine()
 
             # Step 0: Register to all discovered Prefill ranks (idempotent)
             discovered = self._discover_prefill_engine_ranks()
@@ -2586,6 +2947,10 @@ class KVManager:
                 packed_linear_ptrs = self._pack_ptrs(
                     getattr(self, "linear_data_ptrs", [])
                 )
+                packed_indexer_ptrs = self._pack_ptrs(
+                    getattr(self, "indexer_data_ptrs", [])
+                )
+                _tp_size = int(get_tp_group().group_size)
                 parts = [
                     ctrl_room.bytes,
                     CtrlMsgType.DECODE_REGISTER.value,
@@ -2594,13 +2959,14 @@ class KVManager:
                     session_id,
                     packed_kv_ptrs,
                     packed_aux_ptr,
+                    # Fixed-position optional frames
+                    packed_linear_ptrs or b"",
+                    str(int(_tp_size)).encode("ascii") if _tp_size > 1 else b"",
+                    packed_indexer_ptrs or b"",
                 ]
-                if packed_linear_ptrs:
-                    parts.append(packed_linear_ptrs)
-                # NOTE: where Decode sends DECODE_REGISTER to Prefill
                 self._send_zmq_to_prefill(endpoint, parts)
                 self._decode_registered_remote_set.add(engine_rank)
-                logger.info(
+                logger.debug(
                     f"decode endpoint registered to prefill via bootstrap (engine_rank={engine_rank})"
                 )
 
@@ -2700,20 +3066,76 @@ class KVManager:
                         raise RuntimeError(
                             "PD linear state transfer requires linear_attn_cache_manager methods"
                         )
-                    max_linear_blocks = int(linear_cm.get_max_blocks_per_req())
+                    # Linear attention: always reserve max_blocks_per_req (typically 1)
+                    linear_blocks_to_reserve = int(linear_cm.get_max_blocks_per_req())
                     linear_free = getattr(linear_cm, "num_free_blocks", None)
-                    if linear_free is not None and linear_free < max_linear_blocks:
+                    if (
+                        linear_free is not None
+                        and linear_free < linear_blocks_to_reserve
+                    ):
                         raise KVTransferBackpressure(
                             f"Not enough free KV blocks for linear state: req_id={request_id} "
-                            f"need={max_linear_blocks} free={linear_free}"
+                            f"need={linear_blocks_to_reserve} free={linear_free}"
                         )
                     lin_indices = linear_cm.reserve_blocks_for_transfer(
-                        request_id, max_linear_blocks
+                        request_id, linear_blocks_to_reserve
                     )
                     linear_dst_np = np.asarray(lin_indices, dtype=np.int32)
                     if linear_dst_np.size == 0:
                         raise RuntimeError(
-                            "reserve_blocks_for_transfer returned empty for linear state "
+                            f"reserve_blocks_for_transfer returned empty for linear state "
+                            f"request_id={request_id}"
+                        )
+
+                # Reserve destination blocks for indexer KV cache
+                indexer_dst_np = None
+                indexer_cm = getattr(self, "indexer_cache_manager", None)
+                indexer_ptrs = getattr(self, "indexer_data_ptrs", [])
+                indexer_enabled = (
+                    indexer_cm is not None
+                    and int(getattr(indexer_cm, "num_layers", 0)) > 0
+                    and len(indexer_ptrs) > 0
+                )
+                if indexer_enabled:
+                    if not (
+                        hasattr(indexer_cm, "get_max_blocks_per_req")
+                        and hasattr(indexer_cm, "reserve_blocks_for_transfer")
+                    ):
+                        raise RuntimeError(
+                            "PD indexer transfer requires indexer_cache_manager methods"
+                        )
+                    # Indexer cache: reserve blocks based on prefix_len
+                    max_indexer_blocks = int(indexer_cm.get_max_blocks_per_req())
+                    idx_bs = int(getattr(indexer_cm, "block_size", 0))
+                    if idx_bs <= 0 and hasattr(indexer_cm, "get_block_size"):
+                        try:
+                            idx_bs = int(indexer_cm.get_block_size())
+                        except Exception:
+                            idx_bs = 0
+                    if idx_bs > 0 and prefix_len > 0:
+                        indexer_blocks_to_reserve = (prefix_len + idx_bs - 1) // idx_bs
+                        indexer_blocks_to_reserve = max(1, indexer_blocks_to_reserve)
+                        indexer_blocks_to_reserve = min(
+                            max_indexer_blocks, indexer_blocks_to_reserve
+                        )
+                    else:
+                        indexer_blocks_to_reserve = max_indexer_blocks
+                    indexer_free = getattr(indexer_cm, "num_free_blocks", None)
+                    if (
+                        indexer_free is not None
+                        and indexer_free < indexer_blocks_to_reserve
+                    ):
+                        raise KVTransferBackpressure(
+                            f"Not enough free KV blocks for indexer state: req_id={request_id} "
+                            f"need={indexer_blocks_to_reserve} free={indexer_free}"
+                        )
+                    idx_indices = indexer_cm.reserve_blocks_for_transfer(
+                        request_id, indexer_blocks_to_reserve
+                    )
+                    indexer_dst_np = np.asarray(idx_indices, dtype=np.int32)
+                    if indexer_dst_np.size == 0:
+                        raise RuntimeError(
+                            f"reserve_blocks_for_transfer returned empty for indexer state "
                             f"request_id={request_id}"
                         )
 
@@ -2747,6 +3169,7 @@ class KVManager:
                     "aux_index": aux_index,
                     "dst_indices_np": dst_indices_np,
                     "linear_dst_np": linear_dst_np,
+                    "indexer_dst_np": indexer_dst_np,
                     "prefix_len": prefix_len,
                     "prefill_tp_size": prefill_tp_size,
                 }
@@ -2765,6 +3188,7 @@ class KVManager:
 
                 session_id = self.get_session_id().encode("ascii")
                 dst_bytes = dst_indices_np.tobytes()
+                indexer_dst_np = self._prepared_transfers[room].get("indexer_dst_np")
                 parts = [
                     room.bytes,
                     CtrlMsgType.TRANSFER_INFO.value,
@@ -2773,14 +3197,15 @@ class KVManager:
                     session_id,
                     dst_bytes,
                     str(int(aux_index)).encode("ascii"),
+                    # Fixed-position optional frames (b"" as placeholder when absent)
+                    linear_dst_np.tobytes() if linear_dst_np is not None else b"",
+                    indexer_dst_np.tobytes() if indexer_dst_np is not None else b"",
                 ]
-                if linear_dst_np is not None:
-                    parts.append(linear_dst_np.tobytes())
 
-                logger.info(
+                logger.debug(
                     f"[PD_STAGE][decode.transfer_info.send.start] req_id={request_id} room={room}"
                 )
-                logger.info(
+                logger.debug(
                     f"[prepare_kv_transfer] sending TransferInfo for {request_id} room={room} "
                     f"aux_index={aux_index} dst_blocks={dst_indices_np.size}"
                 )
@@ -2793,7 +3218,7 @@ class KVManager:
                     logger.debug(
                         f"posted transfer request:{request_id} to prefill(er={er}) for room {room}"
                     )
-                logger.info(
+                logger.debug(
                     f"[PD_STAGE][decode.transfer_info.send.end] req_id={request_id} room={room}"
                 )
 
@@ -2825,12 +3250,14 @@ class KVManager:
         # This handles the case where cache_manager.realloc() was called after initial registration.
         # We only need to refresh once; subsequent requests can use cached pointers.
         if not getattr(self, "_warmup_completed", False):
-            logger.info(
+            logger.debug(
                 "[recv_kv_cache_and_insert] first request after warmup, refreshing buffer pointers"
             )
             self.register_buffer_to_engine(force_refresh=True)
             if getattr(self, "linear_attn_cache_manager", None) is not None:
                 self.register_linear_attn_buffer_to_engine()
+            if getattr(self, "indexer_cache_manager", None) is not None:
+                self.register_indexer_buffer_to_engine()
             self._warmup_completed = True
             self._buffer_ptrs_valid = True
 
@@ -2841,6 +3268,7 @@ class KVManager:
         room_ids: list[UUID] = []
         reserved_dst_indices_list: list[list[int]] = []
         reserved_dst_linear_indices_list: list[list[int]] = []
+        reserved_dst_indexer_indices_list: list[list[int]] = []
 
         for idx, request_id in enumerate(request_ids):
             room = self._to_uuid(request_id)
@@ -2853,6 +3281,10 @@ class KVManager:
                 linear_np = prep_info.get("linear_dst_np")
                 reserved_dst_linear_indices_list.append(
                     linear_np.tolist() if linear_np is not None else []
+                )
+                indexer_np = prep_info.get("indexer_dst_np")
+                reserved_dst_indexer_indices_list.append(
+                    indexer_np.tolist() if indexer_np is not None else []
                 )
                 logger.debug(
                     f"[recv_kv_cache_and_insert] using prepared transfer for {request_id}"
@@ -2874,6 +3306,7 @@ class KVManager:
             room_ids = []
             reserved_dst_indices_list = []
             reserved_dst_linear_indices_list = []
+            reserved_dst_indexer_indices_list = []
             for idx, request_id in enumerate(request_ids):
                 room = self._to_uuid(request_id)
                 prep_info = self._prepared_transfers.get(room)
@@ -2888,8 +3321,12 @@ class KVManager:
                 reserved_dst_linear_indices_list.append(
                     linear_np.tolist() if linear_np is not None else []
                 )
+                indexer_np = prep_info.get("indexer_dst_np")
+                reserved_dst_indexer_indices_list.append(
+                    indexer_np.tolist() if indexer_np is not None else []
+                )
         else:
-            logger.info(
+            logger.debug(
                 f"[recv_kv_cache_and_insert] all {(request_ids)} requests already prepared, "
                 f"skipping TransferInfo send"
             )
@@ -2945,6 +3382,10 @@ class KVManager:
                     packed_linear_ptrs = self._pack_ptrs(
                         getattr(self, "linear_data_ptrs", [])
                     )
+                    packed_indexer_ptrs = self._pack_ptrs(
+                        getattr(self, "indexer_data_ptrs", [])
+                    )
+                    _tp_size = int(get_tp_group().group_size)
                     reg_parts = [
                         ctrl_room.bytes,
                         CtrlMsgType.DECODE_REGISTER.value,
@@ -2953,9 +3394,11 @@ class KVManager:
                         session_id,
                         packed_kv_ptrs,
                         packed_aux_ptr,
+                        # Fixed-position optional frames
+                        packed_linear_ptrs or b"",
+                        str(int(_tp_size)).encode("ascii") if _tp_size > 1 else b"",
+                        packed_indexer_ptrs or b"",
                     ]
-                    if packed_linear_ptrs:
-                        reg_parts.append(packed_linear_ptrs)
                     for er in discovered:
                         info = self._get_bootstrap_info(engine_rank=er)
                         if info is None:
@@ -3005,6 +3448,25 @@ class KVManager:
                             linear_dst_indices, dtype=np.int32
                         )
 
+                    # indexer indices (if enabled)
+                    indexer_dst_indices_np = None
+                    indexer_cm = getattr(self, "indexer_cache_manager", None)
+                    indexer_ptrs = getattr(self, "indexer_data_ptrs", [])
+                    indexer_enabled = (
+                        indexer_cm is not None
+                        and int(getattr(indexer_cm, "num_layers", 0)) > 0
+                        and len(indexer_ptrs) > 0
+                    )
+                    if indexer_enabled:
+                        indexer_dst_indices = (
+                            indexer_cm.block_table.get(req_id, [])
+                            if hasattr(indexer_cm, "block_table")
+                            else []
+                        )
+                        indexer_dst_indices_np = np.asarray(
+                            indexer_dst_indices, dtype=np.int32
+                        )
+
                     session_id = self.get_session_id().encode("ascii")
                     dst_bytes = dst_indices_np.tobytes()
                     parts = [
@@ -3015,12 +3477,20 @@ class KVManager:
                         session_id,
                         dst_bytes,
                         str(int(aux_index)).encode("ascii"),
+                        # Fixed-position optional frames
+                        (
+                            linear_dst_indices_np.tobytes()
+                            if linear_dst_indices_np is not None
+                            and linear_dst_indices_np.size > 0
+                            else b""
+                        ),
+                        (
+                            indexer_dst_indices_np.tobytes()
+                            if indexer_dst_indices_np is not None
+                            and indexer_dst_indices_np.size > 0
+                            else b""
+                        ),
                     ]
-                    if (
-                        linear_dst_indices_np is not None
-                        and linear_dst_indices_np.size > 0
-                    ):
-                        parts.append(linear_dst_indices_np.tobytes())
 
                     for er in discovered:
                         info = self._get_bootstrap_info(engine_rank=er)
@@ -3057,7 +3527,7 @@ class KVManager:
         # Fetch first-token ids from aux buffer
         first_tokens = self.metadata_buffers.get(aux_indices)
         if pd_trace_enabled():
-            logger.info(
+            logger.debug(
                 f"[PD_TRACE][decode.kv_transfer_done] req_ids={request_ids} "
                 f"first_tokens_shape={list(first_tokens.shape)} aux_slots={aux_indices}"
             )
@@ -3084,15 +3554,13 @@ class KVManager:
                 prefix_len=int(prefix_length),
             )
             if pd_trace_enabled():
-                logger.info(
+                logger.debug(
                     f"[PD_TRACE][decode.insert_kv] req_id={req_id} room={str(room)} "
                     f"page_indices={len(page_indices)} prefix_len={int(prefix_length)}"
                 )
 
-        # Insert transferred linear attention state into linear cache manager (Qwen3-next)
-        if getattr(self, "linear_attn_cache_manager", None) is not None and hasattr(
-            self.linear_attn_cache_manager, "insert_linear_state_from_transfer"
-        ):
+        # Insert transferred linear attention state (Qwen3-next)
+        if getattr(self, "linear_attn_cache_manager", None) is not None:
             for idx, room in enumerate(room_ids):
                 req_id = request_ids[idx]
                 lin_indices = reserved_dst_linear_indices_list[idx]
@@ -3102,9 +3570,26 @@ class KVManager:
                     req_id, int(lin_indices[0])
                 )
                 if pd_trace_enabled():
-                    logger.info(
+                    logger.debug(
                         f"[PD_TRACE][decode.insert_linear] req_id={req_id} room={str(room)} "
                         f"page_index={int(lin_indices[0])}"
+                    )
+
+        # Insert transferred indexer KV cache
+        if getattr(self, "indexer_cache_manager", None) is not None:
+            for idx, room in enumerate(room_ids):
+                req_id = request_ids[idx]
+                idx_indices = reserved_dst_indexer_indices_list[idx]
+                if not idx_indices:
+                    continue
+                prefix_length = int(prefix_lens[idx])
+                self.indexer_cache_manager.insert_kv_cache_from_transfer(
+                    req_id, idx_indices, prefix_length
+                )
+                if pd_trace_enabled():
+                    logger.debug(
+                        f"[PD_TRACE][decode.insert_indexer] req_id={req_id} room={str(room)} "
+                        f"page_indices={len(idx_indices)} prefix_len={prefix_length}"
                     )
 
         # Free aux buffer slots
@@ -3149,9 +3634,18 @@ class KVManager:
             )
 
             for key in cache_manager.paged_kv_cache:
-                cache = cache_manager.paged_kv_cache[
-                    key
-                ]  # [num_layers,num_blocks,block_size,num_heads,head_dim]
+                cache = cache_manager.paged_kv_cache[key]
+
+                if cache.ndim == 4:
+                    # MLA compressed KV cache (e.g. kv_lora_k_pe for DeepSeek-V3):
+                    # shape = [num_layers, num_blocks, block_size, compressed_dim].
+                    # The compressed KV is produced by a replicated LocalLinear
+                    # projection, so all Prefill TP ranks write identical data.
+                    # No per-head TP reorder is needed, skip.
+                    continue
+
+                # MHA KV cache:
+                # [num_layers, num_blocks, block_size, num_heads, head_dim]
                 num_layers, _, block_size, num_heads, head_dim = cache.shape
                 prefill_n_local_head = num_heads // prefill_tp_size
 

@@ -27,6 +27,10 @@ from chitu.distributed.pd_disaggregation.pd_types import (
     PendingPDRequest,
     SchedulerType,
 )
+from chitu.metrics.prometheus_collector import (
+    chitu_router_pending_requests,
+    observe_pd_stage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -221,51 +225,55 @@ class PDRequestRouter(RequestRouter):
     async def _add_pd_request(self, request):
         """Add PD disaggregation request"""
         request_id = getattr(request, "request_id", str(time.time()))
-        logger.info(f"[PD_STAGE][router.recv.start] req_id={request_id}")
+        logger.debug(f"[PD_STAGE][router.recv.start] req_id={request_id}")
 
-        # Select Prefill and Decode Scheduler
-        prefill_scheduler_id = self._select_prefill_scheduler()
-        decode_scheduler_id = self._select_decode_scheduler()
+        with observe_pd_stage("router", "recv"):
+            # Select Prefill and Decode Scheduler
+            prefill_scheduler_id = self._select_prefill_scheduler()
+            decode_scheduler_id = self._select_decode_scheduler()
 
-        if prefill_scheduler_id is None or decode_scheduler_id is None:
-            logger.error("no available prefill or decode scheduler")
-            return
+            if prefill_scheduler_id is None or decode_scheduler_id is None:
+                logger.error("no available prefill or decode scheduler")
+                return
 
-        # PD trace: Router selected a P/D pair for this request.
-        messages = getattr(request, "message", getattr(request, "messages", None))
-        msg_count = len(messages) if isinstance(messages, list) else None
-        max_new = getattr(
-            request, "max_new_tokens", getattr(request, "max_tokens", None)
-        )
-        logger.debug(
-            f"[PD_TRACE][router.select_pair] req_id={request_id} prefill_sid={prefill_scheduler_id} "
-            f"decode_sid={decode_scheduler_id} msg_count={msg_count} max_new_tokens={max_new}"
-        )
-
-        # Create PD request record
-        pd_request = PendingPDRequest(
-            request_id=request_id,
-            original_request=request,
-            prefill_scheduler_id=prefill_scheduler_id,
-            decode_scheduler_id=decode_scheduler_id,
-            status=PDRequestStatus.PENDING,
-        )
-
-        self.pending_pd_requests[request_id] = pd_request
-
-        # Register P-D pair to coordination service
-        if self.pd_coordination_service:
-            await self.pd_coordination_service.register_pd_pair(
-                request_id, prefill_scheduler_id, decode_scheduler_id
+            # PD trace: Router selected a P/D pair for this request.
+            messages = getattr(request, "message", getattr(request, "messages", None))
+            msg_count = len(messages) if isinstance(messages, list) else None
+            max_new = getattr(
+                request, "max_new_tokens", getattr(request, "max_tokens", None)
+            )
+            logger.debug(
+                f"[PD_TRACE][router.select_pair] req_id={request_id} prefill_sid={prefill_scheduler_id} "
+                f"decode_sid={decode_scheduler_id} msg_count={msg_count} max_new_tokens={max_new}"
             )
 
-        logger.info(
-            f"created pd request: {request_id} -> P{prefill_scheduler_id}-D{decode_scheduler_id}"
-        )
+            # Create PD request record
+            pd_request = PendingPDRequest(
+                request_id=request_id,
+                original_request=request,
+                prefill_scheduler_id=prefill_scheduler_id,
+                decode_scheduler_id=decode_scheduler_id,
+                status=PDRequestStatus.PENDING,
+            )
 
-        # Put request into processing queue
-        self.pending_requests.append(pd_request)
-        logger.info(f"[PD_STAGE][router.recv.end] req_id={request_id}")
+            self.pending_pd_requests[request_id] = pd_request
+
+            # Register P-D pair to coordination service
+            if self.pd_coordination_service:
+                await self.pd_coordination_service.register_pd_pair(
+                    request_id, prefill_scheduler_id, decode_scheduler_id
+                )
+
+            logger.debug(
+                f"created pd request: {request_id} -> P{prefill_scheduler_id}-D{decode_scheduler_id}"
+            )
+
+            # Put request into processing queue
+            self.pending_requests.append(pd_request)
+
+        # Update router pending requests gauge
+        chitu_router_pending_requests.set(len(self.pending_pd_requests))
+        logger.debug(f"[PD_STAGE][router.recv.end] req_id={request_id}")
 
     def _select_prefill_scheduler(self) -> Optional[int]:
         """Select Prefill Scheduler"""
@@ -341,7 +349,7 @@ class PDRequestRouter(RequestRouter):
         }
 
         # Dual dispatch: send to both Prefill and Decode simultaneously
-        logger.info(
+        logger.debug(
             f"[PD_STAGE][router.dispatch.start] req_id={pd_request.request_id} "
             f"prefill_sid={pd_request.prefill_scheduler_id} decode_sid={pd_request.decode_scheduler_id}"
         )
@@ -350,26 +358,27 @@ class PDRequestRouter(RequestRouter):
             f"prefill_sid={pd_request.prefill_scheduler_id} decode_sid={pd_request.decode_scheduler_id} "
             f"keys={sorted(list(request_data.keys()))}"
         )
-        try:
-            await asyncio.gather(
-                self._send_to_prefill_scheduler(
-                    pd_request.prefill_scheduler_id, request_data
-                ),
-                self._send_to_decode_scheduler(
-                    pd_request.decode_scheduler_id,
-                    request_data,
-                    pd_request.prefill_scheduler_id,
-                ),
-            )
-        except Exception as e:
-            logger.error(
-                f"pd request dispatch failed: req_id={pd_request.request_id} err={e}"
-            )
-            pd_request.status = PDRequestStatus.PENDING
-            self.pending_requests.appendleft(pd_request)
-            await asyncio.sleep(0.05)
-            return
-        logger.info(f"[PD_STAGE][router.dispatch.end] req_id={pd_request.request_id}")
+        with observe_pd_stage("router", "dispatch"):
+            try:
+                await asyncio.gather(
+                    self._send_to_prefill_scheduler(
+                        pd_request.prefill_scheduler_id, request_data
+                    ),
+                    self._send_to_decode_scheduler(
+                        pd_request.decode_scheduler_id,
+                        request_data,
+                        pd_request.prefill_scheduler_id,
+                    ),
+                )
+            except Exception as e:
+                logger.error(
+                    f"pd request dispatch failed: req_id={pd_request.request_id} err={e}"
+                )
+                pd_request.status = PDRequestStatus.PENDING
+                self.pending_requests.appendleft(pd_request)
+                await asyncio.sleep(0.05)
+                return
+        logger.debug(f"[PD_STAGE][router.dispatch.end] req_id={pd_request.request_id}")
 
         logger.debug(f"pd disaggregation request dispatched: {pd_request.request_id}")
         # Update router performance counters on successful dispatch

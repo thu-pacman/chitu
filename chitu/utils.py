@@ -22,9 +22,7 @@ from torch.distributed import get_rank, get_world_size
 
 from chitu.device_type import is_ascend
 from chitu.global_vars import get_global_args
-from chitu.distributed.parallel_state import get_pp_group
 from chitu.import_utils import try_import_platform_dep
-import itertools
 from typing import Optional
 
 logger = getLogger(__name__)
