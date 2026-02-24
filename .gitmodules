@@ -31,3 +31,6 @@
 [submodule "third_party/fast-hadamard-transform"]
     path = third_party/fast-hadamard-transform
     url = https://github.com/Dao-AILab/fast-hadamard-transform.git
+[submodule "third_party/dInfer"]
+	path = third_party/dInfer
+	url = https://github.com/inclusionAI/dInfer.git
