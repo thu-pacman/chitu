@@ -5,8 +5,6 @@
 name: GLM-5
 type: deepseek-v3
 source: "https://huggingface.co/zai-org/GLM-5" # Just for displaying. No automatic download.
-ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
-tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
 tokenizer_type: "hf" # one of: hf, tiktoken
 vocab_size: "$(config.json:vocab_size)"
 dim: "$(config.json:hidden_size)"

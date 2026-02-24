@@ -173,6 +173,31 @@ def _auto_set_num_blocks_after_warmup(args):
         get_global_args().infer.num_blocks = new_num_block
         if new_num_block > 0:
             Backend.cache_managers["main"].realloc(new_num_block)
+
+        # Realloc indexer cache manager if present
+        indexer_cm = Backend.cache_managers.get("indexer")
+        if (
+            indexer_cm is not None
+            and isinstance(indexer_cm, PagedKVCacheManager)
+            and hasattr(indexer_cm, "realloc")
+        ):
+            # Scale indexer blocks proportionally to main cache
+            indexer_additional = get_additional_block_num(
+                indexer_cm, args.infer.memory_utilization
+            )
+            new_indexer_blocks = indexer_cm.num_blocks + indexer_additional
+            if torch.distributed.get_world_size() > 1:
+                indexer_tensor = torch.tensor(new_indexer_blocks).cuda()
+                torch.distributed.all_reduce(
+                    indexer_tensor, torch.distributed.ReduceOp.RedOpType.MIN
+                )
+                new_indexer_blocks = indexer_tensor.item()
+            if new_indexer_blocks > 0:
+                indexer_cm.realloc(new_indexer_blocks)
+                logger.info(
+                    f"indexer cache manager reallocated to {new_indexer_blocks} blocks after warmup"
+                )
+
         if torch.distributed.get_rank() == 0:
             for scheduler in Backend.schedulers:
                 scheduler.reset_kvcache_block_threshold()

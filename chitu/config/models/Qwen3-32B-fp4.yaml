@@ -11,6 +11,4 @@ defaults:
 # Access info
 name: Qwen3-32B-fp4
 source: "https://huggingface.co/qingcheng-ai/Qwen3-32B-fp4" # Just for displaying. No automatic download.
-ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
-tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
 

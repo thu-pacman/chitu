@@ -927,36 +927,46 @@ class ExpertDataDispatcher(TasksDispatcher):
         self,
         token_list: list[int],
         mtp_token_list: Optional[list[list[int]]] = None,
-    ) -> tuple[PackedTasksBase, list[int], Optional[list[list[int]]]]:
+        pd_first_tokens: Optional[dict[str, int]] = None,
+    ) -> tuple[list[int], Optional[list[list[int]]], dict[str, int]]:
+        if pd_first_tokens is None:
+            pd_first_tokens = {}
         if self.is_main_rank:
             all_tokens = [[] for _ in range(self.group_size)]
             if self.mtp_size > 1:
                 all_tokens_mtp = [[] for _ in range(self.group_size)]
+            all_first_tokens: dict[str, int] = {}
+            base_frame_count = 2 + (1 if self.mtp_size > 1 else 0)
             for _ in range(1, self.group_size):
                 msgs = self.socket.recv_multipart()
                 rank_in_group = int(msgs[0].decode())  # zmq identity prepend by ROUTER
                 all_tokens[rank_in_group] = msgpack.unpackb(msgs[1])
                 if self.mtp_size > 1:
                     all_tokens_mtp[rank_in_group] = msgpack.unpackb(msgs[2])
+                if len(msgs) > base_frame_count:
+                    ft = msgpack.unpackb(msgs[base_frame_count])
+                    if ft:
+                        all_first_tokens.update(ft)
             if not self.mtp_size > 1:
                 return (
                     sum(all_tokens, token_list),
                     None,
+                    all_first_tokens,
                 )
             else:
                 return (
                     sum(all_tokens, token_list),
                     sum(all_tokens_mtp, mtp_token_list),
+                    all_first_tokens,
                 )
         else:
-            if not self.mtp_size > 1:
-                self.socket.send_multipart([msgpack.packb(token_list)])
-                return token_list, None
-            else:
-                self.socket.send_multipart(
-                    [msgpack.packb(token_list), msgpack.packb(mtp_token_list)]
-                )
-                return token_list, mtp_token_list
+            msg = [msgpack.packb(token_list)]
+            if self.mtp_size > 1:
+                msg.append(msgpack.packb(mtp_token_list))
+            if pd_first_tokens:
+                msg.append(msgpack.packb(pd_first_tokens))
+            self.socket.send_multipart(msg)
+            return token_list, (mtp_token_list if self.mtp_size > 1 else None), {}
 
     def send_payload(self, payload: torch.Tensor, tasks=None):
         pass
@@ -1739,6 +1749,7 @@ class Executor:
                     tasks_list = PPTaskCollector.update_ongoing()
         elif self.rank == 0 or self.dp_dispatcher:
             TaskCollector.sync_generated_tasks_results()
+            pd_first_tokens_from_workers: dict[str, int] = {}
             if self.dp_dispatcher:
                 collect_tasks = TaskCollector.get_generated_tasks()
                 if collect_tasks.generated_result is not None:
@@ -1754,8 +1765,16 @@ class Executor:
                     if self.mtp_size > 1
                     else None
                 )
-                token_list, mtp_token_list = self.dp_dispatcher.collect_token(
-                    token_list, mtp_token_list
+                local_first_tokens: dict[str, int] = {}
+                for task in collect_tasks.output_tasks:
+                    ft = getattr(task, "_pd_first_token_for_dp_emit", None)
+                    if ft is not None:
+                        local_first_tokens[task.task_id] = ft
+                        del task._pd_first_token_for_dp_emit
+                token_list, mtp_token_list, pd_first_tokens_from_workers = (
+                    self.dp_dispatcher.collect_token(
+                        token_list, mtp_token_list, pd_first_tokens=local_first_tokens
+                    )
                 )
                 collect_tasks.generated_result = token_list
                 if self.mtp_size > 1:
@@ -1767,6 +1786,19 @@ class Executor:
                 ]
             else:
                 tasks_list = [tasks]
+            # PD 分离 DP 场景下，只有 rank 0 的 task 被 DPTaskWrapper
+            # 替换了 update_response_no_sync，调用时会把 token 发给 Router。
+            # Worker rank 的 task 没有这层替换，第一个 token 只更新了本地状态。
+            # 这里在 rank 0 上补发 worker rank 的第一个 token，确保它们在第二个 token 之前到达 Router。
+            if (
+                pd_first_tokens_from_workers
+                and self.dp_dispatcher
+                and self.dp_dispatcher.is_main_rank
+            ):
+                for rid, token in pd_first_tokens_from_workers.items():
+                    task = TaskPool.pool.get(rid)
+                    if task is not None:
+                        task.update_response_sync(token)
         TaskCollector.update_generated_tasks()
         if self.rank == 0:
             for update_tasks in tasks_list:

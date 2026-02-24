@@ -4,16 +4,194 @@
 
 import logging
 import os
+import time
 import threading
+from contextlib import contextmanager
 from typing import Optional
 from chitu.backend import Backend
 from chitu.utils import get_local_ip, get_free_port
-from prometheus_client import Counter, Gauge, start_http_server, REGISTRY
+from prometheus_client import Counter, Gauge, Histogram, start_http_server, REGISTRY
 import atexit
 from chitu.distributed.parallel_state import get_dp_group
 import torch
 
 logger = logging.getLogger(__name__)
+
+# 部分参考自 sglang 的 metrics.py和 vllm
+# ---------------------------------------------------------------------------
+# PD Disaggregation Metrics (module-level singletons, created on first import)
+# These are safe to define at module scope; Prometheus client handles
+# duplicate registration gracefully when the same metric name is reused.
+# ---------------------------------------------------------------------------
+
+# -- Histograms: per-stage latency ------------------------------------------
+_PD_STAGE_BUCKETS = (
+    0.001,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
+    120.0,
+    300.0,
+)
+
+chitu_pd_stage_duration_seconds = Histogram(
+    "chitu_pd_stage_duration_seconds",
+    "PD disaggregation per-stage request latency in seconds",
+    ["role", "stage"],
+    buckets=_PD_STAGE_BUCKETS,
+)
+
+chitu_e2e_request_duration_seconds = Histogram(
+    "chitu_e2e_request_duration_seconds",
+    "End-to-end request latency from router recv to decode complete",
+    buckets=(1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0),
+)
+
+chitu_time_to_first_token_seconds = Histogram(
+    "chitu_time_to_first_token_seconds",
+    "Time from request arrival to first token generated",
+    buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0),
+)
+
+chitu_kv_transfer_duration_seconds = Histogram(
+    "chitu_kv_transfer_duration_seconds",
+    "KV cache transfer duration in seconds",
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
+)
+
+chitu_kv_transfer_size_bytes = Histogram(
+    "chitu_kv_transfer_size_bytes",
+    "KV cache transfer size in bytes per request",
+    buckets=(1e6, 1e7, 5e7, 1e8, 5e8, 1e9),
+)
+
+# -- Gauges: queue depths ---------------------------------------------------
+
+chitu_pd_queue_size = Gauge(
+    "chitu_pd_queue_size",
+    "Current queue size for PD disaggregation stages",
+    ["role", "queue_name"],
+)
+
+chitu_router_pending_requests = Gauge(
+    "chitu_router_pending_requests",
+    "Number of pending requests in router",
+)
+
+chitu_active_requests = Gauge(
+    "chitu_active_requests",
+    "Number of active streaming requests",
+    ["role"],
+)
+
+chitu_kv_transfer_speed_gbps = Gauge(
+    "chitu_kv_transfer_speed_gbps",
+    "Latest KV transfer speed in GB/s",
+)
+
+# -- Counters: errors / completions -----------------------------------------
+
+chitu_kv_transfer_failures_total = Counter(
+    "chitu_kv_transfer_failures_total",
+    "Total KV transfer failures",
+    ["role"],
+)
+
+chitu_request_timeouts_total = Counter(
+    "chitu_request_timeouts_total",
+    "Total request timeouts",
+    ["stage"],
+)
+
+chitu_completed_requests_total = Counter(
+    "chitu_completed_requests_total",
+    "Total completed requests",
+    ["role"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Lightweight helpers (zero-allocation hot path)
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def observe_pd_stage(role: str, stage: str):
+    """Context-manager that records stage duration into the Histogram.
+
+    Uses ``time.monotonic()`` to avoid wall-clock jumps.  The cost is a
+    single ``Histogram.observe(float)`` call on exit -- no string formatting
+    or memory allocation on the hot path.
+    """
+    start = time.monotonic()
+    try:
+        yield
+    finally:
+        duration = time.monotonic() - start
+        chitu_pd_stage_duration_seconds.labels(role=role, stage=stage).observe(duration)
+
+
+def observe_stage_duration(role: str, stage: str, duration_s: float):
+    """Record a pre-computed stage duration (seconds) into the Histogram."""
+    if duration_s >= 0:
+        chitu_pd_stage_duration_seconds.labels(role=role, stage=stage).observe(
+            duration_s
+        )
+
+
+def observe_e2e_duration(duration_s: float):
+    """Record end-to-end request duration."""
+    if duration_s >= 0:
+        chitu_e2e_request_duration_seconds.observe(duration_s)
+
+
+def observe_ttft(duration_s: float):
+    """Record time-to-first-token."""
+    if duration_s >= 0:
+        chitu_time_to_first_token_seconds.observe(duration_s)
+
+
+def observe_kv_transfer(
+    duration_s: float, size_bytes: float = 0, speed_gbps: float = 0
+):
+    """Record KV transfer duration, size, and speed."""
+    if duration_s >= 0:
+        chitu_kv_transfer_duration_seconds.observe(duration_s)
+    if size_bytes > 0:
+        chitu_kv_transfer_size_bytes.observe(size_bytes)
+    if speed_gbps > 0:
+        chitu_kv_transfer_speed_gbps.set(speed_gbps)
+
+
+def set_queue_size(role: str, queue_name: str, size: int):
+    """Set a queue depth gauge."""
+    chitu_pd_queue_size.labels(role=role, queue_name=queue_name).set(size)
+
+
+def inc_completed_requests(role: str, count: int = 1):
+    """Increment completed requests counter."""
+    chitu_completed_requests_total.labels(role=role).inc(count)
+
+
+def inc_kv_transfer_failures(role: str, count: int = 1):
+    """Increment KV transfer failure counter."""
+    chitu_kv_transfer_failures_total.labels(role=role).inc(count)
+
+
+def inc_request_timeouts(stage: str, count: int = 1):
+    """Increment request timeout counter."""
+    chitu_request_timeouts_total.labels(stage=stage).inc(count)
+
 
 _pynvml = None
 _pynvml_failed = False
@@ -342,7 +520,7 @@ class PrometheusMetricsCollector:
                 # Unregister metrics
                 for attr_name in dir(instance):
                     attr = getattr(instance, attr_name, None)
-                    if isinstance(attr, (Counter, Gauge)):
+                    if isinstance(attr, (Counter, Gauge, Histogram)):
                         try:
                             REGISTRY.unregister(attr)
                         except Exception as e:

@@ -10,11 +10,15 @@ defaults:
     - serve_config_rules
 
   # Include model configs into this file. Please set it to the model you want to run.
-  # In this `Qwen2-7B-Instruct` example, it includes `chitu/config/models/Qwen2-7B-Instruct.yaml`
+  #
+  # Acceptable values: One of the model names listed in `docs/en/SUPPORTED_MODELS.md`,
+  # which is essentially one of the file names without suffix in `chitu/config/models`.
+  #
+  # E.g., `Qwen2-7B-Instruct` means including `chitu/config/models/Qwen2-7B-Instruct.yaml`
   # into this file.
   #
-  # IMPORTANT: Typically, you need to set this field.
-  - models: Qwen2-7B-Instruct
+  # IMPORTANT: You always need to set this field.
+  - models: ???
 
   # Type checks for this config file. Only for chitu developers.
   - serve_config_schema
@@ -28,6 +32,26 @@ defaults:
   # Indicates that values in this file has higher priority than values in other files.
   # Don't touch if you are not sure.
   - _self_
+
+# Configs for the model to inference.
+models:
+  # Path to the model checkpoint directory.
+  #
+  # Acceptable values: /path/to/your/checkpoint
+  #
+  # Note to developers: We use `null` instead of `???` here because we have better error messages
+  # for value missing in `chitu_main.py`, while missing values to a `???` field will always triggers
+  # Hydra's default error message.
+  #
+  # IMPORTANT: You always need to set this field.
+  ckpt_dir: null
+
+  # Path to the tokenizer.
+  #
+  # If null, the tokenizer will be loaded from `ckpt_dir`.
+  #
+  # Acceptable values: null, /path/to/your/tokenizer
+  tokenizer_path: null
 
 # Configs for how chitu responses to HTTP requests.
 serve:

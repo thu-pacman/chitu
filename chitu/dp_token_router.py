@@ -99,7 +99,7 @@ class TokenRouter:
 
     async def register_request(self, request_id: str, router_request) -> AsyncResponse:
         """Register new request, return AsyncResponse for streaming"""
-        logger.info(f"Token Router: Registering request {request_id}")
+        logger.debug(f"Token Router: Registering request {request_id}")
 
         # Create special AsyncDataStream for DP scenario
         dp_stream = DPAsyncDataStream()
@@ -122,7 +122,7 @@ class TokenRouter:
             orig_send_stop_signal = router_request.async_stream.send_stop_signal
 
             def wrapped_send_stop_signal():
-                logger.info(f"Token Router: Stream stop for request {request_id}")
+                logger.debug(f"Token Router: Stream stop for request {request_id}")
                 orig_send_stop_signal()
                 # Mark finished timestamp for diagnostics
                 ctx = self.active_requests.get(request_id)
@@ -136,7 +136,11 @@ class TokenRouter:
                 f"Token Router: failed to wrap stop signal for {request_id}: {e}"
             )
 
-        logger.info(
+        # Update active requests gauge
+        from chitu.metrics.prometheus_collector import chitu_active_requests
+
+        chitu_active_requests.labels(role="decode").set(len(self.active_requests))
+        logger.debug(
             f"Token Router: Request {request_id} registered, active requests: {len(self.active_requests)}"
         )
         return response
@@ -230,7 +234,7 @@ class TokenRouter:
                 context.user_request, "set_prompt_len"
             ):
                 context.user_request.set_prompt_len(prompt_len)
-                logger.info(
+                logger.debug(
                     f"Token Router: Updated prompt_len={prompt_len} for request {request_id}"
                 )
                 router = get_request_router()
@@ -261,13 +265,17 @@ class TokenRouter:
             if ctx and not ctx.first_token_logged:
                 ctx.first_token_logged = True
                 created_ts = getattr(ctx, "created_time", self.start_time)
-                ttft_ms = (time.time() - created_ts) * 1000.0
+                ttft_s = time.time() - created_ts
+                # Record TTFT metric (router-side, includes network latency)
+                from chitu.metrics.prometheus_collector import observe_ttft
+
+                observe_ttft(ttft_s)
                 logger.debug(
-                    f"[TTFT] request={request_id} ttft_ms={ttft_ms:.1f} dp={token_data.get('scheduler_id')}"
+                    f"[TTFT] request={request_id} ttft_ms={ttft_s * 1000.0:.1f} dp={token_data.get('scheduler_id')}"
                 )
-                if ttft_ms > 10000.0:
+                if ttft_s > 10000.0:
                     logger.warning(
-                        f"[TTFT] dp={token_data.get('scheduler_id')}, request={request_id}, has long ttft_ms={ttft_ms:.1f}"
+                        f"[TTFT] dp={token_data.get('scheduler_id')}, request={request_id}, has long ttft_s={ttft_s:.1f}"
                     )
                 # 首 token 到达即释放 Router 本地准入占位
                 router = get_request_router()
@@ -294,7 +302,11 @@ class TokenRouter:
 
             # Remove from active requests
             del self.active_requests[request_id]
-            logger.info(
+            # Update active requests gauge
+            from chitu.metrics.prometheus_collector import chitu_active_requests
+
+            chitu_active_requests.labels(role="decode").set(len(self.active_requests))
+            logger.debug(
                 f"Token Router: Request {request_id} removed from active_requests on finish"
             )
 

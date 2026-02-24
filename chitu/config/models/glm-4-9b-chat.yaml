@@ -8,8 +8,6 @@
 name: glm-4-9b-chat
 type: hf-llama
 source: "https://huggingface.co/zai-org/glm-4-9b-chat-hf" # Just for displaying. No automatic download.
-ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
-tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
 tokenizer_type: "hf" # one of: hf, tiktoken
 dim: 4096
 n_layers: 40
