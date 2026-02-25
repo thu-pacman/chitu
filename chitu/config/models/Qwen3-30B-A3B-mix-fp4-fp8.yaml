@@ -2,11 +2,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+# Qwen3-30B-A3B-mix-fp4-fp8 is a quantization of Qwen3-30B-A3B
 defaults:
   - Qwen3-30B-A3B
   - quant_config: mix-fp4-fp8
   - _self_ # Config in this file overrides configs in defaults
 
-
+# Access info
 name: Qwen3-30B-A3B-mix-fp4-fp8
-source: "(This is an internal quantized model, only for testing purpose)" # Just for displaying. No automatic download.
+is_pro: true

@@ -2,9 +2,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+# DeepSeek-R1-Distill-Qwen-14B-fp8 is a quantization of DeepSeek-R1-Distill-Qwen-14B
 defaults:
   - DeepSeek-R1-Distill-Qwen-14B
   - quant_config: blockfp8
   - _self_ # Config in this file overrides configs in defaults
+
+# Access info
 name: DeepSeek-R1-Distill-Qwen-14B-fp8
-source: "" # Just for displaying. No automatic download.
+is_pro: true

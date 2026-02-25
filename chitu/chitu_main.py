@@ -517,9 +517,18 @@ def warmup_engine(args):
 
 def check_checkpoint_path(args):
     if args.models.ckpt_dir is None:
-        raise ValueError(
-            f"No checkpoint path provided. You can set it in command line by adding `models.ckpt_dir=<path>`. The model {args.models.name} can be downloaded from {args.models.source}"
-        )
+        if not getattr(args.models, "is_pro", False):
+            raise ValueError(
+                f"No checkpoint path provided. You can set it in command line by adding "
+                f"`models.ckpt_dir=<path>`. The model {args.models.name} can be downloaded "
+                f"from {args.models.source}"
+            )
+        else:
+            raise ValueError(
+                f"No checkpoint path provided. You can set it in command line by adding "
+                f"`models.ckpt_dir=<path>`. The model {args.models.name} is part of "
+                f"chitu-pro, which may be obtained by concatting solution@chitu.ai"
+            )
     if args.models.tokenizer_path is None:
         logger.info(
             f"Using {args.models.ckpt_dir} as the path to tokenizer. If the tokenizer has a different path, please set in command line by adding `models.tokenizer_path=<path>`"

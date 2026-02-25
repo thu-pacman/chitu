@@ -10,5 +10,4 @@ defaults:
 
 # Access info
 name: Qwen3-32B-QServe-w4a8-g128
-source: "(This is an internal quantized model, only for testing purpose)" # Just for displaying. No automatic download.
-
+is_pro: true

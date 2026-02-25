@@ -2,13 +2,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# Qwen3-30B-A3B-fp8 is a quantization of Qwen3-30B-A3B
+# Qwen3-30B-A3B-fp8-kv is a quantization of Qwen3-30B-A3B
 defaults:
   - Qwen3-30B-A3B
   - quant_config: blockfp8_moe_kv
   - _self_ # Config in this file overrides configs in defaults
 
 # Access info
-name: Qwen3-30B-A3B-fp8
+name: Qwen3-30B-A3B-fp8-kv
 source: "https://huggingface.co/Qwen/Qwen3-30B-A3B-FP8" # Just for displaying. No automatic download.
-

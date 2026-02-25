@@ -11,4 +11,4 @@ defaults:
 
 # Access info
 name: DeepSeek-R1-Q4_K_M
-
+source: "https://huggingface.co/bartowski/DeepSeek-R1-GGUF" # Just for displaying. No automatic download.

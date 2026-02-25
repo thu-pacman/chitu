@@ -10,4 +10,4 @@ defaults:
 
 # Access info
 name: Qwen3-32B-mixq-mix
-source: "(This is an internal quantized model, only for testing purpose)" # Just for displaying. No automatic download.
+is_pro: true
