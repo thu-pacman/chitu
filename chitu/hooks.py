@@ -13,7 +13,6 @@ from chitu.global_vars import get_global_args
 from chitu.task import (
     Task,
     TaskPool,
-    TaskDecodeType,
     PackedTasks,
     PackedTasksBase,
 )
@@ -231,7 +230,7 @@ class MooncakeKVTransferHook:
                 # `decode_status` is a read-only property; update the internal state directly.
                 # Also clear `waiting` to ensure need_remove() becomes True immediately.
                 t.waiting = False
-                t._decode_status = TaskDecodeType.Stopped
+                t.stopped = True
 
     def before_decode_step(self, req_ids: list[str]):
         if self.kv_manager is None:

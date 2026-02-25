@@ -261,9 +261,9 @@ class DPTaskWrapper:
         self.token_sender = token_sender
         self._finish_sent = False
 
-        # Hook update_response_no_sync for token sending
-        self._original_update_response_sync = original_task.update_response_no_sync
-        original_task.update_response_no_sync = self._dp_update_response_sync
+        # Hook update_response_sync for token sending
+        self._original_update_response_sync = original_task.update_response_sync
+        original_task.update_response_sync = self._dp_update_response_sync
 
         # Hook update_decode_status for finish detection
         self._original_update_decode_status = original_task.update_decode_status

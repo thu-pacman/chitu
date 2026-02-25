@@ -6,7 +6,7 @@ from chitu.scheduler import Scheduler, SkewScheduler
 from chitu.global_vars import set_global_args, set_slot_handle, get_global_args
 from chitu.backend import Backend
 import pytest
-from chitu.task_type import TaskType, TaskDecodeType
+from chitu.task_type import TaskType
 from chitu.utils import ceil_div
 
 
@@ -21,6 +21,9 @@ class MockExecutor:
             if task_id in Backend.cache_managers["main"].block_table
         ]
         Backend.cache_managers["main"].finalize_cache_all_decode(task_ids)
+
+    def special_step(self, task_ids, type):
+        pass
 
 
 class MockCacheManager:
@@ -187,7 +190,7 @@ def test_chunked_prefill_skew():
 
     # Prefill:
 
-    # Slot groups: [[],[]], free_sgroup: [0, 1]
+    # Slot groups: [[],[]], sgroup head at: 0
     # Task length remaining: [1000, 2000, 3000, 4000]
     batch1_ids = scheduler.schedule()
     assert sorted(batch1_ids) == sorted(["req_0", "req_1", "req_2"])
@@ -195,27 +198,27 @@ def test_chunked_prefill_skew():
         TaskPool.pool[task_id].consume_req_tokens()
     scheduler.update(batch1_ids)
 
-    # Slot groups: [["req_0", "req_1", "req_2", 'req_3'],[]], free_sgroup: [1, 0]
+    # Slot groups: [[], ["req_0", "req_1", "req_2", 'req_3']], sgroup head at: 1
     # Task length remaining:: [0, 0, 1904, 4000]
     empty_ids = scheduler.schedule()
     assert empty_ids == []  # skewScheduler doesn't change task's slot group
     scheduler.update([])
 
-    # Slot groups: [["req_0", "req_1", "req_2", 'req_3'],[]], free_sgroup: [0, 1]
+    # Slot groups: [[], ["req_0", "req_1", "req_2", 'req_3'],[]], sgroup head at: 0
     # Task length remaining: [0, 0, 1904, 4000]
     batch2_ids = scheduler.schedule()
-    assert sorted(batch2_ids) == sorted(["req_2"])
+    assert sorted(batch2_ids) == sorted(["req_2", "req_3"])
     for task_id in batch2_ids:
         TaskPool.pool[task_id].consume_req_tokens()
     scheduler.update(batch2_ids)
 
-    # Slot groups: [["req_0", "req_1", "req_2", 'req_3'],[]], free_sgroup: [1, 0]
+    # Slot groups: [[], ["req_0", "req_1", "req_2", 'req_3']], sgroup head at: 1
     # Task length remaining: [0, 0, 0, 1808]
     empty_ids = scheduler.schedule()
     assert empty_ids == []
     scheduler.update([])
 
-    # Slot groups: [["req_0", "req_1", "req_2", 'req_3'],[]], free_sgroup: [0, 1]
+    # Slot groups: [[], ["req_0", "req_1", "req_2", 'req_3']], sgroup head at: 0
     # Task length remaining: [0, 0, 0, 1808]
     batch3_ids = scheduler.schedule()
     assert sorted(batch3_ids) == sorted(["req_3"])
@@ -223,14 +226,14 @@ def test_chunked_prefill_skew():
         TaskPool.pool[task_id].consume_req_tokens()
     scheduler.update(batch3_ids)
 
-    # Slot groups: [["req_0", "req_1", "req_2", 'req_3'],[]], free_sgroup: [1, 0]
+    # Slot groups: [["req_0", "req_1", "req_2", 'req_3'],[]], sgroup head at: 1
     # Remaining: [0, 0, 0, 0]
     empty_ids = scheduler.schedule()
     assert empty_ids == []
     scheduler.update([])
 
     # Decode:
-    # Slot groups: [["req_0", "req_1", "req_2", 'req_3'],[]], free_sgroup: [1, 0]
+    # Slot groups: [[], ["req_0", "req_1", "req_2", 'req_3']], sgroup head at: 0
     # Remaining: [0, 0, 0, 0]
     batch4_ids = scheduler.schedule()
     assert sorted(batch4_ids) == sorted(["req_0", "req_1", "req_2", "req_3"])
@@ -367,7 +370,7 @@ def test_priority_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
+        TaskPool.pool[task_id].stopped = True
     scheduler.update(batch1_ids)
 
     # slot_groups: [[]], free_sgroup: deque([0])
@@ -378,7 +381,7 @@ def test_priority_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
+        TaskPool.pool[task_id].stopped = True
     scheduler.update(batch2_ids)
 
     # slot_group: [[]], free_sgroups: deque([0])
@@ -391,7 +394,7 @@ def test_priority_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
+        TaskPool.pool[task_id].stopped = True
     scheduler.update(batch3_ids)
 
     # slot_group: [[]], free_sgroups: deque([0])
@@ -522,7 +525,7 @@ def test_priority_fcfs_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
+        TaskPool.pool[task_id].stopped = True
     scheduler.update(batch1_ids)
 
     # slot_group: [[]], free_sgroup: deque([0])
@@ -534,7 +537,7 @@ def test_priority_fcfs_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
+        TaskPool.pool[task_id].stopped = True
     scheduler.update(batch2_ids)
 
     # slot_group: [[]], free_sgroup: deque([0])
@@ -542,16 +545,12 @@ def test_priority_fcfs_skew():
     batch3_ids = scheduler.schedule()
     assert sorted(batch3_ids) == sorted(["req_6", "req_7", "req_8"])
 
-    # slot_group: [["req_6", "req_7", "req_8"]], free_sgroup: deque([])
-    # TaskPool: ['req_7', 'req_8', 'req_6']
-    batch4_ids = scheduler.schedule()
-    assert len(batch4_ids) == 0  # No avalible slot group, return empty task_ids
     for task_id in batch3_ids:
         # Make task need_move
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
+        TaskPool.pool[task_id].stopped = True
     scheduler.update(batch3_ids)
 
     # slot_group: [[]], free_sgroup: deque([0])
@@ -697,7 +696,7 @@ def test_priority_request_preset_over_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
+        TaskPool.pool[task_id].stopped = True
     scheduler.update(batch1_ids)
 
     # TaskPool: ['req_2', 'req_1', 'req_5', 'req_8', 'req_6']
@@ -709,7 +708,7 @@ def test_priority_request_preset_over_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
+        TaskPool.pool[task_id].stopped = True
     scheduler.update(batch2_ids)
 
     # TaskPool: ['req_1', 'req_8']
@@ -721,7 +720,7 @@ def test_priority_request_preset_over_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
+        TaskPool.pool[task_id].stopped = True
     scheduler.update(batch3_ids)
 
     # TaskPool: []
@@ -968,7 +967,7 @@ def test_evict_decode_task():
         task = TaskPool.pool[f"req_{i}"]
         task.next_token = 2
         task.num_new_tokens = 1
-        task._decode_status = TaskDecodeType.Stopped
+        task.stopped = True
     task_ids = [task.task_id for task in tasks]
     removed_task_ids, _ = scheduler.update(task_ids)
     Backend.cache_managers["main"].finalize_cache_all_decode(removed_task_ids)
@@ -1028,24 +1027,20 @@ def test_scheduler_group():
     scheduler = Scheduler(100, 4, 2, "prefill_first", num_scheduler_groups=2)
 
     # TaskPool: ['req_7', 'req_2', 'req_1', 'req_5']
-    # free_sgroups: deque([0, 1]), used_sgroups: set()
+    # sgroup head at: 0, empty sgroup: [0, 1]
     batch1_ids = scheduler.schedule()
     assert batch1_ids == [
         "req_7",
         "req_1",
     ]  # scheduler prefill tasks, num_tasks <= prefill_mbs == 4
-    for task_id in batch1_ids:
-        TaskPool.pool[task_id].wait(None)
 
     # TaskPool: {'req_7':waiting, 'req_2', 'req_1':waiting, 'req_5'}
-    # free_sgroups: deque([1]), used_sgroups: {0}
+    # sgroup head at: 1, empty sgroup: [0]
     batch2_ids = scheduler.schedule()
     assert batch2_ids == [
         "req_2",
         "req_5",
     ]  # scheduler decode tasks, num_tasks <=decode_mbs == 4
-    for task_id in batch2_ids:
-        TaskPool.pool[task_id].wait(None)
 
     # Add another 5 tasks
     TaskPool.add(tasks[3])
@@ -1054,66 +1049,54 @@ def test_scheduler_group():
     TaskPool.add(tasks[4])
     TaskPool.add(tasks[6])
 
-    # TaskPool: ['req_7':waiting, 'req_2':waiting, 'req_1':waiting, 'req_5':waiting, 'req_3', 'req_8', 'req_0', 'req_4', 'req_6']
-    # free_sgroups: deque([]), used_sgroups: {0, 1}
-    empty_ids = scheduler.schedule()
-    assert len(empty_ids) == 0  # No avilable scheduler groups, empty task_ids
-
-    # Set all tasks in scheduler_group_0 are unwait, release scheduler_group_0
-    for task_id in batch1_ids:
-        TaskPool.pool[task_id].unwait()
+    # sgroup head at: 0, empty sgroup: []
     scheduler.update(batch1_ids)
+    assert len(scheduler.sgroup_list._sgroup_list[1]) == 0
 
     # TaskPool: ['req_7', 'req_2':waiting, 'req_1', 'req_5':waiting, 'req_3', 'req_8', 'req_0', 'req_4', 'req_6']
-    # free_sgroups: deque([0]), used_sgroups: {1}
+    # sgroup head at: 0, empty sgroup: [1]
     batch3_ids = scheduler.schedule()
     assert batch3_ids == ["req_7", "req_1", "req_3", "req_8"]
 
+    # Set all tasks in scheduler_group_1 are unwait, release scheduler_group_1
+    for task_id in batch2_ids:
+        TaskPool.pool[task_id].num_new_tokens = 1025
+        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id].stopped = True
+    # sgroup head at: 1, empty sgroup: []
+    scheduler.update(batch2_ids)
+
+    # TaskPool: TaskPool: ['req_0', 'req_4', 'req_6']
+    # sgroup head at: 1, empty sgroup: [0]
+    # sgroup_0 release earlier than sgroup_1, so it will be scheduled earlier than sgroup_1
+    batch4_ids = scheduler.schedule()
+    assert batch4_ids == ["req_0", "req_4"]
     # remove tasks in scheduler_group_0, release scheduler_group_0
     for task_id in batch3_ids:
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
+        TaskPool.pool[task_id].stopped = True
+    # sgroup head at: 0, empty sgroup: []
     scheduler.update(batch3_ids)
 
-    # Set all tasks in scheduler_group_1 are unwait, release scheduler_group_1
-    for task_id in batch2_ids:
-        TaskPool.pool[task_id].unwait()
-        TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
-        TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
-    scheduler.update(batch2_ids)
-
-    # TaskPool: TaskPool: ['req_0', 'req_4', 'req_6']
-    # free_sgroups: deque([1, 0]), used_sgroups: set()
-    # sgroup_0 release earlier than sgroup_1, so it will be scheduled earlier than sgroup_1
-    batch4_ids = scheduler.schedule()
-    assert batch4_ids == ["req_0", "req_4"]
-    for task_id in batch4_ids:
-        TaskPool.pool[task_id].wait(None)
-
     # TaskPool: ['req_0':waiting, 'req_4':waiting, 'req_6']
-    # free_sgroups: deque([1]), used_sgroups: {0}
+    # sgroup head at: 0, empty sgroup: [1]
     batch5_ids = scheduler.schedule()
     assert batch5_ids == ["req_6"]
 
-    for task_id in batch5_ids:
-        TaskPool.pool[task_id].wait(None)
     for task_id in batch4_ids + batch5_ids:
-        TaskPool.pool[task_id].unwait()
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
-    scheduler.update(batch5_ids, batch4_ids)
+        TaskPool.pool[task_id].stopped = True
+    scheduler.update(batch4_ids)
+    scheduler.update(batch5_ids)
 
     # TaskPool: []
     empty_ids = scheduler.schedule()
     assert len(empty_ids) == 0
-    assert len(scheduler.free_sgroups) == 2
-    assert len(scheduler.used_sgroups) == 0
 
 
 def test_slot_group_skew():
@@ -1170,24 +1153,20 @@ def test_slot_group_skew():
     )
 
     # TaskPool: ['req_7', 'req_2', 'req_1', 'req_5']
-    # slot_group: [[], []], free_sgroup: deque([0, 1])
+    # slot_group: [[], []], sgroup head at: 0
     batch1_ids = scheduler.schedule()
     assert batch1_ids == [
         "req_7",
         "req_1",
     ]  # scheduler prefill tasks, num_tasks <= prefill_mbs == 4
-    for task_id in batch1_ids:
-        TaskPool.pool[task_id].wait(None)
 
     # TaskPool: {'req_7':waiting, 'req_2', 'req_1':waiting, 'req_5'}
-    # slot_group: [['req_7', 'req_1'], []], free_sgroup: deque([1])
+    # slot_group: [[], ['req_7', 'req_1']], sgroup head at: 1
     batch2_ids = scheduler.schedule()
     assert batch2_ids == [
         "req_2",
         "req_5",
     ]  # scheduler decode tasks, num_tasks <=decode_mbs == 4
-    for task_id in batch2_ids:
-        TaskPool.pool[task_id].wait(None)
 
     # Add another 5 tasks
     TaskPool.add(tasks[3])
@@ -1196,67 +1175,55 @@ def test_slot_group_skew():
     TaskPool.add(tasks[4])
     TaskPool.add(tasks[6])
 
-    # TaskPool: ['req_7':waiting, 'req_2':waiting, 'req_1':waiting, 'req_5':waiting, 'req_3', 'req_8', 'req_0', 'req_4', 'req_6']
-    # slot_group: [['req_7', 'req_1'], ['req_2', 'req_5']], free_sgroups: deque([])
-    empty_ids = scheduler.schedule()
-    assert len(empty_ids) == 0  # No avilable scheduler groups, empty task_ids
-    assert len(scheduler.free_sgroups) == 0
-
     # Set all tasks in scheduler_group_0 are unwait, release scheduler_group_0
-    for task_id in batch1_ids:
-        TaskPool.pool[task_id].unwait()
+    # slot_group: [['req_2', 'req_5'], ['req_7', 'req_1']], sgroup head at: 0
     scheduler.update(batch1_ids)
 
     # TaskPool: ['req_7', 'req_2':waiting, 'req_1', 'req_5':waiting, 'req_3', 'req_8', 'req_0', 'req_4', 'req_6']
-    # slot_group: [['req_7', 'req_1'], ['req_2', 'req_5']], free_sgroup: deque([0])
+    # slot_group: [['req_2', 'req_5'], []], sgroup head at: 0
     batch3_ids = scheduler.schedule()
     assert batch3_ids == ["req_7", "req_1", "req_3", "req_8"]
+
+    # Set all tasks in scheduler_group_1 are unwait, release scheduler_group_1
+    for task_id in batch2_ids:
+        TaskPool.pool[task_id].num_new_tokens = 1025
+        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].task_type = TaskType.Decode
+        TaskPool.pool[task_id].stopped = True
+    # slot_group: [['req_2', 'req_5'], ['req_7', 'req_1', 'req_3', 'req_8']], sgroup head at: 1
+    scheduler.update(batch2_ids)
+
+    # TaskPool: TaskPool: ['req_0', 'req_4', 'req_6']
+    # slot_group: [[], ['req_7', 'req_1', 'req_3', 'req_8']], sgroup head at: 1
+    # sgroup_0 release earlier than sgroup_1, so it will be scheduled earlier than sgroup_1
+    batch4_ids = scheduler.schedule()
+    assert batch4_ids == ["req_0", "req_4"]
 
     # remove tasks in scheduler_group_0, release scheduler_group_0
     for task_id in batch3_ids:
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
+        TaskPool.pool[task_id].stopped = True
+    # slot_group: [['req_0', 'req_4'], ['req_7', 'req_1', 'req_3', 'req_8']], sgroup head at: 0
     scheduler.update(batch3_ids)
 
-    # Set all tasks in scheduler_group_1 are unwait, release scheduler_group_1
-    for task_id in batch2_ids:
-        TaskPool.pool[task_id].unwait()
-        TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
-        TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
-    scheduler.update(batch2_ids)
-
-    # TaskPool: TaskPool: ['req_0', 'req_4', 'req_6']
-    # slot_group: [[], []], free_sgroup: deque([0, 1])
-    # sgroup_0 release earlier than sgroup_1, so it will be scheduled earlier than sgroup_1
-    batch4_ids = scheduler.schedule()
-    assert batch4_ids == ["req_0", "req_4"]
-    for task_id in batch4_ids:
-        TaskPool.pool[task_id].wait(None)
-
     # TaskPool: ['req_0':waiting, 'req_4':waiting, 'req_6']
-    # slot_group: [['req_0', 'req_4'], []], free_sgroup: deque([1])
+    # slot_group: [['req_0', 'req_4'], []], sgroup head at: 0
     batch5_ids = scheduler.schedule()
     assert batch5_ids == ["req_6"]
 
-    for task_id in batch5_ids:
-        TaskPool.pool[task_id].wait(None)
     for task_id in batch4_ids + batch5_ids:
-        TaskPool.pool[task_id].unwait()
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id]._decode_status = TaskDecodeType.Stopped
-    scheduler.update(batch5_ids, batch4_ids)
+        TaskPool.pool[task_id].stopped = True
+    scheduler.update(batch4_ids)
+    scheduler.update(batch5_ids)
 
     # TaskPool: []
     empty_ids = scheduler.schedule()
     assert len(empty_ids) == 0
-    assert len(scheduler.free_sgroups) == 2
-    assert len(scheduler.used_sgroups) == 0
 
 
 def test_pp_chunked_prefill():
@@ -1279,31 +1246,34 @@ def test_pp_chunked_prefill():
     }
     Backend.executor = MockExecutor()
 
-    for i in range(4):
+    for i in range(5):
         req = MockFixedLengthedUserRequest(
             input_len=192, request_id=f"req_{i}", enable_reasoning=False
         )
         task = Task(f"{req.request_id}", req)
         TaskPool.add(task)
 
-    for i in range(4):
+    for i in range(5):
         req = MockFixedLengthedUserRequest(
-            input_len=96, request_id=f"req_{i + 4}", enable_reasoning=False
+            input_len=96, request_id=f"req_{i + 5}", enable_reasoning=False
         )
         task = Task(f"{req.request_id}", req)
         TaskPool.add(task)
 
     scheduler = Scheduler(
-        100, 12, 12, "prefill_first", num_scheduler_groups=4, prefill_chunk_size=200
+        100, 12, 12, "prefill_first", num_scheduler_groups=3, prefill_chunk_size=200
     )
 
+    # group 1: [0, 1], [1, 6]
+    # group 2: [2, 3], [3, 7]
+    # group 3: [4, 5], [5, 8, 9]
     expected_batch_ids_list = [
         ["req_0", "req_1"],
-        ["req_1", "req_2"],
-        ["req_2"],
-        ["req_3"],
+        ["req_2", "req_3"],
         ["req_4", "req_5"],
-        ["req_6", "req_7"],
+        ["req_1", "req_6"],
+        ["req_3", "req_7"],
+        ["req_5", "req_8", "req_9"],
     ]
 
     for i in range(len(expected_batch_ids_list)):

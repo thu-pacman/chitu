@@ -828,7 +828,6 @@ class PDScheduler(Scheduler):
 
         args = get_global_args()
         pp_size = args.infer.pp_size
-
         if pp_size > 1:
             # PP+TP path:
             #
@@ -844,7 +843,6 @@ class PDScheduler(Scheduler):
             tasks = PackedTasksBase(
                 num_tasks=1,
                 task_ids=[task.task_id],
-                req_ids=[task.req.request_id],
                 task_type=TaskType.Prefill,
                 tokens=[tokens],
                 num_tokens=len(tokens),
