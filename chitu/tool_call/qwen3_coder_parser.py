@@ -99,7 +99,7 @@ class Qwen3CoderToolParser(SimpleParser):
         arg_type = None
         try:
             arg_type = self.parameters_type[name].properties[arg_name].type
-        except:
+        except Exception:
             logger.exception(f"get arg_type failed {name=} {arg_name=}")
 
         if arg_type == "string":

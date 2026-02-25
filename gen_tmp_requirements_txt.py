@@ -28,7 +28,7 @@ try:
         extras = sys.argv[1].split(",") if sys.argv[1] else []
     else:
         raise ValueError("Too many arguments")
-except:
+except Exception:
     print(
         f"Usage: {sys.argv[0]} [extra1,extra2,...]",
         file=sys.stderr,
