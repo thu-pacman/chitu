@@ -9,6 +9,8 @@ class TaskType(Enum):
     Prefill = 1
     Decode = 2
     Special = -1
+    PrefillDLLM = 3
+    DecodeDLLM = 4
 
 
 class TaskDecodeType(Enum):

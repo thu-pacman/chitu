@@ -22,8 +22,8 @@ MODEL_NAME="Qwen3-32B"
 
 run_server(){
     SERVE_JOB_NAME="run_serve" # rename "run_serve" (with a unique name) to prevent conflicts
-    SLURM_PARTITION=debug
-    NUM_GPUS=1
+    SLURM_PARTITION=Long
+    NUM_GPUS=2
     CPUS_PER_GPU=24
     MEM_PER_GPU=142144
 
@@ -47,14 +47,14 @@ run_server(){
         HYDRA_FULL_ERROR=1 \
         torchrun \
             --nnodes=\$NUM_NODES \
-            --nproc_per_node=1 \
+            --nproc_per_node=2 \
             -m chitu \
             serve.port=21002 \
             infer.pp_size=1 \
-            infer.tp_size=1 \
+            infer.tp_size=2 \
             infer.cache_type=paged \
             models=Qwen3-32B \
-            models.ckpt_dir=/data/nfs/Qwen3-32B \
+            models.ckpt_dir=/home/dataset/Qwen3-32B \
             infer.use_cuda_graph=True \
             infer.max_reqs=256 \
             infer.max_seq_len=2048 \
@@ -75,6 +75,8 @@ run_benchmark(){
             --output-len 1024 \
             --warmup 1 \
             --base-url http://${host_name}:21002 \
+            --dataset sharegpt \
+            --dataset-path /home/dataset/SharedGPT/ShareGPT_V3_unfiltered_cleaned_split.json \
             2>&1 | stdbuf -o0 tee "$temp_file"  # Do not delete
 
         # Extract result from temp_file, Do not delete

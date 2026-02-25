@@ -1280,6 +1280,10 @@ class Executor:
             out = self.prefill_step(tasks)
         elif tasks.task_type == TaskType.Decode:
             out = self.decode_step(tasks)
+        elif tasks.task_type == TaskType.PrefillDLLM:
+            out = self.prefill_dllm_step(tasks)
+        elif tasks.task_type == TaskType.DecodeDLLM:
+            out = self.decode_dllm_step(tasks)
         else:
             raise NotImplementedError
 
@@ -1634,6 +1638,14 @@ class Executor:
                 dispatcher.send_payload(self.dummy_logits, tasks=tasks)
 
             return self.dummy_output
+
+
+
+    def prefill_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
+        pass
+
+    def decode_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
+        pass
 
     def sample(self, logits: torch.Tensor, tasks: PackedTasks):
         """

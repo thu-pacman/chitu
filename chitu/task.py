@@ -412,12 +412,16 @@ class Task(ConstraintDecodeTask):
         grammar_str: str = "",
         priority: int = 1,
         stop_with_eos: bool = True,
+        infermode: str = "autoregressive",
     ):
         logger.debug(f"Create Task {task_id} with priority {priority}")
 
         # Task meta
         self.task_id = task_id
-        self.task_type = TaskType.Prefill  # New Task object is always a prefill task
+        if infermode == "autoregressive":
+            self.task_type = TaskType.Prefill  # New Task object is always a prefill task
+        elif infermode == "diffusionllm":
+            self.task_type = TaskType.PrefillDLLM
         self.stop_with_eos = stop_with_eos
         self.params = params if params is not None else req.params
         self.dp_rank: Optional[int] = None
