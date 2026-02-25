@@ -221,7 +221,7 @@ async def create_chat_completion(
             return JSONResponse(response_dict)
     except HTTPException:
         raise
-    except:
+    except Exception:
         logger.exception("request handle exception")
         with suppress(Exception):
             del user_req

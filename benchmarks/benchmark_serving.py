@@ -32,7 +32,7 @@ import asyncio
 
 try:
     from transformers import AutoTokenizer
-except:
+except Exception:
     print("Failed to import AutoTokenizer, local tokenizer is disabled.")
 
 
@@ -175,7 +175,7 @@ class BenchmarkServing:
                 self.detokenize = partial(
                     self.tokenizer.decode, skip_special_tokens=True
                 )
-            except:
+            except Exception:
                 print(
                     "Local tokenizer is not loaded, trying tokenizer interface from server if available."
                 )
@@ -185,7 +185,7 @@ class BenchmarkServing:
                 test_prompt = "tokenizer test message"
                 test_token_ids = self.remote_tokenize(test_prompt)
                 self.remote_detokenize(test_token_ids)
-            except:
+            except Exception:
                 raise Exception(
                     "Tokenizer interface unavailable, please install transformers and set local tokenizer using --tokenizer-path."
                 )
@@ -199,7 +199,7 @@ class BenchmarkServing:
             ), "args.dataset_path should be set to use sharegpt dataset."
             try:
                 self.dataset = ShareGPTDataset(self.config.dataset_path)
-            except:
+            except Exception:
                 raise Exception(
                     "Dataset is not loaded, sharegpt dataset is not supported!"
                 )

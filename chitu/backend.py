@@ -1313,7 +1313,7 @@ class Backend:
                     Backend.tokenizer.model.chat_template
                 )
             )
-        except:
+        except Exception:
             logger.exception(f"patch chat template failed, tool call may be incorrect!")
 
         # Initialize tool parser
@@ -1328,7 +1328,7 @@ class Backend:
                     Backend.tokenizer.model.chat_template
                 )
             )
-        except:
+        except Exception:
             logger.exception(f"patch chat template failed, tool call may be incorrect!")
 
         attn_backend_type = Backend._get_attention_backend_type(args)

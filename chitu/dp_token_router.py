@@ -483,7 +483,7 @@ class DPAsyncDataStream(AsyncDataStream):
                     force_full_seq_decode = getattr(
                         Backend.tokenizer, "force_full_seq_decode", False
                     )
-            except:
+            except Exception:
                 force_full_seq_decode = False
 
             if not force_full_seq_decode:
