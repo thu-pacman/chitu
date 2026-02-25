@@ -10,4 +10,4 @@ defaults:
 
 # Access info
 name: DeepSeek-R1-Distill-Llama-70B-ascend-int8
-source: "*" # Just for displaying. No automatic download.
+is_pro: true

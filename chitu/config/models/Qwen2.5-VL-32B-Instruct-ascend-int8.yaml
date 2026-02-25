@@ -10,4 +10,4 @@ defaults:
 
 # Access info
 name: Qwen2.5-VL-32B-Instruct-ascend-int8
-source: "*" # Just for displaying. No automatic download.
+is_pro: true

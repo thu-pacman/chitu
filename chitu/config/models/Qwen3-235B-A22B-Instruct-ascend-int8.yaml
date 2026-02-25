@@ -10,5 +10,4 @@ defaults:
 
 # Access info
 name: Qwen3-235B-A22B-Instruct-ascend-int8
-source: "*" # Just for displaying. No automatic download.
-
+is_pro: true

@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+quant: 
+- model: '.'
+  rules:
+    - regex: '\.self_attn'
+      type: mxfp4
+    - regex: '\.mlp.moe'
+      type: mxfp4
+    - regex: '\.mlp.experts\.'
+      type: mxfp4
+    - regex: '\.mlp.gate_proj'
+      type: mxfp4
+    - regex: '\.mlp.gate_up_proj'
+      type: mxfp4
+    - regex: '\.mlp.up_proj'
+      type: mxfp4
+    - regex: '\.mlp.down_proj'
+      type: mxfp4

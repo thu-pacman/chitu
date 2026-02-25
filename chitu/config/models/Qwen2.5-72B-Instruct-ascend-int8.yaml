@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+# Qwen2.5-72B-Instruct-ascend-int8 is a quantization of Qwen2-72B-Instruct
 defaults:
   - Qwen2-72B-Instruct
   - quant_config: ascend-int8-with-bias
@@ -9,4 +10,4 @@ defaults:
 
 # Access info
 name: Qwen2.5-72B-Instruct-ascend-int8
-source: "*" # Just for displaying. No automatic download.
+is_pro: true

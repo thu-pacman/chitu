@@ -2,12 +2,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# DeepSeek-R1-ascend-int8 is a quantization of DeepSeek-R1
+# Qwen3-32B-mxfp4 is a quantization of Qwen3-32B
 defaults:
-  - DeepSeek-R1
-  - override quant_config: ds-ascend-mla-int8
+  - Qwen3-32B
+  - quant_config: mxfp4
   - _self_ # Config in this file overrides configs in defaults
 
 # Access info
-name: DeepSeek-R1-ascend-int8
+name: Qwen3-32B-mxfp4
 is_pro: true

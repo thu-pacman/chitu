@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+type: mxfp4
+quant: 
+- model: "deepseek"
+  rules:
+    - regex : '\.mlp\.'
+- model: '.'
+  rules:
+    - regex : 'layers\.'
