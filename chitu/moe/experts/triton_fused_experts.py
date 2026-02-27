@@ -25,6 +25,7 @@ from chitu.ops.activation import silu_and_mul
 from chitu.ops.quant import blockfp8_act_quant, a8_per_token_act_quant
 from chitu.device_type import has_accelerator
 from chitu.lazy import single_dispatch_lazy_tensor
+from chitu.cuda_graph import is_warming_up_or_cuda_graph_capture
 
 if has_accelerator():
     from chitu.ops.triton_ops.utils import (
@@ -90,7 +91,11 @@ fused_moe_kernel_configs = [
 ]
 
 
-@autotune_compat(configs=fused_moe_kernel_configs, key=["N", "K"], cache_results=True)
+@autotune_compat(
+    configs=fused_moe_kernel_configs,
+    key=["bs_if_in_graph", "N", "K"],
+    cache_results=True,
+)
 @triton.jit
 def fused_moe_kernel(
     # Pointers to matrices
@@ -124,6 +129,7 @@ def fused_moe_kernel(
     GROUP_SIZE_M: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
+    bs_if_in_graph: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -722,6 +728,7 @@ def invoke_fused_moe_kernel(
     soft_fp8: bool = False,
     use_int8_w8a8: bool = False,
     is_w1w3: bool = False,
+    bs_if_in_graph: int = -1,
 ) -> None:
     assert sorted_token_ids.stride(0) == 1
 
@@ -900,6 +907,7 @@ def invoke_fused_moe_kernel(
             C.stride(2),
             top_k=top_k,
             compute_type=compute_type,
+            bs_if_in_graph=bs_if_in_graph,
         )
 
 
@@ -1206,6 +1214,10 @@ def _(
             hidden_states.activation
         )
 
+    # Add bs as a tuning key if in graph, because bs is also a key for graph capturing and
+    # thus fixed per graph.
+    bs_if_in_graph = M if is_warming_up_or_cuda_graph_capture() else -1
+
     invoke_fused_moe_kernel(
         hidden_states_activation,
         w1,
@@ -1229,6 +1241,7 @@ def _(
         block_shape=block_shape,
         soft_fp8=soft_fp8,
         is_w1w3=True,
+        bs_if_in_graph=bs_if_in_graph,
     )
 
     if activation == "silu":
@@ -1263,6 +1276,7 @@ def _(
         use_int4_w4a16=use_int4_w4a16,
         block_shape=block_shape,
         soft_fp8=soft_fp8,
+        bs_if_in_graph=bs_if_in_graph,
     )
 
     return PerTokenBatchedExpertResult(

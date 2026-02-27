@@ -18,6 +18,13 @@ def is_warming_up_before_cuda_graph_capture():
     return _is_warming_up_before_cuda_graph_capture
 
 
+def is_warming_up_or_cuda_graph_capture():
+    return (
+        _is_warming_up_before_cuda_graph_capture
+        or torch.cuda.is_current_stream_capturing()
+    )
+
+
 def add_post_hook_for_currently_capturing_graph_object(hook: Callable[[], None]):
     assert isinstance(_currently_capturing_graph_object, torch.cuda.CUDAGraph)
     if _currently_capturing_graph_object not in _post_hook_per_graph_object:
