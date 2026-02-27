@@ -189,7 +189,7 @@ class ChituCustomAllreduce:
                 logger.info("ChituCustomAllreduce initialized successfully.")
 
         except Exception as e:
-            logger.error(f"Failed to initialize custom allreduce buffers: {e}")
+            logger.warning(f"Failed to initialize custom allreduce buffers: {e}")
             self.disabled = True
             self.close()
             self._ptr = 0

@@ -2,8 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# PD disaggregation 1P1D overlay
+# PD disaggregation base config overlay
 # 仅保留 PD 分离相关配置；其余模型/推理通用项从基础 serve_config 继承
+# 适用于任意 XP-YD 拓扑：启动脚本通过 Hydra override 动态覆盖
+# prefill_schedulers / decode_schedulers 列表与 dp_size 等字段
 
 defaults:
   - serve_config
@@ -13,7 +15,7 @@ dp_config:
   enabled: True
   scheduler_base_host: 0.0.0.0
   scheduler_base_port: 29610
-  dp_size: 2           # 1P + 1D = 2
+  dp_size: 2           # P + D 总实例数（启动时覆盖）
   dp_id: 0
   tp_size: 1
   pp_size: 1
@@ -45,7 +47,7 @@ dp_config:
         decode_resend_interval_s: 0.5
         decode_poll_interval_s: 0.05
 
-    # Prefill Scheduler（1 个）
+    # Prefill/Decode Scheduler 默认各 1 个；启动时按实际拓扑覆盖
     prefill_schedulers:
       - host: 0.0.0.0
         port: 29620
@@ -53,7 +55,6 @@ dp_config:
         max_total_tokens: 8192
         batching_strategy: "varlen"
 
-    # Decode Scheduler（1 个）
     decode_schedulers:
       - host: 0.0.0.0
         port: 29630

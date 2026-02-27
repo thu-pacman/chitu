@@ -100,12 +100,82 @@ proc extract_router {path} {
     return ""
 }
 
-puts "=== PD Disaggregation CI Test ==="
+proc env_get {name} {
+    if {[info exists ::env($name)] && $::env($name) ne ""} {
+        return $::env($name)
+    }
+    return ""
+}
+
+proc env_get_or {name default_val} {
+    set val [env_get $name]
+    if {$val ne ""} { return $val }
+    return $default_val
+}
+
+proc send_feishu {webhook text} {
+    set py_code {
+import json
+import sys
+import urllib.request
+
+url = sys.argv[1]
+text = sys.argv[2]
+payload = {"msg_type": "text", "content": {"text": text}}
+data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+with urllib.request.urlopen(req, timeout=10) as resp:
+    sys.stdout.write(resp.read().decode("utf-8"))
+}
+    set cmd [list python3 -c $py_code $webhook $text]
+    if {[catch {set out [exec {*}$cmd]} err]} {
+        puts "WARN: Feishu notify failed: $err"
+        return 0
+    }
+    puts "Feishu notify response: $out"
+    return 1
+}
+
+puts "=== PD Disaggregation Daily Benchmark ==="
 puts "Working directory: [pwd]"
 
-set model_config "Qwen3-30B-A3B-fp8"
-set model_ckpt_dir "/data/nfs/Qwen3-30B-A3B-FP8/"
-set router_port "21004"
+set model_config [env_get_or "PD_MODEL_CONFIG" "Qwen3-235B-A22B-fp8"]
+set model_ckpt_dir [env_get_or "PD_MODEL_CKPT_DIR" "/data/nfs/Qwen3-235B-A22B-FP8/"]
+set tokenizer_path [env_get_or "PD_TOKENIZER_PATH" $model_ckpt_dir]
+set router_port [env_get_or "PD_ROUTER_PORT" "21004"]
+set nodes [env_get_or "PD_NODES" "4"]
+set gpus_per_node [env_get_or "PD_GPUS_PER_NODE" "8"]
+set bind_code [env_get_or "PD_BIND_CODE" "1"]
+set model_spec [env_get "PD_MODEL_SPEC"]
+
+set bench_batch_size [env_get_or "PD_BENCH_BATCH_SIZE" "128"]
+set bench_input_len [env_get_or "PD_BENCH_INPUT_LEN" "1024"]
+set bench_output_len [env_get_or "PD_BENCH_OUTPUT_LEN" "1024"]
+set bench_warmup [env_get_or "PD_BENCH_WARMUP" "1"]
+set bench_iterations [env_get_or "PD_BENCH_ITERATIONS" "1"]
+set dataset_path [env_get_or "PD_DATASET_PATH" "/data/nfs/ShareGPT_V3_unfiltered_cleaned_split.json"]
+
+set prefill_specs_str [env_get_or "PD_PREFILL_SPECS" "tp=4,pp=2,dp=1,ep=1,max_seq_len=5200,max_reqs=384,chunk=61440,full_warmup=True|tp=4,pp=2,dp=1,ep=1,max_seq_len=5200,max_reqs=384,chunk=61440,full_warmup=True"]
+set decode_specs_str [env_get_or "PD_DECODE_SPECS" "tp=1,pp=1,dp=16,ep=16,max_seq_len=6200,max_reqs=896,full_warmup=True,infer.memory_utilization=0.99"]
+set common_overrides_str [env_get_or "PD_COMMON_OVERRIDES" "dp_config.router.pd_disaggregation.kv_transfer.decode_wait_timeout_s=1200|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_max_pending=256|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_token_budget=350000|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_reserved_tokens=512|dp_config.router.pd_disaggregation.kv_transfer.decode_max_running_tasks_per_dp=50|metrics.log_interval=10"]
+
+set prefill_specs [split $prefill_specs_str "|"]
+set decode_specs [split $decode_specs_str "|"]
+set common_override_list [split $common_overrides_str "|"]
+set prefill_count [llength $prefill_specs]
+set decode_count [llength $decode_specs]
+
+set partition [env_get_or "PD_PARTITION" "ci-long"]
+if {[info exists env(SLURM_PARTITION)] && $env(SLURM_PARTITION) ne ""} {
+    set partition $env(SLURM_PARTITION)
+}
+
+puts "Model config:   $model_config"
+puts "Checkpoint dir: $model_ckpt_dir"
+puts "Tokenizer:      $tokenizer_path"
+puts "Topology:       $nodes nodes x $gpus_per_node GPUs"
+puts "Prefill(s):     $prefill_count instance(s)"
+puts "Decode(s):      $decode_count instance(s)"
 
 # Resolve Apptainer SIF
 if {[info exists env(APPTAINER_IMAGE)] && $env(APPTAINER_IMAGE) ne ""} {
@@ -129,21 +199,30 @@ set srun_out "${log_dir}/srun.out"
 set model_tag $model_config
 regsub -all {[^A-Za-z0-9_.-]} $model_tag "_" model_tag
 
-set prefill_spec "tp=2,pp=1,dp=1,ep=1,max_seq_len=5200,max_reqs=128,chunk=65536,full_warmup=False"
-set decode_spec "tp=1,pp=1,dp=4,ep=4,max_seq_len=6144,max_reqs=256,full_warmup=False"
-
 set cmd_parts [list bash script/srun_pd_disagg_base_apptainer.sh \
     $model_config $model_ckpt_dir $apptainer_image \
-    --nodes 2 --gpus-per-node 8 --router-port $router_port --partition ci \
-    --prefill $prefill_spec \
-    --prefill $prefill_spec \
-    --decode $decode_spec \
-    --bind-code 0 \
-    --common-override dp_config.router.pd_disaggregation.kv_transfer.decode_wait_timeout_s=600 \
-    --common-override dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_max_pending=128 \
-    --common-override dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_token_budget=250000 \
-    --common-override dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_reserved_tokens=1024 \
-    --common-override dp_config.router.pd_disaggregation.kv_transfer.decode_max_running_tasks_per_dp=64]
+    --nodes $nodes --gpus-per-node $gpus_per_node --router-port $router_port --partition $partition \
+    --bind-code $bind_code]
+
+if {$model_spec ne ""} {
+    lappend cmd_parts --model-spec $model_spec
+}
+
+foreach spec $prefill_specs {
+    if {$spec ne ""} {
+        lappend cmd_parts --prefill $spec
+    }
+}
+foreach spec $decode_specs {
+    if {$spec ne ""} {
+        lappend cmd_parts --decode $spec
+    }
+}
+foreach ovr $common_override_list {
+    if {$ovr ne ""} {
+        lappend cmd_parts --common-override $ovr
+    }
+}
 set cmd_str [join $cmd_parts " "]
 
 puts "=== Launching PD Disaggregation via srun ==="
@@ -181,7 +260,7 @@ while {1} {
 }
 
 set router_ip ""
-set router_timeout 600
+set router_timeout 1200
 set start [clock seconds]
 while {$router_ip eq ""} {
     ensure_process_alive "waiting for router info"
@@ -211,22 +290,35 @@ if {[catch {exec nc -z $router_ip $router_port}]} {
 }
 
 set router_log "${log_dir}/router.${model_tag}.log"
-set prefill_p0_glob "${log_dir}/prefill.${model_tag}.p0.node*.log"
-set prefill_p1_glob "${log_dir}/prefill.${model_tag}.p1.node*.log"
-set decode_d0_glob "${log_dir}/decode.${model_tag}.d0.node*.log"
 set router_ready_str "Uvicorn running on http://0.0.0.0:${router_port}"
 set worker_ready_str "Entering PD Worker Loop"
 
 puts "Waiting for Router readiness..."
-wait_for_pattern "Router" $router_log $router_ready_str 1200
-puts "Waiting for Prefill P0 readiness..."
-wait_for_pattern "Prefill P0" $prefill_p0_glob $worker_ready_str 1200
-puts "Waiting for Prefill P1 readiness..."
-wait_for_pattern "Prefill P1" $prefill_p1_glob $worker_ready_str 1200
-puts "Waiting for Decode D0 readiness..."
-wait_for_pattern "Decode D0" $decode_d0_glob $worker_ready_str 1200
+wait_for_pattern "Router" $router_log $router_ready_str 1800
 
-set bench_output_dir "[pwd]/benchmark_output_30B_A3B_temp"
+for {set i 0} {$i < $prefill_count} {incr i} {
+    set label "Prefill P${i}"
+    set pattern "${log_dir}/prefill.${model_tag}.p${i}.node*.log"
+    puts "Waiting for ${label} readiness..."
+    wait_for_pattern $label $pattern $worker_ready_str 1800
+}
+
+for {set i 0} {$i < $decode_count} {incr i} {
+    set label "Decode D${i}"
+    set pattern "${log_dir}/decode.${model_tag}.d${i}.node*.log"
+    puts "Waiting for ${label} readiness..."
+    wait_for_pattern $label $pattern $worker_ready_str 1800
+}
+
+set pd_output_dir [env_get "PD_OUTPUT_DIR"]
+if {$pd_output_dir ne ""} {
+    set bench_output_dir $pd_output_dir
+} else {
+    set bench_output_dir "[pwd]/benchmark_output_pd_disagg_${model_tag}"
+}
+if {[file exists $bench_output_dir]} {
+    file delete -force $bench_output_dir
+}
 file mkdir $bench_output_dir
 
 set bench_inner_cmd "PY=python; if test -x /opt/conda/bin/python; then PY=/opt/conda/bin/python; fi; \
@@ -236,15 +328,15 @@ set bench_inner_cmd "PY=python; if test -x /opt/conda/bin/python; then PY=/opt/c
     which \$PY || true; \
     \$PY -c \"import sys; print('python:', sys.executable); import transformers; print('transformers:', transformers.__version__)\"; \
     cd /workspace/chitu/benchmarks && \$PY benchmark_serving.py \
-    --batch-size 128 \
+    --batch-size $bench_batch_size \
     --model $model_config \
-    --iterations 1 \
-    --input-len 1024 \
-    --output-len 1024 \
-    --warmup 1 \
+    --iterations $bench_iterations \
+    --input-len $bench_input_len \
+    --output-len $bench_output_len \
+    --warmup $bench_warmup \
     --dataset sharegpt \
-    --dataset-path /data/nfs/ShareGPT_V3_unfiltered_cleaned_split.json \
-    --tokenizer-path /data/nfs/Qwen3-30B-A3B-FP8/ \
+    --dataset-path $dataset_path \
+    --tokenizer-path $tokenizer_path \
     --output-dir $bench_output_dir/ \
     --base-url http://$router_ip:$router_port"
 
@@ -287,17 +379,21 @@ import json
 import sys
 
 path = sys.argv[1]
-print("=== Benchmark generated_texts and errors ===")
+print("=== Benchmark results summary ===")
 has_error = False
+total_texts = 0
+total_errors = 0
 def handle_obj(obj, prefix=""):
-    global has_error
+    global has_error, total_texts, total_errors
     texts = obj.get("generated_texts", [])
     errors = obj.get("errors", [])
+    total_texts += len(texts)
     for i, t in enumerate(texts):
         preview = t[:200] + "..." if len(t) > 200 else t
         print(f"{prefix}generated_texts[{i}]: {preview}")
     for i, e in enumerate(errors):
         if e:
+            total_errors += 1
             has_error = True
             print(f"{prefix}ERROR errors[{i}]: {e}")
 
@@ -343,9 +439,11 @@ if not parsed_any:
 if not parsed_any:
     print("ERROR: no valid json records found")
     sys.exit(1)
+print(f"Total generated_texts: {total_texts}, errors: {total_errors}")
 if has_error:
     print("ERROR: non-empty errors found")
     sys.exit(1)
+print("Validation PASSED")
 }
 
 puts "=== Printing benchmark generated_texts and errors ==="
@@ -372,8 +470,32 @@ if {$parse_exit ne "0"} {
     exit 1
 }
 
+set feishu_webhook [env_get "FEISHU_WEBHOOK_URL"]
+if {$feishu_webhook eq ""} {
+    set feishu_webhook [env_get "LARK_WEBHOOK_URL"]
+}
+if {$feishu_webhook eq ""} {
+    set feishu_webhook [env_get "FEISHU_WEBHOOK"]
+}
+
+set notify_text "PD Disagg Daily Benchmark: PASS\nmodel=$model_config\nnodes=$nodes gpus_per_node=$gpus_per_node prefill=$prefill_count decode=$decode_count\nrouter=$router_ip:$router_port\nresults=$json_path"
+set job_url [env_get "CI_JOB_URL"]
+if {$job_url ne ""} {
+    append notify_text "\njob=$job_url"
+}
+set pipeline_url [env_get "CI_PIPELINE_URL"]
+if {$pipeline_url ne ""} {
+    append notify_text "\npipeline=$pipeline_url"
+}
+if {$feishu_webhook ne ""} {
+    puts "Sending Feishu notification..."
+    send_feishu $feishu_webhook $notify_text
+} else {
+    puts "Feishu webhook not set, skip notify."
+}
+
 puts "Cleaning up PD processes..."
 catch {exec kill -TERM $pd_pid}
 sleep 5
-puts "=== PD Disaggregation CI Test Completed ==="
+puts "=== PD Disaggregation Daily Benchmark Completed ==="
 exit 0
