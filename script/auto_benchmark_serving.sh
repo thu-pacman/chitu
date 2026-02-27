@@ -18,7 +18,8 @@
 # Part 1. The variables and functions that you need to check and modify carefully.
 # Part 1. 你需要仔细检查和修改的变量和函数
 SERVER_LOG_FILE="chitu_run.log"
-MODEL_NAME="Qwen3-32B"
+# MODEL_NAME="Qwen3-32B"
+MODEL_NAME="LLaDA2.0-mini"
 
 run_server(){
     SERVE_JOB_NAME="run_serve" # rename "run_serve" (with a unique name) to prevent conflicts
