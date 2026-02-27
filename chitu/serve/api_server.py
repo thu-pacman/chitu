@@ -65,14 +65,16 @@ class ChatRequest(BaseModel):
     parallel_tool_calls: bool = True
     logprobs: bool = False
     top_logprobs: Optional[int] = None
-    max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
+    max_tokens: Optional[int] = Field(default=None, deprecated=True)
     stream: bool = False
     temperature: float = 0.8  # [0, 2]
     top_p: float = 0.9  # [0,1]
     top_k: int = 50  # -1 or positive integer
     frequency_penalty: float = 0.0  # [-2, 2]
     min_batch_size: int = 1
-    stop_with_eos: bool = True
+    stop_with_eos: Optional[bool] = None
+    ignore_eos: Optional[bool] = None  # Compatible with vLLM. Not a OpenAI standard
     chat_template_kwargs: Mapping[str, Any] = {}
     enable_thinking: bool = True
     extra_body: Mapping[str, Any] = {}
@@ -158,6 +160,39 @@ async def create_chat_completion(
     except ValidationError as e:
         # Keep consistency with FastAPI default behavior for body validation errors
         raise HTTPException(status_code=422, detail=e.errors())
+
+    # Handle deprecated fields or compatibility fields
+    if (
+        req.max_tokens is not None
+        and req.max_completion_tokens is not None
+        and req.max_tokens != req.max_completion_tokens
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="max_tokens and max_completion_tokens cannot be conflict. Please use only one of them.",
+        )
+    if req.max_tokens is None and req.max_completion_tokens is not None:
+        req.max_tokens = req.max_completion_tokens
+    if req.max_completion_tokens is None and req.max_tokens is not None:
+        req.max_completion_tokens = req.max_tokens
+
+    if (
+        req.stop_with_eos is not None
+        and req.ignore_eos is not None
+        and req.stop_with_eos != (not req.ignore_eos)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="stop_with_eos and ignore_eos cannot be conflict. Please use only one of them.",
+        )
+    if req.stop_with_eos is None and req.ignore_eos is not None:
+        req.stop_with_eos = not req.ignore_eos
+    if req.ignore_eos is None and req.stop_with_eos is not None:
+        req.ignore_eos = not req.stop_with_eos
+    if req.stop_with_eos is None:
+        req.stop_with_eos = True
+    if req.ignore_eos is None:
+        req.ignore_eos = False
 
     # Check if DP mode is enabled and use appropriate processing
     if get_global_args().dp_config.enabled:

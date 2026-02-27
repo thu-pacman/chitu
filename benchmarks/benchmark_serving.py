@@ -393,7 +393,7 @@ class BenchmarkServing:
                 payload = {
                     "model": self.config.model_name,
                     "messages": messages_list[i],
-                    "max_tokens": self.config.output_length,
+                    "max_completion_tokens": self.config.output_length,
                     "stream": True,
                     "temperature": 1.0,
                     "top_p": 0.9,
