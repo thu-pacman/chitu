@@ -38,12 +38,14 @@ class PrometheusServerManager:
             with cls._lock:
                 if cls._instance is None:
                     metrics_args = get_global_args().metrics
+                    server_addr: str = metrics_args.prometheus_listening_host
                     server_port: int = metrics_args.prometheus_listening_port
                     config_file: str = metrics_args.prometheus_config_file
                     data_dir: str = metrics_args.prometheus_data_dir
                     scrape_interval: int = metrics_args.prometheus_scrape_interval
                     cls._instance = cls(
                         collector_addrs,
+                        server_addr,
                         server_port,
                         config_file,
                         data_dir,
@@ -54,9 +56,10 @@ class PrometheusServerManager:
     def __init__(
         self,
         collector_addrs,
-        server_port,
-        config_file,
-        data_dir,
+        server_addr: str,
+        server_port: int,
+        config_file: str,
+        data_dir: str,
         scrape_interval: int,
     ):
         """
@@ -67,6 +70,7 @@ class PrometheusServerManager:
             data_dir: Prometheus data stoarge path
         """
         self.collector_addrs = collector_addrs
+        self.server_addr = server_addr
         self.server_port = server_port
         # Use PID to isolate config/data per instance, avoiding TSDB lock
         # conflicts when multiple instances run on the same machine.
@@ -75,7 +79,7 @@ class PrometheusServerManager:
         self.config_file = f"{base}_{pid}{ext}"
         self.data_dir = f"{data_dir}_{pid}"
         self.process = None
-        self.server_url = f"http://localhost:{server_port}"
+        self.server_url = f"http://{server_addr}:{server_port}"
         self.query_url = f"{self.server_url}/api/v1/query"
         self.create_config(collector_addrs, scrape_interval)
         self.start()
@@ -132,7 +136,7 @@ class PrometheusServerManager:
                 f"Port[{self.server_port}] has been allocated, change Prometheus server port to {port}"
             )
             self.server_port = port
-            self.server_url = f"http://localhost:{self.server_port}"
+            self.server_url = f"http://{self.server_addr}:{self.server_port}"
             self.query_url = f"{self.server_url}/api/v1/query"
 
         # 创建数据目录，清理可能的残留锁文件

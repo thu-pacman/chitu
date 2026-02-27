@@ -363,6 +363,7 @@ dp_config:
 
 # Configs how chitu is monitored and logged.
 metrics:
+  prometheus_listening_host: 0.0.0.0 # Access prometheus server at this address
   prometheus_listening_port: 9090 # Access prometheus server at this port
   prometheus_config_file: "prometheus.yml" # prometheus configuration path, which is a yml file
   prometheus_data_dir: "prometheus_data" # prometheus data stoarge path, which is a folder

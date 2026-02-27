@@ -3,13 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
+import time
+from omegaconf import OmegaConf
+import multiprocessing as mp
+
+from chitu.global_vars import set_global_args, get_global_args
 import chitu.metrics
 from chitu.metrics import PrometheusMetricsCollector
 from chitu.metrics import PrometheusServerManager
-import time
-from omegaconf import OmegaConf
-from chitu.global_vars import set_global_args, get_global_args
-import multiprocessing as mp
 
 
 class Backend:
@@ -69,6 +70,7 @@ def test_PrometheusServerManager():
         OmegaConf.create(
             {
                 "metrics": {
+                    "prometheus_listening_host": "localhost",
                     "prometheus_listening_port": 9090,
                     "prometheus_config_file": "prometheus.yml",
                     "prometheus_data_dir": "prometheus_data",
