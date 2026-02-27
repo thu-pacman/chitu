@@ -4,15 +4,14 @@
 
 from argparse import ArgumentParser
 import json
+import os
+
 import matplotlib.pyplot as plt
 import numpy as np
 
 
-def load_data(file_path):
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
+def parse_one_record(data):
+    """将单条 benchmark 结果字典解析为绘图所需输入。"""
     start_ts = data["start_timestamps"]
     response_ts = data["response_timestamp"]
     batch_size = data["batch_size"]
@@ -31,6 +30,22 @@ def load_data(file_path):
         total_input_tokens,
         total_output_tokens,
     )
+
+
+def load_data_jsonl(file_path):
+    """
+    加载 JSONL 文件（每行一个 JSON，如 benchmark_serving --append-result 输出）。
+    返回 (start_ts, response_ts, model_name, batch_size, total_input_tokens, total_output_tokens) 的列表。
+    """
+    records = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            records.append(parse_one_record(data))
+    return records
 
 
 def prepare_plot_data(start_ts, response_ts):
@@ -99,33 +114,70 @@ def plot_timestamps(
         plt.show()
 
 
+def load_records(file_path):
+    """
+    加载 benchmark 结果：自动识别单条 JSON 与 JSONL（多行）。
+    单条 JSON：整个文件为一个对象（如 benchmark_serving 未加 --append-result 时的输出）。
+    JSONL：每行一个 JSON 对象（来自 benchmark_serving --append-result）。
+    返回 (start_ts, response_ts, model_name, batch_size, total_input_tokens, total_output_tokens) 的列表。
+    """
+    with open(file_path, "r", encoding="utf-8") as f:
+        raw = f.read()
+
+    # 先尝试按单条 JSON 解析（支持多行格式化）
+    try:
+        data = json.loads(raw)
+        return [parse_one_record(data)]
+    except json.JSONDecodeError:
+        pass
+
+    # 按 JSONL 处理：每行一个 JSON
+    records = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        data = json.loads(line)
+        records.append(parse_one_record(data))
+    if not records:
+        raise ValueError(f"No valid JSON/JSONL content in {file_path}")
+    return records
+
+
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--benchmark-results", required=True)
-    parser.add_argument("--save-path", required=True)
+    parser.add_argument("--save-path", required=True, help="图片保存目录")
     args = parser.parse_args()
 
-    (
-        start_timestamps,
-        response_timestamps,
-        model_name,
-        batch_size,
-        total_input_tokens,
-        total_output_tokens,
-    ) = load_data(args.benchmark_results)
+    records = load_records(args.benchmark_results)
+    output_dir = args.save_path
+    os.makedirs(output_dir, exist_ok=True)
 
-    start_x, start_y, token_x, token_y = prepare_plot_data(
-        start_timestamps, response_timestamps
-    )
+    for record in records:
+        (
+            start_timestamps,
+            response_timestamps,
+            model_name,
+            batch_size,
+            total_input_tokens,
+            total_output_tokens,
+        ) = record
 
-    plot_timestamps(
-        start_x,
-        start_y,
-        token_x,
-        token_y,
-        model_name=model_name,
-        batch_size=batch_size,
-        total_input_tokens=total_input_tokens,
-        total_output_tokens=total_output_tokens,
-        save_path=args.save_path,
-    )
+        save_path = os.path.join(output_dir, f"{model_name}_{batch_size}.jpg")
+
+        start_x, start_y, token_x, token_y = prepare_plot_data(
+            start_timestamps, response_timestamps
+        )
+
+        plot_timestamps(
+            start_x,
+            start_y,
+            token_x,
+            token_y,
+            model_name=model_name,
+            batch_size=batch_size,
+            total_input_tokens=total_input_tokens,
+            total_output_tokens=total_output_tokens,
+            save_path=save_path,
+        )

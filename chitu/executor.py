@@ -1543,7 +1543,20 @@ class Executor:
         for it, task in enumerate(batch_result.tasks):
             next_token_list.append(batch_result.next_tokens[it])
             if self.mtp_size > 1:
-                mtp_token_list.append(batch_result.mtp_token_list[it])
+                mtp_tokens = batch_result.mtp_token_list[it]
+                # check if stop token is in mtp_tokens, if yes, cut mtp_tokens and set next_token to stop token
+                if task.stop_with_eos and (
+                    set(mtp_tokens) & Backend.tokenizer.stop_tokens
+                ):
+                    stop_idx = next(
+                        i
+                        for i, x in enumerate(mtp_tokens)
+                        if x in Backend.tokenizer.stop_tokens
+                    )
+                    mtp_tokens = mtp_tokens[:stop_idx]
+                    next_token_list[-1] = next(iter(Backend.tokenizer.stop_tokens))
+                mtp_token_list.append(mtp_tokens)
+
         if batch_result.return_logprobs:
             for it, task in enumerate(batch_result.tasks):
                 logprobs, token_idxs = (
