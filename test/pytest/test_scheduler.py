@@ -969,7 +969,7 @@ def test_evict_decode_task():
         task.num_new_tokens = 1
         task.stopped = True
     task_ids = [task.task_id for task in tasks]
-    removed_task_ids, _ = scheduler.update(task_ids)
+    removed_task_ids = scheduler.update(task_ids)
     Backend.cache_managers["main"].finalize_cache_all_decode(removed_task_ids)
     assert len(removed_task_ids) == 2
     assert len(TaskPool.pool) == 2

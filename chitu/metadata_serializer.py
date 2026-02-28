@@ -242,19 +242,21 @@ class MetadataSerializer:
             and auto_dedup
             and isinstance(tasks, PackedTasks)
             and isinstance(tasks.tasks, list)
+            and tasks.task_type != TaskType.Special
         )
 
         if has_dedup:
             if not self.transmitted_task_ids.get(target_rank):
                 self.transmitted_task_ids[target_rank] = set()
-            else:
-                self.transmitted_task_ids[target_rank] &= set(TaskPool.id_list)
             transmitted_task_ids = self.transmitted_task_ids[target_rank]
             for task_id in tasks.task_ids:
                 (
                     known_task_ids if task_id in transmitted_task_ids else new_task_ids
                 ).append(task_id)
             transmitted_task_ids.update(new_task_ids)
+        elif tasks.payload_type == SerializedPackedTasksPayloadType.EndTask:
+            if self.transmitted_task_ids.get(target_rank):
+                self.transmitted_task_ids[target_rank] -= set(tasks.task_ids)
 
         # 选择配置
         if config is None:

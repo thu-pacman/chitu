@@ -410,7 +410,6 @@ class Task(ConstraintDecodeTask):
         self._prefix_tokens_base_len = (
             self.prompt_len if (self.prefix_tokens == [] and self.prompt_len) else 0
         )
-        self.stopped: bool = False
 
         # Request
         self.req = req
@@ -453,29 +452,30 @@ class Task(ConstraintDecodeTask):
         self.mtp_token_list: list[int] = []
         self.generated_result: Optional[torch.Tensor] = None
         self.record_next_token: Union[int, torch.Tensor, None] = None
+
+        # task status
         self.has_unsync_new_token: bool = False
         self.evicting = False
-        self.finished_decode = False
-
-        self.return_logprobs = getattr(req, "logprobs", False)
-        self.logprobs = None
-        self.token_idxs = None
-        self._test_flag = getattr(req, "_test_flag", False)
-        if self._test_flag and self.req._test_standard_tokens is not None:
-            self._test_standard_tokens = (
-                self.req._test_standard_tokens.flatten().tolist()
-            )
-        else:
-            self._test_standard_tokens = None
-
-        self.pixel_values = getattr(req, "pixel_values", None)
-        self.grid_thw = getattr(req, "grid_thw", None)
-
+        self.stopped: bool = False
         # Waiting is only meaningful in pipeline parallelism. It means either of:
         # 1) waiting logits to return from another node, or
         # 2) waiting for a prefill task to end to begin a decode task
         # Data parallelism and tensor parallelism do not need this, because they only call scheduler after finishing a task
         self.waiting = False
+
+        # logprobs and test flag
+        self.return_logprobs = getattr(req, "logprobs", False)
+        self.logprobs = None
+        self.token_idxs = None
+        self._test_flag = getattr(req, "_test_flag", False)
+        self._test_standard_tokens = None
+        if self._test_flag and self.req._test_standard_tokens is not None:
+            self._test_standard_tokens = (
+                self.req._test_standard_tokens.flatten().tolist()
+            )
+
+        self.pixel_values = getattr(req, "pixel_values", None)
+        self.grid_thw = getattr(req, "grid_thw", None)
 
         # Scheduling priority
         self.arrv_ts = time.perf_counter_ns()
@@ -496,11 +496,6 @@ class Task(ConstraintDecodeTask):
 
         # Warmup bookkeeping: ensure each task participates in at most one prefill schedule per warmup
         self._warmup_prefill_seen = False
-
-        self.has_schedule_overlap = (
-            getattr(Backend.args, "infer", False)
-            and Backend.args.infer.schedule_overlap
-        )
 
         # PD prefill info
         self.pd_prefill_engine_rank: Optional[int] = None
@@ -864,7 +859,6 @@ class SerializedPackedTasksPayloadType(Enum):
     Empty = 3
     TerminateBackend = 4
     EndTask = 5
-    Remove = 6
 
 
 def is_empty_payload(payload_type: SerializedPackedTasksPayloadType):
@@ -950,7 +944,6 @@ class PackedTasks(PackedTasksBase):
         self.token_idxs: Optional[torch.Tensor] = None
 
         if not task_ids:  # empty PackedTasks, only dp/dp+pp use this method
-            self._test_flag = False  # dp no single_req_compare
             self.task_type = (
                 task_type
                 if task_type is not None
@@ -1064,6 +1057,9 @@ class PackedTasks(PackedTasksBase):
             )
 
     def get_result_len(self) -> int:
+        """
+        Get the length of generated_result of each task task
+        """
         result_length_per_task = (
             Backend.executor.mtp_size
             + Backend.model.vocab_size
@@ -1193,9 +1189,7 @@ class TaskCollector:
 
     @staticmethod
     def init(length: int):
-        TaskCollector._total_waiting_steps = length + (
-            0 if get_global_args().infer.schedule_overlap else -1
-        )
+        TaskCollector._total_waiting_steps = length
         TaskCollector._waiting_queue = deque(
             [None] * TaskCollector._total_waiting_steps
         )
@@ -1267,6 +1261,8 @@ class DPTaskCollector:
     - After obtaining task_ids in DP scheduler, call prepare_dp_tasks to pack the tasks and set task_ids_list.
     - DataDispatcher obtains the task_ids corresponding to each rank through DPTaskCollector; during prefill, serialized task data is sent, and during decode, only task_ids are sent.
     - In chitu_main, responses are processed based on total_packedtasks.
+
+    Different from TaskCollector, the DPTaskCollector needs to store the last PackedTasks.
     """
 
     _total_waiting_steps: int = None
@@ -1275,9 +1271,7 @@ class DPTaskCollector:
 
     @staticmethod
     def init(length: int):
-        DPTaskCollector._total_waiting_steps = length + (
-            1 if get_global_args().infer.schedule_overlap else 0
-        )
+        DPTaskCollector._total_waiting_steps = length + 1
         DPTaskCollector._total_packedtasks_queue = deque(
             [None] * DPTaskCollector._total_waiting_steps
         )

@@ -442,8 +442,7 @@ def warmup_engine(args):
     if args.dp_config.router.is_router:
         return
 
-    # NOTE: DP+PP每次规划的req数量为max_reqs（纯PP为max_reqs / pp_size），可能导致同时运行的req数量大于max_reqs
-    # 如果在运行时遇到问题，请开启下面的跳过与兜底策略（目前暂未发现问题）
+    # NOTE: 如果在 DP+PP 运行时遇到问题，请开启下面的跳过与兜底策略（目前暂未发现问题）
     # if args.infer.pp_size > 1 and args.infer.dp_size > 1 and args.infer.cache_type == "paged":
     #     assert isinstance(Backend.cache_manager, PagedKVCacheManager)
     #     logger.warning("Warming-up is not supported when PP is enabled. Skipping")
@@ -703,8 +702,11 @@ def chitu_init(args):
             args.infer.use_cuda_graph = True
 
     if args.infer.schedule_overlap == "auto":
+        # PD disaggregation does not support overlap
+        # MTP does synchronize after model run and overlap has no effect
         args.infer.schedule_overlap = (
             not args.dp_config.router.pd_disaggregation.enabled
+            and args.infer.mtp_size <= 1
         )
 
     if args.infer.full_warmup == "auto":
@@ -776,6 +778,7 @@ def chitu_init(args):
 
 @torch.inference_mode()
 def chitu_run_main_rank():
+    # 1. Schedule
     if Backend.args.infer.dp_size == 1:
         assert len(Backend.schedulers) == 1
         task_ids = Backend.schedulers[0].schedule()
@@ -812,8 +815,8 @@ def chitu_run_main_rank():
             DPTaskCollector.prepare_dp_tasks([])
         task_ids = task_ids_list[0]
 
+    # 2. Run
     if task_ids or DPTaskCollector.has_available_tasks():
-        # compute
         logger.debug(f"Processing {task_ids}")
         if task_ids:
             for task_id in task_ids:
@@ -837,6 +840,7 @@ def chitu_run_main_rank():
         )
     backend_payload_type = Backend.executor.step(tasks)
 
+    # 3. Update TaskPool
     task_ids = TaskCollector.get_update_task_ids()
     task_ids = [task_id for task_id in task_ids if TaskPool.pool.get(task_id)]
     # tasks w/o dp_size are evicted and already removed
@@ -847,24 +851,16 @@ def chitu_run_main_rank():
 
     # Collect tasks by DP rank. All tasks that have run should have dp_rank.
     task_ids_per_dp = [[] for _ in range(Backend.args.infer.dp_size)]
-    # assert not any(
-    #     filter(lambda task_id: TaskPool.pool[task_id].dp_rank is None, task_ids)
-    # )
     for task_id in task_ids:
         dp_rank = TaskPool.pool[task_id].dp_rank
         task_ids_per_dp[dp_rank].append(task_id)
 
     # tasks from the model-running tasks (task_ids) which will not run anymore
-    removed_decode_task_ids = []
-    removed_kvcache_task_ids = []
+    removed_task_ids = []
     for i in range(Backend.args.infer.dp_size):
-        dp_local_removed_decode_task_ids, dp_local_removed_kvcache_task_ids = (
-            Backend.schedulers[i].update(task_ids_per_dp[i])
-        )
-        removed_decode_task_ids += dp_local_removed_decode_task_ids
-        removed_kvcache_task_ids += dp_local_removed_kvcache_task_ids
-    Backend.executor.special_step(removed_kvcache_task_ids, type="EndTask")
-    Backend.executor.special_step(removed_decode_task_ids, type="Remove")
+        dp_local_removed_task_ids = Backend.schedulers[i].update(task_ids_per_dp[i])
+        removed_task_ids += dp_local_removed_task_ids
+    Backend.executor.special_step(removed_task_ids, type="EndTask")
     return backend_payload_type
 
 
