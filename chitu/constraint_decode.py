@@ -46,7 +46,7 @@ class ConstraintDecodeManager:
             self.batch_matcher = BatchGrammarMatcher()
             self.states: dict[str, MatcherState] = {}
             self.enabled = True
-        except:
+        except Exception:
             logger.exception("constraint decode initialized failed")
 
     def compile_grammar(

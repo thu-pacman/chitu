@@ -343,7 +343,7 @@ async def test(
                 f"case {idx} failed: nums mismatch "
                 f"real_nums={real_nums} expected={nums}"
             )
-        except:
+        except Exception:
             logger.exception(f"case {idx} failed {retry=}")
             tested_nums.append(None)
     else:

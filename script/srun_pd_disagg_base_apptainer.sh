@@ -57,7 +57,7 @@ usage() {
      --router-prefill-max-total-tokens N    (默认 8192)
      --router-prefill-batching-strategy S   (默认 varlen)
      --router-decode-scheduling-strategy S  (默认 immediate)
-     --config-name NAME                     (默认 pd_disagg_1p1d_multi_node)
+     --config-name NAME                     (默认 pd_disagg_serve_config)
      --cache-type TYPE                      (默认 paged)
      --bind-code 0|1                        (默认 1)
      --apptainer-extra STR                  (额外 apptainer 参数)
@@ -92,7 +92,7 @@ MODEL_USE_CUDA_GRAPH="${MODEL_USE_CUDA_GRAPH:-True}"
 MODEL_SCHEDULE_OVERLAP="${MODEL_SCHEDULE_OVERLAP:-False}"
 
 # Router
-PD_CONFIG_NAME="${PD_CONFIG_NAME:-pd_disagg_1p1d_multi_node}"
+PD_CONFIG_NAME="${PD_CONFIG_NAME:-pd_disagg_serve_config}"
 PD_ROUTER_PORT="${PD_ROUTER_PORT:-21003}"
 PD_CACHE_TYPE="${PD_CACHE_TYPE:-paged}"
 ROUTER_PREFILL_MAX_BATCH_SIZE="${ROUTER_PREFILL_MAX_BATCH_SIZE:-32}"

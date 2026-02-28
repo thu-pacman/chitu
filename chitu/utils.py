@@ -369,7 +369,7 @@ class DataSaver:
                     args = get_global_args()
                     model_name = args.models.type
                     model_path = args.models.ckpt_dir
-                except:
+                except Exception:
                     model_name = "unknown"
                     model_path = "unknown"
                 model_dtype = (
@@ -488,7 +488,7 @@ def is_port_available(port: int):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("", port))
             return True
-    except:
+    except Exception:
         return False
 
 
