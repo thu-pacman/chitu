@@ -39,6 +39,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
 )
+from chitu.distributed.tcp_ip import get_port_from_zmq_socket
 from chitu.dp_token_sender import start_dp_token_manager
 from chitu.hooks import (
     DPTokenSink,
@@ -48,7 +49,6 @@ from chitu.hooks import (
 )
 from chitu.serve.common import start_worker
 from chitu.serve.event_loop import get_server_event_loop
-from chitu.utils import get_free_port
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +69,8 @@ def start_decode_prepare_listener_thread(
     def _listener_loop() -> None:
         ctx = zmq.Context.instance()
         sock = ctx.socket(zmq.PULL)
-        port = int(get_free_port())
-        sock.bind(f"tcp://*:{port}")
+        sock.bind(f"tcp://*:0")
+        port = get_port_from_zmq_socket(sock)
         ip = kv_manager.local_ip if kv_manager.local_ip else "localhost"
         logger.info(
             f"[PD_PREPARE] listener_ready decode_sid={decode_scheduler_id} dp_rank={dp_rank} "

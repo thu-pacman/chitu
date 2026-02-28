@@ -10,9 +10,10 @@ import requests
 import atexit
 from typing import Optional
 import threading
-from chitu.global_vars import get_global_args
-from chitu.utils import is_port_available, get_free_port
 import logging
+
+from chitu.global_vars import get_global_args
+from chitu.distributed.tcp_ip import is_port_available, get_free_port
 
 
 logger = logging.getLogger(__name__)

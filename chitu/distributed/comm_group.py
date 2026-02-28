@@ -2,10 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import netifaces
 import os
 import socket
-import contextlib
 from typing import Optional, List, Tuple, Sequence, Any
 
 import torch
@@ -13,6 +11,7 @@ import torch.distributed
 from logging import getLogger
 
 from chitu.distributed.custom_ar_chitu import create_chitu_custom_allreduce
+from chitu.distributed.tcp_ip import FreeTCPPortHolder, get_local_ip
 
 logger = getLogger(__name__)
 
@@ -321,39 +320,15 @@ class CommGroup:
         if self.group_size == 1:
             return [("localhost", 0, 0, 0)]
 
+        local_ip_fail_reason = None
         try:
-            ifaces = netifaces.interfaces()
-            gateways = netifaces.gateways()
-            default_gateway = gateways.get("default", {}).get(netifaces.AF_INET, None)
-
-            if len(ifaces) == 0 or not default_gateway:
-                local_ip = "localhost"
-            else:
-                _, main_nic_name = default_gateway
-                for iface in ifaces:
-                    if iface == main_nic_name:
-                        iface_addrs = netifaces.ifaddresses(iface).get(
-                            netifaces.AF_INET, []
-                        )
-                        if iface_addrs:
-                            local_ip = iface_addrs[0]["addr"]
-                            break
-                else:
-                    local_ip = "localhost"
+            local_ip = get_local_ip()
         except Exception as e:
             local_ip = "localhost"
-
-        local_ip_fail_reason = None
-        if local_ip == "localhost":
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                    s.connect(("8.8.8.8", 80))
-                    local_ip = s.getsockname()[0]
-            except Exception as e:
-                local_ip_fail_reason = e
-                logger.warning(
-                    "Fail to retrieve local ip, using localhost instead, which may cause an error."
-                )
+            local_ip_fail_reason = e
+            logger.warning(
+                "Fail to retrieve local ip, using localhost instead, which may cause an error."
+            )
 
         ip_list = [None] * self.group_size
         torch.distributed.all_gather_object(ip_list, local_ip, self.cpu_group)
@@ -366,33 +341,21 @@ class CommGroup:
 
         # 为 TP, DP, PP 各分配一个空闲端口
         try:
-            with contextlib.ExitStack() as stack:
-                s_tp = stack.enter_context(
-                    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                )
-                s_tp.bind((local_ip, 0))
-                local_port_tp = s_tp.getsockname()[1]
-
-                s_dp = stack.enter_context(
-                    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                )
-                s_dp.bind((local_ip, 0))
-                local_port_dp = s_dp.getsockname()[1]
-
-                s_pp = stack.enter_context(
-                    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                )
-                s_pp.bind((local_ip, 0))
-                local_port_pp = s_pp.getsockname()[1]
+            local_port_holder_tp = FreeTCPPortHolder()
+            local_port_holder_dp = FreeTCPPortHolder()
+            local_port_holder_pp = FreeTCPPortHolder()
         except Exception as e:
             raise RuntimeError(f"Cannot bind to free ports on {local_ip}.") from e
 
+        local_port_tp = local_port_holder_tp.pop()
         port_tp_list = [None] * self.group_size
         torch.distributed.all_gather_object(port_tp_list, local_port_tp, self.cpu_group)
 
+        local_port_dp = local_port_holder_dp.pop()
         port_dp_list = [None] * self.group_size
         torch.distributed.all_gather_object(port_dp_list, local_port_dp, self.cpu_group)
 
+        local_port_pp = local_port_holder_pp.pop()
         port_pp_list = [None] * self.group_size
         torch.distributed.all_gather_object(port_pp_list, local_port_pp, self.cpu_group)
 
