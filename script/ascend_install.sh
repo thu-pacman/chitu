@@ -37,12 +37,12 @@ fi
 
 # Dependency install stage
 if [ "$(lscpu | grep x86)" ]; then \
-    pip install ./third_party/ascend/torch_npu-2.6.0.post1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl -i https://pypi.tuna.tsinghua.edu.cn/simple; \
+    pip install ./third_party/ascend/torch_npu-2.6.0.post1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl; \
 else \
-    pip install ./third_party/ascend/torch_npu-2.6.0.post1-cp311-cp311-manylinux_2_28_aarch64.whl -i https://pypi.tuna.tsinghua.edu.cn/simple; \
+    pip install ./third_party/ascend/torch_npu-2.6.0.post1-cp311-cp311-manylinux_2_28_aarch64.whl; \
 fi
 
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt
+pip install -r requirements-build.txt
 
 # NOTE:
 # 1. Always add `-c` to avoid breaking compatiblity with installed packages.
@@ -55,13 +55,11 @@ pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.tx
 if [ "${enable_editable_install}" == "true" ]; then
     pip install \
         --no-build-isolation \
-        -i https://pypi.tuna.tsinghua.edu.cn/simple \
         -e .${OPTIONAL_DEPS_SPECIFIER} \
         -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla")
 else
     pip install \
         --no-build-isolation \
-        -i https://pypi.tuna.tsinghua.edu.cn/simple \
         .${OPTIONAL_DEPS_SPECIFIER} \
         -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla")
     rm -rf build chitu.egg-info

@@ -14,6 +14,7 @@
 #           <enable_editable_install> \
 #           <enable_cython> \
 #           <enable_test> \
+#           <pypi_mirror> \
 #           <image_name> \
 #           <image_version> \
 #           <docker_run_prefix_for_the_second_stage>...
@@ -26,9 +27,10 @@ build_jobs=$3
 enable_editable_install=$4
 enable_cython=$5
 enable_test=$6
-image_name=$7
-image_version=$8
-docker_run_prefix="${@:9}"
+pypi_mirror=$7
+image_name=$8
+image_version=$9
+docker_run_prefix="${@:10}"
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
@@ -50,9 +52,10 @@ docker build \
     -f "${dockerfile}" \
     --build-arg optional_deps="${optional_deps}" \
     --build-arg enable_cython="${enable_cython}" \
+    --build-arg enable_test="${enable_test}" \
+    --build-arg pypi_mirror="${pypi_mirror}" \
     --secret id=tos_id,env=TOS_ID \
     --secret id=tos_key,env=TOS_KEY \
-    --build-arg enable_test="${enable_test}" \
     -t ${image_name}:${image_version}-stage0 \
     .
 
