@@ -67,7 +67,7 @@ from omegaconf import OmegaConf
 
 import chitu.global_vars as global_vars
 from chitu.global_vars import set_global_args
-from chitu.utils import get_free_port
+from chitu.distributed.tcp_ip import get_free_port
 from chitu.distributed.parallel_state import (
     initialize_parallel_groups,
     parallel_groups_initialized,

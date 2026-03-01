@@ -601,58 +601,6 @@ class PDScheduler(Scheduler):
             )
         logger.debug(f"[PD_STAGE][decode.enqueue.start] req_id={request_id}")
 
-    async def _wait_for_kv_cache(self, request_id: str, target_dp_rank: int = 0):
-        """Wait for KV cache and start decode"""
-        decode_info = self.pending_decode_requests.get(request_id)
-        if not decode_info:
-            logger.error(f"decode info not found for request: {request_id}")
-            return
-
-        if pd_verbose_enabled():
-            logger.debug(
-                f"waiting for kv cache for request: {request_id} (target_rank={target_dp_rank})"
-            )
-
-        # Create task immediately; KV pull + first-token sampling will happen on the owner DP rank
-        # inside Executor.decode_step via MooncakeKVTransferHook.
-        task = self._create_task_from_request(
-            decode_info["original_request"], TaskType.Decode, enqueue=False
-        )
-        task.cache_owner = target_dp_rank
-        task.dp_rank = target_dp_rank
-        # Propagate PD binding into Task so decode worker ranks can route TransferInfo correctly.
-        prefill_sid = decode_info.get("prefill_scheduler_id", None)
-        if prefill_sid is not None:
-            task.pd_prefill_engine_rank = int(prefill_sid)
-        # NOTE: if task is wrapped by DPTokenManager, assignments above only affect the wrapper.
-        # We must also set fields on the underlying Task in TaskPool so dp workers can receive them
-        # via MsgPackableTask bootstrap (TaskPool.pool[tid].get_msgpackable_task()).
-        base_task = TaskPool.pool.get(task.task_id)
-        if base_task is not None:
-            base_task.cache_owner = target_dp_rank
-            base_task.dp_rank = target_dp_rank
-            if prefill_sid is not None:
-                base_task.pd_prefill_engine_rank = int(prefill_sid)
-
-        decode_info["status"] = PDRequestStatus.DECODE_RUNNING
-        decode_info["decode_start_time"] = time.time()
-
-        _exec_start = time.monotonic()
-        await self._execute_decode(task)
-        _exec_dur = time.monotonic() - _exec_start
-
-        decode_info["status"] = PDRequestStatus.COMPLETED
-        decode_info["decode_complete_time"] = time.time()
-
-        observe_stage_duration("decode", "exec", _exec_dur)
-        inc_completed_requests("decode")
-
-        if pd_verbose_enabled():
-            logger.debug(f"completed decode for request: {request_id}")
-        if not getattr(task, "pd_exec_end_logged", False):
-            task.pd_exec_end_logged = True
-            logger.debug(f"[PD_STAGE][decode.exec.end] req_id={request_id}")
-
     def schedule(self) -> list[list[str]]:
         """Schedule tasks for execution.
 
@@ -800,66 +748,6 @@ class PDScheduler(Scheduler):
         if enqueue:
             TaskPool.enqueue(task)
         return task
-
-    async def _execute_prefill(self, task: Task) -> torch.Tensor:
-        """Execute prefill in PD Prefill-only mode.
-
-        当 pp_size > 1：
-        - PP stage 0 消费 token ids（[num_tokens]）
-        - PP stage i>0 消费 hidden states（[num_tokens, dim]）
-        - KV 由各 PP stage 生成，通过 KV hook / KVManager Transfer到 Decode
-
-        NOTE: PD Prefill-only samples the first token on Prefill side and
-        passes it to Decode via KV metadata. Decode continues from the next token.
-        """
-        request_id = None
-        if getattr(task, "req", None) is not None:
-            request_id = getattr(task.req, "request_id", None)
-        if pd_verbose_enabled():
-            logger.debug(f"executing prefill for task: {task.task_id}")
-        if request_id:
-            logger.debug(f"[PD_STAGE][prefill.exec.start] req_id={request_id}")
-        _prefill_exec_start = time.monotonic()
-
-        # Ensure PackedTasksBase configured
-        if not PackedTasksBase.configured:
-            args = get_global_args()
-            PackedTasksBase.configure(max_num_tasks=args.infer.max_reqs)
-
-        args = get_global_args()
-        pp_size = args.infer.pp_size
-        if pp_size > 1:
-            # PP+TP path:
-            #
-            # Use `PackedTasks` (not PackedTasksBase) so PipeDispatcher can serialize/forward
-            # prefill task metadata to later PP stages via ZMQ. Worker ranks are already running
-            # `Executor.step(None)` in PD worker loop and will participate in collectives.
-            tasks = PackedTasks([task.task_id], tasks=[task])
-            logits = Backend.executor.step(tasks)
-        else:
-            # TP-only path (existing behavior). This avoids any sampling in Executor.step()
-            # and is lower overhead for the common pp_size==1 deployment.
-            tokens = task.prefix_tokens
-            tasks = PackedTasksBase(
-                num_tasks=1,
-                task_ids=[task.task_id],
-                task_type=TaskType.Prefill,
-                tokens=[tokens],
-                num_tokens=len(tokens),
-                has_outputs=[1],
-                payload_type=SerializedPackedTasksPayloadType.Prefill,
-            )
-            logits = Backend.executor.prefill_step_tp_only(tasks)
-
-        _prefill_exec_dur = time.monotonic() - _prefill_exec_start
-        observe_stage_duration("prefill", "exec", _prefill_exec_dur)
-        inc_completed_requests("prefill")
-
-        if pd_verbose_enabled():
-            logger.debug(f"prefill completed for task: {task.task_id}")
-        if request_id:
-            logger.debug(f"[PD_STAGE][prefill.exec.end] req_id={request_id}")
-        return logits
 
     async def _execute_decode(self, task: Task):
         """Execute decode on KV-ready task"""

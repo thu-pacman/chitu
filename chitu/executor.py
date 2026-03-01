@@ -54,7 +54,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
 )
 
 logger = getLogger(__name__)
-_, has_torch_npu = try_import_and_setup_torch_npu()
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 # Although tags are not fully supported in the NCCL backend, they are helpful to understand the code
 TASK_TENSOR_TAG = 1
@@ -552,7 +552,7 @@ class ExpertDataDispatcher(TasksDispatcher):
                     f"{rank_in_group}".encode(),
                     tasks_msg,
                 ]
-                if current_task_type == TaskType.Decode and target_is_pd_decode_rank:
+                if target_is_pd_decode_rank:
                     # Decode task meta：首次下发时发送 MsgPackableTask
                     # 让 worker rank 本地 TaskPool 可以构造 PackedTasks，并在收到 bootstrap 时发送 TransferInfo
                     sent = self._decode_bootstrap_sent[rank_in_group]
@@ -757,11 +757,14 @@ class Executor:
         if self.rank == 0 or self.dp_dispatcher:
             # PP 下的循环节长度为 pp_size
             # 需要接收 pp_size-1 步前的结果
-            TaskCollector.init(length=self.pp_size)
-            DPTaskCollector.init(length=self.pp_size)
+            # 如果接收的位置在模型运行前，需要延后一步
+            length = self.pp_size - 1 + (1 if self.has_schedule_overlap else 0)
+            TaskCollector.init(length=length)
+            if self.rank == 0:
+                DPTaskCollector.init(length=length)
         elif self.pipe_dispatcher and self.pipe_dispatcher.is_last_stage:
             # PP last stage 相比于 PP first stage 在运行同一组 tasks 时延迟了 pp_size-1 步
-            # 需要发送 0 步前的结果
+            # 需要发送 1 步前的结果
             TaskCollector.init(length=1)
 
         if self.pp_size > 1 and not get_pp_group().is_first_rank:
@@ -977,13 +980,6 @@ class Executor:
         if Backend.state == BackendState.Terminated:
             return SerializedPackedTasksPayloadType.TerminateBackend
 
-        if payload_type == SerializedPackedTasksPayloadType.Remove:
-            if self.rank > 0:
-                for task_id in tasks.task_ids:
-                    if task_id in TaskPool.pool:
-                        TaskPool.remove(task_id)
-            return payload_type
-
         if payload_type == SerializedPackedTasksPayloadType.Empty:
             self.postprocess_sync_part(tasks)
             TaskCollector.process_last_batch_results()
@@ -996,6 +992,10 @@ class Executor:
                 for mgr in Backend.cache_managers.values():
                     mgr.finalize_cache_all_decode(rid)
             PrometheusMetricsCollector.update_kvcache_usage()
+            if self.rank > 0:
+                for task_id in tasks.task_ids:
+                    if task_id in TaskPool.pool:
+                        TaskPool.remove(task_id)
             return payload_type
 
         # synchronize
@@ -1055,7 +1055,7 @@ class Executor:
 
         # 4. sync postprocess
         self.postprocess_before_sync(tasks)
-        if not self.has_schedule_overlap or not self.is_pp_first_stage:
+        if not self.has_schedule_overlap and self.is_pp_first_stage:
             self.postprocess_sync_part(tasks)
         return payload_type
 
@@ -1115,6 +1115,9 @@ class Executor:
             for dispatcher in self.task_dispatchers:
                 payload = dispatcher.recv_payload(self.dummy_logits)
 
+        if not self.is_pp_first_stage:
+            self.postprocess_sync_part(tasks)
+
         self.timers("prefill").start()
         out = Backend.model.prefill(
             payload,
@@ -1158,122 +1161,6 @@ class Executor:
                 dispatcher.send_payload(self.dummy_logits, tasks=tasks)
 
             return self.dummy_output
-
-    def prefill_step_tp_only(self, tasks: PackedTasksBase) -> torch.Tensor:
-        """
-        PD-only prefill that supports TP but not PP.
-        - Uses only Tensor parallel dispatcher to propagate metadata and payload
-        - Does NOT send/recv hidden/logits across pipeline stages
-        """
-        # 1) propagate tasks across TP
-        tensor_dispatcher = TensorDispatcher(self.device, weakref.ref(self))
-        payload_type, tasks = tensor_dispatcher.dispatch_metadata(tasks)
-
-        # 2) prepare cache
-        for mgr in Backend.cache_managers.values():
-            mgr.prepare_cache_prefill(tasks.req_ids, [len(t) for t in tasks.tokens])
-        PrometheusMetricsCollector.update_kvcache_usage()
-
-        # 3) prepare payload on TP main rank only
-        num_tokens = tasks.num_tokens
-        tp_group = get_tp_group()
-        is_tp_main_rank = tp_group.global_rank == tp_group.rank_list[0]
-        if is_tp_main_rank and num_tokens > 0:
-            payload = (
-                torch.from_numpy(np.concatenate(tasks.tokens))
-                .to(self.device)
-                .to(torch.int64)
-            )
-        else:
-            payload = torch.empty(
-                self.get_payload_shape(num_tokens),
-                dtype=self.get_payload_dtype(),
-                device=self.device,
-            )
-
-        # 4) broadcast payload to all TP ranks
-        payload = tensor_dispatcher.recv_payload(payload)
-
-        # 5) run model
-        self.timers("prefill").start()
-        out = Backend.model.prefill(
-            payload,
-            self._get_output_token_offsets(tasks),
-            pixel_values=self.vision_tensor_broadcast(
-                getattr(tasks, "pixel_values", None), 3, torch.bfloat16
-            ),
-            grid_thw=self.vision_tensor_broadcast(
-                getattr(tasks, "grid_thw", None), 2, torch.int64, stack=False
-            ),
-        )
-        self.timers("prefill").stop()
-
-        # Notify KV hook in TP-only path as well.
-        output_req_ids = [
-            tasks.req_ids[i] for i in range(tasks.num_tasks) if tasks.has_outputs[i]
-        ]
-        self._kv_hook.on_prefill_done(output_req_ids, out, tasks)
-
-        # 6) finalize cache
-        for mgr in Backend.cache_managers.values():
-            mgr.finalize_cache_all_prefill()
-        # 7) ensure logits are [B, vocab]
-        if out.dim() == 1:
-            out = out.view(1, -1)
-        else:
-            out = out.view(out.shape[0], -1)
-        return out
-
-    def decode_step_tp_only(
-        self, req_ids: list[str], next_tokens: list[int]
-    ) -> torch.Tensor:
-        """
-        PD-only decode that supports TP but not PP.
-        - Broadcasts next_tokens across TP ranks
-        - Runs one decode step and updates KV cache
-        Returns logits with shape [B, vocab]
-        """
-        # Ensure KV is present for PD decode-only before updating CacheManager state.
-        self._kv_hook.before_decode_step(req_ids)
-        # 1) prepare cache and seq lens
-        for mgr in Backend.cache_managers.values():
-            mgr.prepare_cache_decode(req_ids)
-        PrometheusMetricsCollector.update_kvcache_usage()
-        if get_global_args().models.type == "hf-qwen3-next":
-            Backend.linear_attn_cache_manager.prepare_cache_decode(req_ids)
-        if (
-            getattr(Backend, "indexer_cache_manager", None) is not None
-            and get_global_args().models.type == "deepseek-v3"
-        ):
-            Backend.indexer_cache_manager.prepare_cache_decode(req_ids)
-
-        # 2) build payload on TP main rank only
-        num_tokens = len(next_tokens)
-        tp_group = get_tp_group()
-        is_tp_main_rank = tp_group.global_rank == tp_group.rank_list[0]
-        if is_tp_main_rank and num_tokens > 0:
-            payload = torch.tensor(next_tokens, device=self.device, dtype=torch.int64)
-        else:
-            payload = torch.empty(
-                self.get_payload_shape(num_tokens),
-                dtype=self.get_payload_dtype(),
-                device=self.device,
-            )
-
-        # 3) broadcast payload to all TP ranks
-        if self.tp_size > 1:
-            tensor_dispatcher = TensorDispatcher(self.device, weakref.ref(self))
-            payload = tensor_dispatcher.recv_payload(payload)
-
-        # 4) run decode and ensure shape [B, vocab]
-        self.timers("decode").start()
-        out = Backend.model.decode(payload, len(req_ids))
-        self.timers("decode").stop()
-
-        # 5) finalize cache for this step
-        for mgr in Backend.cache_managers.values():
-            mgr.finalize_cache_single_decode(req_ids)
-        return out
 
     def decode_step(self, tasks: PackedTasksBase, is_empty_step: bool = False):
         if tasks.num_tasks == 0:
@@ -1325,6 +1212,9 @@ class Executor:
 
             for dispatcher in self.task_dispatchers:
                 dispatcher.recv_payload(self.dummy_logits)
+
+        if not self.is_pp_first_stage:
+            self.postprocess_sync_part(tasks)
 
         payload_bs = len(tasks.req_ids) if not is_empty_step else 0
         self.timers("decode").start()

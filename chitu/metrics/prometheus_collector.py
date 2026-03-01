@@ -8,14 +8,17 @@ import time
 import threading
 from contextlib import contextmanager
 from typing import Optional
-from chitu.backend import Backend
-from chitu.utils import get_local_ip, get_free_port
 from prometheus_client import Counter, Gauge, Histogram, start_http_server, REGISTRY
 import atexit
-from chitu.distributed.parallel_state import get_dp_group
 import torch
 
+from chitu.backend import Backend
+from chitu.distributed.parallel_state import get_dp_group
+from chitu.distributed.tcp_ip import get_local_ip, get_free_port
+
+
 logger = logging.getLogger(__name__)
+
 
 # 部分参考自 sglang 的 metrics.py和 vllm
 # ---------------------------------------------------------------------------

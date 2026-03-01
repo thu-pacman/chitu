@@ -46,13 +46,11 @@ fi
 if [ "${enable_editable_install}" == "true" ]; then
     pip install \
         --no-build-isolation \
-        -i https://pypi.tuna.tsinghua.edu.cn/simple \
         -e .${OPTIONAL_DEPS_SPECIFIER} \
         -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla")
 else
     pip install \
         --no-build-isolation \
-        -i https://pypi.tuna.tsinghua.edu.cn/simple \
         .${OPTIONAL_DEPS_SPECIFIER} \
         -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla")
 

@@ -6,6 +6,7 @@ ARG optional_deps=''
 ARG chitu_setup_jobs=''
 ARG enable_cython='true'
 ARG enable_test='false'
+ARG pypi_mirror=''
 
 ENV CHITU_SETUP_JOBS=$chitu_setup_jobs
 ENV MAX_JOBS=$CHITU_SETUP_JOBS
@@ -23,8 +24,16 @@ fi
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 
+# Upgrade pip and set mirror. The mirror should be set AFTER upgrading pip
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
+    if [ "${pypi_mirror}" != "" ]; then \
+        pip install -U "pip<25.3" -i "${pypi_mirror}"; \
+    else \
+        pip install -U "pip<25.3"; \
+    fi
+RUN if [ "${pypi_mirror}" != "" ]; then \
+    pip config set global.index-url "${pypi_mirror}"; \
+fi
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
 # NOTE: Test dependencies include:
@@ -32,7 +41,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # - aiohttp is for service tests (for all platforms).
 RUN if [ "${enable_test}" = "true" ]; then \
     apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping && \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp; \
+    pip install pytest aiohttp; \
 fi
 RUN apt update -y && apt install -y curl
 
@@ -81,10 +90,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "$(lscpu | grep x86)" ]; then \
         pip install -U torch==2.6.0+cpu -i https://download.pytorch.org/whl/cpu; \
     else \
-        pip install -U torch==2.6.0 -i https://pypi.tuna.tsinghua.edu.cn/simple; \
+        pip install -U torch==2.6.0; \
     fi
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install pyyaml setuptools -i https://pypi.tuna.tsinghua.edu.cn/simple
+    pip install pyyaml setuptools
 
 WORKDIR /workspace/chitu
 COPY ./test ./test

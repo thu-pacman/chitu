@@ -37,6 +37,9 @@ class SchedulerGroupList:
 
         self.current_sgroup_id = 0
 
+    def __len__(self) -> int:
+        return sum(len(sgroup) for sgroup in self._sgroup_list)
+
     def release_sgroup(self, sgroup_id: Optional[int] = None):
         """
         Release all the tasks in the given sgroup. For default, the first sgroup will be released.
@@ -534,8 +537,6 @@ class Scheduler:
             num_need_blocks = 0
             for task_id in TaskPool.pool.keys():
                 task = TaskPool.pool[task_id]
-                if task.finished_decode:
-                    continue
                 assert (
                     task.kv_cache_len_used_in_completed_steps
                     <= task.kv_cache_len_used_in_completed_steps_and_next_step
@@ -559,8 +560,11 @@ class Scheduler:
 
         evicted_tasks = []
         while not has_enough_block():
-            if len(decode_task_ids) == 1:
-                prefix_len = TaskPool.pool[decode_task_ids[0]].prefix_tokens_len
+            if len(decode_task_ids) + len(self.sgroup_list) <= 1:
+                if len(decode_task_ids) > 0:
+                    prefix_len = TaskPool.pool[decode_task_ids[0]].prefix_tokens_len
+                else:
+                    prefix_len = -1
                 raise Exception(
                     f"KV_cache capacity is insufficient to support decoding completion (batch_size=1, prefix_len={prefix_len})."
                 )
@@ -579,16 +583,17 @@ class Scheduler:
         """Evicting kv cache in kv_cache manager of the given task_id, restore task state to its pre-prefilling state
         Args:
             task_id: the task_id that need to be evicted
+
+        Evicting Rules
+        - For PP=1, raise error when current tasks list is empty
+        - For PP>1, raise error when current DP rank has no tasks
         """
         task = TaskPool.pool[task_id]
-        if task.finished_decode:
-            return
 
         # Remove kvcache of this task
         task.next_token = -1
         task.evicting = True
         Backend.executor.special_step([task.task_id], type="EndTask")
-        Backend.executor.special_step([task.task_id], type="Remove")
         logger.warning(
             f"Evicted task {task_id} due to insufficient KV cache",
             extra={
@@ -635,35 +640,25 @@ class Scheduler:
     def reorder_tasks_for_batching(self, task_ids):
         pass
 
-    def update(self, cur_task_ids: list[str]):
+    def update(self, cur_task_ids: list[str]) -> list[str]:
         self.sgroup_list.release_sgroup()
         removed_task_ids = []
-        removed_kvcache_task_ids = []
         task_ids = cur_task_ids
         task_ids = list(set(task_ids))
         self.reorder_tasks_for_batching(task_ids)
         for task_id in task_ids:
             task = TaskPool.pool[task_id]
-            if (
-                not task.finished_decode
-                and task.task_type == TaskType.Decode
-                and task.need_remove()
-            ):
-                task.finished_decode = True
-                removed_kvcache_task_ids.append(task_id)
+            if task.need_remove():
+                removed_task_ids.append(task_id)
                 num_total_blocks = Backend.cache_managers["main"].get_num_blocks()
                 self.kvcache_block_threshold = num_total_blocks
                 logger.debug(
                     f"Task({task_id}) finished decoding, increasing kvcache_block_threshold to {self.kvcache_block_threshold}, while the number of total blocks is {num_total_blocks}"
                 )
-            if task.need_remove():
-                removed_task_ids.append(task_id)
                 TaskPool.remove(task_id)
 
         if removed_task_ids:
-            logger.debug(f"[scheduler.update] removed_decode_tasks={removed_task_ids}")
-
-        if removed_task_ids:
+            logger.debug(f"[scheduler.update] removed_tasks={removed_task_ids}")
             logger.info(
                 f"Completed {len(removed_task_ids)} tasks",
                 extra={
@@ -672,7 +667,7 @@ class Scheduler:
                 },
             )
 
-        return removed_task_ids, removed_kvcache_task_ids
+        return removed_task_ids
 
     def is_done(self):
         return len(TaskPool.pool) == 0

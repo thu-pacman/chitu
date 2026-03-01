@@ -6,6 +6,7 @@ ARG optional_deps=''
 ARG chitu_setup_jobs=''
 ARG enable_cython='true'
 ARG enable_test='false'
+ARG pypi_mirror=''
 
 ENV CHITU_SETUP_JOBS=$chitu_setup_jobs
 ENV MAX_JOBS=$CHITU_SETUP_JOBS
@@ -30,8 +31,16 @@ fi
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 
+# Upgrade pip and set mirror. The mirror should be set AFTER upgrading pip
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
+    if [ "${pypi_mirror}" != "" ]; then \
+        pip install -U "pip<25.3" -i "${pypi_mirror}"; \
+    else \
+        pip install -U "pip<25.3"; \
+    fi
+RUN if [ "${pypi_mirror}" != "" ]; then \
+    pip config set global.index-url "${pypi_mirror}"; \
+fi
 
 RUN printf '%s\n' \
       "deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy main restricted universe multiverse" \
@@ -103,7 +112,7 @@ fi
 # - aiohttp is for service tests (for all platforms).
 # - matplotlib is for benchmarks/op_bench (for platforms with triton).
 RUN if [ "${enable_test}" = "true" ]; then \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp matplotlib; \
+    pip install pytest aiohttp matplotlib; \
 fi
 
 WORKDIR /workspace/chitu

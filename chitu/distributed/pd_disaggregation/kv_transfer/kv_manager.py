@@ -44,17 +44,14 @@ from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.utils import (
     align_intervals,
     get_tp_splits,
 )
-from chitu.utils import (
-    get_free_port,
-    get_local_ip,
-    ceil_div,
-)
+from chitu.distributed.tcp_ip import get_port_from_zmq_socket, get_local_ip
 from chitu.distributed.partition import compute_layer_dist_in_pp
 from chitu.distributed.pd_disaggregation.pd_log_utils import (
     pd_trace_enabled,
     pd_verbose_enabled,
 )
 from chitu.ops import append_to_paged_kv_cache
+from chitu.utils import ceil_div
 
 import logging
 
@@ -1187,31 +1184,33 @@ class KVManager:
 
     def start_prefill_thread(self):
         """Start Prefill communication thread"""
-        # External control-plane port for Decode -> Prefill:
-        # - DECODE_REGISTER (decode buffer registration)
-        # - TRANSFER_INFO   (per-request transfer info)
-        self.rank_port = get_free_port()
         # Bind to all interfaces to avoid binding to an unreachable IP inside
         # containers / network namespaces. Decode connects using the IP published
         # to bootstrap/coordination service; binding to "*" ensures we accept
         # connections on that interface.
-        self.server_socket.bind(f"tcp://*:{self.rank_port}")
+        self.server_socket.bind(f"tcp://*:0")
+        # External control-plane port for Decode -> Prefill:
+        # - DECODE_REGISTER (decode buffer registration)
+        # - TRANSFER_INFO   (per-request transfer info)
+        self.rank_port = get_port_from_zmq_socket(self.server_socket)
 
         # Internal control-plane port for Prefill shards -> Prefill control rank:
         # - STAGE_DONE (completion notification)
-        self.internal_rank_port = get_free_port()
         self._internal_server_socket = self.zmq_ctx.socket(zmq.PULL)
         # Same rationale as external port.
-        self._internal_server_socket.bind(f"tcp://*:{self.internal_rank_port}")
+        self._internal_server_socket.bind(f"tcp://*:0")
+        self.internal_rank_port = get_port_from_zmq_socket(self._internal_server_socket)
 
         # Internal broadcast port for Prefill control rank -> all PP/TP ranks:
         # - DECODE_REGISTER
         # - TRANSFER_INFO
         #
         # 通过 PUB/SUB 广播控制面消息，替代任务 tensor 广播。
-        self.prefill_ctrl_broadcast_port = get_free_port()
         self._broadcast_pub_socket = self.zmq_ctx.socket(zmq.PUB)
-        self._broadcast_pub_socket.bind(f"tcp://*:{self.prefill_ctrl_broadcast_port}")
+        self._broadcast_pub_socket.bind(f"tcp://*:0")
+        self.prefill_ctrl_broadcast_port = get_port_from_zmq_socket(
+            self._broadcast_pub_socket
+        )
 
         def bootstrap_thread():
             logger.debug(
@@ -1540,9 +1539,9 @@ class KVManager:
 
     def start_decode_thread(self):
         """Start Decode communication thread"""
-        self.rank_port = get_free_port()
         # 绑定到所有网卡，避免绑定到不可达的本地 IP 导致跨节点连接失败
-        self.server_socket.bind(f"tcp://*:{self.rank_port}")
+        self.server_socket.bind(f"tcp://*:0")
+        self.rank_port = get_port_from_zmq_socket(self.server_socket)
         dp_rank = get_dp_group().rank_in_group
 
         self._coordination_set_decode_status_endpoint(
