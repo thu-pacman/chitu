@@ -478,9 +478,15 @@ class Backend:
         )
         # Create appropriate cache manager
         if args.infer.cache_type == "paged":
-            block_size = 64 if args.infer.mla_absorb != "none" else 256
             if args.infer.attn_type == "npu":
                 block_size = 128
+            elif (
+                args.models.type == ModelType.DEEPSEEK_V3
+                and args.infer.mla_absorb != "none"
+            ):
+                block_size = 64
+            else:
+                block_size = 256
             return PagedKVCacheManager(
                 layer_id_map,
                 max_seq_len=args.infer.max_seq_len,
