@@ -867,6 +867,7 @@ def chitu_run_main_rank():
 @torch.inference_mode()
 def chitu_run():
     try:
+        check_alloc_retries()
         rank = torch.distributed.get_rank()
         if rank != 0:
             return Backend.executor.step(None)
@@ -879,6 +880,25 @@ def chitu_run():
         raise Exception(
             msg
         ) from None  # `msg` already contains traceback, so raise from None
+
+
+_last_alloc_retries = 0
+
+
+def check_alloc_retries():
+    global _last_alloc_retries
+    cur_alloc_retries = torch.cuda.memory_stats(torch.cuda.current_device())[
+        "num_alloc_retries"
+    ]
+    if cur_alloc_retries > _last_alloc_retries:
+        logger.warning(
+            f"{cur_alloc_retries - _last_alloc_retries} allocations successed only "
+            f"after retrying (freeing memory from PyTorch allocator to CUDA and then "
+            f"allocating them back). This will significantly reduce the performance. "
+            f"Please try reducing memory usage, for example by lowering "
+            f"`infer.memory_utilization`."
+        )
+    _last_alloc_retries = cur_alloc_retries
 
 
 async def start_enhanced_scheduler_service(rank: int, dp_config, args):
