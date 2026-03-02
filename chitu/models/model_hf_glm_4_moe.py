@@ -24,7 +24,11 @@ from chitu.models.model_hf_qwen2_vl import (
     VisionTransformer,
     TransformerQwen2VL,
 )
-from chitu.models.model_deepseek_v3 import MLPDeepSeekV3, ParallelMoeBlockDeepSeekV3
+from chitu.models.model_deepseek_v3 import (
+    MLPDeepSeekV3,
+    ParallelMoeBlockDeepSeekV3,
+    SharedHeadDeepSeekV3,
+)
 from chitu.models.registry import ModelType, register_model
 from chitu.global_vars import get_global_args
 from chitu.quantization import get_quant_from_checkpoint_prefix, QuantizedMoeExpertsBase
@@ -32,7 +36,7 @@ from chitu.muxi_utils import (
     NormalMoeExpertsMuxiLayout,
     Blockfp8MoeExpertsMuxiLayout,
 )
-from chitu.tensor_parallel import ColumnParallelLinear
+from chitu.tensor_parallel import ColumnParallelLinear, VocabParallelEmbedding
 from chitu.distributed.partition import compute_expert_dist_in_ep
 
 
@@ -290,10 +294,10 @@ class TransformerBlockHFGlm4Moe(TransformerBlockHFLlama):
         args,
         cache_managers: dict[str, KVCacheManagerBase],
         attn_backend,
+        *,
         op_impl="torch",
         rotary_type="separated-half",
-        mlp_type=ParallelMoeBlockDeepSeekV3,
-        checkpoint_prefix="",
+        checkpoint_prefix,
     ):
         base_moe_experts_class: Optional[Type[QuantizedMoeExpertsBase]] = None
         if op_impl == "muxi_custom_kernel":
@@ -330,6 +334,58 @@ class TransformerBlockHFGlm4Moe(TransformerBlockHFLlama):
             checkpoint_prefix=checkpoint_prefix,
         )
 
+    @override
+    def forward(
+        self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
+    ):
+        x = x + self.self_attn(
+            self.input_layernorm(x, compute_dtype=x.dtype), freqs_cis, is_mtp
+        )
+        x = x + self.mlp(self.post_attention_layernorm(x, compute_dtype=x.dtype))
+        return x
+
+
+class TransformerBlockHFGlm4MoeMTP(TransformerBlockHFGlm4Moe):
+    def __init__(
+        self,
+        layer_id: int,
+        args,
+        cache_managers: dict[str, KVCacheManagerBase],
+        attn_backend,
+        *,
+        op_impl="torch",
+        rotary_type="separated-half",
+        checkpoint_prefix,
+    ):
+        super().__init__(
+            layer_id,
+            args,
+            cache_managers,
+            attn_backend=attn_backend,
+            op_impl=op_impl,
+            rotary_type=rotary_type,
+            checkpoint_prefix=checkpoint_prefix,
+        )
+        self.enorm = RMSNorm(args.dim, eps=getattr(args, "rms_norm_eps", 1e-6))
+        self.hnorm = RMSNorm(args.dim, eps=getattr(args, "rms_norm_eps", 1e-6))
+        self.eh_proj = torch.nn.Linear(args.dim * 2, args.dim, bias=False)
+        self.shared_head = SharedHeadDeepSeekV3(args)
+        self.embed_tokens = VocabParallelEmbedding(args.vocab_size, args.dim)
+
+    @override
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
+        previous_hidden_states: torch.Tensor,
+        is_mtp: bool = False,
+    ):
+        inputs_embeds = self.enorm(x)
+        previous_hidden_states = self.hnorm(previous_hidden_states)
+        x = self.eh_proj(torch.cat([inputs_embeds, previous_hidden_states], dim=-1))
+        x = super().forward(x, freqs_cis, is_mtp)
+        return x
+
 
 @register_model(ModelType.HF_GLM_4_MOE)
 class TransformerHFGlm4Moe(TransformerQwen2VL):
@@ -343,10 +399,15 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
         tensor_parallel_size: int,
         attn_backend: AttnBackend,
         rotary_type: str = "separated-half",
-        layer_type: type = TransformerBlockHFGlm4Moe,
         op_impl: str = "torch",
         **kvargs,
     ):
+        def layer_type_callback(layer_id: int):
+            if not (self.mtp_size > 1 and layer_id >= self.params.n_layers):
+                return TransformerBlockHFGlm4Moe
+            else:
+                return TransformerBlockHFGlm4MoeMTP
+
         super().__init__(
             params,
             cache_managers,
@@ -355,7 +416,7 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
             tensor_parallel_size=tensor_parallel_size,
             attn_backend=attn_backend,
             rotary_type=rotary_type,
-            layer_type=layer_type,
+            layer_type_callback=layer_type_callback,
             op_impl=op_impl,
             visual_type=Glm4vVisionTransformer,
             **kvargs,
@@ -389,7 +450,7 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
         fuse_shared_experts = get_global_args().infer.fuse_shared_experts
         n_dense_layers = self.args.models.n_dense_layers
         local_experts = compute_expert_dist_in_ep(
-            self.args.models.n_layers - self.args.models.n_dense_layers,
+            self.global_n_layers - self.args.models.n_dense_layers,
             self.ep_size,
             self.args.models.n_routed_experts,
             self.moe_impl,
@@ -432,7 +493,7 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
 
     @override
     def _get_tensor_column_parallel_layer_names(self) -> list[str]:
-        return [
+        tensor_column_parallel_list = [
             "qkv_proj",
             "q_proj",
             "k_proj",
@@ -445,6 +506,18 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
             "attn\.proj",
             "embed_tokens",
         ]
+        if self.mtp_size > 1:
+            # Use local layer ID here, because we have already transformed state_dict
+            # to use local layer ID when we check tensor parallelism.
+            #
+            # FIXME: Modify model.py to use global layer ID.
+            if self.params.n_layers in range(
+                self.local_begin_layer_id, self.local_end_layer_id
+            ):
+                tensor_column_parallel_list.append(
+                    f"layers\.{self.params.n_layers - self.local_begin_layer_id}\.shared_head\.head"
+                )
+        return tensor_column_parallel_list
 
     @override
     def _get_tensor_row_parallel_layer_names(self) -> list[str]:
@@ -479,3 +552,16 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
             return (f"model.language_model.layers.{i}.", f"layers.{i}.")
         else:
             return (f"model.layers.{i}.", f"layers.{i}.")
+
+    @override
+    def _pre_layers_mtp(self, h, **args):
+        return self.layers[-1].embed_tokens(h)
+
+    @override
+    def _get_prefill_previous_hidden_states(self, h):
+        self.prefill_main_last_hidden_states = self.norm(h, compute_dtype=h.dtype)
+        return torch.roll(self.prefill_main_last_hidden_states, shifts=1, dims=0)
+
+    @override
+    def _post_layers_mtp(self, h):
+        return self.layers[-1].shared_head(h)

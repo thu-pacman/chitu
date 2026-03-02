@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from logging import getLogger
-from typing import Optional
+from typing import Optional, Callable
 from typing_extensions import override
 from types import SimpleNamespace
 
@@ -515,7 +515,8 @@ class TransformerQwen2VL(TransformerHFLlama):
         attn_backend: AttnBackend,
         op_impl: str,
         rotary_type: str = "separated",
-        layer_type: type = TransformerBlockHFLlama,
+        layer_type: Optional[type] = None,
+        layer_type_callback: Optional[Callable[[int], type]] = None,
         visual_type: type = VisionTransformer,
         **kwargs,
     ):
@@ -531,6 +532,7 @@ class TransformerQwen2VL(TransformerHFLlama):
             op_impl=op_impl,
             rotary_type=rotary_type,
             layer_type=layer_type,
+            layer_type_callback=layer_type_callback,
             **kwargs,
         )
 

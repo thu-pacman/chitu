@@ -495,7 +495,7 @@ class ParallelMoeBlockQwen3Next(ParallelMoeBlock):
         )
 
 
-class TransformerBlockHFQwen3Next(TransformerBlock):
+class TransformerBlockHFQwen3NextBase(TransformerBlock):
     def __init__(
         self,
         layer_id: int,
@@ -505,30 +505,10 @@ class TransformerBlockHFQwen3Next(TransformerBlock):
         op_impl,
         rotary_type="separated-half",
         mlp_type=ParallelMoeBlockQwen3Next,
-        checkpoint_prefix="",
-        attn_layer_type="linear_attention",
+        *,
+        checkpoint_prefix,
     ):
         super().__init__(layer_id, args, cache_managers, attn_backend, op_impl)
-
-        self.attn_layer_type = attn_layer_type
-        if self.attn_layer_type == "linear_attention":
-            self.linear_attn = Qwen3NextGatedDeltaNet(
-                args,
-                layer_id,
-                cache_managers["linear"],
-                checkpoint_prefix=f"{checkpoint_prefix}.linear_attn",
-            )
-        elif self.attn_layer_type == "full_attention":
-            self.self_attn = AttentionQwen3Next(
-                args,
-                layer_id,
-                cache_managers["main"],
-                attn_backend,
-                rotary_type=rotary_type,
-                op_impl=op_impl,
-                checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
-            )
-
         self.mlp = mlp_type(
             args,
             op_impl=op_impl,
@@ -539,13 +519,82 @@ class TransformerBlockHFQwen3Next(TransformerBlock):
         self.post_attention_layernorm = Qwen3NextRMSNorm(args.dim, eps=args.norm_eps)
 
     def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
-        if self.attn_layer_type == "full_attention":
-            h = self.self_attn(self.input_layernorm(x), freqs_cis)
-        else:
-            h = self.linear_attn(self.input_layernorm(x))
+        return x + self.mlp(self.post_attention_layernorm(x))
+
+
+class TransformerBlockHFQwen3NextFull(TransformerBlockHFQwen3NextBase):
+    def __init__(
+        self,
+        layer_id: int,
+        args,
+        cache_managers: dict[str, KVCacheManagerBase],
+        attn_backend,
+        op_impl,
+        rotary_type="separated-half",
+        mlp_type=ParallelMoeBlockQwen3Next,
+        *,
+        checkpoint_prefix,
+    ):
+        super().__init__(
+            layer_id,
+            args,
+            cache_managers,
+            attn_backend,
+            op_impl,
+            rotary_type,
+            mlp_type,
+            checkpoint_prefix=checkpoint_prefix,
+        )
+        self.self_attn = AttentionQwen3Next(
+            args,
+            layer_id,
+            cache_managers["main"],
+            attn_backend,
+            rotary_type=rotary_type,
+            op_impl=op_impl,
+            checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
+        )
+
+    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
+        h = self.self_attn(self.input_layernorm(x), freqs_cis)
         h += x
-        out = h + self.mlp(self.post_attention_layernorm(h))
-        return out
+        return super().forward(h, freqs_cis)
+
+
+class TransformerBlockHFQwen3NextLinear(TransformerBlockHFQwen3NextBase):
+    def __init__(
+        self,
+        layer_id: int,
+        args,
+        cache_managers: dict[str, KVCacheManagerBase],
+        attn_backend,
+        op_impl,
+        rotary_type="separated-half",
+        mlp_type=ParallelMoeBlockQwen3Next,
+        *,
+        checkpoint_prefix,
+    ):
+        super().__init__(
+            layer_id,
+            args,
+            cache_managers,
+            attn_backend,
+            op_impl,
+            rotary_type,
+            mlp_type,
+            checkpoint_prefix=checkpoint_prefix,
+        )
+        self.linear_attn = Qwen3NextGatedDeltaNet(
+            args,
+            layer_id,
+            cache_managers["linear"],
+            checkpoint_prefix=f"{checkpoint_prefix}.linear_attn",
+        )
+
+    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
+        h = self.linear_attn(self.input_layernorm(x))
+        h += x
+        return super().forward(h, freqs_cis)
 
 
 @register_model(ModelType.HF_QWEN3_NEXT)
@@ -560,18 +609,14 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
         tensor_parallel_size: int,
         attn_backend: AttnBackend,
         rotary_type: str = "separated-half",
-        layer_type: type = TransformerBlockHFQwen3Next,
         op_impl: str = "torch",
         **kvargs,
     ):
-        self.attn_layer_types = [
-            (
-                "full_attention"
-                if (layer_id + 1) % params.full_attention_interval == 0
-                else "linear_attention"
-            )
-            for layer_id in range(params.n_layers)
-        ]
+        def layer_type_callback(layer_id: int):
+            if (layer_id + 1) % params.full_attention_interval == 0:
+                return TransformerBlockHFQwen3NextFull
+            else:
+                return TransformerBlockHFQwen3NextLinear
 
         super().__init__(
             params,
@@ -581,7 +626,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
             tensor_parallel_size=tensor_parallel_size,
             attn_backend=attn_backend,
             rotary_type=rotary_type,
-            layer_type=layer_type,
+            layer_type_callback=layer_type_callback,
             op_impl=op_impl,
             **kvargs,
         )
@@ -603,24 +648,6 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
         ret = super()._get_tensor_row_parallel_layer_names()
         ret += ["out_proj"]
         return ret
-
-    def _init_layers(
-        self, cache_managers: dict[str, KVCacheManagerBase], attn_backend, op_impl
-    ):
-        self.layers = torch.nn.ModuleList()
-        for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
-            self.layers.append(
-                self.layer_type(
-                    layer_id,
-                    self.params,
-                    cache_managers,
-                    attn_backend=attn_backend,
-                    op_impl=op_impl,
-                    rotary_type=self.rotary_type,
-                    checkpoint_prefix=f"layers.{layer_id}",
-                    attn_layer_type=self.attn_layer_types[layer_id],
-                )
-            )
 
     def _init_post_layers(self):
         self.norm = Qwen3NextRMSNorm(self.params.dim, eps=self.params.norm_eps)

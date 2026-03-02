@@ -658,7 +658,7 @@ class AttentionDeepSeekV3(Attention):
         return self.o_proj(x.flatten(-2)).view(bs_seq, -1)
 
 
-class SharedHead(nn.Module):
+class SharedHeadDeepSeekV3(nn.Module):
     def __init__(self, args) -> None:
         super().__init__()
 
@@ -1021,6 +1021,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             eps=getattr(args, "rms_norm_eps", 1e-6),
         )
 
+    @override
     def forward(
         self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
     ):
@@ -1073,7 +1074,7 @@ class TransformerBlockDeepSeekV3MTP(TransformerBlockDeepSeekV3):
             eps=getattr(args, "rms_norm_eps", 1e-6),
         )
         self.eh_proj = torch.nn.Linear(args.dim * 2, args.dim, bias=False)
-        self.shared_head = SharedHead(args)
+        self.shared_head = SharedHeadDeepSeekV3(args)
         if not getattr(args, "mtp_tie_word_embeddings", False):
             self.embed_tokens = VocabParallelEmbedding(args.vocab_size, args.dim)
 
@@ -1130,9 +1131,16 @@ class TransformerDeepSeekV3(Transformer):
             "lm_head",
         ]
         if self.mtp_size > 1 and not getattr(self.params, "mtp_tie_lm_head", False):
-            tensor_column_parallel_list.append(
-                f"layers.{self.params.n_layers}.shared_head.head"
-            )
+            # Use local layer ID here, because we have already transformed state_dict
+            # to use local layer ID when we check tensor parallelism.
+            #
+            # FIXME: Modify model.py to use global layer ID.
+            if self.params.n_layers in range(
+                self.local_begin_layer_id, self.local_end_layer_id
+            ):
+                tensor_column_parallel_list.append(
+                    f"layers\.{self.params.n_layers - self.local_begin_layer_id}\.shared_head\.head"
+                )
         return tensor_column_parallel_list
 
     @override
@@ -1146,7 +1154,7 @@ class TransformerDeepSeekV3(Transformer):
     @override
     def _get_post_layer_prefixes(self) -> list[str]:
         ret = ["lm_head.", "norm."]
-        if self.mtp_size > 1 and not getattr(self.params, "mtp_tie_lm_head", False):
+        if self.mtp_size > 1 and getattr(self.params, "mtp_tie_word_embeddings", False):
             ret += ["embed_tokens."]
         return ret
 
@@ -1670,7 +1678,7 @@ class TransformerDeepSeekV3(Transformer):
             logger.debug(
                 f"initing layer : {layer_id}  cpu memory usage: {memory_usage / 1024**2} GB  gpu memory usage : RANK : {torch.cuda.current_device()} {torch.cuda.memory_allocated()/(1024**3)} GB"
             )
-            if not (self.mtp_size > 1 and layer_id + 1 == self.local_end_layer_id):
+            if not (self.mtp_size > 1 and layer_id >= self.params.n_layers):
                 self.layers.append(
                     TransformerBlockDeepSeekV3(
                         layer_id,
