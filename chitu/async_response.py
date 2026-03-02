@@ -153,7 +153,7 @@ class AsyncResponse:
         self.async_stream: AsyncDataStream = req.async_stream
         self.tool_parser = Backend.tool_parser(req.tools) if req.tools else None
 
-    def stream_generator(self):
+    def stream_generator(self, *, include_usage: bool):
         if self.tool_parser:
             stream = parse_stream_by_parser(self.async_stream, self.tool_parser)
         else:
@@ -214,15 +214,27 @@ class AsyncResponse:
                             "finish_reason": self.req.finish_reason,
                         }
                     ],
-                    usage={
-                        "prompt_tokens": self.req.prompt_len,
-                        "completion_tokens": self.async_stream.tokens_len,
-                        "total_tokens": self.async_stream.tokens_len
-                        + self.req.prompt_len,
-                    },
                 )
                 data = chunk.model_dump_json(exclude_none=True)
                 yield f"data: {data}\n\n"
+
+                # OpenAI standard requires "usage" in a separated chunk.
+                # See "include_usage" in
+                # https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create
+                if include_usage:
+                    chunk = ChatCompletionResponse(
+                        id=self.id,
+                        choices=[],
+                        usage={
+                            "prompt_tokens": self.req.prompt_len,
+                            "completion_tokens": self.async_stream.tokens_len,
+                            "total_tokens": self.async_stream.tokens_len
+                            + self.req.prompt_len,
+                        },
+                    )
+                    data = chunk.model_dump_json(exclude_none=True)
+                    yield f"data: {data}\n\n"
+
                 logger.debug(
                     f"Completed_{self.id}: {self.req.output}, token_len: {self.async_stream.tokens_len}\n"
                 )
