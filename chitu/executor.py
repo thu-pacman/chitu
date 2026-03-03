@@ -1672,7 +1672,41 @@ class Executor:
 
     def prefill_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         logger.info(f"prefill_dllm_step begin but empty")
-        pass
+        is_empty_step = tasks.num_tasks == 0
+        if not is_empty_step:
+            for mgr in Backend.cache_managers.values():
+                mgr.prepare_cache_prefill(tasks.req_ids, [len(t) for t in tasks.tokens])
+            PrometheusMetricsCollector.update_kvcache_usage()
+
+            num_tokens = tasks.num_tokens
+
+            if (self.rank == 0 and num_tokens > 0) or (
+                self.dp_size > 1 and self.pp_stage == 0
+            ):  # check if num_toekns needs to be validated
+                payload = (
+                    torch.from_numpy(np.concatenate(tasks.tokens))
+                    .to(self.device)
+                    .to(torch.int64)
+                )
+            else:
+                payload = torch.empty(
+                    self.get_payload_shape(num_tokens),
+                    dtype=self.get_payload_dtype(),
+                    device=self.device,
+                )
+
+            # payload recv
+            for dispatcher in self.task_dispatchers:
+                payload = dispatcher.recv_payload(payload)
+        else:
+            for dispatcher in self.task_dispatchers:
+                payload = dispatcher.recv_payload(self.dummy_logits)
+
+        from dinfer import TokenArray
+        token_array = TokenArray(payload, num_tokens, mask_id=Backend.model.decoder.mask_id, eos_id=Backend.model.decoder.eos_id, device=self.device)
+        
+
+
 
     def decode_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         logger.info(f"decode_dllm_step begin but empty")

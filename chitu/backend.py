@@ -324,58 +324,8 @@ class Backend:
         Backend.ip_port_list = world_group.gather_all_rank_ip_port()
         Backend.ipc_session_id = world_group.generate_ipc_session_id()
 
-        # Initialize sglang parallel state for dLLM (LLaDA2) model compatibility.
-        # torch.distributed is already initialized by chitu above, so sglang's
-        # init_distributed_environment will skip init_process_group and only set
-        # its own global variables. This avoids port conflicts.
-        if getattr(args.models, "type", "") == "llada":
-            try:
-                from sglang.srt.distributed import (
-                    init_distributed_environment as sglang_init_dist,
-                    initialize_model_parallel as sglang_init_mp,
-                )
-                from sglang.srt.layers.dp_attention import initialize_dp_attention
-                from sglang.srt.server_args import ServerArgs
-                from sglang.srt.layers.moe import initialize_moe_config
-                from transformers import AutoConfig
-
-                sglang_init_dist(
-                    world_size=world_size,
-                    rank=global_rank,
-                    distributed_init_method="env://",
-                    local_rank=global_rank % torch.cuda.device_count(),
-                    backend="nccl",
-                )
-                sglang_init_mp(
-                    tensor_model_parallel_size=tensor_parallel_size,
-                    expert_model_parallel_size=expert_parallel_size,
-                    pipeline_model_parallel_size=pipeline_parallel_size,
-                    backend="nccl",
-                )
-                server_args = ServerArgs(
-                    model_path=args.models.ckpt_dir,
-                    enable_dp_attention=True,
-                    trust_remote_code=True,
-                    tp_size=tensor_parallel_size,
-                    dp_size=1,
-                    pp_size=pipeline_parallel_size,
-                )
-                try:
-                    from sglang.srt.server_args import set_global_server_args_for_scheduler
-                    set_global_server_args_for_scheduler(server_args)
-                except ImportError:
-                    pass
-                model_config = AutoConfig.from_pretrained(
-                    args.models.ckpt_dir, trust_remote_code=True
-                )
-                initialize_dp_attention(
-                    server_args=server_args,
-                    model_config=model_config,
-                )
-                initialize_moe_config(server_args)
-                logger.info("sglang parallel state initialized for dLLM model")
-            except Exception as e:
-                logger.warning(f"Failed to initialize sglang parallel state: {e}")
+        # sglang parallel state for dLLM (LLaDA2) is initialized in model_llada.py
+        # when TransformerLLaDA is instantiated
 
         Backend.pp_stage = (
             global_rank
