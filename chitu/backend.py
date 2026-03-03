@@ -459,7 +459,7 @@ class Backend:
         total_n_layers = args.models.n_layers + (1 if mtp_size > 1 else 0)
         if pipeline_parallel_size > 1:
             layer_dist = compute_layer_dist_in_pp(
-                args.models.n_layers, pipeline_parallel_size
+                total_n_layers, pipeline_parallel_size
             )
             pp_rank = get_pp_group().rank_in_group
             local_begin_layer_id = sum(layer_dist[:pp_rank])
@@ -519,7 +519,7 @@ class Backend:
         total_n_layers = args.models.n_layers + (1 if mtp_size > 1 else 0)
         if pipeline_parallel_size > 1:
             layer_dist = compute_layer_dist_in_pp(
-                args.models.n_layers, pipeline_parallel_size
+                total_n_layers, pipeline_parallel_size
             )
             pp_rank = get_pp_group().rank_in_group
             local_begin_layer_id = sum(layer_dist[:pp_rank])
@@ -549,7 +549,7 @@ class Backend:
         total_n_layers = args.models.n_layers + (1 if mtp_size > 1 else 0)
         if pipeline_parallel_size > 1:
             layer_dist = compute_layer_dist_in_pp(
-                args.models.n_layers, pipeline_parallel_size
+                total_n_layers, pipeline_parallel_size
             )
             pp_rank = get_pp_group().rank_in_group
             local_begin_layer_id = sum(layer_dist[:pp_rank])

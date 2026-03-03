@@ -50,24 +50,20 @@ def send_request(index: int):
                 if chunk == b"[DONE]":
                     continue
                 data = json.loads(chunk)
-                delta = data["choices"][0]["delta"]
-                if delta.get("content", None):
-                    tokens += 1
-                    generated_text += delta["content"]
-                if delta.get("reasoning_content", None):
-                    tokens += 1
-                    generated_text += delta["reasoning_content"]
+                if len(choices := data["choices"]) > 0:
+                    delta = choices[0]["delta"]
+                    if delta.get("content", None):
+                        tokens += 1
+                        generated_text += delta["content"]
+                    if delta.get("reasoning_content", None):
+                        tokens += 1
+                        generated_text += delta["reasoning_content"]
 
                 with lock:
                     indices_received.append(index)
                 print(f"Response received from request {index}", flush=True)
 
-            return (
-                index,
-                generated_text,
-                reasoning_text,
-                tokens,
-            )
+            return index, generated_text, reasoning_text, tokens
         else:
             print(f"Request failed with status code: {response.status_code}")
 

@@ -57,6 +57,10 @@ class Message(BaseModel):
     tool_call_id: str | None = None  # useless, at least for qwen3
 
 
+class StreamOptions(BaseModel):
+    include_usage: bool = True
+
+
 class ChatRequest(BaseModel):
     conversation_id: str = Field(default_factory=gen_req_id)
     messages: list[Message]
@@ -68,6 +72,7 @@ class ChatRequest(BaseModel):
     max_completion_tokens: Optional[int] = None
     max_tokens: Optional[int] = Field(default=None, deprecated=True)
     stream: bool = False
+    stream_options: StreamOptions = Field(default_factory=StreamOptions)
     temperature: float = 0.8  # [0, 2]
     top_p: float = 0.9  # [0,1]
     top_k: int = 50  # -1 or positive integer
@@ -243,7 +248,10 @@ async def create_chat_completion(
         TaskPool.enqueue(task)
         if req.stream:
             return StreamingResponse(
-                response.stream_generator(), media_type="text/event-stream"
+                response.stream_generator(
+                    include_usage=req.stream_options.include_usage
+                ),
+                media_type="text/event-stream",
             )
         else:
             full_response = await response.full_generator()
@@ -465,7 +473,10 @@ async def process_dp_chat_completion(request: ChatRequest):
                 f"[DP_HTTP] Returning streaming response for request: {req_id}"
             )
             return StreamingResponse(
-                response.stream_generator(), media_type="text/event-stream"
+                response.stream_generator(
+                    include_usage=request.stream_options.include_usage
+                ),
+                media_type="text/event-stream",
             )
         else:
             logger.debug(f"[DP_HTTP] Waiting for full response: {req_id}")

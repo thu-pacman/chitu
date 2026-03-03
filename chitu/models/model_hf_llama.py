@@ -5,7 +5,7 @@
 import math
 from collections import OrderedDict
 from logging import getLogger
-from typing import Any
+from typing import Any, Optional, Callable
 from typing_extensions import override
 
 import torch
@@ -222,9 +222,7 @@ class AttentionHFLlama(Attention):
         return self.o_proj(x)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: BatchedFreqsCis,
+        self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
     ):
         # 因为量化后x是个tuple，所以取shape的时候放linear后面
         xq, xk, xv = self._run_linear(x)
@@ -255,12 +253,16 @@ class AttentionHFLlama(Attention):
         else:
             descales = {}
 
+        if is_mtp:
+            seq_len_delta = self.cache.mtp_seq_len_delta
+        else:
+            seq_len_delta = self.cache.seq_len_delta
         output = self.attn_backend(
             xq,
-            self.cache.get_accessor(self.layer_id),
+            self.cache.get_accessor(self.layer_id, is_mtp),
             xk,
             xv,
-            seq_len_delta=self.cache.seq_len_delta,
+            seq_len_delta=seq_len_delta,
             causal=True,
             **descales,
         ).view(bs_seq, -1)
@@ -426,12 +428,23 @@ class TransformerHFLlama(Transformer):
         attn_backend: AttnBackend,
         op_impl: str,
         rotary_type: str = "separated",
-        layer_type: type = TransformerBlockHFLlama,
+        layer_type: Optional[type] = None,
+        layer_type_callback: Optional[Callable[[int], type]] = None,
         **kvargs,
     ):
         self.rotary_emb: Any = None
         self.rotary_type = rotary_type
-        self.layer_type = layer_type
+
+        if layer_type is None and layer_type_callback is None:
+            layer_type = TransformerBlockHFLlama
+        if layer_type is not None and layer_type_callback is not None:
+            raise ValueError(
+                "Only one of layer_type or layer_type_callback can be provided."
+            )
+        if layer_type is not None:
+            layer_type_callback = lambda _: layer_type
+        self.layer_type_callback = layer_type_callback
+
         super().__init__(
             params,
             cache_managers,
@@ -627,7 +640,7 @@ class TransformerHFLlama(Transformer):
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
             self.layers.append(
-                self.layer_type(
+                self.layer_type_callback(layer_id)(
                     layer_id,
                     self.params,
                     cache_managers,
@@ -704,6 +717,21 @@ class TransformerHFLlama(Transformer):
                 self.cache_managers[
                     "main"
                 ].seq_len_delta.delta_position_ids_tensor_device
+            ],
+        )
+
+    @override
+    def prepare_freqs_cis_mtp(self) -> BatchedFreqsCis:
+        return BatchedFreqsCis(
+            self.rotary_emb.cos_cached[
+                self.cache_managers[
+                    "main"
+                ].mtp_seq_len_delta.delta_position_ids_tensor_device
+            ],
+            self.rotary_emb.sin_cached[
+                self.cache_managers[
+                    "main"
+                ].mtp_seq_len_delta.delta_position_ids_tensor_device
             ],
         )
 

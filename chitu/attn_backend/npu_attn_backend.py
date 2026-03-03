@@ -74,7 +74,7 @@ class NpuAttnBackend(RefAttnBackend):
         )
 
     @override
-    def decode_op_supports_mtp(self):
+    def decode_op_supports_mtp(self) -> bool:
         return True
 
     @classmethod

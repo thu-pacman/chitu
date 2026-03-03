@@ -653,7 +653,9 @@ class Scheduler:
                 num_total_blocks = Backend.cache_managers["main"].get_num_blocks()
                 self.kvcache_block_threshold = num_total_blocks
                 logger.debug(
-                    f"Task({task_id}) finished decoding, increasing kvcache_block_threshold to {self.kvcache_block_threshold}, while the number of total blocks is {num_total_blocks}"
+                    f'Task({task_id}) finished decoding because "{task.req.finish_reason}", '
+                    f"increasing kvcache_block_threshold to {self.kvcache_block_threshold}, "
+                    f"while the number of total blocks is {num_total_blocks}"
                 )
                 TaskPool.remove(task_id)
 

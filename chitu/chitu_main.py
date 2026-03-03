@@ -224,7 +224,7 @@ def _warmup_via_taskpool(args):
         warmup_seq_len = max(
             min(
                 prefill_chunk_size // num_warmup_reqs,
-                args.infer.max_seq_len - 1,
+                args.infer.max_seq_len - get_global_args().infer.mtp_size,
             ),
             1,
         )

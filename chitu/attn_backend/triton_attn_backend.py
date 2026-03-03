@@ -33,15 +33,6 @@ class TritonAttnBackend(RefAttnBackend):
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
-    def prepare_metadata_for_decode(
-        self,
-        seq_len_delta: BatchedSeqLenDelta,
-        block_table,
-        block_size,
-        softmax_scale=None,
-    ):
-        self.block_size = block_size
-
     @override
     def prefill_ragged_qkvo(
         self,

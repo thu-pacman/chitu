@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional, Mapping, Any
+from typing import Optional, Mapping, Any, Callable
 from typing_extensions import override
 import re
 import functools
@@ -183,10 +183,14 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
         tensor_parallel_size: int,
         attn_backend: AttnBackend,
         rotary_type: str = "separated",
-        layer_type: type = TransformerBlockHFQwen3Moe,
+        layer_type: Optional[type] = None,
+        layer_type_callback: Optional[Callable[[int], type]] = None,
         op_impl: str = "torch",
         **kvargs,
     ):
+        if layer_type is None and layer_type_callback is None:
+            layer_type = TransformerBlockHFQwen3Moe
+
         super().__init__(
             params,
             cache_managers,
@@ -196,6 +200,7 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
             attn_backend=attn_backend,
             rotary_type=rotary_type,
             layer_type=layer_type,
+            layer_type_callback=layer_type_callback,
             op_impl=op_impl,
             **kvargs,
         )
