@@ -24,21 +24,41 @@ class HybridAttnBackend(AttnBackend):
     ):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
-        self.triton_backend = TritonAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
-        self.flash_attn_backend = FlashAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+        self.triton_backend: Optional[TritonAttnBackend] = None
+        try:
+            if not self.triton_latest_enough:
+                raise ImportError("Triton not available or too old")
+            self.triton_backend = TritonAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+        except Exception as e:
+            logger.info(f"Disable triton backend due to {e}")
+
+        self.flash_attn_backend: Optional[FlashAttnBackend] = None
+        try:
+            self.flash_attn_backend = FlashAttnBackend(
+                qk_nope_head_dim=qk_nope_head_dim
+            )
+        except Exception as e:
+            logger.info(f"Disable flash attn backend due to {e}")
 
         self.batch_threshold = batch_threshold
-        self.current_backend = self.flash_attn_backend
 
-    def _select_backend(self, batch_size: int):
-        if not self.triton_latest_enough:
-            logger.warning(
-                "Triton not available or too old, HybridAttnBackend will only use FlashAttnBackend"
-            )
+    def _select_backend(self, batch_size: int) -> AttnBackend:
+        if self.triton_backend is not None and self.flash_attn_backend is not None:
+            if getattr(self.args.infer, "mtp_size", 1) > 1:
+                return self.flash_attn_backend
+            if batch_size <= self.batch_threshold:
+                return self.triton_backend
             return self.flash_attn_backend
-        if batch_size <= self.batch_threshold:
+        elif self.triton_backend is not None:
             return self.triton_backend
-        return self.flash_attn_backend
+        elif self.flash_attn_backend is not None:
+            return self.flash_attn_backend
+        else:
+            raise ImportError("No attention backend available")
+
+    @override
+    def decode_op_supports_mtp(self) -> bool:
+        return self.flash_attn_backend is not None
 
     @override
     def prefill_ragged_qkvo(
@@ -54,8 +74,8 @@ class HybridAttnBackend(AttnBackend):
         sinks=None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
-        self.current_backend = self._select_backend(seq_len_delta.batch_size)
-        return self.current_backend.prefill_ragged_qkvo(
+        current_backend = self._select_backend(seq_len_delta.batch_size)
+        return current_backend.prefill_ragged_qkvo(
             q,
             k,
             v,
@@ -84,8 +104,8 @@ class HybridAttnBackend(AttnBackend):
         topk_indices: Optional[torch.Tensor] = None,
     ):
         batch_size = q.shape[0]
-        self.current_backend = self._select_backend(batch_size)
-        return self.current_backend.decode_dense_kv(
+        current_backend = self._select_backend(batch_size)
+        return current_backend.decode_dense_kv(
             q,
             kv_cache,
             k=k,
@@ -114,8 +134,8 @@ class HybridAttnBackend(AttnBackend):
         topk_indices: Optional[torch.Tensor] = None,
     ):
         batch_size = q.shape[0]
-        self.current_backend = self._select_backend(batch_size)
-        return self.current_backend.decode_paged_kv(
+        current_backend = self._select_backend(batch_size)
+        return current_backend.decode_paged_kv(
             q,
             kv_cache,
             k=k,
@@ -127,9 +147,3 @@ class HybridAttnBackend(AttnBackend):
             sinks=sinks,
             topk_indices=topk_indices,
         )
-
-    def prepare_metadata_for_decode(self, *args, **kwargs):
-        self.current_backend.prepare_metadata_for_decode(*args, **kwargs)
-
-    def prepare_metadata_for_prefill(self, *args, **kwargs):
-        self.current_backend.prepare_metadata_for_prefill(*args, **kwargs)

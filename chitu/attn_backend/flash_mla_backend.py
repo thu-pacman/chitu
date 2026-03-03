@@ -111,7 +111,7 @@ class FlashMLABackend(TritonAttnBackend):
         return indices_padded
 
     @override
-    def decode_op_supports_mtp(self):
+    def decode_op_supports_mtp(self) -> bool:
         return True
 
     def convert_indices_ragged_torch(
@@ -246,7 +246,7 @@ class FlashMLABackend(TritonAttnBackend):
             512,  # dv
             self.metadata.get(),
             self.num_splits.get(),
-            causal=(False if s_q == 1 else True),
+            causal=s_q > 1,
             softmax_scale=softmax_scale,
         )
         output = output.view(bsz * s_q, output.shape[-2], output.shape[-1])

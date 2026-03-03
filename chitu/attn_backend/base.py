@@ -49,7 +49,7 @@ class AttnBackend(abc.ABC):
             triton.__version__
         ) >= packaging.version.parse("3.2.0")
 
-    def decode_op_supports_mtp(self):
+    def decode_op_supports_mtp(self) -> bool:
         return False
 
     def prepare_metadata_for_decode(self, *args, **kwargs):
@@ -124,7 +124,9 @@ class AttnBackend(abc.ABC):
             out: (total, nheads, headdim).
         """
 
-        if seq_len_delta.is_classic_decoding:
+        if seq_len_delta.is_classic_decoding or (
+            seq_len_delta.is_decode_stage and self.decode_op_supports_mtp()
+        ):
             return self.decode(
                 q,
                 kv_cache,

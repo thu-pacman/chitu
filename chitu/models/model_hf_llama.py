@@ -720,6 +720,21 @@ class TransformerHFLlama(Transformer):
             ],
         )
 
+    @override
+    def prepare_freqs_cis_mtp(self) -> BatchedFreqsCis:
+        return BatchedFreqsCis(
+            self.rotary_emb.cos_cached[
+                self.cache_managers[
+                    "main"
+                ].mtp_seq_len_delta.delta_position_ids_tensor_device
+            ],
+            self.rotary_emb.sin_cached[
+                self.cache_managers[
+                    "main"
+                ].mtp_seq_len_delta.delta_position_ids_tensor_device
+            ],
+        )
+
 
 class RotaryEmbeddingHFLlama(nn.Module):
     def __init__(
