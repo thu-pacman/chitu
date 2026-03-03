@@ -46,6 +46,7 @@ from chitu.task import (
     DPTaskCollector,
     PPTaskCollector,
 )
+from chitu.task_type import PREFILL_TYPES, DECODE_TYPES, is_decode
 from chitu.utils import (
     gen_req_id,
     try_import_opt_dep,
@@ -209,6 +210,7 @@ def _warmup_via_taskpool(args):
         )
         warmup_seq_len = 1
         prefill_chunk_size = args.infer.max_seq_len * args.infer.max_reqs
+    infermode = "diffusionllm" if args.models.type == ModelType.LLADA else "autoregressive"
     if rank == 0:
         for i in range(num_warmup_reqs):
             req = MockFixedLengthedUserRequest(
@@ -218,7 +220,7 @@ def _warmup_via_taskpool(args):
                 temperature=0.7,
                 top_k=1,
             )
-            task = Task(f"{req.request_id}", req, stop_with_eos=False)
+            task = Task(f"{req.request_id}", req, stop_with_eos=False, infermode=infermode)
             TaskPool.add(task)
         logger.info(f"Added {num_warmup_reqs} warmup requests to TaskPool")
         for scheduler in Backend.schedulers:
@@ -264,12 +266,13 @@ def _warmup_via_taskpool(args):
         prefill_iter = 0
         while True:
             status = chitu_run()
+            logger.info(f"status: {status}")
             if status != SerializedPackedTasksPayloadType.NoneType:
                 prefill_iter += 1
             prefill_remaining = sum(
                 1
                 for task in TaskPool.pool.values()
-                if task.task_type == TaskType.Prefill
+                if task.task_type in PREFILL_TYPES
             )
             logger.debug(
                 f"Warmup prefill iteration {prefill_iter}: remaining={prefill_remaining}"
@@ -767,7 +770,7 @@ def chitu_run_main_rank():
         id_and_scheduler_list = list(enumerate(Backend.schedulers))
         random.shuffle(id_and_scheduler_list)
 
-        strict_allowed_task_type_list = [{TaskType.Prefill}, {TaskType.Decode}]
+        strict_allowed_task_type_list = [PREFILL_TYPES, DECODE_TYPES]
         for strict_allowed_task_type in strict_allowed_task_type_list:
             task_ids_list = [None] * len(id_and_scheduler_list)
             for i, scheduler in id_and_scheduler_list:
@@ -782,7 +785,7 @@ def chitu_run_main_rank():
                         task = TaskPool.pool.get(task_id)
                         if task is None:
                             continue
-                        if getattr(task, "task_type", None) != TaskType.Decode:
+                        if not is_decode(getattr(task, "task_type", None)):
                             continue
                         if getattr(task, "pd_sched_wait_end_logged", False):
                             continue
@@ -797,7 +800,7 @@ def chitu_run_main_rank():
                 break
         else:
             task_ids = []
-
+    logger.info(f"task_ids: {task_ids}")
     if task_ids or DPTaskCollector.has_available_tasks():
         # compute
         logger.debug(f"Processing {task_ids}")
@@ -806,7 +809,7 @@ def chitu_run_main_rank():
                 task = TaskPool.pool.get(task_id)
                 if task is None:
                     continue
-                if getattr(task, "task_type", None) != TaskType.Decode:
+                if not is_decode(getattr(task, "task_type", None)):
                     continue
                 if getattr(task, "pd_sched_wait_end_logged", False):
                     continue

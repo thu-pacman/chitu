@@ -24,7 +24,7 @@ MODEL_NAME="LLaDA2.0-mini"
 run_server(){
     SERVE_JOB_NAME="run_serve" # rename "run_serve" (with a unique name) to prevent conflicts
     SLURM_PARTITION=Long
-    NUM_GPUS=2
+    NUM_GPUS=1
     CPUS_PER_GPU=24
     MEM_PER_GPU=142144
 
@@ -48,14 +48,14 @@ run_server(){
         HYDRA_FULL_ERROR=1 \
         torchrun \
             --nnodes=\$NUM_NODES \
-            --nproc_per_node=2 \
+            --nproc_per_node=1 \
             -m chitu \
             serve.port=21002 \
             infer.pp_size=1 \
-            infer.tp_size=2 \
+            infer.tp_size=1 \
             infer.cache_type=paged \
-            models=Qwen3-32B \
-            models.ckpt_dir=/home/dataset/Qwen3-32B \
+            models=LLaDA2.0-mini \
+            models.ckpt_dir=/home/dataset/LLaDA2.0-mini \
             infer.use_cuda_graph=True \
             infer.max_reqs=256 \
             infer.max_seq_len=2048 \

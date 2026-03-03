@@ -34,6 +34,7 @@ from chitu.task import (
     serialize_tasks,
     deserialize_prefill_tasks,
 )
+from chitu.task_type import is_prefill, is_decode
 from chitu.metadata_serializer import MetadataSerializer
 from chitu.distributed.parallel_state import (
     get_tp_group,
@@ -362,9 +363,14 @@ class PipeDispatcher(TasksDispatcher):
             if payload_type in [
                 SerializedPackedTasksPayloadType.Prefill,
                 SerializedPackedTasksPayloadType.Decode,
+                SerializedPackedTasksPayloadType.PrefillDLLM,
+                SerializedPackedTasksPayloadType.DecodeDLLM,
             ]:
                 # 使用统一接口反序列化
-                is_prefill = payload_type == SerializedPackedTasksPayloadType.Prefill
+                is_prefill = payload_type in (
+                    SerializedPackedTasksPayloadType.Prefill,
+                    SerializedPackedTasksPayloadType.PrefillDLLM,
+                )
                 _, tasks, slot_idx = self.metadata_serializer.deserialize_metadata(
                     msgs[1], require_task_creation=is_prefill
                 )
@@ -392,6 +398,8 @@ class PipeDispatcher(TasksDispatcher):
             if payload_type in [
                 SerializedPackedTasksPayloadType.Prefill,
                 SerializedPackedTasksPayloadType.Decode,
+                SerializedPackedTasksPayloadType.PrefillDLLM,
+                SerializedPackedTasksPayloadType.DecodeDLLM,
             ]:
                 # 使用优化的配置进行序列化
                 slot_handle = get_slot_handle()
@@ -586,6 +594,8 @@ class TensorDispatcher(TasksDispatcher):
             is_normal_payload = payload_type in (
                 SerializedPackedTasksPayloadType.Prefill,
                 SerializedPackedTasksPayloadType.Decode,
+                SerializedPackedTasksPayloadType.PrefillDLLM,
+                SerializedPackedTasksPayloadType.DecodeDLLM,
             )
 
             if not is_normal_payload:
@@ -635,6 +645,8 @@ class TensorDispatcher(TasksDispatcher):
             if payload_type in [
                 SerializedPackedTasksPayloadType.Prefill,
                 SerializedPackedTasksPayloadType.Decode,
+                SerializedPackedTasksPayloadType.PrefillDLLM,
+                SerializedPackedTasksPayloadType.DecodeDLLM,
             ]:
                 payload_type, tasks, slot_idx = (
                     self.metadata_serializer.deserialize_metadata(
@@ -720,7 +732,7 @@ class ExpertDataDispatcher(TasksDispatcher):
                 task_ids_list = DPTaskCollector.get_task_ids_list()
                 # PD decode-only: requests can be enqueued concurrently while a decode step is in progress.
                 # Pull newly-enqueued tasks into TaskPool.pool before we decide which dp ranks need bootstrap.
-                if current_task_type == TaskType.Decode:
+                if is_decode(current_task_type):
                     TaskPool.add_all_queued()
                 for rank_in_group in range(1, self.group_size):
                     task_ids = task_ids_list[rank_in_group]
@@ -735,7 +747,7 @@ class ExpertDataDispatcher(TasksDispatcher):
                     # 让 MetadataSerializer 自动选择配置（支持去重优化）
                     # DP+PP Decode 场景需要传 last_tokens（PP 后续 stage 需要）
                     force_last_tokens = (
-                        current_task_type == TaskType.Decode
+                        is_decode(current_task_type)
                         and self.pp_size is not None
                         and self.pp_size > 1
                     )
@@ -754,14 +766,14 @@ class ExpertDataDispatcher(TasksDispatcher):
                         rank_tasks.payload_type.name.encode(),
                         tasks_msg,
                     ]
-                    if current_task_type == TaskType.Prefill:
+                    if is_prefill(current_task_type):
                         tasks = [
                             TaskPool.pool[tid].get_msgpackable_task()
                             for tid in task_ids
                         ]
                         tasks_msg = serialize_tasks(tasks)
                         msgs.append(tasks_msg)
-                    elif current_task_type == TaskType.Decode:
+                    elif is_decode(current_task_type):
                         sent = self._decode_bootstrap_sent[rank_in_group]
                         msgs.append(msgpack.packb(task_ids))
                         last_tokens_list = [
@@ -809,11 +821,17 @@ class ExpertDataDispatcher(TasksDispatcher):
             msgs = self.socket.recv_multipart()
             payload_type = SerializedPackedTasksPayloadType[msgs[0].decode()]
 
-            if payload_type == SerializedPackedTasksPayloadType.Prefill:
+            if payload_type in (
+                SerializedPackedTasksPayloadType.Prefill,
+                SerializedPackedTasksPayloadType.PrefillDLLM,
+            ):
                 _, tasks, _ = self.metadata_serializer.deserialize_metadata(
                     msgs[1], require_task_creation=True
                 )
-            elif payload_type == SerializedPackedTasksPayloadType.Decode:
+            elif payload_type in (
+                SerializedPackedTasksPayloadType.Decode,
+                SerializedPackedTasksPayloadType.DecodeDLLM,
+            ):
                 # Decode bootstrap frame may be present even when `task_ids` is empty.
                 # This allows worker ranks to prepare TransferInfo early without forcing a decode step.
                 if len(msgs) >= 6:
@@ -822,11 +840,16 @@ class ExpertDataDispatcher(TasksDispatcher):
                     )
                     boot_tasks = deserialize_prefill_tasks(msgs[5])
                     boot_ids = list(getattr(boot_tasks, "task_ids", []) or [])
+                    decode_task_type = (
+                        TaskType.DecodeDLLM
+                        if payload_type == SerializedPackedTasksPayloadType.DecodeDLLM
+                        else TaskType.Decode
+                    )
                     for tid in boot_ids:
                         if tid in TaskPool.pool:
-                            TaskPool.pool[tid].task_type = TaskType.Decode
+                            TaskPool.pool[tid].task_type = decode_task_type
                             logger.debug(
-                                f"DP rank {self.rank_in_group} updated task type for task {tid} to Decode"
+                                f"DP rank {self.rank_in_group} updated task type for task {tid} to {decode_task_type}"
                             )
                     # PD decode-only: prepare TransferInfo on worker ranks immediately upon bootstrap.
                     kv_hook = self.get_executor().get_kv_hook()
@@ -871,11 +894,19 @@ class ExpertDataDispatcher(TasksDispatcher):
                         f"frame_bytes={[len(m) for m in msgs]}"
                     )
 
-                if payload_type == SerializedPackedTasksPayloadType.Decode:
+                if payload_type in (
+                    SerializedPackedTasksPayloadType.Decode,
+                    SerializedPackedTasksPayloadType.DecodeDLLM,
+                ):
                     _, tasks, _ = self.metadata_serializer.deserialize_metadata(
                         msgs[1], require_task_creation=False
                     )
                     task_ids = msgpack.unpackb(msgs[2]) if len(msgs) > 2 else []
+                    decode_task_type = (
+                        TaskType.DecodeDLLM
+                        if payload_type == SerializedPackedTasksPayloadType.DecodeDLLM
+                        else TaskType.Decode
+                    )
                     if len(task_ids) > 0:
                         task_list = [TaskPool.pool[task_id] for task_id in task_ids]
                         last_tokens_list = (
@@ -895,9 +926,7 @@ class ExpertDataDispatcher(TasksDispatcher):
                                 )
                         tasks = PackedTasks([], tasks=task_list)
                     else:
-                        tasks = PackedTasks([], task_type=TaskType.Decode)
-                else:
-                    tasks = PackedTasks([], task_type=TaskType.Decode)
+                        tasks = PackedTasks([], task_type=decode_task_type)
             elif payload_type in (
                 SerializedPackedTasksPayloadType.EndTask,
                 SerializedPackedTasksPayloadType.Remove,
@@ -1241,7 +1270,7 @@ class Executor:
             TaskCollector.update_generated_tasks()
         for dispatcher in self.task_dispatchers:
             payload_type, tasks = dispatcher.dispatch_metadata(tasks)
-
+        logger.info(f"payload_type: {payload_type}")
         if payload_type == SerializedPackedTasksPayloadType.TerminateBackend:
             Backend.state = BackendState.Terminated
         if (
@@ -1275,7 +1304,7 @@ class Executor:
                 else tasks.num_tokens
             )
             self.moe_impl.prepare(tasks.task_type, tasks_num_tokens)
-
+        
         if tasks.task_type == TaskType.Prefill:
             out = self.prefill_step(tasks)
         elif tasks.task_type == TaskType.Decode:
@@ -1287,7 +1316,7 @@ class Executor:
         else:
             raise NotImplementedError
 
-        if tasks.task_type == TaskType.Decode:
+        if is_decode(tasks.task_type):
             self._lb_trigger()
             self._lb_sync()
         self._lb_step += 1
@@ -1299,7 +1328,7 @@ class Executor:
                 if self.rank > 0 or self.dp_size <= 1
                 else DPTaskCollector.get_total_packedtasks()
             )
-            if update_tasks.task_type == TaskType.Prefill:
+            if is_prefill(update_tasks.task_type):
                 for task in update_tasks.tasks:
                     task.consume_req_tokens()
             if self.rank == 0:
@@ -1363,7 +1392,7 @@ class Executor:
         return SerializedPackedTasksPayloadType.NoneType
 
     def _get_output_token_offsets(self, tasks: PackedTasksBase) -> torch.Tensor:
-        if tasks.task_type == TaskType.Prefill:
+        if is_prefill(tasks.task_type):
             output_token_offsets = []
             cnt = 0
             for i in range(tasks.num_tasks):
@@ -1642,9 +1671,11 @@ class Executor:
 
 
     def prefill_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
+        logger.info(f"prefill_dllm_step begin but empty")
         pass
 
     def decode_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
+        logger.info(f"decode_dllm_step begin but empty")
         pass
 
     def sample(self, logits: torch.Tensor, tasks: PackedTasks):
@@ -1673,7 +1704,7 @@ class Executor:
                 for it, task in enumerate(tasks.output_tasks):
                     if (
                         task.params.frequency_penalty > 0
-                        and task.task_type == TaskType.Decode
+                        and is_decode(task.task_type)
                         and len(task.response) > 0
                     ):
                         logits_index_list.append(it)

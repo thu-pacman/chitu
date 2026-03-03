@@ -1092,7 +1092,7 @@ class Backend:
             load_gguf_deepseek_v3_gguf(model, ds_gguf_loader, 10, args)
         elif args.models.type == ModelType.LLADA:
             model.load_weights(args.models.ckpt_dir, device="cuda")
-            logger.info(f"Checkpoint loaded in {time.time() - start_time:.2f} seconds")
+            logger.info(f"Checkpoint of llada loaded in {time.time() - start_time:.2f} seconds")
             return 
         else:
             quant_config = getattr(args.models, "quant_config", None)
@@ -1390,6 +1390,7 @@ class Backend:
         attn_backend_type = Backend._get_attention_backend_type(args)
 
         # Initialize cache manager
+        logger.info(f"args.models.type: {args.models.type}")
         if args.models.type == ModelType.HF_QWEN3_NEXT:
 
             def is_full_attention(layer_id):

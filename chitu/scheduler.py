@@ -17,6 +17,7 @@ from chitu.task import (
     SerializedPackedTasksPayloadType,
     PPTaskCollector,
 )
+from chitu.task_type import PREFILL_TYPES, DECODE_TYPES, ALL_ACTIVE_TYPES, is_prefill, is_decode
 from chitu.global_vars import get_global_args, SlotHandle
 from chitu.utils import ceil_div
 from chitu.backend import Backend
@@ -165,7 +166,7 @@ class Scheduler:
                 self.scorers.append(lambda task: task.priority)
             elif st == "prefill_first":
                 self.scorers.append(
-                    lambda task: 1 if task.task_type == TaskType.Prefill else 0
+                    lambda task: 1 if is_prefill(task.task_type) else 0
                 )
             elif st == "fcfs" or st == "fifo":
                 self.scorers.append(lambda task: -task.arrv_ts)
@@ -199,14 +200,14 @@ class Scheduler:
     def scorer(self, task):
         if self.is_warmup_stage:
             fn = lambda task: (
-                1 if task.task_type == TaskType.Prefill else 0
+                1 if is_prefill(task.task_type) else 0
             )  # prefill first
             return (fn(task),)
         return tuple(fn(task) for fn in self.scorers)
 
     def schedule(
         self,
-        strict_allowed_task_type: set[TaskType] = {TaskType.Prefill, TaskType.Decode},
+        strict_allowed_task_type: set[TaskType] = ALL_ACTIVE_TYPES,
     ) -> list[str]:
         if TaskPool.is_empty():
             logger.debug("TaskPool is empty, returning empty task list.")
@@ -215,7 +216,7 @@ class Scheduler:
         if not self.free_sgroups:
             logger.debug("No available scheduler group, returning empty task list.")
             return []
-
+        logger.info(f"begin to schedule...")
         self.scheduling_ts = time.perf_counter_ns()
 
         # collect ready task ids
@@ -243,8 +244,6 @@ class Scheduler:
             self.strict_allowed_task_type
         )
         if len(strict_allowed_task_type) == 0:
-            # chitu_main 里面先用 strict_allowed_task_type=Prefill调一次 schedule()，如果拿不到任务，再用 Decode 再调一次
-            # 在PD分离只有decode_only，就会走到这里
             return []
         task_ids = [
             tid
@@ -252,34 +251,33 @@ class Scheduler:
             if TaskPool.pool[tid].task_type in strict_allowed_task_type
         ]
         if len(task_ids) == 0:
-            # No avaliable tasks, returning empty task list.
-            # This is in a busy loop waiting for tasks, so don't print logs here.
             return []
-
+        # logger.info(f"task_ids: {task_ids}")
         task_ids.sort(
             key=lambda x: self.scorer(TaskPool.pool[x]),
-            reverse=True,  # Largest first
-        )  # list.sort is a stable sort
-
+            reverse=True,
+        )
+        # logger.info(f"task_ids sorted: {task_ids}")
         filter_task_type = TaskPool.pool[
             task_ids[0]
-        ].task_type  # make the highest priority task's type as the filter_task_type
+        ].task_type
+        # logger.info(f"filter_task_type: {filter_task_type}")
 
-        # Unexpected tasks
-        if filter_task_type not in {TaskType.Prefill, TaskType.Decode}:
+        if filter_task_type not in ALL_ACTIVE_TYPES:
             raise NotImplementedError(f"Unexpected task type: {filter_task_type}")
 
         # scheduling prefill tasks
-        if filter_task_type == TaskType.Prefill:
+        if is_prefill(filter_task_type):
             prefill_task_ids = self._schedule_prefill_tasks(task_ids)
+            logger.info(f"fount prefill tasks, prefill_task_ids: {prefill_task_ids}")
             if prefill_task_ids:
                 task_ids = prefill_task_ids[: self.prefill_num_tasks]
             else:
-                # No available prefill tasks, we can schedule decode at this condition
-                filter_task_type = TaskType.Decode
+                # No available prefill tasks, fall back to decode
+                filter_task_type = TaskType.DecodeDLLM if filter_task_type == TaskType.PrefillDLLM else TaskType.Decode
 
         # scheduling decode tasks
-        if filter_task_type == TaskType.Decode:
+        if is_decode(filter_task_type):
             task_ids = self._schedule_decode_tasks(task_ids)[: self.decode_num_tasks]
 
         # Allocate sgroup for for task_ids
@@ -299,7 +297,7 @@ class Scheduler:
         logger.debug(f"Selected task_ids:")
         for task_id in task_ids:
             task = TaskPool.pool[task_id]
-            if task.task_type == TaskType.Prefill:
+            if is_prefill(task.task_type):
                 if task.prefill_chunk_size is None:
                     logger.debug(
                         f"- {task_id}: Prefill token {task.consumed_req_tokens} to end"
@@ -317,7 +315,7 @@ class Scheduler:
         now = time.perf_counter()
         for tid in task_ids:
             task = TaskPool.pool.get(tid)
-            if task is None or task.task_type != TaskType.Decode:
+            if task is None or not is_decode(task.task_type):
                 continue
             ready_ts = getattr(task, "pd_ready_ts", None)
             if ready_ts is None:
@@ -362,7 +360,7 @@ class Scheduler:
         """
         prefill_task_ids = list(
             filter(
-                lambda task_id: TaskPool.pool[task_id].task_type == TaskType.Prefill,
+                lambda task_id: is_prefill(TaskPool.pool[task_id].task_type),
                 task_ids,
             )
         )
@@ -463,7 +461,7 @@ class Scheduler:
         """
         decode_task_ids = list(
             filter(
-                lambda task_id: TaskPool.pool[task_id].task_type == TaskType.Decode,
+                lambda task_id: is_decode(TaskPool.pool[task_id].task_type),
                 task_ids,
             )
         )
@@ -551,7 +549,7 @@ class Scheduler:
         PrometheusMetricsCollector.inc_task_eviction()
 
         # Restore the task's status to before prefill
-        task.task_type = TaskType.Prefill
+        task.task_type = TaskType.PrefillDLLM if task.task_type == TaskType.DecodeDLLM else TaskType.Prefill
         task.prefill_chunk_size = None
         task.consumed_req_tokens = 0
         task.sched_group_id = None
@@ -565,20 +563,20 @@ class Scheduler:
         """Return TaskType when strict-only is requested, otherwise None.
 
         Recognized tokens:
-        - "prefill_only" => TaskType.Prefill
-        - "decode_only"  => TaskType.Decode
+        - "prefill_only" => PREFILL_TYPES
+        - "decode_only"  => DECODE_TYPES
         If both appear, no strict gating will be applied.
         """
         if not scheduler_type:
-            return {TaskType.Prefill, TaskType.Decode}
+            return ALL_ACTIVE_TYPES
         parts = [p.strip().lower() for p in scheduler_type.split(",") if p.strip()]
         has_prefill_only = any(p == "prefill_only" for p in parts)
         has_decode_only = any(p == "decode_only" for p in parts)
         if has_prefill_only and not has_decode_only:
-            return {TaskType.Prefill}
+            return PREFILL_TYPES
         if has_decode_only and not has_prefill_only:
-            return {TaskType.Decode}
-        return {TaskType.Prefill, TaskType.Decode}
+            return DECODE_TYPES
+        return ALL_ACTIVE_TYPES
 
     def reorder_tasks_for_batching(self, task_ids):
         pass
@@ -606,7 +604,7 @@ class Scheduler:
             task = TaskPool.pool[task_id]
             if (
                 not task.finished_decode
-                and task.task_type == TaskType.Decode
+                and is_decode(task.task_type)
                 and (
                     (not self.has_schedule_overlap and task.need_remove())
                     or (self.has_schedule_overlap and not task.has_model_run())
@@ -679,7 +677,7 @@ class SkewScheduler(Scheduler):
     @override
     def schedule(
         self,
-        strict_allowed_task_type: set[TaskType] = {TaskType.Prefill, TaskType.Decode},
+        strict_allowed_task_type: set[TaskType] = ALL_ACTIVE_TYPES,
     ) -> list[str]:
 
         # no available slot group or empty task pool
@@ -727,12 +725,12 @@ class SkewScheduler(Scheduler):
         # When slot_group's lenght smaller than it's capacity, fill new tasks into it.
         if len(sgroup) < sgroup_capacity:
             # fill sgroup: Decode first then Prefill (if target is Decode), else only target type
-            if target_task_type == TaskType.Decode:
+            if is_decode(target_task_type):
                 decode_fillable = [
                     tid
                     for tid in task_ids
                     if TaskPool.pool[tid].sched_group_id is None
-                    and TaskPool.pool[tid].task_type == TaskType.Decode
+                    and is_decode(TaskPool.pool[tid].task_type)
                 ]
                 # capped by decode limit/remaining capacity
                 num_decode = min(self.decode_num_tasks, sgroup_capacity - len(sgroup))
@@ -747,7 +745,7 @@ class SkewScheduler(Scheduler):
                         tid
                         for tid in task_ids
                         if TaskPool.pool[tid].sched_group_id is None
-                        and TaskPool.pool[tid].task_type == TaskType.Prefill
+                        and is_prefill(TaskPool.pool[tid].task_type)
                     ]
                     num_prefill = min(self.prefill_num_tasks, remaining_cap)
                     sgroup.extend(prefill_fillable[:num_prefill])
@@ -763,7 +761,7 @@ class SkewScheduler(Scheduler):
                 num_to_fill = min(
                     (
                         self.prefill_num_tasks
-                        if target_task_type == TaskType.Prefill
+                        if is_prefill(target_task_type)
                         else self.decode_num_tasks
                     ),
                     sgroup_capacity - len(sgroup),
@@ -775,7 +773,7 @@ class SkewScheduler(Scheduler):
 
         curr_split = self.find_prefill_task_start_pos_sgroup(sgroup)
 
-        if target_task_type == TaskType.Decode:
+        if is_decode(target_task_type):
             ret_task_ids = sgroup[:curr_split]
         else:
             ret_task_ids = sgroup[curr_split:]
@@ -807,7 +805,7 @@ class SkewScheduler(Scheduler):
         while left < right:
             mid = (left + right) // 2
             task = TaskPool.pool[sgroup[mid]]
-            if task.task_type == TaskType.Prefill:
+            if is_prefill(task.task_type):
                 right = mid
             else:
                 left = mid + 1

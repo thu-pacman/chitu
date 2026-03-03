@@ -22,7 +22,7 @@ from typing_extensions import override
 import torch
 import numpy as np
 
-from chitu.task_type import TaskType, TaskDecodeType
+from chitu.task_type import TaskType, TaskDecodeType, is_prefill, is_decode
 from chitu.async_response import AsyncDataStream
 from chitu.backend import Backend
 from chitu.device_list import DeviceList, StaticDeviceListManager
@@ -586,7 +586,7 @@ class Task(ConstraintDecodeTask):
             if (
                 pd_cfg is not None
                 and bool(getattr(pd_cfg, "enabled", False))
-                and self.task_type == TaskType.Decode
+                and is_decode(self.task_type)
                 and getattr(self, "req", None) is not None
                 and not getattr(self, "pd_exec_end_logged", False)
             ):
@@ -651,7 +651,7 @@ class Task(ConstraintDecodeTask):
             self.next_token = int(self.next_token.cpu().item())
         if self.next_token == -1 and self.record_next_token is None:
             return
-        has_update = self.task_type == TaskType.Decode or self.evicting
+        has_update = is_decode(self.task_type) or self.evicting
         if self.record_next_token is not None:
             if not isinstance(self.record_next_token, int):
                 self.record_next_token = int(self.record_next_token.cpu().item())
@@ -685,14 +685,14 @@ class Task(ConstraintDecodeTask):
     def prefix_tokens_len(self):
         # if not sync, compute the prefix tokens length after sync
         base_len = getattr(self, "_prefix_tokens_base_len", 0)
-        if self.task_type == TaskType.Decode and base_len > 0:
+        if is_decode(self.task_type) and base_len > 0:
             total = base_len + len(self.prefix_tokens)
             if not self.sync_new_token:
                 total += Backend.executor.mtp_size
             return total
         return (
             len(self.prefix_tokens)
-            if self.sync_new_token or self.task_type == TaskType.Prefill
+            if self.sync_new_token or is_prefill(self.task_type)
             else len(self.prefix_tokens) + Backend.executor.mtp_size
         )
 
@@ -776,7 +776,7 @@ class Task(ConstraintDecodeTask):
         ):
             # Complete prefill and transition to decode
             self.consumed_req_tokens = self.prefix_tokens_len
-            self.task_type = TaskType.Decode
+            self.task_type = TaskType.DecodeDLLM if self.task_type == TaskType.PrefillDLLM else TaskType.Decode
 
             if self.req is not None:
                 self.req.prefill_end_time = time.monotonic()
@@ -796,20 +796,20 @@ class Task(ConstraintDecodeTask):
         if not self.running():
             return False
         return (
-            self.task_type == TaskType.Prefill
+            is_prefill(self.task_type)
             and (
                 self.prefill_chunk_size is None
                 or self.consumed_req_tokens + self.prefill_chunk_size
                 >= self.prefix_tokens_len
             )
-        ) or self.task_type == TaskType.Decode
+        ) or is_decode(self.task_type)
 
     def has_next_token(self):
         return self.next_token >= 0
 
     def get_msgpackable_task(self) -> MsgPackableTask:
         is_first_prefill = (
-            self.task_type == TaskType.Prefill and self.consumed_req_tokens == 0
+            is_prefill(self.task_type) and self.consumed_req_tokens == 0
         )
         return MsgPackableTask(
             task_id=self.task_id,
@@ -827,9 +827,9 @@ class Task(ConstraintDecodeTask):
 
     @property
     def kv_cache_len_used_in_completed_steps(self):
-        if self.task_type == TaskType.Prefill:
+        if is_prefill(self.task_type):
             return self.consumed_req_tokens
-        elif self.task_type == TaskType.Decode:
+        elif is_decode(self.task_type):
             return len(self.prefix_tokens) - (
                 self.num_new_tokens_single_step if self.sync_new_token else 0
             )
@@ -838,9 +838,9 @@ class Task(ConstraintDecodeTask):
 
     @property
     def kv_cache_len_used_in_completed_steps_and_next_step(self):
-        if self.task_type == TaskType.Prefill:
+        if is_prefill(self.task_type):
             return self.consumed_req_tokens + self.next_req_tokens_len
-        elif self.task_type == TaskType.Decode:
+        elif is_decode(self.task_type):
             return min(self.prefix_tokens_len, get_global_args().infer.max_seq_len)
         else:
             assert False
@@ -859,7 +859,7 @@ def req_encode(task_type: TaskType, task_id: str):
     else:
         hex_id = task_id
 
-    if task_type == TaskType.Prefill:
+    if is_prefill(task_type):
         return int(hex_id, 16)
     else:
         return -int(hex_id, 16)
@@ -969,6 +969,8 @@ class SerializedPackedTasksPayloadType(Enum):
     TerminateBackend = 3
     EndTask = 4
     Remove = 5
+    PrefillDLLM = 6
+    DecodeDLLM = 7
     NoneType = -1
 
 
@@ -980,6 +982,8 @@ def is_normal_payload(payload_type: SerializedPackedTasksPayloadType):
     return payload_type in [
         SerializedPackedTasksPayloadType.Prefill,
         SerializedPackedTasksPayloadType.Decode,
+        SerializedPackedTasksPayloadType.PrefillDLLM,
+        SerializedPackedTasksPayloadType.DecodeDLLM,
     ]
 
 
@@ -1018,7 +1022,7 @@ class PackedTasksBase:
         PackedTasksBase.max_num_tasks = max_num_tasks
 
     def update_by_decode_status(self):
-        if self.task_type == TaskType.Decode:
+        if is_decode(self.task_type):
             num_tasks = 0
             task_ids = []
             req_ids = []
@@ -1090,7 +1094,7 @@ class PackedTasks(PackedTasksBase):
         # TODO: reformat PackedTasks for better support of DP+PP
         # assert all(task.task_type == self.task_type for task in self.tasks)
 
-        if self.task_type == TaskType.Prefill:
+        if is_prefill(self.task_type):
             self.tokens = [task.next_req_tokens() for task in self.tasks]
 
         self.pixel_values = []
@@ -1107,7 +1111,7 @@ class PackedTasks(PackedTasksBase):
         # also need to be handle in deserialize
         self.num_tokens = (
             sum(len(tokens) for tokens in self.tokens)
-            if self.task_type == TaskType.Prefill
+            if is_prefill(self.task_type)
             else self.num_tasks
         )
 
@@ -1213,7 +1217,7 @@ class PackedTasks(PackedTasksBase):
             [task.params.frequency_penalty for task in self.output_tasks],
             dtype=torch.float32,
         ).to(device=self.rank)
-        if self.task_type == TaskType.Decode:
+        if is_decode(self.task_type):
             self.num_tokens = self.num_tasks
 
     def get_result_len(self) -> int:

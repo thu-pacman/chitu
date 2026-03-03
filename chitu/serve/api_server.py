@@ -28,6 +28,7 @@ from chitu.chitu_main import chitu_init, init_logger
 from chitu.dp_request_router import get_request_router
 from chitu.dp_token_router import get_token_router
 from chitu.global_vars import get_global_args, set_global_args
+from chitu.models.registry import ModelType
 from chitu.task import RouterRequest, Task, TaskLoad, TaskPool, UserRequest
 from chitu.utils import gen_req_id
 from chitu.serve.event_loop import start_server_in_new_event_loop
@@ -199,12 +200,15 @@ async def create_chat_completion(
             enable_reasoning=enable_thinking,
         )
         response = AsyncResponse(user_req)
+        infermode = "diffusionllm" if args.models.type == ModelType.LLADA else "autoregressive"
         task = Task(
             user_req.request_id,
             user_req,
             stop_with_eos=req.stop_with_eos,
             priority=task_priority,
+            infermode=infermode,
         )
+        logger.info(f"enqueue task: {task.task_id}, task content: {user_req.messages}, task type: {task.task_type}")
         TaskPool.enqueue(task)
         if req.stream:
             return StreamingResponse(
