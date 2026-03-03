@@ -144,6 +144,7 @@ class Indexer(torch.nn.Module):
             self.head_dim,
             dtype=parse_dtype(getattr(args, "index_norm_dtype", "float32")),
         )
+        # NOTE: the origin impl of self.weights_proj in deepseek-v3.2 uses float32
         self.weights_proj = LocalLinear(
             self.dim,
             self.n_heads,
@@ -182,6 +183,9 @@ class Indexer(torch.nn.Module):
 
         q_fp8, q_scale = blockfp8_act_quant(q, block_size=self.block_size)
         k_fp8, k_scale = blockfp8_act_quant(k, block_size=self.block_size)
+
+        weights = self.weights_proj(x) * self.n_heads**-0.5
+        q_scale = weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
         delta_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
         delta_pos_ids = seq_len_delta.delta_position_ids_tensor_device
