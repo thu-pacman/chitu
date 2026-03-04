@@ -220,11 +220,14 @@ def _warmup_via_taskpool(args):
     init_cache_static()
     num_warmup_reqs = args.infer.max_reqs
     prefill_chunk_size = args.infer.prefill_chunk_size
+    _mtp_size = get_global_args().infer.mtp_size
+    _n_decode_steps = 2 if get_global_args().infer.schedule_overlap else 1
+    _warmup_max_new_tokens = (1 + _n_decode_steps) * _mtp_size
     if prefill_chunk_size is not None:
         warmup_seq_len = max(
             min(
                 prefill_chunk_size // num_warmup_reqs,
-                args.infer.max_seq_len - get_global_args().infer.mtp_size,
+                args.infer.max_seq_len - _warmup_max_new_tokens,
             ),
             1,
         )
@@ -239,7 +242,7 @@ def _warmup_via_taskpool(args):
             req = MockFixedLengthedUserRequest(
                 warmup_seq_len,
                 f"{gen_req_id()}",
-                max_new_tokens=1 + get_global_args().infer.mtp_size,
+                max_new_tokens=_warmup_max_new_tokens,
                 temperature=0.7,
                 top_k=1,
             )
@@ -278,7 +281,7 @@ def _warmup_via_taskpool(args):
         num_required_prefill_schedules = ceil_div(max_tokens_per_rank, per_rank_budget)
     else:
         num_required_prefill_schedules = ceil_div(total_tokens, prefill_chunk_size)
-    num_required_decode_schedules = 2 if get_global_args().infer.schedule_overlap else 1
+    num_required_decode_schedules = _n_decode_steps * _mtp_size
 
     logger.info(
         f"Warmup: total_tokens={total_tokens}, chunk_size={prefill_chunk_size}, "
@@ -295,9 +298,6 @@ def _warmup_via_taskpool(args):
                 1
                 for task in TaskPool.pool.values()
                 if task.task_type == TaskType.Prefill
-            )
-            logger.debug(
-                f"Warmup prefill iteration {prefill_iter}: remaining={prefill_remaining}"
             )
             if prefill_remaining == 0:
                 break

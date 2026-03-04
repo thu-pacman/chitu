@@ -300,6 +300,8 @@ class PrometheusMetricsCollector:
         self.total_generated_tokens: Optional[Counter] = None
         self.total_prompt_tokens: Optional[Counter] = None
         self.total_task_evictions: Optional[Counter] = None
+        self.mtp_proposed_tokens: Optional[Counter] = None
+        self.mtp_accepted_tokens: Optional[Counter] = None
         self.kv_cache_usage: Optional[Gauge] = None
         self.used_blocks: Optional[Gauge] = None
         self.total_blocks: Optional[Gauge] = None
@@ -324,6 +326,16 @@ class PrometheusMetricsCollector:
             self.total_task_evictions = Counter(
                 "chitu_total_task_evictions",
                 "Total number of tasks evicted due to insufficient KV cache",
+                ["rank", "dp_id"],
+            )
+            self.mtp_proposed_tokens = Counter(
+                "chitu_mtp_proposed_tokens",
+                "Total MTP proposed tokens (mtp_size-1 per task per decode step)",
+                ["rank", "dp_id"],
+            )
+            self.mtp_accepted_tokens = Counter(
+                "chitu_mtp_accepted_tokens",
+                "Total MTP accepted tokens after verification",
                 ["rank", "dp_id"],
             )
             self.kv_cache_usage = Gauge(
@@ -359,6 +371,8 @@ class PrometheusMetricsCollector:
             self.total_generated_tokens.labels(rank=rank, dp_id=dp_id).inc(0)
             self.total_prompt_tokens.labels(rank=rank, dp_id=dp_id).inc(0)
             self.total_task_evictions.labels(rank=rank, dp_id=dp_id).inc(0)
+            self.mtp_proposed_tokens.labels(rank=rank, dp_id=dp_id).inc(0)
+            self.mtp_accepted_tokens.labels(rank=rank, dp_id=dp_id).inc(0)
             self.kv_cache_usage.labels(rank=rank, dp_id=dp_id).set(0)
             self.used_blocks.labels(rank=rank, dp_id=dp_id).set(0)
             self.total_blocks.labels(rank=rank, dp_id=dp_id).set(0)
@@ -395,6 +409,24 @@ class PrometheusMetricsCollector:
             ).inc(count)
         except Exception as e:
             logger.error(f"inc_generated_tokens failed: {e}")
+
+    @classmethod
+    def inc_mtp_tokens(cls, proposed: int, accepted: int):
+        if proposed <= 0:
+            return
+
+        collector = cls.get_instance()
+        if not collector:
+            return
+        try:
+            collector.mtp_proposed_tokens.labels(
+                rank=collector.rank, dp_id=collector.dp_id
+            ).inc(proposed)
+            collector.mtp_accepted_tokens.labels(
+                rank=collector.rank, dp_id=collector.dp_id
+            ).inc(accepted)
+        except Exception as e:
+            logger.error(f"inc_mtp_tokens failed: {e}")
 
     @classmethod
     def inc_prompt_tokens(cls, count: int = 1):

@@ -293,7 +293,7 @@ def main(args: ServeConfig):
             history_result = load_result(history_path)
 
     now_result = None
-    if args.infer.pp_size > 1 or args.infer.tp_size > 1:
+    if args.infer.pp_size > 1 or args.infer.tp_size > 1 or args.infer.dp_size > 1:
         now_result = run_pipe_or_tensor_parallelism(args, timers, history_result)
     else:
         now_result = run_normal(args, timers, history_result)

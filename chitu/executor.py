@@ -1227,6 +1227,12 @@ class Executor:
             # In non-DP mode: only rank 0 records metrics
             if self._should_record_metrics(tasks.num_tasks, is_prefill=False):
                 PrometheusMetricsCollector.inc_generated_tokens(tasks.num_tasks)
+                if self.mtp_size > 1 and Backend.model.mtp_token_list:
+                    mtp_proposed = (self.mtp_size - 1) * tasks.num_tasks
+                    mtp_accepted = sum(len(t) for t in Backend.model.mtp_token_list)
+                    PrometheusMetricsCollector.inc_mtp_tokens(
+                        mtp_proposed, mtp_accepted
+                    )
 
             # payload send
             for dispatcher in self.task_dispatchers:
@@ -1347,6 +1353,9 @@ class Executor:
             collect_tasks = PackedTasks([], task_type=TaskType.Special)
         if self.rank == 0 or self.dp_dispatcher:
             pd_first_tokens_from_workers: dict[str, int] = {}
+            local_output_tasks = (
+                collect_tasks.output_tasks if collect_tasks.num_tasks > 0 else []
+            )
             if self.rank == 0 and self.dp_dispatcher:
                 all_tasks = DPTaskCollector.get_last_packedtasks()
                 if all_tasks is not None:
@@ -1364,7 +1373,7 @@ class Executor:
                 else:
                     result_list = []
                 mtp_token_list = (
-                    [task.mtp_token_list for task in collect_tasks.output_tasks]
+                    [task.mtp_token_list for task in local_output_tasks]
                     if self.mtp_size > 1
                     else None
                 )
