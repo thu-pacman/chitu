@@ -37,6 +37,7 @@ TOKENIZER_PATH_OVR=""
 BIND_CODE_OVR=""
 MODEL_SPEC_OVR=""
 BENCH_BATCH_SIZE_OVR=""
+BENCH_BATCH_SIZES_OVR=""
 BENCH_INPUT_LEN_OVR=""
 BENCH_OUTPUT_LEN_OVR=""
 BENCH_WARMUP_OVR=""
@@ -62,7 +63,8 @@ Cluster / SIF options (full flow mode):
   --bind-code 0|1       Bind local code into container (default: 1)
 
 Benchmark options:
-  --batch-size N        Override benchmark batch size
+  --batch-size N        Override benchmark batch size (single)
+  --batch-sizes 1,2,4   Comma-separated batch sizes (overrides --batch-size)
   --input-len N         Override benchmark input length
   --output-len N        Override benchmark output length
   --warmup N            Override benchmark warmup iterations
@@ -193,6 +195,7 @@ load_model_config() {
   PD_PARTITION="${PD_PARTITION:-long}"
   PD_BENCH_WARMUP="${PD_BENCH_WARMUP:-1}"
   PD_BENCH_ITERATIONS="${PD_BENCH_ITERATIONS:-1}"
+  PD_BENCH_BATCH_SIZES="${PD_BENCH_BATCH_SIZES:-}"
 }
 
 ################################################################################
@@ -235,14 +238,21 @@ run_benchmark_only() {
   if [ -d "${output_dir}" ]; then rm -rf "${output_dir}"; fi
   mkdir -p "${output_dir}"
 
+  local batch_sizes
+  if [ -n "${PD_BENCH_BATCH_SIZES}" ]; then
+    IFS=',' read -ra batch_sizes <<< "${PD_BENCH_BATCH_SIZES}"
+  else
+    batch_sizes=("${PD_BENCH_BATCH_SIZE}")
+  fi
+
   echo "=== PD Disagg Benchmark (local mode) ==="
-  echo "Model:      ${PD_MODEL_CONFIG}"
-  echo "Router URL: ${router_url}"
-  echo "Tokenizer:  ${PD_TOKENIZER_PATH}"
-  echo "Batch size: ${PD_BENCH_BATCH_SIZE}"
-  echo "Input len:  ${PD_BENCH_INPUT_LEN}"
-  echo "Output len: ${PD_BENCH_OUTPUT_LEN}"
-  echo "Output dir: ${output_dir}"
+  echo "Model:       ${PD_MODEL_CONFIG}"
+  echo "Router URL:  ${router_url}"
+  echo "Tokenizer:   ${PD_TOKENIZER_PATH}"
+  echo "Batch sizes: ${batch_sizes[*]}"
+  echo "Input len:   ${PD_BENCH_INPUT_LEN}"
+  echo "Output len:  ${PD_BENCH_OUTPUT_LEN}"
+  echo "Output dir:  ${output_dir}"
   echo ""
 
   local bench_script="${ROOT_DIR}/benchmarks/benchmark_serving.py"
@@ -251,18 +261,31 @@ run_benchmark_only() {
     exit 1
   fi
 
-  python3 "${bench_script}" \
-    --batch-size "${PD_BENCH_BATCH_SIZE}" \
-    --model "${PD_MODEL_CONFIG}" \
-    --iterations "${PD_BENCH_ITERATIONS}" \
-    --input-len "${PD_BENCH_INPUT_LEN}" \
-    --output-len "${PD_BENCH_OUTPUT_LEN}" \
-    --warmup "${PD_BENCH_WARMUP}" \
-    --dataset sharegpt \
-    --dataset-path "${PD_DATASET_PATH}" \
-    --tokenizer-path "${PD_TOKENIZER_PATH}" \
-    --output-dir "${output_dir}/" \
-    --base-url "${router_url}"
+  for bs in "${batch_sizes[@]}"; do
+    echo "Starting test with batch size = ${bs}..."
+    python3 "${bench_script}" \
+      --batch-size "${bs}" \
+      --model "${PD_MODEL_CONFIG}" \
+      --iterations "${PD_BENCH_ITERATIONS}" \
+      --input-len "${PD_BENCH_INPUT_LEN}" \
+      --output-len "${PD_BENCH_OUTPUT_LEN}" \
+      --warmup "${PD_BENCH_WARMUP}" \
+      --dataset sharegpt \
+      --dataset-path "${PD_DATASET_PATH}" \
+      --tokenizer-path "${PD_TOKENIZER_PATH}" \
+      --output-dir "${output_dir}/" \
+      --append-result \
+      --base-url "${router_url}"
+
+    local pic_dir="${output_dir}/pics"
+    mkdir -p "${pic_dir}"
+    echo "Generating visualization: ${pic_dir}"
+    python3 "${ROOT_DIR}/benchmarks/visualize_response.py" \
+      --benchmark-results "${output_dir}/benchmark_results.jsonl" \
+      --save-path "${pic_dir}" || echo "WARN: visualization failed for batch size ${bs}"
+
+    sleep 1
+  done
 
   local json_path="${output_dir}/benchmark_results.jsonl"
   if [ ! -f "${json_path}" ]; then
@@ -290,6 +313,7 @@ run_full_flow() {
   export PD_NODES PD_GPUS_PER_NODE PD_ROUTER_PORT PD_PARTITION PD_BIND_CODE
   export PD_PREFILL_SPECS PD_DECODE_SPECS PD_COMMON_OVERRIDES
   export PD_BENCH_BATCH_SIZE PD_BENCH_INPUT_LEN PD_BENCH_OUTPUT_LEN
+  [ -n "${PD_BENCH_BATCH_SIZES}" ] && export PD_BENCH_BATCH_SIZES
   export PD_BENCH_WARMUP PD_BENCH_ITERATIONS PD_DATASET_PATH
   [ -n "${OUTPUT_DIR_OVR}" ] && export PD_OUTPUT_DIR="${OUTPUT_DIR_OVR}"
 
@@ -321,6 +345,7 @@ while [ $# -gt 0 ]; do
     --bind-code)        BIND_CODE_OVR="$2"; shift 2;;
     --model-spec)       MODEL_SPEC_OVR="$2"; shift 2;;
     --batch-size)       BENCH_BATCH_SIZE_OVR="$2"; shift 2;;
+    --batch-sizes)      BENCH_BATCH_SIZES_OVR="$2"; shift 2;;
     --input-len)        BENCH_INPUT_LEN_OVR="$2"; shift 2;;
     --output-len)       BENCH_OUTPUT_LEN_OVR="$2"; shift 2;;
     --warmup)           BENCH_WARMUP_OVR="$2"; shift 2;;
@@ -354,6 +379,7 @@ load_model_config "${MODEL_NAME}"
 [ -n "${BIND_CODE_OVR}" ]         && PD_BIND_CODE="${BIND_CODE_OVR}"
 [ -n "${MODEL_SPEC_OVR}" ]        && PD_MODEL_SPEC="${MODEL_SPEC_OVR}"
 [ -n "${BENCH_BATCH_SIZE_OVR}" ]  && PD_BENCH_BATCH_SIZE="${BENCH_BATCH_SIZE_OVR}"
+[ -n "${BENCH_BATCH_SIZES_OVR}" ] && PD_BENCH_BATCH_SIZES="${BENCH_BATCH_SIZES_OVR}"
 [ -n "${BENCH_INPUT_LEN_OVR}" ]   && PD_BENCH_INPUT_LEN="${BENCH_INPUT_LEN_OVR}"
 [ -n "${BENCH_OUTPUT_LEN_OVR}" ]  && PD_BENCH_OUTPUT_LEN="${BENCH_OUTPUT_LEN_OVR}"
 [ -n "${BENCH_WARMUP_OVR}" ]      && PD_BENCH_WARMUP="${BENCH_WARMUP_OVR}"
@@ -377,7 +403,11 @@ echo "Tokenizer:      ${PD_TOKENIZER_PATH}"
 echo "Topology:       ${PD_NODES} nodes × ${PD_GPUS_PER_NODE} GPUs"
 echo "Prefill(s):     ${prefill_count} instance(s)"
 echo "Decode(s):      ${decode_count} instance(s)"
-echo "Bench params:   batch=${PD_BENCH_BATCH_SIZE} in=${PD_BENCH_INPUT_LEN} out=${PD_BENCH_OUTPUT_LEN}"
+if [ -n "${PD_BENCH_BATCH_SIZES}" ]; then
+  echo "Bench params:   batches=${PD_BENCH_BATCH_SIZES} in=${PD_BENCH_INPUT_LEN} out=${PD_BENCH_OUTPUT_LEN}"
+else
+  echo "Bench params:   batch=${PD_BENCH_BATCH_SIZE} in=${PD_BENCH_INPUT_LEN} out=${PD_BENCH_OUTPUT_LEN}"
+fi
 if [ -n "${ROUTER_URL}" ]; then
   echo "Mode:           BENCHMARK-ONLY (→ ${ROUTER_URL})"
 else

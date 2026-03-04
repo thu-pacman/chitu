@@ -321,52 +321,133 @@ if {[file exists $bench_output_dir]} {
 }
 file mkdir $bench_output_dir
 
-set bench_inner_cmd "PY=python; if test -x /opt/conda/bin/python; then PY=/opt/conda/bin/python; fi; \
-    export PYTHONNOUSERSITE=1; \
-    export PYTHONPATH=; \
-    echo \"PYTHON_BIN=\$PY\"; \
-    which \$PY || true; \
-    \$PY -c \"import sys; print('python:', sys.executable); import transformers; print('transformers:', transformers.__version__)\"; \
-    cd /workspace/chitu/benchmarks && \$PY benchmark_serving.py \
-    --batch-size $bench_batch_size \
-    --model $model_config \
-    --iterations $bench_iterations \
-    --input-len $bench_input_len \
-    --output-len $bench_output_len \
-    --warmup $bench_warmup \
-    --dataset sharegpt \
-    --dataset-path $dataset_path \
-    --tokenizer-path $tokenizer_path \
-    --output-dir $bench_output_dir/ \
-    --base-url http://$router_ip:$router_port"
+################################################################################
+# Phase 3: Multi-batch benchmark loop
+################################################################################
 
-set bench_cmd [list apptainer exec --nv -B /data:/data -B /home:/home \
-    $apptainer_image \
-    bash -lc $bench_inner_cmd]
-
-puts "=== Running benchmark ==="
-puts "Command: $bench_cmd"
-spawn {*}$bench_cmd
-set bench_spawn_id $spawn_id
-expect -i $bench_spawn_id -timeout 7200 {
-    -re {.+} {
-        puts -nonewline -- $expect_out(0,string)
-        exp_continue
-    }
-    eof {
-        puts "\n--- Benchmark finished ---"
-    }
-    timeout {
-        puts "ERROR: benchmark timeout"
-        exit 1
+set batch_sizes_str [env_get "PD_BENCH_BATCH_SIZES"]
+if {$batch_sizes_str ne ""} {
+    set batch_sizes [split $batch_sizes_str ","]
+} else {
+    set batch_sizes [list]
+    set _bs $bench_batch_size
+    while {$_bs <= 512} {
+        lappend batch_sizes $_bs
+        set _bs [expr {$_bs * 2}]
     }
 }
-set bench_status [wait -i $bench_spawn_id]
-set bench_exit [lindex $bench_status 3]
-if {$bench_exit ne "0"} {
-    puts "ERROR: benchmark failed with exit code $bench_exit"
-    exit 1
+
+proc extract_spec_field {spec field} {
+    foreach kv [split $spec ","] {
+        set parts [split $kv "="]
+        if {[lindex $parts 0] eq $field} {
+            return [lindex $parts 1]
+        }
+    }
+    return ""
 }
+
+set first_decode [lindex $decode_specs 0]
+set d_tp [extract_spec_field $first_decode "tp"]
+set d_pp [extract_spec_field $first_decode "pp"]
+set d_dp [extract_spec_field $first_decode "dp"]
+set d_ep [extract_spec_field $first_decode "ep"]
+if {$d_tp eq ""} { set d_tp 1 }
+if {$d_pp eq ""} { set d_pp 1 }
+if {$d_dp eq ""} { set d_dp 1 }
+if {$d_ep eq ""} { set d_ep 1 }
+
+set first_prefill [lindex $prefill_specs 0]
+set p_tp [extract_spec_field $first_prefill "tp"]
+set p_pp [extract_spec_field $first_prefill "pp"]
+if {$p_tp eq ""} { set p_tp 1 }
+if {$p_pp eq ""} { set p_pp 1 }
+
+set model_info "Model: $model_config\n"
+append model_info "Mode: PD Disaggregation\n"
+append model_info "Prefill: ${prefill_count}x (TP${p_tp}-PP${p_pp})\n"
+append model_info "Decode: ${decode_count}x (TP${d_tp}-PP${d_pp}-DP${d_dp}-EP${d_ep})\n"
+
+set column_format "%-12s %-24s %-14s %-11s %-11s %s"
+set benchmark_records [format $column_format "Batch Size" "Benchmark duration (s)" "TPS (tok/s)" "TTFT (ms)" "TPOT (ms)" "Total Throughput (tok/s)"]
+append benchmark_records "\n"
+append benchmark_records [format $column_format "------------" "------------------------" "--------------" "-----------" "-----------" "-------------------------"]
+append benchmark_records "\n"
+
+foreach bs $batch_sizes {
+    puts "Starting test with batch size = $bs..."
+
+    set bench_inner_cmd "PY=python; if test -x /opt/conda/bin/python; then PY=/opt/conda/bin/python; fi; \
+        export PYTHONNOUSERSITE=1; \
+        export PYTHONPATH=; \
+        cd /workspace/chitu/benchmarks && \$PY benchmark_serving.py \
+        --batch-size $bs \
+        --model $model_config \
+        --iterations $bench_iterations \
+        --input-len $bench_input_len \
+        --output-len $bench_output_len \
+        --warmup $bench_warmup \
+        --dataset sharegpt \
+        --dataset-path $dataset_path \
+        --tokenizer-path $tokenizer_path \
+        --output-dir $bench_output_dir/ \
+        --append-result \
+        --base-url http://$router_ip:$router_port"
+
+    set duration "N/A"
+    set output_throughput "N/A"
+    set total_throughput "N/A"
+    set mean_tpot "N/A"
+    set mean_ttft "N/A"
+
+    if {[catch {
+        set output [exec apptainer exec --nv -B /data:/data -B /home:/home \
+            $apptainer_image \
+            bash -lc $bench_inner_cmd 2>@1]
+    } err]} {
+        puts "Benchmark failed for batch size $bs: $err"
+    } else {
+        puts $output
+
+        catch { set duration [exec echo $output | grep "Benchmark duration" | awk {{print $NF}} 2>/dev/null] }
+        catch { set output_throughput [exec echo $output | grep "Output token throughput" | awk {{print $NF}} 2>/dev/null] }
+        catch { set total_throughput [exec echo $output | grep "Total Token throughput" | awk {{print $NF}} 2>/dev/null] }
+        catch { set mean_tpot [exec echo $output | grep "Mean TPOT" | awk {{print $NF}} 2>/dev/null] }
+        catch { set mean_ttft [exec echo $output | grep "Mean TTFT" | awk {{print $NF}} 2>/dev/null] }
+
+        if {$duration eq ""} { set duration "N/A" }
+        if {$output_throughput eq ""} { set output_throughput "N/A" }
+        if {$total_throughput eq ""} { set total_throughput "N/A" }
+        if {$mean_tpot eq ""} { set mean_tpot "N/A" }
+        if {$mean_ttft eq ""} { set mean_ttft "N/A" }
+    }
+
+    append benchmark_records [format $column_format $bs $duration $output_throughput $mean_ttft $mean_tpot $total_throughput]
+    append benchmark_records "\n"
+
+    set pic_dir "${bench_output_dir}/pics"
+    exec mkdir -p $pic_dir
+    puts "Generating visualization: $pic_dir"
+    if {[catch {
+        set viz_output [exec apptainer exec --nv \
+            -B /data:/data -B /home:/home -B /tmp:/tmp \
+            $apptainer_image \
+            bash -lc "cd /workspace/chitu && python benchmarks/visualize_response.py \
+                --benchmark-results $bench_output_dir/benchmark_results.jsonl \
+                --save-path $pic_dir" 2>@1]
+    } viz_err]} {
+        puts "Visualization failed for batch size $bs: $viz_err"
+    } else {
+        puts $viz_output
+        puts "Visualization saved: $pic_dir"
+    }
+
+    sleep 1
+}
+
+################################################################################
+# Phase 4: Record to Feishu bitable (via record_daily_bench)
+################################################################################
 
 set json_path "$bench_output_dir/benchmark_results.jsonl"
 if {![file exists $json_path]} {
@@ -374,12 +455,58 @@ if {![file exists $json_path]} {
     exit 1
 }
 
+set recipes_dir "/data/nfs/recipes"
+set record_log "$bench_output_dir/record_daily_bench.log"
+
+set send_notification 1
+set no_notify [env_get "PD_NO_NOTIFY"]
+if {$no_notify eq "1"} {
+    set send_notification 0
+}
+
+set cmd_args_summary "PD Disagg: prefill=${prefill_count}x(TP${p_tp}-PP${p_pp}), decode=${decode_count}x(TP${d_tp}-PP${d_pp}-DP${d_dp}-EP${d_ep}), nodes=${nodes}, gpus_per_node=${gpus_per_node}"
+
+if {$send_notification && [file isdirectory $recipes_dir]} {
+    puts "=== Writing records to Feishu bitable ==="
+    if {[catch {
+        set record_output [exec apptainer exec --nv \
+            -B /data:/data -B /home:/home -B /tmp:/tmp \
+            --env BENCHMARK_OUTPUT_DIR=$bench_output_dir \
+            --env MODEL_NAME=$model_config \
+            --env TP_SIZE=$d_tp \
+            --env PP_SIZE=$d_pp \
+            --env DP_SIZE=$d_dp \
+            --env EP_SIZE=$d_ep \
+            --env INPUT_LEN=$bench_input_len \
+            --env OUTPUT_LEN=$bench_output_len \
+            --env CMD_ARGS=$cmd_args_summary \
+            --env PARALLEL_SCHEME=P:${prefill_count}x(TP${p_tp}-PP${p_pp})+D:${decode_count}x(TP${d_tp}-PP${d_pp}-DP${d_dp}-EP${d_ep}) \
+            --env DEPLOY_MODE=PD_DISAGG \
+            $apptainer_image \
+            bash -lc "cd $recipes_dir && python -m recipes.tools.record_daily_bench" 2>@1]
+    } record_err]} {
+        puts "WARN: record_daily_bench failed: $record_err"
+    } else {
+        puts $record_output
+    }
+} else {
+    if {!$send_notification} {
+        puts "Notification disabled (PD_NO_NOTIFY=1)."
+    } else {
+        puts "WARN: recipes dir not found ($recipes_dir), skip bitable upload."
+    }
+}
+
+################################################################################
+# Phase 5: Validation (check generated_texts / errors)
+################################################################################
+
 set py_code {
 import json
 import sys
 
 path = sys.argv[1]
-print("=== Benchmark results summary ===")
+print("=== Benchmark results validation ===")
 has_error = False
 total_texts = 0
 total_errors = 0
@@ -405,36 +532,18 @@ if not content:
     sys.exit(1)
 
 parsed_any = False
-try:
-    obj = json.loads(content)
+for line_no, line in enumerate(content.splitlines(), 1):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        print(f"[line {line_no}] WARN: skip non-json line: {line[:120]}")
+        continue
     parsed_any = True
-    if isinstance(obj, list):
-        for idx, item in enumerate(obj, 1):
-            if isinstance(item, dict):
-                handle_obj(item, prefix=f"[item {idx}] ")
-    elif isinstance(obj, dict):
-        handle_obj(obj)
-    else:
-        print(f"WARN: unexpected json root type: {type(obj)}")
-except json.JSONDecodeError as e:
-    print(f"WARN: failed to parse full json: {e}")
-    print(f"WARN: content head: {content[:200]!r}")
-    print(f"WARN: content tail: {content[-200:]!r}")
-    parsed_any = False
-
-if not parsed_any:
-    for line_no, line in enumerate(content.splitlines(), 1):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            print(f"[line {line_no}] WARN: skip non-json line: {line[:120]}")
-            continue
-        parsed_any = True
-        if isinstance(obj, dict):
-            handle_obj(obj, prefix=f"[line {line_no}] ")
+    if isinstance(obj, dict):
+        handle_obj(obj, prefix=f"[batch {line_no}] ")
 
 if not parsed_any:
     print("ERROR: no valid json records found")
@@ -446,7 +555,7 @@ if has_error:
 print("Validation PASSED")
 }
 
-puts "=== Printing benchmark generated_texts and errors ==="
+puts "=== Validating benchmark results ==="
 set parse_cmd [list python3 -c $py_code $json_path]
 spawn {*}$parse_cmd
 set parse_spawn_id $spawn_id
@@ -456,10 +565,10 @@ expect -i $parse_spawn_id -timeout 7200 {
         exp_continue
     }
     eof {
-        puts "\n--- Parse finished ---"
+        puts "\n--- Validation finished ---"
     }
     timeout {
-        puts "ERROR: parse timeout"
+        puts "ERROR: validation timeout"
         exit 1
     }
 }
@@ -470,6 +579,19 @@ if {$parse_exit ne "0"} {
     exit 1
 }
 
+################################################################################
+# Phase 6: BENCHMARK SUMMARY
+################################################################################
+
+puts "==================== BENCHMARK SUMMARY ===================="
+puts $model_info
+puts $benchmark_records
+puts "==========================================================="
+
+################################################################################
+# Phase 7: Feishu webhook notification (optional, in addition to bitable)
+################################################################################
+
 set feishu_webhook [env_get "FEISHU_WEBHOOK_URL"]
 if {$feishu_webhook eq ""} {
     set feishu_webhook [env_get "LARK_WEBHOOK_URL"]
@@ -478,7 +600,7 @@ if {$feishu_webhook eq ""} {
     set feishu_webhook [env_get "FEISHU_WEBHOOK"]
 }
 
-set notify_text "PD Disagg Daily Benchmark: PASS\nmodel=$model_config\nnodes=$nodes gpus_per_node=$gpus_per_node prefill=$prefill_count decode=$decode_count\nrouter=$router_ip:$router_port\nresults=$json_path"
+set notify_text "PD Disagg Daily Benchmark: PASS\nmodel=$model_config\nnodes=$nodes gpus_per_node=$gpus_per_node prefill=$prefill_count decode=$decode_count\nrouter=$router_ip:$router_port\nbatch_sizes=[join $batch_sizes ,]\nresults=$json_path"
 set job_url [env_get "CI_JOB_URL"]
 if {$job_url ne ""} {
     append notify_text "\njob=$job_url"
@@ -488,11 +610,14 @@ if {$pipeline_url ne ""} {
     append notify_text "\npipeline=$pipeline_url"
 }
 if {$feishu_webhook ne ""} {
-    puts "Sending Feishu notification..."
+    puts "Sending Feishu webhook notification..."
     send_feishu $feishu_webhook $notify_text
 } else {
-    puts "Feishu webhook not set, skip notify."
+    puts "Feishu webhook not set, skip webhook notify."
 }
+
+puts "Testing done. You may see some killing messages following, which is expected."
+puts "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 
 puts "Cleaning up PD processes..."
 catch {exec kill -TERM $pd_pid}
