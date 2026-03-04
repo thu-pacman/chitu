@@ -587,7 +587,10 @@ class Backend:
         # Compute sufficient num_blocks for indexer cache when not provided
         # Ensure enough pages for max_seq_len per hot request to avoid OOB when crossing pages
         num_hot_req = ceil_div(args.infer.max_reqs, args.infer.dp_size)
-        auto_num_blocks = ceil_div(args.infer.max_seq_len, block_size) * num_hot_req
+        mtp_extra = args.infer.mtp_size if args.infer.mtp_size > 1 else 0
+        auto_num_blocks = (
+            ceil_div(args.infer.max_seq_len + mtp_extra, block_size) * num_hot_req
+        )
         num_blocks = (
             args.infer.num_blocks if args.infer.num_blocks != -1 else auto_num_blocks
         )
@@ -978,7 +981,8 @@ class Backend:
         return Backend.build_model(
             args.models,
             Backend.cache_managers,
-            max_position_embeddings=args.infer.max_seq_len,
+            max_position_embeddings=args.infer.max_seq_len
+            + (args.infer.mtp_size if args.infer.mtp_size > 1 else 0),
             pipeline_parallel_size=args.infer.pp_size,
             tensor_parallel_size=args.infer.tp_size,
             attn_backend=attn_backend,
