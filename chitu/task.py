@@ -438,6 +438,9 @@ class Task(ConstraintDecodeTask):
         )
         self._decode_status = TaskDecodeType.Normal
 
+        ## for DLLM task
+        self.decoding_start = 0
+
         # Request
         self.req = req
         if req:

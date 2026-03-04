@@ -1702,8 +1702,12 @@ class Executor:
             for dispatcher in self.task_dispatchers:
                 payload = dispatcher.recv_payload(self.dummy_logits)
 
+        logger.info(f"payload shape: {payload.shape}")
         from dinfer import TokenArray
         token_array = TokenArray(payload, num_tokens, mask_id=Backend.model.decoder.mask_id, eos_id=Backend.model.decoder.eos_id, device=self.device)
+        logger.info(f"{tasks.task_ids=}")
+        logger.info(f"{tasks.tokens=}")
+        prefilling_limit = 1024
         
 
 

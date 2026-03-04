@@ -108,41 +108,85 @@ class TransformerLLaDA(nn.Module):
         config_path = params.get("model_config_path") or params.get("ckpt_dir")
         model_config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
         torch.set_default_dtype(torch.bfloat16)
-
-        raw_model = LLaDA2SGLangLM(config=model_config)
-        server_args = _init_sglang_for_llada()
-
+        self.server_args = _init_sglang_for_llada()
+        self.model = LLaDA2SGLangLM(config=model_config)
         ## hard code here
-        max_length = 2048
-        aligned_lengths = [32, 64, 96, 128]
-        supported_batch_sizes = [2**i for i in range(int(np.log2(16)) + 1)]
-        device = torch.device("cuda")
-
-        self.model = ModelRunner(
-            raw_model,
-            device,
-            server_args=server_args,
-            max_length=max_length,
-            prefill_lengths=aligned_lengths,
-            enable_cuda_graph=True,
-            supported_batch_sizes=supported_batch_sizes,
-            use_cross_block=True,
-        )
+        self.max_length = 2048
+        self.aligned_lengths = [32, 64, 96, 128]
+        self.supported_batch_sizes = [1,2,4,8]
+        self.device = torch.device("cuda")
         ## need to add more decoder here, store this option in config (llada.yaml)
         self.decoder = ThresholdParallelDecoder(temperature=0, threshold=0.9, mask_id=156895, eos_id=156892)
 
-    def apply(self, fn, *args, **kwargs):
-        # Skip recursive apply into self.model to avoid method name collision:
-        # LLaDA2SGLangLM contains UnquantizedFusedMoEMethod which overrides apply()
-        # with an incompatible signature. Since all weights are already on CUDA after
-        # load_weights(), the _move_one_module_to_device step is unnecessary.
-        fn(self)
-        return self
+    def _materialize_meta_tensors(self, module: nn.Module, device: str) -> None:
+        """Convert meta tensors to real device (e.g. expert_bias not in checkpoint)."""
+        target = torch.device(device)
+        for key in list(module._parameters.keys()):
+            param = module._parameters[key]
+            if param is not None and param.device.type == "meta":
+                module._parameters[key] = nn.Parameter(
+                    torch.empty(param.shape, dtype=param.dtype, device=target)
+                )
+        for key in list(module._buffers.keys()):
+            buf = module._buffers[key]
+            if buf is not None and buf.device.type == "meta":
+                module._buffers[key] = torch.empty(
+                    buf.shape, dtype=buf.dtype, device=target
+                )
+        for child in module.children():
+            self._materialize_meta_tensors(child, device)
+
+    def _refresh_correction_bias_refs(self, module: nn.Module) -> None:
+        """Refresh correction_bias refs after materialization.
+
+        MLP/TopK hold refs to gate.expert_bias; after replacing meta param they
+        still point to old meta tensor, causing moe_fused_gate to fail.
+        moe_fused_gate expects input and bias in same dtype (float32).
+        """
+        for m in module.modules():
+            if (
+                hasattr(m, "gate")
+                and hasattr(m.gate, "expert_bias")
+                and m.gate.expert_bias is not None
+            ):
+                bias = m.gate.expert_bias
+                if bias.dtype != torch.float32:
+                    m.gate._parameters["expert_bias"] = nn.Parameter(
+                        bias.to(torch.float32)
+                    )
+                    bias = m.gate.expert_bias
+                if hasattr(m, "correction_bias"):
+                    m.correction_bias = bias
+                if hasattr(m, "topk") and hasattr(m.topk, "topk_config"):
+                    cfg = m.topk.topk_config
+                    if hasattr(cfg, "correction_bias") and cfg.correction_bias is not None:
+                        cfg.correction_bias = bias
 
     def load_weights(self, ckpt_dir: str, device: str = "cuda"):
-        # Materialize meta-device parameters to real device before loading weights,
-        # because chitu builds the model under `torch.device("meta")` context.
-        # ModelRunner wraps the raw LLaDA model in .model
-        inner = self.model.model
+        # Chitu builds model under torch.device("meta"). Must to_empty before load_weights,
+        # else param.data = loaded_weight fails (incompatible tensor type: meta vs real).
+        inner = self.model
         inner.to_empty(device=device)
         inner.load_weights(ckpt_dir, device=device)
+        # Materialize any remaining meta (e.g. expert_bias not in checkpoint).
+        self._materialize_meta_tensors(inner, device)
+        # Refresh correction_bias refs so moe_fused_gate receives real tensor.
+        self._refresh_correction_bias_refs(inner)
+        # ModelRunner is not nn.Module; use object.__setattr__ to bypass nn.Module's check.
+        if "model" in self._modules:
+            del self._modules["model"]
+        object.__setattr__(
+            self,
+            "model",
+            ModelRunner(
+                inner,
+                self.device,
+                server_args=self.server_args,
+                max_length=self.max_length,
+                prefill_lengths=self.aligned_lengths,
+                enable_cuda_graph=True,
+                supported_batch_sizes=self.supported_batch_sizes,
+                use_cross_block=True,
+                enable_compile=True,
+            ),
+        )
