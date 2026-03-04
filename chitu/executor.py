@@ -1267,7 +1267,7 @@ class Executor:
                 response_len_list = []
                 for it, task in enumerate(tasks.output_tasks):
                     if (
-                        task.params.frequency_penalty > 0
+                        task.sample_params.frequency_penalty > 0
                         and task.task_type == TaskType.Decode
                         and len(task.response) > 0
                     ):

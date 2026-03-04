@@ -98,7 +98,7 @@ class RouterRequest:
         self.tools = tools
         self.tool_choice = tool_choice
         self.parallel_tool_calls = parallel_tool_calls
-        self.params = SampleParams(
+        self.sample_params = SampleParams(
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
@@ -154,19 +154,24 @@ class RouterRequest:
             logprobs=self.logprobs,
             top_logprobs=self.top_logprobs,
             max_new_tokens=self.max_new_tokens,
-            top_p=self.params.top_p,
-            top_k=self.params.top_k,
-            temperature=self.params.temperature,
-            frequency_penalty=self.params.frequency_penalty,
+            top_p=self.sample_params.top_p,
+            top_k=self.sample_params.top_k,
+            temperature=self.sample_params.temperature,
+            frequency_penalty=self.sample_params.frequency_penalty,
             chat_template_kwargs=self.chat_template_kwargs,
         )
 
 
 class UserRequest:
+    """
+    Unified interface for user request from any API standard (OpenAI, Anthropic)
+    """
+
     def __init__(
         self,
         message,
         request_id,
+        *,
         tokens=None,
         logprobs=False,
         top_logprobs=None,
@@ -185,13 +190,14 @@ class UserRequest:
         self.message = message
         self.request_id = request_id
         self.tokens = tokens
-        self.params = SampleParams(
+        self.sample_params = SampleParams(
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
             frequency_penalty=frequency_penalty,
         )
         self.chat_template_kwargs = chat_template_kwargs
+
         # constraint decoding related
         self.tools = tools
         self.grammar = None
@@ -384,7 +390,7 @@ class Task(ConstraintDecodeTask):
         self,
         task_id: str,
         req: Optional[UserRequest],
-        params: SampleParams = None,
+        sample_params: SampleParams = None,
         prefix_tokens=None,
         prompt_len=None,
         grammar_str: str = "",
@@ -397,7 +403,9 @@ class Task(ConstraintDecodeTask):
         self.task_id = task_id
         self.task_type = TaskType.Prefill  # New Task object is always a prefill task
         self.stop_with_eos = stop_with_eos
-        self.params = params if params is not None else req.params
+        self.sample_params = (
+            sample_params if sample_params is not None else req.sample_params
+        )
         self.dp_rank: Optional[int] = None
         self.prefix_tokens = (
             prefix_tokens if prefix_tokens is not None else req.prompt_tokens
@@ -929,7 +937,7 @@ class PackedTasks(PackedTasksBase):
             self.tasks = tasks
         self.output_tasks = [task for task in self.tasks if task.has_output()]
         self.should_apply_frequency_penalty = any(
-            task.params.frequency_penalty > 0 for task in self.output_tasks
+            task.sample_params.frequency_penalty > 0 for task in self.output_tasks
         )
         self.return_logprobs = any(
             getattr(task.req, "logprobs", False) for task in self.output_tasks
@@ -1003,18 +1011,21 @@ class PackedTasks(PackedTasksBase):
                 self.grid_thw.append(task.grid_thw)
 
         # sample related
-        self.is_all_greedy = all(task.params.top_k <= 1 for task in self.output_tasks)
+        self.is_all_greedy = all(
+            task.sample_params.top_k <= 1 for task in self.output_tasks
+        )
         self.temperatures = torch.tensor(
-            [task.params.temperature for task in self.output_tasks], pin_memory=True
+            [task.sample_params.temperature for task in self.output_tasks],
+            pin_memory=True,
         ).to(device=self.rank, non_blocking=True)
         self.top_ps = torch.tensor(
-            [task.params.top_p for task in self.output_tasks], pin_memory=True
+            [task.sample_params.top_p for task in self.output_tasks], pin_memory=True
         ).to(device=self.rank, non_blocking=True)
         self.top_ks = torch.tensor(
-            [task.params.top_k for task in self.output_tasks], pin_memory=True
+            [task.sample_params.top_k for task in self.output_tasks], pin_memory=True
         ).to(device=self.rank, non_blocking=True)
         self.frequency_penalties = torch.tensor(
-            [task.params.frequency_penalty for task in self.output_tasks],
+            [task.sample_params.frequency_penalty for task in self.output_tasks],
             dtype=torch.float32,
             pin_memory=True,
         ).to(device=self.rank, non_blocking=True)

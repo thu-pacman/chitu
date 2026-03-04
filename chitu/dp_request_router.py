@@ -488,24 +488,24 @@ class RequestRouter:
             "message": serializable_message,  # Use serializable message
             "max_new_tokens": request.max_new_tokens,
             "temperature": (
-                getattr(request.params, "temperature", 1.0)
-                if hasattr(request, "params")
-                else getattr(request, "temperature", 1.0)
+                request.sample_params.temperature
+                if hasattr(request, "sample_params")
+                else request.temperature
             ),
             "top_p": (
-                getattr(request.params, "top_p", 1.0)
-                if hasattr(request, "params")
-                else getattr(request, "top_p", 1.0)
+                request.sample_params.top_p
+                if hasattr(request, "sample_params")
+                else request.top_p
             ),
             "top_k": (
-                getattr(request.params, "top_k", 50)
-                if hasattr(request, "params")
-                else getattr(request, "top_k", 50)
+                request.sample_params.top_k
+                if hasattr(request, "sample_params")
+                else request.top_k
             ),
-            "logprobs": getattr(request, "logprobs", False),
-            "top_logprobs": getattr(request, "top_logprobs", None),
+            "logprobs": request.logprobs,
+            "top_logprobs": request.top_logprobs,
             # honor stop_with_eos from RouterRequest; default True (stop on EOS)
-            "stop_with_eos": getattr(request, "stop_with_eos", True),
+            "stop_with_eos": request.stop_with_eos,
             "timestamp": time.time(),
             "scheduler_id": scheduler_id,
         }

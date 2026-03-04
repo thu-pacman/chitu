@@ -111,7 +111,9 @@ def prefill_task_factory(sample_params, ensure_global_args):
     from chitu.task import Task, TaskPool, TaskType
 
     def _create(task_id: str, tokens: list, consumed: int = 0):
-        t = Task(task_id=task_id, req=None, params=sample_params, prefix_tokens=tokens)
+        t = Task(
+            task_id=task_id, req=None, sample_params=sample_params, prefix_tokens=tokens
+        )
         t.task_type = TaskType.Prefill
         t.consumed_req_tokens = consumed
         TaskPool.add(t)
@@ -126,7 +128,9 @@ def decode_task_factory(sample_params, ensure_global_args):
     from chitu.task import Task, TaskPool, TaskType
 
     def _create(task_id: str, tokens: list):
-        t = Task(task_id=task_id, req=None, params=sample_params, prefix_tokens=tokens)
+        t = Task(
+            task_id=task_id, req=None, sample_params=sample_params, prefix_tokens=tokens
+        )
         t.task_type = TaskType.Decode
         t.consumed_req_tokens = len(tokens)
         TaskPool.add(t)
@@ -377,7 +381,7 @@ class TestPPDispatchWithTask:
         assert "tasks" in msg
         assert len(msg["tasks"]) == 1
         task_data = msg["tasks"][0]
-        assert "params" in task_data
+        assert "sample_params" in task_data
         assert "tokens" in task_data
 
         # Benchmark with separate serializers
@@ -412,9 +416,11 @@ class TestPPDispatchWithTask:
         )
         msg = msgpack.unpackb(data, raw=False)
 
-        # Known task should not transmit params
+        # Known task should not transmit sample_params
         task_data = msg["tasks"][0]
-        assert "params" not in task_data or task_data.get("params") is None
+        assert (
+            "sample_params" not in task_data or task_data.get("sample_params") is None
+        )
 
     def test_pp_decode_minimal(self, decode_task_factory, record_benchmark):
         """PP Decode: should use minimal config"""
@@ -434,7 +440,7 @@ class TestPPDispatchWithTask:
         )
         msg = msgpack.unpackb(data, raw=False)
 
-        # PP Decode should not include params or tokens
+        # PP Decode should not include sample_params or tokens
         assert msg.get("tasks") is None
 
 
@@ -462,7 +468,7 @@ class TestDPDispatchWithTask:
 
         assert "tasks" in msg
         task_data = msg["tasks"][0]
-        assert "params" in task_data
+        assert "sample_params" in task_data
         assert "tokens" in task_data
 
         # Benchmark with separate serializers
@@ -501,7 +507,7 @@ class TestDeduplication:
 
         # Should include full info
         task_data = msg["tasks"][0]
-        assert "params" in task_data
+        assert "sample_params" in task_data
         assert "tokens" in task_data
 
         # Benchmark with separate serializers
@@ -542,9 +548,11 @@ class TestDeduplication:
         # Task not in new_task_ids
         assert "000000f1" not in msg.get("new_task_ids", [])
 
-        # Known task should not include params
+        # Known task should not include sample_params
         task_data = msg["tasks"][0]
-        assert "params" not in task_data or task_data.get("params") is None
+        assert (
+            "sample_params" not in task_data or task_data.get("sample_params") is None
+        )
 
     def test_mixed_batch_new_and_known(self, prefill_task_factory, record_benchmark):
         """Mixed batch: new and known tasks"""
@@ -573,14 +581,14 @@ class TestDeduplication:
         # Verify data
         task_data_map = {d["task_id"]: d for d in msg["tasks"]}
 
-        # Known task should not have params
+        # Known task should not have sample_params
         assert (
-            "params" not in task_data_map["000000f2"]
-            or task_data_map["000000f2"].get("params") is None
+            "sample_params" not in task_data_map["000000f2"]
+            or task_data_map["000000f2"].get("sample_params") is None
         )
 
-        # New task should have params
-        assert "params" in task_data_map["000000f3"]
+        # New task should have sample_params
+        assert "sample_params" in task_data_map["000000f3"]
 
         # Benchmark with separate serializers
         def benchmark_fn():
@@ -619,7 +627,7 @@ class TestAutoConfigSelection:
         # Should include full info for new task
         assert "000000a0" in msg.get("new_task_ids", [])
         task_data = msg["tasks"][0]
-        assert "params" in task_data
+        assert "sample_params" in task_data
         assert "tokens" in task_data
 
         # Benchmark with separate serializers

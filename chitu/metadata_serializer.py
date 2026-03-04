@@ -17,6 +17,7 @@ from chitu.task import (
     TaskPool,
     TaskType,
     SerializedPackedTasksPayloadType,
+    SampleParams,
     is_normal_payload,
 )
 
@@ -306,13 +307,13 @@ class MetadataSerializer:
                         task_data["tokens"] = list(task.prefix_tokens)
                         task_data["standard_tokens"] = task._test_standard_tokens
                         task_data["grammar_str"] = task.grammar_str
-                    # 只对新任务传输 params
+                    # 只对新任务传输 sample_params
                     if config.include_sample_params:
-                        task_data["params"] = {
-                            "temperature": task.params.temperature,
-                            "top_p": task.params.top_p,
-                            "top_k": task.params.top_k,
-                            "frequency_penalty": task.params.frequency_penalty,
+                        task_data["sample_params"] = {
+                            "temperature": task.sample_params.temperature,
+                            "top_p": task.sample_params.top_p,
+                            "top_k": task.sample_params.top_k,
+                            "frequency_penalty": task.sample_params.frequency_penalty,
                         }
                     # 输出相关字段（只对新任务）
                     if config.include_return_params:
@@ -441,30 +442,29 @@ class MetadataSerializer:
         self, task_id: str, task_data: Dict, task_type: TaskType = TaskType.Prefill
     ) -> Task:
         """从序列化数据创建 Task 对象"""
-        from chitu.task import SampleParams
 
-        params_dict = task_data.get("params", {})
-        params = SampleParams(
-            temperature=params_dict.get("temperature", 1.0),
-            top_p=params_dict.get("top_p", 0.9),
-            top_k=params_dict.get("top_k", 50),
-            frequency_penalty=params_dict.get("frequency_penalty", 0.0),
+        sample_params_dict = task_data.get("sample_params", {})
+        sample_params = SampleParams(
+            temperature=sample_params_dict.get("temperature"),
+            top_p=sample_params_dict.get("top_p"),
+            top_k=sample_params_dict.get("top_k"),
+            frequency_penalty=sample_params_dict.get("frequency_penalty"),
         )
-        tokens = task_data.get("tokens", [])
-        grammar_str = task_data.get("grammar_str", "")
-        prompt_len = task_data.get("prompt_len", None)
-        pd_prefill_engine_rank = task_data.get("pd_prefill_engine_rank", None)
+        tokens = task_data.get("tokens")
+        grammar_str = task_data.get("grammar_str")
+        prompt_len = task_data.get("prompt_len")
+        pd_prefill_engine_rank = task_data.get("pd_prefill_engine_rank")
         task = Task(
             task_id=task_id,
             req=None,
-            params=params,
+            sample_params=sample_params,
             prefix_tokens=tokens,
             grammar_str=grammar_str,
             prompt_len=prompt_len,
         )
-        task.return_logprobs = task_data.get("return_logprobs", False)
-        task._test_flag = task_data.get("_test_flag", False)
-        task._test_standard_tokens = task_data.get("standard_tokens", [])
+        task.return_logprobs = task_data.get("return_logprobs")
+        task._test_flag = task_data.get("_test_flag")
+        task._test_standard_tokens = task_data.get("standard_tokens")
         if pd_prefill_engine_rank is not None:
             # Carry PD binding to worker ranks (used by KV hook before KV pull).
             task.pd_prefill_engine_rank = int(pd_prefill_engine_rank)
