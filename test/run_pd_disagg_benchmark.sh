@@ -25,6 +25,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 MODEL_NAME=""
+DEPLOY_MODE="pd_disagg"
 ROUTER_URL=""
 DRY_RUN=0
 SKIP_VALIDATION=0
@@ -45,14 +46,21 @@ BENCH_ITERATIONS_OVR=""
 DATASET_PATH_OVR=""
 OUTPUT_DIR_OVR=""
 
-SUPPORTED_MODELS="Qwen3-235B-A22B  DeepSeek-R1  DeepSeek-V3.2  Qwen3-Next"
+MI_INSTANCES_OVR=""
+MI_INSTANCE_DEFAULT_OVR=""
+MI_LB_ALGORITHM_OVR=""
+
+SUPPORTED_MODELS="Qwen3-235B-A22B  DeepSeek-R1  DeepSeek-V3.2  Qwen3-Next  Qwen3-30B-A3B"
 
 usage() {
   cat <<EOF
-Usage: $0 --model MODEL_NAME [options]
+Usage: $0 --model MODEL_NAME [--mode pd_disagg|multi_instance] [options]
 
 Supported models:
 $(echo "${SUPPORTED_MODELS}" | tr -s ' ' '\n' | sed 's/^/  /')
+
+Deploy mode:
+  --mode MODE           pd_disagg (default) or multi_instance
 
 Cluster / SIF options (full flow mode):
   --sif PATH            Apptainer SIF image path (or set APPTAINER_IMAGE env)
@@ -72,34 +80,36 @@ Benchmark options:
   --dataset-path PATH   Override dataset path
   --output-dir DIR      Override benchmark output directory
 
-Mode options:
+Multi-instance options (--mode multi_instance):
+  --instances N         Number of unified instances
+  --instance-default S  Default instance spec (tp=2,max_seq_len=6144,...)
+  --lb-algorithm ALG    Load balancing: round_robin (default), least_loaded, power_of_two_choices
+
+General options:
   --model NAME          Model name (required)
-  --router-url URL      Benchmark-only mode: skip PD launch, test against existing service
+  --router-url URL      Benchmark-only mode: skip service launch, test against existing service
   --dry-run             Print full config and exit (no execution)
   --skip-validation     Skip benchmark result validation
   --list-models         List supported models and exit
   -h, --help            Show this help
 
-All options can also be set via environment variables (PD_NODES, PD_PARTITION, etc.).
 Priority: CLI flags > environment variables > model defaults.
 
 Examples:
-  # ── Local full flow (simulate CI) ──
-  # Launch PD service + run benchmark, same as CI but on local cluster
-  $0 --model DeepSeek-R1 --sif /data/nfs/docker_images/chitu-latest.sif
+  # ── PD disagg (full flow) ──
+  $0 --model DeepSeek-R1 --sif /path/to/chitu.sif
   $0 --model Qwen3-Next --sif /path/to/chitu.sif --partition dev --nodes 3
 
-  # ── Local benchmark only ──
-  # PD service already running, just run benchmark against it
-  $0 --model DeepSeek-R1 --router-url http://10.0.0.1:21004
-  $0 --model Qwen3-Next --router-url http://10.0.0.1:21004 --batch-size 64
+  # ── Multi-instance (full flow) ──
+  $0 --mode multi_instance --model Qwen3-Next --sif /path/to/chitu.sif
+  $0 --mode multi_instance --model Qwen3-Next --sif /path/to/chitu.sif --instances 8
 
-  # ── CI usage ──
-  # APPTAINER_IMAGE / CHITU_COMMIT_IMAGE set by CI pipeline
-  $0 --model Qwen3-235B-A22B
+  # ── Benchmark only (against running service) ──
+  $0 --model Qwen3-Next --router-url http://10.0.0.1:21004 --batch-sizes 64
 
   # ── Dry run ──
   $0 --model DeepSeek-V3.2 --dry-run
+  $0 --mode multi_instance --model Qwen3-Next --dry-run
 EOF
 }
 
@@ -123,9 +133,15 @@ load_model_config() {
       PD_GPUS_PER_NODE="${PD_GPUS_PER_NODE:-8}"
       PD_ROUTER_PORT="${PD_ROUTER_PORT:-21004}"
       PD_BIND_CODE="${PD_BIND_CODE:-1}"
+      # PD disagg defaults
       PD_PREFILL_SPECS="${PD_PREFILL_SPECS:-tp=4,pp=2,dp=1,ep=1,max_seq_len=5200,max_reqs=384,chunk=61440,full_warmup=True|tp=4,pp=2,dp=1,ep=1,max_seq_len=5200,max_reqs=384,chunk=61440,full_warmup=True}"
       PD_DECODE_SPECS="${PD_DECODE_SPECS:-tp=1,pp=1,dp=16,ep=16,max_seq_len=6200,max_reqs=512,full_warmup=True,infer.memory_utilization=0.99}"
       PD_COMMON_OVERRIDES="${PD_COMMON_OVERRIDES:-dp_config.router.pd_disaggregation.kv_transfer.decode_wait_timeout_s=1200|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_max_pending=256|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_token_budget=350000|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_reserved_tokens=512|dp_config.router.pd_disaggregation.kv_transfer.decode_max_running_tasks_per_dp=50|metrics.log_interval=10}"
+      # Multi-instance defaults
+      MI_NUM_INSTANCES="${MI_NUM_INSTANCES:-4}"
+      MI_INSTANCE_DEFAULT="${MI_INSTANCE_DEFAULT:-tp=4,pp=2,max_seq_len=5200,max_reqs=384,full_warmup=True}"
+      MI_LB_ALGORITHM="${MI_LB_ALGORITHM:-round_robin}"
+      MI_COMMON_OVERRIDES="${MI_COMMON_OVERRIDES:-metrics.log_interval=10}"
       PD_BENCH_BATCH_SIZE="${PD_BENCH_BATCH_SIZE:-128}"
       PD_BENCH_INPUT_LEN="${PD_BENCH_INPUT_LEN:-5120}"
       PD_BENCH_OUTPUT_LEN="${PD_BENCH_OUTPUT_LEN:-1024}"
@@ -143,6 +159,10 @@ load_model_config() {
       PD_PREFILL_SPECS="${PD_PREFILL_SPECS:-tp=8,pp=2,dp=1,ep=1,max_seq_len=6144,max_reqs=256,full_warmup=True,infer.memory_utilization=0.90}"
       PD_DECODE_SPECS="${PD_DECODE_SPECS:-tp=1,pp=1,dp=16,ep=16,max_seq_len=6144,max_reqs=512,full_warmup=True,infer.use_cuda_graph=True}"
       PD_COMMON_OVERRIDES="${PD_COMMON_OVERRIDES:-dp_config.router.pd_disaggregation.kv_transfer.decode_wait_timeout_s=1200|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_max_pending=256|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_token_budget=350000|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_reserved_tokens=1024|dp_config.router.pd_disaggregation.kv_transfer.decode_max_running_tasks_per_dp=30|metrics.log_interval=10}"
+      MI_NUM_INSTANCES="${MI_NUM_INSTANCES:-4}"
+      MI_INSTANCE_DEFAULT="${MI_INSTANCE_DEFAULT:-tp=8,max_seq_len=6144,max_reqs=256,full_warmup=True}"
+      MI_LB_ALGORITHM="${MI_LB_ALGORITHM:-round_robin}"
+      MI_COMMON_OVERRIDES="${MI_COMMON_OVERRIDES:-metrics.log_interval=10}"
       PD_BENCH_BATCH_SIZE="${PD_BENCH_BATCH_SIZE:-128}"
       PD_BENCH_INPUT_LEN="${PD_BENCH_INPUT_LEN:-5120}"
       PD_BENCH_OUTPUT_LEN="${PD_BENCH_OUTPUT_LEN:-1024}"
@@ -160,6 +180,10 @@ load_model_config() {
       PD_PREFILL_SPECS="${PD_PREFILL_SPECS:-tp=8,pp=2,dp=1,ep=1,max_seq_len=6144,max_reqs=256,full_warmup=True,infer.memory_utilization=0.90}"
       PD_DECODE_SPECS="${PD_DECODE_SPECS:-tp=1,pp=1,dp=16,ep=16,max_seq_len=6200,max_reqs=512,full_warmup=True,infer.memory_utilization=0.99}"
       PD_COMMON_OVERRIDES="${PD_COMMON_OVERRIDES:-dp_config.router.pd_disaggregation.kv_transfer.decode_wait_timeout_s=1200|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_max_pending=256|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_token_budget=350000|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_reserved_tokens=512|dp_config.router.pd_disaggregation.kv_transfer.decode_max_running_tasks_per_dp=50|metrics.log_interval=10}"
+      MI_NUM_INSTANCES="${MI_NUM_INSTANCES:-4}"
+      MI_INSTANCE_DEFAULT="${MI_INSTANCE_DEFAULT:-tp=8,max_seq_len=6200,max_reqs=256,full_warmup=True}"
+      MI_LB_ALGORITHM="${MI_LB_ALGORITHM:-round_robin}"
+      MI_COMMON_OVERRIDES="${MI_COMMON_OVERRIDES:-metrics.log_interval=10}"
       PD_BENCH_BATCH_SIZE="${PD_BENCH_BATCH_SIZE:-128}"
       PD_BENCH_INPUT_LEN="${PD_BENCH_INPUT_LEN:-2048}"
       PD_BENCH_OUTPUT_LEN="${PD_BENCH_OUTPUT_LEN:-1024}"
@@ -174,10 +198,34 @@ load_model_config() {
       PD_GPUS_PER_NODE="${PD_GPUS_PER_NODE:-8}"
       PD_ROUTER_PORT="${PD_ROUTER_PORT:-21004}"
       PD_BIND_CODE="${PD_BIND_CODE:-1}"
-      # n_kv_heads=2, prefill tp <= n_kv_heads for staging acceleration
       PD_PREFILL_SPECS="${PD_PREFILL_SPECS:-tp=2,pp=4,dp=1,ep=1,max_seq_len=6144,max_reqs=288,full_warmup=True}"
       PD_DECODE_SPECS="${PD_DECODE_SPECS:-tp=1,pp=1,dp=16,ep=16,max_seq_len=6144,max_reqs=288,full_warmup=True}"
       PD_COMMON_OVERRIDES="${PD_COMMON_OVERRIDES:-dp_config.router.pd_disaggregation.kv_transfer.decode_wait_timeout_s=1200|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_max_pending=128|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_token_budget=250000|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_reserved_tokens=1024|dp_config.router.pd_disaggregation.kv_transfer.decode_max_running_tasks_per_dp=64|metrics.log_interval=10}"
+      MI_NUM_INSTANCES="${MI_NUM_INSTANCES:-4}"
+      MI_INSTANCE_DEFAULT="${MI_INSTANCE_DEFAULT:-tp=2,max_seq_len=6144,max_reqs=128,full_warmup=True}"
+      MI_LB_ALGORITHM="${MI_LB_ALGORITHM:-round_robin}"
+      MI_COMMON_OVERRIDES="${MI_COMMON_OVERRIDES:-metrics.log_interval=10}"
+      PD_BENCH_BATCH_SIZE="${PD_BENCH_BATCH_SIZE:-128}"
+      PD_BENCH_INPUT_LEN="${PD_BENCH_INPUT_LEN:-5120}"
+      PD_BENCH_OUTPUT_LEN="${PD_BENCH_OUTPUT_LEN:-1024}"
+      ;;
+
+    Qwen3-30B-A3B|qwen3-30b-a3b)
+      PD_MODEL_CONFIG="${PD_MODEL_CONFIG:-Qwen3-30B-A3B-fp8}"
+      PD_MODEL_CKPT_DIR="${PD_MODEL_CKPT_DIR:-/data/nfs/Qwen3-30B-A3B-FP8/}"
+      PD_TOKENIZER_PATH="${PD_TOKENIZER_PATH:-/data/nfs/Qwen3-30B-A3B-FP8/}"
+      PD_MODEL_SPEC="${PD_MODEL_SPEC:-}"
+      PD_NODES="${PD_NODES:-1}"
+      PD_GPUS_PER_NODE="${PD_GPUS_PER_NODE:-8}"
+      PD_ROUTER_PORT="${PD_ROUTER_PORT:-21004}"
+      PD_BIND_CODE="${PD_BIND_CODE:-1}"
+      PD_PREFILL_SPECS="${PD_PREFILL_SPECS:-tp=2,max_seq_len=6144,max_reqs=128,full_warmup=True}"
+      PD_DECODE_SPECS="${PD_DECODE_SPECS:-tp=1,pp=1,dp=4,ep=4,max_seq_len=6144,max_reqs=256,full_warmup=True}"
+      PD_COMMON_OVERRIDES="${PD_COMMON_OVERRIDES:-metrics.log_interval=10}"
+      MI_NUM_INSTANCES="${MI_NUM_INSTANCES:-4}"
+      MI_INSTANCE_DEFAULT="${MI_INSTANCE_DEFAULT:-tp=2,max_seq_len=6144,max_reqs=128,full_warmup=True}"
+      MI_LB_ALGORITHM="${MI_LB_ALGORITHM:-round_robin}"
+      MI_COMMON_OVERRIDES="${MI_COMMON_OVERRIDES:-metrics.log_interval=10}"
       PD_BENCH_BATCH_SIZE="${PD_BENCH_BATCH_SIZE:-128}"
       PD_BENCH_INPUT_LEN="${PD_BENCH_INPUT_LEN:-5120}"
       PD_BENCH_OUTPUT_LEN="${PD_BENCH_OUTPUT_LEN:-1024}"
@@ -233,7 +281,7 @@ run_benchmark_only() {
   local router_url="$1"
   local model_tag
   model_tag="$(echo "${PD_MODEL_CONFIG}" | sed 's/[^A-Za-z0-9_.-]/_/g')"
-  local output_dir="${OUTPUT_DIR_OVR:-${ROOT_DIR}/benchmark_output_pd_disagg_${model_tag}}"
+  local output_dir="${OUTPUT_DIR_OVR:-${ROOT_DIR}/benchmark_output_${DEPLOY_MODE}_${model_tag}}"
 
   if [ -d "${output_dir}" ]; then rm -rf "${output_dir}"; fi
   mkdir -p "${output_dir}"
@@ -245,7 +293,7 @@ run_benchmark_only() {
     batch_sizes=("${PD_BENCH_BATCH_SIZE}")
   fi
 
-  echo "=== PD Disagg Benchmark (local mode) ==="
+  echo "=== Benchmark (${DEPLOY_MODE}, local mode) ==="
   echo "Model:       ${PD_MODEL_CONFIG}"
   echo "Router URL:  ${router_url}"
   echo "Tokenizer:   ${PD_TOKENIZER_PATH}"
@@ -309,13 +357,20 @@ run_benchmark_only() {
 ################################################################################
 
 run_full_flow() {
+  export PD_DEPLOY_MODE="${DEPLOY_MODE}"
   export PD_MODEL_CONFIG PD_MODEL_CKPT_DIR PD_TOKENIZER_PATH PD_MODEL_SPEC
   export PD_NODES PD_GPUS_PER_NODE PD_ROUTER_PORT PD_PARTITION PD_BIND_CODE
-  export PD_PREFILL_SPECS PD_DECODE_SPECS PD_COMMON_OVERRIDES
+  export PD_COMMON_OVERRIDES
   export PD_BENCH_BATCH_SIZE PD_BENCH_INPUT_LEN PD_BENCH_OUTPUT_LEN
   [ -n "${PD_BENCH_BATCH_SIZES}" ] && export PD_BENCH_BATCH_SIZES
   export PD_BENCH_WARMUP PD_BENCH_ITERATIONS PD_DATASET_PATH
   [ -n "${OUTPUT_DIR_OVR}" ] && export PD_OUTPUT_DIR="${OUTPUT_DIR_OVR}"
+
+  if [ "${DEPLOY_MODE}" = "multi_instance" ]; then
+    export MI_NUM_INSTANCES MI_INSTANCE_DEFAULT MI_LB_ALGORITHM
+  else
+    export PD_PREFILL_SPECS PD_DECODE_SPECS
+  fi
 
   local exp_script="${SCRIPT_DIR}/test_pd_disagg_daily_benchmark.exp"
   if [ ! -f "${exp_script}" ]; then
@@ -334,6 +389,7 @@ run_full_flow() {
 while [ $# -gt 0 ]; do
   case "$1" in
     --model)            MODEL_NAME="$2"; shift 2;;
+    --mode)             DEPLOY_MODE="$2"; shift 2;;
     --router-url)       ROUTER_URL="$2"; shift 2;;
     --dry-run)          DRY_RUN=1; shift;;
     --skip-validation)  SKIP_VALIDATION=1; shift;;
@@ -352,6 +408,9 @@ while [ $# -gt 0 ]; do
     --iterations)       BENCH_ITERATIONS_OVR="$2"; shift 2;;
     --dataset-path)     DATASET_PATH_OVR="$2"; shift 2;;
     --output-dir)       OUTPUT_DIR_OVR="$2"; shift 2;;
+    --instances)        MI_INSTANCES_OVR="$2"; shift 2;;
+    --instance-default) MI_INSTANCE_DEFAULT_OVR="$2"; shift 2;;
+    --lb-algorithm)     MI_LB_ALGORITHM_OVR="$2"; shift 2;;
     --list-models)
       echo "Supported models:"
       echo "${SUPPORTED_MODELS}" | tr -s ' ' '\n' | sed 's/^/  /'
@@ -385,24 +444,39 @@ load_model_config "${MODEL_NAME}"
 [ -n "${BENCH_WARMUP_OVR}" ]      && PD_BENCH_WARMUP="${BENCH_WARMUP_OVR}"
 [ -n "${BENCH_ITERATIONS_OVR}" ]  && PD_BENCH_ITERATIONS="${BENCH_ITERATIONS_OVR}"
 [ -n "${DATASET_PATH_OVR}" ]      && PD_DATASET_PATH="${DATASET_PATH_OVR}"
+[ -n "${MI_INSTANCES_OVR}" ]         && MI_NUM_INSTANCES="${MI_INSTANCES_OVR}"
+[ -n "${MI_INSTANCE_DEFAULT_OVR}" ]  && MI_INSTANCE_DEFAULT="${MI_INSTANCE_DEFAULT_OVR}"
+[ -n "${MI_LB_ALGORITHM_OVR}" ]      && MI_LB_ALGORITHM="${MI_LB_ALGORITHM_OVR}"
+
+if [ "${DEPLOY_MODE}" = "multi_instance" ]; then
+  PD_COMMON_OVERRIDES="${MI_COMMON_OVERRIDES:-metrics.log_interval=10}"
+fi
 
 ################################################################################
 # Print config summary
 ################################################################################
 
-prefill_count="$(echo "${PD_PREFILL_SPECS}" | tr '|' '\n' | grep -c .)"
-decode_count="$(echo "${PD_DECODE_SPECS}" | tr '|' '\n' | grep -c .)"
-
 echo "========================================"
-echo " PD Disagg Daily Benchmark"
+if [ "${DEPLOY_MODE}" = "multi_instance" ]; then
+  echo " Multi-Instance Daily Benchmark"
+else
+  echo " PD Disagg Daily Benchmark"
+fi
 echo "========================================"
 echo "Model:          ${MODEL_NAME}"
 echo "Config:         ${PD_MODEL_CONFIG}"
 echo "Checkpoint:     ${PD_MODEL_CKPT_DIR}"
 echo "Tokenizer:      ${PD_TOKENIZER_PATH}"
 echo "Topology:       ${PD_NODES} nodes × ${PD_GPUS_PER_NODE} GPUs"
-echo "Prefill(s):     ${prefill_count} instance(s)"
-echo "Decode(s):      ${decode_count} instance(s)"
+if [ "${DEPLOY_MODE}" = "multi_instance" ]; then
+  echo "Instances:      ${MI_NUM_INSTANCES} (${MI_INSTANCE_DEFAULT})"
+  echo "LB algorithm:   ${MI_LB_ALGORITHM}"
+else
+  prefill_count="$(echo "${PD_PREFILL_SPECS}" | tr '|' '\n' | grep -c .)"
+  decode_count="$(echo "${PD_DECODE_SPECS}" | tr '|' '\n' | grep -c .)"
+  echo "Prefill(s):     ${prefill_count} instance(s)"
+  echo "Decode(s):      ${decode_count} instance(s)"
+fi
 if [ -n "${PD_BENCH_BATCH_SIZES}" ]; then
   echo "Bench params:   batches=${PD_BENCH_BATCH_SIZES} in=${PD_BENCH_INPUT_LEN} out=${PD_BENCH_OUTPUT_LEN}"
 else
@@ -411,7 +485,7 @@ fi
 if [ -n "${ROUTER_URL}" ]; then
   echo "Mode:           BENCHMARK-ONLY (→ ${ROUTER_URL})"
 else
-  echo "Mode:           FULL (srun launch PD + benchmark)"
+  echo "Mode:           FULL (srun launch ${DEPLOY_MODE} + benchmark)"
   echo "Partition:      ${PD_PARTITION}"
   echo "Bind code:      ${PD_BIND_CODE}"
   _sif="${APPTAINER_IMAGE:-${CHITU_COMMIT_IMAGE:+(from CHITU_COMMIT_IMAGE)}}"
@@ -424,10 +498,16 @@ if [ "${DRY_RUN}" = "1" ]; then
   if [ -n "${PD_MODEL_SPEC}" ]; then
     echo "Model spec:     ${PD_MODEL_SPEC}"
   fi
-  echo "Prefill specs:"
-  echo "${PD_PREFILL_SPECS}" | tr '|' '\n' | awk '{print "  " NR-1 ": " $0}'
-  echo "Decode specs:"
-  echo "${PD_DECODE_SPECS}" | tr '|' '\n' | awk '{print "  " NR-1 ": " $0}'
+  if [ "${DEPLOY_MODE}" = "multi_instance" ]; then
+    echo "Instance default: ${MI_INSTANCE_DEFAULT}"
+    echo "Instances:        ${MI_NUM_INSTANCES}"
+    echo "LB algorithm:     ${MI_LB_ALGORITHM}"
+  else
+    echo "Prefill specs:"
+    echo "${PD_PREFILL_SPECS}" | tr '|' '\n' | awk '{print "  " NR-1 ": " $0}'
+    echo "Decode specs:"
+    echo "${PD_DECODE_SPECS}" | tr '|' '\n' | awk '{print "  " NR-1 ": " $0}'
+  fi
   echo "Common overrides:"
   echo "${PD_COMMON_OVERRIDES}" | tr '|' '\n' | awk '{print "  " $0}'
   echo ""

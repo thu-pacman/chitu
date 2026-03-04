@@ -62,9 +62,9 @@ proc glob_has_error {pattern} {
 }
 
 proc ensure_process_alive {label} {
-    global pd_pid
-    if {[catch {exec kill -0 $pd_pid}]} {
-        puts "ERROR: $label: PD process exited (pid=$pd_pid)"
+    global svc_pid
+    if {[catch {exec kill -0 $svc_pid}]} {
+        puts "ERROR: $label: service process exited (pid=$svc_pid)"
         exit 1
     }
 }
@@ -136,7 +136,8 @@ with urllib.request.urlopen(req, timeout=10) as resp:
     return 1
 }
 
-puts "=== PD Disaggregation Daily Benchmark ==="
+set deploy_mode [env_get_or "PD_DEPLOY_MODE" "pd_disagg"]
+puts "=== Daily Benchmark (mode=$deploy_mode) ==="
 puts "Working directory: [pwd]"
 
 set model_config [env_get_or "PD_MODEL_CONFIG" "Qwen3-235B-A22B-fp8"]
@@ -154,16 +155,25 @@ set bench_output_len [env_get_or "PD_BENCH_OUTPUT_LEN" "1024"]
 set bench_warmup [env_get_or "PD_BENCH_WARMUP" "1"]
 set bench_iterations [env_get_or "PD_BENCH_ITERATIONS" "1"]
 set dataset_path [env_get_or "PD_DATASET_PATH" "/data/nfs/ShareGPT_V3_unfiltered_cleaned_split.json"]
+set common_overrides_str [env_get "PD_COMMON_OVERRIDES"]
 
-set prefill_specs_str [env_get_or "PD_PREFILL_SPECS" "tp=4,pp=2,dp=1,ep=1,max_seq_len=5200,max_reqs=384,chunk=61440,full_warmup=True|tp=4,pp=2,dp=1,ep=1,max_seq_len=5200,max_reqs=384,chunk=61440,full_warmup=True"]
-set decode_specs_str [env_get_or "PD_DECODE_SPECS" "tp=1,pp=1,dp=16,ep=16,max_seq_len=6200,max_reqs=896,full_warmup=True,infer.memory_utilization=0.99"]
-set common_overrides_str [env_get_or "PD_COMMON_OVERRIDES" "dp_config.router.pd_disaggregation.kv_transfer.decode_wait_timeout_s=1200|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_max_pending=256|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_token_budget=350000|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_reserved_tokens=512|dp_config.router.pd_disaggregation.kv_transfer.decode_max_running_tasks_per_dp=50|metrics.log_interval=10"]
+if {$deploy_mode eq "multi_instance"} {
+    set mi_num_instances [env_get_or "MI_NUM_INSTANCES" "4"]
+    set mi_instance_default [env_get_or "MI_INSTANCE_DEFAULT" "tp=2,max_seq_len=6144,max_reqs=128,full_warmup=True"]
+    set mi_instance_specs_str [env_get "MI_INSTANCE_SPECS"]
+    set mi_lb_algorithm [env_get_or "MI_LB_ALGORITHM" "round_robin"]
+    if {$common_overrides_str eq ""} { set common_overrides_str "metrics.log_interval=10" }
+} else {
+    set prefill_specs_str [env_get_or "PD_PREFILL_SPECS" "tp=4,pp=2,dp=1,ep=1,max_seq_len=5200,max_reqs=384,chunk=61440,full_warmup=True|tp=4,pp=2,dp=1,ep=1,max_seq_len=5200,max_reqs=384,chunk=61440,full_warmup=True"]
+    set decode_specs_str [env_get_or "PD_DECODE_SPECS" "tp=1,pp=1,dp=16,ep=16,max_seq_len=6200,max_reqs=896,full_warmup=True,infer.memory_utilization=0.99"]
+    if {$common_overrides_str eq ""} { set common_overrides_str "dp_config.router.pd_disaggregation.kv_transfer.decode_wait_timeout_s=1200|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_max_pending=256|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_token_budget=350000|dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_reserved_tokens=512|dp_config.router.pd_disaggregation.kv_transfer.decode_max_running_tasks_per_dp=50|metrics.log_interval=10" }
+    set prefill_specs [split $prefill_specs_str "|"]
+    set decode_specs [split $decode_specs_str "|"]
+    set prefill_count [llength $prefill_specs]
+    set decode_count [llength $decode_specs]
+}
 
-set prefill_specs [split $prefill_specs_str "|"]
-set decode_specs [split $decode_specs_str "|"]
 set common_override_list [split $common_overrides_str "|"]
-set prefill_count [llength $prefill_specs]
-set decode_count [llength $decode_specs]
 
 set partition [env_get_or "PD_PARTITION" "ci-long"]
 if {[info exists env(SLURM_PARTITION)] && $env(SLURM_PARTITION) ne ""} {
@@ -174,8 +184,12 @@ puts "Model config:   $model_config"
 puts "Checkpoint dir: $model_ckpt_dir"
 puts "Tokenizer:      $tokenizer_path"
 puts "Topology:       $nodes nodes x $gpus_per_node GPUs"
-puts "Prefill(s):     $prefill_count instance(s)"
-puts "Decode(s):      $decode_count instance(s)"
+if {$deploy_mode eq "multi_instance"} {
+    puts "Instances:      $mi_num_instances (default: $mi_instance_default)"
+} else {
+    puts "Prefill(s):     $prefill_count instance(s)"
+    puts "Decode(s):      $decode_count instance(s)"
+}
 
 # Resolve Apptainer SIF
 if {[info exists env(APPTAINER_IMAGE)] && $env(APPTAINER_IMAGE) ne ""} {
@@ -199,24 +213,34 @@ set srun_out "${log_dir}/srun.out"
 set model_tag $model_config
 regsub -all {[^A-Za-z0-9_.-]} $model_tag "_" model_tag
 
-set cmd_parts [list bash script/srun_pd_disagg_base_apptainer.sh \
-    $model_config $model_ckpt_dir $apptainer_image \
-    --nodes $nodes --gpus-per-node $gpus_per_node --router-port $router_port --partition $partition \
-    --bind-code $bind_code]
+if {$deploy_mode eq "multi_instance"} {
+    set cmd_parts [list bash script/srun_multi_instance_apptainer.sh \
+        $model_config $model_ckpt_dir $apptainer_image \
+        --nodes $nodes --gpus-per-node $gpus_per_node --router-port $router_port --partition $partition \
+        --bind-code $bind_code --load-balancer-algorithm $mi_lb_algorithm \
+        --instance-default $mi_instance_default]
+    if {$mi_instance_specs_str ne ""} {
+        foreach spec [split $mi_instance_specs_str "|"] {
+            if {$spec ne ""} { lappend cmd_parts --instance $spec }
+        }
+    } else {
+        lappend cmd_parts --instances $mi_num_instances
+    }
+} else {
+    set cmd_parts [list bash script/srun_pd_disagg_base_apptainer.sh \
+        $model_config $model_ckpt_dir $apptainer_image \
+        --nodes $nodes --gpus-per-node $gpus_per_node --router-port $router_port --partition $partition \
+        --bind-code $bind_code]
+    foreach spec $prefill_specs {
+        if {$spec ne ""} { lappend cmd_parts --prefill $spec }
+    }
+    foreach spec $decode_specs {
+        if {$spec ne ""} { lappend cmd_parts --decode $spec }
+    }
+}
 
 if {$model_spec ne ""} {
     lappend cmd_parts --model-spec $model_spec
-}
-
-foreach spec $prefill_specs {
-    if {$spec ne ""} {
-        lappend cmd_parts --prefill $spec
-    }
-}
-foreach spec $decode_specs {
-    if {$spec ne ""} {
-        lappend cmd_parts --decode $spec
-    }
 }
 foreach ovr $common_override_list {
     if {$ovr ne ""} {
@@ -225,12 +249,12 @@ foreach ovr $common_override_list {
 }
 set cmd_str [join $cmd_parts " "]
 
-puts "=== Launching PD Disaggregation via srun ==="
+puts "=== Launching ($deploy_mode) via srun ==="
 puts "SIF: $apptainer_image"
 puts "Command: $cmd_str"
 spawn bash -lc "set -e; $cmd_str > \"$srun_out\" 2>&1"
-set pd_pid [exp_pid]
-puts "PD environment launched, pid is $pd_pid"
+set svc_pid [exp_pid]
+puts "Service launched ($deploy_mode), pid=$svc_pid"
 
 puts "Waiting for srun to start (allocation or router logs)..."
 while {1} {
@@ -248,8 +272,9 @@ while {1} {
         puts "Router log exists, continuing."
         break
     }
-    if {[glob -nocomplain "${log_dir}/prefill.${model_tag}.p0.node*.log"] ne ""} {
-        puts "Prefill log exists, continuing."
+    if {[glob -nocomplain "${log_dir}/prefill.${model_tag}.p0.node*.log"] ne "" ||
+        [glob -nocomplain "${log_dir}/instance.${model_tag}.i0.node*.log"] ne ""} {
+        puts "Worker log exists, continuing."
         break
     }
     if {[glob -nocomplain "${log_dir}/decode.${model_tag}.d0.node*.log"] ne ""} {
@@ -291,30 +316,44 @@ if {[catch {exec nc -z $router_ip $router_port}]} {
 
 set router_log "${log_dir}/router.${model_tag}.log"
 set router_ready_str "Uvicorn running on http://0.0.0.0:${router_port}"
-set worker_ready_str "Entering PD Worker Loop"
 
 puts "Waiting for Router readiness..."
 wait_for_pattern "Router" $router_log $router_ready_str 1800
 
-for {set i 0} {$i < $prefill_count} {incr i} {
-    set label "Prefill P${i}"
-    set pattern "${log_dir}/prefill.${model_tag}.p${i}.node*.log"
-    puts "Waiting for ${label} readiness..."
-    wait_for_pattern $label $pattern $worker_ready_str 1800
-}
-
-for {set i 0} {$i < $decode_count} {incr i} {
-    set label "Decode D${i}"
-    set pattern "${log_dir}/decode.${model_tag}.d${i}.node*.log"
-    puts "Waiting for ${label} readiness..."
-    wait_for_pattern $label $pattern $worker_ready_str 1800
+if {$deploy_mode eq "multi_instance"} {
+    set worker_ready_str "Starting to process requests"
+    if {$mi_instance_specs_str ne ""} {
+        set _inst_count [llength [split $mi_instance_specs_str "|"]]
+    } else {
+        set _inst_count $mi_num_instances
+    }
+    for {set i 0} {$i < $_inst_count} {incr i} {
+        set label "Instance I${i}"
+        set pattern "${log_dir}/instance.${model_tag}.i${i}.node*.log"
+        puts "Waiting for ${label} readiness..."
+        wait_for_pattern $label $pattern $worker_ready_str 3600
+    }
+} else {
+    set worker_ready_str "Entering PD Worker Loop"
+    for {set i 0} {$i < $prefill_count} {incr i} {
+        set label "Prefill P${i}"
+        set pattern "${log_dir}/prefill.${model_tag}.p${i}.node*.log"
+        puts "Waiting for ${label} readiness..."
+        wait_for_pattern $label $pattern $worker_ready_str 1800
+    }
+    for {set i 0} {$i < $decode_count} {incr i} {
+        set label "Decode D${i}"
+        set pattern "${log_dir}/decode.${model_tag}.d${i}.node*.log"
+        puts "Waiting for ${label} readiness..."
+        wait_for_pattern $label $pattern $worker_ready_str 1800
+    }
 }
 
 set pd_output_dir [env_get "PD_OUTPUT_DIR"]
 if {$pd_output_dir ne ""} {
     set bench_output_dir $pd_output_dir
 } else {
-    set bench_output_dir "[pwd]/benchmark_output_pd_disagg_${model_tag}"
+    set bench_output_dir "[pwd]/benchmark_output_${deploy_mode}_${model_tag}"
 }
 if {[file exists $bench_output_dir]} {
     file delete -force $bench_output_dir
@@ -347,26 +386,44 @@ proc extract_spec_field {spec field} {
     return ""
 }
 
-set first_decode [lindex $decode_specs 0]
-set d_tp [extract_spec_field $first_decode "tp"]
-set d_pp [extract_spec_field $first_decode "pp"]
-set d_dp [extract_spec_field $first_decode "dp"]
-set d_ep [extract_spec_field $first_decode "ep"]
-if {$d_tp eq ""} { set d_tp 1 }
-if {$d_pp eq ""} { set d_pp 1 }
-if {$d_dp eq ""} { set d_dp 1 }
-if {$d_ep eq ""} { set d_ep 1 }
+if {$deploy_mode eq "multi_instance"} {
+    set mi_spec_for_fields $mi_instance_default
+    set i_tp [extract_spec_field $mi_spec_for_fields "tp"]
+    set i_pp [extract_spec_field $mi_spec_for_fields "pp"]
+    set i_dp [extract_spec_field $mi_spec_for_fields "dp"]
+    set i_ep [extract_spec_field $mi_spec_for_fields "ep"]
+    if {$i_tp eq ""} { set i_tp 1 }
+    if {$i_pp eq ""} { set i_pp 1 }
+    if {$i_dp eq ""} { set i_dp 1 }
+    if {$i_ep eq ""} { set i_ep 1 }
+    set d_tp $i_tp; set d_pp $i_pp; set d_dp $i_dp; set d_ep $i_ep
 
-set first_prefill [lindex $prefill_specs 0]
-set p_tp [extract_spec_field $first_prefill "tp"]
-set p_pp [extract_spec_field $first_prefill "pp"]
-if {$p_tp eq ""} { set p_tp 1 }
-if {$p_pp eq ""} { set p_pp 1 }
+    set model_info "Model: $model_config\n"
+    append model_info "Mode: Multi-Instance (unified)\n"
+    append model_info "Instances: ${_inst_count}x (TP${i_tp}-PP${i_pp})\n"
+    append model_info "LB: $mi_lb_algorithm\n"
+} else {
+    set first_decode [lindex $decode_specs 0]
+    set d_tp [extract_spec_field $first_decode "tp"]
+    set d_pp [extract_spec_field $first_decode "pp"]
+    set d_dp [extract_spec_field $first_decode "dp"]
+    set d_ep [extract_spec_field $first_decode "ep"]
+    if {$d_tp eq ""} { set d_tp 1 }
+    if {$d_pp eq ""} { set d_pp 1 }
+    if {$d_dp eq ""} { set d_dp 1 }
+    if {$d_ep eq ""} { set d_ep 1 }
 
-set model_info "Model: $model_config\n"
-append model_info "Mode: PD Disaggregation\n"
-append model_info "Prefill: ${prefill_count}x (TP${p_tp}-PP${p_pp})\n"
-append model_info "Decode: ${decode_count}x (TP${d_tp}-PP${d_pp}-DP${d_dp}-EP${d_ep})\n"
+    set first_prefill [lindex $prefill_specs 0]
+    set p_tp [extract_spec_field $first_prefill "tp"]
+    set p_pp [extract_spec_field $first_prefill "pp"]
+    if {$p_tp eq ""} { set p_tp 1 }
+    if {$p_pp eq ""} { set p_pp 1 }
+
+    set model_info "Model: $model_config\n"
+    append model_info "Mode: PD Disaggregation\n"
+    append model_info "Prefill: ${prefill_count}x (TP${p_tp}-PP${p_pp})\n"
+    append model_info "Decode: ${decode_count}x (TP${d_tp}-PP${d_pp}-DP${d_dp}-EP${d_ep})\n"
+}
 
 set column_format "%-12s %-24s %-14s %-11s %-11s %s"
 set benchmark_records [format $column_format "Batch Size" "Benchmark duration (s)" "TPS (tok/s)" "TTFT (ms)" "TPOT (ms)" "Total Throughput (tok/s)"]
@@ -464,7 +521,15 @@ if {$no_notify eq "1"} {
     set send_notification 0
 }
 
-set cmd_args_summary "PD Disagg: prefill=${prefill_count}x(TP${p_tp}-PP${p_pp}), decode=${decode_count}x(TP${d_tp}-PP${d_pp}-DP${d_dp}-EP${d_ep}), nodes=${nodes}, gpus_per_node=${gpus_per_node}"
+if {$deploy_mode eq "multi_instance"} {
+    set cmd_args_summary "Multi-Instance: ${_inst_count}x(TP${i_tp}-PP${i_pp}), LB=${mi_lb_algorithm}, nodes=${nodes}, gpus_per_node=${gpus_per_node}"
+    set parallel_scheme "MI:${_inst_count}x(TP${i_tp}-PP${i_pp})"
+    set deploy_mode_label "MULTI_INSTANCE"
+} else {
+    set cmd_args_summary "PD Disagg: prefill=${prefill_count}x(TP${p_tp}-PP${p_pp}), decode=${decode_count}x(TP${d_tp}-PP${d_pp}-DP${d_dp}-EP${d_ep}), nodes=${nodes}, gpus_per_node=${gpus_per_node}"
+    set parallel_scheme "P:${prefill_count}x(TP${p_tp}-PP${p_pp})+D:${decode_count}x(TP${d_tp}-PP${d_pp}-DP${d_dp}-EP${d_ep})"
+    set deploy_mode_label "PD_DISAGG"
+}
 
 if {$send_notification && [file isdirectory $recipes_dir]} {
     puts "=== Writing records to Feishu bitable ==="
@@ -480,8 +545,8 @@ if {$send_notification && [file isdirectory $recipes_dir]} {
             --env INPUT_LEN=$bench_input_len \
             --env OUTPUT_LEN=$bench_output_len \
             --env CMD_ARGS=$cmd_args_summary \
-            --env PARALLEL_SCHEME=P:${prefill_count}x(TP${p_tp}-PP${p_pp})+D:${decode_count}x(TP${d_tp}-PP${d_pp}-DP${d_dp}-EP${d_ep}) \
-            --env DEPLOY_MODE=PD_DISAGG \
+            --env PARALLEL_SCHEME=$parallel_scheme \
+            --env DEPLOY_MODE=$deploy_mode_label \
             $apptainer_image \
             bash -lc "cd $recipes_dir && python -m recipes.tools.record_daily_bench" 2>@1]
     } record_err]} {
@@ -600,7 +665,11 @@ if {$feishu_webhook eq ""} {
     set feishu_webhook [env_get "FEISHU_WEBHOOK"]
 }
 
-set notify_text "PD Disagg Daily Benchmark: PASS\nmodel=$model_config\nnodes=$nodes gpus_per_node=$gpus_per_node prefill=$prefill_count decode=$decode_count\nrouter=$router_ip:$router_port\nbatch_sizes=[join $batch_sizes ,]\nresults=$json_path"
+if {$deploy_mode eq "multi_instance"} {
+    set notify_text "Multi-Instance Daily Benchmark: PASS\nmodel=$model_config\nnodes=$nodes gpus_per_node=$gpus_per_node instances=$_inst_count LB=$mi_lb_algorithm\nrouter=$router_ip:$router_port\nbatch_sizes=[join $batch_sizes ,]\nresults=$json_path"
+} else {
+    set notify_text "PD Disagg Daily Benchmark: PASS\nmodel=$model_config\nnodes=$nodes gpus_per_node=$gpus_per_node prefill=$prefill_count decode=$decode_count\nrouter=$router_ip:$router_port\nbatch_sizes=[join $batch_sizes ,]\nresults=$json_path"
+}
 set job_url [env_get "CI_JOB_URL"]
 if {$job_url ne ""} {
     append notify_text "\njob=$job_url"
@@ -619,8 +688,8 @@ if {$feishu_webhook ne ""} {
 puts "Testing done. You may see some killing messages following, which is expected."
 puts "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 
-puts "Cleaning up PD processes..."
-catch {exec kill -TERM $pd_pid}
+puts "Cleaning up processes..."
+catch {exec kill -TERM $svc_pid}
 sleep 5
-puts "=== PD Disaggregation Daily Benchmark Completed ==="
+puts "=== Daily Benchmark Completed (mode=$deploy_mode) ==="
 exit 0

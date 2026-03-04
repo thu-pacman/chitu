@@ -451,7 +451,7 @@ class MetadataSerializer:
             frequency_penalty=sample_params_dict.get("frequency_penalty"),
         )
         tokens = task_data.get("tokens")
-        grammar_str = task_data.get("grammar_str")
+        grammar_str = task_data.get("grammar_str", "")
         prompt_len = task_data.get("prompt_len")
         pd_prefill_engine_rank = task_data.get("pd_prefill_engine_rank")
         task = Task(

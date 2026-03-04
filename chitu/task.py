@@ -408,7 +408,9 @@ class Task(ConstraintDecodeTask):
         )
         self.dp_rank: Optional[int] = None
         self.prefix_tokens = (
-            prefix_tokens if prefix_tokens is not None else req.prompt_tokens
+            prefix_tokens
+            if prefix_tokens is not None
+            else (req.prompt_tokens if req is not None else [])
         )
         self.prompt_len = (
             prompt_len if prompt_len is not None else len(self.prefix_tokens)
@@ -516,6 +518,8 @@ class Task(ConstraintDecodeTask):
 
     def update_decode_status(self):
         if self.stopped:
+            return
+        if self.req is None:
             return
         if (
             self.stop_with_eos
