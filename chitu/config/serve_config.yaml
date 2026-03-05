@@ -369,9 +369,34 @@ metrics:
   prometheus_data_dir: "prometheus_data" # prometheus data stoarge path, which is a folder
   prometheus_scrape_interval: 1 # prometheus server scrapes PrometheusMetricsCollectors every ${prometheus_scrape_interval} seconds.
   log_interval: 10
+
+# Debugging options. These options have negative effect on performance and correctness, so please
+# don't set them in production.
 debug:
+  # Skip model loading and run on uninitialized weights. You will NOT get correct output with this
+  # enabled. This is useful for quick debugging.
+  #
+  # Acceptable values:
+  # - False: Normal behavior.
+  # - True: Skip model loading.
   skip_model_load: False
+
+  # Force MoE gate to chose some balanced experts. You will NOT get correct output with this enabled.
+  # This is useful for analyze the performance inpact of MoE load inbalance, by comparing performance
+  # with this option on and off.
+  #
+  # Acceptable values:
+  # - False: Normal behavior.
+  # - True: Force balance.
   force_moe_balance: False
+
+  # Save trace to a directory. The trace can be replayed with `benchmarks/benchmark_serving.py` with
+  # additional `--dataset chitu-trace --dataset-path <path/to/trace>` arguments.
+  #
+  # Acceptable values:
+  # - null: No trace will be saved.
+  # - /path/to/directory: Save trace to this directory.
+  save_trace_dir: null
 
 # The data type for 16-bit floating point data type. This field is orthogonal to quantization.
 #

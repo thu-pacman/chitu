@@ -783,6 +783,7 @@ async def handle_messages_request(
             tools=tools,
             tool_choice=tool_choice,
             parallel_tool_calls=True,
+            save_trace_dir=args.debug.save_trace_dir,
         )
     except ValueError:
         return anthropic_error(
@@ -790,10 +791,7 @@ async def handle_messages_request(
         )
 
     task = Task(
-        user_req.request_id,
-        user_req,
-        stop_with_eos=True,
-        priority=task_priority,
+        user_req.request_id, user_req, stop_with_eos=True, priority=task_priority
     )
     TaskPool.enqueue(task)
 
@@ -928,6 +926,7 @@ async def handle_completion_request(
             top_k=top_k,
             frequency_penalty=frequency_penalty,
             enable_reasoning=False,
+            save_trace_dir=args.debug.save_trace_dir,
         )
     except ValueError:
         return anthropic_error(
@@ -935,10 +934,7 @@ async def handle_completion_request(
         )
 
     task = Task(
-        user_req.request_id,
-        user_req,
-        stop_with_eos=True,
-        priority=task_priority,
+        user_req.request_id, user_req, stop_with_eos=True, priority=task_priority
     )
     TaskPool.enqueue(task)
 

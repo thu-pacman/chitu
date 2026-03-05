@@ -237,6 +237,7 @@ async def create_chat_completion(
             frequency_penalty=req.frequency_penalty,
             chat_template_kwargs=chat_template_kwargs,
             enable_reasoning=enable_thinking,
+            save_trace_dir=args.debug.save_trace_dir,
         )
         response = AsyncResponse(user_req)
         task = Task(

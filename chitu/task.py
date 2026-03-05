@@ -11,6 +11,7 @@ import time
 import weakref
 import functools
 from collections import deque
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -109,7 +110,6 @@ class RouterRequest:
 
         # response related
         self.output = ""
-        self.completed = asyncio.Event()
         self.async_stream = (
             None  # Will be set by Token Router, Router doesn't need stream processing
         )
@@ -185,6 +185,7 @@ class UserRequest:
         tools: list[dict] = [],
         tool_choice: ToolChoice = "auto",
         parallel_tool_calls: bool = True,
+        save_trace_dir: Optional[str] = None,
     ):
         # input related
         self.message = message
@@ -218,7 +219,6 @@ class UserRequest:
 
         # response related
         self.output = ""
-        self.completed = asyncio.Event()
         self.async_stream = AsyncDataStream(enable_reasoning=enable_reasoning)
         self.finish_reason = None
         self.max_new_tokens = max_new_tokens
@@ -234,6 +234,7 @@ class UserRequest:
         self._test_standard_it = 0
         self.logprobs = logprobs
         self.top_logprobs = 0 if logprobs and not top_logprobs else top_logprobs
+        self.save_trace_dir = save_trace_dir
 
         # performance metrics
         self.timestamp: str = datetime.now().strftime("%H:%M:%S:%f")
@@ -275,12 +276,14 @@ class UserRequest:
             self.finished = True
 
     def finish(self):
+        if self.finished:
+            return
         self.finished = True
         self.output = repr("".join(self.async_stream.seqs))
         self.async_stream.send_stop_signal()
-        self.completed.set()
         self.completion_time = time.monotonic()
         TaskLoad.reduce(len(self.prompt_tokens) + self.num_output_tokens)
+        self.save_trace_to_json()
 
     def notify_server_data_added_from_server_thread(self):
         self.async_stream.notify_server_from_server_thread()
@@ -301,14 +304,21 @@ class UserRequest:
         # logger.warning(f"add token {token}")
 
     def save_trace_to_json(self):
+        if self.save_trace_dir is None:
+            return
+
         prefill_duration = self.prefill_end_time - self.start_time
         all_duration = self.completion_time - self.start_time
         tps = self.async_stream.tokens_len / all_duration
 
-        path = Path.cwd() / f"log/trace_{datetime.now().strftime('%Y_%m_%d')}.jsonl"
-        os.makedirs(os.path.dirname(path), exist_ok=True)
         trace_data = {
             "id": self.request_id,
+            "message": self.message,
+            "sample_params": dataclasses.asdict(self.sample_params),
+            "chat_template_kwargs": self.chat_template_kwargs,
+            "tools": self.tools,
+            "grammar_str": self.grammar_str,
+            "max_new_tokens": self.max_new_tokens,
             "timestamp": self.timestamp,
             "input_length": self.prompt_len,
             "output_length": self.async_stream.tokens_len,
@@ -316,8 +326,12 @@ class UserRequest:
             "all_duration": round(all_duration, 6),
             "tps": round(tps, 6),
         }
-        logger.debug(f"trace data: {trace_data}")
         trace_str = json.dumps(trace_data)
+
+        os.makedirs(self.save_trace_dir, exist_ok=True)
+        path = (
+            f"{self.save_trace_dir}/trace_{datetime.now().strftime('%Y_%m_%d')}.jsonl"
+        )
         with open(path, "a") as file:
             file.write(trace_str + "\n")
 
