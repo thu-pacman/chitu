@@ -2,6 +2,9 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+# We use CUDAExtension instead of CMake for native sources, because many of the non-NVIDIA GPUs have
+# their custom CUDAExtension, but not their custom CMake support.
+
 import os
 import glob
 
@@ -28,8 +31,14 @@ import csrc.setup_build as operators
 from get_requires import install_requires, extras_require
 
 
-# We use CUDAExtension instead of CMake for native sources, because many of the non-NVIDIA GPUs have
-# their custom CUDAExtension, but not their custom CMake support.
+# In case of OOM, volunteerly make OOM killer more likely to kill this process, and less
+# likely to hang the system.
+try:
+    pid = os.getpid()
+    with open(f"/proc/{pid}/oom_score_adj", "w") as f:
+        f.write("1000")
+except Exception as e:
+    print(f"Unable to volunteer to OOM killer: {e}")
 
 
 if (
