@@ -263,10 +263,11 @@ async def create_chat_completion(
                 }
             )
             return JSONResponse(response_dict)
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("request handle exception")
+    except HTTPException as e:
+        logger.info(f"Rejected illegal request {raw_request}, returning {e}")
+        raise e
+    except Exception as e:
+        logger.exception(f"Error processing request {raw_request}, got {e}")
         with suppress(Exception):
             del user_req
         with suppress(Exception):

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from typing import Any, Awaitable, Callable, Optional, Literal, Annotated
+from logging import getLogger
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -22,6 +23,9 @@ from chitu.tool_call import (
     ToolChoiceFunction,
 )
 from chitu.utils import gen_req_id
+
+
+logger = getLogger(__name__)
 
 
 class AnthropicThinking(BaseModel):
@@ -1007,16 +1011,23 @@ def create_router(
         authorization: Annotated[Optional[str], Header(alias="Authorization")] = None,
         x_api_key: Annotated[Optional[str], Header(alias="x-api-key")] = None,
     ):
-        return await handle_messages_request(
-            raw_request=raw_request,
-            authorization=authorization,
-            x_api_key=x_api_key,
-            server_status=get_server_status(),
-            dp_enabled=get_global_args().dp_config.enabled,
-            dp_service_started=get_dp_service_started(),
-            dp_register_and_submit=_dp_register_and_submit,
-            priority_for_api_key=priority_for_api_key,
-        )
+        try:
+            return await handle_messages_request(
+                raw_request=raw_request,
+                authorization=authorization,
+                x_api_key=x_api_key,
+                server_status=get_server_status(),
+                dp_enabled=get_global_args().dp_config.enabled,
+                dp_service_started=get_dp_service_started(),
+                dp_register_and_submit=_dp_register_and_submit,
+                priority_for_api_key=priority_for_api_key,
+            )
+        except HTTPException as e:
+            logger.info(f"Rejected illegal request {raw_request}, returning {e}")
+            raise e
+        except Exception as e:
+            logger.exception(f"Error processing request {raw_request}, got {e}")
+            raise HTTPException(status_code=500, detail="internal server error")
 
     @router.post("/v1/complete")
     async def v1_complete(
@@ -1024,15 +1035,22 @@ def create_router(
         authorization: Annotated[Optional[str], Header(alias="Authorization")] = None,
         x_api_key: Annotated[Optional[str], Header(alias="x-api-key")] = None,
     ):
-        return await handle_completion_request(
-            raw_request=raw_request,
-            authorization=authorization,
-            x_api_key=x_api_key,
-            server_status=get_server_status(),
-            dp_enabled=get_global_args().dp_config.enabled,
-            dp_service_started=get_dp_service_started(),
-            dp_register_and_submit=_dp_register_and_submit,
-            priority_for_api_key=priority_for_api_key,
-        )
+        try:
+            return await handle_completion_request(
+                raw_request=raw_request,
+                authorization=authorization,
+                x_api_key=x_api_key,
+                server_status=get_server_status(),
+                dp_enabled=get_global_args().dp_config.enabled,
+                dp_service_started=get_dp_service_started(),
+                dp_register_and_submit=_dp_register_and_submit,
+                priority_for_api_key=priority_for_api_key,
+            )
+        except HTTPException as e:
+            logger.info(f"Rejected illegal request {raw_request}, returning {e}")
+            raise e
+        except Exception as e:
+            logger.exception(f"Error processing request {raw_request}, got {e}")
+            raise HTTPException(status_code=500, detail="internal server error")
 
     return router

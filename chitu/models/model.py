@@ -149,10 +149,10 @@ class RMSNorm(nn.Module):
 
 
 class RMSNormBias(RMSNorm):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__(dim=dim, eps=eps)
+    def __init__(self, dim: int, eps: float = 1e-6, dtype=None, bias_dtype=None):
+        super().__init__(dim=dim, eps=eps, dtype=dtype)
         self.bias = nn.Parameter(
-            torch.zeros(self.dim, dtype=torch.get_default_dtype()), requires_grad=False
+            torch.zeros(self.dim, dtype=bias_dtype), requires_grad=False
         )
 
     def forward(
@@ -1955,7 +1955,3 @@ def get_linear_layout_contig_y(
         return QuantizationRegistry.get_quantized_linear_class_from_global_args(
             quant_kwargs=quant_kwargs, checkpoint_prefix=checkpoint_prefix
         )
-
-
-def get_rmsnorm(dim: int, *, use_bias: bool, eps: float = 1e-6) -> RMSNorm:
-    return RMSNormBias(dim, eps=eps) if use_bias else RMSNorm(dim, eps=eps)
