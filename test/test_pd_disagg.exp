@@ -134,7 +134,7 @@ set decode_spec "tp=1,pp=1,dp=4,ep=4,max_seq_len=6144,max_reqs=256,full_warmup=F
 
 set cmd_parts [list bash script/srun_pd_disagg_base_apptainer.sh \
     $model_config $model_ckpt_dir $apptainer_image \
-    --nodes 2 --gpus-per-node 8 --router-port $router_port --partition ci \
+    --nodes 2 --gpus-per-node 4 --router-port $router_port --partition ci \
     --prefill $prefill_spec \
     --prefill $prefill_spec \
     --decode $decode_spec \
