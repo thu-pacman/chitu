@@ -13,7 +13,7 @@ from xgrammar.structural_tag import (
     TagFormat,
     QwenXMLParameterFormat,
 )
-from .types import (
+from .type_def import (
     ChoiceToolCall,
     ChoiceToolCallFunction,
 )

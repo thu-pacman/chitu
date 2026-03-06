@@ -3,14 +3,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .abstract_parser import AbstractToolParser
-from .types import ChoiceDelta
+from .type_def import ChoiceDelta
 from .dummy_parser import DummyToolParser
-from typing import Any, AsyncIterable, AsyncGenerator
+from typing import Any, AsyncIterable, AsyncGenerator, TypeVar
 
 _registere_parsers: dict[str, type[AbstractToolParser]] = {}
 
+T = TypeVar("T")
 
-def register(cls: type[AbstractToolParser]):
+
+def register(cls: T) -> T:
+    assert issubclass(cls, AbstractToolParser)
     _registere_parsers[cls.__name__] = cls
     return cls
 

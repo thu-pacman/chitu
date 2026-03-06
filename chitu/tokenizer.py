@@ -317,8 +317,10 @@ class TokenizerHF:
         path: str,
         trust_remote_code: bool = False,
         force_full_seq_decode: bool = False,
+        skip_special_tokens: bool = True,
     ):
         self.force_full_seq_decode = force_full_seq_decode
+        self.skip_special_tokens = skip_special_tokens
         self.decode_cache: dict[tuple[int, bool], str] = {}
         self.model = AutoTokenizer.from_pretrained(
             path, trust_remote_code=trust_remote_code
@@ -357,7 +359,9 @@ class TokenizerHF:
             t.append(self.eos_id)
         return t
 
-    def decode(self, t: Sequence[int], skip_special_tokens=True) -> str:
+    def decode(self, t: Sequence[int], skip_special_tokens=None) -> str:
+        if skip_special_tokens is None:
+            skip_special_tokens = self.skip_special_tokens
         if len(t) == 1 and not self.force_full_seq_decode:
             token_id = t[0]
             key = (token_id, skip_special_tokens)

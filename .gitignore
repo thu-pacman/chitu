@@ -35,9 +35,10 @@ MANIFEST
 *.manifest
 *.spec
 
-# Installer logs
+# Logs
 pip-log.txt
 pip-delete-this-directory.txt
+/prometheus*
 
 # Unit test / coverage reports
 htmlcov/

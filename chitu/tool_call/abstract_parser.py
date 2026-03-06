@@ -6,7 +6,7 @@ from xgrammar import Grammar
 from abc import ABC, abstractmethod
 from typing import Any, AsyncIterable
 
-from .types import ToolCallParams, ChoiceToolCall, ChoiceDelta
+from .type_def import ToolCallParams, ChoiceToolCall, ChoiceDelta
 
 
 class AbstractToolParser(ABC):

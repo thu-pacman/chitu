@@ -16,7 +16,7 @@ from chitu.backend import Backend
 from chitu.global_vars import get_global_args
 from chitu.task import Task, TaskPool, UserRequest
 from chitu.tool_call import get_tool_parser, parse_stream_by_parser
-from chitu.tool_call.types import (
+from chitu.tool_call import (
     ChoiceToolCall,
     ToolChoiceNamedTool,
     ToolChoiceFunction,
@@ -241,19 +241,6 @@ def map_anthropic_tool_choice(tool_choice: Optional[dict | str]):
     return "auto"
 
 
-def format_tool_call_text(name: str, arguments: str) -> str:
-    parser_cls = get_active_tool_parser()
-    if all(
-        hasattr(parser_cls, attr)
-        for attr in ("tool_template", "tool_begin_tag", "tool_end_tag")
-    ):
-        tool_template = parser_cls.tool_template.replace("{name}", name).replace(
-            "{arguments}", arguments
-        )
-        return f"{parser_cls.tool_begin_tag}{tool_template}{parser_cls.tool_end_tag}"
-    return f'{{"name": "{name}", "arguments": {arguments}}}'
-
-
 def tool_calls_to_anthropic_blocks(tool_calls: list[ChoiceToolCall]) -> list[dict]:
     blocks: list[dict] = []
     for tool_call in tool_calls:
@@ -280,11 +267,17 @@ def anthropic_message_to_internal(message: AnthropicMessage) -> list[dict]:
 
     results: list[dict] = []
     text_parts: list[str] = []
+    tool_calls: list[dict] = []
 
-    def flush_text():
-        if text_parts:
-            results.append({"role": message.role, "content": "".join(text_parts)})
-            text_parts.clear()
+    def flush_message():
+        if not text_parts and not tool_calls:
+            return
+        msg = {"role": message.role, "content": "".join(text_parts)}
+        if tool_calls:
+            msg["tool_calls"] = list(tool_calls)
+        results.append(msg)
+        text_parts.clear()
+        tool_calls.clear()
 
     for item in message.content:
         if isinstance(item, str):
@@ -301,13 +294,23 @@ def anthropic_message_to_internal(message: AnthropicMessage) -> list[dict]:
             continue
         if t == "tool_use":
             name = str(item.get("name", ""))
+            if not name:
+                raise ValueError("tool_use.name is required")
             input_obj = item.get("input", {})
             arguments = json.dumps(input_obj, ensure_ascii=False)
-            text_parts.append(format_tool_call_text(name, arguments))
+            tool_calls.append(
+                {
+                    "id": str(item.get("id") or gen_req_id()),
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+            )
             continue
         if t == "tool_result":
-            flush_text()
+            flush_message()
             tool_use_id = item.get("tool_use_id") or item.get("tool_call_id")
+            if not tool_use_id:
+                raise ValueError("tool_result.tool_use_id is required")
             content = item.get("content", "")
             tool_text = anthropic_content_to_text(content)
             results.append(
@@ -316,7 +319,7 @@ def anthropic_message_to_internal(message: AnthropicMessage) -> list[dict]:
             continue
         raise ValueError(f"Unsupported content block type: {t}")
 
-    flush_text()
+    flush_message()
     return results
 
 

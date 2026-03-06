@@ -208,10 +208,11 @@ class UserRequest:
         self.chat_template_kwargs = chat_template_kwargs
 
         # constraint decoding related
-        self.tools = tools
+        self.tools = []
         self.grammar = None
         self.grammar_str = ""
-        if tools:
+        if tools and tool_choice != "none":
+            self.tools = tools
             self.chat_template_kwargs["tools"] = tools
             grammar = Backend.tool_parser.build_grammar(
                 ToolCallParams(
