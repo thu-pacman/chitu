@@ -41,12 +41,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
 )
 from chitu.distributed.tcp_ip import get_port_from_zmq_socket
 from chitu.dp_token_sender import start_dp_token_manager
-from chitu.hooks import (
-    DPTokenSink,
-    LocalTokenSink,
-    MooncakeKVTransferHook,
-    NoopKVTransferHook,
-)
+from chitu.hooks import DPTokenSink, MooncakeKVTransferHook, NoopKVTransferHook
 from chitu.serve.common import start_worker
 from chitu.serve.event_loop import get_server_event_loop
 

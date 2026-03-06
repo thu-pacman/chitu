@@ -115,6 +115,7 @@ class RouterRequest:
         )
         self.finish_reason = None
         self.max_new_tokens = max_new_tokens
+        self.finished = False
 
         # test information related
         self._test_flag = False
@@ -133,6 +134,13 @@ class RouterRequest:
 
         # No tokenization or length checking in Router
         self._prompt_len = 0  # Will be set later by Enhanced Scheduler
+
+    def finish(self):
+        if self.finished:
+            return
+        self.finished = True
+        self.output = repr("".join(self.async_stream.seqs))
+        self.async_stream.send_stop_signal()
 
     @property
     def prompt_len(self):
@@ -273,7 +281,7 @@ class UserRequest:
 
         self.num_output_tokens += len(value)
         if self.will_finish:
-            self.finished = True
+            self.finish()
 
     def finish(self):
         if self.finished:
@@ -543,15 +551,17 @@ class Task(ConstraintDecodeTask):
                 or (set(self.mtp_token_list) & Backend.tokenizer.stop_tokens)
             )
         ):
-            self.req.finish_reason = "stop"
             self.stopped = True
+            self.req.finish_reason = "stop"
+            self.req.finish()
         elif (
             self.num_new_tokens
             + (self.num_new_tokens_single_step if self.has_unsync_new_token else 0)
             > self.req.max_new_tokens - get_global_args().infer.mtp_size
         ):
-            self.req.finish_reason = "length"
             self.stopped = True
+            self.req.finish_reason = "length"
+            self.req.will_finish = True
         if self.stopped and not self.waiting:
             pd_cfg = getattr(
                 getattr(get_global_args(), "dp_config", None), "router", None

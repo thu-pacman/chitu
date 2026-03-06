@@ -60,7 +60,7 @@ if [[ "$3" != "--node" ]]; then
         NUM_MEMS=$((NUM_MEMS < MAX_MEM ? NUM_MEMS : MAX_MEM))
     fi
 
-    PARAMS="--job-name $JOB_NAME --partition long --nodes $NODES --ntasks-per-node $NTASKS_PER_NODE --cpus-per-task $NUM_CPUS --mem $NUM_MEMS"
+    PARAMS="--job-name $JOB_NAME --nodes $NODES --ntasks-per-node $NTASKS_PER_NODE --cpus-per-task $NUM_CPUS --mem $NUM_MEMS"
     if sinfo --noheader -o "%G" | grep -q "gpu:"; then
         echo "Detected GRES gpu in Slurm, allocating resources with --gres=gpu:$NUM_GPUS"
         PARAMS="$PARAMS --gres=gpu:$NUM_GPUS"
