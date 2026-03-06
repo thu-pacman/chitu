@@ -45,9 +45,11 @@ def append_to_paged_kv_cache_triton(
         assert delta_seq_ids.shape[0] == num_tokens
 
     tot_len_of_other_dims = this_kv.numel() // num_tokens
-    assert (
-        kv_cache.numel() // (kv_cache.shape[0] * kv_cache.shape[1])
-        == tot_len_of_other_dims
+    kv_cache_other_dims = kv_cache.numel() // (kv_cache.shape[0] * kv_cache.shape[1])
+    assert kv_cache_other_dims == tot_len_of_other_dims, (
+        f"KV cache per-token dims ({kv_cache_other_dims}) != this_kv per-token dims ({tot_len_of_other_dims}). "
+        f"kv_cache.shape={kv_cache.shape}, this_kv.shape={this_kv.shape}, num_tokens={num_tokens}. "
+        f"Ensure model output (num_kv_heads*head_dim) matches cache_manager shape_per_token."
     )
 
     block_size = 512  # GPU block size, not page size

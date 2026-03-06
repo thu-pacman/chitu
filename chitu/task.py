@@ -413,6 +413,7 @@ class Task(ConstraintDecodeTask):
         priority: int = 1,
         stop_with_eos: bool = True,
         infermode: str = "autoregressive",
+        block_length: int = 32,
     ):
         logger.debug(f"Create Task {task_id} with priority {priority}")
 
@@ -440,6 +441,9 @@ class Task(ConstraintDecodeTask):
 
         ## for DLLM task
         self.decoding_start = 0
+        # DLLM decode: payload is the full block (not single token). Set when transitioning prefill->decode.
+        self.next_block: Optional[list[int]] = None
+        self.block_length = block_length
 
         # Request
         self.req = req
@@ -783,7 +787,18 @@ class Task(ConstraintDecodeTask):
 
             if self.req is not None:
                 self.req.prefill_end_time = time.monotonic()
-
+            if self.task_type == TaskType.DecodeDLLM:
+                self.next_block = self.prefix_tokens[self.decoding_start : self.decoding_start + self.block_length]
+                # 如果 next_block 不足 block_length，则用 mask_id 补足
+                if self.next_block is not None and len(self.next_block) < self.block_length:
+                    pad_len = self.block_length - len(self.next_block)
+                    decoder = getattr(Backend.model, "decoder", None)
+                    if decoder is not None:
+                        mask_id = decoder.mask_id
+                    else:
+                        mask_id = 0  # Fallback, ideally should never hit
+                    self.next_block = self.next_block + [mask_id] * pad_len
+                print(f"{self.task_id=} {self.next_block=}")
             logger.debug(
                 f"[task.consume] task={self.task_id} prefill->decode "
                 f"consumed={self.consumed_req_tokens}/{self.prefix_tokens_len}"

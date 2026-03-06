@@ -408,6 +408,21 @@ class KVCacheManagerBase:
     def finalize_cache_single_decode(self, req_ids: list[str]):
         self.curr_req_ids = None
 
+    def prepare_cache_decode_dllm(
+        self, req_ids: list[str], decoding_start_list: list[int], block_length: int
+    ):
+        """Prepare cache for DLLM decode. Override in PagedKVCacheManager."""
+        self.curr_req_ids = req_ids
+
+    def finalize_cache_single_decode_dllm(
+        self, req_ids: list[str], block_finished: list[bool], block_length: int
+    ):
+        """Finalize DLLM decode: update req_id_to_seq_len for finished blocks."""
+        for req_id, finished in zip(req_ids, block_finished):
+            if finished:
+                self.req_id_to_seq_len[req_id] += block_length
+        self.curr_req_ids = None
+
     def finalize_cache_all_decode(self, req_id: str):
         del self.req_id_to_seq_len[req_id]
 
@@ -694,6 +709,21 @@ class PagedKVCacheManager(KVCacheManagerBase):
             self.block_table[req_id].extend(
                 [self.get_free_block() for _ in range(num_additional_blocks)]
             )
+        self._upd_gpu_block_table(req_ids)
+
+    def prepare_cache_decode_dllm(
+        self, req_ids: list[str], decoding_start_list: list[int], block_length: int
+    ):
+        """Prepare cache for DLLM decode: reserve blocks for decoding_start + block_length.
+        Does NOT update req_id_to_seq_len (caller updates when block finishes)."""
+        self.curr_req_ids = req_ids
+        for i, req_id in enumerate(req_ids):
+            target = decoding_start_list[i] + block_length
+            num_additional_blocks = self.num_additional_blocks_req_need(req_id, target)
+            if num_additional_blocks > 0:
+                self.block_table[req_id].extend(
+                    [self.get_free_block() for _ in range(num_additional_blocks)]
+                )
         self._upd_gpu_block_table(req_ids)
 
     def get_free_block(self):

@@ -51,7 +51,12 @@ from chitu.utils import (
     top_k_top_p_min_p_sampling_from_logits,
     try_import_and_setup_torch_npu,
 )
-from chitu.ops import apply_frequency_penalty, response_append
+from chitu.ops import (
+    apply_frequency_penalty,
+    response_append,
+    append_to_paged_kv_cache,
+    read_from_paged_kv_cache,
+)
 from chitu.device_list import DeviceList
 from chitu.moe.load_balancer import get_moe_load_planner  # added
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
@@ -1172,6 +1177,20 @@ class Executor:
             dtype=torch.long,
         )
 
+    def _prepare_blocks_for_decode_dllm(self, tasks: PackedTasks) -> torch.Tensor:
+        """Prepare payload as concatenated blocks for DLLM decode. Each task's next_block is [block_length] tokens."""
+        blocks = []
+        for task in tasks.tasks:
+            if task.next_block is not None:
+                blocks.extend(task.next_block)
+            else:
+                # Fallback: mask block if not set (e.g. from DP bootstrap)
+                from chitu.backend import Backend
+
+                mask_id = Backend.model.decoder.mask_id
+                blocks.extend([mask_id] * 32)
+        return torch.tensor(blocks, device=self.device, dtype=torch.long)
+
     def _prepare_lhs_for_decode(self, tasks: PackedTasks):
         return torch.cat([task._last_hidden_states for task in tasks.tasks], dim=0)
 
@@ -1328,6 +1347,7 @@ class Executor:
                 if self.rank > 0 or self.dp_size <= 1
                 else DPTaskCollector.get_total_packedtasks()
             )
+            logger.info(f"update tasks: {update_tasks.task_ids=}")
             if is_prefill(update_tasks.task_type):
                 for task in update_tasks.tasks:
                     task.consume_req_tokens()
@@ -1348,7 +1368,15 @@ class Executor:
             DPTaskCollector.get_total_packedtasks().batch_update_status()
 
         # 3. sample
-        if self.is_sample_stage and self.pp_size <= 1 and len(tasks.output_tasks) > 0:
+        # DLLM: decode uses full blocks (next_block), not single tokens. Skip sample for PrefillDLLM/DecodeDLLM;
+        # also skip when prefill returned dummy_output (0 rows).
+        if (
+            self.is_sample_stage
+            and self.pp_size <= 1
+            and len(tasks.output_tasks) > 0
+            and out.shape[0] > 0
+            and tasks.task_type not in (TaskType.PrefillDLLM, TaskType.DecodeDLLM)
+        ):
             tokens = self.sample(out, tasks)
             if tasks.return_logprobs:
                 logprobs = torch.log_softmax(out, dim=-1)
@@ -1671,11 +1699,29 @@ class Executor:
 
 
     def prefill_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
-        logger.info(f"prefill_dllm_step begin but empty")
         is_empty_step = tasks.num_tasks == 0
+        logger.info(f"{tasks.task_ids=}")
+        logger.info(f"{tasks.tokens=}")
+        
+        # Backend.model.model is ModelRunner; ModelRunner.model is the actual LLaDA model
+        inner_model = Backend.model.model.model
+        num_layers = inner_model.config.num_hidden_layers
+        num_kv_heads = inner_model.config.num_key_value_heads
+        num_heads = inner_model.config.num_attention_heads
+        head_dim = inner_model.config.hidden_size // num_heads
+        block_length = 32
+        prefilling_lengths: list[int] = []
+        # logger.info(f"{tasks.tokens.size=}")
         if not is_empty_step:
+            for it, task in enumerate(tasks.tasks):
+                non_mask_number = len(tasks.tokens[it])
+                decoding_start = min(
+                    ((non_mask_number) // block_length) * block_length, 1024
+                )
+                prefilling_lengths.append(decoding_start)
+            logger.info(f"{prefilling_lengths=}")
             for mgr in Backend.cache_managers.values():
-                mgr.prepare_cache_prefill(tasks.req_ids, [len(t) for t in tasks.tokens])
+                mgr.prepare_cache_prefill(tasks.req_ids, prefilling_lengths)
             PrometheusMetricsCollector.update_kvcache_usage()
 
             num_tokens = tasks.num_tokens
@@ -1704,17 +1750,333 @@ class Executor:
 
         logger.info(f"payload shape: {payload.shape}")
         from dinfer import TokenArray
-        token_array = TokenArray(payload, num_tokens, mask_id=Backend.model.decoder.mask_id, eos_id=Backend.model.decoder.eos_id, device=self.device)
-        logger.info(f"{tasks.task_ids=}")
-        logger.info(f"{tasks.tokens=}")
-        prefilling_limit = 1024
-        
+        token_array = TokenArray(payload, num_tokens, mask_id=Backend.model.decoder.mask_id, eos_id=Backend.model.decoder.eos_id, device=self.device, offset=[len(t) for t in tasks.tokens])
+        logger.info(f"token_array shape: {token_array.data.shape}")
 
+        if not is_empty_step:
+            for it, task in enumerate(tasks.tasks):
+                task.decoding_start = prefilling_lengths[it] + task.consumed_req_tokens
+        max_prefilling_length = max(prefilling_lengths) if prefilling_lengths else 0
 
+        if is_empty_step or max_prefilling_length == 0:
+            for mgr in Backend.cache_managers.values():
+                mgr.finalize_cache_all_prefill()
+            return self.dummy_output
+
+        attn_mask_num_blocks = (max_prefilling_length + block_length - 1) // block_length
+        block_mask = torch.tril(
+            torch.ones(attn_mask_num_blocks, attn_mask_num_blocks, device="cuda", dtype=torch.bool)
+        )
+        bd_attn_mask = (
+            block_mask.repeat_interleave(block_length, dim=0)
+            .repeat_interleave(block_length, dim=1)
+            .unsqueeze(0)
+            .repeat(len(tasks.tasks), 1, 1)
+        )
+        output = Backend.model(
+            token_array[:, :max_prefilling_length].clone(memory_format=torch.contiguous_format),
+            use_cache=True,
+            attention_mask=bd_attn_mask[:, :max_prefilling_length, :max_prefilling_length].clone(
+                memory_format=torch.contiguous_format
+            ),
+            position_ids=torch.arange(max_prefilling_length, device=self.device)
+            .unsqueeze(0)
+            .repeat(len(tasks.tasks), 1)
+            .clone(memory_format=torch.contiguous_format),
+        )
+        inner_shape = output.past_key_values[0].shape
+        logger.info(f"inner_shape: {inner_shape}")
+        # sglang format: past_key_values = [k0, v0, k1, v1, ...] -> [num_layers, 2, batch, num_kv_heads, seq_len, head_dim]
+        prefilling_kv = torch.stack(output.past_key_values, dim=0).reshape(
+            num_layers, 2, *inner_shape
+        )
+
+        # Write prefilling_kv back to Chitu's KV cache
+        # prefilling_kv: [num_layers, 2, batch, num_kv_heads, seq_len, head_dim]
+        # Chitu append_to_paged_kv_cache needs: this_kv (num_tokens, num_heads, head_dim), delta_position_ids, delta_seq_ids
+        total_prefill_tokens = sum(prefilling_lengths)
+        if total_prefill_tokens > 0:
+            cache_manager = Backend.cache_managers["main"]
+            seq_len_delta = cache_manager.seq_len_delta
+            # prepare_cache_prefill used prefilling_lengths, so delta_* already match
+            delta_position_ids = seq_len_delta.delta_position_ids_tensor_device
+            delta_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
+
+            for layer_id in range(num_layers):
+                try:
+                    accessor = cache_manager.get_accessor(layer_id)
+                except KeyError:
+                    continue  # PP: this rank does not own this layer
+                # Convert from [batch, num_kv_heads, seq_len, head_dim] to ragged [num_tokens, num_kv_heads, head_dim]
+                for kv_idx, kv_name in enumerate(["k", "v"]):
+                    layer_kv = prefilling_kv[layer_id, kv_idx].contiguous()
+                    # layer_kv: [batch, num_kv_heads, seq_len, head_dim]
+                    this_kv_list = []
+                    for b in range(len(tasks.tasks)):
+                        Lb = prefilling_lengths[b]
+                        if Lb > 0:
+                            # [num_kv_heads, Lb, head_dim] -> [Lb, num_kv_heads, head_dim]
+                            this_kv_list.append(
+                                layer_kv[b, :, :Lb, :].permute(1, 0, 2)
+                            )
+                    if this_kv_list:
+                        this_kv = torch.cat(this_kv_list, dim=0).contiguous()
+                        # Use None for get_page_ids/get_offs_in_page so they are computed from
+                        # our sliced delta_* (matching total_prefill_tokens), not the full seq_len_delta
+                        append_to_paged_kv_cache(
+                            accessor.kv[kv_name],
+                            accessor.block_table,
+                            this_kv,
+                            delta_position_ids,
+                            delta_seq_ids,
+                            get_page_ids=None,
+                            get_offs_in_page=None,
+                            use_i64_offsets=accessor.use_i64_offsets,
+                        )
+
+            for mgr in Backend.cache_managers.values():
+                mgr.finalize_cache_all_prefill()
+
+        # Return logits for sampling (last valid position per sequence)
+        # In dllm prefill don't need to sample tokens
+        logits = output.logits  # [batch, seq_len, vocab_size]
+        last_positions = torch.tensor(
+            [p - 1 for p in prefilling_lengths], device=logits.device, dtype=torch.long
+        )
+        return logits[
+            torch.arange(len(tasks.tasks), device=logits.device), last_positions, :
+        ]
 
     def decode_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
-        logger.info(f"decode_dllm_step begin but empty")
-        pass
+        """DLLM decode: payload is the full block per task (from next_block), not single token.
+        Per decode step: 1) read KV from cache, 2) forward with block, 3) batch_decode to update block,
+        4) write KV back for finished blocks, 5) update task state."""
+        is_empty_step = tasks.num_tasks == 0
+        if is_empty_step:
+            return self.dummy_output
+
+        if not isinstance(tasks, PackedTasks):
+            return self.dummy_output
+
+        # ModelRunner and decoder
+        model_runner = Backend.model.model
+        decoder = Backend.model.decoder
+        block_length = 32
+        mask_id = decoder.mask_id
+        eos_id = decoder.eos_id
+
+        # 1) Prepare payload and decoding_start
+        batch_size = len(tasks.tasks)
+        logger.info(f"decode task ids: {tasks.task_ids=}")
+        if self.rank == 0 or (self.dp_size > 1 and self.dp_dispatcher is not None):
+            payload = self._prepare_blocks_for_decode_dllm(tasks)
+        else:
+            payload = torch.empty(
+                [batch_size * block_length],
+                dtype=torch.long,
+                device=self.device,
+            )
+        for dispatcher in self.task_dispatchers:
+            payload = dispatcher.recv_payload(payload)
+        decoding_start_list = [getattr(t, "decoding_start", 0) for t in tasks.tasks]
+        
+        # 2) Prepare cache for DLLM (reserve blocks for decoding_start + block_length)
+        self._kv_hook.before_decode_step(tasks.req_ids)
+        for mgr in Backend.cache_managers.values():
+            if hasattr(mgr, "prepare_cache_decode_dllm"):
+                mgr.prepare_cache_decode_dllm(
+                    tasks.req_ids, decoding_start_list, block_length
+                )
+        logger.info(f"{payload=}{payload.shape=}")
+        PrometheusMetricsCollector.update_kvcache_usage()
+
+        # 3) Read past_key_values from Chitu paged cache
+        inner_model = Backend.model.model.model
+        num_layers = inner_model.config.num_hidden_layers
+        num_kv_heads = inner_model.config.num_key_value_heads
+        head_dim = inner_model.config.hidden_size // inner_model.config.num_attention_heads
+
+        current_cache_length = max(decoding_start_list) + block_length
+        # Align to power of 2 for sglang compatibility (like generate_uniform)
+        def align_exp2(x):
+            return 1 << (x - 1).bit_length() if x > 0 else 1
+
+        current_cache_length = max(128, align_exp2(current_cache_length))
+
+        # Build position_ids and seq_ids for reading cache
+        pos_list, seq_list = [], []
+        for i, ds in enumerate(decoding_start_list):
+            for p in range(ds):
+                pos_list.append(p)
+                seq_list.append(i)
+        total_read_tokens = len(pos_list)
+
+        cache_manager = Backend.cache_managers["main"]
+        block_table = cache_manager.get_gpu_block_table() if cache_manager else None
+
+        if total_read_tokens > 0 and block_table is not None:
+            position_ids = torch.tensor(pos_list, device=self.device, dtype=torch.long)
+            seq_ids = torch.tensor(seq_list, device=self.device, dtype=torch.long)
+
+            past_k_list = []
+            past_v_list = []
+            block_size = getattr(cache_manager, "block_size", 512)
+
+            for layer_id in range(num_layers):
+                try:
+                    accessor = cache_manager.get_accessor(layer_id)
+                except KeyError:
+                    continue
+                for kv_name in ["k", "v"]:
+                    kv_cache = accessor.kv[kv_name]
+                    ragged = read_from_paged_kv_cache(
+                        kv_cache,
+                        block_table,
+                        position_ids,
+                        seq_ids,
+                    )
+                    # Scatter into [batch, current_cache_length, num_heads, head_dim]
+                    shape = (batch_size, current_cache_length, num_kv_heads, head_dim)
+                    dense = torch.zeros(shape, dtype=ragged.dtype, device=self.device)
+                    for idx, (s, p) in enumerate(zip(seq_list, pos_list)):
+                        dense[s, p, :, :] = ragged[idx]
+                    # Model expects [batch, num_heads, cache_len, head_dim]
+                    dense = dense.permute(0, 2, 1, 3)
+                    if kv_name == "k":
+                        past_k_list.append(dense)
+                    else:
+                        past_v_list.append(dense)
+
+            # Model expects list of (k, v) per layer
+            past_key_values = [
+                (past_k_list[i], past_v_list[i]) for i in range(num_layers)
+            ]
+        else:
+            past_key_values = None
+
+        # 4) Reshape payload to [batch, block_length] and build position_ids
+        decoding_block = payload.view(batch_size, block_length)
+        decoding_start_t = torch.tensor(
+            decoding_start_list, device=self.device, dtype=torch.long
+        )
+        decoding_pos_ids = (
+            torch.arange(block_length, device=self.device, dtype=torch.long)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+            + decoding_start_t.unsqueeze(1)
+        )
+
+        # 5) Model forward
+        self.timers("decode").start()
+        output = model_runner(
+            decoding_block,
+            use_cache=True,
+            position_ids=decoding_pos_ids,
+            past_key_values=past_key_values,
+        )
+        self.timers("decode").stop()
+
+        logits = output.logits
+
+        # 6) batch_decode: update block in token array
+        total_len = max(decoding_start_list) + block_length
+        x_data = torch.full(
+            (batch_size, total_len), mask_id, dtype=torch.long, device=self.device
+        )
+        for i in range(batch_size):
+            x_data[i, decoding_start_list[i] : decoding_start_list[i] + block_length] = (
+                decoding_block[i]
+            )
+
+        class TokenArrayLike:
+            def __init__(self, data):
+                self.data = data
+
+        x = TokenArrayLike(x_data)
+        decoder.batch_decode(
+            logits, decoding_start_t, x, block_length
+        )
+
+        # 7) block_finished: no mask left in block
+        decoded_block = x.data[
+            torch.arange(batch_size, device=self.device).unsqueeze(1),
+            decoding_start_t.unsqueeze(1)
+            + torch.arange(block_length, device=self.device).unsqueeze(0),
+        ]
+        block_finished = (decoded_block == mask_id).sum(dim=1) == 0
+        block_finished_list = block_finished.cpu().tolist()
+
+        # 8) Write back KV to Chitu cache for block_finished
+        if block_finished.any() and block_table is not None:
+            # output.past_key_values: list [k0, v0, k1, v1, ...]; each [batch, num_heads, cache_len, head_dim]
+            # Extract last block_length (the new block) from each
+            stacked = torch.stack(output.past_key_values, dim=0)
+            # [2*num_layers, batch, num_heads, cache_len, head_dim]
+            decoding_kv = stacked.reshape(
+                num_layers, 2, batch_size, num_kv_heads, -1, head_dim
+            )[:, :, :, :, -block_length:, :]
+            # [num_layers, 2, batch, num_kv_heads, block_length, head_dim]
+            for layer_id in range(num_layers):
+                try:
+                    accessor = cache_manager.get_accessor(layer_id)
+                except KeyError:
+                    continue
+                for kv_idx, kv_name in enumerate(["k", "v"]):
+                    layer_kv = decoding_kv[layer_id, kv_idx]
+                    finished_kv = layer_kv[block_finished]
+                    if finished_kv.shape[0] == 0:
+                        continue
+                    delta_pos_list = []
+                    delta_seq_list = []
+                    for fidx in block_finished.nonzero(as_tuple=True)[0]:
+                        fidx = int(fidx)
+                        ds = decoding_start_list[fidx]
+                        delta_pos_list.extend(range(ds, ds + block_length))
+                        delta_seq_list.extend([fidx] * block_length)
+                    # finished_kv: [num_finished, num_heads, block_length, head_dim]
+                    # -> [num_finished*block_length, num_heads, head_dim]
+                    this_kv = finished_kv.permute(0, 2, 1, 3).reshape(
+                        -1, num_kv_heads, head_dim
+                    ).contiguous()
+                    delta_position_ids = torch.tensor(
+                        delta_pos_list, device=self.device, dtype=torch.long
+                    )
+                    delta_seq_ids = torch.tensor(
+                        delta_seq_list, device=self.device, dtype=torch.long
+                    )
+                    append_to_paged_kv_cache(
+                        accessor.kv[kv_name],
+                        block_table,
+                        this_kv,
+                        delta_position_ids,
+                        delta_seq_ids,
+                    )
+
+        # 9) Finalize cache: update req_id_to_seq_len for finished blocks
+        for mgr in Backend.cache_managers.values():
+            if hasattr(mgr, "finalize_cache_single_decode_dllm"):
+                mgr.finalize_cache_single_decode_dllm(
+                    tasks.req_ids, block_finished_list, block_length
+                )
+
+        # 10) Update task state: next_block, decoding_start, response, _decode_status
+        for i, task in enumerate(tasks.tasks):
+            new_block = x.data[
+                i, decoding_start_list[i] : decoding_start_list[i] + block_length
+            ].cpu().tolist()
+            task.next_block = new_block
+            if block_finished_list[i]:
+                task.decoding_start += block_length
+                task.add_data(new_block)
+                if eos_id in new_block:
+                    task._decode_status = TaskDecodeType.Stopped
+
+        # Send output to dispatchers (for PP, etc.)
+        for dispatcher in self.task_dispatchers:
+            dispatcher.send_payload(logits[:, -1, :], tasks)
+
+        # Return logits for compatibility (DLLM does not sample per-step; last pos logits)
+        return logits[:, -1, :]
 
     def sample(self, logits: torch.Tensor, tasks: PackedTasks):
         """

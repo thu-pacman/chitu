@@ -666,6 +666,47 @@ class Backend:
                 raise NotImplementedError(
                     f"Unsupported mla_absorb {args.infer.mla_absorb}"
                 )
+        elif args.models.type == ModelType.LLADA:
+            # LLaDA: model uses checkpoint config; cache must match model output.
+            # Load from checkpoint so shape_per_token (n_kv_heads * head_dim) aligns.
+            try:
+                from transformers import AutoConfig
+
+                config_path = getattr(args.models, "model_config_path", None) or getattr(
+                    args.models, "ckpt_dir", None
+                )
+                if config_path:
+                    model_config = AutoConfig.from_pretrained(
+                        config_path, trust_remote_code=True
+                    )
+                    n_kv_heads = getattr(
+                        model_config, "num_key_value_heads", model_config.num_attention_heads
+                    )
+                    head_dim = getattr(model_config, "head_dim", None) or (
+                        model_config.hidden_size // model_config.num_attention_heads
+                    )
+                    logger.info(
+                        f"LLaDA cache: checkpoint config "
+                        f"num_key_value_heads={n_kv_heads}, head_dim={head_dim}"
+                    )
+                else:
+                    n_kv_heads = getattr(args.models, "n_kv_heads", args.models.n_heads)
+                    head_dim = getattr(args.models, "head_dim", None) or (
+                        args.models.dim // args.models.n_heads
+                    )
+            except Exception as e:
+                logger.warning(f"LLaDA: fallback to YAML config: {e}")
+                n_kv_heads = getattr(args.models, "n_kv_heads", args.models.n_heads)
+                head_dim = getattr(args.models, "head_dim", None) or (
+                    args.models.dim // args.models.n_heads
+                )
+            n_local_kv_heads = (
+                n_kv_heads // tensor_parallel_size
+                if n_kv_heads > tensor_parallel_size
+                else 1
+            )
+            kv_cache_kvargs["n_local_kv_heads"] = n_local_kv_heads
+            kv_cache_kvargs["head_dim"] = head_dim
         else:
             n_kv_heads = (
                 args.models.n_kv_heads
