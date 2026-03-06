@@ -24,7 +24,7 @@ from xgrammar.structural_tag import (
 
 from .simple_parser import SimpleParser
 from .stream_parse import BufferedStream, DeltaFactory
-from .types import (
+from .type_def import (
     ChoiceToolCall,
     ChoiceToolCallFunction,
     ToolCallParams,

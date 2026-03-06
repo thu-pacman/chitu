@@ -4,7 +4,7 @@
 
 from typing import AsyncIterable, Any
 from .abstract_parser import AbstractToolParser
-from .types import ChoiceDelta
+from .type_def import ChoiceDelta
 
 
 class DummyToolParser(AbstractToolParser):

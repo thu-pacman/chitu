@@ -374,12 +374,18 @@ class Backend:
             if hasattr(args.models, "tokenizer_force_full_seq_decode")
             else False
         )
+        skip_special_tokens = (
+            args.models.skip_special_tokens
+            if hasattr(args.models, "skip_special_tokens")
+            else True
+        )
 
         if args.models.tokenizer_type == "hf":
             tokenizer = TokenizerHF(
                 path=args.models.tokenizer_path,
                 trust_remote_code=trust_remote_code,
                 force_full_seq_decode=force_full_seq_decode,
+                skip_special_tokens=skip_special_tokens,
             )
         else:
             tokenizer = Tokenizer(

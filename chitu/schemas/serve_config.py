@@ -223,6 +223,7 @@ class MetricsConfig:
 class DebugConfig:
     skip_model_load: bool = MISSING
     force_moe_balance: bool = MISSING
+    save_trace_dir: Optional[str] = MISSING
 
 
 class StaticConfig:

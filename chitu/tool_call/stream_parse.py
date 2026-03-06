@@ -5,7 +5,7 @@
 
 import re, json
 from typing import AsyncIterator, AsyncIterable, Callable, Any
-from .types import ChoiceDelta, ChoiceDeltaToolCall, ChoiceDeltaToolCallFunction
+from .type_def import ChoiceDelta, ChoiceDeltaToolCall, ChoiceDeltaToolCallFunction
 from collections import deque
 import uuid
 
@@ -149,6 +149,7 @@ class TakeUntilStream(BufferedStream):
         self.consume_end = consume_end
         self.pending = ""
         self.stopped = False
+        self.found = False
 
     async def fetch(self) -> str:
         while not self.stopped:
@@ -159,6 +160,7 @@ class TakeUntilStream(BufferedStream):
                 return matched_chunk
             if matched_end:
                 self.stopped = True
+                self.found = True
                 if self.consume_end:
                     self.pending = self.pending[len(matched_end) :]
                 self.stream.put_back(self.pending)

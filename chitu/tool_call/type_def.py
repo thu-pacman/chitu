@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Literal
+from typing import Literal, NamedTuple
 from pydantic import BaseModel
 
 
@@ -52,3 +52,11 @@ class ToolCallParams(BaseModel):
     tool_choice: ToolChoice = "auto"
     parallel_tool_calls: bool = True
     enable_reasoning: bool = False
+
+
+class ConstraintParams(NamedTuple):
+    params: ToolCallParams
+    is_none: bool = False
+    at_least_one: bool = False
+    stop_after_first: bool = False
+    tool_schemas: dict[str, dict] = {}

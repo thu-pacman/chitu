@@ -298,7 +298,7 @@ class TokenRouter:
             # Request completed
             finish_reason = token_data.get("finish_reason", "stop")
             context.user_request.finish_reason = finish_reason
-            context.dp_stream.send_stop_signal()
+            context.user_request.finish()
 
             # Remove from active requests
             del self.active_requests[request_id]
@@ -322,7 +322,7 @@ class TokenRouter:
             )
 
             # Send stop signal and cleanup
-            context.dp_stream.send_stop_signal()
+            context.user_request.finish()
             del self.active_requests[request_id]
 
         else:

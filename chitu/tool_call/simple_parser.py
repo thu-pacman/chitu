@@ -15,9 +15,11 @@ from xgrammar.structural_tag import (
     TagFormat,
     AnyTextFormat,
     SequenceFormat,
+    ConstStringFormat,
+    OrFormat,
 )
 from .abstract_parser import AbstractToolParser
-from .types import (
+from .type_def import (
     ChoiceDelta,
     ChoiceDeltaToolCall,
     ChoiceDeltaToolCallFunction,
@@ -63,8 +65,6 @@ class SimpleParser(AbstractToolParser):
         cls.tools_begin, cls.tool_separator, cls.tools_end = cls.tools_template.split(
             "{tool}"
         )
-        if cls.tools_begin or cls.tools_end:
-            raise NotImplementedError  # not supported yet
 
         cls.starting_tags = [cls.tool_begin_tag]
         if cls.tools_begin_tag:
@@ -154,19 +154,20 @@ class SimpleParser(AbstractToolParser):
             raise ValueError(f"required tool '{forced_tool}' is not exist")
 
         if cls.tools_begin_tag:
-            tools_tag = TagFormat(
-                begin=cls.tools_begin_tag,
-                content=TagsWithSeparatorFormat(
-                    tags=tool_tags,
-                    separator=cls.tool_separator,
-                    at_least_one=at_least_one,
-                    stop_after_first=stop_after_first,
-                ),
-                end=cls.tools_end_tag,
+            format = TagsWithSeparatorFormat(
+                tags=tool_tags,
+                separator=cls.tool_separator,
+                at_least_one=at_least_one,
+                stop_after_first=stop_after_first,
+            )
+            format = TagFormat(
+                begin=cls.tools_begin_tag + cls.tools_begin,
+                content=format,
+                end=cls.tools_end + cls.tools_end_tag,
             )
             format = TriggeredTagsFormat(
                 triggers=[cls.tools_begin_tag],
-                tags=[tools_tag],
+                tags=[format],
                 at_least_one=at_least_one,
                 stop_after_first=stop_after_first,
             )
@@ -224,6 +225,8 @@ class SimpleParser(AbstractToolParser):
                 if pos < start:
                     chunks.append(content[pos:start])
                 pos = end
+            if pos < len(content):
+                chunks.append(content[pos:])
             content = "".join(chunks)
 
         return content, tools
@@ -285,6 +288,7 @@ class Automaton:
             self.buffer = self.buffer[m.end(2) :]
         elif matched:
             self.buffer = self.buffer[m.end(1) :]
+
         return matched, state
 
     @staticmethod

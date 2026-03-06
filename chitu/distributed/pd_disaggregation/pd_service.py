@@ -41,12 +41,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
 )
 from chitu.distributed.tcp_ip import get_port_from_zmq_socket
 from chitu.dp_token_sender import start_dp_token_manager
-from chitu.hooks import (
-    DPTokenSink,
-    LocalTokenSink,
-    MooncakeKVTransferHook,
-    NoopKVTransferHook,
-)
+from chitu.hooks import DPTokenSink, MooncakeKVTransferHook, NoopKVTransferHook
 from chitu.serve.common import start_worker
 from chitu.serve.event_loop import get_server_event_loop
 
@@ -539,14 +534,14 @@ async def start_pd_worker_service(args, rank: int = 0):
     model_type = args.models.type
     # Linear attention cache (Qwen3-next)
     has_linear_cache = (
-        hasattr(Backend, "linear_attn_cache_manager")
-        and Backend.linear_attn_cache_manager is not None
+        "linear" in Backend.cache_managers
+        and Backend.cache_managers["linear"] is not None
     )
     logger.info(
         f"[PD_WORKER] linear cache check: model_type={model_type}, has_linear_cache={has_linear_cache}"
     )
     if model_type == "hf-qwen3-next" and has_linear_cache:
-        kv_manager.set_linear_attn_cache_manager(Backend.linear_attn_cache_manager)
+        kv_manager.set_linear_attn_cache_manager(Backend.cache_managers["linear"])
         logger.info("[PD_WORKER] linear attention cache manager set for kv_manager")
 
     # Indexer KV cache (DeepSeek-V3.2)

@@ -1466,15 +1466,15 @@ class Executor:
                 token_idxs_list.append(
                     token_idxs[: max(1, task.req.top_logprobs)].tolist()
                 )
-            self._token_sink.emit_batch(
+            self.get_token_sink().emit_batch(
                 batch_result.tasks, next_token_list, logprobs_list, token_idxs_list
             )
         else:
             if self.mtp_size > 1:
-                self._token_sink.emit_batch(
+                self.get_token_sink().emit_batch(
                     batch_result.tasks, next_token_list, mtp_token_list=mtp_token_list
                 )
             else:
-                self._token_sink.emit_batch(batch_result.tasks, next_token_list)
+                self.get_token_sink().emit_batch(batch_result.tasks, next_token_list)
 
         TaskLoad.increase(batch_result.num_tasks)
