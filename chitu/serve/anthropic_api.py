@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import traceback
 from typing import Any, Awaitable, Callable, Optional, Literal, Annotated
 from logging import getLogger
 
@@ -1023,10 +1024,14 @@ def create_router(
                 priority_for_api_key=priority_for_api_key,
             )
         except HTTPException as e:
-            logger.info(f"Rejected illegal request {raw_request}, returning {e}")
+            logger.info(
+                f"Rejected illegal request, returning {e}: {traceback.format_exc()}"
+            )
             raise e
         except Exception as e:
-            logger.exception(f"Error processing request {raw_request}, got {e}")
+            logger.exception(
+                f"Error processing request, got {e}: {traceback.format_exc()}"
+            )
             raise HTTPException(status_code=500, detail="internal server error")
 
     @router.post("/v1/complete")
@@ -1047,10 +1052,14 @@ def create_router(
                 priority_for_api_key=priority_for_api_key,
             )
         except HTTPException as e:
-            logger.info(f"Rejected illegal request {raw_request}, returning {e}")
+            logger.info(
+                f"Rejected illegal request, returning {e}: {traceback.format_exc()}"
+            )
             raise e
         except Exception as e:
-            logger.exception(f"Error processing request {raw_request}, got {e}")
+            logger.exception(
+                f"Error processing request, got {e}: {traceback.format_exc()}"
+            )
             raise HTTPException(status_code=500, detail="internal server error")
 
     return router
