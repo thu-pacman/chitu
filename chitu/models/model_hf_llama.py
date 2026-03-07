@@ -20,11 +20,11 @@ from chitu.global_vars import get_global_args
 from chitu.models.model import (
     Attention,
     RMSNorm,
+    RMSNormBias,
     Transformer,
     TransformerBlock,
     get_linear_layout_native_y,
     get_linear_layout_contig_y,
-    get_rmsnorm,
 )
 from chitu.models.registry import ModelType, register_model
 from chitu.ops import apply_rotary_pos_emb, silu_and_mul
@@ -33,7 +33,7 @@ from chitu.quantization import (
     get_quant_from_checkpoint_prefix,
     get_quant_kwargs_from_checkpoint_prefix,
 )
-from chitu.utils import is_layer
+from chitu.utils import is_layer, parse_dtype
 from chitu.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -182,8 +182,24 @@ class AttentionHFLlama(Attention):
         )
 
         if getattr(args, "use_qk_norm", False):
-            self.q_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
+            self.q_norm = RMSNorm(
+                self.head_dim,
+                eps=args.norm_eps,
+                dtype=(
+                    parse_dtype(args.rms_norm_dtype)
+                    if hasattr(args, "rms_norm_dtype")
+                    else None
+                ),
+            )
+            self.k_norm = RMSNorm(
+                self.head_dim,
+                eps=args.norm_eps,
+                dtype=(
+                    parse_dtype(args.rms_norm_dtype)
+                    if hasattr(args, "rms_norm_dtype")
+                    else None
+                ),
+            )
 
         if self.cache.quant_type.needs_kv_scales:
             self.k_scale = torch.nn.Parameter(
@@ -393,19 +409,37 @@ class TransformerBlockHFLlama(TransformerBlock):
             layer_id=layer_id,
         )
 
-        self.input_layernorm = get_rmsnorm(
-            args.dim,
-            use_bias=get_quant_kwargs_from_checkpoint_prefix(
+        input_layernorm_module_type = (
+            RMSNormBias
+            if get_quant_kwargs_from_checkpoint_prefix(
                 checkpoint_prefix + ".input_layernorm", args.quant_config.rules
-            ).get("bias"),
-            eps=args.norm_eps,
+            ).get("bias")
+            else RMSNorm
         )
-        self.post_attention_layernorm = get_rmsnorm(
+        self.input_layernorm = input_layernorm_module_type(
             args.dim,
-            use_bias=get_quant_kwargs_from_checkpoint_prefix(
-                checkpoint_prefix + ".post_attention_layernorm", args.quant_config.rules
-            ).get("bias"),
             eps=args.norm_eps,
+            dtype=(
+                parse_dtype(args.rms_norm_dtype)
+                if hasattr(args, "rms_norm_dtype")
+                else None
+            ),
+        )
+        post_attention_layernorm_module_type = (
+            RMSNormBias
+            if get_quant_kwargs_from_checkpoint_prefix(
+                checkpoint_prefix + ".post_attention_layernorm", args.quant_config.rules
+            ).get("bias")
+            else RMSNorm
+        )
+        self.post_attention_layernorm = post_attention_layernorm_module_type(
+            args.dim,
+            eps=args.norm_eps,
+            dtype=(
+                parse_dtype(args.rms_norm_dtype)
+                if hasattr(args, "rms_norm_dtype")
+                else None
+            ),
         )
 
     def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
@@ -652,12 +686,21 @@ class TransformerHFLlama(Transformer):
             )
 
     def _init_post_layers(self):
-        self.norm = get_rmsnorm(
-            self.params.dim,
-            use_bias=get_quant_kwargs_from_checkpoint_prefix(
+        norm_module_type = (
+            RMSNormBias
+            if get_quant_kwargs_from_checkpoint_prefix(
                 "lm_head.norm", self.params.quant_config.rules
-            ).get("bias"),
+            ).get("bias")
+            else RMSNorm
+        )
+        self.norm = norm_module_type(
+            self.params.dim,
             eps=self.params.norm_eps,
+            dtype=(
+                parse_dtype(self.params.rms_norm_dtype)
+                if hasattr(self.params, "rms_norm_dtype")
+                else None
+            ),
         )
         if not getattr(self.params, "tie_word_embeddings", False):
             self.lm_head = ColumnParallelLinear(

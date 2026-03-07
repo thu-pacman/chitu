@@ -51,7 +51,9 @@ app = FastAPI()  # Unified API
 
 class Message(BaseModel):
     role: str = "user"
-    content: str | list[str | dict] = "hello, who are you"
+    # Note on `None` on `content`: OpenClaw may set `content` to be `None`, although this
+    # does not comply with OpenAI spec.
+    content: str | list[str | dict] | None = "hello, who are you"
     reasoning_content: str | None = None
     tool_calls: list[ChoiceToolCall] = []
     tool_call_id: str | None = None  # useless, at least for qwen3
@@ -137,91 +139,91 @@ async def create_chat_completion(
 ):
     global server_status
 
-    if not server_status:
-        return {"message": "Service is not started"}
+    try:
+        if not server_status:
+            return {"message": "Service is not started"}
 
-    args = get_global_args()
+        args = get_global_args()
 
-    api_key = ""
-    if authorization is not None:
-        if not authorization.startswith("Bearer "):
+        api_key = ""
+        if authorization is not None:
+            if not authorization.startswith("Bearer "):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Authorization header must start with 'Bearer'",
+                )
+            api_key = authorization[len("Bearer ") :]
+        task_priority = get_priority_from_api_key(api_key)
+
+        # Parse JSON body tolerant to missing/incorrect content-type
+        try:
+            data = await raw_request.json()
+        except Exception:
+            raise HTTPException(
+                status_code=400, detail="Invalid JSON body. Expecting JSON payload."
+            )
+
+        try:
+            req: ChatRequest = ChatRequest.model_validate(data)
+        except ValidationError as e:
+            # Keep consistency with FastAPI default behavior for body validation errors
+            raise HTTPException(status_code=422, detail=e.errors())
+
+        # Handle deprecated fields or compatibility fields
+        if (
+            req.max_tokens is not None
+            and req.max_completion_tokens is not None
+            and req.max_tokens != req.max_completion_tokens
+        ):
             raise HTTPException(
                 status_code=400,
-                detail="Authorization header must start with 'Bearer'",
+                detail="max_tokens and max_completion_tokens cannot be conflict. Please use only one of them.",
             )
-        api_key = authorization[len("Bearer ") :]
-    task_priority = get_priority_from_api_key(api_key)
+        if req.max_tokens is None and req.max_completion_tokens is not None:
+            req.max_tokens = req.max_completion_tokens
+        if req.max_completion_tokens is None and req.max_tokens is not None:
+            req.max_completion_tokens = req.max_tokens
 
-    # Parse JSON body tolerant to missing/incorrect content-type
-    try:
-        data = await raw_request.json()
-    except Exception:
-        raise HTTPException(
-            status_code=400, detail="Invalid JSON body. Expecting JSON payload."
+        if (
+            req.stop_with_eos is not None
+            and req.ignore_eos is not None
+            and req.stop_with_eos != (not req.ignore_eos)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="stop_with_eos and ignore_eos cannot be conflict. Please use only one of them.",
+            )
+        if req.stop_with_eos is None and req.ignore_eos is not None:
+            req.stop_with_eos = not req.ignore_eos
+        if req.ignore_eos is None and req.stop_with_eos is not None:
+            req.ignore_eos = not req.stop_with_eos
+        if req.stop_with_eos is None:
+            req.stop_with_eos = True
+        if req.ignore_eos is None:
+            req.ignore_eos = False
+
+        # Check if DP mode is enabled and use appropriate processing
+        if get_global_args().dp_config.enabled:
+            logger.debug(f"[HTTP] Using DP mode for request: {req.conversation_id}")
+            return await process_dp_chat_completion(req)
+
+        req_id = gen_req_id()
+        max_new_tokens = req.max_tokens or args.request.max_new_tokens
+        set_min_batch_size(req.min_batch_size)
+
+        enable_thinking = req.extra_body.get(
+            "enable_thinking",
+            req.chat_template_kwargs.get("enable_thinking", req.enable_thinking),
         )
 
-    try:
-        req: ChatRequest = ChatRequest.model_validate(data)
-    except ValidationError as e:
-        # Keep consistency with FastAPI default behavior for body validation errors
-        raise HTTPException(status_code=422, detail=e.errors())
+        # Reconstruct chat_template_kwargs to prevent injection attacks
+        chat_template_kwargs = {}
+        if "DeepSeek-V3.1" in get_global_args().models.name:
+            # DeepSeek-V3.1 tokenizer uses `thinking` instead of `enable_thinking`
+            chat_template_kwargs["thinking"] = enable_thinking
+        else:
+            chat_template_kwargs["enable_thinking"] = enable_thinking
 
-    # Handle deprecated fields or compatibility fields
-    if (
-        req.max_tokens is not None
-        and req.max_completion_tokens is not None
-        and req.max_tokens != req.max_completion_tokens
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="max_tokens and max_completion_tokens cannot be conflict. Please use only one of them.",
-        )
-    if req.max_tokens is None and req.max_completion_tokens is not None:
-        req.max_tokens = req.max_completion_tokens
-    if req.max_completion_tokens is None and req.max_tokens is not None:
-        req.max_completion_tokens = req.max_tokens
-
-    if (
-        req.stop_with_eos is not None
-        and req.ignore_eos is not None
-        and req.stop_with_eos != (not req.ignore_eos)
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="stop_with_eos and ignore_eos cannot be conflict. Please use only one of them.",
-        )
-    if req.stop_with_eos is None and req.ignore_eos is not None:
-        req.stop_with_eos = not req.ignore_eos
-    if req.ignore_eos is None and req.stop_with_eos is not None:
-        req.ignore_eos = not req.stop_with_eos
-    if req.stop_with_eos is None:
-        req.stop_with_eos = True
-    if req.ignore_eos is None:
-        req.ignore_eos = False
-
-    # Check if DP mode is enabled and use appropriate processing
-    if get_global_args().dp_config.enabled:
-        logger.debug(f"[HTTP] Using DP mode for request: {req.conversation_id}")
-        return await process_dp_chat_completion(req)
-
-    req_id = gen_req_id()
-    max_new_tokens = req.max_tokens or args.request.max_new_tokens
-    set_min_batch_size(req.min_batch_size)
-
-    enable_thinking = req.extra_body.get(
-        "enable_thinking",
-        req.chat_template_kwargs.get("enable_thinking", req.enable_thinking),
-    )
-
-    # Reconstruct chat_template_kwargs to prevent injection attacks
-    chat_template_kwargs = {}
-    if "DeepSeek-V3.1" in get_global_args().models.name:
-        # DeepSeek-V3.1 tokenizer uses `thinking` instead of `enable_thinking`
-        chat_template_kwargs["thinking"] = enable_thinking
-    else:
-        chat_template_kwargs["enable_thinking"] = enable_thinking
-
-    try:
         user_req = UserRequest(
             [msg.model_dump() for msg in req.messages],
             req_id,
@@ -263,10 +265,13 @@ async def create_chat_completion(
                 }
             )
             return JSONResponse(response_dict)
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("request handle exception")
+    except HTTPException as e:
+        logger.info(
+            f"Rejected illegal request, returning {e}: {traceback.format_exc()}"
+        )
+        raise e
+    except Exception as e:
+        logger.exception(f"Error processing request, got {e}: {traceback.format_exc()}")
         with suppress(Exception):
             del user_req
         with suppress(Exception):
