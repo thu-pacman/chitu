@@ -1446,6 +1446,7 @@ class Transformer(nn.Module):
                 ),
                 kwargs_max_nelem={},
                 output_max_nelem_callback=output_max_nelem_callback,
+                before_capture_callback=lambda: self.prepare_decoding_attn(),
                 before_replay_callback=before_replay_callback,
                 enable=current_cuda_graph_enabled,
             )
@@ -1464,6 +1465,7 @@ class Transformer(nn.Module):
                     args_max_nelem=(tokens_max_nelem, *extra_inputs_mtp_max_nelem),
                     kwargs_max_nelem={},
                     output_max_nelem_callback=output_max_nelem_callback,
+                    before_capture_callback=lambda: self.prepare_decoding_attn_mtp(),
                     before_replay_callback=before_replay_callback,
                     enable=current_cuda_graph_enabled,
                 )
