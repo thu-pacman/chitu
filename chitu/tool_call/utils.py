@@ -2,10 +2,18 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .abstract_parser import AbstractToolParser
+import json
+import logging
+from .abstract_parser import (
+    AbstractToolParser,
+    JsonMessageToolParserMixin,
+    PatchTemplateToolParserMixin,
+)
 from .type_def import ChoiceDelta
 from .dummy_parser import DummyToolParser
 from typing import Any, AsyncIterable, AsyncGenerator, TypeVar
+
+logger = logging.getLogger(__name__)
 
 _registere_parsers: dict[str, type[AbstractToolParser]] = {}
 
@@ -57,3 +65,25 @@ async def parse_stream_by_parser(
             else:
                 async for chunk in item:
                     yield adapter.wrap(chunk)
+
+
+def adjust_message_for_tool_calls(parser_cls: type[AbstractToolParser], message: list):
+    if not issubclass(parser_cls, JsonMessageToolParserMixin):
+        return message
+    for chunk in message:
+        if not isinstance(chunk, dict):
+            continue
+        tools = chunk.get("tool_calls", [])
+        for tool in tools:
+            function = tool["function"]
+            function["arguments"] = json.loads(function["arguments"])
+    return message
+
+
+def patch_chat_template(parser_cls: type[AbstractToolParser], model):
+    if not issubclass(parser_cls, PatchTemplateToolParserMixin):
+        return
+    try:
+        model.chat_template = parser_cls.patch_chat_template(model.chat_template)
+    except Exception:
+        logger.exception(f"patch chat template failed, tool call may be incorrect!")

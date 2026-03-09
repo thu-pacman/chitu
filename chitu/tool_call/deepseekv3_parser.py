@@ -2,19 +2,63 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .simple_parser import SimpleParser
 from .utils import register
+from .abstract_parser import AbstractToolParser, PatchTemplateToolParserMixin
+
+from .grammar import (
+    JsonArgumentsGrammar,
+    ToolGrammar,
+    TriggeredMultipleToolsGrammar,
+    GrammarImplBase,
+)
+
+from .parse import (
+    TriggeredParser,
+    SequenceParser,
+    JsonArgumentsParser,
+    NameParser,
+    FunctionParser,
+    ContentParser,
+    ToolParserImplBase,
+)
+
+
+class DeepSeekV3GrammarImpl(GrammarImplBase):
+    tool = ToolGrammar(
+        "<｜tool▁call▁begin｜>function<｜tool▁sep｜>{}\n```json\n{}\n```<｜tool▁call▁end｜>",
+        arguments=JsonArgumentsGrammar(),
+    )
+    tools = TriggeredMultipleToolsGrammar(
+        "<｜tool▁calls▁begin｜>{}\n{}<｜tool▁calls▁end｜>",
+        tool=tool,
+        trigger="<｜tool▁calls▁begin｜>",
+    )
+    root_grammar = tools
+
+
+class DeepSeekV3ParserImpl(ToolParserImplBase):
+    tool = SequenceParser(
+        "function<｜tool▁sep｜>{}\n```json\n{}\n```",
+        parsers=[NameParser(), JsonArgumentsParser()],
+    )
+    tools = TriggeredParser(
+        "<｜tool▁call▁begin｜>{}<｜tool▁call▁end｜>",
+        parser=FunctionParser(parser=tool),
+    )
+    root_parser = TriggeredParser(
+        "<｜tool▁calls▁begin｜>{}<｜tool▁calls▁end｜>",
+        parser=tools,
+        outside_parser=ContentParser(),
+    )
 
 
 @register
-class DeepSeekV3ToolParser(SimpleParser):
-    tool_begin_tag = "<｜tool▁call▁begin｜>"
-    tool_template = "function<｜tool▁sep｜>{name}\n```json\n{arguments}\n```"
-    tool_end_tag = "<｜tool▁call▁end｜>"
-    tools_begin_tag = "<｜tool▁calls▁begin｜>"
-    tools_template = "{tool}\n{tool}"
-    tools_end_tag = "<｜tool▁calls▁end｜>"
-
+class DeepSeekV3ToolParser(
+    DeepSeekV3GrammarImpl,
+    DeepSeekV3ParserImpl,
+    AbstractToolParser,
+    PatchTemplateToolParserMixin,
+):
     @classmethod
     def patch_chat_template(cls, template: str):
         LOC = r"{{ bos_token }}{{ ns.system_prompt }}"

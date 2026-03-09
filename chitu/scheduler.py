@@ -403,7 +403,7 @@ class Scheduler:
             if TaskPool.pool[task_id].dp_rank == self.dp_rank
         )
         schedule_dp_rank = (self.dp_rank,)
-        if n_running <= self.max_runing_tasks:
+        if n_running < self.max_runing_tasks:
             schedule_dp_rank += (None,)
         # find the first available task
         first_task = None

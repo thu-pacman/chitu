@@ -39,3 +39,4 @@ mtp_tie_word_embeddings: True
 mtp_tie_lm_head: True
 eos_token_id: "$(config.json:eos_token_id)"
 tool_parser: GLM47ToolParser
+reasoning_without_begin: true

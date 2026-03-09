@@ -109,10 +109,9 @@ fi
 
 # NOTE: Test dependencies include:
 # - pytest is for test/pytest (for all platforms).
-# - aiohttp is for service tests (for all platforms).
-# - matplotlib is for benchmarks/op_bench (for platforms with triton).
+# - matplotlib is for op benchmarks in test/pytest, and benchmarks/visualize_response.py (for all platforms).
 RUN if [ "${enable_test}" = "true" ]; then \
-    pip install pytest aiohttp matplotlib; \
+    pip install pytest matplotlib; \
 fi
 
 WORKDIR /workspace/chitu

@@ -7,7 +7,7 @@ from ..type_def import ChoiceToolCall, ChoiceDelta
 from .type_def import ToolsInfo
 from .context import ParseContext, StreamParseContext
 from .parser import AbstractParser
-from ..stream_parse import BufferedStream
+from .stream_parse import BufferedStream
 
 
 def parse_string(

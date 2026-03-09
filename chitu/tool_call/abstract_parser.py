@@ -16,11 +16,6 @@ class AbstractToolParser(ABC):
 
     @classmethod
     @abstractmethod
-    def patch_chat_template(cls, template: str) -> str:
-        raise NotImplementedError
-
-    @classmethod
-    @abstractmethod
     def build_grammar(
         cls,
         params: ToolCallParams,
@@ -35,4 +30,15 @@ class AbstractToolParser(ABC):
     def parse_stream(
         self, stream: AsyncIterable[str]
     ) -> AsyncIterable[ChoiceDelta | AsyncIterable[ChoiceDelta]]:
+        raise NotImplementedError
+
+
+class JsonMessageToolParserMixin(ABC):
+    pass
+
+
+class PatchTemplateToolParserMixin(ABC):
+    @classmethod
+    @abstractmethod
+    def patch_chat_template(cls, template: str) -> str:
         raise NotImplementedError

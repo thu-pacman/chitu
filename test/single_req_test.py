@@ -38,7 +38,16 @@ msgs_vl = [
                 {"type": "image", "image": "test/test_images/test.jpg"},
             ],
         }
-    ]
+    ],
+    [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "请描述这张图片的内容"},
+                {"type": "image", "image": "test/test_images/test2.jpg"},
+            ],
+        }
+    ],
 ]
 
 USE_TOOLS = False

@@ -30,7 +30,6 @@ class ToolGrammar(AbstractToolGrammar):
     ):
         self.arguments = arguments
         self.begin, self.sep, self.end = template.split(mark)
-        assert self.sep != ""
 
     def build(self, name: str, schema: dict) -> TagFormat:
         arguments = self.arguments.build(schema)

@@ -1123,7 +1123,7 @@ class Executor:
             payload,
             self._get_output_token_offsets(tasks),
             pixel_values=self.vision_tensor_broadcast(
-                getattr(tasks, "pixel_values", None), 3, torch.bfloat16
+                getattr(tasks, "pixel_values", None), 2, torch.bfloat16, stack=False
             ),
             grid_thw=self.vision_tensor_broadcast(
                 getattr(tasks, "grid_thw", None), 2, torch.int64, stack=False

@@ -2,16 +2,18 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .simple_parser import SimpleParser
 from .utils import register
+from .abstract_parser import AbstractToolParser
+from .qwen3_parser import Qwen3GrammarImpl, Qwen3ParserImpl
+from .grammar import GrammarImplBase
+
+
+class Qwen3InstructGrammarImpl(GrammarImplBase):
+    root_grammar = Qwen3GrammarImpl.tools
 
 
 @register
-class Qwen3InstructToolParser(SimpleParser):
-    tool_begin_tag = "<tool_call>"
-    tool_template = '\n{"name": "{name}", "arguments": {arguments}}\n'
-    tool_end_tag = "</tool_call>"
-
-    @classmethod
-    def patch_chat_template(cls, template: str):
-        return template
+class Qwen3InstructToolParser(
+    Qwen3InstructGrammarImpl, Qwen3ParserImpl, AbstractToolParser
+):
+    pass

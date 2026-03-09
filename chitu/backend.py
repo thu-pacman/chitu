@@ -66,7 +66,7 @@ from chitu.tokenizer import (
     Processor,
 )
 from chitu.utils import try_import_opt_dep
-from chitu.tool_call import get_tool_parser
+from chitu.tool_call import get_tool_parser, patch_chat_template
 from chitu.constraint_decode import ConstraintDecodeManager
 from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div, get_global_args
 from chitu.moe import init_moe_impl
@@ -1323,29 +1323,7 @@ class Backend:
         logger.info(
             f"using tool parser {Backend.tool_parser} from config {repr(tool_parser_config)}"
         )
-        try:
-            Backend.tokenizer.model.chat_template = (
-                Backend.tool_parser.patch_chat_template(
-                    Backend.tokenizer.model.chat_template
-                )
-            )
-        except Exception:
-            logger.exception(f"patch chat template failed, tool call may be incorrect!")
-
-        # Initialize tool parser
-        tool_parser_config = getattr(args.models, "tool_parser", "MISSING")
-        Backend.tool_parser = get_tool_parser(tool_parser_config)
-        logger.info(
-            f"using tool parser {Backend.tool_parser} from config {repr(tool_parser_config)}"
-        )
-        try:
-            Backend.tokenizer.model.chat_template = (
-                Backend.tool_parser.patch_chat_template(
-                    Backend.tokenizer.model.chat_template
-                )
-            )
-        except Exception:
-            logger.exception(f"patch chat template failed, tool call may be incorrect!")
+        patch_chat_template(Backend.tool_parser, Backend.tokenizer.model)
 
         attn_backend_type = Backend._get_attention_backend_type(args)
 
