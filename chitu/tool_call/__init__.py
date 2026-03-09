@@ -2,7 +2,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .utils import get_tool_parser, parse_stream_by_parser
+from .utils import (
+    get_tool_parser,
+    parse_stream_by_parser,
+    adjust_message_for_tool_calls,
+    patch_chat_template,
+)
 from .type_def import (
     ChoiceDelta,
     ChoiceToolCall,

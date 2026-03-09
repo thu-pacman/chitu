@@ -27,7 +27,7 @@ from chitu.async_response import AsyncDataStream
 from chitu.backend import Backend
 from chitu.device_list import DeviceList, StaticDeviceListManager
 from chitu.global_vars import get_slot_handle, get_global_args
-from chitu.tool_call import ToolChoice, ToolCallParams
+from chitu.tool_call import ToolChoice, ToolCallParams, adjust_message_for_tool_calls
 from chitu.constraint_decode import ConstraintDecodeTask
 
 logger = getLogger(__name__)
@@ -196,6 +196,9 @@ class UserRequest:
         save_trace_dir: Optional[str] = None,
     ):
         # input related
+        if hasattr(Backend, "tool_parser"):
+            message = adjust_message_for_tool_calls(Backend.tool_parser, message)
+
         self.message = message
         self.request_id = request_id
         self.tokens = tokens
@@ -390,7 +393,7 @@ class MockFixedLengthedUserRequest(UserRequest):
     ):
         self.input_len = input_len
         super().__init__(
-            message="(this is a mock)",
+            message=["(this is a mock)"],
             request_id=request_id,
             logprobs=logprobs,
             top_logprobs=top_logprobs,

@@ -2,18 +2,52 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .simple_parser import SimpleParser
 from .utils import register
+from .abstract_parser import AbstractToolParser
+
+from .grammar import (
+    JsonArgumentsGrammar,
+    ToolGrammar,
+    TriggeredToolsGrammar,
+    ForceReasoningGrammar,
+    GrammarImplBase,
+)
+
+from .parse import (
+    TriggeredParser,
+    SequenceParser,
+    JsonArgumentsParser,
+    NameParser,
+    FunctionParser,
+    ContentParser,
+    ToolParserImplBase,
+)
+
+
+class Qwen3GrammarImpl(GrammarImplBase):
+    tool = ToolGrammar(
+        '<tool_call>\n{"name": "{}", "arguments": {}}\n</tool_call>',
+        arguments=JsonArgumentsGrammar(),
+    )
+    tools = TriggeredToolsGrammar(
+        tool=tool,
+        trigger="<tool_call>",
+    )
+    root_grammar = ForceReasoningGrammar("<think>{}</think>", tools=tools)
+
+
+class Qwen3ParserImpl(ToolParserImplBase):
+    tool = SequenceParser(
+        '\n{"name": "{}", "arguments": {}}\n',
+        parsers=[NameParser(), JsonArgumentsParser()],
+    )
+    root_parser = TriggeredParser(
+        "<tool_call>{}</tool_call>",
+        parser=FunctionParser(tool),
+        outside_parser=ContentParser(),
+    )
 
 
 @register
-class Qwen3ToolParser(SimpleParser):
-    reasoning_begin_tag = "<think>"
-    reasoning_end_tag = "</think>"
-    tool_begin_tag = "<tool_call>"
-    tool_template = '\n{"name": "{name}", "arguments": {arguments}}\n'
-    tool_end_tag = "</tool_call>"
-
-    @classmethod
-    def patch_chat_template(cls, template: str):
-        return template
+class Qwen3ToolParser(Qwen3GrammarImpl, Qwen3ParserImpl, AbstractToolParser):
+    pass

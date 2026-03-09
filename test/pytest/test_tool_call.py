@@ -1,33 +1,10 @@
-from collections import defaultdict
 import random, xgrammar
 
-from chitu.tool_call.simple_parser import Automaton
 from chitu.constraint_decode import apply_bitmask
 import torch
 from chitu.utils import try_import_and_setup_torch_npu
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-
-
-def test_automaton():
-    rules = dict(a={"<tag>": "b"}, b={"</tag>": "a"})
-    rules_regix = Automaton.generate_regex(rules)
-    CASES = [
-        ("123<tag>456</tag>789", "123789", "456"),
-        ("123<tag>456789</tag>", "123", "456789"),
-    ]
-    for data, result_a, result_b in CASES:
-        for _ in range(10000):
-            pos = 0
-            results = defaultdict(str)
-            automaton = Automaton(rules, rules_regix, "a")
-            while pos < len(data):
-                end_pos = min(pos + random.randint(1, 6), len(data))
-                content, state = automaton.step(data[pos:end_pos])
-                results[state] += content
-                pos = end_pos
-            results[automaton.state] += automaton.buffer
-            assert results["a"] == result_a and results["b"] == result_b
 
 
 def test_regex_reject_tags():

@@ -7,7 +7,7 @@ import logging
 import re
 from typing import AsyncIterable
 
-from ..stream_parse import BufferedStream
+from .stream_parse import BufferedStream
 from .context import ParseContext, StreamParseContext, ChoiceDelta
 
 logger = logging.getLogger(__name__)
@@ -27,12 +27,17 @@ class AbstractParser(ABC):
         pass
 
 
-class NotImplementedParser(AbstractParser):
+class EmptyStringParser(AbstractParser):
     def parse(self, ctx, string):
-        raise NotImplementedError()
+        if string:
+            raise ValueError(f"expected empty string but got {repr(string)}")
 
-    def stream_parse(self, ctx, stream):
-        raise NotImplementedError()
+    async def stream_parse(self, ctx, stream):
+        string = await stream.to_string()
+        if string:
+            raise ValueError(f"expected empty string but got {repr(string)}")
+        return
+        yield ChoiceDelta()
 
 
 class IgnoreParser(AbstractParser):
@@ -151,6 +156,30 @@ class SequenceParser(AbstractParser):
             )
 
 
+class TakeBeforeParser(AbstractParser):
+    def __init__(
+        self, separator: str, *, parser: AbstractParser, after_parser: AbstractParser
+    ):
+        self.separator = separator
+        self.parser = parser
+        self.after_parser = after_parser
+
+    def parse(self, ctx, string):
+        segments = string.split(self.separator, 1)
+        self.parser.parse(ctx, segments[0])
+        if len(segments) > 1:
+            self.after_parser.parse(ctx, self.separator + segments[1])
+
+    async def stream_parse(self, ctx, stream):
+        segment = stream.take_until(self.separator, False)
+        async for delta in self.parser.stream_parse(ctx, segment):
+            yield delta
+        await segment.drop_all()
+        async for delta in self.after_parser.stream_parse(ctx, stream):
+            yield delta
+        await stream.drop_all()
+
+
 class ContentParser(AbstractParser):
     def parse(self, ctx, string):
         ctx.as_content(string)
@@ -227,3 +256,11 @@ class JsonArgValueParser(AbstractParser):
 
     def stream_parse(self, ctx, stream):
         return ctx.as_arg_value(stream)
+
+
+class JsonArgumentsParser(AbstractParser):
+    def parse(self, ctx, string):
+        ctx.as_arguments(string)
+
+    def stream_parse(self, ctx, stream):
+        return ctx.as_arguments(stream)

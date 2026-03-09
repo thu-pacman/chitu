@@ -1,51 +1,36 @@
-import random, asyncio
+import random, asyncio, json
 import rich
 import xgrammar
 
 from chitu.tool_call import ToolCallParams, get_tool_parser
 from chitu.tool_call.type_def import ChoiceToolCall, ChoiceToolCallFunction
 
+test_type_arguments = json.dumps({"ks": "vs", "ko": {"kb": True}, "ka": [1, 2, 3]})
+
 TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_temperature",
-            "description": "Get today's temperature in a given location",
+            "name": "test_type",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "location": {
-                        "type": "string",
-                        "description": "City or province, e.g. Beijing / Guangdong",
+                    "ks": {"type": "string"},
+                    "ko": {
+                        "type": "object",
+                        "properties": {"kb": {"type": "boolean"}},
+                        "required": ["kb"],
                     },
-                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                    "ka": {"type": "array", "items": {"type": "integer"}},
                 },
-                # "required": ["location", "unit"],
-                "required": ["location"],
+                "required": ["ks"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "get_humidity",
-            "description": "Get today's humidity (0-1) in a given location",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "multiplier": {
-                        "type": "number",
-                    }
-                },
-                "required": ["multiplier"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_date",
-            "description": "Get today's humidity (0-1) in a given location",
+            "name": "test_empty",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -87,13 +72,22 @@ def run_match(
             accept = False
             break
         accepted += chunk
-    if accept != std_accept:
-        if not accept:
-            raise ValueError(f"{accepted=}")
-        raise ValueError("should not accept")
+    end = ""
+    if accept:
+        accept = matcher.accept_token(stop_token_id)
+        if accept:
+            end += "EOS accepted"
+    if accept:
+        accept = matcher.is_terminated()
+        if accept:
+            end += ", terminated"
+
     if std_accept:
-        assert matcher.accept_token(stop_token_id)
-        assert matcher.is_terminated()
+        if not accept:
+            raise ValueError(f"accepted {repr(accepted)}, end: {end}")
+    else:
+        if accept:
+            raise ValueError("should not accept")
 
 
 async def async_stream(data: str):
@@ -113,47 +107,48 @@ def run_parse(
     parser_cls = get_tool_parser(parser)
     parser_obj = parser_cls(TOOLS)
 
-    content, tools = parser_obj.parse_string(data)
-    for i, tool in enumerate(tools):
-        tool.id = f"tool_id_{i}"
-    try:
-        assert content == std_content
-        assert tools == std_tools
-    except:
-        rich.print(content)
-        rich.print(tools)
-        raise
+    def parse():
+        content, tools = parser_obj.parse_string(data)
+        for i, tool in enumerate(tools):
+            tool.id = f"tool_id_{i}"
+        try:
+            assert content == std_content
+            assert tools == std_tools
+        except:
+            rich.print(content)
+            rich.print(tools)
+            raise
 
     async def stream_parse():
         content = ""
-        tool_calls: list[ChoiceToolCall] = []
+        tools: list[ChoiceToolCall] = []
 
         try:
             async for delta in parser_obj.parse_stream(async_stream(data)):
                 content += delta.content or ""
                 for tool_delta in delta.tool_calls or []:
-                    if tool_delta.index >= len(tool_calls):
-                        assert len(tool_calls) == tool_delta.index
-                        tool_calls.append(
+                    if tool_delta.index >= len(tools):
+                        assert len(tools) == tool_delta.index
+                        tools.append(
                             ChoiceToolCall(
                                 id=tool_delta.id or "",
                                 type="function",
                                 function=ChoiceToolCallFunction(name="", arguments=""),
                             )
                         )
-                    tool = tool_calls[tool_delta.index]
+                    tool = tools[tool_delta.index]
                     tool.function.name += tool_delta.function.name or ""
                     tool.function.arguments += tool_delta.function.arguments or ""
+            for i, tool in enumerate(tools):
+                tool.id = f"tool_id_{i}"
+            assert content == std_content
+            assert tools == std_tools
         except Exception:
             rich.print(content)
-            rich.print(tool_calls)
+            rich.print(tools)
             raise
 
-        for i, tool in enumerate(tools):
-            tool.id = f"tool_id_{i}"
-        assert content == std_content
-        assert tools == std_tools
-
+    parse()
     asyncio.run(stream_parse())
 
 
@@ -163,20 +158,129 @@ def make_std_tool(name: str, arguments: str):
     )
 
 
+std_tools = [
+    make_std_tool("test_type", test_type_arguments),
+    make_std_tool("test_empty", "{}"),
+]
+
+
+def test_deepseekv3():
+    parser = "DeepSeekV3ToolParser"
+    data = (
+        "begin-<｜tool▁calls▁begin｜>"
+        f"<｜tool▁call▁begin｜>function<｜tool▁sep｜>test_type\n```json\n{test_type_arguments}\n```<｜tool▁call▁end｜>"
+        "\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>test_empty\n```json\n{}\n```<｜tool▁call▁end｜>"
+        "<｜tool▁calls▁end｜>-end"
+    )
+    run_match(parser, data, True)
+    run_parse(parser, data, "begin--end", std_tools)
+
+
+def test_deepseekv31():
+    parser = "DeepSeekV31ToolParser"
+
+    data = (
+        "begin-<｜tool▁calls▁begin｜>"
+        f"<｜tool▁call▁begin｜>test_type<｜tool▁sep｜>{test_type_arguments}<｜tool▁call▁end｜>"
+        "<｜tool▁call▁begin｜>test_empty<｜tool▁sep｜>{}<｜tool▁call▁end｜>"
+        "<｜tool▁calls▁end｜>-end"
+    )
+    run_match(parser, data, True, enable_reasoning=False)
+    run_parse(parser, data, "begin--end", std_tools)
+
+
 def test_deepseekv32():
     parser = "DeepSeekV32ToolParser"
-    data = """begin-<｜DSML｜function_calls>\n<｜DSML｜invoke name="get_temperature">\n<｜DSML｜parameter name="location" string="true">Shenzhen</｜DSML｜parameter>\n<｜DSML｜parameter name="unit" string="true">celsius</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name="get_humidity">\n<｜DSML｜parameter name="multiplier" string="false">0.15</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name="get_date">\n</｜DSML｜invoke>\n</｜DSML｜function_calls>-end"""
+    data = (
+        "begin-<｜DSML｜function_calls>\n"
+        '<｜DSML｜invoke name="test_type">\n'
+        '<｜DSML｜parameter name="ks" string="true">vs</｜DSML｜parameter>\n'
+        '<｜DSML｜parameter name="ko" string="false">{"kb": true}</｜DSML｜parameter>\n'
+        '<｜DSML｜parameter name="ka" string="false">[1, 2, 3]</｜DSML｜parameter>\n'
+        "</｜DSML｜invoke>\n"
+        '<｜DSML｜invoke name="test_empty">\n</｜DSML｜invoke>\n'
+        "</｜DSML｜function_calls>-end"
+    )
     run_match(parser, "reason</think>" + data, True)
+    run_match(parser, data, False, tool_choice="required")
+    data_reasoning = data.replace("begin-", "reason</think>")
+    run_match(parser, data_reasoning, True, tool_choice="required")
+    run_parse(parser, data, "begin--end", std_tools)
 
-    std_content = "begin--end"
-    std_tools = [
-        make_std_tool("get_temperature", '{"location": "Shenzhen", "unit": "celsius"}'),
-        make_std_tool("get_humidity", '{"multiplier": 0.15}'),
-        make_std_tool("get_date", "{}"),
-    ]
-    run_parse(parser, data, std_content, std_tools)
+
+def test_glm47():
+    parser = "GLM47ToolParser"
+    data = (
+        "begin-<tool_call>test_type"
+        "<arg_key>ks</arg_key><arg_value>vs</arg_value>"
+        '<arg_key>ko</arg_key><arg_value>{"kb": true}</arg_value>'
+        "<arg_key>ka</arg_key><arg_value>[1, 2, 3]</arg_value>"
+        "</tool_call>-mid-"
+        "<tool_call>test_empty</tool_call>-end"
+    )
+    run_match(parser, data, True)
+    run_match(parser, data, False, tool_choice="required")
+    data_reasoning = data.replace("begin-", "reason</think>")
+    run_match(parser, data_reasoning, True, tool_choice="required")
+    run_parse(parser, data, "begin--mid--end", std_tools)
+
+
+def test_qwen3coder():
+    parser = "Qwen3CoderToolParser"
+    data = (
+        "begin-"
+        "<tool_call>\n<function=test_type>\n"
+        "<parameter=ks>\nvs\n</parameter>\n"
+        '<parameter=ko>\n{"kb": true}\n</parameter>\n'
+        "<parameter=ka>\n[1, 2, 3]\n</parameter>\n"
+        "</function>\n</tool_call>"
+        "-mid-"
+        "<tool_call>\n<function=test_empty>\n</function>\n</tool_call>"
+        "-end"
+    )
+    run_match(parser, data, True)
+    run_parse(parser, data, "begin--mid--end", std_tools)
+
+
+def test_qwen3():
+    parser = "Qwen3ToolParser"
+    data = (
+        "begin-"
+        '<tool_call>\n{"name": "test_type", "arguments": '
+        f"{test_type_arguments}"
+        "}\n</tool_call>"
+        "-mid-"
+        '<tool_call>\n{"name": "test_empty", "arguments": {}}\n</tool_call>'
+        "-end"
+    )
+    run_match(parser, data, True)
+    run_match(parser, data, False, tool_choice="required")
+    data_reasoning = data.replace("begin-", "<think>reason</think>")
+    run_match(parser, data_reasoning, True, tool_choice="required")
+    run_parse(parser, data, "begin--mid--end", std_tools)
+
+
+def test_qwen3_instruct():
+    parser = "Qwen3InstructToolParser"
+    data = (
+        "begin-"
+        '<tool_call>\n{"name": "test_type", "arguments": '
+        f"{test_type_arguments}"
+        "}\n</tool_call>"
+        "-mid-"
+        '<tool_call>\n{"name": "test_empty", "arguments": {}}\n</tool_call>'
+        "-end"
+    )
+    run_match(parser, data, True)
+    run_parse(parser, data, "begin--mid--end", std_tools)
 
 
 if __name__ == "__main__":
+    test_deepseekv3()
+    test_deepseekv31()
     test_deepseekv32()
+    test_glm47()
+    test_qwen3coder()
+    test_qwen3()
+    test_qwen3_instruct()
     print("test ok")

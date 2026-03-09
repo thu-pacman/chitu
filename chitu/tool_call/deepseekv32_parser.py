@@ -88,6 +88,4 @@ class DeepSeekV32ParserImpl(ToolParserImplBase):
 class DeepSeekV32ToolParser(
     DeepSeekV32ParserImpl, DeepSeekV32GrammarImpl, AbstractToolParser
 ):
-    @classmethod
-    def patch_chat_template(cls, template: str):
-        return template
+    pass
