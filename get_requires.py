@@ -41,6 +41,7 @@ install_requires = [
     "xgrammar>=0.1.31",
     "openai",
     "anthropic",
+    "aiohttp",
 ]
 
 

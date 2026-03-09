@@ -37,10 +37,10 @@ fi
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
 # NOTE: Test dependencies include:
 # - pytest is for test/pytest (for all platforms).
-# - aiohttp is for service tests (for all platforms).
+# - matplotlib is for op benchmarks in test/pytest, and benchmarks/visualize_response.py (for all platforms).
 RUN if [ "${enable_test}" = "true" ]; then \
     apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping && \
-    pip install pytest aiohttp; \
+    pip install pytest matplotlib; \
 fi
 RUN apt update -y && apt install -y curl
 
