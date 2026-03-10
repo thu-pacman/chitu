@@ -717,6 +717,10 @@ class PagedKVCacheManager(KVCacheManagerBase):
         """Prepare cache for DLLM decode: reserve blocks for decoding_start + block_length.
         Does NOT update req_id_to_seq_len (caller updates when block finishes)."""
         self.curr_req_ids = req_ids
+        self.seq_len_delta.copy_from_list(
+            [decoding_start_list[i] for i in range(len(req_ids))],
+            [decoding_start_list[i] + block_length for i in range(len(req_ids))],
+        )
         for i, req_id in enumerate(req_ids):
             target = decoding_start_list[i] + block_length
             num_additional_blocks = self.num_additional_blocks_req_need(req_id, target)

@@ -208,7 +208,8 @@ async def create_chat_completion(
             priority=task_priority,
             infermode=infermode,
         )
-        logger.info(f"enqueue task: {task.task_id}, task content: {user_req.messages}, task type: {task.task_type}")
+        logger.info(f"infermode: {infermode}")
+        logger.info(f"enqueue task: {task.task_id}, task content: {user_req.message}, task type: {task.task_type}")
         TaskPool.enqueue(task)
         if req.stream:
             return StreamingResponse(

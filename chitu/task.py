@@ -30,6 +30,7 @@ from chitu.distributed.parallel_state import get_dp_size
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.tool_call import ToolChoice, ToolCallParams
 from chitu.constraint_decode import ConstraintDecodeTask
+from chitu.serve.event_loop import get_server_event_loop
 
 logger = getLogger(__name__)
 
@@ -543,6 +544,9 @@ class Task(ConstraintDecodeTask):
     def need_remove(self):
         return self.decode_status == TaskDecodeType.Stopped
 
+    def complete_block(self, block: list[int]) -> None:
+        pass
+
     def running(self):
         return self._decode_status != TaskDecodeType.Stopped
 
@@ -798,7 +802,7 @@ class Task(ConstraintDecodeTask):
                     else:
                         mask_id = 0  # Fallback, ideally should never hit
                     self.next_block = self.next_block + [mask_id] * pad_len
-                print(f"{self.task_id=} {self.next_block=}")
+                logger.info(f"{self.task_id=} {self.next_block=}")
             logger.debug(
                 f"[task.consume] task={self.task_id} prefill->decode "
                 f"consumed={self.consumed_req_tokens}/{self.prefix_tokens_len}"
@@ -1450,6 +1454,8 @@ class TaskCollector:
     @staticmethod
     def sync_generated_tasks_results():
         for tasks in TaskCollector._generated_tasks:
+            logger.info(f"tasks.generated_result: {tasks.generated_result}")
+            logger.info(f"tasks.task_ids: {tasks.task_ids}")
             if tasks.generated_result is not None:
                 tasks.generated_result = tasks.generated_result.cpu()
 

@@ -1104,6 +1104,7 @@ class Executor:
         self._lb_enabled = self._lb_planner is not None
         self._lb_every = args.infer.moe_lb_trigger
         self._lb_step = 0
+        self._pending_dllm_block = None
 
     def _should_record_metrics(
         self, num_tokens: int = 0, is_prefill: bool = False
@@ -1757,7 +1758,7 @@ class Executor:
             for it, task in enumerate(tasks.tasks):
                 task.decoding_start = prefilling_lengths[it] + task.consumed_req_tokens
         max_prefilling_length = max(prefilling_lengths) if prefilling_lengths else 0
-
+        logger.info(f"max_prefilling_length: {max_prefilling_length}")
         if is_empty_step or max_prefilling_length == 0:
             for mgr in Backend.cache_managers.values():
                 mgr.finalize_cache_all_prefill()
@@ -1773,7 +1774,9 @@ class Executor:
             .unsqueeze(0)
             .repeat(len(tasks.tasks), 1, 1)
         )
-        output = Backend.model(
+        logger.info(f"type of Backend.model: {type(Backend.model)}")
+        logger.info(f"type of Backend.model.model: {type(Backend.model.model)}")
+        output = Backend.model.model(
             token_array[:, :max_prefilling_length].clone(memory_format=torch.contiguous_format),
             use_cache=True,
             attention_mask=bd_attn_mask[:, :max_prefilling_length, :max_prefilling_length].clone(
@@ -1887,7 +1890,7 @@ class Executor:
                 mgr.prepare_cache_decode_dllm(
                     tasks.req_ids, decoding_start_list, block_length
                 )
-        logger.info(f"{payload=}{payload.shape=}")
+        logger.debug(f"{payload=}{payload.shape=}")
         PrometheusMetricsCollector.update_kvcache_usage()
 
         # 3) Read past_key_values from Chitu paged cache
@@ -1920,8 +1923,6 @@ class Executor:
 
             past_k_list = []
             past_v_list = []
-            block_size = getattr(cache_manager, "block_size", 512)
-
             for layer_id in range(num_layers):
                 try:
                     accessor = cache_manager.get_accessor(layer_id)
@@ -1947,10 +1948,15 @@ class Executor:
                     else:
                         past_v_list.append(dense)
 
-            # Model expects list of (k, v) per layer
-            past_key_values = [
-                (past_k_list[i], past_v_list[i]) for i in range(num_layers)
-            ]
+            # Stack to tensor [num_layers, 2, batch, num_kv_heads, cache_len, head_dim]
+            past_key_values = torch.stack(
+                [
+                    torch.stack([past_k_list[i], past_v_list[i]], dim=0)
+                    for i in range(len(past_k_list))
+                ],
+                dim=0,
+            )
+            logger.info(f"past_key_values shape: {past_key_values.shape}")
         else:
             past_key_values = None
 
@@ -1959,6 +1965,7 @@ class Executor:
         decoding_start_t = torch.tensor(
             decoding_start_list, device=self.device, dtype=torch.long
         )
+        logger.info(f"decoding_start_t: {decoding_start_t=}")
         decoding_pos_ids = (
             torch.arange(block_length, device=self.device, dtype=torch.long)
             .unsqueeze(0)
@@ -1968,6 +1975,7 @@ class Executor:
 
         # 5) Model forward
         self.timers("decode").start()
+        logger.info(f"decoding_block: {decoding_block=}")
         output = model_runner(
             decoding_block,
             use_cache=True,
@@ -1975,9 +1983,8 @@ class Executor:
             past_key_values=past_key_values,
         )
         self.timers("decode").stop()
-
         logits = output.logits
-
+        logger.debug(f"{logits=}{logits.shape=}")
         # 6) batch_decode: update block in token array
         total_len = max(decoding_start_list) + block_length
         x_data = torch.full(
@@ -1997,12 +2004,14 @@ class Executor:
             logits, decoding_start_t, x, block_length
         )
 
+        
         # 7) block_finished: no mask left in block
         decoded_block = x.data[
             torch.arange(batch_size, device=self.device).unsqueeze(1),
             decoding_start_t.unsqueeze(1)
             + torch.arange(block_length, device=self.device).unsqueeze(0),
         ]
+        logger.info(f"decoded_block: {decoded_block=}")
         block_finished = (decoded_block == mask_id).sum(dim=1) == 0
         block_finished_list = block_finished.cpu().tolist()
 
@@ -2059,17 +2068,43 @@ class Executor:
                     tasks.req_ids, block_finished_list, block_length
                 )
 
-        # 10) Update task state: next_block, decoding_start, response, _decode_status
+        # 10) Update task state: next_block, decoding_start; for block_finished only,
+        #     create PackedTasks with tokens+output, append to generated_tasks (align with step flow)
+        #     Store generated_result as tensor (same as AR) to avoid early CPU transfer
+        block_finished_tasks = []
+        block_tokens_tensors = []
         for i, task in enumerate(tasks.tasks):
-            new_block = x.data[
+            block_slice = x.data[
                 i, decoding_start_list[i] : decoding_start_list[i] + block_length
-            ].cpu().tolist()
-            task.next_block = new_block
+            ]
+            task.next_block = block_slice.cpu().tolist()
             if block_finished_list[i]:
                 task.decoding_start += block_length
-                task.add_data(new_block)
-                if eos_id in new_block:
+                block_finished_tasks.append(task)
+                block_tokens_tensors.append(block_slice.clone())
+
+        if block_finished_tasks:
+            block_tasks = PackedTasks([], tasks=block_finished_tasks)
+            block_tasks.generated_result = torch.stack(block_tokens_tensors)
+            # Store for executor-only processing (avoid task.py changes)
+            self._pending_dllm_block = block_tasks
+        else:
+            self._pending_dllm_block = None
+
+        for i, task in enumerate(tasks.tasks):
+            if block_finished_list[i]:
+                if eos_id in task.next_block:
                     task._decode_status = TaskDecodeType.Stopped
+                    if task.req is not None:
+                        task.req.finish_reason = "stop"
+                elif (
+                    task.req is not None
+                    and task.req.num_output_tokens + len(task.next_block)
+                    >= task.req.max_new_tokens
+                ):
+                    task._decode_status = TaskDecodeType.Stopped
+                    if task.req is not None:
+                        task.req.finish_reason = "length"
 
         # Send output to dispatchers (for PP, etc.)
         for dispatcher in self.task_dispatchers:
@@ -2158,6 +2193,38 @@ class Executor:
                     Backend.model.last_hidden_states_4_postprocess[it : it + 1, :]
                 )
 
+    def _process_dllm_block_results(self):
+        """Process DLLM block tokens: update each task and emit BatchResult per token pos."""
+        if torch.distributed.get_rank() > 0:
+            self._pending_dllm_block = None
+            return
+        block_tasks = self._pending_dllm_block
+        self._pending_dllm_block = None
+        result = block_tasks.generated_result
+        if result is None:
+            return
+        result = result.cpu()
+        block_length = result.shape[1]
+        tasks_list = block_tasks.tasks
+        for pos in range(block_length):
+            next_tokens = [int(result[i, pos].item()) for i in range(len(tasks_list))]
+            for i, task in enumerate(tasks_list):
+                task.update_response_sync(next_tokens[i])
+            batch_result = BatchResult(
+                num_tasks=len(tasks_list),
+                tasks=tasks_list,
+                next_tokens=next_tokens,
+                return_logprobs=block_tasks.return_logprobs,
+                logprobs=None,
+                token_idxs=None,
+                mtp_token_list=(
+                    [t.mtp_token_list for t in tasks_list]
+                    if get_global_args().infer.mtp_size > 1
+                    else None
+                ),
+            )
+            TaskCollector.append_to_last_batch_results(batch_result)
+
     def postprocess_sync_part(self, tasks: PackedTasks):
         """
         schedule -> model -> sample -> ***sync*** -> send
@@ -2182,6 +2249,13 @@ class Executor:
                     tasks_list = PPTaskCollector.update_ongoing()
         elif self.rank == 0 or self.dp_dispatcher:
             TaskCollector.sync_generated_tasks_results()
+            # Process DLLM block results in executor (avoid task.py changes)
+            # TODO: integrate with dp_dispatcher when DP is enabled
+            if self._pending_dllm_block is not None:
+                if self.dp_dispatcher:
+                    self._pending_dllm_block = None
+                else:
+                    self._process_dllm_block_results()
             if self.dp_dispatcher:
                 collect_tasks = TaskCollector.get_generated_tasks()
                 if collect_tasks.generated_result is not None:

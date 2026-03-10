@@ -66,7 +66,8 @@ run_server(){
 run_benchmark(){
     local host_name=$1
     local temp_file=$(mktemp)
-    for bsz in 1 2 4 8 16 32 64 128 256
+    # for bsz in 1 2 4 8 16 32 64 128 256
+    for bsz in 1
     do
         python benchmarks/benchmark_serving.py \
             --batch-size $bsz \
@@ -76,6 +77,7 @@ run_benchmark(){
             --output-len 1024 \
             --warmup 1 \
             --base-url http://${host_name}:21002 \
+            --output-dir "./results" \
             --dataset sharegpt \
             --dataset-path /home/dataset/SharedGPT/ShareGPT_V3_unfiltered_cleaned_split.json \
             2>&1 | stdbuf -o0 tee "$temp_file"  # Do not delete
