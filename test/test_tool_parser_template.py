@@ -111,7 +111,7 @@ PARSE_EXPECTED = (
 )
 PARSER_TOOLS = TOOLS + [WEATHER_TOOL]
 
-CANDIDATES = [
+DSV32_CANDIDATES = [
     '<｜DSML｜function_calls>\n<｜DSML｜invoke name="get_temperature">\n<｜DSML｜parameter name="location" string="true">Beijing</｜DSML｜parameter>\n<｜DSML｜parameter name="unit" string="true">celsius</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>',
     '<｜DSML｜function_calls>\n<｜DSML｜invoke name="get_humidity">\n<｜DSML｜parameter name="location" string="true">Beijing</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>',
     '<｜DSML｜function_calls>\n<｜DSML｜invoke name="get_temperature">\n<｜DSML｜parameter name="location" string="true">Beijing</｜DSML｜parameter>\n<｜DSML｜parameter name="unit" string="true">celsius</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name="get_humidity">\n<｜DSML｜parameter name="location" string="true">Beijing</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>',
@@ -120,6 +120,8 @@ CANDIDATES = [
     '<｜DSML｜function_calls>\n<｜DSML｜invoke name="get_temperature">\n</｜DSML｜invoke>\n</｜DSML｜function_calls>',
     '<｜DSML｜function_calls>\n<｜DSML｜invoke name="noop">\n</｜DSML｜invoke>\n</｜DSML｜function_calls>',
 ]
+
+CANDIDATES = DSV32_CANDIDATES
 
 GRAMMAR_CASES = [
     {

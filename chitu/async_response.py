@@ -4,6 +4,7 @@
 
 import asyncio
 import threading
+import functools
 from datetime import datetime
 from logging import getLogger
 from typing import Optional
@@ -14,9 +15,14 @@ from chitu.backend import Backend
 from chitu.tokenizer import Tokenizer, TokenizerHF
 from chitu.serve.event_loop import get_server_event_loop
 from chitu.tool_call import ChoiceDelta, parse_stream_by_parser
-from chitu.reasoning.utils import get_initial_reasoning_state
+from chitu.global_vars import get_global_args
 
 logger = getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def get_initial_reasoning_state():
+    return getattr(get_global_args().models, "reasoning_without_begin", False)
 
 
 class ChatCompletionResponse(BaseModel):
@@ -99,7 +105,9 @@ class AsyncDataStream:
         self.notify_server_threadsafe()
 
     def reasoning_handle(self, value: int):
-        if not self.is_reasoning and self.tokens_len == 0 and value == self.rs_token_id:
+        if (
+            not self.is_reasoning and value == self.rs_token_id and self.tokens_len <= 1
+        ):  # Workaround: some models output '\n' or ' '  before <think> tag
             self.is_reasoning = True
         if self.is_reasoning:
             if value == self.re_token_id:
