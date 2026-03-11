@@ -411,7 +411,7 @@ class Transformer(nn.Module):
         self, state_dict: dict[str, Any], prefix: str, skip_preprocess: bool = False
     ) -> nn.Module:
         state_dict = self.preprocess_state_dict_parallel(
-            state_dict, skip_preprocess=skip_preprocess, is_layerwise=True
+            state_dict, skip_preprocess=skip_preprocess
         )
         module_state_dict = {}
         for key, value in state_dict.items():
@@ -889,7 +889,6 @@ class Transformer(nn.Module):
         state_dict: dict[str, Any],
         *,
         skip_preprocess: bool = False,
-        is_layerwise: bool = False,
         replace: bool = True,
     ) -> dict[str, Any]:
         if not skip_preprocess:
@@ -915,7 +914,7 @@ class Transformer(nn.Module):
                     ):
                         state_dict.pop(key, None)
 
-            if self.pipeline_exec and not is_layerwise:
+            if self.pipeline_exec:
                 state_dict = self._chunk_checkpoint_for_pipeline_parallel(
                     state_dict, self.global_n_layers, self.pp_stage, self.pp_size
                 )
