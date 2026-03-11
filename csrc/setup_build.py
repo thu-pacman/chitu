@@ -48,18 +48,20 @@ def get_extensions():
 
     muxi_build = os.environ.get("CHITU_MUXI_BUILD", "0").strip()
     ascend_build = os.environ.get("CHITU_ASCEND_BUILD", "0").strip()
+    torch_cuda_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
 
     enable_nvfp4 = os.environ.get("ENABLE_NVFP4", "0") == "1"
-    enable_marlin = muxi_build == "0"
+    enable_marlin = False
+    if muxi_build == "0":
+        for arch in torch_cuda_arch_list.split():
+            if arch.startswith("8.") or arch.startswith("9."):
+                enable_marlin = True
     enable_custom_all_reduce = (muxi_build == "0") and (ascend_build == "0")
 
     if enable_nvfp4:
         cutlass_path = os.path.join(this_dir, "../third_party/cutlass")
         cxx_extra_args += ["-DENABLE_NVFP4"]
-        nvcc_extra_args += [
-            "-DENABLE_NVFP4",
-            "-gencode=arch=compute_120a,code=compute_120a",
-        ]
+        nvcc_extra_args += ["-DENABLE_NVFP4"]
         extra_include_dirs += [
             os.path.join(cutlass_path, "include"),
             os.path.join(cutlass_path, "tools/util/include"),
@@ -70,6 +72,11 @@ def get_extensions():
         ]
 
     if enable_marlin:
+        cxx_extra_args += ["-DENABLE_MARLIN"]
+        nvcc_extra_args += [
+            "-DENABLE_MARLIN",
+            "-static-global-template-stub=false",  # Backward compatibility for CUDA <13
+        ]
         generate_files()
         extra_sources += [
             os.path.join(this_dir, "cuda/marlin/marlin_gemm/gptq_marlin.cu"),

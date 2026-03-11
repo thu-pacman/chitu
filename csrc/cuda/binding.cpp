@@ -64,8 +64,7 @@ void init_compute(py::module &m) {
           "buffer"_a);
     m.def("w4a8_per_group_gemm_forward_cuda", &w4a8_per_group_gemm_forward_cuda,
           "");
-#if !defined(CHITU_MUXI_BUILD) ||                                              \
-    (defined(CHITU_MUXI_BUILD) && !CHITU_MUXI_BUILD)
+#if defined ENABLE_MARLIN && ENABLE_MARLIN
     m.def("gptq_marlin_gemm", &gptq_marlin_gemm, "VLLM Marlin GEMM");
     m.def("moe_wna16_marlin_gemm", &moe_wna16_marlin_gemm,
           "VLLM Marlin Group GEMM");
