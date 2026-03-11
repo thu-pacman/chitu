@@ -49,7 +49,7 @@ def _render_full_doc(models: list[tuple[str, Any]], lang: str) -> str:
 
     # Generate a table, example:
     #
-    # | Name | Support tool calling (featuring constraint decoding) | Usage (append the argument below when starting Chitu) | How to obtain the model |
+    # | Name | Support tool calling (featuring constrained decoding) | Usage (append the argument below when starting Chitu) | How to obtain the model |
     # |------|------------------------------------------------------|-------------------------------------------------------|-------------------------|
     # | name | ✓                                                    | `models=file_name`                                    | http://...              |
 
@@ -64,7 +64,7 @@ def _render_full_doc(models: list[tuple[str, Any]], lang: str) -> str:
         lines.append("## Open-source models")
         lines.append("")
         lines.append(
-            "| Name | Support tool calling (featuring constraint decoding) | Usage (append the argument below when starting Chitu) | How to obtain the model |"
+            "| Name | Support tool calling (featuring constrained decoding) | Usage (append the argument below when starting Chitu) | How to obtain the model |"
         )
     lines.append("|---|---|---|---|")
     for filename, cfg in _sort_models(models, is_pro=False):

@@ -4,7 +4,7 @@
 
 ## Open-source models
 
-| Name | Support tool calling (featuring constraint decoding) | Usage (append the argument below when starting Chitu) | How to obtain the model |
+| Name | Support tool calling (featuring constrained decoding) | Usage (append the argument below when starting Chitu) | How to obtain the model |
 |---|---|---|---|
 | DeepSeek-R1 | ✓ | `models=DeepSeek-R1` | https://huggingface.co/deepseek-ai/DeepSeek-R1 |
 | DeepSeek-R1-Distill-Llama-70B |  | `models=DeepSeek-R1-Distill-Llama-70B` | https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-70B |
