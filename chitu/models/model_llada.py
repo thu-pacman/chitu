@@ -109,7 +109,8 @@ class TransformerLLaDA(nn.Module):
         model_config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
         torch.set_default_dtype(torch.bfloat16)
         self.server_args = _init_sglang_for_llada()
-        self.model = LLaDA2SGLangLM(config=model_config)
+        print(f"{model_config=}")
+        self.model = LLaDA2SGLangLM(config=model_config, expert_map_path='.')
         ## hard code here
         self.max_length = 2048
         self.aligned_lengths = [32, 64, 96, 128]
@@ -163,14 +164,11 @@ class TransformerLLaDA(nn.Module):
                         cfg.correction_bias = bias
 
     def load_weights(self, ckpt_dir: str, device: str = "cuda"):
-        # Chitu builds model under torch.device("meta"). Must to_empty before load_weights,
-        # else param.data = loaded_weight fails (incompatible tensor type: meta vs real).
+        # LLaDA 在默认设备上构建（与 dinfer 一致），直接 load_weights，不使用 meta/to_empty。
         inner = self.model
-        inner.to_empty(device=device)
+        torch.set_default_dtype(torch.bfloat16)
         inner.load_weights(ckpt_dir, device=device)
-        # Materialize any remaining meta (e.g. expert_bias not in checkpoint).
-        self._materialize_meta_tensors(inner, device)
-        # Refresh correction_bias refs so moe_fused_gate receives real tensor.
+        # 确保 correction_bias 引用与 dtype 正确（与 dinfer 的 dtype 转换一致）。
         self._refresh_correction_bias_refs(inner)
         # ModelRunner is not nn.Module; use object.__setattr__ to bypass nn.Module's check.
         if "model" in self._modules:

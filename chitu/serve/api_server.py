@@ -183,6 +183,7 @@ async def create_chat_completion(
         chat_template_kwargs["enable_thinking"] = enable_thinking
 
     try:
+
         user_req = UserRequest(
             [msg.model_dump() for msg in req.messages],
             req_id,

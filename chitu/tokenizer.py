@@ -473,3 +473,62 @@ class ChatFormatHF_dsv32(ChatFormatHF):
             drop_thinking=drop_thinking,
         )
         return self.tokenizer.encode(prompt, bos=False, eos=False)
+
+
+# Role name mapping: API format -> LLaDA format
+_LLADA_ROLE_MAP = {
+    "system": "SYSTEM",
+    "user": "HUMAN",
+    "assistant": "ASSISTANT",
+}
+
+
+class ChatFormatLLaDA(ChatFormatHF):
+    """Chat format for LLaDA2.0 models.
+
+    Format: <role>SYSTEM</role>content<|role_end|><role>HUMAN</role>content<|role_end|><role>ASSISTANT</role>
+    """
+
+    def __init__(self, tokenizer: TokenizerHF, processor: Processor):
+        super().__init__(tokenizer, processor)
+
+    def encode_dialog_prompt(
+        self,
+        dialog: Dialog,
+        chat_template_kwargs: Mapping[str, Any] = {},
+    ) -> list[int]:
+        enable_thinking = chat_template_kwargs.get("enable_thinking", False)
+        thinking_str = "detailed thinking on" if enable_thinking else "detailed thinking off"
+
+        parts: list[str] = []
+        has_system = any(m.get("role", "").lower() == "system" for m in dialog)
+
+        for message in dialog:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            if isinstance(content, list):
+                text_parts = []
+                for item in content:
+                    if isinstance(item, str):
+                        text_parts.append(item)
+                    elif isinstance(item, dict) and item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                content = "".join(text_parts)
+            else:
+                content = str(content).strip()
+
+            llada_role = _LLADA_ROLE_MAP.get(role.lower(), "HUMAN")
+            if role.lower() == "system":
+                if not content:
+                    content = thinking_str
+                else:
+                    content = f"{thinking_str}\n{content}"
+            parts.append(f"<role>{llada_role}</role>{content}<|role_end|>")
+
+        if not has_system:
+            parts.insert(0, f"<role>SYSTEM</role>{thinking_str}<|role_end|>")
+
+        parts.append("<role>ASSISTANT</role>")
+        prompt = "".join(parts)
+        logger.info(f"prompt: {prompt}")
+        return self.tokenizer.encode(prompt, bos=False, eos=False)

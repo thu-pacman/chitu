@@ -1774,8 +1774,7 @@ class Executor:
             .unsqueeze(0)
             .repeat(len(tasks.tasks), 1, 1)
         )
-        logger.info(f"type of Backend.model: {type(Backend.model)}")
-        logger.info(f"type of Backend.model.model: {type(Backend.model.model)}")
+        print("========================prefilling=======================")
         output = Backend.model.model(
             token_array[:, :max_prefilling_length].clone(memory_format=torch.contiguous_format),
             use_cache=True,
@@ -1804,7 +1803,8 @@ class Executor:
             # prepare_cache_prefill used prefilling_lengths, so delta_* already match
             delta_position_ids = seq_len_delta.delta_position_ids_tensor_device
             delta_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
-
+            logger.info(f"delta_position_ids: {delta_position_ids=}")
+            logger.info(f"delta_seq_ids: {delta_seq_ids=}")
             for layer_id in range(num_layers):
                 try:
                     accessor = cache_manager.get_accessor(layer_id)
@@ -1930,6 +1930,8 @@ class Executor:
                     continue
                 for kv_name in ["k", "v"]:
                     kv_cache = accessor.kv[kv_name]
+                    # logger.info(f"position_ids: {position_ids=}")
+                    # logger.info(f"seq_ids: {seq_ids=}")
                     ragged = read_from_paged_kv_cache(
                         kv_cache,
                         block_table,
@@ -1938,6 +1940,7 @@ class Executor:
                     )
                     # Scatter into [batch, current_cache_length, num_heads, head_dim]
                     shape = (batch_size, current_cache_length, num_kv_heads, head_dim)
+                    # logger.info(f"shape: {shape}")
                     dense = torch.zeros(shape, dtype=ragged.dtype, device=self.device)
                     for idx, (s, p) in enumerate(zip(seq_list, pos_list)):
                         dense[s, p, :, :] = ragged[idx]
@@ -1976,6 +1979,7 @@ class Executor:
         # 5) Model forward
         self.timers("decode").start()
         logger.info(f"decoding_block: {decoding_block=}")
+        print("========================prefilling=======================")
         output = model_runner(
             decoding_block,
             use_cache=True,
@@ -2077,6 +2081,10 @@ class Executor:
             block_slice = x.data[
                 i, decoding_start_list[i] : decoding_start_list[i] + block_length
             ]
+            # INSERT_YOUR_CODE
+            # 强行把block_slice的最后一个token变成eos
+            if task.decoding_start > 256:
+                block_slice[-1] = eos_id
             task.next_block = block_slice.cpu().tolist()
             if block_finished_list[i]:
                 task.decoding_start += block_length
@@ -2105,6 +2113,7 @@ class Executor:
                     task._decode_status = TaskDecodeType.Stopped
                     if task.req is not None:
                         task.req.finish_reason = "length"
+                task.next_block = None
 
         # Send output to dispatchers (for PP, etc.)
         for dispatcher in self.task_dispatchers:

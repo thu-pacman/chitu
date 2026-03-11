@@ -327,6 +327,7 @@ class UserRequest:
             tokens = Backend.formatter.encode_dialog_prompt(
                 self.message, chat_template_kwargs=self.chat_template_kwargs
             )
+            logger.info(f"tokens: {tokens}")
             if isinstance(tokens, tuple):
                 self.tokens = tokens[0]
                 self.pixel_values = tokens[1]
@@ -802,7 +803,6 @@ class Task(ConstraintDecodeTask):
                     else:
                         mask_id = 0  # Fallback, ideally should never hit
                     self.next_block = self.next_block + [mask_id] * pad_len
-                logger.info(f"{self.task_id=} {self.next_block=}")
             logger.debug(
                 f"[task.consume] task={self.task_id} prefill->decode "
                 f"consumed={self.consumed_req_tokens}/{self.prefix_tokens_len}"

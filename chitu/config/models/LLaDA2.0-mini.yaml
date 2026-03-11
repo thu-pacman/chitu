@@ -4,6 +4,7 @@ source: "https://huggingface.co/Qwen/Qwen2.5-32B" # Just for displaying. No auto
 ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
 tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
 tokenizer_type: "hf" # one of: hf, tiktoken
+chatformat_type: "llada" # one of: hf, tiktoken, llada
 
 # temparary values, now directly use dinfer loader
 dim: 5120

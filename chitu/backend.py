@@ -61,6 +61,7 @@ from chitu.tokenizer import (
     ChatFormat,
     ChatFormatHF,
     ChatFormatHF_dsv32,
+    ChatFormatLLaDA,
     Tokenizer,
     TokenizerHF,
     Processor,
@@ -430,6 +431,8 @@ class Backend:
         chatformat_type = getattr(args.models, "chatformat_type", tokenizer_type)
         if chatformat_type == "dsv32":
             return ChatFormatHF_dsv32(Backend.tokenizer, Backend.processor)
+        elif chatformat_type == "llada":
+            return ChatFormatLLaDA(Backend.tokenizer, Backend.processor)
         elif chatformat_type == "hf":
             return ChatFormatHF(Backend.tokenizer, Backend.processor)
         else:
@@ -923,9 +926,14 @@ class Backend:
         Backend.args = args
 
         if not args.debug.skip_model_load:
-            # Build the model. Don't allocate memory yet.
-            with torch.device("meta"):
+            # LLaDA 使用 dinfer 的加载逻辑，需在默认设备上构建（与 dinfer benchmark 一致），
+            # 不能用 meta，否则 to_empty 会导致 expert_bias 等参数加载异常。
+            if args.models.type == ModelType.LLADA:
                 model = Backend._build_model_architecture(args, attn_backend)
+            else:
+                # Build the model. Don't allocate memory yet.
+                with torch.device("meta"):
+                    model = Backend._build_model_architecture(args, attn_backend)
 
             # Load model parameters
             Backend._load_checkpoint(model, args)
