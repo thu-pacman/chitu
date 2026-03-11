@@ -192,6 +192,7 @@ Currently supported optional dependencies are:
 - `flash_attn`: Support `infer.attn_type=flash_attn`.
 - `flashinfer`: Support `infer.attn_type=flash_infer`.
 - `flash_mla`: Support `infer.attn_type=flash_mla`.
+- `flash_linear_attention`: Support running Qwen3-Next series models and similar models with `flash_linear_attention`.
 - `deep_gemm`: Support using DeepGEMM for fp8 inference.
 - `deep_ep`: Support using DeepEP for MoE communication (requiring NVSHMEM installed on your system **before** installing chitu. NVSHMEM is included in `requirements-build-deep_ep-cu12.txt`).
 - `cpu`: Support hybrid CPU+GPU inference.

@@ -196,6 +196,7 @@ TORCH_CUDA_ARCH_LIST=9.0 pip install --no-build-isolation ".[flash_mla]"
     > 直接安装 flash_attn 可能很慢，可以到 flash_attn 的 github 上下载相应的预编译包（一个 .whl 文件），然后通过 pip install 这个 .whl 文件。
 - `flashinfer`: 用于支持 `infer.attn_type=flash_infer`。
 - `flash_mla`: 用于支持 `infer.attn_type=flash_mla`。
+- `flash_linear_attention`: 支持通过 `infer.attn_type=flash_linear_attention` 运行 Qwen3-Next 系列模型及类似的模型。
 - `deep_gemm`: 用于支持使用 DeepGEMM 进行 fp8 推理。
 - `deep_ep`: 用于支持使用 DeepEP 进行 MoE 通信（需要在**安装赤兔前**先在系统中安装 NVSHMEM，NVSHMEM 已经包含在 `requirements-build-deep_ep-cu12.txt` 中）
 - `cpu`: 用于支持 CPU+GPU 混合推理。

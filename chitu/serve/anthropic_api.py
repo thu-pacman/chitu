@@ -791,6 +791,7 @@ async def handle_messages_request(
             tools=tools,
             tool_choice=tool_choice,
             parallel_tool_calls=True,
+            enable_reasoning=enable_thinking,
             save_trace_dir=args.debug.save_trace_dir,
         )
     except ValueError:

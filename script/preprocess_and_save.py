@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import subprocess
 import hydra
 import safetensors.torch
 import torch.distributed
@@ -39,8 +40,26 @@ def main(args: ServeConfig):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     if local_rank == 0:
-        os.system(f"cp -r {args.models.ckpt_dir}/*.json {target_dir}/")
-        os.system(f"cp -r {args.models.tokenizer_path}/*.json {target_dir}/")
+        # Keep all files except .safetensors
+        subprocess.run(
+            [
+                "find",
+                ".",
+                "-type",
+                "f",
+                "!",
+                "-name",
+                "*.safetensors",
+                "-exec",
+                "cp",
+                "--parents",
+                "{}",
+                target_dir,
+                ";",
+            ],
+            cwd=args.models.ckpt_dir,
+            check=True,
+        )
 
     safetensors.torch.save_file(
         Backend.model.state_dict(), target_dir + f"/model.rank{rank}.safetensors"

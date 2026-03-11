@@ -1,22 +1,30 @@
+# `ARG` used in a `FROM` must be defined on the top, and may be redefined below
+ARG base_image='pytorch/pytorch:2.8.0-cuda12.9-cudnn9-devel'
+ARG is_at_least_blackwell='false'
+
 #####################################
 # Base Image Stage
-FROM pytorch/pytorch:2.8.0-cuda12.9-cudnn9-devel AS base
+FROM ${base_image} AS base
 
 SHELL ["/bin/bash", "-c"]
 
 ARG torch_cuda_arch_list='7.0 7.5 8.0 8.6 8.9 9.0+PTX'
+ARG is_at_least_blackwell='false'
 ARG optional_deps='flash_attn,flash_mla,flashinfer'
 ARG chitu_setup_jobs=''
 ARG enable_cython='true'
 ARG enable_test='false'
 ARG pypi_mirror=''
 
-ENV FLASH_ATTENTION_FORCE_BUILD="TRUE"
-ENV FLASH_ATTENTION_OFFLINE_BUILD="TRUE"
-
-ENV CHITU_SETUP_JOBS=$chitu_setup_jobs
-ENV MAX_JOBS=$CHITU_SETUP_JOBS
-
+COPY ./script/is_at_least_blackwell.sh /tmp/is_at_least_blackwell.sh
+RUN if /tmp/is_at_least_blackwell.sh ${torch_cuda_arch_list} && [ "${is_at_least_blackwell}" != "true" ]; then \
+    echo "--build-arg is_at_least_blackwell must be 'true' when you have >=10.0 arch in --build-arg torch_cuda_arch_list"; \
+    exit 1; \
+fi
+RUN if ! /tmp/is_at_least_blackwell.sh ${torch_cuda_arch_list} && [ "${is_at_least_blackwell}" != "false" ]; then \
+    echo "--build-arg is_at_least_blackwell must be 'false' when you don't have >=10.0 arch in --build-arg torch_cuda_arch_list"; \
+    exit 1; \
+fi
 RUN if [ "${enable_cython}" != "true" ] && [ "${enable_cython}" != "false" ]; then \
     echo "ARG enable_cython must either be 'true' or 'false'"; \
     exit 1; \
@@ -26,13 +34,40 @@ RUN if [ "${enable_test}" != "true" ] && [ "${enable_test}" != "false" ]; then \
     exit 1; \
 fi
 
+
+#####################################
+# Environment Setter Stages
+#
+# Because Dockerfile does not support setting ENV conditionally, we have to
+# use separate stages.
+FROM base AS env_is_at_least_blackwell_true
+ENV FLASH_MLA_DISABLE_SM100=0
+ENV ENABLE_NVFP4=1
+
+FROM base AS env_is_at_least_blackwell_false
+ENV FLASH_MLA_DISABLE_SM100=1
+ENV ENABLE_NVFP4=0
+
+
+#####################################
+# Basic Dependencies Stage
+FROM env_is_at_least_blackwell_${is_at_least_blackwell} AS basic_deps
+
+ENV FLASH_ATTENTION_FORCE_BUILD="TRUE"
+ENV FLASH_ATTENTION_OFFLINE_BUILD="TRUE"
+
+ENV CHITU_SETUP_JOBS=$chitu_setup_jobs
+ENV MAX_JOBS=$CHITU_SETUP_JOBS
+
 # Required for non-interactive apt install
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 
-RUN apt update -y && apt install -y git gcc-10 g++-10 libnuma-dev libibverbs1 ibverbs-providers libibverbs-dev rdma-core curl
+RUN apt update -y && apt install -y \
+    git gcc-11 g++-11 libnuma-dev build-essential cmake ninja-build \
+    libibverbs1 ibverbs-providers libibverbs-dev rdma-core curl
 
 # Download prometheus
 RUN --mount=type=secret,id=tos_id \
@@ -107,8 +142,6 @@ RUN if [[ "${optional_deps}" == *"deep_ep"* ]]; then \
         -c <(pip list --format freeze | grep -v "setuptools"); \
 fi
 
-ENV FLASH_MLA_DISABLE_SM100=1
-
 
 #####################################
 # Dependency Resolver Stage
@@ -116,7 +149,7 @@ ENV FLASH_MLA_DISABLE_SM100=1
 # The only purpose of this stage is to generate a requirements.txt file. This
 # stage may trigger rebuild whenever there is any change in the source code,
 # but this stage runs fast.
-FROM base AS dependency_resolver
+FROM basic_deps AS dependency_resolver
 
 WORKDIR /workspace/chitu
 COPY . .
@@ -131,7 +164,7 @@ RUN ./gen_tmp_requirements_txt.py "${optional_deps}" > /tmp/requirements.txt
 # dependencies may require compilation, so this stage may take a long time, but
 # this stage only triggers rebuild when the requirements.txt file changes, or
 # this source of the dependencies changes.
-FROM base AS dependency_installer
+FROM basic_deps AS dependency_installer
 
 WORKDIR /workspace/chitu
 COPY --from=dependency_resolver /tmp/requirements.txt /tmp/requirements.txt
@@ -171,6 +204,8 @@ FROM dependency_installer AS build
 
 COPY --from=wheel_builder /tmp/ /tmp/
 
+# Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
+# compile at install time, and the compile results are environment dependent.
 RUN pip install /tmp/*.whl \
     -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "numpy" -e "transformers" -e "pytest")
 

@@ -52,16 +52,20 @@ class DeepSeekV3ParserImpl(ToolParserImplBase):
     )
 
 
+class DeepSeekV3ChatTemplate(PatchTemplateToolParserMixin):
+    @classmethod
+    def patch_chat_template(cls, template: str):
+        LOC = r"{{ bos_token }}{{ ns.system_prompt }}"
+        PATCH = r"{% if tools %}{{'\n\n## Tools\nYou have access to the following tools:\n\n'}}{% for tool in tools %}{{'### '}}{{tool.function.name}}{{'\nDescription: '}}{{tool.function.description}}{{'\n\nParameters: '}}{{tool.function.parameters | tojson}}{{'\n\n'}}{% endfor %}{{'IMPORTANT: ALWAYS adhere to this exact format for tool use:\n<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>tool_call_name\n```json\ntool_call_arguments\n```<｜tool▁call▁end｜>{additional_tool_calls}<｜tool▁calls▁end｜>\n\nWhere:\n- `tool_call_name` must be an exact match to one of the available tools\n- `tool_call_arguments` must be valid JSON that strictly follows the tool\'s Parameters Schema\n- For multiple tool calls, chain them with a newline as separator'}}{% endif %}"
+        assert template.count(LOC) == 1
+        return template.replace(LOC, LOC + PATCH)
+
+
 @register
 class DeepSeekV3ToolParser(
     DeepSeekV3GrammarImpl,
     DeepSeekV3ParserImpl,
     AbstractToolParser,
-    PatchTemplateToolParserMixin,
+    DeepSeekV3ChatTemplate,
 ):
-    @classmethod
-    def patch_chat_template(cls, template: str):
-        LOC = r"{{ bos_token }}{{ ns.system_prompt }}"
-        PATCH = r"{% if tools %}{{'\n\n# Tools\n\nYou may call one or more functions to assist with the user query.' }}{% for tool in tools %}{{ '\n' }}{{ tool | tojson }}{% endfor %}{{'\n</tools>\n\n'}}{{'For function call returns, you should first print <｜tool▁calls▁begin｜>'}}{{'For each function call, you should return object like:\n' }}{{'<｜tool▁call▁begin｜>function<｜tool▁sep｜><function_name>\n```json\n<function_arguments_in_json_format>\n```<｜tool▁call▁end｜>'}}{{'At the end of function call returns, you should print <｜tool▁calls▁end｜><｜end▁of▁sentence｜>'}}{% endif %}"
-        assert template.count(LOC) == 1
-        return template.replace(LOC, LOC + PATCH)
+    pass

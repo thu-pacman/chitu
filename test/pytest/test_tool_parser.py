@@ -112,8 +112,10 @@ def run_parse(
         for i, tool in enumerate(tools):
             tool.id = f"tool_id_{i}"
         try:
-            assert content == std_content
-            assert tools == std_tools
+            assert (
+                content == std_content
+            ), f"content: {content}, std_content: {std_content}"
+            assert tools == std_tools, f"tools: {tools}, std_tools: {std_tools}"
         except:
             rich.print(content)
             rich.print(tools)
@@ -176,6 +178,21 @@ def test_deepseekv3():
     run_parse(parser, data, "begin--end", std_tools)
 
 
+def test_deepseekr1():
+    parser = "DeepSeekR1ToolParser"
+    data = (
+        "begin-<｜tool▁calls▁begin｜>"
+        f"<｜tool▁call▁begin｜>function<｜tool▁sep｜>test_type\n```json\n{test_type_arguments}\n```<｜tool▁call▁end｜>"
+        "\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>test_empty\n```json\n{}\n```<｜tool▁call▁end｜>"
+        "<｜tool▁calls▁end｜>-end"
+    )
+    run_match(parser, data, True)
+    run_match(parser, data, False, tool_choice="required")
+    data_reasoning = data.replace("begin-", "<think>reason</think>")
+    run_match(parser, data_reasoning, True, tool_choice="required")
+    run_parse(parser, data, "begin--end", std_tools)
+
+
 def test_deepseekv31():
     parser = "DeepSeekV31ToolParser"
 
@@ -223,6 +240,23 @@ def test_glm47():
     data_reasoning = data.replace("begin-", "reason</think>")
     run_match(parser, data_reasoning, True, tool_choice="required")
     run_parse(parser, data, "begin--mid--end", std_tools)
+
+
+def test_glm45():
+    parser = "GLM45ToolParser"
+    data = (
+        "begin-<tool_call>test_type\n"
+        "<arg_key>ks</arg_key>\n<arg_value>vs</arg_value>\n"
+        '<arg_key>ko</arg_key>\n<arg_value>{"kb": true}</arg_value>\n'
+        "<arg_key>ka</arg_key>\n<arg_value>[1, 2, 3]</arg_value>\n"
+        "</tool_call>\n"
+        "<tool_call>test_empty\n</tool_call>-end"
+    )
+    run_match(parser, data, True)
+    run_match(parser, data, False, tool_choice="required")
+    data_reasoning = data.replace("begin-", "reason</think>")
+    run_match(parser, data_reasoning, True, tool_choice="required")
+    run_parse(parser, data, "begin-\n-end", std_tools)
 
 
 def test_qwen3coder():
@@ -276,11 +310,13 @@ def test_qwen3_instruct():
 
 
 if __name__ == "__main__":
+    test_deepseekr1()
     test_deepseekv3()
     test_deepseekv31()
     test_deepseekv32()
+    test_glm45()
     test_glm47()
-    test_qwen3coder()
     test_qwen3()
+    test_qwen3coder()
     test_qwen3_instruct()
     print("test ok")

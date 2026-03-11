@@ -1176,24 +1176,24 @@ class Backend:
             k: str,
             checkpoint_prefix: str,
             model_prefix: str,
-            layer_prefix: str | None,
-            local_layer_prefix: str | None,
         ) -> str:
             if checkpoint_prefix != model_prefix and k.startswith(checkpoint_prefix):
                 k = f"{model_prefix}{k[len(checkpoint_prefix):]}"
-
-            if layer_prefix and local_layer_prefix and k.startswith(layer_prefix):
-                k = f"{local_layer_prefix}{k[len(layer_prefix):]}"
             return k
 
         def _load_and_apply(
             checkpoint_prefix: str,
             model_prefix: str,
-            layer_prefix: str | None = None,
             local_layer_prefix: str | None = None,
         ):
+            """
+            Example layer prefixes:
+            checkpoint_prefix:      model.layer.{global_id}
+            model_prefix:           layer.{global_id}
+            local_layer_prefix:     layer.{local_id}
+            """
             if args.skip_preprocess:
-                checkpoint_prefix = model_prefix
+                checkpoint_prefix = local_layer_prefix or model_prefix
 
             try:
                 state_dict = load_state_dict(
@@ -1208,18 +1208,17 @@ class Backend:
                 ) from e
             assert state_dict, f"No state dict found for prefix {checkpoint_prefix}"
 
-            mapped = {}
-            for k, v in state_dict.items():
-                mapped[
-                    _map_key(
-                        k,
-                        checkpoint_prefix,
-                        model_prefix,
-                        layer_prefix,
-                        local_layer_prefix,
-                    )
-                ] = v
-            state_dict = mapped
+            if not args.skip_preprocess:
+                mapped = {}
+                for k, v in state_dict.items():
+                    mapped[
+                        _map_key(
+                            k,
+                            checkpoint_prefix,
+                            model_prefix,
+                        )
+                    ] = v
+                state_dict = mapped
 
             target_prefix = local_layer_prefix or model_prefix
             try:
@@ -1258,7 +1257,6 @@ class Backend:
             _load_and_apply(
                 checkpoint_prefix,
                 model_prefix,
-                layer_prefix=layer_prefix,
                 local_layer_prefix=local_layer_prefix,
             )
 
