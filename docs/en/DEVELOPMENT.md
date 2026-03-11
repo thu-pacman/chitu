@@ -106,10 +106,18 @@ git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
 pip install -r requirements-build.txt
 ```
 
-If you include `deep_ep` in optional dependencies, please also run:
+If you include `deep_ep` in optional dependencies, please also run one of the followings:
+
+For CUDA 12:
 
 ```bash
 pip install -r requirements-build-deep_ep-cu12.txt
+```
+
+For CUDA 13:
+
+```bash
+pip install -r requirements-build-deep_ep-cu13.txt
 ```
 
 #### 3. Install PyTorch

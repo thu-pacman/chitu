@@ -52,6 +52,15 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+#if CUDA_VERSION >= 13000
+#include <cuda/std/functional>
+using AddOp = cuda::std::plus<>;
+using MaxOp = cuda::maximum<>;
+#else
+using AddOp = cub::Sum;
+using MaxOp = cub::Max;
+#endif
+
 namespace chitu {
 
 /// Aligned array type
@@ -80,7 +89,7 @@ __launch_bounds__(TPB) __global__
 
     const int thread_row_offset = blockIdx.x * num_cols;
 
-    cub::Sum sum;
+    AddOp sum;
     float threadData(-FLT_MAX);
 
     // Don't touch finished rows.
@@ -93,8 +102,7 @@ __launch_bounds__(TPB) __global__
         threadData = max(static_cast<float>(input[idx]), threadData);
     }
 
-    const float maxElem =
-        BlockReduce(tmpStorage).Reduce(threadData, cub::Max());
+    const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, MaxOp());
     if (threadIdx.x == 0) {
         float_max = maxElem;
     }

@@ -49,24 +49,32 @@ def _render_full_doc(models: list[tuple[str, Any]], lang: str) -> str:
 
     # Generate a table, example:
     #
-    # | Name | Usage (append the argument below when starting Chitu) | How to obtain the model |
-    # |------|-------------------------------------------------------|-------------------------|
-    # | name | `models=file_name`                                    | http://...              |
+    # | Name | Support tool calling (featuring constrained decoding) | Usage (append the argument below when starting Chitu) | How to obtain the model |
+    # |------|------------------------------------------------------|-------------------------------------------------------|-------------------------|
+    # | name | ✓                                                    | `models=file_name`                                    | http://...              |
 
     lines: list[str] = []
     if lang == "zh":
         lines.append("## 开源模型")
         lines.append("")
-        lines.append("| 名称 | 用法（启动赤兔时追加下列参数） | 获取方法 |")
+        lines.append(
+            "| 名称 | 支持工具调用（内含约束解码） | 用法（启动赤兔时追加下列参数） | 获取方法 |"
+        )
     else:
         lines.append("## Open-source models")
         lines.append("")
         lines.append(
-            "| Name | Usage (append the argument below when starting Chitu) | How to obtain the model |"
+            "| Name | Support tool calling (featuring constrained decoding) | Usage (append the argument below when starting Chitu) | How to obtain the model |"
         )
-    lines.append("|---|---|---|")
+    lines.append("|---|---|---|---|")
     for filename, cfg in _sort_models(models, is_pro=False):
-        lines.append(f"| {cfg.name} | `models={filename}` | {cfg.source} |")
+        if hasattr(cfg, "tool_parser"):
+            support_tool_calling = "✓"
+        else:
+            support_tool_calling = ""
+        lines.append(
+            f"| {cfg.name} | {support_tool_calling} | `models={filename}` | {cfg.source} |"
+        )
     lines.append("")
     lines.append("")
     open_source_models = "\n".join(lines)
@@ -79,7 +87,9 @@ def _render_full_doc(models: list[tuple[str, Any]], lang: str) -> str:
             "以下模型随赤兔-pro提供，请联系 [solution@chitu.ai](solution@chitu.ai) 进行商务咨询。"
         )
         lines.append("")
-        lines.append("| 名称 | 用法（启动赤兔时追加下列参数） |")
+        lines.append(
+            "| 名称 | 支持工具调用（内含约束解码） | 用法（启动赤兔时追加下列参数） |"
+        )
     else:
         lines.append("## Chitu-pro models")
         lines.append("")
@@ -87,10 +97,16 @@ def _render_full_doc(models: list[tuple[str, Any]], lang: str) -> str:
             "The following models are part of chitu-pro. Please concat [solution@chitu.ai](solution@chitu.ai) for business inquiries."
         )
         lines.append("")
-        lines.append("| Name | Usage (append the argument below when starting Chitu) |")
-    lines.append("|---|---|")
+        lines.append(
+            "| Name | Support tool calling (featuring constraint decoding) | Usage (append the argument below when starting Chitu) |"
+        )
+    lines.append("|---|---|---|")
     for filename, cfg in _sort_models(models, is_pro=True):
-        lines.append(f"| {cfg.name} | `models={filename}` |")
+        if hasattr(cfg, "tool_parser"):
+            support_tool_calling = "✓"
+        else:
+            support_tool_calling = ""
+        lines.append(f"| {cfg.name} | {support_tool_calling} | `models={filename}` |")
     lines.append("")
     lines.append("")
     chitu_pro_models = "\n".join(lines)

@@ -17,11 +17,11 @@ ARG enable_test='false'
 ARG pypi_mirror=''
 
 COPY ./script/is_at_least_blackwell.sh /tmp/is_at_least_blackwell.sh
-RUN if /tmp/is_at_least_blackwell.sh ${torch_cuda_arch_list} && [ "${is_at_least_blackwell}" != "true" ]; then \
+RUN if /tmp/is_at_least_blackwell.sh "${torch_cuda_arch_list}" && [ "${is_at_least_blackwell}" != "true" ]; then \
     echo "--build-arg is_at_least_blackwell must be 'true' when you have >=10.0 arch in --build-arg torch_cuda_arch_list"; \
     exit 1; \
 fi
-RUN if ! /tmp/is_at_least_blackwell.sh ${torch_cuda_arch_list} && [ "${is_at_least_blackwell}" != "false" ]; then \
+RUN if ! /tmp/is_at_least_blackwell.sh "${torch_cuda_arch_list}" && [ "${is_at_least_blackwell}" != "false" ]; then \
     echo "--build-arg is_at_least_blackwell must be 'false' when you don't have >=10.0 arch in --build-arg torch_cuda_arch_list"; \
     exit 1; \
 fi
@@ -63,11 +63,16 @@ ENV MAX_JOBS=$CHITU_SETUP_JOBS
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 
-ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
+ENV TORCH_CUDA_ARCH_LIST="${torch_cuda_arch_list}"
 
 RUN apt update -y && apt install -y \
     git gcc-11 g++-11 libnuma-dev build-essential cmake ninja-build \
     libibverbs1 ibverbs-providers libibverbs-dev rdma-core curl
+
+# Backward compatibily of include path for software developed for CUDA 12
+RUN if python3 -c "import torch; print(int(torch.version.cuda.split('.')[0]) >= 13)" | grep -q "True"; then \
+    ln -s /usr/local/cuda/include/cccl/cuda /usr/local/cuda/include/cuda; \
+fi
 
 # Download prometheus
 RUN --mount=type=secret,id=tos_id \
@@ -134,12 +139,27 @@ fi
 # if some build time dependencies are missing.
 COPY ./requirements-build.txt /tmp/requirements-build.txt
 COPY ./requirements-build-deep_ep-cu12.txt /tmp/requirements-build-deep_ep-cu12.txt
+COPY ./requirements-build-deep_ep-cu13.txt /tmp/requirements-build-deep_ep-cu13.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r /tmp/requirements-build.txt \
         -c <(pip list --format freeze | grep -v "setuptools")
 RUN if [[ "${optional_deps}" == *"deep_ep"* ]]; then \
-    pip install -r /tmp/requirements-build-deep_ep-cu12.txt \
-        -c <(pip list --format freeze | grep -v "setuptools"); \
+    if python3 -c "import torch; print(int(torch.version.cuda.split('.')[0]) == 13)" | grep -q "True"; then \
+        pip install -r /tmp/requirements-build-deep_ep-cu13.txt \
+            -c <(pip list --format freeze | grep -v "setuptools"); \
+    elif python3 -c "import torch; print(int(torch.version.cuda.split('.')[0]) == 12)" | grep -q "True"; then \
+        pip install -r /tmp/requirements-build-deep_ep-cu12.txt \
+            -c <(pip list --format freeze | grep -v "setuptools"); \
+    else \
+        echo "Unsupported CUDA version"; \
+        exit 1; \
+    fi \
+fi
+
+# Triton's built-in assembler may be too old for blackwell. Use the system assembler
+# as a workaround. See https://github.com/triton-lang/triton/issues/8539.
+RUN if [ "${is_at_least_blackwell}" = "true" ]; then \
+    ln -s --force `which ptxas` /opt/conda/lib/python3.11/site-packages/triton/backends/nvidia/bin/ptxas; \
 fi
 
 
