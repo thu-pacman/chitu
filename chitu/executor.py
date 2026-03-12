@@ -311,56 +311,6 @@ class PipeDispatcher(TasksDispatcher):
             payload_type = tasks.payload_type
         else:
             msgs = self.recv_socket.recv_multipart()
-<<<<<<< HEAD
-            payload_type_name = msgs[0].decode()
-            payload_type = SerializedPackedTasksPayloadType[payload_type_name]
-
-            # 使用统一的序列化器处理 Prefill 和 Decode
-            if payload_type in [
-                SerializedPackedTasksPayloadType.Prefill,
-                SerializedPackedTasksPayloadType.Decode,
-                SerializedPackedTasksPayloadType.PrefillDLLM,
-                SerializedPackedTasksPayloadType.DecodeDLLM,
-            ]:
-                # 使用统一接口反序列化
-                is_prefill = payload_type in (
-                    SerializedPackedTasksPayloadType.Prefill,
-                    SerializedPackedTasksPayloadType.PrefillDLLM,
-                )
-                _, tasks, slot_idx = self.metadata_serializer.deserialize_metadata(
-                    msgs[1], require_task_creation=is_prefill
-                )
-
-                # 设置 slot_idx
-                slot_handle = get_slot_handle()
-                if slot_handle and slot_idx is not None:
-                    slot_handle.set_slot_idx(slot_idx)
-
-            elif payload_type in (
-                SerializedPackedTasksPayloadType.EndTask,
-                SerializedPackedTasksPayloadType.Remove,
-                SerializedPackedTasksPayloadType.TerminateBackend,
-            ):
-                task_ids = msgpack.unpackb(msgs[1]) if len(msgs) > 1 else []
-                tasks = self._handle_special_payload(payload_type, task_ids)
-                slot_handle = get_slot_handle()
-                if slot_handle and len(msgs) > 2:
-                    slot_handle.set_slot_idx(msgpack.unpackb(msgs[2]))
-            else:
-                raise ValueError(f"Unknown payload type: {payload_type}")
-
-        # send task to next stage
-        if not self.is_last_stage and tasks is not None:
-            if payload_type in [
-                SerializedPackedTasksPayloadType.Prefill,
-                SerializedPackedTasksPayloadType.Decode,
-                SerializedPackedTasksPayloadType.PrefillDLLM,
-                SerializedPackedTasksPayloadType.DecodeDLLM,
-            ]:
-                # 使用优化的配置进行序列化
-                slot_handle = get_slot_handle()
-                slot_idx = slot_handle.get_slot_idx() if slot_handle else None
-=======
             payload_type, tasks, slot_idx = (
                 self.metadata_serializer.deserialize_metadata(msgs[0])
             )
@@ -387,7 +337,6 @@ class PipeDispatcher(TasksDispatcher):
             )
             msgs = [tasks_msg]
             self.send_socket.send_multipart(msgs)
->>>>>>> public-main
 
         return payload_type, tasks
 
@@ -487,36 +436,6 @@ class TensorDispatcher(TasksDispatcher):
 
         if self.is_main_rank:
             payload_type = tasks.payload_type
-<<<<<<< HEAD
-
-            # 检查是否是特殊 payload（非 Prefill/Decode）
-            is_normal_payload = payload_type in (
-                SerializedPackedTasksPayloadType.Prefill,
-                SerializedPackedTasksPayloadType.Decode,
-                SerializedPackedTasksPayloadType.PrefillDLLM,
-                SerializedPackedTasksPayloadType.DecodeDLLM,
-            )
-
-            if not is_normal_payload:
-                # 特殊 payload：直接发送 payload_type 和 task_ids
-                # TP 场景：所有 ranks 共享 slot_handle，不需要传输 slot_idx
-                for rank_in_group in range(1, self.group_size):
-                    msgs = [f"{rank_in_group}".encode(), payload_type.name.encode()]
-                    if (
-                        payload_type
-                        in (
-                            SerializedPackedTasksPayloadType.EndTask,
-                            SerializedPackedTasksPayloadType.Remove,
-                        )
-                        and tasks is not None
-                    ):
-                        msgs.append(msgpack.packb(tasks.task_ids))
-                    self.socket.send_multipart(msgs)
-                return payload_type, tasks
-
-            # 正常的 Prefill/Decode payload
-=======
->>>>>>> public-main
             slot_handle = get_slot_handle()
             slot_idx = slot_handle.get_slot_idx() if slot_handle else None
             tasks_msg = self.metadata_serializer.serialize_metadata(
@@ -534,27 +453,9 @@ class TensorDispatcher(TasksDispatcher):
         else:
             # 非主 rank：接收消息
             msgs = self.socket.recv_multipart()
-<<<<<<< HEAD
-            payload_type = SerializedPackedTasksPayloadType[msgs[0].decode()]
-
-            # 处理正常 payload
-            if payload_type in [
-                SerializedPackedTasksPayloadType.Prefill,
-                SerializedPackedTasksPayloadType.Decode,
-                SerializedPackedTasksPayloadType.PrefillDLLM,
-                SerializedPackedTasksPayloadType.DecodeDLLM,
-            ]:
-                payload_type, tasks, slot_idx = (
-                    self.metadata_serializer.deserialize_metadata(
-                        msgs[1],
-                        require_task_creation=False,
-                        output_format="packed_tasks_base",
-                    )
-=======
             payload_type, tasks, slot_idx = (
                 self.metadata_serializer.deserialize_metadata(
                     msgs[0],
->>>>>>> public-main
                 )
             )
             slot_handle = get_slot_handle()
@@ -1165,19 +1066,7 @@ class Executor:
                     task.has_unsync_new_token = True
 
         # 3. sample
-<<<<<<< HEAD
-        # DLLM: decode uses full blocks (next_block), not single tokens. Skip sample for PrefillDLLM/DecodeDLLM;
-        # also skip when prefill returned dummy_output (0 rows).
-        if (
-            self.is_sample_stage
-            and self.pp_size <= 1
-            and len(tasks.output_tasks) > 0
-            and out.shape[0] > 0
-            and tasks.task_type not in (TaskType.PrefillDLLM, TaskType.DecodeDLLM)
-        ):
-=======
-        if self.is_sample_stage and len(tasks.output_tasks) > 0:
->>>>>>> public-main
+        if self.is_sample_stage and len(tasks.output_tasks) > 0 and tasks.task_type not in (TaskType.PrefillDLLM, TaskType.DecodeDLLM):
             tokens = self.sample(out, tasks)
             if tasks.return_logprobs:
                 logprobs = torch.log_softmax(out, dim=-1)
@@ -1835,13 +1724,8 @@ class Executor:
                 response_len_list = []
                 for it, task in enumerate(tasks.output_tasks):
                     if (
-<<<<<<< HEAD
-                        task.params.frequency_penalty > 0
-                        and is_decode(task.task_type)
-=======
                         task.sample_params.frequency_penalty > 0
-                        and task.task_type == TaskType.Decode
->>>>>>> public-main
+                        and is_decode(task.task_type)
                         and len(task.response) > 0
                     ):
                         logits_index_list.append(it)
@@ -1895,7 +1779,6 @@ class Executor:
                     Backend.model.last_hidden_states_4_postprocess[it : it + 1, :]
                 )
 
-<<<<<<< HEAD
     def _process_dllm_block_results(self):
         """Process DLLM block tokens: update each task and emit BatchResult per token pos."""
         if torch.distributed.get_rank() > 0:
@@ -1928,10 +1811,7 @@ class Executor:
             )
             TaskCollector.append_to_last_batch_results(batch_result)
 
-    def postprocess_sync_part(self, tasks: PackedTasks):
-=======
     def postprocess_sync_part(self, tasks: PackedTasksBase):
->>>>>>> public-main
         """
         schedule -> model -> sample -> ***sync*** -> send
 
@@ -1966,22 +1846,9 @@ class Executor:
                     collect_tasks.generated_result = None
                     collect_tasks = all_tasks
                 else:
-<<<<<<< HEAD
-                    tasks_list = PPTaskCollector.update_ongoing()
-        elif self.rank == 0 or self.dp_dispatcher:
-            TaskCollector.sync_generated_tasks_results()
-            # Process DLLM block results in executor (avoid task.py changes)
-            # TODO: integrate with dp_dispatcher when DP is enabled
-            if self._pending_dllm_block is not None:
-                if self.dp_dispatcher:
-                    self._pending_dllm_block = None
-                else:
-                    self._process_dllm_block_results()
-=======
                     assert collect_tasks.num_tasks == 0
             if collect_tasks.generated_result is not None:
                 collect_tasks.generated_result = collect_tasks.generated_result.cpu()
->>>>>>> public-main
             if self.dp_dispatcher:
                 if collect_tasks.generated_result is not None:
                     assert collect_tasks.generated_result.dtype == torch.int32
