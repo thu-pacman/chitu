@@ -22,11 +22,7 @@ from typing_extensions import override
 
 import torch
 
-<<<<<<< HEAD
 from chitu.task_type import TaskType, TaskDecodeType, is_prefill, is_decode
-=======
-from chitu.task_type import TaskType
->>>>>>> public-main
 from chitu.async_response import AsyncDataStream
 from chitu.backend import Backend
 from chitu.device_list import DeviceList, StaticDeviceListManager
